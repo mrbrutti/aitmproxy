@@ -10,7 +10,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::l4::{L4Flow, L4Pane};
+use crate::l4::{L4Availability, L4Flow, L4Pane};
 use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::bars::{put, put_sides};
@@ -18,6 +18,90 @@ use crate::ui::overlays::{boxed, lines_into};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, truncate};
 use crate::viewers;
+
+/// The L4 panel (`Mode::L4`, opened by `:l4` / `L`): the capture and
+/// intercept availability the status verbs report (L4 parity spec §1), the
+/// running captures and the capture commands (AC15). It renders **live state
+/// only**; the intercept line is the documented-limited line B4 refines.
+pub fn panel(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, theme.surface());
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut lines: Vec<Line> = vec![
+        Line::styled(" L4", theme.l4().add_modifier(Modifier::BOLD)),
+        Line::raw(""),
+    ];
+    // Spec §1: until the first reply the UI shows exactly the shared literal.
+    let pending = L4Availability::pending();
+    if app.l4.capture == pending || app.l4.intercept == pending {
+        lines.push(Line::styled(
+            format!(" {}", pending.reason.clone().unwrap_or_default()),
+            theme.text_tertiary(),
+        ));
+    }
+    for (label, a) in [
+        ("capture", &app.l4.capture),
+        ("intercept", &app.l4.intercept),
+    ] {
+        if *a == pending {
+            continue;
+        }
+        if a.available {
+            lines.push(Line::styled(format!(" {label}: available"), theme.l4()));
+        } else {
+            // The reason is the core's text: rendered inert (AC40 discipline).
+            let reason = inert(a.reason.as_deref().unwrap_or("unavailable"));
+            lines.push(Line::styled(
+                format!(" {label} unavailable — {reason}"),
+                theme.intercept_armed_quiet(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " running captures",
+        theme.accent().add_modifier(Modifier::BOLD),
+    ));
+    if app.l4.captures.is_empty() {
+        lines.push(Line::styled("   no running capture", theme.text_tertiary()));
+    } else {
+        for id in &app.l4.captures {
+            lines.push(Line::styled(
+                format!("   {}", inert(id)),
+                theme.text_primary(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    let hint = |cmd: &str, what: &str| {
+        Line::from(vec![
+            Span::styled(format!(" {cmd:<40}"), theme.accent()),
+            Span::styled(what.to_string(), theme.text_tertiary()),
+        ])
+    };
+    lines.push(hint(
+        ":l4 capture <iface> [inbound|outbound]",
+        "start a capture (refused while capture is unavailable)",
+    ));
+    lines.push(hint(
+        ":l4 stop [<id>]",
+        "stop one running capture, or every one",
+    ));
+    lines.push(Line::styled(
+        " Esc back · : palette · ? help",
+        theme.text_tertiary(),
+    ));
+    lines_into(buf, area, &lines, 0);
+}
+
+/// Text from the core, made inert for the terminal: every control character
+/// becomes `.` (the same rule as `l4::ascii_column`, applied to a string).
+fn inert(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
 
 /// Draw the L4 inspector for the selected flow into `area`.
 pub fn inspector(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {

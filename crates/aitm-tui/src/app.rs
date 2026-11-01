@@ -80,6 +80,10 @@ pub enum Mode {
     /// The L4 inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10):
     /// shows the server's wire summary; `y` re-issues with `_confirm`.
     L4Confirm,
+    /// The L4 panel (`:l4`, `L`): capture / intercept availability from the
+    /// status verbs, the running captures and the capture commands (L4 parity
+    /// spec §1, AC15). Renders live state only.
+    L4,
 }
 
 /// What the one-line prompt is collecting.
@@ -395,10 +399,12 @@ pub enum SidebarItem {
     Scripts,
     Agent,
     Scan,
+    /// The L4 panel; drawn only when the bus offers `l4.capture.status`.
+    L4,
 }
 
 impl SidebarItem {
-    pub const ALL: [SidebarItem; 11] = [
+    pub const ALL: [SidebarItem; 12] = [
         SidebarItem::Pinned,
         SidebarItem::Saved,
         SidebarItem::All,
@@ -410,6 +416,7 @@ impl SidebarItem {
         SidebarItem::Scripts,
         SidebarItem::Agent,
         SidebarItem::Scan,
+        SidebarItem::L4,
     ];
 
     pub fn label(self) -> &'static str {
@@ -425,6 +432,7 @@ impl SidebarItem {
             SidebarItem::Scripts => "Scripts",
             SidebarItem::Agent => "Agent",
             SidebarItem::Scan => "Scan",
+            SidebarItem::L4 => "L4",
         }
     }
 }
@@ -1336,6 +1344,24 @@ impl App {
 
     /// Everything the palette can run, filtered by the typed query.
     pub fn palette_items(&self) -> Vec<PaletteItem> {
+        // An `:l4 …` line completes from live state only (L4 parity §7(b)):
+        // the sub-commands, the known interface names, the directions and the
+        // running capture ids. Case matters (ids), so the raw text is used.
+        let raw = self.prompt.trim_start().trim_start_matches(':');
+        if raw.starts_with("l4 ") {
+            return crate::ui::complete::l4_command_candidates(
+                raw,
+                &self.l4_interfaces(),
+                &self.l4.captures,
+            )
+            .into_iter()
+            .map(|c| PaletteItem {
+                label: format!(":{}", c.label),
+                detail: c.detail,
+                kind: PaletteKind::Command(c.label),
+            })
+            .collect();
+        }
         let q = self.prompt.trim().to_lowercase();
         let mut items: Vec<PaletteItem> = BUILTIN_COMMANDS
             .iter()
@@ -1766,6 +1792,12 @@ impl App {
                 if asked {
                     self.browser.busy = Some("loading the page");
                 }
+            }
+            // The L4 panel reads only state the slow poll already holds; opening
+            // it sends nothing (AC15: the controls are the `:l4` commands).
+            Action::OpenL4 => {
+                self.mode = Mode::L4;
+                self.sidebar = SidebarItem::L4;
             }
             Action::OpenScan => {
                 self.mode = Mode::Scan;
@@ -2489,6 +2521,15 @@ impl App {
                         self.close_prompt();
                         out.extend(self.call_tool(&name, json!({})));
                     }
+                    // An `:l4 …` completion is a whole line: Enter runs the
+                    // highlighted one (typed free text runs when none match).
+                    Some(PaletteItem {
+                        kind: PaletteKind::Command(cmd),
+                        ..
+                    }) if cmd.starts_with("l4 ") => {
+                        self.close_prompt();
+                        out.extend(self.run_command(&cmd));
+                    }
                     Some(PaletteItem {
                         kind: PaletteKind::Command(cmd),
                         ..
@@ -2854,9 +2895,13 @@ impl App {
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
     fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
         let mut next = step(&SidebarItem::ALL, self.sidebar, d);
-        // The Scan row is drawn only when the bus offers `scan.discover`;
-        // never land on a row the operator cannot see.
-        if next == SidebarItem::Scan && !self.has_tool("scan.discover") {
+        // Rows drawn only when the bus offers their verb (Scan: `scan.discover`;
+        // L4: `l4.capture.status`) are skipped: never land on a row the
+        // operator cannot see. Bounded to one lap.
+        for _ in 0..SidebarItem::ALL.len() {
+            if !self.sidebar_hidden(next) {
+                break;
+            }
             next = step(&SidebarItem::ALL, next, d);
         }
         self.sidebar = next;
@@ -2865,6 +2910,7 @@ impl App {
             SidebarItem::Agent => self.mode = Mode::Agent,
             SidebarItem::Browser => out.extend(self.update(Action::OpenBrowser)),
             SidebarItem::Scan => out.extend(self.update(Action::OpenScan)),
+            SidebarItem::L4 => out.extend(self.update(Action::OpenL4)),
             SidebarItem::Scripts => {
                 self.mode = Mode::Flows;
                 self.toast(Level::Info, "Scripts arrive with M3 (core follow-up F8)");
@@ -2874,6 +2920,16 @@ impl App {
                 self.toast(Level::Info, "Saved sessions need core follow-up F10");
             }
             _ => self.mode = Mode::Flows,
+        }
+    }
+
+    /// Whether a sidebar row is not drawn on this bus (`ui::sidebar` draws
+    /// Scan and L4 only when their verb is offered).
+    fn sidebar_hidden(&self, it: SidebarItem) -> bool {
+        match it {
+            SidebarItem::Scan => !self.has_tool("scan.discover"),
+            SidebarItem::L4 => !self.has_tool("l4.capture.status"),
+            _ => false,
         }
     }
 
@@ -3128,6 +3184,93 @@ impl App {
         ))
     }
 
+    /// The interface names the `:l4` completion offers: live state only, the
+    /// `l4.scope.list` entries and the L4 flows (never a built-in list).
+    pub fn l4_interfaces(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .l4
+            .scope
+            .iter()
+            .map(|e| e.interface.clone())
+            .chain(self.l4.flows.values().map(|f| f.interface.clone()))
+            .filter(|i| !i.is_empty() && i != "any")
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// `:l4 capture <iface> [inbound|outbound]` (AC15): refused locally while
+    /// `l4.capture.status` says unavailable (the toast carries the core's
+    /// reason, so nothing that can only fail reaches the bus, AC33); else
+    /// exactly one `l4.capture.start {interface, direction}`.
+    fn l4_capture_start(&mut self, args: &str) -> Vec<BusRequest> {
+        let mut words = args.split_whitespace();
+        let Some(interface) = words.next() else {
+            self.toast(Level::Error, L4_USAGE);
+            return Vec::new();
+        };
+        let direction = match words.next() {
+            None | Some("inbound") => "inbound",
+            Some("outbound") => "outbound",
+            Some(_) => {
+                self.toast(Level::Error, "direction must be inbound or outbound");
+                return Vec::new();
+            }
+        };
+        if words.next().is_some() {
+            self.toast(Level::Error, L4_USAGE);
+            return Vec::new();
+        }
+        if !self.l4.capture.available {
+            let reason = self
+                .l4
+                .capture
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            self.toast(Level::Warn, format!("capture unavailable: {reason}"));
+            return Vec::new();
+        }
+        if !self.has_tool("l4.capture.start") {
+            self.toast(Level::Warn, "l4.capture.start is not on this bus");
+            return Vec::new();
+        }
+        vec![BusRequest::Call {
+            name: "l4.capture.start".into(),
+            args: json!({"interface": interface, "direction": direction}),
+        }]
+    }
+
+    /// `:l4 stop [<id>]`: one `l4.capture.stop {id}` for the named capture, or
+    /// one per running capture (the ids `l4.capture.status` reported).
+    fn l4_capture_stop(&mut self, id: &str) -> Vec<BusRequest> {
+        let mut words = id.split_whitespace();
+        let named = words.next();
+        if words.next().is_some() {
+            self.toast(Level::Error, L4_USAGE);
+            return Vec::new();
+        }
+        let ids: Vec<String> = match named {
+            Some(id) => vec![id.to_string()],
+            None => self.l4.captures.clone(),
+        };
+        if ids.is_empty() {
+            self.toast(Level::Info, "no running capture");
+            return Vec::new();
+        }
+        if !self.has_tool("l4.capture.stop") {
+            self.toast(Level::Warn, "l4.capture.stop is not on this bus");
+            return Vec::new();
+        }
+        ids.into_iter()
+            .map(|id| BusRequest::Call {
+                name: "l4.capture.stop".into(),
+                args: json!({"id": id}),
+            })
+            .collect()
+    }
+
     /// Run a `:` command line.
     pub fn run_command(&mut self, line: &str) -> Vec<BusRequest> {
         let mut out = Vec::new();
@@ -3252,6 +3395,17 @@ impl App {
                 }
             }
             "browser" => out.extend(self.update(Action::OpenBrowser)),
+            // `:l4` opens the L4 panel; `:l4 capture <iface> [dir]` and
+            // `:l4 stop [<id>]` are the capture controls (L4 parity AC15).
+            "l4" => {
+                let mut p = rest.splitn(2, ' ');
+                match (p.next().unwrap_or(""), p.next().unwrap_or("").trim()) {
+                    ("", _) => out.extend(self.update(Action::OpenL4)),
+                    ("capture", args) => out.extend(self.l4_capture_start(args)),
+                    ("stop", id) => out.extend(self.l4_capture_stop(id)),
+                    _ => self.toast(Level::Error, L4_USAGE),
+                }
+            }
             // `:scan` opens the Scan view only (viewing never crawls; `r`
             // launches); `:scan <host>` opens it and crawls that host,
             // scope-gated.
@@ -4112,6 +4266,15 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "scan",
         "Scan view: scope-bound scan.discover (r crawls; :scan <host> crawls a host)",
     ),
+    (
+        "l4",
+        "L4 panel: capture / intercept availability and running captures (L)",
+    ),
+    (
+        "l4 capture <iface> [inbound|outbound]",
+        "Start a packet capture (refused locally while capture is unavailable)",
+    ),
+    ("l4 stop [<id>]", "Stop one running capture, or every one"),
     ("layout h|v", "Inspector below or right"),
     ("split", "Split view (not built in this pass)"),
     ("export", "Export flows (needs F10)"),
@@ -4127,6 +4290,9 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("help", "Keys and commands"),
     ("quit", "Leave the TUI"),
 ];
+
+/// The `:l4` usage toast.
+const L4_USAGE: &str = "usage: :l4 [capture <iface> [inbound|outbound] | stop [<id>]]";
 
 /// Subsequence match: every char of `needle` appears in order in `hay`.
 /// Parse the craft editor's YAML into a `PacketSpec` JSON value for `l4.craft`

@@ -3,16 +3,23 @@
 //! the core's wire shape (`l4.capture.status` → `{available, code, reason,
 //! captures}`, `l4.intercept.list` → `[{id, flow, state, dir, length, layers,
 //! parked_at}]`, `l4.flow.get` packets with the §2 fields); the app is built with
-//! `App::new` and driven through `on_bus` / `update` / `run_command`. No fixture,
-//! snapshot or seeded store is used anywhere in this file.
+//! `App::new` and driven through `on_bus` / `update` / `run_command`; the two
+//! render checks draw that same state into a `Buffer` and read the text back.
+//! No fixture, snapshot or seeded store is used anywhere in this file.
 
-use aitm_tui::action::{BusEvent, BusRequest, ToolInfo};
-use aitm_tui::app::App;
+use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
+use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::caps::TermCaps;
+use aitm_tui::keys;
 use aitm_tui::l4::{
     ascii_column, flow_get_args, fold_status, hex_dump, inspect_args, slow_l4_reads, status_ids,
     supports_operator_scope_add, supports_window, L4Availability, L4Flow, L4Parked, L4State,
 };
+use aitm_tui::theme::Theme;
+use aitm_tui::ui::complete::l4_command_candidates;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use serde_json::{json, Value};
 
 /// The 25 `l4.*` names the rig's `tools/list` offers: the 22 core verbs plus the
@@ -604,4 +611,425 @@ fn polling_availability_replies_land_in_app_state() {
         app.current_toast().is_none(),
         "an availability change never toasts"
     );
+}
+
+// -------------------------------------------------------- capture_commands
+
+/// Land a capture availability in the app (the slow poll's reply), with
+/// `captures` running.
+fn set_capture(app: &mut App, capture: L4Availability, captures: &[&str]) {
+    let intercept = app.l4.intercept.clone();
+    let out = app.on_bus(BusEvent::L4Availability {
+        capture,
+        intercept,
+        captures: captures.iter().map(|s| (*s).to_string()).collect(),
+    });
+    assert_eq!(out, Vec::<BusRequest>::new());
+}
+
+fn available() -> L4Availability {
+    L4Availability::from_reply(
+        &json!({"available": true, "code": "available", "reason": null, "captures": []}),
+    )
+}
+
+fn unavailable(reason: &str) -> L4Availability {
+    L4Availability::from_reply(
+        &json!({"available": false, "code": "needs_privilege", "reason": reason, "captures": []}),
+    )
+}
+
+fn toast_text(app: &App) -> String {
+    app.current_toast()
+        .map(|t| t.text.clone())
+        .unwrap_or_default()
+}
+
+/// The text of a buffer, one trimmed line per row.
+fn buffer_text(buf: &Buffer) -> Vec<String> {
+    let w = usize::from(buf.area.width);
+    buf.content()
+        .chunks(w)
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+fn press(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+}
+
+/// `:l4` opens the panel and sends nothing; so do `L` and the sidebar item.
+#[test]
+fn capture_commands_l4_opens_the_panel_with_no_request() {
+    {
+        let mut app = app();
+        let _ = connected(&mut app, l4_tools(false));
+        assert_eq!(app.run_command("l4"), Vec::<BusRequest>::new());
+        assert_eq!(app.mode, Mode::L4);
+        assert!(app.current_toast().is_none());
+    }
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert_eq!(
+        keys::map(press('L'), Mode::Flows),
+        Some(Action::OpenL4),
+        "L in the flow list opens the L4 panel"
+    );
+    assert_eq!(app.update(Action::OpenL4), Vec::<BusRequest>::new());
+    assert_eq!(app.mode, Mode::L4);
+    assert_eq!(app.sidebar, SidebarItem::L4);
+    // The panel is a read-only panel: Esc / q back, `:` palette, `?` help.
+    assert_eq!(
+        keys::map(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), Mode::L4),
+        Some(Action::Back)
+    );
+    assert_eq!(keys::map(press('q'), Mode::L4), Some(Action::Back));
+    assert_eq!(keys::map(press(':'), Mode::L4), Some(Action::PaletteOpen));
+    assert_eq!(keys::map(press('?'), Mode::L4), Some(Action::Help));
+    let _ = app.update(Action::Back);
+    assert_eq!(app.mode, Mode::Flows);
+}
+
+/// AC15: with capture unavailable (reason `X`), `:l4 capture lo0` refuses
+/// locally with that reason and puts nothing on the bus. The same before the
+/// first status reply (pending is not available).
+#[test]
+fn capture_commands_refuse_locally_while_capture_is_unavailable() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    // Pending: nothing has answered yet.
+    assert_eq!(app.l4.capture, L4Availability::pending());
+    assert_eq!(app.run_command("l4 capture lo0"), Vec::<BusRequest>::new());
+    assert!(
+        toast_text(&app).contains("Reading L4 availability…"),
+        "toast: {:?}",
+        toast_text(&app)
+    );
+
+    set_capture(&mut app, unavailable("X"), &[]);
+    assert_eq!(app.run_command("l4 capture lo0"), Vec::<BusRequest>::new());
+    let t = toast_text(&app);
+    assert!(t.contains('X'), "toast carries the core's reason: {t:?}");
+    assert!(
+        t.starts_with("capture unavailable: "),
+        "toast is the plan's literal: {t:?}"
+    );
+    assert_eq!(
+        app.run_command("l4 capture lo0 outbound"),
+        Vec::<BusRequest>::new()
+    );
+}
+
+/// With capture available, `:l4 capture <iface> [dir]` is exactly one
+/// `l4.capture.start {interface, direction}`; the direction defaults to
+/// `inbound` and any other word is refused locally.
+#[test]
+fn capture_commands_start_sends_interface_and_direction() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    set_capture(&mut app, available(), &[]);
+    assert_eq!(
+        app.run_command("l4 capture lo0"),
+        vec![BusRequest::Call {
+            name: "l4.capture.start".into(),
+            args: json!({"interface": "lo0", "direction": "inbound"}),
+        }]
+    );
+    assert_eq!(
+        app.run_command("l4 capture lo0 outbound"),
+        vec![BusRequest::Call {
+            name: "l4.capture.start".into(),
+            args: json!({"interface": "lo0", "direction": "outbound"}),
+        }]
+    );
+    assert_eq!(
+        app.run_command("l4 capture lo0 inbound"),
+        vec![BusRequest::Call {
+            name: "l4.capture.start".into(),
+            args: json!({"interface": "lo0", "direction": "inbound"}),
+        }]
+    );
+    assert_eq!(
+        app.run_command("l4 capture lo0 sideways"),
+        Vec::<BusRequest>::new()
+    );
+    assert_eq!(toast_text(&app), "direction must be inbound or outbound");
+    // No interface: a usage toast, no request.
+    assert_eq!(app.run_command("l4 capture"), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains("usage"), "{:?}", toast_text(&app));
+    // The args never carry a `filter` key (the core derives BPF from scope).
+    for line in ["l4 capture lo0", "l4 capture en0 outbound"] {
+        for req in app.run_command(line) {
+            if let BusRequest::Call { args, .. } = req {
+                assert_eq!(args.as_object().map(|o| o.len()), Some(2));
+                assert!(args.get("filter").is_none());
+            }
+        }
+    }
+}
+
+/// `:l4 stop` stops every running capture, one `l4.capture.stop {id}` each,
+/// in the core's order; `:l4 stop <id>` stops that one; nothing running is
+/// a toast.
+#[test]
+fn capture_commands_stop_one_or_every_running_capture() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    set_capture(&mut app, available(), &["C1", "C2"]);
+    assert_eq!(
+        app.run_command("l4 stop"),
+        vec![
+            BusRequest::Call {
+                name: "l4.capture.stop".into(),
+                args: json!({"id": "C1"}),
+            },
+            BusRequest::Call {
+                name: "l4.capture.stop".into(),
+                args: json!({"id": "C2"}),
+            },
+        ]
+    );
+    assert_eq!(
+        app.run_command("l4 stop C1"),
+        vec![BusRequest::Call {
+            name: "l4.capture.stop".into(),
+            args: json!({"id": "C1"}),
+        }]
+    );
+    set_capture(&mut app, available(), &[]);
+    assert_eq!(app.run_command("l4 stop"), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "no running capture");
+    // An unknown sub-command is a usage toast, never a request.
+    assert_eq!(app.run_command("l4 frobnicate"), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains("usage"), "{:?}", toast_text(&app));
+}
+
+/// Without the capture verbs on the bus nothing is sent, whatever the status
+/// says (an older core cannot be asked for a verb it lacks).
+#[test]
+fn capture_commands_need_the_verbs_on_the_bus() {
+    let mut app = app();
+    let tools: Vec<ToolInfo> = l4_tools(false)
+        .into_iter()
+        .filter(|t| !t.name.starts_with("l4.capture.st"))
+        .collect();
+    let _ = connected(&mut app, tools);
+    set_capture(&mut app, available(), &["C1"]);
+    assert_eq!(app.run_command("l4 capture lo0"), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains("l4.capture.start"));
+    assert_eq!(app.run_command("l4 stop"), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains("l4.capture.stop"));
+}
+
+/// Completion for the `:l4` line: `capture` / `stop`, then the known
+/// interface names (live state only: scope entries and L4 flows), then
+/// `inbound` / `outbound`; `stop` offers "all" and each running id.
+#[test]
+fn capture_commands_completion_offers_subcommands_interfaces_and_directions() {
+    let labels = |line: &str, ifaces: &[&str], caps: &[&str]| -> Vec<String> {
+        let ifaces: Vec<String> = ifaces.iter().map(|s| (*s).to_string()).collect();
+        let caps: Vec<String> = caps.iter().map(|s| (*s).to_string()).collect();
+        l4_command_candidates(line, &ifaces, &caps)
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
+    };
+    assert_eq!(
+        labels("l4 ", &["lo0"], &["C1"]),
+        vec!["l4 capture".to_string(), "l4 stop".to_string()]
+    );
+    assert_eq!(
+        labels("l4 ca", &["lo0"], &[]),
+        vec!["l4 capture".to_string()]
+    );
+    assert_eq!(labels("l4 st", &["lo0"], &[]), vec!["l4 stop".to_string()]);
+    assert_eq!(
+        labels("l4 capture ", &["lo0", "en0"], &[]),
+        vec!["l4 capture lo0".to_string(), "l4 capture en0".to_string()]
+    );
+    assert_eq!(
+        labels("l4 capture e", &["lo0", "en0"], &[]),
+        vec!["l4 capture en0".to_string()]
+    );
+    assert_eq!(
+        labels("l4 capture lo0 ", &["lo0"], &[]),
+        vec![
+            "l4 capture lo0 inbound".to_string(),
+            "l4 capture lo0 outbound".to_string()
+        ]
+    );
+    assert_eq!(
+        labels("l4 capture lo0 out", &["lo0"], &[]),
+        vec!["l4 capture lo0 outbound".to_string()]
+    );
+    assert_eq!(
+        labels("l4 stop ", &[], &["C1", "C2"]),
+        vec![
+            "l4 stop".to_string(),
+            "l4 stop C1".to_string(),
+            "l4 stop C2".to_string()
+        ]
+    );
+    assert_eq!(
+        labels("l4 stop C2", &[], &["C1", "C2"]),
+        vec!["l4 stop C2".to_string()]
+    );
+    // Nothing past a complete line, and nothing for other commands.
+    assert_eq!(
+        labels("l4 capture lo0 inbound x", &["lo0"], &[]),
+        Vec::<String>::new()
+    );
+    assert_eq!(labels("scope add", &["lo0"], &["C1"]), Vec::<String>::new());
+    assert_eq!(labels("l4", &["lo0"], &["C1"]), Vec::<String>::new());
+    // Every candidate carries a hint.
+    for c in l4_command_candidates("l4 ", &["lo0".to_string()], &[]) {
+        assert!(!c.detail.is_empty(), "{c:?}");
+    }
+}
+
+/// The palette shows those completions for an `:l4 …` line, with the
+/// interface names taken from live state (scope entries ∪ L4 flows) and
+/// nothing else; Enter runs the highlighted completion.
+#[test]
+fn capture_commands_palette_completes_from_live_state() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    set_capture(&mut app, available(), &["C1"]);
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "lo0", "capability": "capture", "cidr": "127.0.0.1/32",
+        "ports": "9000-9999", "direction": "inbound"
+    })]));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![json!({
+        "id": "C1", "kind": "capture", "interface": "en0", "packet_count": 0,
+        "injected_count": 0, "packets": []
+    })]));
+    assert_eq!(
+        app.l4_interfaces(),
+        vec!["en0".to_string(), "lo0".to_string()]
+    );
+    app.prompt = "l4 capture ".into();
+    let labels: Vec<String> = app.palette_items().into_iter().map(|i| i.label).collect();
+    assert_eq!(
+        labels,
+        vec![":l4 capture en0".to_string(), ":l4 capture lo0".to_string()]
+    );
+    // Enter on the highlighted completion runs that line.
+    let _ = app.update(Action::PaletteOpen);
+    app.prompt = "l4 capture lo0 ".into();
+    app.palette_cursor = 1; // outbound
+    let out = app.update(Action::Submit);
+    assert_eq!(
+        out,
+        vec![BusRequest::Call {
+            name: "l4.capture.start".into(),
+            args: json!({"interface": "lo0", "direction": "outbound"}),
+        }]
+    );
+}
+
+/// The sidebar's L4 item exists only when the bus offers `l4.capture.status`:
+/// `]` never lands on it otherwise, and landing on it opens the panel.
+#[test]
+fn capture_commands_sidebar_item_only_with_the_status_verb() {
+    {
+        let mut app = app();
+        let _ = connected(&mut app, Vec::new());
+        for _ in 0..(SidebarItem::ALL.len() * 2) {
+            let _ = app.update(Action::SidebarNext);
+            assert_ne!(
+                app.sidebar,
+                SidebarItem::L4,
+                "hidden without l4.capture.status"
+            );
+            assert_ne!(app.mode, Mode::L4);
+        }
+    }
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let mut seen = false;
+    for _ in 0..SidebarItem::ALL.len() {
+        let _ = app.update(Action::SidebarNext);
+        if app.sidebar == SidebarItem::L4 {
+            seen = true;
+            assert_eq!(app.mode, Mode::L4);
+        }
+    }
+    assert!(
+        seen,
+        "the L4 item is reachable when the bus offers the verb"
+    );
+    assert_eq!(SidebarItem::L4.label(), "L4");
+}
+
+/// The panel renders live state only: the availability lines, the running
+/// capture ids and the two command hints. Before the first reply it shows the
+/// shared pending literal.
+#[test]
+fn capture_commands_panel_renders_availability_captures_and_hints() {
+    let theme = Theme::new(true);
+    let area = Rect::new(0, 0, 100, 14);
+    let render = |app: &App| -> String {
+        let mut buf = Buffer::empty(area);
+        aitm_tui::ui::l4::panel(app, &theme, area, &mut buf);
+        buffer_text(&buf).join("\n")
+    };
+
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let text = render(&app);
+    assert!(text.contains("Reading L4 availability…"), "{text}");
+    assert!(!text.contains("capture unavailable"), "{text}");
+
+    set_capture(&mut app, unavailable("X"), &[]);
+    let intercept = L4Availability::from_reply(&json!({
+        "available": false, "code": "unsupported_platform", "reason": "Y", "sessions": []
+    }));
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept,
+        captures: vec![],
+    });
+    let text = render(&app);
+    assert!(text.contains("capture unavailable — X"), "{text}");
+    assert!(text.contains("intercept unavailable — Y"), "{text}");
+    assert!(
+        text.contains(":l4 capture <iface> [inbound|outbound]"),
+        "{text}"
+    );
+    assert!(text.contains(":l4 stop [<id>]"), "{text}");
+    assert!(!text.contains("Reading L4 availability…"), "{text}");
+    assert!(text.contains("no running capture"), "{text}");
+
+    set_capture(&mut app, available(), &["C1", "C2"]);
+    let text = render(&app);
+    assert!(text.contains("capture: available"), "{text}");
+    assert!(text.contains("C1"), "{text}");
+    assert!(text.contains("C2"), "{text}");
+    assert!(!text.contains("no running capture"), "{text}");
+    // No control character ever reaches the terminal from this panel.
+    assert!(text.chars().all(|c| c >= ' ' || c == '\n'), "{text:?}");
+}
+
+/// Help lists the panel key and the two `:l4` commands.
+#[test]
+fn capture_commands_help_lists_the_panel_key_and_commands() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    app.mode = Mode::Help;
+    let area = Rect::new(0, 0, 160, 50);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &Theme::new(true), area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert!(
+        text.contains(":l4 capture <iface> [inbound|outbound]"),
+        "{text}"
+    );
+    assert!(text.contains(":l4 stop [<id>]"), "{text}");
+    assert!(text.contains("L4 panel"), "{text}");
 }

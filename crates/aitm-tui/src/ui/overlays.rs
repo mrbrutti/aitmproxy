@@ -106,10 +106,11 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
 }
 
 pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let area = centered(screen, 96, 36);
+    let area = centered(screen, 96, 38);
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let k = |a: &str, b: &str| key_line(theme, a, b);
-    let mut lines = vec![
+    let mut lines =
+        vec![
         heading(theme, "Flow list"),
         k("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
         k(
@@ -131,6 +132,11 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             "F / S / @",
             "findings · scope · agent panels · :scan scan panel (r crawls, ⏎ opens a point's flow)",
         ),
+        k(
+            "L / :l4",
+            "L4 panel: capture / intercept availability and running captures",
+        ),
+        k("", ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]"),
         k("1-9 0 Tab", "content-type chips"),
         k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
         k(

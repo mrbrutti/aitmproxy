@@ -195,6 +195,17 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         };
         line(buf, item(app, SidebarItem::Scan, Some(scan_count), false));
     }
+    // The L4 panel row appears only when the bus offers `l4.capture.status`
+    // (L4 parity AC15); its count is the running captures, a dash when none.
+    if app.has_tool("l4.capture.status") {
+        let n = app.l4.captures.len();
+        let l4_count = if n > 0 {
+            n.to_string()
+        } else {
+            "—".to_string()
+        };
+        line(buf, item(app, SidebarItem::L4, Some(l4_count), false));
+    }
 
     // Footer: the sidebar filter hint, pinned to the bottom.
     if area.height > 2 {

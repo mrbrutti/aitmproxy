@@ -34,8 +34,9 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Ca => ca(key),
         Mode::Browser => browser(key),
         Mode::Scan => scan(key),
-        // Read-only: back, palette, help.
-        Mode::Config => panel(key),
+        // Read-only: back, palette, help. The L4 panel's verbs are the `:l4`
+        // commands (L4 parity AC15), so it is a read-only panel too.
+        Mode::Config | Mode::L4 => panel(key),
         Mode::L4Confirm => l4_confirm(key),
         // Any key closes help (README); `:` goes straight to the palette.
         Mode::Help => Some(match key.code {
@@ -156,6 +157,7 @@ fn flows(key: KeyEvent, ctrl: bool) -> Option<Action> {
         KeyCode::Char('F') => Action::OpenFindings,
         KeyCode::Char('S') => Action::OpenScope,
         KeyCode::Char('@') => Action::OpenAgent,
+        KeyCode::Char('L') => Action::OpenL4,
         KeyCode::Char('l') => Action::ToggleLayout,
         KeyCode::Char('t') => Action::ToggleAutoSelect,
         KeyCode::Char('y') => Action::CopyUrl,

@@ -380,6 +380,79 @@ fn clamp_boundary(src: &str, caret: usize) -> usize {
     c
 }
 
+// ---- The `:l4` command line ----------------------------------------------
+
+/// Completion for the palette's `:l4` line (L4 parity spec §7(b): "capture
+/// commands … with completion"). `line` is the typed text without the colon;
+/// a trailing space means "the next word". The interface names and capture
+/// ids are the caller's **live** state (`l4.scope.list` ∪ the L4 flows;
+/// `l4.capture.status`), never a built-in list. Each label is the whole
+/// completed line, so accepting one runs it as typed.
+pub fn l4_command_candidates(
+    line: &str,
+    interfaces: &[String],
+    captures: &[String],
+) -> Vec<Candidate> {
+    let Some(rest) = line.strip_prefix("l4 ") else {
+        return Vec::new();
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    // The word under the caret is partial unless the line ends in a space.
+    let (done, partial): (&[&str], &str) = match words.split_last() {
+        Some((last, head)) if !rest.ends_with(' ') => (head, last),
+        _ => (&words[..], ""),
+    };
+    let cand = |label: String, detail: &str| Candidate {
+        label,
+        detail: detail.to_string(),
+    };
+    let mut out = Vec::new();
+    match done {
+        [] => {
+            for (sub, detail) in [
+                (
+                    "capture",
+                    "start a capture: :l4 capture <iface> [inbound|outbound]",
+                ),
+                ("stop", "stop a running capture: :l4 stop [<id>]"),
+            ] {
+                if sub.starts_with(partial) {
+                    out.push(cand(format!("l4 {sub}"), detail));
+                }
+            }
+        }
+        ["capture"] => {
+            for iface in interfaces {
+                if iface.starts_with(partial) {
+                    out.push(cand(
+                        format!("l4 capture {iface}"),
+                        "interface (from the L4 scope and flows)",
+                    ));
+                }
+            }
+        }
+        ["capture", iface] => {
+            for dir in ["inbound", "outbound"] {
+                if dir.starts_with(partial) {
+                    out.push(cand(format!("l4 capture {iface} {dir}"), "direction"));
+                }
+            }
+        }
+        ["stop"] => {
+            if partial.is_empty() {
+                out.push(cand("l4 stop".to_string(), "stop every running capture"));
+            }
+            for id in captures {
+                if id.starts_with(partial) {
+                    out.push(cand(format!("l4 stop {id}"), "running capture"));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 // ---- The popup ----------------------------------------------------------
 
 /// The floating completion popup an editor anchors at the caret.

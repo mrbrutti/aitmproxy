@@ -66,6 +66,10 @@ pub enum Action {
     /// The Scan view (scanner-integration Stage 1). Opens the view only and
     /// shows the scope-bound target; viewing never crawls.
     OpenScan,
+    /// The L4 panel (`L`, `:l4`): capture / intercept availability from the
+    /// status verbs, the running captures and the capture commands (L4 parity
+    /// spec §1, AC15). Opening it sends nothing.
+    OpenL4,
     /// Scan view `r`: launch a scope-bound `scan.discover` (deny-by-default:
     /// an out-of-scope target is refused; a running crawl blocks re-launch).
     ScanLaunch,
