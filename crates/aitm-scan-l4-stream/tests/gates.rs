@@ -782,3 +782,88 @@ async fn self_port_exclusion() {
     assert_eq!(client.count(), 1, "the probe reached the client");
     accepts_is(speaker.as_ref(), 0, "and never the loopback speaker");
 }
+
+// ---------------------------------------------------------------------------
+// C14 / C16: what the discovery line reports
+// ---------------------------------------------------------------------------
+
+/// The one `l4_stream discover` line per endpoint carries the counts C14 and
+/// C16 are read off (`seeds_dropped_credential`, `points`, `points_dropped`)
+/// and still not one byte of a seed (C11).
+///
+/// Three RESP seeds carry a credential and one does not, so the line must say
+/// `seeds_dropped_credential=3` and the surviving points must all come from
+/// the fourth.
+#[tokio::test]
+async fn discovery_line_reports_its_counts() {
+    let (_guard, lines) = common::capture_tracing();
+
+    let seeds = hex_seeds(&[
+        b"*2\r\n$4\r\nAUTH\r\n$3\r\nabc\r\n",
+        b"*3\r\n$4\r\nAUTH\r\n$1\r\nu\r\n$1\r\np\r\n",
+        b"*2\r\n$4\r\nauth\r\n$6\r\nsecret\r\n",
+        b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n",
+    ]);
+    let profile = profile_for("127.0.0.1", 9000, Some("resp"), 10, &seeds);
+    let (_lane, _job, found) = discover_with(
+        Some(common::wildcard_guard(&[9000])),
+        Arc::new(CountingClient::dry_run()),
+        profile,
+        "22log",
+    )
+    .await;
+    let discovery = found.expect("one seed survives the credential filter");
+
+    let recorded = lines.lock().expect("the capture sink").clone();
+    assert!(
+        !recorded.is_empty(),
+        "the capture recorded nothing at all, so nothing below is proven"
+    );
+    let line = recorded
+        .iter()
+        .find(|line| line.contains("l4_stream discover"))
+        .unwrap_or_else(|| panic!("no discovery line among {recorded:?}"));
+
+    assert!(
+        line.contains("seeds_dropped_credential=3"),
+        "the line does not count the three AUTH seeds: {line}"
+    );
+    assert!(line.contains("grammar=resp"), "{line}");
+    assert!(line.contains("node=l4s-tcp-127.0.0.1-9000"), "{line}");
+    assert!(line.contains("seeds=1"), "{line}");
+    assert!(
+        line.contains(&format!("points={}", discovery.points.len())),
+        "the line's point count is the discovery's: {line}"
+    );
+    assert!(
+        line.contains("points_dropped=0"),
+        "one seed is far under the 256-point cap: {line}"
+    );
+
+    // C11 again, on this line: counts only, never a seed byte and never its
+    // hex. `secret` is the password in the third seed.
+    for line in &recorded {
+        assert!(
+            !line.contains("secret"),
+            "a seed byte reached a log: {line}"
+        );
+        assert!(
+            !line.contains(&encode_hex(b"secret")),
+            "a seed's hex reached a log: {line}"
+        );
+        assert!(!line.contains("ECHO"), "a seed byte reached a log: {line}");
+    }
+
+    // And the surviving points are the ECHO seed's.
+    assert!(
+        !discovery.points.is_empty(),
+        "the benign seed yields points"
+    );
+    for point in &discovery.points {
+        let example = point.example.clone().unwrap_or_default();
+        assert!(
+            !example.contains(&encode_hex(b"secret")),
+            "a point example carries a credential: {example}"
+        );
+    }
+}
