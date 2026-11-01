@@ -197,12 +197,29 @@ pub fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
 /// [`RawHeader::raw`] is how a check sends a name or value containing a CRLF or
 /// any other byte `http::HeaderName`/`HeaderValue` refuse by construction. The
 /// encoder validates nothing: that is the point of the observe-only probes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawHeader {
     /// The field name bytes, exactly as they go on the wire.
     pub name: Vec<u8>,
     /// The field value bytes, exactly as they go on the wire.
     pub value: Vec<u8>,
+}
+
+/// Prints `name=<N bytes>`: the value is never rendered.
+///
+/// A probe's field value is the one part of a plan that can carry something
+/// worth keeping out of a log or an error — and [`RawH2Plan`] is debug-printed
+/// by its callers, so the derived `Debug` would have carried every value with
+/// it (review finding SEC-6).
+impl std::fmt::Debug for RawHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}=<{} bytes>",
+            String::from_utf8_lossy(&self.name),
+            self.value.len()
+        )
+    }
 }
 
 impl RawHeader {
@@ -312,6 +329,35 @@ pub fn parse_goaway(payload: &[u8]) -> Option<(u32, u32)> {
         )),
         _ => None,
     }
+}
+
+/// `PADDED` on a HEADERS frame (RFC 9113 §6.2). Not in [`flags`]: this codec
+/// never *writes* a padded frame, it only has to read one correctly.
+const HEADERS_PADDED: u8 = 0x8;
+
+/// `PRIORITY` on a HEADERS frame (RFC 9113 §6.2), likewise read-only.
+const HEADERS_PRIORITY: u8 = 0x20;
+
+/// The header block fragment inside a HEADERS payload (RFC 9113 §6.2): the
+/// pad-length byte, the 5-byte stream-dependency/weight field and the trailing
+/// padding are frame furniture, not block bytes.
+///
+/// `None` when the frame is malformed — a `PADDED` frame with no pad-length
+/// byte, a padding run longer than the payload, or a `PRIORITY` field that does
+/// not fit. A caller reads no status from such a frame rather than reading the
+/// furniture as one (review finding SEC-4).
+fn headers_block_fragment(frame_flags: u8, payload: &[u8]) -> Option<&[u8]> {
+    let mut rest = payload;
+    let mut pad = 0usize;
+    if frame_flags & HEADERS_PADDED != 0 {
+        let (len, tail) = rest.split_first()?;
+        pad = *len as usize;
+        rest = tail;
+    }
+    if frame_flags & HEADERS_PRIORITY != 0 {
+        rest = rest.get(5..)?;
+    }
+    rest.get(..rest.len().checked_sub(pad)?)
 }
 
 /// Read a `:status` from a response HEADERS block, but only when the server
@@ -793,18 +839,25 @@ impl FrameReader {
 }
 
 /// Record `outcome` for the stream `id` carries, unless that stream already has
-/// one. Returns whether it filled a slot that was still pending.
-fn record(obs: &mut RawH2Observation, id: u32, outcome: StreamOutcome) -> bool {
+/// an outcome or the driver has not opened it.
+///
+/// `opened` is how many streams this probe has actually written HEADERS for. A
+/// frame naming anything beyond that — a server id, an even id, a stream the
+/// plan has not reached yet — is recorded for nobody: otherwise a peer could
+/// fill a later slot and make the sequential `Blocks` mode open the next block
+/// before the one in flight was answered (review finding SEC-5).
+fn record(obs: &mut RawH2Observation, id: u32, outcome: StreamOutcome, opened: usize) {
     if id == 0 || id.is_multiple_of(2) {
-        return false;
+        return;
     }
     let index = usize::try_from((id - 1) / 2).unwrap_or(usize::MAX);
-    match obs.streams.get_mut(index) {
-        Some(slot) if *slot == StreamOutcome::Timeout => {
+    if index >= opened {
+        return;
+    }
+    if let Some(slot) = obs.streams.get_mut(index) {
+        if *slot == StreamOutcome::Timeout {
             *slot = outcome;
-            true
         }
-        _ => false,
     }
 }
 
@@ -920,20 +973,24 @@ async fn write_headers(
     Ok(())
 }
 
-/// Read frames until at least `want_filled` streams have an outcome, or the
-/// connection ends. Returns whether the connection is still usable.
+/// Read frames until every one of the first `opened` streams has an outcome,
+/// or the connection ends. Returns whether the connection is still usable.
+///
+/// The condition is per slot, not a count: in `Blocks` mode the slot that
+/// matters is the one just opened, and a count could be satisfied by some
+/// other slot (review finding SEC-5).
 async fn read_outcomes(
     stream: &mut dyn ProbeStream,
     reader: &mut FrameReader,
     obs: &mut RawH2Observation,
-    want_filled: usize,
+    opened: usize,
 ) -> Result<bool> {
-    let mut filled = obs
+    while obs
         .streams
         .iter()
-        .filter(|o| **o != StreamOutcome::Timeout)
-        .count();
-    while filled < want_filled {
+        .take(opened)
+        .any(|o| *o == StreamOutcome::Timeout)
+    {
         match reader.next(stream).await? {
             Next::Frame(frame) => match FrameType::from_u8(frame.kind) {
                 Some(FrameType::GoAway) => {
@@ -942,10 +999,11 @@ async fn read_outcomes(
                     return Ok(false);
                 }
                 Some(FrameType::Headers) => {
-                    let status = parse_status_indexed(&frame.payload);
-                    if record(obs, frame.stream, StreamOutcome::Headers { status }) {
-                        filled += 1;
-                    }
+                    // The *block*, not the payload: a `PADDED` or `PRIORITY`
+                    // frame carries bytes in front of it that are not HPACK.
+                    let status = headers_block_fragment(frame.flags, &frame.payload)
+                        .and_then(parse_status_indexed);
+                    record(obs, frame.stream, StreamOutcome::Headers { status }, opened);
                 }
                 Some(FrameType::RstStream) => {
                     if let Some(code) = parse_rst_stream(&frame.payload) {
@@ -954,9 +1012,7 @@ async fn read_outcomes(
                         } else {
                             StreamOutcome::Reset { error_code: code }
                         };
-                        if record(obs, frame.stream, outcome) {
-                            filled += 1;
-                        }
+                        record(obs, frame.stream, outcome, opened);
                     }
                 }
                 // DATA, PING, WINDOW_UPDATE, SETTINGS beyond the first and any
@@ -1055,6 +1111,34 @@ mod tests {
         );
     }
 
+    /// SEC-6: a header's value is the one thing a probe may be carrying that
+    /// must never be printed. `Debug` names the field and sizes the value.
+    #[test]
+    fn raw_header_debug_redacts_the_value() {
+        let shown = format!("{:?}", RawHeader::new("x-token", "secret"));
+        assert_eq!(shown, "x-token=<6 bytes>");
+    }
+
+    /// The redaction holds through every container that prints a header: a
+    /// whole plan is debug-printed by callers and log lines.
+    #[test]
+    fn a_plan_debug_redacts_every_header_value() {
+        let plan = RawH2Plan {
+            target: RawH2Target {
+                scheme: "https".into(),
+                authority: "origin.test".into(),
+            },
+            headers: vec![RawHeader::new("x-token", "secret")],
+            mode: RawH2Mode::Blocks(vec![vec![RawHeader::raw(b"x-other", b"hush")]]),
+            streams: 1,
+        };
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("x-token=<6 bytes>"), "{shown}");
+        assert!(shown.contains("x-other=<4 bytes>"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(!shown.contains("hush"), "{shown}");
+    }
+
     #[test]
     fn encode_integer_uses_the_continuation_form() {
         assert_eq!(encode_integer(1337, 5, 0x20), vec![0x3f, 0x9a, 0x0a]);
@@ -1132,6 +1216,41 @@ mod tests {
         assert_eq!(parse_status_indexed(&[]), None);
     }
 
+    /// SEC-4: the block fragment of a HEADERS payload under every flag
+    /// combination the codec can meet.
+    #[test]
+    fn the_headers_block_fragment_skips_padding_and_priority() {
+        // No flags: the whole payload is the block.
+        assert_eq!(headers_block_fragment(0x00, &[0x88]), Some(&[0x88][..]));
+        // PADDED: one pad-length byte in front, that many bytes behind.
+        assert_eq!(
+            headers_block_fragment(HEADERS_PADDED, &[0x02, 0x8d, 0x00, 0x00]),
+            Some(&[0x8d][..])
+        );
+        // PRIORITY: a 5-byte stream-dependency + weight field in front.
+        assert_eq!(
+            headers_block_fragment(HEADERS_PRIORITY, &[0, 0, 0, 1, 16, 0x8e]),
+            Some(&[0x8e][..])
+        );
+        // Both, together.
+        assert_eq!(
+            headers_block_fragment(
+                HEADERS_PADDED | HEADERS_PRIORITY,
+                &[0x01, 0, 0, 0, 1, 16, 0x89, 0x00]
+            ),
+            Some(&[0x89][..])
+        );
+        // A pad length longer than what is left is malformed.
+        assert_eq!(headers_block_fragment(HEADERS_PADDED, &[0x88, 0x88]), None);
+        // So is a PRIORITY field that does not fit.
+        assert_eq!(
+            headers_block_fragment(HEADERS_PRIORITY, &[0, 0, 0, 1]),
+            None
+        );
+        // And an empty PADDED payload has not even a pad-length byte.
+        assert_eq!(headers_block_fragment(HEADERS_PADDED, &[]), None);
+    }
+
     #[test]
     fn frame_type_round_trips_through_its_wire_byte() {
         assert_eq!(FrameType::from_u8(0x01), Some(FrameType::Headers));
@@ -1165,8 +1284,20 @@ mod driver_tests {
         Reset(u32),
         /// HEADERS whose block is one static-table indexed `:status` byte.
         Status(u8),
+        /// A `PADDED` HEADERS frame: `pad_len` as the pad-length byte, then
+        /// `indexed` as the block, then `padding` bytes of padding. The three
+        /// are independent so a test can script a well-formed padded frame and
+        /// a lying pad length alike.
+        PaddedStatus {
+            pad_len: u8,
+            indexed: u8,
+            padding: u8,
+        },
         /// `GOAWAY(last_stream_id, error_code)`, once, after the first HEADERS.
         GoAway(u32, u32),
+        /// `RST_STREAM(REFUSED_STREAM)` for a *different* stream id than the
+        /// one the HEADERS arrived on, and nothing for that one.
+        ResetOther(u32),
     }
 
     /// What the scripted peer does, and what it saw while doing it.
@@ -1300,6 +1431,20 @@ mod driver_tests {
                                 frame.stream,
                                 &[indexed],
                             )),
+                            Answer::PaddedStatus {
+                                pad_len,
+                                indexed,
+                                padding,
+                            } => {
+                                let mut payload = vec![pad_len, indexed];
+                                payload.extend(std::iter::repeat_n(0u8, padding as usize));
+                                Some(framed(
+                                    FrameType::Headers,
+                                    flags::END_HEADERS | flags::END_STREAM | HEADERS_PADDED,
+                                    frame.stream,
+                                    &payload,
+                                ))
+                            }
                             Answer::GoAway(last, code) if !sent_goaway => {
                                 sent_goaway = true;
                                 let mut payload = last.to_be_bytes().to_vec();
@@ -1307,6 +1452,12 @@ mod driver_tests {
                                 Some(framed(FrameType::GoAway, 0x00, 0, &payload))
                             }
                             Answer::GoAway(..) => None,
+                            Answer::ResetOther(other) => Some(framed(
+                                FrameType::RstStream,
+                                0x00,
+                                other,
+                                &7u32.to_be_bytes(),
+                            )),
                         }
                     }
                     _ => None,
@@ -1466,6 +1617,58 @@ mod driver_tests {
             obs.streams,
             vec![StreamOutcome::Headers { status: Some(200) }]
         );
+    }
+
+    /// SEC-4: a `PADDED` HEADERS frame's first byte is the pad length, not the
+    /// block. Read past it (and the trailing padding) before the status.
+    #[tokio::test]
+    async fn a_padded_headers_frame_is_read_past_its_pad_length() {
+        let (client, dialer, _log) = peer(Script::new(
+            vec![(3, 100)],
+            Answer::PaddedStatus {
+                pad_len: 1,
+                indexed: 0x8d,
+                padding: 1,
+            },
+        ));
+
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: Some(404) }],
+            "the pad-length byte must not be mistaken for the block"
+        );
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    /// SEC-4: a pad length of `0x88` with nothing behind it is a malformed
+    /// frame, not "status 200" — the byte the naive reader would have taken.
+    #[tokio::test]
+    async fn a_lying_pad_length_is_not_read_as_a_status() {
+        let (client, dialer, _log) = peer(Script::new(
+            vec![(3, 100)],
+            Answer::PaddedStatus {
+                pad_len: 0x88,
+                indexed: 0x88,
+                padding: 0,
+            },
+        ));
+
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: None }],
+            "a padded frame whose padding does not fit has no readable status"
+        );
+        assert_eq!(dialer.calls(), 1);
     }
 
     #[tokio::test]
@@ -1811,6 +2014,34 @@ mod driver_tests {
             "each stream carries its own block"
         );
         assert!(log.rst_streams.is_empty(), "no reset pairs in Blocks mode");
+    }
+
+    /// SEC-5: `Blocks` advances only when the stream it just opened has an
+    /// outcome. A peer that resets a stream id the driver never opened fills
+    /// no slot and does not let the next block out early.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_for_an_unopened_stream_neither_fills_a_slot_nor_opens_the_next_block() {
+        // Stream 5 is the third slot: the driver has only opened stream 1.
+        let (client, dialer, log) = peer(Script::new(vec![(3, 100)], Answer::ResetOther(5)));
+
+        let obs = client
+            .probe(&plan(RawH2Mode::Blocks(three_variants()), 3))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Timeout; 3],
+            "a reset for an unopened stream is not an outcome for any slot"
+        );
+        assert!(obs.connection_closed, "the first stream was never answered");
+        assert_eq!(dialer.calls(), 1);
+        settled(&log, |l| l.headers_streams.len() == 1).await;
+        assert_eq!(
+            log.lock().expect("server log").headers_streams,
+            vec![1],
+            "block 2 must not be written while block 1 is unanswered"
+        );
     }
 
     #[tokio::test]

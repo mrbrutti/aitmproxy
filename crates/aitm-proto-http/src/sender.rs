@@ -395,7 +395,7 @@ impl HttpSender {
                     .await
                 {
                     Ok(s) => s,
-                    Err(e) => return Err(handshake_error(e, &authority, &host)),
+                    Err(e) => return Err(handshake_error(e, &authority, &host, &offer)),
                 };
                 let selected = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
                 let negotiated = match selected.as_deref() {
@@ -474,9 +474,22 @@ impl RequestSender for HttpSender {
 }
 
 /// Classify a TLS handshake failure: a `no_application_protocol` alert means
-/// the peer refused every protocol we offered, which for a forced-h2 send is
-/// exactly `h2_not_negotiated`.
-fn handshake_error(err: std::io::Error, authority: &str, host: &str) -> anyhow::Error {
+/// the peer refused every protocol we offered — which is `h2_not_negotiated`
+/// only when `offer` was h2 and nothing else.
+///
+/// `offer` decides it, not the [`VersionPolicy`] alone: a forced `h2`/`h2c`
+/// offers exactly `h2`, and so does an `Auto` send whose ALPN cache already
+/// settled on h2, and both of those really are "this peer will not speak h2".
+/// An offer that carried `http/1.1` — a forced `h1`, or a first `Auto` send —
+/// tells us nothing about h2 in particular, so the alert stays a plain
+/// `TLS to {host}` error rather than being miscounted as a version-negotiation
+/// result (review finding SEC-2).
+fn handshake_error(
+    err: std::io::Error,
+    authority: &str,
+    host: &str,
+    offer: &[&[u8]],
+) -> anyhow::Error {
     let refused = matches!(
         err.get_ref()
             .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
@@ -484,7 +497,8 @@ fn handshake_error(err: std::io::Error, authority: &str, host: &str) -> anyhow::
             rustls::AlertDescription::NoApplicationProtocol
         ))
     );
-    if refused {
+    let asked_only_for_h2 = offer.len() == 1 && offer[0] == ALPN_H2;
+    if refused && asked_only_for_h2 {
         return SendError::H2NotNegotiated {
             authority: authority.to_string(),
             detail: "server refused ALPN h2 (no_application_protocol)".into(),
@@ -1177,6 +1191,44 @@ mod tests {
             sender.negotiated_for("https", "origin.test:443"),
             None,
             "a forced send must never write the ALPN cache"
+        );
+    }
+
+    /// SEC-2: `no_application_protocol` only means "no h2" when h2 is what we
+    /// asked for. A forced **h1** send to a peer that will not speak
+    /// `http/1.1` is a plain TLS failure; calling it `h2_not_negotiated` would
+    /// make the scanner count a protocol refusal as a version-negotiation
+    /// result and retry the wrong thing.
+    #[tokio::test]
+    async fn forced_h1_refused_by_alpn_is_not_h2_not_negotiated() {
+        let (sender, mut results, logs, _dialer) = tls_sends(&[b"h2"], VersionPolicy::H1, 1).await;
+        assert_eq!(logs[0].alpn, vec!["http/1.1".to_string()]);
+        let err = results.remove(0).expect_err("forced h1 cannot be served");
+        assert!(
+            !err.to_string().starts_with("h2_not_negotiated:"),
+            "error was {err}"
+        );
+        assert!(!is_h2_not_negotiated(&err), "error was {err}");
+        assert!(
+            err.to_string().starts_with("TLS to origin.test"),
+            "error was {err}"
+        );
+        assert_eq!(sender.negotiated_for("https", "origin.test:443"), None);
+    }
+
+    /// The same alert under `Auto`: the sender offered both protocols, so a
+    /// peer that refused them both has not told us anything about h2 in
+    /// particular.
+    #[tokio::test]
+    async fn an_auto_send_refused_by_alpn_is_not_h2_not_negotiated() {
+        let (_sender, mut results, logs, _dialer) =
+            tls_sends(&[b"spdy/3"], VersionPolicy::Auto, 1).await;
+        assert_eq!(logs[0].alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+        let err = results.remove(0).expect_err("neither protocol is served");
+        assert!(!is_h2_not_negotiated(&err), "error was {err}");
+        assert!(
+            err.to_string().starts_with("TLS to origin.test"),
+            "error was {err}"
         );
     }
 

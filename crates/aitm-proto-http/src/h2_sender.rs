@@ -180,7 +180,18 @@ async fn handshake(stream: Box<dyn ProbeStream>, key: &str) -> Result<SendReques
     let label = key.to_string();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::warn!("h2 connection to {label} ended with error: {e}");
+            // Never the error's `Display`: for a peer-sent GOAWAY it appends
+            // the frame's opaque debug data, which is peer-controlled text
+            // (review finding SEC-7). A classification is all an operator
+            // needs, and it belongs at `debug` — a peer ending its own
+            // connection is not a fault of ours.
+            tracing::debug!(
+                peer = %label,
+                go_away = e.is_go_away(),
+                reset = e.is_reset(),
+                reason = ?e.reason(),
+                "h2 connection ended with an error"
+            );
         }
     });
     Ok(send_req)
@@ -1045,6 +1056,143 @@ mod tests {
             seen.lock().expect("seen").len(),
             1,
             "no stream was opened for the refused send"
+        );
+        drop(sender);
+        origin.abort();
+    }
+
+    /// Captures this crate's own tracing events on the current thread. A local
+    /// copy: `module.rs`'s equivalent lives in its private test module.
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    struct Fields(String);
+
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push_str(&format!(" {}={value}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            // Only this crate's own events: the `h2` crate's internal tracing
+            // is not ours to police.
+            if !event.metadata().target().starts_with("aitm_proto_http") {
+                return;
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("events")
+                .push((*event.metadata().level(), fields.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A plaintext h2 peer that answers the preface with SETTINGS and then, on
+    /// the first thing the client writes, a `GOAWAY(INTERNAL_ERROR)` carrying
+    /// `debug_data`. It never hangs up, so the client's connection error is the
+    /// GOAWAY and not an EOF.
+    async fn goaway_h2_origin(mut io: DuplexStream, debug_data: &'static [u8]) {
+        use crate::raw_h2::{frame_header, FrameType, PREFACE};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut preface = vec![0u8; PREFACE.len()];
+        if io.read_exact(&mut preface).await.is_err() {
+            return;
+        }
+        if io
+            .write_all(&frame_header(0, FrameType::Settings, 0x00, 0))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut buf = vec![0u8; 4096];
+        if io.read(&mut buf).await.is_err() {
+            return;
+        }
+        let mut payload = 0u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(&2u32.to_be_bytes());
+        payload.extend_from_slice(debug_data);
+        let len = u32::try_from(payload.len()).expect("a test frame fits in 24 bits");
+        let mut out = frame_header(len, FrameType::GoAway, 0x00, 0).to_vec();
+        out.extend_from_slice(&payload);
+        if io.write_all(&out).await.is_err() {
+            return;
+        }
+        let _ = io.flush().await;
+        std::future::pending::<()>().await;
+    }
+
+    /// SEC-7: the opaque debug data on a peer's GOAWAY is peer-controlled text
+    /// (`h2::Error`'s `Display` appends it). The connection task logs a
+    /// classification at `debug`, never that string.
+    #[tokio::test]
+    async fn a_peer_goaway_debug_blob_never_reaches_the_log() {
+        const BLOB: &[u8] = b"goaway-debug-token-7b31";
+
+        let capture = LogCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+
+        let (client, server) = duplex(64 * 1024);
+        let origin = tokio::spawn(goaway_h2_origin(server, BLOB));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = sender_with(dialer.clone());
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a peer that answers GOAWAY serves no response");
+
+        // The connection task logs from its own task; wait for its event.
+        let mut logged = Vec::new();
+        for _ in 0..10_000 {
+            logged = events.lock().expect("events").clone();
+            if !logged.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !logged.is_empty(),
+            "the connection task logged nothing at all"
+        );
+        assert!(
+            !format!("{logged:?}").contains("goaway-debug-token"),
+            "the peer's GOAWAY debug data reached the log: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .all(|(level, _)| *level <= tracing::Level::DEBUG),
+            "a peer-triggered connection end is not warn-worthy: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|(_, fields)| fields.contains("go_away=true")),
+            "the classification must say it was a GOAWAY: {logged:?}"
         );
         drop(sender);
         origin.abort();
