@@ -6,8 +6,11 @@
 //! args → open the audit log (failure ⇒ refuse) → policy gate → load `ca.crt`
 //! → platform → scope → store op (through `DryRunExecutor` when `dry_run`) →
 //! audit record → `tracing` → result. No subprocess runs before the gate
-//! passes. `ca.export` has the same shape without the gate and platform
-//! steps; `ca.status` is read-only and not audited.
+//! passes. Policy gate (spec §D17.2): refused from an agent frontend (MCP)
+//! unless `ca.allow_agent_install` is set; the CLI and an operator-token
+//! connection (a present human) are not gated. `ca.export` has the same
+//! shape without the gate and platform steps; `ca.status` is read-only and
+//! not audited.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -177,11 +180,12 @@ fn no_cert_message(path: &Path) -> String {
     )
 }
 
-/// The frontend as the audit log names it. A frontend that is not the human
-/// CLI is agent-driven for every purpose here (the gated posture).
+/// The frontend as the audit log names it. A variant that is neither the
+/// human CLI nor an operator-token connection is agent-driven here.
 fn frontend_label(frontend: Frontend) -> &'static str {
     match frontend {
         Frontend::Cli => "cli",
+        Frontend::Operator => "operator",
         _ => "mcp",
     }
 }
@@ -376,10 +380,11 @@ fn location_for(platform: &Platform, scope: Scope, exec: &dyn Executor) -> Optio
     }
 }
 
-/// The `TrustErrorKind` behind an error, for the failure log line.
-fn kind_name(err: &anyhow::Error) -> String {
+/// The `TrustErrorKind` behind an error, for the failure log line
+/// (`TrustErrorKind::label`); `"Other"` when it is not a `TrustError`.
+fn kind_name(err: &anyhow::Error) -> &'static str {
     err.downcast_ref::<TrustError>()
-        .map_or_else(|| "Other".to_string(), |e| format!("{:?}", e.kind))
+        .map_or("Other", |e| e.kind.label())
 }
 
 // ---------------------------------------------------------------------------
@@ -723,9 +728,10 @@ impl Op {
             "{what} (macOS keychain via `security`, Linux ca-certificates anchors, Windows Root \
              store via certutil); {effect}. Idempotent; identifies the certificate by \
              fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless \
-             ca.allow_agent_install is set in the aitmproxy config; dry_run is always allowed \
-             and lists the commands that would run. The embedded obscura browser does not use \
-             the OS store (it trusts the CA through --ca-cert) and is unaffected."
+             ca.allow_agent_install is set; the CLI and an operator-token connection (a \
+             present human) are not gated. dry_run is never gated by `ca.allow_agent_install` \
+             and lists the commands that would run. The embedded obscura browser does not use the OS store (it \
+             trusts the CA through --ca-cert) and is unaffected."
         )
     }
 
@@ -771,35 +777,70 @@ struct Change {
 
 impl Change {
     /// The scope to act on: the one asked for if the platform has it, else
-    /// the platform's least-privileged one.
-    fn resolve_scope(platform: &Platform, wanted: Option<Scope>) -> Result<Scope, TrustError> {
-        match wanted {
-            Some(scope) if platform.scopes().contains(&scope) => Ok(scope),
-            Some(scope) => Err(TrustError::new(
-                TrustErrorKind::UnsupportedScope,
-                match platform {
-                    Platform::Linux(_) => {
-                        "Linux has no per-user OS trust store; use --scope system".to_string()
-                    }
-                    other => format!(
-                        "scope {scope} is not available on {}; use one of {}",
-                        other.label(),
-                        other
-                            .scopes()
-                            .iter()
-                            .map(Scope::label)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                },
-            )),
+    /// the platform's least-privileged one. Where a user scope exists, the
+    /// System keychain is the terminal's alone (spec D17.1, D17.14): a bus
+    /// client never makes the core spawn `sudo`, so any other frontend asking
+    /// for it is refused here with one WARN. Linux has only the system scope
+    /// and is unchanged (D17.13).
+    fn resolve_scope(
+        &self,
+        platform: &Platform,
+        wanted: Option<Scope>,
+        frontend: Frontend,
+    ) -> Result<Scope, TrustError> {
+        let scope = match wanted {
+            Some(scope) if platform.scopes().contains(&scope) => scope,
+            Some(scope) => {
+                return Err(TrustError::new(
+                    TrustErrorKind::UnsupportedScope,
+                    match platform {
+                        Platform::Linux(_) => {
+                            "Linux has no per-user OS trust store; use --scope system".to_string()
+                        }
+                        other => format!(
+                            "scope {scope} is not available on {}; use one of {}",
+                            other.label(),
+                            other
+                                .scopes()
+                                .iter()
+                                .map(Scope::label)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    },
+                ))
+            }
             None => platform.default_scope().ok_or_else(|| {
                 TrustError::new(
                     TrustErrorKind::UnsupportedPlatform,
                     format!("no trust store on {}", platform.label()),
                 )
-            }),
+            })?,
+        };
+        if scope == Scope::System
+            && frontend != Frontend::Cli
+            && platform.scopes().contains(&Scope::User)
+        {
+            let refusal = TrustError::new(
+                TrustErrorKind::UnsupportedScope,
+                format!(
+                    "system scope needs a terminal: run `aitm ca {} --scope system` yourself; \
+                     the app and the bus clients use the login keychain",
+                    self.op.verb()
+                ),
+            );
+            warn!(
+                target: "aitm_ca",
+                command = self.op.name(),
+                frontend = frontend_label(frontend),
+                scope = scope.label(),
+                platform = platform.label(),
+                kind = refusal.kind.label(),
+                "refused: the System keychain is reachable from the CLI only"
+            );
+            return Err(refusal);
         }
+        Ok(scope)
     }
 }
 
@@ -821,14 +862,16 @@ impl Command for Change {
                     "scope",
                     TypeDesc::Str,
                     false,
-                    "user | system. Default: user on macOS and Windows, system on Linux.",
+                    "user | system. Default: user on macOS and Windows (the login keychain / \
+                     CurrentUser store; the OS shows its own authentication dialog), system \
+                     on Linux (needs root).",
                 ),
                 param(
                     "dry_run",
                     TypeDesc::Bool,
                     false,
                     "Run the read-only queries and list the mutating commands without running \
-                     them. Never gated.",
+                     them. Never gated by `ca.allow_agent_install`.",
                 ),
             ],
             TypeDesc::Object(vec![
@@ -892,9 +935,10 @@ impl Command for Change {
             fingerprint_sha256: None,
         };
 
-        // The policy gate. Nothing runs on the host before it passes; the
-        // fingerprint for the record comes from ca.crt alone.
-        if frontend != Frontend::Cli && !args.dry_run && !shared.cfg.allow_agent_install {
+        // The policy gate (spec §D17.2): only an autonomous agent is gated.
+        // Nothing runs on the host before it passes; the fingerprint for the
+        // record comes from ca.crt alone.
+        if !frontend.is_trusted_control() && !args.dry_run && !shared.cfg.allow_agent_install {
             audit.fingerprint_sha256 = CaCert::load(&shared.cfg.dir, shared.exec())
                 .ok()
                 .flatten()
@@ -927,7 +971,9 @@ impl Command for Change {
             ));
         }
 
-        let scope = Self::resolve_scope(&platform, args.scope).map_err(|e| audit.fail(e.into()))?;
+        let scope = self
+            .resolve_scope(&platform, args.scope, frontend)
+            .map_err(|e| audit.fail(e.into()))?;
         audit.scope = Some(scope.label().to_string());
 
         let store = store_for(&platform);
@@ -949,7 +995,7 @@ impl Command for Change {
                     fingerprint_sha256 = fingerprint.as_str(),
                     scope = scope.label(),
                     platform = platform.label(),
-                    kind = kind_name(&err).as_str(),
+                    kind = kind_name(&err),
                     error = format!("{err:#}").as_str(),
                     "OS trust store change failed"
                 );
@@ -994,7 +1040,9 @@ impl Command for Change {
     /// The question a human frontend asks first. `None` for a dry run, when
     /// there is no `ca.crt`, or when `invoke` would fail on the platform or
     /// scope anyway (it then fails with the clear error). Reads `ca.crt`
-    /// only; runs nothing.
+    /// only; runs nothing. The prompt has no frontend, so the scope is
+    /// resolved as the CLI's would be (plan correction 16: a non-CLI
+    /// `system` request is prompted, then refused by `invoke`).
     fn confirm_prompt(&self, args: &Params) -> Option<String> {
         let shared = &*self.shared;
         let args = ChangeArgs::parse(args).ok()?;
@@ -1003,7 +1051,9 @@ impl Command for Change {
         }
         let cert = CaCert::load(&shared.cfg.dir, shared.exec()).ok()??;
         let platform = shared.platform();
-        let scope = Self::resolve_scope(&platform, args.scope).ok()?;
+        let scope = self
+            .resolve_scope(&platform, args.scope, Frontend::Cli)
+            .ok()?;
         let location = location_for(&platform, scope, shared.exec())?;
         Some(self.op.prompt(&cert.fingerprint_sha256(), &location, scope))
     }

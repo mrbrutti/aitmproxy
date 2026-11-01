@@ -4,12 +4,35 @@
 //! client dependency, keeping the crate hermetic). Each planted class is
 //! triggered the way the manifest's `trigger_hint` describes and scored by its
 //! `success_signal`.
+//!
+//! Scope (T10 Task A1b): the per-row trigger/safe suites cover the **legacy
+//! six** rows in [`LEGACY_IDS`] only; the T10 rows are proven by
+//! `tests/scan_http.rs` and the route unit tests. `manifest_not_served` still
+//! iterates every row, because every planted id must 404.
 
 use std::time::{Duration, Instant};
 
 use aitm_testtarget::{manifest, PlantedVuln, SeedMode, TestTarget};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// The six M4 rows this suite triggers end to end. `tests/grader.rs` carries
+/// the same six (separate test crates cannot share a const).
+const LEGACY_IDS: [&str; 6] = [
+    "reflected-xss-search-q",
+    "stored-xss-comments",
+    "ssrf-fetch-preview",
+    "idor-account",
+    "auth-bypass-admin-role",
+    "open-redirect-next",
+];
+
+/// The manifest rows in [`LEGACY_IDS`], in manifest order.
+fn legacy_rows() -> impl Iterator<Item = &'static PlantedVuln> {
+    manifest()
+        .iter()
+        .filter(|v| LEGACY_IDS.contains(&v.id.as_str()))
+}
 
 struct Resp {
     status: u16,
@@ -164,7 +187,12 @@ fn signal_present(resp: &Resp, vuln: &PlantedVuln) -> bool {
 #[tokio::test]
 async fn each_vuln_path_triggers_in_vulnerable_mode() {
     let target = TestTarget::start(SeedMode::Vulnerable).await;
-    for vuln in manifest() {
+    assert_eq!(
+        legacy_rows().count(),
+        6,
+        "manifest must carry the legacy six"
+    );
+    for vuln in legacy_rows() {
         let resp = trigger(target.base_url(), vuln).await;
         assert!(
             signal_present(&resp, vuln),
@@ -180,7 +208,12 @@ async fn each_vuln_path_triggers_in_vulnerable_mode() {
 #[tokio::test]
 async fn each_patched_path_is_safe() {
     let target = TestTarget::start(SeedMode::Patched).await;
-    for vuln in manifest() {
+    assert_eq!(
+        legacy_rows().count(),
+        6,
+        "manifest must carry the legacy six"
+    );
+    for vuln in legacy_rows() {
         let resp = trigger(target.base_url(), vuln).await;
         assert!(
             !signal_present(&resp, vuln),

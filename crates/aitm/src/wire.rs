@@ -119,6 +119,45 @@ impl Default for Features {
     }
 }
 
+/// Every scanner v2 lane the build has, in lane order (spec D1).
+///
+/// Each lane crate owns a `lane()` entry point returning `Option<Arc<dyn Lane>>`;
+/// this is the one place that calls them, so a lane track lands by filling its own
+/// crate and edits no shared file ("Registration without shared files"). A slot
+/// that answers `None` — every slot while its track is unimplemented — is skipped,
+/// and `scan.start` refuses that lane with `lane_unavailable`.
+///
+/// The two L4 slots are called with the shared guard and flow store from
+/// [`Features::l4_shared`], so a scanner L4 case acts over the same L4 engagement
+/// state the `l4.*` verbs and the scripting language do. When L4 is disabled `l4`
+/// is `None` and both handles are passed as `None`; a landed L4 lane still returns
+/// `Some` then, so the refusal is `refused_l4` rather than `lane_unavailable`
+/// (spec D3's refusal order).
+#[must_use]
+pub fn collect_lanes(l4: Option<&L4Shared>) -> Vec<Arc<dyn aitm_scan_model::Lane>> {
+    let guard = l4.map(|shared| shared.guard.clone());
+    let store = l4.map(|shared| shared.store.clone());
+    [
+        aitm_scan_http::lane(),
+        aitm_scan_ws::lane(),
+        aitm_scan_l4_packet::lane(guard.clone(), store.clone()),
+        aitm_scan_l4_stream::lane(guard, store),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The native (compiled-in) scanner v2 checks this build ships (spec D1).
+///
+/// `aitm-scan-checks-http` contributes checks to the HTTP lane's catalogue rather
+/// than a second lane, so its slot is `checks()`, not `lane()`. Empty until track
+/// T3 lands.
+#[must_use]
+pub fn collect_native_checks() -> Vec<Arc<dyn aitm_scan_model::Check>> {
+    aitm_scan_checks_http::checks()
+}
+
 /// A built proxy and the CA it serves with.
 pub struct Assembled {
     pub proxy: Proxy,
@@ -357,11 +396,18 @@ pub fn assemble_with_scripts(
         cfg.maps.allow_agent_authoring,
         map_guard.clone(),
     );
+    // The passthrough module decides "pinned or not in Scope" per connection (spec
+    // D1/D2) against the same live guard, through the same late-bound pattern:
+    // bound to the proxy's real guard right after `build`, before anything is
+    // served. Until bound it reports nothing in scope, so the module would tunnel
+    // everything (deny-by-default) rather than decrypt it.
+    let tunnel_guard = Arc::new(LateGuard::default());
 
     let mut builder = Proxy::builder().with_config(cfg.clone());
     // Protocol modules, in registration order (first match claims the connection):
-    // PassthroughModule before HttpModule so a pinned host tunnels past MITM.
-    for module in ordered_modules(http, passthrough_list, inject) {
+    // PassthroughModule before HttpModule so a pinned or out-of-scope host tunnels
+    // past MITM.
+    for module in ordered_modules(http, passthrough_list, inject, tunnel_guard.clone()) {
         builder = builder.register_module(module);
     }
     // The `capture.status` handle: the writer leaves in `Assembled` for the macOS
@@ -379,9 +425,14 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(MetaPlugin::new()))
         // The deterministic scanner's command set (scan.discover): a command-only
         // provider that observes no events. Stage 1 uses the default budgets.
-        .register_plugin(Box::new(aitm_plugin_scanner::ScannerPlugin::new(
-            aitm_plugin_scanner::ScannerConfig::default(),
-        )))
+        // Scanner v2 lane slots, spec D1: the lanes and native checks this build
+        // has are collected here and handed over. The shipped engine ignores
+        // them; the v2 engine (track T1b) consumes them.
+        .register_plugin(Box::new(
+            aitm_plugin_scanner::ScannerPlugin::new(aitm_plugin_scanner::ScannerConfig::default())
+                .with_lanes(collect_lanes(features.l4_shared.as_ref()))
+                .with_native_checks(collect_native_checks()),
+        ))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
         .register_plugin(Box::new(
@@ -500,10 +551,11 @@ pub fn assemble_with_scripts(
     }
 
     let proxy = builder.build()?;
-    // Bind the late guard to the proxy's real guard before anything is served, so
-    // Map Remote's `check_active` rides the same scope/rate guard the client path
-    // and every other command enforce.
+    // Bind the late guards to the proxy's real guard before anything is served, so
+    // Map Remote's `check_active` and the passthrough module's `in_scope` ride the
+    // same scope/rate guard the client path and every other command enforce.
     map_guard.bind(proxy.guard());
+    tunnel_guard.bind(proxy.guard());
 
     // The protocol-general capture ingress (L4OPS-AC17). Its stream/TCP half is wired
     // for **every** build, from the live proxy's shared module list, flow store, event
@@ -575,30 +627,33 @@ pub fn build_capture_session(
 }
 
 /// The protocol modules in registration order. [`PassthroughModule`] is **first**
-/// so its SNI/CONNECT-authority match wins over [`HttpModule`] for a pinned host
-/// (the acceptor picks the first module whose `matches` returns true); then
-/// `HttpModule` (MITM for every other host), then [`WsModule`] (post-upgrade
-/// only), sharing the `inject` registry [`WsCtlPlugin`] holds so `ws.send` reaches
-/// a live conversation. One source of module order for [`assemble_with_scripts`]
-/// and the wiring test.
+/// so its tunnel-authority match wins over [`HttpModule`] for a pinned or
+/// out-of-scope host (the acceptor picks the first module whose `matches` returns
+/// true); then `HttpModule` (MITM for every in-scope host), then [`WsModule`]
+/// (post-upgrade only), sharing the `inject` registry [`WsCtlPlugin`] holds so
+/// `ws.send` reaches a live conversation. `scope` is the live scope guard the
+/// passthrough module decides "in Scope" on (spec D1/D2). One source of module
+/// order for [`assemble_with_scripts`] and the wiring test.
 pub fn ordered_modules(
     http: HttpModule,
     passthrough: PassthroughList,
     inject: InjectRegistry,
+    scope: Arc<dyn ScopeRateGuard>,
 ) -> Vec<Arc<dyn ProtocolModule>> {
     vec![
-        Arc::new(PassthroughModule::new(passthrough)),
+        Arc::new(PassthroughModule::new(passthrough).with_scope(scope)),
         Arc::new(http),
         Arc::new(WsModule::new().with_inject_registry(inject)),
     ]
 }
 
-/// A [`ScopeRateGuard`] handle Map Remote can hold before the proxy (and thus its
-/// guard) exists. The guard is created inside `Proxy::build`; this forwards to it
-/// once [`bind`](LateGuard::bind) is called (immediately after build, before
-/// serving). Unbound it refuses every active check — a guard that cannot check
-/// must not permit (deny-by-default). Mirrors `scripts::LateHandles`' guard facet
-/// without pulling in its store/client/browser facets.
+/// A [`ScopeRateGuard`] handle Map Remote and the passthrough module can hold
+/// before the proxy (and thus its guard) exists. The guard is created inside
+/// `Proxy::build`; this forwards to it once [`bind`](LateGuard::bind) is called
+/// (immediately after build, before serving). Unbound it refuses every active
+/// check and reports nothing in scope — a guard that cannot check must not permit
+/// (deny-by-default). Mirrors `scripts::LateHandles`' guard facet without pulling
+/// in its store/client/browser facets.
 #[derive(Default)]
 struct LateGuard(OnceLock<Arc<dyn ScopeRateGuard>>);
 
@@ -963,6 +1018,28 @@ mod tests {
         cfg.ca.dir = temp_ca_dir("l4-guard-off");
         let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
         assert!(disabled.l4_guard.is_none());
+    }
+
+    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
+    /// a skeleton slot returning `None` is skipped rather than collected. Two lanes
+    /// have landed: T4 (`aitm-scan-ws`) and T5 (`aitm-scan-l4-packet`, which returns
+    /// `Some` even without the L4 handles, call A18); the remaining slots are still
+    /// skeletons, and with the L4 handles present the stream slot is still called
+    /// and still contributes nothing. Each lane track's landing bumps these
+    /// literals; that track re-pins this test.
+    #[test]
+    fn lane_slots_count_the_landed_lanes() {
+        assert_eq!(collect_lanes(None).len(), 2);
+        assert_eq!(collect_native_checks().len(), 0);
+
+        let shared = L4Shared {
+            guard: Arc::new(L4Guard::new(&L4Config {
+                enabled: true,
+                ..L4Config::default()
+            })),
+            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+        };
+        assert_eq!(collect_lanes(Some(&shared)).len(), 2);
     }
 
     /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use aitm_core::{
     Body, Config, Event, Flow, FlowCtx, FlowStore, HttpFlow, Plugin, Proxy, ScopeConfig,
-    ScopeEntry, Verdict,
+    ScopeEntry, TunnelInfo, Verdict,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
 use rustls::pki_types::pem::PemObject;
@@ -309,12 +309,13 @@ async fn response_body_capped_in_store() {
     }
 }
 
-/// The first captured HTTP flow that has a response, waiting briefly for it.
+/// The first captured request flow that has a response, waiting briefly for it.
+/// The `CONNECT` that carried it is its own tunnel row (spec D5) and is skipped.
 async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let found = store.list().into_iter().find_map(|id| match store.get(id) {
-            Some(Flow::Http(f)) if f.response.is_some() => Some(f),
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_none() && f.response.is_some() => Some(f),
             _ => None,
         });
         if let Some(flow) = found {
@@ -323,6 +324,30 @@ async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
         assert!(Instant::now() < deadline, "no completed HttpFlow captured");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The stored request flows: every `HttpFlow` that is not a tunnel row.
+fn request_flows(store: &dyn FlowStore) -> Vec<HttpFlow> {
+    store
+        .list()
+        .into_iter()
+        .filter_map(|id| match store.get(id) {
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_none() => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The stored tunnel rows (`CONNECT`, spec D5), oldest first.
+fn tunnel_rows(store: &dyn FlowStore) -> Vec<HttpFlow> {
+    store
+        .list()
+        .into_iter()
+        .filter_map(|id| match store.get(id) {
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_some() => Some(f),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,6 +375,15 @@ async fn https_get_captured() {
         ),
         other => panic!("captured body was {other:?}, want Bytes"),
     }
+
+    // Spec D5: the CONNECT that carried the request is its own row, decrypted.
+    let rows = tunnel_rows(store.as_ref());
+    assert_eq!(rows.len(), 1, "one tunnel row for the one CONNECT");
+    assert_eq!(rows[0].request.method, "CONNECT");
+    assert_eq!(rows[0].request.authority, upstream.to_string());
+    assert_eq!(rows[0].metadata.tunnel, Some(TunnelInfo::decrypted()));
+    assert_eq!(rows[0].response.as_ref().map(|r| r.status), Some(200));
+    assert!(!rows[0].metadata.passive);
 }
 
 /// Adds `X-Aitm: on` to every request as it passes the chain.
@@ -425,14 +459,25 @@ async fn paused_capture_forwards_but_hides_the_flow() {
     // The 200 above is the real regression guard: under the old drop-on-insert bug
     // the module's post-dispatch `get` missed the flow and bailed, breaking the
     // connection. The flow is hidden from the operator's view while paused.
-    assert_eq!(store.count(), 0, "paused capture must not show the flow");
+    assert_eq!(
+        store.count(),
+        0,
+        "paused capture must not show the flow, nor the tunnel row that carried it"
+    );
     assert!(store.list().is_empty());
 
-    // Resume: the next request is recorded and visible.
+    // Resume: the next request is recorded and visible, with its tunnel row.
     store.set_capturing(true);
     let (status, _body) = https_get(proxy, upstream, "/hello", ca.root_cert_pem()).await;
     assert_eq!(status, 200);
     let flow = wait_for_flow(store.as_ref()).await;
     assert_eq!(flow.request.path, "/hello");
-    assert_eq!(store.count(), 1, "resumed capture shows exactly one flow");
+    assert_eq!(
+        request_flows(store.as_ref()).len(),
+        1,
+        "resumed capture shows exactly one request flow"
+    );
+    let rows = tunnel_rows(store.as_ref());
+    assert_eq!(rows.len(), 1, "and the one CONNECT that carried it");
+    assert_eq!(rows[0].metadata.tunnel, Some(TunnelInfo::decrypted()));
 }

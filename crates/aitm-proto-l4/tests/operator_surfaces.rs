@@ -321,6 +321,99 @@ fn inject_confirm_prompt_in_scope_some_out_of_scope_none() {
     );
 }
 
+// ---- L4PAR-AC5/AC6: operator scope add skips the widen gate; agents do not -----
+
+/// The AC5 `l4.scope.add` arguments (spec L4PAR-AC5).
+fn scope_add_params() -> Params {
+    let mut m = BTreeMap::new();
+    m.insert("cidr".to_string(), Value::Str("127.0.0.1/32".into()));
+    m.insert("ports".to_string(), Value::Str("9100-9199".into()));
+    m.insert("interface".to_string(), Value::Str("lo0".into()));
+    m.insert("direction".to_string(), Value::Str("inbound".into()));
+    m.insert("capability".to_string(), Value::Str("capture".into()));
+    Params::new(m)
+}
+
+/// The scope list as (id, source) pairs, in list order.
+fn scope_sources(reg: &Registry, parts: &Parts) -> Vec<(String, String)> {
+    let listed = reg
+        .command("l4.scope.list")
+        .unwrap()
+        .invoke(Params::default(), &parts.host(Frontend::Operator))
+        .expect("l4.scope.list ok");
+    let Value::Array(entries) = listed else {
+        panic!("l4.scope.list returns an array, got {listed:?}");
+    };
+    entries
+        .iter()
+        .map(|e| {
+            let Value::Object(o) = e else {
+                panic!("entry is an object, got {e:?}");
+            };
+            let s = |k: &str| match o.get(k) {
+                Some(Value::Str(v)) => v.clone(),
+                other => panic!("`{k}` is a string, got {other:?}"),
+            };
+            (s("id"), s("source"))
+        })
+        .collect()
+}
+
+/// L4PAR-AC5 / AC6 (plan A6) — with the widen gate OFF, `l4.scope.add` invoked by
+/// trusted control (`Frontend::Operator`, then `Frontend::Cli`) adds the entry and
+/// the list reports it with `source: "runtime"`; the same call from `Frontend::Mcp`
+/// is refused with the exact widen text and the list is unchanged.
+#[test]
+fn operator_scope_add_skips_widen_gate() {
+    let cfg = cfg_with_inject_scope();
+    assert!(!cfg.allow_agent_widen, "the widen gate starts off");
+    let reg = registry(&cfg);
+    let parts = Parts::new();
+    let add = reg.command("l4.scope.add").unwrap();
+
+    let before = scope_sources(&reg, &parts);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1, "config");
+
+    // Operator: added, Runtime provenance.
+    let out = add
+        .invoke(scope_add_params(), &parts.host(Frontend::Operator))
+        .expect("an operator add skips the widen gate");
+    let Value::Str(op_id) = out else {
+        panic!("l4.scope.add returns the id string, got {out:?}");
+    };
+    let after_op = scope_sources(&reg, &parts);
+    assert_eq!(after_op.len(), 2);
+    assert_eq!(after_op[1], (op_id.clone(), "runtime".to_string()));
+
+    // CLI: also trusted control, also added.
+    let out = add
+        .invoke(scope_add_params(), &parts.host(Frontend::Cli))
+        .expect("a CLI add skips the widen gate");
+    let Value::Str(cli_id) = out else {
+        panic!("l4.scope.add returns the id string, got {out:?}");
+    };
+    assert_ne!(cli_id, op_id, "each add mints its own id");
+    let after_cli = scope_sources(&reg, &parts);
+    assert_eq!(after_cli.len(), 3);
+    assert_eq!(after_cli[2], (cli_id, "runtime".to_string()));
+
+    // Agent: refused by the widen gate with the exact text; nothing added.
+    let err = add
+        .invoke(scope_add_params(), &parts.host(Frontend::Mcp))
+        .expect_err("an agent add is refused while widen is off");
+    assert_eq!(
+        format!("{err:#}"),
+        "runtime L4 scope widening is disabled; declare scope in the `l4.scope` config \
+         block or set `l4.allow_agent_widen`"
+    );
+    assert_eq!(
+        scope_sources(&reg, &parts),
+        after_cli,
+        "a refused agent add leaves the list unchanged"
+    );
+}
+
 // ---- AC11: operator-only l4.agent.set / l4.agent.status -----------------------
 
 /// AC11 backing — the operator toggles a gate and `l4.agent.status` reflects it; an

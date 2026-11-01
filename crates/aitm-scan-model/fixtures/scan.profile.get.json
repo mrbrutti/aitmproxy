@@ -1,0 +1,93 @@
+{
+  "name": "standard",
+  "target": {
+    "origins": [],
+    "l4": []
+  },
+  "lanes": [
+    "http",
+    "ws"
+  ],
+  "intensity": "medium",
+  "speed": "normal",
+  "accuracy": "normal",
+  "checks": {
+    "include": [],
+    "exclude": []
+  },
+  "crawl": {
+    "strategy": "normal",
+    "max_depth": 3,
+    "max_pages": 200,
+    "submit_forms": true,
+    "click_handlers": true,
+    "robots": true,
+    "sitemap": true,
+    "use_browser": "auto"
+  },
+  "audit": {
+    "kinds": [
+      "query",
+      "body_param",
+      "json_value",
+      "xml_value",
+      "xml_attr",
+      "multipart_value",
+      "multipart_filename",
+      "header",
+      "cookie",
+      "path_segment",
+      "path_filename",
+      "param_name_query",
+      "param_name_body",
+      "entire_body",
+      "ws_json_value",
+      "ws_text",
+      "ws_form_param",
+      "ws_binary",
+      "ws_handshake_header",
+      "l4_field"
+    ],
+    "ignore": [
+      {
+        "kind": null,
+        "name_regex": null,
+        "trait": "session"
+      }
+    ],
+    "max_points_per_request": 64,
+    "frequent_point_threshold": 8
+  },
+  "session": {
+    "mode": "observed",
+    "from_flow": null,
+    "on_lost": "stop"
+  },
+  "budget": {
+    "probes": 2000,
+    "time_s": 600,
+    "max_issues": 1024,
+    "check_timeout_s": 60,
+    "per_host_errors": {
+      "consecutive": 10,
+      "ratio": 0.5
+    }
+  },
+  "http": {
+    "version": "auto",
+    "record_probes": "issues_only"
+  },
+  "ws": {
+    "reply_window_ms": 1500,
+    "max_frame_bytes": 1048576
+  },
+  "l4": {
+    "cases": 500,
+    "reproduce_count": 3,
+    "liveness_every": 25,
+    "consecutive_timeouts": 20,
+    "max_bytes_per_s": 65536,
+    "seeds": [],
+    "dry_run": false
+  }
+}

@@ -1,6 +1,6 @@
 ---
 name: aitmproxy-overview
-description: Drive aitmproxy — the intercepting HTTP/WebSocket proxy for AUTHORIZED security testing — end to end over MCP. Use when the user wants to inspect captured web traffic, intercept and mutate live requests or responses, replay or craft requests, or build reproducible PoCs and record findings against an engagement they are authorized to test. Explains the capture → intercept → replay → findings workflow, names the key MCP tools per stage, the scope gating and agent policy, the raw L4 (TCP/UDP) packet family and its status/scope/gate rules when the core enables it, and how output renders across hosts.
+description: Drive aitmproxy — the intercepting HTTP/WebSocket proxy for AUTHORIZED security testing — end to end over MCP. Use when the user wants to inspect captured web traffic, intercept and mutate live requests or responses, replay or craft requests, or build reproducible PoCs and record findings against an engagement they are authorized to test. Explains the capture → intercept → replay → findings workflow, names the key MCP tools per stage, the scope gating and agent policy, the per-host decryption model (Scope is the decryption list; every CONNECT is a row), the raw L4 (TCP/UDP) packet family and its status/scope/gate rules when the core enables it, and how output renders across hosts.
 ---
 
 # aitmproxy overview
@@ -19,6 +19,37 @@ authorized to test. Active tools (`flow.replay`, `request.send`, `ws.send`,
 target host is in the active scope (`scope.list` / `scope.add`). Narrowing scope
 is always allowed; widening from an agent frontend is refused unless the operator
 enabled it. Never use these tools to reach systems outside your authorization.
+
+### Scope is the decryption list
+
+The proxy decrypts TLS only for hosts in Scope and tunnels every other HTTPS
+connection untouched; an empty Scope decrypts nothing. `proxy.status` then
+reports `decrypt.decrypting: false` and `decrypt.advice: "Nothing is decrypted
+until a host is in Scope."` — show that sentence verbatim. Every CONNECT is a
+row in `flow.table` / `flow.get` / `flow.detail` and on the `flow.subscribe`
+push, with the same keys everywhere:
+
+- `tunnel`: `decrypted` (its inner requests are their own rows), `passthrough`
+  (relayed byte for byte; `bytes_up` / `bytes_down` and `duration_ms` once it
+  closes) or `failed` (`status` null); null on a row that is not a tunnel.
+- `tunnel_reason`: `out_of_scope` or `pinned` for a passthrough; for a failure
+  `client_rejected_certificate` (the client refused the proxy's certificate —
+  the usual cause of an empty capture on an untrusted CA), `client_closed`,
+  `client_tls_error`, `upstream_unreachable`, `upstream_tls_failed` or
+  `protocol_error`. A tunnel relays TLS only: a CONNECT whose first byte inside
+  the tunnel is not a TLS record is refused as `failed` / `protocol_error` and
+  nothing is relayed.
+- `passive`: true for plain HTTP to a host outside Scope. It is shown, but
+  nothing acts on it: no script hook, breakpoint rule, mutation or map rule.
+
+`scope.add` decrypts the next connection to that host and `scope.remove` tunnels
+it, live, with no restart; connections already open are left alone. A row with
+`tunnel: passthrough` and `tunnel_reason: out_of_scope`, or with `passive: true`,
+names the host to offer for `scope.add` (its `authority` without the port); a
+`pinned` row does not — `tls.passthrough` pins win over Scope and are lifted
+with `tls.passthrough.remove`. Do not count tunnel rows as requests: a decrypted
+tunnel shares its `authority` with its inner rows. The agent gate on `scope.add`
+is unchanged (below).
 
 ### Agent policy — the operator's governor
 
@@ -44,13 +75,16 @@ The agent cannot change its own policy or approve its own requests. Check
 
 ## The workflow and its tools
 
-1. **Scope first.** `scope.list` to see what is in bounds; `scope.add` /
-   `scope.remove` to adjust (narrowing always allowed). `tls.passthrough.list`
-   shows hosts tunnelled without decryption.
+1. **Scope first.** `scope.list` to see what is in bounds and decrypted;
+   `scope.add` / `scope.remove` to adjust (narrowing always allowed; both apply
+   to new connections). `tls.passthrough.list` shows hosts pinned as tunnelled
+   even when they are in Scope.
 2. **Capture.** `flow.table` for a rendered/tabular overview of captured flows;
    `flow.list` for raw ids; `flow.detail --id` for one flow's headers, bodies,
    timing and edit state. `flow.subscribe` streams live flows. `proxy.status`
-   shows listening state, armed interception, paused count and flow count.
+   shows listening state, armed interception, paused count, flow count and the
+   `decrypt` state (whether anything is decrypted, and the advice to show when
+   nothing is).
 3. **Intercept & mutate.** `flow.intercept` arms parking (global, or by rules);
    a parked flow waits for `flow.resume` (forward, possibly mutated) or
    `flow.kill` (reset / 429 / 503). `flow.mutate` edits a flow's request (or the
@@ -105,19 +139,22 @@ Re-read the status verbs instead of remembering them: privilege can change while
 the core runs.
 
 **Scope and the agent gates.** L4 scope is separate from HTTP scope.
-`l4.scope.list` shows the entries, each with `source: config | runtime`; scope is
-normally declared in `config.yaml`. Runtime `l4.scope.add` is refused for every
-caller (`runtime L4 scope widening is disabled; declare scope in the l4.scope
-config …`) unless the operator opened the Widen gate with
-`l4.agent.set {capability: widen, allowed: true}`. The operator-confirmed
-`l4.scope.add` (a confirm prompt, no Widen gate for a confirmed operator or CLI
-call, still refused to an agent) is designed but not shipped yet (unit (a') of
-the L4 parity fixes); until it lands, ask the operator to declare the entry in
-config or to open the Widen gate. Narrowing with `l4.scope.remove` is never
-Widen-gated (agent policy still applies). Four per-capability gates govern the
-agent path: `inject`, `capture`, `intercept` and `widen`. `l4.agent.status`
-reads them; only the operator can flip them with `l4.agent.set`. The agent can
-never open its own gates; respect a closed one.
+`l4.scope.list` shows the entries, each with `source: config | runtime`; scope
+is normally declared in `config.yaml`. A runtime `l4.scope.add` from an agent
+is refused (`runtime L4 scope widening is disabled; declare scope in the
+l4.scope config …`) unless the operator opened the Widen gate with
+`l4.agent.set {capability: widen, allowed: true}`. The operator adds scope
+without the Widen gate: `l4.scope.add` is confirmable (`confirmable: true` in
+`tools/list`); the operator call answers `needs_confirmation` with a prompt
+summarising the entry and proceeds when re-issued with `_confirm`, and the CLI
+asks its confirmer unless `--yes`. The entry is stored with `source: runtime`
+and never lifts the dangerous-destination denylist. An agent is never offered
+that handshake, so ask the operator to add the entry (or to open the Widen
+gate). Narrowing with `l4.scope.remove` is never Widen-gated (agent policy
+still applies). Four per-capability gates govern the agent path: `inject`,
+`capture`, `intercept` and `widen`. `l4.agent.status` reads them; only the
+operator can flip them with `l4.agent.set`. The agent can never open its own
+gates; respect a closed one.
 
 **Capture and read packets.** `l4.capture.start {interface, direction?}`
 (Capture gate) returns a capture flow id; `l4.capture.stop {id}` ends it.
