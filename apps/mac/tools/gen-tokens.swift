@@ -5,7 +5,7 @@
 //   swift tools/gen-tokens.swift <tokens.json> <Tokens.swift>
 // Colours become `DynamicColor` (light + dark, SwiftUI and AppKit), method /
 // severity / diff colours become `ColorPair` (fg + bg), dimensions CGFloat,
-// durations seconds, curves Animation helpers, icon roles SF Symbol names.
+// durations seconds, curves Animation helpers and CAMediaTimingFunctions, icon roles SF Symbol names.
 import Foundation
 
 let here = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
@@ -118,6 +118,12 @@ func emitLeaf(_ key: String, _ type: String, _ node: [String: Any], _ depth: Int
         if let v = value as? [Double], v.count == 4 {
             line("static func \(ident(key))(_ duration: Double) -> Animation {", depth)
             line("Animation.timingCurve(\(v[0]), \(v[1]), \(v[2]), \(v[3]), duration: duration)", depth + 1)
+            line("}", depth)
+            // The same curve for Core Animation. A computed property rather than a stored static:
+            // CAMediaTimingFunction is not Sendable, so this does not lean on the app target's
+            // MainActor default isolation to be concurrency-safe.
+            line("static var \(ident(key))Timing: CAMediaTimingFunction {", depth)
+            line("CAMediaTimingFunction(controlPoints: \(v[0]), \(v[1]), \(v[2]), \(v[3]))", depth + 1)
             line("}", depth)
         }
     case "string":
