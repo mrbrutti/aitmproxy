@@ -1060,17 +1060,29 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         // The main listener relays client traffic; the browser listener is
         // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
         // Both sockets were pre-bound above, so the accept loops just run on them.
-        tokio::select! {
+        // The stdio MCP arm ending `Ok` is the stdin-EOF exit: it gets one
+        // reporter line after the `select!` (spec Open question 3, AC-W1-32),
+        // ahead of the §D9 (a) restore so it is the session's last reporter line.
+        let stdio_transport = matches!(cfg.mcp.transport, McpTransport::Stdio);
+        let mut stdio_eof = None;
+        let served = tokio::select! {
             result = proxy.run_on(proxy_listener) => result,
             result = proxy.run_browser_on(browser_listener) => result,
-            result = mcp.serve() => result,
+            result = mcp.serve() => {
+                stdio_eof = stdio_eof_note(stdio_transport, &result);
+                result
+            }
             result = web_run => result,
             never = capture_run => match never {},
             () = aitm::shutdown_signal() => {
                 info!("shutdown signal received");
                 Ok(())
             }
+        };
+        if let Some(line) = stdio_eof {
+            reporter.note(line);
         }
+        served
     };
 
     // §D9 (a): whichever arm ended the run, and whether `result` is `Ok` or
@@ -1107,6 +1119,14 @@ fn configured_agent_port(transport: &McpTransport) -> Option<u16> {
         McpTransport::StreamableHttp { bind, .. } => bind.port(),
     };
     (port != 0).then_some(port)
+}
+
+/// The reporter's last line of a serving session when the stdio MCP arm ended
+/// `Ok` — the stdio JSON-RPC channel saw EOF (spec Open question 3, AC-W1-32).
+/// `None` for every other transport and for an `Err` end, which keep their own
+/// reporting.
+fn stdio_eof_note(transport_is_stdio: bool, result: &anyhow::Result<()>) -> Option<&'static str> {
+    (transport_is_stdio && result.is_ok()).then_some("stdin closed · stdio MCP transport ended")
 }
 
 /// Split a leading `--config <path>` / `--config=<path>` off `argv`, returning
@@ -1295,6 +1315,22 @@ mod tests {
             Some(8084)
         );
         assert_eq!(configured_agent_port(&McpTransport::Stdio), None);
+    }
+
+    /// Spec Open question 3 / AC-W1-32: the `stdin closed · stdio MCP
+    /// transport ended` note is produced only when the stdio MCP arm ended
+    /// `Ok` — never for another transport's `Ok`, never on `Err`.
+    #[test]
+    fn stdio_eof_note_only_for_stdio_ok() {
+        let ok: anyhow::Result<()> = Ok(());
+        let err: anyhow::Result<()> = Err(anyhow::anyhow!("boom"));
+        assert_eq!(
+            super::stdio_eof_note(true, &ok),
+            Some("stdin closed · stdio MCP transport ended")
+        );
+        assert_eq!(super::stdio_eof_note(false, &ok), None);
+        assert_eq!(super::stdio_eof_note(true, &err), None);
+        assert_eq!(super::stdio_eof_note(false, &err), None);
     }
 
     /// A `MakeWriter` that appends every formatted log line to a shared buffer,
