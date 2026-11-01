@@ -21,8 +21,10 @@
 //! Without `AITM_L4_TESTS=1`, or without pcap privilege, each test prints a
 //! `SKIP 77` line saying which of the two it was and returns green. This file
 //! never changes system state, never asks for privilege and never runs `sudo`:
-//! reaching the applied branch is the operator's decision (Wireshark's
-//! ChmodBPF / the `access_bpf` group on macOS, `CAP_NET_RAW` on Linux).
+//! reaching the applied branch is the operator's decision, through the
+//! product's own privilege path — on macOS the Aitmproxy app's packet-capture
+//! helper (spec `2026-10-31-l4-capture-privilege-design`), on Linux
+//! `cap_net_raw,cap_net_admin` on the test binary or a rig that has them.
 //!
 //! # Why the numbers are what they are
 //!
@@ -32,10 +34,28 @@
 //!   the default the run would still pass, but every permit past the first
 //!   hundred would wait on the rate limiter instead of measuring the service.
 //!   `max_packet_bytes` and `max_packets_per_call` stay at their defaults.
-//! * **ICMP generation is rate-limited on macOS** (`net.inet.icmp.icmplim`,
-//!   default 250 per second). The two reaction tests send 20 cases at the
-//!   default 500 ms reply window, which stays far below that ceiling, so the
-//!   kernel answers every one and a silent case means something real.
+//! * **ICMP generation is rate-limited.** On macOS `net.inet.icmp.icmplim`
+//!   (default 250 per second) sits far above the 20 cases the reaction tests
+//!   send at the default 500 ms reply window, so the kernel answers every one.
+//!   Linux limits ICMP errors per destination (`net.ipv4.icmp_ratelimit`,
+//!   1000 ms between errors to one peer after a small burst, with
+//!   `icmp_ratemask` covering destination-unreachable; the kernel exempts
+//!   loopback destinations from that per-peer limit but still applies the
+//!   global `icmp_msgs_per_sec`/`icmp_msgs_burst` budget, which the lane's
+//!   liveness probes draw from as well). The closed-UDP test therefore asserts
+//!   that **at least one** case was classified `icmp(3,3)`, tolerates `silence`
+//!   on the others, and prints the class histogram plus the counters so the
+//!   operator sees exactly what the lane made of the silent cases; a false
+//!   `l4-crash` on a closed port fails the test with those numbers in the
+//!   message. The liveness rule itself is not redesigned here.
+//! * **The capture sees the stimulus itself.** On Linux `lo` libpcap delivers
+//!   the RX copy of every frame the lane injects, and macOS `lo0` BPF reports
+//!   sent frames too, so the first frame a reply capture reads is the lane's
+//!   own stimulus. The first real run of this file (Ubuntu 24.04, 2026-11-01)
+//!   found `send_recv` classifying that frame as `Other` and every case as
+//!   `protocol_error`; the echo test still passed because it only checked
+//!   verdicts and counters. These tests now read every case's class through
+//!   `PacketLane::state()` and assert the classification itself.
 //! * **Linux works unchanged.** The interface comes from
 //!   `discover::loopback_interface()` (`lo0` on macOS, `lo` on Linux) and the
 //!   link framing from `link_framing`, which picks Ethernet for `DLT_EN10MB`
@@ -58,6 +78,8 @@ use aitm_proto_l4::types::{
 use aitm_scan_l4_packet::checks::{CRASH_CHECK_ID, REACTION_CHECK_ID};
 use aitm_scan_l4_packet::discover::{loopback_interface, probe_privilege};
 use aitm_scan_l4_packet::lane::PacketLane;
+use aitm_scan_l4_packet::oracle::CaseClass;
+use aitm_scan_l4_packet::state::{CaseRecord, PointRun};
 use aitm_scan_l4_packet::testing::{fields, l4_profile, tcp_target, udp_target, TestJob};
 use aitm_scan_model::{
     Discovery, InsertionPoint, JobCtx, L4Counters, L4Oracle, Lane, Outcome, ProbeHost, ScanProfile,
@@ -126,6 +148,16 @@ fn live_lane() -> Option<(PacketLane, Arc<L4Guard>)> {
     Some((lane, guard))
 }
 
+/// The privilege SKIP line for a `lane_unavailable` refusal `err`. The
+/// privilege path it names is the product's own: on macOS the app's
+/// packet-capture helper (spec `2026-10-31-l4-capture-privilege-design`), on
+/// Linux the capabilities on the test binary; never a third-party tool.
+fn privilege_skip_line(err: &str) -> String {
+    format!(
+        "SKIP 77: L4 packet lane live proof skipped: {err}. BPF is root-only on this host (/dev/bpf* are crw------- root); on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
+    )
+}
+
 /// Print the plan's privilege SKIP verbatim, or fail the test when the lane
 /// refused for any other reason.
 fn skip_or_fail(err: &str) {
@@ -133,9 +165,7 @@ fn skip_or_fail(err: &str) {
         err.contains("lane_unavailable"),
         "the live lane refused for a reason other than pcap privilege: {err}"
     );
-    println!(
-        "SKIP 77: L4 packet lane live proof skipped: {err}. BPF is root-only on this host (/dev/bpf* are crw------- root); grant it via Wireshark's ChmodBPF (the access_bpf group) or run on a Linux rig with CAP_NET_RAW. This session never obtains privilege itself."
-    );
+    println!("{}", privilege_skip_line(err));
 }
 
 /// Whether the lane can open a capture here, printing the privilege SKIP when
@@ -183,6 +213,40 @@ async fn run_check(
         .find(|check| check.meta().id == id)
         .unwrap_or_else(|| panic!("the lane lists the {id} check"));
     check.run(point, host).await
+}
+
+/// The finished run of `point`, as both checks cached it in the lane's state.
+fn point_run(lane: &PacketLane, job: &TestJob, point: &InsertionPoint) -> Arc<PointRun> {
+    lane.state()
+        .expect("the live lane has its L4 handles")
+        .run(job.job_id(), &point.id)
+        .expect("the checks drove the point's run")
+}
+
+/// The run's case classes with their counts, in first-seen order, as the
+/// oracle labels them (`clean`, `icmp(3,3)`, `reset`, `protocol_error`,
+/// `silence`); an unsent case counts under `unsent`.
+fn class_histogram(run: &PointRun) -> Vec<(String, u32)> {
+    let mut seen: Vec<(String, u32)> = Vec::new();
+    for case in &run.cases {
+        let label = case
+            .class()
+            .map_or_else(|| "unsent".to_string(), |class| class.label());
+        if let Some(entry) = seen.iter_mut().find(|(seen, _)| *seen == label) {
+            entry.1 += 1;
+        } else {
+            seen.push((label, 1));
+        }
+    }
+    seen
+}
+
+/// How many of the run's cases the oracle read as `class`.
+fn count_class(run: &PointRun, class: CaseClass) -> usize {
+    run.cases
+        .iter()
+        .filter(|case| case.class() == Some(class))
+        .count()
 }
 
 /// A loopback UDP port with nothing behind it: bind it, read it, let it go.
@@ -250,11 +314,23 @@ impl EchoService {
 
 /// Tester (stage 5): the privilege SKIP is printed only for a
 /// `lane_unavailable` refusal; this runs without privilege and without the
-/// opt-in, so the SKIP wording is pinned in every gate run.
+/// opt-in, so the SKIP wording is pinned in every gate run. The privilege path
+/// it recommends is the product's own helper on macOS and the capabilities on
+/// Linux (Matt's decision, T5 live proof), never Wireshark's ChmodBPF.
 #[test]
 fn skip_or_fail_prints_the_privilege_skip_for_lane_unavailable() {
     skip_or_fail("lane_unavailable: pcap on lo0: no capture privilege (mock)");
     skip_or_fail("the engine wrapped it: lane_unavailable: pcap on lo: Operation not permitted");
+
+    let line = privilege_skip_line("lane_unavailable: pcap on lo0: no capture privilege (mock)");
+    assert_eq!(
+        line,
+        "SKIP 77: L4 packet lane live proof skipped: lane_unavailable: pcap on lo0: no capture privilege (mock). BPF is root-only on this host (/dev/bpf* are crw------- root); on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
+    );
+    assert!(
+        !line.contains("ChmodBPF") && !line.contains("access_bpf"),
+        "the SKIP never recommends a third-party privilege path: {line}"
+    );
 }
 
 /// Tester (stage 5): any other refusal — out of scope, an invalid profile, a
@@ -312,11 +388,36 @@ async fn live_closed_udp_port_yields_icmp_3_3() {
 
     let reaction = run_check(&lane, REACTION_CHECK_ID, &point, host.as_ref()).await;
     let crash = run_check(&lane, CRASH_CHECK_ID, &point, host.as_ref()).await;
+    let counters = lane.counters(job.job_id());
+    let stats = lane.stats(job.job_id());
+    let run = point_run(&lane, &job, &point);
+    let histogram = class_histogram(&run);
+    let icmp_3_3 = count_class(
+        &run,
+        CaseClass::Icmp {
+            icmp_type: 3,
+            code: 3,
+        },
+    );
+    let silent = count_class(&run, CaseClass::Silence);
 
     println!("reaction: {:?} | {}", reaction.outcome, reaction.detail);
-    println!("counters: {:?}", lane.counters(job.job_id()));
-    println!("stats: {:?}", lane.stats(job.job_id()));
+    println!("crash: {:?} | {}", crash.outcome, crash.detail);
+    println!("counters: {counters:?}");
+    println!("stats: {stats:?}");
+    println!("classes: {histogram:?}");
+    println!(
+        "closed udp port: {icmp_3_3} of {} cases drew icmp(3,3), {silent} were silent (Linux rate-limits ICMP errors; the liveness probes draw from the same budget); baseline {:?}, crash {:?}, stopped {:?}",
+        run.cases.len(),
+        run.baseline,
+        run.crash.as_ref().map(|c| (c.case_index, c.recovered)),
+        run.stopped
+    );
 
+    assert!(
+        icmp_3_3 >= 1,
+        "at least one case must be classified icmp(3,3) by the kernel's port-unreachable; classes {histogram:?}"
+    );
     assert_eq!(reaction.outcome, Outcome::Vulnerable);
     let l4 = reaction
         .evidence
@@ -331,7 +432,11 @@ async fn live_closed_udp_port_yields_icmp_3_3() {
         },
         "the kernel's port-unreachable is icmp(3,3)"
     );
-    assert_eq!(crash.outcome, Outcome::Clean, "a closed port never crashes");
+    assert_eq!(
+        crash.outcome,
+        Outcome::Clean,
+        "a closed port never crashes; the lane reported one: counters {counters:?}, stats {stats:?}, classes {histogram:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -357,11 +462,30 @@ async fn live_closed_tcp_port_yields_reset() {
 
     let reaction = run_check(&lane, REACTION_CHECK_ID, &point, host.as_ref()).await;
     let crash = run_check(&lane, CRASH_CHECK_ID, &point, host.as_ref()).await;
+    let counters = lane.counters(job.job_id());
+    let stats = lane.stats(job.job_id());
+    let run = point_run(&lane, &job, &point);
+    let histogram = class_histogram(&run);
+    let resets = count_class(&run, CaseClass::Reset);
+    let silent = count_class(&run, CaseClass::Silence);
 
     println!("reaction: {:?} | {}", reaction.outcome, reaction.detail);
-    println!("counters: {:?}", lane.counters(job.job_id()));
-    println!("stats: {:?}", lane.stats(job.job_id()));
+    println!("crash: {:?} | {}", crash.outcome, crash.detail);
+    println!("counters: {counters:?}");
+    println!("stats: {stats:?}");
+    println!("classes: {histogram:?}");
+    println!(
+        "closed tcp port: {resets} of {} cases drew a reset, {silent} were silent; baseline {:?}, crash {:?}, stopped {:?}",
+        run.cases.len(),
+        run.baseline,
+        run.crash.as_ref().map(|c| (c.case_index, c.recovered)),
+        run.stopped
+    );
 
+    assert!(
+        resets >= 1,
+        "at least one case must be classified reset by the kernel's answer to a syn on a closed port; classes {histogram:?}"
+    );
     assert_eq!(reaction.outcome, Outcome::Vulnerable);
     let l4 = reaction
         .evidence
@@ -373,7 +497,11 @@ async fn live_closed_tcp_port_yields_reset() {
         L4Oracle::Reset,
         "the kernel answers a syn to a closed port with rst"
     );
-    assert_eq!(crash.outcome, Outcome::Clean, "a closed port never crashes");
+    assert_eq!(
+        crash.outcome,
+        Outcome::Clean,
+        "a closed port never crashes; the lane reported one: counters {counters:?}, stats {stats:?}, classes {histogram:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -403,6 +531,8 @@ async fn live_udp_echo_hundred_clean() {
     let reaction = run_check(&lane, REACTION_CHECK_ID, &point, host.as_ref()).await;
     let counters = lane.counters(job.job_id());
     let stats = lane.stats(job.job_id());
+    let run = point_run(&lane, &job, &point);
+    let histogram = class_histogram(&run);
 
     // Join the service before asserting, so a failed expectation never leaves
     // the echo thread behind.
@@ -412,6 +542,7 @@ async fn live_udp_echo_hundred_clean() {
     println!("reaction: {:?} | {}", reaction.outcome, reaction.detail);
     println!("counters: {counters:?}");
     println!("stats: {stats:?}");
+    println!("classes: {histogram:?}");
 
     assert_eq!(points, 1, "one raw point for one target");
     assert_eq!(crash.outcome, Outcome::Clean, "the echo service survives");
@@ -428,5 +559,31 @@ async fn live_udp_echo_hundred_clean() {
             liveness_failures: 0,
             retired_elements: 0,
         })
+    );
+
+    // The classification itself, not just the verdicts: every one of the 100
+    // cases was answered by the echo service and read as clean — which is
+    // what the first Linux run did not have (every case was protocol_error,
+    // the lane's own stimulus mistaken for the reply).
+    assert_eq!(run.cases.len(), 100, "classes {histogram:?}");
+    assert_eq!(
+        run.baseline,
+        Some(CaseClass::Clean),
+        "the unmutated seed echoes"
+    );
+    let not_clean: Vec<(u32, Option<CaseClass>)> = run
+        .cases
+        .iter()
+        .filter(|case| case.class() != Some(CaseClass::Clean))
+        .map(|case: &CaseRecord| (case.index, case.class()))
+        .collect();
+    assert!(
+        not_clean.is_empty(),
+        "every echoed case is classified clean; these were not: {not_clean:?}; classes {histogram:?}"
+    );
+    assert_eq!(
+        stats.as_ref().map(|stats| stats.timeouts),
+        Some(0),
+        "no echoed case timed out: {stats:?}"
     );
 }
