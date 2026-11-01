@@ -375,7 +375,10 @@ extension HandoffSelfCheck {
     ///  E. a `begin` after all that starts over cleanly;
     ///  F. a second `begin` while a RECONCILE apply is in flight with nothing installed
     ///     (startup failed, no `stop()`) is never answered by that reconcile's result: a
-    ///     fresh startup apply follows and answers it; the pending set is applied after.
+    ///     fresh startup apply follows and answers it; the pending set is applied after;
+    ///  G. the provider's failed-startup sequence (fix F3): `begin` fails, `stop()` runs,
+    ///     then the detach that `handoff.stop()` fires reconciles nil -- nothing is
+    ///     applied, installed or reported; a later UDP set is dropped too.
     static func ruleReconcilerStartupAndStop(_ r: Recorder) {
         let fake = FakeApply(r)
         let reconciler = fake.makeReconciler()
@@ -523,6 +526,33 @@ extension HandoffSelfCheck {
         r.check("\(g): F installed == w1", reconciler.installed == w1)
         r.check("\(g): F every apply parked exactly one completion",
               fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+
+        // G. The provider's failed-startup sequence: the startup apply fails, the error
+        //    branch stops the reconciler before the link, and the detach hook's
+        //    reconcile(nil) must then be inert (contrast F, where no stop() ran).
+        reconciler.stop()
+        var startupG: [Error?] = []
+        reconciler.begin { startupG.append($0) }
+        r.check("\(g): G begin applies (.tcpOnly, false)", fake.lastApply(11, tcpOnly, false), fake.trail())
+        fake.complete(11, NSError(domain: "test", code: 6), "\(g): G")
+        r.check("\(g): G the failed startup answers its completion once with the error",
+              startupG.count == 1 && (startupG[0] as NSError?)?.code == 6, "\(startupG.map { String(describing: $0) })")
+        if case .applyFailed(let wanted, let kept, _)? = fake.events.last {
+            r.check("\(g): G .applyFailed(wanted: .tcpOnly, kept: nil) reported once", wanted == tcpOnly && kept == nil,
+                  "\(wanted.summary), \(String(describing: kept?.summary))")
+        } else {
+            r.fail("FAIL \(g): G last event is not .applyFailed: \(String(describing: fake.events.last))")
+        }
+        reconciler.stop()
+        let eventsBeforeG = fake.events.count
+        reconciler.reconcile(for: nil)   // the detach hook fired by handoff.stop()
+        r.check("\(g): G a detach-driven reconcile(nil) after the failed startup + stop applies nothing",
+              fake.applied.count == 12, fake.trail())
+        reconciler.reconcile(for: m1)
+        r.check("\(g): G a UDP set after that applies nothing either", fake.applied.count == 12, fake.trail())
+        r.check("\(g): G nothing installed", reconciler.installed == nil)
+        r.check("\(g): G nothing reported", fake.events.count == eventsBeforeG, "\(fake.events.count) vs \(eventsBeforeG)")
+        r.check("\(g): G the startup completion was not answered again", startupG.count == 1, "\(startupG.count)")
     }
 }
 #endif

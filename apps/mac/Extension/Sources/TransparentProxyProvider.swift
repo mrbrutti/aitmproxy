@@ -64,9 +64,11 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
         // that arrives before this apply lands is coalesced and applied right after it.
         rulesQueue.async {
             self.reconciler.begin { error in
-                if let error = error {
-                    os_log("setTunnelNetworkSettings error %{public}@",
-                           log: self.log, type: .error, String(describing: error))
+                if error != nil {
+                    // Already reported by `logRuleEvent(.applyFailed)`. Mirror `stopProxy`
+                    // (we are on `rulesQueue`): stop the reconciler first so the detach
+                    // that `handoff.stop()` fires reconciles nothing, then stop the link.
+                    self.reconciler.stop()
                     self.handoff.stop()
                 }
                 completionHandler(error)
