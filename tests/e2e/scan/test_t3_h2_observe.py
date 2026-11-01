@@ -65,7 +65,7 @@ JOB_TIMEOUT = 600.0
 
 
 def h2_profile(name: str, origin: str) -> dict:
-    """The observe-only h2 job: one page, no browser, only the five h2 checks."""
+    """The observe-only h2 job: a four-page crawl, no browser, only the five h2 checks."""
     return {
         "name": name,
         "target": {"origins": [origin]},
@@ -74,7 +74,11 @@ def h2_profile(name: str, origin: str) -> dict:
         "speed": "normal",
         "accuracy": "normal",
         "checks": {"include": list(H2_CHECKS), "exclude": []},
-        "crawl": {"max_pages": 1, "use_browser": "never"},
+        # Four pages, not one: the scheduler attaches an origin-scoped check to a
+        # discovered point, and the target's `/` carries no parameter of its own
+        # (its links do), so a one-page crawl schedules nothing (T3 PR 2a live
+        # run, 2026-11-01; the zero-point case is a T1b scheduler follow-up).
+        "crawl": {"max_pages": 4, "use_browser": "never"},
         "session": {"mode": "none"},
         "http": {"version": "auto"},
     }
