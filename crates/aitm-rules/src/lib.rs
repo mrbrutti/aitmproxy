@@ -123,7 +123,7 @@ pub enum Phase {
     Any,
 }
 
-/// Why [`compile`] rejected a rule.
+/// Why [`compile`] rejected a rule, or [`check_rule_count`] a `rules` array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleError {
     BadRegex {
@@ -193,6 +193,18 @@ enum UrlSubject {
     PathOnly,
 }
 
+impl UrlSubject {
+    /// The subject(s) a wildcard runs against: the path only when the pattern
+    /// starts with `/`, both otherwise (see [`UrlSubject::PathOnly`]).
+    fn for_wildcard(pattern: &str) -> Self {
+        if pattern.starts_with('/') {
+            UrlSubject::PathOnly
+        } else {
+            UrlSubject::UrlOrPath
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CompiledHost {
     Exact(String),
@@ -217,31 +229,7 @@ pub fn check_rule_count(count: usize) -> Result<(), RuleError> {
 /// for a pattern over [`MAX_PATTERN_BYTES`] (both before any regex is built) and
 /// [`RuleError::BadRegex`] for an invalid pattern, instead of panicking later.
 pub fn compile(rule: Rule) -> Result<CompiledRule, RuleError> {
-    let url = match &rule.condition.url {
-        None => None,
-        Some(UrlMatch::Wildcard(pat)) => {
-            check_url_pattern(pat)?;
-            Some(CompiledUrl {
-                re: compile_pattern(
-                    &wildcard_to_regex(pat, Anchor::WholeIfStarred),
-                    pat,
-                    Case::Fold,
-                )?,
-                subject: if pat.starts_with('/') {
-                    UrlSubject::PathOnly
-                } else {
-                    UrlSubject::UrlOrPath
-                },
-            })
-        }
-        Some(UrlMatch::Regex(pat)) => {
-            check_url_pattern(pat)?;
-            Some(CompiledUrl {
-                re: compile_pattern(pat, pat, Case::Fold)?,
-                subject: UrlSubject::UrlOrPath,
-            })
-        }
-    };
+    let url = rule.condition.url.as_ref().map(compile_url).transpose()?;
     let host = match &rule.condition.host {
         None => None,
         Some(HostMatch::Exact(h)) => Some(CompiledHost::Exact(h.to_ascii_lowercase())),
@@ -255,6 +243,33 @@ pub fn compile(rule: Rule) -> Result<CompiledRule, RuleError> {
         }
     };
     Ok(CompiledRule { rule, url, host })
+}
+
+/// Compile a `url` clause: the empty and byte-cap checks run before any regex
+/// is built, then each variant picks its regex source and the subject(s) it
+/// runs against.
+fn compile_url(url: &UrlMatch) -> Result<CompiledUrl, RuleError> {
+    let (re, subject) = match url {
+        UrlMatch::Wildcard(pat) => {
+            check_url_pattern(pat)?;
+            (
+                compile_pattern(
+                    &wildcard_to_regex(pat, Anchor::WholeIfStarred),
+                    pat,
+                    Case::Fold,
+                )?,
+                UrlSubject::for_wildcard(pat),
+            )
+        }
+        UrlMatch::Regex(pat) => {
+            check_url_pattern(pat)?;
+            (
+                compile_pattern(pat, pat, Case::Fold)?,
+                UrlSubject::UrlOrPath,
+            )
+        }
+    };
+    Ok(CompiledUrl { re, subject })
 }
 
 /// A `url` pattern must be non-empty and under the byte cap.

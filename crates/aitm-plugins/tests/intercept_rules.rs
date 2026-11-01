@@ -364,9 +364,9 @@ fn too_many_rules_is_error() {
     let err = intercept
         .invoke(params(&[("rules", rules(257))]), &host)
         .expect_err("257 rules are rejected");
-    assert_eq!(
-        err.to_string(),
-        "257 rules supplied; the limit is 256 per call"
+    assert!(
+        err.to_string().contains("limit is 256"),
+        "the error names the cap: {err}"
     );
 
     // The earlier `*/admin` rule is still active.

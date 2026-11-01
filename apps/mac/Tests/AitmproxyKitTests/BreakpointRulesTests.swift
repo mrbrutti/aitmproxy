@@ -25,6 +25,17 @@ import Testing
         #expect(BreakpointRule.wildcardMatches(pattern: "*/search?q=*", text: "https://h/search?q=1"))
     }
 
+    @Test func emptyPatternMatchesNoRow() {
+        // One literal row, not `Fixtures.rows`, so the result does not depend
+        // on the fixture set.
+        let row = FlowRow(id: FlowID("empty"), seq: 1, method: .get, scheme: "https", authority: "h.test", path: "/x")
+        // Positive control: the row is matchable, so the two `false`s below come
+        // from the empty-pattern guard rather than from an unmatchable row.
+        #expect(BreakpointRule(url: "*h.test*").matches(row) == true)
+        #expect(BreakpointRule(url: "").matches(row) == false)
+        #expect(BreakpointRule(url: "", matching: .regex).matches(row) == false)
+    }
+
     @Test func noticeAndWireForm() throws {
         var set = BreakpointRules()
         #expect(set.armedNotice == "Intercept armed — every request pauses here")

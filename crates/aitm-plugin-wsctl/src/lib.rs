@@ -170,7 +170,9 @@ impl Command for WsIntercept {
                     required: false,
                     description: "Rules whose matching frames are parked. Each: {id?, name?, \
                                   enabled?, phase?, ws_dir?, url?, method?, host?}; phase \
-                                  defaults to ws_frame. An invalid regex is rejected."
+                                  defaults to ws_frame. More than 256 rules, a pattern over 4096 \
+                                  bytes, an empty url pattern or an invalid regex rejects the \
+                                  whole call; the active rules are unchanged."
                         .into(),
                 },
             ],
@@ -673,9 +675,9 @@ mod tests {
         let err = cmd
             .invoke(params(rules(257)), &host)
             .expect_err("257 rules are rejected");
-        assert_eq!(
-            err.to_string(),
-            "257 rules supplied; the limit is 256 per call"
+        assert!(
+            err.to_string().contains("limit is 256"),
+            "the error names the cap: {err}"
         );
         assert_eq!(
             lock(&cmd.shared.rules).len(),

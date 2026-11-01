@@ -166,7 +166,9 @@ impl Command for FlowIntercept {
                     required: false,
                     description: "Breakpoint rules; replaces the active set. Omit to leave the \
                                   current rules unchanged; an empty array restores the global arm. \
-                                  An invalid regex rejects the whole call."
+                                  More than 256 rules, a pattern over 4096 bytes, an empty url \
+                                  pattern or an invalid regex rejects the whole call; the active \
+                                  rules are unchanged."
                         .into(),
                 },
             ],
