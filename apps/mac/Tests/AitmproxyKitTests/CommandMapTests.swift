@@ -54,11 +54,13 @@ import Testing
     }
 
     @Test func rowsDescribeThemselvesForVoiceOver() {
-        let login = Fixtures.rows.first { $0.seq == 50 }!
+        let login = Make.row(seq: 1, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
+                             state: .paused, edited: true)
         #expect(login.accessibilityDescription == "POST, paused, auth.shop-staging.test/api/auth/login, edited")
-        let health = Fixtures.rows.first { $0.seq == 54 }!
+        let health = Make.row(seq: 2, method: .head, host: "api.shop-staging.test", path: "/api/health", status: 200,
+                              tls: .pinnedOrFailed)
         #expect(health.accessibilityDescription == "HEAD, 200 OK, api.shop-staging.test/api/health, TLS failed")
-        var marked = Fixtures.rows.first { $0.seq == 41 }!
+        var marked = Make.row(seq: 3, host: "api.shop-staging.test", path: "/api/products", status: 200)
         marked.mark = .red
         marked.comment = "look here"
         marked.inScope = false

@@ -138,6 +138,31 @@ export interface StateNotification {
   memory_bytes?: number;
 }
 
+/** One trust store of `ca.status.stores` (`crates/aitm-ca/src/commands.rs`): `user` or `system`. */
+export interface CAStoreWire {
+  /** present | absent | stale | unknown. */
+  installed: string;
+  /** yes | no | unknown. */
+  trusted: string;
+  /** The keychain, anchor file, or store. */
+  location: string;
+}
+
+/** The `ca.status` reply. `stores` is empty without a certificate or on an unsupported platform. */
+export interface CAStatusWire {
+  exists: boolean;
+  dir: string;
+  path: string;
+  /** Colon-separated uppercase hex; null without a certificate. */
+  fingerprint_sha256: string | null;
+  fingerprint_sha1: string | null;
+  /** macos | linux-debian | linux-fedora | windows | unsupported. */
+  platform: string;
+  stores: Record<string, CAStoreWire>;
+  /** What was and was not verified. */
+  detail: string[];
+}
+
 export class BusError extends Error {
   constructor(
     message: string,

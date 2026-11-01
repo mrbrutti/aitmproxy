@@ -16,6 +16,8 @@ export interface SetupAction {
   hint?: string | undefined;
   /** When set, selecting the action selects this bus command (its form path) instead of `run`. */
   tool?: string | undefined;
+  /** Initial arguments for `tool`'s form (the CA action's `{ scope: 'user' }` on macOS/Windows). */
+  args?: Record<string, unknown> | undefined;
   run?: (() => void | Promise<unknown>) | undefined;
 }
 

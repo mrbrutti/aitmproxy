@@ -89,10 +89,16 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         (_, _, None) if app.has_tool("proxy.status") => "listen address unknown".to_string(),
         (_, _, None) => "listen address unknown (core follow-up F7)".to_string(),
     };
+    // The CA-trust word (§D17.6) follows the listening text; the sys-proxy
+    // word (§D12) goes between them when it lands.
+    let ca = app
+        .ca_trust_word()
+        .map(|w| format!(" {w}"))
+        .unwrap_or_default();
     let pill = Line::from(vec![
         Span::styled("● ", dot_style),
         Span::styled("aitmproxy", bold),
-        Span::styled(format!(" · {listen}{state}"), theme.text_secondary()),
+        Span::styled(format!(" · {listen}{ca}{state}"), theme.text_secondary()),
     ]);
 
     let agent_style = match app.agent.policy {

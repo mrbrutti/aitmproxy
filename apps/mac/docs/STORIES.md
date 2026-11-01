@@ -15,7 +15,7 @@ Acceptance:
 - [snap] Sidebar 240 px with Traffic / Testing / Automation groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left (a label, no status); filter field at the bottom.
 - [snap] Toolbar holds sidebar toggle, compose, clear; the connection cluster (pill, Proxy switch, Capture switch) in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
 - [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised` with the list's facts only.
-- [self] Fixtures load 14 rows; the window opens at 1440×900 with a 1100×640 minimum.
+- [live] The rows come from the core over the bus (none are seeded); the window opens at 1440×900 with a 1100×640 minimum.
 Status: done
 
 ### S-002 Watch the flow list
@@ -62,14 +62,16 @@ Acceptance:
 - [snap] Status bar shows `● bus 127.0.0.1:9090` green when connected, amber connecting, red with the error, grey offline; the listening pill reads `listen:` from the same config.
 Status: done
 
-### S-006 Run the app on fixtures, snapshots and the self-test
-As the operator (or an agent), I run the app in fixture, snapshot or self-test mode and get the mockup's state without a proxy.
+### S-006 Run the app on the live self-test and the dev bundle
+As the operator (or an agent), I verify the app against a real core with real traffic and the live self-test, never against sample data.
 Screens: apps, domains, scope, findings, browser, scripts, agent, settings-general, settings-bus, settings-appearance
 Depends: S-001
 Acceptance:
-- [self] `APP_FIXTURES=1` loads the mockup's 14 flows, armed intercept, two paused, login selected; `APP_LIVE=1` captures the live bus instead.
-- [snap] `tools/snap.sh` writes `<page>-light/dark.png` for every sidebar page and `settings-<tab>-*.png`, plus `-layout.json` grid probes; refuses to run without `APP_STORE` in /tmp.
-- [self] `tools/selftest.sh` exits 0 with 9/9 checks; `swift test` passes 35/35; `tools/grid-lint.sh` and `check-layout.swift` print PASS.
+- [unit] `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build` reports 0 failures.
+- [structural] `tools/grid-lint.sh` and the three tripwires `tools/check-connection-words.sh`, `tools/check-capture-operator-only.sh` and `tools/check-capture-toggle.sh` exit 0.
+- [live] `DEV_TAG=<tag> CORE_DIR=<dir with aitm> tools/snap-dev.sh` builds the dev bundle and launches it LIVE on an isolated `APP_STORE`, printing the pid, the store path and the `kill <pid>` line; `NO_LAUNCH=1` only builds.
+- [live] Real traffic through the bundle: `python3 -m http.server 8099 --bind 127.0.0.1` upstream, `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` (Safari for HTTPS once the CA is trusted) shows the row in the list; `swift tools/winshot.swift <pid printed by snap-dev.sh> /tmp/claude/<name>.png` reads the real window.
+- [live] `AITM_CONFIG=… tools/selftest-live.sh` (external core) and `tools/selftest-live-embedded.sh` end with `LIVE SELFTEST PASS`.
 Status: done
 
 ### S-007 See flat icons and an editorial hierarchy
@@ -238,7 +240,7 @@ Depends: S-010
 Core: F6
 Acceptance:
 - [snap] The mark menu shows 11 system-colour swatches and Clear; the row's 6 px swatch and the Comment column update at once.
-- [self] `flow.mark {id, marks}` and `flow.comment {id, text}` are sent; on fixtures the row updates locally.
+- [self] `flow.mark {id, marks}` and `flow.comment {id, text}` are sent over the bus.
 - [unit] A comment longer than the column truncates with an ellipsis and shows in full in the Summary tab.
 UX:
 - Flow: `m` (or Flow ▸ Mark ▸, or row context menu ▸ Mark) -> popover of 11 swatches + Clear -> click -> swatch appears in the Mark column; `c` / ⌘L -> inline comment field in the status bar's left slot? No — a small popover anchored to the row with one field -> Return saves, Esc cancels -> Comment column shows it
@@ -247,7 +249,7 @@ UX:
 - Words: "Mark ▸ Red … Pink, Clear Mark", "Comment…", popover title "Comment", button "Save"
 - Access: swatches have colour names for VoiceOver; the comment field is the only control focused on open (typing-only surface)
 Status: done
-(Fixtures update locally; live `flow.mark`/`flow.comment` wait on S-core-F6 and surface a status-bar error until then.)
+(Marks and comments go over the bus as `flow.mark` / `flow.comment`; a core without S-core-F6 surfaces a status-bar error.)
 
 ### S-018 Pause the proxy and clear the session
 As the operator, I flip the Proxy switch in the toolbar to stop recording and click clear to drop every flow; both are real proxy state, read back from the core.
@@ -261,11 +263,11 @@ Acceptance:
 UX:
 - Flow: toolbar Proxy switch (or View ▸ Pause Proxy ⇧⌘R) -> switch grey, pill reads "paused" -> click again to resume; toolbar trash (File ▸ Clear Session ⌘⌫) -> list empties -> empty state returns
 - Surface: inline toolbar toggles; Clear asks "Clear 2 paused flows too?" (confirmation dialog, destroys data) only when flows are paused, buttons "Clear" / "Cancel"
-- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"; fixtures toggle locally
+- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"
 - Words: "Proxy" (the switch), "Pause Proxy" / "Resume Proxy", "Clear Session", tooltip "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
 - Access: both in the menu bar; the pill is a status, not a control, to VoiceOver
 Status: done
-(Fixtures toggle locally; live `proxy.pause/resume`/`flow.clear` wait on S-core-F7 and surface a status-bar error until then.)
+(Pause, resume and clear go over the bus as `proxy.pause` / `proxy.resume` / `flow.clear`; a core without S-core-F7 surfaces a status-bar error.)
 
 ---
 
@@ -1172,8 +1174,8 @@ Depends: S-063, S-070, core F1
 Spec: `docs/superpowers/specs/2026-10-31-macos-status-page-and-first-run-design.md`
 Acceptance:
 - [unit] `ConnectionSummary.make` yields the spec's word table for every core × bus × capture state; no lane word says "Capturing" while the scope is empty (ST-AC1/2).
-- [snapshot] The Status page renders every lane state in light + dark with no clipping; grid-lint + check-layout PASS (ST-AC3).
-- [self-test] A fixture session's lanes read "not running / connected / no extension"; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6).
+- [live] The Status page renders every lane state the real core produces, light + dark, on the dev bundle with no clipping; grid-lint PASS (ST-AC3).
+- [live] In the live self-test the lanes read the real core's and extension's state; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6).
 - [structural] The toolbar cluster, Status page, Core Log header and Settings rows take their words only from `ConnectionSummary` (ST-AC5); the sidebar and the status bar carry no connection state (ST-AC10).
 - [self-test] The toolbar's Proxy switch is live only while the bus is connected as operator and flips through `setCapturing`; its position and the pill's "paused" / "intercept armed" are the core's facts from `proxy.status`. The Capture switch's position is the lane's fact (in-flight choice overriding); it stands down, with the reason in its help, when the extension is not in the build, the core is external or a switch is in flight (ST-AC9).
 - [manual] On the notarized app: fresh launch lands on Status; the cards read the real state; Turn Off/On Capture from the card changes Settings ▸ Capture within one poll; adding a host ticks the step; the first flow ticks the last step (ST-AC7).

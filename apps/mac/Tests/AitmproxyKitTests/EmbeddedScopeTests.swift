@@ -93,11 +93,10 @@ import Testing
 
     // MARK: Launch seeding (SP-AC1, SP-AC8(a), SP-AC10)
 
-    @Test func seedsAtLaunchOnlyForEmbeddedWithABundledCoreOutsideFixtures() {
-        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .embedded, bundledCorePresent: true, usesFixtures: false) == true)
-        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .external, bundledCorePresent: true, usesFixtures: false) == false)
-        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .embedded, bundledCorePresent: false, usesFixtures: false) == false)
-        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .embedded, bundledCorePresent: true, usesFixtures: true) == false)
+    @Test func seedsAtLaunchOnlyForEmbeddedWithABundledCore() {
+        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .embedded, bundledCorePresent: true) == true)
+        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .external, bundledCorePresent: true) == false)
+        #expect(EmbeddedScope.seedsAtLaunch(activeKind: .embedded, bundledCorePresent: false) == false)
     }
 
     // MARK: Tester — load edge cases (SP-AC14, SP-AC15)
