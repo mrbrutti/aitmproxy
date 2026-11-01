@@ -1125,7 +1125,7 @@ fn resume_all_skip_toast_is_on_screen_and_the_bar_still_targets_in_scope() {
     assert_eq!(app.update(action), vec![BusRequest::Resume("i1".into())]);
     let text = text_of(&app, 160, 40);
     assert!(
-        text.contains("Resume all: 1 resumed, 2 skipped out of scope"),
+        text.contains("Resume all: 1 resumed, 2 skipped (out of scope:"),
         "{text}"
     );
     // `a` on the oldest (out of scope) is refused with the host; the bar
@@ -1139,6 +1139,6 @@ fn resume_all_skip_toast_is_on_screen_and_the_bar_still_targets_in_scope() {
     assert!(app.update(Action::ResumeAll).is_empty());
     assert_eq!(
         toast(&app),
-        "Resume all: 0 resumed, 3 skipped out of scope (add their hosts to scope to act)"
+        "Resume all: 0 resumed, 3 skipped (out of scope: add their hosts to scope to act)"
     );
 }

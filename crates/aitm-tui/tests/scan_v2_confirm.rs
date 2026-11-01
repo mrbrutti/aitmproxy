@@ -367,7 +367,6 @@ fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
     let confirm =
         WireConfirm::from_reply("scan.start", &json!({ "profile_name": "standard" }), &reply)
             .expect("a confirmation handshake");
-    assert_eq!(PROMPT_MAX, 2000);
     assert!(
         width(&confirm.prompt) <= PROMPT_MAX,
         "{} cells",

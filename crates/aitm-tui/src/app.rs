@@ -34,13 +34,13 @@ use crate::scan::{
     due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
     parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
     tag_parts, typed_origin, usable_selector, walk, Dir, EditorField, FieldKind, IssueFilterKey,
-    IssuePane, JobPane, Launch, LaunchVerb, MapPane, PendingLaunch, ProfileEditor, ProfilePane,
-    ScanError, ScanOffer, ScanState, ScanTab, WireConfirm, CLAMPED_FIELD_MAX, CLAMPED_MAX,
-    ERROR_DETAIL_MAX, ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER,
-    OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX,
+    IssuePane, JobPane, Launch, LaunchVerb, MapPane, MapSource, PendingLaunch, ProfileEditor,
+    ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, WireConfirm, CLAMPED_FIELD_MAX,
+    CLAMPED_MAX, ERROR_DETAIL_MAX, ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS,
+    NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX,
     SAVED_PATH_MAX, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
-use crate::text::{clean, truncate};
+use crate::text::{cut_to, truncate};
 use crate::theme::Theme;
 use crate::ui::overlays;
 use crate::viewers::json;
@@ -1332,7 +1332,8 @@ impl App {
     /// chars), and the buffer shrunk, so a raw core message a megabyte long
     /// neither sits in the ring nor overflows the bar's width sums.
     pub fn toast(&mut self, level: Level, text: impl Into<String>) {
-        let mut text = truncate(&clean(&text.into()), TOAST_MAX);
+        let mut text = text.into();
+        cut_to(&mut text, TOAST_MAX);
         text.shrink_to_fit();
         self.toasts.push_back(Toast {
             level,
@@ -1623,7 +1624,7 @@ impl App {
                     self.toast(
                         Level::Warn,
                         format!(
-                            "Resume all: {sent} resumed, {skipped} skipped out of scope (add their hosts to scope to act)"
+                            "Resume all: {sent} resumed, {skipped} skipped (out of scope: add their hosts to scope to act)"
                         ),
                     );
                 }
@@ -4131,9 +4132,7 @@ impl App {
                         // bus that also offers `scan.discover` (the `m`
                         // fallback) the result stays in `legacy.*` and the
                         // folded v2 lists are kept (fix round H, H20; G19).
-                        if crate::scan::MapSource::from(self.scan_offer())
-                            == crate::scan::MapSource::Legacy
-                        {
+                        if MapSource::from(self.scan_offer()) == MapSource::Legacy {
                             self.scan.sitemap.show_legacy(&self.scan.legacy);
                         }
                         self.toast(
@@ -4160,7 +4159,7 @@ impl App {
                 }
                 out.push(BusRequest::Refresh);
             }
-            BusEvent::CallFailed { name, message } => {
+            BusEvent::CallFailed { name, mut message } => {
                 // A failed tracked `browser.*` call is the view's answer: the
                 // panel must show it (§2.10(c)), not only the status line.
                 if is_tracked_browser_call(&name) {
@@ -4193,7 +4192,8 @@ impl App {
                     // once here (fix round H, H35; D6 hostile-core bounds).
                     "scan.discover" => {
                         self.scan.legacy.running = false;
-                        self.scan.legacy.error = Some(truncate(&clean(&message), ERROR_DETAIL_MAX));
+                        cut_to(&mut message, ERROR_DETAIL_MAX);
+                        self.scan.legacy.error = Some(message.clone());
                     }
                     _ => {}
                 }
@@ -4837,14 +4837,19 @@ impl App {
         if self.scan.tab != ScanTab::Profiles {
             return;
         }
-        if self.scan.profiles.editor.is_none() {
-            self.toast(Level::Info, NO_EDITOR);
+        // One blocker, the no-editor one first (fix round H, H48, H52).
+        let blocker = if self.scan.profiles.editor.is_none() {
+            Some(NO_EDITOR)
+        } else if self.scan.profiles.pane != ProfilePane::Fields {
+            Some(E_NEEDS_FIELDS)
+        } else {
+            None
+        };
+        if let Some(why) = blocker {
+            self.toast(Level::Info, why);
             return;
         }
-        if self.scan.profiles.pane != ProfilePane::Fields {
-            self.toast(Level::Info, E_NEEDS_FIELDS);
-            return;
-        }
+        // Checked above; the let-else only satisfies the borrow.
         let Some(editor) = self.scan.profiles.editor.as_mut() else {
             return;
         };
@@ -6944,7 +6949,9 @@ mod tests {
         );
         assert_eq!(
             app.current_toast().map(|t| t.text.as_str()),
-            Some("Resume all: 1 resumed, 1 skipped out of scope (add their hosts to scope to act)")
+            Some(
+                "Resume all: 1 resumed, 1 skipped (out of scope: add their hosts to scope to act)"
+            )
         );
     }
 

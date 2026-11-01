@@ -475,7 +475,7 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         PromptKind::Pin => ("pin host:", "⏎ pin"),
         PromptKind::ScopeAdd => (
             "scope add:",
-            "host · host:port · *.wildcard, a human action",
+            "host · host:port · *.wildcard (a human action)",
         ),
         PromptKind::PocName => (
             "poc name:",

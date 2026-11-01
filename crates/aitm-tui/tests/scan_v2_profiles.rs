@@ -1972,11 +1972,9 @@ fn an_origin_refused_by_the_rule_keeps_the_prompt_open_but_out_of_scope_closes_i
 }
 
 /// Fix round H, H45: the Fields pane walks by key, the way the live
-/// operator drives it. From the open `standard` editor, `Esc` drops to the
-/// List pane with the draft kept, `Tab` returns to Fields, `Home` then
-/// `Down` twelve times puts the field cursor on `use_browser` (its
-/// `EDITOR_FIELDS` index), and `e` twice cycles it `auto` -> `always` ->
-/// `never`, read off the crawl Fields line at 200x50; no prompt opens.
+/// operator drives it: the key map pins each key to its action, then the
+/// walk of [`walk_to_use_browser_and_set_never`] from the open `standard`
+/// editor.
 #[test]
 fn the_fields_pane_walks_by_key() {
     let mut app = app();
@@ -1992,11 +1990,21 @@ fn the_fields_pane_walks_by_key() {
     ] {
         assert_eq!(keys::map(press(key), Mode::Scan), Some(action), "{key:?}");
     }
+    walk_to_use_browser_and_set_never(&mut app);
+}
+
+/// The live cell's walk (fix round H, H45): `Esc` drops to the List pane
+/// with the draft kept, `Tab` returns to Fields, `Home` then `Down` twelve
+/// times (the `EDITOR_FIELDS` index of `use_browser`) puts the field cursor
+/// on it, and `e` twice cycles it `auto` -> `always` -> `never`, read off
+/// the crawl Fields line at 200x50; no prompt opens.
+fn walk_to_use_browser_and_set_never(app: &mut App) {
+    let pane_before = app.scan.profiles.pane;
     let _ = app.update(Action::Back);
     assert_eq!(
         app.scan.profiles.pane,
         ProfilePane::List,
-        "Esc drops to the list"
+        "Esc drops to the list from {pane_before:?}"
     );
     assert!(app.scan.profiles.editor.is_some(), "the draft is kept");
     assert_eq!(app.mode, Mode::Scan);
@@ -2019,13 +2027,13 @@ fn the_fields_pane_walks_by_key() {
     assert_eq!(
         editor.field(),
         EditorField::UseBrowser,
-        "field {}",
+        "field {} after pane {pane_before:?}",
         editor.field
     );
     let _ = app.update(Action::ScanEdit);
     let _ = app.update(Action::ScanEdit);
     assert_eq!(app.mode, Mode::Scan, "e on a cycle field opens no prompt");
-    let text = text_of(&app, 200, 50);
+    let text = text_of(app, 200, 50);
     let line = line_with(&text, "browser ").unwrap_or_else(|| panic!("no crawl line: {text}"));
     assert!(line.contains("browser never"), "{line:?}");
 }
@@ -2045,33 +2053,7 @@ fn the_fields_pane_walks_by_key_after_an_origin_prompt() {
     }
     let _ = app.update(Action::Submit);
     assert_eq!(app.mode, Mode::Scan, "the prompt closed: {:?}", toast(&app));
-    let pane_after_origin = app.scan.profiles.pane;
-    let _ = app.update(Action::Back);
-    assert_eq!(
-        app.scan.profiles.pane,
-        ProfilePane::List,
-        "Esc drops to the list from {pane_after_origin:?}"
-    );
-    assert!(app.scan.profiles.editor.is_some(), "the draft is kept");
-    let _ = app.update(Action::ScanPaneNext);
-    assert_eq!(app.scan.profiles.pane, ProfilePane::Fields);
-    let _ = app.update(Action::Home);
-    for _ in 0..12 {
-        let _ = app.update(Action::Down);
-    }
-    let editor = app.scan.profiles.editor.as_ref().expect("an editor");
-    assert_eq!(
-        editor.field(),
-        EditorField::UseBrowser,
-        "field {} after origin pane {pane_after_origin:?}",
-        editor.field
-    );
-    let _ = app.update(Action::ScanEdit);
-    let _ = app.update(Action::ScanEdit);
-    assert_eq!(app.mode, Mode::Scan, "e on a cycle field opens no prompt");
-    let text = text_of(&app, 200, 50);
-    let line = line_with(&text, "browser ").unwrap_or_else(|| panic!("no crawl line: {text}"));
-    assert!(line.contains("browser never"), "{line:?}");
+    walk_to_use_browser_and_set_never(&mut app);
 }
 
 /// Fix round H, H43 (same class as H18): a prompt draws over the view it

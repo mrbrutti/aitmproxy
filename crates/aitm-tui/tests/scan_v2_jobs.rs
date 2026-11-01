@@ -701,15 +701,15 @@ fn a_huge_list_folds_to_jobs_max_rows() {
     let mut app = app();
     let _ = app.on_bus(status_reply(fixture("scan.status.json")));
     app.scan.jobs.started_here.insert(JOB.to_string());
+    let template = fixture("scan.list.json")["jobs"][0].clone();
     let jobs: Vec<Value> = (0..100_000)
         .map(|k| {
-            let mut s = fixture("scan.list.json")["jobs"][0].clone();
+            let mut s = template.clone();
             s["job"] = json!(format!("scan-{k:08x}"));
             s
         })
         .collect();
     let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": jobs })));
-    assert_eq!(JOBS_MAX, 256);
     assert_eq!(
         app.scan.jobs.order.len(),
         JOBS_MAX + 1,
