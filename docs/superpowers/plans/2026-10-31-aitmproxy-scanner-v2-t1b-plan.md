@@ -1535,6 +1535,24 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | Quality | Important | `CheckRegistry::replace_source` silently skips an id another source owns and returns `()` | fix task dispatched 2026-11-01: returns `#[must_use] Vec<DuplicateCheck>`; Task 13 raises them as load errors |
+| 3 | Quality | Minor | `ScannerConfig` struct doc still says "every field is a hard ceiling" | fix (wave-1 fix task) |
+| 1 | Quality | Minor | `job_ctx_report_defaults_are_no_ops` asserts `() == ()` | fix (wave-1 fix task): plain calls + `budget_left() == 7` |
+| 1 | Quality | Minor | `RecordingHost::probe_raw` records URLs into `payloads()` | fix (wave-1 fix task): separate `raw_urls()` list |
+| 4 | Quality | Minor | `check_meta_error_names_the_key` uses `contains`; `run_kind` test never covers `RunKind::Check` | fix (wave-1 fix task): literal Display + a `Check` arm case |
+| 4 | Quality | Minor | `HostRunKind` hand-mirrors `engine::RunKind` with a variant-for-variant match | accepted by orchestrator 2026-11-01: `RunKind` is the rhai engine's own enum and the exhaustive match turns drift into a compile error; the seam enum stays in `aitm-plugin` per call B29 |
+| 1 | Quality | Minor | `ScanErrorCode::as_str` indexes the table by discriminant on a test-held invariant | fix (wave-1 fix task): add `const _: () = assert!(SCAN_ERROR_CODES.len() == 9)`; keep the index |
+| 4 | Quality | Minor | `block_on_browser` doc points at `block_on_send` instead of `drive` | fix (wave-1 fix task) |
+| 1 | Quality | Minor | `scan_error` erases the code into a string callers must re-parse | fix (wave-1 fix task): typed `ScanRefusal { code, message }` behind the same wire `Display`; `parse_message` kept |
+| 3 | Spec | Minor | `tempfile = "3"` dev-dep not added and the fallback not recorded | accepted by orchestrator 2026-11-01: not in the offline cache at Task 3 time; seeded from the Terminal before wave 2; Tasks 6/7 may add it or use `std::env::temp_dir()` + a uuid subdir |
+| 4 | Spec | Minor | `rhai.api.json` `http.send` signature lacks `elapsed_ms` | fix: Task 13 updates the signature string in its one edit of that file |
+| 3 | Spec | Minor | `Ceilings` derives `Eq` where the plan said `Debug, Clone, PartialEq` | accepted by orchestrator 2026-11-01: `Ceilings` holds only integers; the `Eq`-dropped reason applies to `ScannerConfig` only |
+| 1-4 | Spec | Minor | Unrequested additions: `Debug` for `CheckRegistry`/`JobBus`, `Default` for `NullJob`/`NullHost` (clippy), dead `block_on` removed, seven extra tests | accepted by orchestrator 2026-11-01: each is a gate consequence or a stronger pin; none changes behaviour |
+| 4 | Security | Minor | Unbounded `check_timeout_s` reaches `Instant + Duration` (panics on overflow) | fix (wave-1 fix task): `checked_add` with a far-future fallback in `begin_run`/`extend_deadline`; Task 6 clamps `budget.check_timeout_s` by `ceilings.time_s` |
+| 3 | Security | Minor | `job_id`/`issue_id` carry 32 bits of randomness; no collision check | fix: Task 7's store re-mints on an existing id (bounded); doc note on `issue_id()` (wave-1 fix task) |
+| 1 | Security | Minor | `replace_source` drops a squatted id silently; registration order unpinned | fix: same as the quality Important (typed return); Task 10 registers native → bundled → custom explicitly and reports duplicates |
+| 6 | Security | Note | Profile `name` must be validated before it becomes a path (`../` traversal) | routed to Task 6 (in flight) 2026-11-01 |
+| 8 | Security | Note | Zero ceilings/budgets must not divide by zero or spin in the pacer | routed to Task 8 (in flight) 2026-11-01 |
 
 ## Shipped
 
