@@ -501,6 +501,14 @@ fn open_redirect(mode: SeedMode, query: &str) -> Resp {
     match mode {
         SeedMode::Vulnerable => redirect(&next),
         SeedMode::Patched => {
+            // Decide on the bytes that will reach the wire: `redirect()` drops
+            // CR/LF and `HeaderValue` keeps TAB, which browsers strip from a
+            // `Location` before parsing, so `/\r/host` or `/\t/host` would pass
+            // the check and leave as `//host`. Strip them here, then check.
+            let next: String = next
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\r' | '\n'))
+                .collect();
             if is_safe_relative(&next) {
                 redirect(&next)
             } else {
@@ -711,7 +719,10 @@ pub(crate) fn not_found() -> Resp {
 /// neither `/` nor `\` (browsers read `//host` AND `/\host` as scheme-relative
 /// URLs to another host), nor a percent-encoded `/` or `\` that a second decode
 /// would turn into one (`/%2fhost`, `/%5chost`; the query parser decoded once
-/// already, so these are the double-encoded forms). T3 finding, 2026-11-01.
+/// already, so these are the double-encoded forms). The caller strips TAB, CR
+/// and LF first (`redirect()` drops CR/LF, browsers strip TAB), so a control
+/// character cannot hide the second character from this check. T3 finding and
+/// security review, 2026-11-01.
 fn is_safe_relative(next: &str) -> bool {
     let mut chars = next.chars();
     if chars.next() != Some('/') {
@@ -720,14 +731,10 @@ fn is_safe_relative(next: &str) -> bool {
     match chars.next() {
         None => true,
         Some('/') | Some('\\') => false,
-        Some('%') => {
-            let enc: String = next[1..]
-                .chars()
-                .take(3)
-                .collect::<String>()
-                .to_ascii_lowercase();
-            !(enc == "%2f" || enc == "%5c")
-        }
+        Some('%') => !next
+            .as_bytes()
+            .get(1..4)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"%2f") || b.eq_ignore_ascii_case(b"%5c")),
         Some(_) => true,
     }
 }
@@ -854,6 +861,13 @@ mod tests {
     }
 
     /// `GET path` on `conn`; returns the full response.
+    fn location(resp: &Resp) -> Option<String> {
+        resp.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
     async fn get_on(state: &Arc<AppState>, conn: &Arc<ConnInfo>, path: &str) -> Resp {
         let req = Request::builder()
             .method("GET")
@@ -1158,12 +1172,6 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_with_crlf_in_next_never_panics() {
-        let location = |resp: &Resp| {
-            resp.headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        };
         // V honours any `next`, but a CR/LF is not a header value hyper will
         // carry: it is stripped, the rest of the open redirect survives.
         let (state, conn) = fresh(SeedMode::Vulnerable);
@@ -1189,12 +1197,6 @@ mod tests {
     /// percent-encoded (once: decoded by the query parser; twice: still literal).
     #[tokio::test]
     async fn patched_redirect_rejects_scheme_relative_forms() {
-        let location = |resp: &Resp| {
-            resp.headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        };
         let (state, conn) = fresh(SeedMode::Patched);
         for next in [
             "//evil.example/",
@@ -1204,6 +1206,13 @@ mod tests {
             "/%255cevil.example/", // one decode -> `/%5cevil.example/`, still rejected
             "/%252fevil.example/",
             "/%5Cevil.example/",
+            // TAB / CR / LF in position two are stripped before the check (`redirect()`
+            // drops CR/LF, browsers strip TAB), so they cannot hide a `/` or `\\`.
+            "/%0d/evil.example/",
+            "/%0a\\evil.example/",
+            "/%09/evil.example/",
+            "/%09\\evil.example/",
+            "/%0d%0a//evil.example/",
             "https://evil.example/",
             "evil.example",
             "",
@@ -1216,11 +1225,16 @@ mod tests {
                 "P must fall back to `/` for {next:?}"
             );
         }
-        for next in ["/account?tab=overview", "/", "/a%2fb", "/%41"] {
+        for (next, want) in [
+            ("/account?tab=overview", "/account?tab=overview"),
+            ("/", "/"),
+            ("/a%2fb", "/a/b"),
+            ("/%41", "/A"),
+        ] {
             let resp = get_on(&state, &conn, &format!("/redirect?next={next}")).await;
             assert_eq!(
                 location(&resp).as_deref(),
-                Some(percent_decode(next).as_str()),
+                Some(want),
                 "P honours a same-origin path {next:?}"
             );
         }
