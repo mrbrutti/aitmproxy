@@ -766,6 +766,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | fix round | done | H81 in `b093da9b`; `--selftest` 75 ok; target boots with 40 ms where the harness offers `latency_ms` | latency run (pre-merge) with T10's harness checked out |
 | 15 | live smoke | latency 40 ms | 55 ok, 1 noted, 6 failed: T7-17 "while running" passed; the sampled job still finished within one sample (engine probes about four at a time, 100 probes/s at 40 ms) | H82 (cell): 300 ms |
 | H (cell) | fix round | done | H82 in `a84b8d63`; `--selftest` 76 ok; cell complete | latency run at 300 ms (pre-merge) |
+| 15 | live smoke | 300 ms | 55 ok, 0 noted, 1 failed: every UI observation live; `x` landed during the crawl so no `progress` push preceded `cancelled` | H83 (cell): wait for the audit phase and one `progress` before `x` |
 
 ## Shipped
 
