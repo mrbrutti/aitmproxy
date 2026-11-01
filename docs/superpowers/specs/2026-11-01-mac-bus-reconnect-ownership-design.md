@@ -249,6 +249,12 @@ worth the signature change (non-goal). `pollLoop`'s `defer` that zeroes the rate
 superseded run within one main-actor turn of cancellation, before the new connection has sampled
 anything, as today.
 
+**Orchestrator amendment (panel, security Minor, 2026-11-01).** The three refreshes at the top of a poll
+iteration stay unplumbed, but the iteration is owner-checked between them: a `guard owns() else { return }`
+follows each of `await refreshScope()`, `await refreshProxyStatus()` and the CA refresh, so a superseded
+run never issues the next refresh through `self.client` (which a later `start()` may already own, possibly
+mid-handshake — a frame ahead of the token line makes the core answer `unauthorized` and close).
+
 ### D3. `stop()` without a following `start()`
 
 With rule 1, a bare `stop()` leaves `session.bus == .disconnected`, `resolvedRole == nil`,
@@ -380,8 +386,9 @@ Contract of `tools/selftest-live-reconnect.sh`:
   one click on Resume Proxy, `capturing == true` within 10 s. No retry of the click: the AX label
   said connected, so `live()` must succeed at once. A `tools/winshot.swift <pid>
   /tmp/claude/reconnect-<tag>-<trigger>.png` after each sub-procedure is the attached evidence.
-- **Teardown:** `set frontmost to true` + `keystroke "q" using command down` (the normal quit
-  path, so `willTerminate` reaps the child), bounded wait, then `kill` + `pkill -f
+- **Teardown:** a path-targeted `tell application "<bundle>" to quit` (the normal quit path, so
+  `willTerminate` reaps the child; **orchestrator amendment, panel security Minor:** not a ⌘Q
+  keystroke, which goes to whatever is frontmost on the operator's desktop), bounded wait, then `kill` + `pkill -f
   '<bundle>/Contents/Resources/core/'` as the fallback; the `EXIT` trap does the same. Never a
   global `pkill`.
 - **Output:** one `reconnect-live: <trigger>: <what was observed>` line per step; final line
