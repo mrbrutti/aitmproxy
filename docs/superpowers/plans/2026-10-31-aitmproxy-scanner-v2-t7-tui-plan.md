@@ -737,6 +737,7 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | live smoke | run 4 | 26 ok, 1 noted, 8 failed: the standard job finished in about a second (sampling and cancel too late), the push thread spun on an instant-`None` read after one timeout, the 8be3e070 engine still refuses `scan.sitemap {}` (fixed on later heads), zero issues again while run 3's pushes show 35 `issue` events for the same kind of job | H62, H63, H64 (cell); the issue contradiction put to T1b; proof core to the final head |
 | H (Rust) | fix round | done | H56 `7705cf0b`, H50 `c609d9fa`, H52 `e4923baa`, H53 `4cf42aa6`; crate gate green (532 tests) | final Rust panel over `03757f77..4cf42aa6` |
 | H (Rust) | coder note | Minor | legacy failure toast now 240 cells; `:scan` failure from Flows reaches Jobs by toast only; key line clipped at inner height <= 5 | ratified |
+| 15 | engine | explained | T1b: cross-job issue dedupe; the first finder owns the issue, `scan.issues {job}` for a later job shows nothing; `Issue.jobs` membership coming | H65 (cell): T7-17 runs first on the fresh core |
 
 ## Shipped
 
