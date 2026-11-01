@@ -147,6 +147,7 @@ Task 8 (plugin) → Task 9 (wiring) → {Task 10 main.rs ∥ Task 11 pins} → T
     pub struct UnsetOutcome { pub restored: Vec<String>, pub left_alone: Vec<String>, pub status: Status }
     pub enum ReadError { Unavailable(String), ToolMissing(String), Failed(String) }
     pub enum WriteError { NeedsPrivilege(String), ToolMissing(String), Failed(String), Hung(String) }
+    // Shipped shape (F3, 2026-10-31): `NeedsPrivilege { line: String }` — the failing rendered line; the engine supplies the §D3 remedy.
     pub const BYPASS_DEFAULT: [&str; 5] = ["localhost", "127.0.0.1", "::1", "*.local", "169.254/16"];
     pub const STATE_FILE_NAME: &str = "system-proxy-state.json";
     pub const WATCHDOG_LOG_NAME: &str = "system-proxy-watchdog.log";
@@ -1624,6 +1625,10 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 8 | spec (re-run) | Important | `proxy.system.status` 2 s cache for non-trusted callers (S3) had no spec sentence | spec §D6 + §D2 amended 2026-10-31; no code change |
+| 3 | security (re-run) | Minor | a KDE tool absent at detection keeps its bare name and is spawned by PATH if it appears later | accepted (recorded), orchestrator 2026-10-31: same-privilege residual; the error message naming the tool is worth more |
+| 6 | spec (re-run) | Minor | `Status::to_map` and `endpoints_equal_wrote` are `pub` | fixed in F4 (`pub(crate)`) |
+| 1 | spec (re-run) | Minor | plan Task 1 still spelled `NeedsPrivilege(String)`; §D2 PATH clause half-stale after S2 | plan annotated, spec §D2 amended 2026-10-31 |
 | 14 (live) | owner | Important | First macOS live run: `auto` startup set ran before the port bind; port 18080 was held by another session's aitm, the core set the proxy then died; watchdog restored in ~1 s | fixed in 13f5809e (F2: `bind_then_recover_system_proxy`, test `port_conflict_never_sets_the_system_proxy`) |
 | 6 | spec | Important | `status()` returned `off`/`other` from scutil when no network service is enabled; §D3 says `Unknown` + "no enabled network service" | fixed in F3 (pending SHA) |
 | 6 | quality | Important | `read_status` swallowed the per-service read error; `managed_by_us: false` with no log and no reason | fixed in F3 |

@@ -148,7 +148,7 @@ impl SystemProxy {
     pub fn detect(exec: Arc<dyn Executor>, cfg: &SystemProxyConfig, ours: Endpoint, watchdog_exe: Option<PathBuf>) -> SystemProxy;
     pub fn detect_with(exec: Arc<dyn Executor>, cfg: &SystemProxyConfig, ours: Endpoint, watchdog_exe: Option<PathBuf>,
                        target_os: &str, env: &dyn Fn(&str) -> Option<String>) -> SystemProxy;   // the testable form
-    pub fn status(&self) -> Status;                                  // fresh read: effective + per-service
+    pub fn status(&self) -> Status;                                  // fresh read: effective + per-service (see §D6 for the agent-side cache)
     pub fn summary(&self) -> Summary;                                // cached (≤ 5 s old) compact view for proxy.status
     pub fn set(&self, req: &SetRequest) -> anyhow::Result<Status>;
     pub fn unset(&self) -> anyhow::Result<UnsetOutcome>;
@@ -175,8 +175,9 @@ stdout or stderr; `ReadError::Unavailable` when a read prints
 Absolute programs, resolved by the crate (`aitm_ca::exec::absolute_program` does
 not know them): `/usr/sbin/networksetup`, `/usr/sbin/scutil`,
 `/usr/bin/gsettings`; `kwriteconfig6`, `kwriteconfig5`, `kreadconfig6`,
-`kreadconfig5`, `dbus-send` by name on `PATH` (a missing one is reported as the
-mechanism's tool missing, never as "off"). Timeouts
+`kreadconfig5`, `dbus-send` located by name on `PATH` at detection and spawned by
+the absolute path found (a missing one is reported as the mechanism's tool
+missing, never as "off"). Timeouts
 **(Architect's call)**: `RealExecutor::with_timeouts(10 s, 30 s)`; a write that
 takes longer than 30 s is a hang and is reported as an error naming the
 rendered command.
@@ -294,7 +295,11 @@ defaults stay minimal and testable), and every live proof on Matt's Mac uses it.
 
 ### D6. Status model, verb schemas, example payloads
 
-`proxy.system.status` — params: none. Result object (field names are the
+`proxy.system.status` — params: none. A call from a caller that is not a
+trusted control surface (an agent over MCP) is served from the last full status
+when it is at most 2 s old, with `setting` always live; operator surfaces (mac
+app, TUI, web, CLI) always get a fresh read (added 2026-10-31 from the security
+panel, S3). Result object (field names are the
 contract):
 
 ```json
