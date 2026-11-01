@@ -5,7 +5,6 @@ import SwiftUI
 /// list / intercept bar / inspector, with the status bar across the bottom.
 struct ShellView: View {
     @Environment(Session.self) private var session
-    @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
     @State private var bus: BusService?
     @State private var embeddedCore: EmbeddedCoreController?
@@ -13,19 +12,12 @@ struct ShellView: View {
 
     var body: some View {
         @Bindable var session = session
-        Group {
-            // APP_KIT_GALLERY=1 shows the parts gallery (DesignKit/KitGallery.swift) in place of the shell.
-            if KitGallery.enabled {
-                KitGallery()
-            } else {
-                VStack(spacing: 0) {
-                    // Hosting controllers do not inherit this view's environment: pass it on.
-                    ShellSplitView(sidebarVisible: $session.sidebarVisible,
-                                   sidebar: SidebarView().environment(session).themed(),
-                                   main: MainView().environment(session).themed())
-                    StatusBar()
-                }
-            }
+        VStack(spacing: 0) {
+            // Hosting controllers do not inherit this view's environment: pass it on.
+            ShellSplitView(sidebarVisible: $session.sidebarVisible,
+                           sidebar: SidebarView().environment(session).themed(),
+                           main: MainView().environment(session).themed())
+            StatusBar()
         }
         .background(Tok.Ground.surface.color)
         // Drop a HAR (or, after F10, a mitmproxy/Proxyman/Charles file) anywhere on the window (S-065).
@@ -67,6 +59,12 @@ struct ShellView: View {
         .sheet(isPresented: Binding(get: { session.scopeSheetVisible }, set: { session.scopeSheetVisible = $0 })) {
             ScopeSheet().environment(session).themed().noInitialFocus()
         }
+        // The first-run sheet (spec D17.8): once per store, when the embedded core is ready, the
+        // bus is the operator's and the OS store says the CA is not trusted.
+        .sheet(isPresented: Binding(get: { session.setupSheetVisible }, set: { session.setupSheetVisible = $0 })) {
+            SetupSheet().environment(session).themed().noInitialFocus().fitsContent()
+        }
+        .onChange(of: session.setupSheetDue, initial: true) { _, due in if due { session.presentSetupSheetIfDue() } }
         .toolbar { ShellToolbar(sidebarVisible: $session.sidebarVisible) }
         .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
         .onChange(of: session.reconnectTick) { bus?.start() }
@@ -74,35 +72,30 @@ struct ShellView: View {
         .task {
             session.attachActivityHooks()
             if session.layout == .detached { openWindow(id: "inspector") }
-            if Store.usesFixtures {
-                session.loadFixtures()
-            } else {
-                let service = BusService(session: session)
-                session.actions = service
-                // The active connection is a switchable, persisted choice (Task 7,
-                // AC10): embedded by default, external when the operator picks it in
-                // Settings ▸ Bus. The driver turns that choice into start/stop of the
-                // bundled core (when present — Task 9) and the matching bus endpoint;
-                // `activate()` applies the restored choice on launch. The health
-                // surface (Task 8) drives the status dot + core-log panel.
-                let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service, health: session.coreHealth)
-                let driver = LiveConnectionDriver(embedded: controller, bus: service)
-                let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence(defaults: Store.defaults))
-                model.activate()
-                session.connection = model
-                embeddedCore = controller
-                bus = service
-                // Operator-launch activation of the macOS capture extension (Task 13,
-                // NE-AC11): the only call site, so no bus/MCP/agent path can trigger it.
-                // Inert unless this build embeds the extension.
-                if captureExtension == nil {
-                    let capture = ExtensionController(health: session.coreHealth)
-                    capture.start()
-                    captureExtension = capture
-                }
+            let service = BusService(session: session)
+            session.actions = service
+            // The active connection is a switchable, persisted choice (Task 7,
+            // AC10): embedded by default, external when the operator picks it in
+            // Settings ▸ Bus. The driver turns that choice into start/stop of the
+            // bundled core (when present — Task 9) and the matching bus endpoint;
+            // `activate()` applies the restored choice on launch. The health
+            // surface (Task 8) drives the status dot + core-log panel.
+            let controller = EmbeddedCoreController(coreID: session.activeCoreID, bus: service, health: session.coreHealth)
+            let driver = LiveConnectionDriver(embedded: controller, bus: service)
+            let model = ActiveConnectionModel(driver: driver, persistence: UserDefaultsActiveKindPersistence(defaults: Store.defaults))
+            model.activate()
+            session.connection = model
+            embeddedCore = controller
+            bus = service
+            // Operator-launch activation of the macOS capture extension (Task 13,
+            // NE-AC11): the only call site, so no bus/MCP/agent path can trigger it.
+            // Inert unless this build embeds the extension.
+            if captureExtension == nil {
+                let capture = ExtensionController(health: session.coreHealth)
+                capture.start()
+                captureExtension = capture
             }
             SelfTest.runIfRequested(session: session)
-            Snapshot.runIfRequested(session: session, openSettings: openSettings)
         }
     }
 }
@@ -182,7 +175,7 @@ struct MainView: View {
             } else if session.page == .connections {
                 ConnectionDashboard().frame(height: 260)
                 Rule()
-            } else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected = session.bus {
+            } else if session.scopeHosts.isEmpty, case .connected = session.bus {
                 ScopeBanner()
                 Rule()
             }

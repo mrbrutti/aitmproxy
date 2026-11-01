@@ -1,0 +1,6 @@
+== build (debug)
+Build complete! (18.89 sec)
+== core from /Users/matt/Security/aitmproxy/target/release
+== bundle /tmp/Aitmproxy-dev-nf.app (Aitmproxy-nf)
+== launched pid 54722 · store /tmp/Aitmproxy-dev-state-nf · stop: kill 54722
+sandbox_extension_issue_file_to_process failed for /tmp/Aitmproxy-dev-nf.app: 1 (Operation not permitted)

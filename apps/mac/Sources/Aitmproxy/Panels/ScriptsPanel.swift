@@ -132,9 +132,6 @@ struct ScriptsPanel: View {
             } catch {
                 session.lastError = "script.list: \(BusService.describe(error))"
             }
-        } else if Store.usesFixtures {
-            scripts = Fixtures.scripts
-            note = "Sample scripts — the live list arrives when the core lists its scripts" // F8 script.list
         } else {
             scripts = []
             note = "The core does not list scripts yet" // F8 script.list
@@ -152,7 +149,6 @@ struct ScriptsPanel: View {
         let previous = scripts[index].enabled
         scripts[index].enabled = on
         syncCount()
-        if Store.usesFixtures, !hasBusToggle { return }
         guard hasBusToggle else {
             scripts[index].enabled = previous
             syncCount()

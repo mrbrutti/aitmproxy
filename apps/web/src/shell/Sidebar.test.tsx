@@ -1,19 +1,19 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@solidjs/testing-library';
-import { createMockBus } from '~/bus/mock';
 import { BusError, type BusClient, type ToolDef } from '~/bus/types';
 import { AppProvider } from '~/state/context';
 import { createAppStore } from '~/state/app';
 import { scriptsStore } from '~/panels/scripts/store';
+import { memoryBus, TEST_VERSION } from '~/state/bridgeBus.testkit';
 import { Sidebar } from './Sidebar';
 
-/** The mock bus, optionally without a `version` in `proxy.status` (a core older than the field). */
+/** The in-memory bus, optionally without a `version` in `proxy.status` (a core older than the field). */
 function mount(opts: { version: boolean }) {
-  const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
+  const mem = memoryBus();
   const bus: BusClient = {
-    ...mock,
+    ...mem,
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
-      const result = await mock.call<T>(tool, args);
+      const result = await mem.call<T>(tool, args);
       if (tool === 'proxy.status' && !opts.version) {
         const { version: _dropped, ...rest } = result as Record<string, unknown>;
         return rest as T;
@@ -44,8 +44,8 @@ describe('Sidebar version', () => {
   it('shows the core’s version as v<version> once proxy.status answers', async () => {
     ({ bus } = mount({ version: true }));
 
-    expect((await screen.findByText('v0.0.0-fixtures')).tagName).toBe('SPAN');
-    expect(brandText()).toBe('aitmproxyv0.0.0-fixtures');
+    expect((await screen.findByText(`v${TEST_VERSION}`)).tagName).toBe('SPAN');
+    expect(brandText()).toBe(`aitmproxyv${TEST_VERSION}`);
     expect(screen.queryByText(/0\.3\.0/)).toBeNull(); // the old hard-coded number is gone
   });
 
@@ -58,30 +58,60 @@ describe('Sidebar version', () => {
   });
 });
 
+/** One `script.list` row as the core sends it (`List::invoke` in crates/aitm-plugin-rhai/src/commands.rs). */
+interface ScriptInfo {
+  name: string;
+  path: string;
+  api: string;
+  hooks: string[];
+  enabled: boolean;
+  last_error: string | null;
+}
+
 describe('Sidebar Scripts count', () => {
-  const mocks: BusClient[] = [];
+  const buses: BusClient[] = [];
   afterEach(() => {
-    while (mocks.length) mocks.pop()!.close();
+    while (buses.length) buses.pop()!.close();
   });
 
-  /** The mock bus (3 scripts, 2 enabled), with the tool list and the `script.list` answer overridable. */
+  /**
+   * Three loaded scripts, two enabled — one of those with a hook error, which `activeCount`
+   * (panels/scripts/model.ts) does not subtract, so the count is 2. Fresh copies: a toggle mutates them.
+   */
+  const loadedScripts = (): ScriptInfo[] => [
+    { name: 'redact-auth', path: '/home/operator/.aitm/scripts/redact-auth.rhai', api: '1', hooks: ['on_request', 'on_response'], enabled: true, last_error: null },
+    { name: 'tag-admin', path: '/home/operator/.aitm/scripts/tag-admin.rhai', api: '1', hooks: ['on_request'], enabled: false, last_error: null },
+    { name: 'flaky-parser', path: '/home/operator/.aitm/scripts/flaky-parser.rhai', api: '1', hooks: ['on_response'], enabled: true, last_error: 'on_response: Property not found: content_type (line 12)' },
+  ];
+
+  /**
+   * The in-memory bus serving those scripts, with `script.enable` / `script.disable` flipping one and
+   * answering `{ name, enabled }` as the core does; the tool list and the `script.list` answer are overridable.
+   */
   function mountScripts(opts: { tools?: (all: ToolDef[]) => ToolDef[]; list?: () => Promise<unknown> | undefined } = {}) {
-    const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
-    mocks.push(mock);
+    const scripts = loadedScripts();
+    const mem = memoryBus({ scripts, extraTools: ['script.enable', 'script.disable'] });
+    buses.push(mem);
     const calls: string[] = [];
     const bus: BusClient = {
-      ...mock,
+      ...mem,
       async tools() {
-        const all = await mock.tools();
+        const all = await mem.tools();
         return opts.tools ? opts.tools(all) : all;
       },
       async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
         calls.push(tool);
         if (tool === 'script.list' && opts.list) {
-          const answer = opts.list(); // undefined: answer from the fixture
+          const answer = opts.list(); // undefined: answer from the loaded scripts
           if (answer !== undefined) return (await answer) as T;
         }
-        return mock.call<T>(tool, args);
+        if (tool === 'script.enable' || tool === 'script.disable') {
+          const s = scripts.find((x) => x.name === args.name);
+          if (!s) throw new BusError(`no loaded script is named \`${String(args.name)}\``);
+          s.enabled = tool === 'script.enable';
+          return { name: s.name, enabled: s.enabled } as T;
+        }
+        return mem.call<T>(tool, args);
       },
     };
     const app = createAppStore(bus);

@@ -2,6 +2,34 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
+/// A request with three cookies (one quoted) and a response that sets two, for
+/// `CookieTests.cookiesInMessagePickTheRightHeader`.
+private enum CookieInputs {
+    static let request = Make.message("GET /api/me HTTP/2", [
+        ("host", "api.shop-staging.test"),
+        ("cookie", "session=9f1c2a7e; prefs=\"theme=dark; density=compact\"; ab_test=B"),
+    ])
+    static let response = Make.response(200, [
+        ("content-type", "application/json; charset=utf-8"),
+        ("set-cookie", "session=9f1c2a7e; Domain=.shop-staging.test; Path=/; "
+            + "Expires=Wed, 28 Oct 2026 11:04:58 GMT; HttpOnly; Secure; SameSite=Lax"),
+        ("set-cookie", "csrf=4d2e9c; Path=/api; Max-Age=3600; Secure; SameSite=Strict"),
+    ])
+}
+
+/// An OpenAI-style stream — one comment line, six content deltas, `[DONE]` — for `SSETests.mergedDeltas`.
+private enum SSEInputs {
+    static let deltas = ["Order", " 4471", " shipped", " on Monday", " and arrives", " Thursday."]
+    static let body: String = {
+        var out = ": keep-alive\n\n"
+        for (n, delta) in deltas.enumerated() {
+            let chunk = #"{"id":"chatcmpl-7Q","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"\#(delta)"},"finish_reason":null}]}"#
+            out += "id: \(n + 1)\ndata: \(chunk)\n\n"
+        }
+        return out + "data: [DONE]\n\n"
+    }()
+}
+
 // MARK: - Cookies (S-019)
 
 @Suite struct CookieTests {
@@ -61,10 +89,10 @@ import Testing
     }
 
     @Test func cookiesInMessagePickTheRightHeader() {
-        let request = Cookie.cookies(in: Fixtures.cookieDetail.request)
+        let request = Cookie.cookies(in: CookieInputs.request)
         #expect(request.map(\.name) == ["session", "prefs", "ab_test"])
         #expect(request[1].value == "theme=dark; density=compact")
-        let response = Cookie.cookies(in: Fixtures.cookieDetail.response!)
+        let response = Cookie.cookies(in: CookieInputs.response)
         #expect(response.map(\.name) == ["session", "csrf"])
         #expect(response[0].expires != nil)
         #expect(response[1].maxAge == 3600)
@@ -122,7 +150,7 @@ import Testing
     }
 
     @Test func mergedDeltas() {
-        let events = SSE.parse(Fixtures.sseDetail.response!.bodyText!)
+        let events = SSE.parse(SSEInputs.body)
         #expect(events.count == 8)
         #expect(events[0].isComment)
         #expect(events.last?.data == "[DONE]")
@@ -137,18 +165,32 @@ import Testing
     }
 }
 
-// MARK: - Fixtures
+// MARK: - Timing and diff (S-020, S-026)
 
-@Suite struct StreamFixtureTests {
-    @Test func timedDetailSumsToTheRowDuration() {
-        let timing = Fixtures.timedDetail.timing!
+@Suite struct TimingAndDiffTests {
+    @Test func everyPhaseReportedSumsToTheTotal() {
+        // 4 + 18 + 31 + 289 + 70 = 412 ms.
+        let timing = FlowTiming(dns: .milliseconds(4), connect: .milliseconds(18), tls: .milliseconds(31),
+                                wait: .milliseconds(289), download: .milliseconds(70))
         #expect(timing.total == .milliseconds(412))
         #expect(FlowTiming.Phase.allCases.allSatisfy { timing.duration(of: $0) != nil })
-        #expect(Format.duration(Fixtures.cookieDetail.timing?.dns) == "0 ms")
+        // A reused connection reports a real zero for DNS, which prints as 0 ms, not a dash.
+        #expect(Format.duration(FlowTiming(dns: .zero, wait: .milliseconds(41)).dns) == "0 ms")
     }
 
-    @Test func diffPairDiffersInAHeaderAndAField() {
-        let (left, right) = Fixtures.diffPair
+    @Test func twoListingsDifferInAHeaderAndAField() {
+        let left = Make.detail(
+            id: "left",
+            request: Make.message("GET /api/products HTTP/2",
+                                  [("host", "api.shop-staging.test"), ("accept", "application/json")]),
+            response: Make.response(200, [("content-type", "application/json")], body: "{\n  \"ok\": true,\n  \"page\": 3\n}"))
+        var right = left
+        right.id = FlowID("right")
+        right.request.headers = [
+            .init("host", "api.shop-staging.test"), .init("accept", "application/json; q=0.9, */*; q=0.1"),
+            .init("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.…"),
+        ]
+        right.response?.body = Data("{\n  \"ok\": true,\n  \"page\": 4\n}".utf8)
         let result = FlowDiff.compare(left, right)
         let changed = result.sections.filter { $0.diff.hasChanges }.map(\.part)
         #expect(changed == [.requestHead, .responseBody])

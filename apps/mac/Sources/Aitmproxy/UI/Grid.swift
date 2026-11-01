@@ -2,7 +2,6 @@ import SwiftUI
 
 /// The spacing scale. Every padding, spacing, and size sits on a 4 pt grid.
 ///   APP_GRID=1 Aitmproxy     draw the grid, margins, and probes over the window
-/// Snapshot mode also writes <page>-<mode>-layout.json, which tools/check-layout.swift checks.
 enum Space {
     static let xs: CGFloat = 4
     static let sm: CGFloat = 8
@@ -33,12 +32,10 @@ extension View {
 @Observable
 final class GridProbes {
     static let shared = GridProbes()
-    static let enabled = ProcessInfo.processInfo.environment["APP_SNAPSHOT"] != nil
-        || GridOverlay.enabled
 
-    enum Kind: String, Codable { case area, probe }
+    enum Kind: String { case area, probe }
 
-    struct Probe: Codable {
+    struct Probe {
         var kind: Kind
         var name: String
         var area: String
@@ -67,16 +64,6 @@ final class GridProbes {
         probes[key] = nil
         owners[key] = nil
     }
-
-    /// Writes the probes next to a snapshot, for tools/check-layout.swift.
-    func write(to path: String, window: CGSize) {
-        struct File: Codable { var window: [String: Double]; var probes: [Probe] }
-        let file = File(window: ["width": window.width, "height": window.height],
-                        probes: probes.values.sorted { ($0.area, $0.y, $0.x) < ($1.area, $1.y, $1.x) })
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? encoder.encode(file).write(to: URL(fileURLWithPath: path))
-    }
 }
 
 private struct GridProbeModifier: ViewModifier {
@@ -88,7 +75,7 @@ private struct GridProbeModifier: ViewModifier {
     @State private var owner = UUID()
 
     func body(content: Content) -> some View {
-        if GridProbes.enabled {
+        if GridOverlay.enabled {
             content
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
                     GridProbes.shared.update(.init(kind: kind, name: name, area: area, edge: edge, inset: inset,

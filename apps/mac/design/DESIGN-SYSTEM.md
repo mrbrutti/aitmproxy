@@ -76,7 +76,7 @@ comes through one of the four files below.
   is a token or `// grid: ok <why>`, and that comment is only for drawn
   geometry (glyph paths, the 44 gutter, the 20 pt code line).
 - `.gridArea` / `.gridProbe` on custom pages and cards; `tools/grid-lint.sh`
-  and `tools/check-layout.swift` must print PASS.
+  must print PASS (`check-layout.swift`, which read snapshot-mode layout files, was removed 2026-10-31).
 
 ## Rules
 
