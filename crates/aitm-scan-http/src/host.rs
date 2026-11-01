@@ -446,10 +446,17 @@ impl MonitorTable {
         self.lost_ids.contains(key)
     }
 
-    /// Hold `monitor` for `key`, newest in the eviction order.
+    /// Hold `monitor` for `key`, newest in the eviction order, evicting the
+    /// oldest monitors until no more than [`MAX_SESSION_MONITORS`] are held:
+    /// the table owns its bound.
     fn insert(&mut self, key: String, monitor: Arc<SessionMonitor>) {
         self.monitors.insert(key.clone(), monitor);
         self.order.push_back(key);
+        while self.over_capacity() {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
     }
 
     /// Whether more monitors are held than [`MAX_SESSION_MONITORS`].
@@ -546,11 +553,6 @@ impl SessionMonitors {
             monitor.force_lost();
         }
         table.insert(key, Arc::clone(&monitor));
-        while table.over_capacity() {
-            if !table.evict_oldest() {
-                break;
-            }
-        }
         monitor
     }
 
