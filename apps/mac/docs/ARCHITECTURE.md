@@ -56,6 +56,6 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
   once. `VerbTableTests` hold the rules; the self-test's menu audit holds the menu bar to them.
 - `docs/architecture-review-<date>.md` and `docs/review-<date>.md`: one check-in per milestone.
   The 2026-10-31 check-in named the fixture bus (`FixtureBus`), put the fixture session in one
-  file and moved the navigation enums out of `Session.swift`; its next cards are
-  `BusService.hostMatches` → `Scope.matches` and the `ShellView` split (both after the revision-2
-  PR) and the bus poll slowing when no window is visible.
+  file, moved the navigation enums out of `Session.swift`, and made the poll's in-scope rule
+  the Kit `Scope.matches` (its only copy); its next cards are the `ShellView` split and the bus
+  poll slowing when no window is visible.
