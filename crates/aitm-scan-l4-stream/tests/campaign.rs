@@ -421,11 +421,17 @@ async fn latency_outlier() {
     };
     let profile = profile_for(speaker.addr.port(), None, 200, &["0003616263", "0001ff"]);
     let run = Run::start(&speaker, profile, "scan-21-slow").await;
-    let point = point_at(&run.points, "length");
+    // The `payload` point, not `length`: a case on the length node leaves the
+    // frame incomplete by construction, and since F4 the latency rule does
+    // not time such a case at all (`affects_framing`). Every `payload` case
+    // is re-rendered with its length satisfied, so the speaker reads a whole
+    // frame and the 1 s it then withholds is the processing delay the rule
+    // is meant to catch.
+    let point = point_at(&run.points, "payload");
 
     // Discovery opens no socket, so the case the speaker holds back can be
-    // named now: late enough in the schedule that the lane has its ten
-    // latency samples before it arrives.
+    // named now, from this point's own schedule: late enough in it that the
+    // lane has its ten latency samples before the case arrives.
     speaker.set_slow_case(nth_case_bytes(&run, &point, 20));
 
     let verdict = run.run_check("l4-latency-outlier", &point).await;
