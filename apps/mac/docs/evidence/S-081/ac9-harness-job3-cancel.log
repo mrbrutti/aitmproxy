@@ -1,0 +1,13 @@
+07:39:56 shot 23-before-cancel; scan.status scan-ac5a0fcc
+{"state": "running", "phase": "auditing", "elapsed_ms": 0, "stopped_reason": null, "sent": 235, "audited": 1506, "found": 1581, "issues": 0}
+07:39:56 click Cancel Scan
+07:39:59 shot 24-cancel-t1; scan.status scan-ac5a0fcc
+{"state": "cancelled", "phase": "done", "elapsed_ms": 4866, "stopped_reason": "cancelled", "sent": 292, "audited": 1506, "found": 1581, "issues": 0}
+07:40:01 shot 24-cancel-t2; scan.status scan-ac5a0fcc
+{"state": "cancelled", "phase": "done", "elapsed_ms": 4866, "stopped_reason": "cancelled", "sent": 292, "audited": 1506, "found": 1581, "issues": 0}
+07:40:04 shot 24-cancel-t3; scan.status scan-ac5a0fcc
+{"state": "cancelled", "phase": "done", "elapsed_ms": 4866, "stopped_reason": "cancelled", "sent": 292, "audited": 1506, "found": 1581, "issues": 0}
+07:40:06 shot 24-cancel-t4; scan.status scan-ac5a0fcc
+{"state": "cancelled", "phase": "done", "elapsed_ms": 4866, "stopped_reason": "cancelled", "sent": 292, "audited": 1506, "found": 1581, "issues": 0}
+07:40:09 shot 24-cancel-t5; scan.status scan-ac5a0fcc
+{"state": "cancelled", "phase": "done", "elapsed_ms": 4866, "stopped_reason": "cancelled", "sent": 292, "audited": 1506, "found": 1581, "issues": 0}
