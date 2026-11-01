@@ -30,12 +30,12 @@ struct OverviewBreakdownRow: View {
                 }
             }
             BarSection(title: "Clients", empty: breakdowns.clients.isEmpty ? "No app attribution" : nil) {
-                ForEach(breakdowns.clients, id: \.name) { entry in
+                ForEach(breakdowns.clients, id: \.key) { entry in
                     BarRow(label: entry.name, labelColor: Tok.Ink.primary,
                            labelWidth: Self.clientWidth, value: String(entry.count),
                            fraction: fraction(entry.count, of: breakdowns.clientMax),
-                           action: { session.show(.apps, group: .client(entry.name)) })
-                        .help(entry.name)
+                           action: { session.show(.apps, group: .client(entry.key)) })
+                        .help(entry.key)
                         .accessibilityLabel("\(entry.name), \(entry.count)")
                 }
             }

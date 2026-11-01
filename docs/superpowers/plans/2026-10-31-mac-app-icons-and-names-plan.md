@@ -229,7 +229,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     - `Pins.pin`: `.host(h)` and `.clientHost(_, h)` → `pinHost(h)`; `.client(k)` → `pinApp(k)`.
       `unpin` mirrors; `contains` mirrors (`.clientHost(_, h)` ⇔ `hosts.contains(h)`).
     - `BoundedCache`: a dictionary plus an insertion-order array; setting a new key past
-      `capacity` removes the oldest key first; overwriting an existing key keeps its age;
+      `capacity` removes the oldest key first; overwriting an existing key refreshes it to newest (ruling 2026-11-01, see Review log);
       setting `nil` removes the key and its order entry (plan call: a removal is a plain delete).
       `Sendable` when `Key` and `Value` are (conditional conformance), so the resolver can hold it
       on the main actor.
@@ -710,6 +710,8 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | docs #242 | quality (2nd pass) | Minor | icons spec AI-AC11 `Overview(rows:).clients` — the type is `OverviewStats` | fixed in b57840e3 |
 | docs #242 | quality (2nd pass) | Minor | `flowTable` overlay anchor "~258"/"~261" | fixed in b57840e3: `ShellView.swift:258` in spec D7 and plan Task 3 |
 | all | Spec (3rd pass) | Minor | `GettingStartedStep.Kind` listing showed `caTrusted` after `scopeSet`; PR D's enum is `coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow` | fixed in ad83ab78: listings use PR D's source order; the steps order stays make's |
+| 2 | Coder (stop-and-report) | Important | spec D1 / plan Task 2 said an overwrite "does not change its age" while AI-AC12 and the plan's literal test expect `c["b"] = 20; c["e"] = 5` to evict `c`, not `b` | ruled 2026-11-01 (architect, self-approved): the AC is the oracle — overwrite refreshes to newest; D1 and Task 2 prose amended; `BoundedCache` setter moves the key to newest |
+| 2 | Coder (noticed) | Important | `FlowGroup.clientHost` makes `Session.swift:410-430` (`pin`/`unpin`/`isPinned`) non-exhaustive, so the app target (and thus `swift test`) cannot build before Task 5 | orchestrator GRANTED 2026-11-01 a narrow interim claim on `Session.swift` for exactly the three one-line functions `pin`/`unpin`/`isPinned` delegating to `Pins.pin/unpin/contains(_ group:)`, landed in the Kit-half PR (nothing near `systemProxy`/`decrypt`/`caTrust`/the poll loop; system-proxy PR 4 owns the rest of the file and whoever lands later re-merges); done by the orchestrating session in the Wave A commit |
 
 ## Shipped
 

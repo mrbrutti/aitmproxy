@@ -407,27 +407,16 @@ final class Session {
         self.group = group
     }
 
-    func pin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.pinHost(h)
-        case .client(let c): pins.pinApp(c)
-        }
-    }
+    // Group → pin mapping lives in the Kit (`Pins.pin/unpin/contains(_ group:)`, icons plan Task 2):
+    // `.host`/`.clientHost` pin the host, `.client` pins the app by its group key.
+    func pin(_ group: FlowGroup) { pins.pin(group) }
 
     func unpin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.unpinHost(h)
-        case .client(let c): pins.unpinApp(c)
-        }
+        pins.unpin(group)
         if self.group == group { self.group = nil }
     }
 
-    func isPinned(_ group: FlowGroup) -> Bool {
-        switch group {
-        case .host(let h): pins.hosts.contains(h)
-        case .client(let c): pins.apps.contains(c)
-        }
-    }
+    func isPinned(_ group: FlowGroup) -> Bool { pins.contains(group) }
 
     // MARK: Intents — state (the actions live in Session+Verbs.swift)
 

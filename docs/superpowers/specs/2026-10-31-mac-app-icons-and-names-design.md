@@ -141,7 +141,7 @@ public struct BoundedCache<Key: Hashable, Value> {
 - `withResolvedName` is `ClientInfo(name: name, bundleID: bundleID, pid: pid)` (the init recomputes the monogram), returning `self` when `name == self.name` so a settled row never changes value.
 - `ClientTree.clients` is today's `Session.clients` body (`Session.clients`, `Session.swift:343` on `main 8e19c2e3`) moved into the Kit; `Session.clients` becomes a one-line call. `ClientTree.hosts(forClient:in:)` counts `authority` over rows whose `client?.groupKey == key`.
 - `Pins.pin/unpin/contains(_ group:)` carry the mapping `Session.pin/unpin/isPinned` do today (`Session.pin` :393, `unpin` :400, `isPinned` :408 on `main 8e19c2e3`) plus the new case; `Session` delegates.
-- `BoundedCache` evicts the oldest-inserted key when a new key would exceed `capacity`; overwriting an existing key does not change its age.
+- `BoundedCache` evicts the oldest key when a new key would exceed `capacity`; overwriting an existing key refreshes it to newest (a re-resolved identity is the last to go — architect ruling 2026-11-01 on the Task 2 stop-and-report: AI-AC12's literal values are the oracle; the earlier "does not change its age" sentence contradicted them).
 
 New app file `apps/mac/Sources/Aitmproxy/UI/AppIdentity.swift`:
 
