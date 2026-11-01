@@ -535,14 +535,25 @@ impl PointRunner {
             });
         }
 
-        // (c) One stimulus, one budget unit — the case, not the attempt: a
+        // (c) The job's case ceiling bounds every counted case, not only the
+        // fuzz loop's and the triage's: a `Check` replaying frames through
+        // `PacketHost::probe` spends the same ceiling (spec D8.4, "cases per
+        // job <= 5000"; review finding G2).
+        if counted == Counted::Case && self.shared.state.cases_remaining(&job_id) == Some(0) {
+            let cap = self.shared.state.cases_cap(&job_id).unwrap_or(0);
+            let reason = StopReason::CaseCap(cap);
+            self.stop(reason.clone());
+            return Err(HostError::Stopped(reason));
+        }
+
+        // (d) One stimulus, one budget unit — the case, not the attempt: a
         // rate wait below retries without charging again.
         if !self.job.charge(1) {
             self.stop(StopReason::Budget);
             return Err(HostError::Stopped(StopReason::Budget));
         }
 
-        // (d) The guarded send, waiting out the guard's injection rate.
+        // (e) The guarded send, waiting out the guard's injection rate.
         let (outcome, elapsed) = loop {
             let now = Instant::now();
             let deadline = self.job.deadline();
@@ -583,7 +594,7 @@ impl PointRunner {
             }
         };
 
-        // (e) The oracle reads the reply, and the ladder gets its say — after
+        // (f) The oracle reads the reply, and the ladder gets its say — after
         // the record exists, so the tripping case is never lost.
         let classified = classify(&outcome, elapsed);
         record.class = Some(classified.class);
@@ -1450,9 +1461,20 @@ mod tests {
                 .crashes,
             0
         );
-        assert_eq!(run.cases.len(), 10);
-        // 1 baseline + 10 cases + 2 failed probes + 1 recovery poll + 3 x (replay + 2 probes).
-        assert_eq!(mock.inject_count(), 1 + 10 + 2 + 1 + 3 * 3);
+        // The three replays are cases of this job (call C10), so they come
+        // out of the same ceiling of ten: the fuzz loop gets seven, and the
+        // eighth is the send the cap refuses (spec D8.4; review finding G2 —
+        // before it the triage spent its replays on top of the ceiling and
+        // the job sent thirteen cases against a cap of ten).
+        assert_eq!(run.cases.len(), 7, "{:?}", run.cases);
+        assert_eq!(run.stopped, Some(StopReason::CaseCap(10)));
+        assert_eq!(
+            shared.state.counters(job.job_id()).expect("counters").cases,
+            10
+        );
+        assert_eq!(shared.state.cases_remaining(job.job_id()), Some(0));
+        // 1 baseline + 7 cases + 2 failed probes + 1 recovery poll + 3 x (replay + 2 probes).
+        assert_eq!(mock.inject_count(), 1 + 7 + 2 + 1 + 3 * 3);
     }
 
     /// Review finding G1: with `reproduce_count: 0` no replay can ever run,
@@ -1722,6 +1744,56 @@ mod tests {
             .expect_err("the lane replays frame bytes only")
             .to_string()
             .contains("frame bytes only"));
+    }
+
+    /// Review finding G2: spec D8.4 caps a job at `cases_cap` cases and a
+    /// check's own `probe()` send is a case like any other, so the cap bounds
+    /// it exactly as it bounds the fuzz loop and the crash triage — a check
+    /// replaying frames in a loop cannot push the job past its ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_host_respects_the_case_cap() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 2);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let host = PacketHost::new(Arc::clone(&runner));
+        // `probe` sends no baseline of its own, so every inject below is a
+        // case charged against the cap of two.
+        let seed = runner.plan.seed_spec(0).expect("the seed spec");
+        let frame = seed.spec.build().expect("the seed frame");
+        let payload = Payload {
+            value: "replay".to_string(),
+            mode: PayloadMode::Replace,
+            bytes: Some(frame),
+        };
+
+        host.probe(&payload).await.expect("the first case fits");
+        host.probe(&payload).await.expect("the second case fits");
+        let refused = host.probe(&payload).await;
+
+        assert!(
+            refused
+                .expect_err("the third case is past the cap")
+                .to_string()
+                .contains("case cap reached"),
+            "the cap is what refused it"
+        );
+        assert_eq!(mock.inject_count(), 2, "the third frame never went out");
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 2,
+                crashes: 0,
+                liveness_failures: 0,
+                retired_elements: 0,
+            })
+        );
+        assert_eq!(shared.state.cases_remaining(job.job_id()), Some(0));
+        assert_eq!(
+            shared.state.stopped(job.job_id()),
+            Some(StopReason::CaseCap(2)),
+            "the cap is job-wide: no later point sends another case"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
