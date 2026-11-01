@@ -209,7 +209,7 @@ struct StatusPanel: View {
         case .trustCA:
             // Operator-only, like the capture switch: the one call path (Session+CATrust.swift).
             Task { await session.trustCA() }
-        case .showCoreLog, .reconnectBus, .openScope, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
+        case .showCoreLog, .reconnectBus, .openScope, .addScopeHost, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
             break // handled by Session.perform(connection:) above
         }
     }

@@ -43,6 +43,9 @@ extension Session {
             reconnectBus()
         case .openScope:
             show(.scope)
+        case .addScopeHost:
+            show(.scope)
+            scopeSheetVisible = true
         case .openCAPanel:
             show(.ca)
         case .trustCA:
