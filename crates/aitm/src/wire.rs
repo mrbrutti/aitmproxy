@@ -693,6 +693,24 @@ impl Plugin for PocCommands {
 /// for `https`. Re-exported from `aitm-proto-http`.
 pub use aitm_proto_http::Http1Sender;
 
+/// What the binary does with an agent transport's bound address, through
+/// `McpServer::on_bound`: the same `FnOnce(SocketAddr)` that method takes.
+pub type BoundHook = Box<dyn FnOnce(std::net::SocketAddr) + Send + 'static>;
+
+/// The [`BoundHook`] that unions the agent transport's bound port into the live
+/// L4 guard's self ports ([`L4Guard::add_self_ports`]), so a loopback capture
+/// never records the bus's own frames — its plaintext `{"token": …}` first line
+/// among them (L4PAR-AC34, spec §2.1). The bound port is the configured one or
+/// the ephemeral port a `port: 0` resolved to, which only `on_bound` can know.
+/// The one hook both the bare-`aitm` server path and `aitm tui` attach, so the
+/// two cannot drift.
+#[must_use]
+pub fn self_port_hook(guard: Arc<L4Guard>) -> BoundHook {
+    Box::new(move |addr: std::net::SocketAddr| {
+        guard.add_self_ports([addr.port()]);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,6 +963,28 @@ mod tests {
         cfg.ca.dir = temp_ca_dir("l4-guard-off");
         let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
         assert!(disabled.l4_guard.is_none());
+    }
+
+    /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand
+    /// the agent `McpServer`'s `on_bound` unions the bound port — the ephemeral
+    /// one a `port: 0` resolved to included — into the live L4 guard's self ports,
+    /// so a loopback capture never records the bus's plaintext token line. Port 0
+    /// is never a bound listener and stays out.
+    #[test]
+    fn the_bound_port_hook_adds_the_agent_port_to_the_l4_guard() {
+        let guard = Arc::new(L4Guard::new(&L4Config::default()));
+        assert_eq!(guard.self_ports(), Vec::<u16>::new());
+
+        let hook = self_port_hook(guard.clone());
+        hook("127.0.0.1:41234".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![41234]);
+
+        // A second bind (a later run on the same guard) adds, never replaces.
+        self_port_hook(guard.clone())("127.0.0.1:27431".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![27431, 41234]);
+
+        self_port_hook(guard.clone())("127.0.0.1:0".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![27431, 41234], "port 0 is ignored");
     }
 
     /// L4PAR-AC34 (plan A10): assembly hands the L4 module the core's own

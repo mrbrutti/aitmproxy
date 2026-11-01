@@ -27,7 +27,9 @@ use aitm::render::render_cli_value;
 use aitm::scripts::LateHandles;
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
-use aitm::wire::{assemble_with_scripts, build_capture_session, Assembled, Features, ScriptWiring};
+use aitm::wire::{
+    assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
+};
 use aitm::{config_file, env, operator_token, tui};
 use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
@@ -738,7 +740,7 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         // `notifications/aitm/agent` lines but no `notifications/aitm/flow`.
         // Its bound port joins the L4 self-port set through `on_bound`, exactly
         // as the server path's does below (L4PAR-AC34).
-        let on_agent_bound = l4_live_guard.clone().map(tui::self_port_hook);
+        let on_agent_bound = l4_live_guard.clone().map(self_port_hook);
         tokio::select! {
             result = tui::run(
                 &cfg,
@@ -773,9 +775,7 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         // (the configured one, or the ephemeral port a `0` resolved to) joins the
         // L4 self-port set beside the listeners bound above (L4PAR-AC34).
         let mcp = match l4_live_guard.clone() {
-            Some(guard) => mcp.on_bound(move |addr| {
-                guard.add_self_ports([addr.port()]);
-            }),
+            Some(guard) => mcp.on_bound(self_port_hook(guard)),
             None => mcp,
         };
 
@@ -1100,8 +1100,8 @@ mod tests {
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
         build_env_filter, configured_agent_port, manages_system_proxy, parse_invocation,
-        parse_mode, split_bus_endpoint_file_arg, split_config_arg, split_script_args,
-        Invocation, Mode, OPERATOR_TOKEN_USAGE,
+        parse_mode, split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation,
+        Mode, OPERATOR_TOKEN_USAGE,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
