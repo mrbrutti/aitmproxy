@@ -644,6 +644,10 @@ tungstenite 0.28's client handshake (`VerifyData::verify_response`, `handshake/c
 - `cswsh`: a probe that answers while the baseline was silent is `Vulnerable`/`Firm` ("differs from the baseline"); `Inconclusive` is gated on the *probe* having no data frame. The vulnerable test server models the seeded target (greets `{"type":"hello","user":"alice"}` after the upgrade when the cookie is present) rather than the bare echo handler; an extra test proves the Firm arm's excerpt is scrubbed (`sid=s3cr3t-cookie` never appears in `{:?}` of the verdict).
 - Handshake-header points are named by the lowercased header name (`origin`, `cookie`, `authorization`, `sec-websocket-protocol`); their chosen frame is the first client frame, so no prerequisite is replayed for them.
 
+### Task 16 ruling (T4 session, 2026-11-01, call 33)
+
+`ws-subprotocol-observe`: a 101 that carries no `sec-websocket-protocol` (or an empty one) is **Clean** (RFC 6455 lets a server decline every offered subprotocol; the client is expected to fail such a connection), so the Patched target, which ignores the header, yields no issue. `Vulnerable(Info, Firm)` only when the 101 echoes the `aitm-<marker>` token (accepts any subprotocol) or selects a protocol the client never offered. Decision 6's "completed the upgrade with none" arm is withdrawn; the test is `server_completing_without_protocol_is_clean`. The check runs on both the `origin` and `sec-websocket-protocol` points (two dials per handshake); a per-handshake dedupe is an engine concern left as a follow-up.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
