@@ -16,8 +16,8 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{
-    probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ScanTab, PROFILE_MAX,
-    TARGETS_MAX,
+    probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ScanTab, DETAIL_LIST_MAX,
+    DETAIL_VALUE_MAX, PROFILE_MAX, TARGETS_MAX,
 };
 use aitm_tui::ui::text::width;
 use common::*;
@@ -358,6 +358,80 @@ fn rows_are_bounded_at_construction() {
         crowded.targets,
         "http://h1.test http://h2.test http://h3.test http://h4.test +2"
     );
+}
+
+/// Fix round G, G11 (D6 hostile-core bounds): the Detail pane's free-text
+/// fields are cut at fold to `DETAIL_VALUE_MAX` cells (`error`, the
+/// frontend and client label, each clamped field, skipped reason and
+/// running check id, the canary path) and the three lists are capped at
+/// `DETAIL_LIST_MAX` with the rest counted as `+n`; a 1 MiB `error` and a
+/// thousand running checks still render.
+#[test]
+fn detail_fields_and_lists_are_bounded_at_fold() {
+    let mut app = app();
+    let mut body = fixture("scan.status.json");
+    body["error"] = json!("e".repeat(1 << 20));
+    body["started_by"]["client_label"] = json!("\t".repeat(1 << 20));
+    body["checks"]["running"] = json!((0..1000).map(|k| format!("http.c{k}")).collect::<Vec<_>>());
+    body["lanes"]["skipped"] = json!((0..20)
+        .map(|k| json!({ "lane": "ws", "reason": format!("r{k}") }))
+        .collect::<Vec<_>>());
+    body["clamped"] = json!((0..20)
+        .map(|k| json!({ "field": format!("f{k}"), "requested": 9, "applied": 1 }))
+        .collect::<Vec<_>>());
+    body["session"]["canary"]["path"] = json!("/p".repeat(1 << 16));
+    let _ = app.on_bus(status_reply(body));
+    let full = app.scan.jobs.full.get(JOB).expect("folded");
+    let error = full.error.as_deref().unwrap_or_default();
+    assert!(
+        error.chars().count() <= 4 * DETAIL_VALUE_MAX,
+        "{} chars",
+        error.chars().count()
+    );
+    assert!(width(error) <= DETAIL_VALUE_MAX);
+    assert_eq!(
+        full.started_by.client_label.as_deref(),
+        Some(""),
+        "tabs stripped"
+    );
+    assert_eq!(full.checks.running.len(), DETAIL_LIST_MAX);
+    assert_eq!(full.lanes.skipped.len(), DETAIL_LIST_MAX);
+    assert_eq!(full.clamped.len(), DETAIL_LIST_MAX);
+    assert_eq!(full.dropped.running, 1000 - DETAIL_LIST_MAX);
+    assert_eq!(full.dropped.skipped, 20 - DETAIL_LIST_MAX);
+    assert_eq!(full.dropped.clamped, 20 - DETAIL_LIST_MAX);
+    let lines = app.scan.jobs.detail_text();
+    let value = |label: &str| {
+        lines
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no {label} line: {lines:?}"))
+    };
+    assert!(
+        value("checks").ends_with("http.c7 +992"),
+        "{:?}",
+        value("checks")
+    );
+    assert!(
+        value("lanes").ends_with("ws (r7) +12"),
+        "{:?}",
+        value("lanes")
+    );
+    assert!(
+        value("clamped").ends_with("f7 9 -> 1 +12"),
+        "{:?}",
+        value("clamped")
+    );
+    let session = value("session");
+    assert!(
+        width(&session) <= DETAIL_VALUE_MAX + 40,
+        "{} cells",
+        width(&session)
+    );
+    let text = screen(&app);
+    assert!(text.lines().all(|l| l.chars().count() <= 200));
+    assert_eq!(app.scan.jobs.detail_len(), 1 + lines.len());
 }
 
 /// Fix round C, C20 and fix round E, E5: the Detail pane's length is

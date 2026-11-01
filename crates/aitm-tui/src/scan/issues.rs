@@ -381,6 +381,16 @@ pub struct ReadIssue {
     pub issue: Issue,
     /// Probe flows the fold dropped past [`FLOWS_MAX`]; 0 when none were.
     pub dropped_flows: usize,
+    /// Timing rows the fold dropped past `TIMING_ROWS_MAX + 1` (fix round
+    /// G, G12), so the table's `... n more` line names the real count; 0
+    /// when none were.
+    pub dropped_timing: usize,
+}
+
+/// What [`bound_issue`] dropped, for [`ReadIssue`].
+struct Bounded {
+    flows: usize,
+    timing: usize,
 }
 
 impl std::ops::Deref for ReadIssue {
@@ -530,14 +540,15 @@ impl IssuesState {
         let Some(k) = self.list.iter().position(|row| row.id == issue.id) else {
             return;
         };
-        let dropped_flows = bound_issue(&mut issue);
+        let bounded = bound_issue(&mut issue);
         let summary = issue.summary();
         self.rows[k] = issue_row(&summary);
         self.list[k] = summary;
         let id = issue.id.clone();
         let read = ReadIssue {
             issue,
-            dropped_flows,
+            dropped_flows: bounded.flows,
+            dropped_timing: bounded.timing,
         };
         if self.read.insert(id.clone(), read).is_none() {
             self.read_order.push_back(id.clone());
@@ -614,11 +625,13 @@ impl IssuesState {
 /// reaches the screen (`name`, `class`, `check_id`, the target, the
 /// location and its L4 point, `poc_ref`, `finding_id`, the L4 evidence's
 /// seed, scope and hex, each mutator). The mutation chain keeps
-/// [`MUTATIONS_MAX`] plus one, the probe flow list [`FLOWS_MAX`]; the
-/// probe flows dropped are returned, so the pane can count them. Ids,
-/// enums and numbers the contract already bounds are left alone. The
-/// per-frame line building then runs over bounded text only.
-fn bound_issue(issue: &mut Issue) -> usize {
+/// [`MUTATIONS_MAX`] plus one, the probe flow list [`FLOWS_MAX`], each
+/// timing series [`TIMING_ROWS_MAX`] plus one (fix round G, G12); the
+/// probe flows and timing rows dropped are returned, so the pane can count
+/// them, and every truncated vector gives its capacity back. Ids, enums
+/// and numbers the contract already bounds are left alone. The per-frame
+/// line building then runs over bounded text only.
+fn bound_issue(issue: &mut Issue) -> Bounded {
     let cut = |s: &mut String| {
         // Control characters go first (fix round G, G10): a tab or an
         // escape would move the cursor or shift a column on screen.
@@ -672,6 +685,7 @@ fn bound_issue(issue: &mut Issue) -> usize {
     }
     if let Some(l4) = &mut issue.evidence.l4 {
         l4.mutation_chain.truncate(MUTATIONS_MAX + 1);
+        l4.mutation_chain.shrink_to_fit();
         fields.push(&mut l4.seed_id);
         fields.push(&mut l4.scope_entry);
         fields.push(&mut l4.sent_hex);
@@ -681,9 +695,26 @@ fn bound_issue(issue: &mut Issue) -> usize {
         cut(field);
     }
     let flows = &mut issue.evidence.probe_flows;
-    let dropped = flows.len().saturating_sub(FLOWS_MAX);
+    let dropped_flows = flows.len().saturating_sub(FLOWS_MAX);
     flows.truncate(FLOWS_MAX);
-    dropped
+    flows.shrink_to_fit();
+    let mut dropped_timing = 0;
+    if let Some(t) = &mut issue.evidence.timing {
+        let keep = TIMING_ROWS_MAX + 1;
+        dropped_timing = timing_rows(t).saturating_sub(keep);
+        if dropped_timing > 0 {
+            t.requested_s.truncate(keep);
+            t.requested_s.shrink_to_fit();
+            t.observed_ms.truncate(keep);
+            t.observed_ms.shrink_to_fit();
+            t.baseline_ms.truncate(keep);
+            t.baseline_ms.shrink_to_fit();
+        }
+    }
+    Bounded {
+        flows: dropped_flows,
+        timing: dropped_timing,
+    }
 }
 
 /// The detail's first line as parts (spec D11; fix round F, F5, F8): the
@@ -728,8 +759,9 @@ pub struct DetailLines {
     pub after_flows: Vec<DetailLine>,
 }
 
-/// The lines of the Issues Detail pane for `issue` ([`DetailLines`]).
-pub fn issue_detail_lines(issue: &Issue) -> DetailLines {
+/// The lines of the Issues Detail pane for the read issue ([`DetailLines`]).
+pub fn issue_detail_lines(read: &ReadIssue) -> DetailLines {
+    let issue = &read.issue;
     let mut before: Vec<DetailLine> = Vec::with_capacity(BEFORE_FIXED_LINES + 8);
     before.push((
         "class",
@@ -757,7 +789,7 @@ pub fn issue_detail_lines(issue: &Issue) -> DetailLines {
         before.push(("matched", m.clone()));
     }
     if let Some(t) = &ev.timing {
-        timing_lines(t, &mut before);
+        timing_lines(t, read.dropped_timing, &mut before);
     }
     if let Some(d) = &ev.diff {
         before.push((
@@ -811,10 +843,11 @@ const BEFORE_FIXED_LINES: usize = 4;
 /// The lines every `after_flows` has: poc, finding, seen.
 const AFTER_FIXED_LINES: usize = 3;
 
-/// How many lines [`issue_detail_lines`] builds for `issue`, both runs
-/// together, counted without building them (the reducer clamps the scroll
-/// on every key). Pinned to the built lines by a unit test.
-fn detail_line_count(issue: &Issue) -> usize {
+/// How many lines [`issue_detail_lines`] builds for the read issue, both
+/// runs together, counted without building them (the reducer clamps the
+/// scroll on every key). Pinned to the built lines by a unit test.
+fn detail_line_count(read: &ReadIssue) -> usize {
+    let issue = &read.issue;
     let ev = &issue.evidence;
     BEFORE_FIXED_LINES
         + AFTER_FIXED_LINES
@@ -874,8 +907,9 @@ fn l4_location_text(l4: &L4Location) -> String {
 /// The timing table (spec D11): a header line, one row per sample
 /// (`requested_s | observed_ms | baseline_ms`, a series shorter than the
 /// longest reads `-`), at most [`TIMING_ROWS_MAX`] of them with a
-/// `... n more` line past that, then `slope`/`r`.
-fn timing_lines(t: &Timing, out: &mut Vec<DetailLine>) {
+/// `... n more` line past that (`n` counting the `dropped` rows the fold
+/// cut as well, fix round G, G12), then `slope`/`r`.
+fn timing_lines(t: &Timing, dropped: usize, out: &mut Vec<DetailLine>) {
     out.push((
         "timing",
         "requested_s | observed_ms | baseline_ms".to_string(),
@@ -895,7 +929,7 @@ fn timing_lines(t: &Timing, out: &mut Vec<DetailLine>) {
         ));
     }
     if rows > shown {
-        out.push(("", format!("... {} more", rows - shown)));
+        out.push(("", format!("... {} more", rows - shown + dropped)));
     }
     out.push(("", format!("slope {:.1} ms/s · r {:.2}", t.slope, t.r)));
 }
@@ -1147,6 +1181,15 @@ mod tests {
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("scan.issue.json: {e}"))
     }
 
+    /// An `Issue` as `read` would hold it, nothing dropped.
+    fn read_of(issue: &Issue) -> ReadIssue {
+        ReadIssue {
+            issue: issue.clone(),
+            dropped_flows: 0,
+            dropped_timing: 0,
+        }
+    }
+
     /// `(label, value)` pairs from literals, for the pins below.
     fn pairs(lines: &[(&'static str, &str)]) -> Vec<DetailLine> {
         lines.iter().map(|(l, v)| (*l, (*v).to_string())).collect()
@@ -1168,7 +1211,7 @@ mod tests {
                 status: IssueStatus::Open,
             }
         );
-        let lines = issue_detail_lines(&issue);
+        let lines = issue_detail_lines(&read_of(&issue));
         assert_eq!(
             lines.before_flows,
             pairs(&[
@@ -1205,7 +1248,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            detail_line_count(&issue),
+            detail_line_count(&read_of(&issue)),
             lines.before_flows.len() + lines.after_flows.len()
         );
         let flows: Vec<(String, &str)> = (0..4)
@@ -1297,10 +1340,10 @@ mod tests {
         issue.remediation = None;
         issue.description = "D".repeat(1 << 20);
         issue.check_id = "C".repeat(1 << 20);
-        assert_eq!(bound_issue(&mut issue), 0, "no probe flows to drop");
-        let lines = issue_detail_lines(&issue);
+        assert_eq!(bound_issue(&mut issue).flows, 0, "no probe flows to drop");
+        let lines = issue_detail_lines(&read_of(&issue));
         assert_eq!(
-            detail_line_count(&issue),
+            detail_line_count(&read_of(&issue)),
             lines.before_flows.len() + lines.after_flows.len()
         );
         assert_eq!(
@@ -1355,12 +1398,17 @@ mod tests {
             .as_mut()
             .unwrap_or_else(|| panic!("timing"));
         timing.observed_ms = vec![0; 40];
-        bound_issue(&mut issue);
+        let bounded = bound_issue(&mut issue);
+        assert_eq!(bounded.timing, 40 - (TIMING_ROWS_MAX + 1), "G12");
         let l4 = issue.evidence.l4.as_ref().unwrap_or_else(|| panic!("l4"));
         assert_eq!(l4.mutation_chain.len(), MUTATIONS_MAX + 1);
-        let lines = issue_detail_lines(&issue);
+        let read = ReadIssue {
+            dropped_timing: bounded.timing,
+            ..read_of(&issue)
+        };
+        let lines = issue_detail_lines(&read);
         assert_eq!(
-            detail_line_count(&issue),
+            detail_line_count(&read),
             lines.before_flows.len() + lines.after_flows.len()
         );
         assert_eq!(
@@ -1376,6 +1424,52 @@ mod tests {
         assert_eq!(
             mutations,
             "m0 > m1 > m2 > m3 > m4 > m5 > m6 > m7 > m8 > m9 > m10 > m11 > m12 > m13 > m14 > m15 > ..."
+        );
+    }
+
+    /// Fix round G, G12: the timing series are cut to `TIMING_ROWS_MAX + 1`
+    /// at fold and the rows dropped are counted beside the issue, so the
+    /// `... n more` line still names the real count; the truncated vectors
+    /// give their capacity back.
+    #[test]
+    fn fold_issue_cuts_the_timing_series_and_keeps_the_count() {
+        let mut issue = fixture_issue();
+        issue.evidence.timing = Some(Timing {
+            requested_s: vec![1.0; 1_000_000],
+            observed_ms: vec![7; 1_000_000],
+            baseline_ms: vec![3; 10],
+            slope: 1.0,
+            r: 0.5,
+        });
+        issue.evidence.probe_flows = vec![issue.evidence.probe_flows[0]; 1000];
+        let mut state = IssuesState::default();
+        state.list = vec![issue.summary()];
+        state.rows = vec![issue_row(&state.list[0])];
+        state.fold_issue(issue);
+        let read = state.detail().unwrap_or_else(|| panic!("read"));
+        let t = read
+            .evidence
+            .timing
+            .as_ref()
+            .unwrap_or_else(|| panic!("timing"));
+        assert_eq!(t.requested_s.len(), TIMING_ROWS_MAX + 1);
+        assert_eq!(t.observed_ms.len(), TIMING_ROWS_MAX + 1);
+        assert_eq!(t.baseline_ms.len(), 10, "a short series is left alone");
+        assert_eq!(read.dropped_timing, 1_000_000 - (TIMING_ROWS_MAX + 1));
+        assert_eq!(read.dropped_timing, 999_987);
+        assert!(t.observed_ms.capacity() < 1000, "capacity given back");
+        assert!(read.evidence.probe_flows.capacity() < 1000);
+        let lines = issue_detail_lines(read);
+        let more = lines
+            .before_flows
+            .iter()
+            .find(|(_, v)| v.starts_with("... "))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(more, "... 999988 more");
+        assert_eq!(
+            detail_line_count(read),
+            lines.before_flows.len() + lines.after_flows.len()
         );
     }
 

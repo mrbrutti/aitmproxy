@@ -3,6 +3,7 @@
 //! measures and draws what [`row`] already cut, never the core's strings.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 
 use aitm_scan_model::{
     BySeverity, Canary, CanaryMethod, JobId, JobState, JobStatus, JobSummary, LaneKind, ListResult,
@@ -36,9 +37,10 @@ pub struct JobsState {
     /// both maps to `order`), so the walks read `order` alone and a key of
     /// either map is always a row.
     pub summaries: BTreeMap<JobId, JobSummary>,
-    /// Full status for the jobs `scan.status` has answered for; every key
-    /// is in `summaries` and in `order` (see `summaries`).
-    pub full: BTreeMap<JobId, JobStatus>,
+    /// Full status for the jobs `scan.status` has answered for, bounded at
+    /// fold ([`ReadStatus`]); every key is in `summaries` and in `order`
+    /// (see `summaries`).
+    pub full: BTreeMap<JobId, ReadStatus>,
     /// The list cursor.
     pub cursor: usize,
     pub pane: JobPane,
@@ -65,21 +67,17 @@ impl JobsState {
     /// Fold a `scan.status` / `scan.cancel` reply (spec D10): the full view
     /// replaces `full[job]`, its summary replaces `summaries[job]`, and a job
     /// not yet in `order` goes to the front (newest first). The core's
-    /// strings are bounded here, once (D6: "row strings are bounded once at
-    /// fold time"): `profile_name` is cut to [`PROFILE_MAX`] and every
-    /// `targets` entry to four times [`TARGETS_MAX`], so [`row`] and the
-    /// Detail pane only copy bounded text.
+    /// strings are bounded here, once ([`bound_status`]; D6: "row strings
+    /// are bounded once at fold time"), so [`row`] and the Detail pane only
+    /// copy bounded text.
     pub fn fold_status(&mut self, mut status: JobStatus) {
-        status.profile_name = truncate(&clean(&status.profile_name), PROFILE_MAX);
-        for target in &mut status.targets {
-            *target = truncate(&clean(target), 4 * TARGETS_MAX);
-        }
+        let dropped = bound_status(&mut status);
         let id = status.job.clone();
         if !self.order.contains(&id) {
             self.order.insert(0, id.clone());
         }
         self.summaries.insert(id.clone(), status.summary());
-        self.full.insert(id, status);
+        self.full.insert(id, ReadStatus { status, dropped });
     }
 
     /// Fold a `scan.list` reply (spec D3, D10). `order` becomes the list's
@@ -203,7 +201,7 @@ impl JobsState {
     /// cannot happen (`full.keys() ⊆ summaries.keys()`, see `summaries`).
     pub fn row_of(&self, id: &str) -> JobRow {
         match self.summaries.get(id) {
-            Some(summary) => row(summary, self.full.get(id)),
+            Some(summary) => row(summary, self.full.get(id).map(|r| &r.status)),
             None => JobRow::unknown(id),
         }
     }
@@ -216,7 +214,7 @@ impl JobsState {
     /// id line; [`JobsState::detail_len`] counts them without building them.
     pub fn detail_text(&self) -> Vec<(&'static str, String)> {
         match self.cursor_job().and_then(|id| self.full.get(id)) {
-            Some(status) => detail_lines(status),
+            Some(read) => detail_lines(read),
             None => vec![("", WAITING_FOR_STATUS.to_string())],
         }
     }
@@ -228,12 +226,115 @@ impl JobsState {
         1 + self
             .cursor_job()
             .and_then(|id| self.full.get(id))
-            .map_or(1, detail_line_count)
+            .map_or(1, |r| detail_line_count(r))
     }
 }
 
 /// The Detail pane's one line while no `scan.status` has answered.
 const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
+
+/// The widest any free-text field of a full status grows, in cells (fix
+/// round G, G11; D6 hostile-core bounds): `error`, the frontend and client
+/// label, each clamped field, skipped reason and running check id, and
+/// the canary path are cut to this once, at fold ([`bound_status`]), so the
+/// Detail pane formats bounded text only.
+pub const DETAIL_VALUE_MAX: usize = 400;
+/// The most entries the Detail pane lists of `checks.running`, `clamped`
+/// and `lanes.skipped` (fix round G, G11; the builder's number): the fold
+/// keeps this many and counts the rest into [`StatusDropped`], which the
+/// lines print as `+n`.
+pub const DETAIL_LIST_MAX: usize = 8;
+
+/// How many entries [`bound_status`] cut off each of the three Detail lists
+/// (fix round G, G11), so their lines can end in `+n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusDropped {
+    pub running: usize,
+    pub clamped: usize,
+    pub skipped: usize,
+}
+
+/// A full status as `JobsState::full` holds it (fix round G, G11,
+/// mirroring the Issues tab's `ReadIssue`): the `JobStatus` with its
+/// strings and lists bounded by [`bound_status`], and what that cut off.
+/// Derefs to the `JobStatus`, so a reader writes `read.probes` as before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadStatus {
+    pub status: JobStatus,
+    pub dropped: StatusDropped,
+}
+
+impl Deref for ReadStatus {
+    type Target = JobStatus;
+
+    fn deref(&self) -> &JobStatus {
+        &self.status
+    }
+}
+
+/// Bound a `scan.status` reply once, at fold (D6 hostile-core bounds; fix
+/// round G, G10, G11): control characters stripped from every string the
+/// screen reads; `profile_name` cut to [`PROFILE_MAX`], every target to
+/// four times [`TARGETS_MAX`], and `error`, `started_by.frontend`,
+/// `client_label`, each `clamped[].field`, each `lanes.skipped[].reason`,
+/// each `checks.running[]` and the canary path to [`DETAIL_VALUE_MAX`]
+/// cells; the three lists cut to [`DETAIL_LIST_MAX`] with the rest counted
+/// in the returned [`StatusDropped`].
+fn bound_status(status: &mut JobStatus) -> StatusDropped {
+    let cut = |s: &mut String| {
+        if s.chars().any(char::is_control) {
+            *s = clean(s);
+        }
+        // A char is never more cells than bytes, so a string within the
+        // cap in bytes needs no walk.
+        if s.len() > DETAIL_VALUE_MAX {
+            *s = truncate(s, DETAIL_VALUE_MAX);
+        }
+    };
+    status.profile_name = truncate(&clean(&status.profile_name), PROFILE_MAX);
+    for target in &mut status.targets {
+        *target = truncate(&clean(target), 4 * TARGETS_MAX);
+    }
+    let dropped = StatusDropped {
+        running: cap(&mut status.checks.running),
+        clamped: cap(&mut status.clamped),
+        skipped: cap(&mut status.lanes.skipped),
+    };
+    cut(&mut status.started_by.frontend);
+    let mut fields: Vec<&mut String> = Vec::new();
+    fields.extend(status.error.as_mut());
+    fields.extend(status.started_by.client_label.as_mut());
+    fields.extend(status.clamped.iter_mut().map(|c| &mut c.field));
+    fields.extend(status.lanes.skipped.iter_mut().map(|s| &mut s.reason));
+    fields.extend(status.checks.running.iter_mut());
+    if let Some(session) = &mut status.session {
+        if let Canary::Flow { path, .. } = &mut session.canary {
+            fields.push(path);
+        }
+    }
+    for field in fields {
+        cut(field);
+    }
+    dropped
+}
+
+/// Cut `v` to [`DETAIL_LIST_MAX`], give the capacity back and return how
+/// many entries left.
+fn cap<T>(v: &mut Vec<T>) -> usize {
+    let dropped = v.len().saturating_sub(DETAIL_LIST_MAX);
+    v.truncate(DETAIL_LIST_MAX);
+    v.shrink_to_fit();
+    dropped
+}
+
+/// `+n` when `dropped` entries were cut off a list, empty otherwise.
+fn more(dropped: usize) -> String {
+    if dropped > 0 {
+        format!(" +{dropped}")
+    } else {
+        String::new()
+    }
+}
 
 /// The widest a `profile` cell grows before it is cut (the column cap, and
 /// the bound [`JobsState::fold_status`] applies to the core's string).
@@ -458,10 +559,12 @@ const DETAIL_FIXED_LINES: usize = 7;
 /// The Detail pane's `label value` lines for a job (spec D11): lanes
 /// requested/run/skipped with reasons, who started it, the probe, crawl,
 /// point and check counters, the session, then `clamped`, `stopped`,
-/// `error` and `l4` only when present. Plain text; the view styles the label.
-/// Read through [`JobsState::detail_text`], the one public reading of the
-/// pane (fix round E, E5).
-fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
+/// `error` and `l4` only when present; a list the fold cut ends in `+n`
+/// (fix round G, G11). Plain text; the view styles the label. Read through
+/// [`JobsState::detail_text`], the one public reading of the pane (fix
+/// round E, E5).
+fn detail_lines(read: &ReadStatus) -> Vec<(&'static str, String)> {
+    let status = &read.status;
     let mut lines = Vec::with_capacity(DETAIL_FIXED_LINES + 4);
     let lanes = &status.lanes;
     let mut lane_text = format!(
@@ -477,6 +580,7 @@ fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
             .collect();
         lane_text.push_str(" · skipped ");
         lane_text.push_str(&skipped.join(", "));
+        lane_text.push_str(&more(read.dropped.skipped));
     }
     lines.push(("lanes", lane_text));
 
@@ -531,6 +635,7 @@ fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
     if !ch.running.is_empty() {
         checks.push_str(" · running ");
         checks.push_str(&ch.running.join(", "));
+        checks.push_str(&more(read.dropped.running));
     }
     lines.push(("checks", checks));
 
@@ -542,7 +647,10 @@ fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
             .iter()
             .map(|c| format!("{} {} -> {}", c.field, c.requested, c.applied))
             .collect();
-        lines.push(("clamped", clamped.join(", ")));
+        lines.push((
+            "clamped",
+            format!("{}{}", clamped.join(", "), more(read.dropped.clamped)),
+        ));
     }
     if let Some(reason) = status.stopped_reason {
         lines.push(("stopped", stopped_text(reason).to_string()));
@@ -697,8 +805,15 @@ mod tests {
     /// line.
     #[test]
     fn detail_line_count_mirrors_detail_lines() {
+        let read_of = |status: &JobStatus| ReadStatus {
+            status: status.clone(),
+            dropped: StatusDropped::default(),
+        };
         let bare = JobStatus::default();
-        assert_eq!(detail_line_count(&bare), detail_lines(&bare).len());
+        assert_eq!(
+            detail_line_count(&bare),
+            detail_lines(&read_of(&bare)).len()
+        );
         assert_eq!(detail_line_count(&bare), 7);
         let full = JobStatus {
             clamped: vec![aitm_scan_model::Clamped {
@@ -711,7 +826,10 @@ mod tests {
             l4: Some(Default::default()),
             ..Default::default()
         };
-        assert_eq!(detail_line_count(&full), detail_lines(&full).len());
+        assert_eq!(
+            detail_line_count(&full),
+            detail_lines(&read_of(&full)).len()
+        );
         assert_eq!(detail_line_count(&full), 11);
     }
 
