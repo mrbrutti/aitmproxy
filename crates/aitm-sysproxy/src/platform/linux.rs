@@ -1542,3 +1542,294 @@ mod tests {
         assert!(snap.skipped.is_empty());
     }
 }
+
+/// Tester (stage 5) additions: malformed GVariant text, garbage `gsettings`
+/// read-backs, and write failures mid-sequence for both Linux mechanisms.
+#[cfg(test)]
+mod tester_tests {
+    use std::collections::BTreeMap;
+
+    use aitm_ca::exec::CmdLine;
+    use aitm_ca::testing::ScriptedExecutor;
+
+    use super::*;
+    use crate::BYPASS_DEFAULT;
+
+    fn ours() -> Endpoint {
+        Endpoint {
+            host: "127.0.0.1".into(),
+            port: 8080,
+        }
+    }
+
+    fn defaults() -> Vec<String> {
+        BYPASS_DEFAULT.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn line(program: &str, args: &[&str]) -> String {
+        CmdLine {
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            stdin: None,
+            mutating: false,
+        }
+        .render()
+    }
+
+    fn get(schema: &str, key: &str) -> String {
+        line(GSETTINGS, &["get", schema, key])
+    }
+
+    fn set(schema: &str, key: &str, value: &str) -> String {
+        line(GSETTINGS, &["set", schema, key, value])
+    }
+
+    /// The six `get`s answering `answers`, in `GSETTINGS_KEYS` order.
+    fn gets_answering(answers: [&str; 6]) -> ScriptedExecutor {
+        let mut exec = ScriptedExecutor::new();
+        for (i, (schema, key)) in GSETTINGS_KEYS.iter().enumerate() {
+            exec = exec.respond(&get(schema, key), 0, answers[i], "");
+        }
+        exec
+    }
+
+    fn previous_none() -> Previous {
+        Previous::Gsettings {
+            keys: BTreeMap::from([
+                (
+                    "org.gnome.system.proxy mode".to_string(),
+                    "'none'".to_string(),
+                ),
+                (
+                    "org.gnome.system.proxy.http host".to_string(),
+                    "''".to_string(),
+                ),
+                (
+                    "org.gnome.system.proxy.http port".to_string(),
+                    "8080".to_string(),
+                ),
+                (
+                    "org.gnome.system.proxy.https host".to_string(),
+                    "''".to_string(),
+                ),
+                (
+                    "org.gnome.system.proxy.https port".to_string(),
+                    "0".to_string(),
+                ),
+                (
+                    "org.gnome.system.proxy ignore-hosts".to_string(),
+                    "['localhost']".to_string(),
+                ),
+            ]),
+        }
+    }
+
+    /// Malformed GVariant text never panics; unterminated or unbracketed
+    /// lists are empty, unquoted strings are returned trimmed, escapes
+    /// round-trip, and ports outside `u16` or non-numeric are 0.
+    #[test]
+    fn gvariant_parsers_survive_malformed_text() {
+        assert_eq!(parse_gvariant_string_list(""), Vec::<String>::new());
+        assert_eq!(parse_gvariant_string_list("garbage"), Vec::<String>::new());
+        assert_eq!(
+            parse_gvariant_string_list("['unterminated"),
+            Vec::<String>::new()
+        );
+        assert_eq!(parse_gvariant_string_list("['a', 'b"), Vec::<String>::new());
+        assert_eq!(parse_gvariant_string_list("[garbage, 'a']"), vec!["a"]);
+        assert_eq!(
+            parse_gvariant_string_list(r#"["dq", 'sq']"#),
+            vec!["dq", "sq"]
+        );
+        assert_eq!(
+            parse_gvariant_string_list(r"['back\\slash', 'tab\tx']"),
+            vec!["back\\slash".to_string(), "tab\tx".to_string()]
+        );
+        assert_eq!(
+            parse_gvariant_string_list("  @as []  "),
+            Vec::<String>::new()
+        );
+
+        assert_eq!(parse_gvariant_string(""), "");
+        assert_eq!(parse_gvariant_string("'"), "'");
+        assert_eq!(parse_gvariant_string("manual"), "manual");
+        assert_eq!(parse_gvariant_string("  'manual'\n"), "manual");
+        assert_eq!(parse_gvariant_string(r"'it\'s'"), "it's");
+        assert_eq!(gvariant_string("it's"), r"'it\'s'");
+        assert_eq!(gvariant_string(r"a\b"), r"'a\\b'");
+        for s in ["", "plain", "it's", "a\\b", "x y", "';rm -rf /"] {
+            assert_eq!(parse_gvariant_string(&gvariant_string(s)), s, "{s:?}");
+            assert_eq!(
+                parse_gvariant_string_list(&gvariant_string_list(&[s.to_string()])),
+                vec![s.to_string()],
+                "{s:?}"
+            );
+        }
+
+        assert_eq!(parse_port("abc"), 0);
+        assert_eq!(parse_port(""), 0);
+        assert_eq!(parse_port("70000"), 0);
+        assert_eq!(parse_port("-1"), 0);
+        assert_eq!(parse_port(" 8080 "), 8080);
+        assert_eq!(parse_port("uint16 8080"), 8080);
+        assert_eq!(parse_port("int32 8080"), 8080);
+    }
+
+    /// Garbage read-backs give a disabled row (never `→ :0`, never a panic):
+    /// a non-`'manual'` mode disables both protocols whatever the hosts say.
+    #[test]
+    fn gsettings_garbage_reads_are_a_disabled_row_not_a_panic() {
+        let exec = gets_answering([
+            "garbage",
+            "",
+            "abc",
+            "'127.0.0.1'",
+            "not a port",
+            "nonsense",
+        ]);
+        let eff = GsettingsOps.read_effective(&exec).expect("read");
+        assert_eq!(
+            eff.http,
+            ProtocolProxy {
+                enabled: false,
+                host: String::new(),
+                port: 0
+            }
+        );
+        assert_eq!(
+            eff.https,
+            ProtocolProxy {
+                enabled: false,
+                host: "127.0.0.1".into(),
+                port: 0
+            }
+        );
+        assert_eq!(eff.bypass, Vec::<String>::new());
+        let rows = GsettingsOps.read_services(&exec).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].http.enabled && !rows[0].https.enabled);
+
+        // A failing `get` is a typed read failure, not a default row.
+        let exec = ScriptedExecutor::new().respond(
+            &get("org.gnome.system.proxy", "mode"),
+            1,
+            "",
+            "No such schema",
+        );
+        assert!(matches!(
+            GsettingsOps.read_effective(&exec),
+            Err(ReadError::Failed(m)) if m.contains("No such schema")
+        ));
+        assert_eq!(exec.runs().len(), 1, "stopped at the first failing get");
+    }
+
+    /// A `gsettings set` that fails mid-sequence is `Failed` naming the line
+    /// and stderr; the later sets never run, so `mode` is never flipped to
+    /// `'manual'` with half the keys written.
+    #[test]
+    fn gsettings_write_failure_mid_sequence_stops_before_the_mode_flip() {
+        let failing = set("org.gnome.system.proxy.https", "host", "'127.0.0.1'");
+        let exec = gets_answering(["'none'", "''", "8080", "''", "0", "['localhost']"]).respond(
+            &failing,
+            1,
+            "",
+            "dconf: error",
+        );
+        let err = GsettingsOps
+            .write(&exec, &previous_none(), &ours(), &defaults())
+            .unwrap_err();
+        let WriteError::Failed(m) = err else {
+            panic!("expected Failed, got {err:?}");
+        };
+        assert!(m.contains(&failing), "{m}");
+        assert!(m.contains("dconf: error"), "{m}");
+        let runs = exec.runs();
+        assert_eq!(
+            runs.len(),
+            6 + 3,
+            "six gets, two good sets, the failing third: {runs:?}"
+        );
+        assert_eq!(runs[8], failing);
+        assert!(
+            !runs.iter().any(|l| l.ends_with("mode 'manual'")),
+            "mode never flipped: {runs:?}"
+        );
+
+        // A restore that fails is `Failed` too and stops at the failing line.
+        let failing = set("org.gnome.system.proxy.http", "port", "8080");
+        let exec = ScriptedExecutor::new().respond(&failing, 1, "", "read-only");
+        let err = GsettingsOps
+            .restore(&exec, &previous_none(), &[GSETTINGS_SERVICE.to_string()])
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Failed(m) if m.contains("read-only")));
+        assert_eq!(exec.runs().len(), 2);
+    }
+
+    /// A `kwriteconfig` that fails is `Failed` and the KIO signal is not
+    /// sent; a `kreadconfig` that fails is a typed read failure.
+    #[test]
+    fn kde_write_failure_is_failed_and_the_signal_is_not_sent() {
+        let kde = KdeOps {
+            kwrite: "kwriteconfig6",
+            kread: "kreadconfig6",
+            gsettings_too: false,
+        };
+        let failing = line(
+            "kwriteconfig6",
+            &[
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                "httpProxy",
+                "http://127.0.0.1 8080",
+            ],
+        );
+        let exec = ScriptedExecutor::new().respond(&failing, 1, "", "cannot write");
+        let previous = Previous::Kde {
+            kioslaverc: BTreeMap::new(),
+            gsettings: None,
+        };
+        let err = kde
+            .write(&exec, &previous, &ours(), &defaults())
+            .unwrap_err();
+        assert!(
+            matches!(err, WriteError::Failed(ref m) if m.contains("cannot write")),
+            "{err:?}"
+        );
+        let runs = exec.runs();
+        assert_eq!(
+            runs.len(),
+            2,
+            "ProxyType, then the failing httpProxy: {runs:?}"
+        );
+        assert!(!runs.iter().any(|l| l.starts_with("dbus-send")));
+
+        let failing_read = line(
+            "kreadconfig6",
+            &[
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                "ProxyType",
+            ],
+        );
+        let exec = ScriptedExecutor::new().respond(&failing_read, 2, "", "no such file");
+        assert!(matches!(
+            kde.read_effective(&exec),
+            Err(ReadError::Failed(m)) if m.contains("no such file")
+        ));
+        assert_eq!(exec.runs().len(), 1);
+
+        // A gsettings snapshot handed to the KDE restore is refused before any run.
+        let exec = ScriptedExecutor::new();
+        assert!(matches!(
+            kde.restore(&exec, &previous_none(), &[KDE_SERVICE.to_string()]),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(exec.runs().is_empty());
+    }
+}

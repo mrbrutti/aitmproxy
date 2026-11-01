@@ -525,3 +525,182 @@ mod tests {
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 }
+
+/// Tester (stage 5) additions: empty, truncated, wrong-typed and oversized
+/// documents, a directory at the state path, and `save_atomic` over a
+/// missing parent.
+#[cfg(test)]
+mod tester_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::{Mechanism, ProtocolProxy, ServiceRow, Wrote, STATE_FILE_NAME};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aitm-sysproxy-state-tester-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn corrupt_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .expect("read temp dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{STATE_FILE_NAME}.corrupt-")))
+            .count()
+    }
+
+    fn wrote() -> Wrote {
+        Wrote {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            bypass: vec!["localhost".into()],
+        }
+    }
+
+    fn small_file() -> StateFile {
+        StateFile::new(
+            Mechanism::Networksetup,
+            7,
+            wrote(),
+            Previous::Networksetup {
+                services: vec![ServiceRow {
+                    service: "Wi-Fi".into(),
+                    http: ProtocolProxy::default(),
+                    https: ProtocolProxy::default(),
+                    bypass: vec![],
+                }],
+            },
+        )
+    }
+
+    /// An empty file, a truncated document, a wrong-typed `version` and a
+    /// document whose `previous.kind` is unknown are all quarantined and
+    /// reported absent; none is an `Err`, none is left in place.
+    #[test]
+    fn empty_truncated_and_wrong_typed_files_are_quarantined() {
+        let dir = temp_dir("bad-docs");
+        let path = dir.join(STATE_FILE_NAME);
+        let valid = serde_json::to_string(&small_file()).expect("encode");
+        let cases: [&str; 4] = [
+            "",
+            &valid[..valid.len() / 2],
+            r#"{"version": "1"}"#,
+            r#"{"version": 1, "platform": "macos", "mechanism": "networksetup", "saved_at": "x", "pid": 1, "wrote": {"host": "h", "port": 1, "bypass": []}, "previous": {"kind": "registry"}}"#,
+        ];
+        for (i, body) in cases.iter().enumerate() {
+            fs::write(&path, body).expect("write");
+            assert_eq!(
+                StateFile::load(&path).expect("quarantine is not an error"),
+                None,
+                "case {i}"
+            );
+            assert!(!path.exists(), "case {i}: moved aside");
+            assert_eq!(
+                corrupt_count(&dir),
+                i + 1,
+                "case {i}: one more quarantined sibling"
+            );
+        }
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// A directory at the state path is treated like a corrupt file: moved
+    /// aside and reported absent, so a mis-set `state_file` never panics
+    /// the engine or the watchdog.
+    #[test]
+    fn a_directory_at_the_state_path_is_moved_aside_and_absent() {
+        let dir = temp_dir("dir-at-path");
+        let path = dir.join(STATE_FILE_NAME);
+        fs::create_dir(&path).expect("create the decoy directory");
+        assert_eq!(StateFile::load(&path).expect("not an error"), None);
+        assert!(!path.exists());
+        assert_eq!(corrupt_count(&dir), 1);
+        // And a save afterwards works at the now-free path.
+        small_file()
+            .save_atomic(&path)
+            .expect("save after the move");
+        assert_eq!(StateFile::load(&path).expect("load"), Some(small_file()));
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// `save_atomic` creates missing parents, leaves exactly one entry (no
+    /// temp file), and replaces an existing file whole.
+    #[test]
+    fn save_atomic_creates_parents_and_leaves_no_temp_file() {
+        let dir = temp_dir("parents");
+        let path = dir.join("nested").join("deeper").join(STATE_FILE_NAME);
+        let first = small_file();
+        first
+            .save_atomic(&path)
+            .expect("save into a missing directory");
+        assert!(path.is_file());
+        let entries: Vec<String> = fs::read_dir(path.parent().unwrap())
+            .expect("read parent")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![STATE_FILE_NAME.to_string()],
+            "no temp file left"
+        );
+        assert_eq!(StateFile::load(&path).expect("load"), Some(first.clone()));
+
+        let mut second = first;
+        second.pid = 99;
+        second.save_atomic(&path).expect("overwrite");
+        assert_eq!(
+            StateFile::load(&path).expect("load").map(|f| f.pid),
+            Some(99)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Oversized: a document with thousands of services and tens of
+    /// thousands of bypass entries round-trips whole.
+    #[test]
+    fn a_large_document_round_trips() {
+        let services: Vec<ServiceRow> = (0..2_000)
+            .map(|i| ServiceRow {
+                service: format!("Service {i}"),
+                http: ProtocolProxy {
+                    enabled: true,
+                    host: "10.0.0.5".into(),
+                    port: 3128,
+                },
+                https: ProtocolProxy::default(),
+                bypass: (0..50).map(|j| format!("h{i}-{j}.test")).collect(),
+            })
+            .collect();
+        let big = StateFile::new(
+            Mechanism::Networksetup,
+            1,
+            wrote(),
+            Previous::Networksetup { services },
+        );
+        let dir = temp_dir("large");
+        let path = dir.join(STATE_FILE_NAME);
+        big.save_atomic(&path).expect("save");
+        assert!(
+            fs::metadata(&path).expect("meta").len() > 1_000_000,
+            "really large"
+        );
+        let loaded = StateFile::load(&path).expect("load").expect("present");
+        assert_eq!(loaded, big);
+        assert_eq!(loaded.service_names().len(), 2_000);
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+}

@@ -659,4 +659,82 @@ mod tests {
             format!("system proxy restored → 127.0.0.1:9090 (2 services, {ms} ms)")
         );
     }
+
+    // ------------------------------------------------------------------
+    // Tester (stage 5) additions.
+
+    /// Tester, SP-AC15 edge: a malformed `bypass` is refused after the
+    /// operator gates and before the engine runs anything or writes a file.
+    #[test]
+    fn set_rejects_a_malformed_bypass_before_any_run() {
+        let r = rig("bad-bypass", ScriptedExecutor::new(), true);
+        let cases: [(Value, &str); 4] = [
+            (
+                Value::Str("corp.test".into()),
+                "must be an array of strings",
+            ),
+            (Value::Int(1), "must be an array of strings"),
+            (
+                Value::Array(vec![Value::Int(1)]),
+                "each `bypass` entry must be a string",
+            ),
+            (
+                Value::Array(vec![Value::Str("ok.test".into()), Value::Null]),
+                "each `bypass` entry must be a string",
+            ),
+        ];
+        for (value, needle) in cases {
+            let args = Params::new(BTreeMap::from([("bypass".to_string(), value.clone())]));
+            let err = r
+                .call("proxy.system.set", Frontend::Operator, args)
+                .expect_err("refused");
+            assert!(err.to_string().contains(needle), "{value:?}: {err}");
+        }
+        assert!(r.exec.runs().is_empty(), "ran: {:?}", r.exec.runs());
+        assert!(!r.dir.join(STATE_FILE_NAME).exists(), "no state file");
+    }
+
+    /// Tester, SP-AC15 twin with a file on disk: the Mcp refusal of `unset`
+    /// happens before the file is read or any command runs, and the file
+    /// (and so the restore it protects) stays. `proxy.system.status` is a
+    /// Read verb, so the same agent may call it.
+    #[test]
+    fn unset_from_mcp_leaves_an_existing_file_and_runs_nothing() {
+        use crate::state::{Previous, StateFile};
+        use crate::Wrote;
+
+        let r = rig("mcp-unset-file", ScriptedExecutor::new(), true);
+        let file = r.dir.join(STATE_FILE_NAME);
+        StateFile::new(
+            Mechanism::Networksetup,
+            1,
+            Wrote {
+                host: "127.0.0.1".into(),
+                port: 8080,
+                bypass: vec![],
+            },
+            Previous::Networksetup { services: vec![] },
+        )
+        .save_atomic(&file)
+        .expect("seed the state file");
+
+        let err = r
+            .call("proxy.system.unset", Frontend::Mcp, Params::default())
+            .expect_err("Mcp is refused");
+        assert!(err.to_string().contains("operator-only"), "{err}");
+        assert!(file.exists(), "the file is untouched by a refused unset");
+        assert!(r.exec.runs().is_empty(), "ran: {:?}", r.exec.runs());
+
+        let status = r
+            .call("proxy.system.status", Frontend::Mcp, Params::default())
+            .expect("status is a Read verb");
+        assert_eq!(field(&status, "state"), &Value::Str("unknown".into()));
+        assert_eq!(field(&status, "managed_by_us"), &Value::Bool(false));
+        assert!(
+            r.exec.runs().contains(&SCUTIL.to_string()),
+            "status read the OS: {:?}",
+            r.exec.runs()
+        );
+        assert!(!r.exec.runs().iter().any(|l| l.contains(" -set")));
+    }
 }

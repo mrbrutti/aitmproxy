@@ -2700,3 +2700,393 @@ mod engine_tests {
         assert_send_sync::<SystemProxy>();
     }
 }
+
+/// Tester (stage 5) additions: the spec literals the Coder's tests compared
+/// against themselves, the §D3 host set, and the engine's failure edges
+/// (empty service list, a failing or garbage `scutil`, a hung write).
+#[cfg(test)]
+mod tester_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use aitm_ca::exec::{CmdLine, CmdOutput, Executor};
+    use aitm_ca::testing::ScriptedExecutor;
+
+    use super::*;
+
+    const SCUTIL: &str = "/usr/sbin/scutil --proxy";
+    const LIST: &str = "/usr/sbin/networksetup -listallnetworkservices";
+    const LIST_OUT: &str = "An asterisk (*) denotes that a network service is disabled.\nDisplay Ethernet\n*Thunderbolt Bridge\nWi-Fi\n";
+    const HEADER_ONLY: &str =
+        "An asterisk (*) denotes that a network service is disabled.\n*Wi-Fi\n";
+
+    fn ours() -> Endpoint {
+        Endpoint {
+            host: "127.0.0.1".into(),
+            port: 8080,
+        }
+    }
+
+    fn on(host: &str, port: u16) -> ProtocolProxy {
+        ProtocolProxy {
+            enabled: true,
+            host: host.into(),
+            port,
+        }
+    }
+
+    fn off() -> ProtocolProxy {
+        ProtocolProxy::default()
+    }
+
+    fn eff(http: ProtocolProxy, https: ProtocolProxy) -> Effective {
+        Effective {
+            http,
+            https,
+            bypass: vec![],
+        }
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn other(host: &str, port: u16) -> State {
+        State::Other {
+            host: host.into(),
+            port,
+        }
+    }
+
+    /// SP-AC9: the §D3 sentence, verbatim from the spec, with the real endpoint
+    /// substituted. The Coder's test compared `remedy()` against itself.
+    #[test]
+    fn remedy_is_the_spec_d3_sentence_verbatim() {
+        assert_eq!(
+            remedy(&ours()),
+            "macOS asks for an administrator to change network settings on this Mac (a standard user, or “Require an administrator password to access system-wide settings” is on under System Settings ▸ Privacy & Security ▸ Advanced). Turn that option off or sign in as an administrator, or set HTTP and HTTPS to 127.0.0.1:8080 under System Settings ▸ Network ▸ <service> ▸ Details ▸ Proxies."
+        );
+        let lan = remedy(&Endpoint {
+            host: "10.0.0.5".into(),
+            port: 18080,
+        });
+        assert!(lan.contains("HTTPS to 10.0.0.5:18080 under"), "{lan}");
+        assert!(!lan.contains("{ours}"), "placeholder filled: {lan}");
+        assert!(!remedy(&ours()).contains("sudo"));
+    }
+
+    /// §D3: every loopback spelling and the literal we wrote count as us; a
+    /// port mismatch, a foreign host or a disabled protocol never does.
+    #[test]
+    fn classify_accepts_every_loopback_spelling_and_the_written_host() {
+        for host in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            let (state, _) = classify(&eff(on(host, 8080), on(host, 8080)), &ours());
+            assert_eq!(state, State::PointsAtUs, "host {host}");
+        }
+        let (state, _) = classify(&eff(on("localhost", 8080), on("::1", 8080)), &ours());
+        assert_eq!(state, State::PointsAtUs, "mixed spellings are still us");
+
+        let lan = Endpoint {
+            host: "10.0.0.5".into(),
+            port: 8080,
+        };
+        let (state, detail) = classify(&eff(on("10.0.0.5", 8080), on("10.0.0.5", 8080)), &lan);
+        assert_eq!(state, State::PointsAtUs);
+        assert_eq!(detail, "HTTP and HTTPS → 10.0.0.5:8080 (this core)");
+
+        let (state, detail) = classify(&eff(on("127.0.0.1", 8081), on("127.0.0.1", 8081)), &ours());
+        assert_eq!(state, other("127.0.0.1", 8081), "our host, not our port");
+        assert_eq!(detail, "HTTP and HTTPS → 127.0.0.1:8081 (not this core)");
+
+        let (state, _) = classify(&eff(on("10.0.0.5", 8080), on("10.0.0.5", 8080)), &ours());
+        assert_eq!(state, other("10.0.0.5", 8080), "our port on another host");
+
+        let mut disabled_at_us = on("127.0.0.1", 8080);
+        disabled_at_us.enabled = false;
+        let (state, detail) = classify(&eff(disabled_at_us, on("127.0.0.1", 8080)), &ours());
+        assert_eq!(
+            state,
+            other("127.0.0.1", 8080),
+            "a disabled protocol is not us"
+        );
+        assert_eq!(detail, "HTTP off, HTTPS → 127.0.0.1:8080");
+    }
+
+    /// §D3 / C4: a split setting names each protocol's side; a half-written
+    /// dictionary (`HTTPEnable : 1` with no host) is `other`, never `off` or
+    /// a panic.
+    #[test]
+    fn classify_names_each_side_of_a_split_setting() {
+        let (state, detail) = classify(&eff(on("127.0.0.1", 8080), on("10.0.0.5", 3128)), &ours());
+        assert_eq!(state, other("127.0.0.1", 8080));
+        assert_eq!(detail, "HTTP → 127.0.0.1:8080, HTTPS → 10.0.0.5:3128");
+
+        let (state, detail) = classify(&eff(off(), on("10.0.0.5", 3128)), &ours());
+        assert_eq!(state, other("10.0.0.5", 3128));
+        assert_eq!(detail, "HTTP off, HTTPS → 10.0.0.5:3128");
+
+        let (state, detail) = classify(&eff(on("", 0), on("", 0)), &ours());
+        assert_eq!(state, other("", 0));
+        assert_eq!(detail, "HTTP and HTTPS → :0 (not this core)");
+    }
+
+    /// §D5 edges: duplicates inside `extra`, empty inputs, order and case kept.
+    #[test]
+    fn merge_bypass_edges() {
+        assert_eq!(merge_bypass(&[], &[]), Vec::<String>::new());
+        assert_eq!(
+            merge_bypass(&strs(&["a", "a"]), &strs(&["a", "b", "b"])),
+            strs(&["a", "b"])
+        );
+        assert_eq!(merge_bypass(&[], &strs(&["b", "a"])), strs(&["b", "a"]));
+        assert_eq!(
+            merge_bypass(&strs(&["Corp.test"]), &strs(&["corp.test"])),
+            strs(&["Corp.test", "corp.test"]),
+            "no case folding: networksetup keeps both"
+        );
+    }
+
+    /// §D3: IPv6 loopback is written as 127.0.0.1 too; a routable IPv6
+    /// listen address is written as its bare literal.
+    #[test]
+    fn ours_from_ipv6() {
+        let e = ours_from("[::1]:8080".parse().unwrap());
+        assert_eq!((e.host.as_str(), e.port), ("127.0.0.1", 8080));
+        let e = ours_from("[fd00::5]:8080".parse().unwrap());
+        assert_eq!((e.host.as_str(), e.port), ("fd00::5", 8080));
+        assert_eq!(e.to_string(), "fd00::5:8080");
+    }
+
+    // ---- engine edges ---------------------------------------------------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aitm-sysproxy-tester-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn proxy_out(host: &str, port: u16) -> String {
+        if port == 0 {
+            "Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n".to_string()
+        } else {
+            format!("Enabled: Yes\nServer: {host}\nPort: {port}\nAuthenticated Proxy Enabled: 0\n")
+        }
+    }
+
+    fn scutil_out(host: &str, port: u16) -> String {
+        format!("<dictionary> {{\n  HTTPEnable : 1\n  HTTPPort : {port}\n  HTTPProxy : {host}\n  HTTPSEnable : 1\n  HTTPSPort : {port}\n  HTTPSProxy : {host}\n}}\n")
+    }
+
+    /// The §D7 before-state round: `Display Ethernet` at 9090, `Wi-Fi` off.
+    fn before_round(exec: ScriptedExecutor) -> ScriptedExecutor {
+        let get = |verb: &str, svc: &str| format!("/usr/sbin/networksetup {verb} {svc}");
+        exec.respond(LIST, 0, LIST_OUT, "")
+            .respond(
+                &get("-getwebproxy", "'Display Ethernet'"),
+                0,
+                &proxy_out("127.0.0.1", 9090),
+                "",
+            )
+            .respond(
+                &get("-getsecurewebproxy", "'Display Ethernet'"),
+                0,
+                &proxy_out("127.0.0.1", 9090),
+                "",
+            )
+            .respond(
+                &get("-getproxybypassdomains", "'Display Ethernet'"),
+                0,
+                "*.local\n169.254/16\n",
+                "",
+            )
+            .respond(&get("-getwebproxy", "Wi-Fi"), 0, &proxy_out("", 0), "")
+            .respond(
+                &get("-getsecurewebproxy", "Wi-Fi"),
+                0,
+                &proxy_out("", 0),
+                "",
+            )
+            .respond(
+                &get("-getproxybypassdomains", "Wi-Fi"),
+                0,
+                "*.local\n169.254/16\n",
+                "",
+            )
+    }
+
+    /// Passes every run to the scripted executor (which records it), then
+    /// fails the one named line the way `RealExecutor` reports a timeout.
+    struct HangOn {
+        inner: ScriptedExecutor,
+        line: String,
+    }
+
+    impl Executor for HangOn {
+        fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
+            let out = self.inner.run(cmd)?;
+            if cmd.render() == self.line {
+                anyhow::bail!("`{}` timed out after 30s", self.line);
+            }
+            Ok(out)
+        }
+        fn read_file(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.read_file(path)
+        }
+        fn dir_exists(&self, path: &Path) -> bool {
+            self.inner.dir_exists(path)
+        }
+        fn home_dir(&self) -> Option<PathBuf> {
+            self.inner.home_dir()
+        }
+        fn is_root(&self) -> bool {
+            self.inner.is_root()
+        }
+    }
+
+    struct Rig {
+        sp: SystemProxy,
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn macos_rig(tag: &str, exec: Arc<dyn Executor>) -> Rig {
+        let dir = temp_dir(tag);
+        let file = dir.join(STATE_FILE_NAME);
+        let cfg = SystemProxyConfig {
+            auto: false,
+            bypass: vec![],
+            state_file: Some(file.clone()),
+        };
+        let sp = SystemProxy::with_mechanism(exec, &cfg, ours(), None, Mechanism::Networksetup);
+        Rig { sp, dir, file }
+    }
+
+    fn mutating(exec: &ScriptedExecutor) -> Vec<String> {
+        exec.runs()
+            .into_iter()
+            .filter(|l| l.contains(" -set"))
+            .collect()
+    }
+
+    /// Empty input: a service list with nothing enabled makes `set` fail
+    /// before any write, leaves no file, releases the in-flight guard, and
+    /// `status()` still answers afterwards.
+    #[test]
+    fn set_with_no_enabled_service_is_an_error_with_no_write_and_no_file() {
+        let exec = Arc::new(
+            ScriptedExecutor::new()
+                .with_real_fs()
+                .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 9090), "")
+                .respond(LIST, 0, HEADER_ONLY, ""),
+        );
+        let r = macos_rig("no-service", exec.clone());
+
+        let err =
+            r.sp.set(&SetRequest::default())
+                .expect_err("nothing to write");
+        let msg = err.to_string();
+        assert!(msg.contains("cannot snapshot"), "{msg}");
+        assert!(msg.contains("no enabled network service"), "{msg}");
+        assert!(mutating(&exec).is_empty(), "{:?}", exec.runs());
+        assert!(!r.file.exists(), "no state file for a failed snapshot");
+        assert!(
+            !r.sp.is_setting(),
+            "in-flight guard released on the error path"
+        );
+
+        let status = r.sp.status();
+        assert_eq!(status.state, other("127.0.0.1", 9090));
+        assert!(status.services.is_empty());
+        assert!(!status.managed_by_us);
+        let (_, changed, _) = r.sp.unset().expect("unset is a no-op");
+        assert!(!changed);
+    }
+
+    /// Malformed input: `scutil --proxy` exiting non-zero, printing garbage,
+    /// or printing an unparsable port is `unknown` with the reason in
+    /// `detail`, never `off`; nothing else is read after a failed read.
+    #[test]
+    fn scutil_failure_or_garbage_is_unknown_with_the_reason() {
+        for (code, stdout, stderr, needle) in [
+            (1, "", "boom", "exit Some(1)"),
+            (0, "garbage\n", "", "empty dictionary"),
+            (
+                0,
+                "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : abc\n}\n",
+                "",
+                "HTTPPort is not a port",
+            ),
+            (0, "", "", "empty dictionary"),
+        ] {
+            let exec = Arc::new(
+                ScriptedExecutor::new()
+                    .with_real_fs()
+                    .respond(SCUTIL, code, stdout, stderr),
+            );
+            let r = macos_rig("scutil-bad", exec.clone());
+            let status = r.sp.status();
+            assert_eq!(status.state, State::Unknown, "{stdout:?}/{stderr:?}");
+            assert!(status.detail.contains(needle), "{}", status.detail);
+            assert_eq!(status.effective, None);
+            assert!(status.services.is_empty());
+            assert_eq!(exec.runs(), vec![SCUTIL.to_string()], "no per-service read");
+            assert_eq!(r.sp.summary().state, State::Unknown);
+            assert_eq!(r.sp.summary().detail, status.detail);
+        }
+    }
+
+    /// A write that hangs (the executor's mutate timeout) is rolled back
+    /// (C7) from `previous`, the file is removed, and `set` is an `Err`
+    /// that names the hang and says the previous setting was restored.
+    #[test]
+    fn hung_write_rolls_back_and_is_an_error_naming_the_restore() {
+        let hung = "/usr/sbin/networksetup -setsecurewebproxy 'Display Ethernet' 127.0.0.1 8080";
+        let exec = Arc::new(HangOn {
+            inner: before_round(ScriptedExecutor::new().with_real_fs()),
+            line: hung.to_string(),
+        });
+        let r = macos_rig("hung", exec.clone());
+
+        let err =
+            r.sp.set(&SetRequest::default())
+                .expect_err("a hang is an error");
+        let msg = err.to_string();
+        assert!(msg.contains("command hung"), "{msg}");
+        assert!(msg.contains(hung), "{msg}");
+        assert!(
+            msg.contains("the previous system proxy setting was restored"),
+            "{msg}"
+        );
+        assert_eq!(
+            mutating(&exec.inner),
+            vec![
+                "/usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 8080".to_string(),
+                hung.to_string(),
+                "/usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 9090".to_string(),
+                "/usr/sbin/networksetup -setwebproxystate 'Display Ethernet' on".to_string(),
+                "/usr/sbin/networksetup -setsecurewebproxy 'Display Ethernet' 127.0.0.1 9090"
+                    .to_string(),
+                "/usr/sbin/networksetup -setsecurewebproxystate 'Display Ethernet' on".to_string(),
+                "/usr/sbin/networksetup -setproxybypassdomains 'Display Ethernet' *.local 169.254/16"
+                    .to_string(),
+                "/usr/sbin/networksetup -setwebproxystate Wi-Fi off".to_string(),
+                "/usr/sbin/networksetup -setsecurewebproxystate Wi-Fi off".to_string(),
+                "/usr/sbin/networksetup -setproxybypassdomains Wi-Fi *.local 169.254/16".to_string(),
+            ],
+            "the two writes that ran, then the full restore"
+        );
+        assert!(!r.file.exists(), "file removed after the rollback");
+        assert!(!r.sp.is_setting(), "in-flight guard released");
+    }
+}

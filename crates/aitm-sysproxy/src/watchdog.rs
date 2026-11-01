@@ -914,3 +914,131 @@ mod tests {
         );
     }
 }
+
+/// Tester (stage 5) additions: the wake path over a corrupt file and over
+/// a file that names no service, through the real macOS ops with scripted
+/// output.
+#[cfg(test)]
+mod tester_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use aitm_ca::testing::ScriptedExecutor;
+
+    use super::*;
+    use crate::platform::macos::MacosOps;
+    use crate::state::{Previous, StateFile};
+    use crate::{Mechanism, Wrote, STATE_FILE_NAME, WATCHDOG_LOG_NAME};
+
+    const LIST: &str = "/usr/sbin/networksetup -listallnetworkservices";
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aitm-sysproxy-wd-tester-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn log_lines(state: &Path) -> Vec<String> {
+        fs::read_to_string(state.with_file_name(WATCHDOG_LOG_NAME))
+            .expect("read log")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// One enabled service whose three `-get*` reads answer nothing useful.
+    fn one_service_exec() -> ScriptedExecutor {
+        ScriptedExecutor::new().respond(
+            LIST,
+            0,
+            "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n",
+            "",
+        )
+    }
+
+    /// A corrupt state file at the wake is quarantined (not read as "ours"),
+    /// the live state is never read, no restore runs, and the wake is
+    /// `file-gone` with exit 0.
+    #[test]
+    fn corrupt_file_at_the_wake_is_quarantined_and_file_gone_exit_0() {
+        let dir = temp_dir("corrupt");
+        let state = dir.join(STATE_FILE_NAME);
+        fs::write(&state, "not json").expect("seed a corrupt file");
+        let exec = one_service_exec();
+        let mut log = open_log(&state);
+        assert_eq!(run_after_wake(&state, &exec, &MacosOps, &mut log), 0);
+        assert!(
+            exec.runs().is_empty(),
+            "nothing read for an unjudgeable file: {:?}",
+            exec.runs()
+        );
+        assert!(!state.exists());
+        let quarantined = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter(|e| {
+                e.as_ref()
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{STATE_FILE_NAME}.corrupt-"))
+            })
+            .count();
+        assert_eq!(quarantined, 1);
+        let lines = log_lines(&state);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(" file-gone services=0 ms="),
+            "{}",
+            lines[0]
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// A file that names no service (every service was authenticated and
+    /// skipped at set time) is removed without a restore and without a
+    /// `-set*` line; the live state is read once to judge it.
+    #[test]
+    fn a_file_naming_no_service_is_removed_without_a_restore() {
+        let dir = temp_dir("no-services");
+        let state = dir.join(STATE_FILE_NAME);
+        StateFile::new(
+            Mechanism::Networksetup,
+            1,
+            Wrote {
+                host: "127.0.0.1".into(),
+                port: 8080,
+                bypass: vec![],
+            },
+            Previous::Networksetup { services: vec![] },
+        )
+        .save_atomic(&state)
+        .expect("save");
+        let exec = one_service_exec();
+        let mut log = open_log(&state);
+        assert_eq!(
+            decide(StateFile::load(&state).expect("load").as_ref(), &[]),
+            Decision::Restore {
+                only: vec![],
+                left_alone: vec![],
+            }
+        );
+        assert_eq!(run_after_wake(&state, &exec, &MacosOps, &mut log), 0);
+        assert_eq!(exec.runs().len(), 4, "list + three gets: {:?}", exec.runs());
+        assert!(!exec.runs().iter().any(|l| l.contains(" -set")));
+        assert!(!state.exists(), "the empty file is forgotten");
+        // Nothing to restore and nothing left alone: the C8 log stays empty
+        // for this edge (observed; reported to the reviewers, not a spec row).
+        let lines = log_lines(&state);
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("restored") && !l.contains("restore-failed")),
+            "{lines:?}"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+}

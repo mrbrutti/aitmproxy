@@ -882,3 +882,375 @@ mod tests {
         assert!(exec.runs().iter().all(|l| !l.contains(" -set")));
     }
 }
+
+/// Tester (stage 5) additions: malformed, empty and oversized `networksetup`
+/// / `scutil` output, argv safety of service names and bypass entries, and
+/// the executor failure kinds (`Hung`, start failure, stderr admin error).
+#[cfg(test)]
+mod tester_tests {
+    use std::path::{Path, PathBuf};
+
+    use aitm_ca::exec::{CmdLine, CmdOutput, Executor};
+    use aitm_ca::testing::ScriptedExecutor;
+
+    use super::*;
+    use crate::ProtocolProxy;
+
+    const LIST: &str = "/usr/sbin/networksetup -listallnetworkservices";
+    const LIST_OUT: &str = "An asterisk (*) denotes that a network service is disabled.\nDisplay Ethernet\n*Thunderbolt Bridge\nWi-Fi\n";
+
+    fn ours() -> Endpoint {
+        Endpoint {
+            host: "127.0.0.1".into(),
+            port: 8080,
+        }
+    }
+
+    fn on(host: &str, port: u16) -> ProtocolProxy {
+        ProtocolProxy {
+            enabled: true,
+            host: host.into(),
+            port,
+        }
+    }
+
+    fn d7_previous() -> Previous {
+        Previous::Networksetup {
+            services: vec![
+                ServiceRow {
+                    service: "Display Ethernet".into(),
+                    http: on("127.0.0.1", 9090),
+                    https: on("127.0.0.1", 9090),
+                    bypass: vec!["*.local".into(), "169.254/16".into()],
+                },
+                ServiceRow {
+                    service: "Wi-Fi".into(),
+                    http: ProtocolProxy::default(),
+                    https: ProtocolProxy::default(),
+                    bypass: vec![],
+                },
+            ],
+        }
+    }
+
+    /// Empty and malformed output never panics and never reads as a
+    /// configured proxy.
+    #[test]
+    fn parsers_survive_empty_and_malformed_output() {
+        assert_eq!(parse_services(""), Vec::<String>::new());
+        assert_eq!(
+            parse_services("An asterisk (*) denotes that a network service is disabled.\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_services("An asterisk (*) denotes that a network service is disabled.\r\nWi-Fi  \r\n\r\n*Off\r\n"),
+            vec!["Wi-Fi"],
+            "CRLF and trailing blanks are trimmed, blank lines dropped"
+        );
+
+        assert_eq!(parse_get_proxy(""), ProtocolProxy::default());
+        assert_eq!(parse_get_proxy("garbage\n"), ProtocolProxy::default());
+        assert_eq!(
+            parse_get_proxy("Enabled: Yes\nServer: 127.0.0.1\nPort: abc\n"),
+            ProtocolProxy {
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: 0
+            },
+            "an unparsable port is 0"
+        );
+        assert_eq!(
+            parse_get_proxy("Enabled: Yes\nServer: 127.0.0.1\nPort: 99999\n").port,
+            0,
+            "a port above u16 is 0, not a wrap-around"
+        );
+        assert_eq!(
+            parse_get_proxy("Enabled: yes\nServer:127.0.0.1\nPort:  9090 \n"),
+            on("127.0.0.1", 9090),
+            "case and spacing around the colon are tolerated"
+        );
+        assert!(!parse_get_proxy_authenticated(""));
+        assert!(!parse_get_proxy_authenticated(
+            "Authenticated Proxy Enabled: 2\n"
+        ));
+
+        assert_eq!(parse_bypass(""), Vec::<String>::new());
+        assert_eq!(parse_bypass("\n  \n"), Vec::<String>::new());
+
+        assert!(matches!(parse_scutil(""), Err(ReadError::Unavailable(_))));
+        assert!(matches!(
+            parse_scutil("garbage\n"),
+            Err(ReadError::Unavailable(_))
+        ));
+        assert!(matches!(
+            parse_scutil("<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : abc\n}\n"),
+            Err(ReadError::Failed(m)) if m.contains("HTTPPort")
+        ));
+        assert!(matches!(
+            parse_scutil("<dictionary> {\n  HTTPSEnable : 1\n  HTTPSPort : 70000\n}\n"),
+            Err(ReadError::Failed(m)) if m.contains("HTTPSPort")
+        ));
+        let half =
+            parse_scutil("<dictionary> {\n  HTTPEnable : 1\n  HTTPSEnable : 0\n}\n").unwrap();
+        assert_eq!(
+            half.http,
+            ProtocolProxy {
+                enabled: true,
+                host: String::new(),
+                port: 0
+            },
+            "enabled with no host/port keys is carried as-is, not dropped"
+        );
+        assert_eq!(half.https, ProtocolProxy::default());
+
+        // Only the top-level keys count: a `__SCOPED__` per-interface
+        // dictionary with its own proxy and ExceptionsList is ignored.
+        let scoped = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  __SCOPED__ : <dictionary> {\n    en0 : <dictionary> {\n      HTTPEnable : 1\n      HTTPPort : 9090\n      HTTPProxy : 10.0.0.5\n      ExceptionsList : <array> {\n        0 : scoped.test\n      }\n    }\n  }\n}\n";
+        let e = parse_scutil(scoped).unwrap();
+        assert_eq!(e.http, ProtocolProxy::default());
+        assert_eq!(e.https, ProtocolProxy::default());
+        assert_eq!(e.bypass, Vec::<String>::new());
+    }
+
+    /// Oversized output: tens of thousands of services or bypass entries
+    /// parse whole, in order, without truncation.
+    #[test]
+    fn oversized_output_parses_whole() {
+        let mut services =
+            String::from("An asterisk (*) denotes that a network service is disabled.\n");
+        for i in 0..20_000 {
+            services.push_str(&format!("Service {i}\n"));
+        }
+        let parsed = parse_services(&services);
+        assert_eq!(parsed.len(), 20_000);
+        assert_eq!(parsed[19_999], "Service 19999");
+
+        let mut dump = String::from("<dictionary> {\n  ExceptionsList : <array> {\n");
+        for i in 0..50_000 {
+            dump.push_str(&format!("    {i} : host{i}.test\n"));
+        }
+        dump.push_str("  }\n  HTTPEnable : 1\n  HTTPPort : 8080\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 8080\n  HTTPSProxy : 127.0.0.1\n}\n");
+        let e = parse_scutil(&dump).unwrap();
+        assert_eq!(e.bypass.len(), 50_000);
+        assert_eq!(e.bypass[49_999], "host49999.test");
+        assert_eq!(e.http, on("127.0.0.1", 8080));
+
+        let bypass: Vec<String> = (0..10_000).map(|i| format!("h{i}.test\n")).collect();
+        assert_eq!(parse_bypass(&bypass.concat()).len(), 10_000);
+    }
+
+    /// Argv safety: a service name with a quote and bypass entries with
+    /// shell metacharacters are each ONE argv word; nothing is split,
+    /// interpreted or re-quoted on the way to `networksetup`.
+    #[test]
+    fn service_names_and_bypass_entries_are_single_argv_words() {
+        let svc = "Matt's iPhone USB";
+        let bypass = vec![
+            "evil; rm -rf /".to_string(),
+            "$(whoami).test".to_string(),
+            "a b".to_string(),
+            String::new(),
+        ];
+        let lines = render_write(svc, &ours(), &bypass);
+        assert_eq!(lines[0].program, NETWORKSETUP);
+        assert_eq!(
+            lines[0].args,
+            vec!["-setwebproxy", svc, "127.0.0.1", "8080"]
+        );
+        assert_eq!(
+            lines[1].args,
+            vec!["-setsecurewebproxy", svc, "127.0.0.1", "8080"]
+        );
+        assert_eq!(
+            lines[2].args,
+            vec![
+                "-setproxybypassdomains",
+                svc,
+                "evil; rm -rf /",
+                "$(whoami).test",
+                "a b",
+                ""
+            ]
+        );
+        assert!(lines.iter().all(|l| l.stdin.is_none() && l.mutating));
+        // The rendered (logged) form quotes the words with whitespace and
+        // escapes the apostrophe, so the log line is unambiguous.
+        assert!(
+            lines[0]
+                .render()
+                .starts_with(r"/usr/sbin/networksetup -setwebproxy 'Matt'\''s iPhone USB' "),
+            "{}",
+            lines[0].render()
+        );
+
+        let previous = vec![ServiceRow {
+            service: svc.into(),
+            http: on("10.0.0.5", 3128),
+            https: on("10.0.0.5", 3128),
+            bypass: vec!["a b".into()],
+        }];
+        let restore = render_restore(&previous, &[svc.to_string()]);
+        assert_eq!(restore.len(), 5);
+        assert!(restore.iter().all(|l| l.args[1] == svc));
+        assert_eq!(restore[4].args, vec!["-setproxybypassdomains", svc, "a b"]);
+        assert!(
+            render_restore(&previous, &["Wi-Fi".to_string()]).is_empty(),
+            "a name not in `previous` renders nothing"
+        );
+        assert!(render_restore(&[], &[svc.to_string()]).is_empty());
+    }
+
+    /// Executor failure kinds on a write: a timeout is `Hung(line)` and the
+    /// sequence stops there; a start failure is `Failed` naming the line;
+    /// the admin text on stderr is `NeedsPrivilege` too; a wrong snapshot
+    /// kind is refused before any run.
+    #[test]
+    fn write_failure_kinds_are_typed_and_stop_the_sequence() {
+        struct HangOn {
+            inner: ScriptedExecutor,
+            line: &'static str,
+        }
+        impl Executor for HangOn {
+            fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
+                let out = self.inner.run(cmd)?;
+                if cmd.render() == self.line {
+                    anyhow::bail!("`{}` timed out after 30s", self.line);
+                }
+                Ok(out)
+            }
+            fn read_file(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+                self.inner.read_file(path)
+            }
+            fn dir_exists(&self, path: &Path) -> bool {
+                self.inner.dir_exists(path)
+            }
+            fn home_dir(&self) -> Option<PathBuf> {
+                self.inner.home_dir()
+            }
+            fn is_root(&self) -> bool {
+                self.inner.is_root()
+            }
+        }
+        let hung = "/usr/sbin/networksetup -setsecurewebproxy 'Display Ethernet' 127.0.0.1 8080";
+        let exec = HangOn {
+            inner: ScriptedExecutor::new(),
+            line: hung,
+        };
+        let err = MacosOps
+            .write(&exec, &d7_previous(), &ours(), &[])
+            .unwrap_err();
+        assert_eq!(err, WriteError::Hung(hung.to_string()));
+        assert_eq!(exec.inner.runs().len(), 2, "stopped at the hung line");
+
+        struct CannotStart;
+        impl Executor for CannotStart {
+            fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
+                anyhow::bail!(
+                    "could not start `{}`: No such file or directory",
+                    cmd.program
+                )
+            }
+            fn read_file(&self, _: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn dir_exists(&self, _: &Path) -> bool {
+                false
+            }
+            fn home_dir(&self) -> Option<PathBuf> {
+                None
+            }
+            fn is_root(&self) -> bool {
+                false
+            }
+        }
+        let err = MacosOps
+            .write(&CannotStart, &d7_previous(), &ours(), &[])
+            .unwrap_err();
+        let WriteError::Failed(m) = err else {
+            panic!("expected Failed, got {err:?}");
+        };
+        assert!(
+            m.contains("-setwebproxy 'Display Ethernet' 127.0.0.1 8080"),
+            "{m}"
+        );
+        assert!(m.contains("could not start"), "{m}");
+
+        let first = "/usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 8080";
+        let exec = ScriptedExecutor::new().respond(first, 1, "", ADMIN_ERROR);
+        assert!(matches!(
+            MacosOps.write(&exec, &d7_previous(), &ours(), &[]),
+            Err(WriteError::NeedsPrivilege(r)) if r.contains("127.0.0.1:8080")
+        ));
+        assert_eq!(exec.runs().len(), 1);
+
+        // A restore that hits the admin error carries the failing line (the
+        // engine fills the §D3 sentence), and stops.
+        let restore_line = "/usr/sbin/networksetup -setwebproxystate Wi-Fi off";
+        let exec = ScriptedExecutor::new().respond(restore_line, 1, ADMIN_ERROR, "");
+        let err = MacosOps
+            .restore(&exec, &d7_previous(), &["Wi-Fi".to_string()])
+            .unwrap_err();
+        assert_eq!(err, WriteError::NeedsPrivilege(restore_line.to_string()));
+        assert_eq!(exec.runs().len(), 1);
+
+        // A snapshot of another mechanism is refused before any run.
+        let exec = ScriptedExecutor::new();
+        let gs = Previous::Gsettings {
+            keys: std::collections::BTreeMap::new(),
+        };
+        assert!(matches!(
+            MacosOps.write(&exec, &gs, &ours(), &[]),
+            Err(WriteError::Failed(m)) if m.contains("not a networksetup")
+        ));
+        assert!(matches!(
+            MacosOps.restore(&exec, &gs, &["gsettings".to_string()]),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(exec.runs().is_empty());
+    }
+
+    /// Read failure kinds: a non-zero list exit is `Failed` with the code
+    /// and stderr; the authorization text is `Unavailable`; a per-service
+    /// read failing mid-way stops the sequence; `scutil` exiting non-zero
+    /// is `Failed`.
+    #[test]
+    fn read_failure_kinds_are_typed_and_stop_the_sequence() {
+        let exec = ScriptedExecutor::new().respond(LIST, 1, "", "boom");
+        assert!(matches!(
+            MacosOps.read_services(&exec),
+            Err(ReadError::Failed(m)) if m.contains("exit Some(1)") && m.contains("boom")
+        ));
+
+        let exec =
+            ScriptedExecutor::new().respond(LIST, 0, "AuthorizationCreate() failed: -60008\n", "");
+        assert!(matches!(
+            MacosOps.read_services(&exec),
+            Err(ReadError::Unavailable(_))
+        ));
+        assert_eq!(exec.runs().len(), 1);
+
+        let exec = ScriptedExecutor::new()
+            .respond(LIST, 0, LIST_OUT, "")
+            .respond(
+                "/usr/sbin/networksetup -getsecurewebproxy 'Display Ethernet'",
+                1,
+                "",
+                "nope",
+            );
+        assert!(matches!(
+            MacosOps.read_services(&exec),
+            Err(ReadError::Failed(m)) if m.contains("nope")
+        ));
+        assert_eq!(exec.runs().len(), 3, "list, web, the failing secure read");
+
+        let exec = ScriptedExecutor::new().respond("/usr/sbin/scutil --proxy", 1, "", "boom");
+        assert!(matches!(
+            MacosOps.read_effective(&exec),
+            Err(ReadError::Failed(m)) if m.contains("boom")
+        ));
+        assert!(matches!(
+            MacosOps.snapshot(&ScriptedExecutor::new().respond(LIST, 1, "", "x")),
+            Err(ReadError::Failed(_))
+        ));
+    }
+}
