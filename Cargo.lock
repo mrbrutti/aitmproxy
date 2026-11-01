@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-l4-helper"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-proto-l4",
  "caps",
