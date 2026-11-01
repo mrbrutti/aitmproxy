@@ -386,9 +386,12 @@ Contract of `tools/selftest-live-reconnect.sh`:
   one click on Resume Proxy, `capturing == true` within 10 s. No retry of the click: the AX label
   said connected, so `live()` must succeed at once. A `tools/winshot.swift <pid>
   /tmp/claude/reconnect-<tag>-<trigger>.png` after each sub-procedure is the attached evidence.
-- **Teardown:** a path-targeted `tell application "<bundle>" to quit` (the normal quit path, so
-  `willTerminate` reaps the child; **orchestrator amendment, panel security Minor:** not a ⌘Q
-  keystroke, which goes to whatever is frontmost on the operator's desktop), bounded wait, then `kill` + `pkill -f
+- **Teardown:** a System Events click, scoped to the dev process, on its own app menu's Quit item
+  (`tell process "Aitmproxy-<tag>" to click menu item "Quit Aitmproxy" of menu 1 of menu bar item 2
+  of menu bar 1`; the normal quit path, so `willTerminate` reaps the child). **Orchestrator
+  amendment, panel security Minors (passes 1 and 2):** never a ⌘Q `keystroke` (it goes to whatever
+  is frontmost on the operator's desktop) and never an application- or bundle-addressed `quit` Apple
+  Event (the dev bundle shares its bundle id with the installed app, which is usually running), bounded wait, then `kill` + `pkill -f
   '<bundle>/Contents/Resources/core/'` as the fallback; the `EXIT` trap does the same. Never a
   global `pkill`.
 - **Output:** one `reconnect-live: <trigger>: <what was observed>` line per step; final line
