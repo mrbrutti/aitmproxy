@@ -29,9 +29,9 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_result, state_text, step, tag_keyed, tag_parts, IssueFilterKey, IssuePane,
-    JobPane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
-    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, STATUS_POLL_TICKS,
+    is_job_id, parse_result, state_text, step, tag_keyed, tag_parts, Dir, IssueFilterKey,
+    IssuePane, JobPane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS,
+    LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -1395,6 +1395,11 @@ impl App {
             | Action::End => self.navigate(&action, &mut out),
             Action::Left | Action::Right => {
                 let d: i32 = if action == Action::Left { -1 } else { 1 };
+                let dir = if action == Action::Left {
+                    Dir::Prev
+                } else {
+                    Dir::Next
+                };
                 match self.mode {
                     Mode::Edit => {
                         if let Some(e) = &mut self.edit {
@@ -1411,7 +1416,7 @@ impl App {
                             usize::try_from((self.compose.field as i64 + i64::from(d)).clamp(0, 3))
                                 .unwrap_or(0)
                     }
-                    _ => self.chip = step(&Chip::ALL, self.chip, d > 0),
+                    _ => self.chip = step(&Chip::ALL, self.chip, dir),
                 }
             }
             Action::Enter => match self.mode {
@@ -1480,10 +1485,10 @@ impl App {
                 _ => {}
             },
             Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
-            Action::SidebarNext => self.sidebar_step(1, &mut out),
-            Action::SidebarPrev => self.sidebar_step(-1, &mut out),
-            Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, true),
-            Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, false),
+            Action::SidebarNext => self.sidebar_step(Dir::Next, &mut out),
+            Action::SidebarPrev => self.sidebar_step(Dir::Prev, &mut out),
+            Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, Dir::Next),
+            Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, Dir::Prev),
             Action::ChipIndex(i) => {
                 if let Some(c) = Chip::ALL.get(i) {
                     self.chip = *c;
@@ -2892,12 +2897,12 @@ impl App {
 
     /// `]`/`[`: the Scope item filters the list (§2.7 "The flow list's
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
-    fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
-        let mut next = step(&SidebarItem::ALL, self.sidebar, d > 0);
+    fn sidebar_step(&mut self, dir: Dir, out: &mut Vec<BusRequest>) {
+        let mut next = step(&SidebarItem::ALL, self.sidebar, dir);
         // The Scan row is drawn only when the bus offers a scanner (D2);
         // never land on a row the operator cannot see.
         if next == SidebarItem::Scan && self.scan_offer() == ScanOffer::None {
-            next = step(&SidebarItem::ALL, next, d > 0);
+            next = step(&SidebarItem::ALL, next, dir);
         }
         self.sidebar = next;
         match self.sidebar {

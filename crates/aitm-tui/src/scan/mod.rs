@@ -141,7 +141,7 @@ impl ScanState {
     /// A successful reply under `tag` clears the error that exact tag left
     /// behind (spec D13): a single-slot verb's tag is the verb itself, a
     /// keyed verb's is `<verb>:<key>`, so job B's success never clears job
-    /// A's error (fix round B, B7).
+    /// A's error.
     pub fn clear_error(&mut self, tag: &str) {
         let same = |e: &Option<ScanError>| e.as_ref().is_some_and(|e| e.tag == tag);
         if same(&self.last_error) {
@@ -161,7 +161,7 @@ impl ScanState {
     /// flow cursor is the Issues task's, and an editor pane is dead while no
     /// profile is open.
     ///
-    /// The Site map panes walk the lists [`SitemapState::source`] picks for
+    /// The Site map panes walk the lists [`MapSource::from`] picks for
     /// `offer`: the v2 nodes and points on a v2 bus, the legacy
     /// `scan.discover` endpoints and injection points otherwise (D12: the
     /// legacy result renders as nodes and points in the same two panes),
@@ -196,7 +196,7 @@ impl ScanState {
                 }
                 JobPane::Detail => None,
             },
-            ScanTab::SiteMap => match (SitemapState::source(offer), self.sitemap.pane) {
+            ScanTab::SiteMap => match (MapSource::from(offer), self.sitemap.pane) {
                 (MapSource::Legacy, MapPane::Nodes) => {
                     let n = self.legacy.endpoints.len();
                     Some((&mut self.legacy.endpoint_cursor, n))
@@ -232,7 +232,7 @@ impl ScanState {
         if self.tab != ScanTab::SiteMap {
             return None;
         }
-        match (SitemapState::source(offer), self.sitemap.pane) {
+        match (MapSource::from(offer), self.sitemap.pane) {
             (MapSource::Legacy, MapPane::Nodes) => self
                 .legacy
                 .endpoints
@@ -260,6 +260,7 @@ impl ScanState {
 
     /// Tab / BackTab: focus the active tab's next (or previous) pane.
     pub fn step_pane(&mut self, forward: bool) {
+        let dir = if forward { Dir::Next } else { Dir::Prev };
         match self.tab {
             ScanTab::Profiles => {
                 self.profiles.pane = step(
@@ -270,25 +271,18 @@ impl ScanState {
                         ProfilePane::Checks,
                     ],
                     self.profiles.pane,
-                    forward,
+                    dir,
                 )
             }
             ScanTab::Jobs => {
-                self.jobs.pane = step(&[JobPane::List, JobPane::Detail], self.jobs.pane, forward)
+                self.jobs.pane = step(&[JobPane::List, JobPane::Detail], self.jobs.pane, dir)
             }
             ScanTab::SiteMap => {
-                self.sitemap.pane = step(
-                    &[MapPane::Nodes, MapPane::Points],
-                    self.sitemap.pane,
-                    forward,
-                )
+                self.sitemap.pane = step(&[MapPane::Nodes, MapPane::Points], self.sitemap.pane, dir)
             }
             ScanTab::Issues => {
-                self.issues.pane = step(
-                    &[IssuePane::List, IssuePane::Detail],
-                    self.issues.pane,
-                    forward,
-                )
+                self.issues.pane =
+                    step(&[IssuePane::List, IssuePane::Detail], self.issues.pane, dir)
             }
         }
     }
@@ -297,7 +291,7 @@ impl ScanState {
     /// (D11). `true` when one was open, so the caller knows the key was
     /// spent here and the view stays. On a legacy bus nothing changes in
     /// behaviour (D12): the key is never spent here, so one Esc leaves the
-    /// view as it did before the tabs (fix round A, A20).
+    /// view as it did before the tabs.
     pub fn close_pane(&mut self, offer: ScanOffer) -> bool {
         if offer == ScanOffer::Legacy {
             return false;
@@ -324,17 +318,23 @@ impl ScanState {
     }
 }
 
+/// Which way a wrapping step goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dir {
+    Next,
+    Prev,
+}
+
 /// The next (or previous) entry of `all` after `cur`, wrapping. An entry not
 /// in `all` stays put. The one wrap helper of the crate: the reducer's chip
-/// and sidebar steps use it too (fix round A, A15).
-pub(crate) fn step<T: PartialEq + Copy>(all: &[T], cur: T, forward: bool) -> T {
+/// and sidebar steps use it too.
+pub(crate) fn step<T: PartialEq + Copy>(all: &[T], cur: T, dir: Dir) -> T {
     match all.iter().position(|x| *x == cur) {
         Some(i) => {
             let n = all.len();
-            all[if forward {
-                (i + 1) % n
-            } else {
-                (i + n - 1) % n
+            all[match dir {
+                Dir::Next => (i + 1) % n,
+                Dir::Prev => (i + n - 1) % n,
             }]
         }
         None => cur,
@@ -511,9 +511,8 @@ pub fn tag_parts(tag: &str) -> (&str, Option<&str>) {
 ///
 /// A port is stripped only from a bracketed IPv6 literal (`[::1]:8080`) or
 /// from a `host:digits` pair holding exactly one colon; a bare IPv6 literal
-/// (`::1`, `fe80::1`) holds more and is kept whole (fix round A, A4; the
-/// finding's "remainder holds at most one colon" is read as "the whole
-/// authority holds at most one colon", which is what its own cases pin).
+/// (`::1`, `fe80::1`) holds more and is kept whole (the rule is "the whole
+/// authority holds at most one colon").
 pub fn scan_host(raw: &str) -> String {
     let s = raw.trim();
     let s = s.split_once("://").map_or(s, |(_, rest)| rest);

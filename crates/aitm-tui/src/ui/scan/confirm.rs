@@ -14,41 +14,69 @@ use crate::theme::Theme;
 use crate::ui::centered;
 use crate::ui::overlays::{boxed, lines_into};
 
-/// Draw the wire-confirm overlay for the pending `App::wire_confirm`. The title
-/// separator is a colon (spec D7); a `scan.*` call reads the scan-launch
-/// wording, any other call (the `l4.*` verbs) the guarded-L4 wording.
+/// The family of the call under confirmation, classified once from its
+/// name: it picks the title, the footnote and the hue of the call-name line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    /// A `scan.*` launch.
+    Scan,
+    /// Any other call: the guarded `l4.*` verbs.
+    L4,
+}
+
+impl Family {
+    fn of(call: &str) -> Family {
+        if call.starts_with("scan.") {
+            Family::Scan
+        } else {
+            Family::L4
+        }
+    }
+
+    /// The box title; the separator is a colon (spec D7).
+    fn title(self) -> &'static str {
+        match self {
+            Family::Scan => "Confirm over the wire: scan launch",
+            Family::L4 => "Confirm over the wire: guarded L4 action",
+        }
+    }
+
+    /// The tertiary line under the prompt.
+    fn footnote(self) -> &'static str {
+        match self {
+            Family::Scan => "Confirming starts the job now; x in Jobs cancels it at any time.",
+            Family::L4 => "This reaches the wire only through l4.inject; the guard enforces scope.",
+        }
+    }
+
+    /// D13, hue only on data: the call-name line reads in the hue of its
+    /// family, the accent for a scan launch and the L4 hue for an L4 verb.
+    fn hue(self, theme: &Theme) -> ratatui::style::Style {
+        match self {
+            Family::Scan => theme.accent(),
+            Family::L4 => theme.l4(),
+        }
+    }
+}
+
+/// Draw the wire-confirm overlay for the pending `App::wire_confirm`: a
+/// `scan.*` call reads the scan-launch wording, any other call (the `l4.*`
+/// verbs) the guarded-L4 wording ([`Family`]).
 pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     let Some(c) = &app.wire_confirm else {
         return;
     };
-    let (title, footnote) = if c.call.starts_with("scan.") {
-        (
-            "Confirm over the wire: scan launch",
-            "Confirming starts the job now; x in Jobs cancels it at any time.",
-        )
-    } else {
-        (
-            "Confirm over the wire: guarded L4 action",
-            "This reaches the wire only through l4.inject; the guard enforces scope.",
-        )
-    };
+    let family = Family::of(&c.call);
     let area = centered(
         screen,
         screen.width.saturating_sub(10).clamp(40, 90),
         screen.height.saturating_sub(8).clamp(7, 16),
     );
-    let inner = boxed(theme, title, area, buf);
-    // D13, hue only on data: the call-name line reads in the hue of its
-    // family, the accent for a scan launch and the L4 hue for an L4 verb.
-    let call_hue = if c.call.starts_with("scan.") {
-        theme.accent()
-    } else {
-        theme.l4()
-    };
+    let inner = boxed(theme, family.title(), area, buf);
     let mut lines = vec![
         Line::styled(
             format!(" {}", c.call),
-            call_hue.add_modifier(Modifier::BOLD),
+            family.hue(theme).add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
     ];
@@ -57,7 +85,10 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(format!(" {footnote}"), theme.text_tertiary()));
+    lines.push(Line::styled(
+        format!(" {}", family.footnote()),
+        theme.text_tertiary(),
+    ));
     lines.push(Line::styled(
         " y confirm (re-issues with _confirm) · n / Esc cancel",
         theme.accent().add_modifier(Modifier::BOLD),

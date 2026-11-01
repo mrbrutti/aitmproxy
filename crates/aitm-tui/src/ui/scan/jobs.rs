@@ -26,7 +26,7 @@ use crate::scan::{
 use crate::theme::Theme;
 use crate::tokens::color::status;
 use crate::ui::bars::put;
-use crate::ui::scan::{note, pane_rule, Panes};
+use crate::ui::scan::{note, pane_rule, stacked, stacked_share, Panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, elide_middle, fit, right, truncate, width};
 
@@ -40,8 +40,6 @@ const GAP: usize = 2;
 const PROFILE_MAX: usize = 16;
 /// The widest a `targets` cell grows before its middle is elided.
 const TARGETS_MAX: usize = 48;
-/// The share of the body the table may take when it has rows to fill it.
-const LIST_PERCENT: u32 = 40;
 /// The Detail pane's footer (D11).
 const FOOTER: &str = "x cancel · ⏎ issues of this job · s start · m map";
 
@@ -69,36 +67,13 @@ fn table(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     detail(app, theme, &rows, split.detail, buf);
 }
 
-/// The table on top, sized to its header and rows up to [`LIST_PERCENT`] of
-/// the body (at least the header and one row), a rule, the detail below.
-/// A body too short for all three gives everything to the table.
+/// The table on top, sized to its header and rows up to the shared
+/// [`stacked_share`] of the body (at least the header and one row), a rule,
+/// the detail below: [`stacked`] with content-sized rows. A body too short
+/// for all three gives everything to the table.
 fn split(area: Rect, rows: usize) -> Panes {
-    let height = usize::from(area.height);
-    if height < 3 {
-        return Panes {
-            list: area,
-            detail: Rect::new(area.x, area.bottom(), area.width, 0),
-            rule: None,
-        };
-    }
-    let cap = usize::try_from(u32::from(area.height) * LIST_PERCENT / 100)
-        .unwrap_or(height)
-        .max(2);
-    let list_h = (1 + rows).min(cap).min(height - 2);
-    let list_h = cells(list_h);
-    let list = Rect::new(area.x, area.y, area.width, list_h);
-    let rule_y = area.y.saturating_add(list_h);
-    let detail = Rect::new(
-        area.x,
-        rule_y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(list_h.saturating_add(1)),
-    );
-    Panes {
-        list,
-        detail,
-        rule: Some(Rect::new(area.x, rule_y, area.width, 1)),
-    }
+    let cap = usize::from(stacked_share(area.height)).max(2);
+    stacked(area, cells((1 + rows).min(cap)))
 }
 
 /// The measured column widths of one table.

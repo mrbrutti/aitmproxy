@@ -188,23 +188,37 @@ fn refreshing(app: &App) -> Option<&'static str> {
 
 /// A tab body split into its list and detail panes, with the rule between
 /// them (D11). Both panes exclude the rule; `rule` is `None` when the body is
-/// too small to leave a cell for it.
+/// too small to leave a cell for it. Built only by [`panes`] and
+/// [`stacked`], so every tab shares one arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Panes {
     pub list: Rect,
     pub detail: Rect,
     pub rule: Option<Rect>,
+    /// Whether the panes sit left and right (a vertical rule) rather than
+    /// top and bottom (a horizontal one).
+    pub side_by_side: bool,
+}
+
+/// The share of a stacked body the list takes when it has rows to fill it
+/// (D11: 40/60); the Jobs tab sizes its table to its rows up to this.
+pub const STACKED_LIST_PERCENT: u32 = 40;
+
+/// `whole * pct / 100` in `u32`, so a very wide terminal cannot overflow
+/// `u16`. `whole * pct / 100 <= whole`, so the narrowing cannot lose bits.
+fn percent(whole: u16, pct: u32) -> u16 {
+    u16::try_from(u32::from(whole) * pct / 100).unwrap_or(whole)
+}
+
+/// The rows a stacked body's list takes at [`STACKED_LIST_PERCENT`].
+pub fn stacked_share(height: u16) -> u16 {
+    percent(height, STACKED_LIST_PERCENT)
 }
 
 /// Split a tab's body into its list and detail panes: side by side (45/55)
-/// from 100 columns, stacked (40/60) below that, with one rule between them
-/// (D11). The split is decided once, here, and the arithmetic runs in `u32`
-/// so a very wide terminal cannot overflow `u16` (fix round A, A12).
+/// from 100 columns, stacked ([`STACKED_LIST_PERCENT`] over the rest) below
+/// that, with one rule between them (D11). The split is decided once, here.
 pub fn panes(area: Rect) -> Panes {
-    let percent = |whole: u16, pct: u32| -> u16 {
-        // `whole * pct / 100 <= whole`, so the narrowing cannot lose bits.
-        u16::try_from(u32::from(whole) * pct / 100).unwrap_or(whole)
-    };
     if area.width >= 100 {
         let left = percent(area.width, 45);
         let list = Rect::new(area.x, area.y, left, area.height);
@@ -216,28 +230,55 @@ pub fn panes(area: Rect) -> Panes {
             area.height,
         );
         let rule = (left < area.width).then(|| Rect::new(rule_x, area.y, 1, area.height));
-        Panes { list, detail, rule }
+        Panes {
+            list,
+            detail,
+            rule,
+            side_by_side: true,
+        }
     } else {
-        let top = percent(area.height, 40).max(1);
-        let list = Rect::new(area.x, area.y, area.width, top);
-        let rule_y = area.y.saturating_add(top);
-        let detail = Rect::new(
-            area.x,
-            rule_y.saturating_add(1),
-            area.width,
-            area.height.saturating_sub(top.saturating_add(1)),
-        );
-        let rule = (top < area.height).then(|| Rect::new(area.x, rule_y, area.width, 1));
-        Panes { list, detail, rule }
+        stacked(area, stacked_share(area.height))
     }
 }
 
-/// Draw the rule [`panes`] left between the two panes, if it left one.
+/// Stack a tab's body: `list_rows` rows of list on top (at least one, and
+/// at least one row left for the detail), one rule row, the detail below.
+/// A body too short for all three (under three rows) gives everything to
+/// the list and leaves no rule and an empty detail.
+pub fn stacked(area: Rect, list_rows: u16) -> Panes {
+    if area.height < 3 {
+        return Panes {
+            list: area,
+            detail: Rect::new(area.x, area.bottom(), area.width, 0),
+            rule: None,
+            side_by_side: false,
+        };
+    }
+    let top = list_rows.clamp(1, area.height - 2);
+    let list = Rect::new(area.x, area.y, area.width, top);
+    let rule_y = area.y.saturating_add(top);
+    let detail = Rect::new(
+        area.x,
+        rule_y.saturating_add(1),
+        area.width,
+        area.height - top - 1,
+    );
+    Panes {
+        list,
+        detail,
+        rule: Some(Rect::new(area.x, rule_y, area.width, 1)),
+        side_by_side: false,
+    }
+}
+
+/// Draw the rule [`panes`] left between the two panes, if it left one: a
+/// vertical line beside the list when the panes sit side by side, a
+/// horizontal one under it when they are stacked.
 pub fn pane_rule(theme: &Theme, panes: &Panes, buf: &mut Buffer) {
     let Some(rule) = panes.rule else {
         return;
     };
-    if rule.width == 1 {
+    if panes.side_by_side {
         for y in rule.y..rule.bottom() {
             buf.set_string(rule.x, y, "│", theme.rule());
         }
@@ -276,6 +317,7 @@ mod tests {
     fn panes_split_a_1500_column_rect_without_overflow() {
         let area = Rect::new(0, 0, 1500, 60);
         let p = panes(area);
+        assert!(p.side_by_side);
         assert_eq!(u32::from(p.list.width), 1500 * 45 / 100);
         assert_eq!(p.list, Rect::new(0, 0, 675, 60));
         assert_eq!(p.rule, Some(Rect::new(675, 0, 1, 60)));
@@ -285,12 +327,35 @@ mod tests {
         assert_eq!(buf.cell((675, 59)).map(|c| c.symbol()), Some("│"));
     }
 
-    /// Below 100 columns the panes stack 40/60 with one rule row between.
+    /// Below 100 columns the panes stack 40/60 with one rule row between,
+    /// drawn as a horizontal line.
     #[test]
     fn panes_stack_below_100_columns() {
         let p = panes(Rect::new(0, 3, 80, 20));
+        assert!(!p.side_by_side);
         assert_eq!(p.list, Rect::new(0, 3, 80, 8));
         assert_eq!(p.rule, Some(Rect::new(0, 11, 80, 1)));
         assert_eq!(p.detail, Rect::new(0, 12, 80, 11));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 23));
+        pane_rule(&Theme::new(true), &p, &mut buf);
+        assert_eq!(buf.cell((79, 11)).map(|c| c.symbol()), Some("─"));
+        assert_eq!(buf.cell((0, 12)).map(|c| c.symbol()), Some(" "));
+    }
+
+    /// Fix round C, C22: the one stacked arithmetic. The list keeps at
+    /// least one row and leaves at least one for the detail; a body under
+    /// three rows is all list, with no rule.
+    #[test]
+    fn stacked_clamps_the_list_and_handles_a_short_body() {
+        let p = stacked(Rect::new(0, 0, 50, 10), 3);
+        assert_eq!(p.list, Rect::new(0, 0, 50, 3));
+        assert_eq!(p.rule, Some(Rect::new(0, 3, 50, 1)));
+        assert_eq!(p.detail, Rect::new(0, 4, 50, 6));
+        assert_eq!(stacked(Rect::new(0, 0, 50, 10), 0).list.height, 1);
+        assert_eq!(stacked(Rect::new(0, 0, 50, 10), 40).list.height, 8);
+        let short = stacked(Rect::new(0, 0, 50, 2), 5);
+        assert_eq!(short.list, Rect::new(0, 0, 50, 2));
+        assert_eq!(short.rule, None);
+        assert_eq!(short.detail, Rect::new(0, 2, 50, 0));
     }
 }

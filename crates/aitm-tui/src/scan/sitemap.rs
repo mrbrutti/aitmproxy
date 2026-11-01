@@ -25,11 +25,24 @@ pub struct SitemapQuery {
 /// Which lists the Site map's two panes walk: the legacy `scan.discover`
 /// endpoints and injection points (D12), or the v2 `scan.sitemap` nodes and
 /// points. Decided once, from the bus, so the cursor keys and `Enter` never
-/// disagree (fix round A, A2).
+/// disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapSource {
     Legacy,
     V2,
+}
+
+impl From<ScanOffer> for MapSource {
+    /// The lists the panes walk on a bus offering `offer`: the v2 lists only
+    /// on a v2 bus, the legacy lists otherwise (a bus with no scanner has
+    /// empty legacy lists, which is the right answer too).
+    fn from(offer: ScanOffer) -> Self {
+        if offer == ScanOffer::V2 {
+            MapSource::V2
+        } else {
+            MapSource::Legacy
+        }
+    }
 }
 
 /// The Site map tab.
@@ -47,17 +60,4 @@ pub struct SitemapState {
     pub fetched_at_tick: u64,
     /// This tab's last error.
     pub error: Option<ScanError>,
-}
-
-impl SitemapState {
-    /// The lists the panes walk on a bus offering `offer`: the v2 lists only
-    /// on a v2 bus, the legacy lists otherwise (a bus with no scanner has
-    /// empty legacy lists, which is the right answer too).
-    pub fn source(offer: ScanOffer) -> MapSource {
-        if offer == ScanOffer::V2 {
-            MapSource::V2
-        } else {
-            MapSource::Legacy
-        }
-    }
 }
