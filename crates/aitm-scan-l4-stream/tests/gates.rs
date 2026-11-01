@@ -1007,14 +1007,15 @@ async fn a_skipped_profile_seed_is_counted_and_named() {
     assert_eq!(client.count(), 0, "a passed deadline opens no exchange");
 }
 
-/// The profile's seeds are the same for every endpoint, so they are decoded
-/// once and the skipped-seed notes are shared, not recomputed per endpoint.
+/// The profile's seeds are the same for every endpoint, so the one skipped
+/// seed is reported by every endpoint, and exactly once each.
 ///
 /// One `flow:` seed this lane cannot use, two L4 endpoints: each endpoint's
 /// discovery line counts the one skipped seed, and each endpoint's verdict
-/// carries the very same note — once.
+/// carries the very same note — once. (That the decode happens once per job
+/// is an implementation property this test cannot observe and does not claim.)
 #[tokio::test]
-async fn one_profile_seed_is_decoded_once_for_every_endpoint() {
+async fn every_endpoint_reports_the_one_skipped_profile_seed() {
     use aitm_core::FlowId;
     use aitm_scan_model::FlowRef;
 
@@ -1244,7 +1245,7 @@ async fn a_guard_refusal_is_warned() {
         !recorded.is_empty(),
         "the capture recorded nothing at all, so nothing below is proven"
     );
-    // Ports 9009 and 9010 are this test's alone: the capture sink is global
+    // Port 9009 is this test's alone: the capture sink is global
     // and the other tests in this binary emit into it beside us, so a line is
     // picked by the point it names and not by being the only one of its kind.
     let warned: Vec<&String> = recorded

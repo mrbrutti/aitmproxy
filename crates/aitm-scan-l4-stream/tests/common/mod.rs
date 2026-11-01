@@ -883,8 +883,12 @@ impl Drop for Guard {
 /// the serial lock that keeps them in turn; its [`lines`](Self::lines) stay
 /// readable for as long as it lives and are cleared when it drops.
 pub struct TracingCapture {
-    _serial: tokio::sync::MutexGuard<'static, ()>,
+    // Field order is load-bearing: fields drop in declaration order, so the
+    // sink-clearing guard must drop BEFORE the serial lock is released, or the
+    // next test could acquire the lock and start recording into a sink this
+    // one then wipes.
     _guard: Guard,
+    _serial: tokio::sync::MutexGuard<'static, ()>,
     /// The shared sink of recorded lines.
     pub lines: Arc<Mutex<Vec<String>>>,
 }
@@ -922,10 +926,10 @@ pub async fn capture_tracing() -> TracingCapture {
     });
     lock(sink).clear();
     TracingCapture {
-        _serial: serial,
         _guard: Guard {
             sink: Arc::clone(sink),
         },
+        _serial: serial,
         lines: Arc::clone(sink),
     }
 }
