@@ -4,4 +4,6 @@
 pub mod availability;
 pub mod contract;
 pub mod derive;
+pub mod linux;
+pub mod macos;
 pub mod report;
