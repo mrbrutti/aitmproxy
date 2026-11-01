@@ -28,7 +28,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::log::{redact_headers, sha256_hex, ConnInfo, ControlLog, Listener, RequestEntry};
+use crate::log::{
+    parse_cookies, redact_headers, sha256_hex, ConnInfo, ControlLog, Listener, RequestEntry,
+};
 use crate::routes;
 use crate::seed::{self, SeedMode};
 use crate::ws;
@@ -230,16 +232,16 @@ where
     let on_upgrade = (path == "/ws").then(|| hyper::upgrade::on(&mut req));
 
     let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
-        Ok(collected) => Some(collected.to_bytes()),
-        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => None,
-        // A body that failed mid-read (peer went away, h2 reset): serve what
-        // we have (nothing) rather than fail the connection.
-        Err(_) => Some(Bytes::new()),
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => Err(BodyRefused::TooLarge),
+        // A body that failed mid-read (peer went away, h2 reset): answer
+        // 400 and log it as such, rather than route an empty body as if it
+        // had been sent.
+        Err(_) => Err(BodyRefused::Unreadable),
     };
-
-    let (body, too_large) = match body {
-        Some(b) => (b, false),
-        None => (Bytes::new(), true),
+    let (body, refused) = match body {
+        Ok(b) => (b, None),
+        Err(why) => (Bytes::new(), Some(why)),
     };
 
     let info = RequestInfo {
@@ -254,13 +256,14 @@ where
         host,
     };
 
-    let resp = if too_large {
-        html(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large".to_string(),
-        )
-    } else {
-        dispatch(&info, &state, on_upgrade).await
+    let resp = match refused {
+        Some(BodyRefused::TooLarge) => {
+            html(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        }
+        Some(BodyRefused::Unreadable) => {
+            html(StatusCode::BAD_REQUEST, "request body could not be read")
+        }
+        None => dispatch(&info, &state, on_upgrade).await,
     };
     let resp = finalize(state.mode, resp);
 
@@ -284,6 +287,16 @@ where
         status: resp.status().as_u16(),
     });
     Ok(resp)
+}
+
+/// Why a request body was not collected: the request is answered without
+/// routing and logged with that status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyRefused {
+    /// Past [`MAX_BODY`]: 413.
+    TooLarge,
+    /// The stream failed mid-read (peer gone, h2 reset): 400.
+    Unreadable,
 }
 
 /// Try every route family in order; the first `Some` wins.
@@ -645,35 +658,34 @@ pub(crate) fn index_mentions(path: &str) -> bool {
 
 // --- Helpers -----------------------------------------------------------------
 
-/// Split every `Cookie` header into name/value pairs; the first occurrence of a
-/// name wins, values are kept raw (no decoding).
-fn parse_cookies(headers: &HeaderMap) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for value in headers.get_all("cookie") {
-        let Ok(text) = value.to_str() else {
-            continue;
-        };
-        for pair in text.split(';') {
-            let Some((name, val)) = pair.split_once('=') else {
-                continue;
-            };
-            let name = name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            out.entry(name.to_string())
-                .or_insert_with(|| val.trim().to_string());
-        }
-    }
-    out
+// --- Response builders -------------------------------------------------------
+
+/// A `text/html; charset=utf-8` response.
+pub(crate) fn html(status: StatusCode, body: impl Into<Bytes>) -> Resp {
+    with_content_type(status, "text/html; charset=utf-8", body)
 }
 
-pub(crate) fn html(status: StatusCode, body: String) -> Resp {
-    Response::builder()
-        .status(status)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
-        .expect("valid response")
+/// An `application/json` response.
+pub(crate) fn json(status: StatusCode, body: impl Into<Bytes>) -> Resp {
+    with_content_type(status, "application/json", body)
+}
+
+/// A `text/plain; charset=utf-8` response.
+pub(crate) fn text_plain(status: StatusCode, body: impl Into<Bytes>) -> Resp {
+    with_content_type(status, "text/plain; charset=utf-8", body)
+}
+
+/// A response with `content-type` (one of this crate's constants) and `body`.
+pub(crate) fn with_content_type(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Bytes>,
+) -> Resp {
+    let mut resp = Response::new(Full::new(body.into()));
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert("content-type", HeaderValue::from_static(content_type));
+    resp
 }
 
 /// A 302 to `location`. The value may be request-derived (the open-redirect
@@ -691,7 +703,7 @@ pub(crate) fn redirect(location: &str) -> Resp {
 }
 
 pub(crate) fn not_found() -> Resp {
-    html(StatusCode::NOT_FOUND, "not found".to_string())
+    html(StatusCode::NOT_FOUND, "not found")
 }
 
 /// A relative, same-origin path: starts with a single `/` (not `//`, which is a
@@ -747,13 +759,10 @@ pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// A URL-decoded field from a form-encoded request body.
+/// A URL-decoded field from a form-encoded request body: [`query_param`]
+/// over the body as UTF-8 (`None` when it is not).
 pub(crate) fn form_param(body: &[u8], key: &str) -> Option<String> {
-    let s = std::str::from_utf8(body).ok()?;
-    s.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| percent_decode(v))
-    })
+    query_param(std::str::from_utf8(body).ok()?, key)
 }
 
 /// Minimal HTML escaping for the patched (safe) rendering paths. Local to keep
@@ -1178,6 +1187,72 @@ mod tests {
             .expect("valid request");
         let resp = route(req, state, conn).await.expect("route is infallible");
         assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A request body whose stream fails after the headers (the peer went
+    /// away, an h2 RST_STREAM).
+    struct FailingBody;
+
+    impl hyper::body::Body for FailingBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+            std::task::Poll::Ready(Some(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn body_that_fails_mid_read_is_400_and_logged_400() {
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comments")
+            .body(FailingBody)
+            .expect("valid request");
+        let resp = route(req, state.clone(), conn.clone())
+            .await
+            .expect("route is infallible");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("full body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"request body could not be read");
+        let e = &state.log.http_json()["entries"][0];
+        assert_eq!(e["status"], 400, "{e}");
+        assert_eq!(e["path"], "/comments", "{e}");
+        assert_eq!(e["body_len"], 0, "{e}");
+        // Nothing was stored from the broken request.
+        assert!(state.comments.lock().expect("comment store").is_empty());
+    }
+
+    #[test]
+    fn form_param_is_query_param_over_utf8() {
+        // One decoder for both: same percent/plus rules, same first-match
+        // semantics; a non-UTF-8 body yields nothing.
+        for (pairs, key) in [
+            ("a=1&b=x%20y+z", "b"),
+            ("a=1&a=2", "a"),
+            ("flag&b=2", "flag"),
+            ("b=%zz", "b"),
+            ("", "b"),
+        ] {
+            assert_eq!(
+                form_param(pairs.as_bytes(), key),
+                query_param(pairs, key),
+                "{pairs:?} {key}"
+            );
+        }
+        assert_eq!(form_param(b"a=1&b=x%20y+z", "b").as_deref(), Some("x y z"));
+        assert_eq!(form_param(&[b'b', b'=', 0xff], "b"), None);
     }
 
     #[test]

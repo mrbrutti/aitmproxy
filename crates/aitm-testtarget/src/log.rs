@@ -454,6 +454,29 @@ pub(crate) fn sha256_prefix16(bytes: &[u8]) -> String {
     s
 }
 
+/// Split every `Cookie` header into name/value pairs; the first occurrence of a
+/// name wins, values are kept raw (no decoding).
+pub(crate) fn parse_cookies(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for value in headers.get_all("cookie") {
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        for pair in text.split(';') {
+            let Some((name, val)) = pair.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            out.entry(name.to_string())
+                .or_insert_with(|| val.trim().to_string());
+        }
+    }
+    out
+}
+
 /// What a `request` / `handshake` entry keeps of the request headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Redacted {
@@ -468,7 +491,8 @@ pub(crate) struct Redacted {
 /// joined with `", "`), except that an `x-*` name on [`X_CREDENTIAL_DENYLIST`]
 /// is kept as `"<redacted>"`; hash `cookie` / `authorization` (first 16 hex
 /// of SHA-256 over the raw value; several `cookie` headers are joined with
-/// `"; "` first) and list the cookie names sorted. Nothing else survives.
+/// `"; "` first) and list the cookie names ([`parse_cookies`], sorted).
+/// Nothing else survives.
 pub(crate) fn redact_headers(h: &HeaderMap) -> Redacted {
     let mut out = Redacted::default();
     let mut cookie_raw: Option<Vec<u8>> = None;
@@ -477,16 +501,7 @@ pub(crate) fn redact_headers(h: &HeaderMap) -> Redacted {
     for (name, value) in h {
         let name = name.as_str().to_ascii_lowercase();
         match name.as_str() {
-            "cookie" => {
-                append_raw(&mut cookie_raw, b"; ", value.as_bytes());
-                for part in value.as_bytes().split(|&b| b == b';') {
-                    let part = part.split(|&b| b == b'=').next().unwrap_or(&[]);
-                    let key = String::from_utf8_lossy(part).trim().to_string();
-                    if !key.is_empty() {
-                        out.cookie_names.push(key);
-                    }
-                }
-            }
+            "cookie" => append_raw(&mut cookie_raw, b"; ", value.as_bytes()),
             "authorization" => append_raw(&mut auth_raw, b", ", value.as_bytes()),
             n if X_CREDENTIAL_DENYLIST.contains(&n) => {
                 out.headers.insert(name.clone(), "<redacted>".to_string());
@@ -505,8 +520,9 @@ pub(crate) fn redact_headers(h: &HeaderMap) -> Redacted {
         }
     }
 
-    out.cookie_names.sort();
-    out.cookie_names.dedup();
+    // One cookie parser for the routes and the log: a `BTreeMap`'s keys are
+    // already sorted and unique.
+    out.cookie_names = parse_cookies(h).into_keys().collect();
     out.cookie_sha256 = cookie_raw.as_deref().map(sha256_prefix16);
     out.auth_sha256 = auth_raw.as_deref().map(sha256_prefix16);
     out
@@ -1201,9 +1217,12 @@ mod tests {
             r.headers.get("user-agent").map(String::as_str),
             Some("ua/1")
         );
+        // Names come from the one cookie parser (`parse_cookies`): sorted,
+        // deduplicated, and a bare `c` without `=` is not a cookie-pair.
+        assert_eq!(r.cookie_names, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(
             r.cookie_names,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            parse_cookies(&h).keys().cloned().collect::<Vec<_>>()
         );
         assert_eq!(
             r.cookie_sha256.as_deref(),

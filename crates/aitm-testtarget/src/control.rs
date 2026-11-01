@@ -11,20 +11,16 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Body;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+use crate::app::Resp;
 use crate::listeners::accept_loop;
 use crate::log::{ControlLog, ServiceInfo};
-
-/// Every control response: a JSON document in a [`Full`] body.
-type Resp = Response<Full<Bytes>>;
 
 /// Bind the control origin on `127.0.0.1:port` (0 = ephemeral), register it
 /// as the `control` service and spawn the HTTP/1 accept loop. Returns the
@@ -108,11 +104,7 @@ fn query_param<'q>(query: Option<&'q str>, key: &str) -> Option<&'q str> {
 
 /// A response carrying `value` as JSON with `content-type: application/json`.
 fn json_response(status: StatusCode, value: &Value) -> Resp {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(value.to_string())))
-        .expect("valid response")
+    crate::app::json(status, value.to_string())
 }
 
 #[cfg(test)]

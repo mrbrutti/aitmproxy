@@ -17,12 +17,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{Response, StatusCode};
+use hyper::StatusCode;
 
-use crate::app::{html, html_escape, not_found, AppState, RequestInfo, Resp};
+use crate::app::{
+    html, html_escape, json, not_found, text_plain, with_content_type, AppState, RequestInfo, Resp,
+};
 use crate::seed::{self, SeedMode};
 
 /// The five rows the virtual `items` table holds (`/items?id=`).
@@ -476,11 +476,7 @@ fn collapse_dot_segments(s: &str) -> String {
 /// The allowlisted assets; anything else is a 404.
 fn serve_static(file: &str) -> Resp {
     match STATIC_FILES.iter().find(|(name, _, _)| *name == file) {
-        Some((_, content_type, body)) => with_content_type(
-            StatusCode::OK,
-            content_type,
-            Bytes::from_static(body.as_bytes()),
-        ),
+        Some((_, content_type, body)) => with_content_type(StatusCode::OK, content_type, *body),
         None => not_found(),
     }
 }
@@ -736,24 +732,6 @@ fn is_balanced(filter: &str) -> bool {
         }
     }
     depth == 0
-}
-
-// --- Response helpers --------------------------------------------------------
-
-fn text_plain(status: StatusCode, body: String) -> Resp {
-    with_content_type(status, "text/plain; charset=utf-8", Bytes::from(body))
-}
-
-fn json(status: StatusCode, body: String) -> Resp {
-    with_content_type(status, "application/json", Bytes::from(body))
-}
-
-fn with_content_type(status: StatusCode, content_type: &str, body: Bytes) -> Resp {
-    Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(Full::new(body))
-        .expect("valid response")
 }
 
 #[cfg(test)]

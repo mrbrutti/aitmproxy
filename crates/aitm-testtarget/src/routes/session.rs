@@ -14,12 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::{Response, StatusCode};
+use hyper::StatusCode;
 use sha1::{Digest as _, Sha1};
 
-use crate::app::{html, redirect, reflect, AppState, RequestInfo, Resp};
+use crate::app::{html, json, redirect, reflect, AppState, RequestInfo, Resp};
 use crate::seed::{SESSION_PASS, SESSION_USER};
 
 /// Most live sessions the store keeps; the oldest is evicted past it.
@@ -243,11 +241,7 @@ fn logout_after(info: &RequestInfo, state: &AppState) -> Resp {
     if !state.sessions.arm(id, n) {
         return redirect("/login");
     }
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(format!("{{\"armed\":{n}}}"))))
-        .expect("valid response")
+    json(StatusCode::OK, format!("{{\"armed\":{n}}}"))
 }
 
 /// The port in a `Host` header (0 when absent or unparsable); only a salt
