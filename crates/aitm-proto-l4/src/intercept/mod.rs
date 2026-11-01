@@ -41,7 +41,7 @@ pub use unsupported::NfqueueBackend;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
@@ -95,9 +95,10 @@ pub struct ParkedPacket {
     pub state: L4InterceptState,
     /// When `on_timeout` applies if no verdict arrives first.
     pub deadline: SystemTime,
-    /// Arrival sequence within its session: assigned from a monotonic per-session
-    /// counter when the packet is parked, so `l4.intercept.list` can order parked
-    /// packets oldest first (the id is a random uuid and carries no order).
+    /// Arrival sequence, **process-wide**: assigned from one monotonic counter
+    /// shared by every session when the packet is parked, so `l4.intercept.list`
+    /// orders parked packets oldest first across sessions (the id is a random
+    /// uuid and carries no order).
     pub parked_seq: u64,
     /// When the packet was parked (`l4.intercept.list` reports it as epoch ms).
     pub parked_at: SystemTime,
@@ -222,16 +223,19 @@ struct ParkedEntry {
     parked: ParkedPacket,
 }
 
+/// The process-wide arrival sequence every parked packet is stamped from (spec §4
+/// / AC37). One counter for every session, so `l4.intercept.list` interleaves
+/// sessions in true arrival order; taken inside [`ParkedTable::park`], under the
+/// table's lock, so the stamp order is exactly the insertion order.
+static NEXT_PARKED_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// The parked-packet table shared between the reader thread and the handle: the
 /// thread inserts/expires, commands read ([`InterceptHandle::parked`]) and submit
-/// verdicts. It also owns the session's **arrival sequence**: [`ParkedTable::park`]
-/// takes the next number under the same lock as the insert, so `parked_seq` order
-/// is exactly insertion order (spec §4 / AC37).
+/// verdicts. [`ParkedTable::park`] is the only way in; it stamps the arrival
+/// sequence from [`NEXT_PARKED_SEQ`].
 #[derive(Debug, Default)]
 struct ParkedTable {
     entries: HashMap<ParkedId, ParkedEntry>,
-    /// The next arrival sequence number for this session (monotonic, from 0).
-    next_seq: u64,
 }
 
 impl ParkedTable {
@@ -246,8 +250,9 @@ impl ParkedTable {
         parked_at: SystemTime,
         deadline: SystemTime,
     ) {
-        let parked_seq = self.next_seq;
-        self.next_seq += 1;
+        // `&mut self` means the caller holds the table lock, so the sequence is
+        // taken and the entry inserted with nothing in between.
+        let parked_seq = NEXT_PARKED_SEQ.fetch_add(1, Ordering::SeqCst);
         let parked = ParkedPacket {
             id,
             flow,
@@ -260,6 +265,26 @@ impl ParkedTable {
             parked_at,
         };
         self.entries.insert(id, ParkedEntry { handle, parked });
+    }
+
+    /// Take `id` out of the table (for a verdict), if it is still parked.
+    fn remove(&mut self, id: ParkedId) -> Option<ParkedEntry> {
+        self.entries.remove(&id)
+    }
+
+    /// How many packets are parked.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The ids of every parked packet (unordered).
+    fn ids(&self) -> Vec<ParkedId> {
+        self.entries.keys().copied().collect()
+    }
+
+    /// A snapshot (clones) of every parked packet (unordered).
+    fn parked(&self) -> Vec<ParkedPacket> {
+        self.entries.values().map(|e| e.parked.clone()).collect()
     }
 }
 
@@ -301,10 +326,7 @@ impl InterceptHandle {
         self.parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entries
-            .values()
-            .map(|e| e.parked.clone())
-            .collect()
+            .parked()
     }
 
     /// Submit a verdict for the parked packet `id` (M5 Task 12's `forward`/`drop`).
@@ -497,8 +519,7 @@ fn apply_submitted(
     let entry = parked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .entries
-        .remove(&req.id);
+        .remove(req.id);
     if let Some(entry) = entry {
         let _ = queue.verdict(entry.handle, wire_of(req.verdict, req.mutated));
     }
@@ -508,21 +529,19 @@ fn apply_submitted(
 /// (default Forward — fail open). Removes them from the table.
 fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_timeout: Verdict) {
     let now = SystemTime::now();
-    let due: Vec<ParkedId> = {
-        let table = parked.lock().unwrap_or_else(PoisonError::into_inner);
-        table
-            .entries
-            .iter()
-            .filter(|(_, e)| e.parked.state.is_live() && e.parked.deadline <= now)
-            .map(|(id, _)| *id)
-            .collect()
-    };
+    let due: Vec<ParkedId> = parked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .parked()
+        .into_iter()
+        .filter(|p| p.state.is_live() && p.deadline <= now)
+        .map(|p| p.id)
+        .collect();
     for id in due {
         let entry = parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entries
-            .remove(&id);
+            .remove(id);
         if let Some(entry) = entry {
             let _ = queue.verdict(entry.handle, wire_of(on_timeout, None));
         }
@@ -532,19 +551,12 @@ fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_ti
 /// Fail-open forward every packet still parked (used on session shutdown so a
 /// held packet is never black-holed).
 fn drain_forward(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>) {
-    let ids: Vec<ParkedId> = parked
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entries
-        .keys()
-        .copied()
-        .collect();
+    let ids = parked.lock().unwrap_or_else(PoisonError::into_inner).ids();
     for id in ids {
         let entry = parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entries
-            .remove(&id);
+            .remove(id);
         if let Some(entry) = entry {
             let _ = queue.verdict(entry.handle, WireVerdict::Forward(None));
         }
@@ -552,8 +564,10 @@ fn drain_forward(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>) {
 }
 
 /// Decode a queued packet and, if the **same** guard authorizes it for `Intercept`,
-/// park it; otherwise auto-forward it untouched (AC14). Overflow past `max_parked`
-/// fails open per `on_overflow`.
+/// park it; otherwise auto-forward it untouched (AC14). The core's own traffic is
+/// forwarded untouched first of all — never parked, never recorded, never listed
+/// (spec §2.1, L4PAR-AC34). Overflow past `max_parked` fails open per
+/// `on_overflow`.
 #[allow(clippy::too_many_arguments)]
 fn process_packet(
     qp: QueuedPacket,
@@ -564,6 +578,13 @@ fn process_packet(
     params: &InterceptParams,
     flow_id: L4FlowId,
 ) {
+    // The self-exclusion choke point: a packet to or from one of the core's own
+    // listener ports on a loopback interface or address goes through untouched
+    // before anything else looks at it.
+    if !guard.admit_frame(&params.interface, &qp.bytes) {
+        let _ = queue.verdict(qp.handle, WireVerdict::Forward(None));
+        return;
+    }
     // A packet that carries no IP target cannot be in a CIDR-scoped interception —
     // forward it untouched rather than park it.
     let Some(target) = ip_target(&qp.bytes, &params.interface, params.direction) else {
@@ -580,7 +601,7 @@ fn process_packet(
     // Overflow: fail open (default Forward) rather than black-hole the packet.
     {
         let table = parked.lock().unwrap_or_else(PoisonError::into_inner);
-        if table.entries.len() as u32 >= params.config.max_parked {
+        if table.len() as u32 >= params.config.max_parked {
             drop(table);
             let _ = queue.verdict(qp.handle, wire_of(params.config.on_overflow, None));
             return;
@@ -730,14 +751,21 @@ mod tests {
     /// A crafted IPv4/UDP packet (starting at L3, exactly as NFQUEUE delivers) to
     /// `dst:9`.
     fn ip_udp(dst: &str) -> Vec<u8> {
+        ip_udp_to(dst, 9)
+    }
+
+    /// A crafted IPv4/UDP packet 127.0.0.1 → `dst:dst_port` (L3, as NFQUEUE
+    /// delivers).
+    fn ip_udp_to(dst: &str, dst_port: u16) -> Vec<u8> {
         PacketSpec {
             layers: vec![
                 Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::LOCALHOST),
                     dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
                     ..Ipv4Spec::default()
                 }),
                 Layer::Udp(UdpSpec {
-                    dst_port: Some(9),
+                    dst_port: Some(dst_port),
                     ..UdpSpec::default()
                 }),
                 Layer::Raw(b"probe".to_vec()),
@@ -912,6 +940,100 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    /// Security fix (spec §2.1, L4PAR-AC34): the in-path reader forwards the
+    /// core's own traffic untouched **before** parking — a queued packet to the
+    /// bus port on a loopback address is verdicted `Forward`, never parked, never
+    /// appended to the intercept flow (so never listed), while the in-scope packet
+    /// behind it parks and is recorded as usual. Hermetic (mock backend).
+    #[test]
+    fn self_port_packet_is_forwarded_never_parked() {
+        let guard = guard_with(vec![intercept_entry(("127.0.0.1", 32))]);
+        guard.set_self_ports([27431]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (backend, verdicts, drained) = MockBackend::with(vec![
+            ip_udp_to("127.0.0.1", 27431), // the bus: the core's own traffic
+            ip_udp_to("127.0.0.1", 9),     // in scope
+        ]);
+
+        let handle = start_intercept(
+            guard,
+            store.clone(),
+            backend,
+            params(intercept_config(Duration::from_secs(10), Verdict::Forward)),
+        )
+        .expect("authorized bind starts");
+
+        wait_for(&drained);
+        wait_until(
+            || !verdicts.lock().unwrap().is_empty(),
+            "the forward verdict for the self-port packet",
+        );
+        assert_eq!(
+            verdicts.lock().unwrap().as_slice(),
+            &[(0, VKind::Forward)],
+            "the self-port packet is forwarded untouched, nothing else is verdicted"
+        );
+        wait_until(|| handle.parked().len() == 1, "the in-scope packet to park");
+        let parked = handle.parked();
+        assert_eq!(
+            PacketSpec::endpoints(&parked[0].packet.bytes).dst_port,
+            Some(9),
+            "only the in-scope packet is parked"
+        );
+        let flow = store.get(handle.flow_id()).expect("the intercept flow");
+        assert_eq!(
+            flow.packets.len(),
+            1,
+            "the self-port packet is never appended to the intercept flow"
+        );
+        assert_eq!(
+            PacketSpec::endpoints(&flow.packets[0].bytes).dst_port,
+            Some(9)
+        );
+
+        handle.stop();
+    }
+
+    /// Spec §4 / L4PAR-AC37: the arrival sequence is **process-wide**, so two
+    /// sessions' parked packets interleave in true arrival order: A1, A2 parked
+    /// in one table and then B1 in another read strictly increasing `parked_seq`.
+    #[test]
+    fn parked_seq_is_process_wide_and_monotonic() {
+        let mut a = ParkedTable::default();
+        let mut b = ParkedTable::default();
+        let now = SystemTime::now();
+        let flow = L4FlowId::new();
+        let packet = || L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: now,
+            decoded: PacketSpec::summarize(b"x"),
+            bytes: b"x".to_vec(),
+            injected: false,
+        };
+        let (a1, a2, b1) = (ParkedId::new(), ParkedId::new(), ParkedId::new());
+        a.park(0, a1, flow, packet(), now, now);
+        a.park(1, a2, flow, packet(), now, now);
+        b.park(0, b1, flow, packet(), now, now);
+        let seq = |t: &ParkedTable, id: ParkedId| {
+            t.parked()
+                .into_iter()
+                .find(|p| p.id == id)
+                .expect("parked")
+                .parked_seq
+        };
+        assert!(seq(&a, a1) < seq(&a, a2), "A1 before A2");
+        assert!(
+            seq(&a, a2) < seq(&b, b1),
+            "B1 (parked last, in another table) sequences after A2"
+        );
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a.ids().len(), 2);
+        assert!(a.remove(a1).is_some());
+        assert!(a.remove(a1).is_none(), "remove is idempotent");
+        assert_eq!(a.ids(), vec![a2]);
     }
 
     /// Pinned (plan Task 11, AC15): a parked packet past its deadline gets

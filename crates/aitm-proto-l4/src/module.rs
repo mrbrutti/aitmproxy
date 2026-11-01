@@ -321,29 +321,21 @@ impl Command for L4Gated {
     }
 }
 
-/// The verbs [`gate`] never wraps: the two status verbs always answer, carrying the
-/// availability object (`available` / `code` / `reason`) built from the same cached
-/// probe the gate reads, so a UI learns *why* the wire verbs would refuse without
-/// having to call one (spec §1, L4PAR-AC9).
-const NEVER_PRIVILEGE_GATED: [&str; 2] = ["l4.capture.status", "l4.intercept.status"];
-
 /// Wrap each command in `cmds` as [`L4Gated`] when `reason` is `Some` (the capability
-/// is unavailable); otherwise leave them live. [`NEVER_PRIVILEGE_GATED`] verbs are
-/// left live either way.
+/// is unavailable); otherwise leave them live. The two status verbs never reach
+/// this function: `wire_commands` / `intercept_commands` return them separately
+/// and [`L4Module::load`] registers them beside the gated list, so they always
+/// answer with the availability object (spec §1, L4PAR-AC9).
 fn gate(cmds: Vec<Arc<dyn Command>>, reason: Option<&str>) -> Vec<Arc<dyn Command>> {
     match reason {
         None => cmds,
         Some(reason) => cmds
             .into_iter()
             .map(|inner| {
-                if NEVER_PRIVILEGE_GATED.contains(&inner.name()) {
-                    inner
-                } else {
-                    Arc::new(L4Gated {
-                        inner,
-                        reason: reason.to_string(),
-                    }) as Arc<dyn Command>
-                }
+                Arc::new(L4Gated {
+                    inner,
+                    reason: reason.to_string(),
+                }) as Arc<dyn Command>
             })
             .collect(),
     }
@@ -476,9 +468,11 @@ impl Plugin for L4Module {
         // still sees an honest, drivable surface (amended M5 Task 13).
         // Both availability sources close over a clone of the one cached probe the
         // gate below reads, and the status verbs query them at invoke time (spec §1,
-        // L4PAR-AC38): `l4.capture.status` / `l4.intercept.status` (never gated) and
-        // the gated verbs' `L4Unavailable` reason cannot disagree, and D0 swaps in a
-        // live `PrivilegeState` here without touching the commands.
+        // L4PAR-AC38): `l4.capture.status` / `l4.intercept.status` and the gated
+        // verbs' `L4Unavailable` reason cannot disagree, and D0 swaps in a live
+        // `PrivilegeState` here without touching the commands. Each status verb
+        // comes back separately from its gated list and registers ungated beside
+        // it, so it always answers (L4PAR-AC9).
         let capture_source: AvailabilitySource = {
             let privilege = self.privilege.clone();
             Arc::new(move || privilege.capture_availability())
@@ -488,34 +482,33 @@ impl Plugin for L4Module {
             let configured = self.intercept_cfg.is_some();
             Arc::new(move || privilege.intercept_availability(configured))
         };
+        let (wire, capture_status) =
+            crate::commands::wire_commands(self.guard(), self.store(), capture_source);
         for cmd in gate(
-            crate::commands::agent_gate(
-                crate::commands::wire_commands(self.guard(), self.store(), capture_source),
-                &gates,
-            ),
+            crate::commands::agent_gate(wire, &gates),
             self.privilege.capture_inject.as_deref(),
         ) {
             reg.add_command(cmd);
         }
+        reg.add_command(capture_status);
         // The in-path interception commands (M5 Task 12) register additively over
         // the shared session registry, so a `start` outlives the call and the later
         // verdict commands reach it. Agent-gated (`intercept` capability) then
         // privilege-gated on in-path (`CAP_NET_ADMIN`) the same way.
+        let (intercept, intercept_status) = crate::commands::intercept::intercept_commands(
+            self.guard(),
+            self.store(),
+            self.sessions.clone(),
+            self.intercept_cfg.clone(),
+            intercept_source,
+        );
         for cmd in gate(
-            crate::commands::agent_gate(
-                crate::commands::intercept::intercept_commands(
-                    self.guard(),
-                    self.store(),
-                    self.sessions.clone(),
-                    self.intercept_cfg.clone(),
-                    intercept_source,
-                ),
-                &gates,
-            ),
+            crate::commands::agent_gate(intercept, &gates),
             self.privilege.intercept.as_deref(),
         ) {
             reg.add_command(cmd);
         }
+        reg.add_command(intercept_status);
         // The operator-only live toggle: `l4.agent.status` (read the four gates) and
         // `l4.agent.set` (flip one). Never privilege- or agent-gated here — the set
         // command self-gates to operator/CLI, and status is read-only.
@@ -1097,28 +1090,17 @@ mod tests {
     }
 
     /// L4PAR-AC4 (plan A4): the real macOS probe classifies in-path as
-    /// `unsupported_platform` with the verbatim rig reason (`R_INT`), and privilege
-    /// outranks configuration (`configured = false` does not turn it into
-    /// `not_configured`).
+    /// `unsupported_platform` with a non-empty reason, and privilege outranks
+    /// configuration (`configured = false` does not turn it into
+    /// `not_configured`). The literal reason text is the e2e cell's to pin.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_probe_intercept_is_unsupported_platform() {
         let av = L4Privilege::probe().intercept_availability(false);
-        assert_eq!(
-            av,
-            L4Availability::Unavailable {
-                code: UnavailableCode::UnsupportedPlatform,
-                reason: "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / \
-                         NFQUEUE only)"
-                    .into(),
-            }
-        );
         assert_eq!(av.code_str(), "unsupported_platform");
-        assert_eq!(
-            av.reason(),
-            Some(
-                "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)"
-            )
+        assert!(
+            av.reason().is_some_and(|r| !r.is_empty()),
+            "a non-empty reason, got {av:?}"
         );
         assert!(!av.is_available());
     }

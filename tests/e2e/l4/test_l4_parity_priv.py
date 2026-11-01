@@ -92,8 +92,28 @@ def skipped_check(msg: str, why: str) -> None:
     _skipped.append(msg)
 
 
+def redact_bytes(value):
+    """`value` with every `bytes` key replaced by its decoded length: packet bytes are
+    never printed (a loopback capture may hold the core's own traffic; the log is not
+    where they belong)."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k == "bytes" and isinstance(v, str):
+                try:
+                    out[k] = f"<{len(base64.b64decode(v))} bytes>"
+                except (ValueError, TypeError):
+                    out[k] = "<bytes>"
+            else:
+                out[k] = redact_bytes(v)
+        return out
+    if isinstance(value, list):
+        return [redact_bytes(v) for v in value]
+    return value
+
+
 def show(label: str, value) -> None:
-    print(f"note: {label} = {json.dumps(value, default=str, sort_keys=True)[:500]}", flush=True)
+    print(f"note: {label} = {json.dumps(redact_bytes(value), default=str, sort_keys=True)[:500]}", flush=True)
 
 
 def blocked(reason) -> None:
@@ -437,7 +457,7 @@ def main() -> int:
         pkts = detail.get("packets", [])
         total = detail.get("packet_count", 0)
         now_ms = int(time.time() * 1000)
-        print(f"note: packet_count={total} window={len(pkts)} first={pkts[:1]}", flush=True)
+        print(f"note: packet_count={total} window={len(pkts)} first={redact_bytes(pkts[:1])}", flush=True)
         if total == 0:
             skip(f"capture opened on {iface!r}/{direction!r} but recorded nothing for our real loopback "
                  "traffic -- the live feed is not functional here (privilege / direction)")
@@ -455,7 +475,7 @@ def main() -> int:
             p0 = udp_to_echo[0]
             raw = base64.b64decode(p0.get("bytes", ""))
             expect(p0.get("src") == "127.0.0.1" and p0.get("dst") == "127.0.0.1", "the UDP packet is 127.0.0.1 -> 127.0.0.1", (p0.get("src"), p0.get("dst")))
-            expect(tag.encode() in raw, "the UDP packet's bytes carry this run's payload tag", raw[-40:])
+            expect(tag.encode() in raw, "the UDP packet's bytes carry this run's payload tag", f"{len(raw)} bytes")
         expect(len(pkts) <= DEFAULT_LIMIT, f"the default window holds at most {DEFAULT_LIMIT} packets", len(pkts))
 
         section("step 4: the bounded window (AC2 live)")
@@ -524,7 +544,7 @@ def main() -> int:
                    (g.get("kind"), g.get("injected_count")))
             expect(bool(ipk) and ipk[0].get("injected") is True and ipk[0].get("proto") == "UDP"
                    and ipk[0].get("dst_port") == echo_port and ipk[0].get("src_port") == INJECT_SRC_PORT,
-                   f"the recorded packet is injected: true, UDP {INJECT_SRC_PORT} -> {echo_port}", ipk[:1])
+                   f"the recorded packet is injected: true, UDP {INJECT_SRC_PORT} -> {echo_port}", redact_bytes(ipk[:1]))
             expect(not [e for p in ipk for e in [packet_shape_errors(p, True, now_ms)] if e], "the injected packet carries the §2 fields")
 
         section("step 8: l4.send_recv gets the echo's reply")
@@ -549,8 +569,10 @@ def main() -> int:
         expect(not ok_b, f"l4.inject to 127.0.0.1:{OUT_OF_SCOPE_PORT} is refused", refusal)
         expect(not ok_b and ("out of L4 scope" in str(refusal) or "denylist" in str(refusal) or "capability" in str(refusal)),
                "the refusal names the scope/denylist (guard), not a transport failure", str(refusal)[-240:])
-        expect(sr.get("flow_id") in op.call("l4.flow.list") if ok_r and isinstance(sr, dict) else True,
-               "l4.flow.list carries the walk's flows")
+        if ok_r and isinstance(sr, dict) and isinstance(sr.get("flow_id"), str):
+            expect(sr["flow_id"] in op.call("l4.flow.list"), "l4.flow.list carries the walk's flows")
+        else:
+            skipped_check("l4.flow.list carries the walk's flows", "send_recv did not run (no flow id to look for)")
     finally:
         if op is not None and flow_id is not None:
             try:

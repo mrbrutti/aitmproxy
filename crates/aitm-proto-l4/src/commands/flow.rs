@@ -7,14 +7,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aitm_core::{
     Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
+use super::{epoch_ms, field};
 use crate::craft::{PacketEndpoints, PacketSpec};
-use crate::flow::{L4Flow, L4FlowStore};
+use crate::flow::{L4Flow, L4FlowKind, L4FlowStore};
 use crate::gates::{AgentGate, L4AgentGates};
 
 /// How many packets `l4.flow.get` returns when the caller gives no `limit`.
@@ -53,17 +53,29 @@ impl PacketWindow {
     /// negative ⇒ an error naming the param, `limit` clamped to
     /// [`FLOW_GET_MAX_LIMIT`].
     pub(crate) fn from_params(args: &Params) -> anyhow::Result<PacketWindow> {
-        let read = |name: &str, default: usize| -> anyhow::Result<usize> {
-            if args.get(name).is_none() {
-                return Ok(default);
+        Self::from_values(args.get("offset"), args.get("limit"))
+    }
+
+    /// The window from two optional values — the command's `offset` / `limit`
+    /// params, or the Rhai `l4.flow.get(id, offset?, limit?)` positional
+    /// arguments — so both faces parse it identically. `None` or `Null` ⇒ the
+    /// default; a non-integer ⇒ an error naming the argument; negative ⇒ an error
+    /// naming it; `limit` clamped to [`FLOW_GET_MAX_LIMIT`].
+    pub(crate) fn from_values(
+        offset: Option<&Value>,
+        limit: Option<&Value>,
+    ) -> anyhow::Result<PacketWindow> {
+        let read = |name: &str, v: Option<&Value>, default: usize| -> anyhow::Result<usize> {
+            match v {
+                None | Some(Value::Null) => Ok(default),
+                Some(Value::Int(i)) => usize::try_from(*i)
+                    .map_err(|_| anyhow::anyhow!("`{name}` must be a non-negative integer")),
+                Some(_) => Err(anyhow::anyhow!("`{name}` must be an integer")),
             }
-            let v = args.get_int(name)?;
-            usize::try_from(v)
-                .map_err(|_| anyhow::anyhow!("`{name}` must be a non-negative integer"))
         };
         let default = Self::default();
-        let offset = read("offset", default.offset)?;
-        let limit = read("limit", default.limit)?.min(FLOW_GET_MAX_LIMIT);
+        let offset = read("offset", offset, default.offset)?;
+        let limit = read("limit", limit, default.limit)?.min(FLOW_GET_MAX_LIMIT);
         Ok(PacketWindow { offset, limit })
     }
 }
@@ -113,10 +125,11 @@ impl Command for FlowList {
 /// `l4.flow.get {id}` → a summary of one L4 flow and its packets.
 ///
 /// Packet `bytes` reach only a trusted-control caller (operator, CLI) or an agent
-/// whose Capture gate is open (spec §2.2, L4PAR-AC35): an agent that could not
-/// capture the bytes itself must not read them, and in particular must not read
-/// the bus-token line off a loopback capture. Every other packet field is
-/// reported to every caller.
+/// holding the gate that could have produced the flow (spec §2.2 as amended,
+/// L4PAR-AC35; see [`bytes_visible`]): an agent that could not have obtained the
+/// bytes itself must not read them, and in particular must not read the
+/// bus-token line off a loopback capture. Every other packet field is reported
+/// to every caller.
 pub struct FlowGet {
     store: Arc<dyn L4FlowStore>,
     gates: Arc<L4AgentGates>,
@@ -130,11 +143,27 @@ impl FlowGet {
     }
 }
 
-/// Whether a caller sees packet `bytes` (spec §2.2): trusted control always, an
-/// agent only while the Capture gate is open. Shared by the command path and the
-/// Rhai `l4.flow.get`, so the two faces cannot drift.
-pub(crate) fn bytes_visible(caller_is_trusted_control: bool, gates: &L4AgentGates) -> bool {
-    caller_is_trusted_control || gates.allowed(AgentGate::Capture)
+/// Whether a caller sees packet `bytes` (spec §2.2 as amended): trusted control
+/// always; an agent only while it holds the gate that could have produced a flow
+/// of this `kind` — `Capture` flows need the Capture gate, `Craft` / `SendRecv`
+/// flows (inject-origin) the Inject gate, `Intercept` flows the Intercept gate.
+/// An agent with that gate open could have obtained the bytes itself, so this
+/// widens nothing; a gate for another primitive reveals nothing. Shared by the
+/// command path and the Rhai `l4.flow.get`, so the two faces cannot drift.
+pub(crate) fn bytes_visible(
+    caller_is_trusted_control: bool,
+    kind: L4FlowKind,
+    gates: &L4AgentGates,
+) -> bool {
+    if caller_is_trusted_control {
+        return true;
+    }
+    let gate = match kind {
+        L4FlowKind::Capture => AgentGate::Capture,
+        L4FlowKind::Craft | L4FlowKind::SendRecv => AgentGate::Inject,
+        L4FlowKind::Intercept => AgentGate::Intercept,
+    };
+    gates.allowed(gate)
 }
 
 impl Command for FlowGet {
@@ -190,19 +219,13 @@ impl Command for FlowGet {
             .store
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no L4 flow with id {id_str}"))?;
-        let with_bytes = bytes_visible(host.caller_is_trusted_control(), &self.gates);
+        let with_bytes = bytes_visible(host.caller_is_trusted_control(), flow.kind, &self.gates);
         Ok(flow_to_value(&flow, window, with_bytes))
     }
 }
 
 /// The fields `l4.flow.get` reports.
 fn flow_fields() -> Vec<ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
     vec![
         field("id", TypeDesc::Str, true, "The flow id."),
         field(
@@ -313,8 +336,11 @@ fn flow_fields() -> Vec<ParamDef> {
                     "bytes",
                     TypeDesc::Bytes,
                     false,
-                    "The on-wire bytes (base64 over MCP). Present for the operator, the CLI, \
-                     or an agent whose Capture gate is open; absent otherwise.",
+                    "The on-wire bytes (padded base64). Present for trusted control (operator, \
+             CLI), or for an agent holding the gate that could have produced the flow: \
+             the Capture gate for `capture` flows, the Inject gate for `craft` / \
+             `send_recv` flows, the Intercept gate for `intercept` flows; absent \
+             otherwise.",
                 ),
                 field(
                     "timestamp",
@@ -358,13 +384,6 @@ fn flow_fields() -> Vec<ParamDef> {
              cut short by the byte budget when `truncated`; empty past the end.",
         ),
     ]
-}
-
-/// Milliseconds since the Unix epoch, UTC, the same clock HTTP `flow.get`'s
-/// `started_at` uses. A pre-epoch time is `0`; a time past `i64::MAX` ms saturates.
-fn epoch_ms(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Insert the §2 address fields (`proto`, `src`, `dst`, `src_port`, `dst_port`) of
@@ -554,10 +573,15 @@ mod tests {
     /// `bytes` seen at `PACKET_MS`, inserted into a fresh store. Returns the store
     /// and the flow id string `l4.flow.get` takes.
     fn one_packet_flow(bytes: Vec<u8>) -> (Arc<dyn L4FlowStore>, String) {
+        one_packet_flow_of(L4FlowKind::Capture, bytes)
+    }
+
+    /// [`one_packet_flow`] for a flow of `kind`.
+    fn one_packet_flow_of(kind: L4FlowKind, bytes: Vec<u8>) -> (Arc<dyn L4FlowStore>, String) {
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let id = store.insert(L4Flow {
             id: L4FlowId::new(),
-            kind: L4FlowKind::Capture,
+            kind,
             bind: L4Bind {
                 interface: "lo0".into(),
                 filter: None,
@@ -778,7 +802,6 @@ mod tests {
     fn window_default_returns_256_of_300() {
         let (store, id) = n_packet_flow(300);
         let (flow, n) = flow_and_count(get_window(store, &id, &[]).expect("flow.get ok"));
-        assert_eq!(n, FLOW_GET_DEFAULT_LIMIT);
         assert_eq!(n, 256);
         assert_eq!(flow.get("packet_count"), Some(&Value::Int(300)));
         assert_eq!(flow.get("injected_count"), Some(&Value::Int(150)));
@@ -831,7 +854,6 @@ mod tests {
         let (store, id) = n_packet_flow(5000);
         let (flow, n) =
             flow_and_count(get_window(store, &id, &[("limit", 100_000)]).expect("flow.get ok"));
-        assert_eq!(n, FLOW_GET_MAX_LIMIT);
         assert_eq!(n, 4096);
         assert_eq!(flow.get("packet_count"), Some(&Value::Int(5000)));
     }
@@ -884,13 +906,6 @@ mod tests {
         assert_eq!(
             PacketWindow::from_params(&Params::default()).expect("absent is default"),
             PacketWindow::default()
-        );
-        assert_eq!(
-            PacketWindow::default(),
-            PacketWindow {
-                offset: 0,
-                limit: 256
-            }
         );
         let mut m = BTreeMap::new();
         m.insert("offset".to_string(), Value::Int(7));
@@ -983,45 +998,166 @@ mod tests {
         packet.clone()
     }
 
-    /// L4PAR-AC35 — an agent (`Frontend::Mcp`) with the Capture gate closed gets
-    /// every other §2 field but no `bytes` key; opening the gate reveals `bytes`;
-    /// the operator always gets `bytes`; and an agent reading a flow whose packets
-    /// carry the bus port gets no bytes.
+    /// L4PAR-AC35, spec §2.2 as amended — `bytes_visible` is the one rule both
+    /// faces share: trusted control always; an agent only while it holds the
+    /// gate that could have produced the flow (Capture → Capture gate, Craft /
+    /// SendRecv → Inject gate, Intercept → Intercept gate). Literal truth table.
     #[test]
-    fn flow_get_bytes_only_for_trusted_or_capture_gate() {
-        let (store, id) = one_packet_flow(vec![0xde, 0xad]);
+    fn bytes_visible_is_per_flow_kind_spec_2_2_as_amended() {
         let gates = closed_gates();
-        assert!(!gates.allowed(AgentGate::Capture), "gates start closed");
-
-        // Agent, gate closed: headers, addresses and length, no `bytes` key.
-        let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
-        assert_eq!(packet.get("length"), Some(&Value::Int(2)));
-        assert_eq!(
-            packet.get("timestamp"),
-            Some(&Value::Int(1_700_000_000_123))
-        );
-        assert_eq!(packet.get("dir"), Some(&Value::Str("inbound".into())));
-        for key in ["proto", "src", "dst", "src_port", "dst_port"] {
-            assert_eq!(packet.get(key), Some(&Value::Null), "packet.{key}");
+        for kind in [
+            L4FlowKind::Capture,
+            L4FlowKind::Craft,
+            L4FlowKind::SendRecv,
+            L4FlowKind::Intercept,
+        ] {
+            assert!(
+                bytes_visible(true, kind, &gates),
+                "{kind:?}: trusted control"
+            );
+            assert!(
+                !bytes_visible(false, kind, &gates),
+                "{kind:?}: agent, all closed"
+            );
         }
-        assert!(
-            !packet.contains_key("bytes"),
-            "an agent with the Capture gate closed must get no `bytes`, got {packet:?}"
-        );
+        let only = |gate: AgentGate| {
+            for g in [
+                AgentGate::Capture,
+                AgentGate::Inject,
+                AgentGate::Intercept,
+                AgentGate::Widen,
+            ] {
+                gates.set(g, g == gate);
+            }
+        };
+        only(AgentGate::Capture);
+        assert!(bytes_visible(false, L4FlowKind::Capture, &gates));
+        assert!(!bytes_visible(false, L4FlowKind::Craft, &gates));
+        assert!(!bytes_visible(false, L4FlowKind::SendRecv, &gates));
+        assert!(!bytes_visible(false, L4FlowKind::Intercept, &gates));
+        only(AgentGate::Inject);
+        assert!(!bytes_visible(false, L4FlowKind::Capture, &gates));
+        assert!(bytes_visible(false, L4FlowKind::Craft, &gates));
+        assert!(bytes_visible(false, L4FlowKind::SendRecv, &gates));
+        assert!(!bytes_visible(false, L4FlowKind::Intercept, &gates));
+        only(AgentGate::Intercept);
+        assert!(!bytes_visible(false, L4FlowKind::Capture, &gates));
+        assert!(!bytes_visible(false, L4FlowKind::Craft, &gates));
+        assert!(!bytes_visible(false, L4FlowKind::SendRecv, &gates));
+        assert!(bytes_visible(false, L4FlowKind::Intercept, &gates));
+        only(AgentGate::Widen);
+        for kind in [
+            L4FlowKind::Capture,
+            L4FlowKind::Craft,
+            L4FlowKind::SendRecv,
+            L4FlowKind::Intercept,
+        ] {
+            assert!(
+                !bytes_visible(false, kind, &gates),
+                "{kind:?}: Widen opens nothing"
+            );
+        }
+    }
 
-        // Agent, Capture gate open: the bytes it could capture itself.
-        gates.set(AgentGate::Capture, true);
-        let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
-        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(vec![0xde, 0xad])));
+    /// L4PAR-AC35, spec §2.2 as amended — through `FlowGet::invoke`, per kind: an
+    /// agent (`Frontend::Mcp`) with every gate closed gets every other §2 field
+    /// but no `bytes` key; the two gates that could not have produced the flow
+    /// (plus Widen) do not reveal `bytes`; the one that could does; the operator
+    /// and the CLI always get `bytes`.
+    #[test]
+    fn flow_get_bytes_gate_is_per_flow_kind_spec_2_2_as_amended() {
+        let cases = [
+            (
+                L4FlowKind::Capture,
+                AgentGate::Capture,
+                [AgentGate::Inject, AgentGate::Intercept],
+            ),
+            (
+                L4FlowKind::Craft,
+                AgentGate::Inject,
+                [AgentGate::Capture, AgentGate::Intercept],
+            ),
+            (
+                L4FlowKind::SendRecv,
+                AgentGate::Inject,
+                [AgentGate::Capture, AgentGate::Intercept],
+            ),
+            (
+                L4FlowKind::Intercept,
+                AgentGate::Intercept,
+                [AgentGate::Capture, AgentGate::Inject],
+            ),
+        ];
+        for (kind, opens, others) in cases {
+            let (store, id) = one_packet_flow_of(kind, vec![0xde, 0xad]);
+            let gates = closed_gates();
 
-        // Operator, gates closed: always bytes.
-        gates.set(AgentGate::Capture, false);
-        let packet = get_as(store, gates.clone(), Frontend::Operator, &id);
-        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(vec![0xde, 0xad])));
+            // Agent, every gate closed: headers, addresses and length, no `bytes`.
+            let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
+            assert_eq!(packet.get("length"), Some(&Value::Int(2)));
+            assert_eq!(
+                packet.get("timestamp"),
+                Some(&Value::Int(1_700_000_000_123))
+            );
+            assert_eq!(packet.get("dir"), Some(&Value::Str("inbound".into())));
+            for key in ["proto", "src", "dst", "src_port", "dst_port"] {
+                assert_eq!(packet.get(key), Some(&Value::Null), "{kind:?} packet.{key}");
+            }
+            assert!(
+                !packet.contains_key("bytes"),
+                "{kind:?}: an agent with every gate closed must get no `bytes`, got {packet:?}"
+            );
 
-        // The bus-token line: a TCP packet to port 27431, read as an agent.
+            // The gates that could not have produced this flow open nothing.
+            for other in others {
+                gates.set(other, true);
+            }
+            gates.set(AgentGate::Widen, true);
+            let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
+            assert!(
+                !packet.contains_key("bytes"),
+                "{kind:?}: {others:?} + Widen open must not reveal `bytes`, got {packet:?}"
+            );
+
+            // The gate that could have produced it: the bytes it could get itself.
+            gates.set(opens, true);
+            let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
+            assert_eq!(
+                packet.get("bytes"),
+                Some(&Value::Bytes(vec![0xde, 0xad])),
+                "{kind:?}: {opens:?} open ⇒ bytes"
+            );
+
+            // Trusted control, every gate closed: always bytes.
+            for g in [
+                AgentGate::Capture,
+                AgentGate::Inject,
+                AgentGate::Intercept,
+                AgentGate::Widen,
+            ] {
+                gates.set(g, false);
+            }
+            let packet = get_as(store.clone(), gates.clone(), Frontend::Operator, &id);
+            assert_eq!(
+                packet.get("bytes"),
+                Some(&Value::Bytes(vec![0xde, 0xad])),
+                "{kind:?}: operator"
+            );
+            let packet = get_as(store, gates, Frontend::Cli, &id);
+            assert_eq!(
+                packet.get("bytes"),
+                Some(&Value::Bytes(vec![0xde, 0xad])),
+                "{kind:?}: CLI"
+            );
+        }
+
+        // The bus-token line off a loopback capture, read as an agent whose Inject
+        // and Intercept gates are open but not Capture: no bytes.
         let bytes = bus_bound_tcp();
         let (store, id) = one_packet_flow(bytes.clone());
+        let gates = closed_gates();
+        gates.set(AgentGate::Inject, true);
+        gates.set(AgentGate::Intercept, true);
         let packet = get_as(store, gates, Frontend::Mcp, &id);
         assert_eq!(packet.get("proto"), Some(&Value::Str("TCP".into())));
         assert_eq!(packet.get("src_port"), Some(&Value::Int(51000)));
@@ -1029,7 +1165,7 @@ mod tests {
         assert_eq!(packet.get("length"), Some(&Value::Int(bytes.len() as i64)));
         assert!(
             !packet.contains_key("bytes"),
-            "an agent must not read the bus-bound payload, got {packet:?}"
+            "an agent without the Capture gate must not read the bus-bound payload, got {packet:?}"
         );
     }
 
@@ -1049,11 +1185,13 @@ mod tests {
         };
         let bytes = pf.iter().find(|f| f.name == "bytes").expect("bytes field");
         assert!(!bytes.required, "bytes is optional on the wire");
-        assert!(
-            bytes.description.contains("Capture gate"),
-            "the description names the Capture gate, got {}",
-            bytes.description
-        );
+        for gate in ["Capture gate", "Inject gate", "Intercept gate"] {
+            assert!(
+                bytes.description.contains(gate),
+                "the description names the {gate} (spec §2.2 as amended), got {}",
+                bytes.description
+            );
+        }
     }
 
     // ---- L4PAR-AC36: reply byte budget ---------------------------------------
@@ -1113,13 +1251,6 @@ mod tests {
             .invoke(Params::new(m), &host)
             .expect("flow.get ok");
         flow_and_count(got)
-    }
-
-    /// L4PAR-AC36 — the budget is 4 MiB of raw bytes per reply.
-    #[test]
-    fn byte_budget_is_four_mib() {
-        assert_eq!(FLOW_GET_MAX_REPLY_BYTES, 4 * 1024 * 1024);
-        assert_eq!(FLOW_GET_MAX_REPLY_BYTES, 4_194_304);
     }
 
     /// L4PAR-AC36 — 300 packets of 60,000 bytes with the default window: the

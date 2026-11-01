@@ -36,8 +36,9 @@ pub mod sendrecv;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
 use crate::module::{AvailabilitySource, L4Availability};
@@ -117,6 +118,26 @@ fn interface_fields() -> Vec<aitm_core::ParamDef> {
 }
 
 // ---- shared helpers for the command layer -------------------------------------
+
+/// One result/param field of a command schema. The shared constructor every
+/// `l4.*` schema builds its field lists with.
+pub(crate) fn field(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDef {
+    ParamDef {
+        name: name.into(),
+        ty,
+        required,
+        description: description.into(),
+    }
+}
+
+/// Milliseconds since the Unix epoch, UTC — the clock HTTP `flow.get`'s
+/// `started_at`, `l4.flow.get`'s `timestamp` / `started_at` and
+/// `l4.intercept.list`'s `parked_at` all report. A pre-epoch time is `0`; a time
+/// past `i64::MAX` ms saturates.
+pub(crate) fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
 
 /// A transport-neutral [`Value`] as a `serde_json::Value`, so a structured craft
 /// spec / scope entry can be deserialized into its serde-derived Rust type.
@@ -318,13 +339,7 @@ fn scope_source_to_string(source: L4ScopeSource) -> &'static str {
 
 /// The fields a scope entry reports — shared by the `scope.add` result and
 /// `scope.list` elements.
-fn scope_entry_fields() -> Vec<aitm_core::ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| aitm_core::ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
+fn scope_entry_fields() -> Vec<ParamDef> {
     vec![
         field("id", TypeDesc::Str, true, "The scope entry's stable id."),
         field(
@@ -424,23 +439,25 @@ fn gate_for(name: &str) -> Option<AgentGate> {
     }
 }
 
-/// Build the ordered list of Task 10 wire commands (`l4.capture.*`, `l4.inject`,
+/// Build the Task 10 wire commands (`l4.capture.start` / `.stop`, `l4.inject`,
 /// `l4.send_recv`) over the shared guard + store, a fresh libpcap wire backend, and
 /// one shared [`CaptureRegistry`](crate::capture::CaptureRegistry) the capture
-/// commands manage together. `capture` is the capture/inject class's
-/// [`AvailabilitySource`]; `l4.capture.status` reads it at invoke time. Kept additive to
-/// [`active_commands`] so the two registration lists merge cleanly;
-/// [`crate::module::L4Module::load`] registers both. The backend construction is
-/// pure (no privilege, fail-closed at call time).
+/// commands manage together — plus, **separately**, the `l4.capture.status` verb
+/// over the same registry. `capture` is the capture/inject class's
+/// [`AvailabilitySource`]; the status verb reads it at invoke time. The split is
+/// the registration contract: [`crate::module::L4Module::load`] gates the first
+/// list on privilege and registers the status verb beside it, ungated, so it
+/// always answers (spec §1, L4PAR-AC9). The backend construction is pure (no
+/// privilege, fail-closed at call time).
 pub(crate) fn wire_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
     capture: AvailabilitySource,
-) -> Vec<Arc<dyn Command>> {
+) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let backend: Arc<dyn crate::backend::CaptureInjectBackend> =
         Arc::new(crate::backend::pcap::PcapBackend::new());
     let registry = Arc::new(crate::capture::CaptureRegistry::new());
-    vec![
+    let gated: Vec<Arc<dyn Command>> = vec![
         Arc::new(CaptureStart::new(
             guard.clone(),
             backend.clone(),
@@ -448,10 +465,10 @@ pub(crate) fn wire_commands(
             registry.clone(),
         )),
         Arc::new(CaptureStop::new(registry.clone())),
-        Arc::new(CaptureStatus::new(registry, capture)),
         Arc::new(Inject::new(guard.clone(), store.clone(), backend.clone())),
         Arc::new(SendRecv::new(guard, store, backend)),
-    ]
+    ];
+    (gated, Arc::new(CaptureStatus::new(registry, capture)))
 }
 
 /// The availability object the two status verbs answer (spec §1, L4PAR-AC3/AC4):
@@ -482,13 +499,7 @@ pub(crate) fn availability_fields(
     payload_key: &str,
     payload_ty: TypeDesc,
     payload_description: &str,
-) -> Vec<aitm_core::ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| aitm_core::ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
+) -> Vec<ParamDef> {
     vec![
         field(
             "available",

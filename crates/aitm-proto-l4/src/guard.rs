@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::L4Config;
-use crate::craft::PacketEndpoints;
+use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::types::{
     IpCidr, L4Action, L4Capability, L4Proto, L4ScopeEntry, L4ScopeId, L4ScopeSource,
 };
@@ -318,13 +318,25 @@ impl L4Guard {
 
     /// Replace the set of the core's own listener ports (see `self_ports` on the
     /// struct). Port `0` is never a bound listener and is ignored, so a caller may
-    /// pass a not-yet-bound ephemeral port through unchanged.
+    /// pass a not-yet-bound ephemeral port through unchanged. Assembly uses this;
+    /// the binary's later bind steps use [`add_self_ports`](Self::add_self_ports).
     pub fn set_self_ports(&self, ports: impl IntoIterator<Item = u16>) {
         let set: BTreeSet<u16> = ports.into_iter().filter(|p| *p != 0).collect();
         *self
             .self_ports
             .write()
             .unwrap_or_else(PoisonError::into_inner) = set;
+    }
+
+    /// Union `ports` into the core's own listener ports (port `0` ignored). The
+    /// binary adds the listeners as they bind — the proxy / browser / web ports
+    /// after the pre-bind, then the agent transport's port from `on_bound` — so
+    /// no step can drop a port an earlier one recorded.
+    pub fn add_self_ports(&self, ports: impl IntoIterator<Item = u16>) {
+        self.self_ports
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(ports.into_iter().filter(|p| *p != 0));
     }
 
     /// The core's own listener ports, ascending.
@@ -342,17 +354,62 @@ impl L4Guard {
     /// destination is a loopback address **and** its source **or** destination port
     /// is one of [`self_ports`](L4Guard::self_ports). Such a frame must never be
     /// recorded (L4PAR-AC34). A frame with no loopback address, or no port in the
-    /// set, is not self traffic.
+    /// set, is not self traffic. [`admit_endpoints`](Self::admit_endpoints) adds
+    /// the interface-name test; this is the address-only half.
     #[must_use]
     pub fn is_self_traffic(&self, ep: &PacketEndpoints) -> bool {
-        let loopback = ep
-            .src
-            .iter()
-            .chain(ep.dst.iter())
-            .any(|ip| ip.to_canonical().is_loopback());
-        if !loopback {
-            return false;
+        has_loopback_addr(ep) && self.touches_self_port(ep)
+    }
+
+    /// **The one choke point for self-exclusion** (spec §2.1, L4PAR-AC34). Whether
+    /// a frame seen on `interface` may be recorded, parked or listed: it may
+    /// **not** when it touches one of the core's own listener ports (source or
+    /// destination) **and** either `interface` is a loopback interface by name
+    /// (`lo`, `lo0`, …) or its source or destination is a loopback address. Every
+    /// path that turns a wire frame into operator-visible state — the capture
+    /// loop, the in-path reader, the send_recv reply capture — asks here first.
+    /// Decodes with [`PacketSpec::endpoints`]; a frame without ports (ICMP, an
+    /// undecodable buffer) carries nothing to refuse on and is admitted.
+    #[must_use]
+    pub fn admit_frame(&self, interface: &str, frame: &[u8]) -> bool {
+        self.admit_endpoints(interface, &PacketSpec::endpoints(frame))
+    }
+
+    /// [`admit_frame`](Self::admit_frame) over an already-decoded frame, so a
+    /// caller that needs the endpoints anyway decodes once.
+    #[must_use]
+    pub fn admit_endpoints(&self, interface: &str, ep: &PacketEndpoints) -> bool {
+        if !self.touches_self_port(ep) {
+            return true;
         }
+        !(is_loopback_interface(interface) || has_loopback_addr(ep))
+    }
+
+    /// The BPF clause that keeps the core's own listener ports out of a loopback
+    /// capture — the kernel-side first boundary ([`admit_frame`](Self::admit_frame)
+    /// is the authoritative second): `not port P` for one self port, `not (port A
+    /// or port B …)` ascending for several, `None` when there are none. The
+    /// capture ANDs it onto its scope filter on a loopback interface; the
+    /// send_recv reply capture does the same.
+    #[must_use]
+    pub fn self_exclusion_bpf(&self) -> Option<String> {
+        let ports = self.self_ports();
+        match ports.as_slice() {
+            [] => None,
+            [port] => Some(format!("not port {port}")),
+            ports => Some(format!(
+                "not ({})",
+                ports
+                    .iter()
+                    .map(|p| format!("port {p}"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )),
+        }
+    }
+
+    /// Whether `ep`'s source or destination port is one of the self ports.
+    fn touches_self_port(&self, ep: &PacketEndpoints) -> bool {
         let set = self
             .self_ports
             .read()
@@ -631,6 +688,25 @@ fn cidr_within(cidr: &IpCidr, outer_addr: IpAddr, outer_prefix: u8) -> bool {
     }
 }
 
+/// Whether `interface` is a loopback interface by name: `lo` (Linux) or
+/// `lo<digits>` (`lo0` on macOS and the BSDs). One of the two tests
+/// [`L4Guard::admit_frame`] applies; the capture's BPF builder uses it too.
+#[must_use]
+pub fn is_loopback_interface(interface: &str) -> bool {
+    interface
+        .strip_prefix("lo")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether `ep`'s source or destination is a loopback address (an IPv4-mapped
+/// `::ffff:127.0.0.1` included).
+fn has_loopback_addr(ep: &PacketEndpoints) -> bool {
+    ep.src
+        .iter()
+        .chain(ep.dst.iter())
+        .any(|ip| ip.to_canonical().is_loopback())
+}
+
 /// The dangerous-destination block governing `ip`, if any: loopback, link-local
 /// (incl. cloud metadata `169.254.169.254`), unspecified/this-network, multicast,
 /// and reserved/broadcast. RFC1918 private ranges are deliberately **not** here —
@@ -860,6 +936,143 @@ mod tests {
         g.set_self_ports(std::iter::empty());
         assert!(g.self_ports().is_empty(), "set to empty clears the set");
         assert!(!g.is_self_traffic(&bus));
+    }
+
+    /// A crafted TCP frame `src:sp → dst:dp` (IPv4 or IPv6 by address family)
+    /// carrying a bus-shaped token line — the frame an agent must never read.
+    fn tcp_frame(src: &str, sp: u16, dst: &str, dp: u16) -> Vec<u8> {
+        use crate::craft::{Ipv4Spec, Ipv6Spec, Layer, PacketSpec, TcpSpec};
+        let src: IpAddr = src.parse().unwrap();
+        let dst: IpAddr = dst.parse().unwrap();
+        let net = match (src, dst) {
+            (IpAddr::V4(s), IpAddr::V4(d)) => Layer::Ipv4(Ipv4Spec {
+                src: Some(s),
+                dst: Some(d),
+                ..Ipv4Spec::default()
+            }),
+            (IpAddr::V6(s), IpAddr::V6(d)) => Layer::Ipv6(Ipv6Spec {
+                src: Some(s),
+                dst: Some(d),
+                ..Ipv6Spec::default()
+            }),
+            _ => panic!("one address family per frame"),
+        };
+        PacketSpec {
+            layers: vec![
+                net,
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(sp),
+                    dst_port: Some(dp),
+                    ..TcpSpec::default()
+                }),
+                Layer::Raw(b"{\"token\": \"not-for-agents\"}\n".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds")
+    }
+
+    /// Security fix (spec §2.1, L4PAR-AC34): `admit_frame` is the one choke point
+    /// for self-exclusion. A frame that touches a self port is refused when the
+    /// interface is a loopback interface **by name** (`lo`, `lo0`) **or** its
+    /// source/destination is a loopback address (`127.0.0.1`, `::1`); an
+    /// in-scope frame to 9099 is admitted; a LAN frame to the same port number on
+    /// a real NIC is not the core's traffic.
+    #[test]
+    fn admit_frame_refuses_self_port_frames_on_loopback() {
+        let g = L4Guard::new(&cfg());
+        g.set_self_ports([27431]);
+        let bus_v4 = tcp_frame("127.0.0.1", 51000, "127.0.0.1", 27431);
+        let bus_v4_rev = tcp_frame("127.0.0.1", 27431, "127.0.0.1", 51000);
+        let bus_v6 = tcp_frame("::1", 51000, "::1", 27431);
+
+        // Loopback by interface name (and by address, both hold here).
+        for iface in ["lo0", "lo", "lo1"] {
+            assert!(
+                !g.admit_frame(iface, &bus_v4),
+                "{iface}: a loopback frame to the bus port is refused"
+            );
+            assert!(
+                !g.admit_frame(iface, &bus_v4_rev),
+                "{iface}: a loopback frame from the bus port is refused"
+            );
+            assert!(
+                !g.admit_frame(iface, &bus_v6),
+                "{iface}: ::1 is loopback too"
+            );
+        }
+        // Loopback by address only: the interface name is not loopback.
+        assert!(
+            !g.admit_frame("en0", &bus_v4),
+            "127.0.0.1 ↔ the bus port on en0 is refused by address"
+        );
+        assert!(
+            !g.admit_frame("en0", &bus_v6),
+            "::1 ↔ the bus port on en0 is refused by address"
+        );
+        // Loopback by name only: non-loopback addresses on `lo0` are still refused.
+        let lan_to_bus_port = tcp_frame("10.0.0.5", 51000, "10.0.0.9", 27431);
+        assert!(
+            !g.admit_frame("lo0", &lan_to_bus_port),
+            "a frame on lo0 touching the bus port is refused whatever its addresses"
+        );
+        // Neither: a LAN frame to port 27431 on a real NIC is someone else's.
+        assert!(
+            g.admit_frame("en0", &lan_to_bus_port),
+            "a LAN frame to port 27431 on en0 is not the core's traffic"
+        );
+        // In scope: a loopback frame to 9099 is admitted.
+        assert!(g.admit_frame("lo0", &tcp_frame("127.0.0.1", 51000, "127.0.0.1", 9099)));
+        // No ports / undecodable / empty: nothing to refuse on, admitted.
+        assert!(g.admit_frame("lo0", &[0xde, 0xad]));
+        assert!(g.admit_frame("lo0", &[]));
+        // The empty set excludes nothing.
+        g.set_self_ports(std::iter::empty());
+        assert!(g.admit_frame("lo0", &bus_v4));
+    }
+
+    /// `add_self_ports` unions into the set (ignoring port 0); `set_self_ports`
+    /// still replaces. The binary adds the bound listener ports one step at a
+    /// time (post-bind, then `on_bound`) without losing assembly's set.
+    #[test]
+    fn add_self_ports_unions() {
+        let g = L4Guard::new(&cfg());
+        g.set_self_ports([28182]);
+        g.add_self_ports([27431, 0, 28182]);
+        assert_eq!(g.self_ports(), vec![27431, 28182]);
+        g.add_self_ports([9]);
+        assert_eq!(g.self_ports(), vec![9, 27431, 28182]);
+        g.set_self_ports([1]);
+        assert_eq!(g.self_ports(), vec![1], "set still replaces");
+    }
+
+    /// The BPF self-exclusion clause the capture (and the send_recv reply
+    /// capture) AND into their filters: `None` with no self ports, `not port P`
+    /// for one, `not (port A or port B)` ascending for several.
+    #[test]
+    fn self_exclusion_bpf_clause() {
+        let g = L4Guard::new(&cfg());
+        assert_eq!(g.self_exclusion_bpf(), None);
+        g.set_self_ports([27431]);
+        assert_eq!(g.self_exclusion_bpf(), Some("not port 27431".to_string()));
+        g.set_self_ports([28182, 27431]);
+        assert_eq!(
+            g.self_exclusion_bpf(),
+            Some("not (port 27431 or port 28182)".to_string())
+        );
+    }
+
+    /// L4PAR-AC34 (tester): which interface names count as loopback.
+    #[test]
+    fn loopback_interface_names() {
+        for yes in ["lo", "lo0", "lo1", "lo10"] {
+            assert!(is_loopback_interface(yes), "{yes} is loopback");
+        }
+        for no in [
+            "", "l", "lo0x", "low", "lo-1", "eth0", "en0", "utun3", "mock0",
+        ] {
+            assert!(!is_loopback_interface(no), "{no:?} is not loopback");
+        }
     }
 
     fn cfg() -> L4Config {

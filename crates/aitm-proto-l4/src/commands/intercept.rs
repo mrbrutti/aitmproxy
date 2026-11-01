@@ -28,12 +28,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use aitm_core::{
     Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
+use super::{epoch_ms, field};
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
 use crate::craft::PacketSpec;
@@ -400,11 +401,11 @@ impl Command for InterceptList {
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let filter = optional_flow(&args)?;
         let map = self.sessions.lock();
-        // Arrival order, oldest first (spec §4 / AC37): the per-session sequence
-        // stamped when the packet was parked, never the random uuid string.
-        // `parked_at` then the id string break ties deterministically across
-        // sessions, whose sequences are independent.
-        let mut out: Vec<((u64, SystemTime, String), Value)> = Vec::new();
+        // Arrival order, oldest first (spec §4 / AC37): the process-wide
+        // sequence stamped when the packet was parked (one counter for every
+        // session, so sessions interleave in true arrival order), never the
+        // random uuid string; the id string is the deterministic tie-break.
+        let mut out: Vec<((u64, String), Value)> = Vec::new();
         for (fid, session) in map.iter() {
             if let Some(want) = filter {
                 if *fid != want {
@@ -423,11 +424,7 @@ impl Command for InterceptList {
                     parked.packet.dir,
                     parked.parked_at,
                 );
-                let key = (
-                    parked.parked_seq,
-                    parked.parked_at,
-                    parked_id_to_string(parked.id),
-                );
+                let key = (parked.parked_seq, parked_id_to_string(parked.id));
                 out.push((key, value));
             }
         }
@@ -749,50 +746,51 @@ impl Command for InterceptDrop {
 // ---- registration -------------------------------------------------------------
 
 /// Build the `l4.intercept.*` commands over the shared guard, store, and session
-/// registry, using the production NFQUEUE backend. Kept additive and separate from
-/// [`super::active_commands`] so the two command groups register independently.
+/// registry, using the production NFQUEUE backend: the seven privilege-gated
+/// verbs, and **separately** the `l4.intercept.status` verb over the same
+/// registry, which [`crate::module::L4Module::load`] registers ungated beside
+/// them so it always answers (spec §1, L4PAR-AC9). Kept additive and separate
+/// from [`super::active_commands`] so the command groups register independently.
 pub(crate) fn intercept_commands(
     guard: Arc<L4Guard>,
     store: Arc<dyn L4FlowStore>,
     sessions: Arc<InterceptSessions>,
     config: Option<InterceptConfig>,
     availability: AvailabilitySource,
-) -> Vec<Arc<dyn Command>> {
+) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let start = InterceptStart::new(guard.clone(), store, sessions.clone(), config);
     commands_over(start, guard, sessions, availability)
 }
 
-/// The eight intercept commands over one start command + session registry. The
-/// guard is threaded to `forward` so a staged mutation is re-checked before reinject;
-/// `availability` (the in-path class's source, read at invoke time) to `status`.
+/// The seven gated intercept commands over one start command + session registry,
+/// plus the status verb. The guard is threaded to `forward` so a staged mutation
+/// is re-checked before reinject; `availability` (the in-path class's source,
+/// read at invoke time) to `status`.
 fn commands_over(
     start: InterceptStart,
     guard: Arc<L4Guard>,
     sessions: Arc<InterceptSessions>,
     availability: AvailabilitySource,
-) -> Vec<Arc<dyn Command>> {
-    vec![
+) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
+    let gated: Vec<Arc<dyn Command>> = vec![
         Arc::new(start),
         Arc::new(InterceptStop::new(sessions.clone())),
-        Arc::new(InterceptStatus::new(sessions.clone(), availability)),
         Arc::new(InterceptList::new(sessions.clone())),
         Arc::new(InterceptMutate::new(sessions.clone())),
         Arc::new(InterceptRevert::new(sessions.clone())),
         Arc::new(InterceptForward::new(guard, sessions.clone())),
-        Arc::new(InterceptDrop::new(sessions)),
-    ]
+        Arc::new(InterceptDrop::new(sessions.clone())),
+    ];
+    (
+        gated,
+        Arc::new(InterceptStatus::new(sessions, availability)),
+    )
 }
 
 // ---- shared helpers -----------------------------------------------------------
 
 /// The fields a session reports (`start` result, `status` elements).
 fn session_fields() -> Vec<ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
     vec![
         field(
             "flow",
@@ -808,12 +806,6 @@ fn session_fields() -> Vec<ParamDef> {
 
 /// The fields a parked packet reports (`list` elements, `mutate` result).
 fn parked_fields() -> Vec<ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
     vec![
         field("id", TypeDesc::Str, true, "The parked packet id."),
         field(
@@ -994,13 +986,6 @@ fn session_value(flow: &str, interface: &str, queue: u16, parked: usize) -> Valu
     o.insert("queue".to_string(), Value::Int(i64::from(queue)));
     o.insert("parked".to_string(), Value::Int(parked as i64));
     Value::Object(o)
-}
-
-/// A `SystemTime` as epoch milliseconds; pre-epoch clamps to `0` (the same shape as
-/// `l4.flow.get`'s `timestamp`).
-fn epoch_ms(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// A parked packet as a transport-neutral object (`list` elements, `mutate` result),
@@ -1285,27 +1270,28 @@ mod tests {
         let guard = guard_with(vec![]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let sessions = Arc::new(InterceptSessions::new());
-        let cmds = intercept_commands(
+        let (gated, status) = intercept_commands(
             guard,
             store,
             sessions,
             Some(cfg(0)),
             Arc::new(|| crate::module::L4Availability::Available),
         );
-        let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
+        let names: Vec<&str> = gated.iter().map(|c| c.name()).collect();
         assert_eq!(
             names,
             vec![
                 "l4.intercept.start",
                 "l4.intercept.stop",
-                "l4.intercept.status",
                 "l4.intercept.list",
                 "l4.intercept.mutate",
                 "l4.intercept.revert",
                 "l4.intercept.forward",
                 "l4.intercept.drop",
-            ]
+            ],
+            "the gated list never carries the status verb"
         );
+        assert_eq!(status.name(), "l4.intercept.status");
     }
 
     /// Plan Task 12 / AC3: a `Capture`-only scope refuses `l4.intercept.start` with
@@ -1901,14 +1887,13 @@ mod tests {
         );
     }
 
-    /// AC37 (tester) FINDING: across two live sessions the unfiltered
-    /// `l4.intercept.list` is not in arrival order. The sort key is
-    /// `(parked_seq, parked_at, id)` and `parked_seq` restarts at 0 in every
-    /// session, so session A's second packet (seq 1) is listed after session B's
-    /// first packet (seq 0) even though B's packet arrived later. Spec §4 says the
-    /// list is "in arrival order, oldest first". Un-ignore with the fix.
+    /// AC37 (tester, fixed): across two live sessions the unfiltered
+    /// `l4.intercept.list` is in true arrival order. The arrival sequence is
+    /// process-wide (one counter for every session), and the sort key is
+    /// `(parked_seq, id)`, so session A's second packet lists before session B's
+    /// first packet when it arrived first. Spec §4: "in arrival order, oldest
+    /// first".
     #[test]
-    #[ignore = "L4PAR-AC37 finding for the Coder: cross-session list order is by per-session seq, not arrival"]
     fn intercept_list_is_arrival_ordered_across_sessions() {
         let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());

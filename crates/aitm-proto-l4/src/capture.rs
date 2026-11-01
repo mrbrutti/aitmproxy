@@ -33,12 +33,10 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-use etherparse::{NetSlice, TransportSlice};
-
 use crate::backend::{CaptureInjectBackend, L4Error};
-use crate::craft::PacketSpec;
+use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
-use crate::guard::{L4Guard, L4Permit};
+use crate::guard::{is_loopback_interface, L4Guard, L4Permit};
 use crate::types::{
     IpCidr, L4Action, L4Capability, L4Direction, L4Proto, L4ScopeEntry, L4Target, PortRange,
 };
@@ -304,30 +302,20 @@ pub fn start_capture(
 /// that entry permits). The per-packet guard check remains authoritative in every
 /// case.
 ///
-/// On a loopback interface (`lo`, `lo0`, …) the core's own listener ports
-/// ([`L4Guard::self_ports`]) are ANDed out — `(<scope>) and not port 27431`, or
-/// `not (port 27431 or port 28182)` for several — whatever the scope says, so the
-/// kernel never delivers the bus's own frames (L4PAR-AC34, spec §2.1). The
-/// per-packet [`L4Guard::is_self_traffic`] drop in the capture loop is the
-/// authoritative second boundary.
+/// On a loopback interface (`lo`, `lo0`, …) the core's own listener ports are
+/// ANDed out with [`L4Guard::self_exclusion_bpf`] — `(<scope>) and not port
+/// 27431`, or `not (port 27431 or port 28182)` for several — whatever the scope
+/// says, so the kernel never delivers the bus's own frames (L4PAR-AC34, spec
+/// §2.1). The per-packet [`L4Guard::admit_frame`] refusal in the capture loop is
+/// the authoritative second boundary.
 #[must_use]
 pub fn scope_filter(guard: &L4Guard, interface: &str) -> Option<String> {
     let scope = scope_clause(guard, interface);
     if !is_loopback_interface(interface) {
         return scope;
     }
-    let self_ports = guard.self_ports();
-    let exclusion = match self_ports.as_slice() {
-        [] => return scope,
-        [port] => format!("not port {port}"),
-        ports => format!(
-            "not ({})",
-            ports
-                .iter()
-                .map(|p| format!("port {p}"))
-                .collect::<Vec<_>>()
-                .join(" or ")
-        ),
+    let Some(exclusion) = guard.self_exclusion_bpf() else {
+        return scope;
     };
     Some(match scope {
         Some(clause) => format!("({clause}) and {exclusion}"),
@@ -366,14 +354,6 @@ fn scope_clause(guard: &L4Guard, interface: &str) -> Option<String> {
     }
 }
 
-/// Whether `interface` is a loopback interface: `lo` (Linux) or `lo<digits>`
-/// (`lo0` on macOS and the BSDs).
-fn is_loopback_interface(interface: &str) -> bool {
-    interface
-        .strip_prefix("lo")
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
-}
-
 /// Decode one delivered frame and, if the **same** guard authorizes it for
 /// `Capture`, append it to the flow. Out-of-scope, undecodable, or non-IP frames
 /// are silently dropped — never recorded.
@@ -385,15 +365,18 @@ fn record_frame(
     store: &dyn L4FlowStore,
     flow_id: L4FlowId,
 ) {
-    // The core's own traffic (a loopback frame to or from one of its listener
-    // ports — the bus's plaintext token line among it) is dropped before the
-    // scope check and before anything is recorded, whatever the scope says
-    // (L4PAR-AC34, spec §2.1).
-    if guard.is_self_traffic(&PacketSpec::endpoints(frame)) {
+    // One decode: the endpoints feed the self-exclusion choke point and the
+    // guard's target alike.
+    let ep = PacketSpec::endpoints(frame);
+    // The core's own traffic (a frame to or from one of its listener ports on a
+    // loopback interface or address — the bus's plaintext token line among it)
+    // is refused before the scope check and before anything is recorded,
+    // whatever the scope says (L4PAR-AC34, spec §2.1).
+    if !guard.admit_endpoints(interface, &ep) {
         return;
     }
     // A frame that carries no IP target cannot be in a CIDR-scoped capture.
-    let Some(target) = packet_target(frame, interface, direction) else {
+    let Some(target) = target_of(&ep, interface, direction) else {
         return;
     };
     // The same guard that authorized the bind decides every packet: an out-of-scope
@@ -414,38 +397,30 @@ fn record_frame(
     );
 }
 
-/// Resolve a captured frame to the `L4Target` the guard checks: destination
-/// address, destination port (for TCP/UDP), and protocol. `None` for a frame that
-/// carries no IP layer (ARP, or an undecodable buffer) — such a frame is out of a
-/// CIDR-scoped capture by definition.
-///
-/// `pub(crate)` so `send_recv` re-checks a correlated reply with the *same* target
-/// resolution the background capture uses before recording it ([`record_frame`]).
+/// The `L4Target` the guard checks for a frame decoded to `ep`: destination
+/// address, destination port (TCP/UDP), and protocol (`Raw` for a transport the
+/// decoder does not name). `None` for a frame with no IP layer (ARP, or an
+/// undecodable buffer) — out of a CIDR-scoped capture by definition.
+fn target_of(ep: &PacketEndpoints, interface: &str, direction: L4Direction) -> Option<L4Target> {
+    Some(L4Target {
+        interface: interface.to_string(),
+        direction,
+        dst: Some(ep.dst?),
+        dst_port: ep.dst_port,
+        proto: ep.proto.unwrap_or(L4Proto::Raw),
+    })
+}
+
+/// Resolve a frame to the `L4Target` the guard checks ([`target_of`] over
+/// [`PacketSpec::endpoints`]). `pub(crate)` so `inject`, `send_recv` and the Rhai
+/// face gate the destination actually on the wire with the *same* resolution the
+/// background capture uses ([`record_frame`]).
 pub(crate) fn packet_target(
     frame: &[u8],
     interface: &str,
     direction: L4Direction,
 ) -> Option<L4Target> {
-    let parsed = crate::craft::parse_frame(frame)?;
-    let dst = match parsed.net? {
-        NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().destination_addr()),
-        NetSlice::Ipv6(ip) => IpAddr::V6(ip.header().destination_addr()),
-        NetSlice::Arp(_) => return None,
-    };
-    let (dst_port, proto) = match parsed.transport {
-        Some(TransportSlice::Tcp(t)) => (Some(t.destination_port()), L4Proto::Tcp),
-        Some(TransportSlice::Udp(u)) => (Some(u.destination_port()), L4Proto::Udp),
-        Some(TransportSlice::Icmpv4(_)) => (None, L4Proto::Icmp),
-        Some(TransportSlice::Icmpv6(_)) => (None, L4Proto::IcmpV6),
-        _ => (None, L4Proto::Raw),
-    };
-    Some(L4Target {
-        interface: interface.to_string(),
-        direction,
-        dst: Some(dst),
-        dst_port,
-        proto,
-    })
+    target_of(&PacketSpec::endpoints(frame), interface, direction)
 }
 
 /// The BPF clause for one scope entry: its address predicate AND its port
@@ -1028,21 +1003,6 @@ mod tests {
                     .to_string()
             )
         );
-    }
-
-    /// L4PAR-AC34 (tester): which interface names get the BPF exclusion. The
-    /// per-packet drop does not depend on the name (it keys on loopback
-    /// addresses), so a miss here only loses the first boundary.
-    #[test]
-    fn loopback_interface_names() {
-        for yes in ["lo", "lo0", "lo1", "lo10"] {
-            assert!(is_loopback_interface(yes), "{yes} is loopback");
-        }
-        for no in [
-            "", "l", "lo0x", "low", "lo-1", "eth0", "en0", "utun3", "mock0",
-        ] {
-            assert!(!is_loopback_interface(no), "{no:?} is not loopback");
-        }
     }
 
     /// L4PAR-AC34 (tester): self-port frames are dropped even when they are

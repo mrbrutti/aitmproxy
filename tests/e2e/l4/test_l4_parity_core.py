@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# e2e: tier=T1 surface=l4 needs=l4
+# e2e: tier=T1 surface=l4 serial needs=l4
 """l4/l4_parity_core -- the L4 parity contract on an UNPRIVILEGED core (plan task A9).
 
 Everything here is provable on a core that cannot capture (this Mac: /dev/bpf* is
 root-only), so it is the "[now]" half of the L4 parity spec, driven over the real MCP bus
 as operator AND as agent and asserted on the core's verbatim replies -- never a fixture:
 
-  * AC2 (live): `tools/list` has every `l4.*` tool the rig exposes, and `l4.flow.get`'s
+  * AC2 (live): `tools/list` has every verb the L4 module registers, and `l4.flow.get`'s
     inputSchema lists `offset` and `limit`, neither required.
   * AC3: `l4.capture.status` answers operator and agent alike, with no error, the object
     `{available, code, reason, captures}`; when unavailable `code == "needs_privilege"`,
@@ -27,7 +27,8 @@ as operator AND as agent and asserted on the core's verbatim replies -- never a 
 
 Env model (like the sibling l4 cells): attaches to the runner's l4 core via AITM_BUS_ADDR +
 AITM_BUS_OPERATOR_TOKEN + AITM_BUS_TOKEN (the agent half); never boots its own core. Tokens
-are never printed. Soft-assertion battery; exit 0 pass / 1 fail / 77 skip.
+are never printed. Soft-assertion battery; exit 0 pass / 1 fail / 77 skip. serial: it flips
+the agent policy on the shared core for the AC6 checks.
 """
 from __future__ import annotations
 
@@ -42,9 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aitm_e2e import fail, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient, BusError, ToolError  # noqa: E402
 
-# The 22 verbs the L4 module registers plus the 3 bundled-catalogue L4 scripts
-# (`scripts/bundled`, see crates/aitm/tests/bundled_startup.rs): the 25 `l4.*` names
-# the rig's tools/list carries (plan A9 (1), spec AC32).
+# The 22 verbs the L4 module registers (plan A9 (1), spec AC32). Bundled-catalogue
+# scripts may add more `l4.*` names; this cell asserts the module's, not a total.
 L4_MODULE_TOOLS = (
     "l4.agent.set", "l4.agent.status",
     "l4.capture.start", "l4.capture.status", "l4.capture.stop",
@@ -53,8 +53,6 @@ L4_MODULE_TOOLS = (
     "l4.intercept.revert", "l4.intercept.start", "l4.intercept.status", "l4.intercept.stop",
     "l4.interfaces", "l4.scope.add", "l4.scope.list", "l4.scope.remove", "l4.send_recv",
 )
-L4_BUNDLED_TOOLS = ("l4.recon", "l4.tcp_probe", "l4.udp_probe")
-L4_TOOL_COUNT = 25
 
 # The unprivileged-rig reasons, verbatim (plan "The rig"; they change when D0 lands and
 # only this cell asserts them literally, spec §1 / plan decision 1).
@@ -350,10 +348,7 @@ def main() -> int:
         print(f"note: {len(names)} l4.* tools: {names}", flush=True)
         missing_mod = [n for n in L4_MODULE_TOOLS if n not in names]
         expect(not missing_mod, "every L4 module verb is in tools/list", missing_mod)
-        missing_bundled = [n for n in L4_BUNDLED_TOOLS if n not in names]
-        expect(not missing_bundled, "the three bundled L4 scripts are in tools/list", missing_bundled)
-        expect(len(names) == L4_TOOL_COUNT, f"tools/list carries exactly {L4_TOOL_COUNT} l4.* names",
-               {"count": len(names), "extra": sorted(set(names) - set(L4_MODULE_TOOLS) - set(L4_BUNDLED_TOOLS))})
+        print(f"note: l4.* names beyond the module's 22: {sorted(set(names) - set(L4_MODULE_TOOLS))}", flush=True)
         fg = tool_by_name(tools, "l4.flow.get") or {}
         schema = fg.get("inputSchema") or {}
         show("l4.flow.get inputSchema", schema)

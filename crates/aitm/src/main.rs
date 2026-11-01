@@ -274,8 +274,8 @@ async fn run() -> anyhow::Result<()> {
         // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports the
         // config already names — the web UI port (`aitm web` only) and the agent
         // transport's port (loopback bus / MCP streamable HTTP). The proxy and
-        // browser-proxy ports are added by assembly; the bound set replaces this
-        // one right after the listeners bind, below.
+        // browser-proxy ports are added by assembly; the bound ports are unioned
+        // in right after the listeners bind, below.
         l4_self_ports: web_settings
             .iter()
             .map(|settings| settings.listen.port())
@@ -405,10 +405,11 @@ async fn run() -> anyhow::Result<()> {
     // Self-exclusion of the core's own listeners (L4PAR-AC34, spec §2.1). Now that
     // the proxy, browser-proxy and (for `aitm web`) web UI listeners are bound,
     // the live L4 guard — the one every `l4.capture.*`, CLI and Rhai capture
-    // records through — learns the union of the core's own ports, so a loopback
-    // capture never records the bus's plaintext token line or any other frame to
-    // or from the core itself. The agent transport's port is the configured one
-    // here; the bound one (an ephemeral `0` included) is added by `on_bound` below.
+    // records through — unions the bound ports into the set assembly seeded, so
+    // a loopback capture never records the bus's plaintext token line or any
+    // other frame to or from the core itself. The agent transport's port is the
+    // configured one here; the bound one (an ephemeral `0` included) is added by
+    // `on_bound` below. Each step only adds; none can drop an earlier port.
     let l4_live_guard = features
         .l4_shared
         .as_ref()
@@ -422,7 +423,7 @@ async fn run() -> anyhow::Result<()> {
     }
     l4_self_ports.extend(configured_agent_port(&cfg.mcp.transport));
     if let Some(guard) = &l4_live_guard {
-        guard.set_self_ports(l4_self_ports.iter().copied());
+        guard.add_self_ports(l4_self_ports.iter().copied());
     }
 
     // Server path: launch the configured engine so the browser.* commands reach
@@ -538,14 +539,11 @@ async fn run() -> anyhow::Result<()> {
         .with_push(push_tx.clone());
         // The agent transport binds inside `serve`; once it has, the bound port
         // (the configured one, or the ephemeral port a `0` resolved to) joins the
-        // L4 self-port set with the listeners bound above (L4PAR-AC34).
+        // L4 self-port set beside the listeners bound above (L4PAR-AC34).
         let mcp = match l4_live_guard.clone() {
-            Some(guard) => {
-                let known = l4_self_ports.clone();
-                mcp.on_bound(move |addr| {
-                    guard.set_self_ports(known.into_iter().chain(std::iter::once(addr.port())));
-                })
-            }
+            Some(guard) => mcp.on_bound(move |addr| {
+                guard.add_self_ports([addr.port()]);
+            }),
             None => mcp,
         };
 

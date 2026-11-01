@@ -274,12 +274,15 @@ impl PacketSpec {
                 Some(NetSlice::Ipv6(_)) => layers.push("IPv6".to_string()),
                 _ => {}
             }
-            match &p.transport {
-                Some(TransportSlice::Tcp(_)) => layers.push("TCP".to_string()),
-                Some(TransportSlice::Udp(_)) => layers.push("UDP".to_string()),
-                Some(TransportSlice::Icmpv4(_)) => layers.push("ICMP".to_string()),
-                Some(TransportSlice::Icmpv6(_)) => layers.push("ICMPv6".to_string()),
-                _ => {}
+            let transport = match &p.transport {
+                Some(TransportSlice::Tcp(_)) => Some(L4Proto::Tcp),
+                Some(TransportSlice::Udp(_)) => Some(L4Proto::Udp),
+                Some(TransportSlice::Icmpv4(_)) => Some(L4Proto::Icmp),
+                Some(TransportSlice::Icmpv6(_)) => Some(L4Proto::IcmpV6),
+                _ => None,
+            };
+            if let Some(proto) = transport {
+                layers.push(proto.wire_name().to_string());
             }
         }
 

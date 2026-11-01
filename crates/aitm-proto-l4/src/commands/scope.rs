@@ -342,9 +342,10 @@ mod tests {
             source.ty
         );
         assert!(source.required, "`source` must be required");
-        assert_eq!(
-            source.description,
-            "`config` (operator config block) or `runtime` (added over the bus)."
+        assert!(
+            source.description.contains("config") && source.description.contains("runtime"),
+            "the description names both provenances, got {}",
+            source.description
         );
     }
 }

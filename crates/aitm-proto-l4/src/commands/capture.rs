@@ -189,7 +189,9 @@ impl Command for CaptureStatus {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Report whether capture is available on this core (`available`,                           `code`, `reason`) and the flow ids of running captures. Always                           answers, never `L4 unavailable`."
+            description: "Report whether capture is available on this core (`available`, \
+                          `code`, `reason`) and the flow ids of running captures. Always \
+                          answers, never `L4 unavailable`."
                 .into(),
             params: vec![],
             result: TypeDesc::Object(super::availability_fields(
@@ -484,21 +486,23 @@ mod tests {
         assert_eq!(second, status_value(true, "available", None));
     }
 
-    /// The Task-10 wire commands are all registered by `wire_commands`.
+    /// `wire_commands` returns the four gated wire verbs and, separately, the
+    /// status verb — never the status verb inside the gated list.
     #[test]
     fn wire_commands_registered() {
         let guard = Arc::new(L4Guard::new(&L4Config::default()));
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let cmds = super::super::wire_commands(guard, store, always_available());
-        let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
-        for want in [
-            "l4.capture.start",
-            "l4.capture.stop",
-            "l4.capture.status",
-            "l4.inject",
-            "l4.send_recv",
-        ] {
-            assert!(names.contains(&want), "{want} must be in wire_commands");
-        }
+        let (gated, status) = super::super::wire_commands(guard, store, always_available());
+        let names: Vec<&str> = gated.iter().map(|c| c.name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "l4.capture.start",
+                "l4.capture.stop",
+                "l4.inject",
+                "l4.send_recv"
+            ]
+        );
+        assert_eq!(status.name(), "l4.capture.status");
     }
 }
