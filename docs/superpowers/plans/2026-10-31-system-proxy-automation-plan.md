@@ -184,7 +184,7 @@ Task 8 (plugin) → Task 9 (wiring) → {Task 10 main.rs ∥ Task 11 pins} → T
     }
     pub(crate) fn ops_for(mechanism: Mechanism) -> Box<dyn PlatformOps>;
     // Shipped shape (recorded by the panel, 2026-10-31): `detail_when_unsupported` and `equals_wrote`
-    // were dropped; `fn snapshot(&self, exec) -> Result<Snapshot { previous, skipped }, ReadError>` was
+    // were dropped; `fn snapshot(&self, exec) -> Result<Snapshot { previous, skipped, rows }, ReadError>` was
     // added (Task 6 + gap resolutions); `ops_for(Kde)` resolves the tool major at runtime (F1).   // Networksetup → macos::MacosOps, Gsettings → linux::GsettingsOps, Kde → linux::KdeOps, None → windows::NoneOps
     pub(crate) fn cmd(program: &str, args: &[&str], mutating: bool) -> aitm_ca::exec::CmdLine;
     ```
@@ -1628,38 +1628,38 @@ Kept by the main session during stage 6. One row per finding.
 | 7 | quality (F4) | Minor | `decide` rustdoc misstates the call graph; the `else { return 0 }` after `decide(Some(..))` is unreachable | accepted (recorded), orchestrator 2026-10-31; fold into the scaffolding follow-up (reword doc or `unreachable!`) |
 | crate | quality (F4) | Minor | rustdoc intra-doc links to `pub(crate)` items (not gated) | accepted (recorded); `#![allow(rustdoc::private_intra_doc_links)]` or plain backticks in the follow-up |
 | 10 | quality (F4) | Minor | config-path resolution spelled in both `main` and `run` | accepted (recorded); `Invocation::config_path()` in the follow-up |
-| 4 | quality (re-run) | Important | two state-file tests compare against a `StateFile::new` stamped after the save (`saved_at` second boundary) — gate flaky (2/4 runs) | fixed in F4 (expected built once before the save) |
-| 6 | quality (re-run) | Minor | idempotent `set` reports `services` minus authenticated rows (Q4 side effect) | fixed in F4 (`Snapshot.rows`) |
-| 6 | quality (re-run) | Minor | `target_os: String` not fixed in F3 as recorded; residual `merge_bypass(&defaults(), …)` spelling | fixed in F4 (`is_windows: bool`, `bypass_for(&[], …)`) |
-| 10 | quality (re-run) | Minor | `OperatorToken` and the watchdog dispatched in two places; leftover `Mode::SysproxyWatchdog` arm | fixed in F4 (both dispatched before the runtime) |
-| 7 | quality (re-run) | Minor | `decide`/`Decision` has no production caller after Q5 | fixed in F4 (`run_after_wake` routes through `decide`) or documented — see F4 report |
-| tests | quality (re-run) | Minor | test helper named `status_with` shadows the engine method; `err_text` wrapper; three fake-PATH helpers | first two fixed in F4; helpers under the accepted scaffolding follow-up |
+| 4 | quality (re-run) | Important | two state-file tests compare against a `StateFile::new` stamped after the save (`saved_at` second boundary) — gate flaky (2/4 runs) | fixed in F4 56adfbe0 (expected built once before the save) |
+| 6 | quality (re-run) | Minor | idempotent `set` reports `services` minus authenticated rows (Q4 side effect) | fixed in F4 56adfbe0 (`Snapshot.rows`) |
+| 6 | quality (re-run) | Minor | `target_os: String` not fixed in F3 as recorded; residual `merge_bypass(&defaults(), …)` spelling | fixed in F4 56adfbe0 (`is_windows: bool`, `bypass_for(&[], …)`) |
+| 10 | quality (re-run) | Minor | `OperatorToken` and the watchdog dispatched in two places; leftover `Mode::SysproxyWatchdog` arm | fixed in F4 56adfbe0 (both dispatched before the runtime) |
+| 7 | quality (re-run) | Minor | `decide`/`Decision` has no production caller after Q5 | fixed in F4 56adfbe0 (`run_after_wake` routes through `decide`) |
+| tests | quality (re-run) | Minor | test helper named `status_with` shadows the engine method; `err_text` wrapper; three fake-PATH helpers | first two fixed in F4 56adfbe0; helpers under the accepted scaffolding follow-up |
 | tester (re-run) | tester | Minor | F3 claimed FIFO quarantine, single recovery log line and `service_names`≡`rows_of` without tests; S3 hit path only | closed by the tester's tests in b786b352 |
 | 8 | spec (re-run) | Important | `proxy.system.status` 2 s cache for non-trusted callers (S3) had no spec sentence | spec §D6 + §D2 amended 2026-10-31; no code change |
 | 3 | security (re-run) | Minor | a KDE tool absent at detection keeps its bare name and is spawned by PATH if it appears later | accepted (recorded), orchestrator 2026-10-31: same-privilege residual; the error message naming the tool is worth more |
-| 6 | spec (re-run) | Minor | `Status::to_map` and `endpoints_equal_wrote` are `pub` | fixed in F4 (`pub(crate)`) |
+| 6 | spec (re-run) | Minor | `Status::to_map` and `endpoints_equal_wrote` are `pub` | fixed in F4 56adfbe0 (`pub(crate)`) |
 | 1 | spec (re-run) | Minor | plan Task 1 still spelled `NeedsPrivilege(String)`; §D2 PATH clause half-stale after S2 | plan annotated, spec §D2 amended 2026-10-31 |
 | 14 (live) | owner | Important | First macOS live run: `auto` startup set ran before the port bind; port 18080 was held by another session's aitm, the core set the proxy then died; watchdog restored in ~1 s | fixed in 13f5809e (F2: `bind_then_recover_system_proxy`, test `port_conflict_never_sets_the_system_proxy`) |
-| 6 | spec | Important | `status()` returned `off`/`other` from scutil when no network service is enabled; §D3 says `Unknown` + "no enabled network service" | fixed in F3 (pending SHA) |
-| 6 | quality | Important | `read_status` swallowed the per-service read error; `managed_by_us: false` with no log and no reason | fixed in F3 |
+| 6 | spec | Important | `status()` returned `off`/`other` from scutil when no network service is enabled; §D3 says `Unknown` + "no enabled network service" | fixed in F3 (5ac8fcce) |
+| 6 | quality | Important | `read_status` swallowed the per-service read error; `managed_by_us: false` with no log and no reason | fixed in F3 (5ac8fcce) |
 | F1 | spec | Important | `merge_previous` (re-set keeps the file's previous rows for services still ours) implemented without a spec sentence | spec §D6 amended 2026-10-31 (one sentence, recorded here); code kept |
 | 6 | spec | Important | Task 6 touched `platform/{mod,macos,linux,windows}.rs` and `watchdog.rs` outside its declared `lib.rs`, reshaping the trait (`snapshot` added, `detail_when_unsupported`/`equals_wrote` dropped) | process deviation recorded; the orchestrator had authorised those files in the dispatch (gap resolutions 1–7); plan Task 1 signature block annotated |
-| 4, 7 | security | Minor | state file / watchdog log opened through symlinks with a predictable temp name; `load` would block on a FIFO | fixed in F3 (`create_new`, `symlink_metadata` quarantine) |
-| 3 | security | Minor | KDE tools and `dbus-send` spawned by bare name on PATH | fixed in F3 (resolved to absolute paths at detection) |
-| 8 | security | Minor | `proxy.system.status` uncached and agent-reachable (process storm) | fixed in F3 (2 s cache for non-trusted callers) |
-| 10 | quality, spec | Minor | startup/exit recovery logged twice (engine + main.rs) | fixed in F3 (`log_recovery` keeps only the `Failed` warn) |
-| 2, 3, 6 | quality | Minor | §D5 bypass union assembled in three places | fixed in F3 (`bypass_for`) |
-| 2 | quality | Minor | `NeedsPrivilege(String)` carries two payloads | fixed in F3 (`NeedsPrivilege { line }`) |
-| 6 | quality | Minor | re-set reads every service three times | fixed in F3 (idempotency from the snapshot rows) |
-| 7 | quality | Minor | watchdog double load, unreachable arm, silent outcome for a file naming no service | fixed in F3 (`left-alone services=0` line) |
-| 4 | quality | Minor | `service_names` and `rows_of` encode the same partition | fixed in F3 |
-| 3 | quality | Minor | Linux `write` accepts a mismatched `Previous` kind | fixed in F3 |
-| various | quality | Minor | idioms: fabricated ServiceRow in `light_summary`, `target_os: String`, unreachable `object()` arm, `strings` duplicate, `ops_for` vs `Detected::ops`, watchdog dispatched inside the runtime, 5-tuple from the pre-bind helper | fixed in F3 |
+| 4, 7 | security | Minor | state file / watchdog log opened through symlinks with a predictable temp name; `load` would block on a FIFO | fixed in F3 5ac8fcce (`create_new`, `symlink_metadata` quarantine) |
+| 3 | security | Minor | KDE tools and `dbus-send` spawned by bare name on PATH | fixed in F3 5ac8fcce (resolved to absolute paths at detection) |
+| 8 | security | Minor | `proxy.system.status` uncached and agent-reachable (process storm) | fixed in F3 5ac8fcce (2 s cache for non-trusted callers) |
+| 10 | quality, spec | Minor | startup/exit recovery logged twice (engine + main.rs) | fixed in F3 5ac8fcce (`log_recovery` keeps only the `Failed` warn) |
+| 2, 3, 6 | quality | Minor | §D5 bypass union assembled in three places | fixed in F3 5ac8fcce (`bypass_for`) |
+| 2 | quality | Minor | `NeedsPrivilege(String)` carries two payloads | fixed in F3 5ac8fcce (`NeedsPrivilege { line }`) |
+| 6 | quality | Minor | re-set reads every service three times | fixed in F3 5ac8fcce (idempotency from the snapshot rows) |
+| 7 | quality | Minor | watchdog double load, unreachable arm, silent outcome for a file naming no service | fixed in F3 5ac8fcce (`left-alone services=0` line) |
+| 4 | quality | Minor | `service_names` and `rows_of` encode the same partition | fixed in F3 (5ac8fcce) |
+| 3 | quality | Minor | Linux `write` accepts a mismatched `Previous` kind | fixed in F3 (5ac8fcce) |
+| various | quality | Minor | idioms: fabricated ServiceRow in `light_summary`, `target_os: String`, unreachable `object()` arm, `strings` duplicate, `ops_for` vs `Detected::ops`, watchdog dispatched inside the runtime, 5-tuple from the pre-bind helper | fixed in F3 (5ac8fcce) |
 | tests | quality | Minor | scripted-macOS test scaffolding copied into six test modules | accepted as follow-up (a `testing` module), orchestrator 2026-10-31 under Matt's mandate |
 | 6 | quality | Minor | `set`/`unset` return 3-tuples instead of outcome structs | accepted by plan (Task 6 specified the tuples); revisit before PR 2–4 consume them |
 | 8 | spec | Minor | `summarize` spells `1240 ms`, spec said `1 240 ms` | spec aligned to the plan/code 2026-10-31 |
 | 5, 9, 13 | spec | Minor | `Cargo.lock` touched by Tasks 5/9 (mechanical); Task 5 tests in `src/config_file.rs` not `tests/config_file.rs`; Task 13 edited README.md as well as the design doc | accepted (recorded), orchestrator 2026-10-31 |
-| 1, 6, 8 | spec | Minor | unrequested public surface (`Mechanism::as_str`, `Display for Endpoint`, several `pub const`s, `SystemProxy::mechanism()/ours()`); quarantine name gains `-n` on collision | consts made `pub(crate)` in F3 where no external test needs them; the rest accepted (recorded) |
+| 1, 6, 8 | spec | Minor | unrequested public surface (`Mechanism::as_str`, `Display for Endpoint`, several `pub const`s, `SystemProxy::mechanism()/ours()`); quarantine name gains `-n` on collision | consts made `pub(crate)` in F3 where no external test needs them; the rest, plus `SystemProxy::status_cached()`/`state_file()` (spec F4 check), accepted (recorded) |
 | spec | spec | Minor | §D5 "operator-critical hosts" added by the orchestrator after approval | flagged to Matt for countersign (wrap-up); frontends PR 2–4 depend on it |
 | tester | tester | Minor | watchdog wrote no log line for a file naming no service; IPv6 literal unbracketed in guidance | first fixed in F3 (Q5); second accepted (spec says "the IP literal"; `ours_from` maps loopback/unspecified to 127.0.0.1) |
 
