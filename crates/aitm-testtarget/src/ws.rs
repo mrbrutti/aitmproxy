@@ -1,21 +1,36 @@
-//! `/ws` WebSocket seed: RFC 6455 server codec and handshake primitives
-//! (Task A4). The upgrade handler, frame loop and logging arrive in A5/A17.
+//! `/ws` WebSocket seed (spec D4): RFC 6455 server codec and handshake
+//! primitives (Task A4), the upgrade handler, frame loop and `/log/ws`
+//! logging (Task A17).
 //!
-//! Everything here is pure: bytes in, bytes or a verdict out. The server side
-//! of RFC 6455 is deliberately strict: a client frame without a mask is a
+//! The codec is pure: bytes in, bytes or a verdict out. The server side of
+//! RFC 6455 is deliberately strict: a client frame without a mask is a
 //! protocol error (`Decoded::Unmasked`, close `1002`), a declared payload above
 //! [`MAX_FRAME`] is refused before any payload byte is read
 //! (`Decoded::Oversize`, close `1009`), and a reserved opcode or RSV bit is
 //! `Decoded::Malformed`. No `unwrap`/`expect` touches wire bytes.
+//!
+//! The handshake is checked in the D4 order: key and version (400), HTTP/1.1
+//! only (400 over h2), `Origin` (403 in P), the login cookie (401 in P), the
+//! subprotocol echo (V only). Every outcome writes a `handshake` entry; the
+//! accepted connection's frames are logged in both directions and the loop's
+//! end writes a `close` entry and stamps the connection closed.
 
-// A17 consumes this: until the upgrade handler lands, nothing outside the
-// unit tests calls these items.
-#![allow(dead_code)]
+use std::sync::Arc;
 
 use base64::Engine as _;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::header::HeaderValue;
+use hyper::{Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use sha1::{Digest as _, Sha1};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::seed::SeedMode;
+use crate::app::{html, AppState, RequestInfo, Resp};
+use crate::log::{
+    sha256_hex, ConnInfo, Dir, WsCloseEntry, WsFrameEntry, WsHandshakeEntry, WsLogEntry, WsOpcode,
+};
+use crate::seed::{SeedMode, SESSION_USER};
 
 /// Largest payload (bytes) a single client frame may declare.
 pub(crate) const MAX_FRAME: u64 = 1_048_576;
@@ -62,7 +77,9 @@ impl Opcode {
         }
     }
 
-    /// Lower-case token used by the `frame` log entry.
+    /// Lower-case wire token (the `frame` log entry serialises
+    /// [`WsOpcode`] instead; kept for callers that print opcodes).
+    #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Opcode::Continuation => "continuation",
@@ -276,15 +293,335 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Initial receive buffer; it grows as a frame needs, up to [`MAX_BUFFER`].
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Largest receive buffer: one [`MAX_FRAME`] payload plus the longest header
+/// (2 bytes, 8-byte extended length, 4-byte mask).
+const MAX_BUFFER: usize = MAX_FRAME as usize + 14;
+
 /// Answer a `/ws` request: the handshake (D4), then the frame loop on the
-/// upgraded connection. Stub from Task A5 with the final signature; Task A17
-/// fills the body. Until then every `/ws` request is `501 not yet`.
+/// upgraded connection, spawned on the runtime. The response carries the
+/// handshake verdict; the loop logs the rest.
 pub(crate) fn serve_upgrade(
-    _info: &crate::app::RequestInfo,
-    _on_upgrade: hyper::upgrade::OnUpgrade,
-    _state: std::sync::Arc<crate::app::AppState>,
-) -> crate::app::Resp {
-    crate::app::html(hyper::StatusCode::NOT_IMPLEMENTED, "not yet".to_string())
+    info: &RequestInfo,
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    state: Arc<AppState>,
+) -> Resp {
+    let mode = state.mode;
+    let key = info.header("sec-websocket-key").map(str::trim);
+    let version = info.header("sec-websocket-version").map(str::trim);
+    let origin = info.header("origin");
+    let session_valid = info
+        .cookie("session")
+        .is_some_and(|s| state.sessions.is_valid(s));
+    let cookie_names = crate::log::redact_headers(&info.headers).cookie_names;
+
+    let verdict = handshake_verdict(
+        mode,
+        key,
+        version,
+        info.conn.alpn.as_deref(),
+        origin,
+        info.scheme,
+        &info.host,
+        session_valid,
+        info.header("sec-websocket-protocol"),
+    );
+
+    let (status, accepted, subprotocol) = match &verdict {
+        Ok(accept) => (
+            StatusCode::SWITCHING_PROTOCOLS,
+            true,
+            accept.subprotocol.clone(),
+        ),
+        Err((status, _)) => (*status, false, None),
+    };
+    state.log.log_ws(WsLogEntry::Handshake(WsHandshakeEntry {
+        seq: 0,
+        ts_ms: 0,
+        conn_id: info.conn.conn_id.clone(),
+        listener: info.conn.listener,
+        path: info.path.clone(),
+        origin: origin.map(str::to_string),
+        sec_websocket_key: key.unwrap_or_default().to_string(),
+        cookie_names,
+        session_valid,
+        accepted,
+        status: status.as_u16(),
+        subprotocol: subprotocol.clone(),
+    }));
+
+    let accept = match verdict {
+        Ok(accept) => accept,
+        Err((status, body)) => return html(status, body.to_string()),
+    };
+
+    let mut resp = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .body(Full::new(Bytes::new()))
+        .expect("valid response");
+    // The accept key is base64 (always a valid header value); the subprotocol
+    // token came off the client's header, so a value hyper refuses is dropped
+    // rather than trusted.
+    if let Ok(v) = HeaderValue::from_str(&accept.accept_key) {
+        resp.headers_mut().insert("sec-websocket-accept", v);
+    }
+    if let Some(v) = subprotocol
+        .as_deref()
+        .and_then(|s| HeaderValue::from_str(s).ok())
+    {
+        resp.headers_mut().insert("sec-websocket-protocol", v);
+    }
+
+    let conn = info.conn.clone();
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                run_frames(TokioIo::new(upgraded), state, conn, session_valid).await;
+            }
+            // The client went away between the 101 and the handoff: there is
+            // no loop to run, but the connection is still over.
+            Err(_) => finish(&state, &conn, None),
+        }
+    });
+    resp
+}
+
+/// What an accepted handshake answers with.
+struct Accepted {
+    accept_key: String,
+    subprotocol: Option<String>,
+}
+
+/// The D4 handshake decision, in order: key + version 13 (400), h1 only
+/// (400 over h2), `Origin` (403), login (401 in P), then the subprotocol echo.
+#[allow(clippy::too_many_arguments)]
+fn handshake_verdict(
+    mode: SeedMode,
+    key: Option<&str>,
+    version: Option<&str>,
+    alpn: Option<&str>,
+    origin: Option<&str>,
+    scheme: &str,
+    host: &str,
+    session_valid: bool,
+    requested_protocol: Option<&str>,
+) -> Result<Accepted, (StatusCode, &'static str)> {
+    let key = match (key, version) {
+        (Some(k), Some("13")) if !k.is_empty() => k,
+        _ => return Err((StatusCode::BAD_REQUEST, "bad websocket handshake")),
+    };
+    if alpn == Some("h2") {
+        return Err((StatusCode::BAD_REQUEST, "websocket requires HTTP/1.1"));
+    }
+    if !origin_allowed(mode, origin, scheme, host) {
+        return Err((StatusCode::FORBIDDEN, "<p>forbidden origin</p>"));
+    }
+    if mode == SeedMode::Patched && !session_valid {
+        return Err((StatusCode::UNAUTHORIZED, "<p>login required</p>"));
+    }
+    Ok(Accepted {
+        accept_key: accept_key(key),
+        subprotocol: subprotocol_reply(mode, requested_protocol),
+    })
+}
+
+/// Drive one upgraded connection: send the hello frame, then decode and
+/// answer client frames until a close, a protocol error, EOF or an I/O error.
+/// Every frame in both directions is logged; when the loop ends a `close`
+/// entry is written and the connection is stamped closed. Returns the close
+/// code sent or echoed (`None` when the socket simply ended).
+pub(crate) async fn run_frames<IO>(
+    mut io: IO,
+    state: Arc<AppState>,
+    conn: Arc<ConnInfo>,
+    session_valid: bool,
+) -> Option<u16>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let code = frame_loop(&mut io, &state, &conn, session_valid).await;
+    finish(&state, &conn, code);
+    code
+}
+
+/// Log the `close` entry and stamp the connection closed (last write wins,
+/// so this overrides the listener's close stamped at the 101).
+fn finish(state: &AppState, conn: &ConnInfo, code: Option<u16>) {
+    state.log.log_ws(WsLogEntry::Close(WsCloseEntry {
+        seq: 0,
+        ts_ms: 0,
+        conn_id: conn.conn_id.clone(),
+        code,
+    }));
+    state.log.close_conn(conn);
+}
+
+/// What the loop does after handling one decoded frame.
+enum Next {
+    Continue,
+    End(Option<u16>),
+}
+
+async fn frame_loop<IO>(
+    io: &mut IO,
+    state: &AppState,
+    conn: &ConnInfo,
+    session_valid: bool,
+) -> Option<u16>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let mode = state.mode;
+    let user = if session_valid {
+        SESSION_USER
+    } else {
+        "anonymous"
+    };
+    let hello = format!(r#"{{"type":"hello","user":"{user}"}}"#);
+    if !send(io, state, conn, Opcode::Text, hello.as_bytes()).await {
+        return None;
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+    let mut chunk = vec![0u8; READ_CHUNK];
+    loop {
+        // Drain every complete frame at the front of the buffer.
+        loop {
+            match decode_frame(&buf) {
+                Decoded::Incomplete => break,
+                Decoded::Frame { frame, consumed } => {
+                    buf.drain(..consumed);
+                    match handle_frame(io, state, conn, mode, frame).await {
+                        Next::Continue => {}
+                        Next::End(code) => return code,
+                    }
+                }
+                Decoded::Oversize { .. } => return close_with(io, state, conn, 1009).await,
+                Decoded::Unmasked | Decoded::Malformed => {
+                    return close_with(io, state, conn, 1002).await;
+                }
+            }
+        }
+        // A frame within MAX_FRAME always fits MAX_BUFFER, so a full buffer
+        // that still decodes as Incomplete cannot be honoured.
+        let room = MAX_BUFFER.saturating_sub(buf.len());
+        if room == 0 {
+            return close_with(io, state, conn, 1009).await;
+        }
+        let want = room.min(chunk.len());
+        match io.read(&mut chunk[..want]).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Answer one decoded client frame (D4 Echo and Control rows).
+async fn handle_frame<IO>(
+    io: &mut IO,
+    state: &AppState,
+    conn: &ConnInfo,
+    mode: SeedMode,
+    frame: Frame,
+) -> Next
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    log_frame(state, conn, Dir::In, frame.opcode, &frame.payload);
+    match frame.opcode {
+        // Fragmented messages are not supported: a continuation, or a data
+        // frame that announces one, is refused with 1003.
+        Opcode::Continuation => Next::End(close_with(io, state, conn, 1003).await),
+        Opcode::Text | Opcode::Binary if !frame.fin => {
+            Next::End(close_with(io, state, conn, 1003).await)
+        }
+        Opcode::Text => {
+            let text = String::from_utf8_lossy(&frame.payload);
+            let reply = echo_reply(mode, &text);
+            continue_if(send(io, state, conn, Opcode::Text, reply.as_bytes()).await)
+        }
+        Opcode::Binary => continue_if(send(io, state, conn, Opcode::Binary, &frame.payload).await),
+        Opcode::Ping => continue_if(send(io, state, conn, Opcode::Pong, &frame.payload).await),
+        Opcode::Pong => Next::Continue,
+        Opcode::Close => {
+            let code = frame
+                .payload
+                .get(..2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]));
+            send(io, state, conn, Opcode::Close, &frame.payload).await;
+            Next::End(code)
+        }
+    }
+}
+
+fn continue_if(sent: bool) -> Next {
+    if sent {
+        Next::Continue
+    } else {
+        Next::End(None)
+    }
+}
+
+/// Send a close frame with `code` and report it as the loop's close code.
+async fn close_with<IO>(io: &mut IO, state: &AppState, conn: &ConnInfo, code: u16) -> Option<u16>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    if write_wire(io, &close_frame(code)).await {
+        log_frame(state, conn, Dir::Out, Opcode::Close, &code.to_be_bytes());
+    }
+    Some(code)
+}
+
+/// Write one server frame and log it; `false` when the socket refused it.
+async fn send<IO>(
+    io: &mut IO,
+    state: &AppState,
+    conn: &ConnInfo,
+    opcode: Opcode,
+    payload: &[u8],
+) -> bool
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let ok = write_wire(io, &encode_frame(opcode, payload)).await;
+    if ok {
+        log_frame(state, conn, Dir::Out, opcode, payload);
+    }
+    ok
+}
+
+async fn write_wire<IO>(io: &mut IO, wire: &[u8]) -> bool
+where
+    IO: AsyncWrite + Unpin,
+{
+    io.write_all(wire).await.is_ok() && io.flush().await.is_ok()
+}
+
+fn log_frame(state: &AppState, conn: &ConnInfo, dir: Dir, opcode: Opcode, payload: &[u8]) {
+    // `WsOpcode` has no continuation variant (D2 lists text|binary|ping|pong|
+    // close); the refusing close frame that follows is logged instead.
+    let opcode = match opcode {
+        Opcode::Text => WsOpcode::Text,
+        Opcode::Binary => WsOpcode::Binary,
+        Opcode::Ping => WsOpcode::Ping,
+        Opcode::Pong => WsOpcode::Pong,
+        Opcode::Close => WsOpcode::Close,
+        Opcode::Continuation => return,
+    };
+    state.log.log_ws(WsLogEntry::Frame(WsFrameEntry {
+        seq: 0,
+        ts_ms: 0,
+        conn_id: conn.conn_id.clone(),
+        dir,
+        opcode,
+        len: payload.len(),
+        sha256: sha256_hex(payload),
+    }));
 }
 
 #[cfg(test)]
@@ -476,5 +813,400 @@ mod tests {
         assert_eq!(subprotocol_reply(Vulnerable, None), None);
         assert_eq!(subprotocol_reply(Patched, Some("chat")), None);
         assert_eq!(subprotocol_reply(Patched, None), None);
+    }
+
+    // --- A17: handshake and frame loop -------------------------------------
+
+    use http_body_util::BodyExt as _;
+
+    use crate::log::{ControlLog, Listener};
+
+    const RFC_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+    const RFC_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+    fn state(mode: SeedMode) -> Arc<AppState> {
+        Arc::new(AppState::new(mode, ControlLog::new(mode)))
+    }
+
+    /// An `OnUpgrade` for a request that is never upgraded: its future errors
+    /// at once, so the spawned loop ends without a socket.
+    fn never_upgraded() -> hyper::upgrade::OnUpgrade {
+        let mut req = hyper::Request::new(Full::new(Bytes::new()));
+        hyper::upgrade::on(&mut req)
+    }
+
+    fn ws_request(extra: &[(&str, &str)]) -> RequestInfo {
+        let mut headers = vec![
+            ("host", "127.0.0.1:1"),
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-key", RFC_KEY),
+            ("sec-websocket-version", "13"),
+        ];
+        headers.extend_from_slice(extra);
+        RequestInfo::test_request("GET", "/ws", &headers, b"")
+    }
+
+    fn header<'a>(resp: &'a crate::app::Resp, name: &str) -> Option<&'a str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    async fn body_text(resp: crate::app::Resp) -> String {
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("Full body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    #[tokio::test]
+    async fn handshake_response_shape() {
+        // V accepts any Origin.
+        let v = state(Vulnerable);
+        let resp = serve_upgrade(
+            &ws_request(&[("origin", "http://evil.example")]),
+            never_upgraded(),
+            v.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 101);
+        assert_eq!(header(&resp, "sec-websocket-accept"), Some(RFC_ACCEPT));
+        assert_eq!(header(&resp, "upgrade"), Some("websocket"));
+        assert_eq!(header(&resp, "connection"), Some("Upgrade"));
+        assert_eq!(header(&resp, "sec-websocket-protocol"), None);
+
+        // P refuses a foreign Origin.
+        let p = state(Patched);
+        let resp = serve_upgrade(
+            &ws_request(&[("origin", "http://evil.example")]),
+            never_upgraded(),
+            p.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 403);
+        assert_eq!(body_text(resp).await, "<p>forbidden origin</p>");
+
+        // P with a same-origin Origin but no session cookie.
+        let resp = serve_upgrade(
+            &ws_request(&[("origin", "http://127.0.0.1:1")]),
+            never_upgraded(),
+            p.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 401);
+        assert_eq!(body_text(resp).await, "<p>login required</p>");
+
+        // P with an absent Origin and no session: the origin rule passes,
+        // the login rule does not.
+        let resp = serve_upgrade(&ws_request(&[]), never_upgraded(), p.clone());
+        assert_eq!(resp.status().as_u16(), 401);
+
+        // P with a same-origin Origin and a live session upgrades, and never
+        // answers with a subprotocol.
+        let session = p.sessions.create(1);
+        let cookie = format!("session={session}");
+        let resp = serve_upgrade(
+            &ws_request(&[
+                ("origin", "http://127.0.0.1:1"),
+                ("cookie", cookie.as_str()),
+                ("sec-websocket-protocol", "chat, json"),
+            ]),
+            never_upgraded(),
+            p.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 101);
+        assert_eq!(header(&resp, "sec-websocket-accept"), Some(RFC_ACCEPT));
+        assert_eq!(header(&resp, "sec-websocket-protocol"), None);
+        let ws = p.log.ws_json();
+        let last = ws["entries"]
+            .as_array()
+            .and_then(|e| {
+                e.iter()
+                    .rev()
+                    .find(|e| e["kind"] == serde_json::json!("handshake"))
+            })
+            .cloned()
+            .expect("handshake entry");
+        assert_eq!(last["session_valid"], serde_json::json!(true));
+        assert_eq!(last["cookie_names"], serde_json::json!(["session"]));
+
+        // V echoes the first requested subprotocol.
+        let resp = serve_upgrade(
+            &ws_request(&[("sec-websocket-protocol", "chat, json")]),
+            never_upgraded(),
+            v.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 101);
+        assert_eq!(header(&resp, "sec-websocket-protocol"), Some("chat"));
+
+        // Missing key / wrong version are 400 in both modes.
+        let no_key = RequestInfo::test_request(
+            "GET",
+            "/ws",
+            &[
+                ("host", "127.0.0.1:1"),
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-version", "13"),
+            ],
+            b"",
+        );
+        let resp = serve_upgrade(&no_key, never_upgraded(), v.clone());
+        assert_eq!(resp.status().as_u16(), 400);
+        let bad_version = RequestInfo::test_request(
+            "GET",
+            "/ws",
+            &[
+                ("host", "127.0.0.1:1"),
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-key", RFC_KEY),
+                ("sec-websocket-version", "8"),
+            ],
+            b"",
+        );
+        let resp = serve_upgrade(&bad_version, never_upgraded(), p.clone());
+        assert_eq!(resp.status().as_u16(), 400);
+
+        // Over an h2 connection the upgrade is refused (D1 TLS row).
+        let mut h2 = ws_request(&[]);
+        h2.conn = ControlLog::new(Vulnerable).open_conn(
+            Listener::Tls,
+            Some("h2"),
+            "127.0.0.1:2".parse().expect("peer"),
+        );
+        h2.scheme = "https";
+        let resp = serve_upgrade(&h2, never_upgraded(), v.clone());
+        assert_eq!(resp.status().as_u16(), 400);
+        assert_eq!(body_text(resp).await, "websocket requires HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn handshake_is_logged() {
+        let v = state(Vulnerable);
+        let info = ws_request(&[
+            ("origin", "http://evil.example"),
+            ("cookie", "theme=dark; session=nope"),
+        ]);
+        let resp = serve_upgrade(&info, never_upgraded(), v.clone());
+        assert_eq!(resp.status().as_u16(), 101);
+
+        let ws = v.log.ws_json();
+        let handshakes: Vec<&serde_json::Value> = ws["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|e| e["kind"] == serde_json::json!("handshake"))
+            .collect();
+        assert_eq!(handshakes.len(), 1);
+        let h = handshakes[0];
+        assert_eq!(h["accepted"], serde_json::json!(true));
+        assert_eq!(h["status"], serde_json::json!(101));
+        assert_eq!(h["session_valid"], serde_json::json!(false));
+        assert_eq!(h["origin"], serde_json::json!("http://evil.example"));
+        assert_eq!(h["sec_websocket_key"], serde_json::json!(RFC_KEY));
+        assert_eq!(h["cookie_names"], serde_json::json!(["session", "theme"]));
+        assert_eq!(h["subprotocol"], serde_json::Value::Null);
+        assert_eq!(h["path"], serde_json::json!("/ws"));
+        assert_eq!(h["listener"], serde_json::json!("plain"));
+        assert_eq!(h["conn_id"], serde_json::json!(info.conn.conn_id.clone()));
+        assert_eq!(h["seq"], serde_json::json!(1));
+
+        // A refused handshake is logged too, with its status.
+        let p = state(Patched);
+        let resp = serve_upgrade(
+            &ws_request(&[("origin", "http://evil.example")]),
+            never_upgraded(),
+            p.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 403);
+        let ws = p.log.ws_json();
+        let h = &ws["entries"][0];
+        assert_eq!(h["kind"], serde_json::json!("handshake"));
+        assert_eq!(h["accepted"], serde_json::json!(false));
+        assert_eq!(h["status"], serde_json::json!(403));
+    }
+
+    /// A client-side (masked) frame, for driving the loop over a duplex pipe.
+    fn masked(opcode: Opcode, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        let mut out = encode_frame(opcode, payload);
+        let header_len = out.len() - payload.len();
+        out[1] |= 0x80;
+        let mut tail = Vec::with_capacity(4 + payload.len());
+        tail.extend_from_slice(&mask);
+        tail.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        out.truncate(header_len);
+        out.extend_from_slice(&tail);
+        out
+    }
+
+    /// Read one server frame off the pipe (unmasked, payload < 64 KiB).
+    async fn read_frame(io: &mut tokio::io::DuplexStream) -> (Opcode, Vec<u8>) {
+        let mut head = [0u8; 2];
+        io.read_exact(&mut head).await.expect("frame header");
+        let opcode = Opcode::from_u8(head[0] & 0x0f).expect("opcode");
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut ext = [0u8; 2];
+                io.read_exact(&mut ext).await.expect("len16");
+                usize::from(u16::from_be_bytes(ext))
+            }
+            n => usize::from(n),
+        };
+        let mut payload = vec![0u8; len];
+        io.read_exact(&mut payload).await.expect("payload");
+        (opcode, payload)
+    }
+
+    #[tokio::test]
+    async fn frame_loop_hello_echo_ping_close() {
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:3".parse().expect("peer"));
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+
+        let (op, hello) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Text);
+        assert_eq!(hello, br#"{"type":"hello","user":"anonymous"}"#);
+
+        client
+            .write_all(&masked(Opcode::Text, br#"{"type":"chat","msg":"<i>"}"#))
+            .await
+            .expect("write text");
+        let (op, echo) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Text);
+        assert_eq!(echo, br#"{"type":"chat","msg":"<i>","html":"<b><i></b>"}"#);
+
+        client
+            .write_all(&masked(Opcode::Binary, &[0, 1, 2, 255]))
+            .await
+            .expect("write binary");
+        let (op, bin) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Binary);
+        assert_eq!(bin, vec![0, 1, 2, 255]);
+
+        client
+            .write_all(&masked(Opcode::Ping, b"hb"))
+            .await
+            .expect("write ping");
+        let (op, pong) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Pong);
+        assert_eq!(pong, b"hb");
+
+        client
+            .write_all(&masked(Opcode::Close, &1000u16.to_be_bytes()))
+            .await
+            .expect("write close");
+        let (op, close) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Close);
+        assert_eq!(close, vec![0x03, 0xe8]);
+
+        assert_eq!(task.await.expect("loop task"), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn frame_loop_refuses_oversize_unmasked_and_continuation() {
+        for (wire, code) in [
+            // Declared 1_048_577 bytes, no payload: close 1009 before reading it.
+            (
+                {
+                    let mut w = vec![0x82, 0x80 | 127];
+                    w.extend_from_slice(&1_048_577u64.to_be_bytes());
+                    w.extend_from_slice(&[1, 2, 3, 4]);
+                    w
+                },
+                1009u16,
+            ),
+            // Unmasked client frame: close 1002.
+            (encode_frame(Opcode::Text, b"hi"), 1002),
+            // Continuation frame: close 1003.
+            (masked(Opcode::Continuation, b"frag"), 1003),
+        ] {
+            let v = state(Vulnerable);
+            let conn = v
+                .log
+                .open_conn(Listener::Plain, None, "127.0.0.1:4".parse().expect("peer"));
+            let (server, mut client) = tokio::io::duplex(1 << 20);
+            let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), true));
+            let (_, hello) = read_frame(&mut client).await;
+            assert_eq!(hello, br#"{"type":"hello","user":"alice"}"#);
+            client.write_all(&wire).await.expect("write");
+            let (op, payload) = read_frame(&mut client).await;
+            assert_eq!(op, Opcode::Close);
+            assert_eq!(payload, code.to_be_bytes().to_vec());
+            assert_eq!(task.await.expect("loop task"), Some(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_loop_logs_frames_close_and_closed_ms() {
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:5".parse().expect("peer"));
+        // The listener closes the connection as soon as hyper hands off the
+        // upgrade; the loop's close must win.
+        v.log.close_conn(&conn);
+        *conn.closed_ms.lock().expect("closed_ms") = Some(1);
+
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        client
+            .write_all(&masked(Opcode::Text, b"nope"))
+            .await
+            .expect("write text");
+        let (_, reply) = read_frame(&mut client).await;
+        assert_eq!(reply, br#"{"type":"error","error":"bad message"}"#);
+        client
+            .write_all(&masked(Opcode::Close, &1000u16.to_be_bytes()))
+            .await
+            .expect("write close");
+        let _close = read_frame(&mut client).await;
+        task.await.expect("loop task");
+
+        let ws = v.log.ws_json();
+        let kinds: Vec<(String, String, String, usize)> = ws["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|e| {
+                (
+                    e["kind"].as_str().unwrap_or("").to_string(),
+                    e["dir"].as_str().unwrap_or("").to_string(),
+                    e["opcode"].as_str().unwrap_or("").to_string(),
+                    e["len"].as_u64().unwrap_or(0) as usize,
+                )
+            })
+            .collect();
+        let s =
+            |a: &str, b: &str, c: &str, n: usize| (a.to_string(), b.to_string(), c.to_string(), n);
+        assert_eq!(
+            kinds,
+            vec![
+                s("frame", "out", "text", 35),
+                s("frame", "in", "text", 4),
+                s("frame", "out", "text", 38),
+                s("frame", "in", "close", 2),
+                s("frame", "out", "close", 2),
+                s("close", "", "", 0),
+            ]
+        );
+        let entries = ws["entries"].as_array().expect("entries");
+        assert_eq!(
+            entries[1]["sha256"],
+            serde_json::json!(crate::log::sha256_hex(b"nope"))
+        );
+        assert_eq!(entries[5]["code"], serde_json::json!(1000));
+        assert_eq!(
+            entries[5]["conn_id"],
+            serde_json::json!(conn.conn_id.clone())
+        );
+
+        let closed = *conn.closed_ms.lock().expect("closed_ms");
+        assert_ne!(closed, Some(1));
+        assert!(closed.is_some_and(|c| c >= conn.opened_ms));
     }
 }

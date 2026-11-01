@@ -586,12 +586,12 @@ impl ControlLog {
         conn
     }
 
-    /// Stamp `closed_ms` on the connection (idempotent: the first close wins).
+    /// Stamp `closed_ms` on the connection. Last write wins: hyper resolves an
+    /// upgraded h1 connection as soon as the `/ws` upgrade is handed off, so
+    /// the listener stamps a close right after the 101 and the frame loop
+    /// stamps the real end when it finishes.
     pub(crate) fn close_conn(&self, conn: &ConnInfo) {
-        let mut closed = lock(&conn.closed_ms);
-        if closed.is_none() {
-            *closed = Some(Self::now_ms());
-        }
+        *lock(&conn.closed_ms) = Some(Self::now_ms());
     }
 
     fn next_conn_id(&self) -> String {
@@ -1029,6 +1029,24 @@ mod tests {
         // The counter is not reset: the next entry continues after `last`.
         assert_eq!(log.next_seq(), 6);
         assert_eq!(log.mode(), SeedMode::Patched);
+    }
+
+    #[test]
+    fn close_conn_last_write_wins() {
+        // hyper resolves an upgraded h1 connection as soon as the upgrade is
+        // handed off, so the listener stamps `closed_ms` right after the 101;
+        // the `/ws` frame loop must be able to overwrite it when it ends.
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let conn = log.open_conn(Listener::Plain, None, peer());
+        *lock(&conn.closed_ms) = Some(1);
+        log.close_conn(&conn);
+        let closed = *lock(&conn.closed_ms);
+        assert_ne!(closed, Some(1));
+        assert!(closed.is_some_and(|c| c >= conn.opened_ms));
+        assert_eq!(
+            log.conns_json()["entries"][0]["closed_ms"],
+            serde_json::json!(closed)
+        );
     }
 
     #[test]
