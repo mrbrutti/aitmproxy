@@ -752,13 +752,20 @@ fn a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line() {
         r"\nCookie: [redacted]".to_string(),
     );
     // Names that are no header, or have no value: nothing to mask.
-    for (label, unit) in [
-        (r"`\nn` x N", r"\nn"),
-        (r"`\nCookie` x N", r"\nCookie"),
-        (r"`\npass:` and a real LF x N", "\\npass:\n"),
-    ] {
+    for (label, unit) in [(r"`\nn` x N", r"\nn"), (r"`\nCookie` x N", r"\nCookie")] {
         t.hostile_settles(label, times(unit), times(unit));
     }
+    // A name with a colon and an empty line: as after a real line break, `scrub_text`
+    // reads the next line's first word as the value (it skips line breaks after the
+    // separator), so the units pair off, the second of each pair being the value.
+    let unit = "\\npass:\n";
+    let units = (2 << 20) / unit.len();
+    assert_eq!(units % 2, 0);
+    t.hostile_settles(
+        r"`\npass:` and a real LF x N",
+        unit.repeat(units),
+        "\\npass:\n[redacted]\n".repeat(units / 2),
+    );
     // A real line break after each value: every line is a header of its own.
     for (label, unit, line) in [
         (
@@ -774,6 +781,159 @@ fn a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line() {
     ] {
         t.hostile_settles(label, times(unit), line.repeat((2 << 20) / unit.len()));
     }
+    t.finish();
+}
+
+#[test]
+fn a_pair_after_an_escaped_line_break_is_masked_whatever_its_key() {
+    // The same text as above, a request kept in a string, with the break written as
+    // a backslash and `n`, `r` or `t` glued to the key that follows it: `\npw` is one
+    // run of name bytes, so `pw`, `otp`, `pass`, `sid`, `auth` and `session` (which the
+    // vocabularies match only as a whole segment of the key) were not read, and the
+    // credential was written whole. The key starts one byte after the letter, as it
+    // does after a real line break. Every literal is the text itself.
+    let mut t = Table::default();
+
+    // The extra words, the shared words that match a whole segment, and the fields
+    // the reviewer named.
+    t.row(r"\npw=abc&x=1", r"\npw=[redacted]&x=1");
+    t.row(r"x\notp=123456&y=1", r"x\notp=[redacted]&y=1");
+    t.row(r"\npass=abc&y=1", r"\npass=[redacted]&y=1");
+    t.row(r"\ntotp=654321&y=1", r"\ntotp=[redacted]&y=1");
+    t.row(r"x\nauth=abc", r"x\nauth=[redacted]");
+    t.row(r"x\nsid=abc;y", r"x\nsid=[redacted];y");
+    t.row(r"\nsession=abc", r"\nsession=[redacted]");
+    t.row(r"\njwt=abc&q=1", r"\njwt=[redacted]&q=1");
+    t.row(r"\ncsrf=abc&q=1", r"\ncsrf=[redacted]&q=1");
+    t.row(r"\nx-auth=abc&q=1", r"\nx-auth=[redacted]&q=1");
+    t.row(r"\nconnect.sid=abc&q=1", r"\nconnect.sid=[redacted]&q=1");
+
+    // What was already masked stays masked: the needles are substrings of the run.
+    t.row(r"\ntoken=abc&x=1", r"\ntoken=[redacted]&x=1");
+    t.row(r"\npassword=O'Brien&x=1", r"\npassword=[redacted]&x=1");
+    t.row(r"\nuserPass=abc", r"\nuserPass=[redacted]");
+    t.row(r"\nauthorization=abc def", r"\nauthorization=[redacted]");
+
+    // Every escape, and every depth of backslashes.
+    t.row(r"\tpw=abc&x=1", r"\tpw=[redacted]&x=1");
+    t.row(r"\rpw=abc&x=1", r"\rpw=[redacted]&x=1");
+    t.row(r"a\r\npw=abc&x=1", r"a\r\npw=[redacted]&x=1");
+    t.row(r"\\npw=abc&x=1", r"\\npw=[redacted]&x=1");
+    t.row(r"\\\npw=abc&x=1", r"\\\npw=[redacted]&x=1");
+    t.row(r"\n\npw=abc&x=1", r"\n\npw=[redacted]&x=1");
+    t.row(r"x\npw=a\npass=b", r"x\npw=[redacted]");
+
+    // The key forms: quoted values, `:` pairs, bracket-notation names, flags.
+    t.row(r#"\npw="a b" z"#, r#"\npw="[redacted]" z"#);
+    t.row(r"\npw='a b' z", r"\npw='[redacted]' z");
+    t.row(r#"\npass=a"b&x"#, r#"\npass=[redacted]&x"#);
+    t.row(r"\npass=O'Brien&x=1", r"\npass=[redacted]&x=1");
+    t.row(r"x\nsession: abc;y", r"x\nsession: [redacted]");
+    t.row(r"a\r\nuser[password]=x", r"a\r\nuser[password]=[redacted]");
+    t.row(
+        r"x\nuser[password]=O'Brien",
+        r"x\nuser[password]=[redacted]",
+    );
+    t.row(r"\nuser[pw]=abc&z=1", r"\nuser[pw]=[redacted]&z=1");
+    t.row(r"\nlogin[auth]=abc&z=1", r"\nlogin[auth]=[redacted]&z=1");
+    t.row(r"\npw[]=abc&z=1", r"\npw[]=[redacted]&z=1");
+    t.row(r"\n--password x y", r"\n--password [redacted] y");
+    t.row(r"\n--token 'a b' z", r"\n--token [redacted] z");
+    t.row(r"\n-u admin:pw rest", r"\n-u admin:[redacted] rest");
+    t.row(
+        r"x\n--proxy-user 'u:p w' z",
+        r"x\n--proxy-user 'u:[redacted]' z",
+    );
+
+    // The frames: groups, wrappers, escaped quotes, one level and two, after a break.
+    t.row(r#"\npassword=["a","b"]"#, r"\npassword=[redacted]");
+    t.row(r#"\npw=["a","b"]&x=1"#, r"\npw=[redacted]&x=1");
+    t.row(r#"\ntoken={"k":"v"}"#, r"\ntoken=[redacted]");
+    t.row(r#"\nauth={"k":"v"} z"#, r"\nauth=[redacted] z");
+    t.row(r#"\npassword=\"x y\"&z=1"#, r"\npassword=[redacted]&z=1");
+    t.row(r#"\nsid=\"x y\"&z=1"#, r"\nsid=[redacted]&z=1");
+    t.row(r#"\npw=\\\"x y\\\"&z=1"#, r"\npw=[redacted]&z=1");
+    t.row(r#"\npw=Str("x") z"#, r"\npw=[redacted] z");
+    t.row(r#"\nsession=Some(Str("a b")) z"#, r"\nsession=[redacted] z");
+    t.row(r"x\nname=<pw>v</pw>", r"x\nname=<pw>[redacted]</pw>");
+    // A multipart field whose `name=` follows an escaped break: the value is the part
+    // body, real line breaks and all.
+    t.row(
+        "x\\nname=\"password\"\r\n\r\nhunter2\r\n--b--",
+        "x\\nname=\"password\"\r\n\r\n[redacted]\r\n--b--",
+    );
+    t.row(
+        "x\\r\\nname='pw'\r\nContent-Type: text/plain\r\n\r\nhunter2\r\n--b--",
+        "x\\r\\nname='pw'\r\nContent-Type: text/plain\r\n\r\n[redacted]\r\n--b--",
+    );
+    t.unchanged("x\\nname=\"city\"\r\n\r\nParis\r\n--b--");
+    // Inside a quoted string the next quote closes the value, as for a real break.
+    t.row(r#"{"a":"b\npw=abc"}"#, r#"{"a":"b\npw=[redacted]"}"#);
+    t.row(r#"{"a":"b\nsid=abc;y"}"#, r#"{"a":"b\nsid=[redacted];y"}"#);
+
+    // A colon after a line-start name is a header line: P2 masks it to the end of the
+    // line (see above), whatever the key.
+    t.row(r"\npw: abc def", r"\npw: [redacted]");
+    t.row(r"\ntotp: 123456", r"\ntotp: [redacted]");
+
+    // Only the pair of characters is a break. A word that merely starts with `n`, `r`
+    // or `t` is no escape without the backslash, and `\x` and `\N` are no break.
+    t.unchanged("npw=abc&x=1");
+    t.unchanged("tpass=abc&y=1");
+    t.unchanged("x rotp=123456");
+    t.unchanged("onpw: x");
+    t.unchanged("onpw=abc");
+    t.unchanged(r"\xpw=abc");
+    t.unchanged(r"\Npw=abc");
+    t.unchanged(r"\nnsid=abc");
+    t.unchanged(r"\ntpass=abc");
+    // Names that are no secret keys keep their value after a break too, and so do
+    // keys the vocabulary matches only as a segment when the word is only part of one.
+    t.unchanged(r"\nbypass=1");
+    t.unchanged(r"\nauthor=bob&x=1");
+    t.unchanged(r"\nnotes=ok");
+    t.unchanged(r"\nsessions=ok&x=1");
+    t.unchanged(r"\ncompass=north");
+    t.unchanged(r"\nside=1");
+    t.unchanged(r"\nname=bob&city=L'Aquila");
+    // A Windows path: with no separator after the name nothing is read, and `\n`
+    // before `pw=` is indistinguishable from an escaped break, so the pair is masked
+    // (over-redaction, the same result every time and a fixed point).
+    t.unchanged(r"C:\temp\ntoken");
+    t.unchanged(r"C:\temp\notes.txt");
+    t.row(r"C:\temp\ntoken=abc", r"C:\temp\ntoken=[redacted]");
+    t.row(r"C:\temp\npw=abc", r"C:\temp\npw=[redacted]");
+
+    // Hostile, 2 MiB each: every run is read once, an escape glued to it included.
+    let times = |unit: &str| unit.repeat((2 << 20) / unit.len());
+    for (label, unit, line) in [
+        (r"`\npw=a&` x N", r"\npw=a&", r"\npw=[redacted]&"),
+        (r"`\nsid=a;` x N", r"\nsid=a;", r"\nsid=[redacted];"),
+        (
+            r"`\nuser[password]=O'B&` x N",
+            r"\nuser[password]=O'B&",
+            r"\nuser[password]=[redacted]&",
+        ),
+        (
+            r#"`\npassword=["a"],` x N"#,
+            r#"\npassword=["a"],"#,
+            r"\npassword=[redacted],",
+        ),
+        (
+            r"`\n--password x ` x N",
+            r"\n--password x ",
+            r"\n--password [redacted] ",
+        ),
+        (r"`\nn=` x N", r"\nn=", r"\nn="),
+    ] {
+        t.hostile_settles(label, times(unit), line.repeat((2 << 20) / unit.len()));
+    }
+    // A value that runs across every quote after it: one mask, to the last quote.
+    t.hostile_settles(
+        r"`\npw=a'` x N",
+        times(r"\npw=a'"),
+        r"\npw=[redacted]'".to_string(),
+    );
     t.finish();
 }
 

@@ -246,7 +246,9 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   line and the value, which runs to the boundary line), a command-line flag
 ///   (`--password x`, `--token 'a b'`; `--key=x` is a pair) and the password of a
 ///   `user:password` flag (`-u`, `-U`, `--user`, `--proxy-user`: what follows the
-///   first colon of the word).
+///   first colon of the word). A key that follows an escaped line break glued to it
+///   (a backslash and `n`, `r` or `t`, as P2 reads it: `\npw=x`) starts after the
+///   letter, so every rule above reads it as it reads a key after a real line break.
 /// - **P2.** The name `authorization`, `proxy-authorization`, `cookie`, `cookie2`
 ///   or `set-cookie` (ASCII case-insensitive, a whole name: not preceded by an
 ///   ASCII alphanumeric, `_`, `.` or `-`) followed by optional blanks and `:`
@@ -292,7 +294,10 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   with bracket groups (`user[password]=x`, `password[]=x`, `a[b][token]=x`) is
 ///   read as a pair under the whole vocabulary, shared words included, because
 ///   `scrub_text` never read it. P2 has already taken a `pass: value` that starts a
-///   line.
+///   line. A key that follows a glued escaped line break (`\npw=x`, `x\nsid=a;y`) is
+///   read from the letter on and judged by the whole vocabulary, since `scrub_text`
+///   saw the run `npw` and `nsid`; the extra words and the shared words that match only
+///   as a whole segment (`sid`, `jwt`, `csrf`, `session`, `auth`) are found there too.
 ///
 /// Plain text only: never call this over JSON text, where a line break is the two
 /// characters `\r\n` and a value is followed by `"}`.
@@ -1216,14 +1221,16 @@ fn mask_value_frames(text: &str) -> Cow<'_, str> {
             }
             continue;
         }
-        let key_start = i;
-        let key_end = run_end(text, key_start, is_name_byte);
-        if key_end == key_start {
+        let run_start = i;
+        let key_end = run_end(text, run_start, is_name_byte);
+        if key_end == run_start {
             // A delimiter or a whitespace char: step over the whole char.
             i += blank_len(text, i).max(1);
             continue;
         }
         i = key_end;
+        // An escaped line break glued to the run (`\npw=x`) is not part of the key.
+        let key_start = key_start_after_escape(bytes, run_start, key_end);
         let found = multipart_value(text, key_start, key_end)
             .or_else(|| cli_value(text, key_start, key_end))
             .or_else(|| userpass_value(text, key_start, key_end))
@@ -1273,6 +1280,15 @@ fn glued_line_escape(bytes: &[u8], start: usize, end: usize) -> bool {
         && bytes[start - 1] == b'\\'
         && matches!(bytes[start], b'n' | b'r' | b't')
         && end - start > 1
+}
+
+/// Where the key starts in the name run `start..end` that a pair scan has read: one
+/// byte later when the run opens with the letter of a glued escaped line break
+/// ([`glued_line_escape`], `\npw=abc`), else at `start`. The frames pre-pass and P6
+/// read keys with it, so a key after an escaped break is judged as it is after a real
+/// one, whole-segment words (`pw`, `otp`, `pass`, `sid`, `auth`, `session`) included.
+fn key_start_after_escape(bytes: &[u8], start: usize, end: usize) -> usize {
+    start + usize::from(glued_line_escape(bytes, start, end))
 }
 
 /// P2. See [`scrub_strict`]. One left-to-right scan: each name run is read once,
@@ -1857,14 +1873,17 @@ fn mask_extra_pairs(text: &str) -> String {
     let mut quote_unclosed = [false; 2];
     let mut i = 0;
     while i < len {
-        let key_start = i;
-        let key_end = run_end(text, key_start, is_name_byte);
-        if key_end == key_start {
+        let run_start = i;
+        let key_end = run_end(text, run_start, is_name_byte);
+        if key_end == run_start {
             // A delimiter or a whitespace char: step over the whole char.
             i += blank_len(text, i).max(1);
             continue;
         }
         i = key_end;
+        // An escaped line break glued to the run (`\npw=x`) is not part of the key.
+        let key_start = key_start_after_escape(bytes, run_start, key_end);
+        let glued = key_start > run_start;
 
         // Bracket groups after the run belong to the key (`user[password]`).
         let groups_end = bracket_groups_end(bytes, key_end);
@@ -1884,12 +1903,13 @@ fn mask_extra_pairs(text: &str) -> String {
 
         // The scan only stops on char boundaries and `run_end` steps whole chars,
         // so `key_start..groups_end` is on char boundaries. A key with groups is a
-        // form field name that `scrub_text` never read as a pair, so the whole
-        // vocabulary applies; one without is read as `scrub_text` read it, and only
-        // what `scrub_text` does not know is masked here.
+        // form field name that `scrub_text` never read as a pair, and `scrub_text` read
+        // a key after a glued escape as `npw`, so the whole vocabulary applies to both;
+        // any other key is read as `scrub_text` read it, and only what `scrub_text` does
+        // not know is masked here.
         // The whole text is judged, brackets included: every group is a segment of it
         // and every needle a substring, so a word in the run or in any group is found.
-        let secret = if bracketed {
+        let secret = if bracketed || glued {
             is_secret_key_strict(&text[key_start..groups_end])
         } else {
             is_extra_secret_key(&text[key_start..key_end])
@@ -1929,7 +1949,10 @@ fn mask_extra_pairs(text: &str) -> String {
 mod tests {
     use std::cell::Cell;
 
-    use super::{converge, glued_line_escape, scrub_round, scrub_strict, MAX_ROUNDS, SHAPES};
+    use super::{
+        converge, glued_line_escape, key_start_after_escape, scrub_round, scrub_strict, MAX_ROUNDS,
+        SHAPES,
+    };
 
     /// `converge` over `round`, and how many times it called it.
     fn run(text: &str, round: impl Fn(&str) -> String) -> (String, usize) {
@@ -1996,6 +2019,29 @@ mod tests {
         ] {
             assert_eq!(
                 glued_line_escape(text.as_bytes(), start, end),
+                want,
+                "{text:?} {start}..{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_run_starts_after_a_glued_escape_letter() {
+        // `(text, run start, run end, key start)`.
+        for (text, start, end, want) in [
+            (r"\npw=1", 1, 4, 2),
+            (r"x\\ntotp: 1", 3, 8, 4),
+            (r"\tsid=1", 1, 5, 2),
+            (r"\n--password x", 1, 12, 2),
+            // Not glued: the run is the key.
+            (r"npw=1", 0, 3, 0),
+            (r"onpw=1", 0, 4, 0),
+            (r"\xpw=1", 1, 4, 1),
+            (r"\Npw=1", 1, 4, 1),
+            (r"a\n=1", 2, 3, 2),
+        ] {
+            assert_eq!(
+                key_start_after_escape(text.as_bytes(), start, end),
                 want,
                 "{text:?} {start}..{end}"
             );
