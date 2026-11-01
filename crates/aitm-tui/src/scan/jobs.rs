@@ -74,7 +74,10 @@ pub struct JobsState {
     /// The tab's own error (spec D13 as ruled 2026-11-01, fix round H, H56):
     /// the last `scan.list`, `scan.status` or `scan.cancel` failure, shown
     /// on the Jobs banner alone until the next success under its tag
-    /// ([`super::ScanState::clear_error`]).
+    /// ([`super::ScanState::clear_error`]) or, for a keyed
+    /// `scan.status:<job>` / `scan.cancel:<job>` error, until its job turns
+    /// terminal or leaves the list ([`super::ScanState::fold_job_status`],
+    /// [`super::ScanState::fold_job_list`]; fix round H, H66).
     pub error: Option<ScanError>,
 }
 

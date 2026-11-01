@@ -22,7 +22,7 @@ pub mod tokens;
 
 use std::collections::BTreeSet;
 
-use aitm_scan_model::ScanErrorCode;
+use aitm_scan_model::{JobId, JobStatus, ListResult, ScanErrorCode};
 use serde_json::Value;
 
 use crate::action::Action;
@@ -182,6 +182,69 @@ impl ScanState {
             ScanTab::SiteMap if same(&self.sitemap.error) => self.sitemap.error = None,
             ScanTab::Issues if same(&self.issues.error) => self.issues.error = None,
             _ => {}
+        }
+    }
+
+    /// Fold a `scan.status` / `scan.cancel` reply into the Jobs tab
+    /// ([`JobsState::fold_status`]) and let go of the keyed Jobs error its
+    /// job can no longer answer (spec D13 as ruled 2026-11-01; fix round H,
+    /// H66): a `scan.status:<job>` / `scan.cancel:<job>` error with any code
+    /// is cleared, from the Jobs slot and `last_error` alike, when this
+    /// reply is that job's and turns it terminal, since no success under
+    /// the tag can come for a job that has ended. Another job's reply never
+    /// clears it (D13: job B's success never clears job A's error).
+    pub fn fold_job_status(&mut self, status: JobStatus) {
+        let ended = status.state.is_terminal().then(|| status.job.clone());
+        self.jobs.fold_status(status);
+        if ended.is_some() && ended.as_deref() == self.jobs_error_job() {
+            self.release_jobs_error();
+        }
+    }
+
+    /// Fold a `scan.list` reply into the Jobs tab ([`JobsState::fold_list`],
+    /// whose status follow-ups this returns) and let go of the keyed Jobs
+    /// error its job can no longer answer (D13 as ruled; H66): one whose
+    /// job the list dropped from `order`, or lists terminal, is cleared
+    /// from the Jobs slot and `last_error` alike. A job that was never in
+    /// `order` has not left the list, so its error stays (D13). The
+    /// `not_found` self-heal's list (`heal_pending`, fix round G, G74) still
+    /// clears its own tag in the reducer; this covers every other code.
+    pub fn fold_job_list(&mut self, list: ListResult) -> Vec<JobId> {
+        let was_listed = self
+            .jobs_error_job()
+            .is_some_and(|job| self.jobs.order.iter().any(|j| j == job));
+        let followups = self.jobs.fold_list(list);
+        let settled = self.jobs_error_job().is_some_and(|job| {
+            if self.jobs.order.iter().any(|j| j == job) {
+                self.jobs
+                    .state_of(job)
+                    .is_some_and(|state| state.is_terminal())
+            } else {
+                was_listed
+            }
+        });
+        if settled {
+            self.release_jobs_error();
+        }
+        followups
+    }
+
+    /// The job the Jobs slot's error names: the key of a keyed
+    /// `scan.status:<job>` / `scan.cancel:<job>` tag (H66). `None` for no
+    /// error, another verb's, or a bare tag.
+    fn jobs_error_job(&self) -> Option<&str> {
+        let err = self.jobs.error.as_ref()?;
+        if !matches!(err.verb.as_str(), "scan.status" | "scan.cancel") {
+            return None;
+        }
+        tag_parts(&err.tag).1
+    }
+
+    /// Clear the Jobs slot's error under its own tag ([`ScanState::clear_error`]),
+    /// so `last_error` goes with it when it is the same error (H66).
+    fn release_jobs_error(&mut self) {
+        if let Some(tag) = self.jobs.error.as_ref().map(|e| e.tag.clone()) {
+            self.clear_error(&tag);
         }
     }
 

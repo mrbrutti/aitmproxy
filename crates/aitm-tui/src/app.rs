@@ -5357,12 +5357,12 @@ impl App {
                     |s: &JobStatus| s.job.as_str(),
                     OTHER_JOB,
                 ) {
-                    self.scan.jobs.fold_status(status);
+                    self.scan.fold_job_status(status);
                 }
             }
             "scan.list" => {
                 if let Some(list) = self.scan_reply::<ListResult>(tag, &value) {
-                    let followups = self.scan.jobs.fold_list(list);
+                    let followups = self.scan.fold_job_list(list);
                     self.request_scan_statuses(&followups, out);
                     // The list a `not_found` self-heal asked for clears the
                     // error it left (D13 as amended; fix round G, G74).

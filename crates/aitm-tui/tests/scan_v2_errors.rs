@@ -94,6 +94,12 @@ fn banner_line(text: &str) -> &str {
     line_with(text, "1 Profiles").expect("the tab strip is drawn")
 }
 
+/// The tab strip row without its box border and padding, so a banner that
+/// reads `idle` is the row's last word (fix round H, H66).
+fn banner_text(text: &str) -> &str {
+    banner_line(text).trim_end_matches(['│', ' '])
+}
+
 /// The rows the Profiles footer reason may wrap onto (at most four, D11),
 /// the detail side only, joined with one space, and the row index the
 /// first of them (the one carrying `needle`) sits on. The wrap cuts after
@@ -372,6 +378,145 @@ fn the_heal_list_clears_the_error_and_does_not_repoll_the_job() {
         )),
         "the timer window re-polls the job: {out:?}"
     );
+}
+
+/// Fix round H, H66 (spec D13 as ruled 2026-11-01): a keyed
+/// `scan.status:<job>` error with a code other than `not_found` has no
+/// same-tag success to wait for once its job leaves the list, so the
+/// `scan.list` that no longer carries the job clears it: the Jobs banner
+/// is back to `idle` and `last_error` is empty.
+#[test]
+fn a_keyed_error_clears_when_its_job_leaves_the_list() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    let tag = format!("scan.status:{JOB}");
+    let _ = app.on_bus(failed(&tag, "scan.status", "scan: busy: full"));
+    assert_eq!(
+        app.scan.jobs.error.as_ref().map(|e| e.tag.as_str()),
+        Some(tag.as_str())
+    );
+    assert!(banner_line(&screen(&app)).contains("Scanner busy"));
+
+    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
+    assert!(app.scan.jobs.order.is_empty(), "{:?}", app.scan.jobs.order);
+    assert_eq!(app.scan.jobs.error, None, "the Jobs slot let the error go");
+    assert_eq!(app.scan.last_error, None, "so did last_error");
+    let shown = screen(&app);
+    assert!(
+        banner_text(&shown).ends_with("idle"),
+        "the Jobs banner is idle:\n{shown}"
+    );
+}
+
+/// H66, the other end of a job's life: a keyed `scan.cancel:<job>` error
+/// clears when that job's own `scan.status` folds a terminal state (no
+/// `scan.cancel:<job>` success can come for a job that has ended). Another
+/// job ending first leaves it in place (D13: job B never clears job A's).
+#[test]
+fn a_keyed_error_clears_when_its_job_turns_terminal() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    let tag = format!("scan.cancel:{JOB}");
+    let _ = app.on_bus(failed(&tag, "scan.cancel", "scan: busy: full"));
+    assert!(banner_line(&screen(&app)).contains("Scanner busy"));
+
+    let mut other = fixture("scan.status.json");
+    other["job"] = json!("scan-55667788");
+    other["state"] = json!("done");
+    other["phase"] = json!("done");
+    let _ = app.on_bus(reply("scan.status:scan-55667788", "scan.status", other));
+    assert_eq!(
+        app.scan.jobs.error.as_ref().map(|e| e.tag.as_str()),
+        Some(tag.as_str()),
+        "another job ending leaves this job's error"
+    );
+
+    let mut done = fixture("scan.status.json");
+    done["state"] = json!("cancelled");
+    done["phase"] = json!("done");
+    let _ = app.on_bus(reply(&format!("scan.status:{JOB}"), "scan.status", done));
+    assert_eq!(app.scan.jobs.error, None, "the job ended: the error goes");
+    assert_eq!(app.scan.last_error, None);
+    let shown = screen(&app);
+    assert!(
+        banner_text(&shown).ends_with("idle"),
+        "the Jobs banner is idle:\n{shown}"
+    );
+}
+
+/// H66 through the list: a `scan.list` that still carries the error's job
+/// but lists it terminal clears the error too (spec D13 as ruled: the job
+/// turned terminal; the status timer never polls a terminal job, so no
+/// other reply could end it).
+#[test]
+fn a_keyed_error_clears_when_the_list_reports_its_job_done() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    let tag = format!("scan.cancel:{JOB}");
+    let _ = app.on_bus(failed(&tag, "scan.cancel", "scan: busy: full"));
+    assert!(app.scan.jobs.error.is_some());
+
+    let mut list = fixture("scan.list.json");
+    list["jobs"][0]["state"] = json!("done");
+    list["jobs"][0]["phase"] = json!("done");
+    let _ = app.on_bus(reply("scan.list", "scan.list", list));
+    assert_eq!(app.scan.jobs.order.len(), 2, "the job is still listed");
+    assert_eq!(app.scan.jobs.error, None, "listed done: the error goes");
+    assert_eq!(app.scan.last_error, None);
+    assert!(banner_text(&screen(&app)).ends_with("idle"));
+}
+
+/// H66's guard: a keyed error whose job is still running and still listed
+/// stays through a status fold and a list fold (only its own tag's
+/// success, its job ending or its job leaving the list clears it).
+#[test]
+fn a_keyed_error_stays_while_its_job_is_live_and_listed() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    let tag = format!("scan.cancel:{JOB}");
+    let _ = app.on_bus(failed(&tag, "scan.cancel", "scan: busy: full"));
+
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    assert_eq!(
+        app.scan.jobs.error.as_ref().map(|e| e.tag.as_str()),
+        Some(tag.as_str()),
+        "a running status leaves the cancel error"
+    );
+    let _ = app.on_bus(reply("scan.list", "scan.list", fixture("scan.list.json")));
+    assert_eq!(
+        app.scan.jobs.error.as_ref().map(|e| e.tag.as_str()),
+        Some(tag.as_str()),
+        "a list still carrying the running job leaves it"
+    );
+    assert_eq!(
+        app.scan.last_error.as_ref().map(|e| e.tag.as_str()),
+        Some(tag.as_str())
+    );
+    assert!(banner_line(&screen(&app)).contains("Scanner busy"));
 }
 
 /// D13 refused state, D7: `out_of_scope` on a launch clears `pending`,
