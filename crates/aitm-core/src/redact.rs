@@ -2636,4 +2636,248 @@ mod tests {
             "(input, expected, actual) is wrong: {bad:#?}"
         );
     }
+
+    /// A secret key whose value is another secret key's label, with the child's
+    /// own value after it: the parent masks the label and the child masks its
+    /// value, whichever parent and whichever blank layout lies between them.
+    #[test]
+    fn scrub_text_masks_a_credential_nested_under_a_secret_parent() {
+        const PARENTS: [&str; 11] = [
+            "auth",
+            "credentials",
+            "secret",
+            "token",
+            "session",
+            "cookie",
+            "password",
+            "sid",
+            "jwt",
+            "csrf",
+            "api_key",
+        ];
+        const LAYOUTS: [&str; 6] = ["\n  ", "\r\n  ", "\n\t", "\r  ", "\u{c}  ", "\n    "];
+        let mut owned: Vec<(String, String)> = Vec::new();
+        for parent in PARENTS {
+            for layout in LAYOUTS {
+                owned.push((
+                    format!("{parent}:{layout}password: hunter2"),
+                    format!("{parent}:{layout}[redacted] [redacted]"),
+                ));
+            }
+        }
+        owned.push((
+            "token:\r\n\tsid: S1".to_string(),
+            "token:\r\n\t[redacted] [redacted]".to_string(),
+        ));
+        owned.push((
+            "session:\n  csrf: C9".to_string(),
+            "session:\n  [redacted] [redacted]".to_string(),
+        ));
+        assert!(owned.len() >= 68, "the table lost rows: {}", owned.len());
+        let rows: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(input, expected)| (input.as_str(), expected.as_str()))
+            .collect();
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// The nested credential is masked in every form a pair takes: quoted keys,
+    /// a separator with blanks before it, a value on its own line, a quoted
+    /// value, and a run of empty lines between the parent and the child.
+    #[test]
+    fn scrub_text_masks_a_nested_credential_in_every_separator_and_quote_form() {
+        let rows = [
+            (
+                "\"auth\":\n  \"password\": \"x\"",
+                "\"auth\":\n  \"[redacted]\": \"[redacted]\"",
+            ),
+            (
+                "'auth':\n  'password' : 'x y'",
+                "'auth':\n  '[redacted]' : '[redacted]'",
+            ),
+            ("auth: password: hunter2", "auth: [redacted] [redacted]"),
+            (
+                "auth:\n  password :   hunter2",
+                "auth:\n  [redacted] :   [redacted]",
+            ),
+            (
+                "auth:\n  password:\n    hunter2",
+                "auth:\n  [redacted]\n    [redacted]",
+            ),
+            (
+                "auth:\n  password: 'hunter2'",
+                "auth:\n  [redacted] '[redacted]'",
+            ),
+            (
+                "auth:\n\n\n\n\n  password: x",
+                "auth:\n\n\n\n\n  [redacted] [redacted]",
+            ),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A chain of secret keys, each the value of the one before it: every pair
+    /// of the chain is read, so the last key in it masks its own value too.
+    #[test]
+    fn scrub_text_reads_every_pair_of_a_chain_of_secret_keys() {
+        let rows = [
+            (
+                "token:\n  sid:\n  password: hunter2",
+                "token:\n  [redacted]\n  [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  secret:\n    password: hunter2",
+                "auth:\n  [redacted]\n    [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  token:\n    secret:\n      password: hunter2",
+                "auth:\n  [redacted]\n    [redacted]\n      [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  password:\n  sid=abc",
+                "auth:\n  [redacted]\n  [redacted]",
+            ),
+            (
+                "auth:\n  secret:\n    \"password\": \"x\"",
+                "auth:\n  [redacted]\n    \"[redacted]\": \"[redacted]\"",
+            ),
+            ("sid:\nsid:\nsid:\n", "sid:\n[redacted]\n[redacted]\n"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A padded base64 credential on the line after a nested pair's key is that
+    /// key's value, whatever its length: it is masked whole and nothing of it is
+    /// left in the clear.
+    #[test]
+    fn scrub_text_masks_a_padded_base64_credential_under_a_nested_pair() {
+        let mut checked = 0;
+        for (_, credential) in padded_credentials() {
+            let input = format!("auth:\n  password:\n    {credential}");
+            let expected = "auth:\n  [redacted]\n    [redacted]";
+            let actual = scrub_text(&input);
+            assert!(
+                actual == expected,
+                "a padded credential under a nested pair was not masked whole: {input:?} gave {actual:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5_000, "the generator changed its count");
+    }
+
+    /// Nested pairs over inputs of a megabyte and more: the scan reads each byte
+    /// a constant number of times, so these finish, and each comes out as the
+    /// scan's rules say.
+    #[test]
+    fn scrub_text_stays_linear_on_nested_pair_shapes() {
+        // A parent and a child on every other line.
+        let input = "auth:\n  password: x\n".repeat(50_000);
+        assert!(
+            scrub_text(&input) == "auth:\n  [redacted] [redacted]\n".repeat(50_000),
+            "nested pairs on consecutive lines were not masked"
+        );
+
+        // A bare secret key on every line: each is the value of the one before.
+        let input = "sid:\n".repeat(100_000);
+        assert!(
+            scrub_text(&input) == "sid:\n".to_string() + &"[redacted]\n".repeat(99_999),
+            "a column of bare secret keys was not masked line by line"
+        );
+
+        let input = "password:\n password:\n".repeat(50_000);
+        assert!(
+            scrub_text(&input)
+                == "password:\n [redacted]\n".to_string()
+                    + &"[redacted]\n [redacted]\n".repeat(49_999),
+            "a column of indented secret keys was not masked line by line"
+        );
+
+        // Half a million empty lines between a parent and its child.
+        let breaks = "\n".repeat(1 << 19);
+        let input = format!("auth:{breaks}  password: x");
+        assert!(
+            scrub_text(&input) == format!("auth:{breaks}  [redacted] [redacted]"),
+            "a child after half a million empty lines was not masked"
+        );
+
+        // A quoted value that holds a million key-like words and no closing quote
+        // until the end.
+        let input = format!("token=\"{}\"", "a=".repeat(1 << 20));
+        assert!(
+            scrub_text(&input) == "token=\"[redacted]\"",
+            "a quoted value full of key-like words was not masked whole"
+        );
+
+        // Two hundred thousand openers of a quoted value, one closing quote.
+        let input = format!("{}x\"", "sid:\"".repeat(200_000));
+        assert!(
+            scrub_text(&input) == "sid:\"[redacted]\"",
+            "a run of quoted-value openers was not masked as one value"
+        );
+
+        // A masked quoted value with a secret-looking word inside, repeated.
+        let input = "token=\"sid: \" tail=\"x\" ".repeat(100_000);
+        assert!(
+            scrub_text(&input) == "token=\"[redacted]\" tail=\"x\" ".repeat(100_000),
+            "repeated quoted values with a key-like word inside were not masked"
+        );
+    }
+
+    /// Under the wide reading the first token after a secret key is its value on
+    /// the next line too, so a wide-only key masks the line after it.
+    #[test]
+    fn scrub_text_wide_masks_a_next_line_credential_under_a_wide_only_parent() {
+        let rows = [
+            ("userSession:\n  S3SS10N9", "userSession:\n  [redacted]"),
+            ("sidebar:\nS3SS10N9", "sidebar:\n[redacted]"),
+            ("author:\nJohn", "author:\n[redacted]"),
+            ("sessionKey:\n  abc123", "sessionKey:\n  [redacted]"),
+            ("userSession:\r\n\tS3SS10N9", "userSession:\r\n\t[redacted]"),
+            ("sidebar=\u{c}v", "sidebar=\u{c}[redacted]"),
+            ("sidebar\n:v", "sidebar\n:[redacted]"),
+        ];
+        let bad = mismatches_wide(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// Under the wide reading a wide-only key nested under a standard secret key
+    /// is read as a pair too: the parent takes its label and it masks its value.
+    #[test]
+    fn scrub_text_wide_masks_a_wide_only_pair_nested_under_a_standard_parent() {
+        let rows = [
+            (
+                "auth:\n  sessionKey: abc123",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            ("auth: sessionKey: abc123", "auth: [redacted] [redacted]"),
+            (
+                "jwt:\n\tsidebar :  \"Q\"",
+                "jwt:\n\t[redacted] :  \"[redacted]\"",
+            ),
+            (
+                "Credentials:\n\tjwt:\n\tsidebar :  \"Q\"",
+                "Credentials:\n\t[redacted]\n\t[redacted] :  \"[redacted]\"",
+            ),
+        ];
+        let bad = mismatches_wide(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
 }
