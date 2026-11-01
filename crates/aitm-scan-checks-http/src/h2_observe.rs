@@ -725,8 +725,14 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
     // The peer dropped the connection on the resets without saying why: the
     // bluntest reset-rate mitigation there is, and the check's whole question
     // answered (tester finding T2-2). Before the series check, because a drop
-    // is usually what cuts the series short.
+    // is usually what cuts the series short. Only once at least one pair has
+    // an outcome, though: a close before any was observed may be a close on
+    // the preface, the SETTINGS or the first HEADERS, and says nothing about
+    // resets (security review FS-2).
     if obs.connection_closed {
+        if observed == 0 {
+            return inconclusive("the peer closed before any reset pair was observed");
+        }
         return no_finding(
             Outcome::Clean,
             format!(

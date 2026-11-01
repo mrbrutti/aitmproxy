@@ -1628,8 +1628,10 @@ async fn an_empty_observation_is_inconclusive_for_the_malformed_checks() {
 ///
 /// - **fewer than eight outcomes**, or an outcome that is not a reset or an
 ///   answer (a `Timeout`), is not that observation and is `Inconclusive`;
-/// - a peer that **closed the connection** on the resets without a GOAWAY has
-///   mitigated by the bluntest means there is, and is `Clean`;
+/// - a peer that **closed the connection** on the resets without a GOAWAY,
+///   after at least one pair reached an outcome, has mitigated by the
+///   bluntest means there is, and is `Clean`; a close before any pair was
+///   observed says nothing about resets and is `Inconclusive` (FS-2);
 /// - only eight non-refused resets/answers on a connection that stayed open
 ///   are "no reset-rate mitigation observed", at `firm`.
 #[tokio::test]
@@ -1682,5 +1684,34 @@ async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
     assert_eq!(
         v.detail,
         "the peer closed the connection without a GOAWAY after 3 of 8 reset pairs"
+    );
+
+    // A drop before a single pair reached an outcome says nothing about
+    // resets at all — the peer may have closed on the preface, the SETTINGS
+    // or the first HEADERS — so it is Inconclusive, not Clean (final
+    // security review FS-2).
+    let mut o = resets(0);
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(
+        v.detail,
+        "the peer closed before any reset pair was observed"
+    );
+    assert_eq!(v.evidence.matched, None);
+
+    // Eight timeouts and a close: still nothing observed, still Inconclusive.
+    let mut o = obs(vec![StreamOutcome::Timeout; 8]);
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(
+        v.detail,
+        "the peer closed before any reset pair was observed"
     );
 }
