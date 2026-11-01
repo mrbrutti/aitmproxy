@@ -25,10 +25,13 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         the detail shows the evidence payload scan.issue reports, Tab + Enter opens the
         first probe flow in the inspector (Request and Response panes, the flow's method
         and path, the Scan strip gone), f -> false_positive, u -> open (screen AND
-        scan.issue), P opens Findings on the PoC or records the toast.
+        scan.issue; after each the cursor is watched for CURSOR_HOLD_S and must stay on
+        the marked issue's row, H76), P opens Findings on the PoC or records the toast.
   T7-16 (UI-1) the held `standard` editor re-entered (never assumed fresh), `browser
         never`, `speed thorough` and `intensity intrusive` asserted on their Fields lines
-        (H62, H70), s -> a Jobs row with the id scan.list reports, sampled as soon as it
+        (H62, H70), s -> the engine's `needs_confirmation` overlay for the intrusive
+        launch (`Confirm over the wire: scan launch`, recorded as a check and answered
+        with y by `launch`, H77) -> a Jobs row with the id scan.list reports, sampled as soon as it
         is on screen at 0.5 s spacing: three or more screen samples whose on-screen
         `sent/budget` is non-decreasing and inside a scan.status bracket taken around the
         sample; the state/phase cell changes at least once; x right after the third
@@ -160,6 +163,13 @@ QUIET_WINDOW_S = 3.0
 L4_SCOPE_S = 5.0
 GATE_CLEAR_S = 25.0
 OVERLAY_S = 20.0
+# How long the Issues cursor is watched after `f` and after `u` (H76). The update reply
+# replaces the row in place, so `false_positive` is on screen before the running job's
+# pushes refetch the page (`app.rs` `request_issues`), and the sixth live run's refetch
+# then moved the rows under a cursor that kept its index (H75): one read right after the
+# `f` check could pass by luck, so the cell holds the cursor under watch for this long
+# and fails the moment its name cell reads another issue.
+CURSOR_HOLD_S = 2.0
 EXIT_S = 15.0
 # The first hex chars of a seeded secret that a truncated pane cell must still betray.
 SECRET_PREFIX = 12
@@ -1027,6 +1037,22 @@ def name_cell_matches(cell, needle):
     return cell.endswith("…") and len(cell) > 1 and want.startswith(cell[:-1])
 
 
+def cursor_holds(term, needle, hold_s):
+    """Watch the Issues cursor row for `hold_s`: `(True, cell)` when its name cell read
+    as `needle` on every read, `(False, cell)` the moment it read as anything else,
+    `cell` the last name cell read (the row the cursor is on, for the failure detail).
+    A refetched page that moves the rows under a cursor keeping its index is caught
+    while it lands instead of being missed by one lucky read (H75, H76)."""
+    last = {}
+
+    def drifted():
+        last["cell"] = issue_row_name(cursor_row(term.text()))
+        return not name_cell_matches(last["cell"], needle)
+
+    moved = poll(drifted, hold_s, 0.2)
+    return not moved, last.get("cell")
+
+
 def surface_of(text):
     """The surface a screen sample was taken on, read from the text itself (H3): `scan`
     while the Scan tab strip is drawn (the four tabs; an overlay counts by the body it
@@ -1453,17 +1479,44 @@ def wait_landed(ctx, job, timeout=ROW_APPEAR_S):
     return poll(lambda: landed_on_jobs(ctx.term.text(), job), timeout, 0.1)
 
 
-def launch(ctx, key, timeout=JOB_APPEAR_S, land_s=ROW_APPEAR_S):
+def launch(ctx, key, timeout=JOB_APPEAR_S, land_s=ROW_APPEAR_S, step="launch"):
     """Press a launch key and return the job id scan.list gained (None when none), only
     once its start reply has landed on screen or `land_s` ran out. The `StartResult`
     switches the Scan tab to Jobs (`fold_start_result`, spec D7) whenever it arrives, so a
     tab key pressed before it lands is undone (the fifth live run: T7-17's `4` was followed
     by the Jobs tab); every launch therefore waits for the Jobs footer and the new row
     before any caller presses another key (H72). Whether the landing came in time is kept
-    in `ctx.landed[job]` for the step's own check."""
+    in `ctx.landed[job]` for the step's own check.
+
+    An `intrusive` launch starts nothing at first: the engine answers `needs_confirmation`
+    and the TUI draws the wire-confirm overlay (`CONFIRM_TITLE`, the prompt "may disrupt
+    the target"; the sixth live run's `fail-3-t7-16.txt`). The key is followed by a watch
+    for either the overlay or a new id; the overlay is recorded as `step`'s own check,
+    answered with `y` (never `n` here: that is T7-18's sub-step), and the id and the
+    landing are then waited for as for any launch (H77)."""
     before = job_ids(ctx.bus)
     ctx.term.press(key)
-    job = wait_new_job(ctx.bus, before, timeout)
+    answer = {}
+
+    def answered():
+        if CONFIRM_TITLE in ctx.term.text():
+            answer["confirm"] = True
+            return True
+        new = job_ids(ctx.bus) - before
+        if new:
+            answer["job"] = sorted(new)[0]
+            return True
+        return False
+
+    poll(answered, timeout, 0.2)
+    job = answer.get("job")
+    if answer.get("confirm"):
+        text = ctx.snap(f"{step_slug(step)}-confirm")
+        ctx.c.check(f"{step}: the engine asked to confirm the intrusive launch (the `{CONFIRM_TITLE}` "
+                    f"overlay after `{key}` carries \"may disrupt the target\"); `y` answers it (H77)",
+                    "may disrupt the target" in text, f"{ctx.ev.redact(text)[-900:]!r}")
+        ctx.term.press("y")
+        job = wait_new_job(ctx.bus, before, timeout)
     if job:
         ctx.landed[job] = wait_landed(ctx, job, land_s)
     return job
@@ -1560,7 +1613,7 @@ def step_t7_16(ctx):
     set_speed_thorough(ctx, "T7-16")
     set_intensity_intrusive(ctx, "T7-16")
 
-    job = launch(ctx, "s")
+    job = launch(ctx, "s", step="T7-16")
     if not job:
         c.fatal("T7-16: `s` started no job (scan.list gained no id)", ctx.screen("t7-16"))
     ctx.jobs["standard"] = job
@@ -1650,7 +1703,7 @@ def step_t7_16(ctx):
         set_browser_never(ctx, "T7-16", "the fresh job's editor")
         set_speed_thorough(ctx, "T7-16", "the fresh job's editor")
         set_intensity_intrusive(ctx, "T7-16", "the fresh job's editor")
-        fresh = launch(ctx, "s")
+        fresh = launch(ctx, "s", step="T7-16")
         if not fresh:
             c.check("T7-16: `s` started the fresh job for the cancel (scan.list gained an id)", False,
                     ctx.screen("t7-16"))
@@ -1725,7 +1778,7 @@ def step_t7_17(ctx):
         return
     set_browser_never(ctx, "T7-17")
     set_speed_thorough(ctx, "T7-17")
-    job = launch(ctx, "s")
+    job = launch(ctx, "s", step="T7-17")
     if not job:
         c.check("T7-17: the second `s` started a job", False, ctx.screen("t7-17"))
         return
@@ -1825,12 +1878,24 @@ def step_t7_17(ctx):
     c.check("T7-17: `f` marked the issue `false_positive` on screen and in scan.issue",
             on_screen and after_f.get("status") == "false_positive",
             f"scan.issue status {after_f.get('status')}; {ctx.screen('t7-17')}")
+    # The next key acts on the row under the cursor (`scan_issue_status` reads
+    # `cursor_issue()`), so the cursor must still be on the marked issue: the sixth live
+    # run's refetch moved the rows and `u` and `P` acted on another issue (H75); the cursor
+    # is held under watch for CURSOR_HOLD_S and the detail names the row it is on (H76).
+    held_f, row_after_f = cursor_holds(term, needle, CURSOR_HOLD_S)
+    c.check(f"T7-17: after `f` the cursor stays on the marked issue's row for {CURSOR_HOLD_S:.0f} s "
+            "(its name cell reads the issue's name; the issues list refetch keeps the id, H75/H76)",
+            held_f, f"cursor row {row_after_f!r} wanted {needle!r}; {ctx.screen('t7-17')}")
 
     term.press("u")
     after_u = wait_field(lambda: issue_of(ctx.bus, issue_id), "status", "open", 20)
     c.check("T7-17: `u` cleared `false_positive` from the screen and scan.issue reads `open`",
             poll(lambda: "false_positive" not in term.text(), 15) and after_u.get("status") == "open",
             f"scan.issue status {after_u.get('status')}; {ctx.screen('t7-17')}")
+    held_u, row_after_u = cursor_holds(term, needle, CURSOR_HOLD_S)
+    c.check(f"T7-17: after `u` the cursor stays on the reopened issue's row for {CURSOR_HOLD_S:.0f} s "
+            "before `P` (its name cell reads the issue's name, H76)",
+            held_u, f"cursor row {row_after_u!r} wanted {needle!r}; {ctx.screen('t7-17')}")
 
     poc_ref = str(full.get("poc_ref") or "").strip()
     stem = os.path.splitext(os.path.basename(poc_ref))[0] if poc_ref else ""
@@ -2145,7 +2210,7 @@ def step_t7_19(ctx):
         c.check("T7-19: `o` never accepted the origin for the map job", False, ctx.screen("t7-19"))
         return
     set_browser_never(ctx, "T7-19")
-    job = launch(ctx, "m")
+    job = launch(ctx, "m", step="T7-19")
     if not job:
         c.check("T7-19: `m` started no map job", False, ctx.screen("t7-19"))
         return
@@ -2617,6 +2682,8 @@ def jobs_frame():
 
 
 ISSUE_NAME = "Reflected XSS in q"
+# The row the sixth live run's cursor drifted to after `f` (H76).
+DRIFT_NAME = "Cookie without Secure or HttpOnly"
 
 
 def fit_cell(s, w):
@@ -2624,21 +2691,30 @@ def fit_cell(s, w):
     return s + " " * (w - len(s)) if len(s) <= w else s[:w - 1] + "…"
 
 
-def issues_frame(name_w=18):
+def issues_frame(name_w=18, drifted=False):
     """Issues (ui/scan/issues.rs): the filter line, the five severity headers with
     the one row under HIGH and the cursor, the Detail pane whose head repeats the
     name on the filter line's row (the G100e trap), its flow list with its own `>`.
-    `name_w` is the measured name column (`fit` cuts the name to it, H17)."""
+    `name_w` is the measured name column (`fit` cuts the name to it, H17). With
+    `drifted` the frame is the sixth live run's `fail-1-t7-17.txt` in miniature: the
+    marked issue reads `false_positive` and has lost the cursor, which sits on another
+    row (`DRIFT_NAME`, under LOW) after a refetched page moved the rows (H75, H76)."""
     f = Frame()
     chrome(f)
     lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 4)
     f.put(lx, y, f" job {JOB} · S none · C none · L none · T none")
     f.put(lx, y + 1, " CRITICAL 0")
     f.put(lx, y + 2, " HIGH 1")
-    f.put(lx, y + 3, f">●● {fit_cell(ISSUE_NAME, name_w)}{GAP_TEXT}{'GET /search':<11}{GAP_TEXT}{'query:q':<7}{GAP_TEXT}{'open':<4}")
+    mark, status = (" ", "false_positive") if drifted else (">", "open")
+    f.put(lx, y + 3, f"{mark}●● {fit_cell(ISSUE_NAME, name_w)}{GAP_TEXT}{'GET /search':<11}{GAP_TEXT}{'query:q':<7}{GAP_TEXT}{status}")
     f.put(lx, y + 4, " MEDIUM 0")
-    f.put(lx, y + 5, " LOW 0")
-    f.put(lx, y + 6, " INFO 0")
+    if drifted:
+        f.put(lx, y + 5, " LOW 1")
+        f.put(lx, y + 6, f">●○ {fit_cell(DRIFT_NAME, name_w)}{GAP_TEXT}{'GET /lang':<11}{GAP_TEXT}{'query:set':<9}{GAP_TEXT}{'open':<4}")
+        f.put(lx, y + 7, " INFO 0")
+    else:
+        f.put(lx, y + 5, " LOW 0")
+        f.put(lx, y + 6, " INFO 0")
     f.put(lx, y + bh - 1, " " + key_text([ISSUES_FILTER_KEYS]))
     f.put(dx, y, f" {ISSUE_NAME}   high · certain · open")
     f.put(dx, y + 1, f" {'class':<9} reflected-xss")
@@ -2884,16 +2960,21 @@ class ScriptedScreens:
 class ScriptedListBus:
     """A bus stand-in for `launch` (H72): `scan.list` answers no job on its first read
     (the `before` set) and `job` on every later one, so the launch sees the new id at
-    once and the landing wait alone decides when `launch` returns."""
+    once and the landing wait alone decides when `launch` returns. With `armed` (a
+    callable) the job is listed only while it answers True: the engine that starts
+    nothing until the confirm overlay's `y` re-issued the launch (H77)."""
 
-    def __init__(self, job):
+    def __init__(self, job, armed=None):
         self.job = job
+        self.armed = armed
         self.calls = 0
 
     def call(self, name, _args=None):
         assert name == "scan.list", name
         self.calls += 1
-        return {"jobs": [] if self.calls == 1 else [{"job": self.job}]}
+        if self.calls == 1 or (self.armed is not None and not self.armed()):
+            return {"jobs": []}
+        return {"jobs": [{"job": self.job}]}
 
 
 class ScriptedSocket:
@@ -3014,6 +3095,23 @@ def selftest():
             repr(cursor_row(issues)))
     c.check("selftest: Issues: the detail's flow list `>` is never the list cursor",
             not (cursor_row(issues) or "").startswith(" 0192"), repr(cursor_row(issues)))
+    # Cell item from the sixth live smoke run: H76. After `f` the running job's refetch
+    # moved the rows and the cursor kept its index (`fail-1-t7-17.txt`): `cursor_holds`
+    # watches the cursor row's name cell for the whole hold and answers False the moment
+    # it reads another issue, naming that row; the still frame holds for the whole window.
+    drifted = issues_frame(drifted=True)
+    drift_screens = ScriptedScreens([issues, issues, drifted])
+    held_screens = ScriptedScreens([issues])
+    drift_ok, drift_row = cursor_holds(drift_screens, needle, 1.0)
+    hold_ok, hold_row = cursor_holds(held_screens, needle, 0.5)
+    c.check("selftest: Issues: cursor_holds reads False as soon as the cursor row's name cell is "
+            "another issue's (the third frame, the row named in the answer) and True when the "
+            "cell reads the issue for the whole hold (H76)",
+            drift_ok is False and drift_row == DRIFT_NAME[:ISSUE_NAME_MIN] and drift_screens.reads == 3
+            and hold_ok is True and hold_row == needle and held_screens.reads >= 2
+            and "false_positive" in drifted and not on_cursor(drifted, needle),
+            f"drift {drift_ok} {drift_row!r} after {drift_screens.reads} reads; hold {hold_ok} {hold_row!r} "
+            f"after {held_screens.reads} reads; drifted cursor {cursor_row(drifted)!r}")
     c.check("selftest: Issues: the tab marker is the Issues footer and the J pin is on the filter line",
             re.search(TAB_MARKERS["4"], issues) is not None and f"job {JOB}" in issues, row_of(issues, "job "))
 
@@ -3424,6 +3522,44 @@ def selftest():
                 and got_never == JOB and never_ctx.landed == {JOB: False} and never.keys == ["m"],
                 f"got {got!r} landed {lands_ctx.landed} reads {lands.reads}; never {got_never!r} "
                 f"{never_ctx.landed} reads {never.reads}")
+
+        # Cell item from the sixth live smoke run: H77. An `intrusive` launch raises the
+        # engine's `needs_confirmation` overlay (`fail-3-t7-16.txt`): `launch` reads the
+        # title after the key, records the check, presses `y`, and only then reads the new
+        # id and waits for the landing. The scripted bus lists the job only once `y` was
+        # pressed, so a launch that never answered the overlay could not pass here.
+        over_held = wire_confirm_over(held)
+        asked = ScriptedScreens([over_held, over_held, jobs_frame()])
+        asked_checks = Checks(out=io.StringIO())
+        asked_ctx = Ctx(asked_checks, asked, ScriptedListBus(JOB, armed=lambda: "y" in asked.keys), None,
+                        s_ev, 0, "", ORIGIN, 8080, set())
+        got_asked = launch(asked_ctx, "s", timeout=3.0, land_s=3.0, step="T7-16")
+        asked_names = [n for n, _ in asked_checks.results]
+        c.check("selftest: launch on the wire-confirm overlay: the title after `s` is recorded as the "
+                "step's own ok check (`asked to confirm the intrusive launch`), `y` is pressed, the id "
+                "is read only after it and the landing wait runs as before; a launch the engine "
+                "started outright records no such check (H77)",
+                got_asked == JOB and asked.keys == ["s", "y"] and asked_ctx.landed == {JOB: True}
+                and len(asked_names) == 1 and asked_names[0].startswith("T7-16: ")
+                and "asked to confirm the intrusive launch" in asked_names[0]
+                and asked_checks.results[0][1] == "ok" and lands_ctx.c.results == []
+                and never_ctx.c.results == [],
+                f"got {got_asked!r} keys {asked.keys} landed {asked_ctx.landed} checks {asked_checks.results}; "
+                f"outright {lands_ctx.c.results} {never_ctx.c.results}")
+        # An overlay whose prompt is not the engine's "may disrupt the target" wording still
+        # gets its `y` (the launch must go on) but the check reads FAIL and names the screen.
+        odd = Frame.from_text(over_held)
+        odd_text = odd.text().replace("may disrupt the target", "may unsettle the target")
+        odd_screens = ScriptedScreens([odd_text, jobs_frame()])
+        odd_checks = Checks(out=io.StringIO())
+        odd_ctx = Ctx(odd_checks, odd_screens, ScriptedListBus(JOB, armed=lambda: "y" in odd_screens.keys),
+                      None, s_ev, 0, "", ORIGIN, 8080, set())
+        got_odd = launch(odd_ctx, "m", timeout=3.0, land_s=3.0, step="T7-19")
+        c.check("selftest: launch on a confirm overlay without the engine's `may disrupt the target` "
+                "prompt still answers `y` and lands, and the recorded check is FAIL (H77)",
+                got_odd == JOB and odd_screens.keys == ["m", "y"] and odd_checks.results
+                and odd_checks.results[0][1] == "FAIL" and odd_checks.results[0][0].startswith("T7-19: "),
+                f"got {got_odd!r} keys {odd_screens.keys} checks {odd_checks.results}")
     finally:
         shutil.rmtree(script_dir, ignore_errors=True)
 
