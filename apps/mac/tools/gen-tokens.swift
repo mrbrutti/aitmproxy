@@ -5,7 +5,7 @@
 //   swift tools/gen-tokens.swift <tokens.json> <Tokens.swift>
 // Colours become `DynamicColor` (light + dark, SwiftUI and AppKit), method /
 // severity / diff colours become `ColorPair` (fg + bg), dimensions CGFloat,
-// durations seconds, curves Animation helpers, icon roles SF Symbol names.
+// durations seconds, curves Animation helpers and CAMediaTimingFunctions, icon roles SF Symbol names.
 import Foundation
 
 let here = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()

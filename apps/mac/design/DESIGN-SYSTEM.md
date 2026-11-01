@@ -35,8 +35,11 @@ comes through one of the four files below.
   Reduce Motion), `rowArrive` 0; `hover` 100, `popover` 160 and `sheet` 220 are
   reserved: hover fills snap on and off, popovers, menus and sheets are system
   controls, and nothing the operator hits all day may take them on. Curves
-  `Tok.Motion.easeOut(_:)` / `easeInOut(_:)` / `pulse(_:)`, each also as
-  `…Timing` (`CAMediaTimingFunction`) for AppKit layers. Nothing enters with an
+  `Tok.Motion.easeOut(_:)` / `easeInOut(_:)` for SwiftUI, each also as
+  `…Timing` (`CAMediaTimingFunction`) for AppKit layers. `pulse` is used only as
+  `pulseTiming` on the dot's Core Animation layer, never as a SwiftUI
+  `repeatForever` (that is what cost a fifth of a core); the generated
+  `pulse(_:)` exists only because every curve is emitted in both forms. Nothing enters with an
   animation; keyboard-initiated changes never animate.
 - `Tok.Glyph.*` is the only place an SF Symbol name belongs. Flat, monochrome,
   regular weight, `Tok.Ink.secondary`; 16 in bars, 12 inline; never in a

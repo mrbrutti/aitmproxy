@@ -230,12 +230,12 @@ struct PulseDot: NSViewRepresentable {
     func makeNSView(context: Context) -> PulseLayerView {
         let view = PulseLayerView()
         view.wantsLayer = true
-        view.layer?.cornerRadius = Tok.Size.statusDot / 2
+        view.color = color
         return view
     }
 
     func updateNSView(_ view: PulseLayerView, context: Context) {
-        view.fill = color.nsColor
+        view.color = color
         view.setPulsing(!reduceMotion)
     }
 
@@ -245,12 +245,21 @@ struct PulseDot: NSViewRepresentable {
 
     /// The dot's own layer-backed view (not `FlowCellView.DotView`, the table's status dot).
     final class PulseLayerView: NSView {
-        static let pulseKey = "pulse"
-        var fill: NSColor = .clear { didSet { needsDisplay = true } }
+        private static let pulseKey = "pulse"
+        /// The token, not a resolved `NSColor`: two dynamic colours never compare equal, the token does,
+        /// so only a real change redraws the layer.
+        var color: DynamicColor = Tok.Intercept.onBase { didSet { if color != oldValue { needsDisplay = true } } }
         private var pulsing = false
 
+        /// The radius lives on the backing layer itself, so a layer AppKit recreates keeps it.
+        override func makeBackingLayer() -> CALayer {
+            let layer = CALayer()
+            layer.cornerRadius = Tok.Size.statusDot / 2
+            return layer
+        }
+
         override var wantsUpdateLayer: Bool { true }
-        override func updateLayer() { layer?.backgroundColor = fill.cgColor }
+        override func updateLayer() { layer?.backgroundColor = color.nsColor.cgColor }
         override func viewDidChangeEffectiveAppearance() {
             super.viewDidChangeEffectiveAppearance()
             needsDisplay = true
