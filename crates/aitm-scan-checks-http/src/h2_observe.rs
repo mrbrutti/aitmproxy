@@ -270,15 +270,14 @@ impl Kind {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
-            // Observe-only kinds (SETTINGS, CL.TE indicator, rapid-reset) probe
-            // the connection/origin once, not per insertion point (spec D8:
-            // h2 observe-only checks run once per origin); the malformed-header
-            // kinds still probe each point.
-            scope: if matches!(spec.technique, Technique::Observe) {
-                aitm_scan_model::CheckScope::Origin
-            } else {
-                aitm_scan_model::CheckScope::Point
-            },
+            // Every h2 check here probes the origin's connection once, never an
+            // insertion point: the malformed-header kinds send their variants
+            // on streams of that one connection too, and `OncePerAuthority`
+            // refuses a second connection to the same origin within its window.
+            // Origin scope says so to the scheduler, which then runs each check
+            // once per origin rather than once per point (coordinator decision 3;
+            // the T3-3 oracle counts exactly one connection per check).
+            scope: aitm_scan_model::CheckScope::Origin,
             cwe: spec.cwe,
             description: spec.description.to_string(),
             remediation: Some(spec.remediation.to_string()),

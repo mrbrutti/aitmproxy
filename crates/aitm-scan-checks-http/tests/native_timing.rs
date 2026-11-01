@@ -75,6 +75,10 @@ async fn sqli_time_is_firm_when_the_delays_correlate() {
     assert_eq!(t.observed_ms, vec![1040, 3060, 1040, 3060]);
     assert!(t.r >= 0.85, "r was {}", t.r);
     assert!((950.0..=1050.0).contains(&t.slope), "slope was {}", t.slope);
+    assert!(
+        t.correlated,
+        "the check judged the fit correlated and the evidence says so (AC T3-4)"
+    );
 
     // The payload an operator re-sends by hand is the longest delay of the
     // family that fired, and the detail names the family and the fit.

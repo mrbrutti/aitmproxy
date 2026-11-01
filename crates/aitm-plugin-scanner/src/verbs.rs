@@ -1256,7 +1256,13 @@ mod tests {
             natives: Vec<Arc<dyn Check>>,
             scratch: Option<ScratchDir>,
         ) -> Self {
-            let plugin = ScannerPlugin::new(cfg.clone()).with_native_checks(natives);
+            // The native slot always carries the lane's two legacy active checks,
+            // standing in for the T3 natives the binary puts there (PR 2a), so
+            // the catalogue these tests pin still holds `xss-reflected` and
+            // `open-redirect` beside the lane's three passive checks.
+            let mut slot = crate::interim_lane::legacy_active_checks();
+            slot.extend(natives);
+            let plugin = ScannerPlugin::new(cfg.clone()).with_native_checks(slot);
             let late = plugin.late();
             let cell = plugin.engine_cell();
 
@@ -1438,7 +1444,8 @@ mod tests {
 
     /// Spec D3: the verb table is the contract. The registry holds exactly the
     /// eighteen `scan.*` names (fifteen new, three shipped) and one uniform
-    /// `check.<id>` per catalogue entry — here the interim lane's five (call B8).
+    /// `check.<id>` per catalogue entry — here the interim lane's three passive
+    /// checks plus the two legacy actives in the harness's native slot (call B8).
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_exposes_every_d3_verb_and_the_manual_checks() {
         let h = Harness::new();

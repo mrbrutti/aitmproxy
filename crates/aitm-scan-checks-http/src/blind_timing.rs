@@ -291,7 +291,13 @@ fn tracked(
         confidence: Confidence::Firm,
         evidence: Evidence {
             payload: Some(payload),
-            timing: Some(timing),
+            // The fitter makes no claim; this check did (`correlated(&timing)`
+            // held), so the evidence says so for the reader (spec D8.2,
+            // coordinator decision 2).
+            timing: Some(Timing {
+                correlated: true,
+                ..timing
+            }),
             probe_flows,
             baseline_flow,
             ..Evidence::default()
