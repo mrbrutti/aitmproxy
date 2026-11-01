@@ -104,12 +104,21 @@ const XSS_MARKER: &str = "<svg/onload>";
 
 #[test]
 fn serves_vulnerable_target_over_a_real_port() {
-    let serve = start(SeedMode::Vulnerable);
+    let mut serve = start(SeedMode::Vulnerable);
 
     // The index is served.
     let (status, body) = request(&serve.base_url, "GET", "/");
     assert_eq!(status, 200);
     assert!(body.contains("aitm test target"), "index body: {body}");
+
+    // `start` read one stdout line and dropped the reader, so the child's
+    // later `ready` line hit a closed pipe: it must ignore EPIPE and keep
+    // serving, not panic (`failed printing to stdout: Broken pipe`).
+    assert_eq!(
+        serve.child.try_wait().expect("try_wait"),
+        None,
+        "serve bin must still be alive after its stdout reader went away"
+    );
 
     // Vulnerable reflected XSS: the marker comes back raw (unescaped).
     let (status, body) = request(

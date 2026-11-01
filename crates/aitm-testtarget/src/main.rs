@@ -90,8 +90,15 @@ async fn main() -> ExitCode {
 
 /// Print one stdout line and flush it.
 fn emit(line: &str) {
-    println!("{line}");
-    let _ = std::io::stdout().flush();
+    emit_to(&mut std::io::stdout().lock(), line);
+}
+
+/// Write `line` plus a newline to `out` and flush. Never panics: when the
+/// parent stopped reading stdout (`EPIPE`) the line is simply lost and the
+/// listeners keep serving, which is what the harness and an operator want.
+fn emit_to<W: Write>(out: &mut W, line: &str) {
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// Parse the process arguments (see the module doc for the flags).
@@ -146,6 +153,31 @@ fn port_value(flag: &str, value: Option<String>) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stdout whose reader has gone away: every write is `EPIPE`.
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn emit_never_panics_when_stdout_is_a_broken_pipe() {
+        // The legacy serve_bin tests read one line and drop the reader; the
+        // child must keep serving rather than die on `ready`.
+        emit_to(&mut BrokenPipe, "listening http://127.0.0.1:1");
+        emit_to(&mut BrokenPipe, "ready");
+        // And a working writer gets the line plus newline.
+        let mut out = Vec::new();
+        emit_to(&mut out, "ready");
+        assert_eq!(out, b"ready\n");
+    }
 
     fn argv(args: &[&str]) -> impl Iterator<Item = String> {
         args.iter()
