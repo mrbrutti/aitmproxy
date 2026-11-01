@@ -372,6 +372,7 @@ dependencies = [
  "etherparse",
  "futures",
  "nfq",
+ "nix 0.31.3",
  "pcap",
  "pnet_packet",
  "rhai",
