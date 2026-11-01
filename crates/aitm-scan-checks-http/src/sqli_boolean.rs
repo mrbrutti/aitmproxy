@@ -417,7 +417,22 @@ impl Check for SqliBoolean {
                     spent += 2;
                     match SqliBoolean::run_pair(host, true_arm, false_arm, baseline_len).await {
                         PairOutcome::Hit(_) => agreed += 1,
-                        PairOutcome::Miss | PairOutcome::Failed => break,
+                        // A repeat that *disagreed* says the difference was
+                        // noise: drop the candidate and try the next pair.
+                        PairOutcome::Miss => break,
+                        // A repeat that could not be *sent* says nothing at
+                        // all. Treating it as a miss would let a refused
+                        // request end the run `Clean` over a candidate SQL
+                        // injection, so the run stops here and says so.
+                        PairOutcome::Failed => {
+                            return no_finding(
+                                Outcome::Inconclusive,
+                                format!(
+                                    "the pair \"{true_arm}\" / \"{false_arm}\" differed once \
+                                     but a repeat could not be sent"
+                                ),
+                            )
+                        }
                     }
                 }
 

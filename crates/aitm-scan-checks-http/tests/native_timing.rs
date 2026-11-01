@@ -169,6 +169,51 @@ async fn a_failed_baseline_does_not_stop_the_check() {
     assert_eq!(host.sent().len(), 4);
 }
 
+/// AC T3-4's `r >= 0.85` boundary, end to end, on a series that *jitters*: the
+/// two one-second probes and the two three-second probes each come back
+/// differently, as a real target under load does. The payload-keyed script
+/// cannot express that — both `SLEEP(1)` probes would get the same answer — so
+/// the host answers the first and second call of each delay separately.
+///
+/// The two series differ by 40 ms on two probes and nothing else. One fits at
+/// `r = 0.856` and is reported; the other at `r = 0.849` and is not. Both have
+/// the same slope, inside the band, so only the correlation half of ZAP's rule
+/// can decide between them.
+#[tokio::test]
+async fn a_jittered_series_decides_at_the_correlation_boundary() {
+    let reported = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .on_nth("SLEEP(1)", 1, timed(800))
+        .on_nth("SLEEP(3)", 1, timed(2600))
+        .on_nth("SLEEP(1)", 2, timed(1735))
+        .on_nth("SLEEP(3)", 2, timed(4130))
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &reported).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    let t = timing_of(&verdict);
+    assert_eq!(t.observed_ms, vec![800, 2600, 1735, 4130]);
+    assert!((0.855..0.86).contains(&t.r), "r was {}", t.r);
+    assert_eq!(reported.sent().len(), 4, "one family, four probes");
+
+    // 40 ms more jitter on the same two probes, and the fit falls below the
+    // acceptance threshold: the second family is flat, so the run is clean.
+    let not_reported = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .on_nth("SLEEP(1)", 1, timed(800))
+        .on_nth("SLEEP(3)", 1, timed(2600))
+        .on_nth("SLEEP(1)", 2, timed(1775))
+        .on_nth("SLEEP(3)", 2, timed(4170))
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &not_reported).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(not_reported.sent().len(), 8, "both families were tried");
+}
+
 // ---------------------------------------------------------------------------
 // cmdi-time
 // ---------------------------------------------------------------------------

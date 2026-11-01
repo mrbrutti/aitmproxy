@@ -301,6 +301,65 @@ async fn accuracy_fewer_false_positives_repeats_the_hit_twice() {
     assert_eq!(false_arms(&host), 3);
 }
 
+/// A pair that hits once and misses on its repeat is noise, not a finding.
+/// `Accuracy::Normal` wants two agreeing runs, so the second run of the first
+/// pair is scripted to come back the baseline's length: the differential
+/// disappears and the check must not report it, however convincing the first
+/// run was.
+#[tokio::test]
+async fn a_hit_that_does_not_reproduce_on_its_repeat_is_not_reported() {
+    let host = vulnerable_host()
+        .with_accuracy(Accuracy::Normal)
+        // Two pairs, so the run is exactly the first pair, its repeat, and one
+        // more pair that never diverges.
+        .with_speed(Speed::Fast)
+        // The repeat's false arm answers like the baseline: no divergence.
+        .on_nth(" AND 1=2", 2, html(200, &body(600)));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Clean,
+        "an unreproduced difference was reported: {}",
+        verdict.detail
+    );
+    assert_eq!(
+        host.sent().iter().filter(|p| *p == FALSE_ARM).count(),
+        2,
+        "the first pair was run exactly twice: {:?}",
+        host.sent()
+    );
+}
+
+/// A repeat that could not be **sent** is not the same as a repeat that
+/// disagreed. The first says nothing about the target; the second says the
+/// difference was noise. Reporting the first as `Clean` would bury a candidate
+/// SQL injection behind a refused request, so it is `Inconclusive` and the
+/// detail names the pair that was left unconfirmed.
+#[tokio::test]
+async fn a_refused_repeat_after_a_hit_is_inconclusive_not_clean() {
+    let host = vulnerable_host()
+        .with_accuracy(Accuracy::Normal)
+        .with_speed(Speed::Fast)
+        // Control, true arm, false arm go through; the repeat is refused.
+        .with_probes_failing_after(3);
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(
+        verdict.detail,
+        "the pair \" AND 1=1\" / \" AND 1=2\" differed once but a repeat could not be sent"
+    );
+    assert_eq!(
+        verdict.evidence.diff, None,
+        "an unconfirmed pair is not evidence"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The stop contract
 // ---------------------------------------------------------------------------

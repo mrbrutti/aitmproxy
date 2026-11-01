@@ -23,6 +23,7 @@
 // Shared by several test binaries; each one uses a different part of it.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -56,7 +57,10 @@ pub struct ScriptedHost {
     baseline: ProbeResponse,
     baseline_fails: bool,
     probes_fail: bool,
+    probes_fail_after: Option<usize>,
     table: Vec<(String, ProbeResponse)>,
+    nth_table: Vec<(String, usize, ProbeResponse)>,
+    nth_seen: Mutex<HashMap<String, usize>>,
     fallback: ProbeResponse,
     sent: Mutex<Vec<Sent>>,
     baseline_calls: AtomicUsize,
@@ -84,7 +88,10 @@ impl ScriptedHost {
             baseline: html(200, ""),
             baseline_fails: false,
             probes_fail: false,
+            probes_fail_after: None,
             table: Vec::new(),
+            nth_table: Vec::new(),
+            nth_seen: Mutex::new(HashMap::new()),
             fallback: html(200, ""),
             sent: Mutex::new(Vec::new()),
             baseline_calls: AtomicUsize::new(0),
@@ -103,6 +110,29 @@ impl ScriptedHost {
     #[must_use]
     pub fn on(mut self, needle: &str, resp: ProbeResponse) -> Self {
         self.table.push((needle.to_string(), resp));
+        self
+    }
+
+    /// Answer `resp` to the `n`-th probe whose payload contains `needle`,
+    /// counting from one, and leave the other calls to the ordinary table.
+    ///
+    /// This is what makes a *stateful* target scriptable: a page that answers
+    /// one way the first time a condition is sent and another way on the
+    /// repeat is exactly the flaky target the confirmation loop exists for, and
+    /// a payload-keyed table alone cannot express it.
+    #[must_use]
+    pub fn on_nth(mut self, needle: &str, n: usize, resp: ProbeResponse) -> Self {
+        assert!(n >= 1, "on_nth counts calls from one");
+        self.nth_table.push((needle.to_string(), n, resp));
+        self
+    }
+
+    /// Let the first `n` probes through and fail every one after them, as a
+    /// lane does when the guard disables a host mid-check or the upstream
+    /// connection dies part-way through a series.
+    #[must_use]
+    pub fn with_probes_failing_after(mut self, n: usize) -> Self {
+        self.probes_fail_after = Some(n);
         self
     }
 
@@ -247,13 +277,51 @@ impl ScriptedHost {
         Ok(())
     }
 
-    /// The scripted answer for `payload`: first table entry whose needle the
-    /// payload contains, else the fallback.
+    /// The scripted answer for `payload`: a matching [`Self::on_nth`] override
+    /// for this call if there is one, else the first table entry whose needle
+    /// the payload contains, else the fallback.
     fn answer(&self, payload: &str) -> ProbeResponse {
+        if let Some(resp) = self.nth_answer(payload) {
+            return resp;
+        }
         self.table
             .iter()
             .find(|(needle, _)| payload.contains(needle.as_str()))
             .map_or_else(|| self.fallback.clone(), |(_, resp)| resp.clone())
+    }
+
+    /// Count this call against every `on_nth` needle it matches and return the
+    /// override whose turn it is, if any.
+    fn nth_answer(&self, payload: &str) -> Option<ProbeResponse> {
+        let mut seen = self
+            .nth_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hit = None;
+        for needle in self
+            .nth_table
+            .iter()
+            .map(|(needle, _, _)| needle)
+            .filter(|needle| payload.contains(needle.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let count = seen.entry(needle.clone()).or_insert(0);
+            *count += 1;
+            if hit.is_none() {
+                hit = self
+                    .nth_table
+                    .iter()
+                    .find(|(n, at, _)| n == needle && at == count)
+                    .map(|(_, _, resp)| resp.clone());
+            }
+        }
+        hit
+    }
+
+    /// Whether the probe now being sent is past [`Self::with_probes_failing_after`].
+    fn past_the_failure_point(&self) -> bool {
+        self.probes_fail_after
+            .is_some_and(|n| self.sent_probes().len() > n)
     }
 }
 
@@ -280,7 +348,7 @@ impl ProbeHost for ScriptedHost {
                     target: self.target.clone(),
                 });
             self.spend()?;
-            if self.probes_fail {
+            if self.probes_fail || self.past_the_failure_point() {
                 anyhow::bail!("the scripted host refused this probe");
             }
             Ok(self.answer(&payload.value))
