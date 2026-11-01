@@ -1539,7 +1539,6 @@ mod tests {
     // the payload with the header fields still well-formed and stamp the
     // mutated `ihl`/`total_length`/`data_offset` afterwards. Un-ignore with that
     // fix; the assertions below are the plan's, unchanged.
-    #[ignore = "blocked on the build_ipv4/build_tcp panic described above"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unsendable_cases_are_not_charged() {
         let mock = MockBackend::new(MockReply::Echo);
