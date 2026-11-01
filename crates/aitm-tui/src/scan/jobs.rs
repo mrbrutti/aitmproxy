@@ -75,6 +75,16 @@ impl JobsState {
             .collect()
     }
 
+    /// The newest job in `order` whose summary is not terminal (spec D2: the
+    /// sidebar count is "the open issues total from the newest non-terminal
+    /// job"). `None` when every listed job has finished.
+    pub fn newest_active(&self) -> Option<&JobSummary> {
+        self.order
+            .iter()
+            .filter_map(|id| self.summaries.get(id))
+            .find(|s| !s.state.is_terminal())
+    }
+
     /// The last state known for a job: the summary (refreshed by both
     /// `scan.list` and `scan.status`) first, the full view otherwise.
     pub fn state_of(&self, id: &str) -> Option<JobState> {
@@ -138,6 +148,38 @@ pub fn state_phase_text(state: JobState, phase: Phase) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix round A, A17: the newest job still running, in `order`, for the
+    /// sidebar count; a list of finished jobs has none.
+    #[test]
+    fn newest_active_is_the_first_non_terminal_job_in_order() {
+        let mut jobs = JobsState::default();
+        for (id, state, total) in [
+            ("scan-done", JobState::Done, 4),
+            ("scan-live", JobState::Running, 2),
+            ("scan-also-live", JobState::Queued, 0),
+        ] {
+            jobs.order.push(id.to_string());
+            jobs.summaries.insert(
+                id.to_string(),
+                JobSummary {
+                    job: id.to_string(),
+                    state,
+                    issues: aitm_scan_model::IssueCounters {
+                        total,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        let active = jobs.newest_active().expect("a running job");
+        assert_eq!(active.job, "scan-live");
+        assert_eq!(active.issues.total, 2);
+
+        jobs.order.retain(|j| j == "scan-done");
+        assert!(jobs.newest_active().is_none(), "no live job, no count");
+    }
 
     #[test]
     fn elapsed_rounds_down_to_whole_seconds() {

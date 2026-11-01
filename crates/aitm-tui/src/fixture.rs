@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use aitm_bus_client::{BoxFuture, BusTransport};
 use serde_json::{json, Map, Value};
 
+use crate::action::CONFIRM_KEY;
 use crate::base64;
 
 /// The fixture that ships with the crate.
@@ -701,7 +702,7 @@ impl Fixture {
             // a first call (no `_confirm`) returns `needs_confirmation`; the
             // re-issue with `_confirm` proceeds (M4 D4).
             "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
-                if args.get("_confirm").is_none() {
+                if args.get(CONFIRM_KEY).is_none() {
                     return Ok(l4_needs_confirmation(name, args));
                 }
                 match name {

@@ -12,7 +12,6 @@ mod common;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::fixture_app_core;
 use aitm_tui::scan::{MapPane, ScanTab};
 use common::*;
 use serde_json::Value;
@@ -25,33 +24,6 @@ macro_rules! fixture {
             $name
         ))
     };
-}
-
-/// Every `scan.*` verb of the v2 contract: a test that means "a legacy bus"
-/// must keep meaning that after T1b re-pins `CORE_TOOLS`.
-const V2_TOOLS: &[&str] = &[
-    "scan.start",
-    "scan.map",
-    "scan.status",
-    "scan.list",
-    "scan.cancel",
-    "scan.issues",
-    "scan.issue",
-    "scan.issue.update",
-    "scan.sitemap",
-    "scan.checks",
-    "scan.profile.list",
-    "scan.profile.get",
-    "scan.profile.save",
-    "scan.profile.delete",
-    "scan.session.preview",
-];
-
-/// The core fixture with every v2 scanner verb removed: `scan.discover` only.
-fn legacy_app(cols: u16, rows: u16) -> App {
-    let mut app = fixture_app_core(cols, rows);
-    app.tools.retain(|t| !V2_TOOLS.contains(&t.name.as_str()));
-    app
 }
 
 /// The text of every tab of the Scan view, in strip order.

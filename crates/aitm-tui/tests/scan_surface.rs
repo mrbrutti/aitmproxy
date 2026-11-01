@@ -4,50 +4,21 @@
 //! tests run. The scanner engine is `aitm-plugin-scanner`; these only exercise
 //! the UI that surfaces its `scan.discover` result.
 
+mod common;
+
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode, SidebarItem};
-use aitm_tui::fixture_app_core;
 use aitm_tui::keys;
 use aitm_tui::scan::legacy::InjectionPointRow;
 use aitm_tui::scan::ScanTab;
 use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use common::{legacy_app, press};
+use crossterm::event::KeyCode;
 use serde_json::{json, Value};
 
 fn screen(app: &App) -> String {
     to_text(&render(app, &Theme::new(true), app.width, app.height))
-}
-
-fn press(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
-}
-
-/// Every verb of the scanner v2 contract: a file that means "the legacy
-/// `scan.discover` path" must keep meaning that when `CORE_TOOLS` gains them.
-const V2_TOOLS: &[&str] = &[
-    "scan.start",
-    "scan.map",
-    "scan.status",
-    "scan.list",
-    "scan.cancel",
-    "scan.issues",
-    "scan.issue",
-    "scan.issue.update",
-    "scan.sitemap",
-    "scan.checks",
-    "scan.profile.list",
-    "scan.profile.get",
-    "scan.profile.save",
-    "scan.profile.delete",
-    "scan.session.preview",
-];
-
-/// The core fixture with every v2 scanner verb removed: a legacy bus.
-fn legacy_app(cols: u16, rows: u16) -> App {
-    let mut app = fixture_app_core(cols, rows);
-    app.tools.retain(|t| !V2_TOOLS.contains(&t.name.as_str()));
-    app
 }
 
 /// Open the view and show the Site map tab, where the legacy

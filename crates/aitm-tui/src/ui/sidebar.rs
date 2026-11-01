@@ -195,16 +195,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             ScanOffer::V2 => app
                 .scan
                 .jobs
-                .order
-                .iter()
-                .find(|j| {
-                    app.scan
-                        .jobs
-                        .summaries
-                        .get(*j)
-                        .is_some_and(|s| !s.state.is_terminal())
-                })
-                .and_then(|j| app.scan.jobs.summaries.get(j))
+                .newest_active()
                 .map(|s| s.issues.total.to_string()),
             ScanOffer::Legacy => (!app.scan.legacy.points.is_empty())
                 .then(|| app.scan.legacy.points.len().to_string()),

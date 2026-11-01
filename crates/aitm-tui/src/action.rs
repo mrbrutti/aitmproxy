@@ -8,6 +8,12 @@ use serde_json::Value;
 
 use crate::model::{AgentPolicy, AgentState, Finding, FlowDetail, ProxyStatus};
 
+/// The reserved argument a confirm-over-the-wire re-issue carries (spec D3,
+/// D7; `server.rs` `needs_confirmation`). No tool schema declares it: the bus
+/// task's prune keeps it, the overlay's `confirmed_args` adds it, and the
+/// fixture bus looks for it.
+pub const CONFIRM_KEY: &str = "_confirm";
+
 /// A tool the bus offers, enough to build the palette and a form: the
 /// `tools/list` entry exactly as the bus client decodes it. [`ToolSchema`]
 /// adds the form-building view of its schema.

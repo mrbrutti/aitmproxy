@@ -27,8 +27,8 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    parse_result, tag_keyed, ScanError, ScanOffer, ScanState, ScanTab, LIST_POLL_TICKS,
-    STATUS_POLL_TICKS,
+    parse_result, step, tag_keyed, ScanError, ScanOffer, ScanState, ScanTab, LIST_POLL_TICKS,
+    NO_SCANNER, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -165,8 +165,8 @@ pub struct BrowserState {
 
 /// The rows the Scan view spends on chrome rather than list body, so a
 /// PgUp/PgDn page is `height - SCAN_CHROME_ROWS`: the three bars, the two box
-/// edges, the tab strip, the state banner, the column header, and the pane
-/// rule plus the first detail line (spec D11, plan task 4).
+/// edges, the strip-and-banner row, a heading row, a rule, a detail line and
+/// one spare footer row (spec D11, plan task 4).
 const SCAN_CHROME_ROWS: u16 = 10;
 
 /// Whether the browser view counts a call as in flight: exactly the calls
@@ -1403,7 +1403,7 @@ impl App {
                             usize::try_from((self.compose.field as i64 + i64::from(d)).clamp(0, 3))
                                 .unwrap_or(0)
                     }
-                    _ => self.chip = step(&Chip::ALL, self.chip, d),
+                    _ => self.chip = step(&Chip::ALL, self.chip, d > 0),
                 }
             }
             Action::Enter => match self.mode {
@@ -1464,8 +1464,8 @@ impl App {
             Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             Action::SidebarNext => self.sidebar_step(1, &mut out),
             Action::SidebarPrev => self.sidebar_step(-1, &mut out),
-            Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, 1),
-            Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, -1),
+            Action::ChipNext => self.chip = step(&Chip::ALL, self.chip, true),
+            Action::ChipPrev => self.chip = step(&Chip::ALL, self.chip, false),
             Action::ChipIndex(i) => {
                 if let Some(c) = Chip::ALL.get(i) {
                     self.chip = *c;
@@ -2705,7 +2705,7 @@ impl App {
             Mode::Scan => {
                 // ↑↓/paging walk the focused pane of the active tab (D11).
                 // A page is the list body: the terminal minus the view's
-                // chrome, which is SCAN_CHROME_ROWS = 10 rows.
+                // chrome rows.
                 let page = usize::from(self.height.saturating_sub(SCAN_CHROME_ROWS)).max(1);
                 let offer = self.scan_offer();
                 if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
@@ -2839,11 +2839,11 @@ impl App {
     /// `]`/`[`: the Scope item filters the list (§2.7 "The flow list's
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
     fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
-        let mut next = step(&SidebarItem::ALL, self.sidebar, d);
+        let mut next = step(&SidebarItem::ALL, self.sidebar, d > 0);
         // The Scan row is drawn only when the bus offers a scanner (D2);
         // never land on a row the operator cannot see.
         if next == SidebarItem::Scan && self.scan_offer() == ScanOffer::None {
-            next = step(&SidebarItem::ALL, next, d);
+            next = step(&SidebarItem::ALL, next, d > 0);
         }
         self.sidebar = next;
         match self.sidebar {
@@ -3245,10 +3245,7 @@ impl App {
                 out.extend(self.update(Action::OpenScan));
                 if !rest.is_empty() {
                     if self.scan_offer() == ScanOffer::None {
-                        self.toast(
-                            Level::Warn,
-                            "the scanner is not on this bus (scan.start / scan.discover)",
-                        );
+                        self.toast(Level::Warn, NO_SCANNER);
                     } else if self.scan.legacy.running {
                         self.toast(Level::Info, "a scan is already running");
                     } else {
@@ -4355,11 +4352,6 @@ fn craft_dst(spec: &Value) -> Option<String> {
 pub fn fuzzy(needle: &str, hay: &str) -> bool {
     let mut it = hay.chars();
     needle.chars().all(|n| it.any(|h| h == n))
-}
-
-fn step<T: Copy + PartialEq>(all: &[T], cur: T, d: i32) -> T {
-    let i = all.iter().position(|x| *x == cur).unwrap_or(0) as i32;
-    all[(i + d).rem_euclid(all.len() as i32) as usize]
 }
 
 fn compose_field(f: &mut ComposeForm) -> &mut String {

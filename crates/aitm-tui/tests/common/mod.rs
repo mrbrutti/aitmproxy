@@ -6,7 +6,9 @@
 
 use aitm_tui::action::{BusEvent, BusRequest, ToolInfo};
 use aitm_tui::app::App;
+use aitm_tui::fixture_app_core;
 use aitm_tui::model::ProxyStatus;
+use aitm_tui::scan::ScanOffer;
 use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -107,6 +109,22 @@ pub const PRE_MERGE_TOOLS: &[&str] = &[
     "ca.install",
     "ca.uninstall",
 ];
+
+/// The core fixture as a legacy scanner bus (spec D2, D12): `scan.discover`
+/// and every non-`scan.` tool are kept, every other `scan.*` verb is dropped,
+/// so a file that means "the legacy path" keeps meaning it however
+/// `CORE_TOOLS` is re-pinned. Asserts the offer it built.
+pub fn legacy_app(cols: u16, rows: u16) -> App {
+    let mut app = fixture_app_core(cols, rows);
+    app.tools
+        .retain(|t| t.name == "scan.discover" || !t.name.starts_with("scan."));
+    assert_eq!(
+        app.scan_offer(),
+        ScanOffer::Legacy,
+        "the fixture is a legacy scanner bus"
+    );
+    app
+}
 
 /// A `flow.get` summary as the core shapes it (§4.3).
 pub fn summary(

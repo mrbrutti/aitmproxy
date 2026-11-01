@@ -327,11 +327,6 @@ impl L4Gates {
     }
 }
 
-/// The confirm-over-the-wire handshake (M4 D4, L4OPS-AC10) is now the generic
-/// [`crate::scan::launch::WireConfirm`], shared with the scanner launches (spec
-/// D3). This alias keeps the L4 call sites reading in L4 terms.
-pub type L4Confirm = crate::scan::launch::WireConfirm;
-
 /// The default `PacketSpec` the craft editor opens with: a loopback UDP probe,
 /// valid for `l4.craft` (outermost layer first; `raw` is a byte list).
 pub const DEFAULT_CRAFT_YAML: &str = "\

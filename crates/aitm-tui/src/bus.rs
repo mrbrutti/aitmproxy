@@ -13,7 +13,7 @@ use aitm_bus_client::{BusClient, BusError};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::action::{BusEvent, BusRequest, Level, ToolInfo};
+use crate::action::{BusEvent, BusRequest, Level, ToolInfo, CONFIRM_KEY};
 use crate::model::{AgentState, Finding, FlowDetail, ProxyStatus};
 
 /// Client name sent in `initialize.clientInfo` (§4.2).
@@ -27,10 +27,6 @@ pub type Connector =
 
 /// The JSON-RPC code `aitm-mcp` answers a wrong token with (foundation §4.1).
 const UNAUTHORIZED: i64 = -32001;
-
-/// The reserved argument a confirm-over-the-wire re-issue carries
-/// (`server.rs` `needs_confirmation`); never declared by any tool schema.
-const CONFIRM_KEY: &str = "_confirm";
 
 /// What the app is told when the bus refuses the token; retrying cannot fix it.
 /// Worded for either intended role and without implying the token came from a
@@ -190,9 +186,8 @@ impl Session {
         }
         match self.client.call("flow.subscribe", json!({})).await {
             Ok(_) => Ok(()),
-            Err(BusError::Transport(e)) => Err(Outcome::Lost(format!("{e:#}"))),
             Err(e) => {
-                let msg = error_text(e);
+                let msg = refusal(e)?;
                 self.emit(BusEvent::Toast(
                     Level::Warn,
                     format!("flow.subscribe failed: {msg}; scan progress will poll only"),
@@ -538,8 +533,7 @@ impl Session {
                 }
                 Ok(Ok(value))
             }
-            Err(BusError::Transport(e)) => Err(Outcome::Lost(format!("{e:#}"))),
-            Err(other) => Ok(Err(error_text(other))),
+            Err(e) => refusal(e).map(Err),
         }
     }
 
@@ -547,21 +541,27 @@ impl Session {
     /// the session like anywhere else; a tool, RPC or protocol error is the
     /// app's [`BusEvent::CallFailed`] with the operator-facing text.
     async fn call_failed(&self, name: &str, e: BusError) -> Result<(), Outcome> {
-        match e {
-            BusError::Transport(e) => Err(Outcome::Lost(format!("{e:#}"))),
-            other => {
-                self.emit(BusEvent::CallFailed {
-                    name: name.to_string(),
-                    message: error_text(other),
-                })
-                .await
-            }
-        }
+        let message = refusal(e)?;
+        self.emit(BusEvent::CallFailed {
+            name: name.to_string(),
+            message,
+        })
+        .await
     }
 }
 
 fn lost(e: BusError) -> Outcome {
     Outcome::Lost(e.to_string())
+}
+
+/// The one split between a dead transport and a refusal the bus answered
+/// with: a transport failure ends the session (`Err(Outcome::Lost)`), any
+/// other error is the operator-facing text of the refusal.
+fn refusal(e: BusError) -> Result<String, Outcome> {
+    match e {
+        BusError::Transport(e) => Err(Outcome::Lost(format!("{e:#}"))),
+        other => Ok(error_text(other)),
+    }
 }
 
 /// The operator-facing text of a non-transport error.

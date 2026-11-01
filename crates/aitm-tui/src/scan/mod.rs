@@ -318,8 +318,9 @@ impl ScanState {
 }
 
 /// The next (or previous) entry of `all` after `cur`, wrapping. An entry not
-/// in `all` stays put.
-fn step<T: Copy + PartialEq>(all: &[T], cur: T, forward: bool) -> T {
+/// in `all` stays put. The one wrap helper of the crate: the reducer's chip
+/// and sidebar steps use it too (fix round A, A15).
+pub(crate) fn step<T: PartialEq + Copy>(all: &[T], cur: T, forward: bool) -> T {
     match all.iter().position(|x| *x == cur) {
         Some(i) => {
             let n = all.len();
@@ -345,6 +346,10 @@ pub enum ScanOffer {
     /// Neither verb: the sidebar row is hidden and every tab says so.
     None,
 }
+
+/// What a bus without any scanner is told (spec D2): the banner of every tab
+/// and the `:scan <target>` refusal toast share this one sentence.
+pub const NO_SCANNER: &str = "the scanner is not on this bus (scan.start / scan.discover)";
 
 /// The detail of a [`ScanError::missing_verb`]: the inline text D2 fixes for
 /// a control whose verb the bus lacks, minus the verb itself.

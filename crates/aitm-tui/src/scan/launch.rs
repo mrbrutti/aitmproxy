@@ -4,6 +4,8 @@
 
 use serde_json::Value;
 
+use crate::action::CONFIRM_KEY;
+
 /// A pending confirm-over-the-wire handshake (spec D3, D7), generalised from the
 /// L4 inject confirm. The first guarded call (without `_confirm`) returns a
 /// `needs_confirmation` reply whose `prompt` is the wire summary; the overlay
@@ -47,7 +49,7 @@ impl WireConfirm {
     pub fn confirmed_args(&self) -> Value {
         let mut args = self.args.clone();
         if let Value::Object(map) = &mut args {
-            map.insert("_confirm".to_string(), Value::String(self.token.clone()));
+            map.insert(CONFIRM_KEY.to_string(), Value::String(self.token.clone()));
         }
         args
     }

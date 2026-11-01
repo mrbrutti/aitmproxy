@@ -19,14 +19,14 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{ScanOffer, ScanTab};
+use crate::scan::{ScanOffer, ScanTab, NO_SCANNER};
 use crate::theme::Theme;
 use crate::ui::bars::put;
 use crate::ui::overlays::boxed;
 use crate::ui::text::truncate;
 
-/// What a bus without any scanner is told, in the banner of every tab (D2).
-pub const NO_SCANNER: &str = "the scanner is not on this bus (scan.start / scan.discover)";
+/// The blank cells between the tab strip and the state banner (D11).
+const GAP: usize = 4;
 
 /// Draw the Scan view into `area`.
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
@@ -54,23 +54,20 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// tab itself.
 fn tab_strip(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let mut spans = Vec::new();
-    for tab in ScanTab::ALL {
+    for (k, tab) in ScanTab::ALL.into_iter().enumerate() {
         let active = app.scan.tab == tab;
         let style = if active {
             theme.text_primary().add_modifier(Modifier::BOLD)
         } else {
             theme.text_tertiary()
         };
-        spans.push(Span::styled(
-            format!(" {} {} ", tab.index() + 1, tab.label()),
-            style,
-        ));
+        spans.push(Span::styled(format!(" {} {} ", k + 1, tab.label()), style));
     }
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let room = usize::from(area.width).saturating_sub(used + 4);
+    let room = usize::from(area.width).saturating_sub(used + GAP);
     let text = banner(app);
     if room > 0 {
-        spans.push(Span::raw("    "));
+        spans.push(Span::raw(" ".repeat(GAP)));
         spans.push(Span::styled(
             truncate(&text, room),
             banner_style(app, theme),
