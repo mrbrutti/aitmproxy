@@ -25,9 +25,9 @@ use crate::scan::{
 };
 use crate::theme::Theme;
 use crate::ui::bars::put;
-use crate::ui::scan::{note, pane_rule, panes};
+use crate::ui::scan::{hint, note, pane_rule, panes};
 use crate::ui::selection_bg;
-use crate::ui::text::{cells, fit, truncate, width};
+use crate::ui::text::{cells, fit, width};
 
 /// Blank cells between columns.
 const GAP: usize = 2;
@@ -60,32 +60,12 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 fn empty(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let filters = &app.scan.issues.filters;
     if filters.is_active() && area.height >= 2 {
-        banner(
-            theme,
-            filters.banner(),
-            Rect::new(area.x, area.y, area.width, 1),
-            buf,
-        );
+        hint(theme, area, &filters.banner(), buf);
         let rest = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
         note(theme, rest, "no issues yet", buf);
     } else {
         note(theme, area, "no issues yet", buf);
     }
-}
-
-/// The filter banner line, tertiary text.
-fn banner(theme: &Theme, text: String, area: Rect, buf: &mut Buffer) {
-    put(
-        buf,
-        area,
-        Line::styled(
-            format!(
-                " {}",
-                truncate(&text, usize::from(area.width).saturating_sub(1))
-            ),
-            theme.text_tertiary(),
-        ),
-    );
 }
 
 /// One line of the grouped list: a severity header or a row index.
@@ -147,19 +127,14 @@ impl Columns {
     }
 }
 
-/// The filter banner, the grouped list scrolled so the cursor row is on
+/// The filter line, the grouped list scrolled so the cursor row is on
 /// screen, and the footer.
 fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
     }
     let issues = &app.scan.issues;
-    banner(
-        theme,
-        issues.filters.banner(),
-        Rect::new(area.x, area.y, area.width, 1),
-        buf,
-    );
+    hint(theme, area, &issues.filters.banner(), buf);
     let has_footer = area.height >= 3;
     let body_h = usize::from(area.height) - 1 - usize::from(has_footer);
     if body_h == 0 {
@@ -211,16 +186,11 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         }
     }
     if has_footer {
-        put(
-            buf,
+        hint(
+            theme,
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
-            Line::styled(
-                format!(
-                    " {}",
-                    truncate(FOOTER, usize::from(area.width).saturating_sub(1))
-                ),
-                theme.text_tertiary(),
-            ),
+            FOOTER,
+            buf,
         );
     }
 }

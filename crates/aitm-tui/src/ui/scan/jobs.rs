@@ -28,7 +28,7 @@ use crate::scan::{
 use crate::theme::Theme;
 use crate::tokens::color::status;
 use crate::ui::bars::put;
-use crate::ui::scan::{note, pane_rule, stacked, stacked_share, Panes};
+use crate::ui::scan::{hint, note, pane_rule, stacked, stacked_share, Panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, elide_middle, fit, right, truncate, width};
 
@@ -347,10 +347,11 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
         );
     }
     if has_footer {
-        put(
-            buf,
+        hint(
+            theme,
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
-            Line::styled(format!(" {}", truncate(FOOTER, w)), theme.text_tertiary()),
+            FOOTER,
+            buf,
         );
     }
 }

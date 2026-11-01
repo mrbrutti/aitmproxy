@@ -577,3 +577,45 @@ fn rows_are_bounded_at_fold_time() {
     assert_eq!(app.scan.issues.list.len(), 512);
     assert_eq!(app.scan.issues.rows.len(), 512);
 }
+
+/// D4 (spec D11, amended): on a v2 bus with `scan.issues` but no
+/// `scan.issue`, the Issues strip row names the missing verb, and a cursor
+/// landing sends nothing (the quiet `scan_poll` path, ruling b).
+#[test]
+fn a_bus_without_scan_issue_is_named_in_the_issues_banner() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let without: Vec<&str> = TOOLS
+        .iter()
+        .copied()
+        .filter(|t| *t != "scan.issue")
+        .collect();
+    let _ = connect(&mut app, &without, None);
+    let _ = app.update(Action::OpenScan);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: json!({ "jobs": [] }),
+    });
+    let reqs = app.update(Action::ScanTab(ScanTab::Issues));
+    assert_eq!(
+        issues_requests(&reqs).len(),
+        1,
+        "scan.issues is still served"
+    );
+    let text = screen(&app);
+    let strip = line_with(&text, "1 Profiles")
+        .unwrap_or_default()
+        .trim_end_matches(['│', ' ']);
+    assert!(
+        strip.ends_with("scan.issue is not on this bus"),
+        "the strip row names the missing read verb: {strip:?}"
+    );
+    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert!(
+        reqs.is_empty(),
+        "a landing without scan.issue sends nothing: {reqs:?}"
+    );
+    assert_eq!(app.scan.issues.pending_read, None);
+    assert_eq!(app.scan.issues.list.len(), 2, "the list is still shown");
+}

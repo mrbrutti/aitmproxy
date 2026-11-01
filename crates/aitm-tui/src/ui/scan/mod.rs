@@ -127,19 +127,24 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
 
 /// The active tab's degraded text, when the bus cannot serve it (D2): on a
 /// legacy bus Profiles and Issues name what they need; on a v2 bus a tab
-/// whose own verb is missing names it. Jobs is not gated by a verb in D2 (a
-/// v2 bus has `scan.start` by definition), and the Site map on a legacy bus
-/// is the legacy result (D12), not degraded.
+/// names the first of its verbs the bus lacks (D11: Issues needs both
+/// `scan.issues` for the list and `scan.issue` for the read; fix round D,
+/// D4). Jobs is not gated by a verb in D2 (a v2 bus has `scan.start` by
+/// definition), and the Site map on a legacy bus is the legacy result
+/// (D12), not degraded.
 fn degraded(app: &App) -> Option<String> {
-    let verb = match (app.scan_offer(), app.scan.tab) {
+    let verbs: &[&str] = match (app.scan_offer(), app.scan.tab) {
         (ScanOffer::Legacy, ScanTab::Profiles) => return Some(PROFILES_DEGRADED.to_string()),
         (ScanOffer::Legacy, ScanTab::Issues) => return Some(ISSUES_DEGRADED.to_string()),
-        (ScanOffer::V2, ScanTab::Profiles) => "scan.profile.list",
-        (ScanOffer::V2, ScanTab::SiteMap) => "scan.sitemap",
-        (ScanOffer::V2, ScanTab::Issues) => "scan.issues",
+        (ScanOffer::V2, ScanTab::Profiles) => &["scan.profile.list"],
+        (ScanOffer::V2, ScanTab::SiteMap) => &["scan.sitemap"],
+        (ScanOffer::V2, ScanTab::Issues) => &["scan.issues", "scan.issue"],
         _ => return None,
     };
-    (!app.has_tool(verb)).then(|| ScanError::missing_verb(verb).wording())
+    verbs
+        .iter()
+        .find(|verb| !app.has_tool(verb))
+        .map(|verb| ScanError::missing_verb(verb).wording())
 }
 
 /// On a legacy bus the Jobs tab's error is the `scan.discover` failure the
@@ -292,18 +297,27 @@ pub fn pane_rule(theme: &Theme, panes: &Panes, buf: &mut Buffer) {
     }
 }
 
-/// One line of secondary text at the top of `area`: what a tab draws when it
-/// is empty, degraded or not served by this bus (D13).
-pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
+/// One line of tertiary text on the first row of `area`, one cell in and
+/// cut to the width: the one way a tab draws its filter line, its footers
+/// and its empty-state note (fix round D, D10). Nothing is drawn into an
+/// area under two cells wide or without a row.
+pub fn hint(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
     }
-    buf.set_string(
-        area.x + 1,
-        area.y,
-        truncate(text, usize::from(area.width).saturating_sub(2)),
-        theme.text_tertiary(),
+    put(
+        buf,
+        Rect::new(area.x, area.y, area.width, 1),
+        Line::styled(
+            format!(" {}", truncate(text, usize::from(area.width) - 1)),
+            theme.text_tertiary(),
+        ),
     );
+}
+
+/// What a tab draws when it is empty (D13): a [`hint`] at the top of `area`.
+pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
+    hint(theme, area, text, buf);
 }
 
 #[cfg(test)]
