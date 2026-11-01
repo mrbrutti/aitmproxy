@@ -1,6 +1,7 @@
 //! `PrivilegeState`: the one shared source of truth for packet-capture
 //! privilege (spec §2.1). It owns the platform prober, the clock, the cached
-//! [`PrivilegeReport`] and the progress of the last `l4.privilege.request`.
+//! [`PrivilegeReport`], the progress of the last `l4.privilege.request` and the
+//! platform [`Requester`] that `request()` dispatches to (spec §2.3).
 //!
 //! `report()` re-probes when the cached capture is not `Available` and is at
 //! least [`REPROBE_MS`] old (**Architect's call** for the TTL), so a core
@@ -16,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::backend::routed::RoutedBackend;
 use crate::backend::CaptureInjectBackend;
 pub use crate::config::{L4PrivilegeConfig, RequestMode};
-use crate::privilege::derive::{derive, ProbeInputs};
+use crate::privilege::derive::{derive, text, ProbeInputs};
 use crate::privilege::linux::gather_linux;
 use crate::privilege::macos::gather_mac;
 use crate::privilege::report::{
@@ -28,6 +29,59 @@ pub const REPROBE_MS: u64 = 1000;
 
 /// The message a request carries once capture became available under it.
 pub const APPROVED_MESSAGE: &str = "packet capture approved";
+
+/// The message of an `already_available` outcome.
+pub const ALREADY_AVAILABLE_MESSAGE: &str = "packet capture is already available on this core";
+
+/// The message the default requester answers on a platform with no handoff.
+pub const NO_HANDOFF_MESSAGE: &str = "no platform handoff is wired on this build yet";
+
+/// What `l4.privilege.request` answers (spec §2.3): the outcome, a message for
+/// the operator, and the report as it stands right after the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestOutcome {
+    pub outcome: Outcome,
+    pub message: String,
+    pub privilege: PrivilegeReport,
+}
+
+/// The wire `outcome` of `l4.privilege.request`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Capture already works; nothing was asked.
+    AlreadyAvailable,
+    /// A prompt is up (or a request was already in flight); poll `l4.privilege`.
+    Pending,
+    /// The request went to the Aitmproxy app (macOS); macOS asks the operator.
+    HandedToApp,
+    /// Nothing could be shown; `message` says why.
+    CannotPrompt,
+}
+
+impl Outcome {
+    /// The wire string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::AlreadyAvailable => "already_available",
+            Outcome::Pending => "pending",
+            Outcome::HandedToApp => "handed_to_app",
+            Outcome::CannotPrompt => "cannot_prompt",
+        }
+    }
+}
+
+/// The platform half of `l4.privilege.request` (spec §2.3): start the OS
+/// permission flow for the report's `needs_approval` capture and say what
+/// happened. It must return at once (never block on the OS); the state turns
+/// its answer into [`RequestProgress`]. `report` is the current report, with
+/// capture not `Available` and no request in flight; `cfg` carries
+/// `l4.privilege.*` and the process lifetime. The macOS handoff (plan P1b.11)
+/// and the Linux `pkexec` spawn (plan P1b.14) implement it behind
+/// [`PlatformRequester`].
+pub(crate) trait Requester: Send + Sync {
+    fn request(&self, cfg: &PrivilegeConfig, report: &PrivilegeReport) -> (Outcome, String);
+}
 
 /// What the state needs from the core's configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +126,11 @@ pub struct PrivilegeState {
     /// (plan P1b.8 seam; P1b.13 sets and clears it). [`RoutedBackend`] takes
     /// it for `Available { via: Helper }`.
     helper: Mutex<Option<Arc<dyn CaptureInjectBackend>>>,
+    /// The platform half of `request()`.
+    requester: Box<dyn Requester>,
+    /// Serialises `request()`: one request at a time (spec §2.3), so two
+    /// operators asking together cannot both reach the platform.
+    requesting: Mutex<()>,
 }
 
 /// What `report()` keeps between probes.
@@ -117,7 +176,16 @@ impl PrivilegeState {
             clock,
             cache: Mutex::new(Cache::default()),
             helper: Mutex::new(None),
+            requester: Box::new(PlatformRequester),
+            requesting: Mutex::new(()),
         }
+    }
+
+    /// Replace the platform requester; tests script one.
+    #[cfg(test)]
+    pub(crate) fn with_requester(mut self, requester: Box<dyn Requester>) -> Self {
+        self.requester = requester;
+        self
     }
 
     /// The one capture/inject backend every production caller holds (spec §2.1,
@@ -178,9 +246,73 @@ impl PrivilegeState {
         report
     }
 
+    /// `l4.privilege.request` (spec §2.3). Non-blocking. In order: L4 off in
+    /// this core's config is `CannotPrompt` (**Architect's call**, plan
+    /// P1b.10); capture already `Available` is `AlreadyAvailable`; a request
+    /// still in flight (`pending` or `handed_to_app`) is `Pending` with the
+    /// same progress; otherwise the platform [`Requester`] is asked once and
+    /// its answer is recorded as this core's request progress
+    /// (`HandedToApp` / `Pending` as themselves, `CannotPrompt` as `failed`).
+    /// The returned report is taken after that, so it carries the progress and
+    /// the request-dependent rows.
+    #[must_use]
+    pub fn request(&self) -> RequestOutcome {
+        let _one_at_a_time = self
+            .requesting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        let report = self.report();
+        if !self.cfg.enabled {
+            return RequestOutcome {
+                outcome: Outcome::CannotPrompt,
+                message: text::L4_OFF.to_string(),
+                privilege: report,
+            };
+        }
+        if matches!(report.capture, Capability::Available { .. }) {
+            return RequestOutcome {
+                outcome: Outcome::AlreadyAvailable,
+                message: ALREADY_AVAILABLE_MESSAGE.to_string(),
+                privilege: report,
+            };
+        }
+        if let Some(in_flight) = report
+            .request
+            .as_ref()
+            .filter(|req| matches!(req.state, RequestState::Pending | RequestState::HandedToApp))
+        {
+            let message = in_flight.message.clone();
+            return RequestOutcome {
+                outcome: Outcome::Pending,
+                message,
+                privilege: report,
+            };
+        }
+
+        let (outcome, message) = self.requester.request(&self.cfg, &report);
+        let state = match outcome {
+            Outcome::HandedToApp => Some(RequestState::HandedToApp),
+            Outcome::Pending => Some(RequestState::Pending),
+            Outcome::CannotPrompt => Some(RequestState::Failed),
+            Outcome::AlreadyAvailable => None,
+        };
+        if let Some(state) = state {
+            self.set_request(Some(RequestProgress {
+                state,
+                at: (self.clock)(),
+                message: message.clone(),
+            }));
+        }
+        RequestOutcome {
+            outcome,
+            message,
+            privilege: self.report(),
+        }
+    }
+
     /// Record (or clear) the progress of this core's `l4.privilege.request`.
     /// The next `report()` probes at once so the request-dependent rows apply.
-    #[allow(dead_code)] // wired by P1b.10 (`l4.privilege.request`)
     pub(crate) fn set_request(&self, request: Option<RequestProgress>) {
         let mut cache = self.lock();
         cache.request = request;
@@ -295,6 +427,37 @@ impl Prober for PlatformProber {
     }
 }
 
+/// This build's platform half of `request()`. It decides on the report's
+/// `platform` (the one the decision table ran for) and never blocks.
+///
+/// Until the platform flows land it answers `CannotPrompt` with the remedy
+/// the report already offers (`how.label`, the `package` label when that is
+/// the row), so an operator reads the same one action everywhere:
+/// - macOS: P1b.11 replaces the arm with the handoff to the installed app
+///   (`handoff_target`, `validate_handoff_app`, `open -a … aitmproxy://…`).
+/// - Linux: P1b.14 replaces the arm with the `pkexec` spawn and its progress.
+struct PlatformRequester;
+
+impl Requester for PlatformRequester {
+    fn request(&self, _cfg: &PrivilegeConfig, report: &PrivilegeReport) -> (Outcome, String) {
+        let remedy = || {
+            report
+                .capture
+                .how()
+                .map(|how| how.label.clone())
+                .or_else(|| report.capture.reason().map(str::to_string))
+                .unwrap_or_else(|| NO_HANDOFF_MESSAGE.to_string())
+        };
+        match report.platform {
+            // P1b.11 replaces this arm (macOS handoff to the app).
+            Platform::Macos => (Outcome::CannotPrompt, remedy()),
+            // P1b.14 replaces this arm (Linux pkexec spawn).
+            Platform::Linux => (Outcome::CannotPrompt, remedy()),
+            Platform::Other => (Outcome::CannotPrompt, NO_HANDOFF_MESSAGE.to_string()),
+        }
+    }
+}
+
 /// The platform this build runs on, in the report's vocabulary.
 #[must_use]
 pub fn current_platform() -> Platform {
@@ -329,13 +492,21 @@ mod tests {
 
     /// A prober that answers from a queue of macOS inputs, repeating the last.
     struct Scripted {
+        enabled: bool,
         rows: Mutex<Vec<MacInputs>>,
         calls: AtomicU64,
     }
 
     impl Scripted {
         fn new(rows: Vec<MacInputs>) -> Box<Self> {
+            Self::with_enabled(true, rows)
+        }
+
+        /// The same prober reporting `l4.enabled` as `enabled` (the production
+        /// prober copies it from the config).
+        fn with_enabled(enabled: bool, rows: Vec<MacInputs>) -> Box<Self> {
             Box::new(Self {
+                enabled,
                 rows: Mutex::new(rows),
                 calls: AtomicU64::new(0),
             })
@@ -352,7 +523,7 @@ mod tests {
                 rows[0].clone()
             };
             ProbeInputs {
-                enabled: true,
+                enabled: self.enabled,
                 platform: Platform::Macos,
                 mac: Some(mac),
                 linux: None,
@@ -521,6 +692,64 @@ mod tests {
             ..report
         };
         assert_eq!(startup_line(&off), None);
+    }
+
+    /// Plan P1b.10 (Architect's call): with `l4.enabled: false` the request is
+    /// `cannot_prompt` with the L4-off literal; no progress is recorded and the
+    /// report still says `enabled: false`.
+    #[test]
+    fn request_with_l4_off_is_cannot_prompt() {
+        let now = Arc::new(AtomicU64::new(0));
+        let clock_now = Arc::clone(&now);
+        let state = PrivilegeState::with_prober(
+            &PrivilegeConfig {
+                enabled: false,
+                ..cfg()
+            },
+            Scripted::with_enabled(false, vec![row6()]),
+            Arc::new(move || clock_now.load(Ordering::SeqCst)),
+        );
+
+        let outcome = state.request();
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        assert_eq!(outcome.outcome.as_str(), "cannot_prompt");
+        assert_eq!(
+            outcome.message,
+            "L4 is off in this core's config (l4.enabled)"
+        );
+        assert!(!outcome.privilege.enabled);
+        assert_eq!(outcome.privilege.request, None, "nothing was attempted");
+        assert_eq!(state.report().request, None);
+    }
+
+    /// The default requester, before P1b.11/P1b.14: `cannot_prompt` carrying
+    /// the row's own remedy label, recorded as a `failed` request. Row 2 is
+    /// `already_available` without touching it.
+    #[test]
+    fn platform_requester_answers_cannot_prompt_with_the_label() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(300, Ordering::SeqCst);
+        let outcome = state.request();
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            outcome.message,
+            "Install the Aitmproxy app (DMG or Homebrew cask); it asks macOS for \
+             packet-capture permission"
+        );
+        assert_eq!(
+            outcome.privilege.request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 300,
+                message: outcome.message.clone(),
+            })
+        );
+
+        let (state, _now) = state_over(vec![row2()]);
+        let outcome = state.request();
+        assert_eq!(outcome.outcome, Outcome::AlreadyAvailable);
+        assert_eq!(outcome.outcome.as_str(), "already_available");
+        assert_eq!(outcome.privilege.request, None);
     }
 
     #[test]

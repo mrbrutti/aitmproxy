@@ -30,6 +30,7 @@ pub mod craft;
 pub mod flow;
 pub mod inject;
 pub mod intercept;
+pub mod privilege;
 pub mod scope;
 pub mod sendrecv;
 
