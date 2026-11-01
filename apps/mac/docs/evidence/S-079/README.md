@@ -8,7 +8,7 @@ Before (main 345bedd), one process, 2026-11-01 ~19:01:
 - `before-flows-new-row-missing-4s.png` — Flows page: a curl parked 4 s earlier (bar "1 paused …/d", sidebar Flows 4) and the list still shows three rows.
 - `before-flows-resume-not-drawn-4s.png` — Flows page: 4 s after Resume All the bar is clear, the status bar says "0 / 4 rows", the list still shows three rows.
 
-After (this PR), 2026-11-01 19:06:
-- `after-flows-parked-190626.png` — 19:06:26: the first curl parks and its row appears.
-- `after-flows-resume-2s-190630.png` — 19:06:30, two seconds after Flow ▸ Resume: row 1 reads 404 · 3.84 s · 460 B with the Edited pencil, and the second curl's row (`/b`, Paused) is already drawn; no page switch.
-- `after-flows-12s-190641.png` — 19:06:41: unchanged, nothing lagging.
+After (this PR), 2026-10-31 19:20–19:21 PDT, one process, each frame distinct (a third request is parked at +10 s so the late frame differs from the earlier one):
+- Flows page: `after-flows-1-parked.png` (19:20:33, `/flows-a` parked), `after-flows-2-resume-plus-2s.png` (19:20:39, two seconds after Flow ▸ Resume: row 1 reads 404 · 5.00 s · 460 B with the Edited pencil, row 2 `/flows-b` Paused already drawn), `after-flows-3-at-12s-third-park.png` (19:20:50, row 3 `/flows-c` Paused appears). No page switch.
+- Apps page, same sequence: `after-apps-1-parked.png` (19:21:00), `after-apps-2-resume-plus-2s.png` (19:21:05, `/apps-a` 404 + pencil, `/apps-b` Paused), `after-apps-3-at-12s-third-park.png` (19:21:16, `/apps-c` appears).
+- The live self-test additionally pins the mechanism: a warm `visibleRows` cache must still register the dependency on `rows` and on `details` (`withObservationTracking`), checked against a real request and a real `flow.detail`.

@@ -34,7 +34,10 @@ struct FlowRowEqualityTests {
             ("request bytes", { $0.requestBytes = 12 }),
             ("comment", { $0.comment = "seen" }),
             ("mark", { $0.mark = .red }),
-            ("scope", { $0.inScope = !$0.inScope }),
+            ("scope", { $0.inScope.toggle() }),
+            ("WebSocket frame counts", { $0.wsFrames = (sent: 3, received: 1) }),
+            ("L4 packet count", { $0.l4 = L4RowInfo(proto: .tcp, sessionState: .capture, target: "10.0.0.1:443", packetCount: 7, injectedCount: 0, inScope: true) }),
+            ("seq after a Clear", { $0.seq = 1 }),
         ]
         for (name, mutate) in mutations {
             var changed = parked
@@ -44,8 +47,11 @@ struct FlowRowEqualityTests {
         }
         // The resumed row as the poll rebuilds it: state, status, duration, sizes and the pencil at once.
         var resumed = parked
-        resumed.state = .complete; resumed.status = 404; resumed.duration = .milliseconds(3_840)
-        resumed.responseBytes = 460; resumed.edited = true
+        resumed.state = .complete
+        resumed.status = 404
+        resumed.duration = .milliseconds(3_840)
+        resumed.responseBytes = 460
+        resumed.edited = true
         #expect(resumed != parked)
     }
 

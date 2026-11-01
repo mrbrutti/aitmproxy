@@ -2,7 +2,7 @@
 
 Bugs found after the fact, with the rule each one taught. Newest first.
 
-## 2026-11-01 — The Flows page stopped redrawing after intercept was armed
+## 2026-10-31 — The Flows page stopped redrawing after intercept was armed
 
 Symptom: on the installed v0.5.6, Flows page, a parked row kept reading `Paused`
 after Resume and new rows never appeared, for as long as you watched, while the
