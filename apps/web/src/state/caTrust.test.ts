@@ -2,9 +2,9 @@
 // and the words they render, then the store's wiring of them.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMockBus } from '~/bus/mock';
-import type { BusClient, ToolDef } from '~/bus/types';
+import type { BusClient } from '~/bus/types';
 import { createAppStore } from './app';
+import { memoryBus, tick } from './bridgeBus.testkit';
 import { caInstallArgs, caPillWord, isCACancelled, isCATrustTool, parseCATrust, type CATrustStatus } from './caTrust';
 
 /** `ca.status` as the core answers it on a Mac with the CA in the login keychain and trusted. */
@@ -109,25 +109,19 @@ describe('isCATrustTool', () => {
 
 // ---- store wiring --------------------------------------------------------------------------
 
-/** The mock bus with `ca.status` answering the core's real shape, optionally without the tool at all. */
+/** The in-memory bus with `ca.status` answering the core's real shape, optionally without the tool at all. */
 function caBus(reply: () => unknown, opts: { withTool?: boolean } = {}): BusClient & { reads: () => number } {
-  const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
+  const mem = memoryBus(opts.withTool === false ? {} : { extraTools: ['ca.status'] });
   let reads = 0;
   return {
-    ...mock,
-    address: '127.0.0.1:8082',
-    onNotification: () => () => {},
+    ...mem,
     reads: () => reads,
-    async tools(): Promise<ToolDef[]> {
-      const list = await mock.tools();
-      return opts.withTool === false ? list.filter((t) => t.name !== 'ca.status') : list;
-    },
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
       if (tool === 'ca.status') {
         reads++;
         return reply() as T;
       }
-      return mock.call<T>(tool, args);
+      return mem.call<T>(tool, args);
     },
   };
 }
@@ -137,7 +131,6 @@ const start = (bus: BusClient) => {
   open.push(bus);
   return createAppStore(bus);
 };
-const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
 
 beforeEach(() => {
   vi.useFakeTimers();
