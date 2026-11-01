@@ -32,20 +32,24 @@
 #   FAILED_BOUND   5 s   T3: kill -KILL → `bus failed`
 #   ACTION_BOUND  10 s   one menu click → `capturing` flips (measured from the click)
 #   MENU_BOUND     5 s   a menu item's title settles (Pause/Resume Proxy) before its one click
-#   QUIT_BOUND    15 s   ⌘Q → app gone
+#   QUIT_BOUND    15 s   quit Apple Event → app gone
+#   QUIT_SLEEP   0.2 s   between app-gone checks, and once before the post-quit core check
 #
 # Hygiene (BR-AC8): nothing is written to the defaults domain; no path under the operator's
 # install or store directories appears here; the operator token is read from the 0600 config
 # into a variable, handed to python3 as an argv item and never printed; the only process reap
 # is by this bundle's own core path; a SIGTERM to the app would skip its AppKit teardown, so the
-# app is quit via ⌘Q and the reap is the fallback.
+# app is quit by a `quit` Apple Event addressed to the dev bundle's path (never a ⌘Q typed at
+# whatever happens to be frontmost on the operator's desktop) and the reap is the fallback.
 #
 # Output: one `reconnect-live: <trigger>: <what was observed>` line per step (build, launch,
 # reconnect-bus, restart-core, crash-respawn, teardown); the last line is
 #   RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn: an operator action through the app succeeded after each)
 # and exit 0, or `RECONNECT LIVE SELFTEST FAIL: <trigger> <step> <detail>` and exit 1 at the
 # first unmet bound, or `RECONNECT LIVE SELFTEST FAIL: setup <detail>` and exit 2 on a rig
-# problem (build, no core, no Accessibility), so a broken rig is distinguishable from the bug.
+# problem (build, no core bundled, DEV_TAG/CORE_DIR validation, store refusal, no Accessibility,
+# stale core, winshot), so a broken rig is distinguishable from the bug. The launch-time "no
+# embedded core within 20 s" stays exit 1: the embedded path failing to spawn is a product failure.
 set -u
 zmodload zsh/datetime
 
@@ -66,7 +70,8 @@ CONNECT_BOUND=20   # trigger → `bus: connected`; T2/T3's respawn wait shares t
 FAILED_BOUND=5     # T3: kill -KILL → `bus failed`
 ACTION_BOUND=10    # one menu click → `capturing` flips
 MENU_BOUND=5       # a menu item's title settles (View ▸ Pause/Resume Proxy re-renders after the app handles its reply)
-QUIT_BOUND=15      # ⌘Q → app gone
+QUIT_BOUND=15      # quit Apple Event → app gone
+QUIT_SLEEP=0.2     # between app-gone checks, and once before the post-quit core check
 AX_SLEEP=0.1       # between AX reads; an osascript read itself takes ~100 ms, so reads land ≤ 250 ms apart
 BUS_SLEEP=0.5      # between proxy.status polls
 MENU_SLEEP=0.2     # between menu-item existence checks
@@ -81,7 +86,7 @@ AX_PILL='help of button 1 of group 1 of toolbar 1 of window "aitmproxy"'
 
 # Script state. The token variable is assigned in discover_child and read only by bus_json.
 app_pid=""; child_pid=""; core_cfg=""; bus_addr=""
-trigger=""; t0=$EPOCHREALTIME
+t0=$EPOCHREALTIME
 labels_seen=""; forbidden_seen=""; capturing_elapsed=""; quit_clean=""
 
 note() { print -r -- "reconnect-live: $*" }
@@ -93,7 +98,8 @@ elapsed() { printf '%.1f' $(( EPOCHREALTIME - t0 )) }
 # unchanged so a missing menu item fails loudly instead of being swallowed.
 se() { osascript -e "tell application \"System Events\" to tell process \"$exe\" to $1" }
 
-# menu_click <item> <menu>: the menu is the LAST menu bar item with that name, because the bar holds two items named "View" (the system one, "Enter Full Screen", and the app's CommandMenu("View")).
+# menu_click <item> <menu>: the menu is the LAST menu bar item with that name, because the bar
+# holds two items named "View" (the system one, "Enter Full Screen", and the app's CommandMenu("View")).
 menu_click() {
   local item=$1 menu=$2
   se 'set frontmost to true' >/dev/null || return 1
@@ -107,7 +113,8 @@ menu_click() {
 wait_menu_item() {
   local item=$1 menu=$2 bound=$3 start=$EPOCHREALTIME got
   while true; do  # bounded: gives up at start + bound (MENU_BOUND)
-    got=$(se "exists menu item \"$item\" of menu 1 of (item -1 of (menu bar items of menu bar 1 whose name is \"$menu\"))" 2>/dev/null) || got=""
+    got=$(se "exists menu item \"$item\" of menu 1 of (item -1 of (menu bar items of menu bar 1 whose name is \"$menu\"))" \
+      2>/dev/null) || got=""
     [[ $got == true ]] && return 0
     (( EPOCHREALTIME - start >= bound )) && return 1
     sleep $MENU_SLEEP
@@ -143,14 +150,14 @@ wait_label() {
   done
 }
 
-# discover_child <old_pid> <old_cfg>: until t0 + CONNECT_BOUND, find the embedded child by its
-# own command line (never "the newest config.yaml"): a pid other than old_pid whose --config
-# path differs from old_cfg, whose config exists and whose bus.endpoint beside it is non-empty.
-# Sets child_pid, core_cfg, bus_addr and the operator token (a variable only — never echoed,
-# never in a note, never in a file name). Re-run after every respawn: each spawn mints a new
-# config, new tokens and a new bus.endpoint.
+# discover_child <old_pid> <old_cfg> <trigger>: until t0 + CONNECT_BOUND, find the embedded child
+# by its own command line (never "the newest config.yaml"): a pid other than old_pid whose
+# --config path differs from old_cfg, whose config exists and whose bus.endpoint beside it is
+# non-empty. Sets child_pid, core_cfg, bus_addr and the operator token (a variable only — never
+# echoed, never in a note, never in a file name). Re-run after every respawn: each spawn mints a
+# new config, new tokens and a new bus.endpoint. <trigger> names the step in its FAIL lines.
 discover_child() {
-  local old_pid=$1 old_cfg=$2 pid cfg step=spawn
+  local old_pid=$1 old_cfg=$2 trig=$3 pid cfg step=spawn
   [[ -n $old_pid ]] && step=respawn
   local deadline=$(( t0 + CONNECT_BOUND ))
   child_pid=""; core_cfg=""; bus_addr=""
@@ -162,11 +169,12 @@ discover_child() {
       child_pid=$pid; core_cfg=$cfg
       bus_addr=$(head -1 "${core_cfg:h}/bus.endpoint" | tr -d '[:space:]')
       op_token=$(sed -n 's/^[[:space:]]*operator_token: "\(.*\)"/\1/p' "$core_cfg" | head -1)
-      [[ -n "$op_token" ]] || fail "$trigger $step the new core's config carries no mcp.operator_token"
-      [[ -n $bus_addr ]] || fail "$trigger $step bus.endpoint beside $core_cfg is empty"
+      [[ -n "$op_token" ]] || fail "$trig $step the new core's config carries no mcp.operator_token"
+      [[ -n $bus_addr ]] || fail "$trig $step bus.endpoint beside $core_cfg is empty"
       return 0
     done
-    (( EPOCHREALTIME >= deadline )) && fail "$trigger $step no embedded core under $dev (pid other than '${old_pid:-none}', new --config, non-empty bus.endpoint) within ${CONNECT_BOUND} s"
+    (( EPOCHREALTIME >= deadline )) && fail "$trig $step no embedded core under $dev" \
+      "(pid other than '${old_pid:-none}', new --config, non-empty bus.endpoint) within ${CONNECT_BOUND} s"
     sleep $BUS_SLEEP
   done
 }
@@ -175,7 +183,7 @@ discover_child() {
 # (observation only — never the action under test). Newline-delimited JSON-RPC: token line,
 # initialize, tools/call with empty arguments. Prints the result's structuredContent as JSON
 # when present, else the first content[].text; exits 1 on an RPC error or isError. The token
-# travels as an argv item and is never printed. Reused by proxy.status and scope.list reads.
+# travels as an argv item and is never printed. Serves the proxy.status reads (generic in the tool name).
 bus_json() {
   python3 - "$bus_addr" "$op_token" "$1" <<'PY'
 import json, socket, sys
@@ -244,25 +252,27 @@ operator_action() {
   base=$(bus_capturing)
   [[ $base != unknown ]] || fail "$trig baseline proxy.status over the bus at $bus_addr failed"
   if [[ $base != true ]]; then
-    wait_menu_item "Resume Proxy" View $MENU_BOUND || fail "$trig baseline the View menu has no Resume Proxy item"
-    menu_click "Resume Proxy" View || fail "$trig baseline the View menu has no Resume Proxy item"
+    wait_menu_item "Resume Proxy" View $MENU_BOUND || fail "$trig baseline the View menu did not show Resume Proxy within ${MENU_BOUND} s"
+    menu_click "Resume Proxy" View || fail "$trig baseline click on Resume Proxy failed"
     wait_capturing true $ACTION_BOUND || fail "$trig baseline capturing stayed false for ${ACTION_BOUND} s after one Resume Proxy click"
   fi
-  wait_menu_item "Pause Proxy" View $MENU_BOUND || fail "$trig pause the View menu has no Pause Proxy item"
-  menu_click "Pause Proxy" View || fail "$trig pause the View menu has no Pause Proxy item"
+  wait_menu_item "Pause Proxy" View $MENU_BOUND || fail "$trig pause the View menu did not show Pause Proxy within ${MENU_BOUND} s"
+  menu_click "Pause Proxy" View || fail "$trig pause click on Pause Proxy failed"
   wait_capturing false $ACTION_BOUND || fail "$trig pause capturing stayed true for ${ACTION_BOUND} s after one Pause Proxy click"
   pause_s=$capturing_elapsed
-  wait_menu_item "Resume Proxy" View $MENU_BOUND || fail "$trig resume the View menu has no Resume Proxy item"
-  menu_click "Resume Proxy" View || fail "$trig resume the View menu has no Resume Proxy item"
+  wait_menu_item "Resume Proxy" View $MENU_BOUND || fail "$trig resume the View menu did not show Resume Proxy within ${MENU_BOUND} s"
+  menu_click "Resume Proxy" View || fail "$trig resume click on Resume Proxy failed"
   wait_capturing true $ACTION_BOUND || fail "$trig resume capturing stayed false for ${ACTION_BOUND} s after one Resume Proxy click"
   note "$trig: Pause Proxy → proxy.status.capturing=false in ${pause_s} s; Resume Proxy → capturing=true in ${capturing_elapsed} s"
 }
 
 # shot <trigger>: the attached evidence, by pid (a tagged bundle keeps the display name Aitmproxy).
+# No PNG written is a rig problem (a screen-recording grant, `swift`), not the app's: exit 2, with
+# the trigger kept in the message. The trigger's own steps have already passed over the bus.
 shot() {
   local png="$shots/reconnect-$tag-$1.png"
   swift "$here/tools/winshot.swift" "$app_pid" "$png" >/dev/null 2>&1 && [[ -s $png ]] \
-    || fail "$1 shot winshot wrote no PNG at $png"
+    || setup_fail "$1 shot winshot wrote no PNG at $png (a screen-recording grant or swift problem)"
 }
 
 # after_trigger <trigger> [forbidden]: the sub-procedure after each trigger (spec D6).
@@ -279,23 +289,25 @@ after_trigger() {
   shot "$trig"
 }
 
-# quit_app: ⌘Q (the normal quit path, so willTerminate reaps the child), bounded wait, then
-# kill + a reap by this bundle's own core path as the fallback. quit_clean=1 when the app
-# left on its own and no core remained under the bundle path before the fallback ran.
+# quit_app: a `quit` Apple Event addressed to the dev bundle's path (the normal terminate path, so
+# willTerminate reaps the child; never a ⌘Q typed at whatever happens to be frontmost on the
+# operator's desktop), bounded wait, then kill + a reap by this bundle's own core path as the
+# fallback. quit_clean=1 when the app left on its own and no core remained under the bundle path
+# before the fallback ran.
 quit_app() {
   [[ -n $app_pid ]] || return 0
   local start=$EPOCHREALTIME
   quit_clean=""
-  if se 'set frontmost to true' >/dev/null 2>&1 && se 'keystroke "q" using command down' >/dev/null 2>&1; then
+  if osascript -e "tell application \"$dev\" to quit" >/dev/null 2>&1; then
     while kill -0 "$app_pid" 2>/dev/null; do  # bounded: gives up at start + QUIT_BOUND
       (( EPOCHREALTIME - start >= QUIT_BOUND )) && break
-      sleep 0.2
+      sleep $QUIT_SLEEP
     done
   fi
   if kill -0 "$app_pid" 2>/dev/null; then
     kill "$app_pid" 2>/dev/null
   else
-    sleep 0.5
+    sleep $QUIT_SLEEP
     pgrep -f "$core_pattern" >/dev/null || quit_clean=1
   fi
   pkill -f "$dev/Contents/Resources/core/" 2>/dev/null  # the only reap: this bundle's own core path
@@ -306,7 +318,6 @@ cleanup() { [[ -n $app_pid ]] && quit_app; return 0 }
 trap cleanup EXIT
 
 # 1. Build and assemble the dev bundle (snap-dev's bundle, scratch dir and staleness check).
-trigger=build
 [[ $tag =~ ^[A-Za-z0-9_-]+$ ]] || setup_fail "DEV_TAG must match [A-Za-z0-9_-]+"
 mkdir -p "$shots"
 if [[ -n $CORE_DIR ]]; then
@@ -335,9 +346,8 @@ stale=$(pgrep -f "$core_pattern" || true)
 #    APP_STORE and defaults to the embedded core, so nothing is written to the defaults domain).
 #    The bundle id's saved window state goes exactly as snap-dev does on a launch (window state,
 #    not the operator's store).
-trigger=launch
 rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState" "$store"
-mkdir "$store" || setup_fail "store $store already exists; refusing to launch"
+mkdir "$store" || setup_fail "something appeared at $store between its removal and the mkdir (snap-dev's race guard); refusing to launch"
 [[ ! -L $store && -O $store && -d $store ]] || setup_fail "store $store is not a directory we own; refusing to launch"
 unsetopt bg_nice
 t0=$EPOCHREALTIME
@@ -346,7 +356,7 @@ app_pid=$!
 
 # 3. Rendezvous: the embedded child, then `bus: connected` on the pill, both within CONNECT_BOUND
 #    of the launch.
-discover_child "" ""
+discover_child "" "" launch
 if ! wait_label "bus: connected" $CONNECT_BOUND 0; then
   [[ -n "$(ax_label)" ]] || setup_fail "System Events could not read the toolbar label (is Accessibility granted to the terminal app?)"
   fail "launch connect bus label never read 'bus: connected' within ${CONNECT_BOUND} s (saw: $labels_seen)"
@@ -355,7 +365,6 @@ note "launch: app pid $app_pid; embedded core pid $child_pid; bus: connected aft
 
 # 4. T1 reconnect-bus: Proxy ▸ Reconnect Bus; the core stays up, so the child pid must not change
 #    and the label must never read `bus failed` on the way back to `bus: connected` (BR-AC5).
-trigger=reconnect-bus
 old_pid=$child_pid
 t0=$EPOCHREALTIME
 menu_click "Reconnect Bus" Proxy || fail "reconnect-bus click the Proxy menu has no Reconnect Bus item"
@@ -366,33 +375,32 @@ note "reconnect-bus: child pid unchanged ($old_pid)"
 
 # 5. T2 restart-core: Proxy ▸ Restart Core; a new child (new pid, new --config, non-empty
 #    bus.endpoint; token and address re-read), then the sub-procedure.
-trigger=restart-core
 old_pid=$child_pid; old_cfg=$core_cfg
 t0=$EPOCHREALTIME
 menu_click "Restart Core" Proxy || fail "restart-core click the Proxy menu has no Restart Core item"
-discover_child "$old_pid" "$old_cfg"
+discover_child "$old_pid" "$old_cfg" restart-core
 note "restart-core: new core pid $child_pid after $(elapsed) s"
 after_trigger restart-core
 
 # 6. T3 crash-respawn: kill -KILL the child; the owner must report the real loss (`bus failed`
 #    within FAILED_BOUND, BR-AC4), then the supervisor respawns and the sub-procedure runs.
-trigger=crash-respawn
 old_pid=$child_pid; old_cfg=$core_cfg
 t0=$EPOCHREALTIME
 kill -KILL "$old_pid" || fail "crash-respawn kill kill -KILL $old_pid failed"
 wait_label "bus failed" $FAILED_BOUND 0 \
   || fail "crash-respawn failed-report bus label never read 'bus failed' within ${FAILED_BOUND} s of kill -KILL (saw: $labels_seen)"
 note "crash-respawn: bus failed seen $(elapsed) s after kill -KILL $old_pid"
-discover_child "$old_pid" "$old_cfg"
+discover_child "$old_pid" "$old_cfg" crash-respawn
 after_trigger crash-respawn
 
 # 7. Teardown: the normal quit path, then the verdict.
-trigger=teardown
 quit_app
 if [[ -n $quit_clean ]]; then
-  note "teardown: app quit via ⌘Q; no core left under the bundle path"
+  note "teardown: app quit on the quit Apple Event; no core left under the bundle path"
 else
-  note "teardown: app did not leave cleanly within ${QUIT_BOUND} s of ⌘Q (or a core remained); killed and reaped by the bundle path"
+  note "teardown: app did not leave cleanly within ${QUIT_BOUND} s of the quit Apple Event (or a core remained);" \
+    "killed and reaped by the bundle path"
 fi
-print -r -- "RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn: an operator action through the app succeeded after each)"
+print -r -- "RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn:" \
+  "an operator action through the app succeeded after each)"
 exit 0

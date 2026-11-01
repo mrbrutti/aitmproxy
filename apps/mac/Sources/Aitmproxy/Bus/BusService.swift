@@ -72,7 +72,9 @@ final class BusService: FlowActions {
     /// Connects (and keeps reconnecting with back-off) until `stop()`.
     func start() {
         stop()
-        runTask = Task { await run(generation: runGeneration) }
+        // Read now, not when the task first runs: the run's number is its own by construction.
+        let generation = runGeneration
+        runTask = Task { await run(generation: generation) }
     }
 
     func stop() {
@@ -144,7 +146,7 @@ final class BusService: FlowActions {
                 }
             }
             await client.disconnect()
-            // A superseded run owns nothing but its own socket: closing it was its last act.
+            // Closing the socket was a superseded run's last act: `self.client` may already be the new run's.
             guard owns() else { return }
             self.client = nil
             if Task.isCancelled { break }
@@ -161,6 +163,8 @@ final class BusService: FlowActions {
         refetch.reset()
         // However this connection ends — stop(), or a core that went away — no
         // connection means no traffic: a stale rate must not sit under a failed badge.
+        // This runs for a superseded run too, by design (spec D2): after a bare stop()
+        // nobody owns, and a new run's first tick re-reads both the rates and the CA fact.
         defer {
             session.upBytesPerSecond = 0
             session.downBytesPerSecond = 0
@@ -174,22 +178,30 @@ final class BusService: FlowActions {
             // banner) read `scopeHosts`, and a host added from the CLI or another client must
             // not leave them claiming an empty scope.
             await refreshScope()
+            // The next refresh reads `self.client`, which a later start() may already own: a
+            // superseded run's call would land a frame ahead of the new client's token line.
+            guard owns() else { return }
             // The proxy's recording state is the core's fact, not this client's memory: a pause
             // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
             // one poll, and a relaunch against an already-paused core starts out saying so.
             await refreshProxyStatus()
+            // Same: `refreshCAStatus` reaches the bus through `session.commandRunner`, which reads `self.client`.
+            guard owns() else { return }
             // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
             // 10th (about every 5 s), because each read spawns `security` per store on the core side.
             if tick % Self.caStatusEveryTicks == 0 { await session.refreshCAStatus() }
+            // From here the iteration is the owner's: the stop() that retired a superseded run is
+            // closing its socket, so whatever it still listed would only be dropped at the next guard.
+            guard owns() else { return }
             tick &+= 1
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
-            // A superseded run owns nothing but its own socket; even the refetch bookkeeping is the owner's.
+            // `FlowRefetchPolicy.shouldFetch` is `mutating`: even the first look at the cache below is a write, and the owner's.
             guard owns() else { return }
             for id in ids {
                 let cached = summaries[id]
                 guard refetch.shouldFetch(id, cached: cached) else { continue }
                 let json = try? await client.call("flow.get", ["id": .string(id.raw)])
-                // A superseded run owns nothing but its own socket; the cache is the owner's.
+                // The cache, the meter and the refetch bookkeeping are the owner's.
                 guard owns() else { return }
                 if let json, let summary = FlowSummary(json: json) {
                     // ↑ is what clients sent (request bodies), ↓ what came back (response
