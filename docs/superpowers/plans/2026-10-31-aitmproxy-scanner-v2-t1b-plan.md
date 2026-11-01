@@ -1426,6 +1426,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 
 **Amendments after Task 15 (orchestrator, 2026-11-01, cfba784b):** ruling: a `scan.map` job by an agent is NOT refused under `auto` (AC T1-4; Task 14's "but keep the policy check" sentence is struck; the worker's live policy re-check still stops any agent job when the operator pauses); `manual_check` runs on its own `ManualJob` (`JobCtx` over the same `JobClient`/budget/ladder, scratch `MemFlowStore`, point minted by the interim lane's `discover`); `scan.checks` with an unknown token is `invalid_profile`; `scan.sitemap` needs `job` or `target`; `ScannerPlugin::engine_cell()` added; the T1a test `filled_slots_register_no_extra_verb` becomes `filled_slots_register_the_v2_surface` (19 names). **Task 19 also relaxes `crates/aitm/tests/frontends.rs::scan_tools_have_non_empty_input_schemas`** for verbs whose D3 params are `{}` (`scan.profile.list`). `crawl::block_on` nests a runtime inside a current-thread runtime (pre-existing; the binary is multi-thread): Task 17 keeps the multi-thread runtime.
 
+**Amendments after Task 16 (orchestrator, 2026-11-01):** `discover_value` is replaced by `discover_value_from(&Discovery, &JobStatus, timed_out)` (points come from the job's `Discovery`, not the store); a seed with a path is reduced to its origin; `budget.time_s = min(profile, cfg.time_budget).max(1)` while the wait honours the configured budget exactly; `endpoints` are site-map node URLs (templated), `stopped_reason` uses the `StoppedReason` vocabulary plus `time_budget` (`left_scope` is gone), scope refusals are `scan: out_of_scope:`, single flight is per origin from the registry, the egress hold is the job's. Tasks 15 and 16 are one compile unit (`commands::register` is called from `ScannerPlugin::load`).
+
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
 (Task 14) and wave 5 (Task 15); `crates/aitm-plugin-scanner/Cargo.toml` in wave 1 (Task 3) and
@@ -1621,6 +1623,7 @@ Kept by the main session during stage 6. One row per finding.
 | T10-3 | T10 live run (external) | Important | Pre-existing: WS flows exposed no `request` to scripts, so `ws-cleartext-transport` and `ws-cross-site-hijack-indicator` never fired on live traffic | fixed in d2dda88a: handshake resolved from the store and projected as the script-visible request; `tests/ws_flow_view.rs` pins both scripts on real handshakes |
 | 14 | Coder (Task 15) | Important | `jobs::agent_gate` refuses an agent's `scan.map` under `auto`, contrary to AC T1-4 | fixed in 03158a6b |
 | 14 | Coder (Task 15) | Important | `trust_gate_scan` fails: `Caller::is_agent` deny-lists `Frontend::Mcp` instead of allow-listing trusted control | fixed in 03158a6b (`load_history` too) |
+| 14 | Coder (Task 16) | Important | `run_job` has no panic supervision: a panicking lane leaves the job in `cancelling` forever and its origin `busy` | fix dispatched 2026-11-01: the worker task is supervised; a panic ends the job `failed` with `stopped_reason: failed`, confinement dropped |
 
 ## Shipped
 
