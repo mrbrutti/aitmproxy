@@ -91,7 +91,7 @@ pub(crate) fn limits_for(opts: &CrawlOptions) -> Limits {
 /// fetched once), and the set of page fingerprints (so two URLs rendering the
 /// same page are extracted from once). It also records *why* work was refused,
 /// which the engine turns into a stop reason.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Frontier {
     queue: VecDeque<(Url, u32)>,
     visited: HashSet<String>,
@@ -173,6 +173,21 @@ impl Frontier {
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+}
+
+/// Counts only: a queued or visited URL may be a stored seed carrying its
+/// captured query string, and this type is one `tracing::debug!` away from a
+/// log line (spec D8.1 redaction rules, S-M3).
+impl fmt::Debug for Frontier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Frontier")
+            .field("queued", &self.queue.len())
+            .field("visited", &self.visited.len())
+            .field("fingerprints", &self.fingerprints.len())
+            .field("depth_hit", &self.depth_hit)
+            .field("dropped_full", &self.dropped_full)
+            .finish()
     }
 }
 
@@ -543,6 +558,27 @@ mod tests {
             assert_eq!(reason.as_str(), literal);
             assert_eq!(reason.to_string(), literal);
         }
+    }
+
+    /// S-M3: a frontier holds queued and visited URLs, and a stored seed
+    /// carries its captured query string; `Debug` prints counts only.
+    #[test]
+    fn frontier_debug_prints_counts_only() {
+        let limits = limits_for(&CrawlOptions::default());
+        let mut frontier = Frontier::new();
+        frontier.push(url("http://t/a?token=abc"), 0, &limits);
+        frontier.mark_visited(&url("http://t/cb?sid=S3"));
+        frontier.note_fingerprint(7);
+
+        let text = format!("{frontier:?}");
+
+        assert!(!text.contains("abc"), "{text}");
+        assert!(!text.contains("S3"), "{text}");
+        assert!(!text.contains("http"), "{text}");
+        assert_eq!(
+            text,
+            "Frontier { queued: 1, visited: 2, fingerprints: 1, depth_hit: false, dropped_full: 0 }"
+        );
     }
 
     #[test]
