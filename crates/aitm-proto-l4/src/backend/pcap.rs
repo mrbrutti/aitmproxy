@@ -26,7 +26,8 @@
 //! writes the IP packet through a header-included raw socket — the workaround
 //! scapy documents as `L3RawSocket`; every other interface and OS — macOS BPF
 //! does process injected frames — keeps `sendpacket`. The capability required is
-//! the same `CAP_NET_RAW`, so this widens no privilege.
+//! the same `CAP_NET_RAW`, so this widens no privilege. Linux loopback injection
+//! accepts Ethernet-framed IP only; an L3-first buffer is refused, never guessed.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -152,34 +153,57 @@ fn no_ip_packet() -> L4Error {
     L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string())
 }
 
-/// The IP packet inside `frame`: the bytes after a 14-byte Ethernet header whose
-/// ethertype is IPv4 (`0x0800`) or IPv6 (`0x86DD`), or `frame` itself when it
-/// already starts with an IP version nibble and is long enough to hold that
-/// version's fixed header. Anything else is [`no_ip_packet`].
+/// The IP packet inside an **Ethernet-framed** `frame`: the bytes after a 14-byte
+/// Ethernet header, accepted only when the ethertype, the IP version nibble and
+/// the IP header's own length field all agree with the bytes present:
+///
+/// - ethertype `0x0800`, version 4, at least 20 bytes, and an IPv4 total length
+///   between 20 and the bytes present; or
+/// - ethertype `0x86DD`, version 6, at least 40 bytes, and 40 + the IPv6 payload
+///   length no greater than the bytes present.
+///
+/// A total/payload length *below* the bytes present is Ethernet padding and is
+/// accepted; the whole remainder comes back and the kernel sends length bytes.
+///
+/// Anything else — including a buffer that already starts with an IP header — is
+/// [`no_ip_packet`]. An L3-first buffer is refused, never guessed: bytes 12..14 of
+/// an L3-first IPv4 packet are the top half of the source address, so sniffing
+/// them for an ethertype misread a packet from `8.0.0.0/16` as Ethernet-framed
+/// and routed it on padding (tester finding F1). Every producer in this repo
+/// writes Ethernet framing for Linux `lo` (libpcap reports `DLT_EN10MB` there),
+/// so nothing that worked is lost.
 fn strip_link_header(frame: &[u8]) -> Result<&[u8], L4Error> {
+    const ETHER_HEADER_LEN: usize = 14;
     const IPV4_HEADER_LEN: usize = 20;
     const IPV6_HEADER_LEN: usize = 40;
 
-    let is_ip_packet = |bytes: &[u8]| match bytes.first().map(|b| b >> 4) {
-        Some(4) => bytes.len() >= IPV4_HEADER_LEN,
-        Some(6) => bytes.len() >= IPV6_HEADER_LEN,
+    let Some(header) = frame.get(..ETHER_HEADER_LEN) else {
+        return Err(no_ip_packet());
+    };
+    let packet = &frame[ETHER_HEADER_LEN..];
+    let version = packet.first().map(|b| b >> 4);
+
+    let well_formed = match (&header[12..14], version) {
+        ([0x08, 0x00], Some(4)) if packet.len() >= IPV4_HEADER_LEN => {
+            let total_length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+            (IPV4_HEADER_LEN..=packet.len()).contains(&total_length)
+        }
+        ([0x86, 0xDD], Some(6)) if packet.len() >= IPV6_HEADER_LEN => {
+            let payload_length = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+            IPV6_HEADER_LEN + payload_length <= packet.len()
+        }
         _ => false,
     };
-
-    if frame.len() > 14 && matches!(&frame[12..14], [0x08, 0x00] | [0x86, 0xDD]) {
-        let packet = &frame[14..];
-        return is_ip_packet(packet)
-            .then_some(packet)
-            .ok_or_else(no_ip_packet);
-    }
-    is_ip_packet(frame)
-        .then_some(frame)
-        .ok_or_else(no_ip_packet)
+    well_formed.then_some(packet).ok_or_else(no_ip_packet)
 }
 
 /// The packet's own destination, read out of its IP header — IPv4 bytes 16..20,
 /// IPv6 bytes 24..40. Port 0: a raw `IPPROTO_RAW` socket routes on the header it
 /// is handed, the address only selects the route.
+///
+/// Only ever called on the output of [`strip_link_header`], which has already
+/// checked the version nibble and that the header's length field fits the bytes
+/// present; the version and length guards here are a second, fail-closed line.
 fn ip_destination(packet: &[u8]) -> Result<SocketAddr, L4Error> {
     let ip = match packet.first().map(|b| b >> 4) {
         Some(4) if packet.len() >= 20 => {
@@ -344,16 +368,158 @@ mod tests {
         assert_eq!(packet.len(), frame.len() - 14);
     }
 
-    /// Pinned: a frame that is already an IP packet is passed through verbatim —
-    /// the stripper keys on the ethertype, not on a fixed offset.
+    /// Pinned (tester F1): a buffer that is already an IP packet is **refused**,
+    /// not passed through. Every producer writes Ethernet framing for Linux `lo`
+    /// (libpcap reports `DLT_EN10MB` there), so an L3-first buffer is not a
+    /// shape the loopback path ever has to guess at — and guessing from bytes
+    /// 12..14 is exactly what F1 broke.
     #[test]
-    fn strip_link_header_leaves_an_l3_first_frame_unchanged() {
+    fn strip_link_header_refuses_an_l3_first_frame() {
         let frame = ether_ipv4_udp_frame(40001, b"probe");
         let l3 = frame[14..].to_vec();
+        assert_eq!(
+            l3[0], 0x45,
+            "the L3-first buffer is a well-formed IPv4 packet"
+        );
 
-        let packet = strip_link_header(&l3).expect("an L3-first frame decodes");
+        assert_eq!(
+            strip_link_header(&l3).expect_err("an L3-first buffer is refused, never guessed"),
+            L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string())
+        );
+    }
 
-        assert_eq!(packet, &l3[..], "an L3-first frame is injected as it is");
+    /// Tester F1, the exact vectors: an L3-first IPv4 packet of 48 bytes from
+    /// `8.0.70.1` to `10.1.2.3` with a correct total length. Bytes 12..14 are
+    /// `08 00` — the top half of the **source** address — and the old stripper
+    /// read them as the IPv4 ethertype, shipped 34 of 48 bytes, and routed on
+    /// `69.69.69.69` read out of the padding. Now it is refused outright, so no
+    /// `ip_destination` is ever computed for it.
+    #[test]
+    fn an_l3_first_packet_is_refused_even_when_well_formed() {
+        let mut packet = vec![0x45; 48];
+        packet[2..4].copy_from_slice(&48u16.to_be_bytes()); // total length: all 48 bytes
+        packet[12..16].copy_from_slice(&[8, 0, 70, 1]); // source 8.0.70.1
+        packet[16..20].copy_from_slice(&[10, 1, 2, 3]); // destination 10.1.2.3
+        assert_eq!(
+            packet[12..14],
+            [0x08, 0x00],
+            "the source's top half is the IPv4 ethertype"
+        );
+        assert_eq!(
+            packet[14] >> 4,
+            4,
+            "and the misread 'packet' has a valid version nibble"
+        );
+        assert_eq!(
+            ip_destination(&packet[14..]).expect("what the old code would have routed on"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(69, 69, 69, 69)), 0),
+            "the misread destination the tester observed"
+        );
+
+        let err = strip_link_header(&packet).expect_err("an L3-first buffer is refused");
+
+        assert_eq!(
+            err,
+            L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string()),
+            "fail-closed: nothing is handed to ip_destination or send_to"
+        );
+    }
+
+    /// Tester F1: an ethertype that contradicts the version nibble behind it is
+    /// refused — `0x0800` over a version-6 header, `0x86DD` over a version-4
+    /// header. Each half alone would pass its own length check.
+    #[test]
+    fn strip_link_header_refuses_an_ethertype_version_mismatch() {
+        let refusal =
+            L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string());
+
+        let mut v6 = vec![0x60; 40];
+        v6[4..6].copy_from_slice(&0u16.to_be_bytes()); // payload length 0: well-formed IPv6
+        assert_eq!(
+            strip_link_header(&ether_frame([0x86, 0xDD], &v6)).expect("IPv6 behind 0x86DD"),
+            &v6[..]
+        );
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &v6)).expect_err("IPv6 behind 0x0800"),
+            refusal
+        );
+
+        let mut v4 = vec![0x45; 20];
+        v4[2..4].copy_from_slice(&20u16.to_be_bytes()); // total length 20: well-formed IPv4
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &v4)).expect("IPv4 behind 0x0800"),
+            &v4[..]
+        );
+        assert_eq!(
+            strip_link_header(&ether_frame([0x86, 0xDD], &v4)).expect_err("IPv4 behind 0x86DD"),
+            refusal
+        );
+    }
+
+    /// Tester F1: the IPv4 total length must fit the bytes present. A header
+    /// that claims more than the frame carries is refused (the kernel would send
+    /// total-length bytes and read past the buffer's end); one that claims less
+    /// — Ethernet padding behind a short datagram — is accepted, and the stripper
+    /// returns the whole remainder, leaving the kernel to send total-length bytes.
+    #[test]
+    fn strip_link_header_checks_the_ipv4_total_length_against_the_bytes_present() {
+        let refusal =
+            L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string());
+
+        let mut packet = vec![0x45; 48];
+        packet[16..20].copy_from_slice(&[127, 0, 0, 1]);
+
+        packet[2..4].copy_from_slice(&49u16.to_be_bytes()); // one more than is present
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &packet))
+                .expect_err("a total length past the end of the frame is refused"),
+            refusal
+        );
+        packet[2..4].copy_from_slice(&1500u16.to_be_bytes());
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &packet))
+                .expect_err("a total length far past the end is refused"),
+            refusal
+        );
+        packet[2..4].copy_from_slice(&19u16.to_be_bytes()); // below the fixed header
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &packet))
+                .expect_err("a total length under 20 is refused"),
+            refusal
+        );
+
+        packet[2..4].copy_from_slice(&48u16.to_be_bytes()); // exactly the bytes present
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &packet)).expect("an exact total length"),
+            &packet[..]
+        );
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes()); // 20 bytes of trailing padding
+        assert_eq!(
+            strip_link_header(&ether_frame([0x08, 0x00], &packet))
+                .expect("a total length under the bytes present is padding"),
+            &packet[..],
+            "the whole remainder comes back; the kernel sends total-length bytes"
+        );
+
+        // The IPv6 twin: 40 + payload length must fit the bytes present.
+        let mut v6 = vec![0x60; 48];
+        v6[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        v6[4..6].copy_from_slice(&9u16.to_be_bytes()); // 40 + 9 = 49 > 48
+        assert_eq!(
+            strip_link_header(&ether_frame([0x86, 0xDD], &v6))
+                .expect_err("an IPv6 payload length past the end is refused"),
+            refusal
+        );
+        v6[4..6].copy_from_slice(&8u16.to_be_bytes()); // 40 + 8 = 48: exact
+        assert_eq!(
+            strip_link_header(&ether_frame([0x86, 0xDD], &v6)).expect("an exact payload length"),
+            &v6[..]
+        );
+        v6[4..6].copy_from_slice(&0u16.to_be_bytes()); // 8 bytes of trailing padding
+        assert_eq!(
+            strip_link_header(&ether_frame([0x86, 0xDD], &v6)).expect("padding behind IPv6"),
+            &v6[..]
+        );
     }
 
     /// Pinned fail-closed: a buffer too short to be either an Ethernet frame or an
@@ -426,37 +592,55 @@ mod tests {
         );
     }
 
-    /// Tester (edge cases): an L3-first packet of exactly the fixed header
-    /// length — 20 bytes of IPv4, 40 of IPv6 — is accepted whole, and one byte
-    /// less is refused. That boundary is what decides whether `ip_destination`
-    /// can read bytes 16..20 / 24..40 at all.
+    /// Tester (edge cases, re-pinned for F1): an Ethernet-framed packet of
+    /// exactly the fixed header length — 20 bytes of IPv4, 40 of IPv6 — is
+    /// accepted whole, and one byte less is refused. That boundary is what
+    /// decides whether `ip_destination` can read bytes 16..20 / 24..40 at all.
+    /// The same bytes without the Ethernet header are refused: the loopback
+    /// path accepts Ethernet-framed IP only.
     #[test]
     fn strip_link_header_accepts_a_header_sized_packet() {
+        let refusal =
+            L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string());
+
         let mut v4 = vec![0x45; 20];
+        v4[2..4].copy_from_slice(&20u16.to_be_bytes());
         v4[16..20].copy_from_slice(&[127, 0, 0, 1]);
         assert_eq!(
-            strip_link_header(&v4).expect("a 20-byte IPv4 packet is an IP packet"),
+            strip_link_header(&ether_frame([0x08, 0x00], &v4))
+                .expect("a 20-byte IPv4 packet behind an Ethernet header is an IP packet"),
             &v4[..]
         );
         assert!(
-            strip_link_header(&v4[..19]).is_err(),
+            strip_link_header(&ether_frame([0x08, 0x00], &v4[..19])).is_err(),
             "19 bytes is one short of an IPv4 header"
+        );
+        assert_eq!(
+            strip_link_header(&v4).expect_err("the same 20 bytes L3-first are refused"),
+            refusal
         );
 
         let mut v6 = vec![0x60; 40];
+        v6[4..6].copy_from_slice(&0u16.to_be_bytes());
         v6[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let framed = ether_frame([0x86, 0xDD], &v6);
         assert_eq!(
-            strip_link_header(&v6).expect("a 40-byte IPv6 packet is an IP packet"),
-            &v6[..],
-            "an L3-first IPv6 packet of exactly the header length is injected as it is"
+            strip_link_header(&framed)
+                .expect("a 40-byte IPv6 packet behind an Ethernet header is an IP packet"),
+            &v6[..]
         );
         assert_eq!(
-            ip_destination(strip_link_header(&v6).expect("decode")).expect("the IPv6 destination"),
+            ip_destination(strip_link_header(&framed).expect("decode"))
+                .expect("the IPv6 destination"),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
         );
         assert!(
-            strip_link_header(&v6[..39]).is_err(),
+            strip_link_header(&ether_frame([0x86, 0xDD], &v6[..39])).is_err(),
             "39 bytes is one short of an IPv6 header"
+        );
+        assert_eq!(
+            strip_link_header(&v6).expect_err("the same 40 bytes L3-first are refused"),
+            refusal
         );
     }
 
@@ -479,10 +663,12 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 11, 12, 13)), 0),
             "bytes 16..20 hold the destination whatever the IHL"
         );
+        packet[2..4].copy_from_slice(&32u16.to_be_bytes());
         assert_eq!(
-            strip_link_header(&packet).expect("an L3-first packet with options"),
+            strip_link_header(&ether_frame([0x08, 0x00], &packet))
+                .expect("an Ethernet-framed packet with options"),
             &packet[..],
-            "options do not make it a link-layer frame"
+            "options change nothing about where the link header ends"
         );
     }
 
@@ -505,14 +691,12 @@ mod tests {
         assert_eq!(ip_destination(&[0x00; 64]).expect_err("version 0"), refusal);
     }
 
-    /// Tester (known limit, finding F1): `strip_link_header` guesses whether a
-    /// buffer carries a link header by reading bytes 12..14 as an ethertype, and
+    /// Tester finding F1 (fixed): the old `strip_link_header` guessed whether a
+    /// buffer carried a link header by reading bytes 12..14 as an ethertype, and
     /// in an L3-first IPv4 packet those bytes are the first half of the **source
-    /// address**. A packet from `8.0.x.x` therefore looks Ethernet to the
-    /// stripper. On the loopback path this PR adds it still fails closed — byte
-    /// 14 of such a packet is the first octet of the destination, `127` for
-    /// loopback, which is no IP version — so nothing wrong reaches the wire; the
-    /// finding is that the caller's DLT, not the buffer's content, should decide.
+    /// address**. A packet from `8.0.x.x` therefore looked Ethernet to it. This
+    /// vector happened to fail closed even then (byte 14 is `127`, no IP
+    /// version); it stays refused now because every L3-first buffer is.
     #[test]
     fn an_l3_first_packet_whose_source_looks_like_an_ethertype_fails_closed() {
         let mut packet = vec![0x45; 28];
