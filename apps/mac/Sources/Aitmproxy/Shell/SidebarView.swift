@@ -32,7 +32,7 @@ struct SidebarView: View {
                         let visible = session.clients.filter { matches($0.0.name) }
                         if querying, visible.isEmpty { hint("No match") }
                         ForEach(visible, id: \.0) { client, count in
-                            subItem(.client(client.name), title: client.name, monogram: client.monogram, count: count,
+                            subItem(.client(client.groupKey), title: client.name, monogram: client.monogram, count: count,
                                     page: .apps, bundleID: client.bundleID)
                         }
                     }
@@ -50,7 +50,7 @@ struct SidebarView: View {
                     }
                     ForEach(session.pins.apps.filter(matches), id: \.self) { app in
                         subItem(.client(app), title: app, monogram: String(app.prefix(1)),
-                                count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
+                                count: session.clients.first { $0.0.groupKey == app }?.1, page: .pinned)
                     }
                     if session.page == .pinned, session.pins.isEmpty {
                         hint("Nothing pinned — press ⇧P on a row.")

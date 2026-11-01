@@ -4,19 +4,25 @@ import Foundation
 /// Pure, so it is unit-tested with literal rows; `Session.clients` and `Session.hosts(forClient:)`
 /// are one-line calls into it.
 public enum ClientTree {
-    /// One entry per distinct `ClientInfo` value (one identifier ⇒ one group, since `bundleID` is
-    /// in the hash), most flows first, then by display name, then by `groupKey` so two
-    /// "(Service)" rows of one owner order deterministically. Rows with no client are skipped.
+    /// One entry per distinct `groupKey` (the same key `hosts(forClient:)`, `FlowQuery`, `Pins`
+    /// and the Overview group on), carrying the first row's `ClientInfo` for that key; most flows
+    /// first, then by display name, then by `groupKey` so two "(Service)" rows of one owner order
+    /// deterministically. Rows with no client are skipped.
     public static func clients(in rows: [FlowRow]) -> [(ClientInfo, Int)] {
-        var counts: [ClientInfo: Int] = [:]
+        var first: [String: ClientInfo] = [:]
+        var counts: [String: Int] = [:]
         for row in rows {
-            if let client = row.client { counts[client, default: 0] += 1 }
+            guard let client = row.client else { continue }
+            let key = client.groupKey
+            if first[key] == nil { first[key] = client }
+            counts[key, default: 0] += 1
         }
-        return counts.sorted { lhs, rhs in
-            if lhs.value != rhs.value { return lhs.value > rhs.value }
-            if lhs.key.name != rhs.key.name { return lhs.key.name < rhs.key.name }
-            return lhs.key.groupKey < rhs.key.groupKey
-        }
+        return counts.compactMap { key, count in first[key].map { ($0, count) } }
+            .sorted { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                if lhs.0.name != rhs.0.name { return lhs.0.name < rhs.0.name }
+                return lhs.0.groupKey < rhs.0.groupKey
+            }
     }
 
     /// The authorities the app with group key `key` talked to, most flows first, then by host.

@@ -248,7 +248,7 @@ func toggleExpanded(_ key: String)
 
 | Thing | Today | After |
 |---|---|---|
-| `Session.clients` group (`Session.swift:343`) | `ClientInfo` hash (name + monogram + bundleID + pid) | unchanged: still the `ClientInfo` value; because `bundleID` is in the hash and every live client carries one, one identifier ⇒ one group and two identifiers ⇒ two groups even with equal names. Tie-break sort by `name` (display name) |
+| `Session.clients` group (`Session.swift:343`) | `ClientInfo` hash (name + monogram + bundleID + pid) | **amended 2026-11-01 (Tester I-2 ruling):** grouped by `groupKey`, the group's `ClientInfo` being the first row's (the same first-row rule as `OverviewBreakdowns.clients`), so an imported row and a live row sharing one identifier under two names make ONE Apps row and the AI-AC20 invariant holds; the earlier "still the `ClientInfo` value" wording let two names split one identifier |
 | Apps count (`SidebarView.swift:30`) | `session.clients.count` | unchanged: distinct apps |
 | App row narrowing (`FlowGroup.client`) | the name | the **group key** `client.groupKey` (= `bundleID ?? name`) |
 | Domain-under-app narrowing | — | `.clientHost(client: key, host: authority)`; count = that app's flows to that host; the counts under an app sum to the app's count |
@@ -431,5 +431,6 @@ The Kit gains a pure `AppIdentifier` (candidate prefixes, ad-hoc trimming, a tin
 
 ## Amendments after approval
 
+- 2026-11-01 (Kit-half Tester I-2; architect ruling, self-approved): D4's `Session.clients` row — groups are keyed by `groupKey` with the first row's `ClientInfo`, not by the `ClientInfo` value; `ClientTree.clients(in:)` amended to match, pinned by a `ClientTreeTests` case.
 - 2026-11-01 (orchestrator ruling at the start of implementation; self-approved, autonomous mode): branch `feat/mac-app-icons-and-names` off `main 681dff57` (PR #265 merged); gate 2 = `c3a4fd37` (#249), gate 4 = `681dff57`. **Folded in** (PR #265 quality Q10 follow-up): D9's token row gains two siblings, `glyph.network` (`network` / `network` / `⇅`) and `glyph.apps` (`app.badge` / `layout-grid` / `▦`), and `Shell/RouteBanner.swift` reads its two glyph literals from `Tok.Glyph.network` / `Tok.Glyph.apps` — rendered symbols unchanged; plan Task 4. Tasks 5/6 additionally wait for system-proxy PR 4 (owner of the `BusService` poll loop).
 - 2026-11-01 (stage-6 fix pass on docs PR #242, spec + quality panel; self-approved, autonomous mode): base `main 8e19c2e3`; PR B recorded as merged (PR #195 `3fe92f66`, v0.5.9) and D7's "PR B is not released" corrected; `Session.swift` citations by symbol (`Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408); D5's `subItem` call matches the plan's `@ViewBuilder mark:` signature (`mark: { Monogram(text: "◎") }`); the `exec` icon remark labelled unverified; AI-AC23's scratch path = the plan's (`test-build-icons`); PR shape stated: two PRs from this branch, traffic-route first, this second (plan gate 4; Tasks 5/6 after the traffic-route plan's Tasks 2/2b on the shared `Session.swift` / `BusService.swift`).

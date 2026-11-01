@@ -31,6 +31,23 @@ import Testing
         #expect(clients.map(\.0.name) == ["Google Chrome", "Google Chrome (Service)", "Google Chrome (Service)"])
     }
 
+    /// Tester finding I-2: two clients with one identifier but different names (a row renamed by
+    /// the resolver after an earlier row settled) are one app, named by the first row.
+    @Test func clientsWithOneIdentifierAndTwoNamesAreOneApp() {
+        let rows = [
+            row("K1", 1, "example.com", ClientInfo(name: "Chrome", bundleID: "com.google.Chrome")),
+            row("K2", 2, "example.com", ClientInfo(name: "Google Chrome", bundleID: "com.google.Chrome")),
+            row("K3", 3, "www.apple.com", ClientInfo(name: "Google Chrome", bundleID: "com.google.Chrome")),
+        ]
+        let clients = ClientTree.clients(in: rows)
+        #expect(clients.count == 1)
+        #expect(clients.map(\.0.groupKey) == ["com.google.Chrome"])
+        #expect(clients.map(\.0.name) == ["Chrome"])
+        #expect(clients.map(\.1) == [3])
+        #expect(ClientTree.hosts(forClient: "com.google.Chrome", in: rows).map { "\($0.0):\($0.1)" }
+            == ["example.com:2", "www.apple.com:1"])
+    }
+
     @Test func hostsUnderAnAppSumToItsCount() {
         let safari = ClientInfo(name: "Safari", bundleID: "com.apple.Safari")
         let curl = ClientInfo(name: "curl", bundleID: "com.apple.curl")

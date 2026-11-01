@@ -716,6 +716,12 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | 4 | Coder (noticed) | Minor | `apps/web/src/components/Icon.tsx` has no Lucide entry for `glyph.network.web = "network"`; nothing generates from `glyph.web`, so no gate breaks | follow-up (web), listed in Shipped |
 | 4 | Coder (noticed) | Minor | `Shell/SidebarView.swift` still holds `AppMark` (uses `NSRunningApplication`) | Task 5 replaces it with `ClientMark` as planned (waits for system-proxy PR 4) |
 | 7 | Coder (noticed) | Minor | two stale "gallery" words remain in KIT.md's token tables (`Tok.Ground.surface` "the gallery ground", section role "gallery section labels"), outside Task 7's three parts | follow-up docs sweep, listed in Shipped |
+| Kit half | Tester | Important | I-1 — `Shell/SidebarView.swift:35` and `:52` still build `.client(client.name)` while `FlowQuery` matches `.client(key)` against `groupKey`: in a build of this range an Apps row lists nothing and `isPinned(.client(name))` disagrees with key-stored pins | orchestrator GRANTED 2026-11-01 a two-token interim claim on `Shell/SidebarView.swift` (the `.client(client.name)` group at line 35 → `.client(client.groupKey)`; the pinned-app count lookup `$0.0.name == app` at the line-52 call site → `$0.0.groupKey == app`; nothing else in the file; observe-lane Task 13 re-merges over it); done by the orchestrating session in the I-1/I-2 fix commit; Task 5 still owns the rest of the file |
+| Kit half | Tester | Important | I-2 — `ClientTree.clients(in:)` grouped by the `ClientInfo` value while every other consumer groups by `groupKey` (two names under one identifier ⇒ two Apps rows, Overview 1) | ruled 2026-11-01 (architect): group by `groupKey`, first row's `ClientInfo`; spec D4 amended; fixed by the Task 2 coder + one pin test (SHA in the next commit) |
+| Kit half | Tester | Minor | M-1 — `sanitized` caps after trimming so a trailing space can survive the cap | accepted: spec-conformant; noted |
+| Kit half | Tester | Minor | M-2 — PR B's `ClientInfo.knownSourceApps` still names `com.apple.WebKit.Networking` "Safari" for one poll / imported rows (anti-goal 1); `Flow.swift` is do-not-touch | accepted for this PR; follow-up in Shipped (core/PR B table) |
+| Kit half | Tester | Minor | M-3 — glyph string literals remain in `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` (outside the Q10 fold) | accepted; follow-up in Shipped (token sweep) |
+| Kit half | Tester | Minor | M-4 — `ClientMark` / `AppIdentityResolver` unreferenced until Tasks 5/6 | by construction (plan waves); no action |
 
 ## Shipped
 
@@ -725,4 +731,6 @@ Pre-filled 2026-11-01 — follow-ups accepted during implementation, each a smal
 
 1. Web: add a Lucide mapping for `network` in `apps/web/src/components/Icon.tsx` (glyph.network.web; Task 4 noticed).
 2. KIT.md: drop the two stale "gallery" words in the token tables (Task 7 noticed).
-3. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.
+3. `Flow.swift` `knownSourceApps`: drop the `com.apple.WebKit.Networking → "Safari"` row so PR B's one-poll name matches `knownUnbundled` (Tester M-2; `Flow.swift` is do-not-touch here).
+4. Glyph-literal sweep: `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` → `Tok.Glyph.*` via gen-tokens (Tester M-3).
+5. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.
