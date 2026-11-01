@@ -6,6 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 description = "Scanner v2 shared data model: wire types, built-in profiles, lane/check traits. No I/O."
 
+[features]
+# The `testing` module's stubs (null client, job, host, check, lane and the
+# recording probe host). Off by default: a production build of the model carries
+# no test scaffolding. A consumer crate that wants the stubs in its own tests
+# enables it under `[dev-dependencies]`; inside this crate `cfg(test)` enables it
+# on its own, so the unit tests need no feature flag.
+testing = []
+
 [dependencies]
 # Flow identity, client, store and guard types: the model expresses its
 # references and traits in core's vocabulary and performs no I/O of its own.

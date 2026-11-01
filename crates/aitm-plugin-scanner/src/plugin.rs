@@ -86,7 +86,8 @@ mod tests {
     use aitm_scan_model::profile::ProfileTarget;
     use aitm_scan_model::traits::{Discovery, JobCtx, ProbeHost};
     use aitm_scan_model::vocab::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
+        CheckCost, CheckOrigin, CheckScope, Confidence, InsertionKind, Intensity, LaneKind,
+        Outcome, Technique,
     };
     use futures::future::BoxFuture;
 
@@ -139,6 +140,7 @@ mod tests {
                     technique: Technique::Passive,
                     severity: aitm_poc::Severity::Info,
                     confidence_max: Confidence::Tentative,
+                    scope: CheckScope::Point,
                     needs_baseline: false,
                     wants_traits: None,
                     targets_session: false,

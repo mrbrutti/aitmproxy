@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::FlowRef;
 use crate::vocab::{
-    CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, PointTrait,
-    Technique,
+    CheckCost, CheckOrigin, CheckScope, Confidence, InsertionKind, Intensity, LaneKind, Outcome,
+    PointTrait, Technique,
 };
 
 /// The largest excerpt [`Evidence::excerpt`] will produce, in bytes (spec D2).
@@ -56,6 +56,12 @@ pub struct CheckMeta {
     /// Whether the check may mutate `session`-trait points. No v2 check does.
     #[serde(default)]
     pub targets_session: bool,
+    /// How often the scheduler runs the check: per point, per node, per origin.
+    ///
+    /// Absent from a pre-T1b catalogue entry, which reads as
+    /// [`CheckScope::Point`] — once per insertion point.
+    #[serde(default)]
+    pub scope: CheckScope,
     /// The CWE this class maps to.
     #[serde(default)]
     pub cwe: Option<u32>,
@@ -168,6 +174,13 @@ pub struct Timing {
     pub slope: f32,
     /// Pearson correlation coefficient of the fit.
     pub r: f32,
+    /// Whether the check judged the fit a correlation (spec D8.2: a blind timing
+    /// technique may claim `firm` only after a correlated repeat).
+    ///
+    /// The check decides, not the reader of the evidence: it knows how many
+    /// repeats it ran and against which threshold. Absent means `false`.
+    #[serde(default)]
+    pub correlated: bool,
 }
 
 /// Response-length evidence for a boolean-blind technique.
@@ -274,6 +287,7 @@ mod tests {
             needs_baseline: false,
             wants_traits: None,
             targets_session: false,
+            scope: CheckScope::Point,
             cwe: Some(89),
             description: "A database error signature reveals the injected quote.".into(),
             remediation: Some("Use parameterised queries.".into()),
@@ -347,6 +361,89 @@ mod tests {
             );
             assert!(text.starts_with(&out), "{n} chars: excerpt is a prefix");
         }
+    }
+
+    /// Coordinator decision 4 (spec D4): `scope` is additive. A catalogue entry
+    /// written before T1b carries no `scope` key and reads as the per-point
+    /// default, so the scheduler keeps scheduling it once per insertion point.
+    #[test]
+    fn check_scope_defaults_to_point() {
+        let json = r#"{
+            "id": "sqli-error",
+            "name": "SQL injection (error-based)",
+            "class": "sqli",
+            "lanes": ["http"],
+            "kinds": ["query"],
+            "intensity": "medium",
+            "cost": "light",
+            "technique": "error",
+            "severity": "high",
+            "confidence_max": "firm",
+            "description": "A database error signature reveals the injected quote.",
+            "origin": {"kind": "native"}
+        }"#;
+
+        let meta: CheckMeta = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(meta.scope, CheckScope::Point);
+        assert_eq!(CheckScope::default(), CheckScope::Point);
+
+        assert_eq!(
+            serde_json::to_string(&CheckScope::Origin).expect("serializes"),
+            "\"origin\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckScope::Node).expect("serializes"),
+            "\"node\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CheckMeta>(
+                &serde_json::to_string(&CheckMeta {
+                    scope: CheckScope::Origin,
+                    ..meta.clone()
+                })
+                .expect("serializes")
+            )
+            .expect("deserializes")
+            .scope,
+            CheckScope::Origin
+        );
+    }
+
+    /// Coordinator decision 3 (spec D8.2, AC T3-4): a timing check records
+    /// whether the fit actually correlated, and evidence written before T1b
+    /// reads as "not correlated" rather than claiming a correlation it never had.
+    #[test]
+    fn timing_correlated_defaults_false() {
+        const WITHOUT: &str = r#"{
+            "requested_s": [1.0, 3.0],
+            "observed_ms": [1020, 3030],
+            "baseline_ms": [18, 19],
+            "slope": 1005.0,
+            "r": 0.999
+        }"#;
+
+        let timing: Timing = serde_json::from_str(WITHOUT).expect("deserializes");
+        assert!(!timing.correlated);
+
+        let with: Timing = serde_json::from_str(
+            r#"{
+            "requested_s": [1.0, 3.0],
+            "observed_ms": [1020, 3030],
+            "baseline_ms": [18, 19],
+            "slope": 1005.0,
+            "r": 0.999,
+            "correlated": true
+        }"#,
+        )
+        .expect("deserializes");
+        assert!(with.correlated);
+
+        let json = serde_json::to_string(&with).expect("serializes");
+        assert!(json.contains(r#""correlated":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Timing>(&json).expect("round trips"),
+            with
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@
 //! add methods to these traits **only with default bodies**. A lane or check track
 //! in flight is compiling against this file; a method without a default body
 //! breaks it, and this crate's version is the contract everyone pins.
+//!
+//! T1b added [`ProbeHost::client`], [`ProbeHost::shared`], [`ProbeHost::captured`],
+//! [`JobCtx::report_l4`], [`JobCtx::report_session_lost`] and [`Lane::validate`]
+//! (all default-bodied) on 2026-10-31.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +29,7 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 
 use crate::check::{CheckMeta, Verdict};
+use crate::job::L4Counters;
 use crate::point::{InsertionPoint, Payload, ProbeResponse, RawProbe, SiteNode};
 use crate::profile::{ProfileTarget, ScanProfile};
 use crate::session::SessionMaterial;
@@ -76,6 +81,13 @@ pub trait ProbeHost: Send + Sync {
     ///
     /// Errors when the budget is exhausted, the deadline has passed, the job was
     /// cancelled or the guard refused the destination.
+    ///
+    /// **Error-prefix convention.** A host that detects the job's session is
+    /// gone returns an error whose message starts with the literal
+    /// `scan: session_lost: `; the engine reads that prefix, sets
+    /// `JobStatus.session.lost` and, under `on_lost: stop`, ends the audit with
+    /// `stopped_reason: session_lost`. Any other message is an ordinary probe
+    /// error counted in `probes.errors`.
     fn probe<'a>(&'a self, payload: &'a Payload) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
 
     /// Send a request the check built itself, for checks that cannot express
@@ -109,6 +121,36 @@ pub trait ProbeHost: Send + Sync {
     /// check does return a vulnerable verdict, the engine can re-record exactly
     /// the flows that proved it (spec D5). Empty when the host held none.
     fn held_flows(&self) -> Vec<aitm_core::Flow>;
+
+    /// The job's budgeted client, for a bridge that must route a send the host
+    /// cannot express as a payload at a point — a Rhai check calling
+    /// `http.send` runs through this client, so scope, rate, marks and the
+    /// record policy still apply (spec D9.3).
+    ///
+    /// `None` by default: a host that cannot lend its client out makes the
+    /// bridge fall back to refusing the send rather than sending unbudgeted.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        None
+    }
+
+    /// An owning handle to this host, for a bridge that must keep it alive past
+    /// the borrow it was handed — the scripting tier parks it in a thread-local
+    /// for the length of one check run (plan call B5, which is why no `unsafe`
+    /// is needed there).
+    ///
+    /// `None` by default: a host that is not behind an `Arc` has none to give.
+    fn shared(&self) -> Option<Arc<dyn ProbeHost>> {
+        None
+    }
+
+    /// The captured flow this point came from, for a passive check that must
+    /// read what was already observed and send nothing at all.
+    ///
+    /// `None` by default, and `None` for any point that was not built from a
+    /// captured flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
 }
 
 /// The engine-owned, per-job surface a [`Lane`] consumes (spec D5).
@@ -164,6 +206,22 @@ pub trait JobCtx: Send + Sync {
 
     /// The job's collision-resistant marker token (see [`ProbeHost::marker`]).
     fn marker(&self) -> String;
+
+    /// Report the L4 lane's running counters — cases sent, crashes, failed
+    /// liveness probes, retired elements. The engine folds them into
+    /// `JobStatus.l4`, which is how a UI shows fuzzing progress (spec D5).
+    ///
+    /// A no-op by default: a context that tracks no L4 counters ignores the
+    /// report, so an HTTP-only engine needs no change.
+    fn report_l4(&self, _counters: L4Counters) {}
+
+    /// Report that the job's session is gone, for a lane that detects auth loss
+    /// itself rather than through a probe error.
+    ///
+    /// The engine sets `JobStatus.session.lost` and, under `on_lost: stop`, ends
+    /// the audit with `stopped_reason: session_lost` (spec D7). A no-op by
+    /// default.
+    fn report_session_lost(&self) {}
 }
 
 /// What one lane's discovery pass found (spec D2).
@@ -191,6 +249,13 @@ pub trait Lane: Send + Sync {
     /// Reads already-captured flows, crawls, or both, depending on the profile.
     /// Returns an error only when the lane could do nothing at all; a partial
     /// discovery is a successful [`Discovery`] with what was found.
+    ///
+    /// **Error-prefix convention.** An error whose message starts with the
+    /// literal `invalid_profile: ` is a refusal of the profile, not a failure of
+    /// the pass: the engine fails the job with
+    /// `error: "scan: invalid_profile: <rest>"`. Prefer [`Lane::validate`],
+    /// which refuses before the job is spawned; this prefix is for a refusal the
+    /// lane can only reach once discovery has started.
     fn discover<'a>(
         &'a self,
         target: &'a ProfileTarget,
@@ -210,6 +275,19 @@ pub trait Lane: Send + Sync {
     /// The checks this lane ships. The engine filters them by profile; the lane
     /// returns all of them.
     fn checks(&self) -> Vec<Arc<dyn Check>>;
+
+    /// Refuse a profile this lane cannot run, before the job is spawned.
+    ///
+    /// The engine calls this for every lane a job would run and maps `Err(msg)`
+    /// to `scan: invalid_profile: <msg>` synchronously, so a caller learns its
+    /// profile is wrong from the `scan.start` call rather than from a job that
+    /// fails later (AC T5-3). A packet plan naming a non-fuzzable field such as
+    /// `ipv4.src` is the motivating case (spec D8.4).
+    ///
+    /// `Ok(())` by default: a lane with nothing to refuse needs no change.
+    fn validate(&self, _target: &ProfileTarget, _profile: &ScanProfile) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -217,217 +295,16 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
-    use aitm_core::{
-        BrowserDriver, FlowStore, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, ScopeRateGuard,
-        StdGuard,
-    };
     use futures::executor::block_on;
-    use futures::future::BoxFuture;
 
-    use crate::check::{CheckMeta, Evidence, Verdict};
-    use crate::point::{InsertionPoint, Payload, ProbeResponse, RawProbe};
+    use crate::job::L4Counters;
     use crate::profile::{ProfileTarget, ScanProfile};
-    use crate::session::SessionMaterial;
-    use crate::vocab::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
-    };
+    use crate::testing::{null_meta, query_point, NullCheck, NullHost, NullJob, NullLane};
+    use crate::vocab::{Confidence, LaneKind, Outcome};
 
     /// Compiles only for a type that can be a trait object.
     fn assert_object_safe<T: ?Sized>() {}
-
-    /// A `ProxyClient` that performs no I/O; the job context needs one to exist.
-    struct NullClient;
-
-    impl ProxyClient for NullClient {
-        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-            Box::pin(async { Err(anyhow::anyhow!("no client in the test context")) })
-        }
-    }
-
-    struct NullJob {
-        profile: ScanProfile,
-        client: Arc<dyn ProxyClient>,
-        store: Arc<dyn FlowStore>,
-        guard: Arc<dyn ScopeRateGuard>,
-    }
-
-    impl NullJob {
-        fn new() -> Self {
-            Self {
-                profile: ScanProfile::default(),
-                client: Arc::new(NullClient),
-                store: Arc::new(MemFlowStore::new()),
-                guard: Arc::new(StdGuard::default()),
-            }
-        }
-    }
-
-    impl JobCtx for NullJob {
-        fn job_id(&self) -> &str {
-            "scan-1a2b3c4d"
-        }
-        fn profile(&self) -> &ScanProfile {
-            &self.profile
-        }
-        fn client(&self) -> Arc<dyn ProxyClient> {
-            Arc::clone(&self.client)
-        }
-        fn store(&self) -> Arc<dyn FlowStore> {
-            Arc::clone(&self.store)
-        }
-        fn guard(&self) -> Arc<dyn ScopeRateGuard> {
-            Arc::clone(&self.guard)
-        }
-        fn browser(&self) -> Option<Arc<dyn BrowserDriver>> {
-            None
-        }
-        fn session(&self) -> Option<Arc<SessionMaterial>> {
-            None
-        }
-        fn charge(&self, _units: u32) -> bool {
-            true
-        }
-        fn budget_left(&self) -> u32 {
-            7
-        }
-        fn deadline(&self) -> Instant {
-            Instant::now() + Duration::from_secs(60)
-        }
-        fn cancelled(&self) -> bool {
-            false
-        }
-        fn marker(&self) -> String {
-            "aitm7f3a".to_string()
-        }
-    }
-
-    struct NullHost {
-        profile: ScanProfile,
-    }
-
-    impl ProbeHost for NullHost {
-        fn baseline(&self) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
-            Box::pin(async { Err(anyhow::anyhow!("no baseline in the test context")) })
-        }
-        fn probe<'a>(
-            &'a self,
-            _payload: &'a Payload,
-        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-            Box::pin(async { Err(anyhow::anyhow!("no probe in the test context")) })
-        }
-        fn probe_raw(&self, _req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
-            Box::pin(async { Err(anyhow::anyhow!("no probe in the test context")) })
-        }
-        fn marker(&self) -> String {
-            "aitm7f3a".to_string()
-        }
-        fn budget_left(&self) -> u32 {
-            3
-        }
-        fn deadline(&self) -> Instant {
-            Instant::now() + Duration::from_secs(60)
-        }
-        fn profile(&self) -> &ScanProfile {
-            &self.profile
-        }
-        fn cancelled(&self) -> bool {
-            false
-        }
-        fn held_flows(&self) -> Vec<aitm_core::Flow> {
-            Vec::new()
-        }
-    }
-
-    fn meta() -> CheckMeta {
-        CheckMeta {
-            id: "null-check".to_string(),
-            name: "Null check".to_string(),
-            class: "none".to_string(),
-            lanes: vec![LaneKind::Http],
-            kinds: vec![InsertionKind::Query],
-            intensity: Intensity::Passive,
-            cost: CheckCost::Light,
-            technique: Technique::Observe,
-            severity: aitm_poc::Severity::Info,
-            confidence_max: Confidence::Tentative,
-            needs_baseline: false,
-            wants_traits: None,
-            targets_session: false,
-            cwe: None,
-            description: "Concludes nothing.".to_string(),
-            remediation: None,
-            origin: CheckOrigin::Native,
-        }
-    }
-
-    struct NullCheck {
-        meta: CheckMeta,
-    }
-
-    impl Check for NullCheck {
-        fn meta(&self) -> &CheckMeta {
-            &self.meta
-        }
-        fn run<'a>(
-            &'a self,
-            _point: &'a InsertionPoint,
-            _host: &'a dyn ProbeHost,
-        ) -> BoxFuture<'a, Verdict> {
-            Box::pin(async {
-                Verdict {
-                    outcome: Outcome::Clean,
-                    confidence: Confidence::Tentative,
-                    evidence: Evidence::default(),
-                    detail: "nothing to report".to_string(),
-                    poc_hint: None,
-                }
-            })
-        }
-    }
-
-    struct NullLane;
-
-    impl Lane for NullLane {
-        fn lane(&self) -> LaneKind {
-            LaneKind::Http
-        }
-        fn discover<'a>(
-            &'a self,
-            _target: &'a ProfileTarget,
-            _job: &'a dyn JobCtx,
-        ) -> BoxFuture<'a, anyhow::Result<Discovery>> {
-            Box::pin(async { Ok(Discovery::default()) })
-        }
-        fn probe_host_for(
-            &self,
-            _point: &InsertionPoint,
-            _job: Arc<dyn JobCtx>,
-        ) -> anyhow::Result<Box<dyn ProbeHost>> {
-            Err(anyhow::anyhow!("the null lane hosts no probes"))
-        }
-        fn checks(&self) -> Vec<Arc<dyn Check>> {
-            Vec::new()
-        }
-    }
-
-    fn point() -> InsertionPoint {
-        InsertionPoint {
-            id: "p1".to_string(),
-            lane: LaneKind::Http,
-            kind: InsertionKind::Query,
-            name: "q".to_string(),
-            path: None,
-            example: None,
-            flow: None,
-            site_node: None,
-            traits: Vec::new(),
-            frequency: 1,
-            method: Some("GET".to_string()),
-            url: Some("http://127.0.0.1:8080/search".to_string()),
-        }
-    }
 
     fn accept_check(check: &dyn Check) -> String {
         check.meta().id.clone()
@@ -452,10 +329,8 @@ mod tests {
         assert_object_safe::<dyn Lane>();
         assert_object_safe::<dyn JobCtx>();
 
-        let check = NullCheck { meta: meta() };
-        let host = NullHost {
-            profile: ScanProfile::default(),
-        };
+        let check = NullCheck::new(null_meta("null-check"));
+        let host = NullHost::new();
         let job = NullJob::new();
 
         assert_eq!(accept_check(&check), "null-check");
@@ -471,11 +346,9 @@ mod tests {
 
     #[test]
     fn dyn_check_runs_against_a_dyn_probe_host() {
-        let check: Arc<dyn Check> = Arc::new(NullCheck { meta: meta() });
-        let host = NullHost {
-            profile: ScanProfile::default(),
-        };
-        let point = point();
+        let check: Arc<dyn Check> = Arc::new(NullCheck::new(null_meta("null-check")));
+        let host = NullHost::new();
+        let point = query_point("http://127.0.0.1:8080/search", "q");
 
         let verdict = block_on(check.run(&point, &host));
 
@@ -497,7 +370,9 @@ mod tests {
         assert!(discovery.nodes.is_empty());
 
         let job_arc: Arc<dyn JobCtx> = Arc::new(NullJob::new());
-        assert!(lane.probe_host_for(&point(), job_arc).is_err());
+        assert!(lane
+            .probe_host_for(&query_point("http://127.0.0.1:8080/search", "q"), job_arc)
+            .is_err());
     }
 
     #[test]
@@ -506,5 +381,53 @@ mod tests {
 
         assert!(discovery.points.is_empty());
         assert!(discovery.nodes.is_empty());
+    }
+
+    /// T1b (spec D2, D9.3): the three `ProbeHost` additions are default-bodied,
+    /// so a lane written against T1a still compiles and answers `None` — the
+    /// engine's own hosts override them.
+    #[test]
+    fn probe_host_defaults_are_none() {
+        let host = NullHost::new();
+
+        assert!(host.client().is_none());
+        assert!(host.shared().is_none());
+        assert!(host.captured().is_none());
+
+        // Through a trait object too: the bridge holds `&dyn ProbeHost`.
+        let dynamic: &dyn ProbeHost = &host;
+        assert!(dynamic.client().is_none());
+        assert!(dynamic.shared().is_none());
+        assert!(dynamic.captured().is_none());
+    }
+
+    /// Coordinator decision 1: a lane may report L4 counters or a lost session;
+    /// a `JobCtx` that does not care inherits a no-op body.
+    #[test]
+    fn job_ctx_report_defaults_are_no_ops() {
+        let job = NullJob::new();
+        let dynamic: &dyn JobCtx = &job;
+
+        let reported: () = dynamic.report_l4(L4Counters {
+            cases: 1,
+            ..Default::default()
+        });
+        assert_eq!(reported, ());
+        assert_eq!(dynamic.report_session_lost(), ());
+
+        // The no-op changed nothing the engine reads.
+        assert_eq!(dynamic.budget_left(), 7);
+    }
+
+    /// AC T5-3 (spec D8.4): a lane refuses a profile it cannot run *before* the
+    /// job is spawned. A lane with nothing to refuse inherits `Ok(())`.
+    #[test]
+    fn lane_validate_defaults_to_ok() {
+        let lane: Arc<dyn Lane> = Arc::new(NullLane);
+
+        assert_eq!(
+            lane.validate(&ProfileTarget::default(), &ScanProfile::default()),
+            Ok(())
+        );
     }
 }
