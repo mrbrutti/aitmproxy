@@ -597,6 +597,75 @@ impl ProxyStatus {
     }
 }
 
+/// The CA-trust pill word (§D17.6), read from the last `ca.status` reply:
+/// `platform` names the OS, `trusted` is what the trust stores reported
+/// (`None` when every store answered `unknown`, when there are no stores, or
+/// when the CA is not generated yet) so an unread state never renders as
+/// "untrusted" (D17.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaTrustWord {
+    pub platform: String,
+    pub trusted: Option<bool>,
+}
+
+impl CaTrustWord {
+    /// `None` unless `v` has the `ca.status` shape (`exists` is a boolean).
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let exists = v.get("exists")?.as_bool()?;
+        let platform = v
+            .get("platform")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let trusted = if exists {
+            let answers: Vec<&str> = v
+                .get("stores")
+                .and_then(Value::as_object)
+                .map(|stores| {
+                    stores
+                        .values()
+                        .filter_map(|s| s.get("trusted").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if answers.contains(&"yes") {
+                Some(true)
+            } else if answers.contains(&"no") {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Some(Self { platform, trusted })
+    }
+
+    /// The pill word: the in-flight form while an install or uninstall waits
+    /// for its reply, else the trust read-back, else nothing.
+    pub fn pill(&self, in_flight: bool) -> Option<String> {
+        if in_flight {
+            return Some("· CA trusting…".to_string());
+        }
+        self.trusted.map(|t| {
+            if t {
+                "· CA trusted".to_string()
+            } else {
+                "· CA untrusted".to_string()
+            }
+        })
+    }
+
+    /// The scope every frontend passes on `ca.install`/`ca.uninstall`
+    /// (D17.1): `user` where the OS has a user store, nothing on Linux.
+    pub fn default_scope(&self) -> Option<&'static str> {
+        match self.platform.as_str() {
+            "macos" | "windows" => Some("user"),
+            _ => None,
+        }
+    }
+}
+
 /// PoC finding severity, as `aitm-poc` names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -953,6 +1022,53 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// D17.6 / SP-AC35: the pill word comes from the `ca.status` stores
+    /// (any `yes` → trusted; a `no` and no `yes` → untrusted; all `unknown`
+    /// → no word), the in-flight form wins, and the default scope is `user`
+    /// only where the OS has a user store.
+    #[test]
+    fn ca_trust_word_parses_and_renders() {
+        let trusted = json!({"exists": true, "platform": "macos", "fingerprint_sha256": "AB:CD",
+            "stores": {"user": {"installed": "present", "trusted": "yes", "location": "x"}}});
+        let w = CaTrustWord::from_json(&trusted).unwrap();
+        assert_eq!(w.platform, "macos");
+        assert_eq!(w.trusted, Some(true));
+        assert_eq!(w.pill(false).as_deref(), Some("· CA trusted"));
+        assert_eq!(w.pill(true).as_deref(), Some("· CA trusting…"));
+        assert_eq!(w.default_scope(), Some("user"));
+
+        let untrusted = json!({"exists": true, "platform": "linux-debian",
+            "stores": {"system": {"installed": "absent", "trusted": "no", "location": "y"}}});
+        let w = CaTrustWord::from_json(&untrusted).unwrap();
+        assert_eq!(w.trusted, Some(false));
+        assert_eq!(w.pill(false).as_deref(), Some("· CA untrusted"));
+        assert_eq!(w.default_scope(), None);
+
+        let mixed = json!({"exists": true, "platform": "windows",
+            "stores": {"user": {"trusted": "no"}, "system": {"trusted": "yes"}}});
+        let w = CaTrustWord::from_json(&mixed).unwrap();
+        assert_eq!(w.trusted, Some(true), "any yes wins");
+        assert_eq!(w.default_scope(), Some("user"));
+
+        let unknown = json!({"exists": true, "platform": "macos",
+            "stores": {"user": {"trusted": "unknown"}, "system": {"trusted": "unknown"}}});
+        let w = CaTrustWord::from_json(&unknown).unwrap();
+        assert_eq!(w.trusted, None);
+        assert_eq!(w.pill(false), None);
+        assert_eq!(w.pill(true).as_deref(), Some("· CA trusting…"));
+
+        let not_generated = json!({"exists": false, "platform": "macos", "stores": {}});
+        assert_eq!(
+            CaTrustWord::from_json(&not_generated).unwrap().pill(false),
+            None
+        );
+
+        // An older core's shape has no `exists`: not the ca.status shape.
+        let old = json!({"path": "/tmp/ca.pem", "fingerprint": "AB:CD", "installed": false});
+        assert!(CaTrustWord::from_json(&old).is_none());
+        assert!(CaTrustWord::from_json(&json!("installed")).is_none());
+    }
 
     #[test]
     fn summary_parses_an_http_flow() {

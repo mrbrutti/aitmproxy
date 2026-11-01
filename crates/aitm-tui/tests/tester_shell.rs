@@ -368,7 +368,18 @@ fn empty_states_keep_the_frame_and_say_the_trades_words() {
     let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
     let _ = app.update(Action::Resize(160, 30));
     let reqs = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
-    assert_eq!(reqs, vec![aitm_tui::action::BusRequest::Refresh]);
+    // The connect contract: one refresh, then the one `ca.status` read the
+    // pill word comes from (D17.11); nothing else is sent unasked.
+    assert_eq!(
+        reqs,
+        vec![
+            aitm_tui::action::BusRequest::Refresh,
+            aitm_tui::action::BusRequest::Call {
+                name: "ca.status".into(),
+                args: json!({}),
+            },
+        ]
+    );
     let text = text_of(&app, 160, 30);
     assert!(
         text.contains("No flows yet — point a client at 127.0.0.1:8080 or open the browser."),
