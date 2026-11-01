@@ -12,9 +12,9 @@
 //! 1. the differential itself (true arm matches the baseline, false arm
 //!    diverges from both) and the `Diff` evidence it produces;
 //! 2. that an unstable page is `inconclusive` rather than a finding — the
-//!    control re-send exists to make a flaky page cost two probes, not twelve;
+//!    control re-send exists to make a flaky page cost two probes, not ten;
 //! 3. the `Speed` and `Accuracy` dials of spec D2, counted in probes;
-//! 4. the stop contract: the twelve-probe cap, the budget, cancellation.
+//! 4. the stop contract: the ten-probe cap, the budget, cancellation.
 
 mod support;
 
@@ -27,7 +27,7 @@ use aitm_scan_model::{
 use support::{html, point, ScriptedHost, TARGET_URL};
 
 /// The hard per-point cap the plan names (`MAX_BOOLEAN_PROBES`).
-const MAX_BOOLEAN_PROBES: usize = 12;
+const MAX_BOOLEAN_PROBES: usize = 10;
 
 /// The first pair the check tries, in order.
 const TRUE_ARM: &str = " AND 1=1";
@@ -261,11 +261,11 @@ async fn speed_fast_tries_two_pairs_and_thorough_eight() {
     assert_eq!(fast.sent().len(), 1 + 2 * 2);
 
     let thorough = stable().with_speed(Speed::Thorough);
-    // Eight pairs would be seventeen stimuli; the cap stops it at eleven, so a
+    // Eight pairs would be seventeen stimuli; the cap stops it at nine, so a
     // thorough run that found nothing is inconclusive, not clean.
     let verdict = sqli().run(&point, &thorough).await;
     assert_eq!(verdict.outcome, Outcome::Inconclusive);
-    assert_eq!(thorough.sent().len(), 11);
+    assert_eq!(thorough.sent().len(), 9);
 }
 
 #[tokio::test]
@@ -360,12 +360,34 @@ async fn a_refused_repeat_after_a_hit_is_inconclusive_not_clean() {
     );
 }
 
+/// The control re-send is the point's **own observed value**. A point that
+/// carries none cannot be re-sent, and sending an empty value instead is a
+/// different request: it would compare the page's answer to "" against the
+/// baseline and call a stable page unstable. The check says what is missing
+/// and sends nothing (review findings Q-M4 and SEC-C4).
+#[tokio::test]
+async fn a_point_with_no_example_is_inconclusive_and_sends_no_control() {
+    let host = vulnerable_host();
+    let mut point = point(InsertionKind::Query, "id", TARGET_URL);
+    point.example = None;
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(
+        verdict.detail,
+        "the point carries no observed value to re-send as a control, so the boolean \
+         differential has nothing stable to compare against"
+    );
+    assert!(host.sent().is_empty(), "sent {:?}", host.sent());
+}
+
 // ---------------------------------------------------------------------------
 // The stop contract
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_check_never_exceeds_twelve_probes() {
+async fn the_check_never_exceeds_ten_probes() {
     // Every arm diverges from the 600-byte baseline, so no pair ever hits and
     // the check runs until something stops it.
     let host = ScriptedHost::new()
@@ -383,8 +405,8 @@ async fn the_check_never_exceeds_twelve_probes() {
         "sent {} probes",
         host.sent().len()
     );
-    // A pair is atomic, so the cap lands on the control plus five whole pairs.
-    assert_eq!(host.sent().len(), 11);
+    // A pair is atomic, so the cap lands on the control plus four whole pairs.
+    assert_eq!(host.sent().len(), 9);
     assert_eq!(verdict.outcome, Outcome::Inconclusive);
 }
 

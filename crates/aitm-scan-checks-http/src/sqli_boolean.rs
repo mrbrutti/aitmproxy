@@ -59,13 +59,14 @@ use crate::gate::{self, ProbeTally};
 use crate::matching::{body_text, length_differs};
 
 /// The hard ceiling on stimuli this check spends on one insertion point,
-/// counting the control re-send and every repeat.
+/// counting the control re-send and every repeat: **ten**, which is what
+/// `cost: Medium` promises the scheduler.
 ///
 /// `Speed::Thorough` would otherwise ask for seventeen (a control plus eight
-/// pairs), and a confirmed hit late in the list can ask for more again. The cap
-/// is the check's own promise to the scheduler, independent of whatever budget
-/// the job still has.
-const MAX_BOOLEAN_PROBES: u32 = 12;
+/// pairs), and a confirmed hit late in the list can ask for more again. A pair
+/// is atomic, so the cap lands on a control plus four whole pairs. It is the
+/// check's own promise, independent of whatever budget the job still has.
+const MAX_BOOLEAN_PROBES: u32 = 10;
 
 /// The condition pairs, in the order they are tried, before the parenthesised
 /// variants are appended.
@@ -350,9 +351,21 @@ impl Check for SqliBoolean {
                     "the job stopped before the control re-send".to_string(),
                 );
             }
+            // The control is the point's *own observed value*. With none to
+            // re-send there is no stability test, and an empty value is a
+            // different request whose answer says nothing about this one
+            // (review findings Q-M4, SEC-C4).
+            let Some(example) = point.example.clone() else {
+                return no_finding(
+                    Outcome::Inconclusive,
+                    "the point carries no observed value to re-send as a control, so the \
+                     boolean differential has nothing stable to compare against"
+                        .to_string(),
+                );
+            };
             spent += 1;
             let control_payload = Payload {
-                value: point.example.clone().unwrap_or_default(),
+                value: example,
                 mode: PayloadMode::Replace,
                 bytes: None,
             };
@@ -575,6 +588,6 @@ mod tests {
     fn the_cap_is_below_what_a_thorough_run_would_ask_for() {
         let thorough = 1 + 2 * pairs_allowed(Speed::Thorough);
         assert!(u32::try_from(thorough).is_ok_and(|n| n > MAX_BOOLEAN_PROBES));
-        assert_eq!(MAX_BOOLEAN_PROBES, 12);
+        assert_eq!(MAX_BOOLEAN_PROBES, 10);
     }
 }
