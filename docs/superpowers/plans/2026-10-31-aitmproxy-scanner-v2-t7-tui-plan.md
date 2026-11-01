@@ -563,6 +563,14 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | spec | Minor | unlisted verbs route to Jobs; cursor clamped after a drop, unstated | D9 amended |
 | 13 | spec | Minor | plan text said `from_message(name, ..)`; code passes the tag per D3 | plan Task 13 text aligned |
 | 13 | spec | note | the `not_found` wording promises a list refresh on a launch tag too | D9 amended: the refresh clause only on keyed status/cancel tags; wording split in G75 |
+| 13 | quality | Minor | `is_refused_launch` inserted between `wording()`'s doc and body | fix round G (G76) |
+| 13 | quality | Minor | `drop_scan_job` is `JobsState` logic on the reducer; copies `fold_list`'s clamp | fix round G (G77, with G64): `JobsState::forget` |
+| 13 | quality | Minor | `not_found` predicate inline with a second `tag_parts`; sibling lives on `ScanError` | fix round G (G78): `ScanError::not_found_job` |
+| 13 | quality | Minor | `owning_tab` explicit Jobs arm equals the fallback | fix round G (G79): arm deleted |
+| 13 | quality | Minor | third copy of `tagged`/`reply`/`opened()` test scaffolding | fix round G (G80): `tests/common` |
+| 13 | quality | Minor | `footer_reason` hard-codes one wording; `unwrap_or_default()` hides the failure cause | fix round G (G81) |
+| 13 | quality | Minor | `scan.cancel:<job>` self-heal untested | fix round G (G75, already queued) |
+| 13 | quality | Minor | narrating `on_scan_failed` doc and footer comment | fix round G (G81) |
 
 ## Shipped
 

@@ -188,6 +188,20 @@ G74. The `not_found` self-heal leaves its error in the Jobs banner forever (`cra
 
 G75. `not_found` wording and the cancel branch (`crates/aitm-tui/src/scan/mod.rs` `code_wording`/`wording`; `tests/scan_v2_errors.rs`): the D9 `not_found` text keeps "; the list is being refreshed" only when the error's tag is a keyed `scan.status:<job>`/`scan.cancel:<job>` (the self-heal ran); on any other tag it reads `No longer known to the core (it may have restarted)` (D9 as amended). Tests: `not_found` on `scan.start` renders the short form; `CallTaggedFailed { tag: "scan.cancel:scan-1a2b3c4d", name: "scan.cancel", message: "scan: not_found: gone" }` drops the job from `order`, `summaries`, `full`, `started_here` and gives exactly `vec![scan.list {}]`.
 
+## Task 13 quality panel
+
+G76. `is_refused_launch` was inserted between `wording()`'s doc comment and its body (`crates/aitm-tui/src/scan/mod.rs`): move the block (its own doc lines plus the fn) below `wording()`'s closing brace so each method keeps its doc.
+
+G77. `drop_scan_job` is `JobsState` logic on the reducer (`crates/aitm-tui/src/app.rs`, `crates/aitm-tui/src/scan/jobs.rs`): `JobsState::forget(&mut self, id: &str)` holds the four removals (`order`, `summaries`, `full`, `started_here`) and the cursor clamp, with a unit test (drop the cursor's job from a two-job order, the cursor clamps); `on_scan_failed` calls it. Rides with G64.
+
+G78. The `not_found` self-heal predicate is inline in the reducer with a second `tag_parts` call (`crates/aitm-tui/src/app.rs`, `crates/aitm-tui/src/scan/mod.rs`): `ScanError::not_found_job(&self) -> Option<&str>` (Some(key) when `code == Some(NotFound)`, the verb is `scan.status`/`scan.cancel` and the tag is keyed) beside `is_refused_launch` with a mirror unit test; the arm becomes `if let Some(job) = err.not_found_job() { self.scan.jobs.forget(job); self.request_scan_list(out); }`; `verb == "scan.issue"` reads `err.verb`. G68's `LaunchVerb` also absorbs `is_refused_launch`'s `"scan.start" | "scan.map"` literal.
+
+G79. `owning_tab`'s explicit Jobs arm equals its fallback (`crates/aitm-tui/src/scan/mod.rs`): delete the explicit arm; the doc sentence and the unit test carry the rule, with a one-line why on the fallback (Jobs reads `last_error`, so an unknown verb is never lost).
+
+G80. Third copy of the `tagged`/`reply`/`failed`/`opened()` test scaffolding (`tests/scan_v2_errors.rs`, `tests/scan_v2_launch.rs`, `tests/scan_v2_profiles.rs`): move `tagged`, `reply`, `failed` and `opened_v2(tools: &[&str]) -> App` into `tests/common/mod.rs`; the three suites import them (G44/G60/G69 stay per-file assertion items).
+
+G81. Test helper and doc hygiene (`tests/scan_v2_errors.rs`; `crates/aitm-tui/src/app.rs` `on_scan_failed` doc; `crates/aitm-tui/src/ui/scan/profiles.rs` footer comment): `footer_reason(text, needle)`; the two `unwrap_or_default()` in the hue assertion become `expect("the wording column")`/`expect("the theme sets a foreground")`; the `on_scan_failed` doc keeps the D9/D13 citations and the two whys (`started_here` removal, blocked-before-refused precedence) and drops the step list; the profiles footer comment likewise. G65's `blocked_footer` builds the refused `String` lazily (only when `blocked` is `None`).
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
