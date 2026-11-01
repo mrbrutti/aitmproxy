@@ -1538,6 +1538,7 @@ enum HandoffSelfCheck {
         rendezvous(r)
         coreLinkAndClaim(r)
         scopeChangeHook(r)
+        providerRules(r)
         pumps(r)
         inboundCap(r)
         return r.failures
