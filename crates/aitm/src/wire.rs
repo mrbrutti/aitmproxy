@@ -1010,14 +1010,15 @@ mod tests {
     }
 
     /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// a skeleton slot returning `None` is skipped rather than collected — with the
-    /// L4 handles present the skeleton slots are still called and still contribute
-    /// nothing. T5 landed: the packet lane returns `Some` even without handles
-    /// (call A18); the other four slots are still skeletons. A lane track's landing
-    /// flips these literals; that track re-pins this test.
+    /// a skeleton slot returning `None` is skipped rather than collected. Two lanes
+    /// have landed: T4 (`aitm-scan-ws`) and T5 (`aitm-scan-l4-packet`, which returns
+    /// `Some` even without the L4 handles, call A18); the remaining slots are still
+    /// skeletons, and with the L4 handles present the stream slot is still called
+    /// and still contributes nothing. Each lane track's landing bumps these
+    /// literals; that track re-pins this test.
     #[test]
-    fn lane_slots_count_the_landed_packet_lane() {
-        assert_eq!(collect_lanes(None).len(), 1);
+    fn lane_slots_count_the_landed_lanes() {
+        assert_eq!(collect_lanes(None).len(), 2);
         assert_eq!(collect_native_checks().len(), 0);
 
         let shared = L4Shared {
@@ -1027,7 +1028,7 @@ mod tests {
             })),
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 1);
+        assert_eq!(collect_lanes(Some(&shared)).len(), 2);
     }
 
     /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand
