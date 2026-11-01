@@ -1,6 +1,8 @@
 //! The decision tables of spec §2.2: pure, no I/O. Platform gatherers build a
 //! [`ProbeInputs`]; `derive` turns it into a [`PrivilegeReport`], first match wins.
 
+use std::path::PathBuf;
+
 use crate::privilege::contract::{Receipt, DOWNLOAD_URL};
 use crate::privilege::report::{
     Action, Capability, Helper, HelperKind, HelperStatus, How, HowKind, Platform, PrivilegeReport,
@@ -15,7 +17,7 @@ pub struct ProbeInputs {
     pub platform: Platform,
     /// Present when `platform` is macOS.
     pub mac: Option<MacInputs>,
-    /// Present when `platform` is Linux (Task P1b.2 fills this in).
+    /// Present when `platform` is Linux.
     pub linux: Option<LinuxInputs>,
     /// The last request on this core.
     pub request: Option<RequestProgress>,
@@ -34,9 +36,37 @@ pub struct MacInputs {
     pub handoff_app_embeds_helper: bool,
 }
 
-/// What the Linux gatherer found. Placeholder: Task P1b.2 defines the fields.
+/// What the Linux gatherer found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxInputs {}
+pub struct LinuxInputs {
+    /// The process's `CapEff` holds `CAP_NET_RAW`.
+    pub cap_net_raw: bool,
+    /// The process's `CapEff` holds `CAP_NET_ADMIN`.
+    pub cap_net_admin: bool,
+    /// A helper session is connected and past its peer checks.
+    pub session_connected: bool,
+    /// The helper binary discovery found (spec §2.2 order), when it found one.
+    pub helper: Option<HelperCandidate>,
+    /// The polkit policy file is installed.
+    pub policy_file_present: bool,
+    /// The polkit launcher is on this host.
+    pub pkexec_present: bool,
+    /// A password prompt could be shown (spec §5.5): a graphical session or a tty.
+    pub prompt_possible: bool,
+}
+
+/// One helper binary found by discovery, as the gatherer inspected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperCandidate {
+    /// Where it was found.
+    pub path: PathBuf,
+    /// It is the policy's exec path ([`crate::privilege::contract::LINUX_HELPER_PATH`]).
+    pub at_policy_path: bool,
+    /// It and every parent are root-owned and not group- or world-writable.
+    pub root_owned_chain: bool,
+    /// `aitm-l4-helper probe` reports `CAP_NET_RAW` effective (file caps).
+    pub file_caps_net_raw: bool,
+}
 
 /// The literal reasons and labels of spec §2.2. They are the only text a
 /// frontend shows for these rows, so they live here as named constants.
@@ -56,8 +86,20 @@ pub mod text {
     /// Row "otherwise".
     pub const MAC_INSTALL_LABEL: &str = "Install the Aitmproxy app (DMG or Homebrew cask); it \
                                         asks macOS for packet-capture permission";
-    /// Capture and inject on a platform with no backend (Task P1b.2 adds the
-    /// Linux rows; until then Linux shares this).
+    /// `intercept` on Linux without `CAP_NET_ADMIN`.
+    pub const LINUX_INTERCEPT: &str = "in-path interception needs the core itself to hold \
+                                       CAP_NET_ADMIN; the packet-capture helper does not provide \
+                                       it yet";
+    /// Row "helper at the policy's exec path, a prompt is possible".
+    pub const LINUX_ALLOW_LABEL: &str = "Allow packet capture (asks for an administrator password)";
+    /// Row "helper at the policy's exec path, but no prompt is possible".
+    pub const LINUX_NO_PROMPT: &str =
+        "No password prompt can be shown here (no desktop session or terminal)";
+    /// Rows "helper found but not root-owned" and "otherwise".
+    pub const LINUX_INSTALL_LABEL: &str =
+        "Install the aitm .deb or .rpm to get the packet-capture helper";
+    /// Capture and inject on a platform with no backend, or on macOS or Linux
+    /// when the platform gatherer supplied no inputs.
     pub const NO_BACKEND: &str = "raw packet capture and injection are supported on macOS and \
                                  Linux only";
 }
@@ -65,8 +107,11 @@ pub mod text {
 /// The whole decision table. Pure; first match wins.
 #[must_use]
 pub fn derive(inputs: &ProbeInputs) -> PrivilegeReport {
-    let (capture, intercept, helper) = match (inputs.platform, &inputs.mac) {
-        (Platform::Macos, Some(mac)) => derive_macos(inputs.enabled, mac, inputs.request.as_ref()),
+    let (capture, intercept, helper) = match (inputs.platform, &inputs.mac, &inputs.linux) {
+        (Platform::Macos, Some(mac), _) => {
+            derive_macos(inputs.enabled, mac, inputs.request.as_ref())
+        }
+        (Platform::Linux, _, Some(linux)) => derive_linux(inputs.enabled, linux),
         _ => derive_other(inputs.enabled),
     };
     PrivilegeReport {
@@ -146,8 +191,104 @@ fn derive_macos(
     (capture, intercept, helper)
 }
 
-/// A platform with no raw-packet backend (and, until Task P1b.2 lands its rows,
-/// Linux): everything unsupported, no helper.
+/// The Linux table of spec §2.2: `(capture-and-inject, intercept, helper)`.
+fn derive_linux(enabled: bool, linux: &LinuxInputs) -> (Capability, Capability, Helper) {
+    let candidate = linux.helper.as_ref();
+    let file_caps = candidate.is_some_and(|helper| helper.file_caps_net_raw);
+    // The packaged install, complete: the only thing the request ever runs
+    // through polkit is the policy's exec path, so every part must be in place
+    // and the path must be one root alone can write.
+    let packaged = candidate.is_some_and(|helper| helper.at_policy_path && helper.root_owned_chain)
+        && linux.policy_file_present
+        && linux.pkexec_present;
+    let untrusted_path = candidate.filter(|helper| !helper.root_owned_chain);
+
+    // helper "as found": the same reading whether or not L4 is enabled.
+    let kind = if file_caps {
+        HelperKind::LinuxCapHelper
+    } else {
+        HelperKind::LinuxPkexecHelper
+    };
+    let (status, detail) = if linux.session_connected {
+        (HelperStatus::Running, None)
+    } else if file_caps || packaged {
+        (HelperStatus::Installed, None)
+    } else if let Some(helper) = untrusted_path {
+        (
+            HelperStatus::NotInstalled,
+            Some(helper.path.display().to_string()),
+        )
+    } else {
+        (HelperStatus::NotInstalled, None)
+    };
+    let found = Helper {
+        kind,
+        status,
+        version: None,
+        detail,
+    };
+    let no_helper = Helper {
+        kind: HelperKind::None,
+        status: HelperStatus::Unknown,
+        version: None,
+        detail: None,
+    };
+
+    if !enabled {
+        let off = unsupported(text::L4_OFF);
+        return (off.clone(), off, found);
+    }
+
+    let intercept = if linux.cap_net_admin {
+        Capability::Available { via: Via::Process }
+    } else {
+        unsupported(text::LINUX_INTERCEPT)
+    };
+
+    let (capture, helper) = if linux.cap_net_raw {
+        (Capability::Available { via: Via::Process }, no_helper)
+    } else if linux.session_connected || file_caps {
+        (Capability::Available { via: Via::Helper }, found)
+    } else if packaged && linux.prompt_possible {
+        (
+            needs_approval(
+                text::LINUX_ALLOW_LABEL,
+                HowKind::Pkexec,
+                text::LINUX_ALLOW_LABEL,
+                Action::BusVerb,
+            ),
+            found,
+        )
+    } else if packaged {
+        (
+            needs_approval(
+                text::LINUX_NO_PROMPT,
+                HowKind::Package,
+                text::LINUX_NO_PROMPT,
+                Action::BusVerb,
+            ),
+            found,
+        )
+    } else {
+        // A helper under $HOME or any other path root does not own, or none at
+        // all: the package is the remedy either way; `found.detail` names the
+        // untrusted path when there is one.
+        (
+            needs_approval(
+                text::LINUX_INSTALL_LABEL,
+                HowKind::Package,
+                text::LINUX_INSTALL_LABEL,
+                Action::OpenUrl(DOWNLOAD_URL.to_string()),
+            ),
+            found,
+        )
+    };
+
+    (capture, intercept, helper)
+}
+
+/// A platform with no raw-packet backend, or macOS/Linux without their
+/// gatherer's inputs: everything unsupported, no helper.
 fn derive_other(enabled: bool) -> (Capability, Capability, Helper) {
     let reason = if enabled {
         text::NO_BACKEND
@@ -188,7 +329,7 @@ fn needs_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privilege::contract::RECEIPT_SCHEMA;
+    use crate::privilege::contract::{LINUX_HELPER_PATH, RECEIPT_SCHEMA};
     use aitm_core::Value;
 
     const NOW: u64 = 1_762_000_000_123;
@@ -561,5 +702,450 @@ mod tests {
             Some(&Value::Str("l4.privilege.request".to_string()))
         );
         assert_eq!(action.get("url"), None);
+    }
+
+    // ---- Linux (Task P1b.2) ----
+
+    const HOME_HELPER: &str = "/home/tester/aitmproxy/aitm-l4-helper";
+
+    /// A Linux probe with nothing found: no caps, no session, no helper.
+    fn linux_nothing() -> LinuxInputs {
+        LinuxInputs {
+            cap_net_raw: false,
+            cap_net_admin: false,
+            session_connected: false,
+            helper: None,
+            policy_file_present: false,
+            pkexec_present: false,
+            prompt_possible: false,
+        }
+    }
+
+    /// The packaged helper, as the .deb/.rpm installs it, with a prompt possible.
+    fn linux_packaged() -> LinuxInputs {
+        LinuxInputs {
+            helper: Some(candidate(LINUX_HELPER_PATH, true, true, false)),
+            policy_file_present: true,
+            pkexec_present: true,
+            prompt_possible: true,
+            ..linux_nothing()
+        }
+    }
+
+    fn candidate(
+        path: &str,
+        at_policy_path: bool,
+        root_owned_chain: bool,
+        file_caps_net_raw: bool,
+    ) -> HelperCandidate {
+        HelperCandidate {
+            path: PathBuf::from(path),
+            at_policy_path,
+            root_owned_chain,
+            file_caps_net_raw,
+        }
+    }
+
+    fn linux_inputs(enabled: bool, linux: LinuxInputs) -> ProbeInputs {
+        ProbeInputs {
+            enabled,
+            platform: Platform::Linux,
+            mac: None,
+            linux: Some(linux),
+            request: None,
+            now_ms: NOW,
+        }
+    }
+
+    const LINUX_INTERCEPT_OFF: &str = "in-path interception needs the core itself to hold \
+                                       CAP_NET_ADMIN; the packet-capture helper does not provide \
+                                       it yet";
+
+    /// Every Linux row: inject mirrors capture, no version is known yet, and the
+    /// probe time is carried through.
+    fn assert_linux_common(report: &PrivilegeReport) {
+        assert_eq!(report.platform, Platform::Linux);
+        assert_eq!(report.inject, report.capture);
+        assert_eq!(report.helper.version, None);
+        assert_eq!(report.checked_at, NOW);
+    }
+
+    fn needs(report: &PrivilegeReport) -> (&str, &How) {
+        match &report.capture {
+            Capability::NeedsApproval { reason, how } => (reason.as_str(), how),
+            other => panic!("expected needs_approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linux_l4_off_is_unsupported() {
+        let off = unsupported("L4 is off in this core's config (l4.enabled)");
+        // Even a fully privileged process: l4.enabled false wins (first row).
+        let report = derive(&linux_inputs(
+            false,
+            LinuxInputs {
+                cap_net_raw: true,
+                cap_net_admin: true,
+                ..linux_packaged()
+            },
+        ));
+        assert!(!report.enabled);
+        assert_linux_common(&report);
+        assert_eq!(report.capture, off);
+        assert_eq!(report.inject, off);
+        assert_eq!(report.intercept, off);
+        // helper "as found": the packaged helper is installed.
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::Installed);
+
+        // ... and nothing found is not installed.
+        let report = derive(&linux_inputs(false, linux_nothing()));
+        assert_eq!(report.capture, off);
+        assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+    }
+
+    #[test]
+    fn process_cap_net_raw_is_available_process() {
+        // A helper is installed too, but the process needs none: kind `none`.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                cap_net_raw: true,
+                ..linux_packaged()
+            },
+        ));
+        assert!(report.enabled);
+        assert_linux_common(&report);
+        assert_eq!(report.capture, Capability::Available { via: Via::Process });
+        assert_eq!(report.helper.kind, HelperKind::None);
+        assert_eq!(report.helper.status, HelperStatus::Unknown);
+        assert_eq!(report.helper.detail, None);
+    }
+
+    #[test]
+    fn connected_session_is_available_helper() {
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                session_connected: true,
+                ..linux_packaged()
+            },
+        ));
+        assert_linux_common(&report);
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::Running);
+
+        // A session over a file-caps helper reports that kind.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                session_connected: true,
+                helper: Some(candidate(LINUX_HELPER_PATH, true, true, true)),
+                ..linux_nothing()
+            },
+        ));
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+        assert_eq!(report.helper.kind, HelperKind::LinuxCapHelper);
+        assert_eq!(report.helper.status, HelperStatus::Running);
+    }
+
+    #[test]
+    fn file_caps_helper_is_available_helper_cap_kind() {
+        // No session yet: it starts lazily on first use, so already `available`.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                helper: Some(candidate(
+                    "/run/wrappers/bin/aitm-l4-helper",
+                    false,
+                    true,
+                    true,
+                )),
+                ..linux_nothing()
+            },
+        ));
+        assert_linux_common(&report);
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+        assert_eq!(report.helper.kind, HelperKind::LinuxCapHelper);
+        assert_eq!(report.helper.status, HelperStatus::Installed);
+        assert_eq!(report.helper.detail, None);
+
+        // The row does not ask about the policy path: a configured helper path
+        // with file caps (the headless fallback, spec §5.6) is enough.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                helper: Some(candidate("/opt/aitm/aitm-l4-helper", false, true, true)),
+                ..linux_nothing()
+            },
+        ));
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+        assert_eq!(report.helper.kind, HelperKind::LinuxCapHelper);
+    }
+
+    #[test]
+    fn policy_helper_with_prompt_is_pkexec() {
+        let report = derive(&linux_inputs(true, linux_packaged()));
+        assert_linux_common(&report);
+        let (reason, how) = needs(&report);
+        assert_eq!(how.kind, HowKind::Pkexec);
+        assert_eq!(
+            how.label,
+            "Allow packet capture (asks for an administrator password)"
+        );
+        assert_eq!(
+            reason,
+            "Allow packet capture (asks for an administrator password)"
+        );
+        assert_eq!(how.action, Action::BusVerb);
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::Installed);
+        assert_eq!(report.helper.detail, None);
+
+        // The wire string for this kind is the enum value, not a reason.
+        let Value::Object(top) = report.to_value() else {
+            panic!("to_value must be an object");
+        };
+        let Some(Value::Object(caps)) = top.get("capabilities") else {
+            panic!("capabilities must be an object");
+        };
+        let Some(Value::Object(capture)) = caps.get("capture") else {
+            panic!("capture must be an object");
+        };
+        let Some(Value::Object(how)) = capture.get("how") else {
+            panic!("how must be an object");
+        };
+        assert_eq!(how.get("kind"), Some(&Value::Str("pkexec".to_string())));
+        assert_eq!(top.get("platform"), Some(&Value::Str("linux".to_string())));
+        let Some(Value::Object(helper)) = top.get("helper") else {
+            panic!("helper must be an object");
+        };
+        assert_eq!(
+            helper.get("kind"),
+            Some(&Value::Str("linux_pkexec_helper".to_string()))
+        );
+    }
+
+    #[test]
+    fn policy_helper_without_prompt_is_package() {
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                prompt_possible: false,
+                ..linux_packaged()
+            },
+        ));
+        assert_linux_common(&report);
+        let (reason, how) = needs(&report);
+        assert_eq!(how.kind, HowKind::Package);
+        assert_eq!(
+            reason,
+            "No password prompt can be shown here (no desktop session or terminal)"
+        );
+        assert_eq!(how.label, reason);
+        assert_eq!(how.action, Action::BusVerb);
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::Installed);
+
+        // "No prompt" is only the answer for a complete install. A helper at the
+        // policy path whose policy file or pkexec is missing is a broken install
+        // and falls through to the install row, whether or not a prompt is possible.
+        for prompt_possible in [true, false] {
+            let report = derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    policy_file_present: false,
+                    prompt_possible,
+                    ..linux_packaged()
+                },
+            ));
+            let (reason, how) = needs(&report);
+            assert_eq!(how.kind, HowKind::Package);
+            assert_eq!(
+                reason,
+                "Install the aitm .deb or .rpm to get the packet-capture helper"
+            );
+            assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+        }
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                pkexec_present: false,
+                ..linux_packaged()
+            },
+        ));
+        assert_eq!(
+            report.capture.how().map(|how| how.kind),
+            Some(HowKind::Package)
+        );
+        assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+    }
+
+    #[test]
+    fn helper_under_home_is_package_not_installed() {
+        // AC20, unit half: the tarball layout under $HOME.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                helper: Some(candidate(HOME_HELPER, false, false, false)),
+                ..linux_nothing()
+            },
+        ));
+        assert_linux_common(&report);
+        let (reason, how) = needs(&report);
+        assert_eq!(how.kind, HowKind::Package);
+        assert_eq!(
+            how.label,
+            "Install the aitm .deb or .rpm to get the packet-capture helper"
+        );
+        assert_eq!(reason, how.label);
+        assert_eq!(how.action, Action::OpenUrl(DOWNLOAD_URL.to_string()));
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+        assert_eq!(report.helper.detail.as_deref(), Some(HOME_HELPER));
+
+        // The policy path itself with a writable parent is the same row: never
+        // `installed`, and the detail names it, prompt or no prompt.
+        for prompt_possible in [true, false] {
+            let report = derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    helper: Some(candidate(LINUX_HELPER_PATH, true, false, false)),
+                    prompt_possible,
+                    ..linux_packaged()
+                },
+            ));
+            assert_eq!(
+                report.capture.how().map(|how| how.kind),
+                Some(HowKind::Package)
+            );
+            assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+            assert_eq!(report.helper.detail.as_deref(), Some(LINUX_HELPER_PATH));
+        }
+    }
+
+    #[test]
+    fn nothing_is_package_with_download_url() {
+        let report = derive(&linux_inputs(true, linux_nothing()));
+        assert_linux_common(&report);
+        let (reason, how) = needs(&report);
+        assert_eq!(how.kind, HowKind::Package);
+        assert_eq!(
+            how.label,
+            "Install the aitm .deb or .rpm to get the packet-capture helper"
+        );
+        assert_eq!(reason, how.label);
+        assert_eq!(how.action, Action::OpenUrl(DOWNLOAD_URL.to_string()));
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+        assert_eq!(report.helper.detail, None);
+
+        let Value::Object(top) = report.to_value() else {
+            panic!("to_value must be an object");
+        };
+        let Some(Value::Object(caps)) = top.get("capabilities") else {
+            panic!("capabilities must be an object");
+        };
+        let Some(Value::Object(inject)) = caps.get("inject") else {
+            panic!("inject must be an object");
+        };
+        let Some(Value::Object(how)) = inject.get("how") else {
+            panic!("how must be an object");
+        };
+        let Some(Value::Object(action)) = how.get("action") else {
+            panic!("action must be an object");
+        };
+        assert_eq!(
+            action.get("type"),
+            Some(&Value::Str("open_url".to_string()))
+        );
+        assert_eq!(
+            action.get("url"),
+            Some(&Value::Str(
+                "https://mrbrutti.github.io/aitmproxy/download.html".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn linux_intercept_follows_cap_net_admin() {
+        // CAP_NET_ADMIN alone: intercept works in-process while capture still
+        // needs approval.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                cap_net_admin: true,
+                ..linux_packaged()
+            },
+        ));
+        assert_eq!(
+            report.intercept,
+            Capability::Available { via: Via::Process }
+        );
+        assert!(matches!(report.capture, Capability::NeedsApproval { .. }));
+
+        // Without it: unsupported with the spec's literal and no remedy, even
+        // when a helper session serves capture.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                session_connected: true,
+                ..linux_packaged()
+            },
+        ));
+        assert_eq!(report.intercept, unsupported(LINUX_INTERCEPT_OFF));
+        assert_eq!(report.intercept.how(), None);
+        assert_eq!(report.intercept.reason(), Some(LINUX_INTERCEPT_OFF));
+        let Value::Object(top) = report.to_value() else {
+            panic!("to_value must be an object");
+        };
+        let Some(Value::Object(caps)) = top.get("capabilities") else {
+            panic!("capabilities must be an object");
+        };
+        let Some(Value::Object(intercept)) = caps.get("intercept") else {
+            panic!("intercept must be an object");
+        };
+        assert_eq!(
+            intercept.get("state"),
+            Some(&Value::Str("unsupported".to_string()))
+        );
+        assert_eq!(intercept.get("how"), None);
+    }
+
+    #[test]
+    fn other_platform_and_missing_inputs_stay_minimal() {
+        let no_backend =
+            unsupported("raw packet capture and injection are supported on macOS and Linux only");
+        let report = derive(&ProbeInputs {
+            enabled: true,
+            platform: Platform::Other,
+            mac: None,
+            linux: None,
+            request: None,
+            now_ms: NOW,
+        });
+        assert_eq!(report.capture, no_backend);
+        assert_eq!(report.inject, no_backend);
+        assert_eq!(report.intercept, no_backend);
+        assert_eq!(report.helper.kind, HelperKind::None);
+        assert_eq!(report.helper.status, HelperStatus::Unknown);
+
+        // Linux without its gatherer's inputs is treated the same way.
+        let report = derive(&ProbeInputs {
+            platform: Platform::Linux,
+            ..inputs(true, mac(false, None, false), None)
+        });
+        let report_without_linux = derive(&ProbeInputs {
+            mac: None,
+            ..ProbeInputs {
+                platform: Platform::Linux,
+                ..inputs(true, mac(false, None, false), None)
+            }
+        });
+        assert_eq!(report_without_linux.capture, no_backend);
+        assert_eq!(report_without_linux.platform, Platform::Linux);
+        // A Linux platform tagged with macOS inputs only is not a macOS report.
+        assert_eq!(report.capture, no_backend);
     }
 }
