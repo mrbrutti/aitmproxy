@@ -22,6 +22,7 @@ fn status(listening: bool, capturing: bool) -> ProxyStatus {
         capturing,
         paused: 5,
         flows: 3,
+        system_proxy: None,
     }
 }
 
