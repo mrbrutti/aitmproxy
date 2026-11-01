@@ -1,0 +1,20 @@
+[package]
+name = "aitm-l4-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Packet-capture privilege helper: macOS /dev/bpf permission fix (bpf-permissions, bpf-revert) and the Linux CAP_NET_RAW serve mode behind the core's L4 guard."
+
+[[bin]]
+name = "aitm-l4-helper"
+path = "src/main.rs"
+
+[dependencies]
+# The helper wire protocol, the privilege receipt and the shared L4 guard
+# (spec §5.2, §5.3): the only product crate the helper links. No Rhai, no
+# `aitm-mcp`, no HTTP (plan unit p2 preamble; the P2.1 `cargo tree` tripwire).
+aitm-proto-l4.workspace = true
+
+[lints]
+workspace = true

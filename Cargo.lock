@@ -166,6 +166,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-l4-helper"
+version = "0.5.9"
+dependencies = [
+ "aitm-proto-l4",
+]
+
+[[package]]
 name = "aitm-mcp"
 version = "0.5.10"
 dependencies = [
