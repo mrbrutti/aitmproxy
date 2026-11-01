@@ -65,6 +65,18 @@ H21. G2's prescribed unit test: in `scan/issues.rs` the L4 mirror test folds 100
 
 Ratified from the G-A+G-B spec re-review: `ui::scan::{Hint, hints, HELP, key_text, rows, wrap, blocked_footer, launch_reason}` stay `pub` because `tests/scan_v2_layout.rs` (G88) reads `HELP`/`key_text` from outside the crate; `scroll(at, ..)` lives in `scan/mod.rs` as `pub(crate)` so `DetailView::scroll` can use it; `LaunchVerb::parse`, `ReadCache::is_empty`/`keys`, `CURSOR_TOO_LONG` and `GATE_OPEN_PROFILE` are accepted helpers.
 
+### Rust bounds (from the G-A+G-B security re-review; same Coder as the tidy, these first)
+
+H33. **Important.** `JobStatus.lanes.requested`/`lanes.run` are unbounded in count at fold and joined per frame in the Jobs Detail pane (`scan/jobs.rs` `bound_status`, `detail_lines`): sort, dedup and `shrink_to_fit` both in `bound_status` (four kinds at most). Test (`tests/scan_v2_jobs.rs`): a status with 100_000 `http` run lanes folds to `lanes.run == [Http]` and the detail line reads `run http` at 200x50.
+
+H34. The wire-confirm prompt is wrapped whole every frame (`ui/scan/confirm.rs` `wrap(&c.prompt, w, usize::MAX)`; `scan/launch.rs` `WireConfirm::from_reply`): cut `prompt` to `PROMPT_MAX = 2000` cells with `clean` in `from_reply`, and pass `usize::from(inner.height)` as `max_rows`. Test: a 1 MiB prompt renders in the box with an ellipsis.
+
+H35. Legacy `scan.discover` failure text kept unbounded and re-bounded per frame (`app.rs` `CallFailed` arm, `ui/scan/mod.rs`): store `truncate(&clean(&message), ERROR_DETAIL_MAX)` in `legacy.error`.
+
+H36. `scan.list` has no row-count cap (`scan/jobs.rs` `fold_list`): `JOBS_MAX = 256`; `list.jobs.truncate(JOBS_MAX)` before the retain-and-order logic (started-here ids are kept in front as today). Test: a list of 100_000 ids folds to 256 rows.
+
+(The Site map `cut` without `clean` is H22's `cut_to`.)
+
 ### Rust tidy (from the G-A+G-B quality re-review, one Coder after H18-H21)
 
 H22. One `pub(crate) fn cut_to(s: &mut String, max: usize)` in `text.rs` (clean, then truncate when over `max`) replaces the copied closure in `bound_issue`/`bound_status` and the private `cut` fns in `profiles.rs` and `sitemap.rs`; per-site constants stay; the Profiles and Site map sites now strip control characters too (state it in the doc).

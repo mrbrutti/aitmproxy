@@ -699,6 +699,10 @@ Kept by the main session during stage 6. One row per finding.
 | G-A+G-B | spec | Minor | spec D3 state shapes predate G-B | D3 amended |
 | G-A+G-B | quality re-review | PASS | every G item verified in place; eleven structural Minors | fix round H Rust tidy (H22-H32) |
 | G-A+G-B | quality | Minor | `cut` closure copied in four folds; `help_line_count` twin; scaffolding copied into the new suite; test-only `check_tree`; allocating `rows()`; `Launch` copied into `PendingLaunch`; key-table residue; `wants_l4` twice; two `not_found` literals; new clippy allow; hygiene | fix round H Rust tidy (H22-H32) |
+| G-A+G-B | security re-review | FAIL | every G security item verified in place (bounds, keyed replies, secrets, no unsafe) | G19 (H20) and H33 Important; H34-H36 Minor |
+| G-A+G-B | security | Important | G19 not landed | fix round H Rust (H20) |
+| G-A+G-B | security | Important | `JobStatus.lanes` unbounded in count at fold, joined per frame | fix round H Rust (H33) |
+| G-A+G-B | security | Minor | confirm prompt wrapped whole per frame; legacy error re-bounded per frame; Site map `cut` without `clean`; `scan.list` uncapped | fix round H Rust (H34, H35, H22, H36) |
 
 ## Shipped
 
