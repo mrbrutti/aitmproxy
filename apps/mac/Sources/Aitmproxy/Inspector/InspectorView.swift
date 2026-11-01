@@ -582,6 +582,8 @@ struct ResponsePane: View {
         // The summary says the flow reached its response park (a status while paused) before the
         // detail does: fetch the parked response so the editor has something to edit.
         .onChange(of: editsResponse, initial: true) { if editsResponse { session.refreshParkedResponse(row.id) } }
+        // …and again when the operator comes back to the row, so a fetch that failed is retried.
+        .onChange(of: row.id) { if editsResponse { session.refreshParkedResponse(row.id) } }
     }
 
     @ViewBuilder private var diff: some View {

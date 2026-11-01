@@ -13,9 +13,11 @@ struct RawRequestEditor: View {
     @State private var text = ""
     @State private var parseError: RawHTTP.ParseError?
 
-    /// The message as the proxy holds it now, and the copy Revert goes back to.
-    private var target: HTTPMessage { phase == .response ? detail.response ?? detail.request : detail.request }
-    private var original: HTTPMessage { phase == .response ? target : detail.originalRequest ?? detail.request }
+    /// The message as the proxy holds it now, and the copy Revert goes back to (one
+    /// mapping, `FlowDetail.message(for:)`; the panes show this editor only once that
+    /// message exists, so the fallback is never shown).
+    private var target: HTTPMessage { detail.message(for: phase) ?? detail.request }
+    private var original: HTTPMessage { detail.original(for: phase) ?? target }
     private var draft: HTTPMessage { session.currentDraft(row.id) ?? target }
     private var noun: String { phase.rawValue }
 
@@ -27,7 +29,7 @@ struct RawRequestEditor: View {
                      onTextChange: { new in
             text = new
             do {
-                let message = try RawHTTP.parse(new)
+                let message = try RawHTTP.parse(new, expecting: phase)
                 parseError = nil
                 session.updateDraft(row.id, message)
             } catch {
@@ -41,7 +43,7 @@ struct RawRequestEditor: View {
         .onChange(of: row.id) { text = RawHTTP.render(draft); parseError = nil }
         // The Headers table (or a revert) changed the draft: re-render unless the text already says the same.
         .onChange(of: session.editDrafts[row.id]) {
-            if (try? RawHTTP.parse(text)) != draft { text = RawHTTP.render(draft); parseError = nil }
+            if (try? RawHTTP.parse(text, expecting: phase)) != draft { text = RawHTTP.render(draft); parseError = nil }
         }
     }
 
@@ -61,6 +63,15 @@ struct RawRequestEditor: View {
                         .lineLimit(1).truncationMode(.middle)
                         .accessibilityIdentifier("removal-warning")
                         .accessibilityValue(removed.joined(separator: ","))
+                } else if !session.unencodableHeaders(row.id).isEmpty {
+                    // flow.mutate carries one value per header name: a changed multi-value
+                    // header is not sent at all rather than collapsed to one line.
+                    let names = session.unencodableHeaders(row.id)
+                    Text("Multi-value header edits need a core follow-up — \(names.joined(separator: ", ")) will keep the original values")
+                        .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Intercept.deep.color)
+                        .lineLimit(1).truncationMode(.middle)
+                        .accessibilityIdentifier("multivalue-warning")
+                        .accessibilityValue(names.joined(separator: ","))
                 } else {
                     let n = session.pendingEditCount(row.id)
                     Text(n == 0 ? "No edits yet — Resume forwards the \(noun) unchanged."
@@ -95,8 +106,8 @@ struct EditableHeaderTable: View {
     var detail: FlowDetail
     var phase: InterceptPhase = .request
 
-    private var target: HTTPMessage { phase == .response ? detail.response ?? detail.request : detail.request }
-    private var original: HTTPMessage { phase == .response ? target : detail.originalRequest ?? detail.request }
+    private var target: HTTPMessage { detail.message(for: phase) ?? detail.request }
+    private var original: HTTPMessage { detail.original(for: phase) ?? target }
     private var draft: HTTPMessage { session.currentDraft(row.id) ?? target }
     private var originalNames: Set<String> { Set(original.headers.map(\.name)) }
 

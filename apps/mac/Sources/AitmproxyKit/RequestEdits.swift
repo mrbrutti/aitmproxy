@@ -74,15 +74,40 @@ public struct RequestEdits: Hashable, Sendable {
         return edits
     }
 
+    /// Headers and body edits. Headers are compared as the list of values per name,
+    /// so a message with two `set-cookie` lines and an untouched header list yields
+    /// no header edit. `flow.mutate {headers}` carries one value per name (the core
+    /// removes every header of that name, then sets the one), so a changed name is
+    /// encoded only when its edited list has exactly one value; a multi-value
+    /// change is left out and reported by `unencodableHeaderNames`, never collapsed.
     private static func headersAndBody(from original: HTTPMessage, to edited: HTTPMessage) -> RequestEdits {
         var edits = RequestEdits()
         var changed: [String: String] = [:]
-        for header in edited.headers where original.header(header.name) != header.value {
-            changed[header.name] = header.value
+        let before = valuesByName(original)
+        for (name, values) in valuesByName(edited) where before[name] != values && values.count == 1 {
+            changed[name] = values[0]
         }
         if !changed.isEmpty { edits.headers = changed }
         if original.body != edited.body { edits.body = edited.body ?? Data() }
         return edits
+    }
+
+    /// Header values grouped by lowercased name, in message order.
+    static func valuesByName(_ message: HTTPMessage) -> [String: [String]] {
+        var byName: [String: [String]] = [:]
+        for header in message.headers { byName[header.name.lowercased(), default: []].append(header.value) }
+        return byName
+    }
+
+    /// Names whose edited values differ from the original and have more than one
+    /// value — a change `flow.mutate {headers}` cannot carry (one value per name).
+    /// `diff` leaves them out so the client never gets a collapsed header; the UI
+    /// says so, as it does for a removal.
+    public static func unencodableHeaderNames(from original: HTTPMessage, to edited: HTTPMessage) -> [String] {
+        let before = valuesByName(original)
+        return valuesByName(edited)
+            .filter { name, values in before[name] != values && values.count > 1 }
+            .keys.sorted()
     }
 
     /// Header names present in `original` but absent in `edited` — an attempted

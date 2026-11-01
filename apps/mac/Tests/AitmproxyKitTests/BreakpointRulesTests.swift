@@ -28,13 +28,17 @@ import Testing
         #expect(set.armedNotice == "Intercept armed — every request pauses here")
         set.rules = [BreakpointRule(name: "login", url: "*/login", onResponse: true, flag: .red), BreakpointRule(url: "x", enabled: false)]
         #expect(set.armedNotice == "Intercept armed — 1 rule")
-        // Only the core's rule fields travel (`match` and `flag` would reject the whole call),
-        // and `url` is the core's object form, so a regex is a regex on the core too.
-        #expect(set.rules[0].arguments == ["id": .string(set.rules[0].id.uuidString), "url": ["wildcard": "*/login"],
+        // Only the core's rule fields travel (`match` and `flag` would reject the whole call), and
+        // `url` is the core's `{regex}` object built by the same conversion the preview uses.
+        #expect(set.rules[0].arguments == ["id": .string(set.rules[0].id.uuidString), "url": ["regex": "(?i)^.*/login$"],
                                             "phase": "any", "name": "login"])
-        // A substring wildcard is anchored on the core, so it travels wrapped in `*`.
-        #expect(BreakpointRule(url: "login").arguments["url"] == ["wildcard": "*login*"])
+        // No `*`/`?` → substring; `?` → one character; regex metacharacters are escaped for both engines.
+        #expect(BreakpointRule(url: "login").arguments["url"] == ["regex": "(?i)^.*login.*$"])
+        #expect(BreakpointRule(url: "/api/?", onRequest: false, onResponse: true).arguments["url"] == ["regex": "(?i)^/api/.$"])
         #expect(BreakpointRule(url: "/api/?", onRequest: false, onResponse: true).arguments["phase"] == "response")
+        #expect(BreakpointRule.wildcardRegex("*/search?q=(1+1)") == "^.*/search.q=\\(1\\+1\\)$")
+        #expect(BreakpointRule.wildcardMatches(pattern: "*/search?q=(1+1)", text: "https://a.test/search?q=(1+1)"))
+        #expect(!BreakpointRule.wildcardMatches(pattern: "*/search?q=(1+1)", text: "https://a.test/search?q=11"))
         #expect(BreakpointRule(url: "^/x$", matching: .regex, method: "post").arguments["url"] == ["regex": "^/x$"])
         #expect(BreakpointRule(url: "^/x$", matching: .regex, method: "post").arguments["method"] == "POST")
         #expect(set.matchCount(of: BreakpointRule(url: "*shop-staging*"), in: Fixtures.rows) == 13)

@@ -56,6 +56,39 @@ import Testing
         #expect(RequestEdits.diff(fromResponse: response, to: response).isEmpty)
     }
 
+    @Test func duplicateHeadersAreNeverCollapsedByAnEdit() {
+        // A real response with two set-cookie lines: a status-only edit must not touch them.
+        let cookies = HTTPMessage(
+            startLine: "HTTP/1.1 200 OK",
+            headers: [.init("set-cookie", "a=1"), .init("set-cookie", "b=2"), .init("vary", "Accept")])
+        var statusOnly = cookies
+        statusOnly.startLine = "HTTP/1.1 203 OK"
+        let edits = RequestEdits.diff(fromResponse: cookies, to: statusOnly)
+        #expect(edits.status == 203)
+        #expect(edits.headers == nil)
+        #expect(edits.changeCount == 1)
+        #expect(RequestEdits.unencodableHeaderNames(from: cookies, to: statusOnly).isEmpty)
+        // Changing one of the two values cannot cross as `{name: value}`: it is reported, not sent.
+        var secondCookie = cookies
+        secondCookie.headers[1].value = "b=3"
+        let partial = RequestEdits.diff(fromResponse: cookies, to: secondCookie)
+        #expect(partial.headers == nil && partial.isEmpty)
+        #expect(RequestEdits.unencodableHeaderNames(from: cookies, to: secondCookie) == ["set-cookie"])
+        // A single-valued header still edits; deleting one of two lines leaves one value, which the
+        // core can carry (remove every set-cookie, set the one that remains).
+        var vary = cookies
+        vary.headers[2].value = "Accept, Origin"
+        #expect(RequestEdits.diff(fromResponse: cookies, to: vary).headers == ["vary": "Accept, Origin"])
+        var oneCookie = cookies
+        oneCookie.headers.remove(at: 1)
+        #expect(RequestEdits.diff(fromResponse: cookies, to: oneCookie).headers == ["set-cookie": "a=1"])
+        #expect(RequestEdits.unencodableHeaderNames(from: cookies, to: oneCookie).isEmpty)
+        // Header names compare case-insensitively, as the core treats them.
+        var cased = cookies
+        cased.headers[2] = .init("Vary", "Accept")
+        #expect(RequestEdits.diff(fromResponse: cookies, to: cased).isEmpty)
+    }
+
     @Test func aReasonPhraseAloneIsNotAStatusEdit() {
         var edited = response
         edited.startLine = "HTTP/2 200"
@@ -74,5 +107,30 @@ import Testing
         #expect(edited.bodyText == "nope")
         #expect((try? RawHTTP.parse("HTTP/2 teapot\n")) == nil)
         #expect((try? RawHTTP.parse("HTTP/2 99\n")) == nil)
+        // The core accepts 100–599 only.
+        #expect((try? RawHTTP.parse("HTTP/2 700\n")) == nil)
+        #expect(HTTPMessage(startLine: "HTTP/2 700", headers: []).statusCode == nil)
+    }
+
+    @Test func theParserKnowsWhichKindOfMessageAnEditorExpects() {
+        // A status line typed into the request editor is an error on line 1, not a silent drop.
+        #expect(throws: RawHTTP.ParseError.self) { try RawHTTP.parse("HTTP/2 200 OK\n", expecting: .request) }
+        #expect(throws: RawHTTP.ParseError.self) { try RawHTTP.parse("GET /x HTTP/2\n", expecting: .response) }
+        #expect((try? RawHTTP.parse("HTTP/2 200 OK\n", expecting: .response))?.statusCode == 200)
+        #expect((try? RawHTTP.parse("GET /x HTTP/2\n", expecting: .request))?.startLine == "GET /x HTTP/2")
+    }
+
+    @Test func headerNamesAndValuesAreValidatedWithTheLine() {
+        // What the core would refuse (`HeaderMap::try_set`) is refused here, naming the line.
+        for bad in ["HTTP/2 200\nx\"y: 1\n", "HTTP/2 200\nx(y): 1\n", "HTTP/2 200\nok: a\rb\n", "HTTP/2 200\nok: a\u{1}b\n"] {
+            do {
+                _ = try RawHTTP.parse(bad)
+                Issue.record("expected a parse error for \(bad.debugDescription)")
+            } catch {
+                #expect(error.line == 2)
+            }
+        }
+        let fine = try? RawHTTP.parse("HTTP/2 200\nx-aitm_edited.1: a\tb\n")
+        #expect(fine?.headers == [.init("x-aitm_edited.1", "a\tb")])
     }
 }

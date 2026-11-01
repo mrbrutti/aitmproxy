@@ -15,11 +15,14 @@ host ws_dir`, phases `request|response|any`, and rejects one unknown key for the
 whole call. It also sent a regex pattern as a bare `url` string, which the core
 reads as a wildcard, and the core anchors a wildcard (`^…$` on the path) where the
 app's preview matches a plain pattern as a substring.
-Fix: the wire form carries only the core's fields, `any` for both phases, a
-substring wildcard wrapped in `*`, and no `url` for a regex rule (there is no
-string form; the object form `{regex}` needs the bus call to send objects, a
-follow-up in `BusService.setIntercept`). The live self-test now arms a response
-rule on a real core and reads what curl received.
+Fix: the wire form carries only the core's fields, `any` for both phases, and
+`url` as the core's `{regex}` object: a regex rule travels as written, a wildcard
+as the regex the app's own preview uses (`*` any run, `?` one character, no
+`*`/`?` a substring, case-insensitive), because the core's wildcard form has no
+`?`, no substring match and is case-sensitive, so the preview and the core would
+disagree. `BusService.setIntercept` sends the objects unchanged. The live self-test arms a response rule and a
+request rule on a real core: the matching request parks, the other passes, and
+the edited response is what curl receives.
 Rule: a wire form is proven against the real core, never against the fixture
 double — one unknown key refuses the whole call and the fixture never says so.
 

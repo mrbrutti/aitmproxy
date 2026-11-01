@@ -153,12 +153,14 @@ extension SelfTest {
                     // The app fetches the detail when a row is selected; here nothing is selected,
                     // so fetch it until the parked response head is in it (the park is at
                     // ResponseHeaders: the head exists the moment the row reads paused).
-                    for _ in 0..<12 where session.details[parked.id]?.response == nil {
+                    var attempts = 0
+                    while attempts < 12, session.details[parked.id]?.response == nil {
+                        attempts += 1
                         await session.loadDetail(parked.id)
                         if session.details[parked.id]?.response == nil { try? await Task.sleep(for: .milliseconds(500)) }
                     }
                     let head = session.details[parked.id]?.response
-                    check("a response rule parks at the response head: the detail carries the response, the strip reads Paused · response",
+                    check("a response rule parks at the response head: the row is parked at the response (Paused · response) and the detail carries it",
                           session.parkedPhase(parked.id) == .response && head?.statusCode != nil,
                           "phase \(String(describing: session.parkedPhase(parked.id))) response \(head?.startLine ?? "nil")")
                     if var edited = head {
@@ -175,7 +177,7 @@ extension SelfTest {
                         check("the client received the edited status and header (flow.mutate on the parked response, then flow.resume)",
                               lines.first?.contains(" 203 ") == true && lines.contains { $0.lowercased() == "x-aitm-edited: 1" } && session.lastError == nil,
                               "curl exit \(curl3.terminationStatus) head \(lines.prefix(6).joined(separator: " | ")) err \(session.lastError ?? "-")")
-                        check("the client received the edited body", received.hasSuffix("edited by aitmproxy"),
+                        check("the client received the edited body", received.hasSuffix("edited by aitmproxy") && curl3.terminationStatus == 0,
                               "tail \(received.suffix(80).replacingOccurrences(of: "\r\n", with: "⏎"))")
                         await settle { session.rows.first { $0.id == parked.id }?.edited == true }
                         check("the Edited pencil appears on the resumed row", session.rows.first { $0.id == parked.id }?.edited == true)

@@ -54,8 +54,8 @@ extension Session {
     /// or the response when the flow is parked there (nil until that response's
     /// detail has been fetched).
     func editTarget(_ id: FlowID) -> HTTPMessage? {
-        guard let detail = details[id] else { return nil }
-        return parkedPhase(id) == .response ? detail.response : detail.request
+        guard let detail = details[id], let phase = parkedPhase(id) else { return nil }
+        return detail.message(for: phase)
     }
 
     /// A row parked at the response head whose cached detail predates the park (it
@@ -66,12 +66,13 @@ extension Session {
         Task { await loadDetail(id) }
     }
 
-    /// The draft that belongs to the flow's current phase. A request draft left
+    /// The draft that belongs to the flow's current park. A request draft left
     /// behind when a flow moved on to its response park (resumed by the agent, say)
-    /// is not a response draft: it is ignored here and replaced by the next edit.
+    /// is not a response draft, and a flow that is no longer paused has no draft at
+    /// all: both are ignored here and replaced by the next edit.
     func currentDraft(_ id: FlowID) -> HTTPMessage? {
-        guard let draft = editDrafts[id] else { return nil }
-        return draft.isResponse == (parkedPhase(id) == .response) ? draft : nil
+        guard let phase = parkedPhase(id), let draft = editDrafts[id], draft.isResponse == (phase == .response) else { return nil }
+        return draft
     }
 
     /// Edits the draft would send, against what the proxy currently holds.
@@ -88,6 +89,14 @@ extension Session {
     func removedHeaders(_ id: FlowID) -> [String] {
         guard let draft = currentDraft(id), let target = editTarget(id) else { return [] }
         return RequestEdits.removedHeaderNames(from: target, to: draft)
+    }
+
+    /// Header names the draft changed to more than one value (two `set-cookie`
+    /// lines, say). `flow.mutate` carries one value per name, so the diff leaves
+    /// these out rather than collapse them; the UI says they keep their original values.
+    func unencodableHeaders(_ id: FlowID) -> [String] {
+        guard let draft = currentDraft(id), let target = editTarget(id) else { return [] }
+        return RequestEdits.unencodableHeaderNames(from: target, to: draft)
     }
 
     /// `Apply & Resume`: mutate with the pending edits, then resume (§4.5). The

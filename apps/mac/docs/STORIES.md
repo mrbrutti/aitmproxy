@@ -635,16 +635,17 @@ UX:
 - States: invalid regex / empty URL -> inline error under the field, Save disabled; no rules -> "Every request pauses" note; live before F3 -> rules kept locally and the bar says "rules need F3"
 - Words: sheet title "Breakpoint Rules"; buttons "Add Rule", "Remove", "Test your rule", "Save ⌘⏎", "Cancel"
 - Access: table rows selectable by keyboard; form fields in reading order
+Live: 2026-10-31, the first time the rules reached a real core (PR #202): `flow.intercept` accepts the app's rule set, a request rule `park` parks `/park` and lets `/` through, a response rule parks the response head (live self-test). The rule `flag` stays in the app and is not applied on park yet — follow-up.
 Status: done
 
 ### S-041 Intercept and edit a response
 As the operator, I pause at the response phase and change status, headers or body before the client sees it.
-Screens: apps
+Screens: apps (the inspector on the flow list; no snapshot scene — fixture scenes are not evidence and are being removed, Matt 2026-10-31)
 Depends: S-037, S-040
 Core: F3
 Acceptance:
-- [snap] The summary pill reads `Paused · response`; the Response pane becomes editable like the request.
-- [self] Apply & Resume sends the response edits then `flow.resume`; the Edited pencil appears.
+- [live] The summary pill reads `Paused · response`; the Response pane becomes editable like the request (real core, real parked response).
+- [live] Apply & Resume sends the response edits then `flow.resume`; the client receives them; the Edited pencil appears (live self-test + screenshots).
 UX:
 - Flow: a rule with ☑ Response pauses at the response -> summary pill `Paused · response` -> Response pane editable (status, headers, body) -> Apply & Resume
 - Surface: inline in the inspector
