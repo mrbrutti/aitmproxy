@@ -10,8 +10,8 @@ use aitm_tui::action::{BusEvent, BusRequest, ToolInfo};
 use aitm_tui::app::App;
 use aitm_tui::caps::TermCaps;
 use aitm_tui::l4::{
-    ascii_column, flow_get_args, hex_dump, inspect_args, status_ids, supports_operator_scope_add,
-    supports_window, L4Availability, L4Flow, L4Parked, L4State,
+    ascii_column, flow_get_args, fold_status, hex_dump, inspect_args, slow_l4_reads, status_ids,
+    supports_operator_scope_add, supports_window, L4Availability, L4Flow, L4Parked, L4State,
 };
 use serde_json::{json, Value};
 
@@ -441,4 +441,167 @@ fn models_bus_events_fold_into_l4_state() {
     assert_eq!(out, Vec::<BusRequest>::new());
     assert_eq!(app.l4.parked_for("F").map(|p| p.id.as_str()), Some("P1"));
     assert_eq!(app.l4.parked[0].parked_at, Some(1_700_000_000_000));
+}
+
+// ----------------------------------------------------------------- polling
+
+/// Spec §1: the slow pass re-reads both status verbs every time; spec §4: it
+/// asks for `l4.intercept.list` only when intercept is available, and the
+/// statuses come first so one pass's status read governs its list read.
+#[test]
+fn polling_slow_reads_status_always_and_parked_only_when_available() {
+    let unavailable = slow_l4_reads(|_| true, false);
+    assert!(unavailable.contains(&"l4.capture.status"));
+    assert!(unavailable.contains(&"l4.intercept.status"));
+    assert!(!unavailable.contains(&"l4.intercept.list"));
+
+    let available = slow_l4_reads(|_| true, true);
+    assert!(available.contains(&"l4.intercept.list"));
+    assert_eq!(
+        available,
+        vec![
+            "l4.scope.list",
+            "l4.agent.status",
+            "l4.capture.status",
+            "l4.intercept.status",
+            "l4.intercept.list",
+        ]
+    );
+}
+
+/// Only verbs the bus offers are read: a core without the intercept verbs is
+/// never asked for them, and a bus without `l4.*` reads nothing.
+#[test]
+fn polling_slow_reads_only_offered_verbs() {
+    let no_intercept = |t: &str| !t.starts_with("l4.intercept.");
+    assert_eq!(
+        slow_l4_reads(no_intercept, true),
+        vec!["l4.scope.list", "l4.agent.status", "l4.capture.status"]
+    );
+    assert_eq!(slow_l4_reads(|_| false, true), Vec::<&str>::new());
+    assert_eq!(slow_l4_reads(|_| false, false), Vec::<&str>::new());
+}
+
+/// Spec §1: a status reply folds through `from_reply` + `status_ids`; a tool
+/// error carrying `L4 unavailable: ` through `from_error`; any other tool error
+/// is honestly unavailable with its text as the reason. No ids on an error.
+#[test]
+fn polling_status_outcome_folds_replies_and_tool_errors() {
+    let ac3 = json!({"available": false, "code": "needs_privilege", "reason": "X", "captures": []});
+    assert_eq!(
+        fold_status(Ok(&ac3), "captures"),
+        (
+            L4Availability {
+                available: false,
+                code: Some("needs_privilege".into()),
+                reason: Some("X".into()),
+            },
+            Vec::new()
+        )
+    );
+    let running =
+        json!({"available": true, "code": "available", "reason": null, "captures": ["C1", "C2"]});
+    assert_eq!(
+        fold_status(Ok(&running), "captures"),
+        (
+            L4Availability {
+                available: true,
+                code: Some("available".into()),
+                reason: None,
+            },
+            vec!["C1".to_string(), "C2".to_string()]
+        )
+    );
+    // An older core's bare array: available, and the ids are the array.
+    assert_eq!(
+        fold_status(Ok(&json!(["C1"])), "captures"),
+        (
+            L4Availability {
+                available: true,
+                code: None,
+                reason: None,
+            },
+            vec!["C1".to_string()]
+        )
+    );
+    // An older core's gated error: the reason is exactly the text after the marker.
+    assert_eq!(
+        fold_status(Err("l4.capture.status: L4 unavailable: X"), "captures"),
+        (
+            L4Availability {
+                available: false,
+                code: None,
+                reason: Some("X".into()),
+            },
+            Vec::new()
+        )
+    );
+    // Any other tool error: unavailable, the error text as the reason.
+    assert_eq!(
+        fold_status(Err("internal error (-32603)"), "sessions"),
+        (
+            L4Availability {
+                available: false,
+                code: None,
+                reason: Some("internal error (-32603)".into()),
+            },
+            Vec::new()
+        )
+    );
+}
+
+/// Spec §1 end to end in the reducer: pending until the first reply, then the
+/// AC3 / AC4 objects land as the app's availability with no toast and no
+/// request; a later flip to available (D0 at runtime) replaces them.
+#[test]
+fn polling_availability_replies_land_in_app_state() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert_eq!(app.l4.capture, L4Availability::pending());
+    assert_eq!(app.l4.intercept, L4Availability::pending());
+    assert_eq!(
+        app.l4.capture.reason.as_deref(),
+        Some("Reading L4 availability…")
+    );
+
+    let ac3 =
+        json!({"available": false, "code": "needs_privilege", "reason": "R_CAP", "captures": []});
+    let ac4 = json!({
+        "available": false, "code": "unsupported_platform", "reason": "R_INT", "sessions": []
+    });
+    let (capture, captures) = fold_status(Ok(&ac3), "captures");
+    let (intercept, _) = fold_status(Ok(&ac4), "sessions");
+    let out = app.on_bus(BusEvent::L4Availability {
+        capture,
+        intercept,
+        captures,
+    });
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert_eq!(app.l4.capture.code, Some("needs_privilege".into()));
+    assert!(!app.l4.capture.available);
+    assert_eq!(app.l4.capture.reason.as_deref(), Some("R_CAP"));
+    assert_eq!(app.l4.intercept.code, Some("unsupported_platform".into()));
+    assert_eq!(app.l4.intercept.reason.as_deref(), Some("R_INT"));
+    assert!(app.l4.captures.is_empty());
+    assert!(
+        app.current_toast().is_none(),
+        "an availability change never toasts"
+    );
+
+    // Availability is never cached: the next slow pass's reply wins.
+    let lit = json!({"available": true, "code": "available", "reason": null, "captures": ["C1"]});
+    let (capture, captures) = fold_status(Ok(&lit), "captures");
+    let out = app.on_bus(BusEvent::L4Availability {
+        capture,
+        intercept: app.l4.intercept.clone(),
+        captures,
+    });
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert!(app.l4.capture.available);
+    assert_eq!(app.l4.capture.code, Some("available".into()));
+    assert_eq!(app.l4.captures, vec!["C1".to_string()]);
+    assert!(
+        app.current_toast().is_none(),
+        "an availability change never toasts"
+    );
 }

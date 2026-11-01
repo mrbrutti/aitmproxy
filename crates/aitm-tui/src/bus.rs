@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::action::{BusEvent, BusRequest, Level, ToolInfo};
+use crate::l4::{flow_get_args, fold_status, slow_l4_reads, supports_window, L4Availability};
 use crate::model::{AgentState, Finding, FlowDetail, ProxyStatus};
 
 /// Client name sent in `initialize.clientInfo` (§4.2).
@@ -95,6 +96,13 @@ struct Session {
     /// Last summary per flow id, to skip `flow.get` on settled flows.
     summaries: HashMap<String, Value>,
     polls: u64,
+    /// What `l4.capture.status` said last (L4 parity spec §1); pending until
+    /// the first slow pass, re-read on every one, never cached for the session.
+    capture: L4Availability,
+    /// What `l4.intercept.status` said last; gates the `l4.intercept.list` read.
+    intercept: L4Availability,
+    /// The running capture ids from the last `l4.capture.status`.
+    captures: Vec<String>,
 }
 
 impl Session {
@@ -105,6 +113,9 @@ impl Session {
             tools: Vec::new(),
             summaries: HashMap::new(),
             polls: 0,
+            capture: L4Availability::pending(),
+            intercept: L4Availability::pending(),
+            captures: Vec::new(),
         }
     }
 
@@ -254,17 +265,7 @@ impl Session {
                     self.emit(BusEvent::Agent(a)).await?;
                 }
             }
-            if self.has("l4.scope.list") {
-                if let Value::Array(entries) = self.panel("l4.scope.list").await? {
-                    self.emit(BusEvent::L4Scope(entries)).await?;
-                }
-            }
-            if self.has("l4.agent.status") {
-                let v = self.panel("l4.agent.status").await?;
-                if v.is_object() {
-                    self.emit(BusEvent::L4Agent(v)).await?;
-                }
-            }
+            self.l4_slow_pass().await?;
             if self.has("poc.list") {
                 if let Value::Array(items) = self.panel("poc.list").await? {
                     let findings = items.iter().filter_map(Finding::from_json).collect();
@@ -289,9 +290,85 @@ impl Session {
         Ok(())
     }
 
+    /// The slow `l4.*` reads (L4 parity spec §1, §4), walking
+    /// [`slow_l4_reads`] in its order: the scope and agent panels; both status
+    /// verbs every pass, folded through [`fold_status`] (an `L4 unavailable: `
+    /// tool error is an honest unavailable, never a toast) and reported as one
+    /// [`BusEvent::L4Availability`]; `l4.intercept.list` only while the last
+    /// `l4.intercept.status` said available. A transport failure ends the
+    /// session like anywhere else.
+    async fn l4_slow_pass(&mut self) -> Result<(), Outcome> {
+        let reads = slow_l4_reads(|t| self.has(t), self.intercept.available);
+        let mut status_read = false;
+        for name in reads {
+            match name {
+                "l4.scope.list" => {
+                    if let Value::Array(entries) = self.panel(name).await? {
+                        self.emit(BusEvent::L4Scope(entries)).await?;
+                    }
+                }
+                "l4.agent.status" => {
+                    let v = self.panel(name).await?;
+                    if v.is_object() {
+                        self.emit(BusEvent::L4Agent(v)).await?;
+                    }
+                }
+                "l4.capture.status" => {
+                    let (availability, ids) = self.status(name, "captures").await?;
+                    self.capture = availability;
+                    self.captures = ids;
+                    status_read = true;
+                }
+                "l4.intercept.status" => {
+                    let (availability, _) = self.status(name, "sessions").await?;
+                    self.intercept = availability;
+                    status_read = true;
+                }
+                "l4.intercept.list" => {
+                    // Listed because the previous status said available; the
+                    // status just read above may have withdrawn that.
+                    if !self.intercept.available {
+                        continue;
+                    }
+                    if let Value::Array(parked) = self.panel(name).await? {
+                        self.emit(BusEvent::L4Parked(parked)).await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if status_read {
+            self.emit(BusEvent::L4Availability {
+                capture: self.capture.clone(),
+                intercept: self.intercept.clone(),
+                captures: self.captures.clone(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Read one status verb (`l4.capture.status` / `l4.intercept.status`) and
+    /// fold it: a reply or a tool error through [`fold_status`]; a transport
+    /// failure ends the session.
+    async fn status(
+        &self,
+        name: &str,
+        key: &str,
+    ) -> Result<(L4Availability, Vec<String>), Outcome> {
+        let outcome = match self.client.call(name, json!({})).await {
+            Ok(v) => Ok(v),
+            Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
+            Err(e) => Err(error_text(e)),
+        };
+        Ok(fold_status(outcome.as_ref().map_err(String::as_str), key))
+    }
+
     /// One pass over the L4 flow store (ui-ext Part 3): `l4.flow.list` → ids,
-    /// `l4.flow.get` per id. A per-flow tool error is skipped (the flow keeps
-    /// what the app has); only a dead transport ends the session.
+    /// `l4.flow.get` per id with `limit: 0` on a core that declares the §2
+    /// window (flow fields only; the inspector fetches packets). A per-flow
+    /// tool error is skipped (the flow keeps what the app has); only a dead
+    /// transport ends the session.
     async fn l4_poll(&mut self) -> Result<(), Outcome> {
         let ids = match self.client.call("l4.flow.list", json!({})).await {
             Ok(Value::Array(ids)) => ids
@@ -302,9 +379,14 @@ impl Session {
             Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
             Err(e) => return self.call_failed("l4.flow.list", e).await,
         };
+        let window = supports_window(&self.tools);
         let mut flows = Vec::with_capacity(ids.len());
         for id in &ids {
-            match self.client.call("l4.flow.get", json!({ "id": id })).await {
+            match self
+                .client
+                .call("l4.flow.get", flow_get_args(id, window))
+                .await
+            {
                 Ok(v) => flows.push(v),
                 Err(BusError::Transport(e)) => return Err(Outcome::Lost(format!("{e:#}"))),
                 Err(_) => {}

@@ -362,6 +362,48 @@ impl L4Parked {
     }
 }
 
+// ------------------------------------------------------------- slow reads
+
+/// The slow pass's `l4.*` reads, in order (spec §1, §4): the L4 scope and
+/// agent panels, then both status verbs every time (availability is never
+/// cached for the session), then `l4.intercept.list` only while intercept is
+/// available — a core whose intercept is unavailable is never asked for its
+/// parked list. Only verbs the bus offers (`has`) are listed. The statuses
+/// precede the list so a status read in one pass governs that pass's list.
+pub fn slow_l4_reads(has: impl Fn(&str) -> bool, intercept_available: bool) -> Vec<&'static str> {
+    const ALWAYS: [&str; 4] = [
+        "l4.scope.list",
+        "l4.agent.status",
+        "l4.capture.status",
+        "l4.intercept.status",
+    ];
+    let mut out: Vec<&'static str> = ALWAYS.into_iter().filter(|t| has(t)).collect();
+    if intercept_available && has("l4.intercept.list") {
+        out.push("l4.intercept.list");
+    }
+    out
+}
+
+/// Fold one status verb's outcome (spec §1): a reply through
+/// [`L4Availability::from_reply`] and [`status_ids`] under `key` (`captures` /
+/// `sessions`); a tool error through [`L4Availability::from_error`], or, when
+/// it is not an `L4 unavailable: ` error, honestly unavailable with the error
+/// text as the reason. An error lists no ids. A transport error never reaches
+/// here: it ends the bus session.
+pub fn fold_status(outcome: Result<&Value, &str>, key: &str) -> (L4Availability, Vec<String>) {
+    match outcome {
+        Ok(v) => (L4Availability::from_reply(v), status_ids(v, key)),
+        Err(text) => (
+            L4Availability::from_error(text).unwrap_or_else(|| L4Availability {
+                available: false,
+                code: None,
+                reason: Some(text.to_string()),
+            }),
+            Vec::new(),
+        ),
+    }
+}
+
 // ------------------------------------------------------- tool-shaped args
 
 fn tool<'a>(tools: &'a [ToolInfo], name: &str) -> Option<&'a ToolInfo> {
