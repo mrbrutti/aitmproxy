@@ -312,7 +312,11 @@ read CONNECT head  →  created = now; authority = Authority(host, port|443)
 
 Raw TLS (no CONNECT): the authority is `sni` + port rule of D1; `!in_scope` →
 relay with the peeked bytes still in the stream (the `Prefixed` reader keeps them);
-no SNI → `failed/protocol_error` as today's error, now with a row.
+no SNI → `failed/protocol_error` as today's error, with a row keyed on the original
+destination **on the capture path** (the ingress hands over `dst`); on the
+explicit-proxy path there is no authority to key a row on (`dst` there is the
+client's own address), so that connection stays rowless as before (amended
+2026-11-01 from the Tester's T3).
 
 The passthrough module's path is the same list minus the TLS branch: parse →
 dial → (dial error → `failed/upstream_unreachable`) → ack → row `passthrough` →
