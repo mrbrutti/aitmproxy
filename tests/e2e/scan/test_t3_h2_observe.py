@@ -117,19 +117,23 @@ def run_on(op, target, label: str) -> tuple[list, list]:
     return issues(op, "operator", job=job), conns
 
 
-def assert_rejections(op, target, label: str) -> None:
+def assert_rejections(cfg, target, label: str) -> None:
     """The three silent checks really wrote their malformed variants: by hand, each
     answers Clean with a verdict that names the rejection (hyper resets or GOAWAYs
     the malformed header block), so "no issue" above is a true negative and not a
-    probe that sent nothing."""
-    for check_id in SILENT_CHECKS:
-        v = scan_call(op, "operator", f"check.{check_id}",
-                      {"url": f"{target.tls_base}/search", "param": "q"}, confirm=True)
-        v = json.loads(v) if isinstance(v, str) else v
-        detail = str(v.get("detail", ""))
-        check(str(v.get("outcome", "")).lower() == "clean" and "rejected" in detail,
-              f"{label}: check.{check_id} by hand is clean with a rejection in its detail "
-              f"(observed {v.get('outcome')!r}: {detail[:120]})")
+    probe that sent nothing. Each check observes an origin once per ten minutes
+    per check instance, and the job just did, so the manual run uses a core of
+    its own (fresh instances) against the same target."""
+    with Aitm.server(cfg) as fresh:
+        op = BusClient.operator(fresh)
+        for check_id in SILENT_CHECKS:
+            v = scan_call(op, "operator", f"check.{check_id}",
+                          {"url": f"{target.tls_base}/search", "param": "q"}, confirm=True)
+            v = json.loads(v) if isinstance(v, str) else v
+            detail = str(v.get("detail", ""))
+            check(str(v.get("outcome", "")).lower() == "clean" and "rejected" in detail,
+                  f"{label}: check.{check_id} by hand is clean with a rejection in its detail "
+                  f"(observed {v.get('outcome')!r}: {detail[:120]})")
 
 
 def assert_issue_set(op, iss, label: str) -> set:
@@ -186,7 +190,7 @@ def main() -> None:
 
             section("the observe-only h2 checks on V")
             iss_v, conns_v = run_on(op, v, "V")
-            assert_rejections(op, v, "V")
+            assert_rejections(cfg, v, "V")
             ids_v = assert_issue_set(op, iss_v, "V")
             assert_connections(conns_v, "V")
 

@@ -106,8 +106,11 @@ def delay_probes_per_point(target, seq0: int) -> dict:
     return counts
 
 
-def run_blind(op, target) -> tuple[list, int]:
-    """The three blind checks against `target`'s plain origin; (issues, seq0)."""
+def run_blind(op, target) -> tuple[list, int, dict]:
+    """The three blind checks against `target`'s plain origin; (issues, seq0, the
+    number of insertion points the job discovered per (path, parameter), read from
+    `scan.sitemap` -- a path can carry the same parameter on more than one node,
+    the `/search` link and the search form both carry `q`)."""
     seq0 = target.logs.reset()
     job = start_job(op, "operator", profile_name="standard",
                     overrides={"target": {"origins": [target.base]},
@@ -116,7 +119,13 @@ def run_blind(op, target) -> tuple[list, int]:
     ok(f"{target.mode}: job ended state={status.get('state')!r} "
        f"probes={(status.get('probes') or {}).get('sent')!r} "
        f"issues={(status.get('issues') or {}).get('total')!r}")
-    return issues(op, "operator", job=job), seq0
+    sitemap = scan_call(op, "operator", "scan.sitemap", {"job": job})
+    points_per_key: dict = {}
+    for node in (sitemap.get("nodes") or []):
+        for name in (node.get("params") or []):
+            key = (node.get("path_template"), name)
+            points_per_key[key] = points_per_key.get(key, 0) + 1
+    return issues(op, "operator", job=job), seq0, points_per_key
 
 
 def main() -> None:
@@ -138,7 +147,7 @@ def main() -> None:
             require_checks(op, *NEEDED_CHECKS)
 
             section("the blind checks find the seeded vulns on V")
-            iss_v, seq_v = run_blind(op, v)
+            iss_v, seq_v, points_v = run_blind(op, v)
 
             boolean = by_check(iss_v, "sqli-boolean", "/items")
             check(len(boolean) == 1,
@@ -176,16 +185,20 @@ def main() -> None:
                 check(n <= MAX_DELAY_PROBES_PER_POINT,
                       f"V: {n} delay-payload request(s) on {point[0]}?{point[1]} "
                       f"(<= {MAX_DELAY_PROBES_PER_POINT}, 8 per timing check)")
-            extra = {f"{k[0]}?{k[1]}": n for k, n in counts_v.items()
-                     if k not in TIMED_POINTS and n > MAX_DELAY_PROBES_PER_POINT}
+            # A (path, parameter) the job discovered on more than one node is that
+            # many points (the engine's own count), each allowed its 16.
+            extra = {f"{k[0]}?{k[1]}": (n, points_v.get(k, 1)) for k, n in counts_v.items()
+                     if k not in TIMED_POINTS
+                     and n > MAX_DELAY_PROBES_PER_POINT * max(1, points_v.get(k, 1))}
             check(not extra,
                   f"V: no other point got more than {MAX_DELAY_PROBES_PER_POINT} delay payloads "
-                  f"(observed {extra or 'none'}; all points {shown or 'none'})")
+                  f"per discovered point (observed {extra or 'none'}; all points {shown or 'none'}; "
+                  f"points per (path, param) {dict((f'{k[0]}?{k[1]}', c) for k, c in points_v.items() if c > 1) or 'all single'})")
             check(sum(counts_v.get(p, 0) for p in TIMED_POINTS[1:]) > 0,
                   f"V: the delay payloads really reached the target (per point {shown or 'none'})")
 
             section("the patched twin yields none of the three")
-            iss_p, seq_p = run_blind(op, p)
+            iss_p, seq_p, _points_p = run_blind(op, p)
             leaked = [i for i in iss_p
                       if i.get("check_id") in ("sqli-boolean", "sqli-time")
                       or i.get("class") == "cmdi"]

@@ -220,8 +220,11 @@ impl SsrfGate {
         ips: &[IpAddr],
     ) -> Result<ActionPermit> {
         self.check(what, authority, host, ips)?;
+        // `host:port`, the form the engine's own gates ask the guard about
+        // (`guard_authority`): a ported scope entry matches on port equality,
+        // so a bare host would never be admitted by it.
         self.scope
-            .check_active(host)
+            .check_active(authority)
             .map_err(|e| anyhow!("scope: refusing {what} to {host}: {e}"))
     }
 }
