@@ -7,3 +7,6 @@ pub mod derive;
 pub mod linux;
 pub mod macos;
 pub mod report;
+pub mod state;
+
+pub use state::PrivilegeState;

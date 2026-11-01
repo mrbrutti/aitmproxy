@@ -115,7 +115,6 @@ fn is_app_bundle_path(path: &Path) -> bool {
 /// fallback; a core running inside a bundle uses its own.
 ///
 /// `pub(crate)`: P1b.6's `PrivilegeState` wires it behind the `Prober` seam.
-#[allow(dead_code)] // wired by P1b.6
 pub(crate) fn gather_mac(macos_app_path: &Path) -> MacInputs {
     let exe = std::env::current_exe().ok();
     let app = handoff_target(exe.as_deref(), macos_app_path);

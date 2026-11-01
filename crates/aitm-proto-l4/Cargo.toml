@@ -44,6 +44,9 @@ etherparse = "0.21"
 # `thiserror` for `L4GuardError` — a trivial Cargo.toml merge at integration,
 # flagged in the Task 2 handover.)
 thiserror = "2"
+# `PrivilegeState` (privilege plan P1b.6) logs one `info!` line per packet-capture
+# state change (AC24). Workspace version; nothing new enters the lock.
+tracing.workspace = true
 # Wire backend (M5 Task 6): libpcap bindings for L2 capture + inject
 # (`Capture::sendpacket`), the same code path on macOS and Linux. Version pinned
 # from research note 08 (pcap 2.5.0, best-maintained of the group). libpcap ships

@@ -110,7 +110,6 @@ pub fn prompt_possible(display: Option<&str>, wayland: Option<&str>, tty_opens: 
 ///
 /// `pub(crate)`: P1b.6's `PrivilegeState` wires it behind the `Prober` seam.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // wired by P1b.6
 pub(crate) fn gather_linux(helper_path: Option<&Path>, session_connected: bool) -> LinuxInputs {
     use crate::privilege::derive::HelperCandidate;
 
@@ -151,7 +150,6 @@ pub(crate) fn gather_linux(helper_path: Option<&Path>, session_connected: bool) 
 /// Portable stand-in: nothing here is a Linux host, so no capability, helper,
 /// policy, launcher or prompt is claimed.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)] // wired by P1b.6
 pub(crate) fn gather_linux(_helper_path: Option<&Path>, session_connected: bool) -> LinuxInputs {
     LinuxInputs {
         cap_net_raw: false,
