@@ -1,6 +1,6 @@
 # macOS traffic-route advice design
 
-**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (see Amendments); amended again 2026-11-01 (self-approved, autonomous mode): implementation and stage-5 Tester rulings on the shipped code (Amendments, last entry)
+**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (see Amendments); amended again 2026-11-01 (self-approved, autonomous mode): implementation and stage-5 Tester rulings on the shipped code (Amendments); amended 2026-11-01, stage-6 panel (self-approved, autonomous mode): the security/quality/spec panel on PR #265 (`58724ef7..6ebc9e8f`) — `TrafficRoute` stores `state`/`remedy` and computes `line`, `DecryptStatus` bounds `advice` and rejects a negative count, both layers normalise a blank advice, `TrafficRoutes` computes its banner fields from `shown`, the StatusPanel hand-over footprint, routes computed once per render (Amendments, last entry)
 **Research inputs:**
 - Live diagnosis, 2026-10-31, installed 0.5.4 app (observation only): `/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_9f6f2891-d1f9-458f-a0c7-0c5668557fb3/live-sidebar-not-loading-diagnosis.md`
 - `docs/research/22-macos-system-proxy-toggle.md` — read-back via `CFNetworkCopySystemProxySettings()`, the sibling "Set as system proxy" work and its candidate words; §5a's live observation (Proxyman's `127.0.0.1:9090` set for HTTP+HTTPS on both enabled services)
@@ -375,9 +375,13 @@ public struct DecryptStatus: Hashable, Sendable {
     /// `NOTHING_DECRYPTED_ADVICE` while `scopeHosts == 0`; nil once a host is in Scope.
     public var advice: String?
     public init(scopeHosts: Int, decrypting: Bool, advice: String?)
-    /// nil unless `json` is the `decrypt` object (it always carries `scope_hosts`). An `advice` that is null,
-    /// missing, empty or whitespace-only is nil (ruling 2026-11-01: a blank sentence reads as absent, so the
-    /// same-words fallback prints — never an empty row or banner).
+    /// nil unless `json` is the `decrypt` object (it always carries `scope_hosts`) **and `scope_hosts >= 0`**
+    /// (stage-6 S3: a negative count is a malformed reply, read as absent — never a "Scope: -1 hosts" step).
+    /// An `advice` that is null, missing, empty or whitespace-only is nil (ruling 2026-11-01: a blank sentence
+    /// reads as absent, so the same-words fallback prints — never an empty row or banner). A present sentence is
+    /// **bounded** (stage-6 S2): newlines and other line breaks are flattened to one space and the result is
+    /// capped at 512 characters, so an untrusted core cannot push a multi-line or unbounded string into a
+    /// one-line banner, a tooltip or a Status row; the core's own sentence (47 characters, one line) is untouched.
     public init?(json: JSONValue)
 }
 
@@ -385,19 +389,27 @@ public struct TrafficRoute: Hashable, Sendable {
     public enum Kind: String, Hashable, Sendable, CaseIterable { case systemProxy, allApps, scope, caTrust }
     public let kind: Kind
     public let open: Bool
-    /// The one line, verbatim on both pages (§D4).
-    public let line: String
+    /// The state words, **stored** (stage-6 S2/Q1 — nothing parses a line): "system proxy off",
+    /// "system proxy on · H:P, not this core", "All Apps off", "All Apps degraded", the quoted Scope sentence
+    /// verbatim with its period, the CA line. The one-line banner is the shown entries' states joined with
+    /// " · " (§D5); remedies are never text there — they are the entry's `actions.first`, the banner's one button.
+    public let state: String
+    /// The remedy clause, **stored**; nil when the line has none (every open entry, the Scope sentence, the CA
+    /// line): "set L as the system proxy, or point a client at it", "turn it on to capture every app's
+    /// traffic (macOS asks you to approve its extension)", "approve the extension in System Settings", the
+    /// degraded reason `r`.
+    public let remedy: String?
+    /// The one line, verbatim on both pages (§D4): `state`, then ` — ` + `remedy` when there is one. Computed
+    /// from the two stored fields, so `state` can never disagree with `line` and a core sentence that happens
+    /// to contain " — " is never split (stage-6 S2: the earlier `state` was `line` up to its first " — ").
+    public var line: String
     /// What this route carries (the lane principle), the same on every state of the route:
     /// systemProxy → "every proxy-aware app, regardless of Scope"; allApps → "in-scope hosts of every app".
     public let detail: String
     /// What opens the route, primary first; empty when open — and empty for the system-proxy entry
     /// until PR4 fills `.setSystemProxy`.
     public let actions: [ConnectionAction]
-    /// The state words: `line` up to its first " — " ("system proxy off", "All Apps off"), or the whole
-    /// line when it has none (the quoted Scope sentence, verbatim with its period; the CA line). The
-    /// one-line banner is the shown entries' states joined with " · " (§D5); remedies are never text
-    /// there — they are the entry's `actions.first`, shown as the banner's one button.
-    public var state: String
+    public init(kind: Kind, open: Bool, state: String, remedy: String?, detail: String, actions: [ConnectionAction])
 }
 
 public struct TrafficRoutes: Hashable, Sendable {
@@ -415,17 +427,23 @@ public struct TrafficRoutes: Hashable, Sendable {
     /// The closed entries we know about — system proxy, All Apps, Scope, CA, in that order: the Flows
     /// empty-state lines. Empty unless the bus lane is `.ok`.
     public let advice: [TrafficRoute]
-    /// The one-line banner text above the Flows table, or nil (§D5): the shown entries' `state`s joined " · ".
-    public let banner: String?
+    /// The banner's entries in its order — §D5's `shown` — **the one stored banner fact** (ruling 2026-11-01;
+    /// shipped shape, stage-6 SP-M3): empty when the banner predicate is false. `banner`, `bannerAction` and
+    /// `bannerDetail` are computed from it, so the text, the button and the tooltip cannot disagree and no view
+    /// re-derives the shown list from the banner text.
+    public let shown: [TrafficRoute]
+    /// The one-line banner text above the Flows table, or nil (§D5): `shown.map(\.state).joined(" · ")`; nil
+    /// when `shown` is empty.
+    public var banner: String?
     /// The banner's one button: the first shown entry that has an action, its `actions.first` (nil when
     /// none has one). Priority: system proxy (PR4's Set as System Proxy, once filled), All Apps, Scope, CA.
-    public let bannerAction: ConnectionAction?
-    /// The banner's entries in its order — §D5's `shown` — empty when `banner == nil` (ruling 2026-11-01): what
-    /// `RouteBanner` reads for its tooltip, so no view re-derives the shown list from the banner text.
-    public let shown: [TrafficRoute]
-    /// The shown entries' `detail`s joined " · "; nil when `banner == nil`. The tooltip's second line.
-    public let bannerDetail: String?
+    public var bannerAction: ConnectionAction?
+    /// The shown entries' `detail`s joined " · "; nil when `shown` is empty. The tooltip's second line.
+    public var bannerDetail: String?
+    /// The two routes only.
     public var anyOpen: Bool
+    public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?,
+                advice: [TrafficRoute], shown: [TrafficRoute])
 }
 
 public struct GettingStartedStep {
@@ -483,7 +501,10 @@ public var passive: Bool
 ```
 
 `FlowRow.tls` from `tunnel`: `.decrypted` → `.decrypted`, `.passthrough` → `.tunnelled`, `.failed` →
-`.pinnedOrFailed`, nil → today's scheme rule (`https`/`wss` → `.decrypted`, else `.none`). `inScope`
+`.pinnedOrFailed`, nil → today's scheme rule (`https`/`wss` → `.decrypted`, else `.none`). `tls` and
+`tunnel` are therefore **independent fields on purpose** (stage-6 Q14, accepted): `tls` has a non-tunnel source
+(the scheme rule on a row with no `tunnel`, every row from an older core), so it is not derivable from `tunnel`
+alone and stays stored beside it. `inScope`
 keeps the scope-list rule unchanged. All five row fields join `FlowRow ==` (every mutable field must,
 memory: a missing one made the Apps banner not redraw). The byte counts ride on the row because the
 improve-loop session's tunnel-row inspector and a possible column consume our Kit names; nothing in
@@ -612,7 +633,7 @@ reset); closed ⇔ `d != nil ? !d.decrypting : scopeHostCount == 0`; `N` = `d?.s
 | state | open | `line` (= `state`: no " — " clause) | `actions` |
 |---|---|---|---|
 | closed, `d?.advice` present and not blank | no | `d.advice` **verbatim** — today `Nothing is decrypted until a host is in Scope.` | `[.addScopeHost, .openScope]` |
-| closed, `d == nil`, or `d.advice` nil, empty or whitespace-only (a blank sentence reads as absent — ruling 2026-11-01) | no | our fallback, the same words: `Nothing is decrypted until a host is in Scope.` | `[.addScopeHost, .openScope]` |
+| closed, `d == nil`, or `d.advice` nil, empty or whitespace-only (a blank sentence reads as absent — ruling 2026-11-01; **both layers normalise it**, stage-6 SP-I1: `DecryptStatus(json:)` decodes a blank to nil, and `make`'s Scope derivation treats a blank `advice` on a memberwise-built `DecryptStatus` the same way, so neither path can print an empty line) | no | our fallback, the same words: `Nothing is decrypted until a host is in Scope.` | `[.addScopeHost, .openScope]` |
 | open | yes | `Scope: ` + `Format.count(N, "host")` + ` decrypted` (`Scope: 1 host decrypted`) | `[]` |
 
 The text is the core's own sentence so every surface in the product (TUI, web, this app) prints one
@@ -712,11 +733,11 @@ caClosed       ⇔  routes.caTrust != nil  ∧  !routes.caTrust.open
 shown          =  closedRoutes
                +  (scopeClosed ∧ (!closedRoutes.isEmpty ∨ allTunnels) ? [scope] : [])
                +  (caClosed ? [caTrust] : [])                       // priority order
-banner != nil  ⇔  flowCount > 0  ∧  bus.state == .ok  ∧  !shown.isEmpty
-banner         =  shown.map(\.state).joined(" · ")            // text: states only, no remedy clause
-bannerAction   =  shown.first { !$0.actions.isEmpty }?.actions.first   // the one button: the first shown fact that has a remedy
-routes.shown   =  banner != nil ? shown : []                           // published (ruling 2026-11-01): the banner's entries, in order
-bannerDetail   =  banner != nil ? shown.map(\.detail).joined(" · ") : nil   // the tooltip's second line; the view never re-derives it
+routes.shown   =  (flowCount > 0 ∧ bus.state == .ok) ? shown : []     // the ONE stored banner fact (ruling 2026-11-01; shipped shape, stage-6 SP-M3)
+banner != nil  ⇔  !routes.shown.isEmpty
+banner         =  routes.shown.map(\.state).joined(" · ")              // computed: states only, no remedy clause
+bannerAction   =  routes.shown.first { !$0.actions.isEmpty }?.actions.first   // computed: the first shown fact that has a remedy
+bannerDetail   =  routes.shown.map(\.detail).joined(" · ")             // computed: the tooltip's second line; the view never re-derives it
 ```
 
 **Why `knownOpenRoute`, not a "both routes read and closed" rule (Architect's call, 2026-11-01).** With no
@@ -775,12 +796,15 @@ A closed CA fact alone does not close the routes, but it adds its state whenever
 HTTPS is not trusted: the flows the operator sees are the plain-HTTP ones and every HTTPS attempt
 is failing right now.
 
-The view (`RouteBanner`) shows `banner` in one line — `lineLimit(1)`, `truncationMode(.tail)`,
+The view (`RouteBanner(routes:)`) shows `banner` in one line — `lineLimit(1)`, `truncationMode(.tail)`,
 `Tok.Size.Row.dense` (28 pt; `Tokens.swift:296`), tertiary ink, the former `ScopeBanner` shape — with
 the full `banner` and `routes.bannerDetail` (the shown entries' `detail`s joined with ` · `) as its `.help`,
 both read from the model and never re-derived from the banner text (ruling 2026-11-01), and **one**
 `SmallButton` for `bannerAction` (`All Apps Settings…` / `Add Host…` / `Trust the aitmproxy CA`;
-PR4 adds `Set as System Proxy`); nothing when `bannerAction` is nil; nothing else sits on the line.
+PR4 adds `Set as System Proxy`); nothing when `bannerAction` is nil; nothing else sits on the line. The
+`TrafficRoutes` value is read from `session.trafficRoutes` **once per render of `MainView.flows`** and passed
+down (`RouteBanner(routes:)`, `EmptyFlows(routes:run:)`) rather than re-read by each child (stage-6 Q6: three
+`make` evaluations per render became one).
 
 **One banner line, everywhere flows are listed (§D8).** On every page that renders the flow
 table — Flows, Pinned, Domains, Apps — the route banner is the only banner: shown iff
@@ -854,31 +878,39 @@ page keeps its own read (untouched); the two agree within one CA tick.
   `passive`), `AitmproxyKit/FlowDetail+Wire.swift` + `Tests/AitmproxyKitTests/FlowSummaryTests.swift`
   (new), `FlowRowEqualityTests.swift`, `FlowDetailWireTests.swift` — **plan Task 1c, claim granted
   2026-11-01**; file-disjoint from Task 1; nothing else in this spec touches them.
-- `Shell/RouteBanner.swift` (new): renders `session.trafficRoutes.banner`, its `bannerDetail` as the tooltip
-  and its one `bannerAction` button. `RouteActions.run(_:session:openSettings:)` — one function, shared with
+- `Shell/RouteBanner.swift` (new): `RouteBanner(routes:)` renders the passed `TrafficRoutes`' `banner`, its
+  `bannerDetail` as the tooltip and its one `bannerAction` button (the value is read once in `MainView.flows`
+  and passed in — stage-6 Q6). `RouteActions.run(_:session:openSettings:)` — one function, shared with
   the empty-state rows — sends every action through `perform`, **except `.trustCA`, which it sends to
   `session.trustCA()` exactly as `StatusPanel.run` does** (PR D makes `perform` return `false` for it on
   purpose: operator-only, like the capture switch; the model hides the button once trusted or while
   installing), and `.openCaptureSettings`, which `perform` leaves to the view, sets `settingsTab = .capture`
-  and calls `openSettings()` exactly as `AppsAttributionBanner` does (ruling 2026-11-01). Reads `banner`,
-  `bannerAction`, `bannerDetail` and `shown` from the model and never re-derives the shown list from the
-  text. Mentions no `connectionSummary`, `ConnectionSummary`, `LaneDot`, `LaneState`, `CaptureSwitch`,
+  and calls `openSettings()` exactly as `AppsAttributionBanner` does (ruling 2026-11-01). The `.trustCA`
+  button on both Flows surfaces is **disabled unless `session.caTrustControlLive`**, exactly as the Status
+  page's row was (stage-6 S1: the downstream guard in `Session+CATrust` already refused the call, but a live
+  button that does nothing is a UX gap). Reads `banner`, `bannerAction`, `bannerDetail` and `shown` from the
+  model and never re-derives the shown list from the text; icon + text pairs are a `Label` (stage-6 Q9); the
+  SF Symbol names for the system-proxy and All Apps rows are string literals for now (stage-6 Q10, accepted —
+  follow-up: `Tok.Glyph.network` / `Tok.Glyph.apps` via gen-tokens, together with the icons PR's `glyph.process`).
+  Mentions no `connectionSummary`, `ConnectionSummary`, `LaneDot`, `LaneState`, `CaptureSwitch`,
   `capture.enabled`, `extensionController`.
-- `Shell/ShellView.swift`, two hunks only: (1) `EmptyFlows` (struct ~316–336) reads
-  `session.trafficRoutes.advice` (via `@Environment(Session.self)`, or a `routes:` parameter
-  passed from the existing `flowTable` overlay call, `ShellView.swift:258` — builder's choice) and gains the
-  route rows; `allowsHitTesting` stays off except for its buttons. (2) In `MainView.flows`
+- `Shell/ShellView.swift`, two hunks only: (1) `EmptyFlows` (struct ~316–336) takes `routes: [TrafficRoute]`
+  and a `run: (ConnectionAction) -> Void` closure from the existing `flowTable` overlay call
+  (`ShellView.swift:258`) and gains the route rows — a pure function of its inputs, no environment read of its
+  own (stage-6 Q7); `allowsHitTesting` stays off except for its buttons. (2) In `MainView.flows`
   (~171–200) the `ScopeBanner()` branch and the `AppsAttributionBanner()` block are removed and one
-  insertion takes their place: `if session.trafficRoutes.banner != nil { RouteBanner(); Rule() }`
-  on every list page (§D8 lists the two removed call sites verbatim). The `AppsAttributionBanner`
-  struct stays. Nothing else in the file changes; the `ExtensionController` block (rule 5) and
-  lines 49–62 are untouched.
+  insertion takes their place: `session.trafficRoutes` is read into a local once, then
+  `if routes.banner != nil { RouteBanner(routes: routes); Rule() }` on every list page (§D8 lists the two
+  removed call sites verbatim; stage-6 Q6). The `AppsAttributionBanner` struct stays. Nothing else in the file
+  changes; the `ExtensionController` block (rule 5) and lines 49–62 are untouched.
 - `Panels/StatusPanel.swift` — **stated once, here; TR-AC8 and the plan refer to it:** (a) the one
   `.help(step.detail ?? step.title)` line on `StepRow` (§D4); (b) `.addScopeHost` joins the
   handled-by-`perform` case list in `run(_:)` (its switch over `ConnectionAction` is exhaustive; PR D
   adds its own `.trustCA`/`.openCAPanel` cases); (c) the PR D hand-over: the interim
-  `stepsWithCATrust` insertion and the `CATrustRow` call are removed — this spec's `caTrusted` step
-  and the Flows CA row carry the same words (§D4).
+  `stepsWithCATrust` insertion and the `CATrustRow` call are removed, **and with them the now-unreferenced
+  private `CATrustRow` struct and the `VStack` that wrapped `LaneCard` + the row under the Core card** (the
+  card returns to the bare `LaneCard` with its frame and grid probe) — stage-6 SP-M4, as shipped in `cb9f59be`;
+  this spec's `caTrusted` step and the Flows CA row carry the same words (§D4).
 - `tools/check-connection-words.sh`: §D9. `tools/check-capture-toggle.sh` (granted on the
   fixture-removal mac SHA; that PR modifies the script): the NS-AC8 banner pins move to
   `RouteBanner()` (§D8). `tools/check-ca-trust-path.sh` (the CA-trust session's tripwire; agreed with that
@@ -919,20 +951,24 @@ the icons-and-names work, not an operator remedy. Rows empty → `AppsEmptyState
 
 What stays: the `ScopeBanner` struct in `Panels/ScopePanel.swift` (untouched, now unreferenced;
 delete with a later cleanup) and the `AppsAttributionBanner` struct in `ShellView.swift` (kept so
-`check-capture-toggle.sh`'s NS-AC3 body pins hold; its call site goes). The read-only-scope fact
-stays visible in the status bar's scope item and on the Scope page.
+`check-capture-toggle.sh`'s NS-AC3 body pins hold; its call site goes). Both are **accepted dead code for
+this PR** (stage-6 Q4/Q5: `ScopePanel.swift` is outside this spec's claim, and the `ShellView` grant is
+`EmptyFlows` + the banner insertion only) and are named follow-ups in the plan's Shipped section: delete
+`ScopeBanner`; retarget the NS-AC3 pins at `RouteBanner` and delete `AppsAttributionBanner`. The
+read-only-scope fact stays visible in the status bar's scope item and on the Scope page.
 
 Call sites removed in `Shell/ShellView.swift`, both inside `MainView.flows` (~185–193 on `main
 8e19c2e3`): (1) `} else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected =
 session.bus { ScopeBanner(); Rule() }` (as the fixture-removal PR leaves it), (2)
 `if session.page == .apps, session.clients.isEmpty, !session.rows.isEmpty { AppsAttributionBanner();
-Rule() }`. In their place, one insertion: `if session.trafficRoutes.banner != nil { RouteBanner();
-Rule() }`, on every list page.
+Rule() }`. In their place, one insertion: `let routes = session.trafficRoutes` read once, then
+`if routes.banner != nil { RouteBanner(routes: routes); Rule() }`, on every list page (stage-6 Q6).
 
 **Tripwire follow-through.** `tools/check-capture-toggle.sh` NS-AC8 pins `AppsAttributionBanner()`
 rendered exactly once in `MainView` and ordered above `if session.splitView {`. Those pins move
-to the route banner: `RouteBanner()` exactly once in `MainView`, guarded by
-`session.trafficRoutes.banner != nil {`, ordered above `if session.splitView {`;
+to the route banner: the `RouteBanner(` call exactly once in `MainView`, guarded by the banner condition on
+the once-read routes value (`routes.banner != nil {` after stage-6 Q6; the pin's pattern follows the shipped
+guard and call, `RouteBanner(routes:`), ordered above `if session.splitView {`;
 `AppsAttributionBanner()` count in `MainView` = 0. The NS-AC3 struct/body pins and the
 `AppsEmptyState` pins are unchanged.
 
@@ -1116,7 +1152,9 @@ Source tripwires:
    shows hunks only inside `MainView.flows` and the `EmptyFlows` struct (lines 49–62 and the
    `ExtensionController` block identical); `git diff <base> -- apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift`
    is the §D7 footprint: the `.help` line, `.addScopeHost` in `run(_:)`'s handled list, and the removal
-   of PR D's interim `stepsWithCATrust`/`CATrustRow` insertion — nothing else.
+   of PR D's interim `stepsWithCATrust`/`CATrustRow` insertion together with the private `CATrustRow`
+   struct and the `VStack` wrapper it needed (stage-6 SP-M4) — nothing else; `grep -c
+   'stepsWithCATrust\|CATrustRow' …/StatusPanel.swift` → `0`.
 9. **TR-AC9 [gates]** `swift test --package-path apps/mac --scratch-path ~/Library/Developer/Aitmproxy/test-build-routes`
    green including the new tests; the release build (`./build.sh --ne --allow-unnotarized` as the input
    to `scripts/notarize-dmg.sh`, `docs/RELEASE.md` step 3) has no warnings; the Rust gate is
@@ -1261,7 +1299,8 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
     every single-fact banner equals that fact's `state` (`"system proxy off"` for the no-extension,
     scope-set case — never the line with its remedy clause). **`shown` / `bannerDetail` (ruling 2026-11-01):**
     the fresh-install-with-PR4 inputs (`.inactive`, `scopeHostCount: 0`, `flowCount: 3`, `systemProxy: .off`,
-    `caTrust: notTrusted`) → `routes.shown.map(\.kind) == [.systemProxy, .allApps, .scope, .caTrust]` and
+    `caTrust: notTrusted`) → `routes.shown.map(\.kind) == [.systemProxy, .allApps, .scope, .caTrust]` (the
+    `.off`-led list is pinned as a literal, not inferred from the banner text — stage-6 SP-M5) and
     `routes.bannerDetail == "every proxy-aware app, regardless of Scope · in-scope hosts of every app · Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel · HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`;
     `.capturing`, `tunnelledFlowCount: 3`, `caTrust: nil` → `shown.map(\.kind) == [.scope]`,
     `bannerDetail == "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"`;
@@ -1298,7 +1337,13 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
     `advice == nil`; `{}` → nil; a `proxy.status` object without `decrypt` → `status["decrypt"].flatMap(DecryptStatus.init) == nil`.
     **Blank advice (ruling 2026-11-01):** `{"scope_hosts": 0, "decrypting": false, "advice": ""}` → `advice == nil`, and
     `"advice": "  \n"` (whitespace only) → `advice == nil` — a blank sentence reads as absent, so `routes.scope.line` is
-    the fallback `Nothing is decrypted until a host is in Scope.`, never an empty row or banner.
+    the fallback `Nothing is decrypted until a host is in Scope.`, never an empty row or banner; **and the second
+    layer** (stage-6 SP-I1): `make(… decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: ""))` (the
+    memberwise init, bypassing the decoder) → `routes.scope.line == "Nothing is decrypted until a host is in Scope."`.
+    **Bounded advice (stage-6 S2):** `"advice": "line one\nline two"` → `advice == "line one line two"` (line breaks
+    flattened to one space); an `advice` of 600 `"a"` characters → `advice?.count == 512`; the core's 47-character
+    sentence is returned unchanged. **Negative count (stage-6 S3):** `{"scope_hosts": -1, "decrypting": false}` →
+    `DecryptStatus(json:) == nil`.
 22. **TR-AC22 [kit-unit, the #228 row/detail decoder — plan Task 1c]** With literal `flow.get`
     objects (`scheme: "https"`): `tunnel: "passthrough"` → `FlowSummary.tunnel == .passthrough`,
     `row.tls == .tunnelled`, `row.isTunnel == true`; `"failed"` → `.failed` / `.pinnedOrFailed`;
@@ -1321,8 +1366,9 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
 - `EmptyFlows` reading `session.trafficRoutes` via the environment or taking a `routes:`
   parameter; the glyphs for the lines (`network` and `app.badge` suggested); the detail
   line's size (`Tok.Typography.Size.sm`, tertiary ink suggested).
-- `Hashable`/`Sendable` conformances and the `TrafficRoutes` memberwise init shape, provided the
-  public fields above exist with these names.
+- `Hashable`/`Sendable` conformances. (The `TrafficRoutes` init shape was the builder's and is now fixed by
+  §D2 as shipped: `init(systemProxy:allApps:scope:caTrust:advice:shown:)`, the banner fields computed — stage-6
+  SP-M3.)
 - Deleting the now-unreferenced `ScopeBanner` struct, `AppsAttributionBanner` struct and
   `CaptureAdvice.banner` is a later cleanup with its own tripwire edits; not here.
 - How `tunnelledFlowCount` is counted in `Session+Connection` (a filter over `rows` is fine at
@@ -1439,3 +1485,4 @@ own (PR D's `needsAdmin`, `text`, `actions`, `step` are consumed instead).
 - 2026-11-01 (stage-6 fix pass on docs PR #242, spec + quality panel; self-approved, autonomous mode): post-PR-D CA state everywhere (the CA entry carries PR D's `[.trustCA, .openCAPanel]`, the `caTrusted` step's action is `.trustCA`, the CA-only banner button is `.trustCA`; every "reserved / no button" sentence removed; step kind `.caTrusted`, route kind `.caTrust`); TR-AC3 has one Scope action list and the stale-list banner case; D10 banner cells carry no remedy text; `scopeClosed ⇔ !routes.scope.open`; the numeric-string Port vector is in TR-AC1; `Tok.Size.Row.dense` is 28 pt (not 40) — D5/D8/TR-AC19 say 28 / 56 and D8 no longer claims a pixel measurement; AC ordinals = ids; `Endpoint.address` computed; STORIES.md not touched; the StatusPanel footprint stated once (D7); labels on the inferences (primary-service rule, NSNumber, spawn rate); base `main 8e19c2e3`.
 - 2026-11-01 (orchestrator rulings, recorded as the plan's gate 2 and gate 5): **no in-app system-proxy reader** — `Bus/SystemProxyReader.swift`, `refreshSystemProxy()` and the `CFNetworkCopySystemProxySettings()` call are dropped; `SystemProxyState.swift` (the type as defined here, with its Kit tests) ships as the system-proxy session's PR 4a = PR #246 ahead of this PR (gate 5), with `init?(compact:listenAddress:)` over `proxy.status.system_proxy`; PR4 (after us) adds `SystemProxyFacts`, the polling, the toggle and `.setSystemProxy`/`.unsetSystemProxy`, writing `Session.systemProxy`; until PR4 the system proxy is unknown (step omitted, no words, never "off"). **`.openNetworkSettings` denied** (Matt: setup happens in the app with the OS prompt): no action, no `settingsURL`, no menu item, no CommandMap/BRIEF/GLOSSARY rows, plan Task 4 removed, TR-AC14 deleted; the system-proxy entry's `actions` are empty until PR4. **CA fact = PR D's published `Session.caTrust`** (`Session+CATrust.swift`; `CATrustFacts` fields `{trusted, scope, fingerprint, platform, installing, needsAdmin}`, helpers `{text, actions, step, …}` consumed (`text` is the line; `state` is a `LaneState`); PR D's cadence `caStatusEveryTicks = 10`); no `refreshCAStatus()`, no `Session.caStatus` here; plan Task 2b removes PR D's interim `stepsWithCATrust`/`CATrustRow` once the CA step exists. **`BusService.swift` = one line** (`proxy.status.decrypt`); `check-capture-toggle.sh` GO on the fixture-removal mac SHA; `Session+Connection.swift` GO on PR D's SHA for `.addScopeHost` and `tunnelledFlowCount`. D5 predicate restated as `knownOpenRoute` with `bannerAction` = the first shown fact that has an action (Architect's calls 18/19); D6/D7 rewritten; the live proof's system-proxy clauses run on the first build that also contains PR4.
 - 2026-11-01 (implementation and stage-5 Tester rulings on the shipped code, branch `feat/mac-traffic-route-advice` `58724ef7..e60a13e8`; self-approved, autonomous mode): CA `open = trusted && !installing` (D3 prose now matches D3's table and PR D's `step.done`; pinned by `caSiblingStates`); TR-AC8's CFNetwork grep excludes `///` doc comments (PR #246's `SystemProxyState.swift` names the function in comments only); the `BusService` grant is one change-guarded decode of `proxy.status.decrypt` — four added lines at `BusService.swift:234–237`, no `await`, no new verb (D6, D7, TR-AC8; replaces "exactly one added line"); `App.swift:226` one token (`ConnectionAction.trustCA.title`) and `tools/check-ca-trust-path.sh` rule 2 allow-list + expect for `Shell/RouteBanner.swift` recorded in D7 and TR-AC7 (orchestrator GO); `.trustCA` from the Flows surfaces goes to `session.trustCA()` through `RouteActions.run`, as `StatusPanel.run` does (D7); a blank `decrypt.advice` reads as absent (D2, D3, TR-AC21); `TrafficRoutes.shown` and `bannerDetail` published and read by `RouteBanner` (D2, D5, D7, TR-AC18); TR-AC17's live form is the TRUSTED rendering since Matt trusted the CA himself on 2026-11-01 through PR D's first-run step (Goals, Constraints, TR-AC17; hard gate unchanged).
+- 2026-11-01 (stage-6 panel on the shipped code, PR #265, range `58724ef7..6ebc9e8f`: security PASS 3 Minor, quality PASS 14 Minor, spec FAIL 2 Important + 5 Minor — every finding and its disposition is a row in the plan's Review log; self-approved, autonomous mode): `TrafficRoute` **stores** `state` and `remedy` and **computes** `line` — nothing splits a line on " — " (S2/Q1; D2); `DecryptStatus(json:)` is nil on `scope_hosts < 0` (S3) and bounds a present `advice` — line breaks flattened, capped at 512 characters (S2) — D2, TR-AC21; a blank `advice` is normalised in **both** layers, the decoder and `make`'s Scope derivation, with the memberwise-`""` test (SP-I1; D3, TR-AC21); `TrafficRoutes` stores `shown` and computes `banner`/`bannerAction`/`bannerDetail`, init `(systemProxy:allApps:scope:caTrust:advice:shown:)` (SP-M3; D2, D5, Left to the builder); the StatusPanel hand-over also deleted the private `CATrustRow` struct and its `VStack` wrapper (SP-M4; D7, TR-AC8); `session.trafficRoutes` is read once per `MainView.flows` render and passed as `RouteBanner(routes:)` / `EmptyFlows(routes:run:)` (Q6/Q7; D5, D7, D8); the Flows `.trustCA` button is disabled unless `caTrustControlLive` (S1; D7); `Label` for icon + text (Q9); the `.off`-led `shown` literal pinned (SP-M5; TR-AC18); accepted for this PR with named follow-ups: `ScopeBanner` and `AppsAttributionBanner` stay as dead code (Q4/Q5; D8), glyph string literals until gen-tokens gains `network`/`apps` (Q10; D7), `FlowRow.tls` and `tunnel` independent (Q14; D2), `Session.systemProxy` never written here by design (Q15; D6).

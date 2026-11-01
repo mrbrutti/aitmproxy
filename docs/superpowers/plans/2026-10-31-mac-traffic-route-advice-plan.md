@@ -1,6 +1,6 @@
 # macOS traffic-route advice — implementation plan
 
-**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (Review log); amended again 2026-11-01 (self-approved, autonomous mode): implementation and stage-5 Tester rulings on the shipped code (Review log, the "Tester (whole branch)" and "Architect (amendment)" rows)
+**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (Review log); amended again 2026-11-01 (self-approved, autonomous mode): implementation and stage-5 Tester rulings on the shipped code (Review log, the "Tester (whole branch)" and "Architect (amendment)" rows); amended 2026-11-01, stage-6 panel (self-approved, autonomous mode): the security/quality/spec panel on PR #265 (`58724ef7..6ebc9e8f`) — one Review-log row per finding ("PR #265" rows), gate 3 stamped, the TRUSTED-CA ruling carried into every Task 6 paragraph, the shipped type shapes in Tasks 1/2b/3, the Swift gate quoted for the head commit
 **Spec:** `docs/superpowers/specs/2026-10-31-mac-traffic-route-advice-design.md`
 (approved 2026-10-31, amended 2026-11-01; acceptance criteria TR-AC1 … TR-AC22 — TR-AC1/2 are PR 4a's `SystemProxyState` contract, TR-AC14 deleted, TR-AC15–17 the CA-trust fact, TR-AC18–19 the one-banner-line rule, TR-AC20–22 per-host decryption on v0.5.9)
 **Branch / worktree:** `feat/mac-traffic-route-advice` (the branch the implementation shipped on; earlier drafts
@@ -79,8 +79,8 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
      are the same). When this PR lands, `StatusPanel`'s interim `stepsWithCATrust` insertion and
      `CATrustRow` (PR D) are replaced by our step and row — Task 2b removes the insertion, the words
      stay. `make(…, caTrust: session.caTrust)` stays as is.
-3. **CA parts only — PR D (the CA-trust session's mac PR) is on `main`** (number TBD; record here:
-   `__________`) and this branch has rebased onto it. Gated on it: **Task 1b** (the `make(caTrust:)`
+3. **CA parts only — PR D (the CA-trust session's mac PR) is on `main`** (recorded 2026-11-01, stage-6
+   SP-M7: **PR #254**, this branch's base `58724ef7` carries it) and this branch has rebased onto it. Gated on it: **Task 1b** (the `make(caTrust:)`
    slot, the `.caTrust` derivation from PR D's helpers, the `.caTrusted` step and its tests), **Task 2b**
    (the `caTrust:` pass-through and the `StatusPanel` hand-over), the CA clauses of Tasks 3/5/6, and —
    because its `Session+Connection.swift` grant is on PR D's SHA — **Task 2** and everything after it.
@@ -141,12 +141,15 @@ plus the three tripwires) so every later failure is attributable to this plan.
   store, sample rows, snapshot, gallery or in-app self-check is evidence for anything here.
 - **Hard gate — no `ca.install` on Matt's Mac.** Trusting the aitm CA on his machine is Matt's
   decision and he has not given it. No Coder, Tester, script or orchestrating session calls
-  `ca.install` (or clicks Install… on the CA page) on his Mac. Task 6 proves only the NOT-trusted
-  state and its line, plus `ca.status` over the bus showing `trusted: "no"`. The install →
+  `ca.install` (or clicks Install… on the CA page) on his Mac. Task 6 proves the CA state **as his Mac
+  has it** — since 2026-11-01 the TRUSTED rendering (spec TR-AC17 ruling: Matt trusted the CA himself
+  through PR D's first-run step; `ca.status` user store `trusted: "yes"`, Status `✓ CA trusted (user
+  keychain)`, no CA row or banner clause); the NOT-trusted line is proved by the Kit tests (TR-AC16) and
+  shown live only on a Mac that does not trust the CA, and nobody untrusts it to recreate it. The install →
   line-disappears path is proved only after Matt says in his own words that the CA may be
   trusted, and then only through the app's own Status step (PR D's `.trustCA` with its confirm and
-  admin prompts — the button is present on Task 6's screenshots and is **not clicked**), never a
-  direct verb call from a script. `Panels/CAPanel.swift`, `AitmproxyKit/Panels/CAStatus.swift` and
+  admin prompts — on a not-trusted Mac the button is present on Task 6's screenshots and is **not
+  clicked**), never a direct verb call from a script. `Panels/CAPanel.swift`, `AitmproxyKit/Panels/CAStatus.swift` and
   `Session+CATrust.swift` join the do-not-touch list.
 - **Do-not-touch:** `apps/mac/Sources/AitmproxyKit/CaptureAdvice.swift`, `CaptureCapability.swift`,
   `AitmproxyKit/SystemProxyState.swift` and its tests (PR 4a's), `apps/mac/Package.swift`,
@@ -250,11 +253,12 @@ greps, Task 6, and the diff review.
       public enum Kind: String, Hashable, Sendable, CaseIterable { case systemProxy, allApps, scope, caTrust }
       public let kind: Kind
       public let open: Bool
-      public let line: String
+      public let state: String      // STORED (stage-6 S2/Q1): the state words — "system proxy off", the quoted Scope sentence with its period, the CA line
+      public let remedy: String?    // STORED: the " — " clause, nil when the line has none (every open entry, Scope, CA)
+      public var line: String       // COMPUTED: state, then " — " + remedy when present; nothing ever parses a line
       public let detail: String
       public let actions: [ConnectionAction]
-      public var state: String      // line before its first " — " (whole line when none — the quoted Scope sentence keeps its period)
-      public init(kind: Kind, open: Bool, line: String, detail: String, actions: [ConnectionAction])
+      public init(kind: Kind, open: Bool, state: String, remedy: String?, detail: String, actions: [ConnectionAction])
   }
 
   public struct TrafficRoutes: Hashable, Sendable {
@@ -263,12 +267,12 @@ greps, Task 6, and the diff review.
       public let scope: TrafficRoute                                   // always present; closed iff !open (D3: !decrypt.decrypting when decrypt is present and the bus lane is .ok, else scopeHostCount == 0)
       public let caTrust: TrafficRoute?                                // nil = ca.status unread/unknown
       public let advice: [TrafficRoute]
-      public let banner: String?
-      public let bannerAction: ConnectionAction?                        // shown.first { !$0.actions.isEmpty }?.actions.first
-      public let shown: [TrafficRoute]                                 // ruling 2026-11-01: D5's `shown`, in order; [] when banner == nil
-      public let bannerDetail: String?                                 // shown.map(\.detail).joined(" · "); nil when banner == nil
+      public let shown: [TrafficRoute]                                 // the ONE stored banner fact (ruling 2026-11-01; shipped shape, stage-6 SP-M3): D5's `shown`, in order; [] when the banner predicate is false
+      public var banner: String? { shown.isEmpty ? nil : shown.map(\.state).joined(separator: " · ") }
+      public var bannerAction: ConnectionAction? { shown.first { !$0.actions.isEmpty }?.actions.first }
+      public var bannerDetail: String? { shown.isEmpty ? nil : shown.map(\.detail).joined(separator: " · ") }
       public var anyOpen: Bool { [systemProxy, allApps].compactMap { $0 }.contains(where: \.open) }   // routes only
-      public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?, advice: [TrafficRoute], banner: String?, bannerAction: ConnectionAction?, shown: [TrafficRoute], bannerDetail: String?)   // the two added parameters' defaults, if any, are the builder's
+      public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?, advice: [TrafficRoute], shown: [TrafficRoute])
   }
 
   public struct GettingStartedStep {
@@ -292,7 +296,7 @@ greps, Task 6, and the diff review.
       public var decrypting: Bool
       public var advice: String?
       public init(scopeHosts: Int, decrypting: Bool, advice: String?)
-      public init?(json: JSONValue)   // nil unless the object carries "scope_hosts"; "decrypting" defaults to scopeHosts > 0; "advice" null → nil; empty or whitespace-only → nil (ruling 2026-11-01)
+      public init?(json: JSONValue)   // nil unless the object carries "scope_hosts" AND scope_hosts >= 0 (stage-6 S3); "decrypting" defaults to scopeHosts > 0; "advice" null → nil; empty or whitespace-only → nil (ruling 2026-11-01); a present advice has its line breaks flattened to one space and is capped at 512 characters (stage-6 S2)
   }
   ```
 
@@ -343,7 +347,13 @@ greps, Task 6, and the diff review.
   **Blank advice (ruling 2026-11-01; fixed in a code commit, SHA stamped in the Review log):**
   `{"scope_hosts": 0, "decrypting": false, "advice": ""}` → `advice == nil`; `"advice": "  \n"` → `advice == nil`;
   and in `ConnectionSummaryTests`, `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: "")` →
-  `routes.scope.line == "Nothing is decrypted until a host is in Scope."` (the fallback, never an empty line).
+  `routes.scope.line == "Nothing is decrypted until a host is in Scope."` (the fallback, never an empty line —
+  the memberwise init bypasses the decoder, so `make`'s Scope derivation normalises the blank itself; stage-6
+  SP-I1, fixed in a code commit, SHA to be stamped).
+  **Bounded advice and negative count (stage-6 S2/S3; fixed in a code commit, SHA to be stamped):**
+  `{"scope_hosts": 0, "decrypting": false, "advice": "line one\nline two"}` → `advice == "line one line two"`;
+  an `advice` of 600 `"a"` characters → `advice?.count == 512`; the core's 47-character sentence unchanged;
+  `{"scope_hosts": -1, "decrypting": false}` → `DecryptStatus(json:) == nil`.
 
   add a helper `both(_ host: String, _ port: Int) -> SystemProxyState` (HTTP and HTTPS at that
   endpoint, built with PR #246's `SystemProxyState(http:https:)` / `Endpoint(host:port:)`). `L = "127.0.0.1:8080"`.
@@ -633,8 +643,11 @@ greps, Task 6, and the diff review.
   `StatusPanel.swift` (the PR D hand-over, spec D4/D7): remove the interim `stepsWithCATrust` insertion
   (PR D inserts `session.caTrustStep` **after `busConnected`**, `StatusPanel.swift:131–136` on
   `claude/ca-trust-mac` 4ae616d3) and the `CATrustRow` call (`:91`) that PR D added so its step was
-  visible before this spec; this spec's `caTrusted` step (from `make`, **after `scopeSet`**) and the Flows
-  CA row now carry the same words — the position changes, the words do not. PR D's two nil-facts rows
+  visible before this spec — **and, with the call gone, the private `CATrustRow` struct itself and the
+  `VStack` that wrapped `LaneCard` + the row under the Core card** (the card returns to the bare `LaneCard`
+  with its `.frame` and `.gridProbe`; as shipped in `cb9f59be`, stage-6 SP-M4); this spec's `caTrusted` step
+  (from `make`, **after `scopeSet`**) and the Flows CA row now carry the same words — the position changes,
+  the words do not. PR D's two nil-facts rows
   (`CATrustFacts.unknownStep()`, `notGeneratedStep()`, produced by `Session.caTrustStep` when `ca.status`
   was read but `caTrust` is nil) leave the Getting-started list with the insertion (spec D4, open
   question 21); `Session.caTrustStep` itself and `Shell/SetupSheet.swift` (PR D's first-run sheet,
@@ -674,9 +687,10 @@ greps, Task 6, and the diff review.
   /// The one banner line above every flow list (Flows, Pinned, Domains, Apps) while flows exist and a
   /// known route is closed, every row is a tunnel with an empty Scope, or the CA is not trusted (spec D5/D8).
   struct RouteBanner: View {
-      @Environment(Session.self) private var session
+      var routes: TrafficRoutes                       // stage-6 Q6: read once in MainView.flows and passed in, not re-read here
+      @Environment(Session.self) private var session  // for RouteActions.run and caTrustControlLive only
       @Environment(\.openSettings) private var openSettings
-      var body: some View   // reads session.trafficRoutes only
+      var body: some View   // renders routes.banner / bannerAction / bannerDetail; spells no route word
   }
   ```
 
@@ -694,7 +708,10 @@ greps, Task 6, and the diff review.
   together with its `check-ca-trust-path.sh` allow-list entry — Task 3's cut had routed it through `perform`,
   a no-op), every other action through `session.perform(connection:)`; when that returns `false` and the
   action is `.openCaptureSettings` (the fresh-install button until PR4), set `session.settingsTab = .capture`
-  and call `openSettings()` exactly as `AppsAttributionBanner` does (ruling 2026-11-01). Glyph `"network"`. The file mentions
+  and call `openSettings()` exactly as `AppsAttributionBanner` does (ruling 2026-11-01). The `.trustCA` button
+  (banner and empty-state row) is `.disabled(!session.caTrustControlLive)`, as the Status page's was (stage-6 S1;
+  fixed in a code commit, SHA to be stamped). Icon + text pairs are a `Label` (stage-6 Q9). Glyph `"network"` (a
+  string literal for now — stage-6 Q10 accepted; follow-up in Shipped). The file mentions
   none of `connectionSummary`, `ConnectionSummary`, `LaneDot`, `LaneState`, `CaptureSwitch`,
   `capture.enabled`, `extensionController`, `CaptureAdvice`.
 
@@ -705,8 +722,9 @@ greps, Task 6, and the diff review.
   was (above `if session.splitView {`):
 
   ```
-  if session.trafficRoutes.banner != nil {
-      RouteBanner()
+  let routes = session.trafficRoutes          // once per render (stage-6 Q6); EmptyFlows gets routes.advice
+  if routes.banner != nil {
+      RouteBanner(routes: routes)
       Rule()
   }
   ```
@@ -716,9 +734,10 @@ greps, Task 6, and the diff review.
   the `AppsAttributionBanner` struct (this file) stay, unreferenced from `MainView`; `AppsEmptyState()`
   and its condition are untouched.
 
-  `ShellView.swift` hunk 2 — `EmptyFlows`: gains `var routes: [TrafficRoute]` (passed from the
-  `flowTable` overlay call as `routes: session.trafficRoutes.advice`; plan call 6 — a parameter,
-  not the environment, so the struct stays a pure function of its inputs). Unfiltered and
+  `ShellView.swift` hunk 2 — `EmptyFlows`: gains `var routes: [TrafficRoute]` and `var run: (ConnectionAction) -> Void`
+  (passed from the `flowTable` overlay call as `routes: routes.advice` from the once-read value and a closure
+  that calls `RouteActions.run`; plan call 6 — parameters, not the environment, so the struct is a pure
+  function of its inputs: stage-6 Q6/Q7 removed the `@Environment` reads the first cut had added). Unfiltered and
   `routes` non-empty: under "No flows yet", one row per route — glyph (`"network"` for
   `.systemProxy`, `"app.badge"` for `.allApps`, `Tok.Glyph.scope` for `.scope`, `Tok.Glyph.lock` for `.caTrust`), `Text(route.line)`,
   its actions as `SmallButton`s (every action in `route.actions`: the Scope row Add Host… and Open
@@ -727,12 +746,11 @@ greps, Task 6, and the diff review.
   `session.trustCA()` — and the system-proxy row **none** until
   PR4 fills `.setSystemProxy`), and `Text(route.detail)` beneath at
   `Tok.Typography.Size.sm`, tertiary ink — **instead of** the generic "Point a client at … or open
-  the browser." line. `routes` empty: today's generic line. Filtered: unchanged. Buttons call
-  `RouteActions.run` (the banner's function: `.trustCA` → `session.trustCA()`, the rest through
-  `session.perform(connection:)` with the `.openCaptureSettings` fallback), so
-  `EmptyFlows` gains `@Environment(Session.self)` and `@Environment(\.openSettings)` for the
-  actions only. `allowsHitTesting(false)` moves from the whole VStack to the text elements so the
-  buttons stay clickable. Nothing else in the file; lines 49–62 and the `ExtensionController(` block
+  the browser." line. `routes` empty: today's generic line. Filtered: unchanged. Buttons call the
+  passed `run` closure, which the caller binds to `RouteActions.run` (the banner's function: `.trustCA` →
+  `session.trustCA()`, the rest through `session.perform(connection:)` with the `.openCaptureSettings`
+  fallback), so `EmptyFlows` reads no environment of its own (stage-6 Q7). `allowsHitTesting(false)` moves
+  from the whole VStack to the text elements so the buttons stay clickable. Nothing else in the file; lines 49–62 and the `ExtensionController(` block
   byte-identical.
 
 - **Test:** none in Kit by construction. Sandbox structural checks the Coder quotes:
@@ -742,7 +760,7 @@ greps, Task 6, and the diff review.
   call site named in D7); `sed -n 49,62p` before and after identical;
   `grep -cE 'ExtensionController[[:space:]]*\(' …/ShellView.swift` → `1`;
   `grep -c 'ScopeBanner()' …/ShellView.swift` → `0`; `grep -c 'AppsAttributionBanner()' …/ShellView.swift` → `0`;
-  `grep -c 'RouteBanner()' …/ShellView.swift` → `1`; `grep -c 'struct AppsAttributionBanner: View' …/ShellView.swift` → `1`;
+  `grep -c 'RouteBanner(' …/ShellView.swift` → `1` (the call is `RouteBanner(routes: routes)` after stage-6 Q6); `grep -c 'struct AppsAttributionBanner: View' …/ShellView.swift` → `1`;
   `grep -nE 'connectionSummary|ConnectionSummary|LaneDot|LaneState|CaptureSwitch|capture\.enabled|extensionController|CaptureAdvice' …/Shell/RouteBanner.swift` → empty;
   `git diff <wave-C-base> -- apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift` is the `.help` line
   and the `.addScopeHost` case, nothing else. `apps/mac/tools/grid-lint.sh` PASS
@@ -774,16 +792,18 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   - `apps/mac/Sources/Aitmproxy/Shell/RouteBanner.swift` (modify — `RouteActions.run` sends `.trustCA` to `session.trustCA()`, as `StatusPanel.run` does; Task 3's cut routed it through `perform`, which PR D makes return `false` for it, so the Flows button did nothing)
   - `apps/mac/Sources/Aitmproxy/App.swift` (modify — one token at `:226`: `Button("Trust the aitmproxy CA")` → `Button(ConnectionAction.trustCA.title)`, so rule 1's new prefix `"Trust the aitmproxy CA` finds no view literal; orchestrator GO 2026-11-01)
 - **Change:** spec D9, and in `check-capture-toggle.sh` the NS-AC8 block: `equals "NS-AC8 the banner is rendered exactly once"`
-  counts `RouteBanner()` (→ 1) and a new `equals "NS-AC8 the old Apps banner is no longer rendered"`
-  counts `AppsAttributionBanner()` in `main_body` (→ 0); `main_bcond` becomes
-  `line_of "$main_body" 'if session[.]trafficRoutes[.]banner != nil [{]'`, `main_bcall` becomes
-  `line_of … 'RouteBanner[(][)]'`; the two `ordered` checks keep their meaning (condition guards the
-  call; call above `if session.splitView {`). NS-AC3 struct/body pins and the NS-AC8 empty-state
+  counts the `RouteBanner(` call (→ 1) and a new `equals "NS-AC8 the old Apps banner is no longer rendered"`
+  counts `AppsAttributionBanner()` in `main_body` (→ 0); `main_bcond` matches the banner guard and
+  `main_bcall` the call — after stage-6 Q6 the guard reads the once-read value (`if routes.banner != nil {`)
+  and the call is `RouteBanner(routes: routes)`, so the two patterns follow the shipped text (the fix commit
+  re-runs the tripwire; its PASS line is `cargo test` exit 0, 265 test binaries ok (Terminal, rust-gate.log)); the two `ordered` checks keep their
+  meaning (condition guards the call; call above `if session.splitView {`). NS-AC3 struct/body pins and the NS-AC8 empty-state
   pins are untouched. Header comment notes spec D8.
   - Rule 1: a second grep with an opening-quote prefix pattern,
     `prefixes='"(system proxy off|system proxy on|All Apps on|All Apps off|All Apps waiting|All Apps degraded|Nothing is decrypted|Scope:|HTTPS is not captured|Trust the aitmproxy CA|CA trusted|trusting CA|CA trust needs)'`,
     same scan root and exclusions as `words`, same FAIL message family
-    ("a view spells a route word; read it from ConnectionSummary.routes instead").
+    ("a view spells a route word; read it from ConnectionSummary.routes instead") — the message names the
+    rule that fired and the exclusion list is the one shared variable, not a second copy (stage-6 Q11).
   - Rule 2: unchanged.
   - New rule 3, "one route derivation": `grep -rnE --include='*.swift' 'var[[:space:]]+trafficRoutes' Sources/Aitmproxy`
     must yield exactly one line, in `Sources/Aitmproxy/Session+Connection.swift`, and that line
@@ -813,8 +833,9 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
 
 ### Task 6: Live proof on the real app (Terminal; orchestrating session or Matt)
 
-- **Satisfies:** TR-AC9 (gates on the whole branch), TR-AC10(a), TR-AC11, TR-AC13(a), TR-AC17 (the
-  NOT-trusted state only), TR-AC19, TR-AC20 (B8, once Task 1c is in). **TR-AC10(b), TR-AC12 and
+- **Satisfies:** TR-AC9 (gates on the whole branch), TR-AC10(a), TR-AC11, TR-AC13(a), TR-AC17 (the CA state
+  as Matt's Mac has it — the TRUSTED rendering since 2026-11-01, spec TR-AC17 ruling; the not-trusted line
+  is TR-AC16's Kit proof), TR-AC19, TR-AC20 (B8, once Task 1c is in). **TR-AC10(b), TR-AC12 and
   TR-AC13(b) — the system-proxy clauses — run on the first build that also contains PR4** and are
   recorded in Shipped then; on this PR's build they are "deferred to PR4", not failed.
 - **Depends on:** Tasks 1–5 merged into the branch, Swift gate green, tripwires PASS; the CA clauses
@@ -825,12 +846,14 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   `scutil --proxy` dumps, bus replies). The Shipped section records the build each half ran on.
 - **Change:** none. **HARD GATE (Matt, via the orchestrator): do NOT run `ca.install` on Matt's
   Mac as part of any proof, do not click Install… on the CA page, and do not click Trust the
-  aitmproxy CA.** Trusting the aitm CA on his machine is Matt's decision and he has not given it.
-  This task proves only the NOT-trusted state and its line as his Mac is today, plus `ca.status`
-  over the bus showing `trusted: "no"`. The install → line-disappears path is proved only after Matt
-  says in his own words that the CA may be trusted, and then only through the app's own Status step
-  (PR D's `.trustCA` with its prompts), never a direct verb call from a script; it is recorded in
-  Shipped when it happens.
+  aitmproxy CA.** Trusting the aitm CA on his machine is Matt's decision alone. This task proves the CA
+  state **as his Mac has it** — since 2026-11-01 the TRUSTED rendering (spec TR-AC17 ruling: Matt trusted
+  the CA himself through PR D's first-run step before Half A ran; `ca.status` user store `trusted: "yes"`,
+  `✓ CA trusted (user keychain)`, no CA row or banner clause — B9), with the not-trusted line proved by the
+  Kit tests (TR-AC16) and shown live only on a Mac that does not trust the CA; nobody untrusts it to
+  recreate that state. Had the Mac not trusted the CA, the install → line-disappears path would be proved
+  only after Matt said in his own words that the CA may be trusted, and then only through the app's own
+  Status step (PR D's `.trustCA` with its prompts), never a direct verb call from a script.
 
   Two halves. On this PR's build **nothing is flipped with `networksetup`** — the system proxy is
   unknown to the app until PR4, so there is nothing to observe. The flip recipe below is kept for the
@@ -891,8 +914,10 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   banner gone within one poll, Status `✓ Scope: 1 host decrypted`, `decrypt.advice null` / `scope_hosts 1`; the
   next HTTPS → a `tunnel decrypted` row plus the inner `GET https://example.com/` 200; `scope.remove` → `[]`; A4
   Add Host… from the empty state and from the banner → the Scope page with the Edit Scope sheet (the Scope page,
-  a flow-list page, shows the one banner above its table — spec D8); TR-AC19 — the column header sat one banner
-  row lower with the banner than without (≈141 px vs ≈110 px at that shot's scale), never two; no `ScopeBanner`,
+  a flow-list page, shows the one banner above its table — spec D8); TR-AC19 — **one banner row, not two**: the
+  column header sat one row lower with the banner than without and no second banner was anywhere (the Half A
+  shots were taken at an unknown scale, so they establish the count, not the 28 pt figure — the 28 pt
+  measurement is Half B's B4, from the table header's AX frame or a known-scale shot; stage-6 SP-M6); no `ScopeBanner`,
   no "Flows carry no source app" anywhere. No `ca.install`, no Install… click, no Trust click, system proxy not
   touched. Half B runs on the first DMG that contains this PR.
   - A1 Build: `apps/mac/build.sh --debug --replace` with `AITM_CORE_DIR` pointing at a core dir that
@@ -1011,6 +1036,29 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
 
   **Whole-branch gates (TR-AC9)**: Swift gate green; `apps/mac/build.sh --ne --allow-unnotarized
   --replace` log shows no warnings; the three tripwires PASS; Rust gate green.
+
+  **Gate record for the stage-6 head commit `6ebc9e8f`** (orchestrating session, Terminal,
+  `/tmp/claude/attr/gate-routes.log`, header `== 6ebc9e8f Sun Nov  1 13:41:15 PST 2026`; stage-6 SP-I2):
+
+  ```
+  ✔ Test run with 624 tests in 77 suites passed after 0.922 seconds.
+  ✔ Test run with 31 tests in 6 suites passed after 0.595 seconds.
+  swift-test-exit=0
+  PASS check-connection-words
+  check-connection-words-exit=0
+  PASS check-capture-operator-only (6 agent-reachable surfaces checked)
+  check-capture-operator-only-exit=0
+  PASS check-capture-toggle
+  check-capture-toggle-exit=0
+  PASS check-ca-trust-path (9 agent-reachable surfaces checked)
+  check-ca-trust-path-exit=0
+  PASS grid-lint
+  grid-lint-exit=0
+  ```
+
+  Rust gate at `6ebc9e8f` (Terminal): `FMT_OK`, `CLIPPY_OK`; `cargo test` result quoted in the PR panel
+  comment. The stage-6 fix commit re-runs the same gate; its lines are `cargo test` exit 0, 265 test binaries ok (Terminal, rust-gate.log) and
+  its SHA stamped into the Review log.
 - **Test:** the screenshots and files above exist and show the literal lines named; the Tester's
   report quotes the `scutil` dumps, the bus replies and (PR4 build) the `diff` result.
 - **Done when:** every TR-AC10(a)/11/13(a)/17/19 clause has its named file, `A2-deferred-to-PR4.txt`
@@ -1068,7 +1116,7 @@ Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touche
 | 14 | — | deleted 2026-11-01 (its surviving clauses are in 10(a): A4, B5) |
 | 15 | K (contract) | PR D's `CATrustFacts` tests; gate 3 |
 | 16 | K | 1b (`caTrust*` tests in `ConnectionSummaryTests`) |
-| 17 | L | 6 (A2/A3 CA row and CA-only banner on the dev bundle; B2/B4/B7 on the installed app) — NOT-trusted state only; buttons present, not clicked; hard gate; needs 1b/2b (gate 3) |
+| 17 | L | 6 (A2/A3 on the dev bundle; B2/B4/B7 on the installed app) — the CA state as Matt's Mac has it: the TRUSTED rendering since 2026-11-01 (`✓ CA trusted (user keychain)`, no CA row or banner clause, `ca.status` user `trusted: "yes"`; spec TR-AC17 ruling); the not-trusted row/step/banner are TR-AC16's Kit proof (Task 1b) and show live only on a Mac that does not trust the CA; hard gate (no `ca.install`, no clicks) unchanged; needs 1b/2b (gate 3) |
 | 18 | K | 1 (`composedBanner`), 1b (`composedBannerWithCA`) |
 | 19 | L | 6 (B4 header measurement against `Tok.Size.Row.dense` = 28 pt, one banner on all four list pages), T (Task 5 NS-AC8 pins) |
 | 20 | L | 6 (B8; unconditional once Task 1c is in, else recorded as deferred) |
@@ -1199,7 +1247,11 @@ panel on docs PR #242 (range `dac90fe9..0bad920f`, merged as `7a5f8585`), fixed 
 docs PR from this branch. Rows whose Reviewer reads "Tester (whole branch)" or "Architect (amendment)" are the
 2026-11-01 stage-5 Tester pass and the docs amendment pass on the shipped code (`58724ef7..e60a13e8`, commits
 `ce296c83` … `e60a13e8`); a "fixed in <code commit>" disposition gets its SHA stamped by the orchestrator when the
-coder's commit lands.
+coder's commit lands. Rows whose Task reads "PR #265" are the **stage-6 panel on the shipped code** (range
+`58724ef7..6ebc9e8f`, PR #265; security PASS with 3 Minor, quality PASS with 14 Minor, spec FAIL with 2 Important
+and 5 Minor); "fixed in <code commit> (SHA to be stamped)" is the one stage-6 fix commit, stamped by the
+orchestrator; "accepted" rows carry the orchestrator's 2026-11-01 ruling and, where one is owed, the follow-up
+named in Shipped.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
@@ -1253,8 +1305,8 @@ coder's commit lands.
 | whole branch | Tester (whole branch) | Minor | T1 — TR-AC8's literal `grep -rln CFNetworkCopySystemProxySettings apps/mac/Sources` is non-empty on the branch: PR #246's `SystemProxyState.swift` names the function in two `///` doc comments (lines 6, 79) and calls it nowhere | fixed in docs (this commit): spec TR-AC8 and plan Task 2 read `grep -rn … \| grep -vE ':[0-9]+:[[:space:]]*///'` → empty |
 | whole branch | Tester (whole branch) | Minor | T2 — the `BusService.swift` diff is four added lines (decode, change-guarded write, two-line comment), not "exactly one added line" | accepted (orchestrator 2026-11-01: the guard matches the file's other per-tick writes; an `@Observable` set notifies on equal values) + amended in docs (this commit): spec D6/D7/TR-AC8, plan gate 2, Task 2, do-not-touch, file table, call 5 |
 | whole branch | Tester (whole branch) | Minor | T3 — `App.swift:226` (one token, `ConnectionAction.trustCA.title`) and `tools/check-ca-trust-path.sh` (rule 2 allow-list + expect for `RouteBanner.swift`) are edited outside the recorded claim | recorded (this commit): orchestrator GO 2026-11-01 on both; spec D7/TR-AC7, plan gate 2, Task 5, do-not-touch, file table amended |
-| whole branch | Tester (whole branch) | Minor | T4 — an empty or whitespace-only `decrypt.advice` is quoted as the Scope line (a blank row / banner) instead of falling back to the sentence | fixed in e58b267a: a blank sentence reads as absent; tests `advice: ""` → nil (`DecryptStatusTests`) and the fallback line (`ConnectionSummaryTests`); docs: spec D2/D3/TR-AC21, plan Task 1 (this commit) |
-| whole branch | Tester (whole branch) | Minor | T5 — `RouteBanner.shownEntries` re-derives the shown list by walking `advice` against the banner text: a second derivation of D5's predicate in a view (anti-goal) | fixed in e58b267a: `TrafficRoutes.shown` and `bannerDetail` published by the Kit and read by `RouteBanner`; docs: spec D2/D5/D7/TR-AC18, plan Tasks 1/3 (this commit) |
+| whole branch | Tester (whole branch) | Minor | T4 — an empty or whitespace-only `decrypt.advice` is quoted as the Scope line (a blank row / banner) instead of falling back to the sentence | fixed in e58b267a (gate at `6ebc9e8f`, `/tmp/claude/attr/gate-routes.log`: `✔ Test run with 624 tests in 77 suites passed after 0.922 seconds.`, `✔ Test run with 31 tests in 6 suites passed after 0.595 seconds.`, `swift-test-exit=0`, `check-connection-words-exit=0`, `check-capture-operator-only-exit=0`, `check-capture-toggle-exit=0`, `check-ca-trust-path-exit=0`, `grid-lint-exit=0`): a blank sentence reads as absent; tests `advice: ""` → nil (`DecryptStatusTests`) and the fallback line (`ConnectionSummaryTests`); docs: spec D2/D3/TR-AC21, plan Task 1 (this commit) |
+| whole branch | Tester (whole branch) | Minor | T5 — `RouteBanner.shownEntries` re-derives the shown list by walking `advice` against the banner text: a second derivation of D5's predicate in a view (anti-goal) | fixed in e58b267a (gate at `6ebc9e8f` as quoted in the T4 row: 624 + 31 tests passed, `swift-test-exit=0`, the five tripwires exit 0): `TrafficRoutes.shown` and `bannerDetail` published by the Kit and read by `RouteBanner`; docs: spec D2/D5/D7/TR-AC18, plan Tasks 1/3 (this commit) |
 | 1b | Architect (amendment) | Minor | item 1 — spec D3's CA prose said `open = trusted`; the code, D3's own table and PR D's `step.done` say `trusted && !installing` | fixed in docs (this commit): D3 prose and plan Task 1b read `open = trusted && !installing`; pinned by `caSiblingStates`, incl. the uninstall-in-flight case |
 | 1b | Architect (amendment) | Minor | item 2 — plan Task 1b said test values are "built with PR D's memberwise init"; PR D's `init?(status:)` in the struct body suppresses it | fixed in docs (this commit): built via `CATrustFacts(status: CAStatus(...))`, then `installing` / `needsAdmin` set (`caFacts(scope:installing:needsAdmin:)`) |
 | 2 | Architect (amendment) | Minor | item 3 — TR-AC8 CFNetwork grep literal | = Tester T1 above; fixed in docs (this commit) |
@@ -1267,6 +1319,32 @@ coder's commit lands.
 | 6 | Architect (amendment) | Minor | item 10 — Half A ran with the session's own bundle script and the installed app left running, so `L` = `127.0.0.1:63109`, not 8080; evidence `/tmp/claude/route-advice/` + shared note `traffic-route-live-proof-half-A.md`; Half B on the first DMG containing this PR | fixed in docs (this commit): plan Task 6 "As run", Half B header, call 8, Q2, Shipped pre-fill |
 | all | Architect (amendment) | Minor | `tools/grid-lint.sh` is zsh; the four tripwires are bash | fixed in docs (this commit): plan Environment adaptation says which is which and to run grid-lint by path, never under `bash` |
 | all | Architect (amendment) | Minor | plan header named the branch `claude/apps-attribution-8ab619`; the implementation shipped on `feat/mac-traffic-route-advice` (Architect's call to correct it) | fixed in docs (this commit) |
+| PR #265 | security | Minor | S1 — the Flows trust-CA button (banner and empty-state row) is not `.disabled(!caTrustControlLive)` as the Status row's is; the downstream guard in `Session+CATrust` refuses the call, so a UX gap, not a bypass | fixed in <code commit> (SHA to be stamped): the `.trustCA` button is disabled unless `session.caTrustControlLive`; docs: spec D7, plan Task 3 (stage-6 docs pass) |
+| PR #265 | security | Minor | S2 — `decrypt.advice` is unbounded, and `TrafficRoute.state` is parsed from `line` by splitting on " — " (a core sentence containing " — ", a multi-line or a huge string reaches the one-line banner, its tooltip and the Status row) | fixed in <code commit> (SHA to be stamped): `TrafficRoute` stores `state` and `remedy`, `line` is computed, nothing parses; `DecryptStatus(json:)` flattens line breaks and caps `advice` at 512 characters; docs: spec D2/D3/TR-AC21, plan Task 1 (stage-6 docs pass) |
+| PR #265 | security | Minor | S3 — a negative `scope_hosts` is accepted (a malformed reply could render `Scope: -1 hosts decrypted`) | fixed in <code commit> (SHA to be stamped): `DecryptStatus(json:)` is nil on `scope_hosts < 0`; docs: spec D2/TR-AC21, plan Task 1 (stage-6 docs pass) |
+| PR #265 | security | — | `unsafe` sign-off: no `unsafe` block in the range | n/a |
+| PR #265 | quality | Minor | Q1 — `state` parsed from `line` | fixed in <code commit> (SHA to be stamped), as S2 |
+| PR #265 | quality | Minor | Q2 — duplicate open/closed filters in `make`'s route derivation | fixed in <code commit> (SHA to be stamped): one filter |
+| PR #265 | quality | Minor | Q3 — external-core `allApps == nil` carried two meanings (no extension vs external core), decided in two places | fixed in <code commit> (SHA to be stamped): decided in one place |
+| PR #265 | quality | Minor | Q4 — `ScopeBanner` is a dead struct in `Panels/ScopePanel.swift` | accepted for this PR (orchestrator 2026-11-01: the file is outside this plan's claim); follow-up in Shipped: delete it |
+| PR #265 | quality | Minor | Q5 — `AppsAttributionBanner` kept alive only so the NS-AC3 pins hold | accepted for this PR (orchestrator 2026-11-01: the `ShellView` grant is `EmptyFlows` + the banner insertion only); follow-up in Shipped: retarget the NS-AC3 pins at `RouteBanner`, delete the struct |
+| PR #265 | quality | Minor | Q6 — three `make` evaluations per render (`MainView.flows`'s guard, `RouteBanner` and `EmptyFlows` each read `session.trafficRoutes`) | fixed in <code commit> (SHA to be stamped): routes computed once in `MainView.flows`, passed to `RouteBanner(routes:)` and `EmptyFlows(routes:run:)`; docs: spec D5/D7/D8, plan Tasks 3/5 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q7 — `EmptyFlows` half-pure (routes by parameter, actions via the environment) | fixed in <code commit> (SHA to be stamped): a `run` closure parameter; docs: spec D7, plan Task 3 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q8 — `?? ""` on the banner text in `RouteBanner` | fixed in <code commit> (SHA to be stamped) |
+| PR #265 | quality | Minor | Q9 — icon + text built as an `HStack`, not a `Label` (apps/mac/CLAUDE.md design rule) | fixed in <code commit> (SHA to be stamped); docs: spec D7, plan Task 3 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q10 — glyph string literals (`"network"`, `"app.badge"`) beside `Tok.Glyph.*` tokens | accepted for this PR (orchestrator 2026-11-01); follow-up in Shipped: `Tok.Glyph.network` / `Tok.Glyph.apps` via gen-tokens, together with the icons PR's `glyph.process` |
+| PR #265 | quality | Minor | Q11 — the words tripwire's FAIL message and exclusion list duplicated between rule 1's two greps | fixed in <code commit> (SHA to be stamped); docs: plan Task 5 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q12 — the grid-invariant test's oracle re-derived the shown set instead of reading `shown` | fixed in <code commit> (SHA to be stamped): the oracle is `routes.shown` |
+| PR #265 | quality | Minor | Q13 — a magic step count and positional `steps[n]` indexing in the step tests | fixed in <code commit> (SHA to be stamped): steps looked up by kind |
+| PR #265 | quality | Minor | Q14 — `FlowRow.tls` and `tunnel` are independent stored fields | accepted by design (orchestrator 2026-11-01): `tls` has non-tunnel sources (the scheme rule on rows without `tunnel`, every row from an older core); noted in spec D2 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q15 — `Session.systemProxy` is declared but never written | accepted by design (spec D6, plan call 4): PR4 writes it; nil = unknown, never "off" |
+| PR #265 | spec | Important | SP-I1 — the blank-advice rule lived only in the decoder, and the plan's memberwise `advice: ""` test was absent, so a memberwise-built `DecryptStatus` would print an empty Scope line | fixed in <code commit> (SHA to be stamped): `make`'s Scope derivation guards a blank advice and the `ConnectionSummaryTests` memberwise-`""` case is added; docs: spec D3/TR-AC21 say both layers normalise, plan Task 1 (stage-6 docs pass) |
+| PR #265 | spec | Important | SP-I2 — no quoted Swift gate for the head commit in the plan | fixed in docs (stage-6 docs pass): Task 6 "Gate record for the stage-6 head commit `6ebc9e8f`" quotes `/tmp/claude/attr/gate-routes.log` — `✔ Test run with 624 tests in 77 suites passed`, `✔ Test run with 31 tests in 6 suites passed`, `swift-test-exit=0`, `check-connection-words-exit=0`, `check-capture-operator-only-exit=0`, `check-capture-toggle-exit=0`, `check-ca-trust-path-exit=0`, `grid-lint-exit=0`; the same lines sit on the e58b267a rows above; Rust gate at `6ebc9e8f`: `FMT_OK`, `CLIPPY_OK`, `cargo test` result `cargo test` exit 0, 265 test binaries ok (Terminal, rust-gate.log) |
+| PR #265 | spec | Minor | SP-M3 — the `TrafficRoutes` signature in spec D2 / plan Task 1 differed from the shipped one (`banner`, `bannerAction`, `bannerDetail` are computed from `shown`; the init is `(systemProxy:allApps:scope:caTrust:advice:shown:)`) | fixed in docs (stage-6 docs pass): spec D2, D5, Left to the builder; plan Task 1 |
+| PR #265 | spec | Minor | SP-M4 — the StatusPanel hand-over (`cb9f59be`) also deleted the private `CATrustRow` struct and the `VStack` wrapper around `LaneCard`, unstated in D7/TR-AC8/Task 2b | fixed in docs (stage-6 docs pass): spec D7 and TR-AC8, plan Task 2b |
+| PR #265 | spec | Minor | SP-M5 — TR-AC18's `.off`-led `shown` literal (`[.systemProxy, .allApps, .scope, .caTrust]`) was not pinned by a test | fixed in <code commit> (SHA to be stamped): the test is added; spec TR-AC18 notes the pin (stage-6 docs pass) |
+| PR #265 | spec | Minor | SP-M6 — Half A's header-offset numbers (≈141 px vs ≈110 px at an unknown scale) do not establish the 28 pt figure | fixed in docs (stage-6 docs pass): Task 6 "As run" reads "one banner row, not two; the 28 pt measurement is Half B's B4 (AX frame or known-scale shot)" |
+| PR #265 | spec | Minor | SP-M7 — gate 3 blank; coverage row 17 and three Task 6 paragraphs still said "NOT-trusted only" against the TR-AC17 TRUSTED ruling | fixed in docs (stage-6 docs pass): gate 3 = PR #254 / `58724ef7`; the Environment hard-gate paragraph, Task 6's Satisfies and Change paragraphs and coverage row 17 aligned with the ruling (the hard-gate text — no `ca.install`, no clicks — unchanged) |
 
 ## Shipped
 
@@ -1285,3 +1363,11 @@ Pre-filled 2026-11-01 — facts the stage-7 entry carries forward:
   first-run step; the live proof shows `✓ CA trusted (user keychain)`, no CA row or banner clause, `ca.status` user store
   `trusted: "yes"` (`bus-A2-ca.json`). No session ran `ca.install` or clicked anything.
 - **Half B:** pending the first DMG that contains this PR (B1–B8 as written; CA clauses in their TRUSTED form).
+- **Follow-ups accepted at the stage-6 panel (PR #265, 2026-11-01), each a small cleanup PR of its own:**
+  1. Delete the dead `ScopeBanner` struct in `Panels/ScopePanel.swift` (quality Q4; outside this plan's claim).
+  2. Retarget `check-capture-toggle.sh`'s NS-AC3 body pins at `RouteBanner` and delete the `AppsAttributionBanner`
+     struct in `Shell/ShellView.swift` (quality Q5; kept here only so the pins hold — plan call 12).
+  3. `Tok.Glyph.network` and `Tok.Glyph.apps` via gen-tokens, together with the icons PR's `glyph.process`, replacing the
+     `"network"` / `"app.badge"` string literals in `RouteBanner.swift` (quality Q10).
+  4. PR4 (system-proxy session) writes `Session.systemProxy` and fills `.setSystemProxy` (quality Q15, by design); the
+     Task 6 PR4 addendum (TR-AC10(b)/12/13(b)) runs on its first build.
