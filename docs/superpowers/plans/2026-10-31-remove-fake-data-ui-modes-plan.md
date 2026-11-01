@@ -284,6 +284,20 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| T1–T4 | Tester | — | PASS on AC1/AC6-static/AC7/AC8/AC9/AC10 and every T-task's named test; added `tests/cli_usage.rs` (the binary rejects the removed flags), three robustness tests, two helper contracts | tests committed in b1cbdf69 |
+| T1–T4 | Security | Minor | the deleted `tester_bus_task.rs` guarded a refused token (no retry), connect back-off (≥ 400 ms) and a malformed `flow.detail` reply; nothing re-pinned them | fixed in 897cb53c: `tests/bus_task.rs` with a file-local scripted `BusTransport` whose replies are literals (closes spec Q3 — no follow-up card needed) |
+| T1–T4 | Security | Minor | two reducer-level tests D7 allowed were dropped (`:scan` scope gate; non-image `browser.screenshot` placeholder) | fixed in 897cb53c (re-added in `robustness.rs` on inline inputs) |
+| T1–T4 | Security | Minor | L4 inject confirm had no sandbox-runnable test until the L4 parity plan | fixed in 897cb53c (`l4_inject_is_scope_gated_and_confirmed_over_the_wire`; the real sequence is a probe, then `needs_confirmation`, then `y` resends with `_confirm` — the finding's "local confirm" description was wrong, the test pins the code) |
+| T1–T4 | Quality | Minor | `sample_app` duplicated in two test binaries | fixed in 897cb53c (`tests/common::sample_app`) |
+| T1–T4 | Quality | Minor | process-global silent panic hook installed from parallel tests (eight sites) | fixed in 897cb53c (`common::quietly`, `Once` + thread-local suppression) |
+| T1–T4 | Quality | Minor | three private `summary` builders for the same `flow.get` JSON | fixed in 897cb53c (one `cfg(test)` `summary` in `lib.rs`) |
+| T1–T4 | Quality | Minor | render-to-text exists three times (lib `cfg(test)`, `tests/common`, `l4_cua_tui.rs`) with an unreachable `None` branch | loops simplified in 897cb53c (`buf.content().chunks(width)`, explicit zero-width case); the three copies accepted (autonomous mode, orchestrator 2026-11-01): spec D7 — the lib ships no renderer-to-text |
+| T1–T4 | Quality | Minor | README said `CORE_TOOLS` has 59 commands (65); Testing bullet omitted `connected_app` | fixed in 897cb53c |
+| T1–T4 | Quality | Minor | hygiene: `"fixture"` as a test bus label; a negatives-only status-bar assertion; a `params` assertion inside an unrelated test | fixed in 897cb53c (`"remote.test:9090"`; `"142 B ↑ — ↓ — (F4)"` pinned; `tool_info_params_reads_the_input_schema`) |
+| T1–T4 | Spec | Important | the cited gate log predated the tester's commit; the 250 ms `five_thousand_flows…` bound flaked under parallel load | fixed in 897cb53c (`tests/perf.rs`: the wall-clock-bounded tests run in their own binary, bound unchanged) and the full gate rerun in the Terminal on the final head (see the PR body) |
+| T1–T4 | Spec | Minor | README "59 commands" | fixed in 897cb53c |
+| T1–T4 | Spec | Minor | plan T2 still listed `l4_cua_tui.rs` after it moved to T3 | recorded: T3 is the record (the T2 text carries a pointer) |
+| T1–T4 | Spec | note | `crates/aitm` gains a `ratatui = "0.30"` dev-dependency (one `Cargo.lock` edge, no new crate) — sanctioned by the T3 amendment | recorded |
 
 ## Shipped
 
