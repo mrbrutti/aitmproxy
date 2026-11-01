@@ -18,7 +18,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,24 +81,79 @@ pub struct WatchdogArgs {
     pub no_pipe: bool,
 }
 
-/// The core's side of a spawned watchdog. Holding `_stdin` open is what
+/// The core's side of a spawned watchdog. Holding `stdin` open is what
 /// keeps the watchdog asleep; dropping the handle closes the pipe, and the
-/// watchdog then sees the file (gone or present) and acts.
+/// watchdog then sees the file (gone or present) and acts, while the child
+/// is reaped off the core's thread ([`reap`]). Both fields are `Some` until
+/// the drop takes them.
 #[derive(Debug)]
 pub struct WatchdogHandle {
-    child: Child,
-    _stdin: ChildStdin,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
 }
 
 impl WatchdogHandle {
     /// The watchdog's pid, for `Status::watchdog_pid`.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().map_or(0, Child::id)
     }
 
     /// Still running (not exited, not yet reaped).
     pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        self.child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+    }
+}
+
+impl Drop for WatchdogHandle {
+    fn drop(&mut self) {
+        // Close our end of the pipe first: that is what wakes the watchdog,
+        // and a reaper waiting on a watchdog that is still asleep would
+        // never return.
+        drop(self.stdin.take());
+        if let Some(child) = self.child.take() {
+            match reap(child) {
+                Reaped::Now(status) => {
+                    tracing::debug!(target: "aitm_sysproxy", %status, "watchdog had exited; reaped");
+                }
+                // Detach: the thread finishes when the watchdog does.
+                Reaped::Deferred(thread) => drop(thread),
+                Reaped::Dropped(e) => {
+                    tracing::debug!(target: "aitm_sysproxy", error = %e, "watchdog child left for the OS to collect");
+                }
+            }
+        }
+    }
+}
+
+/// How [`reap`] disposed of a child.
+#[derive(Debug)]
+pub(crate) enum Reaped {
+    /// Already exited: reaped on the spot.
+    Now(ExitStatus),
+    /// Still running: a detached thread owns the child and `wait`s on it.
+    /// Dropping the handle detaches the thread.
+    Deferred(thread::JoinHandle<io::Result<ExitStatus>>),
+    /// No thread could be started; the child is dropped unreaped and the
+    /// OS collects it when this process exits.
+    Dropped(io::Error),
+}
+
+/// Reap `child` without blocking the caller: `try_wait` first, else `wait`
+/// on a detached thread that owns the child. The core never waits for the
+/// watchdog's restore, and no watchdog is left a zombie until the core
+/// exits.
+pub(crate) fn reap(mut child: Child) -> Reaped {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Reaped::Now(status);
+    }
+    match thread::Builder::new()
+        .name("sysproxy-watchdog-reaper".to_string())
+        .spawn(move || child.wait())
+    {
+        Ok(handle) => Reaped::Deferred(handle),
+        Err(e) => Reaped::Dropped(e),
     }
 }
 
@@ -128,8 +183,8 @@ pub fn spawn(exe: &Path, core_pid: u32, state: &Path) -> io::Result<WatchdogHand
         .take()
         .ok_or_else(|| io::Error::other("watchdog stdin was not piped"))?;
     Ok(WatchdogHandle {
-        child,
-        _stdin: stdin,
+        child: Some(child),
+        stdin: Some(stdin),
     })
 }
 
@@ -296,7 +351,12 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aitm_ca::exec::Executor;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use aitm_ca::exec::{Executor, RealExecutor};
     use aitm_ca::testing::ScriptedExecutor;
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
@@ -504,9 +564,123 @@ mod tests {
     fn spawn_builds_the_hidden_argv() {
         let mut handle = spawn(Path::new("/usr/bin/true"), 1, Path::new("/x")).expect("spawn");
         assert!(handle.pid() > 0);
-        let status = handle.child.wait().expect("wait");
+        let status = handle
+            .child
+            .as_mut()
+            .expect("child held until drop")
+            .wait()
+            .expect("wait");
         assert!(status.success(), "status = {status:?}");
         assert!(!handle.is_alive(), "waited child is not alive");
+    }
+
+    /// F1.2: `reap` never blocks its caller and really waits. An exited
+    /// child yields its status (now, or on the thread when it had not quite
+    /// exited yet); a child blocked on its stdin is handed to a detached
+    /// thread whose `wait` yields the status once the pipe closes.
+    #[test]
+    fn reap_collects_now_or_on_a_detached_thread() {
+        let done = Command::new("/usr/bin/true").spawn().expect("spawn true");
+        let status = match reap(done) {
+            Reaped::Now(status) => status,
+            Reaped::Deferred(thread) => thread
+                .join()
+                .expect("reaper thread did not panic")
+                .expect("wait succeeded"),
+            Reaped::Dropped(e) => panic!("reaper thread could not start: {e}"),
+        };
+        assert!(status.success(), "true exits 0, got {status:?}");
+
+        // `cat` blocks until its stdin closes, so it is certainly alive.
+        let mut blocked = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = blocked.stdin.take().expect("piped stdin");
+        let started = Instant::now();
+        let reaped = reap(blocked);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "reap returned without waiting ({:?})",
+            started.elapsed()
+        );
+        let Reaped::Deferred(thread) = reaped else {
+            panic!("a running child is reaped on a thread");
+        };
+        assert!(!thread.is_finished(), "the thread waits while cat lives");
+        drop(stdin);
+        let status = thread
+            .join()
+            .expect("reaper thread did not panic")
+            .expect("wait succeeded");
+        assert!(status.success(), "cat exits 0 on EOF, got {status:?}");
+    }
+
+    /// F1.2: dropping the handle closes the pipe (the watchdog wakes) and
+    /// returns at once; the child is reaped in the background, not left a
+    /// zombie until the core exits.
+    #[test]
+    fn dropping_the_handle_closes_the_pipe_and_reaps_without_blocking() {
+        // `cat`'s stdout reaches EOF only when cat has exited, which it does
+        // on stdin EOF: that is how the pipe closure is observed.
+        let mut cat = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = cat.stdin.take().expect("piped stdin");
+        let mut stdout = cat.stdout.take().expect("piped stdout");
+        let pid = cat.id();
+        let handle = WatchdogHandle {
+            child: Some(cat),
+            stdin: Some(stdin),
+        };
+        drop(handle);
+        let mut out = Vec::new();
+        stdout
+            .read_to_end(&mut out)
+            .expect("read cat stdout to EOF");
+        assert!(out.is_empty(), "nothing was ever written to cat");
+
+        // The OS liveness probe cannot run inside the Bash sandbox (`ps` is
+        // refused); where it can, the pid is gone, not a `Z` zombie. Our own
+        // pid is the control: alive if the probe works at all.
+        let exec = RealExecutor::new();
+        let os = std::env::consts::OS;
+        if is_alive_on(os, std::process::id(), &exec) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while is_alive_on(os, pid, &exec) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !is_alive_on(os, pid, &exec),
+                "watchdog child {pid} reaped after the handle was dropped"
+            );
+        } else {
+            eprintln!(
+                "NOTE: liveness probe unavailable here; the reap itself is proven by reap_collects_now_or_on_a_detached_thread"
+            );
+        }
+
+        // A child that ignores the pipe must not make the drop wait for it.
+        let mut sleeper = Command::new("/bin/sleep")
+            .arg("2")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin = sleeper.stdin.take().expect("piped stdin");
+        let handle = WatchdogHandle {
+            child: Some(sleeper),
+            stdin: Some(stdin),
+        };
+        let started = Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drop returned before the child exited ({:?})",
+            started.elapsed()
+        );
     }
 
     /// A `PlatformOps` whose reads and restores are scripted; the only ops

@@ -56,6 +56,29 @@ pub(crate) trait PlatformOps: Send + Sync {
     ) -> Result<Vec<String>, WriteError>;
 }
 
+/// The live rows a snapshot describes, named as `StateFile::service_names`
+/// spells them: the macOS rows themselves; the `gsettings` row parsed from
+/// the six keys; the `kde` row from kioslaverc plus `gsettings` when
+/// mirrored. A snapshot is the live read it was taken from, so this is how
+/// a `set` over an existing file judges which services are still ours
+/// without running a second read.
+pub(crate) fn rows_of(previous: &Previous) -> Vec<ServiceRow> {
+    match previous {
+        Previous::Networksetup { services } => services.clone(),
+        Previous::Gsettings { keys } => vec![linux::gsettings_row(keys)],
+        Previous::Kde {
+            kioslaverc,
+            gsettings,
+        } => {
+            let mut rows = vec![linux::kde_row(kioslaverc)];
+            if let Some(keys) = gsettings {
+                rows.push(linux::gsettings_row(keys));
+            }
+            rows
+        }
+    }
+}
+
 // "Does a live row still equal what we wrote" has one implementation,
 // `crate::service_equals_wrote` (plan C3); the engine and the watchdog both
 // judge a whole file against a live read through `watchdog::decide`, so the
@@ -64,22 +87,17 @@ pub(crate) trait PlatformOps: Send + Sync {
 /// The ops for a bare mechanism word: what the watchdog has (the state file
 /// names the mechanism, nothing else) and what the public
 /// `SystemProxy::with_mechanism` test constructor takes. `detect_with`
-/// builds its ops from the full detection instead, so a KDE host gets the
-/// tool major it actually has.
+/// builds its ops from the full detection instead.
 pub(crate) fn ops_for(mechanism: Mechanism) -> Box<dyn PlatformOps> {
     match mechanism {
         Mechanism::Networksetup => Box::new(macos::MacosOps),
         Mechanism::Gsettings => Box::new(linux::GsettingsOps),
         // A bare `Kde` cannot say which `kwriteconfig` major is on PATH nor
-        // whether `gsettings` is present too; the 6 variants are assumed. A
-        // KDE restore through the watchdog therefore needs `kwriteconfig6`
-        // (the mirrored gsettings keys are restored from the snapshot's
-        // content regardless of `gsettings_too`).
-        Mechanism::Kde => Box::new(linux::KdeOps {
-            kwrite: "kwriteconfig6",
-            kread: "kreadconfig6",
-            gsettings_too: false,
-        }),
+        // whether `gsettings` is present too, so both are resolved from this
+        // host at runtime: a watchdog restore on a Plasma 5 host uses
+        // `kwriteconfig5`, not an assumed 6 (the mirrored gsettings keys are
+        // restored from the snapshot's content regardless of `gsettings_too`).
+        Mechanism::Kde => Box::new(linux::kde_ops_from_host()),
         Mechanism::None => Box::new(windows::NoneOps),
     }
 }

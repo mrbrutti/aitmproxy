@@ -12,6 +12,7 @@ pub mod state;
 pub mod watchdog;
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -22,8 +23,9 @@ use std::time::{Duration, Instant};
 use aitm_ca::exec::Executor;
 use aitm_core::Value;
 
+use platform::linux::{GSETTINGS_SERVICE, KDE_SERVICE};
 use platform::{ops_for, PlatformOps, Snapshot};
-use state::StateFile;
+use state::{Previous, StateFile};
 use watchdog::{decide, Decision, WatchdogHandle};
 
 pub use config::SystemProxyConfig;
@@ -584,11 +586,9 @@ impl SystemProxy {
         let ops: Box<dyn PlatformOps> = match target_os {
             "macos" => Box::new(platform::macos::MacosOps),
             "linux" => {
-                let path = env("PATH").unwrap_or_default();
-                let on_path = |tool: &str| {
-                    std::env::split_paths(&path)
-                        .any(|dir| !dir.as_os_str().is_empty() && dir.join(tool).is_file())
-                };
+                let path = env("PATH");
+                let on_path =
+                    |tool: &str| platform::linux::on_path_in(path.as_deref().map(OsStr::new), tool);
                 platform::linux::detect(target_os, env, &on_path)
                     .ops()
                     .unwrap_or_else(|| Box::new(platform::windows::NoneOps))
@@ -599,8 +599,8 @@ impl SystemProxy {
     }
 
     /// A fixed mechanism on this host's OS word (plan C2): lets another
-    /// crate's tests drive Linux ops on a macOS host. A bare `Kde` assumes
-    /// the `kwriteconfig6` tools (see `platform::ops_for`).
+    /// crate's tests drive Linux ops on a macOS host. A bare `Kde` resolves
+    /// its tool major from this host's `PATH` (see `platform::ops_for`).
     pub fn with_mechanism(
         exec: Arc<dyn Executor>,
         cfg: &SystemProxyConfig,
@@ -875,9 +875,12 @@ impl SystemProxy {
     /// anything was written, and the rendered lines that ran.
     ///
     /// Idempotent when the effective state already points at us and a state
-    /// file exists. `needs_privilege` and `unsupported` are `Ok` with the
-    /// state; a tool that cannot start or hangs, a change already in
-    /// flight, and a rollback that failed are `Err`.
+    /// file exists. With a file but a live state that no longer points at
+    /// us, the new file keeps the old file's `previous` for every service
+    /// still equal to what it wrote ([`merge_previous`]). `needs_privilege`
+    /// and `unsupported` are `Ok` with the state; a tool that cannot start
+    /// or hangs, a change already in flight, and a rollback that failed are
+    /// `Err`.
     pub fn set(&self, req: &SetRequest) -> anyhow::Result<(Status, bool, Vec<String>)> {
         let _guard = self.begin()?;
         if !self.supported() {
@@ -898,6 +901,12 @@ impl SystemProxy {
             .ops
             .snapshot(self.exec.as_ref())
             .map_err(|e| anyhow::anyhow!("cannot snapshot the current system proxy: {e}"))?;
+        // A re-set over our own file must not record our own endpoint as
+        // "previous": keep the file's row for every service still ours.
+        let previous = match &existing {
+            Some(file) => merge_previous(file, previous),
+            None => previous,
+        };
         let extra = merge_bypass(&self.config_bypass, &req.bypass);
         let wrote = Wrote {
             host: self.ours.host.clone(),
@@ -1055,8 +1064,9 @@ impl SystemProxy {
         self.needs_privilege.store(false, Ordering::SeqCst);
         Self::log_commands(&lines);
         StateFile::remove(&self.state_file)?;
-        // The watchdog sees the file gone and exits on its own; closing our
-        // end of its stdin wakes it now rather than at our exit.
+        // The watchdog sees the file gone and exits on its own; dropping the
+        // handle closes our end of its stdin, which wakes it now rather than
+        // at our exit, and reaps it off this thread.
         *lock(&self.watchdog) = None;
         tracing::info!(
             target: "aitm_sysproxy",
@@ -1230,6 +1240,73 @@ fn partition(file: &StateFile, live: &[ServiceRow]) -> (Vec<String>, Vec<String>
     }
 }
 
+/// A `set` over an existing file: the file's `previous` is the real
+/// before-state for every service whose live row still equals the file's
+/// `wrote` (our own endpoint is never recorded as "previous"); a service
+/// another tool took over since takes its live row. `fresh` is the snapshot
+/// just read, which is also the live read it is judged by
+/// ([`platform::rows_of`]). The Linux key sets follow the same rule per
+/// synthetic service: the file's keys while the live keys still equal what
+/// we wrote, else the fresh ones.
+fn merge_previous(file: &StateFile, fresh: Previous) -> Previous {
+    let still_ours: Vec<String> = platform::rows_of(&fresh)
+        .into_iter()
+        .filter(|row| service_equals_wrote(row, &file.wrote))
+        .map(|row| row.service)
+        .collect();
+    let ours = |name: &str| still_ours.iter().any(|s| s == name);
+    match (&file.previous, fresh) {
+        (Previous::Networksetup { services: old }, Previous::Networksetup { services: live }) => {
+            Previous::Networksetup {
+                services: live
+                    .into_iter()
+                    .map(|row| {
+                        if !ours(&row.service) {
+                            return row;
+                        }
+                        old.iter()
+                            .find(|o| o.service == row.service)
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect(),
+            }
+        }
+        (Previous::Gsettings { keys: old }, Previous::Gsettings { keys: live }) => {
+            Previous::Gsettings {
+                keys: if ours(GSETTINGS_SERVICE) {
+                    old.clone()
+                } else {
+                    live
+                },
+            }
+        }
+        (
+            Previous::Kde {
+                kioslaverc: old_k,
+                gsettings: old_g,
+            },
+            Previous::Kde {
+                kioslaverc: live_k,
+                gsettings: live_g,
+            },
+        ) => Previous::Kde {
+            kioslaverc: if ours(KDE_SERVICE) {
+                old_k.clone()
+            } else {
+                live_k
+            },
+            gsettings: match (old_g, live_g) {
+                (Some(old), Some(_)) if ours(GSETTINGS_SERVICE) => Some(old.clone()),
+                (_, live) => live,
+            },
+        },
+        // The file was written by another mechanism: nothing in it can be
+        // matched to this snapshot.
+        (_, fresh) => fresh,
+    }
+}
+
 /// `managed_by_us` (§D6): every service the file lists still equals `wrote`.
 fn all_still_ours(file: &StateFile, live: &[ServiceRow]) -> bool {
     let (_, left_alone) = partition(file, live);
@@ -1315,6 +1392,167 @@ mod tests {
         let (state, detail) = classify(&effective(off(), off()), &ours);
         assert_eq!(state, State::Off);
         assert_eq!(detail, "HTTP and HTTPS off");
+    }
+
+    fn gs_keys(mode: &str, host: &str, port: u16) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "org.gnome.system.proxy mode".to_string(),
+                format!("'{mode}'"),
+            ),
+            (
+                "org.gnome.system.proxy.http host".to_string(),
+                format!("'{host}'"),
+            ),
+            (
+                "org.gnome.system.proxy.http port".to_string(),
+                port.to_string(),
+            ),
+            (
+                "org.gnome.system.proxy.https host".to_string(),
+                format!("'{host}'"),
+            ),
+            (
+                "org.gnome.system.proxy.https port".to_string(),
+                port.to_string(),
+            ),
+            (
+                "org.gnome.system.proxy ignore-hosts".to_string(),
+                "['localhost']".to_string(),
+            ),
+        ])
+    }
+
+    fn kde_keys(proxy_type: &str, host: &str, port: u16) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("ProxyType".to_string(), proxy_type.to_string()),
+            ("httpProxy".to_string(), format!("http://{host} {port}")),
+            ("httpsProxy".to_string(), format!("http://{host} {port}")),
+            ("NoProxyFor".to_string(), "localhost".to_string()),
+        ])
+    }
+
+    fn row_at(service: &str, host: &str, port: u16) -> ServiceRow {
+        let p = ProtocolProxy {
+            enabled: port != 0,
+            host: host.to_string(),
+            port,
+        };
+        ServiceRow {
+            service: service.to_string(),
+            http: p.clone(),
+            https: p,
+            bypass: vec!["*.local".into()],
+        }
+    }
+
+    /// F1.1 for the Linux key sets: the file's keys stay while the live
+    /// keys still equal what we wrote, else the fresh ones; a KDE snapshot
+    /// judges `kde` and the mirrored `gsettings` each on its own.
+    #[test]
+    fn merge_previous_keeps_the_file_keys_only_while_still_ours() {
+        use crate::state::{Previous, StateFile};
+        let wrote = Wrote {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            bypass: vec![],
+        };
+
+        // gsettings: the real before-state was `'none'`; we wrote manual 8080.
+        let real = gs_keys("none", "", 0);
+        let file = StateFile::new(
+            Mechanism::Gsettings,
+            1,
+            wrote.clone(),
+            Previous::Gsettings { keys: real.clone() },
+        );
+        let still_ours = Previous::Gsettings {
+            keys: gs_keys("manual", "127.0.0.1", 8080),
+        };
+        assert_eq!(
+            merge_previous(&file, still_ours),
+            Previous::Gsettings { keys: real.clone() }
+        );
+        let taken = Previous::Gsettings {
+            keys: gs_keys("manual", "10.0.0.5", 3128),
+        };
+        assert_eq!(merge_previous(&file, taken.clone()), taken);
+
+        // KDE with a mirrored gsettings snapshot.
+        let real_k = kde_keys("0", "", 0);
+        let file = StateFile::new(
+            Mechanism::Kde,
+            1,
+            wrote.clone(),
+            Previous::Kde {
+                kioslaverc: real_k.clone(),
+                gsettings: Some(real.clone()),
+            },
+        );
+        // kde still ours, gsettings taken over.
+        let fresh = Previous::Kde {
+            kioslaverc: kde_keys("1", "127.0.0.1", 8080),
+            gsettings: Some(gs_keys("manual", "10.0.0.5", 3128)),
+        };
+        assert_eq!(
+            merge_previous(&file, fresh),
+            Previous::Kde {
+                kioslaverc: real_k.clone(),
+                gsettings: Some(gs_keys("manual", "10.0.0.5", 3128)),
+            }
+        );
+        // kde taken over, gsettings still ours.
+        let fresh = Previous::Kde {
+            kioslaverc: kde_keys("1", "10.0.0.5", 3128),
+            gsettings: Some(gs_keys("manual", "127.0.0.1", 8080)),
+        };
+        assert_eq!(
+            merge_previous(&file, fresh),
+            Previous::Kde {
+                kioslaverc: kde_keys("1", "10.0.0.5", 3128),
+                gsettings: Some(real.clone()),
+            }
+        );
+        // The fresh snapshot has no mirror (gsettings left the host): none kept.
+        let fresh = Previous::Kde {
+            kioslaverc: kde_keys("1", "127.0.0.1", 8080),
+            gsettings: None,
+        };
+        assert_eq!(
+            merge_previous(&file, fresh),
+            Previous::Kde {
+                kioslaverc: real_k,
+                gsettings: None,
+            }
+        );
+        // A file of another mechanism: the fresh snapshot stands as it is.
+        let fresh = Previous::Gsettings {
+            keys: gs_keys("manual", "127.0.0.1", 8080),
+        };
+        assert_eq!(merge_previous(&file, fresh.clone()), fresh);
+
+        // networksetup: a service the live read no longer lists is not
+        // resurrected, one still ours keeps the file's row.
+        let file = StateFile::new(
+            Mechanism::Networksetup,
+            1,
+            wrote,
+            Previous::Networksetup {
+                services: vec![
+                    row_at("Display Ethernet", "127.0.0.1", 9090),
+                    row_at("Wi-Fi", "", 0),
+                ],
+            },
+        );
+        let fresh = Previous::Networksetup {
+            services: vec![row_at("Wi-Fi", "127.0.0.1", 8080)],
+        };
+        assert_eq!(
+            merge_previous(&file, fresh),
+            Previous::Networksetup {
+                services: vec![row_at("Wi-Fi", "", 0)],
+            }
+        );
     }
 
     /// §D5: ordered, de-duplicated union, previous first.
@@ -1822,6 +2060,49 @@ mod engine_tests {
         assert_eq!(status.state, State::PointsAtUs);
         assert!(r.file.exists(), "a file exists afterwards");
         assert_eq!(r.exec.mutating_runs().len(), 6);
+    }
+
+    /// F1.1: a set over an existing file whose live state no longer points
+    /// at us keeps the file's previous row for every service still equal to
+    /// the file's `wrote` (our own endpoint is never recorded as "previous")
+    /// and takes the live row for the rest.
+    #[test]
+    fn set_over_a_file_keeps_the_real_previous_for_services_still_ours() {
+        // The status read before the set says `other`; the verify read after
+        // it says `points_at_us`.
+        let exec = ScriptedExecutor::new()
+            .respond(SCUTIL, 0, &scutil_out("10.0.0.5", 3128), "")
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "");
+        // Live: `Display Ethernet` still at what we wrote, `Wi-Fi` taken
+        // over by another tool. One round for the status read, one for the
+        // snapshot, then the verify round.
+        let exec = answer_round(exec, ("127.0.0.1", 8080), ("10.0.0.5", 3128));
+        let exec = answer_round(exec, ("127.0.0.1", 8080), ("10.0.0.5", 3128));
+        let r = macos_rig("reset-previous", at_us_round(exec));
+        d7_file().save_atomic(&r.file).expect("seed file");
+
+        let (status, changed, commands) = r.sp.set(&SetRequest::default()).expect("set");
+        assert!(changed);
+        assert_eq!(commands, set_lines(""));
+        assert_eq!(status.state, State::PointsAtUs);
+        assert!(status.managed_by_us);
+
+        let file = StateFile::load(&r.file)
+            .expect("load")
+            .expect("state file present");
+        let Previous::Networksetup { services } = &file.previous else {
+            panic!("networksetup previous, got {:?}", file.previous);
+        };
+        assert_eq!(
+            services,
+            &vec![
+                row("Display Ethernet", "127.0.0.1", 9090),
+                row("Wi-Fi", "10.0.0.5", 3128),
+            ],
+            "Display Ethernet keeps the file's 9090, Wi-Fi takes the live 3128"
+        );
+        assert_eq!(file.wrote.port, 8080);
+        assert_eq!(file.pid, std::process::id());
     }
 
     /// SP-AC8: partial takeover → only `Wi-Fi` restored, the file removed.

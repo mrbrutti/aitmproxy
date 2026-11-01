@@ -9,6 +9,7 @@
 //! so `NeedsPrivilege` is never produced.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 
 use aitm_ca::exec::{CmdLine, Executor};
 
@@ -121,6 +122,64 @@ pub(crate) fn detect(
         return Detected::Gsettings;
     }
     Detected::None
+}
+
+/// Is `tool` a file in one of `path`'s entries? The `PATH` probe behind
+/// detection (`Path::is_file`, no command run). Empty entries are skipped:
+/// a leading or doubled `:` must not make the working directory a tool
+/// source.
+pub(crate) fn on_path_in(path: Option<&OsStr>, tool: &str) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(path).any(|dir| !dir.as_os_str().is_empty() && dir.join(tool).is_file())
+}
+
+/// The ops for a bare [`Mechanism::Kde`], which names the mechanism but
+/// not the tool major (the state file, the `with_mechanism` constructor):
+/// the §D4 [`detect`] over `os`, `env` and `on_path` when it says KDE;
+/// otherwise (the desktop word is absent from this environment, or the OS
+/// word is not `linux` on a test host) `PATH` alone picks the major,
+/// `kwriteconfig6` unless only `kwriteconfig5` is present, and no gsettings
+/// mirror is assumed: a restore follows the snapshot's content regardless.
+pub(crate) fn kde_ops_resolved(
+    os: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    on_path: &dyn Fn(&str) -> bool,
+) -> KdeOps {
+    if let Detected::Kde {
+        kwrite,
+        kread,
+        gsettings_too,
+    } = detect(os, env, on_path)
+    {
+        return KdeOps {
+            kwrite,
+            kread,
+            gsettings_too,
+        };
+    }
+    let (kwrite, kread) = if !on_path("kwriteconfig6") && on_path("kwriteconfig5") {
+        ("kwriteconfig5", "kreadconfig5")
+    } else {
+        ("kwriteconfig6", "kreadconfig6")
+    };
+    KdeOps {
+        kwrite,
+        kread,
+        gsettings_too: false,
+    }
+}
+
+/// [`kde_ops_resolved`] over this process: `std::env::consts::OS`, the real
+/// environment and its `PATH`. What the watchdog and `ops_for` use.
+pub(crate) fn kde_ops_from_host() -> KdeOps {
+    let path = std::env::var_os("PATH");
+    kde_ops_resolved(
+        std::env::consts::OS,
+        &|name| std::env::var(name).ok(),
+        &|tool| on_path_in(path.as_deref(), tool),
+    )
 }
 
 /// [`detect`] reduced to the mechanism word.
@@ -349,6 +408,18 @@ fn row(service: &str, effective: Effective) -> ServiceRow {
         https: effective.https,
         bypass: effective.bypass,
     }
+}
+
+/// The `gsettings` row the six raw key values describe: what
+/// `read_services` would return for them, so a snapshot can be judged
+/// against `wrote` without a second read.
+pub(crate) fn gsettings_row(keys: &BTreeMap<String, String>) -> ServiceRow {
+    row(GSETTINGS_SERVICE, gsettings_effective(keys))
+}
+
+/// The `kde` row the four raw kioslaverc values describe.
+pub(crate) fn kde_row(kioslaverc: &BTreeMap<String, String>) -> ServiceRow {
+    row(KDE_SERVICE, kde_effective(kioslaverc))
 }
 
 /// The six `set`s in §D4 order, `mode 'manual'` last.
@@ -856,6 +927,106 @@ mod tests {
                 &tools_of(&["gsettings"]),
             ),
             Mechanism::None
+        );
+    }
+
+    /// F1.3: the `PATH` probe behind detection, on a real directory. Only a
+    /// file in a listed entry counts; a directory of that name, an entry
+    /// that does not exist, an empty entry and an absent `PATH` do not.
+    #[test]
+    fn on_path_in_finds_files_in_path_entries_only() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aitm-sysproxy-path-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("kwriteconfig5"), b"#!/bin/sh\n").expect("write tool");
+        std::fs::create_dir(dir.join("kwriteconfig6")).expect("create decoy dir");
+
+        let path = std::env::join_paths([
+            std::path::PathBuf::from("/nonexistent-aitm-sysproxy"),
+            std::path::PathBuf::new(),
+            dir.clone(),
+        ])
+        .expect("join paths");
+        assert!(on_path_in(Some(&path), "kwriteconfig5"));
+        assert!(
+            !on_path_in(Some(&path), "kwriteconfig6"),
+            "a directory is not a tool"
+        );
+        assert!(!on_path_in(Some(&path), "gsettings"));
+        assert!(!on_path_in(None, "kwriteconfig5"), "no PATH, no tools");
+        assert!(
+            !on_path_in(Some(std::ffi::OsStr::new("")), "kwriteconfig5"),
+            "an empty PATH entry is not the working directory"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// F1.3: a bare `Mechanism::Kde` (the state file names the mechanism,
+    /// not the tool major) resolves its tools at runtime: the §D4 detection
+    /// when the environment says KDE, else `PATH` alone, 6 preferred and 5
+    /// when only 5 is present; the 6 names when nothing is found, so the
+    /// error names the tool a current Plasma host would have.
+    #[test]
+    fn kde_ops_resolved_follows_detection_then_path() {
+        let kde = env_of(&[("XDG_CURRENT_DESKTOP", "KDE")]);
+        assert_eq!(
+            kde_ops_resolved("linux", &kde, &tools_of(&["kwriteconfig5"])),
+            KdeOps {
+                kwrite: "kwriteconfig5",
+                kread: "kreadconfig5",
+                gsettings_too: false
+            }
+        );
+        assert_eq!(
+            kde_ops_resolved(
+                "linux",
+                &kde,
+                &tools_of(&["kwriteconfig6", "kwriteconfig5", "gsettings"])
+            ),
+            KdeOps {
+                kwrite: "kwriteconfig6",
+                kread: "kreadconfig6",
+                gsettings_too: true
+            }
+        );
+        // No desktop word (a core started from a unit file, a watchdog with
+        // a trimmed environment): PATH decides the major; no mirror is
+        // assumed, the snapshot's content decides what is restored.
+        assert_eq!(
+            kde_ops_resolved(
+                "linux",
+                &env_of(&[]),
+                &tools_of(&["kwriteconfig5", "gsettings"])
+            ),
+            KdeOps {
+                kwrite: "kwriteconfig5",
+                kread: "kreadconfig5",
+                gsettings_too: false
+            }
+        );
+        assert_eq!(
+            kde_ops_resolved("linux", &env_of(&[]), &tools_of(&["kwriteconfig6"])),
+            KdeOps {
+                kwrite: "kwriteconfig6",
+                kread: "kreadconfig6",
+                gsettings_too: false
+            }
+        );
+        assert_eq!(
+            kde_ops_resolved("macos", &env_of(&[]), &tools_of(&[])),
+            KdeOps {
+                kwrite: "kwriteconfig6",
+                kread: "kreadconfig6",
+                gsettings_too: false
+            }
+        );
+        assert_eq!(
+            crate::platform::ops_for(Mechanism::Kde).mechanism(),
+            Mechanism::Kde
         );
     }
 
