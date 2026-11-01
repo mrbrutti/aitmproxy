@@ -1324,6 +1324,10 @@ mod driver_tests {
         /// `RST_STREAM(REFUSED_STREAM)` for a *different* stream id than the
         /// one the HEADERS arrived on, and nothing for that one.
         ResetOther(u32),
+        /// Drop the connection on the first HEADERS: no reset, no GOAWAY,
+        /// just a FIN — what a reset-rate mitigation in front of an origin
+        /// does.
+        HangUp,
     }
 
     /// What the scripted peer does, and what it saw while doing it.
@@ -1335,6 +1339,8 @@ mod driver_tests {
         flood: bool,
         /// Read the preface and then say nothing at all (timeout probe).
         silent: bool,
+        /// Read the preface and hang up before sending any SETTINGS.
+        hang_up_before_settings: bool,
     }
 
     impl Script {
@@ -1344,6 +1350,7 @@ mod driver_tests {
                 answer,
                 flood: false,
                 silent: false,
+                hang_up_before_settings: false,
             }
         }
     }
@@ -1392,6 +1399,12 @@ mod driver_tests {
         if script.silent {
             // Hold the connection open, saying nothing, past any client timeout.
             tokio::time::sleep(Duration::from_secs(3600)).await;
+            return;
+        }
+
+        if script.hang_up_before_settings {
+            // Dropping `io` here closes the duplex: the driver reads EOF
+            // where it expected the peer's SETTINGS.
             return;
         }
 
@@ -1484,6 +1497,9 @@ mod driver_tests {
                                 other,
                                 &7u32.to_be_bytes(),
                             )),
+                            // Return, dropping `io`: the client sees a FIN
+                            // with nothing said about the stream.
+                            Answer::HangUp => return,
                         }
                     }
                     _ => None,
@@ -1794,6 +1810,74 @@ mod driver_tests {
         assert_eq!(
             waited, RAW_READ_TIMEOUT,
             "the probe took {waited:?}; one silent read should cost exactly {RAW_READ_TIMEOUT:?}"
+        );
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    /// A peer that drops the connection in the middle of the probe — no
+    /// `GOAWAY`, no `RST_STREAM`, just a FIN — is an **observation**, not an
+    /// error: the streams it never answered stay `Timeout` and
+    /// `connection_closed` records the hang-up. `h2-rapid-reset-mitigation`
+    /// reads exactly this shape as "the peer cut us off" and calls it clean,
+    /// so EOF has to set the flag and not merely end the read loop (tester
+    /// whole-branch pass: dropping `Next::Eof` from the mid-conversation arm
+    /// left all 238 lib tests green).
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_hangs_up_mid_probe_closes_the_connection_without_a_timeout() {
+        let (client, dialer, _log) = peer(Script::new(vec![(3, 100)], Answer::HangUp));
+
+        let started = tokio::time::Instant::now();
+        let obs = client
+            .probe(&plan(RawH2Mode::RapidReset { pairs: 8 }, 8))
+            .await
+            .expect("a hang-up is an observation, not an error");
+        let waited = started.elapsed();
+
+        assert!(obs.connection_closed, "the peer hung up on the probe");
+        assert_eq!(obs.goaway, None, "a FIN is not a GOAWAY");
+        assert_eq!(obs.streams, vec![StreamOutcome::Timeout; 8]);
+        assert_eq!(
+            obs.settings,
+            vec![(3, 100)],
+            "the peer's SETTINGS arrived before it hung up"
+        );
+        // Virtual time: EOF is noticed when it arrives, not after a read
+        // timeout's worth of waiting.
+        assert_eq!(
+            waited,
+            Duration::ZERO,
+            "a hang-up cost {waited:?}; it should cost no wait at all"
+        );
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    /// The same hang-up one step earlier, before the peer's SETTINGS ever
+    /// arrive: nothing was observed, and the probe still returns an
+    /// observation that says the connection closed rather than an error or a
+    /// timeout (tester whole-branch pass: dropping `Next::Eof` from the
+    /// SETTINGS arm left all 238 lib tests green).
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_hangs_up_before_its_settings_closes_the_connection() {
+        let (client, dialer, _log) = peer(Script {
+            hang_up_before_settings: true,
+            ..Script::new(vec![(3, 100)], Answer::Nothing)
+        });
+
+        let started = tokio::time::Instant::now();
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("a hang-up is an observation, not an error");
+        let waited = started.elapsed();
+
+        assert!(obs.connection_closed);
+        assert_eq!(obs.settings, Vec::new(), "nothing was ever advertised");
+        assert_eq!(obs.streams, vec![StreamOutcome::Timeout]);
+        assert_eq!(obs.goaway, None);
+        assert_eq!(
+            waited,
+            Duration::ZERO,
+            "a hang-up cost {waited:?}; it should cost no wait at all"
         );
         assert_eq!(dialer.calls(), 1);
     }
@@ -2468,6 +2552,23 @@ mod driver_tests {
             gate_warnings(&events).is_empty(),
             "a gated client must not warn: {:?}",
             events.lock().expect("events")
+        );
+
+        // The positive control, without which this test would also pass if
+        // nothing at all reached the capture (`tracing` caches one `Interest`
+        // per callsite for the whole process, and every other driver test
+        // probes through an ungated client): an ungated client on a fresh
+        // peer must produce the warning the gated one did not (tester
+        // whole-branch pass).
+        let (ungated, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        ungated
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the ungated probe completes");
+        assert_eq!(
+            gate_warnings(&events),
+            vec![tracing::Level::WARN],
+            "the capture was live: an ungated client warns where the gated one did not"
         );
     }
 }

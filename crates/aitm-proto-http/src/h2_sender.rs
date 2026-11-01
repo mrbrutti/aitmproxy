@@ -865,6 +865,79 @@ mod tests {
         }
     }
 
+    /// The same hand-scripted peer, but the frame it answers the second
+    /// stream with is **malformed**: a `RST_STREAM` whose payload is three
+    /// bytes where RFC 9113 §6.4 requires four, which a client must treat as
+    /// a connection error of type `FRAME_SIZE_ERROR`. `h2` notices it, sends
+    /// its own `GOAWAY` and fails the stream — a GOAWAY error the **library**
+    /// raised, not one the peer sent. Records every HEADERS stream id read.
+    async fn h2_origin_breaking_the_protocol_on_the_second_stream(
+        mut io: DuplexStream,
+        headers_seen: Arc<Mutex<Vec<u32>>>,
+    ) {
+        use crate::raw_h2::{flags, frame_header, parse_frame, FrameType, PREFACE};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut preface = vec![0u8; PREFACE.len()];
+        if io.read_exact(&mut preface).await.is_err() {
+            return;
+        }
+        if io
+            .write_all(&frame_header(0, FrameType::Settings, 0x00, 0))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            while let Ok(Some((frame, used))) = parse_frame(&buf) {
+                buf.drain(..used);
+                let reply: Option<Vec<u8>> = match FrameType::from_u8(frame.kind) {
+                    Some(FrameType::Settings) if frame.flags & flags::ACK == 0 => {
+                        Some(frame_header(0, FrameType::Settings, flags::ACK, 0).to_vec())
+                    }
+                    Some(FrameType::Headers) => {
+                        headers_seen
+                            .lock()
+                            .expect("headers seen")
+                            .push(frame.stream);
+                        if frame.stream == 1 {
+                            // One static-table indexed field: `:status 200`.
+                            let mut out = frame_header(
+                                1,
+                                FrameType::Headers,
+                                flags::END_HEADERS | flags::END_STREAM,
+                                1,
+                            )
+                            .to_vec();
+                            out.push(0x88);
+                            Some(out)
+                        } else {
+                            // Three octets of error code where four belong.
+                            let mut out =
+                                frame_header(3, FrameType::RstStream, 0x00, frame.stream).to_vec();
+                            out.extend_from_slice(&[0x00, 0x00, 0x08]);
+                            Some(out)
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(bytes) = reply {
+                    if io.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    let _ = io.flush().await;
+                }
+            }
+            match io.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
     /// A resolver whose answer a test can change between sends.
     struct SwitchableResolver(Mutex<IpAddr>);
 
@@ -1754,6 +1827,106 @@ mod tests {
         second.abort();
     }
 
+    /// SEC-10, at the one place the rule is written down. The three
+    /// constructors of [`ExchangeFailure`] are the whole retry policy: only a
+    /// failure that **proves** the peer never processed the request may put
+    /// it on the wire a second time.
+    ///
+    /// The end-to-end tests above drive the two remote roads (a peer GOAWAY
+    /// below the stream, a remote `RST_STREAM(REFUSED_STREAM)`). The
+    /// pre-write road — `ready()`/`send_request()` failing before a byte is
+    /// written — cannot be scripted over a duplex without racing
+    /// [`H2Pool::take`]'s readiness probe, so it is pinned here: flipping
+    /// `not_processed` to non-retryable left all 238 lib tests green before
+    /// this test existed (tester whole-branch pass).
+    #[test]
+    fn only_a_provably_unprocessed_failure_may_be_reissued() {
+        assert!(
+            ExchangeFailure::not_processed(anyhow!("h2 connection not ready")).retryable,
+            "a failure before this request's first byte was written is safe to reissue"
+        );
+        assert!(
+            !ExchangeFailure::settled(anyhow!("upstream response timed out")).retryable,
+            "a settled failure says nothing about what the peer did with the request"
+        );
+        // An `h2::Error` carrying a bare reason is one *this* side made up:
+        // no peer frame stands behind it, so `REFUSED_STREAM` on it proves
+        // nothing and the request stays put.
+        let invented = h2::Error::from(h2::Reason::REFUSED_STREAM);
+        assert!(!invented.is_remote(), "a bare reason is not a peer frame");
+        assert!(
+            !ExchangeFailure::after_headers(invented, "await h2 response").retryable,
+            "only the peer's own REFUSED_STREAM declines a stream"
+        );
+        // The context the sender logs and returns survives the wrapping.
+        let failure = ExchangeFailure::after_headers(
+            h2::Error::from(h2::Reason::INTERNAL_ERROR),
+            "await h2 response",
+        );
+        assert!(!failure.retryable);
+        assert_eq!(failure.error.to_string(), "await h2 response");
+    }
+
+    /// SEC-10, the clause the predicate turns on: `is_remote()`. A GOAWAY the
+    /// **library** raised — here because the pooled peer answered the second
+    /// stream with a malformed `RST_STREAM` (three octets, not four), a
+    /// connection error `h2` itself reports — is not the peer saying "I did
+    /// not process this". The send fails on the pooled connection and the
+    /// healthy origin queued behind it is never reached.
+    ///
+    /// Without this, dropping `err.is_remote()` from `peer_declined_stream`
+    /// left all 238 lib tests green (tester whole-branch pass).
+    #[tokio::test]
+    async fn a_protocol_error_this_side_raised_is_not_a_peer_declining_the_stream() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let headers_seen = Arc::new(Mutex::new(Vec::new()));
+        let healthy_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let first = tokio::spawn(h2_origin_breaking_the_protocol_on_the_second_stream(
+            server1,
+            headers_seen.clone(),
+        ));
+        let second = tokio::spawn(h2_origin(server2, b"hi", healthy_seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let first_resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first h2c exchange succeeds");
+        assert_eq!(first_resp.status, 200);
+        assert_eq!(dialer.calls(), 1, "the connection is now pooled");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/b"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a protocol error on the pooled connection fails the send");
+        assert!(err.to_string().contains("h2"), "error was {err}");
+        assert_eq!(
+            dialer.calls(),
+            1,
+            "a GOAWAY this side raised is no licence to reissue the request"
+        );
+        assert_eq!(
+            *headers_seen.lock().expect("headers seen"),
+            vec![1, 3],
+            "the request went to the pooled peer once"
+        );
+        assert!(
+            healthy_seen.lock().expect("seen").is_empty(),
+            "the healthy origin must never have been reached"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
     /// Q2: eviction names a connection, not just a key. A failure that lands
     /// after another send has already pooled a healthy replacement must not
     /// drop the replacement.
@@ -1990,27 +2163,49 @@ mod tests {
         let events = capture.events.clone();
         let _guard = tracing::subscriber::set_default(capture);
 
-        let (client, server) = duplex(64 * 1024);
-        let origin = tokio::spawn(goaway_h2_origin(server, BLOB));
-        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
-        let sender = sender_with(dialer.clone());
-
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
-        )
-        .await
-        .expect("the send finished within the guard")
-        .expect_err("a peer that answers GOAWAY serves no response");
-
-        // The connection task logs from its own task; wait for its event.
+        // `tracing` caches one `Interest` per callsite for the whole process,
+        // and every other test in this binary ends an h2 connection with no
+        // subscriber on its thread. If one of them first-registers the
+        // connection task's callsite while this test is installing its
+        // capture, the callsite stays cached as "never" and the event is
+        // dropped before any subscriber sees it. Rebuilding the cache with
+        // this capture registered repairs that, and the scenario is replayed
+        // rather than trusted first time (tester whole-branch pass: 2 failures
+        // in 32 four-way concurrent runs of this binary, each waiting the full
+        // wait for an event that was never dispatched; a test-thread probe
+        // event in the same capture showed the subscriber itself was live).
         let mut logged = Vec::new();
-        for _ in 0..10_000 {
-            logged = events.lock().expect("events").clone();
+        for _ in 0..8 {
+            tracing::callsite::rebuild_interest_cache();
+
+            let (client, server) = duplex(64 * 1024);
+            let origin = tokio::spawn(goaway_h2_origin(server, BLOB));
+            let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+            let sender = sender_with(dialer.clone());
+
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+            )
+            .await
+            .expect("the send finished within the guard")
+            .expect_err("a peer that answers GOAWAY serves no response");
+
+            // The connection task logs from its own task; wait for its event,
+            // bounded by the clock rather than by a count of yields.
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            while std::time::Instant::now() < deadline {
+                logged = events.lock().expect("events").clone();
+                if !logged.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(sender);
+            origin.abort();
             if !logged.is_empty() {
                 break;
             }
-            tokio::task::yield_now().await;
         }
         assert!(
             !logged.is_empty(),
@@ -2032,8 +2227,6 @@ mod tests {
                 .any(|(_, fields)| fields.contains("go_away=true")),
             "the classification must say it was a GOAWAY: {logged:?}"
         );
-        drop(sender);
-        origin.abort();
     }
 
     /// D8.2 "closed on error": an exchange that fails while the connection is

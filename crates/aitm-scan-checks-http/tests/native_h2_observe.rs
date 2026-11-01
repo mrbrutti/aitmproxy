@@ -785,6 +785,38 @@ async fn a_runner_error_is_inconclusive_for_every_check() {
     }
 }
 
+/// The driver's own "the whole-probe cap ran out before anything was
+/// connected" error (`aitm-proto-http` review finding SEC-11, fix round F4) is
+/// a failure to observe, not an observation: every check reports it the same
+/// way as any other driver error — `Inconclusive`, no evidence, no hint — and
+/// the driver's message, which names the host it was dialling, stays in the
+/// debug log rather than travelling into an issue (tester whole-branch pass).
+#[tokio::test]
+async fn a_probe_that_never_connected_is_inconclusive_and_quotes_nothing() {
+    for id in ALL_IDS {
+        let runner = FakeRunner::scripted(|_| {
+            anyhow::bail!("raw h2 probe to origin.test: no connection within the cap")
+        });
+        let check = check_named(&runner, id);
+
+        let v = run(&check, &h2host()).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
+        assert_eq!(
+            v.detail, "origin does not negotiate h2 (or the raw probe failed)",
+            "{id}"
+        );
+        assert_eq!(v.confidence, Confidence::Tentative, "{id}");
+        assert_eq!(v.evidence, aitm_scan_model::Evidence::default(), "{id}");
+        assert!(v.poc_hint.is_none(), "{id}");
+        assert!(
+            !format!("{v:?}").contains("within the cap"),
+            "the driver's error reached the verdict for {id}: {v:?}"
+        );
+        assert_eq!(runner.calls(), 1, "{id}");
+    }
+}
+
 #[tokio::test]
 async fn a_stopped_job_sends_nothing() {
     for host in [
