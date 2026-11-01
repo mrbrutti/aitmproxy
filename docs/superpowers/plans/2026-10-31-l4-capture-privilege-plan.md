@@ -1,6 +1,6 @@
 # L4 capture privilege implementation plan
 
-**Status:** Approved (Matt, 2026-11-01, defaults for the spec's forks); tasks P7.1 and the AC5 `all`-case half of P1b.17 blocked on Question 2; spikes first
+**Status:** Approved (Matt, 2026-11-01, defaults for the spec's forks); tasks P7.1 and the AC5 `all`-case half of P1b.17 blocked on Question 2; spikes first. S7 proven (PR #240, 2026-11-01): P1b.12–14 and P2.6–P2.8 unblocked; amendments folded (rows marked "(S7)"; write-up `docs/research/experiments/2026-11-01-l4-s7-pkexec-helper.md`, spec §5.7).
 **Spec:** `docs/superpowers/specs/2026-10-31-l4-capture-privilege-design.md` (approved 2026-11-01, forks i–v on the
 recommended defaults; acceptance criteria L4PRIV-AC1 … L4PRIV-AC29). Still open: Matt's written acceptance of the
 headless `setcap` doc (spec open question; blocks Task P5.4 only).
@@ -136,13 +136,23 @@ fresh Coder, is test-first, and ends in one commit. The independent sets are lis
 **Linux rig [linux-ci].** **(Architect's call:** "Linux CI" in this plan means the systemd container on the Lima VM
 `cis-lab`, driven from the Terminal; adding a GitHub Actions job is left to the orchestrator as a follow-up, so no
 task here edits `.github/workflows/`.)
-- Fedora and Debian trixie systemd containers in `cis-lab` with `dbus`, `polkitd`, and the `pkexec` package
-  (Debian) or `polkit` (Fedora).
+- (S7) `cis-lab` has **no container runtime** (no `nerdctl`, `docker` or `podman`). The rig script
+  (`linux-privilege-rig.sh`, P2.8) installs `podman` from Ubuntu's apt inside the VM, or the orchestrator keeps one
+  installed; the S7 spike purged it at revert.
+- Fedora 42 and Debian trixie systemd containers in `cis-lab`, run rootful as `podman run -d --systemd=always
+  --privileged` (S7: `polkitd`'s unit needs `CAP_SYS_ADMIN`; unprivileged it fails `status=217/USER` and every
+  `pkexec` dies after 25 s with `Error getting authority … Timeout was reached`, exit 127). Packages: Debian
+  `systemd dbus polkitd pkexec`; Fedora `systemd dbus-broker polkit` (plus `libpcap` at run time).
 - User `tester` with a password, in the admin group (`wheel` / `sudo`). No graphical agent.
+- (S7) On the Ubuntu 24.04 host (`cis-lab`), unload the `unix-chkpwd` AppArmor profile (`apparmor_parser -R
+  /etc/apparmor.d/unix-chkpwd`) before Fedora's PAM can authenticate inside a container, and reload it (`-r`) when
+  the rig comes down. Debian is unaffected.
 - The core is built inside the VM.
 - Scope: `lo`, `127.0.0.1/32`, `9000-9999`. Same targets.
 - For AC16 only, a test-only rule `/etc/polkit-1/rules.d/49-aitm-test.rules` returns `polkit.Result.YES` for
-  `tester` on `com.mrbrutti.aitmproxy.l4-helper.run`. It is removed for AC22 and AC21.
+  `tester` on `com.mrbrutti.aitmproxy.l4-helper.run` (S7: confirmed, the helper connects with no prompt at once). It
+  is removed for AC22 and AC21. `pkaction --verbose --action-id com.mrbrutti.aitmproxy.l4-helper.run` checks the
+  policy was read as written.
 
 **Linux desktop [linux-desk].** A GNOME VM in Lima (or UTM), by hand, with the `.deb` from P5.3 installed. Used for
 AC21 only.
@@ -317,6 +327,15 @@ list, and it is announced anyway.
 - **Output:** the exact drop order that works, the pid answer (decides P1b.12's peer check), and the exit codes
   (decide P1b.14's mapping). If `CAP_NET_RAW` alone is not enough, stop: the spec's AC16 literals change, and that
   goes to Matt.
+- **Answered (S7, 2026-11-01, `docs/research/experiments/2026-11-01-l4-s7-pkexec-helper.md`, PR #240): PROVEN.**
+  1 yes (the agent opens `/dev/tty`, not stdin; no controlling terminal gives exit 127 with `Error creating textual
+  authentication agent`); 2 yes; 3 yes (`SO_PEERCRED.pid == Popen.pid` in all 17 pkexec runs); 4 `PKEXEC_UID` set,
+  but the textual agent **never exits 126**: wrong password, Ctrl-D and no-tty are all 127 with distinct stderr
+  texts and Ctrl-C is death by SIGINT that also reaches the core; 5 yes; 6 **`CAP_NET_RAW` alone**, the stop
+  condition did not fire, AC16's literals stand; 7 yes, byte for byte. New: a `pcap_inject` frame on `lo` is a
+  martian and never reaches a local socket; local destinations go through a raw IP socket with `IP_HDRINCL`. The
+  rig ran under `podman --systemd=always --privileged` (the revert steps above named `nerdctl`, which `cis-lab`
+  lacks). Folded into spec §5.7 and the rows below marked "(S7)".
 
 ### S8: inject on lo0 (macOS)
 
@@ -623,8 +642,13 @@ capability's reason.
     - `pub struct PathMeta { pub uid: u32, pub mode: u32, pub is_symlink: bool }`
     - `pub fn root_owned_chain(chain: &[PathMeta]) -> bool`: every element uid 0, no group or other write bits, and
       no symlink.
-    - `pub fn prompt_possible(display: Option<&str>, wayland: Option<&str>, stdin_tty: bool) -> bool`
-    - `fn gather_linux(cfg, session_connected) -> LinuxInputs` (I/O; runs `<helper> probe` for the file-caps row).
+    - `pub fn prompt_possible(display: Option<&str>, wayland: Option<&str>, tty_opens: bool) -> bool` (S7: the third
+      input is "a controlling terminal opens", i.e. `open("/dev/tty")` succeeded, **not** `isatty(stdin)`; pkexec's
+      textual agent uses `/dev/tty` and prompts fine with all three stdio fds redirected).
+    - `fn controlling_tty_opens() -> bool` (I/O): `OpenOptions::new().read(true).write(true).open("/dev/tty")`
+      succeeds; false under `setsid` or with no terminal.
+    - `fn gather_linux(cfg, session_connected) -> LinuxInputs` (I/O; runs `<helper> probe` for the file-caps row;
+      `prompt_possible` is fed `controlling_tty_opens()`).
 - **Test (first, failing):**
   - `macos::tests`:
     - `bundle_of_exe("/Applications/Aitmproxy.app/Contents/Resources/core/aitm") == Some("/Applications/Aitmproxy.app")`
@@ -641,7 +665,8 @@ capability's reason.
     - mode `0o775` is `false`
     - `prompt_possible(None, None, false) == false`
     - `prompt_possible(Some(":0"), None, false) == true`
-    - `prompt_possible(None, None, true) == true`
+    - `prompt_possible(None, Some("wayland-0"), false) == true`
+    - `prompt_possible(None, None, true) == true` (S7: a controlling terminal with stdin on `/dev/null` is a prompt)
 - **Done when:** the tests pass and the unit gate passes.
 
 ### Task P1b.6: `PrivilegeState`, config, re-probe and state-change logging
@@ -816,11 +841,17 @@ capability's reason.
 ### Task P1b.12: Linux helper session, core end (listener, peer checks, handshake)
 
 - **Satisfies:** AC16 (core half), AC18 (core-side protocol errors), spec §5.1 step 5, §5.2
-- **Depends on:** P1b.10; spike **S7** written up (the pid answer for the peer check)
+- **Depends on:** P1b.10; spike **S7** written up (the pid answer for the peer check). (S7) Answered: pkexec execs
+  the helper in place, so `expected_pid` **is the pkexec child's pid** as returned by the spawner; the helper connects
+  about 0.4 s after the password, well inside the 10 s AC16 budget.
 - **Files:** `crates/aitm-proto-l4/src/helper/client.rs` (create), `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/Cargo.toml` (Linux-target `nix` with `socket,user`)
 - **Change:**
   - `pub fn socket_dir(xdg_runtime: Option<&Path>, uid: u32) -> PathBuf`: `$XDG_RUNTIME_DIR/aitm`, else
-    `/tmp/aitm-<uid>`. It creates the directory with mode 0700 and verifies owner and mode.
+    `/tmp/aitm-<uid>`. It creates the directory with mode 0700 and verifies owner and mode. (S7) The full socket
+    path appears on the helper's argv and therefore in the journal (`pkexec[…]: … [COMMAND=… --connect <path>]`),
+    readable by any journal reader: the name is `l4-helper-<core pid>.sock` and **never** carries a token, a
+    random secret or anything else that must stay private. The core resolves it to an absolute path before spawning
+    (the helper's `cwd` is `/root` and `XDG_RUNTIME_DIR` is not in its environment).
   - `pub struct HelperListener` with
     - `bind(dir: &Path) -> io::Result<Self>`, which creates `l4-helper-<core pid>.sock`, and
     - `accept_checked(&self, expected_pid: u32, timeout: Duration) -> Result<HelperSession, SessionError>`, which
@@ -866,12 +897,38 @@ capability's reason.
 ### Task P1b.14: Linux request: pkexec, the file-caps path, progress, one-shot refusal
 
 - **Satisfies:** AC16, AC17, AC20, AC22, AC23 (core halves), spec §2.3, §2.4 (one-shot), §5.1, §5.5
-- **Depends on:** P1b.13; spike **S7** (exit codes)
+- **Depends on:** P1b.13; spike **S7** (exit codes). (S7) Answered; the mapping and the tests below are the
+  corrected ones (spec §5.5 table). The original "126 dismissed, 127 failed" rule is wrong for the textual agent.
 - **Files:** `crates/aitm-proto-l4/src/privilege/linux.rs`, `crates/aitm-proto-l4/src/privilege/state.rs`
 - **Change:**
   - `pub trait Spawner: Send + Sync { fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>>; }` and
-    `pub trait Child: Send { fn id(&self) -> u32; fn try_wait(&mut self) -> io::Result<Option<i32>>; fn kill(&mut
-    self); }`.
+    `pub trait Child: Send { fn id(&self) -> u32; fn try_wait(&mut self) -> io::Result<Option<ChildExit>>; fn
+    stderr_tail(&mut self) -> String; fn kill(&mut self); }` with `pub enum ChildExit { Exited(i32), Signaled(i32) }`
+    (S7: the watcher must tell "exit 127" from "killed by SIGINT"; the real implementation reads
+    `ExitStatus::code()` and `ExitStatusExt::signal()`). The real spawner gives the child **a pipe for stderr** and
+    leaves stdin and stdout inherited (S7: the textual prompt goes to the controlling terminal, not to stdio, so the
+    pipe costs nothing and lets the core classify the failure text); a drain thread copies the pipe into a bounded
+    tail buffer (last 4 KiB, **Architect's call**) for as long as the child lives, because the helper inherits that
+    stderr and must never block on a full pipe. `stderr_tail` returns the buffer.
+  - `pub trait SigintGuard: Send + Sync { fn hold(&self) -> Box<dyn Any + Send>; }` (S7): while a pkexec child is
+    alive the core has a **SIGINT handler installed, never `SIG_IGN`** (`SIG_IGN` is inherited across `execve` and
+    makes the prompt un-cancellable; the default disposition kills `aitm`/`aitm tui` when the operator presses
+    Ctrl-C at the password). The handler only records the interrupt; the previous disposition is restored when the
+    returned token drops. The real implementation uses `nix::sys::signal::sigaction` with a flag (or `signal-hook`
+    if already locked; a new crate is named in the PR body per the traps). **(Architect's call:** during that window
+    Ctrl-C cancels the prompt and does not shut the core down; see Questions.)
+  - `pub fn classify_exit(exit: ChildExit, stderr: &str) -> (Progress, String)` (pure), the spec §5.5 table:
+    - `Exited(126)` → `Dismissed`, `"Approval was cancelled"` (graphical agent's Cancel);
+    - `Exited(127)` with stderr containing `Got unexpected EOF while reading from controlling terminal` →
+      `Dismissed`, `"Approval was cancelled"` (Ctrl-D at the textual prompt);
+    - `Signaled(SIGINT)` → `Dismissed`, `"Approval was cancelled"` (Ctrl-C);
+    - `Exited(127)` with `Not authorized` → `Failed`, `"Administrator authentication failed (wrong password or not
+      authorized)"`;
+    - `Exited(127)` with `Error creating textual authentication agent` → `Failed`, `"No password prompt could be
+      shown here (no desktop session or terminal)"` (the request should have been `cannot_prompt`; this is the
+      safety net, and the watcher logs one `warn` that the predicate and pkexec disagreed);
+    - any other `Exited(n)` or `Signaled(_)` → `Failed`, `"The packet-capture helper did not start (pkexec exit
+      <n>)"` (for a signal, `signal <n>`).
   - `pub fn request_linux(cfg, inputs: &LinuxInputs, spawner: &dyn Spawner) -> (Outcome, String)`:
     - `lifetime == OneShot` gives `CannotPrompt`, `"a one-shot command exits before the helper could serve it; set
       l4.privilege.request: at_start or use Allow in the TUI or web UI"`, and nothing is spawned.
@@ -882,10 +939,10 @@ capability's reason.
       The message is `"Waiting for administrator approval in the polkit dialog"` when `DISPLAY` or
       `WAYLAND_DISPLAY` is set, else `"Enter an administrator password in the terminal running aitm"`. The messages
       are the Architect's call.
-  - A watcher thread moves the progress:
-    - the session passes `accept_checked` (pid == child id): `Approved`;
-    - exit 126: `Dismissed`, `"Approval was cancelled"`;
-    - exit 127 or any other: `Failed`, `"The packet-capture helper did not start (pkexec exit <n>)"`;
+  - A watcher thread moves the progress (S7 mapping):
+    - the session passes `accept_checked` (pid == child id): `Approved`; the stderr drain keeps running for the
+      helper's lifetime, the SIGINT guard is released;
+    - the child ends before connecting: `classify_exit(exit, stderr_tail)` as above, then the guard is released;
     - 300 s on the injected clock: kill and `Failed`, `"No approval within 5 minutes"`.
   - File-caps row: `state.backend()` spawns `[<helper path>, "serve", "--connect", <socket>]` directly, without
     pkexec, on first use.
@@ -895,8 +952,23 @@ capability's reason.
   - `no_prompt_is_cannot_prompt_and_spawns_nothing`
   - `pkexec_argv_is_policy_path_only`: with `helper_path: /home/u/aitm-l4-helper` configured, no spawned argv
     contains `/home/u`. The argv is the literal above.
-  - `exit_126_is_dismissed`
-  - `exit_127_is_failed`
+  - `exit_126_is_dismissed` (the graphical case; stderr `Error executing command as another user: Request
+    dismissed`)
+  - `exit_127_not_authorized_is_failed` (S7): stderr `polkit-agent-helper-1: pam_authenticate failed: Authentication
+    failure\n==== AUTHENTICATION FAILED ====\nError executing command as another user: Not authorized` gives
+    `Failed` and a message containing `wrong password`
+  - `exit_127_eof_is_dismissed` (S7): stderr containing `Got unexpected EOF while reading from controlling terminal`
+    followed by the same FAILED lines gives `Dismissed`, `"Approval was cancelled"`
+  - `no_agent_text_is_failed` (S7): exit 127 with `Error creating textual authentication agent: Error opening
+    current controlling terminal for the process (`/dev/tty'): No such device or address` gives `Failed` and a
+    message containing `No password prompt`
+  - `sigint_is_dismissed` (S7): `Signaled(2)` gives `Dismissed`, `"Approval was cancelled"`
+  - `other_exit_is_failed`: `Exited(2)` gives `"The packet-capture helper did not start (pkexec exit 2)"`
+  - `sigint_handler_installed_not_ignored` (S7): with a fake `SigintGuard`, the hold count is 1 from spawn until the
+    child ends or connects, and 0 after; the fake refuses (panics) on any `SIG_IGN`-style call. Nothing is spawned
+    without a hold.
+  - `stderr_pipe_is_drained_after_approval`: a fake child writing 64 KiB to stderr after `Approved` never blocks and
+    `stderr_tail` is at most 4 KiB.
   - `timeout_is_failed_after_300s`
   - `file_caps_helper_spawns_directly`: the argv starts with the candidate path, not `pkexec`.
 - **Done when:** the tests pass and the unit gate passes.
@@ -965,9 +1037,11 @@ capability's reason.
        (see Questions: the spec's `all` literal does not match the current gate text). `agent.activity` shows the
        agent caller.
     7. Linux only, AC20 and AC23 in the [linux-ci] container: the tarball helper under `$HOME` gives `how.kind ==
-       "package"` and the request gives `cannot_prompt`. With `DISPLAY` and `WAYLAND_DISPLAY` unset and stdin not a
-       tty, the request gives `cannot_prompt`. The one-shot `aitm l4.privilege.request` refuses with the §2.4 text.
-       In all three cases, `pgrep -x pkexec` finds nothing.
+       "package"` and the request gives `cannot_prompt`. With `DISPLAY` and `WAYLAND_DISPLAY` unset and **no
+       controlling terminal** (S7: the core is started under `setsid`, so `open("/dev/tty")` fails; stdin being a
+       pipe alone is not enough, the textual agent would still prompt on the terminal), the request gives
+       `cannot_prompt`. The one-shot `aitm l4.privilege.request` refuses with the §2.4 text. In all three cases,
+       `pgrep -x pkexec` finds nothing.
   - `test_l4_parity_core.py`: drop the literal `R_CAP`. Assert `reason == "packet capture is not allowed yet (" +
     privilege.capabilities.capture.how.label + ")"` and that the start error equals `L4 unavailable: ` + `reason`.
     The intercept literal becomes `"in-path interception is Linux only"`. The `l4.*` count becomes 27.
@@ -1109,24 +1183,40 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
 ### Task P2.6: `serve` start-up: invoking user, privilege drop, path and peer checks, death signal
 
 - **Satisfies:** AC16, AC18 (path refusals, `PKEXEC_UID`), AC19, spec §5.1, T3
-- **Depends on:** P2.1; spike **S7** written up (the drop order that keeps `pcap` working)
+- **Depends on:** P2.1; spike **S7** written up (the drop order that keeps `pcap` working). (S7) Answered: the spec
+  §5.1 order works as written and is necessary; details below.
 - **Files:** `crates/aitm-l4-helper/src/serve.rs` (create), `crates/aitm-l4-helper/Cargo.toml` (Linux-target `caps`, and `nix` with `user,process,prctl,socket,fs`)
 - **Change:**
   - `pub fn invoking_user(real_uid: u32, pkexec_uid: Option<&str>) -> Result<u32, String>` (pure).
     `PKEXEC_UID` is trusted only when `real_uid == 0`. Root without it is an `Err`.
   - `pub fn check_socket_path(sock: &PathMeta, dir: &PathMeta, invoking: u32) -> Result<(), String>` (pure): the
     socket is a socket and not a symlink; the directory is owned by the invoking user, mode 0700, and not a symlink.
-  - `fn drop_to(user: u32) -> Result<(), String>` (Linux) follows spec §5.1 step 3 in S7's working order, then sets
-    `no_new_privs`.
+  - `fn drop_to(user: u32, gid: u32) -> Result<(), String>` (Linux) follows spec §5.1 step 3 in S7's proven order,
+    then sets `no_new_privs`. (S7) In `caps`/`nix` terms, in this order: `caps::drop(None, CapSet::Bounding, cap)`
+    for every capability except `NET_RAW` (while `CAP_SETPCAP` is still held; all 40 succeed on 6.8);
+    `caps::clear(None, CapSet::Ambient)`; `prctl(PR_SET_KEEPCAPS, 1)` (**mandatory**: without it the `caps::set`
+    below fails `EPERM` and the helper has no capability left); `nix::unistd::setgroups(&[gid])` (**not**
+    `initgroups`, which keeps the admin group `sudo`/`wheel`); `setresgid(gid, gid, gid)`; `setresuid(uid, uid,
+    uid)`; `caps::set(None, CapSet::Permitted, {NET_RAW})` and `caps::set(None, CapSet::Effective, {NET_RAW})`;
+    `caps::clear(None, CapSet::Inheritable)`; `prctl(PR_SET_KEEPCAPS, 0)`; `prctl(PR_SET_NO_NEW_PRIVS, 1)`. `gid` is
+    the invoking user's primary gid from `getpwuid`. `CAP_NET_RAW` alone suffices for libpcap on `lo`; nothing asks
+    for `CAP_NET_ADMIN`.
+  - (S7) `PKEXEC_UID` is a decimal string; `invoking_user` parses it with `str::parse::<u32>` and any other form is
+    an `Err`.
   - `pub fn startup(args, env_pkexec_uid) -> Result<UnixStream, String>` follows steps 1–6 exactly:
     1. record `getppid`;
     2. determine the user;
     3. drop;
     4. check the path;
     5. connect, and check the peer uid equals the invoking user;
-    6. set `PR_SET_PDEATHSIG(SIGKILL)` and re-check `getppid`.
+    6. set `PR_SET_PDEATHSIG(SIGKILL)` and re-check `getppid`. (S7) **Strictly after step 3**: the kernel clears the
+       parent-death signal during the credential change (the task becomes non-dumpable), so a signal armed before
+       the drop reads back as 0 and the helper would outlive the core. A debug assertion reads
+       `PR_GET_PDEATHSIG` back and expects `SIGKILL`.
 
-    A failure exits non-zero before any other I/O. On non-Linux, `serve` exits non-zero with "serve is Linux only in
+    (S7) The helper starts with `cwd` `/root`, no `XDG_RUNTIME_DIR`, `TERM` or `DISPLAY` in its environment, and
+    every fd above 2 closed; it uses nothing but argv and `PKEXEC_UID`. A failure exits non-zero before any other
+    I/O. On non-Linux, `serve` exits non-zero with "serve is Linux only in
     Phase 1".
 - **Test (first, failing):** `serve::tests`:
   - `invoking_user(1000, Some("0")) == Ok(1000)`
@@ -1134,6 +1224,7 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
   - `invoking_user(0, None)` is an `Err`
   - `check_socket_path` with the directory owned by uid 1001 for invoking 1000 is an `Err`; mode 0755 is an `Err`; a
     symlinked socket is an `Err`; an owned 0700 directory is `Ok`
+  - `invoking_user(0, Some("1000x"))` and `invoking_user(0, Some(""))` are `Err` (S7: decimal string only)
 - **Done when:** the tests pass and the Rust gate passes.
 
 ### Task P2.7: `serve` loop: handshake, scope, capture, inject
@@ -1143,14 +1234,23 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
 - **Files:** `crates/aitm-l4-helper/src/serve_loop.rs` (create), `crates/aitm-l4-helper/src/main.rs`
 - **Change:**
   - `pub trait Wire: Send { fn open(&self, iface: &str, filter: Option<&str>, timeout: Duration) -> Result<Box<dyn
-    CaptureSource>, String>; fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String>; fn link(&self, iface:
-    &str) -> LinkType; }`. The real implementation is `pcap`.
+    CaptureSource>, String>; fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String>; fn inject_local(&self,
+    ipv4_packet: &[u8]) -> Result<(), String>; fn link(&self, iface: &str) -> LinkType; fn local_addrs(&self) ->
+    Vec<IpAddr>; }`. The real implementation is `pcap` for `open`/`inject`, and for `inject_local` (S7) a
+    `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` with `IP_HDRINCL` set, `sendto` the IPv4 packet (Ethernet header
+    stripped) to its own destination address; `local_addrs` lists the host's interface addresses (`nix::ifaddrs`)
+    plus 127/8.
+  - `pub fn inject_path(target: &InjectTarget, local: &[IpAddr]) -> InjectPath` (pure): `Local` when the IPv4
+    destination is in 127/8 or in `local`, else `Interface` (S7: a `pcap_inject` frame on `lo` has no route and is
+    dropped as a martian before any local socket sees it; the raw-IP path goes through `ip_output` with a route and
+    is still seen by the `lo` capture, so W3's `injected: true` holds).
   - `pub fn serve_loop(stream: impl Read + Write, wire: &dyn Wire, version: &str) -> Result<(), ServeExit>`:
     - `Hello` gives `HelloAck { caps: ["CAP_NET_RAW"] }`.
     - `ScopeSet` replaces the `HelperGuard`.
     - `CaptureOpen` gives `capture_filter(iface)?` then `wire.open(iface, filter)`, and streams `Frame`s from a
       reader thread.
-    - `Inject` gives `check_inject(..)` then `wire.inject`, and `InjectResult`.
+    - `Inject` gives `check_inject(..)` first (the guard precedes either path), then by `inject_path`: `Local` gives
+      `wire.inject_local(ipv4 bytes)`, `Interface` gives `wire.inject(iface, frame)`; then `InjectResult`. (S7)
     - EOF, any `ProtoError`, or an `Inject` before any `ScopeSet` ends the loop.
 - **Test (first, failing):** `serve_loop::tests` over an in-memory duplex with a recording fake `Wire`:
   - `inject_out_of_scope_is_refused_before_the_wire`: `ScopeSet 9000-9999`, then `Inject` to 8999, gives an
@@ -1159,6 +1259,17 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
   - `inject_before_scope_exits`
   - `capture_open_outside_scope_is_refused`
   - `filter_is_helper_built`: the filter `wire.open` receives equals `scope_filter` of the helper's guard.
+  - `loopback_inject_uses_raw_ip_not_pcap` (S7): `ScopeSet 9000-9999`, `Inject` of an Ethernet+IPv4+UDP frame to
+    127.0.0.1:9053 calls `wire.inject_local` once with the 45-byte IPv4 packet (Ethernet header stripped) and
+    `wire.inject` 0 times; a frame to an address outside `local_addrs` calls `wire.inject` once and `inject_local` 0
+    times.
+  - `out_of_scope_local_target_never_reaches_either_path`: `Inject` to 127.0.0.1:8999 calls neither.
+  - `loopback_inject_reaches_udp_socket` (S7, Linux, `#[ignore]`; **Architect's call:** it needs `CAP_NET_RAW`, so it
+    runs by name in P2.8 inside the container as the dropped helper's user with the file-caps copy, and the P2.8
+    script asserts it passes): bind a UDP socket on 127.0.0.1:0, send a crafted IPv4+UDP packet to it through the
+    real `inject_local`, and receive the payload `aitm-inject` within 1 s with `net.ipv4.conf.lo.route_localnet` read
+    back as `0` (the test skips with a message if the sysctl is not 0, so the martian path can never come back
+    unnoticed).
 - **Done when:** the tests pass and the Rust gate passes.
 
 ### Task P2.8: Linux live checks (helper)
@@ -1166,14 +1277,20 @@ dependency tree contains `aitm-proto-l4` and its own small dependencies only: no
 - **Satisfies:** AC8 (Linux, both modes), AC16, AC17, AC18 (live), AC19
 - **Depends on:** P2.7; p1b merged (the core end). The helper is installed at the policy path by copying from the
   build into the container as root:root 0755, until p5's `.deb` exists. The policy file comes from p5 P5.1 if merged,
-  else is copied from that branch for the check only.
+  else is copied from that branch for the check only. (S7) The rig is the one in "The rigs": `podman` installed
+  in `cis-lab` by the script if absent, containers `--systemd=always --privileged`, Debian `polkitd pkexec dbus`,
+  Fedora `polkit dbus-broker`, the `unix-chkpwd` AppArmor profile unloaded on the host for the Fedora run and reloaded
+  after; `pkaction --verbose` on the action id as the first check. The test rule `49-aitm-test.rules` is installed
+  for AC16 and removed before anything that must prompt.
 - **Files:** `tests/e2e/l4/linux-privilege-rig.sh` (create; builds and starts the [linux-ci] container in `cis-lab`), `tests/e2e/l4/test_privilege_helper_linux.py` (create)
 - **Change:** the script checks, as operator, on `lo`:
   1. AC16: with the test polkit rule, `l4.privilege.request` gives `pending`, then `capture.state == "available"` and
      `via == "helper"` within 10 s. `/proc/<helper pid>/status` shows the four `Uid:` fields equal to the tester uid,
      `CapEff: 0000000000002000`, `CapPrm: 0000000000002000`, `CapBnd: 0000000000002000`,
      `CapAmb: 0000000000000000` and `NoNewPrivs: 1`.
-  2. Walk W (W1–W5) through the helper.
+  2. Walk W (W1–W5) through the helper. (S7) W3–W4 to 127.0.0.1:9053 pass with `sysctl net.ipv4.conf.lo.route_localnet`
+     printed and equal to `0` (the raw-IP path, P2.7); the script also runs `cargo test -p aitm-l4-helper --
+     --ignored loopback_inject_reaches_udp_socket` in the container and quotes it.
   3. AC17: a copy with `cap_net_raw+ep` in a root-owned 0750 directory, named by `helper_path`, gives
      `helper.kind == "linux_cap_helper"`, capture `available` with no pkexec process ever seen (`pgrep -x pkexec`
      polled), and walk W passes again. Setting `helper_path` to `/tmp/x/aitm-l4-helper` never yields a `pkexec`
@@ -1604,14 +1721,20 @@ sign order and waits for its go (Rule 4). The orchestrator reviews the diffs.
 - **Change:** the policy:
   - action `com.mrbrutti.aitmproxy.l4-helper.run`;
   - `org.freedesktop.policykit.exec.path` = `/usr/lib/aitmproxy/aitm-l4-helper`;
-  - `org.freedesktop.policykit.exec.allow_gui` = `true`;
+  - **no** `org.freedesktop.policykit.exec.allow_gui` annotation (S7: was `true`; the helper has no GUI and the
+    dialog is pkexec's agent's, so the annotation only leaked `DISPLAY`/`XAUTHORITY` into the root helper's
+    environment);
   - defaults `allow_any`, `allow_inactive` and `allow_active` all `auth_admin`;
   - the message `Allow aitmproxy to capture and send raw packets (only within the L4 scope you configured)`.
 - **Test (first, failing):** `check-linux-packaging.sh` exits 1 unless all of these hold:
   - the action id and the exec.path are exact;
   - every default is exactly `auth_admin`;
   - `auth_admin_keep` appears nowhere in the file;
+  - `allow_gui` appears nowhere in the file (S7);
   - `xmllint --noout` passes (when present).
+
+  (S7) The deb `recommends` entry `pkexec` in P5.2 stands and is deliberate: on Debian trixie `pkexec` is a separate
+  package from `polkitd`.
 
   It exits 1 before the file exists.
 - **Done when:** the check exits 0.
@@ -1720,7 +1843,11 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
   - `pub fn should_suspend(platform: &str, core_shares_tty: bool, outcome: &str) -> bool` is true iff `linux`,
     `core_shares_tty` and `pending`.
   - When true, the run loop calls `ratatui::restore()`, prints `Waiting for administrator approval…`, and
-    re-`init`s when the polled `request.state` leaves `pending`.
+    re-`init`s when the polled `request.state` leaves `pending`. (S7) Once raw mode is off, Ctrl-C at the password
+    is a SIGINT to the whole foreground process group, which in `aitm tui` is this process; P1b.14's handler (held
+    while the pkexec child lives) is what keeps the TUI alive, and the TUI must not install `SIG_IGN` or its own
+    exit-on-SIGINT during this window. After the prompt ends with `dismissed`, the TUI redraws with the banner
+    "Approval was cancelled".
 - **Test (first, failing):** `should_suspend("linux", true, "pending") == true`. The cases `("macos", true,
   "handed_to_app")`, `("linux", false, "pending")` and `("linux", true, "cannot_prompt")` are all `false`.
 - **Done when:** the tests pass and the Rust gate passes.
@@ -1818,9 +1945,12 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
   - With `macos_app_path: /nonexistent.app`, both show the `package` label and the download link and no shell
     command. The request gives `cannot_prompt`.
   - Screenshots are looked at.
-- **Live check [linux-ci] (AC22):** in the systemd container without the test polkit rule, `aitm tui` in a pty.
-  Allow plus confirm restores the normal screen. A prompt containing `com.mrbrutti.aitmproxy.l4-helper.run`
-  appears. The harness types the password. The TUI redraws, the banner is gone, and capture is `available`.
+- **Live check [linux-ci] (AC22):** in the systemd container without the test polkit rule (`49-aitm-test.rules`
+  removed), `aitm tui` in a pty. Allow plus confirm restores the normal screen. A prompt appears whose first line is
+  `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====` (S7: the harness matches on this line; the
+  policy message, `Authenticating as: tester` and `Password: ` follow, with ANSI colour codes stripped). The harness
+  types the password. The TUI redraws, the banner is gone, and capture is `available`. A second run answers the prompt
+  with Ctrl-C: the TUI stays alive and redraws with "Approval was cancelled" (S7).
 - **Live check [linux-desk] (AC21):** on the GNOME VM, the web UI's Allow shows the graphical polkit dialog with the
   helper path and the policy message.
   - Approve: walk W passes.
@@ -1869,7 +1999,7 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 | AC5 | P1b.10, P7.1 | P1b.17 (after p7) |
 | AC6 | P1a.1, P2.2, P2.3, P3.3, P3.4, P3.6 | P3.13 [mac-signed] |
 | AC7 | P1b.6, P1b.7 | P3.13 [mac-signed] |
-| AC8 | P1b.8, P1b.13, P2.7 | P2.8 [linux-ci]; P3.13 [mac-signed] (W3–W4 per S8) |
+| AC8 | P1b.8, P1b.13, P2.7 (`inject_path`, `loopback_inject_uses_raw_ip_not_pcap`; S7) | P2.8 [linux-ci] (W3–W4 via raw IP with `route_localnet=0`, plus the ignored `loopback_inject_reaches_udp_socket`; S7); P3.13 [mac-signed] (W3–W4 per S8) |
 | AC9 | P3.2, P3.9, P6.2, P6.6 | P3.13 step 4 with P6.10's scripts [mac-signed] |
 | AC10 | P1b.5, P1b.11, P6.1, P6.5 | P1b.17, P6.10 [mac-any] |
 | AC11 | P3.1, P3.2, P3.7, P4.4, P4.5 | P3.13 [mac-any] |
@@ -1877,14 +2007,14 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 | AC13 | P3.6 | P3.13 [mac-signed] |
 | AC14 | P2.2, P2.3, P3.6 | P3.13 [mac-signed] |
 | AC15 | P5.1, P5.2 | P5.3 [linux-ci] |
-| AC16 | P1b.12, P2.6 | P2.8 [linux-ci] |
+| AC16 | P1b.12, P2.6 | P2.8 [linux-ci] (test rule `49-aitm-test.rules` present; literals confirmed by S7) |
 | AC17 | P1b.5, P1b.14 | P2.8 [linux-ci] |
 | AC18 | P1a.2, P1a.3, P1a.4, P2.6, P2.7 | P2.8 [linux-ci] |
 | AC19 | P2.6 | P2.8 [linux-ci] |
 | AC20 | P1b.2, P1b.14 | P1b.17 [linux-ci] |
 | AC21 | P6.6 | P6.10 [linux-desk] |
-| AC22 | P6.3 | P6.10 [linux-ci] |
-| AC23 | P1b.5, P1b.14 | P1b.17 [linux-ci]; doc branch after P5.4 |
+| AC22 | P6.3, P1b.14 (`sigint_is_dismissed`, `sigint_handler_installed_not_ignored`; S7) | P6.10 [linux-ci] (test rule removed; harness matches `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====`; S7) |
+| AC23 | P1b.5 (`prompt_possible` with `tty_opens`; S7), P1b.14 (`no_prompt_is_cannot_prompt_and_spawns_nothing`, `no_agent_text_is_failed`) | P1b.17 [linux-ci] (core under `setsid`; S7); doc branch after P5.4 |
 | AC24 | P1b.6, P1b.16 | P1b.17 |
 | AC25 | P3.10, P6.1, P6.4, P6.5 | P3.13, P6.10 [mac-any, linux-ci] |
 | AC26 | P3.5, P3.10 | P3.13 [mac-any, mac-signed] |
@@ -1896,7 +2026,7 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 
 - **Now:** S3, S5 and S7 (S4 and S8 in a VM, or inside S3's window). p1a. p7.
 - **After p1a merges:** p1b P1b.1–P1b.10 run in parallel with p2 P2.1, P2.5 and P2.9, and with p5 P5.1. P2.2–P2.4
-  start once S4 is written up. P1b.11 starts once S5 is. P1b.12–P1b.14 and P2.6–P2.7 start once S7 is.
+  start once S4 is written up. P1b.11 starts once S5 is. P1b.12–P1b.14 and P2.6–P2.7 start once S7 is (S7 is written up, PR #240: they are unblocked).
 - **After S3 and the orchestrator's go:** p4 P4.1–P4.2 (in parallel with the above). P4.3–P4.5 wait for p2.
 - **After p2 merges:** p5 P5.2–P5.3, and p4 P4.3–P4.5.
 - **After parity (d), S3 and S5:** p3 P3.1–P3.10 (P3.5 is independent of P3.1–P3.4; P3.10 is independent of
@@ -1922,6 +2052,10 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
    shows. Keep that, or pick a free key?
 5. **Still open from the spec:** written acceptance of `docs/packet-capture.md` (headless `setcap` and the NixOS
    wrapper). P5.4 is blocked until then.
+6. **(S7) Ctrl-C while the password prompt is up.** The plan (P1b.14) makes Ctrl-C during a pkexec prompt cancel the
+   prompt only; the core keeps running, and a Ctrl-C after the prompt has ended behaves as before. The alternative is
+   "Ctrl-C always quits aitm, prompt or not". The Architect chose the first because the operator pressed it to
+   decline a password, not to stop the proxy. Confirm or reverse.
 
 ## Review log
 
