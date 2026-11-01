@@ -138,7 +138,7 @@ Top bar: filters as `FlatMenu`s — Job (All), Severity ≥ (Info…Critical), C
 - Header: name (ui xl medium), `Badge(severity)`, `Badge(confidence, grey)`, `Badge(lane, grey)`, trailing **Status** segmented Open · Confirmed · False positive (→ `scan.issue.update`; a failure restores the old value and shows the reason inline).
 - **Where**: `scheme://host:port` + `method path` (path_template in tertiary when it differs) + `kind name` + `field_path` / `ws_path` / l4 fields when present.
 - **Description** (ui md). **Remediation** when present.
-- **Evidence**: Payload (data, selectable, raised box), Matched (same), Timing (`correlated`, slope, r, requested/observed in a 2-column table) when present, Diff (a raised box with the diff text) when present, L4 evidence fields when present.
+- **Evidence**: Payload (data, selectable, raised box), Matched (same), Timing (slope, r, and requested_s / observed_ms / baseline_ms as a 3-column table) when present, Diff (baseline / true / false lengths as three numbers) when present, L4 evidence fields when present.
 - **Probe flows**: one row per flow id (method+URL when listed, else id) with Open Flow; **Baseline flow** likewise.
 - **Links**: `FlatButton("Open PoC")` when `poc_ref` (opens Findings with the finding whose `pocPath` ends with the ref or whose id equals `finding_id`; when the Findings list has none, it opens Findings and shows "PoC poc-3b1c is not in this app's findings list"); `FlatButton("Open Finding")` when `finding_id`.
 - **Note**: a text field; Save Note → `scan.issue.update { id, status: <current>, note }`.
