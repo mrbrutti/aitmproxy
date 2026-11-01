@@ -610,6 +610,19 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| (a) A10/A11 | security | Critical | Self-exclusion guarded only the capture loop; send_recv replies, Linux parks and NE ingress units reach the same store that `l4.flow.get` now serves with bytes | fixed: `L4Guard::admit_frame`/`admit_endpoints` choke point + intercept forwards self traffic (d9f01f95); send_recv BPF + Ignore, NE ingress, tui on_bound (fix task 2, sha below) |
+| (a) A11 | security | Important | Capture gate alone exposed bytes of intercept/craft flows an agent could not capture | fixed d9f01f95: bytes gate keyed on flow kind (Capture→Capture, SendRecv/craft→Inject, Intercept→Intercept); spec §2.2 amended |
+| (a) A10 | security | Important | `aitm tui` with an ephemeral bus port never added it to the self-port set | fixed in fix task 2 (tui.rs on_bound) |
+| (a) A13 | quality, spec | Important | `parked_seq` per session: unfiltered `l4.intercept.list` interleaved sessions | fixed d9f01f95: process-wide `NEXT_PARKED_SEQ`, sort `(parked_seq, id)`, tester's cross-session test un-ignored |
+| (a) A9 | spec | Important | priv cell's BPF assertion false-fails on a multi-port rig | fixed 8b5fed22 (tester): parses both filter forms |
+| (a) A9 | spec | Important | Agent scope-add live check (AC6) landed in (a) though planned for (a') | accepted by the orchestrator 2026-11-01: the check is correct and runs against R_WIDEN; A6's live check on (a') turns the AC5 skip into a pass |
+| (a) A4/A10/A13/A15/e2e | quality | Minor ×14 | description whitespace, `epoch_ms`/`field` duplication, triple frame decode, three self-port writers, status verbs exempted by name, Rhai `flow.get` unpaged, `ParkedTable` leaks `entries`, test helper duplication, implementation-asserting tests, e2e helper duplication, never-ran `[ok]`, missing `serial`, hard-coded tool count, duplicated cfg list | fixed d9f01f95 except: e2e status-parsing helpers stay per cell (a shared `aitm_e2e/l4.py` is follow-up work for unit (e), file outside (a)) |
+| (a) A4 | spec | Minor | macOS probe unit test asserted the literal reason | fixed d9f01f95: asserts `code` and a non-empty reason |
+| (a) A7 | spec | Minor | `pub const DEFAULT_INTERFACE` not recorded | accepted by the orchestrator 2026-11-01: recorded here; needed so both test files share one per-OS constant |
+| (a) A5 | spec | Minor | `commands/scope.rs` missing from §7(a); A5 filed under (a') | fixed: spec §7(a) lists it; A5 stays in (a) (Decision 5) |
+| (a) A2 | security | Minor | `l4.flow.get` clones the whole flow under the store lock whatever the window | accepted by the orchestrator 2026-11-01 as follow-up (windowed store accessor; `flow.rs` outside (a)) |
+| (a) §2.1 | security | Minor | Other cores on the host and the CDP port are not excluded | accepted; recorded as a known limit in spec §2.1 |
+| (a) A14 | quality | Minor | `docs/design/languages/rhai.api.json` still lists `flow.get` with only `id` | follow-up for unit (e) (file outside (a)) |
 
 ## Shipped
 
