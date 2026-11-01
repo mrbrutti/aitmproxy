@@ -260,15 +260,24 @@ final class Session {
     }
 
     /// Rows after the query. Compiled once per query change, not per access.
+    ///
+    /// `rows` and `details` are read on every access, before the cache is consulted:
+    /// an `@Observable` view depends only on what it read during its last body
+    /// evaluation, so a cache hit that skipped them would leave the flow table with
+    /// no dependency on the capture the first time it re-rendered for another reason
+    /// (the intercept bar appearing, a selection) — and the Flows page then stopped
+    /// redrawing until a page switch (FIXLOG 2026-11-01).
     var visibleRows: [FlowRow] {
         let q = query
+        let current = rows
+        let currentDetails = details
         if cachedQuery != q || cachedRows == nil || cachedRowsVersion != rowsVersion {
             cachedQuery = q
             cachedCompiled = q.compiled()
-            cachedRows = cachedCompiled?.apply(rows, details: details)
+            cachedRows = cachedCompiled?.apply(current, details: currentDetails)
             cachedRowsVersion = rowsVersion
         }
-        return cachedRows ?? rows
+        return cachedRows ?? current
     }
 
     // MARK: Panels (M5): each panel owns its state; the session holds one of each.
