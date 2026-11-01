@@ -1169,7 +1169,11 @@ async fn no_h2_check_supplies_a_poc_hint() {
 
 #[tokio::test]
 async fn the_real_runner_refuses_session_material_before_dialling() {
-    let runner = RealRawH2Runner::new();
+    // The only constructor there is: a gated one.
+    let runner = RealRawH2Runner::with_ssrf(
+        aitm_core::SsrfPolicy::default(),
+        Arc::new(aitm_core::StdGuard::default()),
+    );
     let plan = RawH2Plan {
         target: RawH2Target {
             scheme: "https".to_string(),

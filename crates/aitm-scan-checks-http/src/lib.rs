@@ -7,9 +7,16 @@
 //! `lane()` (spec amendment of 2026-10-31, recorded as A16).
 //!
 //! Track T1a handed over the skeleton: the crate exists, is a workspace member,
-//! and exposes the final [`checks`] signature the binary already calls, so T3
-//! flips the body and edits no shared file (spec D1). [`checks`] now returns
-//! the ten native checks of D8.2, in id order:
+//! and exposes the registration slot the binary calls, so T3 flips the body
+//! and edits no shared file (spec D1).
+//!
+//! There are two slots. [`checks_with`] takes the job's `SsrfPolicy` and the
+//! engine's `ScopeRateGuard` and returns the ten native checks of D8.2;
+//! [`checks`] returns only the five that dial nothing of their own, so an
+//! ungated raw HTTP/2 probe cannot be built through a slot at all
+//! (coordinator decision of 2026-11-01, option A). `crates/aitm/src/wire.rs`
+//! calls **`checks_with`**, with the live policy and guard; T3's integration
+//! task makes that one-line swap. The ten, in id order:
 //!
 //! | Technique | Checks | Module |
 //! |---|---|---|
@@ -54,8 +61,9 @@ pub mod redirect;
 pub mod sqli_boolean;
 pub mod xss;
 
-pub use catalogue::checks;
+pub use catalogue::{checks, checks_with};
 
-// The catalogue slot's agreement with the design — the ten ids, the metadata
-// shape and the `class` tokens — is pinned in `tests/catalogue.rs`, which reads
-// `checks()` through the public API exactly as `crates/aitm/src/wire.rs` does.
+// The catalogue slots' agreement with the design — the ten ids, the five
+// gate-free ones, the metadata shape and the `class` tokens — is pinned in
+// `tests/catalogue.rs`, which reads them through the public API exactly as
+// `crates/aitm/src/wire.rs` does.

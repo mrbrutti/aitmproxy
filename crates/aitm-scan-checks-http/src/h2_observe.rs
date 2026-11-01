@@ -105,18 +105,24 @@ pub struct RealRawH2Runner {
 }
 
 impl RealRawH2Runner {
-    /// A runner over [`RawH2Client`] with `TlsVerify::AcceptAny`.
+    /// A runner over [`RawH2Client`] with `TlsVerify::AcceptAny`, gated by
+    /// `ssrf` and `guard`.
+    ///
+    /// This is the **only** constructor: the driver checks both against every
+    /// address the target's name resolves to, immediately before it dials, so
+    /// a short-TTL record that flipped after the point cleared the lane's own
+    /// client cannot steer an accept-any probe at an internal address. A
+    /// runner that could skip that check would be a caller's mistake away
+    /// from an ungated raw socket, so there is none (coordinator decision of
+    /// 2026-11-01, option A).
     #[must_use]
-    pub fn new() -> Self {
+    pub fn with_ssrf(
+        ssrf: aitm_core::SsrfPolicy,
+        guard: Arc<dyn aitm_core::ScopeRateGuard>,
+    ) -> Self {
         Self {
-            client: RawH2Client::new(TlsVerify::AcceptAny),
+            client: RawH2Client::new(TlsVerify::AcceptAny).with_ssrf(ssrf, guard),
         }
-    }
-}
-
-impl Default for RealRawH2Runner {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -1,17 +1,46 @@
 //! The catalogue slot agrees with the design (spec D1, D6, D8.2; T3 plan task 10).
 //!
-//! These tests read [`aitm_scan_checks_http::checks`] the way the binary does —
-//! `crates/aitm/src/wire.rs::collect_native_checks` calls it once at startup and
-//! hands the result to the HTTP lane — and pin what the engine depends on: the
-//! ten ids, the metadata shape every scheduler field is read from, and the
-//! `class` tokens D6's dedupe groups issues by. No check body runs and no socket
-//! is opened; building the list is all these tests do.
+//! These tests read the two catalogue slots the way the binary does —
+//! `crates/aitm/src/wire.rs::collect_native_checks` calls one of them once at
+//! startup and hands the result to the HTTP lane — and pin what the engine
+//! depends on: the ids, the metadata shape every scheduler field is read from,
+//! and the `class` tokens D6's dedupe groups issues by. No check body runs and
+//! no socket is opened; building the lists is all these tests do.
+//!
+//! There are two slots because five of the ten checks dial raw:
+//! [`aitm_scan_checks_http::checks_with`] takes the live SSRF policy and scope
+//! guard and returns all ten, and [`aitm_scan_checks_http::checks`] returns
+//! only the five that probe through the lane's own guarded client. An ungated
+//! raw-h2 probe therefore cannot be constructed through the slot at all
+//! (coordinator decision of 2026-11-01, option A).
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
-use aitm_scan_checks_http::checks;
-use aitm_scan_model::{CheckOrigin, Intensity, LaneKind};
+use aitm_core::{ScopeRateGuard, SsrfPolicy, StdGuard};
+use aitm_scan_checks_http::{checks, checks_with};
+use aitm_scan_model::{Check, CheckOrigin, Intensity, LaneKind};
 use regex::Regex;
+
+/// The gated slot, built the way `wire.rs` builds it: the job's SSRF policy
+/// and the engine's scope guard, which every raw h2 probe is checked against.
+fn gated() -> Vec<Arc<dyn Check>> {
+    checks_with(SsrfPolicy::default(), guard())
+}
+
+fn guard() -> Arc<dyn ScopeRateGuard> {
+    Arc::new(StdGuard::default())
+}
+
+/// The five checks `checks()` returns: every native check that probes through
+/// the lane's own guarded client and dials nothing itself.
+const GATE_FREE_IDS: [&str; 5] = [
+    "cmdi-time",
+    "open-redirect",
+    "sqli-boolean",
+    "sqli-time",
+    "xss-reflected",
+];
 
 /// The ten native ids, in the sorted order the plan's task 10 enumerates them.
 const NATIVE_IDS: [&str; 10] = [
@@ -29,7 +58,7 @@ const NATIVE_IDS: [&str; 10] = [
 
 /// The `class` of the check with `id`, or a panic naming the missing id.
 fn class_of(id: &str) -> String {
-    checks()
+    gated()
         .into_iter()
         .find(|check| check.meta().id == id)
         .unwrap_or_else(|| panic!("checks() has no check with id {id}"))
@@ -39,18 +68,53 @@ fn class_of(id: &str) -> String {
 }
 
 #[test]
-fn checks_returns_every_native_id() {
-    let built = checks();
-    assert_eq!(built.len(), 10, "checks() must return ten native checks");
+fn checks_with_returns_every_native_id() {
+    let built = gated();
+    assert_eq!(
+        built.len(),
+        10,
+        "checks_with() must return ten native checks"
+    );
 
     let mut ids: Vec<String> = built.iter().map(|check| check.meta().id.clone()).collect();
     ids.sort();
     assert_eq!(ids, NATIVE_IDS, "the sorted native ids");
 }
 
+/// The ungated slot returns only the checks that need no gate. The five h2
+/// checks dial a raw socket, so they exist only where a policy and a guard
+/// were supplied: a caller that forgot cannot get one by accident.
+#[test]
+fn checks_returns_only_the_gate_free_five() {
+    let ids: Vec<String> = checks()
+        .iter()
+        .map(|check| check.meta().id.clone())
+        .collect();
+
+    assert_eq!(ids, GATE_FREE_IDS);
+    for id in &ids {
+        assert!(!id.starts_with("h2-"), "{id} dials raw and needs a gate");
+    }
+}
+
+/// Together they are the whole catalogue, with nothing in `checks()` that
+/// `checks_with()` does not also build.
+#[test]
+fn the_gated_slot_is_a_superset_of_the_ungated_one() {
+    let gate_free: BTreeSet<String> = checks().iter().map(|c| c.meta().id.clone()).collect();
+    let all: BTreeSet<String> = gated().iter().map(|c| c.meta().id.clone()).collect();
+
+    assert!(gate_free.is_subset(&all));
+    let only_gated: Vec<&String> = all.difference(&gate_free).collect();
+    assert_eq!(only_gated.len(), 5, "the five h2 checks");
+    for id in only_gated {
+        assert!(id.starts_with("h2-"), "{id}");
+    }
+}
+
 #[test]
 fn every_meta_is_well_formed() {
-    let built = checks();
+    let built = gated();
     // Guard against a vacuous pass: an empty catalogue satisfies every `for`
     // body below, so the count is part of the assertion.
     assert_eq!(built.len(), NATIVE_IDS.len(), "checks examined");
@@ -113,7 +177,7 @@ fn the_shared_classes_match_the_taxonomy() {
 #[test]
 fn ids_are_verb_safe() {
     let verb_safe = Regex::new("^[a-z0-9][a-z0-9-]*$").expect("the id pattern compiles");
-    let built = checks();
+    let built = gated();
     assert_eq!(built.len(), NATIVE_IDS.len(), "ids examined");
 
     for check in built {
@@ -125,14 +189,14 @@ fn ids_are_verb_safe() {
     }
 }
 
-/// `checks()` promises the list **in id order**, and `wire.rs` hands it
+/// Both slots promise the list **in id order**, and `wire.rs` hands it
 /// straight to the catalogue. Sorting a copy before comparing (as
 /// `checks_returns_every_native_id` must, to name the ids) would hide both a
 /// lost sort and a duplicate id, so this reads the list as it comes back:
 /// strictly ascending is sorted and unique in one assertion.
 #[test]
 fn checks_come_back_sorted_and_unique() {
-    let ids: Vec<String> = checks()
+    let ids: Vec<String> = gated()
         .iter()
         .map(|check| check.meta().id.clone())
         .collect();
@@ -150,8 +214,8 @@ fn checks_come_back_sorted_and_unique() {
 /// the second catalogue silently skip an origin the first had already seen.
 #[test]
 fn each_call_builds_fresh_check_instances() {
-    let first = checks();
-    let second = checks();
+    let first = gated();
+    let second = gated();
 
     assert_eq!(first.len(), second.len());
     for (a, b) in first.iter().zip(second.iter()) {
@@ -170,7 +234,7 @@ fn each_call_builds_fresh_check_instances() {
 /// upper-case letter would mint a verb the contract lists cannot express.
 #[test]
 fn no_id_carries_a_verb_separator() {
-    for check in checks() {
+    for check in gated() {
         let id = &check.meta().id;
         assert!(!id.contains('.'), "{id} would split the verb namespace");
         assert!(!id.contains('_'), "{id} is not kebab-case");
