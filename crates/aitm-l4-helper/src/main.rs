@@ -7,6 +7,8 @@
 //! arrive in later tasks.
 #![forbid(unsafe_code)]
 
+#[allow(dead_code)] // wired into main by task P2.4
+mod bpf;
 mod cli;
 mod probe;
 
