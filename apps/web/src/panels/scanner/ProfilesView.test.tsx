@@ -59,9 +59,15 @@ const start = (): HTMLButtonElement => screen.getByRole('button', { name: 'Start
 const reasonOf = (c: HTMLElement): string | null => c.querySelector('[data-reason]')?.textContent ?? null;
 const noteOf = (c: HTMLElement): string | null => c.querySelector('[data-note]')?.textContent ?? null;
 
+/** The scheme radio (`https` | `http`) inside the `Origin scheme` segmented control. */
+const schemeRadio = (scheme: string): HTMLButtonElement =>
+  within(screen.getByRole('radiogroup', { name: 'Origin scheme' })).getByRole('radio', {
+    name: scheme,
+  }) as HTMLButtonElement;
+
 /** The Add-origin picker, the way an operator drives it (a disabled port input is left alone). */
 function addOrigin(scheme: string, host: string, port?: string): void {
-  fireEvent.change(screen.getByLabelText('Origin scheme'), { target: { value: scheme } });
+  fireEvent.click(schemeRadio(scheme));
   fireEvent.change(screen.getByLabelText('Origin host'), { target: { value: host } });
   const portInput = screen.getByLabelText('Origin port') as HTMLInputElement;
   if (port !== undefined && !portInput.disabled) fireEvent.input(portInput, { target: { value: port } });
@@ -152,7 +158,13 @@ describe('ProfileEditor: binding and targets (D-T8.5)', () => {
 
   it('add_origin_and_start: the picker composes the origin and the launch carries the draft whole (W-12)', async () => {
     const { container, argsOf } = await mount();
+    // The scheme is a segmented control (a native <select> cannot be driven by real key events in
+    // headless Chrome); it defaults to https.
+    expect(schemeRadio('https').getAttribute('aria-checked')).toBe('true');
+    expect(schemeRadio('http').getAttribute('aria-checked')).toBe('false');
     addOrigin('http', '127.0.0.1', '8080');
+    expect(schemeRadio('http').getAttribute('aria-checked')).toBe('true');
+    expect(schemeRadio('https').getAttribute('aria-checked')).toBe('false');
 
     const origins = screen.getByRole('list', { name: 'Origins' });
     await waitFor(() => expect(origins.textContent).toContain('http://127.0.0.1:8080'));
@@ -174,7 +186,7 @@ describe('ProfileEditor: binding and targets (D-T8.5)', () => {
     const host = screen.getByLabelText('Origin host') as HTMLSelectElement;
     expect([...host.options].map((o) => o.value)).toEqual(['127.0.0.1:8080', 'app.example']);
 
-    fireEvent.change(screen.getByLabelText('Origin scheme'), { target: { value: 'http' } });
+    fireEvent.click(schemeRadio('http'));
     fireEvent.change(host, { target: { value: '127.0.0.1:8080' } });
     const port = screen.getByLabelText('Origin port') as HTMLInputElement;
     await waitFor(() => expect(port.disabled).toBe(true));

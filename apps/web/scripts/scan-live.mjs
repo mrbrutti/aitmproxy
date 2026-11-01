@@ -194,6 +194,30 @@ async function pickSelect(sel, wanted) {
   throw new Error(`could not pick ${wanted} in ${sel} (value stays ${j(await valueOf(sel))})`);
 }
 
+/**
+ * Picks in a real <select> only when its current value does not already match `wanted`; when it
+ * does (the proof's scope has exactly one concrete host, already selected) no key event is sent.
+ * Headless Chrome on macOS does not change a native <select> from ArrowDown (the popup is a native
+ * widget), so driving one is a last resort, kept only as the fallback.
+ */
+async function pickSelectUnless(sel, wanted) {
+  const ok = (v) => (wanted instanceof RegExp ? wanted.test(v ?? '') : v === wanted);
+  const current = await valueOf(sel);
+  if (ok(current)) return current;
+  return pickSelect(sel, wanted);
+}
+
+const SCHEME_GROUP = '[role=radiogroup][aria-label="Origin scheme"]';
+/** Clicks the `https` | `http` radio of the Origin scheme segmented control and asserts it took. */
+async function pickScheme(scheme) {
+  await d.click({ role: 'radio', text: scheme, match: 'exact', within: SCHEME_GROUP });
+  const checked = await d.ev(
+    `Array.from(document.querySelectorAll(${j(`${SCHEME_GROUP} [role=radio]`)})).find((b) => (b.textContent ?? '').trim() === ${j(scheme)})?.getAttribute('aria-checked') ?? null`,
+  );
+  if (checked !== 'true') throw new Error(`Origin scheme radio ${j(scheme)} is not checked after the click (aria-checked ${j(checked)})`);
+  return scheme;
+}
+
 /** The probes numerator the UI renders for `job` (`418/2000` -> 418), or null. */
 async function renderedProbes(sel) {
   const t = await d.q('text', sel);
@@ -255,8 +279,8 @@ async function run() {
   // 2 ----------------------------------------------------------------------------------------
   await step('02 start a standard scan against the test target', async () => {
     await d.click({ sel: `${PROFILES} [data-profile="standard"]` });
-    await pickSelect('select[aria-label="Origin scheme"]', 'http');
-    await pickSelect('select[aria-label="Origin host"]', /127\.0\.0\.1/);
+    await pickScheme('http');
+    await pickSelectUnless('select[aria-label="Origin host"]', /127\.0\.0\.1/);
     await typeInto('input[aria-label="Origin port"]', String(target.port));
     await d.click({ role: 'button', text: 'Add origin', match: 'startsWith' });
     const origins = await d.q('text', '[aria-label="Origins"]');
@@ -541,7 +565,7 @@ async function run() {
     }
     await typeInto(ipSel, '127.0.0.1');
     await typeInto(portSel, String(target.port));
-    if (protoSel) await pickSelect(protoSel, 'tcp').catch((e) => note('08b proto select', e.message.split('\n')[0]));
+    if (protoSel) await pickSelectUnless(protoSel, 'tcp').catch((e) => note('08b proto select', e.message.split('\n')[0]));
     await d.mouse(addBtn.x, addBtn.y);
 
     const start = await soft(() => d.q('find', { role: 'button', text: 'Start', match: 'exact', within: SCANNER }), 5000);

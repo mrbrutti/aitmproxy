@@ -117,6 +117,10 @@ const BoolField: Component<{ label: string; checked: boolean; onValue: (v: boole
   </label>
 );
 
+/** Origin scheme: a segmented control, not a native <select> (headless Chrome cannot drive one with real key events). */
+type Scheme = 'https' | 'http';
+const SCHEMES: readonly Scheme[] = ['https', 'http'];
+
 function Segmented<T extends string>(props: {
   label: string;
   options: readonly T[];
@@ -310,7 +314,7 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
 
   /* -------------------------------------------------------------- targets */
 
-  const [scheme, setScheme] = createSignal<'https' | 'http'>('https');
+  const [scheme, setScheme] = createSignal<Scheme>('https');
   const [host, setHost] = createSignal('');
   const [port, setPort] = createSignal('');
   /** Concrete in-scope hosts only: a `*.` wildcard is not a host one can connect to. */
@@ -509,21 +513,7 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
             </div>
 
             <div class={css.originRow}>
-              <label class={css.field}>
-                <span class={css.fieldLabel}>Origin scheme</span>
-                <select
-                  aria-label="Origin scheme"
-                  value={scheme()}
-                  onChange={(e) => setScheme(e.currentTarget.value === 'http' ? 'http' : 'https')}
-                >
-                  <option value="https" selected={scheme() === 'https'}>
-                    https
-                  </option>
-                  <option value="http" selected={scheme() === 'http'}>
-                    http
-                  </option>
-                </select>
-              </label>
+              <Segmented label="Origin scheme" options={SCHEMES} value={scheme()} onValue={setScheme} />
               <label class={css.field}>
                 <span class={css.fieldLabel}>Origin host</span>
                 <select aria-label="Origin host" value={host()} onChange={(e) => setHost(e.currentTarget.value)}>
