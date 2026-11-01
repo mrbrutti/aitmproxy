@@ -422,22 +422,25 @@ Kept by the main session during stage 6. One row per finding.
 | 8 | coder note | Minor | Issues degraded text names `scan.issues`/`scan.issue` but not `scan.issue.update` | fixed in edecb09f (fix round E) (E17) |
 | 8 | coder note | Minor | Issues List-pane `Enter` is inert | fixed in 0263c577 (fix round E) (E18): `Enter` on the list focuses the Detail pane |
 | 8 | coder note | note | the developer fixture answers `scan.issue.update` with a missing-tool error | accepted: the fixture is development only; the pty cell runs against a real core |
-| 8 | spec | Minor | flow list drawn after `seen`, not between the evidence and `poc` as D11 orders | fix round F (F1): move the flow list to its D11 position |
+| 8 | spec | Minor | flow list drawn after `seen`, not between the evidence and `poc` as D11 orders | fixed in e05aee93 (fix round F) (F1): move the flow list to its D11 position |
 | 8 | spec | Minor | an unrequested `target` line in the detail | accepted by the T7 session; spec D11 amended in this commit |
-| 8 | spec | Minor | `waiting for scan.issue...` placeholder is false after a failed read or a missing verb | fix round F (F2): neutral wording `no detail read for this row` |
+| 8 | spec | Minor | `waiting for scan.issue...` placeholder is false after a failed read or a missing verb | fixed in e05aee93 (fix round F) (F2): neutral wording `no detail read for this row` |
 | 8 | spec | Minor | eleven helpers public beyond the plan's two names | accepted (as for Tasks 6 and 7) |
-| 8 | security | Minor | `P` with a degenerate `poc_ref` (`""`, `/`, `.yaml`) jumps to an unrelated finding | fix round F (F3): empty ref = no PoC; match on file stem/name |
-| 8 | security | Minor | per-frame `format!` over unbounded `Issue` strings and the whole flow list; raw `poc_ref` in a toast | fix round F (F4): bound every rendered string and the flow list at insert, draw only the visible window |
-| 8 | security | Minor | head line's verdict forgeable by a name with three spaces (string re-split) | fix round F (F5): structured head, hue from the typed severity |
-| 8 | security | Minor | `flow_cursor` unclamped when an update shrinks the flow list | fix round F (F6) |
-| 8 | quality | Important | the view overrides `detail_scroll` to follow the flow cursor; paging keys cannot reach the top of a tall detail | fix round F (F7): `follow_flow` in state |
-| 8 | quality | Important | model bakes `label value` layout into strings; view re-parses them; head split on three spaces | fix round F (F8): pairs plus a structured head and one shared `labelled()` line builder |
-| 8 | quality | Minor | `Enter` reads an unclamped `flow_cursor` and materialises the whole flow list | fix round F (F9): `flow_under_cursor` with `FlowTag` |
-| 8 | quality | Minor | `scan_open_poc` matches on `contains` so an empty ref matches everything; two avoidable clones | fix round F (F3, F10) |
-| 8 | quality | Minor | three identical `u16` scroll steps in `navigate` | fix round F (F11) |
-| 8 | quality | Minor | seven public items with no external caller | fix round F (F12) |
-| 8 | quality | Minor | tests `contains` where literals exist; unit fixture loader hides a missing file | fix round F (F13) |
-| 8 | quality | Minor | Findings `Enter` arm duplicates `open_scan_flow` | fix round F (F14): shared `open_flow(id, toast)` |
+| 8 | security | Minor | `P` with a degenerate `poc_ref` (`""`, `/`, `.yaml`) jumps to an unrelated finding | fixed in 7fbf0da5 (fix round F) (F3): empty ref = no PoC; match on file stem/name |
+| 8 | security | Minor | per-frame `format!` over unbounded `Issue` strings and the whole flow list; raw `poc_ref` in a toast | fixed in e05aee93 (fix round F) (F4): bound every rendered string and the flow list at insert, draw only the visible window |
+| 8 | security | Minor | head line's verdict forgeable by a name with three spaces (string re-split) | fixed in e05aee93 (fix round F) (F5): structured head, hue from the typed severity |
+| 8 | security | Minor | `flow_cursor` unclamped when an update shrinks the flow list | fixed in e05aee93 (fix round F) (F6) |
+| 8 | quality | Important | the view overrides `detail_scroll` to follow the flow cursor; paging keys cannot reach the top of a tall detail | fixed in e05aee93 (fix round F) (F7): `follow_flow` in state |
+| 8 | quality | Important | model bakes `label value` layout into strings; view re-parses them; head split on three spaces | fixed in e05aee93 (fix round F) (F8): pairs plus a structured head and one shared `labelled()` line builder |
+| 8 | quality | Minor | `Enter` reads an unclamped `flow_cursor` and materialises the whole flow list | fixed in e05aee93 (fix round F) (F9): `flow_under_cursor` with `FlowTag` |
+| 8 | quality | Minor | `scan_open_poc` matches on `contains` so an empty ref matches everything; two avoidable clones | fixed in 7fbf0da5 (fix round F) (F3, F10) |
+| 8 | quality | Minor | three identical `u16` scroll steps in `navigate` | fixed in e05aee93 (fix round F) (F11) |
+| 8 | quality | Minor | seven public items with no external caller | fixed in e05aee93 (fix round F) (F12) |
+| 8 | quality | Minor | tests `contains` where literals exist; unit fixture loader hides a missing file | fixed in e05aee93 (fix round F) (F13) |
+| 8 | quality | Minor | Findings `Enter` arm duplicates `open_scan_flow` | fixed in 8f553f92 (fix round F) (F14): shared `open_flow(id, toast)` |
+| fix F | coder note | note | `read` values are now `ReadIssue { issue, dropped_flows }` (Deref to `Issue`); `follow_flow` added | spec D3 amended in this commit |
+| fix F | coder note | Minor | `follow_flow` defaults false, so the first `Tab` into a tall detail may leave the flows below the fold until `Down` | accepted (prescribed); Task 14's layout pass may set it on entering the Detail pane |
+| fix F | coder note | Minor | Jobs `labelled()` passes `width - 1`, Issues `width`; one spare cell differs | fix round G (deferred to the whole-branch pass) |
 
 ## Shipped
 
