@@ -19,8 +19,8 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::helper::HelperBackend;
@@ -219,8 +219,13 @@ pub(crate) struct Shared {
     /// [`PrivilegeState::cancel_prompt`] sends SIGINT to. Set by the watcher
     /// when a request's child is watched, cleared with the hold.
     prompt_child: Mutex<Option<SharedChild>>,
-    /// A watcher thread is running (a request in flight or a helper serving).
-    watching: AtomicBool,
+    /// The id of the running watcher thread (a request in flight or a helper
+    /// serving), 0 for none. Each watch owns one id (panel 3, D1) and clears
+    /// only its own, so a watch that has ended but is still in its bounded
+    /// reap cannot clear the flag of the watch that followed it.
+    watching: AtomicU64,
+    /// Watch ids handed out so far; the next is one more, never 0.
+    watch_ids: AtomicU64,
 }
 
 /// A watched child, shared between the watcher thread (which steps it) and
@@ -287,7 +292,8 @@ impl Shared {
             session_failure: Mutex::new(None),
             hold: Mutex::new(HoldCount::default()),
             prompt_child: Mutex::new(None),
-            watching: AtomicBool::new(false),
+            watching: AtomicU64::new(0),
+            watch_ids: AtomicU64::new(0),
         })
     }
 
@@ -304,6 +310,12 @@ impl Shared {
     /// Record this core's request progress; the next `report()` probes.
     fn set_progress(&self, state: RequestState, message: &str) {
         let mut cache = self.lock_cache();
+        self.write_progress(&mut cache, state, message);
+    }
+
+    /// The one writer of a progress row: `state` and `message` at `now`, and
+    /// the cache is dirty so the next `report()` probes.
+    fn write_progress(&self, cache: &mut Cache, state: RequestState, message: &str) {
         cache.request = Some(RequestProgress {
             state,
             at: self.now(),
@@ -362,8 +374,20 @@ impl Shared {
         lock(&self.prompt_child).clone()
     }
 
-    fn set_prompt_child(&self, child: Option<SharedChild>) {
-        *lock(&self.prompt_child) = child;
+    fn register_prompt_child(&self, child: &SharedChild) {
+        *lock(&self.prompt_child) = Some(Arc::clone(child));
+    }
+
+    /// Clear the prompt slot if `child` is the child in it (panel 3, D1): a
+    /// later watch's child, registered while this one reaped, stays.
+    fn unregister_prompt_child(&self, child: &SharedChild) {
+        let mut slot = lock(&self.prompt_child);
+        if slot
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, child))
+        {
+            *slot = None;
+        }
     }
 
     /// Move a still-`pending` request to `failed` with `message`; any other
@@ -375,17 +399,27 @@ impl Shared {
             .as_ref()
             .is_some_and(|req| req.state == RequestState::Pending)
         {
-            cache.request = Some(RequestProgress {
-                state: RequestState::Failed,
-                at: self.now(),
-                message: message.to_string(),
-            });
-            cache.dirty = true;
+            self.write_progress(&mut cache, RequestState::Failed, message);
         }
     }
 
+    /// Mark a watch as running under a fresh id (never 0) and return the id.
+    fn start_watching(&self) -> u64 {
+        let id = self.watch_ids.fetch_add(1, Ordering::SeqCst) + 1;
+        self.watching.store(id, Ordering::SeqCst);
+        id
+    }
+
+    /// Clear `watching` only if it still names `id` (panel 3, D1): the id of
+    /// a watch that started meanwhile stays.
+    fn stop_watching(&self, id: u64) {
+        let _ = self
+            .watching
+            .compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     fn watching(&self) -> bool {
-        self.watching.load(Ordering::SeqCst)
+        self.watching.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -463,10 +497,21 @@ impl PrivilegeState {
     /// now instead of at the 300 s timeout and the watcher records
     /// `dismissed` through the §5.5 table. With no launcher alive (no request
     /// in flight, or a directly started file-caps helper) this does nothing.
+    ///
+    /// It never blocks on the watcher's child lock (panel 3, D4): the watcher
+    /// holds it only across one `try_wait` or `kill`, and a lock found held
+    /// means the child is being stepped as it ends, so the cancel is skipped.
     pub fn cancel_prompt(&self) {
-        if let Some(child) = self.shared.prompt_child() {
-            lock(&child).interrupt();
-        }
+        let Some(child) = self.shared.prompt_child() else {
+            return;
+        };
+        match child.try_lock() {
+            Ok(mut child) => child.interrupt(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().interrupt(),
+            Err(TryLockError::WouldBlock) => {
+                tracing::debug!("the prompt's child is mid-step with its watcher; cancel skipped");
+            }
+        };
     }
 
     /// The one capture/inject backend every production caller holds (spec §2.1,
@@ -1082,10 +1127,11 @@ fn start_watch_with(shared: Arc<Shared>, pending: PendingWatch, progress: bool) 
         listener,
         started_ms,
     } = pending;
-    shared.watching.store(true, Ordering::SeqCst);
+    // `watching` reads true from the spawn on. The thread's `Watch` takes an
+    // id of its own as it starts and clears that one when it ends, however
+    // it ends (a panic included); this id only covers the gap.
+    let id = shared.start_watching();
     let thread_shared = Arc::clone(&shared);
-    // `run_watcher`'s guard clears `watching` when the thread ends, however
-    // it ends (a panic included).
     let built = std::thread::Builder::new()
         .name("l4-privilege-watch".to_string())
         .spawn(move || {
@@ -1101,7 +1147,7 @@ fn start_watch_with(shared: Arc<Shared>, pending: PendingWatch, progress: bool) 
     if let Err(err) = built {
         // The child handle went with the closure; its connect will find no
         // listener and the helper exits on its own.
-        shared.watching.store(false, Ordering::SeqCst);
+        shared.stop_watching(id);
         return Err(err);
     }
     Ok(())
@@ -1243,8 +1289,10 @@ pub(crate) fn run_watcher(
 /// One watch, owned by the watcher thread: the child (shared with
 /// `cancel_prompt` while it is a prompt), the listener, the SIGINT hold, and
 /// the thread's unwind guard. Its `Drop` is the panic path: whatever the
-/// watcher was doing, the hold and the listener go, a still-`pending` request
-/// reads `failed`, and `watching` is cleared.
+/// watcher was doing, the hold and the listener go, the child is killed
+/// (best effort, no reap), a still-`pending` request reads `failed`, and
+/// `watching` is cleared. It releases only what it registered (panel 3,
+/// D1): its own child from the prompt slot, its own id from `watching`.
 struct Watch {
     shared: Arc<Shared>,
     child: SharedChild,
@@ -1253,6 +1301,11 @@ struct Watch {
     hold: Option<HoldToken>,
     started_ms: u64,
     progress: bool,
+    /// The child was spawned under a hold, so it is a prompt: registered for
+    /// `cancel_prompt` until the prompt is over.
+    prompt: bool,
+    /// This watch's id in `Shared::watching`.
+    id: u64,
 }
 
 impl Watch {
@@ -1264,10 +1317,13 @@ impl Watch {
         started_ms: u64,
         progress: bool,
     ) -> Self {
+        let id = shared.start_watching();
         let child: SharedChild = Arc::new(Mutex::new(child));
-        if progress {
-            // A request's child is a prompt: a held Ctrl-C may cancel it.
-            shared.set_prompt_child(Some(Arc::clone(&child)));
+        // A child spawned under the SIGINT hold is a launcher at a prompt: a
+        // held Ctrl-C may cancel it. A direct start has no hold and no prompt.
+        let prompt = hold.is_some();
+        if prompt {
+            shared.register_prompt_child(&child);
         }
         Watch {
             shared,
@@ -1276,6 +1332,8 @@ impl Watch {
             hold,
             started_ms,
             progress,
+            prompt,
+            id,
         }
     }
 
@@ -1308,8 +1366,8 @@ impl Watch {
     /// the SIGINT hold and unregister the child from `cancel_prompt`.
     fn release_prompt(&mut self) {
         drop(self.hold.take());
-        if self.progress {
-            self.shared.set_prompt_child(None);
+        if self.prompt {
+            self.shared.unregister_prompt_child(&self.child);
         }
     }
 
@@ -1355,11 +1413,16 @@ impl Drop for Watch {
         let panicking = std::thread::panicking();
         self.release_prompt();
         drop(self.acceptor.take());
-        if panicking && self.progress {
-            tracing::warn!("the packet-capture watcher ended unexpectedly");
-            self.shared.fail_if_pending(msg::ENDED_UNEXPECTEDLY);
+        if panicking {
+            // Nothing will step this child again: kill it, best effort, and
+            // skip the bounded reap (panel 3, D2).
+            lock(&self.child).kill();
+            if self.progress {
+                tracing::warn!("the packet-capture watcher ended unexpectedly");
+                self.shared.fail_if_pending(msg::ENDED_UNEXPECTEDLY);
+            }
         }
-        self.shared.watching.store(false, Ordering::SeqCst);
+        self.shared.stop_watching(self.id);
     }
 }
 
@@ -2146,7 +2209,7 @@ mod tests {
         });
         assert_eq!(holds.count(), 1, "the prompt is up");
 
-        state.cancel_prompt();
+        cancel_until_signalled(&state, &signals);
         watcher.join().expect("the watcher ended the request");
         assert_eq!(
             *signals.lock().unwrap(),
@@ -2219,7 +2282,11 @@ mod tests {
     }
 
     /// A child whose `try_wait` panics (a broken `waitpid` wrapper, a bug).
-    struct PanicsOnWait;
+    /// `kill` only counts.
+    #[derive(Default)]
+    struct PanicsOnWait {
+        killed: Arc<AtomicUsize>,
+    }
 
     impl Child for PanicsOnWait {
         fn id(&self) -> u32 {
@@ -2228,7 +2295,9 @@ mod tests {
         fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
             panic!("try_wait blew up");
         }
-        fn kill(&mut self) {}
+        fn kill(&mut self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
         fn interrupt(&mut self) {}
         fn stderr_tail(&mut self) -> String {
             String::new()
@@ -2241,7 +2310,9 @@ mod tests {
     /// request ended unexpectedly"), never `pending`; the hold is 0, the
     /// prompt slot and the `watching` flag are clear, and the next
     /// `request()` is accepted (not answered `pending`). A request that was
-    /// not pending is left as it was.
+    /// not pending is left as it was. Panel 3 (D2): the unwinding watcher
+    /// also kills its child, best effort, so no launcher outlives the watch
+    /// that was its only keeper.
     #[test]
     fn watcher_panic_releases_hold_and_ends_pending() {
         let (state, now) = state_over(vec![row6()]);
@@ -2251,14 +2322,15 @@ mod tests {
             at: 6_900,
             message: msg::PENDING_DIALOG.to_string(),
         }));
-        state.shared.watching.store(true, Ordering::SeqCst);
         let holds = HoldCount::default();
         let hold = holds.hold();
         let shared = Arc::clone(&state.shared);
+        let child = PanicsOnWait::default();
+        let killed = Arc::clone(&child.killed);
         let crashed = std::thread::spawn(move || {
             run_watcher(
                 shared,
-                Box::new(PanicsOnWait),
+                Box::new(child),
                 Box::new(NoPeer),
                 Some(hold),
                 7_000,
@@ -2267,6 +2339,11 @@ mod tests {
         })
         .join();
         assert!(crashed.is_err(), "the watcher panicked");
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            1,
+            "the unwinding watcher kills its child once"
+        );
         assert_eq!(
             state.report().request,
             Some(RequestProgress {
@@ -2299,7 +2376,7 @@ mod tests {
         let crashed = std::thread::spawn(move || {
             run_watcher(
                 shared,
-                Box::new(PanicsOnWait),
+                Box::new(PanicsOnWait::default()),
                 Box::new(NoPeer),
                 Some(hold),
                 8_000,
@@ -2357,7 +2434,7 @@ mod tests {
         let (state, now) = state_over(vec![row6()]);
         now.store(13_000, Ordering::SeqCst);
         // As `start_watch_with` does before the thread starts.
-        state.shared.watching.store(true, Ordering::SeqCst);
+        state.shared.start_watching();
         let holds = HoldCount::default();
         let at_drop = Arc::new(Mutex::new(None));
         let child = FakeChild::alive(4242);
@@ -2430,7 +2507,7 @@ mod tests {
             at: 13_900,
             message: msg::PENDING_DIALOG.to_string(),
         }));
-        state.shared.watching.store(true, Ordering::SeqCst);
+        state.shared.start_watching();
         let holds = HoldCount::default();
         let at_drop = Arc::new(Mutex::new(None));
         let acceptor = BrokenDropWatch {
@@ -2443,7 +2520,7 @@ mod tests {
         let crashed = std::thread::spawn(move || {
             run_watcher(
                 shared,
-                Box::new(PanicsOnWait),
+                Box::new(PanicsOnWait::default()),
                 Box::new(acceptor),
                 Some(hold),
                 14_000,
@@ -2475,7 +2552,7 @@ mod tests {
         // A direct start (no hold, no progress) that panics: nothing is
         // written as request progress, the slot stays empty, the flag clears.
         let (state, _now) = state_over(vec![row6()]);
-        state.shared.watching.store(true, Ordering::SeqCst);
+        state.shared.start_watching();
         let at_drop = Arc::new(Mutex::new(None));
         let acceptor = BrokenDropWatch {
             shared: Arc::clone(&state.shared),
@@ -2486,7 +2563,7 @@ mod tests {
         let crashed = std::thread::spawn(move || {
             run_watcher(
                 shared,
-                Box::new(PanicsOnWait),
+                Box::new(PanicsOnWait::default()),
                 Box::new(acceptor),
                 None,
                 0,
@@ -3769,5 +3846,151 @@ mod tests {
         );
         assert!(state.helper_backend().is_none());
         peer_thread.join().expect("peer");
+    }
+
+    // ---- fix task, round-3 minors (p1b panel 3): D1 a watch releases only
+    // what it registered, D4 `cancel_prompt` never blocks on the child ------
+
+    /// `cancel_prompt()` until its SIGINT lands. The cancel skips a contended
+    /// child lock rather than block (D4); an acceptor that times out at once
+    /// keeps the watcher hot on that lock, so one call may land on nothing.
+    /// Exactly one SIGINT is sent: no call is made once one has landed.
+    fn cancel_until_signalled(state: &PrivilegeState, signals: &Mutex<Vec<i32>>) {
+        until("the cancel to land", || {
+            if signals.lock().unwrap().is_empty() {
+                state.cancel_prompt();
+            }
+            !signals.lock().unwrap().is_empty()
+        });
+    }
+
+    /// A child that outlives `kill` until the test lets it go: `try_wait`
+    /// reads `None` until `released`, then `Exited(0)`. `kill` only counts.
+    struct LingeringChild {
+        pid: u32,
+        released: Arc<AtomicBool>,
+        killed: Arc<AtomicUsize>,
+    }
+
+    impl Child for LingeringChild {
+        fn id(&self) -> u32 {
+            self.pid
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
+            Ok(self
+                .released
+                .load(Ordering::SeqCst)
+                .then_some(ChildExit::Exited(0)))
+        }
+        fn kill(&mut self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn interrupt(&mut self) {}
+        fn stderr_tail(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// An acceptor whose listener is broken: every `accept` is an I/O error.
+    struct BrokenListener;
+
+    impl Acceptor for BrokenListener {
+        fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+            Err(SessionError::Io("accept: EBADF".to_string()))
+        }
+    }
+
+    /// Panel 3 (D1): a watch releases only what it registered. Watch A ends
+    /// through the accept-errors arm into the bounded reap of a child that
+    /// refuses to die; inside that window a re-request starts watch B, whose
+    /// child becomes the prompt. When A's child finally goes and A's `Drop`
+    /// runs, B's prompt slot and the `watching` flag survive: a held Ctrl-C
+    /// still reaches B's child, and `lazy_start_helper` still sees a watcher.
+    #[test]
+    fn ended_watch_in_its_reap_does_not_release_the_next_watch() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(16_000, Ordering::SeqCst);
+        let holds = HoldCount::default();
+
+        // Watch A: after ACCEPT_ERRORS_MAX the request fails, the child is
+        // killed and the reap starts; the child ignores the kill.
+        let released = Arc::new(AtomicBool::new(false));
+        let a_killed = Arc::new(AtomicUsize::new(0));
+        let a_child = LingeringChild {
+            pid: 4242,
+            released: Arc::clone(&released),
+            killed: Arc::clone(&a_killed),
+        };
+        let shared = Arc::clone(&state.shared);
+        let hold = holds.hold();
+        let watch_a = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(a_child),
+                Box::new(BrokenListener),
+                Some(hold),
+                16_000,
+                true,
+            );
+        });
+        until("watch A to reach its reap", || {
+            a_killed.load(Ordering::SeqCst) == 1
+        });
+        assert_eq!(
+            state.report().request.map(|r| r.state),
+            Some(RequestState::Failed)
+        );
+        assert!(state.shared.prompt_child().is_none(), "A's prompt is over");
+        assert_eq!(holds.count(), 0, "A's hold is released");
+        assert!(state.shared.watching(), "A is still reaping");
+
+        // Watch B starts inside A's reap window; its child is the prompt.
+        let b_child = FakeChild::alive(4243);
+        let b_signals = Arc::clone(&b_child.signals);
+        let shared = Arc::clone(&state.shared);
+        let hold = holds.hold();
+        let watch_b = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(b_child),
+                Box::new(NoPeer),
+                Some(hold),
+                16_000,
+                true,
+            );
+        });
+        let prompt_pid = || state.shared.prompt_child().map(|child| lock(&child).id());
+        until("B's child to be the prompt", || prompt_pid() == Some(4243));
+
+        // A's child goes: A's reap returns and its `Drop` runs.
+        released.store(true, Ordering::SeqCst);
+        watch_a.join().expect("watch A");
+        assert_eq!(a_killed.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            prompt_pid(),
+            Some(4243),
+            "A's end left B's child registered as the prompt"
+        );
+        assert!(
+            state.shared.watching(),
+            "A's end left the watching flag to B"
+        );
+        assert_eq!(holds.count(), 1, "B's hold is up");
+
+        // And a held Ctrl-C still reaches B's child.
+        cancel_until_signalled(&state, &b_signals);
+        watch_b.join().expect("watch B");
+        assert_eq!(
+            *b_signals.lock().unwrap(),
+            vec![crate::privilege::linux::SIGINT]
+        );
+        assert_eq!(
+            state.report().request.map(|r| r.state),
+            Some(RequestState::Dismissed)
+        );
+        assert_eq!(holds.count(), 0);
+        assert!(state.shared.prompt_child().is_none());
+        assert!(!state.shared.watching(), "B's end cleared its own flag");
     }
 }

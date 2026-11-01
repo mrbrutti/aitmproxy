@@ -107,7 +107,7 @@ impl HelperCandidate {
     /// could have written (S2 of the p1b panel). The one spelling of the rule,
     /// for the `derive` row and the direct start alike.
     #[must_use]
-    pub fn trusted_file_caps(&self) -> bool {
+    pub(crate) fn trusted_file_caps(&self) -> bool {
         self.file_caps_net_raw && self.root_owned_chain
     }
 }

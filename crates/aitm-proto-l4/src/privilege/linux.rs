@@ -209,7 +209,8 @@ fn path_chain(path: &Path) -> Option<Vec<PathMeta>> {
 /// settable by the file's owner; ctime is the kernel's and moves on every
 /// content or metadata change, and a replaced file is a new inode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProbeKey {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct ProbeKey {
     /// `st_dev`.
     pub dev: u64,
     /// `st_ino`.
@@ -222,6 +223,7 @@ pub struct ProbeKey {
     pub ctime: (i64, i64),
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl ProbeKey {
     /// The key of a file as its metadata describes it.
     #[must_use]
@@ -241,10 +243,12 @@ impl ProbeKey {
 /// a subprocess and must not run on every re-probe of the report (1 s TTL).
 /// A file whose identity changed in any part is probed again.
 #[derive(Debug, Default)]
-pub struct ProbeCache {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct ProbeCache {
     seen: HashMap<PathBuf, (ProbeKey, bool)>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl ProbeCache {
     /// The cached answer for `path` under `key`, else `probe()`'s, remembered.
     pub fn file_caps(&mut self, path: &Path, key: ProbeKey, probe: impl FnOnce() -> bool) -> bool {
@@ -625,8 +629,9 @@ impl Child for StdChild {
     /// SIGINT to the child's pid through `nix`'s safe `kill` wrapper (Linux,
     /// the only platform a launcher is spawned on). A child that already
     /// ended, or one that refuses the signal (another user), is left to the
-    /// watcher, which reads its exit. Off Linux there is no launcher; the
-    /// portable fallback is `kill`.
+    /// watcher, which reads its exit. Off Linux there is no launcher and no
+    /// prompt to cancel: an explicit no-op, so nothing is ever signalled
+    /// (the trait's "SIGINT ... never SIGKILL"; panel 3, D7).
     fn interrupt(&mut self) {
         #[cfg(target_os = "linux")]
         {
@@ -641,7 +646,10 @@ impl Child for StdChild {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        self.kill();
+        tracing::debug!(
+            pid = self.child.id(),
+            "interrupt is a no-op off Linux: no launcher is spawned here"
+        );
     }
 
     fn stderr_tail(&mut self) -> String {
@@ -1642,6 +1650,34 @@ mod tests {
         assert_eq!(child.stderr_tail().trim(), "0");
     }
 
+    /// Puts the process environment back as it was when dropped, so an
+    /// assertion failure cannot leave the other tests under a changed one.
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl RestoreEnv {
+        fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in pairs {
+                std::env::set_var(key, value);
+            }
+            RestoreEnv(saved)
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Plan P1b.14 `pkexec_env_is_cleared_but_for_display` (panel, 2026-11-01;
     /// spec §5.5 "How the launcher is spawned"): the child's environment is
     /// exactly the subset of [`PASSED_ENV`] set in the core; `SHELL`, `LANG`
@@ -1650,12 +1686,21 @@ mod tests {
     /// its own under an empty environment (`PWD`, `SHLVL`, `_`, by shell), so
     /// the baseline is measured the same way under `env -i`, and what the
     /// spawner's child has beyond that baseline must be within `PASSED_ENV`.
+    ///
+    /// This is the one test in the binary that mutates the process
+    /// environment; it restores the four variables when it ends (panel 3,
+    /// D3). The child's output is read through the 4 KiB `stderr_tail`: a
+    /// tail at the bound has lost its head, so its first, partial line is
+    /// dropped before keys are taken. Failure messages print only well-formed
+    /// keys (`[A-Z_][A-Z0-9_]*`) and counts, never values.
     #[test]
     fn pkexec_env_is_cleared_but_for_display() {
-        std::env::set_var("SHELL", "/bin/zsh");
-        std::env::set_var("LANG", "en_US.UTF-8");
-        std::env::set_var("LC_ALL", "C");
-        std::env::set_var("DISPLAY", ":9");
+        let _restore = RestoreEnv::set(&[
+            ("SHELL", "/bin/zsh"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_ALL", "C"),
+            ("DISPLAY", ":9"),
+        ]);
         assert_eq!(
             std::env::var("LC_ALL").as_deref(),
             Ok("C"),
@@ -1663,9 +1708,26 @@ mod tests {
         );
 
         let keys_of = |env: &str| -> Vec<String> {
+            // At the bound the tail's first line is the cut remainder of a
+            // longer one (see `StderrTail`): not a key.
+            let skip = usize::from(env.len() >= STDERR_TAIL_BYTES);
             env.lines()
+                .skip(skip)
                 .filter(|line| !line.is_empty())
                 .map(|line| line.split('=').next().unwrap_or(line).to_string())
+                .collect()
+        };
+        let well_formed = |key: &str| -> bool {
+            let mut chars = key.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+                && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        };
+        let printable = |keys: &[String]| -> Vec<String> {
+            keys.iter()
+                .filter(|key| well_formed(key))
+                .cloned()
                 .collect()
         };
         let run = |argv: &[&str]| -> String {
@@ -1679,7 +1741,8 @@ mod tests {
         let shell_own = keys_of(&baseline);
         assert!(
             !shell_own.iter().any(|k| k == "DISPLAY" || k == "SHELL"),
-            "the baseline carries no display and no SHELL: {baseline:?}"
+            "the baseline carries no display and no SHELL: {:?}",
+            printable(&shell_own)
         );
 
         // The spawner's child, as pkexec would see it.
@@ -1688,15 +1751,19 @@ mod tests {
             .into_iter()
             .filter(|k| !shell_own.contains(k))
             .collect();
-        // Keys only in the messages: a leaking spawner must not have this
-        // test print the core's environment (proxy credentials live there).
+        // Well-formed keys and counts only in the messages: a leaking spawner
+        // must not have this test print the core's environment (proxy
+        // credentials live there).
         assert!(
             !inherited.is_empty() && inherited.iter().all(|k| PASSED_ENV.contains(&k.as_str())),
-            "only DISPLAY, WAYLAND_DISPLAY and XAUTHORITY may be inherited; got {inherited:?}"
+            "only DISPLAY, WAYLAND_DISPLAY and XAUTHORITY may be inherited; got {} keys: {:?}",
+            inherited.len(),
+            printable(&inherited)
         );
         assert!(
             env.lines().any(|line| line == "DISPLAY=:9"),
-            "DISPLAY is passed through verbatim; keys: {inherited:?}"
+            "DISPLAY is passed through verbatim; keys: {:?}",
+            printable(&inherited)
         );
         for absent in ["SHELL=", "LANG=", "LC_ALL=", "PATH=", "HOME="] {
             assert!(
@@ -1722,10 +1789,11 @@ mod tests {
 
     /// Tester (C4): `StdChild::interrupt` on a real child. On Linux (the only
     /// platform a launcher is spawned on) it is SIGINT, so the child ends
-    /// `Signaled(SIGINT)` and the §5.5 table reads `dismissed`; off Linux the
-    /// documented fallback is `kill`, so the child ends `Signaled(9)`. Either
-    /// way the call never waits, and a second `interrupt` on the ended child
-    /// is harmless.
+    /// `Signaled(SIGINT)` and the §5.5 table reads `dismissed`. Off Linux it
+    /// is a no-op (panel 3, D7: "SIGINT ... never SIGKILL", so no `kill`
+    /// fallback): the child keeps running and this test kills it itself.
+    /// Either way the call never waits, and a second `interrupt` on the ended
+    /// child is harmless.
     #[test]
     fn std_child_interrupt_ends_a_real_child() {
         let mut child = StdSpawner
@@ -1738,21 +1806,28 @@ mod tests {
             before.elapsed() < std::time::Duration::from_secs(5),
             "interrupt never waits"
         );
-        let exit = wait_fake_free(child.as_mut());
-        if cfg!(target_os = "linux") {
+        let exit = if cfg!(target_os = "linux") {
+            let exit = wait_fake_free(child.as_mut());
             assert_eq!(exit, ChildExit::Signaled(SIGINT), "SIGINT, never SIGKILL");
             assert_eq!(
                 pair(exit, "").0,
                 RequestState::Dismissed,
                 "a cancelled prompt is dismissed"
             );
+            exit
         } else {
+            // Give a signal, had one been sent, time to land.
+            std::thread::sleep(std::time::Duration::from_millis(200));
             assert_eq!(
-                exit,
-                ChildExit::Signaled(9),
-                "the off-Linux fallback is kill"
+                child.try_wait().expect("try_wait after interrupt"),
+                None,
+                "off Linux `interrupt` sends nothing: the child keeps running"
             );
-        }
+            child.kill();
+            let exit = wait_fake_free(child.as_mut());
+            assert_eq!(exit, ChildExit::Signaled(9), "the test's own kill");
+            exit
+        };
         child.interrupt();
         assert_eq!(child.try_wait().expect("try_wait after exit"), Some(exit));
     }

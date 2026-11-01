@@ -195,22 +195,26 @@ fn read_receipt() -> Option<Receipt> {
 /// The app bundle's main executable, relative to the bundle: the
 /// `CFBundleExecutable` of `apps/mac/Info.plist.in`. Read as a fixed path
 /// rather than from the plist, which would cost a `plutil` run per probe.
-pub const APP_EXECUTABLE_REL: &str = "Contents/MacOS/Aitmproxy";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const APP_EXECUTABLE_REL: &str = "Contents/MacOS/Aitmproxy";
 
 /// The code signature's resource list: the fallback stamp when the main
 /// executable is not where [`APP_EXECUTABLE_REL`] says (it is rewritten by
 /// every re-sign).
-pub const CODE_RESOURCES_REL: &str = "Contents/_CodeSignature/CodeResources";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const CODE_RESOURCES_REL: &str = "Contents/_CodeSignature/CodeResources";
 
 /// One file's mtime and size, as a bundle part is stamped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileStamp {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct FileStamp {
     /// Last modification.
     pub mtime: SystemTime,
     /// `st_size`.
     pub size: u64,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl FileStamp {
     /// The stamp of a file as its metadata describes it (`None` when the
     /// filesystem reports no mtime).
@@ -225,7 +229,8 @@ impl FileStamp {
 
 /// [`FileStamp`] of the file at `path`, `None` when it cannot be read.
 #[must_use]
-pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn file_stamp(path: &Path) -> Option<FileStamp> {
     std::fs::metadata(path)
         .ok()
         .and_then(|meta| FileStamp::of(&meta))
@@ -234,7 +239,8 @@ pub fn file_stamp(path: &Path) -> Option<FileStamp> {
 /// The executable part of a [`BundleStamp`]: the main executable's stamp
 /// when it exists, else the code signature's resource list, else nothing.
 #[must_use]
-pub fn executable_stamp(
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn executable_stamp(
     main_executable: Option<FileStamp>,
     code_resources: Option<FileStamp>,
 ) -> Option<FileStamp> {
@@ -245,34 +251,37 @@ pub fn executable_stamp(
 /// directory's identity and the parts a replaced or re-signed bundle changes.
 /// The directory's own mtime is not among them: swapping the executable or
 /// `Info.plist` in place leaves it alone, and a fresh copy with the same
-/// mtime is a different inode. The main executable is stamped by mtime
-/// **and** size, so an in-place overwrite is a new key.
+/// mtime is a different inode. `Info.plist` and the main executable are
+/// each stamped by mtime **and** size (panel 3, D9), so an in-place
+/// overwrite of either is a new key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BundleStamp {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct BundleStamp {
     /// `st_dev` of the bundle directory.
     dev: u64,
     /// `st_ino` of the bundle directory.
     ino: u64,
-    /// mtime of `Contents/Info.plist`, when it exists.
-    info_plist_mtime: Option<SystemTime>,
+    /// [`FileStamp`] of `Contents/Info.plist`, when it exists.
+    info_plist: Option<FileStamp>,
     /// [`executable_stamp`]: the main executable, else `CodeResources`.
     executable: Option<FileStamp>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl BundleStamp {
     /// The key for a bundle directory with identity `(dev, ino)`, its
-    /// `Info.plist` mtime and its executable stamp (see [`executable_stamp`]).
+    /// `Info.plist` stamp and its executable stamp (see [`executable_stamp`]).
     #[must_use]
     pub fn new(
         dev: u64,
         ino: u64,
-        info_plist_mtime: Option<SystemTime>,
+        info_plist: Option<FileStamp>,
         executable: Option<FileStamp>,
     ) -> Self {
         BundleStamp {
             dev,
             ino,
-            info_plist_mtime,
+            info_plist,
             executable,
         }
     }
@@ -308,7 +317,7 @@ fn app_facts(path: &Path) -> AppFacts {
     let stamp = BundleStamp::new(
         meta.dev(),
         meta.ino(),
-        file_stamp(&path.join("Contents/Info.plist")).map(|plist| plist.mtime),
+        file_stamp(&path.join("Contents/Info.plist")),
         executable_stamp(
             file_stamp(&path.join(APP_EXECUTABLE_REL)),
             file_stamp(&path.join(CODE_RESOURCES_REL)),
@@ -567,62 +576,71 @@ mod tests {
 
     /// S3, as amended by panel 2 (C7): the facts cache is keyed on the
     /// bundle's identity and contents, not the directory's own mtime:
-    /// `(dev, ino)` of the bundle, the mtime of `Contents/Info.plist`, and the
-    /// mtime **and size** of the main executable (`Contents/MacOS/Aitmproxy`),
-    /// falling back to `Contents/_CodeSignature/CodeResources` when there is
-    /// none. Any change of any part is a new key; an executable overwritten in
-    /// place (same directory, same inode) is seen through its own stamp.
+    /// `(dev, ino)` of the bundle, the mtime **and size** of
+    /// `Contents/Info.plist` (panel 3, D9) and of the main executable
+    /// (`Contents/MacOS/Aitmproxy`), falling back to
+    /// `Contents/_CodeSignature/CodeResources` when there is none. Any change
+    /// of any part is a new key; a part overwritten in place (same directory,
+    /// same inode) is seen through its own stamp.
     #[test]
     fn bundle_stamp_keys_on_identity_plist_and_executable() {
         use std::time::{Duration, UNIX_EPOCH};
         let t = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
-        let exe = |s: u64, size: u64| Some(FileStamp { mtime: t(s), size });
+        let stamp = |s: u64, size: u64| Some(FileStamp { mtime: t(s), size });
 
-        let base = BundleStamp::new(5, 100, Some(t(10)), exe(20, 4_096));
-        assert_eq!(base, BundleStamp::new(5, 100, Some(t(10)), exe(20, 4_096)));
+        let base = BundleStamp::new(5, 100, stamp(10, 1_234), stamp(20, 4_096));
+        assert_eq!(
+            base,
+            BundleStamp::new(5, 100, stamp(10, 1_234), stamp(20, 4_096))
+        );
         assert_ne!(
             base,
-            BundleStamp::new(6, 100, Some(t(10)), exe(20, 4_096)),
+            BundleStamp::new(6, 100, stamp(10, 1_234), stamp(20, 4_096)),
             "device"
         );
         assert_ne!(
             base,
-            BundleStamp::new(5, 101, Some(t(10)), exe(20, 4_096)),
+            BundleStamp::new(5, 101, stamp(10, 1_234), stamp(20, 4_096)),
             "inode"
         );
         assert_ne!(
             base,
-            BundleStamp::new(5, 100, Some(t(11)), exe(20, 4_096)),
+            BundleStamp::new(5, 100, stamp(11, 1_234), stamp(20, 4_096)),
             "Info.plist mtime"
         );
         assert_ne!(
             base,
-            BundleStamp::new(5, 100, Some(t(10)), exe(21, 4_096)),
+            BundleStamp::new(5, 100, stamp(10, 1_235), stamp(20, 4_096)),
+            "Info.plist size"
+        );
+        assert_ne!(
+            base,
+            BundleStamp::new(5, 100, stamp(10, 1_234), stamp(21, 4_096)),
             "executable mtime"
         );
         assert_ne!(
             base,
-            BundleStamp::new(5, 100, Some(t(10)), exe(20, 4_097)),
+            BundleStamp::new(5, 100, stamp(10, 1_234), stamp(20, 4_097)),
             "executable size"
         );
         assert_ne!(
             base,
-            BundleStamp::new(5, 100, None, exe(20, 4_096)),
+            BundleStamp::new(5, 100, None, stamp(20, 4_096)),
             "no plist at all is a different key from any plist"
         );
         assert_ne!(
             base,
-            BundleStamp::new(5, 100, Some(t(10)), None),
+            BundleStamp::new(5, 100, stamp(10, 1_234), None),
             "no executable at all is a different key from any executable"
         );
 
         // The executable stamp: the main executable when it exists, else the
         // code signature's resource list, else nothing.
         assert_eq!(
-            executable_stamp(exe(20, 4_096), exe(30, 512)),
-            exe(20, 4_096)
+            executable_stamp(stamp(20, 4_096), stamp(30, 512)),
+            stamp(20, 4_096)
         );
-        assert_eq!(executable_stamp(None, exe(30, 512)), exe(30, 512));
+        assert_eq!(executable_stamp(None, stamp(30, 512)), stamp(30, 512));
         assert_eq!(executable_stamp(None, None), None);
         assert_eq!(APP_EXECUTABLE_REL, "Contents/MacOS/Aitmproxy");
         assert_eq!(CODE_RESOURCES_REL, "Contents/_CodeSignature/CodeResources");
