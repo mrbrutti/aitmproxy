@@ -398,7 +398,13 @@ impl StreamHost {
         if Instant::now() >= self.job.deadline() {
             return Err(HostError::Deadline);
         }
-        if self.state.is_retired(&self.point.point.id) {
+        // Either this point, or the `(node, field path)` another seed's
+        // point on the same field was retired under (spec S6.2, F8).
+        if self.state.is_retired(&self.point.point.id)
+            || self
+                .state
+                .is_path_retired(&self.point.node_id, self.point.field_path())
+        {
             return Err(HostError::Retired);
         }
 
@@ -1439,6 +1445,25 @@ mod tests {
             .probe(&payload(b"PING\r\n"))
             .await
             .expect_err("a retired point sends nothing");
+
+        assert!(matches!(host_error(&error), HostError::Retired), "{error}");
+        assert_eq!(client.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retired_path_refuses() {
+        let job = Arc::new(TestJob::new());
+        let client = Arc::new(CountingClient::live());
+        let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
+        // Another seed's point, on the same node and the same field path,
+        // crashed the target. This point's own id was never retired (F8).
+        assert!(host.state.retire_path(&host.point.node_id, "inline.data"));
+        assert!(!host.state.is_retired(&host.point.point.id));
+
+        let error = host
+            .probe(&payload(b"PING\r\n"))
+            .await
+            .expect_err("a point on a retired field path sends nothing");
 
         assert!(matches!(host_error(&error), HostError::Retired), "{error}");
         assert_eq!(client.count(), 0);

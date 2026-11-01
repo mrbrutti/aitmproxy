@@ -313,6 +313,19 @@ pub struct DiscoveredPoint {
     pub selection: String,
 }
 
+impl DiscoveredPoint {
+    /// The field path this point names: with [`DiscoveredPoint::node_id`],
+    /// the key the lane retires a crash under (spec S6.2, F8).
+    ///
+    /// Discovery always sets a path on an L4 point; one without keys on the
+    /// empty path, which still groups it with its own node's other pathless
+    /// points and no one else's.
+    #[must_use]
+    pub fn field_path(&self) -> &str {
+        self.point.path.as_deref().unwrap_or_default()
+    }
+}
+
 impl fmt::Debug for DiscoveredPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiscoveredPoint")
@@ -368,6 +381,16 @@ pub struct JobState {
     pub parser_faults: AtomicU32,
     /// Point ids retired after a crash; a probe on one of these is refused.
     pub retired: Mutex<HashSet<String>>,
+    /// `(node id, field path)` pairs retired after a crash, the L4 half of
+    /// the umbrella's dedupe key (D6); a probe on any point sitting on one of
+    /// these is refused (spec S6.2, F8).
+    ///
+    /// One endpoint yields a point per `(seed, field path)` pair, so a field
+    /// that crashes the target crashes it once per seed. The engine dedupes
+    /// those into a single issue, and each one costs a recovery window, two
+    /// reply timeouts and three replays, so the lane retires the path itself
+    /// and lets every later point on it read the first one's result.
+    pub retired_paths: Mutex<HashSet<(String, String)>>,
     /// Silent cases in a row, against the profile's `consecutive_timeouts`.
     pub consecutive_timeouts: AtomicU32,
     /// How often the guard's injection-rate cap made an exchange wait and
@@ -440,6 +463,7 @@ impl JobState {
             crashes: AtomicU32::new(0),
             parser_faults: AtomicU32::new(0),
             retired: Mutex::new(HashSet::new()),
+            retired_paths: Mutex::new(HashSet::new()),
             consecutive_timeouts: AtomicU32::new(0),
             rate_waits: AtomicU32::new(0),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -464,7 +488,7 @@ impl JobState {
             cases: u64::from(self.cases_sent.load(Ordering::Relaxed)),
             crashes: u64::from(self.crashes.load(Ordering::Relaxed)),
             liveness_failures: u64::from(self.liveness_failures.load(Ordering::Relaxed)),
-            retired_elements: lock(&self.retired).len() as u64,
+            retired_elements: lock(&self.retired_paths).len() as u64,
         }
     }
 
@@ -515,6 +539,29 @@ impl JobState {
         lock(&self.retired).contains(point_id)
     }
 
+    /// Retire a field path on a node, covering every point on it whatever
+    /// seed it came from (spec S6.2, F8). `true` the first time, `false`
+    /// afterwards.
+    ///
+    /// This is what [`JobState::counters`] reports as `retired_elements`:
+    /// one element per crash finding, matching the umbrella's L4 dedupe key
+    /// `(class, ip, port, proto, grammar, field_path, mutation_class)`, under
+    /// which the per-seed repeats of one crash are a single issue.
+    pub fn retire_path(&self, node_id: &str, path: &str) -> bool {
+        lock(&self.retired_paths).insert((node_id.to_string(), path.to_string()))
+    }
+
+    /// Whether this node's field path was retired.
+    #[must_use]
+    pub fn is_path_retired(&self, node_id: &str, path: &str) -> bool {
+        // `HashSet<(String, String)>` cannot be probed with a `(&str, &str)`
+        // without allocating; the set holds at most one entry per crash
+        // finding, so a scan is cheaper than the two allocations.
+        lock(&self.retired_paths)
+            .iter()
+            .any(|(node, field)| node == node_id && field == path)
+    }
+
     /// Take the job's current deadline and cancellation, for eviction.
     fn refresh_from(&self, job: &dyn JobCtx) {
         *lock(&self.deadline) = job.deadline();
@@ -553,6 +600,7 @@ impl fmt::Debug for JobState {
             .field("crashes", &self.crashes.load(Ordering::Relaxed))
             .field("parser_faults", &self.parser_faults.load(Ordering::Relaxed))
             .field("retired", &lock(&self.retired).len())
+            .field("retired_paths", &lock(&self.retired_paths).len())
             .field(
                 "consecutive_timeouts",
                 &self.consecutive_timeouts.load(Ordering::Relaxed),
@@ -905,7 +953,9 @@ mod tests {
         let state = JobState::new("scan-01", "aitm01", 65_536);
         state.cases_sent.fetch_add(3, Ordering::Relaxed);
         state.crashes.fetch_add(1, Ordering::Relaxed);
+        // One crash finding: the point and the field path it sat on.
         assert!(state.retire("p"));
+        assert!(state.retire_path("n", "length"));
         assert_eq!(
             state.counters(),
             L4Counters {
@@ -942,13 +992,41 @@ mod tests {
     }
 
     #[test]
+    fn retire_path_covers_every_point_on_it() {
+        let state = JobState::new("scan-01", "aitm01", 65_536);
+        assert!(!state.is_path_retired("node-a", "length"));
+        assert!(state.retire_path("node-a", "length"));
+        assert!(!state.retire_path("node-a", "length"), "idempotent");
+        assert!(state.is_path_retired("node-a", "length"));
+
+        // Every point on that node and path is covered, whichever seed it
+        // came from: the points themselves were never named.
+        assert!(!state.is_retired("l4s-point-length-hex:0"));
+        assert!(!state.is_retired("l4s-point-length-hex:1"));
+
+        // The same path on another node, and another path on the same node,
+        // are untouched: the key is the pair.
+        assert!(!state.is_path_retired("node-b", "length"));
+        assert!(!state.is_path_retired("node-a", "body"));
+
+        // `retired_elements` counts retired paths, one per crash finding,
+        // however many points sat on each.
+        assert!(state.retire("l4s-point-length-hex:0"));
+        assert!(state.retire("l4s-point-length-hex:1"));
+        assert_eq!(state.counters().retired_elements, 1);
+        assert!(state.retire_path("node-a", "body"));
+        assert_eq!(state.counters().retired_elements, 2);
+    }
+
+    #[test]
     fn retire_is_idempotent() {
         let state = JobState::new("scan-01", "aitm01", 65_536);
         assert!(!state.is_retired("p"));
         assert!(state.retire("p"));
         assert!(!state.retire("p"));
         assert!(state.is_retired("p"));
-        assert_eq!(state.counters().retired_elements, 1);
+        // A point is not an element: `retired_elements` counts paths (F8).
+        assert_eq!(state.counters().retired_elements, 0);
     }
 
     #[test]

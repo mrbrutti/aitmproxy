@@ -217,6 +217,9 @@ pub struct Campaign {
     pub skipped_too_large: u32,
     /// How often the guard's injection rate made the host wait.
     pub rate_waits: u32,
+    /// How often a refused connect made the campaign wait the target back
+    /// before sending a case (spec S6.2, F9).
+    pub connect_waits: u32,
     /// Latency evaluations the F4 guard skipped: cases that leave the frame
     /// incomplete, whose delay is the peer's framing timeout.
     pub latency_skipped_framing: u32,
@@ -242,6 +245,7 @@ impl fmt::Debug for Campaign {
             .field("skipped_denylisted", &self.skipped_denylisted)
             .field("skipped_too_large", &self.skipped_too_large)
             .field("rate_waits", &self.rate_waits)
+            .field("connect_waits", &self.connect_waits)
             .field("latency_skipped_framing", &self.latency_skipped_framing)
             .field("crash", &self.crash)
             .field("parser_fault", &self.parser_fault)
@@ -263,6 +267,7 @@ impl Campaign {
             skipped_denylisted: 0,
             skipped_too_large: 0,
             rate_waits: 0,
+            connect_waits: 0,
             latency_skipped_framing: 0,
             crash: None,
             parser_fault: None,
@@ -349,6 +354,19 @@ pub fn donors_for(job: &JobState, dp: &DiscoveredPoint) -> Vec<Vec<u8>> {
     donors
 }
 
+/// The seed of one point's schedule: the host's marker and the point's id,
+/// so a run is reproducible and two points never share a schedule.
+fn rng_seed_for(host: &dyn ProbeHost, point: &InsertionPoint) -> u64 {
+    fnv1a64(
+        format!(
+            "{marker}|{id}",
+            marker = host.marker(),
+            id = point.id.as_str()
+        )
+        .as_bytes(),
+    )
+}
+
 /// Build and run one campaign.
 async fn run(
     point: &InsertionPoint,
@@ -358,6 +376,23 @@ async fn run(
     let Some(dp) = lock(&job.points).get(&point.id).cloned() else {
         return Err(error_verdict(not_this_lanes_point(&point.id, &job.job_id)));
     };
+    // A crash on this field, from any seed, already retired the path (spec
+    // S6.2, F8). Every case this point could send would re-crash the same
+    // field for an issue the engine dedupes into the first one, so the
+    // campaign is empty and the three checks read it without sending: no
+    // recovery window, no replays, no second verdict of the same crash.
+    if job.is_path_retired(&dp.node_id, dp.field_path()) {
+        let mut campaign = Campaign::new(point.id.clone(), rng_seed_for(host, point), 0);
+        campaign.stopped = StopReason::Retired;
+        tracing::debug!(
+            point = %point.id,
+            node = %dp.node_id,
+            stop = "retired",
+            "l4 stream campaign skipped: the field path is retired"
+        );
+        return Ok(campaign);
+    }
+
     let grammar = grammar_for(job, &dp);
     let Some(tree) = grammar.parse(&dp.seed_bytes) else {
         return Err(error_verdict(seed_does_not_parse(
@@ -368,14 +403,7 @@ async fn run(
     };
 
     let path = FieldPath::new(point.path.as_deref().unwrap_or_default());
-    let rng_seed = fnv1a64(
-        format!(
-            "{marker}|{id}",
-            marker = host.marker(),
-            id = point.id.as_str()
-        )
-        .as_bytes(),
-    );
+    let rng_seed = rng_seed_for(host, point);
     let profile = host.profile();
     let planned = cases_planned(
         profile.l4.cases,
@@ -452,6 +480,9 @@ enum Step {
     SkipDenylisted,
     /// Count the skip and go on to the next case.
     SkipTooLarge,
+    /// The transport could not reach the peer, so nothing went out: wait the
+    /// target back and send the same case once more (spec S6.2, F9).
+    ConnectFailed,
     /// Stop the campaign.
     Stop(StopReason),
 }
@@ -479,12 +510,26 @@ fn step_for(error: &anyhow::Error) -> Step {
         HostError::Retired => Step::Stop(StopReason::Retired),
         HostError::Guard(message) => Step::Stop(StopReason::Guard(message.clone())),
         HostError::DryRun => Step::Stop(StopReason::DryRun),
-        // The transport could not reach the peer at all: from the campaign's
-        // side that is the target being down.
-        HostError::Connect(_) => Step::Stop(StopReason::TargetDown),
+        // The transport could not reach the peer at all. Nothing went out,
+        // so this is a pre-existing down state and not a reading about the
+        // case: the caller waits the target back and retries it once, and
+        // only a second refusal is the target being down (F9).
+        HostError::Connect(_) => Step::ConnectFailed,
         HostError::NotBytes | HostError::Unsupported(_) => Step::Stop(StopReason::Guard(format!(
             "l4_stream: the host refused the probe: {host_error}"
         ))),
+    }
+}
+
+/// The stop a loop decision means where there is no next case to go on to:
+/// the opening baseline and its retry (F9).
+fn stop_of(step: Step) -> StopReason {
+    match step {
+        Step::Stop(reason) => reason,
+        Step::ConnectFailed => StopReason::TargetDown,
+        // The baseline is the grammar's own fixed exchange: neither filter
+        // applies to it, and neither ends the campaign.
+        Step::SkipDenylisted | Step::SkipTooLarge => StopReason::Completed,
     }
 }
 
@@ -528,6 +573,8 @@ impl Runner<'_> {
             Ok(response) => Ok(!failed_liveness(&response)),
             Err(e) => match step_for(&e) {
                 Step::Stop(reason) => Err(reason),
+                // A probe that cannot reach the peer is the reading itself.
+                Step::ConnectFailed => Ok(false),
                 // A liveness probe is never denylisted or too large.
                 Step::SkipDenylisted | Step::SkipTooLarge => Ok(false),
             },
@@ -584,6 +631,9 @@ impl Runner<'_> {
                     // The identical case passed the same filters already.
                     return (confirmed, None);
                 }
+                // A replay runs behind its own recovery wait, so a peer that
+                // still cannot be reached is the target being down.
+                Err(Step::ConnectFailed) => return (confirmed, Some(StopReason::TargetDown)),
                 Err(Step::Stop(reason)) => return (confirmed, Some(reason)),
             }
         }
@@ -614,17 +664,67 @@ impl Runner<'_> {
         }
     }
 
+    /// One opening baseline exchange.
+    async fn baseline_once(&mut self) -> Result<(), Step> {
+        match self.host.baseline().await {
+            Ok(response) => {
+                self.alive = !failed_liveness(&response);
+                Ok(())
+            }
+            Err(e) => Err(step_for(&e)),
+        }
+    }
+
+    /// Wait the target back after a refused connect, counting the wait
+    /// (spec S6.2, F9).
+    ///
+    /// `true` when the caller may try the same exchange once more; `false`
+    /// when the campaign must stop, with the reason already recorded.
+    async fn wait_after_refused_connect(&mut self, campaign: &mut Campaign) -> bool {
+        campaign.connect_waits += 1;
+        self.alive = false;
+        match self.wait_recovery().await {
+            Ok(true) => true,
+            Ok(false) => {
+                campaign.stopped = StopReason::TargetDown;
+                false
+            }
+            Err(reason) => {
+                campaign.stopped = reason;
+                false
+            }
+        }
+    }
+
+    /// The opening baseline, behind one recovery wait when the connect
+    /// itself was refused (F9). `true` when the campaign may go on.
+    async fn baseline_with_retry(&mut self, campaign: &mut Campaign) -> bool {
+        let Err(step) = self.baseline_once().await else {
+            return true;
+        };
+        if !matches!(step, Step::ConnectFailed) {
+            campaign.stopped = stop_of(step);
+            return false;
+        }
+        // The campaign may have started inside another point's crash window:
+        // a peer that cannot be reached before anything was sent is a
+        // pre-existing down state, not a reading of this point.
+        if !self.wait_after_refused_connect(campaign).await {
+            return false;
+        }
+        match self.baseline_once().await {
+            Ok(()) => true,
+            Err(step) => {
+                campaign.stopped = stop_of(step);
+                false
+            }
+        }
+    }
+
     /// The whole case loop.
     async fn drive(&mut self, schedule: Schedule, campaign: &mut Campaign) {
-        match self.host.baseline().await {
-            Ok(response) => self.alive = !failed_liveness(&response),
-            Err(e) => {
-                campaign.stopped = match step_for(&e) {
-                    Step::Stop(reason) => reason,
-                    Step::SkipDenylisted | Step::SkipTooLarge => StopReason::Completed,
-                };
-                return;
-            }
+        if !self.baseline_with_retry(campaign).await {
+            return;
         }
 
         for case in schedule {
@@ -646,6 +746,35 @@ impl Runner<'_> {
                 Err(Step::SkipTooLarge) => {
                     campaign.skipped_too_large += 1;
                     continue;
+                }
+                // Nothing went out, so this is not a reading of the case:
+                // wait the target back and send the same case once more
+                // (F9). The refused attempt is not a sent case.
+                Err(Step::ConnectFailed) => {
+                    if !self.wait_after_refused_connect(campaign).await {
+                        return;
+                    }
+                    match self.probe(&case.bytes).await {
+                        Ok(response) => response,
+                        Err(Step::SkipDenylisted) => {
+                            campaign.skipped_denylisted += 1;
+                            continue;
+                        }
+                        Err(Step::SkipTooLarge) => {
+                            campaign.skipped_too_large += 1;
+                            continue;
+                        }
+                        // It answered the recovery poll and still refuses
+                        // the case's connection: the target is down.
+                        Err(Step::ConnectFailed) => {
+                            campaign.stopped = StopReason::TargetDown;
+                            return;
+                        }
+                        Err(Step::Stop(reason)) => {
+                            campaign.stopped = reason;
+                            return;
+                        }
+                    }
                 }
                 Err(Step::Stop(reason)) => {
                     campaign.stopped = reason;
@@ -742,7 +871,13 @@ impl Runner<'_> {
         true
     }
 
-    /// Record a crash and retire the point (spec S6.2 step 5).
+    /// Record a crash, and retire both the point and the field path it sits
+    /// on (spec S6.2 step 5, F8).
+    ///
+    /// The path is retired for the same reason the engine dedupes on it: one
+    /// endpoint yields a point per `(seed, field path)` pair, so a field that
+    /// crashes the target crashes it once per seed, for one issue and a
+    /// recovery window plus three replays each time.
     fn record_crash(
         &self,
         case: &Case,
@@ -765,6 +900,7 @@ impl Runner<'_> {
         });
         self.job.crashes.fetch_add(1, Ordering::SeqCst);
         self.job.retire(&campaign.point_id);
+        self.job.retire_path(&self.dp.node_id, self.dp.field_path());
     }
 
     /// The parser-fault path (spec S6.2, amendment A7). `true` when the
@@ -845,6 +981,14 @@ impl Runner<'_> {
         let repeat = match self.probe(&case.bytes).await {
             Ok(repeat) => repeat,
             Err(Step::SkipDenylisted | Step::SkipTooLarge) => return false,
+            // The confirming repeat follows a case the target answered, so a
+            // peer that cannot now be reached has gone away: today's meaning,
+            // unchanged by F9, which only covers a connect refused before a
+            // case went out.
+            Err(Step::ConnectFailed) => {
+                campaign.stopped = StopReason::TargetDown;
+                return true;
+            }
             Err(Step::Stop(reason)) => {
                 campaign.stopped = reason;
                 return true;
@@ -1205,7 +1349,8 @@ fn detail_base(campaign: &Campaign, job: &JobState, dp: Option<&DiscoveredPoint>
         "l4_stream {grammar} {endpoint} point={path} cases={sent}/{planned} \
          skipped_denylisted={denylisted} skipped_too_large={too_large} \
          liveness_probes={probes} liveness_failures={failures} rate_waits={waits} \
-         latency_skipped_framing={skipped_framing} stop={stop} selection={selection}",
+         connect_waits={connect_waits} latency_skipped_framing={skipped_framing} stop={stop} \
+         selection={selection}",
         sent = campaign.cases_sent,
         planned = campaign.cases_planned,
         denylisted = campaign.skipped_denylisted,
@@ -1213,6 +1358,7 @@ fn detail_base(campaign: &Campaign, job: &JobState, dp: Option<&DiscoveredPoint>
         probes = job.liveness_probes.load(Ordering::SeqCst),
         failures = job.liveness_failures.load(Ordering::SeqCst),
         waits = campaign.rate_waits,
+        connect_waits = campaign.connect_waits,
         skipped_framing = campaign.latency_skipped_framing,
         stop = campaign.stopped.token(),
     );
@@ -1688,6 +1834,17 @@ mod tests {
         }
     }
 
+    /// The same point as [`discovered`], from another seed: the shape
+    /// discovery produces when one endpoint has several seeds, which gives
+    /// every field path one point per seed (F8).
+    fn discovered_from(path: &str, seed_id: &str, seed_bytes: Vec<u8>) -> DiscoveredPoint {
+        let mut dp = discovered(path);
+        dp.point.id = format!("l4s-point-{path}-{seed_id}");
+        dp.seed_id = seed_id.to_string();
+        dp.seed_bytes = seed_bytes;
+        dp
+    }
+
     /// A lane state holding one job (marker `m1`) with one point at `path`
     /// and the inferred TLV grammar for its node.
     fn lane_state_with(job: &NullJob, path: &str) -> (Arc<LaneState>, DiscoveredPoint) {
@@ -1700,6 +1857,28 @@ mod tests {
         lock(&job_state.grammars).insert(point.node_id.clone(), grammar);
         job_state.points_total.store(1, Ordering::SeqCst);
         (state, point)
+    }
+
+    /// A lane state holding one job (marker `m1`) with two points at the same
+    /// `path` on the same node, one per seed, and the inferred TLV grammar.
+    fn lane_state_with_two_seeds(
+        job: &NullJob,
+        path: &str,
+    ) -> (Arc<LaneState>, DiscoveredPoint, DiscoveredPoint) {
+        let state = Arc::new(LaneState::new());
+        let job_state = state.job_for(job);
+        let first = discovered_from(path, "hex:0", vec![0x00, 0x03, b'a', b'b', b'c']);
+        let second = discovered_from(path, "hex:1", vec![0x00, 0x01, 0xff]);
+        let (grammar, _descriptor) = tlv::from_seeds_on(&seeds(), Transport::Tcp)
+            .expect("the two seeds carry a length relation");
+        {
+            let mut points = lock(&job_state.points);
+            points.insert(first.point.id.clone(), first.clone());
+            points.insert(second.point.id.clone(), second.clone());
+        }
+        lock(&job_state.grammars).insert(first.node_id.clone(), grammar);
+        job_state.points_total.store(2, Ordering::SeqCst);
+        (state, first, second)
     }
 
     #[tokio::test]
@@ -1742,8 +1921,8 @@ mod tests {
             verdict.detail,
             "l4_stream tlv 127.0.0.1:9000/tcp point=payload cases=20/20 skipped_denylisted=0 \
              skipped_too_large=0 liveness_probes=0 liveness_failures=0 rate_waits=0 \
-             latency_skipped_framing=0 stop=completed selection=inferred(u16 be at 0, counts \
-             body) clean"
+             connect_waits=0 latency_skipped_framing=0 stop=completed \
+             selection=inferred(u16 be at 0, counts body) clean"
         );
         assert_eq!(
             host.calls().len(),
@@ -1807,6 +1986,198 @@ mod tests {
             host.calls()[5],
             Call::Liveness,
             "the recovery poll runs before the first replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_retires_the_field_path_for_every_seed() {
+        let job = NullJob::new("m1", 20);
+        let (state, first, second) = lane_state_with_two_seeds(&job, "length");
+        let job_state = state.job_by_marker("m1").expect("the job was recorded");
+        let host =
+            FakeHost::new("m1", job.profile.clone(), Some(Arc::clone(&job_state))).script(vec![
+                clean(10),
+                reading(L4Oracle::LivenessFailed),
+                alive(),
+                reading(L4Oracle::LivenessFailed),
+                alive(),
+                reading(L4Oracle::LivenessFailed),
+                alive(),
+                reading(L4Oracle::LivenessFailed),
+            ]);
+
+        // The first seed's point crashes the target and is confirmed 3/3.
+        let crash = checks(Arc::clone(&state))[0].run(&first.point, &host).await;
+        assert_eq!(crash.outcome, Outcome::Vulnerable, "{}", crash.detail);
+        let evidence = crash.evidence.l4.as_ref().expect("l4 evidence");
+        assert_eq!(evidence.reproduced, (3, 3));
+        assert!(job_state.is_retired(&first.point.id));
+        assert!(job_state.is_path_retired(&first.node_id, "length"));
+
+        // The second seed's point sits on the same node and the same field
+        // path. Its own id was never retired, but every case it could send
+        // would crash the same field again, for one more issue the engine
+        // dedupes away and ~40 s of recovery window and replays.
+        assert!(!job_state.is_retired(&second.point.id));
+        let calls_before = host.calls().len();
+        let mut verdicts = Vec::new();
+        for check in &checks(Arc::clone(&state)) {
+            verdicts.push(check.run(&second.point, &host).await);
+        }
+
+        assert_eq!(
+            host.calls().len(),
+            calls_before,
+            "the three checks of a point on a retired path send nothing"
+        );
+        assert_eq!(
+            verdicts.iter().map(|v| v.outcome).collect::<Vec<_>>(),
+            vec![
+                Outcome::Inconclusive,
+                Outcome::Inconclusive,
+                Outcome::Inconclusive
+            ],
+        );
+        for verdict in &verdicts {
+            assert_ne!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+            assert!(
+                verdict.detail.contains("stop=retired"),
+                "the detail names the retirement: {detail}",
+                detail = verdict.detail
+            );
+            assert!(
+                verdict.detail.contains("cases=0/0"),
+                "no case was planned or sent: {detail}",
+                detail = verdict.detail
+            );
+            assert!(verdict.evidence.l4.is_none());
+        }
+
+        // One crash, one retired element: the per-seed repeats of one field
+        // are a single issue under the umbrella's L4 dedupe key.
+        assert_eq!(job_state.counters().crashes, 1);
+        assert_eq!(job_state.counters().retired_elements, 1);
+    }
+
+    /// The transport could not reach the peer at all, before any case went
+    /// out.
+    fn refused_connect() -> Result<ProbeResponse, HostError> {
+        Err(HostError::Connect("connection refused".to_string()))
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_waits_for_recovery_and_retries_the_same_case() {
+        let job = NullJob::new("m1", 3);
+        let (state, point) = lane_state_with(&job, "length");
+        let job_state = state.job_by_marker("m1").expect("the job was recorded");
+        let host =
+            FakeHost::new("m1", job.profile.clone(), Some(Arc::clone(&job_state))).script(vec![
+                clean(10),         // the baseline
+                refused_connect(), // case 0: nothing was sent
+                alive(),           // the recovery poll: the target is back
+                clean(10),         // case 0 again
+                clean(10),         // case 1
+                clean(10),         // case 2
+            ]);
+
+        let verdict = checks(Arc::clone(&state))[0].run(&point.point, &host).await;
+
+        // A connect refused before a case went out says nothing about that
+        // case: the campaign waits the target back and sends it.
+        assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+        assert!(
+            verdict.detail.contains("cases=3/3"),
+            "every planned case was sent: {detail}",
+            detail = verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("connect_waits=1"),
+            "the wait is counted: {detail}",
+            detail = verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("stop=completed"),
+            "{detail}",
+            detail = verdict.detail
+        );
+        assert!(
+            !verdict.detail.contains("target_down"),
+            "a target that came back is not down: {detail}",
+            detail = verdict.detail
+        );
+
+        // The refused attempt sent nothing and is not counted as a case; the
+        // retry is the identical case, after one recovery poll.
+        let cases = host.case_calls();
+        assert_eq!(cases.len(), 4, "one refused attempt, then three cases");
+        assert_eq!(cases[0], cases[1], "the retry is the same case");
+        assert_eq!(
+            host.calls()[2],
+            Call::Liveness,
+            "the recovery poll runs before the retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_baseline_connect_refusal_also_waits_for_recovery() {
+        let job = NullJob::new("m1", 2);
+        let (state, point) = lane_state_with(&job, "length");
+        let job_state = state.job_by_marker("m1").expect("the job was recorded");
+        let host =
+            FakeHost::new("m1", job.profile.clone(), Some(Arc::clone(&job_state))).script(vec![
+                refused_connect(), // the baseline
+                alive(),           // the recovery poll
+                clean(10),         // the baseline again
+                clean(10),         // case 0
+                clean(10),         // case 1
+            ]);
+
+        let verdict = checks(Arc::clone(&state))[0].run(&point.point, &host).await;
+
+        assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+        assert!(
+            verdict.detail.contains("cases=2/2"),
+            "{detail}",
+            detail = verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("connect_waits=1"),
+            "{detail}",
+            detail = verdict.detail
+        );
+        assert_eq!(host.calls()[1], Call::Liveness);
+    }
+
+    #[tokio::test]
+    async fn a_connect_refused_again_after_recovery_is_target_down() {
+        let job = NullJob::new("m1", 3);
+        let (state, point) = lane_state_with(&job, "length");
+        let job_state = state.job_by_marker("m1").expect("the job was recorded");
+        let host =
+            FakeHost::new("m1", job.profile.clone(), Some(Arc::clone(&job_state))).script(vec![
+                clean(10),         // the baseline
+                refused_connect(), // case 0: nothing was sent
+                alive(),           // the recovery poll says it is back
+                refused_connect(), // but the retry cannot reach it either
+            ]);
+
+        let verdict = checks(Arc::clone(&state))[0].run(&point.point, &host).await;
+
+        assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+        assert!(
+            verdict.detail.contains("stop=target_down"),
+            "{detail}",
+            detail = verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("cases=0/3"),
+            "no case ever went out: {detail}",
+            detail = verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("connect_waits=1"),
+            "{detail}",
+            detail = verdict.detail
         );
     }
 
