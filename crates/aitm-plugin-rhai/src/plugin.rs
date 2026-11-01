@@ -441,7 +441,17 @@ impl LoadedScript {
             return Verdict::Continue;
         }
 
-        let state = Arc::new(Mutex::new(FlowState::snapshot(ctx.flow(), ev, max_body)));
+        // A WebSocket flow's script-visible `request` is its upgrade handshake,
+        // which the `WsFlow` only references by id; resolve it through the store
+        // (the WebSocket module stores it before the `WsFlow` exists). Done after
+        // the `defines` check above, so a script without a WS hook pays nothing.
+        let mut state = FlowState::snapshot(ctx.flow(), ev, max_body);
+        if let aitm_core::Flow::WebSocket(w) = ctx.flow() {
+            if let Some(handshake) = self.services.store.get(w.handshake) {
+                state = state.with_handshake(&handshake, max_body);
+            }
+        }
+        let state = Arc::new(Mutex::new(state));
         let flow_id = lock(&state).id;
         let args = hook_args(ev, &state);
 
