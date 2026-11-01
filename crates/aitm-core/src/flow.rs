@@ -233,6 +233,130 @@ pub struct ConnInfo {
     pub established: SystemTime,
 }
 
+/// How a `CONNECT` (or raw TLS) connection was handled: the outcome of one
+/// tunnel row (spec D5). Stored in [`FlowMeta::tunnel`]; `None` there means the
+/// flow is not a tunnel row at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelMode {
+    /// TLS terminated with the proxy's leaf; the inner requests are their own rows.
+    Decrypted,
+    /// Relayed byte for byte to the origin; the client saw the origin's own
+    /// certificate. [`TunnelInfo::reason`] is `OutOfScope` or `Pinned`.
+    Passthrough,
+    /// The tunnel never became established. [`TunnelInfo::reason`] is one of the
+    /// six failure codes.
+    Failed,
+}
+
+impl TunnelMode {
+    /// The wire code every surface emits as `tunnel` (spec D7).
+    pub fn label(&self) -> &'static str {
+        match self {
+            TunnelMode::Decrypted => "decrypted",
+            TunnelMode::Passthrough => "passthrough",
+            TunnelMode::Failed => "failed",
+        }
+    }
+}
+
+/// Why a tunnel was passed through or failed (spec D5). `OutOfScope` and `Pinned`
+/// accompany [`TunnelMode::Passthrough`]; the rest accompany [`TunnelMode::Failed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelReason {
+    /// The authority is not in Scope, so the proxy did not decrypt it.
+    OutOfScope,
+    /// The host is on the `tls.passthrough` list; pins win over Scope.
+    Pinned,
+    /// The client-facing handshake ended with a certificate-family TLS alert: the
+    /// client refused the proxy's CA (Safari, `curl` without `--cacert`).
+    ClientRejectedCertificate,
+    /// EOF, reset or broken pipe from the client before the tunnel was established.
+    ClientClosed,
+    /// Any other client-side TLS alert or protocol error.
+    ClientTlsError,
+    /// DNS, refused, timed out or any I/O failure dialling the origin.
+    UpstreamUnreachable,
+    /// The origin's TLS handshake failed or timed out.
+    UpstreamTlsFailed,
+    /// Anything else: a malformed `CONNECT` head, an h2-to-h1 mirror refusal, TLS
+    /// without an SNI the proxy could decrypt.
+    ProtocolError,
+}
+
+impl TunnelReason {
+    /// The wire code every surface emits as `tunnel_reason` (spec D7).
+    pub fn label(&self) -> &'static str {
+        match self {
+            TunnelReason::OutOfScope => "out_of_scope",
+            TunnelReason::Pinned => "pinned",
+            TunnelReason::ClientRejectedCertificate => "client_rejected_certificate",
+            TunnelReason::ClientClosed => "client_closed",
+            TunnelReason::ClientTlsError => "client_tls_error",
+            TunnelReason::UpstreamUnreachable => "upstream_unreachable",
+            TunnelReason::UpstreamTlsFailed => "upstream_tls_failed",
+            TunnelReason::ProtocolError => "protocol_error",
+        }
+    }
+}
+
+/// The tunnel fields of a `CONNECT` row (spec D5): the outcome, the reason when
+/// there is one, and the byte counts a passthrough tunnel reports when it closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelInfo {
+    pub mode: TunnelMode,
+    /// `None` for a decrypted tunnel; set for passthrough and failed ones.
+    pub reason: Option<TunnelReason>,
+    /// Client-to-origin bytes relayed; set when a passthrough tunnel closes.
+    pub bytes_up: Option<u64>,
+    /// Origin-to-client bytes relayed; set when a passthrough tunnel closes.
+    pub bytes_down: Option<u64>,
+}
+
+impl TunnelInfo {
+    /// A tunnel relayed byte for byte, for `reason` (`OutOfScope` or `Pinned`).
+    /// Byte counts are `None` until the relay closes.
+    #[must_use]
+    pub fn passthrough(reason: TunnelReason) -> Self {
+        Self {
+            mode: TunnelMode::Passthrough,
+            reason: Some(reason),
+            bytes_up: None,
+            bytes_down: None,
+        }
+    }
+
+    /// A tunnel the proxy terminated with its own leaf.
+    #[must_use]
+    pub fn decrypted() -> Self {
+        Self {
+            mode: TunnelMode::Decrypted,
+            reason: None,
+            bytes_up: None,
+            bytes_down: None,
+        }
+    }
+
+    /// A tunnel that never became established, for one of the failure reasons.
+    #[must_use]
+    pub fn failed(reason: TunnelReason) -> Self {
+        Self {
+            mode: TunnelMode::Failed,
+            reason: Some(reason),
+            bytes_up: None,
+            bytes_down: None,
+        }
+    }
+
+    /// The terminal rule of spec D5: a tunnel row is closed (or failed) iff the
+    /// row's `duration` is set, which the producer does exactly once, when the
+    /// tunnel closes or fails. The mode and the `200` acknowledgement an
+    /// established tunnel carries play no part; the store consults this for
+    /// `clear` and eviction.
+    pub fn is_closed(&self, meta_duration: Option<Duration>) -> bool {
+        meta_duration.is_some()
+    }
+}
+
 /// Per-flow bookkeeping: marks, comment, replay flag, timing, edit state.
 #[derive(Debug, Clone)]
 pub struct FlowMeta {
@@ -262,6 +386,14 @@ pub struct FlowMeta {
     /// The capture backend that delivered the client connection (`"macos-ne"`). `None`
     /// for a proxied flow.
     pub capture_interface: Option<String>,
+    /// Observed only, nothing acted on it (spec D4): plain HTTP to a host outside
+    /// Scope is stored and shown, but no intercept rule parks it, no script sees it
+    /// and no scanner touches it. A tunnel row is dispatched passively by virtue of
+    /// `tunnel.is_some()`, so this stays `false` on it.
+    pub passive: bool,
+    /// The tunnel fields when this flow is a `CONNECT` row (spec D5); `None` for
+    /// every other flow.
+    pub tunnel: Option<TunnelInfo>,
 }
 
 impl Default for FlowMeta {
@@ -276,6 +408,8 @@ impl Default for FlowMeta {
             edited: false,
             source_app: None,
             capture_interface: None,
+            passive: false,
+            tunnel: None,
         }
     }
 }

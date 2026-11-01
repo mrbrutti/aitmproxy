@@ -2,7 +2,7 @@
 
 use aitm_core::{
     Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpVersion,
-    InterceptState, StreamBody,
+    InterceptState, StreamBody, TunnelInfo, TunnelMode, TunnelReason,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -148,4 +148,102 @@ fn flow_meta_started_at_ms_saturates_a_far_future_clock() {
         ..FlowMeta::default()
     };
     assert_eq!(meta.started_at_ms(), Some(i64::MAX));
+}
+
+/// Spec D7: a tunnel row's `tunnel` and `tunnel_reason` values are these literal
+/// snake_case codes on every surface (`flow.table`, `flow.get`, push, `flow.detail`),
+/// so a frontend matches them byte for byte. One assertion per variant.
+#[test]
+fn tunnel_labels_are_the_wire_codes() {
+    assert_eq!(TunnelMode::Decrypted.label(), "decrypted");
+    assert_eq!(TunnelMode::Passthrough.label(), "passthrough");
+    assert_eq!(TunnelMode::Failed.label(), "failed");
+
+    // passthrough reasons
+    assert_eq!(TunnelReason::OutOfScope.label(), "out_of_scope");
+    assert_eq!(TunnelReason::Pinned.label(), "pinned");
+    // failed reasons (the six codes of spec D5)
+    assert_eq!(
+        TunnelReason::ClientRejectedCertificate.label(),
+        "client_rejected_certificate"
+    );
+    assert_eq!(TunnelReason::ClientClosed.label(), "client_closed");
+    assert_eq!(TunnelReason::ClientTlsError.label(), "client_tls_error");
+    assert_eq!(
+        TunnelReason::UpstreamUnreachable.label(),
+        "upstream_unreachable"
+    );
+    assert_eq!(
+        TunnelReason::UpstreamTlsFailed.label(),
+        "upstream_tls_failed"
+    );
+    assert_eq!(TunnelReason::ProtocolError.label(), "protocol_error");
+}
+
+/// An ordinary flow is neither passive nor a tunnel row: both the plain default
+/// and the attribution constructor every protocol module uses start with
+/// `passive == false` and `tunnel == None`.
+#[test]
+fn flow_meta_defaults_are_not_passive_and_not_a_tunnel() {
+    let meta = FlowMeta::default();
+    assert!(!meta.passive);
+    assert_eq!(meta.tunnel, None);
+
+    let attributed =
+        FlowMeta::with_attribution(Some("com.apple.Safari".into()), Some("macos-ne".into()));
+    assert!(!attributed.passive);
+    assert_eq!(attributed.tunnel, None);
+    assert_eq!(attributed.source_app.as_deref(), Some("com.apple.Safari"));
+}
+
+/// The three constructors build exactly the shapes of spec D5: a decrypted tunnel
+/// has no reason; passthrough and failed carry theirs; no constructor sets byte
+/// counts (a passthrough tunnel gets them on close).
+#[test]
+fn tunnel_info_constructors_set_mode_and_reason_and_no_bytes() {
+    assert_eq!(
+        TunnelInfo::decrypted(),
+        TunnelInfo {
+            mode: TunnelMode::Decrypted,
+            reason: None,
+            bytes_up: None,
+            bytes_down: None,
+        }
+    );
+    assert_eq!(
+        TunnelInfo::passthrough(TunnelReason::OutOfScope),
+        TunnelInfo {
+            mode: TunnelMode::Passthrough,
+            reason: Some(TunnelReason::OutOfScope),
+            bytes_up: None,
+            bytes_down: None,
+        }
+    );
+    assert_eq!(
+        TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
+        TunnelInfo {
+            mode: TunnelMode::Failed,
+            reason: Some(TunnelReason::UpstreamUnreachable),
+            bytes_up: None,
+            bytes_down: None,
+        }
+    );
+}
+
+/// Spec D5's terminal rule in one place: a tunnel row is closed iff its
+/// `duration` is set — whatever the mode, and regardless of the `200` an
+/// established tunnel carries.
+#[test]
+fn tunnel_is_closed_iff_the_duration_is_set() {
+    for info in [
+        TunnelInfo::decrypted(),
+        TunnelInfo::passthrough(TunnelReason::Pinned),
+        TunnelInfo::failed(TunnelReason::ClientClosed),
+    ] {
+        assert!(!info.is_closed(None), "{info:?} with no duration is open");
+        assert!(
+            info.is_closed(Some(Duration::from_millis(1))),
+            "{info:?} with a duration is closed"
+        );
+    }
 }

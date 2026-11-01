@@ -54,7 +54,8 @@ pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{
     ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
-    InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
+    InterceptState, ResumeHandle, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow, WsMessage,
+    WsOpcode,
 };
 pub use guard::{
     classify_host, engine_may_reach_private, ssrf_check, ActionPermit, HostClass, ScopeRateGuard,

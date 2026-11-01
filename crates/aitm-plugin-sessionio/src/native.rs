@@ -376,6 +376,10 @@ fn rec_to_meta(m: &MetaRec) -> FlowMeta {
         edited: m.edited,
         source_app: m.source_app.clone(),
         capture_interface: m.capture_interface.clone(),
+        // Not carried by the native format yet: a loaded flow is neither passive
+        // nor a tunnel row.
+        passive: false,
+        tunnel: None,
     }
 }
 
