@@ -206,6 +206,11 @@ const POC_TOAST_MAX: usize = 80;
 /// What the Profiles keys say when no editor is open (plan task 10).
 const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
 
+/// The most cells a toast keeps (fix round H, H47): every `CallFailed`
+/// message reaches [`App::toast`] whole, so the text is bounded once, when
+/// it is stored, never per frame.
+pub const TOAST_MAX: usize = 400;
+
 /// The toast the Scan views raise when `⏎` names a flow the store no
 /// longer holds (D11): the one "not in the flow list" wording.
 fn not_in_flow_list(id: &str) -> String {
@@ -1316,10 +1321,17 @@ impl App {
         known.then_some(total)
     }
 
+    /// Show `text` in the status bar for 16 ticks. The text is bounded here,
+    /// once (fix round H, H47; D6 hostile-core bounds): control characters
+    /// stripped, cut to [`TOAST_MAX`] cells (so at most `4 * TOAST_MAX`
+    /// chars), and the buffer shrunk, so a raw core message a megabyte long
+    /// neither sits in the ring nor overflows the bar's width sums.
     pub fn toast(&mut self, level: Level, text: impl Into<String>) {
+        let mut text = truncate(&clean(&text.into()), TOAST_MAX);
+        text.shrink_to_fit();
         self.toasts.push_back(Toast {
             level,
-            text: text.into(),
+            text,
             expires_at_tick: self.ticks + 16,
         });
         while self.toasts.len() > 3 {

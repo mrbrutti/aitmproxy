@@ -13,7 +13,7 @@ use aitm_tui::scan::legacy::InjectionPointRow;
 use aitm_tui::scan::ScanTab;
 use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
-use common::{legacy_app, press};
+use common::{legacy_app, line_with, press};
 use crossterm::event::KeyCode;
 use serde_json::{json, Value};
 
@@ -531,13 +531,13 @@ fn legacy_discover_failure_text_is_bounded_when_stored() {
     assert!(!stored.contains('\t'), "tabs stripped: {stored:?}");
     assert!(stored.ends_with('…'), "{stored:?}");
     assert!(stored.starts_with("refused:refused:"));
-    // The same CallFailed also toasts the raw message (every verb's path,
-    // outside H35); the toast is dropped here so the Jobs banner alone is
-    // read.
-    app.toasts.clear();
+    // The same CallFailed also toasts the message (bounded by H47), so the
+    // banner is read on its own row, the tab strip's (D11), not anywhere
+    // on the screen.
     let text = screen(&app);
+    let banner_row = line_with(&text, "3 Site map").expect("the tab strip row");
     assert!(
-        text.contains("refused:refused:"),
-        "the Jobs banner reads the stored reason: {text}"
+        banner_row.contains("refused:refused:"),
+        "the Jobs banner reads the stored reason: {banner_row}\n{text}"
     );
 }

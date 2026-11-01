@@ -435,18 +435,21 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
 
     let rw = cells(right.width());
     let cw = cells(center.width());
-    // Drop hints from the right before touching the centre counts.
+    // Drop hints from the right before touching the centre counts. Every
+    // sum saturates (fix round H, H47): the three widths are each clamped
+    // to `u16::MAX` by `cells`, so a plain add could still wrap.
+    let needed = cw.saturating_add(2).saturating_add(rw);
     let mut left_line = hint_line(&hints);
-    while !hints.is_empty() && cells(left_line.width()).saturating_add(cw + 2 + rw) > area.width {
+    while !hints.is_empty() && cells(left_line.width()).saturating_add(needed) > area.width {
         hints.pop();
         left_line = hint_line(&hints);
     }
     let lw = cells(left_line.width());
     buf.set_line(area.x, area.y, &left_line, area.width.saturating_sub(rw));
-    if lw + rw < area.width {
+    if lw.saturating_add(rw) < area.width {
         buf.set_line(area.x + area.width - rw, area.y, &right, rw);
         let free = area.width - lw - rw;
-        if cw + 2 <= free {
+        if cw.saturating_add(2) <= free {
             let x = area.x + lw + (free - cw) / 2;
             buf.set_line(x, area.y, &center, cw);
         } else if free > 4 {
