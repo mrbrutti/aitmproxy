@@ -994,7 +994,7 @@ fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
     // With M4 merged the whole fixture is core: the core app equals the full one.
-    assert_eq!(fixture_app(200, 50).tools.len(), 95);
+    assert_eq!(fixture_app(200, 50).tools.len(), 103);
     let text = text_of(&app, 200, 50);
     assert!(text.contains("11 / 15 rows"), "{text}");
     assert!(text.contains("Agent ● all tools · 14/min"), "{text}");
