@@ -26,6 +26,7 @@ use crate::backend::CaptureInjectBackend;
 use crate::capture::{start_capture, CaptureParams, CaptureRegistry};
 use crate::flow::L4FlowStore;
 use crate::guard::L4Guard;
+use crate::module::L4Availability;
 use crate::types::L4Direction;
 
 /// `l4.capture.start {interface, direction?}` → start a scoped, filtered capture;
@@ -160,15 +161,23 @@ impl Command for CaptureStop {
     }
 }
 
-/// `l4.capture.status` → the flow ids of the currently-running captures.
+/// `l4.capture.status` → whether capture is available on this core (`available`,
+/// `code`, `reason`) and the flow ids of the currently-running captures. Never
+/// privilege-gated (spec §1): it always answers, so a UI learns *why* `start` would
+/// refuse without calling it.
 pub struct CaptureStatus {
     registry: Arc<CaptureRegistry>,
+    availability: L4Availability,
 }
 
 impl CaptureStatus {
-    /// A command over the shared capture registry.
-    pub fn new(registry: Arc<CaptureRegistry>) -> Self {
-        Self { registry }
+    /// A command over the shared capture registry and the capture/inject class's
+    /// availability from the module's cached probe.
+    pub fn new(registry: Arc<CaptureRegistry>, availability: L4Availability) -> Self {
+        Self {
+            registry,
+            availability,
+        }
     }
 }
 
@@ -183,19 +192,28 @@ impl Command for CaptureStatus {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "List the flow ids of the currently-running captures (read-only).".into(),
+            description: "Report whether capture is available on this core (`available`,                           `code`, `reason`) and the flow ids of running captures. Always                           answers, never `L4 unavailable`."
+                .into(),
             params: vec![],
-            result: TypeDesc::Array(Box::new(TypeDesc::Str)),
+            result: TypeDesc::Object(super::availability_fields(
+                "captures",
+                TypeDesc::Array(Box::new(TypeDesc::Str)),
+                "The flow ids of the currently-running captures; `[]` when unavailable.",
+            )),
         }
     }
 
     fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        Ok(Value::Array(
-            self.registry
-                .list()
-                .into_iter()
-                .map(|id| Value::Str(super::flow_id_to_string(id)))
-                .collect(),
+        let captures = self
+            .registry
+            .list()
+            .into_iter()
+            .map(|id| Value::Str(super::flow_id_to_string(id)))
+            .collect();
+        Ok(super::availability_object(
+            &self.availability,
+            "captures",
+            captures,
         ))
     }
 }
@@ -328,7 +346,7 @@ mod tests {
         let registry = Arc::new(CaptureRegistry::new());
 
         let start = CaptureStart::new(guard, backend, store.clone(), registry.clone());
-        let status = CaptureStatus::new(registry.clone());
+        let status = CaptureStatus::new(registry.clone(), L4Availability::available());
         let stop = CaptureStop::new(registry.clone());
 
         let mem = aitm_core::MemFlowStore::new();
@@ -351,9 +369,17 @@ mod tests {
             L4FlowKind::Capture
         );
 
-        // status lists exactly this capture.
+        // status lists exactly this capture, inside the availability object.
+        let status_value = |captures: Vec<Value>| {
+            let mut m = BTreeMap::new();
+            m.insert("available".to_string(), Value::Bool(true));
+            m.insert("code".to_string(), Value::Str("available".into()));
+            m.insert("reason".to_string(), Value::Null);
+            m.insert("captures".to_string(), Value::Array(captures));
+            Value::Object(m)
+        };
         let listed = status.invoke(Params::default(), &h).expect("status ok");
-        assert_eq!(listed, Value::Array(vec![Value::Str(flow_id.clone())]));
+        assert_eq!(listed, status_value(vec![Value::Str(flow_id.clone())]));
 
         // stop ends it; status is then empty; a second stop is false.
         let mut sm = BTreeMap::new();
@@ -364,7 +390,7 @@ mod tests {
         );
         assert_eq!(
             status.invoke(Params::default(), &h).expect("status ok"),
-            Value::Array(vec![])
+            status_value(vec![])
         );
         assert_eq!(
             stop.invoke(Params::new(sm), &h).expect("stop ok"),
@@ -406,7 +432,7 @@ mod tests {
     fn wire_commands_registered() {
         let guard = Arc::new(L4Guard::new(&L4Config::default()));
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let cmds = super::super::wire_commands(guard, store);
+        let cmds = super::super::wire_commands(guard, store, L4Availability::available());
         let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
         for want in [
             "l4.capture.start",

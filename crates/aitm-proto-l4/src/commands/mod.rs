@@ -40,6 +40,7 @@ use std::sync::Arc;
 use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
+use crate::module::L4Availability;
 use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
 
 pub use crate::gates::{AgentGate, L4AgentGates};
@@ -403,12 +404,15 @@ fn gate_for(name: &str) -> Option<AgentGate> {
 /// Build the ordered list of Task 10 wire commands (`l4.capture.*`, `l4.inject`,
 /// `l4.send_recv`) over the shared guard + store, a fresh libpcap wire backend, and
 /// one shared [`CaptureRegistry`](crate::capture::CaptureRegistry) the capture
-/// commands manage together. Kept additive to [`active_commands`] so the two
-/// registration lists merge cleanly; [`crate::module::L4Module::load`] registers
-/// both. The backend construction is pure (no privilege, fail-closed at call time).
+/// commands manage together. `capture` is the capture/inject class's availability
+/// from the module's cached probe; `l4.capture.status` reports it. Kept additive to
+/// [`active_commands`] so the two registration lists merge cleanly;
+/// [`crate::module::L4Module::load`] registers both. The backend construction is
+/// pure (no privilege, fail-closed at call time).
 pub(crate) fn wire_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
+    capture: L4Availability,
 ) -> Vec<Arc<dyn Command>> {
     let backend: Arc<dyn crate::backend::CaptureInjectBackend> =
         Arc::new(crate::backend::pcap::PcapBackend::new());
@@ -421,9 +425,68 @@ pub(crate) fn wire_commands(
             registry.clone(),
         )),
         Arc::new(CaptureStop::new(registry.clone())),
-        Arc::new(CaptureStatus::new(registry)),
+        Arc::new(CaptureStatus::new(registry, capture)),
         Arc::new(Inject::new(guard.clone(), store.clone(), backend.clone())),
         Arc::new(SendRecv::new(guard, store, backend)),
+    ]
+}
+
+/// The availability object the two status verbs answer (spec §1, L4PAR-AC3/AC4):
+/// `{available: Bool, code: Str, reason: Str|Null, <payload_key>: Array}`. The
+/// payload (capture flow ids / intercept sessions) is forced to `[]` when the class
+/// is unavailable, so a UI never renders stale rows under a refusing control.
+pub(crate) fn availability_object(
+    av: &L4Availability,
+    payload_key: &str,
+    payload: Vec<Value>,
+) -> Value {
+    let mut obj = BTreeMap::new();
+    obj.insert("available".to_string(), Value::Bool(av.is_available()));
+    obj.insert("code".to_string(), Value::Str(av.code.as_str().to_string()));
+    obj.insert(
+        "reason".to_string(),
+        av.reason.clone().map_or(Value::Null, Value::Str),
+    );
+    let payload = if av.is_available() { payload } else { vec![] };
+    obj.insert(payload_key.to_string(), Value::Array(payload));
+    Value::Object(obj)
+}
+
+/// The result fields of an [`availability_object`], for the two status verbs'
+/// schemas: one shape, one parser on every frontend.
+pub(crate) fn availability_fields(
+    payload_key: &str,
+    payload_ty: TypeDesc,
+    payload_description: &str,
+) -> Vec<aitm_core::ParamDef> {
+    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| aitm_core::ParamDef {
+        name: name.into(),
+        ty,
+        required,
+        description: description.into(),
+    };
+    vec![
+        field(
+            "available",
+            TypeDesc::Bool,
+            true,
+            "Whether this capability class works on this core now.",
+        ),
+        field(
+            "code",
+            TypeDesc::Str,
+            true,
+            "`available`, `needs_privilege` (the platform supports it, the process lacks \
+             it), `unsupported_platform`, or `not_configured`.",
+        ),
+        field(
+            "reason",
+            TypeDesc::Str,
+            false,
+            "The exact text the gated verbs return in `L4 unavailable: <reason>`; null \
+             when available.",
+        ),
+        field(payload_key, payload_ty, true, payload_description),
     ]
 }
 

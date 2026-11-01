@@ -8,7 +8,8 @@
 //!   dedicated reader thread and records the session. `L4Unavailable` when in-path
 //!   is disabled (`intercept: None`) or on a non-Linux OS / without `CAP_NET_ADMIN`.
 //! - `l4.intercept.stop` — end a session (fail-open forwards anything still parked).
-//! - `l4.intercept.status` — the live sessions and their parked counts (read-only).
+//! - `l4.intercept.status` — in-path availability (`available` / `code` / `reason`)
+//!   and the live sessions with their parked counts (read-only, never privilege-gated).
 //! - `l4.intercept.list` — the parked packets awaiting a verdict (read-only).
 //! - `l4.intercept.mutate` / `.revert` — edit (or revert) a parked packet via a
 //!   [`PacketSpec`] or raw bytes; the original is kept as a backup.
@@ -41,6 +42,7 @@ use crate::intercept::{
     start_intercept, InterceptBackend, InterceptHandle, InterceptParams, NfqueueBackend, ParkedId,
     ParkedPacket,
 };
+use crate::module::L4Availability;
 use crate::types::{L4Action, L4Direction};
 
 /// How the `start` command obtains the in-path backend for a queue number. The
@@ -97,6 +99,12 @@ impl InterceptSessions {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// The `L4Unavailable` text `l4.intercept.start` refuses with when in-path is
+/// disabled (no `intercept` config); also the `reason` `l4.intercept.status` carries
+/// under `code: not_configured`, so the two can never disagree (spec §1).
+pub(crate) const INTERCEPT_NOT_CONFIGURED: &str =
+    "in-path interception is disabled (no `intercept` config)";
 
 // ---- l4.intercept.start -------------------------------------------------------
 
@@ -192,9 +200,7 @@ impl Command for InterceptStart {
         // or any backend. Fail-closed is also what a non-Linux backend returns on
         // open, so `l4.intercept.*` is honest about platform support either way.
         let mut config = self.config.clone().ok_or_else(|| {
-            anyhow::Error::new(L4Error::Unavailable(
-                "in-path interception is disabled (no `intercept` config)".into(),
-            ))
+            anyhow::Error::new(L4Error::Unavailable(INTERCEPT_NOT_CONFIGURED.into()))
         })?;
 
         let interface = args.get_str("interface")?.to_string();
@@ -291,15 +297,22 @@ impl Command for InterceptStop {
 
 // ---- l4.intercept.status ------------------------------------------------------
 
-/// `l4.intercept.status` — the live interception sessions (read-only).
+/// `l4.intercept.status` — whether in-path interception is available on this core
+/// (`available`, `code`, `reason`) and the live interception sessions (read-only).
+/// Never privilege-gated (spec §1): it always answers.
 pub(crate) struct InterceptStatus {
     sessions: Arc<InterceptSessions>,
+    availability: L4Availability,
 }
 
 impl InterceptStatus {
-    /// A status command over the shared session registry.
-    pub(crate) fn new(sessions: Arc<InterceptSessions>) -> Self {
-        Self { sessions }
+    /// A status command over the shared session registry and the in-path class's
+    /// availability from the module's cached probe.
+    pub(crate) fn new(sessions: Arc<InterceptSessions>, availability: L4Availability) -> Self {
+        Self {
+            sessions,
+            availability,
+        }
     }
 }
 
@@ -314,11 +327,17 @@ impl Command for InterceptStatus {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "List the live interception sessions and their parked-packet counts \
-                          (read-only)."
+            description: "Report whether in-path interception is available on this core \
+                          (`available`, `code`, `reason`) and the live interception sessions \
+                          with their parked-packet counts. Always answers, never `L4 \
+                          unavailable`."
                 .into(),
             params: vec![],
-            result: TypeDesc::Array(Box::new(TypeDesc::Object(session_fields()))),
+            result: TypeDesc::Object(super::availability_fields(
+                "sessions",
+                TypeDesc::Array(Box::new(TypeDesc::Object(session_fields()))),
+                "The live interception sessions; `[]` when unavailable.",
+            )),
         }
     }
 
@@ -334,7 +353,11 @@ impl Command for InterceptStatus {
             .collect();
         // Stable, caller-friendly order (the registry is a HashMap).
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(Value::Array(out.into_iter().map(|(_, v)| v).collect()))
+        Ok(super::availability_object(
+            &self.availability,
+            "sessions",
+            out.into_iter().map(|(_, v)| v).collect(),
+        ))
     }
 }
 
@@ -718,22 +741,25 @@ pub(crate) fn intercept_commands(
     store: Arc<dyn L4FlowStore>,
     sessions: Arc<InterceptSessions>,
     config: Option<InterceptConfig>,
+    availability: L4Availability,
 ) -> Vec<Arc<dyn Command>> {
     let start = InterceptStart::new(guard.clone(), store, sessions.clone(), config);
-    commands_over(start, guard, sessions)
+    commands_over(start, guard, sessions, availability)
 }
 
 /// The eight intercept commands over one start command + session registry. The
-/// guard is threaded to `forward` so a staged mutation is re-checked before reinject.
+/// guard is threaded to `forward` so a staged mutation is re-checked before reinject;
+/// `availability` (the in-path class, from the module's cached probe) to `status`.
 fn commands_over(
     start: InterceptStart,
     guard: Arc<L4Guard>,
     sessions: Arc<InterceptSessions>,
+    availability: L4Availability,
 ) -> Vec<Arc<dyn Command>> {
     vec![
         Arc::new(start),
         Arc::new(InterceptStop::new(sessions.clone())),
-        Arc::new(InterceptStatus::new(sessions.clone())),
+        Arc::new(InterceptStatus::new(sessions.clone(), availability)),
         Arc::new(InterceptList::new(sessions.clone())),
         Arc::new(InterceptMutate::new(sessions.clone())),
         Arc::new(InterceptRevert::new(sessions.clone())),
@@ -1228,7 +1254,13 @@ mod tests {
         let guard = guard_with(vec![]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let sessions = Arc::new(InterceptSessions::new());
-        let cmds = intercept_commands(guard, store, sessions, Some(cfg(0)));
+        let cmds = intercept_commands(
+            guard,
+            store,
+            sessions,
+            Some(cfg(0)),
+            L4Availability::available(),
+        );
         let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
         assert_eq!(
             names,

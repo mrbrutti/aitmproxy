@@ -124,6 +124,23 @@ fn intercept_start_fail_closed_via_registry() {
         matches!(l4, L4Error::Unavailable(_)),
         "in-path must fail closed with L4Unavailable, got {l4:?}"
     );
+
+    // L4PAR-AC4 / AC9 (plan A4): `l4.intercept.status` is not privilege-gated. It
+    // answers `Ok` with `available: false` and the same reason the start refused with.
+    let status = reg
+        .command("l4.intercept.status")
+        .expect("l4.intercept.status must be on the bus")
+        .invoke(Params::default(), &host)
+        .expect("intercept.status must answer Ok without CAP_NET_ADMIN");
+    let Value::Object(fields) = &status else {
+        panic!("intercept.status must be an object, got {status:?}");
+    };
+    assert_eq!(fields.get("available"), Some(&Value::Bool(false)));
+    assert_eq!(
+        fields.get("reason"),
+        Some(&Value::Str("missing CAP_NET_ADMIN".into()))
+    );
+    assert_eq!(fields.get("sessions"), Some(&Value::Array(vec![])));
 }
 
 // ---- Linux-gated functional suite (real NFQUEUE on a loopback nft queue) ---------
