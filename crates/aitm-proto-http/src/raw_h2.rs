@@ -45,6 +45,7 @@
 //! keep.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -561,6 +562,9 @@ pub struct RawH2Client {
     dialer: Arc<dyn Dialer>,
     resolver: Arc<dyn HostResolver>,
     ssrf: Option<crate::sender::SsrfGate>,
+    /// Set by the first `probe` that runs without an SSRF gate, so the
+    /// warning about it is logged once per client, not once per probe.
+    warned_no_gate: AtomicBool,
 }
 
 impl RawH2Client {
@@ -574,6 +578,7 @@ impl RawH2Client {
             dialer: Arc::new(TcpDialer::new(RAW_CONNECT_TIMEOUT)),
             resolver: Arc::new(SystemResolver),
             ssrf: None,
+            warned_no_gate: AtomicBool::new(false),
         }
     }
 
@@ -620,11 +625,19 @@ impl RawH2Client {
     /// more than [`MAX_RAW_STREAMS`] streams, when its mode opens more streams
     /// than it declares, when it carries a forbidden header, or when the target
     /// is unusable (bad scheme, bad authority, no address). After that it
-    /// errors only on a transport failure; a peer that resets, goes away or
-    /// says nothing is an observation, not an error.
+    /// errors only on a transport failure, or when [`RAW_TOTAL_TIMEOUT`] runs
+    /// out before a connection exists (there is nothing to observe); a peer
+    /// that resets, goes away or says nothing is an observation, not an error.
     pub async fn probe(&self, plan: &RawH2Plan) -> Result<RawH2Observation> {
-        let encoded = validate(plan)?;
+        let encoded = validate_and_encode(plan)?;
         let streams = encoded.len();
+
+        // A runner that forgot `with_ssrf` probes wherever the name points.
+        // Say so once per client, loudly enough to be seen (review finding
+        // SEC-13); the gate itself stays opt-in.
+        if self.ssrf.is_none() && !self.warned_no_gate.swap(true, Ordering::Relaxed) {
+            tracing::warn!("raw h2 probe running without an SSRF gate");
+        }
 
         let scheme = plan.target.scheme.to_ascii_lowercase();
         let tls = match scheme.as_str() {
@@ -644,6 +657,9 @@ impl RawH2Client {
         };
 
         let started = Instant::now();
+        // Set once the transport is established (after TLS and ALPN for an
+        // `https` target). A cap that fires before then observed nothing.
+        let mut connected = false;
         let outcome = tokio::time::timeout(RAW_TOTAL_TIMEOUT, async {
             // The resolve is *inside* the cap: a name server that never answers
             // must not hold the probe open past the whole-probe deadline.
@@ -659,8 +675,11 @@ impl RawH2Client {
                 .next()
                 .map(|ip| SocketAddr::new(ip, port))
                 .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
-            self.connect_and_converse(plan, addr, &host, tls, &encoded, &mut obs)
-                .await
+            let mut stream = self.connect(addr, &host, tls).await?;
+            connected = true;
+            let result = converse(&mut *stream, plan, &encoded, &mut obs).await;
+            let _ = tokio::time::timeout(RAW_CLOSE_TIMEOUT, stream.shutdown()).await;
+            result
         })
         .await;
         obs.elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
@@ -668,48 +687,48 @@ impl RawH2Client {
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            // The whole-probe cap ran out: the connection is dropped here, and
-            // whatever the peer had already said stands as the observation.
+            // The whole-probe cap ran out before the resolve, the dial or the
+            // TLS handshake finished: no peer was ever talked to, so an
+            // observation shaped like a server hang-up would be a lie
+            // (review finding SEC-11).
+            Err(_) if !connected => {
+                anyhow::bail!("raw h2 probe to {host}: no connection within the cap")
+            }
+            // The whole-probe cap ran out mid-conversation: the connection is
+            // dropped here, and whatever the peer had already said stands as
+            // the observation.
             Err(_) => obs.connection_closed = true,
         }
         Ok(obs)
     }
 
-    /// Dial once, wrap in TLS for an `https` target, run the conversation and
-    /// close. No retry: a failure here is the probe's result.
-    async fn connect_and_converse(
+    /// Dial once and wrap in TLS for an `https` target. No retry: a failure
+    /// here is the probe's result.
+    async fn connect(
         &self,
-        plan: &RawH2Plan,
         addr: SocketAddr,
         host: &str,
         tls: bool,
-        encoded: &[Vec<u8>],
-        obs: &mut RawH2Observation,
-    ) -> Result<()> {
+    ) -> Result<Box<dyn ProbeStream>> {
         let dialed = self
             .dialer
             .dial(addr)
             .await
             .with_context(|| format!("raw h2 dial {addr}"))?;
 
-        let mut stream: Box<dyn ProbeStream> = if tls {
-            let name = ServerName::try_from(host.to_string())
-                .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
-            let tls_stream = TlsConnector::from(self.client_config()?)
-                .connect(name, dialed)
-                .await
-                .with_context(|| format!("raw h2 TLS to {host}"))?;
-            if tls_stream.get_ref().1.alpn_protocol() != Some(ALPN_H2) {
-                anyhow::bail!("raw h2 probe: {host} did not negotiate ALPN h2");
-            }
-            Box::new(tls_stream)
-        } else {
-            dialed
-        };
-
-        let result = converse(&mut *stream, plan, encoded, obs).await;
-        let _ = tokio::time::timeout(RAW_CLOSE_TIMEOUT, stream.shutdown()).await;
-        result
+        if !tls {
+            return Ok(dialed);
+        }
+        let name = ServerName::try_from(host.to_string())
+            .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
+        let tls_stream = TlsConnector::from(self.client_config()?)
+            .connect(name, dialed)
+            .await
+            .with_context(|| format!("raw h2 TLS to {host}"))?;
+        if tls_stream.get_ref().1.alpn_protocol() != Some(ALPN_H2) {
+            anyhow::bail!("raw h2 probe: {host} did not negotiate ALPN h2");
+        }
+        Ok(Box::new(tls_stream))
     }
 
     /// The TLS config: ALPN `h2` only, verified per [`TlsVerify`].
@@ -740,7 +759,7 @@ impl RawH2Client {
 ///
 /// Everything a plan can be refused for is decided here, before the dial, so a
 /// refused plan costs the target not even a connection (review finding Q7).
-fn validate(plan: &RawH2Plan) -> Result<Vec<Vec<u8>>> {
+fn validate_and_encode(plan: &RawH2Plan) -> Result<Vec<Vec<u8>>> {
     if plan.streams > MAX_RAW_STREAMS {
         anyhow::bail!(
             "a raw h2 probe opens at most 8 streams on its one connection; the plan declares {}",
@@ -762,6 +781,8 @@ fn validate(plan: &RawH2Plan) -> Result<Vec<Vec<u8>>> {
 
     let blocks = plan.mode.blocks(&plan.headers);
     let mut checked = blocks.clone();
+    // `plan.headers` is scanned even when the mode ignores it (`Blocks`,
+    // `SettingsOnly`): a forbidden header anywhere in a plan is refused.
     checked.push(&plan.headers);
     for header in checked.into_iter().flatten() {
         let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
@@ -1752,9 +1773,11 @@ mod driver_tests {
 
         assert_eq!(obs.streams, vec![StreamOutcome::Timeout]);
         assert_eq!(obs.settings, vec![]);
-        assert!(
-            waited <= RAW_TOTAL_TIMEOUT,
-            "the probe took {waited:?}, cap is {RAW_TOTAL_TIMEOUT:?}"
+        // Virtual time: a peer that never sends its SETTINGS costs exactly one
+        // read timeout, not a byte of slack.
+        assert_eq!(
+            waited, RAW_READ_TIMEOUT,
+            "the probe took {waited:?}; one silent read should cost exactly {RAW_READ_TIMEOUT:?}"
         );
         assert_eq!(dialer.calls(), 1);
     }
@@ -2145,9 +2168,9 @@ mod driver_tests {
 
         assert_eq!(obs.streams, vec![StreamOutcome::Timeout; 3]);
         assert!(obs.connection_closed);
-        assert!(
-            waited <= RAW_READ_TIMEOUT + Duration::from_secs(1),
-            "the probe took {waited:?}, one silent stream should cost one read timeout"
+        assert_eq!(
+            waited, RAW_READ_TIMEOUT,
+            "the probe took {waited:?}; one silent stream should cost exactly one read timeout"
         );
         assert_eq!(dialer.calls(), 1);
         settled(&log, |l| l.headers_streams.len() == 1).await;
@@ -2288,25 +2311,146 @@ mod driver_tests {
     }
 
     /// SEC-1/SEC-9: the resolve is inside the whole-probe cap, so a resolver
-    /// that never answers cannot hold the probe open past it.
+    /// that never answers cannot hold the probe open past it. SEC-11: and a
+    /// cap that fires before a connection exists is an *error*, not an
+    /// observation shaped like a peer that hung up — nothing was observed.
+    /// The outer guard (T-O3) makes a regression a red test, not a hung one.
     #[tokio::test(start_paused = true)]
     async fn a_resolver_that_never_answers_is_bounded_by_the_total_timeout() {
         let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
         let client = client.with_resolver(Arc::new(HangingResolver));
 
         let started = tokio::time::Instant::now();
-        let obs = client
-            .probe(&plan(RawH2Mode::SingleRequest, 1))
-            .await
-            .expect("the probe completes");
+        let err = tokio::time::timeout(
+            RAW_TOTAL_TIMEOUT * 4,
+            client.probe(&plan(RawH2Mode::SingleRequest, 1)),
+        )
+        .await
+        .expect("the probe must not outlive its own cap")
+        .expect_err("a probe that never connected has nothing to observe");
         let waited = started.elapsed();
 
-        assert!(obs.connection_closed);
-        assert_eq!(obs.streams, vec![StreamOutcome::Timeout]);
-        assert!(
-            waited <= RAW_TOTAL_TIMEOUT,
-            "the probe took {waited:?}, cap is {RAW_TOTAL_TIMEOUT:?}"
+        assert_eq!(
+            err.to_string(),
+            "raw h2 probe to origin.test: no connection within the cap",
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            waited, RAW_TOTAL_TIMEOUT,
+            "the probe took {waited:?}; the cap is exactly {RAW_TOTAL_TIMEOUT:?}"
         );
         assert_eq!(dialer.calls(), 0, "a probe that never resolved never dials");
+    }
+
+    /// Captures this crate's own tracing events on the current thread (a
+    /// local copy of `h2_sender`'s; accepted duplicate, review finding QM-10).
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    struct Fields(String);
+
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push_str(&format!(" {}={value}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if !event.metadata().target().starts_with("aitm_proto_http") {
+                return;
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("events")
+                .push((*event.metadata().level(), fields.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    const NO_GATE_WARNING: &str = "raw h2 probe running without an SSRF gate";
+
+    fn gate_warnings(events: &Arc<Mutex<Vec<(tracing::Level, String)>>>) -> Vec<tracing::Level> {
+        events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|(_, fields)| fields.contains(NO_GATE_WARNING))
+            .map(|(level, _)| *level)
+            .collect()
+    }
+
+    /// SEC-13: a client probing without `with_ssrf` says so, once, at `warn`
+    /// — so a mis-wired runner shows in the logs rather than silently probing
+    /// unguarded — and a second probe on the same client does not repeat it.
+    #[tokio::test]
+    async fn probing_without_an_ssrf_gate_warns_exactly_once_per_client() {
+        let capture = LogCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+
+        let (client, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the first probe completes");
+        assert_eq!(
+            gate_warnings(&events),
+            vec![tracing::Level::WARN],
+            "the first unguarded probe warns once: {:?}",
+            events.lock().expect("events")
+        );
+
+        // The one connection is spent; a second probe fails to dial, which is
+        // fine — the warning is about the gate, and it must not repeat.
+        let _ = client.probe(&plan(RawH2Mode::SingleRequest, 1)).await;
+        assert_eq!(
+            gate_warnings(&events),
+            vec![tracing::Level::WARN],
+            "the second probe on the same client does not warn again"
+        );
+    }
+
+    /// SEC-13: a client built with the gate never warns.
+    #[tokio::test]
+    async fn probing_with_an_ssrf_gate_does_not_warn() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let capture = LogCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+
+        let (client, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let scope = Arc::new(StdGuard::default());
+        scope.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let client = client.with_ssrf(SsrfPolicy::default(), scope);
+        client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the gated probe completes");
+
+        assert!(
+            gate_warnings(&events).is_empty(),
+            "a gated client must not warn: {:?}",
+            events.lock().expect("events")
+        );
     }
 }
