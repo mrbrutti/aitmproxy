@@ -284,6 +284,10 @@ fn trim_spaces(bytes: &[u8]) -> &[u8] {
 /// [`StopReason::as_str`] is the literal the lane logs and the engine's
 /// report carries: `max_pages`, `max_depth`, `time`, `budget`, `cancelled`,
 /// `left_scope`, `navigation_failed`, `guard_refused`, `no_browser`.
+///
+/// `NoBrowser` is lane-only: the lane logs it when the profile demands a
+/// browser the job does not have and no engine runs at all, so no engine ever
+/// sets it on a [`CrawlReport`] (`stopped_reason` is never `NoBrowser`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopReason {
     /// `max_pages` attempts were spent.
@@ -303,7 +307,8 @@ pub(crate) enum StopReason {
     NavigationFailed,
     /// The frontier ran dry only because the scope guard refused pages.
     GuardRefused,
-    /// The profile demanded a browser the job does not have.
+    /// The profile demanded a browser the job does not have. Logged by the
+    /// lane before any engine runs; never set on a report.
     NoBrowser,
 }
 
