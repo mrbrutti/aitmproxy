@@ -164,6 +164,7 @@ AC21 only.
 | Unit | Gate (each must exit 0; output quoted) |
 |---|---|
 | p1a, p1b, p2, p7 | sandbox: `cargo fmt --check && cargo clippy --all-targets --offline -- -D warnings && cargo test --offline`; once per unit the same in the Terminal (for `tui_live_bus`) |
+| p1b (Panel 3, 2026-11-01) | the row above, plus `cargo test --offline -p aitm --bin aitm` in the per-stage (per-package) gate: the `main.rs` tests `tui_shutdown_arm_consults_the_prompt_hold` and `the_prompt_hold_handed_to_the_shutdown_arms_is_the_states` live in the binary target, and `cargo test -p aitm --lib` skips them. The full workspace `cargo test --offline` above already covers the binary target; only the `-p aitm --lib` shortcut misses it. |
 | p3 | Terminal: `DEV_TAG=l4priv apps/mac/tools/snap-dev.sh` (prints `Build complete`), `cd apps/mac && swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build`, `apps/mac/tools/check-packet-capture-ui.sh`, `apps/mac/tools/check-connection-words.sh`, `apps/mac/tools/grid-lint.sh` (P3.8, P3.10 change layout) |
 | p4 | `scripts/tests/run-notarize-dmg-stubbed.sh`, `apps/mac/tools/check-packet-helper.sh`, `shellcheck` on every changed script, plus the Rust gate if `package.sh` changed |
 | p5 | `scripts/tests/check-linux-packaging.sh`, `shellcheck scripts/package-linux.sh`, the Rust gate |
@@ -178,7 +179,7 @@ A file in two units is never open in both at once. The "after" column says why.
 | Unit | Creates | Modifies |
 |---|---|---|
 | p1a | `crates/aitm-proto-l4/src/privilege/{mod,contract}.rs`, `crates/aitm-proto-l4/src/helper/{mod,proto,frame,enforce}.rs` | `crates/aitm-proto-l4/src/lib.rs`, `crates/aitm-proto-l4/Cargo.toml` (none expected) |
-| p1b | `crates/aitm-proto-l4/src/privilege/{report,derive,availability,state,macos,linux}.rs`, `crates/aitm-proto-l4/src/commands/privilege.rs`, `crates/aitm-proto-l4/src/helper/client.rs`, `crates/aitm-proto-l4/src/backend/{helper,routed}.rs`, `crates/aitm-proto-l4/tests/privilege.rs`, `tests/e2e/l4/test_privilege_core.py` | `crates/aitm-proto-l4/src/{lib,module,config,guard,language}.rs`, `crates/aitm-proto-l4/src/privilege/mod.rs`, `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/{mod,capture,intercept}.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/src/{wire,main}.rs` (after unit (a), merged), `crates/aitm/tests/frontends.rs`, `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only; panel 2026-11-01: `bus-fixture.json` and `tester_shell.rs` dropped, deleted by #244), `Cargo.lock` (panel 2026-11-01: the derived line for the `Cargo.toml` change only; p2 owns the lock for the new crate), `crates/aitm/src/lib.rs` (panel 2026-11-01: `shutdown_signal` consults the prompt hold, P1b.14), `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`, `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md` |
+| p1b | `crates/aitm-proto-l4/src/privilege/{report,derive,availability,state,macos,linux}.rs`, `crates/aitm-proto-l4/src/commands/privilege.rs`, `crates/aitm-proto-l4/src/helper/client.rs`, `crates/aitm-proto-l4/src/backend/{helper,routed}.rs`, `crates/aitm-proto-l4/tests/privilege.rs`, `tests/e2e/l4/test_privilege_core.py` | `crates/aitm-proto-l4/src/{lib,module,config,guard,language}.rs`, `crates/aitm-proto-l4/src/privilege/mod.rs`, `crates/aitm-proto-l4/src/helper/mod.rs`, `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/{mod,capture,intercept}.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/src/{wire,main}.rs` (after unit (a), merged), `crates/aitm/tests/frontends.rs`, `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only; panel 2026-11-01: `bus-fixture.json` and `tester_shell.rs` dropped, deleted by #244), `Cargo.lock` (panel 2026-11-01: the derived line for the `Cargo.toml` change only; p2 owns the lock for the new crate), `crates/aitm/src/lib.rs` (panel 2026-11-01: `shutdown_signal` consults the prompt hold, P1b.14), `crates/aitm/src/tui.rs` (Panel 3, 2026-11-01: the `aitm tui` shutdown arm consults the hold, P1b.14; granted from P6.3), `crates/aitm/tests/l4_cua_tui.rs` (Panel 3, 2026-11-01: the AC27 branch and the bounded wait, P1b.16/P1b.17), `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`, `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md` |
 | p2 | `crates/aitm-l4-helper/{Cargo.toml,src/main.rs,src/cli.rs,src/bpf.rs,src/bpf_exec.rs,src/log.rs,src/probe.rs,src/serve.rs,src/serve_loop.rs}`, `tests/e2e/l4/test_privilege_helper_linux.py`, `tests/e2e/l4/linux-privilege-rig.sh` | root `Cargo.toml` (`members`, workspace dep), `Cargo.lock` |
 | p3 | `apps/mac/Sources/AitmproxyKit/{PacketCapture,L4Capture}.swift`, `apps/mac/Tests/AitmproxyKitTests/{PacketCaptureTests,L4CaptureTests}.swift`, `apps/mac/Sources/Aitmproxy/Privilege/PacketCaptureHelper.swift`, `apps/mac/Sources/Aitmproxy/Panels/{PacketCaptureCard,L4CaptureControls}.swift`, `apps/mac/tools/check-packet-capture-ui.sh`, `apps/mac/tools/cua-packet-capture.sh` | `apps/mac/Info.plist.in` (orchestrator first), `apps/mac/Sources/AitmproxyKit/{ConnectionSummary,EmbeddedCoreLaunch}.swift`, `apps/mac/Tests/AitmproxyKitTests/{ConnectionSummaryTests,EmbeddedCoreLaunchTests}.swift`, `apps/mac/Sources/Aitmproxy/{App,SettingsView,Session}.swift`, `apps/mac/Sources/Aitmproxy/Panels/{StatusPanel,ScopePanel}.swift`, `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (L4 empty state), `apps/mac/tools/check-connection-words.sh` (after parity (d)) |
 | p4 | `apps/mac/LaunchDaemons/com.mrbrutti.aitmproxy.l4-helper.plist`, `apps/mac/LaunchDaemons/com.mrbrutti.aitmproxy.l4-helper-revert.plist`, `apps/mac/tools/check-packet-helper.sh` | `scripts/notarize-dmg.sh`, `scripts/tests/run-notarize-dmg-stubbed.sh`, `scripts/package.sh`, `apps/mac/build.sh`, `docs/RELEASE.md`; the tap repo `mrbrutti/homebrew-aitmproxy` `Casks/aitmproxy.rb` (orchestrator executes) |
@@ -918,26 +919,39 @@ capability's reason.
     pipe costs nothing and lets the core classify the failure text); a drain thread copies the pipe into a bounded
     tail buffer (last 4 KiB, **Architect's call**) for as long as the child lives, because the helper inherits that
     stderr and must never block on a full pipe. `stderr_tail` returns the buffer.
-  - `pub trait SignalGuard: Send + Sync { fn hold(&self) -> Box<dyn Any + Send>; }` (S7; corrected by the panel,
-    2026-11-01, replacing the `sigaction` design and the leaf-crate follow-up). **The Ctrl-C hold lives in the `aitm`
+  - `pub struct HoldCount` (`Clone`; clones share one counter) with `pub fn hold(&self) -> HoldToken`, `pub fn
+    is_held(&self) -> bool` and `pub fn count(&self) -> usize`, and `pub struct HoldToken` whose `Drop` lowers the
+    count, both in `privilege/linux.rs` (Panel 3, 2026-11-01: replaces the `SignalGuard` trait and its `Box<dyn Any +
+    Send>` token, deleted in fix task C; the only operation is `hold`, so nothing can install an ignore through it)
+    (S7; corrected by the panel, 2026-11-01, replacing the `sigaction` design and the leaf-crate follow-up). **The Ctrl-C hold lives in the `aitm`
     binary.** `aitm` already owns SIGINT through tokio's `ctrl_c` (`crates/aitm/src/lib.rs` `shutdown_signal`), so
     the signal never kills the process; the shutdown future resolving is what stops the core. The `PrivilegeState`
-    owns a hold count that `hold()` raises while a pkexec child is alive and the dropped token lowers when the child
-    ends or the helper connects; `shutdown_signal` is given that count and, on Ctrl-C while it is non-zero, logs
+    owns a `HoldCount` that `hold()` raises (a `HoldToken`) while a pkexec child is alive and the dropped token lowers
+    when the child ends or the helper connects; `shutdown_signal` is given that count and, on Ctrl-C while it is non-zero, logs
     `Ctrl-C cancelled the packet-capture prompt; the core keeps serving` and keeps waiting for the next signal. The
-    child has the default disposition after exec, dies of the SIGINT, and `classify_exit` records `dismissed`. Never
+    child has the default disposition after exec, dies of the SIGINT, and `classify_exit_full` records `dismissed`. Never
     `SIG_IGN` (inherited across `execve`, it makes the prompt un-cancellable). No `sigaction`, no `unsafe`, no new
     crate; the shape of the count is the builder's. **(Architect's call:** during that window Ctrl-C cancels the
     prompt and does not shut the core down; see Questions, Q6 stays flagged for Matt.)
     (Panel 2, 2026-11-01) Both serving shutdown futures consult the hold: `shutdown_signal` in `lib.rs` (`aitm`,
     `aitm web`) and the `aitm tui` select arm in `tui.rs`, which receives the hold through `tui::run`. On a held
     Ctrl-C each arm calls `pub fn PrivilegeState::cancel_prompt(&self)`, which kills the live launcher child (SIGINT,
-    so `classify_exit` records `dismissed`), so a Ctrl-C delivered to the core alone (no shared foreground process
+    so `classify_exit_full` records `dismissed`), so a Ctrl-C delivered to the core alone (no shared foreground process
     group) still ends the prompt and never waits out the 300 s timeout; with no child alive it is a no-op. The
     watcher thread carries an unwind guard (a drop guard) that moves a still-`pending` request to `failed` and
     releases the hold if the thread panics, so a panic never leaves the request `pending` or the hold raised
     (**Architect's call** on `failed` as the terminal state).
-  - `pub fn classify_exit(exit: ChildExit, stderr: &str) -> (Progress, String)` (pure), the spec §5.5 table:
+    (Panel 3, 2026-11-01) The guard's `failed` message is exactly `The packet-capture request ended unexpectedly`
+    (`msg::ENDED_UNEXPECTEDLY`), and on a panic the guard also kills the launcher child best-effort.
+    `cancel_prompt()` signals only the request's own launcher child, never a serving helper and never a helper
+    started directly on the file-caps row; `Child::interrupt()` sends SIGINT on Linux and is a no-op off Linux (no
+    launcher exists there). The prompt-child slot `cancel_prompt()` reads is cleared only by the watch that set it
+    (`Arc::ptr_eq` on the child), and the `watching` flag is owned by a watch generation, so a watch that outlives a
+    newer request can neither unregister the newer child nor clear the newer watch's flag.
+  - `pub(crate) fn classify_exit_full(exit: ChildExit, stderr: &str) -> (ExitClass, RequestState, String)` (pure;
+    Panel 3, 2026-11-01: was `classify_exit(exit, stderr) -> (Progress, String)`; `ExitClass { Dismissed, AuthFailed,
+    NoAgent, TimedOut, Other }` names the §5.5 row the watcher branches on, never the message text), the spec §5.5
+    table:
     - `Exited(126)` → `Dismissed`, `"Approval was cancelled"` (graphical agent's Cancel);
     - `Exited(127)` with stderr containing `Got unexpected EOF while reading from controlling terminal` →
       `Dismissed`, `"Approval was cancelled"` (Ctrl-D at the textual prompt);
@@ -961,8 +975,9 @@ capability's reason.
     `SessionError::VersionMismatch(theirs)` to `VersionMismatch(theirs)` and every other `SessionError` to
     `Protocol(<its text, bounded by TEXT_BOUND>)`. `Protocol(_)` reads `helper.status: unknown` with the text in
     `detail`; only `VersionMismatch(_)` reads `version_mismatch`.
-  - `pub fn request_linux(cfg, inputs: &LinuxInputs, spawner: &dyn Spawner, signal: &dyn SignalGuard, socket: &Path,
-    display_set: bool) -> LinuxRequest` (panel, 2026-11-01: the signature as landed; the checks run in this order):
+  - `pub fn request_linux(cfg, inputs: &LinuxInputs, spawner: &dyn Spawner, hold: &HoldCount, socket: &Path,
+    display_set: bool) -> LinuxRequest` (panel, 2026-11-01: the signature as landed; Panel 3, 2026-11-01: `hold:
+    &HoldCount` replaces `signal: &dyn SignalGuard`; the checks run in this order):
     - `lifetime == OneShot` gives `CannotPrompt`, `"a one-shot command exits before the helper could serve it; set
       l4.privilege.request: at_start or use Allow in the TUI or web UI"`, and nothing is spawned.
     - Not packaged (panel, 2026-11-01: evaluated before the prompt predicate): the helper is not at the policy path,
@@ -973,7 +988,7 @@ capability's reason.
     - Otherwise spawn exactly `["/usr/bin/pkexec", LINUX_HELPER_PATH, "serve", "--connect", <socket>]` (panel,
       2026-11-01: the launcher by absolute path, `PKEXEC_PATH`, never a `PATH` lookup) with the child's environment
       cleared and only `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` passed through (no `SHELL`: pkexec refuses a value
-      absent from `/etc/shells`; no `LANG`/`LC_*`: the stderr literals `classify_exit` matches stay the English ones
+      absent from `/etc/shells`; no `LANG`/`LC_*`: the stderr literals `classify_exit_full` matches stay the English ones
       S7 measured), and return `Pending`.
       The message is `"Waiting for administrator approval in the polkit dialog"` when `DISPLAY` or
       `WAYLAND_DISPLAY` is set, else `"Enter an administrator password in the terminal running aitm"`. The messages
@@ -981,7 +996,7 @@ capability's reason.
   - A watcher thread moves the progress (S7 mapping):
     - the session passes `accept_checked` (pid == child id): `Approved`; the stderr drain keeps running for the
       helper's lifetime, the prompt hold is released;
-    - the child ends before connecting: `classify_exit(exit, stderr_tail)` as above, then the hold is released;
+    - the child ends before connecting: `classify_exit_full(exit, stderr_tail)` as above, then the hold is released;
     - (panel, 2026-11-01) the handshake fails after connecting: `last_session_error` is set, the progress is
       `failed`, the hold is released;
     - 300 s on the injected clock: kill and `Failed`, `"No approval within 5 minutes"`.
@@ -1010,7 +1025,7 @@ capability's reason.
   - `sigint_is_dismissed` (S7): `Signaled(2)` gives `Dismissed`, `"Approval was cancelled"`
   - `other_exit_is_failed`: `Exited(2)` gives `"The packet-capture helper did not start (pkexec exit 2)"`
   - `sigint_handler_installed_not_ignored` (S7; panel 2026-11-01: the name is kept, it now pins the hold count): with
-    a counting `SignalGuard`, the hold count is 1 from spawn until the child ends or connects, and 0 after; the fake
+    a `HoldCount` (Panel 3, 2026-11-01: was "a counting `SignalGuard`"), `count()` is 1 from spawn until the child ends or connects, and 0 after; the fake
     refuses (panics) on any `SIG_IGN`-style call. Nothing is spawned without a hold.
   - `held_ctrl_c_keeps_serving` (panel, 2026-11-01; in `crates/aitm/src/lib.rs`, pure): the shutdown decision for a
     Ctrl-C with the hold count at 1 is "keep serving" and its log line is exactly `Ctrl-C cancelled the
@@ -1021,7 +1036,13 @@ capability's reason.
     cancelled"`, and the hold is 0; with no child it changes nothing. (Name the Architect's; the fix-task coder
     reports the delivered name.)
   - `watcher_panic_releases_hold_and_ends_pending` (panel 2, 2026-11-01; `state::tests`): a fake child whose
-    `try_wait` panics leaves the request `failed`, not `pending`, and the hold at 0.
+    `try_wait` panics leaves the request `failed`, not `pending`, and the hold at 0. (Panel 3, 2026-11-01) The message is
+    exactly `The packet-capture request ended unexpectedly`; the prompt-child slot and `watching` are clear.
+  - `tui_shutdown_arm_consults_the_prompt_hold` (Panel 3, 2026-11-01; `crates/aitm/src/main.rs`): a source tripwire,
+    the `aitm tui` select arm in `crates/aitm/src/tui.rs` goes through `interrupt_unless_held` with the hold.
+  - `the_prompt_hold_handed_to_the_shutdown_arms_is_the_states` (Panel 3, 2026-11-01; `crates/aitm/src/main.rs`): the
+    `HoldCount` the binary hands both shutdown arms is a clone of the `PrivilegeState`'s own (`sigint_hold()`), so a
+    hold taken by a request is seen by the arms: `count()` reads 1 on both after one `hold()` on the state's.
   - `linux_session_failure_is_version_mismatch_until_a_session_connects` (panel, 2026-11-01; `derive::tests`;
     panel 2: the delivered name, was `version_mismatch_after_handshake_failure`): no session, `last_session_error =
     Some(SessionFailure::VersionMismatch(2))` gives `helper.status == "version_mismatch"` and a `detail` containing
@@ -1124,6 +1145,14 @@ TUI is live-only, and `tui_live_bus.rs` compares `CORE_TOOLS` to the live `tools
   until p7), `test_l4_parity_core.py` exits 0, `test_l4_parity_priv.py` exits 77. **[linux-ci]:** the same three in
   the Fedora container, output quoted. (Panel 2, 2026-11-01) The Terminal `l4_cua_tui` run result is quoted in the
   Review log at ready time alongside these.
+  (Panel 3, 2026-11-01) The first gated invoke after the privilege cache's 1 s TTL (`REPROBE_MS`) can pay the probe cost
+  synchronously: on macOS that is `codesign --verify --strict` on the handoff bundle, bounded at 5 s (`TOOL_WAIT`).
+  The `l4_cua_tui` wait bound is 20 s for that reason, not because the drive itself is slow; a run that trips it
+  is a real failure. A background probe thread is the follow-up recorded after P1b.18.
+  (Panel 3, 2026-11-01) The AC3 scan in `test_privilege_core.py` exempts exactly the two pinned §5.5 forms of the generic
+  row, `The packet-capture helper did not start (pkexec exit <n>)` and `The packet-capture helper did not start
+  (killed by signal <n>)` with `<n>` an integer, and nothing wider (the row's message names `pkexec` because the
+  spec pins it verbatim; progress messages are otherwise outside the P1b.3 tripwire).
 - (Panel, 2026-11-01) The `[linux-ci]` half (AC20, AC23 and the Linux cells of `test_privilege_core.py`) is
   re-scoped to P2.8 [linux-ci], the helper unit, which builds the container rig this needs (`cis-lab` has none yet:
   podman, `--systemd=always --privileged`), pending Matt's acceptance (Review log row "P1b.17 [linux-ci]"). Until
@@ -1139,6 +1168,11 @@ TUI is live-only, and `tui_live_bus.rs` compares `CORE_TOOLS` to the live `tools
   commands (27 names; panel, 2026-11-01) in both files.
 - **Done when:** the diff check passes. **Unit close:** a Tester run on the whole unit and the panel. AC5's live half is
   re-run after p7 merges (orchestrator re-dispatches P1b.17's AC5 block).
+
+**Follow-ups Panel 3, 2026-11-01, p1b, not blocking the unit):** a background probe thread, so no gated invoke pays the
+privilege probe synchronously after the 1 s TTL (today the first one after the TTL can wait up to the 5 s
+`codesign` bound on macOS; P1b.17 note). Orchestrator to schedule after p1b merges; a spec amendment to §2.1's
+cache sentence goes with it.
 
 ---
 

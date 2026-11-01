@@ -237,7 +237,9 @@ policy's exec path is ever run through `pkexec` (§5.1).
   then does it run `/usr/bin/open -a <path> aitmproxy://packet-capture/allow` (§3.4) and reply `handed_to_app`. A
   missing or failing app is `cannot_prompt`. (Panel 2, 2026-11-01) The configured or derived path is canonicalized
   first, and a path that cannot be canonicalized is "missing"; the `plutil` and `codesign` facts are cached per
-  bundle stamp (device, inode, `Info.plist` mtime, main executable mtime).
+  bundle stamp (device, inode, `Info.plist` mtime and size, main executable mtime and size; the executable is
+  `Contents/MacOS/Aitmproxy`, else `Contents/_CodeSignature/CodeResources`) (Panel 3, 2026-11-01: the size fields and
+  the executable fallback, so an in-place overwrite of the executable changes the stamp).
 - Linux: `pending` after spawning `/usr/bin/pkexec /usr/lib/aitmproxy/aitm-l4-helper serve --connect <socket>` (§5;
   panel, 2026-11-01: the launcher by absolute path, environment per §5.5) with
   pkexec's stderr on a pipe the core drains; the progress moves to `approved` when the helper connects and passes
@@ -655,6 +657,13 @@ Ctrl-C reaches the core alone (no shared foreground process group, so the child 
 launcher child itself, so the prompt is cancelled and the stop is never deferred to the 300 s timeout
 (**Architect's call:** the core sends the child SIGINT, so the table above records `dismissed`). The watcher thread
 carries an unwind guard, so a panic can never leave the request `pending` or the hold raised.
+
+(Panel 3, 2026-11-01) The `failed` message the unwind guard writes to a still-`pending` request is exactly
+`The packet-capture request ended unexpectedly`; on a panic the guard also kills the launcher child, best-effort (a
+child already gone, or one that refuses the signal, is left to its own exit). `cancel_prompt()` signals only the
+request's own launcher child: never a serving helper, and never a helper started directly on the file-caps row;
+with no launcher alive it does nothing. `Child::interrupt()` sends SIGINT on Linux; off Linux no launcher ever
+exists, so it is a no-op.
 
 (S7) The textual prompt names an **admin** identity (`Authenticating as: <admin>`); for an operator who is not in
 `sudo`/`wheel` that is another user's account, which is correct polkit behaviour and why the web banner says "Enter
