@@ -277,17 +277,22 @@ pub fn severity_header(s: Severity) -> &'static str {
 }
 
 /// The tally's five counts in [`SEVERITY_ORDER`] order: the one walk of a
-/// `BySeverity` the headers and the Jobs tab's severity bar share.
+/// `BySeverity` the headers and the Jobs tab's severity bar share, read
+/// through [`count_of`].
 pub fn severity_counts(b: &BySeverity) -> [u64; 5] {
-    [b.critical, b.high, b.medium, b.low, b.info]
+    SEVERITY_ORDER.map(|s| count_of(b, s))
 }
 
-/// The `by_severity` count for `s`.
+/// The `by_severity` count for `s`: the one exhaustive match from a
+/// severity to its tally field, so a new severity fails to compile here.
 pub fn count_of(b: &BySeverity, s: Severity) -> u64 {
-    SEVERITY_ORDER
-        .iter()
-        .position(|x| *x == s)
-        .map_or(0, |i| severity_counts(b)[i])
+    match s {
+        Severity::Critical => b.critical,
+        Severity::High => b.high,
+        Severity::Medium => b.medium,
+        Severity::Low => b.low,
+        Severity::Info => b.info,
+    }
 }
 
 /// The row indices of `list` grouped under the five severities in
@@ -359,7 +364,13 @@ pub fn issue_row(i: &IssueSummary) -> IssueRow {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct IssuesState {
     /// `scan.issues`' rows, in wire order, at most [`ISSUES_PAGE_LIMIT`] of
-    /// them and every id in the wire form; the view groups them by severity.
+    /// them and every id in the wire form; the view groups them by severity
+    /// ([`grouped`] reads the severities off it). `rows` is its display
+    /// twin, index for index (`fold_result` asserts the lengths); `list`
+    /// stays because the reducer reads summary fields the display row does
+    /// not carry for a row whose full issue is not yet read: the id for the
+    /// cursor landing and the keyed calls, `poc_ref` and `name` for `P`,
+    /// `status` for the round trip.
     pub list: Vec<IssueSummary>,
     /// The display row of every `list` entry, index for index, built once
     /// per fold with its strings bounded (D6 hostile-core bounds): what the
@@ -373,11 +384,13 @@ pub struct IssuesState {
     /// The list cursor.
     pub cursor: usize,
     pub pane: IssuePane,
-    /// The full issues received from `scan.issue` (and, from the Issues
-    /// detail task on, `scan.issue.update`), by id: inserted on a reply
-    /// only, never on send, and pruned by every fold to the page's ids, so
-    /// `read.len() <= list.len()` (spec D3, D6; fix round D, D1). An entry
-    /// also leaves on a terminal line for its job ([`IssuesState::forget_job`]).
+    /// The full issues received from `scan.issue` (and from
+    /// `scan.issue.update`, which Task 8 adds), by id: inserted on a reply
+    /// only, never on send, only while the page lists the id, and pruned by
+    /// every fold to the page's ids, so `read.len() <= list.len()` (spec
+    /// D3, D6; fix round D, D1; fix round E, E11). An entry also leaves on
+    /// a terminal line for its job ([`IssuesState::forget_job`]) or as the
+    /// oldest once [`READ_MAX`] are held.
     pub read: BTreeMap<IssueId, Issue>,
     /// The keys of `read` in insertion order, oldest first: the eviction
     /// order once `read` holds [`READ_MAX`] entries (fix round E, E1). Kept
@@ -396,7 +409,7 @@ pub struct IssuesState {
     pub fetched_at_tick: Option<u64>,
     /// The one `scan.issue` read in flight, by id (spec D6: at most one at a
     /// time); the reply, ok or failed, clears it, as does a disconnect.
-    pub pending_read: Option<String>,
+    pub pending_read: Option<IssueId>,
     /// This tab's last error.
     pub error: Option<ScanError>,
 }
@@ -419,6 +432,11 @@ impl IssuesState {
         let listed: BTreeSet<&str> = self.list.iter().map(|i| i.id.as_str()).collect();
         self.read.retain(|id, _| listed.contains(id.as_str()));
         self.prune_read_order();
+        debug_assert_eq!(
+            self.list.len(),
+            self.rows.len(),
+            "rows is list's display twin, index for index"
+        );
     }
 
     /// Drop from `read_order` every id no longer in `read`, after a prune

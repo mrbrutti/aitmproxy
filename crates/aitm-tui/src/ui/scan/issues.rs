@@ -34,7 +34,8 @@ use crate::ui::text::{cells, fit, truncate, width};
 
 /// Blank cells between columns.
 const GAP: usize = 2;
-/// The widest a status cell grows (`false_positive` is fourteen cells).
+/// The widest a status cell grows: `false_positive`, the longest status
+/// token, is fourteen cells (pinned by a unit test).
 const STATUS_MAX: usize = 14;
 /// The narrowest a cut column is allowed to get before the next one goes.
 const COLUMN_MIN: usize = 8;
@@ -351,6 +352,17 @@ fn row_line(theme: &Theme, cols: &Columns, row: &IssueRow, under_cursor: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::status_token;
+    use aitm_scan_model::IssueStatus;
+
+    /// Fix round E, E16: the status column cap is the longest status token.
+    #[test]
+    fn status_max_is_the_longest_status_token() {
+        assert_eq!(STATUS_MAX, status_token(IssueStatus::FalsePositive).len());
+        for s in [IssueStatus::Open, IssueStatus::Confirmed] {
+            assert!(status_token(s).len() <= STATUS_MAX);
+        }
+    }
 
     fn row(name: &str) -> IssueRow {
         IssueRow {

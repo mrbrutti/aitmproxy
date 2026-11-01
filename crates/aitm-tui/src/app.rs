@@ -4395,7 +4395,6 @@ impl App {
                 // job (and a new poll) per reply.
                 if let Some(status) = self.scan_reply_keyed::<JobStatus>(
                     tag,
-                    name,
                     &value,
                     |s: &JobStatus| s.job.as_str(),
                     OTHER_JOB,
@@ -4432,7 +4431,6 @@ impl App {
                 // round E, E11).
                 if let Some(issue) = self.scan_reply_keyed::<Issue>(
                     tag,
-                    name,
                     &value,
                     |i: &Issue| i.id.as_str(),
                     OTHER_ISSUE,
@@ -4487,23 +4485,20 @@ impl App {
         }
     }
 
-    /// [`App::scan_reply`] for a keyed verb (`<name>:<key>`): the parsed
+    /// [`App::scan_reply`] for a keyed verb (`<verb>:<key>`): the parsed
     /// reply is returned only when `key` reads the tag's key off it (spec
     /// D6, hostile-core bounds); otherwise the uncoded error `other`
     /// (`OTHER_JOB`, `OTHER_ISSUE`) is recorded under the tag and nothing is
-    /// folded. `scan.status`, `scan.cancel` and `scan.issue` share it; the
-    /// Issues detail task's `scan.issue.update` will too (fix round D, D9).
-    /// `name` is the verb the bus echoed; the bus task echoes what the
-    /// reducer sent, so it is the tag's verb part by construction.
+    /// folded. `scan.status`, `scan.cancel`, `scan.issue` and
+    /// `scan.issue.update` share it (fix round D, D9). The tag is the
+    /// verb's source ([`tag_parts`]), so no verb name travels beside it.
     fn scan_reply_keyed<T: serde::de::DeserializeOwned>(
         &mut self,
         tag: &str,
-        name: &str,
         value: &Value,
         key: fn(&T) -> &str,
         other: &'static str,
     ) -> Option<T> {
-        debug_assert_eq!(tag_parts(tag).0, name, "a keyed tag carries its verb");
         let parsed = self.scan_reply::<T>(tag, value)?;
         if Some(key(&parsed)) == tag_parts(tag).1 {
             Some(parsed)

@@ -42,12 +42,13 @@ const REDIRECT: &str = "issue-4c3b2a19";
 /// The first probe flow of `scan.issue.json`.
 const PROBE_1: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-/// A connected v2 app at 200x50 on the Profiles tab, the `scan.list` its
-/// open issued already settled empty, so nothing is in flight.
-fn app() -> App {
+/// A connected v2 app at 200x50 on the Profiles tab offering `tools`, the
+/// `scan.list` its open issued already settled empty, so nothing is in
+/// flight.
+fn app_with(tools: &[&str]) -> App {
     let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
     let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, TOOLS, None);
+    let _ = connect(&mut app, tools, None);
     let _ = app.update(Action::OpenScan);
     let _ = app.on_bus(BusEvent::CallTaggedOk {
         tag: "scan.list".into(),
@@ -61,6 +62,24 @@ fn app() -> App {
         "nothing in flight at the start"
     );
     app
+}
+
+/// [`app_with`] offering every verb the Issues tab uses.
+fn app() -> App {
+    app_with(TOOLS)
+}
+
+/// `TOOLS` without `verb`.
+fn tools_without(verb: &str) -> Vec<&'static str> {
+    TOOLS.iter().copied().filter(|t| *t != verb).collect()
+}
+
+/// The strip row's banner: the text after the tab strip, trimmed of the
+/// box edge and padding.
+fn strip_banner(text: &str) -> &str {
+    line_with(text, "1 Profiles")
+        .unwrap_or_default()
+        .trim_end_matches(['│', ' '])
 }
 
 /// The `scan.issues` request the Issues tab sends under its single-slot tag.
@@ -836,20 +855,7 @@ fn rows_are_bounded_at_fold_time() {
 /// landing sends nothing (the quiet `scan_poll` path, ruling b).
 #[test]
 fn a_bus_without_scan_issue_is_named_in_the_issues_banner() {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
-    let _ = app.update(Action::Resize(200, 50));
-    let without: Vec<&str> = TOOLS
-        .iter()
-        .copied()
-        .filter(|t| *t != "scan.issue")
-        .collect();
-    let _ = connect(&mut app, &without, None);
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    });
+    let mut app = app_with(&tools_without("scan.issue"));
     let reqs = app.update(Action::ScanTab(ScanTab::Issues));
     assert_eq!(
         issues_requests(&reqs).len(),
@@ -857,9 +863,7 @@ fn a_bus_without_scan_issue_is_named_in_the_issues_banner() {
         "scan.issues is still served"
     );
     let text = screen(&app);
-    let strip = line_with(&text, "1 Profiles")
-        .unwrap_or_default()
-        .trim_end_matches(['│', ' ']);
+    let strip = strip_banner(&text);
     assert!(
         strip.ends_with("scan.issue is not on this bus"),
         "the strip row names the missing read verb: {strip:?}"
@@ -871,6 +875,27 @@ fn a_bus_without_scan_issue_is_named_in_the_issues_banner() {
     );
     assert_eq!(app.scan.issues.pending_read, None);
     assert_eq!(app.scan.issues.list.len(), 2, "the list is still shown");
+}
+
+/// Fix round E, E17 (D11): the Issues tab's degraded text names every verb
+/// the tab uses, so a v2 bus without `scan.issue.update` says so in the
+/// strip row while the list and the read are still served; `c` then sends
+/// nothing and the banner already explains why.
+#[test]
+fn a_bus_without_scan_issue_update_is_named_in_the_issues_banner() {
+    let mut app = app_with(&tools_without("scan.issue.update"));
+    let reqs = app.update(Action::ScanTab(ScanTab::Issues));
+    assert_eq!(issues_requests(&reqs).len(), 1);
+    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert_eq!(reqs, vec![issue_request(XSS)], "the read is still served");
+    let text = screen(&app);
+    let strip = strip_banner(&text);
+    assert!(
+        strip.ends_with("scan.issue.update is not on this bus"),
+        "the strip row names the missing update verb: {strip:?}"
+    );
+    let reqs = app.update(Action::ScanIssueStatus(IssueStatus::Confirmed));
+    assert!(reqs.is_empty(), "no verb, no call: {reqs:?}");
 }
 
 /// D7 (spec D6): the Issues timer counts from `fetched_at_tick`, so a tab

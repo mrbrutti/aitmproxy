@@ -127,10 +127,11 @@ fn banner(app: &App, error: Option<&ScanError>) -> String {
 
 /// The active tab's degraded text, when the bus cannot serve it (D2): on a
 /// legacy bus Profiles and Issues name what they need; on a v2 bus a tab
-/// names the first of its verbs the bus lacks (D11: Issues needs both
-/// `scan.issues` for the list and `scan.issue` for the read; fix round D,
-/// D4). Jobs is not gated by a verb in D2 (a v2 bus has `scan.start` by
-/// definition), and the Site map on a legacy bus is the legacy result
+/// names the first of its verbs the bus lacks (D11: Issues needs
+/// `scan.issues` for the list, `scan.issue` for the read and
+/// `scan.issue.update` for the status keys; fix round D, D4, and fix round
+/// E, E17). Jobs is not gated by a verb in D2 (a v2 bus has `scan.start`
+/// by definition), and the Site map on a legacy bus is the legacy result
 /// (D12), not degraded.
 fn degraded(app: &App) -> Option<String> {
     let verbs: &[&str] = match (app.scan_offer(), app.scan.tab) {
@@ -138,7 +139,7 @@ fn degraded(app: &App) -> Option<String> {
         (ScanOffer::Legacy, ScanTab::Issues) => return Some(ISSUES_DEGRADED.to_string()),
         (ScanOffer::V2, ScanTab::Profiles) => &["scan.profile.list"],
         (ScanOffer::V2, ScanTab::SiteMap) => &["scan.sitemap"],
-        (ScanOffer::V2, ScanTab::Issues) => &["scan.issues", "scan.issue"],
+        (ScanOffer::V2, ScanTab::Issues) => &["scan.issues", "scan.issue", "scan.issue.update"],
         _ => return None,
     };
     verbs
