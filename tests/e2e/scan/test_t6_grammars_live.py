@@ -88,7 +88,8 @@ GRAMMARS: tuple[tuple[str, str], ...] = (
     ("ftp", "l4-ftp"),
 )
 # `tlv` is the one grammar with no generator of its own: a named `tlv` with an empty
-# corpus has nothing to infer from (T6 child spec S5.2 (c)), so the row passes the
+# corpus has nothing to infer from (parent spec D8.5 Corpus (c); T6 child spec S5.2 (c)),
+# so the row passes the
 # same three well-formed frames `test_t6_tlv_crash.py` uses (u16 BE length + payload,
 # three distinct lengths so the S4 length inference succeeds). Every other grammar
 # generates its own seeds.
