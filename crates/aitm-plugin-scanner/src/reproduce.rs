@@ -367,8 +367,11 @@ impl<'a> Scrubber<'a> {
 /// URL userinfo is stripped first ([`strip_userinfo`]: `//user:pw@host` →
 /// `//host`), so a `user:pw@` prefix cannot make the scan swallow the host. Then
 /// [`scrub_text_wide`] masks every `key=value` / `key: value` pair whose key
-/// reads as a secret: it runs core's one pair scan twice, first with the
-/// standard reading and then with the wide one. This scrub and
+/// reads as a secret. Its two scans differ in the key test: the first judges a
+/// key run by the standard vocabulary, except a run that begins inside a value
+/// it has just masked, which it judges by the wide one; the second judges every
+/// key run by the wide vocabulary. A pair that begins inside a masked value is
+/// read, and so is a pair with a line break beside its separator. This scrub and
 /// [`is_secret_name`], which decides the *name* of a header or parameter, judge
 /// a key by the same predicate, so a `sid=`, `auth=` or `author=` pair embedded
 /// in a `Referer`-style or URL-valued value is masked as it would be under a
@@ -1992,18 +1995,8 @@ mod tests {
             "{\"sidebar\":\"YWJj=\",\"user\":\"bob\"}",
             "{\"sidebar\":\"[redacted]\",\"user\":\"bob\"}",
         ),
-        // (xii) a standard-secret pair nested under a wide-only parent (YAML and
-        // inline), and a line break or form feed beside the separator of a wide-only key
-        (
-            "authentication:\n  password: hunter2",
-            "authentication:\n  password: [redacted]",
-        ),
-        ("author:\n  token: abc123", "author:\n  token: [redacted]"),
-        ("sessions:\n  jwt: J1", "sessions:\n  jwt: [redacted]"),
-        (
-            "sidebar:\n    api_key: K1",
-            "sidebar:\n    api_key: [redacted]",
-        ),
+        // (xii) a standard-secret pair nested under a wide-only parent on one
+        // line, the shapes the nested-pair rule leaves as they were
         (
             "authentication: {password: hunter2}",
             "authentication: [redacted] [redacted]}",
@@ -2012,15 +2005,6 @@ mod tests {
         ("author=password='C2'", "author=[redacted]'[redacted]'"),
         ("inside=x?sid\t=\tC9", "inside=[redacted]\t=\t[redacted]"),
         ("Auths:Pwd: C", "Auths:[redacted] [redacted]"),
-        (
-            "authentication:\n  sessionKey: abc123",
-            "authentication:\n  sessionKey: [redacted]",
-        ),
-        ("side:\nSid2':C", "side:\nSid2':[redacted]"),
-        ("bsid:\rSIDE:'C", "bsid:\rSIDE:'[redacted]"),
-        ("author:\nJohn", "author:\nJohn"),
-        ("sidebar\n:v", "sidebar\n:v"),
-        ("sidebar=\u{c}v", "sidebar=\u{c}v"),
     ];
 
     /// The recorded output of the old two-scan pipeline at `15009b2`, row by
@@ -2312,9 +2296,9 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({
-                "note": "authentication:\n  password: [redacted]",
+                "note": "authentication:\n  [redacted] [redacted]",
                 "memo": "sidebar=[redacted]\"[redacted]\"",
-                "list": ["author:\n  token: [redacted]"],
+                "list": ["author:\n  [redacted] [redacted]"],
             })
         );
 
@@ -2340,7 +2324,7 @@ mod tests {
         assert_eq!(
             pairs,
             [
-                ("note", "authentication:\n  password: [redacted]"),
+                ("note", "authentication:\n  [redacted] [redacted]"),
                 ("memo", "sidebar=[redacted]\"[redacted]\""),
                 ("page", "2"),
             ]
@@ -2351,7 +2335,7 @@ mod tests {
         let poc = build(&[], Some("authentication:\n  password: RAWPW6"));
         assert_eq!(
             http_step(&poc).body.as_deref(),
-            Some("authentication:\n  password: [redacted]")
+            Some("authentication:\n  [redacted] [redacted]")
         );
 
         // A header value.
@@ -2397,6 +2381,186 @@ mod tests {
         assert!(
             bad.is_empty(),
             "rows that differ from the pinned output (input, expected, actual): {bad:#?}"
+        );
+    }
+
+    /// The ten inputs whose `scrub_embedded` output changes once a pair that
+    /// begins inside a masked value is read and a line break beside a separator
+    /// is read across, each with its new output and, in a comment, what the old
+    /// pipeline at `15009b2` printed. None of them is in
+    /// [`RECORDED_SCRUB_EMBEDDED`] any more.
+    #[test]
+    fn scrub_embedded_nested_pair_changes_are_exactly_these() {
+        let rows: &[(&str, &str)] = &[
+            // old pipeline at 15009b2: `authentication:\n  password: [redacted]`
+            (
+                "authentication:\n  password: hunter2",
+                "authentication:\n  [redacted] [redacted]",
+            ),
+            // old pipeline at 15009b2: `author:\n  token: [redacted]`
+            (
+                "author:\n  token: abc123",
+                "author:\n  [redacted] [redacted]",
+            ),
+            // old pipeline at 15009b2: `sessions:\n  jwt: [redacted]`
+            ("sessions:\n  jwt: J1", "sessions:\n  [redacted] [redacted]"),
+            // old pipeline at 15009b2: `sidebar:\n    api_key: [redacted]`
+            (
+                "sidebar:\n    api_key: K1",
+                "sidebar:\n    [redacted] [redacted]",
+            ),
+            // old pipeline at 15009b2: `authentication:\n  sessionKey: [redacted]`
+            (
+                "authentication:\n  sessionKey: abc123",
+                "authentication:\n  [redacted] [redacted]",
+            ),
+            // old pipeline at 15009b2: `side:\nSid2':[redacted]`
+            ("side:\nSid2':C", "side:\n[redacted]':[redacted]"),
+            // old pipeline at 15009b2: `bsid:\rSIDE:'[redacted]`
+            ("bsid:\rSIDE:'C", "bsid:\r[redacted]'[redacted]"),
+            // old pipeline at 15009b2: `author:\nJohn`, unchanged
+            ("author:\nJohn", "author:\n[redacted]"),
+            // old pipeline at 15009b2: `sidebar\n:v`, unchanged
+            ("sidebar\n:v", "sidebar\n:[redacted]"),
+            // old pipeline at 15009b2: `sidebar=\u{c}v`, unchanged
+            ("sidebar=\u{c}v", "sidebar=\u{c}[redacted]"),
+        ];
+        assert!(rows.len() >= 10, "the table shrank: {} rows", rows.len());
+
+        let recorded: HashSet<&str> = RECORDED_SCRUB_EMBEDDED
+            .iter()
+            .map(|&(input, _)| input)
+            .collect();
+        let still_recorded: Vec<&str> = rows
+            .iter()
+            .map(|&(input, _)| input)
+            .filter(|input| recorded.contains(input))
+            .collect();
+        assert!(
+            still_recorded.is_empty(),
+            "inputs that are still rows of the recorded corpus: {still_recorded:?}"
+        );
+
+        let bad = embedded_mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "rows that differ from the new output (input, expected, actual): {bad:#?}"
+        );
+    }
+
+    /// A credential on the line after a secret parent or after a wide-only
+    /// parent is masked with the label that carries it, through the whole
+    /// embedded-value scrub (userinfo first).
+    #[test]
+    fn scrub_embedded_masks_a_nested_credential_under_a_secret_or_a_wide_only_parent() {
+        let rows: &[(&str, &str)] = &[
+            (
+                "auth:\n  password: hunter2",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            (
+                "credentials:\r\n\tsecret: S1",
+                "credentials:\r\n\t[redacted] [redacted]",
+            ),
+            (
+                "auth:\n  sessionKey: abc123",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            ("userSession:\n  S3SS10N9", "userSession:\n  [redacted]"),
+            ("sidebar:\nS3SS10N9", "sidebar:\n[redacted]"),
+            (
+                "see http://u:pw@host/x\nauth:\n  password: hunter2",
+                "see http://host/x\nauth:\n  [redacted] [redacted]",
+            ),
+        ];
+        assert!(rows.len() >= 6, "the table shrank: {} rows", rows.len());
+
+        let bad = embedded_mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "rows that differ from the new output (input, expected, actual): {bad:#?}"
+        );
+    }
+
+    /// A credential nested under a secret parent is masked wherever a PoC
+    /// carries free text: the query of the URL, a JSON string leaf (the line
+    /// break is a real one once the JSON is parsed), a form value (`%0A` and `+`)
+    /// and an untyped body. No canary survives in the serialized PoC.
+    #[test]
+    fn build_poc_masks_a_credential_nested_under_a_secret_parent() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let build = |flow: &HttpFlow| {
+            let q = point(flow, Location::Query, "q", "hello");
+            build_poc(flow, &def, &q, payload).expect("poc builds")
+        };
+        let assert_no_canary = |poc: &Poc, canaries: &[&str]| {
+            let serialized = serde_json::to_string(poc).expect("poc serializes");
+            for canary in canaries {
+                assert!(
+                    !serialized.contains(canary),
+                    "leaked `{canary}`: {serialized}"
+                );
+            }
+        };
+
+        // The URL: `%3A` is a colon, `%0A` a line break, `%20` a space.
+        let flow = flow_with_query("/go?q=hello&note=auth%3A%0A%20%20password%3A%20URLPW1");
+        let poc = build(&flow);
+        assert_no_canary(&poc, &["URLPW1"]);
+        assert_eq!(
+            http_step(&poc).url,
+            "{{target}}/go?q=%3Caitm-canary-0001%3E&note=auth%3A%0A++%5Bredacted%5D+%5Bredacted%5D"
+        );
+
+        // JSON string leaves, one of them inside an array.
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[("Content-Type", "application/json")],
+            Some(
+                r#"{"note":"auth:\n  password: JSONPW2","list":["credentials:\r\n\tsecret: JSONSEC9"]}"#,
+            ),
+        );
+        let poc = build(&flow);
+        assert_no_canary(&poc, &["JSONPW2", "JSONSEC9"]);
+        let body: serde_json::Value =
+            serde_json::from_str(http_step(&poc).body.as_deref().expect("a json body"))
+                .expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "note": "auth:\n  [redacted] [redacted]",
+                "list": ["credentials:\r\n\t[redacted] [redacted]"],
+            })
+        );
+
+        // A form value, percent-encoded.
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            Some("note=auth%3A%0A++password%3A+FORMPW3&page=2"),
+        );
+        let poc = build(&flow);
+        assert_no_canary(&poc, &["FORMPW3"]);
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("note=auth%3A%0A++%5Bredacted%5D+%5Bredacted%5D&page=2")
+        );
+
+        // A body with no content type is scrubbed whole.
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[],
+            Some("auth:\n  password: RAWPW4"),
+        );
+        let poc = build(&flow);
+        assert_no_canary(&poc, &["RAWPW4"]);
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("auth:\n  [redacted] [redacted]")
         );
     }
 }
