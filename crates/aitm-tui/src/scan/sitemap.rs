@@ -111,32 +111,35 @@ impl From<ScanOffer> for MapSource {
 }
 
 /// One node's line in the Nodes pane: its group key (`host[:port]`, the
-/// header it sits under), its text (`METHOD path_template  flows n · pts n
-/// · ✓`) and the index of the node in `SitemapState::nodes` it was built
-/// from. Lines are in group order: every line of one host before the next
-/// host's, hosts in the order they first appear.
+/// header it sits under) and its text (`METHOD path_template  flows n ·
+/// pts n · ✓`). `SitemapState::lines[k]` is the line of
+/// `SitemapState::nodes[k]` (fix round G, G22): the fold sorts the nodes
+/// into group order (every node of one host before the next host's, hosts
+/// in the order they first appear), so the cursor walks what the pane
+/// draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeLine {
     pub host: String,
     pub text: String,
-    pub node: usize,
 }
 
 /// The Site map tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SitemapState {
-    /// The nodes shown: every `scan.sitemap` page appended so far, or on a
-    /// legacy bus the `scan.discover` endpoints read as nodes
-    /// ([`SitemapState::show_legacy`], index for index with
-    /// `legacy.endpoints`); strings bounded when set.
+    /// The nodes shown, in group order ([`group_nodes`]; fix round G,
+    /// G22): every `scan.sitemap` page appended so far, or on a legacy bus
+    /// the `scan.discover` endpoints read as nodes
+    /// ([`SitemapState::show_legacy`]; `legacy.endpoint_cursor` indexes
+    /// this grouped list); strings bounded when set.
     pub nodes: Vec<SiteNode>,
-    /// The nodes' display twin, one line per node in group order, built
-    /// with `nodes` (`lines.len() == nodes.len()`).
+    /// The nodes' display twin, index for index with `nodes`
+    /// (`lines[k]` draws `nodes[k]`; `lines.len() == nodes.len()`).
     pub lines: Vec<NodeLine>,
     /// The points shown. From `scan.sitemap`: sorted so each node's points
-    /// are contiguous in node order ([`SitemapState::node_points`]), a
-    /// point naming no node of `nodes` dropped at fold time (the pane lists
-    /// the selected node's points, so it has no place to be drawn). On a
+    /// are contiguous in node order ([`SitemapState::node_points`]), then
+    /// the orphans (a point naming no node of `nodes`, or none at all)
+    /// last in their wire order and not drawn, kept so a point whose node
+    /// arrives on a later page re-attaches (fix round G, G20). On a
     /// legacy bus: the injection points read as points, index for index
     /// with `legacy.points`. Strings bounded when set.
     pub points: Vec<InsertionPoint>,
@@ -163,14 +166,19 @@ impl SitemapState {
     /// `points`, or appends to them after `n` (`appending`); `next_cursor`
     /// is the reply's. Hostile-core bounds (D6): the page is cut to
     /// [`SITEMAP_PAGE_LIMIT`] nodes and points, every string is cut to
-    /// [`VALUE_MAX`] cells here, once, the lines are rebuilt here, and both
-    /// cursors are settled onto what is now listed.
+    /// [`VALUE_MAX`] cells here, once. The nodes are then sorted into group
+    /// order and the lines rebuilt index for index (fix round G, G22), the
+    /// points re-ordered under them (orphans last, G20), and both cursors
+    /// settled: the Nodes cursor stays on the id it was on when that node
+    /// is still listed (an appended page may move its row), else it is
+    /// clamped.
     pub fn fold_result(&mut self, mut result: SitemapResult) {
         let append = std::mem::take(&mut self.appending);
         result.nodes.truncate(SITEMAP_PAGE_LIMIT);
         result.points.truncate(SITEMAP_PAGE_LIMIT);
         result.nodes.iter_mut().for_each(bound_node);
         result.points.iter_mut().for_each(bound_point);
+        let selected = self.selected_node().map(|n| n.id.clone());
         if append {
             self.nodes.extend(result.nodes);
             self.points.extend(result.points);
@@ -179,6 +187,14 @@ impl SitemapState {
             self.points = result.points;
         }
         self.next_cursor = result.next_cursor;
+        self.relist(selected);
+    }
+
+    /// Sort `nodes` into group order, rebuild `lines` and the point order,
+    /// and settle both cursors; `selected` is the id the Nodes cursor was
+    /// on, re-found when still listed.
+    fn relist(&mut self, selected: Option<String>) {
+        group_nodes(&mut self.nodes);
         self.order_points();
         self.lines = node_lines(&self.nodes);
         debug_assert_eq!(
@@ -186,34 +202,45 @@ impl SitemapState {
             self.nodes.len(),
             "lines is nodes' display twin, one per node"
         );
-        self.node_cursor = self.node_cursor.min(self.nodes.len().saturating_sub(1));
+        let found = selected.and_then(|id| self.nodes.iter().position(|n| n.id == id));
+        self.node_cursor =
+            found.unwrap_or(self.node_cursor.min(self.nodes.len().saturating_sub(1)));
         self.settle_point_cursor();
     }
 
     /// On a legacy bus (D12) the lists are the `scan.discover` result read
-    /// as nodes and points ([`legacy_nodes`], [`legacy_points`]), index for
-    /// index with `legacy.endpoints` and `legacy.points`, whose cursors the
-    /// panes keep walking; bounded and lined like a page, once per result,
-    /// so a frame draws bounded text only. The v2 cursors, query and page
-    /// cursor are not touched (a legacy bus never has them).
+    /// as nodes and points ([`legacy_nodes`], [`legacy_points`]): the
+    /// nodes in group order like a page (`legacy.endpoint_cursor` walks
+    /// them; the node's id is the endpoint URL, so `Enter` reads its flow
+    /// through `legacy.endpoint_flows`), the points index for index with
+    /// `legacy.points`, whose cursor the Points pane keeps walking; bounded
+    /// and lined once per result, so a frame draws bounded text only. The
+    /// v2 cursors, query and page cursor are not touched (a legacy bus
+    /// never has them).
     pub fn show_legacy(&mut self, legacy: &LegacyState) {
         self.nodes = legacy_nodes(legacy);
         self.nodes.iter_mut().for_each(bound_node);
+        group_nodes(&mut self.nodes);
         self.points = legacy_points(legacy);
         self.points.iter_mut().for_each(bound_point);
         self.lines = node_lines(&self.nodes);
     }
 
     /// Sort `points` into node order (stable, so a node's points keep the
-    /// core's order) and drop the ones naming no node of `nodes`.
+    /// core's order), the orphans last (key `nodes.len()`; fix round G,
+    /// G20), so [`SitemapState::node_points`] finds each node's points
+    /// contiguous and an orphan is never in any node's range.
     fn order_points(&mut self) {
-        let position = |p: &InsertionPoint| -> Option<usize> {
-            let id = p.site_node.as_deref()?;
-            self.nodes.iter().position(|n| n.id == id)
+        let last = self.nodes.len();
+        let position = |p: &InsertionPoint| -> usize {
+            p.site_node
+                .as_deref()
+                .and_then(|id| self.nodes.iter().position(|n| n.id == id))
+                .unwrap_or(last)
         };
         let mut keyed: Vec<(usize, InsertionPoint)> = std::mem::take(&mut self.points)
             .into_iter()
-            .filter_map(|p| position(&p).map(|k| (k, p)))
+            .map(|p| (position(&p), p))
             .collect();
         keyed.sort_by_key(|(k, _)| *k);
         self.points = keyed.into_iter().map(|(_, p)| p).collect();
@@ -318,32 +345,55 @@ fn cut(s: &mut String) {
     }
 }
 
-/// The node lines of `nodes` in group order (D11): one line per node under
-/// its `host[:port]` key, hosts in first-appearance order, each node's
-/// `node` the index it had in `nodes`. The port is shown when it is not the
-/// scheme's default (80 for http, 443 for https).
-pub fn node_lines(nodes: &[SiteNode]) -> Vec<NodeLine> {
+/// Sort `nodes` into group order (D11; fix round G, G22): every node of
+/// one `host[:port]` key before the next key's, keys in the order they
+/// first appear, stable inside a group (a node keeps its place among its
+/// host's). The port is part of the key only when it is not the scheme's
+/// default (80 for http, 443 for https).
+pub fn group_nodes(nodes: &mut [SiteNode]) {
     let mut hosts: Vec<String> = Vec::new();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (k, node) in nodes.iter().enumerate() {
-        let key = host_key(node);
-        match hosts.iter().position(|h| *h == key) {
-            Some(g) => groups[g].push(k),
-            None => {
+    let groups: Vec<usize> = nodes
+        .iter()
+        .map(|node| {
+            let key = host_key(node);
+            hosts.iter().position(|h| *h == key).unwrap_or_else(|| {
                 hosts.push(key);
-                groups.push(vec![k]);
+                hosts.len() - 1
+            })
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..nodes.len()).collect();
+    order.sort_by_key(|k| groups[*k]);
+    // Apply the permutation in place: `order[i]` is the node that moves
+    // to `i`; cycles are followed with swaps.
+    let mut placed = vec![false; nodes.len()];
+    for start in 0..nodes.len() {
+        if placed[start] {
+            continue;
+        }
+        let mut i = start;
+        loop {
+            placed[i] = true;
+            let from = order[i];
+            if from == start {
+                break;
             }
+            nodes.swap(i, from);
+            i = from;
         }
     }
-    hosts
-        .into_iter()
-        .zip(groups)
-        .flat_map(|(host, members)| {
-            members.into_iter().map(move |k| NodeLine {
-                host: host.clone(),
-                text: node_text(&nodes[k]),
-                node: k,
-            })
+}
+
+/// The node lines of `nodes`, one per node, index for index (D11; fix
+/// round G, G22): its `host[:port]` key and its text. `nodes` is expected
+/// in group order ([`group_nodes`]), so the pane opens a host header
+/// wherever the key changes.
+pub fn node_lines(nodes: &[SiteNode]) -> Vec<NodeLine> {
+    nodes
+        .iter()
+        .map(|node| NodeLine {
+            host: host_key(node),
+            text: node_text(node),
         })
         .collect()
 }
@@ -527,23 +577,48 @@ mod tests {
         }
     }
 
-    /// Lines are grouped by `host[:port]` in first-appearance order, the
-    /// default port dropped, each line pointing back at its node.
+    /// Fix round G, G22: the fold sorts the nodes into group order
+    /// (`host[:port]` groups in first-appearance order, stable inside a
+    /// group, the default port dropped), so `lines` is index for index
+    /// with `nodes` and the cursor walks what the pane draws: from `a`,
+    /// Down selects `c` (the next row on screen). An appended page keeps
+    /// the cursor on the same id.
     #[test]
-    fn node_lines_group_by_host_and_keep_the_node_index() {
-        let nodes = vec![
-            node("a", "h1", 8080, "http"),
-            node("b", "h2", 443, "https"),
-            node("c", "h1", 8080, "http"),
-            node("d", "h3", 80, "http"),
-        ];
-        let lines = node_lines(&nodes);
-        let keys: Vec<(&str, usize)> = lines.iter().map(|l| (l.host.as_str(), l.node)).collect();
+    fn fold_sorts_nodes_into_group_order_and_the_cursor_follows_the_id() {
+        let mut s = SitemapState::default();
+        s.fold_result(SitemapResult {
+            nodes: vec![
+                node("a", "h1", 8080, "http"),
+                node("b", "h2", 443, "https"),
+                node("c", "h1", 8080, "http"),
+                node("d", "h3", 80, "http"),
+            ],
+            points: vec![],
+            next_cursor: None,
+        });
+        let ids: Vec<&str> = s.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "b", "d"]);
+        let keys: Vec<&str> = s.lines.iter().map(|l| l.host.as_str()).collect();
+        assert_eq!(keys, vec!["h1:8080", "h1:8080", "h2", "h3"]);
+        assert_eq!(s.lines[0].text, "GET  /a  flows 0 · pts 0");
+        assert_eq!(s.lines.len(), s.nodes.len());
+        assert_eq!(s.node_cursor, 0);
+        s.node_cursor += 1;
+        assert_eq!(s.selected_node().map(|n| n.id.as_str()), Some("c"));
+
+        s.appending = true;
+        s.fold_result(SitemapResult {
+            nodes: vec![node("e", "h2", 443, "https")],
+            points: vec![],
+            next_cursor: None,
+        });
+        let ids: Vec<&str> = s.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "b", "e", "d"], "e joins h2's group");
         assert_eq!(
-            keys,
-            vec![("h1:8080", 0), ("h1:8080", 2), ("h2", 1), ("h3", 3)]
+            s.selected_node().map(|n| n.id.as_str()),
+            Some("c"),
+            "the cursor stays on the same id"
         );
-        assert_eq!(lines[0].text, "GET  /a  flows 0 · pts 0");
         assert!(node_lines(&[]).is_empty());
     }
 
@@ -639,8 +714,8 @@ mod tests {
         assert!(point_line(&points[0]).contains("query"));
     }
 
-    /// The fold sorts points into node order, drops the orphans and settles
-    /// the point cursor onto the selected node's range.
+    /// The fold sorts points into node order, keeps the orphans last and
+    /// settles the point cursor onto the selected node's range.
     #[test]
     fn fold_orders_points_by_node_and_settles_the_cursor() {
         let point = |id: &str, node: Option<&str>| InsertionPoint {
@@ -670,10 +745,14 @@ mod tests {
             next_cursor: Some("c".into()),
         });
         let ids: Vec<&str> = s.points.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, vec!["a1", "b1", "b2"]);
+        assert_eq!(
+            ids,
+            vec!["a1", "b1", "b2", "orphan", "stranger"],
+            "orphans are kept, last, in their order (fix round G, G20)"
+        );
         assert_eq!(s.node_points(0), 0..1);
         assert_eq!(s.node_points(1), 1..3);
-        assert_eq!(s.node_points(7), 3..3);
+        assert_eq!(s.node_points(7), 5..5);
         assert_eq!(s.point_cursor, 0);
         assert_eq!(s.summary(), "2 nodes · 1 points of a · n next page");
 

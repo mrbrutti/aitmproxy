@@ -154,8 +154,9 @@ enum Entry {
 }
 
 /// The Nodes pane: the head, then the lines under their host headers (in
-/// the accent), scrolled so the line of the node at `cursor` is on screen
-/// and highlighted while the pane is focused.
+/// the accent; `lines` is index for index with the nodes, in group order,
+/// so a header opens wherever the key changes), scrolled so the line of the
+/// node at `cursor` is on screen and highlighted while the pane is focused.
 #[allow(clippy::too_many_arguments)]
 fn nodes(
     theme: &Theme,
@@ -195,7 +196,7 @@ fn nodes(
     }
     let cursor_entry = entries
         .iter()
-        .position(|e| matches!(e, Entry::Row(k) if lines[*k].node == cursor))
+        .position(|e| matches!(e, Entry::Row(k) if *k == cursor))
         .unwrap_or(0);
     let h = usize::from(body.height);
     let top = cursor_entry.saturating_sub(h - 1);
@@ -213,7 +214,7 @@ fn nodes(
             ),
             Entry::Row(i) => {
                 let line = &lines[*i];
-                let is_cursor = line.node == cursor;
+                let is_cursor = *i == cursor;
                 if is_cursor && focused {
                     buf.set_style(row, selection_bg(theme));
                 }

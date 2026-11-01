@@ -221,7 +221,9 @@ impl ScanState {
             },
             ScanTab::SiteMap => match (MapSource::from(offer), self.sitemap.pane) {
                 (MapSource::Legacy, MapPane::Nodes) => {
-                    let n = self.legacy.endpoints.len();
+                    // The grouped node list `show_legacy` built from the
+                    // endpoints (fix round G, G22), one node per endpoint.
+                    let n = self.sitemap.nodes.len();
                     Some((&mut self.legacy.endpoint_cursor, n))
                 }
                 (MapSource::Legacy, MapPane::Points) => {
@@ -256,11 +258,14 @@ impl ScanState {
             return None;
         }
         match (MapSource::from(offer), self.sitemap.pane) {
+            // The node under the legacy cursor is the grouped list's (fix
+            // round G, G22); its id is the endpoint URL `endpoint_flows`
+            // is keyed by (AC3).
             (MapSource::Legacy, MapPane::Nodes) => self
-                .legacy
-                .endpoints
+                .sitemap
+                .nodes
                 .get(self.legacy.endpoint_cursor)
-                .and_then(|e| self.legacy.endpoint_flows.get(e).cloned()),
+                .and_then(|n| self.legacy.endpoint_flows.get(&n.id).cloned()),
             (MapSource::Legacy, MapPane::Points) => self
                 .legacy
                 .points

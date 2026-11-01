@@ -216,6 +216,46 @@ fn sitemap_renders_nodes_points_and_pages() {
     assert!(reqs.is_empty(), "no cursor, no request: {reqs:?}");
 }
 
+/// Fix round G, G20: a point whose node is not yet listed is kept, sorted
+/// last and not drawn; when `n` appends the page that carries its node the
+/// point re-attaches and renders under that node.
+#[test]
+fn an_orphan_point_reattaches_when_its_node_arrives() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    let mut first = fixture("scan.sitemap.json");
+    first["points"][1]["site_node"] = json!("node-2");
+    first["points"][1]["name"] = json!("orphan-theme");
+    let _ = app.on_bus(sitemap_reply(first));
+    assert_eq!(app.scan.sitemap.points.len(), 2, "the orphan is kept");
+    assert_eq!(app.scan.sitemap.node_points(0), 0..1);
+    let text = screen(&app);
+    assert!(
+        line_with(&text, "orphan-theme").is_none(),
+        "an orphan is not drawn: {text}"
+    );
+
+    let _ = app.update(Action::ScanNextPage);
+    let mut second = fixture("scan.sitemap.json");
+    second["nodes"][0]["id"] = json!("node-2");
+    second["nodes"][0]["path_template"] = json!("/second");
+    second["points"] = json!([]);
+    second["next_cursor"] = Value::Null;
+    let _ = app.on_bus(sitemap_reply(second));
+    assert_eq!(app.scan.sitemap.nodes.len(), 2);
+    assert_eq!(app.scan.sitemap.node_points(1), 1..2, "re-attached");
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.sitemap.node_cursor, 1);
+    let text = screen(&app);
+    let line = line_with(&text, "orphan-theme")
+        .unwrap_or_else(|| panic!("the point renders under node-2:\n{text}"));
+    assert!(line.contains("cookie"), "{line:?}");
+    assert!(
+        line_with(&text, "2 nodes · 1 points of node-2").is_some(),
+        "the summary counts the re-attached point: {text}"
+    );
+}
+
 /// T7-10: `Enter` on a node opens its first flow and on a point its flow,
 /// both through the flow store: a flow the store lacks is refused with the
 /// one "not in the flow list" toast and the view stays; once a `Flows`
