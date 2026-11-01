@@ -19,6 +19,7 @@
 
 use std::fmt;
 
+use crate::codec::{crc32, internet_checksum};
 use crate::spec::{
     ChecksumAlgo, Endian, FieldKind, FieldSpec, LenOf, Literal, MessageSpec, Relation, Until,
 };
@@ -809,42 +810,6 @@ fn encode_number(kind: FieldKind, value: i64) -> Option<Vec<u8>> {
         FieldKind::Decimal => Some(value.to_string().into_bytes()),
         _ => None,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Checksums
-// ---------------------------------------------------------------------------
-//
-// Task 5 moves these two into `crate::codec` and leaves calls here.
-
-/// CRC-32 (IEEE), table-free.
-pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-/// The RFC 1071 internet checksum.
-pub(crate) fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut pairs = bytes.chunks_exact(2);
-    for pair in &mut pairs {
-        let word = [*pair.first().unwrap_or(&0), *pair.get(1).unwrap_or(&0)];
-        sum = sum.wrapping_add(u32::from(u16::from_be_bytes(word)));
-    }
-    if let Some(last) = pairs.remainder().first() {
-        sum = sum.wrapping_add(u32::from(u16::from_be_bytes([*last, 0])));
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !u16::try_from(sum & 0xffff).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
