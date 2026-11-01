@@ -270,10 +270,14 @@ fn no_source_path_builds_an_ungated_raw_h2_runner() {
         "the one construction must be gated on the same line: {}",
         constructions[0]
     );
+    let accept_any_in_code = h2
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| line.contains("TlsVerify::AcceptAny"))
+        .count();
     assert_eq!(
-        h2.matches("TlsVerify::AcceptAny").count() - h2.matches("`TlsVerify::AcceptAny`").count(),
-        1,
-        "accept-any appears in code exactly once (the rest is documentation)"
+        accept_any_in_code, 1,
+        "accept-any appears on exactly one non-comment line (the rest is documentation)"
     );
     assert!(
         !h2.contains("pub fn new(") && !h2.contains("impl Default for RealRawH2Runner"),

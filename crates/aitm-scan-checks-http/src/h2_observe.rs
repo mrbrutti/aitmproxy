@@ -527,8 +527,7 @@ impl Check for H2Check {
             if !target.is_a_profile_origin(&host.profile().target.origins) {
                 return inconclusive(NOT_A_PROFILE_ORIGIN);
             }
-            let key = target.origin_key();
-            if self.guard.seen(key, Instant::now()) {
+            if self.guard.seen(&target.origin_key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
             // The scope gate: the guarded job client must reach this authority
@@ -549,7 +548,7 @@ impl Check for H2Check {
             }
             // Claimed only now, so a refused baseline does not burn the
             // authority; atomic, so two concurrent points open one connection.
-            if !self.guard.claim(key, Instant::now()) {
+            if !self.guard.claim(&target.origin_key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
             match self.runner.run(plan).await {
@@ -629,11 +628,6 @@ impl Target {
         ];
         headers.extend(extra);
         headers
-    }
-
-    /// See [`Self::origin_key`] (the field).
-    fn origin_key(&self) -> &str {
-        &self.origin_key
     }
 
     /// Whether the job's profile names this origin.
@@ -1031,7 +1025,7 @@ mod tests {
         assert_eq!(t.scheme, "https");
         assert_eq!(t.wire_authority, "origin.test");
         assert_eq!(t.path, "/x");
-        assert_eq!(t.origin_key(), "https://origin.test:443");
+        assert_eq!(t.origin_key, "https://origin.test:443");
 
         // A written port stays on the wire form and in the key; userinfo and
         // case go; a non-http(s) scheme is not dialable.
@@ -1039,7 +1033,7 @@ mod tests {
         assert_eq!(t.scheme, "http");
         assert_eq!(t.wire_authority, "origin.test:8080");
         assert_eq!(t.path, "/a/b");
-        assert_eq!(t.origin_key(), "http://origin.test:8080");
+        assert_eq!(t.origin_key, "http://origin.test:8080");
         assert!(Target::parse("ftp://origin.test/").is_none());
         assert!(Target::parse("//origin.test/").is_none());
     }

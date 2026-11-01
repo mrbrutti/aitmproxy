@@ -775,14 +775,16 @@ impl RawH2Client {
 fn validate_and_encode(plan: &RawH2Plan) -> Result<Vec<Vec<u8>>> {
     if plan.streams > MAX_RAW_STREAMS {
         anyhow::bail!(
-            "a raw h2 probe opens at most 8 streams on its one connection; the plan declares {}",
+            "a raw h2 probe opens at most {MAX_RAW_STREAMS} streams on its one connection; the \
+             plan declares {}",
             plan.streams
         );
     }
     let wanted = plan.mode.stream_count();
     if wanted > MAX_RAW_STREAMS as usize {
         anyhow::bail!(
-            "a raw h2 probe opens at most 8 streams on its one connection; this mode opens {wanted}"
+            "a raw h2 probe opens at most {MAX_RAW_STREAMS} streams on its one connection; this \
+             mode opens {wanted}"
         );
     }
     if wanted > plan.streams as usize {
@@ -1773,9 +1775,12 @@ mod driver_tests {
             .await
             .expect_err("nine streams is refused");
 
-        assert!(
-            err.to_string().contains("at most 8 streams"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "a raw h2 probe opens at most {MAX_RAW_STREAMS} streams on its one connection; \
+                 the plan declares 9"
+            )
         );
         assert_eq!(dialer.calls(), 0);
     }
@@ -1789,9 +1794,12 @@ mod driver_tests {
             .await
             .expect_err("nine reset pairs is refused");
 
-        assert!(
-            err.to_string().contains("at most 8 streams"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "a raw h2 probe opens at most {MAX_RAW_STREAMS} streams on its one connection; \
+                 this mode opens 9"
+            )
         );
         assert_eq!(dialer.calls(), 0);
     }
@@ -2275,9 +2283,12 @@ mod driver_tests {
             .await
             .expect_err("nine blocks are refused");
 
-        assert!(
-            err.to_string().contains("at most 8 streams"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "a raw h2 probe opens at most {MAX_RAW_STREAMS} streams on its one connection; \
+                 this mode opens 9"
+            )
         );
         assert_eq!(dialer.calls(), 0);
     }
