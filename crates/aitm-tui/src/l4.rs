@@ -300,6 +300,17 @@ impl L4Availability {
     pub fn reason_text(&self) -> &str {
         self.reason.as_deref().unwrap_or("unknown")
     }
+
+    /// The one refusal rule for an L4 capability class (L4 parity spec §1 /
+    /// AC33): `None` while available; otherwise the toast to show,
+    /// `<class> unavailable: <reason>`, so the caller sends nothing. `class`
+    /// is `inject`, `capture` or `in-path intercept`.
+    pub fn refusal(&self, class: &str) -> Option<String> {
+        if self.available {
+            return None;
+        }
+        Some(format!("{class} unavailable: {}", self.reason_text()))
+    }
 }
 
 impl Default for L4Availability {
@@ -839,15 +850,6 @@ impl L4Confirm {
         })
     }
 
-    /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
-    /// `None` when the reply is not a complete confirmation handshake.
-    pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
-        match Self::classify(call, args, reply) {
-            ConfirmReply::Handshake(c) => Some(c),
-            ConfirmReply::Malformed | ConfirmReply::Plain => None,
-        }
-    }
-
     /// The args to re-send on confirm: the originals plus the `_confirm` token.
     pub fn confirmed_args(&self) -> Value {
         let mut args = self.args.clone();
@@ -1056,12 +1058,19 @@ mod tests {
     fn confirm_round_trip_adds_the_token() {
         let args = json!({"spec": {"layers": []}, "dst": "127.0.0.1", "port": 7});
         let reply = json!({"status": "needs_confirmation", "prompt": "Inject 1 UDP to 127.0.0.1:7?", "confirm_token": "tok-9"});
-        let c = L4Confirm::from_reply("l4.inject", &args, &reply).unwrap();
+        let ConfirmReply::Handshake(c) = L4Confirm::classify("l4.inject", &args, &reply) else {
+            panic!("a complete handshake classifies as Handshake");
+        };
+        assert_eq!(c.call, "l4.inject");
+        assert_eq!(c.prompt, "Inject 1 UDP to 127.0.0.1:7?");
         assert_eq!(c.token, "tok-9");
         assert_eq!(c.confirmed_args()["_confirm"], "tok-9");
         assert_eq!(c.confirmed_args()["dst"], "127.0.0.1");
         // A plain success is not a confirmation handshake.
-        assert!(L4Confirm::from_reply("l4.inject", &args, &json!({"injected": 1})).is_none());
+        assert_eq!(
+            L4Confirm::classify("l4.inject", &args, &json!({"injected": 1})),
+            ConfirmReply::Plain
+        );
     }
 
     #[test]

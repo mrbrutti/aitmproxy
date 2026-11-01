@@ -3859,3 +3859,178 @@ fn quality_inert_maps_every_control_character_to_a_dot() {
     assert_eq!(inert("plain · text"), "plain · text");
     assert_eq!(inert(""), "");
 }
+
+/// Security pass-2 Minor 1: a `CallFailed` clears `pending` only when it names
+/// the pending call. A failed operator `:scope add l4 …` clears its pending
+/// entry (so a later same-name handshake cannot bind stale args); a failed
+/// `l4.intercept.forward` leaves a pending inject exactly where it was.
+#[test]
+fn call_failed_clears_pending_only_for_its_own_name() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let reqs = on.run_command("scope add l4 10.0.0.0/8 1-65535 en0 inbound capture");
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert_eq!(
+        on.l4.pending,
+        Some((
+            "l4.scope.add".to_string(),
+            json!({
+                "cidr": "10.0.0.0/8", "ports": "1-65535", "interface": "en0",
+                "direction": "inbound", "capability": "capture"
+            })
+        ))
+    );
+    let reqs = on.on_bus(BusEvent::CallFailed {
+        name: "l4.scope.add".into(),
+        message: "interface en0 not found".into(),
+    });
+    assert_eq!(reqs, Vec::<BusRequest>::new());
+    assert!(on.l4.pending.is_none(), "{:?}", on.l4.pending);
+    assert_eq!(toast_text(&on), "interface en0 not found");
+    assert_eq!(toast_level(&on), Some(Level::Error));
+
+    let mut inj = inject_ready(available());
+    let _ = inj.update(Action::L4Inject);
+    assert_eq!(
+        inj.l4.pending,
+        Some(("l4.inject".to_string(), inject_args()))
+    );
+    let reqs = inj.on_bus(BusEvent::CallFailed {
+        name: "l4.intercept.forward".into(),
+        message: "no parked packet P9".into(),
+    });
+    assert_eq!(reqs, Vec::<BusRequest>::new());
+    assert_eq!(
+        inj.l4.pending,
+        Some(("l4.inject".to_string(), inject_args())),
+        "a foreign verb's failure leaves the inject pending"
+    );
+    // The inject's own failure clears it.
+    let _ = inj.on_bus(BusEvent::CallFailed {
+        name: "l4.inject".into(),
+        message: "out of scope".into(),
+    });
+    assert!(inj.l4.pending.is_none(), "{:?}", inj.l4.pending);
+}
+
+/// Security pass-2 Minor 2: while a control's call is already pending, a second
+/// press of the same control sends nothing and toasts
+/// `<call> is already waiting for the core`; the pending args are untouched.
+/// Once the reply lands (a plain result, or a handshake that was answered) the
+/// control sends again.
+#[test]
+fn same_verb_in_flight_sends_once_and_toasts_until_the_reply() {
+    // Inject: two `s` presses, one `l4.inject` on the bus.
+    let mut inj = inject_ready(available());
+    let first = inj.update(Action::L4Inject);
+    assert_eq!(
+        first,
+        vec![BusRequest::Call {
+            name: "l4.inject".into(),
+            args: inject_args(),
+        }]
+    );
+    inj.toasts.clear();
+    let second = inj.update(Action::L4Inject);
+    assert_eq!(second, Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&inj),
+        "l4.inject is already waiting for the core"
+    );
+    assert_eq!(toast_level(&inj), Some(Level::Warn));
+    assert_eq!(
+        inj.l4.pending,
+        Some(("l4.inject".to_string(), inject_args()))
+    );
+    // A plain reply settles it; the next press sends again.
+    let _ = inj.on_bus(BusEvent::CallOk {
+        name: "l4.inject".into(),
+        value: json!({"injected": 1}),
+    });
+    assert!(inj.l4.pending.is_none());
+    assert_eq!(inj.update(Action::L4Inject), first);
+
+    // Scope add: the second typed command is refused the same way; after the
+    // handshake is answered a new one goes out.
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let cmd = "scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture";
+    let first = on.run_command(cmd);
+    assert_eq!(first.len(), 1, "{first:?}");
+    on.toasts.clear();
+    assert_eq!(on.run_command(cmd), Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&on),
+        "l4.scope.add is already waiting for the core"
+    );
+    assert_eq!(toast_level(&on), Some(Level::Warn));
+    let _ = on.on_bus(BusEvent::CallOk {
+        name: "l4.scope.add".into(),
+        value: handshake("Add 127.0.0.1/32?", "tok-s"),
+    });
+    assert_eq!(on.mode, Mode::L4Confirm);
+    assert!(on.l4.pending.is_none());
+    let confirmed = on.update(Action::L4Confirm(true));
+    assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+    assert_eq!(on.run_command(cmd), first);
+
+    // Forward: `Resume` twice is one `l4.intercept.forward`; the guard is by
+    // call name, so `Kill` (drop) is a different verb and still goes out.
+    let mut park = intercept_ready(vec![parked_p1()]);
+    let fwd = park.update(Action::Resume);
+    assert_eq!(
+        fwd,
+        vec![BusRequest::Call {
+            name: "l4.intercept.forward".into(),
+            args: json!({"id": "P1"}),
+        }]
+    );
+    park.toasts.clear();
+    assert_eq!(park.update(Action::Resume), Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&park),
+        "l4.intercept.forward is already waiting for the core"
+    );
+    assert_eq!(
+        park.l4.pending,
+        Some(("l4.intercept.forward".to_string(), json!({"id": "P1"})))
+    );
+    assert_eq!(
+        park.update(Action::Kill),
+        vec![BusRequest::Call {
+            name: "l4.intercept.drop".into(),
+            args: json!({"id": "P1"}),
+        }]
+    );
+    park.toasts.clear();
+    assert_eq!(park.update(Action::Kill), Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&park),
+        "l4.intercept.drop is already waiting for the core"
+    );
+}
+
+/// Quality pass-2 Minor 2: the refusal rule is a pure method on the
+/// availability — `None` while available, otherwise the exact toast text with
+/// the core's reason or the one fallback `unknown`.
+#[test]
+fn quality_refusal_is_pure_and_keeps_every_literal() {
+    assert_eq!(available().refusal("capture"), None);
+    assert_eq!(available().refusal("inject"), None);
+    assert_eq!(
+        unavailable("R").refusal("capture"),
+        Some("capture unavailable: R".to_string())
+    );
+    assert_eq!(
+        unavailable("needs root").refusal("inject"),
+        Some("inject unavailable: needs root".to_string())
+    );
+    assert_eq!(
+        L4Availability::pending().refusal("inject"),
+        Some("inject unavailable: Reading L4 availability…".to_string())
+    );
+    assert_eq!(
+        L4Availability::from_reply(&json!({"available": false})).refusal("in-path intercept"),
+        Some("in-path intercept unavailable: unknown".to_string())
+    );
+}

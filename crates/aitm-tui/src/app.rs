@@ -2078,8 +2078,8 @@ impl App {
         let Some(flow) = self.selected_l4().cloned() else {
             return Vec::new();
         };
-        let capture = self.l4.capture.clone();
-        if self.refuse_if_unavailable("inject", &capture) {
+        if let Some(t) = self.l4.capture.refusal("inject") {
+            self.toast(Level::Warn, t);
             return Vec::new();
         }
         if !self.has_tool("l4.inject") {
@@ -2109,6 +2109,9 @@ impl App {
         let mut args = json!({ "spec": spec.clone(), "interface": flow.interface });
         if let Some(dst) = craft_dst(&spec) {
             args["dst"] = Value::String(dst);
+        }
+        if self.l4_in_flight("l4.inject") {
+            return Vec::new();
         }
         self.l4.pending = Some(("l4.inject".to_string(), args.clone()));
         vec![BusRequest::Call {
@@ -2156,6 +2159,7 @@ impl App {
             return Vec::new();
         }
         match crate::l4::scope_add_args(words) {
+            Ok(_) if self.l4_in_flight("l4.scope.add") => Vec::new(),
             Ok(args) => {
                 self.l4.pending = Some(("l4.scope.add".to_string(), args.clone()));
                 vec![BusRequest::Call {
@@ -2200,6 +2204,9 @@ impl App {
             return Vec::new();
         };
         let args = json!({ "id": parked_id });
+        if self.l4_in_flight(tool) {
+            return Vec::new();
+        }
         self.l4.pending = Some((tool.to_string(), args.clone()));
         vec![BusRequest::Call {
             name: tool.to_string(),
@@ -2207,21 +2214,19 @@ impl App {
         }]
     }
 
-    /// The one refusal rule for an L4 capability class (L4 parity spec §1 /
-    /// AC33): while `availability` says unavailable, toast
-    /// `<class> unavailable: <reason>` (the core's reason, or `unknown`) and
-    /// report `true` so the caller sends nothing. `class` is `inject`,
-    /// `capture` or `in-path intercept`.
-    fn refuse_if_unavailable(
-        &mut self,
-        class: &str,
-        availability: &crate::l4::L4Availability,
-    ) -> bool {
-        if availability.available {
+    /// The single-flight rule for a guarded L4 control: while `pending`
+    /// already holds `call` (its first request has not been answered), a
+    /// second press toasts and sends nothing, so one overlay can never bind
+    /// to another in-flight request's prompt and token (the `CallOk` arm binds
+    /// by name alone). `true` means the caller must send nothing.
+    fn l4_in_flight(&mut self, call: &str) -> bool {
+        if !matches!(&self.l4.pending, Some((c, _)) if c == call) {
             return false;
         }
-        let text = format!("{class} unavailable: {}", availability.reason_text());
-        self.toast(Level::Warn, text);
+        self.toast(
+            Level::Warn,
+            format!("{call} is already waiting for the core"),
+        );
         true
     }
 
@@ -2231,8 +2236,8 @@ impl App {
     /// packet listed for the flow, or the flow out of L4 scope. `None` means
     /// nothing may reach the bus; the toast says why.
     fn l4_parked_target(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Option<String> {
-        let intercept = self.l4.intercept.clone();
-        if self.refuse_if_unavailable("in-path intercept", &intercept) {
+        if let Some(t) = self.l4.intercept.refusal("in-path intercept") {
+            self.toast(Level::Warn, t);
             return None;
         }
         if !self.has_tool(tool) {
@@ -3566,8 +3571,8 @@ impl App {
             self.toast(Level::Error, L4_USAGE);
             return Vec::new();
         }
-        let capture = self.l4.capture.clone();
-        if self.refuse_if_unavailable("capture", &capture) {
+        if let Some(t) = self.l4.capture.refusal("capture") {
+            self.toast(Level::Warn, t);
             return Vec::new();
         }
         if !self.has_tool("l4.capture.start") {
@@ -3594,8 +3599,8 @@ impl App {
         }
         let ids: Vec<String> = match named {
             Some(id) => {
-                let capture = self.l4.capture.clone();
-                if self.refuse_if_unavailable("capture", &capture) {
+                if let Some(t) = self.l4.capture.refusal("capture") {
+                    self.toast(Level::Warn, t);
                     return Vec::new();
                 }
                 vec![id.to_string()]
@@ -4507,9 +4512,18 @@ impl App {
                         }
                     }
                     // A guard refusal (out-of-scope / rate / denylist / oversize /
-                    // count) is surfaced verbatim; drop the pending confirm.
-                    "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
-                        self.l4.pending = None;
+                    // count) is surfaced verbatim; drop the pending confirm —
+                    // only the one this failure names, so a foreign verb's
+                    // failure leaves another control's pending call in place
+                    // (symmetric with the `CallOk` take above).
+                    "l4.inject"
+                    | "l4.send_recv"
+                    | "l4.intercept.forward"
+                    | "l4.intercept.drop"
+                    | "l4.scope.add" => {
+                        if matches!(&self.l4.pending, Some((c, _)) if *c == name) {
+                            self.l4.pending = None;
+                        }
                     }
                     // A refused or failed crawl clears the running flag and keeps
                     // the reason in the Scan view until the next launch.
