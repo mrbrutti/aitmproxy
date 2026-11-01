@@ -1625,6 +1625,9 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 7 | quality (F4) | Minor | `decide` rustdoc misstates the call graph; the `else { return 0 }` after `decide(Some(..))` is unreachable | accepted (recorded), orchestrator 2026-10-31; fold into the scaffolding follow-up (reword doc or `unreachable!`) |
+| crate | quality (F4) | Minor | rustdoc intra-doc links to `pub(crate)` items (not gated) | accepted (recorded); `#![allow(rustdoc::private_intra_doc_links)]` or plain backticks in the follow-up |
+| 10 | quality (F4) | Minor | config-path resolution spelled in both `main` and `run` | accepted (recorded); `Invocation::config_path()` in the follow-up |
 | 4 | quality (re-run) | Important | two state-file tests compare against a `StateFile::new` stamped after the save (`saved_at` second boundary) — gate flaky (2/4 runs) | fixed in F4 (expected built once before the save) |
 | 6 | quality (re-run) | Minor | idempotent `set` reports `services` minus authenticated rows (Q4 side effect) | fixed in F4 (`Snapshot.rows`) |
 | 6 | quality (re-run) | Minor | `target_os: String` not fixed in F3 as recorded; residual `merge_bypass(&defaults(), …)` spelling | fixed in F4 (`is_windows: bool`, `bypass_for(&[], …)`) |
