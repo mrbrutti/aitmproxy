@@ -836,3 +836,163 @@ fn issues_timer_counts_from_the_last_fetch_not_the_tick_modulo() {
     assert_eq!(fired_at, vec![39], "twenty ticks after the stamp, once");
     assert_eq!(app.scan.issues.fetched_at_tick, Some(39));
 }
+
+/// A `scan.issues` page whose `k`th row is the fixture's first row with
+/// the id and name of `rows[k]`, every row high so the tally reads it.
+fn named_page(rows: &[(&str, &str)]) -> Value {
+    let template = fixture("scan.issues.json")["issues"][0].clone();
+    let issues: Vec<Value> = rows
+        .iter()
+        .map(|(id, name)| {
+            let mut row = template.clone();
+            row["id"] = json!(id);
+            row["name"] = json!(name);
+            row
+        })
+        .collect();
+    json!({
+        "issues": issues,
+        "next_cursor": null,
+        "by_severity": { "critical": 0, "high": rows.len(), "medium": 0, "low": 0, "info": 0 },
+    })
+}
+
+/// [`issue_reply`] with the issue's `name` rewritten too, so the row the
+/// fold rebuilds from the reply keeps the name the page gave it.
+fn named_issue_reply(id: &str, name: &str) -> BusEvent {
+    let mut issue = fixture("scan.issue.json");
+    issue["id"] = json!(id);
+    issue["name"] = json!(name);
+    reply(&format!("scan.issue:{id}"), "scan.issue", issue)
+}
+
+/// The Scan box's rows split at the pane rule: `(list, detail)` text per
+/// screen line, each trimmed, for the lines that have both panes.
+fn panes(text: &str) -> Vec<(&str, &str)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('│');
+            let _edge = parts.next()?;
+            let list = parts.next()?;
+            let detail = parts.next()?;
+            Some((list.trim(), detail.trim()))
+        })
+        .collect()
+}
+
+/// The list row the `>` cursor mark is drawn on.
+fn marked_row(text: &str) -> String {
+    let marked: Vec<&str> = panes(text)
+        .into_iter()
+        .filter_map(|(list, _)| list.strip_prefix('>'))
+        .collect();
+    assert_eq!(marked.len(), 1, "one cursor row: {marked:?}\n{text}");
+    marked[0].to_string()
+}
+
+const ID_A: &str = "issue-000000aa";
+const ID_B: &str = "issue-000000bb";
+const ID_C: &str = "issue-000000cc";
+const ID_D: &str = "issue-000000dd";
+const PAGE_ABCD: &[(&str, &str)] = &[
+    (ID_A, "Issue A"),
+    (ID_B, "Issue B"),
+    (ID_C, "Issue C"),
+    (ID_D, "Issue D"),
+];
+
+/// An Issues tab on `PAGE_ABCD` with the cursor on row 3 (`ID_D`), rows
+/// 0 and 3 read and nothing in flight.
+fn app_on_row_three() -> App {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let reqs = app.on_bus(issues_reply(named_page(PAGE_ABCD)));
+    assert_eq!(reqs, vec![issue_request(ID_A)]);
+    for _ in 0..3 {
+        let reqs = app.update(Action::Down);
+        assert!(reqs.is_empty(), "a read is pending: {reqs:?}");
+    }
+    assert_eq!(app.scan.issues.cursor, 3);
+    // The pending read settles and the held landing on row 3 is retried.
+    let reqs = app.on_bus(named_issue_reply(ID_A, "Issue A"));
+    assert_eq!(reqs, vec![issue_request(ID_D)]);
+    let reqs = app.on_bus(named_issue_reply(ID_D, "Issue D"));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.issues.pending_read, None);
+    assert_eq!(app.scan.issues.detail().map(|i| i.id.as_str()), Some(ID_D));
+    app
+}
+
+/// Spec D11 (ruling 2026-11-01, H75): the Issues list cursor follows the
+/// issue id across folds. On row 3 (`Issue D`), a refetched page that
+/// lists that issue at row 1 leaves the cursor on it: `cursor_issue()` is
+/// the same id, the `>` row drawn is `Issue D`, the detail is still its,
+/// and the fold sends no second `scan.issue` for an id already read.
+#[test]
+fn the_issues_cursor_follows_the_issue_id_across_a_fold() {
+    let mut app = app_on_row_three();
+    let refetched = named_page(&[
+        (ID_B, "Issue B"),
+        (ID_D, "Issue D"),
+        (ID_A, "Issue A"),
+        (ID_C, "Issue C"),
+    ]);
+    let reqs = app.on_bus(issues_reply(refetched));
+    assert!(
+        reqs.is_empty(),
+        "the cursor's issue is read already: {reqs:?}"
+    );
+    assert_eq!(app.scan.issues.cursor, 1, "re-found at its new row");
+    assert_eq!(
+        app.scan.issues.cursor_issue().map(|i| i.id.as_str()),
+        Some(ID_D),
+        "the cursor stays on the issue, not the index"
+    );
+    let detail = app.scan.issues.detail().expect("the detail is still read");
+    assert_eq!(detail.id.as_str(), ID_D);
+    assert_eq!(detail.name, "Issue D");
+
+    let text = screen(&app);
+    let row = marked_row(&text);
+    assert!(
+        row.contains("Issue D"),
+        "the > row is the issue the operator was on: {row:?}"
+    );
+    assert!(
+        !row.contains("Issue B"),
+        "row 1's old occupant is not marked: {row:?}"
+    );
+    let head = panes(&text)
+        .into_iter()
+        .map(|(_, detail)| detail)
+        .find(|d| d.starts_with("Issue "))
+        .unwrap_or_default();
+    assert_eq!(head, "Issue D   high · certain · open");
+}
+
+/// H75's other half: when the refetched page no longer lists the cursor's
+/// id, the index clamps as before (row 3 of four becomes row 1 of two), the
+/// row now under the cursor is unread, so one `scan.issue` goes out for it,
+/// and the dropped issue leaves `read`.
+#[test]
+fn a_fold_that_drops_the_cursor_id_clamps_the_index() {
+    let mut app = app_on_row_three();
+    let refetched = named_page(&[(ID_B, "Issue B"), (ID_C, "Issue C")]);
+    let reqs = app.on_bus(issues_reply(refetched));
+    assert_eq!(app.scan.issues.cursor, 1, "clamped to the last row");
+    assert_eq!(
+        app.scan.issues.cursor_issue().map(|i| i.id.as_str()),
+        Some(ID_C)
+    );
+    assert_eq!(reqs, vec![issue_request(ID_C)], "the new row is unread");
+    assert!(
+        !app.scan.issues.read.contains(ID_D),
+        "the dropped id left read"
+    );
+    assert!(
+        app.scan.issues.detail().is_none(),
+        "nothing read for row 1 yet"
+    );
+    let row = marked_row(&screen(&app));
+    assert!(row.contains("Issue C"), "{row:?}");
+}

@@ -491,19 +491,24 @@ pub struct IssuesState {
 
 impl IssuesState {
     /// Fold a `scan.issues` reply (spec D10): the page replaces `list` and
-    /// `rows`, the tally and `next_cursor`; the list cursor is clamped to
-    /// the new page. Hostile-core bounds (D6): a row whose id is not in the
-    /// wire form is dropped, the page is cut to [`ISSUES_PAGE_LIMIT`], the
-    /// row strings are bounded here, and `read` keeps only the ids the page
-    /// lists.
+    /// `rows`, the tally and `next_cursor`; the list cursor follows the
+    /// issue id it was on, re-found in the new page like the Jobs and Site
+    /// map cursors (spec D11; fix round H, H75: a refetch after a status
+    /// change moved the rows under a fixed index), and is clamped to the
+    /// page only when that id is gone. Hostile-core bounds (D6): a row
+    /// whose id is not in the wire form is dropped, the page is cut to
+    /// [`ISSUES_PAGE_LIMIT`], the row strings are bounded here, and `read`
+    /// keeps only the ids the page lists.
     pub fn fold_result(&mut self, mut result: IssuesResult) {
         result.issues.retain(|i| is_issue_id(&i.id));
         result.issues.truncate(ISSUES_PAGE_LIMIT);
+        let selected = self.cursor_issue().map(|i| i.id.clone());
         self.rows = result.issues.iter().map(issue_row).collect();
         self.list = result.issues;
         self.by_severity = result.by_severity;
         self.next_cursor = result.next_cursor;
-        self.cursor = self.cursor.min(self.list.len().saturating_sub(1));
+        let found = selected.and_then(|id| self.list.iter().position(|i| i.id == id));
+        self.cursor = found.unwrap_or(self.cursor.min(self.list.len().saturating_sub(1)));
         let listed: BTreeSet<&str> = self.list.iter().map(|i| i.id.as_str()).collect();
         self.read.retain(|id, _| listed.contains(id.as_str()));
         debug_assert_eq!(
