@@ -26,6 +26,11 @@ the edited response is what curl receives.
 Rule: a wire form is proven against the real core, never against the fixture
 double — one unknown key refuses the whole call and the fixture never says so.
 
+Superseded 2026-10-31 by #208: the core's wildcard now has the preview's semantics
+(`*` any run, `?` literal, substring when star-less, leading `/` path-only,
+case-insensitive, full URL or path), so a wildcard travels as `{wildcard}` as
+typed and `wildcardRegex` is gone; the field discipline above stands.
+
 ## 2026-10-31 — The inspector kept the parked copy after Apply & Resume
 
 Symptom: after editing a parked response's status to 203 and pressing Apply &
