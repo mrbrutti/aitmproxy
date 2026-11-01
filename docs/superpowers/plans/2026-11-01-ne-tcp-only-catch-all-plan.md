@@ -395,6 +395,7 @@ Kept by the main session during stage 6. One row per finding.
 | 4 | Quality (r3) | Minor | R3-1: `begin`'s lead sentence ("`completion` receives THAT apply's result, never a reconcile apply's") contradicts the parked-begin arms enumerated below it. | Fixed in `5ea7a3d8` (comment-only). |
 | 4 | Quality (r3) | Minor | R3-2: provider error-branch comment opens with "Already reported by `logRuleEvent(.applyFailed)`", untrue on the ECANCELED arm until the parenthetical four lines later. | Fixed in `5ea7a3d8` (comment-only). |
 | — | Quality (r3) | Minor | R3-3: `fix R2-n` labels in code comments did not resolve to this Review log (rows were labelled "(r2)" only). | Fixed in the docs commit that carries this row: the four round-2 rows now start with their `R2-n` label. |
+| 4 | Tester (r3) | — (test hardening) | The exact R2-3 regression (`answerStartup` invoking before clearing) made vector J re-enter `stop()` without end: the self-check died with `Segmentation fault: 11` and printed nothing (the Recorder prints at the end). | Fixed in `fb4bf3d0` (tests only): vector J bounds its re-entry at 8 nested stops; the same mutation now prints 4 labelled J FAIL lines. Round-3 Tester PASS with mutation evidence for R2-1/R2-3/R2-4. |
 | — | Security (r3), Spec (r3) | — | Round 3: PASS, no findings (security: every re-entrancy claim verified from source, `handleNewFlow`/`handleNewUDPFlow` md5-identical to base; spec: every amended sentence pinned, Review log matches the code). | Recorded 2026-11-01. |
 
 ## Shipped
