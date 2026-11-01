@@ -3,24 +3,20 @@
 The terminal operator UI for aitmproxy: a ratatui client of the command bus
 (the MCP server in `aitm-mcp`), one binary for macOS and Linux. It shows the
 same shell as the macOS app and the web UI (sidebar, chip bar, flow list,
-intercept bar, inspector, status bar), built from the same tokens file and
-the same recorded fixture. Design, degradations and the bus contract are in
+intercept bar, inspector, status bar), built from the same tokens file.
+Design, degradations and the bus contract are in
 [`docs/design/operator-ui-foundation.md`](../../docs/design/operator-ui-foundation.md)
 (§2.9, §2.10(c), §4.2).
 
 ## Run
 
 ```
-usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]
-       aitm-tui --snapshot out.svg [--cols N --rows N]
-       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the core tools)
+usage: aitm-tui --bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] [--poc-dir dir] [--ansi|--truecolor] [--poll ms]
        --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it
        --expect-role: the role you expect the token to resolve to; the status line warns if it does not (it is never sent to the server)
 ```
 
-(The binary's own usage text still says "the 56 core tools" for `--snapshot-core`;
-the list it uses, `CORE_TOOLS`, has 59.) With neither `--bus` nor `--fixture`, and
-no `AITM_BUS`, it prints this usage and exits with status 2.
+With no `--bus` and no `AITM_BUS` it prints this usage and exits with status 2.
 
 **Against a running proxy.** The proxy's loopback TCP transport and its token.
 Configure that transport in the proxy's `config.yaml`, start the proxy (`aitm`), and
@@ -76,17 +72,6 @@ otherwise a fresh `aitm-tui-<pid>.log` is created under the system temp
 directory for this run. Either way the file is owner-only (`0600`) on Unix,
 and the status bar's startup toast says where it went — or that there is no
 log because `RUST_LOG` is unset.
-
-**Fixture.** `aitm-tui --fixture` runs against the built-in
-`fixtures/bus-fixture.json`; `--fixture path/to.json` against another recording.
-
-**Snapshot.** `aitm-tui --snapshot out.svg --cols 200 --rows 50` renders the
-main screen from the fixture and exits. The extension picks the format:
-`.svg`, `.ans`/`.ansi` (escape codes), anything else plain text. Default 200×50.
-`--snapshot-core` renders the same screen against the fixture limited to the
-59 tools in `CORE_TOOLS` (`crates/aitm-tui/src/lib.rs`), the commands the core
-serves. The built-in fixture currently carries exactly those 59, so the two
-pictures are the same.
 
 `--ansi` forces the 16-colour palette, `--truecolor` the hex palette;
 otherwise the terminal is detected (see Terminal capabilities).
@@ -346,8 +331,9 @@ such a bus as `PRE_MERGE_TOOLS`.
 Confirmations are **local** until F1: `ca.install` and `ca.uninstall` (the
 `CONFIRM_TOOLS` list) ask for `y/N` in the TUI before anything is sent, because
 the bus has no `confirm` on the wire yet and the TUI's server identity is
-`Frontend::Mcp`; `dry_run=true` skips the prompt. The fixture contains the
-F1 tools in their proposed shape and every lit tool in the core's real shape.
+`Frontend::Mcp`; `dry_run=true` skips the prompt. The core serves the F1 tools
+in their real shape; `CORE_TOOLS` in `src/lib.rs` lists what the TUI expects
+and `crates/aitm/tests/tui_live_bus.rs` pins it against the running server.
 Sidebar items whose feature is further out carry their label (`F10` saved
 sessions, `M3` scripts); the Browser item's count is the open tab count, a
 dash until F14 (`browser.tabs`).
@@ -391,30 +377,31 @@ Detected once at start from the environment (`caps.rs`):
 
 `--ansi` and `--truecolor` override detection.
 
-## Fixture and snapshots for UI work
+## Testing
 
-`fixtures/bus-fixture.json` is a recorded bus: server info, listening address,
-scope, agent state, the `tools/list` reply, 15 flows (the mockup's rows
-41–54 plus `f40`, the 101 upgrade the WebSocket flow `f47` names as its
-handshake — on the real bus a WebSocket summary carries only that id, and
-the row takes its URL from it), a PoC library of 3 files (`pocs`, what
-`poc.list` / `poc.get` serve), 2 recorded `poc.run` results (`findings`,
-replayed as `CallOk { name: "poc.run" }` since the core keeps no run
-history), `poc.artifact` bytes, and the redacted `config.get` object. Per
-foundation §2.10 it is the one fixture shared by the macOS, web and TUI
-surfaces, so a screen renders the same data everywhere. Bodies are readable
-`body_text` and WebSocket messages `data_text`; the fixture transport
-base64-encodes them as `body` / `data` with `body_size` / `length` the way
-`flow.detail` does. Mutating commands update it in memory the way the core
-would (resume attaches the recorded `on_resume` response, kill marks the
-flow, replay and `request.send` append, `flow.clear` drops completed flows).
-In tests, `aitm_tui::fixture_app(cols, rows)` loads it into an `App`
-(`fixture_app_core` with only the 59 core tools); `snapshot::render` draws to
-a buffer and `to_text` / `to_svg` / `to_ansi` serialise it.
-`docs/design/tui/main-screen.svg` is such a snapshot with every proposed tool
-present; `docs/design/tui/main-screen-core.svg` is the same screen against
-the 59 core tools — with M4 merged the F1 agent surface is lit, so the core
-screen now matches the full one.
+Three kinds of check, and nothing else counts as evidence:
+
+- **Unit and integration tests with inline inputs.** `cargo test -p aitm-tui`.
+  Every test builds its `App` from literals in the core's wire shapes:
+  `tests/common/mod.rs` has `App::new` + `connect` (a bus offering the
+  `CORE_TOOLS` names, or `PRE_MERGE_TOOLS` to prove degradation), `summary`
+  for a `flow.get` row, and `draw` / `text_of` to read the screen through
+  `ui::render` into an off-screen buffer.
+- **The real-server contract.** `cargo test -p aitm --test tui_live_bus`
+  spawns a real core and pins `CORE_TOOLS` against its `tools/list`. It binds
+  a port, so it runs in a real shell (the Terminal panel), never the sandbox.
+- **The real run.** `aitm tui` (in-process), or `aitm-tui --bus 127.0.0.1:9090
+  --token-file …` against a running proxy, with real traffic:
+  `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` against
+  `python3 -m http.server 8099 --bind 127.0.0.1`, and the row appears in the
+  list. A capture of that screen is what a PR body shows.
+
+The recorded bus fixture and the snapshot mode (`bus-fixture.json`, its
+loaders and the SVG/ANSI renderer) were removed on 2026-10-31 (spec
+`2026-10-31-remove-fake-data-ui-modes`): they rendered sample data that let
+broken builds look healthy. They must not come back; a test that needs data
+writes it inline. `docs/design/tui/main-screen*.svg` are design-history
+images from that removed snapshot mode and are not regenerable.
 
 ## Development
 

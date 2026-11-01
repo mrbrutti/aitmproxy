@@ -1,9 +1,8 @@
 //! The operator UI's state and its reducer. `App` is plain data; `update`
 //! takes an [`Action`] and returns the [`BusRequest`]s it implies; `on_bus`
 //! folds a [`BusEvent`] in. No terminal, no socket, no clock: the loop in
-//! `lib.rs` owns those, which is what lets every screen be tested from fixture
-//! data (foundation §2.10: "one fixture file … so a screen renders the same
-//! data on every platform").
+//! `lib.rs` owns those, which is what lets every screen be tested from
+//! `BusEvent`s written inline in the core's wire shapes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
