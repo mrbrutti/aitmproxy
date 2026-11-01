@@ -12,11 +12,19 @@ the proxy cannot fabricate — never a fixture:
     (the exact DER we minted), reads the origin's unique body marker, and a client
     that trusts ONLY the aitm CA is REJECTED by that host (the leaf was never
     minted by aitm) — so the proxy never terminated TLS;
-  - it is FLAGGED as passthrough: `flow.table` holds a `CONNECT` row marked
-    `tunnelled` for the host and NO decrypted request flow leaked for it;
+  - it is FLAGGED as passthrough: `flow.table` holds a `CONNECT` row with
+    `tunnel == "passthrough"` and `tunnel_reason == "pinned"` for the host (the
+    host is in Scope, so only the pin explains the tunnel; the retired `tunnelled`
+    mark is gone) and NO decrypted request flow leaked for it;
   - CONTRAST (so "not MITM'd" is meaningful): a non-passthrough host on the SAME
     proxy IS MITM'd — the client sees a CA-minted leaf (not the origin cert) and
     the decrypted `GET /secret` is captured.
+
+Both hosts are seeded into Scope: since per-host decryption (spec
+2026-10-31-per-host-decryption-design, D1) the proxy decrypts ONLY hosts in Scope,
+so the contrast host must be in Scope to be MITM'd at all, and the pinned host
+being in Scope is what makes `tunnel_reason == "pinned"` (not `out_of_scope`) the
+proof that pins win over Scope (AC7).
 
 The passthrough feature needs a TLS origin that presents its own certificate, so
 (like the canonical Rust test crates/aitm-plugin-passthrough/tests/tunnel.rs) this
@@ -243,6 +251,9 @@ def main() -> int:
     bus = None
     try:
         section("boot: real aitm with localhost on the TLS passthrough list")
+        # Both hosts in Scope (per-host decryption decrypts only Scope hosts): the
+        # contrast host so it IS MITM'd, the pinned host so its tunnel row's reason
+        # is the pin and not `out_of_scope`.
         cfg = PassthroughConfig(
             proxy_port=free_port(),
             browser_proxy_port=free_port(),
@@ -287,17 +298,25 @@ def main() -> int:
               "a client trusting only the aitm CA cannot verify the passthrough "
               "host — it is the origin's own cert, so aitm never MITM'd it")
 
-        section("flagged: a CONNECT row marked `tunnelled`, no decrypted flow leaked")
+        section("flagged: a CONNECT row with tunnel == passthrough / reason pinned, "
+                "no decrypted flow leaked")
         marker = _poll_row(
             bus,
             lambda r: r.get("kind") == "http"
             and r.get("method") == "CONNECT"
-            and "tunnelled" in (r.get("marks") or [])
+            and r.get("tunnel") == "passthrough"
             and _host_of(r.get("authority")) == "localhost",
         )
         check(marker is not None,
-              f"flow.table has a CONNECT row flagged `tunnelled` for the host "
-              f"(row={marker})")
+              f"flow.table has a CONNECT row with tunnel == \"passthrough\" for the "
+              f"host (row={marker})")
+        reason = (marker or {}).get("tunnel_reason")
+        check(reason == "pinned",
+              f"the row's tunnel_reason is \"pinned\" — localhost is in Scope, so the "
+              f"pin, not out_of_scope, is why it was tunnelled (got {reason!r})")
+        check((marker or {}).get("status") == 200,
+              f"the passthrough row reports the established tunnel as status 200 "
+              f"(got {(marker or {}).get('status')!r})")
         leaked = any(
             r.get("method") == "GET"
             and r.get("path") == SECRET_PATH
