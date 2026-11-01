@@ -1,0 +1,62 @@
+# FTP's control channel (spec S3 row 8).
+#
+# One message is one command line, framed and replied to exactly as SMTP is.
+# The server speaks first, so the host reads the 220 banner before it writes,
+# and the prelude logs in anonymously. Every verb that opens a data channel
+# or makes the server connect out is refused by `denylist.rs`, so the lane
+# only ever holds the control connection.
+grammar: ftp
+transport: tcp
+default_ports: [21]
+reply: >
+  The server opens with a 220 banner and answers every command with lines
+  that begin with three ASCII digits. A space in the fourth column ends the
+  reply; a hyphen continues it, so a 211-features listing is read on until a
+  211 line arrives. 2xx and 3xx mean the server took the command, 4xx and
+  5xx mean it refused it, and anything else is not an FTP reply at all.
+message:
+  - name: command
+    type: group
+    fields:
+      # The verb is matched case-insensitively and substituted from this list
+      # by the type mutator. USER and PASS are in the vocabulary because the
+      # prelude sends them; a captured line carrying either is dropped from
+      # the corpus by the credential filter.
+      - name: verb
+        type: token
+        one_of:
+          [
+            USER,
+            PASS,
+            NOOP,
+            SYST,
+            FEAT,
+            PWD,
+            CWD,
+            CDUP,
+            TYPE,
+            MODE,
+            STRU,
+            STAT,
+            HELP,
+            QUIT,
+            REIN,
+            ABOR,
+            ALLO,
+            REST,
+            SIZE,
+            MDTM,
+          ]
+      # PWD has no argument and PWD<SP> is a different line, so the separator
+      # is a choice between one space and nothing at all. Neither alternative
+      # is mutable: moving the separator rewrites the framing rather than the
+      # field the point names.
+      - name: sp
+        type: choice
+        mutable: false
+        fields:
+          - { name: present, type: delim, value: " " }
+          - { name: absent, type: bytes, size: 0 }
+      # Everything up to and including the CRLF, which belongs to the field.
+      # This is the long-line point: FTP line-length limits live here.
+      - { name: arg, type: line, terminator: "\r\n" }
