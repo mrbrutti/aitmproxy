@@ -694,7 +694,12 @@ extension HandoffSelfCheck {
         var nestedStops = 0
         reconciler.begin { error in
             startupJ.append(error)
-            if error != nil {   // what TransparentProxyProvider.startProxy's error branch does
+            // What `TransparentProxyProvider.startProxy`'s error branch does. The bound exists
+            // for the regression this vector guards: an `answerStartup` that invokes before it
+            // clears the list re-enters here without end (stack overflow, exit 139, and every
+            // group's result lost -- the Recorder prints only at the end), so the bound stops
+            // the recursion and the pins below name the failure instead. Correct code reaches 1.
+            if error != nil && nestedStops < 8 {
                 nestedStops += 1
                 reconciler.stop()
             }
