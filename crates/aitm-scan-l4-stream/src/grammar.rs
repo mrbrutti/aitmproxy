@@ -46,6 +46,17 @@ pub trait Grammar: Send + Sync {
     /// The message format this grammar parses and renders.
     fn spec(&self) -> &MessageSpec;
 
+    /// Every document this grammar parses with, in the order
+    /// [`Grammar::parse`] tries them, opening with [`Grammar::spec`].
+    ///
+    /// Two grammar files hold a second YAML document for a second form of the
+    /// same protocol — RESP's inline command line, memcached's storage
+    /// command — and override this so that document is validated and
+    /// round-tripped with the rest of the registry (spec C1).
+    fn specs(&self) -> Vec<&MessageSpec> {
+        vec![self.spec()]
+    }
+
     /// The ports this grammar is selected for when no grammar is named.
     fn default_ports(&self) -> &'static [u16];
 
@@ -627,42 +638,65 @@ mod tests {
         assert!(!exchange.matches(b"", Ended::Silence));
     }
 
-    /// C1's round-trip half for **every** grammar, not only the three whose
-    /// own module asserts it: each embedded spec validates, serialises with
-    /// `serde_yaml` and re-parses to an equal value, and names itself.
+    /// C1's round-trip half for **every** document of every grammar, not only
+    /// the three whose own module asserts it: each embedded spec validates,
+    /// serialises with `serde_yaml` and re-parses to an equal value, and names
+    /// itself.
+    ///
+    /// The loop walks [`Grammar::specs`] rather than [`Grammar::spec`],
+    /// because two grammar files hold a second YAML document — RESP's inline
+    /// command line and memcached's storage command — that `spec()` does not
+    /// return and that would otherwise never be round-tripped here.
     #[test]
     fn every_grammar_spec_validates_and_round_trips() {
+        let mut documents = 0usize;
         for grammar in registry() {
-            let spec = grammar.spec();
-            spec.validate()
-                .unwrap_or_else(|e| panic!("{}: embedded spec is invalid: {e}", grammar.name()));
-
-            let yaml = spec
-                .to_yaml()
-                .unwrap_or_else(|e| panic!("{}: spec does not serialise: {e}", grammar.name()));
-            let again = MessageSpec::from_yaml(&yaml).unwrap_or_else(|e| {
-                panic!("{}: serialised spec does not parse: {e}", grammar.name())
-            });
             assert_eq!(
-                &again,
-                spec,
-                "{}: the YAML round trip is not the identity",
+                grammar.specs().first().copied(),
+                Some(grammar.spec()),
+                "{}: specs() opens with the document spec() returns",
                 grammar.name()
             );
 
-            assert_eq!(
-                spec.grammar,
-                grammar.name(),
-                "the document names the grammar it belongs to"
-            );
-            assert_eq!(spec.transport, grammar.transport());
-            assert_eq!(spec.default_ports, grammar.default_ports().to_vec());
-            assert!(
-                !yaml.is_empty() && yaml.contains("grammar:"),
-                "{}: serialised to {yaml:?}",
-                grammar.name()
-            );
+            for spec in grammar.specs() {
+                documents += 1;
+                spec.validate().unwrap_or_else(|e| {
+                    panic!("{}: embedded spec is invalid: {e}", grammar.name())
+                });
+
+                let yaml = spec
+                    .to_yaml()
+                    .unwrap_or_else(|e| panic!("{}: spec does not serialise: {e}", grammar.name()));
+                let again = MessageSpec::from_yaml(&yaml).unwrap_or_else(|e| {
+                    panic!("{}: serialised spec does not parse: {e}", grammar.name())
+                });
+                assert_eq!(
+                    &again,
+                    spec,
+                    "{}: the YAML round trip is not the identity",
+                    grammar.name()
+                );
+
+                assert_eq!(
+                    spec.grammar,
+                    grammar.name(),
+                    "the document names the grammar it belongs to"
+                );
+                assert_eq!(spec.transport, grammar.transport());
+                assert_eq!(spec.default_ports, grammar.default_ports().to_vec());
+                assert!(
+                    !yaml.is_empty() && yaml.contains("grammar:"),
+                    "{}: serialised to {yaml:?}",
+                    grammar.name()
+                );
+            }
         }
+        // Nine grammars, two of which (resp, memcached) carry a second
+        // document of their own.
+        assert_eq!(
+            documents, 11,
+            "the registry holds eleven grammar documents in all"
+        );
     }
 
     /// Every grammar survives the inputs a fuzzing lane will inevitably hand

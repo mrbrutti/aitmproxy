@@ -107,6 +107,12 @@ impl Grammar for Memcached {
         &self.command
     }
 
+    /// Both documents of `grammars/memcached.yaml`, in the order
+    /// [`Memcached::parse`] tries them.
+    fn specs(&self) -> Vec<&MessageSpec> {
+        vec![&self.command, &self.storage]
+    }
+
     fn default_ports(&self) -> &'static [u16] {
         &[11211]
     }

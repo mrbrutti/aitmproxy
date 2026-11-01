@@ -90,6 +90,12 @@ impl Grammar for Resp {
         &self.array
     }
 
+    /// Both documents of `grammars/resp.yaml`, in the order
+    /// [`Resp::parse`] tries them.
+    fn specs(&self) -> Vec<&MessageSpec> {
+        vec![&self.array, &self.inline]
+    }
+
     fn default_ports(&self) -> &'static [u16] {
         &[6379]
     }
