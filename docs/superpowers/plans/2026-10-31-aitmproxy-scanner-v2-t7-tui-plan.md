@@ -311,7 +311,7 @@ Kept by the main session during stage 6. One row per finding.
 | 5 | security | Important | unbounded `scan.status` fan-out per `scan.list` fold and per timer firing; O(n^2) membership; UI loop blocks past 128 queued requests | fixed in d56a77b4 (fix round B): `MAX_STATUS_FOLLOWUPS = 16` per fold and per firing, `BTreeSet` membership, `full.retain` (spec D6 amended) |
 | 5 | security | Minor | push-line and list job ids used unvalidated as tag key, argument and `inflight` entry | fixed in 10803fc0 (fix round B): accept only `scan-` + 8 hex (spec D6 amended) |
 | 5 | quality | Minor | `scan.status {job}` request spelled out three times | fixed in d56a77b4 (fix round B): `request_scan_status(job)` helper |
-| 5 | quality | Minor | `on_scan_ok` repeats the parse / clear-or-set-error scaffold per verb arm | fixed in 53c2f5e2 (fix round B): `scan_reply::<T>(name, &value) -> Option<T>` |
+| 5 | quality | Minor | `on_scan_ok` repeats the parse / clear-or-set-error scaffold per verb arm | fixed in 53c2f5e2 (fix round B): `scan_reply::<T>(tag, name, &value) -> Option<T>` |
 | 5 | quality | Minor | `issues_wanted` leans on a zero sentinel; doc comment overstates | Task 7: `fetched_at_tick: Option<u64>` (hand-off recorded in Task 7) |
 | 5 | quality | Minor | `scan_issues_args` hand-built on `App`; `limit: 512` bare | fixed in 53c2f5e2 (fix round B): `pub const ISSUES_PAGE_LIMIT: usize = 512` in `scan/mod.rs`; Task 7 moves the body to `IssueFilters::args` and deletes the `App` copy |
 | 5 | quality | Minor | `clear_error(verb)` clears a keyed verb's error on a sibling job's success | fixed in 53c2f5e2 (fix round B): `ScanError` carries the tag; clear by tag for keyed verbs (spec D13 amended) |
@@ -353,6 +353,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix B | quality | Minor | three more fix-round provenance tags in production doc comments | fix round C (same row as the six from round A) |
 | fix B | quality | Minor | `scan_v2_cadence.rs` hand-builds the bus envelopes in nine places; mid-file helpers; two expectations computed with `tag_keyed` | fix round C: `job_line()`, `list_reply()`, `status_reply_for()` helpers at the top; literal `format!("scan.status:{id}")` expectations |
 | fix B | quality | Minor | stale binding name `text` in `scan_v2_parse.rs` after B10 | fix round C |
+| fix B | spec | re-review | B1 to B10 closed with the report's literals; D6 ordering parenthetical, "lowercase", and the D3 `ScanError` shape re-aligned in this commit | closed |
+| fix B | spec | Minor | `pub const OTHER_JOB` and `ScanError::tagged` are unrequested public helpers | accepted (`tagged()` goes in fix round C's constructor change; `OTHER_JOB` stays, consistent with `NO_SCANNER`/`MISSING_VERB`) |
 
 ## Shipped
 
