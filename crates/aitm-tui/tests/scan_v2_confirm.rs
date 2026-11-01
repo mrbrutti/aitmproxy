@@ -344,29 +344,33 @@ fn an_l4_confirm_from_flows_still_shows_the_flow_list() {
     }
 }
 
+/// A `needs_confirmation` handshake for `scan.start` carrying `prompt`,
+/// folded through `WireConfirm::from_reply` (the fold the H34 bound lives
+/// in).
+fn confirm_for(prompt: String) -> WireConfirm {
+    let reply = json!({
+        "status": "needs_confirmation",
+        "prompt": prompt,
+        "confirm_token": "tok-9",
+    });
+    WireConfirm::from_reply("scan.start", &json!({ "profile_name": "standard" }), &reply)
+        .expect("a confirmation handshake")
+}
+
 /// Fix round H, H34 (D6 hostile-core bounds): the server's prompt is
 /// bounded once, in `WireConfirm::from_reply`, to `PROMPT_MAX` cells with
-/// control characters stripped, and the overlay wraps it to the box's rows
-/// only. A 1 MiB prompt of tab-joined words folds to one unit; a 1 MiB
-/// prompt of space-separated words (the one that wraps) renders in the box
-/// ending in an ellipsis at 200x50, every row within the box's width, and
-/// (fix round H, H50) the `y confirm` key line is the last row drawn
-/// inside the box.
+/// control characters stripped. A 1 MiB prompt of tab-joined words folds
+/// to one unit, cut once with an ellipsis and no tab left; nothing is
+/// rendered here (fix round H, H69: the fold bound and the box wrap are
+/// two tests).
 #[test]
-fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
+fn a_huge_prompt_is_bounded_once_at_fold() {
     use aitm_tui::scan::launch::PROMPT_MAX;
     use aitm_tui::text::width;
 
     let words = "word\t".repeat(1 << 18);
     assert!(words.len() >= 1 << 20);
-    let reply = json!({
-        "status": "needs_confirmation",
-        "prompt": words,
-        "confirm_token": "tok-9",
-    });
-    let confirm =
-        WireConfirm::from_reply("scan.start", &json!({ "profile_name": "standard" }), &reply)
-            .expect("a confirmation handshake");
+    let confirm = confirm_for(words);
     assert!(
         width(&confirm.prompt) <= PROMPT_MAX,
         "{} cells",
@@ -374,18 +378,21 @@ fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
     );
     assert!(confirm.prompt.ends_with('…'), "cut once at fold");
     assert!(!confirm.prompt.contains('\t'), "tabs stripped");
+}
 
-    // The wrapping case: `PROMPT_MAX` cells of space-separated words need
-    // more rows than the 16-row box holds.
+/// Fix round H, H34 and H50: a bounded prompt of `PROMPT_MAX` cells of
+/// space-separated words needs more rows than the 16-row box holds, so
+/// the overlay wraps it to the box's rows only: at 200x50 the cleaned
+/// prompt is drawn, the row the box cannot finish ends in an ellipsis,
+/// and the `y confirm` key line is the last row drawn inside the box
+/// (H50).
+#[test]
+fn a_prompt_wider_than_the_box_wraps_and_keeps_the_key_line_last() {
+    use aitm_tui::scan::launch::PROMPT_MAX;
+    use aitm_tui::text::width;
+
     let spaced = "word ".repeat(1 << 18);
-    let reply = json!({
-        "status": "needs_confirmation",
-        "prompt": spaced,
-        "confirm_token": "tok-9",
-    });
-    let confirm =
-        WireConfirm::from_reply("scan.start", &json!({ "profile_name": "standard" }), &reply)
-            .expect("a confirmation handshake");
+    let confirm = confirm_for(spaced);
     assert!(width(&confirm.prompt) <= PROMPT_MAX);
     let mut app = fixture_app_core(200, 50);
     app.wire_confirm = Some(confirm);
