@@ -1,9 +1,10 @@
 # macOS traffic-route advice — implementation plan
 
-**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (Review log)
+**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (Review log); amended again 2026-11-01 (self-approved, autonomous mode): implementation and stage-5 Tester rulings on the shipped code (Review log, the "Tester (whole branch)" and "Architect (amendment)" rows)
 **Spec:** `docs/superpowers/specs/2026-10-31-mac-traffic-route-advice-design.md`
 (approved 2026-10-31, amended 2026-11-01; acceptance criteria TR-AC1 … TR-AC22 — TR-AC1/2 are PR 4a's `SystemProxyState` contract, TR-AC14 deleted, TR-AC15–17 the CA-trust fact, TR-AC18–19 the one-banner-line rule, TR-AC20–22 per-host decryption on v0.5.9)
-**Branch / worktree:** this worktree, `claude/apps-attribution-8ab619`
+**Branch / worktree:** `feat/mac-traffic-route-advice` (the branch the implementation shipped on; earlier drafts
+named it `claude/apps-attribution-8ab619`), in this worktree
 (`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), base `main 8e19c2e3`.
 **PR shape:** two PRs from this branch — this traffic-route plan ships **first**; the sibling icons plan
 (`2026-10-31-mac-app-icons-and-names-plan.md`) ships second and records this PR's merge SHA as its gate 4
@@ -30,8 +31,11 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
      `Shell/RouteBanner.swift` (new).
    - `apps/mac/tools/check-capture-toggle.sh`: **GO**, on the fixture-removal mac SHA (that PR modifies
      the script; Task 5 moves the NS-AC8 pins to `RouteBanner()` there).
-   - `Bus/BusService.swift`: **GO for exactly one line** — the `proxy.status.decrypt` decode inside the
-     existing `refreshProxyStatus()`. **NO** `refreshCAStatus()` (CA polling is PR D's), **NO**
+   - `Bus/BusService.swift`: **GO for one decode** of `proxy.status.decrypt` inside the existing
+     `refreshProxyStatus()` (the grant read "exactly one line"; amended 2026-11-01 — the decode is change-guarded
+     like the file's other per-tick writes, since an `@Observable` set notifies on equal values: four added lines,
+     two statements plus a two-line comment, at `BusService.swift:234–237`, no `await`, no new verb; accepted by
+     the orchestrator). **NO** `refreshCAStatus()` (CA polling is PR D's), **NO**
      `refreshSystemProxy()`, **NO** `Bus/SystemProxyReader.swift`, no `defer` reset lines.
    - `Session+Connection.swift`: **GO on PR D's merged SHA** for `.addScopeHost` in `perform(connection:)`
      and the `tunnelledFlowCount` accessor (PR D edits the same switch; sequential, never
@@ -42,8 +46,12 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
      `actions` stay **empty** until PR4 fills `.setSystemProxy`.
    - `Session.swift`: `var systemProxy: SystemProxyState?` (nil; **written by PR4 only** — plan call 4)
      and `var decrypt: DecryptStatus?`. `Session.caTrust` / `caStatus` are PR D's.
-   - Withdrawn with the denial, not touched: `App.swift`, `AitmproxyKit/CommandMap.swift`,
-     `apps/mac/docs/BRIEF.md`, `apps/mac/docs/GLOSSARY.md`. `apps/mac/docs/STORIES.md`: never touched
+   - Withdrawn with the denial, not touched: `AitmproxyKit/CommandMap.swift`, `apps/mac/docs/BRIEF.md`,
+     `apps/mac/docs/GLOSSARY.md`. `App.swift`: **one token** (orchestrator GO 2026-11-01, Task 5) — `App.swift:226`
+     `Button("Trust the aitmproxy CA")` → `Button(ConnectionAction.trustCA.title)`, so no view spells a route word
+     under the D9 prefix rule; nothing else in the file. `apps/mac/tools/check-ca-trust-path.sh`: **GO** (2026-11-01,
+     agreed with the CA-trust session, Task 5) — rule 2's allow-list gains `Shell/RouteBanner.swift` with an expect
+     line. `apps/mac/docs/STORIES.md`: never touched
      (the improve-loop session owns S-073/S-074/S-080).
    - **System-proxy source** (agreed with the system-proxy session, 2026-11-01): `Session.systemProxy:
      SystemProxyState?` (nil = unknown until the first answer, never rendered as "off") is set by PR4
@@ -116,8 +124,11 @@ plus the three tripwires) so every later failure is attributable to this plan.
   (memory `gate-exit-status-not-grep`). The orchestrator runs it after each wave, commits the
   wave's tasks once green, and quotes the output in the Tester hand-off.
 - **Tripwires** (TR-AC7), Terminal: `apps/mac/tools/check-capture-operator-only.sh`,
-  `apps/mac/tools/check-capture-toggle.sh`, `apps/mac/tools/check-connection-words.sh` — each
-  prints PASS. The structural greps of TR-AC8 run in the sandbox.
+  `apps/mac/tools/check-capture-toggle.sh`, `apps/mac/tools/check-connection-words.sh` and
+  `apps/mac/tools/check-ca-trust-path.sh` — each prints PASS. The tripwires are **bash**
+  (`#!/usr/bin/env bash`); `apps/mac/tools/grid-lint.sh` is **zsh** — run it by path
+  (`apps/mac/tools/grid-lint.sh`), never as `bash tools/grid-lint.sh`. The structural greps of TR-AC8 run in
+  the sandbox.
 - **Rust gate** (TR-AC9): no Rust file changes; `cargo fmt --check && cargo clippy --all-targets
   -- -D warnings && cargo test` runs once on the whole branch to prove it.
 - **Building the real app** (Task 6 only): Terminal only. The dev bundle is `apps/mac/build.sh
@@ -141,11 +152,12 @@ plus the three tripwires) so every later failure is attributable to this plan.
   `AitmproxyKit/SystemProxyState.swift` and its tests (PR 4a's), `apps/mac/Package.swift`,
   `apps/mac/Sources/Aitmproxy/UI/Tokens.swift` (generated),
   `apps/mac/Sources/Aitmproxy/Bus/ExtensionController.swift`, `Panels/ScopePanel.swift`
-  (`ScopeBanner`'s text), `App.swift`, `AitmproxyKit/CommandMap.swift`, `apps/mac/docs/BRIEF.md`,
+  (`ScopeBanner`'s text), `App.swift` except Task 5's one token at `:226` (GO 2026-11-01),
+  `AitmproxyKit/CommandMap.swift`, `apps/mac/docs/BRIEF.md`,
   `apps/mac/docs/GLOSSARY.md`, `apps/mac/docs/STORIES.md`, anything under `apps/mac/Extension/` or
   `crates/`. In `Shell/ShellView.swift`: lines 49–62, the `ExtensionController(` block (~99) and
   everything outside the two named hunks. In `Bus/BusService.swift`: everything but the one granted
-  line. A Coder whose task seems to need one of these **stops and reports**.
+  decode (Task 2: two statements plus a comment, change-guarded). A Coder whose task seems to need one of these **stops and reports**.
 - **Stop-and-report rule.** A Coder that finds the spec wrong (a D-section that cannot be built as
   written, a signature that will not typecheck under strict concurrency) stops and reports; it does
   not redesign. One known seam is pre-decided in the plan calls (StatusPanel's exhaustive switch,
@@ -157,7 +169,7 @@ Eight tasks (1, 1b, 1c, 2, 2b, 3, 5, 6 — Task 4 was removed 2026-11-01) in eig
 A′, B′, A″, E). Wave A is pure Kit (one task: the `TrafficRoutes` model over PR 4a's `SystemProxyState`,
 the `make` extension and the whole predicate table as tests, the CA kinds declared but never produced).
 Wave B wires the app target to the Kit value (`Session.systemProxy` — nil, PR4's to write —
-`Session.decrypt` and the one `BusService` line, `Session.trafficRoutes`, `tunnelledFlowCount`,
+`Session.decrypt` and the one `BusService` decode, `Session.trafficRoutes`, `tunnelledFlowCount`,
 `perform(.addScopeHost)`). Wave C is the one UI task: the two surfaces (Status step help + Flows empty
 state + the route banner). Wave D updates the words tripwire and moves the NS-AC8 pins, which can only
 pass once `trafficRoutes` and `RouteBanner.swift` exist. Wave E is the real-app proof plus the
@@ -253,8 +265,10 @@ greps, Task 6, and the diff review.
       public let advice: [TrafficRoute]
       public let banner: String?
       public let bannerAction: ConnectionAction?                        // shown.first { !$0.actions.isEmpty }?.actions.first
+      public let shown: [TrafficRoute]                                 // ruling 2026-11-01: D5's `shown`, in order; [] when banner == nil
+      public let bannerDetail: String?                                 // shown.map(\.detail).joined(" · "); nil when banner == nil
       public var anyOpen: Bool { [systemProxy, allApps].compactMap { $0 }.contains(where: \.open) }   // routes only
-      public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?, advice: [TrafficRoute], banner: String?, bannerAction: ConnectionAction?)
+      public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?, advice: [TrafficRoute], banner: String?, bannerAction: ConnectionAction?, shown: [TrafficRoute], bannerDetail: String?)   // the two added parameters' defaults, if any, are the builder's
   }
 
   public struct GettingStartedStep {
@@ -278,7 +292,7 @@ greps, Task 6, and the diff review.
       public var decrypting: Bool
       public var advice: String?
       public init(scopeHosts: Int, decrypting: Bool, advice: String?)
-      public init?(json: JSONValue)   // nil unless the object carries "scope_hosts"; "decrypting" defaults to scopeHosts > 0; "advice" null → nil
+      public init?(json: JSONValue)   // nil unless the object carries "scope_hosts"; "decrypting" defaults to scopeHosts > 0; "advice" null → nil; empty or whitespace-only → nil (ruling 2026-11-01)
   }
   ```
 
@@ -326,6 +340,10 @@ greps, Task 6, and the diff review.
   `{"scope_hosts": 2, "decrypting": true, "advice": null}` → `(2, true, nil)`; `{}` → `nil`;
   a `proxy.status`-shaped object without `decrypt` → `status["decrypt"].flatMap(DecryptStatus.init) == nil`;
   `{"scope_hosts": 1}` (no `decrypting`) → `decrypting == true` (defaults to `scopeHosts > 0`).
+  **Blank advice (ruling 2026-11-01; fixed in a code commit, SHA stamped in the Review log):**
+  `{"scope_hosts": 0, "decrypting": false, "advice": ""}` → `advice == nil`; `"advice": "  \n"` → `advice == nil`;
+  and in `ConnectionSummaryTests`, `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: "")` →
+  `routes.scope.line == "Nothing is decrypted until a host is in Scope."` (the fallback, never an empty line).
 
   add a helper `both(_ host: String, _ port: Int) -> SystemProxyState` (HTTP and HTTPS at that
   endpoint, built with PR #246's `SystemProxyState(http:https:)` / `Endpoint(host:port:)`). `L = "127.0.0.1:8080"`.
@@ -407,6 +425,11 @@ greps, Task 6, and the diff review.
     `.inactive, hosts: 2, flows: 3, systemProxy: .off` → `banner == "system proxy off · All Apps off"`;
     `supported: false, hosts: 2, flows: 3, systemProxy: .off` → `banner == "system proxy off"`, `bannerAction == nil`;
     `banner == nil` → `bannerAction == nil`.
+    **`shown` / `bannerDetail` (ruling 2026-11-01; fixed in a code commit, SHA in the Review log):**
+    `.inactive, hosts: 0, flows: 3, systemProxy: .off` → `routes.shown.map(\.kind) == [.systemProxy, .allApps, .scope]`,
+    `routes.bannerDetail == "every proxy-aware app, regardless of Scope · in-scope hosts of every app · Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"`;
+    `.capturing, hosts: 0, flows: 3, tunnelled: 3` → `shown.map(\.kind) == [.scope]`, `bannerDetail == scopeDetail`;
+    `banner == nil` → `shown == []`, `bannerDetail == nil`.
 - **Done when:** the new tests and the two updated expectations pass, every other existing
   `AitmproxyKitTests` suite still passes, and the Swift gate is green (Terminal, orchestrator).
   Sandbox evidence: `swiftc -parse` clean on the four files; the report lists the literal values above.
@@ -420,7 +443,8 @@ greps, Task 6, and the diff review.
   - `apps/mac/Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (modify)
   - PR D's `AitmproxyKit/CATrustFacts.swift`, `AitmproxyKit/Panels/CAStatus.swift`, `Session+CATrust.swift` and PR D's tests: **read only** — a Coder who finds `CATrustFacts` missing, or its API differing from the record below (read from `claude/ca-trust-mac` `4ae616d3`), stops and reports (gate 3 not met or spec D2 to be amended first)
 - **Change:** `make` gains `caTrust: CATrustFacts? = nil` (before `tunnelledFlowCount`). CA fact in `make`
-  (spec D3/D4/D5): `routes.caTrust` nil when `caTrust == nil`; else `kind: .caTrust`, `open = trusted`,
+  (spec D3/D4/D5): `routes.caTrust` nil when `caTrust == nil`; else `kind: .caTrust`, `open = trusted && !installing`
+  (ruling 2026-11-01, spec D3: PR D's `installing` outranks `trusted`, as its `step.done` does),
   `line` = PR D's **`text`** (the one-line fact string — PR D's `state` is a `LaneState`, `remedy` a longer
   sentence; neither is used), `actions` = PR D's `actions` when closed, `[]` when open, `detail` =
   `"HTTPS on both routes"` when trusted, else `"HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`.
@@ -440,10 +464,14 @@ greps, Task 6, and the diff review.
   the route detail. PR D's nil-facts rows (`unknownStep()`, `notGeneratedStep()`) are not produced here
   (spec D4, open question 21).
 
-- **Test:** the private `make(...)` helper gains `caTrust: CATrustFacts? = nil`. Values are built with PR
-  D's memberwise init (`platform` is a `String` with no default — pass `"macos"`); `notTrusted` = trusted
-  false, scope nil, fingerprint `"AB:CD"`, platform `"macos"`, installing false, needsAdmin false;
-  `trustedUser` = trusted true, scope `"user"`, fingerprint `"AB:CD"`, platform `"macos"`.
+- **Test:** the private `make(...)` helper gains `caTrust: CATrustFacts? = nil`. **Ruling 2026-11-01:** PR D
+  declares `init?(status:)` in the struct body, so Swift synthesises no memberwise init (the earlier "built with
+  PR D's memberwise init" was wrong); values are built as `try #require(CATrustFacts(status: CAStatus(fingerprint:
+  "AB:CD", installed:, trusted:, platform: "macos", trustedScope:, trustReported: true)))` and `installing` /
+  `needsAdmin` are then set on the `var` (the suite's `caFacts(scope:installing:needsAdmin:)` helper).
+  `notTrusted` = `caFacts()`: trusted false, scope nil, fingerprint `"AB:CD"`, platform `"macos"`, installing
+  false, needsAdmin false; `trustedUser` = `caFacts(scope: "user")`: trusted true, scope `"user"`, fingerprint
+  `"AB:CD"`, platform `"macos"`.
 
   `ConnectionSummaryTests` additions for the CA fact (TR-AC16):
   - `caTrustJoinsAdviceAndSteps`: TR-AC3 inputs + `caTrust: notTrusted` → `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"` (`== notTrusted.text`),
@@ -462,6 +490,7 @@ greps, Task 6, and the diff review.
     `allStepsDone == true` with `core(.ready)`, `both("127.0.0.1", 8080)`, `.capturing, hosts: 2, flows: 1, caTrust: trustedUser`;
   - `caUnknownSaysNothing`: `caTrust: nil` → `routes.caTrust == nil`, no `.caTrusted` step, `advice`/`banner` carry no `"CA"` and no `"HTTPS"`;
   - `caSiblingStates`: `installing: true` → `line == "trusting CA…"`, `open == false`, `actions == []`, the step `title == "trusting CA…"`, `action == nil`;
+    `scope: "user", installing: true` (an uninstall in flight) → `line == "trusting CA…"`, `open == false`, the step `done == false` (ruling 2026-11-01: `installing` outranks `trusted`);
     `needsAdmin: true` → `line == "CA trust needs an administrator"`, `open == false`, `actions == [.openCAPanel]`, the step `title == "CA trust needs an administrator"`, `action == .openCAPanel`;
     `needsAdmin: true` + `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3` → `banner == "CA trust needs an administrator"`, `bannerAction == .openCAPanel`.
   - `composedBannerWithCA` (TR-AC18, CA cases; `notTrusted`/`trustedUser` as above):
@@ -522,16 +551,16 @@ greps, Task 6, and the diff review.
   `mode: "weird"` → `tunnel == nil`.
 - **Done when:** the tests pass, every other suite still passes (the memberwise-init defaults keep them compiling), the Swift gate is green.
 
-### Task 2: App wiring — `Session.systemProxy` (PR4's to write), `Session.decrypt` + the one `BusService` line, `Session.trafficRoutes`, `tunnelledFlowCount`, `perform(.addScopeHost)` (no CA wiring, no reader)
+### Task 2: App wiring — `Session.systemProxy` (PR4's to write), `Session.decrypt` + the one `BusService` decode, `Session.trafficRoutes`, `tunnelledFlowCount`, `perform(.addScopeHost)` (no CA wiring, no reader)
 
-- **Satisfies:** TR-AC8 (no CFNetwork anywhere; Kit import rule; the one-line `BusService` diff), the model
+- **Satisfies:** TR-AC8 (no CFNetwork anywhere; Kit import rule; the `BusService` decode footprint), the model
   half of TR-AC10(a), TR-AC11 and TR-AC13(a) (the facts reach the views within one poll)
 - **Depends on:** Task 1; **gate 3** (its `Session+Connection.swift` edits are granted on PR D's merged SHA —
   PR D edits the same `perform` switch; sequential, never simultaneous); not concurrent with the icons
   plan's Tasks 5/6 (shared `BusService.swift`, `Session.swift`)
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Session.swift` (modify: two stored properties — `systemProxy`, `decrypt`)
-  - `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (modify: **exactly one added line**)
+  - `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (modify: **one change-guarded decode** — four added lines, ruling 2026-11-01)
   - `apps/mac/Sources/Aitmproxy/Session+Connection.swift` (modify)
   - **Not created:** `Bus/SystemProxyReader.swift` (withdrawn by the orchestrator 2026-11-01)
 - **Change:**
@@ -544,8 +573,12 @@ greps, Task 6, and the diff review.
   core; `make` ignores it while the bus lane is not `.ok`"). No `caStatus`/`caTrust` here (PR D's).
 
   `BusService.swift`: in the existing `refreshProxyStatus()`, after the `capturing` and
-  `intercept_armed` reads, one line: `session.decrypt = status["decrypt"].flatMap(DecryptStatus.init)`
-  — no new verb, no new read (`proxy.status` is already polled every tick), no `defer` reset (spec D3
+  `intercept_armed` reads, one decode, change-guarded like the two reads above it (an `@Observable` set
+  notifies even on an equal value, and every route surface reads `decrypt`):
+  `let decrypt = status["decrypt"].flatMap(DecryptStatus.init)` then
+  `if session.decrypt != decrypt { session.decrypt = decrypt }`, with a two-line comment saying why — four
+  added lines, `BusService.swift:234–237` (ruling 2026-11-01; the grant's "one line" counted the decode, not
+  the guard) — no new verb, no new read (`proxy.status` is already polled every tick), no `defer` reset (spec D3
   ignores a stale value by rule), no `refreshSystemProxy()`, no `refreshCAStatus()`, no `await` added
   to `pollLoop`. An older core without `decrypt` leaves it nil and the Kit falls back to `scopeHostCount`.
 
@@ -565,12 +598,15 @@ greps, Task 6, and the diff review.
   `.openNetworkSettings` case (denied).
 
 - **Test:** none in Kit by construction. Sandbox structural checks the Coder runs and quotes:
-  `grep -rln CFNetworkCopySystemProxySettings apps/mac/Sources` → **empty**;
+  `grep -rn CFNetworkCopySystemProxySettings apps/mac/Sources | grep -vE ':[0-9]+:[[:space:]]*///'` → **empty**
+  (the second grep drops `///` doc comments: PR #246's `SystemProxyState.swift` names the function in two of
+  them and calls it nowhere — ruling 2026-11-01);
   `grep -rln 'SystemProxyReader\|refreshSystemProxy' apps/mac/Sources` → empty;
   `grep -rlE '^import (CFNetwork|SystemConfiguration|SwiftUI|AppKit)' apps/mac/Sources/AitmproxyKit` → empty;
   `grep -rn 'var trafficRoutes' apps/mac/Sources/Aitmproxy` → one line, in `Session+Connection.swift`,
   containing `connectionSummary.routes`; `git diff <wave-B-base> -- apps/mac/Sources/Aitmproxy/Bus/BusService.swift`
-  → exactly one added line (plus at most a comment), containing `DecryptStatus` and no `await`;
+  → four added lines, all inside `refreshProxyStatus()` (two statements + a two-line comment), no removed
+  lines, containing `DecryptStatus.init` and `session.decrypt != decrypt` and no `await` (ruling 2026-11-01);
   `grep -c 'DecryptStatus' apps/mac/Sources/Aitmproxy/Bus/BusService.swift` → `1`;
   `grep -c 'var systemProxy: SystemProxyState?' apps/mac/Sources/Aitmproxy/Session.swift` → `1` and
   `grep -rn 'session.systemProxy =' apps/mac/Sources/Aitmproxy` → empty (nothing of ours writes it);
@@ -647,11 +683,18 @@ greps, Task 6, and the diff review.
   Renders `session.trafficRoutes.banner` (`lineLimit(1)`, `truncationMode(.tail)`,
   `Tok.Size.Row.dense` height — 28 pt, `Tokens.swift:296` — `Tok.Ink.tertiary` ink, `Space.md` horizontal
   padding, a `Rule` under it from the caller — the `ScopeBanner`/`AppsAttributionBanner` shape), `.help` =
-  the shown entries' `detail`s joined with `" · "`, and **one** `SmallButton(action.title)` for
-  `session.trafficRoutes.bannerAction` (nothing when nil — e.g. a lone closed system-proxy fact before
-  PR4): `session.perform(connection: action)`; when it returns `false` and the action is
-  `.openCaptureSettings` (the fresh-install button until PR4), set `session.settingsTab = .capture` and
-  call `openSettings()` exactly as `AppsAttributionBanner` does. Glyph `"network"`. The file mentions
+  the full `banner` plus `routes.bannerDetail` (the shown entries' `detail`s joined with `" · "`), read from
+  the model — never re-derived by walking `advice` against the banner text (ruling 2026-11-01: the first cut's
+  `shownEntries` did exactly that and was struck as a second derivation; fixed in a code commit, SHA in the
+  Review log) — and **one** `SmallButton(action.title)` for `session.trafficRoutes.bannerAction` (nothing when
+  nil — e.g. a lone closed system-proxy fact before PR4), run by `RouteActions.run(_:session:openSettings:)`
+  (one function, shared with the empty-state rows): `.trustCA` goes to `session.trustCA()` exactly as
+  `StatusPanel.run` does (PR D makes `perform` return `false` for it on purpose — operator-only, like the
+  capture switch; the model hides the button once trusted or while installing; shipped in Task 5's commit
+  together with its `check-ca-trust-path.sh` allow-list entry — Task 3's cut had routed it through `perform`,
+  a no-op), every other action through `session.perform(connection:)`; when that returns `false` and the
+  action is `.openCaptureSettings` (the fresh-install button until PR4), set `session.settingsTab = .capture`
+  and call `openSettings()` exactly as `AppsAttributionBanner` does (ruling 2026-11-01). Glyph `"network"`. The file mentions
   none of `connectionSummary`, `ConnectionSummary`, `LaneDot`, `LaneState`, `CaptureSwitch`,
   `capture.enabled`, `extensionController`, `CaptureAdvice`.
 
@@ -680,11 +723,13 @@ greps, Task 6, and the diff review.
   `.systemProxy`, `"app.badge"` for `.allApps`, `Tok.Glyph.scope` for `.scope`, `Tok.Glyph.lock` for `.caTrust`), `Text(route.line)`,
   its actions as `SmallButton`s (every action in `route.actions`: the Scope row Add Host… and Open
   Scope…, the All Apps row its one, the CA row Trust the aitmproxy CA and the CA page — PR D's
-  `.trustCA`/`.openCAPanel`, which `perform` already handles — and the system-proxy row **none** until
+  `.openCAPanel`, which `perform` handles, and `.trustCA`, which `RouteActions.run` sends to
+  `session.trustCA()` — and the system-proxy row **none** until
   PR4 fills `.setSystemProxy`), and `Text(route.detail)` beneath at
   `Tok.Typography.Size.sm`, tertiary ink — **instead of** the generic "Point a client at … or open
   the browser." line. `routes` empty: today's generic line. Filtered: unchanged. Buttons call
-  `session.perform(connection:)` with the same `.openCaptureSettings` fallback as the banner, so
+  `RouteActions.run` (the banner's function: `.trustCA` → `session.trustCA()`, the rest through
+  `session.perform(connection:)` with the `.openCaptureSettings` fallback), so
   `EmptyFlows` gains `@Environment(Session.self)` and `@Environment(\.openSettings)` for the
   actions only. `allowsHitTesting(false)` moves from the whole VStack to the text elements so the
   buttons stay clickable. Nothing else in the file; lines 49–62 and the `ExtensionController(` block
@@ -712,18 +757,22 @@ greps, Task 6, and the diff review.
 The orchestrator denied `ConnectionAction.openNetworkSettings` as a product action (Matt: system-proxy
 setup happens automatically in the app with the OS's own prompt, never by sending him to System
 Settings). With it go the Proxy ▸ "Network Settings…" menu item, the `CommandMap`/`BRIEF.md` rows, the
-`GLOSSARY.md` rows and `CommandMapTests` change this task carried; `App.swift`, `CommandMap.swift`,
-`BRIEF.md` and `GLOSSARY.md` are not touched by this plan, and the Proxy menu gets only PR4's toggle
+`GLOSSARY.md` rows and `CommandMapTests` change this task carried; `CommandMap.swift`,
+`BRIEF.md` and `GLOSSARY.md` are not touched by this plan (`App.swift` gets Task 5's one-token title change of
+2026-11-01, nothing of Task 4's), and the Proxy menu gets only PR4's toggle
 (⌥⌘P). `apps/mac/docs/STORIES.md` was never touched (the improve-loop session owns S-073/S-074/S-080).
 Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log stay readable.
 
 ### Task 5: Words tripwire — route-word prefixes and the one-derivation rule
 
-- **Satisfies:** TR-AC7
+- **Satisfies:** TR-AC7 (including its `check-ca-trust-path.sh` clause, 2026-11-01)
 - **Depends on:** Task 3 (rule 3 needs `trafficRoutes` and `RouteBanner.swift` to exist; the NS-AC8 move needs the new `MainView`); gate 1 (`check-capture-toggle.sh` is granted on the fixture-removal mac SHA)
 - **Files:**
   - `apps/mac/tools/check-connection-words.sh` (modify)
   - `apps/mac/tools/check-capture-toggle.sh` (modify — NS-AC8 banner pins only, spec D8; GO 2026-11-01)
+  - `apps/mac/tools/check-ca-trust-path.sh` (modify — rule 2's allow-list of `.trustCA(` callers gains `Shell/RouteBanner.swift` with an expect line, header comment updated; agreed with the CA-trust session, orchestrator GO 2026-11-01)
+  - `apps/mac/Sources/Aitmproxy/Shell/RouteBanner.swift` (modify — `RouteActions.run` sends `.trustCA` to `session.trustCA()`, as `StatusPanel.run` does; Task 3's cut routed it through `perform`, which PR D makes return `false` for it, so the Flows button did nothing)
+  - `apps/mac/Sources/Aitmproxy/App.swift` (modify — one token at `:226`: `Button("Trust the aitmproxy CA")` → `Button(ConnectionAction.trustCA.title)`, so rule 1's new prefix `"Trust the aitmproxy CA` finds no view literal; orchestrator GO 2026-11-01)
 - **Change:** spec D9, and in `check-capture-toggle.sh` the NS-AC8 block: `equals "NS-AC8 the banner is rendered exactly once"`
   counts `RouteBanner()` (→ 1) and a new `equals "NS-AC8 the old Apps banner is no longer rendered"`
   counts `AppsAttributionBanner()` in `main_body` (→ 0); `main_bcond` becomes
@@ -755,7 +804,12 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   5. `check-capture-operator-only.sh` PASS unchanged; `check-capture-toggle.sh` PASS with the moved
      pins, and FAIL (mutation, reverted) when a second `RouteBanner()` or an `AppsAttributionBanner()`
      call is added to `MainView`.
-- **Done when:** steps 1–5 print as stated and the tree is restored (`git status` clean of mutations).
+  6. (2026-11-01) `check-ca-trust-path.sh` PASS with `Shell/RouteBanner.swift` in rule 2's allow-list (its
+     expect line finds the one `.trustCA(` call), and FAIL (mutation, reverted) when a `session.trustCA()`
+     call is added to `Shell/ShellView.swift`; `check-connection-words.sh` PASS with `App.swift:226` reading
+     `ConnectionAction.trustCA.title`, and FAIL (mutation, reverted) when it reads `"Trust the aitmproxy CA"`
+     again.
+- **Done when:** steps 1–6 print as stated and the tree is restored (`git status` clean of mutations).
 
 ### Task 6: Live proof on the real app (Terminal; orchestrating session or Matt)
 
@@ -817,7 +871,30 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   **Half A — "system-proxy step absent until PR4" on the dev bundle** (an early, fast pass; a build
   without the extension, so `routes.allApps == nil` and the Status `extensionOn` step reads "All Apps
   capture is not in this build"). Quit the installed app first (port 8080 would otherwise be taken and
-  `L` would not read `127.0.0.1:8080`).
+  `L` would not read `127.0.0.1:8080`) — or read `L` from the toolbar pill: the criterion is that every line
+  names the address the pill shows, not that it is 8080.
+
+  **As run (ruling 2026-11-01; 12:57–13:02 PST, branch at `8a605948` = Tasks 1, 1b, 1c, 2, 2b, 3, 5):** the dev
+  bundle was assembled with the session's own bundle script, not `build.sh --debug` — `/tmp/Aitmproxy-dev-attr.app`,
+  a `swift build` of `apps/mac` at that SHA with an embedded release core built from the same tree (v0.5.10, #228
+  per-host decryption in), isolated `APP_STORE=/tmp/attr-store`, no extension — and the installed app was **left
+  running** on 8080, so **`L` = `127.0.0.1:63109`**, the dev core's ephemeral port; the toolbar pill and every line
+  read that address. Evidence folder `/tmp/claude/route-advice/` (`A1-launch.png`, `A2-*.png`, `A3-*.png`,
+  `A4-*.png`, `bus-A*.json`, `live-A*.txt`, `scutil-before.txt` — `HTTPEnable 0` / `HTTPSEnable 0`, Proxyman off at
+  the time — and `A2-deferred-to-PR4.txt`) and the shared note `traffic-route-live-proof-half-A.md`
+  (side-session-notes). What the real app showed: A2 Status — no system-proxy step, `○ All Apps capture is not in
+  this build`, `○ Add a host to Scope (for now as example.com:443)` [Open Scope…], `✓ CA trusted (user keychain)`,
+  no "off", no "system proxy"; A2 Flows — "No flows yet" with one row, the core sentence + Add Host… / Open
+  Scope… and its detail, no CA row (the CA is trusted — TR-AC17 ruling); A3 — two plain-HTTP rows, no banner;
+  Clear, `curl https://` → `CONNECT example.com:443`, `tunnel passthrough`, `tunnel_reason out_of_scope`, every row
+  a tunnel → exactly ONE banner line, the core sentence + [Add Host…]; `scope.add example.com:443` over the bus →
+  banner gone within one poll, Status `✓ Scope: 1 host decrypted`, `decrypt.advice null` / `scope_hosts 1`; the
+  next HTTPS → a `tunnel decrypted` row plus the inner `GET https://example.com/` 200; `scope.remove` → `[]`; A4
+  Add Host… from the empty state and from the banner → the Scope page with the Edit Scope sheet (the Scope page,
+  a flow-list page, shows the one banner above its table — spec D8); TR-AC19 — the column header sat one banner
+  row lower with the banner than without (≈141 px vs ≈110 px at that shot's scale), never two; no `ScopeBanner`,
+  no "Flows carry no source app" anywhere. No `ca.install`, no Install… click, no Trust click, system proxy not
+  touched. Half B runs on the first DMG that contains this PR.
   - A1 Build: `apps/mac/build.sh --debug --replace` with `AITM_CORE_DIR` pointing at a core dir that
     holds `aitm`, `obscura` and `share/aitm/scripts` (coreless-bundle trap: build.sh skips the core
     silently). Verify `ls ~/Applications/Aitmproxy.app/Contents/Resources/core/aitm`. Launch; the
@@ -826,8 +903,10 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
     system proxy (`…/scutil-before.txt`), the Flows page shows "No flows yet" with the row
     `Nothing is decrypted until a host is in Scope.` (detail line; Add Host…, Open Scope…) — and, once
     2b is in, beneath it the CA row `HTTPS is not captured until the CA is trusted` with its detail and
-    its buttons Trust the aitmproxy CA / the CA page, **not clicked** (`ca.status` → `…/bus-A2-ca.json`,
-    every store `trusted: "no"`). Status: **no** system-proxy step; `○ Add a host to Scope (for now as
+    its buttons Trust the aitmproxy CA / the CA page, **not clicked** (`ca.status` → `…/bus-A2-ca.json`:
+    every store `trusted: "no"` on a Mac that does not trust the CA; on Matt's Mac since 2026-11-01 the user store
+    reads `trusted: "yes"`, the row is absent and Status reads `✓ CA trusted (user keychain)` — the TRUSTED
+    rendering, spec TR-AC17 ruling; that is what A2 showed). Status: **no** system-proxy step; `○ Add a host to Scope (for now as
     example.com:443)` (Open Scope…); `○ Trust the aitmproxy CA` with its button (not clicked) once 2b is
     in. `grep -c 'system proxy' <(strings of the two screenshots' OCR or the AX dump)` is the Tester's
     choice of method; the requirement is that nowhere does either page mention the system proxy, say
@@ -845,7 +924,8 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
     the Scope page; hover the All Apps / Scope steps on Status → their help. → `A4-*.png`. Quit the dev
     bundle.
 
-  **Half B — All Apps / scope lines and the banner on the installed app** (the notarized build
+  **Half B — All Apps / scope lines and the banner on the installed app** — **runs on the first DMG that
+  contains this PR** (ruling 2026-11-01; Half A already covers every clause that does not need the extension) (the notarized build
   containing this change installed in `/Applications`, embedded core running, All Apps on, extension
   attached — a dev build cannot activate the extension and does not count here). System proxy unknown
   to the app (this PR's build).
@@ -853,7 +933,9 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   - B2 As found (TR-AC10(a), full): Flows "No flows yet" with the row `Nothing is decrypted until a host
     is in Scope.` (Add Host…, Open Scope…) and its detail line, then (with 2b) the CA row `HTTPS is not
     captured until the CA is trusted` with its detail and its buttons, not clicked (`ca.status` →
-    `…/bus-B2-ca.json`, every store `trusted: "no"` — TR-AC17). Status: no system-proxy step,
+    `…/bus-B2-ca.json` — TR-AC17 as ruled 2026-11-01: on Matt's Mac the user store reads `trusted: "yes"`, so
+    there is no CA row and Status reads `✓ CA trusted (user keychain)`; the not-trusted row and step appear only
+    on a Mac that does not trust the CA). Status: no system-proxy step,
     `✓ All Apps is on`, `○ Add a host to Scope (for now as example.com:443)` (Open Scope…; hover → the
     scope line), and (with 2b) `○ Trust the aitmproxy CA` with its button above the first-flow step —
     PR D's interim `CATrustRow` gone, the words unchanged; hover → the CA detail. Nothing reads
@@ -889,7 +971,9 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   - B6 Restore check: `scope.list` → `[]`; `…/B6-restored-flows.png` shows the B2 lines; on the PR4 build
     also `diff proxy-before.txt proxy-after.txt` empty.
   - B7 CA fact, read-only (TR-AC17): `call("ca.status")` → `…/bus-B7-ca.json` quoted in the report
-    (stores `user`/`system`: `installed`, `trusted: "no"`); the Flows and Status screenshots from B2
+    (stores `user`/`system`: `installed`, `trusted` as the keychain has it — the user store `"yes"` on Matt's Mac
+    since 2026-11-01, so the pages render the TRUSTED state: `✓ CA trusted (user keychain)`, no CA row, no CA
+    banner clause); the Flows and Status screenshots from B2
     and B4 are the evidence for the line, the step, the buttons present-and-unclicked and the CA-only
     banner. **No `ca.install`, no Install… click, no Trust the aitmproxy CA click, no Keychain Access
     change.**
@@ -913,11 +997,11 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
     `…/bus-B8-row-decrypted.json`). `scope.remove example.com:443` → the next `curl https://` row is a
     passthrough tunnel again and the line is back (`B8-after-remove.png`). Safari's HTTPS stays
     under the hard gate (keychain trust); curl `--cacert` is the decrypted-row evidence.
-  - B9 (exists only if Matt, in his own words, allows the CA to be trusted before this task runs):
-    through the app's own Status step only — the Trust the aitmproxy CA button, PR D's `.trustCA`
-    with its prompts — then `ca.status` → `trusted: "yes"`, both pages read `✓ CA trusted (user
-    keychain)` and the line is gone from the empty state and the banner. Otherwise B9 does not exist
-    and Shipped says so.
+  - B9 — **happened on 2026-11-01, by Matt's own hand:** he trusted the aitm CA through PR D's first-run step
+    (the app's own Trust the aitmproxy CA, with its prompts) before Half A ran; no session clicked or called
+    anything. The observation this step wanted — `ca.status` user store `trusted: "yes"`, Status `✓ CA trusted
+    (user keychain)`, no CA line in the empty state or the banner — is Half A's A2 evidence (`bus-A2-ca.json`,
+    `A2-status.png`, `A2-flows-empty.png`) and is re-read on Half B's build. Shipped records it so.
 
   **PR4 addendum (first build containing PR4; recorded in Shipped, not a gate for this PR):** repeat
   setup steps 1–2 in full and run TR-AC10(b) (the `.other` row/step with PR4's Set as System Proxy
@@ -946,22 +1030,24 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
 | `AitmproxyKit/ConnectionSummary.swift` | M | M (after T1 landed) | | | | | |
 | `Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` | M | M (after T1 landed) | | | | | |
 | PR D's `CATrustFacts` (Kit), `AitmproxyKit/Panels/CAStatus.swift`, `Session+CATrust.swift`, `Panels/CAPanel.swift` | — PR D (gate 3); read-only here | | | | | | |
-| `Aitmproxy/Bus/BusService.swift` (one line) | | | M | | | | |
+| `Aitmproxy/Bus/BusService.swift` (one change-guarded decode, four lines) | | | M | | | | |
 | `Aitmproxy/Session.swift` (two properties) | | | M | | | | |
 | `Aitmproxy/Session+Connection.swift` | | | M (on PR D's SHA) | M (after T2) | | | |
-| `Aitmproxy/Shell/RouteBanner.swift` (new) | | | | | C | | |
+| `Aitmproxy/Shell/RouteBanner.swift` (new) | | | | | C | M (`.trustCA` → `session.trustCA()`, after T3) | |
 | `Aitmproxy/Shell/ShellView.swift` (two hunks + the `EmptyFlows` call; two old banner call sites removed) | | | | | M | | |
 | `Aitmproxy/Panels/StatusPanel.swift` (`.help` line + `.addScopeHost` case; PR D hand-over removal) | | | | M (after T3) | M | | |
 | `apps/mac/tools/check-connection-words.sh` | | | | | | M | |
 | `apps/mac/tools/check-capture-toggle.sh` (NS-AC8 banner pins; on the fixture-removal mac SHA) | | | | | | M | |
+| `apps/mac/tools/check-ca-trust-path.sh` (rule 2 allow-list + expect line for `Shell/RouteBanner.swift`; GO 2026-11-01) | | | | | | M | |
+| `Aitmproxy/App.swift` (one token at `:226`, `ConnectionAction.trustCA.title`; GO 2026-11-01) | | | | | | M | |
 | (no repo files; `/tmp/claude/route-advice/`) | | | | | | | — |
 
 C = create, M = modify. A file in two columns is edited by the later task only after the earlier one
-has landed (T1→T1b, T2→T2b, T3→T2b); no two tasks edit a file concurrently. T1b may run beside Wave
+has landed (T1→T1b, T2→T2b, T3→T2b, T3→T5 on `RouteBanner.swift`); no two tasks edit a file concurrently. T1b may run beside Wave
 C/D. Shared with the sibling icons plan on this branch: `Bus/BusService.swift`, `Session.swift` (its
 Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touched by anyone here:
 `CaptureAdvice.swift`, `CaptureCapability.swift`, `Package.swift`, `UI/Tokens.swift`,
-`Bus/ExtensionController.swift`, `Panels/ScopePanel.swift`, `App.swift`, `AitmproxyKit/CommandMap.swift`,
+`Bus/ExtensionController.swift`, `Panels/ScopePanel.swift`, `AitmproxyKit/CommandMap.swift`,
 `apps/mac/docs/BRIEF.md`, `apps/mac/docs/GLOSSARY.md`, `apps/mac/docs/STORIES.md` (improve-loop session),
 `Bus/SystemProxyReader.swift` (never created), `apps/mac/Extension/**`, `crates/**`.
 
@@ -972,8 +1058,8 @@ Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touche
 | 1, 2 | K (contract) | PR #246's `SystemProxyStateTests` (gate 5); Task 1 reports if a literal is unpinned |
 | 3 (quoted, fallback, stale list, bus not `.ok`), 4, 5 | K | 1 |
 | 6 | K | 1 (`addScopeHost`, the `allCases` witness list) |
-| 7 | T | 5 (write + mutations), 3 (pre-form PASS), 6 (whole branch) |
-| 8 | structural | 2 (no CFNetwork, Kit imports, one-line `BusService` diff, `Package.swift`), 3 (ShellView footprint), 2b (`"ca.status"` set, StatusPanel footprint) |
+| 7 | T | 5 (write + mutations, incl. `check-ca-trust-path.sh` — 2026-11-01), 3 (pre-form PASS), 6 (whole branch) |
+| 8 | structural | 2 (no CFNetwork — the `///`-filtered grep, Kit imports, the `BusService` decode footprint, `Package.swift`), 3 (ShellView footprint), 2b (`"ca.status"` set, StatusPanel footprint) |
 | 9 | gates | every wave (Swift), 6 (release build warnings, Rust) |
 | 10 | L | 6 — (a) A2 on the dev bundle, B2 on the installed app; (b) PR4 addendum |
 | 11 | L | 6 (B3) |
@@ -1004,7 +1090,7 @@ Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touche
    (nil = unknown, never "off"); PR4 writes it. Declaring it here lets `connectionSummary` compile
    before PR4 lands; if PR4 has declared it first, Task 2 leaves PR4's. (Replaces the earlier
    `SystemProxyReader.read()` nil-vs-`.off` call: there is no reader.)
-5. No disconnect resets in `BusService` (the grant is one line): `make` ignores `decrypt` while the
+5. No disconnect resets in `BusService` (the grant is one decode, change-guarded): `make` ignores `decrypt` while the
    bus lane is not `.ok` (spec D3), and `advice`/`banner` are already empty then; the Status list
    returns to its pre-connect shape by that rule, not by a `defer`.
 6. `EmptyFlows` takes `routes: [TrafficRoute]` as a parameter from the existing overlay call rather
@@ -1012,9 +1098,10 @@ Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touche
    environment `Session` for its buttons' `perform`.
 7. (Superseded 2026-11-01.) There is no Proxy ▸ Network Settings… item: `.openNetworkSettings` was
    denied; the Proxy menu gets only PR4's toggle (⌥⌘P).
-8. Half A of the live proof runs on the `build.sh --debug` dev bundle (fast, no notarization) and is
-   the evidence for TR-AC10(a)/13(a)'s no-extension rows; Half B runs on the notarized installed
-   build. The system-proxy clauses (TR-AC10(b)/12/13(b)) run once on the first PR4 build and are
+8. Half A of the live proof runs on a dev bundle with a real core (as run 2026-11-01: the session's own bundle
+   script, not `build.sh --debug`; the installed app left running, so `L` was the dev core's ephemeral
+   `127.0.0.1:63109`) and is the evidence for TR-AC10(a)/13(a)'s no-extension rows; Half B runs on the first
+   DMG that contains this PR. The system-proxy clauses (TR-AC10(b)/12/13(b)) run once on the first PR4 build and are
    recorded in Shipped. If a notarized build is available when Half A runs, re-run A2–A3 on it too
    so all evidence sits on one build, and say which in Shipped.
 9. The CA cadence is PR D's (`BusService.caStatusEveryTicks = 10`, first tick, forced after
@@ -1061,18 +1148,18 @@ Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touche
 - **Q1 (claim) — resolved 2026-11-01.** The orchestrator's answers are recorded in gate 2
   (`check-capture-toggle.sh` GO; `BusService.swift` one line; `Session+Connection.swift` GO on PR D's
   SHA; `.openNetworkSettings` denied; no reader; `Session.swift` two properties; STORIES/GLOSSARY/
-  BRIEF/CommandMap/App.swift untouched) and gate 5 (PR #246). Sequencing with the icons plan's Tasks
+  BRIEF/CommandMap untouched; `App.swift` later granted one token, 2026-11-01) and gate 5 (PR #246). Sequencing with the icons plan's Tasks
   5/6 on `BusService.swift` / `Session.swift`: this PR first; the icons plan's gate 4 records it.
-- **Q2 (evidence build).** Does the dev-bundle pass (Half A) count as the TR-AC10(a)/13(a)
-  no-extension evidence, or must A2–A3 be repeated on the notarized build (plan call 8 assumes
-  "re-run if available")? And is the PR4 addendum (TR-AC10(b)/12/13(b)) acceptable as a
-  Shipped-section entry rather than a gate for this PR?
+- **Q2 (evidence build) — as run 2026-11-01.** Half A ran on a dev bundle with a real core (Task 6 "As run";
+  `L` = `127.0.0.1:63109`) and stands as the TR-AC10(a)/13(a) no-extension evidence; Half B runs on the first DMG
+  that contains this PR. Still Matt's to overturn: whether the PR4 addendum (TR-AC10(b)/12/13(b)) is acceptable as
+  a Shipped-section entry rather than a gate for this PR (assumed yes).
 - **Q3 (PR D, CA init) — resolved 2026-11-01.** PR D's `CATrustFacts(status:)` is failable; its
   fields/helpers are recorded in gate 2. Open only in detail: which helper is the CA entry's `line`
   (`state` assumed) — confirmed when gate 3 is recorded.
-- **Q4 (Matt, not blocking).** The CA-trusted proof (step B9) exists only if Matt allows the aitm
-  CA to be trusted on his Mac, in his own words; until then TR-AC17 is proved in its not-trusted
-  form only and Shipped says so.
+- **Q4 — resolved 2026-11-01 by Matt's own action.** Matt trusted the aitm CA on his Mac himself (PR D's
+  first-run step) before Task 6 ran; TR-AC17's live form is therefore the TRUSTED rendering (spec TR-AC17 ruling)
+  and B9 records it. No session clicked or called anything.
 - **Q5 — resolved 2026-11-01.** The core story shipped as PR #228 (v0.5.9); the `FlowSummary` →
   `.tunnelled` mapping is Task 1c here (gate 4 GO).
 - **Q6 (orchestrator, gate 3).** PR D's number and merge SHA, and confirmation that its
@@ -1109,7 +1196,10 @@ Tasks 5/6) — sequence, never concurrent; the icons PR ships second. Not touche
 
 Kept by the main session during stage 6. One row per finding. Rows dated 2026-11-01 are the stage-6
 panel on docs PR #242 (range `dac90fe9..0bad920f`, merged as `7a5f8585`), fixed in the follow-up
-docs PR from this branch.
+docs PR from this branch. Rows whose Reviewer reads "Tester (whole branch)" or "Architect (amendment)" are the
+2026-11-01 stage-5 Tester pass and the docs amendment pass on the shipped code (`58724ef7..e60a13e8`, commits
+`ce296c83` … `e60a13e8`); a "fixed in <code commit>" disposition gets its SHA stamped by the orchestrator when the
+coder's commit lands.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
@@ -1160,6 +1250,23 @@ docs PR from this branch.
 | docs #242 | quality (2nd pass) | Minor | icons spec AI-AC11 `Overview(rows:).clients` — the type is `OverviewStats` | fixed in b57840e3 |
 | docs #242 | quality (2nd pass) | Minor | `flowTable` overlay anchor "~258"/"~261" | fixed in b57840e3: `ShellView.swift:258` in spec D7 and plan Task 3 |
 | all | Spec (3rd pass) | Minor | `GettingStartedStep.Kind` listing showed `caTrusted` after `scopeSet`; PR D's enum is `coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow` | fixed in ad83ab78: listings use PR D's source order; the steps order stays make's |
+| whole branch | Tester (whole branch) | Minor | T1 — TR-AC8's literal `grep -rln CFNetworkCopySystemProxySettings apps/mac/Sources` is non-empty on the branch: PR #246's `SystemProxyState.swift` names the function in two `///` doc comments (lines 6, 79) and calls it nowhere | fixed in docs (this commit): spec TR-AC8 and plan Task 2 read `grep -rn … \| grep -vE ':[0-9]+:[[:space:]]*///'` → empty |
+| whole branch | Tester (whole branch) | Minor | T2 — the `BusService.swift` diff is four added lines (decode, change-guarded write, two-line comment), not "exactly one added line" | accepted (orchestrator 2026-11-01: the guard matches the file's other per-tick writes; an `@Observable` set notifies on equal values) + amended in docs (this commit): spec D6/D7/TR-AC8, plan gate 2, Task 2, do-not-touch, file table, call 5 |
+| whole branch | Tester (whole branch) | Minor | T3 — `App.swift:226` (one token, `ConnectionAction.trustCA.title`) and `tools/check-ca-trust-path.sh` (rule 2 allow-list + expect for `RouteBanner.swift`) are edited outside the recorded claim | recorded (this commit): orchestrator GO 2026-11-01 on both; spec D7/TR-AC7, plan gate 2, Task 5, do-not-touch, file table amended |
+| whole branch | Tester (whole branch) | Minor | T4 — an empty or whitespace-only `decrypt.advice` is quoted as the Scope line (a blank row / banner) instead of falling back to the sentence | fixed in <code commit> (SHA to be stamped): a blank sentence reads as absent; tests `advice: ""` → nil (`DecryptStatusTests`) and the fallback line (`ConnectionSummaryTests`); docs: spec D2/D3/TR-AC21, plan Task 1 (this commit) |
+| whole branch | Tester (whole branch) | Minor | T5 — `RouteBanner.shownEntries` re-derives the shown list by walking `advice` against the banner text: a second derivation of D5's predicate in a view (anti-goal) | fixed in <code commit> (SHA to be stamped): `TrafficRoutes.shown` and `bannerDetail` published by the Kit and read by `RouteBanner`; docs: spec D2/D5/D7/TR-AC18, plan Tasks 1/3 (this commit) |
+| 1b | Architect (amendment) | Minor | item 1 — spec D3's CA prose said `open = trusted`; the code, D3's own table and PR D's `step.done` say `trusted && !installing` | fixed in docs (this commit): D3 prose and plan Task 1b read `open = trusted && !installing`; pinned by `caSiblingStates`, incl. the uninstall-in-flight case |
+| 1b | Architect (amendment) | Minor | item 2 — plan Task 1b said test values are "built with PR D's memberwise init"; PR D's `init?(status:)` in the struct body suppresses it | fixed in docs (this commit): built via `CATrustFacts(status: CAStatus(...))`, then `installing` / `needsAdmin` set (`caFacts(scope:installing:needsAdmin:)`) |
+| 2 | Architect (amendment) | Minor | item 3 — TR-AC8 CFNetwork grep literal | = Tester T1 above; fixed in docs (this commit) |
+| 2 | Architect (amendment) | Minor | item 4 — `BusService` "exactly one added line" | = Tester T2 above; accepted + amended in docs (this commit) |
+| 5 | Architect (amendment) | Minor | item 5 — `App.swift:226` and `check-ca-trust-path.sh` outside the claim | = Tester T3 above; recorded, orchestrator GO (this commit) |
+| 3/5 | Architect (amendment) | Minor | item 6 — spec D7 said the Flows surfaces run every action through `perform`; `.trustCA` goes to `session.trustCA()` via `RouteActions.run` (PR D's `perform` returns `false` for it on purpose), as `StatusPanel.run` does; the model hides the button once trusted or while installing | fixed in docs (this commit): spec D7, plan Tasks 3 and 5 |
+| 1 | Architect (amendment) | Minor | item 7 — blank `decrypt.advice` | = Tester T4 above; fixed in <code commit> (SHA to be stamped) |
+| 1/3 | Architect (amendment) | Minor | item 8 — `TrafficRoutes.shown` / `bannerDetail` as the contract; `RouteBanner` reads them | = Tester T5 above; fixed in <code commit> (SHA to be stamped) |
+| 6 | Architect (amendment) | Minor | item 9 — TR-AC17: the aitm CA was trusted in Matt's login keychain on 2026-11-01 by Matt himself (PR D's first-run step), so the live proof shows the TRUSTED rendering (`✓ CA trusted (user keychain)`, no CA row/banner, `ca.status` user `trusted: "yes"`) | fixed in docs (this commit): spec Goals, Constraints, TR-AC17 (hard-gate text unchanged); plan Task 6 A2/B2/B7/B9, Q4, Shipped pre-fill |
+| 6 | Architect (amendment) | Minor | item 10 — Half A ran with the session's own bundle script and the installed app left running, so `L` = `127.0.0.1:63109`, not 8080; evidence `/tmp/claude/route-advice/` + shared note `traffic-route-live-proof-half-A.md`; Half B on the first DMG containing this PR | fixed in docs (this commit): plan Task 6 "As run", Half B header, call 8, Q2, Shipped pre-fill |
+| all | Architect (amendment) | Minor | `tools/grid-lint.sh` is zsh; the four tripwires are bash | fixed in docs (this commit): plan Environment adaptation says which is which and to run grid-lint by path, never under `bash` |
+| all | Architect (amendment) | Minor | plan header named the branch `claude/apps-attribution-8ab619`; the implementation shipped on `feat/mac-traffic-route-advice` (Architect's call to correct it) | fixed in docs (this commit) |
 
 ## Shipped
 
@@ -1167,3 +1274,14 @@ docs PR from this branch.
 PR4 writing `Session.systemProxy` and filling `.setSystemProxy` (the PR4 addendum of Task 6:
 TR-AC10(b)/12/13(b) on the first PR4 build); whether the CA-trusted state (B9) was proved, and on
 whose say-so.)
+
+Pre-filled 2026-11-01 — facts the stage-7 entry carries forward:
+
+- **Half A** ran 2026-11-01 12:57–13:02 PST on a dev bundle with a real core (`/tmp/Aitmproxy-dev-attr.app`: `swift build`
+  of `apps/mac` at `8a605948`, embedded release core v0.5.10 from the same tree, isolated `APP_STORE`, no extension; the
+  installed app left running, so `L` = `127.0.0.1:63109`). Evidence `/tmp/claude/route-advice/` and the shared note
+  `traffic-route-live-proof-half-A.md`. Deferred to PR4: TR-AC10(b)/12/13(b) (`A2-deferred-to-PR4.txt`).
+- **CA (B9 / TR-AC17):** the aitm CA was trusted in Matt's login keychain on 2026-11-01 by Matt himself, through PR D's
+  first-run step; the live proof shows `✓ CA trusted (user keychain)`, no CA row or banner clause, `ca.status` user store
+  `trusted: "yes"` (`bus-A2-ca.json`). No session ran `ca.install` or clicked anything.
+- **Half B:** pending the first DMG that contains this PR (B1–B8 as written; CA clauses in their TRUSTED form).
