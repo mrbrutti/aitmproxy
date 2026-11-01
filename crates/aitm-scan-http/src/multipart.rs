@@ -59,11 +59,8 @@ impl fmt::Debug for Part {
 /// `boundary` parameter, or when the boundary is empty or carries a line
 /// break (which no delimiter can contain).
 ///
-/// Unused by the lane: `params::body_format` resolves the boundary with its own
-/// `boundary_param` before it hands one here. Kept, with its pinning test, as
-/// this module's own stricter reading of the header — the two are a collapse
-/// candidate for the integration task, not for a lane coder to decide.
-#[allow(dead_code)]
+/// The one reading of the header the lane has: `params::body_format` resolves
+/// the boundary here before it hands one to [`parse`].
 pub(crate) fn boundary_of(content_type: &str) -> Option<String> {
     let (media, rest) = content_type.split_once(';')?;
     if !media.trim().to_ascii_lowercase().starts_with("multipart/") {

@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail};
 use serde_json::Value;
 
 use crate::limits::{MAX_JSON_DEPTH, MAX_PAIRS};
+use crate::multipart;
 
 // --- form and cookie pairs ------------------------------------------------
 
@@ -407,32 +408,13 @@ pub(crate) fn body_format(req: &HttpRequest) -> BodyFormat {
         return BodyFormat::Xml;
     }
     if essence == "multipart/form-data" {
-        if let Some(boundary) = boundary_param(content_type) {
+        // The multipart module owns the one reading of the header's parameters
+        // (quoted-string aware; an empty boundary is none).
+        if let Some(boundary) = multipart::boundary_of(content_type) {
             return BodyFormat::Multipart { boundary };
         }
     }
     BodyFormat::Other
-}
-
-/// The `boundary=` parameter of a `Content-Type`, quotes stripped.
-fn boundary_param(content_type: &str) -> Option<String> {
-    for param in content_type.split(';').skip(1) {
-        let Some((name, value)) = param.split_once('=') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("boundary") {
-            continue;
-        }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|rest| rest.strip_suffix('"'))
-            .unwrap_or(value);
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -580,6 +562,17 @@ mod tests {
             )),
             BodyFormat::Multipart {
                 boundary: "XyZ".to_string()
+            }
+        );
+        // The boundary is read by `multipart::boundary_of`, which understands a
+        // quoted-string, so a quoted `;` stays inside the boundary (R2).
+        assert_eq!(
+            body_format(&req(
+                Some("multipart/form-data; boundary=\"a;b\"; charset=utf-8"),
+                Body::Bytes(b"--a;b--\r\n".to_vec())
+            )),
+            BodyFormat::Multipart {
+                boundary: "a;b".to_string()
             }
         );
         assert_eq!(
