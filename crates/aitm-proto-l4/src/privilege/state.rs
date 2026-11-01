@@ -2312,6 +2312,249 @@ mod tests {
         assert_eq!(holds.count(), 0);
     }
 
+    // ---- tester, fix-C range (p1b panel 2): the S1 ordering on the accept-errors
+    // arm, the unwind guard's ordering, a serving helper is never a cancel target --
+
+    /// What the state looks like at one instant: the request progress, the
+    /// hold count, whether a prompt child is registered, and `watching`.
+    type Snapshot = (Option<RequestState>, usize, bool, bool);
+
+    /// An acceptor that fails every `accept` and, when dropped, records a
+    /// [`Snapshot`] of the state at that instant.
+    struct BrokenDropWatch {
+        shared: Arc<Shared>,
+        holds: HoldCount,
+        at_drop: Arc<Mutex<Option<Snapshot>>>,
+    }
+
+    impl Acceptor for BrokenDropWatch {
+        fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+            Err(SessionError::Io("accept: EBADF".to_string()))
+        }
+    }
+
+    impl Drop for BrokenDropWatch {
+        fn drop(&mut self) {
+            let progress = self.shared.lock_cache().request.as_ref().map(|r| r.state);
+            *self.at_drop.lock().unwrap() = Some((
+                progress,
+                self.holds.count(),
+                self.shared.prompt_child().is_some(),
+                self.shared.watching(),
+            ));
+        }
+    }
+
+    /// Tester (C5/C11): the one `end_request` epilogue keeps the S1 ordering
+    /// on the accept-errors arm too, which no earlier test pinned: when the
+    /// listener has failed `ACCEPT_ERRORS_MAX` times the acceptor (and its
+    /// socket path) is dropped **before** the `failed` row is written, and by
+    /// then the hold is released and the child is no longer a cancel target.
+    /// The child is killed exactly once (SIGKILL, never SIGINT: this is not a
+    /// cancel).
+    #[test]
+    fn accept_errors_arm_drops_the_acceptor_before_the_failed_row() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(13_000, Ordering::SeqCst);
+        // As `start_watch_with` does before the thread starts.
+        state.shared.watching.store(true, Ordering::SeqCst);
+        let holds = HoldCount::default();
+        let at_drop = Arc::new(Mutex::new(None));
+        let child = FakeChild::alive(4242);
+        let signals = Arc::clone(&child.signals);
+        let (done_tx, done_rx) = mpsc::channel();
+        let shared = Arc::clone(&state.shared);
+        let acceptor = BrokenDropWatch {
+            shared: Arc::clone(&state.shared),
+            holds: holds.clone(),
+            at_drop: Arc::clone(&at_drop),
+        };
+        let hold = holds.hold();
+        std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(child),
+                Box::new(acceptor),
+                Some(hold),
+                13_000,
+                true,
+            );
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(WAIT)
+            .expect("the watcher ended after the accept errors");
+        assert_eq!(
+            *at_drop.lock().unwrap(),
+            Some((None, 0, false, true)),
+            "at the acceptor's drop: no terminal row yet, hold released, prompt \
+             unregistered, the watcher still marked running"
+        );
+        assert_eq!(
+            *signals.lock().unwrap(),
+            vec![9],
+            "killed once, never interrupted"
+        );
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 13_000,
+                message: "The packet-capture helper socket failed (helper socket error: accept: \
+                          EBADF)"
+                    .to_string(),
+            })
+        );
+        assert!(!state.shared.watching());
+        assert!(state.shared.prompt_child().is_none());
+        state.cancel_prompt();
+        assert_eq!(
+            *signals.lock().unwrap(),
+            vec![9],
+            "a cancel after the end reaches no child"
+        );
+    }
+
+    /// Tester (C5): the unwind guard keeps the S1 ordering on the panic path
+    /// as well: the acceptor is dropped while the request still reads
+    /// `pending` (the `failed` row comes after), with the hold already
+    /// released and the prompt child already unregistered; `watching` is the
+    /// last thing cleared. A direct (launcher-less) start that panics writes
+    /// no request progress at all and still clears `watching`.
+    #[test]
+    fn watcher_panic_drops_the_acceptor_before_the_failed_row() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(14_000, Ordering::SeqCst);
+        state.set_request(Some(RequestProgress {
+            state: RequestState::Pending,
+            at: 13_900,
+            message: msg::PENDING_DIALOG.to_string(),
+        }));
+        state.shared.watching.store(true, Ordering::SeqCst);
+        let holds = HoldCount::default();
+        let at_drop = Arc::new(Mutex::new(None));
+        let acceptor = BrokenDropWatch {
+            shared: Arc::clone(&state.shared),
+            holds: holds.clone(),
+            at_drop: Arc::clone(&at_drop),
+        };
+        let hold = holds.hold();
+        let shared = Arc::clone(&state.shared);
+        let crashed = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(PanicsOnWait),
+                Box::new(acceptor),
+                Some(hold),
+                14_000,
+                true,
+            );
+        })
+        .join();
+        assert!(crashed.is_err(), "the watcher panicked");
+        assert_eq!(
+            *at_drop.lock().unwrap(),
+            Some((Some(RequestState::Pending), 0, false, true)),
+            "at the acceptor's drop: still pending, hold released, prompt \
+             unregistered, watching not yet cleared"
+        );
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 14_000,
+                message: msg::ENDED_UNEXPECTEDLY.to_string(),
+            })
+        );
+        assert_eq!(
+            msg::ENDED_UNEXPECTEDLY,
+            "The packet-capture request ended unexpectedly"
+        );
+        assert!(!state.shared.watching());
+
+        // A direct start (no hold, no progress) that panics: nothing is
+        // written as request progress, the slot stays empty, the flag clears.
+        let (state, _now) = state_over(vec![row6()]);
+        state.shared.watching.store(true, Ordering::SeqCst);
+        let at_drop = Arc::new(Mutex::new(None));
+        let acceptor = BrokenDropWatch {
+            shared: Arc::clone(&state.shared),
+            holds: HoldCount::default(),
+            at_drop: Arc::clone(&at_drop),
+        };
+        let shared = Arc::clone(&state.shared);
+        let crashed = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(PanicsOnWait),
+                Box::new(acceptor),
+                None,
+                0,
+                false,
+            );
+        })
+        .join();
+        assert!(crashed.is_err());
+        assert_eq!(*at_drop.lock().unwrap(), Some((None, 0, false, true)));
+        assert_eq!(state.report().request, None, "a direct start writes no row");
+        assert!(!state.shared.watching());
+        assert!(state.shared.prompt_child().is_none());
+    }
+
+    /// Tester (C4): once the helper has connected the child is no longer a
+    /// prompt. `cancel_prompt()` during the serving session signals nothing
+    /// (the live helper must never get the Ctrl-C meant for a prompt), the
+    /// backend stays live, and the session's own end still reaps the child
+    /// without a kill.
+    #[test]
+    fn cancel_prompt_never_signals_a_serving_helper() {
+        let (state, now) = state_over(vec![row6()]);
+        let state = Arc::new(state);
+        now.store(15_000, Ordering::SeqCst);
+        state.set_guard(Arc::new(L4Guard::new(&L4Config::default())));
+        let holds = HoldCount::default();
+        let hold = holds.hold();
+
+        let (core, peer) = UnixStream::pair().expect("socketpair");
+        let close = helper_peer(peer, true);
+        let session = HelperSession::from_stream(core).expect("session");
+        let child = FakeChild {
+            exit: Some(ChildExit::Exited(0)),
+            ..FakeChild::alive(4242)
+        };
+        let signals = Arc::clone(&child.signals);
+        let shared = Arc::clone(&state.shared);
+        let watcher = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(child),
+                Box::new(OnePeer(Mutex::new(Some(session)))),
+                Some(hold),
+                15_000,
+                true,
+            );
+        });
+        until("the helper backend", || state.helper_backend().is_some());
+        assert_eq!(holds.count(), 0, "the hold went with the connect");
+        assert!(
+            state.shared.prompt_child().is_none(),
+            "a connected helper is not a prompt"
+        );
+        state.cancel_prompt();
+        state.cancel_prompt();
+        assert!(
+            signals.lock().unwrap().is_empty(),
+            "no signal reaches a serving helper"
+        );
+        assert!(state.shared.live_is_up(), "the session is untouched");
+
+        close.send(()).expect("close");
+        watcher.join().expect("watcher thread");
+        assert!(signals.lock().unwrap().is_empty(), "reaped, never killed");
+        assert!(state.helper_backend().is_none());
+        assert!(!state.shared.watching());
+    }
+
     /// Tester: a connection from a process other than the spawned launcher
     /// (the peer uid or pid check fails) is dropped and the watcher keeps
     /// waiting; the request's end is still decided by the launcher's exit.

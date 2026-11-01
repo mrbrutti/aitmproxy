@@ -2007,8 +2007,10 @@ mod tests {
             run_body.contains("crate::shutdown_signal_unless_held("),
             "the tui select arm must consult the prompt hold"
         );
+        // Tester (fix-C range): any spelling of the plain future, imported or
+        // path-qualified, is the regression; forbid the bare call outright.
         assert!(
-            !run_body.contains("crate::shutdown_signal()"),
+            !run_body.contains("shutdown_signal()"),
             "the plain shutdown future ignores the hold"
         );
     }

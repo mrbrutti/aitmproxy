@@ -1718,6 +1718,45 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+    // ---- tester, fix-C range (p1b panel 2, C4): the real child's `interrupt` ---
+
+    /// Tester (C4): `StdChild::interrupt` on a real child. On Linux (the only
+    /// platform a launcher is spawned on) it is SIGINT, so the child ends
+    /// `Signaled(SIGINT)` and the §5.5 table reads `dismissed`; off Linux the
+    /// documented fallback is `kill`, so the child ends `Signaled(9)`. Either
+    /// way the call never waits, and a second `interrupt` on the ended child
+    /// is harmless.
+    #[test]
+    fn std_child_interrupt_ends_a_real_child() {
+        let mut child = StdSpawner
+            .spawn(&os(&["/bin/sleep", "30"]))
+            .expect("spawn sleep");
+        assert_eq!(child.try_wait().expect("try_wait"), None, "alive");
+        let before = std::time::Instant::now();
+        child.interrupt();
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(5),
+            "interrupt never waits"
+        );
+        let exit = wait_fake_free(child.as_mut());
+        if cfg!(target_os = "linux") {
+            assert_eq!(exit, ChildExit::Signaled(SIGINT), "SIGINT, never SIGKILL");
+            assert_eq!(
+                pair(exit, "").0,
+                RequestState::Dismissed,
+                "a cancelled prompt is dismissed"
+            );
+        } else {
+            assert_eq!(
+                exit,
+                ChildExit::Signaled(9),
+                "the off-Linux fallback is kill"
+            );
+        }
+        child.interrupt();
+        assert_eq!(child.try_wait().expect("try_wait after exit"), Some(exit));
+    }
+
     // ---- tester (privilege unit p1b): oversized, hostile and failing inputs ---
 
     /// Tester: one chunk bigger than the bound keeps only its last 4 KiB; a
