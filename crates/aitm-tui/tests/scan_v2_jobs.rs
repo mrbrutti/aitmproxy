@@ -17,7 +17,7 @@ use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{
     probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ReadStatus, ScanTab,
-    DETAIL_LIST_MAX, DETAIL_VALUE_MAX, PROFILE_MAX, TARGETS_MAX,
+    DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX, PROFILE_MAX, TARGETS_MAX,
 };
 use aitm_tui::text::width;
 use common::*;
@@ -716,4 +716,38 @@ fn lanes_are_deduped_and_sorted_at_fold() {
         2,
         "one requested http, one run http: {line:?}"
     );
+}
+
+/// Fix round H, H36 (D6 hostile-core bounds): `scan.list` has a row-count
+/// cap. A list of 100_000 ids folds to `JOBS_MAX` (256) rows, the first
+/// listed ids kept in list order, a `started_here` id the list omits still
+/// in front, and the screen still draws.
+#[test]
+fn a_huge_list_folds_to_jobs_max_rows() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    app.scan.jobs.started_here.insert(JOB.to_string());
+    let jobs: Vec<Value> = (0..100_000)
+        .map(|k| {
+            let mut s = fixture("scan.list.json")["jobs"][0].clone();
+            s["job"] = json!(format!("scan-{k:08x}"));
+            s
+        })
+        .collect();
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: json!({ "jobs": jobs }),
+    });
+    assert_eq!(JOBS_MAX, 256);
+    assert_eq!(
+        app.scan.jobs.order.len(),
+        JOBS_MAX + 1,
+        "256 listed + 1 started here"
+    );
+    assert_eq!(app.scan.jobs.order[0], JOB);
+    assert_eq!(app.scan.jobs.order[1], "scan-00000000");
+    assert_eq!(app.scan.jobs.order[JOBS_MAX], "scan-000000ff");
+    assert_eq!(app.scan.jobs.summaries.len(), JOBS_MAX + 1);
+    let _ = screen(&app);
 }

@@ -128,12 +128,14 @@ impl JobsState {
     /// replace their `summaries`; `full` and `summaries` then keep only the
     /// jobs in `order`, so a job the core forgot, or one learned only from a
     /// reply or a push line, leaves with the list. A row whose id is not in
-    /// the wire form is skipped (D6 hostile-core bounds). Returns the listed
-    /// ids with no `full` entry yet and not in `healed` (G83), in list
-    /// order, for one `scan.status` each (the caller caps them at
+    /// the wire form is skipped and the list is cut to [`JOBS_MAX`] rows
+    /// (D6 hostile-core bounds; fix round H, H36). Returns the listed ids
+    /// with no `full` entry yet and not in `healed` (G83), in list order,
+    /// for one `scan.status` each (the caller caps them at
     /// [`super::MAX_STATUS_FOLLOWUPS`]).
     pub fn fold_list(&mut self, mut list: ListResult) -> Vec<JobId> {
         list.jobs.retain(|j| is_job_id(&j.job));
+        list.jobs.truncate(JOBS_MAX);
         let listed: BTreeSet<JobId> = list.jobs.iter().map(|j| j.job.clone()).collect();
         self.started_here.retain(|id| !listed.contains(id));
         let known: BTreeSet<&JobId> = self.order.iter().collect();
@@ -398,6 +400,10 @@ fn more(dropped: usize) -> String {
     }
 }
 
+/// The most rows a `scan.list` reply folds to (fix round H, H36; D6
+/// hostile-core bounds): the list is cut to this many before the
+/// started-here ids are put in front, so `order` is bounded in count.
+pub const JOBS_MAX: usize = 256;
 /// The widest a `profile` cell grows before it is cut (the column cap, and
 /// the bound [`JobsState::fold_status`] applies to the core's string).
 pub const PROFILE_MAX: usize = 16;
