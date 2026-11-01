@@ -31,9 +31,6 @@
 //! Nothing here logs, and nothing here reaches the network: the caller
 //! (`host.rs`) owns both.
 
-// Removed by Task 19/20, the first consumers of this module.
-#![allow(dead_code)]
-
 use aitm_core::{Body, HeaderMap, HttpRequest};
 use aitm_scan_model::{InsertionKind, InsertionPoint, Payload, PayloadMode};
 use anyhow::{anyhow, Result};
@@ -44,6 +41,7 @@ use crate::params::{
     body_bytes, body_format, cookie_pairs, form_pairs, json_get, json_rename_top, json_set,
     serialize_cookies, serialize_form, split_path, typed_replacement, BodyFormat,
 };
+use crate::points::kind_token;
 use crate::xml::{self, XmlSlotKind};
 
 /// Combine a payload with the value already at an insertion point.
@@ -572,18 +570,6 @@ fn stale(point: &InsertionPoint, reason: &str) -> anyhow::Error {
         kind_token(point.kind),
         point.id
     )
-}
-
-/// The snake_case wire token of an insertion kind.
-///
-/// Taken from the model's own serde representation rather than a second
-/// hand-written table, so this module cannot drift from the wire vocabulary
-/// `points::kind_token` spells into point ids.
-fn kind_token(kind: InsertionKind) -> String {
-    match serde_json::to_value(kind) {
-        Ok(Value::String(token)) => token,
-        _ => "insertion".to_string(),
-    }
 }
 
 #[cfg(test)]

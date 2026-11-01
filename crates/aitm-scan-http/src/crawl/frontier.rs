@@ -7,10 +7,6 @@
 //! fingerprint that keeps volatile content from looping, the deadline bound on
 //! every await, and the report shape the lane reads back (spec D8.1).
 
-// Filled by siblings in later waves; `crawl/client.rs`, `crawl/browser.rs` and
-// `lane.rs` consume these. Allowed until a consuming module is on the branch.
-#![allow(dead_code)]
-
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -166,11 +162,17 @@ impl Frontier {
     }
 
     /// How many URLs are waiting.
+    ///
+    /// Read by this module's tests; an engine drains the queue with
+    /// [`Frontier::pop`] and never asks for its size. `is_empty` is its
+    /// conventional partner (`clippy::len_without_is_empty`).
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
     }
 
     /// Whether no URL is waiting.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }

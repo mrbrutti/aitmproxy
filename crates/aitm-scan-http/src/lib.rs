@@ -33,21 +33,30 @@ pub(crate) mod xml;
 #[cfg(test)]
 mod testutil;
 
-/// The HTTP lane, or `None` while the lane is unimplemented.
+/// The HTTP lane.
 ///
 /// `crates/aitm/src/wire.rs` calls this once at startup and registers the lane
-/// it gets back; a `None` lane makes `scan.start` refuse an `http` lane with
-/// `lane_unavailable`. Track T2 replaces the body with `Some(Arc::new(..))`;
-/// the signature is final.
+/// it gets back. The slot is an `Option` because a lane crate may ship before
+/// its lane does — a `None` lane makes `scan.start` refuse an `http` lane with
+/// `lane_unavailable` — but this one is now built (track T2, task 20), so the
+/// binary prefers it over the interim lane (spec D1).
 #[must_use]
 pub fn lane() -> Option<Arc<dyn Lane>> {
-    None
+    Some(Arc::new(lane::HttpLane::new()))
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use aitm_scan_model::LaneKind;
+
+    /// The slot the binary reads is filled, is the HTTP lane, and ships no
+    /// checks of its own (track T3 owns the HTTP checks).
     #[test]
-    fn skeleton_returns_none() {
-        assert!(crate::lane().is_none());
+    fn lane_slot_is_populated() {
+        let lane = crate::lane().expect("the http lane is registered");
+
+        assert_eq!(lane.lane(), LaneKind::Http);
+        assert!(lane.checks().is_empty());
     }
 }

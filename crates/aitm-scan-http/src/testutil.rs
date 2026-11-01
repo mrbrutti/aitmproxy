@@ -17,10 +17,6 @@
 //! still records a cookie *name* only, never a cookie value, so a test that
 //! prints the log cannot leak one.
 
-// The doubles are consumed by the tests of tasks 13, 15 and 17 to 20, which are
-// not written yet; without this, every unused double is a `-D warnings` failure
-// in the waves before them.
-#![allow(dead_code)]
 // A double may panic on a malformed input: that is a bug in the test that built
 // it, and failing loudly is the point. The crate root denies both lints for the
 // library paths that handle network and user input.

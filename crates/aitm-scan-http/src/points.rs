@@ -27,9 +27,6 @@
 //! cut to `max_points_per_request` with the overflow counted rather than
 //! silently dropped.
 
-// Removed by tasks 19 and 20, the first non-test consumers of the enumerator.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 
 use anyhow::{bail, Result};

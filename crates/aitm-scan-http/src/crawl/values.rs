@@ -17,9 +17,6 @@
 //! honestly — a file upload, an empty select, a hidden field with no value —
 //! yields `None` and is left out of the submission entirely.
 
-// Removed by the tasks that fill the crawl engines consuming these helpers.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 
 use url::Url;

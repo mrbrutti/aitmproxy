@@ -19,9 +19,6 @@
 //! `crawl::frontier` decides what is in scope and what a relative reference
 //! means against `Extracted::base`.
 
-// Removed by the tasks that fill the modules consuming this extractor.
-#![allow(dead_code)]
-
 use std::fmt;
 
 use crate::limits::{
@@ -595,11 +592,6 @@ fn raw_text_end(html: &str, tag: &str, from: usize) -> usize {
                 && hay[i + 2..i + needle_len].eq_ignore_ascii_case(tag)
         })
         .map_or(html.len(), |i| start + i)
-}
-
-/// Skip the body of a raw-text element, leaving the walk on its `</tag`.
-fn skip_raw_text(html: &str, tag: &str, from: usize) -> usize {
-    raw_text_end(html, tag, from)
 }
 
 /// Decode the entities an attribute value or an option's text commonly carries.

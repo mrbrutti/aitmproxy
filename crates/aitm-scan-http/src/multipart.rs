@@ -12,9 +12,6 @@
 //! slice, malformed input is an `Err` naming a byte offset rather than a panic,
 //! and no error message or `Debug` line carries header or body content.
 
-// Removed by Tasks 10 and 11, the first consumers of this module.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::ops::Range;
 
@@ -61,6 +58,12 @@ impl fmt::Debug for Part {
 /// `None` when the media type is not `multipart/*`, when there is no
 /// `boundary` parameter, or when the boundary is empty or carries a line
 /// break (which no delimiter can contain).
+///
+/// Unused by the lane: `params::body_format` resolves the boundary with its own
+/// `boundary_param` before it hands one here. Kept, with its pinning test, as
+/// this module's own stricter reading of the header — the two are a collapse
+/// candidate for the integration task, not for a lane coder to decide.
+#[allow(dead_code)]
 pub(crate) fn boundary_of(content_type: &str) -> Option<String> {
     let (media, rest) = content_type.split_once(';')?;
     if !media.trim().to_ascii_lowercase().starts_with("multipart/") {

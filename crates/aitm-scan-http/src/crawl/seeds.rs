@@ -24,9 +24,6 @@
 //! served fixture names `http://t:8080/sm.xml`, and a cross-origin `Sitemap:`
 //! line is pinned as *not* fetched.
 
-// No non-test consumer until task 17 wires the client crawler; removed there.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::time::{Instant, SystemTime};
 
@@ -36,12 +33,9 @@ use url::Url;
 
 use crate::limits::{
     MAX_AWAIT, MAX_BODY_PARSE_BYTES, MAX_SEED_URLS, MAX_SITEMAPS_FOLLOWED, MAX_SITEMAP_URLS,
+    USER_AGENT,
 };
 use crate::{params, redact, session, url_norm};
-
-/// The `User-Agent` the lane's own fetches carry, so an operator reading the
-/// target's logs can tell the scanner's traffic from a real client's.
-const USER_AGENT: &str = "aitm-scan";
 
 /// What a `robots.txt` offered: paths worth crawling and sitemaps worth reading.
 #[derive(Debug, Default, PartialEq, Eq)]

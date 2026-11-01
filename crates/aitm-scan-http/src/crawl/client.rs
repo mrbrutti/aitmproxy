@@ -27,9 +27,6 @@
 //! Nothing here logs a header, a cookie or a body, and every URL that reaches
 //! a line goes through [`redact::safe_url`].
 
-// Consumed by `lane.rs` (task 20); allowed until that module is on the branch.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,17 +43,13 @@ use aitm_scan_model::JobCtx;
 use crate::crawl::extract::{extract, FormSpec};
 use crate::crawl::frontier::{fingerprint, remaining, CrawlReport, Crawler, Frontier, Limits};
 use crate::crawl::values::{form_action, form_pairs_for};
-use crate::limits::{MARK_CRAWL, MAX_DOM_BYTES, MAX_HELD_CRAWL_BODY};
+use crate::limits::{MARK_CRAWL, MAX_DOM_BYTES, MAX_HELD_CRAWL_BODY, USER_AGENT};
 use crate::url_norm::{guard_authority, origin_key, resolve, same_origin};
 use crate::{params, redact, session};
 
 /// What the crawler says it accepts; a target that content-negotiates answers
 /// the HTML the crawler can actually read (call **A13**).
 const ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
-
-/// What the crawler calls itself. Honest on purpose: an operator reading the
-/// target's access log sees the scanner, not a spoofed browser (call **A13**).
-const USER_AGENT: &str = "aitm-scan";
 
 /// The crawl engine that fetches pages with the job's HTTP client.
 pub(crate) struct ClientCrawler;

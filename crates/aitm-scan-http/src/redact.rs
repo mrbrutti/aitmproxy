@@ -20,9 +20,6 @@
 //! crate, so widening the vocabulary (PR #199's `_wide` pair, task 22) is a
 //! two-line edit in this file.
 
-// Removed by the tasks that fill the modules consuming these helpers.
-#![allow(dead_code)]
-
 use aitm_core::flow::HttpRequest;
 use aitm_scan_model::InsertionKind;
 

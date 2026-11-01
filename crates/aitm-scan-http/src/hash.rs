@@ -5,9 +5,6 @@
 //! the design deliberately takes FNV-1a over a cryptographic hash and adds no
 //! dependency (plan call A1: `blake3` stays out of this crate).
 
-// Removed by the tasks that fill the modules consuming these helpers.
-#![allow(dead_code)]
-
 /// FNV-1a offset basis, 64-bit.
 const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 

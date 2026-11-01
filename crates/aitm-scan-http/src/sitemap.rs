@@ -21,9 +21,6 @@
 //!   collects were already redacted by `points::enumerate_v2`. This module adds
 //!   no example, no header value and no log line.
 
-// Removed by task 20, the first non-test consumer of the builder.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use aitm_core::{FlowId, HttpRequest};

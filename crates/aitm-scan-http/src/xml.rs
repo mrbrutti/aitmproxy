@@ -31,9 +31,6 @@
 //! - **No value in `Debug`.** [`XmlSlot`] prints the length of its value, never
 //!   the value, because a slot holds body content (crate redaction rule, D8.1).
 
-// Removed by the tasks that fill the modules consuming these helpers.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::ops::Range;
 

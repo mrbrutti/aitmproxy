@@ -4,9 +4,6 @@
 //! site: a reviewer reads this one file to see every ceiling the lane applies
 //! to a page, a body, the frontier, the browser budget or an await.
 
-// Removed by the tasks that fill the modules consuming these constants.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 /// Links taken from one HTML page.
@@ -99,6 +96,14 @@ pub(crate) const MAX_HELD_CRAWL_BODY: usize = 64 * 1024;
 
 /// The mark put on every request the crawler makes (spec D5, "crawl marks").
 pub(crate) const MARK_CRAWL: &str = "crawl";
+
+/// The `User-Agent` every request the lane makes itself carries — a crawl page
+/// fetch, a form submission, a `robots.txt` or `sitemap.xml` read.
+///
+/// Honest on purpose: an operator reading the target's access log sees the
+/// scanner, not a spoofed browser (call **A13**). One constant, so the crawl
+/// engine and the seed reader cannot drift apart.
+pub(crate) const USER_AGENT: &str = "aitm-scan";
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

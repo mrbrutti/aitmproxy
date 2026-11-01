@@ -42,10 +42,6 @@
 //! text, field value or cookie value ever reaches a log line (spec D8.1
 //! redaction rules, AC **T2-6**).
 
-// The lane (task 20) is the only non-test consumer of this engine, and it is a
-// later wave. Allowed until it is on the branch.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -303,7 +299,7 @@ fn set_checked_js(selector: &str) -> String {
 
 /// `origin` reduced to its root document: the browser profile is primed there,
 /// and a cookie is written for the whole origin anyway.
-fn origin_root(origin: &Url) -> Url {
+pub(crate) fn origin_root(origin: &Url) -> Url {
     let mut root = origin.clone();
     root.set_path("/");
     root.set_query(None);

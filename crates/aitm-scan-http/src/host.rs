@@ -38,10 +38,6 @@
 //! error starting with [`session::SESSION_LOST_PREFIX`] and sends nothing
 //! (cross-track seam S1, AC T2-5).
 
-// Consumed by `lane.rs` (task 20), which is still a placeholder; without this
-// every item here is an unused-code failure under `-D warnings`.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -422,7 +418,9 @@ impl SessionMonitors {
         monitor
     }
 
-    /// How many monitors are held.
+    /// How many monitors are held. Read by the lane's tests to pin call A5
+    /// (one monitor per job, built on the first point).
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -431,7 +429,10 @@ impl SessionMonitors {
             .len()
     }
 
-    /// Whether no monitor is held.
+    /// Whether no monitor is held. The conventional partner of
+    /// [`SessionMonitors::len`] (`clippy::len_without_is_empty`); no caller
+    /// needs it yet.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

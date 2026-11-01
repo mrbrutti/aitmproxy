@@ -21,10 +21,6 @@
 //! contract; a `JobCtx::report_session_lost` hook is wired in task 22, once
 //! T1b lands it.
 
-// Consumed by `host.rs` (task 19) and `crawl/browser.rs` (task 18), which are
-// still placeholders. Allowed until a consuming module is on the branch.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -181,9 +177,13 @@ fn escape_cookie_value(value: &str) -> String {
 pub(crate) struct CanaryRequest {
     /// The request to replay, body already forced empty.
     pub request: HttpRequest,
-    /// `GET` or `HEAD`, never a method that could mutate state.
+    /// `GET` or `HEAD`, never a method that could mutate state. Read only by
+    /// [`SessionMonitor::canary`], which waits on seam S1.
+    #[allow(dead_code)]
     pub method: CanaryMethod,
-    /// The request's path (with query), for the status shape.
+    /// The request's path (with query), for the status shape. Read only by
+    /// [`SessionMonitor::canary`], which waits on seam S1.
+    #[allow(dead_code)]
     pub path: String,
     /// The status the replay is expected to answer with.
     pub expected_status: u16,
@@ -364,6 +364,12 @@ impl SessionMonitor {
     }
 
     /// The canary's wire shape (a method, a path and a status — never a value).
+    ///
+    /// The lane never reads it: `Canary` is a *results* type, and nothing on
+    /// [`aitm_scan_model::JobCtx`] lets a lane hand one back, so the engine
+    /// cannot see the canary this job armed (cross-track seam S1). Kept so the
+    /// shape exists the moment that seam does.
+    #[allow(dead_code)]
     pub fn canary(&self) -> Canary {
         match &self.canary {
             None => Canary::None,

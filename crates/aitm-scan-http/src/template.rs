@@ -13,9 +13,6 @@
 //! fetches or trusts the value, and none of it ever logs one: a trait is a
 //! label, never evidence.
 
-// Removed by the tasks that fill the modules consuming these helpers.
-#![allow(dead_code)]
-
 use aitm_scan_model::PointTrait;
 
 /// Longest run of digits still read as an identifier by [`is_id_like`].

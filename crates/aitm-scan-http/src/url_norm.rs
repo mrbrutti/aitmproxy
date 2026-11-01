@@ -1,9 +1,5 @@
 //! URL normalisation, origin and scope keys (task 3).
 
-// Filled by siblings in later waves; the crawler, site map and host consume
-// these keys. Allowed until a consuming module is on the branch.
-#![allow(dead_code)]
-
 use aitm_core::HttpRequest;
 use url::Url;
 

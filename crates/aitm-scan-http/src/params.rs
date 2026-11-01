@@ -12,9 +12,6 @@
 //! is `redact.rs`'s job, and `points.rs` is the only caller that builds an
 //! `InsertionPoint` from these.
 
-// Removed by the tasks that fill the modules consuming these helpers.
-#![allow(dead_code)]
-
 use aitm_core::{Body, HttpRequest};
 use anyhow::{anyhow, bail};
 use serde_json::Value;
