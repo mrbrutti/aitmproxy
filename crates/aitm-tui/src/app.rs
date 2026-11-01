@@ -28,8 +28,8 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    parse_result, step, tag_keyed, ScanError, ScanOffer, ScanState, ScanTab, LIST_POLL_TICKS,
-    NO_SCANNER, STATUS_POLL_TICKS,
+    parse_result, step, tag_keyed, tag_parts, ScanError, ScanOffer, ScanState, ScanTab,
+    LIST_POLL_TICKS, NO_SCANNER, OTHER_JOB, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -4073,10 +4073,18 @@ impl App {
         self.scan.inflight.remove(tag);
         match name {
             "scan.status" | "scan.cancel" => match parse_result::<JobStatus>(name, &value) {
-                Ok(status) => {
+                // D6 hostile-core bound: the reply is folded only under the
+                // job the tag asked about, so a core cannot mint a new live
+                // job (and a new poll) per reply.
+                Ok(status) if Some(status.job.as_str()) == tag_parts(tag).1 => {
                     self.scan.clear_error(name);
                     self.scan.jobs.fold_status(status);
                 }
+                Ok(_) => self.scan.set_error(ScanError {
+                    verb: name.to_string(),
+                    code: None,
+                    detail: OTHER_JOB.to_string(),
+                }),
                 Err(e) => self.scan.set_error(e),
             },
             "scan.list" => match parse_result::<ListResult>(name, &value) {

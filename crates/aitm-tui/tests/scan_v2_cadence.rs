@@ -221,3 +221,32 @@ fn a_malformed_status_keeps_the_row() {
     assert_eq!(err.code, None);
     assert_eq!(err.verb, "scan.status");
 }
+
+/// D6 hostile-core bounds (fix round B, B1): a `scan.status` reply whose
+/// `job` is not the tag's key folds nothing (no new row, no `full` entry) and
+/// records an uncoded error; the polled row stays as it was.
+#[test]
+fn a_status_reply_naming_another_job_is_not_folded() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let mut forged = fixture("scan.status.json");
+    forged["job"] = json!("scan-ffff0001");
+    let reqs = app.on_bus(status_reply(forged));
+    assert!(reqs.is_empty(), "a refused reply pushes nothing: {reqs:?}");
+    assert_eq!(app.scan.jobs.order, vec![JOB.to_string()]);
+    assert!(!app.scan.jobs.full.contains_key("scan-ffff0001"));
+    assert!(!app.scan.jobs.summaries.contains_key("scan-ffff0001"));
+    assert_eq!(app.scan.jobs.full[JOB].probes.sent, 418);
+    let err = app
+        .scan
+        .last_error
+        .as_ref()
+        .expect("the mismatch is recorded");
+    assert_eq!(err.code, None);
+    assert_eq!(err.verb, "scan.status");
+    assert_eq!(err.detail, "reply named a different job");
+    assert!(
+        app.scan.inflight.is_empty(),
+        "the tag is settled even when the reply is refused"
+    );
+}

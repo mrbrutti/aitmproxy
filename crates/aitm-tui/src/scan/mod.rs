@@ -355,6 +355,11 @@ pub const NO_SCANNER: &str = "the scanner is not on this bus (scan.start / scan.
 /// a control whose verb the bus lacks, minus the verb itself.
 pub const MISSING_VERB: &str = "is not on this bus";
 
+/// The detail of the uncoded error a `scan.status` / `scan.cancel` reply gets
+/// when its `job` is not the key of the tag it answers (spec D6, hostile-core
+/// bounds): nothing is folded from such a reply.
+pub const OTHER_JOB: &str = "reply named a different job";
+
 /// A failed `scan.*` call, coded when the core's message carries a D9 code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanError {
