@@ -126,6 +126,10 @@ start_capture() {
 # stop_capture: SIGINT so tcpdump flushes, then make the file ours to read.
 stop_capture() {
   [ -n "$TCPD_PID" ] || return 0
+  # Run 4 (2026-11-01) lost the last three exchanges of the echo test from the pcap while the lane itself
+  # had every reply: under load the VM's tcpdump had not yet read them from the ring when it was stopped.
+  # Give it a few seconds after the last frame before the SIGINT.
+  sleep 3
   sudo kill -INT "$TCPD_PID" 2>/dev/null
   wait "$TCPD_PID" 2>/dev/null
   sleep 1
