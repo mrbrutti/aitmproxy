@@ -101,6 +101,13 @@ fn scan(key: KeyEvent) -> Option<Action> {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
         KeyCode::Char('x') => Action::ScanCancel,
+        // Issues filters (D11): one key per filter, `R` resets them all.
+        KeyCode::Char('S') => Action::ScanFilter(crate::scan::IssueFilterKey::Severity),
+        KeyCode::Char('C') => Action::ScanFilter(crate::scan::IssueFilterKey::Confidence),
+        KeyCode::Char('L') => Action::ScanFilter(crate::scan::IssueFilterKey::Lane),
+        KeyCode::Char('T') => Action::ScanFilter(crate::scan::IssueFilterKey::Status),
+        KeyCode::Char('J') => Action::ScanFilter(crate::scan::IssueFilterKey::Job),
+        KeyCode::Char('R') => Action::ScanFilterReset,
         KeyCode::Char('1') => Action::ScanTab(crate::scan::ScanTab::Profiles),
         KeyCode::Char('2') => Action::ScanTab(crate::scan::ScanTab::Jobs),
         KeyCode::Char('3') => Action::ScanTab(crate::scan::ScanTab::SiteMap),

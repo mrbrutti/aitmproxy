@@ -576,12 +576,30 @@ fn forty_ticks_in_scan_mode_list_once() {
 
 /// D6, third row (fix round B, B9): in `Mode::Scan` on the Issues tab, a
 /// `finished` line yields `scan.status {job}` and `scan.issues {limit: 512}`.
+/// Entering Issues fetches the list itself (Task 7), so that fetch is settled
+/// with an empty page first; otherwise the tag dedupe would hold the line's
+/// `scan.issues` back.
 #[test]
 fn a_terminal_line_on_the_issues_tab_requests_issues() {
     let mut app = app();
     let _ = app.update(Action::OpenScan);
     let _ = app.on_bus(empty_list_reply());
-    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let entering = app.update(Action::ScanTab(ScanTab::Issues));
+    assert_eq!(
+        entering,
+        vec![BusRequest::CallTagged {
+            tag: "scan.issues".into(),
+            name: "scan.issues".into(),
+            args: json!({ "limit": 512 }),
+        }],
+        "entering Issues fetches once"
+    );
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.issues".into(),
+        name: "scan.issues".into(),
+        value: json!({ "issues": [] }),
+    });
+    assert!(app.scan.inflight.is_empty(), "the entry fetch is settled");
     let reqs = app.on_bus(BusEvent::Notification(json!({
         "jsonrpc": "2.0",
         "method": "notifications/aitm/job",

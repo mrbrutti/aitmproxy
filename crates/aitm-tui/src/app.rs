@@ -13,7 +13,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use aitm_scan_model::{
-    JobEvent, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+    Issue, IssuesResult, JobEvent, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN,
+    JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -28,9 +29,9 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_result, state_text, step, tag_keyed, tag_parts, JobPane, ScanError, ScanOffer,
-    ScanState, ScanTab, ISSUES_PAGE_LIMIT, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER,
-    OTHER_JOB, STATUS_POLL_TICKS,
+    is_job_id, parse_result, state_text, step, tag_keyed, tag_parts, IssueFilterKey, IssuePane,
+    JobPane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
+    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -1756,6 +1757,11 @@ impl App {
                 // the bus has no `scan.list` (a legacy bus): the Jobs tab's
                 // degraded text says so, a toast on every open would not.
                 self.request_scan_list(&mut out);
+                // Coming back to the view on the Issues tab is entering it
+                // (D6): the list may have moved while the operator was away.
+                if self.scan.tab == ScanTab::Issues {
+                    self.request_issues(&mut out);
+                }
             }
             Action::ScanLaunch => {
                 if self.scan.legacy.running {
@@ -1764,10 +1770,12 @@ impl App {
                     self.scan_launch(None, &mut out);
                 }
             }
-            Action::ScanTab(tab) => self.scan.tab = tab,
+            Action::ScanTab(tab) => self.scan_tab(tab, &mut out),
             Action::ScanPaneNext => self.scan.step_pane(true),
             Action::ScanPanePrev => self.scan.step_pane(false),
             Action::ScanCancel => self.scan_cancel(&mut out),
+            Action::ScanFilter(key) => self.scan_filter(key, &mut out),
+            Action::ScanFilterReset => self.scan_filter_reset(&mut out),
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2751,10 +2759,15 @@ impl App {
                             Action::End => n - 1,
                             _ => c,
                         };
+                        let moved = *cursor != c;
                         // A new job under the Jobs cursor shows its detail
                         // from the top.
-                        if *cursor != c && self.scan.tab == ScanTab::Jobs {
+                        if moved && self.scan.tab == ScanTab::Jobs {
                             self.scan.jobs.detail_scroll = 0;
+                        }
+                        // The Issues cursor landing on a row reads it (D6).
+                        if moved && self.scan.tab == ScanTab::Issues {
+                            self.issue_cursor_landed(out);
                         }
                     }
                 }
@@ -3983,23 +3996,100 @@ impl App {
             return;
         }
         self.request_scan_status(job, out);
-        let settles = matches!(
+        let terminal = matches!(
             line.event,
-            JobEvent::Issue | JobEvent::Finished | JobEvent::Cancelled | JobEvent::Failed
+            JobEvent::Finished | JobEvent::Cancelled | JobEvent::Failed
         );
+        // A terminal line replaces what the job's issues said (D6): the
+        // next landing on one of them reads it again.
+        if terminal {
+            self.scan.issues.forget_job(job);
+        }
+        let settles = terminal || line.event == JobEvent::Issue;
         if settles && self.issues_wanted() {
             self.request_issues(out);
         }
     }
 
     /// `scan.issues {filters, limit}` under its single-slot tag (spec D6):
-    /// the one spelling the Jobs `Enter`, the settling push line and the
-    /// Issues tab (Task 7) share. Quiet when the bus lacks the verb: the
-    /// Issues banner already says so (D2), and the tag dedupe keeps one
-    /// request in flight.
+    /// the one spelling the Jobs `Enter`, the settling push line, the Issues
+    /// tab's entry, filters and timer share. Stamps `fetched_at_tick` when
+    /// the call leaves. Quiet when the bus lacks the verb: the Issues banner
+    /// already says so (D2), and the tag dedupe keeps one request in flight.
     fn request_issues(&mut self, out: &mut Vec<BusRequest>) {
-        let args = self.scan_issues_args();
-        self.scan_poll("scan.issues".to_string(), "scan.issues", args, out);
+        let args = self.scan.issues.filters.args();
+        if self.scan_poll("scan.issues".to_string(), "scan.issues", args, out) {
+            self.scan.issues.fetched_at_tick = Some(self.ticks);
+        }
+    }
+
+    /// `1`..`4`: show a tab (spec D11). Entering Issues from another tab
+    /// reads the list with the current filters (D6); the other tabs' entry
+    /// reads arrive with their tasks.
+    fn scan_tab(&mut self, tab: ScanTab, out: &mut Vec<BusRequest>) {
+        let entering = self.scan.tab != tab;
+        self.scan.tab = tab;
+        if entering && tab == ScanTab::Issues {
+            self.request_issues(out);
+        }
+    }
+
+    /// Issues `S` `C` `L` `T` `J` (spec D11): cycle one filter and refetch.
+    /// `J` takes the Jobs cursor's job. Only the Issues tab has filters
+    /// here; Task 9 routes `J` on the Site map to its own query.
+    fn scan_filter(&mut self, key: IssueFilterKey, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        let cursor_job = self.scan.jobs.cursor_job().cloned();
+        self.scan.issues.filters.cycle(key, cursor_job.as_deref());
+        self.request_issues(out);
+    }
+
+    /// Issues `R` (spec D11): clear every filter and refetch.
+    fn scan_filter_reset(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        self.scan.issues.filters = Default::default();
+        self.request_issues(out);
+    }
+
+    /// The Issues cursor came to rest on a row (a key, or a list arriving
+    /// under it while the tab is shown): read the issue once (spec D6),
+    /// `scan.issue {id}` under `scan.issue:<id>`, remembered in `fetched`
+    /// until a status update or a terminal line for its job forgets it.
+    fn issue_cursor_landed(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.issues.pane != IssuePane::List {
+            return;
+        }
+        let Some(id) = self.scan.issues.cursor_issue().map(|i| i.id.clone()) else {
+            return;
+        };
+        if self.scan.issues.fetched.contains(&id) {
+            return;
+        }
+        if self.scan_poll(
+            tag_keyed("scan.issue", &id),
+            "scan.issue",
+            json!({ "id": id }),
+            out,
+        ) {
+            self.scan.issues.fetched.insert(id);
+        }
+    }
+
+    /// Whether the D6 issues timer has a live job to follow: the filtered
+    /// job when the `J` filter is set, any live job otherwise.
+    fn issues_live(&self) -> bool {
+        match &self.scan.issues.filters.job {
+            Some(job) => self
+                .scan
+                .jobs
+                .state_of(job)
+                .is_some_and(|s| !s.is_terminal()),
+            None => !self.scan.jobs.live().is_empty(),
+        }
     }
 
     /// Jobs `x` (spec D11): `scan.cancel {job}` for the cursor's job under
@@ -4033,49 +4123,21 @@ impl App {
         }
     }
 
-    /// Whether the Issues list is on screen or was fetched before: Task 7
-    /// stamps `fetched_at_tick` on entering Issues, so a non-zero stamp is
-    /// "ever opened" (the TUI has ticked before an operator can get there).
+    /// Whether the Issues list is on screen or was ever fetched (spec D6,
+    /// "when the Issues tab was ever opened"): `request_issues` stamps
+    /// `fetched_at_tick` the first time the tab is entered.
     fn issues_wanted(&self) -> bool {
         (self.mode == Mode::Scan && self.scan.tab == ScanTab::Issues)
-            || self.scan.issues.fetched_at_tick > 0
-    }
-
-    /// The `scan.issues` arguments: the current filters (umbrella contract
-    /// names, `None` omitted) and the D6 page size.
-    fn scan_issues_args(&self) -> Value {
-        let f = &self.scan.issues.filters;
-        let mut args = Map::new();
-        if let Some(s) = f.severity_min {
-            args.insert("severity_min".into(), json!(s.label()));
-        }
-        if let Some(c) = f.confidence_min {
-            if let Ok(v) = serde_json::to_value(c) {
-                args.insert("confidence_min".into(), v);
-            }
-        }
-        if let Some(l) = f.lane {
-            if let Ok(v) = serde_json::to_value(l) {
-                args.insert("lane".into(), v);
-            }
-        }
-        if let Some(st) = f.status {
-            if let Ok(v) = serde_json::to_value(st) {
-                args.insert("status".into(), v);
-            }
-        }
-        if let Some(j) = &f.job {
-            args.insert("job".into(), json!(j));
-        }
-        args.insert("limit".into(), json!(ISSUES_PAGE_LIMIT));
-        Value::Object(args)
+            || self.scan.issues.fetched_at_tick.is_some()
     }
 
     /// The D6 timers, run from every `Tick`: every [`STATUS_POLL_TICKS`] one
     /// `scan.status` per live job (the cursor's job first, then `order`, at
     /// most [`MAX_STATUS_FOLLOWUPS`] leaving per firing; the rest wait for the
     /// next one), every [`LIST_POLL_TICKS`] a `scan.list` while the Scan view
-    /// is shown. Tasks 7 and 9 add the Issues and Site map timers here.
+    /// is shown, every [`ISSUES_POLL_TICKS`] a `scan.issues` while the Issues
+    /// tab is shown and the filtered job (any job, without the filter) is
+    /// live. Task 9 adds the Site map timer here.
     fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
         if t.is_multiple_of(STATUS_POLL_TICKS) {
             let live = self.scan.jobs.live();
@@ -4083,6 +4145,13 @@ impl App {
         }
         if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
             self.request_scan_list(out);
+        }
+        if t.is_multiple_of(ISSUES_POLL_TICKS)
+            && self.mode == Mode::Scan
+            && self.scan.tab == ScanTab::Issues
+            && self.issues_live()
+        {
+            self.request_issues(out);
         }
     }
 
@@ -4195,6 +4264,33 @@ impl App {
                 if let Some(list) = self.scan_reply::<ListResult>(tag, name, &value) {
                     let followups = self.scan.jobs.fold_list(list);
                     self.request_scan_statuses(followups.iter().map(String::as_str), out);
+                }
+            }
+            "scan.issues" => {
+                if let Some(result) = self.scan_reply::<IssuesResult>(tag, name, &value) {
+                    self.scan.issues.fold_result(result);
+                    // The page arriving puts the cursor on a row: read it
+                    // while the tab is on screen (D6, cursor landing).
+                    if self.mode == Mode::Scan && self.scan.tab == ScanTab::Issues {
+                        self.issue_cursor_landed(out);
+                    }
+                }
+            }
+            "scan.issue" => {
+                if let Some(issue) = self.scan_reply::<Issue>(tag, name, &value) {
+                    // The same hostile-core bound as `scan.status`: the
+                    // detail is folded only under the id the tag asked for.
+                    if Some(issue.id.as_str()) == tag_parts(tag).1 {
+                        self.scan.issues.detail = Some(issue);
+                        self.scan.issues.flow_cursor = 0;
+                    } else {
+                        self.scan.set_error(ScanError {
+                            tag: tag.to_string(),
+                            verb: name.to_string(),
+                            code: None,
+                            detail: OTHER_ISSUE.to_string(),
+                        });
+                    }
                 }
             }
             _ => {}

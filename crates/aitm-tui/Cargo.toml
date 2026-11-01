@@ -20,6 +20,10 @@ aitm-bus-client.workspace = true
 # Scanner v2 wire types (spec D3, D10): the Scan surface parses every scan.*
 # reply and job push line into the shared model rather than hand-rolled JSON.
 aitm-scan-model.workspace = true
+# The wire `Severity` the issue types carry (already a transitive dependency
+# through aitm-scan-model): the Issues filters name it instead of mapping it
+# through strings (plan amendment, Task 7).
+aitm-poc.workspace = true
 anyhow.workspace = true
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }

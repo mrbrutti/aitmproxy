@@ -86,6 +86,11 @@ pub enum Action {
     /// with no extra prompt: the tag dedupe sends it once until the reply; on
     /// a terminal job the key is inert and the banner reads `already <state>`.
     ScanCancel,
+    /// Issues tab `S` `C` `L` `T` `J`: cycle one `scan.issues` filter and
+    /// refetch the list (spec D11).
+    ScanFilter(crate::scan::IssueFilterKey),
+    /// Issues tab `R`: clear every filter and refetch (spec D11).
+    ScanFilterReset,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,
