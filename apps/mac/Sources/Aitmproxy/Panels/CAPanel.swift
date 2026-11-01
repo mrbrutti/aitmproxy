@@ -6,13 +6,24 @@ import UniformTypeIdentifiers
 
 /// Certificate Authority (S-058): the CA's status, export PEM/DER, install or
 /// uninstall after the proxy's own confirmation, the read-only agent-gate flag,
-/// and setup guides for iOS, Android, browsers and terminals.
+/// and setup guides for iOS, Android, browsers and terminals. The status is the
+/// session's `ca.status` read-back (spec D17.5); Install…/Uninstall… route through
+/// `Session.trustCA()` / `untrustCA()`, the app's one CA call path (D17.10).
 struct CAPanel: View {
     @Environment(Session.self) private var session
-    @State private var status: CAStatus?
     @State private var agentMayInstall = false
     @State private var busy = false
+    /// Export errors; trust errors come from the session (`caTrustLastError`).
     @State private var actionError: String?
+    /// The first `ca.status` read has been attempted, so a core without the verb shows
+    /// "No certificate" rather than loading forever.
+    @State private var loaded = false
+
+    private var status: CAStatus? {
+        if Store.usesFixtures { return Fixtures.caStatus }
+        if let live = session.caStatus { return live }
+        return loaded ? CAStatus(fingerprint: "", installed: false, trusted: false, exists: false) : nil
+    }
 
     var body: some View {
         ScrollView {
@@ -51,13 +62,21 @@ struct CAPanel: View {
             if !status.fingerprint.isEmpty { fingerprint(status.fingerprint) }
             keyValue("Subject", status.subject)
             if let path = status.path { pathRow(path) }
-            if let actionError {
-                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+            // The remedy is the read-back's word (D17.6), shown only while the OS store says not trusted.
+            if let facts = session.caTrust, !facts.trusted, let remedy = facts.remedy {
+                Text(remedy)
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.State.warning.fg.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let error = session.caTrustLastError ?? actionError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Status.serverError.color)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            Hint(text: CATrustFacts.quicCaveat)
         }
     }
 
@@ -149,9 +168,10 @@ struct CAPanel: View {
             FlatButton("Export DER…") { export(format: "der") }.disabled(busy || !status.exists)
             Spacer()
             if status.installed {
-                FlatButton("Uninstall…") { change(install: false, status: status) }.disabled(busy)
+                FlatButton("Uninstall…") { change(install: false, status: status) }.disabled(busy || session.caTrustInstalling)
             } else {
-                PrimaryButton("Install…") { change(install: true, status: status) }.disabled(busy || !status.exists)
+                PrimaryButton("Install…") { change(install: true, status: status) }
+                    .disabled(busy || session.caTrustInstalling || !status.exists)
             }
         }
     }
@@ -173,18 +193,14 @@ struct CAPanel: View {
 
     private func load() {
         if Store.usesFixtures {
-            status = Fixtures.caStatus
             agentMayInstall = Fixtures.caStatus.allowAgentInstall
             return
         }
         agentMayInstall = configFlag()
         Task {
-            if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
-                status = parsed
-                if parsed.allowAgentInstall { agentMayInstall = true }
-            } else {
-                status = CAStatus(fingerprint: "", installed: false, trusted: false, exists: false)
-            }
+            await session.refreshCAStatus()
+            if session.caStatus?.allowAgentInstall == true { agentMayInstall = true }
+            loaded = true
         }
     }
 
@@ -213,6 +229,9 @@ struct CAPanel: View {
         }
     }
 
+    /// The panel's own confirmation (the ellipsis promises one), then the session's one call
+    /// path: scope, confirm token, in-flight flag, the forced `ca.status` re-read. The word
+    /// after it is the read-back's, never the reply's.
     private func change(install: Bool, status: CAStatus) {
         let alert = NSAlert()
         alert.messageText = install ? "Install the aitmproxy root CA?" : "Remove the aitmproxy root CA?"
@@ -224,29 +243,10 @@ struct CAPanel: View {
         Task {
             defer { busy = false }
             actionError = nil
-            let command = install ? "ca.install" : "ca.uninstall"
-            do {
-                // ca.install / ca.uninstall are confirm-gated over the bus: the first call
-                // returns a confirm token and applies nothing; it must be re-sent with
-                // `_confirm` to actually run (the alert above is the human confirmation).
-                // Missing this re-call was the silent no-op — the first response looked like
-                // success while the keychain was never touched.
-                let result = try await session.runCommand(command, [:])
-                if let token = result["confirm_token"]?.stringValue {
-                    _ = try await session.runCommand(command, ["_confirm": .string(token)])
-                }
-                if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
-                    self.status = parsed
-                }
-                // The install can finish without login-keychain trust landing (the macOS
-                // trust dialog may not surface in this process); say so, don't look installed.
-                if install, let current = self.status, !(current.installed && current.trusted) {
-                    actionError = "Install finished but the CA is not trusted in the login keychain yet. Export the PEM and trust it in Keychain Access, or follow the setup guide below."
-                }
-            } catch {
-                let message = "\(command): \(BusService.describe(error))"
-                actionError = message
-                session.lastError = message
+            if install {
+                await session.trustCA()
+            } else {
+                await session.untrustCA()
             }
         }
     }

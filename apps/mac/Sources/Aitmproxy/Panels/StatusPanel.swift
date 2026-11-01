@@ -83,9 +83,16 @@ struct StatusPanel: View {
         let busy = session.coreHealth.captureBusy
         return layout {
             ForEach(summary.lanes, id: \.kind) { lane in
-                LaneCard(lane: lane, captureBusy: busy, run: run)
-                    .frame(width: cardWidth, alignment: .leading)
-                    .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
+                VStack(alignment: .leading, spacing: Space.md) {
+                    LaneCard(lane: lane, captureBusy: busy, run: run)
+                    // The CA fact sits under the Core card (spec D17.6); no row while the OS store
+                    // has not answered, so "unread" never reads as "not trusted".
+                    if lane.kind == .core, let facts = session.caTrust {
+                        CATrustRow(facts: facts, run: run)
+                    }
+                }
+                .frame(width: cardWidth, alignment: .leading)
+                .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
             }
             // No trailing Spacer: it would add one more HStack spacing (20 pt) and push the
             // row past the viewport, which centres the whole page on a half point.
@@ -95,18 +102,19 @@ struct StatusPanel: View {
     // MARK: Getting started
 
     private func gettingStarted(_ summary: ConnectionSummary) -> some View {
-        VStack(alignment: .leading, spacing: Space.md) {
+        let steps = stepsWithCATrust(summary)
+        return VStack(alignment: .leading, spacing: Space.md) {
             TrackedLabel("Getting started").accessibilityAddTraits(.isHeader)
-            if summary.allStepsDone {
+            if steps.allSatisfy(\.done) {
                 Text("Everything is connected — \(Format.count(session.rows.count, "flow")) captured")
                     .font(Tok.Face.ui(Tok.Typography.Size.md))
                     .foregroundStyle(Tok.Ink.secondary.color)
                     .frame(height: Tok.Size.Row.default)
             } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(summary.steps, id: \.kind) { step in
+                    ForEach(steps, id: \.kind) { step in
                         StepRow(step: step, run: run)
-                        if step.kind != summary.steps.last?.kind {
+                        if step.kind != steps.last?.kind {
                             Rule(color: Tok.Line.rule)
                         }
                     }
@@ -116,6 +124,16 @@ struct StatusPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Getting started")
+    }
+
+    /// The summary's steps with the CA step after Bus (spec D17.9): the facts' row when the OS
+    /// store answered, the "unknown" row when it was read but every store is unknown, and no
+    /// row at all while `ca.status` has never been read.
+    private func stepsWithCATrust(_ summary: ConnectionSummary) -> [GettingStartedStep] {
+        var steps = summary.steps
+        guard session.caStatus != nil, let at = steps.firstIndex(where: { $0.kind == .busConnected }) else { return steps }
+        steps.insert(session.caTrust?.step ?? CATrustFacts.unknownStep(), at: at + 1)
+        return steps
     }
 
     // MARK: Recent
@@ -189,7 +207,10 @@ struct StatusPanel: View {
             Task { await CaptureSwitch.set(false, session: session) }
         case .uninstallExtension:
             confirmingUninstall = true
-        case .showCoreLog, .reconnectBus, .openScope, .openBrowser, .copyListenAddress, .approveInSystemSettings:
+        case .trustCA:
+            // Operator-only, like the capture switch: the one call path (Session+CATrust.swift).
+            Task { await session.trustCA() }
+        case .showCoreLog, .reconnectBus, .openScope, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
             break // handled by Session.perform(connection:) above
         }
     }
@@ -276,6 +297,43 @@ private struct LaneCard: View {
                 .accessibilityLabel("More \(lane.kind.title) actions")
             }
         }
+    }
+}
+
+// MARK: - CA trust row
+
+/// The CA fact under the Core card (spec D17.6): state dot + the fact's text, the remedy, its
+/// actions. Every word is `CATrustFacts`'; the buttons stand down while a change is in flight.
+private struct CATrustRow: View {
+    var facts: CATrustFacts
+    var run: (ConnectionAction) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            HStack(spacing: Tok.Metric.gapTight) {
+                Circle().fill(facts.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+                    .accessibilityHidden(true)
+                Text(facts.text)
+            }
+            .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
+            .foregroundStyle(Tok.Ink.primary.color)
+            if let remedy = facts.remedy {
+                Text(remedy)
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !facts.actions.isEmpty {
+                HStack(spacing: Space.xs) {
+                    ForEach(facts.actions, id: \.self) { action in
+                        FlatButton(action.title) { run(action) }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Certificate Authority: \(facts.text)")
     }
 }
 

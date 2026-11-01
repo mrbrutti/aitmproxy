@@ -67,6 +67,12 @@ struct ShellView: View {
         .sheet(isPresented: Binding(get: { session.scopeSheetVisible }, set: { session.scopeSheetVisible = $0 })) {
             ScopeSheet().environment(session).themed().noInitialFocus()
         }
+        // The first-run sheet (spec D17.8): once per store, when the embedded core is ready, the
+        // bus is the operator's and the OS store says the CA is not trusted.
+        .sheet(isPresented: Binding(get: { session.setupSheetVisible }, set: { session.setupSheetVisible = $0 })) {
+            SetupSheet().environment(session).themed().noInitialFocus().fitsContent()
+        }
+        .onChange(of: session.setupSheetDue) { _, due in if due { session.presentSetupSheetIfDue() } }
         .toolbar { ShellToolbar(sidebarVisible: $session.sidebarVisible) }
         .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
         .onChange(of: session.reconnectTick) { bus?.start() }

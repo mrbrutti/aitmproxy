@@ -43,6 +43,11 @@ extension Session {
             reconnectBus()
         case .openScope:
             show(.scope)
+        case .openCAPanel:
+            show(.ca)
+        case .trustCA:
+            // Operator-only, like the capture switch: the view calls `trustCA()` itself.
+            return false
         case .openBrowser:
             show(.browser)
         case .copyListenAddress:
