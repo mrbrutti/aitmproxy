@@ -43,6 +43,7 @@ use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, V
 use crate::flow::L4FlowId;
 use crate::guard::interface_covers;
 use crate::module::{AvailabilitySource, L4Availability};
+use crate::privilege::report::PrivilegeReport;
 use crate::types::{
     IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
 };
@@ -55,6 +56,16 @@ pub use flow::{FlowGet, FlowList};
 pub use inject::Inject;
 pub use scope::{ScopeAdd, ScopeList, ScopeRemove};
 pub use sendrecv::SendRecv;
+
+/// Where the two status verbs read the [`PrivilegeReport`] they carry under their
+/// optional `privilege` key (privilege spec §2.4, L4PRIV-AC4), on every invoke.
+/// In production it is the live [`PrivilegeState`](crate::privilege::PrivilegeState)'s
+/// `report()`; a module built over a fixed [`L4Privilege`](crate::module::L4Privilege)
+/// (the test constructors) answers `None`, and the reply then carries exactly the
+/// parity four keys. (The plan names this `PrivilegeSource`; that name is
+/// `module.rs`'s private gate-source enum from P1b.7, so the alias is
+/// `PrivilegeReportSource`.)
+pub(crate) type PrivilegeReportSource = Arc<dyn Fn() -> Option<PrivilegeReport> + Send + Sync>;
 
 /// `l4.interfaces` → list the capture-capable interfaces libpcap can see.
 ///
@@ -457,12 +468,14 @@ fn gate_for(name: &str) -> Option<AgentGate> {
 /// always answers (spec §1, L4PAR-AC9). In production `backend` is the state's
 /// [`RoutedBackend`](crate::backend::routed::RoutedBackend) (privilege spec §2.1,
 /// plan P1b.8), which routes every call on the live privilege report; nothing
-/// here opens libpcap on its own.
+/// here opens libpcap on its own. `privilege` is the [`PrivilegeReportSource`]
+/// the status verb carries under its optional `privilege` key (plan P1b.9).
 pub(crate) fn wire_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
     capture: AvailabilitySource,
     backend: Arc<dyn crate::backend::CaptureInjectBackend>,
+    privilege: PrivilegeReportSource,
 ) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let registry = Arc::new(crate::capture::CaptureRegistry::new());
     let gated: Vec<Arc<dyn Command>> = vec![
@@ -476,7 +489,10 @@ pub(crate) fn wire_commands(
         Arc::new(Inject::new(guard.clone(), store.clone(), backend.clone())),
         Arc::new(SendRecv::new(guard, store, backend)),
     ];
-    (gated, Arc::new(CaptureStatus::new(registry, capture)))
+    (
+        gated,
+        Arc::new(CaptureStatus::new(registry, capture, privilege)),
+    )
 }
 
 /// The availability object the two status verbs answer (spec §1, L4PAR-AC3/AC4):
@@ -499,6 +515,32 @@ pub(crate) fn availability_object(
     let payload = if av.is_available() { payload } else { vec![] };
     obj.insert(payload_key.to_string(), Value::Array(payload));
     Value::Object(obj)
+}
+
+/// Add the optional `privilege` key (privilege spec §2.4, L4PRIV-AC4) to an
+/// [`availability_object`]: `Some(report)` ⇒ `"privilege": report.to_value()`;
+/// `None` ⇒ the object is returned untouched, so the parity four keys are exactly
+/// what they were. Additive only: no existing key is read or rewritten.
+pub(crate) fn with_privilege(reply: Value, report: Option<PrivilegeReport>) -> Value {
+    match (reply, report) {
+        (Value::Object(mut obj), Some(report)) => {
+            obj.insert("privilege".to_string(), report.to_value());
+            Value::Object(obj)
+        }
+        (reply, _) => reply,
+    }
+}
+
+/// The schema field for the optional `privilege` key of the two status verbs.
+pub(crate) fn privilege_field() -> ParamDef {
+    field(
+        "privilege",
+        TypeDesc::Object(vec![]),
+        false,
+        "The `PrivilegeReport` (see `l4.privilege`): `enabled`, `platform`, \
+         `capabilities.{capture,inject,intercept}`, `helper`, `request`, `checked_at`. \
+         Present when this core reads a live privilege state.",
+    )
 }
 
 /// The result fields of an [`availability_object`], for the two status verbs'

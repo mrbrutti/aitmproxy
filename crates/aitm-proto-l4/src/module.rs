@@ -34,6 +34,7 @@ use aitm_core::{Command, CommandHost, ParamSchema, Params, Plugin, Registry, Val
 use crate::backend::pcap::PcapBackend;
 use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::commands::intercept::InterceptSessions;
+use crate::commands::PrivilegeReportSource;
 use crate::config::{InterceptConfig, L4Config};
 use crate::flow::{InMemoryL4FlowStore, L4FlowStore};
 use crate::guard::L4Guard;
@@ -329,6 +330,20 @@ impl PrivilegeSource {
         }
     }
 
+    /// The [`PrivilegeReport`](crate::privilege::report::PrivilegeReport) source
+    /// the two status verbs carry under `privilege` (privilege spec §2.4, plan
+    /// P1b.9): the live state's `report()` on every call; `None` for a fixed test
+    /// privilege, which has no report to show.
+    fn report_source(&self) -> PrivilegeReportSource {
+        match self {
+            Self::Live(state) => {
+                let state = state.clone();
+                Arc::new(move || Some(state.report()))
+            }
+            Self::Fixed(_) => Arc::new(|| None),
+        }
+    }
+
     /// One class's availability now (spec §2.4 mapping, plan P1b.4).
     fn availability(&self, class: GateClass) -> L4Availability {
         match (self, class) {
@@ -611,6 +626,10 @@ impl Plugin for L4Module {
             let privilege = self.privilege.clone();
             Arc::new(move || privilege.availability(intercept_class))
         };
+        // Both status verbs also carry the live `PrivilegeReport` under their
+        // optional `privilege` key (privilege spec §2.4, L4PRIV-AC4, plan P1b.9);
+        // a fixed test privilege has no report, so the reply stays the parity four.
+        let report_source = self.privilege.report_source();
         // The wire verbs share one backend: in production the state's routed
         // backend, so a helper session or a later approval is seen per call
         // (privilege spec §2.1, plan P1b.8).
@@ -619,6 +638,7 @@ impl Plugin for L4Module {
             self.store(),
             capture_source,
             self.privilege.backend(),
+            report_source.clone(),
         );
         for cmd in gate(
             crate::commands::agent_gate(wire, &gates),
@@ -638,6 +658,7 @@ impl Plugin for L4Module {
             self.sessions.clone(),
             self.intercept_cfg.clone(),
             intercept_source,
+            report_source,
         );
         for cmd in gate(
             crate::commands::agent_gate(intercept, &gates),

@@ -299,8 +299,13 @@ mod tests {
         router: Arc<dyn CaptureInjectBackend>,
     ) -> BTreeMap<String, Arc<dyn aitm_core::Command>> {
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let (gated, _status) =
-            crate::commands::wire_commands(capture_guard(), store, always_available(), router);
+        let (gated, _status) = crate::commands::wire_commands(
+            capture_guard(),
+            store,
+            always_available(),
+            router,
+            Arc::new(|| None),
+        );
         gated
             .into_iter()
             .map(|cmd| (cmd.name().to_string(), cmd))

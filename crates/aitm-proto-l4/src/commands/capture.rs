@@ -29,6 +29,8 @@ use crate::guard::L4Guard;
 use crate::module::AvailabilitySource;
 use crate::types::L4Direction;
 
+use super::PrivilegeReportSource;
+
 /// `l4.capture.start {interface, direction?}` → start a scoped, filtered capture;
 /// returns the `Capture` flow id it records into.
 pub struct CaptureStart {
@@ -162,19 +164,30 @@ impl Command for CaptureStop {
 }
 
 /// `l4.capture.status` → whether capture is available on this core (`available`,
-/// `code`, `reason`) and the flow ids of the currently-running captures. Never
-/// privilege-gated (spec §1): it always answers, so a UI learns *why* `start` would
-/// refuse without calling it.
+/// `code`, `reason`) and the flow ids of the currently-running captures, plus,
+/// when the core reads a live privilege state, the `PrivilegeReport` under
+/// `privilege` (privilege spec §2.4, L4PRIV-AC4). Never privilege-gated (spec §1):
+/// it always answers, so a UI learns *why* `start` would refuse without calling it.
 pub struct CaptureStatus {
     registry: Arc<CaptureRegistry>,
     source: AvailabilitySource,
+    privilege: PrivilegeReportSource,
 }
 
 impl CaptureStatus {
-    /// A command over the shared capture registry and the capture/inject class's
-    /// [`AvailabilitySource`], read on every invoke (L4PAR-AC38).
-    pub fn new(registry: Arc<CaptureRegistry>, source: AvailabilitySource) -> Self {
-        Self { registry, source }
+    /// A command over the shared capture registry, the capture/inject class's
+    /// [`AvailabilitySource`] and the [`PrivilegeReportSource`], both read on every
+    /// invoke (L4PAR-AC38).
+    pub fn new(
+        registry: Arc<CaptureRegistry>,
+        source: AvailabilitySource,
+        privilege: PrivilegeReportSource,
+    ) -> Self {
+        Self {
+            registry,
+            source,
+            privilege,
+        }
     }
 }
 
@@ -190,15 +203,20 @@ impl Command for CaptureStatus {
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "Report whether capture is available on this core (`available`, \
-                          `code`, `reason`) and the flow ids of running captures. Always \
-                          answers, never `L4 unavailable`."
+                          `code`, `reason`), the flow ids of running captures and, when \
+                          known, the `privilege` report. Always answers, never `L4 \
+                          unavailable`."
                 .into(),
             params: vec![],
-            result: TypeDesc::Object(super::availability_fields(
-                "captures",
-                TypeDesc::Array(Box::new(TypeDesc::Str)),
-                "The flow ids of the currently-running captures; `[]` when unavailable.",
-            )),
+            result: TypeDesc::Object({
+                let mut fields = super::availability_fields(
+                    "captures",
+                    TypeDesc::Array(Box::new(TypeDesc::Str)),
+                    "The flow ids of the currently-running captures; `[]` when unavailable.",
+                );
+                fields.push(super::privilege_field());
+                fields
+            }),
         }
     }
 
@@ -209,11 +227,8 @@ impl Command for CaptureStatus {
             .into_iter()
             .map(|id| Value::Str(super::flow_id_to_string(id)))
             .collect();
-        Ok(super::availability_object(
-            &(self.source)(),
-            "captures",
-            captures,
-        ))
+        let reply = super::availability_object(&(self.source)(), "captures", captures);
+        Ok(super::with_privilege(reply, (self.privilege)()))
     }
 }
 
@@ -252,6 +267,9 @@ mod tests {
     use crate::flow::{InMemoryL4FlowStore, L4FlowKind};
     use crate::guard::L4GuardError;
     use crate::module::{L4Availability, UnavailableCode};
+    use crate::privilege::availability::capture_availability;
+    use crate::privilege::derive::{derive, MacInputs, ProbeInputs};
+    use crate::privilege::report::Platform;
     use crate::types::{IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, PortRange, RateCap};
 
     /// An availability source that always answers `Available`.
@@ -351,7 +369,7 @@ mod tests {
         let registry = Arc::new(CaptureRegistry::new());
 
         let start = CaptureStart::new(guard, backend, store.clone(), registry.clone());
-        let status = CaptureStatus::new(registry.clone(), always_available());
+        let status = CaptureStatus::new(registry.clone(), always_available(), Arc::new(|| None));
         let stop = CaptureStop::new(registry.clone());
 
         let mem = aitm_core::MemFlowStore::new();
@@ -451,7 +469,8 @@ mod tests {
                 }
             }
         });
-        let status = CaptureStatus::new(Arc::new(CaptureRegistry::new()), source);
+        let status =
+            CaptureStatus::new(Arc::new(CaptureRegistry::new()), source, Arc::new(|| None));
 
         let mem = aitm_core::MemFlowStore::new();
         let client = StubClient;
@@ -486,6 +505,92 @@ mod tests {
         assert_eq!(second, status_value(true, "available", None));
     }
 
+    /// Privilege spec §2.4 / L4PRIV-AC4 (plan P1b.9): with a report source the
+    /// reply gains exactly one key, `privilege`, holding the `PrivilegeReport`;
+    /// the four parity keys are byte-identical with and without it. The report
+    /// is macOS row 6 (nothing opens, no receipt, no handoff app) so the mapped
+    /// `code` is `needs_privilege` and `capabilities.capture.state` is
+    /// `needs_approval`; `code` comes from `capture_availability`, not a literal.
+    #[test]
+    fn status_carries_privilege_additively() {
+        let report = derive(&ProbeInputs {
+            enabled: true,
+            platform: Platform::Macos,
+            mac: Some(MacInputs {
+                bpf_rw_opens: false,
+                receipt: None,
+                handoff_app_embeds_helper: false,
+            }),
+            linux: None,
+            request: None,
+            now_ms: 1_762_000_000_123,
+        });
+        let availability: AvailabilitySource = {
+            let report = report.clone();
+            Arc::new(move || capture_availability(&report))
+        };
+        let with_report: PrivilegeReportSource = {
+            let report = report.clone();
+            Arc::new(move || Some(report.clone()))
+        };
+        let without_report: PrivilegeReportSource = Arc::new(|| None);
+        let registry = Arc::new(CaptureRegistry::new());
+
+        let mem = aitm_core::MemFlowStore::new();
+        let client = StubClient;
+        let core = aitm_core::StdGuard::default();
+        let h = host(&mem, &client, &core);
+
+        let keys = |v: &Value| -> Vec<String> {
+            let Value::Object(obj) = v else {
+                panic!("status returns an object, got {v:?}");
+            };
+            obj.keys().cloned().collect()
+        };
+
+        // With the report source: exactly the parity four plus `privilege`.
+        let full = CaptureStatus::new(registry.clone(), availability.clone(), with_report)
+            .invoke(Params::default(), &h)
+            .expect("status answers with a privilege report");
+        assert_eq!(
+            keys(&full),
+            ["available", "captures", "code", "privilege", "reason"]
+        );
+        let Value::Object(full_obj) = &full else {
+            unreachable!()
+        };
+        assert_eq!(full_obj.get("available"), Some(&Value::Bool(false)));
+        assert_eq!(
+            full_obj.get("code"),
+            Some(&Value::Str("needs_privilege".into()))
+        );
+        assert_eq!(full_obj.get("captures"), Some(&Value::Array(vec![])));
+        assert_eq!(full_obj.get("privilege"), Some(&report.to_value()));
+        let Some(Value::Object(privilege)) = full_obj.get("privilege") else {
+            panic!("privilege is an object");
+        };
+        let Some(Value::Object(capabilities)) = privilege.get("capabilities") else {
+            panic!("privilege.capabilities is an object");
+        };
+        let Some(Value::Object(capture)) = capabilities.get("capture") else {
+            panic!("privilege.capabilities.capture is an object");
+        };
+        assert_eq!(
+            capture.get("state"),
+            Some(&Value::Str("needs_approval".into()))
+        );
+
+        // With a `None` source: exactly the parity four, and their values are
+        // byte-identical to the ones beside `privilege`.
+        let parity = CaptureStatus::new(registry, availability, without_report)
+            .invoke(Params::default(), &h)
+            .expect("status answers without a privilege report");
+        assert_eq!(keys(&parity), ["available", "captures", "code", "reason"]);
+        let mut full_minus_privilege = full_obj.clone();
+        full_minus_privilege.remove("privilege");
+        assert_eq!(parity, Value::Object(full_minus_privilege));
+    }
+
     /// `wire_commands` returns the four gated wire verbs and, separately, the
     /// status verb — never the status verb inside the gated list.
     #[test]
@@ -493,8 +598,13 @@ mod tests {
         let guard = Arc::new(L4Guard::new(&L4Config::default()));
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let backend: Arc<dyn CaptureInjectBackend> = Arc::new(IdleBackend { available: true });
-        let (gated, status) =
-            super::super::wire_commands(guard, store, always_available(), backend);
+        let (gated, status) = super::super::wire_commands(
+            guard,
+            store,
+            always_available(),
+            backend,
+            Arc::new(|| None),
+        );
         let names: Vec<&str> = gated.iter().map(|c| c.name()).collect();
         assert_eq!(
             names,
