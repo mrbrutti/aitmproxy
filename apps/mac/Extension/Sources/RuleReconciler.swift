@@ -287,5 +287,147 @@ extension HandoffSelfCheck {
         r.check("ruleReconciler: 13 installed == w1", reconciler.installed == w1)
         r.check("ruleReconciler: 13 nothing further applied", applied.count == 9, "\(applied.count)")
     }
+
+    /// Tester (stage 5) vectors around `begin` and `stop()` (spec Design B, C), on a
+    /// fresh reconciler with the same fake `apply`:
+    ///  A. a `reconcile` BEFORE `begin` applies nothing (`stopped` starts true) and
+    ///     installs nothing; `begin` then installs TCP-only first, without `reasserting`,
+    ///     and -- per the plan's `begin` contract (`pending = .tcpOnly`) -- the pre-begin
+    ///     set is NOT re-applied after startup (observed; the next Scope push installs it);
+    ///  B. a `reconcile` DURING the startup flight is coalesced and applied right after it
+    ///     with `reasserting` (spec C: "a Scope that arrives before the startup apply
+    ///     completes is coalesced as pendingWanted and applied right after");
+    ///  C. a second `begin` without `stop()` (Tahoe FB21464147) while a UDP set is
+    ///     installed re-applies TCP-only without `reasserting`; the UDP rules return on
+    ///     the next scope change (observed; recorded in the Tester report);
+    ///  D. after `stop()`: a hook carrying a UDP set is dropped (plan step 10 covers nil
+    ///     only), a late completion of a pre-stop apply -- success or error -- neither
+    ///     installs nor reports nor answers a startup, and nothing further is applied;
+    ///  E. a `begin` after all that starts over cleanly.
+    static func ruleReconcilerStartupAndStop(_ r: Recorder) {
+        var applied: [(ProviderRuleSet, Bool)] = []
+        var completions: [(Error?) -> Void] = []
+        var events: [RuleReconciler.Event] = []
+        let reconciler = RuleReconciler(
+            apply: { wanted, reasserting, completion in
+                applied.append((wanted, reasserting))
+                completions.append(completion)
+            },
+            onEvent: { events.append($0) })
+        let m1 = ScopeMatcher(spec: "example.com 198.51.100.7")
+        let w1 = ProviderRuleSet.wanted(for: m1)
+        let tcpOnly = ProviderRuleSet.tcpOnly
+        func trail() -> String { applied.map { "(\($0.0.summary), \($0.1))" }.joined(separator: "; ") }
+        /// True iff `applied` has exactly `i + 1` entries and the last is `(set, reasserting)`.
+        func lastApply(_ i: Int, _ set: ProviderRuleSet, _ reasserting: Bool) -> Bool {
+            applied.count == i + 1 && applied[i] == (set, reasserting)
+        }
+        func complete(_ i: Int, _ error: Error?) {
+            if completions.count == i + 1 {
+                completions[i](error)
+            } else {
+                r.fail("FAIL ruleReconciler/startup-stop: expected \(i + 1) parked completion(s), have \(completions.count)")
+            }
+        }
+
+        // A. Before begin nothing moves, whatever the set; begin then installs TCP-only.
+        reconciler.reconcile(for: nil)
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler/startup-stop: A reconcile before begin applies nothing", applied.isEmpty, trail())
+        r.check("ruleReconciler/startup-stop: A nothing installed before begin", reconciler.installed == nil)
+        r.check("ruleReconciler/startup-stop: A no event before begin", events.isEmpty, "\(events)")
+        var startupA: [Error?] = []
+        reconciler.begin { startupA.append($0) }
+        r.check("ruleReconciler/startup-stop: A begin applies (.tcpOnly, false) first", lastApply(0, tcpOnly, false), trail())
+        complete(0, nil)
+        r.check("ruleReconciler/startup-stop: A installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("ruleReconciler/startup-stop: A startup answered once with nil",
+              startupA.count == 1 && startupA[0] == nil, "\(startupA.map { String(describing: $0) })")
+        r.check("ruleReconciler/startup-stop: A the pre-begin set is not re-applied after startup (begin resets pending to .tcpOnly)",
+              applied.count == 1, trail())
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler/startup-stop: A the next Scope push installs it", lastApply(1, w1, true), trail())
+        complete(1, nil)
+        r.check("ruleReconciler/startup-stop: A installed == w1", reconciler.installed == w1)
+
+        // B. A Scope during the startup flight is coalesced and applied right after it.
+        reconciler.stop()
+        var startupB: [Error?] = []
+        reconciler.begin { startupB.append($0) }
+        r.check("ruleReconciler/startup-stop: B begin applies (.tcpOnly, false)", lastApply(2, tcpOnly, false), trail())
+        reconciler.reconcile(for: nil)   // serve start
+        reconciler.reconcile(for: m1)    // the Scope frame
+        r.check("ruleReconciler/startup-stop: B reconciles during the startup flight apply nothing yet", applied.count == 3, trail())
+        r.check("ruleReconciler/startup-stop: B nothing installed during the startup flight", reconciler.installed == nil)
+        complete(2, nil)
+        r.check("ruleReconciler/startup-stop: B startup answered once with nil",
+              startupB.count == 1 && startupB[0] == nil, "\(startupB.map { String(describing: $0) })")
+        r.check("ruleReconciler/startup-stop: B the coalesced Scope set is applied right after startup with reasserting",
+              lastApply(3, w1, true), trail())
+        r.check("ruleReconciler/startup-stop: B installed == .tcpOnly until that lands", reconciler.installed == tcpOnly)
+        complete(3, nil)
+        r.check("ruleReconciler/startup-stop: B installed == w1", reconciler.installed == w1)
+        r.check("ruleReconciler/startup-stop: B events end [.applied(.tcpOnly), .applied(w1)]",
+              Array(events.suffix(2)) == [.applied(tcpOnly), .applied(w1)], "\(events.suffix(2))")
+
+        // C. A second begin WITHOUT stop while w1 is installed (observed behaviour).
+        var startupC: [Error?] = []
+        reconciler.begin { startupC.append($0) }
+        r.check("ruleReconciler/startup-stop: C a second begin without stop re-applies (.tcpOnly, false)",
+              lastApply(4, tcpOnly, false), trail())
+        complete(4, nil)
+        r.check("ruleReconciler/startup-stop: C installed == .tcpOnly (the UDP rule is gone until the next scope change)",
+              reconciler.installed == tcpOnly, "\(String(describing: reconciler.installed?.summary))")
+        r.check("ruleReconciler/startup-stop: C the second startup answered once with nil",
+              startupC.count == 1 && startupC[0] == nil, "\(startupC.map { String(describing: $0) })")
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler/startup-stop: C the next scope change restores w1", lastApply(5, w1, true), trail())
+        complete(5, nil)
+        r.check("ruleReconciler/startup-stop: C installed == w1", reconciler.installed == w1)
+
+        // D1. stop() with a SUCCEEDING apply in flight: the late completion is inert, and
+        //     a hook carrying a UDP set after stop is dropped.
+        reconciler.reconcile(for: nil)
+        r.check("ruleReconciler/startup-stop: D1 reconcile(nil) applies (.tcpOnly, true)", lastApply(6, tcpOnly, true), trail())
+        reconciler.stop()
+        r.check("ruleReconciler/startup-stop: D1 stop resets installed", reconciler.installed == nil)
+        let eventsBeforeD1 = events.count
+        complete(6, nil)
+        r.check("ruleReconciler/startup-stop: D1 late success completion installs nothing", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("ruleReconciler/startup-stop: D1 late success completion reports nothing", events.count == eventsBeforeD1,
+              "\(events.count) vs \(eventsBeforeD1)")
+        r.check("ruleReconciler/startup-stop: D1 late success completion applies nothing further", applied.count == 7, trail())
+        reconciler.reconcile(for: m1)
+        r.check("ruleReconciler/startup-stop: D1 a hook carrying a UDP set after stop applies nothing", applied.count == 7, trail())
+        r.check("ruleReconciler/startup-stop: D1 still nothing installed", reconciler.installed == nil)
+
+        // D2. stop() with a FAILING apply in flight: no .applyFailed, no startup answer.
+        var startupD: [Error?] = []
+        reconciler.begin { startupD.append($0) }
+        r.check("ruleReconciler/startup-stop: D2 begin after stop applies (.tcpOnly, false)", lastApply(7, tcpOnly, false), trail())
+        reconciler.stop()
+        let eventsBeforeD2 = events.count
+        complete(7, NSError(domain: "test", code: 3))
+        r.check("ruleReconciler/startup-stop: D2 late error completion reports nothing", events.count == eventsBeforeD2,
+              "\(events.count) vs \(eventsBeforeD2)")
+        r.check("ruleReconciler/startup-stop: D2 late error completion does not answer the abandoned startup",
+              startupD.isEmpty, "\(startupD.count)")
+        r.check("ruleReconciler/startup-stop: D2 nothing installed", reconciler.installed == nil)
+        r.check("ruleReconciler/startup-stop: D2 nothing further applied", applied.count == 8, trail())
+
+        // E. A begin after all that starts over cleanly.
+        var startupE: [Error?] = []
+        reconciler.begin { startupE.append($0) }
+        r.check("ruleReconciler/startup-stop: E begin applies (.tcpOnly, false)", lastApply(8, tcpOnly, false), trail())
+        complete(8, nil)
+        r.check("ruleReconciler/startup-stop: E installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("ruleReconciler/startup-stop: E startup answered once with nil",
+              startupE.count == 1 && startupE[0] == nil, "\(startupE.map { String(describing: $0) })")
+        r.check("ruleReconciler/startup-stop: E last event is .applied(.tcpOnly)", events.last == .applied(tcpOnly),
+              "\(String(describing: events.last))")
+        r.check("ruleReconciler/startup-stop: E every apply parked exactly one completion",
+              completions.count == applied.count, "\(completions.count) vs \(applied.count)")
+    }
 }
 #endif

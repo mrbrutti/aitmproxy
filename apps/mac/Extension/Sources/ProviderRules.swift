@@ -263,5 +263,115 @@ extension HandoffSelfCheck {
               wantedSix.summary == "4 rules (TCP catch-all + UDP 198.51.100.7:any, [2001:db8::3]:443, 203.0.113.9:4433)",
               wantedSix.summary)
     }
+
+    /// Tester (stage 5) edge vectors for the pure rule set, as reached through
+    /// `wanted(for:)`: a large shuffled token set with every token twice stays canonical
+    /// with no cap; an IPv4-mapped IPv6 token is unmapped by `IPText.canonical` and
+    /// yields the SAME /32 IPv4 rule as the plain token; a spec made only of
+    /// never-claimed ports, wildcards (any port -- spec H is unconditional) and malformed
+    /// tokens is TCP-only; loopback is not a wildcard; the summary's count prefix follows
+    /// the rule count.
+    static func providerRulesEdges(_ r: Recorder) {
+        typealias Target = ProviderRuleSet.UDPTarget
+        func remote(_ rule: NENetworkRule) -> String {
+            guard let endpoint = rule.matchRemoteHostOrNetworkEndpoint else { return "nil" }
+            guard case let .hostPort(host, port) = endpoint else { return "not hostPort: \(endpoint)" }
+            switch host {
+            case .ipv4(let address): return "\(address)|\(port.rawValue)"
+            case .ipv6(let address): return "\(address)|\(port.rawValue)"
+            case .name(let name, _): return "name \(name)|\(port.rawValue)"
+            @unknown default: return "unknown host|\(port.rawValue)"
+            }
+        }
+
+        // -- Oversized, shuffled, duplicated input: no cap, canonical order ----------
+        var distinct: [(address: String, port: UInt16?, token: String)] = []
+        for i in 0..<64 {
+            distinct.append(("10.1.\(i).9", UInt16(4000 + i), "10.1.\(i).9:\(4000 + i)"))
+        }
+        for i in 1...8 {
+            distinct.append(("2001:db8::\(i)", nil, "[2001:db8::\(i)]"))
+        }
+        // A fixed permutation (7 is coprime to 72); every token twice; a host token and
+        // an ip:53 token between each pair as noise that must yield nothing.
+        var tokens: [String] = []
+        for k in 0..<72 {
+            let item = distinct[(k * 7) % 72]
+            tokens.append(item.token)
+            tokens.append("example.com")
+            tokens.append(item.token)
+            tokens.append("10.9.9.9:53")
+        }
+        let big = ScopeMatcher(spec: tokens.joined(separator: " "))
+        r.check("providerRulesEdges: big spec parsed every token", big.entries.count == 72 * 4, "\(big.entries.count)")
+        let wantedBig = ProviderRuleSet.wanted(for: big)
+        // Expected: the 72 distinct targets in plain string order of their address text
+        // (all addresses distinct here, so the port tiebreak is not involved).
+        let expected = distinct.sorted { $0.address < $1.address }.map { Target($0.address, $0.port) }
+        r.check("providerRulesEdges: 72 distinct targets, none dropped, none duplicated",
+              wantedBig.udpTargets.count == 72, "\(wantedBig.udpTargets.count)")
+        r.check("providerRulesEdges: big set is sorted by address text and de-duplicated",
+              wantedBig.udpTargets == expected,
+              "\(wantedBig.udpTargets.prefix(4)) ... \(wantedBig.udpTargets.suffix(2))")
+        let bigRules = wantedBig.networkRules()
+        r.check("providerRulesEdges: big set builds 73 rules (no cap)", bigRules.count == 73, "\(bigRules.count)")
+        if bigRules.count == 73 {
+            r.check("providerRulesEdges: big rule 0 is the TCP catch-all",
+                  bigRules[0].matchProtocol == .TCP && bigRules[0].matchRemoteHostOrNetworkEndpoint == nil
+                      && bigRules[0].matchRemotePrefix == 0)
+            r.check("providerRulesEdges: big rule 1 is the text-first address 10.1.0.9:4000 /32",
+                  bigRules[1].matchProtocol == .UDP && remote(bigRules[1]) == "10.1.0.9|4000"
+                      && bigRules[1].matchRemotePrefix == 32,
+                  remote(bigRules[1]))
+            r.check("providerRulesEdges: big rule 72 is the text-last address [2001:db8::8]:any /128",
+                  bigRules[72].matchProtocol == .UDP && remote(bigRules[72]) == "2001:db8::8|0"
+                      && bigRules[72].matchRemotePrefix == 128,
+                  remote(bigRules[72]))
+            r.check("providerRulesEdges: every big rule is outbound with nil local",
+                  bigRules.allSatisfy { $0.matchDirection == .outbound && $0.matchLocalNetworkEndpoint == nil })
+        }
+        r.check("providerRulesEdges: big summary counts 73 rules and starts with the text-first target",
+              wantedBig.summary.hasPrefix("73 rules (TCP catch-all + UDP 10.1.0.9:4000, "), wantedBig.summary)
+        r.check("providerRulesEdges: big summary ends with the last IPv6 target bracketed",
+              wantedBig.summary.hasSuffix(", [2001:db8::8]:any)"), wantedBig.summary)
+        r.check("providerRulesEdges: big set equals its reversed, newline-separated token order",
+              ProviderRuleSet.wanted(for: ScopeMatcher(spec: tokens.reversed().joined(separator: "\n"))) == wantedBig)
+
+        // -- IPv4-mapped IPv6 token: unmapped to the /32 IPv4 rule ------------------
+        let mapped = ProviderRuleSet.wanted(for: ScopeMatcher(spec: "[::ffff:198.51.100.7]:443"))
+        let plain = ProviderRuleSet.wanted(for: ScopeMatcher(spec: "198.51.100.7:443"))
+        r.check("providerRulesEdges: IPv4-mapped IPv6 token equals the plain IPv4 token", mapped == plain,
+              "\(mapped.udpTargets) vs \(plain.udpTargets)")
+        r.check("providerRulesEdges: IPv4-mapped target carries the IPv4 text",
+              mapped.udpTargets == [Target("198.51.100.7", 443)], "\(mapped.udpTargets)")
+        let mappedRules = mapped.networkRules()
+        r.check("providerRulesEdges: IPv4-mapped rule is .UDP to 198.51.100.7:443 /32",
+              mappedRules.count == 2 && mappedRules[1].matchProtocol == .UDP
+                  && remote(mappedRules[1]) == "198.51.100.7|443" && mappedRules[1].matchRemotePrefix == 32,
+              mappedRules.count == 2 ? remote(mappedRules[1]) + " /\(mappedRules[1].matchRemotePrefix)" : "\(mappedRules.count) rules")
+
+        // -- Only never-claimed, wildcard and malformed tokens: TCP-only -------------
+        let junk = "[2001:db8::3 198.51.100.7:0 198.51.100.7:65536 10.0.0.1:53 10.0.0.2:5353 10.0.0.3:853 "
+            + "0.0.0.0 [::]:443 0.0.0.0:8080 [::ffff:0.0.0.0] * *.example.com example.com:443 999.1.1.1 :443"
+        let junkSet = ProviderRuleSet.wanted(for: ScopeMatcher(spec: junk))
+        r.check("providerRulesEdges: never-claimed, wildcard and malformed tokens are TCP-only",
+              junkSet == .tcpOnly, "\(junkSet.udpTargets)")
+        r.check("providerRulesEdges: that set builds exactly one rule", junkSet.networkRules().count == 1,
+              "\(junkSet.networkRules().count)")
+        r.check("providerRulesEdges: that summary is the TCP-only line",
+              junkSet.summary == "1 rule (TCP catch-all)", junkSet.summary)
+        r.check("providerRulesEdges: a wildcard with a non-zero port is still skipped (spec H is unconditional)",
+              ProviderRuleSet.wanted(for: ScopeMatcher(spec: "0.0.0.0:8080 [::]:443")) == .tcpOnly)
+        r.check("providerRulesEdges: the matcher does hold those wildcard-with-port entries (the skip is in wanted)",
+              ScopeMatcher(spec: "0.0.0.0:8080 [::]:443").udpClaimableIPEntries.count == 2)
+        r.check("providerRulesEdges: a separators-only spec is TCP-only",
+              ProviderRuleSet.wanted(for: ScopeMatcher(spec: " ,;\n\t")) == .tcpOnly)
+        // Loopback is not a wildcard: spec H names only 0.0.0.0 and ::, so a loopback
+        // token yields a rule (the kernel never diverts loopback anyway).
+        r.check("providerRulesEdges: loopback tokens are not skipped",
+              ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 [::1]:9000")).udpTargets
+                  == [Target("127.0.0.1", 9000), Target("::1", 9000)],
+              "\(ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 [::1]:9000")).udpTargets)")
+    }
 }
 #endif

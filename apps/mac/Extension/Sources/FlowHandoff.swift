@@ -1538,8 +1538,11 @@ enum HandoffSelfCheck {
         rendezvous(r)
         coreLinkAndClaim(r)
         scopeChangeHook(r)
+        scopeChangeHookStaleHandle(r)
         providerRules(r)
+        providerRulesEdges(r)
         ruleReconciler(r)
+        ruleReconcilerStartupAndStop(r)
         pumps(r)
         inboundCap(r)
         return r.failures
@@ -2180,6 +2183,77 @@ enum HandoffSelfCheck {
             r.check("detach hook sees current() == nil already", afterDetach[2].1)
         }
         r.check("detached and fail-open", !link.isAttached && link.current() == nil)
+    }
+
+    /// Tester (stage 5): the negative case of hook (b) -- `detach` fires the hook "only
+    /// when the `control === handle` guard was true" (spec "Hook"). Two pairs are served
+    /// on ONE link: the second `serve` replaces the first attachment, so the first handle
+    /// is stale. Closing the stale core side runs `detach` for that handle, which must
+    /// neither fire the hook nor reset the live attachment; otherwise a stale detach
+    /// would re-apply TCP-only rules under a live scope and blank `current()`.
+    private static func scopeChangeHookStaleHandle(_ r: Recorder) {
+        guard let own = ownIdentifierRequirement() else { return }
+        guard let (coreA, providerA) = pair(), let (coreB, providerB) = pair() else { return }
+        setRecvTimeout(coreA.fd, seconds: 5)
+        setRecvTimeout(coreB.fd, seconds: 5)
+        let link = CoreLink(requirement: own)
+        let calls = Box<(ScopeMatcher?, Bool)>()
+        link.onScopeChange = { matcher in calls.append((matcher, link.current() == nil)) }
+        let hello = #"{"Hello":{"protocol_version":1}}"#
+
+        // A attaches: one nil at serve start.
+        let doneA = DispatchSemaphore(value: 0)
+        Thread { _ = link.serve(providerA, directory: "/run/aitm-a"); doneA.signal() }.start()
+        let helloA = (try? FDIO.readFrame(coreA.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+        r.check("stale handle: hello on A", helloA == hello, helloA ?? "nil")
+        r.check("stale handle: A's serve start fires the hook once",
+              waitUntil { calls.all.count == 1 }, "\(calls.all.count) call(s)")
+
+        // B is served on the SAME link while A is still being read: B replaces A as
+        // `control` (A is now the stale handle) and, being a fresh attachment with no
+        // Scope, fires one nil of its own.
+        let doneB = DispatchSemaphore(value: 0)
+        Thread { _ = link.serve(providerB, directory: "/run/aitm-b"); doneB.signal() }.start()
+        let helloB = (try? FDIO.readFrame(coreB.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+        r.check("stale handle: hello on B", helloB == hello, helloB ?? "nil")
+        r.check("stale handle: B's serve start fires the hook once more",
+              waitUntil { calls.all.count == 2 }, "\(calls.all.count) call(s)")
+        let afterB = calls.all
+        if afterB.count == 2 {
+            r.check("stale handle: B's serve-start hook passes nil with current() nil",
+                  afterB[1].0 == nil && afterB[1].1, "\(String(describing: afterB[1].0)), \(afterB[1].1)")
+        }
+
+        // Arm B: the hook fires with the matcher and current() names B's directory.
+        let armed = ScopeMatcher(spec: "example.com 198.51.100.7")
+        try? FDIO.writeFrame(coreB.fd, Data(#"{"Scope":{"spec":"example.com 198.51.100.7"}}"#.utf8), max: 1 << 20)
+        r.check("stale handle: B's Scope fires the hook once",
+              waitUntil { calls.all.count == 3 }, "\(calls.all.count) call(s)")
+        r.check("stale handle: B is the live attachment, armed",
+              link.current()?.directory == "/run/aitm-b" && link.current()?.scope == armed,
+              "\(String(describing: link.current()?.directory)) \(String(describing: link.current()?.scope.entries))")
+
+        // Close the STALE core side. A's readControl returns and detach(A) runs with the
+        // guard false: no hook call, no reset. A wrongly fired hook would run on A's
+        // serve thread BEFORE doneA is signalled, so the count is final once the wait
+        // returns.
+        coreA.shutdownBoth()
+        r.check("stale handle: A's serve returned", doneA.wait(timeout: .now() + 5) == .success)
+        r.check("stale handle: a stale detach fires no hook", calls.all.count == 3, "\(calls.all.count) call(s)")
+        r.check("stale handle: a stale detach leaves the live attachment armed",
+              link.isAttached && link.current()?.directory == "/run/aitm-b" && link.current()?.scope == armed,
+              "\(link.isAttached) \(String(describing: link.current()?.directory))")
+
+        // Close the LIVE core side: the real detach, one nil with current() already nil.
+        coreB.shutdownBoth()
+        r.check("stale handle: B's serve returned", doneB.wait(timeout: .now() + 5) == .success)
+        let afterDetach = calls.all
+        r.check("stale handle: the live detach fires the hook once", afterDetach.count == 4, "\(afterDetach.count) call(s)")
+        if afterDetach.count == 4 {
+            r.check("stale handle: the live detach passes nil with current() already nil",
+                  afterDetach[3].0 == nil && afterDetach[3].1, "\(String(describing: afterDetach[3].0)), \(afterDetach[3].1)")
+        }
+        r.check("stale handle: detached and fail-open", !link.isAttached && link.current() == nil)
     }
 
     // -- pumps ---------------------------------------------------------------
