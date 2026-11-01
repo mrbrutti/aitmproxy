@@ -381,7 +381,8 @@ impl CeilingsFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TlsFile {
-    /// Hosts (or `*.wildcard`) tunnelled past MITM.
+    /// Hosts (or `*.wildcard`) pinned out of MITM: tunnelled even when in Scope
+    /// (pins win over Scope; a host outside Scope is tunnelled regardless).
     passthrough: Option<Vec<String>>,
     /// Let an agent (MCP) frontend change the passthrough list. Off by default.
     allow_agent_passthrough: Option<bool>,

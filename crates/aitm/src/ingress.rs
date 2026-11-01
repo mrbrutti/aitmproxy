@@ -240,13 +240,17 @@ impl CoreIngress {
         match sd.modules.iter().find(|m| m.matches(&hint)).cloned() {
             Some(module) => {
                 let dst = flow.dst;
+                // The same guard that admitted the flow rides the ctx, so a module
+                // that re-checks Scope before terminating TLS (spec D2) answers
+                // from the live scope, not the seam's deny-by-default.
                 let ctx = aitm_core::ModuleCtx::new(
                     sd.store.clone(),
                     sd.sink.clone(),
                     sd.connector.clone(),
                 )
                 .with_modules(sd.modules.clone())
-                .with_hint(hint);
+                .with_hint(hint)
+                .with_scope(sd.guard.clone());
                 // Log a module-spawn error the way the acceptor's `handle_conn` does
                 // (warn with the dst + error), rather than silently dropping it.
                 if let Err(e) = module.spawn(flow.stream, ctx).await {
@@ -939,6 +943,74 @@ mod tests {
             dial_calls.load(Ordering::SeqCst),
             0,
             "no upstream is dialled"
+        );
+    }
+
+    /// A stub module that claims everything and, when spawned, asks its context
+    /// whether two authorities are in scope — the question the HTTP module asks
+    /// before it terminates TLS (spec D2).
+    struct ScopeProbeModule {
+        answers: Arc<Mutex<Option<(bool, bool)>>>,
+    }
+
+    impl ProtocolModule for ScopeProbeModule {
+        fn id(&self) -> &str {
+            "scope-probe"
+        }
+        fn matches(&self, _hint: &NextLayerHint) -> bool {
+            true
+        }
+        fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>> {
+            let probed = (
+                ctx.in_scope("example.com:443"),
+                ctx.in_scope("other.test:443"),
+            );
+            *self.answers.lock().unwrap_or_else(PoisonError::into_inner) = Some(probed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// AC14: the capture ingress attaches its scope guard to the `ModuleCtx` it
+    /// spawns a module with, so `ctx.in_scope` answers from the **same** guard the
+    /// ingress gated the flow on — `true` for the in-scope authority, `false` for
+    /// another — not the seam's deny-by-default `false`.
+    #[tokio::test]
+    async fn dispatched_module_ctx_carries_the_ingress_scope_guard() {
+        let guard = Arc::new(aitm_core::StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "example.com".to_string(),
+        });
+        let answers = Arc::new(Mutex::new(None));
+        let module: Arc<dyn ProtocolModule> = Arc::new(ScopeProbeModule {
+            answers: answers.clone(),
+        });
+        let connector: Arc<dyn UpstreamConnector> = Arc::new(MockConnector {
+            dial_calls: Arc::new(AtomicUsize::new(0)),
+            upstream: Mutex::new(None),
+        });
+        let ingress = CoreIngress::empty().with_stream(
+            Arc::from(vec![module]),
+            store(),
+            Arc::new(MockSink),
+            connector,
+            guard,
+        );
+
+        let outcome = ingress
+            .dispatch_tcp(CapturedTcpFlow {
+                stream: dummy_stream(),
+                dst: "93.184.216.34:443".parse().unwrap(),
+                sni: Some("example.com".to_string()),
+                first_bytes: vec![0x16, 0x03, 0x01],
+                peer_identity: None,
+                interface: "test-if".to_string(),
+            })
+            .await;
+        assert_eq!(outcome, StreamOutcome::Dispatched);
+        assert_eq!(
+            *answers.lock().unwrap_or_else(PoisonError::into_inner),
+            Some((true, false)),
+            "the module's ctx answers in_scope from the ingress's guard"
         );
     }
 
