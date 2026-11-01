@@ -240,6 +240,23 @@ export function viaProxy(proxyPort, method, url, { headers = {}, body = null, ti
 }
 
 /**
+ * Pulls the operator web-UI URL out of the core's stdout, or `null` when none has been printed.
+ * Accepts both formats the core has used: the older `web UI (operator): <url>` line and the
+ * current startup block (`crates/aitm/src/web/mod.rs` `startup_summary`), whose line is
+ * `  Operator   http://127.0.0.1:<port>/#t=<optoken>&expect=operator` and is only emitted when
+ * `mcp.operator_token` is configured. A bare `Web UI` line is the agent URL, never the operator.
+ * Pure (no spawning) so a proof script can unit-check it against a captured block.
+ */
+export function parseOperatorUrl(stdout) {
+  const text = String(stdout ?? '');
+  const candidates = [];
+  const legacy = text.match(/web UI \(operator\):\s*(\S+)/);
+  if (legacy) candidates.push(legacy[1]);
+  for (const m of text.matchAll(/^\s*Operator\s+(\S+)\s*$/gm)) candidates.push(m[1]);
+  return candidates.find((u) => u.includes('#t=')) ?? null;
+}
+
+/**
  * Spawns `aitm web` with its own config (all ports free, scope widening on, PoC dirs set).
  * Resolves once the bridge is up. `env.stop()` kills it.
  */
@@ -256,8 +273,9 @@ export async function startAitm({
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
   const token = 'live-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   // Configuring `mcp.operator_token` (any non-empty secret) ENABLES operator access: the server then
-  // mints a FRESH per-run operator *bridge* token and prints `web UI (operator): http://…/#t=<tok>`
-  // on stdout (the secret itself never appears in a URL/log). We parse that URL + token below so the
+  // mints a FRESH per-run operator *bridge* token and prints `  Operator   http://…/#t=<tok>&expect=operator`
+  // on stdout (older builds: `web UI (operator): <url>`; the secret itself never appears in a URL/log).
+  // We parse that URL + token below (`parseOperatorUrl`) so the
   // CUA can drive the web surface as a real `Frontend::Operator` (vs the agent `--token` = Mcp).
   const operatorSecret = 'opsecret-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   const pocDir = join(dir, 'poc');
@@ -272,19 +290,23 @@ export async function startAitm({
   let stderr = '';
   let out = '';
   let operatorUiUrl = null;
-  const opMatch = () => out.match(/web UI \(operator\):\s*(\S+)/);
+  const opMatch = () => {
+    const url = parseOperatorUrl(out);
+    return url ? [url, url] : null;
+  };
   child.stderr.on('data', (d) => {
     stderr += d;
     log(String(d).trimEnd());
   });
   await new Promise((res, rej) => {
     // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the agent +
-    // operator URLs on stdout. Resolve once the operator URL is captured, or on the generic
-    // listen/agent line (older builds / operator disabled).
+    // operator URLs on stdout (current builds: a `  Web UI     http://…` startup block line).
+    // Resolve once the operator URL is captured, or on the generic listen/agent/Web UI line
+    // (older builds / operator disabled).
     const check = () => {
       const m = opMatch();
       if (m) operatorUiUrl = m[1];
-      if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr)) res();
+      if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr) || /^\s*Web UI\s+http/m.test(out)) res();
     };
     child.stdout.on('data', (d) => {
       out += d;
