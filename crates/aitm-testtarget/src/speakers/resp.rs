@@ -6,7 +6,10 @@
 //! it is. The deliberate bug: a bulk length over [`MAX_BULK`] (or negative)
 //! crashes the Vulnerable origin, and so does an array still short of its `N`
 //! elements after [`super::IDLE_TIMEOUT`]; the Patched control answers the
-//! row's `-ERR Protocol error` and closes. Destructive commands get
+//! row's `-ERR Protocol error` and closes. Malformed framing that is not
+//! the bug (a garbled `*N` or `$len`, an element not starting with `$`) is
+//! answered with a specific `-ERR Protocol error: ...` and then closed in
+//! both modes: no close is ever silent (T10 PR C). Destructive commands get
 //! `-ERR denylisted command` and are logged `denylisted` (spec D5).
 
 use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
@@ -43,6 +46,7 @@ const OK: &[u8] = b"+OK\r\n";
 const DENIED: &[u8] = b"-ERR denylisted command\r\n";
 const INVALID_BULK: &[u8] = b"-ERR Protocol error: invalid bulk length\r\n";
 const INCOMPLETE_MULTIBULK: &[u8] = b"-ERR Protocol error: incomplete multibulk\r\n";
+const INVALID_MULTIBULK: &[u8] = b"-ERR Protocol error: invalid multibulk length\r\n";
 
 fn new_conn() -> Box<dyn Speaker> {
     Box::new(Resp)
@@ -141,12 +145,13 @@ fn parse_array(mode: SeedMode, buf: &[u8]) -> Parsed {
         Len::Value(n) if n >= 0 => n.unsigned_abs() as usize,
         // Too many to ever arrive: stays incomplete until the idle trigger.
         Len::Overflow => usize::MAX,
-        // A negative or garbled count desynchronises the stream: close.
+        // A negative or garbled count desynchronises the stream: say so,
+        // then close (in both modes; this is not the D5 trigger).
         Len::Value(_) | Len::Malformed => {
             return Parsed::Message {
                 consumed: pos,
                 verb: None,
-                step: Step::Fault(Vec::new()),
+                step: Step::Fault(INVALID_MULTIBULK.to_vec()),
             }
         }
     };
@@ -157,11 +162,12 @@ fn parse_array(mode: SeedMode, buf: &[u8]) -> Parsed {
         };
         let after_header = pos + n;
         let Some(digits) = l.strip_prefix(b"$") else {
-            // Clients only send arrays of bulk strings.
+            // Clients only send arrays of bulk strings: name the byte we
+            // found instead, then close (in both modes).
             return Parsed::Message {
                 consumed: after_header,
                 verb: None,
-                step: Step::Fault(Vec::new()),
+                step: Step::Fault(expected_dollar(l)),
             };
         };
         let len = match parse_len(digits) {
@@ -226,6 +232,18 @@ fn command(name: &[u8], args: &[&[u8]]) -> (String, Step) {
         Step::ProtocolError(format!("-ERR unknown command '{typed}'\r\n").into_bytes())
     };
     (verb, step)
+}
+
+/// `-ERR Protocol error: expected '$', got '<c>'` for an array element line
+/// that does not start with `$`; `<c>` is its first byte when printable,
+/// empty otherwise (redis's own wording).
+fn expected_dollar(elem: &[u8]) -> Vec<u8> {
+    let got: String = String::from_utf8_lossy(elem)
+        .chars()
+        .take(1)
+        .filter(|c| !c.is_control())
+        .collect();
+    format!("-ERR Protocol error: expected '$', got '{got}'\r\n").into_bytes()
 }
 
 /// The command name as typed, safe to echo inside a simple-error line:
@@ -436,8 +454,10 @@ mod tests {
 
     #[test]
     fn resp_malformed_lengths_close_without_a_crash() {
-        // A garbled or negative array count desynchronises the stream: Fault
-        // with no bytes, in both modes (never the crash window).
+        // A garbled or negative array count desynchronises the stream: the
+        // protocol-error reply, then close, in both modes (never the crash
+        // window, never a silent close; T10 PR C).
+        let bad_count = Step::Fault(b"-ERR Protocol error: invalid multibulk length\r\n".to_vec());
         for buf in [&b"*abc\r\n"[..], b"*-1\r\n", b"*\r\n"] {
             for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
                 assert_eq!(
@@ -445,20 +465,20 @@ mod tests {
                     Parsed::Message {
                         consumed: buf.len(),
                         verb: None,
-                        step: Step::Fault(Vec::new()),
+                        step: bad_count.clone(),
                     },
                     "{:?}",
                     String::from_utf8_lossy(buf)
                 );
             }
         }
-        // An array element that is not a bulk string: Fault, no bytes.
+        // An array element that is not a bulk string: reply, then close.
         assert_eq!(
             parse(SeedMode::Vulnerable, b"*1\r\n+PING\r\n"),
             Parsed::Message {
                 consumed: 11,
                 verb: None,
-                step: Step::Fault(Vec::new()),
+                step: Step::Fault(b"-ERR Protocol error: expected '$', got '+'\r\n".to_vec()),
             }
         );
         // A garbled bulk length is the protocol-error reply in both modes.
@@ -513,5 +533,108 @@ mod tests {
                 Step::ProtocolError(b"-ERR unknown command 'ab'\r\n".to_vec())
             )
         );
+    }
+
+    // --- T10 PR C: malformed framing replies before closing, in both modes ---
+
+    #[test]
+    fn resp_malformed_framing_replies_then_closes() {
+        let cases: [(&[u8], usize, &[u8]); 5] = [
+            // `*1$4` is not a number: the multibulk header is garbled.
+            (
+                b"*1$4\r\nPING\r\n",
+                6,
+                b"-ERR Protocol error: invalid multibulk length\r\n",
+            ),
+            // The element after `*1` does not start with `$`.
+            (
+                b"*1\r\n4\r\nPING\r\n",
+                7,
+                b"-ERR Protocol error: expected '$', got '4'\r\n",
+            ),
+            // An empty element line: nothing to quote after `got`.
+            (
+                b"*1\r\n\r\nPING\r\n",
+                6,
+                b"-ERR Protocol error: expected '$', got ''\r\n",
+            ),
+            // A control byte where `$` should be is not echoed raw.
+            (
+                b"*1\r\n\x01PING\r\n",
+                11,
+                b"-ERR Protocol error: expected '$', got ''\r\n",
+            ),
+            // A garbled bulk length.
+            (
+                b"*1\r\n$abc\r\n",
+                10,
+                b"-ERR Protocol error: invalid bulk length\r\n",
+            ),
+        ];
+        for (buf, consumed, reply) in cases {
+            for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+                assert_eq!(
+                    parse(mode, buf),
+                    Parsed::Message {
+                        consumed,
+                        verb: None,
+                        step: Step::Fault(reply.to_vec()),
+                    },
+                    "{mode:?} {:?}",
+                    String::from_utf8_lossy(buf)
+                );
+            }
+        }
+        // The D5 trigger is untouched: `$N` over 1 MiB crashes V, P replies.
+        assert_eq!(
+            parse(SeedMode::Vulnerable, b"*1\r\n$1048577\r\n"),
+            Parsed::Message {
+                consumed: 14,
+                verb: None,
+                step: Step::Trigger,
+            }
+        );
+        assert_eq!(
+            parse(SeedMode::Patched, b"*1\r\n$1048577\r\n"),
+            Parsed::Message {
+                consumed: 14,
+                verb: None,
+                step: Step::Fault(b"-ERR Protocol error: invalid bulk length\r\n".to_vec()),
+            }
+        );
+    }
+
+    /// A high-bit byte in an argument never breaks verb matching, and a
+    /// non-UTF-8 verb is an ordinary unknown command: reply, keep (T10 PR C).
+    #[test]
+    fn resp_high_bit_bytes_get_a_normal_reply() {
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                parse(mode, b"ECHO \xff\r\n"),
+                msg(8, "ECHO", Step::Reply(b"$1\r\n\xff\r\n".to_vec()))
+            );
+            assert_eq!(
+                parse(mode, b"GET k\xff\r\n"),
+                msg(8, "GET", Step::Reply(b"$-1\r\n".to_vec()))
+            );
+            assert_eq!(
+                parse(mode, b"*2\r\n$3\r\nGET\r\n$2\r\nk\xff\r\n"),
+                msg(21, "GET", Step::Reply(b"$-1\r\n".to_vec()))
+            );
+            // The verb itself carries the high-bit byte: unknown, echoed
+            // lossily, connection kept.
+            assert_eq!(
+                parse(mode, b"PI\xffNG\r\n"),
+                msg(
+                    7,
+                    "PI\u{FFFD}NG",
+                    Step::ProtocolError(
+                        "-ERR unknown command 'PI\u{FFFD}NG'\r\n"
+                            .as_bytes()
+                            .to_vec()
+                    )
+                )
+            );
+        }
     }
 }
