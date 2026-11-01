@@ -731,6 +731,9 @@ Kept by the main session during stage 6. One row per finding.
 | 17 | coordinator | note | `l4.scope.add` needs explicit `inject_rate_pps`; `Issue.location.l4` arrives on T1b's final head; `poc_ref` fallback already the TUI's | H59 (cell), H60 (Rust at Task 17), none |
 | 17 | coordinator | ruling | `scan.sitemap {}` = newest job's map (umbrella amendment 27); D13 own-error ruling confirmed; canary and `wait_notification` fixes right | H58 closed; D6 amended; H61 at Task 17 |
 | 15 | engine | corrected | T1b: the canary is never excluded; the fabricated `Authorization: Bearer` on every probe made the target answer unauthenticated, so no reflection | H55 amended: Cookie-only seed on `GET /`; `scan.sitemap` gains a `job` field on the next head (H61) |
+| H (cell) | fix round | done | H51, H54, H55 (Cookie-only), H57, H59 in `3dbdb13c`, `2c7c8981`; `--selftest` 48 ok | live run 4 |
+| H (cell) | coder note | Minor | H57 root cause: the harness drain waits for 0.5 s of silence the TUI's polling never allows; `wait_notification` per line instead | ratified; harness note for T10 stands |
+| H (cell) | coder note | note | run 3 pushes carried `issue` events while `scan.issues {job}` read zero | checked on run 4; T1b if it repeats |
 
 ## Shipped
 
