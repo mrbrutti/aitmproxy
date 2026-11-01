@@ -620,6 +620,12 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   page and the flows list header, "No flows yet? Set aitmproxy as the system
   proxy so Safari and other apps use it.", with "Set as System Proxy", "Not Now"
   and a "Don't ask again" checkbox; at most once per launch.
+- **Step order and words (Matt, 2026-10-31, per-host decryption like Proxyman: only hosts in
+  Scope are decrypted, the rest pass through, inline Add to Scope).** The first-run sheet and
+  the Status checklist present the three automations in this order with these words: 1 "Set
+  aitmproxy as the system proxy" (or point a client at it), 2 "Trust the aitmproxy CA" (D17),
+  3 "Add a host to Scope — nothing is decrypted until a host is in Scope". Shared with
+  mac-attribution's advice model; no change to the verbs.
 - **Getting started**: the `.firstFlow` step's undone title becomes "Set
   aitmproxy as the system proxy, or open the browser" (action
   `.setSystemProxy`) when supported and not at us; "System proxy points at
