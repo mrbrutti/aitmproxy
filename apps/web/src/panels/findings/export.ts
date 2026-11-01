@@ -86,7 +86,7 @@ export function mimeForPath(path: string): string {
 }
 
 /**
- * The bus returns `poc.artifact` as bare base64 of the file's bytes (F13); an older fixture shape
+ * The bus returns `poc.artifact` as bare base64 of the file's bytes (F13); an older model shape
  * was `{mime, base64|text}`. Both become an Artifact; textual types also get `text`.
  */
 export function toArtifact(raw: unknown, path: string): Artifact {
