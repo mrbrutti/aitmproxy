@@ -57,6 +57,11 @@ recorded and tallied apart, never a pass). The per-run work dir (the TUI's HOME,
 is removed with the run; the L4 scope entry the cell adds is removed by its id.
 
 Exit 0 PASS / 1 FAIL / 77 SKIP.
+
+`python3 -I tests/e2e/tui/test_tui_scan_live.py --selftest` runs the screen readers
+(cursor row, severity group, editor header, surface tag, inspector, Findings head) against
+frames painted with the TUI's real geometry (the boxed Scan view, its pane rule, a sidebar
+offset), with no core and no pty, one line per assertion; exit 0 when all hold.
 """
 from __future__ import annotations
 
@@ -91,9 +96,6 @@ from aitm_e2e.target import Target, testtarget_bin  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(E2E))
 SKIP_EXIT = 77
 COLS, ROWS = 200, 50
-# The Scan tabs split side by side at 100 columns or more: the list pane takes the left
-# 45 % (crates/aitm-tui/src/ui/scan/mod.rs `panes`), the detail the rest.
-LIST_SPAN = int(COLS * 45 / 100)
 
 # Timings. The TUI polls scan.status about once a second (spec D6), so every
 # screen claim is polled, never read once.
@@ -121,10 +123,30 @@ STATE_RE = re.compile(
     r"\b(queued|running|cancelling|done|cancelled|failed)(?:/(queued|crawl|passive|audit|report|done))?\b"
 )
 PROBES_RE = re.compile(r"(\d+)/(\d+)")
-CURSOR_ROW_RE = re.compile(r"(?:^|\n)>")
+# The Scan view is drawn inside a box (`boxed(theme, "Scan", ..)`, crates/aitm-tui/src/ui/
+# scan/mod.rs), so every screen row starts with the box's left border `│` and the list
+# pane of each tab (Profiles, Jobs, the Site map's Nodes, Issues) sits at the box's inner
+# edge: its cursor row reads `│>...` wherever the box starts (column 0 in Scan mode, which
+# draws no sidebar; after one should a layout ever keep it). The capture runs to the pane
+# rule (the next `│`, `panes`) or the row's end. The detail sides' own `>` marks (the
+# editor's Origins pane, the Site map's Points pane, the Issues detail's flow list) follow
+# the rule further right and are never the list's (fix round H, H9/H7).
+CURSOR_ROW_RE = re.compile(r"│>([^│\n]*)")
 # The held editor's header (`crates/aitm-tui/src/ui/scan/profiles.rs` `header`): ` profile `
-# then the name. The D7 gate's `open the profile (⏎)` does not match (no `(` in a name).
-EDITOR_HEAD_RE = re.compile(r"\bprofile [A-Za-z0-9_.-]+")
+# then the name, drawn at the detail pane's first cell, so the pane rule `│` stands right
+# before it. The no-editor hint `⏎ opens the profile under the cursor · N new profile` and
+# the D7 gate's `open the profile (⏎)` carry `profile` mid-sentence and never match (H4).
+EDITOR_HEAD_RE = re.compile(r"│ profile (?!under\b)([A-Za-z0-9_.-]+)")
+# The flow inspector's pane rows (`crates/aitm-tui/src/ui/inspector.rs`): ` Request  Headers ..`.
+INSPECTOR_PANE_RE = re.compile(r"Request\s+Headers")
+# The Findings overlay's detail head (`crates/aitm-tui/src/ui/overlays.rs` `findings`):
+# ` {title}  {severity}` and nothing after it; a list row puts the severity first and
+# ends with the title, so it never matches (H10).
+FINDING_HEAD_RE = re.compile(r"^ (.+?)  (critical|high|medium|low|info)\s*$")
+# The Issues list's name column never shrinks below this many cells
+# (`crates/aitm-tui/src/ui/scan/issues.rs` `COLUMN_MIN`), so the first ISSUE_NAME_MIN chars
+# of a name are always rendered (H6).
+ISSUE_NAME_MIN = 8
 # The core's scan error text (`aitm_scan_model::ScanErrorCode::parse_message`): `scan: <code>`.
 SCAN_CODE_RE = re.compile(r"scan: ([a-z_]+)")
 TOKEN = re.compile(
@@ -133,15 +155,18 @@ TOKEN = re.compile(
 
 ENTER, ESC = "\r", "\x1b"
 SCAN_STRIP = "1 Profiles"
-# A text each tab alone draws (crates/aitm-tui/src/ui/scan/{profiles,jobs,sitemap,issues}.rs):
-# the Profiles list header, the Jobs footer, the v2 Nodes pane's summary head, the Issues
-# footer. The tab strip is on every tab and proves nothing about which one drew.
+# A text each tab alone draws (crates/aitm-tui/src/ui/scan/{profiles,jobs,issues}.rs): the
+# Profiles list header, the Jobs footer, the Issues footer. The tab strip is on every tab
+# and proves nothing about which one drew. The Site map's marker is the summary head's
+# node count of the job under test (`sitemap.rs` `summary`: `N nodes · ..`), which T7-19
+# waits for after pinning the job with `J` (H11); a bare `\d+ nodes` would be the
+# job-less query's answer.
 TAB_MARKERS = {
     "1": r"name\s+lanes\s+intensity",
     "2": r"x cancel · ⏎ issues of this job",
-    "3": r"\d+ nodes",
     "4": r"S severity · C confidence",
 }
+SITEMAP_MARKER = "{n} nodes"
 # Spec D9 wordings a refused launch can show instead of a Jobs row (T7-18), by the
 # core's error code (crates/aitm-tui/src/scan/mod.rs `code_wording`).
 REFUSAL_WORDINGS = {
@@ -342,8 +367,8 @@ class Terminal:
 
 class Evidence:
     """Every screen sample is kept RAW in memory (T7-20 greps the raw samples), tagged
-    with the surface it was taken on (`scan`: the four tabs and their overlays;
-    `inspector`: a flow detail; `other`: Flows, Findings, the exit), and written
+    with the surface its text shows (`surface_of`: `scan`, the four tabs and their
+    overlays; `inspector`, a flow detail; `other`, Flows, Findings, the exit), and written
     REDACTED to the artifacts dir, so no file and no printed line can carry a seeded
     secret. A secret is matched whole and by its first SECRET_PREFIX hex chars, so a
     pane that truncates the value is still caught."""
@@ -565,23 +590,82 @@ def row_state(text, job):
     return m.group(0) if m else None
 
 
-def on_cursor(text, needle):
-    """True when a row carrying `needle` is the one the cursor marks (`>` then at most a
-    few glyph cells, then the text): the Scan list panes all draw the cursor that way."""
-    return re.search(r">[^\n]{0,8}" + re.escape(needle), text) is not None
+def box_left(text):
+    """The column of the Scan box's left border: the `│` right before the tab strip
+    (`tab_strip` draws ` 1 Profiles ..` at the box's inner edge). None off the view."""
+    for line in text.split("\n"):
+        i = line.find(" " + SCAN_STRIP)
+        if i > 0 and line[i - 1] == "│":
+            return i - 1
+    return None
 
 
 def cursor_row(text):
-    """The text of the row the `>` cursor marks (after the mark), or None."""
-    m = re.search(r"(?:^|\n)>([^\n]*)", text)
-    return m.group(1) if m else None
+    """The text of the row the list pane's `>` cursor marks (after the mark, to the pane
+    rule, the pad before the rule dropped), or None: the `│>` at the box's left border
+    (H9); off the view, the leftmost `│>` of the first row carrying one."""
+    left = box_left(text)
+    for line in text.split("\n"):
+        for m in CURSOR_ROW_RE.finditer(line):
+            if left is None or m.start() == left:
+                return m.group(1).rstrip()
+    return None
+
+
+def on_cursor(text, needle):
+    """True when the list pane's cursor row carries `needle` after at most a few glyph
+    cells (`>` then the two confidence glyphs on Issues, a pad cell on the Site map)."""
+    row = cursor_row(text)
+    return row is not None and re.match(r"[^\n]{0,8}" + re.escape(needle), row) is not None
+
+
+def list_span(text):
+    """Each screen row cut to the list pane: from the box's inner edge to the pane rule
+    (the next `│`), so the detail side can never be read as a list row."""
+    left = box_left(text)
+    start = 0 if left is None else left + 1
+    out = []
+    for line in text.split("\n"):
+        seg = line[start:]
+        cut = seg.find("│")
+        out.append(seg if cut < 0 else seg[:cut])
+    return out
+
+
+def issue_row_name(row):
+    """The name cell of an Issues cursor row (`>` then the two glyphs, a space, the name)
+    cut to ISSUE_NAME_MIN chars, or None when the row has not that shape (H6)."""
+    m = re.match(r"\S\S (.*)$", row or "")
+    return m.group(1)[:ISSUE_NAME_MIN].rstrip() if m else None
+
+
+def surface_of(text):
+    """The surface a screen sample was taken on, read from the text itself (H3): `scan`
+    while the Scan tab strip is drawn (the four tabs and the overlays over them),
+    `inspector` while the flow inspector's pane row is, else `other`."""
+    if SCAN_STRIP in text:
+        return "scan"
+    if INSPECTOR_PANE_RE.search(text):
+        return "inspector"
+    return "other"
+
+
+def findings_head_title(text):
+    """The title of the Findings overlay's selected finding, read from its detail head
+    (` {title}  {severity}`, right of the list's rule) and nowhere else, or None (H10)."""
+    for line in text.split("\n"):
+        for seg in line.split("│"):
+            m = FINDING_HEAD_RE.match(seg)
+            if m:
+                return m.group(1)
+    return None
 
 
 def group_of(text, needle, headers):
     """The severity header (of `headers`) the LIST row carrying `needle` sits under, or
-    None. Only the list pane's columns are read: the detail head on the right shares its
-    row with the filter line and would otherwise claim the needle first."""
-    lines = [ln[:LIST_SPAN] for ln in text.split("\n")]
+    None. Only the list pane's span is read (`list_span`): the detail head on the right
+    shares its row with the filter line and would otherwise claim the needle first."""
+    lines = list_span(text)
     idx = next((i for i, ln in enumerate(lines) if needle in ln), None)
     if idx is None:
         return None
@@ -612,7 +696,7 @@ def inspector_open(text, method, path):
     (crates/aitm-tui/src/ui/inspector.rs), the flow's method then its path on the header
     row, and the Scan tab strip gone. `path` alone is everywhere (`/`)."""
     return (bool(method) and bool(path)
-            and re.search(r"Request\s+Headers", text) is not None
+            and INSPECTOR_PANE_RE.search(text) is not None
             and re.search(r"Response\s+Headers", text) is not None
             and re.search(r"\b" + re.escape(method) + r"\b[^\n]*" + re.escape(path), text) is not None
             and SCAN_STRIP not in text)
@@ -646,13 +730,15 @@ class Ctx:
         self.jobs = {}
         self.l4_entry_id = None
 
-    def snap(self, step, tag="scan"):
-        """One screen sample on surface `tag`: recorded for the T7-20 grep, returned raw."""
-        return self.ev.sample(step, self.term.text(), tag)
+    def snap(self, step):
+        """One screen sample, tagged with the surface its own text shows (`surface_of`,
+        H3: never the caller's expectation), recorded for the T7-20 grep, returned raw."""
+        text = self.term.text()
+        return self.ev.sample(step, text, surface_of(text))
 
-    def screen(self, step="detail", tag="scan"):
+    def screen(self, step="detail"):
         """The screen as a failure detail: redacted and cut."""
-        return f"screen: {self.ev.redact(self.snap(step, tag))[-1400:]!r}"
+        return f"screen: {self.ev.redact(self.snap(step))[-1400:]!r}"
 
 
 def open_scan(ctx):
@@ -677,16 +763,18 @@ def tab(ctx, key, timeout=10):
 def focus_profiles_list(ctx):
     """The Profiles List pane focused before a cursor walk (G99): while an editor is held
     its Fields pane owns the cursor keys, so one `Esc` (`close_pane`: pane = List, draft
-    kept) comes first whenever the editor header `profile <name>` is on screen. The `>`
-    row is drawn whichever pane is focused, so a List that was already focused is told
-    by the strip leaving on that `Esc`, and `:scan` brings the view back on this tab."""
+    kept) comes first whenever the held editor's header `│ profile <name>` is on screen
+    (EDITOR_HEAD_RE; the no-editor hint is not one, H4, so a plain Profiles visit presses
+    nothing). The `>` row is drawn whichever pane is focused, so a List that was already
+    focused is told by the strip leaving on that `Esc`, and `:scan` brings the view back
+    on this tab."""
     term = ctx.term
     if EDITOR_HEAD_RE.search(term.text()):
         term.press(ESC)
         time.sleep(UI_SETTLE)
         if SCAN_STRIP not in term.text() and not open_scan(ctx):
             return False
-    return poll(lambda: CURSOR_ROW_RE.search(term.text()) is not None, 5)
+    return poll(lambda: cursor_row(term.text()) is not None, 5)
 
 
 def cursor_to(ctx, needle, tries=64):
@@ -806,7 +894,7 @@ def step_seed(ctx):
     c.check("seed: the core captured the seeded flow (flow.table)",
             poll(lambda: row() is not None, 20), "no row carries the marker")
     c.check("seed: the TUI painted the seeded flow", poll(lambda: ctx.marker in ctx.term.text(), 20),
-            ctx.screen("seed", "other"))
+            ctx.screen("seed"))
 
 
 def step_t7_16(ctx):
@@ -825,8 +913,12 @@ def step_t7_16(ctx):
         c.fatal("T7-16: `s` started no job (scan.list gained no id)", ctx.screen("t7-16"))
     ctx.jobs["standard"] = job
     c.check("T7-16: scan.list reports a job id in the engine's form", bool(JOB_ID_RE.fullmatch(job)), job)
-    c.check(f"T7-16: the Jobs row for {job} is on screen",
-            poll(lambda: row_tail(term.text(), job) is not None, ROW_APPEAR_S), ctx.screen("t7-16"))
+    # A launch lands on the Jobs tab (app.rs: `scan.tab = ScanTab::Jobs` on the start
+    # reply); its footer is the tab's own text, so the row is read on the Jobs tab (H5).
+    on_jobs = term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S)
+    c.check(f"T7-16: the Jobs tab drew and carries the row for {job}",
+            on_jobs and poll(lambda: row_tail(term.text(), job) is not None, ROW_APPEAR_S),
+            f"jobs tab {on_jobs}; {ctx.screen('t7-16')}")
 
     samples = []
     for n in range(SAMPLES_MAX):
@@ -943,8 +1035,10 @@ def step_t7_17(ctx):
     summary, full = found["summary"], found["full"]
     issue_id, name = summary.get("id"), str(summary.get("name") or "")
     severity = str(summary.get("severity") or "").upper()
-    # The list cuts the name column to fit the pane, so the needle is a prefix.
-    needle = name[:20]
+    # The list's name column is at least ISSUE_NAME_MIN cells however the pane is cut
+    # (`COLUMN_MIN`), so this prefix is always rendered; the `J` pin (checked below) keeps
+    # the cancelled job's twin issue off the list, so it names one row (H6).
+    needle = name[:ISSUE_NAME_MIN]
 
     if not tab(ctx, "4"):
         c.check("T7-17: the Issues tab drew", False, ctx.screen("t7-17"))
@@ -952,9 +1046,8 @@ def step_t7_17(ctx):
     # `J` pins the filter to the Jobs cursor's job (D11), so the row under the cursor is
     # this job's issue and not a same-named one from the cancelled job.
     term.press("J")
-    if not poll(lambda: f"job {job}" in term.text(), 10):
-        c.note("T7-17: `J` did not pin the Issues filter to this job (the list may hold "
-               "other jobs' issues)", job)
+    c.check("T7-17: `J` pinned the Issues filter to this job (its id on the filter line)",
+            poll(lambda: f"job {job}" in term.text(), 10), f"{job}; {ctx.screen('t7-17')}")
     shown = poll(lambda: needle in term.text(), 30)
     text = ctx.snap("t7-17-list")
     running = (status_of(ctx.bus, job) or {}).get("state")
@@ -965,7 +1058,11 @@ def step_t7_17(ctx):
             group_of(text, needle, headers) == severity,
             f"group {group_of(text, needle, headers)}; {ctx.ev.redact(text)[-900:]!r}")
 
-    c.check("T7-17: the cursor lands on the issue row", cursor_to(ctx, needle), ctx.screen("t7-17"))
+    landed = cursor_to(ctx, needle)
+    row_name = issue_row_name(cursor_row(term.text()))
+    c.check("T7-17: the cursor lands on the issue row (its name cell, after the glyphs, reads "
+            "the issue's name)", landed and row_name == needle.rstrip(),
+            f"row name {row_name!r} wanted {needle!r}; {ctx.screen('t7-17')}")
     evidence = full.get("evidence") or {}
     payload = str(evidence.get("payload") or "")
     if c.check("T7-17: scan.issue reports an evidence.payload for the issue", bool(payload),
@@ -989,10 +1086,10 @@ def step_t7_17(ctx):
         time.sleep(UI_SETTLE)
         term.press(ENTER)
         opened = poll(lambda: inspector_open(term.text(), method, path), 15)
-        ctx.ev.write("screen-T7-17-inspector.txt", ctx.snap("t7-17-inspector", "inspector"))
+        ctx.ev.write("screen-T7-17-inspector.txt", ctx.snap("t7-17-inspector"))
         c.check("T7-17: `⏎` on the first probe flow opened the inspector (Request/Response panes, "
                 "the flow's method and path, the Scan strip gone)",
-                opened, f"{method} {path!r}; {ctx.screen('t7-17', 'inspector')}")
+                opened, f"{method} {path!r}; {ctx.screen('t7-17')}")
         if not back_to_scan_list(ctx, "T7-17"):
             c.check("T7-17: the Scan view came back after the inspector", False, ctx.screen("t7-17"))
             return
@@ -1017,7 +1114,7 @@ def step_t7_17(ctx):
     answered = poll(lambda: "PoCs and runs" in term.text() or "is not in the Findings list" in term.text()
                     or "this issue has no PoC" in term.text(), 10, 0.2)
     opened = "PoCs and runs" in term.text()
-    text = ctx.snap("t7-17-poc", "other" if opened else "scan")
+    text = ctx.snap("t7-17-poc")
     ctx.ev.write("screen-T7-17-poc.txt", text)
     if poc_ref:
         toast = "is not in the Findings list" in text
@@ -1026,14 +1123,18 @@ def step_t7_17(ctx):
                         f"{ctx.ev.redact(text)[-900:]!r}")
         if opened:
             # The Findings list marks its selection by highlight only (ui/overlays.rs), so
-            # the selected finding is read from the detail pane: its `poc <path>` line
-            # names the PoC file, and its head repeats the title the list row carries.
+            # the selected finding is read from the detail pane alone: its `poc <path>`
+            # line names the PoC file, else its head (` {title}  {severity}`) carries the
+            # issue's name as the title `scan_open_poc` matched on (H10; a count of the
+            # name anywhere on the screen would pass on the list rows alone).
             poc_line = re.search(r"\bpoc\s+(\S+)", text)
+            head_title = findings_head_title(text)
             selected = ((poc_line is not None and (stem in poc_line.group(1) or poc_ref in poc_line.group(1)))
-                        or (bool(needle) and text.count(needle) >= 2))
+                        or (bool(name) and head_title == name))
             c.check("T7-17: the Findings selection is the issue's PoC (its file stem on the "
-                    "detail's `poc` line, or the issue name on both list and detail)",
-                    selected, f"stem {stem!r} name {needle!r}; {ctx.ev.redact(text)[-900:]!r}")
+                    "detail's `poc` line, or the issue name as the detail head's title)",
+                    selected, f"stem {stem!r} name {name!r} head {head_title!r}; "
+                              f"{ctx.ev.redact(text)[-900:]!r}")
             term.press(ESC)
             time.sleep(UI_SETTLE)
             open_scan(ctx)
@@ -1064,14 +1165,42 @@ def l4_add_args(bus, cidr, ports):
     return {k: v for k, v in wanted.items() if k in declared}, unknown
 
 
-def l4_entry_by_id(bus, entry_id):
-    """The l4.scope.list entry carrying `entry_id`, or None (never matched by cidr)."""
+L4_TUPLE_KEYS = ("cidr", "ports", "interface", "direction", "capability")
+
+
+def l4_entries(bus):
+    """The l4.scope.list entries (dicts), or [] when the list cannot be read."""
     try:
         entries = bus.call("l4.scope.list", {})
     except (ToolError, BusError):
-        return None
+        return []
     rows = entries if isinstance(entries, list) else (entries.get("entries") or [])
-    return next((e for e in rows if isinstance(e, dict) and str(e.get("id")) == entry_id), None)
+    return [e for e in rows if isinstance(e, dict)]
+
+
+def l4_entry_by_id(bus, entry_id):
+    """The l4.scope.list entry carrying `entry_id`, or None (never matched by cidr)."""
+    return next((e for e in l4_entries(bus) if str(e.get("id")) == entry_id), None)
+
+
+def l4_entry_matching(bus, args):
+    """The id of the l4.scope.list entry whose WHOLE tuple is the one the cell sent
+    (`cidr`, `ports` as the core echoes them, `lo-hi`, `interface`, `direction`,
+    `capability`) and whose `source` is `runtime` (added over the bus), or None: the
+    exact match H2 allows for a lost `l4.scope.add` reply, never the loose one G97
+    ruled out. None too when any tuple key was not sent."""
+    if any(k not in args for k in L4_TUPLE_KEYS):
+        return None
+    ports = str(args["ports"])
+    if "-" not in ports:
+        ports = f"{ports}-{ports}"
+    want = (str(args["cidr"]), ports, str(args["interface"]), str(args["direction"]),
+            str(args["capability"]), "runtime")
+    for e in l4_entries(bus):
+        got = tuple(str(e.get(k, "")) for k in L4_TUPLE_KEYS + ("source",))
+        if got == want and e.get("id"):
+            return str(e["id"])
+    return None
 
 
 def l4_remove_quietly(bus, entry_id):
@@ -1087,16 +1216,27 @@ def l4_remove_quietly(bus, entry_id):
 def harness_scan_start(ctx):
     """What the core answers the harness for the L4 profile and target the TUI launched:
     ("job", id) or ("code", scan error code) or ("error", text)."""
-    try:
-        profile = ctx.bus.call("scan.profile.get", {"name": "l4-stream-safe"})
-        target = profile.setdefault("target", {})
-        target["l4"] = [{"ip": "127.0.0.1", "port": ctx.target_port, "proto": "tcp"}]
-        res = ctx.bus.confirm("scan.start", {"profile": profile})
-        job = res.get("job") if isinstance(res, dict) else None
-        return ("job", job) if job else ("error", f"scan.start answered {str(res)[:120]!r} without a job")
-    except (ToolError, BusError, AttributeError, TypeError) as e:
+    def answer_of(e):
         m = SCAN_CODE_RE.search(str(e))
         return ("code", m.group(1)) if m else ("error", f"{type(e).__name__}: {e}")
+
+    try:
+        profile = ctx.bus.call("scan.profile.get", {"name": "l4-stream-safe"})
+    except (ToolError, BusError) as e:
+        return answer_of(e)
+    if not isinstance(profile, dict):
+        return ("error", f"scan.profile.get answered {str(profile)[:120]!r}, not a profile object")
+    target = profile.get("target")
+    if not isinstance(target, dict):
+        target = {}
+        profile["target"] = target
+    target["l4"] = [{"ip": "127.0.0.1", "port": ctx.target_port, "proto": "tcp"}]
+    try:
+        res = ctx.bus.confirm("scan.start", {"profile": profile})
+    except (ToolError, BusError) as e:
+        return answer_of(e)
+    job = res.get("job") if isinstance(res, dict) else None
+    return ("job", job) if job else ("error", f"scan.start answered {str(res)[:120]!r} without a job")
 
 
 def step_t7_18(ctx):
@@ -1136,9 +1276,17 @@ def step_t7_18(ctx):
     answer = ""
     try:
         answer = str(ctx.bus.confirm("l4.scope.add", args) or "")
-    except (ToolError, BusError) as e:
+    except ToolError as e:
+        # The core refused: nothing was added.
         answer = f"{type(e).__name__}: {e}"
         ctx.l4_entry_id = NO_L4_ID
+    except BusError as e:
+        # The reply was lost, not refused: the entry may stand on the core. Its id is
+        # found by the cell's own whole tuple (H2) so the run's `finally` removes it by
+        # id like any other; the step then goes on with that id. No match, nothing to
+        # remove.
+        answer = f"{type(e).__name__}: {e}"
+        ctx.l4_entry_id = l4_entry_matching(ctx.bus, args) or NO_L4_ID
     else:
         ctx.l4_entry_id = answer.strip() or NO_L4_ID
 
@@ -1241,12 +1389,16 @@ def step_t7_19(ctx):
     nodes = [n for n in (live.get("nodes") or []) if isinstance(n, dict)]
     points = [p for p in (live.get("points") or []) if isinstance(p, dict)]
 
-    if not tab(ctx, "3"):
-        c.check("T7-19: the Site map tab never drew", False, ctx.screen("t7-19"))
+    # `3`, then `J` (follow the Jobs cursor's job, the one the harness read), then the
+    # job's own node count as the tab's marker: a wait on a bare `N nodes` before the pin
+    # would ride on the job-less `scan.sitemap {}` answer (H11).
+    term.press("3")
+    term.press("J")
+    marker = SITEMAP_MARKER.format(n=len(nodes))
+    if not c.check(f"T7-19: the Site map tab drew the live read's {len(nodes)} nodes for this job "
+                   f"(`{marker}` on the Nodes pane head after `J`)",
+                   poll(lambda: marker in term.text(), 15), ctx.screen("t7-19")):
         return
-    term.press("J")  # follow the Jobs cursor's job, the one the harness reads
-    c.check(f"T7-19: the Nodes pane head counts the live read's {len(nodes)} nodes",
-            poll(lambda: f"{len(nodes)} nodes" in term.text(), 15), ctx.screen("t7-19"))
 
     # Walk the Nodes pane from the top, one row per `j`, polling for the cursor to move.
     seen_text = []
@@ -1293,10 +1445,10 @@ def step_t7_19(ctx):
     method, path = str(flow.get("method") or ""), str(flow.get("path") or "")
     term.press(ENTER)
     opened = poll(lambda: inspector_open(term.text(), method, path), 15)
-    ctx.ev.write("screen-T7-19-inspector.txt", ctx.snap("t7-19-inspector", "inspector"))
+    ctx.ev.write("screen-T7-19-inspector.txt", ctx.snap("t7-19-inspector"))
     c.check("T7-19: `⏎` on the node under the cursor opened its first flow in the inspector "
             "(Request/Response panes, the flow's method and path, the Scan strip gone)",
-            opened, f"{method} {path!r}; {ctx.screen('t7-19', 'inspector')}")
+            opened, f"{method} {path!r}; {ctx.screen('t7-19')}")
     open_scan(ctx)
 
 
@@ -1313,7 +1465,7 @@ def step_t7_20(ctx):
         time.sleep(0.25)
     term.press("q")
     code = term.wait_exit(EXIT_S)
-    c.check("T7-20: `q` ended aitm-tui with exit 0", code == 0, f"exit {code}; {ctx.screen('t7-20', 'other')}")
+    c.check("T7-20: `q` ended aitm-tui with exit 0", code == 0, f"exit {code}; {ctx.screen('t7-20')}")
 
 
 def scenario(ctx):
@@ -1351,6 +1503,14 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"FAIL  {type(e).__name__}: {ev.redact(str(e))}", flush=True)
         return 1
+
+
+def quietly(step):
+    """Run one cleanup step; whatever it raises is swallowed so the next step runs."""
+    try:
+        step()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def run(tui, ev, marker, cookie_secret, auth_secret):
@@ -1448,32 +1608,354 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
         print(head, flush=True)
         return 0 if not failed else 1
     finally:
-        if pushes is not None:
-            pushes.stop()
-        if term is not None:
-            term.stop()
-        if token_file:
-            # The operator token never outlives the run (it is never printed either).
-            try:
-                os.unlink(token_file)
-            except OSError:
-                pass
+        # Each cleanup step on its own, so one that raises cannot skip those after it;
+        # the L4 scope entry goes first, before a hung TUI's kill can delay it (H1).
         if bus is not None and ctx is not None:
             # The L4 scope widening the cell added leaves with it (matched by its id).
-            l4_remove_quietly(bus, ctx.l4_entry_id)
+            quietly(lambda: l4_remove_quietly(bus, ctx.l4_entry_id))
+        if pushes is not None:
+            quietly(pushes.stop)
+        if term is not None:
+            quietly(term.stop)
+        if token_file:
+            # The operator token never outlives the run (it is never printed either).
+            quietly(lambda: os.unlink(token_file))
         if push_client is not None:
-            push_client.close()
+            quietly(push_client.close)
         if bus is not None:
-            bus.close()
+            quietly(bus.close)
         if booted is not None:
-            booted.stop()
+            quietly(booted.stop)
         if tgt is not None:
-            tgt.stop()
+            quietly(tgt.stop)
         if work:
             # The run's HOME, token file and (self-booted) findings store, which holds
             # the seeded session values raw, go with the run.
-            shutil.rmtree(work, ignore_errors=True)
+            quietly(lambda: shutil.rmtree(work, ignore_errors=True))
+
+
+# -------------------------------------------------------- offline self-test
+
+
+class Frame:
+    """A COLS x ROWS screen painted cell by cell the way the TUI's buffer is
+    (`buf.set_string(x, y, ..)`), so a self-test frame carries the renderer's geometry:
+    the Scan box (`boxed`, ui/scan/mod.rs), its tab strip, the 45/55 pane split with its
+    rule (`panes`), the list panes' `>` cursor rows and the detail sides. A hand-typed
+    200-column literal cannot be kept honest; the painted one is checked against the
+    Rust sources named at each painter."""
+
+    def __init__(self, cols=COLS, rows=ROWS):
+        self.cols, self.rows = cols, rows
+        self.grid = [[" "] * cols for _ in range(rows)]
+
+    def put(self, x, y, text):
+        for i, ch in enumerate(text):
+            if 0 <= x + i < self.cols and 0 <= y < self.rows:
+                self.grid[y][x + i] = ch
+
+    def text(self):
+        return "\n".join("".join(r).rstrip() for r in self.grid)
+
+
+# The whole-screen rows (ui/mod.rs `render`): toolbar, chip bar, body, status bar.
+BODY_Y, BODY_H = 2, ROWS - 3
+GAP_TEXT = "  "
+
+
+def chrome(f):
+    """The bars outside the body (ui/bars.rs): never read by a Scan check."""
+    f.put(0, 0, " ›•‹ aitmproxy  ● rec   Flows  Scan  Findings")
+    f.put(0, 1, " All  HTTP  HTTPS  WebSocket  h1  h2  JSON")
+    f.put(0, ROWS - 1, " bus 127.0.0.1:9001 · operator")
+    f.put(COLS - 60, ROWS - 1, "0 B   1 2 3 4 tabs · Tab/BackTab pane · Esc back")
+
+
+def box(f, x, y, w, h, title):
+    """`boxed`: a bordered block with ` title ` on the top border; its inner rect."""
+    f.put(x, y, "┌" + "─" * (w - 2) + "┐")
+    f.put(x + 1, y, f" {title} ")
+    for yy in range(y + 1, y + h - 1):
+        f.put(x, yy, "│")
+        f.put(x + w - 1, yy, "│")
+    f.put(x, y + h - 1, "└" + "─" * (w - 2) + "┘")
+    return x + 1, y + 1, w - 2, h - 2
+
+
+def scan_box(f, tab, offset=0, banner="idle"):
+    """The Scan box over the body from `offset` (0 in Scan mode, which draws no
+    sidebar; 28 should a layout ever keep one), its strip with `tab` active, and the
+    side-by-side panes: (list x, body y, list width, rule x, detail x, detail width,
+    body height)."""
+    if offset:
+        for yy in range(BODY_Y, BODY_Y + BODY_H):
+            f.put(offset - 1, yy, "│")
+        f.put(1, BODY_Y + 1, "Pinned")
+        f.put(1, BODY_Y + 2, "Saved")
+        f.put(1, BODY_Y + 3, "All flows")
+        f.put(1, BODY_Y + 4, "Scan")
+    ix, iy, iw, ih = box(f, offset, BODY_Y, COLS - offset, BODY_H, "Scan")
+    strip = "".join(f" {k} {label} " for k, label in
+                    ((1, "Profiles"), (2, "Jobs"), (3, "Site map"), (4, "Issues")))
+    f.put(ix, iy, strip + "    " + banner)
+    body_y, body_h = iy + 1, ih - 1
+    left = iw * 45 // 100
+    rule_x = ix + left
+    for yy in range(body_y, body_y + body_h):
+        f.put(rule_x, yy, "│")
+    return ix, body_y, left, rule_x, rule_x + 1, iw - left - 1, body_h
+
+
+def profiles_frame(editor, offset=0):
+    """Profiles (ui/scan/profiles.rs): the column header, three rows with `standard`
+    under the cursor, and on the detail side either the no-editor hint over the D7
+    gate text and the key footer, or the held editor's header and Fields block."""
+    f = Frame()
+    chrome(f)
+    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 1, offset)
+    f.put(lx, y, f" {'name':<14}   {GAP_TEXT}{'lanes':<9}{GAP_TEXT}{'intensity':<9}{GAP_TEXT}speed")
+    rows = [("standard", "http ws", "balanced", "normal"),
+            ("map-only", "http", "passive", "normal"),
+            ("l4-stream-safe", "l4_stream", "cautious", "slow")]
+    for k, (name, lanes, inten, speed) in enumerate(rows):
+        mark = ">" if k == 0 else " "
+        editing = "*" if editor and k == 0 else " "
+        f.put(lx, y + 1 + k, f"{mark}{name:<14} {editing}·{GAP_TEXT}{lanes:<9}{GAP_TEXT}{inten:<9}{GAP_TEXT}{speed:<8}")
+    if editor:
+        f.put(dx, y, " profile standard (builtin)")
+        f.put(dx + dw - 6, y, "dirty")
+        f.put(dx, y + 1, f" {'origins':<9} http://127.0.0.1:8080")
+        f.put(dx, y + 2, f" {'l4':<9} -")
+        f.put(dx, y + 3, f" {'lanes':<9} [x] http  [x] ws  [ ] l4_packet  [ ] l4_stream")
+        f.put(dx, y + 4, f" {'intensity':<9} balanced   speed normal   accuracy balanced")
+        f.put(dx, y + 5, f" {'checks':<9} all (12)")
+    else:
+        f.put(dx, y, " ⏎ opens the profile under the cursor · N new profile")
+        f.put(dx, y + bh - 2, " L4 launch disabled: open the profile (⏎) to check its L4 target and scope")
+    f.put(dx, y + bh - 1, " s start · m map · w save as · e edit · Space toggle · Esc back")
+    return f.text()
+
+
+JOB = "scan-1a2b3c4d"
+
+
+def jobs_frame():
+    """Jobs (ui/scan/jobs.rs): the table stacked over its detail (full width, one
+    horizontal rule), the one row under the cursor, the Jobs footer."""
+    f = Frame()
+    chrome(f)
+    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 2)
+    # The Jobs tab stacks: no vertical rule, the table spans the inner width.
+    for yy in range(y, y + bh):
+        f.put(rule_x, yy, " ")
+    target = "http://127.0.0.1:8080"
+    f.put(lx, y, f" {'job':<13}{GAP_TEXT}{'profile':<8}{GAP_TEXT}{'targets':<21}{GAP_TEXT}{'state/phase':<13}"
+                 f"{GAP_TEXT}{'probes':<13}{GAP_TEXT}{'points':<6}{GAP_TEXT}{'issues':<6}{GAP_TEXT}{'el.':>3}")
+    f.put(lx, y + 1, f">{JOB:<13}{GAP_TEXT}{'standard':<8}{GAP_TEXT}{target:<21}{GAP_TEXT}{'running/crawl':<13}"
+                     f"{GAP_TEXT}{'12/400':<6} ━━────{GAP_TEXT}{'3/9':<6}{GAP_TEXT}──────{GAP_TEXT}{'12s':>3}")
+    f.put(lx, y + 2, "─" * (COLS - 2))
+    f.put(lx, y + 3, f" {JOB}")
+    f.put(lx, y + 4, " state running · phase crawl")
+    f.put(lx, y + 5, f" targets {target}")
+    f.put(lx, y + bh - 1, " x cancel · ⏎ issues of this job · s start · m map · Esc back")
+    return f.text()
+
+
+ISSUE_NAME = "Reflected XSS in q"
+
+
+def issues_frame():
+    """Issues (ui/scan/issues.rs): the filter line, the five severity headers with
+    the one row under HIGH and the cursor, the Detail pane whose head repeats the
+    name on the filter line's row (the G100e trap), its flow list with its own `>`."""
+    f = Frame()
+    chrome(f)
+    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 4)
+    f.put(lx, y, f" job {JOB} · S none · C none · L none · T none")
+    f.put(lx, y + 1, " CRITICAL 0")
+    f.put(lx, y + 2, " HIGH 1")
+    f.put(lx, y + 3, f">●● {ISSUE_NAME:<18}{GAP_TEXT}{'GET /search':<11}{GAP_TEXT}{'query:q':<7}{GAP_TEXT}{'open':<4}")
+    f.put(lx, y + 4, " MEDIUM 0")
+    f.put(lx, y + 5, " LOW 0")
+    f.put(lx, y + 6, " INFO 0")
+    f.put(lx, y + bh - 1, " S severity · C confidence · L lane · T status · J job · R reset")
+    f.put(dx, y, f" {ISSUE_NAME}   high · certain · open")
+    f.put(dx, y + 1, f" {'class':<9} reflected-xss")
+    f.put(dx, y + 2, f" {'payload':<9} <svg/onload=alert(1)>")
+    f.put(dx, y + 3, f" {'flows':<9}")
+    f.put(dx, y + 4, "> 0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b  probe")
+    f.put(dx, y + bh - 1, " c confirm · f false positive · u reopen · ⏎ open flow · P PoC · Esc back")
+    return f.text()
+
+
+SITEMAP_NODES = [{"method": "GET", "path_template": "/search", "scheme": "http", "host": "127.0.0.1",
+                  "port": 8080, "flows": ["f-1"]},
+                 {"method": "GET", "path_template": "/", "scheme": "http", "host": "127.0.0.1",
+                  "port": 8080, "flows": ["f-2"]},
+                 {"method": "POST", "path_template": "/login", "scheme": "http", "host": "127.0.0.1",
+                  "port": 8080, "flows": ["f-3"]}]
+
+
+def sitemap_frame():
+    """Site map (ui/scan/sitemap.rs): the summary head, a host header, the node rows
+    with the cursor on the first, and the Points pane whose cursor row sits one row
+    ABOVE the Nodes cursor row, right after the pane rule (the H9 trap)."""
+    f = Frame()
+    chrome(f)
+    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 3)
+    f.put(lx, y, f" {len(SITEMAP_NODES)} nodes · 2 points of n-1")
+    f.put(lx, y + 1, f" {host_label(SITEMAP_NODES[0])}")
+    for k, n in enumerate(SITEMAP_NODES):
+        mark = ">" if k == 0 else " "
+        f.put(lx, y + 2 + k, f"{mark} {node_needle(n)}  flows {len(n['flows'])} · pts {2 if k != 1 else 0}")
+    f.put(dx, y, f" {'kind':<12} {'name':<14} {'path':<24} {'traits':<8} example")
+    f.put(dx, y + 1, f"> {'query':<12} {'q':<14} {'/search':<24} {'-':<8} ts12ab34cd")
+    f.put(dx, y + 2, f"  {'header':<12} {'user-agent':<14} {'/search':<24} {'-':<8} curl/8.4")
+    f.put(dx, y + bh - 1, " ⏎ open flow · n next page · J job filter · Esc back")
+    return f.text()
+
+
+FLOW_PATH = "/search?q=ts12ab34cd"
+
+
+def inspector_frame(secret):
+    """The flow inspector (ui/inspector.rs) under the Flows list with the sidebar
+    (main_region): no Scan strip, the summary row with the flow's method and path,
+    the Request and Response pane rows, and the captured Cookie header verbatim."""
+    f = Frame()
+    chrome(f)
+    for yy in range(BODY_Y, BODY_Y + BODY_H):
+        f.put(27, yy, "│")
+    for k, item in enumerate(("Pinned", "Saved", "All flows", "Scan", "Findings")):
+        f.put(1, BODY_Y + 1 + k, item)
+    f.put(28, BODY_Y, f" {'#':>3}  {'method':<6}  {'host':<20}  {'path':<40}  status")
+    f.put(28, BODY_Y + 1, f" {1:>3}  {'GET':<6}  {'127.0.0.1:8080':<20}  {FLOW_PATH:<40}  200")
+    insp_y = BODY_Y + BODY_H // 2
+    f.put(28, insp_y + 1, f" GET http://127.0.0.1:8080{FLOW_PATH}  200 OK · 1.2 KB · 12 ms")
+    panes_y = insp_y + 2
+    mid = 28 + (COLS - 28) // 2
+    for yy in range(panes_y, BODY_Y + BODY_H):
+        f.put(mid - 1, yy, "│")
+    f.put(28, panes_y, " Request  Headers  Query  Cookies  Body")
+    f.put(mid, panes_y, " Response  Headers  Set-Cookie  Body  JSON")
+    f.put(28, panes_y + 1, " Host: 127.0.0.1:8080")
+    f.put(28, panes_y + 2, f" Cookie: sid={secret}")
+    f.put(mid, panes_y + 1, " Content-Type: text/html")
+    return f.text()
+
+
+POC_PATH = "/work/findings/pocs/reflected-xss-q.yaml"
+
+
+def findings_frame():
+    """The Findings overlay (ui/overlays.rs `findings`): the list rows put the
+    severity before the title, the detail head puts the title before the severity."""
+    f = Frame()
+    chrome(f)
+    ix, iy, iw, ih = box(f, 0, BODY_Y, COLS, BODY_H, "Findings \u2014 PoCs and runs")
+    list_w = iw * 45 // 100
+    for yy in range(iy, iy + ih):
+        f.put(ix + list_w - 1, yy, "│")
+    f.put(ix, iy, f" ·  high  {ISSUE_NAME}")
+    f.put(ix, iy + 1, "       · not run · r to run")
+    f.put(ix, iy + 2, f" ·  low  Other finding")
+    dx = ix + list_w
+    f.put(dx, iy, f" {ISSUE_NAME}  high")
+    f.put(dx, iy + 1, f" poc     {POC_PATH}")
+    return f.text()
+
+
+def selftest():
+    """H9: the screen readers against frames painted with the TUI's real geometry, with
+    no core and no pty. One line per assertion; exit 0 when every one holds."""
+    c = Checks()
+    headers = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    plain, held = profiles_frame(editor=False), profiles_frame(editor=True)
+    shifted = profiles_frame(editor=False, offset=28)
+
+    def row_of(text, needle):
+        return line_with(text, needle) or ""
+
+    c.check("selftest: a line-anchored `>` reader finds nothing on the boxed frame (the H9 regression)",
+            re.search(r"(?:^|\n)>", plain) is None, row_of(plain, "standard"))
+    c.check("selftest: Profiles: cursor_row reads the `standard` row through the box border",
+            (cursor_row(plain) or "").startswith("standard"), repr(cursor_row(plain)))
+    c.check("selftest: Profiles: on_cursor sees `standard` and not `map-only`",
+            on_cursor(plain, "standard") and not on_cursor(plain, "map-only"), row_of(plain, "standard"))
+    c.check("selftest: Profiles: the no-editor hint and the D7 gate text are not an editor header (H4)",
+            EDITOR_HEAD_RE.search(plain) is None,
+            repr(EDITOR_HEAD_RE.search(plain) and EDITOR_HEAD_RE.search(plain).group(0)))
+    m = EDITOR_HEAD_RE.search(held)
+    c.check("selftest: Profiles: the held editor's header names `standard`",
+            m is not None and m.group(1) == "standard", repr(m and m.group(0)))
+    c.check("selftest: Profiles: the tab marker is the Profiles header and no other tab's",
+            re.search(TAB_MARKERS["1"], plain) is not None
+            and all(re.search(TAB_MARKERS[k], plain) is None for k in ("2", "4")), row_of(plain, "lanes"))
+    c.check("selftest: Profiles: the Scan view is not the inspector",
+            not inspector_open(plain, "GET", "/search") and surface_of(plain) == "scan", surface_of(plain))
+    c.check("selftest: Profiles behind a 28-column sidebar: the same cursor row (box-relative, H9)",
+            box_left(shifted) == 28 and cursor_row(shifted) == cursor_row(plain) and on_cursor(shifted, "standard"),
+            repr(cursor_row(shifted)))
+
+    jobs = jobs_frame()
+    c.check("selftest: Jobs: the cursor row is the job and its cells read back",
+            (cursor_row(jobs) or "").startswith(JOB) and row_probes(jobs, JOB) == (12, 400)
+            and row_state(jobs, JOB) == "running/crawl", repr(cursor_row(jobs)))
+    c.check("selftest: Jobs: the Jobs footer is the tab's marker (H5)",
+            re.search(TAB_MARKERS["2"], jobs) is not None and re.search(TAB_MARKERS["1"], jobs) is None,
+            row_of(jobs, "cancel"))
+
+    issues = issues_frame()
+    needle = ISSUE_NAME[:ISSUE_NAME_MIN]
+    c.check("selftest: Issues: the issue sits under HIGH although the detail head repeats its "
+            "name on the filter row (G100e)", group_of(issues, needle, headers) == "HIGH",
+            repr(group_of(issues, needle, headers)))
+    c.check("selftest: Issues: the detail head's row carries the needle first when rows are read whole",
+            line_with(issues, needle) == line_with(issues, "job " + JOB), repr(line_with(issues, needle)))
+    c.check("selftest: Issues: the cursor row's name cell is the issue's first COLUMN_MIN chars (H6)",
+            on_cursor(issues, needle) and issue_row_name(cursor_row(issues)) == needle,
+            repr(cursor_row(issues)))
+    c.check("selftest: Issues: the detail's flow list `>` is never the list cursor",
+            not (cursor_row(issues) or "").startswith(" 0192"), repr(cursor_row(issues)))
+    c.check("selftest: Issues: the tab marker is the Issues footer and the J pin is on the filter line",
+            re.search(TAB_MARKERS["4"], issues) is not None and f"job {JOB}" in issues, row_of(issues, "job "))
+
+    sitemap = sitemap_frame()
+    under = (cursor_row(sitemap) or "").strip()
+    node = next((n for n in SITEMAP_NODES if under.startswith(node_needle(n).rstrip())), None)
+    c.check("selftest: Site map: the Nodes cursor row is read, not the Points pane's `>` one row above (H9)",
+            node is SITEMAP_NODES[0] and not under.startswith("query"), repr(cursor_row(sitemap)))
+    c.check("selftest: Site map: the job's node count is the tab's marker (H11)",
+            SITEMAP_MARKER.format(n=len(SITEMAP_NODES)) in sitemap and SITEMAP_MARKER.format(n=4) not in sitemap,
+            row_of(sitemap, "nodes"))
+
+    secret = "f00dbabe0123456789abcdef00000000"
+    insp = inspector_frame(secret)
+    c.check("selftest: inspector: Request/Response panes, the flow's method and path, no Scan strip",
+            inspector_open(insp, "GET", FLOW_PATH) and not inspector_open(insp, "POST", FLOW_PATH)
+            and not inspector_open(plain, "GET", FLOW_PATH), row_of(insp, "GET http"))
+    ev = Evidence([secret])
+    ev.sample("selftest-insp", insp, surface_of(insp))
+    ev.sample("selftest-scan", issues, surface_of(issues))
+    c.check("selftest: surfaces are read from the text: inspector, scan, other (H3)",
+            surface_of(insp) == "inspector" and surface_of(issues) == "scan"
+            and surface_of(findings_frame()) == "other",
+            f"{surface_of(insp)} {surface_of(issues)} {surface_of(findings_frame())}")
+    c.check("selftest: the T7-20 grep covers the scan samples only; the inspector sample carries the secret",
+            ev.leaks("scan") == [] and [i for i, _, _ in ev.leaks("inspector")] == [0], repr(ev.leaks("inspector")))
+
+    findings = findings_frame()
+    c.check("selftest: Findings: the detail head's title is read, never the list row's severity-first text (H10)",
+            findings_head_title(findings) == ISSUE_NAME, repr(findings_head_title(findings)))
+    poc = re.search(r"\bpoc\s+(\S+)", findings)
+    c.check("selftest: Findings: the detail's `poc` line names the PoC file",
+            poc is not None and poc.group(1) == POC_PATH, repr(poc and poc.group(1)))
+    n_ok, n_noted, n_failed = c.tally()
+    print(f"{'PASS' if not n_failed else 'FAIL'}: selftest {n_ok} ok, {n_failed} failed", flush=True)
+    return 0 if not n_failed else 1
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(selftest())
     sys.exit(main())
