@@ -12,7 +12,10 @@ use aitm_ca::store::{
     store_for, LinuxFamily, Platform, Presence, Scope, Trust, TrustError, TrustErrorKind,
     TrustStore,
 };
-use aitm_ca::testing::{ScriptedExecutor, FIXTURE_FP1, FIXTURE_FP256};
+use aitm_ca::testing::{
+    ScriptedExecutor, CANCEL_STDERR, FIXTURE_FP1, FIXTURE_FP256, MACOS_DETAIL, NOT_TRUSTED,
+    VERIFY_CMD, VERIFY_OK, VERIFY_SPAWN_FAILURE,
+};
 
 /// The checked-in fixture CA, exactly as `ca.crt` on disk.
 const FIXTURE: &[u8] = include_bytes!("fixtures/ca.crt");
@@ -24,8 +27,6 @@ const Q_SYS: &str = "security find-certificate -a -Z /Library/Keychains/System.k
 
 /// What `security add-trusted-cert` prints on stderr in an SSH session.
 const HEADLESS_STDERR: &str = "SecTrustSettingsSetTrustSettings: The authorization was denied since no user interaction was possible";
-
-const MACOS_DETAIL: &str = "Keychain Access";
 
 /// Uppercase hex without separators — the form `find-certificate -Z` prints.
 fn fp256_hex() -> String {
@@ -84,11 +85,13 @@ fn status_present_absent_sha1_only() {
     let cert = fixture_cert();
     let store = MacOsStore;
 
-    // (a) A block whose SHA-256 is ours.
-    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), "");
+    // (a) A block whose SHA-256 is ours; the trust read-back says trusted.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Present);
-    assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(st.trusted, Trust::Yes);
     assert_eq!(st.scope, Scope::User);
     assert_eq!(st.location, K_USER);
     assert!(
@@ -96,21 +99,27 @@ fn status_present_absent_sha1_only() {
         "detail: {:?}",
         st.detail
     );
-    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_CMD.to_string()]
+    );
 
-    // (b) Only other hashes.
+    // (b) Only other hashes: absent, so not trusted, and no read-back runs.
     let exec = ScriptedExecutor::new().respond(Q_USER, 0, &other_output(), "");
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Absent);
-    assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(st.trusted, Trust::No);
     assert!(st.detail.iter().any(|d| d.contains(MACOS_DETAIL)));
+    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
 
     // (c) SHA-1 only, as older macOS prints it (uppercase).
     let sha1_only = format!("SHA-1 hash: {}\nkeychain: \"{K_USER}\"\n", fp1_hex());
-    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &sha1_only, "");
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &sha1_only, "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Present);
-    assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(st.trusted, Trust::Yes);
 
     // Exit 0 with empty output: nothing in the keychain at all.
     let exec = ScriptedExecutor::new();
@@ -129,15 +138,153 @@ fn status_present_absent_sha1_only() {
     assert_eq!(st.trusted, Trust::Unknown);
     assert!(st.detail.iter().any(|d| d.contains(MACOS_DETAIL)));
 
-    // System scope queries the System keychain, never through sudo.
+    // System scope queries the System keychain, never through sudo; the
+    // read-back is the same per-user evaluation.
     let exec = ScriptedExecutor::new()
         .root(false)
-        .respond(Q_SYS, 0, &present_output(), "");
+        .respond(Q_SYS, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
     let st = store.status(&cert, Scope::System, &exec).unwrap();
     assert_eq!(st.installed, Presence::Present);
+    assert_eq!(st.trusted, Trust::Yes);
     assert_eq!(st.scope, Scope::System);
     assert_eq!(st.location, K_SYS);
-    assert_eq!(exec.runs(), vec![Q_SYS.to_string()]);
+    assert_eq!(exec.runs(), vec![Q_SYS.to_string(), VERIFY_CMD.to_string()]);
+}
+
+/// Delegates to a `ScriptedExecutor` but cannot spawn `security verify-cert`
+/// (the tool is missing), the way `RealExecutor` fails when a program cannot
+/// start.
+// SP-AC31 (D17.3): trust comes from one `verify-cert` evaluation, run only
+// when the certificate is present.
+#[test]
+fn status_reads_trust_with_verify_cert() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+
+    // Present + exit 0 with the success text: trusted.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Present);
+    assert_eq!(st.trusted, Trust::Yes);
+    assert_eq!(exec.runs().last().map(String::as_str), Some(VERIFY_CMD));
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
+
+    // Present + non-zero exit: not trusted, the output tail in detail
+    // (whichever stream `security` printed it on).
+    for (stdout, stderr) in [("", NOT_TRUSTED), (NOT_TRUSTED, "")] {
+        let exec = ScriptedExecutor::new()
+            .respond(Q_USER, 0, &present_output(), "")
+            .respond(VERIFY_CMD, 1, stdout, stderr);
+        let st = store.status(&cert, Scope::User, &exec).unwrap();
+        assert_eq!(st.installed, Presence::Present);
+        assert_eq!(st.trusted, Trust::No);
+        assert!(
+            st.detail.iter().any(|d| d.contains(NOT_TRUSTED)),
+            "detail: {:?}",
+            st.detail
+        );
+        assert!(
+            st.detail.iter().any(|d| d.contains(VERIFY_CMD)),
+            "detail: {:?}",
+            st.detail
+        );
+        assert_eq!(
+            exec.runs(),
+            vec![Q_USER.to_string(), VERIFY_CMD.to_string()]
+        );
+    }
+
+    // Present + exit 0 without the success text: not trusted, and detail says
+    // what was missing.
+    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert!(
+        st.detail
+            .iter()
+            .any(|d| d.contains("certificate verification successful") && d.contains(VERIFY_CMD)),
+        "detail: {:?}",
+        st.detail
+    );
+
+    // Absent: not trusted, and no verify-cert run.
+    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &other_output(), "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Absent);
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
+
+    // Present + verify-cert unspawnable: unknown, with the failure text.
+    let exec = ScriptedExecutor::new().unspawnable("verify-cert").respond(
+        Q_USER,
+        0,
+        &present_output(),
+        "",
+    );
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Present);
+    assert_eq!(st.trusted, Trust::Unknown);
+    assert!(
+        st.detail.iter().any(|d| d.contains(VERIFY_SPAWN_FAILURE)),
+        "detail: {:?}",
+        st.detail
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_CMD.to_string()]
+    );
+    assert!(st.detail.iter().any(|d| d.contains(MACOS_DETAIL)));
+}
+
+// SP-AC32 (D17.4): a dismissed authentication dialog is `Cancelled`, calm,
+// and still rolls back the untrusted copy.
+#[test]
+fn install_cancelled_is_calm_and_rolls_back() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, "", "")
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(&add_user(), 1, "", CANCEL_STDERR);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not \
+         trusted; removed the untrusted copy it left behind"
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            add_user(),
+            Q_USER.to_string(),
+            del_user(&fp256_hex()),
+        ]
+    );
+
+    // Nothing left behind: the message is the bare literal.
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", CANCEL_STDERR);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted"
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), add_user(), Q_USER.to_string()]
+    );
+
+    // The headless text is still HeadlessAuth, not Cancelled.
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", HEADLESS_STDERR);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::HeadlessAuth);
 }
 
 // CA-AC9
@@ -155,12 +302,21 @@ fn install_user_idempotent() {
     assert_eq!(change.location, K_USER);
     assert_eq!(change.commands, exec.runs());
 
-    // Present: the query alone, nothing added.
-    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), "");
+    // Present and trusted: the query and the read-back, nothing added.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
     let change = store.install(&cert, Scope::User, &exec).unwrap();
-    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_CMD.to_string()]
+    );
     assert!(!change.changed);
     assert_eq!(change.location, K_USER);
+    assert_eq!(
+        change.detail,
+        vec![format!("already present and trusted in {K_USER}")]
+    );
 }
 
 // CA-AC10
@@ -553,37 +709,479 @@ fn store_model_surface() {
     assert_eq!(kind_of(&as_anyhow), TrustErrorKind::NeedsRoot);
 }
 
-/// Audit minor e — a present certificate's trust is reported as `Unknown`
-/// (macOS has no reliable CLI trust check), but the `detail` now says so
-/// explicitly: present yet UNCONFIRMED, with how to confirm it. An absent
-/// certificate carries no such claim.
+/// Every status answer names what ran for presence and what ran for trust
+/// (spec D17.3), present or absent, and nothing else when the read-back
+/// succeeded.
 #[test]
-fn status_present_detail_names_unconfirmed_trust() {
+fn status_present_detail_names_the_trust_check() {
     let cert = fixture_cert();
     let store = MacOsStore;
 
-    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), "");
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Present);
-    assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(st.trusted, Trust::Yes);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
     assert!(
-        st.detail.iter().any(|d| d.contains("UNCONFIRMED")),
-        "present status must name the unconfirmed trust: {:?}",
-        st.detail
-    );
-    assert!(
-        st.detail.iter().any(|d| d.contains(MACOS_DETAIL)),
-        "detail: {:?}",
+        !st.detail.iter().any(|d| d.contains("UNCONFIRMED")),
+        "the old unconfirmed claim is gone: {:?}",
         st.detail
     );
 
-    // Absent: no "present but unconfirmed" claim.
+    // Absent: the same line, no trust evaluation ran.
     let exec = ScriptedExecutor::new().respond(Q_USER, 0, &other_output(), "");
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Absent);
-    assert!(
-        !st.detail.iter().any(|d| d.contains("UNCONFIRMED")),
-        "absent status must not claim an unconfirmed present cert: {:?}",
-        st.detail
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
+    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Stage-5 tester additions (Task 34, spec D17.3 / D17.4): the parser's edges.
+// ---------------------------------------------------------------------------
+
+/// System-scope add as a non-root operator renders it.
+fn add_sys() -> String {
+    format!(
+        "sudo -- security add-trusted-cert -d -r trustRoot -p ssl -p basic -k {K_SYS} /ca/ca.crt"
+    )
+}
+
+fn del_sys(hash: &str) -> String {
+    format!("sudo -- security delete-certificate -Z {hash} {K_SYS}")
+}
+
+// SP-AC31 (tester): `verify-cert` output that is malformed, empty, noisy or
+// contradictory never yields `Yes` by accident, and the detail tail is the
+// exact last-five-lines rendering.
+#[test]
+fn status_verify_cert_output_edges() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+
+    // Exit 1 with the success phrase on stdout: the exit code wins.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 1, VERIFY_OK, "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!("`{VERIFY_CMD}` exited 1: {VERIFY_OK}")
+        ]
+    );
+
+    // Exit 0 with the phrase buried in noise: still Yes (substring match).
+    let noisy = format!("warning: legacy keychain\n\n{VERIFY_OK}\n  trailing  \n");
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, &noisy, "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::Yes);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
+
+    // Exit 0 with the phrase only on stderr: not a success (stdout is the
+    // channel the literal was quoted from).
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, "", VERIFY_OK);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!(
+                "`{VERIFY_CMD}` exited 0 without \"certificate verification successful\" in its output"
+            )
+        ]
+    );
+
+    // Exit 1 with nothing on either stream: the bare exit line.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 1, "", "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![MACOS_DETAIL.to_string(), format!("`{VERIFY_CMD}` exited 1")]
+    );
+
+    // Oversized output: only the last five non-empty lines, stdout before
+    // stderr, trimmed and joined with " | ".
+    let stdout = "s1\n\n  s2  \ns3\ns4\n";
+    let stderr = "\ne1\ne2\n   \ne3\n";
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 2, stdout, stderr);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!("`{VERIFY_CMD}` exited 2: s3 | s4 | e1 | e2 | e3")
+        ]
+    );
+
+    // A very large stderr (a tool dump) never lands whole in detail.
+    let dump: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 1, "", &dump);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail[1],
+        format!(
+            "`{VERIFY_CMD}` exited 1: line 9995 | line 9996 | line 9997 | line 9998 | line 9999"
+        )
+    );
+
+    // Unknown presence (find-certificate itself failed): no verify run, and
+    // the trust stays Unknown rather than defaulting to No.
+    let not_found =
+        "security: SecKeychainSearchCopyNext: The specified keychain could not be found.";
+    let exec = ScriptedExecutor::new().respond(Q_USER, 1, "", not_found);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Unknown);
+    assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
+    assert_eq!(
+        st.detail,
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!("`{Q_USER}` exited 1: {not_found}")
+        ]
+    );
+}
+
+// SP-AC32 (tester): the cancel marker is case-insensitive and spelled either
+// way, headless text takes precedence over it, an unrelated failure is
+// `ToolFailed`, and a failed rollback appends the "may remain" suffix.
+#[test]
+fn install_cancelled_marker_edges() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+    let bare = "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted";
+
+    for stderr in [
+        "User CANCELED the operation.",
+        "SecTrustSettingsSetTrustSettings: The authorization was cancelled by the user.",
+        "error: Cancel\n",
+    ] {
+        let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", stderr);
+        let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+        assert_eq!(
+            kind_of(&err),
+            TrustErrorKind::Cancelled,
+            "stderr: {stderr:?}"
+        );
+        assert_eq!(err.to_string(), bare, "stderr: {stderr:?}");
+        // The raw tool text never leaks into the calm message.
+        assert!(!err.to_string().contains("CANCELED"), "{err}");
+    }
+
+    // Both markers present: headless wins (the SSH case must keep its hint).
+    let both = format!("{HEADLESS_STDERR}; the request was canceled");
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", &both);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::HeadlessAuth);
+    assert!(err.to_string().contains("GUI session"), "{err}");
+
+    // "cancel" on stdout only is not the dialog: stderr is the channel.
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "canceled", "");
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+
+    // An unrelated failure, and an empty one, stay ToolFailed with the tool
+    // text.
+    let exec = ScriptedExecutor::new().respond(
+        &add_user(),
+        1,
+        "",
+        "security: SecTrustSettingsSetTrustSettings: One or more parameters passed to a function were not valid.",
+    );
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+    assert!(err.to_string().contains("were not valid"), "got: {err}");
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", "");
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+    assert_eq!(err.to_string(), format!("`{}` exited 1", add_user()));
+
+    // Cancelled, copy left behind, rollback itself fails on both hashes:
+    // the other suffix.
+    let not_found =
+        "security: SecKeychainItemDelete: The specified item could not be found in the keychain.";
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, "", "")
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(&add_user(), 1, "", CANCEL_STDERR)
+        .respond(&del_user(&fp256_hex()), 1, "", not_found)
+        .respond(&del_user(&fp1_hex().to_lowercase()), 1, "", not_found);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        format!("{bare}; an untrusted copy may remain in the keychain")
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            add_user(),
+            Q_USER.to_string(),
+            del_user(&fp256_hex()),
+            del_user(&fp1_hex().to_lowercase()),
+        ]
+    );
+}
+
+// SP-AC32 (tester, System scope): the same classification applies to the
+// `sudo` path, and the rollback uses the System keychain through `sudo`.
+#[test]
+fn install_cancelled_system_scope_rolls_back_through_sudo() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+    let sys_present = present_output().replace(K_USER, K_SYS);
+
+    let exec = ScriptedExecutor::new()
+        .root(false)
+        .respond(Q_SYS, 0, "", "")
+        .respond(Q_SYS, 0, &sys_present, "")
+        .respond(&add_sys(), 1, "", CANCEL_STDERR);
+    let err = store.install(&cert, Scope::System, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not \
+         trusted; removed the untrusted copy it left behind"
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_SYS.to_string(),
+            add_sys(),
+            Q_SYS.to_string(),
+            del_sys(&fp256_hex()),
+        ]
+    );
+}
+
+// Plan correction 8, spec D17.3: `install` on a present certificate reads
+// trust back; an untrusted copy is replaced, a trusted one is left alone, and
+// an unreadable one is reported present as before.
+#[test]
+fn install_present_reads_trust_back_and_replaces_an_untrusted_copy() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+    let del = del_user(&fp256_hex());
+
+    // Present, verify-cert says No: delete the copy, then the normal add.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 1, "", NOT_TRUSTED);
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(change.changed);
+    assert_eq!(change.location, K_USER);
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_CMD.to_string(),
+            del.clone(),
+            add_user(),
+        ]
+    );
+    assert_eq!(change.commands, exec.runs());
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("replaced the untrusted copy in {K_USER}"),
+            format!("added to {K_USER} as a trusted root for ssl and basic"),
+        ]
+    );
+
+    // Present, verify-cert says Yes: nothing changes (the idempotent case).
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 0, VERIFY_OK, "");
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(!change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_CMD.to_string()]
+    );
+    assert_eq!(
+        change.detail,
+        vec![format!("already present and trusted in {K_USER}")]
+    );
+
+    // Present, verify-cert cannot run: present as before, with the failure.
+    let exec = ScriptedExecutor::new().unspawnable("verify-cert").respond(
+        Q_USER,
+        0,
+        &present_output(),
+        "",
+    );
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(!change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_CMD.to_string()]
+    );
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("already present in {K_USER}"),
+            VERIFY_SPAWN_FAILURE.to_string()
+        ]
+    );
+
+    // Untrusted, the dialog is dismissed on the re-add, the copy is back:
+    // the same classification and rollback as a first install.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 1, "", NOT_TRUSTED)
+        .respond(&add_user(), 1, "", CANCEL_STDERR);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not \
+         trusted; removed the untrusted copy it left behind"
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_CMD.to_string(),
+            del.clone(),
+            add_user(),
+            Q_USER.to_string(),
+            del.clone(),
+        ]
+    );
+
+    // Older macOS keys the keychain on SHA-1: the listing has no SHA-256
+    // line and the SHA-256 delete misses, so the SHA-1 delete runs (as in
+    // `uninstall`) and the re-add proceeds.
+    let sha1_only = format!("SHA-1 hash: {}\nkeychain: \"{K_USER}\"\n", fp1_hex());
+    let del1 = del_user(&fp1_hex().to_lowercase());
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &sha1_only, "")
+        .respond(VERIFY_CMD, 1, "", NOT_TRUSTED)
+        .respond(
+            &del,
+            1,
+            "",
+            "security: SecKeychainItemDelete: The specified item could not be found in the keychain.",
+        );
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_CMD.to_string(),
+            del.clone(),
+            del1.clone(),
+            add_user(),
+        ]
+    );
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("replaced the untrusted copy in {K_USER}"),
+            format!("added to {K_USER} as a trusted root for ssl and basic"),
+        ]
+    );
+
+    // Untrusted and both deletes fail: stop before adding a second copy,
+    // and name both attempts (the SHA-1 miss must not hide the real reason).
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_CMD, 1, "", NOT_TRUSTED)
+        .respond(
+            &del,
+            1,
+            "",
+            "security: SecKeychainItemDelete: User interaction is not allowed.",
+        )
+        .respond(
+            &del1,
+            1,
+            "",
+            "security: SecKeychainItemDelete: The specified item could not be found in the keychain.",
+        );
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "could not remove the untrusted copy from {K_USER}: `{del}` exited 1: security: \
+             SecKeychainItemDelete: User interaction is not allowed.; `{del1}` exited 1: \
+             security: SecKeychainItemDelete: The specified item could not be found in the \
+             keychain."
+        )
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_CMD.to_string(),
+            del.clone(),
+            del1.clone()
+        ]
+    );
+
+    // System scope: the delete and the add both go through sudo.
+    let sys_present = present_output().replace(K_USER, K_SYS);
+    let exec = ScriptedExecutor::new()
+        .root(false)
+        .respond(Q_SYS, 0, &sys_present, "")
+        .respond(VERIFY_CMD, 1, "", NOT_TRUSTED);
+    let change = store.install(&cert, Scope::System, &exec).unwrap();
+    assert!(change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_SYS.to_string(),
+            VERIFY_CMD.to_string(),
+            del_sys(&fp256_hex()),
+            add_sys(),
+        ]
+    );
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("replaced the untrusted copy in {K_SYS}"),
+            format!("added to {K_SYS} as a trusted root for ssl and basic"),
+        ]
+    );
+}
+
+// The kind's audit/WARN word has one home (spec D17.4 for `cancelled`).
+#[test]
+fn trust_error_kind_labels() {
+    assert_eq!(TrustErrorKind::Cancelled.label(), "cancelled");
+    assert_eq!(TrustErrorKind::HeadlessAuth.label(), "HeadlessAuth");
+    assert_eq!(TrustErrorKind::NeedsRoot.label(), "NeedsRoot");
+    assert_eq!(TrustErrorKind::UnsupportedScope.label(), "UnsupportedScope");
+    assert_eq!(TrustErrorKind::ToolFailed.label(), "ToolFailed");
+    assert_eq!(TrustErrorKind::ToolMissing.label(), "ToolMissing");
+    assert_eq!(TrustErrorKind::Timeout.label(), "Timeout");
+    assert_eq!(TrustErrorKind::CopiesRemain.label(), "CopiesRemain");
+    assert_eq!(TrustErrorKind::NoCertificate.label(), "NoCertificate");
+    assert_eq!(
+        TrustErrorKind::UnsupportedPlatform.label(),
+        "UnsupportedPlatform"
     );
 }

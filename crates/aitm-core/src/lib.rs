@@ -39,7 +39,7 @@ pub use audit::{
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;
-pub use client::{PipelineClient, RequestSender};
+pub use client::{PipelineClient, RecordPolicy, RequestSender, SendOptions, VersionPolicy};
 pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,

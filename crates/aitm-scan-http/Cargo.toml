@@ -1,0 +1,16 @@
+[package]
+name = "aitm-scan-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scanner v2 HTTP lane (track T2): discovery, insertion points and payload placement over HTTP. Skeleton slot handed over at T1a."
+
+[dependencies]
+# The `Lane` trait this crate's `lane()` slot returns, plus the shared scanner
+# vocabulary. The model is pure data and traits, so a lane crate depends on it
+# without pulling in the scanner engine (spec D1).
+aitm-scan-model.workspace = true
+
+[lints]
+workspace = true

@@ -455,8 +455,12 @@ impl Plugin for L4Module {
         // `add_runtime_scope` enforces, so an operator toggle is one live source of truth.
         let gates = self.guard.agent_gates();
         // The pure/read verbs (`l4.interfaces`, `l4.scope.*`, `l4.flow.*`, `l4.craft`)
-        // work regardless of privilege — never privilege-gated. `l4.scope.add`'s widen
-        // gate lives in the guard (`add_runtime_scope`), so these are unwrapped.
+        // work regardless of privilege — never privilege-gated, so these are
+        // unwrapped. `l4.scope.add` needs no wrapper either: its widen gate lives in
+        // the guard (`add_runtime_scope`), applies to untrusted and script/PoC
+        // callers, and is skipped by a confirmed operator or CLI call
+        // (`add_operator_scope`); both paths force `source = Runtime` via
+        // `push_runtime`.
         for cmd in crate::commands::active_commands(self.guard(), self.store()) {
             reg.add_command(cmd);
         }

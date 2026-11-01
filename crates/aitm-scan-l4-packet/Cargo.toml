@@ -1,0 +1,17 @@
+[package]
+name = "aitm-scan-l4-packet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scanner v2 L4 packet lane (track T5): packet-level discovery and checks behind the deny-by-default L4 guard. Skeleton slot handed over at T1a."
+
+[dependencies]
+# The L4 handles `wire.rs` passes from `Features::l4_shared`: the deny-by-default
+# `L4Guard` and the `L4FlowStore`. Both are `None` when L4 is disabled (call A18).
+aitm-proto-l4.workspace = true
+# The `Lane` trait this crate's `lane()` slot returns.
+aitm-scan-model.workspace = true
+
+[lints]
+workspace = true

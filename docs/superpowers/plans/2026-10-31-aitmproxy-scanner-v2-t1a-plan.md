@@ -105,7 +105,7 @@ Shared facts for every coder:
      `pub type NodeId = String; pub type JobId = String; pub type IssueId = String;`.
   5. `vocab.rs`, every enum `Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize`,
      snake_case tokens exactly as spec D2:
-     `LaneKind { Http, Ws, L4Packet, L4Stream }` (tokens `http|ws|l4_packet|l4_stream`; the
+     `LaneKind { Http, Ws, L4Packet, L4Stream }` (derives `PartialOrd, Ord` too, so it can key `ProbeCounters.by_lane`; tokens `http|ws|l4_packet|l4_stream`; the
      **enum** is `LaneKind` because `Lane` is the trait, Architect's call A1);
      `Intensity { Passive, Light, Medium, Intrusive }` plus `PartialOrd, Ord` in that order;
      `Speed { Fast, Normal, Thorough }`; `Accuracy { FewerFalseNegatives, Normal, FewerFalsePositives }`;
@@ -123,9 +123,9 @@ Shared facts for every coder:
      `CrawlStrategy { Fast, Normal, Thorough }`; `UseBrowser { Auto, Always, Never }`;
      `SessionMode { Observed, None }`; `OnLost { Stop, Continue }`;
      `PayloadMode { Replace, Prefix, Suffix }`;
-     `ScanErrorCode` with exactly the eleven D3 codes (`NotFound, Busy, OutOfScope, RefusedAgent,
-     RefusedL4, LaneUnavailable, InvalidProfile, UnknownCheck, ConfirmRequired, Cancelled,
-     Clamped`; `h2_not_negotiated` is a sender error, not a verb error code, and is not here),
+     `ScanErrorCode` with exactly the nine D3 codes (`NotFound, Busy, OutOfScope, RefusedAgent,
+     RefusedL4, LaneUnavailable, InvalidProfile, UnknownCheck, ConfirmRequired`; clamping and
+     cancellation are not errors; `h2_not_negotiated` is a sender error, not a verb error code, and is not here),
      `pub fn as_str(&self) -> &'static str`, `impl FromStr`, and
      `pub fn parse_message(msg: &str) -> Option<(ScanErrorCode, &str)>` for the
      `scan: <code>: <message>` form.
@@ -487,7 +487,7 @@ Shared facts for every coder:
 - **Depends on:** Tasks 4, 5, 6.
 - **Files:** `crates/aitm-scan-model/src/results.rs` (replace placeholder).
 - **Change:** result types (`#[serde(default)]` where a field is optional; tolerant of unknown keys):
-  `StartResult { job: JobId, status: JobStatus, clamped: Vec<Clamped>, lanes: LaneReport }` (`scan.start`, `scan.map`);
+  `StartResult { job: JobId, status: JobStatus, clamped: Vec<Clamped>, lanes: LaneReport, dry_run: Option<bool> }` (`scan.start`, `scan.map`; `dry_run` is `skip_serializing_if = None` and set only for profiles with an L4 lane, spec D3/D8.4);
   `ListResult { jobs: Vec<JobSummary> }`; `IssuesResult { issues: Vec<IssueSummary>, next_cursor: Option<String>, by_severity: BySeverity }`;
   `SitemapResult { nodes: Vec<SiteNode>, points: Vec<InsertionPoint>, next_cursor: Option<String> }`;
   `ChecksResult { checks: Vec<CheckMeta> }`;
@@ -638,7 +638,7 @@ Shared facts for every coder:
   existing plugin tests still pass unchanged (the registry still exposes exactly `scan.discover`,
   `scan.passive`, `scan.report`).
 - **Done when:** `cargo test -p aitm --lib --offline wire` and `cargo test -p aitm-plugin-scanner --offline`
-  pass in the sandbox; `cargo tree -p aitm --offline -e normal | grep -c 'aitm-scan-'` prints `6`
+  pass in the sandbox; `cargo tree -p aitm --offline -e normal --depth 1 | grep -c 'aitm-scan-'` prints `6` (without `--depth 1` it prints 12, because each lane crate re-lists the model crate)
   (quoted); the full gate passes in the Terminal (port-binding tests).
 
 ### Task 12: integration: merge `origin/main`, gate, real boot proof
@@ -690,7 +690,10 @@ Shared facts for every coder:
 | 9 | `crates/aitm-scan-model/fixtures/**`, `crates/aitm-scan-model/tests/fixtures.rs` |
 | 10 | `Cargo.toml` (root, after Task 1), `crates/aitm-scan-{http,checks-http,ws,l4-packet,l4-stream}/**` |
 | 11 | `crates/aitm/{Cargo.toml, src/wire.rs, src/main.rs}`, `crates/aitm-plugin-scanner/{Cargo.toml, src/plugin.rs}` |
-| 12 | none (merge + proof) |
+| 12 | none (merge + proof); may regenerate `Cargo.lock` after the merge |
+| fix round (panel) | `crates/aitm-proto-l4/src/{guard.rs, capture.rs, commands/mod.rs}`, `crates/aitm/src/scripts.rs`, `crates/aitm-scan-model/src/{point.rs, profile.rs, issue.rs, job.rs, lib.rs, session.rs, vocab.rs}`, `crates/aitm-scan-model/tests/builtin_profiles.rs`, `crates/aitm-scan-model/fixtures/{README.md, scan.checks.json}`, `Cargo.toml` (comment) |
+
+`Cargo.lock` is a derived file: Tasks 1, 10 and 11 regenerate it as a mechanical consequence of their manifest edits (new members and dependency edges only; no external crate enters it in T1a), and Task 12 regenerates it after merging `origin/main`.
 
 Within a wave no two tasks share a file. The root `Cargo.toml` is edited by Task 1 (wave 1)
 and Task 10 (wave 4), sequentially.
@@ -756,6 +759,36 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1-11 | Tester | Important | `Cargo.lock` pinned the six new crates at 0.5.5 after the v0.5.6 merge | fixed in 8574223f |
+| 1 | Tester | Minor | `ScanErrorCode` carried eleven codes (`Cancelled`, `Clamped`) vs spec D3's nine | fixed in 2a3cf99b (plan text 15b14494) |
+| 11 | Tester | Minor | No hermetic test for the `main.rs` ws-language slot (binary-only wiring) | accepted by orchestrator 2026-10-31: covered by `skeleton_returns_none`, `wire::tests::skeleton_lane_slots_are_empty_today`, the real-boot proof, and T4's live cells |
+| 4 | Tester | Info | An empty profile document parses to `ScanProfile::default()` | accepted by orchestrator 2026-10-31: pinned by test; T1b refuses nameless/targetless profiles (`invalid_profile`) |
+| 3 | Security | Minor | `scope_filter` and `covering_scope_entry` compared `interface` literally and missed `"*"` entries | fixed in 801c63f3 (`interface_covers` helper used by all three callers) |
+| 2 | Security | Minor | `LateHandles` did not forward `send_opts`, so `record: Never`/`marks` were dropped through it | fixed in 801c63f3 |
+| 5 | Security | Minor | Derived `Debug` on `Payload`/`RawProbe`/`ProbeResponse`/`Frame` would print live session header values | fixed in 801c63f3 (redacting `Debug`); follow-up accepted 2026-10-31: `RawProbe.url` still prints verbatim and `L4Reply` keeps derived `Debug`; T2 redacts the query before any log line, T5 gives `L4Reply` a redacting `Debug` |
+| - | Security | n/a | `cargo audit` not runnable in the sandbox | orchestrator: run in the Terminal before integration; no external crate entered `Cargo.lock` in T1a |
+| 4 | Quality | Minor | `L4Seed` untagged enum errors could not name a mistyped key | fixed in 2019feef (`try_from = "L4SeedRaw"`) |
+| 3 | Quality | Minor | Interface-match rule duplicated between guard and capture | fixed in 801c63f3 (same helper as the Security finding) |
+| 1 | Quality | Minor | `ScanErrorCode` tokens hand-maintained in three places; `FromStr::Err = anyhow` | accepted by orchestrator 2026-10-31: the agreement test pins the three tables; a single token table and a unit error type go to T1b, the next writer of `vocab.rs` |
+| 6 | Quality | Minor | `Issue`/`IssueSummary` and `JobStatus`/`JobSummary` duplicate fields by hand | fixed in 2019feef (structural subset tests); flattening deferred to T1b |
+| 5 | Quality | Minor | `FrameKind` not comparable | fixed in 801c63f3 (`Copy, PartialEq, Eq, Hash`) |
+| 11 | Quality | Minor | `main.rs` language wiring is a copy-paste block per language | accepted by orchestrator 2026-10-31: style; refactor when a third language lands (T5/T6) |
+| 7, 11 | Quality | Minor | Null `Lane`/`Check`/`JobCtx`/`ProbeHost` stubs duplicated across crates | accepted by orchestrator 2026-10-31: a `testing` module in `aitm-scan-model` is T1b's first task as the next consumer |
+| 1, 6, 9 | Quality | Minor | Stale doc comments (`#[allow(unused_imports)]`, `Clamped.field`, fixture README generator, `SessionProfile` rename) | fixed in 2019feef |
+| 4 | Quality | Minor | `builtin_profiles()` restates two defaults | accepted by orchestrator 2026-10-31: explicit values keep the spec's "dry_run off" / "cases 500" visible |
+| 1, 10, 11 | Spec | Minor | `Cargo.lock` edited but declared by no task | fixed in 6ada1233 (ownership matrix: derived file) |
+| 2 | Spec | Minor | Spec D9.1/D12 attributed the `PipelineClient::send_opts` impl to T1b | fixed in 6ada1233 (spec D9.1 and D12 rows) |
+| 11 | Spec | Minor | D12 T1a row lacked the `aitm-plugin-scanner` setter exception | fixed in 6ada1233 |
+| 8 | Spec | Minor | Plan Task 8 omitted `StartResult.dry_run`; no fixture note | fixed in 6ada1233 (plan) and 2019feef (README note) |
+| 1 | Spec | Minor | `LaneKind` L4 doc comments misdescribed the two lanes | fixed in 2019feef |
+| 1 | Spec | Minor | `blake3` dependency comment named the wrong purpose | fixed in 2019feef |
+| 9 | Spec | Minor | Two `scan.checks.json` entries reused XSS metadata | fixed in 2019feef |
+| fix round | Security (re-review `15b14494..1af619fe`) | - | S1-S3 confirmed closed, no regression; asked that `L4Reply` get the redacting `Debug` now | fixed in a953b9e3; `RawProbe.url` query redaction stays with T2 (pin test required there) |
+| fix round | Quality (re-review) | Minor | Redundant `#[serde(default)]` on `L4SeedRaw`; eager key-name list | fixed in a953b9e3 |
+| fix round | Quality (re-review) | Minor | `get_ex_test()` helper not reused in one test | fixed in a953b9e3 |
+| fix round | Quality (re-review) | Minor | `interface_covers` called by path in `commands/mod.rs` | fixed in a953b9e3 |
+| fix round | Spec (re-review) | Minor | D9.1 paragraph placed the D9.1 types in `ctx.rs` | fixed in the docs commit that carries this row |
+| fix round | Spec (re-review) | Minor | D12 T1a cell missed `wire.rs`/`main.rs`/`types.rs`/`config.rs`; plan matrix lacked the fix-round files | fixed in the docs commit that carries this row |
 
 ## Shipped
 
