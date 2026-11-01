@@ -12,10 +12,18 @@
 //! - **The source is the capture, not a reconstruction.** The request comes
 //!   from the store by the point's `flow` id; a point whose flow is gone is an
 //!   error rather than a probe against a guessed URL.
-//! - **The session is applied once.** [`session::apply_session`] runs in
-//!   [`HttpProbeHost::new`], so every probe, the baseline and every raw probe
-//!   carry the job's session (spec **D7**, AC T2-4) and a `cookie`-kind probe
-//!   that deliberately mutates a session cookie is not overwritten later.
+//! - **The session is settled once.** Under `session.mode: observed`
+//!   [`session::apply_session`] runs in [`HttpProbeHost::new`], so every probe,
+//!   the baseline and every raw probe carry the job's session (spec **D7**,
+//!   AC T2-4) and a `cookie`-kind probe that deliberately mutates a session
+//!   cookie is not overwritten later.
+//! - **`session.mode: none` means unauthenticated.** A capture taken while the
+//!   operator was logged in carries the operator's own session, so under that
+//!   mode [`strip_session_headers`] takes `Cookie`, `Authorization` and every
+//!   header [`redact::is_secret_name`] knows off the source request at
+//!   construction, no material is merged, and a raw probe's own copies of those
+//!   headers are dropped too: a job that must scan unauthenticated cannot
+//!   re-authenticate itself through any path (AC T2-4).
 //! - **Every send is bounded.** `min(deadline - now, MAX_AWAIT)`, where the
 //!   host's deadline is itself `min(job deadline, now + check_timeout_s)`, so a
 //!   check cannot outlive its slice of the job (AC T2-6).
@@ -101,9 +109,18 @@ impl HttpProbeHost {
             return Err(anyhow!("scan: source flow {flow_ref} is gone"));
         };
 
+        let profile = job.profile().clone();
         let mut source = flow.request;
-        if let Some(material) = job.session() {
-            session::apply_session(&mut source, &material);
+        match profile.session.mode {
+            // The capture may itself be authenticated; an unauthenticated job
+            // sheds that here, before the baseline exists, so no later path
+            // can put it back (AC T2-4).
+            SessionMode::None => strip_session_headers(&mut source),
+            SessionMode::Observed => {
+                if let Some(material) = job.session() {
+                    session::apply_session(&mut source, &material);
+                }
+            }
         }
         let Some(origin) = url_norm::request_url(&source) else {
             return Err(anyhow!(
@@ -111,7 +128,6 @@ impl HttpProbeHost {
             ));
         };
 
-        let profile = job.profile().clone();
         Ok(Self {
             source,
             point: point.clone(),
@@ -258,6 +274,11 @@ impl HttpProbeHost {
             if name.eq_ignore_ascii_case("host") {
                 continue;
             }
+            // A check that hands `probe_raw` a session header does not get to
+            // authenticate a job whose profile says `session.mode: none`.
+            if self.unauthenticated() && is_session_header(name) {
+                continue;
+            }
             // `HeaderError`'s `Display` prints the value it rejected, so it is
             // dropped and the name alone names the problem.
             headers
@@ -284,10 +305,48 @@ impl HttpProbeHost {
             body,
             timestamp: SystemTime::now(),
         };
-        if let Some(material) = self.job.session() {
-            session::apply_session(&mut req, &material);
+        if !self.unauthenticated() {
+            if let Some(material) = self.job.session() {
+                session::apply_session(&mut req, &material);
+            }
         }
         Ok(req)
+    }
+
+    /// Whether the job's profile says scan unauthenticated
+    /// (`session.mode: none`).
+    fn unauthenticated(&self) -> bool {
+        self.profile.session.mode == SessionMode::None
+    }
+}
+
+/// Whether `name` is a header a session rides in: `Cookie`, `Authorization`,
+/// or any name the shared secret vocabulary recognises (`X-Api-Key`,
+/// `X-CSRF-Token`, …).
+///
+/// The first two are named outright rather than left to the vocabulary: they
+/// are the two headers the spec calls out (D7), and naming them keeps this
+/// decision readable without reading another crate.
+fn is_session_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("authorization")
+        || redact::is_secret_name(name)
+}
+
+/// Take every [`is_session_header`] header off `req`.
+///
+/// Names are collected before anything is removed: `HeaderMap::remove` takes
+/// a name, so mutating while iterating is not possible, and a request may
+/// legally carry the same header twice (`remove` drops both).
+fn strip_session_headers(req: &mut HttpRequest) {
+    let doomed: Vec<String> = req
+        .headers
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .filter(|name| is_session_header(name))
+        .collect();
+    for name in doomed {
+        req.headers.remove(&name);
     }
 }
 
@@ -1100,5 +1159,140 @@ mod tests {
         assert_eq!(req.headers.get("content-length"), Some("3"));
         assert!(matches!(&req.body, aitm_core::Body::Bytes(bytes) if bytes == b"abc"));
         assert!(req.headers.get("cookie").unwrap().contains("sid=S3"));
+    }
+
+    // --- N1: `session.mode: none` means unauthenticated (AC T2-4) ----------
+
+    /// A capture taken while the operator was logged in: its own session rides
+    /// in a `Cookie`, an `Authorization` and a secret-named header, and the
+    /// job's observed material repeats the session cookie.
+    fn authed_capture() -> HttpRequest {
+        request(
+            "GET",
+            "http://t:8080/account?tab=overview",
+            &[
+                ("cookie", "session=abc; theme=dark"),
+                ("authorization", "Bearer tok"),
+                ("x-api-key", "tok"),
+            ],
+            None,
+        )
+    }
+
+    /// A fixture over a caller-supplied capture, pointed at its `tab` query
+    /// parameter, with the capture's own session cookie as the job's material.
+    fn fixture_capture(profile: ScanProfile, source: HttpRequest) -> Fixture {
+        let store = Arc::new(MemFlowStore::new());
+        let client = Arc::new(ok_200().recording_into(Arc::clone(&store) as Arc<dyn FlowStore>));
+        let flow = captured_flow(source, 200, &[("content-type", "text/html")], b"hi");
+        let flow_id = flow.id;
+        store.insert(Flow::Http(flow));
+
+        let mut job = FakeJob::new(profile, Arc::clone(&client))
+            .with_store(Arc::clone(&store))
+            .with_session(SessionMaterial {
+                cookies: vec![("session".to_string(), "abc".to_string())],
+                headers: Vec::new(),
+            });
+        job.deadline = Instant::now() + Duration::from_secs(60);
+
+        let mut point = query_point(FlowRef(flow_id));
+        point.name = "tab".to_string();
+        Fixture {
+            job: Arc::new(job),
+            client,
+            store,
+            point,
+        }
+    }
+
+    /// A profile that scans unauthenticated.
+    fn mode_none() -> ScanProfile {
+        let mut profile = ScanProfile::default();
+        profile.session.mode = SessionMode::None;
+        profile
+    }
+
+    /// Under `session.mode: none` the capture's own session goes once, at
+    /// construction, so the baseline, every probe and every raw probe leave
+    /// unauthenticated — including the session headers a check handed to
+    /// `probe_raw` itself (AC T2-4).
+    #[tokio::test]
+    async fn session_mode_none_strips_the_captures_own_session() {
+        let fx = fixture_capture(mode_none(), authed_capture());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        host.baseline().await.unwrap();
+        host.probe(&replace("x")).await.unwrap();
+        host.probe_raw(RawProbe {
+            method: "GET".to_string(),
+            url: "http://t:8080/account".to_string(),
+            headers: vec![
+                ("Cookie".to_string(), "session=abc".to_string()),
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+                ("X-Api-Key".to_string(), "tok".to_string()),
+                ("X-Extra".to_string(), "yes".to_string()),
+            ],
+            body: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let sent = fx.sent();
+        assert_eq!(sent.len(), 3);
+        for (what, (req, _)) in ["baseline", "probe", "probe_raw"].iter().zip(sent.iter()) {
+            assert_eq!(req.headers.get("cookie"), None, "{what} sent a cookie");
+            assert_eq!(
+                req.headers.get("authorization"),
+                None,
+                "{what} sent an authorization header"
+            );
+            assert_eq!(
+                req.headers.get("x-api-key"),
+                None,
+                "{what} sent a secret-named header"
+            );
+        }
+
+        // Only the session goes: the capture and the raw probe keep the rest.
+        assert_eq!(sent[0].0.path, "/account?tab=overview");
+        assert_eq!(sent[0].0.headers.get("host"), Some("t:8080"));
+        assert_eq!(sent[1].0.path, "/account?tab=x");
+        assert_eq!(sent[2].0.headers.get("x-extra"), Some("yes"));
+
+        // And no value of the stripped session reaches an error (AC T2-6).
+        let refused = host
+            .probe_raw(RawProbe {
+                method: "GET".to_string(),
+                url: "http://evil.test/in?session=abc&auth=tok".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("another origin is refused");
+        let text = format!("{refused:#}");
+        for secret in ["abc", "tok"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    /// `mode: observed` is unchanged: the capture's own session rides and the
+    /// job's material only fills the gaps (spec D7).
+    #[tokio::test]
+    async fn session_mode_observed_keeps_the_captures_own_session() {
+        let fx = fixture_capture(ScanProfile::default(), authed_capture());
+        assert_eq!(fx.job.profile().session.mode, SessionMode::Observed);
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        host.baseline().await.unwrap();
+
+        let sent = fx.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].0.headers.get("cookie"),
+            Some("session=abc; theme=dark")
+        );
+        assert_eq!(sent[0].0.headers.get("authorization"), Some("Bearer tok"));
+        assert_eq!(sent[0].0.headers.get("x-api-key"), Some("tok"));
     }
 }
