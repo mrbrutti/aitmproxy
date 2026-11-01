@@ -424,7 +424,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| T1 | Tester, pass 1 (aitm-term) | Minor | F2: `Caps::from_parts(_, Some(0), ..)` yields `width: 0`; only `detect_stderr` filters a zero measurement, so the pure API must apply `w > 0` itself (fall back to 80) and a test must pin `from_parts(true, Some(0), ..).width == 80` | open — T1 fix task |
+| T1 | Tester, pass 1 (aitm-term) | Minor | F2: `Caps::from_parts(_, Some(0), ..)` yields `width: 0`; only `detect_stderr` filters a zero measurement, so the pure API must apply `w > 0` itself (fall back to 80) and a test must pin `from_parts(true, Some(0), ..).width == 80` | fixed in 483cd989 (from_parts filters w > 0; test caps_treats_a_zero_width_as_unknown) |
 | T1 | Tester, pass 1 (aitm-term) | — | F1: AC-W1-11's `CLICOLOR_FORCE=1 aitm 2>file` clause contradicted D4 (no escape byte on a non-TTY stream); the renderer follows D4 | resolved as a spec amendment 2026-11-01 (AC-W1-11 rewritten to TTY-only observables; D2 rule 7 and T2 sentence added; T14 §14 updated) — no code change |
 
 ## Shipped
