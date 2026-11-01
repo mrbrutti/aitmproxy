@@ -486,6 +486,7 @@ mod tests {
     use crate::codec::hex_encode;
     use crate::fields::FieldPath;
     use crate::host::{PacketHost, PointRunner, RunnerRegistry};
+    use crate::oracle::CaseClass;
     use crate::state::{Candidate, StopReason};
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
@@ -1165,5 +1166,172 @@ mod tests {
         assert_eq!(counters.cases, 2);
         assert_eq!(counters.crashes, 0);
         assert_eq!(counters.retired_elements, 0);
+    }
+
+    /// Break the mock's wire once `injects` frames have gone out: the next
+    /// inject fails with `WireWrite`. Keyed off the inject count, so the test
+    /// does not race a sleep; the mock's `reply_delay` keeps consecutive
+    /// injects far enough apart for the 1 ms poll to land between them.
+    fn break_wire_after(mock: &Arc<MockBackend>, injects: usize) -> tokio::task::JoinHandle<()> {
+        let mock = Arc::clone(mock);
+        tokio::spawn(async move {
+            for _ in 0..20_000 {
+                if mock.inject_count() >= injects {
+                    mock.fail_injects_with_wire_write();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("the wire never saw {injects} injects");
+        })
+    }
+
+    /// Tester (fix rounds, review finding Q1): the wire breaks on the fourth
+    /// case, not the baseline. The three cases that went out are kept, the
+    /// failed one is charged (the charge precedes the send) but is not a case,
+    /// and the job stops on `WireWrite` — so this point is judged on what was
+    /// sent, and an untouched point of the same job reports the wire failure
+    /// as its stop, by its literal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_write_on_the_nth_case_stops_the_job_and_keeps_the_sent_cases() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.reply_delay(Duration::from_millis(30));
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        let (shared, job, plans, disc) = setup(
+            Arc::clone(&mock),
+            profile,
+            &fields(&["raw", "ipv4.ttl"]),
+            1000,
+        );
+        let first = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let second = runner_for(&shared, &job, &plans, &disc.points, "ipv4.ttl");
+        let registry = registry_with(&job, &first);
+        registry.register(
+            &job.marker(),
+            second.point().id.as_str(),
+            Arc::clone(&second),
+        );
+        // 1 baseline + 3 cases go out; the fourth case meets the broken wire.
+        let breaker = break_wire_after(&mock, 4);
+
+        let run = first.run_point().await;
+        breaker.await.expect("the wire broke");
+
+        assert_eq!(run.cases.len(), 3, "{:?}", run.cases);
+        assert!(run
+            .cases
+            .iter()
+            .all(|case| case.class() == Some(CaseClass::Clean)));
+        assert_eq!(
+            run.stopped,
+            Some(StopReason::WireWrite("mock wire down".to_string()))
+        );
+        assert!(run.crash.is_none());
+        assert_eq!(
+            mock.inject_count(),
+            4,
+            "the fourth case never reached the wire"
+        );
+        assert_eq!(
+            job.charged(),
+            5,
+            "the failed case was charged before the send"
+        );
+        let stats = shared.state.stats(job.job_id()).expect("stats");
+        assert_eq!(stats.l4.cases, 3, "the failed case is not a case");
+        assert_eq!(stats.cases_unsendable, 0, "nor an unsendable one");
+        assert_eq!(
+            stats.stopped,
+            Some(StopReason::WireWrite("mock wire down".to_string()))
+        );
+
+        // The point with cases is judged on them: no crash, no reaction.
+        let crash = run_check(&CrashCheck::new(Arc::clone(&registry)), &first).await;
+        assert_eq!(crash.outcome, Outcome::Clean);
+        assert_eq!(
+            crash.detail,
+            "3 cases sent on 127.0.0.1:9/udp field raw; no crash"
+        );
+        let reaction = run_check(&ReactionCheck::new(Arc::clone(&registry)), &first).await;
+        assert_eq!(reaction.outcome, Outcome::Clean);
+        assert_eq!(
+            reaction.detail,
+            "3 cases sent on 127.0.0.1:9/udp field raw; no protocol reaction"
+        );
+
+        // The untouched point sends nothing and names the wire failure.
+        let starved = run_check(&CrashCheck::new(registry), &second).await;
+        assert_eq!(starved.outcome, Outcome::Error);
+        assert_eq!(starved.confidence, Confidence::Tentative);
+        assert_eq!(
+            starved.detail,
+            "the packet lane stopped before any case on 127.0.0.1:9/udp field ipv4.ttl: \
+             wire write failed: mock wire down"
+        );
+        assert_eq!(mock.inject_count(), 4, "a stopped job sends nothing more");
+        assert_eq!(job.charged(), 5);
+    }
+
+    /// Tester (fix rounds, review findings Q1/Q2): the wire breaks on the first
+    /// reproduction replay, after the target came back. A replay that never
+    /// left the host is not an attempt, so the candidate is `Interrupted` by
+    /// the `WireWrite` stop — not confirmed, not judged — and the crash check
+    /// surfaces it as inconclusive, naming the wire failure as the reason
+    /// nothing was reproduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_write_inside_a_triage_replay_is_an_interrupted_candidate() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.reply_delay(Duration::from_millis(30));
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+        // 1 baseline + 2 cases + 2 failed probes + 1 passing recovery poll = 6;
+        // the replay is the seventh inject, and it meets the broken wire.
+        let breaker = break_wire_after(&mock, 6);
+
+        let run = runner.run_point().await;
+        breaker.await.expect("the wire broke");
+
+        assert_eq!(mock.inject_count(), 6, "the replay never reached the wire");
+        assert_eq!(job.charged(), 7, "the replay was charged before the send");
+        assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::WireWrite("mock wire down".to_string()),
+            }
+        );
+        assert_eq!(
+            run.stopped,
+            Some(StopReason::WireWrite("mock wire down".to_string()))
+        );
+        assert!(run.crash.is_none(), "{:?}", run.crash);
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(aitm_scan_model::L4Counters {
+                cases: 2,
+                crashes: 0,
+                // The candidate's two failed probes; the recovery poll passed.
+                liveness_failures: 2,
+                retired_elements: 0,
+            })
+        );
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+
+        let verdict = run_check(&CrashCheck::new(registry), &runner).await;
+        assert_eq!(verdict.outcome, Outcome::Inconclusive);
+        assert_eq!(verdict.confidence, Confidence::Tentative);
+        assert_eq!(
+            verdict.detail,
+            "crash candidate on 127.0.0.1:9/udp field raw mutation grow:8: \
+             wire write failed: mock wire down before reproduction"
+        );
+        let trigger = mock.injected().get(2).cloned().expect("the third inject");
+        assert_eq!(verdict.evidence.payload, Some(hex_encode(&trigger)));
+        assert!(verdict.evidence.l4.is_none(), "{:?}", verdict.evidence.l4);
+        assert_eq!(mock.inject_count(), 6, "the check sent nothing");
     }
 }

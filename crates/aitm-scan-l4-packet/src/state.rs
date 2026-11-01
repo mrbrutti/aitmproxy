@@ -1454,4 +1454,45 @@ mod tests {
         assert_eq!(run.outlier_count(), 1);
         assert_eq!(run.reactions(), vec![(CaseClass::Reset, 1)]);
     }
+
+    /// Tester (fix rounds, review findings SEC2/Q4): a re-begun job keeps its
+    /// eviction slot, so when the ninth job arrives the re-begun first job is
+    /// still the one evicted — and the marker handed back is its *current*
+    /// marker (the re-begin already returned the previous one), so the caller
+    /// forgets exactly the runners that exist, never a marker twice.
+    #[test]
+    fn ninth_job_evicts_a_re_begun_first_job_by_its_current_marker() {
+        let state = LaneState::new();
+        let begin = |id: &str, marker: &str| {
+            state.begin_job(
+                JobKey::new(id, marker),
+                vec![plan_fixture()],
+                points(1),
+                100,
+                20,
+                false,
+            )
+        };
+        for i in 1..=8 {
+            assert!(begin(&format!("j{i}"), &format!("m-j{i}")).is_empty());
+        }
+        // The first job is re-begun under a new marker: its old marker comes
+        // back, nothing is evicted, and all eight jobs are still known.
+        assert_eq!(begin("j1", "m-j1-again"), vec!["m-j1".to_string()]);
+        for i in 1..=8 {
+            assert!(state.counters(&format!("j{i}")).is_some(), "j{i} is known");
+        }
+        // The ninth job evicts the oldest slot — still j1 — and returns the
+        // marker j1 now runs under, not the one already forgotten.
+        assert_eq!(begin("j9", "m-j9"), vec!["m-j1-again".to_string()]);
+        assert_eq!(state.counters("j1"), None);
+        for i in 2..=9 {
+            assert!(state.counters(&format!("j{i}")).is_some(), "j{i} survives");
+        }
+        // Re-beginning an evicted job is a new job: it takes a fresh slot at
+        // the back and the window evicts the oldest survivor, j2.
+        assert_eq!(begin("j1", "m-j1-third"), vec!["m-j2".to_string()]);
+        assert_eq!(state.counters("j2"), None, "j2 was the oldest by then");
+        assert!(state.counters("j1").is_some());
+    }
 }

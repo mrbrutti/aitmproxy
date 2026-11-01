@@ -1165,4 +1165,103 @@ mod tests {
             "an IPv6 payload over 65535 bytes must be TooLarge, not a panic"
         );
     }
+
+    /// Tester (fix rounds, review finding SEC1): the three auto-length guards
+    /// sit exactly at the `u16` boundary. A payload that fills the length to
+    /// 65535 builds with the length stamped `0xffff`; one byte more is
+    /// `TooLarge` from the guard (IPv4) or from the whole-packet cap (IPv6 and
+    /// UDP, whose own `u16` still fits), and never a panic. A *pinned* UDP
+    /// length still ships verbatim.
+    #[test]
+    fn auto_lengths_at_the_u16_boundary_build_and_one_more_is_too_large() {
+        let too_large = Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+        let v4 = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+        let frame = v4(65_515).build().expect("20 + 65515 = 65535 builds");
+        assert_eq!(frame.len(), 65_535);
+        assert_eq!(&frame[2..4], &[0xff, 0xff], "total_length is 65535");
+        assert_eq!(v4(65_516).build(), too_large);
+
+        let v4_udp = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+        let frame = v4_udp(65_507)
+            .build()
+            .expect("20 + 8 + 65507 = 65535 builds");
+        assert_eq!(frame.len(), 65_535);
+        assert_eq!(&frame[2..4], &[0xff, 0xff], "total_length is 65535");
+        assert_eq!(&frame[24..26], &[0xff, 0xeb], "udp length is 65515");
+        assert_eq!(v4_udp(65_508).build(), too_large);
+
+        let v6 = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+        let frame = v6(65_495).build().expect("40 + 65495 = 65535 builds");
+        assert_eq!(frame.len(), 65_535);
+        assert_eq!(&frame[4..6], &[0xff, 0xd7], "payload_length is 65495");
+        // 65496 fits payload_length but not the frame: the cap, not a wrap.
+        assert_eq!(v6(65_496).build(), too_large);
+        // The largest UDP payload IPv6 can declare (65527) still overflows the
+        // frame; both the UDP and IPv6 guards admit it and the cap refuses it.
+        let v6_udp = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(53),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; 65_527]),
+            ],
+        };
+        assert_eq!(v6_udp.build(), too_large);
+
+        // A pinned UDP length is the operator's and ships verbatim, however
+        // wrong.
+        let pinned = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    length: Some(0xffff),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; 4]),
+            ],
+        }
+        .build()
+        .expect("a pinned length builds");
+        assert_eq!(pinned.len(), 32);
+        assert_eq!(&pinned[24..26], &[0xff, 0xff], "the pinned length ships");
+    }
 }

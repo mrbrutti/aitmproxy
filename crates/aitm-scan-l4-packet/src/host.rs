@@ -1309,7 +1309,9 @@ mod tests {
     use aitm_proto_l4::types::L4Direction;
     use aitm_scan_model::{JobCtx, L4Counters, Payload, PayloadMode, ProbeHost};
 
-    use super::{join_error_message, PacketHost, RunnerRegistry, Shared, Timing};
+    use super::{
+        join_error_message, HostError, PacketHost, PointRunner, RunnerRegistry, Shared, Timing,
+    };
     use crate::codec::hex_encode;
     use crate::oracle::CaseClass;
     use crate::state::{Candidate, StopReason};
@@ -2422,5 +2424,281 @@ mod tests {
         // 1 baseline + 4 cases; `liveness_every` is 25, so no scheduled probe.
         assert_eq!(mock.inject_count(), 5);
         assert_eq!(job.charged(), 5);
+    }
+
+    /// Tester (fix rounds, review finding Q3): `register` is idempotent even
+    /// while the registered runner's run is in flight. A second runner built
+    /// for the same point mid-run is dropped in favour of the first, and the
+    /// caller that waits on the returned runner gets the very `PointRun` the
+    /// in-flight run produces — one baseline, one set of cases, no second run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_hands_back_the_in_flight_runner() {
+        let mock = MockBackend::new(MockReply::Echo);
+        // Every reply waits 10 ms, so the twenty-case run is long enough to be
+        // caught mid-flight without a sleep race.
+        mock.reply_delay(Duration::from_millis(10));
+        let profile = l4_profile(vec![udp_target(9)], 20);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let first = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = RunnerRegistry::new();
+        let registered =
+            registry.register(&job.marker(), first.point().id.as_str(), Arc::clone(&first));
+        assert!(Arc::ptr_eq(&registered, &first));
+
+        let in_flight = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run_point().await })
+        };
+        for _ in 0..20_000 {
+            if mock.inject_count() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(mock.inject_count() >= 3, "the first run is mid-flight");
+        assert!(mock.inject_count() < 21, "the first run has not finished");
+
+        // A fresh runner for the same point, as a second `probe_host_for` would
+        // build: the registry keeps the first and hands it back.
+        let second = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        assert!(!Arc::ptr_eq(&second, &first));
+        let second_id = second.point().id.clone();
+        let shared_runner = registry.register(&job.marker(), &second_id, second);
+        assert!(
+            Arc::ptr_eq(&shared_runner, &first),
+            "the in-flight runner stays the point's one runner"
+        );
+        assert_eq!(registry.len(), 1);
+
+        let from_second = shared_runner.run_point().await;
+        let from_first = in_flight.await.expect("the first run finishes");
+        assert!(
+            Arc::ptr_eq(&from_first, &from_second),
+            "both callers hold the one run"
+        );
+        assert_eq!(from_first.cases.len(), 20);
+        // 1 baseline + 20 cases; `liveness_every` is 25, so no scheduled probe,
+        // and no second baseline from a second run.
+        assert_eq!(mock.inject_count(), 21);
+        assert_eq!(job.charged(), 21);
+        assert_eq!(
+            shared.state.counters(job.job_id()).expect("counters").cases,
+            20
+        );
+    }
+
+    /// Tester (fix rounds, review finding SEC4): the replay pin checks both
+    /// halves of the destination. A frame to the right port on another loopback
+    /// host, and a frame with no decodable IP at all, are refused by name and
+    /// never charged; a frame to the right host and port is accepted even on a
+    /// point whose own field does not preserve the transport header
+    /// (`udp.length`), because the replay pins `dst_port` itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_refuses_another_host_or_no_ip_and_accepts_its_own_target() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 50);
+        let (shared, job, plans, disc) = setup(
+            Arc::clone(&mock),
+            profile,
+            &fields(&["raw", "udp.length"]),
+            1000,
+        );
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "udp.length");
+        let host = PacketHost::new(Arc::clone(&runner));
+        let replay = |bytes: Vec<u8>, label: &str| Payload {
+            value: label.to_string(),
+            mode: PayloadMode::Replace,
+            bytes: Some(bytes),
+        };
+
+        // Right port, wrong host: 127.0.0.2:9 is inside the 127/8 Inject scope
+        // but is not this point's target.
+        let mut other_host = plans[0].target.clone();
+        other_host.ip = "127.0.0.2".parse().expect("an address");
+        let elsewhere = crate::plan::seed_spec(&other_host, 40_000, b"x", "elsewhere".to_string())
+            .expect("the frame builds")
+            .spec
+            .build()
+            .expect("the frame crafts");
+        let message = host
+            .probe(&replay(elsewhere, "wrong host"))
+            .await
+            .expect_err("a frame to another host is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "the packet lane replays frames to its own target only: got 127.0.0.2:9"
+        );
+
+        // No IP header at all: neither half of the destination can be read.
+        let message = host
+            .probe(&replay(vec![0xff; 7], "garbage"))
+            .await
+            .expect_err("an undecodable frame is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "the packet lane replays frames to its own target only: got none:none"
+        );
+
+        // Right host, wrong port, on this non-transport-preserving point.
+        let mut other_port = plans[0].target.clone();
+        other_port.port = 10;
+        let wrong_port = crate::plan::seed_spec(&other_port, 40_000, b"x", "port".to_string())
+            .expect("the frame builds")
+            .spec
+            .build()
+            .expect("the frame crafts");
+        let message = host
+            .probe(&replay(wrong_port, "wrong port"))
+            .await
+            .expect_err("a frame to another port is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "the packet lane replays frames to its own target only: got 127.0.0.1:10"
+        );
+
+        assert_eq!(mock.inject_count(), 0, "no refused replay reached the wire");
+        assert_eq!(job.charged(), 0, "no refused replay was charged");
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters::default())
+        );
+
+        // The point's own target, on a point whose field (`udp.length`) leaves
+        // `dst_port` unpinned for its own cases: the replay still goes out and
+        // is correlated, because `replay` pins the port itself.
+        let own = plans[0]
+            .seed_spec(0)
+            .expect("the seed spec")
+            .spec
+            .build()
+            .expect("the seed frame");
+        let response = host
+            .probe(&replay(own, "own target"))
+            .await
+            .expect("a frame to the point's own target is replayed");
+        assert_eq!(response.body, plans[0].seeds[0].bytes, "the echo came back");
+        // The reply's *class* is deliberately not pinned here: a verbatim
+        // replay is a `Raw`-only `PacketSpec`, so `send_recv` correlates it
+        // with `L4Proto::Raw` and reads the echo as `Other` (tester finding on
+        // the fix rounds, reported for the Coder).
+        assert_eq!(mock.inject_count(), 1);
+        assert_eq!(job.charged(), 1);
+        assert_eq!(
+            shared.state.counters(job.job_id()).expect("counters").cases,
+            1,
+            "a replay is a case"
+        );
+    }
+
+    /// Tester (fix rounds, review finding M8): `PointRunner::new` builds seed 0
+    /// and is fallible, so a plan that cannot craft is refused at construction
+    /// — no seed at all, a mixed-family target, or a seed the frame cannot
+    /// carry — each with its `PlanError`. No production path reaches these
+    /// (discovery built seed 0 of every plan already), so the constructor is
+    /// the last line, pinned here directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_runner_new_refuses_a_plan_that_does_not_build() {
+        use crate::fields::FieldPath;
+        use crate::plan::{PlanError, SeedOrigin, SeedPayload};
+
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let point = disc.points[0].clone();
+        let build = |plan: crate::plan::TargetPlan| {
+            PointRunner::new(
+                Arc::clone(&shared),
+                Arc::clone(&job) as Arc<dyn JobCtx>,
+                point.clone(),
+                plan,
+                FieldPath::Raw,
+            )
+            .map(|_| ())
+        };
+
+        let mut seedless = plans[0].clone();
+        seedless.seeds.clear();
+        assert_eq!(
+            build(seedless),
+            Err(PlanError::Craft(
+                "the target plan carries no seed".to_string()
+            ))
+        );
+
+        let mut mixed = plans[0].clone();
+        mixed.target.local_ip = "::1".parse().expect("an address");
+        assert_eq!(build(mixed), Err(PlanError::IpVersionMismatch));
+
+        let mut oversize = plans[0].clone();
+        oversize.seeds = vec![SeedPayload {
+            id: "127.0.0.1:9/udp#0".to_string(),
+            bytes: vec![0x41; 65_507],
+            origin: SeedOrigin::Profile,
+        }];
+        let err = build(oversize).expect_err("the frame cannot carry 65507 payload bytes");
+        assert!(
+            matches!(&err, PlanError::Craft(message) if message.contains("exceeds 65535 bytes")),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid_profile: cannot craft the seed packet: crafted packet exceeds 65535 bytes"
+        );
+
+        assert!(
+            build(plans[0].clone()).is_ok(),
+            "the discovered plan builds"
+        );
+        assert_eq!(mock.inject_count(), 0, "construction sends nothing");
+    }
+
+    /// Tester (fix rounds, review finding M1): `HostError` is a
+    /// `std::error::Error`, so the `anyhow::Error` a `ProbeHost` method returns
+    /// downcasts back to the exact stop reason, and each variant renders as
+    /// its literal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_error_downcasts_through_anyhow_with_its_reason() {
+        assert_eq!(
+            HostError::Stopped(StopReason::Budget).to_string(),
+            "budget exhausted"
+        );
+        assert_eq!(
+            HostError::Craft("no such layer".to_string()).to_string(),
+            "cannot craft the case: no such layer"
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(HostError::Stopped(StopReason::Deadline));
+        assert_eq!(boxed.to_string(), "job deadline passed");
+
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 1);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let host = PacketHost::new(Arc::clone(&runner));
+        let frame = plans[0]
+            .seed_spec(0)
+            .expect("the seed spec")
+            .spec
+            .build()
+            .expect("the seed frame");
+        let payload = Payload {
+            value: "replay".to_string(),
+            mode: PayloadMode::Replace,
+            bytes: Some(frame),
+        };
+        host.probe(&payload).await.expect("the one case fits");
+        let err = host
+            .probe(&payload)
+            .await
+            .expect_err("the cap of one is spent");
+        assert_eq!(
+            err.downcast_ref::<HostError>(),
+            Some(&HostError::Stopped(StopReason::CaseCap(1))),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), "case cap reached: 1 cases sent");
+        assert_eq!(mock.inject_count(), 1);
     }
 }

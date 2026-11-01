@@ -298,4 +298,24 @@ mod tests {
         );
         assert_eq!(CodecError::BadPadding.to_string(), "invalid base64 padding");
     }
+
+    /// Tester (fix rounds, review finding SEC3): the detail/example cut sits at
+    /// exactly 64 hex characters — 64 is printed whole, 65 is cut to 64 plus
+    /// `...`, and nothing is cut to fewer than 64.
+    #[test]
+    fn truncate_hex_cuts_at_exactly_sixty_four_characters() {
+        use super::{truncate_hex, DETAIL_HEX_CHARS};
+
+        assert_eq!(DETAIL_HEX_CHARS, 64);
+        assert_eq!(truncate_hex(""), "");
+        assert_eq!(truncate_hex("ab"), "ab");
+        let sixty_four = "ab".repeat(32);
+        assert_eq!(sixty_four.len(), 64);
+        assert_eq!(truncate_hex(&sixty_four), sixty_four);
+        let sixty_five = format!("{sixty_four}c");
+        assert_eq!(truncate_hex(&sixty_five), format!("{sixty_four}..."));
+        assert_eq!(truncate_hex(&sixty_five).len(), 67);
+        let long = "ff".repeat(1000);
+        assert_eq!(truncate_hex(&long), format!("{}...", "ff".repeat(32)));
+    }
 }

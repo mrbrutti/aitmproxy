@@ -1588,4 +1588,228 @@ mod tests {
             IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
         ));
     }
+
+    /// Tester (fix rounds, review finding S2): with literal and wildcard Inject
+    /// entries side by side, a non-loopback target any of them covers is
+    /// `lane_unavailable` — whether the literal entry's port range reaches it
+    /// or only the `"*"` entry does — and a non-loopback target none covers is
+    /// still `out_of_scope`. The loopback target under the same guard resolves
+    /// through its literal entry.
+    #[test]
+    fn mixed_literal_and_wildcard_entries_for_a_non_loopback_target() {
+        let entry = |addr: [u8; 4], prefix: u8, lo: u16, hi: u16, interface: &str| {
+            let interface = interface.to_string();
+            BOTH.iter()
+                .map(move |(direction, capability)| L4ScopeEntry {
+                    id: L4ScopeId::new(),
+                    cidr: IpCidr {
+                        addr: IpAddr::from(addr),
+                        prefix,
+                    },
+                    ports: PortRange { lo, hi },
+                    interface: interface.clone(),
+                    direction: *direction,
+                    capability: *capability,
+                    inject_rate: RateCap {
+                        pps: 100,
+                        burst: 100,
+                    },
+                    source: L4ScopeSource::Config,
+                })
+                .collect::<Vec<L4ScopeEntry>>()
+        };
+        let mut scope: Vec<L4ScopeEntry> = Vec::new();
+        // A literal NIC entry over 10/8 for the low ports only.
+        scope.extend(entry([10, 0, 0, 0], 8, 0, 100, "en0"));
+        // A wildcard entry over 10/8 for every port.
+        scope.extend(entry([10, 0, 0, 0], 8, 0, u16::MAX, "*"));
+        // A literal loopback entry.
+        scope.extend(entry([127, 0, 0, 0], 8, 0, u16::MAX, loopback_interface()));
+        let guard = L4Guard::new(&L4Config {
+            enabled: true,
+            scope,
+            ..L4Config::default()
+        });
+        let spec = |ip: &str, port: u16| aitm_scan_model::profile::L4TargetSpec {
+            ip: ip.to_string(),
+            port,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+
+        // Covered by the literal entry and the wildcard: lane_unavailable.
+        let err = resolve_target(&guard, &spec("10.1.2.3", 53)).expect_err("loopback only");
+        assert_eq!(
+            err,
+            DiscoverError::LaneUnavailable(
+                "10.1.2.3: the packet lane v2 sends on the loopback interface only".to_string()
+            )
+        );
+        assert_eq!(
+            err.to_string(),
+            "lane_unavailable: 10.1.2.3: the packet lane v2 sends on the loopback interface only"
+        );
+        // Covered by the wildcard alone (the literal entry stops at port 100):
+        // still lane_unavailable, never out_of_scope.
+        let err = resolve_target(&guard, &spec("10.1.2.3", 5000)).expect_err("loopback only");
+        assert!(matches!(err, DiscoverError::LaneUnavailable(_)), "{err:?}");
+        // Covered by nothing: out_of_scope, naming the target.
+        let err = resolve_target(&guard, &spec("192.0.2.9", 53)).expect_err("not in 10/8");
+        assert_eq!(
+            err,
+            DiscoverError::OutOfScope(
+                "192.0.2.9:53/udp: no L4 scope entry with Inject (outbound) and Capture (inbound) \
+                 covers it"
+                    .to_string()
+            )
+        );
+        // The loopback target still resolves, through its literal entry.
+        let resolved = resolve_target(&guard, &udp_target(9)).expect("loopback resolves");
+        assert_eq!(resolved.interface, loopback_interface());
+        assert_eq!(guard.in_flight(), 0);
+    }
+
+    /// Tester (fix rounds, review finding SEC1): the seed ceiling is enforced
+    /// for a base64 seed and for a captured-flow seed exactly as for a hex one,
+    /// at the same literal boundary, and the refusal names the seed's own
+    /// index. The flow seed is an IPv6 datagram, the one family whose UDP
+    /// payload can legitimately exceed the ceiling on the wire.
+    #[test]
+    fn seed_ceiling_holds_for_base64_and_flow_seeds() {
+        let guard = loopback_guard("*", 100);
+        let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+
+        // 65507 = 3 * 21835 + 2 zero bytes; 65508 = 3 * 21836.
+        let at_ceiling = format!("{}AAA=", "AAAA".repeat(21_835));
+        let over = "AAAA".repeat(21_836);
+        let seeds = seed_payloads(
+            &target,
+            &L4Options {
+                seeds: vec![L4Seed::Base64 { base64: at_ceiling }],
+                ..L4Options::default()
+            },
+            None,
+            "aitm7f3a",
+        )
+        .expect("the ceiling itself fits");
+        assert_eq!(seeds[0].bytes.len(), MAX_SEED_BYTES);
+        let err = seed_payloads(
+            &target,
+            &L4Options {
+                seeds: vec![
+                    L4Seed::Hex {
+                        hex: "00".to_string(),
+                    },
+                    L4Seed::Base64 { base64: over },
+                ],
+                ..L4Options::default()
+            },
+            None,
+            "aitm7f3a",
+        )
+        .expect_err("one byte too many");
+        assert_eq!(
+            err,
+            DiscoverError::InvalidProfile(
+                "seed 127.0.0.1:9/udp#1 is 65508 bytes; the largest payload is 65507".to_string()
+            )
+        );
+
+        // A captured IPv6 UDP datagram carrying 65527 payload bytes (the
+        // largest IPv6 payload_length allows), hand-assembled because the
+        // crafter itself refuses to build one.
+        let v6 = aitm_scan_model::profile::L4TargetSpec {
+            ip: "::1".to_string(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+        let v6_guard = guard_over(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128, "*", &BOTH);
+        let v6_target = resolve_target(&v6_guard, &v6).expect("::1 resolves");
+        let payload_len = 65_527usize;
+        let mut bytes: Vec<u8> = Vec::with_capacity(40 + 8 + payload_len);
+        bytes.extend_from_slice(&[0x60, 0, 0, 0]);
+        bytes.extend_from_slice(&u16::to_be_bytes(0xffff));
+        bytes.push(17);
+        bytes.push(64);
+        bytes.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        bytes.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        bytes.extend_from_slice(&50_000u16.to_be_bytes());
+        bytes.extend_from_slice(&53u16.to_be_bytes());
+        bytes.extend_from_slice(&u16::to_be_bytes(0xffff));
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.resize(40 + 8 + payload_len, 0x41);
+        let jumbo = L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&bytes),
+            bytes,
+            injected: false,
+        };
+        let (store, id) = store_with(vec![jumbo]);
+        let err = seed_payloads(
+            &v6_target,
+            &L4Options {
+                seeds: vec![L4Seed::Flow { flow: flow_ref(id) }],
+                ..L4Options::default()
+            },
+            Some(&store as &dyn L4FlowStore),
+            "aitm7f3a",
+        )
+        .expect_err("a captured payload over the ceiling is refused by name");
+        assert_eq!(
+            err,
+            DiscoverError::InvalidProfile(
+                "seed [::1]:53/udp#0 is 65527 bytes; the largest payload is 65507".to_string()
+            )
+        );
+    }
+
+    /// Tester (fix rounds, review finding SEC1 / M8): through `discover_all`
+    /// the real boundary is the whole frame — link framing, IPv4 and UDP
+    /// headers and the payload must fit 65535 bytes — so the largest seed that
+    /// plans is `MAX_SEED_BYTES` less the link header, and one byte more is
+    /// still an `invalid_profile` refusal at discovery (seed 0 is built there),
+    /// never a send-time failure.
+    #[test]
+    fn discover_all_refuses_a_seed_the_frame_cannot_carry() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let largest = MAX_SEED_BYTES - link_framing(loopback_interface()).header_len();
+        for (n, fits) in [(largest, true), (largest + 1, false)] {
+            let mut profile = l4_profile(vec![udp_target(9)], 10);
+            profile.l4.seeds.push(L4Seed::Hex {
+                hex: "41".repeat(n),
+            });
+            let planned = discover_all(
+                &guard,
+                backend.as_ref(),
+                None,
+                &profile.target,
+                &profile,
+                &fields(&["raw"]),
+                "aitm7f3a",
+            );
+            if fits {
+                let (plans, discovery) = planned.expect("the largest frame plans");
+                assert_eq!(plans[0].seeds[0].bytes.len(), n);
+                assert_eq!(
+                    plans[0]
+                        .seed_spec(0)
+                        .expect("builds")
+                        .spec
+                        .build()
+                        .expect("65535 bytes")
+                        .len(),
+                    65_535
+                );
+                assert_eq!(discovery.points.len(), 1);
+            } else {
+                let err = planned.expect_err("one byte over the frame");
+                assert!(matches!(err, DiscoverError::InvalidProfile(_)), "{err:?}");
+                assert!(err.to_string().starts_with("invalid_profile: "), "{err}");
+            }
+        }
+        assert_eq!(backend.inject_count(), 0);
+    }
 }

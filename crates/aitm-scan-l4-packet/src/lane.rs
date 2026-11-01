@@ -923,4 +923,129 @@ mod tests {
         assert_eq!(mock.inject_count(), 0);
         assert_eq!(lane.counters(JOB_ID).expect("the job counted").cases, 0);
     }
+
+    /// Tester (fix rounds, review findings SEC2/Q4): the eviction window and
+    /// the registry move together through a *re-begun* job too. Re-discovering
+    /// the first job under a new marker forgets its previous runner at once;
+    /// the ninth job then evicts that re-begun job — the oldest slot — and its
+    /// current runner goes with it, so the registry never exceeds eight and
+    /// never keeps a runner whose job state is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_discovering_a_job_forgets_its_previous_runners_and_keeps_its_slot() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let lane = lane_with(Arc::clone(&mock), &["raw"]);
+        let profile = l4_profile(vec![udp_target(9)], 1);
+        let host_job = |job_id: &str, marker: &str| {
+            let lane = &lane;
+            let profile = profile.clone();
+            let job_id = job_id.to_string();
+            let marker = marker.to_string();
+            async move {
+                let job = TestJob::new(profile.clone())
+                    .with_job_id(&job_id)
+                    .with_marker(&marker);
+                let discovery = lane
+                    .discover(&profile.target, job.as_ref())
+                    .await
+                    .expect("one raw point");
+                let point = discovery.points[0].clone();
+                lane.probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+                    .expect("the lane hosts the point it minted");
+                point.id
+            }
+        };
+
+        let mut point_id = String::new();
+        for n in 0..8u32 {
+            point_id = host_job(&format!("scan-{n:08x}"), &format!("aitm000{n}")).await;
+        }
+        assert_eq!(lane.registry.len(), 8);
+        assert!(lane.registry.get("aitm0000", &point_id).is_some());
+
+        // Job 0 again, under a new marker: its old runner is forgotten the
+        // moment the job is re-begun, before the new host registers.
+        host_job("scan-00000000", "aitm00re").await;
+        assert_eq!(lane.registry.len(), 8, "one runner per live job");
+        assert!(
+            lane.registry.get("aitm0000", &point_id).is_none(),
+            "the re-begun job's previous runner is gone"
+        );
+        assert!(lane.registry.get("aitm00re", &point_id).is_some());
+        for n in 1..8u32 {
+            assert!(
+                lane.registry
+                    .get(&format!("aitm000{n}"), &point_id)
+                    .is_some(),
+                "job {n} kept its runner"
+            );
+        }
+
+        // The ninth job evicts the oldest slot, which is still job 0's.
+        host_job("scan-00000008", "aitm0008").await;
+        assert_eq!(lane.registry.len(), 8);
+        assert!(
+            lane.registry.get("aitm00re", &point_id).is_none(),
+            "the evicted job's current runner went with its state"
+        );
+        assert!(lane.registry.get("aitm0001", &point_id).is_some());
+        assert!(lane.registry.get("aitm0008", &point_id).is_some());
+        assert_eq!(lane.counters("scan-00000000"), None);
+        assert!(lane.counters("scan-00000001").is_some());
+    }
+
+    /// A backend whose capture open panics, standing in for a pcap handle that
+    /// takes the blocking thread down with it.
+    #[derive(Debug)]
+    struct PanickingBackend;
+
+    impl CaptureInjectBackend for PanickingBackend {
+        fn open_capture(
+            &self,
+            _iface: &str,
+            _filter: Option<&str>,
+            _read_timeout: std::time::Duration,
+        ) -> Result<Box<dyn aitm_proto_l4::backend::CaptureSource>, aitm_proto_l4::backend::L4Error>
+        {
+            panic!("the mock pcap handle blew up")
+        }
+
+        fn inject(
+            &self,
+            _iface: &str,
+            _bytes: &[u8],
+        ) -> Result<(), aitm_proto_l4::backend::L4Error> {
+            Ok(())
+        }
+    }
+
+    /// Tester (fix rounds, review findings SEC5/M7): discovery runs on the
+    /// blocking pool, so a panic inside it — here the privilege probe's capture
+    /// open — is a `JoinError` the lane turns into a `lane_unavailable:`
+    /// refusal, not a panic on the engine's task and not a hung worker. The job
+    /// was never begun, so it has no counters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discovery_panic_is_a_lane_unavailable_refusal() {
+        let backend: Arc<dyn CaptureInjectBackend> = Arc::new(PanickingBackend);
+        let lane = PacketLane::with_backend(loopback_guard("*", 1000), None, backend)
+            .with_timing(fast())
+            .with_default_fields(fields(&["raw"]));
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        let job = TestJob::new(profile.clone());
+
+        let err = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect_err("a panicking privilege probe plans nothing");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("lane_unavailable: discovery task failed: "),
+            "D3 code first, then the task failure: {text}"
+        );
+        assert!(
+            text.contains("panicked"),
+            "the join error names the panic: {text}"
+        );
+        assert_eq!(lane.counters(JOB_ID), None, "the job was never begun");
+        assert!(lane.registry.is_empty());
+    }
 }

@@ -1716,4 +1716,64 @@ mod tests {
         expected.extend(std::iter::repeat_n(0u8, 11));
         assert_eq!(payload_of(&zeros), expected);
     }
+
+    /// Tester (fix rounds, review finding SEC6): `draw_ip_protocol` is a
+    /// bijection from `0..253` onto `0..=255` minus `{4, 41, 47}`. Across 2000
+    /// draws (two seeds) it never yields a tunnelling number and still reaches
+    /// both ends of the range and the two transports the lane speaks: 0, 6, 17
+    /// and 255 all appear, and every draw is a byte.
+    #[test]
+    fn protocol_draw_skips_only_the_tunnelling_numbers_across_2000_draws() {
+        use std::collections::BTreeSet;
+
+        use super::{draw_ip_protocol, TUNNELLING_PROTOS};
+
+        assert_eq!(TUNNELLING_PROTOS, [4, 41, 47]);
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for seed in [0x5EC6u64, 0xC0FFEE] {
+            let mut rng = Rng::new(seed);
+            for _ in 0..1000 {
+                let value = draw_ip_protocol(&mut rng);
+                assert!(value <= 255, "a protocol byte: {value}");
+                assert!(
+                    !matches!(value, 4 | 41 | 47),
+                    "drew a tunnelling protocol {value}"
+                );
+                seen.insert(value);
+            }
+        }
+        for wanted in [0u32, 6, 17, 255] {
+            assert!(seen.contains(&wanted), "{wanted} never drawn: {seen:?}");
+        }
+        // 2000 draws over 253 values cover the range; the three holes are the
+        // tunnelling numbers and nothing else is systematically missing.
+        assert!(seen.len() >= 240, "only {} distinct values", seen.len());
+        for hole in TUNNELLING_PROTOS {
+            assert!(!seen.contains(&u32::from(hole)));
+        }
+
+        // The same holds through `random_case` for both paths, which is the
+        // only production caller.
+        for (path, seed) in [
+            (FieldPath::Ipv4(Ipv4Field::Protocol), udp_seed(b"probe")),
+            (
+                FieldPath::Ipv6(crate::fields::Ipv6Field::NextHeader),
+                udp_seed(b"probe"),
+            ),
+        ] {
+            let mut rng = Rng::new(7);
+            let values: BTreeSet<u32> = (0..2000)
+                .map(|_| match random_case(path, &seed, &mut rng) {
+                    Mutation::Field { value, .. } => value,
+                    other => panic!("{path} drew {other:?}"),
+                })
+                .collect();
+            for hole in [4u32, 41, 47] {
+                assert!(!values.contains(&hole), "{path} drew {hole}");
+            }
+            for wanted in [0u32, 6, 17, 255] {
+                assert!(values.contains(&wanted), "{path} never drew {wanted}");
+            }
+        }
+    }
 }
