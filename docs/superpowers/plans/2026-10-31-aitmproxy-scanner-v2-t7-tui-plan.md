@@ -743,6 +743,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | security | note | `browser.*` and `poc.get` `CallFailed` arms store the raw core message | follow-up outside the scan items (TUI-wide bound sweep) |
 | H (Rust) | quality review (H50-H56) | PASS | every H52 sub-item and H56's shape verified | three Minors to H67-H69 |
 | H (Rust) | quality | Minor | `last_error` doc claims a toast reader; slot dispatch written thrice; H50 test proves two things | fix round H Rust (H67, H68, H69) |
+| H (Rust) | spec review (H50-H56) | PASS | H56 behaviour and tests, T7-7 and T7-13 intact, H50/H52/H53 exact | three doc Minors: D13, D3 shapes and D6 wording amended |
 
 ## Shipped
 
