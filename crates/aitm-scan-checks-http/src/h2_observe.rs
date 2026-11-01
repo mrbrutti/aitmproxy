@@ -28,7 +28,9 @@
 //! only while **all four** of these hold, and every check here keeps them:
 //!
 //! 1. the raw connection goes to the **same authority** as the insertion point
-//!    (derived from `point.url`, userinfo dropped), and to no other;
+//!    (derived from `point.url`, userinfo dropped), **and that authority is one
+//!    of the profile's own `target.origins`** (compared in one canonical form:
+//!    lower-case host, the scheme's default port filled in), and to no other;
 //! 2. it is opened only **after `host.baseline()` succeeded** through the
 //!    guarded job client, so the scope gate has already cleared that authority;
 //! 3. **no cookie, authorization or session header** is ever sent: a plan holds
@@ -328,7 +330,7 @@ impl H2Check {
             let mut headers = vec![
                 RawHeader::new(":method", "GET"),
                 RawHeader::new(":scheme", &target.scheme),
-                RawHeader::new(":authority", &target.authority),
+                RawHeader::new(":authority", &target.wire_authority()),
                 RawHeader::new(":path", &target.path),
             ];
             headers.extend(extra);
@@ -377,7 +379,7 @@ impl H2Check {
         RawH2Plan {
             target: RawH2Target {
                 scheme: target.scheme.clone(),
-                authority: target.authority.clone(),
+                authority: target.wire_authority(),
             },
             headers,
             mode,
@@ -414,7 +416,13 @@ impl Check for H2Check {
             if !may_send(host) {
                 return inconclusive(STOPPED);
             }
-            let key = format!("{}://{}", target.scheme, target.authority);
+            // The profile gate, before anything at all is sent: a raw probe
+            // bypasses the lane's guarded client, so the authority it would
+            // dial must be one the operator named in the job's profile.
+            if !target.is_a_profile_origin(&host.profile().target.origins) {
+                return inconclusive(NOT_A_PROFILE_ORIGIN);
+            }
+            let key = target.origin_key();
             if self.guard.seen(&key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
@@ -444,6 +452,7 @@ impl Check for H2Check {
 
 const STOPPED: &str = "stopped: the job was cancelled, out of budget or past its deadline";
 const ALREADY_OBSERVED: &str = "already observed for this authority";
+const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
 
 /// Whether the check may send another request right now (copy of the gate
 /// `xss.rs` keeps; folding both into one helper is a later round).
@@ -451,49 +460,71 @@ fn may_send(host: &dyn ProbeHost) -> bool {
     !host.cancelled() && host.budget_left() > 0 && Instant::now() < host.deadline()
 }
 
-/// Where a raw probe goes, cut from a point's URL.
+/// Where a raw probe goes, cut from a point's URL by [`crate::url`].
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
+    /// The point's authority, parsed once: lower-case host, the port as the
+    /// URL wrote it, userinfo dropped.
+    authority: crate::url::Authority,
     /// `http` or `https`, lower-cased.
     scheme: String,
-    /// `host[:port]`, lower-cased, userinfo dropped.
-    authority: String,
     /// The request path without its query, or `/`.
     path: String,
 }
 
 impl Target {
+    /// The target of a point's URL, or `None` when the URL names no authority
+    /// this driver can dial. Only `http` and `https` are dialable.
     fn parse(url: &str) -> Option<Self> {
-        let (scheme, rest) = url.split_once("://")?;
-        let scheme = scheme.to_ascii_lowercase();
+        let (authority, rest) = crate::url::split_url(url)?;
+        let scheme = authority.scheme.clone()?;
         if scheme != "http" && scheme != "https" {
             return None;
         }
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let (authority, after) = rest.split_at(end);
-        // Userinfo is credential material; it never reaches the wire.
-        let authority = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host)
-            .to_ascii_lowercase();
-        let host_ok = !authority.is_empty()
-            && authority.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
-            });
-        if !host_ok {
-            return None;
-        }
-        let path = after.split(['?', '#']).next().unwrap_or("");
+        let path = rest.split(['?', '#']).next().unwrap_or("");
         let path = if path.starts_with('/') && path.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             path.to_string()
         } else {
             "/".to_string()
         };
         Some(Self {
-            scheme,
             authority,
+            scheme,
             path,
         })
+    }
+
+    /// `host[:port]` as a client writes it: the form that goes in the
+    /// `:authority` pseudo-header and in [`RawH2Target`], with the scheme's
+    /// default port left out as every HTTP client leaves it out.
+    fn wire_authority(&self) -> String {
+        self.authority.as_written()
+    }
+
+    /// The canonical `scheme://host:port`. Both the profile-origin gate and
+    /// the once-per-authority guard key on this one string, so two spellings
+    /// of one origin can never be compared as two (security review SEC-C3).
+    fn origin_key(&self) -> String {
+        self.authority
+            .origin_key()
+            .unwrap_or_else(|| format!("{}://{}", self.scheme, self.authority.as_written()))
+    }
+
+    /// Whether the job's profile names this origin.
+    ///
+    /// The raw probe does not go through the lane's guarded client, so this is
+    /// the check that keeps it inside what the operator asked for: the
+    /// authority about to be dialled must be one of
+    /// `profile.target.origins`, compared in the canonical form above. An
+    /// origin the profile wrote without a scheme names no origin and
+    /// authorises nothing (interim gate for sender finding SEC-1, item C6).
+    fn is_a_profile_origin(&self, origins: &[String]) -> bool {
+        let key = self.origin_key();
+        origins
+            .iter()
+            .filter_map(|origin| crate::url::authority_of(origin))
+            .filter_map(|origin| origin.origin_key())
+            .any(|origin| origin == key)
     }
 }
 
@@ -689,10 +720,46 @@ mod tests {
 
     #[test]
     fn target_parse_cuts_scheme_authority_and_path() {
-        let t = Target::parse("https://origin.test/x?y=1").unwrap();
-        assert_eq!(
-            (t.scheme.as_str(), t.authority.as_str(), t.path.as_str()),
-            ("https", "origin.test", "/x")
+        let t = Target::parse("https://origin.test/x?y=1").expect("a usable url");
+        assert_eq!(t.scheme, "https");
+        assert_eq!(t.wire_authority(), "origin.test");
+        assert_eq!(t.path, "/x");
+        assert_eq!(t.origin_key(), "https://origin.test:443");
+    }
+
+    /// The gate compares canonical origins, so every spelling of the one
+    /// origin matches and a different scheme, host or port does not.
+    #[test]
+    fn the_profile_gate_matches_one_canonical_origin() {
+        let target = Target::parse("https://origin.test:443/x").expect("a usable url");
+
+        for origin in [
+            "https://origin.test",
+            "https://ORIGIN.test",
+            "https://origin.test:443",
+            "https://origin.test/ignored/path",
+        ] {
+            assert!(
+                target.is_a_profile_origin(&[origin.to_string()]),
+                "{origin} should authorise the probe"
+            );
+        }
+        for origin in [
+            "http://origin.test",
+            "https://other.test",
+            "https://origin.test:8443",
+            "origin.test",
+            "*.origin.test",
+            "",
+        ] {
+            assert!(
+                !target.is_a_profile_origin(&[origin.to_string()]),
+                "{origin} must not authorise the probe"
+            );
+        }
+        assert!(
+            !target.is_a_profile_origin(&[]),
+            "an empty origin list authorises nothing"
         );
     }
 }

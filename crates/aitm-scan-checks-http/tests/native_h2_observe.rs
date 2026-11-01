@@ -25,6 +25,16 @@ use support::{point, ScriptedHost};
 
 const ORIGIN_URL: &str = "https://origin.test/x";
 
+/// The one origin the job's profile names. A raw h2 probe may only be opened
+/// to an authority the operator put in the profile, so every host in this file
+/// carries it (the off-origin case has its own test).
+const ORIGIN: &str = "https://origin.test";
+
+/// The scripted host every test uses: the profile targets [`ORIGIN`].
+fn h2host() -> ScriptedHost {
+    ScriptedHost::new().with_origins(&[ORIGIN])
+}
+
 type Script = dyn Fn(&RawH2Plan) -> anyhow::Result<RawH2Observation> + Send + Sync;
 
 /// Records every plan and answers from a closure.
@@ -247,7 +257,7 @@ fn no_h2_check_is_intrusive() {
 async fn settings_observe_reports_the_advertised_values() {
     let runner = FakeRunner::answering(obs(vec![]));
     let check = check_named(&runner, "h2-settings-observe");
-    let host = ScriptedHost::new();
+    let host = h2host();
 
     let v = run(&check, &host).await;
 
@@ -289,7 +299,7 @@ async fn settings_observe_names_unknown_ids_and_bounds_the_evidence() {
     let runner = FakeRunner::answering(o);
     let check = check_named(&runner, "h2-settings-observe");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     let matched = v.evidence.matched.expect("settings listed");
     assert!(
@@ -306,7 +316,7 @@ async fn settings_observe_is_clean_only_when_no_settings_were_read() {
     let runner = FakeRunner::answering(o);
     let check = check_named(&runner, "h2-settings-observe");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     assert_eq!(v.confidence, Confidence::Tentative);
@@ -322,7 +332,7 @@ async fn pseudo_header_validation_sends_three_variants_on_one_connection() {
     let runner = FakeRunner::answering(resets(3));
     let check = check_named(&runner, "h2-pseudo-header-validation");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     let plan = runner.only_plan();
@@ -366,7 +376,7 @@ async fn pseudo_header_validation_is_clean_when_every_stream_is_rejected() {
     ]));
     let check = check_named(&runner, "h2-pseudo-header-validation");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     assert_eq!(v.evidence.matched, None);
@@ -381,7 +391,7 @@ async fn pseudo_header_validation_names_the_tolerated_variant() {
     ]));
     let check = check_named(&runner, "h2-pseudo-header-validation");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(v.confidence, Confidence::Tentative);
@@ -408,7 +418,7 @@ async fn an_answer_with_an_unreadable_status_counts_as_tolerated_and_a_redirect_
         let runner = FakeRunner::answering(obs(vec![reset(), reset(), answer]));
         let check = check_named(&runner, "h2-pseudo-header-validation");
 
-        let v = run(&check, &ScriptedHost::new()).await;
+        let v = run(&check, &h2host()).await;
 
         assert_eq!(v.outcome, Outcome::Vulnerable, "{answer:?}");
         assert!(
@@ -430,7 +440,7 @@ async fn a_timed_out_or_missing_stream_is_inconclusive_not_clean() {
         let runner = FakeRunner::answering(o);
         let check = check_named(&runner, "h2-pseudo-header-validation");
 
-        let v = run(&check, &ScriptedHost::new()).await;
+        let v = run(&check, &h2host()).await;
 
         assert_eq!(v.outcome, Outcome::Inconclusive);
     }
@@ -445,7 +455,7 @@ async fn crlf_tolerance_sends_one_name_and_one_value_probe() {
     let runner = FakeRunner::answering(resets(2));
     let check = check_named(&runner, "h2-header-crlf-tolerance");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     let plan = runner.only_plan();
@@ -465,7 +475,7 @@ async fn crlf_tolerance_names_the_tolerated_variant() {
     ]));
     let check = check_named(&runner, "h2-header-crlf-tolerance");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(
@@ -483,7 +493,7 @@ async fn cl_te_indicator_sends_two_variants_and_never_a_body() {
     let runner = FakeRunner::answering(resets(2));
     let check = check_named(&runner, "h2-cl-te-downgrade-indicator");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     let plan = runner.only_plan();
@@ -503,7 +513,7 @@ async fn cl_te_indicator_is_tentative_when_a_stream_is_answered() {
     ]));
     let check = check_named(&runner, "h2-cl-te-downgrade-indicator");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(v.confidence, Confidence::Tentative);
@@ -522,7 +532,7 @@ async fn rapid_reset_never_opens_more_than_eight_pairs() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
 
-    run(&check, &ScriptedHost::new()).await;
+    run(&check, &h2host()).await;
 
     let plan = runner.only_plan();
     assert_eq!(plan.mode, RawH2Mode::RapidReset { pairs: 8 });
@@ -537,7 +547,7 @@ async fn rapid_reset_is_clean_when_the_peer_sends_goaway() {
     let runner = FakeRunner::answering(o);
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     assert_eq!(
@@ -553,7 +563,7 @@ async fn rapid_reset_is_clean_when_the_peer_refuses_a_stream() {
     let runner = FakeRunner::answering(obs(streams));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Clean);
     assert_eq!(v.detail, "the peer refused a stream during 8 reset pairs");
@@ -564,7 +574,7 @@ async fn rapid_reset_without_goaway_reports_no_mitigation_observed() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
 
-    let v = run(&check, &ScriptedHost::new()).await;
+    let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(v.confidence, Confidence::Tentative);
@@ -583,7 +593,7 @@ async fn every_h2_check_calls_baseline_before_it_dials() {
     for id in ALL_IDS {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, id);
-        let host = ScriptedHost::new().with_baseline_fails(true);
+        let host = h2host().with_baseline_fails(true);
 
         let v = run(&check, &host).await;
 
@@ -603,8 +613,8 @@ async fn a_refused_baseline_does_not_use_up_the_authority() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
 
-    let refused = run(&check, &ScriptedHost::new().with_baseline_fails(true)).await;
-    let allowed = run(&check, &ScriptedHost::new()).await;
+    let refused = run(&check, &h2host().with_baseline_fails(true)).await;
+    let allowed = run(&check, &h2host()).await;
 
     assert_eq!(refused.outcome, Outcome::Inconclusive);
     assert_eq!(allowed.outcome, Outcome::Vulnerable);
@@ -615,8 +625,8 @@ async fn a_refused_baseline_does_not_use_up_the_authority() {
 async fn an_h2_check_runs_once_per_authority() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
-    let host = ScriptedHost::new();
-    let second_host = ScriptedHost::new();
+    let host = h2host();
+    let second_host = h2host();
 
     let first = run(&check, &host).await;
     let second = check
@@ -652,8 +662,14 @@ async fn the_guard_is_per_authority_and_per_scheme() {
         "https://other.test/x",
         "http://origin.test/x",
     ] {
+        let host = ScriptedHost::new().with_origins(&[
+            "https://origin.test",
+            "https://origin.test:8443",
+            "https://other.test",
+            "http://origin.test",
+        ]);
         let v = check
-            .run(&point(InsertionKind::Query, "q", url), &ScriptedHost::new())
+            .run(&point(InsertionKind::Query, "q", url), &host)
             .await;
         assert_eq!(v.outcome, Outcome::Vulnerable, "{url}");
     }
@@ -667,8 +683,8 @@ async fn the_guard_is_per_check_instance() {
     let one = check_named(&runner, "h2-rapid-reset-mitigation");
     let two = check_named(&runner, "h2-rapid-reset-mitigation");
 
-    run(&one, &ScriptedHost::new()).await;
-    let v = run(&two, &ScriptedHost::new()).await;
+    run(&one, &h2host()).await;
+    let v = run(&two, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(runner.calls(), 2);
@@ -684,7 +700,7 @@ async fn each_check_has_its_own_guard() {
     let checks = h2_checks(dynamic);
 
     for check in &checks {
-        let v = run(check, &ScriptedHost::new()).await;
+        let v = run(check, &h2host()).await;
         assert_ne!(v.outcome, Outcome::Inconclusive, "{}", check.meta().id);
     }
 
@@ -697,7 +713,7 @@ async fn a_runner_error_is_inconclusive_for_every_check() {
         let runner = FakeRunner::failing();
         let check = check_named(&runner, id);
 
-        let v = run(&check, &ScriptedHost::new()).await;
+        let v = run(&check, &h2host()).await;
 
         assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
         assert_eq!(
@@ -711,9 +727,9 @@ async fn a_runner_error_is_inconclusive_for_every_check() {
 #[tokio::test]
 async fn a_stopped_job_sends_nothing() {
     for host in [
-        ScriptedHost::new().with_cancelled(true),
-        ScriptedHost::new().with_budget(0),
-        ScriptedHost::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+        h2host().with_cancelled(true),
+        h2host().with_budget(0),
+        h2host().with_deadline(Instant::now() - Duration::from_secs(1)),
     ] {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
@@ -730,7 +746,7 @@ async fn a_stopped_job_sends_nothing() {
 async fn the_raw_probe_does_not_spend_the_hosts_budget() {
     let runner = FakeRunner::answering(resets(8));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
-    let host = ScriptedHost::new().with_budget(1);
+    let host = h2host().with_budget(1);
 
     let v = run(&check, &host).await;
 
@@ -766,9 +782,15 @@ async fn the_target_is_derived_from_the_point_url() {
     for (url, scheme, authority, path) in cases {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
+        let host = ScriptedHost::new().with_origins(&[
+            "https://origin.test",
+            "https://origin.test:8443",
+            "http://origin.test",
+            "https://[::1]:9443",
+        ]);
 
         check
-            .run(&point(InsertionKind::Query, "q", url), &ScriptedHost::new())
+            .run(&point(InsertionKind::Query, "q", url), &host)
             .await;
 
         let plan = runner.only_plan();
@@ -801,7 +823,7 @@ async fn an_unusable_url_is_inconclusive_and_dials_nothing() {
         let runner = FakeRunner::answering(resets(8));
         let check = check_named(&runner, "h2-rapid-reset-mitigation");
 
-        let v = check.run(&p, &ScriptedHost::new()).await;
+        let v = check.run(&p, &h2host()).await;
 
         assert_eq!(v.outcome, Outcome::Inconclusive, "{:?}", p.url);
         assert_eq!(
@@ -821,11 +843,134 @@ async fn a_path_with_control_bytes_falls_back_to_the_root() {
     check
         .run(
             &point(InsertionKind::Query, "q", "https://origin.test/a b"),
-            &ScriptedHost::new(),
+            &h2host(),
         )
         .await;
 
     assert_eq!(runner.only_plan().headers[3], h(":path", "/"));
+}
+
+// ---------------------------------------------------------------------------
+// the profile-origin gate
+// ---------------------------------------------------------------------------
+
+/// A raw h2 probe bypasses the lane's own client, so the only thing standing
+/// between it and an unauthorised origin is this check: the authority it is
+/// about to dial must be one the profile names. A point that arrived pointing
+/// somewhere else — a redirect the crawler followed, a host header the
+/// application echoed — opens nothing, and does not even take a baseline.
+#[tokio::test]
+async fn a_point_outside_the_profile_origins_is_never_dialled() {
+    for id in ALL_IDS {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, id);
+        let host = ScriptedHost::new().with_origins(&["https://origin.test"]);
+
+        let v = check
+            .run(
+                &point(InsertionKind::Query, "q", "https://other.test/"),
+                &host,
+            )
+            .await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
+        assert_eq!(v.detail, "raw probe target is not a profile origin", "{id}");
+        assert_eq!(runner.calls(), 0, "{id} dialled an origin nobody named");
+        assert_eq!(host.baseline_calls(), 0, "{id}");
+    }
+}
+
+/// An empty origin list names nothing, so it authorises nothing.
+#[tokio::test]
+async fn an_empty_profile_origin_list_authorises_no_raw_probe() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let host = ScriptedHost::new();
+
+    let v = run(&check, &host).await;
+
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert_eq!(v.detail, "raw probe target is not a profile origin");
+    assert_eq!(runner.calls(), 0);
+    assert_eq!(host.baseline_calls(), 0);
+}
+
+/// Scheme and port are part of an origin: `http://origin.test` does not
+/// authorise an `https` probe, and `https://origin.test:8443` does not
+/// authorise the default port.
+#[tokio::test]
+async fn the_origin_gate_is_per_scheme_and_per_port() {
+    for (origin, url) in [
+        ("http://origin.test", "https://origin.test/x"),
+        ("https://origin.test:8443", "https://origin.test/x"),
+        ("https://origin.test", "https://origin.test:8443/x"),
+        ("origin.test", "https://origin.test/x"),
+    ] {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+        let host = ScriptedHost::new().with_origins(&[origin]);
+
+        let v = check
+            .run(&point(InsertionKind::Query, "q", url), &host)
+            .await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{origin} vs {url}");
+        assert_eq!(v.detail, "raw probe target is not a profile origin");
+        assert_eq!(runner.calls(), 0, "{origin} vs {url}");
+    }
+}
+
+/// The comparison and the guard key both run on a **normalised** authority:
+/// the host is lower-cased and the scheme's default port is filled in, so
+/// `origin.test` and `origin.test:443` are one origin for an `https` job.
+/// Two points that differ only that way therefore share one claim, and the
+/// probe is opened once.
+#[tokio::test]
+async fn the_default_port_is_the_same_origin_and_the_same_guard_claim() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    let first = check
+        .run(
+            &point(InsertionKind::Query, "q", "https://origin.test/a"),
+            &ScriptedHost::new().with_origins(&["https://origin.test"]),
+        )
+        .await;
+    let second = check
+        .run(
+            &point(InsertionKind::Query, "q", "https://ORIGIN.test:443/b"),
+            &ScriptedHost::new().with_origins(&["https://origin.test"]),
+        )
+        .await;
+
+    assert_eq!(first.outcome, Outcome::Vulnerable);
+    assert_eq!(second.outcome, Outcome::Inconclusive);
+    assert_eq!(second.detail, "already observed for this authority");
+    assert_eq!(runner.calls(), 1, "one authority, one raw connection");
+}
+
+/// The same normalisation on the profile's side: an origin written without a
+/// port authorises a point written with the scheme's default port, and an
+/// origin written with the default port authorises one written without it.
+#[tokio::test]
+async fn a_profile_origin_matches_a_point_however_the_default_port_is_written() {
+    for (origin, url) in [
+        ("https://origin.test", "https://origin.test:443/x"),
+        ("https://origin.test:443", "https://origin.test/x"),
+        ("https://ORIGIN.test", "https://origin.test/x"),
+        ("http://origin.test:80", "http://origin.test/x"),
+    ] {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+        let host = ScriptedHost::new().with_origins(&[origin]);
+
+        let v = check
+            .run(&point(InsertionKind::Query, "q", url), &host)
+            .await;
+
+        assert_eq!(v.outcome, Outcome::Vulnerable, "{origin} vs {url}");
+        assert_eq!(runner.calls(), 1, "{origin} vs {url}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -852,7 +997,7 @@ async fn the_t3_3_expected_set_on_a_conforming_server() {
     let dynamic: Arc<dyn RawH2Runner> = runner.clone();
     let mut got = Vec::new();
     for check in h2_checks(dynamic) {
-        let v = run(&check, &ScriptedHost::new()).await;
+        let v = run(&check, &h2host()).await;
         got.push((check.meta().id.clone(), v.outcome, check.meta().severity));
     }
 
@@ -888,7 +1033,7 @@ async fn no_plan_ever_exceeds_eight_streams_or_carries_session_material() {
     let runner = conforming_runner();
     let dynamic: Arc<dyn RawH2Runner> = runner.clone();
     for check in h2_checks(dynamic) {
-        run(&check, &ScriptedHost::new()).await;
+        run(&check, &h2host()).await;
     }
 
     for plan in runner.plans() {
@@ -927,7 +1072,7 @@ async fn no_h2_check_supplies_a_poc_hint() {
     ]));
     for id in ALL_IDS {
         let check = check_named(&vulnerable, id);
-        let v = run(&check, &ScriptedHost::new()).await;
+        let v = run(&check, &h2host()).await;
         assert!(v.poc_hint.is_none(), "{id}");
     }
     assert!(vulnerable.calls() > 0);
@@ -982,7 +1127,7 @@ async fn no_h2_check_dials_without_a_usable_http_url() {
         for p in &points {
             let runner = FakeRunner::answering(resets(8));
             let check = check_named(&runner, id);
-            let host = ScriptedHost::new();
+            let host = h2host();
 
             let v = check.run(p, &host).await;
 
@@ -1007,9 +1152,9 @@ async fn no_h2_check_dials_without_a_usable_http_url() {
 async fn no_h2_check_probes_a_stopped_job_or_burns_the_authority() {
     for id in ALL_IDS {
         for stopped in [
-            ScriptedHost::new().with_cancelled(true),
-            ScriptedHost::new().with_budget(0),
-            ScriptedHost::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+            h2host().with_cancelled(true),
+            h2host().with_budget(0),
+            h2host().with_deadline(Instant::now() - Duration::from_secs(1)),
         ] {
             let runner = FakeRunner::answering(resets(8));
             let check = check_named(&runner, id);
@@ -1025,7 +1170,7 @@ async fn no_h2_check_probes_a_stopped_job_or_burns_the_authority() {
             assert_eq!(runner.calls(), 0, "{id}");
 
             // The authority was never claimed, so a healthy run still probes.
-            let healthy = run(&check, &ScriptedHost::new()).await;
+            let healthy = run(&check, &h2host()).await;
             assert_ne!(healthy.outcome, Outcome::Inconclusive, "{id}");
             assert_eq!(runner.calls(), 1, "{id}");
         }

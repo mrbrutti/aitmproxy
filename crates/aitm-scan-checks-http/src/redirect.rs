@@ -133,54 +133,12 @@ fn may_send(host: &dyn ProbeHost) -> bool {
 /// The lower-case authority host a `Location` points at, or `None` when it is
 /// relative and therefore stays on the origin.
 ///
-/// Backslashes are normalised to slashes first, as a browser does, so
-/// `/\host/` is read as the authority it will actually resolve to. Userinfo is
-/// dropped (`https://target.example@canary/` goes to the canary, not the
-/// target) and the port is cut, with bracketed IPv6 literals kept whole.
+/// The parsing is [`crate::url::authority_of`]; this check's one extra rule is
+/// the backslash: browsers normalise `\` to `/` inside a URL, so `/\host/` is
+/// read as the authority it will actually resolve to rather than as a path.
 fn location_host(location: &str) -> Option<String> {
     let loc = location.trim().replace('\\', "/");
-
-    // `scheme://authority...`, but only when what precedes `://` really is a
-    // scheme; otherwise fall back to the scheme-relative form.
-    let after_scheme = match loc.find("://") {
-        Some(at)
-            if at > 0
-                && loc[..at]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
-        {
-            Some(&loc[at + 3..])
-        }
-        _ => None,
-    };
-    let rest = match after_scheme {
-        Some(rest) => rest,
-        // Three or more leading slashes still means "no host", as `//` then an
-        // empty authority; `strip_prefix` leaves the leading slash and the
-        // authority below comes out empty, which we reject.
-        None => loc.strip_prefix("//")?,
-    };
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Userinfo: everything before the last `@` belongs to the credentials, not
-    // the host.
-    let authority = match authority.rsplit_once('@') {
-        Some((_, host)) => host,
-        None => authority,
-    };
-    let host = if authority.starts_with('[') {
-        match authority.find(']') {
-            Some(end) => &authority[..=end],
-            None => authority,
-        }
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
+    Some(crate::url::authority_of(&loc)?.host_literal())
 }
 
 /// Whether `resp` is a redirect to the canary.

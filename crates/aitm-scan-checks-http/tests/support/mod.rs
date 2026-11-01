@@ -239,6 +239,17 @@ impl ScriptedHost {
         self
     }
 
+    /// The origins the profile names as the job's target.
+    ///
+    /// The h2 checks dial raw, so they compare the point's own authority
+    /// against this list before they open anything: a job may only probe what
+    /// the operator put in its profile.
+    #[must_use]
+    pub fn with_origins(mut self, origins: &[&str]) -> Self {
+        self.profile.target.origins = origins.iter().map(|o| (*o).to_string()).collect();
+        self
+    }
+
     /// The profile's time-versus-coverage dial.
     #[must_use]
     pub fn with_speed(mut self, speed: Speed) -> Self {
