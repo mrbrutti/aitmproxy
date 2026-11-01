@@ -231,13 +231,120 @@ pub(crate) const CLICKABLES_JS: &str = concat!(
 );
 
 /// Tag `document.forms[index]` with `data-aitm-form` so [`field_selector`] can
-/// address its controls unambiguously.
+/// address its controls unambiguously, and read the **live** form back.
 ///
 /// A page may hold several forms with the same field names (a header search and
 /// a page search); without the tag, `[name="q"]` would type into whichever came
 /// first in the document.
+///
+/// The expression answers an object — `action`, `method` and `enctype` as the
+/// live element's attributes (`null` when absent) and `names`, the ordered
+/// `name`s of its `input`/`select`/`textarea` controls minus the buttons — or
+/// `null` when there is no form at that index. The engine submits only when
+/// that answer agrees with the form the extractor read (S-I2): the page is
+/// re-navigated between extraction and submission, and a JS-mounted
+/// third-party form or a markup shape the extractor and the browser read
+/// differently would otherwise put a different form at index `i`.
+///
+/// Everything is read through the prototype getters: a form's named controls
+/// shadow its own properties, so `f.action` with an `<input name="action">`
+/// in the form is the input, and `f.getAttribute`, `f.setAttribute` and
+/// `f.elements` can be clobbered the same way. It reads the DOM and nothing
+/// else, like [`CLICKABLES_JS`], and is marked `/*aitm-tag-form*/` for the
+/// same reason.
 pub(crate) fn tag_form_js(index: usize) -> String {
-    format!("document.forms[{index}].setAttribute(\"data-aitm-form\",\"{index}\")")
+    format!(
+        concat!(
+            "/*aitm-tag-form*/(function(){{",
+            "var f=document.forms[{index}];if(!f){{return null;}}",
+            "var get=Element.prototype.getAttribute;",
+            "Element.prototype.setAttribute.call(f,\"data-aitm-form\",\"{index}\");",
+            "var els=Object.getOwnPropertyDescriptor(HTMLFormElement.prototype,\"elements\")",
+            ".get.call(f);",
+            "var names=[];",
+            "for(var k=0;k<els.length;k++){{var e=els[k];var tag=e.tagName;",
+            "if(tag!==\"INPUT\"&&tag!==\"SELECT\"&&tag!==\"TEXTAREA\"){{continue;}}",
+            "var type=(get.call(e,\"type\")||\"\").trim().toLowerCase();",
+            "if(tag===\"INPUT\"&&(type===\"submit\"||type===\"button\"||type===\"image\"",
+            "||type===\"reset\")){{continue;}}",
+            "var n=get.call(e,\"name\");if(n&&n.trim()){{names.push(n.trim());}}}}",
+            "return {{action:get.call(f,\"action\"),method:get.call(f,\"method\"),",
+            "enctype:get.call(f,\"enctype\"),names:names}};}})()"
+        ),
+        index = index
+    )
+}
+
+/// What [`tag_form_js`] read from the live form.
+struct LiveForm {
+    action: Option<String>,
+    method: Option<String>,
+    enctype: Option<String>,
+    names: Vec<String>,
+}
+
+impl LiveForm {
+    /// The live form in `value`, or `None` when the page answered anything but
+    /// the object [`tag_form_js`] builds (no form at that index, a driver that
+    /// could not serialise it).
+    fn from_value(value: &Value) -> Option<Self> {
+        let Value::Object(fields) = value else {
+            return None;
+        };
+        let text = |key: &str| match fields.get(key) {
+            Some(Value::Str(text)) => Some(text.clone()),
+            _ => None,
+        };
+        let Some(Value::Array(items)) = fields.get("names") else {
+            return None;
+        };
+        let names = items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Str(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        Some(Self {
+            action: text("action"),
+            method: text("method"),
+            enctype: text("enctype"),
+            names,
+        })
+    }
+
+    /// The live form in the extractor's shape, so [`form_action`] judges it by
+    /// exactly the rule that admitted the extracted form.
+    fn as_spec(&self, index: usize) -> FormSpec {
+        let trimmed = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        FormSpec {
+            index,
+            action: trimmed(&self.action),
+            method: trimmed(&self.method)
+                .map(|method| method.to_ascii_uppercase())
+                .unwrap_or_else(|| "GET".to_string()),
+            enctype: trimmed(&self.enctype).map(|enctype| enctype.to_ascii_lowercase()),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Whether this live form is the form the extractor read as `form`: its
+    /// action resolves same-origin with a `GET`/`POST` method, and its
+    /// controls are `form`'s controls (as a set of names).
+    fn matches(&self, form: &FormSpec, page: &Url, origin: &Url, base: Option<&str>) -> bool {
+        if form_action(&self.as_spec(form.index), page, origin, base).is_none() {
+            return false;
+        }
+        let declared: HashSet<&str> = form.fields.iter().map(|f| f.name.as_str()).collect();
+        let live: HashSet<&str> = self.names.iter().map(String::as_str).collect();
+        declared == live
+    }
 }
 
 /// Submit `document.forms[index]` the way the page expects (plan call **A4**).
@@ -548,12 +655,26 @@ impl<'a> Run<'a> {
                 Step::Continue => {}
                 other => return Ok(other),
             }
-            // Tagging is best effort: a page that rewrote its forms between the
-            // extraction and now simply does not get submitted.
-            if bounded(self.job, self.browser.eval(&tag_form_js(form.index)))
-                .await
-                .is_err()
-            {
+            // Tagging is best effort: a browser that cannot answer simply does
+            // not get this form submitted. A browser that answers with a form
+            // other than the one the extractor read (S-I2) is skipped and
+            // counted: the submit would go wherever *that* form points.
+            let live = match bounded(self.job, self.browser.eval(&tag_form_js(form.index))).await {
+                Ok(value) => LiveForm::from_value(&value),
+                Err(_) => continue,
+            };
+            let agrees = live.as_ref().is_some_and(|live| {
+                live.matches(&form, page, self.origin, extracted.base.as_deref())
+            });
+            if !agrees {
+                self.report.forms_skipped = self.report.forms_skipped.saturating_add(1);
+                tracing::debug!(
+                    target: "scan",
+                    job = self.job.job_id(),
+                    url = %safe_url(page.as_str()),
+                    form = form.index,
+                    "crawl: the live form is not the form the page declared; skipped"
+                );
                 continue;
             }
             self.fill_form(&form).await;
@@ -891,8 +1012,8 @@ mod tests {
     use crate::crawl::frontier::{limits_for, Crawler};
     use crate::limits::MAX_CLICKABLES_LISTED;
     use crate::testutil::{
-        captured_flow, request, response, FakeBrowser, FakeJob, PageScript, ScriptedClient,
-        CLICKABLES_MARKER,
+        captured_flow, request, response, FakeBrowser, FakeJob, LiveFormScript, PageScript,
+        ScriptedClient, CLICKABLES_MARKER, TAG_FORM_MARKER,
     };
     use crate::url_norm::parse_absolute;
 
@@ -928,14 +1049,21 @@ mod tests {
     /// The site of the plan's test: every page carries one capture, so each
     /// navigation, submission and click adds exactly one flow to the store.
     fn pages() -> FakeBrowser {
+        pages_with_home(home())
+    }
+
+    /// The home page of [`pages`], before any live-form override.
+    fn home() -> PageScript {
+        PageScript::new(HOME)
+            .with_forms(&[(0, SEARCH)])
+            .with_clickables(&[(BUTTON, "http://t:8080/clicked")])
+            .with_captures(vec![request("GET", ROOT, &[], None)])
+    }
+
+    /// [`pages`] with `home` standing in for the root page.
+    fn pages_with_home(home: PageScript) -> FakeBrowser {
         FakeBrowser::new(vec![
-            (
-                ROOT,
-                PageScript::new(HOME)
-                    .with_forms(&[(0, SEARCH)])
-                    .with_clickables(&[(BUTTON, "http://t:8080/clicked")])
-                    .with_captures(vec![request("GET", ROOT, &[], None)]),
-            ),
+            (ROOT, home),
             (
                 "http://t:8080/a",
                 PageScript::new("<html><body>a</body></html>").with_captures(vec![request(
@@ -1005,21 +1133,14 @@ mod tests {
             .await
             .expect("the crawl succeeds");
 
-        assert_eq!(
-            driving(&browser),
-            vec![
-                "navigate http://t:8080/".to_string(),
-                "type form[data-aitm-form=\"0\"] [name=\"q\"] = aitm-aitm7f3a".to_string(),
-                // The return before the click: the submit navigated away.
-                "navigate http://t:8080/".to_string(),
-                "click body > button:nth-child(3)".to_string(),
-                "navigate http://t:8080/a".to_string(),
-            ]
-        );
+        // The second navigation to `/` is the return before the click: the
+        // submit navigated away.
+        assert_eq!(driving(&browser), pinned_driving());
         assert_eq!(job.charges.load(Ordering::SeqCst), 5);
         assert_eq!(report.pages, 4);
         assert_eq!(report.attempts, 2);
         assert_eq!(report.forms_submitted, 1);
+        assert_eq!(report.forms_skipped, 0);
         assert_eq!(report.clicks, 1);
         assert_eq!(report.stopped_reason, None);
 
@@ -1040,6 +1161,149 @@ mod tests {
             }
         }
         assert_eq!(report.flows.len(), store.count() - 1);
+    }
+
+    /// The driving sequence `browser_crawl_pins` pins.
+    fn pinned_driving() -> Vec<String> {
+        vec![
+            "navigate http://t:8080/".to_string(),
+            "type form[data-aitm-form=\"0\"] [name=\"q\"] = aitm-aitm7f3a".to_string(),
+            "navigate http://t:8080/".to_string(),
+            "click body > button:nth-child(3)".to_string(),
+            "navigate http://t:8080/a".to_string(),
+        ]
+    }
+
+    // --- S-I2: the live form must be the form the extractor read -------------
+
+    /// The extracted form posts to `/search`, but the form the live page holds
+    /// at that index points at a third party: nothing is typed, nothing is
+    /// submitted, no request leaves, and the report counts the skip.
+    #[tokio::test]
+    async fn live_form_off_origin_is_skipped() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = home().with_live_form(
+            0,
+            LiveFormScript {
+                action: Some("https://evil.test/collect".to_string()),
+                method: Some("post".to_string()),
+                enctype: None,
+                names: vec!["q".to_string()],
+            },
+        );
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert_eq!(
+            driving(&browser),
+            vec![
+                "navigate http://t:8080/".to_string(),
+                "click body > button:nth-child(3)".to_string(),
+                "navigate http://t:8080/a".to_string(),
+            ]
+        );
+        assert!(
+            !browser
+                .log_lines()
+                .iter()
+                .any(|line| line.starts_with("submit ")),
+            "{:?}",
+            browser.log_lines()
+        );
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.forms_skipped, 1);
+        assert_eq!(report.clicks, 1);
+        // Only the navigations' and the click's captures exist; nothing left
+        // for `evil.test` and nothing reached `/search`.
+        for id in store.list() {
+            let Some(Flow::Http(flow)) = store.get(id) else {
+                panic!("the double stores HTTP flows");
+            };
+            assert!(
+                !flow.request.authority.contains("evil"),
+                "{:?}",
+                flow.request.path
+            );
+            assert!(
+                !flow.request.path.starts_with("/search"),
+                "{:?}",
+                flow.request.path
+            );
+        }
+    }
+
+    /// The live form's controls are not the extracted form's controls (a
+    /// re-rendered page swapped the form at this index): skipped and counted.
+    #[tokio::test]
+    async fn live_form_with_other_controls_is_skipped() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = home().with_live_form(
+            0,
+            LiveFormScript {
+                action: Some("/search".to_string()),
+                method: Some("get".to_string()),
+                enctype: None,
+                names: vec!["q".to_string(), "card_number".to_string()],
+            },
+        );
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert!(
+            !browser
+                .log_lines()
+                .iter()
+                .any(|line| line.starts_with("submit ") || line.starts_with("type ")),
+            "{:?}",
+            browser.log_lines()
+        );
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.forms_skipped, 1);
+    }
+
+    /// Live attributes that agree with the extracted form (same action, method
+    /// in another case, the same control names) submit exactly as
+    /// `browser_crawl_pins` pins.
+    #[tokio::test]
+    async fn live_form_that_matches_submits_as_pinned() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = home().with_live_form(
+            0,
+            LiveFormScript {
+                action: Some("/search".to_string()),
+                method: Some("GeT".to_string()),
+                enctype: None,
+                names: vec!["q".to_string()],
+            },
+        );
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert_eq!(driving(&browser), pinned_driving());
+        assert_eq!(report.forms_submitted, 1);
+        assert_eq!(report.forms_skipped, 0);
+        assert_eq!(job.charges.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
@@ -1320,10 +1584,37 @@ mod tests {
 
     #[test]
     fn js_helpers_pin() {
-        assert_eq!(
-            tag_form_js(2),
-            "document.forms[2].setAttribute(\"data-aitm-form\",\"2\")"
-        );
+        // Tagging reads the LIVE form back through the prototype getters, so
+        // an `<input name="action">` (or `name="getAttribute"`) in the form
+        // cannot answer for the form itself; it reads the DOM and nothing else.
+        let tag = tag_form_js(2);
+        assert!(tag.starts_with(TAG_FORM_MARKER), "{tag}");
+        assert!(tag.contains("document.forms[2]"), "{tag}");
+        assert!(tag.contains("\"data-aitm-form\",\"2\""), "{tag}");
+        for needed in [
+            "Element.prototype.getAttribute",
+            "Element.prototype.setAttribute",
+            "HTMLFormElement.prototype,\"elements\"",
+            "\"action\"",
+            "\"method\"",
+            "\"enctype\"",
+            "names",
+        ] {
+            assert!(tag.contains(needed), "{needed}: {tag}");
+        }
+        for forbidden in [
+            ".action",
+            ".method",
+            ".enctype",
+            "fetch(",
+            "XMLHttpRequest",
+            "location",
+            ".submit(",
+            ".click(",
+            "innerHTML",
+        ] {
+            assert!(!tag.contains(forbidden), "{forbidden}: {tag}");
+        }
         assert_eq!(
             submit_form_js(1),
             "document.forms[1].requestSubmit ? document.forms[1].requestSubmit() : document.forms[1].submit()"

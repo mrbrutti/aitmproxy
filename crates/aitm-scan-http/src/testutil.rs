@@ -277,6 +277,44 @@ pub(crate) struct PageScript {
     /// Requests inserted into the store as captured flows when this page is
     /// reached, standing in for what the proxy would have captured.
     pub captures: Vec<HttpRequest>,
+    /// What the *live* form at an index reports when the crawler tags it
+    /// (S-I2). Without an entry the double derives the answer from `html`
+    /// with the real extractor, so the live form is the declared form; a test
+    /// that wants the two to diverge (a JS-mounted third-party form) sets one.
+    pub live_forms: HashMap<usize, LiveFormScript>,
+}
+
+/// The attributes and control names the live form at one index reports back
+/// to the crawler's tagging expression.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LiveFormScript {
+    pub action: Option<String>,
+    pub method: Option<String>,
+    pub enctype: Option<String>,
+    pub names: Vec<String>,
+}
+
+impl LiveFormScript {
+    /// The `Value` the tagging expression answers with.
+    fn to_value(&self) -> Value {
+        let text = |value: &Option<String>| match value {
+            Some(text) => Value::Str(text.clone()),
+            None => Value::Null,
+        };
+        Value::Object(
+            [
+                ("action".to_string(), text(&self.action)),
+                ("method".to_string(), text(&self.method)),
+                ("enctype".to_string(), text(&self.enctype)),
+                (
+                    "names".to_string(),
+                    Value::Array(self.names.iter().cloned().map(Value::Str).collect()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
 }
 
 impl PageScript {
@@ -289,7 +327,15 @@ impl PageScript {
             clickables: Vec::new(),
             forms: Vec::new(),
             captures: Vec::new(),
+            live_forms: HashMap::new(),
         }
+    }
+
+    /// The same page whose live form `index` reports `live` instead of what
+    /// `html` declares.
+    pub(crate) fn with_live_form(mut self, index: usize, live: LiveFormScript) -> Self {
+        self.live_forms.insert(index, live);
+        self
     }
 
     /// The same page with `clickables` attached.
@@ -334,6 +380,10 @@ pub(crate) struct FakeBrowser {
 /// The comment a crawler puts in the expression that asks for the page's
 /// clickable elements.
 pub(crate) const CLICKABLES_MARKER: &str = "/*aitm-clickables*/";
+
+/// The comment a crawler puts in the expression that tags a form and reads
+/// its live attributes back.
+pub(crate) const TAG_FORM_MARKER: &str = "/*aitm-tag-form*/";
 
 impl FakeBrowser {
     /// A browser serving `pages`, keyed by exact URL, starting on no page.
@@ -530,6 +580,30 @@ impl BrowserDriver for FakeBrowser {
                     })
                     .unwrap_or_default();
                 return Ok(Value::Array(items));
+            }
+            if expr.contains(TAG_FORM_MARKER) {
+                let index = form_index(&expr);
+                let current = self.current_url();
+                let Some(page) = self.pages.get(&current) else {
+                    return Ok(Value::Null);
+                };
+                if let Some(live) = page.live_forms.get(&index) {
+                    return Ok(live.to_value());
+                }
+                // No override: the live form is the one the markup declares.
+                let declared = crate::crawl::extract::extract(&page.html)
+                    .forms
+                    .into_iter()
+                    .find(|form| form.index == index);
+                return Ok(declared.map_or(Value::Null, |form| {
+                    LiveFormScript {
+                        action: form.action.clone(),
+                        method: Some(form.method.clone()),
+                        enctype: form.enctype.clone(),
+                        names: form.fields.iter().map(|field| field.name.clone()).collect(),
+                    }
+                    .to_value()
+                }));
             }
             if expr.contains("requestSubmit") || expr.contains(".submit()") {
                 let index = form_index(&expr);

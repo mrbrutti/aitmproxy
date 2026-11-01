@@ -187,11 +187,15 @@ pub(crate) fn extract(html: &str) -> Extracted {
             i = scan_tag(html, j, None);
             continue;
         }
-        // Raw-text elements: their content is script or CSS, not markup, so
-        // `var action = "/api/delete-all"` inside one is not a form. `<script>`
-        // still has its `src` read, so it goes through `Walk::open`.
-        if tag == "style" {
-            i = raw_text_end(html, "style", scan_tag(html, j, None));
+        // Raw-text elements: their content is script, CSS or plain text, not
+        // markup, so `var action = "/api/delete-all"` inside one is not a form
+        // and a `<form>` written inside a `<title>`, `<noscript>` or `<xmp>` is
+        // not one either; the live DOM has no such form, and counting one would
+        // put every later form's index off by one (S-I2). `<script>` still has
+        // its `src` read and `<textarea>` its name, so those two go through
+        // `Walk::open`, which skips their bodies the same way.
+        if is_raw_text_element(&tag) {
+            i = raw_text_end(html, &tag, scan_tag(html, j, None));
             continue;
         }
         if !is_element_of_interest(&tag) {
@@ -204,6 +208,13 @@ pub(crate) fn extract(html: &str) -> Extracted {
     }
 
     walk.finish()
+}
+
+/// Whether the element's body is text the tokenizer never reads as markup
+/// (besides `<script>` and `<textarea>`, which carry an attribute the walk
+/// wants and are handled in [`Walk::open`]).
+fn is_raw_text_element(tag: &str) -> bool {
+    matches!(tag, "style" | "title" | "noscript" | "xmp")
 }
 
 /// Whether the tokenizer reads this element's attributes at all; every other
@@ -294,6 +305,8 @@ impl<'a> Walk<'a> {
                 });
             }
             "textarea" if self.form.is_some() => return self.open_textarea(attrs, after),
+            // Outside a form its text is still text, never markup.
+            "textarea" => return raw_text_end(self.html, "textarea", after),
             "option" => self.open_option(attrs, after),
             _ => {}
         }
@@ -759,6 +772,35 @@ mod tests {
             r#"<meta http-equiv="refresh" content="éé"><meta http-equiv="refresh" content="日本語=/x"><meta http-equiv="refresh" content="0; URL=/ok">"#,
         );
         assert_eq!(out.links, ["/ok"]);
+    }
+
+    /// S-I2: the bodies of `textarea`, `title`, `noscript` and `xmp` are text,
+    /// never markup, in or out of a form, so a `<form>` written inside one is
+    /// not a form the crawler would submit (the live DOM has no such form, and
+    /// the index of every later form would otherwise be off by one).
+    #[test]
+    fn extract_treats_raw_text_bodies_as_text() {
+        let out = extract(r#"<textarea><form action="/x"><input name="q"></textarea>"#);
+        assert!(out.forms.is_empty(), "{out:?}");
+        assert!(out.links.is_empty());
+
+        let out = extract(concat!(
+            r#"<title><form action="/t"><a href="/t"></title>"#,
+            r#"<noscript><form action="/n"><input name="n"></noscript>"#,
+            r#"<xmp><a href="/x"><form action="/x"></xmp>"#,
+            r#"<TEXTAREA name="free"><form action="/ta"></TEXTAREA>"#,
+            r#"<form action="/real"><textarea name="c"><input name="not-a-field"></textarea></form>"#,
+        ));
+        assert!(out.links.is_empty(), "{:?}", out.links);
+        assert_eq!(out.forms.len(), 1);
+        assert_eq!(out.forms[0].index, 0);
+        assert_eq!(out.forms[0].action.as_deref(), Some("/real"));
+        let names: Vec<&str> = out.forms[0]
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, ["c"]);
     }
 
     /// Controls the plan excludes stay out; the ones it keeps carry their

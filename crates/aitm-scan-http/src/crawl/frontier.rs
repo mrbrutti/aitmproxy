@@ -280,6 +280,9 @@ pub(crate) struct CrawlReport {
     pub attempts: u32,
     /// Forms the crawler submitted.
     pub forms_submitted: u32,
+    /// Forms the browser engine refused to submit because the live form was
+    /// not the form the page markup declared (S-I2).
+    pub forms_skipped: u32,
     /// Elements the crawler clicked.
     pub clicks: u32,
     /// The flows the crawl produced, for the lane to turn into site-map nodes.
@@ -298,6 +301,7 @@ impl fmt::Debug for CrawlReport {
             .field("pages", &self.pages)
             .field("attempts", &self.attempts)
             .field("forms_submitted", &self.forms_submitted)
+            .field("forms_skipped", &self.forms_skipped)
             .field("clicks", &self.clicks)
             .field("flows", &self.flows.len())
             .field("stopped_reason", &self.stopped_reason)
@@ -553,7 +557,7 @@ mod tests {
         // The report never prints a flow's bytes.
         assert_eq!(
             format!("{report:?}"),
-            "CrawlReport { pages: 1, attempts: 0, forms_submitted: 0, clicks: 0, flows: 0, stopped_reason: Some(\"max_pages\"), depth_reached: 3 }"
+            "CrawlReport { pages: 1, attempts: 0, forms_submitted: 0, forms_skipped: 0, clicks: 0, flows: 0, stopped_reason: Some(\"max_pages\"), depth_reached: 3 }"
         );
     }
 }
