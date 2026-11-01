@@ -20,6 +20,16 @@
   `TLSState.tunnelled` ("CONNECT tunnel passed through; not decrypted"); `FlowSummary` (line ~156)
   does not yet produce it from the wire. Shared strings confirmed by the improve-loop session for
   stories S-073/S-074/S-080 (notes `proxyman-capture-flow-gaps.md` §3).
+- Per-host decryption merged as PR #228 (`main 8175eea3` = v0.5.9): `proxy.status` now carries
+  `decrypt = {scope_hosts: Int, decrypting: Bool, advice: String?}` (`crates/aitm-plugins/src/control.rs`
+  ~140–155) where `advice` is the core constant `NOTHING_DECRYPTED_ADVICE` =
+  `"Nothing is decrypted until a host is in Scope."` (`crates/aitm-core/src/config.rs:176`) while
+  `scope_hosts == 0` and `null` once a host is in Scope — "the one constant every surface prints
+  verbatim". Rows carry `tunnel` (`decrypted` | `passthrough` | `failed`), `tunnel_reason`
+  (`out_of_scope`, `pinned`, `client_rejected_certificate`, `client_closed`, `client_tls_error`,
+  `upstream_unreachable`, `upstream_tls_failed`, `protocol_error`), `bytes_up`, `bytes_down`
+  (`crates/aitm-plugins/src/capture.rs` `tunnel_fields` ~265–283; labels in
+  `crates/aitm-core/src/flow.rs` `TunnelMode`/`TunnelReason`).
 
 ## Intent
 
@@ -52,8 +62,8 @@ client-side flag.
   on, the Flows page's empty state shows two lines — for a system proxy that is off, verbatim
   `system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it`; for one
   pointing elsewhere, the same line naming what it found (`system proxy on · 127.0.0.1:9090, not
-  this core — …`) — and `Nothing is decrypted until a host is in Scope — add one`, each with its
-  action (Open Network Settings… / Copy Address; Open Scope…).
+  this core — …`) — and the core's own sentence `Nothing is decrypted until a host is in Scope.`,
+  each with its action (Open Network Settings… / Copy Address; Add Host…).
 - With the CA not trusted (Matt's Mac today), both pages carry one more line, verbatim: `HTTPS is
   not captured until the CA is trusted` — the Flows empty state as a row, the Status checklist as
   the undone step "Trust the aitmproxy CA"; when `ca.status` has not been read, nothing is said
@@ -134,7 +144,11 @@ client-side flag.
   CA work (the `make(caTrust:)` slot, the `.caTrust` entry and step, the `ca.status` read, the
   Flows/Status rendering of the CA line) starts only once that PR is on `main`. The system-proxy,
   All Apps and Scope parts are not gated on it and land first (plan Tasks 1/2 vs 1b/2b).
-- **Start SHA and claims.** Code starts from `main` at or after `5eac2a50` (PR #196 merged) and
+- **`FlowSummary` decoder is a separate claim.** Mapping the wire's `tunnel` field onto
+  `FlowRow.tls` edits `AitmproxyKit/FlowSummary.swift` and adds its Kit tests; the coordinator has
+  asked the orchestrator for that claim. It is plan Task 1c, gated on the answer; everything else
+  here is independent of it, and TR-AC20 becomes unconditional once Task 1c is in.
+- **Start SHA and claims.** Code starts from `main` at or after `8175eea3` (v0.5.9, PR #228 merged; supersedes `5eac2a50`) and
   after the fixture-removal PR; this worktree is rebased onto `5eac2a50` and the design is
   against the working tree. The orchestrator's claim approval is granted for the files in §D7.
   In `Shell/ShellView.swift` only `EmptyFlows` (the struct at ~319–336) and the insertion of the
@@ -247,6 +261,7 @@ real, current case: Matt's Mac carries Proxyman's `127.0.0.1:9090` for HTTP and 
 ```swift
 public enum ConnectionAction {
     …, case openNetworkSettings           // NEW here: title "Open Network Settings…"
+    …, case addScopeHost                  // NEW here: title "Add Host…" — the Scope entry's remedy button (opens Scope with its add sheet)
     // RESERVED for the set-system-proxy session, not added by this spec:
     //   case setSystemProxy, unsetSystemProxy
     // RESERVED for the system-proxy-automation session (CA install side), not added by this spec:
@@ -275,6 +290,20 @@ public struct CATrustFacts: Hashable, Sendable {
     public init?(status: CAStatus)
 }
 
+// AitmproxyKit/DecryptStatus.swift (new)
+/// `proxy.status.decrypt` as the core reports it (v0.5.9+): how many hosts the decryption list
+/// (Scope) holds, whether anything is decrypted, and the one sentence the core asks every surface
+/// to print verbatim while nothing is. nil from an older core (no `decrypt` key).
+public struct DecryptStatus: Hashable, Sendable {
+    public var scopeHosts: Int
+    public var decrypting: Bool
+    /// `NOTHING_DECRYPTED_ADVICE` while `scopeHosts == 0`; nil once a host is in Scope.
+    public var advice: String?
+    public init(scopeHosts: Int, decrypting: Bool, advice: String?)
+    /// nil unless `json` is the `decrypt` object (it always carries `scope_hosts`).
+    public init?(json: JSONValue)
+}
+
 public struct TrafficRoute: Hashable, Sendable {
     public enum Kind: String, Hashable, Sendable, CaseIterable { case systemProxy, allApps, scope, caTrust }
     public let kind: Kind
@@ -286,11 +315,11 @@ public struct TrafficRoute: Hashable, Sendable {
     public let detail: String
     /// What opens the route, primary first; empty when open.
     public let actions: [ConnectionAction]
-    /// `line` split at its first " — ": the state words before it ("system proxy off", "Nothing is
-    /// decrypted until a host is in Scope", the whole CA line) and the remedy after it (nil for the CA
-    /// line and for open entries). The one-line banner is composed from these (§D5).
+    /// The state words: `line` up to its first " — " ("system proxy off", "All Apps off"), or the whole
+    /// line when it has none (the quoted Scope sentence, verbatim with its period; the CA line). The
+    /// one-line banner is the shown entries' states joined with " · " (§D5); remedies are never text
+    /// there — they are the entry's `actions.first`, shown as the banner's one button.
     public var state: String
-    public var remedy: String?
 }
 
 public struct TrafficRoutes: Hashable, Sendable {
@@ -306,8 +335,11 @@ public struct TrafficRoutes: Hashable, Sendable {
     /// The closed entries we know about — system proxy, All Apps, Scope, CA, in that order: the Flows
     /// empty-state lines. Empty unless the bus lane is `.ok`.
     public let advice: [TrafficRoute]
-    /// The one-line banner text above the Flows table, or nil (§D5).
+    /// The one-line banner text above the Flows table, or nil (§D5): the shown entries' `state`s joined " · ".
     public let banner: String?
+    /// The banner's one button: the highest-priority shown entry's `actions.first` (nil when that entry
+    /// has none). Priority: system proxy, All Apps, Scope, CA.
+    public let bannerAction: ConnectionAction?
     public var anyOpen: Bool
 }
 
@@ -327,10 +359,52 @@ public struct ConnectionSummary {
         flowCount: Int, listenAddress: String, coreCapture: CoreCaptureStatus? = nil,
         systemProxy: SystemProxyState? = nil,         // NEW, defaulted so existing call sites compile
         caTrust: CATrustFacts? = nil,                 // NEW; nil = `ca.status` unread/unknown
-        tunnelledFlowCount: Int = 0                   // NEW; rows whose `tls == .tunnelled` (§D5)
+        tunnelledFlowCount: Int = 0,                  // NEW; rows whose `tls == .tunnelled` (§D5)
+        decrypt: DecryptStatus? = nil                 // NEW; `proxy.status.decrypt`, nil from an older core
     ) -> ConnectionSummary
 }
 ```
+
+**Why a `DecryptStatus` value and not a `decryptAdvice: String?` beside `scopeHostCount` (Architect's
+call).** The core's object carries the count, the flag and the sentence together; decoding it once
+means the step's N, the entry's open/closed state and the quoted sentence can never come from two
+reads (`scope.list` is no longer needed for N — `Session.scopeHosts` stays for the Scope page and
+the capture lane). An older core simply yields nil and the fallback strings. The parser is a pure
+Kit test.
+
+**Kit row/detail decoder (plan Task 1c, own claim) — the #228 wire contract, names agreed with the
+improve-loop session (they match the core's types):**
+
+```swift
+public enum TunnelMode: String, Hashable, Sendable { case decrypted, passthrough, failed }
+public enum TunnelReason: String, Hashable, Sendable {
+    case outOfScope = "out_of_scope", pinned, clientRejectedCertificate = "client_rejected_certificate",
+         clientClosed = "client_closed", clientTLSError = "client_tls_error",
+         upstreamUnreachable = "upstream_unreachable", upstreamTLSFailed = "upstream_tls_failed",
+         protocolError = "protocol_error"                                   // unknown label → nil, never a crash
+}
+// on BOTH FlowSummary and FlowRow:
+public var tunnel: TunnelMode?          // wire `tunnel`; nil when not a CONNECT row or an older core
+public var tunnelReason: TunnelReason?  // wire `tunnel_reason`
+public var tunnelBytesUp: Int64?        // wire `bytes_up`  (same guards as request/response bytes)
+public var tunnelBytesDown: Int64?      // wire `bytes_down`
+public var passive: Bool                // wire `passive`; absent → false
+// FlowRow only:
+public var isTunnel: Bool { tunnel != nil }
+// FlowDetail (AitmproxyKit/FlowDetail.swift, decoded in FlowDetail+Wire.swift from meta.tunnel / meta.passive):
+public struct TunnelInfo: Hashable, Sendable { public var mode: TunnelMode; public var reason: TunnelReason?; public var bytesUp: Int64?; public var bytesDown: Int64? }
+public var tunnel: TunnelInfo?
+public var passive: Bool
+```
+
+`FlowRow.tls` from `tunnel`: `.decrypted` → `.decrypted`, `.passthrough` → `.tunnelled`, `.failed` →
+`.pinnedOrFailed`, nil → today's scheme rule (`https`/`wss` → `.decrypted`, else `.none`). `inScope`
+keeps the scope-list rule unchanged. All five row fields join `FlowRow ==` (every mutable field must,
+memory: a missing one made the Apps banner not redraw). The byte counts ride on the row because the
+improve-loop session's tunnel-row inspector and a possible column consume our Kit names; nothing in
+this spec renders them. Wire source: `crates/aitm-plugins/src/capture.rs` `tunnel_fields` (row),
+`crates/aitm-plugins/src/detail.rs` ~355–380 (`meta.passive`, `meta.tunnel {mode, reason, bytes_up,
+bytes_down}`), labels in `crates/aitm-core/src/flow.rs`.
 
 The Kit `CAStatus` decoder gains nothing the sibling does not also need: `CATrustFacts(status:)`
 reads `stores.*.trusted` labels ("yes" → trusted with that store's scope; any "no" and no "yes" →
@@ -348,6 +422,7 @@ does not redefine any of the following.
 | `SystemProxyState.Endpoint` | `host`, `port`, `address` ("host:port") |
 | `SystemProxyRoute` | `.off`, `.thisCore(http:https:)`, `.other(host:port:)` — `state.route(to: listenAddress)` |
 | `ConnectionAction.openNetworkSettings` | title "Open Network Settings…"; `settingsURL` = `x-apple.systempreferences:com.apple.Network-Settings.extension` |
+| `ConnectionAction.addScopeHost` | title "Add Host…"; opens the Scope page with its add sheet — the Scope entry's remedy button (shared with S-073/S-074/S-080) |
 | `ConnectionAction.setSystemProxy`, `.unsetSystemProxy` | **reserved names** for the sibling's actions (candidate titles "Set as System Proxy" / "Restore System Proxy", research 22 §4); not implemented here |
 | `TrafficRoute.Kind.systemProxy` / `.allApps` / `.scope` / `.caTrust` | the two routes, and the two facts that gate what they carry (Scope → decryption, CA → HTTPS) |
 | `CATrustFacts` | `trusted`, `scope` ("user" \| "system"), `fingerprint`, `installing` (sibling), `remedy` (sibling); `init?(status: CAStatus)`; nil slot = unknown |
@@ -389,9 +464,11 @@ The last two rows are the sibling's strings, listed here so there is one table; 
 
 | Fact | String | Where |
 |---|---|---|
-| scope empty (closed) | `Nothing is decrypted until a host is in Scope — add one` (state `Nothing is decrypted until a host is in Scope`, remedy `add one`) | Flows empty-state row, the banner (also when every flow is a tunnel), the `scopeSet` step's detail |
+| scope empty (closed), core v0.5.9+ | **quoted verbatim, and nothing appended**: `proxy.status.decrypt.advice` = `Nothing is decrypted until a host is in Scope.` (core spec D9: every frontend prints it verbatim and never composes its own sentence; `state` = the same string, period included) | Flows empty-state row, the banner (also when every flow is a tunnel), the `scopeSet` step's detail; identical to the TUI's and web's text and survives a core wording change |
+| scope empty (closed), older core (no `decrypt`) | fallback: our own copy of the same words, `Nothing is decrypted until a host is in Scope.` (no remedy suffix) | same |
+| the remedy | the **button**, never text: `Add Host…` (`ConnectionAction.addScopeHost`, new here: `show(.scope)` + the Scope page's add sheet). The Status step keeps `Open Scope…` (`.openScope`) because its title already names the task | Flows row, banner button |
 | scope empty, Status step | `Add a host to Scope` (today with the DNS hint: `Add a host to Scope (for now as example.com:443)`) → **Open Scope…** | `scopeSet` step title / action |
-| scope set (open) | `Scope: N hosts decrypted` via `Format.count` — `Scope: 1 host decrypted`, `Scope: 3 hosts decrypted` | `scopeSet` done title, the Scope entry's line |
+| scope set (open) | ours: `Scope: N hosts decrypted` via `Format.count` — `Scope: 1 host decrypted`, `Scope: 3 hosts decrypted`; N = `decrypt.scope_hosts` when present, else `scopeHostCount` (the core's `advice` is null in this state) | `scopeSet` done title, the Scope entry's line |
 | detail | `Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel` | `TrafficRoute.detail` for `.scope` |
 | system proxy / CA lines | as in the tables above | S-073/S-074 reuse them unchanged |
 
@@ -431,18 +508,18 @@ banner never says it twice. (`CaptureAdvice.onEmptyScope` still drives the captu
 
 Scope fact (always present; `kind = .scope`; `detail` = `Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel`):
 
-| `scopeHostCount` | open | `line` | `actions` |
+Let `d` = `decrypt` (nil from an older core); closed ⇔ `d != nil ? !d.decrypting : scopeHostCount == 0`;
+`N` = `d?.scopeHosts ?? scopeHostCount`.
+
+| state | open | `line` (= `state`: no " — " clause) | `actions` |
 |---|---|---|---|
-| `0` | no | `Nothing is decrypted until a host is in Scope — add one` | `[.openScope]` |
-| `n > 0` | yes | `Scope: ` + `Format.count(n, "host")` + ` decrypted` (`Scope: 1 host decrypted`) | `[]` |
+| closed, `d?.advice` present | no | `d.advice` **verbatim** — today `Nothing is decrypted until a host is in Scope.` | `[.addScopeHost, .openScope]` |
+| closed, `d == nil` or `d.advice == nil` | no | our fallback, the same words: `Nothing is decrypted until a host is in Scope.` | `[.addScopeHost, .openScope]` |
+| open | yes | `Scope: ` + `Format.count(N, "host")` + ` decrypted` (`Scope: 1 host decrypted`) | `[]` |
 
-The All Apps route's `actions` never include `.turnCaptureOn`/`.turnCaptureOff`: the Flows
-surfaces are not capture-switch surfaces (tripwire NS-AC4), so for `.off` they open Settings ▸
-All Apps. The Status page's `extensionOn` *step* keeps its own `.turnCaptureOn` action (§D4);
-only the words are shared. With an external core the capture lane already says "The external
-core does not run the extension"; the system-proxy route still compares against `L`.
-
-`anyOpen` = any non-nil route (system proxy, All Apps) is open; the Scope and CA facts are not routes.
+The text is the core's own sentence so every surface in the product (TUI, web, this app) prints one
+string (core spec D9) and a core wording change reaches this app without an edit; the remedy is the
+**button** `Add Host…`, never appended text. The open form stays ours: the core's `advice` is null then.
 
 CA fact (`nil` when `caTrust == nil`); `kind = .caTrust`, `detail` = `HTTPS on both routes` when
 trusted, else `HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then`:
@@ -451,8 +528,8 @@ trusted, else `HTTPS is not captured until the CA is trusted — browsers using 
 |---|---|---|---|
 | `trusted == true` | yes | `CA trusted (user keychain)` / `(system keychain)` per `scope`; `CA trusted` when `scope` is nil | `[]` |
 | `installing == true` | no | `trusting CA…` | `[]` |
-| `remedy != nil` | no | the `remedy` text (sibling's `CA trust needs an administrator`) | `[]` |
-| otherwise | no | `HTTPS is not captured until the CA is trusted` | `[]` (reserved `.trustCA`/`.openCAPanel` not yet available) |
+| `remedy != nil` | no | the `remedy` text (sibling's `CA trust needs an administrator`) | `[.trustCA, .openCAPanel]` |
+| otherwise | no | `HTTPS is not captured until the CA is trusted` | `[.trustCA, .openCAPanel]` (PR D's cases; title "Trust the aitmproxy CA" — the banner's button when the CA is the highest-priority shown fact) |
 
 `advice` = `[systemProxy, allApps, scope, caTrust].compactMap { $0 }.filter { !$0.open }`, in that
 order, when the bus lane's state is `.ok`, else `[]` (the scope is known only through the bus).
@@ -473,11 +550,12 @@ order, when the bus lane's state is `.ok`, else `[]` (the scope is known only th
   `.openCaptureSettings` (unchanged actions); `.onEmptyScope` / `.on` → "All Apps is on", done,
   `detail` = the route's `detail` (**Architect's call**: was "Capture extension is on", pre-rev-3
   vocabulary; one string, test-pinned).
-- `scopeSet`: keeps its title and action. Undone (`scopeHostCount == 0`): `title` = "Add a host to
+- `scopeSet`: keeps its title and action. Undone (the Scope entry closed, §D3): `title` = "Add a host to
   Scope (for now as example.com:443)" (unchanged; the DNS hint goes with the provider fix), action
-  `.openScope`, `detail` = `Nothing is decrypted until a host is in Scope — add one`. Done: `title` =
-  `Scope: N hosts decrypted` (`Format.count`; was "Scope has n hosts"), action nil, `detail` = the
-  Scope entry's `detail`.
+  `.openScope`, `detail` = the Scope entry's `line` (the quoted core sentence; our same-words fallback
+  on an older core). Done: `title` = `Scope: N hosts
+  decrypted` with N = `decrypt.scopeHosts` when present (`Format.count`; was "Scope has n hosts"),
+  action nil, `detail` = the Scope entry's `detail`.
 - `coreRunning`, `busConnected`, `firstFlow`: unchanged, `detail` nil.
 - `caTrust` (new): **omitted while `routes.caTrust == nil`** (unread or unknown: we can neither say
   it is trusted nor that it is not, and a step that cannot name its fix is noise — the CA page shows
@@ -515,16 +593,22 @@ shown          =  (routesClosed ? [systemProxy, allApps].compactMap{$0}.filter{!
                +  (scopeClosed ∧ (routesClosed ∨ allTunnels) ? [scope] : [])
                +  (caClosed ? [caTrust] : [])                       // priority order
 banner != nil  ⇔  flowCount > 0  ∧  bus.state == .ok  ∧  !shown.isEmpty
-banner         =  shown.map(\.state).joined(" · ")
-               +  (shown.first { $0.remedy != nil }.map { " — " + $0.remedy! } ?? "")
+banner         =  shown.map(\.state).joined(" · ")            // text: states only, no remedy clause
+bannerAction   =  shown.first?.actions.first                     // the one button: the highest-priority remedy
 ```
 
 `tunnelledFlowCount` = the rows whose `FlowRow.tls == .tunnelled` (`AitmproxyKit/Flow.swift`:
 "CONNECT tunnel passed through; not decrypted"), counted by `Session+Connection` and passed into
-`make`. **Conditional on the core story:** today `FlowSummary` maps every `https`/`wss` row to
-`.decrypted` and never emits `.tunnelled`; the per-host-decryption core story must surface
-tunnelled CONNECTs as rows with a wire field the Kit maps to `.tunnelled`. Until it lands,
-`tunnelledFlowCount` is 0, `allTunnels` is false, and TR-AC20 is deferred (it says so).
+`make`. The core (v0.5.9, PR #228) surfaces every CONNECT as a row with `tunnel` =
+`passthrough` | `decrypted` | `failed`; the Kit decoder maps `passthrough` → `.tunnelled` (plan Task
+1c, its own claim, §D2). Until Task 1c is in, `FlowSummary` still maps every `https`/`wss` row to
+`.decrypted`, `tunnelledFlowCount` is 0, `allTunnels` is false and TR-AC20 is deferred; with Task
+1c in, TR-AC20 is unconditional.
+
+**Quoted sentence in the composed line.** The Scope `state` is the core's sentence verbatim,
+period included, so a composed line reads `… · Nothing is decrypted until a host is in Scope. · …`
+(verbatim beats typography — the text must equal the TUI's and web's); its remedy is the button
+`Add Host…`. A single shown Scope fact yields exactly the core's sentence.
 
 **Why "all tunnels", not "any tunnel" (Architect's call).** A tunnel row carries its own remedy
 in the inspector (the improve-loop session's `Add <host> to Scope (⌥⏎)`), so one unreadable row
@@ -532,23 +616,26 @@ among readable ones needs no banner. When every row is a tunnel the operator can
 the one line says why; with a route open and some rows readable, the Scope fact is not banner
 material (anti-goal: nagging). It always appears in the empty state when closed.
 
-**Composed form (Architect's call, after the improve-loop measurement).** Up to four facts
-compete for one 40 pt line; four full lines joined would be ~260 characters and the tail would
-never be seen. The banner names every shown fact by its *state words* and carries the *one
-remedy* of the highest-priority shown fact that has one: system proxy, then All Apps, then Scope,
-then the CA (whose line has no remedy clause). A single shown fact yields exactly its full
-`line`, so every single-fact literal elsewhere in this spec is unchanged. Literals:
+**Composed form (Architect's call, after the improve-loop measurement; shape aligned with core
+spec D9).** Up to four facts compete for one 40 pt line, and full lines with remedies would be
+~260 characters. The banner names every shown fact by its *state words* joined with ` · ` and
+carries **no remedy text at all**; the remedy is the banner's one **button**, the highest-priority
+shown fact's primary action: system proxy → `Open Network Settings…`, All Apps off → `All Apps
+Settings…`, Scope → `Add Host…`, CA → `Trust the aitmproxy CA`. So the system-proxy and CA
+remedies become buttons too, and the Scope text is the core's sentence untouched. Literals
+(button in the last column):
 
-| Shown facts | `banner` |
-|---|---|
-| fresh install: system proxy off + All Apps off + scope empty + CA not trusted | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it` |
-| system proxy off + All Apps off + scope empty | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it` |
-| a route open + scope empty + every row a tunnel | `Nothing is decrypted until a host is in Scope — add one` |
-| a route open + scope empty + every row a tunnel + CA not trusted | `Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one` |
-| a route open + scope empty + some rows readable (plain HTTP) | nil, or the CA line alone when the CA is not trusted |
-| a route open + CA not trusted | `HTTPS is not captured until the CA is trusted` |
-| no extension in the build + system proxy off + scope empty | `system proxy off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it` |
-| no extension in the build + system proxy off + scope set | `system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it` |
+| Shown facts | `banner` | `bannerAction` |
+|---|---|---|
+| fresh install: system proxy off + All Apps off + scope empty + CA not trusted | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted` | `.openNetworkSettings` |
+| system proxy off + All Apps off + scope empty | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.` | `.openNetworkSettings` |
+| system proxy off + All Apps off + scope set | `system proxy off · All Apps off` | `.openNetworkSettings` |
+| a route open + scope empty + every row a tunnel | `Nothing is decrypted until a host is in Scope.` | `.addScopeHost` |
+| a route open + scope empty + every row a tunnel + CA not trusted | `Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted` | `.addScopeHost` |
+| a route open + scope empty + some rows readable (plain HTTP) | nil, or `HTTPS is not captured until the CA is trusted` when the CA is not trusted | — / `.trustCA` |
+| a route open + CA not trusted | `HTTPS is not captured until the CA is trusted` | `.trustCA` |
+| no extension in the build + system proxy off + scope empty | `system proxy off · Nothing is decrypted until a host is in Scope.` | `.openNetworkSettings` |
+| no extension in the build + system proxy off + scope set | `system proxy off` | `.openNetworkSettings` |
 
 A closed CA fact alone does not close the routes, but it adds its state whenever flows exist and
 HTTPS is not trusted: the flows the operator sees are the plain-HTTP ones and every HTTPS attempt
@@ -556,9 +643,9 @@ is failing right now.
 
 The view (`RouteBanner`) shows `banner` in one line — `lineLimit(1)`, `truncationMode(.tail)`,
 `Tok.Size.Row.dense` (40 pt), tertiary ink, the former `ScopeBanner` shape — with the full
-`banner` and the shown entries' `detail`s joined with ` · ` as its `.help`, and one `SmallButton`
-per shown entry's primary action (at most two: Open Network Settings…, Open Scope… / All Apps
-Settings…; the CA fact has none).
+`banner` and the shown entries' `detail`s joined with ` · ` as its `.help`, and **one** `SmallButton`
+for `bannerAction` (`Open Network Settings…` / `All Apps Settings…` / `Add Host…` / `Trust the
+aitmproxy CA`); nothing else sits on the line.
 
 **One banner line, everywhere flows are listed (§D8).** On every page that renders the flow
 table — Flows, Pinned, Domains, Apps — the route banner is the only banner: shown iff
@@ -604,16 +691,26 @@ The CA page keeps its own read (untouched); the two agree within one CA tick.
   `AitmproxyKit/CATrustFacts.swift` (new), `Tests/AitmproxyKitTests/CATrustFactsTests.swift` (new)
   and the two additive fields `trustedScope` / `trustReported` in `AitmproxyKit/Panels/CAStatus.swift`.
   `Panels/CAPanel.swift` is **not** changed by anyone here.
-- `Session.swift`: `var systemProxy: SystemProxyState?`, `var caStatus: CAStatus?`.
-- `Session+Connection.swift`: `connectionSummary` passes `systemProxy:` and
-  `caTrust: caStatus.flatMap(CATrustFacts.init)`; new one-line accessor
+- `Session.swift`: `var systemProxy: SystemProxyState?`, `var caStatus: CAStatus?`,
+  `var decrypt: DecryptStatus?` (from `proxy.status.decrypt`, nil until read / on an older core).
+- `Session+Connection.swift`: `connectionSummary` passes `systemProxy:`, `decrypt:`,
+  `tunnelledFlowCount:` and `caTrust: caStatus.flatMap(CATrustFacts.init)`; new one-line accessor
   `var trafficRoutes: TrafficRoutes { connectionSummary.routes }` — the only thing the Flows
   surfaces read, so `connectionSummary`'s reader allow-list does not grow and no lane word can
-  leak into `ShellView.swift`; `perform(connection: .openNetworkSettings)` opens
-  `action.settingsURL` with `NSWorkspace` (and `.approveInSystemSettings` switches to the same
+  leak into `ShellView.swift`; `perform(connection: .addScopeHost)` does `show(.scope)` then
+  `scopeSheetVisible = true` (the Proxy ▸ Scope… menu's add-sheet path); `perform(connection:
+  .openNetworkSettings)` opens `action.settingsURL` with `NSWorkspace` (and `.approveInSystemSettings` switches to the same
   `settingsURL` table).
-- `Bus/SystemProxyReader.swift` (new), `Bus/BusService.swift` (the two system-proxy call sites and
-  `refreshCAStatus()` with its tick counter, §D6).
+- `Bus/SystemProxyReader.swift` (new), `Bus/BusService.swift` (the two system-proxy call sites,
+  `refreshCAStatus()` with its tick counter, §D6, and — in the existing `refreshProxyStatus()` —
+  `session.decrypt = status["decrypt"].flatMap(DecryptStatus.init)`, reset to nil in the `pollLoop`
+  `defer`; no new verb, no new read: `proxy.status` is already polled every tick).
+- `AitmproxyKit/DecryptStatus.swift` (new) + `Tests/AitmproxyKitTests/DecryptStatusTests.swift` (new).
+- `AitmproxyKit/FlowSummary.swift`, `AitmproxyKit/Flow.swift` (`TunnelMode`, `TunnelReason`, the five
+  `FlowRow` fields, `isTunnel`, `==`), `AitmproxyKit/FlowDetail.swift` (`TunnelInfo`, `tunnel`,
+  `passive`), `AitmproxyKit/FlowDetail+Wire.swift` + `Tests/AitmproxyKitTests/FlowSummaryTests.swift`
+  (new), `FlowRowEqualityTests.swift`, `FlowDetailWireTests.swift` — **plan Task 1c, pending the
+  orchestrator's claim answer**; file-disjoint from Task 1; nothing else in this spec touches them.
 - `Shell/RouteBanner.swift` (new): renders `session.trafficRoutes.banner` with the closed
   routes' primary actions through `session.perform(connection:)`; `.openCaptureSettings`, which
   `perform` leaves to the view, sets `settingsTab = .capture` and calls `openSettings()` exactly as
@@ -647,8 +744,8 @@ hit the header and sorted by URL.
 
 Rule: on every page that lists flows, at most ONE 40 pt banner line is ever shown, and it is the
 route banner of this spec. It absorbs the scope line (the Scope fact: `Nothing is decrypted until a
-host is in Scope — add one`; "every host is read-only" is retired) and replaces `AppsAttributionBanner` (its "no source app" case is the
-All Apps / scope / CA state in the shared vocabulary, with the one remedy). Neither old banner is
+host is in Scope.`; "every host is read-only" is retired) and replaces `AppsAttributionBanner` (its "no source app" case is the
+All Apps / scope / CA state in the shared vocabulary, with the one remedy button). Neither old banner is
 rendered when the route banner is, and when nothing is closed no banner is shown at all.
 
 **Apps-page predicate.** Rows exist and `clients` is empty → the route banner iff
@@ -692,7 +789,10 @@ to the route banner: `RouteBanner()` exactly once in `MainView`, guarded by
 
 ### D10. Predicate table
 
-SP = system proxy route; AA = `CaptureAdvice` (on = `.on`/`.onEmptyScope`); SC = `scopeHostCount`;
+SP = system proxy route; AA = `CaptureAdvice` (on = `.on`/`.onEmptyScope`); SC = `decrypt.scopeHosts`
+when `decrypt` is present, else `scopeHostCount` (the scope line is the quoted core sentence when
+`decrypt.advice` is present, the fallback otherwise — same `state`, so every banner literal below holds
+for both);
 T = every row a tunnel; bus `.ok` throughout (with the bus not `.ok`: no advice, no banner, steps
 as today). L = listen address; H:P = a foreign endpoint. The Kit test makes one
 `ConnectionSummary.make` call per row with literal inputs and pins the literal lines. "E" = the
@@ -702,10 +802,10 @@ Flows empty-state entries (0 flows), "B" = the banner (flows > 0).
 |---|---|---|---|---|---|---|
 | unknown (nil) | on | 0 | absent / ✓ All Apps is on / ○ Add a host to Scope … | scope line | no | scope line |
 | off | on | n | ○ system proxy off — … / ✓ / ✓ Scope: n hosts decrypted | system proxy line | no | no (T impossible with a host decrypting — if seen, no) |
-| off | on | 0 | ○ system proxy off — … / ✓ All Apps is on / ○ Add a host to Scope … | system proxy line, scope line | no | `Nothing is decrypted until a host is in Scope — add one` |
-| off | off / awaiting / degraded | 0 | ○ … / ○ All Apps off — … (or waiting / degraded) / ○ Add a host … | system proxy, All Apps, scope lines | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set …` (waiting/degraded state words likewise) | same |
+| off | on | 0 | ○ system proxy off — … / ✓ All Apps is on / ○ Add a host to Scope … | system proxy line, scope line | no | `Nothing is decrypted until a host is in Scope.` |
+| off | off / awaiting / degraded | 0 | ○ … / ○ All Apps off — … (or waiting / degraded) / ○ Add a host … | system proxy, All Apps, scope lines | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. — set …` (waiting/degraded state words likewise) | same |
 | off | off | n | ○ / ○ / ✓ | system proxy, All Apps lines | `system proxy off · All Apps off — set …` | same |
-| off | unsupported or external core | 0 | ○ / "not in this build" or lane / ○ | system proxy, scope lines | `system proxy off · Nothing is decrypted until a host is in Scope — set …` | same |
+| off | unsupported or external core | 0 | ○ / "not in this build" or lane / ○ | system proxy, scope lines | `system proxy off · Nothing is decrypted until a host is in Scope. — set …` | same |
 | off | unsupported or external core | n | ○ / … / ✓ | system proxy line | `system proxy off — set …` | same |
 | other(H,P) | any | any | ○ system proxy on · H:P, not this core — … / per AA / per SC | as the "off" rows with the other line | as the "off" rows with the other state | same |
 | thisCore(·,·) | on | 0 | ✓ system proxy on · L [· HTTP(S) only] / ✓ / ○ Add a host … | scope line | no | scope line |
@@ -742,18 +842,27 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    role: "operator", roleWarning: false, capability: .capturing, captureSupported: true,
    scopeHostCount: 0, flowCount: 0, listenAddress: L, systemProxy: .off).routes.advice.map(\.line) ==
    ["system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it",
-   "Nothing is decrypted until a host is in Scope — add one"]`; `advice.map(\.kind) == [.systemProxy, .scope]`
+   "Nothing is decrypted until a host is in Scope."]`; `advice.map(\.kind) == [.systemProxy, .scope]`
    (All Apps is on, so open: `routes.allApps?.line == "All Apps on"`); `advice.map(\.detail) ==
    ["every proxy-aware app, regardless of Scope", "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"]`;
    `advice[0].actions == [.openNetworkSettings, .copyListenAddress]`; `advice[1].actions == [.openScope]`;
-   `routes.scope.state == "Nothing is decrypted until a host is in Scope"`, `routes.scope.remedy == "add one"`;
-   `banner == nil`; `anyOpen == true` (All Apps). The same with `flowCount: 6` → `advice == []` and
+   `routes.scope.state == "Nothing is decrypted until a host is in Scope."` (= its line), `advice[1].actions == [.addScopeHost, .openScope]`;
+   `banner == nil`, `bannerAction == nil`; `anyOpen == true` (All Apps). The same with `flowCount: 6` → `advice == []` and
    `banner == nil` (a route is open and the rows are readable); with `flowCount: 6, tunnelledFlowCount: 6`
-   → `banner == "Nothing is decrypted until a host is in Scope — add one"`; with `capability: .inactive, flowCount: 6` →
-   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`.
+   → `banner == "Nothing is decrypted until a host is in Scope."`; with `capability: .inactive, flowCount: 6` →
+   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`.
    The same with `systemProxy` both at `127.0.0.1:9090` and `flowCount: 0` →
    `advice[0].line == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it"`
-   and no advice line contains `"off"`.
+   and no advice line contains `"off"`. **Quoted core sentence:** the same inputs plus
+   `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: "Nothing is decrypted until a host is in Scope.")` →
+   `routes.scope.line == "Nothing is decrypted until a host is in Scope."` (verbatim, period included),
+   `routes.scope.state == "Nothing is decrypted until a host is in Scope."` (period kept), `routes.scope.open == false`, `actions == [.addScopeHost, .openScope]`; with `flowCount: 6, tunnelledFlowCount: 6`
+   → `banner == "Nothing is decrypted until a host is in Scope."`; with `capability: .inactive, flowCount: 6` →
+   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`, `bannerAction == .openNetworkSettings`
+   (identical to the fallback composition); the all-tunnels case above has `bannerAction == .addScopeHost`. `decrypt: DecryptStatus(scopeHosts: 2, decrypting: true, advice: nil)` with
+   `scopeHostCount: 0` (stale list) → `routes.scope.open == true`, `line == "Scope: 2 hosts decrypted"`
+   (N comes from `decrypt`). `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil)` →
+   the fallback `line == "Nothing is decrypted until a host is in Scope."`.
 4. **TR-AC4 [kit-unit, predicate table]** One `make` call per row of §D10 pinning `routes` and
    the steps, including: `.inactive` → All Apps line `"All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`
    with `[.openCaptureSettings]`; `.pendingApproval` → `"All Apps waiting for approval — approve the extension in System Settings"`,
@@ -765,7 +874,7 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    `systemProxy: nil, .capturing, scopeHostCount: 0` → `routes.systemProxy == nil` and `advice` holds
    the scope line only; `captureSupported: false` → `routes.allApps == nil`, and with `systemProxy: .off,
    scopeHostCount: 2, flowCount: 3` the banner is the system-proxy line alone, with `scopeHostCount: 0`
-   it is `"system proxy off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`; `systemProxy: .off, capability: .capturing,
+   it is `"system proxy off · Nothing is decrypted until a host is in Scope."` with `bannerAction == .openNetworkSettings`; `systemProxy: .off, capability: .capturing,
    scopeHostCount: 2, flowCount: 3` → `banner == nil` (one route open) and `anyOpen == true`;
    `systemProxy` at `127.0.0.1:9090`, `.capturing`, `scopeHostCount: 2`, `flowCount: 3` →
    `banner == nil`; bus `.disconnected` → `advice == []`, `banner == nil`; `activeKind: .external`
@@ -780,7 +889,7 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    and `allStepsDone` is then true when the other steps are. `.capturing, scopeHostCount: 0` →
    `extensionOn.title == "All Apps is on"` (done, `detail == "in-scope hosts of every app"`) and
    `scopeSet.title == "Add a host to Scope (for now as example.com:443)"`, `done == false`, action
-   `.openScope`, `detail == "Nothing is decrypted until a host is in Scope — add one"`; `.inactive` →
+   `.openScope`, `detail == "Nothing is decrypted until a host is in Scope."`; `.inactive` →
    `extensionOn.title` is the All Apps off line with action `.turnCaptureOn`; `.pendingApproval` →
    the waiting line with `.approveInSystemSettings`; `.capturing, scopeHostCount: 2` →
    `scopeSet.title == "Scope: 2 hosts decrypted"`, `done == true`, `action == nil`,
@@ -795,15 +904,15 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    `caTrust: CATrustFacts(trusted: false, scope: nil, fingerprint: "AB:CD")`:
    `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"`,
    `routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`,
-   `routes.caTrust?.actions == []`, `advice.map(\.kind) == [.systemProxy, .scope, .caTrust]`
+   `routes.caTrust?.actions == [.trustCA, .openCAPanel]`, `advice.map(\.kind) == [.systemProxy, .scope, .caTrust]`
    (All Apps on → open), `anyOpen == true`; `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow]`,
    the `.caTrust` step `title == "Trust the aitmproxy CA"`, `done == false`, `action == nil`,
    `detail` = the detail string above. With `flowCount: 6` → `banner == "HTTPS is not captured until the CA is trusted"`
    (All Apps open, rows readable); with `flowCount: 6, tunnelledFlowCount: 6` →
-   `banner == "Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one"`; with `capability: .inactive, flowCount: 6` →
-   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`.
+   `banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`; with `capability: .inactive, flowCount: 6` →
+   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`.
    With `systemProxy` both at the core, `.capturing`, `scopeHostCount: 2`, `flowCount: 3`, same
-   `caTrust` → `banner == "HTTPS is not captured until the CA is trusted"`, `anyOpen == true`.
+   `caTrust` → `banner == "HTTPS is not captured until the CA is trusted"`, `bannerAction == .trustCA`, `anyOpen == true`.
    With `caTrust: CATrustFacts(trusted: true, scope: "user", fingerprint: "AB:CD")` →
    `routes.caTrust?.line == "CA trusted (user keychain)"`, `open == true`, `detail == "HTTPS on both routes"`,
    the step `title == "CA trusted (user keychain)"`, `done == true`, and with the two routes open
@@ -811,7 +920,8 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    `caTrust: nil` → `routes.caTrust == nil`, no `.caTrust` step, no CA text in `advice` or `banner`.
    `installing: true` → `line == "trusting CA…"`, `open == false`; `remedy: "CA trust needs an administrator"`
    → `line == "CA trust needs an administrator"`.
-6. **TR-AC6 [kit-unit]** `ConnectionAction.openNetworkSettings.title == "Open Network Settings…"`,
+6. **TR-AC6 [kit-unit]** `ConnectionAction.addScopeHost.title == "Add Host…"`, `isDestructive == false`, `settingsURL == nil`;
+   `ConnectionAction.openNetworkSettings.title == "Open Network Settings…"`,
    `.isDestructive == false`, `settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.Network-Settings.extension"`;
    `approveInSystemSettings.settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"`;
    every other action's `settingsURL` is nil; `ConnectionAction` has no case named
@@ -824,7 +934,7 @@ Source tripwires:
 7. **TR-AC7 [structural]** `tools/check-connection-words.sh` PASS on the branch, and FAIL
    (tester mutation, reverted) when `Text("system proxy off — x")`, `Text("system proxy on · x")`,
    `Text("HTTPS is not captured until the CA is trusted")`, `Text("Trust the aitmproxy CA")`
-   or `Text("Nothing is decrypted until a host is in Scope — add one")` is added to any view in
+   or `Text("Nothing is decrypted until a host is in Scope.")` is added to any view in
    `Sources/Aitmproxy`, when `Shell/ShellView.swift` or `Shell/RouteBanner.swift` mentions
    `connectionSummary`, or when a second `trafficRoutes` definition appears.
    `tools/check-capture-operator-only.sh` PASS unchanged and `tools/check-capture-toggle.sh` PASS
@@ -862,7 +972,7 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
     `HTTPEnable : 1`, `HTTPProxy : 127.0.0.1`, `HTTPPort : 9090`, HTTPS the same) and
     `scope.list` over the operator bus `[]`: the Flows page shows "No flows yet" with
     `system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it`
-    and `Nothing is decrypted until a host is in Scope — add one`, each with its detail line and its
+    and `Nothing is decrypted until a host is in Scope.`, each with its detail line and its
     buttons (Open Network Settings…, Copy Address; Open Scope…); the Status page's Getting-started
     list shows `○` the system-proxy line (Open Network Settings…), `✓ All Apps is on`, and
     `○ Add a host to Scope (for now as example.com:443)` (Open Scope…) whose help is the scope line. Nowhere does either
@@ -886,7 +996,7 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
 13. **TR-AC13 [live, banner]** With the system proxy not pointing at the core (as found) and
     `scope.list` `[]`, `curl -x 127.0.0.1:8080 http://example.com/` ×2: the Flows page shows the
     table with the rows and ONE banner line composed per §D5 (the state words of every closed
-    fact, then the system-proxy remedy) with Open Network Settings… and Open Scope…, and no "No
+    fact, no remedy text) with one button, Open Network Settings…, and no "No
     scope set" `ScopeBanner` anywhere; Pinned, Domains and Apps show the same single line and no
     other banner. After `scope.add example.com:443` the All Apps state leaves the line; after
     `scope.remove` and the system proxy set to 127.0.0.1:8080 the system-proxy state leaves it;
@@ -909,20 +1019,23 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
     (`CA trusted (user keychain)`, the line gone) is proved only after Matt says in his own words
     that the CA may be trusted, through the app's own step once `.trustCA` exists — recorded then
     in the plan's Shipped section, not here.
-16. **TR-AC18 [kit-unit, composed banner]** `TrafficRoute.state`/`remedy`: the system-proxy off
-    route has `state == "system proxy off"`, `remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    the CA line has `state` == its line and `remedy == nil`; All Apps `.on(hosts: 2)` has
-    `line == "All Apps on"`, `remedy == nil`; `routes.scope` with `scopeHostCount: 0` has
-    `state == "Nothing is decrypted until a host is in Scope"`, `remedy == "add one"`.
+16. **TR-AC18 [kit-unit, composed banner]** `TrafficRoute.state`: the system-proxy off route has
+    `state == "system proxy off"` (its `line` keeps the ` — set …` clause for the row and the step);
+    the CA line has `state` == its line; All Apps `.on(hosts: 2)` has `line == "All Apps on"`;
+    `routes.scope` with `scopeHostCount: 0` has `state == line == "Nothing is decrypted until a host is in Scope."`. `bannerAction` is
+    the highest-priority shown entry's first action: `.openNetworkSettings` whenever the system-proxy
+    fact is shown, `.openCaptureSettings` when only All Apps + Scope are shown, `.addScopeHost` for
+    the all-tunnels Scope-only case, `.trustCA` for the CA-only case, nil when `banner == nil`.
     `make(… bus ok, capability: .inactive, captureSupported: true, scopeHostCount: 0, flowCount: 3,
     listenAddress: L, systemProxy: .off, caTrust: CATrustFacts(trusted: false, scope: nil, fingerprint: nil))`
-    → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`
+    → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`
     (the fresh-install case); the same with `.capturing` → `banner == "HTTPS is not captured until the CA is trusted"`
-    (All Apps open, rows readable), and with `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one"`;
-    `.capturing`, `caTrust: nil`, `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope — add one"`;
-    `.inactive`, `caTrust: nil` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    `.inactive`, `scopeHostCount: 2`, `caTrust: nil` → `banner == "system proxy off · All Apps off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    every single-fact banner equals that fact's `line`.
+    (All Apps open, rows readable), and with `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`;
+    `.capturing`, `caTrust: nil`, `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope."`;
+    `.inactive`, `caTrust: nil` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`;
+    `.inactive`, `scopeHostCount: 2`, `caTrust: nil` → `banner == "system proxy off · All Apps off"`;
+    every single-fact banner equals that fact's `state` (`"system proxy off"` for the no-extension,
+    scope-set case — never the line with its remedy clause).
 17. **TR-AC19 [live, one banner line]** On the installed app with rows present (TR-AC13 state), on
     each of Flows, Pinned, Domains and Apps: exactly one banner line above the table, none of
     the old texts "No scope set" / "Flows carry no source app" anywhere; the column header's top
@@ -930,19 +1043,45 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
     its position after Edit ▸ Clear empties the list (no rows → `banner == nil` → no banner),
     never 80; Undo Clear restores rows and the single banner. A click on the first row's y
     selects row 1 and does not sort.
-18. **TR-AC20 [live, per-host decryption — CONDITIONAL on the core story]** Applies only once the
-    core decrypts per host and surfaces tunnelled CONNECTs as rows the Kit maps to
-    `TLSState.tunnelled`; until then it is recorded as deferred, not failed. With the system proxy
-    pointing at the core (TR-AC12's 8080 step) and `scope.list` `[]`, Safari → `https://example.com/`:
-    the row appears with the SSL column in its tunnel state, no body; with every row a tunnel the
-    banner reads `Nothing is decrypted until a host is in Scope — add one` (with the CA untrusted:
-    `Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one`).
-    `scope.add example.com:443` → the next request's row is decrypted (SSL column decrypted, body
-    present), the line leaves both pages and the `scopeSet` step reads `✓ Scope: 1 host decrypted`;
-    `scope.remove` → the next row is a tunnel again and the line is back. Decryption of a host
-    additionally requires the CA to be trusted on that Mac; on Matt's Mac this clause waits for his
-    decision (hard gate), so the decrypted-row half is proved on a Mac whose keychain trusts the CA
-    or recorded as deferred with the CA half.
+18. **TR-AC20 [live, per-host decryption, v0.5.9+]** Unconditional once plan Task 1c (the `tunnel`
+    decoder) is in; until then recorded as deferred, not failed. With the installed app on the
+    v0.5.9+ core, `scope.list` `[]`, and curl pointed at the proxy:
+    `curl -x 127.0.0.1:8080 https://example.com/` → one row whose SSL column shows the tunnel state
+    (`flow.get` carries `tunnel: "passthrough"`, `tunnel_reason: "out_of_scope"`; no body); with every
+    row a tunnel (Edit ▸ Clear first) the banner reads exactly the core's sentence
+    `Nothing is decrypted until a host is in Scope.` (with the CA untrusted on that Mac:
+    `Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted`, button `Add Host…`),
+    and the Flows empty state (after another Clear) shows the same quoted sentence as its row with
+    `Add Host…` (and `Open Scope…`). `proxy.status.decrypt` over the bus reads `{scope_hosts: 0, decrypting: false,
+    advice: "Nothing is decrypted until a host is in Scope."}`. `scope.add example.com:443` → the
+    line leaves both pages within one poll, the `scopeSet` step reads `✓ Scope: 1 host decrypted`,
+    `proxy.status.decrypt.advice` is null; `curl -x 127.0.0.1:8080 --cacert <exported PEM>
+    https://example.com/` (PEM from `aitm ca export` / the CA page's Export PEM — a file, no keychain
+    change, so the hard gate holds) → a row with `tunnel: "decrypted"`, SSL column decrypted, body
+    present. `scope.remove` → the next `curl https://` row is a passthrough tunnel again and the
+    line is back. Safari's HTTPS still needs the keychain to trust the CA and stays under the hard
+    gate; curl with `--cacert` is the decrypted-row proof.
+19. **TR-AC21 [kit-unit, `DecryptStatus`]** `DecryptStatus(json:)` over literal `JSONValue` objects:
+    `{"scope_hosts": 0, "decrypting": false, "advice": "Nothing is decrypted until a host is in Scope."}`
+    → `scopeHosts == 0`, `decrypting == false`, `advice == "Nothing is decrypted until a host is in Scope."`;
+    `{"scope_hosts": 2, "decrypting": true, "advice": null}` → `scopeHosts == 2`, `decrypting == true`,
+    `advice == nil`; `{}` → nil; a `proxy.status` object without `decrypt` → `status["decrypt"].flatMap(DecryptStatus.init) == nil`.
+20. **TR-AC22 [kit-unit, the #228 row/detail decoder — plan Task 1c]** With literal `flow.get`
+    objects (`scheme: "https"`): `tunnel: "passthrough"` → `FlowSummary.tunnel == .passthrough`,
+    `row.tls == .tunnelled`, `row.isTunnel == true`; `"failed"` → `.failed` / `.pinnedOrFailed`;
+    `"decrypted"` → `.decrypted` / `.decrypted`; `tunnel: null` or absent → `tunnel == nil`,
+    `isTunnel == false`, `tls == .decrypted` (scheme rule); `scheme: "http"`, no `tunnel` → `.none`.
+    `tunnel_reason`: each of the eight labels decodes to its `TunnelReason` case
+    (`"out_of_scope"` → `.outOfScope`, …, `"protocol_error"` → `.protocolError`); `"something_new"`
+    → `tunnelReason == nil` (never a crash); absent → nil. `bytes_up: 1234`, `bytes_down: 56` →
+    `tunnelBytesUp == 1234`, `tunnelBytesDown == 56` on summary and row; null/absent → nil;
+    `passive: true` → `passive == true`; absent → `false`. `FlowDetail(json:)` over a literal detail
+    object with `meta.tunnel: {mode: "passthrough", reason: "out_of_scope", bytes_up: 1, bytes_down: 2}`
+    and `meta.passive: false` → `detail.tunnel == TunnelInfo(mode: .passthrough, reason: .outOfScope,
+    bytesUp: 1, bytesDown: 2)`, `detail.passive == false`; `meta.tunnel: null` → `detail.tunnel == nil`;
+    `meta.passive` absent → `false`. `FlowRow ==` notices a change in each of `tunnel`,
+    `tunnelReason`, `tunnelBytesUp`, `tunnelBytesDown`, `passive` (one `FlowRowEqualityTests` row per
+    field); `inScope` is unchanged by any of them.
 
 ## Left to the builder
 
@@ -963,6 +1102,7 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
   `CaptureAdvice.banner` is a later cleanup with its own tripwire edits; not here.
 - How `tunnelledFlowCount` is counted in `Session+Connection` (a filter over `rows` is fine at
   today's sizes; cache it beside `rowsVersion` if it shows in a profile).
+- Whether `FlowSummary.tunnel` is stored as `String?` or a small enum; only the `tls` mapping is pinned.
 
 ## Open questions
 
@@ -987,9 +1127,9 @@ None block. Calls Matt may want to flip (each a one-line change):
    not trusted; the sibling may prefer a non-failable init plus a `known` flag.
 10. The CA step and row ship without a button until `.trustCA`/`.openCAPanel` land; an interim
     navigation action to the CA page would be one more case.
-11. Composed banner (§D5): state words of every closed fact + the one remedy of the highest-priority
-    fact (system proxy > All Apps > CA). Alternative: show only the highest-priority fact's full
-    line and a count ("· 2 more").
+11. Composed banner (§D5): state words of every shown fact as text, the highest-priority fact's
+    remedy as the one button (system proxy > All Apps > Scope > CA). Alternative: show only the
+    highest-priority fact's state and a count ("· 2 more").
 12. The read-only-scope banner retires from the list pages (its fact lives in the route banner, the
     status bar and the Scope page). Alternative: keep it on pages where the route banner is absent.
 13. The Scope fact enters the banner only when both routes are closed or EVERY row is a tunnel
@@ -1000,6 +1140,12 @@ None block. Calls Matt may want to flip (each a one-line change):
     tells the operator. Alternative: keep All Apps closed on an empty scope until the story ships.
 15. Done form `Scope: N hosts decrypted` (coordinators' proposal, accepted) rather than "Scope has n
     hosts"; `Format.count` gives `1 host` / `n hosts`.
+16. `DecryptStatus` value over a bare `decryptAdvice: String?` (§D2). The banner carries no remedy
+    text for any fact — states joined, one remedy button (core spec D9 alignment); the quoted
+    Scope sentence keeps its period inside a composed line (verbatim beats typography).
+    Alternative: strip the period in the composed form only.
+17. The five #228 row fields ride on `FlowRow` (agreed Kit names; the improve-loop inspector and a
+    possible column consume them) even though this spec renders none of them. Alternative: summary-only.
 
 ## Summary
 
@@ -1008,7 +1154,7 @@ One Kit value, `ConnectionSummary.routes`, derived inside `make` from a new publ
 into the proxy — the macOS system proxy (every proxy-aware app, regardless of Scope) and All
 Apps (in-scope hosts of every app) — as open or closed with one line, one detail and one action
 each, plus two facts that gate what the routes carry: Scope (per-host decryption, Matt's
-2026-10-31 decision: `Nothing is decrypted until a host is in Scope — add one`, shown in the banner
+2026-10-31 decision: `Nothing is decrypted until a host is in Scope.`, shown in the banner
 when both routes are closed or every row is a tunnel) and CA trust. The Status page's Getting-started list (a new `systemProxy` step; the
 `extensionOn`/`scopeSet` steps' words) and the Flows page's empty state and one-line banner read
 `Session.trafficRoutes` and nothing else, so they cannot disagree; the banner shows only while
@@ -1030,7 +1176,9 @@ app with the real system proxy flipped — no fixture or sample-data UI tests.
 - 2026-10-31 (coordinating session, agreed with the system-proxy session): `SystemProxyState(settings:)` accepts a Port given as a number or a numeric string; the "Network Settings…" menu item sits in a new Proxy-menu group right after the first divider (before Browser), with that session's "Set as System Proxy" toggle (⌥⌘P) to be added on the line above it. ⌥⌘P is unused by the app today (`grep keyboardShortcut("p"` finds nothing).
 - 2026-10-31 (coordinating session, agreed with the NE and system-proxy-automation sessions): third fact **CA trust** added — `CATrustFacts` (`trusted`, `scope`, `fingerprint`, sibling-owned `installing`/`remedy`), `make(caTrust:)`, `TrafficRoute.Kind.caTrust`, step `caTrust` "Trust the aitmproxy CA" / `CA trusted (user keychain)`, line `HTTPS is not captured until the CA is trusted`, detail `… — browsers using QUIC load directly until then`, banner rule `bothClosed ∨ caClosed`, `ca.status` read every 10th tick; `.trustCA`/`.openCAPanel` reserved; **hard gate: no `ca.install` on Matt's Mac in any proof** (TR-AC15–17).
 - 2026-10-31 (coordinating session, after the improve-loop measurement on `main 9dba3d9f`): D8 widened — one 40 pt banner line on every list page (Flows, Pinned, Domains, Apps), the route banner only; `ScopeBanner()` and `AppsAttributionBanner()` call sites removed from `MainView.flows` (structs kept), `check-capture-toggle.sh` NS-AC8 pins move to `RouteBanner()`; composed banner form (`TrafficRoute.state`/`remedy`; states joined ` · ` + the one remedy, priority system proxy > All Apps > CA) with the fresh-install literal `system proxy off · All Apps off · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`; Apps-page predicate stated; TR-AC18 (kit) and TR-AC19 (live header position) added; TR-AC3/13/16 literals updated.
-- 2026-10-31 (coordinating session, Matt's per-host-decryption decision; strings confirmed by the improve-loop session for S-073/S-074/S-080): the Scope fact becomes its own `TrafficRoute` (`Kind.scope`, always present) with line `Nothing is decrypted until a host is in Scope — add one` / `Scope: N hosts decrypted` and detail `Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel`; All Apps is closed only when off/awaiting/degraded (open line `All Apps on`), so no clause repeats; `make(tunnelledFlowCount:)` from `FlowRow.tls == .tunnelled`; banner rule `routesClosed ∨ (scopeClosed ∧ (routesClosed ∨ allTunnels)) ∨ caClosed` with the fresh-install literal `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`; `scopeSet` keeps title/action, done form `Scope: N hosts decrypted`, detail = the scope line; "every host is read-only" retired; D2a lists the improve-loop session's adjacent tunnel-row strings; TR-AC3/4/5/16/18 literals updated, TR-AC20 (conditional on the core story) added; `check-connection-words.sh` prefixes gain `"Nothing is decrypted` and `"Scope:`.
+- 2026-10-31 (coordinating session, Matt's per-host-decryption decision; strings confirmed by the improve-loop session for S-073/S-074/S-080): the Scope fact becomes its own `TrafficRoute` (`Kind.scope`, always present) with line `Nothing is decrypted until a host is in Scope.` / `Scope: N hosts decrypted` and detail `Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel`; All Apps is closed only when off/awaiting/degraded (open line `All Apps on`), so no clause repeats; `make(tunnelledFlowCount:)` from `FlowRow.tls == .tunnelled`; banner rule `routesClosed ∨ (scopeClosed ∧ (routesClosed ∨ allTunnels)) ∨ caClosed` with the fresh-install literal `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`; `scopeSet` keeps title/action, done form `Scope: N hosts decrypted`, detail = the scope line; "every host is read-only" retired; D2a lists the improve-loop session's adjacent tunnel-row strings; TR-AC3/4/5/16/18 literals updated, TR-AC20 (conditional on the core story) added; `check-connection-words.sh` prefixes gain `"Nothing is decrypted` and `"Scope:`.
 - 2026-10-31 (coordinating session, agreed with the CA-trust session): `CATrustFacts.swift`, `CATrustFactsTests.swift` and the two additive `CAStatus` fields are implemented in the CA-trust session's PR (number TBD) to this spec's definitions; this spec remains the contract (TR-AC15 proved there). Our CA work (`make(caTrust:)`, `.caTrust` entry/step, `ca.status` read, rendering) is gated on that PR; system-proxy/All Apps/Scope parts are not (plan Tasks 1/2 split into 1/1b and 2/2b).
 
 - 2026-10-31 (coordinating session, orchestrator registry update): the CA-trust session's mac PR D lands BEFORE this spec's PR and carries, as a narrow additive exception on `ConnectionSummary.swift`, `ConnectionAction.trustCA` and `.openCAPanel` with their titles and `GettingStartedStep.Kind.caTrusted` with its title — nothing else; `CATrustFacts` and the two `CAStatus` fields live in that PR too. This spec's step kind is therefore `.caTrusted` (not `.caTrust`; the route kind `TrafficRoute.Kind.caTrust` is unchanged), Task 1 must not redeclare those cases, and this branch rebases onto PR D's merged SHA before Task 1b/2b. Coding still starts on the fixture-removal SHA.
+- 2026-11-01 (coordinating session, after PR #228 / v0.5.9): the Scope entry quotes `proxy.status.decrypt.advice` verbatim (`Nothing is decrypted until a host is in Scope.`) when present and falls back to our `… — add one` on an older core; `make(decrypt: DecryptStatus?)` (new Kit value decoded from `proxy.status`, which `BusService` already polls — no new read); N for `Scope: N hosts decrypted` = `decrypt.scope_hosts`; composed `state` strips one trailing `.`, remedy `add one`; Kit row decoder maps `tunnel` `passthrough`→`.tunnelled`, `failed`→`.pinnedOrFailed`, `decrypted`→`.decrypted` (plan Task 1c, own claim pending; `tunnel_reason`/bytes stay on the wire); TR-AC20 rewritten around curl passthrough/`--cacert` decrypted rows and unconditional once Task 1c is in; TR-AC21/22 added; start SHA `8175eea3`.
+- 2026-11-01 (coordinating session, aligned with core spec D9 and the improve-loop session): banner text = shown states joined ` · ` with **no remedy text**; the remedy is one button `bannerAction` (`Open Network Settings…` / `All Apps Settings…` / `Add Host…` / `Trust the aitmproxy CA`); the Scope line is `proxy.status.decrypt.advice` verbatim (`Nothing is decrypted until a host is in Scope.`), fallback the same words, `— add one` retired; new `ConnectionAction.addScopeHost` ("Add Host…"); the Status step keeps `Open Scope…`. Task 1c widened to the full #228 contract: `TunnelMode`, `TunnelReason` (8), `tunnel`/`tunnelReason`/`tunnelBytesUp`/`tunnelBytesDown`/`passive` on `FlowSummary` and `FlowRow` (+ `isTunnel`, `==`), `FlowDetail.tunnel: TunnelInfo?` + `passive` from `meta`; TR-AC3/6/16/18/22 and D5/D10 literals updated.
