@@ -276,6 +276,8 @@ G103. Four em dashes remain in operator-visible `app.rs` toasts outside the Scan
 
 **Round G-C (the Python cell, `tests/e2e/tui/test_tui_scan_live.py` only)**, in parallel with G-B (disjoint file): G93, G94, G95, G96, G97, G98, G99, G100, G101, in the order G99, G95, G100, G94, G97, then the rest. Verified by `python3 -m py_compile`, the discovery dry run, and a sandbox run that must reach the capability skip or die at the socket-bind denial before any claim; the real run stays the orchestrator's in the Terminal.
 
+**Round G-B result (2026-11-01):** done, ten commits `802d5228..fbdc4513`, all 53 items, crate gate green (fmt 0, clippy 0, 517 tests), mutation proofs for G88 and G58 quoted. Combined re-review of G-A+G-B over `6df3ce4b..fbdc4513 -- crates/`.
+
 **Round G-C result (2026-11-01):** done, one commit `e32e7275` (+449/-234); py_compile and discovery clean; the sandbox run dies at the socket-bind denial before any claim; work-dir cleanup verified. Re-review of the cell runs beside G-B.
 
 Each Coder may touch only the files its items name plus the test files that reproduce them; neither touches `CORE_TOOLS`, `fixtures/bus-fixture.json`, nor `docs/**`.
