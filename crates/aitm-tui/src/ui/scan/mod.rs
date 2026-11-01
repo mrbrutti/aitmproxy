@@ -164,9 +164,9 @@ fn degraded(app: &App) -> Option<String> {
 }
 
 /// On a legacy bus the Jobs tab's error is the `scan.discover` failure the
-/// legacy state kept as text; the one `ScanError` built per frame, so the
-/// Jobs tab's row never has to keep an error of its own. `None` on a v2
-/// bus, where the Jobs tab reads `last_error` alone.
+/// legacy state kept as text; the one `ScanError` built per frame. `None`
+/// on a v2 bus, where the Jobs tab reads its own `JobsState::error` (fix
+/// round H, H56).
 fn legacy_jobs_error(app: &App) -> Option<ScanError> {
     if app.scan.tab != ScanTab::Jobs || app.scan_offer() != ScanOffer::Legacy {
         return None;
@@ -178,17 +178,17 @@ fn legacy_jobs_error(app: &App) -> Option<ScanError> {
         .map(|e| ScanError::from_message("scan.discover", e))
 }
 
-/// The active tab's last error, falling back to the view's for a tab that
-/// keeps none of its own; `legacy` is [`legacy_jobs_error`], the Jobs
-/// tab's on a legacy bus.
+/// The active tab's own error and nothing else (spec D13 as ruled
+/// 2026-11-01, fix round H, H56: another tab's error never sits on this
+/// banner; `ScanState::last_error` feeds the toast alone). `legacy` is
+/// [`legacy_jobs_error`], the Jobs tab's on a legacy bus.
 fn tab_error<'a>(app: &'a App, legacy: Option<&'a ScanError>) -> Option<&'a ScanError> {
-    let own = match app.scan.tab {
+    match app.scan.tab {
         ScanTab::Profiles => app.scan.profiles.error.as_ref(),
-        ScanTab::Jobs => legacy,
+        ScanTab::Jobs => legacy.or(app.scan.jobs.error.as_ref()),
         ScanTab::SiteMap => app.scan.sitemap.error.as_ref(),
         ScanTab::Issues => app.scan.issues.error.as_ref(),
-    };
-    own.or(app.scan.last_error.as_ref())
+    }
 }
 
 /// The verb the active tab is waiting on while its pane is still empty.

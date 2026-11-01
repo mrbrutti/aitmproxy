@@ -83,17 +83,16 @@ pub const ERROR_DETAIL_MAX: usize = 240;
 /// tab"; plan task 13). The profile verbs, the catalogue, the session
 /// preview and the two launch verbs are the Profiles tab's (a launch is
 /// made there, and a refused one is answered in its footer, D13); list,
-/// status and cancel are the Jobs tab's, which keeps no error of its own
-/// and reads `ScanState::last_error`; the site map and the issue verbs
-/// their tabs'. A verb outside the D3 set falls to Jobs.
+/// status and cancel are the Jobs tab's (`JobsState::error`, fix round H,
+/// H56); the site map and the issue verbs their tabs'. A verb outside the
+/// D3 set falls to Jobs, so an unknown verb's error is never lost.
 pub fn owning_tab(verb: &str) -> ScanTab {
     match verb {
         "scan.checks" | "scan.session.preview" | "scan.start" | "scan.map" => ScanTab::Profiles,
         _ if verb.starts_with("scan.profile.") => ScanTab::Profiles,
         "scan.sitemap" => ScanTab::SiteMap,
         "scan.issues" | "scan.issue" | "scan.issue.update" => ScanTab::Issues,
-        // The Jobs verbs (list, status, cancel) and any verb outside D3:
-        // Jobs reads `last_error`, so an unknown verb is never lost.
+        // The Jobs verbs (list, status, cancel) and any verb outside D3.
         _ => ScanTab::Jobs,
     }
 }
@@ -132,9 +131,11 @@ pub struct ScanState {
     pub legacy: LegacyState,
     /// Tags of tagged calls awaiting their reply (dedupe, D6).
     pub inflight: BTreeSet<String>,
-    /// The most recent `scan.*` failure, shown until the next successful
+    /// The most recent `scan.*` failure, kept until the next successful
     /// reply under the same tag (D13: a keyed verb's error outlives a
-    /// sibling key's success).
+    /// sibling key's success). It feeds the toast and the tests; a banner
+    /// reads its tab's own slot only (D13 as ruled 2026-11-01, fix round
+    /// H, H56), never this.
     pub last_error: Option<ScanError>,
     /// A non-error notice for the banner (D11: `already <state>` when `x`
     /// lands on a terminal job): the answer to one key, cleared by the next
@@ -154,14 +155,14 @@ pub struct ScanState {
 
 impl ScanState {
     /// Record a `scan.*` failure where its tab shows it: the owning tab's
-    /// error line (the Jobs tab has none of its own) and `last_error`, the
-    /// view-wide fallback the banner reads.
+    /// error slot (every tab has one) and `last_error`, which the toast
+    /// path and the tests read.
     pub fn set_error(&mut self, err: ScanError) {
         match owning_tab(&err.verb) {
             ScanTab::Profiles => self.profiles.error = Some(err.clone()),
+            ScanTab::Jobs => self.jobs.error = Some(err.clone()),
             ScanTab::SiteMap => self.sitemap.error = Some(err.clone()),
             ScanTab::Issues => self.issues.error = Some(err.clone()),
-            ScanTab::Jobs => {}
         }
         self.last_error = Some(err);
     }
@@ -177,6 +178,7 @@ impl ScanState {
         }
         match owning_tab(tag_parts(tag).0) {
             ScanTab::Profiles if same(&self.profiles.error) => self.profiles.error = None,
+            ScanTab::Jobs if same(&self.jobs.error) => self.jobs.error = None,
             ScanTab::SiteMap if same(&self.sitemap.error) => self.sitemap.error = None,
             ScanTab::Issues if same(&self.issues.error) => self.issues.error = None,
             _ => {}

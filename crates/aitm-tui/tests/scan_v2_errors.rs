@@ -460,3 +460,76 @@ fn a_success_clears_the_error() {
     assert_eq!(app.scan.last_error, None);
     assert_eq!(app.scan.jobs.order.len(), 2, "the list folded");
 }
+
+/// Fix round H, H56 (spec D13 as ruled 2026-11-01): a tab's banner shows
+/// that tab's own error only. A `refused_l4` on `scan.start` is the
+/// Profiles tab's; the Jobs, Site map and Issues banners never carry it,
+/// while `last_error` keeps it for the toast.
+#[test]
+fn a_refused_launch_shows_on_profiles_and_no_other_tab() {
+    let mut app = opened();
+    let wording = "L4 refused: enable `l4.enabled` in config (and the agent L4 gates for an agent-started job): off";
+    let _ = app.on_bus(failed("scan.start", "scan.start", "scan: refused_l4: off"));
+    assert_eq!(toast(&app), wording);
+    assert_eq!(
+        app.scan.last_error.as_ref().map(|e| e.wording()),
+        Some(wording.to_string()),
+        "last_error keeps it for the toast"
+    );
+    let shown = screen(&app);
+    assert!(
+        banner_line(&shown).contains("L4 refused"),
+        "Profiles shows its own error:\n{shown}"
+    );
+    for tab in [ScanTab::Jobs, ScanTab::SiteMap, ScanTab::Issues] {
+        let _ = app.update(Action::ScanTab(tab));
+        assert_eq!(app.scan.tab, tab);
+        let shown = screen(&app);
+        assert!(
+            !banner_line(&shown).contains("L4 refused"),
+            "{tab:?} does not carry the Profiles tab's error:\n{shown}"
+        );
+    }
+    let _ = app.update(Action::ScanTab(ScanTab::Profiles));
+    assert!(
+        banner_line(&screen(&app)).contains("L4 refused"),
+        "the Profiles error survives the tab walk"
+    );
+}
+
+/// Fix round H, H56: the Jobs tab keeps its own error slot, owned by
+/// `scan.list`/`scan.status`/`scan.cancel`. A `scan.list` failure is the
+/// Jobs banner's and no other tab's.
+#[test]
+fn a_list_failure_shows_on_jobs_only() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(failed("scan.list", "scan.list", "scan: busy: full"));
+    let err = app
+        .scan
+        .jobs
+        .error
+        .as_ref()
+        .expect("scan.list is the Jobs tab's error");
+    assert_eq!(err.tag, "scan.list");
+    assert_eq!(err.verb, "scan.list");
+    assert_eq!(err.detail, "full");
+    let shown = screen(&app);
+    assert!(
+        banner_line(&shown).contains("Scanner busy"),
+        "Jobs shows its own error:\n{shown}"
+    );
+    for tab in [ScanTab::Profiles, ScanTab::SiteMap, ScanTab::Issues] {
+        let _ = app.update(Action::ScanTab(tab));
+        let shown = screen(&app);
+        assert!(
+            !banner_line(&shown).contains("Scanner busy"),
+            "{tab:?} does not carry the Jobs tab's error:\n{shown}"
+        );
+    }
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    assert!(banner_line(&screen(&app)).contains("Scanner busy"));
+    let _ = app.on_bus(reply("scan.list", "scan.list", fixture("scan.list.json")));
+    assert_eq!(app.scan.jobs.error, None, "the list's success clears it");
+    assert!(!banner_line(&screen(&app)).contains("Scanner busy"));
+}

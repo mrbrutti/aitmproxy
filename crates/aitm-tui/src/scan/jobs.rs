@@ -11,7 +11,8 @@ use aitm_scan_model::{
 };
 
 use super::{
-    is_job_id, lane_token, severity_counts, severity_token, DETAIL_VALUE_MAX, SEVERITY_ORDER,
+    is_job_id, lane_token, severity_counts, severity_token, ScanError, DETAIL_VALUE_MAX,
+    SEVERITY_ORDER,
 };
 use crate::text::{clean, cut_to, truncate};
 
@@ -70,6 +71,11 @@ pub struct JobsState {
     /// of driving a reply-paced list/status ping-pong. The forty-tick timer
     /// clears it when its list leaves.
     pub healed: BTreeSet<JobId>,
+    /// The tab's own error (spec D13 as ruled 2026-11-01, fix round H, H56):
+    /// the last `scan.list`, `scan.status` or `scan.cancel` failure, shown
+    /// on the Jobs banner alone until the next success under its tag
+    /// ([`super::ScanState::clear_error`]).
+    pub error: Option<ScanError>,
 }
 
 impl JobsState {
