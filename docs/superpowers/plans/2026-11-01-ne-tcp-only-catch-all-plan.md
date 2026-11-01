@@ -1,6 +1,6 @@
 # macOS NE: TCP-only catch-all rule, per-target UDP rules — implementation plan
 
-**Status:** approved (2026-11-01, self-approved by the fix session under Matt's autonomous mandate;
+**Status:** shipped pending merge (2026-11-01; see Shipped) — approved (2026-11-01, self-approved by the fix session under Matt's autonomous mandate;
 no product decision beyond the approved spec; Tester after each task, the three-reviewer panel on the
 whole branch before the PR and again after any fix)
 **Spec:** `docs/superpowers/specs/2026-11-01-ne-tcp-only-catch-all-design.md` (approved 2026-11-01;
@@ -386,16 +386,88 @@ Kept by the main session during stage 6. One row per finding.
 | 4 | Spec | Minor | `generation` counter beyond the plan's `inFlight`/`stopped` sketch. | Accepted 2026-11-01: the minimum mechanism that makes the plan's stop contract hold in its own step-11 scenario; pinned (step 12, D1/D2). |
 | 4 | Spec | Minor | `.error` log line appends `(wanted <summary>)` beyond spec D's named elements. | Accepted 2026-11-01: scoped targets are operator configuration (spec D); the TR-AC8 ladder's construction-bug rung needs the wanted set. |
 | T | Spec | Minor | Tester added three `run()` lines and a second group in `FlowHandoff.swift`, beyond the coordination allowance (one group, one line). | Accepted 2026-11-01: tests only, zero removed lines; the observe-lane session is told the `run()` region widened; whoever merges second rebases. |
-| 3 | Security (r2) | Minor | The cap's `(+K dropped)` suffix sat at the end of a ~5 KiB log line os_log may truncate. | Fixed in `a03a5dfb`: capped form is `257 rules, 44 dropped (TCP catch-all + UDP …)`; pins rewritten. |
-| 4 | Quality + Spec (r2) | Minor | `begin`'s doc comment misstated the parked-begin success arm; the arm was unpinned. | Pins added by the round-2 Tester (`a0b0a6c6` vector I, `d12b65e9` vector H); comment reworded in `69fbe492`; spec Design C sentence added (round 2). |
-| 4 | Quality (r2) | Minor | `stop()` is re-entered through the cancelled startup completion — correct by ordering but unwritten and unpinned. | Fixed in `69fbe492`: comments in `stop()` and the provider error branch; vector J (parked completion calls `stop()` itself → answered once with ECANCELED, nothing further). |
-| 3 | Quality (r2) | Minor | Redundant `v4.isLoopback ||` beside the 127/8 octet test. | Fixed in `1d149b2c`. |
+| 3 | Security (r2) | Minor | R2-1: The cap's `(+K dropped)` suffix sat at the end of a ~5 KiB log line os_log may truncate. | Fixed in `a03a5dfb`: capped form is `257 rules, 44 dropped (TCP catch-all + UDP …)`; pins rewritten. |
+| 4 | Quality + Spec (r2) | Minor | R2-2: `begin`'s doc comment misstated the parked-begin success arm; the arm was unpinned. | Pins added by the round-2 Tester (`a0b0a6c6` vector I, `d12b65e9` vector H); comment reworded in `69fbe492`; spec Design C sentence added (round 2). |
+| 4 | Quality (r2) | Minor | R2-3: `stop()` is re-entered through the cancelled startup completion — correct by ordering but unwritten and unpinned. | Fixed in `69fbe492`: comments in `stop()` and the provider error branch; vector J (parked completion calls `stop()` itself → answered once with ECANCELED, nothing further). |
+| 3 | Quality (r2) | Minor | R2-4: Redundant `v4.isLoopback ||` beside the 127/8 octet test. | Fixed in `1d149b2c`. |
 | 3 | Security (r2) | — (note) | The cap's eviction order (address text) lets a token set decide which 256 targets survive. | No finding: Scope tokens come only from the peer-authenticated core at operator privilege (confirm handshake); under-inclusive only. Recorded 2026-11-01. |
 | 4 | Tester (r2) | — (note) | Vector G proves the detach-driven reconcile is inert after `stop()` at the reconciler level; the provider's `startProxy` error-branch call order is verifiable by inspection only (no NE runtime in the sandbox). | Accepted 2026-11-01: same status as every provider line; TR-AC8 exercises the provider live. |
+| 4 | Quality (r3) | Minor | R3-1: `begin`'s lead sentence ("`completion` receives THAT apply's result, never a reconcile apply's") contradicts the parked-begin arms enumerated below it. | Fix task round 3 (comment-only), see the commit recorded in Shipped. |
+| 4 | Quality (r3) | Minor | R3-2: provider error-branch comment opens with "Already reported by `logRuleEvent(.applyFailed)`", untrue on the ECANCELED arm until the parenthetical four lines later. | Fix task round 3 (comment-only), see Shipped. |
+| — | Quality (r3) | Minor | R3-3: `fix R2-n` labels in code comments did not resolve to this Review log (rows were labelled "(r2)" only). | Fixed in the docs commit that carries this row: the four round-2 rows now start with their `R2-n` label. |
+| — | Security (r3), Spec (r3) | — | Round 3: PASS, no findings (security: every re-entrancy claim verified from source, `handleNewFlow`/`handleNewUDPFlow` md5-identical to base; spec: every amended sentence pinned, Review log matches the code). | Recorded 2026-11-01. |
 
 ## Shipped
 
-Filled at stage 7: what merged, the Task 5 evidence (log lines, driver `SUMMARY`, Chrome text,
-2d/2e observations), which contingency (if any) was built and why, follow-ups (the Apple
-Feedback in `docs/research/25-…` is Matt's to file; the observe-lane plan's Task 15
-expectations assume this fix is on main).
+**Status line:** shipped pending merge (2026-11-01). Tasks 1–4 built and panel-reviewed over three rounds
+(all PASS; every Minor fixed or accepted above); Task 5 (TR-AC8) run on Matt's Mac 2026-11-01 14:25–14:31
+PST under his go ("Yes, when ready", via the orchestrator, display lock held); **Tasks 6 (T2) and 7 (R1) were
+NOT built** — the ladder's first rung held: the in-place `setTunnelNetworkSettings` re-apply takes effect on
+macOS 27.0 and a `/32` UDP host rule diverts the datagram.
+
+### TR-AC8 evidence (Terminal; full log `/tmp/claude/ne-tcp/out/proof-run.log`, copies in the session notes folder)
+
+- **Before:** app 0.5.10 build 202611011040; sysex active 0.5.7/202610311934 (idle, capture off); `capture.enabled`
+  unset; `bus.activeKind` embedded; no rendezvous. Capture-OFF control (12:18 PST): every `setsockopt(DONTFRAG) ok`,
+  Chrome forced QUIC HTTP/3 on both origins (`out/control-before.log`).
+- **Step 0:** branch tree `4e6bb38e` → app + sysex build 202611011427, Developer ID `1D24F95F…`, notarization
+  `Accepted` (submission `56a8a2c1-c5ca-40e1-a8a6-27138138215c`), stapled, `spctl` Notarized Developer ID. Capture ON via
+  Proxy ▸ "Capture All Apps" (the menu title since the 0.5.x Capture-all-apps rename; the proof script's survey-era
+  "Enable Capture" call failed once and was corrected mid-run with no other effect). sysextd replaced 0.5.7 with
+  202611011427 with **no System Settings prompt**. Provider log:
+  `startProxy` → `provider rules applied: 1 rule (TCP catch-all)` (14:28:56.284) → `attached to core` →
+  `scope updated (0 entries)`.
+- **Step 1 (capture ON, no UDP target):** `dontfrag-core.py` → `setsockopt(DONTFRAG) ok` on 104.18.27.14:443,
+  142.250.73.110:443, 1.1.1.1:53, 10.9.10.1:53, 17.253.16.125:123, 127.0.0.1:443; DNS replies 5 ms on connected
+  sockets with DONTFRAG set. Headless Chrome `--origin-to-force-quic-on=cloudflare-quic.com:443` → "your browser used
+  HTTP/3"; `quic.nginx.org:443` → "Congratulations! You're connected over QUIC" (the shipped `.any` rule gave
+  `ERR_CONNECTION_RESET` in the survey). Framework log, last 5 min: **0** `NEFlow type = datagram`, **40**
+  `NEFlow type = stream`. Firefox (own instance, temp profile) loaded cloudflare-quic.com with capture on
+  (`out/ff-step1.png`: the page rendered behind the fresh profile's welcome sheet and reports HTTP/2, as every
+  first load does; the ⌘R reloads that negotiate h3 were not performed this run, so Firefox h3 is **not re-proven
+  here** — it is unaffected by construction (0 datagram flows reach the provider) and was proven h3 under the worse
+  `.any` rule in survey §R4b). IPv6: no route on this Mac (`EHOSTUNREACH`), unmeasurable as recorded in spec F.
+- **Step 2 (UDP target; recipe deviation recorded):** instead of Settings ▸ Bus external mode, the app was quit
+  normally (its embedded core is reaped on quit and the tunnel stays up), so no bus-mode setting was touched; the
+  signed bundle core `/Applications/Aitmproxy.app/Contents/Resources/core/aitm` ran from the Terminal with
+  `l4.enabled` + `macos_capture.enabled` (driver `/tmp/claude/ne-tcp/udp-target-proof.py`). Provider attached.
+  **TCP unchanged:** `scope.add example.com` on that core's own scope (Matt's Scope untouched) + plain `curl` →
+  `200 dns=0.031s total=0.092s`, `flows_handed_off.tcp` 0→1, one `flow.table` row, framework
+  `provider accepted new flow TCP com.apple.curl`. **(2a)** `l4.scope.add 17.253.16.125/32` port 123 (operator
+  confirm) → `scope updated (2 entries)` → `provider rules applied: 2 rules (TCP catch-all + UDP 17.253.16.125:123)`
+  (14:29:47.356). **(2b)** `dontfrag` on the target: `ECONNRESET` (the kernel oracle: the `/32` rule covers the
+  socket). **(2c)** framework: two `New flow: NEFlow type = datagram, app = python3.14 … <-> 17.253.16.125:123`,
+  `provider accepted new flow UDP python3.14` ×2; `capture.status` `flows_handed_off.udp` 0→**2** (NE-AC2; no NTP
+  reply, the embedded core relays no UDP — pre-existing, not this fix's). **(2d) R2 measurement:** with the target
+  scoped, `dontfrag` on 104.18.27.14:443, 1.1.1.1:53 and 17.253.16.253:123 all `ok` → the `IP_DONTFRAG` effect is
+  **per matching rule**, not per provider: Chromium keeps HTTP/3 while a UDP target is scoped. **(2e)** not measured
+  (no long-lived claimed TCP connection was held across the transition; the driver's curl completed before step 2b).
+- **Step 3:** `l4.scope.remove` → `scope updated (1 entries)` → `provider rules applied: 1 rule (TCP catch-all)`
+  (14:29:55.354); `dontfrag` on the target `ok`; full probe all `ok`; external core stopped → `detached from core;
+  failing open`.
+- **Step 4 / restore (EXIT trap):** Proxy ▸ "Stop Capturing All Apps"; release bundle 0.5.10/202611011040 restored
+  from the saved copy (`spctl` Notarized Developer ID), relaunched. **Read-back matches:** app 0.5.10/202611011040,
+  `capture.enabled` 0, `bus.activeKind` embedded, rendezvous absent. Active sysex after: 0.5.10/202611011427 (the
+  branch build, idle, tunnel stopped) instead of the idle 0.5.7 — with capture off the relaunched release app makes
+  no activation request; the next capture-on re-activates the release's own build (delegate `.replace`). Reported to
+  the orchestrator; no state change made for it.
+
+### Ladder verdict
+
+(2a) present, (2b) `ECONNRESET`, (2c) datagram flow + accepted + counter: **T1 and R2 confirmed**; Tasks 6 and 7
+stay unbuilt (their sections above are the record of what would have been).
+
+### Spec known unknowns resolved by the proof
+
+F1 runtime replacement: **works** on macOS 27.0 (26A428). F2 `/32` host rule: **diverts** the single host. F3 R2
+confinement: **per match**. F4 Chrome over IPv6: unmeasured (no IPv6 route). F5 in-flight claimed TCP flow across a
+re-apply: unmeasured (2e).
+
+### Follow-ups (not in this PR)
+
+- Apple Feedback: `docs/research/25-apple-feedback-ne-udp-dontfrag-draft.md` is Matt's to file (not filed).
+- `coreLinkAndClaim` self-check load flake (Review log row 2): poll `isAttached` instead of asserting it right after Hello.
+- Observe-lane plan Task 15 expectations assume this fix is on main (no UDP rows by default); the `run()` region of
+  `HandoffSelfCheck` widened (rows 17) — whoever merges second rebases.
+- Spec F5 (claimed TCP flow across a re-apply) can be observed in a later `[Mac]` run; `(2e)` recipe: open a long
+  `curl --limit-rate` to an in-scope host before `l4.scope.add`.
