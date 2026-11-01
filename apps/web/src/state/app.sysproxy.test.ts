@@ -416,3 +416,60 @@ describe('app store — refreshSystemProxy (the full read on menu open)', () => 
     expect(app.toast()).toBeNull();
   });
 });
+
+// ---- tester (F-web): the OTHER proxy.status reader — refreshSide's catalogue-time read — merges too ----
+//
+// `app.ts` reads `proxy.status` in two places: the 2 s `pollStatus` (covered above) and the read
+// inside `refreshSide()`, which runs at bootstrap and again after scope.add/remove, poc.build and
+// poc.run. The second one must keep the fetched guidance/remedy as well, or a scope edit after the
+// menu-open read would silently drop "Copy env line" and the privilege remedy.
+
+describe('app store — refreshSide keeps the fetched guidance/remedy (tester)', () => {
+  it('a refreshSide after the full read keeps guidance and follows the compact detail', async () => {
+    const { bus, app } = start(sysproxyBus({ status: UNSUPPORTED }));
+    await tick(200);
+    bus.sys.full = { ...UNSUPPORTED, guidance: ENV_LINE, remedy: null, mechanism: 'none', services: [] };
+    let done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+    expect(app.proxy.systemProxy?.guidance).toBe(ENV_LINE);
+    const statuses = bus.count('proxy.status');
+
+    bus.sys.status = { ...UNSUPPORTED, detail: 'no system proxy mechanism on this host (gsettings missing)' };
+    done = app.refreshSide();
+    await tick(50);
+    await done;
+
+    expect(bus.count('proxy.status')).toBe(statuses + 1); // the catalogue-time reader, not the poll
+    expect(app.proxy.systemProxy).toEqual({
+      state: 'unsupported',
+      host: null,
+      port: null,
+      managed_by_us: false,
+      setting: false,
+      supported: false,
+      detail: 'no system proxy mechanism on this host (gsettings missing)',
+      guidance: ENV_LINE,
+      remedy: null,
+    });
+  });
+
+  it('a refreshSide after the full read keeps the remedy; a state change in the compact object still wins', async () => {
+    const { bus, app } = start(sysproxyBus({ status: NEEDS_ADMIN }));
+    await tick(200);
+    bus.sys.full = { ...NEEDS_ADMIN, guidance: null, remedy: REMEDY };
+    let done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+    expect(app.proxy.systemProxy?.remedy).toBe(REMEDY);
+
+    bus.sys.status = { ...NEEDS_ADMIN, setting: true };
+    done = app.refreshSide();
+    await tick(50);
+    await done;
+
+    expect(app.proxy.systemProxy?.setting).toBe(true);
+    expect(app.proxy.systemProxy?.remedy).toBe(REMEDY);
+    expect(app.proxy.systemProxy?.guidance).toBeNull();
+  });
+});
