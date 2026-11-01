@@ -11,7 +11,7 @@ own record so the system-proxy plan file is never edited by two sessions.
 
 | PR | Tasks | Files |
 |---|---|---|
-| A core | 32 (probe), 33, 34, 42 | `crates/aitm-ca/src/{commands,store}.rs`, `crates/aitm-ca/src/platform/macos.rs`, `crates/aitm-ca/tests/{commands,macos}.rs`, `docs/design/operator-ui-foundation.md`, this file |
+| A core (PR #219) | 32 (probe), 33, 34, 42 | `crates/aitm-ca/src/{commands,store}.rs`, `crates/aitm-ca/src/platform/macos.rs`, `crates/aitm-ca/tests/{commands,macos}.rs`, `docs/design/operator-ui-foundation.md`, this file |
 | B TUI | 35 | `crates/aitm-tui/src/{model,app}.rs`, `crates/aitm-tui/src/ui/bars.rs`, `crates/aitm-tui/tests/ca_pill.rs` |
 | C web | 36 | `apps/web/src/state/caTrust.ts` (+ test), `bus/types.ts`, `state/app.ts`, `palette/{groups,setup}.ts`, `palette/CommandPalette.tsx`, `shell/Toolbar.tsx` |
 | D mac | 37–41 | `Session+CATrust.swift` (new), `Session.swift`, `Session+Connection.swift`, `Bus/BusService.swift`, `Panels/{CAPanel,StatusPanel}.swift`, `App.swift`, `SettingsView.swift`, `Shell/ShellToolbar.swift`, `Shell/SetupSheet.swift` (new), `AitmproxyKit/CommandMap.swift`, `AitmproxyKit/CATrustFacts.swift` (new, the attribution spec's type, one home), `tools/check-ca-trust-path.sh` |
@@ -114,10 +114,16 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 20. **`CATrustFacts` surface.** `platform` (chooses the Linux vs macOS needs-admin remedy), `isCancelled`, `signalsNeedsAdmin`, `notGeneratedStep()` are part of the type; the tripwire's extra checks (tree-wide `.string("system")`, `FixtureBus.swift`, fixture files denied the runners) are accepted.
 21. **D17.6 `exists == false` row** renders as the step "CA not generated yet — the core creates it on first start" (no action) on the Status page and the sheet; the CA panel keeps its "No certificate" badge.
 
+22. **PR C files.** Besides the table above, PR C touches `apps/web/src/bus/confirm.ts` (+ `confirm.test.ts`, the one home of the bus `needs_confirmation` envelope guard and the stale-token literal, shared with the L4 panel), `apps/web/src/lib/isRecord.ts`, `apps/web/src/panels/l4/inject.ts`, `apps/web/src/panels/l4/model.ts` (+ `model.test.ts`): the L4 panel now imports the shared guard. The palette performs the bus confirm handshake (spec D4) itself; a `needs_confirmation` reply requires the server's `prompt`.
+
 ## Review log
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
 |---|---|---|---|---|---|
+| 2026-11-01 | C web | quality (W2 re) | `prompt` optional with three invented fallbacks; l4 re-export only for a test; "left meanwhile" arm untested | Minor | fix task W3 |
+| 2026-11-01 | C web | security (W2 re) | late `needs_confirmation` for run A attaches to a newer run B | Minor | fix task W3: `runSeq` |
+| 2026-11-01 | C web | spec (W2 re) | l4 invented prompts; PR C files unrecorded; Esc exit untested | Minor | fix task W3; correction 22 |
+| 2026-11-01 | A core | gate | merged head 0bfe98e1: fmt 0, clippy 0, 235 test binaries ok, 4 failing binaries = known wall-clock tests (web_bus_write_deadline ×2, rhai engine budget, tui browser_screenshot, tui five_thousand_flows), three reproduced on untouched main | — | PR #219 opened with the panel comment |
 | 2026-11-01 | A core | C2 note | `Op::delete_copy` returns `Result<Option<String>, TrustError>` (None = gone; Some = both attempts' failure texts), not the `(CmdLine, CmdOutput)` the task sketched, so the replace-path error keeps the SHA-256 attempt's real reason | — | accepted; the `dry_run` param text reads "Never gated by `ca.allow_agent_install`." |
 | 2026-11-01 | D mac | security + quality | needs-admin latch overrides the read-back; step done while state warning | Important | fix task M1 (A) |
 | 2026-11-01 | D mac | security | `changeCATrust` trusts its callers; Status row buttons not gated | Minor | fix task M1 (B) |
