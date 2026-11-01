@@ -380,3 +380,84 @@ fn agent_cannot_self_grant() {
     assert!(!is_error(&status));
     assert_eq!(status["structuredContent"]["inject"], json!(true));
 }
+
+/// L4PAR-AC1 — over the real MCP server, a packet's `bytes` (`Value::Bytes`) render
+/// as standard padded base64 in `structuredContent`: `[0xde, 0xad]` is `"3q0="`.
+/// The module is built over a store the test holds, so the flow is inserted directly.
+#[test]
+fn flow_get_bytes_are_base64_on_the_wire() {
+    use std::collections::VecDeque;
+    use std::time::SystemTime;
+
+    use aitm_proto_l4::craft::PacketSpec;
+    use aitm_proto_l4::flow::{
+        InMemoryL4FlowStore, L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet,
+    };
+    use aitm_proto_l4::guard::L4Guard;
+
+    let cfg = l4_cfg();
+    let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+    let module = L4Module::with_shared(
+        Arc::new(L4Guard::new(&cfg)),
+        store.clone(),
+        None,
+        L4Privilege::available(),
+    );
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(module));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio).with_services(
+        Arc::new(MemFlowStore::new()),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    );
+
+    let bytes = vec![0xde, 0xad];
+    let id = store.insert(L4Flow {
+        id: L4FlowId::new(),
+        kind: L4FlowKind::Capture,
+        bind: L4Bind {
+            interface: "lo0".into(),
+            filter: None,
+            queue: None,
+        },
+        packets: VecDeque::from(vec![L4Packet {
+            dir: L4Direction::Inbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&bytes),
+            bytes,
+            injected: false,
+        }]),
+        metadata: L4Meta::default(),
+    });
+
+    // The store's id is a uuid string on the wire; `l4.flow.list` confirms it is live.
+    let id_str = serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .expect("L4FlowId serialises as a string");
+    let ids = call(&srv, Frontend::Operator, "l4.flow.list", json!({}));
+    assert!(!is_error(&ids), "flow.list failed: {}", text(&ids));
+    assert_eq!(ids["structuredContent"], json!([id_str]));
+
+    let flow = call(
+        &srv,
+        Frontend::Operator,
+        "l4.flow.get",
+        json!({"id": id_str}),
+    );
+    assert!(!is_error(&flow), "flow.get failed: {}", text(&flow));
+    assert_eq!(
+        flow["structuredContent"]["packets"][0]["bytes"],
+        json!("3q0="),
+        "bytes must be padded base64 on the wire, got {}",
+        flow["structuredContent"]
+    );
+    for key in ["proto", "src", "dst", "src_port", "dst_port"] {
+        assert!(
+            flow["structuredContent"]["packets"][0][key].is_null(),
+            "undecodable packet.{key} must be null, got {}",
+            flow["structuredContent"]
+        );
+    }
+}
