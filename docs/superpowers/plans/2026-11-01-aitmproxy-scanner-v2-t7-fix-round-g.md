@@ -184,6 +184,10 @@ G73. A list-row launch of a stored profile with an L4 lane bypasses the UI-3 cli
 
 G74. The `not_found` self-heal leaves its error in the Jobs banner forever (`crates/aitm-tui/src/app.rs` `on_scan_failed`, `scan.list` arm): remember the dropped job's error tag (`scan.status:<job>` or `scan.cancel:<job>`) in `ScanState.heal_pending: Option<String>` when the self-heal requests `scan.list`; on that `scan.list` success call `clear_error(&tag)` and clear the field (D13 as amended). Test (`tests/scan_v2_errors.rs`): after `not_found` on `scan.status:scan-1a2b3c4d`, folding `scan.list.json` leaves `last_error == None` and the Jobs banner without the wording.
 
+## Task 13 spec panel
+
+G75. `not_found` wording and the cancel branch (`crates/aitm-tui/src/scan/mod.rs` `code_wording`/`wording`; `tests/scan_v2_errors.rs`): the D9 `not_found` text keeps "; the list is being refreshed" only when the error's tag is a keyed `scan.status:<job>`/`scan.cancel:<job>` (the self-heal ran); on any other tag it reads `No longer known to the core (it may have restarted)` (D9 as amended). Tests: `not_found` on `scan.start` renders the short form; `CallTaggedFailed { tag: "scan.cancel:scan-1a2b3c4d", name: "scan.cancel", message: "scan: not_found: gone" }` drops the job from `order`, `summaries`, `full`, `started_here` and gives exactly `vec![scan.list {}]`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

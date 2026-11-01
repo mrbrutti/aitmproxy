@@ -125,11 +125,11 @@ The origin picker lists, per concrete (non-wildcard) entry of `app.scope`, `http
 
 ### D9. Errors by code (decided; wording is the Architect's)
 
-Every `CallTaggedFailed` for a `scan.*` verb becomes a `ScanError`; the wording is shown inline in the owning tab's error line and as an Error toast; an unparseable message is shown verbatim as `<verb>: <message>`.
+Every `CallTaggedFailed` for a `scan.*` verb becomes a `ScanError`; the wording is shown inline in the owning tab's error line and as an Error toast; a verb outside the D3 set is the Jobs tab's (ruling 2026-11-01); an unparseable message is shown verbatim as `<verb>: <message>`.
 
 | Code | Operator wording (then `: <detail>`) |
 |---|---|
-| `not_found` | "No longer known to the core (it may have restarted); the list is being refreshed" (the reducer drops the id and requests `scan.list`) |
+| `not_found` | "No longer known to the core (it may have restarted); the list is being refreshed" on a keyed `scan.status:<job>`/`scan.cancel:<job>` tag (the reducer drops the id, clamps the Jobs cursor to the remaining rows, and requests `scan.list`); on any other tag the clause after the semicolon is omitted since nothing is refreshed (ruling on the Task 13 spec panel, 2026-11-01) |
 | `busy` | "Scanner busy: the job limit is reached or this origin already has a running job; wait or cancel one in Jobs (x)" |
 | `out_of_scope` | "Out of scope: add the HTTP host to Scope (S) or an L4 scope entry with the inject capability covering the target" |
 | `refused_agent` | "Refused for the agent role: this client is not the operator; check the token the TUI was started with" |
