@@ -309,9 +309,10 @@ enum GateClass {
 ///
 /// A production module reads the live [`PrivilegeState`] on **every** call
 /// (privilege spec §2.1, AC7): a core started before approval serves capture
-/// after it, with no rebuild. The constructors that take an [`L4Privilege`]
-/// hold that fixed result instead, carrying its reason strings verbatim, so the
-/// parity tests' literals stand until P1b.15 moves the binary to the live state.
+/// after it, with no rebuild. The test constructors that take an
+/// [`L4Privilege`] ([`L4Module::with_privilege`], [`L4Module::with_shared`])
+/// hold that fixed result instead, carrying its reason strings verbatim, which
+/// is what the parity tests' literals pin.
 enum PrivilegeSource {
     Live(Arc<PrivilegeState>),
     Fixed(L4Privilege),
@@ -468,9 +469,10 @@ impl L4Module {
     }
 
     /// Build a module from config over a **fixed** capability probe result, whose
-    /// reason strings the gate and the status verbs carry verbatim. For tests that
-    /// force a known privilege state; the binary moves to
-    /// [`with_state`](L4Module::with_state) in P1b.15.
+    /// reason strings the gate and the status verbs carry verbatim. A test
+    /// constructor, for tests that force a known privilege state; the binary
+    /// builds over the live state with [`with_state`](L4Module::with_state) /
+    /// [`with_shared_state`](L4Module::with_shared_state).
     #[must_use]
     pub fn with_privilege(cfg: &L4Config, privilege: L4Privilege) -> Self {
         Self::from_config(cfg, Arc::new(PrivilegeSource::Fixed(privilege)))
@@ -504,10 +506,10 @@ impl L4Module {
     }
 
     /// Build a module over an **already-shared** guard + store and a **fixed**
-    /// privilege result, keeping the fail-closed gate. The binary's current
-    /// constructor when it pre-built the L4 state for the scripting engine's
-    /// [`L4Language`](crate::language::L4Language); P1b.15 moves it to
-    /// [`with_shared_state`](L4Module::with_shared_state) and this stays for tests.
+    /// privilege result, keeping the fail-closed gate. A test constructor: the
+    /// binary, which pre-builds the L4 state for the scripting engine's
+    /// [`L4Language`](crate::language::L4Language), uses
+    /// [`with_shared_state`](L4Module::with_shared_state) over the live state.
     #[must_use]
     pub fn with_shared(
         guard: Arc<L4Guard>,

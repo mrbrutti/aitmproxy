@@ -34,8 +34,8 @@ use crate::helper::client::{
 };
 use crate::privilege::derive::{derive, text, LinuxInputs, ProbeInputs, SessionFailure};
 use crate::privilege::linux::{
-    direct_helper_argv, gather_linux, msg, request_linux, watch_step, Child, HoldCount, Spawned,
-    Spawner, StdSpawner, WatchOutcome,
+    direct_helper_argv, gather_linux, msg, request_linux, watch_step, Child, ExitClass, HoldCount,
+    Spawned, Spawner, StdSpawner, WatchOutcome,
 };
 use crate::privilege::macos::gather_mac;
 use crate::privilege::report::{
@@ -69,6 +69,9 @@ const REAP_WAIT: Duration = Duration::from_secs(10);
 const LAZY_START_WAIT: Duration = Duration::from_secs(5);
 /// How long `request()` waits for another caller's first probe to land.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
+/// Consecutive `accept` errors (not timeouts, not foreign peers) after which
+/// the watch ends `failed`: the listener is broken, waiting is pointless.
+pub(crate) const ACCEPT_ERRORS_MAX: usize = 10;
 
 /// What `l4.privilege.request` answers (spec §2.3): the outcome, a message for
 /// the operator, and the report as it stands right after the request.
@@ -112,8 +115,9 @@ impl Outcome {
 /// capture not `Available` and no request in flight; `cfg` carries
 /// `l4.privilege.*` and the process lifetime. The macOS handoff (plan P1b.11)
 /// and the Linux `pkexec` spawn (plan P1b.14) implement it behind
-/// [`PlatformRequester`].
-pub(crate) trait Requester: Send + Sync {
+/// [`PlatformRequester`]; a fixed-input module or a test installs its own
+/// through [`PrivilegeState::with_requester`] (a seam, like `with_prober`).
+pub trait Requester: Send + Sync {
     fn request(&self, cfg: &PrivilegeConfig, report: &PrivilegeReport) -> (Outcome, String);
 
     /// Called by the state right after the answer of `request` was recorded
@@ -122,6 +126,22 @@ pub(crate) trait Requester: Send + Sync {
     /// watcher's first progress write can never be overwritten by the
     /// `pending` row. The default does nothing.
     fn after_recorded(&self) {}
+
+    /// The spawner the direct (launcher-less) start of a file-capability
+    /// helper goes through, so a scripted requester's spawner sees that
+    /// spawn too. The default is the real one.
+    fn spawner(&self) -> Arc<dyn Spawner> {
+        Arc::new(StdSpawner)
+    }
+}
+
+/// What the helper slot holds: a capture/inject backend that also knows
+/// whether its session is still open. One slot serves both readers: the
+/// routed backend (as a [`CaptureInjectBackend`]) and the prober's
+/// `session_connected` (through `is_live`).
+pub trait LiveBackend: CaptureInjectBackend {
+    /// The helper session behind this backend is open right now.
+    fn is_live(&self) -> bool;
 }
 
 /// What the state needs from the core's configuration.
@@ -179,13 +199,10 @@ pub struct PrivilegeState {
 pub(crate) struct Shared {
     clock: Clock,
     cache: Mutex<Cache>,
-    /// The helper session's capture/inject backend while one is connected
-    /// (plan P1b.8 seam). [`RoutedBackend`] takes it for
-    /// `Available { via: Helper }`.
-    helper: Mutex<Option<Arc<dyn CaptureInjectBackend>>>,
-    /// The connected helper backend, for `is_live()`: the prober's
-    /// `session_connected` input (plan P1b.13 hand-over).
-    live: Mutex<Option<Arc<HelperBackend>>>,
+    /// The one helper slot: the connected session's backend (plan P1b.8
+    /// seam). [`RoutedBackend`] takes it for `Available { via: Helper }`; the
+    /// prober reads its `is_live()` as `session_connected` (plan P1b.13).
+    live: Mutex<Option<Arc<dyn LiveBackend>>>,
     /// The guard a [`HelperBackend`] is built over; set by the wiring through
     /// [`PrivilegeState::set_guard`]. Without it a connecting helper cannot be
     /// attached.
@@ -257,7 +274,6 @@ impl Shared {
         Arc::new(Shared {
             clock,
             cache: Mutex::new(Cache::default()),
-            helper: Mutex::new(None),
             live: Mutex::new(None),
             guard: Mutex::new(None),
             last_linux: Mutex::new(None),
@@ -293,15 +309,14 @@ impl Shared {
         self.lock_cache().dirty = true;
     }
 
+    /// The slot's backend as the router takes it.
     fn helper(&self) -> Option<Arc<dyn CaptureInjectBackend>> {
-        lock(&self.helper).clone()
+        lock(&self.live)
+            .clone()
+            .map(|backend| backend as Arc<dyn CaptureInjectBackend>)
     }
 
-    fn set_helper(&self, backend: Option<Arc<dyn CaptureInjectBackend>>) {
-        *lock(&self.helper) = backend;
-    }
-
-    fn set_live(&self, backend: Option<Arc<HelperBackend>>) {
+    fn set_live(&self, backend: Option<Arc<dyn LiveBackend>>) {
         *lock(&self.live) = backend;
     }
 
@@ -380,9 +395,11 @@ impl PrivilegeState {
         }
     }
 
-    /// Replace the platform requester; tests script one.
-    #[cfg(test)]
-    pub(crate) fn with_requester(mut self, requester: Box<dyn Requester>) -> Self {
+    /// Replace the platform requester (the spawner and request seams); tests
+    /// and fixed-input modules script one. Reachable in production builds so
+    /// the seam is one code path.
+    #[must_use]
+    pub fn with_requester(mut self, requester: Box<dyn Requester>) -> Self {
         self.requester = requester;
         self
     }
@@ -429,10 +446,11 @@ impl PrivilegeState {
         self.shared.guard().is_some()
     }
 
-    /// Set (or clear) the helper session's backend. The routed backend takes it
-    /// for `Available { via: Helper }` from the next call on.
-    pub(crate) fn set_helper_backend(&self, backend: Option<Arc<dyn CaptureInjectBackend>>) {
-        self.shared.set_helper(backend);
+    /// Set (or clear) the helper session's backend: the one slot the routed
+    /// backend takes for `Available { via: Helper }` from the next call on and
+    /// the prober reads `session_connected` from.
+    pub fn set_helper_backend(&self, backend: Option<Arc<dyn LiveBackend>>) {
+        self.shared.set_live(backend);
     }
 
     /// The helper session's backend, if one is connected. On the Linux
@@ -601,12 +619,6 @@ impl PrivilegeState {
         cache.dirty = true;
     }
 
-    /// How many capture-state changes `report()` has logged.
-    #[cfg(test)]
-    pub(crate) fn changes(&self) -> u64 {
-        self.shared.lock_cache().changes
-    }
-
     /// Gather and derive outside the cache lock, then merge under it. A
     /// prober that panics still releases the single-flight claim.
     fn probe(&self, request: Option<RequestProgress>, now: u64) {
@@ -708,7 +720,7 @@ impl PrivilegeState {
             return;
         }
         if !self.shared.watching() {
-            match spawn_direct(&self.shared, &helper) {
+            match spawn_direct(&self.shared, &helper, self.requester.spawner()) {
                 Ok(()) => tracing::info!(
                     "starting the packet-capture helper directly (file capabilities)"
                 ),
@@ -832,7 +844,11 @@ impl PlatformRequester {
             gather_linux(cfg.l4.helper_path.as_deref(), self.shared.live_is_up())
         });
         let binder = BindingSpawner::new(Arc::clone(&self.spawner));
-        let socket = binder.socket();
+        // No socket location: refuse before `request_linux`, so no argv is
+        // ever built with an empty path.
+        let Some(socket) = binder.socket() else {
+            return (Outcome::CannotPrompt, no_socket_location());
+        };
         // The hold is the state's (shared with the binary's shutdown future).
         let hold = self.shared.sigint_hold();
         let request = request_linux(cfg, &inputs, &binder, &hold, &socket, display_set());
@@ -903,10 +919,10 @@ fn display_set() -> bool {
 /// [`crate::helper::client::socket_dir`] (`$XDG_RUNTIME_DIR/aitm`, else
 /// `/tmp/aitm-<uid>`) and this process's real uid.
 #[cfg(target_os = "linux")]
-fn socket_location() -> io::Result<(PathBuf, u32)> {
+fn socket_location() -> Option<(PathBuf, u32)> {
     let uid = nix::unistd::getuid().as_raw();
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-    Ok((
+    Some((
         crate::helper::client::socket_dir(runtime.as_deref(), uid),
         uid,
     ))
@@ -914,11 +930,17 @@ fn socket_location() -> io::Result<(PathBuf, u32)> {
 
 /// Off Linux there is no helper session to bind for.
 #[cfg(not(target_os = "linux"))]
-fn socket_location() -> io::Result<(PathBuf, u32)> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "helper sessions are Linux only",
-    ))
+fn socket_location() -> Option<(PathBuf, u32)> {
+    None
+}
+
+/// The refusal when there is no socket location: nothing is spawned, no argv
+/// ever carries an empty path.
+fn no_socket_location() -> String {
+    format!(
+        "{} (no socket directory on this platform)",
+        msg::SPAWN_FAILED
+    )
 }
 
 /// A [`Spawner`] that binds the listener first, then spawns: the helper's
@@ -927,7 +949,7 @@ fn socket_location() -> io::Result<(PathBuf, u32)> {
 /// created on a refusal). The bound listener is taken by the caller.
 struct BindingSpawner {
     inner: Arc<dyn Spawner>,
-    location: Result<(PathBuf, u32), String>,
+    location: Option<(PathBuf, u32)>,
     listener: Mutex<Option<HelperListener>>,
 }
 
@@ -935,17 +957,17 @@ impl BindingSpawner {
     fn new(inner: Arc<dyn Spawner>) -> Self {
         BindingSpawner {
             inner,
-            location: socket_location().map_err(|err| err.to_string()),
+            location: socket_location(),
             listener: Mutex::new(None),
         }
     }
 
-    /// The socket path the listener will bind (the argv needs it first).
-    fn socket(&self) -> PathBuf {
+    /// The socket path the listener will bind (the argv needs it first);
+    /// `None` where no helper session can be bound for (off Linux).
+    fn socket(&self) -> Option<PathBuf> {
         self.location
             .as_ref()
             .map(|(dir, _)| socket_path(dir, std::process::id()))
-            .unwrap_or_default()
     }
 
     fn take_listener(&self) -> Option<HelperListener> {
@@ -958,7 +980,7 @@ impl Spawner for BindingSpawner {
         let (dir, uid) = self
             .location
             .as_ref()
-            .map_err(|err| io::Error::new(io::ErrorKind::Unsupported, err.clone()))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, no_socket_location()))?;
         ensure_socket_dir(dir, *uid)?;
         let listener = HelperListener::bind(dir)?;
         *lock(&self.listener) = Some(listener);
@@ -966,11 +988,18 @@ impl Spawner for BindingSpawner {
     }
 }
 
-/// Start a file-capability helper directly (no launcher, no SIGINT hold) and
-/// watch it like a request, without touching the request progress.
-fn spawn_direct(shared: &Arc<Shared>, helper: &std::path::Path) -> io::Result<()> {
-    let binder = BindingSpawner::new(Arc::new(StdSpawner));
-    let socket = binder.socket();
+/// Start a file-capability helper directly (no launcher, no SIGINT hold)
+/// through `spawner` (the requester's seam) and watch it like a request,
+/// without touching the request progress.
+fn spawn_direct(
+    shared: &Arc<Shared>,
+    helper: &std::path::Path,
+    spawner: Arc<dyn Spawner>,
+) -> io::Result<()> {
+    let binder = BindingSpawner::new(spawner);
+    let socket = binder
+        .socket()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, no_socket_location()))?;
     let child = binder.spawn(&direct_helper_argv(helper, &socket))?;
     let listener = binder
         .take_listener()
@@ -1047,11 +1076,14 @@ impl Acceptor for HelperListener {
 ///   session closes, clears the slot and marks the cache dirty so the next
 ///   report re-probes.
 /// - The child ends first: the hold is released and
-///   [`crate::privilege::linux::classify_exit`] names the progress; the
-///   no-agent row also logs one `warn` (the predicate and the launcher
-///   disagreed).
+///   [`crate::privilege::linux::classify_exit_full`] names the row
+///   ([`ExitClass`]) and the progress; the no-agent row also logs one `warn`
+///   (the predicate and the launcher disagreed).
 /// - [`crate::privilege::linux::APPROVAL_TIMEOUT_MS`] pass: the child is
 ///   killed and the progress is `failed` with the timeout text.
+/// - The listener fails `accept` [`ACCEPT_ERRORS_MAX`] times in a row: one
+///   `warn` at the first, then the child is killed and the progress is
+///   `failed` with the socket error.
 ///
 /// In every terminal arm the listener is dropped (its socket path unlinked)
 /// **before** the terminal progress row is written and before any reap, so a
@@ -1068,6 +1100,7 @@ pub(crate) fn run_watcher(
     progress: bool,
 ) {
     let mut hold = Some(hold);
+    let mut accept_errors = 0usize;
     let record = |state: RequestState, message: &str| {
         if progress {
             shared.set_progress(state, message);
@@ -1079,18 +1112,14 @@ pub(crate) fn run_watcher(
                 drop(hold.take());
                 match attach_session(&shared, session) {
                     Ok(backend) => {
-                        shared.set_helper(Some(
-                            Arc::clone(&backend) as Arc<dyn CaptureInjectBackend>
-                        ));
+                        shared.set_live(Some(Arc::clone(&backend) as Arc<dyn LiveBackend>));
                         record(RequestState::Approved, msg::APPROVED);
-                        shared.set_live(Some(Arc::clone(&backend)));
                         shared.mark_dirty();
                         tracing::info!("L4 packet-capture helper connected");
                         drop(acceptor);
                         while backend.is_live() {
                             std::thread::sleep(LIVE_POLL);
                         }
-                        shared.set_helper(None);
                         shared.set_live(None);
                         shared.mark_dirty();
                         tracing::info!("L4 packet-capture helper session ended");
@@ -1111,20 +1140,51 @@ pub(crate) fn run_watcher(
                 }
                 return;
             }
-            Err(SessionError::Timeout) => {}
+            Err(SessionError::Timeout) => accept_errors = 0,
             Err(SessionError::PeerUid(_) | SessionError::PeerPid(_)) => {
+                accept_errors = 0;
                 tracing::warn!(
                     "a process other than the spawned helper connected to the \
                      packet-capture socket; dropped"
                 );
             }
-            Err(_) => std::thread::sleep(ACCEPT_SLICE),
+            Err(err) => {
+                // A broken listener: say so once, and give up after a bound
+                // rather than spin for the whole approval window.
+                accept_errors += 1;
+                if accept_errors == 1 {
+                    tracing::warn!(error = %err, "the packet-capture socket failed to accept");
+                }
+                if accept_errors >= ACCEPT_ERRORS_MAX {
+                    drop(hold.take());
+                    child.kill();
+                    drop(acceptor);
+                    let message = format!(
+                        "{} ({})",
+                        msg::SOCKET_FAILED,
+                        bounded_text(&err.to_string(), TEXT_BOUND)
+                    );
+                    tracing::info!(
+                        state = RequestState::Failed.as_str(),
+                        reason = %message,
+                        "L4 packet-capture request ended"
+                    );
+                    record(RequestState::Failed, &message);
+                    reap(child.as_mut());
+                    return;
+                }
+                std::thread::sleep(ACCEPT_SLICE);
+            }
         }
 
-        match watch_step(child.as_mut(), false, started_ms, shared.now()) {
-            WatchOutcome::Waiting | WatchOutcome::Connected => {}
-            WatchOutcome::Ended { state, message } => {
-                if message == msg::NO_PROMPT_SHOWN {
+        match watch_step(child.as_mut(), started_ms, shared.now()) {
+            WatchOutcome::Waiting => {}
+            WatchOutcome::Ended {
+                reason,
+                state,
+                message,
+            } => {
+                if reason == ExitClass::NoAgent {
                     tracing::warn!(
                         "a prompt was judged possible but the launcher found no \
                          authentication agent"
@@ -1142,7 +1202,7 @@ pub(crate) fn run_watcher(
                     "L4 packet-capture request ended"
                 );
                 record(state, &message);
-                if message == msg::TIMED_OUT {
+                if reason == ExitClass::TimedOut {
                     reap(child.as_mut());
                 }
                 return;
@@ -1218,6 +1278,13 @@ mod tests {
 
     use super::*;
     use crate::privilege::derive::{HelperCandidate, LinuxInputs, MacInputs, ProbeInputs};
+
+    impl PrivilegeState {
+        /// How many capture-state changes `report()` has logged.
+        fn changes(&self) -> u64 {
+            self.shared.lock_cache().changes
+        }
+    }
     use crate::privilege::report::{
         Capability, HelperStatus, Platform, PrivilegeReport, RequestProgress, RequestState, Via,
     };
@@ -1526,7 +1593,7 @@ mod tests {
     use crate::guard::L4Guard;
     use crate::helper::client::{HelperSession, SessionError};
     use crate::helper::proto::{encode, read_msg, Msg, PROTO};
-    use crate::privilege::linux::fakes::FakeChild;
+    use crate::privilege::linux::fakes::{FakeChild, FakeSpawner};
     use crate::privilege::linux::{ChildExit, HoldCount, SignalGuard};
 
     /// Generous: the machine running these may be under heavy load.
@@ -1715,15 +1782,19 @@ mod tests {
     /// listener can be bound (off Linux here) nothing is spawned at all.
     #[test]
     fn binding_spawner_never_spawns_without_a_listener() {
-        use crate::privilege::linux::fakes::FakeSpawner;
         use crate::privilege::linux::{pkexec_argv, Spawner};
 
         let holds = HoldCount::default();
         let inner = Arc::new(FakeSpawner::new(&holds));
         let binder = BindingSpawner::new(Arc::clone(&inner) as Arc<dyn Spawner>);
-        let socket = binder.socket();
-        let result = binder.spawn(&pkexec_argv(&socket));
         let on_linux = cfg!(target_os = "linux");
+        let socket = binder.socket();
+        assert_eq!(
+            socket.is_some(),
+            on_linux,
+            "a socket location exists on Linux only"
+        );
+        let result = binder.spawn(&pkexec_argv(&socket.unwrap_or_default()));
         match result {
             Ok(_child) => {
                 // Linux: a real bind in the runtime directory, then the spawn.
@@ -2445,5 +2516,260 @@ mod tests {
             prompt_possible: false,
             last_session_error: None,
         }
+    }
+
+    // ---- fix task 2026-11-01: Q4 (one slot), Q6 (seams), Q7 (no socket), Q10 ----
+
+    /// A helper-slot backend whose liveness the test flips.
+    struct Flippable {
+        live: AtomicBool,
+    }
+
+    impl CaptureInjectBackend for Flippable {
+        fn open_capture(
+            &self,
+            _iface: &str,
+            _filter: Option<&str>,
+            _read_timeout: Duration,
+        ) -> Result<Box<dyn crate::backend::CaptureSource>, crate::backend::L4Error> {
+            Err(crate::backend::L4Error::Unavailable("test".to_string()))
+        }
+        fn inject(&self, _iface: &str, _bytes: &[u8]) -> Result<(), crate::backend::L4Error> {
+            Ok(())
+        }
+    }
+
+    impl LiveBackend for Flippable {
+        fn is_live(&self) -> bool {
+            self.live.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Q4: the helper backend lives in **one** slot: what `helper_backend()`
+    /// hands the router is the same object whose liveness the prober reads.
+    #[test]
+    fn helper_backend_has_one_slot_read_by_router_and_prober() {
+        let (state, _now) = state_over(vec![row6()]);
+        assert!(state.helper_backend().is_none());
+        assert!(!state.shared.live_is_up());
+
+        let backend = Arc::new(Flippable {
+            live: AtomicBool::new(true),
+        });
+        state.set_helper_backend(Some(Arc::clone(&backend) as Arc<dyn LiveBackend>));
+        assert!(state.helper_backend().is_some());
+        assert!(state.shared.live_is_up());
+
+        // Same object: flipping its liveness is what the prober sees, and the
+        // slot still holds it until the watcher clears it.
+        backend.live.store(false, Ordering::SeqCst);
+        assert!(!state.shared.live_is_up());
+        assert!(state.helper_backend().is_some());
+
+        state.set_helper_backend(None);
+        assert!(state.helper_backend().is_none());
+        assert!(!state.shared.live_is_up());
+    }
+
+    /// A requester that answers nothing but lends its spawner to the direct
+    /// start (Q6: the seam is reachable in a production build).
+    struct SpawnerOnly(Arc<FakeSpawner>);
+
+    impl Requester for SpawnerOnly {
+        fn request(&self, _cfg: &PrivilegeConfig, _report: &PrivilegeReport) -> (Outcome, String) {
+            (Outcome::CannotPrompt, "no".to_string())
+        }
+        fn spawner(&self) -> Arc<dyn Spawner> {
+            Arc::clone(&self.0) as Arc<dyn Spawner>
+        }
+    }
+
+    /// Q6 / S2 (the Tester's lazy-start unit test): on the file-caps row the
+    /// first `helper_backend()` starts the helper directly through the
+    /// requester's spawner with exactly `direct_helper_argv`; a user-writable
+    /// file-caps helper is never spawned; a one-shot process never spawns.
+    #[test]
+    fn lazy_start_spawns_only_a_root_owned_file_caps_helper_through_the_seam() {
+        let trusted = HelperCandidate {
+            path: PathBuf::from("/opt/aitm/aitm-l4-helper"),
+            at_policy_path: false,
+            root_owned_chain: true,
+            file_caps_net_raw: true,
+        };
+        let run = |lifetime: ProcessLifetime, helper: HelperCandidate| {
+            let holds = HoldCount::default();
+            let spawner = Arc::new(FakeSpawner::new(&holds));
+            let (state, _now) = state_over(vec![row6()]);
+            let state = PrivilegeState {
+                cfg: PrivilegeConfig { lifetime, ..cfg() },
+                ..state
+            }
+            .with_requester(Box::new(SpawnerOnly(Arc::clone(&spawner))));
+            *lock(&state.shared.last_linux) = Some(LinuxInputs {
+                helper: Some(helper),
+                ..linux_nothing()
+            });
+            let backend = state.helper_backend();
+            (backend.is_some(), spawner.argvs(), holds.count())
+        };
+
+        // Untrusted: nothing is spawned, on every OS.
+        let (attached, argvs, holds) = run(
+            ProcessLifetime::Serving,
+            HelperCandidate {
+                root_owned_chain: false,
+                ..trusted.clone()
+            },
+        );
+        assert!(!attached);
+        assert!(argvs.is_empty(), "a user-writable helper is never started");
+        assert_eq!(holds, 0);
+
+        // One-shot: nothing is spawned.
+        let (attached, argvs, _) = run(ProcessLifetime::OneShot, trusted.clone());
+        assert!(!attached);
+        assert!(argvs.is_empty());
+
+        // Trusted, serving: the direct argv through the seam (Linux binds a
+        // real listener first; off Linux there is no socket location, so the
+        // refusal comes before any spawn).
+        let (attached, argvs, holds) = run(ProcessLifetime::Serving, trusted);
+        assert!(!attached, "the fake child never connects");
+        assert_eq!(holds, 0, "a direct start takes no SIGINT hold");
+        if cfg!(target_os = "linux") {
+            assert_eq!(argvs.len(), 1, "{argvs:?}");
+            let argv = &argvs[0];
+            assert_eq!(
+                argv[0],
+                std::ffi::OsString::from("/opt/aitm/aitm-l4-helper")
+            );
+            assert_eq!(argv[1], std::ffi::OsString::from("serve"));
+            assert_eq!(argv[2], std::ffi::OsString::from("--connect"));
+            assert_eq!(
+                argv,
+                &direct_helper_argv(
+                    std::path::Path::new("/opt/aitm/aitm-l4-helper"),
+                    std::path::Path::new(&argv[3])
+                )
+            );
+        } else {
+            assert!(argvs.is_empty(), "no socket location, no spawn: {argvs:?}");
+        }
+    }
+
+    /// Q7: with no socket location (off Linux) the Linux request refuses
+    /// before `request_linux`, so no argv ever carries an empty socket path
+    /// and nothing is spawned.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn linux_request_refuses_without_a_socket_location() {
+        let holds = HoldCount::default();
+        let spawner = Arc::new(FakeSpawner::new(&holds));
+        let requester = PlatformRequester {
+            shared: Shared::new(Arc::new(|| 0)),
+            spawner: Arc::clone(&spawner) as Arc<dyn Spawner>,
+            pending: Mutex::new(None),
+        };
+        let (outcome, message) = requester.linux_request(&cfg());
+        assert_eq!(outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            message,
+            "The packet-capture helper could not be started (no socket directory on this \
+             platform)"
+        );
+        assert!(spawner.argvs().is_empty());
+        assert_eq!(holds.count(), 0);
+        assert!(
+            BindingSpawner::new(Arc::clone(&spawner) as Arc<dyn Spawner>)
+                .socket()
+                .is_none()
+        );
+    }
+
+    /// Q10: a listener that keeps failing `accept` (not a timeout, not a
+    /// foreign peer) does not spin forever: after `ACCEPT_ERRORS_MAX`
+    /// consecutive errors the watch ends `failed`, the child is killed once,
+    /// the hold is released. A timeout in between resets the count.
+    #[test]
+    fn watcher_ends_the_request_after_consecutive_accept_errors() {
+        struct Broken(Arc<AtomicUsize>);
+        impl Acceptor for Broken {
+            fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(SessionError::Io("accept: EBADF".to_string()))
+            }
+        }
+        let (state, now) = state_over(vec![row6()]);
+        now.store(4_000, Ordering::SeqCst);
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let child = FakeChild::alive(4242);
+        let killed = Arc::clone(&child.killed);
+        let holds = HoldCount::default();
+        let hold = holds.hold();
+        let shared = Arc::clone(&state.shared);
+        let accepts_in = Arc::clone(&accepts);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(child),
+                Box::new(Broken(accepts_in)),
+                hold,
+                4_000,
+                true,
+            );
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(WAIT)
+            .expect("the watcher ended instead of spinning on accept errors");
+        assert_eq!(accepts.load(Ordering::SeqCst), ACCEPT_ERRORS_MAX);
+        assert_eq!(killed.load(Ordering::SeqCst), 1, "the child is killed once");
+        assert!(!holds.is_held());
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 4_000,
+                message: "The packet-capture helper socket failed (helper socket error: accept: \
+                          EBADF)"
+                    .to_string(),
+            })
+        );
+
+        // Errors interleaved with timeouts never reach the bound.
+        struct Flaky(Arc<AtomicUsize>);
+        impl Acceptor for Flaky {
+            fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                if n.is_multiple_of(2) {
+                    Err(SessionError::Io("accept: EBADF".to_string()))
+                } else {
+                    Err(SessionError::Timeout)
+                }
+            }
+        }
+        let (state, now) = state_over(vec![row6()]);
+        now.store(5_000, Ordering::SeqCst);
+        let child = FakeChild {
+            ticks_left: 2 * ACCEPT_ERRORS_MAX as u32 + 2,
+            exit: Some(ChildExit::Exited(126)),
+            stderr: "Request dismissed".to_string(),
+            ..FakeChild::alive(4242)
+        };
+        let killed = Arc::clone(&child.killed);
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(child),
+            Box::new(Flaky(Arc::new(AtomicUsize::new(0)))),
+            holds.hold(),
+            5_000,
+            true,
+        );
+        assert_eq!(killed.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.report().request.map(|r| r.state),
+            Some(RequestState::Dismissed)
+        );
     }
 }

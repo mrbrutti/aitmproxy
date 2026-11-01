@@ -1194,10 +1194,11 @@ mod tests {
     }
 
     /// Plan P1b.15: with L4 enabled the registry carries the module's 22 parity
-    /// names plus the two privilege verbs. The module registers 22 today
+    /// names plus the two privilege verbs. The module registers 22
     /// (`aitm-proto-l4/tests/surface.rs::L4_COMMANDS`); the plan's "25 + 2 = 27"
-    /// counted parity verbs that have not landed on this branch, so this pins
-    /// 22 + 2 = 24 (P1b.16 moves the three tool-contract pins by the same +2).
+    /// counted parity verbs that are not on this branch, so this pins
+    /// 22 + 2 = 24. The tool-contract pins carry the same +2 in `EXPECTED_TOOLS`
+    /// and `CORE_TOOLS` (and the bus fixture).
     #[test]
     fn l4_on_registers_24_l4_names() {
         let mut cfg = Config::default();

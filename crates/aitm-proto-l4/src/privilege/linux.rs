@@ -676,6 +676,8 @@ pub mod msg {
     pub const NO_GUARD: &str = "no L4 guard attached to the privilege state";
     /// `cannot_prompt`: the spawn itself failed; the OS text follows.
     pub const SPAWN_FAILED: &str = "The packet-capture helper could not be started";
+    /// `failed`: the listener kept failing `accept`; the socket error follows.
+    pub const SOCKET_FAILED: &str = "The packet-capture helper socket failed";
 }
 
 /// Launcher stderr texts the §5.5 table keys on (spike S7, verbatim).
@@ -780,45 +782,88 @@ pub fn request_linux(
     }
 }
 
+/// Which §5.5 row ended the watch; what the watcher branches on (never the
+/// message text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitClass {
+    /// Cancel, Ctrl-D or Ctrl-C at the prompt.
+    Dismissed,
+    /// Wrong password, or the caller is not an administrator.
+    AuthFailed,
+    /// The launcher found no authentication agent (the predicate and the
+    /// launcher disagreed): the watcher also logs one `warn`.
+    NoAgent,
+    /// Nothing within [`APPROVAL_TIMEOUT_MS`]; the child was killed and must
+    /// be reaped.
+    TimedOut,
+    /// Any other exit, signal, or a broken `try_wait`.
+    Other,
+}
+
 /// The §5.5 exit table (S7), pure: how the launcher ended and its stderr
-/// tail, to the request's progress and message. Exit 126 is a graphical
-/// agent's Cancel; the textual agent never exits 126 and tells its three
-/// endings apart only by text, checked in the order no-agent, EOF, not
-/// authorized (the EOF text is followed by the same "Not authorized" line).
+/// tail, to the row's class, the request's progress and the message. Exit
+/// 126 is a graphical agent's Cancel; the textual agent never exits 126 and
+/// tells its three endings apart only by text, checked in the order no-agent,
+/// EOF, not authorized (the EOF text is followed by the same "Not authorized"
+/// line).
 #[must_use]
-pub fn classify_exit(exit: ChildExit, stderr_tail: &str) -> (RequestState, String) {
+pub fn classify_exit_full(exit: ChildExit, stderr_tail: &str) -> (ExitClass, RequestState, String) {
     match exit {
-        ChildExit::Exited(126) => (RequestState::Dismissed, msg::CANCELLED.to_string()),
-        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::NO_AGENT) => {
-            (RequestState::Failed, msg::NO_PROMPT_SHOWN.to_string())
-        }
-        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::EOF) => {
-            (RequestState::Dismissed, msg::CANCELLED.to_string())
-        }
-        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::NOT_AUTHORIZED) => {
-            (RequestState::Failed, msg::AUTH_FAILED.to_string())
-        }
-        ChildExit::Signaled(SIGINT) => (RequestState::Dismissed, msg::CANCELLED.to_string()),
+        ChildExit::Exited(126) => (
+            ExitClass::Dismissed,
+            RequestState::Dismissed,
+            msg::CANCELLED.to_string(),
+        ),
+        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::NO_AGENT) => (
+            ExitClass::NoAgent,
+            RequestState::Failed,
+            msg::NO_PROMPT_SHOWN.to_string(),
+        ),
+        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::EOF) => (
+            ExitClass::Dismissed,
+            RequestState::Dismissed,
+            msg::CANCELLED.to_string(),
+        ),
+        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::NOT_AUTHORIZED) => (
+            ExitClass::AuthFailed,
+            RequestState::Failed,
+            msg::AUTH_FAILED.to_string(),
+        ),
+        ChildExit::Signaled(SIGINT) => (
+            ExitClass::Dismissed,
+            RequestState::Dismissed,
+            msg::CANCELLED.to_string(),
+        ),
         ChildExit::Exited(code) => (
+            ExitClass::Other,
             RequestState::Failed,
             format!("The packet-capture helper did not start (pkexec exit {code})"),
         ),
         ChildExit::Signaled(signal) => (
+            ExitClass::Other,
             RequestState::Failed,
             format!("The packet-capture helper did not start (killed by signal {signal})"),
         ),
     }
 }
 
-/// What one watcher step decided.
+/// [`classify_exit_full`] without the class: the progress and the message.
+#[must_use]
+pub fn classify_exit(exit: ChildExit, stderr_tail: &str) -> (RequestState, String) {
+    let (_, state, message) = classify_exit_full(exit, stderr_tail);
+    (state, message)
+}
+
+/// What one watcher step decided. A connected session is not a step outcome:
+/// the watcher learns of it from its own `accept`, not from the child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchOutcome {
     /// Nothing yet; step again.
     Waiting,
-    /// The helper session is up: the request is approved.
-    Connected,
     /// The child ended (or was killed at the deadline); record this progress.
     Ended {
+        /// Which row ended it; the watcher branches on this.
+        reason: ExitClass,
         /// `Dismissed` or `Failed`.
         state: RequestState,
         /// The operator's message.
@@ -826,32 +871,30 @@ pub enum WatchOutcome {
     },
 }
 
-/// One step of the watcher, pure over its inputs: a connected session wins;
-/// else a child that ended is [`classify_exit`]ed over its stderr tail; else
-/// [`APPROVAL_TIMEOUT_MS`] after `started_ms` on the injected clock the child
-/// is killed and the request `failed` with the timeout text; else wait.
-pub fn watch_step(
-    child: &mut dyn Child,
-    connected: bool,
-    started_ms: u64,
-    now_ms: u64,
-) -> WatchOutcome {
-    if connected {
-        return WatchOutcome::Connected;
-    }
+/// One step of the watcher, pure over its inputs: a child that ended is
+/// [`classify_exit_full`]ed over its stderr tail; else [`APPROVAL_TIMEOUT_MS`]
+/// after `started_ms` on the injected clock the child is killed and the
+/// request `failed` with the timeout text; else wait.
+pub fn watch_step(child: &mut dyn Child, started_ms: u64, now_ms: u64) -> WatchOutcome {
     match child.try_wait() {
         Ok(Some(exit)) => {
             let tail = child.stderr_tail();
-            let (state, message) = classify_exit(exit, &tail);
-            WatchOutcome::Ended { state, message }
+            let (reason, state, message) = classify_exit_full(exit, &tail);
+            WatchOutcome::Ended {
+                reason,
+                state,
+                message,
+            }
         }
         Err(err) => WatchOutcome::Ended {
+            reason: ExitClass::Other,
             state: RequestState::Failed,
             message: format!("The packet-capture helper did not start ({err})"),
         },
         Ok(None) if now_ms.saturating_sub(started_ms) >= APPROVAL_TIMEOUT_MS => {
             child.kill();
             WatchOutcome::Ended {
+                reason: ExitClass::TimedOut,
                 state: RequestState::Failed,
                 message: msg::TIMED_OUT.to_string(),
             }
@@ -1371,29 +1414,22 @@ mod tests {
 
         // Still waiting one tick short of the deadline, nothing killed.
         assert_eq!(
-            watch_step(&mut child, false, started, started + 299_999),
+            watch_step(&mut child, started, started + 299_999),
             WatchOutcome::Waiting
         );
         assert_eq!(killed.load(Ordering::SeqCst), 0);
 
         // At 300 s on the injected clock: kill and `failed`.
         assert_eq!(
-            watch_step(&mut child, false, started, started + 300_000),
+            watch_step(&mut child, started, started + 300_000),
             WatchOutcome::Ended {
+                reason: ExitClass::TimedOut,
                 state: RequestState::Failed,
                 message: "No approval within 5 minutes".to_string(),
             }
         );
         assert_eq!(killed.load(Ordering::SeqCst), 1);
         assert_eq!(APPROVAL_TIMEOUT_MS, 300_000);
-
-        // A connected session wins over everything, even past the deadline.
-        let mut child = FakeChild::alive(78);
-        assert_eq!(
-            watch_step(&mut child, true, started, started + 400_000),
-            WatchOutcome::Connected
-        );
-        assert_eq!(child.killed.load(Ordering::SeqCst), 0);
 
         // A child that ended is classified, whatever the clock says.
         let mut child = FakeChild {
@@ -1402,8 +1438,9 @@ mod tests {
             ..FakeChild::alive(79)
         };
         assert_eq!(
-            watch_step(&mut child, false, started, started + 1),
+            watch_step(&mut child, started, started + 1),
             WatchOutcome::Ended {
+                reason: ExitClass::Dismissed,
                 state: RequestState::Dismissed,
                 message: "Approval was cancelled".to_string(),
             }
@@ -1674,8 +1711,7 @@ mod tests {
     }
 
     /// Tester: a `try_wait` error (the launcher was reaped by someone else, or
-    /// `waitpid` failed) is a `failed` end naming the error, never a hang; a
-    /// connected session still wins over a broken child.
+    /// `waitpid` failed) is a `failed` end naming the error, never a hang.
     #[test]
     fn watch_step_reports_a_try_wait_error_as_failed() {
         struct Broken;
@@ -1693,13 +1729,13 @@ mod tests {
         }
         let mut child = Broken;
         assert_eq!(
-            watch_step(&mut child, false, 0, 1),
+            watch_step(&mut child, 0, 1),
             WatchOutcome::Ended {
+                reason: ExitClass::Other,
                 state: RequestState::Failed,
                 message: "The packet-capture helper did not start (waitpid: ECHILD)".to_string(),
             }
         );
-        assert_eq!(watch_step(&mut child, true, 0, 1), WatchOutcome::Connected);
     }
 
     /// Tester: a `/proc/self/status` the kernel did not write. An oversized,
@@ -1805,5 +1841,72 @@ mod tests {
             probe(true)
         ));
         assert_eq!(runs.get(), 3);
+    }
+
+    // ---- fix task 2026-11-01: Q2 (the exit class is an enum, not a text) ----
+
+    /// The watcher decides on `ExitClass`, never by comparing message text.
+    /// Every §5.5 row maps to one class; the timeout and a broken `try_wait`
+    /// have theirs.
+    #[test]
+    fn exit_class_is_pinned_for_every_row() {
+        let class = |exit, tail: &str| classify_exit_full(exit, tail).0;
+        assert_eq!(class(ChildExit::Exited(126), ""), ExitClass::Dismissed);
+        assert_eq!(
+            class(ChildExit::Exited(127), stderr_text::NO_AGENT),
+            ExitClass::NoAgent
+        );
+        assert_eq!(
+            class(ChildExit::Exited(127), stderr_text::EOF),
+            ExitClass::Dismissed
+        );
+        assert_eq!(
+            class(ChildExit::Exited(127), stderr_text::NOT_AUTHORIZED),
+            ExitClass::AuthFailed
+        );
+        assert_eq!(class(ChildExit::Signaled(SIGINT), ""), ExitClass::Dismissed);
+        assert_eq!(class(ChildExit::Exited(1), ""), ExitClass::Other);
+        assert_eq!(class(ChildExit::Exited(127), ""), ExitClass::Other);
+        assert_eq!(class(ChildExit::Signaled(9), ""), ExitClass::Other);
+
+        // The full form agrees with the pair form on state and message.
+        let (reason, state, message) =
+            classify_exit_full(ChildExit::Exited(127), stderr_text::NO_AGENT);
+        assert_eq!(reason, ExitClass::NoAgent);
+        assert_eq!(
+            (state, message),
+            classify_exit(ChildExit::Exited(127), stderr_text::NO_AGENT)
+        );
+
+        // Timed out and a broken child carry their classes through watch_step.
+        let mut child = FakeChild::alive(77);
+        assert_eq!(
+            watch_step(&mut child, 0, APPROVAL_TIMEOUT_MS),
+            WatchOutcome::Ended {
+                reason: ExitClass::TimedOut,
+                state: RequestState::Failed,
+                message: "No approval within 5 minutes".to_string(),
+            }
+        );
+        struct Broken;
+        impl Child for Broken {
+            fn id(&self) -> u32 {
+                1
+            }
+            fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
+                Err(std::io::Error::other("waitpid: ECHILD"))
+            }
+            fn kill(&mut self) {}
+            fn stderr_tail(&mut self) -> String {
+                String::new()
+            }
+        }
+        match watch_step(&mut Broken, 0, 1) {
+            WatchOutcome::Ended { reason, state, .. } => {
+                assert_eq!(reason, ExitClass::Other);
+                assert_eq!(state, RequestState::Failed);
+            }
+            other => panic!("expected Ended, got {other:?}"),
+        }
     }
 }

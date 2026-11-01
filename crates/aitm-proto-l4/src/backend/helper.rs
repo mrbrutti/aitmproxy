@@ -44,7 +44,7 @@ use crate::guard::L4Guard;
 use crate::helper::client::{CaptureEvent, HelperSession, SessionError};
 use crate::helper::proto::Msg;
 use crate::privilege::report::{bounded_text_or, TEXT_BOUND};
-use crate::privilege::PrivilegeState;
+use crate::privilege::state::LiveBackend;
 use crate::types::L4Direction;
 
 /// How long one `Inject` may wait for its `InjectResult` (plan P1b.13).
@@ -141,23 +141,17 @@ impl HelperBackend {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// True while the helper session is open. This is what the privilege
-    /// prober's `session_connected` input should read (P1b.14).
+    /// True while the helper session is open: what the privilege prober's
+    /// `session_connected` input reads through the state's helper slot.
     #[must_use]
     pub fn is_live(&self) -> bool {
         !self.session.is_closed()
     }
+}
 
-    /// Set this backend as the state's helper backend, so the routed backend
-    /// takes it for `Available { via: Helper }` from the next call on.
-    pub fn attach(self: &Arc<Self>, state: &PrivilegeState) {
-        let backend: Arc<dyn CaptureInjectBackend> = Arc::<Self>::clone(self);
-        state.set_helper_backend(Some(backend));
-    }
-
-    /// Clear the state's helper backend (the session ended).
-    pub fn detach(state: &PrivilegeState) {
-        state.set_helper_backend(None);
+impl LiveBackend for HelperBackend {
+    fn is_live(&self) -> bool {
+        HelperBackend::is_live(self)
     }
 }
 
@@ -266,6 +260,7 @@ mod tests {
     use crate::privilege::derive::{LinuxInputs, ProbeInputs};
     use crate::privilege::report::{Platform, RequestProgress};
     use crate::privilege::state::{PrivilegeConfig, Prober, ProcessLifetime};
+    use crate::privilege::PrivilegeState;
     use crate::types::{
         IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange, RateCap,
     };
@@ -642,16 +637,17 @@ mod tests {
         ))
     }
 
-    /// `attach` fills the state's helper slot so `state.backend()` routes an
-    /// inject to this session; `detach` empties it again.
+    /// Setting the state's one helper slot makes `state.backend()` route an
+    /// inject to this session (and the prober see it live); clearing it
+    /// closes the route again.
     #[test]
-    fn attach_and_detach_set_the_state_slot() {
+    fn the_state_slot_routes_to_this_session_until_cleared() {
         let (session, mut peer) = open_session();
         let backend = backend_over(Arc::clone(&session), guard(), &mut peer);
         let state = helper_state();
         assert!(state.helper_backend().is_none());
 
-        backend.attach(&state);
+        state.set_helper_backend(Some(Arc::clone(&backend) as Arc<dyn LiveBackend>));
         assert!(state.helper_backend().is_some());
 
         let t = std::thread::spawn(move || {
@@ -670,7 +666,7 @@ mod tests {
             .expect("routed to the helper session");
         drop(t.join().expect("peer"));
 
-        HelperBackend::detach(&state);
+        state.set_helper_backend(None);
         assert!(state.helper_backend().is_none());
         let err = state.backend().inject("lo", &[7]).expect_err("unwired");
         assert_eq!(

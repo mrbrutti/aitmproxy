@@ -7,8 +7,9 @@
 //! is available right now and delegates accordingly:
 //!
 //! - `Available { via: Process }` → the in-process libpcap backend;
-//! - `Available { via: Helper }` → the helper session's backend, once P1b.13 sets
-//!   it on the state ([`PrivilegeState::set_helper_backend`]); until then a fixed
+//! - `Available { via: Helper }` → the helper session's backend in the state's
+//!   helper slot ([`PrivilegeState::set_helper_backend`], filled by the watcher
+//!   when a session attaches); while no session is attached, a fixed
 //!   [`L4Error::Unavailable`] ([`HELPER_NOT_WIRED`]);
 //! - anything else → [`L4Error::Unavailable`] carrying the same text the gated
 //!   verbs and the status verbs report
@@ -34,7 +35,7 @@ use crate::privilege::report::{Capability, Via};
 use crate::privilege::PrivilegeState;
 
 /// The refusal while capture is available only through the helper but no helper
-/// session backend has been set on the state (P1b.13 wires it).
+/// session is attached (the state's helper slot is empty).
 pub const HELPER_NOT_WIRED: &str = "packet-capture helper session is not wired yet";
 
 /// The capture/inject backend every production caller holds: routes each call on
@@ -233,6 +234,12 @@ mod tests {
         fn next_frame(&mut self) -> Result<Option<Vec<u8>>, L4Error> {
             std::thread::sleep(Duration::from_millis(5));
             Ok(None)
+        }
+    }
+
+    impl crate::privilege::state::LiveBackend for MockBackend {
+        fn is_live(&self) -> bool {
+            true
         }
     }
 
@@ -442,7 +449,9 @@ mod tests {
         assert_eq!(unavailable_text(&err), HELPER_NOT_WIRED);
 
         let helper = MockBackend::new();
-        state.set_helper_backend(Some(helper.clone()));
+        state.set_helper_backend(Some(
+            Arc::clone(&helper) as Arc<dyn crate::privilege::state::LiveBackend>
+        ));
         router
             .inject("lo", &[9])
             .expect("inject goes to the helper");

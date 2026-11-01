@@ -48,21 +48,29 @@ fn src_dir() -> PathBuf {
 /// cleanly excludes test-only code (e.g. mock backends that legitimately call
 /// `.inject(..)`) from the structural scan.
 ///
-/// A `#[cfg(test)]` on a single test-only *method* earlier in the file does not end
-/// the prefix (tester, privilege unit p1b): `privilege/state.rs` carries two such
-/// seams hundreds of lines before its `mod tests`, and cutting there would hide the
-/// watcher thread, the session attach and the direct helper start from the scan.
-/// Including a test-only method in the scan is the conservative direction: a wire
-/// write inside one would still trip the gate.
+/// A `#[cfg(test)]` on a single test-only *item* earlier in the file (a method, an
+/// `impl`) does not end the prefix (tester, privilege unit p1b): cutting there
+/// would hide everything after it from the scan. The convention
+/// (`intercept/mod.rs`) is to keep such items below every production item anyway;
+/// including one in the scan is the conservative direction: a wire write inside
+/// it would still trip the gate. Further attribute or comment lines between the
+/// `#[cfg(test)]` and the `mod` keyword (`#[allow(..)]`, `///`, `//`) are skipped,
+/// and every module visibility (`mod`, `pub`, `pub(crate)`, `pub(super)`) counts.
 fn production_prefix(source: &str) -> &str {
     const ATTR: &str = "#[cfg(test)]";
     let mut from = 0;
     while let Some(rel) = source[from..].find(ATTR) {
         let idx = from + rel;
-        let after = source[idx + ATTR.len()..].trim_start();
-        if after.starts_with("mod ")
-            || after.starts_with("pub mod ")
-            || after.starts_with("pub(crate) mod ")
+        let mut after = source[idx + ATTR.len()..].trim_start();
+        // Skip further attributes and comment lines before the item keyword.
+        while after.starts_with("#[") || after.starts_with("//") {
+            after = after
+                .find('\n')
+                .map_or("", |end| after[end + 1..].trim_start());
+        }
+        if ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+            .iter()
+            .any(|prefix| after.starts_with(prefix))
         {
             return &source[..idx];
         }
@@ -185,12 +193,13 @@ fn mangling_verdict_requires_permit_by_type() {
 }
 
 /// Tester (privilege unit p1b): the tripwire's notion of "production code" must
-/// reach the end of every production item. `privilege/state.rs` puts
-/// `#[cfg(test)]` on two test-only methods (`with_requester`, `changes`) long
-/// before its `mod tests`; cutting the scan at the first attribute would leave the
-/// watcher thread, the session attach and the direct helper start (plan P1b.14)
-/// outside `exactly_one_production_wire_write`. This pins that the scan reaches
-/// them, still stops at the test module, and that the one choke point is in view.
+/// reach the end of every production item. `privilege/state.rs` once put
+/// `#[cfg(test)]` on two test-only methods long before its `mod tests` (the fix
+/// task of 2026-11-01 moved them below every production item, per the convention);
+/// cutting the scan at a first such attribute would leave the watcher thread, the
+/// session attach and the direct helper start (plan P1b.14) outside
+/// `exactly_one_production_wire_write`. This pins that the scan reaches them,
+/// still stops at the test module, and that the one choke point is in view.
 #[test]
 fn production_prefix_reaches_the_trailing_test_module() {
     let state = std::fs::read_to_string(src_dir().join("privilege").join("state.rs"))
@@ -234,4 +243,28 @@ fn production_prefix_reaches_the_trailing_test_module() {
         production_prefix("fn a() {}\n#[cfg(test)]\npub(crate) mod fakes {}\n"),
         "fn a() {}\n"
     );
+
+    // Fix task 2026-11-01 (Q12): a `pub(super) mod`, and further attributes or
+    // comment lines between `#[cfg(test)]` and the `mod`, still end the prefix.
+    assert_eq!(
+        production_prefix("fn a() {}\n#[cfg(test)]\npub(super) mod fakes {}\n"),
+        "fn a() {}\n"
+    );
+    assert_eq!(
+        production_prefix(
+            "fn a() {}\n#[cfg(test)]\n#[allow(dead_code)]\n// scripted stand-ins\nmod tests {}\n"
+        ),
+        "fn a() {}\n"
+    );
+    assert_eq!(
+        production_prefix("fn a() {}\n#[cfg(test)]\n/// doc\npub(crate) mod fakes {}\n"),
+        "fn a() {}\n"
+    );
+    // A test-only item that is not a module, even behind extra attributes,
+    // still does not end the prefix.
+    let prefix = production_prefix(
+        "fn a() {}\n#[cfg(test)]\n#[allow(dead_code)]\nfn seam() {}\nfn b() {}\n#[cfg(test)]\nmod tests {}\n",
+    );
+    assert!(prefix.contains("fn b()"), "{prefix:?}");
+    assert!(!prefix.contains("mod tests"), "{prefix:?}");
 }
