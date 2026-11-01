@@ -91,6 +91,10 @@ aitm-testtarget.workspace = true
 # (`aitm_tui::keys::map`) with crossterm `KeyEvent`s against a spawned core — the
 # same crossterm the TUI itself reads keys through.
 crossterm = { version = "0.29", features = ["event-stream"] }
+# `tests/l4_cua_tui.rs` reads the TUI's screen by drawing `aitm_tui::ui::render`
+# into an off-screen `ratatui::buffer::Buffer` — the same ratatui `aitm-tui`
+# pins, so Cargo.lock only gains the edge.
+ratatui = "0.30"
 # The HTTPS fixture behind the obscura MITM tests (M2 Task 24): same crates and
 # features as aitm-proto-http, so nothing new enters the tree.
 rcgen = "0.14"
