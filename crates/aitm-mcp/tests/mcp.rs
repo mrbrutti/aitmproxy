@@ -8332,7 +8332,10 @@ fn a_visible_agent_line_gaps_a_paused_agent_a_hidden_one_does_not_and_trusted_co
 
 // ------------------------------------------------ flow finish and timing, Task 5: push mirrors flow.get
 
-use aitm_core::{FlowError, HttpResponse, StreamBody, WsDir, WsFlow, WsMessage, WsOpcode};
+use aitm_core::{
+    FlowError, HttpResponse, StreamBody, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow,
+    WsMessage, WsOpcode,
+};
 use aitm_plugins::CapturePlugin;
 use std::time::UNIX_EPOCH;
 
@@ -8439,6 +8442,17 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
     assert_eq!(expected_http["request_bytes"], json!(412));
     assert_eq!(expected_http["response_bytes"], json!(2048));
     assert_eq!(expected_http["is_replay"], json!(true));
+    // Spec D7: the tunnel keys are present (null) on an ordinary request, and
+    // `passive` is a literal false. `.get` distinguishes "absent" from "null".
+    let http_obj = expected_http.as_object().expect("flow.get is an object");
+    for key in ["tunnel", "tunnel_reason", "bytes_up", "bytes_down"] {
+        assert_eq!(
+            http_obj.get(key),
+            Some(&JsonValue::Null),
+            "`{key}` is present and null on an ordinary request: {expected_http}"
+        );
+    }
+    assert_eq!(http_obj.get("passive"), Some(&json!(false)));
     srv.push_flow_event(&Event::RequestHeaders(http_id));
     let note = next_json(&mut lines).await;
     assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
@@ -8461,6 +8475,105 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
     assert_eq!(
         note["params"]["summary"], expected_ws,
         "the WebSocket push summary is the flow.get object, field for field"
+    );
+    let ws_obj = expected_ws.as_object().expect("flow.get is an object");
+    for key in ["tunnel", "tunnel_reason", "bytes_up", "bytes_down"] {
+        assert_eq!(
+            ws_obj.get(key),
+            Some(&JsonValue::Null),
+            "`{key}` is present and null on a WebSocket flow: {expected_ws}"
+        );
+    }
+    assert_eq!(ws_obj.get("passive"), Some(&json!(false)));
+
+    // Per-host decryption, spec D7 / AC11: a passthrough row (closed, with byte
+    // counts), a failed row (no response) and a passive cleartext flow carry
+    // `tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down` and `passive` on both
+    // sides with the literal wire codes.
+    let mut passthrough = http_flow_with_method("origin.test:443", "", "CONNECT");
+    let Flow::Http(f) = &mut passthrough else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.scheme = "https".into();
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(1500));
+    f.metadata.tunnel = Some(TunnelInfo {
+        mode: TunnelMode::Passthrough,
+        reason: Some(TunnelReason::OutOfScope),
+        bytes_up: Some(10),
+        bytes_down: Some(20),
+    });
+    let passthrough_id = store.insert(passthrough);
+    let expected_passthrough = capture_flow_get(&store, passthrough_id);
+    assert_eq!(expected_passthrough["method"], "CONNECT");
+    assert_eq!(expected_passthrough["status"], json!(200));
+    assert_eq!(expected_passthrough["duration_ms"], json!(1500));
+    assert_eq!(expected_passthrough["tunnel"], json!("passthrough"));
+    assert_eq!(expected_passthrough["tunnel_reason"], json!("out_of_scope"));
+    assert_eq!(expected_passthrough["bytes_up"], json!(10));
+    assert_eq!(expected_passthrough["bytes_down"], json!(20));
+    assert_eq!(expected_passthrough["passive"], json!(false));
+    srv.push_flow_event(&Event::Response(passthrough_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], passthrough_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_passthrough,
+        "the passthrough push summary is the flow.get object, field for field"
+    );
+
+    let mut failed = http_flow_with_method("pinned.test:443", "", "CONNECT");
+    let Flow::Http(f) = &mut failed else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.scheme = "https".into();
+    f.response = None;
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(37));
+    f.metadata.tunnel = Some(TunnelInfo::failed(TunnelReason::ClientRejectedCertificate));
+    let failed_id = store.insert(failed);
+    let expected_failed = capture_flow_get(&store, failed_id);
+    let failed_obj = expected_failed.as_object().expect("flow.get is an object");
+    assert_eq!(expected_failed["tunnel"], json!("failed"));
+    assert_eq!(
+        expected_failed["tunnel_reason"],
+        json!("client_rejected_certificate")
+    );
+    assert_eq!(failed_obj.get("status"), Some(&JsonValue::Null));
+    assert_eq!(failed_obj.get("bytes_up"), Some(&JsonValue::Null));
+    assert_eq!(failed_obj.get("bytes_down"), Some(&JsonValue::Null));
+    assert_eq!(expected_failed["duration_ms"], json!(37));
+    assert_eq!(expected_failed["passive"], json!(false));
+    srv.push_flow_event(&Event::Response(failed_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], failed_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_failed,
+        "the failed-tunnel push summary is the flow.get object, field for field"
+    );
+
+    let mut passive = http_flow("plain.test", "/p");
+    passive.metadata_mut().created = created;
+    passive.metadata_mut().passive = true;
+    let passive_id = store.insert(passive);
+    let expected_passive = capture_flow_get(&store, passive_id);
+    let passive_obj = expected_passive.as_object().expect("flow.get is an object");
+    assert_eq!(expected_passive["passive"], json!(true));
+    assert_eq!(passive_obj.get("tunnel"), Some(&JsonValue::Null));
+    assert_eq!(passive_obj.get("tunnel_reason"), Some(&JsonValue::Null));
+    srv.push_flow_event(&Event::RequestHeaders(passive_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], passive_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_passive,
+        "the passive-flow push summary is the flow.get object, field for field"
     );
 
     let _ = w.shutdown().await;
