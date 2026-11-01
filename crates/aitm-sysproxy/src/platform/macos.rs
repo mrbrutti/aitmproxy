@@ -5,7 +5,7 @@
 
 use aitm_ca::exec::{CmdLine, Executor};
 
-use crate::platform::{cmd, PlatformOps};
+use crate::platform::{cmd, PlatformOps, Snapshot};
 use crate::state::Previous;
 use crate::{
     merge_bypass, remedy, Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow,
@@ -350,10 +350,6 @@ impl PlatformOps for MacosOps {
         Mechanism::Networksetup
     }
 
-    fn detail_when_unsupported(&self) -> Option<String> {
-        None
-    }
-
     fn read_effective(&self, exec: &dyn Executor) -> Result<Effective, ReadError> {
         let out = run_query(exec, &cmd(SCUTIL, &["--proxy"], false))?;
         parse_scutil(&out)
@@ -363,18 +359,29 @@ impl PlatformOps for MacosOps {
         self.read_services_full(exec).map(|full| full.rows)
     }
 
+    /// The rows of [`Self::read_services_full`] minus the authenticated
+    /// services, which are returned as `skipped` (§D3: their password cannot
+    /// be restored, so they are never written).
+    fn snapshot(&self, exec: &dyn Executor) -> Result<Snapshot, ReadError> {
+        let MacosServices {
+            rows,
+            authenticated,
+        } = self.read_services_full(exec)?;
+        let services = rows
+            .into_iter()
+            .filter(|row| !authenticated.contains(&row.service))
+            .collect();
+        Ok(Snapshot {
+            previous: Previous::Networksetup { services },
+            skipped: authenticated,
+        })
+    }
+
     /// Per service in `previous`, in order: the three lines of
     /// [`render_write`] with bypass = previous ∪ default ∪ `bypass_extra`.
-    /// Stops at the first failure.
-    ///
-    /// PLAN GAP (plan Task 2 "`MacosOps::write` skips it"): this signature
-    /// carries no authenticated-service marker (`ServiceRow` has no such
-    /// field and `Previous` is the trait's only input), so the skip cannot
-    /// happen here without re-reading every service between the snapshot
-    /// and the first `-set*` line, which SP-AC5's run order forbids. Until
-    /// the Architect decides, the engine (Task 6) must leave the services
-    /// named by `read_services_full().authenticated` out of the `previous`
-    /// it passes here and report them as "skipped <svc>: authenticated proxy".
+    /// Stops at the first failure. Authenticated services are already
+    /// absent from the `previous` that [`Self::snapshot`] built, so none is
+    /// written here.
     fn write(
         &self,
         exec: &dyn Executor,
@@ -809,5 +816,69 @@ mod tests {
         );
         assert_eq!(exec.runs(), ran);
         assert!(!exec.runs().iter().any(|l| l.contains("Display Ethernet")));
+    }
+
+    /// Gap 1: `snapshot` is the rows minus the authenticated services, which
+    /// are reported as `skipped` so the engine can name them.
+    #[test]
+    fn snapshot_excludes_authenticated_services_and_names_them() {
+        let exec = ScriptedExecutor::new()
+            .respond(
+                "/usr/sbin/networksetup -listallnetworkservices",
+                0,
+                "An asterisk (*) denotes that a network service is disabled.\nDisplay Ethernet\n*Thunderbolt Bridge\nWi-Fi\n",
+                "",
+            )
+            .respond(
+                "/usr/sbin/networksetup -getwebproxy 'Display Ethernet'",
+                0,
+                "Enabled: Yes\nServer: 127.0.0.1\nPort: 9090\nAuthenticated Proxy Enabled: 0\n",
+                "",
+            )
+            .respond(
+                "/usr/sbin/networksetup -getsecurewebproxy 'Display Ethernet'",
+                0,
+                "Enabled: Yes\nServer: 127.0.0.1\nPort: 9090\nAuthenticated Proxy Enabled: 0\n",
+                "",
+            )
+            .respond(
+                "/usr/sbin/networksetup -getproxybypassdomains 'Display Ethernet'",
+                0,
+                "*.local\n169.254/16\n",
+                "",
+            )
+            .respond(
+                "/usr/sbin/networksetup -getwebproxy Wi-Fi",
+                0,
+                "Enabled: Yes\nServer: proxy.corp\nPort: 3128\nAuthenticated Proxy Enabled: 1\n",
+                "",
+            )
+            .respond(
+                "/usr/sbin/networksetup -getsecurewebproxy Wi-Fi",
+                0,
+                "Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n",
+                "",
+            )
+            .respond(
+                "/usr/sbin/networksetup -getproxybypassdomains Wi-Fi",
+                0,
+                "There aren't any bypass domains set on Wi-Fi.\n",
+                "",
+            );
+        let snapshot = MacosOps.snapshot(&exec).unwrap();
+        assert_eq!(snapshot.skipped, vec!["Wi-Fi".to_string()]);
+        assert_eq!(
+            snapshot.previous,
+            Previous::Networksetup {
+                services: vec![ServiceRow {
+                    service: "Display Ethernet".into(),
+                    http: on("127.0.0.1", 9090),
+                    https: on("127.0.0.1", 9090),
+                    bypass: strs(&["*.local", "169.254/16"]),
+                }],
+            }
+        );
+        assert_eq!(exec.runs().len(), 7, "the list and three gets per service");
+        assert!(exec.runs().iter().all(|l| !l.contains(" -set")));
     }
 }

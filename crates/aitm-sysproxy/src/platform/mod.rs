@@ -1,7 +1,7 @@
 //! Per-platform mechanisms behind one trait. All of them compile on every
 //! host so each mechanism's command lines are unit-tested against canned
-//! output wherever the suite runs; only detection (Task 6) consults the
-//! target OS.
+//! output wherever the suite runs; only detection (`SystemProxy::detect_with`)
+//! consults the target OS.
 
 pub mod linux;
 pub mod macos;
@@ -10,26 +10,36 @@ pub mod windows;
 use aitm_ca::exec::{CmdLine, Executor};
 
 use crate::state::Previous;
-use crate::{
-    service_equals_wrote, Effective, Endpoint, Mechanism, ReadError, ServiceRow, WriteError, Wrote,
-};
+use crate::{Effective, Endpoint, Mechanism, ReadError, ServiceRow, WriteError};
+
+/// The before-state a set records (§D7) and the services it must not write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    /// What `restore` puts back; excludes `skipped`.
+    pub previous: Previous,
+    /// macOS services with `Authenticated Proxy Enabled: 1` (§D3): their
+    /// password cannot be restored, so the engine leaves them alone and
+    /// reports "skipped <svc>: authenticated proxy". Empty on Linux.
+    pub skipped: Vec<String>,
+}
 
 /// One mechanism's reads and writes, each a sequence of [`CmdLine`]s run
 /// through the executor. Returned `Vec<String>`s are the rendered lines, in
 /// order, for the verb's `commands` field.
-// `SystemProxy` (Task 6) is the first caller of this trait and the two
-// helpers below; the allow goes with it.
-#[allow(dead_code)]
 pub(crate) trait PlatformOps: Send + Sync {
     fn mechanism(&self) -> Mechanism;
-    /// The `detail` to report when the mechanism cannot manage anything
-    /// (`None` for mechanisms that can).
-    fn detail_when_unsupported(&self) -> Option<String>;
     /// The effective view: `scutil --proxy` / six `gsettings get`.
     fn read_effective(&self, exec: &dyn Executor) -> Result<Effective, ReadError>;
-    /// Per-service rows (macOS); Linux yields one synthetic row.
+    /// Per-service rows (macOS); Linux yields one synthetic row (two on KDE
+    /// with gsettings mirrored).
     fn read_services(&self, exec: &dyn Executor) -> Result<Vec<ServiceRow>, ReadError>;
-    /// Point every service at `ours`, bypass = previous ∪ default ∪ `bypass_extra`.
+    /// The before-state for the state file, taken before the first mutating
+    /// line. Runs reads only.
+    fn snapshot(&self, exec: &dyn Executor) -> Result<Snapshot, ReadError>;
+    /// Point every service in `previous` at `ours`, bypass = previous ∪
+    /// default ∪ `bypass_extra`. Stops at the first failure and reports
+    /// nothing about what was already written (the engine rolls back every
+    /// service in `previous`, plan C7).
     fn write(
         &self,
         exec: &dyn Executor,
@@ -44,25 +54,27 @@ pub(crate) trait PlatformOps: Send + Sync {
         previous: &Previous,
         only: &[String],
     ) -> Result<Vec<String>, WriteError>;
-    /// Per service: does the live row still equal what we wrote (C3)?
-    fn equals_wrote(&self, live: &[ServiceRow], wrote: &Wrote) -> Vec<(String, bool)> {
-        live.iter()
-            .map(|row| (row.service.clone(), service_equals_wrote(row, wrote)))
-            .collect()
-    }
 }
 
-/// The ops for a detected mechanism.
-#[allow(dead_code)]
+// "Does a live row still equal what we wrote" has one implementation,
+// `crate::service_equals_wrote` (plan C3); the engine and the watchdog both
+// judge a whole file against a live read through `watchdog::decide`, so the
+// trait carries no per-mechanism equality hook.
+
+/// The ops for a bare mechanism word: what the watchdog has (the state file
+/// names the mechanism, nothing else) and what the public
+/// `SystemProxy::with_mechanism` test constructor takes. `detect_with`
+/// builds its ops from the full detection instead, so a KDE host gets the
+/// tool major it actually has.
 pub(crate) fn ops_for(mechanism: Mechanism) -> Box<dyn PlatformOps> {
     match mechanism {
         Mechanism::Networksetup => Box::new(macos::MacosOps),
         Mechanism::Gsettings => Box::new(linux::GsettingsOps),
-        // PLAN GAP (plan Task 1, `ops_for` comment "Kde → linux::KdeOps"): a bare
-        // `Mechanism::Kde` does not say which `kwriteconfig`/`kreadconfig` major
-        // is on PATH nor whether `gsettings` is present too (§D4). The 6 variants
-        // without gsettings are a placeholder until the Architect decides where
-        // that probe lives (Task 3's `detect_mechanism` or Task 6's `with_mechanism`).
+        // A bare `Kde` cannot say which `kwriteconfig` major is on PATH nor
+        // whether `gsettings` is present too; the 6 variants are assumed. A
+        // KDE restore through the watchdog therefore needs `kwriteconfig6`
+        // (the mirrored gsettings keys are restored from the snapshot's
+        // content regardless of `gsettings_too`).
         Mechanism::Kde => Box::new(linux::KdeOps {
             kwrite: "kwriteconfig6",
             kread: "kreadconfig6",
@@ -74,7 +86,6 @@ pub(crate) fn ops_for(mechanism: Mechanism) -> Box<dyn PlatformOps> {
 
 /// A command line with no stdin. `program` and `args` reach the OS as given;
 /// quoting exists only in [`CmdLine::render`].
-#[allow(dead_code)]
 pub(crate) fn cmd(program: &str, args: &[&str], mutating: bool) -> CmdLine {
     CmdLine {
         program: program.to_string(),

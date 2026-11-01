@@ -302,7 +302,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::platform::PlatformOps;
+    use crate::platform::{PlatformOps, Snapshot};
     use crate::state::{Previous, StateFile};
     use crate::{
         Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow, WriteError, Wrote,
@@ -538,14 +538,14 @@ mod tests {
         fn mechanism(&self) -> Mechanism {
             Mechanism::Networksetup
         }
-        fn detail_when_unsupported(&self) -> Option<String> {
-            None
-        }
         fn read_effective(&self, _exec: &dyn Executor) -> Result<Effective, ReadError> {
             Err(ReadError::Unavailable("not used".into()))
         }
         fn read_services(&self, _exec: &dyn Executor) -> Result<Vec<ServiceRow>, ReadError> {
             self.live.clone()
+        }
+        fn snapshot(&self, _exec: &dyn Executor) -> Result<Snapshot, ReadError> {
+            panic!("the watchdog never snapshots")
         }
         fn write(
             &self,

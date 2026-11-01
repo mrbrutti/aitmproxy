@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use aitm_ca::exec::{CmdLine, Executor};
 
-use crate::platform::{cmd, PlatformOps};
+use crate::platform::{cmd, PlatformOps, Snapshot};
 use crate::state::Previous;
 use crate::{
     merge_bypass, Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow, WriteError,
@@ -47,10 +47,7 @@ const NOT_PERSISTED: &str = "gsettings did not persist the change (no dconf sess
 
 /// What [`detect`] found: the mechanism plus the facts a bare
 /// [`Mechanism`] cannot carry (which KDE tool major is on `PATH`, whether
-/// `gsettings` is there too).
-// `SystemProxy::detect_with` (Task 6) is the caller; until it lands only the
-// tests use this.
-#[allow(dead_code)]
+/// `gsettings` is there too). `SystemProxy::detect_with` is the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Detected {
     Gsettings,
@@ -62,7 +59,6 @@ pub(crate) enum Detected {
     None,
 }
 
-#[allow(dead_code)]
 impl Detected {
     pub(crate) fn mechanism(&self) -> Mechanism {
         match self {
@@ -95,7 +91,6 @@ impl Detected {
 /// | `XDG_CURRENT_DESKTOP` contains `KDE` and `kwriteconfig6` or `kwriteconfig5` on `PATH` | `Kde` (6 preferred) |
 /// | `gsettings` on `PATH` and (`DBUS_SESSION_BUS_ADDRESS` or `DISPLAY`/`WAYLAND_DISPLAY` set) | `Gsettings` |
 /// | anything else, and every `target_os != "linux"` | `None` |
-#[allow(dead_code)]
 pub(crate) fn detect(
     target_os: &str,
     env: &dyn Fn(&str) -> Option<String>,
@@ -323,14 +318,18 @@ fn gsettings_value<'a>(keys: &'a BTreeMap<String, String>, schema: &str, key: &s
         .map_or("", String::as_str)
 }
 
-/// The effective view of the six keys: `enabled = (mode == 'manual')`.
+/// The effective view of the six keys: `enabled = (mode == 'manual')` and
+/// a non-empty host, so a half-configured desktop never reads as `→ :0`.
 fn gsettings_effective(keys: &BTreeMap<String, String>) -> Effective {
     let manual =
         parse_gvariant_string(gsettings_value(keys, "org.gnome.system.proxy", "mode")) == "manual";
-    let proto = |schema: &str| ProtocolProxy {
-        enabled: manual,
-        host: parse_gvariant_string(gsettings_value(keys, schema, "host")),
-        port: parse_port(gsettings_value(keys, schema, "port")),
+    let proto = |schema: &str| {
+        let host = parse_gvariant_string(gsettings_value(keys, schema, "host"));
+        ProtocolProxy {
+            enabled: manual && !host.is_empty(),
+            host,
+            port: parse_port(gsettings_value(keys, schema, "port")),
+        }
     };
     Effective {
         http: proto("org.gnome.system.proxy.http"),
@@ -430,22 +429,9 @@ fn gsettings_restore(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GsettingsOps;
 
-#[allow(dead_code)]
-impl GsettingsOps {
-    /// The before-state for the state file: six `get`s, raw text.
-    pub(crate) fn snapshot(&self, exec: &dyn Executor) -> Result<Previous, ReadError> {
-        let keys = gsettings_read_keys(exec, &mut Vec::new())?;
-        Ok(Previous::Gsettings { keys })
-    }
-}
-
 impl PlatformOps for GsettingsOps {
     fn mechanism(&self) -> Mechanism {
         Mechanism::Gsettings
-    }
-
-    fn detail_when_unsupported(&self) -> Option<String> {
-        None
     }
 
     fn read_effective(&self, exec: &dyn Executor) -> Result<Effective, ReadError> {
@@ -455,6 +441,15 @@ impl PlatformOps for GsettingsOps {
 
     fn read_services(&self, exec: &dyn Executor) -> Result<Vec<ServiceRow>, ReadError> {
         Ok(vec![row(GSETTINGS_SERVICE, self.read_effective(exec)?)])
+    }
+
+    /// The before-state for the state file: six `get`s, raw text.
+    fn snapshot(&self, exec: &dyn Executor) -> Result<Snapshot, ReadError> {
+        let keys = gsettings_read_keys(exec, &mut Vec::new())?;
+        Ok(Snapshot {
+            previous: Previous::Gsettings { keys },
+            skipped: Vec::new(),
+        })
     }
 
     fn write(
@@ -514,7 +509,7 @@ fn kde_proxy_value(ours: &Endpoint) -> String {
 }
 
 /// `http://host port` (KDE's spelling) or `host:port` → the protocol row;
-/// `enabled` is the caller's `ProxyType == 1`.
+/// `enabled` is the caller's `ProxyType == 1` and needs a non-empty host.
 fn parse_kde_proxy(value: &str, enabled: bool) -> ProtocolProxy {
     let value = value.trim();
     let no_scheme = value
@@ -526,7 +521,7 @@ fn parse_kde_proxy(value: &str, enabled: bool) -> ProtocolProxy {
         None => no_scheme.rsplit_once(':').unwrap_or((no_scheme, "")),
     };
     ProtocolProxy {
-        enabled,
+        enabled: enabled && !host.is_empty(),
         host: host.to_string(),
         port: port.parse().unwrap_or(0),
     }
@@ -583,23 +578,6 @@ impl KdeOps {
         Ok(map)
     }
 
-    /// The before-state for the state file: the four kioslaverc keys and,
-    /// when `gsettings_too`, the six gsettings keys.
-    // `SystemProxy::set` (Task 6) is the caller.
-    #[allow(dead_code)]
-    pub(crate) fn snapshot(&self, exec: &dyn Executor) -> Result<Previous, ReadError> {
-        let kioslaverc = self.read_kioslaverc(exec)?;
-        let gsettings = if self.gsettings_too {
-            Some(gsettings_read_keys(exec, &mut Vec::new())?)
-        } else {
-            None
-        };
-        Ok(Previous::Kde {
-            kioslaverc,
-            gsettings,
-        })
-    }
-
     /// The four `kwriteconfig` lines then the KIO signal.
     fn write_kioslaverc(
         &self,
@@ -633,12 +611,26 @@ impl PlatformOps for KdeOps {
         Mechanism::Kde
     }
 
-    fn detail_when_unsupported(&self) -> Option<String> {
-        None
-    }
-
     fn read_effective(&self, exec: &dyn Executor) -> Result<Effective, ReadError> {
         Ok(kde_effective(&self.read_kioslaverc(exec)?))
+    }
+
+    /// The before-state for the state file: the four kioslaverc keys and,
+    /// when `gsettings_too`, the six gsettings keys.
+    fn snapshot(&self, exec: &dyn Executor) -> Result<Snapshot, ReadError> {
+        let kioslaverc = self.read_kioslaverc(exec)?;
+        let gsettings = if self.gsettings_too {
+            Some(gsettings_read_keys(exec, &mut Vec::new())?)
+        } else {
+            None
+        };
+        Ok(Snapshot {
+            previous: Previous::Kde {
+                kioslaverc,
+                gsettings,
+            },
+            skipped: Vec::new(),
+        })
     }
 
     /// The `kde` row and, when `gsettings_too`, the `gsettings` row.
@@ -1007,7 +999,7 @@ mod tests {
         assert_eq!(rows[0].service, GSETTINGS_SERVICE);
         assert_eq!(rows[0].bypass, eff.bypass);
         assert_eq!(
-            GsettingsOps.snapshot(&exec).expect("snapshot"),
+            GsettingsOps.snapshot(&exec).expect("snapshot").previous,
             previous_gsettings()
         );
 
@@ -1199,7 +1191,7 @@ mod tests {
         assert_eq!(rows[0].service, KDE_SERVICE);
         assert_eq!(rows[0].http, eff.http);
         assert_eq!(
-            kde6().snapshot(&exec).expect("snapshot"),
+            kde6().snapshot(&exec).expect("snapshot").previous,
             Previous::Kde {
                 kioslaverc: BTreeMap::from([
                     ("ProxyType".to_string(), "1".to_string()),
@@ -1228,7 +1220,7 @@ mod tests {
             "8080",
             WRITTEN_LIST,
         ]));
-        let snap = both.snapshot(&exec).expect("snapshot");
+        let snap = both.snapshot(&exec).expect("snapshot").previous;
         let Previous::Kde { gsettings, .. } = &snap else {
             panic!("kde snapshot");
         };
@@ -1316,5 +1308,66 @@ mod tests {
             parse_gvariant_string_list(&gvariant_string_list(&["it's".into()])),
             vec!["it's".to_string()]
         );
+    }
+
+    /// Gap 6: `manual` with an empty host is not an enabled proxy, so a
+    /// half-configured desktop never renders as `HTTPS → :0`.
+    #[test]
+    fn manual_mode_with_an_empty_host_is_not_enabled() {
+        let mut exec = ScriptedExecutor::new();
+        let answers = ["'manual'", "'127.0.0.1'", "8080", "''", "0", "@as []"];
+        for (i, (schema, key)) in GSETTINGS_KEYS.iter().enumerate() {
+            exec = exec.respond(&get(schema, key), 0, answers[i], "");
+        }
+        let eff = GsettingsOps.read_effective(&exec).expect("read");
+        assert_eq!(
+            eff.http,
+            ProtocolProxy {
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            eff.https,
+            ProtocolProxy {
+                enabled: false,
+                host: String::new(),
+                port: 0
+            }
+        );
+        assert_eq!(eff.bypass, Vec::<String>::new());
+
+        let exec = ScriptedExecutor::new()
+            .respond(&kr("ProxyType"), 0, "1\n", "")
+            .respond(&kr("httpProxy"), 0, "http://127.0.0.1 8080\n", "")
+            .respond(&kr("httpsProxy"), 0, "\n", "")
+            .respond(&kr("NoProxyFor"), 0, "\n", "");
+        let eff = kde6().read_effective(&exec).expect("read");
+        assert!(eff.http.enabled);
+        assert_eq!(eff.http.port, 8080);
+        assert!(!eff.https.enabled);
+        assert_eq!(eff.https.host, "");
+    }
+
+    /// Gap 1: the inherent snapshots are the trait's `snapshot`, unchanged.
+    #[test]
+    fn trait_snapshot_is_the_mechanism_snapshot() {
+        let exec = scripted_gsettings(None);
+        let ops: &dyn PlatformOps = &GsettingsOps;
+        let snap = ops.snapshot(&exec).expect("snapshot");
+        assert_eq!(snap.previous, previous_gsettings());
+        assert!(snap.skipped.is_empty());
+
+        let exec = ScriptedExecutor::new()
+            .respond(&kr("ProxyType"), 0, "0\n", "")
+            .respond(&kr("httpProxy"), 0, "\n", "")
+            .respond(&kr("httpsProxy"), 0, "\n", "")
+            .respond(&kr("NoProxyFor"), 0, "\n", "");
+        let kde = kde6();
+        let ops: &dyn PlatformOps = &kde;
+        let snap = ops.snapshot(&exec).expect("snapshot");
+        assert_eq!(snap.previous, previous_kde());
+        assert!(snap.skipped.is_empty());
     }
 }
