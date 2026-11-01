@@ -27,9 +27,11 @@
 //! early *with what it has*, because a cancelled job still reports its partial
 //! discovery. A bad origin, a refused origin or a failed crawl is a warning and
 //! a skip, never an error: `discover` errors only when it could do nothing at
-//! all (an uncompilable ignore list). And every URL that reaches a log line or
-//! an error goes through [`redact::safe_url`]; no header, cookie or body value
-//! is ever named here.
+//! all (an uncompilable ignore list), and after a failed crawl the store is
+//! read again so the captures the crawl inserted before failing still become
+//! nodes. And every URL that reaches a log line or an error goes through
+//! [`redact::safe_url`], every foreign error text through
+//! [`redact::scrub_error`]; no header, cookie or body value is ever named here.
 
 use std::sync::Arc;
 
@@ -64,13 +66,41 @@ pub(crate) struct HttpLane {
     /// One canary monitor per job, bounded; built on the first
     /// [`Lane::probe_host_for`] of that job.
     monitors: SessionMonitors,
+    /// The two crawl engines `discover` chooses between.
+    crawlers: Crawlers,
+}
+
+/// The crawl engines a lane runs: one per [`Engine`].
+///
+/// Held by value on the lane so a test can stand in a failing engine; the
+/// production pair is [`BrowserCrawler`] and [`ClientCrawler`].
+#[derive(Clone, Copy)]
+pub(crate) struct Crawlers {
+    /// The engine for [`Engine::Browser`].
+    pub(crate) browser: &'static dyn Crawler,
+    /// The engine for [`Engine::Client`].
+    pub(crate) client: &'static dyn Crawler,
+}
+
+impl Crawlers {
+    /// The real engines.
+    const REAL: Self = Self {
+        browser: &BrowserCrawler,
+        client: &ClientCrawler,
+    };
 }
 
 impl HttpLane {
-    /// A lane with no job monitors yet.
+    /// A lane with no job monitors yet, running the real crawl engines.
     pub fn new() -> Self {
+        Self::with_crawlers(Crawlers::REAL)
+    }
+
+    /// A lane running `crawlers` in place of the real engines.
+    pub(crate) fn with_crawlers(crawlers: Crawlers) -> Self {
         Self {
             monitors: SessionMonitors::new(),
+            crawlers,
         }
     }
 }
@@ -123,7 +153,15 @@ impl Lane for HttpLane {
                     continue;
                 }
 
-                discover_origin(&origin, job, &opts, session.as_deref(), &mut builder).await;
+                discover_origin(
+                    &origin,
+                    job,
+                    &opts,
+                    session.as_deref(),
+                    &mut builder,
+                    self.crawlers,
+                )
+                .await;
             }
 
             Ok(builder.finish())
@@ -165,17 +203,33 @@ async fn discover_origin(
     opts: &EnumerateOptions<'_>,
     session: Option<&SessionMaterial>,
     builder: &mut SiteMapBuilder,
+    crawlers: Crawlers,
 ) {
     let job_mark = format!("scan:{}", job.job_id());
 
     // (i) What the proxy already captured for this origin.
-    let stored = stored_flows(job, origin, &job_mark);
+    let mut stored = stored_flows(job, origin, &job_mark);
 
     // (ii) What a crawl adds, if the profile allows one.
     let crawled = if job.cancelled() {
         Vec::new()
     } else {
-        crawl_origin(origin, job, &stored, session, &job_mark).await
+        match crawl_origin(origin, job, &stored, session, &job_mark, crawlers).await {
+            Ok(flows) => flows,
+            Err(error) => {
+                tracing::warn!(
+                    job = job.job_id(),
+                    error = %redact::scrub_error(&error),
+                    "scan: http lane: the crawl failed; continuing with the captured flows"
+                );
+                // A browser crawl records through the proxy as it goes, so the
+                // store may hold captures the failed crawl never reported. Read
+                // it again rather than keep the pre-crawl snapshot; this job's
+                // own crawl marks keep those flows in (R3).
+                stored = stored_flows(job, origin, &job_mark);
+                Vec::new()
+            }
+        }
     };
 
     // (iii) to (v) Enumerate both sets into the shared site map.
@@ -280,22 +334,23 @@ fn engine_for(job: &dyn JobCtx) -> Option<Engine> {
 
 /// Step (ii): crawl `origin` and hand back the flows the crawl produced.
 ///
-/// Empty when the profile disabled crawling, when no engine applies, when the
-/// job was cancelled, or when the crawl failed — a failed crawl is a warning and
-/// the discovery continues with the flows the store already held.
+/// `Ok` and empty when the profile disabled crawling, when no engine applies or
+/// when the job was cancelled; `Err` when the engine itself failed, which the
+/// caller turns into a warning.
 async fn crawl_origin(
     origin: &Url,
     job: &dyn JobCtx,
     stored: &[HttpFlow],
     session: Option<&SessionMaterial>,
     job_mark: &str,
-) -> Vec<HttpFlow> {
+    crawlers: Crawlers,
+) -> Result<Vec<HttpFlow>> {
     let crawl = &job.profile().crawl;
     if crawl.max_pages == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(engine) = engine_for(job) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let send = SendOptions {
@@ -319,42 +374,31 @@ async fn crawl_origin(
     // `fetch_seeds` cannot poll cancellation itself, so the lane polls the moment
     // it returns.
     if job.cancelled() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     seeds.extend(stored_seeds(stored));
 
     if engine == Engine::Browser {
         prime_browser(job, origin, session).await;
         if job.cancelled() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
     }
 
     let limits = limits_for(crawl);
-    let crawler: &dyn Crawler = match engine {
-        Engine::Browser => &BrowserCrawler,
-        Engine::Client => &ClientCrawler,
+    let crawler = match engine {
+        Engine::Browser => crawlers.browser,
+        Engine::Client => crawlers.client,
     };
-    match crawler.crawl(origin, seeds, job, &limits).await {
-        Ok(report) => {
-            if let Some(reason) = report.stopped_reason {
-                tracing::info!(
-                    job = job.job_id(),
-                    reason,
-                    "scan: http lane: the crawl stopped early"
-                );
-            }
-            report.flows
-        }
-        Err(error) => {
-            tracing::warn!(
-                job = job.job_id(),
-                error = %redact::scrub_error(&error),
-                "scan: http lane: the crawl failed; continuing with the captured flows"
-            );
-            Vec::new()
-        }
+    let report = crawler.crawl(origin, seeds, job, &limits).await?;
+    if let Some(reason) = report.stopped_reason {
+        tracing::info!(
+            job = job.job_id(),
+            reason,
+            "scan: http lane: the crawl stopped early"
+        );
     }
+    Ok(report.flows)
 }
 
 /// Call **A19**: up to [`MAX_SEED_URLS`] captured `GET` URLs, so traffic the
@@ -415,7 +459,9 @@ mod tests {
         ParamRef, ProfileTarget, ScanProfile, SessionMaterial, SiteNode, UseBrowser,
     };
 
-    use super::HttpLane;
+    use super::{Crawlers, HttpLane};
+    use crate::crawl::frontier::{CrawlReport, Crawler, Limits};
+    use crate::limits::MARK_CRAWL;
     use crate::testutil::{
         captured_flow, request, site, FakeBrowser, FakeJob, PageScript, JOB_ID, MARKER,
     };
@@ -978,5 +1024,73 @@ mod tests {
                 .collect::<BTreeSet<String>>()
         );
         assert_eq!(client.sent.lock().unwrap().len(), 0);
+    }
+
+    // --- stage-5 R3: a failed crawl still yields the captures it inserted ---
+
+    /// The path a [`FailingCrawler`] captures before it dies.
+    const INSERTED_BY_CRAWL: &str = "/inserted-by-crawl";
+
+    /// A crawl engine that records one origin flow into the store, as a browser
+    /// navigation does through the proxy, and then fails with a driver error
+    /// that echoes a credential.
+    struct FailingCrawler;
+
+    impl Crawler for FailingCrawler {
+        fn crawl<'a>(
+            &'a self,
+            _origin: &'a url::Url,
+            _seeds: Vec<url::Url>,
+            job: &'a dyn JobCtx,
+            _limits: &'a Limits,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<CrawlReport>> {
+            Box::pin(async move {
+                let mut flow = captured_flow(
+                    request("GET", &format!("{ORIGIN}{INSERTED_BY_CRAWL}"), &[], None),
+                    200,
+                    &[],
+                    b"<p>captured mid-crawl</p>",
+                );
+                flow.metadata.marks = vec![format!("scan:{JOB_ID}"), MARK_CRAWL.to_string()];
+                job.store().insert(Flow::Http(flow));
+                Err(anyhow::anyhow!(
+                    "the browser died on http://t:8080/cb?token=abc"
+                ))
+            })
+        }
+    }
+
+    /// When the crawl fails, the lane re-reads the store, so a capture the crawl
+    /// inserted before failing is enumerated into a node instead of being lost
+    /// with the pre-crawl snapshot; the warning carries no credential.
+    #[tokio::test]
+    async fn failed_crawl_re_reads_the_store_for_its_captures() {
+        let (_guard, lines) = crate::redact::capture::install();
+        let store = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured_flow(
+            request("GET", "http://t:8080/before", &[], None),
+            200,
+            &[],
+            b"",
+        )));
+        let job = FakeJob::new(profile(|_| {}), Arc::new(site(&[]))).with_store(Arc::clone(&store));
+        let lane = HttpLane::with_crawlers(Crawlers {
+            browser: &FailingCrawler,
+            client: &FailingCrawler,
+        });
+
+        let discovery = lane
+            .discover(&target(&[ORIGIN]), &job)
+            .await
+            .expect("a failed crawl is a warning, not a failed discovery");
+
+        node(&discovery, "/before");
+        node(&discovery, INSERTED_BY_CRAWL);
+        assert_eq!(store.query(&aitm_core::FlowQuery::default()).len(), 2);
+
+        let warned = lines.containing("the crawl failed");
+        assert_eq!(warned.len(), 1, "{:?}", lines.all());
+        assert!(warned[0].contains("the browser died"), "{}", warned[0]);
+        assert!(!warned[0].contains("abc"), "{}", warned[0]);
     }
 }
