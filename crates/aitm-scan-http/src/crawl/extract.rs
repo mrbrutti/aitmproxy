@@ -221,6 +221,12 @@ pub(crate) fn extract(html: &str) -> Extracted {
         // form's index off by one (S-I2, R-M2). `<script>` and `<iframe>` still
         // have their `src` read and `<textarea>` its name, so those three go
         // through `Walk::open`, which skips their bodies the same way.
+        // `<plaintext>` has no end tag: a browser never leaves PLAINTEXT, so a
+        // literal `</plaintext>` is text and the rest of the page is swallowed
+        // (F4-4).
+        if tag == "plaintext" {
+            break;
+        }
         if is_raw_text_element(&tag) {
             i = raw_text_end(html, &tag, scan_tag(html, j, None));
             continue;
@@ -237,14 +243,14 @@ pub(crate) fn extract(html: &str) -> Extracted {
     walk.finish()
 }
 
-/// Whether the element's body is text the tokenizer never reads as markup
-/// (besides `<script>`, `<iframe>` and `<textarea>`, which carry an attribute
-/// the walk wants and are handled in [`Walk::open`]). `<plaintext>` has no end
-/// tag, so it swallows the rest of the document, as it does in a browser.
+/// Whether the element's body is text the tokenizer never reads as markup, up
+/// to its end tag (besides `<script>`, `<iframe>` and `<textarea>`, which
+/// carry an attribute the walk wants and are handled in [`Walk::open`], and
+/// `<plaintext>`, which has no end tag and ends the walk in [`extract`]).
 fn is_raw_text_element(tag: &str) -> bool {
     matches!(
         tag,
-        "style" | "title" | "noscript" | "xmp" | "noembed" | "noframes" | "plaintext"
+        "style" | "title" | "noscript" | "xmp" | "noembed" | "noframes"
     )
 }
 
@@ -896,7 +902,9 @@ mod tests {
     /// form written inside one is not a form and does not consume an index
     /// (`FormSpec::index` counts forms the walk *started*; a form inside a
     /// raw-text body is never started), while the `<iframe src>` is still a
-    /// link.
+    /// link. `<plaintext>` has no end tag at all: a literal `</plaintext>`
+    /// is text too, so a form written after one is a phantom the live DOM
+    /// never has (F4-4).
     #[test]
     fn extract_treats_iframe_noembed_noframes_and_plaintext_bodies_as_text() {
         let out = extract(concat!(
@@ -920,6 +928,7 @@ mod tests {
             r#"<NOFRAMES><form action="/nf"><input name="nf"></NOFRAMES>"#,
             r#"<form action="/real"><input name="b"></form>"#,
             r#"<plaintext><form action="/pt"><a href="/pt">"#,
+            r#"</plaintext><form action="/phantom"><input name="p"></form>"#,
         ));
         assert!(out.links.is_empty(), "{:?}", out.links);
         assert_eq!(out.forms.len(), 1, "{out:?}");
