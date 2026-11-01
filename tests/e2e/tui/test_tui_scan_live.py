@@ -27,14 +27,17 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         and path, the Scan strip gone), f -> false_positive, u -> open (screen AND
         scan.issue), P opens Findings on the PoC or records the toast.
   T7-16 (UI-1) the held `standard` editor re-entered (never assumed fresh), `browser
-        never` and `speed thorough` asserted on their Fields lines, s -> a Jobs row with
-        the id scan.list reports, sampled as soon as it is on screen at 1.0 s spacing
-        (H62): three or more screen samples whose on-screen `sent/budget` is
-        non-decreasing and inside a scan.status bracket taken around the sample; the
-        state/phase cell changes at least once; x right after the third sample yields
-        `cancelled` on screen and in scan.status (on a fresh `thorough` job cancelled in
-        its first second when the sampled one finished before x, H37); the second client
-        saw a `progress` and a `cancelled` line for the cancelled job.
+        never`, `speed thorough` and `intensity intrusive` asserted on their Fields lines
+        (H62, H70), s -> a Jobs row with the id scan.list reports, sampled as soon as it
+        is on screen at 0.5 s spacing: three or more screen samples whose on-screen
+        `sent/budget` is non-decreasing and inside a scan.status bracket taken around the
+        sample; the state/phase cell changes at least once; x right after the third
+        sample yields `cancelled` on screen and in scan.status (on a fresh `thorough`
+        `intrusive` job cancelled in its first second when the sampled one finished
+        before x, H37); the second client saw a `progress` and a `cancelled` line for the
+        cancelled job. Every launch (s, m, the confirm's y) returns only once its start
+        reply has landed on the Jobs tab with the new row, since that reply switches the
+        tab and undoes a tab key pressed before it (H72).
   T7-18 (UI-3) `l4-stream-safe` + t 127.0.0.1:<port>/tcp: the D7 gate text is on screen and
         s starts nothing (scan.list unchanged for 3 s); after the harness adds an inject
         L4 scope entry (removed again at the end of the run), s shows the confirm overlay
@@ -87,12 +90,15 @@ Exit 0 PASS / 1 FAIL / 77 SKIP.
 (cursor row, severity group, editor header, surface tag, inspector, Findings head, the
 Site map node and marker, the wire-confirm overlay, the crawl `browser` line, the strip
 banner, the Site map settle rule (H54) and head-first wait (H63), the prompt bar and the
-Fields `origins`/`l4`/`speed` lines), the failure-screen writer, the L4 scope read and
-add arguments (H59), the prompt, `browser` and `speed` key helpers against a scripted
-terminal (H49, H44, H62) and the push-counting thread against a scripted bus client with
-the harness's blocking per-line read (H46, H57, H64), against frames painted with the
-TUI's real geometry (the boxed Scan view, its pane rule, a sidebar offset), with no core
-and no pty, one line per assertion; exit 0 when all hold.
+Fields `origins`/`l4`/`speed`/`intensity` lines), the failure-screen writer, the L4 scope
+read and add arguments (H59), the prompt, `browser`, `speed` and `intensity` key helpers
+against a scripted terminal (H49, H44, H62, H70), the launch's landing wait against
+scripted screens and a scripted scan.list (H72), the tab markers against footers painted
+from the Rust key tables and read back from the Rust sources (H71), and the push-counting
+thread against a scripted bus client with the harness's blocking per-line read (H46, H57,
+H64), against frames painted with the TUI's real geometry (the boxed Scan view, its pane
+rule, a sidebar offset), with no core and no pty, one line per assertion; exit 0 when all
+hold.
 """
 from __future__ import annotations
 
@@ -137,9 +143,10 @@ UI_SETTLE = 0.35
 JOB_APPEAR_S = 30.0
 ROW_APPEAR_S = 20.0
 # Between two T7-16 samples: the `standard` job finishes its 182 probes in about a second
-# with the client crawl (the fourth live run), so the sampled job runs `thorough` and is
-# sampled at this spacing, the first sample as soon as its row is on screen (H62).
-SAMPLE_GAP_S = 1.0
+# with the client crawl (the fourth live run) and its 278 `thorough` probes in about 2 s
+# (the fifth: one `done` sample), so the sampled job runs `thorough` AND `intrusive` and
+# is sampled at this spacing, the first sample as soon as its row is on screen (H62, H70).
+SAMPLE_GAP_S = 0.5
 SAMPLES_MIN, SAMPLES_MAX = 3, 6
 CATCHUP_S = 8.0
 CANCEL_S = 25.0
@@ -193,13 +200,87 @@ TOKEN = re.compile(
 
 ENTER, ESC = "\r", "\x1b"
 SCAN_STRIP = "1 Profiles"
+# The Scan key tables as `crates/aitm-tui/src/ui/scan/mod.rs` spells them (`key_table!`
+# and the `ISSUES_FILTER_KEYS` const; a `Hint` is `(key, what)`), mirrored here so the
+# self-test frames paint their footers from the same tuples the TUI does and the tab
+# markers below are checked against them; `rust_hints` reads the tables back from the
+# Rust source in the self-test, so a renamed key fails there with no core (H71). The
+# status bar's `Esc back` is the bar's own, never in a footer.
+PROFILES_KEYS = (("s", "start"), ("m", "map"), ("w", "save as"), ("e", "edit"), ("Space", "toggle"))
+JOBS_KEYS = (("x", "cancel"), ("⏎", "issues of this job"), ("s", "start"), ("m", "map"))
+SITEMAP_KEYS = (("⏎", "open flow"), ("n", "next page"), ("J", "job filter"))
+ISSUES_KEYS = (("c", "confirm"), ("f", "false positive"), ("u", "reopen"), ("⏎", "open flow"), ("P", "PoC"))
+ISSUES_FILTER_KEYS = (("S", "severity"), ("C", "confidence"), ("L", "lane"), ("T", "status"), ("J", "job"),
+                      ("R", "reset"))
+# The Profiles list header's column names, in the order `ui/scan/profiles.rs` formats them
+# (` {name}   {GAP}{lanes}{GAP}{intensity}{GAP}speed`, each `fit` to its column).
+PROFILES_HEADER = ("name", "lanes", "intensity", "speed")
+RUST_KEY_TABLES = os.path.join(ROOT, "crates", "aitm-tui", "src", "ui", "scan", "mod.rs")
+RUST_PROFILES_VIEW = os.path.join(ROOT, "crates", "aitm-tui", "src", "ui", "scan", "profiles.rs")
+
+
+def key_text(groups):
+    """`key what · key what ...`: the hint groups joined the way `ui/scan/mod.rs`
+    `key_text` spells a footer (H71)."""
+    return " · ".join(f"{k} {w}" for g in groups for k, w in g)
+
+
+RUST_HINT_RE = re.compile(r'\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\)')
+
+
+def rust_hints(path, table):
+    """The `(key, what)` tuples the Rust key table `table` lists in the source at `path`
+    (`key_table!(NAME, BAR[, MORE]: hints);` or `const NAME: &[Hint] = &[hints];`), a
+    bare const hint (`RESET`, `OPEN_FLOW`) resolved from its own `const X: Hint = (..);`
+    line; () when the file or the table is not there (H71)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError:
+        return ()
+    consts = {m.group(1): (m.group(2), m.group(3)) for m in
+              re.finditer(r'const\s+([A-Z_]+)\s*:\s*Hint\s*=\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)', src)}
+    m = (re.search(r"key_table!\(\s*" + re.escape(table) + r"\s*,[^:]*:(.*?)\);", src, re.S)
+         or re.search(r"const\s+" + re.escape(table) + r"\s*:\s*&\[Hint\]\s*=\s*&\[(.*?)\];", src, re.S))
+    if m is None:
+        return ()
+    out = []
+    for tok in re.finditer(r'\(\s*"(?:[^"\\]|\\.)*"\s*,\s*"(?:[^"\\]|\\.)*"\s*\)|\b([A-Z][A-Z_]+)\b', m.group(1)):
+        if tok.group(1):
+            if tok.group(1) in consts:
+                out.append(consts[tok.group(1)])
+        else:
+            pair = RUST_HINT_RE.match(tok.group(0))
+            out.append((pair.group(1), pair.group(2)))
+    return tuple(out)
+
+
+def rust_profiles_header(path):
+    """The column names the Profiles list header formats, in order, read from the
+    `format!(" {}   {GAP_TEXT}{}..", fit("name", ..), fit("lanes", ..), fit("intensity",
+    ..), "speed")` call in `ui/scan/profiles.rs`; () when not found (H71)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError:
+        return ()
+    m = re.search(r'format!\(\s*" \{\}   \{GAP_TEXT\}\{\}\{GAP_TEXT\}\{\}\{GAP_TEXT\}\{\}",(.*?)\)\s*,\s*theme',
+                  src, re.S)
+    if m is None:
+        return ()
+    return tuple(re.findall(r'"([a-z]+)"', m.group(1)))
+
+
 # A text each tab alone draws (crates/aitm-tui/src/ui/scan/{profiles,jobs,issues}.rs): the
-# Profiles list header, the Jobs footer, the Issues footer. The tab strip is on every tab
-# and proves nothing about which one drew. The Site map's marker is the summary head's
-# node count of the job under test (`sitemap.rs` `summary`: `N nodes · ..`), which T7-19
-# waits for after pinning the job with `J` (H11); a bare `\d+ nodes` would be the
-# job-less query's answer. The head is drawn by `hint` (ui/scan/mod.rs): a pad cell, then
-# the summary, so the marker keeps that pad and `3 nodes` cannot match the job-less
+# Profiles list header, the Jobs footer (`key_text(&[JOBS_KEYS])`), the Issues list pane's
+# filter line (`key_text(&[ISSUES_FILTER_KEYS])`: `S severity · C confidence · L lane · T
+# status · J job · R reset`, the Issues detail pane's footer being `key_text(&[ISSUES_KEYS])`),
+# each checked in the self-test against the table it is drawn from (H71). The tab strip is
+# on every tab and proves nothing about which one drew. The Site map's marker is the
+# summary head's node count of the job under test (`sitemap.rs` `summary`: `N nodes · ..`),
+# which T7-19 waits for after pinning the job with `J` (H11); a bare `\d+ nodes` would be
+# the job-less query's answer. The head is drawn by `hint` (ui/scan/mod.rs): a pad cell,
+# then the summary, so the marker keeps that pad and `3 nodes` cannot match the job-less
 # answer's `13 nodes` (H12).
 TAB_MARKERS = {
     "1": r"name\s+lanes\s+intensity",
@@ -246,6 +327,16 @@ BROWSER_RING = ("auto", "always", "never")
 # `speed` is followed by a pad or the pane rule, never a ring word, so it never reads.
 SPEED_FIELD_RE = re.compile(r"\bspeed (fast|normal|thorough)\b")
 SPEED_RING = ("fast", "normal", "thorough")
+# The same Fields line's first value (`│ intensity <v>   speed ..`, the label padded to
+# LABEL_W at the detail pane's first cell); `e` on the `intensity` field cycles the ring
+# passive, light, medium, intrusive (`crates/aitm-scan-model/src/vocab.rs` `Intensity`,
+# `scan/profiles.rs` `INTENSITIES`). `thorough` alone still finished the `standard` job in
+# about 2 s (the fifth live run: 278 probes, one `done` sample), so T7-16's sampled job and
+# its fresh cancel job run `intrusive` too (H70); T7-17's first finder keeps `thorough`
+# alone. The list header's `intensity` is followed by a pad then `speed`, and the list
+# rows' intensity cells stand without the label, so neither reads.
+INTENSITY_FIELD_RE = re.compile(r"│ intensity +(passive|light|medium|intrusive)\b")
+INTENSITY_RING = ("passive", "light", "medium", "intrusive")
 # The Scan prompts' bar (`ui/bars.rs` `prompt`): while `Mode::Prompt` is up the status
 # row (the screen's last) reads ` <label> <typed>` with the label one of `origin:` (o),
 # `l4 target:` (t), `profile name:` (w) or `value:` (e on a text or number field).
@@ -1032,6 +1123,20 @@ def speed_value(text):
     return m.group(1) if m else None
 
 
+def intensity_value(text):
+    """The held editor's `intensity` value as its Fields line reads it (`passive`, `light`,
+    `medium`, `intrusive`), or None without an editor on screen (H70)."""
+    m = INTENSITY_FIELD_RE.search(text)
+    return m.group(1) if m else None
+
+
+def landed_on_jobs(text, job):
+    """True when the start reply has landed: the Jobs footer (`fold_start_result`, app.rs,
+    sets `scan.tab = ScanTab::Jobs`) AND `job`'s row are on screen. The start toast
+    carries the id too, so the id alone proves nothing (H72, H5)."""
+    return re.search(TAB_MARKERS["2"], text) is not None and row_tail(text, job) is not None
+
+
 def prompt_open(text):
     """The label of the Scan prompt the status row carries (`origin:`, `l4 target:`,
     `profile name:`, `value:`), or None when no Scan prompt is up (H49, H44). The bar
@@ -1131,6 +1236,9 @@ class Ctx:
         self.marker = ""
         self.cookie_secret = ""
         self.jobs = {}
+        # job id -> whether its start reply landed on the Jobs tab with its row inside the
+        # launch's wait (`launch`, H72).
+        self.landed = {}
         self.l4_entry_id = None
 
     def snap(self, step):
@@ -1316,11 +1424,35 @@ def set_speed_thorough(ctx, step, what="the editor"):
     return set_ring_field(ctx, step, "speed", "thorough", SPEED_RING, speed_value, "`speed`", "H62", what)
 
 
-def launch(ctx, key, timeout=JOB_APPEAR_S):
-    """Press a launch key and return the job id scan.list gained (None when none)."""
+def set_intensity_intrusive(ctx, step, what="the editor"):
+    """The held editor's `intensity` set to `intrusive` (`set_ring_field`): the ring
+    passive, light, medium, intrusive read off the same Fields line as `speed`, so the
+    T7-16 sampled job outlives its three 0.5 s samples and its `x` where `thorough` alone
+    did not (H70)."""
+    return set_ring_field(ctx, step, "intensity", "intrusive", INTENSITY_RING, intensity_value,
+                          "`intensity`", "H70", what)
+
+
+def wait_landed(ctx, job, timeout=ROW_APPEAR_S):
+    """Poll until the start reply for `job` has landed (`landed_on_jobs`: the Jobs footer
+    and the job's row); True once it has, False after `timeout` (H72)."""
+    return poll(lambda: landed_on_jobs(ctx.term.text(), job), timeout, 0.1)
+
+
+def launch(ctx, key, timeout=JOB_APPEAR_S, land_s=ROW_APPEAR_S):
+    """Press a launch key and return the job id scan.list gained (None when none), only
+    once its start reply has landed on screen or `land_s` ran out. The `StartResult`
+    switches the Scan tab to Jobs (`fold_start_result`, spec D7) whenever it arrives, so a
+    tab key pressed before it lands is undone (the fifth live run: T7-17's `4` was followed
+    by the Jobs tab); every launch therefore waits for the Jobs footer and the new row
+    before any caller presses another key (H72). Whether the landing came in time is kept
+    in `ctx.landed[job]` for the step's own check."""
     before = job_ids(ctx.bus)
     ctx.term.press(key)
-    return wait_new_job(ctx.bus, before, timeout)
+    job = wait_new_job(ctx.bus, before, timeout)
+    if job:
+        ctx.landed[job] = wait_landed(ctx, job, land_s)
+    return job
 
 
 def back_to_scan_list(ctx, step):
@@ -1398,8 +1530,10 @@ def step_t7_16(ctx):
     """T7-16 (UI-1): launch from the held editor, watch the counters, cancel. It runs
     after T7-17 (H65), so the editor is re-entered (`ensure_editor`, as T7-17 did
     before) and never assumed fresh; the sampled job and the fresh cancel job run
-    `thorough`, since a `standard` job with the client crawl is `done` in about a
-    second (H62)."""
+    `thorough` and `intrusive`, since a `standard` job with the client crawl is `done`
+    in about a second (H62) and a `thorough` one in about 2 s (H70). The launch returns
+    once its start reply landed on the Jobs tab with the row (`launch`, H72), and the
+    samples then come every SAMPLE_GAP_S (0.5 s) with `x` right after the third."""
     c, term = ctx.c, ctx.term
     if not open_scan(ctx):
         c.fatal("T7-16: `:scan` never opened the Scan view", ctx.screen("t7-16"))
@@ -1410,6 +1544,7 @@ def step_t7_16(ctx):
             ctx.origin in (field_line(term.text(), "origins") or ""), ctx.screen("t7-16"))
     set_browser_never(ctx, "T7-16")
     set_speed_thorough(ctx, "T7-16")
+    set_intensity_intrusive(ctx, "T7-16")
 
     job = launch(ctx, "s")
     if not job:
@@ -1430,12 +1565,12 @@ def step_t7_16(ctx):
             return (row_probes(term.text(), job) or (-1, 0))[0] >= (b_sent or 0)
 
         if n == 0:
-            # A launch lands on the Jobs tab (app.rs: `scan.tab = ScanTab::Jobs` on the
-            # start reply); its footer is the tab's own text, so the row is read on the
-            # Jobs tab (H5). That wait is folded into the first sample's poll: the sample
-            # is taken as soon as the row is on screen, nothing between (H62).
-            caught_up = poll(lambda: re.search(TAB_MARKERS["2"], term.text()) is not None and fresh_enough(),
-                             ROW_APPEAR_S, 0.1)
+            # A launch lands on the Jobs tab (app.rs `fold_start_result`: `scan.tab =
+            # ScanTab::Jobs` on the start reply); its footer is the tab's own text, so the
+            # row is read on the Jobs tab (H5). `launch` already waited for that landing
+            # (H72); the first sample is taken as soon as the row's paint has caught up
+            # with the bracket's first read, nothing between (H62, H70).
+            caught_up = poll(lambda: landed_on_jobs(term.text(), job) and fresh_enough(), ROW_APPEAR_S, 0.1)
         else:
             caught_up = poll(fresh_enough, CATCHUP_S, 0.2)
         text = ctx.snap(f"t7-16-{n}")
@@ -1500,16 +1635,17 @@ def step_t7_16(ctx):
             return
         set_browser_never(ctx, "T7-16", "the fresh job's editor")
         set_speed_thorough(ctx, "T7-16", "the fresh job's editor")
+        set_intensity_intrusive(ctx, "T7-16", "the fresh job's editor")
         fresh = launch(ctx, "s")
         if not fresh:
             c.check("T7-16: `s` started the fresh job for the cancel (scan.list gained an id)", False,
                     ctx.screen("t7-16"))
             return
         ctx.jobs["cancel"] = cancel_job = fresh
-        on_row = (term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S)
-                  and poll(lambda: row_tail(term.text(), fresh) is not None, ROW_APPEAR_S, 0.1))
+        # `launch` returned once the start reply landed on the Jobs tab with the row (H72).
+        on_row = ctx.landed.get(fresh, False)
         c.check(f"T7-16: the Jobs tab drew the fresh job {fresh} under the cursor",
-                on_row and on_cursor(term.text(), fresh), ctx.screen("t7-16"))
+                on_row and on_cursor(term.text(), fresh), f"landed {on_row}; {ctx.screen('t7-16')}")
         term.press("x")
     cancelled = poll(lambda: "cancelled" in (row_state(term.text(), cancel_job) or ""), CANCEL_S, 0.3)
     text = ctx.snap("t7-16-cancel")
@@ -1580,6 +1716,10 @@ def step_t7_17(ctx):
         c.check("T7-17: the second `s` started a job", False, ctx.screen("t7-17"))
         return
     ctx.jobs["issues"] = job
+    # The start reply switches the tab to Jobs when it lands (D7); `4` pressed before it
+    # was undone in the fifth live run, so `launch` waited for the landing (H72).
+    c.check(f"T7-17: the start reply for {job} landed on the Jobs tab with its row before any "
+            "tab key (H72)", ctx.landed.get(job, False), ctx.screen("t7-17"))
 
     found = {}
 
@@ -1931,9 +2071,9 @@ def step_t7_18(ctx):
     term.press("y")
     new_job = wait_new_job(ctx.bus, before, OVERLAY_S)
     # The start toast carries the id too, so the row is read on the Jobs tab only: its
-    # footer first (the tab the launch lands on), then the row (H14, H5 parity).
-    row_shown = (bool(new_job) and term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S)
-                 and poll(lambda: row_tail(term.text(), new_job) is not None, ROW_APPEAR_S))
+    # footer and the row together (`wait_landed`, H14, H5 parity, H72); `y` is a launch
+    # too, so no key follows before that landing.
+    row_shown = bool(new_job) and wait_landed(ctx, new_job)
     if not new_job:
         poll(lambda: set(wordings_on(term.text())) - pre_codes, OVERLAY_S, 0.3)
     tui_codes = sorted(set(wordings_on(term.text())) - pre_codes)
@@ -2383,20 +2523,32 @@ def scan_box(f, tab, offset=0, banner="idle"):
 ORIGIN = "http://127.0.0.1:8080"
 
 
-def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none", speed="normal"):
-    """Profiles (ui/scan/profiles.rs): the column header, three rows with `standard`
-    under the cursor, and on the detail side either the no-editor hint over the D7
-    gate text and the key footer, or the held editor's header and Fields block (its
-    `origins` and `l4` rows as `text_of` writes them, `none` when empty, H49; its
-    `crawl` row carrying `browser` as `field_lines` writes it, H42; its `intensity`
-    row carrying `speed` the same way, H62)."""
+def profiles_header_text():
+    """The Profiles list header as `ui/scan/profiles.rs` formats it from PROFILES_HEADER:
+    ` {name}   {GAP}{lanes}{GAP}{intensity}{GAP}speed`, the first three `fit` to their
+    columns (the name column 14 and the lanes column 9 wide here, `INTENSITY_W` 9) (H71)."""
+    name, lanes, intensity, speed = PROFILES_HEADER
+    return f" {name:<14}   {GAP_TEXT}{lanes:<9}{GAP_TEXT}{intensity:<9}{GAP_TEXT}{speed}"
+
+
+def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none", speed="normal",
+                   intensity="medium", banner="idle"):
+    """Profiles (ui/scan/profiles.rs): the column header (`profiles_header_text`), three
+    rows with `standard` under the cursor (their intensity and speed cells the builtins'
+    wire tokens, as the fifth live run's screen read them), and on the detail side
+    either the no-editor hint over the D7 gate text and the key footer
+    (`key_text(&[PROFILES_KEYS])`, H71), or the held editor's header and Fields block
+    (its `origins` and `l4` rows as `text_of` writes them, `none` when empty, H49; its
+    `crawl` row carrying `browser` as `field_lines` writes it, H42; its `intensity` row
+    carrying `intensity`, `speed` and `accuracy` the same way, H62, H70). `banner` is the
+    strip's state text (a start toast's text in the H72 rows)."""
     f = Frame()
     chrome(f)
-    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 1, offset)
-    f.put(lx, y, f" {'name':<14}   {GAP_TEXT}{'lanes':<9}{GAP_TEXT}{'intensity':<9}{GAP_TEXT}speed")
-    rows = [("standard", "http ws", "balanced", "normal"),
+    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 1, offset, banner=banner)
+    f.put(lx, y, profiles_header_text())
+    rows = [("standard", "http ws", "medium", "normal"),
             ("map-only", "http", "passive", "normal"),
-            ("l4-stream-safe", "l4_stream", "cautious", "slow")]
+            ("l4-stream-safe", "l4_stream", "medium", "normal")]
     for k, (name, lanes, inten, row_speed) in enumerate(rows):
         mark = ">" if k == 0 else " "
         editing = "*" if editor and k == 0 else " "
@@ -2407,13 +2559,13 @@ def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none", 
         f.put(dx, y + 1, f" {'origins':<9} {origins}")
         f.put(dx, y + 2, f" {'l4':<9} {l4}")
         f.put(dx, y + 3, f" {'lanes':<9} [x] http  [x] ws  [ ] l4_packet  [ ] l4_stream")
-        f.put(dx, y + 4, f" {'intensity':<9} balanced   speed {speed}   accuracy balanced")
+        f.put(dx, y + 4, f" {'intensity':<9} {intensity}   speed {speed}   accuracy normal")
         f.put(dx, y + 5, f" {'checks':<9} all (12)")
         f.put(dx, y + 6, f" {'crawl':<9} normal · browser {browser} · depth 3 · pages 200 · forms on")
     else:
         f.put(dx, y, " ⏎ opens the profile under the cursor · N new profile")
         f.put(dx, y + bh - 2, " L4 launch disabled: open the profile (⏎) to check its L4 target and scope")
-    f.put(dx, y + bh - 1, " s start · m map · w save as · e edit · Space toggle · Esc back")
+    f.put(dx, y + bh - 1, " " + key_text([PROFILES_KEYS]))
     return f.text()
 
 
@@ -2438,7 +2590,7 @@ def jobs_frame():
     f.put(lx, y + 3, f" {JOB}")
     f.put(lx, y + 4, " state running · phase crawl")
     f.put(lx, y + 5, f" targets {target}")
-    f.put(lx, y + bh - 1, " x cancel · ⏎ issues of this job · s start · m map · Esc back")
+    f.put(lx, y + bh - 1, " " + key_text([JOBS_KEYS]))
     return f.text()
 
 
@@ -2465,13 +2617,13 @@ def issues_frame(name_w=18):
     f.put(lx, y + 4, " MEDIUM 0")
     f.put(lx, y + 5, " LOW 0")
     f.put(lx, y + 6, " INFO 0")
-    f.put(lx, y + bh - 1, " S severity · C confidence · L lane · T status · J job · R reset")
+    f.put(lx, y + bh - 1, " " + key_text([ISSUES_FILTER_KEYS]))
     f.put(dx, y, f" {ISSUE_NAME}   high · certain · open")
     f.put(dx, y + 1, f" {'class':<9} reflected-xss")
     f.put(dx, y + 2, f" {'payload':<9} <svg/onload=alert(1)>")
     f.put(dx, y + 3, f" {'flows':<9}")
     f.put(dx, y + 4, "> 0192a3b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b  probe")
-    f.put(dx, y + bh - 1, " c confirm · f false positive · u reopen · ⏎ open flow · P PoC · Esc back")
+    f.put(dx, y + bh - 1, " " + key_text([ISSUES_KEYS]))
     return f.text()
 
 
@@ -2501,7 +2653,7 @@ def sitemap_frame(cursor=0, count=None, nodes=SITEMAP_NODES, banner="idle"):
     f.put(dx, y, f" {'kind':<12} {'name':<14} {'path':<24} {'traits':<8} example")
     f.put(dx, y + 1, f"> {'query':<12} {'q':<14} {'/search':<24} {'-':<8} ts12ab34cd")
     f.put(dx, y + 2, f"  {'header':<12} {'user-agent':<14} {'/search':<24} {'-':<8} curl/8.4")
-    f.put(dx, y + bh - 1, " ⏎ open flow · n next page · J job filter · Esc back")
+    f.put(dx, y + bh - 1, " " + key_text([SITEMAP_KEYS]))
     return f.text()
 
 
@@ -2619,21 +2771,23 @@ class ScriptedTerm:
     cleared); Esc closes it and drops the value (H43). The Fields cursor is tracked the
     way `app.rs` moves it: `g` to the first field, each `j` one field down
     (EDITOR_FIELDS); `e` acts on the field under it when `on_field`: the crawl
-    `browser` ring on `use_browser`, the `speed` ring on `speed` (H62), the `value:`
-    prompt prefilled with the name on any other. With `on_field` False the cursor
-    never left `name`, so `e` opens that prompt (the live H44 failure)."""
+    `browser` ring on `use_browser`, the `speed` ring on `speed` (H62), the `intensity`
+    ring on `intensity` (H70), the `value:` prompt prefilled with the name on any
+    other. With `on_field` False the cursor never left `name`, so `e` opens that
+    prompt (the live H44 failure)."""
 
     def __init__(self, on_field=True, refuse=False, lag=2):
         self.keys = []
         self.on_field, self.refuse, self.lag = on_field, refuse, lag
         self.origins, self.l4, self.browser, self.speed = "none", "none", "auto", "normal"
+        self.intensity = "medium"  # the builtin `standard`'s, as the live screen reads it
         self.field = 0  # the Fields cursor: an EDITOR_FIELDS index
         self.prompt = None  # (label, typed)
         self._pending = None  # (label, typed, reads left) after Enter
 
     def _frame(self):
         return profiles_frame(editor=True, browser=self.browser, origins=self.origins, l4=self.l4,
-                              speed=self.speed)
+                              speed=self.speed, intensity=self.intensity)
 
     def text(self):
         if self._pending is not None:
@@ -2681,21 +2835,43 @@ class ScriptedTerm:
                 self.browser = BROWSER_RING[(BROWSER_RING.index(self.browser) + 1) % len(BROWSER_RING)]
             elif under == "speed":
                 self.speed = SPEED_RING[(SPEED_RING.index(self.speed) + 1) % len(SPEED_RING)]
+            elif under == "intensity":
+                self.intensity = INTENSITY_RING[(INTENSITY_RING.index(self.intensity) + 1) % len(INTENSITY_RING)]
             else:
                 self.prompt = ("value:", "standard")
 
 
 class ScriptedScreens:
-    """A `Terminal` stand-in for `wait_sitemap_head` (H63): `text()` serves the scripted
-    frames in order, one per read, and repeats the last."""
+    """A `Terminal` stand-in for `wait_sitemap_head` (H63) and `wait_landed`/`launch`
+    (H72): `text()` serves the scripted frames in order, one per read, and repeats the
+    last; `press` records the keys and moves nothing (the frames are the script)."""
 
     def __init__(self, frames):
         self.frames = list(frames)
         self.reads = 0
+        self.keys = []
 
     def text(self):
         self.reads += 1
         return self.frames[min(self.reads, len(self.frames)) - 1]
+
+    def press(self, keys):
+        self.keys.append(keys)
+
+
+class ScriptedListBus:
+    """A bus stand-in for `launch` (H72): `scan.list` answers no job on its first read
+    (the `before` set) and `job` on every later one, so the launch sees the new id at
+    once and the landing wait alone decides when `launch` returns."""
+
+    def __init__(self, job):
+        self.job = job
+        self.calls = 0
+
+    def call(self, name, _args=None):
+        assert name == "scan.list", name
+        self.calls += 1
+        return {"jobs": [] if self.calls == 1 else [{"job": self.job}]}
 
 
 class ScriptedSocket:
@@ -3151,8 +3327,128 @@ def selftest():
                 and set_speed_thorough(both_ctx, "T7-16", "the fresh job's editor") is True
                 and both.keys.count("e") == 3 and both_checks.tally() == (4, 0, 0),
                 f"{both_ok} browser {both.browser!r} speed {both.speed!r} keys {both.keys!r}")
+
+        # Cell item from the fifth live smoke run: H70. `thorough` alone still finished the
+        # `standard` job in about 2 s (278 probes, one `done` sample), so the sampled job
+        # and the fresh cancel job also cycle `intensity` to `intrusive`, read off the same
+        # Fields line as `speed`, and the samples come every 0.5 s.
+        intrusive = profiles_frame(editor=True, intensity="intrusive")
+        c.check("selftest: intensity_value reads the held editor's `intensity` from its Fields row "
+                "(`medium` on the builtin, `intrusive`) and nothing from the list header's bare "
+                "`intensity` or the list rows' `medium` cells (H70)",
+                intensity_value(held) == "medium" and intensity_value(intrusive) == "intrusive"
+                and intensity_value(plain) is None and "medium" in plain
+                and INTENSITY_RING == ("passive", "light", "medium", "intrusive"),
+                f"{intensity_value(held)!r} {intensity_value(intrusive)!r} {intensity_value(plain)!r}")
+        harder, harder_checks, harder_ctx = scripted(on_field=True)
+        harder_ok = set_intensity_intrusive(harder_ctx, "T7-16")
+        c.check("selftest: set_intensity_intrusive: Esc, Tab, `g`, then EDITOR_FIELDS.index('intensity') "
+                "`j`s land on `intensity`; one `e` turns `medium` into `intrusive`, the H70 check passes "
+                "and the `speed` and crawl `browser` values are untouched (H70)",
+                harder_ok is True and harder.intensity == "intrusive" and harder.speed == "normal"
+                and harder.browser == "auto" and harder.keys.count("e") == 1
+                and harder_checks.tally() == (1, 0, 0)
+                and harder.keys[:3] == [ESC, "\t", "g"]
+                and harder.keys[3] == "j" * EDITOR_FIELDS.index("intensity")
+                and intensity_value(harder.text()) == "intrusive" and speed_value(harder.text()) == "normal",
+                f"{harder_ok} intensity {harder.intensity!r} speed {harder.speed!r} keys {harder.keys!r}")
+        three, three_checks, three_ctx = scripted(on_field=True)
+        three_ok = (set_browser_never(three_ctx, "T7-16") and set_speed_thorough(three_ctx, "T7-16")
+                    and set_intensity_intrusive(three_ctx, "T7-16"))
+        c.check("selftest: the T7-16 launch sequence, `browser never`, `speed thorough`, `intensity "
+                "intrusive` on one held editor, leaves all three on the Fields lines with four `e` "
+                "presses and three passed checks; a second pass presses no `e`; the samples come "
+                f"every 0.5 s and `x` right after the third (H70)",
+                three_ok is True and three.browser == "never" and three.speed == "thorough"
+                and three.intensity == "intrusive" and three.keys.count("e") == 4
+                and three_checks.tally() == (3, 0, 0)
+                and set_intensity_intrusive(three_ctx, "T7-16", "the fresh job's editor") is True
+                and three.keys.count("e") == 4 and three_checks.tally() == (4, 0, 0)
+                and SAMPLE_GAP_S == 0.5 and SAMPLES_MIN == 3,
+                f"{three_ok} browser {three.browser!r} speed {three.speed!r} intensity "
+                f"{three.intensity!r} keys {three.keys!r}; gap {SAMPLE_GAP_S}")
+
+        # Cell item from the fifth live smoke run: H72. The start reply switches the Scan tab
+        # to Jobs (`fold_start_result`), so a `4` pressed before it lands is undone: `launch`
+        # returns only once the Jobs footer and the new row are on screen (or the wait ran
+        # out, recorded in `ctx.landed`).
+        landing = ScriptedScreens([held, held, jobs_frame()])
+        landed_ok = wait_landed(Ctx(Checks(out=io.StringIO()), landing, None, None, s_ev, 0, "", ORIGIN,
+                                    8080, set()), JOB, 3.0)
+        toasted = profiles_frame(editor=True, banner=f"started {JOB}")
+        toast_only = ScriptedScreens([toasted])
+        toast_ok = wait_landed(Ctx(Checks(out=io.StringIO()), toast_only, None, None, s_ev, 0, "", ORIGIN,
+                                   8080, set()), JOB, 0.4)
+        c.check("selftest: wait_landed ends on the Jobs footer AND the job's row (the third read), "
+                "not on the job id alone: the Profiles tab with the start toast's id on the strip "
+                "runs the whole wait and answers False (H72)",
+                landed_ok is True and landing.reads == 3 and toast_ok is False and JOB in toasted
+                and toast_only.reads >= 3 and landed_on_jobs(jobs_frame(), JOB)
+                and not landed_on_jobs(toasted, JOB) and not landed_on_jobs(jobs_frame(), "scan-ffffffff"),
+                f"landed {landed_ok} after {landing.reads} reads; toast {toast_ok} after {toast_only.reads}")
+        lands = ScriptedScreens([held, held, held, jobs_frame()])
+        lands_bus = ScriptedListBus(JOB)
+        lands_ctx = Ctx(Checks(out=io.StringIO()), lands, lands_bus, None, s_ev, 0, "", ORIGIN, 8080, set())
+        got = launch(lands_ctx, "s", timeout=3.0, land_s=3.0)
+        never = ScriptedScreens([held])
+        never_ctx = Ctx(Checks(out=io.StringIO()), never, ScriptedListBus(JOB), None, s_ev, 0, "", ORIGIN,
+                        8080, set())
+        got_never = launch(never_ctx, "m", timeout=3.0, land_s=0.4)
+        c.check("selftest: launch presses the key, reads the new id off scan.list and returns it only "
+                "once the start reply landed on the Jobs tab (`ctx.landed[job]` True after the Jobs "
+                "frame); on a screen that never lands it returns the id after the bounded wait with "
+                "`landed` False, so the step's check names it (H72)",
+                got == JOB and lands_ctx.landed == {JOB: True} and lands.reads == 4 and lands.keys == ["s"]
+                and got_never == JOB and never_ctx.landed == {JOB: False} and never.keys == ["m"],
+                f"got {got!r} landed {lands_ctx.landed} reads {lands.reads}; never {got_never!r} "
+                f"{never_ctx.landed} reads {never.reads}")
     finally:
         shutil.rmtree(script_dir, ignore_errors=True)
+
+    # Cell item from the fifth live smoke run: H71. The tab markers are checked against the
+    # footer literals the Rust key tables spell (`ui/scan/mod.rs` `key_text(&[JOBS_KEYS])`,
+    # `key_text(&[ISSUES_FILTER_KEYS])`; the Profiles list header in `ui/scan/profiles.rs`):
+    # the frames paint their footers from the same tuples, one row per marker, and the
+    # tuples are read back from the Rust sources so a renamed key fails here, with no core.
+    profiles_header = profiles_header_text()
+    jobs_footer, issues_filter, issues_detail = (key_text([JOBS_KEYS]), key_text([ISSUES_FILTER_KEYS]),
+                                                 key_text([ISSUES_KEYS]))
+    others = {"1": [jobs_footer, issues_filter, issues_detail, key_text([SITEMAP_KEYS]), key_text([PROFILES_KEYS])],
+              "2": [profiles_header, issues_filter, issues_detail, key_text([SITEMAP_KEYS]), key_text([PROFILES_KEYS])],
+              "4": [profiles_header, jobs_footer, issues_detail, key_text([SITEMAP_KEYS]), key_text([PROFILES_KEYS])]}
+    c.check("selftest: marker `1` matches the Profiles list header painted from its column names "
+            "(`name  lanes  intensity  speed`) and no tab's key footer (H71)",
+            re.search(TAB_MARKERS["1"], profiles_header) is not None
+            and all(re.search(TAB_MARKERS["1"], t) is None for t in others["1"])
+            and re.search(TAB_MARKERS["1"], profiles_frame(editor=False)) is not None,
+            repr(profiles_header))
+    c.check("selftest: marker `2` matches the Jobs footer `key_text(&[JOBS_KEYS])` painted from the "
+            "table (`x cancel · ⏎ issues of this job · s start · m map`) and no other footer (H71)",
+            re.search(TAB_MARKERS["2"], jobs_footer) is not None
+            and jobs_footer == "x cancel · ⏎ issues of this job · s start · m map"
+            and all(re.search(TAB_MARKERS["2"], t) is None for t in others["2"])
+            and line_with(jobs_frame(), "x cancel").strip("│ ") == jobs_footer,
+            repr(jobs_footer))
+    c.check("selftest: marker `4` matches the Issues filter line `key_text(&[ISSUES_FILTER_KEYS])` "
+            "painted from the table (`S severity · C confidence · L lane · T status · J job · R reset`) "
+            "and neither the Issues detail footer nor any other tab's (H71)",
+            re.search(TAB_MARKERS["4"], issues_filter) is not None
+            and issues_filter == "S severity · C confidence · L lane · T status · J job · R reset"
+            and all(re.search(TAB_MARKERS["4"], t) is None for t in others["4"])
+            and line_with(issues_frame(), "S severity").split("│")[1].strip() == issues_filter
+            and issues_detail == "c confirm · f false positive · u reopen · ⏎ open flow · P PoC",
+            repr(issues_filter))
+    rust = {name: rust_hints(RUST_KEY_TABLES, name) for name in
+            ("PROFILES_KEYS", "JOBS_KEYS", "SITEMAP_KEYS", "ISSUES_KEYS", "ISSUES_FILTER_KEYS")}
+    c.check("selftest: the key tuples the frames paint from are the Rust key tables' "
+            "(`crates/aitm-tui/src/ui/scan/mod.rs`, read back; a const hint such as `RESET` or "
+            "`OPEN_FLOW` resolved), and the Profiles header's four column names stand in that "
+            "order in `ui/scan/profiles.rs` (H71)",
+            rust["PROFILES_KEYS"] == PROFILES_KEYS and rust["JOBS_KEYS"] == JOBS_KEYS
+            and rust["SITEMAP_KEYS"] == SITEMAP_KEYS and rust["ISSUES_KEYS"] == ISSUES_KEYS
+            and rust["ISSUES_FILTER_KEYS"] == ISSUES_FILTER_KEYS
+            and rust_profiles_header(RUST_PROFILES_VIEW) == PROFILES_HEADER,
+            f"rust {rust}; header {rust_profiles_header(RUST_PROFILES_VIEW)}")
 
     def job_line(job, event, **extra):
         params = {"job": job, "kind": "scan", "event": event, "seq": 1, "status": {"state": "running"}}
