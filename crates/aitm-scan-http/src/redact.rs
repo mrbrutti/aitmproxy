@@ -397,6 +397,10 @@ mod tests {
         let lines: Vec<&str> = source.lines().collect();
         let mut found = Vec::new();
         for (index, line) in lines.iter().enumerate() {
+            // A `use tracing::{..};` line names the crate, not a log site.
+            if line.trim_start().starts_with("use ") {
+                continue;
+            }
             if !LOG_OPENERS.iter().any(|opener| line.contains(opener)) {
                 continue;
             }
@@ -462,6 +466,29 @@ mod tests {
         let invocations = log_invocations(scrubbed);
         assert_eq!(invocations.len(), 1);
         assert!(mentions_safe_url(&invocations[0].1));
+
+        // An import block is not a log site: a `use tracing::{..};` line followed
+        // by `use url::Url;` must not be read as an invocation naming a URL (R1),
+        // while the real warn! that follows it is still caught.
+        let imports_then_raw = concat!(
+            "use tracing::{debug, warn};\n",
+            "use url::Url;\n",
+            "\n",
+            "fn f(url: &Url) {\n",
+            "    warn!(url = %url, \"probe failed\");\n",
+            "}\n",
+        );
+        let invocations = log_invocations(imports_then_raw);
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|(line, _)| *line)
+                .collect::<Vec<_>>(),
+            vec![5],
+            "{invocations:?}"
+        );
+        assert!(mentions_url(&invocations[0].1));
+        assert!(!mentions_safe_url(&invocations[0].1));
     }
 
     // --- tester additions (stage 5, whole branch) ----------------------------
