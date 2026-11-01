@@ -10,7 +10,7 @@ host-scoped capture model, the NE claim rule), the shipped TLS-passthrough desig
 honest-state spec `docs/superpowers/specs/2026-10-31-ne-no-scope-honest-state-design.md`
 ("nothing in scope" wording), `docs/superpowers/specs/2026-10-31-flow-finish-and-timing-design.md`
 (the one `duration_ms` rule).
-**Milestone:** v0.5.8.
+**Milestone:** v0.5.9 (main released v0.5.8 while this branch was in flight).
 **Branch / worktree:** `claude/youthful-kapitsa-c196d6` off `main` 144cdcc8,
 `/Users/matt/Security/aitmproxy/.claude/worktrees/youthful-kapitsa-c196d6`.
 
