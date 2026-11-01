@@ -14,7 +14,7 @@ use aitm_scan_model::{
 
 use super::{lane_token, step, Dir, ScanError};
 use crate::model::FlowRow;
-use crate::text::truncate;
+use crate::text::{truncate, width};
 
 /// The most `scan.profile.list` rows kept at fold (spec D6, hostile-core
 /// bounds; the builder's number: a profile directory of a few dozen files
@@ -82,11 +82,26 @@ pub enum ProfilePane {
     Checks,
 }
 
+/// The widest name and lanes text of the folded profile list, in cells,
+/// measured once at fold (fix round G, G51) so a frame clamps two numbers
+/// instead of measuring every row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListWidths {
+    pub name: usize,
+    pub lanes: usize,
+}
+
 /// The Profiles tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProfilesState {
-    /// `scan.profile.list`'s entries.
+    /// `scan.profile.list`'s entries, each row's lanes sorted and deduped
+    /// at fold (the four kinds at most; fix round G, G51).
     pub list: Vec<ProfileListEntry>,
+    /// The rows' lanes column, index for index with `list`
+    /// ([`lanes_text`] of each row's lanes, built once at fold).
+    pub lanes_text: Vec<String>,
+    /// The widest name and lanes text of `list`, measured at fold.
+    pub widest: ListWidths,
     /// The list cursor.
     pub cursor: usize,
     pub pane: ProfilePane,
@@ -617,11 +632,19 @@ impl ProfileEditor {
     }
 
     /// The current value of the field under the cursor as text: what the
-    /// `ScanField` prompt is prefilled with and what a plain view prints.
+    /// `ScanField` prompt is prefilled with ([`ProfileEditor::text_of`] of
+    /// [`ProfileEditor::field`]).
     pub fn field_text(&self) -> String {
+        self.text_of(self.field())
+    }
+
+    /// The current value of `field` as text: the one text rule the prompt
+    /// prefill and the Fields block share (fix round G, G52), read without
+    /// moving the cursor or copying the editor.
+    pub fn text_of(&self, field: EditorField) -> String {
         let d = &self.draft;
         let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
-        match self.field() {
+        match field {
             EditorField::Name => d.name.clone(),
             EditorField::Origins => {
                 if d.target.origins.is_empty() {
@@ -1015,6 +1038,16 @@ pub fn session_line(editor: &ProfileEditor, previews: &BTreeMap<String, SessionP
     format!("session: observed · {names} (names) · {canary}")
 }
 
+/// `http ws`: lanes in their wire tokens joined by a space, empty for no
+/// lane (the list column; the Jobs detail spells `none`).
+pub fn lanes_text(lanes: &[LaneKind]) -> String {
+    lanes
+        .iter()
+        .map(|l| lane_token(*l))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Whether a wire string may be used as a selector or a name the TUI sends
 /// back verbatim: non-empty and at most [`SELECTOR_MAX`] bytes.
 fn usable_selector(s: &str) -> bool {
@@ -1046,9 +1079,27 @@ impl ProfilesState {
     /// (D6): a row whose name is empty or longer than [`SELECTOR_MAX`] is
     /// dropped (the name is the key `scan.profile.get` takes back), the
     /// list is cut to [`PROFILES_MAX`], and the cursor is clamped.
+    ///
+    /// Each row's lanes are sorted and deduped here and its lanes text and
+    /// the two column widths are measured here, once (fix round G, G51),
+    /// so a frame only copies.
     pub fn fold_list(&mut self, mut list: ProfileListResult) {
         list.profiles.retain(|p| usable_selector(&p.name));
         list.profiles.truncate(PROFILES_MAX);
+        let mut widest = ListWidths::default();
+        self.lanes_text = list
+            .profiles
+            .iter_mut()
+            .map(|p| {
+                p.summary.lanes.sort();
+                p.summary.lanes.dedup();
+                let lanes = lanes_text(&p.summary.lanes);
+                widest.name = widest.name.max(width(&p.name));
+                widest.lanes = widest.lanes.max(width(&lanes));
+                lanes
+            })
+            .collect();
+        self.widest = widest;
         self.list = list.profiles;
         self.cursor = self.cursor.min(self.list.len().saturating_sub(1));
     }

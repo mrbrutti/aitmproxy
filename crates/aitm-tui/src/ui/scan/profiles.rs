@@ -37,9 +37,9 @@ use aitm_scan_model::{LaneKind, ProfileListEntry};
 
 use crate::app::App;
 use crate::scan::{
-    lane_token, session_line, token, tri_state, EditorField, OriginSource, ProfileEditor,
-    ProfilePane, ProfilesState, ScanError, ScanOffer, TreeNode, BUILTIN_MARK, COLLAPSED_MARK,
-    EDITOR_FIELDS, OPEN_MARK,
+    lane_token, session_line, token, tri_state, EditorField, ListWidths, OriginSource,
+    ProfileEditor, ProfilePane, ProfilesState, ScanError, ScanOffer, TreeNode, BUILTIN_MARK,
+    COLLAPSED_MARK, OPEN_MARK,
 };
 use crate::theme::Theme;
 use crate::tokens::color::status;
@@ -123,23 +123,14 @@ struct Columns {
 
 impl Columns {
     /// Measure the rows: the name and lanes columns their widest content
+    /// (measured once at fold, `ProfilesState::widest`; fix round G, G51)
     /// up to their caps; when the whole row does not fit `avail`, the
     /// lanes column gives way first (down to [`LANES_MIN`]), then the name
     /// (down to [`NAME_MIN`]); past that the row is cut at the right.
-    fn measure(list: &[ProfileListEntry], avail: usize) -> Self {
+    fn measure(widest: ListWidths, avail: usize) -> Self {
         let mut c = Columns {
-            name: list
-                .iter()
-                .map(|p| width(&p.name))
-                .max()
-                .unwrap_or(0)
-                .clamp(NAME_MIN, NAME_MAX),
-            lanes: list
-                .iter()
-                .map(|p| width(&lanes_text(&p.summary.lanes)))
-                .max()
-                .unwrap_or(0)
-                .clamp(LANES_MIN, LANES_MAX),
+            name: widest.name.clamp(NAME_MIN, NAME_MAX),
+            lanes: widest.lanes.clamp(LANES_MIN, LANES_MAX),
         };
         let over = |c: &Columns| (FIXED_W + c.name + c.lanes).saturating_sub(avail);
         let cut = over(&c).min(c.lanes - LANES_MIN);
@@ -148,15 +139,6 @@ impl Columns {
         c.name -= cut;
         c
     }
-}
-
-/// `http ws`, the lanes in their wire tokens.
-fn lanes_text(lanes: &[LaneKind]) -> String {
-    lanes
-        .iter()
-        .map(|l| lane_token(*l))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// The List pane: the column header, then the rows scrolled so the cursor
@@ -171,7 +153,7 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         return;
     }
     let w = usize::from(area.width);
-    let cols = Columns::measure(&profiles.list, w);
+    let cols = Columns::measure(profiles.widest, w);
     put(
         buf,
         Rect::new(area.x, area.y, area.width, 1),
@@ -200,7 +182,8 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         .as_ref()
         .and_then(|e| e.loaded_from.as_deref());
     let top = cursor.saturating_sub(body_h - 1);
-    for (k, p) in profiles.list.iter().enumerate().skip(top).take(body_h) {
+    let rows = profiles.list.iter().zip(&profiles.lanes_text);
+    for (k, (p, lanes)) in rows.enumerate().skip(top).take(body_h) {
         let row = Rect::new(area.x, area.y + 1 + cells(k - top), area.width, 1);
         if k == cursor && focused {
             buf.set_style(row, selection_bg(theme));
@@ -212,6 +195,7 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                 theme,
                 &cols,
                 p,
+                lanes,
                 k == cursor,
                 held == Some(p.name.as_str()),
                 w,
@@ -221,11 +205,13 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 }
 
 /// One list row: the cursor mark, the name, the held and builtin marks,
-/// the lanes, the intensity and the speed.
+/// the lanes (`lanes`, built at fold), the intensity and the speed.
+#[allow(clippy::too_many_arguments)]
 fn row_line(
     theme: &Theme,
     cols: &Columns,
     p: &ProfileListEntry,
+    lanes: &str,
     under_cursor: bool,
     held: bool,
     w: usize,
@@ -241,7 +227,7 @@ fn row_line(
             Span::styled(
                 format!(
                     "{GAP}{}{GAP}{}{GAP}{}",
-                    fit(&lanes_text(&p.summary.lanes), cols.lanes),
+                    fit(lanes, cols.lanes),
                     fit(&token(&p.summary.intensity), INTENSITY_W),
                     fit(&token(&p.summary.speed), SPEED_W),
                 ),
@@ -448,16 +434,9 @@ fn header(editor: &ProfileEditor, theme: &Theme, name_style: Style, area: Rect, 
 /// speed, accuracy; the check summary; the crawl dials; the session line
 /// (verbatim, names only) and `on_lost`; the budget; the http dials.
 fn field_lines(profiles: &ProfilesState, editor: &ProfileEditor) -> Vec<(&'static str, Vec<Seg>)> {
-    // One clone per frame: `field_text` reads the field under the cursor,
-    // so the probe walks the fields for the one text rule the prompt uses.
-    let mut probe = editor.clone();
-    let text = |probe: &mut ProfileEditor, field: EditorField| -> String {
-        probe.field = EDITOR_FIELDS
-            .iter()
-            .position(|f| *f == field)
-            .unwrap_or_default();
-        probe.field_text()
-    };
+    // `text_of` is the one text rule the prompt prefill uses too (fix
+    // round G, G52): read in place, nothing copied per frame.
+    let text = |field: EditorField| editor.text_of(field);
     let d = &editor.draft;
     let lane = |field: EditorField, kind: LaneKind| -> Seg {
         let on = if d.lanes.contains(&kind) {
@@ -470,17 +449,11 @@ fn field_lines(profiles: &ProfilesState, editor: &ProfileEditor) -> Vec<(&'stati
     vec![
         (
             "origins",
-            vec![seg(
-                EditorField::Origins,
-                text(&mut probe, EditorField::Origins),
-            )],
+            vec![seg(EditorField::Origins, text(EditorField::Origins))],
         ),
         (
             "l4",
-            vec![seg(
-                EditorField::L4Targets,
-                text(&mut probe, EditorField::L4Targets),
-            )],
+            vec![seg(EditorField::L4Targets, text(EditorField::L4Targets))],
         ),
         (
             "lanes",
@@ -497,53 +470,32 @@ fn field_lines(profiles: &ProfilesState, editor: &ProfileEditor) -> Vec<(&'stati
         (
             "intensity",
             vec![
-                seg(
-                    EditorField::Intensity,
-                    text(&mut probe, EditorField::Intensity),
-                ),
+                seg(EditorField::Intensity, text(EditorField::Intensity)),
                 sep("   speed "),
-                seg(EditorField::Speed, text(&mut probe, EditorField::Speed)),
+                seg(EditorField::Speed, text(EditorField::Speed)),
                 sep("   accuracy "),
-                seg(
-                    EditorField::Accuracy,
-                    text(&mut probe, EditorField::Accuracy),
-                ),
+                seg(EditorField::Accuracy, text(EditorField::Accuracy)),
             ],
         ),
         (
             "checks",
             vec![seg(
                 EditorField::Checks,
-                check_summary(profiles, editor, &text(&mut probe, EditorField::Checks)),
+                check_summary(profiles, editor, &text(EditorField::Checks)),
             )],
         ),
         (
             "crawl",
             vec![
-                seg(
-                    EditorField::CrawlStrategy,
-                    text(&mut probe, EditorField::CrawlStrategy),
-                ),
+                seg(EditorField::CrawlStrategy, text(EditorField::CrawlStrategy)),
                 sep(" · browser "),
-                seg(
-                    EditorField::UseBrowser,
-                    text(&mut probe, EditorField::UseBrowser),
-                ),
+                seg(EditorField::UseBrowser, text(EditorField::UseBrowser)),
                 sep(" · depth "),
-                seg(
-                    EditorField::MaxDepth,
-                    text(&mut probe, EditorField::MaxDepth),
-                ),
+                seg(EditorField::MaxDepth, text(EditorField::MaxDepth)),
                 sep(" · pages "),
-                seg(
-                    EditorField::MaxPages,
-                    text(&mut probe, EditorField::MaxPages),
-                ),
+                seg(EditorField::MaxPages, text(EditorField::MaxPages)),
                 sep(" · forms "),
-                seg(
-                    EditorField::SubmitForms,
-                    text(&mut probe, EditorField::SubmitForms),
-                ),
+                seg(EditorField::SubmitForms, text(EditorField::SubmitForms)),
             ],
         ),
         (
@@ -554,26 +506,20 @@ fn field_lines(profiles: &ProfilesState, editor: &ProfileEditor) -> Vec<(&'stati
                     session_line(editor, &profiles.previews),
                 ),
                 sep(" · on_lost "),
-                seg(EditorField::OnLost, text(&mut probe, EditorField::OnLost)),
+                seg(EditorField::OnLost, text(EditorField::OnLost)),
             ],
         ),
         (
             "budget",
             vec![
                 sep("probes "),
-                seg(
-                    EditorField::BudgetProbes,
-                    text(&mut probe, EditorField::BudgetProbes),
-                ),
+                seg(EditorField::BudgetProbes, text(EditorField::BudgetProbes)),
                 sep(" · time "),
-                seg(
-                    EditorField::BudgetTimeS,
-                    text(&mut probe, EditorField::BudgetTimeS),
-                ),
+                seg(EditorField::BudgetTimeS, text(EditorField::BudgetTimeS)),
                 sep(" s · issues "),
                 seg(
                     EditorField::BudgetMaxIssues,
-                    text(&mut probe, EditorField::BudgetMaxIssues),
+                    text(EditorField::BudgetMaxIssues),
                 ),
             ],
         ),
@@ -581,15 +527,9 @@ fn field_lines(profiles: &ProfilesState, editor: &ProfileEditor) -> Vec<(&'stati
             "http",
             vec![
                 sep("version "),
-                seg(
-                    EditorField::HttpVersion,
-                    text(&mut probe, EditorField::HttpVersion),
-                ),
+                seg(EditorField::HttpVersion, text(EditorField::HttpVersion)),
                 sep(" · record "),
-                seg(
-                    EditorField::RecordProbes,
-                    text(&mut probe, EditorField::RecordProbes),
-                ),
+                seg(EditorField::RecordProbes, text(EditorField::RecordProbes)),
             ],
         ),
     ]

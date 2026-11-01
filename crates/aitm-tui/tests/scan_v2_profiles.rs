@@ -1033,6 +1033,55 @@ fn hostile_profile_replies_are_bounded() {
     let _ = text_of(&app, 40, 4);
 }
 
+/// Fix round G, G51: a `scan.profile.list` row's lanes are sorted and
+/// deduped at fold (the four kinds at most) and the row's lanes text is
+/// built there, so a row with a hundred thousand `http` lanes renders
+/// `http` once and a row with `[ws, http, http]` renders `http ws`.
+#[test]
+fn list_lanes_are_deduped_at_fold_and_rendered_once() {
+    let mut app = app();
+    let entry = fixture("scan.profile.list.json")["profiles"][0].clone();
+    let mut flood = entry.clone();
+    flood["name"] = json!("flood");
+    flood["summary"]["lanes"] = json!(vec!["http"; 100_000]);
+    let mut mixed = entry;
+    mixed["name"] = json!("mixed");
+    mixed["summary"]["lanes"] = json!(["ws", "http", "http"]);
+    let _ = app.on_bus(reply(
+        "scan.profile.list",
+        "scan.profile.list",
+        json!({ "profiles": [flood, mixed] }),
+    ));
+    let list = &app.scan.profiles.list;
+    assert_eq!(list[0].summary.lanes, vec![LaneKind::Http]);
+    assert_eq!(list[1].summary.lanes, vec![LaneKind::Http, LaneKind::Ws]);
+    assert_eq!(app.scan.profiles.lanes_text, vec!["http", "http ws"]);
+    let (left, _) = halves(&app, 200, 50);
+    let flood_row = line_with(&left, "flood").unwrap_or_else(|| panic!("no row:\n{left}"));
+    assert_eq!(flood_row.matches("http").count(), 1, "{flood_row:?}");
+    let mixed_row = line_with(&left, "mixed").unwrap_or_else(|| panic!("no row:\n{left}"));
+    assert!(mixed_row.contains("http ws"), "{mixed_row:?}");
+    assert!(!mixed_row.contains("ws http"), "{mixed_row:?}");
+}
+
+/// Fix round G, G52: `text_of(field)` is the one text rule; it reads any
+/// field without moving the cursor, and equals what `field_text()` prints
+/// with the cursor on that field.
+#[test]
+fn text_of_reads_every_field_without_moving_the_cursor() {
+    let mut app = app();
+    open_standard(&mut app);
+    let editor = app.scan.profiles.editor.as_ref().expect("editor");
+    for (i, f) in EDITOR_FIELDS.iter().enumerate() {
+        let mut probe = editor.clone();
+        probe.field = i;
+        assert_eq!(editor.text_of(*f), probe.field_text(), "{f:?}");
+    }
+    assert_eq!(editor.field, 0, "the cursor did not move");
+    assert_eq!(editor.text_of(EditorField::Name), "standard");
+    assert_eq!(editor.text_of(EditorField::Intensity), "medium");
+}
+
 /// Fix round G, G45 and G53: a `scan.profile.get` reply over the draft
 /// bounds is refused, not cut (the draft is echoed back on `w` and `s`):
 /// the editor stays closed, the uncoded error `profile exceeds bounds` is
