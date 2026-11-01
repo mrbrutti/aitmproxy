@@ -33,9 +33,14 @@ Ratings: **Strong** = do now · **Worth exploring** = at the named moment · **S
   test adapter that is an anonymous closure in `Session.init` — the one seam whose test half
   has no name, so `ARCHITECTURE.md` describes it as "the fixture closure in `Session.init`".
 - **Drifted copies.** No duplicated `private struct` (the grep is clean). One duplicated
-  function: `BusService.hostMatches(_:_:)` is `Scope.matches(_:_:)` (Kit, `Compose.swift`)
-  line for line; `Session+Transfer`, `FixtureActions` and `FixtureExtras` already call the Kit
-  one. (`BusService.swift` is frozen until the macOS revision-2 PR merges; carried below.)
+  function: `BusService.hostMatches(_:_:)` was `Scope.matches(_:_:)` (Kit, `Compose.swift`)
+  line for line; deleted in step 2a. The stage-6 panel on that step found the drift the
+  survey's grep could not: `FixtureActions.send`/`addScope` decide `inScope` with a bare
+  `hasSuffix` (no wildcard, no port strip; fixture code, going with the fixture removal), and
+  the "empty scope marks every row in scope" policy is written inline at four call sites and
+  omitted at `Session+Transfer.importFlows`, so imported rows are out of scope when polled rows
+  are in. A Kit `Scope.marksInScope(_:scope:)` with an empty-scope test would give the row rule
+  one home; `importFlows` then needs an explicit decision. Carried as a card below.
 - **Pure logic inside the main-actor store.** `Session.paletteItems(for:)` builds and ranks
   the palette (fuzzy score, literal-title-first, section order, Recent on top) in 90 lines
   that no unit test exercises; `Session.landingPage(saved:)`, `clients`/`hosts`
@@ -165,7 +170,7 @@ because `CoreFailedBanner` bumps it; the move is mostly a tripwire rewrite, and 
 revision-2 PR is editing the neighbouring Shell files now. Do it the day that PR merges, in
 one commit with the two scripts, and say so in both.
 
-## `BusService.hostMatches` → `Scope.matches`  [Strong — after the revision-2 PR merges]
+## `BusService.hostMatches` → `Scope.matches`  [Strong — shipped as step 2a]
 
 Files: `Bus/BusService.swift` (frozen today).
 Signal: a drifted copy (identical today; the next scope rule change would make them differ).
@@ -264,6 +269,27 @@ fixture files go with that removal; what remains of step 1 is `Session.swift` at
 navigation enums in `Shell/`. Nothing further is built on the fixture seam. The `APP_STORE`
 isolation (`Store.isOverridden`) stays: it is what lets a dev bundle run a real core without
 touching the operator's settings, and PR #201 closes its last leaks.
+
+## Step 2a status (2026-10-31)
+
+`BusService.hostMatches` deleted; `pollLoop`'s `scoped(_:)` calls `Scope.contains` behind the
+unchanged empty-scope short-circuit. One file, +1/−8, off main 9dba3d9 after the S-041 PR
+released `BusService.swift`. Proof: the real run with a seeded `scope.json` (`example.com`),
+traffic to it and to `httpbin.org`, window shots of main and the branch (in-scope rows normal,
+out-of-scope rows dimmed, identical apart from port and timings); Kit tests green (the Kit rule
+has literal tests in `ComposeTests`, the deleted copy had none); tripwires PASS. Panel:
+security PASS, quality PASS (Minors: this doc update; the drifted rules above), spec below.
+
+## Empty-scope policy as one Kit rule  [Worth exploring — found by the step-2a panel]
+
+Files: `Bus/BusService.swift`, `Bus/FlowActions.swift`, `Session+Fixtures.swift`,
+`Session+Transfer.swift`, `AitmproxyKit/Compose.swift`.
+Signal: the same policy inline four times, omitted once (a drifted rule, not a copy).
+Proposal: `Scope.marksInScope(_ authority: String, scope: [String]) -> Bool` in Kit (true when
+the scope is empty, else `contains`), with an empty-scope test; every site calls it; the Scope
+page banner ("every host is read-only until you add one") and the rule must then agree — today
+an empty scope enables every verb, which the banner's wording contradicts (security Minor).
+Proof: the seeded-scope real run plus one with an empty `scope.json` and imported flows.
 
 Not done in step 1: the cards marked "after the revision-2 PR merges" (`BusService.hostMatches`
 → `Scope.matches` waits for the S-041 PR, which owns `BusService.swift`; the `ShellView` split
