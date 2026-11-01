@@ -349,7 +349,7 @@ async fn crawl_origin(
         Err(error) => {
             tracing::warn!(
                 job = job.job_id(),
-                error = %error,
+                error = %redact::scrub_error(&error),
                 "scan: http lane: the crawl failed; continuing with the captured flows"
             );
             Vec::new()
@@ -397,7 +397,7 @@ async fn prime_browser(job: &dyn JobCtx, origin: &Url, session: Option<&SessionM
         Ok(_) => {}
         Err(error) => tracing::warn!(
             job = job.job_id(),
-            error = %error,
+            error = %redact::scrub_error(&error),
             "scan: http lane: the browser could not be primed with the session"
         ),
     }

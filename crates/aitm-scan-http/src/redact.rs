@@ -40,6 +40,18 @@ pub(crate) fn scrub(text: &str) -> String {
     aitm_core::redact::scrub_text(text)
 }
 
+/// A foreign error's text, flattened with its context chain and scrubbed, for a
+/// log line or an `anyhow!` message.
+///
+/// The lane cannot know what a browser driver, a transport or a body parser
+/// puts in an error: a driver may echo the URL it failed on (`?token=…`) or the
+/// `document.cookie = "sid=…"` statement it rejected, a parser the element name
+/// it choked on. Every such error goes through here before it is logged or
+/// propagated, so the scrub happens once and at the boundary.
+pub(crate) fn scrub_error(err: &anyhow::Error) -> String {
+    scrub(&format!("{err:#}"))
+}
+
 /// Whether a parameter, header or cookie name reads as a secret, using the
 /// shared vocabulary.
 ///
@@ -166,10 +178,98 @@ fn cut_chars(text: &str, max: usize) -> String {
     }
 }
 
+/// Test support: a thread-local `tracing` subscriber that records every event
+/// as one line, so a test can assert on what a real log site wrote.
+///
+/// `install` sets the subscriber as the current thread's default for the life of
+/// the returned guard; a `current_thread` tokio test runs its futures on that
+/// thread, so the lane's log lines land in `lines`. Each line is the event's
+/// fields as `name=value` pairs (Display values are recorded through their
+/// `Debug` of the `%` wrapper, which is the same text), followed by the message.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod capture {
+    use std::fmt::{self, Write as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::DefaultGuard;
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// The lines a [`install`]ed capture recorded so far.
+    #[derive(Clone, Default)]
+    pub(crate) struct Lines(Arc<Mutex<Vec<String>>>);
+
+    impl Lines {
+        /// Every recorded line, in order.
+        pub(crate) fn all(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// The lines whose text contains `needle`.
+        pub(crate) fn containing(&self, needle: &str) -> Vec<String> {
+            self.all()
+                .into_iter()
+                .filter(|line| line.contains(needle))
+                .collect()
+        }
+    }
+
+    struct CaptureSubscriber {
+        lines: Lines,
+        next_span: AtomicU64,
+    }
+
+    struct LineVisitor(String);
+
+    impl Visit for LineVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(self.next_span.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = LineVisitor(String::new());
+            event.record(&mut visitor);
+            self.lines.0.lock().unwrap().push(visitor.0);
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// Start capturing this thread's `tracing` events until the guard drops.
+    pub(crate) fn install() -> (DefaultGuard, Lines) {
+        let lines = Lines::default();
+        let subscriber = CaptureSubscriber {
+            lines: lines.clone(),
+            next_span: AtomicU64::new(0),
+        };
+        let guard = tracing::subscriber::set_default(subscriber);
+        (guard, lines)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{example, safe_url};
+    use super::{example, safe_url, scrub_error};
     use crate::limits::{MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
     use aitm_scan_model::InsertionKind;
     use regex::Regex;
@@ -220,6 +320,25 @@ mod tests {
                 .chars()
                 .count(),
             MAX_SAFE_URL_CHARS
+        );
+    }
+
+    /// A foreign error (a browser driver's, a body parser's) is flattened to one
+    /// line and scrubbed before it can reach a log or an `anyhow` message
+    /// (stage-5 F1/F3).
+    #[test]
+    fn scrub_error_masks_credentials_in_a_foreign_error() {
+        let err = anyhow::anyhow!(
+            "navigation to http://t:8080/cb?token=abc failed after document.cookie = \"sid=S3\""
+        )
+        .context("crawl step");
+        let text = scrub_error(&err);
+        assert!(!text.contains("abc"), "{text}");
+        assert!(!text.contains("S3"), "{text}");
+        assert!(text.contains("crawl step"), "{text}");
+        assert!(
+            text.contains("navigation to http://t:8080/cb?token="),
+            "{text}"
         );
     }
 

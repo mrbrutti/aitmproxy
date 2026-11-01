@@ -59,7 +59,7 @@ use crate::crawl::values::{form_action, value_for};
 use crate::limits::{
     MARK_CRAWL, MAX_CLICKABLES_LISTED, MAX_DOM_BYTES, SETTLE_MAX_MS, SETTLE_POLL_MS,
 };
-use crate::redact::safe_url;
+use crate::redact::{safe_url, scrub_error};
 use crate::session::{browser_cookie_statements, browser_partial};
 use crate::url_norm::{guard_authority, parse_absolute, request_url, same_origin};
 
@@ -309,7 +309,9 @@ pub(crate) fn origin_root(origin: &Url) -> Url {
 
 /// Await `future` under the job's deadline (spec D8.1: no await outlives
 /// `min(deadline - now, MAX_AWAIT)`), so one hung browser call cannot outlive
-/// the job.
+/// the job, and with the driver's error text scrubbed, so nothing the driver
+/// echoed reaches a log or an error (AC T2-6). Every browser call in this
+/// module goes through here.
 async fn bounded<T>(
     job: &dyn JobCtx,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
@@ -318,7 +320,11 @@ async fn bounded<T>(
         anyhow::bail!("scan: the job deadline passed before the browser answered");
     };
     match tokio::time::timeout(limit, future).await {
-        Ok(result) => result,
+        Ok(Ok(value)) => Ok(value),
+        // The driver's error text is foreign (it may echo the URL it failed on
+        // or the statement it rejected), so it is scrubbed here, once, before
+        // any call site logs it or `prime_session` propagates it (AC T2-6).
+        Ok(Err(err)) => Err(anyhow::anyhow!("{}", scrub_error(&err))),
         Err(_) => anyhow::bail!("scan: the browser did not answer within {limit:?}"),
     }
 }
@@ -1361,6 +1367,144 @@ mod tests {
         ] {
             assert!(!CLICKABLES_JS.contains(forbidden), "{forbidden}");
         }
+    }
+
+    // --- stage-5 F1: foreign error texts are scrubbed -------------------------
+
+    /// The text a misbehaving driver might put in its error: the URL it failed
+    /// on, credential and all, and the cookie statement it rejected.
+    const LEAKY_DRIVER_ERROR: &str =
+        "navigation to http://t:8080/cb?token=abc failed; document.cookie = \"sid=S3\"";
+
+    /// A driver whose every navigation fails with [`LEAKY_DRIVER_ERROR`].
+    struct FailingNavBrowser;
+
+    impl BrowserDriver for FailingNavBrowser {
+        fn navigate(&self, _url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            Box::pin(async { Err(anyhow::anyhow!(LEAKY_DRIVER_ERROR)) })
+        }
+
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// A [`FakeJob`] whose browser is any driver, for a double `FakeJob` cannot
+    /// hold.
+    struct JobWithDriver {
+        inner: FakeJob,
+        driver: Arc<dyn BrowserDriver>,
+    }
+
+    impl JobCtx for JobWithDriver {
+        fn job_id(&self) -> &str {
+            self.inner.job_id()
+        }
+        fn profile(&self) -> &ScanProfile {
+            self.inner.profile()
+        }
+        fn client(&self) -> Arc<dyn aitm_core::ProxyClient> {
+            self.inner.client()
+        }
+        fn store(&self) -> Arc<dyn FlowStore> {
+            self.inner.store()
+        }
+        fn guard(&self) -> Arc<dyn ScopeRateGuard> {
+            self.inner.guard()
+        }
+        fn browser(&self) -> Option<Arc<dyn BrowserDriver>> {
+            Some(Arc::clone(&self.driver))
+        }
+        fn session(&self) -> Option<Arc<SessionMaterial>> {
+            self.inner.session()
+        }
+        fn charge(&self, units: u32) -> bool {
+            self.inner.charge(units)
+        }
+        fn budget_left(&self) -> u32 {
+            self.inner.budget_left()
+        }
+        fn deadline(&self) -> Instant {
+            self.inner.deadline()
+        }
+        fn cancelled(&self) -> bool {
+            self.inner.cancelled()
+        }
+        fn marker(&self) -> String {
+            self.inner.marker()
+        }
+    }
+
+    /// The crawler's "could not load this page" line carries the driver's error
+    /// with every credential masked; the crawl itself goes on.
+    #[tokio::test]
+    async fn failed_navigation_is_logged_scrubbed() {
+        let (_guard, lines) = crate::redact::capture::install();
+        let job = JobWithDriver {
+            inner: FakeJob::new(
+                ScanProfile::default(),
+                Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+            ),
+            driver: Arc::new(FailingNavBrowser),
+        };
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("a page the browser cannot load is skipped, not fatal");
+        assert_eq!(report.pages, 0);
+        assert_eq!(report.attempts, 1);
+
+        let logged = lines.containing("could not load this page");
+        assert_eq!(logged.len(), 1, "{:?}", lines.all());
+        assert!(logged[0].contains("error="), "{}", logged[0]);
+        assert!(!logged[0].contains("abc"), "{}", logged[0]);
+        assert!(!logged[0].contains("S3"), "{}", logged[0]);
+        for line in lines.all() {
+            assert!(!line.contains("abc") && !line.contains("S3"), "{line}");
+        }
+    }
+
+    /// `prime_session` propagates a failed navigation as an error whose text is
+    /// scrubbed, so the lane's warning cannot leak what the driver echoed.
+    #[tokio::test]
+    async fn prime_session_propagates_a_scrubbed_error() {
+        let material = SessionMaterial {
+            cookies: vec![("sid".to_string(), "S3".to_string())],
+            headers: Vec::new(),
+        };
+        let job = FakeJob::new(
+            ScanProfile::default(),
+            Arc::new(ScriptedClient::new(|_| Ok(response(200, &[], b"")))),
+        );
+
+        let err = prime_session(&FailingNavBrowser, &url(ROOT), &material, &job)
+            .await
+            .expect_err("the navigation failed");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("navigation to http://t:8080/cb?token="),
+            "{text}"
+        );
+        assert!(!text.contains("abc"), "{text}");
+        assert!(!text.contains("S3"), "{text}");
     }
 
     #[tokio::test]
