@@ -386,6 +386,12 @@ Kept by the main session during stage 6. One row per finding.
 | 4 | Spec | Minor | `generation` counter beyond the plan's `inFlight`/`stopped` sketch. | Accepted 2026-11-01: the minimum mechanism that makes the plan's stop contract hold in its own step-11 scenario; pinned (step 12, D1/D2). |
 | 4 | Spec | Minor | `.error` log line appends `(wanted <summary>)` beyond spec D's named elements. | Accepted 2026-11-01: scoped targets are operator configuration (spec D); the TR-AC8 ladder's construction-bug rung needs the wanted set. |
 | T | Spec | Minor | Tester added three `run()` lines and a second group in `FlowHandoff.swift`, beyond the coordination allowance (one group, one line). | Accepted 2026-11-01: tests only, zero removed lines; the observe-lane session is told the `run()` region widened; whoever merges second rebases. |
+| 3 | Security (r2) | Minor | The cap's `(+K dropped)` suffix sat at the end of a ~5 KiB log line os_log may truncate. | Fixed in `a03a5dfb`: capped form is `257 rules, 44 dropped (TCP catch-all + UDP …)`; pins rewritten. |
+| 4 | Quality + Spec (r2) | Minor | `begin`'s doc comment misstated the parked-begin success arm; the arm was unpinned. | Pins added by the round-2 Tester (`a0b0a6c6` vector I, `d12b65e9` vector H); comment reworded in `69fbe492`; spec Design C sentence added (round 2). |
+| 4 | Quality (r2) | Minor | `stop()` is re-entered through the cancelled startup completion — correct by ordering but unwritten and unpinned. | Fixed in `69fbe492`: comments in `stop()` and the provider error branch; vector J (parked completion calls `stop()` itself → answered once with ECANCELED, nothing further). |
+| 3 | Quality (r2) | Minor | Redundant `v4.isLoopback ||` beside the 127/8 octet test. | Fixed in `1d149b2c`. |
+| 3 | Security (r2) | — (note) | The cap's eviction order (address text) lets a token set decide which 256 targets survive. | No finding: Scope tokens come only from the peer-authenticated core at operator privilege (confirm handshake); under-inclusive only. Recorded 2026-11-01. |
+| 4 | Tester (r2) | — (note) | Vector G proves the detach-driven reconcile is inert after `stop()` at the reconciler level; the provider's `startProxy` error-branch call order is verifiable by inspection only (no NE runtime in the sandbox). | Accepted 2026-11-01: same status as every provider line; TR-AC8 exercises the provider live. |
 
 ## Shipped
 

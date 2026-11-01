@@ -210,7 +210,10 @@ completion still parked when `stopProxy` arrives is answered with a cancellation
 (`ECANCELED`), never dropped; a second `startProxy` without `stopProxy` (FB21464147) with a rule
 set already installed answers its completion at once and keeps the installed set (no TCP-only
 re-apply); a `Scope` reaching the queue before the startup apply is kept as `pendingWanted` and
-applied right after it; a failed startup apply stops the reconciler before `handoff.stop()`. The class doc comment and the `startProxy` comment ("Provider
+applied right after it; a failed startup apply stops the reconciler before `handoff.stop()`; if a
+set becomes installed while a second `startProxy` is parked (a reconcile apply landing first), that
+completion is answered `nil` at that moment and a reconcile apply's error never answers it (round-2
+spec review). The class doc comment and the `startProxy` comment ("Provider
 *rules* cannot be hot-edited without a restart") are rewritten to describe this design.
 
 ### D. Logging **(Architect's call on addresses)**
