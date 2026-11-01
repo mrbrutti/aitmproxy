@@ -138,6 +138,30 @@ export interface StateNotification {
   memory_bytes?: number;
 }
 
+/**
+ * `proxy.status.system_proxy` (spec D6): the OS-level system proxy as the core reads it. The
+ * compact sub-object carries the first seven fields; the full `proxy.system.*` results add
+ * `guidance` (the env line when `unsupported`) and `remedy` (the privilege sentence when
+ * `needs_privilege`). A state string the client does not know parses to `unknown`.
+ */
+export type SystemProxyState = 'off' | 'points_at_us' | 'other' | 'unsupported' | 'needs_privilege' | 'unknown';
+
+export interface SystemProxyStatus {
+  state: SystemProxyState;
+  /** The effective endpoint; present only for `other` (D6). */
+  host: string | null;
+  port: number | null;
+  /** The state file exists and every service it lists still reads back as what we wrote. */
+  managed_by_us: boolean;
+  /** A set/unset is in flight in the core (another client's call). */
+  setting: boolean;
+  /** `mechanism != none`. */
+  supported: boolean;
+  detail: string;
+  guidance?: string | null;
+  remedy?: string | null;
+}
+
 export class BusError extends Error {
   constructor(
     message: string,
