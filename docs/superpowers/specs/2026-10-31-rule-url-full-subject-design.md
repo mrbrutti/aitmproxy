@@ -37,6 +37,14 @@ working, and pins the preview to the core's answers.
   to align there. Both were checked.
 - Fixing the macOS app's wire form (`match`, `flag`, `phase: both`, regex sent
   as a bare string). That is the sibling Kit PR from story S-041.
+  Amended 2026-10-31 at the merge: #202 (S-041) landed first and sent every
+  wildcard as the `(?i)` regex its `wildcardRegex` built, on the premise that
+  the core's wildcard was anchored, case-sensitive and `?`-less. This spec
+  removed that premise, and keeping the translation would have re-created the
+  `?` (AC7) and `//` (AC17) disagreements the case table forbids, so the merge
+  resolution sends `{wildcard: <as typed>}` and deletes `wildcardRegex`; `id`,
+  `phase request|response|any`, `method`, `name`, `JSONValue` and the
+  no-`match`/`flag` discipline stay #202's.
 - Normalising the authority (dropping a default `:443`/`:80`, IDNA, percent
   decoding). The subject is what the client sent.
 - `?` as a single-character wildcard. In a URL `?` starts the query, so it is a
@@ -63,7 +71,9 @@ working, and pins the preview to the core's answers.
 - The macOS change is confined to `apps/mac/Sources/AitmproxyKit/` and
   `apps/mac/Tests/AitmproxyKitTests/`; `apps/mac/Sources/Aitmproxy/**` is not
   touched (the sibling Kit PR owns the wire form in the same Swift file; this
-  change edits only `matches` and `wildcardMatches` and the tests).
+  change edits only `matches` and `wildcardMatches` and the tests; at the
+  merge with #202, `arguments`' wildcard arm was the one further edit, see
+  Non-goals).
 
 ## Design
 
