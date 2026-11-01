@@ -12,8 +12,10 @@ What it proves, Vulnerable (V) next to Patched (P), both booted with `--l4`:
     negotiates `1.1`, the h1-only listener negotiates `1.1` under `--http2`; the
     control log then holds `tls_handshake` entries with those ALPNs and `request`
     entries with `version` h2/h1 and `conn_req_index == 1`
-  - one seed per D3 class answers on V with the row's literal signal and on P
-    with the row's patched answer (the rows are the child spec's D3 table)
+  - one seed per D3 class, then EVERY remaining D3 row (the `SEEDS` table, 20 rows
+    plus the stored-XSS round trip), answers on V with the row's literal signal
+    and on P with the row's patched answer; the timing rows (`SLEEP(2)`,
+    `;sleep 2`) take >= 2 s on V and < 1 s on P
   - S3: five `curl --http2` requests in one invocation ride ONE h2 connection: one
     `/log/conns` row on `tls` with `alpn h2` and `requests == 5`, and the five
     `request` entries carry `conn_req_index` 1..5 on that `conn_id`
@@ -23,9 +25,13 @@ What it proves, Vulnerable (V) next to Patched (P), both booted with `--l4`:
     answers 403 to the foreign `Origin`, 401 without a session, and with the
     session cookie upgrades (hello `alice`) and escapes `<i>`; `/log/ws` holds each
     handshake under the client's own `Sec-WebSocket-Key` with `cookie_names`
-  - the TLV speaker (D5): V closes on the trigger frame, refuses connects, is back
-    inside the 5 s window and logs one `downtime` row with
-    `up_at_ms - down_at_ms == 5000`; P answers `00 03 45 52 52` and never goes down
+  - all nine D5 speakers (the `SPEAKERS` table, bytes mirrored from the crate's
+    `speakers_live.rs`): on V the trigger closes with no bytes (UDP: no reply), the
+    service is refused / silent within 2 s, still down at +4 s, answers liveness
+    again by +6 s and logs exactly one `downtime` row with
+    `up_at_ms - down_at_ms == 5000`; on P the same trigger gets the row's reply
+    (MQTT: a bare close) and the service never goes down; the nine V windows run
+    concurrently so the whole cell stays under ~25 s
   - S6: `/manifest`, `/manifest.yaml` and `/<seed id>` for all 28 manifest ids are
     404 on the target AND on the control origin (the manifest is never served)
   - the control log never stores a `cookie` key or the session value; a request
@@ -48,6 +54,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -55,7 +62,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aitm_e2e import check, fail, ok, section, skip  # noqa: E402
-from aitm_e2e.scan import ScanTarget  # noqa: E402
+from aitm_e2e.scan import ScanTarget, boot_target, until  # noqa: E402
 from aitm_e2e.tls import curl, curl_http_version, have  # noqa: E402
 from aitm_e2e.ws import ws_encode, ws_read_frame  # noqa: E402
 
@@ -100,12 +107,60 @@ WS_ECHO_P = '{"type":"echo","msg":"&lt;i&gt;","html":"<b>&lt;i&gt;</b>"}'
 WS_MAX_FRAME = 1_048_576
 FOREIGN_ORIGIN = "http://evil.example"
 
-TLV_SERVICE = "l4-tlv-crash"
-TLV_BENIGN = bytes.fromhex("0003616263")   # len 3 + "abc" -> echoed (D5 benign exchange)
-TLV_LIVENESS = bytes.fromhex("0000")       # D5 liveness: `00 00` -> `00 00`
-TLV_TRIGGER = bytes.fromhex("ffff")        # declared len 65535 > 4096: the D5 trigger
-TLV_P_REPLY = bytes.fromhex("0003455252")  # D5 P reply (`ERR` frame), then close
 CRASH_WINDOW_MS = 5000
+LONG_LINE = b"a" * 4096 + b"\r\n"        # past every line cap (1024 / 2048)
+MQTT_CONNECT = bytes.fromhex("100c00044d5154540402003c0000")
+MQTT_CONNACK = bytes.fromhex("20020000")
+MQTT_DISCONNECT = bytes.fromhex("e000")
+DNS_QUERY = bytes.fromhex("123401000001000000000000076578616d706c65047465737400000100 01".replace(" ", ""))
+DNS_ANSWER = bytes.fromhex("123481800001000100000000076578616d706c6504746573740000010001c00c000100010000003c00047f000001")
+DNS_ROOT_QUERY = bytes.fromhex("0001010000010000000000000000010001")
+DNS_ROOT_ANSWER = bytes.fromhex("0001818000010001000000000000010001c00c000100010000003c00047f000001")
+MODBUS_READ = bytes.fromhex("000100000006010300000001")
+MODBUS_REPLY = bytes.fromhex("0001000000050103020000")
+
+# The nine D5 speakers, bytes copied from `crates/aitm-testtarget/tests/speakers_live.rs`
+# `cases()`: benign and liveness exchanges, the Vulnerable trigger, and the Patched
+# reply to that trigger (`None`: the protocol has no error reply, the speaker just
+# closes). `banner`: what the speaker writes first on connect.
+SPEAKERS = (
+    dict(service="l4-tlv-crash", proto="tcp", banner=b"",
+         benign=bytes.fromhex("0003616263"), benign_expect=bytes.fromhex("0003616263"),
+         liveness=bytes.fromhex("0000"), liveness_expect=bytes.fromhex("0000"),
+         trigger=bytes.fromhex("ffff"), p_reply=bytes.fromhex("0003455252")),
+    dict(service="l4-dns-fault", proto="udp", banner=b"",
+         benign=DNS_QUERY, benign_expect=DNS_ANSWER,
+         liveness=DNS_ROOT_QUERY, liveness_expect=DNS_ROOT_ANSWER,
+         trigger=bytes.fromhex("1234010000010000000000003f6162"),
+         p_reply=bytes.fromhex("123481810000000000000000")),
+    dict(service="l4-udp-payload-crash", proto="udp", banner=b"",
+         benign=b"abc", benign_expect=b"abc", liveness=b"abc", liveness_expect=b"abc",
+         trigger=bytes.fromhex("deadbeef00000000"), p_reply=bytes.fromhex("deadbeef00000000")),
+    dict(service="l4-resp", proto="tcp", banner=b"",
+         benign=b"*1\r\n$4\r\nPING\r\n", benign_expect=b"+PONG\r\n",
+         liveness=b"PING\r\n", liveness_expect=b"+PONG\r\n",
+         trigger=b"*1\r\n$2000000\r\n", p_reply=b"-ERR Protocol error: invalid bulk length\r\n"),
+    dict(service="l4-memcached", proto="tcp", banner=b"",
+         benign=b"version\r\n", benign_expect=b"VERSION 1.6.0-aitm\r\n",
+         liveness=b"version\r\n", liveness_expect=b"VERSION 1.6.0-aitm\r\n",
+         trigger=LONG_LINE, p_reply=b"CLIENT_ERROR line too long\r\n"),
+    dict(service="l4-modbus", proto="tcp", banner=b"",
+         benign=MODBUS_READ, benign_expect=MODBUS_REPLY,
+         liveness=MODBUS_READ, liveness_expect=MODBUS_REPLY,
+         trigger=bytes.fromhex("000300000105010300000001"), p_reply=bytes.fromhex("000300000003018303")),
+    dict(service="l4-mqtt", proto="tcp", banner=b"",
+         benign=MQTT_CONNECT, benign_expect=MQTT_CONNACK,
+         liveness=MQTT_CONNECT + MQTT_DISCONNECT, liveness_expect=MQTT_CONNACK,
+         trigger=bytes.fromhex("30ffffffff7f"), p_reply=None),
+    dict(service="l4-smtp", proto="tcp", banner=b"220 target.test ESMTP aitm\r\n",
+         benign=b"EHLO x\r\n", benign_expect=b"250 target.test\r\n",
+         liveness=b"NOOP\r\n", liveness_expect=b"250 OK\r\n",
+         trigger=LONG_LINE, p_reply=b"500 line too long\r\n"),
+    dict(service="l4-ftp", proto="tcp", banner=b"220 aitm ftp\r\n",
+         benign=b"USER a\r\n", benign_expect=b"331 password required\r\n",
+         liveness=b"NOOP\r\n", liveness_expect=b"200 ok\r\n",
+         trigger=LONG_LINE, p_reply=b"500 line too long\r\n"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -142,32 +197,62 @@ def addr_of(target: ScanTarget, name: str) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# TLV speaker primitives (raw sockets; the speaker's own bytes are the oracle)
+# L4 speaker primitives (raw sockets; the speaker's own bytes are the oracle)
 # ---------------------------------------------------------------------------
-def tlv_exchange(addr: tuple[str, int], payload: bytes, want: int, timeout: float = 3.0) -> bytes:
-    """Connect, send `payload`, read up to `want` bytes (or EOF), close."""
-    with socket.create_connection(addr, timeout=timeout) as s:
-        s.settimeout(timeout)
-        s.sendall(payload)
-        got = b""
+def recv_exact(sock, want: int) -> bytes:
+    """Read `want` bytes or until EOF / the socket timeout."""
+    got = b""
+    try:
         while len(got) < want:
-            chunk = s.recv(want - len(got))
+            chunk = sock.recv(want - len(got))
             if not chunk:
                 break
             got += chunk
-        return got
+    except socket.timeout:
+        pass
+    return got
 
 
-def tlv_send_trigger(addr: tuple[str, int], timeout: float = 3.0) -> tuple[bytes, bool]:
-    """Send the trigger frame on a fresh connection; return (bytes read back, saw_eof)."""
-    with socket.create_connection(addr, timeout=timeout) as s:
+def tcp_open(addr: tuple[str, int], banner: bytes, timeout: float):
+    s = socket.create_connection(addr, timeout=timeout)
+    s.settimeout(timeout)
+    if banner:
+        got = recv_exact(s, len(banner))
+        if got != banner:
+            s.close()
+            raise AssertionError(f"banner {got!r} != {banner!r}")
+    return s
+
+
+def udp_exchange(addr: tuple[str, int], payload: bytes, timeout: float = 0.5) -> bytes | None:
+    """One datagram out, the first datagram back (None when nothing answers in `timeout`)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(timeout)
-        s.sendall(TLV_TRIGGER)
+        s.sendto(payload, addr)
+        try:
+            return s.recvfrom(65535)[0]
+        except socket.timeout:
+            return None
+
+
+def exchange(row: dict, addr: tuple[str, int], payload: bytes, want: int, timeout: float = 3.0) -> bytes | None:
+    """Connect (TCP) or send (UDP), write `payload`, read `want` bytes back."""
+    if row["proto"] == "udp":
+        return udp_exchange(addr, payload, timeout=min(timeout, 1.0))
+    with tcp_open(addr, row["banner"], timeout) as s:
+        s.sendall(payload)
+        return recv_exact(s, want)
+
+
+def tcp_trigger(row: dict, addr: tuple[str, int], timeout: float = 3.0) -> tuple[bytes, bool]:
+    """Send the trigger on a fresh connection; (bytes read back before EOF, saw_eof)."""
+    with tcp_open(addr, row["banner"], timeout) as s:
+        s.sendall(row["trigger"])
         got = b""
         eof = False
         try:
-            while len(got) < 64:
-                chunk = s.recv(64 - len(got))
+            while len(got) < 256:
+                chunk = s.recv(256 - len(got))
                 if not chunk:
                     eof = True
                     break
@@ -175,6 +260,25 @@ def tlv_send_trigger(addr: tuple[str, int], timeout: float = 3.0) -> tuple[bytes
         except socket.timeout:
             pass
         return got, eof
+
+
+def is_down(row: dict, addr: tuple[str, int]) -> bool:
+    """TCP: the connect is refused. UDP: the liveness datagram goes unanswered."""
+    if row["proto"] == "udp":
+        return udp_exchange(addr, row["liveness"]) is None
+    return connect_refused(addr)
+
+
+def wait_liveness(row: dict, addr: tuple[str, int], until_t: float) -> bool:
+    """Poll the liveness exchange until it answers the row's bytes or `until_t` (monotonic) passes."""
+    while time.monotonic() < until_t:
+        try:
+            if exchange(row, addr, row["liveness"], len(row["liveness_expect"]), timeout=1.0) == row["liveness_expect"]:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def connect_refused(addr: tuple[str, int]) -> bool:
@@ -187,26 +291,12 @@ def connect_refused(addr: tuple[str, int]) -> bool:
         return False
 
 
-def wait_refused(addr: tuple[str, int], within: float) -> float | None:
-    """Seconds until the first refused connect, or None if none was refused within `within`."""
+def wait_down(row: dict, addr: tuple[str, int], within: float) -> float | None:
+    """Seconds until the service is first seen down, or None if it stayed up for `within`."""
     t0 = time.monotonic()
-    while time.monotonic() - t0 < within:
-        if connect_refused(addr):
-            return time.monotonic() - t0
-        time.sleep(0.02)
+    if until(lambda: is_down(row, addr), within, interval=0.02):
+        return time.monotonic() - t0
     return None
-
-
-def wait_liveness(addr: tuple[str, int], until: float) -> bool:
-    """Poll the liveness exchange until it answers `00 00` or `until` (monotonic) passes."""
-    while time.monotonic() < until:
-        try:
-            if tlv_exchange(addr, TLV_LIVENESS, 2, timeout=1.0) == TLV_LIVENESS:
-                return True
-        except OSError:
-            pass
-        time.sleep(0.1)
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -219,11 +309,7 @@ def curl_supports_h2() -> bool:
 
 
 def boot(mode: str) -> ScanTarget:
-    try:
-        return ScanTarget(mode, l4=True)
-    except FileNotFoundError as e:
-        skip(str(e))
-    raise AssertionError("unreachable")
+    return boot_target(mode, l4=True)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +357,10 @@ def check_alpn(t: ScanTarget) -> None:
         check(rc == 0 and ver == want,
               f"{m}: curl {' '.join(args)} {url} negotiated HTTP {ver!r} "
               f"(want {want!r}; rc={rc} {err.strip()[:120]})")
-    time.sleep(0.2)  # the target writes its log entries after the bytes left its socket
+    # The target writes its log entries after the bytes left its socket: wait for the
+    # three handshakes instead of sleeping a fixed 200 ms.
+    until(lambda: len([e for e in t.logs.http()
+                       if int(e.get("seq", 0)) > seq0 and e.get("kind") == "tls_handshake"]) >= 3, 3.0)
     entries = [e for e in t.logs.http() if int(e.get("seq", 0)) > seq0]
     hs_tls = sorted(e.get("alpn") for e in entries
                     if e.get("kind") == "tls_handshake" and e.get("listener") == "tls")
@@ -382,32 +471,233 @@ def check_seeds(v: ScanTarget, p: ScanTarget) -> None:
         check(header(hp, name) == value, f"P: `{name}: {value}` (got {header(hp, name)!r})")
 
 
-def check_tlv_vulnerable(v: ScanTarget) -> None:
-    addr = addr_of(v, TLV_SERVICE)
-    check(tlv_exchange(addr, TLV_BENIGN, 5) == TLV_BENIGN,
-          "V tlv: benign `00 03 61 62 63` echoes back")
-    check(tlv_exchange(addr, TLV_LIVENESS, 2) == TLV_LIVENESS, "V tlv: liveness `00 00` -> `00 00`")
-    before = len(v.logs.downtime(TLV_SERVICE))
-    got, _ = tlv_send_trigger(addr)
-    check(got == b"", f"V tlv: the `FF FF` trigger draws no reply, the connection closes (got {got.hex()!r})")
-    refused_at = wait_refused(addr, 0.5)
-    check(refused_at is not None,
-          f"V tlv: connects are refused within 500 ms of the trigger (saw refusal at {refused_at})")
-    up = wait_liveness(addr, time.monotonic() + 6.0)
-    check(up, "V tlv: the benign liveness answers again within 6 s (the window closed)")
-    dt = v.logs.downtime(TLV_SERVICE)
-    check(len(dt) == before + 1, f"V tlv: exactly one new `downtime` row (had {before}, now {len(dt)})")
-    window = int(dt[-1].get("up_at_ms", 0)) - int(dt[-1].get("down_at_ms", 0))
-    check(window == CRASH_WINDOW_MS, f"V tlv: up_at_ms - down_at_ms == 5000 (got {window})")
+# The remaining D3 seed rows (`check_seeds` above covers one per class plus the
+# session gate and the passive headers). Markers are the crate's `seed.rs` constants;
+# the literal shapes are the spec's D3 table. A row is (name, method, path, headers,
+# body, V predicate, P predicate); predicates see (status, headers, text, elapsed s).
+CMDI_MARKER = "uid=0(root) gid=0(root)"
+TRAVERSAL_MARKER = "root:x:0:0:root:/root:/bin/bash"
+LDAPI_ALL_USERS_MARKER = "LDAP-ALL-USERS-MARKER-77c2"
+SSRF_MARKER = "SSRF-INTERNAL-METADATA-9d4e"
+IDOR_MARKER = "IDOR-ACCOUNT2-SECRET-5a8b"
+AUTH_BYPASS_MARKER = "ADMIN-AREA-MARKER-c6f0"
+REDIRECT_TARGET = "https://redirect-marker-e2d9.example/"
+XXE_BODY = (b'<?xml version="1.0"?><!DOCTYPE order [<!ENTITY e SYSTEM "file:///etc/passwd">]>'
+            b'<order id="7"><name>&e;</name></order>')
+MULTIPART_BOUNDARY = "e2eBoundary7f3a"
+MULTIPART_BODY = (
+    f"--{MULTIPART_BOUNDARY}\r\n"
+    f'Content-Disposition: form-data; name="file"; filename="{MARK}.txt"\r\n'
+    "Content-Type: text/plain\r\n\r\nx\r\n"
+    f"--{MULTIPART_BOUNDARY}\r\n"
+    'Content-Disposition: form-data; name="note"\r\n\r\n'
+    f"{MARK}\r\n"
+    f"--{MULTIPART_BOUNDARY}--\r\n"
+).encode()
+Q = lambda v: urllib.parse.quote(v, safe="")  # noqa: E731
 
 
-def check_tlv_patched(p: ScanTarget) -> None:
-    addr = addr_of(p, TLV_SERVICE)
-    check(tlv_exchange(addr, TLV_BENIGN, 5) == TLV_BENIGN, "P tlv: benign echo still works")
-    got, _ = tlv_send_trigger(addr)
-    check(got == TLV_P_REPLY, f"P tlv: the `FF FF` trigger is answered `00 03 45 52 52` (got {got.hex()!r})")
-    check(not connect_refused(addr), "P tlv: the listener stays up (the next connect succeeds)")
-    check(p.logs.downtime(TLV_SERVICE) == [], f"P tlv: no downtime (got {p.logs.downtime(TLV_SERVICE)})")
+def escaped(t: str) -> bool:
+    """P's answer: the marker HTML-escaped and never raw."""
+    return MARK_ESC in t and MARK not in t
+
+
+SEEDS = (
+    ("sqli-boolean true", "GET", "/items?id=" + Q("1 AND 1=1"), None, None,
+     lambda st, h, t, dt: st == 200 and "<p>items: 1</p>" in t,
+     lambda st, h, t, dt: st == 400 and t == "invalid id"),
+    ("sqli-boolean false", "GET", "/items?id=" + Q("1 AND 1=2"), None, None,
+     lambda st, h, t, dt: st == 200 and "<p>items: 0</p>" in t,
+     lambda st, h, t, dt: st == 400 and t == "invalid id"),
+    ("sqli-boolean or-all", "GET", "/items?id=" + Q("1 OR 1=1"), None, None,
+     lambda st, h, t, dt: st == 200 and "<p>items: 5</p>" in t,
+     lambda st, h, t, dt: st == 400),
+    ("sqli-time base", "GET", "/orders?id=1", None, None,
+     lambda st, h, t, dt: st == 200 and t == "<p>order 1</p>" and dt < 1.0,
+     lambda st, h, t, dt: st == 200 and t == "<p>order 1</p>" and dt < 1.0),
+    ("sqli-time SLEEP(2)", "GET", "/orders?id=" + Q("1 AND SLEEP(2)"), None, None,
+     lambda st, h, t, dt: st == 200 and t.startswith("<p>order ") and dt >= 2.0,
+     lambda st, h, t, dt: st == 400 and t == "invalid id" and dt < 1.0),
+    ("cmdi ;id", "GET", "/ping?host=" + Q("localhost;id"), None, None,
+     lambda st, h, t, dt: st == 200 and CMDI_MARKER in t,
+     lambda st, h, t, dt: st == 400 and t == "invalid host"),
+    ("cmdi ;sleep 2", "GET", "/ping?host=" + Q("localhost;sleep 2"), None, None,
+     lambda st, h, t, dt: st == 200 and dt >= 2.0,
+     lambda st, h, t, dt: st == 400 and dt < 1.0),
+    ("xxe", "POST", "/xml", {"content-type": "text/xml"}, XXE_BODY,
+     lambda st, h, t, dt: st == 200 and TRAVERSAL_MARKER in t,
+     lambda st, h, t, dt: st == 400 and t == "DTD not allowed"),
+    ("ldapi wildcard", "GET", "/ldap?user=" + Q("*"), None, None,
+     lambda st, h, t, dt: st == 200 and LDAPI_ALL_USERS_MARKER in t,
+     lambda st, h, t, dt: st == 200 and t == "<p>no entries</p>"),
+    ("ldapi filter break", "GET", "/ldap?user=" + Q("a)(uid=*"), None, None,
+     lambda st, h, t, dt: st == 500 and "Bad search filter" in t,
+     lambda st, h, t, dt: st == 200 and t == "<p>no entries</p>"),
+    ("cookie-reflection /prefs", "GET", "/prefs", {"cookie": f"theme={MARK}"}, None,
+     lambda st, h, t, dt: st == 200 and f'<body class="{MARK}">' in t,
+     lambda st, h, t, dt: st == 200 and escaped(t)),
+    ("nested-json /api/profile", "POST", "/api/profile", {"content-type": "application/json"},
+     json.dumps({"profile": {"address": {"city": MARK}}}).encode(),
+     lambda st, h, t, dt: st == 200 and f'<div class="city">{MARK}</div>' in t,
+     lambda st, h, t, dt: st == 200 and escaped(t)),
+    ("multipart /upload", "POST", "/upload",
+     {"content-type": f"multipart/form-data; boundary={MULTIPART_BOUNDARY}"}, MULTIPART_BODY,
+     lambda st, h, t, dt: st == 200 and t == f"<p>uploaded {MARK}.txt (1 bytes): {MARK}</p>",
+     lambda st, h, t, dt: st == 200 and escaped(t) and "(1 bytes)" in t),
+    ("path-segment /docs/", "GET", "/docs/" + Q(MARK), None, None,
+     lambda st, h, t, dt: st == 200 and t == f"<h1>Doc: {MARK}</h1>",
+     lambda st, h, t, dt: st == 200 and escaped(t)),
+    ("path-filename /files/", "GET", "/files/" + Q(MARK) + ".txt", None, None,
+     lambda st, h, t, dt: st == 200 and t == f"<p>file {MARK}.txt</p>",
+     lambda st, h, t, dt: st == 200 and escaped(t)),
+    ("open-redirect", "GET", "/redirect?next=" + Q(REDIRECT_TARGET), None, None,
+     lambda st, h, t, dt: st in (301, 302, 303, 307) and header(h, "location") == REDIRECT_TARGET,
+     lambda st, h, t, dt: st in (301, 302, 303, 307) and header(h, "location") == "/"),
+    ("ssrf /fetch metadata", "GET", "/fetch?url=" + Q("http://169.254.169.254/"), None, None,
+     lambda st, h, t, dt: st == 200 and SSRF_MARKER in t,
+     lambda st, h, t, dt: st == 403 and SSRF_MARKER not in t),
+    ("idor /account/2", "GET", "/account/2", None, None,
+     lambda st, h, t, dt: st == 200 and IDOR_MARKER in t,
+     lambda st, h, t, dt: st == 403 and IDOR_MARKER not in t),
+    ("auth-bypass /admin X-Role", "GET", "/admin", {"x-role": "admin"}, None,
+     lambda st, h, t, dt: st == 200 and AUTH_BYPASS_MARKER in t,
+     lambda st, h, t, dt: st == 403 and AUTH_BYPASS_MARKER not in t),
+    ("reflected-xss /search", "GET", "/search?q=" + Q(MARK), None, None,
+     lambda st, h, t, dt: st == 200 and f"<h1>Results for {MARK}</h1>" in t,
+     lambda st, h, t, dt: st == 200 and escaped(t)),
+)
+
+
+def timed(base: str, method: str, path: str, headers, body):
+    t0 = time.monotonic()
+    st, h, b = http1(base, method, path, headers=headers, body=body, timeout=15.0)
+    return st, h, text(b), time.monotonic() - t0
+
+
+def check_seed_rows(v: ScanTarget, p: ScanTarget) -> None:
+    """Every remaining D3 row: V's literal signal beside P's patched answer."""
+    section(f"the remaining {len(SEEDS)} D3 seed rows, V's signal beside P's patched answer")
+    for name, method, path, headers, body, v_ok, p_ok in SEEDS:
+        sv, hv, tv, dv = timed(v.base, method, path, headers, body)
+        sp, hp, tp, dp = timed(p.base, method, path, headers, body)
+        check(v_ok(sv, hv, tv, dv), f"V {name}: {sv} {tv[:90]!r} ({dv:.2f} s)")
+        check(p_ok(sp, hp, tp, dp), f"P {name}: {sp} {tp[:90]!r} ({dp:.2f} s)")
+
+    section("stored-xss: POST /comments then GET /comments, V raw, P escaped")
+    for mode, t in (("V", v), ("P", p)):
+        st, h, _ = http1(t.base, "POST", "/comments",
+                         headers={"content-type": "application/x-www-form-urlencoded"},
+                         body=("comment=" + Q(MARK)).encode())
+        check(st in (301, 302, 303) and header(h, "location") == "/comments",
+              f"{mode}: POST /comments redirects to /comments (got {st} {header(h, 'location')!r})")
+        st, _, b = http1(t.base, "GET", "/comments")
+        want = f"<li>{MARK}</li>" in text(b) if mode == "V" else escaped(text(b))
+        check(st == 200 and want, f"{mode}: GET /comments shows the comment {'raw' if mode == 'V' else 'escaped'} "
+                                  f"(got {st} {text(b)[:90]!r})")
+
+
+def speaker_vulnerable(t: ScanTarget, row: dict) -> list[tuple[bool, str]]:
+    """S5, Vulnerable half for one speaker: benign, liveness, trigger closes with no
+    bytes, down within 2 s, still down at +4 s, back by +6 s, one 5000 ms downtime row.
+    Returns (passed, message) pairs; the caller turns them into checks (a thread
+    must not call `check`, whose `sys.exit` would only end the thread)."""
+    name = row["service"]
+    out: list[tuple[bool, str]] = []
+    try:
+        addr = addr_of(t, name)
+        got = exchange(row, addr, row["benign"], len(row["benign_expect"]))
+        out.append((got == row["benign_expect"],
+                    f"V {name}: benign {row['benign'][:16].hex()} -> {row['benign_expect'][:16].hex()} "
+                    f"(got {(got or b'')[:16].hex()})"))
+        got = exchange(row, addr, row["liveness"], len(row["liveness_expect"]))
+        out.append((got == row["liveness_expect"],
+                    f"V {name}: liveness answers {row['liveness_expect'][:16].hex()} (got {(got or b'')[:16].hex()})"))
+        before = len(t.logs.downtime(name))
+        t_trig = time.monotonic()
+        if row["proto"] == "udp":
+            reply = udp_exchange(addr, row["trigger"])
+            out.append((reply is None, f"V {name}: the trigger datagram draws no reply (got {(reply or b'').hex()!r})"))
+        else:
+            bytes_back, eof = tcp_trigger(row, addr)
+            out.append((bytes_back == b"" and eof,
+                        f"V {name}: the trigger closes the connection with no bytes (got {bytes_back.hex()!r}, eof={eof})"))
+        down_at = wait_down(row, addr, 2.0)
+        out.append((down_at is not None, f"V {name}: down within 2 s of the trigger (seen at {down_at})"))
+        time.sleep(max(0.0, t_trig + 4.0 - time.monotonic()))
+        out.append((is_down(row, addr), f"V {name}: still down at +4 s (inside the 5 s window)"))
+        up = wait_liveness(row, addr, t_trig + 6.0)
+        out.append((up, f"V {name}: liveness answers again by +6 s (the window closed)"))
+        dt = t.logs.downtime(name)
+        out.append((len(dt) == before + 1, f"V {name}: exactly one new `downtime` row (had {before}, now {len(dt)})"))
+        if dt:
+            window = int(dt[-1].get("up_at_ms", 0)) - int(dt[-1].get("down_at_ms", 0))
+            out.append((window == CRASH_WINDOW_MS, f"V {name}: up_at_ms - down_at_ms == {CRASH_WINDOW_MS} (got {window})"))
+    except Exception as e:  # noqa: BLE001  (reported as a failed check, never swallowed)
+        out.append((False, f"V {name}: {type(e).__name__}: {e}"))
+    return out
+
+
+def speaker_patched(t: ScanTarget, row: dict) -> list[tuple[bool, str]]:
+    """S5, Patched half: benign still works, the trigger gets the row's reply and the
+    connection closes (UDP: the reply datagram), the service never goes down."""
+    name = row["service"]
+    out: list[tuple[bool, str]] = []
+    try:
+        addr = addr_of(t, name)
+        got = exchange(row, addr, row["benign"], len(row["benign_expect"]))
+        out.append((got == row["benign_expect"], f"P {name}: benign exchange unchanged (got {(got or b'')[:16].hex()})"))
+        before = len(t.logs.downtime(name))
+        want = row["p_reply"] or b""
+        if row["proto"] == "udp":
+            reply = udp_exchange(addr, row["trigger"], timeout=1.0)
+            out.append((reply == want, f"P {name}: the trigger is answered {want.hex()} (got {(reply or b'').hex()!r})"))
+        else:
+            bytes_back, eof = tcp_trigger(row, addr)
+            label = want.hex() if want else "nothing (the protocol has no error reply)"
+            out.append((bytes_back == want and eof,
+                        f"P {name}: the trigger gets {label} then the close (got {bytes_back!r}, eof={eof})"))
+        out.append((not is_down(row, addr), f"P {name}: the service stays up (the next exchange succeeds)"))
+        dt = t.logs.downtime(name)
+        out.append((len(dt) == before, f"P {name}: no downtime row (had {before}, now {len(dt)})"))
+    except Exception as e:  # noqa: BLE001
+        out.append((False, f"P {name}: {type(e).__name__}: {e}"))
+    return out
+
+
+def run_concurrently(fn, t: ScanTarget) -> list[list[tuple[bool, str]]]:
+    """`fn(t, row)` for every SPEAKERS row at once; results in table order."""
+    results: list[list[tuple[bool, str]]] = [[] for _ in SPEAKERS]
+
+    def worker(i: int, row: dict) -> None:
+        results[i] = fn(t, row)
+
+    threads = [threading.Thread(target=worker, args=(i, row), name=row["service"], daemon=True)
+               for i, row in enumerate(SPEAKERS)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30.0)
+    for i, th in enumerate(threads):
+        if th.is_alive():
+            results[i].append((False, f"{SPEAKERS[i]['service']}: the check did not finish within 30 s"))
+    return results
+
+
+def check_speakers(v: ScanTarget, p: ScanTarget) -> None:
+    """All nine D5 speakers, the nine Vulnerable crash windows run concurrently."""
+    t0 = time.monotonic()
+    v_results = run_concurrently(speaker_vulnerable, v)
+    p_results = run_concurrently(speaker_patched, p)
+    elapsed = time.monotonic() - t0
+    failed = [m for rows in v_results + p_results for passed, m in rows if not passed]
+    for rows in v_results + p_results:
+        for passed, m in rows:
+            if passed:
+                ok(m)
+    for m in failed:
+        print(f"  [FAIL] {m}", flush=True)
+    check(not failed, f"all nine speakers: V trigger -> 5 s window, P trigger -> the row's reply "
+                      f"({len(failed)} failing assertion(s), {elapsed:.1f} s)")
 
 
 def check_h2_conn_counter(t: ScanTarget) -> None:
@@ -422,7 +712,8 @@ def check_h2_conn_counter(t: ScanTarget) -> None:
     check(rc == 0 and versions == ["2"] * 5,
           f"{m}: five curl --http2 requests in one invocation all negotiated HTTP/2 "
           f"(rc={rc} versions={versions} {err.strip()[:120]})")
-    time.sleep(0.2)
+    until(lambda: len([e for e in t.logs.http() if int(e.get("seq", 0)) > seq0
+                       and e.get("kind") == "request" and e.get("path") == "/preview"]) >= 5, 3.0)
     entries = [e for e in t.logs.http() if int(e.get("seq", 0)) > seq0]
     reqs = sorted((e for e in entries if e.get("kind") == "request" and e.get("path") == "/preview"),
                   key=lambda e: int(e.get("seq", 0)))
@@ -510,22 +801,21 @@ def ws_oversize_header(declared: int) -> bytes:
     return bytes([0x82, 0xFF]) + struct.pack("!Q", declared) + os.urandom(4)
 
 
-def ws_handshake_entry(t: ScanTarget, key: str, tries: int = 15) -> dict:
-    for _ in range(tries):
-        for e in t.logs.ws():
-            if e.get("kind") == "handshake" and e.get("sec_websocket_key") == key:
-                return e
-        time.sleep(0.2)
-    return {}
+def ws_log_entry(t: ScanTarget, pred, timeout: float = 3.0) -> dict:
+    """The first `/log/ws` entry matching `pred`, polled for up to `timeout` s ({} if none)."""
+    def find():
+        return next((e for e in t.logs.ws() if pred(e)), None)
+    return until(find, timeout) or {}
 
 
-def ws_close_entry(t: ScanTarget, conn_id: str | None, tries: int = 15) -> dict:
-    for _ in range(tries):
-        for e in t.logs.ws():
-            if e.get("kind") == "close" and conn_id and e.get("conn_id") == conn_id:
-                return e
-        time.sleep(0.2)
-    return {}
+def ws_handshake_entry(t: ScanTarget, key: str) -> dict:
+    return ws_log_entry(t, lambda e: e.get("kind") == "handshake" and e.get("sec_websocket_key") == key)
+
+
+def ws_close_entry(t: ScanTarget, conn_id: str | None) -> dict:
+    if not conn_id:
+        return {}
+    return ws_log_entry(t, lambda e: e.get("kind") == "close" and e.get("conn_id") == conn_id)
 
 
 def check_ws(v: ScanTarget, p: ScanTarget) -> None:
@@ -640,9 +930,11 @@ def check_cookie_redaction(v: ScanTarget) -> None:
     seq0 = v.logs.reset()
     secret = f"s3cr3t{RUN}"
     http1(v.base, "GET", "/", headers={"cookie": f"session={secret}"})
-    time.sleep(0.2)
-    reqs = [e for e in v.logs.http()
-            if e.get("kind") == "request" and e.get("path") == "/" and int(e.get("seq", 0)) > seq0]
+
+    def logged():
+        return [e for e in v.logs.http()
+                if e.get("kind") == "request" and e.get("path") == "/" and int(e.get("seq", 0)) > seq0]
+    reqs = until(logged, 3.0) or []
     check(len(reqs) == 1, f"one `/` request logged after the reset (got {len(reqs)})")
     entry = reqs[0]
     check(entry.get("cookie_names") == ["session"],
@@ -673,10 +965,10 @@ def main() -> int:
         section("S3: five requests on one h2 connection are one /log/conns row with requests 5")
         check_h2_conn_counter(v)
         check_seeds(v, p)
+        check_seed_rows(v, p)
         check_ws(v, p)
-        section("the TLV speaker's 5 s crash window (V) vs the protocol-error reply (P)")
-        check_tlv_vulnerable(v)
-        check_tlv_patched(p)
+        section("the nine D5 speakers: the 5 s crash window (V) vs the protocol-error reply (P)")
+        check_speakers(v, p)
         section("S6: `/manifest`, `/manifest.yaml` and every seed id are 404 on the target and the control origin")
         check_manifest_404(v, p)
         section("the control log redacts `cookie` to names + a 16-hex hash")
