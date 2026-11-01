@@ -597,8 +597,11 @@ impl<'a> Run<'a> {
                 return Ok(Step::NextPage);
             }
         };
-        // The permit covered the navigation and the DOM read; the per-page work
-        // that follows takes its own as it goes.
+        // The permit covered the navigation and the DOM read, which is the
+        // authority this page needed from the scope guard. The submissions,
+        // clicks and return navigations that follow take no permit of their
+        // own: each is metered by `job.charge(1)` only (orchestrator ruling,
+        // Q6).
         drop(permit);
         self.collect();
 
