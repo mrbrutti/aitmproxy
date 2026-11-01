@@ -280,6 +280,35 @@ What this means for aitmproxy:
   Allow, and possibly a reboot. Proxyman names every one of them in a UI
   string; so should we.
 
+### 4b. App attribution without the extension
+
+```
+nm -u -arch arm64 Contents/Frameworks/ProxymanCore.framework/ProxymanCore | grep -E 'proc_|sysctl|NSRunningApplication'
+strings -a -arch arm64 Contents/Frameworks/ProxymanCore.framework/ProxymanCore | grep -E 'ProcessNameForPID|Client'
+```
+
+The demo video and Matt's screenshots show a real icon and name in the
+`Client` column for **plain system-proxy flows**, with no Network Extension
+installed (`iStat Menus Menubar`, `Proxyman` itself, `Codex (Service)`).
+ProxymanCore imports `proc_listpids`, `proc_pidinfo`, `proc_pidfdinfo`,
+`proc_name`, `proc_pidpath`, `sysctl`, `sysctlbyname`, and
+`NSRunningApplication`; symbols `macProcessNameForPID:`,
+`fullKernelProcessNameForPID:`, `clientName`, and the Swift initializer
+`ProxymanCore.Client.init(name:bundlePath:icon:)`. That is the libproc
+recipe: for a loopback connection whose peer port is known, walk
+`proc_listpids`, ask `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` for each socket
+until one matches the client's local port, then `proc_pidpath` → bundle →
+`NSRunningApplication(processIdentifier:)` for `localizedName` and `icon`
+(`iconForFile:` as the fallback for bare executables such as `dataaccessd`).
+No privilege is needed for the user's own processes; system daemons resolve
+by name only.
+
+What this means for aitmproxy: the `Client —` column in every proxied flow
+of our app (see DELTA.md) is not waiting on the extension. The core (or the
+Mac app, from the flow's `client` address `127.0.0.1:<port>`) can resolve
+the owning process the same way; the extension then only adds the apps that
+never touch the proxy.
+
 ## 5. Entitlements
 
 `codesign -d --entitlements :- <path>` prints `binary contains an invalid
