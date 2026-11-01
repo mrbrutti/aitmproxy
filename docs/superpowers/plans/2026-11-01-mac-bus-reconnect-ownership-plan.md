@@ -398,7 +398,7 @@ Mac: the five-step gate in `apps/mac/CLAUDE.md` plus the two checks this plan ad
      socket.
   2. **Signatures** (exact):
      ```swift
-     func start()                                                           // body: stop(); runTask = Task { await run(generation: runGeneration) }
+     func start()                                                           // body: stop(); runTask = Task { await run(generation: runGeneration) }  (panel fix 346b6a9c: the generation is captured eagerly, `let generation = runGeneration` before the Task, so the run's number is its own by construction)
      func stop()                                                            // today's body plus `runGeneration += 1` — the single bump site
      private func run(generation: Int) async                                // was run()
      private func pollLoop(_ client: BusClient, generation: Int) async throws   // was pollLoop(_:)
