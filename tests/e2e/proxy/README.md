@@ -77,7 +77,10 @@ Python stdlib has no h2 server).
   the exact advice sentence on the empty scope and `decrypting true`, `advice`
   null, after `scope.add`; a `flow.subscribe` on the operator connection receives
   the passthrough row as `created` then `response`, both carrying
-  `tunnel == "passthrough"`.
+  `tunnel == "passthrough"`; and the launch line: booted with an empty Scope, bare
+  `aitm` logs "Nothing is decrypted until a host is in Scope." exactly once (the
+  core's own stdout + stderr, polled briefly after boot in case the line lags the
+  bus endpoint file).
 
 ## The kill-503 regression
 

@@ -36,7 +36,9 @@ push, with the same keys everywhere:
   `client_rejected_certificate` (the client refused the proxy's certificate —
   the usual cause of an empty capture on an untrusted CA), `client_closed`,
   `client_tls_error`, `upstream_unreachable`, `upstream_tls_failed` or
-  `protocol_error`.
+  `protocol_error`. A tunnel relays TLS only: a CONNECT whose first byte inside
+  the tunnel is not a TLS record is refused as `failed` / `protocol_error` and
+  nothing is relayed.
 - `passive`: true for plain HTTP to a host outside Scope. It is shown, but
   nothing acts on it: no script hook, breakpoint rule, mutation or map rule.
 

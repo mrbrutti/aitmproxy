@@ -32,9 +32,10 @@ user's request to keep research docs and memory inside `docs/research`.)
 - Development workflow (7 engines, 7 stages) is defined in `docs/superpowers/WORKFLOW.md`;
   engines live in `.claude/agents/`; `CLAUDE.md` points every session at it (2026-10-27).
 - **Per-host decryption (Matt, 2026-10-31):** the proxy decrypts only hosts in Scope —
-  Scope is the decryption list; an empty Scope decrypts nothing; every other CONNECT is
-  tunnelled byte for byte; and every CONNECT is a visible row (`decrypted` /
-  `passthrough` / `failed` + reason). `tls.passthrough` pins still win; the `scope.add`
+  Scope is the decryption list; an empty Scope decrypts nothing; every other TLS CONNECT
+  is tunnelled (a tunnel relays TLS only: a CONNECT whose first inner byte is not a TLS
+  record is a `failed/protocol_error` row); and every CONNECT is a visible row
+  (`decrypted` / `passthrough` / `failed` + reason). `tls.passthrough` pins still win; the `scope.add`
   agent gate is unchanged. Spec: `docs/superpowers/specs/2026-10-31-per-host-decryption-design.md`.
 
 ## Environment constraints (this machine, 2026-10-26)

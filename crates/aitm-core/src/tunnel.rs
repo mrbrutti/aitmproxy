@@ -58,8 +58,12 @@ pub struct TunnelRequest {
     /// The CONNECT request headers; empty for a raw-TLS connection. Stored on
     /// the row with every credential value redacted (see [`TunnelRow::open`]).
     pub headers: HeaderMap,
-    /// The client side: `tls: true` for a TLS tunnel, `false` for a cleartext
-    /// `CONNECT` the proxy served inside the tunnel.
+    /// The client side. Its `tls` is whether a TLS handshake record has been
+    /// seen from the client: a raw-TLS connection opened with one, so it starts
+    /// `true`; a `CONNECT`'s is `false` until the first byte inside the
+    /// acknowledged tunnel is `0x16` — so a tunnel that failed before that
+    /// byte, and a cleartext `CONNECT` the proxy served inside the tunnel, say
+    /// `false`. Every producer records it the same way.
     pub client: ConnInfo,
     /// The resolved origin when one was dialled; `None` when the tunnel failed
     /// before that.
@@ -232,6 +236,14 @@ fn log_failed(authority: &Authority, reason: Option<TunnelReason>) {
 /// shut down (spec Constraints, panel S2): an idle passthrough must not pin an
 /// open row, a task and two sockets forever.
 pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How long a producer waits, after acknowledging a `CONNECT`, for the first
+/// byte the client sends inside the tunnel (spec D1, panel S7). A client that
+/// acknowledges and then sends nothing would otherwise hold a dialled origin
+/// socket with no row, ahead of [`RELAY_IDLE_TIMEOUT`], which only starts once
+/// the relay does. On elapse the tunnel is recorded as `failed/client_closed`
+/// and both sockets are shut, exactly as for a client that closed instead.
+pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The byte counts of one relayed tunnel: `up` is what was read from the client
 /// toward the origin, `down` what was written to the client from the origin —

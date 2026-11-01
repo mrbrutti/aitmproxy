@@ -69,9 +69,7 @@ pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
 pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
-pub use tunnel::{
-    classify_client_failure, relay, RelayCounts, TunnelRequest, TunnelRow, RELAY_IDLE_TIMEOUT,
-};
+pub use tunnel::{classify_client_failure, relay, RelayCounts, TunnelRequest, TunnelRow};
 pub use value::{Params, Value};
 
 /// The crate version, wired to the Cargo package version.

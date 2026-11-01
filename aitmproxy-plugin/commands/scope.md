@@ -9,7 +9,9 @@ bounds; keep it tight and only ever within the operator's authorization.
 
 **Scope is the decryption list.** The proxy decrypts TLS only for hosts in Scope
 and tunnels every other HTTPS connection byte for byte, so an empty Scope decrypts
-nothing. Every CONNECT is still a row in `flow.table`: `tunnel` is `decrypted`
+nothing. A tunnel relays TLS only: a CONNECT whose first byte inside the tunnel is
+not a TLS record is refused and shown as a `failed` row with `tunnel_reason`
+`protocol_error`. Every CONNECT is still a row in `flow.table`: `tunnel` is `decrypted`
 (its inner requests are their own rows), `passthrough` (`tunnel_reason`
 `out_of_scope` or `pinned`, with `bytes_up` / `bytes_down` and a duration once it
 closes) or `failed` with a reason — `client_rejected_certificate` means the client

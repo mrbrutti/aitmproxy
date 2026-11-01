@@ -321,13 +321,30 @@ pub fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
             let name_len = u16::from_be_bytes([*list.get(1)?, *list.get(2)?]) as usize;
             let name = list.get(3..3 + name_len)?;
             if name_type == 0x00 {
-                return std::str::from_utf8(name).ok().map(str::to_string);
+                return std::str::from_utf8(name)
+                    .ok()
+                    .filter(|name| is_dns_name(name))
+                    .map(str::to_string);
             }
             return None;
         }
         ext = ext.get(4 + ext_len..)?;
     }
     None
+}
+
+/// Whether `name` is what an SNI `host_name` must be (RFC 6066 §3: an ASCII
+/// DNS name, no IP literal): non-empty, at most 253 bytes, every byte an ASCII
+/// letter or digit, `-` or `.`. The SNI keys tunnel rows and is echoed into
+/// error text, so anything else — a control byte, a space, a non-ASCII byte, an
+/// over-long name — is treated as no SNI at all (panel S8). An IDNA name is its
+/// `xn--` A-label on the wire and passes.
+fn is_dns_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -733,5 +750,65 @@ mod tests {
     fn non_tls_bytes_yield_none() {
         assert_eq!(parse_client_hello_sni(b"GET / HTTP/1.1\r\n\r\n"), None);
         assert_eq!(parse_client_hello_sni(b""), None);
+    }
+
+    /// Panel S8, mirroring `Authority`'s `rejects_ascii_control_characters_in_the_host`:
+    /// the SNI is echoed into error text and keyed rows, so only an ASCII DNS
+    /// name is accepted — letters, digits, `-` and `.`, at most 253 bytes. A
+    /// terminal escape or any other control byte, a space, a slash, a colon, a
+    /// non-ASCII byte, an empty name or one past the DNS limit is `None`; a
+    /// plain name, an IDNA `xn--` A-label and a 253-byte name still parse.
+    #[test]
+    fn rejects_sni_that_is_not_an_ascii_dns_name() {
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("\x1b[2Jevil.example")),
+            None,
+            "a terminal escape in the SNI"
+        );
+        for c in [
+            '\x01', '\x07', '\x08', '\x0b', '\x0c', '\x1b', '\x7f', '\0', '\r', '\n', '\t', ' ',
+            '/', ':', '_',
+        ] {
+            let name = format!("evil{c}example.test");
+            assert_eq!(
+                parse_client_hello_sni(&client_hello_with_sni(&name)),
+                None,
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("bücher.example")),
+            None,
+            "a non-ASCII byte (a U-label is not what the wire carries)"
+        );
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("")),
+            None,
+            "an empty name"
+        );
+        let over = format!("{}.example", "a".repeat(246)); // 254 bytes
+        assert_eq!(over.len(), 254);
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni(&over)),
+            None,
+            "254 bytes is past the DNS limit"
+        );
+
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("pinned.example")).as_deref(),
+            Some("pinned.example")
+        );
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("xn--bcher-kva.example")).as_deref(),
+            Some("xn--bcher-kva.example"),
+            "an IDNA A-label is ASCII and parses"
+        );
+        let max = format!("{}.example", "a".repeat(245)); // 253 bytes
+        assert_eq!(max.len(), 253);
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni(&max)).as_deref(),
+            Some(max.as_str()),
+            "253 bytes is the DNS limit and parses"
+        );
     }
 }

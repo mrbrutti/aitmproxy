@@ -17,6 +17,7 @@ use std::task::{Context as TaskCx, Poll};
 use std::time::SystemTime;
 
 use aitm_core::proxy::parse_client_hello_sni;
+use aitm_core::tunnel::FIRST_BYTE_TIMEOUT;
 use aitm_core::{
     classify_client_failure, relay, Authority, Body, CaConfig, ConnInfo, Event, Flow, FlowId,
     FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState,
@@ -300,8 +301,8 @@ impl HttpModule {
     ///   gives (`client_closed` for a client that left, else `protocol_error`);
     /// - an origin that does not resolve → `failed/upstream_unreachable`, with
     ///   no acknowledgement (as before, the client gets no `200` for it);
-    /// - the client gone after the acknowledgement, before its first byte →
-    ///   `failed/client_closed`;
+    /// - the client gone after the acknowledgement, before its first byte — or
+    ///   silent for [`FIRST_BYTE_TIMEOUT`] (panel S7) → `failed/client_closed`;
     /// - cleartext inside an in-scope tunnel → `decrypted` with `client.tls =
     ///   false`, closed when the connection ends.
     ///
@@ -316,8 +317,9 @@ impl HttpModule {
     /// ends the connection with the error and no row: there is nothing to key
     /// a row on ([`fail_before_authority`]). An authority token that does not
     /// parse is recorded under the label `Authority::new(raw, 443)` — the raw
-    /// text, lowercased, as the host — so the operator sees what the client
-    /// asked for; it is never dialled.
+    /// text with every ASCII control byte dropped, lowercased, as the host — so
+    /// the operator sees what the client asked for and no escape byte rides on
+    /// the row; it is never dialled.
     async fn tunnel(
         &self,
         mut client: Prefixed<ByteStream>,
@@ -350,8 +352,13 @@ impl HttpModule {
         let authority = match Authority::parse_with_default(&raw, DEFAULT_TLS_PORT) {
             Ok(authority) => authority,
             Err(e) => {
+                // The row's label is the raw token with every ASCII control
+                // byte dropped (a terminal escape must never ride on
+                // `request.authority` into a table or a session file; the
+                // error below still names the token as sent, Debug-escaped).
+                let label: String = raw.chars().filter(|c| !c.is_ascii_control()).collect();
                 let head = TunnelHead {
-                    authority: Authority::new(&raw, DEFAULT_TLS_PORT),
+                    authority: Authority::new(&label, DEFAULT_TLS_PORT),
                     headers,
                     opened_at,
                 };
@@ -382,9 +389,12 @@ impl HttpModule {
         let next = match first_byte_after_ack(&mut client).await {
             Ok(Some(next)) => next,
             Ok(None) => {
-                // EOF before the first byte: a speculative pre-connect, a client
-                // that gave up. A row, but not an error worth the acceptor's log.
+                // EOF — or silence for `FIRST_BYTE_TIMEOUT` — before the first
+                // byte: a speculative pre-connect, a client that gave up. A row,
+                // but not an error worth the acceptor's log; the client is shut
+                // so a silent one sees EOF (nothing was dialled yet).
                 fail_tunnel(&ctx, request, TunnelReason::ClientClosed).await;
+                let _ = client.shutdown().await;
                 return Ok(());
             }
             Err(e) => {
@@ -826,10 +836,16 @@ async fn acknowledge<S: AsyncWrite + Unpin>(client: &mut S) -> io::Result<()> {
 
 /// Acknowledge the `CONNECT` and look at the first byte the client then sends
 /// inside the tunnel without consuming it — `None` when the client closed
-/// instead. What the tunnel becomes is decided on that byte (spec D1/D6).
+/// instead, or sent nothing within [`FIRST_BYTE_TIMEOUT`] (panel S7: a client
+/// that is acknowledged and goes silent must not hold a dialled origin with no
+/// row; it is treated as gone). What the tunnel becomes is decided on that byte
+/// (spec D1/D6).
 async fn first_byte_after_ack(client: &mut Prefixed<ByteStream>) -> io::Result<Option<u8>> {
     acknowledge(client).await?;
-    Ok(client.peek(1).await?.first().copied())
+    match tokio::time::timeout(FIRST_BYTE_TIMEOUT, client.peek(1)).await {
+        Ok(peeked) => Ok(peeked?.first().copied()),
+        Err(_elapsed) => Ok(None),
+    }
 }
 
 /// Spec D1/D2/D5: a tunnel whose authority is outside the live Scope is not
@@ -837,8 +853,9 @@ async fn first_byte_after_ack(client: &mut Prefixed<ByteStream>) -> io::Result<O
 /// dialled through the connector (a failure there is
 /// `failed/upstream_unreachable`, answered with nothing). On the `CONNECT`
 /// path (`connect`) the acknowledgement is then written and the first byte the
-/// client sends must open a TLS handshake record (`0x16`): EOF before it is
-/// `failed/client_closed` (a speculative pre-connect; a row, not an error), any
+/// client sends must open a TLS handshake record (`0x16`): EOF before it — or
+/// silence for [`FIRST_BYTE_TIMEOUT`] (panel S7) — is `failed/client_closed`
+/// (a speculative pre-connect; a row, not an error; both sockets shut), any
 /// other byte is `failed/protocol_error` with nothing relayed and the client
 /// shut down — the proxy is not a raw relay to an arbitrary `host:port` (panel
 /// S1) — and the row's `client.tls` is set only once that byte was seen. A
@@ -891,7 +908,12 @@ async fn relay_out_of_scope(
                 );
             }
             Ok(None) => {
+                // EOF — or silence for `FIRST_BYTE_TIMEOUT` — before the first
+                // byte: the same row; both sockets shut so neither the dialled
+                // origin nor a silent client is left waiting on the other.
                 fail_tunnel(ctx, request, TunnelReason::ClientClosed).await;
+                let _ = client.shutdown().await;
+                let _ = upstream.shutdown().await;
                 return Ok(());
             }
             Err(e) => {
@@ -7260,6 +7282,7 @@ mod tests {
 
         use super::attribution::{read_one_200, test_ca};
         use super::*;
+        use aitm_core::tunnel::FIRST_BYTE_TIMEOUT;
         use aitm_core::{
             Chain, FlowCtx, Plugin, Registry, ResumeHandle, ScopeEntry, ScopeRateGuard, StdGuard,
             TunnelInfo, TunnelMode, TunnelReason,
@@ -8963,6 +8986,129 @@ mod tests {
             assert_eq!(store.count(), 1);
         }
 
+        /// Panel S7 on the module's own relay: a client that is acknowledged and
+        /// then sends nothing holds the dialled origin with no row — for
+        /// `FIRST_BYTE_TIMEOUT` (30 s) and not a moment longer. The clock is
+        /// paused: 31 s later the module has recorded a `failed/client_closed` row
+        /// carrying the dialled origin, `client.tls` is `false`, both sockets are
+        /// shut (the still-open client and the origin each read EOF) and `spawn`
+        /// returns `Ok`, exactly as for a client that closed.
+        #[tokio::test(start_paused = true)]
+        async fn silent_client_after_the_ack_is_a_failed_client_closed_row_at_the_first_byte_timeout(
+        ) {
+            assert_eq!(FIRST_BYTE_TIMEOUT, Duration::from_secs(30));
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, _dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                tokio::time::advance(Duration::from_secs(31)).await;
+                let mut rest = Vec::new();
+                client
+                    .read_to_end(&mut rest)
+                    .await
+                    .expect("client read after the module gave up");
+                let mut got = Vec::new();
+                origin.read_to_end(&mut got).await.expect("origin read");
+                (rest, got)
+            };
+            // The clock is paused, so this guard fires (by auto-advance) only if
+            // the module is still waiting past the bound: a hang is a failure.
+            let (served, (rest, got)) = tokio::time::timeout(Duration::from_secs(60), async {
+                tokio::join!(serving, script)
+            })
+            .await
+            .expect("the module did not give up on the silent client within 60 s");
+            served.expect("a client that stays silent is not an error");
+            assert_eq!(
+                rest, b"",
+                "the client was shut down with nothing after the ack"
+            );
+            assert_eq!(got, b"", "the origin was shut down with nothing relayed");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert_failed(row, TunnelReason::ClientClosed);
+            assert!(!row.client_conn.tls, "no TLS handshake record was seen");
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer()),
+                "the origin had been dialled"
+            );
+            assert_eq!(store.count(), 1);
+        }
+
+        /// The bound is 30 s, not less: a first byte that arrives 29 s after the
+        /// acknowledgement is waited for and relayed like one that came at once —
+        /// a `passthrough/out_of_scope` row with exact counts, `client.tls` true.
+        #[tokio::test(start_paused = true)]
+        async fn first_byte_at_29_seconds_is_still_relayed() {
+            const RECORD: &[u8] = &[TLS_HANDSHAKE, 0x03, 0x01, 0x00, 0x03, b'a', b'b', b'c'];
+            const REPLY: &[u8] = &[TLS_HANDSHAKE, 0x03, 0x03, 0x00, 0x02, b'o', b'k'];
+            assert_eq!(FIRST_BYTE_TIMEOUT, Duration::from_secs(30));
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, _dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                tokio::time::advance(Duration::from_secs(29)).await;
+                assert!(tunnel_rows(&store).is_empty(), "no row yet: still waiting");
+                client.write_all(RECORD).await.expect("the late record");
+                let mut got = vec![0u8; RECORD.len()];
+                origin
+                    .read_exact(&mut got)
+                    .await
+                    .expect("the late record reaches the origin");
+                assert_eq!(got, RECORD);
+                origin.write_all(REPLY).await.expect("origin replies");
+                let mut reply = vec![0u8; REPLY.len()];
+                client
+                    .read_exact(&mut reply)
+                    .await
+                    .expect("the reply reaches the client");
+                assert_eq!(reply, REPLY);
+                drop(client);
+                let mut rest = Vec::new();
+                origin.read_to_end(&mut rest).await.expect("origin read");
+                assert!(rest.is_empty());
+                drop(origin);
+            };
+            let (served, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+                tokio::join!(serving, script)
+            })
+            .await
+            .expect("the relay hung");
+            served.expect("a tunnel both ends closed is a clean close");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(
+                row.metadata.tunnel,
+                Some(TunnelInfo {
+                    mode: TunnelMode::Passthrough,
+                    reason: Some(TunnelReason::OutOfScope),
+                    bytes_up: Some(8),
+                    bytes_down: Some(7),
+                })
+            );
+            assert_eq!(status(row), Some(200));
+            assert!(row.client_conn.tls, "a 0x16 first byte was seen");
+            assert!(row.metadata.duration.is_some());
+        }
+
         /// The decided-on bytes are not lost: a client that sends its TLS record
         /// right behind the CONNECT head — before the acknowledgement, as browsers
         /// do — has the whole record relayed to the origin first and counted:
@@ -9033,8 +9179,8 @@ mod tests {
                 Some(TunnelInfo {
                     mode: TunnelMode::Passthrough,
                     reason: Some(TunnelReason::OutOfScope),
-                    bytes_up: Some(RECORD.len() as u64),
-                    bytes_down: Some(REPLY.len() as u64),
+                    bytes_up: Some(10),
+                    bytes_down: Some(7),
                 }),
                 "the first byte is counted with the rest"
             );
@@ -9613,9 +9759,10 @@ mod tests {
         /// byte (a terminal escape) is refused before anything is acknowledged or
         /// dialled — `Authority` rejects it — and the error the acceptor logs
         /// carries the raw text Debug-escaped: no raw escape byte reaches a log
-        /// line. The row is `failed/protocol_error` under the raw label the module
-        /// records for an unparseable token (lowercased, the byte kept — pinned
-        /// here so a change to that label is a knowing one).
+        /// line. The row is `failed/protocol_error` under the label the module
+        /// records for an unparseable token — the raw text with every ASCII
+        /// control byte dropped, lowercased (Tester T8: `request.authority` never
+        /// carries a control byte; the error text still names the token as sent).
         #[tokio::test]
         async fn connect_authority_with_a_control_byte_is_refused_with_an_escaped_error() {
             let module = HttpModule::with_ca(test_ca()).with_insecure(true);
@@ -9653,14 +9800,18 @@ mod tests {
             assert_eq!(rows.len(), 1);
             let row = &rows[0];
             assert_failed(row, TunnelReason::ProtocolError);
-            // The raw label as `Authority::new(raw, 443)` prints it today: the
-            // token kept a colon, so `Display` brackets it like an IPv6 literal
-            // (`[host:port]:443`), control byte and all. Pinned so a change to
-            // that label is a knowing one (Tester finding: the label misleads;
-            // `log_failed` is the only place it is escaped).
+            // The label as `Authority::new(<raw minus control bytes>, 443)`
+            // prints it: `\x1b` dropped, the leading `[` trimmed as an IPv6
+            // bracket, lowercased; the token kept a colon, so `Display` brackets
+            // it like an IPv6 literal (`[host:port]:443`).
             assert_eq!(
-                row.request.authority, "[\x1b[2jevil.example:443]:443",
-                "the raw label, lowercased and bracketed"
+                row.request.authority, "[2jevil.example:443]:443",
+                "the raw label with the control byte stripped, lowercased and bracketed"
+            );
+            assert!(
+                !row.request.authority.chars().any(|c| c.is_ascii_control()),
+                "no control byte on the row: {:?}",
+                row.request.authority
             );
             assert_eq!(row.request.headers.get("host"), Some("evil.example:443"));
             assert!(!row.client_conn.tls);

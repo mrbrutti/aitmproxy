@@ -15,10 +15,11 @@
 //!
 //! A passthrough relays **TLS only** (spec D1): after the acknowledgement the
 //! first byte the client sends must open a TLS handshake record (`0x16`), for a
-//! pinned host as much as an out-of-scope one. EOF before it is a client that
-//! gave up; any other byte is refused with nothing relayed, so the proxy never
-//! becomes a raw relay to an arbitrary `host:port`. A raw TLS connection (SNI,
-//! no CONNECT) is TLS by construction: the acceptor matched its ClientHello.
+//! pinned host as much as an out-of-scope one. EOF before it — or silence for
+//! `FIRST_BYTE_TIMEOUT` (30 s) — is a client that gave up; any other byte is
+//! refused with nothing relayed, so the proxy never becomes a raw relay to an
+//! arbitrary `host:port`. A raw TLS connection (SNI, no CONNECT) is TLS by
+//! construction: the acceptor matched its ClientHello.
 //!
 //! Every connection it claims is a **tunnel row** (spec D5) recorded through the
 //! shared recorder in [`aitm_core::tunnel`]: a `CONNECT host:port` flow whose
@@ -33,8 +34,11 @@
 //! without an acknowledgement; an acknowledgement the client is no longer there
 //! to read, or a client gone before its first byte (`client_closed`); a first
 //! byte that is not TLS (`protocol_error`). The row's headers are the CONNECT
-//! head's; a captured connection's attribution (`source_app`,
-//! `capture_interface`) is carried over.
+//! head's; its `client.tls` says whether a TLS handshake record was seen from
+//! the client (a raw TLS connection opened with one; a CONNECT's is `false`
+//! until its first byte inside the tunnel is `0x16`, so a tunnel that failed
+//! before that says `false`); a captured connection's attribution
+//! (`source_app`, `capture_interface`) is carried over.
 
 use std::io;
 use std::net::SocketAddr;
@@ -43,6 +47,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskCx, Poll};
 use std::time::SystemTime;
 
+use aitm_core::tunnel::FIRST_BYTE_TIMEOUT;
 use aitm_core::{
     classify_client_failure, relay, Authority, ByteStream, ConnInfo, HeaderMap, ModuleCtx,
     NextLayerHint, ProtocolModule, ScopeRateGuard, TunnelInfo, TunnelReason, TunnelRequest,
@@ -60,8 +65,10 @@ const MAX_CONNECT_HEAD: usize = 16 * 1024;
 /// inside an acknowledged tunnel must be for the tunnel to be relayed (spec D1).
 const TLS_HANDSHAKE: u8 = 0x16;
 /// The most of the client's first bytes read ahead of the relay to decide on
-/// them: one TLS record (a 5-byte header and at most 2^14 bytes of payload).
-const FIRST_READ: usize = 5 + 16 * 1024;
+/// them. The decision needs one byte; whatever else that read yields is put
+/// back in front of the relay (`Replayed`), so a small buffer loses nothing and
+/// the rest of a large first write flows through `relay` as usual.
+const FIRST_READ: usize = 4 * 1024;
 
 /// Tunnels a TLS connection byte-for-byte when its host is on the shared
 /// passthrough list **or not in Scope**, instead of decrypting it (spec D1/D2).
@@ -107,9 +114,10 @@ impl PassthroughModule {
     /// duration). Every earlier exit is a `failed` row: a head that cannot be
     /// read or parsed (`client_closed` / `protocol_error`, keyed on the authority
     /// the acceptor peeked), a dial failure (`upstream_unreachable`), an
-    /// acknowledgement that cannot be written or a client gone before its first
-    /// byte (`client_closed`), a first byte that does not open a TLS handshake
-    /// record (`protocol_error`, nothing relayed — spec D1, panel S1).
+    /// acknowledgement that cannot be written or a client gone — or silent for
+    /// `FIRST_BYTE_TIMEOUT` — before its first byte (`client_closed`), a first
+    /// byte that does not open a TLS handshake record (`protocol_error`,
+    /// nothing relayed — spec D1, panel S1).
     async fn tunnel(&self, mut client: ByteStream, ctx: ModuleCtx) -> Result<()> {
         // The row's `created`, and what its `duration` is measured from.
         let opened_at = SystemTime::now();
@@ -125,7 +133,11 @@ impl PassthroughModule {
                 peer,
                 sni: hint.and_then(|h| h.client_hello_sni.clone()),
                 alpn: None,
-                tls: true,
+                // Whether a TLS handshake record has been seen from the client
+                // (`TunnelRequest::client`): a raw TLS connection opened with
+                // one; a CONNECT's is unknown until its first byte inside the
+                // tunnel, so a row for a failure before that says `false`.
+                tls: !is_connect,
                 established: opened_at,
             },
             opened_at,
@@ -216,35 +228,43 @@ impl PassthroughModule {
         // acknowledged tunnel must open a TLS handshake record. The stream has
         // no peek, so what the first read yields is kept and put back in front
         // of the relay (`Replayed`): the origin receives it first and `bytes_up`
-        // counts it. A raw TLS connection needs no check — the acceptor matched
-        // its ClientHello, which is what it opens with.
+        // counts it. The wait is bounded by `FIRST_BYTE_TIMEOUT` (panel S7). A
+        // raw TLS connection needs no check — the acceptor matched its
+        // ClientHello, which is what it opens with.
         let mut client = if is_connect {
             let mut first = vec![0u8; FIRST_READ];
-            let n = match client.read(&mut first).await {
-                Ok(n) => n,
-                Err(err) => {
+            let n = match tokio::time::timeout(FIRST_BYTE_TIMEOUT, client.read(&mut first)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) => {
                     let err = anyhow::Error::from(err)
                         .context("passthrough: reading the first byte inside the tunnel");
                     TunnelRow::open(&ctx, req, TunnelInfo::failed(classify_client_failure(&err)))
                         .await;
                     return Err(err);
                 }
+                // Silent for the whole bound: treated as a client that is gone,
+                // the same as an EOF (no byte to decide on).
+                Err(_elapsed) => 0,
             };
             first.truncate(n);
             match first.first() {
-                Some(&TLS_HANDSHAKE) => {}
+                Some(&TLS_HANDSHAKE) => req.client.tls = true,
                 None => {
-                    // EOF before the first byte: a speculative pre-connect, a
-                    // client that gave up. A row, but not an error worth a log.
+                    // EOF — or silence for `FIRST_BYTE_TIMEOUT` — before the first
+                    // byte: a speculative pre-connect, a client that gave up. A
+                    // row, but not an error worth a log; both sockets shut so
+                    // neither the dialled origin nor a silent client is left
+                    // waiting on the other.
                     TunnelRow::open(&ctx, req, TunnelInfo::failed(TunnelReason::ClientClosed))
                         .await;
+                    let _ = client.shutdown().await;
+                    let _ = upstream.shutdown().await;
                     return Ok(());
                 }
                 Some(&other) => {
                     // Not TLS (`curl -p http://…`): the proxy is not a raw relay
                     // to an arbitrary host. Nothing has reached the origin.
                     let authority = req.authority.to_string();
-                    req.client.tls = false;
                     TunnelRow::open(&ctx, req, TunnelInfo::failed(TunnelReason::ProtocolError))
                         .await;
                     let _ = client.shutdown().await;
@@ -476,6 +496,7 @@ fn parse_connect(head: &[u8]) -> Result<(String, HeaderMap)> {
 mod tests {
     use std::sync::Arc;
 
+    use aitm_core::tunnel::FIRST_BYTE_TIMEOUT;
     use aitm_core::{Authority, ScopeEntry, ScopeRateGuard, StdGuard, TunnelReason};
 
     use super::*;
@@ -1168,6 +1189,10 @@ mod tests {
             Some(TunnelInfo::failed(TunnelReason::ClientClosed))
         );
         assert!(row.metadata.duration.is_some());
+        assert!(
+            !row.client_conn.tls,
+            "no TLS handshake record was seen from the client (Q13/S9)"
+        );
         assert_eq!(
             row.server_conn.as_ref().map(|s| s.peer),
             Some(origin_addr()),
@@ -1334,6 +1359,10 @@ mod tests {
             Some(TunnelInfo::failed(TunnelReason::ClientClosed))
         );
         assert!(row.metadata.duration.is_some());
+        assert!(
+            !row.client_conn.tls,
+            "no TLS handshake record was seen from the client (Q13/S9)"
+        );
         assert_eq!(
             row.server_conn.as_ref().map(|s| s.peer),
             Some(origin_addr()),
@@ -1403,8 +1432,8 @@ mod tests {
             Some(TunnelInfo {
                 mode: TunnelMode::Passthrough,
                 reason: Some(TunnelReason::OutOfScope),
-                bytes_up: Some(1 + REST.len() as u64),
-                bytes_down: Some(DOWN.len() as u64),
+                bytes_up: Some(10),
+                bytes_down: Some(10),
             }),
             "the first byte is counted with the rest"
         );
@@ -1596,7 +1625,7 @@ mod tests {
     }
 
     /// Oversized first write: a client that sends far more than the module reads
-    /// ahead to decide (one record, 16 KiB + 5) — 128 KiB + 1, more than the
+    /// ahead to decide (`FIRST_READ`, 4 KiB) — 128 KiB + 1, more than the
     /// duplex buffers hold at once — loses nothing: the read-ahead goes first,
     /// the remainder follows from the stream in order, back-pressure and all,
     /// and `bytes_up` is the exact total.
@@ -1724,6 +1753,128 @@ mod tests {
         assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
     }
 
+    /// Panel S7: a client that is acknowledged and then sends nothing holds a
+    /// dialled origin with no row — for `FIRST_BYTE_TIMEOUT` (30 s) and not a
+    /// moment longer. The clock is paused: 31 s later the module has recorded a
+    /// `failed/client_closed` row carrying the dialled origin, `client.tls` is
+    /// `false`, both sockets are shut (the still-open client and the origin each
+    /// read EOF) and `spawn` returns `Ok`, exactly as for a client that closed.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_after_the_ack_is_a_failed_client_closed_row_at_the_first_byte_timeout() {
+        assert_eq!(FIRST_BYTE_TIMEOUT, std::time::Duration::from_secs(30));
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        // The clock is paused, so this guard fires (by auto-advance) only if the
+        // module is still waiting past the bound: a hang becomes a failure.
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.finish())
+            .await
+            .expect("the module did not give up on the silent client within 60 s")
+            .expect("a client that stays silent is not an error");
+
+        let mut rest = Vec::new();
+        client
+            .read_to_end(&mut rest)
+            .await
+            .expect("client read after the module gave up");
+        assert_eq!(
+            rest, b"",
+            "the client was shut down with nothing after the ack"
+        );
+        let mut got = Vec::new();
+        origin.read_to_end(&mut got).await.expect("origin read");
+        assert_eq!(got, b"", "the origin was shut down with nothing relayed");
+
+        let row = h.row();
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert!(row.response.is_none(), "no 200 on a failed tunnel");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ClientClosed))
+        );
+        assert!(row.metadata.duration.is_some(), "closed on insert");
+        assert!(!row.client_conn.tls, "no TLS handshake record was seen");
+        assert_eq!(
+            row.server_conn.as_ref().map(|s| s.peer),
+            Some(origin_addr()),
+            "the origin had been dialled"
+        );
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// The bound is 30 s, not less: a first byte that arrives 29 s after the
+    /// acknowledgement is waited for and relayed like one that came at once —
+    /// a `passthrough/out_of_scope` row with exact counts, `client.tls` true.
+    #[tokio::test(start_paused = true)]
+    async fn first_byte_at_29_seconds_is_still_relayed() {
+        assert_eq!(FIRST_BYTE_TIMEOUT, std::time::Duration::from_secs(30));
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        assert!(h.store.list().is_empty(), "no row yet: still waiting");
+        assert!(!h.task.is_finished(), "the module is still waiting at 29 s");
+
+        client.write_all(UP).await.expect("the late record");
+        let mut up = vec![0u8; UP.len()];
+        origin
+            .read_exact(&mut up)
+            .await
+            .expect("the late record reaches the origin");
+        assert_eq!(up, UP);
+        origin.write_all(DOWN).await.expect("origin writes");
+        let mut down = vec![0u8; DOWN.len()];
+        client
+            .read_exact(&mut down)
+            .await
+            .expect("origin bytes reach the client");
+        assert_eq!(down, DOWN);
+        drop(client);
+        drop(origin);
+        tokio::time::timeout(std::time::Duration::from_secs(60), h.finish())
+            .await
+            .expect("the relay hung")
+            .expect("a clean close is not an error");
+
+        let row = h.row();
+        assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo {
+                mode: TunnelMode::Passthrough,
+                reason: Some(TunnelReason::OutOfScope),
+                bytes_up: Some(10),
+                bytes_down: Some(10),
+            })
+        );
+        assert!(row.client_conn.tls, "a 0x16 first byte was seen");
+        assert!(row.metadata.duration.is_some());
+    }
+
     /// Connection drop mid-stream, at the first-byte read: the client resets
     /// right after the acknowledgement. The read fails with the reset: a
     /// `failed/client_closed` row carrying the dialled origin, nothing relayed,
@@ -1776,14 +1927,9 @@ mod tests {
             Some(TunnelInfo::failed(TunnelReason::ClientClosed))
         );
         assert!(row.metadata.duration.is_some(), "closed on insert");
-        // Panel re-check Q13/S9 (OPEN micro-fix): this producer still reports
-        // `client.tls = true` for a CONNECT that failed before any inner byte,
-        // where the HTTP module reports `false`. Pinned to today's value so the
-        // fix flips it knowingly; the spec's answer is `false` (no handshake
-        // record was seen).
         assert!(
-            row.client_conn.tls,
-            "Q13/S9 landed: flip this assertion to `!row.client_conn.tls`"
+            !row.client_conn.tls,
+            "no TLS handshake record was seen from the client (Q13/S9)"
         );
         assert_eq!(
             row.server_conn.as_ref().map(|s| s.peer),
