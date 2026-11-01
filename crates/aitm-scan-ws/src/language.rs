@@ -31,8 +31,10 @@
 //! line or a `Debug` output: a bad header is named, never quoted, and a refused
 //! upgrade is reported by status alone.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::rc::Rc;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,14 +46,16 @@ use aitm_plugin::language::{
     PocStepHandler, ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use aitm_scan_model::{Frame, FrameKind};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 
-use crate::dialer::{DialError, DialLimits, DialOutcome, WsConn, WsDialer, REGENERATED_HEADERS};
-use crate::transport::TcpTransport;
-use crate::types::{
-    authority_with_port, TlsPolicy, HANDLE_IDLE_REAP, MAX_HANDLES, RECV_TIMEOUT_CAP_MS,
+use crate::dialer::{
+    request_authority, DialError, DialLimits, DialOutcome, WsConn, WsDialer, REGENERATED_HEADERS,
 };
+use crate::transport::TcpTransport;
+use crate::types::{TlsPolicy, HANDLE_IDLE_REAP, MAX_HANDLES, RECV_TIMEOUT_CAP_MS};
 
 /// The namespace this crate contributes: the `ws.*` host fns.
 pub const NAMESPACE: &str = "ws";
@@ -76,9 +80,13 @@ const REPLY_GRACE: Duration = Duration::from_secs(2);
 const REAP_TICK: Duration = Duration::from_secs(5);
 
 /// Why a `ws.dial` is refused once [`MAX_HANDLES`] are open (plan call 24).
-const HANDLE_BOUND_REASON: &str = "4 handles already open; close one first";
+///
+/// Built from the constant so the number can never drift from the bound.
+fn handle_bound_reason() -> String {
+    format!("{MAX_HANDLES} handles already open; close one first")
+}
 
-/// A [`MAX_HANDLES`]-bounded reply window: `ms` clamped into
+/// A [`RECV_TIMEOUT_CAP_MS`]-bounded reply window: `ms` clamped into
 /// `0..=`[`RECV_TIMEOUT_CAP_MS`].
 ///
 /// A script cannot park a worker thread for longer than the cap however large
@@ -356,7 +364,7 @@ fn dial(link: &DriverLink, args: &[Value]) -> Result<Value, HostError> {
         }
     };
     let request = build_request(url, options.get("headers"))?;
-    let authority = authority_of(&request);
+    let authority = request_authority(&request);
 
     let sender = link.start()?;
     let handle = link.ask(&sender, DIAL_TIMEOUT + REPLY_GRACE, |reply| {
@@ -472,17 +480,28 @@ fn frame_value(frame: Frame) -> Value {
 /// meaningless and a forged `Host` would lie about the authority the guard just
 /// admitted. Errors name the offending header, never its value.
 fn build_request(url: &str, headers: Option<&Value>) -> Result<Request<()>, HostError> {
-    let scheme_ok = url.len() >= 5
-        && (url[..5].eq_ignore_ascii_case("ws://")
-            || (url.len() >= 6 && url[..6].eq_ignore_ascii_case("wss://")));
+    // Byte slices, never `str` indices: byte 5 or 6 of `url` can fall inside a
+    // multi-byte char, which `url[..5]`/`url[..6]` would panic on (findings
+    // Q1/S4). `get` yields `None` for a short url, which is simply not a scheme.
+    let bytes = url.as_bytes();
+    let scheme_ok = bytes
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"ws://"))
+        || bytes
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"wss://"));
     if !scheme_ok {
-        return Err(HostError::BadArgs(format!(
-            "ws.dial needs a ws:// or wss:// url, not {url}"
-        )));
+        // The url is never echoed: it can carry userinfo and a query (S6).
+        return Err(HostError::BadArgs(
+            "the url must be ws:// or wss://".to_string(),
+        ));
     }
     let mut request = url
         .into_client_request()
-        .map_err(|err| HostError::BadArgs(format!("{url} is not a websocket url: {err}")))?;
+        .map_err(|_| HostError::BadArgs("the url has no host".to_string()))?;
+    if request.uri().host().unwrap_or_default().is_empty() {
+        return Err(HostError::BadArgs("the url has no host".to_string()));
+    }
 
     let fields = match headers {
         None | Some(Value::Null) => return Ok(request),
@@ -517,20 +536,6 @@ fn build_request(url: &str, headers: Option<&Value>) -> Result<Request<()>, Host
         request.headers_mut().insert(name, header);
     }
     Ok(request)
-}
-
-/// The `host:port` the guard will be asked about, for the refusal reason.
-///
-/// Mirrors [`WsDialer::dial_request`]'s own derivation so the reason names the
-/// authority the guard actually saw.
-fn authority_of(request: &Request<()>) -> String {
-    let uri = request.uri();
-    let scheme = uri.scheme_str().unwrap_or("ws");
-    let host = uri.host().unwrap_or_default();
-    match uri.port_u16() {
-        Some(port) => format!("{host}:{port}"),
-        None => authority_with_port(scheme, host),
-    }
 }
 
 /// The variant name of a [`GuardError`], for the refusal reason (plan call 24).
@@ -589,6 +594,13 @@ enum DriverCmd {
         handle: i64,
         reply: SyncSender<Result<(), HostError>>,
     },
+    /// Test-only: report `(recorded, unrecorded)` frame counts for a handle,
+    /// draining its record as it reads it (security finding S5).
+    #[cfg(test)]
+    Inspect {
+        handle: i64,
+        reply: SyncSender<Result<(usize, usize), HostError>>,
+    },
 }
 
 /// The host fns' side of the driver: the live state plus the channel to it.
@@ -600,29 +612,34 @@ enum DriverCmd {
 struct DriverLink {
     guard: Arc<dyn ScopeRateGuard>,
     dialer: Arc<WsDialer>,
-    sender: Mutex<Option<Sender<DriverCmd>>>,
+    sender: Mutex<Option<UnboundedSender<DriverCmd>>>,
 }
 
 impl DriverLink {
     /// The channel to the driver, starting the thread if this is the first call.
-    fn start(&self) -> Result<Sender<DriverCmd>, HostError> {
+    ///
+    /// The command channel is a `tokio::sync::mpsc`: its async `recv` is what
+    /// lets the driver's [`tokio::task::LocalSet`] loop wait for a command and
+    /// still drive the in-flight ones (Q3), while the reply half of each command
+    /// stays a bounded `std::sync::mpsc` the host fn blocks on.
+    fn start(&self) -> Result<UnboundedSender<DriverCmd>, HostError> {
         let mut slot = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(sender) = slot.as_ref() {
             return Ok(sender.clone());
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let guard = Arc::clone(&self.guard);
         let dialer = Arc::clone(&self.dialer);
         thread::Builder::new()
             .name("aitm-ws-script".to_string())
-            .spawn(move || run_driver(&receiver, &guard, &dialer))
+            .spawn(move || run_driver(receiver, guard, dialer))
             .map_err(|_| driver_unavailable())?;
         *slot = Some(sender.clone());
         Ok(sender)
     }
 
     /// The channel to the driver, or `None` when no `ws.dial` has run yet.
-    fn started(&self) -> Option<Sender<DriverCmd>> {
+    fn started(&self) -> Option<UnboundedSender<DriverCmd>> {
         self.sender
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -636,7 +653,7 @@ impl DriverLink {
     /// thread a script is waiting on.
     fn ask<T>(
         &self,
-        sender: &Sender<DriverCmd>,
+        sender: &UnboundedSender<DriverCmd>,
         wait: Duration,
         command: impl FnOnce(SyncSender<Result<T, HostError>>) -> DriverCmd,
     ) -> Result<T, HostError> {
@@ -659,15 +676,19 @@ struct OpenHandle {
     last_used: Instant,
 }
 
-/// The driver thread: a current-thread runtime and the open connections.
+/// The driver thread: a current-thread runtime running a [`tokio::task::LocalSet`].
 ///
-/// `std::sync::mpsc` blocks the thread, so the loop waits for a command
-/// *outside* the runtime and enters it per command; the [`REAP_TICK`] timeout
-/// doubles as the idle sweep.
+/// Commands arrive on a `tokio::sync::mpsc` and each is handled in its own
+/// [`tokio::task::spawn_local`] task, so a slow command on one handle (a long
+/// `ws.recv`) never blocks a command on another (Q3). Commands on the *same*
+/// handle still serialise, because each handle lives behind its own
+/// [`AsyncMutex`]. The reaper is a separate task on the [`REAP_TICK`]. When the
+/// last [`DriverLink`] drops, the command channel closes, the loop ends, and
+/// every open handle is closed before the runtime drops.
 fn run_driver(
-    commands: &Receiver<DriverCmd>,
-    guard: &Arc<dyn ScopeRateGuard>,
-    dialer: &Arc<WsDialer>,
+    mut commands: UnboundedReceiver<DriverCmd>,
+    guard: Arc<dyn ScopeRateGuard>,
+    dialer: Arc<WsDialer>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -681,183 +702,255 @@ fn run_driver(
             return;
         }
     };
-    let mut state = DriverState {
+    let state = Rc::new(RefCell::new(DriverState {
         handles: HashMap::new(),
         next_handle: 1,
-    };
-    loop {
-        match commands.recv_timeout(REAP_TICK) {
-            Ok(command) => runtime.block_on(state.run(command, guard, dialer)),
-            Err(RecvTimeoutError::Timeout) => runtime.block_on(state.reap()),
-            Err(RecvTimeoutError::Disconnected) => break,
+        dialing: 0,
+    }));
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        // The reaper runs independently of the command stream.
+        let reaper_state = Rc::clone(&state);
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(REAP_TICK).await;
+                reap(&reaper_state).await;
+            }
+        });
+        while let Some(command) = commands.recv().await {
+            let state = Rc::clone(&state);
+            let guard = Arc::clone(&guard);
+            let dialer = Arc::clone(&dialer);
+            tokio::task::spawn_local(handle_command(state, guard, dialer, command));
         }
-    }
-    // The language is gone: close what is still open before the runtime drops.
-    runtime.block_on(state.close_all());
+        // The language is gone. In-flight command tasks are still driven by this
+        // LocalSet, so awaiting a handle's lock here cannot deadlock.
+        close_all(&state).await;
+    });
 }
 
-/// The driver's own state: the open handles and the next handle number.
+/// The driver's own state: the open handles, the next handle number, and how
+/// many dials are in flight — counted so concurrent dials cannot exceed the
+/// bound while their sockets are still opening.
 struct DriverState {
-    handles: HashMap<i64, OpenHandle>,
+    handles: HashMap<i64, Rc<AsyncMutex<OpenHandle>>>,
     next_handle: i64,
+    dialing: usize,
 }
 
-impl DriverState {
-    /// Run one command, answering on its reply channel.
-    ///
-    /// A receiver that has already given up (its host fn timed out) makes the
-    /// send fail; that is expected and ignored — the handle table stays correct
-    /// either way.
-    async fn run(
-        &mut self,
-        command: DriverCmd,
-        guard: &Arc<dyn ScopeRateGuard>,
-        dialer: &Arc<WsDialer>,
-    ) {
-        self.reap().await;
-        match command {
-            DriverCmd::Dial {
-                request,
-                authority,
-                reply,
-            } => {
-                let answer = self.dial(*request, &authority, guard, dialer).await;
-                let _ = reply.send(answer);
-            }
-            DriverCmd::Send {
-                handle,
-                frame,
-                reply,
-            } => {
-                let answer = self.send(handle, frame).await;
-                let _ = reply.send(answer);
-            }
-            DriverCmd::Recv {
-                handle,
-                window,
-                reply,
-            } => {
-                let answer = self.recv(handle, window).await;
-                let _ = reply.send(answer);
-            }
-            DriverCmd::Close { handle, reply } => {
-                let answer = self.close(handle).await;
-                let _ = reply.send(answer);
-            }
+/// The handle `handle` points at, cloned out of the table so the operation can
+/// `await` without holding the [`RefCell`] borrow.
+fn handle_rc(
+    state: &Rc<RefCell<DriverState>>,
+    handle: i64,
+) -> Result<Rc<AsyncMutex<OpenHandle>>, HostError> {
+    state
+        .borrow()
+        .handles
+        .get(&handle)
+        .map(Rc::clone)
+        .ok_or_else(|| unknown_handle(handle))
+}
+
+/// Run one command, answering on its reply channel.
+///
+/// A receiver that has already given up (its host fn timed out) makes the reply
+/// send fail; that is expected and ignored — the handle table stays correct
+/// either way.
+async fn handle_command(
+    state: Rc<RefCell<DriverState>>,
+    guard: Arc<dyn ScopeRateGuard>,
+    dialer: Arc<WsDialer>,
+    command: DriverCmd,
+) {
+    match command {
+        DriverCmd::Dial {
+            request,
+            authority,
+            reply,
+        } => {
+            let answer = drive_dial(&state, *request, &authority, &guard, &dialer).await;
+            let _ = reply.send(answer);
+        }
+        DriverCmd::Send {
+            handle,
+            frame,
+            reply,
+        } => {
+            let answer = drive_send(&state, handle, frame).await;
+            let _ = reply.send(answer);
+        }
+        DriverCmd::Recv {
+            handle,
+            window,
+            reply,
+        } => {
+            let answer = drive_recv(&state, handle, window).await;
+            let _ = reply.send(answer);
+        }
+        DriverCmd::Close { handle, reply } => {
+            let answer = drive_close(&state, handle).await;
+            let _ = reply.send(answer);
+        }
+        #[cfg(test)]
+        DriverCmd::Inspect { handle, reply } => {
+            let answer = drive_inspect(&state, handle).await;
+            let _ = reply.send(answer);
         }
     }
+}
 
-    /// Dial, register the connection and return its handle.
-    async fn dial(
-        &mut self,
-        request: Request<()>,
-        authority: &str,
-        guard: &Arc<dyn ScopeRateGuard>,
-        dialer: &Arc<WsDialer>,
-    ) -> Result<i64, HostError> {
-        if self.handles.len() >= MAX_HANDLES {
+/// Dial, register the connection and return its handle.
+async fn drive_dial(
+    state: &Rc<RefCell<DriverState>>,
+    request: Request<()>,
+    authority: &str,
+    guard: &Arc<dyn ScopeRateGuard>,
+    dialer: &Arc<WsDialer>,
+) -> Result<i64, HostError> {
+    {
+        // Open handles plus in-flight dials: reserve a slot now so two
+        // concurrent dials cannot both slip past the bound while they connect.
+        let mut st = state.borrow_mut();
+        if st.handles.len() + st.dialing >= MAX_HANDLES {
             return Err(HostError::GuardRefused {
                 namespace: NAMESPACE.to_string(),
-                reason: HANDLE_BOUND_REASON.to_string(),
+                reason: handle_bound_reason(),
             });
         }
-        let deadline = Instant::now() + DIAL_TIMEOUT;
-        let outcome = dialer
-            .dial_request(request, guard.as_ref(), deadline, DialLimits::default())
-            .await;
-        match outcome {
-            Ok(DialOutcome::Upgraded(conn)) => {
-                let handle = self.next_handle;
-                self.next_handle += 1;
-                self.handles.insert(
-                    handle,
-                    OpenHandle {
-                        conn,
-                        last_used: Instant::now(),
-                    },
-                );
-                Ok(handle)
+        st.dialing += 1;
+    }
+    let deadline = Instant::now() + DIAL_TIMEOUT;
+    let outcome = dialer
+        .dial_request(request, guard.as_ref(), deadline, DialLimits::default())
+        .await;
+    let mut st = state.borrow_mut();
+    st.dialing -= 1;
+    match outcome {
+        Ok(DialOutcome::Upgraded(conn)) => {
+            let handle = st.next_handle;
+            st.next_handle += 1;
+            st.handles.insert(
+                handle,
+                Rc::new(AsyncMutex::new(OpenHandle {
+                    conn,
+                    last_used: Instant::now(),
+                })),
+            );
+            Ok(handle)
+        }
+        // A non-101 is data to the lane (plan call 18) but a script asked for an
+        // open connection and did not get one; the status is the whole story,
+        // and no response header is quoted.
+        Ok(DialOutcome::Refused { status, .. }) => Err(HostError::BadArgs(format!(
+            "upgrade refused with status {status}"
+        ))),
+        Err(DialError::Guard(err)) => Err(HostError::GuardRefused {
+            namespace: NAMESPACE.to_string(),
+            reason: format!("{}: {authority}", guard_error_variant(&err)),
+        }),
+        Err(err) => Err(HostError::BadArgs(err.to_string())),
+    }
+}
+
+/// Send one frame on `handle`.
+async fn drive_send(
+    state: &Rc<RefCell<DriverState>>,
+    handle: i64,
+    frame: Frame,
+) -> Result<(), HostError> {
+    let open = handle_rc(state, handle)?;
+    let mut open = open.lock().await;
+    // The error text is tungstenite's own (a protocol or socket message); the
+    // frame payload never reaches it.
+    open.conn
+        .send(frame)
+        .await
+        .map_err(|err| HostError::BadArgs(format!("the frame could not be sent: {err}")))?;
+    open.last_used = Instant::now();
+    Ok(())
+}
+
+/// Collect the frames that arrive on `handle` within `window`.
+async fn drive_recv(
+    state: &Rc<RefCell<DriverState>>,
+    handle: i64,
+    window: Duration,
+) -> Result<Vec<Frame>, HostError> {
+    let open = handle_rc(state, handle)?;
+    let mut open = open.lock().await;
+    // The collection's own deadline is the window plus the grace the host fn is
+    // waiting out, so `collect` ends on the window, never on this.
+    let deadline = Instant::now() + window + REPLY_GRACE;
+    let outcome = open.conn.collect(window, deadline, &|| false).await;
+    // The collected frames are about to be returned to the script, so drop the
+    // driver's own copy of them: a long-lived handle must not accumulate every
+    // frame it ever saw (security finding S5).
+    let _ = open.conn.take_recorded();
+    open.last_used = Instant::now();
+    Ok(outcome.frames)
+}
+
+/// Close `handle` and free its connection.
+async fn drive_close(state: &Rc<RefCell<DriverState>>, handle: i64) -> Result<(), HostError> {
+    let open = state
+        .borrow_mut()
+        .handles
+        .remove(&handle)
+        .ok_or_else(|| unknown_handle(handle))?;
+    let mut open = open.lock().await;
+    open.conn.close().await;
+    Ok(())
+}
+
+/// Test-only: `(recorded, unrecorded)` frame counts for `handle`, draining the
+/// record as it reads it (security finding S5).
+#[cfg(test)]
+async fn drive_inspect(
+    state: &Rc<RefCell<DriverState>>,
+    handle: i64,
+) -> Result<(usize, usize), HostError> {
+    let open = handle_rc(state, handle)?;
+    let mut open = open.lock().await;
+    let unrecorded = open.conn.unrecorded();
+    let recorded = open.conn.take_recorded().len();
+    Ok((recorded, unrecorded))
+}
+
+/// Close every handle untouched for longer than [`HANDLE_IDLE_REAP`].
+///
+/// A handle a command is actively using holds its lock; `try_lock` skips it, so
+/// the reaper never waits on, or closes, a busy connection.
+async fn reap(state: &Rc<RefCell<DriverState>>) {
+    let entries: Vec<(i64, Rc<AsyncMutex<OpenHandle>>)> = state
+        .borrow()
+        .handles
+        .iter()
+        .map(|(handle, open)| (*handle, Rc::clone(open)))
+        .collect();
+    let mut dead = Vec::new();
+    for (handle, open) in entries {
+        if let Ok(mut open) = open.try_lock() {
+            if open.last_used.elapsed() > HANDLE_IDLE_REAP {
+                tracing::debug!(handle, "reaping an idle ws script handle");
+                open.conn.close().await;
+                dead.push(handle);
             }
-            // A non-101 is data to the lane (plan call 18) but a script asked
-            // for an open connection and did not get one; the status is the
-            // whole story, and no response header is quoted.
-            Ok(DialOutcome::Refused { status, .. }) => Err(HostError::BadArgs(format!(
-                "upgrade refused with status {status}"
-            ))),
-            Err(DialError::Guard(err)) => Err(HostError::GuardRefused {
-                namespace: NAMESPACE.to_string(),
-                reason: format!("{}: {authority}", guard_error_variant(&err)),
-            }),
-            Err(err) => Err(HostError::BadArgs(err.to_string())),
         }
     }
-
-    /// Send one frame on `handle`.
-    async fn send(&mut self, handle: i64, frame: Frame) -> Result<(), HostError> {
-        let open = self
-            .handles
-            .get_mut(&handle)
-            .ok_or_else(|| unknown_handle(handle))?;
-        open.last_used = Instant::now();
-        // The error text is tungstenite's own (a protocol or socket message);
-        // the frame payload never reaches it.
-        open.conn
-            .send(frame)
-            .await
-            .map_err(|err| HostError::BadArgs(format!("the frame could not be sent: {err}")))?;
-        open.last_used = Instant::now();
-        Ok(())
+    let mut st = state.borrow_mut();
+    for handle in dead {
+        st.handles.remove(&handle);
     }
+}
 
-    /// Collect the frames that arrive on `handle` within `window`.
-    async fn recv(&mut self, handle: i64, window: Duration) -> Result<Vec<Frame>, HostError> {
-        let open = self
-            .handles
-            .get_mut(&handle)
-            .ok_or_else(|| unknown_handle(handle))?;
-        open.last_used = Instant::now();
-        // The collection's own deadline is the window plus the grace the host
-        // fn is waiting out, so `collect` ends on the window, never on this.
-        let deadline = Instant::now() + window + REPLY_GRACE;
-        let outcome = open.conn.collect(window, deadline, &|| false).await;
-        open.last_used = Instant::now();
-        Ok(outcome.frames)
-    }
-
-    /// Close `handle` and free its connection.
-    async fn close(&mut self, handle: i64) -> Result<(), HostError> {
-        let mut open = self
-            .handles
-            .remove(&handle)
-            .ok_or_else(|| unknown_handle(handle))?;
+/// Close every open handle, whatever its age.
+async fn close_all(state: &Rc<RefCell<DriverState>>) {
+    let handles: Vec<Rc<AsyncMutex<OpenHandle>>> =
+        state.borrow_mut().handles.drain().map(|(_, v)| v).collect();
+    for open in handles {
+        let mut open = open.lock().await;
         open.conn.close().await;
-        Ok(())
-    }
-
-    /// Close every handle untouched for longer than [`HANDLE_IDLE_REAP`].
-    async fn reap(&mut self) {
-        let idle: Vec<i64> = self
-            .handles
-            .iter()
-            .filter(|(_, open)| open.last_used.elapsed() > HANDLE_IDLE_REAP)
-            .map(|(handle, _)| *handle)
-            .collect();
-        for handle in idle {
-            tracing::debug!(handle, "reaping an idle ws script handle");
-            if let Some(mut open) = self.handles.remove(&handle) {
-                open.conn.close().await;
-            }
-        }
-    }
-
-    /// Close every open handle, whatever its age.
-    async fn close_all(&mut self) {
-        let open: Vec<i64> = self.handles.keys().copied().collect();
-        for handle in open {
-            if let Some(mut open) = self.handles.remove(&handle) {
-                open.conn.close().await;
-            }
-        }
     }
 }
 
@@ -1112,7 +1205,7 @@ mod tests {
         ] {
             let text = refusal(&format!(r#"ws.dial(#{{ url: "{url}" }})"#));
             assert!(
-                text.contains("ws.dial needs a ws:// or wss:// url"),
+                text.contains("the url must be ws:// or wss://"),
                 "unexpected refusal for {url}: {text}"
             );
         }
@@ -1151,6 +1244,40 @@ mod tests {
                 "the refusal must name the header: {text}"
             );
         }
+    }
+
+    #[test]
+    fn ws_dial_rejects_a_non_ascii_scheme_without_panicking() {
+        // Byte 5 (and byte 6) can fall inside a multi-byte char, so the scheme
+        // check must slice on bytes, never on a `str` index (findings Q1/S4):
+        // `é` straddles the boundary a naive `url[..5]`/`url[..6]` would cut.
+        for url in ["abcdé://x", "abcdé"] {
+            let text = refusal(&format!(r#"ws.dial(#{{ url: "{url}" }})"#));
+            assert!(
+                text.contains("the url must be ws:// or wss://"),
+                "unexpected refusal for {url}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_url_error_never_echoes_userinfo_or_query() {
+        // A non-ws scheme carrying userinfo and a query is the case that used to
+        // interpolate the whole URL into the refusal (finding S6). The refusal
+        // names the scheme rule and nothing of the secret or the token.
+        let text = refusal(r#"ws.dial(#{ url: "http://alice:s3cret@host/ws?token=abc" })"#);
+        assert!(
+            text.contains("the url must be ws:// or wss://"),
+            "unexpected refusal: {text}"
+        );
+        assert!(
+            !text.contains("s3cret"),
+            "the refusal leaked userinfo: {text}"
+        );
+        assert!(
+            !text.contains("token=abc"),
+            "the refusal leaked the query: {text}"
+        );
     }
 
     #[test]
@@ -1201,6 +1328,116 @@ mod tests {
             }
             other => panic!("a verb outside the namespace must be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_long_recv_on_one_handle_does_not_block_another() {
+        // The driver must not serialise commands across handles: a long `ws.recv`
+        // on handle 1 may not stall `ws.dial`/`send`/`recv` on handle 2 (Q3).
+        use std::time::Instant;
+
+        let guard = scoped_guard();
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = Arc::new(WsDialer::new(Arc::clone(&transport) as Arc<dyn WsTransport>));
+        let language = WsLanguage::new(guard, dialer);
+        let engine_a = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+        let engine_b = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+
+        // Open handle 1 first so it is deterministically handle 1.
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+        let h1: i64 = engine_a
+            .eval(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws" })"#)
+            .expect("the first dial evaluates");
+        assert_eq!(h1, 1);
+
+        // Thread A: a 1500 ms recv on handle 1. No frame arrives, so it waits out
+        // the whole window, holding handle 1 the entire time.
+        let a = std::thread::spawn(move || {
+            let _seed = seed_call_context(CallerTrust::Operator, None, None);
+            let _ = engine_a.eval::<Dynamic>("ws.recv(1, 1500)");
+        });
+
+        // Give A's long recv time to reach the driver before B starts.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let start = Instant::now();
+        let reply: String = engine_b
+            .eval(
+                r#"
+                let h = ws.dial(#{ url: "ws://127.0.0.1:8080/ws" });
+                ws.send(h, "hi");
+                let r = ws.recv(h, 300);
+                r.frames[0].text
+            "#,
+            )
+            .expect("handle 2's round trip evaluates");
+        let elapsed = start.elapsed();
+
+        assert_eq!(reply, "echo:hi");
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "handle 2 took {elapsed:?}; a recv on handle 1 must not block it"
+        );
+        a.join().expect("thread A joins");
+    }
+
+    #[test]
+    fn recv_drains_the_record_so_a_handle_does_not_grow() {
+        // Each `ws.recv` returns its frames to the script, so the driver must
+        // then drain the connection's record; otherwise a long-lived handle's
+        // memory grows with every frame it ever saw (security finding S5).
+        use super::{DriverCmd, DIAL_TIMEOUT, REPLY_GRACE};
+
+        let guard = scoped_guard();
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = Arc::new(WsDialer::new(Arc::clone(&transport) as Arc<dyn WsTransport>));
+        let language = WsLanguage::new(guard, dialer);
+        let engine = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+
+        let handle: i64 = engine
+            .eval(
+                r#"
+                let h = ws.dial(#{ url: "ws://127.0.0.1:8080/ws" });
+                for i in 0..5 {
+                    ws.send(h, "hi");
+                    ws.recv(h, 100);
+                }
+                h
+            "#,
+            )
+            .expect("five send/recv round trips evaluate");
+        assert_eq!(handle, 1);
+
+        // Ask the driver for the handle's record counts; `Inspect` drains as it
+        // reads, so a non-empty count means a prior `recv` left the record full.
+        let sender = language.link.started().expect("the driver is running");
+        let (recorded, unrecorded) = language
+            .link
+            .ask(&sender, DIAL_TIMEOUT + REPLY_GRACE, |reply| {
+                DriverCmd::Inspect { handle, reply }
+            })
+            .expect("the driver answers the inspect");
+        assert_eq!(
+            recorded, 0,
+            "the driver must drain the record after each recv"
+        );
+        assert_eq!(unrecorded, 0, "no frame was dropped");
     }
 
     #[test]

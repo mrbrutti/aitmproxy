@@ -104,6 +104,24 @@ fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
         .map_err(|_| anyhow!("the value of header {name} cannot be sent on the wire"))
 }
 
+/// The `host:port` the scope guard is asked about for `request`.
+///
+/// The single place this derivation lives: [`WsDialer::dial_request`] uses it
+/// for the dial it guards, and the `ws.*` language uses it for the refusal
+/// reason, so a refusal names exactly the authority the guard saw. A request
+/// with no host yields a bare `:port`, which the guard refuses like any other
+/// out-of-scope authority; no path, query or header value ever reaches it.
+#[must_use]
+pub fn request_authority(request: &Request<()>) -> String {
+    let uri = request.uri();
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let host = uri.host().unwrap_or_default();
+    match uri.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => authority_with_port(scheme, host),
+    }
+}
+
 /// The upgrade request that replays `handshake` with `overrides` applied.
 ///
 /// Everything the capture sent is replayed — `Cookie`, `Origin`,
@@ -371,10 +389,7 @@ impl WsDialer {
             .host()
             .ok_or_else(|| DialError::Connect("the upgrade request has no host".to_string()))?;
         let port = uri.port_u16().unwrap_or_else(|| default_port(&scheme));
-        let authority = match uri.port_u16() {
-            Some(port) => format!("{host}:{port}"),
-            None => authority_with_port(&scheme, host),
-        };
+        let authority = request_authority(&request);
         // `http` keeps an IPv6 literal in its brackets; a socket wants it bare.
         let dial_host = host
             .strip_prefix('[')
@@ -768,6 +783,22 @@ impl WsConn {
     #[must_use]
     pub fn unrecorded(&self) -> usize {
         self.unrecorded
+    }
+
+    /// Drain and return the frames recorded so far, clearing the record.
+    ///
+    /// The `ws.*` language calls this after every `ws.recv`: those frames were
+    /// already returned to the script, so draining them keeps a long-lived
+    /// handle's memory from growing with its conversation (security finding S5).
+    /// The byte counter is reset with the record so recording continues from a
+    /// clean budget. The replay-flow path ([`WsConn::into_flows`]) never calls
+    /// this and so keeps the full conversation.
+    pub fn take_recorded(&mut self) -> Vec<Frame> {
+        self.recorded_bytes = 0;
+        std::mem::take(&mut self.recorded)
+            .into_iter()
+            .map(|recorded| recorded.frame)
+            .collect()
     }
 
     /// The subprotocol the server echoed in its 101, if any.
