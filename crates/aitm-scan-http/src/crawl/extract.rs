@@ -189,11 +189,12 @@ pub(crate) fn extract(html: &str) -> Extracted {
         }
         // Raw-text elements: their content is script, CSS or plain text, not
         // markup, so `var action = "/api/delete-all"` inside one is not a form
-        // and a `<form>` written inside a `<title>`, `<noscript>` or `<xmp>` is
-        // not one either; the live DOM has no such form, and counting one would
-        // put every later form's index off by one (S-I2). `<script>` still has
-        // its `src` read and `<textarea>` its name, so those two go through
-        // `Walk::open`, which skips their bodies the same way.
+        // and a `<form>` written inside a `<title>`, `<noscript>`, `<xmp>`,
+        // `<noembed>`, `<noframes>` or `<plaintext>` is not one either; the
+        // live DOM has no such form, and counting one would put every later
+        // form's index off by one (S-I2, R-M2). `<script>` and `<iframe>` still
+        // have their `src` read and `<textarea>` its name, so those three go
+        // through `Walk::open`, which skips their bodies the same way.
         if is_raw_text_element(&tag) {
             i = raw_text_end(html, &tag, scan_tag(html, j, None));
             continue;
@@ -211,10 +212,14 @@ pub(crate) fn extract(html: &str) -> Extracted {
 }
 
 /// Whether the element's body is text the tokenizer never reads as markup
-/// (besides `<script>` and `<textarea>`, which carry an attribute the walk
-/// wants and are handled in [`Walk::open`]).
+/// (besides `<script>`, `<iframe>` and `<textarea>`, which carry an attribute
+/// the walk wants and are handled in [`Walk::open`]). `<plaintext>` has no end
+/// tag, so it swallows the rest of the document, as it does in a browser.
 fn is_raw_text_element(tag: &str) -> bool {
-    matches!(tag, "style" | "title" | "noscript" | "xmp")
+    matches!(
+        tag,
+        "style" | "title" | "noscript" | "xmp" | "noembed" | "noframes" | "plaintext"
+    )
 }
 
 /// Whether the tokenizer reads this element's attributes at all; every other
@@ -283,7 +288,13 @@ impl<'a> Walk<'a> {
                 }
             }
             "a" | "area" => push_capped(&mut self.out.links, attr(attrs, "href")),
-            "iframe" | "frame" => push_capped(&mut self.out.links, attr(attrs, "src")),
+            // An iframe's content is fallback text to the parser, never markup
+            // of this page (R-M2): its `src` is the link, its body is skipped.
+            "iframe" => {
+                push_capped(&mut self.out.links, attr(attrs, "src"));
+                return raw_text_end(self.html, "iframe", after);
+            }
+            "frame" => push_capped(&mut self.out.links, attr(attrs, "src")),
             "button" => push_capped(&mut self.out.links, attr(attrs, "formaction")),
             "link" => push_capped(&mut self.out.resources, attr(attrs, "href")),
             "meta" => self.meta_refresh(attrs),
@@ -856,6 +867,42 @@ mod tests {
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(names, ["c"]);
+    }
+
+    /// The remaining raw-text bodies (R-M2): an `<iframe>`'s fallback content,
+    /// `<noembed>`, `<noframes>` and `<plaintext>` are text to the parser, so a
+    /// form written inside one is not a form and does not consume an index
+    /// (`FormSpec::index` counts forms the walk *started*; a form inside a
+    /// raw-text body is never started), while the `<iframe src>` is still a
+    /// link.
+    #[test]
+    fn extract_treats_iframe_noembed_noframes_and_plaintext_bodies_as_text() {
+        let out = extract(concat!(
+            r#"<iframe src="/f"><form action="/x"><input name="q"></form></iframe>"#,
+            r#"<form action="/real"><input name="a"></form>"#,
+        ));
+        assert_eq!(out.links, vec!["/f".to_string()]);
+        assert!(out.resources.is_empty(), "{:?}", out.resources);
+        assert_eq!(out.forms.len(), 1, "{out:?}");
+        assert_eq!(out.forms[0].index, 0);
+        assert_eq!(out.forms[0].action.as_deref(), Some("/real"));
+        let names: Vec<&str> = out.forms[0]
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, ["a"]);
+
+        let out = extract(concat!(
+            r#"<noembed><form action="/ne"><a href="/ne"></noembed>"#,
+            r#"<NOFRAMES><form action="/nf"><input name="nf"></NOFRAMES>"#,
+            r#"<form action="/real"><input name="b"></form>"#,
+            r#"<plaintext><form action="/pt"><a href="/pt">"#,
+        ));
+        assert!(out.links.is_empty(), "{:?}", out.links);
+        assert_eq!(out.forms.len(), 1, "{out:?}");
+        assert_eq!(out.forms[0].index, 0);
+        assert_eq!(out.forms[0].action.as_deref(), Some("/real"));
     }
 
     /// Controls the plan excludes stay out; the ones it keeps carry their
