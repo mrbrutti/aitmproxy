@@ -262,7 +262,7 @@ impl PacketSpec {
     /// input yields an empty layer list with the correct length.
     #[must_use]
     pub fn summarize(bytes: &[u8]) -> PacketSummary {
-        use etherparse::{NetSlice, TransportSlice};
+        use etherparse::NetSlice;
 
         let mut layers = Vec::new();
         if let Some(p) = parse_frame(bytes) {
@@ -274,14 +274,7 @@ impl PacketSpec {
                 Some(NetSlice::Ipv6(_)) => layers.push("IPv6".to_string()),
                 _ => {}
             }
-            let transport = match &p.transport {
-                Some(TransportSlice::Tcp(_)) => Some(L4Proto::Tcp),
-                Some(TransportSlice::Udp(_)) => Some(L4Proto::Udp),
-                Some(TransportSlice::Icmpv4(_)) => Some(L4Proto::Icmp),
-                Some(TransportSlice::Icmpv6(_)) => Some(L4Proto::IcmpV6),
-                _ => None,
-            };
-            if let Some(proto) = transport {
+            if let Some(proto) = transport_proto(&p.transport) {
                 layers.push(proto.wire_name().to_string());
             }
         }
@@ -297,7 +290,7 @@ impl PacketSpec {
     /// undecodable buffer returns [`PacketEndpoints::default`].
     #[must_use]
     pub fn endpoints(bytes: &[u8]) -> PacketEndpoints {
-        use etherparse::{NetSlice, TransportSlice};
+        use etherparse::NetSlice;
 
         let mut out = PacketEndpoints::default();
         let Some(p) = parse_frame(bytes) else {
@@ -316,21 +309,8 @@ impl PacketSpec {
             }
             _ => {}
         }
-        match &p.transport {
-            Some(TransportSlice::Tcp(t)) => {
-                out.proto = Some(L4Proto::Tcp);
-                out.src_port = Some(t.source_port());
-                out.dst_port = Some(t.destination_port());
-            }
-            Some(TransportSlice::Udp(u)) => {
-                out.proto = Some(L4Proto::Udp);
-                out.src_port = Some(u.source_port());
-                out.dst_port = Some(u.destination_port());
-            }
-            Some(TransportSlice::Icmpv4(_)) => out.proto = Some(L4Proto::Icmp),
-            Some(TransportSlice::Icmpv6(_)) => out.proto = Some(L4Proto::IcmpV6),
-            _ => {}
-        }
+        out.proto = transport_proto(&p.transport);
+        (out.src_port, out.dst_port) = transport_ports(&p.transport);
         out
     }
 
@@ -356,6 +336,36 @@ impl PacketSpec {
             }
         }
         None
+    }
+}
+
+/// The transport an etherparse slice decodes to, as the [`L4Proto`] whose
+/// [`wire_name`](L4Proto::wire_name) the §2 `proto` field and
+/// [`PacketSpec::summarize`]'s layer name share; `None` for no or an unknown
+/// transport. The one mapping every decoder in the crate uses.
+pub(crate) fn transport_proto(
+    transport: &Option<etherparse::TransportSlice<'_>>,
+) -> Option<L4Proto> {
+    use etherparse::TransportSlice;
+    match transport {
+        Some(TransportSlice::Tcp(_)) => Some(L4Proto::Tcp),
+        Some(TransportSlice::Udp(_)) => Some(L4Proto::Udp),
+        Some(TransportSlice::Icmpv4(_)) => Some(L4Proto::Icmp),
+        Some(TransportSlice::Icmpv6(_)) => Some(L4Proto::IcmpV6),
+        _ => None,
+    }
+}
+
+/// The `(source, destination)` ports of a transport slice: TCP and UDP carry
+/// them, anything else is `(None, None)`.
+pub(crate) fn transport_ports(
+    transport: &Option<etherparse::TransportSlice<'_>>,
+) -> (Option<u16>, Option<u16>) {
+    use etherparse::TransportSlice;
+    match transport {
+        Some(TransportSlice::Tcp(t)) => (Some(t.source_port()), Some(t.destination_port())),
+        Some(TransportSlice::Udp(u)) => (Some(u.source_port()), Some(u.destination_port())),
+        _ => (None, None),
     }
 }
 
