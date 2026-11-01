@@ -83,8 +83,10 @@ use crate::ctx::Frontend;
 use crate::value::Value;
 
 /// The default capacity (entries) of the evidence lane before it evicts. A few
-/// thousand entries is enough for the live "Agent" view; a durable sink, when one
-/// is attached, keeps the full history.
+/// thousand entries is enough for the live "Agent" view; the durable file the
+/// `aitm` binary attaches to the ring keeps the longer history, best-effort: its
+/// writer drops an entry when its queue is full and loses one when a write
+/// fails, so it is a long record, not a guaranteed complete one.
 pub const DEFAULT_AUDIT_CAPACITY: usize = 4096;
 
 /// The default capacity (entries) of the routine lane, half the evidence lane:
@@ -372,9 +374,14 @@ pub fn lane_for(sensitivity: Option<Sensitivity>, result: &AuditResult) -> Audit
     }
 }
 
-/// Where audit entries go. The in-memory [`AuditRing`] implements it (always on);
-/// a durable JSONL log implements it too when one is attached, so one `append`
-/// fans to both without the caller knowing which sinks are attached.
+/// Where audit entries go. The in-memory [`AuditRing`] implements it (always on).
+/// A per-server tap implements it too: `McpServer::with_durable_audit` takes any
+/// `AuditSink` (a JSONL file log, in the tests that use it) and calls it with each
+/// entry after the ring, so the caller of `append` does not know which sinks are
+/// attached. The `aitm` binary's durable file is not fed this way: it is a
+/// [`DurableAudit`] attached to the ring with [`AuditRing::attach_durable`], and
+/// the ring forwards every entry to it. A file writer attached both ways writes
+/// each entry twice.
 pub trait AuditSink: Send + Sync {
     /// Record one entry. Infallible by contract: a durable sink that cannot write
     /// logs and drops the line rather than breaking the command that produced it.

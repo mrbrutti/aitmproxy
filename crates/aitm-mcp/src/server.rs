@@ -1055,10 +1055,13 @@ pub struct McpServer {
     /// `agent.activity` reads it. Shared with the `AgentPlugin` so both see the
     /// same entries.
     audit_ring: Arc<AuditRing>,
-    /// An optional durable audit sink (a JSONL log, opt-in by config). When set,
-    /// each entry is appended here as well as to the ring, so the full session is
-    /// reconstructable after the fact (spec D3a.2); the CA plugin's log is a
-    /// subset of this one format.
+    /// An optional per-server audit tap (see [`McpServer::with_durable_audit`]).
+    /// The `aitm` binary does not set it: it attaches its durable JSONL writer to
+    /// the shared [`AuditRing`] instead (config `mcp.audit_log`, on by default),
+    /// and the ring forwards every entry to that writer. When this tap is set,
+    /// `record_audit` appends each entry here as well as to the ring, so a file
+    /// writer attached in both places writes every entry twice. The CA plugin's
+    /// log is a separate file in a different shape, not part of either.
     durable_audit: Option<Arc<dyn AuditSink>>,
     /// The `Ask`-policy parked-request table (spec D4). A Sensitive agent call under
     /// `AgentPolicy::Ask` is parked here until an operator `agent.approve`s it or the
@@ -1134,8 +1137,12 @@ impl McpServer {
         self
     }
 
-    /// Attach a durable audit sink (a JSONL log). Opt-in: when absent, only the
-    /// in-memory ring records. Every entry the ring gets is appended here too.
+    /// Attach a per-server audit tap: an [`AuditSink`] that `record_audit` calls
+    /// with every entry, right after it appends the entry to the ring. Tests use
+    /// it. The `aitm` binary does not: it attaches its durable JSONL writer to the
+    /// shared [`AuditRing`] (config `mcp.audit_log`, on by default; the writer is
+    /// `aitm::audit_log`), which needs no call here. Attaching a file writer both
+    /// here and to the ring writes each entry twice.
     pub fn with_durable_audit(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.durable_audit = Some(sink);
         self
@@ -1916,15 +1923,18 @@ impl McpServer {
     /// spec D3a). `args_summary` is the arguments **redacted** (tokens, auth
     /// headers, and other secret-marked keys dropped) and size-capped, so a secret
     /// never reaches the ring, the durable log, or the pushed `agent` line. Each
-    /// entry goes to the always-on ring, the optional durable sink, and the F4
-    /// agent stream.
+    /// entry goes to the always-on ring, the optional per-server tap
+    /// ([`McpServer::with_durable_audit`]), and the F4 agent stream. The durable
+    /// writer the `aitm` binary attaches to the ring (config `mcp.audit_log`) is
+    /// not called from here: the ring's `append_in` forwards the entry to it.
     ///
     /// The ring keeps the entry in the lane [`aitm_core::lane_for`] picks from the
     /// command's registered sensitivity and the outcome: a successful `Read` is
     /// routine, everything else (refused, failed, `Write`, `Sensitive`, and a name
     /// the registry does not know) is evidence, so a polling burst cannot evict a
-    /// refusal. The lane only chooses where the ring keeps the entry; the durable
-    /// sink and the agent stream still get every entry.
+    /// refusal. The lane chooses where the ring keeps the entry, and, with the
+    /// origin, which stream file the ring's durable writer puts it in; the tap and
+    /// the agent stream still get every entry.
     ///
     /// The entry is bounded before any of them sees it: the label is sanitised on
     /// consumption and an error reason is scrubbed and then capped. The tool result
