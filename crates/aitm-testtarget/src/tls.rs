@@ -7,8 +7,6 @@
 //! the `tls_h1` listener `[http/1.1]` only, so the HTTP/2 sender and its version
 //! override can be proven against a target that behaves either way.
 
-#![allow(dead_code)] // consumed by A20 (`bind`)
-
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;

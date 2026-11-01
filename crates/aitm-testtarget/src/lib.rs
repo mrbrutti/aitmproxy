@@ -66,6 +66,10 @@ pub struct TestTarget {
     _state: Arc<app::AppState>,
     // Dropping the target aborts every speaker task (and its connections).
     _l4: Option<L4Services>,
+    // The legacy UDP echo + minimal TCP pair ([`l4`]), started alongside the
+    // speakers under `l4(true)` so `/services` lists it (spec D2); dropping
+    // the target aborts its loops too.
+    _legacy_l4: Option<L4Service>,
 }
 
 /// Which listeners a [`TestTarget`] starts (spec D1 "Library" row). Every port
@@ -113,7 +117,8 @@ impl TargetBuilder {
     }
 
     /// Bind and start the listeners in the order plain, tls, tls_h1, control,
-    /// l4, returning once every one is accepting. `l4(true)` without
+    /// l4 (the nine speakers, then the legacy `l4-udp-echo` / `l4-tcp-service`
+    /// pair), returning once every one is accepting. `l4(true)` without
     /// `control(..)` is `InvalidInput` (`l4 needs control`) and binds nothing;
     /// a bind error is returned as-is (a serve process must report a port
     /// clash cleanly).
@@ -146,10 +151,19 @@ impl TargetBuilder {
             let addr = control::bind(port, log.clone()).await?;
             control_url = Some(format!("http://{addr}"));
         }
-        let l4 = if self.l4 {
-            Some(L4Services::start(mode, log).await?)
+        let (l4, legacy_l4) = if self.l4 {
+            let speakers = L4Services::start(mode, log.clone()).await?;
+            let legacy = L4Service::try_start(L4Config { enabled: true })
+                .await?
+                .ok_or_else(|| {
+                    std::io::Error::other("legacy l4 service did not start when enabled")
+                })?;
+            for row in legacy_l4_rows(legacy.udp_addr(), legacy.tcp_addr()) {
+                log.register_service(row);
+            }
+            (Some(speakers), Some(legacy))
         } else {
-            None
+            (None, None)
         };
 
         Ok(TestTarget {
@@ -160,8 +174,32 @@ impl TargetBuilder {
             control_url,
             _state: state,
             _l4: l4,
+            _legacy_l4: legacy_l4,
         })
     }
+}
+
+/// The `/services` rows for the legacy L4 pair (spec D2: `--l4` also lists
+/// `l4-udp-echo` and `l4-tcp-service`, `role == "l4"`, `"grammar": null`).
+fn legacy_l4_rows(udp_addr: SocketAddr, tcp_addr: SocketAddr) -> [log::ServiceInfo; 2] {
+    [
+        log::ServiceInfo {
+            name: "l4-udp-echo".to_string(),
+            proto: "udp",
+            addr: udp_addr,
+            role: "l4",
+            alpn: None,
+            grammar: None,
+        },
+        log::ServiceInfo {
+            name: "l4-tcp-service".to_string(),
+            proto: "tcp",
+            addr: tcp_addr,
+            role: "l4",
+            alpn: None,
+            grammar: None,
+        },
+    ]
 }
 
 /// Bind the plain HTTP/1 listener on loopback `port`, register it as the
@@ -245,7 +283,9 @@ impl TestTarget {
     }
 
     /// The running L4 speakers in [`speakers::driver::all`] order; empty unless
-    /// the builder's `l4(true)` was set.
+    /// the builder's `l4(true)` was set. The legacy `l4-udp-echo` /
+    /// `l4-tcp-service` pair is not in this list; it is reachable through the
+    /// control origin's `/services`.
     pub fn l4_services(&self) -> &[RunningService] {
         self._l4.as_ref().map(L4Services::services).unwrap_or(&[])
     }
@@ -272,5 +312,30 @@ mod tests {
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(err.to_string(), "l4 needs control");
+    }
+
+    /// The legacy pair's `/services` rows (spec D2: `l4-udp-echo` / `udp`,
+    /// `l4-tcp-service` / `tcp`, both `role == "l4"` with `grammar: null` and
+    /// no `alpn`). The socket-level proof that `l4(true)` registers them is
+    /// A21's `services_lists_everything`; this pins the row shape without a bind.
+    #[test]
+    fn legacy_l4_rows_match_d2() {
+        let udp: SocketAddr = "127.0.0.1:40001".parse().expect("literal addr");
+        let tcp: SocketAddr = "127.0.0.1:40002".parse().expect("literal addr");
+        let [udp_row, tcp_row] = legacy_l4_rows(udp, tcp);
+
+        assert_eq!(udp_row.name, "l4-udp-echo");
+        assert_eq!(udp_row.proto, "udp");
+        assert_eq!(udp_row.addr, udp);
+        assert_eq!(udp_row.role, "l4");
+        assert_eq!(udp_row.alpn, None);
+        assert_eq!(udp_row.grammar, None);
+
+        assert_eq!(tcp_row.name, "l4-tcp-service");
+        assert_eq!(tcp_row.proto, "tcp");
+        assert_eq!(tcp_row.addr, tcp);
+        assert_eq!(tcp_row.role, "l4");
+        assert_eq!(tcp_row.alpn, None);
+        assert_eq!(tcp_row.grammar, None);
     }
 }

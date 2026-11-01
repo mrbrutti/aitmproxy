@@ -6,7 +6,6 @@
 //! the Patched control echoes it like any other.
 
 // consumed by A19 (the driver registers `DEF`); nothing links it yet.
-#![allow(dead_code)]
 
 use super::{Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;

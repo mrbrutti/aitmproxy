@@ -79,7 +79,7 @@ impl Opcode {
 
     /// Lower-case wire token (the `frame` log entry serialises
     /// [`WsOpcode`] instead; kept for callers that print opcodes).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // only the `opcode_table` unit test calls it
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Opcode::Continuation => "continuation",

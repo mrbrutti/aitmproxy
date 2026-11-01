@@ -8,7 +8,6 @@
 //! connection; UDP datagrams use `u-<peer port>`, minted by the L4 driver).
 //! Each ring holds [`RING_CAP`] entries; a full ring drops the oldest and
 //! counts it in `dropped`.
-#![allow(dead_code)] // consumed by A5/A6/A17/A19
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -396,18 +395,11 @@ impl<T> Ring<T> {
         self.items.clear();
         self.dropped = 0;
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub(crate) fn dropped(&self) -> u64 {
-        self.dropped
-    }
 }
 
 impl<T: Clone> Ring<T> {
     /// The items oldest-first plus the drop count.
+    #[allow(dead_code)] // only the `ring_is_bounded` unit test reads a ring this way; routes use `to_json`
     pub(crate) fn snapshot(&self) -> (Vec<T>, u64) {
         (self.items.iter().cloned().collect(), self.dropped)
     }
@@ -539,6 +531,7 @@ impl ControlLog {
         })
     }
 
+    #[allow(dead_code)] // only the `reset_clears_and_returns_last_seq` unit test reads it; routes use `mode_token`
     pub(crate) fn mode(&self) -> SeedMode {
         self.mode
     }

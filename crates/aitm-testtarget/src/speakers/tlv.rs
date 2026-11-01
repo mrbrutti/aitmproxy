@@ -7,7 +7,6 @@
 //! origin; the Patched control answers `00 03 45 52 52` (`ERR`) and closes.
 
 // consumed by A19 (the driver registers `DEF`); nothing links it yet.
-#![allow(dead_code)]
 
 use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;

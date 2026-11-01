@@ -86,7 +86,6 @@ impl L4Services {
     /// Bind every service in [`all`] on `127.0.0.1:0`, register each as an
     /// `l4` row in `/services`, and spawn its driver task. A bind failure
     /// returns the error after aborting the tasks already spawned.
-    #[allow(dead_code)] // consumed by A20 (the `lib.rs` builder's `.l4(true)`)
     pub(crate) async fn start(mode: SeedMode, log: Arc<ControlLog>) -> io::Result<L4Services> {
         let mut this = L4Services {
             services: Vec::new(),

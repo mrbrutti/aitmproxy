@@ -4,7 +4,6 @@
 //! adds the P-mode headers. Six routes: `GET /services`, `GET /log/http`,
 //! `GET /log/ws`, `GET /log/l4[?service=NAME]`, `GET /log/conns`,
 //! `POST /reset`, `GET /mode`; anything else is a JSON 404.
-#![allow(dead_code)] // `bind` is consumed by A20 (the `lib.rs` builder)
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

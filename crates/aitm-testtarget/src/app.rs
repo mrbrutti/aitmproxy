@@ -47,10 +47,8 @@ pub(crate) struct AppState {
     /// /comments` renders back.
     pub comments: Mutex<Vec<String>>,
     /// Login sessions (`POST /login`, `/account?tab=`, `/ws` `session_valid`).
-    #[allow(dead_code)] // A15/A17 consume this
     pub sessions: routes::session::SessionStore,
     /// `GET /flaky` request counter (every third request fails).
-    #[allow(dead_code)] // A16 consumes this
     pub flaky: AtomicU64,
     /// The observer log behind the control origin.
     pub log: Arc<ControlLog>,
@@ -71,7 +69,6 @@ impl AppState {
 /// One parsed request, as every route sees it: the body is already collected
 /// (bounded by [`MAX_BODY`]), cookies are split out of `Cookie`, and the
 /// connection it arrived on is attached so routes and `/ws` can log against it.
-#[allow(dead_code)] // `conn`, `scheme`, `host`: A17 (`/ws` origin rule) consumes these
 pub(crate) struct RequestInfo {
     pub method: String,
     pub path: String,
@@ -90,7 +87,6 @@ pub(crate) struct RequestInfo {
 
 // Routes land in A13-A17; until then only the legacy six and the tests read
 // these accessors.
-#[allow(dead_code)]
 impl RequestInfo {
     /// A request header as text (`None` when absent or not UTF-8).
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
@@ -181,7 +177,6 @@ where
 }
 
 /// Serve HTTP/2 on `io` (a TLS stream that negotiated `h2`).
-#[allow(dead_code)] // A18 (tls.rs) consumes this
 pub(crate) async fn serve_h2<IO>(io: IO, state: Arc<AppState>, conn: Arc<ConnInfo>)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -621,7 +616,7 @@ pub(crate) fn index() -> Resp {
 /// Does `/` make `path` discoverable? True when an anchor `href`, a form
 /// `action` or a `data-href` equals `path` (or `path` plus a query), or the
 /// inline script carries `path` as a quoted literal.
-#[allow(dead_code)] // read by the index test (`index_links_every_seed_route`)
+#[allow(dead_code)] // only the `index_links_every_seed_route` unit test calls it
 pub(crate) fn index_mentions(path: &str) -> bool {
     let page = index_html();
     let (markup, script) = match (page.find("<script>"), page.find("</script>")) {

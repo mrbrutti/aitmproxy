@@ -12,7 +12,6 @@
 //! ([`Step::Fault`]) via [`mode_bug`].
 
 // consumed by A19 (the driver registers `DEF`).
-#![allow(dead_code)]
 
 use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;

@@ -57,7 +57,8 @@ pub struct L4Service {
 impl L4Service {
     /// Bind the UDP and TCP services on fresh loopback ports and start serving —
     /// but only when `config.enabled`. Returns `None` when disabled (the
-    /// default), so the service is opt-in by construction.
+    /// default), so the service is opt-in by construction. Panics on a bind
+    /// failure; [`try_start`](Self::try_start) returns it instead.
     pub async fn start(config: L4Config) -> Option<L4Service> {
         if !config.enabled {
             return None;
@@ -80,6 +81,29 @@ impl L4Service {
             tcp_addr,
             tasks,
         })
+    }
+
+    /// [`start`](Self::start) that returns a bind error instead of panicking,
+    /// for callers (the [`TestTarget`](crate::TestTarget) builder) that must
+    /// report a bind failure cleanly. `Ok(None)` when `config.enabled` is off.
+    pub async fn try_start(config: L4Config) -> std::io::Result<Option<L4Service>> {
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_addr = udp.local_addr()?;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp.local_addr()?;
+
+        let tasks = vec![tokio::spawn(udp_echo(udp)), tokio::spawn(tcp_serve(tcp))];
+
+        Ok(Some(L4Service {
+            udp_addr,
+            tcp_addr,
+            tasks,
+        }))
     }
 
     /// The `127.0.0.1:PORT` the UDP echo responder is bound to.
