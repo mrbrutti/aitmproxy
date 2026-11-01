@@ -236,6 +236,18 @@ A `no_application_protocol` refusal of a cache-narrowed `Auto` offer invalidates
 cache entry so the next `Auto` send re-offers both protocols (F4; spec re-review Minor);
 forced sends are unaffected.
 
+
+**Amendment A8 (T3 session, 2026-11-01, plan text brought to the shipped values after F3).**
+Task 2 item 1: `regex` is a dev-dependency (used only in a test); `serde_json`/`serde_yaml`
+are not dependencies of the crate (the Task 11 harness pins `rhai` and whatever it needs
+itself). Task 7 item 5 and Architect's call B11: `MAX_BOOLEAN_PROBES = 10` (cost `medium`
+honest), test `the_check_never_exceeds_ten_probes`. Task 8: `the_check_never_sleeps` bound
+is 2 s. Task 9 table: `h2-pseudo-header-validation` severity Info, `confidence_max`
+Tentative; `h2-header-crlf-tolerance` severity Medium, `confidence_max` Tentative (both
+"inferred once", D2); `h2-settings-observe` `confidence_max` Firm; `h2-rapid-reset-mitigation`
+cost Medium, no-mitigation verdict Firm. `matching::scrub` is `pub(crate)` (F5). The
+`origin/main` merge af52322a changed no T3-owned file.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
@@ -1549,6 +1561,9 @@ Kept by the main session during stage 6. One row per finding.
 | F3 range | Security reviewer (checks re-review) | Minor | `url.rs` accepts a non-IPv6 host containing colons under the bare-IPv6 heuristic (fail-closed today: never matches a profile origin) | F5 S2-1: require a parsable `Ipv6Addr` when the host carries `:` |
 | F3 range | Security reviewer (checks re-review) | — | PASS: SEC-C1..SEC-C5 closed (scrub before the bound at every evidence site; budget pre-check; canonical guard/origin key; `example: None`; manifest); one gated runner, one constructor; hostile `point.url` shapes fail closed; `scrub_text` is the consolidated vocabulary on main too; no `unsafe`; A5 residuals recorded | Recorded |
 | 11-16 (drafts) | T3 session (proof through T1b's real bridge at 0300fd33) | — | All fifteen converted scripts load verbatim through the real `RhaiLoader` + `CheckRegistry` (no filter), register one check each with the declared meta incl. `remediation` and `scope: origin` on the four audits, return Vulnerable on their vulnerable shapes and Clean on patched, carry the seven `PocHint`s; `paths` returns root + `more` siblings with `location.path` per exposed path (A6 "planned" item now shipped in the draft). Residual: T1b's `RecordingHost` cannot drive header-reading or `probe.raw` checks (reported to T1b); the in-tree harness is T3's own | Recorded 2026-11-01; Task 11 moves drafts + harness + README in after T1b lands on main |
+| F3 range | Spec reviewer (checks re-review) | Minor | `matching::scrub` is public though every caller is in-crate | F5 SP2-1: `pub(crate)` |
+| F3 range | Spec reviewer (checks re-review) | Minor | Plan Task 9 table, Task 7 cap/test name, Task 2 deps, Task 8 bound and B11 still carry pre-F3 literals | Fixed by amendment A8 (plan text) |
+| F3 range | Spec reviewer (checks re-review) | — | PASS: crate content equals 75944b38 after the merge; `checks()` five / `checks_with` ten pinned literally; D2 ceilings and cost bands hold; classes as pinned; every plan-named test present; D8.1 redaction implemented and tested; A5 correctly deferred; ACs T3-3..T3-5 open until Task 17; `wire.rs` swap is a merge condition | Recorded |
 | 3 | Coder (Task 3 report) | Minor | ALPN cache and h2 pool are keyed by `host:port` without scheme; one sender driving `http://h:p` (h2c) and `https://h:p` would collide on one key | Fixed in eb5b1f40 (F1.2): `conn_key(scheme, authority)` for cache and pool; `negotiated_for(scheme, authority)`; two tests |
 | 1,2,4 | Coder (Tasks 2 and 4 reports) | Important (process) | Parallel coders share one git index; a `git add <path>` + bare `git commit` swept a sibling's staged files into commit 25a42279 | Fixed by the Task 4 coder (rebuilt as 013a338e, single file); every later brief requires `git commit -- <paths>`; orchestrator audits each commit's stat |
 
