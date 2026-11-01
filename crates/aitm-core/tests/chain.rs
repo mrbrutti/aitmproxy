@@ -3,13 +3,19 @@
 
 use aitm_core::{
     Body, Chain, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpVersion, InterceptState, MemFlowStore, Plugin, Registry, Verdict,
+    HttpRequest, HttpVersion, InterceptState, MemFlowStore, Plugin, Registry, TunnelInfo,
+    TunnelReason, Verdict,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 fn http_flow() -> Flow {
+    http_flow_with(FlowMeta::default())
+}
+
+/// An ordinary `GET http://ex.test/` flow carrying the given metadata.
+fn http_flow_with(metadata: FlowMeta) -> Flow {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     Flow::Http(HttpFlow {
         id: FlowId::new(),
@@ -32,7 +38,7 @@ fn http_flow() -> Flow {
             established: SystemTime::now(),
         },
         server_conn: None,
-        metadata: FlowMeta::default(),
+        metadata,
         intercept: InterceptState::Observed,
     })
 }
@@ -47,16 +53,21 @@ fn label(ev: &Event) -> &'static str {
 }
 
 /// Records `(plugin_name, event_label)` for each event it sees, and optionally
-/// halts on a chosen event label.
+/// halts on a chosen event label. `observes_passive` is what it answers to
+/// `Plugin::observes_passive_flows`.
 struct RecPlugin {
     name: String,
     log: Arc<Mutex<Vec<(String, String)>>>,
     halt_on: Option<&'static str>,
+    observes_passive: bool,
 }
 
 impl Plugin for RecPlugin {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn observes_passive_flows(&self) -> bool {
+        self.observes_passive
     }
     fn on_event(&mut self, ev: &Event, _ctx: &mut FlowCtx<'_>) -> Verdict {
         let lbl = label(ev);
@@ -80,11 +91,13 @@ async fn ordered_events_and_halt() {
         name: "A".into(),
         log: log.clone(),
         halt_on: Some("Request"), // A halts the Request event
+        observes_passive: false,
     }));
     reg.add_plugin(Box::new(RecPlugin {
         name: "B".into(),
         log: log.clone(),
         halt_on: None,
+        observes_passive: false,
     }));
 
     let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
@@ -299,4 +312,162 @@ async fn abandoned_intercept_is_killed_after_timeout() {
         matches!(store.get(id), Some(Flow::Http(f)) if matches!(f.intercept, InterceptState::Killed)),
         "an abandoned intercept must be killed after the timeout"
     );
+}
+
+/// Spec D4 / AC10: a passive flow (`passive = true`, or a tunnel row via
+/// `tunnel.is_some()`) is dispatched only to plugins that opt in through
+/// `observes_passive_flows()`; a flow with neither still reaches every plugin, in
+/// registration order.
+#[tokio::test]
+async fn passive_flow_reaches_only_observers() {
+    /// Dispatch `Request` on a flow carrying `metadata` through an "actor" (does
+    /// not observe passive flows) and an "observer" (does). Returns both logs and
+    /// the verdict.
+    async fn run(metadata: FlowMeta) -> (Vec<(String, String)>, Vec<(String, String)>, Verdict) {
+        let actor_log = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let observer_log = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(RecPlugin {
+            name: "actor".into(),
+            log: actor_log.clone(),
+            halt_on: None,
+            observes_passive: false,
+        }));
+        reg.add_plugin(Box::new(RecPlugin {
+            name: "observer".into(),
+            log: observer_log.clone(),
+            halt_on: None,
+            observes_passive: true,
+        }));
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let id = store.insert(http_flow_with(metadata));
+        let chain = Chain::new(Arc::new(reg), store);
+
+        let verdict = chain.dispatch(Event::Request(id)).await;
+        let actor = actor_log.lock().unwrap().clone();
+        let observer = observer_log.lock().unwrap().clone();
+        (actor, observer, verdict)
+    }
+
+    let seen = |name: &str| vec![(name.to_string(), "Request".to_string())];
+
+    // `passive = true`: only the observer runs.
+    let (actor, observer, verdict) = run(FlowMeta {
+        passive: true,
+        ..FlowMeta::default()
+    })
+    .await;
+    assert_eq!(
+        observer,
+        seen("observer"),
+        "the observer must see the passive flow's event"
+    );
+    assert!(
+        actor.is_empty(),
+        "a plugin that does not observe passive flows must not run on one, got {actor:?}"
+    );
+    assert_eq!(verdict, Verdict::Continue);
+
+    // A tunnel row (`passive = false`, `tunnel.is_some()`) is passive too.
+    let (actor, observer, verdict) = run(FlowMeta {
+        passive: false,
+        tunnel: Some(TunnelInfo::passthrough(TunnelReason::OutOfScope)),
+        ..FlowMeta::default()
+    })
+    .await;
+    assert_eq!(
+        observer,
+        seen("observer"),
+        "the observer must see the tunnel row's event"
+    );
+    assert!(
+        actor.is_empty(),
+        "a plugin that does not observe passive flows must not run on a tunnel row, got {actor:?}"
+    );
+    assert_eq!(verdict, Verdict::Continue);
+
+    // Neither: every plugin runs, as before.
+    let (actor, observer, verdict) = run(FlowMeta::default()).await;
+    assert_eq!(
+        actor,
+        seen("actor"),
+        "an ordinary flow still reaches the actor"
+    );
+    assert_eq!(
+        observer,
+        seen("observer"),
+        "an ordinary flow still reaches the observer"
+    );
+    assert_eq!(verdict, Verdict::Continue);
+}
+
+/// Spec D4 / AC10: a passive flow is never parked. The intercepting plugin does
+/// not observe passive flows, so it is skipped: `dispatch` returns at once with
+/// `Continue` (no 300 s intercept wait) and the stored flow stays `Observed`.
+#[tokio::test]
+async fn passive_flow_is_never_parked() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(Interceptor));
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let id = store.insert(http_flow_with(FlowMeta {
+        passive: true,
+        ..FlowMeta::default()
+    }));
+    let chain = Chain::new(Arc::new(reg), store.clone());
+
+    let verdict = tokio::time::timeout(
+        Duration::from_millis(100),
+        chain.dispatch(Event::Request(id)),
+    )
+    .await
+    .expect("a passive dispatch must return without parking");
+
+    assert_eq!(verdict, Verdict::Continue);
+    assert!(
+        matches!(store.get(id), Some(Flow::Http(f)) if matches!(f.intercept, InterceptState::Observed)),
+        "a passive flow must stay Observed; the intercept plugin never ran on it"
+    );
+}
+
+/// Opts in to passive flows and (wrongly) tries to park every request. No
+/// first-party plugin does this; it exercises the chain's defensive half of the
+/// rule.
+struct ObservingInterceptor;
+
+impl Plugin for ObservingInterceptor {
+    fn name(&self) -> &str {
+        "observing-interceptor"
+    }
+    fn observes_passive_flows(&self) -> bool {
+        true
+    }
+    fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
+        if matches!(ev, Event::Request(_)) {
+            ctx.intercept();
+        }
+        Verdict::Continue
+    }
+}
+
+/// Spec D4 / AC10, defensive half: even a plugin that observes passive flows
+/// cannot park one. The chain drops the parked receiver and returns at once.
+#[tokio::test]
+async fn opted_in_plugin_cannot_park_a_passive_flow() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(ObservingInterceptor));
+    let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+    let id = store.insert(http_flow_with(FlowMeta {
+        tunnel: Some(TunnelInfo::passthrough(TunnelReason::OutOfScope)),
+        ..FlowMeta::default()
+    }));
+    let chain = Chain::new(Arc::new(reg), store);
+
+    let verdict = tokio::time::timeout(
+        Duration::from_millis(100),
+        chain.dispatch(Event::Request(id)),
+    )
+    .await
+    .expect("a passive dispatch must return even if an observer tried to park it");
+
+    assert_eq!(verdict, Verdict::Continue);
 }
