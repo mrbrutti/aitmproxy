@@ -1,11 +1,12 @@
 //! Task 5: the flow store (`FlowStore` trait + in-memory `MemFlowStore`).
 
 use aitm_core::{
-    Body, ConnInfo, Flow, FlowId, FlowMeta, FlowQuery, FlowStore, HeaderMap, HttpFlow, HttpRequest,
-    HttpResponse, HttpVersion, InterceptState, MemFlowStore,
+    Body, ClearOutcome, ConnInfo, Flow, FlowId, FlowMeta, FlowQuery, FlowStore, HeaderMap,
+    HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, TunnelInfo,
+    TunnelReason,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// A terminal flow: a fully-buffered response, so the store may evict it.
 fn http_flow_terminal(authority: &str, path: &str, body_len: usize) -> Flow {
@@ -318,4 +319,129 @@ fn query_method_filter_is_case_insensitive() {
         ..Default::default()
     });
     assert!(none.is_empty(), "a different method must not match");
+}
+
+/// A `CONNECT` row as the tunnel producers insert it (spec D5): `method CONNECT`,
+/// `scheme https`, empty path, `metadata.tunnel` set; `response` is the `200`
+/// acknowledgement of an established tunnel or `None` for a failed one;
+/// `duration` is `None` while the tunnel is open and set once when it closes or
+/// fails.
+fn tunnel_row(info: TunnelInfo, status: Option<u16>, duration: Option<Duration>) -> Flow {
+    let mut flow = http_flow("origin.test:443", "");
+    if let Flow::Http(h) = &mut flow {
+        h.request.method = "CONNECT".into();
+        h.request.scheme = "https".into();
+        h.client_conn.tls = true;
+        h.response = status.map(|status| HttpResponse {
+            status,
+            version: HttpVersion::Http11,
+            headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
+            body: Body::Empty,
+            timestamp: SystemTime::now(),
+        });
+        h.metadata.tunnel = Some(info);
+        h.metadata.duration = duration;
+    }
+    flow
+}
+
+/// AC12 (spec D5 terminal rule): an open passthrough row — `200` acknowledged,
+/// bytes still relaying, no `duration` yet — is in flight. `clear` keeps it and
+/// counts it in `skipped_in_flight`; count-cap eviction passes over it even when
+/// it is the oldest flow in the store.
+#[test]
+fn open_tunnel_row_is_kept_by_clear_and_eviction() {
+    let store = MemFlowStore::new();
+    let open = store.insert(tunnel_row(
+        TunnelInfo::passthrough(TunnelReason::OutOfScope),
+        Some(200),
+        None,
+    ));
+
+    assert_eq!(
+        store.clear(),
+        ClearOutcome {
+            cleared: 0,
+            skipped_in_flight: 1,
+        },
+        "an open tunnel row is in flight: kept and counted, never cleared"
+    );
+    assert!(
+        store.get(open).is_some(),
+        "the open tunnel row survives clear"
+    );
+
+    // max_flows = 1 with the byte budget effectively off: the second insert
+    // pushes the store over its cap, and the eviction must skip the open tunnel
+    // row (the oldest) and drop the terminal flow instead.
+    let tight = MemFlowStore::with_limits(1, 100_000_000);
+    let open = tight.insert(tunnel_row(
+        TunnelInfo::passthrough(TunnelReason::OutOfScope),
+        Some(200),
+        None,
+    ));
+    let terminal = tight.insert(http_flow_terminal("a.test", "/t", 10));
+    assert!(
+        tight.get(open).is_some(),
+        "the open tunnel row must survive eviction (clearing it would strand the relay's close)"
+    );
+    assert!(
+        tight.get(terminal).is_none(),
+        "the terminal flow is the one evicted instead"
+    );
+}
+
+/// AC12: once a tunnel row has its `duration` it is finished — closed by the
+/// client (passthrough or decrypted, `200` present) or failed (no response at
+/// all) — and `clear` removes it like any completed exchange.
+#[test]
+fn closed_or_failed_tunnel_row_is_cleared() {
+    let closed_passthrough = MemFlowStore::new();
+    closed_passthrough.insert(tunnel_row(
+        TunnelInfo::passthrough(TunnelReason::Pinned),
+        Some(200),
+        Some(Duration::from_millis(12)),
+    ));
+    assert_eq!(
+        closed_passthrough.clear(),
+        ClearOutcome {
+            cleared: 1,
+            skipped_in_flight: 0,
+        },
+        "a closed passthrough row (200 + duration) is cleared"
+    );
+    assert!(closed_passthrough.list().is_empty());
+
+    let closed_decrypted = MemFlowStore::new();
+    closed_decrypted.insert(tunnel_row(
+        TunnelInfo::decrypted(),
+        Some(200),
+        Some(Duration::from_millis(40)),
+    ));
+    assert_eq!(
+        closed_decrypted.clear(),
+        ClearOutcome {
+            cleared: 1,
+            skipped_in_flight: 0,
+        },
+        "a closed decrypted row (200 + duration) is cleared"
+    );
+    assert!(closed_decrypted.list().is_empty());
+
+    let failed = MemFlowStore::new();
+    failed.insert(tunnel_row(
+        TunnelInfo::failed(TunnelReason::ClientRejectedCertificate),
+        None,
+        Some(Duration::from_millis(3)),
+    ));
+    assert_eq!(
+        failed.clear(),
+        ClearOutcome {
+            cleared: 1,
+            skipped_in_flight: 0,
+        },
+        "a failed row (no response, duration set) is cleared"
+    );
+    assert!(failed.list().is_empty());
 }
