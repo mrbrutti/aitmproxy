@@ -8,7 +8,21 @@
 //!
 //! Track T1a handed over the skeleton: the crate exists, is a workspace member,
 //! and exposes the final [`checks`] signature the binary already calls, so T3
-//! flips the body and edits no shared file (spec D1).
+//! flips the body and edits no shared file (spec D1). [`checks`] now returns
+//! the ten native checks of D8.2, in id order:
+//!
+//! | Technique | Checks | Module |
+//! |---|---|---|
+//! | Boolean differential | `sqli-boolean` | [`sqli_boolean`] |
+//! | Blind timing | `sqli-time`, `cmdi-time` | [`blind_timing`] |
+//! | Reflection | `xss-reflected` | [`xss`] |
+//! | Redirect | `open-redirect` | [`redirect`] |
+//! | Observe-only HTTP/2 | `h2-settings-observe`, `h2-pseudo-header-validation`, `h2-header-crlf-tolerance`, `h2-cl-te-downgrade-indicator`, `h2-rapid-reset-mitigation` | [`h2_observe`] |
+//!
+//! A check's `class` carries the taxonomy token rather than its id, so the two
+//! SQL-injection techniques (and the Rhai `sqli` script beside them) dedupe
+//! into one issue, while the five h2 observations keep five distinct classes
+//! and stay five issues (spec D6, session call S3).
 //!
 //! The layout is one module per technique, plus two shared, dependency-light
 //! toolboxes every technique draws on:
@@ -36,10 +50,6 @@ pub mod xss;
 
 pub use catalogue::checks;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn skeleton_returns_no_checks() {
-        assert!(crate::checks().is_empty());
-    }
-}
+// The catalogue slot's agreement with the design — the ten ids, the metadata
+// shape and the `class` tokens — is pinned in `tests/catalogue.rs`, which reads
+// `checks()` through the public API exactly as `crates/aitm/src/wire.rs` does.
