@@ -371,14 +371,18 @@ pub fn resolve_target(
 }
 
 /// The source port the lane claims for the target at `target_index`: the first
-/// of `40000 + index`, `+1`, `+2`, ... that is not one of the core's own
-/// listener ports, so the reply capture's self-exclusion never drops the lane's
-/// own replies (call C25).
+/// of `40000 + index`, `+1`, `+2`, ... that is neither one of the core's own
+/// listener ports — so the reply capture's self-exclusion never drops the
+/// lane's own replies (call C25) — nor the target's own port `target_port`, so
+/// a stimulus's direction is never ambiguous: `send_recv` recognises its own
+/// looped-back frame by `src:src_port -> dst:dst_port`, and on loopback, where
+/// both addresses are the same host, equal ports would make the echo service's
+/// reply indistinguishable from the stimulus (T5 live proof).
 #[must_use]
-pub fn choose_src_port(guard: &L4Guard, target_index: usize) -> u16 {
+pub fn choose_src_port(guard: &L4Guard, target_index: usize, target_port: u16) -> u16 {
     let self_ports = guard.self_ports();
     let mut port = src_port_for(target_index);
-    while self_ports.contains(&port) {
+    while self_ports.contains(&port) || port == target_port {
         let Some(next) = port.checked_add(1) else {
             break;
         };
@@ -731,7 +735,7 @@ pub fn discover_all(
         let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)
             .map_err(|message| DiscoverError::InvalidProfile(bare_invalid_profile(message)))?;
         let seeds = seed_payloads(&resolved, &profile.l4, seed_store, marker)?;
-        let src_port = choose_src_port(guard, index);
+        let src_port = choose_src_port(guard, index, resolved.port);
 
         if !probed.contains(&resolved.interface) {
             probe_privilege(guard, backend, &resolved.interface)?;
@@ -1340,7 +1344,41 @@ mod tests {
         };
         assert!(message.contains("own listener ports"), "{message}");
 
-        assert_eq!(choose_src_port(&guard, 0), 40_001);
+        assert_eq!(choose_src_port(&guard, 0, 9), 40_001);
+    }
+
+    /// T5 live proof: the source port never equals the target's own port, so
+    /// the stimulus's direction (`src:src_port -> dst:dst_port`) is never
+    /// symmetric and `send_recv` can tell its looped-back frame from the
+    /// echo service's reply on loopback. Target port 40000 moves the source to
+    /// 40001; a self port and the target port are both skipped; an unrelated
+    /// target port leaves the default alone.
+    #[test]
+    fn src_port_skips_the_targets_own_port() {
+        let guard = loopback_guard("*", 100);
+        assert_eq!(choose_src_port(&guard, 0, 40_000), 40_001);
+        assert_eq!(choose_src_port(&guard, 0, 9), 40_000);
+        assert_eq!(choose_src_port(&guard, 1, 40_001), 40_002);
+
+        guard.set_self_ports([40_000]);
+        assert_eq!(choose_src_port(&guard, 0, 40_001), 40_002);
+
+        // Through discovery: a target on the lane's default source port is
+        // planned with the next one.
+        let profile = l4_profile(vec![udp_target(40_000)], 10);
+        let backend = MockBackend::new(MockReply::Echo);
+        let (plans, _) = discover_all(
+            &loopback_guard("*", 100),
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &fields(&["raw"]),
+            "aitm7f3a",
+        )
+        .expect("a loopback udp target discovers");
+        assert_eq!(plans[0].src_port, 40_001);
+        assert_eq!(plans[0].target.port, 40_000);
     }
 
     #[test]
