@@ -443,18 +443,20 @@ impl IssuesState {
     /// D10): it replaces `read[id]`, and the matching `list` row and its
     /// display row are rebuilt from `issue.summary()`, so the list shows
     /// the status the reply carries. An issue the page does not list is
-    /// still kept in `read` (the next fold prunes it if it stays unlisted).
+    /// dropped, not read (fix round E, E11): the D1 invariant
+    /// `read.len() <= list.len()` then holds between folds as well.
     /// Hostile-core bounds (D6; fix round E, E1, E19): the strings the
     /// detail lines are built from are cut here, once ([`bound_issue`]),
     /// and `read` keeps at most [`READ_MAX`] entries, the oldest inserted
     /// leaving first.
     pub fn fold_issue(&mut self, mut issue: Issue) {
+        let Some(k) = self.list.iter().position(|row| row.id == issue.id) else {
+            return;
+        };
         bound_issue(&mut issue);
-        if let Some(k) = self.list.iter().position(|row| row.id == issue.id) {
-            let summary = issue.summary();
-            self.rows[k] = issue_row(&summary);
-            self.list[k] = summary;
-        }
+        let summary = issue.summary();
+        self.rows[k] = issue_row(&summary);
+        self.list[k] = summary;
         let id = issue.id.clone();
         if self.read.insert(id.clone(), issue).is_none() {
             self.read_order.push_back(id);

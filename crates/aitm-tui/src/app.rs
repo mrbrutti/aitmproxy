@@ -1473,7 +1473,8 @@ impl App {
                 }
                 // On Issues with the Detail pane focused it opens the probe
                 // (or baseline) flow under the flow cursor (D11); on the
-                // List pane the key is inert.
+                // List pane it opens the row: the Detail pane takes the
+                // focus (D11 "⏎ open or act"; fix round E, E18).
                 Mode::Scan if self.scan.tab == ScanTab::Issues => {
                     if self.scan.issues.pane == IssuePane::Detail {
                         let flow = self
@@ -1487,6 +1488,8 @@ impl App {
                         if let Some(id) = flow {
                             self.open_scan_flow(id, &mut out);
                         }
+                    } else {
+                        self.scan.issues.pane = IssuePane::Detail;
                     }
                 }
                 // On Site map it opens the focused list's selected flow in
@@ -4424,7 +4427,9 @@ impl App {
                 }
                 // The same hostile-core bound as `scan.status`: the issue
                 // is folded only under the id the tag asked for. Both
-                // verbs replace `read[id]` and the matching list row (D10).
+                // verbs replace `read[id]` and the matching list row (D10;
+                // an id the page no longer lists is not inserted, fix
+                // round E, E11).
                 if let Some(issue) = self.scan_reply_keyed::<Issue>(
                     tag,
                     name,
@@ -4432,10 +4437,26 @@ impl App {
                     |i: &Issue| i.id.as_str(),
                     OTHER_ISSUE,
                 ) {
-                    if name == "scan.issue" {
-                        self.scan.issues.flow_cursor = 0;
-                    }
+                    let answered = issue.id.clone();
                     self.scan.issues.fold_issue(issue);
+                    // A landing the pending read held back is retried once
+                    // (fix round E, E10): while the Issues tab is shown,
+                    // a cursor row other than the one answered is read
+                    // now if it is still unread (`issue_cursor_landed`
+                    // keeps the List-pane and `read` checks). Only a
+                    // successful reply retries, so there is no loop.
+                    let moved_on = self
+                        .scan
+                        .issues
+                        .cursor_issue()
+                        .is_some_and(|row| row.id != answered);
+                    if name == "scan.issue"
+                        && moved_on
+                        && self.mode == Mode::Scan
+                        && self.scan.tab == ScanTab::Issues
+                    {
+                        self.issue_cursor_landed(out);
+                    }
                 }
             }
             _ => {}

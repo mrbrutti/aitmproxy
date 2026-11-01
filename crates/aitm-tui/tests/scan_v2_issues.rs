@@ -336,7 +336,9 @@ fn cursor_on_a_row_reads_it_once_and_detail_follows_the_cursor() {
 }
 
 /// D1 (3): at most one `scan.issue` is in flight. Two landings before any
-/// reply send one request; the reply clears `pending_read`.
+/// reply send one request; the reply settles it and (fix round E, E10)
+/// retries the held landing, so the one read in flight is now the row
+/// under the cursor's.
 #[test]
 fn two_landings_before_any_reply_send_one_read() {
     let mut app = app();
@@ -347,9 +349,11 @@ fn two_landings_before_any_reply_send_one_read() {
     assert_eq!(app.scan.issues.cursor, 1);
     assert!(down.is_empty(), "a read is pending: {down:?}");
     assert_eq!(app.scan.issues.pending_read.as_deref(), Some(XSS));
-    let _ = app.on_bus(issue_reply(XSS));
-    assert_eq!(app.scan.issues.pending_read, None);
-    assert!(app.scan.inflight.is_empty());
+    let reqs = app.on_bus(issue_reply(XSS));
+    assert_eq!(reqs, vec![issue_request(REDIRECT)]);
+    assert_eq!(app.scan.issues.pending_read.as_deref(), Some(REDIRECT));
+    assert_eq!(app.scan.inflight.len(), 1, "still one read in flight");
+    assert!(!app.scan.inflight.contains(&format!("scan.issue:{XSS}")));
 }
 
 /// D3: a failed `scan.issue` clears the pending read and inserts nothing,
@@ -377,6 +381,116 @@ fn a_failed_read_leaves_the_issue_readable() {
         vec![issue_request(XSS)],
         "the failed row is asked for again"
     );
+}
+
+/// Fix round E, E10: a landing suppressed while a read was pending is
+/// retried once when that read lands. The list arriving reads row 0; `Down`
+/// to row 1 sends nothing (a read is pending); row 0's reply then leaves
+/// exactly one `scan.issue` for row 1, the row under the cursor.
+#[test]
+fn a_landing_suppressed_by_a_pending_read_is_retried_when_the_read_lands() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert_eq!(reqs, vec![issue_request(XSS)]);
+    let down = app.update(Action::Down);
+    assert!(down.is_empty(), "a read is pending: {down:?}");
+    assert_eq!(app.scan.issues.cursor, 1);
+
+    let reqs = app.on_bus(issue_reply(XSS));
+    assert_eq!(
+        reqs,
+        vec![issue_request(REDIRECT)],
+        "the row under the cursor is read once the pending read lands"
+    );
+    assert_eq!(app.scan.issues.pending_read.as_deref(), Some(REDIRECT));
+    // The reply for the row under the cursor retries nothing further.
+    let reqs = app.on_bus(issue_reply(REDIRECT));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.issues.read.len(), 2);
+    // A failed reply never retries (no retry loop): a fresh list lands on
+    // row 0, `Down` is held by the pending read, and the failure of row 0's
+    // read leaves nothing; the next landing asks again.
+    let mut app = self::app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let _ = app.update(Action::Down);
+    let reqs = app.on_bus(BusEvent::CallTaggedFailed {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        message: "scan: not_found: gone".into(),
+    });
+    assert!(reqs.is_empty(), "a failed read retries nothing: {reqs:?}");
+    assert_eq!(app.scan.issues.pending_read, None);
+    let reqs = app.update(Action::Up);
+    assert_eq!(reqs, vec![issue_request(XSS)]);
+}
+
+/// Fix round E, E11: a `scan.issue` reply for an id the page no longer
+/// lists is not inserted, so `read.len() <= list.len()` holds between
+/// folds too. Land on X, refetch to a page without X, fold X's reply:
+/// `read` stays empty.
+#[test]
+fn a_read_for_an_unlisted_id_is_not_inserted() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert_eq!(reqs, vec![issue_request(XSS)]);
+    let other = page_of(2, |k| format!("issue-0000000{k}"));
+    let reqs = app.on_bus(issues_reply(other));
+    assert!(
+        reqs.is_empty(),
+        "the pending read blocks a new one: {reqs:?}"
+    );
+    let _ = app.on_bus(issue_reply(XSS));
+    assert!(
+        app.scan.issues.read.is_empty(),
+        "an unlisted id is not read: {:?}",
+        app.scan.issues.read.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.scan.issues.pending_read.as_deref(),
+        Some("issue-00000000")
+    );
+}
+
+/// Fix round E, E12: the flow cursor is reset when the list cursor moves,
+/// not by whichever read answers. With the Detail pane focused and the
+/// flow cursor on the second flow, a `scan.issue` reply for another row
+/// leaves it there.
+#[test]
+fn a_read_answering_for_another_row_does_not_reset_the_flow_cursor() {
+    let mut app = app_with_xss_read();
+    let _ = app.update(Action::ScanPaneNext);
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.issues.flow_cursor, 1);
+    let reqs = app.on_bus(issue_reply(REDIRECT));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(
+        app.scan.issues.flow_cursor, 1,
+        "the reply moved the flow cursor"
+    );
+    assert_eq!(app.scan.issues.detail().map(|i| i.id.as_str()), Some(XSS));
+    // Moving the list cursor resets it.
+    let _ = app.update(Action::ScanPanePrev);
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.issues.flow_cursor, 0);
+}
+
+/// Fix round E, E18 (D11 "⏎ open or act"): `Enter` with the List pane
+/// focused focuses the Detail pane and sends nothing; the row stays.
+#[test]
+fn enter_on_the_list_focuses_the_detail_pane() {
+    let mut app = app_with_xss_read();
+    assert_eq!(app.scan.issues.pane, IssuePane::List);
+    let reqs = app.update(Action::Enter);
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.issues.pane, IssuePane::Detail);
+    assert_eq!(app.scan.issues.cursor, 0);
+    assert_eq!(app.mode, Mode::Scan);
+    let _ = app.update(Action::Back);
+    assert_eq!(app.scan.issues.pane, IssuePane::List, "Esc closes the pane");
+    assert_eq!(app.mode, Mode::Scan);
 }
 
 /// D5: a `scan.issue` reply naming another issue than the tag's key is not
