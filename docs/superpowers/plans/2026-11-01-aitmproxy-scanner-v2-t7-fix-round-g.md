@@ -106,6 +106,18 @@ G43. Stringly-typed `set_text`/`parse_l4_target` errors (`crates/aitm-tui/src/sc
 
 G44. Test hygiene in `tests/scan_v2_profiles.rs`: literals for the session line, the builtin-name toasts; `assert_eq!` for the exact `CHECKS_MAX`/`PROFILES_MAX`/`CHECKS_MAX + 2` counts; import `SELECTOR_MAX`; bound the description with `4 * VALUE_MAX`.
 
+## Task 10 security panel
+
+G45. **Important, priority with G20/G22.** The `scan.profile.get` reply is adopted into the editor unbounded (`crates/aitm-tui/src/app.rs` `scan.profile.get` arm; `crates/aitm-tui/src/scan/profiles.rs`): `pub fn fold_profile(tag: &str, profile: ScanProfile) -> Result<ScanProfile, ScanError>` applied before `open_editor`. The draft is echoed back on `w`/`s`, so the fold refuses rather than cuts: an uncoded `ScanError` with detail `profile exceeds bounds` when `target.origins.len() > ORIGINS_MAX (64)` or any origin is empty or over 2048 bytes, `target.l4.len() > 64`, `checks.include`/`exclude` longer than `CHECKS_MAX` or any selector fails `usable_selector`, `audit.ignore.len() > 64`, `l4.seeds.len() > 64` or any seed string over 1 MiB; `lanes` sorted and deduped. On refusal the editor stays closed, the error is recorded under the tag, and no `scan.session.preview` leaves. Test: a `scan.profile.get:standard` reply with 100_000 origins leaves `editor.is_none()`, `last_error.detail == "profile exceeds bounds"`, and no `scan.session.preview` request.
+
+G46. `ProfileSaveResult.saved` is adopted as `loaded_from` unchecked (`crates/aitm-tui/src/app.rs` `scan.profile.save` arm): accept only when `usable_selector(&saved.saved) && saved.saved == editor.draft.name`; otherwise keep `loaded_from` and record an uncoded error `save reply named a different profile`. The delete confirm description truncates the name to `SAVED_NAME_MAX`. Test: a `saved: "other"` reply leaves `loaded_from` unchanged and the error set.
+
+G47. Control characters pass `usable_selector` (`crates/aitm-tui/src/scan/profiles.rs`): also require `!s.chars().any(char::is_control)`; a list row or check failing it is dropped. Test: a profile named `"a\x1b[2Jb"` is absent from `profiles.list`.
+
+G48. Canary path shown as received (`crates/aitm-tui/src/scan/profiles.rs` `fold_preview`): cut `Canary::Flow.path` at the first `?` or `#` before `cut`. Test: `path: "/account?token=abc"` renders as `/account`.
+
+G49. Typed profile names are file-ish keys with no shape check (`crates/aitm-tui/src/app.rs` `submit_scan_profile_name`, `crates/aitm-tui/src/scan/profiles.rs` `set_text(Name)`): refuse a name containing `/`, `\`, `..`, a leading `.`, a control character, or over `SELECTOR_MAX` bytes with `profile name must be a plain file name`; one `fn plain_file_name(s) -> bool` used by both. Test: `../../x`, `/abs`, `.hidden`, a 200-byte name all refused with the prompt kept open. Core-track note (relayed to the coordinator): `scan.profile.save` must validate `name` and `grammar` server-side; the client check is defence only.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

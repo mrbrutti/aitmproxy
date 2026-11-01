@@ -499,6 +499,12 @@ Kept by the main session during stage 6. One row per finding.
 | 10 | quality | Minor | `w` prompt name bypasses trimming | fix round G (G42) |
 | 10 | quality | Minor | stringly-typed field and L4 target errors | fix round G (G43, with G26) |
 | 10 | quality | Minor | test fragments where literals exist; loose bounds | fix round G (G44) |
+| 10 | security | Important | `scan.profile.get` reply adopted into the editor unbounded; the draft is echoed back on save and start | fix round G (G45, priority): `fold_profile` refuses over bounds |
+| 10 | security | Minor | `saved` adopted as `loaded_from` unbounded and unchecked | fix round G (G46) |
+| 10 | security | Minor | control characters pass `usable_selector` | fix round G (G47) |
+| 10 | security | Minor | canary path not cut at `?`/`#` | fix round G (G48) |
+| 10 | security | Minor | typed profile names unchecked as plain file names | fix round G (G49); core-side validation relayed to the coordinator |
+| 10 | security | note | `scan.profile.get` origins and shrunk scope are not re-checked until `s` | Task 12 gate re-checks every origin and L4 target against scope before `scan.start` (brief) |
 
 ## Shipped
 
