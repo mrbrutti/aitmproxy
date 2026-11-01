@@ -1970,3 +1970,106 @@ fn an_origin_refused_by_the_rule_keeps_the_prompt_open_but_out_of_scope_closes_i
         .origins
         .is_empty());
 }
+
+/// Fix round H, H45: the Fields pane walks by key, the way the live
+/// operator drives it. From the open `standard` editor, `Esc` drops to the
+/// List pane with the draft kept, `Tab` returns to Fields, `Home` then
+/// `Down` twelve times puts the field cursor on `use_browser` (its
+/// `EDITOR_FIELDS` index), and `e` twice cycles it `auto` -> `always` ->
+/// `never`, read off the crawl Fields line at 200x50; no prompt opens.
+#[test]
+fn the_fields_pane_walks_by_key() {
+    let mut app = app();
+    open_standard(&mut app);
+    for (key, action) in [
+        (KeyCode::Esc, Action::Back),
+        (KeyCode::Tab, Action::ScanPaneNext),
+        (KeyCode::Home, Action::Home),
+        (KeyCode::Char('g'), Action::Home),
+        (KeyCode::Down, Action::Down),
+        (KeyCode::Char('j'), Action::Down),
+        (KeyCode::Char('e'), Action::ScanEdit),
+    ] {
+        assert_eq!(keys::map(press(key), Mode::Scan), Some(action), "{key:?}");
+    }
+    let _ = app.update(Action::Back);
+    assert_eq!(
+        app.scan.profiles.pane,
+        ProfilePane::List,
+        "Esc drops to the list"
+    );
+    assert!(app.scan.profiles.editor.is_some(), "the draft is kept");
+    assert_eq!(app.mode, Mode::Scan);
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(
+        app.scan.profiles.pane,
+        ProfilePane::Fields,
+        "Tab returns to Fields"
+    );
+    let _ = app.update(Action::Home);
+    let idx = EDITOR_FIELDS
+        .iter()
+        .position(|f| *f == EditorField::UseBrowser)
+        .expect("a D3 field");
+    assert_eq!(idx, 12);
+    for _ in 0..idx {
+        let _ = app.update(Action::Down);
+    }
+    let editor = app.scan.profiles.editor.as_ref().expect("an editor");
+    assert_eq!(
+        editor.field(),
+        EditorField::UseBrowser,
+        "field {}",
+        editor.field
+    );
+    let _ = app.update(Action::ScanEdit);
+    let _ = app.update(Action::ScanEdit);
+    assert_eq!(app.mode, Mode::Scan, "e on a cycle field opens no prompt");
+    let text = text_of(&app, 200, 50);
+    let line = line_with(&text, "browser ").unwrap_or_else(|| panic!("no crawl line: {text}"));
+    assert!(line.contains("browser never"), "{line:?}");
+}
+
+/// Fix round H, H45, the live walk in full: the `o` origin prompt answered
+/// first (the live cell adds the target origin before it walks the
+/// fields), then `Esc`, `Tab`, `Home`, `Down` x12, `e` x2.
+#[test]
+fn the_fields_pane_walks_by_key_after_an_origin_prompt() {
+    let mut app = app();
+    app.scope = vec!["127.0.0.1".to_string()];
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanOrigin));
+    for c in "http://127.0.0.1:8080".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let _ = app.update(Action::Submit);
+    assert_eq!(app.mode, Mode::Scan, "the prompt closed: {:?}", toast(&app));
+    let pane_after_origin = app.scan.profiles.pane;
+    let _ = app.update(Action::Back);
+    assert_eq!(
+        app.scan.profiles.pane,
+        ProfilePane::List,
+        "Esc drops to the list from {pane_after_origin:?}"
+    );
+    assert!(app.scan.profiles.editor.is_some(), "the draft is kept");
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.profiles.pane, ProfilePane::Fields);
+    let _ = app.update(Action::Home);
+    for _ in 0..12 {
+        let _ = app.update(Action::Down);
+    }
+    let editor = app.scan.profiles.editor.as_ref().expect("an editor");
+    assert_eq!(
+        editor.field(),
+        EditorField::UseBrowser,
+        "field {} after origin pane {pane_after_origin:?}",
+        editor.field
+    );
+    let _ = app.update(Action::ScanEdit);
+    let _ = app.update(Action::ScanEdit);
+    assert_eq!(app.mode, Mode::Scan, "e on a cycle field opens no prompt");
+    let text = text_of(&app, 200, 50);
+    let line = line_with(&text, "browser ").unwrap_or_else(|| panic!("no crawl line: {text}"));
+    assert!(line.contains("browser never"), "{line:?}");
+}
