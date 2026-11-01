@@ -17,8 +17,9 @@ Assert:
     `evidence.timing.correlated == True` and `evidence.timing.r >= 0.85`;
   - class `cmdi` on `/ping` with correlated timing evidence;
   - on P none of the three;
-  - per point (counted per path over the target's own request log) at most 8
-    requests carry a delay payload -- the timing checks are bounded, not a flood;
+  - per point (counted per path over the target's own request log) at most 16
+    requests carry a delay payload, 8 per timing check -- the timing checks are
+    bounded, not a flood;
   - no bundled active Rhai script calls `sleep(`: the host measures `elapsed_ms`,
     a check never waits itself (parent spec D8.2 "Timing without `sleep`").
 
@@ -61,7 +62,11 @@ ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
 # case-insensitively, so `SLEEP`, `pg_sleep` and `sleep` are one token here.
 DELAY_TOKENS = ("sleep", "waitfor")
 TIMED_PATHS = ("/items", "/orders", "/ping")
-MAX_DELAY_PROBES_PER_POINT = 8
+# Spec D2 caps a timing check at 8 delay probes per point; two timing checks run
+# here (`sqli-time`, `cmdi-time`) and both apply to every query point, so the
+# target may see up to 16 delay-bearing requests per path, 8 from each (live run
+# 2026-11-01: /items saw exactly 16, 8 per check).
+MAX_DELAY_PROBES_PER_POINT = 16
 MIN_TIMING_R = 0.85
 JOB_TIMEOUT = 600.0
 
