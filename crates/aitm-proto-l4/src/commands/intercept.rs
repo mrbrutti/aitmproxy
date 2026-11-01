@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aitm_core::{
     Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
@@ -384,7 +385,7 @@ impl Command for InterceptList {
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "List the packets currently parked awaiting a verdict, across sessions \
-                          or for one `flow` (read-only)."
+                          or for one `flow` (read-only), in arrival order, oldest first."
                 .into(),
             params: vec![ParamDef {
                 name: "flow".into(),
@@ -399,7 +400,11 @@ impl Command for InterceptList {
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let filter = optional_flow(&args)?;
         let map = self.sessions.lock();
-        let mut out: Vec<(String, Value)> = Vec::new();
+        // Arrival order, oldest first (spec §4 / AC37): the per-session sequence
+        // stamped when the packet was parked, never the random uuid string.
+        // `parked_at` then the id string break ties deterministically across
+        // sessions, whose sequences are independent.
+        let mut out: Vec<((u64, SystemTime, String), Value)> = Vec::new();
         for (fid, session) in map.iter() {
             if let Some(want) = filter {
                 if *fid != want {
@@ -410,8 +415,20 @@ impl Command for InterceptList {
                 let edit = session.edits.get(&parked.id);
                 let state = if edit.is_some() { "mutated" } else { "parked" };
                 let bytes = edit.map_or(parked.packet.bytes.as_slice(), |e| e.mutated.as_slice());
-                let value = parked_value(parked.id, *fid, state, bytes, parked.packet.dir);
-                out.push((parked_id_to_string(parked.id), value));
+                let value = parked_value(
+                    parked.id,
+                    *fid,
+                    state,
+                    bytes,
+                    parked.packet.dir,
+                    parked.parked_at,
+                );
+                let key = (
+                    parked.parked_seq,
+                    parked.parked_at,
+                    parked_id_to_string(parked.id),
+                );
+                out.push((key, value));
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -503,6 +520,7 @@ impl Command for InterceptMutate {
             "mutated",
             &new_bytes,
             parked.packet.dir,
+            parked.parked_at,
         ))
     }
 }
@@ -818,6 +836,13 @@ fn parked_fields() -> Vec<ParamDef> {
             true,
             "Decoded layer names of the (current) packet.",
         ),
+        field(
+            "parked_at",
+            TypeDesc::Int,
+            true,
+            "When the packet was parked, epoch milliseconds. `list` is ordered by \
+             arrival, oldest first.",
+        ),
     ]
 }
 
@@ -971,18 +996,27 @@ fn session_value(flow: &str, interface: &str, queue: u16, parked: usize) -> Valu
     Value::Object(o)
 }
 
+/// A `SystemTime` as epoch milliseconds; pre-epoch clamps to `0` (the same shape as
+/// `l4.flow.get`'s `timestamp`).
+fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// A parked packet as a transport-neutral object (`list` elements, `mutate` result),
-/// summarizing the current (possibly mutated) bytes.
+/// summarizing the current (possibly mutated) bytes, stamped with `parked_at`.
 fn parked_value(
     id: ParkedId,
     flow: L4FlowId,
     state: &str,
     bytes: &[u8],
     dir: L4Direction,
+    parked_at: SystemTime,
 ) -> Value {
     let summary = PacketSpec::summarize(bytes);
     let mut o = BTreeMap::new();
     o.insert("id".to_string(), Value::Str(parked_id_to_string(id)));
+    o.insert("parked_at".to_string(), Value::Int(epoch_ms(parked_at)));
     o.insert(
         "flow".to_string(),
         Value::Str(super::flow_id_to_string(flow)),
@@ -1006,13 +1040,13 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use aitm_core::{CommandHost, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
     use futures::future::BoxFuture;
 
     use crate::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
-    use crate::flow::InMemoryL4FlowStore;
+    use crate::flow::{InMemoryL4FlowStore, L4Packet};
     use crate::guard::{L4Guard, L4GuardError};
     use crate::intercept::{InterceptQueue, QueuedPacket, WireVerdict};
     use crate::types::{
@@ -1604,6 +1638,113 @@ mod tests {
         // Null spec counts as absent, so this is the bytes path, not "both".
         assert!(mutated_bytes(&Params::new(both)).is_ok());
         assert!(mutated_bytes(&one_param("bytes", Value::Array(vec![Value::Int(256)]))).is_err());
+    }
+
+    /// AC37 (plan A13): `l4.intercept.list` is in **arrival order**, oldest first,
+    /// and every entry carries `parked_at` (epoch ms). The order comes from the
+    /// per-session arrival sequence assigned when a packet is parked, never from the
+    /// random uuid string: `P2` (uuid `…0002`) is parked first and `P1` (uuid `…0001`,
+    /// which sorts *lower* as a string) second, so the list must be `[P2, P1]`.
+    #[test]
+    fn intercept_list_is_arrival_ordered() {
+        let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let sessions = Arc::new(InterceptSessions::new());
+        let (backend, _verdicts) = MockBackend::with(vec![]);
+        let start = InterceptStart::with_backend(
+            guard,
+            store,
+            sessions.clone(),
+            Some(cfg(0)),
+            mock_factory(backend),
+        );
+        let list = InterceptList::new(sessions.clone());
+        let parts = HostParts::new();
+        let host = parts.host();
+        start.invoke(start_params(0), &host).expect("start ok");
+
+        let p2 = ParkedId::from_u128(2);
+        let p1 = ParkedId::from_u128(1);
+        let packet = |payload: &[u8]| {
+            let bytes = ip_udp("10.0.0.5", payload);
+            L4Packet {
+                dir: L4Direction::Outbound,
+                timestamp: SystemTime::now(),
+                decoded: PacketSpec::summarize(&bytes),
+                bytes,
+                injected: false,
+            }
+        };
+        {
+            let map = sessions.lock();
+            let session = map.values().next().expect("one live session");
+            let deadline = SystemTime::now() + Duration::from_secs(30);
+            session
+                .handle
+                .park_for_test(p2, packet(b"arrives first"), deadline);
+            session
+                .handle
+                .park_for_test(p1, packet(b"arrives second"), deadline);
+        }
+
+        let Value::Array(items) = list.invoke(Params::default(), &host).expect("list ok") else {
+            panic!("list returns an array");
+        };
+        let field = |v: &Value, name: &str| -> Value {
+            let Value::Object(o) = v else {
+                panic!("a parked entry is an object");
+            };
+            o.get(name)
+                .unwrap_or_else(|| panic!("entry lacks `{name}`"))
+                .clone()
+        };
+        let ids: Vec<Value> = items.iter().map(|v| field(v, "id")).collect();
+        assert_eq!(
+            ids,
+            vec![
+                Value::Str("00000000-0000-0000-0000-000000000002".into()),
+                Value::Str("00000000-0000-0000-0000-000000000001".into()),
+            ],
+            "arrival order, not uuid string order"
+        );
+        let parked_at: Vec<i64> = items
+            .iter()
+            .map(|v| match field(v, "parked_at") {
+                Value::Int(ms) => ms,
+                other => panic!("`parked_at` must be an Int (epoch ms), got {other:?}"),
+            })
+            .collect();
+        assert!(
+            parked_at[0] <= parked_at[1],
+            "the first-listed (oldest) entry's parked_at {} must be <= the next {}",
+            parked_at[0],
+            parked_at[1]
+        );
+        // Epoch milliseconds, not seconds or nanoseconds: after 2020-01-01T00:00:00Z
+        // and before 3000-01-01T00:00:00Z.
+        assert!(
+            parked_at[0] > 1_577_836_800_000 && parked_at[0] < 32_503_680_000_000,
+            "parked_at {} is not an epoch-ms timestamp",
+            parked_at[0]
+        );
+
+        // The schema advertises the new field as an Int.
+        let TypeDesc::Array(elem) = list.schema().result else {
+            panic!("list result is an array");
+        };
+        let TypeDesc::Object(fields) = *elem else {
+            panic!("list elements are objects");
+        };
+        let parked_at_field = fields
+            .iter()
+            .find(|f| f.name == "parked_at")
+            .expect("schema lists `parked_at`");
+        assert!(
+            matches!(parked_at_field.ty, TypeDesc::Int),
+            "`parked_at` is an Int in the schema, got {:?}",
+            parked_at_field.ty
+        );
+        assert!(parked_at_field.required);
     }
 
     // ---- Linux-gated functional tests (real NFQUEUE on a loopback nft queue) ---

@@ -95,6 +95,12 @@ pub struct ParkedPacket {
     pub state: L4InterceptState,
     /// When `on_timeout` applies if no verdict arrives first.
     pub deadline: SystemTime,
+    /// Arrival sequence within its session: assigned from a monotonic per-session
+    /// counter when the packet is parked, so `l4.intercept.list` can order parked
+    /// packets oldest first (the id is a random uuid and carries no order).
+    pub parked_seq: u64,
+    /// When the packet was parked (`l4.intercept.list` reports it as epoch ms).
+    pub parked_at: SystemTime,
 }
 
 /// The platform `InterceptState` model, at the packet level. A `backup` of the
@@ -218,8 +224,44 @@ struct ParkedEntry {
 
 /// The parked-packet table shared between the reader thread and the handle: the
 /// thread inserts/expires, commands read ([`InterceptHandle::parked`]) and submit
-/// verdicts.
-type ParkedTable = HashMap<ParkedId, ParkedEntry>;
+/// verdicts. It also owns the session's **arrival sequence**: [`ParkedTable::park`]
+/// takes the next number under the same lock as the insert, so `parked_seq` order
+/// is exactly insertion order (spec §4 / AC37).
+#[derive(Debug, Default)]
+struct ParkedTable {
+    entries: HashMap<ParkedId, ParkedEntry>,
+    /// The next arrival sequence number for this session (monotonic, from 0).
+    next_seq: u64,
+}
+
+impl ParkedTable {
+    /// Park `packet` as `id` behind the backend `handle`, stamping its arrival
+    /// sequence and `parked_at`. The only way a packet enters the table.
+    fn park(
+        &mut self,
+        handle: u32,
+        id: ParkedId,
+        flow: L4FlowId,
+        packet: L4Packet,
+        parked_at: SystemTime,
+        deadline: SystemTime,
+    ) {
+        let parked_seq = self.next_seq;
+        self.next_seq += 1;
+        let parked = ParkedPacket {
+            id,
+            flow,
+            packet: packet.clone(),
+            state: L4InterceptState::Parked {
+                backup: Box::new(packet),
+            },
+            deadline,
+            parked_seq,
+            parked_at,
+        };
+        self.entries.insert(id, ParkedEntry { handle, parked });
+    }
+}
 
 /// A verdict a command submits for a parked packet (M5 Task 12 routes through
 /// here). Applied on the reader thread so the backend stays single-owner.
@@ -259,6 +301,7 @@ impl InterceptHandle {
         self.parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entries
             .values()
             .map(|e| e.parked.clone())
             .collect()
@@ -330,7 +373,7 @@ pub fn start_intercept(
     };
     let permit = guard.check(L4Action::Intercept, &bind_target)?;
 
-    let parked: Arc<Mutex<ParkedTable>> = Arc::new(Mutex::new(ParkedTable::new()));
+    let parked: Arc<Mutex<ParkedTable>> = Arc::new(Mutex::new(ParkedTable::default()));
     let stop = Arc::new(AtomicBool::new(false));
     let (verdict_tx, verdict_rx) = mpsc::channel::<VerdictRequest>();
     let (open_tx, open_rx) = mpsc::channel::<Result<L4FlowId, L4Error>>();
@@ -454,6 +497,7 @@ fn apply_submitted(
     let entry = parked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+        .entries
         .remove(&req.id);
     if let Some(entry) = entry {
         let _ = queue.verdict(entry.handle, wire_of(req.verdict, req.mutated));
@@ -467,6 +511,7 @@ fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_ti
     let due: Vec<ParkedId> = {
         let table = parked.lock().unwrap_or_else(PoisonError::into_inner);
         table
+            .entries
             .iter()
             .filter(|(_, e)| e.parked.state.is_live() && e.parked.deadline <= now)
             .map(|(id, _)| *id)
@@ -476,6 +521,7 @@ fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_ti
         let entry = parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entries
             .remove(&id);
         if let Some(entry) = entry {
             let _ = queue.verdict(entry.handle, wire_of(on_timeout, None));
@@ -489,6 +535,7 @@ fn drain_forward(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>) {
     let ids: Vec<ParkedId> = parked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+        .entries
         .keys()
         .copied()
         .collect();
@@ -496,6 +543,7 @@ fn drain_forward(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>) {
         let entry = parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entries
             .remove(&id);
         if let Some(entry) = entry {
             let _ = queue.verdict(entry.handle, WireVerdict::Forward(None));
@@ -532,7 +580,7 @@ fn process_packet(
     // Overflow: fail open (default Forward) rather than black-hole the packet.
     {
         let table = parked.lock().unwrap_or_else(PoisonError::into_inner);
-        if table.len() as u32 >= params.config.max_parked {
+        if table.entries.len() as u32 >= params.config.max_parked {
             drop(table);
             let _ = queue.verdict(qp.handle, wire_of(params.config.on_overflow, None));
             return;
@@ -546,26 +594,15 @@ fn process_packet(
         bytes: qp.bytes.clone(),
         injected: false,
     };
-    let id = ParkedId::new();
-    let parked_pkt = ParkedPacket {
-        id,
-        flow: flow_id,
-        packet: packet.clone(),
-        state: L4InterceptState::Parked {
-            backup: Box::new(packet.clone()),
-        },
-        deadline: now + params.config.verdict_timeout,
-    };
-    parked
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(
-            id,
-            ParkedEntry {
-                handle: qp.handle,
-                parked: parked_pkt,
-            },
-        );
+    // Park under the table's lock, which stamps the arrival sequence (AC37).
+    parked.lock().unwrap_or_else(PoisonError::into_inner).park(
+        qp.handle,
+        ParkedId::new(),
+        flow_id,
+        packet.clone(),
+        now,
+        now + params.config.verdict_timeout,
+    );
     // Record the parked packet in the interception flow (observed, not injected).
     store.append_packet(flow_id, packet);
 }
@@ -610,6 +647,39 @@ pub(crate) fn ip_target(
         dst_port,
         proto,
     })
+}
+
+// Test-only seams. They sit after every production item on purpose: the AC21
+// tripwire in `tests/hard_gates.rs` audits the text before the first test-only
+// `cfg` attribute as the production code.
+#[cfg(test)]
+impl ParkedId {
+    /// A deterministic id for tests that need to control uuid string order.
+    #[must_use]
+    pub fn from_u128(v: u128) -> Self {
+        Self(Uuid::from_u128(v))
+    }
+}
+
+#[cfg(test)]
+impl InterceptHandle {
+    /// Park `packet` under a caller-chosen `id` with no backend packet behind it
+    /// (the kernel handle is a sentinel), through the same [`ParkedTable::park`]
+    /// path the reader uses, so the command layer can prove arrival ordering with
+    /// deterministic ids. A verdict on it is a no-op at the mock queue.
+    pub(crate) fn park_for_test(&self, id: ParkedId, packet: L4Packet, deadline: SystemTime) {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .park(
+                u32::MAX,
+                id,
+                self.flow_id,
+                packet,
+                SystemTime::now(),
+                deadline,
+            );
+    }
 }
 
 #[cfg(test)]
