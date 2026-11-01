@@ -31,6 +31,8 @@ use aitm::{config_file, env, operator_token, tui};
 use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
+use aitm_sysproxy::watchdog::{self, WatchdogArgs};
+use aitm_sysproxy::Recovery;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -53,7 +55,26 @@ enum Mode {
     /// into the config file and exit, before any service is built (spec F2).
     /// CLI-only; never dispatched through the registry, so no agent can run it.
     OperatorToken { force: bool },
+    /// `sysproxy-watchdog --pid <n> --state <path> [--no-pipe]`: the hidden
+    /// system-proxy watchdog the core spawns on every successful set
+    /// (system-proxy spec §D9 (b)). It waits for the core to die, then runs
+    /// the restore rule over the state file. Never in usage text, never in
+    /// the CLI registry; parsed here like `operator-token`.
+    SysproxyWatchdog {
+        pid: u32,
+        state: PathBuf,
+        no_pipe: bool,
+    },
 }
+
+/// `operator-token`'s usage line (spec F2).
+const OPERATOR_TOKEN_USAGE: &str =
+    "usage: aitm [--config <path>] operator-token generate [--force]";
+
+/// The hidden watchdog's usage line: printed only to a caller that spelled
+/// the hidden subcommand itself and got its arguments wrong (exit 2).
+const SYSPROXY_WATCHDOG_USAGE: &str =
+    "usage: aitm sysproxy-watchdog --pid <pid> --state <file> [--no-pipe]";
 
 /// Classify `argv`. `tui` takes no arguments; anything after it is a usage
 /// error carrying the line to print. `web` is recognised here and its
@@ -65,7 +86,89 @@ fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
         Some("tui") => Err(tui::USAGE.to_string()),
         Some("web") => Ok(Mode::Web),
         Some("operator-token") => parse_operator_token(&argv[1..]),
+        Some("sysproxy-watchdog") => parse_sysproxy_watchdog(&argv[1..]),
         Some(_) => Ok(Mode::Cli(argv)),
+    }
+}
+
+/// Classify the arguments after `sysproxy-watchdog`: `--pid <n>` and
+/// `--state <path>` are both required, `--no-pipe` is optional; anything else,
+/// a missing value or a non-numeric pid is a usage error (the process exits
+/// `watchdog::EXIT_BAD_ARGS`, 2, like every other usage error here).
+fn parse_sysproxy_watchdog(rest: &[String]) -> Result<Mode, String> {
+    let mut pid: Option<u32> = None;
+    let mut state: Option<PathBuf> = None;
+    let mut no_pipe = false;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--pid" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("--pid requires a value\n{SYSPROXY_WATCHDOG_USAGE}"))?;
+                pid = Some(value.parse().map_err(|_| {
+                    format!("--pid `{value}` is not a number\n{SYSPROXY_WATCHDOG_USAGE}")
+                })?);
+            }
+            "--state" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("--state requires a path\n{SYSPROXY_WATCHDOG_USAGE}"))?;
+                state = Some(PathBuf::from(value));
+            }
+            "--no-pipe" => no_pipe = true,
+            other => {
+                return Err(format!(
+                    "unknown argument `{other}`\n{SYSPROXY_WATCHDOG_USAGE}"
+                ))
+            }
+        }
+    }
+    match (pid, state) {
+        (Some(pid), Some(state)) => Ok(Mode::SysproxyWatchdog {
+            pid,
+            state,
+            no_pipe,
+        }),
+        _ => Err(SYSPROXY_WATCHDOG_USAGE.to_string()),
+    }
+}
+
+/// Plan C5: the system-proxy engine's startup recovery and orderly-exit
+/// restore run only for a process that serves (`Server`, `Tui`, `Web`). A
+/// one-shot `Cli` dispatch, the token generator and the watchdog itself
+/// never touch the system proxy from `main` (spec §D10).
+fn manages_system_proxy(mode: &Mode) -> bool {
+    matches!(mode, Mode::Server | Mode::Tui | Mode::Web)
+}
+
+/// One log line per recovery outcome: `warn!` when it failed, `info!`
+/// otherwise. `phase` is `startup` (§D9 (c)) or `exit` (§D9 (a)).
+fn log_recovery(phase: &str, recovery: &Recovery) {
+    match recovery {
+        Recovery::Nothing => info!(phase, "system proxy: nothing to do"),
+        Recovery::Set(status) => info!(
+            phase,
+            state = status.state.as_str(),
+            "system proxy: set to this core (system_proxy.auto)"
+        ),
+        Recovery::Adopted { pid } => {
+            info!(phase, pid, "system proxy: adopted the leftover setting")
+        }
+        Recovery::Restored {
+            restored,
+            left_alone,
+        } => info!(
+            phase,
+            restored = restored.len(),
+            left_alone = left_alone.len(),
+            "system proxy: restored the previous setting"
+        ),
+        Recovery::Forgot => info!(
+            phase,
+            "system proxy: another tool owns the system proxy; forgot the state file"
+        ),
+        Recovery::Failed(msg) => warn!(phase, "system proxy: {msg}"),
     }
 }
 
@@ -73,19 +176,22 @@ fn parse_mode(argv: Vec<String>) -> Result<Mode, String> {
 /// valid; an unknown sub-verb or flag is a usage error carrying the line to
 /// print. This stays out of the CLI registry (spec F2) so no agent reaches it.
 fn parse_operator_token(rest: &[String]) -> Result<Mode, String> {
-    const USAGE: &str = "usage: aitm [--config <path>] operator-token generate [--force]";
     match rest.first().map(String::as_str) {
         Some("generate") => {
             let mut force = false;
             for arg in &rest[1..] {
                 match arg.as_str() {
                     "--force" => force = true,
-                    other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+                    other => {
+                        return Err(format!(
+                            "unknown argument `{other}`\n{OPERATOR_TOKEN_USAGE}"
+                        ))
+                    }
                 }
             }
             Ok(Mode::OperatorToken { force })
         }
-        _ => Err(USAGE.to_string()),
+        _ => Err(OPERATOR_TOKEN_USAGE.to_string()),
     }
 }
 
@@ -141,11 +247,31 @@ async fn run() -> anyhow::Result<()> {
         println!("{}", operator_token::confirmation_message(&written));
         return Ok(());
     }
+    // The system-proxy watchdog (spec §D9 (b)) needs no config, no tracing
+    // and no service: the state file carries everything it restores from.
+    // Its parent nulled its stdout/stderr, so it never prints; its exit code
+    // is the whole report (0 done, 2 bad arguments, 3 restore failed).
+    if let Mode::SysproxyWatchdog {
+        pid,
+        state,
+        no_pipe,
+    } = &mode
+    {
+        std::process::exit(watchdog::run(&WatchdogArgs {
+            pid: *pid,
+            state: state.clone(),
+            no_pipe: *no_pipe,
+        }));
+    }
 
     // The TUI owns the terminal, so its subscriber must not write there.
     let tui_log = match mode {
         Mode::Tui => tui::init_tracing(),
-        Mode::Server | Mode::Cli(_) | Mode::Web | Mode::OperatorToken { .. } => {
+        Mode::Server
+        | Mode::Cli(_)
+        | Mode::Web
+        | Mode::OperatorToken { .. }
+        | Mode::SysproxyWatchdog { .. } => {
             init_tracing();
             TuiLog::Off
         }
@@ -157,8 +283,9 @@ async fn run() -> anyhow::Result<()> {
         rhai: mut rhai_cfg,
         mut l4,
         macos_capture,
-        // Read by `wire.rs` from Task 10 on (the `SystemProxy` engine).
-        system_proxy: _,
+        // The `system_proxy:` section: `wire.rs` builds the `SystemProxy`
+        // engine from it, and `auto` drives the startup recovery below.
+        system_proxy,
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
@@ -273,6 +400,7 @@ async fn run() -> anyhow::Result<()> {
         l4,
         l4_shared,
         macos_capture,
+        system_proxy: system_proxy.clone(),
         ..Features::default()
     };
     let assembled = assemble_with_scripts(
@@ -309,6 +437,9 @@ async fn run() -> anyhow::Result<()> {
         l4_guard,
         // The write side of `capture.status`, consumed by the feeder below.
         capture_status,
+        // The system-proxy engine: startup recovery before serving, restore on
+        // the orderly exit path (system-proxy spec §D8, §D9 (a)/(c)).
+        sysproxy,
         // `..` stands only for the private `governance` (taken above). Any new
         // `pub` field of `Assembled` must be named here, not absorbed by it.
         ..
@@ -342,6 +473,15 @@ async fn run() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // §D9 (c): before serving, judge any leftover state file (reboot, power
+    // loss, a killed watchdog) and, with `system_proxy.auto`, point the system
+    // proxy at this core. Serving modes only (plan C5); a one-shot process
+    // returned above. Blocking shell-outs, but nothing is served yet.
+    if manages_system_proxy(&mode) {
+        let recovery = sysproxy.recover_at_startup(system_proxy.auto);
+        log_recovery("startup", &recovery);
     }
 
     // Pre-bind every service port up front, before obscura is spawned and before
@@ -605,6 +745,15 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
+    // §D9 (a): whichever arm ended the run, give the system proxy back before
+    // anything else — a dead port is never acceptable — whether or not `auto`
+    // set it. Runs ahead of the browser reap so the restore lands inside the
+    // mac app's stop grace even when the browser is slow to close.
+    if manages_system_proxy(&mode) {
+        let recovery = sysproxy.on_orderly_exit();
+        log_recovery("exit", &recovery);
+    }
+
     // Whichever arm ended the run, reap the browser child before returning;
     // a signal would otherwise leave it orphaned (no destructor runs).
     if let Some(b) = launched {
@@ -791,9 +940,12 @@ mod tests {
 
     use aitm_core::McpTransport;
 
+    use aitm::wire::{build_proxy_with, Features};
+
     use super::{
-        apply_bus_endpoint_file, build_env_filter, parse_mode, split_bus_endpoint_file_arg,
-        split_config_arg, split_script_args, Mode,
+        apply_bus_endpoint_file, build_env_filter, manages_system_proxy, parse_mode,
+        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Mode,
+        OPERATOR_TOKEN_USAGE,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
@@ -1102,6 +1254,109 @@ mod tests {
             parse_mode(args(&["tui", "extra"])),
             Err("usage: aitm [--config <path>] tui (takes no further arguments)".to_string())
         );
+    }
+
+    /// SP-AC13 (`parse_mode` half): the hidden watchdog mode parses exactly
+    /// `--pid <n> --state <path> [--no-pipe]`; anything less is the usage line.
+    #[test]
+    fn parse_mode_sysproxy_watchdog() {
+        assert_eq!(
+            parse_mode(args(&["sysproxy-watchdog", "--pid", "1", "--state", "/x"])),
+            Ok(Mode::SysproxyWatchdog {
+                pid: 1,
+                state: PathBuf::from("/x"),
+                no_pipe: false,
+            })
+        );
+        assert_eq!(
+            parse_mode(args(&[
+                "sysproxy-watchdog",
+                "--pid",
+                "1",
+                "--state",
+                "/x",
+                "--no-pipe"
+            ])),
+            Ok(Mode::SysproxyWatchdog {
+                pid: 1,
+                state: PathBuf::from("/x"),
+                no_pipe: true,
+            })
+        );
+        let err = parse_mode(args(&["sysproxy-watchdog", "--pid", "1"])).unwrap_err();
+        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
+        let err = parse_mode(args(&["sysproxy-watchdog", "--state", "/x"])).unwrap_err();
+        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
+        let err =
+            parse_mode(args(&["sysproxy-watchdog", "--pid", "x", "--state", "/x"])).unwrap_err();
+        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
+        let err = parse_mode(args(&[
+            "sysproxy-watchdog",
+            "--pid",
+            "1",
+            "--state",
+            "/x",
+            "--bogus",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("usage: aitm sysproxy-watchdog"), "{err}");
+        assert!(err.contains("--bogus"), "{err}");
+    }
+
+    /// §D9 (b): the watchdog subcommand is hidden — no usage text reachable
+    /// from this binary names it, and it is never a registry command, so the
+    /// CLI dispatcher's `usage()` over the assembled registry has no line for it.
+    #[test]
+    fn usage_does_not_mention_the_watchdog() {
+        for (name, text) in [
+            ("tui::USAGE", aitm::tui::USAGE),
+            ("web::USAGE", aitm::web::USAGE),
+            ("operator-token usage", OPERATOR_TOKEN_USAGE),
+        ] {
+            assert!(
+                !text.contains("sysproxy-watchdog"),
+                "{name} mentions the hidden watchdog:\n{text}"
+            );
+        }
+        let mut cfg = aitm_core::Config::default();
+        cfg.ca.dir = std::env::temp_dir().join(format!(
+            "aitm-main-usage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let proxy = build_proxy_with(&cfg, &Features::default()).expect("assemble");
+        let usage = aitm_cli::Cli::new(proxy.registry_arc()).usage();
+        assert!(
+            usage.contains("proxy system status"),
+            "the real registry is being listed:\n{usage}"
+        );
+        assert!(
+            !usage.contains("sysproxy-watchdog"),
+            "the CLI dispatcher lists the hidden watchdog:\n{usage}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// Plan C5: `recover_at_startup` / `on_orderly_exit` run only in the
+    /// serving modes; a one-shot `aitm proxy system status`, the token
+    /// generator and the watchdog itself never touch the system proxy here.
+    #[test]
+    fn recovery_runs_only_in_serving_modes() {
+        assert!(manages_system_proxy(&Mode::Server));
+        assert!(manages_system_proxy(&Mode::Tui));
+        assert!(manages_system_proxy(&Mode::Web));
+        assert!(!manages_system_proxy(&Mode::Cli(args(&[
+            "proxy", "system", "status"
+        ]))));
+        assert!(!manages_system_proxy(&Mode::OperatorToken { force: false }));
+        assert!(!manages_system_proxy(&Mode::SysproxyWatchdog {
+            pid: 1,
+            state: PathBuf::from("/x"),
+            no_pipe: false,
+        }));
     }
 
     #[test]
