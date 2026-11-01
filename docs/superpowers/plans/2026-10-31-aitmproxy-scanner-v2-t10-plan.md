@@ -487,6 +487,44 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| PR A whole branch | security | Important | `strip_prefix_ci` byte-slices request text; non-ASCII after `;` panics the serving task (`inject.rs`) | fixed in 78718ec9 |
+| PR A whole branch | security | Important | `redirect()` `expect`s a `Location` built from the open-redirect `next`; CR/LF panics (`app.rs`) | fixed in 78718ec9 |
+| PR A whole branch | spec | Important | `/log/conns` stamps an upgraded `/ws` connection closed at the 101 (hyper hands the socket off) | fixed in c1598509 (`ConnInfo.upgraded`; only the ws loop closes it) |
+| PR A whole branch | quality | Important | plain and TLS accept loops swallow errors and hot-spin; the loop is copied three times | fixed in 51443db2 (`listeners::accept_loop`, 10 ms back-off) |
+| PR A whole branch | quality | Important | `html_escape` duplicated into `ws.rs` | fixed in 73f82077 |
+| PR A whole branch | quality | Important | a speaker that cannot rebind after the crash window dies silently | fixed in d17f9192 (open-ended `downtime` row + stderr line) |
+| PR A whole branch | orchestrator (gate log) | Important | serve binary panics on EPIPE when its stdout reader goes away | fixed in 198a8c50 |
+| PR A whole branch | security | Minor | DNS replies 12 bytes to a datagram shorter than 12 (amplification) | fixed in 1c4b168c (no reply) |
+| PR A whole branch | security | Minor | multipart boundary unbounded; O(n*m) scan | fixed in 1c4b168c (70-byte cap -> 400) |
+| PR A whole branch | security | Minor | comment and session stores unbounded | fixed in 1c4b168c (1 000 / 10 000, evict oldest) |
+| PR A whole branch | security | Minor | `POST /reset` reachable by browser CSRF | fixed in 1c4b168c (403 on any `Origin` header) |
+| PR A whole branch | security | Minor | `x-*` credential headers stored verbatim | fixed in 1c4b168c (`x-api-key`, `x-auth-token`, `x-csrf-token`, `x-amz-security-token` -> `"<redacted>"`; D2 amended) |
+| PR A whole branch | security | Minor | WS frame loop drains per frame (quadratic memmove) | fixed in 1c4b168c |
+| PR A whole branch | security | Minor | no handshake/header/idle/connection-count limits on the listeners | accepted by the T10 session 2026-11-01 (loopback test target driven only by the harness; not a product surface) |
+| PR A whole branch | spec | Minor | one self-signed certificate per listener, spec says per process | fixed in fce265a3 (one `Identity` minted by the builder; socket test asserts equal leaf DER) |
+| PR A whole branch | spec | Minor | `/ws` over h2 answers the spec literal only when key+version are present | fixed in fce265a3 (h2 check first) |
+| PR A whole branch | spec | Minor | `/logout-after` counts only `/account` requests; spec said any request | accepted: spec amended in 23d09aba (counts authenticated `/account` requests; T2's canary replays `/account`) |
+| PR A whole branch | spec | Minor | `l4.rs` gained `try_start`, spec said unchanged | fixed in fce265a3 (`pub(crate)`, no `Option`); spec amended in 23d09aba |
+| PR A whole branch | spec | Minor | stale MQTT `32 0A` literal in manifest and a test comment | fixed in fce265a3 |
+| PR A whole branch | spec | Minor | `seed_index()` lists `/items` twice vs plan "once" | accepted: plan A1 wording corrected in 23d09aba; after item 32 `/items` appears once and `/orders` carries the timing seed |
+| PR A whole branch | quality | Minor | test-only items kept alive with `allow(dead_code)` | fixed in 5efa9eff (`#[cfg(test)]`, `Opcode::as_str` deleted) |
+| PR A whole branch | quality | Minor | stale plan-breadcrumb comments | fixed in 5efa9eff |
+| PR A whole branch | quality | Minor | `speakers::classify` twin of `driver::classified` | fixed in 5efa9eff (deleted) |
+| PR A whole branch | quality | Minor | three JSON builders and a `String`-only `html()` | fixed in f12a2f3e (`json`/`text_plain`/`with_content_type` in `app.rs`, `impl Into<Bytes>`) |
+| PR A whole branch | quality | Minor | `seq`/`ts_ms` placeholder stamping in every producer (`Stamped<T>` refactor) | accepted by the T10 session 2026-11-01 (churn over value in test support code) |
+| PR A whole branch | quality | Minor | stringly-typed `role`/`proto` on `ServiceInfo` | accepted by the T10 session 2026-11-01 (same reason) |
+| PR A whole branch | quality | Minor | speaker conventions differ (`const`/`static` DEF, `msg` helper order, `consumed` on Trigger/Fault) | fixed in ecce2cc3 (all `pub const DEF`, one `msg` helper, driver hashes the whole pending buffer on Trigger/Fault; `speakers_live` asserts exact hashes) |
+| PR A whole branch | quality | Minor | per-message allocations on hot paths | fixed in ecce2cc3 (`sha256_hex` via `digest`, `with_l4`, log before drain) |
+| PR A whole branch | quality | Minor | `handshake_verdict` nine positional args | fixed in da660119 |
+| PR A whole branch | quality | Minor | TLS `Box<dyn Error>`, ALPN kept twice | fixed in fce265a3 / da660119 |
+| PR A whole branch | quality | Minor | wider visibility than needed (`pub mod speakers`, `pub(crate)` helpers, `_l4`) | fixed in 5efa9eff |
+| PR A whole branch | quality | Minor | two cookie parsers and two form/query decoders | fixed in f12a2f3e (one `parse_cookies` in `log.rs`; `form_param` delegates); a bare cookie token without `=` is no longer a name |
+| PR A whole branch | quality | Minor | a body that fails mid-read is dispatched as an empty request | fixed in f12a2f3e (400, logged 400) |
+| PR A whole branch | quality | Minor | doc nits (`control.rs` route count, `pg_sleep` attribution) | fixed in 1c4b168c / 5efa9eff |
+| PR A whole branch | quality | Minor | mirrored hash expectation, 100 ms wall-clock bound, duplicated test helpers (`tests/common`) | fixed in ecce2cc3 (literal prefixes, bound dropped); `tests/common/mod.rs` accepted as-is by the T10 session 2026-11-01 |
+| PR A whole branch | quality | Minor | small idiom items (`SeedMode` import, `touch`/`arm` locking, `Action::Fault` sentinel) | fixed in ecce2cc3 |
+| PR A whole branch | T3 / coordinator | Important | reflection rows must be class `reflected-xss`; WS rows `ws-cswsh` / `ws-injection` (family vocabulary) | fixed in c73952c3 (item 31) and the item-33 commit |
+| PR A whole branch | B8 coder (spec gap) | Important | boolean and time-based SQLi on one point dedupe into one issue under D6 | fixed in 932f31de (timing seed moved to `/orders?id=`); spec amended in 0211ed84 |
 
 ## Shipped
 
