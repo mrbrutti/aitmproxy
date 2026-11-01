@@ -943,7 +943,7 @@ extension ScanSurfaceTests {
 
         // `aboveIntensity` follows the rank: a passive profile greys everything but passive checks.
         let passive = ScanCheckTree(checks: checks, selection: selection, intensity: .passive, query: "")
-        let above = Dictionary(uniqueKeysWithValues: passive.groups.flatMap(\.leaves).map { ($0.meta.id, $0.aboveIntensity) })
+        let above = Dictionary(passive.groups.flatMap(\.leaves).map { ($0.meta.id, $0.aboveIntensity) }, uniquingKeysWith: { first, _ in first })
         #expect(above["http.custom-marker"] == false)
         #expect(above["http.sqli-error"] == true)
         #expect(above["http.reflected-xss"] == true)

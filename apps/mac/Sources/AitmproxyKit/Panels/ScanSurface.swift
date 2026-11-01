@@ -361,6 +361,8 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     // Push
     public var lastSeq: [String: UInt64] = [:]
+    /// Jobs this app started that `scan.list` has not carried yet (kept ahead of the list).
+    public var locallyStarted: Set<String> = []
     public var refreshNeeded: Set<String> = []
     public var listRefreshNeeded = false
     public var issuesRefreshNeeded = false
@@ -405,9 +407,13 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         if origins.isEmpty, profile.target.l4Rows.isEmpty {
             // A profile with nothing to aim at never reaches the bus: an HTTP/WS profile
             // wants an origin; a pure-L4 one wants an L4 target in its `target.l4` list.
-            return profile.lanes.contains(where: { !$0.isL4 })
+            return profile.lanes.contains(where: { !$0.isL4 }) || profile.lanes.isEmpty
                 ? "Choose at least one in-scope origin."
                 : "This profile has no L4 targets; add one to its target.l4 list."
+        }
+        // A blank row is not a host to add to scope; it is a missing origin.
+        if origins.contains(where: { $0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            return "Choose at least one in-scope origin."
         }
         for origin in origins {
             guard let authority = ScanForm.authority(of: origin), Scope.contains(authority, in: scopeHosts) else {
@@ -497,7 +503,10 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// list does not carry yet stays in front of it.
     public mutating func applyList(_ result: ScanListResult) {
         let listed = Set(result.jobs.map(\.job))
-        let pending = jobs.filter { !listed.contains($0.job) }
+        // Only a job this app started and the core has not listed yet stays ahead of the
+        // list; a job the core itself stopped listing (restart, history cap) goes with it.
+        let pending = jobs.filter { !listed.contains($0.job) && locallyStarted.contains($0.job) }
+        locallyStarted.subtract(listed)
         jobs = pending + result.jobs
         jobsError = nil
     }
@@ -514,6 +523,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// Jobs tab opens; `clamped` and `lanes.skipped` become its notices.
     public mutating func applyStart(_ result: ScanStartResult) {
         statuses[result.job] = result.status
+        locallyStarted.insert(result.job)
         if let index = jobs.firstIndex(where: { $0.job == result.job }) {
             jobs[index] = result.status.summary
         } else {

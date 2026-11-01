@@ -622,13 +622,13 @@ extension ScanModelTests {
 
         // Terminal states and events.
         #expect([ScanJobState.queued, .running, .cancelling].allSatisfy { !$0.isTerminal })
-        #expect([ScanJobState.done, .cancelled, .failed].allSatisfy(\.isTerminal))
+        #expect([ScanJobState.done, .cancelled, .failed].allSatisfy { $0.isTerminal })
         #expect([ScanJobState.queued, .running, .cancelling, .done, .cancelled, .failed].map(\.word)
                 == ["Queued", "Running", "Cancelling", "Done", "Cancelled", "Failed"])
         #expect([ScanPhase.queued, .crawling, .passive, .auditing, .reporting, .done].map(\.word)
                 == ["Queued", "Crawling", "Passive", "Auditing", "Reporting", "Done"])
         #expect([ScanJobEvent.started, .phase, .progress, .issue].allSatisfy { !$0.isTerminal })
-        #expect([ScanJobEvent.finished, .cancelled, .failed].allSatisfy(\.isTerminal))
+        #expect([ScanJobEvent.finished, .cancelled, .failed].allSatisfy { $0.isTerminal })
 
         // `init?(rawValue:)` never returns nil for any vocabulary; the raw text survives.
         #expect(ScanPhase(rawValue: "warming") == .other("warming"))
