@@ -478,4 +478,75 @@ mod tests {
         let scopes: Vec<Scope> = got.iter().map(|s| s.scope).collect();
         assert_eq!(scopes, vec![Scope::System]);
     }
+
+    // ---- tester, whole-branch pass (plan C16) ----
+
+    #[test]
+    fn trust_statuses_windows_and_fedora_scope_orders() {
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::Windows, &exec).unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.scope).collect::<Vec<_>>(),
+            vec![Scope::User, Scope::System]
+        );
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::Linux(LinuxFamily::Fedora), &exec).unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.scope).collect::<Vec<_>>(),
+            vec![Scope::System]
+        );
+    }
+
+    /// The first store that cannot answer fails the whole read: the error
+    /// propagates, the later scope is never queried, and so `read_ca_trust`
+    /// (which maps `Err` to no word) never shows a half-read verdict.
+    #[test]
+    fn trust_statuses_stops_at_the_first_failing_store() {
+        let exec = ScriptedExecutor::new().unspawnable("find-certificate");
+        let err = trust_statuses(&cert(), &Platform::MacOs, &exec).unwrap_err();
+        assert!(
+            err.to_string().contains("find-certificate"),
+            "the error names the tool that could not start: {err}"
+        );
+        assert_eq!(
+            exec.runs(),
+            vec![
+                "security find-certificate -a -Z /Users/t/Library/Keychains/login.keychain-db"
+                    .to_string()
+            ],
+            "fail fast: the System keychain is never queried after the user one failed"
+        );
+    }
+
+    /// The word the ready card and `ca.status` share: a certificate present
+    /// in the login keychain and passing `verify-cert` is `Yes` there and
+    /// `No` in the (empty) System keychain, in scope order.
+    #[test]
+    fn trust_statuses_reports_a_trusted_user_store() {
+        let c = cert();
+        let present = format!("SHA-256 hash: {}\n", c.sha256_hex());
+        let exec = ScriptedExecutor::new()
+            .respond(
+                "security find-certificate -a -Z /Users/t/Library/Keychains/login.keychain-db",
+                0,
+                &present,
+                "",
+            )
+            .respond(crate::testing::VERIFY_CMD, 0, crate::testing::VERIFY_OK, "");
+        let got = trust_statuses(&c, &Platform::MacOs, &exec).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|s| (s.scope, s.installed, s.trusted))
+                .collect::<Vec<_>>(),
+            vec![
+                (Scope::User, Presence::Present, Trust::Yes),
+                (Scope::System, Presence::Absent, Trust::No),
+            ]
+        );
+        assert_eq!(
+            got[0].location,
+            "/Users/t/Library/Keychains/login.keychain-db"
+        );
+        assert_eq!(got[1].location, "/Library/Keychains/System.keychain");
+    }
 }

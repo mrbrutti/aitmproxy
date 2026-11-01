@@ -898,4 +898,265 @@ mod tests {
             None
         );
     }
+
+    // ---- tester, whole-branch pass (spec D10, T7, M1p, M6; AC-W1-5/6/7/8) ----
+
+    /// Every `BusWord` is the Server (and Tui) card's `Bus` value verbatim;
+    /// the Web card says `ready` whatever the transport is.
+    #[test]
+    fn ready_card_bus_row_for_every_bus_word() {
+        let off = summary(State::Off);
+        let table = [
+            (BusWord::Stdio, "stdio (MCP)"),
+            (BusWord::Loopback(0), "loopback 127.0.0.1 (ephemeral port)"),
+            (BusWord::Loopback(65535), "loopback 127.0.0.1:65535"),
+            (BusWord::Http(addr("127.0.0.1:8084")), "http 127.0.0.1:8084"),
+            (BusWord::Http(addr("[::1]:8084")), "http [::1]:8084"),
+            (BusWord::Off, "off"),
+        ];
+        for (bus, text) in table {
+            for mode in [ModeWord::Server, ModeWord::Tui] {
+                let i = ReadyInputs {
+                    mode,
+                    bus,
+                    ..m1_inputs(&off, None, None)
+                };
+                let card = ready_card(&i);
+                assert_eq!(
+                    card.rows[0],
+                    row("Bus", text, Role::Plain, None),
+                    "{mode:?} {bus:?}"
+                );
+                assert_eq!(
+                    labels(&card.rows),
+                    vec!["Bus", "Scope", "CA", "System proxy"],
+                    "{mode:?} {bus:?}"
+                );
+            }
+            let web = ReadyInputs {
+                mode: ModeWord::Web,
+                bus,
+                web_url: Some(WEB_URL),
+                ..m1_inputs(&off, None, None)
+            };
+            let card = ready_card(&web);
+            assert_eq!(
+                card.rows[3],
+                row("Bus", "ready", Role::Plain, None),
+                "{bus:?}"
+            );
+        }
+    }
+
+    /// Every `State` as the `System proxy` row: value, role and next step
+    /// (spec T7); the row is always present and sits right before `Log`.
+    #[test]
+    fn ready_card_system_proxy_row_for_every_state() {
+        let table: [(State, &str, Role, Option<&str>); 6] = [
+            (
+                State::Off,
+                "off",
+                Role::Warning,
+                Some("aitm proxy system set"),
+            ),
+            (State::PointsAtUs, "points at this proxy", Role::Plain, None),
+            (
+                State::Other {
+                    host: "proxy.corp.example".to_string(),
+                    port: 8888,
+                },
+                "points at proxy.corp.example:8888",
+                Role::Warning,
+                Some("aitm proxy system set"),
+            ),
+            (
+                State::NeedsPrivilege,
+                "needs privilege",
+                Role::Warning,
+                None,
+            ),
+            (
+                State::Unsupported,
+                "unsupported on this platform",
+                Role::Plain,
+                None,
+            ),
+            (State::Unknown, "unknown", Role::Warning, None),
+        ];
+        for (state, value, role, next) in table {
+            let s = summary(state.clone());
+            let i = m1_inputs(&s, Some(Path::new(LOG)), None);
+            let card = ready_card(&i);
+            let n = card.rows.len();
+            assert_eq!(
+                card.rows[n - 2],
+                row("System proxy", value, role, next),
+                "{state:?}"
+            );
+            assert_eq!(card.rows[n - 1].label, "Log", "{state:?}");
+            assert_eq!(
+                system_proxy_row(&s),
+                (value.to_string(), next.map(|c| FixCommand(c.to_string()))),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// The T7 reduction over ten stores: one `yes` anywhere wins, one `no`
+    /// among unknowns is `Untrusted`, all unknown is no word.
+    #[test]
+    fn ca_word_over_ten_stores() {
+        let ten = |fill: Trust| -> Vec<StoreStatus> { (0..10).map(|_| status(fill)).collect() };
+        assert_eq!(ca_word(&ten(Trust::Unknown)), None);
+        assert_eq!(ca_word(&ten(Trust::No)), Some(CaWord::Untrusted));
+        assert_eq!(ca_word(&ten(Trust::Yes)), Some(CaWord::Trusted));
+
+        let mut last_yes = ten(Trust::Unknown);
+        last_yes[9].trusted = Trust::Yes;
+        assert_eq!(ca_word(&last_yes), Some(CaWord::Trusted));
+
+        let mut first_no = ten(Trust::Unknown);
+        first_no[0].trusted = Trust::No;
+        assert_eq!(ca_word(&first_no), Some(CaWord::Untrusted));
+
+        let mut nine_no_one_yes = ten(Trust::No);
+        nine_no_one_yes[9].trusted = Trust::Yes;
+        assert_eq!(ca_word(&nine_no_one_yes), Some(CaWord::Trusted));
+    }
+
+    /// `read_ca_trust` answers `None` before any trust-store tool runs when
+    /// the certificate cannot be loaded: no PEM at all, a PEM block of the
+    /// wrong label, two CERTIFICATE blocks, or a key file with no
+    /// certificate. Hermetic: none of these reaches `Platform::detect`.
+    #[test]
+    fn read_ca_trust_with_an_unloadable_certificate_is_none() {
+        let base = std::env::temp_dir().join(format!(
+            "aitm-card-bad-cert-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let cases: [(&str, &str); 4] = [
+            ("not-pem", "not a certificate\n"),
+            (
+                "wrong-label",
+                "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+            ),
+            (
+                "two-blocks",
+                "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            ),
+            ("empty", ""),
+        ];
+        for (name, pem) in cases {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("ca.crt"), pem).unwrap();
+            assert_eq!(read_ca_trust(&dir), None, "{name}");
+        }
+        let key_only = base.join("key-only");
+        std::fs::create_dir_all(&key_only).unwrap();
+        std::fs::write(key_only.join("ca.key"), "not a key\n").unwrap();
+        assert_eq!(
+            read_ca_trust(&key_only),
+            None,
+            "a key without a certificate"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The Tui card, were it asked for, is the Server card (D11 prints none).
+    #[test]
+    fn ready_card_tui_mode_is_the_server_card() {
+        let off = summary(State::Off);
+        let server = m1_inputs(&off, Some(Path::new(LOG)), Some(Path::new("/Users/matt")));
+        let tui = ReadyInputs {
+            mode: ModeWord::Tui,
+            ..server.clone()
+        };
+        assert_eq!(ready_card(&tui), ready_card(&server));
+    }
+
+    /// A Web card with no URLs omits the URL rows rather than printing a
+    /// placeholder.
+    #[test]
+    fn ready_card_web_without_urls_has_no_url_rows() {
+        let at_us = summary(State::PointsAtUs);
+        let i = ReadyInputs {
+            mode: ModeWord::Web,
+            web_url: None,
+            operator_url: None,
+            ca: Some(CaWord::Trusted),
+            ..m1_inputs(&at_us, Some(Path::new(LOG)), None)
+        };
+        assert_eq!(
+            labels(&ready_card(&i).rows),
+            vec!["Proxy", "Browser", "Bus", "Scope", "System proxy", "Log"]
+        );
+    }
+
+    /// AC-W1-5 / M1p: the plain card for M1's inputs on a pipe (no `~`),
+    /// byte for byte, no pill line, `Label: value · command` rows.
+    #[test]
+    fn plain_card_for_m1p_inputs_is_byte_exact() {
+        let off = summary(State::Off);
+        let piped = m1_inputs(&off, Some(Path::new(LOG)), None);
+        assert_eq!(
+            ready_card(&piped).render_plain(&RICH),
+            concat!(
+                "Bus: stdio (MCP)\n",
+                "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>\n",
+                "CA: untrusted · aitm ca install\n",
+                "System proxy: off · aitm proxy system set\n",
+                "Log: /Users/matt/Library/Application Support/aitmproxy/logs/aitm.log\n",
+            )
+        );
+        // A `home` given to a pipe is still honoured by the renderer-agnostic
+        // card (C7 says the caller passes `None`); nothing else changes.
+        let with_home = m1_inputs(&off, Some(Path::new(LOG)), Some(Path::new("/Users/matt")));
+        assert_eq!(
+            ready_card(&with_home).render_plain(&RICH).lines().last(),
+            Some("Log: ~/Library/Application Support/aitmproxy/logs/aitm.log")
+        );
+        // AC-W1-5: zero escape bytes and no carriage return in the plain form.
+        let plain = ready_card(&piped).render_plain(&RICH);
+        assert!(!plain.as_bytes().contains(&0x1b));
+        assert!(!plain.contains('\r'));
+    }
+
+    /// M6 piped: the Web card's plain rows in order, URLs whole.
+    #[test]
+    fn plain_card_for_m6_web_inputs_is_byte_exact() {
+        let at_us = summary(State::PointsAtUs);
+        let i = ReadyInputs {
+            mode: ModeWord::Web,
+            web_url: Some(WEB_URL),
+            operator_url: Some(OPERATOR_URL),
+            ca: Some(CaWord::Trusted),
+            ..m1_inputs(&at_us, Some(Path::new(LOG)), None)
+        };
+        assert_eq!(
+            ready_card(&i).render_plain(&RICH),
+            concat!(
+                "Web UI: http://127.0.0.1:8082/#t=abc\n",
+                "Operator: http://127.0.0.1:8082/#t=def&expect=operator\n",
+                "Proxy: 127.0.0.1:8080\n",
+                "Browser: 127.0.0.1:8081  (SSRF-filtered)\n",
+                "Bus: ready\n",
+                "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>\n",
+                "System proxy: points at this proxy\n",
+                "Log: /Users/matt/Library/Application Support/aitmproxy/logs/aitm.log\n",
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_summary_restored_with_no_services() {
+        assert_eq!(
+            recovery_summary(&Recovery::Restored {
+                restored: Vec::new(),
+                left_alone: vec!["Wi-Fi".to_string()],
+            }),
+            Some("system proxy restored · 0 services".to_string())
+        );
+    }
 }

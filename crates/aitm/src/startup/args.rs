@@ -460,4 +460,215 @@ mod tests {
         );
         assert!(!SYNOPSIS.ends_with("\n\n"));
     }
+
+    // ---- tester, whole-branch pass (plan C26, spec D8/D9, AC-W1-1/2/12) ----
+
+    /// The equals form of a valued flag is one token, so it rides through and
+    /// the terminal flags around it are still stripped; a valued flag's value
+    /// is never read as a terminal flag; a valued flag with nothing after it
+    /// is handed on as is for the mode parser to reject (plan C26).
+    #[test]
+    fn split_term_args_equals_form_and_flag_shaped_values() {
+        assert_eq!(
+            split(&["--config=/etc/aitm.yaml", "-v", "scope", "list"]),
+            Ok((
+                opts(Verbosity::Verbose, ColorChoice::Auto),
+                argv(&["--config=/etc/aitm.yaml", "scope", "list"])
+            ))
+        );
+        assert_eq!(
+            split(&["--script=a.rhai", "-q", "--bus-endpoint-file=/f", "web"]),
+            Ok((
+                opts(Verbosity::Quiet, ColorChoice::Auto),
+                argv(&["--script=a.rhai", "--bus-endpoint-file=/f", "web"])
+            ))
+        );
+        // `--config -v` names a file called `-v`: no level is raised.
+        assert_eq!(
+            split(&["--config", "-v", "web"]),
+            Ok((TermOpts::default(), argv(&["--config", "-v", "web"])))
+        );
+        assert_eq!(
+            split(&["--script", "-q"]),
+            Ok((TermOpts::default(), argv(&["--script", "-q"])))
+        );
+        // Nothing after a valued flag: handed on; the mode parser reports the
+        // missing path.
+        assert_eq!(
+            split(&["--config"]),
+            Ok((TermOpts::default(), argv(&["--config"])))
+        );
+        assert_eq!(split(&[]), Ok((TermOpts::default(), Vec::new())));
+    }
+
+    #[test]
+    fn split_term_args_color_edge_cases_and_repeated_flags() {
+        assert_eq!(
+            split(&["--color="]),
+            Err("--color expects auto, always or never, got ``".to_string())
+        );
+        assert_eq!(
+            split(&["--color=Never"]),
+            Err("--color expects auto, always or never, got `Never`".to_string()),
+            "the three words are lowercase"
+        );
+        // `--color` takes the next token whatever it is: a mode word in that
+        // position is a bad value, not a mode.
+        assert_eq!(
+            split(&["--color", "scope", "list"]),
+            Err("--color expects auto, always or never, got `scope`".to_string())
+        );
+        // The last `--color` wins, in either spelling.
+        assert_eq!(
+            split(&["--color", "always", "--color=never"]),
+            Ok((opts(Verbosity::Normal, ColorChoice::Never), Vec::new()))
+        );
+        assert_eq!(
+            split(&["--color=never", "--color", "auto"]),
+            Ok((opts(Verbosity::Normal, ColorChoice::Auto), Vec::new()))
+        );
+        // Terminal flags after the mode word belong to the mode parser.
+        assert_eq!(
+            split(&["scope", "list", "--color", "never", "-q", "-vv"]),
+            Ok((
+                TermOpts::default(),
+                argv(&["scope", "list", "--color", "never", "-q", "-vv"])
+            ))
+        );
+        // `-q` twice is Quiet; `-q` with any verbose spelling, in any order,
+        // around any valued flag, is the one error.
+        assert_eq!(
+            split(&["-q", "--quiet"]),
+            Ok((opts(Verbosity::Quiet, ColorChoice::Auto), Vec::new()))
+        );
+        for bad in [
+            &["--quiet", "--verbose"][..],
+            &["-vv", "-q"],
+            &["-q", "-v", "web"],
+            &["-v", "--config", "x", "-q"],
+        ] {
+            assert_eq!(
+                split(bad),
+                Err("`-v` and `-q` cannot be combined".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Spec D8: only `--config <p>` / `--config=<p>` is stepped over, the
+    /// alias must be the whole first token, and nothing after it matters.
+    #[test]
+    fn pre_boot_steps_over_config_only_and_matches_whole_tokens() {
+        assert_eq!(pre_boot(&argv(&["--config=x"])), None);
+        assert_eq!(pre_boot(&argv(&["--config", "x"])), None);
+        // `--config --version` names a file called `--version`: it boots.
+        assert_eq!(pre_boot(&argv(&["--config", "--version"])), None);
+        assert_eq!(
+            pre_boot(&argv(&["--config", "a", "--config=b", "-V"])),
+            Some(PreBoot::Version)
+        );
+        // Any other flag first boots (the terminal flags included).
+        assert_eq!(pre_boot(&argv(&["-v", "--version"])), None);
+        assert_eq!(pre_boot(&argv(&["--color=never", "--help"])), None);
+        assert_eq!(pre_boot(&argv(&["--script", "a.rhai", "--help"])), None);
+        for not_alias in [
+            "--version=1",
+            "--helpme",
+            "-Vv",
+            "-hh",
+            "Version",
+            "HELP",
+            "--Help",
+            "",
+        ] {
+            assert_eq!(pre_boot(&argv(&[not_alias])), None, "{not_alias:?}");
+        }
+        assert_eq!(
+            pre_boot(&argv(&["--help", "scope", "list"])),
+            Some(PreBoot::Help)
+        );
+        assert_eq!(
+            pre_boot(&argv(&["version", "--config"])),
+            Some(PreBoot::Version)
+        );
+    }
+
+    /// AC-W1-2: `aitm --help` is spec M3's wave-1 block verbatim, with the
+    /// package version in place of the mock-up's, the core's own advice
+    /// sentence, 27 lines, none over 80 columns, no tab.
+    #[test]
+    fn synopsis_is_spec_m3_verbatim() {
+        let mut expected = format!(
+            "aitm {} — intercepting proxy for authorized security testing\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        expected.push_str(concat!(
+            "\n",
+            "Usage:\n",
+            "  aitm                      run the proxy with the MCP agent transport\n",
+            "  aitm web [options]        run the proxy and the web operator UI\n",
+            "  aitm tui                  run the proxy and the terminal operator UI\n",
+            "  aitm <group> <verb> [--flag <value>]...\n",
+            "                            run one command and exit\n",
+            "  aitm operator-token generate [--force]\n",
+            "\n",
+            "Groups:\n",
+            "  agent  browser  ca  capture  config  findings  flow  map  poc  proxy\n",
+            "  request  scan  scope  script  session  tls  ws\n",
+            "\n",
+            "Options:\n",
+            "  --config <path>           config file (env AITM_CONFIG)\n",
+            "  --script <path>           load an extra Rhai script (repeatable)\n",
+            "  -v, -vv                   show INFO / DEBUG tracing on stderr\n",
+            "  -q                        errors only\n",
+            "  --color <auto|always|never>\n",
+            "  --version, -V             print the version and exit\n",
+            "  --help, -h                print this help\n",
+            "\n",
+            "Learn more:\n",
+            "  aitm web --help           the web UI's options\n",
+            "  Nothing is decrypted until a host is in Scope.  aitm scope add --host <host>\n",
+            "  Trust the CA:  aitm ca install\n",
+        ));
+        assert_eq!(SYNOPSIS, expected);
+        assert_eq!(SYNOPSIS.lines().count(), 27);
+        assert!(
+            SYNOPSIS.contains(aitm_core::NOTHING_DECRYPTED_ADVICE),
+            "the advice sentence is the core's constant, verbatim"
+        );
+        for line in SYNOPSIS.lines() {
+            assert!(line.chars().count() <= 80, "over 80 columns: {line:?}");
+            assert!(!line.contains('\t'), "tab in {line:?}");
+            assert_eq!(line.trim_end(), line, "trailing whitespace in {line:?}");
+        }
+        assert!(!SYNOPSIS.as_bytes().contains(&0x1b));
+    }
+
+    /// A pipe never animates whatever `--color` says (spec D2 rule 7);
+    /// `-q` is the reporter's business and leaves the caps alone; `CI` on a
+    /// TTY means plain lines (D2 rule 5, plan C22).
+    #[test]
+    fn caps_from_parts_pipe_quiet_and_ci() {
+        let always = opts(Verbosity::Normal, ColorChoice::Always);
+        let piped = always.caps_from_parts(false, None, &env_of(TTY_ENV));
+        assert!(!piped.tty);
+        assert!(!piped.animate, "a pipe never animates: {piped:?}");
+        assert_eq!(piped.width, 80, "80 when unknown");
+
+        let quiet = opts(Verbosity::Quiet, ColorChoice::Auto);
+        assert_eq!(
+            quiet.caps_from_parts(true, Some(100), &env_of(TTY_ENV)),
+            TermOpts::default().caps_from_parts(true, Some(100), &env_of(TTY_ENV)),
+            "-q changes no capability"
+        );
+
+        let ci = env_of(&[
+            ("TERM", "xterm-256color"),
+            ("LANG", "en_US.UTF-8"),
+            ("CI", ""),
+        ]);
+        let caps = TermOpts::default().caps_from_parts(true, Some(100), &ci);
+        assert!(caps.ci, "CI present with an empty value counts (plan C22)");
+        assert!(!caps.animate, "CI on a TTY: plain lines");
+    }
 }

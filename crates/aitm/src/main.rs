@@ -1935,4 +1935,77 @@ mod tests {
         );
         assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
     }
+
+    // ---- tester, whole-branch pass (spec D6, D9; AC-W1-3, AC-W1-12) ----
+
+    /// Plan C26 end to end through `parse_invocation`: the terminal flags are
+    /// stripped around an equals-form `--config`, the mode is classified from
+    /// what is left, and a flag-shaped `--config` value is a file name.
+    #[test]
+    fn parse_invocation_strips_term_flags_around_an_equals_config() {
+        let invocation = parse_invocation(args(&[
+            "--config=/etc/aitm.yaml",
+            "-v",
+            "--color",
+            "never",
+            "scope",
+            "list",
+            "-q",
+        ]))
+        .expect("parses")
+        .expect("something to run");
+        assert_eq!(
+            invocation.term,
+            TermOpts {
+                verbosity: Verbosity::Verbose,
+                color: ColorChoice::Never,
+            }
+        );
+        assert_eq!(invocation.config_arg, Some(PathBuf::from("/etc/aitm.yaml")));
+        assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list", "-q"])));
+
+        let named_dash_v = parse_invocation(args(&["--config", "-v", "web"]))
+            .expect("parses")
+            .expect("something to run");
+        assert_eq!(named_dash_v.term, TermOpts::default());
+        assert_eq!(named_dash_v.config_arg, Some(PathBuf::from("-v")));
+        assert_eq!(named_dash_v.mode, Mode::Web);
+        assert!(named_dash_v.web_args.is_some());
+    }
+
+    /// AC-W1-3 through the real producer: the error `bind_service_port`
+    /// returns maps to M2's fields and its plain panel carries every literal
+    /// the live proof greps for, with no `os error` text.
+    #[test]
+    fn addr_in_use_error_maps_to_the_m2_panel() {
+        use aitm::startup::errors::report_for;
+        use aitm_term::error::{ErrorKind, ErrorReport, FixCommand};
+
+        let addr: std::net::SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let remedy = "Free it, or set `listen:` to another address in aitm.yaml.";
+        let err = addr_in_use_error(addr, "the proxy", remedy);
+        let report = report_for(&err, Some(std::path::Path::new("/x/aitm.log")));
+        assert_eq!(
+            report,
+            ErrorReport {
+                kind: ErrorKind::Failure,
+                what: "cannot start: the proxy port 127.0.0.1:18080 is already in use".to_string(),
+                why: vec![
+                    "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.".to_string()
+                ],
+                fix: Some(remedy.to_string()),
+                command: Some(FixCommand("lsof -nP -iTCP:18080 -sTCP:LISTEN".to_string())),
+                log: Some(PathBuf::from("/x/aitm.log")),
+            }
+        );
+        assert_eq!(report.exit_code(), 1);
+        assert_eq!(
+            report.render_plain(&aitm_term::glyphs::ASCII),
+            "error: cannot start: the proxy port 127.0.0.1:18080 is already in use\n\
+             \x20 It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.\n\
+             \x20 Free it, or set `listen:` to another address in aitm.yaml.\n\
+             \x20 fix: lsof -nP -iTCP:18080 -sTCP:LISTEN\n\
+             \x20 log: /x/aitm.log\n"
+        );
+    }
 }

@@ -874,4 +874,259 @@ mod tests {
             "an empty RUST_LOG must fall back to the curated default: {out:?}"
         );
     }
+
+    // ---- tester, whole-branch pass (spec D7, AC-W1-15/17/18/19/22) ----
+
+    /// A parent that is a regular file: `mkdir` on it is `EEXIST`; a parent
+    /// under a regular file is `ENOTDIR`. Either way the open fails, the file
+    /// in the way is untouched and nothing is created beside it.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_file_fails_when_a_parent_is_a_file() {
+        let d = TempDir::new("parent-file");
+        let blocker = d.path().join("logs");
+        fs::write(&blocker, "not a directory\n").expect("write blocker");
+
+        let direct = open_log_file(&blocker.join("aitm.log")).expect_err("parent is a file");
+        assert_eq!(direct.raw_os_error(), Some(libc::EEXIST), "{direct}");
+
+        let nested = open_log_file(&blocker.join("sub").join("aitm.log"))
+            .expect_err("grandparent is a file");
+        assert_eq!(nested.raw_os_error(), Some(libc::ENOTDIR), "{nested}");
+
+        assert_eq!(
+            fs::read_to_string(&blocker).expect("blocker"),
+            "not a directory\n"
+        );
+        assert_eq!(
+            fs::read_dir(d.path()).expect("list").count(),
+            1,
+            "nothing was created beside the blocker"
+        );
+    }
+
+    /// `AITM_LOG_FILE` naming a directory (AC-W1-18's failure twin): the
+    /// open is `EISDIR`, the directory is neither rotated nor removed, and
+    /// through `open_sink` the operator gets the one warning line while the
+    /// run continues without a log.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_file_refuses_a_directory_at_the_log_path() {
+        let d = TempDir::new("isdir");
+        let path = d.path().join("aitm.log");
+        fs::create_dir(&path).expect("make the directory");
+
+        let err = open_log_file(&path).expect_err("a directory is not a log file");
+        assert_eq!(err.raw_os_error(), Some(libc::EISDIR), "{err}");
+        assert!(path.is_dir(), "still a directory");
+        assert!(!d.path().join("aitm.log.1").exists(), "never rotated");
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        let (file, log_sink) = open_sink(&reporter, &path);
+        reporter.finish();
+        assert!(file.is_none());
+        assert_eq!(log_sink.path, None);
+        assert_eq!(
+            log_sink.problem.as_deref(),
+            Some("Is a directory (os error 21)")
+        );
+        assert_eq!(
+            sink.text(),
+            format!(
+                "warning: log file unavailable: {} (Is a directory (os error 21)) - running without a log\n",
+                path.display()
+            )
+        );
+    }
+
+    /// Blank overrides are unset in both modes; a relative override is taken
+    /// as given (no resolution against any directory).
+    #[test]
+    fn log_file_path_blank_overrides_and_relative_values() {
+        let blank_both =
+            |key: &str| (key == "AITM_LOG_FILE" || key == "AITM_TUI_LOG").then(String::new);
+        assert_eq!(
+            log_file_path(true, &blank_both),
+            default_log_dir().join("aitm.log")
+        );
+        assert_eq!(
+            log_file_path(false, &blank_both),
+            default_log_dir().join("aitm.log")
+        );
+
+        let blank_file_set_tui = |key: &str| match key {
+            "AITM_LOG_FILE" => Some(String::new()),
+            "AITM_TUI_LOG" => Some("/tmp/t.log".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            log_file_path(true, &blank_file_set_tui),
+            PathBuf::from("/tmp/t.log"),
+            "a blank AITM_LOG_FILE does not shadow AITM_TUI_LOG in tui mode"
+        );
+        assert_eq!(
+            log_file_path(false, &blank_file_set_tui),
+            default_log_dir().join("aitm.log"),
+            "AITM_TUI_LOG is tui-only"
+        );
+
+        let relative = |key: &str| (key == "AITM_LOG_FILE").then(|| "x.log".to_string());
+        assert_eq!(log_file_path(false, &relative), PathBuf::from("x.log"));
+    }
+
+    /// `-q` is the reporter's business (spec D7): WARN and ERROR events
+    /// still fold into the view under `Quiet`, as `warning: …` / `error: …`
+    /// lines with their fields, and the file keeps INFO.
+    #[test]
+    fn compose_under_quiet_still_folds_warn_and_error_into_the_view() {
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Quiet);
+        let file = BufWriter::new();
+        let subscriber = compose(
+            &opts(Verbosity::Quiet),
+            &reporter,
+            Some(file.clone()),
+            false,
+            None,
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("proxy listening");
+            warn_browser_unavailable();
+            tracing::error!(target: "aitm::wire", code = 7, "boom");
+        });
+        reporter.finish();
+
+        assert_eq!(
+            sink.text(),
+            "warning: embedded browser unavailable; browser.* commands will error engine=obscura\n\
+             error: boom code=7\n"
+        );
+        let logged = file.text();
+        assert!(
+            logged.contains(" INFO "),
+            "-q never thins the file: {logged:?}"
+        );
+        assert!(logged.contains("proxy listening"), "{logged:?}");
+        assert!(logged.contains("ERROR"), "{logged:?}");
+    }
+
+    /// AC-W1-22 through the whole composition: a WARN carrying `token`,
+    /// `password` and `*secret` fields reaches the view with every one of
+    /// them redacted and the other fields intact. The file layer is a plain
+    /// `fmt` layer and does not redact (spec D7 puts redaction in the
+    /// `UiLayer`); keeping tokens out of the file is the call-site pin
+    /// `no_tracing_call_site_logs_a_tokened_url`'s job.
+    #[test]
+    fn compose_redacts_secret_fields_in_the_view() {
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        let file = BufWriter::new();
+        let subscriber = compose(
+            &opts(Verbosity::Normal),
+            &reporter,
+            Some(file.clone()),
+            false,
+            None,
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                token = "not-a-real-token",
+                password = "not-a-real-password",
+                api_secret = "not-a-real-secret",
+                url = "http://127.0.0.1:8082/",
+                "bridge token minted"
+            );
+        });
+        reporter.finish();
+
+        assert_eq!(
+            sink.text(),
+            "warning: bridge token minted token=<redacted> password=<redacted> api_secret=<redacted> url=http://127.0.0.1:8082/\n"
+        );
+        let logged = file.text();
+        assert!(
+            logged.contains("token=\"not-a-real-token\"")
+                || logged.contains("token=not-a-real-token"),
+            "the file layer records the field as logged (no redaction there): {logged:?}"
+        );
+    }
+
+    /// A non-empty `RUST_LOG` is the file's directive wholesale (spec D7): at
+    /// `warn` the INFO record is dropped from the file, the WARN is kept, and
+    /// the raw stderr stream replaces the `UiLayer` so the view gets nothing.
+    #[test]
+    fn compose_with_rust_log_warn_thins_the_file_and_installs_no_ui_layer() {
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        let file = BufWriter::new();
+        let subscriber = compose(
+            &opts(Verbosity::Normal),
+            &reporter,
+            Some(file.clone()),
+            false,
+            Some("warn"),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("proxy listening");
+            warn_browser_unavailable();
+        });
+        reporter.finish();
+
+        assert_eq!(sink.text(), "", "the raw stream took the WARN");
+        let logged = file.text();
+        assert!(
+            !logged.contains("proxy listening"),
+            "RUST_LOG=warn drops INFO from the file: {logged:?}"
+        );
+        assert!(
+            logged.contains("embedded browser unavailable"),
+            "{logged:?}"
+        );
+    }
+
+    /// AC-W1-15's filter half: the per-script `loaded script` record is
+    /// DEBUG, hidden by the default directive and shown by `-vv`'s, while
+    /// the noisy-crate caps hold at both levels.
+    #[test]
+    fn file_directive_hides_loaded_script_by_default_and_shows_it_under_debug() {
+        let emit = || {
+            tracing::debug!(target: "aitm_plugin_rhai::loader", script = "x", "loaded script");
+            tracing::debug!(target: "aitm::scripts", script = "x", "script loaded into the host");
+            tracing::debug!(target: "hyper::proto::h1", "parsed headers");
+            tracing::info!(target: "aitm_core::proxy", "proxy listening");
+        };
+        let default = capture_with_filter(
+            tracing_subscriber::EnvFilter::new(file_directive(None, Verbosity::Normal)),
+            emit,
+        );
+        assert!(default.contains("proxy listening"), "{default:?}");
+        assert!(!default.contains("loaded script"), "{default:?}");
+        assert!(
+            !default.contains("script loaded into the host"),
+            "{default:?}"
+        );
+        assert!(!default.contains("parsed headers"), "{default:?}");
+
+        let debug = capture_with_filter(
+            tracing_subscriber::EnvFilter::new(file_directive(None, Verbosity::Debug)),
+            emit,
+        );
+        assert!(debug.contains("loaded script"), "{debug:?}");
+        assert!(debug.contains("script loaded into the host"), "{debug:?}");
+        assert!(debug.contains("proxy listening"), "{debug:?}");
+        assert!(
+            !debug.contains("parsed headers"),
+            "hyper stays capped at warn under -vv: {debug:?}"
+        );
+        assert_eq!(debug.matches("loaded script").count(), 1, "{debug:?}");
+        assert_eq!(
+            debug.matches("script loaded into the host").count(),
+            1,
+            "{debug:?}"
+        );
+    }
 }

@@ -515,4 +515,288 @@ mod tests {
             Some("permission denied".to_string())
         );
     }
+
+    // ---- tester, whole-branch pass (spec D6 rules 1–5, plan C15) ----
+
+    fn addr6() -> SocketAddr {
+        "[::1]:8080".parse().expect("literal socket address")
+    }
+
+    /// Degenerate shapes stay deterministic and never panic: an empty
+    /// message is an empty-headlined failure; a bare `usage:` is a usage
+    /// headline; an empty first line followed by a usage line makes that line
+    /// the cause; the registry dump header as the first line keeps only the
+    /// header; blank lines before the dump are dropped and indented detail
+    /// lines are kept verbatim; the prefix match is on the first line only
+    /// and is case-sensitive.
+    #[test]
+    fn report_for_degenerate_usage_shapes() {
+        let empty = report_for(&anyhow::anyhow!(""), None);
+        assert_eq!(
+            empty,
+            ErrorReport {
+                kind: ErrorKind::Failure,
+                what: String::new(),
+                why: Vec::new(),
+                fix: None,
+                command: None,
+                log: None,
+            }
+        );
+        assert_eq!(empty.exit_code(), 1);
+
+        let bare = report_for(&anyhow::anyhow!("usage:"), None);
+        assert_eq!(bare.kind, ErrorKind::Usage);
+        assert_eq!(bare.exit_code(), 2);
+        assert_eq!(bare.what, "usage:");
+        assert_eq!(bare.why, Vec::<String>::new());
+        assert_eq!(bare.command, Some(FixCommand("aitm --help".to_string())));
+
+        let led = report_for(&anyhow::anyhow!("\nusage: aitm x"), None);
+        assert_eq!(led.kind, ErrorKind::Usage);
+        assert_eq!(led.what, "");
+        assert_eq!(led.why, vec!["usage: aitm x".to_string()]);
+
+        let dump = "usage: aitm <command> [--flag value]...\n(a value that itself starts with `--` must be given as --flag=value)\n\ncommands:\n  flow list\n";
+        let report = report_for(&anyhow::anyhow!("{dump}"), None);
+        assert_eq!(report.kind, ErrorKind::Usage);
+        assert_eq!(report.what, "usage: aitm <command> [--flag value]...");
+        assert_eq!(report.why, Vec::<String>::new());
+        assert_eq!(report.command, Some(FixCommand("aitm --help".to_string())));
+
+        let spaced = "unknown flag --x for `a.b`\n\n  accepted: y, z\n   \nusage: aitm <command> [--flag value]...\ncommands:\n  a b\n";
+        let report = report_for(&anyhow::anyhow!("{spaced}"), None);
+        assert_eq!(report.kind, ErrorKind::Usage);
+        assert_eq!(report.what, "unknown flag --x for `a.b`");
+        assert_eq!(report.why, vec!["  accepted: y, z".to_string()]);
+
+        // A later line that looks like a usage prefix does not make a failure
+        // a usage error; the whole message stays the headline (rule 5).
+        let later = report_for(&anyhow::anyhow!("boom\nunknown command `x`"), None);
+        assert_eq!(later.kind, ErrorKind::Failure);
+        assert_eq!(later.exit_code(), 1);
+        assert_eq!(later.what, "boom\nunknown command `x`");
+        assert_eq!(later.why, Vec::<String>::new());
+        assert_eq!(later.command, None);
+
+        let cased = report_for(&anyhow::anyhow!("Unknown command `x`"), None);
+        assert_eq!(cased.kind, ErrorKind::Failure, "the prefixes are lowercase");
+        let cased = report_for(&anyhow::anyhow!("Usage: aitm x"), None);
+        assert_eq!(cased.kind, ErrorKind::Failure, "`usage:` is lowercase");
+    }
+
+    /// Rule order: a typed error anywhere in the chain beats a usage-looking
+    /// top message, however deep the contexts are.
+    #[test]
+    fn report_for_prefers_the_typed_error_over_a_usage_looking_context() {
+        let err = anyhow::Error::new(port_in_use()).context("unknown command `x`");
+        assert_eq!(report_for(&err, None), m2_report().with_log(None));
+
+        let deep = anyhow::Error::new(port_in_use())
+            .context("binding ports")
+            .context("starting")
+            .context("expected a command before flags, got `--x`");
+        assert_eq!(
+            report_for(&deep, Some(Path::new(LOG))),
+            m2_report(),
+            "three contexts deep, the M2 fields still win"
+        );
+
+        let strict = anyhow::Error::new(StartupError::StrictScripts { failed: 3 })
+            .context("loading detections");
+        let report = report_for(&strict, None);
+        assert_eq!(
+            report.what,
+            "3 script(s) failed to load and `rhai.strict` is set"
+        );
+        assert_eq!(report.why, Vec::<String>::new());
+        assert_eq!(
+            report.fix.as_deref(),
+            Some("Fix the scripts above, or unset rhai.strict.")
+        );
+        assert_eq!(report.kind, ErrorKind::Failure);
+
+        let config = anyhow::Error::new(StartupError::ConfigFile {
+            path: PathBuf::from("/x/cfg.yaml"),
+            source: anyhow::anyhow!("bad yaml").context("parsing config YAML"),
+        })
+        .context("reading config");
+        let report = report_for(&config, None);
+        assert_eq!(report.what, "in config file /x/cfg.yaml");
+        assert_eq!(
+            report.why,
+            vec!["parsing config YAML".to_string(), "bad yaml".to_string()],
+            "the outer context is not a cause: the typed source chain is"
+        );
+    }
+
+    /// `LogFile` is never fatal and has no panel of its own; should it ever
+    /// be returned it falls through to rule 5 with its source as the cause.
+    #[test]
+    fn report_for_log_file_variant_falls_through_to_the_generic_chain() {
+        let err = anyhow::Error::new(StartupError::LogFile {
+            path: PathBuf::from("/x/logs/aitm.log"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        });
+        assert_eq!(
+            report_for(&err, None),
+            ErrorReport {
+                kind: ErrorKind::Failure,
+                what: "log file unavailable: /x/logs/aitm.log (permission denied)".to_string(),
+                why: vec!["permission denied".to_string()],
+                fix: None,
+                command: None,
+                log: None,
+            }
+        );
+    }
+
+    /// Rule 2's corners: a source equal to the headline is filtered out of
+    /// the causes; a `NotFound` three levels deep still picks the create
+    /// remedy; any other `io::Error` kind picks the fix-the-file remedy.
+    #[test]
+    fn report_for_config_file_source_corners() {
+        let same = anyhow::Error::new(StartupError::ConfigFile {
+            path: PathBuf::from("/x/cfg.yaml"),
+            source: anyhow::anyhow!("in config file /x/cfg.yaml"),
+        });
+        let report = report_for(&same, None);
+        assert_eq!(report.what, "in config file /x/cfg.yaml");
+        assert_eq!(report.why, Vec::<String>::new());
+        assert_eq!(
+            report.fix.as_deref(),
+            Some("Fix the file, or pass --config <path> to use another.")
+        );
+
+        let deep = anyhow::Error::new(StartupError::ConfigFile {
+            path: PathBuf::from("/x/cfg.yaml"),
+            source: anyhow::anyhow!(io::Error::new(io::ErrorKind::NotFound, "nope"))
+                .context("a")
+                .context("b"),
+        });
+        let report = report_for(&deep, None);
+        assert_eq!(
+            report.why,
+            vec!["b".to_string(), "a".to_string(), "nope".to_string()]
+        );
+        assert_eq!(
+            report.fix.as_deref(),
+            Some("Create it, or run without --config to use the defaults.")
+        );
+
+        let denied = anyhow::Error::new(StartupError::ConfigFile {
+            path: PathBuf::from("/x/cfg.yaml"),
+            source: anyhow::anyhow!(io::Error::from(io::ErrorKind::PermissionDenied))
+                .context("reading config file /x/cfg.yaml"),
+        });
+        let report = report_for(&denied, None);
+        assert_eq!(
+            report.why,
+            vec![
+                "reading config file /x/cfg.yaml".to_string(),
+                "permission denied".to_string()
+            ]
+        );
+        assert_eq!(
+            report.fix.as_deref(),
+            Some("Fix the file, or pass --config <path> to use another."),
+            "only NotFound earns the create remedy"
+        );
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    /// Rule 1 for the other two roles `main` binds, and for an IPv6 address:
+    /// the headline carries the role and the full address, the command only
+    /// the port.
+    #[test]
+    fn port_in_use_fields_for_the_other_roles_and_ipv6() {
+        let browser = StartupError::PortInUse {
+            role: "the embedded browser's proxy".to_string(),
+            addr: "127.0.0.1:8081".parse().unwrap(),
+            remedy: "Free it, or set `browser.proxy_addr:` to another address in /x.yaml."
+                .to_string(),
+        };
+        let report = report_for(&anyhow::Error::new(browser), None);
+        assert_eq!(
+            report.what,
+            "cannot start: the embedded browser's proxy port 127.0.0.1:8081 is already in use"
+        );
+        assert_eq!(
+            report.fix.as_deref(),
+            Some("Free it, or set `browser.proxy_addr:` to another address in /x.yaml.")
+        );
+        assert_eq!(
+            report.command,
+            Some(FixCommand("lsof -nP -iTCP:8081 -sTCP:LISTEN".to_string()))
+        );
+        assert_eq!(report.why, vec![HELD_BY.to_string()]);
+
+        let web = StartupError::PortInUse {
+            role: "the web UI".to_string(),
+            addr: "127.0.0.1:8082".parse().unwrap(),
+            remedy: "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN)."
+                .to_string(),
+        };
+        let report = report_for(&anyhow::Error::new(web), None);
+        assert_eq!(
+            report.what,
+            "cannot start: the web UI port 127.0.0.1:8082 is already in use"
+        );
+        assert_eq!(
+            report.command,
+            Some(FixCommand("lsof -nP -iTCP:8082 -sTCP:LISTEN".to_string()))
+        );
+
+        let v6 = StartupError::PortInUse {
+            role: "the proxy".to_string(),
+            addr: addr6(),
+            remedy: remedy(),
+        };
+        assert_eq!(
+            v6.to_string(),
+            format!(
+                "cannot start: the proxy port [::1]:8080 is already in use.\n{HELD_BY}\n{}\nFind the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN",
+                remedy()
+            )
+        );
+        let report = report_for(&anyhow::Error::new(v6), None);
+        assert_eq!(
+            report.what,
+            "cannot start: the proxy port [::1]:8080 is already in use"
+        );
+        assert_eq!(
+            report.command,
+            Some(FixCommand("lsof -nP -iTCP:8080 -sTCP:LISTEN".to_string()))
+        );
+    }
+
+    /// AC-W1-3's literal strings, end to end through the plain panel (M2
+    /// piped): the headline, the held-by sentence, the remedy, the trimmed
+    /// `fix: lsof …` line and the `log:` footer, in that order, with no
+    /// `os error` text and no escape byte.
+    #[test]
+    fn port_in_use_plain_panel_is_m2_piped_verbatim() {
+        let report = report_for(&anyhow::Error::new(port_in_use()), Some(Path::new(LOG)));
+        let plain = report.render_plain(&aitm_term::glyphs::ASCII);
+        assert_eq!(
+            plain,
+            format!(
+                "error: cannot start: the proxy port 127.0.0.1:8080 is already in use\n\
+                 \x20 {HELD_BY}\n\
+                 \x20 {}\n\
+                 \x20 fix: lsof -nP -iTCP:8080 -sTCP:LISTEN\n\
+                 \x20 log: {LOG}\n",
+                remedy()
+            )
+        );
+        assert!(!plain.contains("os error"));
+        assert!(!plain.as_bytes().contains(&0x1b));
+        assert_eq!(
+            plain
+                .lines()
+                .filter(|l| l.trim() == "fix: lsof -nP -iTCP:8080 -sTCP:LISTEN")
+                .count(),
+            1
+        );
+    }
 }
