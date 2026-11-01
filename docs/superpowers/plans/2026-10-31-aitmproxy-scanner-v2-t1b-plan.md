@@ -1388,7 +1388,7 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 |---|---|
 | 1 | `crates/aitm-scan-model/{Cargo.toml, src/lib.rs, src/vocab.rs, src/registry.rs, src/testing.rs, src/traits.rs, src/profile.rs, src/check.rs, fixtures/scan.checks.json}` |
 | 2 | `crates/aitm-core/src/{jobs.rs, lib.rs, ctx.rs, client.rs (tests)}` |
-| 3 | `crates/aitm-plugin-scanner/{Cargo.toml, src/lib.rs, src/config.rs, src/util.rs, placeholders src/{profiles,issues,client,session,catalogue,scheduler,reproduce_link,interim_lane,jobs,worker,verbs,manual_check}.rs}`, `crates/aitm/src/config_file.rs` |
+| 3 | `crates/aitm-plugin-scanner/{Cargo.toml, src/lib.rs, src/config.rs, src/util.rs, src/report.rs (the `index_to_value` delegation only), placeholders src/{profiles,issues,client,session,catalogue,scheduler,reproduce_link,interim_lane,jobs,worker,verbs,manual_check}.rs}`, `crates/aitm/src/config_file.rs`, `crates/aitm/src/main.rs` (the `scanner: _,` destructure line only; Task 17 binds it) |
 | 4 | `crates/aitm-plugin-rhai/{Cargo.toml, src/lib.rs, src/engine.rs, src/host_net.rs, src/error.rs, src/host_registry.rs, placeholders src/{check_bridge,host_probe}.rs, tests/check_run.rs}`, `crates/aitm-plugin/src/language.rs` (additive, call B29) |
 | 5 | `crates/aitm-mcp/src/{server.rs, lib.rs}` |
 | 6 | `crates/aitm-plugin-scanner/src/profiles.rs` |
@@ -1405,6 +1405,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 | 17 | `crates/aitm/src/{wire.rs, main.rs, tui.rs}` |
 | 18 | `docs/scanner.md` |
 | 19 | integration-shared files (re-pin), `crates/aitm-plugin-scanner/src/util.rs` (one line, conditional), merge hunks |
+
+**Amendments after wave 1 (orchestrator, 2026-11-01):** Task 3 also edits `report.rs` (its Change step 4 moves `index_to_value`'s body into `util::json_to_value`) and one line of `main.rs` (the exhaustive `Settings` destructure needs `scanner: _,` to compile; Task 17 replaces it with the real binding). Task 3's dev-dep `aitm-scan-model = { features = ["testing"] }` needs Task 1's feature, so on a re-run Task 3 follows Task 1. Task 1's required `CheckMeta.scope` field also touches the one `CheckMeta` literal outside the model crate (`crates/aitm-plugin-scanner/src/plugin.rs` tests), committed with Task 1.
 
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
