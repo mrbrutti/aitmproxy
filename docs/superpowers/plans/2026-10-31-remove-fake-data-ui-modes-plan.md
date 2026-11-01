@@ -1,0 +1,290 @@
+# Remove the fake-data UI modes (mac, web, TUI) implementation plan
+
+**Status:** approved (2026-10-31 by Matt, autonomous mode)
+**Spec:** `docs/superpowers/specs/2026-10-31-remove-fake-data-ui-modes-design.md` (AC1 … AC12; Design D1 … D10)
+**Branch / worktree:** three PRs against `main`, opened web → TUI → mac (the orchestrator's sequencing of 2026-10-31), all cut from `c8cf56a5` (v0.5.8):
+
+| Group | Branch | Worktree | PR gate |
+|---|---|---|---|
+| mac (M1–M5) | `claude/nice-pare-a04795` | `/Users/matt/Security/aitmproxy/.claude/worktrees/nice-pare-a04795` (the root worktree) | `swift build` / `swift test` in the Terminal by the orchestrator; four `tools/*.sh` exit 0; AC2, AC4 live |
+| web (W1–W4) | `chore/no-fixtures-web` | `/Users/matt/Security/aitmproxy/.claude/worktrees/nice-pare-a04795/.wt/web` | `npm run typecheck && npm test` in `apps/web` of that worktree; AC5 live (Terminal) |
+| TUI (T1–T4) | `chore/no-fixtures-tui` | `/Users/matt/Security/aitmproxy/.claude/worktrees/nice-pare-a04795/.wt/tui` | the Rust gate run in that worktree with `CARGO_TARGET_DIR=/Users/matt/Security/aitmproxy/.claude/worktrees/nice-pare-a04795/target`; AC6 live (Terminal) |
+
+## Overview
+
+Three independent groups, one per frontend, fan out to the three worktrees; within a group the tasks are sequential except the README/docs task, which touches no code and may run at any time. The order inside each group is chosen so that every intermediate state passes its stated gate:
+
+- **TUI:** T1 removes the shipped mode and fixes the lib/bin unit tests (gate: lib + bin targets only, because `tests/` still references `fixture_app`), T2 rewrites the kept integration tests and deletes the pure-fixture ones, T3 salvages the robustness tests into `tests/robustness.rs` and deletes the four salvage sources (first full Rust gate), T4 is the README.
+- **Web:** `tsc` type-checks the test files, so the production deletion cannot pass `npm run typecheck` until no test imports `~/bus/mock`. W1 rewrites the testkit and the four store suites on an in-memory bus while `mock.ts` still exists, W2 moves the other four test files off the mock, W3 deletes `mock.ts` / `fixtures.ts` and collapses `createBus` / `app.ts`, W4 is the README.
+- **mac:** `swift test` builds the whole package, so M1 (panels and guards, which compile while `Store.usesFixtures` and the Kit `Fixtures` still exist) comes before M2 (delete the fixture files, collapse `Session` / `ShellView` / `App` / `SelfTest`, add `OfflineActions`; the app no longer references `Fixtures`), then M3 (move `Fixtures` out of the Kit into the test target, `HAR.swift`, `SettingsDomain`), M4 (tools and tripwires; its gate needs M2), M5 (docs, independent).
+
+**Rule for every task (Matt, 2026-10-31; repeat it in every Coder report).** No fixture, snapshot, self-test or seeded-store run counts as evidence or as a gate. Evidence is exactly one of: (1) a unit test of pure logic whose input is built in the test; (2) a source tripwire; (3) the live check — the real frontend against a real core with real traffic. A green fixture or snapshot suite is never cited.
+
+**Sandbox (every mac task).** The Coder cannot run SwiftPM. It edits, then reports the exact files it changed. The orchestrator runs `swift build --scratch-path ~/Library/Developer/Aitmproxy/test-build --package-path apps/mac` and `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build --package-path apps/mac` in the Terminal and returns compiler and test output to a fresh Coder as a fix task. A mac task is done when both pass on the orchestrator's run.
+
+**Sandbox (every TUI task).** Run `cargo` from `.wt/tui` with `CARGO_TARGET_DIR=/Users/matt/Security/aitmproxy/.claude/worktrees/nice-pare-a04795/target` (offline works once dependencies are cached). The shared target dir can reuse a sibling worktree's stale artifacts: `touch` the sources you changed (or `cargo clean -p aitm-tui`) before the gate. `cargo test -p aitm --test tui_live_bus` binds a port and is Terminal-only.
+
+**Sandbox (every web task).** Run `npm` from `.wt/web/apps/web` (`npm ci` once, in the Terminal if the registry is unreachable). `node scripts/selftest-live.mjs` spawns `aitm web` and binds ports: Terminal only.
+
+**Coordination.** Before the first edit of a task, the Coder sends the orchestrator its **Files** list and edits nothing outside it. A Coder that needs a file not listed stops and reports. The orchestrator receives the mac file list before the mac PR opens. Each PR number goes to the orchestrator the moment it exists, and each merge SHA is the `R` the L4 parity plan waits on.
+
+---
+
+## TUI group — `.wt/tui`, branch `chore/no-fixtures-tui`
+
+### Task T1: remove the shipped fixture mode; lib and bin compile and their unit tests pass
+
+- **Satisfies:** AC1 (TUI `src/`, JSON), AC6 (flags rejected), AC9 (`snapshot_core_is_a_snapshot_with_the_core_fixture`, `bus_fixture_mirrors_the_real_verb_descriptions`), AC10
+- **Depends on:** none
+- **Files:** `crates/aitm-tui/src/fixture.rs` (delete), `crates/aitm-tui/src/snapshot.rs` (delete), `crates/aitm-tui/fixtures/bus-fixture.json` (delete, and the now-empty `fixtures/` directory), `crates/aitm-tui/src/lib.rs` (modify), `crates/aitm-tui/src/main.rs` (modify), `crates/aitm-tui/src/ui/mod.rs` (modify), `crates/aitm-tui/src/ui/inspector.rs` (modify, tests only), `crates/aitm-tui/src/ui/flows.rs` (modify, tests only), `crates/aitm-tui/src/app.rs` (modify, tests only), `crates/aitm/tests/sysproxy_contract.rs` (modify)
+- **Change:**
+  - `src/lib.rs`: drop `pub mod fixture;`, `pub mod snapshot;`, `use crate::fixture::{Fixture, FixtureTransport};`, the `TransportChoice::Fixture(Option<PathBuf>)` variant and its `connector` arm, `pub fn fixture_app`, `pub fn fixture_app_core`, `pub fn fixture_app_from`, `fn load_fixture_app` (lines 312–459), doc lines 8 and 11–12 and the `fixture_app_core` sentence of the `CORE_TOOLS` doc. Remove imports that become unused (`PathBuf`, `Value`, `AgentState`, `Finding`, `FlowDetail`, `ProxyStatus`, `Action`, `BusEvent`, `BusRequest`, `ToolInfo` — whichever the compiler names). `CORE_TOOLS` is untouched. Add, test-only:
+    ```rust
+    #[cfg(test)]
+    pub(crate) fn connected_app(cols: u16, rows: u16) -> App
+    ```
+    (`App::new(TermCaps::full(), "test")`, `Action::Resize(cols, rows)`, then `on_bus(BusEvent::Connected { server: "aitmproxy test".into(), tools: <ToolInfo for every CORE_TOOLS name, description "<name> (test)", input_schema {"type":"object","properties":{}}>, role: None })`).
+  - `src/ui/mod.rs`: add, test-only, after `pub fn render`:
+    ```rust
+    #[cfg(test)]
+    pub(crate) fn render_buffer(app: &App, cols: u16, rows: u16) -> ratatui::buffer::Buffer
+    #[cfg(test)]
+    pub(crate) fn render_text(app: &App, cols: u16, rows: u16) -> String
+    ```
+    `render_buffer` draws into `Buffer::empty(Rect::new(0, 0, cols, rows))` with `Theme::new(true)` through the existing `render`; `render_text` emits one symbol per cell, trims each line's trailing spaces, joins with `\n` and ends with `\n` (the exact text `snapshot::to_text` produced).
+  - `src/main.rs`: doc lines 2 and 6–8; `USAGE` becomes `usage: aitm-tui --bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] [--poc-dir dir] [--ansi|--truecolor] [--poll ms]` plus the two existing explanatory lines for `--poc-dir` and `--expect-role`; remove `Args.fixture`, `.snapshot`, `.snapshot_core`, `.cols`, `.rows` and their defaults and parse arms (`--fixture`, `--snapshot`, `--snapshot-core`, `--cols`, `--rows`); remove the snapshot block (147–163); the transport match becomes `match args.bus { Some(bus) => …, None => match std::env::var("AITM_BUS") { … } }` with the arms' bodies unchanged; the import becomes `use aitm_tui::{RunOptions, TransportChoice};`.
+  - `src/main.rs` tests: in `usage_marks_the_inline_token_insecure` drop the `--snapshot-core` assertion and add `assert!(!USAGE.contains("--fixture") && !USAGE.contains("--snapshot"), "{USAGE}")`; in `poc_dir_flag_takes_a_path_and_is_documented` replace `--fixture` with `--bus 127.0.0.1:9090 --token t`; delete `snapshot_core_is_a_snapshot_with_the_core_fixture`; add `fn fixture_and_snapshot_flags_are_unknown_arguments()`.
+  - In-crate tests rewritten on `crate::connected_app` + inline JSON (`BusEvent::Flows(vec![json!({…})])`, `BusEvent::Detail(Box::new(FlowDetail::from_json(&json!({…})).unwrap()))`), rendering through `crate::ui::render_buffer` / `render_text`: `src/ui/mod.rs` `compose_survives_a_zero_width_field_area` (no flows needed) and `frame_view_is_the_visible_and_paused_sets` (three summaries: `f41` complete 200, `f50` and `f51` with `"intercept": "paused"`); `src/ui/flows.rs` `marked_rows_show_a_colour_swatch_in_the_tick_column` (one summary with `"marks": ["red"]`, one without, one paused); `src/ui/inspector.rs` `json_tab_app` (a detail `f41` whose response is `content-type: application/json` with base64 body of `{"products":[{"id":1,"name":"Widget"}]}`), `timing_tab_is_labelled_and_explains_itself` (any detail), `cookies_tab_renders_served_cookies_bound_to_their_names` (request header `cookie: session=9f1c`); `src/app.rs` `open_externally_targets_screenshots_images_and_large_bodies` (feed `BusEvent::CallOk { name: "poc.run", value: json!({…, "screenshot_path": "pocs/reflected-xss-search.png", …}) }` in the shape `Finding::from_json` reads) and `json_tab_app` (same detail as inspector's). A test whose only subject was how the fixture rendered is deleted instead.
+  - `crates/aitm/tests/sysproxy_contract.rs`: delete `bus_fixture_mirrors_the_real_verb_descriptions` and its doc comment (lines 123–165), the `tool()` helper if it has no other user, the `Path` / `PathBuf` / `Value` imports if unused, and the `//!` sentence about `bus-fixture.json`.
+- **Test:**
+  - `main.rs::fixture_and_snapshot_flags_are_unknown_arguments`: `parse(&argv("--fixture")).unwrap_err().starts_with("unknown argument `--fixture`")`, likewise `"--snapshot out.svg"` → `` "unknown argument `--snapshot`" ``, `"--snapshot-core out.svg"` → `` "unknown argument `--snapshot-core`" ``, `"--cols 100"` → `` "unknown argument `--cols`" ``; each error string also `contains("usage: aitm-tui")`. Written first; it fails at `c8cf56a5` because `--fixture` parses.
+  - `main.rs::usage_marks_the_inline_token_insecure`: `USAGE.contains("insecure")` and neither `--fixture` nor `--snapshot` appear.
+  - `ui/mod.rs::frame_view_is_the_visible_and_paused_sets`: `view.visible == app.visible()` and the paused ids `== vec!["f50", "f51"]`.
+  - `ui/flows.rs::marked_rows_show_a_colour_swatch_in_the_tick_column`: the marked row's line contains `▍` in the Tick column, the unmarked row's does not, the paused row shows the pause tick (the existing assertion, now against the inline rows).
+  - `ui/inspector.rs::cookies_tab_renders_served_cookies_bound_to_their_names`: the row containing `session` also contains `9f1c`; `timing_tab_is_labelled_and_explains_itself`: the request tab row contains `Timing (F5)` and `Cookies  `.
+  - `app.rs::open_externally_targets_screenshots_images_and_large_bodies`: `app.update(Action::OpenExternally) == vec![BusRequest::Call { name: "poc.artifact".into(), args: json!({"path": "pocs/reflected-xss-search.png"}) }]`.
+  - `grep -c "fixture" crates/aitm/tests/sysproxy_contract.rs` prints `0`; `ls crates/aitm-tui/src/fixture.rs crates/aitm-tui/src/snapshot.rs crates/aitm-tui/fixtures` each report no such file.
+- **Done when:** `cargo fmt --check && cargo clippy -p aitm-tui --lib --bins -- -D warnings && cargo test -p aitm-tui --lib --bins && cargo test -p aitm --test sysproxy_contract` pass (run from `.wt/tui` with the `CARGO_TARGET_DIR` above; if `sysproxy_contract` is refused a bind in the sandbox, the orchestrator runs it in the Terminal), with the test runs quoted red-then-green. `tests/` is expected not to compile yet; the full gate is T3's.
+
+### Task T2: rewrite the kept integration tests on the inline app; delete the pure-fixture ones
+
+- **Satisfies:** AC1 (TUI `tests/`), AC9 (no `l4_surface.rs`, `scan_surface.rs`, `tester_bus_task.rs`)
+- **Depends on:** T1
+- **Files:** `crates/aitm-tui/tests/common/mod.rs` (modify), `crates/aitm-tui/tests/core_sync.rs` (modify), `crates/aitm-tui/tests/tester_edge_cases.rs` (modify), `crates/aitm-tui/tests/tester_bus_task.rs` (delete), `crates/aitm-tui/tests/l4_surface.rs` (delete), `crates/aitm-tui/tests/scan_surface.rs` (delete)
+- **Change:**
+  - `tests/common/mod.rs`: replace `use aitm_tui::snapshot::{render, to_text};` with a local `fn to_text(buf: &Buffer) -> String` (same semantics as T1's `render_text`); `pub fn draw(app: &App, cols: u16, rows: u16) -> Buffer` draws through `aitm_tui::ui::render(app, &theme(), Rect::new(0, 0, cols, rows), &mut buf)`; `text_of` is unchanged in signature. Add `pub fn connected_app(cols: u16, rows: u16) -> App` (as T1's, via the existing `tools(CORE_TOOLS)` and `connect`). Header comment updated. Keep `PRE_MERGE_TOOLS`, `summary`, `connect`, `visible_ids`, `toast`, `press`, `ctrl`, `cell`, `col_of`, `line_with`, `line_index`.
+  - `tests/core_sync.rs`: `use aitm_tui::fixture_app;` → `mod common; use common::connected_app;` (or the file's existing `common` import); `findings_panel_renders_library_entries_as_not_run_with_their_description` feeds `BusEvent::Findings(vec![three Finding literals])` plus two `BusEvent::CallOk { name: "poc.run", value: … }` (the two "runs"); `websocket_messages_draw_with_arrows_from_the_core_direction` feeds one WebSocket summary `f47` (`"kind": "websocket"`) and its detail with two messages (`dir: "out"`, text `{"type":"subscribe"}`, a timestamp that formats to `11:05:05.001`; `dir: "in"`, text `{"type":"ack"}`). The other five tests already build their JSON inline and are unchanged.
+  - `tests/tester_edge_cases.rs`: remove `use aitm_tui::fixture::{Fixture, FixtureTransport};` and `use aitm_tui::fixture_app;`; delete the "fixture bus" section (`reply`, `fixture_transport_answers_malformed_lines_with_json_rpc_errors` and the `Fixture::parse` edge cases, lines 407–515); `app_in(mode)` and the four other `fixture_app(200, 50)` calls (99, 219, 392, 749, 804, 1029 — whichever remain) build `connected_app(200, 50)` plus two summaries (`f41` complete, `f50` paused) so every mode is reachable; the doc comment at line 2 drops "a fixture file".
+  - Delete `tester_bus_task.rs` (its subject is the fixture transport; the real-server counterpart is `crates/aitm/tests/tui_live_bus.rs`; coverage loss recorded as spec Q3's follow-up), `l4_surface.rs` (replaced by the L4 parity plan's `tests/l4_parity.rs` on `App::new`), `scan_surface.rs` (renders `fixture_app_core`).
+- **Test:**
+  - `core_sync::findings_panel_renders_library_entries_as_not_run_with_their_description`: the sidebar's `Findings` line (first 28 columns) `ends_with("3│")`; `core_sync::websocket_messages_draw_with_arrows_from_the_core_direction`: the line containing `{"type":"subscribe"}` contains `11:05:05.001 → text`.
+  - `tester_edge_cases::reducer_and_renderer_survive_every_key_in_every_mode` and `a_random_key_walk_never_panics`: complete without panic; `text_of(&app, 200, 50).lines().count() == 50` after the walk.
+  - `ls crates/aitm-tui/tests/tester_bus_task.rs crates/aitm-tui/tests/l4_surface.rs crates/aitm-tui/tests/scan_surface.rs` reports no such file for all three.
+- **Done when:** `cargo fmt --check && cargo test -p aitm-tui --test core_sync --test tester_edge_cases --test complete --test syntax` pass with output quoted; `cargo clippy -p aitm-tui --test core_sync --test tester_edge_cases -- -D warnings` clean.
+
+### Task T3: salvage the robustness tests into `tests/robustness.rs`; delete the four salvage sources; first full Rust gate
+
+- **Satisfies:** AC1 (TUI, complete), AC6 (Rust gate), AC9 (the listed `tester_shell` / `tester_pass2` / `fix_pass2` / `tester_components` names are gone)
+- **Depends on:** T2
+- **Files:** `crates/aitm-tui/tests/robustness.rs` (create), `crates/aitm-tui/tests/tester_shell.rs` (delete), `crates/aitm-tui/tests/tester_pass2.rs` (delete), `crates/aitm-tui/tests/fix_pass2.rs` (delete), `crates/aitm-tui/tests/tester_components.rs` (delete)
+- **Change:** `tests/robustness.rs` starts with `mod common;` and the imports the moved tests need, then the salvaged tests, each rewritten on `common::connected_app(cols, rows)` (or `App::new` + `connect` with `PRE_MERGE_TOOLS` where a test proves degradation) with its inputs written inline and its assertion's subject unchanged. Bring along the file-local helpers they use (`five_mb_json`, `big_body_app`, `response_tab`, `call`, `ok`, `failed`, `shot_facts`, `walk`, `key_codes`, `fixture_png` renamed `test_png`). The list (spec D7):
+  - from `tester_shell.rs`: `no_mode_panics_at_any_terminal_size`, `terminals_below_40x4_show_the_minimum_size_line`, `five_thousand_flows_ingest_and_render_within_bounds`, `a_five_megabyte_json_body_renders_without_panicking`, `inspector_frames_with_a_five_megabyte_body_do_not_freeze`, `palette_overlay_survives_short_terminals`;
+  - from `tester_pass2.rs`: `a_random_walk_through_every_mode_including_browser_ca_and_confirm_never_panics`, `regex_filters_name_the_size_limit_and_syntax_errors`, `status_bar_total_is_a_dash_until_a_size_is_known`, `detail_cap_and_detail_failed_marks_follow_the_flow_list`;
+  - from `fix_pass2.rs`: `a_prompt_returns_to_the_mode_it_was_opened_from`, `esc_and_enter_from_every_prompt_land_in_the_same_mode`, `finding_yaml_refuses_a_directory_handle_with_a_yaml_name`, `findings_o_opens_only_a_regular_file_that_is_an_image`, `finding_yaml_is_read_only_from_small_regular_yaml_files_and_is_carried_forward`, `findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_resolve`, `dry_run_bypasses_the_confirm_only_as_a_declared_boolean_true`, `an_untracked_browser_tool_answer_does_not_settle_a_tracked_call_in_flight`, `an_unrelated_error_toast_does_not_settle_an_in_flight_browser_call`, `a_disconnect_during_a_navigate_clears_the_browser_busy_state`, `a_not_on_this_bus_call_failed_lands_in_the_browser_panel`, `a_websocket_row_without_a_listed_handshake_makes_no_empty_domains_group`;
+  - from `tester_components.rs`: `auto_select_and_selection_stability`, `tools_list_drives_detail_fetching`, `every_absent_tool_degrades_to_a_labelled_follow_up`, `filter_expressions_select_the_documented_rows` (its rows written inline, e.g. `f1 GET api.shop-staging.test /api/products 200`, `f2 POST auth.shop-staging.test /api/auth/login 401`, `f3 GET cdn.shop-staging.test /static/app.js 304`, with the expected ids per documented expression stated in the test).
+  The Coder may keep more tests from the four files when the subject is a reducer or layout property and the inputs fit in a few literals; it never keeps a test that asserts the deleted sample set's shape (tool counts, row counts, "the mockup order"). Then delete the four source files.
+- **Test:** the moved tests pass with their assertions intact; literal spot checks the Tester reads back: `terminals_below_40x4_show_the_minimum_size_line` renders at 39×3 and the text contains the minimum-size line the test names; `status_bar_total_is_a_dash_until_a_size_is_known` sees `—` as the total before `BusEvent::ProxyStatus`; `five_thousand_flows_ingest_and_render_within_bounds` has `app.flows.len() == 5000` after the ingest; `filter_expressions_select_the_documented_rows` selects exactly the ids its inline table states (for example `status:4xx` → `["f2"]`). `grep -rn "fixture_app\|Fixture\b\|snapshot::" crates/aitm-tui/tests` prints nothing.
+- **Done when:** the full Rust gate passes from `.wt/tui`: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` (with `CARGO_TARGET_DIR` as above, sources touched first), output quoted; the acceptance grep (spec AC1) restricted to `crates/aitm-tui` finds nothing outside `tests/` and `#[cfg(test)]` blocks. The orchestrator then runs `cargo test -p aitm --test tui_live_bus` and `aitm tui` with a curl flow in the Terminal for AC6 and attaches the output to the PR.
+
+### Task T4: TUI README
+
+- **Satisfies:** AC1 (TUI README), AC7
+- **Depends on:** none (touches only the README; may run in parallel with T1–T3)
+- **Files:** `crates/aitm-tui/README.md` (modify)
+- **Change:** line 7 "the same recorded fixture" → "the same tokens"; the usage block (13–19) becomes T1's `USAGE`; lines 21–23 lose the "56 core tools" parenthesis and read "With no `--bus` and no `AITM_BUS` it prints this usage and exits with status 2"; delete the "**Fixture.**" and "**Snapshot.**" paragraphs (80–89); line 349 "The fixture contains the F1 tools in their proposed shape and every lit tool in the core's real shape" → "The core serves the F1 tools in their real shape; `CORE_TOOLS` in `src/lib.rs` lists what the TUI expects and `crates/aitm/tests/tui_live_bus.rs` pins it against the running server"; replace the section "Fixture and snapshots for UI work" (394–420) with "## Testing": unit and integration tests with inline inputs (`cargo test -p aitm-tui`; `tests/common/mod.rs` builds an `App` with `App::new`, `connect`, `summary`), the real-server contract `cargo test -p aitm --test tui_live_bus` (binds a port: Terminal only), the real run `aitm tui` or `aitm-tui --bus 127.0.0.1:9090 --token-file …` against a running proxy with `curl -x` traffic, and the statement that the recorded fixture and `--snapshot` were removed on 2026-10-31 and must not come back; one line that `docs/design/tui/main-screen*.svg` are design-history images from the removed snapshot mode and are not regenerable.
+- **Test:** `grep -n "fixture\|snapshot" crates/aitm-tui/README.md` prints only lines in the "Testing" section (the removal statement and the design-history line); `grep -c "\-\-fixture\|\-\-snapshot\|--cols" crates/aitm-tui/README.md` prints `0`.
+- **Done when:** both greps match; the acceptance grep on `crates/aitm-tui/README.md` finds nothing.
+
+---
+
+## Web group — `.wt/web`, branch `chore/no-fixtures-web`
+
+### Task W1: the testkit's own in-memory bus; the four store suites off the mock
+
+- **Satisfies:** AC5 (unit half, in part), AC9 (`the static fixtures bus`, `the fixtures bus still applies the summary directly`, `on the fixtures bus`)
+- **Depends on:** none
+- **Files:** `apps/web/src/state/bridgeBus.testkit.ts` (modify), `apps/web/src/state/app.polling.test.ts` (modify), `apps/web/src/state/app.push.test.ts` (modify), `apps/web/src/state/app.resync.test.ts` (modify), `apps/web/src/state/app.activity.test.ts` (modify)
+- **Change:** `bridgeBus.testkit.ts` drops `import { createMockBus, type MockControls } from '~/bus/mock'` and `import { generateRequest, generateResponse, mulberry32 } from '~/bus/fixtures'` and provides:
+  ```ts
+  export const TEST_VERSION = '0.0.0-test';
+  export type FlowWire = Record<string, unknown>;          // the server's flow.get / flow.detail object
+  export function flow(id: string, over?: Partial<FlowWire>): FlowWire;
+  export interface MemoryBusOptions { tools?: string[]; flows?: FlowWire[]; status?: Record<string, unknown>; scripts?: unknown[]; address?: string; }
+  export interface MemoryControls { flowsById(): Map<string, FlowWire>; emit(method: string, params: unknown): void; }
+  export function memoryBus(opts?: MemoryBusOptions): BusClient & MemoryControls;
+  export function bridgeBus(address = '127.0.0.1:8082'): TestBus;   // built on memoryBus; same ctl surface as today
+  export function captureSilently(bus: TestBus, seq: number): string;
+  export function captureInFlight(bus: TestBus, seq: number): string;
+  export function complete(bus: TestBus, id: string): void;
+  ```
+  `memoryBus.call` answers `flow.list` (ids in insertion order), `flow.get` / `flow.detail` (the stored object; `flow.detail` of an unknown id throws `BusError`), `proxy.status` (`{ listening: '127.0.0.1:8080', capturing: true, intercept_armed: false, paused: 0, version: TEST_VERSION, …opts.status }`), `scope.list` (`[]`), `agent.status`, `agent.activity` (`[]`), `script.list` (`opts.scripts ?? []`), `script.findings` (`[]`), `poc.list` (`[]`) — and whatever else `createAppStore`'s bootstrap and `panels/scripts/store.ts` call (the Coder greps `app.ts` and `store.ts`); any other tool throws `new BusError(\`${tool}: not served by the test bus\`)`. Its default catalogue is the names it answers plus `flow.subscribe`. `TestBus`, `ctl` (`failDetail`, `failFlowList`, `holdFlowList`, `holdReply`, `replyWith`, `hideTools`, `failToolsOnce`, `failStatus`, `activityWire`, `stripSeq`, `setState`), `calls`, `count`, `callArgs`, `peak`, `emit`, `tick`, `gate`, `FLOW_PING`, `AGENT_LINE`, `SUBSCRIBE` keep their names. `flow()` emits the server's wire shape as `normalize.ts` documents it (epoch-ms times, base64 `body`, no `seq`), with the model shape allowed where a suite's assertions need it (spec D6). `captureSilently` / `captureInFlight` / `complete` are rewritten on `flow()` (in-flight = `status: null`; `complete` sets `status: 200` and a response).
+  In the four suites: switch any import of the mock to the testkit; `app.polling.test.ts` line 158 asserts `TEST_VERSION` and the `describe('app store — the static fixtures bus')` (419–428) is deleted; `app.push.test.ts` deletes `'the fixtures bus still applies the summary directly'` (480–490) and the `describe('on the fixtures bus')` block (494–540) — their subject is the `onFlowEvent` fixtures path W3 removes; a case that only needed "a bus that does not poll" uses the fake timers instead. Every other case keeps its assertion.
+- **Test:** `npm test -- src/state` passes with every remaining case in the four suites green and the deleted cases absent (`grep -n "fixtures bus\|static fixtures\|bridgeBus('fixtures')" src/state/*.test.ts` prints nothing); `grep -n "createMockBus\|bus/mock\|bus/fixtures\|0.0.0-fixtures" src/state/bridgeBus.testkit.ts src/state/app.polling.test.ts src/state/app.push.test.ts src/state/app.resync.test.ts src/state/app.activity.test.ts` prints nothing; `app.polling.test.ts` asserts `expect(app.proxy.version).toBe(TEST_VERSION)` where it asserted `'0.0.0-fixtures'`. Red first: the suites fail to type-check the moment the testkit's imports change, then go green on the new bus.
+- **Done when:** `npm run typecheck && npm test` pass in `.wt/web/apps/web`, output quoted (`mock.ts` still exists at this point and is still imported by the four files W2 owns; that is expected).
+
+### Task W2: Sidebar, Scripts, version and L4 tests off the mock
+
+- **Satisfies:** AC5 (unit half, in part)
+- **Depends on:** W1
+- **Files:** `apps/web/src/shell/Sidebar.test.tsx` (modify), `apps/web/src/panels/scripts/Scripts.test.tsx` (modify), `apps/web/src/state/app.version.test.ts` (modify), `apps/web/src/state/app.l4.test.ts` (modify)
+- **Change:** each file builds its bus from `memoryBus(...)` (or a literal `BusClient` object, as `Findings.test.tsx` already does) with its sample data written in the test: `Sidebar.test.tsx` `mount()` wraps `memoryBus()` and expects `v${TEST_VERSION}`; `Scripts.test.tsx` `mount()` wraps `memoryBus({ scripts: [three ScriptInfo literals in the `crates/aitm-plugin-rhai/src/commands.rs` shape: two enabled (one of them with an `error`), one disabled], tools: [the `script.*` names] })` and its `reply` hook answers `script.enable` / `script.disable` / `script.validate` / `script.save` / `script.reload` / `script.findings` from the test's own state; its header comment stops saying "against the fixture bus"; `app.version.test.ts` `withStatus(rewrite, address = '127.0.0.1:8082')` wraps `memoryBus()` and `MOCK_VERSION` becomes `TEST_VERSION` from the testkit; `app.l4.test.ts` `store()` uses `memoryBus()`.
+- **Test:** `Sidebar.test.tsx`: `(await screen.findByText('v0.0.0-test')).tagName === 'SPAN'` and `brandText() === 'aitmproxyv0.0.0-test'`, and the no-version case renders no version span; `Scripts.test.tsx`: the list shows 3 rows, 2 toggles on, the sidebar count the panel predicate gives (`1` active, since enabled-with-error is not active); `app.version.test.ts`: `app.proxy.version === TEST_VERSION` from a plain status, the rewritten literal from a rewritten status, `''` when the field is absent; `app.l4.test.ts` unchanged assertions. `grep -rn "createMockBus\|from '~/bus/mock'" src --include='*.test.ts' --include='*.test.tsx'` prints only the two `PocRun` type imports in `panels/findings/` (W3 moves them).
+- **Done when:** `npm run typecheck && npm test` pass in `.wt/web/apps/web`, output quoted.
+
+### Task W3: delete the mock and the fixtures; `PocRun` to `types.ts`; `createBus` and `app.ts` live only
+
+- **Satisfies:** AC1 (web), AC5 (no `mock` / `fixtures` module; `'fixtures'` only in tests), AC8 (web: no live change), AC10
+- **Depends on:** W2
+- **Files:** `apps/web/src/bus/mock.ts` (delete), `apps/web/src/bus/fixtures.ts` (delete), `apps/web/src/bus/types.ts` (modify), `apps/web/src/bus/index.ts` (modify), `apps/web/src/bus/index.test.ts` (create), `apps/web/src/bus/normalize.ts` (modify, comments), `apps/web/src/state/app.ts` (modify), `apps/web/src/panels/findings/Findings.tsx`, `FindingDetail.tsx`, `model.ts`, `export.ts`, `Findings.test.tsx`, `export.test.ts` (modify: imports)
+- **Change:**
+  - `export interface PocRun { … }` (mock.ts 39–58) moves verbatim to `src/bus/types.ts`; the seven importers (`panels/findings/Findings.tsx:6`, `FindingDetail.tsx:6`, `model.ts:4`, `export.ts:5`, `Findings.test.tsx:4`, `export.test.ts:4`, `state/app.ts:14`) import it from `~/bus/types`.
+  - `src/bus/index.ts`: remove `import { createMockBus } from './mock'` and the `forced` / `live` / `rate` / `initial` logic; `createBus()` reads the `#t=` token and `#expect=` as today and always returns `createWsBus({ url: \`${proto}://${location.host}/bus\`, token, expect })`. Doc comment: `vite dev` proxies `/bus` to a running `aitm web` (`vite.config.ts`, `AITM_WEB`); the operator opens `http://127.0.0.1:5173/#t=<token>` with the token `aitm web` prints; `?bus=` is no longer read.
+  - `src/state/app.ts`: `onFlowEvent(n)` becomes `onFlowTrigger(n)`'s only caller with no address test (delete lines 306–322 and keep the trigger path); line 930 becomes `startPolling();`; the comments at 121 ("false on push or on the static fixtures bus" → "false while push notifications are fresh"), 310, 510 and 848 lose their fixtures clauses — the `scope.list` decoding at 848 stays tolerant.
+  - `src/bus/types.ts` comments at 83, 104, 114, 117, 156 and `src/bus/normalize.ts` comments at 5, 71, 143, 293, 333 are reworded to describe the server's shapes and the tolerated alternative without naming a fixture bus; no code changes.
+  - `panels/findings/Findings.test.tsx`: `address: 'fixtures'` → `'127.0.0.1:8082'` in `fakeBus` and `coreBus`, and the comment "`address: 'fixtures'` keeps the store from polling" is replaced by the truth: the poll loop is gated on `bus.state()`, and these buses answer `flow.list` with `[]`.
+  - New `src/bus/index.test.ts`.
+- **Test:** `src/bus/index.test.ts` `createBus ignores ?bus=mock and always builds the WebSocket bus`: `history.replaceState(null, '', '/?bus=mock&rate=1#t=abc&expect=operator')`; `const bus = createBus()`; `expect(bus.address).not.toBe('fixtures')`; `expect(sessionStorage.getItem('aitm.bus.token')).toBe('abc')`; `expect(sessionStorage.getItem('aitm.bus.expect')).toBe('operator')`; `expect(location.hash).toBe('')`; `bus.close()`. Written first: at `c8cf56a5` under vitest (`import.meta.env.DEV` is true) `createBus()` returns the mock with `address === 'fixtures'`, so the first assertion fails; it passes after the change. The existing push suite's "a real bus: the push is a trigger" cases keep passing (AC8). `ls src/bus/mock.ts src/bus/fixtures.ts` reports no such file; `grep -rn "'fixtures'" src` prints nothing outside `*.test.ts(x)` / `*.testkit.ts` (and ideally nothing at all); `grep -rn "bus=mock\|createMockBus\|import.meta.env.DEV" src vite.config.ts scripts` prints nothing.
+- **Done when:** `npm run typecheck && npm test` pass in `.wt/web/apps/web`, output quoted; the acceptance grep (spec AC1) restricted to `apps/web/src apps/web/scripts apps/web/vite.config.ts` finds nothing outside the allowed test paths. The orchestrator then runs `node scripts/selftest-live.mjs` and the real-browser check in the Terminal for AC5 and attaches the output and the screenshot to the PR.
+
+### Task W4: web README
+
+- **Satisfies:** AC7
+- **Depends on:** none (creates one file; may run in parallel with W1–W3)
+- **Files:** `apps/web/README.md` (create)
+- **Change:** sections: what `apps/web` is (the Solid operator UI served by `aitm web`, with `/bus` on the same origin); the dev loop — start `aitm web` (it prints the URL with `#t=<token>`), `npm run dev`, open `http://127.0.0.1:5173/#t=<token>` (Vite proxies `/bus` to `AITM_WEB`, default `http://127.0.0.1:8082`); the gate — `npm run typecheck && npm test` (unit tests with inputs written in the test; `src/state/bridgeBus.testkit.ts` is the in-memory bus the store suites share), `node scripts/selftest-live.mjs` (real `aitm web`, real proxy, real traffic; `--keep` leaves it running and prints the UI URL), and the UI in a real browser against that `aitm web` with a `curl -x` flow visible; "No mock bus exists; do not add one. `?bus=`, `rate` and `initial` are not read. The mock bus and its fixtures were removed on 2026-10-31."
+- **Test:** `grep -c "selftest-live.mjs\|npm run typecheck && npm test\|do not add one" apps/web/README.md` prints `3` or more; `grep -c "bus=mock\|createMockBus" apps/web/README.md` prints `0` (the README names `?bus=` only to say it is not read).
+- **Done when:** both greps match; the file exists in the PR.
+
+---
+
+## mac group — root worktree, branch `claude/nice-pare-a04795`
+
+### Task M1: collapse the panel and guard branches to the live arm
+
+- **Satisfies:** AC1 (mac `Sources`, in part), AC8 (D3 items 2, 3, 4, 6)
+- **Depends on:** none
+- **Files:** `apps/mac/Sources/Aitmproxy/Session+Detail.swift`, `Session+Editing.swift`, `Session+Transfer.swift`, `Inspector/InspectorView.swift`, `Shell/CommandPalette.swift`, `Panels/AgentPanel.swift`, `Panels/ScriptsPanel.swift`, `Panels/CAPanel.swift`, `Panels/ConfigPanel.swift`, `Panels/ScopePanel.swift`, `Panels/BrowserState.swift`, `Panels/PocSheets.swift`, `Panels/FindingsPanel.swift`, `Bus/BusService.swift`, `Bus/CoreHealthState.swift`, `Bus/ExtensionController.swift`, `UI/Grid.swift` (all modify)
+- **Change** (line numbers at `c8cf56a5`; `Store.usesFixtures` and the Kit `Fixtures` still exist after this task, so everything compiles):
+  - `Session+Detail.swift:11` drop `!Store.usesFixtures,` from the guard.
+  - `Session+Editing.swift:16` → `guard let detail = details[id] else { lastError = "Flow detail not loaded yet — select the flow and try again"; return }` (D3 item 2).
+  - `Session+Transfer.swift:70` → `guard !SelfTest.requested else { return }` (D3 item 6).
+  - `Inspector/InspectorView.swift`: delete `previousResponse` (628–634) and the `else if row.state == .paused, let previous = previousResponse { … }` branch at 554 that reads it (the following branches keep their order).
+  - `Shell/CommandPalette.swift:52` delete the `paletteSeedQuery` line; `:85` → `Text(session.tools.isEmpty ? "Bus offline — connect in Settings ▸ Bus" : "No match")`.
+  - `Panels/AgentPanel.swift`: `init` loses lines 49–53 (the `Fixtures.activity` seeding, `connectedClients = 1`, `busFed = true`); `:66` → `!busFed ? "This app's own commands only — …" : nil`; `:88` → `if entry.origin == .agent { session.agentActionsLastMinute = ring.actionsLastMinute() }`; the fixture branches at 134–138 (`setL4Gate`) and 163–167 (`agentPolicy`) go; `busOnline` (213–216) → `if case .connected = session.bus { return true }; return false`.
+  - `Panels/ScriptsPanel.swift`: the `else if Store.usesFixtures { scripts = Fixtures.scripts; note = … }` branch (135–137) goes, the `else` ("The core does not list scripts yet") stays; `:155` `if Store.usesFixtures, !hasBusToggle { return }` goes.
+  - `Panels/CAPanel.swift:175–179` and `Panels/ConfigPanel.swift:94–98`: fixture branches deleted.
+  - `Panels/ScopePanel.swift:42` → `let limits: [String: ScopeLimits] = [:]` (or the type `ScopeEntry.entries(hosts:limits:)` takes; keep the call).
+  - `Panels/BrowserState.swift`: delete the fixture branches at 65–73 (init), 87 (`available` → connected only), 140–146 (navigate), 186 (`evalQuietly`), 201 (`syncLocation`: `guard var tab = current else { return }`), 217–220 (`screenshot`), 286 (`click`), 299 (`type`), 314 (`eval`), 326 (`dom`).
+  - `Panels/PocSheets.swift:98` → `guard let detail = session.details[flowID] else { return [] }; return PocParameters.candidates(for: detail, row: row)` (D3 item 3).
+  - `Panels/FindingsPanel.swift`: `load()` keeps only the `else` body (31–37); `save()` writes unconditionally (116); `persist()` → `try? store.save(findings)` (186); `resolveBuilt` (190–200) per D3 item 4 — no `Fixtures.pocYAML`; path unreadable → `(yaml: "", path: returned)` and `session.lastError = "poc.build: could not read \(returned)"`; neither YAML nor path → `(yaml: "", path: "")` and `session.lastError = "poc.build returned neither YAML nor a path"`; in `build(flowID:name:param:)` after line 78: `guard !yaml.isEmpty else { return }` (the `lastError` is already set).
+  - `Bus/BusService.swift:205` → `guard preferEmbedded else { return }`.
+  - `Bus/CoreHealthState.swift:68–70` → `guard !SelfTest.requested else { return false }`; `Bus/ExtensionController.swift:125–127` → `guard !SelfTest.requested else { return }`; their comments stop naming fixture and snapshot runs (D3 item 6).
+  - `UI/Grid.swift`: line 5 (the `-layout.json` sentence) deleted; `GridProbes.enabled = GridOverlay.enabled` (36–37).
+- **Test:** no Swift test target covers the app target; this task is deletion and guard collapse. Proof: the orchestrator's `swift build` + `swift test` (unchanged Kit tests, 0 failures), and after the task `grep -rn "usesFixtures\|Fixtures\.\|APP_SNAPSHOT" apps/mac/Sources/Aitmproxy/Panels apps/mac/Sources/Aitmproxy/Bus apps/mac/Sources/Aitmproxy/Inspector apps/mac/Sources/Aitmproxy/UI apps/mac/Sources/Aitmproxy/Session+Detail.swift apps/mac/Sources/Aitmproxy/Session+Editing.swift apps/mac/Sources/Aitmproxy/Session+Transfer.swift apps/mac/Sources/Aitmproxy/Shell/CommandPalette.swift` prints hits only in `Panels/ScanPanel.swift` (`Fixtures.scanDiscover`), `Bus/FlowActions.swift` (`FixtureActions`) and `Bus/FixtureBus.swift` — all three are M2's files. The live proof of the whole group is AC2 and AC4.
+- **Done when:** the Coder cannot run SwiftPM; it reports the files changed and the grep above; the orchestrator runs `swift build` and `swift test` (scratch path `~/Library/Developer/Aitmproxy/test-build`) in the Terminal; compiler output comes back as a fix task; done when both pass.
+
+### Task M2: delete the fixture files; `Session`, `ShellView`, `App`, `SelfTest` live only; `OfflineActions`
+
+- **Satisfies:** AC1 (mac `Sources`, complete), AC2 (refusal and menu audit), AC8 (D3 items 1, 5), AC11 (`seedsAtLaunch` truth table)
+- **Depends on:** M1
+- **Files:** `apps/mac/Sources/Aitmproxy/Session+Fixtures.swift` (delete), `Bus/FixtureBus.swift` (delete), `Snapshot.swift` (delete), `SnapshotScenes.swift` (delete), `DesignKit/KitGallery.swift` (delete), `DesignKit/KitGalleryParts.swift` (delete), `Bus/FlowActions.swift` (modify), `Session.swift` (modify), `Shell/ShellView.swift` (modify), `App.swift` (modify), `SelfTest.swift` (modify), `SelfTest+Live.swift` (modify), `Panels/ScanPanel.swift` (modify), `SettingsView.swift` (modify, comments 113, 170, 217), `UI/Theme.swift` (modify, comment 70), `apps/mac/Sources/AitmBusClient/BusEndpointSettings.swift` (modify, comment 7), `apps/mac/Sources/AitmproxyKit/EmbeddedScope.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/EmbeddedScopeTests.swift` (modify)
+- **Change:**
+  - `Bus/FlowActions.swift`: delete `final class FixtureActions` (25–153); the protocol's doc comment (5–7) stops describing fixtures; add
+    ```swift
+    /// Installed until `ShellView` hands the session a `BusService`: every action fails
+    /// with `BusError.disconnected`, which `Session+Verbs` shows in the status bar.
+    final class OfflineActions: FlowActions { … }
+    ```
+    with every protocol method `throws BusError.disconnected` (`replay` / `send` never return).
+  - `Session.swift`: delete `paletteSeedQuery` (163–164); `:165` `var tools: [ToolDescriptor] = []`; `:195` `let activeCoreID = CoreID()` and its comment (190–194) reads "the single active core connection's id this launch; rows built without a core (imports, tests) use `CoreID.fixture`"; `:219–221` comment drops "`nil` in fixture/snapshot runs"; `:224` `@ObservationIgnored lazy var actions: any FlowActions = OfflineActions()`; `init`: `pins = Pins.load(from: pinsURL)` and `breakpointRules = BreakpointRules.load(from: rulesURL)` unconditional; `EmbeddedScope.seedsAtLaunch(activeKind: …, bundledCorePresent: …)` two-argument; delete the `FixtureBus` install (240–244).
+  - `Shell/ShellView.swift`: lines 17–20 keep only the `VStack` (no `KitGallery.enabled` test); `.task` runs the `else` body unconditionally (77–79); delete `Snapshot.runIfRequested(…)` (105); `:185` → `} else if session.scopeHosts.isEmpty, case .connected = session.bus {`.
+  - `App.swift`: delete header lines 7 and 9 and `Store.usesFixtures` (100–106). `isOverridden`, `defaults`, `url` untouched.
+  - `Panels/ScanPanel.swift`: delete `loadFixture()` (40–46).
+  - `SelfTest.swift`: delete lines 56–468 (the fixture pass); `runIfRequested` after the `isOverridden` guard becomes
+    ```swift
+    guard live else {
+        print("SELFTEST refused: the fixture self-test was removed on 2026-10-31; run tools/selftest-live.sh (APP_LIVE=1)")
+        finish(code: 1)
+        return
+    }
+    runLive(session: session)
+    ```
+    `checkMenuCoverage()` and `checkTypingIsNotAVerb(_:)` lose `private` (file-scoped in Swift; `runLive` is in another file); the `settle` doc comment (539–540) stops mentioning fixture actions; `enum SelfTest`'s header comment describes the live run only.
+  - `SelfTest+Live.swift`: header comment (6–8) drops "the path the fixture self-test never touches"; on the happy path, immediately before `finishLive()` (line ~425): `checkMenuCoverage()` then `await checkTypingIsNotAVerb(session)`.
+  - `AitmproxyKit/EmbeddedScope.swift`: `public static func seedsAtLaunch(activeKind: ActiveCoreKind, bundledCorePresent: Bool) -> Bool { activeKind == .embedded && bundledCorePresent }`; doc comments at 7 and 118–120 drop "never in fixture mode".
+  - Comments only: `SettingsView.swift` 113, 170, 217; `UI/Theme.swift` 70; `AitmBusClient/BusEndpointSettings.swift` 7 (harness runs are `APP_STORE` / `APP_LIVE`).
+- **Test:** `EmbeddedScopeTests.seedsAtLaunchOnlyForEmbeddedWithABundledCore` (renamed) asserts `seedsAtLaunch(activeKind: .embedded, bundledCorePresent: true) == true`, `(.external, true) == false`, `(.embedded, false) == false` — written first against the two-parameter signature, so it fails to compile until the Kit changes (red), then passes (green). No test covers the app target; proof: the orchestrator's `swift build` + `swift test`, `grep -rn "usesFixtures\|Fixtures\.\|APP_FIXTURES\|APP_SNAPSHOT\|APP_KIT_GALLERY\|FixtureBus\|FixtureActions\|SnapshotScene\|loadFixtures" apps/mac/Sources/Aitmproxy apps/mac/Sources/AitmBusClient` prints nothing, and AC2's first half in the Terminal: `APP_STORE=/tmp/claude/nf-store <built Aitmproxy> --selftest` prints the refusal line and `echo $?` is `1`.
+- **Done when:** the Coder cannot run SwiftPM; it reports the files changed and the grep; the orchestrator runs `swift build` and `swift test` in the Terminal and the AC2 refusal; compiler output comes back as a fix task; done when all pass. (The Kit still contains `Fixtures*.swift` after this task, unreferenced by the app; M3 moves them.)
+
+### Task M3: Kit — `HAR.swift`, `Fixtures` into the test target, `SettingsDomain`, test edits
+
+- **Satisfies:** AC1 (mac `Sources/AitmproxyKit`), AC9 (`fixturesMatchTheMockup`, `FixturesTests`), AC11 (`harnessVariables`, non-public `Fixtures`, `HAR.swift`)
+- **Depends on:** M2
+- **Files:** `apps/mac/Sources/AitmproxyKit/HAR.swift` (create), `apps/mac/Sources/AitmproxyKit/Fixtures.swift`, `Fixtures+Agent.swift`, `Fixtures+Binary.swift`, `Fixtures+Bodies.swift`, `Fixtures+L4.swift`, `Fixtures+Poc.swift`, `Fixtures+Scope.swift`, `Fixtures+Streams.swift`, `Fixtures+Tools.swift` (`git mv` to `apps/mac/Tests/AitmproxyKitTests/Fixtures/` or delete), `apps/mac/Sources/AitmproxyKit/Panels/Scan.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/Fixtures/Fixtures+Scan.swift` (create), `apps/mac/Sources/AitmproxyKit/SettingsDomain.swift` (modify), `apps/mac/Sources/AitmproxyKit/CoreConnection.swift` (modify, doc 18–21), `apps/mac/Tests/AitmproxyKitTests/SettingsDomainTests.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/FixturesTests.swift` (delete), `apps/mac/Tests/AitmproxyKitTests/FlowQueryTests.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/KitTests.swift` (modify), `apps/mac/Package.swift` (modify, comment 11)
+- **Change:**
+  - `HAR.swift`: `public enum HAR` and `public enum QueryPairs` moved verbatim from `Fixtures+Poc.swift` 122–241 (with the imports they need). `Transfer.swift` and `FindingsPanel.swift` compile unchanged.
+  - `git mv` each `Fixtures*.swift` the tests use into `Tests/AitmproxyKitTests/Fixtures/`, drop every `public` (the tests use `@testable import AitmproxyKit`), keep `enum Fixtures` and the member names, keep `extension FlowRow { func withID(_:seq:) }` in `Fixtures.swift`. Delete members no test uses (D5 list: `browserPage` and `struct BrowserPage`, `domOutline`, `caStatus`, `wsDetail(for:)`, `l4Detail(for:)`, `sseDeltas`, `l4Scope`, …) and any file that becomes empty (`Fixtures+Agent.swift` keeps `activity`; `Fixtures+Scope.swift` keeps `scope`, `scopeEntries`, `scopeLimits`); keep a member a kept member needs (the `aitm` / `obscura` clients if `rows` use them). The Coder confirms each deletion by `grep -rn "Fixtures\.<member>" apps/mac/Tests` and by the compile.
+  - `Panels/Scan.swift`: delete lines 306–337; `Tests/AitmproxyKitTests/Fixtures/Fixtures+Scan.swift` holds `extension Fixtures { static let scanDiscover: JSONValue = … }` verbatim minus `public`.
+  - `SettingsDomain.swift`: `static let harnessVariables = ["APP_STORE", "APP_LIVE"]`; doc lines 8 and 15 reword to "a dev bundle or live self-test run (`APP_STORE`, `APP_LIVE=1`) reads an isolated suite instead".
+  - `CoreConnection.swift` 18–21: doc → "The well-known id for rows built without a core (imports, tests): one stable originating connection so they share a `CoreID`. The live embedded connection gets a fresh id."
+  - `SettingsDomainTests.harnessRunsReadAWipedIsolatedSuite`: iterate `["APP_STORE", "APP_LIVE"]` and add `#expect(SettingsDomain.harnessVariables == ["APP_STORE", "APP_LIVE"])`.
+  - `FixturesTests.swift` deleted; `pinnedQueryNarrowsToPinnedHostsAndApps` moves into `FlowQueryTests` unchanged. `KitTests.fixturesMatchTheMockup` (413–418) deleted. `Package.swift` line 11 → "Domain models, formatting, filters. No SwiftUI, so tests run without the app."
+- **Test:** `SettingsDomainTests.harnessRunsReadAWipedIsolatedSuite`: `SettingsDomain.harnessVariables == ["APP_STORE", "APP_LIVE"]` and `SettingsDomain.select(environment: ["APP_LIVE": "1"]) == .suite(name: SettingsDomain.harnessSuite, wipe: true)` — written first, red (the array has four entries at `c8cf56a5`), green after. `FlowQueryTests.pinnedQueryNarrowsToPinnedHostsAndApps`: `rows.map(\.seq) == [45, 49, 50]`. `TransferTests` (HAR round trip) unchanged and green. `grep -rn "public" apps/mac/Tests/AitmproxyKitTests/Fixtures` prints nothing; `grep -rln "enum Fixtures\|extension Fixtures" apps/mac/Sources` prints nothing; `ls apps/mac/Sources/AitmproxyKit/HAR.swift` exists.
+- **Done when:** the Coder cannot run SwiftPM; it reports the files and the greps; the orchestrator runs `swift build` and `swift test` in the Terminal (0 failures; the test count drops by exactly the three deleted tests); fix tasks on compiler output; done when both pass and the acceptance grep (spec AC1) over `apps/mac/Sources apps/mac/Extension` finds nothing.
+
+### Task M4: tools — `snap-dev.sh` launches live; delete the fixture tools; tripwires honest and green
+
+- **Satisfies:** AC1 (mac `tools`), AC3 (four scripts exit 0), AC4 (the dev bundle launches live)
+- **Depends on:** M2 (the tripwires' gate needs `SnapshotScenes.swift` gone; the edits can be prepared earlier)
+- **Files:** `apps/mac/tools/snap.sh`, `selftest.sh`, `verify.sh`, `cua-clickthrough.sh`, `cua-l4.sh`, `check-layout.swift` (delete), `apps/mac/tools/snap-dev.sh` (modify), `apps/mac/tools/check-connection-words.sh` (modify), `apps/mac/tools/check-capture-operator-only.sh` (modify), `apps/mac/tools/check-capture-toggle.sh` (modify)
+- **Change:**
+  - `snap-dev.sh`: keep lines 1–71 (header rewritten: "Build a debug dev bundle and launch it LIVE against its embedded core on an isolated APP_STORE; `./build.sh` signs + installs for releases. Usage: `DEV_TAG=<tag> CORE_DIR=<dir with aitm> tools/snap-dev.sh`; `NO_LAUNCH=1` only builds"); drop the positional `pages` argument (line 18) and the sentences "the fixture/snapshot defaults are shared" (32) and "snapshots never spawn it" (60); replace lines 73–81 with: `store="/tmp/$name-dev-state$tag"`; remove the saved application state and `$store`; `mkdir -p "$store"`; unless `NO_LAUNCH=1`: `APP_STORE="$store" "$dev/Contents/MacOS/$exe" &` (no `APP_FIXTURES`, no `APP_SNAPSHOT`), then print `== launched pid <pid> · store <store> · stop: kill <pid>`.
+  - `check-connection-words.sh:35`: `readers` regex → `…|Session\+Connection|SelfTest)\.swift$`.
+  - `check-capture-operator-only.sh` 188–200: comment → "`BusService.swift` is the one command path (no fixture adapters since 2026-10-31); the agent-reachable surfaces below reference none of the capture keys"; remove `Sources/Aitmproxy/Bus/FixtureBus.swift`, `Sources/AitmproxyKit/Fixtures+Agent.swift`, `Sources/AitmproxyKit/Fixtures+Tools.swift` from the `deny` list.
+  - `check-capture-toggle.sh`: delete lines 41–42 and `"$snap" "$scenes"` from the loop at 43; delete the `has … 'Store.usesFixtures'` line (330) and the `has … 'APP_SNAPSHOT'` line (332), keep 331; replace the TG-AC11 / NS-AC5 blocks that pin `$scenes` / `$snap` (426–438, 441–447, 479–481, 565–584) with the single comment line `# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).` once per block; keep the unrelated lines 439–440 (`NS-AC4` Settings status row, `security-3` poll loop). No `has` / `hasnt` / `found` / `ordered` / `body_of` / `case_body` on a removed file remains.
+- **Test:** `tools/check-connection-words.sh; echo $?`, `tools/check-capture-operator-only.sh; echo $?`, `tools/check-capture-toggle.sh; echo $?`, `tools/grid-lint.sh; echo $?` each print `0` and no `NOTE: … skipped` / `not found` line (run from `apps/mac` — these are pure greps over the source tree and run in the sandbox); `grep -n "Fixture\|usesFixtures\|APP_SNAPSHOT\|SnapshotScenes\|Snapshot.swift" tools/check-*.sh` prints only the three removal-comment lines; `grep -n "APP_FIXTURES\|APP_SNAPSHOT\|pages" tools/snap-dev.sh` prints nothing; `ls tools/snap.sh tools/selftest.sh tools/verify.sh tools/cua-clickthrough.sh tools/cua-l4.sh tools/check-layout.swift` reports no such file for all six. Red first: on M2's tree, before this task, `tools/check-capture-toggle.sh` prints `FAIL: Sources/Aitmproxy/Snapshot.swift not found; update this script` and exits 1 (its existence loop still names the deleted file); that run is quoted in the report, then the green run after the edit. (`check-connection-words.sh` passes before and after; its `readers` entry for `SnapshotScenes` is removed so the allow-list names only files that exist.)
+- **Done when:** the four scripts exit 0 with output quoted, the greps match, and the orchestrator runs `NO_LAUNCH=1 DEV_TAG=nf CORE_DIR=<dir> tools/snap-dev.sh` in the Terminal (prints `== bundle /tmp/Aitmproxy-dev-nf.app (Aitmproxy-nf)` and no launch line), then the full AC4 live check (launch, curl, `winshot`), attaching the shot to the PR.
+
+### Task M5: mac docs
+
+- **Satisfies:** AC1 (mac docs), AC7
+- **Depends on:** none (docs only; may run in parallel with M1–M4; describes the end state)
+- **Files:** `apps/mac/CLAUDE.md`, `apps/mac/docs/ARCHITECTURE.md`, `apps/mac/docs/STORIES.md`, `apps/mac/docs/CAPABILITIES.md`, `apps/mac/design/KIT.md` (all modify)
+- **Change** (spec D9):
+  - `CLAUDE.md` "Build and check": delete line 23 (fixture self-test), 27 (CUA click-through), 28–30 (snapshots), 31 (parts gallery), 32 (seed data), the `check-layout` half of 34, and 35; line 25's variable list → `APP_STORE`, `APP_LIVE`; keep line 22 (`snap-dev.sh` builds a throwaway bundle) and line 24 (live self-test), updating 22 to say it launches live; add "**The gate**" with the five numbered steps of spec D4 and the sentence "No fixture, snapshot, gallery or sample-data run exists any more and none may be added"; add "Removed 2026-10-31" with one line per deleted tool and its replacement: `tools/snap.sh`, `tools/verify.sh`, `tools/selftest.sh` → the gate; `tools/cua-clickthrough.sh`, `tools/cua-l4.sh` → `tools/cua-ne-drive.sh` on the dev bundle; `tools/check-layout.swift` → `tools/grid-lint.sh` plus reading the real window.
+  - `docs/ARCHITECTURE.md`: line 18 drop "`Fixtures` (the mockup's data, also the self-test's), "; line 23 drop ", `Session+Fixtures` for the fixture session"; line 27 "(parts and the gallery)" → "(parts)"; Seams table rows 34–38: `FlowActions` test adapter → "none: live only (`OfflineActions` throws `disconnected` until `BusService` is installed)"; `Session.commandRunner` → "none: live only"; `notificationSink` → "none: live only"; `BusClient` transport → `FakeBusServer` (kept); Panel state → "none: Kit unit tests cover the models"; delete line 40; lines 49–50 → "The gate (`apps/mac/CLAUDE.md`): `swift test`, `grid-lint.sh` and the three `check-*.sh` tripwires, the dev bundle with a real core and real traffic, the live self-tests."; line 58 append "(removed 2026-10-31 with the fixture modes)".
+  - `docs/STORIES.md`: S-006 (65–73) retitled "Run the app on the live self-test and the dev bundle", story sentence "As the operator (or an agent), I verify the app against a real core with real traffic and the live self-test, never against sample data.", acceptance = the five gate steps as `[live]` / `[unit]` / `[structural]` lines, `Status: done` kept; line 1175 → "- [live] The Status page renders every lane state the real core produces, light + dark, on the dev bundle with no clipping; grid-lint PASS (ST-AC3)."; line 1176 → "- [live] In the live self-test the lanes read the real core's and extension's state; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6)." Nothing else in the file changes.
+  - `docs/CAPABILITIES.md:17`: delete " Works on fixtures."
+  - `design/KIT.md` 7–9: → "Parts are reviewed in the real app (dev bundle, real core); there is no parts gallery."
+- **Test:** the acceptance grep (spec AC1) over `apps/mac/CLAUDE.md apps/mac/design apps/mac/docs/ARCHITECTURE.md apps/mac/docs/CAPABILITIES.md apps/mac/docs/STORIES.md` prints nothing (baseline 9 hits); `grep -n "snap.sh\|verify.sh\|selftest.sh\|check-layout\|cua-clickthrough\|cua-l4" apps/mac/CLAUDE.md` prints only the "Removed 2026-10-31" lines; `grep -c "The gate" apps/mac/CLAUDE.md` prints `1`; `sed -n '65,73p' apps/mac/docs/STORIES.md` shows the new S-006 with `Status: done`.
+- **Done when:** the greps match; the diff touches no STORIES.md line outside 65–73 and 1175–1176.
+
+---
+
+## Whole-branch checks (Tester, once per group) and the panel
+
+- **TUI** (after T1–T4): the Rust gate in `.wt/tui`; AC1 on `crates/aitm-tui`; AC6 (flags, usage, `tui_live_bus` in the Terminal, `aitm tui` with a curl flow); AC9 TUI names; AC10 diff check.
+- **Web** (after W1–W4): `npm run typecheck && npm test`; AC1 on the web paths; AC5 (`selftest-live.mjs`, real browser); AC9 web names; AC10 (`gen-langs.mjs` untouched).
+- **mac** (after M1–M5): `swift test`; AC1 on the mac paths; AC2; AC3; AC4; AC8 site-by-site table; AC9 mac names; AC11.
+- Every PR: AC12 — gate output, live evidence and the stage-6 panel comment in the PR body; no fixture run cited.
+
+## Review log
+
+Kept by the main session during stage 6. One row per finding.
+
+| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+|---|---|---|---|---|
+
+## Shipped
+
+What merged, what was cut, follow-ups. Filled at stage 7. Follow-up cards to open at that point (from the spec's Open questions): `CoreID.fixture` rename (Q2); scripted-transport bus-task tests for the TUI (Q3); `docs/design/operator-ui-foundation.md` §2.10 wording (Q7).
