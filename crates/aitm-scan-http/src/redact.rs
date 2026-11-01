@@ -178,27 +178,31 @@ fn cut_chars(text: &str, max: usize) -> String {
     }
 }
 
-/// Test support: a thread-local `tracing` subscriber that records every event
-/// as one line, so a test can assert on what a real log site wrote.
+/// Test support: capture the `tracing` events this thread emits, so a test can
+/// assert on what a real log site wrote.
 ///
-/// `install` sets the subscriber as the current thread's default for the life of
-/// the returned guard; a `current_thread` tokio test runs its futures on that
-/// thread, so the lane's log lines land in `lines`. Each line is the event's
-/// fields as `name=value` pairs (Display values are recorded through their
-/// `Debug` of the `%` wrapper, which is the same text), followed by the message.
+/// One process-wide subscriber is installed on first use; it enables every
+/// callsite and hands each event to the *emitting thread's* sink, which
+/// [`install`] sets for the life of the returned guard. A `current_thread`
+/// tokio test runs its futures on the test thread, so the lane's lines land in
+/// that test's `Lines` and nowhere else. (A scoped `set_default` subscriber is
+/// not enough: while exactly one is alive, another test thread's first hit on a
+/// callsite caches that callsite's interest as `never` against the no-op global
+/// default, and the capturing thread then loses the event.) Each line is the
+/// event's fields as `name=value ` pairs followed by the message.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod capture {
+    use std::cell::RefCell;
     use std::fmt::{self, Write as _};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
 
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
-    use tracing::subscriber::DefaultGuard;
     use tracing::{Event, Metadata, Subscriber};
 
-    /// The lines a [`install`]ed capture recorded so far.
+    /// The lines an [`install`]ed capture recorded so far.
     #[derive(Clone, Default)]
     pub(crate) struct Lines(Arc<Mutex<Vec<String>>>);
 
@@ -217,8 +221,14 @@ pub(crate) mod capture {
         }
     }
 
-    struct CaptureSubscriber {
-        lines: Lines,
+    thread_local! {
+        /// Where this thread's events go while a capture is installed.
+        static SINK: RefCell<Option<Lines>> = const { RefCell::new(None) };
+    }
+
+    static INSTALL: Once = Once::new();
+
+    struct FanOut {
         next_span: AtomicU64,
     }
 
@@ -230,7 +240,7 @@ pub(crate) mod capture {
         }
     }
 
-    impl Subscriber for CaptureSubscriber {
+    impl Subscriber for FanOut {
         fn enabled(&self, _: &Metadata<'_>) -> bool {
             true
         }
@@ -246,7 +256,11 @@ pub(crate) mod capture {
         fn event(&self, event: &Event<'_>) {
             let mut visitor = LineVisitor(String::new());
             event.record(&mut visitor);
-            self.lines.0.lock().unwrap().push(visitor.0);
+            SINK.with(|sink| {
+                if let Some(lines) = sink.borrow().as_ref() {
+                    lines.0.lock().unwrap().push(visitor.0);
+                }
+            });
         }
 
         fn enter(&self, _: &Id) {}
@@ -254,15 +268,27 @@ pub(crate) mod capture {
         fn exit(&self, _: &Id) {}
     }
 
+    /// Clears this thread's sink when dropped.
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SINK.with(|sink| sink.borrow_mut().take());
+        }
+    }
+
     /// Start capturing this thread's `tracing` events until the guard drops.
-    pub(crate) fn install() -> (DefaultGuard, Lines) {
+    pub(crate) fn install() -> (Guard, Lines) {
+        INSTALL.call_once(|| {
+            // Another global (none in this crate) would mean every capture test
+            // fails loudly on its first assertion, which is the right outcome.
+            let _ = tracing::subscriber::set_global_default(FanOut {
+                next_span: AtomicU64::new(0),
+            });
+        });
         let lines = Lines::default();
-        let subscriber = CaptureSubscriber {
-            lines: lines.clone(),
-            next_span: AtomicU64::new(0),
-        };
-        let guard = tracing::subscriber::set_default(subscriber);
-        (guard, lines)
+        SINK.with(|sink| *sink.borrow_mut() = Some(lines.clone()));
+        (Guard, lines)
     }
 }
 

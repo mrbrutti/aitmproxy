@@ -508,7 +508,11 @@ fn body_candidates(
             let slots = match xml::scan(bytes) {
                 Ok(slots) => slots,
                 Err(err) => {
-                    tracing::debug!(flow = %flow.id, error = %err, "xml body does not parse; no body points");
+                    tracing::debug!(
+                        flow = %flow.id,
+                        error = %redact::scrub_error(&err),
+                        "xml body does not parse; no body points"
+                    );
                     return;
                 }
             };
@@ -540,7 +544,11 @@ fn body_candidates(
             let parts = match multipart::parse(bytes, boundary) {
                 Ok(parts) => parts,
                 Err(err) => {
-                    tracing::debug!(flow = %flow.id, error = %err, "multipart body does not parse; no body points");
+                    tracing::debug!(
+                        flow = %flow.id,
+                        error = %redact::scrub_error(&err),
+                        "multipart body does not parse; no body points"
+                    );
                     return;
                 }
             };
@@ -928,6 +936,64 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(message.contains('('), "{message}");
+    }
+
+    /// A body parser's error names the markup it choked on; the log line that
+    /// carries it is scrubbed, so a namespace-prefixed element whose text reads
+    /// like a credential (`<sid:S3>`) never reaches the log (stage-5 F3).
+    #[test]
+    fn unparseable_body_error_is_logged_scrubbed() {
+        let (_guard, lines) = crate::redact::capture::install();
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let opts = EnumerateOptions::from_profile(&profile, &ignore, None);
+
+        let unclosed = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[],
+                Some(("text/xml", b"<sid:S3>")),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&unclosed, &opts);
+        assert!(!out
+            .points
+            .iter()
+            .any(|p| p.kind == XmlValue || p.kind == XmlAttr));
+
+        let logged = lines.containing("xml body does not parse");
+        assert_eq!(logged.len(), 1, "{:?}", lines.all());
+        assert!(logged[0].contains("unclosed element"), "{}", logged[0]);
+        assert!(!logged[0].contains("S3"), "{}", logged[0]);
+
+        // The multipart parser's error travels the same route.
+        let bad_multipart = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/upload",
+                &[],
+                Some(("multipart/form-data; boundary=XyZ", b"no delimiter here")),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&bad_multipart, &opts);
+        assert!(!out
+            .points
+            .iter()
+            .any(|p| p.kind == MultipartValue || p.kind == MultipartFilename));
+        let logged = lines.containing("multipart body does not parse");
+        assert_eq!(logged.len(), 1, "{:?}", lines.all());
+        assert!(
+            logged[0].contains("no opening boundary delimiter"),
+            "{}",
+            logged[0]
+        );
     }
 
     #[test]
