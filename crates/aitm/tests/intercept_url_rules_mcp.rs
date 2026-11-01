@@ -290,3 +290,42 @@ fn rule_schemas_state_the_full_url_subject() {
         "map.add condition must drop the path-only wording; got: {condition}"
     );
 }
+
+/// AC15 (operator docs): the intercept skill and the site state the same
+/// subject and rules as the schema, so an operator reading either learns that a
+/// host-bearing pattern works, a star-less one is a substring, and matching is
+/// case-insensitive. Read from the workspace checkout; the files are prose, so
+/// this pins the phrases the spec names rather than exact sentences.
+#[test]
+fn operator_docs_state_the_full_url_subject() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (what, rel, phrases) in [
+        (
+            "intercept SKILL.md",
+            "aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md",
+            &[
+                "full URL",
+                "path alone",
+                "case-insensitive",
+                "substring",
+                "(?-i)",
+            ][..],
+        ),
+        (
+            "site/docs.html",
+            "site/docs.html",
+            &["full URL", "path alone", "case-insensitive", "substring"][..],
+        ),
+    ] {
+        let path = root.join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{what} must be readable at {}: {e}", path.display()));
+        for phrase in phrases {
+            assert!(
+                text.contains(phrase),
+                "{what} must state `{phrase}` for the url rule; not found in {}",
+                path.display()
+            );
+        }
+    }
+}

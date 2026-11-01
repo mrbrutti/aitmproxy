@@ -126,6 +126,98 @@ fn oversized_regex_rejected() {
     let err = compile(rule(UrlMatch::Regex("a{1000}{1000}{100}".into())))
         .expect_err("a pattern over the size cap must be rejected, not balloon");
     assert!(matches!(err, RuleError::BadRegex { .. }));
+    // Tester: the pattern is valid syntax, so the rejection must come from the
+    // cap, not the parser; a `BadRegex` alone would also pass for a syntax error.
+    assert!(
+        err.to_string().contains("size limit"),
+        "rejection must name the size cap: {err}"
+    );
+}
+
+#[test]
+fn oversized_wildcards_rejected_under_size_cap() {
+    // Tester (spec Constraints: agent-supplied patterns are rejected, never
+    // panic, never balloon). A wildcard is compiled through the same capped
+    // builder, so a pathological one is rejected like a regex. A run of stars
+    // compiles to a `.*` program per star; a huge star-less literal compiles to
+    // one case-folded instruction per character. Both blow the 1 MiB cap.
+    let stars = "*".repeat(50_000);
+    let err = compile(rule(UrlMatch::Wildcard(stars)))
+        .expect_err("a 50k-star wildcard must be rejected under the size cap");
+    assert!(matches!(err, RuleError::BadRegex { .. }));
+    assert!(
+        err.to_string().contains("size limit"),
+        "rejection must name the size cap: {}",
+        err.to_string().chars().take(120).collect::<String>()
+    );
+
+    let literal = "a".repeat(256 * 1024);
+    let err = compile(rule(UrlMatch::Wildcard(literal)))
+        .expect_err("a 256 KiB star-less wildcard must be rejected under the size cap");
+    assert!(matches!(err, RuleError::BadRegex { .. }));
+    assert!(
+        err.to_string().contains("size limit"),
+        "rejection must name the size cap: {}",
+        err.to_string().chars().take(120).collect::<String>()
+    );
+
+    // A long-but-realistic pattern (a 4 KiB path) still compiles and matches.
+    let long_path = format!("/{}", "x".repeat(4096));
+    let compiled = compile(rule(UrlMatch::Wildcard(format!("*{long_path}"))))
+        .expect("4 KiB wildcard compiles");
+    assert!(compiled.matches(&http_flow(&long_path), Phase::Request, None));
+    assert!(!compiled.matches(&http_flow("/x"), Phase::Request, None));
+}
+
+#[test]
+fn empty_url_patterns_match_every_http_flow() {
+    // Tester: the degenerate end of the substring rule. `bus.rs` accepts
+    // `url: ""` (a bare string is a wildcard) and `{regex: ""}`, and an empty
+    // pattern is a substring of every subject, so both arm a match-everything
+    // rule on an HTTP flow, the same as omitting `url`. The macOS form refuses
+    // an empty pattern ("Enter a URL pattern") before it reaches the bus; the
+    // core does not. Pinned so a change here is deliberate.
+    let wildcard =
+        compile(rule(UrlMatch::Wildcard(String::new()))).expect("empty wildcard compiles");
+    assert!(wildcard.matches(&http_flow("/get"), Phase::Request, None));
+    assert!(wildcard.matches(
+        &http_flow_scheme("https", "GET", "h.test:443", ""),
+        Phase::Request,
+        None
+    ));
+    // Still an HTTP-only clause: a WebSocket flow has no URL to be a substring of.
+    assert!(!wildcard.matches(&ws_flow(), Phase::Request, None));
+
+    let regex = compile(rule(UrlMatch::Regex(String::new()))).expect("empty regex compiles");
+    assert!(regex.matches(&http_flow("/get"), Phase::Request, None));
+    assert!(!regex.matches(&ws_flow(), Phase::Request, None));
+}
+
+#[test]
+fn anchored_empty_regex_matches_only_an_empty_path() {
+    // Tester: `^$` can never match the full URL (it always has a scheme), so it
+    // fires only through the second subject, and only when the path is empty.
+    let compiled = compile(rule(UrlMatch::Regex("^$".into()))).expect("valid regex");
+    assert!(compiled.matches(
+        &http_flow_scheme("https", "GET", "h.test:443", ""),
+        Phase::Request,
+        None
+    ));
+    assert!(!compiled.matches(
+        &http_flow_scheme("https", "GET", "h.test:443", "/"),
+        Phase::Request,
+        None
+    ));
+}
+
+#[test]
+fn url_wildcard_case_folds_beyond_ascii() {
+    // Tester: case-insensitivity is the regex crate's Unicode fold, not an ASCII
+    // lowercase, so a non-ASCII letter in a path folds too (the subject is what
+    // the client sent; a raw UTF-8 path is legal on the wire).
+    let compiled = compile(rule(UrlMatch::Wildcard("*/caf\u{c9}*".into()))).expect("valid");
+    assert!(compiled.matches(&http_flow("/caf\u{e9}/menu"), Phase::Request, None));
+    assert!(!compiled.matches(&http_flow("/cafe/menu"), Phase::Request, None));
 }
 
 #[test]
