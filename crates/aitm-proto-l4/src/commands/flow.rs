@@ -21,6 +21,11 @@ use crate::gates::{AgentGate, L4AgentGates};
 pub(crate) const FLOW_GET_DEFAULT_LIMIT: usize = 256;
 /// The most packets one `l4.flow.get` reply carries; a larger `limit` is clamped.
 pub(crate) const FLOW_GET_MAX_LIMIT: usize = 4096;
+/// The most raw packet bytes one `l4.flow.get` reply carries when the caller sees
+/// `bytes` (spec §2, L4PAR-AC36). 4 MiB raw is about 5.6 MiB of base64, and the
+/// MCP server sends the value twice (`structuredContent` plus the `content`
+/// text), so a full reply stays under the bus's 16 MiB message cap.
+pub(crate) const FLOW_GET_MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 
 /// The `[offset, offset + limit)` slice of a flow's packet log that one
 /// `l4.flow.get` reply carries (spec §2, L4PAR-AC2).
@@ -146,7 +151,10 @@ impl Command for FlowGet {
             description: "Summarize one L4 flow: kind, bind, creation time, endpoints, and a \
                           window of its packets with bytes, time and addresses (read-only). \
                           `packet_count` is always the total; list polling should pass \
-                          `limit: 0` and let only an inspector fetch a window."
+                          `limit: 0` and let only an inspector fetch a window. A reply \
+                          carries at most 4 MiB of raw packet bytes; when that stops the \
+                          window early, `truncated` is true and `next_offset` is where to \
+                          resume."
                 .into(),
             params: vec![
                 ParamDef {
@@ -271,6 +279,20 @@ fn flow_fields() -> Vec<ParamDef> {
             "Index in the log of the first packet in `packets` (the `offset` asked for).",
         ),
         field(
+            "truncated",
+            TypeDesc::Bool,
+            true,
+            "True when the 4 MiB per-reply byte budget stopped the window before `limit`; \
+             fetch the rest from `next_offset`.",
+        ),
+        field(
+            "next_offset",
+            TypeDesc::Int,
+            false,
+            "Index in the log of the first packet not returned when `truncated`; null \
+             otherwise.",
+        ),
+        field(
             "packets",
             TypeDesc::Array(Box::new(TypeDesc::Object(vec![
                 field("dir", TypeDesc::Str, true, "`inbound` or `outbound`."),
@@ -332,8 +354,8 @@ fn flow_fields() -> Vec<ParamDef> {
                 ),
             ]))),
             true,
-            "The `[offset, offset + limit)` window of the packet log, in arrival order; \
-             empty past the end.",
+            "The `[offset, offset + limit)` window of the packet log, in arrival order, \
+             cut short by the byte budget when `truncated`; empty past the end.",
         ),
     ]
 }
@@ -398,29 +420,41 @@ pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow, with_bytes: boo
         .map(|p| PacketSpec::endpoints(&p.bytes))
         .find(|e| e.proto.is_some())
         .unwrap_or_default();
-    let packets: Vec<Value> = flow
-        .packets
-        .iter()
-        .skip(window.offset)
-        .take(window.limit)
-        .map(|p| {
-            let endpoints = PacketSpec::endpoints(&p.bytes);
-            let mut o = BTreeMap::new();
-            o.insert("dir".to_string(), Value::Str(dir(p.dir).to_string()));
-            o.insert("length".to_string(), Value::Int(p.bytes.len() as i64));
-            o.insert("injected".to_string(), Value::Bool(p.injected));
-            o.insert(
-                "layers".to_string(),
-                Value::Array(p.decoded.layers.iter().cloned().map(Value::Str).collect()),
-            );
-            if with_bytes {
-                o.insert("bytes".to_string(), Value::Bytes(p.bytes.clone()));
-            }
-            o.insert("timestamp".to_string(), Value::Int(epoch_ms(p.timestamp)));
-            insert_endpoints(&mut o, &endpoints);
-            Value::Object(o)
-        })
-        .collect();
+    // The window, stopped early by the byte budget when the caller sees `bytes`
+    // (spec §2, L4PAR-AC36): packets are added in order while the running sum
+    // of their raw lengths stays within `FLOW_GET_MAX_REPLY_BYTES`, always at
+    // least one, so a caller can always advance past an oversized packet.
+    let mut packets: Vec<Value> = Vec::new();
+    let mut raw_bytes = 0usize;
+    let mut truncated = false;
+    for p in flow.packets.iter().skip(window.offset).take(window.limit) {
+        if with_bytes
+            && !packets.is_empty()
+            && raw_bytes.saturating_add(p.bytes.len()) > FLOW_GET_MAX_REPLY_BYTES
+        {
+            truncated = true;
+            break;
+        }
+        raw_bytes = raw_bytes.saturating_add(p.bytes.len());
+        let endpoints = PacketSpec::endpoints(&p.bytes);
+        let mut o = BTreeMap::new();
+        o.insert("dir".to_string(), Value::Str(dir(p.dir).to_string()));
+        o.insert("length".to_string(), Value::Int(p.bytes.len() as i64));
+        o.insert("injected".to_string(), Value::Bool(p.injected));
+        o.insert(
+            "layers".to_string(),
+            Value::Array(p.decoded.layers.iter().cloned().map(Value::Str).collect()),
+        );
+        if with_bytes {
+            o.insert("bytes".to_string(), Value::Bytes(p.bytes.clone()));
+        }
+        o.insert("timestamp".to_string(), Value::Int(epoch_ms(p.timestamp)));
+        insert_endpoints(&mut o, &endpoints);
+        packets.push(Value::Object(o));
+    }
+    // The index of the first packet not returned, only when the budget (not the
+    // window or the log's end) stopped the walk.
+    let next_offset = truncated.then(|| window.offset.saturating_add(packets.len()));
     let injected = flow.packets.iter().filter(|p| p.injected).count();
 
     let mut obj = BTreeMap::new();
@@ -454,6 +488,11 @@ pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow, with_bytes: boo
     );
     obj.insert("injected_count".to_string(), Value::Int(injected as i64));
     obj.insert("offset".to_string(), Value::Int(window.offset as i64));
+    obj.insert("truncated".to_string(), Value::Bool(truncated));
+    obj.insert(
+        "next_offset".to_string(),
+        next_offset.map_or(Value::Null, |n| Value::Int(n as i64)),
+    );
     obj.insert("packets".to_string(), Value::Array(packets));
     Value::Object(obj)
 }
@@ -1015,5 +1054,215 @@ mod tests {
             "the description names the Capture gate, got {}",
             bytes.description
         );
+    }
+
+    // ---- L4PAR-AC36: reply byte budget ---------------------------------------
+
+    /// A Capture flow of `n` undecodable packets of `size` bytes each, none
+    /// injected, in a fresh store. Returns the store and the flow id string.
+    fn sized_packet_flow(n: usize, size: usize) -> (Arc<dyn L4FlowStore>, String) {
+        let bytes = vec![0xab_u8; size];
+        let decoded = PacketSpec::summarize(&bytes);
+        let packets: VecDeque<L4Packet> = (0..n)
+            .map(|i| L4Packet {
+                dir: L4Direction::Inbound,
+                timestamp: at_ms(PACKET_MS + i as u64),
+                decoded: decoded.clone(),
+                bytes: bytes.clone(),
+                injected: false,
+            })
+            .collect();
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let id = store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind: L4FlowKind::Capture,
+            bind: L4Bind {
+                interface: "lo0".into(),
+                filter: None,
+                queue: None,
+            },
+            packets,
+            metadata: L4Meta {
+                marks: Vec::new(),
+                comment: None,
+                created: at_ms(CREATED_MS),
+            },
+        });
+        (store, super::super::flow_id_to_string(id))
+    }
+
+    /// Invoke `l4.flow.get` as `frontend` with the given gates and extra window
+    /// params, returning the flow object and the number of packets it carries.
+    fn get_window_as(
+        store: Arc<dyn L4FlowStore>,
+        gates: Arc<L4AgentGates>,
+        frontend: Frontend,
+        id: &str,
+        extra: &[(&str, i64)],
+    ) -> (BTreeMap<String, Value>, usize) {
+        let mem = MemFlowStore::new();
+        let client = StubClient;
+        let core = StdGuard::default();
+        let host = CommandHost::new(&mem, &client, &core, None).with_frontend(frontend);
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Str(id.to_string()));
+        for (k, v) in extra {
+            m.insert((*k).to_string(), Value::Int(*v));
+        }
+        let got = FlowGet::new(store, gates)
+            .invoke(Params::new(m), &host)
+            .expect("flow.get ok");
+        flow_and_count(got)
+    }
+
+    /// L4PAR-AC36 — the budget is 4 MiB of raw bytes per reply.
+    #[test]
+    fn byte_budget_is_four_mib() {
+        assert_eq!(FLOW_GET_MAX_REPLY_BYTES, 4 * 1024 * 1024);
+        assert_eq!(FLOW_GET_MAX_REPLY_BYTES, 4_194_304);
+    }
+
+    /// L4PAR-AC36 — 300 packets of 60,000 bytes with the default window: the
+    /// operator gets 69 packets (69 × 60,000 = 4,140,000 ≤ 4 MiB; 70 would not
+    /// fit), `truncated: true`, `next_offset: 69`; a 3-packet flow is not
+    /// truncated and `next_offset` is null; an agent with the Capture gate closed
+    /// gets no bytes, so the budget does not apply and the window alone (256)
+    /// bounds the reply.
+    #[test]
+    fn window_byte_budget() {
+        let (store, id) = sized_packet_flow(300, 60_000);
+        let (flow, n) = get_window_as(store.clone(), closed_gates(), Frontend::Operator, &id, &[]);
+        assert_eq!(n, 69, "69 × 60,000 fits the 4 MiB budget, 70 does not");
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Int(69)));
+        assert_eq!(flow.get("offset"), Some(&Value::Int(0)));
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(300)));
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array");
+        };
+        let Some(Value::Object(first)) = packets.first() else {
+            panic!("first packet is an object");
+        };
+        assert_eq!(
+            first.get("bytes"),
+            Some(&Value::Bytes(vec![0xab_u8; 60_000])),
+            "the operator's packets carry their bytes"
+        );
+
+        // A small flow: nothing stopped the window early.
+        let (small_store, small_id) = n_packet_flow(3);
+        let (flow, n) = get_window_as(
+            small_store,
+            closed_gates(),
+            Frontend::Operator,
+            &small_id,
+            &[],
+        );
+        assert_eq!(n, 3);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+
+        // The same 300-packet flow as an agent with the gates closed: no bytes,
+        // so only `offset`/`limit` apply.
+        let gates = closed_gates();
+        assert!(!gates.allowed(AgentGate::Capture), "gates start closed");
+        let (flow, n) = get_window_as(store, gates, Frontend::Mcp, &id, &[]);
+        assert_eq!(n, 256);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array");
+        };
+        let Some(Value::Object(first)) = packets.first() else {
+            panic!("first packet is an object");
+        };
+        assert!(
+            !first.contains_key("bytes"),
+            "agent gets no bytes: {first:?}"
+        );
+    }
+
+    /// L4PAR-AC36 — `next_offset` is an index into the log, not into the window:
+    /// `{offset 100}` on the 300 × 60,000 flow returns packets 100..169 and
+    /// `next_offset: 169`.
+    #[test]
+    fn window_byte_budget_next_offset_is_a_log_index() {
+        let (store, id) = sized_packet_flow(300, 60_000);
+        let (flow, n) = get_window_as(
+            store,
+            closed_gates(),
+            Frontend::Operator,
+            &id,
+            &[("offset", 100)],
+        );
+        assert_eq!(n, 69);
+        assert_eq!(flow.get("offset"), Some(&Value::Int(100)));
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Int(169)));
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array");
+        };
+        let Some(Value::Object(last)) = packets.last() else {
+            panic!("last packet is an object");
+        };
+        assert_eq!(
+            last.get("timestamp"),
+            Some(&Value::Int(PACKET_MS as i64 + 168)),
+            "the last packet returned is log index 168"
+        );
+    }
+
+    /// L4PAR-AC36 — at least one packet is always returned when any remain in
+    /// the window, even one larger than the whole budget; the budget never turns
+    /// a non-empty window into an empty reply the caller could not advance past.
+    #[test]
+    fn window_byte_budget_returns_at_least_one_packet() {
+        let (store, id) = sized_packet_flow(2, FLOW_GET_MAX_REPLY_BYTES + 1);
+        let (flow, n) = get_window_as(store.clone(), closed_gates(), Frontend::Operator, &id, &[]);
+        assert_eq!(n, 1);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Int(1)));
+
+        // Advancing to `next_offset` fetches the last packet; the window is then
+        // exhausted by the log, not the budget.
+        let (flow, n) = get_window_as(
+            store.clone(),
+            closed_gates(),
+            Frontend::Operator,
+            &id,
+            &[("offset", 1)],
+        );
+        assert_eq!(n, 1);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+
+        // `limit 0` returns nothing and is not a truncation.
+        let (flow, n) = get_window_as(
+            store,
+            closed_gates(),
+            Frontend::Operator,
+            &id,
+            &[("limit", 0)],
+        );
+        assert_eq!(n, 0);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+    }
+
+    /// L4PAR-AC36 — the result schema lists `truncated` (required Bool) and
+    /// `next_offset` (optional Int).
+    #[test]
+    fn window_byte_budget_schema_lists_truncated_and_next_offset() {
+        let fields = flow_fields();
+        let by_name = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("flow field `{n}` in the schema"))
+        };
+        assert!(matches!(by_name("truncated").ty, TypeDesc::Bool));
+        assert!(by_name("truncated").required);
+        assert!(matches!(by_name("next_offset").ty, TypeDesc::Int));
+        assert!(!by_name("next_offset").required);
     }
 }
