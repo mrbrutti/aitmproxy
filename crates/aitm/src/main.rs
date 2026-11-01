@@ -637,10 +637,9 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         .l4_shared
         .as_ref()
         .map(|shared| shared.guard.clone());
-    let mut l4_self_ports = vec![
-        proxy_listener.local_addr()?.port(),
-        browser_listener.local_addr()?.port(),
-    ];
+    // Bound addresses from the pre-bind step: nothing fallible may run between
+    // the system-proxy auto-set and the `select!` (its restore-on-exit depends on it).
+    let mut l4_self_ports = vec![proxy_addr.port(), browser_addr.port()];
     if let Some((_, bound)) = &web_listener {
         l4_self_ports.push(bound.port());
     }
