@@ -127,7 +127,9 @@ fn rebuild(parsed: &url::Url) -> String {
 /// replaced by [`REDACTED`], and the value of every other pair passed through
 /// [`scrub`], so a credential nested inside a non-secret parameter (an
 /// unencoded `next=/cb?sid=abc`) is masked too. Pairs are split on `&` and the
-/// first `=` only; a fragment with no `=` is scrubbed whole.
+/// first `=` only; a fragment with no `=` is scrubbed whole. The key is
+/// percent-decoded before the secret check, so `s%65ssion` cannot escape the
+/// rule, while the raw key is emitted unchanged (S-M4).
 fn safe_query(query: &str) -> String {
     let mut out = String::new();
     for (index, pair) in query.split('&').enumerate() {
@@ -135,7 +137,7 @@ fn safe_query(query: &str) -> String {
             out.push('&');
         }
         match pair.split_once('=') {
-            Some((key, _)) if is_secret_name(key) => {
+            Some((key, _)) if is_secret_name(&decode_key(key)) => {
                 out.push_str(key);
                 out.push('=');
                 out.push_str(REDACTED);
@@ -149,6 +151,15 @@ fn safe_query(query: &str) -> String {
         }
     }
     out
+}
+
+/// A query key with its percent-encoding decoded, so the secret-key check sees
+/// `session` rather than `s%65ssion` (S-M4). `+` is treated as a space, as in a
+/// form-encoded key. On the rare malformed key the raw text is returned.
+fn decode_key(key: &str) -> String {
+    url::form_urlencoded::parse(key.as_bytes())
+        .next()
+        .map_or_else(|| key.to_string(), |(decoded, _)| decoded.into_owned())
 }
 
 /// `url` with everything up to and including the last `@` of its
@@ -365,6 +376,17 @@ mod tests {
         assert!(
             text.contains("navigation to http://t:8080/cb?token="),
             "{text}"
+        );
+    }
+
+    /// A percent-encoded query key must not escape the secret-key rule: the key
+    /// is decoded before [`super::is_secret_name`] sees it, while the raw key is
+    /// emitted unchanged (S-M4).
+    #[test]
+    fn safe_url_decodes_query_key_for_the_secret_check() {
+        assert_eq!(
+            safe_url("http://t/x?s%65ssion=abc"),
+            "http://t/x?s%65ssion=<redacted>"
         );
     }
 
