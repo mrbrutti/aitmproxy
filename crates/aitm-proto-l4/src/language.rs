@@ -100,8 +100,27 @@ pub const PACKET_SOURCE: &str = "packet";
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 
 /// The default interface a `l4:` step injects on / captures from when its body
-/// omits `interface` (the normative spec example does).
-const DEFAULT_INTERFACE: &str = "lo";
+/// omits `interface` (the normative spec example does): the loopback of the OS
+/// the core was compiled for, `lo0` on macOS/BSD, `lo` on Linux.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+pub const DEFAULT_INTERFACE: &str = "lo0";
+/// See the macOS/BSD definition above: `lo` everywhere else.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+pub const DEFAULT_INTERFACE: &str = "lo";
 
 /// Every l4 scripting verb, in catalog order — the one vocabulary shared by the
 /// Rhai `l4.*` host fns, the `l4:` step `op`, and the `l4.*` command names. The
@@ -1413,5 +1432,32 @@ mod tests {
                 "the step op `{op}` must be a real host-fn verb"
             );
         }
+    }
+
+    /// L4PAR-AC8: an `l4:` step with no `interface` resolves to the loopback
+    /// name of the OS the core was compiled for — `lo0` on macOS/BSD, `lo` on
+    /// Linux — so the normative spec example (no `interface`) works unedited
+    /// on both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn step_default_interface_is_lo0_on_macos() {
+        let body: serde_yaml::Value = serde_yaml::from_str("op: craft").expect("the step parses");
+        assert_eq!(step_interface(&body), "lo0");
+    }
+
+    /// L4PAR-AC8, the Linux half: the default is `lo`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn step_default_interface_is_lo_on_linux() {
+        let body: serde_yaml::Value = serde_yaml::from_str("op: craft").expect("the step parses");
+        assert_eq!(step_interface(&body), "lo");
+    }
+
+    /// An explicit `interface` always wins over the per-OS default.
+    #[test]
+    fn step_default_interface_is_overridden_by_explicit_field() {
+        let body: serde_yaml::Value =
+            serde_yaml::from_str("op: craft\ninterface: en0").expect("the step parses");
+        assert_eq!(step_interface(&body), "en0");
     }
 }

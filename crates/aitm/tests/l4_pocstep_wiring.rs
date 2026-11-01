@@ -30,7 +30,10 @@ use aitm_proto_l4::types::{
     IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange, RateCap,
 };
 
-const IFACE: &str = "lo";
+/// The scope interface: the per-OS loopback the `l4:` step defaults to
+/// (`lo0` on macOS/BSD, `lo` on Linux), so the normative no-`interface`
+/// PoC steps below prove the default on the OS the tests compiled for.
+const IFACE: &str = aitm_proto_l4::language::DEFAULT_INTERFACE;
 
 /// The normative `l4:` PoC (one `send_recv` step to the in-scope loopback target).
 const L4_POC: &str = r#"id: l4-send-recv
