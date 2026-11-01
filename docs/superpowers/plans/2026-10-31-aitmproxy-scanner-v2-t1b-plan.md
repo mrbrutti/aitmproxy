@@ -1412,6 +1412,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 
 **Amendments after wave 2 (orchestrator, 2026-11-01):** Task 7: `upsert` keys `passive` → `Passive`, else `location.l4.is_some()` → `L4`, else `Http` (spec D6 names the L4 tuple; the plan sentence omitted the branch); the `target` filter matches the normalized origin, the explicit `scheme://host:port` or the bare host; a colliding issue id is re-minted (bounded, `create_new`). Task 10: the catalogue registers native (lanes' `checks()`, then `native_checks`) → bundled → custom; the **first** claim on an id wins and a later duplicate is a reported `CheckConflict` exposed by `Catalogue::conflicts()` (replaces the plan's "later wins with `tracing::warn!`"; `aitm-plugin-scanner` has no `tracing` dep); Task 14/15 must surface `conflicts()` at load (log + `scan.checks` cannot hide it). `IgnoreRule.name_regex` is evaluated through `aitm_poc`'s regex assertion (no `regex` dep). `SiteNode` has no content type, so `interest()` always takes the unknown branch until a lane adds one.
 
+**Amendment for Task 8 (orchestrator ruling, 2026-11-01, spec D5 over the plan sentence):** under job policy `issues_only` the `JobClient` forwards `record: Never` to the inner client whatever `opts.record` says; under `all`, `Always`. D5's issue re-recording is a store insert of the flows the `ProbeHost` held in memory (marks `scan:<job>`, `issue:<id>`, `is_replay: true`), done by the engine, never a re-send. The per-host ratio rule applies from `LADDER_MIN_SAMPLE = 10` outcomes (otherwise the first 5xx trips any `ratio < 1.0`); `Ladder` keeps a sticky `tripped`; `ProbeRefused` gains `Timeout { host, after }` for the 30 s bound.
+
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
 (Task 14) and wave 5 (Task 15); `crates/aitm-plugin-scanner/Cargo.toml` in wave 1 (Task 3) and
@@ -1539,7 +1541,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| 1 | Quality | Important | `CheckRegistry::replace_source` silently skips an id another source owns and returns `()` | fix task dispatched 2026-11-01: returns `#[must_use] Vec<DuplicateCheck>`; Task 13 raises them as load errors |
+| 1 | Quality | Important | `CheckRegistry::replace_source` silently skips an id another source owns and returns `()` | fixed in e66189ba: returns `#[must_use] Vec<DuplicateCheck>`; Task 13 raises them as load errors |
 | 3 | Quality | Minor | `ScannerConfig` struct doc still says "every field is a hard ceiling" | fix (wave-1 fix task) |
 | 1 | Quality | Minor | `job_ctx_report_defaults_are_no_ops` asserts `() == ()` | fix (wave-1 fix task): plain calls + `budget_left() == 7` |
 | 1 | Quality | Minor | `RecordingHost::probe_raw` records URLs into `payloads()` | fix (wave-1 fix task): separate `raw_urls()` list |
@@ -1558,6 +1560,7 @@ Kept by the main session during stage 6. One row per finding.
 | 6 | Security | Note | Profile `name` must be validated before it becomes a path (`../` traversal) | routed to Task 6 (in flight) 2026-11-01 |
 | 8 | Security | Note | Zero ceilings/budgets must not divide by zero or spin in the pacer | routed to Task 8 (in flight) 2026-11-01 |
 | 13 | Coder (gap) | Important | Plan Task 13 Files list omitted `tests/api_catalog.rs`, whose `receiver_type` panics on the new `probe` prefix; `serde_yaml` is dev-only; no error variant named for a duplicate id | plan amended 2026-11-01 (Task 13 amendments a-d); call B30 extended to the test file |
+| 1-4 | Tester | PASS | Every plan-named test present with literal values; 30 tests added (803cbdd7); `HELP_CHECK_META` omits `targets_session`/`scope` and `origin` is host-supplied | help text: wave-1 fix task item 10 |
 
 ## Shipped
 
