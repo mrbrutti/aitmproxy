@@ -95,9 +95,8 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 4. **D17.6 pill column.** `· CA needs admin` is a mac-fact-only row: `ca.status` carries no needs-admin reading, so the TUI and web (D17.11, D17.12, which derive the word from `ca.status` + the in-flight flag) render three words plus nothing; the mac app latches `needsAdmin` from the install reply. Their install error toast carries the core's NeedsRoot/HeadlessAuth text.
 5. **D17.6 in-flight row.** One in-flight word, `· CA trusting…` / "trusting CA…", for install and uninstall alike (accepted; no fourth form).
 6. **Task 35 files.** `crates/aitm-tui/tests/tester_shell.rs` was edited: its connect-contract assertion now pins `[Refresh, Call ca.status]`, which D17.11's connect-time request forces.
-7. **D17.2 scope guard (core security Important).** A non-CLI frontend may not ask for `scope: "system"` on a platform that has a user scope (macOS, Windows): refused as `UnsupportedScope` before any executor run, so the operator token can never make the core spawn `sudo` against the System keychain (D17.1, D17.14). Linux is unchanged (its only scope is system; D17.13).
-8. **D17.3 install on a present-but-untrusted certificate.** `install` no longer returns "already present" on presence alone: when present and `verify_trust` says No it deletes the untrusted copy and re-adds it with trust settings, so the Trust step can complete after a cancelled dialog whose rollback failed or a by-hand import.
-
+7. **D17.2 scope guard (core security Important).** A non-CLI frontend may not ask for `scope: "system"` on a platform that has a user scope (macOS, Windows): refused in `Change::invoke` right after `resolve_scope`, before any executor run, as `TrustErrorKind::UnsupportedScope` with the message `system scope needs a terminal: run \`aitm ca <install|uninstall> --scope system\` yourself; the app and the bus clients use the login keychain` (verb substituted), audited `outcome == "error"` (through `audit.fail`, like the Linux `UnsupportedScope` path), one WARN `refused: the System keychain is reachable from the CLI only`; `dry_run` is not exempt. So the operator token can never make the core spawn `sudo` against the System keychain (D17.1, D17.14). Linux is unchanged (its only scope is system; D17.13). SP-AC29 gains the clause: the same call from `Operator` (and from `Mcp` with the flag on) with `scope: "system"` on macOS or Windows is `Err` of kind `UnsupportedScope` with that message and zero executor runs; from `Cli` it proceeds through `sudo`; Linux `system` from any frontend is unchanged. D17.2 reads: the agent gate refuses only an agent; separately, the System keychain is reachable from the CLI alone where a user scope exists. The command descriptions' "dry_run is always allowed" becomes "dry_run is never gated by `ca.allow_agent_install`".
+8. **D17.3 install on a present-but-untrusted certificate.** `install` no longer returns "already present" on presence alone. Present and `verify_trust` says **Yes** → `changed == false`, detail `already present and trusted in <keychain>`. Present and **No** → delete our copy (`-Z <sha256>`, then `-Z <sha1>` as `uninstall` does) and re-add it with trust settings: `changed == true`, details `replaced the untrusted copy in <keychain>` then the usual `added to <keychain> as a trusted root for ssl and basic`; a cancelled re-add is classified and rolled back like a first install; a failed delete is `ToolFailed` `could not remove the untrusted copy from <keychain>: <failure text>` with nothing added (fail-closed, never two copies). Present and `verify_trust` **could not run** → `changed == false`, detail `already present in <keychain>` plus the error text (`Trust::Unknown` never deletes).
 9. **D17.3 tail.** A failed `verify-cert` puts the output tail (stdout first, where `Cert Verify Result:` is printed, then stderr) in `detail`, not the stderr tail alone.
 10. **SP-AC31 literals.** `-l -L -p basic`; not trusted = `Cert Verify Result: CSSMERR_TP_NOT_TRUSTED`.
 11. **Task 32 Result line** in the system-proxy plan points at this record's "Task 32 result".
@@ -107,10 +106,29 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 
 15. **D17.4 cancelled prefix.** Frontends accept `ca.(install|uninstall) cancelled`; the core emits only the install form today, and classifying a cancelled `remove-trusted-cert` dialog as `Cancelled` is a core follow-up.
 
+16. **`confirm_prompt` and a doomed system request.** `confirm_prompt` has no frontend, so a hand-rolled bus client sending `scope: "system"` is prompted and then refused by correction 7's guard; accepted as a residual (no frontend sends `"system"`, SP-AC34), a `Command` trait change is the follow-up.
+17. **PR A files.** Besides the table above, PR A touches `crates/aitm-ca/src/audit.rs`, `crates/aitm-ca/tests/audit.rs`, `crates/aitm-ca/src/platform/mod.rs` (shared tail rendering) and `crates/aitm-ca/src/testing.rs` (test literals, `unspawnable`).
+
 ## Review log
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
 |---|---|---|---|---|---|
+| 2026-11-01 | A core | security (re) | delete arm in `install` matches `Trust::Unknown` too | Minor | fix task C2: key on `Trust::No` |
+| 2026-11-01 | A core | security (re) + quality (re) | re-trust delete has no SHA-1 fallback; third copy of the delete line | Minor | fix task C2: `Op::delete_copy` |
+| 2026-11-01 | A core | security (re) + spec (re) | `confirm_prompt` still prompts a doomed non-CLI system request | Minor | correction 16: accepted residual |
+| 2026-11-01 | A core | quality (re) | scope/frontend policy inline in `invoke` | Minor | fix task C2: into `resolve_scope(platform, wanted, frontend)` |
+| 2026-11-01 | A core | quality (re) | "fix task C1 (finding N)" test comments; `VERIFY_USER` misnomer | Minor | fix task C2 |
+| 2026-11-01 | A core | quality (re) | double-negative WARN assertion | Minor | fix task C2 |
+| 2026-11-01 | A core | spec (re) | correction 7 literals / SP-AC29 clause missing from the record | Important (record) | correction 7 extended (this commit) |
+| 2026-11-01 | A core | spec (re) | correction 8 outcomes/strings unrecorded | Minor | correction 8 extended (this commit) |
+| 2026-11-01 | A core | spec (re) | Review log row named `sudo -n` as part of C1 | Minor | row amended |
+| 2026-11-01 | A core | spec (re) | three files outside PR A's list | Minor | correction 17 |
+| 2026-11-01 | B TUI | quality (re) | connect-clears-flag asserted twice | Minor | accepted (one assertion in a neighbouring test) |
+| 2026-11-01 | B TUI | security (re) | pre-existing `tester_pass2` temp-file race (out of range) | Minor | follow-up for the TUI owner; not this PR |
+| 2026-11-01 | C web | security (re) + quality (re) | CA flag sticks if the palette is disposed during phase 1 | Minor | fix task W2: `disposed` flag |
+| 2026-11-01 | C web | security (re) | handshake guard applies to every tool's reply | Minor | accepted (core-authored root shape; harmless extra call at worst) |
+| 2026-11-01 | C web | quality (re) | second envelope parser vs l4; `run` phase sentinel; stale-token + onInput tests missing | Minor | fix task W2 |
+| 2026-11-01 | C web | spec (re) | both-verb cancelled prefix beyond D17.4 text | Minor | correction 15 |
 | 2026-11-01 | A core | quality | Cancelled branch drops stderr (same as security Minor) | Minor | fix task C1 |
 | 2026-11-01 | A core | quality | `verify_failure_text` duplicates `failure_text`/`stderr_tail` | Minor | fix task C1: shared tail helpers |
 | 2026-11-01 | A core | quality | two-pass kind/message with wildcard arm | Minor | fix task C1 |
@@ -131,7 +149,7 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 | 2026-11-01 | B TUI | spec | `· CA needs admin` has no source in the TUI/web (D17.6 vs D17.11) | Important (spec) | correction 4: mac-fact-only row |
 | 2026-11-01 | B TUI | spec | `· CA trusting…` also for uninstall | Minor | correction 5: accepted |
 | 2026-11-01 | B TUI | spec | `ca.uninstall cancelled` not special-cased | Minor | consistent with the core; none |
-| 2026-11-01 | A core | security | Operator-token client may request `scope: "system"` → core spawns `sudo` | Important | fix task C1: correction 7 guard + test, `sudo -n` for non-CLI |
+| 2026-11-01 | A core | security | Operator-token client may request `scope: "system"` → core spawns `sudo` | Important | fix task C1: correction 7 guard + test; `sudo -n` deferred per correction 14 |
 | 2026-11-01 | A core | security | Cancelled path drops the tool's stderr from log and audit | Minor | fix task C1: warn the tail on the Cancelled branch |
 | 2026-11-01 | A core | security | Present-but-untrusted certificate is a dead end for the Trust step | Minor | fix task C1: correction 8 |
 | 2026-11-01 | C web | security | The palette never performs the bus confirm handshake (`needs_confirmation` envelope shown as `ok`), so `ca.install` from the web could never run | Minor (security) / Important (function) | fix task W1: generic handshake in `run`, server prompt, `_confirm` re-call, tests |
