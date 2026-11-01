@@ -70,15 +70,24 @@ struct ProviderRuleSet: Equatable {
         }
     }
 
-    /// Canonical: sorted (`UDPTarget.<`) and de-duplicated. Empty means TCP-only.
+    /// Canonical: sorted (`UDPTarget.<`), de-duplicated, at most `maxUDPTargets` (the
+    /// first ones in that order). Empty means TCP-only.
     let udpTargets: [UDPTarget]
+    /// How many canonical targets the cap left out (0 when under it). Part of equality,
+    /// so a scope that only changes beyond the cap still counts as a change.
+    let dropped: Int
 
-    private init(udpTargets: [UDPTarget]) {
+    private init(udpTargets: [UDPTarget], dropped: Int) {
         self.udpTargets = udpTargets
+        self.dropped = dropped
     }
 
     /// The startup set and the set for any scope without a UDP-claimable IP token.
-    static let tcpOnly = ProviderRuleSet(udpTargets: [])
+    static let tcpOnly = ProviderRuleSet(udpTargets: [], dropped: 0)
+
+    /// Upper bound on UDP rules per set (spec Design A as amended): the framework
+    /// documents no rule-count limit, so the bound is ours; under-inclusive beyond it.
+    static let maxUDPTargets = 256
 
     /// Wildcards the header forbids with port 0; no real flow has them as destination.
     private static let wildcardAddresses: Set<String> = ["0.0.0.0", "::"]
@@ -97,7 +106,8 @@ struct ProviderRuleSet: Equatable {
         for target in targets.sorted() where canonical.last != target {
             canonical.append(target)
         }
-        return ProviderRuleSet(udpTargets: canonical)
+        let kept = Array(canonical.prefix(maxUDPTargets))
+        return ProviderRuleSet(udpTargets: kept, dropped: canonical.count - kept.count)
     }
 
     /// The `NENetworkRule`s to install, TCP catch-all first, then one `.UDP` host rule
@@ -123,12 +133,14 @@ struct ProviderRuleSet: Equatable {
     }
 
     /// For the "provider rules applied" log line (spec Design D): `1 rule (TCP
-    /// catch-all)` or `N rules (TCP catch-all + UDP a:any, [b]:443, …)`. Scoped target
+    /// catch-all)` or `N rules (TCP catch-all + UDP a:any, [b]:443, …)`, with
+    /// ` (+K dropped)` appended when the cap left K targets out. Scoped target
     /// addresses are the operator's own configuration, not user traffic.
     var summary: String {
         if udpTargets.isEmpty { return "1 rule (TCP catch-all)" }
         let targets = udpTargets.map(\.summaryText).joined(separator: ", ")
-        return "\(1 + udpTargets.count) rules (TCP catch-all + UDP \(targets))"
+        let suffix = dropped > 0 ? " (+\(dropped) dropped)" : ""
+        return "\(1 + udpTargets.count) rules (TCP catch-all + UDP \(targets))\(suffix)"
     }
 
     /// The parsed host and the host-route prefix for a canonical IP text; nil when
@@ -270,7 +282,8 @@ extension HandoffSelfCheck {
 
     /// Tester (stage 5) edge vectors for the pure rule set, as reached through
     /// `wanted(for:)`: a large shuffled token set with every token twice stays canonical
-    /// with no cap; an IPv4-mapped IPv6 token is unmapped by `IPText.canonical` and
+    /// under the cap; a 300-target set is capped at 256 in canonical order with the
+    /// dropped count in the summary; an IPv4-mapped IPv6 token is unmapped by `IPText.canonical` and
     /// yields the SAME /32 IPv4 rule as the plain token; a spec made only of
     /// never-claimed ports, wildcards (any port -- spec H is unconditional) and malformed
     /// tokens is TCP-only; loopback is not a wildcard; the summary's count prefix follows
@@ -278,7 +291,7 @@ extension HandoffSelfCheck {
     static func providerRulesEdges(_ r: Recorder) {
         typealias Target = ProviderRuleSet.UDPTarget
 
-        // -- Oversized, shuffled, duplicated input: no cap, canonical order ----------
+        // -- Large, shuffled, duplicated input: under the cap, canonical order --------
         var distinct: [(address: String, port: UInt16?, token: String)] = []
         for i in 0..<64 {
             distinct.append(("10.1.\(i).9", UInt16(4000 + i), "10.1.\(i).9:\(4000 + i)"))
@@ -308,7 +321,7 @@ extension HandoffSelfCheck {
               wantedBig.udpTargets == expected,
               "\(wantedBig.udpTargets.prefix(4)) ... \(wantedBig.udpTargets.suffix(2))")
         let bigRules = wantedBig.networkRules()
-        r.check("providerRulesEdges: big set builds 73 rules (no cap)", bigRules.count == 73, "\(bigRules.count)")
+        r.check("providerRulesEdges: big set builds 73 rules (under the 256 cap)", bigRules.count == 73, "\(bigRules.count)")
         if bigRules.count == 73 {
             r.check("providerRulesEdges: big rule 0 is the TCP catch-all",
                   bigRules[0].matchProtocol == .TCP && bigRules[0].matchRemoteHostOrNetworkEndpoint == nil
@@ -330,6 +343,43 @@ extension HandoffSelfCheck {
               wantedBig.summary.hasSuffix(", [2001:db8::8]:any)"), wantedBig.summary)
         r.check("providerRulesEdges: big set equals its reversed, newline-separated token order",
               ProviderRuleSet.wanted(for: ScopeMatcher(spec: tokens.reversed().joined(separator: "\n"))) == wantedBig)
+
+        // -- Over the cap (fix F4): 300 distinct targets keep the first 256 in canonical
+        //    order and record the rest as dropped. Every "10.2.0.x" sorts before every
+        //    "10.2.1.y" by text, so exactly the 256 "10.2.0.*" targets survive.
+        var capTokens: [String] = []
+        for i in 0..<300 {
+            capTokens.append("10.2.\(i / 256).\(i % 256):\(5000 + i)")
+        }
+        let capped = ProviderRuleSet.wanted(for: ScopeMatcher(spec: capTokens.joined(separator: " ")))
+        r.check("providerRulesEdges: cap vector parses 300 claimable entries",
+              ScopeMatcher(spec: capTokens.joined(separator: " ")).udpClaimableIPEntries.count == 300)
+        r.check("providerRulesEdges: 300 targets are capped at 256", capped.udpTargets.count == 256, "\(capped.udpTargets.count)")
+        r.check("providerRulesEdges: maxUDPTargets is 256", ProviderRuleSet.maxUDPTargets == 256, "\(ProviderRuleSet.maxUDPTargets)")
+        r.check("providerRulesEdges: 44 targets recorded as dropped", capped.dropped == 44, "\(capped.dropped)")
+        r.check("providerRulesEdges: capped first target is 10.2.0.0:5000",
+              capped.udpTargets.first == Target("10.2.0.0", 5000), "\(String(describing: capped.udpTargets.first))")
+        r.check("providerRulesEdges: capped last target is the text-last 10.2.0.99:5099",
+              capped.udpTargets.last == Target("10.2.0.99", 5099), "\(String(describing: capped.udpTargets.last))")
+        r.check("providerRulesEdges: no 10.2.1.* target survives the cap",
+              capped.udpTargets.allSatisfy { $0.address.hasPrefix("10.2.0.") }, "\(capped.udpTargets.suffix(3))")
+        r.check("providerRulesEdges: capped set builds 257 rules", capped.networkRules().count == 257,
+              "\(capped.networkRules().count)")
+        r.check("providerRulesEdges: capped summary starts with 257 rules and the first target",
+              capped.summary.hasPrefix("257 rules (TCP catch-all + UDP 10.2.0.0:5000, "), capped.summary)
+        r.check("providerRulesEdges: capped summary ends with the dropped count",
+              capped.summary.hasSuffix(", 10.2.0.99:5099) (+44 dropped)"), capped.summary)
+        r.check("providerRulesEdges: the cap is canonical (reversed token order gives the same set)",
+              ProviderRuleSet.wanted(for: ScopeMatcher(spec: capTokens.reversed().joined(separator: "\n"))) == capped)
+        let justKept = ProviderRuleSet.wanted(for: ScopeMatcher(spec: capTokens.prefix(256).joined(separator: " ")))
+        r.check("providerRulesEdges: the kept 256 alone are the same targets", justKept.udpTargets == capped.udpTargets)
+        r.check("providerRulesEdges: equality keys on the dropped count too (256 kept + 44 dropped != 256 kept + 0)",
+              justKept != capped)
+        r.check("providerRulesEdges: the kept 256 alone drop nothing", justKept.dropped == 0, "\(justKept.dropped)")
+        r.check("providerRulesEdges: an uncapped summary has no dropped suffix",
+              !justKept.summary.contains("dropped"), justKept.summary)
+        r.check("providerRulesEdges: the 72-target set and tcpOnly drop nothing",
+              wantedBig.dropped == 0 && ProviderRuleSet.tcpOnly.dropped == 0, "\(wantedBig.dropped)")
 
         // -- IPv4-mapped IPv6 token: unmapped to the /32 IPv4 rule ------------------
         let mapped = ProviderRuleSet.wanted(for: ScopeMatcher(spec: "[::ffff:198.51.100.7]:443"))
