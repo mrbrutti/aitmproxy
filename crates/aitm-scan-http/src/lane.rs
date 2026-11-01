@@ -39,7 +39,7 @@ use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
 use url::Url;
 
-use aitm_core::{Flow, FlowKind, FlowQuery, HttpFlow, RecordPolicy, SendOptions};
+use aitm_core::{Body, Flow, FlowKind, FlowQuery, HttpFlow, RecordPolicy, SendOptions};
 use aitm_scan_model::{
     Check, Discovery, InsertionPoint, JobCtx, Lane, LaneKind, ProbeHost, ProfileTarget,
     SessionMaterial, UseBrowser,
@@ -50,7 +50,7 @@ use crate::crawl::client::ClientCrawler;
 use crate::crawl::frontier::{limits_for, Crawler};
 use crate::crawl::seeds::fetch_seeds;
 use crate::host::{HttpProbeHost, SessionMonitors};
-use crate::limits::{job_mark, MARK_CRAWL, MAX_SEED_URLS};
+use crate::limits::{job_mark, MARK_CRAWL, MAX_SEED_URLS, MAX_STORED_FLOWS};
 use crate::points::{enumerate_v2, CompiledIgnore, EnumerateOptions};
 use crate::redact;
 use crate::sitemap::{is_authenticated, SiteMapBuilder};
@@ -264,12 +264,19 @@ async fn discover_origin(
     );
 }
 
-/// Step (i): the captured, non-replay, same-origin HTTP flows this job may read.
+/// Step (i): the captured, non-replay, same-origin HTTP flows this job may read,
+/// newest first and at most [`MAX_STORED_FLOWS`] of them.
 ///
 /// A flow another job of this run crawled is left out: its points belong to that
 /// job's discovery, and re-enumerating them here would double a shared store's
 /// site map. This job's own crawl flows are kept — under call **A2** they are how
 /// a crawled page's points reach a stored source request at all.
+///
+/// The store is walked newest first (it lists in insertion order), so the cap
+/// keeps the latest captures. Only the request of a stored flow is read — by
+/// `enumerate_v2`, the site-map builder and `is_authenticated` — so the clone
+/// held here drops its response body rather than duplicate up to two thousand
+/// captured pages for the life of discovery (S-M7).
 fn stored_flows(job: &dyn JobCtx, origin: &Url, job_mark: &str) -> Vec<HttpFlow> {
     let store = job.store();
     let query = FlowQuery {
@@ -279,8 +286,8 @@ fn stored_flows(job: &dyn JobCtx, origin: &Url, job_mark: &str) -> Vec<HttpFlow>
     };
 
     let mut flows = Vec::new();
-    for id in store.query(&query) {
-        if job.cancelled() {
+    for id in store.query(&query).into_iter().rev() {
+        if job.cancelled() || flows.len() >= MAX_STORED_FLOWS {
             break;
         }
         let Some(Flow::Http(flow)) = store.get(id) else {
@@ -295,9 +302,17 @@ fn stored_flows(job: &dyn JobCtx, origin: &Url, job_mark: &str) -> Vec<HttpFlow>
         if is_another_jobs_crawl(&flow, job_mark) {
             continue;
         }
-        flows.push(flow);
+        flows.push(request_only(flow));
     }
     flows
+}
+
+/// `flow` with its response body dropped; the stored pass reads the request.
+fn request_only(mut flow: HttpFlow) -> HttpFlow {
+    if let Some(response) = flow.response.as_mut() {
+        response.body = Body::Empty;
+    }
+    flow
 }
 
 /// Whether `flow` carries the crawl mark of some *other* job of this run.
@@ -459,12 +474,13 @@ mod tests {
         ParamRef, ProfileTarget, ScanProfile, SessionMaterial, SiteNode, UseBrowser,
     };
 
-    use super::{Crawlers, HttpLane};
+    use super::{stored_flows, Crawlers, HttpLane};
     use crate::crawl::frontier::{CrawlReport, Crawler, Limits};
-    use crate::limits::MARK_CRAWL;
+    use crate::limits::{job_mark, MARK_CRAWL, MAX_STORED_FLOWS};
     use crate::testutil::{
         captured_flow, request, site, FakeBrowser, FakeJob, PageScript, JOB_ID, MARKER,
     };
+    use crate::url_norm::parse_absolute;
 
     /// The origin every test discovers; `t:8080` is the host [`FakeJob`] scopes.
     const ORIGIN: &str = "http://t:8080";
@@ -1024,6 +1040,52 @@ mod tests {
                 .collect::<BTreeSet<String>>()
         );
         assert_eq!(client.sent.lock().unwrap().len(), 0);
+    }
+
+    // --- S-M7: the stored pass is capped, newest first, request only ---------
+
+    /// 2100 same-origin captures: the lane enumerates at most
+    /// `MAX_STORED_FLOWS` of them, the newest kept, and the clones it holds
+    /// carry no response body (only the request is read); the store's copies
+    /// are untouched.
+    #[test]
+    fn stored_flows_are_capped_newest_first_without_bodies() {
+        let store = Arc::new(MemFlowStore::new());
+        let mut ids = Vec::new();
+        for i in 0..2100 {
+            ids.push(store.insert(Flow::Http(captured_flow(
+                request("GET", &format!("http://t:8080/p{i}"), &[], None),
+                200,
+                &[("content-type", "text/html")],
+                b"<p>kept in the store</p>",
+            ))));
+        }
+        let job = FakeJob::new(profile(|_| {}), Arc::new(site(&[]))).with_store(Arc::clone(&store));
+        let origin = parse_absolute(ORIGIN).expect("the test origin parses");
+
+        let flows = stored_flows(&job, &origin, &job_mark(JOB_ID));
+
+        assert_eq!(MAX_STORED_FLOWS, 2048);
+        assert_eq!(flows.len(), MAX_STORED_FLOWS);
+        assert_eq!(flows[0].request.path, "/p2099");
+        assert_eq!(flows[MAX_STORED_FLOWS - 1].request.path, "/p52");
+        assert!(!flows.iter().any(|flow| flow.request.path == "/p51"));
+        for flow in &flows {
+            let response = flow.response.as_ref().expect("the clone keeps its status");
+            assert_eq!(response.status, 200);
+            assert!(
+                matches!(response.body, aitm_core::Body::Empty),
+                "{} carries a body",
+                flow.request.path
+            );
+        }
+        let Some(Flow::Http(stored)) = store.get(ids[2099]) else {
+            panic!("the store holds the flow");
+        };
+        assert!(matches!(
+            stored.response.as_ref().map(|r| &r.body),
+            Some(aitm_core::Body::Bytes(_))
+        ));
     }
 
     // --- stage-5 R3: a failed crawl still yields the captures it inserted ---

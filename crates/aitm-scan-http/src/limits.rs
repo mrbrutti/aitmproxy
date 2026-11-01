@@ -94,6 +94,10 @@ pub(crate) const MAX_SESSION_MONITORS: usize = 16;
 /// Response body bytes held from one crawl fetch.
 pub(crate) const MAX_HELD_CRAWL_BODY: usize = 64 * 1024;
 
+/// Captured same-origin flows the stored pass of one origin enumerates, newest
+/// first; older captures are left to the crawl to rediscover.
+pub(crate) const MAX_STORED_FLOWS: usize = 2048;
+
 /// The mark put on every request the crawler makes (spec D5, "crawl marks").
 pub(crate) const MARK_CRAWL: &str = "crawl";
 
