@@ -2063,6 +2063,8 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| P1b.14 (S7 amendment) | Architect (e74b0b98) | Decision | Ctrl-C at the pkexec prompt: the core installs a SIGINT handler while a pkexec child is alive; Ctrl-C cancels the prompt only (`dismissed`) and does not shut the core down; the prior disposition returns once the child is gone. `aitm`'s shutdown future (`crates/aitm/src/lib.rs` `shutdown_signal`, tokio `ctrl_c`) must yield to this handler for the prompt window only. | Approved as written by the orchestrator 2026-11-01 under Matt's autonomous-approve mode (**flagged for Matt**): the operator-visible change is confined to the prompt window and is stated in spec §5.5; `aitm web` has no help text documenting Ctrl-C, so nothing else to update. |
+| P1b.14 (S7 amendment) | Architect (e74b0b98) | Decision | pkexec exit 127 with `Error creating textual authentication agent` after a `pending` reply maps to progress `failed` with the no-prompt message plus one `warn` line; `cannot_prompt` stays the outcome of the pre-spawn check. | Approved as written by the orchestrator 2026-11-01 under Matt's autonomous-approve mode (**flagged for Matt**): the two paths stay distinguishable in the audit line. |
 
 ## Shipped
 
