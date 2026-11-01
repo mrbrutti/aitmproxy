@@ -264,13 +264,12 @@ fn is_terminal(flow: &Flow) -> bool {
         Flow::Http(f) => match &f.intercept {
             InterceptState::Intercepted { .. } => false,
             InterceptState::Killed => true,
-            _ => match &f.metadata.tunnel {
-                Some(tunnel) => tunnel.is_closed(f.metadata.duration),
-                None => f
-                    .response
-                    .as_ref()
-                    .is_some_and(|r| r.status != 101 && !matches!(r.body, Body::Streamed(_))),
-            },
+            // A tunnel row (spec D5) is finished iff its `duration` is set.
+            _ if f.metadata.tunnel.is_some() => f.metadata.tunnel_is_closed(),
+            _ => f
+                .response
+                .as_ref()
+                .is_some_and(|r| r.status != 101 && !matches!(r.body, Body::Streamed(_))),
         },
         Flow::WebSocket(f) => matches!(f.intercept, InterceptState::Killed),
     }

@@ -54,9 +54,9 @@ pub use egress::{ConfinementToken, EgressConfinement};
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{
-    ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
-    InterceptState, ResumeHandle, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow, WsMessage,
-    WsOpcode,
+    saturating_i64, ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse,
+    HttpVersion, InterceptState, ResumeHandle, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow,
+    WsMessage, WsOpcode,
 };
 pub use guard::{
     classify_host, engine_may_reach_private, ssrf_check, ActionPermit, HostClass, ScopeRateGuard,
@@ -69,7 +69,9 @@ pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
 pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
-pub use tunnel::{classify_client_failure, relay, TunnelRequest, TunnelRow};
+pub use tunnel::{
+    classify_client_failure, relay, RelayCounts, TunnelRequest, TunnelRow, RELAY_IDLE_TIMEOUT,
+};
 pub use value::{Params, Value};
 
 /// The crate version, wired to the Cargo package version.

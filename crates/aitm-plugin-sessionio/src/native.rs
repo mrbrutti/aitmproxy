@@ -414,28 +414,14 @@ fn tunnel_to_rec(t: &TunnelInfo) -> TunnelRec {
     }
 }
 
-/// The inverse of the labels: `None` when `mode`, or a present `reason`, is not a
-/// code this build knows (a newer writer or a hand-edited file).
+/// The inverse of the labels (`TunnelMode::from_label`, `TunnelReason::from_label`):
+/// `None` when `mode`, or a present `reason`, is not a code this build knows (a
+/// newer writer or a hand-edited file).
 fn rec_to_tunnel(t: &TunnelRec) -> Option<TunnelInfo> {
-    const MODES: [TunnelMode; 3] = [
-        TunnelMode::Decrypted,
-        TunnelMode::Passthrough,
-        TunnelMode::Failed,
-    ];
-    const REASONS: [TunnelReason; 8] = [
-        TunnelReason::OutOfScope,
-        TunnelReason::Pinned,
-        TunnelReason::ClientRejectedCertificate,
-        TunnelReason::ClientClosed,
-        TunnelReason::ClientTlsError,
-        TunnelReason::UpstreamUnreachable,
-        TunnelReason::UpstreamTlsFailed,
-        TunnelReason::ProtocolError,
-    ];
-    let mode = MODES.into_iter().find(|m| m.label() == t.mode)?;
+    let mode = TunnelMode::from_label(&t.mode)?;
     let reason = match &t.reason {
         None => None,
-        Some(code) => Some(REASONS.into_iter().find(|r| r.label() == code)?),
+        Some(code) => Some(TunnelReason::from_label(code)?),
     };
     Some(TunnelInfo {
         mode,

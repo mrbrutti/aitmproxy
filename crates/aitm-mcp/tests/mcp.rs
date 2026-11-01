@@ -8487,9 +8487,9 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
     assert_eq!(ws_obj.get("passive"), Some(&json!(false)));
 
     // Per-host decryption, spec D7 / AC11: a passthrough row (closed, with byte
-    // counts), a failed row (no response) and a passive cleartext flow carry
-    // `tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down` and `passive` on both
-    // sides with the literal wire codes.
+    // counts), a failed row (no response), a decrypted row and a passive
+    // cleartext flow carry `tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down`
+    // and `passive` on both sides with the literal wire codes.
     let mut passthrough = http_flow_with_method("origin.test:443", "", "CONNECT");
     let Flow::Http(f) = &mut passthrough else {
         unreachable!("http_flow builds an HTTP flow")
@@ -8558,6 +8558,52 @@ async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
         note["params"]["summary"], expected_failed,
         "the failed-tunnel push summary is the flow.get object, field for field"
     );
+
+    // A decrypted row (panel P4; AC11 names all five kinds): the `200` ack, a
+    // duration once closed, `tunnel == "decrypted"`, and null `tunnel_reason`,
+    // `bytes_up`, `bytes_down` (its inner requests are their own rows).
+    let mut decrypted = http_flow_with_method("secure.test:443", "", "CONNECT");
+    let Flow::Http(f) = &mut decrypted else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.scheme = "https".into();
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(900));
+    f.metadata.tunnel = Some(TunnelInfo::decrypted());
+    let decrypted_id = store.insert(decrypted);
+    let expected_decrypted = capture_flow_get(&store, decrypted_id);
+    let decrypted_obj = expected_decrypted
+        .as_object()
+        .expect("flow.get is an object");
+    assert_eq!(expected_decrypted["method"], "CONNECT");
+    assert_eq!(expected_decrypted["authority"], "secure.test:443");
+    assert_eq!(expected_decrypted["status"], json!(200));
+    assert_eq!(expected_decrypted["duration_ms"], json!(900));
+    assert_eq!(expected_decrypted["tunnel"], json!("decrypted"));
+    assert_eq!(decrypted_obj.get("tunnel_reason"), Some(&JsonValue::Null));
+    assert_eq!(decrypted_obj.get("bytes_up"), Some(&JsonValue::Null));
+    assert_eq!(decrypted_obj.get("bytes_down"), Some(&JsonValue::Null));
+    assert_eq!(decrypted_obj.get("passive"), Some(&json!(false)));
+    srv.push_flow_event(&Event::Response(decrypted_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], decrypted_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_decrypted,
+        "the decrypted-tunnel push summary is the flow.get object, field for field"
+    );
+    assert_eq!(note["params"]["summary"]["tunnel"], json!("decrypted"));
+    assert_eq!(note["params"]["summary"]["tunnel_reason"], JsonValue::Null);
+    assert_eq!(note["params"]["summary"]["bytes_up"], JsonValue::Null);
+    assert_eq!(note["params"]["summary"]["bytes_down"], JsonValue::Null);
+    assert_eq!(note["params"]["summary"]["passive"], json!(false));
 
     let mut passive = http_flow("plain.test", "/p");
     passive.metadata_mut().created = created;

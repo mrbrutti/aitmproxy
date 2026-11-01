@@ -199,8 +199,8 @@ impl PassthroughModule {
         // Byte-for-byte relay in both directions until either side closes. The
         // client's TLS terminates at the real upstream, so nothing here is
         // decrypted; the counts are exact even when the relay ends in an error.
-        let (up, down, relayed) = relay(&mut client, &mut upstream).await;
-        row.close(&ctx, Some((up, down))).await;
+        let (counts, relayed) = relay(&mut client, &mut upstream).await;
+        row.close(&ctx, Some(counts)).await;
         relayed.map_err(Into::into)
     }
 }

@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aitm_core::{
-    Body, Command, CommandHost, Flow, FlowMeta, ParamDef, ParamSchema, Params, Plugin, Registry,
-    TypeDesc, Value,
+    saturating_i64, Body, Command, CommandHost, Flow, FlowMeta, ParamDef, ParamSchema, Params,
+    Plugin, Registry, TypeDesc, Value,
 };
 
 /// Registers `flow.list` and `flow.get`. Observes no events.
@@ -280,12 +280,6 @@ fn tunnel_fields(meta: &FlowMeta) -> [(&'static str, Value); 5] {
         ),
         ("passive", Value::Bool(meta.passive)),
     ]
-}
-
-/// A byte count as the bus integer: saturated at `i64::MAX`, never wrapped
-/// negative (the same rule `duration_ms` follows).
-fn saturating_i64(n: u64) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 /// A body's reported size ([`Body::buffered_len`]) as a `Value`: the byte count,

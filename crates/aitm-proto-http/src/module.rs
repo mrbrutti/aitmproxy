@@ -901,8 +901,8 @@ async fn relay_out_of_scope(
         TunnelInfo::passthrough(TunnelReason::OutOfScope),
     )
     .await;
-    let (up, down, relayed) = relay(&mut client, &mut upstream).await;
-    row.close(ctx, Some((up, down))).await;
+    let (counts, relayed) = relay(&mut client, &mut upstream).await;
+    row.close(ctx, Some(counts)).await;
     relayed.map_err(Into::into)
 }
 

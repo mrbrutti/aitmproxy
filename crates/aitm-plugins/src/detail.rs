@@ -25,8 +25,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse, HttpVersion,
-    ParamDef, ParamSchema, Params, Plugin, Registry, TunnelInfo, TypeDesc, Value, WsMessage,
+    saturating_i64, Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse,
+    HttpVersion, ParamDef, ParamSchema, Params, Plugin, Registry, TunnelInfo, TypeDesc, Value,
+    WsMessage,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -366,13 +367,10 @@ fn meta(m: &FlowMeta) -> Value {
 /// `meta.tunnel` for a tunnel row (spec D7): `{mode, reason, bytes_up,
 /// bytes_down}` with the wire codes of `TunnelMode::label` / `TunnelReason::label`,
 /// `reason` null for a decrypted tunnel, the byte counts null until a passthrough
-/// tunnel closes. Counts saturate at `i64::MAX` rather than wrap.
+/// tunnel closes. Counts saturate at `i64::MAX` rather than wrap
+/// (`aitm_core::saturating_i64`, the rule every surface shares).
 fn tunnel(t: &TunnelInfo) -> Value {
-    let count = |n: Option<u64>| {
-        n.map_or(Value::Null, |n| {
-            Value::Int(i64::try_from(n).unwrap_or(i64::MAX))
-        })
-    };
+    let count = |n: Option<u64>| n.map_or(Value::Null, |n| Value::Int(saturating_i64(n)));
     let mut obj = BTreeMap::new();
     obj.insert("mode".into(), Value::Str(t.mode.label().into()));
     obj.insert("reason".into(), opt_str(t.reason.map(|r| r.label())));

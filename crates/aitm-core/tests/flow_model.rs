@@ -1,8 +1,8 @@
 //! Task 2: core flow-model types (`HeaderMap`, `Body`, `HttpFlow`, …).
 
 use aitm_core::{
-    Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpVersion,
-    InterceptState, StreamBody, TunnelInfo, TunnelMode, TunnelReason,
+    saturating_i64, Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest,
+    HttpVersion, InterceptState, StreamBody, TunnelInfo, TunnelMode, TunnelReason,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -230,20 +230,138 @@ fn tunnel_info_constructors_set_mode_and_reason_and_no_bytes() {
     );
 }
 
-/// Spec D5's terminal rule in one place: a tunnel row is closed iff its
-/// `duration` is set — whatever the mode, and regardless of the `200` an
-/// established tunnel carries.
+/// Spec D5's terminal rule in one place (panel Q6): a tunnel row is closed iff
+/// it *is* a tunnel row and its `duration` is set — whatever the mode, and
+/// regardless of the `200` an established tunnel carries. An ordinary flow is
+/// never a "closed tunnel", however finished.
 #[test]
-fn tunnel_is_closed_iff_the_duration_is_set() {
+fn tunnel_is_closed_iff_a_tunnel_row_has_its_duration() {
     for info in [
         TunnelInfo::decrypted(),
         TunnelInfo::passthrough(TunnelReason::Pinned),
         TunnelInfo::failed(TunnelReason::ClientClosed),
     ] {
-        assert!(!info.is_closed(None), "{info:?} with no duration is open");
+        let open = FlowMeta {
+            tunnel: Some(info.clone()),
+            duration: None,
+            ..FlowMeta::default()
+        };
         assert!(
-            info.is_closed(Some(Duration::from_millis(1))),
+            !open.tunnel_is_closed(),
+            "{info:?} with no duration is open"
+        );
+        let closed = FlowMeta {
+            tunnel: Some(info.clone()),
+            duration: Some(Duration::from_millis(1)),
+            ..FlowMeta::default()
+        };
+        assert!(
+            closed.tunnel_is_closed(),
             "{info:?} with a duration is closed"
         );
     }
+    let finished_request = FlowMeta {
+        tunnel: None,
+        duration: Some(Duration::from_millis(1)),
+        ..FlowMeta::default()
+    };
+    assert!(
+        !finished_request.tunnel_is_closed(),
+        "a finished ordinary request is not a tunnel row at all"
+    );
+    assert!(!FlowMeta::default().tunnel_is_closed());
+}
+
+/// Panel Q3: `TunnelMode::ALL` is the one list of variants — sessionio reverses
+/// the wire labels through it — so every label round-trips through `from_label`,
+/// a code this build does not know is `None`, and the list is exactly the variant
+/// set. The exhaustive `match` is the witness: a new variant fails to compile
+/// until it is added to the pattern, whose arm count then fails this test until
+/// `ALL` grows to hold it.
+#[test]
+fn tunnel_mode_all_round_trips_through_from_label() {
+    let variant_count = match TunnelMode::Decrypted {
+        // Add a new variant here AND to `TunnelMode::ALL`, then bump the count.
+        TunnelMode::Decrypted | TunnelMode::Passthrough | TunnelMode::Failed => 3,
+    };
+    assert_eq!(TunnelMode::ALL.len(), variant_count);
+    assert_eq!(
+        TunnelMode::ALL,
+        [
+            TunnelMode::Decrypted,
+            TunnelMode::Passthrough,
+            TunnelMode::Failed
+        ],
+        "every variant once, in wire-code order"
+    );
+    for mode in TunnelMode::ALL {
+        assert_eq!(TunnelMode::from_label(mode.label()), Some(mode), "{mode:?}");
+    }
+    assert_eq!(
+        TunnelMode::from_label("passthrough"),
+        Some(TunnelMode::Passthrough)
+    );
+    assert_eq!(
+        TunnelMode::from_label("Passthrough"),
+        None,
+        "labels are exact, not case-folded"
+    );
+    assert_eq!(TunnelMode::from_label("pending"), None);
+    assert_eq!(TunnelMode::from_label(""), None);
+}
+
+/// Panel Q3, the reason side: eight variants, eight labels, one list.
+#[test]
+fn tunnel_reason_all_round_trips_through_from_label() {
+    let variant_count = match TunnelReason::OutOfScope {
+        // Add a new variant here AND to `TunnelReason::ALL`, then bump the count.
+        TunnelReason::OutOfScope
+        | TunnelReason::Pinned
+        | TunnelReason::ClientRejectedCertificate
+        | TunnelReason::ClientClosed
+        | TunnelReason::ClientTlsError
+        | TunnelReason::UpstreamUnreachable
+        | TunnelReason::UpstreamTlsFailed
+        | TunnelReason::ProtocolError => 8,
+    };
+    assert_eq!(TunnelReason::ALL.len(), variant_count);
+    assert_eq!(
+        TunnelReason::ALL,
+        [
+            TunnelReason::OutOfScope,
+            TunnelReason::Pinned,
+            TunnelReason::ClientRejectedCertificate,
+            TunnelReason::ClientClosed,
+            TunnelReason::ClientTlsError,
+            TunnelReason::UpstreamUnreachable,
+            TunnelReason::UpstreamTlsFailed,
+            TunnelReason::ProtocolError,
+        ],
+        "every variant once, in wire-code order"
+    );
+    for reason in TunnelReason::ALL {
+        assert_eq!(
+            TunnelReason::from_label(reason.label()),
+            Some(reason),
+            "{reason:?}"
+        );
+    }
+    assert_eq!(
+        TunnelReason::from_label("client_rejected_certificate"),
+        Some(TunnelReason::ClientRejectedCertificate)
+    );
+    assert_eq!(TunnelReason::from_label("client-closed"), None);
+    assert_eq!(TunnelReason::from_label("OUT_OF_SCOPE"), None);
+    assert_eq!(TunnelReason::from_label("unknown"), None);
+}
+
+/// Panel Q4: the one byte-count-to-bus-integer rule. A count that fits is itself;
+/// anything past `i64::MAX` saturates there, never wraps negative.
+#[test]
+fn saturating_i64_clamps_at_i64_max() {
+    assert_eq!(saturating_i64(0), 0);
+    assert_eq!(saturating_i64(4_096), 4_096);
+    assert_eq!(saturating_i64(i64::MAX as u64), i64::MAX);
+    assert_eq!(saturating_i64(i64::MAX as u64 + 1), i64::MAX);
+    assert_eq!(saturating_i64(u64::MAX), i64::MAX);
 }

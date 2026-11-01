@@ -5,8 +5,9 @@
 //!
 //! A tunnel row is a [`Flow::Http`] whose request is the `CONNECT` itself
 //! (method `CONNECT`, scheme `https`, the normalised `host:port` authority, the
-//! CONNECT headers, no path, no body) and whose `metadata.tunnel` carries the
-//! outcome ([`TunnelInfo`]). It appears **at the outcome**, never as "pending":
+//! CONNECT headers with any credential value redacted, no path, no body) and
+//! whose `metadata.tunnel` carries the outcome ([`TunnelInfo`]). It appears
+//! **at the outcome**, never as "pending":
 //! `decrypted` once the client's handshake with the proxy's leaf completes,
 //! `passthrough` once the origin is dialled and the acknowledgement written,
 //! `failed` at the failure. An established tunnel carries a `200` response (the
@@ -22,11 +23,15 @@
 //! and nothing at `warn`; producers should not log it again.
 
 use std::io;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures::future::{select, Either};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::time::Instant;
 
 use crate::authority::Authority;
 use crate::body::Body;
@@ -37,7 +42,11 @@ use crate::flow::{
 };
 use crate::header::HeaderMap;
 use crate::protocol::ModuleCtx;
+use crate::redact::is_secret_key;
 use crate::stream::ByteStream;
+
+/// What a tunnel row stores in place of a credential header's value.
+const REDACTED: &str = "<redacted>";
 
 /// What a producer knows about a `CONNECT` (or raw-TLS) connection when its
 /// outcome is decided: everything [`TunnelRow::open`] needs to insert the row.
@@ -46,7 +55,8 @@ pub struct TunnelRequest {
     /// The tunnel authority (spec D1), already normalised: it becomes
     /// `request.authority` as `host:port`.
     pub authority: Authority,
-    /// The CONNECT request headers; empty for a raw-TLS connection.
+    /// The CONNECT request headers; empty for a raw-TLS connection. Stored on
+    /// the row with every credential value redacted (see [`TunnelRow::open`]).
     pub headers: HeaderMap,
     /// The client side: `tls: true` for a TLS tunnel, `false` for a cleartext
     /// `CONNECT` the proxy served inside the tunnel.
@@ -80,7 +90,10 @@ impl TunnelRow {
     /// `Event::RequestHeaders` for it.
     ///
     /// The row's request is `CONNECT host:port` (scheme `https`, empty path,
-    /// `req.headers`, empty body, timestamp `req.opened_at`); `metadata.created`
+    /// `req.headers` with the value of every header [`is_secret_key`] flags —
+    /// `Proxy-Authorization` above all — stored as the literal `<redacted>`,
+    /// because `flow.detail` and session files carry headers verbatim; empty
+    /// body, timestamp `req.opened_at`); `metadata.created`
     /// is `req.opened_at`, `metadata.tunnel` is `info`, `passive` is `false` (a
     /// tunnel row is passive through its tunnel fields) and the attribution is
     /// copied. For `Decrypted` and `Passthrough` the row carries a `200` response
@@ -110,7 +123,7 @@ impl TunnelRow {
                 authority: authority.to_string(),
                 path: String::new(),
                 version: HttpVersion::Http11,
-                headers: req.headers,
+                headers: redact_secret_headers(&req.headers),
                 body: Body::Empty,
                 timestamp: opened_at,
             },
@@ -139,17 +152,17 @@ impl TunnelRow {
     }
 
     /// Close an established tunnel: `duration` becomes now minus `created`;
-    /// when `bytes` is `Some((up, down))` (a passthrough relay's counts) they
-    /// become `tunnel.bytes_up` / `tunnel.bytes_down`; then `Event::Response`
-    /// is emitted. The `200` acknowledgement stays.
-    pub async fn close(self, ctx: &ModuleCtx, bytes: Option<(u64, u64)>) {
+    /// when `bytes` is `Some` (a passthrough relay's [`RelayCounts`]) `up` and
+    /// `down` become `tunnel.bytes_up` / `tunnel.bytes_down`; then
+    /// `Event::Response` is emitted. The `200` acknowledgement stays.
+    pub async fn close(self, ctx: &ModuleCtx, bytes: Option<RelayCounts>) {
         let duration = elapsed_since(self.created);
         ctx.store().update(self.id, &mut |flow| {
             let meta = flow.metadata_mut();
             meta.duration = Some(duration);
-            if let (Some((up, down)), Some(tunnel)) = (bytes, meta.tunnel.as_mut()) {
-                tunnel.bytes_up = Some(up);
-                tunnel.bytes_down = Some(down);
+            if let (Some(counts), Some(tunnel)) = (bytes, meta.tunnel.as_mut()) {
+                tunnel.bytes_up = Some(counts.up);
+                tunnel.bytes_down = Some(counts.down);
             }
         });
         let _: Verdict = ctx.emit(Event::Response(self.id)).await;
@@ -193,46 +206,155 @@ fn elapsed_since(since: SystemTime) -> Duration {
     since.elapsed().unwrap_or_default()
 }
 
-/// The one `debug` line a failed tunnel produces (spec D5).
+/// The CONNECT headers as a row stores them (spec Constraints, panel S3): the
+/// value of every header whose name [`is_secret_key`] flags — `Proxy-Authorization`
+/// above all — replaced by the literal `<redacted>`. Names, order and every other
+/// value are kept.
+fn redact_secret_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut stored = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        stored.set(name, if is_secret_key(name) { REDACTED } else { value });
+    }
+    stored
+}
+
+/// The one `debug` line a failed tunnel produces (spec D5). The authority is
+/// Debug-escaped (panel S4): a control byte in a host name reaches no terminal raw.
 fn log_failed(authority: &Authority, reason: Option<TunnelReason>) {
     tracing::debug!(
-        %authority,
+        authority = ?authority.to_string(),
         reason = reason.as_ref().map_or("unspecified", TunnelReason::label),
         "tunnel failed"
     );
 }
 
+/// How long a relay may go with no byte moving in either direction before it is
+/// shut down (spec Constraints, panel S2): an idle passthrough must not pin an
+/// open row, a task and two sockets forever.
+pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The byte counts of one relayed tunnel: `up` is what was read from the client
+/// toward the origin, `down` what was written to the client from the origin —
+/// the values a passthrough row reports as `bytes_up` / `bytes_down`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RelayCounts {
+    pub up: u64,
+    pub down: u64,
+}
+
 /// Relay `client` and `upstream` byte for byte in both directions until either
 /// side closes (an EOF on one side shuts down the other's write half, as
-/// [`tokio::io::copy_bidirectional`] does) or an I/O error ends the relay.
+/// [`tokio::io::copy_bidirectional`] does), an I/O error ends the relay, or no
+/// byte has moved in either direction for [`RELAY_IDLE_TIMEOUT`] — then both
+/// write halves are shut down and the relay ends cleanly, so the row closes
+/// normally with its counts and duration (panel S2).
 ///
-/// Returns `(bytes_up, bytes_down, result)`: `bytes_up` is what was read from the
-/// client toward the origin, `bytes_down` what was written to the client from the
-/// origin. Both are counted on the client stream itself, so they are exact even
-/// when the relay ends in an error (a reset mid-transfer) and the passthrough row
-/// still reports what moved.
+/// Returns the [`RelayCounts`] and the result. The counts are kept on the client
+/// stream itself, so they are exact even when the relay ends in an error (a
+/// reset mid-transfer) and the passthrough row still reports what moved.
 pub async fn relay(
     client: &mut ByteStream,
     upstream: &mut ByteStream,
-) -> (u64, u64, io::Result<()>) {
+) -> (RelayCounts, io::Result<()>) {
+    let activity = Arc::new(Activity::new());
     let mut counted = Counted {
         inner: client,
-        up: 0,
-        down: 0,
+        activity: Arc::clone(&activity),
     };
-    let result = tokio::io::copy_bidirectional(&mut counted, upstream)
-        .await
-        .map(|_| ());
-    (counted.up, counted.down, result)
+    // `Some(result)` when the copy itself ended; `None` when the idle bound did.
+    let outcome = {
+        let mut copy = pin!(tokio::io::copy_bidirectional(&mut counted, upstream));
+        loop {
+            // Sleep until the bound measured from the last byte. When it fires,
+            // a byte that moved meanwhile has pushed the bound out: sleep again.
+            let deadline = activity.last_active() + RELAY_IDLE_TIMEOUT;
+            let idle = pin!(tokio::time::sleep_until(deadline));
+            match select(copy.as_mut(), idle).await {
+                Either::Left((done, _)) => break Some(done.map(|_| ())),
+                Either::Right(((), _)) => {
+                    if activity.last_active() + RELAY_IDLE_TIMEOUT <= Instant::now() {
+                        break None;
+                    }
+                }
+            }
+        }
+    };
+    let result = match outcome {
+        Some(result) => result,
+        None => {
+            // Idle: shut both write halves so each peer sees EOF. A half that is
+            // already gone fails its shutdown, which changes nothing here.
+            let _ = counted.shutdown().await;
+            let _ = upstream.shutdown().await;
+            Ok(())
+        }
+    };
+    (activity.counts(), result)
 }
 
-/// The client stream with two counters: bytes read from it (`up`) and bytes
-/// written to it (`down`). The counts live outside the copy future, so they are
-/// readable after it fails.
+/// What has moved through one relay: the two byte counters and when the last
+/// byte moved. Shared between the counting stream wrapper inside the copy
+/// future and the idle watchdog beside it, so the counts are readable after
+/// the copy fails and the watchdog sees every byte.
+struct Activity {
+    start: Instant,
+    up: AtomicU64,
+    down: AtomicU64,
+    /// Nanoseconds after `start` of the last byte moved in either direction.
+    last_active: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
+            last_active: AtomicU64::new(0),
+        }
+    }
+
+    /// `n` bytes read from the client (toward the origin).
+    fn moved_up(&self, n: usize) {
+        self.moved(&self.up, n);
+    }
+
+    /// `n` bytes written to the client (from the origin).
+    fn moved_down(&self, n: usize) {
+        self.moved(&self.down, n);
+    }
+
+    fn moved(&self, counter: &AtomicU64, n: usize) {
+        if n == 0 {
+            return;
+        }
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+        let since_start = Instant::now().saturating_duration_since(self.start);
+        let nanos = u64::try_from(since_start.as_nanos()).unwrap_or(u64::MAX);
+        self.last_active.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// When the last byte moved; `start` while nothing has.
+    fn last_active(&self) -> Instant {
+        let nanos = self.last_active.load(Ordering::Relaxed);
+        self.start
+            .checked_add(Duration::from_nanos(nanos))
+            .unwrap_or(self.start)
+    }
+
+    fn counts(&self) -> RelayCounts {
+        RelayCounts {
+            up: self.up.load(Ordering::Relaxed),
+            down: self.down.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The client stream, reporting every byte read from it (`up`) and written to
+/// it (`down`) to the shared [`Activity`].
 struct Counted<'a> {
     inner: &'a mut ByteStream,
-    up: u64,
-    down: u64,
+    activity: Arc<Activity>,
 }
 
 impl AsyncRead for Counted<'_> {
@@ -245,7 +367,7 @@ impl AsyncRead for Counted<'_> {
         let before = buf.filled().len();
         let polled = this.inner.as_mut().poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &polled {
-            this.up += (buf.filled().len() - before) as u64;
+            this.activity.moved_up(buf.filled().len() - before);
         }
         polled
     }
@@ -260,7 +382,7 @@ impl AsyncWrite for Counted<'_> {
         let this = self.get_mut();
         let polled = this.inner.as_mut().poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &polled {
-            this.down += *n as u64;
+            this.activity.moved_down(*n);
         }
         polled
     }
@@ -365,6 +487,7 @@ mod tests {
     use crate::error::FlowError;
     use crate::flow::{ConnInfo, Flow, FlowId, HttpFlow, HttpVersion, InterceptState, TunnelMode};
     use crate::protocol::{EventSink, UpstreamConnector};
+    use crate::redact::is_secret_key;
     use crate::store::{ClearOutcome, FlowStore, MemFlowStore};
     use futures::future::BoxFuture;
     use std::io;
@@ -532,6 +655,66 @@ mod tests {
         assert!(store.get(id).is_some(), "clear must keep the open tunnel");
     }
 
+    /// Panel S3: the CONNECT headers are the row's request, but a credential in
+    /// them must not reach `flow.detail` or a session file. The value of every
+    /// header `is_secret_key` flags — `Proxy-Authorization` above all — is stored
+    /// as the literal `<redacted>`; names, order and every other value are kept.
+    #[tokio::test]
+    async fn open_redacts_proxy_authorization_and_keeps_the_rest() {
+        // The rule the redaction rides on, pinned for the names a CONNECT carries.
+        assert!(is_secret_key("proxy-authorization"));
+        assert!(is_secret_key("Proxy-Authorization"));
+        assert!(!is_secret_key("host"));
+        assert!(!is_secret_key("proxy-connection"));
+        assert!(!is_secret_key("user-agent"));
+        // The response-side challenge is not a credential under the shared rule.
+        assert!(!is_secret_key("proxy-authenticate"));
+
+        let (ctx, store, _sink) = harness();
+        let mut req = request(SystemTime::now());
+        req.headers = HeaderMap::new();
+        req.headers.set("Proxy-Authorization", "Basic abc");
+        req.headers.set("Host", "x");
+        req.headers.set("User-Agent", "curl/8.7.1");
+        let row =
+            TunnelRow::open(&ctx, req, TunnelInfo::passthrough(TunnelReason::OutOfScope)).await;
+
+        let h = http(&store, row.id());
+        let stored: Vec<(&str, &str)> = h.request.headers.iter().collect();
+        assert_eq!(
+            stored,
+            vec![
+                ("Proxy-Authorization", "<redacted>"),
+                ("Host", "x"),
+                ("User-Agent", "curl/8.7.1"),
+            ]
+        );
+        assert_eq!(
+            h.request.headers.get("proxy-authorization"),
+            Some("<redacted>")
+        );
+        assert_eq!(h.request.headers.get("host"), Some("x"));
+
+        // The same path serves a failed row.
+        let mut req = request(SystemTime::now());
+        req.headers = HeaderMap::new();
+        req.headers
+            .set("proxy-authorization", "Bearer eyJ.secret.sig");
+        let failed = TunnelRow::open(
+            &ctx,
+            req,
+            TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
+        )
+        .await;
+        assert_eq!(
+            http(&store, failed.id())
+                .request
+                .headers
+                .get("Proxy-Authorization"),
+            Some("<redacted>")
+        );
+    }
+
     #[tokio::test]
     async fn close_sets_duration_and_bytes_and_pushes_response() {
         let (ctx, store, sink) = harness();
@@ -544,7 +727,14 @@ mod tests {
         .await;
         let id = row.id();
 
-        row.close(&ctx, Some((1234, 56789))).await;
+        row.close(
+            &ctx,
+            Some(RelayCounts {
+                up: 1234,
+                down: 56789,
+            }),
+        )
+        .await;
 
         let h = http(&store, id);
         let duration = h.metadata.duration.expect("close sets the duration");
@@ -715,8 +905,8 @@ mod tests {
         drop(client_far);
         up_far.write_all(b"late").await.unwrap();
 
-        let (up, down, result) = relay_task.await.unwrap();
-        assert_eq!((up, down), (5, 7));
+        let (counts, result) = relay_task.await.unwrap();
+        assert_eq!(counts, RelayCounts { up: 5, down: 7 });
         assert_eq!(
             result
                 .expect_err("the relay ended in the write error")
@@ -726,7 +916,7 @@ mod tests {
     }
 
     /// Empty input: a relay whose both ends are already closed moves nothing and
-    /// ends cleanly — `(0, 0, Ok)`, so the row it closes reports zero bytes, not
+    /// ends cleanly — zero counts and `Ok`, so the row it closes reports zero bytes, not
     /// an error (Tester addition, whole-branch stage 5).
     #[tokio::test]
     async fn relay_with_nothing_to_move_closes_cleanly_with_zero_counts() {
@@ -737,10 +927,128 @@ mod tests {
         let mut client: ByteStream = Box::pin(client_near);
         let mut upstream: ByteStream = Box::pin(up_near);
 
-        let (up, down, result) = relay(&mut client, &mut upstream).await;
+        let (counts, result) = relay(&mut client, &mut upstream).await;
 
-        assert_eq!((up, down), (0, 0));
+        assert_eq!(counts, RelayCounts { up: 0, down: 0 });
         result.expect("two closed ends are a clean close, not an error");
+    }
+
+    /// Panel S2: a relay with no byte in either direction for `RELAY_IDLE_TIMEOUT`
+    /// is shut down on both halves, so an idle passthrough cannot pin an open
+    /// row, a task and two sockets forever. A byte in either direction restarts
+    /// the clock; the result is the clean close with the exact counts moved so
+    /// far, so the row closes normally with counts and duration. Paused tokio
+    /// time: the minutes are virtual.
+    #[tokio::test(start_paused = true)]
+    async fn relay_ends_after_the_idle_bound_with_the_counts_so_far() {
+        assert_eq!(RELAY_IDLE_TIMEOUT, Duration::from_secs(600));
+        let (client_near, mut client_far) = tokio::io::duplex(1024);
+        let (up_near, mut up_far) = tokio::io::duplex(1024);
+        let relay_task = tokio::spawn(async move {
+            let mut client: ByteStream = Box::pin(client_near);
+            let mut upstream: ByteStream = Box::pin(up_near);
+            relay(&mut client, &mut upstream).await
+        });
+        let almost = RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
+
+        // 5 bytes up, then silence just short of the bound: still relaying.
+        client_far.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        up_far.read_exact(&mut buf).await.unwrap();
+        tokio::time::advance(almost).await;
+        assert!(
+            !relay_task.is_finished(),
+            "a byte {almost:?} ago keeps the relay alive"
+        );
+
+        // 7 bytes down restart the clock: the relay survives a second near-bound
+        // silence, now well past one bound of total wall time.
+        up_far.write_all(b"goodbye").await.unwrap();
+        let mut buf = [0u8; 7];
+        client_far
+            .read_exact(&mut buf)
+            .await
+            .expect("the relay still forwards after the first silence");
+        assert_eq!(&buf, b"goodbye");
+        tokio::time::advance(almost).await;
+        assert!(
+            !relay_task.is_finished(),
+            "a byte in the other direction restarts the idle clock"
+        );
+        client_far.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        up_far
+            .read_exact(&mut buf)
+            .await
+            .expect("the relay still forwards after the second silence");
+
+        // Nothing moves past the bound: the relay shuts both halves and returns.
+        tokio::time::advance(RELAY_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let (counts, result) = tokio::time::timeout(Duration::from_secs(5), relay_task)
+            .await
+            .expect("the relay ends once the idle bound passes")
+            .unwrap();
+        assert_eq!(counts, RelayCounts { up: 9, down: 7 });
+        result.expect("an idle shutdown is a clean close, not an error");
+        // Both peers see EOF: both write halves were shut down.
+        assert_eq!(up_far.read(&mut [0u8; 1]).await.unwrap(), 0);
+        assert_eq!(client_far.read(&mut [0u8; 1]).await.unwrap(), 0);
+    }
+
+    /// Records the `authority` field of every event exactly as tracing hands it
+    /// to a formatter (the panel S4 check on `log_failed`).
+    #[derive(Default)]
+    struct AuthorityFields(Mutex<Vec<String>>);
+
+    impl tracing::Subscriber for AuthorityFields {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "authority" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Panel S4, second half: the one `debug` line a failed tunnel produces
+    /// carries the authority Debug-escaped, so a control byte that reached an
+    /// `Authority` by any path (`Authority::new` does not validate) cannot
+    /// reach a terminal raw.
+    #[test]
+    fn log_failed_debug_escapes_the_authority() {
+        let fields = Arc::new(AuthorityFields::default());
+        tracing::subscriber::with_default(fields.clone(), || {
+            log_failed(
+                &Authority::new("\x1b[2Jevil.example", 443),
+                Some(TunnelReason::ProtocolError),
+            );
+        });
+        let recorded = fields.0.lock().unwrap().clone();
+        // Quoted and `\u{1b}`-escaped as `str`'s Debug prints it (the host is
+        // lowercased by `Authority::new`, hence `2j`).
+        assert_eq!(recorded, vec![r#""\u{1b}[2jevil.example:443""#.to_string()]);
+        assert!(
+            !recorded[0].contains('\x1b'),
+            "no raw escape byte in the log field: {recorded:?}"
+        );
     }
 
     /// An `io::Error` of `kind`, wrapped in an `anyhow` context the way the HTTP

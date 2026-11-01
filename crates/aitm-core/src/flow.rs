@@ -249,6 +249,15 @@ pub enum TunnelMode {
 }
 
 impl TunnelMode {
+    /// Every variant, in wire-code order: the one list a surface enumerates or
+    /// reverses labels through ([`Self::from_label`]). `flow_model.rs` pins its
+    /// length to the variant count, so it cannot silently fall behind the enum.
+    pub const ALL: [TunnelMode; 3] = [
+        TunnelMode::Decrypted,
+        TunnelMode::Passthrough,
+        TunnelMode::Failed,
+    ];
+
     /// The wire code every surface emits as `tunnel` (spec D7).
     pub fn label(&self) -> &'static str {
         match self {
@@ -256,6 +265,13 @@ impl TunnelMode {
             TunnelMode::Passthrough => "passthrough",
             TunnelMode::Failed => "failed",
         }
+    }
+
+    /// The inverse of [`Self::label`]: the mode whose wire code is exactly
+    /// `label` (no case folding); `None` for a code this build does not know (a
+    /// newer writer, a hand-edited file).
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.label() == label)
     }
 }
 
@@ -284,6 +300,21 @@ pub enum TunnelReason {
 }
 
 impl TunnelReason {
+    /// Every variant, in wire-code order (the two passthrough reasons, then the
+    /// six failure codes of spec D5): the one list a surface enumerates or
+    /// reverses labels through ([`Self::from_label`]). `flow_model.rs` pins its
+    /// length to the variant count.
+    pub const ALL: [TunnelReason; 8] = [
+        TunnelReason::OutOfScope,
+        TunnelReason::Pinned,
+        TunnelReason::ClientRejectedCertificate,
+        TunnelReason::ClientClosed,
+        TunnelReason::ClientTlsError,
+        TunnelReason::UpstreamUnreachable,
+        TunnelReason::UpstreamTlsFailed,
+        TunnelReason::ProtocolError,
+    ];
+
     /// The wire code every surface emits as `tunnel_reason` (spec D7).
     pub fn label(&self) -> &'static str {
         match self {
@@ -296,6 +327,12 @@ impl TunnelReason {
             TunnelReason::UpstreamTlsFailed => "upstream_tls_failed",
             TunnelReason::ProtocolError => "protocol_error",
         }
+    }
+
+    /// The inverse of [`Self::label`]: the reason whose wire code is exactly
+    /// `label` (no case folding); `None` for a code this build does not know.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.label() == label)
     }
 }
 
@@ -345,15 +382,6 @@ impl TunnelInfo {
             bytes_up: None,
             bytes_down: None,
         }
-    }
-
-    /// The terminal rule of spec D5: a tunnel row is closed (or failed) iff the
-    /// row's `duration` is set, which the producer does exactly once, when the
-    /// tunnel closes or fails. The mode and the `200` acknowledgement an
-    /// established tunnel carries play no part; the store consults this for
-    /// `clear` and eviction.
-    pub fn is_closed(&self, meta_duration: Option<Duration>) -> bool {
-        meta_duration.is_some()
     }
 }
 
@@ -442,12 +470,30 @@ impl FlowMeta {
     pub fn duration_ms(&self) -> Option<i64> {
         self.duration.map(whole_ms)
     }
+
+    /// The terminal rule of spec D5 for a tunnel row: closed (or failed) iff this
+    /// *is* a tunnel row (`tunnel.is_some()`) and its `duration` is set, which
+    /// the producer does exactly once, when the tunnel closes or fails. The mode
+    /// and the `200` acknowledgement an established tunnel carries play no part;
+    /// the store consults this for `clear` and eviction. `false` for a flow that
+    /// is not a tunnel row, however finished.
+    pub fn tunnel_is_closed(&self) -> bool {
+        self.tunnel.is_some() && self.duration.is_some()
+    }
 }
 
 /// A duration as whole milliseconds (the fraction dropped), saturated at
 /// `i64::MAX` rather than wrapped or truncated.
 fn whole_ms(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// A byte count as the bus integer: `n` itself when it fits, else `i64::MAX` —
+/// saturated, never wrapped negative (the rule `duration_ms` follows). The one
+/// place `flow.get`, `flow.table`, `flow.detail` and the push summary convert a
+/// tunnel's `bytes_up` / `bytes_down`.
+pub fn saturating_i64(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 /// Lifecycle of interception for a single flow.

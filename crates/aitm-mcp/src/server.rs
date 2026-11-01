@@ -14,9 +14,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
-    AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink, BrowserDriver, Command,
-    CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend,
-    McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
+    saturating_i64, AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink,
+    BrowserDriver, Command, CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery,
+    FlowStore, Frontend, McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity,
+    SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::{broadcast, Notify};
@@ -2657,11 +2658,10 @@ fn flow_summary(flow: &Flow) -> JsonValue {
     // Per-host decryption keys (spec D7), the same five on both kinds: a WebSocket
     // is never a tunnel row, so its tunnel keys are null; `passive` is as stamped.
     let tunnel = flow.metadata().tunnel.as_ref();
-    let bytes = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
     let tunnel_mode = tunnel.map(|t| t.mode.label());
     let tunnel_reason = tunnel.and_then(|t| t.reason).map(|r| r.label());
-    let bytes_up = bytes(tunnel.and_then(|t| t.bytes_up));
-    let bytes_down = bytes(tunnel.and_then(|t| t.bytes_down));
+    let bytes_up = tunnel.and_then(|t| t.bytes_up).map(saturating_i64);
+    let bytes_down = tunnel.and_then(|t| t.bytes_down).map(saturating_i64);
     let passive = flow.metadata().passive;
     match flow {
         Flow::Http(f) => json!({

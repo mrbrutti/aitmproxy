@@ -67,7 +67,13 @@ impl Authority {
                 .map_err(|_| AuthorityError::InvalidPort(s.to_string()))?,
             None => default_port,
         };
-        if host.is_empty() || host.contains(['/', ' ', '\t', '\r', '\n', '\0']) {
+        // No delimiter, no space and no ASCII control byte (which includes the
+        // `\t\r\n\0` family): an authority is echoed into log and error text.
+        if host.is_empty()
+            || host
+                .chars()
+                .any(|c| c == '/' || c == ' ' || c.is_ascii_control())
+        {
             return Err(AuthorityError::InvalidHost(s.to_string()));
         }
         Ok(Self::new(&host, port))
@@ -182,6 +188,58 @@ mod tests {
         );
         assert!(Authority::parse_with_default("ex.test:x", 80).is_err());
         assert!(Authority::parse_with_default("", 80).is_err());
+    }
+
+    /// Panel S4: a CONNECT authority is echoed into log and error text, so no
+    /// ASCII control byte (a terminal escape, a bell, a DEL) may survive parsing —
+    /// not only the whitespace family rejected before. Valid shapes are unchanged.
+    #[test]
+    fn rejects_ascii_control_characters_in_the_host() {
+        assert_eq!(
+            Authority::parse_with_default("\x1b[2Jevil.example:443", 443),
+            Err(AuthorityError::InvalidHost(
+                "\x1b[2Jevil.example:443".into()
+            ))
+        );
+        for c in [
+            '\x01', '\x07', '\x08', '\x0b', '\x0c', '\x1b', '\x7f', '\0', '\r', '\n', '\t',
+        ] {
+            let s = format!("evil{c}example.test:443");
+            assert_eq!(
+                Authority::parse_with_default(&s, 443),
+                Err(AuthorityError::InvalidHost(s.clone())),
+                "{c:?} inside the host"
+            );
+            assert_eq!(
+                s.parse::<Authority>(),
+                Err(AuthorityError::InvalidHost(s.clone())),
+                "{c:?} inside the host (FromStr)"
+            );
+            let bracketed = format!("[::{c}1]:443");
+            assert_eq!(
+                Authority::parse_with_default(&bracketed, 443),
+                Err(AuthorityError::InvalidHost(bracketed.clone())),
+                "{c:?} inside an IPv6 literal"
+            );
+        }
+        // The valid shapes are unchanged.
+        assert_eq!(
+            Authority::parse_with_default("evil.example:443", 443).unwrap(),
+            Authority::new("evil.example", 443)
+        );
+        assert_eq!(
+            Authority::parse_with_default("[::1]:8443", 443).unwrap(),
+            Authority::new("::1", 8443)
+        );
+        assert_eq!(
+            Authority::parse_with_default("xn--bcher-kva.example", 443).unwrap(),
+            Authority::new("xn--bcher-kva.example", 443)
+        );
+        assert_eq!(
+            Authority::parse_with_default("  padded.example:80  ", 443).unwrap(),
+            Authority::new("padded.example", 80),
+            "surrounding whitespace is still trimmed, not rejected"
+        );
     }
 
     #[test]
