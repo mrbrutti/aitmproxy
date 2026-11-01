@@ -703,6 +703,8 @@ Kept by the main session during stage 6. One row per finding.
 | G-A+G-B | security | Important | G19 not landed | fix round H Rust (H20) |
 | G-A+G-B | security | Important | `JobStatus.lanes` unbounded in count at fold, joined per frame | fix round H Rust (H33) |
 | G-A+G-B | security | Minor | confirm prompt wrapped whole per frame; legacy error re-bounded per frame; Site map `cut` without `clean`; `scan.list` uncapped | fix round H Rust (H34, H35, H22, H36) |
+| 15 | live smoke | run 1 | real `aitm-tui` on the real bus against T1b's engine at abaf5264 (throwaway merge): 21 of 26 ok incl. UI-3 end to end (gate, `l4.scope.add` with `*`, overlay, `y` matched the harness, `n`), Jobs row for a real job, probes inside the bracket, phase change, no secret leak, clean exit | cell items H37-H39; two engine questions to the coordinator (zero issues from `standard`, zero `notifications/aitm/job` on a second subscriber) |
+| 15 | live smoke | finding | `scan.profile.get` failed to parse on this branch's older contract crate (T1b added `l4.fields`, `ScanProfile` is `deny_unknown_fields`) | resolved by building against T1b's model; the integration merge of main after T1b lands carries it |
 
 ## Shipped
 
