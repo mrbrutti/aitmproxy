@@ -2,6 +2,34 @@
 
 **Status:** approved. **Amendment 1 (Design 14, strict redaction on disk) approved 2026-10-31 by the orchestrating session at Matt's direction (relayed by the lead session: default-on confirmed; "NO tokens, secrets, or credential values EVER hit disk"). Its one existing-test change, the `tests/e2e/audit/test_audit_log.py` `X-Audit-Marker` assertion (AC59), is approved; so is the one-hunk relaxation of the `aitm-mcp` fence (the `server.rs` call-path hunk and the new `redact_args.rs`). Rule D's evidence cost (custom header values leave the audit copy) is flagged for Matt in the PR; the veto path is rule S alone (Open question 5).** Original approval: (2026-10-31, self-approved by the orchestrating session under Matt's autonomous-approve mode, per the lead session's brief; the Architect's calls listed at the end stand as written, with one orchestrator amendment: `crates/aitm/tests/shutdown.rs`, the one Rust test that spawns the real `aitm` binary, joins the hermeticity group in Files E and AC38 and is the single exception to AC41's "no existing test is edited", as a one-line environment addition. Default-on (call 1) is the decision flagged for Matt's veto in the PR.)
 
+**Amendments 2 and 3 are descriptive.** They record what shipped after the chain R fix rounds
+and the whole-branch panel, not new decisions of Matt's; the orchestrating session approved
+them under Matt's autonomous-approve mode after three panel rounds. The Status line stays
+approved.
+
+**Amendment 3 (whole-branch panel, 2026-11-01; folded in from the code at `e28a310e`, after the
+chain R fix rounds 5 and 6, the corpus tasks W14 and W15, and the writer-group and
+whole-branch panels).** The code is the truth again. Nothing Amendments 1 and 2 decided is
+reversed except where a sentence is marked superseded. What changed, in eight lines: (1) the
+redaction rounds **fail closed**: `scrub_strict` repeats a round up to `MAX_ROUNDS` = 8 and a
+text that never settles is replaced whole by `[redacted]`; `redact_value` replaces a value that
+no walk round confirms by `"<redacted>"`; (2) a line break written as a backslash and `n`, `r`
+or `t` glued to a header name or key stands for a real one; (3) the registry stores JSON forms
+at escaping depths 1 to 3 and the fragment mask makes room, so a capped field stays within its
+cap; (4) a wedged rotation holds the active file to twice its cap and counts the lines it
+refuses; (5) the `ca.audit_log` collision is checked on resolved files, rotated names included;
+(6) configuration and environment diagnostics print a kind or a reason, never a value; (7) the
+test seams and the public API were narrowed, the tail flush runs in `block_in_place` and
+AC37's test clock is 10 s; (8) the corpus now exists, so AC52, AC55 to AC57 and AC61 are met.
+Every paragraph it changes is marked `[Amended: Amendment 3, whole-branch panel]` and sits in
+place: Goals, Anti-goals, Constraints, Facts, Design 2, 4, 5, 7, 8, 9, 11, 13, 14.3 to 14.7,
+Semantics by surface, Rebase hazards, Residual risks (22 amended; 25 to 31 new), Files, AC1,
+AC2, AC4, AC25, AC37, AC44, AC47, AC52, AC55 to AC57, AC61, AC64, Left to the builder, Open
+questions, Summary and Architect's calls 29 to 36. Two corrections of Amendment 2 follow from
+it: its statement that a text or value that has not settled "is returned as the last round
+left it" is **superseded** by (1), and its "Fix 5 is not in `f9c1f5b4`" is now history (Fix 5
+is `ba742893`).
+
 **Amendment 2 (chain R fix rounds, 2026-11-01; folded in from the code at `f9c1f5b4`, after
 the panel's rounds on the redaction path).** The code is the truth: this amendment records what
 the redaction chain (`crates/aitm-core/src/redact_strict.rs`, `crates/aitm-mcp/src/redact_args.rs`)
@@ -81,7 +109,11 @@ the redaction hunk Design 14 names (Amendment 1).
 - A lost entry is never silent: it is counted (`agent.status.durable_audit`) and marked in the
   file (a `gap` line).
 - Disk use is bounded (at most 92 MiB with the defaults) and rotation never loses the line
-  being written.
+  being written. **[Amended: Amendment 3, whole-branch panel: the 92 MiB bound holds while
+  rotation works. While a rotation is wedged (it cannot rename or create) the active file is
+  held to twice its cap, and a line that would take it past that is refused, counted
+  `dropped` and recorded in the pending `gap` marker, never written (Design 8, AC25). "Never
+  loses the line being written" therefore holds up to that ceiling, not beyond it.]**
 - The file never contains a raw control character, or a label, reason or argument longer than
   the ring's own caps.
 - (Amendment 1) No token, secret or credential value ever reaches the file: the bus/operator
@@ -150,9 +182,26 @@ the redaction hunk Design 14 names (Amendment 1).
   plus at most `SETTLE_ROUNDS` = 3 further ones, and returns the last result the same way. "No
   counter-example is known" is a measured fact (the tabled inputs, `FUZZ_FOUND_SHAPES`, about 50
   million fuzz inputs), not a proof (Residual risks 22).
+  **[Amended: Amendment 3, whole-branch panel: the *Idempotence* sentence above is superseded
+  because it was false of the design's intent. A bounded loop is bypassable by an adversary who
+  chooses the layering unless hitting the bound fails closed, so: `scrub_strict` repeats its
+  round up to `MAX_ROUNDS` = 8 and a text that never settles is replaced whole by `[redacted]`
+  (`scrub_strict_bounded` follows); `redact_value` repeats its walk (the first plus at most
+  `SETTLE_ROUNDS` = 3 further) and a value that no round confirms is replaced whole by the string
+  `"<redacted>"`, which is itself a fixed point, so `redact_value` is exactly idempotent and the
+  text pass returns only fixed points. The price is an attacker-controlled string forced to
+  `[redacted]` (about 6 bytes of nesting per layer): it costs that string's evidence and nothing
+  else (Residual risks 31). "No counter-example is known" for an input that reaches the bound is
+  still a measured fact, no longer a safety property.]**
 - (Amendment 1) Masking a short configured token by raw substring (it would corrupt ordinary
   text), and any log line, `Debug` or `Display` output that contains a registered secret or
   its length.
+- **[Amended: Amendment 3, whole-branch panel]** A diagnostic that echoes a value. The
+  `mcp.audit_log` config error prints only the YAML kind of what it was given, and the
+  `AITM_AUDIT_LOG` warning only the reason it is not a setting, because a token pasted under
+  the wrong key or into the wrong variable must not reach a log (Design 2, AC1, AC2).
+- **[Amended: Amendment 3, whole-branch panel]** A rotation failure that lets the active file
+  grow without bound. Wedged, it is held to twice its cap (Design 8, AC25).
 - A comparison against the agent role by `==`, `!=`, `matches!` or `if let` anywhere in
   `crates/*/src` (`trust_gate_scan.rs`); roles are classified with `is_trusted_control()`.
 - Test runs of the binary (the e2e harness, `cargo test`) appending to the operator's real
@@ -183,6 +232,12 @@ the redaction hunk Design 14 names (Amendment 1).
   (`REASON_EXAMINE_BYTES`) before the text pass and capped to 1024 afterwards. The coders'
   measured worst adversarial case is 27 ms in a release build; that is a report, not an
   assertion (AC46 asserts deterministic bounds and a 20 s clock).
+  **[Amended: Amendment 3, whole-branch panel: `MAX_ROUNDS` is 8, not 6: each pass runs up
+  to eight rounds, and a text that has not settled by the eighth is replaced whole by
+  `[redacted]`, so the work is still bounded and the result is always a fixed point. The 27 ms
+  figure was reported before the change from 6 to 8 and has not been restated. The tail flush
+  in `main.rs` runs inside `tokio::task::block_in_place`, because it sleeps while the stream
+  threads drain and must say so to the multi-thread runtime (Design 7).]**
 - **Memory.** Three bounded queues (1024, 4096, 2048 entries). Every entry field is capped
   before the entry is queued (ring caps), so the queues add at most about 18 MiB worst case
   and typically under 4 MiB, on top of the ring's own bound.
@@ -239,12 +294,19 @@ added by Amendment 2 from the code at `f9c1f5b4`.
 | An existing test pins that the durable sink keeps entries an agent cannot read | `crates/aitm-mcp/tests/mcp.rs:5393-5425` |
 | README claims "every call lands in one audit log" and "One audit log of every command" | `README.md:43, 501`; config examples `README.md:187-194`, `INSTALL.md:44-56` |
 | Idle web UI polling is about 150 calls a minute, origin `mcp` | PR 171 spec, Intent (3) |
-| (Amendment 2) The strict text module is public API `scrub_strict`, `scrub_strict_bounded(text, max_bytes)`, `is_secret_key_strict`, `is_benign_header`; one round is the PEM pre-pass, the frames pre-pass, P1 (`scrub_text`), P2 to P6; `MAX_ROUNDS` is 6; `BENIGN_HEADERS` holds 42 names plus the prefixes `sec-fetch-` and `sec-ch-` | `crates/aitm-core/src/redact_strict.rs` at `f9c1f5b4`: `BENIGN_HEADERS` 75, `is_secret_key_strict` 138, `is_benign_header` 197, `scrub_strict` 288, `scrub_strict_bounded` 298, `MAX_ROUNDS` 313 |
-| (Amendment 2) The structural half is `redact_value` with `LEAF_EXAMINE_BYTES` 4096, `TOTAL_EXAMINE_BYTES` 64 KiB, `NAME_EXAMINE_BYTES` 256, `MAX_DEPTH` 64, `SETTLE_ROUNDS` 3, `OUTPUT_ROUNDS` 4, and `pub(crate) REASON_EXAMINE_BYTES` 8192; it is `pub` so the writer reuses it | `crates/aitm-mcp/src/redact_args.rs:118-178` at `f9c1f5b4` |
-| (Amendment 2) The call-path hunk in `record_audit` is `AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)))` (rustfmt wraps it to four lines); `bound_text` is private to `redact_args.rs` | `crates/aitm-mcp/src/server.rs:1966-1969` at `f9c1f5b4` |
-| (Amendment 2) The writer is split: `audit_log.rs` (streams, preflight, queues, rotation, `start`, `AuditLogHandle`, `bridge_token`, `SHUTDOWN_BUDGET` 2 s) and three submodules, `pipeline` (field pipeline, `FIELD_BOUND_BYTES` 64 KiB, `MAX_COMMAND_CHARS` 128, `MAX_CONNECTION_ID_BYTES` 64), `registry` (`SecretRegistry`, tiers 4 and 8 bytes, fragment minimum 6) and `jsonscan` (parse-first and the tolerant scan) | `crates/aitm/src/audit_log.rs:54-58`, `audit_log/pipeline.rs:46-52`, `audit_log/registry.rs:43-51`, `audit_log/jsonscan.rs` at `f9c1f5b4` |
-| (Amendment 2) `main.rs` calls `audit_log::start(&cfg, &audit_ring, web token, env pairs)` after the one-shot CLI branch and before any bind, mints the operator bridge token with `audit_log::bridge_token(audit.as_ref())`, and flushes with `handle.shutdown(audit_log::SHUTDOWN_BUDGET)` as the last statement before `result` | `crates/aitm/src/main.rs:563, 834, 920` at `f9c1f5b4` |
-| (Amendment 2) Branch history: chain R (`claude/durable-audit-redact`) was merged into the plan branch twice (`bfe4483e`, `a6c4f344`); `origin/main` (v0.5.8) was merged in once (`b3a2a8df`), and the merge-base with `origin/main` is `f2c9d70b` | `git log` at `f9c1f5b4` |
+| (Amendment 2) The strict text module is public API `scrub_strict`, `scrub_strict_bounded(text, max_bytes)`, `is_secret_key_strict`, `is_benign_header`; one round is the PEM pre-pass, the frames pre-pass, P1 (`scrub_text`), P2 to P6; `MAX_ROUNDS` is 6 **[Amended: Amendment 3, whole-branch panel: 8, and a text that no round settles is replaced whole by `[redacted]`]**; `BENIGN_HEADERS` holds 42 names plus the prefixes `sec-fetch-` and `sec-ch-` | `crates/aitm-core/src/redact_strict.rs` at `f9c1f5b4`: `BENIGN_HEADERS` 75, `is_secret_key_strict` 138, `is_benign_header` 197, `scrub_strict` 288, `scrub_strict_bounded` 298, `MAX_ROUNDS` 313 **[Amended: Amendment 3, whole-branch panel: at `e28a310e`: `BENIGN_HEADERS` 86, `is_secret_key_strict` 149, `is_benign_header` 208, `scrub_strict` 320, `scrub_strict_bounded` 332, `MAX_ROUNDS` 349]** |
+| (Amendment 2) The structural half is `redact_value` with `LEAF_EXAMINE_BYTES` 4096, `TOTAL_EXAMINE_BYTES` 64 KiB, `NAME_EXAMINE_BYTES` 256, `MAX_DEPTH` 64, `SETTLE_ROUNDS` 3, `OUTPUT_ROUNDS` 4, and `pub(crate) REASON_EXAMINE_BYTES` 8192; it is `pub` so the writer reuses it | `crates/aitm-mcp/src/redact_args.rs:118-178` at `f9c1f5b4` **[Amended: Amendment 3, whole-branch panel: `KEY_REDACTED` 119, `REASON_EXAMINE_BYTES` 149, `redact_value` 179 at `e28a310e`]** |
+| (Amendment 2) The call-path hunk in `record_audit` is `AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)))` (rustfmt wraps it to four lines); `bound_text` is private to `redact_args.rs` | `crates/aitm-mcp/src/server.rs:1966-1969` at `f9c1f5b4` (unchanged at `e28a310e`) |
+| (Amendment 2) The writer is split: `audit_log.rs` (streams, preflight, queues, rotation, `start`, `AuditLogHandle`, `bridge_token`, `SHUTDOWN_BUDGET` 2 s) and three submodules, `pipeline` (field pipeline, `FIELD_BOUND_BYTES` 64 KiB, `MAX_COMMAND_CHARS` 128, `MAX_CONNECTION_ID_BYTES` 64), `registry` (`SecretRegistry`, tiers 4 and 8 bytes, fragment minimum 6) and `jsonscan` (parse-first and the tolerant scan) | `crates/aitm/src/audit_log.rs:54-58`, `audit_log/pipeline.rs:46-52`, `audit_log/registry.rs:43-51`, `audit_log/jsonscan.rs` at `f9c1f5b4` **[Amended: Amendment 3, whole-branch panel: at `e28a310e` `SHUTDOWN_BUDGET` is `audit_log.rs:543`, the pipeline constants (`pipeline.rs:49-55`) are private, `registry.rs` holds `JSON_DEPTHS` 3 and `PERCENT_OF_JSON_DEPTHS` 2 (60, 65)]** |
+| (Amendment 2) `main.rs` calls `audit_log::start(&cfg, &audit_ring, web token, env pairs)` after the one-shot CLI branch and before any bind, mints the operator bridge token with `audit_log::bridge_token(audit.as_ref())`, and flushes with `handle.shutdown(audit_log::SHUTDOWN_BUDGET)` as the last statement before `result` | `crates/aitm/src/main.rs:563, 834, 920` at `f9c1f5b4` **[Amended: Amendment 3, whole-branch panel: the flush is `tokio::task::block_in_place(|| handle.shutdown(audit_log::SHUTDOWN_BUDGET))`, `main.rs:922` at `e28a310e`]** |
+| (Amendment 2) Branch history: chain R (`claude/durable-audit-redact`) was merged into the plan branch twice (`bfe4483e`, `a6c4f344`); `origin/main` (v0.5.8) was merged in once (`b3a2a8df`), and the merge-base with `origin/main` is `f2c9d70b` | `git log` at `f9c1f5b4` **[Amended: Amendment 3, whole-branch panel: still true at `e28a310e`; the orchestrator merges `origin/main` again before the PR, which this branch does not yet contain, so the merge-base is still `f2c9d70b` and the local `origin/main` ref has moved on (`1782353a`); re-measure then]** |
+| (Amendment 3) Fail closed: `converge` returns the literal `[redacted]` when no round within `MAX_ROUNDS` leaves its input as it was; `settle` returns `"<redacted>"` (`redacted()`) when no walk round within `SETTLE_ROUNDS` confirms the value; both results are fixed points | `crates/aitm-core/src/redact_strict.rs:349-369` (`MAX_ROUNDS` and `converge`), `crates/aitm-mcp/src/redact_args.rs` (`settle`) at `e28a310e` |
+| (Amendment 3) A wedged rotation: `write_through` returns `Placed::HeldBack` when `past_ceiling` says the active file would pass twice its cap while a rotation failure is outstanding; the line is counted `dropped` (`held_back`) and goes into the pending `gap`; the new `rotation_wedged` flag feeds `status().degraded` | `crates/aitm/src/audit_log.rs`: `rotation_wedged` 928, `Placed` 1060, `write_through` 1252, `past_ceiling` 1298, `held_back` 1415, `status` 1639 at `e28a310e` |
+| (Amendment 3) The CA-log collision compares resolved files: `ca_log_collision` canonicalises the longest existing ancestor with `.`/`..` removed (`resolved`) and compares the three active names and every rotated name `F.1` to `F.keep` | `crates/aitm/src/audit_log.rs:1921` (`ca_log_collision`), `:1945` (`resolved`) at `e28a310e` |
+| (Amendment 3) Diagnostics print a kind or a reason: the config error prints `yaml_kind(..)` (`null`, `a boolean`, `a number`, `a string`, `a list`, `a mapping`, `a tagged value`), or, for a string, `a string that is neither off nor an absolute path`; the env warning prints `why_not_a_setting(..)` (`empty`, `a relative path`, `not one of off/on/default or an absolute path`) | `crates/aitm/src/config_file.rs:623`, `crates/aitm/src/env.rs:82` at `e28a310e` |
+| (Amendment 3) Registry forms: raw, JSON-escaped at depths 1 to 3, percent-encoded (upper- and lower-case hex) of the raw secret and of its JSON forms at depths 1 and 2; tier judged on the raw secret; the fragment mask cuts the text before the fragment so the field fits its cap | `crates/aitm/src/audit_log/registry.rs:336` (`forms_of`), `audit_log/pipeline.rs:163` (`mask_fragment`) at `e28a310e` |
+| (Amendment 3) The test seams are narrowed: `start_at` is `#[doc(hidden)]` (`audit_log.rs:1807`), `AuditLogWriter` (1493) and `stream_for` (162) are private, the pipeline constants are private, `io_refusal` and `io_context` are free functions (297, 305), there is one registry (`AuditLogHandle::registry()` returns the writer's, 1731); the corpus has `FLUSH_TIMEOUT` and honours `AITM_CORPUS_SEED`; the binary test has `FAILED_BOOT_TIMEOUT` (10 s) | `crates/aitm/src/audit_log.rs`, `crates/aitm/tests/audit_log_redaction.rs:69, 218`, `crates/aitm/tests/audit_log_binary.rs:51` at `e28a310e` |
+| (Amendment 3) The corpus exists: `crates/aitm/tests/audit_log_redaction.rs` (3587 lines, 10 tests) makes over 300 audited calls (105 in corpus A, 313 after corpus B, as the commit messages report) through a real server, the ring and the real writer with a small cap so the files rotate | `crates/aitm/tests/audit_log_redaction.rs` at `e28a310e` (`ed249691`, `1231f845`) |
 
 ## Design
 
@@ -269,6 +331,15 @@ from the ring it already holds.
 | an absolute path string | `Path(p)`: the control stream file is `p` (Design 5 names the other two) |
 | anything else (a relative path, `~/x`, an empty string) | a config error naming `mcp.audit_log` and "absolute" |
 
+**[Amended: Amendment 3, whole-branch panel: diagnostics never echo a value.]** The error does
+not print what it was given, only its kind, because a token pasted under the wrong key must
+not reach a log. As built it reads `mcp.audit_log must be true, false, off, or an absolute path;
+got <kind>`, where `<kind>` is `a string that is neither off nor an absolute path` for any
+string (a relative path, `~/x`, an empty string, a bare word), and for another YAML value
+`null`, `a boolean`, `a number`, `a string`, `a list`, `a mapping` or `a tagged value`
+(`yaml_kind` in `config_file.rs`). The error still contains `mcp.audit_log` and `absolute`
+(AC1).
+
 `AuditLogSetting { Default, Off, Path(PathBuf) }` lives in `aitm-core::config` beside
 `McpConfig` (a new field `audit_log`, default `Default`), with `resolved_path(&self) ->
 Option<PathBuf>`. `McpFile` gains `audit_log: Option<..>` (its `deny_unknown_fields` still
@@ -280,13 +351,27 @@ over the file:
 selects `Path`. Any other value (a relative path, a typo, empty) **leaves the file's setting
 alone** and logs one `warn!`, unlike the `is_truthy` rule (where "anything else is false"):
 for an audit control the fail-safe direction is "stay on", so a typo in `AITM_AUDIT_LOG=ofd`
-cannot silently disable the trail. `env::apply` stays infallible.
+cannot silently disable the trail. `env::apply` stays infallible. **[Amended: Amendment 3,
+whole-branch panel: the warning does not print the value either. It reads `AITM_AUDIT_LOG is
+<reason>; the audit log setting is unchanged`, where `<reason>` is `empty`, `a relative path`
+(the value has a `/` or `\`, so it was meant for a directory) or `not one of off/on/default or
+an absolute path` (`why_not_a_setting` in `env.rs`); a token pasted into the wrong variable
+must not reach a log (AC2).]**
 
 **Relationship to `ca.audit_log`.** Independent keys, independent files, independent shapes.
 The CA log is fail-closed per `ca.*` command, never rewritten, never rotated, eight keys. The
 general audit is best-effort, rotated, seven keys. They must not share a file: a boot-time
 check fails (with `ca.audit_log` in the message) when any of the three stream paths equals
-`ca.audit_log`. The "one format" sentence in the doc comments is wrong and is corrected
+`ca.audit_log`. **[Amended: Amendment 3, whole-branch panel: the check is on resolved files, not
+spelled paths, and covers the rotated names. `ca_log_collision` canonicalises the longest
+existing ancestor of each path (`.` and `..` removed, a link to a directory followed, the part
+that does not exist appended) and compares the CA log against the three active names and
+every rotated name a stream writes, `F.1` to `F.keep` (4 for control, 5 for agent, 2 for
+reads). `<d>/sub/../audit.jsonl`, `<d>/link-to-d/audit.jsonl` and `audit.agent.jsonl.5` all
+collide; `audit.jsonl.5`, `audit.agent.jsonl.6` and `audit.reads.jsonl.3`, just past what a
+stream keeps, do not. The error names `ca.audit_log`, the stream and the stream file it would
+write (or rotate to), and the CA log's path as written; nothing is created; and the check
+runs first in `start_core` under both boot policies (AC4).]** The "one format" sentence in the doc comments is wrong and is corrected
 (Design 13): the CA's `ca.*` calls appear in the general audit as ordinary entries (who called
 what, outcome) and in the CA log as the CA's own detail; neither is a subset of the other.
 
@@ -373,7 +458,10 @@ names the path and the reason, `agent.status.durable_audit` reports `enabled: tr
 true`, and each entry is counted as a write failure until the path becomes usable (the writer
 retries opening at most once a second, Design 9). `Off` creates nothing. **[Amended: Amendment
 2, chain R fix rounds: one `warn!` per failed stream; the explicit-path error names the path and
-the reason and ends `; fix mcp.audit_log (or AITM_AUDIT_LOG) or set it to off`.]**
+the reason and ends `; fix mcp.audit_log (or AITM_AUDIT_LOG) or set it to off`.]** **[Amended:
+Amendment 3, whole-branch panel: before any stream is opened, under both policies, `start_core`
+refuses a configuration in which a stream file, or a rotated name of one, is the CA audit log
+through any spelling (Design 2, AC4); the check is not a preflight step and creates nothing.]**
 
 **Alternatives rejected.** *Always fail the boot*: breaks read-only containers on upgrade.
 *Always degrade*: an explicit trail that quietly is not there. *`chmod` the parent directory*:
@@ -413,7 +501,9 @@ sends, because it cannot produce an operator-origin entry and the origin is serv
 fifty thousand entries. The agent stream's 48 MiB is on the order of 135 thousand entries (an
 agent fuzzing at 20 requests a second fills it in about two hours; Residual risks 3). Reads'
 24 MiB is about nine hours of one idle web UI. The total is at most 92 MiB on disk. These are
-constants in `audit_log.rs`, not config (Non-goals).
+constants in `audit_log.rs`, not config (Non-goals). **[Amended: Amendment 3, whole-branch panel:
+"at most 92 MiB" holds while rotation works; a wedged rotation holds each active file to twice
+its cap instead (Design 8).]**
 
 **Alternatives rejected.** *One file, all entries*: polling erases evidence within a day.
 *One file, evidence only*: loses the read trail the PR 171 spec called out (Residual risks 3)
@@ -515,7 +605,11 @@ the three streams and sets `degraded` when any stream's writer has died (a write
 through a normal `Close` is closed, not degraded) or its most recent write attempt failed
 (cleared by the next success). It is read through
 `AuditRing::durable_status()` by `agent.status` (Design 11): the counter lives beside what
-`agent.status` already reads, so no new handle is plumbed to `AgentPlugin`.
+`agent.status` already reads, so no new handle is plumbed to `AgentPlugin`. **[Amended:
+Amendment 3, whole-branch panel: `degraded` is also true while a stream's rotation is wedged (a
+new `rotation_wedged` flag, set when a rotation fails and cleared by a successful rotation or by
+opening a fresh file); a failed rotation is still not a write failure, and the lines a wedged
+stream refuses are counted in `dropped`, not in `write_failures` (Design 8).]**
 
 **Shutdown.** `AuditLogWriter::shutdown(budget) -> ShutdownReport` sends a `Close` message to
 each stream (retrying `try_send` until the budget ends, never a blocking `send`), each writer
@@ -525,7 +619,10 @@ ends first (a blocked writer) it returns with `complete: false` and an estimate 
 left, and the process exits regardless: shutdown never hangs. `main.rs` calls it with a 2 s
 budget in the shared tail, after the browser is reaped, in every non-CLI mode; the `select!` has
 ended by then, so blocking that task is harmless. A `warn!` is logged only if the flush was
-incomplete. SIGKILL and a crash lose what was queued (at most the queue bounds) and may leave a
+incomplete. **[Amended: Amendment 3, whole-branch panel: the call is made inside
+`tokio::task::block_in_place`, because shutdown sleeps while the stream threads drain and says
+so to the multi-thread runtime rather than blocking inside the async function unannounced;
+`SHUTDOWN_BUDGET` is still 2 s.]** SIGKILL and a crash lose what was queued (at most the queue bounds) and may leave a
 torn last line, which the next boot repairs (Design 4 step 5).
 
 **Alternatives rejected.** *One writer thread and one queue*: a stalled disk or an agent flood
@@ -557,7 +654,17 @@ throttle the drain into drops for no durability a crash does not already take.
 - *At the cap, when rotation fails* (a rename or create error): the line is written to the
   still-open file, which then exceeds `M` (the cap is soft only while rotation is failing),
   the failure is logged under the Design 9 throttle, and rotation is retried at most once a
-  minute. The line is never dropped for being at the cap.
+  minute. The line is never dropped for being at the cap. **[Amended: Amendment 3,
+  whole-branch panel: the last sentence is superseded; the cap is soft only up to a ceiling.
+  While a rotation failure is outstanding a line is refused when `size + incoming` would pass
+  `2 * M` (`past_ceiling`; an empty file takes whatever comes, so a line larger than the
+  ceiling is not stuck): it is never written, it is counted `dropped`, and its `at` goes into the
+  pending `gap` marker, which stays pending until a write succeeds, so the hole is in the file
+  once the wedge clears. A new `rotation_wedged` flag turns `status().degraded` on; a
+  successful rotation, or opening a fresh file, clears it, and the file that was held at its
+  ceiling is kept whole as `F.1`. No line is lost up to twice the cap; beyond that a refused
+  line is lost and counted (Residual risks 25). While rotation works the bound of Design 5
+  holds; while it is wedged the bound per stream is twice its cap plus its rotated files.]**
 - *Re-check:* at most every 5 s, and at every rotation, the writer compares the path with the
   open handle (`symlink_metadata`, `(dev, ino)`). If the path is gone or names another file
   (the operator removed it, an external `logrotate` renamed it) it reopens through the
@@ -587,7 +694,12 @@ clears `degraded`, and logs one `info!`. Failures are logged at `warn!` target `
 once, then at most once a minute with the count since the last line, naming the path and the
 error kind. A command is never told, refused or delayed. The ring and the push still have the
 entry. **[Amended: Amendment 2, chain R fix rounds: the warning carries the error's own text (an
-`io::Error` display, the `error` field), never a field of an entry.]**
+`io::Error` display, the `error` field), never a field of an entry.]** **[Amended: Amendment 3,
+whole-branch panel: a failed rotation is not a write failure. The entry is written to the file
+that is still open (up to the ceiling of Design 8); past the ceiling it is refused and counted
+`dropped`, never `write_failures`, and `degraded` stays on for as long as the rotation is
+wedged. A clean `degraded` therefore means no stream is dead, no latest write failed and no
+rotation is wedged.]**
 
 ### 10. Wiring into every server (Q8) (Architect's call)
 
@@ -636,7 +748,7 @@ arrive on the shared-ring servers. Named follow-up "audit the TUI-facing operato
 | Key | Type | Shown to |
 |---|---|---|
 | `enabled` | bool | every role: a sink is attached |
-| `degraded` | bool | every role: any stream's writer stopped or its last write failed |
+| `degraded` | bool | every role: any stream's writer stopped or its last write failed **[Amended: Amendment 3, whole-branch panel: or its rotation is wedged]** |
 | `dropped` | int | trusted control only |
 | `write_failures` | int | trusted control only |
 
@@ -683,8 +795,12 @@ host filesystem (anti-goal), so any later reader is a CLI-only verb dispatched l
   recorded). Make `README.md:43` and `501` precise instead of absolute. (Amendment 1) It also
   states what is never written (tokens, auth and cookie headers and their values, credential
   shapes), that header values other than a short benign list show as `<redacted>` while the
-  names stay, and what cannot be caught (Design 14.8).
-- `INSTALL.md`: a five-line "Audit log" note after the config example (`INSTALL.md:44-56`)
+  names stay, and what cannot be caught (Design 14.8). **[Amended: Amendment 3, whole-branch
+  panel: after the panel the README also says that the 92 MiB bound holds while rotation works
+  and what a wedged rotation does, the session-export exception (Residual risks 26), that `origin`
+  may be `cli`, valid `jq` for the markers and for a torn line, and that custom header values
+  are absent from the ring, `agent.activity` and the push as well as from the files.]**
+- `INSTALL.md`: a five-line "Audit log" note after the config example (`INSTALL.md:44-56`) **[Amended: Amendment 3, whole-branch panel: as built it is a `## Audit log` section of 7 text lines (accepted, not trimmed) that also points to the README's section]**
   saying where the files are and how to turn them off.
 - `crates/aitm-tui/README.md` mentions `operator_token` only for connection and needs no
   change.
@@ -881,6 +997,56 @@ and `is_benign_header`. `server.rs` calls `scrub_strict_bounded` for the reason,
 it on the first element of a header array. The additions below are in the order a round runs
 them.
 
+**[Amended: Amendment 3, whole-branch panel] Fail closed, and `MAX_ROUNDS` is 8 (supersedes the
+paragraph above where it says `MAX_ROUNDS` = 6 and that an unsettled text "is returned as the
+last round left it").** `scrub_strict` repeats the round until its output equals its input, at
+most `MAX_ROUNDS` = 8 times; the call that shows a text settled counts, so a text that needs
+eight calls, the last of them changing nothing, still settles. A text that no round within the
+cap settles is **replaced whole by `[redacted]`**, never returned as the last round left it,
+and `scrub_strict_bounded` follows (it cuts first and then calls `scrub_strict`; its result is
+not bounded in length, because a mask can make a value longer, so a caller that needs a length
+cap cuts the result itself, as the audit reason does). Why: a bounded loop is bypassable by an
+adversary who chooses the layering (each `"D "c ` segment of the `layered` shape in the tests
+costs two rounds) unless hitting the bound fails closed; the last round's output may still
+hold what a later round would mask. Every result of `scrub_strict` is therefore a fixed point
+(a second call over it changes nothing). The shapes a fuzz run found that need more than two
+rounds (`FUZZ_FOUND_SHAPES`; one of them needs seven calls) settle well inside the cap with
+their masks intact (`a_shape_that_needed_seven_rounds_is_masked_not_replaced`). The price is
+that a string an attacker controls can be forced to `[redacted]` (about 6 bytes of layering per
+round): it costs that string's evidence and nothing else (Residual risks 31). The tests are
+`a_text_that_never_settles_is_replaced_whole_after_max_rounds`,
+`a_text_that_settles_on_the_last_allowed_round_is_kept`,
+`a_shape_that_needs_seven_calls_settles_within_the_cap` and
+`the_replacement_is_itself_a_fixed_point` (in `redact_strict.rs`), and
+`a_text_that_does_not_settle_is_replaced_whole` (in `crates/aitm-core/tests/redact_strict.rs`).
+
+**[Amended: Amendment 3, whole-branch panel] Glued escapes (fixes Y, Y2 and Y3).** A raw
+request kept inside a string reaches the pass with its line breaks written as a backslash and
+`n`, `r` or `t` (any number of backslashes), and the letter is glued to the next word. So a
+backslash run followed by a lowercase `n`, `r` or `t` immediately before a header name or a key
+run counts as a line boundary: the name starts after the letter and is at the start of a line.
+It is read in P2, the frames pre-pass (Debug wrappers, escaped quotes, groups, XML, multipart,
+CLI flags and curl), P6 and the bracket-notation keys. `GET / HTTP/1.1\nCookie: a=b; z=C` is
+masked to the end of **its line**, and here "line" ends at the next real CR or LF or the end of
+the text, so escaped breaks and the headers after them are swallowed and no tail of a value is
+left (`\nCookie: [redacted]`); `\npw=abc&x=1` is masked (`scrub_text` saw the run `npw`, so P6
+reads the key from the letter on and judges it by the whole vocabulary, `sid`, `jwt`, `csrf`,
+`session` and `auth` included). The same rule at the left boundary of P5's credential shapes is
+fix Y3 (committed, `e28a310e`): a token on a line of its own after an escaped break
+(`x\nghp_...`; `ghp_`, `AKIA`, a JWT or JWE, `sk-`, `xox`, `glpat-`, `AIza`) is masked, because the
+escape letter is alphanumeric and used to count as the middle of a word. P2, P6 and P5 share one
+definition of the escape letter (`is_escape_letter`: a lowercase `n`, `r` or `t` with a backslash
+right before it); `nghp_...` with no backslash is still a word that ends in `n` and is not a
+boundary. Over-redaction accepted: `C:\temp\npw=abc` is masked (a Windows
+path reads as an escaped break). Residual: the spellings `\u000a`, `\x0a` and `%0a` are not
+read (Residual risks 30). The tests are `a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line`
+and `a_pair_after_an_escaped_line_break_is_masked_whatever_its_key`, and, in `redact_strict.rs`,
+`a_line_escape_glued_to_a_name_run_is_a_backslash_and_n_r_or_t`,
+`a_key_run_starts_after_a_glued_escape_letter`,
+`the_letter_of_an_escaped_break_is_n_r_or_t_after_a_backslash` and
+`every_entry_of_the_shape_table_is_found_after_an_escaped_break`, and, in
+`crates/aitm-core/tests/redact_strict.rs`, `a_credential_shape_after_an_escaped_line_break_is_masked`.
+
 - **P2 header lines.** The name `authorization`, `proxy-authorization`, `cookie`, `cookie2` or
   `set-cookie` (case-insensitive, preceded by a start or a character that is not an ASCII
   alphanumeric, `_`, `.` or `-`) followed by optional blanks and `:` masks the **rest of the
@@ -968,7 +1134,7 @@ them.
   and the password of a `user:password` flag (`-u`, `-U`, `--user`, `--proxy-user`): the next
   word is masked after its first `:`, the closing quote kept, and a word with no colon, or
   nothing after it, is untouched.
-- **Fix 5 (the answer to security round 3; not in `f9c1f5b4`, check the committed code).**
+- **Fix 5 (the answer to security round 3; committed as `ba742893`, after `f9c1f5b4`) [Amended: Amendment 3, whole-branch panel: it was "not in `f9c1f5b4`" when Amendment 2 was written].**
   (i) For every strict-secret key (shared vocabulary, extras, camelCase, bracket keys) an
   **unquoted** value continues across a quote that is followed by a non-delimiter character
   (`password=O'Brien&remember=1` masks `O'Brien`); a quote followed by whitespace, `&`, `;`, `,`,
@@ -1027,7 +1193,21 @@ framing, `Bearer` prefix or header name. Replacement is `[redacted]`.
 (the way `serde_json` writes it inside a string), its percent-encoded form (unreserved
 characters kept, the rest as `%XX` in upper case, and in lower case when that differs), and all
 are masked longest first. A secret that is a substring of the mask literals (`redacted`) is
-ignored, so masking is idempotent.
+ignored, so masking is idempotent. **[Amended: Amendment 3, whole-branch panel: the forms are
+more than the first text says. A registered secret is stored (`forms_of`) as: the raw secret;
+its JSON-escaped form at depth 1, 2 and 3 (`JSON_DEPTHS` = 3; each depth escapes the one
+before, so depth 2 is what a document that holds the secret becomes inside the string of
+another document); and the percent-encoded form, in upper-case and lower-case hex, of the raw
+secret and of its JSON forms at depth 1 and 2 (`PERCENT_OF_JSON_DEPTHS` = 2), which is "a
+document in a URL or a form". JSON-escaping a percent form is the identity (a percent form has
+no quote, backslash or control character left), so it needs no form of its own. Every form is
+stored once. The tier is judged on the raw secret's byte length, never
+on a form's, so a short secret with a longer escaped form stays a whole-token secret
+(`a_short_secret_is_masked_at_every_depth_as_a_whole_token`). `Debug` still prints only a
+count, and the number of forms changes neither the count nor any log line
+(`many_forms_change_neither_the_count_nor_the_log`). Not stored, and so a residual (Residual
+risks 27): a fourth JSON level, a double percent encoding, PHP's `\/` and Python's `\uXXXX`
+spellings of a character.]**
 
 **Minimum length (decided).** A secret of 8 or more bytes is masked as a substring anywhere. One
 of 4 to 7 bytes is masked **only as a whole token**: bounded on both sides by a character that is
@@ -1060,6 +1240,16 @@ therefore sets one trailing `…` aside, tests what remains, masks the fragment,
 back (`see CUT12SECRE…` becomes `see [redacted]…`); a fragment of 5 bytes or fewer is not masked,
 the documented residual. The same marker is set aside by the args scan (14.5), where the
 letter of the pass would otherwise make a `…` outside every string literal fatal to the scan.
+**[Amended: Amendment 3, whole-branch panel: the fragment mask makes room. The mask is 10 bytes
+(`[redacted]`) and a fragment is 6 or more, so masking a fragment at the end of a field that the
+cap already filled can leave the field up to four bytes past its cap, and a second pass over it
+would cut it again (not a fixed point). So the mask is applied after the cap and then the text
+before the fragment gives way, a character at a time and never the mask, until the field is
+as its cap leaves it; a field that is cut this way ends with the `…` marker when its cap marks
+cuts, as the producer's cut would have, and in JSON text the cut never ends inside an escape
+(no lone backslash is left, an escaped backslash before the cut is kept). A field therefore
+never ends past its cap and a second pass over it changes nothing. Design 14.5's step order
+("mask after the cap") is unchanged; its guarantee is what is new.]**
 
 **Alternatives rejected.** *No registry* (rely on `Bearer`/`token=`/`Authorization` framing): a
 token echoed under an innocuous key, in `#t=<token>` or in a URL path is not framed, and these
@@ -1093,6 +1283,15 @@ For each entry, on the writer thread, in this order:
 6. **Render** with `entry_to_jsonl`.
 
 For an entry `record_audit` produced, steps 2 to 5 are the identity (AC17, AC47).
+
+**[Amended: Amendment 3, whole-branch panel]** Two clarifications of the steps above, as built.
+(a) Step 3 is the registry mask over every stored form (14.4, depths 1 to 3); the trailing-fragment
+mask belongs to the end of step 5, not step 3, and it makes room: the text before the fragment
+gives way until the field fits its cap, so a field never ends past its cap and a second pass is
+the identity (14.4). (b) The `scrub_strict` of step 2 fails closed (14.3): a field whose text no
+round settles is written as `[redacted]`; and the `args` path inherits `redact_value`'s fail-closed
+settle (14.6). Neither can fire on an entry `record_audit` produced, which has already been through
+the same functions.
 
 **[Amended: Amendment 2, chain R fix rounds] As built (`audit_log/pipeline.rs`, `jsonscan.rs`,
 `registry.rs`).**
@@ -1146,7 +1345,11 @@ iteration order, which is deterministic, so the same arguments always give the s
   *shown* as is held to the same bound: a mask can lengthen text (`token=x ` becomes
   `token=[redacted] `), so a result that does not fit is cut like an input and passed again, up to
   `OUTPUT_ROUNDS` = 4 more times, and if it still does not fit it is cut for good (a text that
-  does not settle is returned as the last round left it).
+  does not settle is returned as the last round left it). **[Amended: Amendment 3, whole-branch
+  panel: the parenthesis is superseded. A text that is cut for good may read differently under a
+  further pass, and `redact_value`'s settle then finds that the value does not settle and
+  replaces it whole (next bullet); the strict text pass itself, inside each bounded pass,
+  fails closed after `MAX_ROUNDS` = 8 rounds (14.3).]**
 - *Depth.* A container nested deeper than `MAX_DEPTH` = 64 (the top value is level 1) becomes the
   string `"<redacted>"`, so hostile nesting cannot exhaust the stack; siblings do not use up the
   depth.
@@ -1154,6 +1357,14 @@ iteration order, which is deterministic, so the same arguments always give the s
   first walk and at most `SETTLE_ROUNDS` = 3 more, each with the budgets of a fresh call. A colon
   a mask removes changes how a header array reads on the next walk, which is why. A value that
   does not settle is returned as the last round left it; no input is known to reach that.
+  **[Amended: Amendment 3, whole-branch panel: the last sentence is superseded. A value that no
+  round confirms fails closed: it is replaced whole by the string `"<redacted>"` (the literal a
+  secret-named key produces, and itself a fixed point), because input built to keep changing
+  must not leave its last round, whatever it holds, in the entry. `redact_value` is therefore
+  exactly idempotent (`redact_value(&redact_value(v)) == redact_value(v)`, with no exception).
+  No input is known to reach the replacement; the test that pins it is
+  `settle_stops_at_a_fixed_point_or_fails_closed_after_three_rounds` (renamed from
+  `settle_stops_at_a_fixed_point_or_after_three_rounds`).]**
 - *The reason* is a separate, smaller bound: the call path scrubs only its first
   `REASON_EXAMINE_BYTES` = 8192 bytes (`scrub_strict_bounded`), and `cap_reason` then keeps 1024
   bytes of the result and appends `…` only when it cut. A text that fits is not cut. A secret frame that starts early and runs
@@ -1190,6 +1401,45 @@ tests in `audit_log.rs` and its three submodules, `crates/aitm/tests/audit_log_w
 (`crates/aitm/tests/audit_log_redaction.rs`, AC52, AC55 to AC57, AC61), is not yet in the
 branch**: its tasks (W14, W15) have not landed, so those five ACs are not yet true.
 
+**[Amended: Amendment 3, whole-branch panel] State of the layers at `e28a310e` (supersedes the
+paragraph above, whose "not yet in the branch" is now false).** All four layers exist. Counts are
+`#[test]` lines and file lengths at that commit. *Unit:* `crates/aitm-core/tests/redact_strict.rs`
+(28 tests, 2174 lines) and 11 in-module tests of `redact_strict.rs` (2186 lines). *Source:*
+`crates/aitm-mcp/tests/audit_redaction.rs` (12 tests, 888 lines) and 46 in-module tests of
+`redact_args.rs` (3002 lines). *Writer:* `audit_log.rs` (7776 lines, its test module from line
+2048, 100 tests), `audit_log/pipeline.rs` (1296 lines, 18 tests), `audit_log/registry.rs` (1233
+lines, 19 tests), `audit_log/jsonscan.rs` (1122 lines, 14 tests), and the integration files
+`audit_log_config.rs` (605 lines, 6 tests), `audit_log_wiring.rs` (675, 5), `audit_log_binary.rs`
+(889, 4), `durable_audit_hook.rs` (172, 2) and `agent_status_durable.rs` (383, 3). *Corpus:*
+`crates/aitm/tests/audit_log_redaction.rs` (3587 lines, 10 tests) makes over 300 audited calls
+(105 in corpus A and 313 once corpus B is in, as the commit messages report) through a real
+`McpServer`, the ring and the writer started with the production `start_tuned`, with a small cap so
+the agent file rotates, and reads every `audit*` file, rotated ones included. Its rows are the
+spec's R1 to R74, then from R75 extra rows for the amended rules (bracket-notation keys,
+apostrophes in userinfo and in unquoted values, camelCase keys, bracketed values under a secret
+key, Rust `Debug` wrappers, an error reason echoing a shape, the header shapes of rule D), and from
+R100 generated rows (every P5 shape in four positions, every registered secret in every position a
+secret can sit). Two kinds of row differ in what the source can know: a *canary* row carries a value
+a source pass recognises, so the ring entry, the push and the file are all clean; a *secret* row
+carries a value only the writer's registry knows (a token under an innocuous key, in a `#t=`
+fragment, in a label, cut in half by the cap), so the ring still holds it, by design (the registry
+is for the disk), and the test asserts that, so a row cannot pass because a source pass took the
+value out first. The seed is one per process, printed in every failure message, and
+`AITM_CORPUS_SEED` repeats a run (`the_seed_repeats_the_run_and_every_failure_says_how`). The
+tests are `no_canary_reaches_any_file_through_the_real_path` (AC55),
+`benign_values_survive_the_real_path_byte_for_byte` (AC56),
+`every_line_is_valid_json_with_the_same_shape` (AC57),
+`corpus_args_are_idempotent_under_redact_value` (the corpus half of AC47),
+`a_built_poc_passes_through_the_audit_clean` (AC61),
+`start_registers_every_configured_source` (AC52), `print_the_seed`,
+`the_seed_repeats_the_run_and_every_failure_says_how`,
+`a_masked_short_fragment_keeps_args_within_the_cap` and
+`a_registered_secret_with_a_quote_is_masked_inside_json_text_in_a_string`. **What the corpus
+proves and what it does not:** a real server call produces an entry that the source has already made
+clean, so the writer's own passes are a no-op on rows R1 to R39; only the hand-built row R25 reaches
+them. Skipping the writer's `scrub_strict` therefore does not turn rows R1 to R39 red, and the
+writer's own passes are proved by the unit and writer tests of layers 1 to 3 and by R25.
+
 #### 14.8 What "airtight" means, and what no rule catches
 
 Covered by a structural or literal rule: every configured token and every environment secret
@@ -1204,7 +1454,7 @@ body); a secret carried in a non-string under an innocuous key; a secret split b
 `args` cap where the first half is all that remains (the source masks before it cuts, so a
 fragment is what is left, which is fine for an unregistered value and handled for a registered
 one); and a short token in an unframed position (14.4). These are Residual risks 14 to 18.
-**[Amended: Amendment 2, chain R fix rounds]** Four committed fix rounds (and a fifth in progress) on the passes and the structural
+**[Amended: Amendment 2, chain R fix rounds]** Four committed fix rounds (and a fifth in progress; [Amended: Amendment 3, whole-branch panel: it and a sixth are committed, and glued-escape fixes followed]) on the passes and the structural
 rules widened what is covered (Debug wrappers, escaped quotes, groups, XML, multipart, flags,
 camelCase, bracket-notation keys, folded lines, JWE, PGP, header text of any shape) and the
 review that drove them also named the shapes that stay unread. Those are listed, one by one, in
@@ -1217,9 +1467,9 @@ named, each covered by a structural or literal rule; it is not a claim about all
 
 | Surface | Changes | Does not change |
 |---|---|---|
-| Process boot (`aitm`, `aitm web`, `aitm tui`) | Three files appear under the config dir; one `info!` startup line; an explicit unusable path fails the boot before any port is bound; an unusable default path warns and runs degraded | `Off` creates nothing and logs nothing; `aitm <subcommand>` builds no writer |
-| `agent.status` | Additive `durable_audit` object (Design 11), counters for trusted control only | `policy`, `actions_last_minute`, `connected_clients`, the description string, `exclude_self` |
-| `agent.activity`, the `notifications/aitm/agent` push, the ring, lanes, fair share | None to lanes, fair share, the role filter, or the entry shape. **(Amendment 1) The `args` and `result.error` text changes** (the one source of all three): a header value other than the benign list reads `"<redacted>"` (names stay); `Cookie`, `Set-Cookie`, `Authorization` and secret-named header lines in free text are masked to the end of the line; `Basic` credentials, URL userinfo passwords, credential shapes (JWT, PEM, AWS, GitHub, GitLab, Slack, Stripe, `sk-`, Google) and the extra keys (`passphrase`, `private_key`, `access_key`, `pass`, `pw`, `otp`, `totp`) read `[redacted]`; a value typed into a `selector` that names a secret reads `"<redacted>"`; a string argument longer than 4 KiB is cut at 4 KiB with `…` (it was already cut at 512 bytes of the whole). **[Amended: Amendment 2, chain R fix rounds]** Also: any object key that contains `header` or `hdr` (or is `trailer`/`trailers`) makes everything below it a header collection (not only the seven names); a hidden raw header line reads `Name: [redacted]`; a header value that is an object is replaced; `Sec-WebSocket-Protocol` header values are hidden (they carry bearer tokens); camelCase secret keys (`userPass`, `authKey`, `totpCode`) are hidden; a `header_value` member beside a hidden `header_name`, and any `*value`/`*values` member beside a secret-named `name`/`key`/`selector`, are hidden; every object key is masked by the text pass and cut at 256 bytes (two keys that collapse to one text share a member); a container nested deeper than 64 levels reads `"<redacted>"`; the error reason is scrubbed over its first 8192 bytes only (an entry carries at most 1024 of it) | Everything else, including that `args` is a JSON text of the arguments, `flow.detail` (the capture store keeps the raw request), and `flow.detail {id, body:"none"}` which the web UI's poll filter reads |
+| Process boot (`aitm`, `aitm web`, `aitm tui`) | Three files appear under the config dir; one `info!` startup line; an explicit unusable path fails the boot before any port is bound; an unusable default path warns and runs degraded. **[Amended: Amendment 3, whole-branch panel: a configuration or environment value that is not a setting is reported by its kind or reason, never printed; a `ca.audit_log` that is any stream file, or a rotated name of one, through any spelling refuses the boot; the exit flush runs in `block_in_place`]** | `Off` creates nothing and logs nothing; `aitm <subcommand>` builds no writer |
+| `agent.status` | Additive `durable_audit` object (Design 11), counters for trusted control only. **[Amended: Amendment 3, whole-branch panel: `degraded` is also true while a stream's rotation is wedged, and a wedged stream's refused lines count in `dropped`]** | `policy`, `actions_last_minute`, `connected_clients`, the description string, `exclude_self` |
+| `agent.activity`, the `notifications/aitm/agent` push, the ring, lanes, fair share | None to lanes, fair share, the role filter, or the entry shape. **(Amendment 1) The `args` and `result.error` text changes** (the one source of all three): a header value other than the benign list reads `"<redacted>"` (names stay); `Cookie`, `Set-Cookie`, `Authorization` and secret-named header lines in free text are masked to the end of the line; `Basic` credentials, URL userinfo passwords, credential shapes (JWT, PEM, AWS, GitHub, GitLab, Slack, Stripe, `sk-`, Google) and the extra keys (`passphrase`, `private_key`, `access_key`, `pass`, `pw`, `otp`, `totp`) read `[redacted]`; a value typed into a `selector` that names a secret reads `"<redacted>"`; a string argument longer than 4 KiB is cut at 4 KiB with `…` (it was already cut at 512 bytes of the whole). **[Amended: Amendment 2, chain R fix rounds]** Also: any object key that contains `header` or `hdr` (or is `trailer`/`trailers`) makes everything below it a header collection (not only the seven names); a hidden raw header line reads `Name: [redacted]`; a header value that is an object is replaced; `Sec-WebSocket-Protocol` header values are hidden (they carry bearer tokens); camelCase secret keys (`userPass`, `authKey`, `totpCode`) are hidden; a `header_value` member beside a hidden `header_name`, and any `*value`/`*values` member beside a secret-named `name`/`key`/`selector`, are hidden; every object key is masked by the text pass and cut at 256 bytes (two keys that collapse to one text share a member); a container nested deeper than 64 levels reads `"<redacted>"`; the error reason is scrubbed over its first 8192 bytes only (an entry carries at most 1024 of it) | Everything else, **[Amended: Amendment 3, whole-branch panel: except that an `args` leaf or reason that no redaction round settles reads `[redacted]`, and an `args` value no walk round confirms reads `"<redacted>"` (an attacker-built shape; no honest input reaches either)]** including that `args` is a JSON text of the arguments, `flow.detail` (the capture store keeps the raw request), and `flow.detail {id, body:"none"}` which the web UI's poll filter reads |
 | Apps that show `args` (macOS `Activity.swift`, web `AgentPanel` and `activity.ts`, the TUI Agent page) | None in code: they show the string or its parsed object and read only `args.body` of a `flow.detail` poll | A header's value in an Activity row is `<redacted>` for a non-benign name where it used to show; an operator wanting it opens the flow |
 | `ca.audit_log`, `ca.*` commands, `FileAuditLog` | Doc comments only | Format, location, fail-closed behaviour |
 | `config.get` | None (it does not show the audit path) | Shape |
@@ -1280,6 +1530,23 @@ merge-base with `origin/main` is now `f2c9d70b`; every fence in AC40 and in the 
 Part A is measured against it, not against `031b09c` or `15009b2`, and the counts are recomputed
 there. The semantic-merge trap of PR 171 (CI tests the branch merged with current `main`) still
 applies: after any later merge grep `McpConfig {` and the files in "Files" for new conflicts.]**
+**[Amended: Amendment 3, whole-branch panel: four corrections and a forecast. (1) Task D1
+edited four comment-only hunks of `server.rs`, not three: the `record_audit` doc sentence
+about the lane became false once the ring hook existed, so it was corrected too (the hunks are
+at about 1058, 1140, 1926 and 1935 at `e28a310e`). On the whole branch `git diff -U0
+<merge-base>..HEAD -- crates/aitm-mcp/src/server.rs | grep -c '^@@'` therefore prints `7` (three
+executable hunks and four comment hunks), and the comment-filtered AC40 fence still prints `6`
+`+` and `24` `-` lines; both measured against `f2c9d70b` at `e28a310e`. (2) The redaction branch
+was merged three times, not twice: `bfe4483e` (R1 to R4 and the first fix rounds), `a6c4f344`
+(round 4) and `320e1daa` (rounds 5 and 6, the fail-closed convergence). (3) `main.rs` changed in
+five hunks (42 lines against the merge-base): the tail flush grew a `block_in_place` wrapper.
+`config_file.rs` and `env.rs` gained the `yaml_kind` and `why_not_a_setting` helpers (no echoed
+values). (4) `origin/main` was merged, not rebased; the orchestrator merges it again before the
+PR, a second merge this branch does not yet contain: the merge-base is still `f2c9d70b` at
+`e28a310e`, and the local `origin/main` ref has since moved to `1782353a`. Re-measure every fence
+and every count above after that merge. Forecast of the numbers to expect against `f2c9d70b`:
+`grep -c '^+'` 6, `grep -c '^-'` 24, `server.rs` `@@` 7, if the merge touches none of the lines
+the fence reads.]**
 
 ## Residual risks
 
@@ -1385,7 +1652,12 @@ applies: after any later merge grep `McpConfig {` and the files in "Files" for n
     times, and each returns the last round's text when it has not settled. No counter-example is
     known on the tabled inputs, `FUZZ_FOUND_SHAPES` and about 50 million fuzz inputs. A text that
     never settled would be returned as the last round left it: still masked as far as the last
-    round masked it, but a second call could differ.
+    round masked it, but a second call could differ. **[Amended: Amendment 3, whole-branch panel:
+    the last sentence is superseded. `MAX_ROUNDS` is 8, and a text or value that no round
+    confirms is replaced whole (`[redacted]`, `"<redacted>"`), so a second call over any result
+    changes nothing: idempotence is now a property of the design, not a measurement. What stays
+    measured is that no input in the tabled set, `FUZZ_FOUND_SHAPES` or the fuzz run reaches the
+    replacement except the test shapes built to; an honest input never does.]**
 23. **(Amendment 2) What the bounds cut is cut, not masked.** A leaf beyond 4096 bytes, text beyond
     the 64 KiB pools, a reason beyond 8192 bytes, a key beyond 256 bytes and a container beyond
     depth 64 never reach the entry in their original form (the cut leaves `…` or
@@ -1398,7 +1670,41 @@ applies: after any later merge grep `McpConfig {` and the files in "Files" for n
     accepted. The flush it calls is proved at the writer (`shutdown_flushes_every_queued_entry`,
     AC29, and AC30's bounded wait) and the SIGTERM path with a real process by
     `sigterm_flushes_a_real_boot` (AC31), which does not separate this call from the stream
-    threads' own draining.
+    threads' own draining. **[Amended: Amendment 3, whole-branch panel: the call is wrapped in
+    `block_in_place`, which is as unobservable as the call (the plan's mutation 43 covers both).]**
+25. **(Amendment 3) A wedged rotation is bounded, and what it refuses is lost.** While a rotation
+    cannot rename or create (a link or a non-regular file at the oldest slot, a directory the
+    process cannot write), the active file is held to twice its cap and every line that would pass
+    that is refused: counted `dropped`, recorded in the pending `gap` marker, never written. No
+    line is lost up to twice the cap; beyond it the refused lines are gone, and the marker says
+    how many and when. `degraded` is true while the wedge lasts. The 92 MiB bound of Design 5 holds
+    while rotation works.
+26. **(Amendment 3) `session.save`, `session.load`, `flow.export` and `flow.import` with
+    `session_io.allow_agent_file_io: true` and no `session_io.root`** take paths that are not
+    confined, so an agent could overwrite or truncate any file the proxy can write, the audit
+    files included. That opt-in is the operator's authorization decision; the README says so and
+    asks for `session_io.root` whenever agents get file access. The audit log adds no command that
+    reads or writes the files, so this is the one route.
+27. **(Amendment 3) Forms of a registered secret that are not stored:** a fourth JSON escaping
+    level, a double percent encoding, PHP's `\/` and Python's `\uXXXX` spellings of a character.
+    A secret met in one of those is masked only where another rule frames it. The depths 1 to 3 and
+    the percent forms of Design 14.4 are stored and masked.
+28. **(Amendment 3) A panic in a stream thread kills that stream.** Its later entries are counted
+    `dropped` and `degraded` is true; the other two streams are untouched and the call path is
+    unaffected. No input reaches a panic under the fuzz runs.
+29. **(Amendment 3) Residuals of code the audit shares or freezes.** The PoC builder's own, older
+    scrubber leaves P5 shapes inside header values that are not credentials (`aitm-poc` is frozen
+    by AC62; the audit's strict pass masks them in the audit copy). `scrub_text`'s `Authorization`
+    pass loses a CR (shared, untouched).
+30. **(Amendment 3) Newline spellings and a glued-escape over-redaction.** A line break written
+    `\u000a`, `\x0a` or `%0a` is not read as a line boundary (the glued `\n`, `\r` and `\t` forms
+    are). A path such as `C:\temp\npw=abc` reads as an escaped break followed by `pw=abc` and is
+    masked: accepted, in the safe direction.
+31. **(Amendment 3) An attacker-controlled string can be forced to `[redacted]`.** The round loop
+    fails closed, so input layered deeper than `MAX_ROUNDS` allows (about 6 bytes of nesting per
+    round, so a few dozen bytes) is written as `[redacted]`, and a value that no walk round
+    confirms as `"<redacted>"`. It costs the evidence in that string and nothing else; the
+    alternative, returning the last round, would leave what a later round masks.
 
 **What this answers of PR 171's residuals.** (1) A source overwriting its own history: answered
 for the file (the ring's eviction no longer erases the record), except for a sustained agent
@@ -1444,6 +1750,11 @@ Disjoint groups, so the plan can split tasks. Each line is the one-line reason.
 **D. Docs and comments (no executable change)**
 - `crates/aitm-mcp/src/server.rs`: three stale comments.
 - `crates/aitm-ca/src/audit.rs`: two stale doc comments.
+- **[Amended: Amendment 3, whole-branch panel]** As built, D1 changed four comment-only
+  hunks of `server.rs` (the fourth is the `record_audit` doc sentence about the lane, which
+  became false), comment lines of `crates/aitm-ca/src/audit.rs`, and comment lines of
+  `crates/aitm-core/src/audit.rs` (the `DEFAULT_AUDIT_CAPACITY` and `AuditSink` docs, 17 lines).
+  No executable line changed in D1.
 - `README.md`, `INSTALL.md`: Design 13.
 
 **E. Test harness hermeticity**
@@ -1491,8 +1802,25 @@ Disjoint groups, so the plan can split tasks. Each line is the one-line reason.
   submodules `pipeline.rs` (871), `registry.rs` (933) and `jsonscan.rs` (1122). The test files that exist:
   `crates/aitm-core/tests/{durable_audit_hook,redact_strict}.rs`,
   `crates/aitm-mcp/tests/audit_redaction.rs`, `crates/aitm-plugins/tests/agent_status_durable.rs`,
-  `crates/aitm/tests/{audit_log_config,audit_log_wiring,audit_log_binary}.rs`. **Still to come:**
+  `crates/aitm/tests/{audit_log_config,audit_log_wiring,audit_log_binary}.rs`. **Still to come
+  at `f9c1f5b4`, and present now (Amendment 3):**
   `crates/aitm/tests/audit_log_redaction.rs` (the corpus, AC52, AC55 to AC57, AC61).
+- **[Amended: Amendment 3, whole-branch panel] Counts at `e28a310e`** (`wc -l` and the number
+  of `#[test]` lines; the redaction chain's files grew with fix rounds 5 and 6 and the glued-escape
+  fixes): `crates/aitm-core/src/redact_strict.rs` 2186 lines, 11 in-module tests;
+  `crates/aitm-core/tests/redact_strict.rs` 2174 lines, 28 tests;
+  `crates/aitm-mcp/src/redact_args.rs` 3002 lines, 46 in-module tests;
+  `crates/aitm-mcp/tests/audit_redaction.rs` 888 lines, 12 tests;
+  `crates/aitm/src/audit_log.rs` 7776 lines (test module from line 2048, 100 tests),
+  `audit_log/pipeline.rs` 1296 lines (18 tests), `audit_log/registry.rs` 1233 (19) and
+  `audit_log/jsonscan.rs` 1122 (14); `crates/aitm/tests/audit_log_redaction.rs` 3587 lines, 10
+  tests; `audit_log_config.rs` 605 (6), `audit_log_wiring.rs` 675 (5), `audit_log_binary.rs` 889
+  (4); `crates/aitm-core/tests/durable_audit_hook.rs` 172 (2);
+  `crates/aitm-plugins/tests/agent_status_durable.rs` 383 (3). The counts are those of the
+  commit that landed fix Y3 (`e28a310e`); only the two `redact_strict` files differ from the
+  commit before it (`aa89d325`: 2113 and 2028 lines, 9 and 27 tests). The branch against
+  `f2c9d70b` at `e28a310e` is 39 files, 16 of them new (14 source and test files, the spec and the
+  plan), counted before this amendment's own edits to the spec and the plan.
 
 Group A must land before B, C and F compile against it (F's `redact_strict.rs` is independent of
 the ring hook and can start first); D and E are independent of everything. Within B and F,
@@ -1512,11 +1840,25 @@ shortened intervals) so no test sleeps for the production intervals.
    `false`, `off` and `OFF` give `Off`; `/var/log/aitm/audit.jsonl` gives
    `Path("/var/log/aitm/audit.jsonl")`; `audit.jsonl`, `~/audit.jsonl` and `""` each error with a
    message containing both `mcp.audit_log` and `absolute`; `mcp: {audit_logg: off}` still errors.
+   **[Amended: Amendment 3, whole-branch panel: the message is also the one that never echoes the
+   value. For a string (`audit.jsonl`, `~/audit.jsonl`, `""`, a bare word) it ends `got a string
+   that is neither off nor an absolute path`; for another YAML value it ends with the kind:
+   `a number` for `5`, `a list` for `[x, b]`, `a mapping` for a mapping with a key of its own, and
+   so on (Design 2). The test `a_value_that_is_not_a_setting_is_never_echoed` feeds a mapping with
+   a key of its own that holds the canary `CNRY04xdeadbeefcafe`, a list that holds it, the number
+   `5`, a relative path that starts with it and the bare canary, and asserts that the error text
+   lacks the canary and holds `mcp.audit_log`, `absolute` and the kind.]**
 2. **AC2** `[red]` `audit_log_env_wins_and_never_silently_disables`: `off|false|0|no|OFF` give
    `Off`; `on|true|1|yes|default` give `Default`; `/tmp/x/a.jsonl` gives that `Path`; with the file
    at `Path("/a/audit.jsonl")`, the values `ofd`, `relative.jsonl` and `""` leave it exactly
    `Path("/a/audit.jsonl")`; with the file at `Off`, env `/tmp/x/a.jsonl` wins; unset leaves the
-   file's value.
+   file's value. **[Amended: Amendment 3, whole-branch panel: each of those leaving values logs one
+   `WARN` that carries the reason and never the value: `empty` for `""`, `a relative path` for a
+   value with a `/` or `\` (`~/audit.jsonl`, `logs/audit.jsonl`), and `not one of off/on/default
+   or an absolute path` for the rest (`ofd`, `relative.jsonl`, `" off"` and `"off "` with their
+   blanks, `"a\nb"`), in the form `AITM_AUDIT_LOG is <reason>; the audit log setting is unchanged`.
+   The same test `a_value_that_is_not_a_setting_is_never_echoed` pins that the canary (bare, as a
+   path prefix, as `operator_token=<canary>`) is not in the warning.]**
 3. **AC3** `[red]` `stream_paths_follow_the_rule`: `/a/audit.jsonl` gives `/a/audit.jsonl`,
    `/a/audit.agent.jsonl`, `/a/audit.reads.jsonl`; `/a/audit` gives `/a/audit`, `/a/audit.agent`,
    `/a/audit.reads`; `Default.resolved_path()` ends in `audit.jsonl` and has the same parent as
@@ -1525,6 +1867,16 @@ shortened intervals) so no test sleeps for the production intervals.
    `audit_log = Path(ca.audit_log)` returns an error whose text contains `ca.audit_log`, and no
    file is created; `audit_log = Path(<dir>/audit.jsonl)` with `ca.audit_log =
    <dir>/audit.reads.jsonl` (a derived stream path collides) is refused the same way.
+   **[Amended: Amendment 3, whole-branch panel: the comparison is of resolved files and covers the
+   rotated names. `a_stream_path_equal_to_the_ca_log_is_refused` keeps its three rows (the control,
+   agent and reads files) and its distinct-CA-log control; the error names `ca.audit_log` and the CA
+   log's path as written, nothing is created and no sink is attached.
+   `a_ca_log_that_is_a_stream_file_in_another_spelling_is_refused` adds, each refused by name with
+   nothing created: `<d>/sub/../audit.jsonl` (the directory there, and not there), a link to the
+   directory (`<d>/link/audit.jsonl`), and the rotated names `audit.jsonl.1`, `audit.jsonl.4`,
+   `audit.agent.jsonl.5` and `audit.reads.jsonl.2` (the files each stream keeps: 4, 5 and 2); and
+   as the other side of the check `audit.jsonl.5`, `audit.agent.jsonl.6` and `audit.reads.jsonl.3`
+   start normally.]**
 
 **Files, permissions, boot policy** (`audit_log.rs` tests, `#[cfg(unix)]` where noted)
 
@@ -1649,7 +2001,20 @@ shortened intervals) so no test sleeps for the production intervals.
     still create a file in the directory after the `chmod`, as root can): after start, `chmod 0500`
     the stream directory so every rename and create fails while the open file stays writable;
     record 100 entries: all 100 are in `F` (its size exceeds 2048), none lost,
-    `write_failures == 0`, no panic.
+    `write_failures == 0`, no panic. **[Amended: Amendment 3, whole-branch panel: the text above is
+    superseded; its "all 100 are in `F`, none lost" is false of the design. AC25 now reads: no
+    line is lost up to twice the cap, and a refused rotation costs nothing below it. The test
+    `a_failed_rotation_never_drops_the_line` records 12 lines of about 250 bytes against the cap of
+    2048 (past the cap, under twice it): all 12 are in `F`, nothing rotated, `status()` is
+    `{degraded: true, dropped: 0, write_failures: 0}` (a failed rotation is not a write failure; the
+    wedge is `degraded`). The companion `a_wedged_rotation_holds_the_file_to_twice_its_cap` plants a
+    symbolic link at the oldest slot, so every rotation fails, and records 600 such lines: the
+    active file is over the cap and at most twice it (4096 bytes), the lines written are the first
+    ones in order with no hole after them, `status()` is `{degraded: true, dropped: 600 - written,
+    write_failures: 0}`, the link is untouched and nothing was renamed.
+    `a_wedged_rotation_recovers_when_the_slot_is_free` frees the slot: the next write rotates (the
+    file held at its ceiling is kept whole as `F.1`), `degraded` clears, the fresh file is `start`,
+    one `gap` marker with `dropped` equal to the refused count (counted once), then the line.]**
 26. **AC26** `[red]` `an_oversized_file_rotates_on_its_first_write`: start on a file pre-filled
     past the cap; record one entry: `F.1` begins with the old content, `F` holds a `start` marker
     then the entry.
@@ -1713,7 +2078,11 @@ shortened intervals) so no test sleeps for the production intervals.
 37. **AC37** `[red]` (`audit_log_binary.rs`, no socket: it fails before any port is bound)
     `an_explicit_bad_path_fails_the_boot_loudly`: the real binary with `mcp.audit_log` naming a
     path under a regular file exits non-zero within 5 s with a message containing the path and
-    prints no `proxy listening` line (it failed before any listener was bound).
+    prints no `proxy listening` line (it failed before any listener was bound). **[Amended:
+    Amendment 3, whole-branch panel: the test's own clock is `FAILED_BOOT_TIMEOUT` = 10 s, twice
+    the 5 s above. The boot fails in milliseconds, before any port is bound; the clock only keeps a
+    loaded machine from failing the test. The 5 s in the criterion is what the design promises,
+    the 10 s is the test's safety margin.]**
 38. **AC38** `[guard]` Harness hermeticity by grep (exit 0): `tests/e2e/aitm_e2e/core.py`,
     `tests/e2e/run.py`, `tests/e2e/start/test_bus_endpoint_file.py`, `tests/e2e/cli/cli-startup.sh`,
     `scripts/bus-agent-check.py`, `scripts/tui-live-check.sh` and
@@ -1751,7 +2120,15 @@ shortened intervals) so no test sleeps for the production intervals.
     comment-only hunks add to them), and recompute both numbers after any further merge. The
     reason statement is `AuditResult::Error(cap_reason(aitm_core::redact_strict::
     scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)))`, so "the one changed
-    reason line" above reads "the one changed reason statement".]**
+    reason line" above reads "the one changed reason statement".]** **[Amended: Amendment 3,
+    whole-branch panel: re-measured at `e28a310e` against `f2c9d70b`: `grep -c '^+'` prints `6` and
+    `grep -c '^-'` prints `24`; `git diff -U0 f2c9d70b..HEAD -- crates/aitm-mcp/src/server.rs |
+    grep -c '^@@'` prints `7` (three executable hunks and four comment-only hunks of D1, not
+    three); the chain R range alone is three. Cargo files, `redact.rs`, the scanner, findings,
+    `aitm-poc`, `web/`, `wire.rs` and `tui.rs` show no diff, and neither `ConnCtx` nor
+    `AuditEntry` gained a field. `origin/main` is merged again before the PR, so these numbers
+    are to be re-measured then: the expected values, if that merge touches none of the lines the
+    fence reads, are the same.]**
 41. **AC41** `[guard]` No existing test is edited (the exceptions are the one-line environment
     additions of AC38, in `crates/aitm/tests/shutdown.rs` and
     `tests/e2e/start/test_bus_endpoint_file.py`, and the one e2e assertion of AC59), in
@@ -1831,7 +2208,27 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     `curl_user_flags_mask_the_password_part`; and, inside `redact_strict.rs`,
     `every_entry_of_the_shape_table_fires_at_its_minimum_and_not_below`,
     `an_unchanged_text_costs_exactly_one_round`, `rounds_repeat_until_the_output_equals_the_input`
-    and `the_rounds_are_bounded`.
+    and `the_rounds_are_bounded`. **[Amended: Amendment 3, whole-branch panel]** The "every row is
+    a fixed point" clause is now true by construction, not by measurement: `scrub_strict` returns
+    only fixed points because a text no round settles is replaced whole by `[redacted]`, which is
+    itself a fixed point (Design 14.3, Residual risks 22). The test `the_rounds_are_bounded` was
+    **renamed and split**, and the new names are the ones to cite:
+    `a_text_that_never_settles_is_replaced_whole_after_max_rounds`,
+    `a_text_that_settles_on_the_last_allowed_round_is_kept`,
+    `a_shape_that_needs_seven_calls_settles_within_the_cap` and
+    `the_replacement_is_itself_a_fixed_point` (in `redact_strict.rs`); and, in
+    `crates/aitm-core/tests/redact_strict.rs`,
+    `a_shape_that_needed_seven_rounds_is_masked_not_replaced` and
+    `a_text_that_does_not_settle_is_replaced_whole`. Fix 5 and the glued-escape fixes add, in the
+    same files, `an_unquoted_value_runs_across_a_quote_that_does_not_end_it`,
+    `a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line`,
+    `a_pair_after_an_escaped_line_break_is_masked_whatever_its_key`,
+    `a_line_escape_glued_to_a_name_run_is_a_backslash_and_n_r_or_t`,
+    `a_key_run_starts_after_a_glued_escape_letter`,
+    `the_letter_of_an_escaped_break_is_n_r_or_t_after_a_backslash` and
+    `every_entry_of_the_shape_table_is_found_after_an_escaped_break` (fix Y3), and, in the test
+    file, `a_credential_shape_after_an_escaped_line_break_is_masked`. The `otp` row stays the
+    mid-line form. At `e28a310e` the test file has 28 tests and `redact_strict.rs` 11.
 45. **AC45** `[red]` (`crates/aitm-mcp/tests/audit_redaction.rs`, a real `McpServer`; a stub
     command with `Any`-typed `headers`, `pairs`, `entries`, `request`, `edits`, `selector`,
     `text`, `vars`) `rules_s_and_d_redact_header_collections_and_siblings`: the ring entry's
@@ -1888,7 +2285,15 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     writer writes that string byte for byte, and it parses as JSON; `{"raw":"GET /\r\nCookie: a=b;
     z=SECRET47\r\nHost: x"}` gives `{"raw":"GET /\r\nCookie: [redacted]\r\nHost: x"}` (the line
     breaks as the JSON escapes) and the writer writes it unchanged. Running `scrub_text` over the
-    JSON text instead turns both red, which is the Design 14.0 defect.
+    JSON text instead turns both red, which is the Design 14.0 defect. **[Amended: Amendment 3,
+    whole-branch panel: the three tests are `redaction_is_idempotent_and_json_safe` (the source
+    half, with a local list of values), `an_honest_entry_is_written_unchanged` (the writer half, in
+    `audit_log_wiring.rs`: an agent connection's four calls, every entry line equal to
+    `entry_to_jsonl` of its ring entry, the two shapes above as written) and
+    `corpus_args_are_idempotent_under_redact_value` (the corpus half, in
+    `audit_log_redaction.rs`, now present: every row's input value). `redact_value` is exactly
+    idempotent: a value no walk round confirms is replaced whole by `"<redacted>"`, which is a
+    fixed point (Design 14.6), so the property has no exception.]**
 48. **AC48** `[red]` (`audit_log.rs` tests) `registry_tiers`: with `ABCD1234EFGH` registered
     (returns `Substring`), `"x ABCD1234EFGH y"` gives `"x [redacted] y"` and
     `"prefixABCD1234EFGHsuffix"` gives `"prefix[redacted]suffix"`. With `wxyz` registered
@@ -1919,6 +2324,7 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     `E` bare, in a `#t=` URL and as a `Referer` header value reach the files with none of them
     present, while `/tmp/sock52xxxxxxxx` and `/home/u52xxxxxx` are present unmasked. The same for a
     `StreamableHttp` transport token.
+    **[Amended: Amendment 3, whole-branch panel: MET.]** `start_registers_every_configured_source` is in `crates/aitm/tests/audit_log_redaction.rs` (line 3363 at `e28a310e`); it was not true at `f9c1f5b4`. The registration mechanics it builds on are `start_registers_the_configured_sources` in `audit_log.rs`.
 53. **AC53** `[red]` `the_operator_bridge_token_is_registered_when_minted`:
     `handle.generate_bridge_token()` returns a 64-hex-digit `t` and `registry.mask("a t b")`
     gives `"a [redacted] b"`; a second call returns a different token, also masked; with the audit
@@ -1981,6 +2387,7 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
       the 512-byte cap (AC54a); R72 `E` bare.
     - **Multi.** R73 one string carrying `Bearer C`, `password=C`, an AKIA shape, a JWT and a
       `Cookie:` line; R74 `T1` and `T2` in one header value.
+    **[Amended: Amendment 3, whole-branch panel: MET.]** `no_canary_reaches_any_file_through_the_real_path` is in `crates/aitm/tests/audit_log_redaction.rs`. The run makes over 300 audited calls (105 from corpus A; 313 once corpus B is in, per the commit messages), with extra rows from R75 on and generated rows from R100 on (Design 14.7), the real writer started with `start_tuned` and a small cap, and the completeness guard that entry lines over every file equal audited calls. The 74 rows listed above are the first of them.
 56. **AC56** `[red]` `benign_values_survive_the_real_path_byte_for_byte`: each of AC44's benign
     strings is sent as `note`, and these headers as header values: `Accept: text/html`,
     `Content-Type: application/json`, `Host: h.test`, `User-Agent: Mozilla/5.0 (X11; Linux x86_64)`,
@@ -1988,10 +2395,12 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     `Sec-Fetch-Mode: cors`, `Accept-Language: en-US,en;q=0.9`. For each the file's `args` equals
     `entry_to_jsonl(&ring_entry)`'s `args`, and the value read back from the parsed `args` equals the
     value sent.
+    **[Amended: Amendment 3, whole-branch panel: MET.]** `benign_values_survive_the_real_path_byte_for_byte` is in `crates/aitm/tests/audit_log_redaction.rs`.
 57. **AC57** `[red]` `every_line_is_valid_json_with_the_same_shape`: every line of every file of
     the AC55 run parses as JSON; an entry line has exactly the seven keys and a marker line has
     `marker`; and for every row whose ring `args` parses, the file's `args` parses and has the same
     paths as the ring's (the JSON value with every string replaced by `""` is equal).
+    **[Amended: Amendment 3, whole-branch panel: MET.]** `every_line_is_valid_json_with_the_same_shape` is in `crates/aitm/tests/audit_log_redaction.rs`.
 58. **AC58** `[red]` `[socket]` (`audit_log_binary.rs`)
     `the_generated_operator_bridge_token_never_reaches_disk`: boot the real binary as `aitm web`
     with `mcp.operator_token` set and `--token <web agent token>`; read the operator link's token
@@ -2014,6 +2423,7 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     sid=SECRET61B; theme=dark`, `?access_token=SECRET61C&q=hi` and body `user=a&password=SECRET61D`,
     serialised with `serde_yaml::to_string` and sent as `poc_text`: none of the four appears in
     any file, and every `{{...}}` placeholder of the YAML is present in the file's `args`.
+    **[Amended: Amendment 3, whole-branch panel: MET.]** `a_built_poc_passes_through_the_audit_clean` is in `crates/aitm/tests/audit_log_redaction.rs`, with the placeholder clause the plan's Ambiguity 26 describes.
 62. **AC62** `[guard]` Existing redaction suites pass unmodified, and nothing they cover moved:
     `mcp.rs` `audit_redacts_secrets`, `audit_redacts_secret_inside_non_secret_named_value`,
     `audit_redacts_secret_in_error_reason`; `audit_integrity.rs`
@@ -2059,6 +2469,38 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
     `the_environment_rule_skips_values_that_are_not_secrets` red; removing the writer's cap-marker
     set-aside turns `a_text_cut_outside_a_literal_is_still_scanned` red; and removing the
     `shutdown` call at the tail of `main.rs` **survives** (Residual risks 24).
+    **[Amended: Amendment 3, whole-branch panel]** Corrections and additions (plan C1 numbers 35, 37
+    and 44 to 54). Three Amendment-2 entries change: running one round instead of up to eight
+    turns `rounds_repeat_until_the_output_equals_the_input`,
+    `a_shape_that_needed_seven_rounds_is_masked_not_replaced`,
+    `a_shape_that_needs_seven_calls_settles_within_the_cap` and
+    `shapes_found_by_fuzzing_are_fixed_points` red (`the_rounds_are_bounded` no longer exists);
+    making `settle` return the last round instead of failing closed turns
+    `settle_stops_at_a_fixed_point_or_fails_closed_after_three_rounds` red (the old name is
+    gone; setting `SETTLE_ROUNDS` to 0 now replaces every value, which is a different
+    mutation); and the `shutdown` survivor includes its `block_in_place` wrapper. New: making
+    `scrub_strict` return the last round's output instead of `[redacted]` turns
+    `a_text_that_never_settles_is_replaced_whole_after_max_rounds` and
+    `a_text_that_does_not_settle_is_replaced_whole` red; removing the wedged ceiling
+    (`past_ceiling` always false) turns `a_wedged_rotation_holds_the_file_to_twice_its_cap` red;
+    not feeding `rotation_wedged` into `degraded` turns it and
+    `a_failed_rotation_never_drops_the_line` red; comparing the CA log by spelled path (no
+    `resolved`) turns `a_ca_log_that_is_a_stream_file_in_another_spelling_is_refused` red; leaving
+    out the rotated names does too; printing the value in the config error or the env warning
+    turns `a_value_that_is_not_a_setting_is_never_echoed` red; removing the glued-escape reading
+    from P2 turns `a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line` red,
+    and from the frames pre-pass and P6 turns
+    `a_pair_after_an_escaped_line_break_is_masked_whatever_its_key` red, and from P5's left boundary
+    (fix Y3) turns `a_credential_shape_after_an_escaped_line_break_is_masked` and
+    `every_entry_of_the_shape_table_is_found_after_an_escaped_break` red; storing the registry's JSON
+    forms at depth 1 only turns `a_secret_is_masked_at_every_escaping_depth` and
+    `nested_json_that_holds_a_registered_secret_is_masked_end_to_end` red; and a fragment mask that
+    appends the mask without cutting the text before it turns
+    `a_fragment_mask_at_the_cap_edge_leaves_args_within_its_cap` and the corpus test
+    `a_masked_short_fragment_keeps_args_within_the_cap` red. A mutation of the writer's own
+    passes (skipping its `scrub_strict` calls) turns red only the hand-built corpus row R25 and the
+    writer and pipeline tests, not rows R1 to R39: a real server call is clean at the source
+    already (Design 14.7).
 65. **AC65** `[guard]` Docs by grep (exit 0): the README's audit-log subsection contains
     `<redacted>`, `Set-Cookie`, `tokens` and the sentence naming what cannot be caught (a bare
     credential with no frame, registered value or known shape).
@@ -2091,6 +2533,13 @@ per row and per run. `T1` to `T5` are the five registered tokens (the transport 
   nothing prints a secret.
 - (Amendment 1) The corpus rows' exact surrounding text (the words around a canary), provided each
   row keeps the shape its carrier names and every canary is unique.
+- **[Amended: Amendment 3, whole-branch panel]** The test seams are decided, not left: `start_at` is
+  `#[doc(hidden)]`; `AuditLogWriter`, `stream_for` and the pipeline constants are private;
+  `Tuning` and `start_tuned` stay `#[doc(hidden)] pub` for the corpus's rotation seam; there is
+  one registry, which `AuditLogHandle::registry()` returns; `io_refusal` and `io_context` are free
+  functions. What stays the builder's: the wording of the new diagnostics' kinds and reasons beyond
+  the literals in AC1 and AC2, the corpus rows' text, and how a test waits (the tests use named
+  constants such as `FLUSH_TIMEOUT` and `FAILED_BOOT_TIMEOUT`, not a bare sleep).
 
 ## Open questions
 
@@ -2120,6 +2569,15 @@ All have a default; none blocks approval or the build.
    SQL, HTML attribute form, header-like data outside header-named keys, and the rest). Default:
    accept; each was found by review and none is a heuristic worth its false positives. There is
    no veto path that costs nothing: a new shape is a new pass or a new rule.
+8. **(Amendment 3) Fail closed, or return the last round?** Default: fail closed. A text that no
+   round settles in `MAX_ROUNDS` = 8 becomes `[redacted]`, and a value no walk round confirms
+   becomes `"<redacted>"` (Design 14.3, 14.6). Veto path: return the last round, which restores
+   the old evidence for a layered string and the old bypass for an adversary who chooses the
+   layering; nothing else changes. Matt's "NO secrets EVER" is why the default is to fail closed.
+9. **(Amendment 3) A path that looks like an escaped break is masked.** Default: accept the
+   over-redaction of `C:\temp\npw=abc` (Design 14.3, Residual risks 30). Veto path: stop reading
+   `\n`, `\r` and `\t` as line boundaries, which reopens the double-escaped raw request (a cookie
+   tail left behind after `\nCookie:`).
 
 ## Summary
 
@@ -2150,7 +2608,7 @@ ring, the writer and every rotated file, plus a benign table that must survive b
 the proof. What cannot be caught is stated: a bare credential with no frame, no registered value
 and no known shape.
 
-(Amendment 2.) Four committed fix rounds on the redaction path (and a fifth in progress) made it stricter and its limits exact. The
+(Amendment 2.) Four committed fix rounds on the redaction path (and a fifth in progress; [Amended: Amendment 3, whole-branch panel: it and a sixth are committed]) made it stricter and its limits exact. The
 text pass gained a PEM and PGP pre-pass and a frames pre-pass (Rust `Debug` wrappers, escaped
 quotes, `[..]`/`{..}` groups, XML, multipart, CLI flags, curl `-u`), folded header lines, a
 last-`@` URL rule, JWE, bracket-notation keys, camelCase keys and a round loop that repeats up to
@@ -2164,6 +2622,21 @@ rather than rebasing, so the fences are recomputed against `f2c9d70b`. The resid
 and honest: shapes no pass reads, header shapes the structure rules do not read, and an
 idempotence claim that is measured, not proved. The corpus (AC52, AC55 to AC57, AC61) is still to
 land.
+
+(Amendment 3.) After the whole-branch panel the redaction rounds fail closed (a text no round
+settles within eight is written `[redacted]`, a value no walk round confirms `"<redacted>"`, so
+both functions return only fixed points), a line break written `\n`, `\r` or `\t` and glued to a
+header name or key counts as a line boundary, the registry masks a secret at JSON escaping depths 1
+to 3 and in the percent forms of those, and the fragment mask makes room so a capped field never
+ends past its cap. The writer holds a wedged rotation to twice its cap (refused lines counted and
+marked, `degraded` on); the CA-log collision check compares resolved files and rotated names;
+configuration and environment diagnostics print a kind or a reason, never a value. The corpus now
+exists: over 300 audited calls through a real server, the ring and the real writer, with no
+canary in any live or rotated file, so AC52, AC55 to AC57 and AC61 are met. The residual list
+grew by the wedged-rotation bound, the session-export route, registry forms not stored, a stream
+thread panic, shared-code leftovers, newline spellings and the attacker-forced `[redacted]`.
+Amendments 2 and 3 are descriptive and approved by the orchestrating session under Matt's
+autonomous-approve mode after three panel rounds.
 
 ## Architect's calls (for Matt to approve or correct)
 
@@ -2246,8 +2719,10 @@ land.
     key is judged line by line by name, and a non-benign value is hidden wherever the key
     says "header". Veto path: Open question 6.
 23. **`MAX_ROUNDS` is 6** (and `SETTLE_ROUNDS` 3, `OUTPUT_ROUNDS` 4). Nothing in Amendment 1 stated
-    a round count; the code started at four (fix R2) and was raised to six in fix 4A. A text that
-    has not settled is returned as the last round left it, and the
+    a round count; the code started at four (fix R2) and was raised to six in fix 4A. **[Amended:
+    Amendment 3, whole-branch panel: it is 8 now, and a text that has not settled is replaced
+    whole, see call 29; the next sentence, which is about the unsettled text, is superseded.]** A
+    text that has not settled is returned as the last round left it, and the
     idempotence claim is measured, not proved (Residual risks 22). A higher bound costs the call
     path linearly.
 24. **The writer sets the producer's trailing `…` aside** before the args scan and before the
@@ -2268,10 +2743,51 @@ land.
     a hand-built entry, not the source's rule set; no producer builds such an entry today.
 27. **`origin/main` was merged into the plan branch, not rebased**, because the branch already
     carries two merges of the redaction branch. The fences are measured against the merge-base
-    `f2c9d70b` and recomputed after any further merge (AC40).
+    `f2c9d70b` and recomputed after any further merge (AC40). [Amended: Amendment 3, whole-branch
+    panel: the redaction branch has been merged three times (`bfe4483e`, `a6c4f344`, `320e1daa`),
+    and `origin/main` is merged again before the PR, a second merge this branch does not yet
+    contain.]
 28. **Two as-built decisions the review forced, flagged for a veto:** `sec-websocket-protocol` was
     removed from the benign header list (its subprotocols carry bearer tokens), so its values are
-    hidden; and, in "Fix 5" (not yet in `f9c1f5b4`), an unquoted value under a strict-secret key
+    hidden; and, in "Fix 5" (committed as `ba742893`; [Amended: Amendment 3, whole-branch panel: it was "not yet in `f9c1f5b4`" when this call was written]), an unquoted value under a strict-secret key
     continues across a quote followed by a non-delimiter (`password=O'Brien&remember=1` masks
     `O'Brien`): a password that contains an apostrophe is masked whole, at the cost of masking text
     after a stray apostrophe up to the next delimiter.
+
+**Amendment 3 (whole-branch panel), for Matt to approve or correct**
+
+29. **The redaction rounds fail closed, and `MAX_ROUNDS` is 8.** A text that no round settles is
+    replaced whole by `[redacted]`; a value that no walk round confirms is replaced whole by
+    `"<redacted>"`. Both functions now return only fixed points. This supersedes call 23's
+    "returned as the last round left it" and its 6: a bounded loop is bypassable by an adversary who
+    chooses the layering unless hitting the bound fails closed. The cost is that an attacker-built
+    string can be forced to `[redacted]` and loses its own evidence (Residual risks 31). Veto path:
+    Open question 8.
+30. **A glued escape counts as a line boundary.** A backslash run followed by `n`, `r` or `t`
+    immediately before a header name, key run or (fix Y3, committed `e28a310e`) a P5 shape reads as a real
+    line break, so a double-escaped raw request is masked to the end of its line. The over-redaction
+    `C:\temp\npw=abc` is accepted; the spellings `\u000a`, `\x0a` and `%0a` stay unread. Veto
+    path: Open question 9.
+31. **A wedged rotation is held to twice its cap and refuses beyond it.** This supersedes Design 8's
+    "the line is never dropped for being at the cap" and AC25's "all 100 are in `F`": no line is
+    lost up to twice the cap, a refused line is counted `dropped` and marked in the `gap`, and
+    `degraded` is on. The alternative, an unbounded file, breaks the disk bound the design promises.
+32. **The `ca.audit_log` collision is checked on resolved files, rotated names included.** Spelled
+    paths were not enough (`..`, a link to the directory, `audit.agent.jsonl.5`); the check
+    canonicalises the longest existing ancestor and compares the three active names and every
+    `F.1` to `F.keep`. Names just past what a stream keeps are not a collision.
+33. **Diagnostics never echo a value.** The config error prints the YAML kind (or "a string that is
+    neither off nor an absolute path"), the env warning the reason (`empty`, `a relative path`, `not
+    one of off/on/default or an absolute path`). A token pasted under the wrong key or into the
+    wrong variable must not reach a log; the cost is a less specific message.
+34. **The registry stores JSON forms at depths 1 to 3 and percent forms of the raw secret and its
+    depth 1 and 2 forms, and the fragment mask makes room.** A masked fragment can no longer leave
+    a field past its cap, and a second pass is the identity. Depth 4 and double percent encoding are
+    residuals (Residual risks 27).
+35. **The test seams and API are narrowed, and the exit flush runs in `block_in_place`.** `start_at`
+    is hidden, the writer, `stream_for` and the pipeline constants are private, there is one
+    registry; AC37's test clock is 10 s (`FAILED_BOOT_TIMEOUT`), the corpus seed is replayable with
+    `AITM_CORPUS_SEED`. These change no behaviour a user sees.
+36. **Amendments 2 and 3 are descriptive.** They record what shipped, the orchestrating session
+    approved them under Matt's autonomous-approve mode after three panel rounds, and the Status
+    line stays approved. The new decisions in them are calls 22 to 35, for Matt to correct.
