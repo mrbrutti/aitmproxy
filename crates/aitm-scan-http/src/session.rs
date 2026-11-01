@@ -30,7 +30,7 @@ use aitm_core::{
 use aitm_scan_model::{Canary, CanaryMethod, OnLost, SessionMaterial};
 use url::Url;
 
-use crate::{params, redact, url_norm};
+use crate::{limits, params, redact, url_norm};
 
 /// The prefix of every error returned once a job's session is lost (seam S1).
 pub(crate) const SESSION_LOST_PREFIX: &str = "scan: session_lost: ";
@@ -205,6 +205,12 @@ pub(crate) struct CanaryRequest {
 /// but does not qualify, the substitution is logged at info and the search falls
 /// through to the newest qualifying captured flow. `None` when nothing
 /// qualifies — the job then runs with an unarmed monitor.
+///
+/// The search skips the scanner's own captures: a flow marked `crawl` or
+/// `scan:<job>` (spec D5) is a crawl navigation the browser made with the
+/// primed session, not the operator's traffic, and makes a poor canary (an
+/// arbitrary route that may be slow or non-idempotent). A `from_flow` the
+/// operator named explicitly is exempt from that rule.
 pub(crate) fn pick_canary(
     store: &dyn FlowStore,
     origin: &Url,
@@ -235,8 +241,22 @@ pub(crate) fn pick_canary(
         store
             .get(id)
             .as_ref()
+            .filter(|flow| !is_scanner_capture(flow))
             .and_then(|flow| canary_from(flow, origin, material))
     })
+}
+
+/// Whether `flow` is one the scanner produced itself: marked `crawl` or with a
+/// job mark `scan:<job>` (spec D5). Such a capture is never picked as a canary
+/// by the search; it is still accepted when named through `from_flow`.
+fn is_scanner_capture(flow: &Flow) -> bool {
+    let Flow::Http(http) = flow else {
+        return false;
+    };
+    http.metadata
+        .marks
+        .iter()
+        .any(|mark| mark == limits::MARK_CRAWL || mark.starts_with(limits::JOB_MARK_PREFIX))
 }
 
 /// The canary `flow` would make, or `None` when it does not qualify.
@@ -569,8 +589,8 @@ mod tests {
     }
 
     /// The store of `pick_canary_rules`, oldest first, with the ids of the
-    /// older eligible `GET /older` and of the ineligible `POST /login` for the
-    /// two `from_flow` cases.
+    /// older eligible `GET /older`, of the ineligible `POST /login` and of the
+    /// scanner's own `GET /slow?ms=10` crawl capture for the `from_flow` cases.
     fn canary_store() -> CanaryStore {
         let store = Arc::new(MemFlowStore::default());
 
@@ -638,15 +658,38 @@ mod tests {
         );
         replay.metadata.is_replay = true;
         store.insert(Flow::Http(replay));
+        // Newest of all and a real capture carrying the material, but the
+        // scanner's own: a browser crawl primed with the session navigated
+        // here, so it carries the job mark and the crawl mark (live finding
+        // L4). The operator's `/account` must still win over it.
+        let mut crawled = captured_flow(
+            request(
+                "GET",
+                "http://t:8080/slow?ms=10",
+                &[("cookie", "sid=S3")],
+                None,
+            ),
+            200,
+            &[],
+            b"slow",
+        );
+        crawled.metadata.marks = vec!["scan:scan-1a2b3c4d".to_string(), "crawl".to_string()];
+        let crawl = store.insert(Flow::Http(crawled));
 
-        CanaryStore { store, older, post }
+        CanaryStore {
+            store,
+            older,
+            post,
+            crawl,
+        }
     }
 
-    /// The store of `canary_store` and the two ids its `from_flow` cases name.
+    /// The store of `canary_store` and the three ids its `from_flow` cases name.
     struct CanaryStore {
         store: Arc<MemFlowStore>,
         older: aitm_core::FlowId,
         post: aitm_core::FlowId,
+        crawl: aitm_core::FlowId,
     }
 
     #[test]
@@ -662,7 +705,9 @@ mod tests {
         let picked = pick_canary(store.as_ref(), &origin, &material, None).expect("a canary");
         // Not `/replayed` (a replay), not `/pending` (no response to expect),
         // not `/login` (not a canary method), not `/public` (no session name),
-        // and not the older `/older`.
+        // not the older `/older`, and not the newer `/slow?ms=10`: a capture
+        // marked `scan:<job>` + `crawl` is the scanner's own crawl navigation,
+        // not the operator's session (live finding L4).
         // The status shape is the path alone; the replay still targets the
         // captured request line, query and all.
         assert_eq!(picked.path, "/account");
@@ -682,6 +727,23 @@ mod tests {
         let from_older =
             pick_canary(store.as_ref(), &origin, &material, Some(fixture.older)).expect("a canary");
         assert_eq!(from_older.path, "/older");
+
+        // The operator may name a marked flow explicitly: `from_flow` is exempt
+        // from the own-capture rule.
+        let from_crawl =
+            pick_canary(store.as_ref(), &origin, &material, Some(fixture.crawl)).expect("a canary");
+        assert_eq!(from_crawl.path, "/slow");
+        assert_eq!(from_crawl.request.path, "/slow?ms=10");
+
+        // A newer *unmarked* capture is still the operator's traffic and wins.
+        store.insert(Flow::Http(captured_flow(
+            request("GET", "http://t:8080/newest", &[("cookie", "sid=S3")], None),
+            200,
+            &[],
+            b"newest",
+        )));
+        let newest = pick_canary(store.as_ref(), &origin, &material, None).expect("a canary");
+        assert_eq!(newest.path, "/newest");
 
         // No flow carries a name of this material.
         let absent = session_of(&[("other", "X")], &[]);
