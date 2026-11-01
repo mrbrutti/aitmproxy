@@ -1570,6 +1570,21 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | Coder (gap) | Important | Plan Task 13 Files list omitted `tests/api_catalog.rs`, whose `receiver_type` panics on the new `probe` prefix; `serde_yaml` is dev-only; no error variant named for a duplicate id | plan amended 2026-11-01 (Task 13 amendments a-d); call B30 extended to the test file |
 | 1-4 | Tester | PASS | Every plan-named test present with literal values; 30 tests added (803cbdd7); `HELP_CHECK_META` omits `targets_session`/`scope` and `origin` is host-supplied | fixed in 5960c928 |
 | 13 | T3 live run (external) | Important | `check_bridge.rs` `META_KEYS` omits `remediation`, so every script declaring the optional key is refused at load | fix dispatched 2026-11-01 (multi-verdict coder): key added; a test pins `META_KEYS` == every `CheckMeta` field except `origin` |
+| 12 | Quality (w2+3) | Important | `interim_lane::ends_the_run` classifies probe errors by substring instead of the typed `ProbeRefused` | fix (wave-2/3 fix task): downcast `ProbeRefused::{Budget, Deadline, Cancelled}`; test with an upstream "operation was canceled" error that still tries the next payload |
+| 13 | Quality (w2+3) | Important | `run_load` leaves a script's non-colliding checks registered after a duplicate-id load failure (contradicts "all or nothing") | fix routed to the in-flight Rhai coder 2026-11-01: conflicts detected before mutating; test with one duplicate + one fresh id |
+| 13 | Quality (w2+3) | Important | `META_KEYS` omits `remediation`; two hand-mirrored field tables | same as the T3 row above; `field_parses` to share the list |
+| 6,7,9,12 | Quality (w2+3) | Important | Four private origin-normal-form implementations (`profiles`, `session`, `interim_lane`, `issues`) that already diverge on `ws`/`wss` default ports | fix (wave-2/3 fix task): one `util::normalize_origin` + `util::origin_key` with a four-scheme default-port table; callers switched; shape table test in `util.rs` |
+| 8 | Quality (w2+3) | Minor | Rate-retry exhaustion returns the raw `GuardError`; `HostDisabled` does not bump `errors` | fix (wave-2/3 fix task) |
+| 10 | Quality (w2+3) | Minor | `skipped.frequent` counts items while `skipped.ignored` counts points | fix (wave-2/3 fix task): once per point |
+| 7,10,12,13 | Quality (w2+3) | Minor | Four serde-roundtrip enum-to-token helpers | fix (wave-2/3 fix task): `util::wire_token`; the Rhai copy stays (crate boundary) |
+| 13 | Quality (w2+3) | Minor | Fourth hand-written `aitm_core::Value` → `serde_json::Value` | accepted by orchestrator 2026-11-01: `aitm-core/value.rs` is outside this track; follow-up `From` impl noted in Shipped |
+| 6 | Quality (w2+3) | Minor | `save` builds the path outside `saved_path` | fix (wave-2/3 fix task) |
+| 9 | Quality (w2+3) | Minor | `pick_observed` scans and clones the whole store | fix (wave-2/3 fix task): `FlowStore::query` by host/replay/kind first |
+| 11 | Quality (w2+3) | Minor | `match` on a `bool` | fix (wave-2/3 fix task) |
+| 12 | Quality (w2+3) | Minor | Crawl failure swallowed with no reason surfaced | fix (wave-2/3 fix task): `crawl_origin` returns the reason; the worker logs it |
+| 13 | Quality (w2+3) | Minor | `response_map` mirrors `host_net`'s private helpers | accepted by orchestrator 2026-11-01: parity pinned by `probe_response_has_the_http_send_shape`; helpers take core types the bridge does not have |
+| 5 | Quality (w2+3) | Minor | `JOB_NOTIFICATION_METHOD` literal duplicated across crates without a pin | fix: Task 19 adds the cross-crate `assert_eq!` in `crates/aitm/tests` |
+| 8 | Quality (w2+3) | Minor | 30 s timeout mapping tested on the helper, not through `send_opts` | accepted by orchestrator 2026-11-01: tokio `test-util` is not in the crate's dev-deps; the helper test pins the mapping and the bound is `MAX_AWAIT` |
 
 ## Shipped
 
