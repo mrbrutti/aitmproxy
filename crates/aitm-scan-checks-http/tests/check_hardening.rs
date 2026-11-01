@@ -340,16 +340,13 @@ async fn no_detail_quotes_a_secret_the_target_returned() {
     }
 }
 
-/// **Known defect, reported to the Coder (finding R1).** Spec D8.1 says "every
-/// `example` and every excerpt in `Evidence.matched` passes `aitm_core::redact`",
-/// and `matching.rs`'s own documentation says the caller hands it text that has
-/// already been scrubbed. No check does: `xss-reflected` quotes the response
-/// body and `open-redirect` quotes the `Location` verbatim, so a credential
-/// sitting next to the canary reaches the issue store, the push stream and the
-/// UIs. Un-ignore this test when the scrub is wired in; it needs a production
-/// change, so the Tester leaves it failing rather than fixing it.
+/// Spec D8.1: "every `example` and every excerpt in `Evidence.matched` passes
+/// `aitm_core::redact`". A credential sitting next to the canary in the body,
+/// or in the `Location` the target answered with, must not reach the issue
+/// store, the push stream or the UIs. The assertion is the scrub's own fixed
+/// point: an excerpt that still carries credential material is not what
+/// `aitm_core::redact::scrub_text` would have produced.
 #[tokio::test]
-#[ignore = "R1: Evidence.matched is not scrubbed with aitm_core::redact (finding for the Coder)"]
 async fn evidence_excerpts_are_scrubbed_with_the_core_vocabulary() {
     let leaky = format!("<div>{SECRET}</div><p>{FIRST_XSS_PROBE}</p>");
     let xss_host = ScriptedHost::new()
@@ -374,6 +371,48 @@ async fn evidence_excerpts_are_scrubbed_with_the_core_vocabulary() {
             aitm_core::redact::scrub_text(&matched),
             "{}: the excerpt still carries unscrubbed credential material",
             check.meta().id
+        );
+    }
+}
+
+/// The same rule stated as the literal an operator would recognise: the session
+/// value the *target* returned, and the one the *point* carried as its
+/// `example`, appear in neither `Evidence.matched` nor `Evidence.payload` of
+/// any of the five value checks. `scrub_text`'s fixed point above says the
+/// excerpt is shaped like scrubbed text; this says the secret itself is gone.
+#[tokio::test]
+async fn no_evidence_field_carries_a_session_value_from_the_body_or_the_point() {
+    const SESSION_VALUE: &str = "super-secret-value";
+
+    let leaky_body = format!("<div>{SECRET}</div><p>{FIRST_XSS_PROBE}</p>");
+    let mut secret_point = q();
+    secret_point.example = Some(SECRET.to_string());
+
+    for check in value_checks() {
+        let id = check.meta().id.clone();
+        let host = ScriptedHost::new()
+            .with_marker(MARKER)
+            .with_baseline(html(200, &leaky_body))
+            .on(FIRST_XSS_PROBE, html(200, &leaky_body))
+            .on(CANARY, redirect(302, &format!("{CANARY}?{SECRET}")))
+            .with_fallback(html(200, &leaky_body));
+
+        let verdict = check.run(&secret_point, &host).await;
+
+        for (field, text) in [
+            ("matched", verdict.evidence.matched.clone()),
+            ("payload", verdict.evidence.payload.clone()),
+        ] {
+            let Some(text) = text else { continue };
+            assert!(
+                !text.contains(SESSION_VALUE),
+                "{id}: evidence.{field} carried the session value: {text}"
+            );
+        }
+        assert!(
+            !verdict.detail.contains(SESSION_VALUE),
+            "{id}: the detail carried the session value: {}",
+            verdict.detail
         );
     }
 }

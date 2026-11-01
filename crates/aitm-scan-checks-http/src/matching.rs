@@ -1,10 +1,12 @@
 //! Bounded response matching shared by the native HTTP checks.
 //!
 //! Everything a check reads out of a response passes through here, and
-//! everything here is bounded. A response body is matched at most
+//! everything here is bounded and scrubbed. A response body is matched at most
 //! [`MAX_MATCH_BODY`] bytes deep and every excerpt a check quotes into an
-//! [`Evidence`] is cut by [`Evidence::excerpt`], so a hostile target cannot grow
-//! an issue, a log line or a bus message without limit (spec D8.2, "Redaction").
+//! [`Evidence`] goes through [`scrub`] and is then cut by
+//! [`Evidence::excerpt`], so a hostile target cannot grow an issue, a log line
+//! or a bus message without limit, and a credential it printed next to the
+//! match does not become evidence (spec D8.1 and D8.2, "Redaction").
 //!
 //! These helpers are deliberately dumb: they answer "what does the response
 //! say", never "is this a vulnerability". The verdict is the check's.
@@ -90,19 +92,41 @@ pub fn length_differs(a: usize, b: usize, baseline: usize) -> bool {
     a.abs_diff(b) > threshold
 }
 
-/// A bounded window of `hay` around the first occurrence of `needle`, for an
-/// [`Evidence::matched`] field.
+/// The one shared credential vocabulary, applied to anything a check is about
+/// to quote (spec D8.1, "Redaction").
 ///
-/// The window is centred on the match and cut to [`MAX_EXCERPT_BYTES`] on
-/// character boundaries, so the evidence shows the context that makes the match
-/// meaningful rather than a naked prefix. When `needle` does not occur, the
-/// leading bytes of `hay` come back instead — a check that quotes a response it
-/// did not match still quotes a bounded amount of it.
+/// A target controls everything in its response, and an insertion point's
+/// `example` is whatever was observed on the wire — either can be a session
+/// cookie, a bearer token or an API key. Every excerpt a check puts into an
+/// [`Evidence`] passes through `aitm_core::redact::scrub_text`, so the issue
+/// store, the push stream and the UIs see `[redacted]` where the credential
+/// was. It is deliberately the core's vocabulary and not a local list: one
+/// scanner-shaped exception is how the two diverge.
+#[must_use]
+pub fn scrub(text: &str) -> String {
+    aitm_core::redact::scrub_text(text)
+}
+
+/// A bounded, **scrubbed** window of `hay` around the first occurrence of
+/// `needle`, for an [`Evidence::matched`] field.
 ///
-/// This is a **bound, not a scrub**: the caller passes text that has already
-/// been through `aitm_core::redact`.
+/// Two things happen here, in this order (spec D8.1, "Redaction"):
+///
+/// 1. `hay` goes through [`scrub`], the one shared credential vocabulary, so a
+///    session cookie or an API key the target happened to print next to the
+///    match never becomes evidence;
+/// 2. the result is cut to [`MAX_EXCERPT_BYTES`] on character boundaries,
+///    centred on `needle`, so the evidence shows the context that makes the
+///    match meaningful rather than a naked prefix.
+///
+/// The needle is looked for in the **scrubbed** text: a match that the scrub
+/// swallowed (because it sat inside credential material) yields the bounded
+/// leading window instead, which is also what a `needle` that never occurred
+/// yields. A check that quotes a response it did not match still quotes a
+/// bounded, scrubbed amount of it.
 #[must_use]
 pub fn excerpt_around(hay: &str, needle: &str) -> String {
+    let hay = &scrub(hay);
     let Some(at) = hay.find(needle) else {
         return Evidence::excerpt(hay);
     };
@@ -123,7 +147,7 @@ pub fn excerpt_around(hay: &str, needle: &str) -> String {
 mod tests {
     use aitm_scan_model::{ProbeResponse, MAX_EXCERPT_BYTES, MAX_MATCH_BODY};
 
-    use super::{body_text, excerpt_around, header, is_html, length_differs};
+    use super::{body_text, excerpt_around, header, is_html, length_differs, scrub};
 
     fn resp(content_type: &str, body: Vec<u8>) -> ProbeResponse {
         ProbeResponse {
@@ -206,6 +230,23 @@ mod tests {
         assert_eq!(header(&r, "X-FRAME-OPTIONS"), Some("DENY"));
         assert_eq!(header(&r, "content-type"), Some("text/html"));
         assert_eq!(header(&r, "location"), None);
+    }
+
+    /// The excerpt is scrubbed with the core vocabulary before it is cut, so a
+    /// credential the target printed beside the match never reaches an
+    /// `Evidence`. The literal `[redacted]` is `aitm_core::redact`'s own
+    /// replacement, and the scrub is the same one every other surface uses.
+    #[test]
+    fn an_excerpt_is_scrubbed_with_the_core_vocabulary_before_it_is_cut() {
+        let hay = "hello <marker> SESSIONID=super-secret-value";
+        let out = excerpt_around(hay, "<marker>");
+
+        assert_eq!(out, "hello <marker> SESSIONID=[redacted]");
+        assert!(!out.contains("super-secret-value"), "{out}");
+
+        // Nothing secret, nothing changed: the scrub is not a mangler.
+        assert_eq!(excerpt_around("a <marker> b", "<marker>"), "a <marker> b");
+        assert_eq!(scrub("a plain sentence"), "a plain sentence");
     }
 
     /// The window is centred on the match and bounded, and a needle that is not

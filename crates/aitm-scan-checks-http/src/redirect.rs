@@ -36,7 +36,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-use crate::matching::header;
+use crate::matching::{header, scrub};
 
 /// The absolute canary target. RFC 2606 reserves `.invalid`, so this name
 /// resolves nowhere and a client that follows the redirect contacts nothing.
@@ -214,7 +214,10 @@ fn redirected(
         confidence: Confidence::Certain,
         evidence: Evidence {
             payload: Some(probe.to_string()),
-            matched: Some(Evidence::excerpt(location)),
+            // The target wrote this `Location`; it can carry a session value
+            // in a query parameter, so it is scrubbed before it is quoted
+            // (spec D8.1, "Redaction").
+            matched: Some(Evidence::excerpt(&scrub(location))),
             probe_flows: resp.flow.into_iter().collect(),
             ..Evidence::default()
         },

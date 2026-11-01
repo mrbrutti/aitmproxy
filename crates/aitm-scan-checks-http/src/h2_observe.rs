@@ -536,7 +536,7 @@ fn settings_verdict(obs: &RawH2Observation) -> Verdict {
         .map(|(id, value)| format!("{}={value}", setting_name(*id)))
         .collect::<Vec<_>>()
         .join(", ");
-    let listed = Evidence::excerpt(&listed);
+    let listed = Evidence::excerpt(&crate::matching::scrub(&listed));
     Verdict {
         outcome: Outcome::Vulnerable,
         confidence: Confidence::Certain,
@@ -634,7 +634,7 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
             outcome: Outcome::Vulnerable,
             confidence: Confidence::Tentative,
             evidence: Evidence {
-                matched: Some(Evidence::excerpt(&matched)),
+                matched: Some(Evidence::excerpt(&crate::matching::scrub(&matched))),
                 ..Evidence::default()
             },
             detail,
