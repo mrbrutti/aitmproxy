@@ -478,16 +478,17 @@ fn mutate_path_segment(
     Ok(())
 }
 
-/// Percent-encode everything outside the RFC 3986 path-segment set — unless the
-/// payload already carries a `%`, in which case it is a traversal or
-/// double-decoding probe and is passed through exactly as written.
+/// Percent-encode everything outside the RFC 3986 path-segment set.
+///
+/// When the payload already carries a `%` it is a traversal or double-decoding
+/// probe, so its `%` and the RFC 3986 segment set pass through exactly as
+/// written — but SP, CR, LF, `?`, `#` and every control byte are still encoded,
+/// or the h1 sender rejects the request line and the probe is lost (S-M1).
 fn encode_path_segment(text: &str) -> String {
-    if text.contains('%') {
-        return text.to_string();
-    }
+    let keep_percent = text.contains('%');
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
-        if is_pchar(byte) {
+        if is_pchar(byte) || (keep_percent && byte == b'%') {
             out.push(char::from(byte));
         } else {
             out.push_str(&format!("%{byte:02X}"));
@@ -873,6 +874,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.path, "/files/reports/x.txt?x=1");
+    }
+
+    /// A `%`-bearing path payload is a traversal or double-decoding probe, so
+    /// its `%` and the RFC 3986 segment set pass through untouched; but SP, CR,
+    /// LF, `?`, `#` and control bytes are still percent-encoded, or the h1 sender
+    /// rejects the request line and the probe is lost (S-M1).
+    #[test]
+    fn path_percent_payload_encodes_unsafe_bytes() {
+        let req = request(
+            "GET",
+            "http://t:8080/files/reports/summary.pdf?x=1",
+            &[],
+            None,
+        );
+        let segment = point(InsertionKind::PathSegment, "reports", Some("2"));
+
+        let out = build_request(&req, &segment, &replace("..%2f a")).unwrap();
+        assert_eq!(out.path, "/files/..%2f%20a/summary.pdf?x=1");
+
+        let out = build_request(&req, &segment, &replace("..%2f\r\nX:1")).unwrap();
+        assert_eq!(out.path, "/files/..%2f%0D%0AX:1/summary.pdf?x=1");
+
+        let out = build_request(&req, &segment, &replace("..%2f?#")).unwrap();
+        assert_eq!(out.path, "/files/..%2f%3F%23/summary.pdf?x=1");
     }
 
     #[test]

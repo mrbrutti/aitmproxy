@@ -254,6 +254,13 @@ impl HttpProbeHost {
     /// reason `probe_raw` exists) and the authority is the capture's, so a
     /// same-origin raw probe addresses exactly the host the capture did.
     fn raw_request(&self, raw: &RawProbe) -> Result<HttpRequest> {
+        // The method is taken verbatim onto the request line, so a malformed one
+        // is refused here; the value is left out of the error (S-M1).
+        if !is_method_token(&raw.method) {
+            return Err(anyhow!(
+                "scan: probe_raw: method is not a valid RFC 9110 token"
+            ));
+        }
         let target = url_norm::parse_absolute(&raw.url)
             .filter(|url| url_norm::same_origin(url, &self.origin))
             .ok_or_else(|| {
@@ -318,6 +325,34 @@ impl HttpProbeHost {
     fn unauthenticated(&self) -> bool {
         self.profile.session.mode == SessionMode::None
     }
+}
+
+/// Whether `method` is a non-empty RFC 9110 token (`tchar`s only), so a
+/// malformed method never reaches the request line (S-M1).
+fn is_method_token(method: &str) -> bool {
+    !method.is_empty() && method.bytes().all(is_tchar)
+}
+
+/// RFC 9110 `tchar`: the characters a `token` (and thus a method) may contain.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// Whether `name` is a header a session rides in: `Cookie`, `Authorization`,
@@ -742,6 +777,32 @@ mod tests {
         assert_eq!(sent[0].0.method, "HEAD");
         assert_eq!(sent[0].0.path, "/raw");
         assert!(sent[0].0.headers.get("cookie").unwrap().contains("sid=S3"));
+    }
+
+    /// A method that is not an RFC 9110 token is refused with a value-free error
+    /// (it never reaches the request line), and the method text does not leak
+    /// into the message (S-M1).
+    #[tokio::test]
+    async fn probe_raw_rejects_a_non_token_method() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        let refused = host
+            .probe_raw(RawProbe {
+                method: "GE T".to_string(),
+                url: "http://t:8080/raw".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a non-token method is refused");
+        let message = format!("{refused:#}");
+        assert!(message.contains("method"), "unexpected message: {message}");
+        assert!(
+            !message.contains("GE T"),
+            "the error leaked the method: {message}"
+        );
+        assert_eq!(fx.sent().len(), 0);
     }
 
     #[tokio::test]
