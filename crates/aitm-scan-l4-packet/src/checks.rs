@@ -22,6 +22,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::codec::truncate_hex;
 use crate::host::RunnerRegistry;
 use crate::state::{Candidate, CrashRecord, PointRun};
 
@@ -33,10 +34,6 @@ pub const REACTION_CHECK_ID: &str = "l4-packet-reaction";
 pub const CRASH_CLASS: &str = "l4-crash";
 /// The vulnerability class a reaction verdict carries.
 pub const REACTION_CLASS: &str = "l4-protocol-reaction";
-
-/// How many hex characters of a rendered case a dry-run detail prints before
-/// it is cut with `...`.
-const DETAIL_HEX_CHARS: usize = 64;
 
 /// The crash check's catalogue entry (spec D8.4: `l4-crash`, `critical`,
 /// `firm`).
@@ -439,14 +436,10 @@ pub fn reaction_detail(run: &PointRun) -> String {
 /// what the first one would have put on the wire.
 #[must_use]
 pub fn dry_run_detail(run: &PointRun) -> String {
-    let first = run.cases.first().map_or(String::new(), |case| {
-        if case.sent_hex.len() <= DETAIL_HEX_CHARS {
-            case.sent_hex.clone()
-        } else {
-            let head: String = case.sent_hex.chars().take(DETAIL_HEX_CHARS).collect();
-            format!("{head}...")
-        }
-    });
+    let first = run
+        .cases
+        .first()
+        .map_or(String::new(), |case| truncate_hex(&case.sent_hex));
     format!(
         "dry run: {} cases rendered for {}; first {first}",
         run.cases.len(),

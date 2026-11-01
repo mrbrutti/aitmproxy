@@ -549,6 +549,18 @@ pub fn random_case(path: FieldPath, seed: &PacketSpec, rng: &mut Rng) -> Mutatio
         path,
         value: as_u32(rng.below(width)),
     };
+    // The IP protocol / next-header fields draw a byte that excludes the
+    // tunnelling numbers, so a case never asks the kernel to decapsulate the
+    // seed as an inner packet aimed off the pinned destination (SEC6).
+    if matches!(
+        path,
+        FieldPath::Ipv4(Ipv4Field::Protocol) | FieldPath::Ipv6(Ipv6Field::NextHeader)
+    ) {
+        return Mutation::Field {
+            path,
+            value: draw_ip_protocol(rng),
+        };
+    }
     match path.class() {
         FieldClass::U8 | FieldClass::Ttl | FieldClass::TcpFlags => field(0x100),
         FieldClass::U16 | FieldClass::Checksum => field(0x1_0000),
@@ -581,6 +593,26 @@ pub fn random_case(path: FieldPath, seed: &PacketSpec, rng: &mut Rng) -> Mutatio
             }
         }
     }
+}
+
+/// The IP protocol numbers never drawn for `ipv4.protocol`/`ipv6.next_header`:
+/// 4 (IP-in-IP), 41 (IPv6-in-IPv4) and 47 (GRE) ask a stock host to
+/// decapsulate the seed payload as an inner packet whose addresses are not the
+/// pinned destination (review finding SEC6).
+const TUNNELLING_PROTOS: [u8; 3] = [4, 41, 47];
+
+/// A uniform protocol byte drawn from the 253 numbers that are not a
+/// tunnelling protocol: the `index`-th value of `0..=255` with
+/// [`TUNNELLING_PROTOS`] removed, so the draw stays single-pass and seed-stable.
+fn draw_ip_protocol(rng: &mut Rng) -> u32 {
+    let span = 256 - TUNNELLING_PROTOS.len() as u64;
+    let mut value = rng.below(span);
+    for excluded in TUNNELLING_PROTOS {
+        if value >= u64::from(excluded) {
+            value += 1;
+        }
+    }
+    as_u32(value)
 }
 
 /// Apply one byte mutator in place. `payload` is the lane's own buffer, so the
@@ -1306,6 +1338,47 @@ mod tests {
             .apply(&seed, 1472),
             Err(MutateError::EmptyPayload(RawMutator::BitFlip))
         );
+    }
+
+    /// Review finding SEC6: the random draw for `ipv4.protocol` and
+    /// `ipv6.next_header` never emits 4 (IP-in-IP), 41 (IPv6-in-IPv4) or 47
+    /// (GRE), so the kernel is never asked to decapsulate the seed as an inner
+    /// packet aimed somewhere other than the pinned destination.
+    #[test]
+    fn protocol_draw_never_tunnels() {
+        use aitm_proto_l4::craft::Ipv6Spec;
+
+        use crate::fields::Ipv6Field;
+
+        let v4_seed = udp_seed(b"probe");
+        let v6_seed = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(std::net::Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        };
+        for (path, seed) in [
+            (FieldPath::Ipv4(Ipv4Field::Protocol), &v4_seed),
+            (FieldPath::Ipv6(Ipv6Field::NextHeader), &v6_seed),
+        ] {
+            let mut rng = Rng::new(0x5EC6);
+            for _ in 0..500 {
+                let Mutation::Field { value, .. } = random_case(path, seed, &mut rng) else {
+                    panic!("{path} draws a field case");
+                };
+                assert!(
+                    !matches!(value, 4 | 41 | 47),
+                    "{path} drew a tunnelling protocol {value}"
+                );
+            }
+        }
     }
 
     #[test]

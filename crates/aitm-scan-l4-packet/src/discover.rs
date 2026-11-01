@@ -40,7 +40,7 @@ use aitm_scan_model::profile::{L4Options, L4Seed, L4TargetSpec, ProfileTarget, S
 use aitm_scan_model::traits::Discovery;
 use aitm_scan_model::vocab::{InsertionKind, L4Transport, LaneKind};
 
-use crate::codec::{base64_decode, hex_decode, hex_encode, CodecError};
+use crate::codec::{base64_decode, hex_decode, hex_encode, truncate_hex, CodecError};
 use crate::fields::{validate_fields, FieldError, FieldPath, IpVersion};
 use crate::mutate::declared_value;
 use crate::plan::{
@@ -254,6 +254,22 @@ fn target_key(ip: IpAddr, port: u16, proto: L4Transport) -> String {
     format!("{}/{}", host_port(ip, port), transport_name(proto))
 }
 
+/// Whether any `Inject`/`Outbound` scope entry covers `ip:port` by CIDR and
+/// port range, regardless of the interface it names (a `"*"` entry included).
+///
+/// This is the interface-independent half of the candidate search: a target no
+/// such entry covers is `out_of_scope`, but a non-loopback target one *does*
+/// cover is the v2 lane's own limit, `lane_unavailable` (review finding S2).
+fn inject_covers(guard: &L4Guard, ip: IpAddr, port: u16) -> bool {
+    guard.list_scope().into_iter().any(|entry| {
+        entry.capability == L4Capability::Inject
+            && entry.direction == L4Direction::Outbound
+            && cidr_contains(&entry.cidr, ip)
+            && port >= entry.ports.lo
+            && port <= entry.ports.hi
+    })
+}
+
 /// Resolve one declared target against the guard.
 ///
 /// # Errors
@@ -274,6 +290,17 @@ pub fn resolve_target(
         ))
     })?;
     let (port, proto) = (spec.port, spec.proto);
+
+    // A non-loopback target the scope covers at all — through a literal
+    // interface or a `"*"` entry alike — is the v2 lane's own limit, not the
+    // operator's scope: it is `lane_unavailable`, so a wildcard-covered remote
+    // target is not mistaken for `out_of_scope` (plan C4; review finding S2).
+    // A target no entry covers stays `out_of_scope`, decided below.
+    if !ip.is_loopback() && inject_covers(guard, ip, port) {
+        return Err(DiscoverError::LaneUnavailable(format!(
+            "{ip}: the packet lane v2 sends on the loopback interface only"
+        )));
+    }
 
     // Candidate interfaces: every literal interface an `Inject`/`Outbound`
     // entry names for this target, in scope order, then this platform's
@@ -547,16 +574,32 @@ fn raw_payload(seed: &SeedSpec) -> &[u8] {
         .unwrap_or_default()
 }
 
+/// The `example` for a raw point. A captured seed is operator plaintext, so it
+/// is shown only as a byte count; a profile or default seed is shown as hex,
+/// cut at [`crate::codec::DETAIL_HEX_CHARS`] (review finding SEC3, spec D2).
+fn raw_example(seed: &SeedSpec, origin: SeedOrigin) -> String {
+    let payload = raw_payload(seed);
+    match origin {
+        SeedOrigin::Captured => format!("<{} bytes>", payload.len()),
+        SeedOrigin::Profile | SeedOrigin::Default => truncate_hex(&hex_encode(payload)),
+    }
+}
+
 /// One insertion point per field of this target, in field order.
 ///
 /// `example` is the value the seed actually puts on the wire — decimal for a
-/// header field, hex for the raw payload — so a UI shows what a case starts
-/// from. Every point is lane-local: no site node, no flow (call C6).
+/// header field, a bounded hex preview for the raw payload — so a UI shows what
+/// a case starts from. A captured seed's payload is operator plaintext, so the
+/// raw point shows only its byte count, never the bytes (spec D2 "`example`
+/// redacted"; review finding SEC3); a profile or default seed shows its hex, cut
+/// at [`crate::codec::DETAIL_HEX_CHARS`]. Every point is lane-local: no site node, no flow
+/// (call C6).
 #[must_use]
 pub fn points_for(
     target: &ResolvedTarget,
     fields: &[FieldPath],
     seed: &SeedSpec,
+    origin: SeedOrigin,
 ) -> Vec<InsertionPoint> {
     let link_len = target.framing.header_len();
     let url = format!(
@@ -569,7 +612,7 @@ pub fn points_for(
         .map(|field| {
             let name = field.to_string();
             let example = match field {
-                FieldPath::Raw => Some(hex_encode(raw_payload(seed))),
+                FieldPath::Raw => Some(raw_example(seed, origin)),
                 other => declared_value(&seed.spec, *other, link_len).map(|v| v.to_string()),
             };
             InsertionPoint {
@@ -671,7 +714,11 @@ pub fn discover_all(
         let seed = plan
             .seed_spec(0)
             .map_err(|err| DiscoverError::InvalidProfile(err.to_string()))?;
-        points.extend(points_for(&plan.target, &plan.fields, &seed));
+        let origin = plan
+            .seeds
+            .first()
+            .map_or(SeedOrigin::Default, |payload| payload.origin);
+        points.extend(points_for(&plan.target, &plan.fields, &seed, origin));
         plans.push(plan);
     }
 
@@ -873,19 +920,38 @@ mod tests {
 
     #[test]
     fn non_loopback_is_lane_unavailable() {
-        let guard = guard_over(IpAddr::from([10, 0, 0, 0]), 8, "en0", &BOTH);
-        let spec = aitm_scan_model::profile::L4TargetSpec {
-            ip: "10.1.2.3".to_string(),
+        let spec = |ip: &str| aitm_scan_model::profile::L4TargetSpec {
+            ip: ip.to_string(),
             port: 53,
             proto: L4Transport::Udp,
             grammar: None,
         };
-        let err = resolve_target(&guard, &spec).expect_err("v2 is loopback only");
 
+        // A literal-interface entry covers 10.1.2.3: lane_unavailable.
+        let guard = guard_over(IpAddr::from([10, 0, 0, 0]), 8, "en0", &BOTH);
+        let err = resolve_target(&guard, &spec("10.1.2.3")).expect_err("v2 is loopback only");
         let DiscoverError::LaneUnavailable(message) = &err else {
             panic!("expected lane_unavailable, got {err:?}");
         };
         assert!(message.contains("loopback"), "{message}");
+
+        // A `"*"` entry covers it too, and is still lane_unavailable, not
+        // out_of_scope (review finding S2).
+        let wildcard = guard_over(IpAddr::from([10, 0, 0, 0]), 8, "*", &BOTH);
+        let err = resolve_target(&wildcard, &spec("10.1.2.3")).expect_err("v2 is loopback only");
+        assert!(
+            matches!(err, DiscoverError::LaneUnavailable(_)),
+            "a wildcard-covered remote target is lane_unavailable, got {err:?}"
+        );
+        assert!(err.to_string().starts_with("lane_unavailable:"), "{err}");
+
+        // A non-loopback target no entry covers stays out_of_scope.
+        let err =
+            resolve_target(&wildcard, &spec("192.0.2.9")).expect_err("192.0.2.9 is outside 10/8");
+        assert!(
+            matches!(err, DiscoverError::OutOfScope(_)),
+            "an uncovered remote target is out_of_scope, got {err:?}"
+        );
     }
 
     #[test]
@@ -1092,7 +1158,7 @@ mod tests {
             src_port: 40_000,
         };
         let seed = plan.seed_spec(0).expect("the seed builds");
-        let points = points_for(&plan.target, &plan.fields, &seed);
+        let points = points_for(&plan.target, &plan.fields, &seed, SeedOrigin::Default);
 
         assert_eq!(points.len(), 14);
         assert_eq!(points[0].id, "l4:127.0.0.1:9/udp/ipv4.ttl");
@@ -1117,10 +1183,21 @@ mod tests {
         };
         assert_eq!(example("ipv4.ttl").as_deref(), Some("64"));
         assert_eq!(example("udp.length").as_deref(), Some("24"));
+        // 16 default-seed bytes = 32 hex characters, under the 64-char cut, so
+        // the default seed's hex is shown verbatim (review finding SEC3).
         assert_eq!(
             example("raw").as_deref(),
             Some("6169746d376633612020202020202020")
         );
+
+        // The same point built from a captured seed shows only the byte count,
+        // never the captured plaintext (spec D2 "example redacted"; SEC3).
+        let captured = points_for(&plan.target, &plan.fields, &seed, SeedOrigin::Captured);
+        let captured_raw = captured
+            .iter()
+            .find(|p| p.name == "raw")
+            .and_then(|p| p.example.clone());
+        assert_eq!(captured_raw.as_deref(), Some("<16 bytes>"));
     }
 
     #[test]
@@ -1433,7 +1510,7 @@ mod tests {
             seed.spec.build().expect("builds").len(),
             plan.target.framing.header_len() + 40 + 8 + 16
         );
-        let points = points_for(&plan.target, &plan.fields, &seed);
+        let points = points_for(&plan.target, &plan.fields, &seed, SeedOrigin::Default);
         assert_eq!(points.len(), 9);
         assert_eq!(points[0].id, "l4:[::1]:53/udp/ipv6.hop_limit");
         assert_eq!(points[8].id, "l4:[::1]:53/udp/raw");

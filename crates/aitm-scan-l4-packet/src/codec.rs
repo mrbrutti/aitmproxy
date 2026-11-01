@@ -49,6 +49,23 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// How many hex characters of a rendered frame a detail or an insertion-point
+/// example prints before it is cut with `...`, so neither carries a whole seed
+/// payload (review finding SEC3; the dry-run detail's long-standing convention).
+pub const DETAIL_HEX_CHARS: usize = 64;
+
+/// `hex` as it appears in a detail or an example: verbatim up to
+/// [`DETAIL_HEX_CHARS`], else its first that many characters with `...`.
+#[must_use]
+pub fn truncate_hex(hex: &str) -> String {
+    if hex.len() <= DETAIL_HEX_CHARS {
+        hex.to_string()
+    } else {
+        let head: String = hex.chars().take(DETAIL_HEX_CHARS).collect();
+        format!("{head}...")
+    }
+}
+
 /// The lowercase hex digit for a nibble (values above 15 cannot occur).
 const fn hex_digit(nibble: u8) -> char {
     match nibble {

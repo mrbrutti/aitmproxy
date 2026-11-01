@@ -314,7 +314,32 @@ impl PointRunner {
         index: u32,
     ) -> Result<Sent, HostError> {
         let delivered = self
-            .deliver(spec, seed_id, chain, index, Counted::Case)
+            .deliver(spec, seed_id, chain, index, Counted::Case, self.field)
+            .await?;
+        match delivered.stop {
+            Some(reason) => Err(HostError::Stopped(reason)),
+            None => Ok(delivered.sent),
+        }
+    }
+
+    /// Replay a verbatim frame at this point's target as a case.
+    ///
+    /// Unlike [`PointRunner::send_spec`], the reply correlation always pins
+    /// `dst_port` to the target's port, whatever field this runner fuzzes, so a
+    /// replay can never be correlated against — or aimed at — any other port
+    /// `send_recv`'s C3 check would otherwise leave open (review finding SEC4).
+    ///
+    /// # Errors
+    /// As [`PointRunner::send_spec`].
+    pub async fn replay(
+        &self,
+        spec: PacketSpec,
+        seed_id: &str,
+        chain: Vec<String>,
+        index: u32,
+    ) -> Result<Sent, HostError> {
+        let delivered = self
+            .deliver(spec, seed_id, chain, index, Counted::Case, FieldPath::Raw)
             .await?;
         match delivered.stop {
             Some(reason) => Err(HostError::Stopped(reason)),
@@ -339,6 +364,7 @@ impl PointRunner {
                 vec!["liveness".to_string()],
                 0,
                 Counted::Probe,
+                self.field,
             )
             .await?;
         let passed = match (*lock(&self.baseline), delivered.sent.record.class) {
@@ -486,6 +512,7 @@ impl PointRunner {
         chain: Vec<String>,
         index: u32,
         counted: Counted,
+        request_field: FieldPath,
     ) -> Result<Delivery, HostError> {
         let job_id = self.job.job_id().to_string();
 
@@ -570,7 +597,10 @@ impl PointRunner {
                 .reply_window
                 .min(deadline.saturating_duration_since(now));
             let started = Instant::now();
-            match self.send_blocking(spec.clone(), timeout).await {
+            match self
+                .send_blocking(spec.clone(), timeout, request_field)
+                .await
+            {
                 Ok(outcome) => break (outcome, started.elapsed()),
                 Err(L4Error::Guard(L4GuardError::InjectionRateExceeded { retry_after })) => {
                     self.shared.state.record_rate_wait(&job_id);
@@ -632,11 +662,12 @@ impl PointRunner {
         &self,
         spec: PacketSpec,
         timeout: Duration,
+        request_field: FieldPath,
     ) -> Result<SendRecvOutcome, L4Error> {
         let guard = Arc::clone(&self.shared.guard);
         let backend = Arc::clone(&self.shared.backend);
         let store = Arc::clone(&self.shared.case_store);
-        let request = send_recv_spec(&self.plan.target, spec, self.field, timeout);
+        let request = send_recv_spec(&self.plan.target, spec, request_field, timeout);
         match tokio::task::spawn_blocking(move || send_recv(&guard, backend, store, request)).await
         {
             Ok(result) => result.map(|(_flow, outcome)| outcome),
@@ -673,6 +704,7 @@ impl PointRunner {
                 vec!["baseline".to_string()],
                 0,
                 Counted::Probe,
+                self.field,
             )
             .await
         {
@@ -739,7 +771,14 @@ impl PointRunner {
             };
 
             let delivered = match self
-                .deliver(spec.clone(), &seed.id, chain.clone(), index, Counted::Case)
+                .deliver(
+                    spec.clone(),
+                    &seed.id,
+                    chain.clone(),
+                    index,
+                    Counted::Case,
+                    self.field,
+                )
                 .await
             {
                 Ok(delivered) => delivered,
@@ -964,11 +1003,31 @@ impl PointRunner {
                     }
                     Err(HostError::Craft(_)) => return triage,
                 }
+            } else {
+                // The previous replay did not reproduce the candidate, so its
+                // probe pair passed and no recovery wait spaced this one. Space
+                // it by `replay_spacing` instead (spec D8.4 "spaced 1 s"); the
+                // reproducing path is spaced by the recovery poll (finding S1).
+                let now = Instant::now();
+                let deadline = self.job.deadline();
+                let spacing = self
+                    .shared
+                    .timing
+                    .replay_spacing
+                    .min(deadline.saturating_duration_since(now));
+                tokio::time::sleep(spacing).await;
             }
             triage.recovered = true;
             triage.attempts += 1;
             let delivered = match self
-                .deliver(spec.clone(), seed_id, chain.to_vec(), index, Counted::Case)
+                .deliver(
+                    spec.clone(),
+                    seed_id,
+                    chain.to_vec(),
+                    index,
+                    Counted::Case,
+                    self.field,
+                )
                 .await
             {
                 Ok(delivered) => delivered,
@@ -1129,8 +1188,23 @@ impl ProbeHost for PacketHost {
             let Some(bytes) = payload.bytes.clone() else {
                 return Err(anyhow::anyhow!("the packet lane replays frame bytes only"));
             };
-            // The frame goes out as it is; `send_recv`'s C3 check still pins the
-            // destination, so a replay cannot be aimed somewhere else.
+            // A replay goes out verbatim, so before it does the frame's own
+            // destination is read back and must be this point's target: the
+            // packet lane never replays a frame aimed anywhere else, even at
+            // another loopback port the Inject scope happens to cover (review
+            // finding SEC4). `PointRunner::replay` then pins `dst_port` for the
+            // reply correlation whatever field this point fuzzes.
+            let target = &self.runner.plan.target;
+            let ends = PacketSpec::endpoints(&bytes);
+            if ends.dst != Some(target.ip) || ends.dst_port != Some(target.port) {
+                return Err(anyhow::anyhow!(
+                    "the packet lane replays frames to its own target only: got {}:{}",
+                    ends.dst
+                        .map_or_else(|| "none".to_string(), |ip| ip.to_string()),
+                    ends.dst_port
+                        .map_or_else(|| "none".to_string(), |port| port.to_string()),
+                ));
+            }
             let spec = PacketSpec {
                 layers: vec![Layer::Raw(bytes)],
             };
@@ -1142,7 +1216,7 @@ impl ProbeHost for PacketHost {
                 .unwrap_or_default();
             let sent = self
                 .runner
-                .send_spec(spec, &seed_id, vec![payload.value.clone()], 0)
+                .replay(spec, &seed_id, vec![payload.value.clone()], 0)
                 .await?;
             Ok(response_for(&sent))
         })
@@ -1533,7 +1607,16 @@ mod tests {
         let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
         let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
 
+        let started = Instant::now();
         let run = runner.run_point().await;
+        // Two of the three replays follow a passing probe pair, so each is
+        // spaced by `replay_spacing` (10 ms here); the run cannot finish in
+        // under two of them (review finding S1, a generous lower bound).
+        assert!(
+            started.elapsed() >= 2 * shared.timing.replay_spacing,
+            "the spaced replays took {:?}",
+            started.elapsed()
+        );
 
         assert_eq!(
             run.cases[1].candidate,
@@ -1844,6 +1927,57 @@ mod tests {
             .expect_err("the lane replays frame bytes only")
             .to_string()
             .contains("frame bytes only"));
+    }
+
+    /// Review finding SEC4: a replay is pinned to the point's own target, so a
+    /// frame addressed to any other port — even one the loopback Inject scope
+    /// covers — is refused before it reaches the wire, and nothing is charged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_refuses_a_frame_aimed_at_another_port() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 50);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let host = PacketHost::new(Arc::clone(&runner));
+
+        // A well-formed frame to 127.0.0.1:10, a port the "*" loopback scope
+        // covers but this point never targets (its target is :9).
+        let target = &plans[0].target;
+        let elsewhere = crate::plan::seed_spec(
+            target.framing,
+            target.local_ip,
+            target.ip,
+            10,
+            aitm_scan_model::L4Transport::Udp,
+            target.port + 1,
+            b"x",
+            "elsewhere".to_string(),
+        )
+        .expect("the frame builds")
+        .spec
+        .build()
+        .expect("the frame crafts");
+
+        let refused = host
+            .probe(&Payload {
+                value: "wrong port".to_string(),
+                mode: PayloadMode::Replace,
+                bytes: Some(elsewhere),
+            })
+            .await;
+        let message = refused
+            .expect_err("a frame to another port is refused")
+            .to_string();
+        assert!(
+            message.contains("its own target only") && message.contains("127.0.0.1:10"),
+            "{message}"
+        );
+        assert_eq!(mock.inject_count(), 0, "the refused replay never went out");
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters::default()),
+            "a refused replay is not a case"
+        );
     }
 
     /// Review finding G2: spec D8.4 caps a job at `cases_cap` cases and a
