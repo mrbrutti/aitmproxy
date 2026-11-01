@@ -46,7 +46,7 @@
 //! error starting with [`session::SESSION_LOST_PREFIX`] and sends nothing
 //! (cross-track seam S1, AC T2-5).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -446,9 +446,26 @@ impl ProbeHost for HttpProbeHost {
     }
 }
 
-/// The registry's contents: job ids in insertion order, so the oldest can be
-/// evicted, and the monitors themselves.
-type MonitorTable = (VecDeque<String>, HashMap<String, Arc<SessionMonitor>>);
+/// How many evicted-lost job ids the registry remembers, so a rebuilt monitor
+/// for one of them starts lost (S-M5). Bounded so the set cannot grow without
+/// limit over a long run.
+const MAX_LOST_MONITOR_IDS: usize = 256;
+
+/// The registry's contents, behind one lock: the per-job monitors in insertion
+/// order (so the oldest can be evicted) and a bounded record of the jobs whose
+/// monitor was lost when it was evicted, so a rebuilt monitor starts lost and
+/// probing does not resume after a `session_lost` stop (S-M5).
+#[derive(Default)]
+struct MonitorTable {
+    /// Job ids in insertion order, oldest first.
+    order: VecDeque<String>,
+    /// The live monitors, one per job id.
+    monitors: HashMap<String, Arc<SessionMonitor>>,
+    /// Evicted-lost job ids in insertion order, oldest first (for the bound).
+    lost_order: VecDeque<String>,
+    /// Membership test for [`MonitorTable::lost_order`].
+    lost_ids: HashSet<String>,
+}
 
 /// One [`SessionMonitor`] per job, bounded at [`MAX_SESSION_MONITORS`].
 ///
@@ -473,12 +490,11 @@ impl SessionMonitors {
     /// The monitor for `job`, building it against `origin` the first time.
     pub fn for_job(&self, job: &dyn JobCtx, origin: &Url) -> Arc<SessionMonitor> {
         let key = job.job_id().to_string();
-        let mut guard = self
+        let mut table = self
             .inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (order, monitors) = &mut *guard;
-        if let Some(found) = monitors.get(&key) {
+        if let Some(found) = table.monitors.get(&key) {
             return Arc::clone(found);
         }
 
@@ -499,14 +515,34 @@ impl SessionMonitors {
         };
 
         let monitor = Arc::new(monitor);
-        monitors.insert(key.clone(), Arc::clone(&monitor));
-        order.push_back(key);
-        while monitors.len() > MAX_SESSION_MONITORS {
-            match order.pop_front() {
-                Some(oldest) => {
-                    monitors.remove(&oldest);
+        // A rebuilt monitor for a job whose monitor was evicted while lost starts
+        // lost, so probing does not resume after a `session_lost` stop (S-M5).
+        if table.lost_ids.contains(&key) {
+            monitor.force_lost();
+        }
+        table.monitors.insert(key.clone(), Arc::clone(&monitor));
+        table.order.push_back(key);
+        while table.monitors.len() > MAX_SESSION_MONITORS {
+            let Some(oldest) = table.order.pop_front() else {
+                break;
+            };
+            let was_lost = table
+                .monitors
+                .remove(&oldest)
+                .is_some_and(|evicted| evicted.is_lost());
+            if was_lost {
+                tracing::debug!(job = %oldest, "scan: evicting a lost session monitor");
+                if table.lost_ids.insert(oldest.clone()) {
+                    table.lost_order.push_back(oldest);
+                    while table.lost_ids.len() > MAX_LOST_MONITOR_IDS {
+                        match table.lost_order.pop_front() {
+                            Some(stale) => {
+                                table.lost_ids.remove(&stale);
+                            }
+                            None => break,
+                        }
+                    }
                 }
-                None => break,
             }
         }
         monitor
@@ -519,7 +555,7 @@ impl SessionMonitors {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .1
+            .monitors
             .len()
     }
 
@@ -1018,6 +1054,36 @@ mod tests {
         for _ in 0..50 {
             assert!(!monitor.tick(), "a sessionless job gets an unarmed monitor");
         }
+    }
+
+    /// A lost monitor evicted from the bounded registry is rebuilt lost, so
+    /// probing does not resume for a job after a `session_lost` stop (S-M5).
+    #[tokio::test]
+    async fn an_evicted_lost_monitor_is_rebuilt_lost() {
+        let monitors = SessionMonitors::new();
+        let origin = url::Url::parse("http://t:8080/").unwrap();
+
+        let fx = fixture(ok_200());
+        let first = monitors.for_job(&*fx.job, &origin);
+        first.force_lost();
+        assert!(first.should_stop());
+
+        // Sixteen more jobs push job 1's monitor out of the registry.
+        for index in 0..MAX_SESSION_MONITORS {
+            let job = id_job(&format!("scan-fill-{index:08x}"), true);
+            monitors.for_job(&job, &origin);
+        }
+        assert_eq!(monitors.len(), MAX_SESSION_MONITORS);
+
+        let rebuilt = monitors.for_job(&*fx.job, &origin);
+        assert!(
+            rebuilt.should_stop(),
+            "the rebuilt monitor must start lost, not fresh"
+        );
+
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), rebuilt).unwrap();
+        let err = host.probe(&replace("x")).await.unwrap_err().to_string();
+        assert!(err.starts_with(SESSION_LOST_PREFIX), "{err}");
     }
 
     #[test]

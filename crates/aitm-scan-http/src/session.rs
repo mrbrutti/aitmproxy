@@ -363,6 +363,15 @@ impl SessionMonitor {
         self.lost.load(Ordering::SeqCst)
     }
 
+    /// Mark this monitor lost without running a check.
+    ///
+    /// Used when a lost monitor is evicted from the registry and later rebuilt
+    /// for the same job: the rebuilt monitor starts lost, so probing does not
+    /// resume after a `session_lost` stop (S-M5).
+    pub fn force_lost(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+    }
+
     /// Whether the job must stop: the session is lost and `on_lost` is `stop`.
     pub fn should_stop(&self) -> bool {
         self.is_lost() && matches!(self.on_lost, OnLost::Stop)
