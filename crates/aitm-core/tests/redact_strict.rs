@@ -573,6 +573,56 @@ fn shapes_found_by_fuzzing_are_fixed_points() {
     );
 }
 
+/// A text that needs as many rounds as an adversary likes: after the quotes are
+/// re-paired, each round masks one more `"D "c ` segment, and two rounds are spent on
+/// each, so `n` segments (`n` of 1 or more) need `5 + 2 * n` calls of one round until a
+/// call leaves the text as it was.
+fn layered(n: usize) -> String {
+    format!("-u\t\"otp:(\": \"h\u{3000}\"#&{}", "\"D \"c ".repeat(n))
+}
+
+#[test]
+fn a_shape_that_needed_seven_rounds_is_masked_not_replaced() {
+    // Found by fuzzing: the fixed point is reached after the sixth round and shown by
+    // the seventh. It is masked as the rounds leave it, not replaced whole.
+    assert_eq!(layered(1), "-u\t\"otp:(\": \"h\u{3000}\"#&\"D \"c ");
+    let mut t = Table::default();
+    t.row(&layered(1), "-u\t\"otp:[redacted]");
+    t.finish();
+}
+
+#[test]
+fn a_text_that_does_not_settle_is_replaced_whole() {
+    // When the rounds run out without a round leaving its input as it was, the last
+    // output has not been shown to be a fixed point and may still hold a credential a
+    // later round would mask. The whole text is replaced, and the replacement is a
+    // fixed point. If a later change makes these shapes settle, replace them with
+    // shapes that still do not.
+    let mut t = Table::default();
+    t.row(&layered(40), "[redacted]");
+    t.row(&format!("before {} after", layered(40)), "[redacted]");
+    t.row(&format!("{}password=hunter2", layered(40)), "[redacted]");
+    t.row("[redacted]", "[redacted]");
+    // 2 MiB: the work is a fixed number of linear rounds.
+    t.hostile_settles(
+        "`\"D \"c ` x N",
+        layered((2 << 20) / "\"D \"c ".len()),
+        "[redacted]".to_string(),
+    );
+    t.finish();
+    // The bounded form follows: the text is cut first, then replaced whole.
+    assert_eq!(
+        scrub_strict_bounded(&layered(40), 1 << 20),
+        "[redacted]",
+        "bounded, inside the cut"
+    );
+    assert_eq!(
+        scrub_strict_bounded(&layered(40), 100),
+        "[redacted]",
+        "bounded, cut inside the layers"
+    );
+}
+
 #[test]
 fn a_private_key_block_is_masked_whole_whatever_precedes_it() {
     // The block is masked before `scrub_text` and P2 run, so a key name in front of

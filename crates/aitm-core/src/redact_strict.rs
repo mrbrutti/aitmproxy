@@ -21,11 +21,15 @@
 //! replaces with the literal `[redacted]`.
 //!
 //! What is guaranteed: a mask can change how a neighbour reads, so one round does not
-//! always settle a text, and the rounds are repeated until it does. A second call over
-//! a result changes nothing for every input in the tests and for the shapes a fuzz run
-//! found (`FUZZ_FOUND_SHAPES` in the tests); no counter-example is known. A text that does not settle within
-//! `MAX_ROUNDS` rounds is returned as the last round left it, and is not claimed to
-//! be a fixed point.
+//! always settle a text, and the rounds are repeated until a round leaves its input as
+//! it was. The result is therefore always one of two things: a text a round leaves
+//! alone (a second call over it changes nothing), or, when `MAX_ROUNDS` rounds were not
+//! enough, the whole text replaced by `[redacted]` (itself a fixed point). The last
+//! round's output is never returned unsettled, because it may still hold what a later
+//! round would mask, and a person who controls the text can make the rounds needed grow
+//! without bound (each `"D "c ` segment of the `layered` shape in the tests costs two).
+//! An ordinary text settles in one or two rounds, and the shapes a fuzz run found that
+//! need more (`FUZZ_FOUND_SHAPES` in the tests) settle well inside the cap.
 //!
 //! Accepted residuals, which no pass reads: a credential with no key, frame or known
 //! shape around it; percent-encoded frames and SQL (`SET PASSWORD = 'x'`); an XML
@@ -288,15 +292,19 @@ pub fn is_benign_header(name: &str) -> bool {
 /// Plain text only: never call this over JSON text, where a line break is the two
 /// characters `\r\n` and a value is followed by `"}`.
 ///
-/// The round is repeated until its output equals its input, at most `MAX_ROUNDS` (six)
+/// The round is repeated until its output equals its input, at most `MAX_ROUNDS`
 /// times. One round does not always settle a text, because a mask can change how a
 /// neighbour reads: masking a value that ends in a backslash un-escapes the quote after
 /// it, and masking a span can remove the `.` that made `scrub_text` read a host and a
-/// port, or a `/` that ended a P4 authority. A second call over the result changes
-/// nothing for every input in the tests and for the fuzz-found shapes there; no
-/// counter-example is known. A text the round leaves alone costs one round, and the
-/// work is at most `MAX_ROUNDS` passes, each linear in the length of `text`. A text that
-/// has not settled after `MAX_ROUNDS` rounds is returned as the last one left it.
+/// port, or a `/` that ended a P4 authority. A text the round leaves alone costs one
+/// round, and the work is at most `MAX_ROUNDS` passes, each linear in the length of
+/// `text`.
+///
+/// **Fail closed.** A text for which no round, within `MAX_ROUNDS`, left its input as it
+/// was has not been shown to be a fixed point, and the last round's output may still
+/// hold a credential a later round would mask. The result is then the literal
+/// `[redacted]` for the whole text, never that output. Every result is therefore a
+/// fixed point: a second call over it changes nothing.
 pub fn scrub_strict(text: &str) -> String {
     converge(text, scrub_round)
 }
@@ -305,8 +313,10 @@ pub fn scrub_strict(text: &str) -> String {
 /// boundary. When the text is cut a `…` is appended, so what remains of a credential
 /// the cut fell in reads as an unquoted value and is masked with it (`password=CN…`
 /// gives `password=[redacted]`). A text that fits is not cut. The bound limits the
-/// work, and the length of the result is at most `max_bytes` plus the three bytes of
-/// the `…` (less what masking shortens).
+/// work, not the length of the result: a mask can make a short value longer
+/// (`pw=a` becomes `pw=[redacted]`), so a caller that needs a length cap cuts the
+/// result itself, as the audit reason does. A text that does not settle is replaced
+/// whole by `[redacted]`, as [`scrub_strict`] does.
 pub fn scrub_strict_bounded(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return scrub_strict(text);
@@ -321,12 +331,16 @@ pub fn scrub_strict_bounded(text: &str, max_bytes: usize) -> String {
     scrub_strict(&bounded)
 }
 
-/// The most rounds [`scrub_strict`] runs over one text.
-const MAX_ROUNDS: usize = 6;
+/// The most rounds [`scrub_strict`] runs over one text. The call that shows a text
+/// settled (output equal to input) counts: a text that needs this many calls, the
+/// last of them changing nothing, still settles.
+const MAX_ROUNDS: usize = 8;
 
 /// Run `round` over `text` until its output equals its input, at most
-/// [`MAX_ROUNDS`] times, and return that output (the last one, when the text has
-/// not settled by then). A text the round leaves alone costs one round.
+/// [`MAX_ROUNDS`] times, and return that output. A text the round leaves alone costs
+/// one round. When the last round allowed still changed its input, the text never
+/// settled and the result is [`REDACTED`], not that round's output: it is not known to
+/// be a fixed point and may still hold what a further round would mask.
 fn converge(text: &str, round: impl Fn(&str) -> String) -> String {
     let mut current = round(text);
     if current == text {
@@ -339,7 +353,7 @@ fn converge(text: &str, round: impl Fn(&str) -> String) -> String {
         }
         current = next;
     }
-    current
+    REDACTED.to_string()
 }
 
 /// One round of [`scrub_strict`]: the PEM pre-pass, the frames pre-pass,
@@ -1891,7 +1905,7 @@ fn mask_extra_pairs(text: &str) -> String {
 mod tests {
     use std::cell::Cell;
 
-    use super::{converge, scrub_strict, MAX_ROUNDS, SHAPES};
+    use super::{converge, scrub_round, scrub_strict, MAX_ROUNDS, SHAPES};
 
     /// `converge` over `round`, and how many times it called it.
     fn run(text: &str, round: impl Fn(&str) -> String) -> (String, usize) {
@@ -1948,12 +1962,52 @@ mod tests {
     }
 
     #[test]
-    fn the_rounds_are_bounded() {
-        // A round that never settles is cut off after MAX_ROUNDS calls, and the last
-        // output is the result: one more `x` per round.
+    fn a_text_that_never_settles_is_replaced_whole_after_max_rounds() {
+        // A round that never settles is cut off after MAX_ROUNDS calls. The last output
+        // (one more `x` per round) is not the result, because it was never seen to be
+        // a fixed point: it may still hold what a later round would have masked, so the
+        // text is replaced whole.
         assert_eq!(
             run("", |t| format!("{t}x")),
-            ("x".repeat(MAX_ROUNDS), MAX_ROUNDS)
+            ("[redacted]".to_string(), MAX_ROUNDS)
         );
+    }
+
+    #[test]
+    fn a_text_that_settles_on_the_last_allowed_round_is_kept() {
+        // Each round drops one trailing `x`, and the call that leaves the text as it
+        // was proves it settled. `MAX_ROUNDS - 1` copies of `x` need exactly MAX_ROUNDS
+        // calls, so the proof arrives on the last call allowed; one more `x` needs a
+        // call beyond the cap.
+        let drop_one = |t: &str| t.strip_suffix('x').unwrap_or(t).to_string();
+        assert_eq!(
+            run(&"x".repeat(MAX_ROUNDS - 1), drop_one),
+            (String::new(), MAX_ROUNDS)
+        );
+        assert_eq!(
+            run(&"x".repeat(MAX_ROUNDS), drop_one),
+            ("[redacted]".to_string(), MAX_ROUNDS)
+        );
+    }
+
+    #[test]
+    fn a_shape_that_needs_seven_calls_settles_within_the_cap() {
+        // Found by fuzzing. Each round re-pairs the quotes and masks one more segment
+        // (`"otp:(": ` first, then the next quote-delimited run, and so on). The text
+        // after the sixth call is the fixed point, and the seventh call proves it, one
+        // more than an earlier, smaller cap of `converge` allowed.
+        let shape = "-u\t\"otp:(\": \"h\u{3000}\"#&\"D \"c ";
+        let (out, calls) = run(shape, scrub_round);
+        assert_eq!(out, "-u\t\"otp:[redacted]");
+        assert_eq!(calls, 7);
+        assert!(calls <= MAX_ROUNDS, "{calls} calls, cap {MAX_ROUNDS}");
+    }
+
+    #[test]
+    fn the_replacement_is_itself_a_fixed_point() {
+        // `scrub_strict` is idempotent over what the fail-closed path returns.
+        assert_eq!(scrub_strict("[redacted]"), "[redacted]");
+        let (out, calls) = run("[redacted]", scrub_round);
+        assert_eq!((out.as_str(), calls), ("[redacted]", 1));
     }
 }
