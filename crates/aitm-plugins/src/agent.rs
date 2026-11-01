@@ -20,6 +20,13 @@
 //! of reads cannot push evidence out. `actions_last_minute` counts both lanes,
 //! across every surface: a UI that polls `agent.status` counts too, unless it
 //! passes `exclude_self`.
+//!
+//! `agent.status` also reports `durable_audit`, the health of the durable audit
+//! file the `aitm` binary attaches to the ring: `enabled` and `degraded` for every
+//! role (they describe the disk, not anyone's activity), `dropped` and
+//! `write_failures` for trusted control only, because a global drop count that an
+//! agent can read would be a second channel for hidden operator entries. The file's
+//! path is never reported.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -84,8 +91,8 @@ fn param(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDe
     }
 }
 
-/// `agent.status {exclude_self?} -> {policy, actions_last_minute, connected_clients}`
-/// (Read; any role).
+/// `agent.status {exclude_self?} -> {policy, actions_last_minute, connected_clients,
+/// durable_audit}` (Read; any role).
 ///
 /// `actions_last_minute` is the caller's view of the ring
 /// ([`AuditRing::count_since_for`] with the caller's frontend): a caller that is not
@@ -96,6 +103,14 @@ fn param(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDe
 /// out, so a client's own polling does not inflate the number it reads. A caller
 /// with no connection id has nothing to exclude. The flag changes only the count
 /// this caller receives; it cannot lower what any other connection sees.
+///
+/// `durable_audit` is `{enabled, degraded}` for every role plus `{dropped,
+/// write_failures}` when [`CommandHost::caller_is_trusted_control`]. It reads the
+/// ring's durable sink status ([`AuditRing::durable_status`], atomics only). With no
+/// sink attached it is `enabled: false, degraded: false` and, for trusted control,
+/// both counters `0`. It describes the disk, not anyone's activity; the counters are
+/// withheld from every other caller because a global drop count would be a second
+/// channel for hidden operator entries. The path is never reported.
 struct AgentStatus {
     state: Arc<AgentState>,
     audit: Arc<AuditRing>,
@@ -153,6 +168,42 @@ impl Command for AgentStatus {
                     "Connected MCP clients (sourced from the connection registry; empty until it \
                      is wired).",
                 ),
+                param(
+                    "durable_audit",
+                    TypeDesc::Object(vec![
+                        param(
+                            "enabled",
+                            TypeDesc::Bool,
+                            true,
+                            "A durable audit file is attached.",
+                        ),
+                        param(
+                            "degraded",
+                            TypeDesc::Bool,
+                            true,
+                            "A writer of the durable audit file has stopped or its last write \
+                             failed; entries may be missing from the file.",
+                        ),
+                        param(
+                            "dropped",
+                            TypeDesc::Int,
+                            false,
+                            "Entries the durable audit writer dropped because its queue was \
+                             full. Trusted control only; absent for any other caller.",
+                        ),
+                        param(
+                            "write_failures",
+                            TypeDesc::Int,
+                            false,
+                            "Writes to the durable audit file that failed. Trusted control \
+                             only; absent for any other caller.",
+                        ),
+                    ]),
+                    true,
+                    "Health of the durable audit file, not anyone's activity: `enabled` and \
+                     `degraded` for every role, the counters for trusted control only. The \
+                     file's path is never reported.",
+                ),
             ]),
         }
     }
@@ -183,6 +234,29 @@ impl Command for AgentStatus {
             Value::Int(last_minute as i64),
         );
         fields.insert("connected_clients".to_string(), Value::Array(vec![]));
+
+        // `enabled` is whether a sink is attached; `degraded` is its flag (a sink
+        // that is absent is not degraded). The counters are trusted control's alone:
+        // see the type's doc comment. Nothing else of the sink is reported.
+        let durable = self.audit.durable_status();
+        let mut durable_audit = BTreeMap::new();
+        durable_audit.insert("enabled".to_string(), Value::Bool(durable.is_some()));
+        durable_audit.insert(
+            "degraded".to_string(),
+            Value::Bool(durable.is_some_and(|s| s.degraded)),
+        );
+        if host.caller_is_trusted_control() {
+            let status = durable.unwrap_or_default();
+            durable_audit.insert(
+                "dropped".to_string(),
+                Value::Int(i64::try_from(status.dropped).unwrap_or(i64::MAX)),
+            );
+            durable_audit.insert(
+                "write_failures".to_string(),
+                Value::Int(i64::try_from(status.write_failures).unwrap_or(i64::MAX)),
+            );
+        }
+        fields.insert("durable_audit".to_string(), Value::Object(durable_audit));
         Ok(Value::Object(fields))
     }
 }

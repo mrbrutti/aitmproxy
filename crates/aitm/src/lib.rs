@@ -2,9 +2,11 @@
 //! into a running-ready `Proxy` plus the CA it serves with; `main` drives it.
 //! `env` bridges the process environment into `Config`; `render` prints a
 //! command's result for the CLI; `web` is the `aitm web` static host and
-//! `/bus` WebSocket bridge (F15). Kept as a library so the wiring is testable
-//! (AC-P3/AC-P4, CA-AC27) without the process entrypoint.
+//! `/bus` WebSocket bridge (F15); `audit_log` is the durable audit writer (the
+//! JSONL files every audited command is appended to). Kept as a library so the
+//! wiring is testable (AC-P3/AC-P4, CA-AC27) without the process entrypoint.
 
+pub mod audit_log;
 pub mod bundled;
 pub mod config_file;
 pub mod env;
