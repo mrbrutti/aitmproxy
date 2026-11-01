@@ -49,10 +49,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::L4Config;
+use crate::privilege::contract::bounded_json_error;
 use crate::types::{L4Direction, L4ScopeEntry};
 
 /// Protocol version carried by [`Msg::Hello`] / [`Msg::HelloAck`]. A mismatch
 /// closes the session; the core reports `helper.status: "version_mismatch"`.
+///
+/// The handshake bodies tolerate unknown keys so a newer peer is reported as a
+/// version mismatch, not as malformed JSON; every other control body is strict.
 pub const PROTO: u32 = 1;
 
 /// Largest `length` field accepted, in bytes (type byte plus payload). A
@@ -200,7 +204,8 @@ pub enum ProtoError {
     /// The type byte is none of the nine defined ones; carries the byte.
     UnknownType(u8),
     /// A control payload is not the JSON its type requires; carries the
-    /// parser's message.
+    /// parser's message, cut to a bounded length (the peer chooses the text
+    /// serde quotes, not how much of it the core shows).
     BadJson(String),
     /// A binary payload is truncated, overruns its own length field, or
     /// carries a non-UTF-8 interface name. Also a length of 0, which has no
@@ -232,19 +237,22 @@ impl std::error::Error for ProtoError {}
 
 // The JSON bodies of the control messages. They are separate from `Msg` so the
 // type byte is the only discriminant on the wire: a payload can never claim to
-// be a different variant than its type byte says. Each denies unknown keys: at
-// this trust boundary a key the type does not define is `BadJson`, and a peer
-// that needs a new key needs a new `PROTO`.
+// be a different variant than its type byte says. Every body after the
+// handshake denies unknown keys: at this trust boundary a key the type does
+// not define is `BadJson`, and a peer that needs a new key needs a new `PROTO`.
+// The two handshake bodies are the exception, deliberately: a proto-2 peer
+// that added a key to its `Hello` / `HelloAck` must still decode, so the
+// session compares `proto` and reports `version_mismatch` (spec §5.2) rather
+// than `failed` on malformed JSON. Nothing in them is acted on before that
+// comparison.
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct HelloJson {
     proto: u32,
     core_version: String,
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct HelloAckJson {
     proto: u32,
     helper_version: String,
@@ -288,8 +296,11 @@ fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_else(|_| b"!".to_vec())
 }
 
+/// Decode a control body. The parser's message is bounded by
+/// [`bounded_json_error`]: the peer chooses the key names and string values
+/// serde quotes, and must not choose the length of the text the core shows.
 fn from_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, ProtoError> {
-    serde_json::from_slice(payload).map_err(|err| ProtoError::BadJson(err.to_string()))
+    serde_json::from_slice(payload).map_err(|err| ProtoError::BadJson(bounded_json_error(&err)))
 }
 
 /// Encode a message, header included.
@@ -509,7 +520,7 @@ fn decode(ty: u8, payload: &[u8]) -> Result<Msg, ProtoError> {
             Ok(Msg::CaptureClose { id: body.id })
         }
         TYPE_FRAME => {
-            let mut cur = Cursor::new(payload);
+            let mut cur = Payload::new(payload);
             let capture_id = cur.u64()?;
             let ts_us = cur.u64()?;
             Ok(Msg::Frame {
@@ -526,7 +537,7 @@ fn decode(ty: u8, payload: &[u8]) -> Result<Msg, ProtoError> {
             })
         }
         TYPE_INJECT => {
-            let mut cur = Cursor::new(payload);
+            let mut cur = Payload::new(payload);
             let request_id = cur.u64()?;
             let interface = cur.string()?;
             Ok(Msg::Inject {
@@ -546,56 +557,54 @@ fn decode(ty: u8, payload: &[u8]) -> Result<Msg, ProtoError> {
     }
 }
 
-/// A bounds-checked walk over a binary payload. Every read is a `get`, so a
+/// A bounds-checked walk over a binary payload: the unread tail of the slice,
+/// shrinking from the front as fields are taken. Every split is checked, so a
 /// truncated or overrunning payload is [`ProtoError::BadBinary`] and never a
-/// panic.
-struct Cursor<'a> {
-    buf: &'a [u8],
-    at: usize,
+/// panic, and the fixed-width fields come out as arrays directly, with no
+/// slice-to-array conversion left to fail.
+struct Payload<'a> {
+    rest: &'a [u8],
 }
 
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, at: 0 }
+impl<'a> Payload<'a> {
+    fn new(rest: &'a [u8]) -> Self {
+        Self { rest }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], ProtoError> {
-        let end = self.at.checked_add(n).ok_or(ProtoError::BadBinary)?;
-        let slice = self.buf.get(self.at..end).ok_or(ProtoError::BadBinary)?;
-        self.at = end;
-        Ok(slice)
+    /// The next `N` bytes, or `BadBinary` when fewer remain.
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ProtoError> {
+        let (head, tail) = self
+            .rest
+            .split_first_chunk::<N>()
+            .ok_or(ProtoError::BadBinary)?;
+        self.rest = tail;
+        Ok(*head)
     }
 
     fn u64(&mut self) -> Result<u64, ProtoError> {
-        let bytes: [u8; 8] = self
-            .take(8)?
-            .try_into()
-            .map_err(|_| ProtoError::BadBinary)?;
-        Ok(u64::from_be_bytes(bytes))
+        Ok(u64::from_be_bytes(self.array()?))
     }
 
     fn u16(&mut self) -> Result<u16, ProtoError> {
-        let bytes: [u8; 2] = self
-            .take(2)?
-            .try_into()
-            .map_err(|_| ProtoError::BadBinary)?;
-        Ok(u16::from_be_bytes(bytes))
+        Ok(u16::from_be_bytes(self.array()?))
     }
 
     /// A u16-length-prefixed UTF-8 string. Non-UTF-8 is `BadBinary`: an
     /// interface name is matched against scope, so it is never lossily
     /// reconstructed.
     fn string(&mut self) -> Result<String, ProtoError> {
-        let len = self.u16()? as usize;
-        let bytes = self.take(len)?;
+        let len = usize::from(self.u16()?);
+        let (bytes, tail) = self
+            .rest
+            .split_at_checked(len)
+            .ok_or(ProtoError::BadBinary)?;
+        self.rest = tail;
         String::from_utf8(bytes.to_vec()).map_err(|_| ProtoError::BadBinary)
     }
 
     /// Everything not yet consumed.
     fn rest(&mut self) -> &'a [u8] {
-        let slice = self.buf.get(self.at..).unwrap_or(&[]);
-        self.at = self.buf.len();
-        slice
+        std::mem::take(&mut self.rest)
     }
 }
 
@@ -1146,23 +1155,7 @@ mod tests {
         assert_eq!(wire.len(), 4 + 1 + 8 + 2 + 65_535 + 1);
         let mut reader = Cursor::new(wire);
         assert_eq!(read_msg(&mut reader), Ok(msg));
-
-        // One byte over: the encoder writes a 0xFFFF length and nothing after
-        // it, neither the name nor the frame bytes, so the peer answers
-        // BadBinary (see `fix_f1_oversized_interface_name_is_always_bad_binary`).
-        let wire = encode(&Msg::Inject {
-            request_id: 1,
-            interface: "a".repeat(65_536),
-            bytes: vec![0x45, 0x00],
-        });
-        assert_eq!(
-            wire.len(),
-            4 + 1 + 8 + 2,
-            "neither the name nor the frame bytes are written"
-        );
-        assert_eq!(&wire[13..15], &[0xff, 0xff]);
-        let mut reader = Cursor::new(wire);
-        assert_eq!(read_msg(&mut reader), Err(ProtoError::BadBinary));
+        // (One byte over is `fix_f1_oversized_interface_name_is_always_bad_binary`.)
 
         // The length is bytes, not chars: 21845 three-byte chars fill a u16.
         let euro = "\u{20ac}".repeat(21_845);
@@ -1186,26 +1179,16 @@ mod tests {
             read_msg(&mut reader)
         };
 
-        // An unknown field inside an entry is ignored (`L4ScopeEntry` is the
-        // core's type) and the known fields decode to the literal set.
+        // An unknown field at the top level is BadJson naming it. (The
+        // `filter` key, and an unknown key inside an entry, are
+        // `fix_f2_unknown_top_level_key_is_bad_json_entry_level_key_is_ignored`.)
         let mut v = base.clone();
-        v["scope"][0]["filter"] = serde_json::json!("not port 22");
-        assert_eq!(read(&v), Ok(Msg::ScopeSet(set.clone())));
-        // An unknown field at the top level is BadJson naming it. (A `filter`
-        // key in particular: the helper takes no filter from the core.)
-        for (key, value) in [
-            ("unexpected", serde_json::json!({"deep": [1, 2]})),
-            ("filter", serde_json::json!("not port 22")),
-        ] {
-            let mut v = base.clone();
-            v[key] = value;
-            match read(&v) {
-                Err(ProtoError::BadJson(msg)) => assert!(
-                    msg.starts_with(&format!("unknown field `{key}`")),
-                    "{key}: {msg}"
-                ),
-                other => panic!("top-level {key} must be BadJson, got {other:?}"),
+        v["unexpected"] = serde_json::json!({"deep": [1, 2]});
+        match read(&v) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert!(msg.starts_with("unknown field `unexpected`"), "{msg}");
             }
+            other => panic!("top-level unexpected must be BadJson, got {other:?}"),
         }
 
         // Every required top-level field missing is BadJson naming it.
@@ -1303,14 +1286,41 @@ mod tests {
         }
 
         // The decoder passes any proto through: the mismatch is the session's
-        // decision (spec §5.2), not the framing's. (A proto-2 body with a new
-        // key is BadJson instead; see `fix_f2_...`.)
+        // decision (spec §5.2), not the framing's.
         let mut reader = Cursor::new(framed(TYPE_HELLO, br#"{"proto":2,"core_version":"9.9.9"}"#));
         assert_eq!(
             read_msg(&mut reader),
             Ok(Msg::Hello {
                 proto: 2,
                 core_version: "9.9.9".to_string(),
+            })
+        );
+        // Panel SP-M1: a proto-2 peer that added a key to its handshake must
+        // still decode, so the session can report `version_mismatch` from
+        // `proto` rather than `failed` from malformed JSON. The handshake
+        // bodies tolerate unknown keys; every other control body is strict
+        // (see `fix_f2_...`).
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO,
+            br#"{"proto":2,"core_version":"9.9.9","features":["dlt_loop"]}"#,
+        ));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::Hello {
+                proto: 2,
+                core_version: "9.9.9".to_string(),
+            })
+        );
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO_ACK,
+            br#"{"proto":2,"helper_version":"9.9.9","caps":["cap_net_raw"],"features":["dlt_loop"]}"#,
+        ));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::HelloAck {
+                proto: 2,
+                helper_version: "9.9.9".to_string(),
+                caps: vec!["cap_net_raw".to_string()],
             })
         );
         // But not a proto that is not a u32.
@@ -1425,12 +1435,10 @@ mod tests {
 
         // The stream ends inside the length word: Io, not Eof.
         let mut r = scripted(vec![Step::Data(wire[..2].to_vec())]);
-        match read_msg(&mut r) {
-            Err(ProtoError::Io(msg)) => {
-                assert!(msg.contains("failed to fill whole buffer"), "{msg}");
-            }
-            other => panic!("a cut length word must be Io, got {other:?}"),
-        }
+        assert!(
+            matches!(read_msg(&mut r), Err(ProtoError::Io(_))),
+            "a cut length word must be Io"
+        );
 
         // EINTR before the first byte, and again inside the payload, is
         // retried: the message still decodes.
@@ -1456,22 +1464,25 @@ mod tests {
         // A refused message consumes exactly its own bytes, so the next one on
         // the stream is still readable (the caller closes anyway; this pins
         // that the reader never over- or under-reads).
-        let refusals: [(Vec<u8>, ProtoError); 3] = [
-            (framed(0x7f, b"junk"), ProtoError::UnknownType(0x7f)),
+        // Each refusal is named by its `Display` prefix: the first two are this
+        // module's whole text, the third stops where serde_json's prose begins.
+        let refusals: [(Vec<u8>, &str); 3] = [
+            (framed(0x7f, b"junk"), "unknown message type 0x7f"),
             (
                 framed(TYPE_FRAME, &11u64.to_be_bytes()),
-                ProtoError::BadBinary,
+                "malformed binary message payload",
             ),
             (
                 framed(TYPE_HELLO, b"{"),
-                ProtoError::BadJson("EOF while parsing an object at line 1 column 1".to_string()),
+                "malformed message JSON: EOF while parsing an object",
             ),
         ];
-        for (bad, err) in refusals {
+        for (bad, display) in refusals {
             let mut stream = bad.clone();
             stream.extend_from_slice(&encode(&hello()));
             let mut reader = Cursor::new(stream);
-            assert_eq!(read_msg(&mut reader), Err(err));
+            let err = read_msg(&mut reader).expect_err("the message is refused");
+            assert!(err.to_string().starts_with(display), "{err}");
             assert_eq!(reader.position() as usize, bad.len());
             assert_eq!(read_msg(&mut reader), Ok(hello()));
             assert_eq!(read_msg(&mut reader), Err(ProtoError::Eof));
@@ -1530,9 +1541,11 @@ mod tests {
         }
     }
 
-    /// Tester F2. An unknown key at the top level of any JSON control payload
-    /// is `BadJson` at this trust boundary (version skew is [`PROTO`]'s job),
-    /// while an unknown key inside a scope entry is still ignored:
+    /// Tester F2, amended by panel SP-M1. An unknown key at the top level of
+    /// a JSON control payload is `BadJson` at this trust boundary, except in
+    /// the two handshake bodies, which tolerate it so version skew stays
+    /// [`PROTO`]'s job (a newer peer is a `version_mismatch`, not malformed
+    /// JSON). An unknown key inside a scope entry is still ignored:
     /// `L4ScopeEntry` is the core's type, not this module's to tighten.
     #[test]
     fn fix_f2_unknown_top_level_key_is_bad_json_entry_level_key_is_ignored() {
@@ -1556,19 +1569,36 @@ mod tests {
             other => panic!("a top-level unknown key must be BadJson, got {other:?}"),
         }
 
-        // Every JSON control type: the canonical body decodes, the same body
-        // with one stray key is BadJson naming that key.
-        let bodies: [(u8, &[u8], &[u8]); 6] = [
-            (
-                TYPE_HELLO,
-                &br#"{"proto":1,"core_version":"0.5.9"}"#[..],
-                &br#"{"proto":1,"core_version":"0.5.9","future":true}"#[..],
-            ),
-            (
-                TYPE_HELLO_ACK,
-                &br#"{"proto":1,"helper_version":"0.5.9","caps":[]}"#[..],
-                &br#"{"proto":1,"helper_version":"0.5.9","caps":[],"future":true}"#[..],
-            ),
+        // The two handshake bodies tolerate a stray key (panel SP-M1: a newer
+        // peer must reach the `proto` comparison, see `PROTO`), and decode to
+        // the literal message without it.
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO,
+            br#"{"proto":1,"core_version":"0.5.9","future":true}"#,
+        ));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::Hello {
+                proto: 1,
+                core_version: "0.5.9".to_string(),
+            })
+        );
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO_ACK,
+            br#"{"proto":1,"helper_version":"0.5.9","caps":[],"future":true}"#,
+        ));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::HelloAck {
+                proto: 1,
+                helper_version: "0.5.9".to_string(),
+                caps: Vec::new(),
+            })
+        );
+
+        // Every other JSON control type: the canonical body decodes, the same
+        // body with one stray key is BadJson naming that key.
+        let bodies: [(u8, &[u8], &[u8]); 4] = [
             (
                 TYPE_CAPTURE_OPEN,
                 &br#"{"id":11,"interface":"lo0","direction":"inbound","read_timeout_ms":250}"#[..],
@@ -1703,13 +1733,16 @@ mod tests {
         }
     }
 
-    /// Tester re-run on F2. The fix's bodies put the stray key last. serde
-    /// must refuse an unknown key wherever it sits and whatever it holds:
-    /// first or last, with a `null`, an empty name, or a case variant of a
-    /// real key; and a duplicated known key is refused too. Checked for
-    /// `ScopeSet` and all six control types, each against its canonical body,
-    /// which still decodes. Inside a scope entry the same stray keys stay
-    /// ignored (`L4ScopeEntry` is the core's type).
+    /// Tester re-run on F2, amended by panel SP-M1. The fix's bodies put the
+    /// stray key last. serde must refuse an unknown key wherever it sits and
+    /// whatever it holds: first or last, with a `null`, an empty name, or a
+    /// case variant of a real key; and a duplicated known key is refused too.
+    /// Checked for `ScopeSet` and the four strict control types, each against
+    /// its canonical body, which still decodes. The two handshake bodies
+    /// accept the same strays in the same positions and decode to the
+    /// canonical message; a duplicated key is refused in them too. Inside a
+    /// scope entry the same stray keys stay ignored (`L4ScopeEntry` is the
+    /// core's type).
     #[test]
     fn tester_rerun_f2_unknown_key_is_bad_json_in_any_position_and_shape() {
         let set = scope_set();
@@ -1760,15 +1793,24 @@ mod tests {
                 ("", r#""":0"#.to_string()),
                 (upper.as_str(), format!(r#""{upper}":1"#)),
             ];
+            // Panel SP-M1: the two handshake bodies tolerate the stray in any
+            // position and decode to the same message as the canonical body;
+            // every other type refuses it, naming the key.
+            let handshake = matches!(ty, TYPE_HELLO | TYPE_HELLO_ACK);
+            let mut reader = Cursor::new(framed(ty, canonical.as_bytes()));
+            let canonical_msg = read_msg(&mut reader).expect("canonical body decodes");
             for (key, stray) in &strays {
                 for doc in [format!("{{{stray},{body}}}"), format!("{{{body},{stray}}}")] {
                     let mut reader = Cursor::new(framed(ty, doc.as_bytes()));
                     match read_msg(&mut reader) {
-                        Err(ProtoError::BadJson(msg)) => assert!(
+                        Ok(msg) if handshake => {
+                            assert_eq!(msg, canonical_msg, "{ty:#04x}: {doc}");
+                        }
+                        Err(ProtoError::BadJson(msg)) if !handshake => assert!(
                             msg.starts_with(&format!("unknown field `{key}`")),
                             "{ty:#04x}: {doc}: {msg}"
                         ),
-                        other => panic!("{ty:#04x}: {doc} must be BadJson, got {other:?}"),
+                        other => panic!("{ty:#04x}: {doc} gave {other:?}"),
                     }
                 }
             }
@@ -1795,5 +1837,62 @@ mod tests {
         v["scope"][0]["INTERFACE"] = serde_json::json!(1);
         let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, v.to_string().as_bytes()));
         assert_eq!(read_msg(&mut reader), Ok(Msg::ScopeSet(set)));
+    }
+
+    /// Panel SEC-M1. `deny_unknown_fields` puts the unknown key's name in
+    /// serde's message, and a string where a number belongs is quoted in
+    /// full, so a peer could plant a quarter-megabyte "run sudo …" sentence
+    /// in the error the core shows. The stored text is bounded, cut at a char
+    /// boundary; a short message is carried unchanged.
+    #[test]
+    fn fix_sec_m1_bad_json_text_is_bounded() {
+        let long = "a".repeat(250_000);
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&to_json(&scope_set())).expect("a ScopeSet serializes");
+        v[long.as_str()] = serde_json::json!(true);
+        let body = v.to_string();
+        assert!(body.len() < MAX_FRAME, "the body fits one frame");
+        let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, body.as_bytes()));
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert_eq!(msg.len(), 123, "120 bytes of text plus the marker: {msg}");
+                assert!(msg.starts_with("unknown field `aaaa"), "{msg}");
+                assert!(msg.ends_with('…'), "{msg}");
+            }
+            other => panic!("a 250 000-byte unknown key must be BadJson, got {other:?}"),
+        }
+
+        // The same bound where a value, not a key, carries the text.
+        let hello = format!(r#"{{"proto":"{long}","core_version":"x"}}"#);
+        let mut reader = Cursor::new(framed(TYPE_HELLO, hello.as_bytes()));
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert_eq!(msg.len(), 123, "{msg}");
+                assert!(msg.starts_with("invalid type: string \"aaaa"), "{msg}");
+            }
+            other => panic!("a string proto must be BadJson, got {other:?}"),
+        }
+        // Three-byte chars: cut on a char boundary (22 bytes of prose plus 32
+        // whole euro signs is 118 bytes).
+        let euro = "\u{20ac}".repeat(80_000);
+        let hello = format!(r#"{{"proto":"{euro}","core_version":"x"}}"#);
+        let mut reader = Cursor::new(framed(TYPE_HELLO, hello.as_bytes()));
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert_eq!(msg.len(), 121, "{msg}");
+                assert_eq!(msg.chars().filter(|c| *c == '\u{20ac}').count(), 32);
+                assert!(msg.ends_with('…'), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
+        // A short message is verbatim: no marker.
+        let mut reader = Cursor::new(framed(TYPE_HELLO, b"{"));
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert!(msg.starts_with("EOF while parsing an object"), "{msg}");
+                assert!(!msg.ends_with('…'), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 }

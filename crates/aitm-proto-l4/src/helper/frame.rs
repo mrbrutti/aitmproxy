@@ -14,26 +14,27 @@
 //!    IPv4 header is [`FrameError::Truncated`], whatever its bytes say.
 //! 3. The link header names the family ([`LinkType`]); anything but IPv4 or
 //!    IPv6, or a family that disagrees with the IP version nibble behind it, is
-//!    [`FrameError::NotIp`]. An IPv6 packet shorter than its 40-byte header is
-//!    [`FrameError::Truncated`].
+//!    [`FrameError::NotIp`].
 //! 4. The IP packet is decoded over the crate's one etherparse path (the same
 //!    [`endpoints_of`] behind [`PacketSpec::endpoints`](crate::craft::PacketSpec::endpoints)).
-//!    A header or transport header cut short is [`FrameError::Truncated`]; a
-//!    header etherparse rejects is [`FrameError::NotIp`].
+//!    A header or transport header cut short — an IPv6 packet shorter than its
+//!    40-byte header among them — is [`FrameError::Truncated`]; a header
+//!    etherparse rejects is [`FrameError::NotIp`].
 //! 5. A packet whose transport the guard cannot name (an unknown IP protocol,
 //!    or a fragment whose transport header is in another packet) is
 //!    [`FrameError::NoTransport`]. TCP and UDP yield a port; ICMP and ICMPv6
-//!    are transports the guard names ([`L4Proto::Icmp`], [`L4Proto::IcmpV6`])
+//!    are transports the guard names ([`L4Proto::Icmp`](crate::types::L4Proto::Icmp),
+//!    [`L4Proto::IcmpV6`](crate::types::L4Proto::IcmpV6))
 //!    and yield a target with no port.
 //!
 //! This is stricter than the core's own capture-side resolution, which files an
-//! unnamed transport under [`L4Proto::Raw`]: on the privilege boundary a frame
-//! the helper cannot place is refused, not guessed at.
+//! unnamed transport under [`L4Proto::Raw`](crate::types::L4Proto::Raw): on the
+//! privilege boundary a frame the helper cannot place is refused, not guessed at.
 
 use std::fmt;
 
 use crate::craft::endpoints_of;
-use crate::types::{L4Direction, L4Proto, L4Target};
+use crate::types::{L4Direction, L4Target};
 
 /// The link-layer framing the helper will hand the frame to the kernel in,
 /// which is the framing the frame must already carry.
@@ -93,10 +94,10 @@ const ETHERNET_HEADER_LEN: usize = 14;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 /// EtherType of IPv6.
 const ETHERTYPE_IPV6: u16 = 0x86DD;
-/// The smallest IPv4 header (no options).
+/// The smallest IPv4 header (no options). The smallest buffer the link header
+/// can be followed by; an IPv6 header shorter than its fixed 40 bytes is the
+/// decoder's `Len` error, [`FrameError::Truncated`].
 const IPV4_MIN_HEADER_LEN: usize = 20;
-/// The fixed IPv6 header.
-const IPV6_HEADER_LEN: usize = 40;
 
 /// The IP family a link header or version nibble names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,14 +113,6 @@ impl Family {
             4 => Some(Family::V4),
             6 => Some(Family::V6),
             _ => None,
-        }
-    }
-
-    /// The smallest header this family can carry.
-    fn min_header_len(self) -> usize {
-        match self {
-            Family::V4 => IPV4_MIN_HEADER_LEN,
-            Family::V6 => IPV6_HEADER_LEN,
         }
     }
 }
@@ -141,27 +134,19 @@ pub fn inject_target(
     if frame.len() > max_len {
         return Err(FrameError::Oversized(frame.len()));
     }
-    let (family, ip) = strip_link(link, frame)?;
-    // The link header named a family; the bytes behind it must agree, or what
-    // the kernel sends is not what we decoded. (`strip_link` guarantees at
-    // least a minimal IPv4 header is present, so the first byte exists.)
-    if ip.first().copied().and_then(Family::of_nibble) != Some(family) {
-        return Err(FrameError::NotIp);
-    }
-    if ip.len() < family.min_header_len() {
-        return Err(FrameError::Truncated);
-    }
-
+    let ip = strip_link(link, frame)?;
     let packet = etherparse::SlicedPacket::from_ip(ip).map_err(|e| match e {
         etherparse::err::packet::SliceError::Len(_) => FrameError::Truncated,
         _ => FrameError::NotIp,
     })?;
     let ep = endpoints_of(&packet);
+    // unreachable by construction: `from_ip` yields only an IPv4 or IPv6 net
+    // layer, and `endpoints_of` names a destination for both; the type still
+    // carries an `Option`, and refusing is the right answer if that changed.
     let dst = ep.dst.ok_or(FrameError::NotIp)?;
+    // TCP and UDP always come with their ports (`endpoints_of` reads both from
+    // the same transport slice), so `dst_port` needs no check of its own.
     let proto = ep.proto.ok_or(FrameError::NoTransport)?;
-    if matches!(proto, L4Proto::Tcp | L4Proto::Udp) && ep.dst_port.is_none() {
-        return Err(FrameError::NoTransport);
-    }
     Ok(L4Target {
         interface: interface.to_string(),
         direction: L4Direction::Outbound,
@@ -171,46 +156,56 @@ pub fn inject_target(
     })
 }
 
-/// Split `frame` into the family its link header names and the IP bytes behind
-/// it. A buffer shorter than the link header plus a minimal IPv4 header is
-/// [`FrameError::Truncated`] before any of it is read.
-fn strip_link(link: LinkType, frame: &[u8]) -> Result<(Family, &[u8]), FrameError> {
-    let header_len = match link {
-        LinkType::Null => NULL_HEADER_LEN,
-        LinkType::Ethernet => ETHERNET_HEADER_LEN,
-        LinkType::Raw => 0,
-    };
-    if frame.len() < header_len + IPV4_MIN_HEADER_LEN {
-        return Err(FrameError::Truncated);
-    }
-    let (header, ip) = frame.split_at(header_len);
-    let family = match link {
+/// The IP bytes behind `frame`'s link header, once the header is known to name
+/// IPv4 or IPv6 and the version nibble behind it agrees. A buffer shorter than
+/// the link header plus a minimal IPv4 header is [`FrameError::Truncated`]
+/// before any byte of it is interpreted.
+fn strip_link(link: LinkType, frame: &[u8]) -> Result<&[u8], FrameError> {
+    let (claimed, ip) = match link {
         LinkType::Null => {
-            let af = u32::from_ne_bytes(header.try_into().map_err(|_| FrameError::Truncated)?);
-            match af {
+            let (af, ip) = split_header::<NULL_HEADER_LEN>(frame)?;
+            let family = match u32::from_ne_bytes(*af) {
                 AF_INET => Family::V4,
                 AF_INET6 => Family::V6,
                 _ => return Err(FrameError::NotIp),
-            }
+            };
+            (Some(family), ip)
         }
         LinkType::Ethernet => {
-            let ethertype = match header.get(12..14) {
-                Some([hi, lo]) => u16::from_be_bytes([*hi, *lo]),
-                _ => return Err(FrameError::Truncated),
-            };
-            match ethertype {
+            let (header, ip) = split_header::<ETHERNET_HEADER_LEN>(frame)?;
+            let family = match u16::from_be_bytes([header[12], header[13]]) {
                 ETHERTYPE_IPV4 => Family::V4,
                 ETHERTYPE_IPV6 => Family::V6,
                 _ => return Err(FrameError::NotIp),
-            }
+            };
+            (Some(family), ip)
         }
-        LinkType::Raw => ip
-            .first()
-            .copied()
-            .and_then(Family::of_nibble)
-            .ok_or(FrameError::NotIp)?,
+        // No link header: the version nibble alone names the family.
+        LinkType::Raw => (None, split_header::<0>(frame)?.1),
     };
-    Ok((family, ip))
+    // `ip` holds at least a minimal IPv4 header, so its first byte is the
+    // version nibble. A link header that disagrees with it means the kernel
+    // would send something other than what we decoded: refused, not guessed.
+    let nibble = ip
+        .first()
+        .copied()
+        .and_then(Family::of_nibble)
+        .ok_or(FrameError::NotIp)?;
+    if claimed.is_some_and(|family| family != nibble) {
+        return Err(FrameError::NotIp);
+    }
+    Ok(ip)
+}
+
+/// The first `N` bytes of `frame` as its link header and the rest as the IP
+/// packet, or [`FrameError::Truncated`] when the buffer cannot hold the header
+/// plus a minimal IPv4 header. Decided on lengths alone, before any byte is
+/// interpreted.
+fn split_header<const N: usize>(frame: &[u8]) -> Result<(&[u8; N], &[u8]), FrameError> {
+    match frame.split_first_chunk::<N>() {
+        Some((header, ip)) if ip.len() >= IPV4_MIN_HEADER_LEN => Ok((header, ip)),
+        _ => Err(FrameError::Truncated),
+    }
 }
 
 #[cfg(test)]

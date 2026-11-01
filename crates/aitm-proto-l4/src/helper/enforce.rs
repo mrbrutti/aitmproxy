@@ -170,7 +170,6 @@ mod tests {
         let err = hg
             .check_inject("lo", LinkType::Ethernet, &eth_udp(8999))
             .expect_err("8999 is outside 9000-9999");
-        assert!(err.contains("scope"), "{err}");
         assert_eq!(err, "target 127.0.0.1 is out of L4 scope");
     }
 

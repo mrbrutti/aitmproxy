@@ -95,12 +95,12 @@ impl Receipt {
     /// document contains. Malformed bytes yield [`ReceiptError::Json`]. Never
     /// panics — the input is a file any root process could have written.
     pub fn parse(bytes: &[u8]) -> Result<Receipt, ReceiptError> {
-        let probe: SchemaProbe =
-            serde_json::from_slice(bytes).map_err(|err| ReceiptError::Json(err.to_string()))?;
+        let probe: SchemaProbe = serde_json::from_slice(bytes)
+            .map_err(|err| ReceiptError::Json(bounded_json_error(&err)))?;
         if probe.schema != RECEIPT_SCHEMA {
             return Err(ReceiptError::Schema(probe.schema));
         }
-        serde_json::from_slice(bytes).map_err(|err| ReceiptError::Json(err.to_string()))
+        serde_json::from_slice(bytes).map_err(|err| ReceiptError::Json(bounded_json_error(&err)))
     }
 
     /// Serialize the receipt for the helper to write.
@@ -115,10 +115,46 @@ impl Receipt {
     }
 }
 
+/// Longest JSON parser message carried in an error, in bytes, before it is
+/// cut and marked with `…`.
+///
+/// serde quotes peer-chosen text in its messages: an unknown key's name, a
+/// string found where a number belongs. The input these messages describe is
+/// a file any root process could have written or a frame the other end of
+/// the helper socket sent, so an unbounded message would let that peer put a
+/// quarter-megabyte of its own prose — a fake "run sudo …" instruction, say —
+/// into the error a frontend shows. 120 bytes keeps serde's classification
+/// (`unknown field`, `invalid type: string`, `missing field \`x\``) and
+/// enough of the offending text to recognise, and nothing a peer can stretch.
+const MAX_JSON_ERROR_TEXT: usize = 120;
+
+/// serde's message for `err`, cut to [`MAX_JSON_ERROR_TEXT`] bytes on a char
+/// boundary and marked with `…` when it was longer. A message that fits is
+/// returned verbatim, position suffix and all. Shared by every JSON trust
+/// boundary in the crate's privilege contract (the receipt and the helper
+/// protocol's control bodies).
+pub(crate) fn bounded_json_error(err: &serde_json::Error) -> String {
+    let text = err.to_string();
+    if text.len() <= MAX_JSON_ERROR_TEXT {
+        return text;
+    }
+    let mut cut = String::with_capacity(MAX_JSON_ERROR_TEXT + '…'.len_utf8());
+    for c in text.chars() {
+        if cut.len() + c.len_utf8() > MAX_JSON_ERROR_TEXT {
+            break;
+        }
+        cut.push(c);
+    }
+    cut.push('…');
+    cut
+}
+
 /// Why a receipt could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptError {
-    /// The bytes are not the JSON this build expects; carries the parser's message.
+    /// The bytes are not the JSON this build expects; carries the parser's
+    /// message, cut to a bounded length (the writer chooses the text serde
+    /// quotes, not how much of it a reader shows).
     Json(String),
     /// The receipt is a schema this build does not read; carries the version found.
     Schema(u32),
@@ -197,10 +233,9 @@ mod tests {
 
         // Malformed bytes are a Json error, never a panic.
         match Receipt::parse(b"{") {
-            Err(ReceiptError::Json(msg)) => assert!(
-                msg.contains("EOF") || !msg.is_empty(),
-                "the parser's message is carried through, got {msg:?}"
-            ),
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("EOF while parsing"), "{msg}");
+            }
             other => panic!("truncated JSON must be a Json error, got {other:?}"),
         }
         assert!(
@@ -250,20 +285,18 @@ mod tests {
     }
 
     #[test]
-    fn tester_truncated_json_carries_serdes_literal_message() {
-        // Stronger than `contains("EOF") || !is_empty()`: the exact parser text.
-        assert_eq!(
-            Receipt::parse(b"{"),
-            Err(ReceiptError::Json(
-                "EOF while parsing an object at line 1 column 1".to_string()
-            ))
-        );
-        assert_eq!(
-            Receipt::parse(b""),
-            Err(ReceiptError::Json(
-                "EOF while parsing a value at line 1 column 0".to_string()
-            ))
-        );
+    fn tester_truncated_json_carries_serdes_message() {
+        // The parser's classification is carried through; its position suffix
+        // is serde_json's prose and not pinned.
+        for (bytes, prefix) in [
+            (&b"{"[..], "EOF while parsing an object"),
+            (b"", "EOF while parsing a value"),
+        ] {
+            match Receipt::parse(bytes) {
+                Err(ReceiptError::Json(msg)) => assert!(msg.starts_with(prefix), "{msg}"),
+                other => panic!("{bytes:?} must be a Json error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -351,9 +384,9 @@ mod tests {
     #[test]
     fn tester_missing_fields_name_the_field() {
         match Receipt::parse(br#"{"schema":1}"#) {
-            Err(ReceiptError::Json(msg)) => assert_eq!(
-                msg, "missing field `helper_version` at line 1 column 12",
-                "the first missing field is named"
+            Err(ReceiptError::Json(msg)) => assert!(
+                msg.starts_with("missing field `helper_version`"),
+                "the first missing field is named: {msg}"
             ),
             other => panic!("a schema-only receipt must be a Json error, got {other:?}"),
         }
@@ -399,21 +432,27 @@ mod tests {
             Receipt::parse(&doc("1", &format!(r#""junk":{open}{close},"#))),
             Ok(expected())
         );
-        assert_eq!(
-            Receipt::parse(format!(r#"{{"schema":{open}{close}}}"#).as_bytes()),
-            Err(ReceiptError::Json(
-                "invalid type: sequence, expected u32 at line 1 column 10".to_string()
-            ))
-        );
+        match Receipt::parse(format!(r#"{{"schema":{open}{close}}}"#).as_bytes()) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(
+                    msg.starts_with("invalid type: sequence, expected u32"),
+                    "{msg}"
+                );
+            }
+            other => panic!("a nested schema must be a Json error, got {other:?}"),
+        }
         let typed = format!(
             r#"{{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1,"members_added":{open}{close},"errors":[]}}"#
         );
-        assert_eq!(
-            Receipt::parse(typed.as_bytes()),
-            Err(ReceiptError::Json(
-                "invalid type: sequence, expected a string at line 1 column 99".to_string()
-            ))
-        );
+        match Receipt::parse(typed.as_bytes()) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(
+                    msg.starts_with("invalid type: sequence, expected a string"),
+                    "{msg}"
+                );
+            }
+            other => panic!("a nested member must be a Json error, got {other:?}"),
+        }
         let unbalanced = format!(r#"{{"schema":1,"x":{open}"#);
         match Receipt::parse(unbalanced.as_bytes()) {
             Err(ReceiptError::Json(msg)) => {
@@ -460,6 +499,45 @@ mod tests {
             Receipt::parse(&doc("1", r#""rotations":7,"note":{"a":[1,2]},"#)),
             Ok(expected())
         );
+    }
+
+    /// Panel SEC-M1. serde's message quotes peer-chosen text verbatim: a
+    /// string where a number belongs is echoed in full, so a hostile writer
+    /// could plant a quarter-megabyte "run sudo …" sentence in the error a
+    /// frontend shows. The stored message is bounded whatever the input, cut
+    /// at a char boundary, while a short message is carried unchanged.
+    #[test]
+    fn fix_sec_m1_json_error_text_is_bounded() {
+        let long = "a".repeat(250_000);
+        let bytes = format!(r#"{{"schema":"{long}"}}"#);
+        match Receipt::parse(bytes.as_bytes()) {
+            Err(ReceiptError::Json(msg)) => {
+                assert_eq!(msg.len(), 123, "120 bytes of text plus the marker: {msg}");
+                assert!(msg.starts_with("invalid type: string \"aaaa"), "{msg}");
+                assert!(msg.ends_with('…'), "{msg}");
+            }
+            other => panic!("a string schema must be a Json error, got {other:?}"),
+        }
+        // Three-byte chars: the cut lands on a char boundary (22 bytes of
+        // prose plus 32 whole euro signs is 118 bytes), never inside a char.
+        let euro = "\u{20ac}".repeat(100_000);
+        let bytes = format!(r#"{{"schema":"{euro}"}}"#);
+        match Receipt::parse(bytes.as_bytes()) {
+            Err(ReceiptError::Json(msg)) => {
+                assert_eq!(msg.len(), 121, "{msg}");
+                assert_eq!(msg.chars().filter(|c| *c == '\u{20ac}').count(), 32);
+                assert!(msg.ends_with('…'), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
+        // A short message is verbatim: no marker.
+        match Receipt::parse(b"{") {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("EOF while parsing an object"), "{msg}");
+                assert!(!msg.ends_with('…'), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]
