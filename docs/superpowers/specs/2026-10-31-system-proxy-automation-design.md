@@ -281,6 +281,17 @@ incident: a tool whose API calls were routed to another proxy)." The macOS
 setter replaces the entire list, so the union is computed before the single
 write.
 
+**Operator-critical hosts (added 2026-10-31 after the first live run; orchestrator's
+requirement, flagged to Matt).** While the system proxy points at the core, every
+proxy-aware process on the machine routes through it — including the operator's
+own tooling (Claude Desktop, browsers, `gh`), which does not trust the MITM CA and
+fails TLS for the duration. The product therefore ships a *recommended* bypass
+list the frontends pre-fill into the editable "Bypass hosts" field on first run
+(the operator may clear it): `*.anthropic.com`, `api.anthropic.com`, `claude.ai`,
+`*.claude.ai`, `github.com`, `*.githubusercontent.com`. It is a UI default for
+the `bypass` setting, not part of `BYPASS_DEFAULT` (the core's loopback/local
+defaults stay minimal and testable), and every live proof on Matt's Mac uses it.
+
 ### D6. Status model, verb schemas, example payloads
 
 `proxy.system.status` — params: none. Result object (field names are the
