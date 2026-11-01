@@ -907,6 +907,15 @@ fn build_masks_a_credential_nested_under_a_secret_parent_on_every_surface() {
     );
 }
 
+/// The body text of the PoC step that `StdPocBuilder` builds from a flow whose body is
+/// `bytes` (`/x`, `basic_spec()`), or `None` when the step has no body.
+fn built_body(bytes: &[u8]) -> Option<String> {
+    let poc = StdPocBuilder
+        .build(&flow_with("/x", Body::Bytes(bytes.to_vec())), basic_spec())
+        .expect("build");
+    http_step(&poc).body.clone()
+}
+
 /// A nested credential in a header the builder keeps (its name is not a secret), on one line
 /// and across a tab and a no-break space (a header value cannot hold a line break:
 /// `HeaderMap::set` drops it); in a query value, where the pair has no blank to read across;
@@ -964,13 +973,7 @@ fn build_masks_a_nested_credential_in_a_header_a_query_value_and_a_body_cut_at_e
     let mut cuts = 0;
     let mut leaks: Vec<(usize, String)> = Vec::new();
     for cut in 0..=body.len() {
-        let poc = StdPocBuilder
-            .build(
-                &flow_with("/x", Body::Bytes(body[..cut].to_vec())),
-                basic_spec(),
-            )
-            .expect("build");
-        let text = http_step(&poc).body.clone().unwrap_or_default();
+        let text = built_body(&body[..cut]).unwrap_or_default();
         cuts += 1;
         if text.contains('Q') {
             leaks.push((cut, text));
@@ -978,11 +981,8 @@ fn build_masks_a_nested_credential_in_a_header_a_query_value_and_a_body_cut_at_e
     }
     assert!(cuts >= 25, "the body is too short: {cuts} cuts");
     assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
-    let poc = StdPocBuilder
-        .build(&flow_with("/x", Body::Bytes(body.to_vec())), basic_spec())
-        .expect("build");
     assert_eq!(
-        http_step(&poc).body.as_deref(),
+        built_body(body).as_deref(),
         Some("auth:\n  [redacted] [redacted]")
     );
 }
@@ -999,13 +999,7 @@ fn build_masks_a_nested_credential_in_an_oversized_opaque_body() {
     let body = UNIT.repeat(copies);
     assert!(body.len() >= FLOOR && body.len() <= CEILING);
 
-    let poc = StdPocBuilder
-        .build(
-            &flow_with("/x", Body::Bytes(body.into_bytes())),
-            basic_spec(),
-        )
-        .expect("build");
-    let text = http_step(&poc).body.clone().expect("a body");
+    let text = built_body(body.as_bytes()).expect("a body");
     assert!(
         !text.contains("BIGPW8"),
         "a canary of the large body leaked"

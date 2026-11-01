@@ -2357,9 +2357,8 @@ mod tests {
 
     /// A next-line value that only looks like a pair (a padded base64 tail, a
     /// colon inside the value, a credential-shaped word) is masked whole under
-    /// a secret parent, and a standard pair that follows its parent keeps the
-    /// output the embedded scrub gave when this test was written. These rows
-    /// hold on any rule that reads a nested pair.
+    /// a secret parent, and a standard pair that follows its parent keeps its
+    /// output. These rows hold on any rule that reads a nested pair.
     #[test]
     fn scrub_embedded_keeps_the_output_it_had_for_a_value_that_looks_like_a_pair() {
         let rows: &[(&str, &str)] = &[
@@ -2375,7 +2374,7 @@ mod tests {
                 "auth:\n  [redacted]\n    password: [redacted]",
             ),
         ];
-        assert!(rows.len() == 8, "the table changed: {} rows", rows.len());
+        assert!(rows.len() >= 8, "the table lost a row: {} rows", rows.len());
 
         let bad = embedded_mismatches(rows);
         assert!(
@@ -2388,7 +2387,7 @@ mod tests {
     /// begins inside a masked value is read and a line break beside a separator
     /// is read across, each with its new output and, in a comment, what the old
     /// pipeline at `15009b2` printed. None of them is in
-    /// [`RECORDED_SCRUB_EMBEDDED`] any more.
+    /// [`RECORDED_SCRUB_EMBEDDED`], which keeps the rows whose output did not move.
     #[test]
     fn scrub_embedded_nested_pair_changes_are_exactly_these() {
         let rows: &[(&str, &str)] = &[
@@ -2564,8 +2563,25 @@ mod tests {
         );
     }
 
-    // ---- Tester additions: a nested credential in a text cut short, and on the
-    // ---- surfaces of a PoC that the nested-pair tests above do not reach.
+    // ---- A nested credential in a text cut short, and on the surfaces of a PoC
+    // ---- that the nested-pair tests above do not reach.
+
+    /// Count the cuts in `outputs`, each a cut position and the scrubbed text of
+    /// that cut, and collect the ones whose text still holds a `Q`. Every credential
+    /// in these texts is a run of `Q` and `Q` is nowhere else in them.
+    fn leaking_cuts(
+        outputs: impl IntoIterator<Item = (usize, String)>,
+    ) -> (usize, Vec<(usize, String)>) {
+        let mut cuts = 0;
+        let mut leaks = Vec::new();
+        for (cut, text) in outputs {
+            cuts += 1;
+            if text.contains('Q') {
+                leaks.push((cut, text));
+            }
+        }
+        (cuts, leaks)
+    }
 
     /// A connection that drops mid-stream hands over a prefix of the text. Cut at
     /// every char boundary, the embedded scrub never panics and leaves no character
@@ -2573,6 +2589,11 @@ mod tests {
     /// `Q` is nowhere else in a text. Userinfo in the text, before the pair and
     /// inside its value, is stripped first as it always was. The whole text comes
     /// out as the rule says.
+    ///
+    /// The documents are the two that hold userinfo, the one thing `scrub_embedded`
+    /// adds to `scrub_text_wide`; core's
+    /// `scrub_text_masks_a_nested_credential_on_every_prefix_of_the_text` cuts the
+    /// nested shapes.
     #[test]
     fn scrub_embedded_masks_a_nested_credential_on_every_prefix_of_the_text() {
         let docs: &[(&str, &str)] = &[
@@ -2584,41 +2605,14 @@ mod tests {
                 "auth:\n  password: http://u:pw@host/QQQQ",
                 "auth:\n  [redacted] [redacted]",
             ),
-            (
-                "credentials:\r\n\tsecret: QQQQ",
-                "credentials:\r\n\t[redacted] [redacted]",
-            ),
-            (
-                "auth:\n  token:\n    secret:\n      password: QQQQ",
-                "auth:\n  [redacted]\n    [redacted]\n      [redacted] [redacted]",
-            ),
-            (
-                "auth:\n  password: \u{e9}QQQQ\u{1f600}",
-                "auth:\n  [redacted] [redacted]",
-            ),
-            ("userSession:\n  QQQQ", "userSession:\n  [redacted]"),
-            (
-                "auth:\n  sessionKey: QQQQ",
-                "auth:\n  [redacted] [redacted]",
-            ),
-            (
-                "Credentials:\n\tjwt:\n\tsidebar :  \"QQQQ\"",
-                "Credentials:\n\t[redacted]\n\t[redacted] :  \"[redacted]\"",
-            ),
         ];
-        let mut cuts = 0;
-        let mut leaks: Vec<(usize, String)> = Vec::new();
         for &(doc, whole) in docs {
             assert!(scrub_embedded(doc) == whole, "the whole text: {doc:?}");
-            for prefix in prefixes(doc) {
-                cuts += 1;
-                let out = scrub_embedded(prefix);
-                if out.contains('Q') {
-                    leaks.push((prefix.len(), out));
-                }
-            }
         }
-        assert!(cuts >= 250, "the documents are too short: {cuts} cuts");
+        let (cuts, leaks) = leaking_cuts(docs.iter().flat_map(|&(doc, _)| {
+            prefixes(doc).map(|prefix| (prefix.len(), scrub_embedded(prefix)))
+        }));
+        assert!(cuts >= 80, "the documents are too short: {cuts} cuts");
         assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
     }
 
@@ -2666,19 +2660,13 @@ mod tests {
         // The body, cut at every byte. `\u{e9}` is two bytes, `\u{1f600}` four, so
         // some cuts split a character and the lossy decode puts U+FFFD there.
         let body = "auth:\n  password: \u{e9}QQQQ\u{1f600}".as_bytes();
-        let mut cuts = 0;
-        let mut leaks: Vec<(usize, String)> = Vec::new();
-        for cut in 0..=body.len() {
+        let (cuts, leaks) = leaking_cuts((0..=body.len()).map(|cut| {
             let mut flow = flow_with("POST", "/search?q=hello", &[], None);
             flow.request.body = Body::Bytes(body[..cut].to_vec());
             let q = point(&flow, Location::Query, "q", "hello");
             let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
-            let text = http_step(&poc).body.clone().unwrap_or_default();
-            cuts += 1;
-            if text.contains('Q') {
-                leaks.push((cut, text));
-            }
-        }
+            (cut, http_step(&poc).body.clone().unwrap_or_default())
+        }));
         assert!(cuts >= 25, "the body is too short: {cuts} cuts");
         assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
         let mut flow = flow_with("POST", "/search?q=hello", &[], None);
