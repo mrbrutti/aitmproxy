@@ -22,7 +22,7 @@ use aitm_tui::keys;
 use aitm_tui::scan::{EditorField, ProfilePane, ScanTab, EDITOR_FIELDS};
 use common::*;
 use crossterm::event::KeyCode;
-use serde_json::{json, Value};
+use serde_json::json;
 
 const TOOLS: &[&str] = &[
     "scan.start",
@@ -41,22 +41,6 @@ const ORIGIN: &str = "https://auth.shop-staging.test";
 const GATE_NO_LAYER: &str = "L4 launch disabled: the L4 layer is not on this bus (l4.scope.list)";
 const GATE_NO_TARGET: &str = "L4 launch disabled: add an L4 target (ip, port, proto) first";
 const GATE_NO_INJECT: &str = "L4 launch disabled: no L4 scope entry with the inject capability. Add one with interface \"*\", direction outbound, 127.0.0.1/32 ports 7000, capability inject (l4.scope.add).";
-
-fn tagged(tag: &str, name: &str, args: Value) -> BusRequest {
-    BusRequest::CallTagged {
-        tag: tag.into(),
-        name: name.into(),
-        args,
-    }
-}
-
-fn reply(tag: &str, name: &str, value: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: tag.into(),
-        name: name.into(),
-        value,
-    }
-}
 
 /// The launch requests among `reqs`: `scan.start`, `scan.map` or the
 /// legacy `scan.discover`, tagged or not (an open also lists jobs and
@@ -82,26 +66,10 @@ fn connected_with(tool_names: &[&str]) -> App {
     app
 }
 
-/// [`connected_with`], opened on the Scan view (landing on Profiles, D2)
-/// with the open's reads settled from the fixtures. Nothing is in flight.
+/// [`opened_v2`] with one host in scope.
 fn opened_with(tool_names: &[&str]) -> App {
-    let mut app = connected_with(tool_names);
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
-    let _ = app.on_bus(reply(
-        "scan.profile.list",
-        "scan.profile.list",
-        fixture("scan.profile.list.json"),
-    ));
-    let _ = app.on_bus(reply(
-        "scan.checks",
-        "scan.checks",
-        fixture("scan.checks.json"),
-    ));
-    assert_eq!(app.mode, Mode::Scan);
-    assert_eq!(app.scan.tab, ScanTab::Profiles);
-    assert_eq!(app.scan.profiles.list[3].name, "standard");
-    assert!(app.scan.inflight.is_empty(), "{:?}", app.scan.inflight);
+    let mut app = opened_v2(tool_names);
+    app.scope = vec![SCOPE_HOST.to_string()];
     app
 }
 

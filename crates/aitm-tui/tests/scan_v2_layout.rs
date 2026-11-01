@@ -14,14 +14,14 @@
 
 mod common;
 
-use aitm_tui::action::{Action, BusEvent, BusRequest};
+use aitm_tui::action::{Action, BusRequest};
 use aitm_tui::app::{App, Mode, BUILTIN_COMMANDS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::ScanTab;
 use aitm_tui::ui::scan::HELP;
 use common::*;
 use crossterm::event::KeyCode;
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// Every verb of the v2 surface (spec D2, D3).
 const TOOLS: &[&str] = &[
@@ -48,14 +48,6 @@ const XSS: &str = "issue-9f8e7d6c";
 
 /// The sizes T7-14 names.
 const SIZES: [(u16, u16); 4] = [(200, 50), (90, 40), (100, 30), (40, 4)];
-
-fn reply(tag: &str, name: &str, value: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: tag.into(),
-        name: name.into(),
-        value,
-    }
-}
 
 /// A connected v2 app at 200x50 with every tab populated from the fixture
 /// pack: the `standard` editor open on Profiles, one status'd job on Jobs,
@@ -247,7 +239,7 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
     let row = text
         .lines()
         .find(|l| l.contains("running/audit"))
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("no running/audit row:\n{text}"));
     assert!(
         !row.contains("standard"),
         "the narrow row does not carry the profile: {row:?}"
@@ -257,7 +249,7 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
     let header = wide
         .lines()
         .find(|l| l.contains("state/phase"))
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("no wide Jobs header:\n{wide}"));
     let words: Vec<&str> = header.trim_matches('│').split_whitespace().collect();
     assert_eq!(
         words,

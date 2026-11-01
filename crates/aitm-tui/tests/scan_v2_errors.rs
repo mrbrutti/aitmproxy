@@ -13,11 +13,10 @@
 mod common;
 
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level};
-use aitm_tui::app::{App, Mode};
-use aitm_tui::caps::TermCaps;
+use aitm_tui::app::App;
 use aitm_tui::scan::{ScanError, ScanTab, ERROR_DETAIL_MAX};
 use common::*;
-use serde_json::{json, Value};
+use serde_json::json;
 
 const TOOLS: &[&str] = &[
     "scan.start",
@@ -77,55 +76,12 @@ const D9: [(&str, &str); 9] = [
     ),
 ];
 
-fn tagged(tag: &str, name: &str, args: Value) -> BusRequest {
-    BusRequest::CallTagged {
-        tag: tag.into(),
-        name: name.into(),
-        args,
-    }
-}
-
-fn reply(tag: &str, name: &str, value: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: tag.into(),
-        name: name.into(),
-        value,
-    }
-}
-
-fn failed(tag: &str, name: &str, message: &str) -> BusEvent {
-    BusEvent::CallTaggedFailed {
-        tag: tag.into(),
-        name: name.into(),
-        message: message.into(),
-    }
-}
-
-/// A connected v2 app at 240x50 opened on the Scan view (landing on
-/// Profiles, D2) with the open's reads settled from the fixtures. Nothing
-/// is in flight. 240 columns so the longest D9 wording fits the banner and
-/// one footer row.
+/// [`opened_v2`] at 240x50 with one host in scope: 240 columns so the
+/// longest D9 wording fits the banner and one footer row.
 fn opened() -> App {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let mut app = opened_v2(TOOLS);
     let _ = app.update(Action::Resize(240, 50));
-    let _ = connect(&mut app, TOOLS, None);
     app.scope = vec![SCOPE_HOST.to_string()];
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
-    let _ = app.on_bus(reply(
-        "scan.profile.list",
-        "scan.profile.list",
-        fixture("scan.profile.list.json"),
-    ));
-    let _ = app.on_bus(reply(
-        "scan.checks",
-        "scan.checks",
-        fixture("scan.checks.json"),
-    ));
-    assert_eq!(app.mode, Mode::Scan);
-    assert_eq!(app.scan.tab, ScanTab::Profiles);
-    assert_eq!(app.scan.profiles.list[3].name, "standard");
-    assert!(app.scan.inflight.is_empty(), "{:?}", app.scan.inflight);
     app
 }
 
@@ -140,15 +96,15 @@ fn banner_line(text: &str) -> &str {
 
 /// The rows the Profiles footer reason may wrap onto (at most four, D11),
 /// the detail side only, joined with one space, and the row index the
-/// first of them sits on. The wrap cuts after a clause-ending `:`, so the
-/// wording and its detail can sit on two rows.
-fn footer_reason(text: &str) -> (String, usize) {
+/// first of them (the one carrying `needle`) sits on. The wrap cuts after
+/// a clause-ending `:`, so the wording and its detail can sit on two rows.
+fn footer_reason(text: &str, needle: &str) -> (String, usize) {
     let footer =
         line_index(text, PROFILES_FOOTER).unwrap_or_else(|| panic!("the footer is drawn:\n{text}"));
     let lines: Vec<&str> = text.lines().collect();
     let first = (footer.saturating_sub(4)..footer)
-        .find(|y| lines[*y].contains("Out of scope"))
-        .unwrap_or_else(|| panic!("the wording sits above the footer:\n{text}"));
+        .find(|y| lines[*y].contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} sits above the footer:\n{text}"));
     let joined = (first..footer)
         .map(|y| {
             // The detail side: between the pane rule and the box's right
@@ -442,7 +398,7 @@ fn a_refused_launch_keeps_the_key_live() {
     );
 
     let text = screen(&app);
-    let (reason, y) = footer_reason(&text);
+    let (reason, y) = footer_reason(&text, "Out of scope");
     assert!(
         reason.contains("Out of scope: add the HTTP host to Scope (S)"),
         "the refused wording sits in the footer rows:\n{text}"
@@ -455,15 +411,15 @@ fn a_refused_launch_keeps_the_key_live() {
         banner_line(&text).contains("Out of scope: add the HTTP host to Scope (S)"),
         "and the banner shows the tab's error:\n{text}"
     );
-    let row = text.lines().nth(y).unwrap_or_default();
-    let x = col_of(row, "Out of scope").unwrap_or_default();
+    let row = text.lines().nth(y).expect("the wording row");
+    let x = col_of(row, "Out of scope").expect("the wording column");
     let buf = draw(&app, 240, 50);
     assert_eq!(
         cell(&buf, x, y).fg,
         theme()
             .fg(&aitm_tui::tokens::color::status::CLIENT_ERROR)
             .fg
-            .unwrap_or_default(),
+            .expect("the theme sets a foreground"),
         "the warning hue"
     );
 

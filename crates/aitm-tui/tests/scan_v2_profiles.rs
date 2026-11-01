@@ -48,22 +48,6 @@ const TOOLS: &[&str] = &[
 const ORIGIN: &str = "http://127.0.0.1:8080";
 const SESSION_LINE: &str = "session: observed · sid, authorization (names) · canary GET /account";
 
-fn tagged(tag: &str, name: &str, args: Value) -> BusRequest {
-    BusRequest::CallTagged {
-        tag: tag.into(),
-        name: name.into(),
-        args,
-    }
-}
-
-fn reply(tag: &str, name: &str, value: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: tag.into(),
-        name: name.into(),
-        value,
-    }
-}
-
 /// A connected v2 app at 200x50, still on Flows: nothing scan-related has
 /// been asked yet.
 fn connected() -> App {
@@ -73,34 +57,9 @@ fn connected() -> App {
     app
 }
 
-/// [`connected`], opened on the Scan view (landing on Profiles, D2) with the
-/// open's three reads settled: an empty `scan.list`, the profile list and
-/// the check catalogue fixtures. Nothing is in flight afterwards.
+/// [`opened_v2`] on this suite's tools, with the fixture counts asserted.
 fn app() -> App {
-    let mut app = connected();
-    let reqs = app.update(Action::OpenScan);
-    assert_eq!(
-        reqs,
-        vec![
-            tagged("scan.list", "scan.list", json!({})),
-            tagged("scan.profile.list", "scan.profile.list", json!({})),
-            tagged("scan.checks", "scan.checks", json!({})),
-        ],
-        "the first open lands on Profiles and reads its list and checks (D6)"
-    );
-    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
-    let _ = app.on_bus(reply(
-        "scan.profile.list",
-        "scan.profile.list",
-        fixture("scan.profile.list.json"),
-    ));
-    let _ = app.on_bus(reply(
-        "scan.checks",
-        "scan.checks",
-        fixture("scan.checks.json"),
-    ));
-    assert_eq!(app.mode, Mode::Scan);
-    assert_eq!(app.scan.tab, ScanTab::Profiles);
+    let app = opened_v2(TOOLS);
     assert_eq!(
         app.scan.profiles.list.len(),
         7,

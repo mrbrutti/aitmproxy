@@ -4,11 +4,12 @@
 
 #![allow(dead_code)]
 
-use aitm_tui::action::{BusEvent, BusRequest, ToolInfo};
-use aitm_tui::app::App;
+use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
+use aitm_tui::app::{App, Mode};
+use aitm_tui::caps::TermCaps;
 use aitm_tui::fixture_app_core;
 use aitm_tui::model::ProxyStatus;
-use aitm_tui::scan::ScanOffer;
+use aitm_tui::scan::{ScanOffer, ScanTab};
 use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -188,4 +189,69 @@ pub fn fixture(name: &str) -> Value {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("fixture {name}: cannot read {path}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("fixture {name} is not JSON: {e}"))
+}
+
+/// A tagged call request, as the reducer issues one (fix round G, G80: the
+/// one scaffolding the scanner v2 suites share).
+pub fn tagged(tag: &str, name: &str, args: Value) -> BusRequest {
+    BusRequest::CallTagged {
+        tag: tag.into(),
+        name: name.into(),
+        args,
+    }
+}
+
+/// A tagged success reply.
+pub fn reply(tag: &str, name: &str, value: Value) -> BusEvent {
+    BusEvent::CallTaggedOk {
+        tag: tag.into(),
+        name: name.into(),
+        value,
+    }
+}
+
+/// A tagged failure reply.
+pub fn failed(tag: &str, name: &str, message: &str) -> BusEvent {
+    BusEvent::CallTaggedFailed {
+        tag: tag.into(),
+        name: name.into(),
+        message: message.into(),
+    }
+}
+
+/// A connected v2 app at 200x50 opened on the Scan view (landing on
+/// Profiles, D2) with the open's three reads (`scan.list`,
+/// `scan.profile.list`, `scan.checks`; D6) asserted to leave and settled
+/// from the fixtures: an empty job list, the seven profiles and the check
+/// catalogue. Nothing is in flight afterwards.
+pub fn opened_v2(tool_names: &[&str]) -> App {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, tool_names, None);
+    let reqs = app.update(Action::OpenScan);
+    assert_eq!(
+        reqs,
+        vec![
+            tagged("scan.list", "scan.list", json!({})),
+            tagged("scan.profile.list", "scan.profile.list", json!({})),
+            tagged("scan.checks", "scan.checks", json!({})),
+        ],
+        "the first open lands on Profiles and reads its list and checks (D6)"
+    );
+    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
+    let _ = app.on_bus(reply(
+        "scan.profile.list",
+        "scan.profile.list",
+        fixture("scan.profile.list.json"),
+    ));
+    let _ = app.on_bus(reply(
+        "scan.checks",
+        "scan.checks",
+        fixture("scan.checks.json"),
+    ));
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(app.scan.tab, ScanTab::Profiles);
+    assert_eq!(app.scan.profiles.list[3].name, "standard");
+    assert!(app.scan.inflight.is_empty(), "{:?}", app.scan.inflight);
+    app
 }
