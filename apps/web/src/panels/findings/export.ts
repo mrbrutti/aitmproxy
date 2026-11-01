@@ -2,7 +2,7 @@
 // an anchor; names are `<title-slug>-<yyyymmdd-HHMM>.<ext>` so repeated runs of one PoC sort by
 // time and never overwrite each other. HAR of the capture waits on the core follow-up.
 
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { base64ToBytes } from '~/lib/bytes';
 
 export type ExportExt = 'yaml' | 'png';

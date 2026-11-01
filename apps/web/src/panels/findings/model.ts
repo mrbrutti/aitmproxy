@@ -1,7 +1,7 @@
 // Pure helpers behind the Findings panel: ordering, filtering, counts, the "when" text and the
 // Run-again `vars` round trip. Kept free of Solid so they test as plain functions.
 
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { fmtClock } from '~/lib/format';
 
 export const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
