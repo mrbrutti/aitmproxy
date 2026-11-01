@@ -622,6 +622,23 @@ impl Engine {
         run
     }
 
+    /// [`lanes_for_run`](Self::lanes_for_run) as `scan.checks` reports it: each
+    /// lane with its source, `interim` for the engine's own HTTP lane and
+    /// `crate` for every lane a lane crate handed the binary.
+    pub fn lane_entries(&self) -> Vec<aitm_scan_model::LaneEntry> {
+        self.lanes_for_run()
+            .iter()
+            .map(|lane| aitm_scan_model::LaneEntry {
+                lane: lane.lane(),
+                source: if Arc::ptr_eq(lane, &self.interim) {
+                    aitm_scan_model::LaneSource::Interim
+                } else {
+                    aitm_scan_model::LaneSource::Crate
+                },
+            })
+            .collect()
+    }
+
     /// The catalogue as this engine would run it, assembled fresh so a script
     /// added since the last call is in it (spec D4).
     pub fn catalogue(&self) -> Catalogue {
@@ -2223,6 +2240,29 @@ mod tests {
         );
     }
 
+    /// `scan.checks` tells a client which lane is the interim one: with a lane
+    /// crate present the `http` lane is `crate`, with none it is `interim`
+    /// (a cell that needs T2's lane skips on this, instead of failing).
+    #[test]
+    fn lane_entries_name_the_interim_lane() {
+        use aitm_scan_model::{LaneEntry, LaneSource};
+        let bare = Harness::bare();
+        assert_eq!(
+            bare.engine.lane_entries(),
+            vec![LaneEntry {
+                lane: LaneKind::Http,
+                source: LaneSource::Interim
+            }]
+        );
+        let with_lane = Harness::new();
+        let entries = with_lane.engine.lane_entries();
+        let http = entries
+            .iter()
+            .find(|e| e.lane == LaneKind::Http)
+            .expect("the harness lane is an http lane");
+        assert_eq!(http.source, LaneSource::Crate);
+        assert!(entries.iter().all(|e| e.source == LaneSource::Crate));
+    }
     /// Coordinator decision 1: the two error-prefix conventions a lane may use
     /// instead of the `JobCtx` hooks.
     #[test]

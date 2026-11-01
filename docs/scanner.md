@@ -103,7 +103,7 @@ submits a form, because a form POST is a write the target did not see coming.)
 | `scan.issue` | Read | `id` | `Issue` | `not_found` |
 | `scan.issue.update` | Write | `id`, `status`, `note?` | `Issue` | `not_found`, `invalid_profile` |
 | `scan.sitemap` | Read | `job?` or `target?`, `cursor?`, `limit?` (1024, max 4096) | `{ nodes, points, next_cursor }` | `invalid_profile`, `not_found` |
-| `scan.checks` | Read | `lane?`, `class?`, `origin?` | `{ checks: [CheckMeta] }` | `invalid_profile` |
+| `scan.checks` | Read | `lane?`, `class?`, `origin?` | `{ checks: [CheckMeta], lanes: [{ lane, source: crate \| interim }] }` | `invalid_profile` |
 | `scan.profile.list` | Read | — | `{ profiles: [{ name, builtin, summary }] }` | — |
 | `scan.profile.get` | Read | `name` | `ScanProfile` | `not_found`, `invalid_profile` |
 | `scan.profile.save` | Write | `profile` | `{ saved, path }` | `invalid_profile` |

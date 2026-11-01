@@ -967,7 +967,8 @@ impl Command for ScanChecks {
             .engine
             .catalogue()
             .filter(lane, class.as_deref(), origin.as_deref());
-        result_of(&ChecksResult { checks })
+        let lanes = self.engine.lane_entries();
+        result_of(&ChecksResult { checks, lanes })
     }
 }
 
@@ -1779,6 +1780,13 @@ mod tests {
 
         let ws = h.ok("scan.checks", &[("lane", s("ws"))]);
         assert_eq!(as_array(obj(&ws, "checks")).len(), 0);
+
+        // The lanes the engine would run, with their source: with no lane crate
+        // the `http` lane is the interim one, and a filter does not hide it.
+        let lanes = as_array(obj(&ws, "lanes"));
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(as_str(obj(&lanes[0], "lane")), "http");
+        assert_eq!(as_str(obj(&lanes[0], "source")), "interim");
 
         let demo = h.ok("scan.checks", &[("class", s("demo"))]);
         assert_eq!(as_array(obj(&demo, "checks")).len(), 1);

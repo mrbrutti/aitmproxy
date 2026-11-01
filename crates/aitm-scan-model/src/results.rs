@@ -88,12 +88,40 @@ pub struct SitemapResult {
     pub next_cursor: Option<String>,
 }
 
+/// Where a lane the engine would run on comes from (additive, 2026-11-01):
+/// a lane crate (`crate`, the default) or the engine's interim HTTP lane
+/// (`interim`), which serves `http` only until `aitm-scan-http` lands. A client
+/// that needs the real lane (T2's e2e cells) reads this instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneSource {
+    /// A lane a lane crate handed the binary.
+    #[default]
+    Crate,
+    /// The engine's interim HTTP lane.
+    Interim,
+}
+
+/// One lane the engine would run a job on, with its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LaneEntry {
+    /// The lane.
+    pub lane: LaneKind,
+    /// Where it comes from; absent on the wire means `crate`.
+    #[serde(default)]
+    pub source: LaneSource,
+}
+
 /// The result of `scan.checks`: the unified catalogue as loaded (spec D4).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct ChecksResult {
     /// The checks matching the filter, native and script alike.
     pub checks: Vec<CheckMeta>,
+    /// The lanes this engine would run a job on, unfiltered, each with its
+    /// source (additive; an older core omits the key).
+    pub lanes: Vec<LaneEntry>,
 }
 
 /// The result of `scan.profile.list`: every built-in and saved profile.

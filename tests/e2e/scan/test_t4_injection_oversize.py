@@ -5,7 +5,7 @@
 # reflection.rs) and the oversize check is id+class `ws-oversize-frame`
 # (checks/oversize.rs); `ws-injection` is retired.
 """AC T4-3: seeded reflected injection in the `msg` field is found on V
-(`ws-input-reflection`) and not on P; `ws-oversize-frame` sends exactly one frame
+(`ws-input-reflection`) and not on P; `ws-oversize-frame` sends exactly one frame per WS point
 of `2 x max observed`, capped.
 
 Real, never a fixture: a stdlib RFC 6455 client holds a real `/ws` conversation
@@ -121,14 +121,20 @@ def main() -> int:
             v_refl = [i for i in v_issues if i.get("class") == WS_REFLECTION_CLASS]
             check(len(v_refl) >= 1, f"V: a {WS_REFLECTION_CLASS} issue was raised ({len(v_refl)})")
 
-            section("V: exactly one lane frame at 2 x max observed (capped)")
+            section("V: one lane frame at 2 x max observed per WS point (capped)")
+            # T4's lane sends the oversize frame once per insertion point by
+            # design (one conversation per point), so the count is the number of
+            # WS points the job audited, not one per job (integration-shared cell
+            # edit by T1b, 2026-11-01, on the coordinator's ruling).
+            n_points = int(((v_final.get("points") or {}).get("audited")) or 0)
+            check(n_points >= 1, f"V: the ws job audited {n_points} WS point(s)")
             lane_in = [f for f in v.logs.ws()
                        if f.get("kind") == "frame" and f.get("dir") == "in"
                        and int(f.get("seq", 0)) > v_seq0]
             oversize = [f for f in lane_in if int(f.get("len", 0)) == 2 * v_max]
-            check(len(oversize) == 1,
-                  f"exactly one lane in-frame has len == 2*{v_max} == {2 * v_max} "
-                  f"({len(oversize)} of {len(lane_in)} lane frames)")
+            check(len(oversize) == n_points,
+                  f"one lane in-frame per WS point has len == 2*{v_max} == {2 * v_max} "
+                  f"({len(oversize)} of {len(lane_in)} lane frames; {n_points} point(s))")
             v_oversize_issues = [i for i in v_issues if i.get("check_id") == WS_OVERSIZE_CHECK_ID]
             check(len(v_oversize_issues) <= 1,
                   f"{WS_OVERSIZE_CHECK_ID} contributes at most one issue per job "
