@@ -1111,9 +1111,16 @@ async fn a_guard_refusal_and_a_dead_target_are_warned() {
         !recorded.is_empty(),
         "the capture recorded nothing at all, so nothing below is proven"
     );
+    // Ports 9009 and 9010 are this test's alone: the capture sink is global
+    // and the other tests in this binary emit into it beside us, so a line is
+    // picked by the point it names and not by being the only one of its kind.
     let warned: Vec<&String> = recorded
         .iter()
-        .filter(|line| line.starts_with("WARN ") && line.contains("listener ports"))
+        .filter(|line| {
+            line.starts_with("WARN ")
+                && line.contains("listener ports")
+                && line.contains(point.id.as_str())
+        })
         .collect();
     assert_eq!(
         warned.len(),
@@ -1121,8 +1128,8 @@ async fn a_guard_refusal_and_a_dead_target_are_warned() {
         "one WARN for the guard refusal: {recorded:?}"
     );
     assert!(
-        warned[0].contains(&point.id),
-        "the WARN names the point: {}",
+        warned[0].contains("endpoint=127.0.0.1:9009"),
+        "{}",
         warned[0]
     );
 
@@ -1156,7 +1163,10 @@ async fn a_guard_refusal_and_a_dead_target_are_warned() {
     let warned: Vec<&String> = recorded
         .iter()
         .filter(|line| {
-            line.starts_with("WARN ") && line.contains("target") && line.contains("recover")
+            line.starts_with("WARN ")
+                && line.contains("target")
+                && line.contains("recover")
+                && line.contains(point.id.as_str())
         })
         .collect();
     assert_eq!(
@@ -1164,9 +1174,5 @@ async fn a_guard_refusal_and_a_dead_target_are_warned() {
         1,
         "one WARN for the target that never came back: {recorded:?}"
     );
-    assert!(
-        warned[0].contains(&point.id),
-        "the WARN names the point: {}",
-        warned[0]
-    );
+    assert!(warned[0].contains("job=22down"), "{}", warned[0]);
 }
