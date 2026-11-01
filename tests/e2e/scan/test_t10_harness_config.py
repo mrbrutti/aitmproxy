@@ -109,6 +109,13 @@ def check_emitter_literals() -> None:
           "a CoreConfig with no scanner section emits no scanner: key")
     cfg9 = CoreConfig(proxy_port=1, l4_enabled=True, l4_scope_entries=[l4_inject_entry()])
     check(S9_BLOCK in cfg9.to_yaml(), "S9: l4_inject_entry() emits the exact l4:/scope: block")
+    # The browser proxy port: 0 (the default) must never reach the YAML, obscura
+    # dials that literal address (T2 live diagnosis, 2026-11-01).
+    default_yaml = CoreConfig(proxy_port=1).to_yaml()
+    check("proxy_addr: 127.0.0.1:0" not in default_yaml and "proxy_addr: 127.0.0.1:" in default_yaml,
+          "browser proxy: the default port is resolved to a real port, never written as :0")
+    check("proxy_addr: 127.0.0.1:5555" in CoreConfig(proxy_port=1, browser_proxy_port=5555).to_yaml(),
+          "browser proxy: an explicit port is written verbatim")
 
 
 def check_core_b_l4_scope() -> None:
