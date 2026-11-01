@@ -65,9 +65,8 @@ fn template_segment(segment: &str) -> &str {
 
 /// The template placeholder [`path_template`] renders `segment` as, or `None`
 /// when it is kept verbatim: `{id}` for all digits, `{uuid}` for a UUID, `{oid}`
-/// for a 24-hex object id (S-M2, so a point naming an id-like segment shows the
-/// placeholder instead of the token).
-pub(crate) fn placeholder_for(segment: &str) -> Option<&'static str> {
+/// for a 24-hex object id.
+fn placeholder_for(segment: &str) -> Option<&'static str> {
     if is_all_digits(segment) {
         Some("{id}")
     } else if is_uuid(segment) {
@@ -79,11 +78,30 @@ pub(crate) fn placeholder_for(segment: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a path segment is an opaque token whose example must be withheld: a
-/// UUID, or a run of 16 or more hex characters (a 24-hex object id, a 64-hex
-/// reset token, a session handle). A plain numeric id is not opaque — its
-/// example is safe to show (S-M2).
-pub(crate) fn is_opaque_token(segment: &str) -> bool {
+/// The one name a path segment that carries a token is shown under, or `None`
+/// when the segment is a route word shown as itself (S-M2, R-M1).
+///
+/// An id-like segment ([`is_id_like`]) is named by its template placeholder,
+/// `{id}`, `{uuid}` or `{oid}`, so the point and the site-map node agree. Any
+/// other opaque token — 16 or more hex characters (a reset token, a session
+/// handle), a base64 blob, a digit run too long to be an id — is `{token}`.
+/// The caller withholds the example for every placeholder but `{id}`: a plain
+/// numeric id is safe to show, and the 1-based `path` index still addresses
+/// the segment either way.
+pub(crate) fn path_segment_token(segment: &str) -> Option<&'static str> {
+    if is_id_like(segment) {
+        placeholder_for(segment)
+    } else if is_opaque_token(segment) || is_base64(segment) {
+        Some("{token}")
+    } else {
+        None
+    }
+}
+
+/// Whether a path segment is an opaque token: a UUID, or a run of 16 or more
+/// hex characters (a 24-hex object id, a 64-hex reset token, a session
+/// handle). A plain numeric id is not opaque.
+fn is_opaque_token(segment: &str) -> bool {
     is_uuid(segment) || (segment.len() >= 16 && is_hex(segment))
 }
 
@@ -246,7 +264,7 @@ fn last_path_segment(value: &str) -> &str {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{is_id_like, looks_like_filename, path_template, traits_for};
+    use super::{is_id_like, looks_like_filename, path_segment_token, path_template, traits_for};
     use aitm_scan_model::PointTrait::{Base64, Email, Filename, Id, Json, Number, Url};
 
     #[test]
@@ -263,6 +281,34 @@ mod tests {
         );
         assert_eq!(path_template(""), "/");
         assert_eq!(path_template("/v1.2/x"), "/v1.2/x");
+    }
+
+    /// One answer per path segment (R-M1): the id placeholders for id-like
+    /// segments, `{token}` for an opaque token (16 or more hex, a base64 blob,
+    /// a digit run too long to be an id), nothing for a route word, a file
+    /// name or a short hex run.
+    #[test]
+    fn path_segment_token_pins() {
+        assert_eq!(path_segment_token("42"), Some("{id}"));
+        assert_eq!(
+            path_segment_token("550e8400-e29b-41d4-a716-446655440000"),
+            Some("{uuid}")
+        );
+        assert_eq!(
+            path_segment_token("507f1f77bcf86cd799439011"),
+            Some("{oid}")
+        );
+        assert_eq!(path_segment_token(&"a".repeat(64)), Some("{token}"));
+        assert_eq!(path_segment_token("0123456789abcdef"), Some("{token}"));
+        assert_eq!(
+            path_segment_token("QUJDREVGR0hJSktMTU5PUA=="),
+            Some("{token}")
+        );
+        assert_eq!(path_segment_token("123456789012345678901"), Some("{token}"));
+        assert_eq!(path_segment_token("0123456789abcde"), None);
+        assert_eq!(path_segment_token("reports"), None);
+        assert_eq!(path_segment_token("summary.pdf"), None);
+        assert_eq!(path_segment_token(""), None);
     }
 
     #[test]

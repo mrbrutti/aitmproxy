@@ -40,9 +40,7 @@ use aitm_scan_model::{
 
 use crate::limits::MAX_BODY_PARSE_BYTES;
 use crate::params::{self, BodyFormat, JsonStep};
-use crate::template::{
-    is_id_like, is_opaque_token, looks_like_filename, placeholder_for, traits_for,
-};
+use crate::template::{looks_like_filename, path_segment_token, traits_for};
 use crate::{multipart, redact, xml};
 
 /// Headers that are never insertion points, ASCII-lowercased.
@@ -228,6 +226,35 @@ impl<'a> Collector<'a> {
         value: &str,
         json: bool,
     ) {
+        self.record(kind, name, path, value, json, false);
+    }
+
+    /// Record one path candidate at the 1-based `index`, with its example
+    /// withheld when the caller says so: the segment is a token
+    /// ([`path_segment_token`] named it anything but `{id}`), and a token in
+    /// the path must not leak through `example` (S-M2, R-M1).
+    fn push_path(
+        &mut self,
+        kind: InsertionKind,
+        name: &str,
+        index: usize,
+        value: &str,
+        withhold: bool,
+    ) {
+        self.record(kind, name, Some(index.to_string()), value, false, withhold);
+    }
+
+    /// The one recording path behind [`Collector::push`] and
+    /// [`Collector::push_path`].
+    fn record(
+        &mut self,
+        kind: InsertionKind,
+        name: &str,
+        path: Option<String>,
+        value: &str,
+        json: bool,
+        withhold: bool,
+    ) {
         if name.is_empty() {
             return;
         }
@@ -249,14 +276,9 @@ impl<'a> Collector<'a> {
             .filter(|point_trait| found.contains(point_trait))
             .collect();
 
-        // D8.1: a session point never shows its value, whatever it is named.
-        // A path segment that is an opaque token (a UUID, a long hex run) or a
-        // base64 blob also has its example withheld, so a token in the path does
-        // not leak through `example` (S-M2); a plain numeric id keeps its value.
-        let withhold = traits.contains(&PointTrait::Session)
-            || (is_path_kind(kind)
-                && (is_opaque_token(value) || traits.contains(&PointTrait::Base64)));
-        let example = if withhold {
+        // D8.1: a session point never shows its value, whatever it is named;
+        // the caller withholds a path token's value the same way (S-M2).
+        let example = if withhold || traits.contains(&PointTrait::Session) {
             redact::REDACTED.to_string()
         } else {
             redact::example(kind, name, value)
@@ -270,14 +292,6 @@ impl<'a> Collector<'a> {
             example,
         });
     }
-}
-
-/// Whether `kind` is a path segment or path file name.
-fn is_path_kind(kind: InsertionKind) -> bool {
-    matches!(
-        kind,
-        InsertionKind::PathSegment | InsertionKind::PathFilename
-    )
 }
 
 /// Whether a structured-body point is session material by its *path* rather
@@ -296,7 +310,11 @@ fn path_is_secret(kind: InsertionKind, path: Option<&str>) -> bool {
 /// Whether a point carries session state: its name is a session cookie or (case
 /// insensitively) a session header of this job, or it reads as a secret.
 fn session_trait(kind: InsertionKind, name: &str, session: Option<&SessionMaterial>) -> bool {
-    if redact::is_secret_name(name) {
+    // A template placeholder (`{id}`, `{token}`) is the lane's own label for a
+    // path segment, not a name the application reads, so the secret-name
+    // vocabulary does not apply to it: `{token}` names a point that must be
+    // audited, with its example withheld (R-M1).
+    if !is_placeholder(name) && redact::is_secret_name(name) {
         return true;
     }
     let Some(material) = session else {
@@ -311,6 +329,12 @@ fn session_trait(kind: InsertionKind, name: &str, session: Option<&SessionMateri
             .any(|(known, _)| known.eq_ignore_ascii_case(name)),
         _ => false,
     }
+}
+
+/// Whether `name` is a template placeholder such as `{id}` or `{token}`, the
+/// shape [`path_segment_token`] answers and nothing else produces.
+fn is_placeholder(name: &str) -> bool {
+    name.len() > 2 && name.starts_with('{') && name.ends_with('}')
 }
 
 /// Every insertion point of one captured request (spec D8.1).
@@ -339,18 +363,17 @@ pub(crate) fn enumerate_v2(flow: &HttpFlow, opts: &EnumerateOptions<'_>) -> Enum
         } else {
             InsertionKind::PathSegment
         };
-        // A token in the path is never shown as a point name: an id-like segment
-        // is named by its template placeholder (`{id}`, `{uuid}`, `{oid}`), so a
-        // customer id or a reset token does not leak through `name` (S-M2). The
-        // 1-based index in `path` still addresses the segment, so
+        // A token in the path is never shown as a point name or example: one
+        // rule names the segment (`{id}`, `{uuid}`, `{oid}` for an id-like
+        // segment, `{token}` for any other opaque one) and the same answer
+        // decides the example, kept only for a plain numeric `{id}` (S-M2,
+        // R-M1). The 1-based index in `path` still addresses the segment, so
         // `build_request` replaces the right one even when two share a text
         // (plan call A9).
-        let name = if is_id_like(segment) {
-            placeholder_for(segment).unwrap_or(segment)
-        } else {
-            segment
-        };
-        collector.push(kind, name, Some((index + 1).to_string()), segment, false);
+        let token = path_segment_token(segment);
+        let name = token.unwrap_or(segment);
+        let withhold = token.is_some_and(|placeholder| placeholder != "{id}");
+        collector.push_path(kind, name, index + 1, segment, withhold);
     }
 
     // 3. Body values, by format.
@@ -988,8 +1011,16 @@ mod tests {
         assert_eq!(numeric.example.as_deref(), Some("42"));
 
         let long_hex = seg(&format!("http://t:8080/reset/{}", "a".repeat(64)));
-        assert_eq!(long_hex.name, "a".repeat(64));
+        assert_eq!(long_hex.name, "{token}");
+        assert_eq!(long_hex.path.as_deref(), Some("2"));
         assert_eq!(long_hex.example.as_deref(), Some("<redacted>"));
+        // The placeholder is the lane's label, not a secret name: the point is
+        // audited (not a `Session` point the default ignore list would drop).
+        assert!(
+            !long_hex.traits.contains(&PointTrait::Session),
+            "{:?}",
+            long_hex.traits
+        );
 
         let uuid = seg("http://t:8080/s/550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(uuid.name, "{uuid}");
@@ -1022,7 +1053,7 @@ mod tests {
         assert_eq!(oid.example.as_deref(), Some("<redacted>"));
 
         let hex16 = last_segment("http://t:8080/k/0123456789abcdef");
-        assert_eq!(hex16.name, "0123456789abcdef");
+        assert_eq!(hex16.name, "{token}");
         assert_eq!(hex16.example.as_deref(), Some("<redacted>"));
 
         let hex15 = last_segment("http://t:8080/k/0123456789abcde");
@@ -1030,7 +1061,7 @@ mod tests {
         assert_eq!(hex15.example.as_deref(), Some("0123456789abcde"));
 
         let b64 = last_segment("http://t:8080/dl/QUJDREVGR0hJSktMTU5PUA==");
-        assert_eq!(b64.name, "QUJDREVGR0hJSktMTU5PUA==");
+        assert_eq!(b64.name, "{token}");
         assert!(b64.traits.contains(&PointTrait::Base64), "{:?}", b64.traits);
         assert_eq!(b64.example.as_deref(), Some("<redacted>"));
 
