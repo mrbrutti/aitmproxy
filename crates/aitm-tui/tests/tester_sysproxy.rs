@@ -17,11 +17,8 @@ use aitm_tui::app::{App, BusStatus, Mode, PaletteKind, PromptKind};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::model::{ProxyStatus, SystemProxyWord};
-use aitm_tui::ui::bars::toolbar;
 use common::*;
 use crossterm::event::KeyCode;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
 use serde_json::{json, Value};
 
 const VERBS: &[&str] = &[
@@ -92,14 +89,6 @@ fn poll(system_proxy: Value) -> BusEvent {
         "listening": true, "address": "127.0.0.1:8080", "capturing": true,
         "system_proxy": system_proxy
     })))
-}
-
-/// The toolbar row at `cols` columns, styles dropped, trailing spaces trimmed.
-fn toolbar_at(app: &App, cols: u16) -> String {
-    let area = Rect::new(0, 0, cols, 1);
-    let mut buf = Buffer::empty(area);
-    toolbar(app, &theme(), area, &mut buf);
-    to_text(&buf).trim_end().to_string()
 }
 
 fn toolbar_text(app: &App) -> String {

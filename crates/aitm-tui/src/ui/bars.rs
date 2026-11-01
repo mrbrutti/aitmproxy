@@ -19,8 +19,11 @@ use crate::ui::FrameView;
 /// width up; narrower, the agent toggle alone is the right cluster.
 pub const TOOLBAR_HINTS_COLS: u16 = 150;
 
-/// Blank cells the centred listening pill keeps on each side so it never
-/// abuts the left cluster or the agent toggle.
+/// Blank cells the centred listening pill needs free around it so it never
+/// abuts the left cluster or the agent toggle: the hints decision reserves
+/// one gutter per side (`2 * PILL_GUTTER`); the placement branch takes a
+/// single gutter as the minimum total gap, which is what the 160/220-column
+/// tests pin.
 const PILL_GUTTER: usize = 2;
 
 /// The intercept bar's Kill hint: the abort mode is fixed at connection

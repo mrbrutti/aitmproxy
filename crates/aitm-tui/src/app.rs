@@ -2215,6 +2215,23 @@ impl App {
         }
     }
 
+    /// One system-proxy change at a time, however it is reached (`s`,
+    /// `:sysproxy on|off`, the raw `:proxy.system.set|unset`, the palette's
+    /// tool list): refused with a Warn toast while ours is in flight or the
+    /// core's `setting` flag (another client's call) is up — the core would
+    /// refuse the second call anyway, and that refusal would wrongly settle
+    /// the first one's pill. Otherwise raises the flag and returns `true`.
+    fn sysproxy_begin_change(&mut self) -> bool {
+        let in_flight =
+            self.sysproxy_setting || self.system_proxy.as_ref().is_some_and(|w| w.setting);
+        if in_flight {
+            self.toast(Level::Warn, "a system-proxy change is already in flight");
+            return false;
+        }
+        self.sysproxy_setting = true;
+        true
+    }
+
     /// Hold `name(args)` for a `y/N` when it is in [`CONFIRM_TOOLS`] (and not
     /// a dry run); otherwise send it.
     fn call_tool(&mut self, name: &str, args: Value) -> Vec<BusRequest> {
@@ -2246,6 +2263,11 @@ impl App {
                 return_to,
             });
             self.open_prompt(PromptKind::Confirm);
+            return Vec::new();
+        }
+        if matches!(name, "proxy.system.set" | "proxy.system.unset")
+            && !self.sysproxy_begin_change()
+        {
             return Vec::new();
         }
         if let Some(label) = browser_busy_label(name) {
@@ -3337,18 +3359,8 @@ impl App {
                     );
                     return out;
                 }
-                if tool != "proxy.system.status" {
-                    // One change at a time: ours in flight, or the core's
-                    // `setting` flag from another client's call. The core
-                    // would refuse the second call anyway, and that refusal
-                    // would wrongly settle the first one's pill.
-                    let in_flight = self.sysproxy_setting
-                        || self.system_proxy.as_ref().is_some_and(|w| w.setting);
-                    if in_flight {
-                        self.toast(Level::Warn, "system proxy change already in flight");
-                        return out;
-                    }
-                    self.sysproxy_setting = true;
+                if tool != "proxy.system.status" && !self.sysproxy_begin_change() {
+                    return out;
                 }
                 out.push(BusRequest::Call {
                     name: tool.into(),
@@ -3426,8 +3438,10 @@ impl App {
                     );
                 }
                 // A (re)connect is a new session: nothing sent before it
-                // will be answered.
+                // will be answered — including a `proxy.system.set|unset`
+                // whose reply would have settled the pill.
                 self.browser_forget_inflight();
+                self.sysproxy_setting = false;
                 out.push(BusRequest::Refresh);
             }
             BusEvent::ProxyStatus(s) => {
@@ -3450,6 +3464,7 @@ impl App {
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
                 self.browser_forget_inflight();
+                self.sysproxy_setting = false;
                 self.toast(Level::Error, format!("bus: {why}"));
             }
             BusEvent::Flows(summaries) => {
@@ -6338,7 +6353,7 @@ mod tests {
         assert!(app.update(Action::ToggleSysProxy).is_empty());
         let t = app.current_toast().expect("the in-flight toast");
         assert_eq!(t.level, Level::Warn);
-        assert_eq!(t.text, "system proxy change already in flight");
+        assert_eq!(t.text, "a system-proxy change is already in flight");
         assert!(
             app.sysproxy_setting,
             "the refusal does not settle our flight"
@@ -6349,7 +6364,7 @@ mod tests {
         assert!(app.run_command(":sysproxy off").is_empty());
         assert_eq!(
             app.current_toast().map(|t| t.text.as_str()),
-            Some("system proxy change already in flight")
+            Some("a system-proxy change is already in flight")
         );
 
         // `status` only reads; it is allowed mid-flight.
@@ -6369,10 +6384,102 @@ mod tests {
         assert!(app.run_command(":sysproxy on").is_empty());
         let t = app.current_toast().expect("the core-flag toast");
         assert_eq!(t.level, Level::Warn);
-        assert_eq!(t.text, "system proxy change already in flight");
+        assert_eq!(t.text, "a system-proxy change is already in flight");
         assert!(!app.sysproxy_setting);
         assert_eq!(
             app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+    }
+
+    /// F-tui 6 (panel Important): a bus drop mid-flight loses the reply that
+    /// would have settled the pill. A (re)connect is a new session, so it
+    /// drops our in-flight flag too — otherwise the guard would refuse every
+    /// later `s` / `:sysproxy on|off` for the rest of the run.
+    #[test]
+    fn a_reconnect_drops_the_in_flight_flag_so_the_guard_lets_the_retry_through() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let names = [
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ];
+        app.tools.extend(tools(&names));
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.run_command(":sysproxy on"),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting);
+
+        // The bus drops before the reply: the pill stops claiming `setting…`.
+        let _ = app.on_bus(BusEvent::Disconnected("core restarted".into()));
+        assert!(
+            !app.sysproxy_setting,
+            "a disconnect settles nothing but ends the flight"
+        );
+
+        // Reconnect with the verbs: the retry is a real call, not the Warn toast.
+        let _ = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&names),
+            role: Some("operator".into()),
+        });
+        assert!(!app.sysproxy_setting);
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(
+            app.sysproxy_setting,
+            "the retry is in flight until its reply"
+        );
+
+        // And a reconnect alone (no disconnect seen) drops it as well.
+        let _ = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&names),
+            role: Some("operator".into()),
+        });
+        assert!(!app.sysproxy_setting);
+        assert_ne!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("a system-proxy change is already in flight")
+        );
+    }
+
+    /// F-tui 7 (panel Minor): the raw `:proxy.system.set|unset` (and the
+    /// palette's tool list, which calls the same path) goes through the same
+    /// guard as `s` / `:sysproxy`: refused mid-flight, and a cold call raises
+    /// the flag so its reply settles the pill it started.
+    #[test]
+    fn the_raw_verb_path_shares_the_in_flight_guard() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.run_command(":proxy.system.set"),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting, "the raw call is a flight too");
+
+        assert!(app.run_command(":proxy.system.unset").is_empty());
+        assert!(app.run_command(":sysproxy off").is_empty());
+        let t = app.current_toast().expect("the in-flight toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "a system-proxy change is already in flight");
+        assert!(
+            app.sysproxy_setting,
+            "the refusal does not settle the first flight"
+        );
+
+        // `status` by name is a read; it passes.
+        assert_eq!(
+            app.run_command(":proxy.system.status"),
             vec![sysproxy_call("proxy.system.status")]
         );
     }

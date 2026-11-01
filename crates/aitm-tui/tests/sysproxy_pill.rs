@@ -91,14 +91,6 @@ fn pill_shows_the_word_table() {
     );
 }
 
-/// The toolbar row at `cols` columns, styles dropped, trailing spaces trimmed.
-fn toolbar_at(app: &App, cols: u16) -> String {
-    let area = Rect::new(0, 0, cols, 1);
-    let mut buf = Buffer::empty(area);
-    toolbar(app, &theme(), area, &mut buf);
-    to_text(&buf).trim_end().to_string()
-}
-
 /// The `: palette · layout · b sidebar` hints are a courtesy: at 160 columns
 /// they show beside a bare listening pill and yield when a long `other`
 /// word would otherwise be clipped against the agent toggle; at 220 columns
