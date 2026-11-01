@@ -151,6 +151,26 @@ record would silently never be written. `.` does not cross `\n`, so the match st
 on the `Location` line (test `the_location_matcher_is_multiline_and_line_bounded`).
 The hint also carries `control: Some(ControlHint { payload: "/", expect: [Not(<canary regex>)] })`.
 
+
+**Amendment A3 (T3 session, 2026-11-01, from the Task 9 report).** The Task 6 driver
+sends one header block per connection, but `h2-pseudo-header-validation` (3 variants),
+`h2-header-crlf-tolerance` (2) and `h2-cl-te-downgrade-indicator` (2) need a distinct
+block per stream on ONE connection (D8.2, AC T3-3). Task 9 therefore also edits
+`crates/aitm-proto-http/src/raw_h2.rs` to add `RawH2Mode::Blocks(Vec<Vec<RawHeader>>)`:
+one stream per block, written in order, each awaited to its `StreamOutcome` before the
+next is opened (so answered-vs-reset is observable per variant), count = `blocks.len()`,
+refused above `MAX_RAW_STREAMS` before the dial, every block subject to the same
+session-header and size refusals as `headers`; `SingleRequest` keeps using `headers`.
+Driver tests for the mode live in `raw_h2.rs`'s `driver_tests`. Further Task 9
+decisions: the `OncePerAuthority` TTL guard is per check instance, not shared; every
+runner `Err` (including "did not negotiate ALPN h2") maps to `Outcome::Inconclusive`
+with `detail` "origin does not negotiate h2 (or the raw probe failed)"; the AC T3-3
+expected set on a conforming server is enumerated for all five ids:
+`h2-settings-observe` info, `h2-rapid-reset-mitigation` info ("no reset-rate mitigation
+observed in 8 reset pairs" is the normal reading of a conforming server), and
+`h2-pseudo-header-validation`, `h2-header-crlf-tolerance`, `h2-cl-te-downgrade-indicator`
+clean; forwarded to the coordinator as an AC wording item.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
