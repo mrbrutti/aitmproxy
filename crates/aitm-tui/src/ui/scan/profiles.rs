@@ -37,7 +37,7 @@ use aitm_scan_model::{LaneKind, ProfileListEntry};
 
 use crate::app::App;
 use crate::scan::{
-    lane_token, session_line, token, tri_state, EditorField, ListWidths, OriginSource,
+    lane_token, session_line, token, EditorField, ListWidths, NodeKind, OriginSource,
     ProfileEditor, ProfilePane, ProfilesState, ScanError, ScanOffer, TreeNode, BUILTIN_MARK,
     COLLAPSED_MARK, OPEN_MARK,
 };
@@ -535,27 +535,26 @@ fn field_lines(profiles: &ProfilesState, editor: &ProfileEditor) -> Vec<(&'stati
     ]
 }
 
-/// The check summary line (the mockup's `◆ http  ▸ ◆ reflected-xss  ▸ ○
+/// The check summary line (the mockup's `◆ http  ▸ ◆ reflected-xss  ▸ ◇
 /// sqli-error`): each lane with its glyph, then its classes after `▸`
-/// marks, read from the full tree (collapse state aside), with the
-/// include and exclude counts (`counts`, the field's text) after it.
-/// Without a catalogue the counts alone.
+/// marks, read from the editor's cached tree (every node, collapse state
+/// aside; fix round G, G57), with the include and exclude counts
+/// (`counts`, the field's text) after it. Without a catalogue the counts
+/// alone.
 fn check_summary(profiles: &ProfilesState, editor: &ProfileEditor, counts: &str) -> String {
     if profiles.checks.is_empty() {
         return counts.to_string();
     }
-    let tree = crate::scan::check_tree(&profiles.checks, &Default::default());
     let mut out = String::new();
-    for node in tree.iter().filter(|n| n.depth < 2) {
-        let glyph = tri_state(&editor.draft.checks, &node.selector).glyph();
-        if node.depth == 0 {
+    for node in editor.tree.iter().filter(|n| n.kind != NodeKind::Check) {
+        if node.kind == NodeKind::Lane {
             if !out.is_empty() {
                 out.push_str("  ");
             }
         } else {
             out.push_str(&format!(" {COLLAPSED_MARK} "));
         }
-        out.push_str(&format!("{glyph} {}", node.label));
+        out.push_str(&format!("{} {}", node.state.glyph(), node.label()));
     }
     format!("{out} · {counts}")
 }
@@ -659,7 +658,7 @@ fn checks(
     if body.height == 0 {
         return;
     }
-    let tree = profiles.tree();
+    let tree = profiles.rows();
     if tree.is_empty() {
         note(theme, body, NO_CHECKS, buf);
         return;
@@ -669,7 +668,7 @@ fn checks(
     let focused = profiles.pane == ProfilePane::Checks;
     let cursor = editor.tree_cursor.min(tree.len() - 1);
     let top = cursor.saturating_sub(h - 1);
-    for (k, node) in tree.iter().enumerate().skip(top).take(h) {
+    for (k, node) in tree.into_iter().enumerate().skip(top).take(h) {
         let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
         let is_cursor = k == cursor;
         if is_cursor && focused {
@@ -688,20 +687,22 @@ fn tree_line(
     w: usize,
 ) -> Line<'static> {
     let mark = if under_cursor { ">" } else { " " };
-    let fold = if node.depth >= 2 {
+    let fold = if node.kind == NodeKind::Check {
         " "
     } else if editor.collapsed.contains(&node.selector) {
         COLLAPSED_MARK
     } else {
         OPEN_MARK
     };
-    let glyph = tri_state(&editor.draft.checks, &node.selector).glyph();
     let indent = "  ".repeat(usize::from(node.depth));
     clip(
         vec![
             Span::styled(mark.to_string(), theme.accent()),
             Span::styled(format!("{indent}{fold} "), theme.text_secondary()),
-            Span::styled(format!("{glyph} {}", node.label), theme.text_primary()),
+            Span::styled(
+                format!("{} {}", node.state.glyph(), node.label()),
+                theme.text_primary(),
+            ),
         ],
         w,
     )

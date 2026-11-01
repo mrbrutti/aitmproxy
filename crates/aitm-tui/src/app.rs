@@ -2962,7 +2962,7 @@ impl App {
                     // The Checks pane walks the flattened tree's rows
                     // (lanes, classes and checks), not the catalogue's
                     // entries (plan task 10).
-                    let rows = self.scan.profiles.tree().len();
+                    let rows = self.scan.profiles.rows().len();
                     if let Some(editor) = self.scan.profiles.editor.as_mut() {
                         if rows > 0 {
                             editor.tree_cursor = walk(action, editor.tree_cursor, rows, page);
@@ -3612,8 +3612,10 @@ impl App {
     pub fn on_bus(&mut self, event: BusEvent) -> Vec<BusRequest> {
         let mut out = Vec::new();
         // The origin picker reads the scope and the captured flows (D8):
-        // an open editor's rows follow them.
-        let origins_moved = matches!(event, BusEvent::Flows(_) | BusEvent::Scope(_));
+        // an open editor's rows follow them. A `Flows` sweep counts only
+        // when it added or removed a row (fix round G, G37): the picker
+        // reads authorities, which a status change never moves.
+        let mut origins_moved = matches!(event, BusEvent::Scope(_));
         match event {
             BusEvent::Connected {
                 server,
@@ -3720,6 +3722,7 @@ impl App {
                 if self.flows.len() != before {
                     self.rebuild_index();
                 }
+                origins_moved = before > had || self.flows.len() != before;
                 self.resolve_websocket_urls();
                 self.prune_details(&seen);
                 self.detail_failed.retain(|id| seen.contains(id));
@@ -4201,7 +4204,7 @@ impl App {
                 self.on_scan_failed(&tag, message, &mut out)
             }
         }
-        if origins_moved {
+        if origins_moved && self.scan.profiles.editor.is_some() {
             self.refresh_origin_choices();
         }
         out
@@ -4552,16 +4555,15 @@ impl App {
             ProfilePane::Fields => self.scan_edit(out),
             ProfilePane::Origins => self.scan_origin_add(out),
             ProfilePane::Checks => {
-                let Some(node) = self.scan.profiles.cursor_node() else {
+                let Some(selector) = self.scan.profiles.cursor_node().map(|n| n.selector.clone())
+                else {
                     return;
                 };
-                let Some(editor) = self.scan.profiles.editor.as_mut() else {
-                    return;
-                };
-                if editor.collapsed.remove(&node.selector) {
+                // A collapsed node expands; any other cycles its state.
+                if self.scan.profiles.set_collapsed(&selector, false) {
                     return;
                 }
-                editor.toggle_node(&node.selector);
+                self.scan.profiles.toggle_node(&selector);
                 self.recompute_launch_gate();
             }
         }
@@ -4574,6 +4576,7 @@ impl App {
     fn open_editor(&mut self, editor: ProfileEditor, out: &mut Vec<BusRequest>) {
         self.scan.profiles.editor = Some(editor);
         self.scan.profiles.pane = ProfilePane::Fields;
+        self.scan.profiles.rebuild_tree();
         self.refresh_origin_choices();
         self.request_session_preview(out);
         self.recompute_launch_gate();
@@ -4883,13 +4886,12 @@ impl App {
                 }
             }
             ProfilePane::Checks => {
-                let Some(node) = self.scan.profiles.cursor_node() else {
+                let Some(selector) = self.scan.profiles.cursor_node().map(|n| n.selector.clone())
+                else {
                     return;
                 };
-                if let Some(editor) = self.scan.profiles.editor.as_mut() {
-                    editor.toggle_node(&node.selector);
-                    self.recompute_launch_gate();
-                }
+                self.scan.profiles.toggle_node(&selector);
+                self.recompute_launch_gate();
             }
             ProfilePane::List | ProfilePane::Origins => {}
         }
@@ -4902,23 +4904,18 @@ impl App {
         if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Checks {
             return;
         }
-        let Some(node) = self.scan.profiles.cursor_node() else {
+        let Some((selector, kind)) = self
+            .scan
+            .profiles
+            .cursor_node()
+            .map(|n| (n.selector.clone(), n.kind))
+        else {
             return;
         };
-        if node.id.is_some() {
+        if kind == crate::scan::NodeKind::Check {
             return;
         }
-        if let Some(editor) = self.scan.profiles.editor.as_mut() {
-            if collapse {
-                editor.collapsed.insert(node.selector);
-            } else {
-                editor.collapsed.remove(&node.selector);
-            }
-            let rows = self.scan.profiles.tree().len();
-            if let Some(editor) = self.scan.profiles.editor.as_mut() {
-                editor.tree_cursor = editor.tree_cursor.min(rows.saturating_sub(1));
-            }
-        }
+        self.scan.profiles.set_collapsed(&selector, collapse);
     }
 
     /// Profiles `o` (D11): the typed-origin prompt; needs an editor.

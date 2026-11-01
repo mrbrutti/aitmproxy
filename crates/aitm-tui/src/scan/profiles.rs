@@ -186,10 +186,16 @@ pub struct ProfileEditor {
     pub dirty: bool,
     /// Index into [`EDITOR_FIELDS`].
     pub field: usize,
-    /// Cursor in the flattened check tree.
+    /// Cursor in the check tree's visible rows ([`ProfilesState::rows`]).
     pub tree_cursor: usize,
     /// Collapsed tree node keys.
     pub collapsed: BTreeSet<String>,
+    /// The check tree over the catalogue, every node with its tri-state
+    /// and whether a collapsed ancestor hides it (fix round G, G36, G54,
+    /// G57): built by [`ProfilesState::rebuild_tree`] on `fold_checks`, on
+    /// open and on collapse, its states refreshed on toggle, so a frame
+    /// reads it and builds nothing.
+    pub tree: Vec<TreeNode>,
     /// Cursor in the origin picker.
     pub origin_cursor: usize,
     /// The origin picker's rows.
@@ -647,6 +653,7 @@ impl ProfileEditor {
             field: 0,
             tree_cursor: 0,
             collapsed: BTreeSet::new(),
+            tree: Vec::new(),
             origin_cursor: 0,
             origin_choices: Vec::new(),
         }
@@ -840,16 +847,36 @@ impl ProfileEditor {
     }
 
     /// Space on the check tree: cycle the node's own selector through
-    /// [`toggle_selector`] and mark the draft dirty.
+    /// [`toggle_selector`], mark the draft dirty and refresh the cached
+    /// tree's states (G54).
     pub fn toggle_node(&mut self, selector: &str) {
         toggle_selector(&mut self.draft.checks, selector);
         self.dirty = true;
+        for node in &mut self.tree {
+            node.state = tri_state(&self.draft.checks, &node.selector);
+        }
+    }
+
+    /// The visible rows of the cached tree: every node no collapsed
+    /// ancestor hides, in display order; what the Checks cursor walks.
+    pub fn rows(&self) -> Vec<&TreeNode> {
+        self.tree.iter().filter(|n| !n.hidden).collect()
+    }
+
+    /// The tree node under the Checks cursor.
+    pub fn cursor_node(&self) -> Option<&TreeNode> {
+        self.rows().get(self.tree_cursor).copied()
     }
 
     /// Rebuild the picker rows from the D8 rule over `scope` and `flows`,
     /// keeping the origins the operator typed (`o`) that the rule does not
     /// list, and settle the picker cursor onto the rows.
+    ///
+    /// The highlighted origin is re-found by value (fix round G, G37), so
+    /// a row added above it does not move the highlight; one that vanished
+    /// leaves the cursor clamped where it was.
     pub fn refresh_origins(&mut self, scope: &[String], flows: &[FlowRow]) {
+        let highlighted = self.highlighted_origin().map(str::to_string);
         let mut rows = origin_choices(scope, flows);
         for typed in self
             .origin_choices
@@ -861,9 +888,12 @@ impl ProfileEditor {
             }
         }
         self.origin_choices = rows;
-        self.origin_cursor = self
-            .origin_cursor
-            .min(self.origin_choices.len().saturating_sub(1));
+        let found =
+            highlighted.and_then(|h| self.origin_choices.iter().position(|c| c.origin == h));
+        self.origin_cursor = found.unwrap_or(
+            self.origin_cursor
+                .min(self.origin_choices.len().saturating_sub(1)),
+        );
     }
 
     /// Record an origin the operator typed as a picker row (so `a` and `d`
@@ -936,26 +966,64 @@ pub fn parse_l4_target(s: &str) -> Result<L4TargetSpec, String> {
     })
 }
 
-/// One row of the flattened check tree (spec D3, D11): a lane at depth 0,
-/// a class at depth 1, a check at depth 2, each with the one selector its
-/// toggle writes (`lane:<lane>`, `<class>`, `<id>`).
+/// What a check-tree node is (fix round G, G36): a lane at depth 0, a
+/// class at depth 1, a check at depth 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Lane,
+    Class,
+    Check,
+}
+
+/// One node of the check tree (spec D3, D11): its kind, the one selector
+/// its toggle writes (`lane:<lane>`, `<class>`, `<id>`), its own tri-state
+/// (G54) and whether a collapsed ancestor hides it (G57). The label and
+/// the check id derive from the selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeNode {
     pub depth: u8,
-    /// What the row prints: the lane token, the class, the check id.
-    pub label: String,
+    pub kind: NodeKind,
     /// The selector this node's toggle writes.
     pub selector: String,
-    /// The check id, on a check node only.
-    pub id: Option<String>,
+    /// The node's own selector state, refreshed on every toggle.
+    pub state: TriState,
+    /// Under a collapsed lane or class: not a row of the pane.
+    pub hidden: bool,
 }
+
+impl TreeNode {
+    /// What the row prints: the lane token, the class, the check id.
+    pub fn label(&self) -> &str {
+        match self.kind {
+            NodeKind::Lane => self
+                .selector
+                .strip_prefix(LANE_PREFIX)
+                .unwrap_or(&self.selector),
+            NodeKind::Class | NodeKind::Check => &self.selector,
+        }
+    }
+
+    /// The check id, on a check node only.
+    pub fn id(&self) -> Option<&str> {
+        (self.kind == NodeKind::Check).then_some(self.selector.as_str())
+    }
+}
+
+/// The selector prefix of a lane node.
+const LANE_PREFIX: &str = "lane:";
 
 /// The lane to class to check tree over `checks` (spec D11), flattened in
 /// display order: lanes in declaration order, classes by name under each
-/// lane a check lists, check ids by name under their class; a node whose
-/// selector is in `collapsed` hides what is under it. A check in two lanes
-/// appears under both (the engine resolves a selector lane-free).
-pub fn check_tree(checks: &[CheckMeta], collapsed: &BTreeSet<String>) -> Vec<TreeNode> {
+/// lane a check lists, check ids by name under their class. Every node is
+/// listed; one under a selector in `collapsed` is `hidden`, and each
+/// carries its state in `selection`. A check in two lanes appears under
+/// both (the engine resolves a selector lane-free). [`check_tree`] is the
+/// visible rows of this.
+pub fn tree_nodes(
+    checks: &[CheckMeta],
+    collapsed: &BTreeSet<String>,
+    selection: &CheckSelection,
+) -> Vec<TreeNode> {
     let mut lanes: BTreeMap<LaneKind, BTreeMap<&str, BTreeSet<&str>>> = BTreeMap::new();
     for check in checks {
         for lane in &check.lanes {
@@ -968,40 +1036,38 @@ pub fn check_tree(checks: &[CheckMeta], collapsed: &BTreeSet<String>) -> Vec<Tre
         }
     }
     let mut out = Vec::new();
-    for (lane, classes) in lanes {
-        let lane_selector = format!("lane:{}", lane_token(lane));
-        let lane_open = !collapsed.contains(&lane_selector);
+    let mut push = |depth: u8, kind: NodeKind, selector: String, hidden: bool| {
         out.push(TreeNode {
-            depth: 0,
-            label: lane_token(lane).to_string(),
-            selector: lane_selector,
-            id: None,
+            depth,
+            kind,
+            state: tri_state(selection, &selector),
+            selector,
+            hidden,
         });
-        if !lane_open {
-            continue;
-        }
+    };
+    for (lane, classes) in lanes {
+        let lane_selector = format!("{LANE_PREFIX}{}", lane_token(lane));
+        let lane_hidden = collapsed.contains(&lane_selector);
+        push(0, NodeKind::Lane, lane_selector, false);
         for (class, ids) in classes {
-            let class_open = !collapsed.contains(class);
-            out.push(TreeNode {
-                depth: 1,
-                label: class.to_string(),
-                selector: class.to_string(),
-                id: None,
-            });
-            if !class_open {
-                continue;
-            }
+            let class_hidden = lane_hidden || collapsed.contains(class);
+            push(1, NodeKind::Class, class.to_string(), lane_hidden);
             for id in ids {
-                out.push(TreeNode {
-                    depth: 2,
-                    label: id.to_string(),
-                    selector: id.to_string(),
-                    id: Some(id.to_string()),
-                });
+                push(2, NodeKind::Check, id.to_string(), class_hidden);
             }
         }
     }
     out
+}
+
+/// The visible rows of the check tree over `checks` for the collapse state
+/// `collapsed` ([`tree_nodes`] without the hidden nodes), states at their
+/// default. What the Checks pane lists.
+pub fn check_tree(checks: &[CheckMeta], collapsed: &BTreeSet<String>) -> Vec<TreeNode> {
+    tree_nodes(checks, collapsed, &CheckSelection::default())
+        .into_iter()
+        .filter(|n| !n.hidden)
+        .collect()
 }
 
 /// A node's own selector state (spec D3): `Exclude` when `selector` is in
@@ -1160,9 +1226,43 @@ impl ProfilesState {
             }
         }
         self.checks = result.checks;
+        self.rebuild_tree();
+    }
+
+    /// Rebuild the open editor's cached tree over the catalogue and its
+    /// collapse state ([`tree_nodes`]) and clamp the Checks cursor onto
+    /// the visible rows (fix round G, G36); nothing without an editor.
+    pub fn rebuild_tree(&mut self) {
         if let Some(editor) = self.editor.as_mut() {
-            let rows = check_tree(&self.checks, &editor.collapsed).len();
+            editor.tree = tree_nodes(&self.checks, &editor.collapsed, &editor.draft.checks);
+            let rows = editor.rows().len();
             editor.tree_cursor = editor.tree_cursor.min(rows.saturating_sub(1));
+        }
+    }
+
+    /// `h` / `l` and `Enter` on a lane or class node: collapse or expand
+    /// `selector` and rebuild the rows. Returns whether the collapse state
+    /// changed.
+    pub fn set_collapsed(&mut self, selector: &str, collapse: bool) -> bool {
+        let Some(editor) = self.editor.as_mut() else {
+            return false;
+        };
+        let changed = if collapse {
+            editor.collapsed.insert(selector.to_string())
+        } else {
+            editor.collapsed.remove(selector)
+        };
+        if changed {
+            self.rebuild_tree();
+        }
+        changed
+    }
+
+    /// Space on the tree node `selector`: cycle its state on the open
+    /// editor's draft ([`ProfileEditor::toggle_node`]); nothing without one.
+    pub fn toggle_node(&mut self, selector: &str) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.toggle_node(selector);
         }
     }
 
@@ -1191,21 +1291,18 @@ impl ProfilesState {
         self.list.get(self.cursor)
     }
 
-    /// The flattened check tree for the open editor's collapse state (an
-    /// empty tree without one).
-    pub fn tree(&self) -> Vec<TreeNode> {
-        match &self.editor {
-            Some(e) => check_tree(&self.checks, &e.collapsed),
-            None => Vec::new(),
-        }
+    /// The visible rows of the open editor's cached tree (none without an
+    /// editor): what the Checks pane lists and its cursor walks.
+    pub fn rows(&self) -> Vec<&TreeNode> {
+        self.editor
+            .as_ref()
+            .map(ProfileEditor::rows)
+            .unwrap_or_default()
     }
 
     /// The tree node under the Checks cursor.
-    pub fn cursor_node(&self) -> Option<TreeNode> {
-        let editor = self.editor.as_ref()?;
-        check_tree(&self.checks, &editor.collapsed)
-            .into_iter()
-            .nth(editor.tree_cursor)
+    pub fn cursor_node(&self) -> Option<&TreeNode> {
+        self.editor.as_ref().and_then(ProfileEditor::cursor_node)
     }
 }
 
@@ -1400,6 +1497,101 @@ mod tests {
         }
         let v6 = parse_l4_target("[::1]:9000").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(l4_target_text(&v6), "[::1]:9000/tcp");
+    }
+
+    /// Fix round G, G36, G54, G57: the check tree is cached on the editor
+    /// with every node's tri-state and a hidden flag; it is rebuilt on
+    /// `fold_checks` and on collapse, its states refreshed on toggle, and
+    /// the cursor reads the visible rows.
+    #[test]
+    fn the_cached_tree_carries_states_and_hidden_rows() {
+        let checks: ChecksResult = serde_json::from_str(include_str!(
+            "../../../aitm-scan-model/fixtures/scan.checks.json"
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut profiles = ProfilesState {
+            editor: Some(ProfileEditor::new(ScanProfile::default(), None, false)),
+            ..ProfilesState::default()
+        };
+        profiles.fold_checks(checks);
+        let editor = profiles.editor.as_ref().unwrap_or_else(|| panic!("editor"));
+        assert_eq!(editor.tree.len(), 7, "every node is cached");
+        assert!(editor
+            .tree
+            .iter()
+            .all(|n| !n.hidden && n.state == TriState::Default));
+        assert_eq!(editor.tree[0].label(), "http");
+        assert_eq!(editor.tree[0].kind, NodeKind::Lane);
+        assert_eq!(editor.tree[1].label(), "information-disclosure");
+        assert_eq!(editor.tree[2].id(), Some("http.custom-marker"));
+        assert_eq!(profiles.rows().len(), 7);
+
+        profiles.toggle_node("sqli-error");
+        let editor = profiles.editor.as_ref().unwrap_or_else(|| panic!("editor"));
+        let class = editor
+            .tree
+            .iter()
+            .find(|n| n.selector == "sqli-error")
+            .unwrap_or_else(|| panic!("class"));
+        assert_eq!(
+            class.state,
+            TriState::Include,
+            "the state follows the toggle"
+        );
+
+        profiles.set_collapsed("lane:http", true);
+        let editor = profiles.editor.as_ref().unwrap_or_else(|| panic!("editor"));
+        assert_eq!(
+            editor.tree.len(),
+            7,
+            "hidden rows stay cached for the summary"
+        );
+        assert_eq!(editor.tree.iter().filter(|n| n.hidden).count(), 6);
+        assert_eq!(profiles.rows().len(), 1);
+        assert_eq!(
+            profiles.cursor_node().map(|n| n.selector.as_str()),
+            Some("lane:http")
+        );
+        profiles.set_collapsed("lane:http", false);
+        assert_eq!(profiles.rows().len(), 7);
+        if let Some(e) = profiles.editor.as_mut() {
+            e.tree_cursor = 99;
+        }
+        profiles.rebuild_tree();
+        assert_eq!(
+            profiles.editor.as_ref().map(|e| e.tree_cursor),
+            Some(6),
+            "the cursor is clamped onto the rows"
+        );
+    }
+
+    /// Fix round G, G37: a picker refresh re-finds the highlighted origin
+    /// by value, so a row added above it does not move the highlight.
+    #[test]
+    fn refresh_origins_keeps_the_highlighted_origin() {
+        let mut e = ProfileEditor::new(ScanProfile::default(), None, false);
+        let scope = vec!["a.test".to_string(), "b.test".to_string()];
+        e.refresh_origins(&scope, &[]);
+        assert_eq!(e.highlighted_origin(), Some("https://a.test"));
+        e.origin_cursor = 1;
+        assert_eq!(e.highlighted_origin(), Some("https://b.test"));
+        let flows = vec![FlowRow::from_summary(
+            &serde_json::json!({ "id": "f1", "scheme": "http", "authority": "a.test:8080" }),
+            0,
+        )
+        .unwrap_or_else(|| panic!("a row"))];
+        e.refresh_origins(&scope, &flows);
+        assert_eq!(
+            e.origin_choices
+                .iter()
+                .map(|c| c.origin.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://a.test", "http://a.test:8080", "https://b.test"]
+        );
+        assert_eq!(e.origin_cursor, 2);
+        assert_eq!(e.highlighted_origin(), Some("https://b.test"));
+        e.refresh_origins(&[], &[]);
+        assert_eq!(e.origin_cursor, 0, "a vanished origin clamps");
     }
 
     /// Fix round G, G35: every field `kind()` says cycles or toggles does,

@@ -402,10 +402,10 @@ fn check_tree_toggles_write_exactly_the_selectors() {
     assert_eq!(tree[0].depth, 0);
     assert_eq!(tree[1].depth, 1);
     assert_eq!(tree[2].depth, 2);
-    assert_eq!(tree[2].id.as_deref(), Some("http.custom-marker"));
-    assert_eq!(tree[1].id, None);
-    assert_eq!(tree[0].label, "http");
-    assert_eq!(tree[6].label, "http.sqli-error");
+    assert_eq!(tree[2].id(), Some("http.custom-marker"));
+    assert_eq!(tree[1].id(), None);
+    assert_eq!(tree[0].label(), "http");
+    assert_eq!(tree[6].label(), "http.sqli-error");
 
     focus_node(&mut app, "http.sqli-error");
     let _ = app.update(Action::ScanToggle);
