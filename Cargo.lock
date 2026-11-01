@@ -405,6 +405,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-scan-model"
+version = "0.5.5"
+dependencies = [
+ "aitm-core",
+ "aitm-poc",
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "aitm-testtarget"
 version = "0.5.5"
 dependencies = [
