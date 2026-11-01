@@ -9,7 +9,7 @@ Ratings: **Strong** = do now · **Worth exploring** = at the named moment · **S
 
 ## Survey
 
-- **Targets.** `AitmBusClient` (actor, 27 tests) ← `AitmproxyKit` (values only, ~350 tests)
+- **Targets.** `AitmBusClient` (actor, 31 tests) ← `AitmproxyKit` (values only, 493 tests)
   ← `Aitmproxy` (`defaultIsolation(MainActor)`, no test target). Direction unchanged and
   right. Kit grew the right way this week: `VerbTable`, `ClearedFlows`, `ConnectionSummary`,
   `CaptureAdvice`, `SettingsDomain`, `BusEndpointSettings` are all values with tests.
@@ -48,8 +48,11 @@ Ratings: **Strong** = do now · **Worth exploring** = at the named moment · **S
   move out of that file is a tripwire edit as much as a code edit.
 - **Harness isolation gap (not a refactor; routed).** `Session.density`, `recentPaletteIDs`
   and `settingsTab` read `UserDefaults.standard` without the `Store.isOverridden` guard that
-  `page`, `layout` and `autoSelect` have, so a snapshot or self-test run inherits the
-  operator's row density, palette history and last Settings tab (the dev bundle shares the
+  `page`, `layout` and `autoSelect` have, `ThemeStore.themeID` reads and writes
+  `appearance.accent` the same way, and `Session.init` reads `bus.activeKind` through
+  `UserDefaultsActiveKindPersistence()`'s Kit default argument (`.standard`; the panel found
+  this one), so a run with `APP_STORE` set inherits the operator's row density, palette
+  history, last Settings tab, accent and active-core choice (the dev bundle shares the
   bundle id). Writes are guarded, reads are not. Fixed as its own small PR (not folded into a
   pure-move step), proven on a real run — see the step-1 status below.
 - **Deletion test.** `Session+*` extensions: still locality, not modules (no interface).
@@ -71,7 +74,10 @@ Proposal: a type beside `FixtureActions`, same interface as the production runne
 /// The fixture bus: what `BusService.call` is live. Verbs the shell models act on the
 /// session; the rest echo. Installed as `session.commandRunner` by `Session.init`.
 final class FixtureBus {
-    unowned let session: Session
+    /// Weak, like the `[weak self]` closure it replaces: a call after the session is gone
+    /// throws `disconnected`, as a dropped bus would. (`FixtureActions` is `unowned`; the
+    /// closure's contract wins here because `runCommand` callers expect that error.)
+    private weak var session: Session?
     init(session: Session)
     func call(_ name: String, _ args: [String: JSONValue]) async throws -> JSONValue
 }
@@ -245,8 +251,10 @@ source tripwires. Proof for step 1, before (`main`) vs after (the branch):
 `main` with an isolated `APP_STORE` showed the operator's *comfortable* row density — the three
 unguarded `UserDefaults.standard` reads (`density`, `recentPaletteIDs`, `settingsTab`) plus the
 theme's `appearance.accent` read leaked the operator's prefs into every dev-bundle run on this
-Mac. The fix gates them on `Store.isOverridden`; the same real run on the fixed build shows
-dense rows with the same five flows and counts.
+Mac, and the stage-6 panel added `Session.init`'s `bus.activeKind` read through the Kit
+persistence's `.standard` default. PR #201 gates the reads on `Store.isOverridden`, passes
+`Store.defaults` to the persistence and removes the Kit default so every caller names its
+store; the same real run on the fixed build shows dense rows with the same five flows and counts.
 
 **Superseded the same evening:** the fixture and sample-data modes are being deleted from all
 three frontends by a dedicated session (on the Mac: `FixtureBus.swift`, `Session+Fixtures.swift`,

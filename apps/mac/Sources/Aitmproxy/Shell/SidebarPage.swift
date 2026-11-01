@@ -1,8 +1,7 @@
-import AitmproxyKit
+// Where the operator can be: the sidebar's pages, the inspector's placement and the agent
+// policy the toolbar and the Agent page switch. Model enums with titles and symbols; the
+// state that picks among them lives on `Session`.
 
-/// Where the operator can be: the sidebar's pages, the inspector's placement and the agent
-/// policy the toolbar and the Agent page switch. Model enums with titles and symbols; the
-/// state that picks among them lives on `Session`.
 /// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
 enum SidebarPage: String, CaseIterable, Identifiable {
     case status, flows, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config

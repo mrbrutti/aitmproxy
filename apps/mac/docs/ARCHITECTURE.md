@@ -58,4 +58,4 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
   The 2026-10-31 check-in named the fixture bus (`FixtureBus`), put the fixture session in one
   file and moved the navigation enums out of `Session.swift`; its next cards are
   `BusService.hostMatches` → `Scope.matches` and the `ShellView` split (both after the revision-2
-  PR), the self-test as check groups, and the bus poll slowing when no window is visible.
+  PR) and the bus poll slowing when no window is visible.
