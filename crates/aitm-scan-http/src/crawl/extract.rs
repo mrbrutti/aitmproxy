@@ -161,8 +161,9 @@ pub(crate) fn extract(html: &str) -> Extracted {
             continue;
         }
         // A comment is not markup: a commented-out anchor is not a link.
-        if html[i..].starts_with("<!--") {
-            i = html[i..].find("-->").map_or(bytes.len(), |off| i + off + 3);
+        let rest = html.get(i..).unwrap_or_default();
+        if rest.starts_with("<!--") {
+            i = rest.find("-->").map_or(bytes.len(), |off| i + off + 3);
             continue;
         }
         let closing = bytes.get(i + 1) == Some(&b'/');
@@ -176,7 +177,10 @@ pub(crate) fn extract(html: &str) -> Extracted {
             i += 1;
             continue;
         }
-        let tag = html[name_start..j].to_ascii_lowercase();
+        let tag = html
+            .get(name_start..j)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
 
         if closing {
             walk.close(&tag);
@@ -346,7 +350,9 @@ impl<'a> Walk<'a> {
             self.push_field(FieldSpec {
                 name,
                 kind: FieldKind::Textarea,
-                value: Some(decode_entities(&self.html[after..end])),
+                value: Some(decode_entities(
+                    self.html.get(after..end).unwrap_or_default(),
+                )),
                 options: Vec::new(),
                 checked: false,
             });
@@ -358,9 +364,10 @@ impl<'a> Walk<'a> {
     /// has none. Options outside a select are not markup the lane needs.
     fn open_option(&mut self, attrs: &[Attr], after: usize) {
         let text = || {
-            self.html[after..]
-                .find('<')
-                .map_or(&self.html[after..], |end| &self.html[after..after + end])
+            let rest = self.html.get(after..).unwrap_or_default();
+            rest.find('<')
+                .and_then(|end| rest.get(..end))
+                .unwrap_or(rest)
                 .trim()
                 .to_string()
         };
@@ -470,12 +477,17 @@ fn has_attr(attrs: &[Attr], name: &str) -> bool {
 ///
 /// `content="0;url=/next"`, `content="0; URL='/next'"` and `content="url=/next"`
 /// all give `/next`; a plain delay gives nothing.
+///
+/// Page text is sliced with `get`, never by index: `content="0;éé"` puts a
+/// multi-byte char across byte 3, and an indexed `rest[..3]` panics the whole
+/// extraction (C1).
 fn refresh_target(content: &str) -> Option<String> {
     let rest = content.split_once(';').map_or(content, |(_, r)| r).trim();
-    if !rest.len().ge(&3) || !rest[..3].eq_ignore_ascii_case("url") {
+    let (keyword, after) = (rest.get(..3)?, rest.get(3..)?);
+    if !keyword.eq_ignore_ascii_case("url") {
         return None;
     }
-    let target = rest[3..]
+    let target = after
         .trim_start()
         .strip_prefix('=')?
         .trim()
@@ -508,7 +520,7 @@ fn scan_tag(html: &str, from: usize, mut sink: Option<&mut Vec<Attr>>) -> usize 
         {
             i += 1;
         }
-        let name = &html[name_start..i];
+        let name = html.get(name_start..i).unwrap_or_default();
         let mut k = i;
         while k < bytes.len() && bytes[k].is_ascii_whitespace() {
             k += 1;
@@ -531,8 +543,12 @@ fn scan_tag(html: &str, from: usize, mut sink: Option<&mut Vec<Attr>>) -> usize 
         let (value, next) = match bytes[k] {
             quote @ (b'"' | b'\'') => {
                 let start = k + 1;
-                match html[start..].find(quote as char) {
-                    Some(len) => (&html[start..start + len], start + len + 1),
+                let rest = html.get(start..).unwrap_or_default();
+                match rest
+                    .find(quote as char)
+                    .and_then(|len| Some((rest.get(..len)?, len)))
+                {
+                    Some((value, len)) => (value, start + len + 1),
                     // An unterminated quote swallows the rest of the page.
                     None => return bytes.len(),
                 }
@@ -545,10 +561,11 @@ fn scan_tag(html: &str, from: usize, mut sink: Option<&mut Vec<Attr>>) -> usize 
             }
             _ => {
                 let start = k;
-                let len = html[start..]
+                let rest = html.get(start..).unwrap_or_default();
+                let len = rest
                     .find(|c: char| c.is_ascii_whitespace() || c == '>')
-                    .unwrap_or(html.len() - start);
-                (&html[start..start + len], start + len)
+                    .unwrap_or(rest.len());
+                (rest.get(..len).unwrap_or_default(), start + len)
             }
         };
         record(&mut sink, name, Some(value));
@@ -606,16 +623,16 @@ fn decode_entities(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let tail = &rest[amp..];
+        out.push_str(rest.get(..amp).unwrap_or_default());
+        let tail = rest.get(amp..).unwrap_or_default();
         match decode_one(tail) {
             Some((decoded, len)) => {
                 out.push(decoded);
-                rest = &tail[len..];
+                rest = tail.get(len..).unwrap_or_default();
             }
             None => {
                 out.push('&');
-                rest = &tail[1..];
+                rest = tail.get(1..).unwrap_or_default();
             }
         }
     }
@@ -652,7 +669,7 @@ fn decode_one(tail: &str) -> Option<(char, usize)> {
     if end == 0 || end > MAX_NUMERIC_ENTITY {
         return None;
     }
-    let code = u32::from_str_radix(&digits[..end], radix).ok()?;
+    let code = u32::from_str_radix(digits.get(..end)?, radix).ok()?;
     let decoded = char::from_u32(code)?;
     Some((decoded, tail.len() - digits.len() + end + 1))
 }
@@ -730,6 +747,18 @@ mod tests {
         assert_eq!(out.links, ["<<<"]);
         assert_eq!(out.forms.len(), 1);
         assert!(out.forms[0].fields.is_empty());
+
+        // C1: a refresh whose target is multi-byte text where the `url` keyword
+        // would be must not slice inside a char. Neither is a link.
+        let out = extract(
+            r#"<meta http-equiv="refresh" content="0;éé"><meta http-equiv="refresh" content="0;é日"><a href="/after">x</a>"#,
+        );
+        assert_eq!(out.links, ["/after"]);
+        // The same shapes without a delay, and a bare multi-byte keyword.
+        let out = extract(
+            r#"<meta http-equiv="refresh" content="éé"><meta http-equiv="refresh" content="日本語=/x"><meta http-equiv="refresh" content="0; URL=/ok">"#,
+        );
+        assert_eq!(out.links, ["/ok"]);
     }
 
     /// Controls the plan excludes stay out; the ones it keeps carry their
