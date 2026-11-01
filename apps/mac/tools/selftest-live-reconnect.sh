@@ -86,10 +86,11 @@ elapsed() { printf '%.1f' $(( EPOCHREALTIME - t0 )) }
 # unchanged so a missing menu item fails loudly instead of being swallowed.
 se() { osascript -e "tell application \"System Events\" to tell process \"$exe\" to $1" }
 
+# menu_click <item> <menu>: the menu is the LAST menu bar item with that name, because the bar holds two items named "View" (the system one, "Enter Full Screen", and the app's CommandMenu("View")).
 menu_click() {
   local item=$1 menu=$2
   se 'set frontmost to true' >/dev/null || return 1
-  se "click menu item \"$item\" of menu \"$menu\" of menu bar 1" >/dev/null
+  se "click menu item \"$item\" of menu 1 of (item -1 of (menu bar items of menu bar 1 whose name is \"$menu\"))" >/dev/null
 }
 
 # The pill's tooltip text; empty on any error (no window yet, no Accessibility grant, app gone).
