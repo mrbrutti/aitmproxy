@@ -13,6 +13,8 @@ final class BusService: FlowActions {
     private(set) var serverInfo: ServerInfo?
     /// How often the list is polled while connected.
     var pollInterval: Duration = .milliseconds(500)
+    /// `ca.status` is read on one poll tick in this many (spec D17.10: about every 5 s).
+    static let caStatusEveryTicks = 10
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
@@ -135,7 +137,11 @@ final class BusService: FlowActions {
         defer {
             session.upBytesPerSecond = 0
             session.downBytesPerSecond = 0
+            // No connection means no fact: the CA row and step must not keep a stale store's word,
+            // nor the last change's latch and error.
+            session.forgetCATrust()
         }
+        var tick = 0
         while !Task.isCancelled {
             // Scope first: `inScope` below and the capture advice (Settings ▸ Capture, the Apps
             // banner) read `scopeHosts`, and a host added from the CLI or another client must
@@ -145,6 +151,10 @@ final class BusService: FlowActions {
             // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
             // one poll, and a relaunch against an already-paused core starts out saying so.
             await refreshProxyStatus()
+            // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
+            // 10th (about every 5 s), because each read spawns `security` per store on the core side.
+            if tick % Self.caStatusEveryTicks == 0 { await session.refreshCAStatus() }
+            tick &+= 1
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
             for id in ids {
                 let cached = summaries[id]
@@ -195,14 +205,14 @@ final class BusService: FlowActions {
     /// core's `scope.list` as of the operator's last Scope action — written from
     /// `addScope`/`removeScope` only after the verb and the refresh both succeeded; never
     /// on connect or poll, never while the client points at an external core (the callers
-    /// also require that intent to have held across the whole round trip), never in
-    /// fixture/snapshot/self-test runs. A failed save is an error of the action: it throws
-    /// `BusError.tool("Scope change not saved: …")`, which `Session.perform` lands in
-    /// `lastError`, because a silently failed save after a remove would resurrect the host
-    /// at the next launch. By then the core has accepted the change and the refresh has
-    /// set `session.scopeHosts`, so the in-memory scope stays right for this run.
+    /// also require that intent to have held across the whole round trip). A failed save
+    /// is an error of the action: it throws `BusError.tool("Scope change not saved: …")`,
+    /// which `Session.perform` lands in `lastError`, because a silently failed save after
+    /// a remove would resurrect the host at the next launch. By then the core has accepted
+    /// the change and the refresh has set `session.scopeHosts`, so the in-memory scope
+    /// stays right for this run.
     private func persistEmbeddedScope() throws {
-        guard preferEmbedded, !Store.usesFixtures else { return }
+        guard preferEmbedded else { return }
         do {
             try EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
         } catch {

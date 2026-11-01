@@ -566,8 +566,18 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
 
 ### D13. macOS app (PR 4)
 
+- **Shipped Kit type (PR 4a, 2026-11-01).** `SystemProxyState` is a struct of two optional
+  `Endpoint { host, port }` (`http`, `https`), built by `init(settings:)` from the CFNetwork
+  dictionary or `init?(compact: JSONValue, listenAddress:)` from the bus object (`points_at_us`
+  → both at the listen address, `other` → both at host:port unless that endpoint is our own, in
+  which case nil; `off` → `.off`; `unsupported`/`needs_privilege`/`unknown`/malformed → nil, never
+  off); `route(to:) -> SystemProxyRoute { off, thisCore(http:https:), other(host:port:) }`
+  (ports equal and hosts equal case-insensitively with IPv6 brackets stripped, or both loopback,
+  or a wildcard listen host with a loopback proxy host; `thisCore` when at least one protocol
+  matches). `SystemProxyFacts` carries `route` plus the verb facts; the three non-endpoint states
+  come from the verb's `state` string, not from the type.
 - **Facts in.** `Session` polls `proxy.status` already; it parses
-  `system_proxy` into `SystemProxyFacts { state: SystemProxyState, managedByUs:
+  `system_proxy` into `SystemProxyFacts { route: SystemProxyRoute, managedByUs:
   Bool, setting: Bool, supported: Bool, remedy: String?, guidance: String? }`
   (Kit, `Hashable`). `ConnectionSummary.make` gains one parameter
   `systemProxy: SystemProxyFacts?` (nil = no verb on this bus) and one output
@@ -620,6 +630,12 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   page and the flows list header, "No flows yet? Set aitmproxy as the system
   proxy so Safari and other apps use it.", with "Set as System Proxy", "Not Now"
   and a "Don't ask again" checkbox; at most once per launch.
+- **Step order and words (Matt, 2026-10-31, per-host decryption like Proxyman: only hosts in
+  Scope are decrypted, the rest pass through, inline Add to Scope).** The first-run sheet and
+  the Status checklist present the three automations in this order with these words: 1 "Set
+  aitmproxy as the system proxy" (or point a client at it), 2 "Trust the aitmproxy CA" (D17),
+  3 "Add a host to Scope — nothing is decrypted until a host is in Scope". Shared with
+  mac-attribution's advice model; no change to the verbs.
 - **Getting started**: the `.firstFlow` step's undone title becomes "Set
   aitmproxy as the system proxy, or open the browser" (action
   `.setSystemProxy`) when supported and not at us; "System proxy points at
@@ -666,8 +682,15 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   `setting`, unsupported, or the bus is not operator), a disabled line with
   `detail`, and, when `guidance` is present, a "Copy env line" item.
   Selecting calls `proxy.system.set {}` / `proxy.system.unset`; the pill shows
-  `· sys-proxy setting…` until the reply; an error or refusal goes to the status
-  bar message slot.
+  `· sys-proxy setting…` until the reply; an error or refusal goes to the existing
+  notice toast above the status bar (the web has no separate message slot).
+- **Full status on menu open (amended 2026-11-01 after the PR 3 panel).** The polled
+  compact sub-object carries no `guidance`/`remedy` (§D6), so the pill menu, when it
+  opens, calls `proxy.system.status` (gated on the tool being offered; operator
+  surfaces get the fresh read) and stores the full object; the 2 s poll then keeps
+  the last `guidance`/`remedy` when the compact object lacks them, until the next
+  menu open or a set/unset reply replaces them. Without that call the "Copy env line"
+  item and the privilege remedy would be unreachable.
 - Never touch `apps/web/src/bus/mock.ts` or `apps/web/src/bus/noise.ts`.
 
 ### D16. Logging and audit

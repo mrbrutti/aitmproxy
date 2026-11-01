@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from . import free_port
+
 
 def _yaml_str(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -86,12 +88,16 @@ def l4_capture_entry(
 
 @dataclass
 class CoreConfig:
-    """The inputs to one `aitm` config.yaml. Ports default to None -> caller fills
-    them with free_port() before writing."""
+    """The inputs to one `aitm` config.yaml. The caller picks `proxy_port` (usually
+    `free_port()`). `browser_proxy_port` 0 (the default) is resolved to a free port
+    in `__post_init__`: before that fix the 0 was written verbatim as
+    `proxy_addr: 127.0.0.1:0`, so a core started without an explicit port pointed
+    obscura at port 0 and every browser navigation timed out (T2 live diagnosis,
+    2026-11-01). Explicit `browser_proxy_port=free_port()` arguments stay valid."""
 
     proxy_port: int
     bus_port: int = 0  # 0 = ephemeral; read the real port from --bus-endpoint-file
-    browser_proxy_port: int = 0
+    browser_proxy_port: int = 0  # 0 -> a free port, see __post_init__
     agent_token: str = "e2e-agent-token"
     operator_token: str = "e2e-operator-secret"
     scope_entries: list[str] = field(default_factory=list)
@@ -115,6 +121,12 @@ class CoreConfig:
     # allow_agent_authoring opens script.save/reload to an agent frontend.
     rhai_scripts_dir: str | None = None
     rhai_allow_agent_authoring: bool = False
+
+    def __post_init__(self) -> None:
+        # obscura dials the browser proxy by this literal address: 0 is never a
+        # listenable port, so resolve it here rather than write it into the YAML.
+        if self.browser_proxy_port == 0:
+            self.browser_proxy_port = free_port()
 
     def to_yaml(self) -> str:
         lines: list[str] = [

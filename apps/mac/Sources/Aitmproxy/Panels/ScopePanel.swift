@@ -39,8 +39,7 @@ struct ScopePanel: View {
     }
 
     private var entries: [ScopeEntry] {
-        let limits = Store.usesFixtures ? Fixtures.scopeLimits : [:]
-        let listed = ScopeEntry.entries(hosts: session.scopeHosts, limits: limits)
+        let listed = ScopeEntry.entries(hosts: session.scopeHosts)
         return listed + pending.filter { !session.scopeHosts.contains($0) }.map { ScopeEntry(host: $0) }
     }
 

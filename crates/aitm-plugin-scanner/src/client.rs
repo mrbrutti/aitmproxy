@@ -80,15 +80,38 @@ pub async fn bounded_await<T>(
     cancel: &CancellationToken,
     fut: impl Future<Output = T>,
 ) -> Result<T, AwaitEnd> {
+    bounded_await_with(deadline, cancel, Some(MAX_AWAIT), fut).await
+}
+
+/// [`bounded_await`] without the per-await cap: the future runs until it ends,
+/// the job's deadline passes or the job is cancelled. For the **discovery**
+/// phase, whose one await is a whole crawl: capping it at [`MAX_AWAIT`] cut
+/// every crawl longer than 30 s and reported the job as out of `time` while
+/// `budget.time_s` still had minutes left (T2 live run, 2026-11-01).
+pub async fn await_until_deadline<T>(
+    deadline: Instant,
+    cancel: &CancellationToken,
+    fut: impl Future<Output = T>,
+) -> Result<T, AwaitEnd> {
+    bounded_await_with(deadline, cancel, None, fut).await
+}
+
+/// The one implementation behind [`bounded_await`] (`cap = Some(MAX_AWAIT)`)
+/// and [`await_until_deadline`] (`cap = None`).
+pub async fn bounded_await_with<T>(
+    deadline: Instant,
+    cancel: &CancellationToken,
+    cap: Option<Duration>,
+    fut: impl Future<Output = T>,
+) -> Result<T, AwaitEnd> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(AwaitEnd::Deadline);
     }
     // Whichever bound is tighter is the one whose name the caller gets.
-    let (bound, end) = if remaining <= MAX_AWAIT {
-        (remaining, AwaitEnd::Deadline)
-    } else {
-        (MAX_AWAIT, AwaitEnd::Timeout)
+    let (bound, end) = match cap {
+        Some(cap) if remaining > cap => (cap, AwaitEnd::Timeout),
+        _ => (remaining, AwaitEnd::Deadline),
     };
     tokio::select! {
         // Biased: a send that has already answered is never thrown away for a
@@ -958,6 +981,46 @@ mod tests {
 
         client.send(req_to("ex.test")).await.expect("probe");
         assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
+    }
+
+    /// `await_until_deadline` has no per-await cap: a future longer than the
+    /// cap still completes while the deadline holds, and only the deadline
+    /// (never `Timeout`) ends it; `bounded_await_with(Some(cap))` keeps the
+    /// cap and names it `Timeout`.
+    #[tokio::test]
+    async fn await_until_deadline_has_no_per_await_cap() {
+        let cancel = CancellationToken::new();
+        let cap = Duration::from_millis(20);
+        // A generous deadline: the first two assertions are about the cap,
+        // not about racing the clock under load.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // A future that never completes: the cap, and only the cap, ends it.
+        let never = std::future::pending::<u8>();
+        let capped = bounded_await_with(deadline, &cancel, Some(cap), never).await;
+        assert!(
+            matches!(capped, Err(AwaitEnd::Timeout)),
+            "the cap ends a pending future as Timeout: {capped:?}"
+        );
+
+        let slow = async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            7
+        };
+        assert_eq!(
+            await_until_deadline(deadline, &cancel, slow).await.ok(),
+            Some(7),
+            "without a cap a future longer than the cap completes inside the deadline"
+        );
+
+        let soon = Instant::now() + Duration::from_millis(30);
+        let never = std::future::pending::<u8>();
+        assert!(
+            matches!(
+                await_until_deadline(soon, &cancel, never).await,
+                Err(AwaitEnd::Deadline)
+            ),
+            "only the deadline ends an uncapped await"
+        );
     }
 
     /// Spec D5 "Cancellation": `scan.cancel` ends a probe that is still in

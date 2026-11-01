@@ -527,3 +527,4 @@ Decided by the brief or the architect; nothing blocks implementation. For Matt, 
 blocking: should `scope.remove` now share `tls.passthrough.add`'s agent gate, since
 under this model it hides traffic? Kept **unchanged** per the brief ("the agent gate
 for scope widening stays exactly as it is"); it remains `Sensitive` and audited.
+**Decided by Matt, 2026-11-01: "No, keep it free."** `scope.remove` stays ungated.

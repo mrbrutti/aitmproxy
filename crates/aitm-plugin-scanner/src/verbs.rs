@@ -426,8 +426,12 @@ impl Command for ScanMap {
             description: "Map one authorized, in-scope target: crawl it, run the passive \
                           checks and enumerate its insertion points. Takes the same \
                           parameters as `scan.start`, but the engine forces `lanes: [http]` \
-                          and `intensity: passive`, so no probe is ever sent. Returns the \
-                          accepted job immediately; read the result with `scan.sitemap` and \
+                          and `intensity: passive`, so no probe is ever sent. The map crawl \
+                          submits same-origin forms with inert values and the observed \
+                          session, skips logout-looking and destructive-looking forms \
+                          (counted in `crawl.forms_skipped`), and can be turned off with \
+                          `crawl.submit_forms: false`. Returns the accepted job \
+                          immediately; read the result with `scan.sitemap` and \
                           `scan.issues`."
                 .into(),
             params: start_params(),
@@ -805,7 +809,9 @@ impl Command for ScanSitemap {
         ParamSchema {
             description: "The site map one job discovered: its nodes (method and path \
                           template per origin) and the insertion points on them. Name the \
-                          job, or name a `target` origin and get its newest job. `nodes` is \
+                          job, name a `target` origin and get its newest job, or give \
+                          neither and get the newest job of all; `job` names the job \
+                          the map came from. `nodes` is \
                           always complete; `points` is paged — at most `limit` (default \
                           1024, capped 4096), then pass `next_cursor` back as `cursor`."
                 .into(),
@@ -840,28 +846,27 @@ impl Command for ScanSitemap {
     }
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        let job = match opt_str(&args, "job")? {
-            Some(job) => job,
-            None => {
-                let target = opt_str(&args, "target")?.ok_or_else(|| {
-                    scan_error(
-                        ScanErrorCode::InvalidProfile,
-                        "give either `job` or `target`",
-                    )
-                })?;
-                let origin = profiles::normalize_origin(&target)
-                    .map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
-                self.engine
-                    .registry
-                    .newest_for_target(&origin)
-                    .ok_or_else(|| {
-                        scan_error(
-                            ScanErrorCode::NotFound,
-                            format!("no scan job has run against {origin}"),
-                        )
-                    })?
-            }
-        };
+        let job =
+            match (opt_str(&args, "job")?, opt_str(&args, "target")?) {
+                (Some(job), _) => job,
+                // Neither given (both are optional in spec D3): the newest job.
+                (None, None) => self.engine.registry.newest().ok_or_else(|| {
+                    scan_error(ScanErrorCode::NotFound, "no scan job has run yet")
+                })?,
+                (None, Some(target)) => {
+                    let origin = profiles::normalize_origin(&target)
+                        .map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
+                    self.engine
+                        .registry
+                        .newest_for_target(&origin)
+                        .ok_or_else(|| {
+                            scan_error(
+                                ScanErrorCode::NotFound,
+                                format!("no scan job has run against {origin}"),
+                            )
+                        })?
+                }
+            };
         let discovery = self
             .engine
             .registry
@@ -890,6 +895,7 @@ impl Command for ScanSitemap {
         let next = offset.saturating_add(points.len());
         let next_cursor = (next < guarded.points.len()).then(|| next.to_string());
         let result = SitemapResult {
+            job: Some(job.clone()),
             nodes: guarded.nodes.clone(),
             points,
             next_cursor,
@@ -967,7 +973,8 @@ impl Command for ScanChecks {
             .engine
             .catalogue()
             .filter(lane, class.as_deref(), origin.as_deref());
-        result_of(&ChecksResult { checks })
+        let lanes = self.engine.lane_entries();
+        result_of(&ChecksResult { checks, lanes })
     }
 }
 
@@ -1719,6 +1726,54 @@ mod tests {
         assert_eq!(code(&missing), ScanErrorCode::NotFound);
     }
 
+    /// Amendment 27c (T7 live run 3): a second job on the same core and target
+    /// re-finds the issue the first job recorded; D6 merges it, and the per-job
+    /// view still lists it for the re-finder — `scan.issues { job: <second> }`
+    /// returns it with `jobs` of length 2 and `job` naming the first finder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_job_lists_the_issue_it_refound() {
+        let h = Harness::with_check(FakeCheck::new("fake.vuln", "demo", FakeRun::vulnerable()));
+        h.capture("/search?q=1", HeaderMap::new(), "ok");
+
+        let first = h.ok("scan.start", &[("target", s("http://scan.test"))]);
+        let first_job = as_str(obj(&first, "job")).to_string();
+        h.wait_terminal(&first_job).await;
+        let second = h.ok("scan.start", &[("target", s("http://scan.test"))]);
+        let second_job = as_str(obj(&second, "job")).to_string();
+        assert_ne!(first_job, second_job);
+        h.wait_terminal(&second_job).await;
+
+        let mine = h.ok("scan.issues", &[("job", s(&second_job))]);
+        let listed = as_array(obj(&mine, "issues"));
+        assert!(
+            !listed.is_empty(),
+            "the second job lists the issue it re-found"
+        );
+        let issue = &listed[0];
+        assert_eq!(
+            as_str(obj(issue, "job")),
+            first_job,
+            "`job` names the first finder"
+        );
+        let jobs: Vec<&str> = as_array(obj(issue, "jobs")).iter().map(as_str).collect();
+        assert_eq!(jobs, vec![first_job.as_str(), second_job.as_str()]);
+        assert_eq!(
+            as_array(obj(
+                &h.ok("scan.issues", &[("job", s(&first_job))]),
+                "issues"
+            ))
+            .len(),
+            listed.len(),
+            "the first finder still lists the same issues"
+        );
+        let status = h.ok("scan.status", &[("job", s(&second_job))]);
+        let total = obj(obj(&status, "issues"), "total");
+        assert!(
+            matches!(total, Value::Int(n) if *n >= 1),
+            "the second job's issues tally counts the re-found issue: {total:?}"
+        );
+    }
+
     /// Spec D3 / call B12: `scan.sitemap` pages its points by a decimal cursor
     /// and returns the node list whole every time.
     #[tokio::test(flavor = "multi_thread")]
@@ -1754,6 +1809,47 @@ mod tests {
         // `target` resolves to the newest job for that origin.
         let by_target = h.ok("scan.sitemap", &[("target", s("http://scan.test"))]);
         assert_eq!(as_array(obj(&by_target, "points")).len(), 2);
+
+        // Neither `job` nor `target` (spec amendment 27): the newest job of
+        // all. A second job against an origin with no captures has no node,
+        // which tells it from the first.
+        let bare = h.ok("scan.sitemap", &[]);
+        assert_eq!(
+            as_array(obj(&bare, "nodes")).len(),
+            2,
+            "one job: it is the newest"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = h.ok("scan.map", &[("target", s("http://other.test"))]);
+        let second = as_str(obj(&second, "job")).to_string();
+        h.wait_terminal(&second).await;
+        let bare = h.ok("scan.sitemap", &[]);
+        assert_eq!(
+            as_array(obj(&bare, "nodes")).len(),
+            0,
+            "the newest job's nodes"
+        );
+        assert_eq!(as_array(obj(&bare, "points")).len(), 0);
+        assert_eq!(
+            h.engine.registry.newest().as_deref(),
+            Some(second.as_str()),
+            "the registry names the same job"
+        );
+        let by_target = h.ok("scan.sitemap", &[("target", s("http://scan.test"))]);
+        assert_eq!(
+            as_array(obj(&by_target, "nodes")).len(),
+            2,
+            "`target` still picks the first job"
+        );
+    }
+
+    /// `scan.sitemap {}` before any job has run is `not_found`, in words.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sitemap_without_job_or_target_on_a_fresh_engine_is_not_found() {
+        let h = Harness::new();
+        let err = h.call("scan.sitemap", &[]).expect_err("no job has run");
+        assert_eq!(code(&err), ScanErrorCode::NotFound);
+        assert_eq!(err.to_string(), "scan: not_found: no scan job has run yet");
     }
 
     /// Spec D3/D4: `scan.checks` is the unified catalogue, filtered by lane,
@@ -1786,6 +1882,13 @@ mod tests {
 
         let ws = h.ok("scan.checks", &[("lane", s("ws"))]);
         assert_eq!(as_array(obj(&ws, "checks")).len(), 0);
+
+        // The lanes the engine would run, with their source: with no lane crate
+        // the `http` lane is the interim one, and a filter does not hide it.
+        let lanes = as_array(obj(&ws, "lanes"));
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(as_str(obj(&lanes[0], "lane")), "http");
+        assert_eq!(as_str(obj(&lanes[0], "source")), "interim");
 
         let demo = h.ok("scan.checks", &[("class", s("demo"))]);
         assert_eq!(as_array(obj(&demo, "checks")).len(), 1);

@@ -79,8 +79,8 @@ final class Session {
     /// The landing page (spec §3): the list page the operator last used; Status until they
     /// have navigated once (a fresh install has nothing to show yet, so show what is running
     /// and what to do first). Only list pages are remembered, so a session that ends on Status
-    /// or Saved comes back on Flows. Fixture, snapshot and self-test runs start on Apps so their
-    /// scenes stay deterministic.
+    /// or Saved comes back on Flows. Runs with `APP_STORE` set (the self-test, a dev bundle)
+    /// start on Apps so they are deterministic.
     static func landingPage(saved: String?) -> SidebarPage {
         guard let saved, let page = SidebarPage(rawValue: saved) else { return .status }
         return page.isInSidebar ? page : .flows
@@ -160,9 +160,7 @@ final class Session {
     var paletteVisible = false
     /// Opened with the mouse → animates; with ⌘K → does not (foundation §2.8).
     var paletteOpenedByKeyboard = true
-    /// A query the palette starts with the next time it opens (snapshot scenes); cleared on use.
-    var paletteSeedQuery: String?
-    var tools: [ToolDescriptor] = Store.usesFixtures ? Fixtures.tools : []
+    var tools: [ToolDescriptor] = []
     var recentPaletteIDs: [String] = Store.isOverridden ? [] : UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
     /// A generic bus call for the palette; nil until a bus is attached.
     @ObservationIgnored var commandRunner: ((String, [String: JSONValue]) async throws -> JSONValue)?
@@ -189,10 +187,10 @@ final class Session {
     /// edited proxy settings (listen port, upstream-TLS) take effect.
     var restartCoreTick = 0
     /// The single active core connection's id this launch (Task 5). Every flow
-    /// ingested over the bus is stamped with it; fixture/offline data uses the
-    /// well-known `.fixture` id. The seam for multi-core: a second connection is
-    /// additive because every stored flow already carries its originating id.
-    let activeCoreID: CoreID = Store.usesFixtures ? .fixture : CoreID()
+    /// ingested over the bus is stamped with it; rows built without a core (imports,
+    /// tests) use the well-known `CoreID.fixture`. The seam for multi-core: a second
+    /// connection is additive because every stored flow already carries its originating id.
+    let activeCoreID = CoreID()
     var scopeHosts: [String] = []
     var findingsCount = 0
     var browserTabs = 0
@@ -208,7 +206,7 @@ final class Session {
     var upBytesPerSecond: Int64 = 0
     var downBytesPerSecond: Int64 = 0
     var version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1"
-    /// Settings reopens on the last tab. Test and snapshot runs neither read nor write it.
+    /// Settings reopens on the last tab. Runs with `APP_STORE` set neither read nor write it.
     var settingsTab: SettingsTab = Store.isOverridden ? .general
         : SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(settingsTab.rawValue, forKey: "settings.tab") } }
@@ -216,32 +214,43 @@ final class Session {
 
     /// The switchable, persistent active-core choice (Task 7, AC10): embedded vs
     /// external, driven from Settings ▸ Bus. Set once the live stack is built
-    /// (`ShellView`); `nil` in fixture/snapshot runs, where Bus settings show the
-    /// persisted default without a live core to switch.
+    /// (`ShellView`); `nil` until then.
     @ObservationIgnored var connection: ActiveConnectionModel?
 
-    /// Where actions go: the bus, or the fixture session itself.
-    @ObservationIgnored lazy var actions: any FlowActions = FixtureActions(session: self)
+    /// Where actions go: `OfflineActions` (every call fails with `disconnected`) until
+    /// `ShellView` installs the `BusService`.
+    @ObservationIgnored var actions: any FlowActions = OfflineActions()
     /// The last failed action, shown in the status bar until the next one succeeds.
     var lastError: String?
 
+    // MARK: CA trust (spec D17; the actions live in Session+CATrust.swift)
+
+    /// The last `ca.status` read-back: the poll's first tick and every 10th, and forced after
+    /// every trust change. `nil` until read, and again while the bus is down.
+    var caStatus: CAStatus?
+    /// A `ca.install` / `ca.uninstall` call is in flight; `CATrustFacts.installing` reads it.
+    var caTrustInstalling = false
+    /// The last change came back `HeadlessAuth` (macOS) or `NeedsRoot` (Linux).
+    var caTrustNeedsAdmin = false
+    /// The last change's failure other than a cancelled dialog, with the verb it came from. The CA
+    /// panel shows it until a `ca.status` read-back says that verb's end state holds
+    /// (`CATrustFailure.resolved(by:)`, applied in `refreshCAStatus`), a later change succeeds or
+    /// is cancelled, or the bus goes (`forgetCATrust`).
+    var caTrustLastError: CATrustFailure?
+    /// The first-run sheet (Shell/SetupSheet.swift) is up.
+    var setupSheetVisible = false
+
     init() {
-        if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
+        pins = Pins.load(from: pinsURL)
         // The Scope page shows the embedded core's persisted scope before the bus
         // connects; `refreshScope()` replaces it with the core's `scope.list` on connect (D5).
         if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded,
-                                       bundledCorePresent: EmbeddedCore.discoverBundled() != nil,
-                                       usesFixtures: Store.usesFixtures) {
+                                       bundledCorePresent: EmbeddedCore.discoverBundled() != nil) {
             scopeHosts = EmbeddedScope.load(from: scopeURL).hosts
         }
         composeHistory = ComposeHistory.load(from: composeURL)
-        if !Store.usesFixtures { breakpointRules = BreakpointRules.load(from: rulesURL) }
+        breakpointRules = BreakpointRules.load(from: rulesURL)
         loadSavedFilters()
-        if Store.usesFixtures {
-            // The fixture bus (Bus/FixtureBus.swift): what `BusService.call` is live.
-            let bus = FixtureBus(session: self)
-            commandRunner = { name, args in try await bus.call(name, args) }
-        }
     }
 
     var paused: [FlowRow] { rows.filter { $0.state == .paused } }

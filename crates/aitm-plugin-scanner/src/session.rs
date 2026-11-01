@@ -120,7 +120,9 @@ pub fn pick_observed(
         .and_then(|flow| {
             Some(Canary::Flow {
                 method: canary_method(&flow.request.method)?,
-                path: flow.request.path.clone(),
+                // The bare path: the contract (and the lane's status shape) is
+                // `/account`, never `/account?tab=1` (T2 live run 2, 2026-11-01).
+                path: bare_path(&flow.request.path),
                 expected_status: flow.response.as_ref().map(|r| r.status),
             })
         })
@@ -137,6 +139,18 @@ pub fn pick_observed(
         profile,
         canary_flow,
     })
+}
+
+/// `path` without its query string or fragment: `/account?tab=1#x` → `/account`;
+/// an empty path reads as `/`.
+fn bare_path(path: &str) -> String {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    let bare = &path[..end];
+    if bare.is_empty() {
+        "/".to_string()
+    } else {
+        bare.to_string()
+    }
 }
 
 /// Merge the session into a probe request (spec D7): the probe's own headers
@@ -473,6 +487,34 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// The canary names the bare path: a flow captured as `/account?tab=1`
+    /// gives `canary.path == "/account"` (contract shape; T2 live run 2).
+    #[test]
+    fn canary_path_drops_the_query_string() {
+        let store = MemFlowStore::new();
+        store.insert(Flow::Http(captured(
+            id(1),
+            "GET",
+            "/account?tab=1&x=2",
+            &[("Cookie", "sid=abc")],
+            0,
+        )));
+        let picked = pick_observed(&store, ORIGIN, None).expect("a session");
+        match &picked.profile.canary {
+            Canary::Flow { path, method, .. } => {
+                assert_eq!(path, "/account");
+                assert_eq!(
+                    *method,
+                    canary_method("GET").expect("GET is a canary method")
+                );
+            }
+            other => panic!("expected a flow canary, got {other:?}"),
+        }
+        assert_eq!(bare_path("/"), "/");
+        assert_eq!(bare_path(""), "/");
+        assert_eq!(bare_path("/a#frag"), "/a");
     }
 
     /// Spec D7: the session comes from the newest **captured** flow to the

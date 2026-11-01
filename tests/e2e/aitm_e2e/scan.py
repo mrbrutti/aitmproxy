@@ -217,15 +217,39 @@ def require_lane(client, lane: str, role: str = "operator") -> None:
         skip(f"lane {lane} has no scan.checks entry on this build")
 
 
-def require_checks(client, *ids: str, role: str = "operator") -> None:
+def require_checks(client, *ids: str, role: str = "operator", needs: str | None = None) -> None:
     """SKIP 77 naming every check id of `ids` the live `scan.checks` catalogue lacks
     (a check that has not landed on this build is a loud SKIP, never a silent pass).
-    Goes through `scan_call`, so the ledger records the call at `role`."""
+    `needs` names the track that lands them (appended to the reason). Goes through
+    `scan_call`, so the ledger records the call at `role`."""
     require_verbs(client, "scan.checks")
     live = {c.get("id") for c in _catalogue(client, role)}
     missing = [i for i in ids if i not in live]
     if missing:
-        skip("missing check id " + ", ".join(missing) + " in scan.checks (not on this build)")
+        reason = "missing check id " + ", ".join(missing) + " in scan.checks (not on this build)"
+        skip(reason + (f"; {needs}" if needs else ""))
+
+
+def lane_source(client, lane: str, role: str = "operator") -> str | None:
+    """`scan.checks`' `lanes[].source` for `lane`: `"crate"` (a lane crate's lane),
+    `"interim"` (the engine's own HTTP lane, which stands in until `aitm-scan-http`
+    lands) or None when the core does not list the lane at all or predates the
+    key (T1b, 2026-11-01: additive, so an older core simply reports None)."""
+    require_verbs(client, "scan.checks")
+    result = scan_call(client, role, "scan.checks", {})
+    rows = result.get("lanes", []) if isinstance(result, dict) else []
+    for row in rows:
+        if isinstance(row, dict) and row.get("lane") == lane:
+            return str(row.get("source", "crate"))
+    return None
+
+
+def require_crate_lane(client, lane: str, needs: str, role: str = "operator") -> None:
+    """SKIP 77 while `lane` is served by the engine's interim lane rather than a
+    lane crate; `needs` names the track that lands the crate. A core that does not
+    report lane sources is left alone (the cell then asserts on real behaviour)."""
+    if lane_source(client, lane, role) == "interim":
+        skip(f"{lane} lane is the interim lane; {needs}")
 
 
 def _catalogue(client, role: str) -> list[dict]:
@@ -337,6 +361,11 @@ atexit.register(ledger_flush)
 # ---------------------------------------------------------------------------
 
 
+def _sets_use_browser(d) -> bool:
+    """Whether a profile or overrides dict pins `crawl.use_browser` itself."""
+    return isinstance(d, dict) and isinstance(d.get("crawl"), dict) and "use_browser" in d["crawl"]
+
+
 def _job_args(profile, profile_name, target, overrides) -> dict:
     given = [k for k, v in (("profile", profile), ("profile_name", profile_name), ("target", target)) if v is not None]
     if len(given) != 1:
@@ -348,6 +377,17 @@ def _job_args(profile, profile_name, target, overrides) -> dict:
         args["profile_name"] = profile_name
     if target is not None:
         args["target"] = target
+    # Sanctioned default (coordinator, 2026-11-01): a cell that does not ask for
+    # the browser runs the client crawl. On a rig with obscura present the
+    # engine's `use_browser: auto` would pick the browser, and a browser proxy
+    # port shared with another session's core makes every navigation time out.
+    # A cell that sets `crawl.use_browser` itself (profile or overrides) is
+    # left alone (test_t2_crawl needs the real browser).
+    if not _sets_use_browser(profile) and not _sets_use_browser(overrides):
+        overrides = dict(overrides or {})
+        crawl = dict(overrides.get("crawl") or {})
+        crawl["use_browser"] = "never"
+        overrides["crawl"] = crawl
     if overrides is not None:
         args["overrides"] = overrides
     return args

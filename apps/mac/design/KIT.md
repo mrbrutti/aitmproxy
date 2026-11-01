@@ -4,9 +4,8 @@ The parts of the native macOS operator app, with their sizes and states, as
 built. Agents build from this page and review against it. Which token to
 use when is in `DESIGN-SYSTEM.md`; the values are in
 `docs/design/tokens.json` (generated into `UI/Tokens.swift`, never edited by
-hand). The gallery `DesignKit/KitGallery.swift` shows every part below in
-every state it can take; `APP_KIT_GALLERY=1` with the snapshot command
-captures it light and dark.
+hand). Parts are reviewed in the real app (dev bundle, real core); there is
+no parts gallery.
 
 ## Feel
 

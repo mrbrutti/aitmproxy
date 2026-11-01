@@ -34,10 +34,10 @@ use aitm_core::{
 };
 use aitm_scan_model::{
     scan_error, Canary, CheckMeta, Confidence, Discovery, Evidence, InsertionPoint, IssueLocation,
-    IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, Lane,
-    LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes,
-    ScanErrorCode, ScanProfile, SessionMaterial, SessionMode, SessionStatus, SiteNode,
-    StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
+    IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, L4Location,
+    L4Transport, Lane, LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe,
+    RecordProbes, ScanErrorCode, ScanProfile, SessionMaterial, SessionMode, SessionStatus,
+    SiteNode, StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
 };
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -256,6 +256,13 @@ pub struct JobRuntime {
     /// Charges the HTTP lane made during the crawling phase: one per browser
     /// navigation, which is the page count of a browser crawl (spec D5).
     crawl_charges: AtomicU64,
+    /// Crawls of one origin that failed outright (`JobCtx::report_crawl_error`),
+    /// folded into `crawl.errors` by `sync_counters`.
+    crawl_errors: AtomicU64,
+    /// Forms the crawl deliberately did not submit
+    /// (`JobCtx::report_forms_skipped`), folded into `crawl.forms_skipped` by
+    /// `sync_counters`.
+    forms_skipped: AtomicU64,
 }
 
 impl JobRuntime {
@@ -410,6 +417,22 @@ impl JobCtx for JobRuntime {
 
     fn report_session_lost(&self) {
         self.mark_session_lost();
+    }
+
+    fn report_crawl_error(&self, origin: &str, reason: &str) {
+        self.crawl_errors.fetch_add(1, Ordering::SeqCst);
+        // Scrubbed at the sink: a lane's reason may quote a URL or an error
+        // that carries a secret (security review, delta, 2026-11-01).
+        tracing::warn!(
+            target: "aitm::scanner",
+            origin,
+            reason = %util::scrub(reason),
+            "crawl failed; discovery continues over what the lane still has"
+        );
+    }
+
+    fn report_forms_skipped(&self, count: u64) {
+        self.forms_skipped.fetch_add(count, Ordering::SeqCst);
     }
 
     fn report_session_canary(&self, canary: Canary) {
@@ -572,6 +595,8 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         current_lane: Mutex::new(None),
         in_crawl: AtomicBool::new(false),
         crawl_charges: AtomicU64::new(0),
+        crawl_errors: AtomicU64::new(0),
+        forms_skipped: AtomicU64::new(0),
     });
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
@@ -585,7 +610,9 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     let mut nodes: Vec<SiteNode> = Vec::new();
     for lane in &lanes {
         runtime.set_lane(lane.lane());
-        match bounded_await(
+        // The whole crawl is one await: bound it by the job's deadline only
+        // (`bounded_await`'s 30 s cap is for a single probe).
+        match crate::client::await_until_deadline(
             deadline,
             &cancel,
             lane.discover(&profile.target, job_ctx.as_ref()),
@@ -668,6 +695,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         job_ctx: &job_ctx,
         lanes: &lanes,
         points: &points,
+        nodes: &nodes,
         budget: &budget,
         meter: &meter,
         canary: canary.as_ref(),
@@ -733,6 +761,7 @@ struct RunCtx<'a> {
     job_ctx: &'a Arc<dyn JobCtx>,
     lanes: &'a [Arc<dyn Lane>],
     points: &'a [InsertionPoint],
+    nodes: &'a [SiteNode],
     budget: &'a Arc<JobBudget>,
     meter: &'a Arc<ProbeMeter>,
     canary: Option<&'a CanaryRunner>,
@@ -905,7 +934,7 @@ impl RunCtx<'_> {
         if !matches!(verdict.outcome, Outcome::Vulnerable) {
             self.note_lane_text(&verdict.detail);
         }
-        for (verdict, new) in issues_from_verdict(self.job, point, &meta, &verdict) {
+        for (verdict, new) in issues_from_verdict(self.job, point, &meta, &verdict, self.nodes) {
             self.record_issue(new, &verdict, &meta, &host).await;
         }
     }
@@ -1135,20 +1164,71 @@ fn issues_from_verdict(
     point: &InsertionPoint,
     meta: &CheckMeta,
     verdict: &Verdict,
+    nodes: &[SiteNode],
 ) -> Vec<(Verdict, NewIssue)> {
+    let node = point
+        .site_node
+        .as_ref()
+        .and_then(|id| nodes.iter().find(|n| &n.id == id));
     let mut out = Vec::new();
     for one in std::iter::once(verdict).chain(verdict.more.iter()) {
         if one.outcome != Outcome::Vulnerable {
             continue;
         }
-        out.push((one.clone(), new_issue(job, point, meta, one)));
+        out.push((one.clone(), new_issue(job, point, meta, one, node)));
     }
     out
 }
 
-/// The issue one vulnerable verdict reports.
-fn new_issue(job: &str, point: &InsertionPoint, meta: &CheckMeta, verdict: &Verdict) -> NewIssue {
-    let (scheme, host, port, path) = parts_of(point);
+/// The `location.l4` block of an L4 issue (T6 child spec S6.3; D6 dedupe):
+/// `ip`/`port`/`proto` from the point's site node (`host`, `port`, `scheme`
+/// via [`SiteNode::l4_transport`]), `grammar` = [`SiteNode::l4_grammar`],
+/// `field_path` = the point's path inside the message, `mutation` = the first
+/// mutator of the evidence chain truncated at its first `(` (the mutation
+/// class). `None` when the node's scheme is not an L4 transport: the block is
+/// absent rather than guessed `tcp`.
+fn l4_location(point: &InsertionPoint, node: &SiteNode, verdict: &Verdict) -> Option<L4Location> {
+    let proto: L4Transport = node.l4_transport()?;
+    let mutation = verdict
+        .evidence
+        .l4
+        .as_ref()
+        .and_then(|l4| l4.mutation_chain.first())
+        .map(|m| m.split('(').next().unwrap_or(m).to_string())
+        .filter(|m| !m.is_empty());
+    Some(L4Location {
+        ip: node.host.clone(),
+        port: node.port,
+        proto,
+        grammar: node.l4_grammar().map(str::to_string),
+        field_path: point.path.clone(),
+        mutation,
+    })
+}
+
+/// The issue one vulnerable verdict reports. `node` is the point's site node
+/// when discovery recorded one; an L4 point's target and `location.l4` come
+/// from it (the point carries no URL).
+fn new_issue(
+    job: &str,
+    point: &InsertionPoint,
+    meta: &CheckMeta,
+    verdict: &Verdict,
+    node: Option<&SiteNode>,
+) -> NewIssue {
+    let is_l4 = matches!(point.lane, LaneKind::L4Stream | LaneKind::L4Packet);
+    // An L4 point's site node is its target tuple (the point carries no URL).
+    let l4_node = node.filter(|_| is_l4);
+    let l4 = l4_node.and_then(|node| l4_location(point, node, verdict));
+    let (scheme, host, port, path) = match l4_node {
+        Some(node) => (
+            node.scheme.clone(),
+            node.host.clone(),
+            node.port,
+            node.path_template.clone(),
+        ),
+        None => parts_of(point),
+    };
     let path = verdict
         .location
         .as_ref()
@@ -1183,7 +1263,7 @@ fn new_issue(job: &str, point: &InsertionPoint, meta: &CheckMeta, verdict: &Verd
             name,
             field_path: point.path.clone(),
             ws_path: None,
-            l4: None,
+            l4,
         },
         evidence,
         description: meta.description.clone(),
@@ -1329,12 +1409,31 @@ fn sync_counters(
         meter.timeouts.load(Ordering::SeqCst),
     );
     raise(
+        &mut guarded.crawl.errors,
+        runtime.crawl_errors.load(Ordering::SeqCst),
+    );
+    raise(
+        &mut guarded.crawl.forms_skipped,
+        runtime.forms_skipped.load(Ordering::SeqCst),
+    );
+    raise(
         &mut guarded.probes.rate_waits,
         meter.rate_waits.load(Ordering::SeqCst),
     );
     raise(&mut guarded.issues.total, issues_total);
     guarded.issues.by_severity = by_severity;
     guarded.issues.by_confidence = by_confidence;
+    live_elapsed(&mut guarded);
+}
+
+/// `elapsed_ms` as of now for a job that is still running (spec D5 "monotonic
+/// from `started_at`"); a terminal status keeps the value its transition
+/// fixed. Every writer of a snapshot calls this, so a push line and
+/// `scan.status` agree (panel, delta review, 2026-11-01).
+fn live_elapsed(status: &mut JobStatus) {
+    if status.finished_at.is_none() {
+        status.elapsed_ms = util::now_ms().saturating_sub(status.started_at);
+    }
 }
 
 /// Move the status to `state`/`phase`.
@@ -1354,7 +1453,8 @@ fn emit(
     status: &Arc<RwLock<JobStatus>>,
     issue: Option<aitm_scan_model::IssueSummary>,
 ) -> bool {
-    let snapshot = status.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut snapshot = status.read().unwrap_or_else(|e| e.into_inner()).clone();
+    live_elapsed(&mut snapshot);
     progress.emit(event, &snapshot, issue)
 }
 
@@ -2053,6 +2153,268 @@ mod tests {
         }
     }
 
+    /// A [`super::JobRuntime`] over the harness's services, with no job task
+    /// behind it, so a test can drive the `JobCtx` hooks and `sync_counters`
+    /// by hand (the jobs `Harness` binds no browser, and a browser crawl only
+    /// fails outright on a guard refusal of its seed).
+    fn bare_runtime(
+        h: &Harness,
+        job: &str,
+        started_at: u64,
+    ) -> (super::JobRuntime, Arc<std::sync::RwLock<JobStatus>>) {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{Mutex, RwLock};
+        use std::time::Instant;
+
+        let status = Arc::new(RwLock::new(JobStatus {
+            job: job.to_string(),
+            started_at,
+            ..JobStatus::default()
+        }));
+        let runtime = super::JobRuntime {
+            job: job.to_string(),
+            profile: h.profile(&["http://scan.test"]),
+            client: Arc::clone(&h.client) as Arc<dyn aitm_core::ProxyClient>,
+            store: Arc::clone(&h.store) as Arc<dyn FlowStore>,
+            guard: Arc::clone(&h.guard) as Arc<dyn aitm_core::ScopeRateGuard>,
+            browser: None,
+            session: None,
+            budget: Arc::new(crate::client::JobBudget::new(
+                100,
+                Instant::now() + Duration::from_secs(60),
+                tokio_util::sync::CancellationToken::new(),
+            )),
+            status: Arc::clone(&status),
+            markers: AtomicU64::new(0),
+            session_lost: AtomicBool::new(false),
+            lane_charges: AtomicU64::new(0),
+            charges_by_lane: Mutex::new(BTreeMap::new()),
+            current_lane: Mutex::new(None),
+            in_crawl: AtomicBool::new(false),
+            crawl_charges: AtomicU64::new(0),
+            crawl_errors: AtomicU64::new(0),
+            forms_skipped: AtomicU64::new(0),
+        };
+        (runtime, status)
+    }
+
+    /// T7/T2 live runs (2026-11-01): a crawl error a lane reports through
+    /// `JobCtx::report_crawl_error` is one unit of `crawl.errors` on the
+    /// status once the counters are synced — once, not once per sync — and
+    /// a skipped form reported through `report_forms_skipped` is one unit of
+    /// `crawl.forms_skipped`.
+    #[test]
+    fn reported_crawl_errors_and_skipped_forms_reach_the_status() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee1", 1);
+        let meter = crate::client::ProbeMeter::default();
+        let issues = crate::issues::IssueStore::new(None);
+
+        runtime.report_crawl_error("http://scan.test", "the browser refused the seed");
+        runtime.report_forms_skipped(1);
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee1");
+        {
+            let seen = status.read().expect("status");
+            assert_eq!(seen.crawl.errors, 1);
+            assert_eq!(seen.crawl.forms_skipped, 1);
+        }
+
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee1");
+        let seen = status.read().expect("status");
+        assert_eq!(seen.crawl.errors, 1, "a sync copies, it does not add");
+        assert_eq!(seen.crawl.forms_skipped, 1);
+    }
+
+    /// Spec D5 "monotonic from `started_at`" (T9 live run, panel delta
+    /// review): every writer of a status snapshot — `sync_counters` and the
+    /// push `emit` — carries a live `elapsed_ms` while the job runs, so a
+    /// push line and `scan.status` agree; a terminal snapshot keeps the value
+    /// the terminal transition fixed.
+    #[tokio::test]
+    async fn sync_counters_and_push_lines_carry_live_elapsed_ms() {
+        let h = Harness::bare();
+        let started_at = crate::util::now_ms().saturating_sub(5_000);
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee2", started_at);
+        let meter = crate::client::ProbeMeter::default();
+        let issues = crate::issues::IssueStore::new(None);
+
+        assert_eq!(
+            status.read().expect("status").elapsed_ms,
+            0,
+            "nothing ran yet"
+        );
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee2");
+        let synced = status.read().expect("status").elapsed_ms;
+        assert!(
+            synced >= 5_000,
+            "sync_counters writes the live elapsed: {synced}"
+        );
+
+        // The push line computes its own, not the stored value.
+        status.write().expect("status").elapsed_ms = 0;
+        let bus = Arc::new(aitm_core::JobBus::default());
+        let mut rx = bus.subscribe();
+        let progress = super::Progress::new(Arc::clone(&bus), "scan-0c0ffee2".to_string());
+        assert!(super::emit(&progress, JobEvent::Phase, &status, None));
+        let line: JobNotification = serde_json::from_value(crate::verbs::value_to_json(
+            &rx.try_recv().expect("one line").payload,
+        ))
+        .expect("the payload is a JobNotification");
+        assert!(
+            line.status.elapsed_ms >= 5_000,
+            "the push line's elapsed is live: {}",
+            line.status.elapsed_ms
+        );
+
+        // Terminal: the fixed value stands, whatever the clock says now.
+        {
+            let mut guarded = status.write().expect("status");
+            guarded.finished_at = Some(started_at + 42);
+            guarded.elapsed_ms = 42;
+        }
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee2");
+        assert_eq!(status.read().expect("status").elapsed_ms, 42);
+        assert!(super::emit(&progress, JobEvent::Finished, &status, None));
+        let line: JobNotification = serde_json::from_value(crate::verbs::value_to_json(
+            &rx.try_recv().expect("one line").payload,
+        ))
+        .expect("the payload is a JobNotification");
+        assert_eq!(
+            line.status.elapsed_ms, 42,
+            "a terminal line keeps the fixed elapsed"
+        );
+    }
+
+    /// T6 child spec S6.3 / D6: an issue from an L4 point carries
+    /// `location.l4 = { ip, port, proto, grammar, field_path, mutation }` built
+    /// from the point's site node and the evidence's mutation chain, and its
+    /// target is the node's tuple (an L4 point has no URL). An HTTP point keeps
+    /// `l4: None`.
+    #[test]
+    fn l4_issue_location_comes_from_the_site_node_and_the_mutation_chain() {
+        use super::issues_from_verdict;
+        use aitm_scan_model::{
+            Check, Confidence, Evidence, InsertionKind, InsertionPoint, LaneKind, Outcome,
+            SiteNode, Verdict,
+        };
+        let node = SiteNode {
+            id: "l4:127.0.0.1:6379/tcp".to_string(),
+            method: "L4".to_string(),
+            scheme: "tcp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            path_template: "/resp".to_string(),
+            flows: Vec::new(),
+            params: Vec::new(),
+            auth: false,
+            points: 1,
+            audited: true,
+        };
+        let point = InsertionPoint {
+            id: "l4-1".to_string(),
+            lane: LaneKind::L4Stream,
+            kind: InsertionKind::L4Field,
+            name: "bulk.len".to_string(),
+            path: Some("array[0].bulk.len".to_string()),
+            example: None,
+            flow: None,
+            site_node: Some(node.id.clone()),
+            traits: Vec::new(),
+            frequency: 1,
+            method: None,
+            url: None,
+        };
+        let meta = crate::jobs::test_support::FakeCheck::on_lane(
+            "l4-crash",
+            "l4-crash",
+            LaneKind::L4Stream,
+            crate::jobs::test_support::FakeRun::vulnerable(),
+        )
+        .meta()
+        .clone();
+        let verdict = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence {
+                l4: Some(aitm_scan_model::L4Evidence {
+                    sent_hex: "2a31".into(),
+                    seed_id: "127.0.0.1:6379/tcp#0".into(),
+                    rng_seed: 7,
+                    mutation_chain: vec!["len_desync(3)".into(), "bitflip".into()],
+                    prior_messages: 0,
+                    oracle: aitm_scan_model::L4Oracle::LivenessFailed,
+                    liveness_before: true,
+                    liveness_after: false,
+                    reproduced: (2, 2),
+                    scope_entry: "127.0.0.1/32".into(),
+                }),
+                ..Evidence::default()
+            },
+            detail: "crash".into(),
+            poc_hint: None,
+            location: None,
+            more: Vec::new(),
+        };
+
+        let issues = issues_from_verdict(
+            "scan-l4test1",
+            &point,
+            &meta,
+            &verdict,
+            std::slice::from_ref(&node),
+        );
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0].1;
+        let l4 = issue
+            .location
+            .l4
+            .as_ref()
+            .expect("an L4 point gets location.l4");
+        assert_eq!(l4.ip, "127.0.0.1");
+        assert_eq!(l4.port, 6379);
+        assert_eq!(l4.proto, aitm_scan_model::L4Transport::Tcp);
+        assert_eq!(l4.grammar.as_deref(), Some("resp"));
+        assert_eq!(l4.field_path.as_deref(), Some("array[0].bulk.len"));
+        assert_eq!(l4.mutation.as_deref(), Some("len_desync"));
+        assert_eq!(issue.target.host, "127.0.0.1");
+        assert_eq!(issue.target.port, 6379);
+        assert_eq!(issue.target.scheme, "tcp");
+
+        // Without a site node the block is absent rather than guessed.
+        let orphan = issues_from_verdict("scan-l4test1", &point, &meta, &verdict, &[]);
+        assert!(orphan[0].1.location.l4.is_none());
+
+        // A node whose scheme is not `tcp`/`udp` is not an L4 tuple: the whole
+        // block is `None`, never a `Tcp` guess (panel, delta review).
+        let http_node = SiteNode {
+            scheme: "http".to_string(),
+            ..node.clone()
+        };
+        let guessed = issues_from_verdict(
+            "scan-l4test1",
+            &point,
+            &meta,
+            &verdict,
+            std::slice::from_ref(&http_node),
+        );
+        assert_eq!(guessed.len(), 1);
+        assert_eq!(guessed[0].1.location.l4, None, "no Tcp fallback");
+
+        // An HTTP point keeps `l4: None`.
+        let http = crate::jobs::test_support::fake_point("p1", "q", "http://scan.test/search");
+        let http_meta = crate::jobs::test_support::FakeCheck::new(
+            "fake.vuln",
+            "demo",
+            crate::jobs::test_support::FakeRun::vulnerable(),
+        )
+        .meta()
+        .clone();
+        let issues = issues_from_verdict("scan-l4test1", &http, &http_meta, &verdict, &[]);
+        assert!(issues[0].1.location.l4.is_none());
+    }
+
     /// Coordinator item (g): a verdict may move its issue off the point it was
     /// found at, and may report siblings. One issue per entry, each at its own
     /// path, because the dedupe key is computed after the override.
@@ -2307,7 +2669,10 @@ mod tests {
         .expect("the job starts");
         assert!(h.egress_confined(), "a running job holds the posture");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(2)).await;
+        // 10 s, not 2: the job is supervised through catch_unwind on a worker
+        // thread, and a load average near 300 (shared gate machine) stretched
+        // the hand-back past 2 s once (2026-11-01).
+        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
         assert_eq!(status.state, JobState::Failed);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Failed));
         assert_eq!(status.phase, Phase::Done);

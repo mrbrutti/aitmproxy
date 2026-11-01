@@ -13,6 +13,11 @@
 //! the process too, over an in-process bus channel (`aitm::tui`).
 //! `aitm web [--listen ADDR] [--token TOKEN] [--no-open]` is the server path
 //! plus the embedded web UI and its `/bus` bridge (`aitm::web`, F15).
+//!
+//! Every serving mode writes the durable audit file (`mcp.audit_log`, on by
+//! default; `aitm::audit_log`): it starts before any port is bound, so an
+//! explicit path that cannot be used fails the boot, and it is flushed on every
+//! orderly exit. The bus and web tokens never reach it.
 
 use std::future::Future;
 use std::io::Write as _;
@@ -30,7 +35,7 @@ use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{
     assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
 };
-use aitm::{config_file, env, operator_token, tui};
+use aitm::{audit_log, config_file, env, operator_token, tui};
 use aitm_core::{
     engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin, NOTHING_DECRYPTED_ADVICE,
 };
@@ -612,6 +617,24 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         }
     }
 
+    // The durable audit log (spec Design 10): started once the one-shot CLI branch
+    // has returned and before any port is pre-bound or the browser is spawned, so
+    // an explicit `mcp.audit_log` that cannot be used fails the boot here with
+    // nothing bound and nothing to undo. `audit_ring` is the ring every server
+    // below shares, so the sink it carries audits all of them. The configured
+    // tokens, the web agent bridge token (resolved above, before the config was
+    // loaded) and the secret-looking environment are registered by `start` before
+    // the sink is attached; a non-UTF-8 variable is skipped, never a panic.
+    let env_pairs: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let audit = audit_log::start(
+        &cfg,
+        &audit_ring,
+        web_settings.as_ref().map(|s| s.token.as_str()),
+        &env_pairs,
+    )?;
+
     // Pre-bind every service port up front, before obscura is spawned and before
     // any "listening" success line. A port conflict is then ONE clear, actionable
     // error here — which port, who likely holds it, how to change it — never a
@@ -905,7 +928,7 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                     .operator_token
                     .as_deref()
                     .is_some_and(|t| !t.is_empty())
-                    .then(web::generate_token);
+                    .then(|| audit_log::bridge_token(audit.as_ref()));
                 let state = Arc::new(WebState {
                     mcp: bus,
                     agent_token: settings.token.clone(),
@@ -986,6 +1009,21 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!(error = %e, "embedded browser did not close cleanly"),
             Err(_) => warn!(?budget, "embedded browser close timed out"),
+        }
+    }
+
+    // Last: every call the servers audited is queued by now. This flushes it, and
+    // is bounded (`SHUTDOWN_BUDGET`), so a stalled disk cannot hold the exit. It
+    // sleeps while the stream threads drain, so it says so to the (multi-thread)
+    // runtime rather than blocking inside the async fn unannounced.
+    if let Some(handle) = &audit {
+        let report = tokio::task::block_in_place(|| handle.shutdown(audit_log::SHUTDOWN_BUDGET));
+        if !report.complete {
+            warn!(
+                target: "aitm::audit",
+                estimated_left = report.estimated_left,
+                "the audit log did not finish flushing before exit"
+            );
         }
     }
     result

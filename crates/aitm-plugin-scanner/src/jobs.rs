@@ -15,6 +15,7 @@
 //! The gate order is contract, not taste: a caller that is wrong in two ways
 //! must always learn the same reason first, or a UI cannot explain itself.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -245,11 +246,37 @@ impl JobRegistry {
         Ok(id)
     }
 
-    /// A snapshot of one job's status.
+    /// A snapshot of one job's status. `elapsed_ms` is live while the job runs
+    /// (spec D5: monotonic from `started_at`); the terminal transition fixes it.
     pub fn status(&self, id: &str) -> Option<JobStatus> {
         self.lock()
             .get(id)
-            .map(|e| e.status.read().unwrap_or_else(|p| p.into_inner()).clone())
+            .map(|e| with_live_elapsed(e.status.read().unwrap_or_else(|p| p.into_inner()).clone()))
+    }
+
+    /// The newest job of all, for `scan.sitemap` with neither `job` nor `target`.
+    pub fn newest(&self) -> Option<JobId> {
+        self.newest_where(|_| true)
+    }
+
+    /// The newest job that ran against `origin`, for `scan.sitemap { target }`.
+    pub fn newest_for_target(&self, origin: &str) -> Option<JobId> {
+        self.newest_where(|e| e.origins.iter().any(|o| o == origin))
+    }
+
+    /// The job with the greatest `started_at` among those `keep` admits; the
+    /// smaller id wins a same-millisecond tie, so the answer is deterministic.
+    fn newest_where(&self, keep: impl Fn(&JobEntry) -> bool) -> Option<JobId> {
+        let inner = self.lock();
+        inner
+            .values()
+            .filter(|e| keep(e))
+            .map(|e| {
+                let status = e.status.read().unwrap_or_else(|p| p.into_inner());
+                (status.started_at, Reverse(status.job.clone()))
+            })
+            .max()
+            .map(|(_, Reverse(job))| job)
     }
 
     /// The three handles the worker needs to drive one job.
@@ -266,7 +293,7 @@ impl JobRegistry {
         let inner = self.lock();
         let mut rows: Vec<JobStatus> = inner
             .values()
-            .map(|e| e.status.read().unwrap_or_else(|p| p.into_inner()).clone())
+            .map(|e| with_live_elapsed(e.status.read().unwrap_or_else(|p| p.into_inner()).clone()))
             .filter(|s| !active_only || !s.state.is_terminal())
             .collect();
         // Newest first; the id breaks a tie so two jobs started in the same
@@ -286,7 +313,7 @@ impl JobRegistry {
         if !status.state.is_terminal() {
             status.state = JobState::Cancelling;
         }
-        Some(status.clone())
+        Some(with_live_elapsed(status.clone()))
     }
 
     /// How many jobs are not yet terminal.
@@ -387,21 +414,18 @@ impl JobRegistry {
         prune(&mut inner, self.history);
         Ok(added)
     }
+}
 
-    /// The newest job that ran against `origin`, for `scan.sitemap { target }`.
-    pub fn newest_for_target(&self, origin: &str) -> Option<JobId> {
-        let inner = self.lock();
-        let mut rows: Vec<(u64, JobId)> = inner
-            .values()
-            .filter(|e| e.origins.iter().any(|o| o == origin))
-            .map(|e| {
-                let status = e.status.read().unwrap_or_else(|p| p.into_inner());
-                (status.started_at, status.job.clone())
-            })
-            .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        rows.into_iter().next().map(|(_, job)| job)
+/// `elapsed_ms` as a reader should see it: the wall time since `started_at`
+/// while the job runs (spec D5 "monotonic from started_at"; T9 live run,
+/// 2026-11-01), the fixed value once it is terminal. The worker writes the
+/// field on every counter sync and push line, but not during the crawling
+/// phase, so `status`, `list` and `cancel` compute it on the way out.
+fn with_live_elapsed(mut status: JobStatus) -> JobStatus {
+    if status.finished_at.is_none() {
+        status.elapsed_ms = util::now_ms().saturating_sub(status.started_at);
     }
+    status
 }
 
 /// What one job's live handles are, as [`JobRegistry::entry_handles`] hands
@@ -622,6 +646,23 @@ impl Engine {
         run
     }
 
+    /// [`lanes_for_run`](Self::lanes_for_run) as `scan.checks` reports it: each
+    /// lane with its source, `interim` for the engine's own HTTP lane and
+    /// `crate` for every lane a lane crate handed the binary.
+    pub fn lane_entries(&self) -> Vec<aitm_scan_model::LaneEntry> {
+        self.lanes_for_run()
+            .iter()
+            .map(|lane| aitm_scan_model::LaneEntry {
+                lane: lane.lane(),
+                source: if Arc::ptr_eq(lane, &self.interim) {
+                    aitm_scan_model::LaneSource::Interim
+                } else {
+                    aitm_scan_model::LaneSource::Crate
+                },
+            })
+            .collect()
+    }
+
     /// The catalogue as this engine would run it, assembled fresh so a script
     /// added since the last call is in it (spec D4).
     pub fn catalogue(&self) -> Catalogue {
@@ -759,13 +800,16 @@ pub fn start(
     // (1) `scan.map` is the passive, HTTP-only shape: it crawls and reads, and
     // sends no probe, so it is a `Write` verb rather than a `Sensitive` one.
     // Its crawl follows GET links only: a form POST is a write the target did
-    // not see coming, and a map job is admitted to an agent under `auto` on
-    // the strength of sending none (security review, whole branch,
-    // 2026-11-01).
+    // not see coming; a map job is admitted to an agent under `auto` on the
+    // strength of sending no probe (security review, whole branch, 2026-11-01).
     if force_map {
+        // Lanes and intensity only. `crawl.submit_forms` stays as the profile
+        // says: spec D8.1 makes form filling with inert generated values a
+        // crawl step (it reaches routes and finds points), not a probe, and
+        // "map-only" means no checks, not no forms (coordinator decision,
+        // 2026-11-01, reversing the earlier security-review Minor).
         profile.lanes = vec![LaneKind::Http];
         profile.intensity = Intensity::Passive;
-        profile.crawl.submit_forms = false;
     }
     profiles::validate(&profile).map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
     let clamped: Vec<Clamped> = profiles::clamp(
@@ -2223,6 +2267,29 @@ mod tests {
         );
     }
 
+    /// `scan.checks` tells a client which lane is the interim one: with a lane
+    /// crate present the `http` lane is `crate`, with none it is `interim`
+    /// (a cell that needs T2's lane skips on this, instead of failing).
+    #[test]
+    fn lane_entries_name_the_interim_lane() {
+        use aitm_scan_model::{LaneEntry, LaneSource};
+        let bare = Harness::bare();
+        assert_eq!(
+            bare.engine.lane_entries(),
+            vec![LaneEntry {
+                lane: LaneKind::Http,
+                source: LaneSource::Interim
+            }]
+        );
+        let with_lane = Harness::new();
+        let entries = with_lane.engine.lane_entries();
+        let http = entries
+            .iter()
+            .find(|e| e.lane == LaneKind::Http)
+            .expect("the harness lane is an http lane");
+        assert_eq!(http.source, LaneSource::Crate);
+        assert!(entries.iter().all(|e| e.source == LaneSource::Crate));
+    }
     /// Coordinator decision 1: the two error-prefix conventions a lane may use
     /// instead of the `JobCtx` hooks.
     #[test]
@@ -2669,6 +2736,9 @@ mod tests {
             Some("scan-00000014".to_string())
         );
         assert_eq!(registry.newest_for_target("http://nowhere.test"), None);
+        // Of all three, the newest is the live `b.test` job.
+        assert_eq!(registry.newest(), Some("scan-0000001e".to_string()));
+        assert_eq!(crate::jobs::JobRegistry::new(1).newest(), None);
 
         // The handles are the entry's own, and cancelling through the registry
         // is what the worker observes.
@@ -2799,31 +2869,132 @@ mod tests {
         h.cancel_all();
     }
 
-    /// Security review (whole branch, 2026-11-01): a `scan.map` job is
-    /// admitted to an agent under `auto` because it sends no probe (spec D3),
-    /// so its client crawl must follow GET links only — a form POST is a
-    /// write the target did not see coming. An ordinary passive scan of the
-    /// same page still submits the form, which is what makes the map job's
-    /// restraint visible.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_map_job_never_submits_forms() {
-        const PAGE: &str = "<html><body><a href=\"/about\">about</a>\
+    /// Spec D5 "monotonic from `started_at`" (T9 live run, 2026-11-01): a job
+    /// that is still running reports the wall time since `started_at` from
+    /// every registry reader — `status`, `list` and the status `cancel`
+    /// returns — while a finished job keeps the value its terminal transition
+    /// fixed.
+    #[test]
+    fn a_running_job_reports_live_elapsed_ms() {
+        use aitm_scan_model::{JobState, JobStatus};
+        let registry = crate::jobs::JobRegistry::new(4);
+        let now = crate::util::now_ms();
+        let entry =
+            |job: &str, state: JobState, started_at: u64, elapsed_ms: u64| crate::jobs::JobEntry {
+                status: Arc::new(std::sync::RwLock::new(JobStatus {
+                    job: job.to_string(),
+                    state,
+                    started_at,
+                    finished_at: state.is_terminal().then_some(started_at + elapsed_ms),
+                    elapsed_ms,
+                    targets: vec!["http://a.test".to_string()],
+                    ..JobStatus::default()
+                })),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                confine: None,
+                started_by: Default::default(),
+                discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+                origins: vec!["http://a.test".to_string()],
+                is_agent: false,
+            };
+        assert!(registry.try_insert(entry(
+            "scan-11111111",
+            JobState::Running,
+            now.saturating_sub(5_000),
+            0
+        )));
+        assert!(registry.try_insert(entry(
+            "scan-22222222",
+            JobState::Done,
+            now.saturating_sub(60_000),
+            42
+        )));
+
+        let live = registry.status("scan-11111111").expect("the live job");
+        assert_eq!(live.finished_at, None);
+        assert!(
+            live.elapsed_ms >= 5_000,
+            "status is live: {}",
+            live.elapsed_ms
+        );
+
+        let listed = registry.list(false, 10);
+        let by_job = |job: &str| {
+            listed
+                .iter()
+                .find(|s| s.job == job)
+                .unwrap_or_else(|| panic!("{job} is listed"))
+                .elapsed_ms
+        };
+        assert!(
+            by_job("scan-11111111") >= 5_000,
+            "list agrees: {}",
+            by_job("scan-11111111")
+        );
+        assert_eq!(
+            by_job("scan-22222222"),
+            42,
+            "a finished job keeps its fixed elapsed"
+        );
+
+        let cancelled = registry.cancel("scan-11111111").expect("the live job");
+        assert_eq!(cancelled.state, JobState::Cancelling);
+        assert!(
+            cancelled.elapsed_ms >= 5_000,
+            "cancel's returned status is live too: {}",
+            cancelled.elapsed_ms
+        );
+        assert_eq!(
+            registry
+                .status("scan-22222222")
+                .expect("the done job")
+                .elapsed_ms,
+            42
+        );
+    }
+
+    /// Security review (delta ca852f71..e6bd03bc, 2026-11-01): a map crawl
+    /// under agent `auto` admission does not submit a form that looks like it
+    /// changes something that matters. The `/account/delete` form is skipped
+    /// and counted in `crawl.forms_skipped`; the `/comments` form beside it is
+    /// submitted as before. `max_depth: 1` parses the seed page only, so the
+    /// count is one page's worth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_destructive_looking_form_is_skipped_and_counted() {
+        const PAGE: &str = "<html><body>\
+             <form action=\"/account/delete\" method=\"post\"><input name=\"id\" value=\"7\"></form>\
              <form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>\
              </body></html>";
 
         let h = Harness::bare().with_page(PAGE);
         h.bind();
         let mut profile = h.profile(&["http://scan.test"]);
-        profile.intensity = Intensity::Passive;
-        let started = crate::jobs::start(&h.engine, profile, operator(), false)
-            .expect("a passive scan starts");
-        h.wait_terminal(&started.job, std::time::Duration::from_secs(5))
+        profile.crawl.max_depth = 1;
+        let started =
+            crate::jobs::start(&h.engine, profile, operator(), true).expect("a map job starts");
+        let status = h
+            .wait_terminal(&started.job, std::time::Duration::from_secs(5))
             .await;
+
         assert_eq!(
             h.client.trail(),
-            vec!["GET /", "GET /about", "POST /comments"],
-            "a scan.start crawl submits the form"
+            vec!["GET /", "POST /comments"],
+            "the delete form is never submitted; the comments form is"
         );
+        assert_eq!(status.crawl.forms_skipped, 1, "{:?}", status.crawl);
+        assert_eq!(status.crawl.errors, 0);
+    }
+
+    /// Coordinator decision (2026-11-01, spec D8.1): a `scan.map` crawl submits
+    /// forms with inert generated values exactly like a scan's crawl does, because
+    /// form filling is how the crawl reaches routes and finds points; "map-only"
+    /// forces lanes and intensity, never `crawl.submit_forms`. The map job's
+    /// restraint is the absence of probes (`force_map_pins_http_and_passive`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_map_job_submits_forms_like_any_crawl() {
+        const PAGE: &str = "<html><body><a href=\"/about\">about</a>\
+             <form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>\
+             </body></html>";
 
         let h = Harness::bare().with_page(PAGE);
         h.bind();
@@ -2838,8 +3009,8 @@ mod tests {
             .await;
         assert_eq!(
             h.client.trail(),
-            vec!["GET /", "GET /about"],
-            "a scan.map crawl follows GET links only"
+            vec!["GET /", "GET /about", "POST /comments"],
+            "a scan.map crawl follows the links and submits the form, like a scan's crawl"
         );
     }
 

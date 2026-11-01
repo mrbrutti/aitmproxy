@@ -87,8 +87,7 @@ Its crawl has three modes, and the lane picks one per origin:
   crawl off; the lane maps and audits only what the proxy has already
   captured for the origin.
 
-(`scan.map` uses the same crawl with `submit_forms` forced off: it never
-submits a form, because a form POST is a write the target did not see coming.)
+(`scan.map` uses the same crawl, `submit_forms` included: spec D8.1 makes form filling with inert generated values a crawl step, so a map job reaches the same routes a scan does and sends no probe)
 
 ## The verbs
 
@@ -102,8 +101,8 @@ submits a form, because a form POST is a write the target did not see coming.)
 | `scan.issues` | Read | `job?`, `target?`, `severity_min?`, `confidence_min?`, `class?`, `lane?`, `status?`, `since?`, `limit?` (100, max 1024), `cursor?` | `{ issues, next_cursor, by_severity }` | `invalid_profile`, `not_found` |
 | `scan.issue` | Read | `id` | `Issue` | `not_found` |
 | `scan.issue.update` | Write | `id`, `status`, `note?` | `Issue` | `not_found`, `invalid_profile` |
-| `scan.sitemap` | Read | `job?` or `target?`, `cursor?`, `limit?` (1024, max 4096) | `{ nodes, points, next_cursor }` | `invalid_profile`, `not_found` |
-| `scan.checks` | Read | `lane?`, `class?`, `origin?` | `{ checks: [CheckMeta] }` | `invalid_profile` |
+| `scan.sitemap` | Read | `job?`, `target?` (neither ⇒ the newest job of all), `cursor?`, `limit?` (1024, max 4096) | `{ nodes, points, next_cursor }` | `invalid_profile`, `not_found` |
+| `scan.checks` | Read | `lane?`, `class?`, `origin?` | `{ checks: [CheckMeta], lanes: [{ lane, source: crate \| interim }] }` | `invalid_profile` |
 | `scan.profile.list` | Read | — | `{ profiles: [{ name, builtin, summary }] }` | — |
 | `scan.profile.get` | Read | `name` | `ScanProfile` | `not_found`, `invalid_profile` |
 | `scan.profile.save` | Write | `profile` | `{ saved, path }` | `invalid_profile` |
@@ -122,8 +121,15 @@ a partial profile merged over it key by key, and a mistyped override key is an
 
 `scan.map` is `scan.start` with `lanes: [http]` and `intensity: passive` forced:
 it crawls, runs the passive checks and enumerates insertion points, and sends no
-probe. Its crawl follows GET links only (`crawl.submit_forms` is forced off), so
-a map job never submits a form. Read its result with `scan.sitemap` and
+probe. Its crawl honours the profile's `crawl.submit_forms` (default on): form
+filling with inert generated values is part of the crawl, not a probe
+(coordinator decision, 2026-11-01). Plainly: the map crawl **submits same-origin
+forms** with inert values and the observed session, **skips** logout-looking and
+destructive-looking forms — an action path or field name containing `delete`,
+`remove`, `destroy`, `password`, `transfer`, `pay`, `purchase`, `unsubscribe` or
+`confirm`, matched as whole words — and counts every form it skipped in
+`JobStatus.crawl.forms_skipped`; `crawl.submit_forms: false` turns form
+submission off altogether. Read its result with `scan.sitemap` and
 `scan.issues`.
 
 `scan.discover` is **deprecated**. It is now a `scan.map` job plus a bounded
@@ -382,6 +388,14 @@ Recorded scan flows carry marks, so they can be filtered back out of the capture
 list: `scan:<job>` on every flow the job produced, `crawl` on a lane's crawl
 captures, and `issue:<id>` on the flows re-recorded as an issue's evidence.
 
+Three reading notes from the 2026-11-01 live runs: `elapsed_ms` is live while
+the job runs (wall time since `started_at`, fixed at the terminal transition);
+`crawl.errors` counts crawls of an origin that failed outright (a browser crawl
+that timed out or was refused, after which the client crawl stands in), so a job
+that ran on fewer points than it could have says so; `poc_ref` on an issue is
+present only when `findings.dir` is set, because the reproduction's
+`FindingRecord` is what it points at (no findings dir, no record, no `poc_ref`).
+
 ## Issues
 
 An issue is one weakness at one place. It carries a **class** (`sqli`,
@@ -391,6 +405,15 @@ the check's declared `confidence_max`), the evidence that produced it (payload,
 a bounded scrubbed excerpt of what matched, timing correlation, response diff,
 the probe flows and the baseline flow), and its triage **status**: `open`,
 `confirmed` or `false_positive`, set with `scan.issue.update` and persisted.
+
+An issue belongs to **every job that found it**: spec D6 dedupes across jobs,
+so a later job that re-finds a known weakness merges into the existing record
+(`occurrences` grows, `last_seen` moves, evidence is replaced only on higher
+confidence); `job` names the first finder and `jobs` lists every job that found
+or re-found it, and `scan.issues { job }` and a job's `issues` tally include the
+issue for each of them (amendment 27c). An `issue` push line means found **or**
+re-found. `scan.sitemap` names the job its map came from in `job`, also when it
+fell back to the newest job (27b).
 
 **Dedupe.** One weakness at one place is one issue however many checks report
 it: the dedupe key is a blake3 digest of the **class plus the location**, and
@@ -578,6 +601,15 @@ replayed **every 25 probes**. A `2xx` that turns into a redirect, a `401` or a
 `403` means the session is gone. Under `session.on_lost: stop` (the default) the
 job ends with `stopped_reason: session_lost`; under `continue` it keeps going
 unauthenticated.
+
+Two consequences for anyone seeding a session for a scan: points whose **name**
+looks like session material (cookies such as `sid`, headers such as
+`Authorization`, token-like parameters) carry the `session` trait and the
+default `audit.ignore` rule skips them (`points.skipped.ignored`); the canary
+request's own point is **not** excluded from the audit. Seed the session with
+the cookie alone, on `/`, and send the pages you want audited without session
+headers; a fabricated `Authorization` header is re-sent on every probe and a
+target that refuses it answers nothing worth reflecting.
 
 ## Running one check by hand
 

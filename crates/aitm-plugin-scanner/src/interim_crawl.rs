@@ -142,6 +142,9 @@ impl std::fmt::Display for CrawlStop {
 pub struct ClientCrawl {
     /// Pages fetched successfully.
     pub pages: u32,
+    /// Forms the crawl found and deliberately did not submit — logout-looking
+    /// or destructive-looking ones (`CrawlCounters::forms_skipped`).
+    pub forms_skipped: u32,
     /// Why it stopped, or `None` when the reachable graph was exhausted.
     pub stopped: Option<CrawlStop>,
 }
@@ -162,6 +165,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     let Some(seed) = Url::parse(origin).ok().filter(|u| u.has_host()) else {
         return ClientCrawl {
             pages: 0,
+            forms_skipped: 0,
             stopped: Some(CrawlStop::BadOrigin),
         };
     };
@@ -179,6 +183,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     queue.push_back((seed, 0));
 
     let mut pages = 0u32;
+    let mut forms_skipped = 0u32;
     let mut attempts = 0u32;
     let mut depth_hit = false;
     let mut stopped: Option<CrawlStop> = None;
@@ -252,11 +257,12 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
                 // contributes nothing rather than ending the crawl.
                 let parsed = tokio::task::spawn_blocking(move || {
                     let text = String::from_utf8_lossy(&head);
-                    navigations(&base, &text, submit_forms)
+                    navigations_counted(&base, &text, submit_forms)
                 })
                 .await;
-                if let Ok(navs) = parsed {
-                    found.extend(navs);
+                if let Ok(extracted) = parsed {
+                    forms_skipped = forms_skipped.saturating_add(extracted.forms_skipped);
+                    found.extend(extracted.navigations);
                 }
             }
         }
@@ -273,6 +279,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
 
     ClientCrawl {
         pages,
+        forms_skipped,
         stopped: stopped.or(depth_hit.then_some(CrawlStop::MaxDepth)),
     }
 }
@@ -354,11 +361,32 @@ fn authority(url: &Url) -> String {
 ///   userinfo, on the page's own origin. Fragments are stripped, so a link to
 ///   the page itself is not a navigation, and a log-out looking path is left
 ///   alone.
+/// - A form whose action path or field names look like a log-out or a
+///   destructive action ([`looks_destructive`]) is not submitted; the crawl
+///   counts it instead ([`Extracted::forms_skipped`]).
 /// - Comments are not markup, and the text of `<script>` / `<style>` is not
 ///   markup either (their `src` still is).
 pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation> {
+    navigations_counted(base, html, submit_forms).navigations
+}
+
+/// What one page's markup yields: the navigations the crawl makes, and how
+/// many forms it deliberately left alone.
+#[derive(Debug, Default)]
+pub struct Extracted {
+    /// The navigations, in document order, deduplicated.
+    pub navigations: Vec<Navigation>,
+    /// Forms skipped as logout-looking or destructive-looking
+    /// (`CrawlCounters::forms_skipped`). Counted only when `submit_forms` is
+    /// on: with it off no form is read, so none is skipped.
+    pub forms_skipped: u32,
+}
+
+/// [`navigations`], with the count of forms the crawl refused to submit.
+pub fn navigations_counted(base: &Url, html: &str, submit_forms: bool) -> Extracted {
     let html = crate::util::truncate_on_char_boundary(html, MAX_HTML_BYTES);
     let mut out: Vec<Navigation> = Vec::new();
+    let mut forms_skipped = 0u32;
     let mut seen: HashSet<String> = HashSet::new();
     let mut i = 0;
     // One budget of tag parses for the whole page, spent by this walk and by
@@ -384,7 +412,11 @@ pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation
             "a" | "area" => push(link(base, tag.attr("href")), &mut out),
             "form" => {
                 if submit_forms {
-                    push(form(base, &tag, html, &mut budget), &mut out);
+                    match form(base, &tag, html, &mut budget) {
+                        FormOutcome::Submit(nav) => push(Some(nav), &mut out),
+                        FormOutcome::Skipped => forms_skipped = forms_skipped.saturating_add(1),
+                        FormOutcome::NotEncodable => {}
+                    }
                 }
             }
             // Raw text, not markup: skip the content, keep the `src`.
@@ -398,7 +430,10 @@ pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation
             _ => {}
         }
     }
-    out
+    Extracted {
+        navigations: out,
+        forms_skipped,
+    }
 }
 
 /// A `GET` navigation for an `href`/`src` value, or `None` when it is not one.
@@ -408,34 +443,59 @@ fn link(base: &Url, href: Option<&str>) -> Option<Navigation> {
     (url != *base).then(|| Navigation::get(url))
 }
 
-/// The navigation one `<form>` describes, `None` when the crawl will not
-/// submit it. `budget` is the page's remaining tag budget, which the field
-/// scan draws on.
-fn form(base: &Url, tag: &Tag, html: &str, budget: &mut usize) -> Option<Navigation> {
+/// What the crawl does with one `<form>`.
+enum FormOutcome {
+    /// Submit it as this navigation.
+    Submit(Navigation),
+    /// Leave it alone, and say so: it looks like a log-out or a destructive
+    /// action (`CrawlCounters::forms_skipped`).
+    Skipped,
+    /// Not a form the crawl can send: off-origin or unresolvable action, or an
+    /// encoding the crawl does not produce.
+    NotEncodable,
+}
+
+/// The navigation one `<form>` describes, or why the crawl will not submit
+/// it. `budget` is the page's remaining tag budget, which the field scan
+/// draws on.
+fn form(base: &Url, tag: &Tag, html: &str, budget: &mut usize) -> FormOutcome {
     let enctype = tag.attr("enctype").unwrap_or("").to_ascii_lowercase();
     if !enctype.is_empty() && !enctype.contains("application/x-www-form-urlencoded") {
-        return None;
+        return FormOutcome::NotEncodable;
     }
     // An empty action submits to the page the form is on, query and all.
     let mut url = match tag.attr("action").map(str::trim).unwrap_or("") {
         "" => base.clone(),
-        action => resolve(base, action)?,
+        action => match resolve(base, action) {
+            Some(url) => url,
+            None => return FormOutcome::NotEncodable,
+        },
     };
+    let fields = fields(html, tag.end, budget);
+    let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+    if looks_like_logout(&url) || looks_destructive(url.path(), &names) {
+        tracing::debug!(
+            target: "aitm::scanner",
+            path = url.path(),
+            "crawl: skipped a form that looks like a log-out or a destructive action"
+        );
+        return FormOutcome::Skipped;
+    }
     let encoded = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(fields(html, tag.end, budget))
+        .extend_pairs(fields)
         .finish();
     let post = tag
         .attr("method")
         .is_some_and(|method| method.trim().eq_ignore_ascii_case("post"));
     if post {
-        return Some(Navigation {
+        return FormOutcome::Submit(Navigation {
             method: "POST".to_string(),
             url,
             body: Some(encoded),
         });
     }
     url.set_query((!encoded.is_empty()).then_some(encoded.as_str()));
-    Some(Navigation::get(url))
+    FormOutcome::Submit(Navigation::get(url))
 }
 
 /// The `(name, value)` pairs a form submits, read from the controls between
@@ -535,6 +595,64 @@ fn looks_like_logout(url: &Url) -> bool {
     ]
     .iter()
     .any(|word| path.contains(word))
+}
+
+/// The words that make a form look like it changes something that matters.
+/// Matched whole, against the words of the action path's segments and of the
+/// field names (security review, delta ca852f71..e6bd03bc, 2026-11-01).
+const DESTRUCTIVE_WORDS: [&str; 9] = [
+    "delete",
+    "remove",
+    "destroy",
+    "password",
+    "transfer",
+    "pay",
+    "purchase",
+    "unsubscribe",
+    "confirm",
+];
+
+/// Whether a form reads as destructive: its action path or any field name
+/// carries one of [`DESTRUCTIVE_WORDS`] as a whole word. A map crawl under
+/// agent `auto` admission must not submit such a form; `scan.map` is admitted
+/// without a human in the loop, and the crawl fills forms with inert values.
+///
+/// Words are matched whole, not as substrings — `payload` is not `pay`,
+/// `deleted-items` is not `delete` — split on anything that is not a letter
+/// or digit and at a camelCase boundary (`removeUser`, `confirmPassword`),
+/// case-insensitively.
+fn looks_destructive(action_path: &str, field_names: &[&str]) -> bool {
+    action_path
+        .split('/')
+        .chain(field_names.iter().copied())
+        .flat_map(words)
+        .any(|word| DESTRUCTIVE_WORDS.contains(&word.as_str()))
+}
+
+/// The lowercase words of one path segment or field name: split on anything
+/// that is not alphanumeric and at a lower-to-upper camelCase boundary.
+fn words(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if c.is_uppercase() && previous_lower && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            current.extend(c.to_lowercase());
+            previous_lower = c.is_lowercase();
+        } else {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            previous_lower = false;
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// One opening tag: its lowercase name, its attributes, and the index just
@@ -749,6 +867,77 @@ mod tests {
         );
     }
 
+    /// Security review (delta ca852f71..e6bd03bc, 2026-11-01): a map crawl
+    /// under agent `auto` admission must not submit a form that looks like
+    /// it changes something that matters. A form whose action path or field
+    /// name carries a destructive marker is skipped and counted; ordinary
+    /// forms are submitted.
+    #[test]
+    fn destructive_looking_forms_are_skipped_and_counted() {
+        let page = concat!(
+            "<form action=\"/account/delete\" method=\"post\">",
+            "<input name=\"id\" value=\"7\"></form>",
+            "<form action=\"/comments\" method=\"post\">",
+            "<input name=\"comment\"></form>",
+            "<form action=\"/search\"><input name=\"q\"></form>",
+            "<form action=\"/settings\" method=\"post\">",
+            "<input name=\"old_password\"><input name=\"display\"></form>",
+            "<form action=\"/logout\" method=\"post\"></form>",
+        );
+
+        let extracted = navigations_counted(&base(), page, true);
+        assert_eq!(
+            shape(&extracted.navigations),
+            vec![
+                ("POST", "http://target.test/comments", Some("comment=a")),
+                ("GET", "http://target.test/search?q=a", None),
+            ]
+        );
+        assert_eq!(
+            extracted.forms_skipped, 3,
+            "the delete form, the password form and the logout form"
+        );
+
+        // With `submit_forms: false` no form is read, so none is "skipped".
+        let off = navigations_counted(&base(), page, false);
+        assert!(off.navigations.is_empty());
+        assert_eq!(off.forms_skipped, 0);
+    }
+
+    /// The destructive heuristic matches whole words (split on `/`, `-`, `_`,
+    /// `.` and camelCase), case-insensitively, on the action path and the
+    /// field names — not substrings, so `payload` is not `pay`.
+    #[test]
+    fn looks_destructive_matches_words_not_substrings() {
+        assert!(looks_destructive("/account/delete", &[]));
+        assert!(looks_destructive("/Account/DELETE", &[]));
+        assert!(looks_destructive("/api/removeUser", &[]));
+        assert!(looks_destructive("/cart/purchase.php", &[]));
+        assert!(looks_destructive("/money/transfer-funds", &[]));
+        assert!(looks_destructive("/pay", &[]));
+        assert!(looks_destructive("/newsletter/unsubscribe", &[]));
+        assert!(looks_destructive("/order/confirm", &[]));
+        assert!(looks_destructive("/settings", &["old_password"]));
+        assert!(looks_destructive(
+            "/settings",
+            &["display", "confirmPassword"]
+        ));
+        assert!(looks_destructive("/things", &["destroy"]));
+
+        assert!(!looks_destructive("/comments", &["comment"]));
+        assert!(!looks_destructive("/search", &["q"]));
+        assert!(!looks_destructive("/upload", &["payload"]));
+        assert!(
+            !looks_destructive("/payments-history", &[]),
+            "payments is not pay"
+        );
+        assert!(
+            !looks_destructive("/deleted-items", &[]),
+            "deleted is not delete"
+        );
+        assert!(!looks_destructive("/", &[]));
+    }
+
     /// A relative link resolves against the page it was found on, not the
     /// origin root.
     #[test]
@@ -922,8 +1111,13 @@ mod tests {
             .expect("extraction finished within 10 s (a regression to quadratic time)");
 
         eprintln!("2 MiB page of unclosed forms extracted in {elapsed:?}");
+        // The regression this guards is quadratic (~30 min on this page); the
+        // linear pass takes ~0.1 s in debug on an idle machine and ~1.7 s at a
+        // load average near 300 (2026-11-01 gate), so the bound leaves room for
+        // a loaded shared machine while still catching the regression by orders
+        // of magnitude.
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
+            elapsed < std::time::Duration::from_secs(5),
             "a 2 MiB page of unclosed forms took {elapsed:?}"
         );
         assert_eq!(count, 1, "every form is the same navigation");

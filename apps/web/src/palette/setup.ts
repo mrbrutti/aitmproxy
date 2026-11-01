@@ -1,6 +1,7 @@
 // The palette's Setup group: the handful of operator actions that are not bus commands with a
 // form of their own. Labels read the current state so the action says what it will do.
 import type { AppStore, Density } from '~/state/app';
+import { caInstallArgs } from '~/state/caTrust';
 import type { SetupAction } from './groups';
 
 const DENSITY_NEXT: Record<Density, Density> = { dense: 'default', default: 'comfortable', comfortable: 'dense' };
@@ -14,7 +15,15 @@ export function setupActions(app: AppStore, close: () => void): SetupAction[] {
   const hasTool = (n: string) => app.proxy.tools.some((t) => t.name === n);
   const theme = effectiveTheme(app);
   const list: SetupAction[] = [];
-  if (hasTool('ca.install')) list.push({ id: 'install-ca', label: 'Install CA', hint: 'Trust the root certificate on this machine', icon: 'lock', tool: 'ca.install' });
+  if (hasTool('ca.install'))
+    list.push({
+      id: 'install-ca',
+      label: 'Trust the aitmproxy CA',
+      hint: 'Install the root CA into your user trust store; HTTPS is not captured until then',
+      icon: 'lock',
+      tool: 'ca.install',
+      args: caInstallArgs(app.ca),
+    });
   list.push(
     {
       id: 'add-scope',

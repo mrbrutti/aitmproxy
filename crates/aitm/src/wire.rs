@@ -1350,15 +1350,53 @@ mod tests {
     }
 
     /// Task 15 and call B7: an ordinary assembly carries the whole scanner v2
-    /// verb surface plus one `check.<id>` command per catalogue entry — the five
-    /// interim-lane checks included, because while no lane crate supplies an
-    /// HTTP lane the plugin's own interim lane is what stocks the catalogue.
+    /// verb surface plus one `check.<id>` command per catalogue entry. Which
+    /// entries exist depends on the lanes this build links (the interim HTTP
+    /// lane's five while no lane crate supplies `http`; T2's once it does), so
+    /// the manual verbs are checked against the engine's own catalogue, and the
+    /// interim ids only while the `http` lane is the interim one.
     #[test]
     fn scan_verbs_and_manual_checks_are_registered() {
         let mut cfg = Config::default();
         cfg.ca.dir = temp_ca_dir("scan-verbs");
         let assembled = assemble(&cfg).expect("assemble");
         let reg = assembled.proxy.registry();
+        let engine = assembled
+            .scanner_engine
+            .get()
+            .expect("the scanner plugin built its engine during assembly")
+            .clone();
+        let catalogue = engine.catalogue();
+        let ids: Vec<String> = catalogue
+            .all()
+            .iter()
+            .map(|c| c.meta().id.clone())
+            .collect();
+        assert!(!ids.is_empty(), "the catalogue is never empty");
+        for id in &ids {
+            assert!(
+                reg.command(&format!("check.{id}")).is_some(),
+                "check.{id} is registered for catalogue entry {id}"
+            );
+        }
+        let http_is_interim = engine.lane_entries().iter().any(|e| {
+            e.lane == aitm_scan_model::LaneKind::Http
+                && e.source == aitm_scan_model::LaneSource::Interim
+        });
+        if http_is_interim {
+            for id in [
+                "xss-reflected",
+                "open-redirect",
+                "reflection",
+                "security-header",
+                "cookie-flag",
+            ] {
+                assert!(
+                    ids.iter().any(|have| have == id),
+                    "interim check {id} is in the catalogue"
+                );
+            }
+        }
 
         for name in [
             "scan.start",
@@ -1379,11 +1417,6 @@ mod tests {
             "scan.discover",
             "scan.passive",
             "scan.report",
-            "check.xss-reflected",
-            "check.open-redirect",
-            "check.reflection",
-            "check.security-header",
-            "check.cookie-flag",
         ] {
             assert!(reg.command(name).is_some(), "{name} is registered");
         }

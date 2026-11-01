@@ -13,6 +13,7 @@
 mod base64;
 pub mod http;
 pub mod json;
+pub mod redact_args;
 pub mod render;
 pub mod schema;
 pub mod server;
