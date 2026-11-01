@@ -503,7 +503,7 @@ Kept by the main session during stage 6. One row per finding.
 | 10 | security | Minor | `saved` adopted as `loaded_from` unbounded and unchecked | fix round G (G46) |
 | 10 | security | Minor | control characters pass `usable_selector` | fix round G (G47) |
 | 10 | security | Minor | canary path not cut at `?`/`#` | fix round G (G48) |
-| 10 | security | Minor | typed profile names unchecked as plain file names | fix round G (G49); core-side validation relayed to the coordinator |
+| 10 | security | Minor | typed profile names unchecked as plain file names | fix round G (G49) mirrors the engine's `^[a-z0-9][a-z0-9._-]{0,63}$` rule (T1b, relayed by the coordinator 2026-11-01); D11 amended |
 | 10 | security | note | `scan.profile.get` origins and shrunk scope are not re-checked until `s` | Task 12 gate re-checks every origin and L4 target against scope before `scan.start` (brief) |
 | 10 | spec | Minor | `scan.session.preview` skipped when a preview for the origin is cached | fix round G (G50): drop the cache skip; D11 amended |
 | 10 | spec | Minor | `cycle` returns `bool` against the plan's `()` | plan Task 10 signature amended, no code change |
