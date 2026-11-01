@@ -10,7 +10,7 @@
 
 use aitm_proto_l4::privilege::contract::{Receipt, BPF_GROUP, RECEIPT_DIR, RECEIPT_SCHEMA};
 
-use crate::bpf::{plan_apply, plan_revert, ConsoleUser, NodeFacts, Step};
+use crate::bpf::{plan_apply, plan_revert, render, ConsoleUser, NodeFacts, Step};
 
 /// The one directory-service tool the helper runs, by absolute path.
 pub const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
@@ -223,6 +223,95 @@ pub fn revert(sys: &dyn MacSys) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// How many `/dev/bpfN` nodes exist on a machine after step 1 (`BPF_MAX_DEVICES`).
+const NODE_TOTAL: usize = 256;
+
+/// The prior receipt for a `--dry-run`, read-only. Where the real run would
+/// create the directory, stop on it or fail to read it, the dry run pushes one
+/// line saying so and plans as if there were no receipt. `missing` finishes
+/// the line for an absent directory (what the real run would do about it).
+fn dry_prior(sys: &dyn MacSys, lines: &mut Vec<String>, missing: &str) -> Option<Receipt> {
+    match sys.receipt_dir_meta() {
+        Err(err) => {
+            lines.push(format!("receipt directory not readable: {err}"));
+            None
+        }
+        Ok(None) => {
+            lines.push(format!(
+                "receipt directory {RECEIPT_DIR} is missing; {missing}"
+            ));
+            None
+        }
+        Ok(Some(meta)) => {
+            if let Err(why) = check_receipt_dir(&meta) {
+                lines.push(format!("the run would stop: {why}"));
+                return None;
+            }
+            match read_prior(sys) {
+                Ok(prior) => prior,
+                Err(err) => {
+                    lines.push(format!("the run would stop: {err}"));
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// `bpf-permissions --dry-run` (spec §3.1, last paragraph): the lines the run
+/// would print, read-only, for any user. Gathers the facts [`apply`] gathers
+/// (receipt directory, prior receipt, nodes, group, console user) but never
+/// pre-creates a node, creates the directory, changes an owner, a mode or the
+/// directory service, or writes. Facts an unprivileged user cannot read are
+/// reported as a line and planned around conservatively; only the node list
+/// is required.
+pub fn dry_run_apply(sys: &dyn MacSys) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let prior = dry_prior(sys, &mut lines, "bpf-permissions would create it");
+    let nodes = sys.list_nodes()?;
+    if nodes.len() < NODE_TOTAL {
+        lines.push(format!(
+            "{} of {NODE_TOTAL} nodes exist; bpf-permissions would create the rest first",
+            nodes.len()
+        ));
+    }
+    let group_gid = match sys.group_gid() {
+        Ok(gid) => gid,
+        Err(err) => {
+            lines.push(format!(
+                "group {BPF_GROUP} could not be looked up ({err}); planning as if it were absent"
+            ));
+            None
+        }
+    };
+    let console = match sys.console_user() {
+        Ok(console) => console,
+        Err(err) => {
+            lines.push(format!(
+                "console user could not be determined ({err}); planning as if nobody were logged in"
+            ));
+            None
+        }
+    };
+    lines.extend(render(&plan_apply(
+        &nodes,
+        group_gid,
+        prior.as_ref(),
+        console.as_ref(),
+    )));
+    Ok(lines)
+}
+
+/// `bpf-revert --dry-run`: the lines the run would print, read-only, for any
+/// user. Same facts as [`revert`], no change to anything.
+pub fn dry_run_revert(sys: &dyn MacSys) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let prior = dry_prior(sys, &mut lines, "there is no receipt to read");
+    let nodes = sys.list_nodes()?;
+    lines.extend(render(&plan_revert(&nodes, prior.as_ref())));
+    Ok(lines)
 }
 
 /// The gid in a `dscl . -read /Groups/<name> PrimaryGroupID` reply, which is
@@ -500,6 +589,8 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<Call>>,
         dir: Option<DirMeta>,
+        /// When set, `receipt_dir_meta` fails with this message instead.
+        dir_error: Option<String>,
         nodes: Vec<NodeFacts>,
         /// The gid `group_gid` answers right now.
         gid: RefCell<Option<u32>>,
@@ -514,6 +605,7 @@ mod tests {
             Fake {
                 calls: RefCell::new(Vec::new()),
                 dir: Some(good_dir()),
+                dir_error: None,
                 nodes,
                 gid: RefCell::new(gid),
                 gid_after_create: gid,
@@ -596,7 +688,10 @@ mod tests {
         }
         fn receipt_dir_meta(&self) -> Result<Option<DirMeta>, String> {
             self.record(Call::ReceiptDirMeta);
-            Ok(self.dir.clone())
+            match &self.dir_error {
+                Some(err) => Err(err.clone()),
+                None => Ok(self.dir.clone()),
+            }
         }
         fn create_receipt_dir(&self) -> Result<(), String> {
             self.record(Call::CreateReceiptDir);
@@ -1042,5 +1137,164 @@ mod tests {
         assert_eq!(parse_primary_group_id(""), None);
         assert_eq!(parse_primary_group_id("PrimaryGroupID: abc\n"), None);
         assert_eq!(parse_primary_group_id("RecordName: access_bpf\n"), None);
+    }
+
+    #[test]
+    fn dry_run_apply_touches_nothing() {
+        let sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        let lines = match dry_run_apply(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        let expected = render(&plan_apply(
+            &all_nodes(),
+            Some(701),
+            None,
+            Some(&admin("matt")),
+        ));
+        assert_eq!(lines, expected);
+        assert_eq!(lines.len(), 256 * 2 + 2);
+        assert_eq!(lines[0], "chown root:access_bpf /dev/bpf0");
+        assert_eq!(lines[1], "chmod 0660 /dev/bpf0");
+        assert_eq!(lines[512], "add matt to access_bpf");
+        assert_eq!(
+            lines[513],
+            "write receipt /Library/Application Support/Aitmproxy/l4-helper.json"
+        );
+
+        let calls = sys.calls();
+        assert!(
+            !calls.iter().any(touches_the_machine),
+            "a dry run touches nothing: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::PrecreateNodes)),
+            "a dry run pre-creates no node: {calls:?}"
+        );
+        // It did gather the facts the real run would.
+        for wanted in [
+            Call::ReceiptDirMeta,
+            Call::ReadReceipt,
+            Call::ListNodes,
+            Call::GroupGid,
+            Call::ConsoleUser,
+        ] {
+            assert!(calls.contains(&wanted), "{wanted:?} missing from {calls:?}");
+        }
+    }
+
+    #[test]
+    fn dry_run_apply_without_the_group_prints_the_whole_plan() {
+        let sys = Fake::new(all_nodes(), None, Some(admin("matt")));
+        let lines = match dry_run_apply(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        assert_eq!(lines[0], "create group access_bpf");
+        assert_eq!(lines[1], "chown root:access_bpf /dev/bpf0");
+        assert_eq!(
+            dseditgroup_calls(&sys.calls()),
+            Vec::<Vec<String>>::new(),
+            "no group is created on a dry run"
+        );
+    }
+
+    #[test]
+    fn dry_run_reports_a_missing_or_unreadable_receipt_dir_as_a_line() {
+        // Missing directory: a line, then the plan as on a first run.
+        let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        sys.dir = None;
+        let lines = match dry_run_apply(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        assert_eq!(
+            lines[0],
+            "receipt directory /Library/Application Support/Aitmproxy is missing; bpf-permissions would create it"
+        );
+        assert_eq!(lines[1], "chown root:access_bpf /dev/bpf0");
+        assert!(lines.contains(&"add matt to access_bpf".to_string()));
+        assert!(
+            !sys.calls().contains(&Call::CreateReceiptDir),
+            "a dry run creates no directory"
+        );
+
+        // Unreadable directory (as for an unprivileged user): a line, then the plan.
+        let mut sys = Fake::new(all_nodes(), Some(701), None);
+        sys.dir_error = Some(
+            "stat /Library/Application Support/Aitmproxy: Permission denied (os error 13)"
+                .to_string(),
+        );
+        let lines = match dry_run_apply(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        assert_eq!(
+            lines[0],
+            "receipt directory not readable: stat /Library/Application Support/Aitmproxy: Permission denied (os error 13)"
+        );
+        assert_eq!(lines[1], "chown root:access_bpf /dev/bpf0");
+        assert!(!sys.calls().contains(&Call::ReadReceipt));
+
+        // A refused directory is a line too; the real run would stop there.
+        let mut sys = Fake::new(all_nodes(), Some(701), None);
+        sys.dir = Some(DirMeta {
+            is_dir: false,
+            is_symlink: true,
+            ..good_dir()
+        });
+        let lines = match dry_run_revert(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        assert_eq!(
+            lines[0],
+            "the run would stop: /Library/Application Support/Aitmproxy is a symlink; nothing was changed"
+        );
+        assert_eq!(lines[1], "chown root:wheel /dev/bpf0");
+    }
+
+    #[test]
+    fn dry_run_apply_notes_nodes_still_to_create() {
+        let nodes: Vec<NodeFacts> = (0..4).map(|n| node(n, BPF_MAJOR)).collect();
+        let sys = Fake::new(nodes, Some(701), None);
+        let lines = match dry_run_apply(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        assert_eq!(
+            lines[0],
+            "4 of 256 nodes exist; bpf-permissions would create the rest first"
+        );
+        assert_eq!(lines[1], "chown root:access_bpf /dev/bpf0");
+        assert_eq!(lines.len(), 1 + 4 * 2 + 1);
+        assert!(!sys.calls().contains(&Call::PrecreateNodes));
+    }
+
+    #[test]
+    fn dry_run_revert_touches_nothing() {
+        let sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        *sys.receipt.borrow_mut() = Some(receipt(&["matt"]).to_json());
+        let lines = match dry_run_revert(&sys) {
+            Ok(lines) => lines,
+            Err(err) => panic!("dry run must succeed: {err}"),
+        };
+        let prior = receipt(&["matt"]);
+        assert_eq!(lines, render(&plan_revert(&all_nodes(), Some(&prior))));
+        assert_eq!(lines[0], "chown root:wheel /dev/bpf0");
+        assert_eq!(lines[512], "remove matt from access_bpf");
+        assert_eq!(
+            lines[513],
+            "delete receipt /Library/Application Support/Aitmproxy/l4-helper.json"
+        );
+        let calls = sys.calls();
+        assert!(
+            !calls.iter().any(touches_the_machine),
+            "a dry run touches nothing: {calls:?}"
+        );
+        assert!(
+            sys.receipt.borrow().is_some(),
+            "the receipt is still there after a dry run"
+        );
     }
 }
