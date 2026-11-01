@@ -712,6 +712,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | fix round | done | H37-H39, H42 in `8ecd6c9d`; `--selftest` 33 ok; mutation checks per row | second live smoke run; H41 after H40 |
 | H (cell) | coder note | Minor | "finished before `x`" is a note with a fresh job's own check; failure screens double as Evidence samples; `no site map yet` recorded; Fields pane by Esc then Tab; `EDITOR_FIELDS` copied as a tuple; H42 a hard check | ratified |
 | 15 | live smoke | run 2 | 7 ok, 2 failed: the editor's Fields walk by key did not reach `use_browser`, `e` opened a `value:` prompt and `s` typed into it; H38's failure screens captured it | H45 (Rust, Important: no test drives the Fields pane by keys), H43 (Rust: a Scan prompt draws over the Flows view), H44 (cell guard) |
+| 15 | engine | answered | T1b: zero issues = browser crawl bound but unreachable with no client-crawl fallback on 8be3e070 (fix landing); `use_browser: never` yields `reflected-xss` on `/search?q`; push fans out to every `flow.subscribe` connection, no replay | H42 stands; H46 makes the push thread's state visible; proof core re-pointed to 8be3e070 |
 
 ## Shipped
 
