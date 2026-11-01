@@ -804,9 +804,12 @@ async fn discovery_line_reports_its_counts() {
         b"*2\r\n$4\r\nauth\r\n$6\r\nsecret\r\n",
         b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n",
     ]);
-    let profile = profile_for("127.0.0.1", 9000, Some("resp"), 10, &seeds);
+    // Port 9007 is this test's alone: the capture sink is global and the
+    // other tests in this binary run beside it, so the line is picked by the
+    // node id rather than by being the first discovery line recorded.
+    let profile = profile_for("127.0.0.1", 9007, Some("resp"), 10, &seeds);
     let (_lane, _job, found) = discover_with(
-        Some(common::wildcard_guard(&[9000])),
+        Some(common::wildcard_guard(&[9007])),
         Arc::new(CountingClient::dry_run()),
         profile,
         "22log",
@@ -819,17 +822,24 @@ async fn discovery_line_reports_its_counts() {
         !recorded.is_empty(),
         "the capture recorded nothing at all, so nothing below is proven"
     );
-    let line = recorded
+    let mine: Vec<&String> = recorded
         .iter()
-        .find(|line| line.contains("l4_stream discover"))
-        .unwrap_or_else(|| panic!("no discovery line among {recorded:?}"));
+        .filter(|line| {
+            line.contains("l4_stream discover") && line.contains("node=l4s-tcp-127.0.0.1-9007")
+        })
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "exactly one discovery line per endpoint: {mine:?}"
+    );
+    let line = mine[0];
 
     assert!(
         line.contains("seeds_dropped_credential=3"),
         "the line does not count the three AUTH seeds: {line}"
     );
     assert!(line.contains("grammar=resp"), "{line}");
-    assert!(line.contains("node=l4s-tcp-127.0.0.1-9000"), "{line}");
     assert!(line.contains("seeds=1"), "{line}");
     assert!(
         line.contains(&format!("points={}", discovery.points.len())),
