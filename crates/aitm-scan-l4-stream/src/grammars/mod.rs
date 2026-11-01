@@ -107,6 +107,63 @@ impl Grammar for Pending {
     }
 }
 
+/// Test helpers shared across the grammar modules.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use crate::grammar::Grammar;
+    use crate::mutate::structure::structure_cases;
+    use crate::tree::FieldPath;
+
+    /// Assert that the separator at `path`, parsed out of `line`, is a live
+    /// `delim` point: it is a mutable node carrying a single space, and
+    /// S6.4's three delimiter mutators all reach it — `delim_remove` renders
+    /// `removed`, `delim_dup` renders `doubled`, and `delim_inject` names the
+    /// `command.verb` the separator's choice sits after. SMTP and FTP share
+    /// this point exactly, so both pin the same renderings here.
+    pub(crate) fn assert_separator_is_a_delim_point(
+        grammar: &dyn Grammar,
+        line: &[u8],
+        path: &str,
+        removed: &[u8],
+        doubled: &[u8],
+    ) {
+        let tree = grammar
+            .parse(line)
+            .expect("a command with an argument parses");
+        let point = FieldPath::new(path);
+        let separator = tree
+            .get(&point)
+            .expect("the separator is a node of its own");
+        assert_eq!(separator.bytes, b" ".to_vec());
+        assert!(separator.mutable, "the separator must be mutable");
+
+        let cases = structure_cases(&tree, grammar.spec(), &point, grammar.kind());
+        let chains: Vec<String> = cases.iter().flat_map(|case| case.chain.clone()).collect();
+        assert!(
+            chains.contains(&format!("delim_remove({path})")),
+            "{chains:?}"
+        );
+        assert!(chains.contains(&format!("delim_dup({path})")), "{chains:?}");
+        assert!(
+            chains
+                .iter()
+                .any(|entry| entry.starts_with("delim_inject(command.verb,")),
+            "{chains:?}"
+        );
+
+        let removed_case = cases
+            .iter()
+            .find(|case| case.chain == [format!("delim_remove({path})")])
+            .expect("the separator can be removed");
+        assert_eq!(removed_case.bytes, removed.to_vec());
+        let doubled_case = cases
+            .iter()
+            .find(|case| case.chain == [format!("delim_dup({path})")])
+            .expect("the separator can be doubled");
+        assert_eq!(doubled_case.bytes, doubled.to_vec());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Pending;

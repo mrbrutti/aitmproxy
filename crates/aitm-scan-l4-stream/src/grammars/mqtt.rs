@@ -234,8 +234,10 @@ pub(crate) fn read_string(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
 }
 
 /// The connect flags of a CONNECT, read from the bytes rather than from a
-/// tree so an unparsed captured packet is still judged.
-fn connect_flags(bytes: &[u8]) -> Option<u8> {
+/// tree so an unparsed captured packet is still judged. Shared with
+/// [`denylist`](crate::denylist) so the will-retain rule reads the flags the
+/// one way the grammar does.
+pub(crate) fn connect_flags(bytes: &[u8]) -> Option<u8> {
     let (_, after_length) = read_varint(bytes, 1)?;
     let (_, after_name) = read_string(bytes, after_length)?;
     // The protocol level sits between the name and the flags.

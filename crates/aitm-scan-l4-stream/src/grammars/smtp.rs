@@ -282,7 +282,7 @@ mod tests {
     use crate::client::Ended;
     use crate::denylist;
     use crate::grammar::{Expect, ReplyClass};
-    use crate::mutate::structure::structure_cases;
+    use crate::grammars::testkit;
     use crate::spec::{GrammarKind, MessageSpec, Transport};
     use crate::tree::{render, FieldPath};
 
@@ -453,14 +453,15 @@ mod tests {
     #[test]
     fn the_present_separator_is_a_delim_point() {
         let smtp = grammar();
-        let tree = smtp
-            .parse(b"VRFY postmaster\r\n")
-            .expect("a command with an argument parses");
+        testkit::assert_separator_is_a_delim_point(
+            smtp.as_ref(),
+            b"VRFY postmaster\r\n",
+            "command.sp.present",
+            b"VRFYpostmaster\r\n",
+            b"VRFY  postmaster\r\n",
+        );
 
-        let path = FieldPath::new("command.sp.present");
-        let separator = tree.get(&path).expect("the space is a node of its own");
-        assert_eq!(separator.bytes, b" ".to_vec());
-        assert!(separator.mutable, "the separator must be mutable");
+        // The empty alternative stays immutable: there is no separator to move.
         let absent = smtp
             .parse(b"NOOP\r\n")
             .expect("NOOP is a command")
@@ -468,36 +469,6 @@ mod tests {
             .expect("the empty alternative is a node of its own")
             .mutable;
         assert!(!absent, "the empty alternative stays immutable");
-
-        let cases = structure_cases(&tree, smtp.spec(), &path, GrammarKind::Smtp);
-        let chains: Vec<String> = cases.iter().flat_map(|case| case.chain.clone()).collect();
-        assert!(
-            chains.contains(&"delim_remove(command.sp.present)".to_string()),
-            "{chains:?}"
-        );
-        assert!(
-            chains.contains(&"delim_dup(command.sp.present)".to_string()),
-            "{chains:?}"
-        );
-        // `delim_inject` names the field before the separator, which is the
-        // verb the choice sits after.
-        assert!(
-            chains
-                .iter()
-                .any(|entry| entry.starts_with("delim_inject(command.verb,")),
-            "{chains:?}"
-        );
-
-        let removed = cases
-            .iter()
-            .find(|case| case.chain == ["delim_remove(command.sp.present)"])
-            .expect("the separator can be removed");
-        assert_eq!(removed.bytes, b"VRFYpostmaster\r\n".to_vec());
-        let doubled = cases
-            .iter()
-            .find(|case| case.chain == ["delim_dup(command.sp.present)"])
-            .expect("the separator can be doubled");
-        assert_eq!(doubled.bytes, b"VRFY  postmaster\r\n".to_vec());
     }
 
     #[test]

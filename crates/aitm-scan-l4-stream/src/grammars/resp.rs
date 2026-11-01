@@ -535,6 +535,37 @@ mod tests {
         assert!(resp.parse(b"no terminator").is_none());
     }
 
+    /// SPEC-I1 against the shipped RESP document: an array whose `count` says
+    /// two is two elements, so a third on the wire is leftover and the frame
+    /// is not that message. A parser that ignored the count would call a
+    /// three-element array well-formed. The only assertion against the
+    /// shipped RESP grammar's count; DNS's is `dns_qdcount_bounds_the_questions`.
+    #[test]
+    fn resp_count_bounds_the_shipped_array() {
+        let resp = grammar();
+        let two = resp
+            .parse(b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n")
+            .expect("a two-element RESP array parses");
+        assert_eq!(
+            two.get(&FieldPath::new("args"))
+                .expect("an `args` repeat")
+                .children
+                .len(),
+            2,
+        );
+        // Three elements behind a count of two: the array form takes two and
+        // the third is leftover, so it is not a RESP array — nor the inline
+        // form, which is a single `\r\n`-terminated line.
+        let three = resp.parse(b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n$3\r\nxyz\r\n");
+        assert!(
+            three.is_none(),
+            "`*2` bounds the array at two elements: {:?}",
+            three.map(|tree| tree
+                .get(&FieldPath::new("args"))
+                .map(|args| args.children.len()))
+        );
+    }
+
     #[test]
     fn resp_liveness_pings() {
         let probe = grammar().liveness_probe();

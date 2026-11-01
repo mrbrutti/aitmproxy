@@ -20,7 +20,7 @@
 
 use std::net::IpAddr;
 
-use crate::grammars::mqtt::{read_string, read_varint};
+use crate::grammars::mqtt::{connect_flags, read_string, read_varint};
 use crate::spec::GrammarKind;
 
 // ---------------------------------------------------------------------------
@@ -372,12 +372,8 @@ fn mqtt(rendered: &[u8]) -> Option<&'static str> {
             let topic = read_string(rendered, after_length)?.0;
             (topic.first() == Some(&b'$')).then_some("publish $topic")
         }
-        // CONNECT: protocol name, level, then the connect flags.
-        1 => {
-            let (_, after_name) = read_string(rendered, after_length)?;
-            let connect_flags = *rendered.get(after_name.checked_add(1)?)?;
-            (connect_flags & 0x20 != 0).then_some("connect will-retain")
-        }
+        // CONNECT: the will-retain flag, read the one way the grammar reads it.
+        1 => (connect_flags(rendered)? & 0x20 != 0).then_some("connect will-retain"),
         _ => None,
     }
 }
@@ -562,7 +558,7 @@ mod tests {
     /// fixed header alone decides — still fires on a truncated packet.
     #[test]
     fn mqtt_rules_use_the_grammar_decoder() {
-        use crate::grammars::mqtt::{read_string, read_varint};
+        use crate::grammars::mqtt::{connect_flags, read_string, read_varint};
 
         // 0x30 PUBLISH, remaining length 5, topic length 0xffff, three bytes.
         let truncated: Vec<u8> = vec![0x30, 0x05, 0xff, 0xff, b'a', b'b', b'c'];
@@ -596,6 +592,18 @@ mod tests {
         assert_eq!(read_varint(&long, 1), Some((128, 3)));
         assert_eq!(read_string(&long, 3), Some((&b"a/b"[..], 8)));
         assert_eq!(refuses(GrammarKind::Mqtt, &long), None);
+
+        // CONNECT reads its will-retain flag through the same shared
+        // decoder: a will-retain CONNECT is refused on that one path, and a
+        // CONNECT truncated before its flags byte decodes to None rather
+        // than reading past the buffer.
+        assert_eq!(
+            refuses(GrammarKind::Mqtt, &mqtt_connect(0x20)),
+            Some("connect will-retain")
+        );
+        let truncated_connect: Vec<u8> = vec![0x10, 0x02, 0x00, 0x04];
+        assert_eq!(connect_flags(&truncated_connect), None);
+        assert_eq!(refuses(GrammarKind::Mqtt, &truncated_connect), None);
 
         // Nothing at all, and a fixed header with no length byte.
         assert_eq!(read_varint(&[], 0), None);

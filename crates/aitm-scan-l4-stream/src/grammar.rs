@@ -49,10 +49,14 @@ pub trait Grammar: Send + Sync {
     /// Every document this grammar parses with, in the order
     /// [`Grammar::parse`] tries them, opening with [`Grammar::spec`].
     ///
-    /// Two grammar files hold a second YAML document for a second form of the
-    /// same protocol — RESP's inline command line, memcached's storage
-    /// command — and override this so that document is validated and
-    /// round-tripped with the rest of the registry (spec C1).
+    /// Production parses through [`Grammar::spec`]; `specs` exists so the
+    /// tests can validate and round-trip *every* embedded document, not just
+    /// the first. Two grammar files hold a second YAML document for a second
+    /// form of the same protocol — RESP's inline command line, memcached's
+    /// storage command — and override this so that document is covered with
+    /// the rest of the registry (spec C1). The return stays a `Vec` because
+    /// those two overrides return two documents; a slice would force each to
+    /// own a backing array, so the allocation is kept over the churn.
     fn specs(&self) -> Vec<&MessageSpec> {
         vec![self.spec()]
     }
