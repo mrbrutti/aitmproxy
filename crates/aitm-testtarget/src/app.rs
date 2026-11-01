@@ -1207,17 +1207,20 @@ mod tests {
                 let resp = get_on(&state, &conn, path).await;
                 let took = t0.elapsed();
                 assert!(took >= latency, "{mode:?} {path}: {took:?} < {latency:?}");
-                assert!(
-                    resp.status() != StatusCode::INTERNAL_SERVER_ERROR,
+                assert_ne!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     "{mode:?} {path}"
                 );
             }
             let (state, conn) = fresh(mode);
             let t0 = tokio::time::Instant::now();
             get_on(&state, &conn, "/").await;
-            assert!(
-                t0.elapsed() < latency,
-                "{mode:?}: zero latency must not wait {latency:?}"
+            // Virtual time: with no sleep awaited the clock does not move at all.
+            assert_eq!(
+                t0.elapsed(),
+                Duration::ZERO,
+                "{mode:?}: zero latency must not wait"
             );
         }
     }
