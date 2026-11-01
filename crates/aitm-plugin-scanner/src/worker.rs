@@ -34,8 +34,8 @@ use aitm_core::{
 };
 use aitm_scan_model::{
     scan_error, Canary, CheckMeta, Confidence, Discovery, Evidence, InsertionPoint, IssueLocation,
-    IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, Lane,
-    LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes,
+    IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, L4Location,
+    Lane, LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes,
     ScanErrorCode, ScanProfile, SessionMaterial, SessionMode, SessionStatus, SiteNode,
     StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
 };
@@ -684,6 +684,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         job_ctx: &job_ctx,
         lanes: &lanes,
         points: &points,
+        nodes: &nodes,
         budget: &budget,
         meter: &meter,
         canary: canary.as_ref(),
@@ -749,6 +750,7 @@ struct RunCtx<'a> {
     job_ctx: &'a Arc<dyn JobCtx>,
     lanes: &'a [Arc<dyn Lane>],
     points: &'a [InsertionPoint],
+    nodes: &'a [SiteNode],
     budget: &'a Arc<JobBudget>,
     meter: &'a Arc<ProbeMeter>,
     canary: Option<&'a CanaryRunner>,
@@ -921,7 +923,7 @@ impl RunCtx<'_> {
         if !matches!(verdict.outcome, Outcome::Vulnerable) {
             self.note_lane_text(&verdict.detail);
         }
-        for (verdict, new) in issues_from_verdict(self.job, point, &meta, &verdict) {
+        for (verdict, new) in issues_from_verdict(self.job, point, &meta, &verdict, self.nodes) {
             self.record_issue(new, &verdict, &meta, &host).await;
         }
     }
@@ -1151,20 +1153,75 @@ fn issues_from_verdict(
     point: &InsertionPoint,
     meta: &CheckMeta,
     verdict: &Verdict,
+    nodes: &[SiteNode],
 ) -> Vec<(Verdict, NewIssue)> {
+    let node = point
+        .site_node
+        .as_ref()
+        .and_then(|id| nodes.iter().find(|n| &n.id == id));
     let mut out = Vec::new();
     for one in std::iter::once(verdict).chain(verdict.more.iter()) {
         if one.outcome != Outcome::Vulnerable {
             continue;
         }
-        out.push((one.clone(), new_issue(job, point, meta, one)));
+        out.push((one.clone(), new_issue(job, point, meta, one, node)));
     }
     out
 }
 
-/// The issue one vulnerable verdict reports.
-fn new_issue(job: &str, point: &InsertionPoint, meta: &CheckMeta, verdict: &Verdict) -> NewIssue {
-    let (scheme, host, port, path) = parts_of(point);
+/// The `location.l4` block of an L4 issue (T6 child spec S6.3; D6 dedupe):
+/// `ip`/`port`/`proto` from the point's site node (`host`, `port`, `scheme`),
+/// `grammar` = the node's `path_template` without its leading `/`,
+/// `field_path` = the point's path inside the message, `mutation` = the first
+/// mutator of the evidence chain truncated at its first `(` (the mutation class).
+fn l4_location(point: &InsertionPoint, node: &SiteNode, verdict: &Verdict) -> L4Location {
+    let proto = if node.scheme.eq_ignore_ascii_case("udp") {
+        aitm_scan_model::L4Transport::Udp
+    } else {
+        aitm_scan_model::L4Transport::Tcp
+    };
+    let grammar = node.path_template.trim_start_matches('/');
+    let mutation = verdict
+        .evidence
+        .l4
+        .as_ref()
+        .and_then(|l4| l4.mutation_chain.first())
+        .map(|m| m.split('(').next().unwrap_or(m).to_string())
+        .filter(|m| !m.is_empty());
+    L4Location {
+        ip: node.host.clone(),
+        port: node.port,
+        proto,
+        grammar: (!grammar.is_empty()).then(|| grammar.to_string()),
+        field_path: point.path.clone(),
+        mutation,
+    }
+}
+
+/// The issue one vulnerable verdict reports. `node` is the point's site node
+/// when discovery recorded one; an L4 point's target and `location.l4` come
+/// from it (the point carries no URL).
+fn new_issue(
+    job: &str,
+    point: &InsertionPoint,
+    meta: &CheckMeta,
+    verdict: &Verdict,
+    node: Option<&SiteNode>,
+) -> NewIssue {
+    let is_l4 = matches!(point.lane, LaneKind::L4Stream | LaneKind::L4Packet);
+    let l4 = match (is_l4, node) {
+        (true, Some(node)) => Some(l4_location(point, node, verdict)),
+        _ => None,
+    };
+    let (scheme, host, port, path) = match (&l4, node) {
+        (Some(_), Some(node)) => (
+            node.scheme.clone(),
+            node.host.clone(),
+            node.port,
+            node.path_template.clone(),
+        ),
+        _ => parts_of(point),
+    };
     let path = verdict
         .location
         .as_ref()
@@ -1199,7 +1256,7 @@ fn new_issue(job: &str, point: &InsertionPoint, meta: &CheckMeta, verdict: &Verd
             name,
             field_path: point.path.clone(),
             ws_path: None,
-            l4: None,
+            l4,
         },
         evidence,
         description: meta.description.clone(),
@@ -2071,6 +2128,118 @@ mod tests {
             );
             assert_eq!(status.points.audited, audited, "{payload} / {on_lost:?}");
         }
+    }
+
+    /// T6 child spec S6.3 / D6: an issue from an L4 point carries
+    /// `location.l4 = { ip, port, proto, grammar, field_path, mutation }` built
+    /// from the point's site node and the evidence's mutation chain, and its
+    /// target is the node's tuple (an L4 point has no URL). An HTTP point keeps
+    /// `l4: None`.
+    #[test]
+    fn l4_issue_location_comes_from_the_site_node_and_the_mutation_chain() {
+        use super::issues_from_verdict;
+        use aitm_scan_model::{
+            Check, Confidence, Evidence, InsertionKind, InsertionPoint, LaneKind, Outcome,
+            SiteNode, Verdict,
+        };
+        let node = SiteNode {
+            id: "l4:127.0.0.1:6379/tcp".to_string(),
+            method: "L4".to_string(),
+            scheme: "tcp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            path_template: "/resp".to_string(),
+            flows: Vec::new(),
+            params: Vec::new(),
+            auth: false,
+            points: 1,
+            audited: true,
+        };
+        let point = InsertionPoint {
+            id: "l4-1".to_string(),
+            lane: LaneKind::L4Stream,
+            kind: InsertionKind::L4Field,
+            name: "bulk.len".to_string(),
+            path: Some("array[0].bulk.len".to_string()),
+            example: None,
+            flow: None,
+            site_node: Some(node.id.clone()),
+            traits: Vec::new(),
+            frequency: 1,
+            method: None,
+            url: None,
+        };
+        let meta = crate::jobs::test_support::FakeCheck::on_lane(
+            "l4-crash",
+            "l4-crash",
+            LaneKind::L4Stream,
+            crate::jobs::test_support::FakeRun::vulnerable(),
+        )
+        .meta()
+        .clone();
+        let verdict = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence {
+                l4: Some(aitm_scan_model::L4Evidence {
+                    sent_hex: "2a31".into(),
+                    seed_id: "127.0.0.1:6379/tcp#0".into(),
+                    rng_seed: 7,
+                    mutation_chain: vec!["len_desync(3)".into(), "bitflip".into()],
+                    prior_messages: 0,
+                    oracle: aitm_scan_model::L4Oracle::LivenessFailed,
+                    liveness_before: true,
+                    liveness_after: false,
+                    reproduced: (2, 2),
+                    scope_entry: "127.0.0.1/32".into(),
+                }),
+                ..Evidence::default()
+            },
+            detail: "crash".into(),
+            poc_hint: None,
+            location: None,
+            more: Vec::new(),
+        };
+
+        let issues = issues_from_verdict(
+            "scan-l4test1",
+            &point,
+            &meta,
+            &verdict,
+            std::slice::from_ref(&node),
+        );
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0].1;
+        let l4 = issue
+            .location
+            .l4
+            .as_ref()
+            .expect("an L4 point gets location.l4");
+        assert_eq!(l4.ip, "127.0.0.1");
+        assert_eq!(l4.port, 6379);
+        assert_eq!(l4.proto, aitm_scan_model::L4Transport::Tcp);
+        assert_eq!(l4.grammar.as_deref(), Some("resp"));
+        assert_eq!(l4.field_path.as_deref(), Some("array[0].bulk.len"));
+        assert_eq!(l4.mutation.as_deref(), Some("len_desync"));
+        assert_eq!(issue.target.host, "127.0.0.1");
+        assert_eq!(issue.target.port, 6379);
+        assert_eq!(issue.target.scheme, "tcp");
+
+        // Without a site node the block is absent rather than guessed.
+        let orphan = issues_from_verdict("scan-l4test1", &point, &meta, &verdict, &[]);
+        assert!(orphan[0].1.location.l4.is_none());
+
+        // An HTTP point keeps `l4: None`.
+        let http = crate::jobs::test_support::fake_point("p1", "q", "http://scan.test/search");
+        let http_meta = crate::jobs::test_support::FakeCheck::new(
+            "fake.vuln",
+            "demo",
+            crate::jobs::test_support::FakeRun::vulnerable(),
+        )
+        .meta()
+        .clone();
+        let issues = issues_from_verdict("scan-l4test1", &http, &http_meta, &verdict, &[]);
+        assert!(issues[0].1.location.l4.is_none());
     }
 
     /// Coordinator item (g): a verdict may move its issue off the point it was
