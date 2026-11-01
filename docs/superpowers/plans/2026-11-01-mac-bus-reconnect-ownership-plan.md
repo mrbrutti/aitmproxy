@@ -1,6 +1,6 @@
 # macOS BusService reconnect ownership (issue #192) — implementation plan
 
-**Status:** approved — self-approved 2026-11-01 by the fix session (autonomous mode, memory
+**Status:** approved — self-approved 2026-11-01 by the fix session; PR #262 open (draft) 2026-11-01 (autonomous mode, memory
 `aitmproxy-autonomous-approve-merge-mode`); the eight Architect's calls accepted. Orchestrator note on
 runbook step 9: `tools/selftest-live-embedded.sh` quits the app named `Aitmproxy` and pgreps
 `Aitmproxy.app/Contents/Resources/core/aitm`; it is run only while the operator's own `/Applications`
@@ -229,7 +229,7 @@ Mac: the five-step gate in `apps/mac/CLAUDE.md` plus the two checks this plan ad
   - Bounds, each a named constant with the spec's number: `CONNECT_BOUND=20` (s, `bus: connected`
     after a trigger; T2/T3's respawn wait shares this one deadline, measured from the trigger),
     `FAILED_BOUND=5` (s, T3's `bus failed`), `ACTION_BOUND=10` (s, one menu click → `capturing`
-    flips), `QUIT_BOUND=15` (s, ⌘Q → app gone), `AX_SLEEP=0.1` (s between AX reads; an
+    flips), `QUIT_BOUND=15` (s, the app menu's Quit click → app gone; was ⌘Q, see `quit_app()`), `AX_SLEEP=0.1` (s between AX reads; an
     `osascript` read itself takes ~100 ms, so reads land ≤ 250 ms apart), `BUS_SLEEP=0.5` (s
     between `proxy.status` polls), `T1_MIN_SETTLE=1` (s: after Reconnect Bus the label may still
     read the *old* `bus: connected`, so T1 keeps polling for at least this long before it
@@ -336,7 +336,7 @@ Mac: the five-step gate in `apps/mac/CLAUDE.md` plus the two checks this plan ad
      `kill -KILL "$old_pid"`; `wait_label "bus failed" $FAILED_BOUND 0 || fail "crash-respawn failed-report bus label never read 'bus failed' within 5 s of kill -KILL (saw: <labels_seen>)"`;
      `note "crash-respawn: bus failed seen <x> s after kill -KILL $old_pid"`;
      `discover_child "$old_pid" "$old_cfg"` (deadline `t0 + CONNECT_BOUND`); `after_trigger crash-respawn`.
-  7. **Teardown:** `quit_app`; `note "teardown: app quit via ⌘Q; no core left under the bundle path"`;
+  7. **Teardown:** `quit_app`; `note "teardown: app quit on the app menu's Quit click (process-scoped); no core left under the bundle path"` (was "via ⌘Q"; superseded by the panel, f9a815ac);
      final line exactly
      `RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn: an operator action through the app succeeded after each)`;
      `exit 0`.
@@ -573,7 +573,7 @@ Then: whole-branch Tester (every BR-AC, quoting steps 2–3 and 5–11), the thr
 
 Traps the orchestrator already knows, restated for the runbook: the dev bundle's `pgrep` and
 `kill` target only its own bundle path; a SIGTERM to the app skips its teardown (the scripts quit
-via ⌘Q and reap by bundle path); `swift test`, the live scripts and `osascript` are Terminal-only;
+by a process-scoped click on their own app menu's Quit item and reap by bundle path); `swift test`, the live scripts and `osascript` are Terminal-only;
 the AX element path for `AX_PILL` comes from the orchestrator's System Events probe
 (`/tmp/claude/192-ax-probe.sh`) and goes into Task 2's dispatch; if a first-run sheet is up on
 the dev bundle, `window 1` may be the sheet — the probe decides the path. **Probe result
@@ -622,11 +622,32 @@ Kept by the main session during stage 6. One row per finding.
 | — | quality (pass 2) | — | Spec D6 wording (same as security pass 2) | fixed in 0dc624cb |
 | — | Tester (pass 2) | PASS; Minor F6 | 89e41798 committed the three evidence PNGs under `apps/mac/docs/evidence/192-reconnect-ownership/`, outside BR-AC9's literal file list and D8's "Nothing else" (byte-identical to the green run's winshots) | fixed in the pass-2 docs commit: BR-AC9 and D8 amended (orchestrator) to name the evidence folder, the repo's existing convention for PR shots (`apps/mac/docs/evidence/S-041/`) |
 | — | Tester (pass 2) | Minor F7 | The only `swift test` logs predate the fix round's `BusService.swift` change (the test targets do not build the app target; the app compiled in `192-snapdev-fix3.log`) | fixed: `swift test` re-run on HEAD, `/tmp/claude/192-swift-test-final.log` (result recorded in Shipped) |
+| — | spec (pass 2, c1134e43..60f3a751) | FAIL (evidence) | Important: `tools/selftest-live-embedded.sh` not run — only Matt or the merge-driver may close it (run it with the operator's app closed, or accept in writing) | OPEN; see the step-9 row below and Shipped |
+| — | spec (pass 2) | Important | 89e41798 committed the evidence shots outside BR-AC9/D8's file set with no Review log row | fixed in d5111878 (BR-AC9 and D8 amended, Tester F6 row); the reviewer read 60f3a751, before that commit |
+| 2 | spec (pass 2) | Minor | Plan Task 2 still described the ⌘Q teardown at three spots (the `QUIT_BOUND` comment, step 7's note literal, the runbook trap) | fixed in the Shipped commit: the three lines read the shipped Quit click |
 | — | Owner (runbook step 9) | Minor | `tools/selftest-live-embedded.sh` installs over the user-level app, quits the process named `Aitmproxy` and pgreps `Aitmproxy.app/Contents/Resources/core/aitm`; the operator's own `/Applications/Aitmproxy.app` (pid 34883) and its core were running throughout this session | accepted by the orchestrator 2026-11-01: not run while the operator's app is up (it would quit his app and its pgrep would catch his core, a false AC7 failure); the embedded path's reconnect behaviour is proven by `tools/selftest-live-reconnect.sh` on a dev bundle with a unique process name (runbook step 6). The script itself is unchanged by this PR |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**PR [mrbrutti/aitmproxy#262](https://github.com/mrbrutti/aitmproxy/pull/262)** (branch `claude/cool-zhukovsky-c12370` → `main`, opened 2026-11-01 as a draft; merged main at 4762cdc2). Opened as a draft because one Important stays open for Matt / the merge-driver (below); everything else is clean.
 
 | What | Where |
 |---|---|
+| The fix: `runGeneration` bumped only in `stop()`; `run(generation:)` / `pollLoop(_:generation:)` write shared state only while current (ten `owns()` guard sites, the eager capture in `start()`); a superseded run only closes its own socket; the owner's failure path unchanged | `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (3687fa19, 346b6a9c) |
+| In-app regression check: six D5 checks + `BusStateRecorder`; the recording check and the reconnect start settle on a quiescent session | `apps/mac/Sources/Aitmproxy/SelfTest+Live.swift` (20b1f407, 78a1eb52) |
+| Shell regression check on the embedded path: Reconnect Bus, Restart Core, `kill -KILL`, one menu-driven Pause/Resume Proxy after each, observed over the bus; process-scoped teardown | `apps/mac/tools/selftest-live-reconnect.sh` (c2538fba, 48ae42aa, fc119ffe, f7457872, c148b0ff, 346b6a9c, f9a815ac) |
+| Gate wiring sentence | `apps/mac/CLAUDE.md` (1e8eadcf, 346b6a9c) |
+| Evidence shots after each trigger | `apps/mac/docs/evidence/192-reconnect-ownership/after-{reconnect-bus,restart-core,crash-respawn}.png` (89e41798) |
+
+**Evidence (all 2026-11-01):** red on the pre-fix build — in-app `FAIL the first Scope action after Reconnect Bus … err add to scope: the bus connection closed` (`/tmp/claude/192-live-red.log`), shell `FAIL: reconnect-bus pause capturing stayed true for 10 s after one Pause Proxy click` (final script against origin/main's `BusService.swift`, `/tmp/claude/192-reconnect-red2.log`); green on the fixed bundle — in-app `LIVE SELFTEST PASS 97 checks` (`192-live-green2.log`), shell `RECONNECT LIVE SELFTEST PASS (…)` with `bus failed seen 0.3 s after kill -KILL` (`192-reconnect-green2.log`); `swift test` 31 ✔ on d5111878 (`192-swift-test-final.log`); five tripwires PASS; Rust gate green except the three load-flaky suites, which pass alone at load 55–65 (Review log row).
+
+**Cut:** nothing.
+
+**Open before merge (Matt / the merge-driver):** BR-AC10's `tools/selftest-live-embedded.sh` was not run — it installs over the user-level app and quits the process named `Aitmproxy`, and the operator's own `/Applications` app was running all session. Either run it once that app is closed, or accept the skip in writing in the Review log (the embedded connect path is otherwise proven by the new script on a uniquely named dev bundle).
+
+**Follow-ups (not in this PR):**
+- The app shows two menus named "View" (the system one and `CommandMenu("View")`); the script addresses the last one by name.
+- `setIntercept(false)` sends no `rules`, so a core keeps the previous rule set (`flow.intercept {enabled: false}` leaves it alone); the live self-test therefore needs a fresh external core per run (runbook). Disarming should send `rules: []`.
+- `BusClient.request()` should refuse public calls unless `state == .ready` (keep `initialize` in `.authenticating`); it would close the pre-existing operator-action-during-connecting instance of the frame-before-token path (security pass 1).
+- Tidy-ups for the next touch: a file-local `BusState.isConnected` in the self-test; `throw CancellationError()` at the three disconnect-and-return sites for a single close path.
+- `redact_strict::scrub_strict_masks_every_pass_and_keeps_the_benign` (PR #259, main) timed out at 60 s once at load avg 85 and passed on the next run; a candidate for the load-flaky list.
