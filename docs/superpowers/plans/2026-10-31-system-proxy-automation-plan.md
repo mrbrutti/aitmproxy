@@ -1625,6 +1625,13 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 4 | quality (re-run) | Important | two state-file tests compare against a `StateFile::new` stamped after the save (`saved_at` second boundary) — gate flaky (2/4 runs) | fixed in F4 (expected built once before the save) |
+| 6 | quality (re-run) | Minor | idempotent `set` reports `services` minus authenticated rows (Q4 side effect) | fixed in F4 (`Snapshot.rows`) |
+| 6 | quality (re-run) | Minor | `target_os: String` not fixed in F3 as recorded; residual `merge_bypass(&defaults(), …)` spelling | fixed in F4 (`is_windows: bool`, `bypass_for(&[], …)`) |
+| 10 | quality (re-run) | Minor | `OperatorToken` and the watchdog dispatched in two places; leftover `Mode::SysproxyWatchdog` arm | fixed in F4 (both dispatched before the runtime) |
+| 7 | quality (re-run) | Minor | `decide`/`Decision` has no production caller after Q5 | fixed in F4 (`run_after_wake` routes through `decide`) or documented — see F4 report |
+| tests | quality (re-run) | Minor | test helper named `status_with` shadows the engine method; `err_text` wrapper; three fake-PATH helpers | first two fixed in F4; helpers under the accepted scaffolding follow-up |
+| tester (re-run) | tester | Minor | F3 claimed FIFO quarantine, single recovery log line and `service_names`≡`rows_of` without tests; S3 hit path only | closed by the tester's tests in b786b352 |
 | 8 | spec (re-run) | Important | `proxy.system.status` 2 s cache for non-trusted callers (S3) had no spec sentence | spec §D6 + §D2 amended 2026-10-31; no code change |
 | 3 | security (re-run) | Minor | a KDE tool absent at detection keeps its bare name and is spawned by PATH if it appears later | accepted (recorded), orchestrator 2026-10-31: same-privilege residual; the error message naming the tool is worth more |
 | 6 | spec (re-run) | Minor | `Status::to_map` and `endpoints_equal_wrote` are `pub` | fixed in F4 (`pub(crate)`) |
