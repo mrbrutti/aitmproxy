@@ -290,6 +290,22 @@ Kept by the main session during stage 6. One row per finding.
 | 1-3 | spec | Important | Task 1 edited `Cargo.lock`, not in its declared file list | plan Task 1 file list and Ownership matrix amended (this commit); no code change; the Coder should have reported it |
 | 1-3 | spec | Minor | `IssueFilters.severity_min` typed `crate::model::Severity`, not the wire type | plan amendment 8883634a: Task 7 adds `aitm-poc` and retypes it |
 | 1-3 | spec | note | overlay call-name line uses `theme.l4()` for `scan.*` calls too | fix round A: `accent()` for `scan.*` (hue only on data, D13) |
+| 4 | security | Minor | `panes()`/`pane_rule()` multiply width/height in `u16` (overflow at 1457 columns) and compute the split twice | fix round A: one split helper in `u32`, returning list/detail/rule |
+| 4 | security | Minor | legacy `scan.discover` failure reason stored in `legacy.error` but drawn nowhere | fix round A: Jobs banner under `Legacy` shows `ScanError::from_message("scan.discover", e).wording()` |
+| 4 | quality | Important | Site map pane-to-list choice made twice (`cursor_mut` by emptiness, `Enter` always legacy) and the copies disagree | fix round A: one `MapSource { Legacy, V2 }` decided from `ScanOffer`; `cursor_mut(offer)` and `sitemap_selected_flow(offer)` both read it |
+| 4 | quality | Minor | `SCAN_CHROME_ROWS = 10` doc comment describes rows that are not drawn; prose repeats the value | fix round A: honest comment, drop the repeated value; constant kept at 10 (test literal unchanged) |
+| 4 | quality | Minor | `step` wrap helper duplicated (`scan/mod.rs`, `app.rs`) | fix round A: one `pub(crate)` helper |
+| 4 | quality | Minor | no-scanner sentence spelled as a const and as an inline toast literal | fix round A: the const moves to `crate::scan`, the toast uses it |
+| 4 | quality | Minor | `format!("http://{host}/")` inlined at two sites | accepted until Task 9 deletes both (D8); Task 9 must replace both sites |
+| 4 | quality | Minor | sidebar computes "newest non-terminal job" inline | fix round A: `JobsState::newest_active()` |
+| 4 | quality | Minor | `legacy_app` helper and 15-verb list duplicated across two test files | fix round A: one `legacy_app` in `tests/common/mod.rs` using `starts_with("scan.")`, asserting `scan_offer() == Legacy` |
+| 4 | quality | Minor | strip/prelude hygiene (`index()` vs `enumerate`, gap literal, `pub const DEGRADED`, prelude repetition) | fix round A: `enumerate` and a `GAP` const; the rest accepted (explicit matches preferred) |
+| 4 | quality | note | first `Esc` on the legacy Site map flips Points to Nodes instead of leaving the view (base needed one `Esc`) | fix round A: under `Legacy`, `close_pane` is a no-op so `Esc` leaves at once (D12 "nothing changes in behaviour") |
+| 4 | spec | Important | banner reads `idle` on a degraded tab; the degraded text was moved into the pane body (D13 "exactly one state") | fix round A: `banner()` returns the tab's degraded text ahead of `idle`; the matrix test pins the banner text |
+| 4 | spec | Minor | Profiles draws a populated list arm (Task 11's view) | accepted as a harmless placeholder; Task 11 rewrites the file |
+| 4 | spec | Minor | legacy Jobs row carries an in-pane hint line | accepted until Task 14 lands the `bars.rs` hints, which then replace it |
+| 4 | spec | Minor | Issues degraded wording was a builder literal | spec D2 cell fixed in 12733a88 ("issues need scan.issues (scanner v2)") |
+| 4 | spec | note | D11 "under it" vs the strip row; page-size enumeration off by one | spec D11 and plan Task 4 amended in 12733a88 |
 
 ## Shipped
 
