@@ -17,22 +17,29 @@ mod cli;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod log;
 mod probe;
+// `serve` runs only on Linux; the pure checks it exports are unused elsewhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod serve;
 
 use std::process::ExitCode;
 
 /// Exit status for a rejected command line (the conventional usage code).
 const EXIT_USAGE: u8 = 2;
-/// Exit status for a mode this build does not implement yet.
+/// Exit status for a mode this build does not implement yet (the `serve`
+/// loop, task P2.7).
+#[cfg(target_os = "linux")]
 const EXIT_NOT_IMPLEMENTED: u8 = 70;
 /// Exit status when `probe` could not gather its inputs.
 const EXIT_PROBE_FAILED: u8 = 1;
 /// Exit status when `bpf-permissions` or `bpf-revert` (or their `--dry-run`)
 /// did not complete.
 const EXIT_BPF_FAILED: u8 = 1;
-/// Exit status for a bpf mode on a platform that has no `/dev/bpf*`
-/// (`EX_UNAVAILABLE`).
-#[cfg(not(target_os = "macos"))]
+/// Exit status for a mode on a platform that cannot run it: a bpf mode where
+/// there is no `/dev/bpf*`, `serve` off Linux (`EX_UNAVAILABLE`).
 const EXIT_WRONG_PLATFORM: u8 = 69;
+/// Exit status when `serve` start-up (spec §5.1 steps 1–6) failed.
+#[cfg(target_os = "linux")]
+const EXIT_SERVE_FAILED: u8 = 1;
 
 /// Which of the two macOS permission modes was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +74,33 @@ fn main() -> ExitCode {
         },
         cli::Mode::BpfPermissions { dry_run } => run_bpf(BpfMode::Permissions, dry_run),
         cli::Mode::BpfRevert { dry_run } => run_bpf(BpfMode::Revert, dry_run),
-        cli::Mode::Serve { .. } => {
-            eprintln!("aitm-l4-helper: this mode is not implemented in this task");
+        cli::Mode::Serve { connect } => run_serve(&connect),
+    }
+}
+
+/// `serve` on Linux (spec §5.1): start-up first, which exits non-zero before
+/// any other I/O on failure. The serve loop itself arrives in task P2.7; until
+/// then a successful start-up reports that and exits non-zero.
+#[cfg(target_os = "linux")]
+fn run_serve(connect: &std::path::Path) -> ExitCode {
+    let pkexec_uid = std::env::var_os("PKEXEC_UID");
+    match serve::startup(connect, pkexec_uid.as_deref()) {
+        Ok(_stream) => {
+            eprintln!("aitm-l4-helper: serve loop arrives in task P2.7");
             ExitCode::from(EXIT_NOT_IMPLEMENTED)
         }
+        Err(err) => {
+            eprintln!("aitm-l4-helper: serve: {err}");
+            ExitCode::from(EXIT_SERVE_FAILED)
+        }
     }
+}
+
+/// Off Linux there is no pkexec-started helper to drop (spec §5 is L-C).
+#[cfg(not(target_os = "linux"))]
+fn run_serve(_connect: &std::path::Path) -> ExitCode {
+    eprintln!("aitm-l4-helper: serve is Linux only in Phase 1");
+    ExitCode::from(EXIT_WRONG_PLATFORM)
 }
 
 /// `bpf-permissions` / `bpf-revert` on macOS (spec §3.1). A dry run prints the
