@@ -218,7 +218,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The 59 commands the bus serves today — `tools/list` of the core as of
+/// The commands the bus serves today — `tools/list` of the core as of
 /// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
@@ -251,6 +251,10 @@ pub const CORE_TOOLS: &[&str] = &[
     "proxy.pause",
     "proxy.resume",
     "config.get",
+    // capture.status (spec 2026-10-31-capture-status-verb-design): the macOS NE
+    // capture feeder's read-only state (Sensitivity::Read), registered on every
+    // platform.
+    "capture.status",
     "browser.navigate",
     "browser.click",
     "browser.type",
