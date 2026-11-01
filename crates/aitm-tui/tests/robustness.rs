@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use aitm_tui::action::ToolSchema as _;
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level, Param, ToolInfo};
-use aitm_tui::app::{App, Mode, Pane, PromptKind, SidebarItem, MAX_DETAILS, RESPONSE_TABS};
+use aitm_tui::app::{
+    App, Mode, PaletteKind, Pane, PromptKind, SidebarItem, MAX_DETAILS, RESPONSE_TABS,
+};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::filter;
 use aitm_tui::keys;
@@ -2026,4 +2028,280 @@ fn a_websocket_row_without_a_listed_handshake_makes_no_empty_domains_group() {
         toast(&app),
         "Out of scope — unknown host (the WebSocket handshake is not listed)"
     );
+}
+
+// ------------------------------------------- tester: hostile tools/list
+
+/// Tester: a bus whose `tools/list` is empty — every plugin off, or a list
+/// that failed to parse — leaves every mode drawable at the design size and
+/// in a small terminal, degrades each control to its follow-up label, sends
+/// nothing for a tool that is not there, and lists no tool in the palette.
+#[test]
+fn a_bus_that_offers_no_tools_renders_every_mode_and_sends_nothing() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let reqs = connect(&mut app, &[], None);
+    assert_eq!(
+        reqs,
+        vec![BusRequest::Refresh],
+        "the handshake still asks for the first list"
+    );
+    assert!(app.tools.is_empty());
+    app.scope = vec!["h.test".into()];
+    let reqs = app.on_bus(BusEvent::Flows(vec![
+        summary("a", "GET", "h.test", "/a", Some(200), "observed"),
+        summary("b", "POST", "h.test", "/b", None, "intercepted"),
+    ]));
+    assert!(reqs.is_empty(), "no flow.detail: nothing fetched: {reqs:?}");
+    assert_eq!(app.flows.len(), 2, "rows land without any tool listed");
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.contains("listen address unknown (core follow-up F7)"),
+        "{text}"
+    );
+    assert!(text.contains("https://h.test/a"), "{text}");
+    // Controls stay local and say which follow-up they need.
+    app.selected = Some("a".into());
+    for (action, label) in [
+        (Action::Mark, "F6"),
+        (Action::Comment, "F6"),
+        (Action::AgentSet(AgentPolicy::Paused), "F1"),
+    ] {
+        assert!(
+            app.update(action.clone()).is_empty(),
+            "{action:?} must not reach the bus"
+        );
+        assert!(toast(&app).contains(label), "{action:?}: {}", toast(&app));
+    }
+    // Edit on the paused row: refused at the edit verb itself, by name,
+    // before the F5 detail check is even reached.
+    app.selected = Some("b".into());
+    assert!(app.update(Action::Edit).is_empty());
+    assert_eq!(toast(&app), "flow.mutate is not on this bus");
+    assert_eq!(app.mode, Mode::Flows);
+    // A tool name typed as a command is refused, not sent.
+    assert!(app.run_command("flow.list").is_empty());
+    assert_eq!(toast(&app), "unknown command `flow.list` (try :help)");
+    // The palette holds the built-in commands and the rows, never a tool.
+    let _ = app.update(Action::PaletteOpen);
+    for c in "fl".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let items = app.palette_items();
+    assert!(!items.is_empty(), "the built-in commands are still offered");
+    assert!(
+        items
+            .iter()
+            .all(|i| !matches!(i.kind, PaletteKind::Tool(_))),
+        "no tool on the bus, no tool in the palette: {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+    let _ = app.update(Action::Back);
+    // Every mode draws, at the design size and in an 80×24 terminal.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    for mode in [
+        Mode::Flows,
+        Mode::Inspector,
+        Mode::QuickLook,
+        Mode::Scope,
+        Mode::Findings,
+        Mode::Agent,
+        Mode::Ca,
+        Mode::Browser,
+        Mode::Help,
+        Mode::Config,
+        Mode::Compose,
+        Mode::Prompt(PromptKind::Palette),
+        Mode::Prompt(PromptKind::Filter),
+        Mode::Prompt(PromptKind::Confirm),
+    ] {
+        for (c, r) in [(200u16, 50u16), (80, 24)] {
+            let mut a = app.clone();
+            a.mode = mode;
+            let _ = a.update(Action::Resize(c, r));
+            match catch_unwind(AssertUnwindSafe(|| text_of(&a, c, r))) {
+                Ok(text) if text.lines().count() == usize::from(r) => {}
+                Ok(text) => failures.push(format!(
+                    "{mode:?} at {c}×{r}: {} lines",
+                    text.lines().count()
+                )),
+                Err(_) => failures.push(format!("{mode:?} at {c}×{r}: panicked")),
+            }
+        }
+    }
+    std::panic::set_hook(previous_hook);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // The inspector on a row without a detail says why, instead of an empty pane.
+    app.mode = Mode::Inspector;
+    assert!(
+        text_of(&app, 200, 50).contains("Headers and bodies need core follow-up F5 (flow.detail)"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+}
+
+/// Tester: a `tools/list` of ten thousand entries — long names, one empty
+/// name, one duplicate — is held whole, found by exact name only, drawn in
+/// the palette at every size without panicking, and the odd entries neither
+/// hide the real tools nor become something that is sent.
+#[test]
+fn a_ten_thousand_entry_tools_list_with_an_empty_and_a_duplicate_name_still_renders() {
+    let mut names: Vec<String> = (0..10_000)
+        .map(|i| format!("plugin{:04}.verb-with-a-rather-long-name-{i}", i % 97))
+        .collect();
+    names.push(String::new());
+    names.push("flow.list".into());
+    names.push("flow.list".into());
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &refs, Some("127.0.0.1:8080"));
+    assert_eq!(app.tools.len(), 10_003, "the list is held whole");
+    assert!(app.has_tool("flow.list"));
+    assert!(app.has_tool("plugin0000.verb-with-a-rather-long-name-0"));
+    assert!(app.has_tool("plugin0008.verb-with-a-rather-long-name-9999"));
+    assert!(!app.has_tool("plugin0008"), "a prefix is not a tool");
+    assert!(!app.has_tool("flow.lis"), "a prefix is not a tool");
+    let _ = app.on_bus(BusEvent::Flows(vec![summary(
+        "a",
+        "GET",
+        "h.test",
+        "/a",
+        Some(200),
+        "observed",
+    )]));
+    // The palette finds the last entry by a fragment of its name.
+    let _ = app.update(Action::PaletteOpen);
+    for c in "name-9999".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let items = app.palette_items();
+    assert!(
+        items.iter().any(|i| matches!(
+            &i.kind,
+            PaletteKind::Tool(t) if t == "plugin0008.verb-with-a-rather-long-name-9999"
+        )),
+        "{:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut failures = Vec::new();
+    for (c, r) in [(200u16, 50u16), (80, 24), (80, 6), (41, 5)] {
+        let _ = app.update(Action::Resize(c, r));
+        match catch_unwind(AssertUnwindSafe(|| text_of(&app, c, r))) {
+            Ok(text) => assert_eq!(text.lines().count(), usize::from(r), "{c}×{r}"),
+            Err(_) => failures.push(format!("{c}×{r}")),
+        }
+    }
+    std::panic::set_hook(previous_hook);
+    assert!(
+        failures.is_empty(),
+        "the palette over 10 003 tools panics at: {}",
+        failures.join(", ")
+    );
+    let _ = app.update(Action::Resize(200, 50));
+    assert!(
+        text_of(&app, 200, 50).contains("name-9999"),
+        "the match is drawn"
+    );
+    // An empty prompt line runs nothing; the empty-named entry is not a command.
+    let _ = app.update(Action::Back);
+    assert!(app.run_command("").is_empty());
+    assert_eq!(app.mode, Mode::Flows);
+    // The real tool still reaches the bus by name, once.
+    assert_eq!(
+        app.run_command("flow.list"),
+        vec![call("flow.list", json!({}))]
+    );
+}
+
+// ----------------------------------------------- tester: a bus that drops
+
+/// Tester: the bus drops after the list landed and while two details and
+/// two browser calls are outstanding. The rows the operator already has
+/// stay listed and selected, the toolbar and status bar say so, the drop
+/// itself sends nothing, the browser calls are forgotten, a late answer
+/// from the old connection is still folded in, and the reconnect is a new
+/// session: a fresh list, and the lost detail is asked for on `Enter`
+/// (a poll never re-asks for an existing row — the contract
+/// `tools_list_drives_detail_fetching` pins).
+#[test]
+fn a_bus_drop_after_the_list_landed_keeps_the_rows_and_recovers_on_reconnect() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, CORE_TOOLS, None);
+    let rows = vec![
+        summary("a", "GET", "h.test", "/a", Some(200), "observed"),
+        summary("b", "POST", "h.test", "/b", None, "intercepted"),
+    ];
+    let reqs = app.on_bus(BusEvent::Flows(rows.clone()));
+    assert_eq!(
+        reqs,
+        vec![
+            BusRequest::Detail("a".into()),
+            BusRequest::Detail("b".into())
+        ]
+    );
+    app.selected = Some("a".into());
+    let _ = app.update(Action::OpenBrowser);
+    assert_eq!(app.browser.inflight, 2);
+    let _ = app.update(Action::Back);
+
+    let reqs = app.on_bus(BusEvent::Disconnected("connection reset by peer".into()));
+    assert!(reqs.is_empty(), "nothing is sent on a dead bus: {reqs:?}");
+    assert_eq!(app.flows.len(), 2, "the rows the operator had stay listed");
+    assert_eq!(app.selected.as_deref(), Some("a"));
+    assert_eq!(app.browser.inflight, 0);
+    assert_eq!(app.browser.busy, None);
+    assert_eq!(toast(&app), "bus: connection reset by peer");
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.lines().next().unwrap().contains("bus disconnected"),
+        "{text}"
+    );
+    assert!(
+        text.lines().last().unwrap().contains("bus down · retrying"),
+        "{text}"
+    );
+    assert!(text.contains("https://h.test/a"), "{text}");
+    // Keys still work on what is there: moving onto `b`, which has no
+    // detail, asks for one as always — the reducer is plain data and the
+    // bus task owns delivery; this request dies with the dead connection.
+    assert_eq!(
+        app.update(Action::Down),
+        vec![BusRequest::Detail("b".into())]
+    );
+    assert_eq!(app.selected.as_deref(), Some("b"));
+    // A late detail delivered by the old connection is folded in, not refused.
+    let d = FlowDetail::from_json(&json!({"id":"a","kind":"http"})).unwrap();
+    let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+    assert!(app.details.contains_key("a"));
+
+    // Reconnect: a new session asks for a fresh list; the toolbar follows
+    // the proxy.status the handshake reads.
+    let reqs = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
+    assert_eq!(reqs, vec![BusRequest::Refresh]);
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains("listening 127.0.0.1:8080"),
+        "{text}"
+    );
+    assert!(!text.contains("bus down"), "{text}");
+    // The poll after it: both rows known, `a` loaded; nothing re-asked.
+    let reqs = app.on_bus(BusEvent::Flows(rows));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.flows.len(), 2);
+    // `b`'s detail was lost to the drop: Enter asks for it.
+    assert_eq!(app.selected.as_deref(), Some("b"));
+    assert_eq!(
+        app.update(Action::Enter),
+        vec![BusRequest::Detail("b".into())]
+    );
+    assert!(text_of(&app, 200, 50).contains("loading detail…"));
 }

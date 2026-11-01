@@ -337,4 +337,52 @@ mod tests {
             Some("f51")
         );
     }
+
+    /// Tester (D7): `render_text` is the text the terminal shows — one line
+    /// per row, trailing spaces trimmed, `\n`-joined and `\n`-terminated,
+    /// no line wider than the buffer — and `render_buffer` is exactly
+    /// `cols`×`rows`: at the design size, at the 40×4 minimum, below it, at
+    /// a single cell and at the empty rectangle. The same text
+    /// `tests/common/mod.rs::to_text` reads, so a 1×1 terminal shows the
+    /// first glyph of the minimum-size line.
+    #[test]
+    fn render_text_is_one_trimmed_line_per_row_at_every_size() {
+        let app = crate::connected_app(200, 50);
+        for (cols, rows) in [
+            (200u16, 50u16),
+            (40, 4),
+            (39, 3),
+            (1, 1),
+            (0, 0),
+            (0, 3),
+            (300, 1),
+            (1, 100),
+        ] {
+            let buf = render_buffer(&app, cols, rows);
+            assert_eq!(buf.area, Rect::new(0, 0, cols, rows), "{cols}×{rows}");
+            let text = render_text(&app, cols, rows);
+            assert_eq!(
+                text.lines().count(),
+                usize::from(rows),
+                "{cols}×{rows}: {text:?}"
+            );
+            assert_eq!(text.is_empty(), rows == 0, "{cols}×{rows}: {text:?}");
+            if rows > 0 {
+                assert!(text.ends_with('\n'), "{cols}×{rows}: {text:?}");
+            }
+            for line in text.lines() {
+                assert_eq!(line, line.trim_end(), "trailing spaces kept: {line:?}");
+                assert!(
+                    line.chars().count() <= usize::from(cols),
+                    "{cols}×{rows}: wider than the buffer: {line:?}"
+                );
+            }
+        }
+        let text = render_text(&app, 200, 50);
+        assert!(
+            text.lines().next().unwrap().contains("aitmproxy"),
+            "the toolbar is row 0: {text}"
+        );
+        assert_eq!(render_text(&app, 1, 1), "a\n");
+    }
 }

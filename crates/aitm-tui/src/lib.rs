@@ -312,3 +312,34 @@ pub(crate) fn connected_app(cols: u16, rows: u16) -> App {
     });
     app
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tester (D7): the in-crate test bus offers every `CORE_TOOLS` name
+    /// exactly once and nothing more; its address `test` is not loopback
+    /// (so a screenshot goes through `poc.artifact`, never the local disk);
+    /// it is the size asked for; and it carries no flows, details, scope or
+    /// findings — every test writes those itself.
+    #[test]
+    fn connected_app_offers_every_core_tool_and_nothing_else() {
+        let app = connected_app(120, 30);
+        assert_eq!(app.tools.len(), CORE_TOOLS.len());
+        for name in CORE_TOOLS {
+            assert!(app.has_tool(name), "{name} is on the test bus");
+            assert_eq!(
+                app.tools.iter().filter(|t| t.name == *name).count(),
+                1,
+                "{name} listed once"
+            );
+        }
+        assert!(!app.is_loopback_bus());
+        assert_eq!((app.width, app.height), (120, 30));
+        assert!(app.flows.is_empty());
+        assert!(app.details.is_empty());
+        assert!(app.scope.is_empty());
+        assert!(app.findings.is_empty());
+        assert_eq!(app.selected, None);
+    }
+}
