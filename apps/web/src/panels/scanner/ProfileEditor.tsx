@@ -199,6 +199,9 @@ function parseSeeds(text: string): L4Seed[] {
 
 const DASH = '—';
 
+/** The reconnecting note (D-T8.10), the same sentence the Jobs view prints. */
+const RECONNECT_NOTE = 'reconnecting: controls are disabled until the bus is back';
+
 /** The session preview, as **names** (D7): no reply field here carries a value to print. */
 function previewLines(session: SessionProfile): [string, string] {
   const names = `cookies: ${session.cookies.length ? session.cookies.join(', ') : DASH} · headers: ${
@@ -240,7 +243,7 @@ export const ProfileEditor: Component<{ name: string }> = (props) => {
           {(error) => (
             <div class={css.errorBlock} role="alert">
               <p>{error()}</p>
-              <Button class={css.retry} variant="outline" onClick={() => void s.loadProfile(props.name)}>
+              <Button class={css.retry} variant="outline" disabled={!s.busOpen()} onClick={() => void s.loadProfile(props.name)}>
                 Retry
               </Button>
             </div>
@@ -449,441 +452,449 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
   return (
     <>
       <form class={css.editor} aria-label="Profile editor" onSubmit={(e) => e.preventDefault()}>
-        <Section title="Name">
-          <TextField
-            label="Profile name"
-            value={p().name}
-            readOnly={isBuiltin() && !renaming()}
-            onValue={(v) => setField('name', v)}
-          />
-          <Show when={isBuiltin()}>
-            <p class={css.note}>A built-in profile is never overwritten — `Save as` stores it under a new name.</p>
-          </Show>
-        </Section>
+        <Show when={!s.busOpen()}>
+          <p class={css.note} role="status">
+            {RECONNECT_NOTE}
+          </p>
+        </Show>
+        {/* D-T8.10: every control is disabled while the bus is not open; the draft stays on screen. */}
+        <fieldset class={css.fieldset} disabled={!s.busOpen()}>
+          <Section title="Name">
+            <TextField
+              label="Profile name"
+              value={p().name}
+              readOnly={isBuiltin() && !renaming()}
+              onValue={(v) => setField('name', v)}
+            />
+            <Show when={isBuiltin()}>
+              <p class={css.note}>A built-in profile is never overwritten — `Save as` stores it under a new name.</p>
+            </Show>
+          </Section>
 
-        <Section title="Targets">
-          <div class={css.field}>
-            <span class={css.fieldLabel}>Origins</span>
-            <div role="list" aria-label="Origins">
-              <Show when={p().target.origins.length === 0}>
-                <p class={css.note}>No origins yet.</p>
-              </Show>
-              <For each={p().target.origins}>
-                {(origin) => (
-                  <div class={css.originRow} role="listitem" data-origin={origin}>
-                    <span>{origin}</span>
-                    <Show when={outOfScope(origin)}>
-                      <span class={css.tag}>not in scope</span>
-                      <Button variant="small" onClick={() => void app.addScope(hostOf(origin))}>
-                        Add {hostOf(origin)} to Scope
+          <Section title="Targets">
+            <div class={css.field}>
+              <span class={css.fieldLabel}>Origins</span>
+              <div role="list" aria-label="Origins">
+                <Show when={p().target.origins.length === 0}>
+                  <p class={css.note}>No origins yet.</p>
+                </Show>
+                <For each={p().target.origins}>
+                  {(origin) => (
+                    <div class={css.originRow} role="listitem" data-origin={origin}>
+                      <span>{origin}</span>
+                      <Show when={outOfScope(origin)}>
+                        <span class={css.tag}>not in scope</span>
+                        <Button variant="small" onClick={() => void app.addScope(hostOf(origin))}>
+                          Add {hostOf(origin)} to Scope
+                        </Button>
+                      </Show>
+                      <Button variant="ghost" aria-label={`Remove ${origin}`} onClick={() => removeOrigin(origin)}>
+                        <Icon name="x" size={12} />
                       </Button>
-                    </Show>
-                    <Button variant="ghost" aria-label={`Remove ${origin}`} onClick={() => removeOrigin(origin)}>
-                      <Icon name="x" size={12} />
-                    </Button>
-                  </div>
-                )}
-              </For>
-            </div>
-          </div>
-
-          <div class={css.originRow}>
-            <label class={css.field}>
-              <span class={css.fieldLabel}>Origin scheme</span>
-              <select
-                aria-label="Origin scheme"
-                value={scheme()}
-                onChange={(e) => setScheme(e.currentTarget.value === 'http' ? 'http' : 'https')}
-              >
-                <option value="https" selected={scheme() === 'https'}>
-                  https
-                </option>
-                <option value="http" selected={scheme() === 'http'}>
-                  http
-                </option>
-              </select>
-            </label>
-            <label class={css.field}>
-              <span class={css.fieldLabel}>Origin host</span>
-              <select aria-label="Origin host" value={host()} onChange={(e) => setHost(e.currentTarget.value)}>
-                <For each={hosts()}>
-                  {(h) => (
-                    <option value={h} selected={h === host()}>
-                      {h}
-                    </option>
+                    </div>
                   )}
                 </For>
-              </select>
-            </label>
-            <label class={css.field}>
-              <span class={css.fieldLabel}>Origin port</span>
-              <input
-                type="text"
-                aria-label="Origin port"
-                inputmode="numeric"
-                value={hostHasPort() ? '' : port()}
-                disabled={hostHasPort()}
-                placeholder={hostHasPort() ? 'in the host' : 'default'}
-                onInput={(e) => setPort(e.currentTarget.value)}
-              />
-            </label>
-            <Button variant="outline" disabled={composed() === null} onClick={() => addOrigin()}>
-              Add origin
-            </Button>
-          </div>
-          <Show when={hosts().length === 0}>
-            <p class={css.note}>No concrete host is in scope yet — add one below to pick it here.</p>
-          </Show>
-          <AddHost existing={app.proxy.scope.map((e) => e.host)} onAdd={(h) => app.addScope(h)} />
-
-          <div class={css.field}>
-            <span class={css.fieldLabel}>L4 targets</span>
-            <div role="list" aria-label="L4 targets">
-              <Show when={p().target.l4.length === 0}>
-                <p class={css.note}>No L4 targets yet.</p>
-              </Show>
-              <For each={p().target.l4}>
-                {(t, i) => (
-                  <div class={css.originRow} role="listitem" data-l4={`${t.ip}:${t.port}`}>
-                    <span>
-                      {t.ip}:{t.port} {t.proto}
-                      {t.grammar === null ? '' : ` · ${t.grammar}`}
-                    </span>
-                    <Button
-                      variant="ghost"
-                      aria-label={`Remove L4 target ${t.ip}:${t.port}`}
-                      onClick={() => removeL4Target(i())}
-                    >
-                      <Icon name="x" size={12} />
-                    </Button>
-                  </div>
-                )}
-              </For>
+              </div>
             </div>
-            <p class={css.note}>{L4_HINT}</p>
-          </div>
-          <div class={css.originRow}>
-            <TextField label="L4 target IP" value={l4Ip()} placeholder="127.0.0.1" onValue={setL4Ip} />
-            <TextField label="L4 target port" value={l4Port()} placeholder="9" onValue={setL4Port} />
-            <Picker label="L4 target proto" options={L4_TRANSPORTS} value={l4Proto()} onValue={setL4Proto} />
-            <TextField label="L4 target grammar" value={l4Grammar()} placeholder="optional" onValue={setL4Grammar} />
-            <Button variant="outline" onClick={() => addL4Target()}>
-              Add L4 target
-            </Button>
-          </div>
-        </Section>
 
-        <Section title="Lanes">
-          <div role="group" aria-label="Lanes">
-            <For each={LANES}>
-              {(lane) => (
-                <label class={css.checkRow} data-lane={lane}>
-                  <input
-                    type="checkbox"
-                    aria-label={lane}
-                    checked={p().lanes.includes(lane)}
-                    onChange={(e) => setLane(lane, e.currentTarget.checked)}
-                  />
-                  <span>{lane}</span>
-                  <Show when={!laneAvailable(lane)}>
-                    <span class={css.tag}>not available on this build</span>
-                  </Show>
-                </label>
-              )}
-            </For>
-          </div>
-        </Section>
+            <div class={css.originRow}>
+              <label class={css.field}>
+                <span class={css.fieldLabel}>Origin scheme</span>
+                <select
+                  aria-label="Origin scheme"
+                  value={scheme()}
+                  onChange={(e) => setScheme(e.currentTarget.value === 'http' ? 'http' : 'https')}
+                >
+                  <option value="https" selected={scheme() === 'https'}>
+                    https
+                  </option>
+                  <option value="http" selected={scheme() === 'http'}>
+                    http
+                  </option>
+                </select>
+              </label>
+              <label class={css.field}>
+                <span class={css.fieldLabel}>Origin host</span>
+                <select aria-label="Origin host" value={host()} onChange={(e) => setHost(e.currentTarget.value)}>
+                  <For each={hosts()}>
+                    {(h) => (
+                      <option value={h} selected={h === host()}>
+                        {h}
+                      </option>
+                    )}
+                  </For>
+                </select>
+              </label>
+              <label class={css.field}>
+                <span class={css.fieldLabel}>Origin port</span>
+                <input
+                  type="text"
+                  aria-label="Origin port"
+                  inputmode="numeric"
+                  value={hostHasPort() ? '' : port()}
+                  disabled={hostHasPort()}
+                  placeholder={hostHasPort() ? 'in the host' : 'default'}
+                  onInput={(e) => setPort(e.currentTarget.value)}
+                />
+              </label>
+              <Button variant="outline" disabled={composed() === null} onClick={() => addOrigin()}>
+                Add origin
+              </Button>
+            </div>
+            <Show when={hosts().length === 0}>
+              <p class={css.note}>No concrete host is in scope yet — add one below to pick it here.</p>
+            </Show>
+            <AddHost existing={app.proxy.scope.map((e) => e.host)} onAdd={(h) => app.addScope(h)} />
 
-        <Section title="Intensity, speed, accuracy">
-          <Segmented
-            label="Intensity"
-            options={INTENSITIES}
-            value={p().intensity}
-            onValue={(v) => setField('intensity', v)}
-          />
-          <Show when={p().intensity === 'intrusive'}>
-            <p class={css.note}>operator only; asks for confirmation</p>
-          </Show>
-          <Segmented label="Speed" options={SPEEDS} value={p().speed} onValue={(v) => setField('speed', v)} />
-          <Segmented
-            label="Accuracy"
-            options={ACCURACIES}
-            value={p().accuracy}
-            onValue={(v) => setField('accuracy', v)}
-          />
-        </Section>
+            <div class={css.field}>
+              <span class={css.fieldLabel}>L4 targets</span>
+              <div role="list" aria-label="L4 targets">
+                <Show when={p().target.l4.length === 0}>
+                  <p class={css.note}>No L4 targets yet.</p>
+                </Show>
+                <For each={p().target.l4}>
+                  {(t, i) => (
+                    <div class={css.originRow} role="listitem" data-l4={`${t.ip}:${t.port}`}>
+                      <span>
+                        {t.ip}:{t.port} {t.proto}
+                        {t.grammar === null ? '' : ` · ${t.grammar}`}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        aria-label={`Remove L4 target ${t.ip}:${t.port}`}
+                        onClick={() => removeL4Target(i())}
+                      >
+                        <Icon name="x" size={12} />
+                      </Button>
+                    </div>
+                  )}
+                </For>
+              </div>
+              <p class={css.note}>{L4_HINT}</p>
+            </div>
+            <div class={css.originRow}>
+              <TextField label="L4 target IP" value={l4Ip()} placeholder="127.0.0.1" onValue={setL4Ip} />
+              <TextField label="L4 target port" value={l4Port()} placeholder="9" onValue={setL4Port} />
+              <Picker label="L4 target proto" options={L4_TRANSPORTS} value={l4Proto()} onValue={setL4Proto} />
+              <TextField label="L4 target grammar" value={l4Grammar()} placeholder="optional" onValue={setL4Grammar} />
+              <Button variant="outline" onClick={() => addL4Target()}>
+                Add L4 target
+              </Button>
+            </div>
+          </Section>
 
-        <Section title="Checks">
-          <CheckTree
-            selection={p().checks}
-            checks={s.checks()}
-            unknown={unknownSelectors(p().checks, s.checks())}
-            onChange={(next) => setField('checks', next)}
-          />
-          <label class={css.field}>
-            <span class={css.fieldLabel}>Include selectors</span>
-            <textarea
-              aria-label="Include selectors"
-              value={includeText()}
-              placeholder="one of id | class | lane:* per line"
-              onInput={(e) => writeSelectors('include', e.currentTarget.value)}
-            />
-          </label>
-          <label class={css.field}>
-            <span class={css.fieldLabel}>Exclude selectors</span>
-            <textarea
-              aria-label="Exclude selectors"
-              value={excludeText()}
-              placeholder="one of id | class | lane:* per line"
-              onInput={(e) => writeSelectors('exclude', e.currentTarget.value)}
-            />
-          </label>
-        </Section>
-
-        <Section title="Crawl">
-          <Segmented
-            label="Crawl strategy"
-            options={CRAWL_STRATEGIES}
-            value={p().crawl.strategy}
-            onValue={(v) => setCrawl('strategy', v)}
-          />
-          <NumField label="Max depth" value={p().crawl.max_depth} onValue={(v) => setCrawl('max_depth', v)} />
-          <NumField label="Max pages" value={p().crawl.max_pages} onValue={(v) => setCrawl('max_pages', v)} />
-          <BoolField
-            label="Submit forms"
-            checked={p().crawl.submit_forms}
-            onValue={(v) => setCrawl('submit_forms', v)}
-          />
-          <BoolField
-            label="Click handlers"
-            checked={p().crawl.click_handlers}
-            onValue={(v) => setCrawl('click_handlers', v)}
-          />
-          <BoolField label="Read robots.txt" checked={p().crawl.robots} onValue={(v) => setCrawl('robots', v)} />
-          <BoolField label="Read sitemap.xml" checked={p().crawl.sitemap} onValue={(v) => setCrawl('sitemap', v)} />
-          <Picker
-            label="Use browser"
-            options={USE_BROWSER}
-            value={p().crawl.use_browser}
-            onValue={(v) => setCrawl('use_browser', v)}
-          />
-        </Section>
-
-        <Section title="Audit">
-          <div class={css.field}>
-            <span class={css.fieldLabel}>Insertion kinds</span>
-            <div role="group" aria-label="Audit kinds">
-              <For each={INSERTION_KINDS}>
-                {(kind) => (
-                  <label class={css.checkRow}>
+          <Section title="Lanes">
+            <div role="group" aria-label="Lanes">
+              <For each={LANES}>
+                {(lane) => (
+                  <label class={css.checkRow} data-lane={lane}>
                     <input
                       type="checkbox"
-                      aria-label={kind}
-                      checked={p().audit.kinds.includes(kind)}
-                      onChange={(e) => setKind(kind, e.currentTarget.checked)}
+                      aria-label={lane}
+                      checked={p().lanes.includes(lane)}
+                      onChange={(e) => setLane(lane, e.currentTarget.checked)}
                     />
-                    <span>{kind}</span>
+                    <span>{lane}</span>
+                    <Show when={!laneAvailable(lane)}>
+                      <span class={css.tag}>not available on this build</span>
+                    </Show>
                   </label>
                 )}
               </For>
             </div>
-          </div>
-          <div class={css.field}>
-            <span class={css.fieldLabel}>Ignore rules</span>
-            <div role="list" aria-label="Ignore rules">
-              <Show when={p().audit.ignore.length === 0}>
-                <p class={css.note}>No ignore rules.</p>
-              </Show>
-              <For each={p().audit.ignore}>
-                {(rule, i) => (
-                  <div class={css.originRow} role="listitem">
-                    <span>{ignoreWords(rule)}</span>
-                    <Button
-                      variant="ghost"
-                      aria-label={`Remove ignore rule ${i() + 1}`}
-                      onClick={() => setAudit('ignore', p().audit.ignore.filter((_, at) => at !== i()))}
-                    >
-                      <Icon name="x" size={12} />
-                    </Button>
-                  </div>
-                )}
-              </For>
-            </div>
-          </div>
-          <div class={css.originRow}>
-            <Picker
-              label="Ignore kind"
-              options={['', ...INSERTION_KINDS] as const}
-              value={ignoreKind()}
-              onValue={(v) => setIgnoreKind(v as InsertionKind | '')}
-            />
-            <TextField label="Ignore name regex" value={ignoreRegex()} onValue={setIgnoreRegex} />
-            <Picker
-              label="Ignore trait"
-              options={['', ...POINT_TRAITS] as const}
-              value={ignoreTrait()}
-              onValue={(v) => setIgnoreTrait(v as PointTrait | '')}
-            />
-            <Button variant="outline" onClick={() => addIgnore()}>
-              Add ignore rule
-            </Button>
-          </div>
-          <NumField
-            label="Max points per request"
-            value={p().audit.max_points_per_request}
-            onValue={(v) => setAudit('max_points_per_request', v)}
-          />
-          <NumField
-            label="Frequent point threshold"
-            value={p().audit.frequent_point_threshold}
-            onValue={(v) => setAudit('frequent_point_threshold', v)}
-          />
-        </Section>
+          </Section>
 
-        <Section title="Session">
-          <Segmented
-            label="Session mode"
-            options={SESSION_MODES}
-            value={p().session.mode}
-            onValue={(v) => setSession('mode', v)}
-          />
-          <Segmented
-            label="On session lost"
-            options={ON_LOST}
-            value={p().session.on_lost}
-            onValue={(v) => setSession('on_lost', v)}
-          />
-          <TextField
-            label="Session from flow"
-            value={p().session.from_flow ?? ''}
-            placeholder="flow id (optional)"
-            onValue={(v) => setSession('from_flow', v.trim() === '' ? null : v.trim())}
-          />
-          <For each={p().target.origins}>
-            {(origin) => (
-              <Button variant="outline" disabled={s.busy()} onClick={() => void runPreview(origin)}>
-                Preview session for {origin}
-              </Button>
-            )}
-          </For>
-          <Show when={preview()}>
-            {(pv) => (
-              <div data-preview={pv().origin}>
-                <For each={previewLines(pv().session)}>{(line) => <p class={css.note}>{line}</p>}</For>
+          <Section title="Intensity, speed, accuracy">
+            <Segmented
+              label="Intensity"
+              options={INTENSITIES}
+              value={p().intensity}
+              onValue={(v) => setField('intensity', v)}
+            />
+            <Show when={p().intensity === 'intrusive'}>
+              <p class={css.note}>operator only; asks for confirmation</p>
+            </Show>
+            <Segmented label="Speed" options={SPEEDS} value={p().speed} onValue={(v) => setField('speed', v)} />
+            <Segmented
+              label="Accuracy"
+              options={ACCURACIES}
+              value={p().accuracy}
+              onValue={(v) => setField('accuracy', v)}
+            />
+          </Section>
+
+          <Section title="Checks">
+            <CheckTree
+              selection={p().checks}
+              checks={s.checks()}
+              unknown={unknownSelectors(p().checks, s.checks())}
+              onChange={(next) => setField('checks', next)}
+            />
+            <label class={css.field}>
+              <span class={css.fieldLabel}>Include selectors</span>
+              <textarea
+                aria-label="Include selectors"
+                value={includeText()}
+                placeholder="one of id | class | lane:* per line"
+                onInput={(e) => writeSelectors('include', e.currentTarget.value)}
+              />
+            </label>
+            <label class={css.field}>
+              <span class={css.fieldLabel}>Exclude selectors</span>
+              <textarea
+                aria-label="Exclude selectors"
+                value={excludeText()}
+                placeholder="one of id | class | lane:* per line"
+                onInput={(e) => writeSelectors('exclude', e.currentTarget.value)}
+              />
+            </label>
+          </Section>
+
+          <Section title="Crawl">
+            <Segmented
+              label="Crawl strategy"
+              options={CRAWL_STRATEGIES}
+              value={p().crawl.strategy}
+              onValue={(v) => setCrawl('strategy', v)}
+            />
+            <NumField label="Max depth" value={p().crawl.max_depth} onValue={(v) => setCrawl('max_depth', v)} />
+            <NumField label="Max pages" value={p().crawl.max_pages} onValue={(v) => setCrawl('max_pages', v)} />
+            <BoolField
+              label="Submit forms"
+              checked={p().crawl.submit_forms}
+              onValue={(v) => setCrawl('submit_forms', v)}
+            />
+            <BoolField
+              label="Click handlers"
+              checked={p().crawl.click_handlers}
+              onValue={(v) => setCrawl('click_handlers', v)}
+            />
+            <BoolField label="Read robots.txt" checked={p().crawl.robots} onValue={(v) => setCrawl('robots', v)} />
+            <BoolField label="Read sitemap.xml" checked={p().crawl.sitemap} onValue={(v) => setCrawl('sitemap', v)} />
+            <Picker
+              label="Use browser"
+              options={USE_BROWSER}
+              value={p().crawl.use_browser}
+              onValue={(v) => setCrawl('use_browser', v)}
+            />
+          </Section>
+
+          <Section title="Audit">
+            <div class={css.field}>
+              <span class={css.fieldLabel}>Insertion kinds</span>
+              <div role="group" aria-label="Audit kinds">
+                <For each={INSERTION_KINDS}>
+                  {(kind) => (
+                    <label class={css.checkRow}>
+                      <input
+                        type="checkbox"
+                        aria-label={kind}
+                        checked={p().audit.kinds.includes(kind)}
+                        onChange={(e) => setKind(kind, e.currentTarget.checked)}
+                      />
+                      <span>{kind}</span>
+                    </label>
+                  )}
+                </For>
               </div>
-            )}
-          </Show>
-        </Section>
-
-        <Section title="Budget">
-          <NumField label="Probe budget" value={p().budget.probes} onValue={(v) => setBudget('probes', v)} />
-          <NumField label="Time budget (s)" value={p().budget.time_s} onValue={(v) => setBudget('time_s', v)} />
-          <NumField label="Max issues" value={p().budget.max_issues} onValue={(v) => setBudget('max_issues', v)} />
-          <NumField
-            label="Check timeout (s)"
-            value={p().budget.check_timeout_s}
-            onValue={(v) => setBudget('check_timeout_s', v)}
-          />
-          <NumField
-            label="Consecutive errors per host"
-            value={p().budget.per_host_errors.consecutive}
-            onValue={(v) => setBudget('per_host_errors', { ...p().budget.per_host_errors, consecutive: v })}
-          />
-          <NumField
-            label="Error ratio per host"
-            step="0.1"
-            value={p().budget.per_host_errors.ratio}
-            onValue={(v) => setBudget('per_host_errors', { ...p().budget.per_host_errors, ratio: v })}
-          />
-        </Section>
-
-        <Section title="HTTP">
-          <Segmented
-            label="HTTP version"
-            options={HTTP_VERSION_POLICIES}
-            value={p().http.version}
-            onValue={(v) => setHttp('version', v)}
-          />
-          <Segmented
-            label="Record probes"
-            options={RECORD_PROBES}
-            value={p().http.record_probes}
-            onValue={(v) => setHttp('record_probes', v)}
-          />
-        </Section>
-
-        <Section title="WS">
-          <NumField
-            label="Reply window (ms)"
-            value={p().ws.reply_window_ms}
-            onValue={(v) => setWs('reply_window_ms', v)}
-          />
-          <NumField
-            label="Max frame bytes"
-            value={p().ws.max_frame_bytes}
-            onValue={(v) => setWs('max_frame_bytes', v)}
-          />
-        </Section>
-
-        <Section title="L4">
-          <NumField label="Cases" value={p().l4.cases} onValue={(v) => setL4('cases', v)} />
-          <NumField
-            label="Reproduce count"
-            value={p().l4.reproduce_count}
-            onValue={(v) => setL4('reproduce_count', v)}
-          />
-          <NumField label="Liveness every" value={p().l4.liveness_every} onValue={(v) => setL4('liveness_every', v)} />
-          <NumField
-            label="Consecutive timeouts"
-            value={p().l4.consecutive_timeouts}
-            onValue={(v) => setL4('consecutive_timeouts', v)}
-          />
-          <NumField
-            label="Max bytes per second"
-            value={p().l4.max_bytes_per_s}
-            onValue={(v) => setL4('max_bytes_per_s', v)}
-          />
-          <BoolField label="Dry run" checked={p().l4.dry_run} onValue={(v) => setL4('dry_run', v)} />
-          <label class={css.field}>
-            <span class={css.fieldLabel}>L4 seeds</span>
-            <textarea
-              aria-label="L4 seeds"
-              value={seeds()}
-              placeholder="flow:<id>, hex:<bytes> or base64:<bytes>, one per line"
-              onInput={(e) => {
-                const text = e.currentTarget.value;
-                batch(() => {
-                  setSeeds(text);
-                  setL4('seeds', parseSeeds(text));
-                });
-              }}
-            />
-          </label>
-        </Section>
-
-        <Show when={s.lastError() ?? s.startNotice()}>
-          <div class={css.notice} role="status" aria-label="Launch result">
-            <Show
-              when={s.lastError()}
-              fallback={
-                <Show when={s.startNotice()}>{(started) => <p class={css.note}>{started().job} started</p>}</Show>
-              }
-            >
-              {(error) => (
-                <>
-                  <p>{error()}</p>
-                  <Show when={refusedHost()}>
-                    {(h) => (
-                      <Button variant="outline" onClick={() => void app.addScope(h())}>
-                        Add {h()} to Scope
+            </div>
+            <div class={css.field}>
+              <span class={css.fieldLabel}>Ignore rules</span>
+              <div role="list" aria-label="Ignore rules">
+                <Show when={p().audit.ignore.length === 0}>
+                  <p class={css.note}>No ignore rules.</p>
+                </Show>
+                <For each={p().audit.ignore}>
+                  {(rule, i) => (
+                    <div class={css.originRow} role="listitem">
+                      <span>{ignoreWords(rule)}</span>
+                      <Button
+                        variant="ghost"
+                        aria-label={`Remove ignore rule ${i() + 1}`}
+                        onClick={() => setAudit('ignore', p().audit.ignore.filter((_, at) => at !== i()))}
+                      >
+                        <Icon name="x" size={12} />
                       </Button>
-                    )}
-                  </Show>
-                </>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+            <div class={css.originRow}>
+              <Picker
+                label="Ignore kind"
+                options={['', ...INSERTION_KINDS] as const}
+                value={ignoreKind()}
+                onValue={(v) => setIgnoreKind(v as InsertionKind | '')}
+              />
+              <TextField label="Ignore name regex" value={ignoreRegex()} onValue={setIgnoreRegex} />
+              <Picker
+                label="Ignore trait"
+                options={['', ...POINT_TRAITS] as const}
+                value={ignoreTrait()}
+                onValue={(v) => setIgnoreTrait(v as PointTrait | '')}
+              />
+              <Button variant="outline" onClick={() => addIgnore()}>
+                Add ignore rule
+              </Button>
+            </div>
+            <NumField
+              label="Max points per request"
+              value={p().audit.max_points_per_request}
+              onValue={(v) => setAudit('max_points_per_request', v)}
+            />
+            <NumField
+              label="Frequent point threshold"
+              value={p().audit.frequent_point_threshold}
+              onValue={(v) => setAudit('frequent_point_threshold', v)}
+            />
+          </Section>
+
+          <Section title="Session">
+            <Segmented
+              label="Session mode"
+              options={SESSION_MODES}
+              value={p().session.mode}
+              onValue={(v) => setSession('mode', v)}
+            />
+            <Segmented
+              label="On session lost"
+              options={ON_LOST}
+              value={p().session.on_lost}
+              onValue={(v) => setSession('on_lost', v)}
+            />
+            <TextField
+              label="Session from flow"
+              value={p().session.from_flow ?? ''}
+              placeholder="flow id (optional)"
+              onValue={(v) => setSession('from_flow', v.trim() === '' ? null : v.trim())}
+            />
+            <For each={p().target.origins}>
+              {(origin) => (
+                <Button variant="outline" disabled={!s.busOpen() || s.busy()} onClick={() => void runPreview(origin)}>
+                  Preview session for {origin}
+                </Button>
+              )}
+            </For>
+            <Show when={preview()}>
+              {(pv) => (
+                <div data-preview={pv().origin}>
+                  <For each={previewLines(pv().session)}>{(line) => <p class={css.note}>{line}</p>}</For>
+                </div>
               )}
             </Show>
-          </div>
-        </Show>
+          </Section>
+
+          <Section title="Budget">
+            <NumField label="Probe budget" value={p().budget.probes} onValue={(v) => setBudget('probes', v)} />
+            <NumField label="Time budget (s)" value={p().budget.time_s} onValue={(v) => setBudget('time_s', v)} />
+            <NumField label="Max issues" value={p().budget.max_issues} onValue={(v) => setBudget('max_issues', v)} />
+            <NumField
+              label="Check timeout (s)"
+              value={p().budget.check_timeout_s}
+              onValue={(v) => setBudget('check_timeout_s', v)}
+            />
+            <NumField
+              label="Consecutive errors per host"
+              value={p().budget.per_host_errors.consecutive}
+              onValue={(v) => setBudget('per_host_errors', { ...p().budget.per_host_errors, consecutive: v })}
+            />
+            <NumField
+              label="Error ratio per host"
+              step="0.1"
+              value={p().budget.per_host_errors.ratio}
+              onValue={(v) => setBudget('per_host_errors', { ...p().budget.per_host_errors, ratio: v })}
+            />
+          </Section>
+
+          <Section title="HTTP">
+            <Segmented
+              label="HTTP version"
+              options={HTTP_VERSION_POLICIES}
+              value={p().http.version}
+              onValue={(v) => setHttp('version', v)}
+            />
+            <Segmented
+              label="Record probes"
+              options={RECORD_PROBES}
+              value={p().http.record_probes}
+              onValue={(v) => setHttp('record_probes', v)}
+            />
+          </Section>
+
+          <Section title="WS">
+            <NumField
+              label="Reply window (ms)"
+              value={p().ws.reply_window_ms}
+              onValue={(v) => setWs('reply_window_ms', v)}
+            />
+            <NumField
+              label="Max frame bytes"
+              value={p().ws.max_frame_bytes}
+              onValue={(v) => setWs('max_frame_bytes', v)}
+            />
+          </Section>
+
+          <Section title="L4">
+            <NumField label="Cases" value={p().l4.cases} onValue={(v) => setL4('cases', v)} />
+            <NumField
+              label="Reproduce count"
+              value={p().l4.reproduce_count}
+              onValue={(v) => setL4('reproduce_count', v)}
+            />
+            <NumField label="Liveness every" value={p().l4.liveness_every} onValue={(v) => setL4('liveness_every', v)} />
+            <NumField
+              label="Consecutive timeouts"
+              value={p().l4.consecutive_timeouts}
+              onValue={(v) => setL4('consecutive_timeouts', v)}
+            />
+            <NumField
+              label="Max bytes per second"
+              value={p().l4.max_bytes_per_s}
+              onValue={(v) => setL4('max_bytes_per_s', v)}
+            />
+            <BoolField label="Dry run" checked={p().l4.dry_run} onValue={(v) => setL4('dry_run', v)} />
+            <label class={css.field}>
+              <span class={css.fieldLabel}>L4 seeds</span>
+              <textarea
+                aria-label="L4 seeds"
+                value={seeds()}
+                placeholder="flow:<id>, hex:<bytes> or base64:<bytes>, one per line"
+                onInput={(e) => {
+                  const text = e.currentTarget.value;
+                  batch(() => {
+                    setSeeds(text);
+                    setL4('seeds', parseSeeds(text));
+                  });
+                }}
+              />
+            </label>
+          </Section>
+
+          <Show when={s.lastError() ?? s.startNotice()}>
+            <div class={css.notice} role="status" aria-label="Launch result">
+              <Show
+                when={s.lastError()}
+                fallback={
+                  <Show when={s.startNotice()}>{(started) => <p class={css.note}>{started().job} started</p>}</Show>
+                }
+              >
+                {(error) => (
+                  <>
+                    <p>{error()}</p>
+                    <Show when={refusedHost()}>
+                      {(h) => (
+                        <Button variant="outline" onClick={() => void app.addScope(h())}>
+                          Add {h()} to Scope
+                        </Button>
+                      )}
+                    </Show>
+                  </>
+                )}
+              </Show>
+            </div>
+          </Show>
+        </fieldset>
       </form>
 
       <div class={css.footer}>
@@ -904,11 +915,11 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
         <Show when={s.agent() && note() === null}>
           <p class={css.note}>{AGENT_NOTE}</p>
         </Show>
-        <Button variant="outline" disabled={!canSave()} onClick={() => void s.saveProfile(p())}>
+        <Button variant="outline" disabled={!s.busOpen() || !canSave()} onClick={() => void s.saveProfile(p())}>
           Save
         </Button>
         <Show when={isBuiltin() && !renaming()}>
-          <Button variant="ghost" onClick={() => setRenaming(true)}>
+          <Button variant="ghost" disabled={!s.busOpen()} onClick={() => setRenaming(true)}>
             Save as
           </Button>
         </Show>
@@ -916,18 +927,18 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
           <Show
             when={confirmDelete()}
             fallback={
-              <Button variant="ghost" onClick={() => setConfirmDelete(true)}>
+              <Button variant="ghost" disabled={!s.busOpen()} onClick={() => setConfirmDelete(true)}>
                 Delete
               </Button>
             }
           >
             <span>Delete {props.name}?</span>
-            <Button variant="ghost" onClick={() => setConfirmDelete(false)}>
+            <Button variant="ghost" disabled={!s.busOpen()} onClick={() => setConfirmDelete(false)}>
               Keep
             </Button>
             <Button
               variant="outline"
-              disabled={s.busy()}
+              disabled={!s.busOpen() || s.busy()}
               onClick={() => {
                 setConfirmDelete(false);
                 void s.deleteProfile(props.name);
@@ -937,10 +948,10 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
             </Button>
           </Show>
         </Show>
-        <Button variant="outline" disabled={!pf().ok || s.busy()} onClick={() => launch('map')}>
+        <Button variant="outline" disabled={!s.busOpen() || !pf().ok || s.busy()} onClick={() => launch('map')}>
           Map only
         </Button>
-        <Button variant="primary" disabled={!pf().ok || s.busy()} onClick={() => launch('start')}>
+        <Button variant="primary" disabled={!s.busOpen() || !pf().ok || s.busy()} onClick={() => launch('start')}>
           Start
         </Button>
       </div>

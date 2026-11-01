@@ -155,6 +155,7 @@ export const IssuesView: Component = () => {
                 <button
                   type="button"
                   class={css.chip}
+                  data-raw="true"
                   aria-pressed={s.filter().classes.has(c)}
                   disabled={offline()}
                   onClick={() => setFilter({ classes: toggled(s.filter().classes, c) })}

@@ -200,9 +200,6 @@ export const SitemapView: Component = () => {
                         <div class={css.rowMain}>
                           <Badge hue={hue(n.method)}>{n.method}</Badge>
                           <span>{n.path_template}</span>
-                          <span class={css.tag} data-field="points" title="insertion points">
-                            {n.points}
-                          </span>
                           <Show when={n.audited}>
                             <span title="audited">
                               <Icon name="check" size={12} label="audited" />
@@ -214,7 +211,10 @@ export const SitemapView: Component = () => {
                             </span>
                           </Show>
                         </div>
-                        <div class={css.rowSecondary}>{g.host}</div>
+                        {/* The host is the group label above; the row's right column is the point count. */}
+                        <div class={css.rowSecondary} title="insertion points">
+                          <span data-field="points">{n.points}</span> points
+                        </div>
                       </div>
                     )}
                   </For>

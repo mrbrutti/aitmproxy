@@ -290,6 +290,11 @@
   color: var(--color-text-primary);
   font-weight: var(--font-weight-medium);
 }
+/* A chip whose text is a wire token (an issue class): printed as the engine names it. */
+.chip[data-raw='true'] {
+  text-transform: none;
+  font-family: var(--font-data);
+}
 .chip .dot {
   display: inline-block;
   width: 6px;
@@ -394,6 +399,21 @@
   color: var(--color-text-tertiary);
   white-space: nowrap;
 }
+/* Jobs rows: line 1 is state + elapsed, line 2 is id/counters + a short severity bar. The strip
+   keeps its 120px bar; the row's is scoped here so the 320px list never crowds the state words. */
+.jobRow .rowSecondary {
+  grid-row: 1;
+  align-self: end;
+  line-height: 18px;
+}
+.jobRow .bar {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: start;
+  justify-self: end;
+  width: 56px;
+  margin-top: 5px;
+}
 .tag {
   display: inline-block;
   flex: none;
@@ -422,6 +442,16 @@
 .body {
   max-width: 920px;
   padding: var(--space-5) var(--space-6) var(--space-8);
+}
+.detailHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.detailHead > h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .body h2 {
   margin: 0;
@@ -622,6 +652,16 @@
   gap: var(--space-5);
   max-width: 640px;
 }
+/* The editor body: one fieldset so a closed bus disables every control at once (D-T8.10). It
+   takes over the editor's grid so the sections keep their rhythm. */
+.fieldset {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
 .field {
   display: grid;
   gap: var(--space-1);
@@ -632,6 +672,7 @@
   color: var(--color-text-secondary);
 }
 .field input,
+.field select,
 .field textarea {
   width: 100%;
   min-width: 0;
@@ -643,7 +684,8 @@
   font: var(--font-size-md) / 20px var(--font-data);
   caret-color: var(--color-accent-base);
 }
-.field input {
+.field input,
+.field select {
   height: var(--size-control);
 }
 .field textarea {
@@ -656,6 +698,7 @@
   color: var(--color-text-tertiary);
 }
 .field input:focus-visible,
+.field select:focus-visible,
 .field textarea:focus-visible {
   outline: 2px solid var(--color-line-focus);
   outline-offset: -1px;
@@ -764,13 +807,22 @@
 }
 
 /* ---------- site map tree ---------- */
+/* The per-host group label, sticky at the top of the listbox (`.rows` is what scrolls). */
 .treeHost {
-  min-height: 0;
-  overflow: auto;
-  outline: none;
-}
-.treeHost:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--color-line-focus);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  height: var(--size-row-dense);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--color-line-rule);
+  background: var(--color-ground-surface);
+  font: var(--font-size-xs) / 16px var(--font-data);
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tree {
   margin: 0;
@@ -836,7 +888,8 @@
   .strip > button:last-child {
     margin-left: 0;
   }
-  .rowSecondary {
+  .rowSecondary,
+  .jobRow .bar {
     display: none;
   }
   .row {

@@ -82,6 +82,8 @@ describe('JobsView: rows and strip', () => {
     expect(h.field(first, 'probes')).toBe('418/2000');
     expect(h.field(first, 'points')).toBe('80/120');
     expect(h.field(first, 'elapsed')).toBe('0:42');
+    // The row carries no control: the selected job's Cancel lives in the strip and the detail.
+    expect(first.querySelector('button')).toBeNull();
     expect(rows[1]!.getAttribute('data-job')).toBe(DONE);
     expect(h.field(rows[1]!, 'state')).toBe('done');
   });
@@ -203,11 +205,12 @@ describe('JobsView: live values', () => {
     expect(seen).toEqual(['418/2000', '418/2000', '450/2000']);
   });
 
-  it('cancel_calls_verb: a row Cancel sends scan.cancel { job } and the row shows the reply', async () => {
+  it('cancel_calls_verb: the detail Cancel sends scan.cancel { job } and the row shows the reply', async () => {
     const h = mount();
     await tick();
     expect(h.count('scan.cancel')).toBe(0);
-    fireEvent.click(within(h.row(JOB)).getByRole('button', { name: `Cancel scan ${JOB}` }));
+    // Scoped to the detail: the strip carries a same-named Cancel of its own.
+    fireEvent.click(within(h.detail()).getByRole('button', { name: `Cancel scan ${JOB}` }));
     await tick();
     expect(h.argsOf('scan.cancel')[0]).toEqual({ job: JOB });
     expect(h.field(h.row(JOB), 'state')).toBe('cancelling · auditing');

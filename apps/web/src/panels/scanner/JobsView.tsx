@@ -196,14 +196,19 @@ export const JobsView: Component = () => {
                       id={`job-${summary.job}`}
                       data-job={summary.job}
                       data-state={j().state}
-                      class={css.row}
+                      class={`${css.row} ${css.jobRow}`}
                       role="option"
                       aria-selected={selectedId() === summary.job}
                       onClick={() => select(summary.job)}
                     >
+                      {/* Two lines, no control: line 1 is the state and elapsed, line 2 the id,
+                          counters and the severity bar. Cancel lives in the strip and the detail. */}
                       <div class={css.rowMain}>
                         <StateDot state={j().state} />
                         <span data-field="state">{stateWords(j())}</span>
+                      </div>
+                      <div class={css.rowSecondary}>
+                        <span data-field="elapsed">{fmtElapsed(j().elapsed_ms)}</span>
                       </div>
                       <div class={css.rowMeta}>
                         <span class={css.mono}>{summary.job}</span>
@@ -216,21 +221,7 @@ export const JobsView: Component = () => {
                           points <span data-field="points">{`${j().points.audited}/${j().points.found}`}</span>
                         </span>
                       </div>
-                      <div class={css.rowSecondary}>
-                        <SeverityBar by={j().issues.by_severity} />
-                        <span data-field="elapsed">{fmtElapsed(j().elapsed_ms)}</span>
-                        <Button
-                          variant="small"
-                          aria-label={`Cancel scan ${summary.job}`}
-                          disabled={!canCancel(j())}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void s.cancel(summary.job);
-                          }}
-                        >
-                          Cancel
-                        </Button>
-                      </div>
+                      <SeverityBar by={j().issues.by_severity} />
                     </div>
                   );
                 }}
@@ -245,9 +236,19 @@ export const JobsView: Component = () => {
           <Show when={selected()} fallback={<div class={css.empty}>No job selected</div>}>
             {(j) => (
               <div class={css.body}>
-                <h2>
-                  <span class={css.mono}>{j().job}</span>
-                </h2>
+                <div class={css.detailHead}>
+                  <h2>
+                    <span class={css.mono}>{j().job}</span>
+                  </h2>
+                  <Button
+                    variant="small"
+                    aria-label={`Cancel scan ${j().job}`}
+                    disabled={!canCancel(j())}
+                    onClick={() => void s.cancel(j().job)}
+                  >
+                    Cancel
+                  </Button>
+                </div>
 
                 <Show when={notice()}>
                   {(n) => (

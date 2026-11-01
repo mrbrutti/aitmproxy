@@ -290,6 +290,37 @@ describe('ProfileEditor: the launch handshake (D-T8.6)', () => {
   });
 });
 
+describe('ProfileEditor: a closed bus (D-T8.10)', () => {
+  it('reconnecting_disables_editor: every control is off and a note says so; open re-enables Start', async () => {
+    const h = await mount();
+    addOrigin('http', '127.0.0.1', '8080');
+    await waitFor(() => expect(start().disabled).toBe(false));
+    const NOTE = 'reconnecting: controls are disabled until the bus is back';
+    expect(screen.queryByText(NOTE)).toBeNull();
+
+    h.setBusState('reconnecting');
+    await waitFor(() => expect(start().disabled).toBe(true));
+    const button = (name: string) => screen.getByRole('button', { name }) as HTMLButtonElement;
+    expect(button('Save').disabled).toBe(true);
+    expect(button('Map only').disabled).toBe(true);
+    expect(button('Save as').disabled).toBe(true);
+    // The body is one disabled fieldset: its controls are disabled through the ancestor, which
+    // `:disabled` sees and the `disabled` property (the attribute) does not.
+    expect(button('Add origin').matches(':disabled')).toBe(true);
+    expect(button('Preview session for http://127.0.0.1:8080').matches(':disabled')).toBe(true);
+    expect((screen.getByLabelText('Profile name') as HTMLInputElement).matches(':disabled')).toBe(true);
+    expect(screen.getByText(NOTE)).toBeTruthy();
+    // Data kept: the draft is still on screen.
+    expect(screen.getByRole('list', { name: 'Origins' }).textContent).toContain('http://127.0.0.1:8080');
+
+    h.setBusState('open');
+    await waitFor(() => expect(start().disabled).toBe(false));
+    expect(button('Save as').disabled).toBe(false);
+    expect((screen.getByLabelText('Profile name') as HTMLInputElement).matches(':disabled')).toBe(false);
+    expect(screen.queryByText(NOTE)).toBeNull();
+  });
+});
+
 describe('CheckTree and the selector grammar (W-11)', () => {
   it('check_tree_writes_grammar: a toggle writes the selector, an unknown one is flagged', async () => {
     await mount();

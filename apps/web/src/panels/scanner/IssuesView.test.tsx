@@ -120,9 +120,15 @@ describe('IssuesView: the list', () => {
     expect(within(confidence).getByRole('button', { name: 'certain' }).getAttribute('aria-pressed')).toBe('true');
     expect(h.count('scan.issues')).toBe(1);
 
-    // The class chips come from the loaded rows.
+    // The class chips come from the loaded rows, and print the class token as the engine names it
+    // (`data-raw` opts the chip out of the title-casing the other chip groups get).
     const classes = screen.getByRole('group', { name: 'Class' });
     expect(within(classes).getAllByRole('button').map((b) => b.textContent)).toEqual(['open-redirect', 'reflected-xss']);
+    const xssChip = within(classes).getByRole('button', { name: 'reflected-xss' });
+    expect(xssChip.textContent).toBe('reflected-xss');
+    expect(xssChip.getAttribute('data-raw')).toBe('true');
+    // The confidence chips keep the default (capitalised) presentation.
+    expect(within(confidence).getByRole('button', { name: 'certain' }).getAttribute('data-raw')).toBeNull();
   });
 
   it('all_jobs_toggle: "All jobs" reads the page without a job', async () => {

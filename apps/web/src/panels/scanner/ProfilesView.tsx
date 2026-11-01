@@ -108,7 +108,7 @@ export const ProfilesView: Component = () => {
             {(error) => (
               <div class={css.errorBlock} role="alert">
                 <p>{error()}</p>
-                <Button class={css.retry} variant="outline" onClick={() => void s.loadProfiles()}>
+                <Button class={css.retry} variant="outline" disabled={!s.busOpen()} onClick={() => void s.loadProfiles()}>
                   Retry
                 </Button>
               </div>
