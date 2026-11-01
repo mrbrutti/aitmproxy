@@ -212,6 +212,10 @@ impl L4StreamLane {
         // for discovery. A disabled lane is refused there, per endpoint, with
         // the endpoint named and the S9 WARN emitted (spec S5.1, S9).
         let job_state = self.state.job_for(job);
+        // `JobCtx::marker()` is a generator: it mints a fresh token on every
+        // call (F7). Read it once, so every endpoint of one discover derives
+        // its generator seed from the same value.
+        let marker = job.marker();
         let mut discovery = Discovery {
             points: Vec::new(),
             nodes: Vec::new(),
@@ -254,8 +258,7 @@ impl L4StreamLane {
             if seeds.is_empty() {
                 // (c) the grammar's own messages. `tlv` and `raw` generate
                 // nothing, so such an endpoint yields a node and no points.
-                let rng_seed =
-                    fnv1a64(format!("{marker}{node_id}", marker = job.marker()).as_bytes());
+                let rng_seed = fnv1a64(format!("{marker}{node_id}").as_bytes());
                 seeds = corpus::seeds_generated(grammar.as_ref(), rng_seed);
             }
 
@@ -331,9 +334,14 @@ impl Lane for L4StreamLane {
         point: &InsertionPoint,
         job: Arc<dyn JobCtx>,
     ) -> anyhow::Result<Box<dyn ProbeHost>> {
-        // Records `by_marker[marker] = job_id`, which is how a check reaches
-        // this job's state from a host (spec S5.1, A2).
         let job_state = self.state.job_for(job.as_ref());
+        // The marker is read **once** and carried by the host for its whole
+        // life: a `JobCtx` mints a fresh token on every `marker()` call, so a
+        // host that asked again would carry a marker no map has ever seen
+        // (F7). Registering it here is how a check reaches this job's state
+        // from a host (spec S5.1, A2).
+        let marker = job.marker();
+        self.state.register_marker(&marker, job.job_id());
         if self.guard.is_none() {
             return Err(anyhow!(L4_DISABLED));
         }
@@ -355,6 +363,7 @@ impl Lane for L4StreamLane {
             discovered,
             grammar,
             job,
+            marker,
             job_state,
             self.guard.clone(),
             Arc::clone(&self.client),

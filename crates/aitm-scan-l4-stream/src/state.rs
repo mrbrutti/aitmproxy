@@ -343,7 +343,13 @@ impl fmt::Debug for DiscoveredPoint {
 pub struct JobState {
     /// The job's identifier, the key of [`LaneState`]'s first map.
     pub job_id: String,
-    /// `JobCtx::marker()`, the only key a check has (A2).
+    /// The first marker seen for this job: what `JobCtx::marker()` returned
+    /// when this state was created (A2).
+    ///
+    /// Informational only — it is one of possibly several keys in
+    /// [`LaneState`]'s marker map, because a `JobCtx` may mint a fresh marker
+    /// on every call (F7). A check reaches a job through the marker its host
+    /// carries, never through this field.
     pub marker: String,
     /// Every message written that is a case (not a prelude, not a liveness
     /// probe).
@@ -576,6 +582,12 @@ impl fmt::Debug for JobState {
 /// thing that grows with jobs, and it is bounded at [`MAX_JOBS`]. Both maps are
 /// updated under one lock order — `jobs`, then `by_marker` — so they never
 /// disagree about which jobs are held.
+///
+/// `by_marker` is many-to-one: a `JobCtx` is free to mint a fresh marker on
+/// every `marker()` call, so one job holds one marker per host built for it
+/// (F7). Every one of them resolves to the same `Arc<JobState>`, and
+/// [`LaneState::drop_job`] removes all of a job's markers together, so an
+/// evicted job leaves nothing behind in either map.
 #[derive(Debug)]
 pub struct LaneState {
     jobs: Mutex<HashMap<String, Arc<JobState>>>,
@@ -650,6 +662,24 @@ impl LaneState {
         jobs.insert(job_id.clone(), Arc::clone(&state));
         markers.insert(marker, job_id);
         state
+    }
+
+    /// Record one more marker for a job already held, so a check reaching
+    /// this state from a host's marker finds it (A2, F7).
+    ///
+    /// `JobCtx::marker()` is a generator in the engine — each call mints a
+    /// token a check can recognise again — so the marker a host carries is
+    /// not the one [`LaneState::job_for`] happened to capture. Every host
+    /// registers the marker it was built with here. A marker for a job this
+    /// state does not hold is dropped rather than recorded, so the map never
+    /// grows an entry no job will ever evict.
+    pub fn register_marker(&self, marker: &str, job_id: &str) {
+        let jobs = lock(&self.jobs);
+        if !jobs.contains_key(job_id) {
+            return;
+        }
+        let mut markers = lock(&self.by_marker);
+        markers.insert(marker.to_string(), job_id.to_string());
     }
 
     /// The state a check reaches from its `ProbeHost`'s marker (A2).
@@ -967,6 +997,42 @@ mod tests {
         assert!(state.job_by_marker("aitm17").is_none());
         assert!(state.get("scan-02").is_some());
         assert!(state.get("scan-18").is_some());
+    }
+
+    #[test]
+    fn many_markers_resolve_to_one_job_and_die_with_it() {
+        // A `JobCtx` may mint a fresh marker on every call (F7), so one job
+        // can have one marker per host it built. All of them resolve, and
+        // eviction takes every one of them.
+        let state = LaneState::new();
+        let job = TestJob::new(1);
+        let held = state.job_for(&job);
+
+        state.register_marker("mint-a", job.job_id());
+        state.register_marker("mint-b", job.job_id());
+
+        for marker in ["aitm01", "mint-a", "mint-b"] {
+            let found = state
+                .job_by_marker(marker)
+                .unwrap_or_else(|| panic!("`{marker}` resolves to the job"));
+            assert!(Arc::ptr_eq(&found, &held), "`{marker}` is the same state");
+        }
+
+        // A marker for a job this state never held is not recorded.
+        state.register_marker("mint-c", "scan-99");
+        assert!(state.job_by_marker("mint-c").is_none());
+
+        // Evicting the job takes every marker pointing at it.
+        for n in 2..18 {
+            state.job_for(&TestJob::new(n));
+        }
+        assert!(state.get("scan-01").is_none(), "the oldest job was evicted");
+        for marker in ["aitm01", "mint-a", "mint-b"] {
+            assert!(
+                state.job_by_marker(marker).is_none(),
+                "`{marker}` outlived its job"
+            );
+        }
     }
 
     #[test]

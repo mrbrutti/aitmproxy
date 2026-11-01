@@ -175,8 +175,15 @@ pub struct StreamHost {
     pub(crate) point: DiscoveredPoint,
     /// The grammar selected for the endpoint.
     pub(crate) grammar: Arc<dyn Grammar>,
-    /// The job: budget, deadline, cancellation, profile, marker.
+    /// The job: budget, deadline, cancellation, profile.
     pub(crate) job: Arc<dyn JobCtx>,
+    /// The marker this host was built with, constant for its life (F7).
+    ///
+    /// Not `job.marker()`: the engine's `JobCtx` mints a fresh token on every
+    /// call, so asking it twice gives two different answers and a check would
+    /// never find its job state. The lane registers this value in
+    /// [`crate::state::LaneState`] when the host is built.
+    pub(crate) marker: String,
     /// The job's lane state: counters, pacer, semaphore, latency window.
     pub(crate) state: Arc<JobState>,
     /// The L4 guard, or `None` when L4 is disabled (call A18).
@@ -217,6 +224,7 @@ impl StreamHost {
         point: DiscoveredPoint,
         grammar: Arc<dyn Grammar>,
         job: Arc<dyn JobCtx>,
+        marker: String,
         state: Arc<JobState>,
         guard: Option<Arc<L4Guard>>,
         client: Arc<dyn StreamClient>,
@@ -225,6 +233,7 @@ impl StreamHost {
             point,
             grammar,
             job,
+            marker,
             state,
             guard,
             client,
@@ -720,7 +729,7 @@ impl ProbeHost for StreamHost {
     }
 
     fn marker(&self) -> String {
-        self.job.marker()
+        self.marker.clone()
     }
 
     fn budget_left(&self) -> u32 {
@@ -982,6 +991,7 @@ mod tests {
             discovered(ep),
             grammar::by_kind(GrammarKind::Resp),
             Arc::clone(job) as Arc<dyn JobCtx>,
+            job.marker(),
             state,
             guard,
             client,
@@ -1007,6 +1017,7 @@ mod tests {
             point,
             grammar,
             Arc::clone(job) as Arc<dyn JobCtx>,
+            job.marker(),
             state,
             Some(loopback_guard()),
             Arc::clone(client) as Arc<dyn StreamClient>,

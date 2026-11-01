@@ -1328,3 +1328,161 @@ async fn a_target_that_never_recovers_is_warned() {
     );
     assert!(warned[0].contains("job=22down"), "{}", warned[0]);
 }
+
+// ---------------------------------------------------------------------------
+// F7: a `JobCtx` whose `marker()` mints a fresh token on every call
+// ---------------------------------------------------------------------------
+
+/// A `JobCtx` whose `marker()` is a **generator**: every call hands back a
+/// token nobody has seen before, which is what the engine's real `JobCtx`
+/// does (it mints one per call so a check can recognise its own payload).
+///
+/// The lane may not assume a job's marker is stable. Everything else is the
+/// shared [`TestJob`] double.
+struct MintingJob {
+    inner: TestJob,
+    minted: AtomicU32,
+}
+
+impl MintingJob {
+    fn new(profile: ScanProfile, job_id: &str) -> MintingJob {
+        MintingJob {
+            inner: TestJob::new(profile).with_job_id(job_id),
+            minted: AtomicU32::new(0),
+        }
+    }
+
+    /// How many distinct markers this job has handed out.
+    fn minted(&self) -> u32 {
+        self.minted.load(Ordering::SeqCst)
+    }
+}
+
+impl JobCtx for MintingJob {
+    fn job_id(&self) -> &str {
+        self.inner.job_id()
+    }
+
+    fn profile(&self) -> &ScanProfile {
+        self.inner.profile()
+    }
+
+    fn client(&self) -> Arc<dyn aitm_core::ProxyClient> {
+        self.inner.client()
+    }
+
+    fn store(&self) -> Arc<dyn aitm_core::FlowStore> {
+        self.inner.store()
+    }
+
+    fn guard(&self) -> Arc<dyn aitm_core::ScopeRateGuard> {
+        self.inner.guard()
+    }
+
+    fn browser(&self) -> Option<Arc<dyn aitm_core::BrowserDriver>> {
+        self.inner.browser()
+    }
+
+    fn session(&self) -> Option<Arc<aitm_scan_model::SessionMaterial>> {
+        self.inner.session()
+    }
+
+    fn charge(&self, units: u32) -> bool {
+        self.inner.charge(units)
+    }
+
+    fn budget_left(&self) -> u32 {
+        self.inner.budget_left()
+    }
+
+    fn deadline(&self) -> Instant {
+        self.inner.deadline()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn marker(&self) -> String {
+        format!(
+            "aitm{n:08x}",
+            n = self.minted.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+}
+
+/// A job that mints a fresh marker per call still reaches its own job state
+/// (spec S5.1 amendment A2, S5.5): the host carries the marker it was built
+/// with, so all three checks run the campaign instead of erroring out with
+/// "no job state for this host".
+///
+/// A dry run is the cleanest proof the campaign really ran: it needs no
+/// socket, so a verdict of `Inconclusive` with a `dry run:` detail can only
+/// come from a campaign that found its job state.
+#[tokio::test]
+async fn a_minting_marker_still_reaches_its_job_state() {
+    let mut profile = profile_for("127.0.0.1", UNBOUND, Some("raw"), 20, &hex_seeds(&[b"abc"]));
+    profile.l4.dry_run = true;
+
+    let target = profile.target.clone();
+    let client = Arc::new(CountingClient::dry_run());
+    let lane = lane_with_client(
+        Some(common::wildcard_guard(&[UNBOUND])),
+        None,
+        Arc::clone(&client) as Arc<dyn StreamClient>,
+    );
+    let minting = Arc::new(MintingJob::new(profile, "22mint"));
+    let job: Arc<dyn JobCtx> = Arc::clone(&minting) as Arc<dyn JobCtx>;
+
+    let discovery = lane
+        .discover(&target, job.as_ref())
+        .await
+        .expect("discovery over a scoped loopback endpoint opens no socket");
+    assert_eq!(discovery.points.len(), 1, "one `raw` seed is one point");
+    let point = &discovery.points[0];
+
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts probes for a point it discovered");
+
+    for id in ["l4-crash", "l4-parser-fault", "l4-latency-outlier"] {
+        let verdict = check_by_id(&lane.checks(), id)
+            .run(point, host.as_ref())
+            .await;
+        assert_ne!(
+            verdict.detail, "l4_stream: no job state for this host",
+            "`{id}` lost its job state"
+        );
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Inconclusive,
+            "`{id}`: {}",
+            verdict.detail
+        );
+        assert!(
+            verdict.detail.starts_with("dry run:"),
+            "`{id}`: {}",
+            verdict.detail
+        );
+        if id == "l4-crash" {
+            assert!(
+                verdict.detail.starts_with("dry run: 20 cases"),
+                "the crash check renders the schedule: {}",
+                verdict.detail
+            );
+        }
+    }
+
+    // The host's marker is the one it was built with, not a fresh mint.
+    let first = host.marker();
+    assert_eq!(host.marker(), first, "the host's marker never changes");
+
+    // The job really is a generator: it minted a new token every time it was
+    // asked, so a stable `JobCtx` is not what made this pass.
+    assert!(
+        minting.minted() > 1,
+        "the job double handed out {} markers",
+        minting.minted()
+    );
+    assert_eq!(client.count(), 0, "a dry run opens no exchange");
+}

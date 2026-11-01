@@ -600,6 +600,7 @@ async fn no_bytes_in_logs_or_debug() {
         dp.clone(),
         Arc::clone(&grammar),
         Arc::clone(&run.job),
+        run.job.marker(),
         Arc::clone(&state),
         None,
         Arc::clone(&run.client) as Arc<dyn StreamClient>,
