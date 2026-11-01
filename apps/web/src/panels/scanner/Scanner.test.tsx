@@ -89,6 +89,27 @@ describe('Scanner shell', () => {
     expect(h.tabCount('issues')).toBe('2');
   });
 
+  it('no_duplicate_bootstrap_reads (PA11): the shell and the views join the store’s reads instead of repeating them', async () => {
+    const h = mount();
+    await tick();
+    // Profiles is the default tab: the shell’s mount effect and the Profiles view both want the list
+    // and the catalogue, and the store’s own bootstrap already asked. One verb each.
+    expect(h.count('scan.profile.list')).toBe(1);
+    expect(h.count('scan.checks')).toBe(1);
+    expect(h.count('scan.list')).toBe(1);
+    expect(h.count('l4.scope.list')).toBe(1);
+
+    for (let i = 0; i < 2; i++) {
+      fireEvent.click(h.tab('jobs'));
+      await tick();
+      fireEvent.click(h.tab('profiles'));
+      await tick();
+    }
+    expect(h.count('scan.profile.list')).toBe(1);
+    expect(h.count('scan.checks')).toBe(1);
+    expect(h.count('l4.scope.list')).toBe(1);
+  });
+
   it('state_survives_unmount: tab, selection and polling outlive the panel', async () => {
     const h = mount();
     await tick();

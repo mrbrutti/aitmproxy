@@ -1,8 +1,8 @@
 // W-18: the v2 Scan stylesheet uses design tokens only. These tests read the CSS file itself with
 // `node:fs` (vitest blanks every `.css` import, `?raw` included, so the text is only reachable from
 // disk) and fail the moment a hard-coded colour or a stray severity hue lands.
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
@@ -105,6 +105,10 @@ const REQUIRED = [
   'footer',
   'kv',
   'table',
+  'jobRow',
+  'detailHead',
+  'fieldset',
+  'idList',
 ];
 
 describe('scanner.module.css (W-18 design tokens only)', () => {
@@ -170,5 +174,42 @@ describe('scanner.module.css (W-18 design tokens only)', () => {
     for (const b of loading) {
       expect(b.body, b.selector).not.toMatch(/animation|transition/);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ no `node:` in the app bundle */
+
+const SRC_ROOT = resolve(__dirname, '../..');
+
+/** Every `.ts`/`.tsx` under `src/` that is not a test file, a test kit or an ambient declaration. */
+function sourceFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    let children: string[] | null = null;
+    try {
+      children = readdirSync(path);
+    } catch {
+      children = null; // ENOTDIR: a file
+    }
+    if (children !== null) {
+      out.push(...sourceFiles(path));
+      continue;
+    }
+    if (!/\.tsx?$/.test(name)) continue;
+    if (/\.test\.tsx?$/.test(name) || /\.d\.ts$/.test(name) || /\.testkit\.tsx?$/.test(name) || name === 'testkit.ts') continue;
+    out.push(path);
+  }
+  return out;
+}
+
+describe('the app bundle never imports node: modules (plan PA1)', () => {
+  it('no non-test file under src/ imports from node:', () => {
+    const files = sourceFiles(SRC_ROOT);
+    // The walk is real: the scanner views are in it, the tests are not.
+    expect(files.some((f) => f.endsWith('/panels/scanner/JobsView.tsx'))).toBe(true);
+    expect(files.some((f) => /\.test\.tsx?$/.test(f))).toBe(false);
+    const offenders = files.filter((f) => /from\s+['"]node:|require\(\s*['"]node:/.test(readFileSync(f, 'utf8')));
+    expect(offenders).toEqual([]);
   });
 });

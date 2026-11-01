@@ -38,14 +38,15 @@ export const Scanner: Component = () => {
   const s = scanStore(app);
   const busOpen = (): boolean => s.busOpen();
 
-  // Read what the surface needs the first time the panel mounts (the store's own bootstrap may have
-  // read some already, hence the loaded guards). Checks and the L4 scope have no store bootstrap, so
-  // they are read here; each call is a no-op unless the bus is open on a v2 core.
+  // Read what the surface needs the first time the panel mounts. The memoised `ensure*` (A3, PA11)
+  // join a read the store's bootstrap already has in flight and do nothing once loaded, so this
+  // mount and a view mounting in the same tick cost one verb each; each is a no-op unless the bus is
+  // open on a v2 core. The bare `load*` are for Retry only.
   onMount(() => {
-    if (!s.profilesLoaded()) void s.loadProfiles();
-    if (!s.checksLoaded()) void s.loadChecks();
-    if (!s.jobsLoaded()) void s.refreshJobs();
-    if (s.l4Offered()) void s.loadL4Scope();
+    void s.ensureProfiles();
+    void s.ensureChecks();
+    void s.ensureJobs();
+    if (s.l4Offered()) void s.ensureL4Scope();
   });
 
   /** The count shown beside each tab (D-T8.2): profiles, live/total jobs, nodes, issues by severity. */

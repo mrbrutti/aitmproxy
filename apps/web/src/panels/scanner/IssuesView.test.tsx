@@ -252,6 +252,19 @@ describe('IssueDetail', () => {
     expect(Array.from(diff.querySelectorAll('td')).map((td) => td.textContent)).toEqual(['100', '100', '7']);
   });
 
+  it('jobs_list (PA10): the detail lists every job that found the issue, the first finder first', async () => {
+    const h = await mount();
+    await waitFor(() => expect(options()).toHaveLength(2));
+    const region = await openDetail(XSS);
+    // The fixture carries no `jobs`: the list falls back to the one job the issue belongs to.
+    const items = () => Array.from(within(region).getByRole('list', { name: 'Found by jobs' }).querySelectorAll('li')).map((li) => li.textContent);
+    expect(items()).toEqual([JOB]);
+
+    h.reply('scan.issue', { ...raw('scan.issue.json'), jobs: [JOB, 'scan-9e8d7c6b'] });
+    await h.s.loadIssue(XSS);
+    await waitFor(() => expect(items()).toEqual([JOB, 'scan-9e8d7c6b']));
+  });
+
   it('open_flow_and_poc: a probe flow is the app selection; the PoC ref opens Findings', async () => {
     const h = await mount({ findings: [pocRun('poc-3b1c')] });
     await waitFor(() => expect(options()).toHaveLength(2));

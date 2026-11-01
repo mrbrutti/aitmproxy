@@ -153,16 +153,19 @@ describe('JobsView: detail texts (W-14)', () => {
     expect(h.field(h.row(JOB), 'state')).toBe('failed');
   });
 
-  it('crawl_errors: the Crawl section prints crawl.errors, and 0 as `0` rather than a dash', async () => {
+  it('crawl_facts (PA6): the Crawl section prints crawl.errors and crawl.forms_skipped, 0 as `0` rather than a dash', async () => {
     const h = mount();
     await tick();
+    // The fixture carries neither field: both default to 0 and print as `0`.
     expect(h.field(h.detail(), 'crawl-errors')).toBe('0');
+    expect(h.field(h.detail(), 'crawl-forms-skipped')).toBe('0');
 
     const raw = statusFixture();
     const crawl = raw.crawl as Record<string, unknown>;
-    h.reply('scan.status', { ...raw, crawl: { ...crawl, errors: 2 } });
+    h.reply('scan.status', { ...raw, crawl: { ...crawl, errors: 2, forms_skipped: 1 } });
     await h.s.refreshStatus(JOB);
     expect(h.field(h.detail(), 'crawl-errors')).toBe('2');
+    expect(h.field(h.detail(), 'crawl-forms-skipped')).toBe('1');
   });
 
   it('start_notice: the after-start notice lists clamped, skipped lanes, and can be dismissed', async () => {
@@ -228,6 +231,47 @@ describe('JobsView: live values', () => {
     expect(h.field(h.row(JOB), 'state')).toBe('cancelling · auditing');
     expect(h.row(JOB).getAttribute('data-state')).toBe('cancelling');
     expect(h.field(h.strip(), 'state')).toBe('cancelling · auditing');
+  });
+});
+
+describe('JobsView: per-job errors (PA4, PA5)', () => {
+  it('status_error_block: a failed scan.status read shows its text in the detail with a Retry that reads again', async () => {
+    const h = mount();
+    await tick();
+    expect(h.detail().querySelector(`.${css.errorBlock}`)).toBeNull();
+
+    h.fail('scan.status', 'scan: not_found: scan-1a2b3c4d');
+    await h.s.refreshStatus(JOB);
+    const block = h.detail().querySelector(`.${css.errorBlock}`);
+    expect(block).not.toBeNull();
+    expect(block!.textContent).toContain('scan: not_found');
+    // The block sits above the facts: the operator reads why the counters stopped before the counters.
+    const detailText = h.detail().textContent ?? '';
+    expect(detailText.indexOf('scan: not_found')).toBeLessThan(detailText.indexOf('Overview'));
+    // Data kept: the held status still renders behind the block.
+    expect(h.detail().textContent).toContain('operator · web-ui');
+
+    const before = h.count('scan.status');
+    h.reply('scan.status', statusFixture());
+    fireEvent.click(within(block as HTMLElement).getByRole('button', { name: 'Retry' }));
+    await tick();
+    expect(h.count('scan.status')).toBe(before + 1);
+    expect(h.detail().querySelector(`.${css.errorBlock}`)).toBeNull();
+  });
+
+  it('cancel_failure_renders: a refused scan.cancel shows the core’s text in the Jobs view', async () => {
+    const h = mount();
+    await tick();
+    h.fail('scan.cancel', 'scan: not_found: scan-1a2b3c4d');
+    fireEvent.click(within(h.detail()).getByRole('button', { name: `Cancel scan ${JOB}` }));
+    await tick();
+    expect(h.argsOf('scan.cancel')[0]).toEqual({ job: JOB });
+    const line = h.detail().querySelector('[data-error="cancel"]');
+    expect(line).not.toBeNull();
+    expect(line!.textContent).toBe('Not found: scan-1a2b3c4d');
+    expect(h.notice).toHaveBeenCalledWith('Not found: scan-1a2b3c4d', 'error');
+    // The row keeps what the list said: a refused cancel changes no counter.
+    expect(h.field(h.row(JOB), 'state')).toBe('running · auditing');
   });
 });
 

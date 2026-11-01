@@ -6,24 +6,35 @@
 // loads it (`store.loadProfile` never overwrites a draft in progress), and `standard` is selected
 // once, the first time a list arrives, so the surface opens on something runnable.
 
-import { createEffect, createMemo, For, Match, onMount, Show, Switch, untrack, type Component } from 'solid-js';
-import { Button } from '~/components';
+import { createEffect, createMemo, createSignal, For, Match, onMount, Show, Switch, untrack, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import { ProfileEditor } from './ProfileEditor';
+import { ErrorBlock, listboxKeys, LoadingBars } from './primitives';
 import { scanStore } from './store';
 import type { ProfileListEntry } from './model';
 import css from './scanner.module.css';
+
+/** A row's DOM id: looked up with `getElementById`, so a wire profile name is never part of a selector. */
+const domId = (name: string): string => `profile-${name}`;
 
 export const ProfilesView: Component = () => {
   const app = useApp();
   const s = scanStore(app);
 
   // The editor needs all three: the list, the check catalogue (the tree and the lane tags) and the
-  // L4 scope (the pre-flight reason). Each is a no-op unless the bus is open on a v2 core.
+  // L4 scope (the pre-flight reason). The memoised `ensure*` join a read in flight and do nothing
+  // once loaded (A3): mounting beside the shell costs no second verb. Retry below uses the bare `load`.
   onMount(() => {
-    void s.loadProfiles();
-    void s.loadChecks();
-    void s.loadL4Scope();
+    void s.ensureProfiles();
+    void s.ensureChecks();
+    void s.ensureL4Scope();
+  });
+
+  // "Last good": when this view last saw the list answer without an error (D-T8.10).
+  const [lastGood, setLastGood] = createSignal<number | null>(null);
+  createEffect(() => {
+    s.profiles();
+    if (s.profilesLoaded() && s.profilesError() === null) setLastGood(Date.now());
   });
 
   /** Built-ins first, then saved; first-seen order inside each group (the sort is stable). */
@@ -33,10 +44,9 @@ export const ProfilesView: Component = () => {
 
   let detail: HTMLDivElement | undefined;
 
-  const select = (name: string, fromKeyboard = false): void => {
+  const select = (name: string): void => {
     s.setSelectedProfile(name);
     void s.loadProfile(name);
-    if (fromKeyboard) document.querySelector(`[data-profile="${name}"]`)?.scrollIntoView?.({ block: 'nearest' });
   };
 
   // Default selection `standard` (D-T8.5), set once on the first list that arrives so a later
@@ -53,39 +63,13 @@ export const ProfilesView: Component = () => {
     });
   });
 
-  const move = (delta: number): void => {
-    const list = rows();
-    if (list.length === 0) return;
-    const at = list.findIndex((e) => e.name === s.selectedProfile());
-    const next = at < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, at + delta));
-    select(list[next]!.name, true);
-  };
-
-  const onKeyDown = (e: KeyboardEvent): void => {
-    const list = rows();
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        move(1);
-        break;
-      case 'ArrowUp':
-        e.preventDefault();
-        move(-1);
-        break;
-      case 'Home':
-        e.preventDefault();
-        if (list.length) select(list[0]!.name, true);
-        break;
-      case 'End':
-        e.preventDefault();
-        if (list.length) select(list[list.length - 1]!.name, true);
-        break;
-      case 'Enter':
-        e.preventDefault();
-        detail?.focus({ preventScroll: true });
-        break;
-    }
-  };
+  const onKeyDown = listboxKeys({
+    ids: () => rows().map((e) => e.name),
+    selectedId: () => s.selectedProfile(),
+    select,
+    focusDetail: () => detail?.focus({ preventScroll: true }),
+    domId,
+  });
 
   return (
     <div class={css.layout}>
@@ -95,26 +79,15 @@ export const ProfilesView: Component = () => {
             Profiles <span class={css.n}>{rows().length}</span>
           </span>
         </div>
+        {/* A failed reload keeps the rows (data kept, D-T8.10): the block sits above them. */}
+        <Show when={s.profilesLoaded() && s.profilesError()}>
+          {(error) => <ErrorBlock text={error()} lastGood={lastGood()} onRetry={() => void s.loadProfiles()} disabled={!s.busOpen()} />}
+        </Show>
         <Switch>
           <Match when={!s.profilesLoaded()}>
-            <div class={css.loading} aria-label="Loading profiles">
-              <i />
-              <i />
-              <i />
-              <i />
-            </div>
+            <LoadingBars label="Loading profiles" />
           </Match>
-          <Match when={s.profilesError()}>
-            {(error) => (
-              <div class={css.errorBlock} role="alert">
-                <p>{error()}</p>
-                <Button class={css.retry} variant="outline" disabled={!s.busOpen()} onClick={() => void s.loadProfiles()}>
-                  Retry
-                </Button>
-              </div>
-            )}
-          </Match>
-          <Match when={rows().length === 0}>
+          <Match when={rows().length === 0 && s.profilesError() === null}>
             <div class={css.empty} role="status" aria-label="Profiles">
               No profiles
             </div>
@@ -124,6 +97,7 @@ export const ProfilesView: Component = () => {
               <For each={rows()}>
                 {(entry) => (
                   <div
+                    id={domId(entry.name)}
                     class={css.row}
                     role="option"
                     data-profile={entry.name}

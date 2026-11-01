@@ -71,7 +71,8 @@ describe('tester: parseJobStatus against a hostile reply', () => {
     expect(parsed!.probes.sent).toBe(0);
     expect(parsed!.probes.budget).toBe(0);
     expect(parsed!.probes.errors).toBe(0);
-    expect(parsed!.elapsed_ms).toBe(-1);
+    // A negative counter is not a counter: it clamps to 0 at the parser, so nothing downstream sees it.
+    expect(parsed!.elapsed_ms).toBe(0);
     expect(fmtElapsed(parsed!.elapsed_ms)).toBe('0:00');
   });
 
@@ -392,7 +393,9 @@ describe('tester: store against a hostile profile.delete reply', () => {
 
     stub.reply('scan.profile.delete', { nope: 1 });
     expect(await s.deleteProfile('my-api')).toBe(false);
-    expect(s.lastError()).toBe('scan.profile.delete answered with an unexpected shape');
+    expect(s.lastError()!.text).toBe('scan.profile.delete answered with an unexpected shape');
+    expect(s.lastError()!.source).toBe('delete');
+    expect(s.lastError()!.code).toBeNull();
     expect(stub.notice).toHaveBeenCalledWith('scan.profile.delete answered with an unexpected shape', 'error');
 
     stub.reply('scan.profile.delete', { deleted: false });

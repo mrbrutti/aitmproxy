@@ -829,6 +829,14 @@
   padding: 0;
   list-style: none;
 }
+/* A list of ids inside a fact (`Found by jobs`): no bullets, one id per line. */
+.idList {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
 .tree .tree {
   padding-left: var(--space-4);
 }

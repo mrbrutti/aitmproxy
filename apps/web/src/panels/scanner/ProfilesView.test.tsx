@@ -9,7 +9,7 @@
 // The replies come from `crates/aitm-scan-model/fixtures/` through `stubApp`: wire *shapes*, never
 // evidence. A green run here says the editor holds the contract, not that any scan ever ran
 // (fixtures/README.md). The acceptance for this track is `scripts/scan-live.mjs` against a real core.
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@solidjs/testing-library';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -126,6 +126,55 @@ describe('ProfilesView: the list (D-T8.5, D-T8.10)', () => {
     await waitFor(() => expect(selected()).toBe('passive-only'));
     fireEvent.keyDown(list, { key: 'End' });
     await waitFor(() => expect(selected()).toBe('l4-full'));
+  });
+
+  it('weird_name_keyboard (B3): a profile name with quote and bracket renders and a keyboard move scrolls it by id', async () => {
+    const WEIRD = 'we"ird]';
+    const list = fixture('scan.profile.list.json') as { profiles: unknown[] };
+    const scroll = vi.fn();
+    const proto = Element.prototype as unknown as { scrollIntoView?: (arg?: unknown) => void };
+    const had = proto.scrollIntoView;
+    proto.scrollIntoView = scroll;
+    try {
+      const h = await mount({
+        replies: {
+          'scan.profile.list': {
+            profiles: [...list.profiles, { name: WEIRD, builtin: false, summary: { lanes: ['http'], intensity: 'medium', speed: 'normal' } }],
+          },
+        },
+      });
+      // The row is found by id, not by a selector: a name with `"` and `]` is still just a string here.
+      const row = document.getElementById(`profile-${WEIRD}`);
+      expect(row).not.toBeNull();
+      expect(row!.getAttribute('data-profile')).toBe(WEIRD);
+
+      const listbox = screen.getByRole('listbox', { name: 'Profiles' });
+      fireEvent.keyDown(listbox, { key: 'End' });
+      await waitFor(() => expect(h.s.selectedProfile()).toBe(WEIRD));
+      expect(scroll).toHaveBeenCalledTimes(1);
+      expect(scroll.mock.instances[0]).toBe(row);
+    } finally {
+      if (had) proto.scrollIntoView = had;
+      else delete proto.scrollIntoView;
+    }
+  });
+
+  it('profiles_error_last_good (B8): a failed reload keeps the rows and shows the last good time', async () => {
+    const h = await mount();
+    expect(h.container.querySelectorAll('[role=option][data-profile]')).toHaveLength(7);
+    h.fail('scan.profile.list', 'bus closed');
+    await h.s.loadProfiles();
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('bus closed');
+    expect(alert.textContent).toMatch(/last good: \d/);
+    expect(alert.textContent).not.toContain('last good: —');
+    // Data kept: the list read before the failure is still on screen, and Retry reads again.
+    expect(h.container.querySelectorAll('[role=option][data-profile]')).toHaveLength(7);
+    const before = h.count('scan.profile.list');
+    h.reply('scan.profile.list', fixture('scan.profile.list.json'));
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(h.count('scan.profile.list')).toBe(before + 1));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
   });
 
   it('No profiles keeps the frame when the core has none', async () => {
@@ -302,6 +351,75 @@ describe('ProfileEditor: the launch handshake (D-T8.6)', () => {
   });
 });
 
+describe('ProfileEditor: errors it does not own (PA5)', () => {
+  it('profile_error_block_is_separate: an issue-update failure never shows in the editor', async () => {
+    const h = await mount();
+    h.fail('scan.issue.update', 'scan: not_found: x');
+    expect(await h.s.updateIssue('issue-x', 'confirmed')).toBeNull();
+    expect(h.s.lastError()).toEqual({ source: 'issue', code: 'not_found', text: 'Not found: x' });
+    // The toast went out; the editor shows no error text of any kind.
+    expect(h.notice).toHaveBeenCalledWith('Not found: x', 'error');
+    expect(screen.queryByRole('status', { name: 'Launch result' })).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('form', { name: 'Profile editor' }).textContent).not.toContain('Not found');
+    // The editor is still bound and usable.
+    expect((screen.getByLabelText('Profile name') as HTMLInputElement).value).toBe('standard');
+  });
+});
+
+describe('ProfileEditor: per-profile local state (PA9)', () => {
+  it('per_profile_reset: a preview, a half-typed L4 target and a typed port never follow the operator to another profile', async () => {
+    const h = await mount({
+      replies: { 'scan.profile.get': (args: Record<string, unknown>) => ({ ...(fixture('scan.profile.get.json') as object), name: args.name }) },
+    });
+    const nameInput = () => screen.getByLabelText('Profile name') as HTMLInputElement;
+    const pick = async (name: string) => {
+      fireEvent.click(h.container.querySelector<HTMLElement>(`[data-profile="${name}"]`)!);
+      await waitFor(() => expect(nameInput().value).toBe(name));
+    };
+    // Both drafts are loaded first, so a later switch between them has no loading gap that would
+    // unmount the editor by accident: the reset must come from keying the editor on the profile.
+    await pick('thorough');
+    await pick('standard');
+    expect(h.s.draft('thorough')).not.toBeNull();
+
+    // A preview on `standard` ...
+    addOrigin('http', '127.0.0.1', '8080');
+    await waitFor(() => expect(screen.getByRole('list', { name: 'Origins' }).textContent).toContain('http://127.0.0.1:8080'));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview session for http://127.0.0.1:8080' }));
+    await waitFor(() => expect(h.container.querySelector('[data-preview]')).not.toBeNull());
+    // ... is gone on `thorough`.
+    await pick('thorough');
+    expect(h.container.querySelector('[data-preview]')).toBeNull();
+
+    // A half-typed L4 target and a typed port on `thorough` do not land in `standard`'s pickers.
+    fireEvent.input(screen.getByLabelText('L4 target IP'), { target: { value: '10.0.0' } });
+    fireEvent.input(screen.getByLabelText('Origin port'), { target: { value: '9' } });
+    expect((screen.getByLabelText('L4 target IP') as HTMLInputElement).value).toBe('10.0.0');
+    expect((screen.getByLabelText('Origin port') as HTMLInputElement).value).toBe('9');
+    await pick('standard');
+    expect((screen.getByLabelText('L4 target IP') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('Origin port') as HTMLInputElement).value).toBe('');
+    // The draft itself is kept: the origin added on `standard` is still there.
+    expect(screen.getByRole('list', { name: 'Origins' }).textContent).toContain('http://127.0.0.1:8080');
+  });
+
+  it('picker_rejects_unknown: a select value outside the options is ignored, never cast into the draft', async () => {
+    await mount();
+    toggleLane('l4_stream');
+    fireEvent.input(screen.getByLabelText('L4 target IP'), { target: { value: '127.0.0.1' } });
+    fireEvent.input(screen.getByLabelText('L4 target port'), { target: { value: '9' } });
+    fireEvent.change(screen.getByLabelText('L4 target proto'), { target: { value: 'bogus' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add L4 target' }));
+    const row = await waitFor(() => {
+      const el = screen.getByRole('list', { name: 'L4 targets' }).querySelector('[data-l4="127.0.0.1:9"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(row.textContent).toContain('tcp');
+  });
+});
+
 describe('ProfileEditor: a closed bus (D-T8.10)', () => {
   it('reconnecting_disables_editor: every control is off and a note says so; open re-enables Start', async () => {
     const h = await mount();
@@ -383,6 +501,9 @@ describe('ProfileEditor: save, delete and session preview (D-T8.5, W-12, W-13)',
     fireEvent.click(save());
     await waitFor(() => expect(h.argsOf('scan.profile.save')).toHaveLength(1));
     expect((h.argsOf('scan.profile.save')[0]!.profile as ScanProfile).name).toBe('my-api');
+    // The save re-reads the list before it settles; `Confirm delete` below is disabled while any
+    // guarded call is in flight, so wait for the save to finish rather than racing its microtasks.
+    await waitFor(() => expect(h.s.busy()).toBe(false));
 
     const saved = await waitFor(() => {
       const row = h.container.querySelector<HTMLElement>('[data-profile="my-api"]');

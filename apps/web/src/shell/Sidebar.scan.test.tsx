@@ -38,21 +38,29 @@ const SCAN_V2_VERBS = [
   'scan.session.preview',
 ];
 const DISCOVER: ToolDef = { name: 'scan.discover', description: 'v1 discover', inputSchema: { type: 'object' } };
+const tool = (name: string): ToolDef => ({ name, description: `${name} (scan test)`, inputSchema: { type: 'object' } });
 
 const mounted: { app: AppStore; close: () => void }[] = [];
 
-/** A bridge bus with the scan catalogue trimmed/extended and `scan.list` optionally answered by hand. */
+/**
+ * The bridge bus serves no `scan.*` verb of its own (`bridgeBus.testkit.ts` answers the flow-list
+ * suites' tools only), so the scan catalogue and its replies are added here: the fifteen v2 verbs
+ * minus `hide`, answered from the `crates/aitm-scan-model/fixtures/` shapes, `scan.list` optionally
+ * by hand. `scan.discover` is appended on request.
+ */
 function mount(opts: { hide?: string[]; addDiscover?: boolean; list?: unknown } = {}) {
   const base = bridgeBus();
-  for (const t of opts.hide ?? []) base.ctl.hideTools.add(t);
+  const hidden = new Set(opts.hide ?? []);
+  const scanTools = SCAN_V2_VERBS.filter((v) => !hidden.has(v)).map(tool);
   const bus: BusClient = {
     ...base,
     async tools() {
       const all = await base.tools();
-      return opts.addDiscover ? [...all, DISCOVER] : all;
+      return [...all, ...scanTools, ...(opts.addDiscover ? [DISCOVER] : [])];
     },
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
       if (tool === 'scan.list' && opts.list !== undefined) return opts.list as T;
+      if (SCAN_V2_VERBS.includes(tool)) return fixture(`${tool}.json`) as T;
       return base.call<T>(tool, args);
     },
   };

@@ -17,13 +17,11 @@ import { methodHue } from '~/model/flow';
 import { useApp } from '~/state/context';
 import { nodesByHost } from './helpers';
 import type { InsertionPoint, SiteNode } from './model';
+import { Dash, ErrorBlock, listboxKeys, LoadingBars, ReconnectNote } from './primitives';
 import { scanStore } from './store';
 import css from './scanner.module.css';
 
-/** Missing prints as a grey dash (foundation §2.8); zero prints as `0`. */
-const Dash: Component = () => <span class={css.dash}>—</span>;
-
-const fmtTime = (ms: number): string => new Date(ms).toLocaleTimeString();
+const domId = (id: string): string => `sitemap-node-${id}`;
 
 /** `method url` from the two nullable halves; a dash only when both are missing. */
 function requestText(p: InsertionPoint): string | null {
@@ -86,41 +84,17 @@ export const SitemapView: Component = () => {
 
   let detailEl: HTMLDivElement | undefined;
 
-  const select = (id: string, fromKeyboard = false) => {
-    s.setSelectedNode(id);
-    if (fromKeyboard) document.getElementById(`sitemap-node-${id}`)?.scrollIntoView?.({ block: 'nearest' });
+  const activeId = (): string | undefined => {
+    const id = s.selectedNode();
+    return id === null ? undefined : domId(id);
   };
-  const move = (delta: number) => {
-    const list = ordered();
-    if (!list.length) return;
-    const i = list.findIndex((n) => n.id === s.selectedNode());
-    const next = i < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, i + delta));
-    select(list[next]!.id, true);
-  };
-  const onKeyDown = (e: KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        move(1);
-        break;
-      case 'ArrowUp':
-        e.preventDefault();
-        move(-1);
-        break;
-      case 'Home':
-        e.preventDefault();
-        if (ordered().length) select(ordered()[0]!.id, true);
-        break;
-      case 'End':
-        e.preventDefault();
-        if (ordered().length) select(ordered()[ordered().length - 1]!.id, true);
-        break;
-      case 'Enter':
-        e.preventDefault();
-        detailEl?.focus({ preventScroll: true });
-        break;
-    }
-  };
+  const onKeyDown = listboxKeys({
+    ids: () => ordered().map((n) => n.id),
+    selectedId: () => s.selectedNode(),
+    select: (id) => s.setSelectedNode(id),
+    focusDetail: () => detailEl?.focus({ preventScroll: true }),
+    domId,
+  });
 
   const hue = (method: string) => methodHue({ method, kind: 'http' });
 
@@ -136,9 +110,7 @@ export const SitemapView: Component = () => {
             <span class={css.n}>· {ordered().length}</span>
           </span>
           <Show when={disabled()}>
-            <span class={css.reconnectNote} role="status">
-              reconnecting: controls paused
-            </span>
+            <ReconnectNote />
           </Show>
           <Show when={hasMore()}>
             <Button variant="small" disabled={disabled() || page()?.loading === true} onClick={loadMore}>
@@ -152,24 +124,11 @@ export const SitemapView: Component = () => {
             when={page()?.error}
             fallback={
               <Show when={loading()}>
-                <div class={css.loading} aria-busy="true" aria-label="Loading site map">
-                  <i />
-                  <i />
-                  <i />
-                  <i />
-                </div>
+                <LoadingBars label="Loading site map" />
               </Show>
             }
           >
-            {(err) => (
-              <div class={css.errorBlock} role="alert">
-                <p>{err()}</p>
-                <Show when={page()?.loadedAt}>{(at) => <span class={css.mono}>last good {fmtTime(at())}</span>}</Show>
-                <Button variant="small" class={css.retry} disabled={disabled()} onClick={retry}>
-                  Retry
-                </Button>
-              </div>
-            )}
+            {(err) => <ErrorBlock text={err()} lastGood={page()?.loadedAt ?? null} onRetry={retry} disabled={disabled()} />}
           </Show>
         </div>
         <div
@@ -177,7 +136,7 @@ export const SitemapView: Component = () => {
           role="listbox"
           aria-label="Site map"
           tabIndex={0}
-          aria-activedescendant={s.selectedNode() ? `sitemap-node-${s.selectedNode()}` : undefined}
+          aria-activedescendant={activeId()}
           onKeyDown={onKeyDown}
         >
           <Show when={job() !== null} fallback={<div class={css.empty}>No jobs yet: start one from Profiles</div>}>
@@ -193,12 +152,12 @@ export const SitemapView: Component = () => {
                   <For each={g.nodes}>
                     {(n) => (
                       <div
-                        id={`sitemap-node-${n.id}`}
+                        id={domId(n.id)}
                         class={css.row}
                         role="option"
                         data-node={n.id}
                         aria-selected={s.selectedNode() === n.id}
-                        onClick={() => select(n.id)}
+                        onClick={() => s.setSelectedNode(n.id)}
                       >
                         <div class={css.rowMain}>
                           <Badge hue={hue(n.method)}>{n.method}</Badge>

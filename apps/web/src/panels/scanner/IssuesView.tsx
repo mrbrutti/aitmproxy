@@ -12,14 +12,16 @@
 
 import { createEffect, createMemo, For, on, onCleanup, Show, type Component } from 'solid-js';
 import { Button } from '~/components';
-import { fmtClock } from '~/lib/format';
 import { SeverityPill } from '~/panels/findings/SeverityPill';
 import { useApp } from '~/state/context';
 import { filterIssues, groupBySeverity, type IssueFilter } from './helpers';
 import { IssueDetail } from './IssueDetail';
 import { CONFIDENCES, ISSUE_STATUSES, LANES, type Confidence, type IssueStatus, type IssueSummary, type Lane } from './model';
+import { ErrorBlock, listboxKeys, LoadingBars, ReconnectNote } from './primitives';
 import { scanStore } from './store';
 import css from './scanner.module.css';
+
+const domId = (id: string): string => `issue-${id}`;
 
 /** A set with one member toggled: the chips' only edit. */
 function toggled<T>(set: ReadonlySet<T>, v: T): Set<T> {
@@ -57,41 +59,18 @@ export const IssuesView: Component = () => {
 
   let layoutEl: HTMLDivElement | undefined;
 
-  const select = (id: string, fromKeyboard = false) => {
-    s.setSelectedIssue(id);
-    if (fromKeyboard) document.getElementById(`issue-${id}`)?.scrollIntoView?.({ block: 'nearest' });
+  const activeId = (): string | undefined => {
+    const id = s.selectedIssue();
+    return id === null ? undefined : domId(id);
   };
-  const move = (delta: number) => {
-    const list = filtered();
-    if (!list.length) return;
-    const i = list.findIndex((r) => r.id === s.selectedIssue());
-    const next = i < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, i + delta));
-    select(list[next]!.id, true);
-  };
-  const onKeyDown = (e: KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        move(1);
-        break;
-      case 'ArrowUp':
-        e.preventDefault();
-        move(-1);
-        break;
-      case 'Home':
-        e.preventDefault();
-        if (filtered().length) select(filtered()[0]!.id, true);
-        break;
-      case 'End':
-        e.preventDefault();
-        if (filtered().length) select(filtered()[filtered().length - 1]!.id, true);
-        break;
-      case 'Enter':
-        e.preventDefault();
-        layoutEl?.querySelector<HTMLElement>('[role="region"][aria-label="Issue detail"]')?.focus({ preventScroll: true });
-        break;
-    }
-  };
+  const onKeyDown = listboxKeys({
+    ids: () => filtered().map((r) => r.id),
+    selectedId: () => s.selectedIssue(),
+    select: (id) => s.setSelectedIssue(id),
+    focusDetail: () =>
+      layoutEl?.querySelector<HTMLElement>('[role="region"][aria-label="Issue detail"]')?.focus({ preventScroll: true }),
+    domId,
+  });
 
   return (
     <div class={css.layout} ref={layoutEl} data-empty={page().rows.length === 0 ? 'true' : undefined}>
@@ -110,9 +89,7 @@ export const IssuesView: Component = () => {
             onInput={(e) => setFilter({ text: e.currentTarget.value })}
           />
           <Show when={offline()}>
-            <span class={css.reconnectNote} role="status">
-              reconnecting…
-            </span>
+            <ReconnectNote />
           </Show>
           <Button variant="small" active={s.allJobs()} disabled={offline()} onClick={() => s.setAllJobs(!s.allJobs())}>
             All jobs
@@ -186,27 +163,14 @@ export const IssuesView: Component = () => {
           role="listbox"
           aria-label="Issues"
           tabIndex={0}
-          aria-activedescendant={s.selectedIssue() ? `issue-${s.selectedIssue()}` : undefined}
+          aria-activedescendant={activeId()}
           onKeyDown={onKeyDown}
         >
-          <Show when={page().error !== null}>
-            <div class={css.errorBlock} role="alert" data-state="error">
-              <p>{page().error}</p>
-              <span class={css.mono}>
-                last good: <Show when={page().loadedAt !== null} fallback={<span class={css.dash}>—</span>}>{fmtClock(page().loadedAt!)}</Show>
-              </span>
-              <Button variant="small" class={css.retry} disabled={offline()} onClick={() => void s.refreshIssues(scope())}>
-                Retry
-              </Button>
-            </div>
+          <Show when={page().error}>
+            {(err) => <ErrorBlock text={err()} lastGood={page().loadedAt} onRetry={() => void s.refreshIssues(scope())} disabled={offline()} />}
           </Show>
           <Show when={loadingFirst()}>
-            <div class={css.loading} aria-busy="true" aria-label="Loading issues">
-              <i />
-              <i />
-              <i />
-              <i />
-            </div>
+            <LoadingBars label="Loading issues" />
           </Show>
           <Show when={isEmpty()}>
             <div class={css.empty} role="status">
@@ -222,12 +186,12 @@ export const IssuesView: Component = () => {
                 <For each={g.rows}>
                   {(r) => (
                     <div
-                      id={`issue-${r.id}`}
+                      id={domId(r.id)}
                       data-issue={r.id}
                       class={css.row}
                       role="option"
                       aria-selected={s.selectedIssue() === r.id}
-                      onClick={() => select(r.id)}
+                      onClick={() => s.setSelectedIssue(r.id)}
                     >
                       <div class={css.rowMain}>
                         <SeverityPill severity={r.severity} />

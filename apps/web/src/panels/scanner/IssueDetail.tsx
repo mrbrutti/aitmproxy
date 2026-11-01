@@ -7,35 +7,26 @@
 // `scan.issue.update { id, status, note? }` and the reply replaces both the cached issue and the
 // row (`store.updateIssue`). Missing values print a grey dash, never an empty cell (§2.8).
 
-import { createEffect, createSignal, For, on, Show, type Component, type JSX } from 'solid-js';
+import { createEffect, createSignal, For, on, Show, type Component } from 'solid-js';
 import { Button } from '~/components';
 import { fmtClock } from '~/lib/format';
 import { SeverityPill } from '~/panels/findings/SeverityPill';
 import { useApp } from '~/state/context';
 import { ISSUE_STATUSES, type Issue, type IssueStatus, type L4Oracle } from './model';
+import { Dash, ErrorBlock, Fact, LoadingBars, yesNo } from './primitives';
 import { scanStore } from './store';
 import css from './scanner.module.css';
 
-const Dash: Component = () => <span class={css.dash}>—</span>;
-
-/** A fact's value: the text, or a dash when the core gave nothing. */
-const val = (v: string | number | null | undefined): JSX.Element =>
-  v === null || v === undefined || v === '' ? <Dash /> : <>{String(v)}</>;
-
-const yesNo = (b: boolean): string => (b ? 'yes' : 'no');
+/** A fact's value: the text, or `null` (the dash) when the core gave nothing — an empty string too. */
+const val = (v: string | number | null | undefined): string | null =>
+  v === null || v === undefined || v === '' ? null : String(v);
 
 function oracleText(o: L4Oracle): string {
   return o.kind === 'icmp' ? `icmp type ${o.type} code ${o.code}` : o.kind;
 }
 
-const Fact: Component<{ label: string; value: JSX.Element; field?: string | undefined; mono?: boolean | undefined }> = (props) => (
-  <>
-    <dt>{props.label}</dt>
-    <dd class={props.mono ? css.mono : undefined} data-field={props.field}>
-      {props.value}
-    </dd>
-  </>
-);
+/** The jobs that found or re-found the issue (A5): the engine's list, else the one it belongs to. */
+const foundBy = (i: Issue): readonly string[] => (i.jobs.length > 0 ? i.jobs : [i.job]);
 
 /** A series row of the Timing table: one cell per sample, so two series line up column by column. */
 const SeriesRow: Component<{ label: string; values: readonly number[] }> = (props) => (
@@ -75,21 +66,11 @@ export const IssueDetail: Component<{ id: string }> = (props) => {
   return (
     <div class={css.detail} role="region" aria-label="Issue detail" tabIndex={-1}>
       <div class={css.body}>
-        <Show when={error() !== null && issue() === null}>
-          <div class={css.errorBlock} role="alert" data-state="error">
-            <p>{error()}</p>
-            <Button variant="small" class={css.retry} disabled={offline()} onClick={() => void s.loadIssue(props.id)}>
-              Retry
-            </Button>
-          </div>
+        <Show when={issue() === null && error()}>
+          {(err) => <ErrorBlock text={err()} onRetry={() => void s.loadIssue(props.id)} disabled={offline()} />}
         </Show>
         <Show when={error() === null && issue() === null}>
-          <div class={css.loading} aria-busy="true" aria-label="Loading issue">
-            <i />
-            <i />
-            <i />
-            <i />
-          </div>
+          <LoadingBars label="Loading issue" />
         </Show>
         <Show when={issue()}>
           {(i) => (
@@ -291,6 +272,14 @@ export const IssueDetail: Component<{ id: string }> = (props) => {
                     }
                   />
                   <Fact label="note" value={val(i().note)} />
+                  <Fact
+                    label="found by jobs"
+                    value={
+                      <ul class={css.idList} aria-label="Found by jobs">
+                        <For each={foundBy(i())}>{(job) => <li class={css.mono}>{job}</li>}</For>
+                      </ul>
+                    }
+                  />
                 </dl>
               </section>
 

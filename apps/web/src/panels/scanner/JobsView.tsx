@@ -9,42 +9,18 @@
 // status when none is held yet (a finished job is never polled, and its detail needs the fields
 // only `scan.status` carries); that read is gated on the bus being open inside `live.ts` (W-16).
 
-import { createEffect, createMemo, createSignal, For, Match, on, Show, Switch, type Component, type JSX } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, Match, on, Show, Switch, type Component } from 'solid-js';
 import { Button } from '~/components';
 import { fmtWhenFull } from '~/panels/findings/model';
 import { useApp } from '~/state/context';
 import { fmtElapsed, isTerminal, stateWords, stoppedReasonText } from './helpers';
 import { jobOf, StateDot } from './JobStrip';
 import { SEVERITY_ORDER, type JobStatus, type JobSummary, type Lane, type StartResult } from './model';
+import { ErrorBlock, Fact, listboxKeys, LoadingBars, ReconnectNote, Section, yesNo } from './primitives';
 import { SeverityBar } from './SeverityBar';
 import { scanStore } from './store';
 import css from './scanner.module.css';
 
-/** A grey dash for a missing value (foundation §2.8); zero is printed as `0`, never dashed. */
-const Dash: Component = () => <span class={css.dash}>—</span>;
-
-/** One `dt`/`dd` pair of a `.facts` list; `null`/`undefined` prints the dash. */
-const Fact: Component<{ k: string; v: JSX.Element | string | number | boolean | null | undefined; field?: string | undefined; mono?: boolean | undefined }> = (
-  props,
-) => (
-  <>
-    <dt>{props.k}</dt>
-    <dd data-field={props.field} class={props.mono ? css.mono : undefined}>
-      <Show when={props.v !== null && props.v !== undefined} fallback={<Dash />}>
-        {typeof props.v === 'boolean' ? String(props.v) : props.v}
-      </Show>
-    </dd>
-  </>
-);
-
-const Section: Component<{ title: string; children: JSX.Element }> = (props) => (
-  <section class={css.section}>
-    <h3 class={css.sectionTitle}>{props.title}</h3>
-    {props.children}
-  </section>
-);
-
-const yesNo = (v: boolean): string => (v ? 'yes' : 'no');
 const list = (xs: readonly string[]): string | null => (xs.length > 0 ? xs.join(', ') : null);
 const byLane = (lanes: Partial<Record<Lane, number>>): string | null =>
   list((Object.keys(lanes) as Lane[]).map((lane) => `${lane} ${lanes[lane] ?? 0}`));
@@ -83,6 +59,7 @@ export const JobsView: Component = () => {
     return n !== null && n.job === selectedId() ? n : null;
   });
   const offline = () => !s.busOpen();
+  const cancelError = s.errorFor(['cancel']);
 
   // A selected job whose full status is not held yet is read once; the live poll takes over for a
   // live job, and a finished job's detail is complete after this one read.
@@ -101,41 +78,14 @@ export const JobsView: Component = () => {
 
   let detailEl: HTMLDivElement | undefined;
 
-  const select = (id: string, fromKeyboard = false) => {
-    s.setSelectedJob(id);
-    if (fromKeyboard) document.getElementById(`job-${id}`)?.scrollIntoView?.({ block: 'nearest' });
-  };
-  const move = (delta: number) => {
-    const all = rows();
-    if (!all.length) return;
-    const i = all.findIndex((j) => j.job === selectedId());
-    const next = i < 0 ? (delta > 0 ? 0 : all.length - 1) : Math.max(0, Math.min(all.length - 1, i + delta));
-    select(all[next]!.job, true);
-  };
-  const onKeyDown = (e: KeyboardEvent) => {
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        move(1);
-        break;
-      case 'ArrowUp':
-        e.preventDefault();
-        move(-1);
-        break;
-      case 'Home':
-        e.preventDefault();
-        if (rows().length) select(rows()[0]!.job, true);
-        break;
-      case 'End':
-        e.preventDefault();
-        if (rows().length) select(rows()[rows().length - 1]!.job, true);
-        break;
-      case 'Enter':
-        e.preventDefault();
-        detailEl?.focus({ preventScroll: true });
-        break;
-    }
-  };
+  const select = (id: string) => s.setSelectedJob(id);
+  const onKeyDown = listboxKeys({
+    ids: () => rows().map((j) => j.job),
+    selectedId,
+    select,
+    focusDetail: () => detailEl?.focus({ preventScroll: true }),
+    domId: (id) => `job-${id}`,
+  });
 
   const canCancel = (j: JobSummary): boolean => !isTerminal(j.state) && !s.busy() && !offline();
 
@@ -148,24 +98,11 @@ export const JobsView: Component = () => {
             <span class={css.n}>· {rows().length}</span>
           </span>
           <Show when={offline()}>
-            <p class={css.note}>reconnecting: controls are disabled until the bus is back</p>
+            <ReconnectNote />
           </Show>
         </div>
         <Show when={s.jobsError()}>
-          {(err) => (
-            <div class={css.errorBlock} role="alert">
-              <p>{err()}</p>
-              <span class={css.mono}>
-                last good:{' '}
-                <Show when={lastGood()} fallback={<Dash />}>
-                  {(t) => fmtWhenFull(t())}
-                </Show>
-              </span>
-              <Button variant="small" class={css.retry} disabled={offline()} onClick={() => void s.refreshJobs()}>
-                Retry
-              </Button>
-            </div>
-          )}
+          {(err) => <ErrorBlock text={err()} lastGood={lastGood()} onRetry={() => void s.refreshJobs()} disabled={offline()} />}
         </Show>
         <div
           class={css.rows}
@@ -177,12 +114,7 @@ export const JobsView: Component = () => {
         >
           <Switch>
             <Match when={!s.jobsLoaded()}>
-              <div class={css.loading} aria-busy="true">
-                <i />
-                <i />
-                <i />
-                <i />
-              </div>
+              <LoadingBars label="Loading jobs" />
             </Match>
             <Match when={rows().length === 0}>
               <div class={css.empty}>No jobs yet: start one from Profiles</div>
@@ -190,7 +122,9 @@ export const JobsView: Component = () => {
             <Match when={rows().length > 0}>
               <For each={rows()}>
                 {(summary) => {
-                  const j = () => jobOf(s, summary.job) ?? summary;
+                  // One memo per row: the held status (or the summary) is resolved once per change,
+                  // not once per field the row prints.
+                  const j = createMemo(() => jobOf(s, summary.job) ?? summary);
                   return (
                     <div
                       id={`job-${summary.job}`}
@@ -250,6 +184,20 @@ export const JobsView: Component = () => {
                   </Button>
                 </div>
 
+                {/* A failed per-job read (PA4): the core's text with Retry, above the facts, so the
+                    operator reads why the counters stopped before reading the counters. */}
+                <Show when={s.statusError(j().job)}>
+                  {(err) => <ErrorBlock text={err()} onRetry={() => void s.refreshStatus(j().job)} disabled={offline()} />}
+                </Show>
+                {/* The one store error this view owns (PA5): a refused cancel, beside the toast. */}
+                <Show when={cancelError()}>
+                  {(err) => (
+                    <p class={css.reason} role="alert" data-error="cancel">
+                      {err().text}
+                    </p>
+                  )}
+                </Show>
+
                 <Show when={notice()}>
                   {(n) => (
                     <div class={css.notice} role="status" data-notice="start">
@@ -266,23 +214,25 @@ export const JobsView: Component = () => {
 
                 <Section title="Overview">
                   <dl class={css.facts}>
-                    <Fact k="state" v={stateWords(j())} />
-                    <Fact k="phase" v={j().phase} />
-                    <Fact k="elapsed" v={fmtElapsed(j().elapsed_ms)} mono />
+                    <Fact label="state" value={stateWords(j())} />
+                    <Fact label="phase" value={j().phase} />
+                    <Fact label="elapsed" value={fmtElapsed(j().elapsed_ms)} mono />
                     <Show when={detail()}>
                       {(st) => (
                         <>
-                          <Fact k="profile" v={st().profile_name} />
-                          <Fact k="targets" v={list(st().targets)} mono />
+                          <Fact label="profile" value={st().profile_name} />
+                          <Fact label="targets" value={list(st().targets)} mono />
                           <Fact
-                            k="started by"
-                            v={st().started_by.client_label === null ? st().started_by.frontend : `${st().started_by.frontend} · ${st().started_by.client_label}`}
+                            label="started by"
+                            value={st().started_by.client_label === null ? st().started_by.frontend : `${st().started_by.frontend} · ${st().started_by.client_label}`}
                           />
-                          <Fact k="started" v={fmtWhenFull(st().started_at)} />
-                          <Fact k="finished" v={fmtWhenFull(st().finished_at)} />
-                          <Fact k="stopped" field="stopped" v={st().stopped_reason === null ? null : stoppedReasonText(st().stopped_reason!)} />
+                          <Fact label="started" value={fmtWhenFull(st().started_at)} />
+                          <Fact label="finished" value={fmtWhenFull(st().finished_at)} />
+                          <Show when={st().stopped_reason} fallback={<Fact label="stopped" field="stopped" value={null} />}>
+                            {(reason) => <Fact label="stopped" field="stopped" value={stoppedReasonText(reason())} />}
+                          </Show>
                           <Show when={st().error !== null}>
-                            <Fact k="error" field="error" v={st().error} mono />
+                            <Fact label="error" field="error" value={st().error} mono />
                           </Show>
                         </>
                       )}
@@ -292,11 +242,11 @@ export const JobsView: Component = () => {
 
                 <Section title="Probes">
                   <dl class={css.facts}>
-                    <Fact k="sent / budget" v={`${j().probes.sent}/${j().probes.budget}`} mono />
-                    <Fact k="errors" v={j().probes.errors} mono />
-                    <Fact k="timeouts" v={j().probes.timeouts} mono />
-                    <Fact k="rate waits" v={j().probes.rate_waits} mono />
-                    <Fact k="by lane" v={byLane(j().probes.by_lane)} mono />
+                    <Fact label="sent / budget" value={`${j().probes.sent}/${j().probes.budget}`} mono />
+                    <Fact label="errors" value={j().probes.errors} mono />
+                    <Fact label="timeouts" value={j().probes.timeouts} mono />
+                    <Fact label="rate waits" value={j().probes.rate_waits} mono />
+                    <Fact label="by lane" value={byLane(j().probes.by_lane)} mono />
                   </dl>
                 </Section>
 
@@ -304,11 +254,12 @@ export const JobsView: Component = () => {
                   {(st) => (
                     <Section title="Crawl">
                       <dl class={css.facts}>
-                        <Fact k="pages" v={st().crawl.pages} mono />
-                        <Fact k="queued" v={st().crawl.queued} mono />
-                        <Fact k="depth" v={st().crawl.depth} mono />
-                        <Fact k="forms submitted" v={st().crawl.forms_submitted} mono />
-                        <Fact k="errors" v={st().crawl.errors} field="crawl-errors" mono />
+                        <Fact label="pages" value={st().crawl.pages} mono />
+                        <Fact label="queued" value={st().crawl.queued} mono />
+                        <Fact label="depth" value={st().crawl.depth} mono />
+                        <Fact label="forms submitted" value={st().crawl.forms_submitted} mono />
+                        <Fact label="errors" value={st().crawl.errors} field="crawl-errors" mono />
+                        <Fact label="forms skipped" value={st().crawl.forms_skipped} field="crawl-forms-skipped" mono />
                       </dl>
                     </Section>
                   )}
@@ -316,12 +267,12 @@ export const JobsView: Component = () => {
 
                 <Section title="Points">
                   <dl class={css.facts}>
-                    <Fact k="found" v={j().points.found} mono />
-                    <Fact k="queued" v={j().points.queued} mono />
-                    <Fact k="audited" v={j().points.audited} mono />
+                    <Fact label="found" value={j().points.found} mono />
+                    <Fact label="queued" value={j().points.queued} mono />
+                    <Fact label="audited" value={j().points.audited} mono />
                     <Fact
-                      k="skipped"
-                      v={`ignored ${j().points.skipped.ignored} · frequent ${j().points.skipped.frequent} · limit ${j().points.skipped.limit}`}
+                      label="skipped"
+                      value={`ignored ${j().points.skipped.ignored} · frequent ${j().points.skipped.frequent} · limit ${j().points.skipped.limit}`}
                       mono
                     />
                   </dl>
@@ -331,8 +282,8 @@ export const JobsView: Component = () => {
                   {(st) => (
                     <Section title="Checks">
                       <dl class={css.facts}>
-                        <Fact k="scheduled / done" v={`${st().checks.scheduled}/${st().checks.done}`} mono />
-                        <Fact k="running" v={list(st().checks.running)} mono />
+                        <Fact label="scheduled / done" value={`${st().checks.scheduled}/${st().checks.done}`} mono />
+                        <Fact label="running" value={list(st().checks.running)} mono />
                       </dl>
                     </Section>
                   )}
@@ -340,16 +291,16 @@ export const JobsView: Component = () => {
 
                 <Section title="Issues">
                   <dl class={css.facts}>
-                    <Fact k="total" v={j().issues.total} mono />
-                    <Fact k="by severity" v={<SeverityBar by={j().issues.by_severity} />} />
+                    <Fact label="total" value={j().issues.total} mono />
+                    <Fact label="by severity" value={<SeverityBar by={j().issues.by_severity} />} />
                     <Fact
-                      k="counts"
-                      v={SEVERITY_ORDER.map((sev) => `${sev} ${j().issues.by_severity[sev]}`).join(' · ')}
+                      label="counts"
+                      value={SEVERITY_ORDER.map((sev) => `${sev} ${j().issues.by_severity[sev]}`).join(' · ')}
                       mono
                     />
                     <Fact
-                      k="by confidence"
-                      v={`certain ${j().issues.by_confidence.certain} · firm ${j().issues.by_confidence.firm} · tentative ${j().issues.by_confidence.tentative}`}
+                      label="by confidence"
+                      value={`certain ${j().issues.by_confidence.certain} · firm ${j().issues.by_confidence.firm} · tentative ${j().issues.by_confidence.tentative}`}
                       mono
                     />
                   </dl>
@@ -362,10 +313,10 @@ export const JobsView: Component = () => {
                         {(l4) => (
                           <Section title="L4">
                             <dl class={css.facts}>
-                              <Fact k="cases" v={l4().cases} mono />
-                              <Fact k="crashes" v={l4().crashes} mono />
-                              <Fact k="liveness failures" v={l4().liveness_failures} mono />
-                              <Fact k="retired elements" v={l4().retired_elements} mono />
+                              <Fact label="cases" value={l4().cases} mono />
+                              <Fact label="crashes" value={l4().crashes} mono />
+                              <Fact label="liveness failures" value={l4().liveness_failures} mono />
+                              <Fact label="retired elements" value={l4().retired_elements} mono />
                             </dl>
                           </Section>
                         )}
@@ -375,10 +326,10 @@ export const JobsView: Component = () => {
                         {(session) => (
                           <Section title="Session">
                             <dl class={css.facts}>
-                              <Fact k="reused" v={yesNo(session().reused)} />
-                              <Fact k="lost" v={yesNo(session().lost)} />
-                              <Fact k="canary" v={canaryText(st())} mono />
-                              <Fact k="browser partial" v={yesNo(session().browser_partial)} />
+                              <Fact label="reused" value={yesNo(session().reused)} />
+                              <Fact label="lost" value={yesNo(session().lost)} />
+                              <Fact label="canary" value={canaryText(st())} mono />
+                              <Fact label="browser partial" value={yesNo(session().browser_partial)} />
                             </dl>
                           </Section>
                         )}
@@ -386,9 +337,9 @@ export const JobsView: Component = () => {
 
                       <Section title="Lanes">
                         <dl class={css.facts}>
-                          <Fact k="requested" v={list(st().lanes.requested)} mono />
-                          <Fact k="run" v={list(st().lanes.run)} mono />
-                          <Fact k="skipped" v={list(st().lanes.skipped.map((sk) => `${sk.lane}: ${sk.reason}`))} mono />
+                          <Fact label="requested" value={list(st().lanes.requested)} mono />
+                          <Fact label="run" value={list(st().lanes.run)} mono />
+                          <Fact label="skipped" value={list(st().lanes.skipped.map((sk) => `${sk.lane}: ${sk.reason}`))} mono />
                         </dl>
                       </Section>
 
