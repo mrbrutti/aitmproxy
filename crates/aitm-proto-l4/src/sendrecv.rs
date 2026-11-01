@@ -803,7 +803,11 @@ mod tests {
             dst: "127.0.0.1".parse().unwrap(),
             dst_port: Some(9),
             interface: IFACE.to_string(),
-            timeout: Duration::from_secs(1),
+            // The mock answers instantly, so this bound is only the hermetic
+            // ceiling a stalled run would hit: ten seconds, wide enough that a
+            // loaded CI box cannot turn a correlation into a Timeout, and the
+            // wall time of a passing run is unchanged (security panel 3).
+            timeout: Duration::from_secs(10),
             expect,
         };
 
