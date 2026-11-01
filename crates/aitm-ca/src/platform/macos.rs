@@ -1,23 +1,29 @@
-//! macOS: `security find-certificate` / `add-trusted-cert` /
+//! macOS: `security find-certificate` / `verify-cert` / `add-trusted-cert` /
 //! `remove-trusted-cert` / `delete-certificate` against the login and System
 //! keychains.
 //!
-//! Presence is what `find-certificate -a -Z` prints; trust settings are not
-//! verified (`verify-cert` and `dump-trust-settings` were inconclusive in
-//! research 07 §3.1 — `verify-cert` exited 1 for both a trusted Apple root and
-//! an untrusted self-signed CA, so its result is not a trust signal), so
-//! `trusted` is always `Unknown` here. Rather than leave that `Unknown`
-//! unexplained (audit minor e), a `status` that finds the certificate *present*
-//! says so in `detail`: present but trust UNCONFIRMED, with the one reliable way
-//! to confirm it (Keychain Access). Every mutation is check-first, which keeps
+//! Presence is what `find-certificate -a -Z` prints. Trust is one
+//! `verify-cert -l -L -p basic` evaluation, run only when the certificate is
+//! present (spec D17.3). The policy is `basic`, not `ssl`: `-p ssl` rejects
+//! every CA certificate with "Invalid Extended Key Usage for policy", trusted
+//! or not (the read-only probe recorded under "Task 32 result" in
+//! `docs/superpowers/plans/2026-10-31-ca-trust-first-run-plan.md`); our
+//! install sets both policies, so a `basic` verdict reflects HTTPS trust for
+//! every path the app offers. Trust settings are per user and per certificate
+//! hash, not per keychain, so both scopes report the same evaluation. Every
+//! mutation is check-first, and `install` on a present certificate reads
+//! trust back and replaces an untrusted copy (plan correction 8), which keeps
 //! the design independent of what a duplicate `add-trusted-cert` does.
 
 use crate::cert::CaCert;
 use crate::exec::{CmdLine, CmdOutput, Executor};
-use crate::platform::{cmd, failure_text, run, sudo_if_needed};
+use crate::platform::{
+    cmd, failure_text, failure_text_with_tail, run, stderr_tail, sudo_if_needed, tail_of,
+};
 use crate::store::{
     Change, Platform, Presence, Scope, StoreStatus, Trust, TrustError, TrustErrorKind, TrustStore,
 };
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MacOsStore;
@@ -27,18 +33,21 @@ static PLATFORM: Platform = Platform::MacOs;
 const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
 const LOGIN_KEYCHAIN: &str = "Library/Keychains/login.keychain-db";
 
-/// Shown on every status answer: presence is not trust on macOS.
-const DETAIL: &str = "macOS: keychain presence is reported; trust settings are not verified. \
-                      Open Keychain Access to confirm \"Always Trust\".";
+/// Shown on every status answer: what ran for presence and what ran for trust.
+const DETAIL: &str = "macOS: presence from `security find-certificate`; trust from `security \
+                      verify-cert` (basic policy, local only; our install sets the ssl and \
+                      basic policies together)";
 
-/// Added when the certificate is present: name the UNCONFIRMED trust explicitly
-/// and how to confirm it, so `Trust::Unknown` is never a silent dead end (audit
-/// minor e). `security verify-cert` is not used: research 07 §3.1 found it
-/// exits 1 for a trusted root too, so it cannot confirm trust.
-const PRESENT_TRUST_UNCONFIRMED: &str =
-    "The certificate is present, but macOS exposes no reliable CLI check of its \
-     trust settings, so its trust is UNCONFIRMED here. Confirm \"Always Trust\" in \
-     Keychain Access (or that `aitm ca install` reported success).";
+/// `verify-cert`'s stdout contains this on exit 0 (the literal the probe
+/// quoted; see the module docs).
+const VERIFY_SUCCESS: &str = "certificate verification successful";
+
+/// What `add-trusted-cert` says (case-insensitively) when the authentication
+/// dialog was dismissed; Apple spells it "canceled".
+const CANCEL_MARKER: &str = "cancel";
+
+const CANCELLED_MESSAGE: &str = "ca.install cancelled: the macOS authentication dialog was \
+                                 dismissed; the CA is not trusted";
 
 const HEADLESS_HINT: &str = "macOS refused to change trust settings without a GUI session; run \
                              aitm ca install from a terminal in a logged-in desktop session";
@@ -107,6 +116,33 @@ impl<'a> Op<'a> {
         Ok((cmd, out))
     }
 
+    /// `security verify-cert -c <cert> -l -L -p basic`, never `sudo`: `-l`
+    /// marks the leaf as a CA, `-L` keeps the evaluation local. `Yes` on exit 0
+    /// with [`VERIFY_SUCCESS`] in stdout; otherwise `No` with a detail line;
+    /// `Err` only when the tool could not run (the caller reports `Unknown`).
+    fn verify_trust(&mut self) -> Result<(Trust, Option<String>), TrustError> {
+        let path = self.cert.path.display().to_string();
+        let cmd = cmd(
+            "security",
+            &["verify-cert", "-c", &path, "-l", "-L", "-p", "basic"],
+            false,
+        );
+        let out = self.run(&cmd)?;
+        if !out.success() {
+            return Ok((Trust::No, Some(verify_failure_text(&cmd, &out))));
+        }
+        if out.stdout.contains(VERIFY_SUCCESS) {
+            return Ok((Trust::Yes, None));
+        }
+        Ok((
+            Trust::No,
+            Some(format!(
+                "`{}` exited 0 without \"{VERIFY_SUCCESS}\" in its output",
+                cmd.render()
+            )),
+        ))
+    }
+
     /// Presence, or `ToolFailed` when the query itself failed: a mutation
     /// must not proceed on a guess.
     fn presence(&mut self) -> Result<Presence, TrustError> {
@@ -141,6 +177,29 @@ impl<'a> Op<'a> {
         }
         let out = self.run(&cmd)?;
         Ok((cmd, out))
+    }
+
+    /// `delete-certificate -Z <sha256>`, then `-Z <sha1>` when that fails
+    /// (older macOS keys the keychain on SHA-1). `None` once a copy is gone;
+    /// otherwise the failure text of every attempt, so the attempt that
+    /// carried the real reason is never hidden by the other's "not found".
+    fn delete_copy(&mut self) -> Result<Option<String>, TrustError> {
+        let keychain = self.keychain.clone();
+        let sha256 = self.cert.sha256_hex();
+        let (cmd, out) = self.mutate("delete-certificate", false, &["-Z", &sha256, &keychain])?;
+        if out.success() {
+            return Ok(None);
+        }
+        let sha1 = self.cert.sha1_hex_lower();
+        let (cmd1, out1) = self.mutate("delete-certificate", false, &["-Z", &sha1, &keychain])?;
+        if out1.success() {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{}; {}",
+            failure_text(&cmd, &out),
+            failure_text(&cmd1, &out1)
+        )))
     }
 
     fn finish(self, changed: bool, detail: Vec<String>) -> Change {
@@ -185,6 +244,40 @@ fn is_headless(out: &CmdOutput) -> bool {
     HEADLESS_MARKERS.iter().any(|m| stderr.contains(m))
 }
 
+fn is_cancelled(out: &CmdOutput) -> bool {
+    out.stderr.to_lowercase().contains(CANCEL_MARKER)
+}
+
+/// What `install` does with a certificate that is already in `keychain`,
+/// from the trust read-back: `None` when the copy is untrusted and is to be
+/// replaced; otherwise the `detail` of an unchanged result. Only a definite
+/// `No` deletes (plan correction 8).
+fn keep_present_copy(
+    keychain: &str,
+    verdict: Result<(Trust, Option<String>), TrustError>,
+) -> Option<Vec<String>> {
+    match verdict {
+        Ok((Trust::Yes, _)) => Some(vec![format!("already present and trusted in {keychain}")]),
+        Ok((Trust::No, _)) => None,
+        Ok((Trust::Unknown, line)) => {
+            let mut detail = vec![format!("already present in {keychain}")];
+            detail.extend(line);
+            Some(detail)
+        }
+        Err(e) => Some(vec![
+            format!("already present in {keychain}"),
+            e.to_string(),
+        ]),
+    }
+}
+
+/// `verify-cert` prints its verdict (`Cert Verify Result: …`) on stdout, so a
+/// failed evaluation's tail is taken from both streams, stdout first.
+fn verify_failure_text(cmd: &CmdLine, out: &CmdOutput) -> String {
+    let tail = tail_of(out.stdout.lines().chain(out.stderr.lines()));
+    failure_text_with_tail(cmd, out, &tail)
+}
+
 impl TrustStore for MacOsStore {
     fn platform(&self) -> &Platform {
         &PLATFORM
@@ -200,19 +293,28 @@ impl TrustStore for MacOsStore {
         let (cmd, out) = op.query()?;
         let installed = parse_presence(&out, cert);
         let mut detail = vec![DETAIL.to_string()];
-        match installed {
-            Presence::Present => detail.push(PRESENT_TRUST_UNCONFIRMED.to_string()),
-            Presence::Unknown => detail.push(failure_text(&cmd, &out)),
-            _ => {}
-        }
+        let trusted = match installed {
+            Presence::Present => match op.verify_trust() {
+                Ok((trust, line)) => {
+                    detail.extend(line);
+                    trust
+                }
+                Err(e) => {
+                    detail.push(e.to_string());
+                    Trust::Unknown
+                }
+            },
+            Presence::Unknown => {
+                detail.push(failure_text(&cmd, &out));
+                Trust::Unknown
+            }
+            Presence::Absent | Presence::Stale => Trust::No,
+        };
         Ok(StoreStatus {
             scope,
             location: op.keychain,
             installed,
-            // Always `Unknown`: macOS has no reliable CLI trust check (see the
-            // module docs and `PRESENT_TRUST_UNCONFIRMED`). When present, `detail`
-            // now says so explicitly instead of leaving it unexplained.
-            trusted: Trust::Unknown,
+            trusted,
             detail,
         })
     }
@@ -220,8 +322,22 @@ impl TrustStore for MacOsStore {
     fn install(&self, cert: &CaCert, scope: Scope, exec: &dyn Executor) -> anyhow::Result<Change> {
         let mut op = Op::new(cert, scope, exec)?;
         let keychain = op.keychain.clone();
+        let mut detail = Vec::new();
         if op.presence()? == Presence::Present {
-            return Ok(op.finish(false, vec![format!("already present in {keychain}")]));
+            // Presence is not trust: a copy left by a dismissed dialog whose
+            // rollback failed, or imported by hand, has no trust settings.
+            let verdict = op.verify_trust();
+            if let Some(unchanged) = keep_present_copy(&keychain, verdict) {
+                return Ok(op.finish(false, unchanged));
+            }
+            if let Some(failure) = op.delete_copy()? {
+                return Err(TrustError::new(
+                    TrustErrorKind::ToolFailed,
+                    format!("could not remove the untrusted copy from {keychain}: {failure}"),
+                )
+                .into());
+            }
+            detail.push(format!("replaced the untrusted copy in {keychain}"));
         }
 
         let path = cert.path.display().to_string();
@@ -241,19 +357,27 @@ impl TrustStore for MacOsStore {
             ],
         )?;
         if out.success() {
-            return Ok(op.finish(
-                true,
-                vec![format!(
-                    "added to {keychain} as a trusted root for ssl and basic"
-                )],
+            detail.push(format!(
+                "added to {keychain} as a trusted root for ssl and basic"
             ));
+            return Ok(op.finish(true, detail));
         }
 
-        let headless = is_headless(&out);
-        let mut message = failure_text(&cmd, &out);
-        if headless {
-            message = format!("{HEADLESS_HINT} ({message})");
-        }
+        let (kind, mut message) = if is_headless(&out) {
+            (
+                TrustErrorKind::HeadlessAuth,
+                format!("{HEADLESS_HINT} ({})", failure_text(&cmd, &out)),
+            )
+        } else if is_cancelled(&out) {
+            debug!(
+                target: "aitm_ca",
+                stderr_tail = stderr_tail(&out).as_str(),
+                "add-trusted-cert classified as cancelled"
+            );
+            (TrustErrorKind::Cancelled, CANCELLED_MESSAGE.to_string())
+        } else {
+            (TrustErrorKind::ToolFailed, failure_text(&cmd, &out))
+        };
 
         // Rollback, best effort: a failed add-trusted-cert can leave the
         // certificate in the keychain without trust settings, where it
@@ -261,11 +385,7 @@ impl TrustStore for MacOsStore {
         // caller sees either way.
         if let Ok((_, requery)) = op.query() {
             if parse_presence(&requery, cert) == Presence::Present {
-                let sha256 = cert.sha256_hex();
-                let rolled_back = op
-                    .mutate("delete-certificate", false, &["-Z", &sha256, &keychain])
-                    .map(|(_, out)| out.success())
-                    .unwrap_or(false);
+                let rolled_back = matches!(op.delete_copy(), Ok(None));
                 message.push_str(if rolled_back {
                     "; removed the untrusted copy it left behind"
                 } else {
@@ -274,11 +394,6 @@ impl TrustStore for MacOsStore {
             }
         }
 
-        let kind = if headless {
-            TrustErrorKind::HeadlessAuth
-        } else {
-            TrustErrorKind::ToolFailed
-        };
         Err(TrustError::new(kind, message).into())
     }
 
@@ -307,25 +422,9 @@ impl TrustStore for MacOsStore {
             ));
         }
 
-        let sha256 = cert.sha256_hex();
-        let sha1 = cert.sha1_hex_lower();
         for pass in 1..=MAX_DELETE_PASSES {
-            let (cmd, out) = op.mutate("delete-certificate", false, &["-Z", &sha256, &keychain])?;
-            if !out.success() {
-                // Older macOS keys the keychain on SHA-1.
-                let (cmd1, out1) =
-                    op.mutate("delete-certificate", false, &["-Z", &sha1, &keychain])?;
-                if !out1.success() {
-                    return Err(TrustError::new(
-                        TrustErrorKind::ToolFailed,
-                        format!(
-                            "{}; {}",
-                            failure_text(&cmd, &out),
-                            failure_text(&cmd1, &out1)
-                        ),
-                    )
-                    .into());
-                }
+            if let Some(failure) = op.delete_copy()? {
+                return Err(TrustError::new(TrustErrorKind::ToolFailed, failure).into());
             }
             if op.presence()? != Presence::Present {
                 detail.push(format!("removed from {keychain}"));
@@ -344,5 +443,23 @@ impl TrustStore for MacOsStore {
             ),
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_verdict_never_deletes() {
+        assert_eq!(
+            keep_present_copy("K", Ok((Trust::Unknown, Some("line".to_string())))),
+            Some(vec!["already present in K".to_string(), "line".to_string()])
+        );
+        assert_eq!(
+            keep_present_copy("K", Ok((Trust::Unknown, None))),
+            Some(vec!["already present in K".to_string()])
+        );
+        assert_eq!(keep_present_copy("K", Ok((Trust::No, None))), None);
     }
 }
