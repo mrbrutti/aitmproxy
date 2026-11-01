@@ -3,8 +3,9 @@
 **Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 (Review log)
 **Spec:** `docs/superpowers/specs/2026-10-31-mac-app-icons-and-names-design.md`
 (approved 2026-10-31, revision 2, amended 2026-11-01; acceptance criteria AI-AC1 … AI-AC24)
-**Branch / worktree:** this worktree, `claude/apps-attribution-8ab619`
-(`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), base `main 8e19c2e3`
+**Branch / worktree:** `feat/mac-app-icons-and-names` in this worktree
+(`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), cut 2026-11-01 off `main 681dff57`
+(the traffic-route PR #265 merge; the original base was `main 8e19c2e3`)
 (PR #196 `5eac2a50` is the last owner of `Shell/SidebarView.swift` and `Bus/BusService.swift`; PR #197
 `9776a0e6` moved `Session.swift`'s navigation enums out).
 **PR shape:** two PRs from this branch — the traffic-route plan
@@ -18,7 +19,7 @@ traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
    ClientInfo(sourceApp:)`, `ClientInfo.displayName(forSourceApp:)`). Merge SHA: **`3fe92f66`**
    (released in v0.5.9). Every Kit task below calls `ClientInfo(sourceApp:)`; without it nothing compiles.
 2. **The fixture-removal PR is on `main` and this branch has rebased once onto its SHA**
-   (record: `__________`). That PR deletes the mac app's fixture and sample-data modes
+   (record: **`c3a4fd37`**, PR #249; `main 681dff57` contains it). That PR deletes the mac app's fixture and sample-data modes
    (`Store.usesFixtures`, `APP_FIXTURES`/`APP_SNAPSHOT`, the Kit `Fixtures*.swift`,
    `Snapshot*.swift`, `SnapshotScenes`, the fixture `--selftest`, `snap.sh`/`selftest.sh`, the kit
    gallery). **This plan references none of them.** Coders who find a `Fixtures.` or
@@ -26,8 +27,9 @@ traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
 3. **The orchestrator session has approved the file claim** for `Shell/SidebarView.swift`,
    `Bus/BusService.swift`, `Session.swift`, `FlowTable/FlowCellView.swift` (the files PR #196 and
    the fixture-removal PR touched last).
-4. **The traffic-route PR is merged** (record its merge SHA here: `__________`) and this branch's
-   second PR is cut on top of it. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
+4. **The traffic-route PR is merged** (record its merge SHA here: **`681dff57`**, PR #265, 2026-11-01) and this branch's
+   second PR is cut on top of it (`feat/mac-app-icons-and-names` off `681dff57`). Orchestrator ruling 2026-11-01: Tasks 5/6 also
+   wait for system-proxy PR 4 (it owns the `BusService` poll loop Task 6 enriches); the orchestrator says when it is in. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
    have landed** — they share `Session.swift` (traffic-route: `systemProxy`, `decrypt`) and
    `Bus/BusService.swift` (traffic-route: one `decrypt` line; PR D's `refreshCAStatus()` is also in
    that file by then) — and never concurrently with them; whichever lands second rebases onto the
@@ -313,14 +315,20 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
   (Task 8) and by the diff review; gates AI-AC23 (`gen-tokens` leaves no diff; Rust gate).
 - **Depends on:** Task 1 (`AppIdentifier`, `withResolvedName`), Task 2 (`BoundedCache`).
 - **Files:**
-  - `docs/design/tokens.json` (modify: one row)
+  - `docs/design/tokens.json` (modify: three rows — `process`, plus `network` and `apps` for the folded-in PR #265 Q10 follow-up)
   - `apps/mac/Sources/Aitmproxy/UI/Tokens.swift` (regenerate only, via `swift apps/mac/tools/gen-tokens.swift` — Terminal; the Coder edits `tokens.json` and asks the orchestrator to regenerate, or regenerates if the sandbox permits running the script)
   - `apps/mac/Sources/Aitmproxy/UI/AppIdentity.swift` (create)
+  - `apps/mac/Sources/Aitmproxy/Shell/RouteBanner.swift` (modify: ONLY the two glyph string literals — PR #265 quality Q10 follow-up, folded in here by the orchestrator 2026-11-01)
 - **Change:**
   - `tokens.json` `icon.glyph` table gains `"process": { "mac": "terminal", "web": "terminal", "tui": "$" }`
     (D9). Consumers: mac `gen-tokens.swift` (→ `Tok.Glyph.process`), `crates/aitm-tui/build.rs`
     (→ `glyph::PROCESS = "$"`, no test pins the count), `apps/web/src/components/Icon.tsx` already
-    maps `terminal` to a Lucide icon. No other edit.
+    maps `terminal` to a Lucide icon. **Folded-in follow-up (PR #265 Q10):** two more rows,
+    `"network": { "mac": "network", "web": "network", "tui": "⇅" }` and
+    `"apps": { "mac": "app.badge", "web": "layout-grid", "tui": "▦" }`, and `Shell/RouteBanner.swift` swaps its two
+    string literals for `Tok.Glyph.network` and `Tok.Glyph.apps` (lines `Image(systemName: "network")` and the
+    `case .systemProxy: "network"` / `case .allApps: "app.badge"` glyph switch) — the rendered symbols are unchanged,
+    `check-connection-words.sh` / `check-capture-toggle.sh` must still PASS. No other edit.
   - `UI/AppIdentity.swift`, exactly spec D1's app API:
 
     ```swift
@@ -607,6 +615,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 | `docs/design/tokens.json` | | | | M | | | | |
 | `Aitmproxy/UI/Tokens.swift` (generated) | | | | G | | | | |
 | `Aitmproxy/UI/AppIdentity.swift` (new) | | | | C | | | | |
+| `Aitmproxy/Shell/RouteBanner.swift` (two glyph literals only; folded-in PR #265 Q10) | | | | M | | | | |
 | `Aitmproxy/Session.swift` | | | | | M | | | |
 | `Aitmproxy/Shell/SidebarView.swift` | | | | | M | | | |
 | `Aitmproxy/Bus/BusService.swift` | | | | | | M | | |
