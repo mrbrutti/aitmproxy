@@ -1107,6 +1107,11 @@ crates/aitm-scan-http/
      references them**. Anything still referenced (expected candidates: `commands.rs`, `reproduce.rs`,
      `passive.rs`) is reported to the coordinator by file and symbol, not refactored. If T1b is not
      on `main`, skip and say so in the PR body.
+     **Amendment 2026-11-01 (coordinator):** T3's PR 2a edits `interim_lane.rs`, `manual_check.rs`,
+     `plugin.rs` and `verbs.rs` (the interim lane's `LegacyActiveCheck` leaves `Lane::checks()` and
+     becomes `#[cfg(test)]`), so #223 must not delete or edit the interim lane; the legacy deletion
+     moves to a follow-up PR after 2a and 2b are on `main`, and any rebase of #223 keeps T3's version
+     of those four files. The grep inventory of step 3 is still run and reported in the PR body.
   3b. **Session-lost hook**: if `aitm_scan_model::JobCtx` on `origin/main` has
      `report_session_lost(&self)`, call it from the lane's loss path (`host.rs`/`session.rs`) and
      add a `FakeJob` assertion that it was called once; otherwise note the pending hook in the PR body.
