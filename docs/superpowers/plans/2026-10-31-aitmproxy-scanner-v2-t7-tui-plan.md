@@ -307,23 +307,23 @@ Kept by the main session during stage 6. One row per finding.
 | 4 | spec | Minor | legacy Jobs row carries an in-pane hint line | accepted until Task 14 lands the `bars.rs` hints, which then replace it |
 | 4 | spec | Minor | Issues degraded wording was a builder literal | spec D2 cell fixed in 12733a88 ("issues need scan.issues (scanner v2)") |
 | 4 | spec | note | D11 "under it" vs the strip row; page-size enumeration off by one | spec D11 and plan Task 4 amended in 12733a88 |
-| 5 | security | Important | `scan.status` reply folded under the body's `job`, not the tag's key: a core can mint a new live job per reply, doubling the poll set | fix round B: fold only when `status.job == tag key`, else an uncoded error "reply named a different job" (spec D6 amended) |
-| 5 | security | Important | unbounded `scan.status` fan-out per `scan.list` fold and per timer firing; O(n^2) membership; UI loop blocks past 128 queued requests | fix round B: `MAX_STATUS_FOLLOWUPS = 16` per fold and per firing, `BTreeSet` membership, `full.retain` (spec D6 amended) |
-| 5 | security | Minor | push-line and list job ids used unvalidated as tag key, argument and `inflight` entry | fix round B: accept only `scan-` + 8 hex (spec D6 amended) |
-| 5 | quality | Minor | `scan.status {job}` request spelled out three times | fix round B: `request_scan_status(job)` helper |
-| 5 | quality | Minor | `on_scan_ok` repeats the parse / clear-or-set-error scaffold per verb arm | fix round B: `scan_reply::<T>(name, &value) -> Option<T>` |
+| 5 | security | Important | `scan.status` reply folded under the body's `job`, not the tag's key: a core can mint a new live job per reply, doubling the poll set | fixed in cf7a0423 (fix round B): fold only when `status.job == tag key`, else an uncoded error "reply named a different job" (spec D6 amended) |
+| 5 | security | Important | unbounded `scan.status` fan-out per `scan.list` fold and per timer firing; O(n^2) membership; UI loop blocks past 128 queued requests | fixed in d56a77b4 (fix round B): `MAX_STATUS_FOLLOWUPS = 16` per fold and per firing, `BTreeSet` membership, `full.retain` (spec D6 amended) |
+| 5 | security | Minor | push-line and list job ids used unvalidated as tag key, argument and `inflight` entry | fixed in 10803fc0 (fix round B): accept only `scan-` + 8 hex (spec D6 amended) |
+| 5 | quality | Minor | `scan.status {job}` request spelled out three times | fixed in d56a77b4 (fix round B): `request_scan_status(job)` helper |
+| 5 | quality | Minor | `on_scan_ok` repeats the parse / clear-or-set-error scaffold per verb arm | fixed in 53c2f5e2 (fix round B): `scan_reply::<T>(name, &value) -> Option<T>` |
 | 5 | quality | Minor | `issues_wanted` leans on a zero sentinel; doc comment overstates | Task 7: `fetched_at_tick: Option<u64>` (hand-off recorded in Task 7) |
-| 5 | quality | Minor | `scan_issues_args` hand-built on `App`; `limit: 512` bare | fix round B: `pub const ISSUES_PAGE_LIMIT: usize = 512` in `scan/mod.rs`; Task 7 moves the body to `IssueFilters::args` and deletes the `App` copy |
-| 5 | quality | Minor | `clear_error(verb)` clears a keyed verb's error on a sibling job's success | fix round B: `ScanError` carries the tag; clear by tag for keyed verbs (spec D13 amended) |
-| 5 | quality | Minor | `fold_list` keeps dropped jobs in `full` for ever; `order` doc stale | fix round B: `full.retain`; doc rewritten with the `started_here` rule |
+| 5 | quality | Minor | `scan_issues_args` hand-built on `App`; `limit: 512` bare | fixed in 53c2f5e2 (fix round B): `pub const ISSUES_PAGE_LIMIT: usize = 512` in `scan/mod.rs`; Task 7 moves the body to `IssueFilters::args` and deletes the `App` copy |
+| 5 | quality | Minor | `clear_error(verb)` clears a keyed verb's error on a sibling job's success | fixed in 53c2f5e2 (fix round B): `ScanError` carries the tag; clear by tag for keyed verbs (spec D13 amended) |
+| 5 | quality | Minor | `fold_list` keeps dropped jobs in `full` for ever; `order` doc stale | fixed in a506a762 (fix round B): `full.retain`; doc rewritten with the `started_here` rule |
 | 5 | quality | Minor | `order` ids may lack a `summaries` entry | Task 6 reads rows through `state_of`/`full` (hand-off recorded in Task 6) |
-| 5 | quality | Minor | two builder rules, `OpenScan -> scan.list`, the 40-tick list cadence untested | fix round B: tests for `fold_list` with `started_here`, `OpenScan`, 40 ticks in both modes |
-| 5 | quality | Minor | `fixture!`/`value()` duplicated across test files; `from_value(params.clone())` | fix round B: helpers into `tests/common/mod.rs`; deserialize from `&Value` |
-| 5 | spec | Important | `fold_list` replaced the "started here" rule with a heuristic without reporting the gap | ruling (b): `started_here: BTreeSet<JobId>` on `JobsState` (spec D3 amended); fix round B implements it; Task 12 inserts on `StartResult` |
+| 5 | quality | Minor | two builder rules, `OpenScan -> scan.list`, the 40-tick list cadence untested | fixed in dba0525c (fix round B): tests for `fold_list` with `started_here`, `OpenScan`, 40 ticks in both modes |
+| 5 | quality | Minor | `fixture!`/`value()` duplicated across test files; `from_value(params.clone())` | fixed in c18fbffd (fix round B): helpers into `tests/common/mod.rs`; deserialize from `&Value` |
+| 5 | spec | Important | `fold_list` replaced the "started here" rule with a heuristic without reporting the gap | ruling (b): `started_here: BTreeSet<JobId>` on `JobsState` (spec D3 amended); implemented in a506a762 (fix round B); Task 12 inserts on `StartResult` |
 | 5 | spec | Minor | `scan_issues_args` is Task 7's `IssueFilters::args` elsewhere | Task 7 moves it (recorded in Task 7) |
-| 5 | spec | Minor | untested Task 5 behaviours (40-tick list, `OpenScan` list, D6 row 3 `scan.issues` args, `Disconnected` clears `pending`, front-insertion rule) | fix round B adds the pins |
+| 5 | spec | Minor | untested Task 5 behaviours (40-tick list, `OpenScan` list, D6 row 3 `scan.issues` args, `Disconnected` clears `pending`, front-insertion rule) | pins added in dba0525c (fix round B) |
 | 5 | spec | Minor | `issues_wanted` narrows "ever opened" by interpretation | ruling: sidebar clause is vacuous (count reads `summaries`); "ever opened" is `fetched_at_tick.is_some()` once Task 7 retypes it |
-| 5 | spec | Minor | `four_progress_lines_yield_one_inflight_status` counts only `scan.status` tags | fix round B: count every `CallTagged` |
+| 5 | spec | Minor | `four_progress_lines_yield_one_inflight_status` counts only `scan.status` tags | fixed in dba0525c (fix round B): count every `CallTagged` |
 | fix A | security/quality/spec | re-review | all 21 fix round A findings closed as prescribed (three PASS verdicts; spec `L4Confirm` text and two plan Task 4 bullets re-aligned in 3aaeffe7) | closed |
 | fix A | spec | Minor | A3/A12 edited `ui/scan/sitemap.rs` as a required consequence without the report naming it | accepted; recorded here |
 | fix A | quality | Minor | `tab_error` clones a `ScanError` twice per frame | fix round C: compute once per frame, pass `Option<&ScanError>` |
@@ -341,6 +341,9 @@ Kept by the main session during stage 6. One row per finding.
 | fix A | quality | Minor | fix-round provenance tags in six production doc comments | fix round C: drop the tags, keep the why |
 | fix A | security | Minor | `scan_host` now forwards a colon-bearing host (`host:abc`, bare `::1`) into the `http://{host}/` seed | Task 9 (D8 seed): bracket an `Ipv6Addr` host, refuse any other colon-bearing host with a toast and no call (hand-off recorded in Task 9) |
 | fix A | security | note | `tester_pass2::browser_screenshot_of_non_png_bytes_is_labelled_not_trusted` races on a shared temp path under load (outside the range) | known flake for the Tester; re-run alone; not changed by this track |
+| fix B | coder note | Minor | under the 16-cap, jobs past position 16 are starved while earlier ones answer fast | fix round C: rotating start index for the timer's follow-ups (Architect's number stays 16) |
+| fix B | coder note | Minor | `tests/scan_v2_matrix.rs` still has its own `fixture!` macro | fix round C: use `common::fixture` |
+| fix B | coder note | note | `a_terminal_line_on_the_issues_tab_requests_issues` will need re-pinning once Task 7 fetches on entering Issues | Task 7 settles the entering-Issues fetch first in that test |
 
 ## Shipped
 
