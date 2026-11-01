@@ -405,6 +405,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-sysproxy"
+version = "0.5.5"
+dependencies = [
+ "aitm-ca",
+ "aitm-core",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "aitm-testtarget"
 version = "0.5.5"
 dependencies = [
