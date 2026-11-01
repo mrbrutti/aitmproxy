@@ -1398,7 +1398,7 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 | 10 | `crates/aitm-plugin-scanner/src/{catalogue.rs, scheduler.rs}` |
 | 11 | `crates/aitm-plugin-scanner/src/{reproduce_link.rs, reproduce.rs}` |
 | 12 | `crates/aitm-plugin-scanner/src/interim_lane.rs` |
-| 13 | `crates/aitm-plugin-rhai/{src/check_bridge.rs, src/host_probe.rs, src/command.rs, src/loader.rs, src/plugin.rs, src/wire.rs, src/lib.rs, tests/check_bridge.rs}`, `docs/design/languages/rhai.api.json` (call B30) |
+| 13 | `crates/aitm-plugin-rhai/{src/check_bridge.rs, src/host_probe.rs, src/command.rs, src/loader.rs, src/plugin.rs, src/wire.rs, src/lib.rs, tests/check_bridge.rs, tests/api_catalog.rs (the one `"probe" => "probe"` arm of `receiver_type`)}`, `docs/design/languages/rhai.api.json` (call B30; also the `http.send` signature string gains `elapsed_ms`) |
 | 14 | `crates/aitm-plugin-scanner/{Cargo.toml (one dep line), src/jobs.rs, src/worker.rs, src/plugin.rs (setters)}` |
 | 15 | `crates/aitm-plugin-scanner/src/{verbs.rs, manual_check.rs, plugin.rs (load)}` |
 | 16 | `crates/aitm-plugin-scanner/src/commands.rs` |
@@ -1407,6 +1407,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 | 19 | integration-shared files (re-pin), `crates/aitm-plugin-scanner/src/util.rs` (one line, conditional), merge hunks |
 
 **Amendments after wave 1 (orchestrator, 2026-11-01):** Task 3 also edits `report.rs` (its Change step 4 moves `index_to_value`'s body into `util::json_to_value`) and one line of `main.rs` (the exhaustive `Settings` destructure needs `scanner: _,` to compile; Task 17 replaces it with the real binding). Task 3's dev-dep `aitm-scan-model = { features = ["testing"] }` needs Task 1's feature, so on a re-run Task 3 follows Task 1. Task 1's required `CheckMeta.scope` field also touches the one `CheckMeta` literal outside the model crate (`crates/aitm-plugin-scanner/src/plugin.rs` tests), committed with Task 1.
+
+**Amendments for Task 13 (orchestrator, 2026-11-01):** (a) `tests/api_catalog.rs::receiver_type` panics on an unmapped prefix, so Task 13 also adds the single arm `"probe" => "probe"` there (the file is T1b-owned and not on the integration-shared list; Task 19 only re-runs it). (b) `serde_yaml` is a dev-dependency only in `aitm-plugin-rhai`; `poc_hint_from_map` converts the `matchers` list with `serde_json::from_value::<aitm_poc::Assertion>` (the hand-written `Deserialize` on `Assertion` accepts the same vocabulary; the model crate's "no serde derives" remark means derives, not impls). (c) A duplicate check id reported by `CheckRegistry::add`/`replace_source` is a load error through the existing `ScriptError::CheckMeta { script, check: Some(id), key: "id", message: "check `<id>` is already registered by source `<other>`" }`; no new `ScriptError` variant. (d) The `http.send` signature string in `rhai.api.json` gains `elapsed_ms` in Task 13's edit.
 
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
@@ -1553,6 +1555,7 @@ Kept by the main session during stage 6. One row per finding.
 | 1 | Security | Minor | `replace_source` drops a squatted id silently; registration order unpinned | fix: same as the quality Important (typed return); Task 10 registers native → bundled → custom explicitly and reports duplicates |
 | 6 | Security | Note | Profile `name` must be validated before it becomes a path (`../` traversal) | routed to Task 6 (in flight) 2026-11-01 |
 | 8 | Security | Note | Zero ceilings/budgets must not divide by zero or spin in the pacer | routed to Task 8 (in flight) 2026-11-01 |
+| 13 | Coder (gap) | Important | Plan Task 13 Files list omitted `tests/api_catalog.rs`, whose `receiver_type` panics on the new `probe` prefix; `serde_yaml` is dev-only; no error variant named for a duplicate id | plan amended 2026-11-01 (Task 13 amendments a-d); call B30 extended to the test file |
 
 ## Shipped
 
