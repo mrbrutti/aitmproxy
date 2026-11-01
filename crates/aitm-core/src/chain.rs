@@ -45,6 +45,11 @@ impl Chain {
     /// Dispatch one event. Plugins run in registration order; a `Halt` stops the
     /// chain. If a plugin parks the flow (`intercept`), the returned future waits
     /// for a resume command before marking the flow `Resumed`.
+    ///
+    /// A **passive** flow (spec D4: `FlowMeta::passive`, or a tunnel row with
+    /// `FlowMeta::tunnel.is_some()`) is observed, never acted on: only plugins
+    /// whose [`Plugin::observes_passive_flows`](crate::Plugin::observes_passive_flows)
+    /// is `true` run, and the flow is never parked.
     pub async fn dispatch(&self, ev: Event) -> Verdict {
         let Some(id) = event_flow_id(&ev) else {
             return Verdict::Continue;
@@ -56,6 +61,10 @@ impl Chain {
         // the write-back can tell a plugin's change to them from a concurrent
         // `flow.mark` / `flow.comment` that landed while the plugins ran.
         let base_meta = flow.metadata().clone();
+        // Spec D4: decided from the copy we already hold — no extra store read and
+        // no guard in the chain. The producing module stamped `passive`; a tunnel
+        // row is passive by virtue of carrying tunnel fields.
+        let passive = flow.metadata().passive || flow.metadata().tunnel.is_some();
 
         let (mut verdict, parked) = {
             let mut ctx = FlowCtx::new(&mut flow);
@@ -68,6 +77,11 @@ impl Chain {
                     tracing::warn!("plugin lock was poisoned; recovering and continuing dispatch");
                     poisoned.into_inner()
                 });
+                // A passive flow reaches only the plugins that observe such flows
+                // (the subscription tap); nothing that acts on a flow sees it.
+                if passive && !p.observes_passive_flows() {
+                    continue;
+                }
                 let v = p.on_event(&ev, &mut ctx);
                 drop(p);
                 if matches!(v, Verdict::Halt) {
@@ -76,6 +90,20 @@ impl Chain {
                 }
             }
             (verdict, ctx.take_parked())
+        };
+
+        // A passive dispatch never parks. Only a plugin that opted in could have
+        // armed a receiver here, and no observer does; drop it rather than wait
+        // on it, and undo the `Intercepted` state it stamped on our working copy
+        // so the stored row never reads `intercepted` with a handle nobody awaits.
+        let parked = if passive {
+            if parked.is_some() {
+                tracing::debug!(%id, "an observer tried to park a passive flow; ignored");
+                set_intercept(&mut flow, InterceptState::Observed);
+            }
+            None
+        } else {
+            parked
         };
 
         // Persist the plugins' edits onto the *live* stored flow, rather than
