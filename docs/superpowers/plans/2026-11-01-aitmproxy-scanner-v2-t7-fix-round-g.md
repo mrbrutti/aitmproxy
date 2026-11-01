@@ -218,13 +218,17 @@ G85. The help overlay's Scan section is cut off on any terminal under 42 rows wi
 
 G86. On a legacy bus the Profiles and Issues hints advertise keys the degraded tabs do not serve (`crates/aitm-tui/src/ui/scan/mod.rs` `hints`): when `scan_offer() == Legacy`, Profiles reads `s scan · m map · 3 site map · Esc back`, Issues reads `3 site map · Esc back`, Site map keeps `⏎ flow · Esc back` (no `n next page`/`J job`); Jobs unchanged. One row each in `hints_follow_the_tab` on `legacy_app`.
 
+## Task 14 spec panel
+
+G87. Layout literals weaker than the spec sentences (`crates/aitm-tui/tests/scan_v2_layout.rs`): in `narrow_frames_stack_the_detail_below_the_list` add at 90x40 `row_of(narrow, "Reflected cross-site scripting   high") > row_of(narrow, "INFO 0")` and `row_of(narrow, "profile standard") > row_of(narrow, "team-staging")` (first detail line below the last list row, T7-14's sentence); in `jobs_narrow_row_drops_profile_and_targets_into_the_detail` assert at 200x50 that a `│─` rule row exists and the detail's `JOB` line sits below it (Jobs stacks at every width).
+
 ## Dispatch (2026-11-01, after Task 14 lands)
 
 Round G runs as two fix Coders in sequence in the one worktree, each committing by explicit path as `fix(tui-scan): G<ids> <title>` with reproducing tests first for every behaviour item, followed by one combined panel over both ranges.
 
 **Round G-A (behaviour, bounds, security, spec rulings)**, first, while the Task 14 panel runs: G10, G11, G12, G13, G14, G15, G16, G17, G18, G19, G20, G21, G22, G31, G33, G35, G36, G37, G42, G45, G46, G47, G48, G49, G50, G51, G52, G53, G54, G57, G61, G66, G67, G71, G72, G73, G74, G75, G82, G83. Priority order inside the round: G82, G45 (+G53), G51, G52, G20, G22, G61 (+G14), then the rest by number.
 
-**Round G-B (structure, hygiene, tests)**, after G-A is committed: G1, G2, G3, G5, G6, G7, G8, G9, G23, G24, G25, G26, G27, G28, G29, G30, G32, G34, G38, G39, G40, G41, G43, G44, G55, G56, G58, G59, G60, G62, G63, G64, G65, G68, G69, G70, G76, G77, G78, G79, G80, G81, G84, G85, G86, plus whatever the rest of the Task 14 panel adds (appended below as G84+ before G-B is dispatched).
+**Round G-B (structure, hygiene, tests)**, after G-A is committed: G1, G2, G3, G5, G6, G7, G8, G9, G23, G24, G25, G26, G27, G28, G29, G30, G32, G34, G38, G39, G40, G41, G43, G44, G55, G56, G58, G59, G60, G62, G63, G64, G65, G68, G69, G70, G76, G77, G78, G79, G80, G81, G84, G85, G86, G87, plus whatever the Task 14 quality panel adds (appended below as G84+ before G-B is dispatched).
 
 Each Coder may touch only the files its items name plus the test files that reproduce them; neither touches `CORE_TOOLS`, `fixtures/bus-fixture.json`, nor `docs/**`.
 
