@@ -49,7 +49,9 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
   T7-19 (UI-5) a `map-only` job that reached `done`: every host, `METHOD path_template` and
         point name of the harness's live scan.sitemap read is in the rendered text (never
         a fixture); Enter on the node under the cursor opens its first flow in the
-        inspector. The wait after `3`/`J` is head-first (H63): the job's `{n} nodes` head
+        inspector, the cursor read only once the `g` after the walk has visibly put it
+        back on the walk's first row (`press_home`, H74). The wait after `3`/`J` is
+        head-first (H63): the job's `{n} nodes` head
         alone ends it, for the whole SITEMAP_HEAD_S (an engine refusing the tab-entry
         `scan.sitemap {}` request changes the strip banner a moment before `J`'s head
         lands); a head that never draws is reported with the banner, read as an error
@@ -1304,6 +1306,18 @@ def cursor_to(ctx, needle, tries=64):
     return on_cursor(ctx.term.text(), needle)
 
 
+def press_home(term, first_row, timeout=5.0):
+    """`g` (Home) on the focused list pane, then wait until the cursor row reads
+    `first_row` (the row the pane's walk started from, `cursor_row` of its first frame);
+    True once it does, False after `timeout`. A read that only asked for some `>` row
+    was satisfied at once by the stale screen with the cursor still on the LAST row,
+    while the TUI homed and opened the first node's flow (the fifth live run's T7-19
+    inspector showed `GET /` for a `POST /login` row, H74). With one row the walk's
+    first row is the last and the wait ends at once, rightly."""
+    term.press("g")
+    return poll(lambda: (cursor_row(term.text()) or "").rstrip() == first_row.rstrip(), timeout, 0.1)
+
+
 def open_profile(ctx, name):
     """Profiles tab, List pane, cursor to `name`, Enter: the editor over scan.profile.get."""
     if not tab(ctx, "1"):
@@ -2188,9 +2202,13 @@ def step_t7_19(ctx):
         return
 
     # Walk the Nodes pane from the top, one row per `j`, polling for the cursor to move.
+    # The first `g` is a no-op on a fresh tab (the Nodes cursor starts at the top), so its
+    # wait is a bounded change-wait: a cursor that was elsewhere is seen moving, one that
+    # was at the top costs the bound (H74).
     seen_text = []
+    was_before_home = cursor_row(term.text())
     term.press("g")
-    poll(lambda: cursor_row(term.text()) is not None, 5)
+    poll(lambda: cursor_row(term.text()) not in (None, was_before_home), 1.0, 0.1)
     for _ in range(min(len(nodes), 60)):
         was = cursor_row(term.text())
         seen_text.append(ctx.snap("t7-19-walk"))
@@ -2212,13 +2230,17 @@ def step_t7_19(ctx):
             not missing_points, f"missing {missing_points}; {len(points)} points in the live read")
 
     # `⏎` on the node under the cursor after `g` (the pane renders in host-group order,
-    # so the first row is not necessarily the reply's first node).
-    term.press("g")
-    poll(lambda: cursor_row(term.text()) is not None, 5)
+    # so the first row is not necessarily the reply's first node). The walk left the
+    # cursor on the last row, so the read after `g` waits for the cursor row to read the
+    # walk's first row again (`press_home`): the stale screen must not name the row the
+    # TUI is no longer on (H74).
+    first_row = cursor_row(seen_text[0]) or ""
+    homed = press_home(term, first_row)
     under = (cursor_row(term.text()) or "").strip()
     node = node_at_cursor(under, nodes)
-    if not c.check("T7-19: the row under the cursor after `g` is a node of the live read",
-                   node is not None, f"row {under!r}; {ctx.screen('t7-19')}"):
+    if not c.check("T7-19: `g` put the cursor back on the walk's first row and the row under it is a "
+                   "node of the live read (H74)", homed and node is not None,
+                   f"homed {homed}; row {under!r}; the walk's first row {first_row!r}; {ctx.screen('t7-19')}"):
         return
     first_flows = [str(f) for f in (node.get("flows") or [])]
     if not c.check("T7-19: the node under the cursor carries a flow to open", bool(first_flows),
@@ -3438,6 +3460,28 @@ def selftest():
             and line_with(issues_frame(), "S severity").split("│")[1].strip() == issues_filter
             and issues_detail == "c confirm · f false positive · u reopen · ⏎ open flow · P PoC",
             repr(issues_filter))
+    # Cell item from the fifth live smoke run: H74. After the Nodes walk the cursor sat on
+    # the last row; `g` was pressed and the next read, satisfied by the stale screen, took
+    # the last row (`POST /login`) for the row under the cursor while the TUI homed and
+    # opened the first node's flow (`GET /`).
+    first_row = cursor_row(sitemap_frame(cursor=0))
+    last_frame = sitemap_frame(cursor=2)
+    homing = ScriptedScreens([last_frame, last_frame, sitemap_frame(cursor=0)])
+    homed = press_home(homing, first_row, timeout=3.0)
+    stuck = ScriptedScreens([last_frame])
+    stuck_home = press_home(stuck, first_row, timeout=0.4)
+    c.check("selftest: press_home presses `g` and waits for the cursor row to read the walk's first "
+            "row: the stale screen with the `>` still on the last row (`POST /login`, which the old "
+            "`is not None` read took at once) does not end the wait, the homed frame two reads later "
+            "does; a screen that never homes runs the whole wait and answers False (H74)",
+            homed is True and homing.reads == 3 and homing.keys == ["g"]
+            and (cursor_row(last_frame) or "").strip().startswith("POST /login")
+            and cursor_row(last_frame) is not None and first_row.strip().startswith("GET  /search")
+            and stuck_home is False and stuck.reads >= 3
+            and node_at_cursor((cursor_row(last_frame) or "").strip(), SITEMAP_NODES) is SITEMAP_NODES[2],
+            f"homed {homed} after {homing.reads} reads keys {homing.keys}; stuck {stuck_home} after "
+            f"{stuck.reads}; last row {cursor_row(last_frame)!r} first {first_row!r}")
+
     rust = {name: rust_hints(RUST_KEY_TABLES, name) for name in
             ("PROFILES_KEYS", "JOBS_KEYS", "SITEMAP_KEYS", "ISSUES_KEYS", "ISSUES_FILTER_KEYS")}
     c.check("selftest: the key tuples the frames paint from are the Rust key tables' "
