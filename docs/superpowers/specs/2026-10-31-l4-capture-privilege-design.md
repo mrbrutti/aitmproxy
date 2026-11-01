@@ -1,6 +1,6 @@
 # L4 capture privilege, obtained by the product design
 
-**Status:** Draft, awaiting Matt (forks i–v and the headless-doc acceptance open). The orchestrator's bundle-layout
+**Status:** Approved (Matt, 2026-11-01: the recommended defaults for forks i–v). Decided: (i) macOS phase 1 ships B2, the SMAppService-registered permission daemon, with the single privileged helper (candidate 1) as phase 2; (ii) device group `access_bpf` (switch to `admin` only if spike S4 shows a re-login is needed); (iii) the Linux helper + polkit policy ship in deb/rpm only, no Homebrew cask pkg; (iv) "Allow packet capture" stays a separate switch from All Apps; (v) the first-run card keeps line 4 ("Any app you run can then capture and send raw packets"). Open: Matt's written acceptance of the headless `setcap` doc pointer. The orchestrator's bundle-layout conditions are folded into the body; the spikes run under the spike rule before phase 1 code.
 conditions (2026-10-31, approved in principle) are folded into §2.3, §2.4, §3.2, §4.4, §4.5 and §10; the
 release-pipeline files stay claimed through the orchestrator, which reviews those diffs. Panel fixes of 2026-10-31
 folded in.
@@ -801,20 +801,4 @@ these run on Matt's Mac via the Terminal and CUA recipe. **[linux-desk]** a Linu
 
 ## Open questions
 
-Only Matt can answer these. Most important first; each has a recommended default.
-
-1. **(i) B2 now, or straight to the candidate-1 helper on macOS?** *Default: B2 now, candidate 1 in Phase 2.* B2
-   works for every frontend within one release; candidate 1 needs a launchd socket protocol, code-signature peer auth
-   and a macOS helper backend (weeks). The cost of B2 is T1 until Phase 2.
-2. **(ii) Group `access_bpf` or `admin`?** *Default: `access_bpf`.* It is Wireshark's group, so the two ChmodBPF
-   daemons agree at boot, and it can exclude other admin accounts. `admin` needs no group work and no re-login. If
-   spike S4 shows `access_bpf` membership needs a re-login, I would switch to `admin`.
-3. **(iii) Linux helper in deb/rpm only, or also a Homebrew cask `pkg` for macOS CLI-only users?** *Default: deb/rpm
-   only.* On macOS the app is the privilege path; a `pkg` is a second privileged install path that prompts for sudo.
-4. **(iv) One "Allow packet capture" that also turns on All Apps (the extension), or separate switches?** *Default:
-   separate.* Different OS approvals, risks and results (raw frames vs other apps' flows); neither needs the other.
-5. **(v) Card honesty.** Is the plain checklist wording in §3.2 (especially line 4's "Any app you run can then capture
-   and send raw packets") the honesty level you want? *Default: yes, as written.*
-6. **Headless setcap doc.** May `docs/packet-capture.md` describe the setcap / NixOS fallback (§5.6), and may the
-   `cannot_prompt` message point at it? It is a command-line step for admins of headless hosts. *Default: yes, docs
-   only, never as a product default;* needs your written acceptance.
+Forks (i)–(v) were decided by Matt on 2026-11-01 (see Status). One item stays open: Matt's written acceptance that `docs/packet-capture.md` may describe `setcap` on the helper as the headless Linux fallback (never the product's default path).

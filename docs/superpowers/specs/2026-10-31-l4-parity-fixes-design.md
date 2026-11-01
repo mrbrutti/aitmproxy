@@ -1,6 +1,6 @@
 # L4 parity fixes design
 
-**Status:** Approved for the pre-approved small fixes (Matt, 2026-10-31, via the orchestrator); forks (i) and (iii) decided on their defaults; fork (ii), the operator scope add, is with Matt and ships as its own PR (`fix/l4-parity-core-scope`, §7(a')); panel fixes of 2026-10-31 folded in.
+**Status:** Approved (Matt, 2026-11-01: the recommended defaults for every fork). Fork (ii) decided: the operator adds L4 scope through confirm-over-the-wire; the agent Widen gate governs agents only. Ships as unit (a') on `fix/l4-parity-core-scope` after unit (a) (#215) and (e) (#216). Panel fixes of 2026-10-31 folded in.
 **Research inputs:** `docs/research/12-l4-parity-audit.md` (defects D0–D15, D11 split into D11a/D11b), `docs/research/05-synthesis.md`.
 **Stays consistent with:** `docs/superpowers/specs/2026-10-28-aitmproxy-l4-operator-surfaces-design.md` (Part 2 policy, §3 UI contract, L4OPS-AC*), `docs/superpowers/specs/2026-10-27-aitmproxy-m5-l4-packet-mitm-design.md` (L4Guard / L4Permit authorisation model), `docs/design/languages/flow-kinds.json` (`l4` descriptor), `docs/design/languages/filter.grammar.json` (`~l4 ~tcp ~udp ~icmp`).
 **Related:** `docs/superpowers/specs/2026-10-31-l4-capture-privilege-design.md` (D0, the product obtaining capture privilege; it layers an optional `privilege` object on this spec's status shape, §1). `docs/superpowers/specs/2026-10-31-capture-status-verb-design.md` is unrelated: its `capture.status` reports NE flows, while `l4.capture.status` here reports raw frames.
