@@ -153,8 +153,8 @@ After, while loading (frames redraw in place; shown mid-way):
 ›•‹ aitmproxy 0.5.11
 
   ✓ config defaults · ~/Library/Application Support/aitmproxy/config.yaml not found
-  ✓ CA created · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ 49 detections ready
+  ✓ CA created · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ⠹ starting obscura
 ```
 
@@ -164,8 +164,8 @@ After, ready (final screen):
 ›•‹ aitmproxy 0.5.11
 
   ✓ config defaults · ~/Library/Application Support/aitmproxy/config.yaml not found
-  ✓ CA created · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ 49 detections ready
+  ✓ CA created · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ obscura probed 0.3.1
   ✓ proxy listening 127.0.0.1:8080 · browser proxy 127.0.0.1:8081
 
@@ -187,8 +187,8 @@ Colour: mark and wordmark accent; `✓` success; `●` success; `untrusted` and 
 ```text
 aitmproxy 0.5.11
 config defaults · /Users/matt/Library/Application Support/aitmproxy/config.yaml not found
-CA created · /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt
 49 detections ready
+CA created · /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt
 obscura probed 0.3.1
 proxy listening 127.0.0.1:8080 · browser proxy 127.0.0.1:8081
 Bus: stdio (MCP)
@@ -217,8 +217,8 @@ After, TTY:
 ›•‹ aitmproxy 0.5.11
 
   ✓ config ~/Library/Application Support/aitmproxy/config.yaml
-  ✓ CA loaded · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ 49 detections ready
+  ✓ CA loaded · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✕ binding ports
 
 ✕ cannot start: the proxy port 127.0.0.1:8080 is already in use
@@ -239,8 +239,8 @@ After, piped (`2>file` or the e2e merged log):
 ```text
 aitmproxy 0.5.11
 config /Users/matt/Library/Application Support/aitmproxy/config.yaml
-CA loaded · /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt
 49 detections ready
+CA loaded · /Users/matt/Library/Application Support/aitmproxy/ca/ca.crt
 error: binding ports
 error: cannot start: the proxy port 127.0.0.1:8080 is already in use
   It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.
@@ -369,8 +369,8 @@ Piped, `flow table` prints tab-separated rows without a header and without trunc
 ›•‹ aitmproxy 0.5.11
 
   ✓ config ~/Library/Application Support/aitmproxy/config.yaml
-  ✓ CA loaded · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ 49 detections ready
+  ✓ CA loaded · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ obscura probed 0.3.1
   ✓ proxy listening 127.0.0.1:8080 · browser proxy 127.0.0.1:8081
   ✓ web UI listening 127.0.0.1:8082
@@ -395,8 +395,8 @@ The URL rows are printed whole (tokens shown shortened here only). The whole car
 ›•‹ aitmproxy 0.5.11
 
   ✓ config ~/Library/Application Support/aitmproxy/config.yaml
-  ✓ CA loaded · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ✓ 49 detections ready
+  ✓ CA loaded · ~/Library/Application Support/aitmproxy/ca/ca.crt
   ⠼ starting obscura
 ```
 
@@ -407,8 +407,8 @@ When the last phase completes the reporter clears its lines (cursor up + clear p
 ### D1. Crate layout
 
 - `crates/aitm-term/` (new, `aitm-term`, lib only): `caps.rs`, `style.rs`, `glyphs.rs`, `reporter.rs` (the renderer, ticker thread, live region), `card.rs`, `error.rs`, `tracing_layer.rs`, `text.rs` (width, truncate, wrap, `~` shortening), `lib.rs` re-exports. Dependencies: `crossterm 0.29` (default features), `unicode-width 0.2`, `tracing 0.1`, `tracing-subscriber 0.3` (`registry`, `std`; the `env-filter` feature is `aitm`'s), `anyhow 1`. Workspace member and `workspace.dependencies` entry.
-- `crates/aitm/src/startup.rs` (new): everything that knows aitmproxy — `TermOpts` parsing, pre-boot dispatch, tracing composition and the log file, `StartupError`, `report_for`, `ReadyInputs → Card`, the CA/system-proxy word mapping. `main.rs` calls into it.
-- `crates/aitm-core/src/config.rs`: `default_aitm_dir` becomes `pub` (one line) so the log directory is `<aitm dir>/logs`.
+- `crates/aitm/src/startup/` (new module, split into `mod.rs`, `args.rs`, `errors.rs`, `log.rs`, `card.rs` so parallel builders never share a file): everything that knows aitmproxy — `TermOpts` parsing, pre-boot dispatch, tracing composition and the log file, `StartupError`, `report_for`, `ReadyInputs → Card`, the CA/system-proxy word mapping. `main.rs` calls into it.
+- `crates/aitm-core`: **no edit** (amendment B). The log directory is derived the way `config_file::default_config_path` already derives the config path, `aitm_core::CaConfig::default().audit_log.with_file_name("logs")`, so the file is `<aitm dir>/logs/aitm.log` with the same platform fallbacks.
 - `crates/aitm-ca`: expose the store-status read the `ca.status` command already performs as a method the ready card can call (shape left to the builder) so the CA word cannot diverge between `ca status` and the card.
 - `crates/aitm/src/tui.rs`: `init_tracing` is replaced by the shared composition; `TuiLog::File(path)` is returned for the toast (`embedded proxy · log: <path>`).
 
@@ -493,6 +493,7 @@ Behaviour:
 - TTY (`animate`): the live region is redrawn with `MoveUp(n)`, `MoveToColumn(0)`, `Clear(CurrentLine)` per line, wrapped in `BeginSynchronizedUpdate`/`EndSynchronizedUpdate`; the cursor is hidden while a spinner runs and shown again by `finish`, `error`, and a `Drop` guard; `Ctrl-C` during startup restores the cursor through the same guard (the existing `shutdown_signal` path returns through `main`).
 - Non-TTY or `animate=false`: `phase()` prints nothing; `done()`/`fail()` print one line (`<summary>` / `error: <what>`); `warn()` prints `warning: <line>`; `card()` prints `Label: value · command` lines; no ESC bytes ever.
 - `Quiet`: phases, header and card are suppressed; `warn` and `error` still print.
+- A phase that spawns an OS process for the report itself (`checking CA trust`, which shells out to the trust store) exists only in the serving modes (`Server`, `Web`, `Tui`); a one-shot `aitm <group> <verb>` and the pre-boot paths never add a process spawn (amendment A; AC-W1-30 keeps the one-shot within 5 ms of 0.5.10).
 - A phase that fails is followed by the error panel from `main`; the panel is never printed twice (the `Phase::fail` line and the panel are distinct: the line names the step, the panel the cause).
 
 ### D5. Card
@@ -564,7 +565,7 @@ pub struct UiEvent { pub level: tracing::Level, pub target: String, pub message:
 ```
 
 One `tracing_subscriber::registry()` with three layers, each with its own filter **(Orchestrator's call)**:
-- **File layer**: `fmt::layer().with_ansi(false).with_writer(Mutex<File>)`, filter = `RUST_LOG` when set and non-empty, else `-vv` → `debug,<noisy crates>=warn`, else `DEFAULT_LOG_DIRECTIVE` (INFO with the curated noisy-crate caps). The file is `<default_aitm_dir()>/logs/aitm.log` (`~/Library/Application Support/aitmproxy/logs/aitm.log` on macOS, `$XDG_CONFIG_HOME/aitmproxy/logs/aitm.log` on Linux), overridable by `AITM_LOG_FILE=<path>` **(Architect's call; `AITM_TUI_LOG` stays honoured in tui mode for one release)**; directory created `0700`; file opened `O_CREAT|O_APPEND|O_WRONLY|O_NOFOLLOW` mode `0600`; if it is larger than **10 MiB** at open it is renamed to `aitm.log.1` (replacing any older `.1`) before opening **(Orchestrator's call; the figure is the Architect's)**; no mid-run rotation in W1. If the file cannot be opened, `LogSink.problem` is set, one `warn` line is printed (`! log file unavailable: <why> · running without a log`), and startup continues.
+- **File layer**: `fmt::layer().with_ansi(false).with_writer(Mutex<File>)`, filter = `RUST_LOG` when set and non-empty, else `-vv` → `debug,<noisy crates>=warn`, else `DEFAULT_LOG_DIRECTIVE` (INFO with the curated noisy-crate caps). The file is `CaConfig::default().audit_log.with_file_name("logs").join("aitm.log")` (`~/Library/Application Support/aitmproxy/logs/aitm.log` on macOS, `$XDG_CONFIG_HOME/aitmproxy/logs/aitm.log` on Linux; no `aitm-core` edit, amendment B), overridable by `AITM_LOG_FILE=<path>` **(Architect's call; `AITM_TUI_LOG` stays honoured in tui mode for one release)**; directory created `0700`; file opened `O_CREAT|O_APPEND|O_WRONLY|O_NOFOLLOW` mode `0600`; if it is larger than **10 MiB** at open it is renamed to `aitm.log.1` (replacing any older `.1`) before opening **(Orchestrator's call; the figure is the Architect's)**; no mid-run rotation in W1. If the file cannot be opened, `LogSink.problem` is set, one `warn` line is printed (`! log file unavailable: <why> · running without a log`), and startup continues.
 - **UiLayer**: `filter = LevelFilter::WARN` on every target (so the noisy crates' WARNs still surface); `on_event` records the `message` field and the other fields and sends a `UiEvent`; the reporter prints it as `! <message> · k=v · k=v` (dim fields) above the live region, or as `warning: <message> k=v` in plain mode. ERROR events render with the failed glyph. Never on stdout.
 - **Stderr layer** (optional): installed only when `RUST_LOG` is set and non-empty (back-compat raw stream, filter = `RUST_LOG`), or `-v` (filter INFO + curated caps) or `-vv` (DEBUG + caps); `with_ansi(caps.color)`, writer `std::io::stderr`. When it is installed the UiLayer is not (no double warnings) and `Caps.animate` is false.
 - Per-script lines: `aitm_plugin_rhai::loader` `loaded script` and `aitm::scripts` `script loaded into the host` drop from INFO to DEBUG (two one-word edits in `loader.rs` and `main.rs`). `CDP endpoint is loopback-only and unauthenticated` stays INFO in the file (not a WARN; it is a fact, not a problem — R20 is addressed by it no longer reaching the terminal).
@@ -609,9 +610,9 @@ pub fn ca_word(stores: &[aitm_ca::store::StoreStatus]) -> Option<CaWord>;   // T
 pub fn system_proxy_row(s: &aitm_sysproxy::Summary) -> (String, Option<FixCommand>);
 ```
 
-Sources, all in-process in `run()` where the values already exist: `proxy`/`browser` from the pre-bound listeners; `bus` from `cfg.mcp.transport` and `configured_agent_port`; `web_url`/`operator_url` from `web::ui_url`/`operator_ui_url` (W1 keeps those functions); `ca` from the aitm-ca store read (a phase `checking CA trust`, since it shells out to `security`; on error or all-`unknown` → `None`); `scope_hosts` = `cfg.scope.entries.len()`; `system_proxy` = `sysproxy.summary()` after the startup recovery; `log` from `LogSink`. The headline is composed exactly as the TUI pill (T7). Next-step rows: `Scope` when empty (`NOTHING_DECRYPTED_ADVICE` + `aitm scope add --host <host>`); `CA` when `Untrusted` (`aitm ca install`); `System proxy` when `off`/`other` (`aitm proxy system set`). The `Log` row is always last and dim.
+Sources, all in-process in `run()` where the values already exist: `proxy`/`browser` from the pre-bound listeners; `bus` from `cfg.mcp.transport` and `configured_agent_port`; `web_url`/`operator_url` from `web::ui_url`/`operator_ui_url` (W1 keeps those functions); `ca` from the aitm-ca store read (a phase `checking CA trust`, since it shells out to `security`; **serving modes only**, never for a one-shot `aitm <group> <verb>` and never on the pre-boot paths, amendment A; on error or all-`unknown` → `None`); `scope_hosts` = `cfg.scope.entries.len()`; `system_proxy` = `sysproxy.summary()` after the startup recovery; `log` from `LogSink`. The headline is composed exactly as the TUI pill (T7). Next-step rows: `Scope` when empty (`NOTHING_DECRYPTED_ADVICE` + `aitm scope add --host <host>`); `CA` when `Untrusted` (`aitm ca install`); `System proxy` when `off`/`other` (`aitm proxy system set`). The `Log` row is always last and dim.
 
-Phases in `run()`, in order, with their done summaries: `reading config` → `config <path>` / `config defaults · <path> not found`; `preparing CA` → `CA loaded · <path>` / `CA created · <path>` (the CA phase wraps `wire::assemble`; whether a key was created is read by comparing the key file's existence before and after, since `wire.rs` is frozen); `loading detections` → `<n> detections ready`; `binding ports` → `proxy listening <addr> · browser proxy <addr>` (+ ` · web UI listening <addr>` for `aitm web`); `restoring system proxy` (only when the recovery did something; summary from `log_recovery`'s words); `starting obscura` → `obscura probed <version>` / `fail`-less `warn`: the existing `embedded browser unavailable; browser.* commands will error` WARN reaches the view through `UiLayer`, so the phase ends `done("browser unavailable")`; `checking CA trust` → `CA trusted` / `CA untrusted` / `CA trust unknown`. One-shot `aitm <verb>` runs the same phases but they finish under 100 ms, so nothing is drawn (M5's stderr stays empty on success).
+Phases in `run()`, in the real order of `crates/aitm/src/main.rs` (amendment C), with their done summaries: `reading config` (`load_settings` plus the env bridge) → `config <path>` / `config defaults · <path> not found`; `loading detections` (the Rhai tier `build_with_languages`, built before the proxy) → `<n> detections ready`; `preparing CA` (wraps `assemble_with_scripts`, which mints or loads the CA) → `CA loaded · <path>` / `CA created · <path>` (whether a key was created is read by comparing the key file's existence before and after, since `wire.rs` is frozen); `binding ports` → `proxy listening <addr> · browser proxy <addr>` (+ ` · web UI listening <addr>` for `aitm web`); `restoring system proxy` (only when the recovery did something; summary from the `Recovery` outcome); `starting obscura` → `obscura probed <version>` / `fail`-less `warn`: the existing `embedded browser unavailable; browser.* commands will error` WARN reaches the view through `UiLayer`, so the phase ends `done("browser unavailable")`; `checking CA trust` (serving modes only, amendment A) → `CA trusted` / `CA untrusted` / `CA trust unknown`. One-shot `aitm <verb>` runs the first three phases only (a `Mode::Cli` process returns before the ports, the browser and the trust read); they finish under 100 ms, so nothing is drawn (M5's stderr stays empty on success).
 
 ### D11. `aitm tui` handover
 
@@ -652,7 +653,7 @@ Phases in `run()`, in order, with their done summaries: `reading config` → `co
 
 ### D14. The no-bypass rule
 
-No human-facing text bypasses the layer. Allowed direct writers: `crates/aitm-term/src/**` (the renderer), `crates/aitm/src/render.rs` (`render_cli_value`, results to stdout), `crates/aitm/src/startup.rs` (the two pre-boot `stdout` writes), `crates/aitm-cli/src/confirm.rs` (the `[y/N]` prompt, until W3 routes it), and `#[cfg(test)]` code. A unit test in `crates/aitm` (`tests/no_bypass.rs`) walks `crates/aitm/src`, `crates/aitm-cli/src`, `crates/aitm-tui/src/*.rs` (not `main.rs`, which is the separate binary) and fails on any `println!`, `print!`, `eprintln!`, `eprint!` outside those files and outside `#[cfg(test)] mod tests` blocks; the allow-list lives in the test and every entry carries a one-line reason. W2 removes `confirm.rs` from the list when the prompt goes through the layer.
+No human-facing text bypasses the layer. Allowed direct writers: `crates/aitm-term/src/**` (the renderer), `crates/aitm/src/render.rs` (`render_cli_value`, results to stdout), `crates/aitm/src/startup/mod.rs` (`write_stdout`: the pre-boot `--version`/`--help` text, `aitm web --help`'s usage text and the `operator-token` confirmation), `crates/aitm-cli/src/confirm.rs` (the `[y/N]` prompt, until W3 routes it), and `#[cfg(test)]` code. A unit test in `crates/aitm` (`tests/no_bypass.rs`) walks `crates/aitm/src` and `crates/aitm-cli/src` (recursively) and fails on any `println!`, `print!`, `eprintln!`, `eprint!` outside those files and outside `#[cfg(test)] mod tests` blocks; the allow-list lives in the test and every entry carries a one-line reason. `crates/aitm-tui/src` is out of wave 1's scope (the TUI is a non-goal and wave 1 edits no file under `crates/aitm-tui`); it joins the scan in a later wave (amendment D). W2 removes `confirm.rs` from the list when the prompt goes through the layer.
 
 ### D15. Wave 2 design (fixed now so W1's API holds)
 
@@ -701,7 +702,7 @@ Each is observable on the real binary unless marked (unit). W1 unless tagged.
 25. **AC-W1-25** `aitm tui` in a real terminal: the `script` capture shows the phases, then clear-line sequences for each live line, then the alternate-screen enter (`ESC [ ? 1049 h`); after quitting the TUI the main screen shows only the header line from the reporter.
 26. **AC-W1-26** `aitm-tui --help 2>&1; echo $?` prints a text containing `usage: aitm-tui` and `2`.
 27. **AC-W1-27** `aitm web --help` prints a text containing `web operator UI` on stdout, exit 0.
-28. **AC-W1-28** No-bypass test (unit, `crates/aitm/tests/no_bypass.rs`): fails on any `println!`/`print!`/`eprintln!`/`eprint!` in `crates/aitm/src`, `crates/aitm-cli/src`, `crates/aitm-tui/src/*.rs` outside the allow-list in D14 and outside `#[cfg(test)]` blocks; passes on the W1 tree.
+28. **AC-W1-28** No-bypass test (unit, `crates/aitm/tests/no_bypass.rs`): fails on any `println!`/`print!`/`eprintln!`/`eprint!` in `crates/aitm/src` and `crates/aitm-cli/src` (recursively) outside the allow-list in D14 and outside `#[cfg(test)]` blocks; passes on the W1 tree. `crates/aitm-tui/src` joins the scan in a later wave (amendment D).
 29. **AC-W1-29** No stdout tracing (unit): a test scans `crates/aitm/src` and `crates/aitm-term/src` for `tracing_subscriber::fmt()` / `fmt::layer()` / `.init()` / `.try_init()` calls and asserts each is inside `startup::init_tracing` and carries a `with_writer`; plus the existing `web_listening_log_has_no_token`.
 30. **AC-W1-30** Performance: `/usr/bin/time` of `aitm scope list` (one-shot) and of `aitm --version` are within 5 ms of the 0.5.10 binary's medians for the one-shot and under 100 ms for `--version`; no `aitm-term` thread is alive after the ready card is printed (`ps -M <pid>` / `/proc/<pid>/task` count equals the 0.5.10 count).
 31. **AC-W2-1** `aitm --help` on a TTY prints the grouped help (19 groups, every registered verb) with aligned columns, dim descriptions wrapped to width, `Examples:` and `Learn more:`, exit 0, no file created; piped, the same text with zero ESC bytes.
@@ -740,14 +741,14 @@ Each is observable on the real binary unless marked (unit). W1 unless tagged.
 
 ## Open questions
 
-Only Matt can answer; defaults chosen so the plans can proceed.
+Status at approval (2026-11-01): questions 1–3 are routed to Matt through the orchestrator with the defaults below in force; questions 4–6 were decided at approval with their defaults. A different answer from Matt is a spec amendment.
 
-1. **R14, one-shot verbs and a running core.** Should `aitm scope add` (and every state-changing one-shot) reach a running core over the loopback bus when one exists, instead of a fresh in-memory proxy? Default: no change in W1–W3; W3 prints the honest `this one-shot proxy only` line (AC-W3-7). A yes becomes its own spec.
-2. **R11 for other one-shot verbs.** `aitm scope list` still boots the host (and mints a CA on a fresh `HOME`) because the registry needs the proxy. Should read-only verbs get a side-effect-free path? Default: W2's schema-only registry covers help; verbs keep booting (quietly, with the log file) until the R14 decision.
-3. **`aitm web` stdin EOF.** With the card now on stderr and nothing on stdout, `aitm web </dev/null` still exits 0 silently when the stdio MCP arm ends. Default: W1 adds nothing; the reporter prints `✓ stdin closed · stdio MCP transport ended` as its last line on that exit so the silence is gone, and the lifecycle fix stays routed separately.
-4. **`AITM_TERM` naming.** Keep `AITM_TERM=rich|ascii|plain` (default), or follow cargo's split (`AITM_TERM_UNICODE`, `AITM_TERM_PROGRESS`)?
-5. **Usage errors exit 2 for registry errors** (today 1): any script relying on exit 1 for `unknown command`? Default: 2 (uv, cargo-ish, our own mode errors already do).
-6. **Log location on macOS**: `~/Library/Application Support/aitmproxy/logs/` (default, beside the CA and config) or `~/Library/Logs/aitmproxy/` (Apple's Logs row, Homebrew precedent, visible in Console.app)?
+1. **R14, one-shot verbs and a running core** — *routed to Matt; default in force.* Should `aitm scope add` (and every state-changing one-shot) reach a running core over the loopback bus when one exists, instead of a fresh in-memory proxy? Default: no change in W1–W3; W3 prints the honest `this one-shot proxy only` line (AC-W3-7). A yes becomes its own spec.
+2. **R11 for other one-shot verbs** — *routed to Matt; default in force.* `aitm scope list` still boots the host (and mints a CA on a fresh `HOME`) because the registry needs the proxy. Should read-only verbs get a side-effect-free path? Default: W2's schema-only registry covers help; verbs keep booting (quietly, with the log file) until the R14 decision.
+3. **`aitm web` stdin EOF** — *routed to Matt; default in force.* With the card now on stderr and nothing on stdout, `aitm web </dev/null` still exits 0 silently when the stdio MCP arm ends. Default: W1 adds nothing; the reporter prints `✓ stdin closed · stdio MCP transport ended` as its last line on that exit so the silence is gone, and the lifecycle fix stays routed separately.
+4. **`AITM_TERM` naming** — *decided: keep `AITM_TERM=rich|ascii|plain`* (one variable, three words; cargo's two-variable split is not adopted).
+5. **Usage errors exit 2 for registry errors** (today 1) — *decided: exit 2* (uv, cargo-ish; our own mode usage errors already exit 2). No script in the tree relies on exit 1 for `unknown command`.
+6. **Log location on macOS** — *decided: the data dir*, `~/Library/Application Support/aitmproxy/logs/aitm.log`, beside the CA and the config (not `~/Library/Logs/aitmproxy/`), derived per amendment B.
 
 ## Summary
 
