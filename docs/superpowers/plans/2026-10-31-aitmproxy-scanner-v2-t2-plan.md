@@ -1062,6 +1062,9 @@ crates/aitm-scan-http/
      references them**. Anything still referenced (expected candidates: `commands.rs`, `reproduce.rs`,
      `passive.rs`) is reported to the coordinator by file and symbol, not refactored. If T1b is not
      on `main`, skip and say so in the PR body.
+  3b. **Session-lost hook**: if `aitm_scan_model::JobCtx` on `origin/main` has
+     `report_session_lost(&self)`, call it from the lane's loss path (`host.rs`/`session.rs`) and
+     add a `FakeJob` assertion that it was called once; otherwise note the pending hook in the PR body.
   4. **`wire.rs` pin check**: Task 20 already re-pinned `lane_slots_hold_the_http_lane` to `1`;
      after the merge confirm the literal survived and `collect_native_checks().len()` is whatever
      `main` pins (T3 may have flipped it).
@@ -1120,8 +1123,12 @@ is touched by Task 20 alone (the one literal), so every commit on the branch kee
   `session.lost: true`. The T2 session already left this in
   `side-session-notes/.../t2-http-lane-seed-needs.md` ("Open coordination point"); Task 22 greps
   T1b's engine for the literal and reports a mismatch to the coordinator rather than changing it.
-  If T1b drives the canary loop itself, the lane's monitor is left unarmed via `SessionMonitors`
-  (one constructor flag; call A5).
+  Coordinator decision 2026-10-31: the lane drives the canary exactly so; T1b additionally adds a
+  default-bodied `JobCtx::report_session_lost(&self)` and maps either signal to
+  `stopped_reason: session_lost` + `session.lost: true`. Task 22 step 3b: once `origin/main`'s
+  `aitm-scan-model` has that method, `SessionMonitor::check` (via `host.rs`) calls
+  `job.report_session_lost()` on loss, keeping the `Err` token regardless; absent the method, the
+  token alone is the contract.
 - **S2 lane preference.** The moment `aitm_scan_http::lane()` returns `Some`, `collect_lanes` hands
   it to the engine, which prefers a lane crate's lane over the interim one (D1). Task 20 flips the
   body last and re-pins the one `wire.rs` literal in the same commit (T1a call A23).
