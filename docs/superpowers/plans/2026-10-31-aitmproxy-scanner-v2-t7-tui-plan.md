@@ -441,6 +441,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix F | coder note | note | `read` values are now `ReadIssue { issue, dropped_flows }` (Deref to `Issue`); `follow_flow` added | spec D3 amended in this commit |
 | fix F | coder note | Minor | `follow_flow` defaults false, so the first `Tab` into a tall detail may leave the flows below the fold until `Down` | accepted (prescribed); Task 14's layout pass may set it on entering the Detail pane |
 | fix F | coder note | Minor | Jobs `labelled()` passes `width - 1`, Issues `width`; one spare cell differs | fix round G (deferred to the whole-branch pass) |
+| fix E+F | spec | re-review | E1 to E19 and F1 to F15 closed with the reports' literals; four file-placement Minors accepted (E4/E11/E16 edits inside the model and view were the natural site) | closed |
+| fix E+F | spec | Minor | D3 did not name `read_order` or the oldest-first eviction | spec D3 amended in this commit |
 
 ## Shipped
 
