@@ -1625,7 +1625,7 @@ Kept by the main session during stage 6. One row per finding.
 | T10-3 | T10 live run (external) | Important | Pre-existing: WS flows exposed no `request` to scripts, so `ws-cleartext-transport` and `ws-cross-site-hijack-indicator` never fired on live traffic | fixed in d2dda88a: handshake resolved from the store and projected as the script-visible request; `tests/ws_flow_view.rs` pins both scripts on real handshakes |
 | 14 | Coder (Task 15) | Important | `jobs::agent_gate` refuses an agent's `scan.map` under `auto`, contrary to AC T1-4 | fixed in 03158a6b |
 | 14 | Coder (Task 15) | Important | `trust_gate_scan` fails: `Caller::is_agent` deny-lists `Frontend::Mcp` instead of allow-listing trusted control | fixed in 03158a6b (`load_history` too) |
-| 14 | Coder (Task 16) | Important | `run_job` has no panic supervision: a panicking lane leaves the job in `cancelling` forever and its origin `busy` | fix dispatched 2026-11-01: the worker task is supervised; a panic ends the job `failed` with `stopped_reason: failed`, confinement dropped |
+| 14 | Coder (Task 16) | Important | `run_job` has no panic supervision: a panicking lane leaves the job in `cancelling` forever and its origin `busy` | fixed in 10e97b21 (job-level catch_unwind + per-check catch) |
 
 ## Shipped
 
