@@ -2,14 +2,31 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
+/// A parked login as the editor sees it: the request as it arrived (the core's backup) and
+/// the same request with one header added while paused.
+private enum RawHTTPInputs {
+    static let original = Make.message(
+        "POST /api/auth/login HTTP/2",
+        [("host", "auth.shop-staging.test"), ("content-type", "application/json"), ("accept", "*/*"),
+         ("user-agent", "curl/8.7.1")],
+        body: "{\n  \"email\": \"ops@shop-staging.test\",\n  \"password\": \"correct-horse-battery\",\n  \"remember\": true\n}")
+
+    static let edited: HTTPMessage = {
+        var message = original
+        message.headers.append(.init("x-forwarded-for", "127.0.0.1"))
+        return message
+    }()
+}
+
 @Suite struct RawHTTPTests {
-    @Test func roundTripsTheFixtureRequest() throws {
-        let text = RawHTTP.render(Fixtures.pausedLogin.request)
+    @Test func roundTripsAParkedRequest() throws {
+        let request = RawHTTPInputs.edited
+        let text = RawHTTP.render(request)
         #expect(text.hasPrefix("POST /api/auth/login HTTP/2\nhost: auth.shop-staging.test\n"))
         let parsed = try RawHTTP.parse(text)
-        #expect(parsed.startLine == Fixtures.pausedLogin.request.startLine)
-        #expect(parsed.headers == Fixtures.pausedLogin.request.headers)
-        #expect(parsed.bodyText == Fixtures.pausedLogin.request.bodyText)
+        #expect(parsed.startLine == request.startLine)
+        #expect(parsed.headers == request.headers)
+        #expect(parsed.bodyText == request.bodyText)
     }
 
     @Test func parsesEditsAndReportsErrors() throws {
@@ -28,8 +45,8 @@ import Testing
     }
 
     @Test func diffCountsChanges() {
-        let original = Fixtures.pausedLogin.originalRequest!
-        var edited = Fixtures.pausedLogin.request
+        let original = RawHTTPInputs.original
+        var edited = RawHTTPInputs.edited
         edited.body = Data("{}".utf8)
         let edits = RequestEdits.diff(from: original, to: edited)
         #expect(edits.headers?["x-forwarded-for"] == "127.0.0.1")

@@ -24,6 +24,19 @@ import Testing
     }
 }
 
+/// Inputs for `ComposeDraftTests`: the authorised hosts, and a parked login to prefill from.
+private enum ComposeInputs {
+    static let scope = ["api.shop-staging.test", "auth.shop-staging.test"]
+    static let loginRow = Make.row(seq: 1, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
+                                   state: .paused)
+    static let loginDetail = Make.detail(
+        id: "flow-1",
+        request: Make.message(
+            "POST /api/auth/login HTTP/2",
+            [("host", "auth.shop-staging.test"), ("content-type", "application/json"), ("accept", "*/*")],
+            body: "{\"email\": \"ops@shop-staging.test\", \"password\": \"correct-horse-battery\"}"))
+}
+
 @Suite struct ComposeDraftTests {
     @Test func buildsRequestEditsFromTheURL() {
         let draft = ComposeDraft(method: "POST", url: "https://api.shop-staging.test:8443/api/cart?x=1&y=two",
@@ -40,15 +53,14 @@ import Testing
 
     @Test func scopeDisablesSend() {
         let draft = ComposeDraft(url: "https://telemetry.vendor-analytics.example/v2/batch")
-        #expect(draft.validationError(scope: Fixtures.scope)?.hasPrefix("Out of scope") == true)
-        #expect(ComposeDraft(url: "https://api.shop-staging.test/x").validationError(scope: Fixtures.scope) == nil)
+        #expect(draft.validationError(scope: ComposeInputs.scope)?.hasPrefix("Out of scope") == true)
+        #expect(ComposeDraft(url: "https://api.shop-staging.test/x").validationError(scope: ComposeInputs.scope) == nil)
         #expect(ComposeDraft(url: "not a url").validationError(scope: []) != nil)
         #expect(ComposeDraft(url: "ftp://api.shop-staging.test/").validationError(scope: []) != nil)
     }
 
     @Test func prefillsFromAFlow() {
-        let row = Fixtures.rows[9]
-        let draft = ComposeDraft.from(detail: Fixtures.pausedLogin, row: row)
+        let draft = ComposeDraft.from(detail: ComposeInputs.loginDetail, row: ComposeInputs.loginRow)
         #expect(draft.method == "POST")
         #expect(draft.url == "https://auth.shop-staging.test/api/auth/login")
         #expect(!draft.headersText.contains("host:"))
