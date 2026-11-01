@@ -670,7 +670,7 @@
       "name": "probe.raw",
       "kind": "function",
       "signature": "probe.raw(#{ method, url, headers, body }) -> #{ status, headers, body, elapsed_ms, flow_id }",
-      "description": "Send a request the check built itself, for a handshake or header check a payload-at-a-point cannot express. Same origin, same budget. Only inside a check closure."
+      "description": "Send a request the check built itself, for a handshake or header check a payload-at-a-point cannot express. Same origin, same budget. `method` must be an HTTP token (letters, digits, !#$%&'*+-.^_`|~; max 32 bytes), default GET. Only inside a check closure."
     },
     {
       "name": "probe.marker",

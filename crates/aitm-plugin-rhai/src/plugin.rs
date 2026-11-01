@@ -346,7 +346,7 @@ impl LoadedScript {
     /// Run the script's `load(reg)` through the command/option bridge
     /// (`command.rs`), so what it registers lands in the platform registry the
     /// frontends read — a script command is an MCP tool and a CLI subcommand
-    /// with no special casing (spec §9). Called once, at startup, by
+    /// with no special casing (spec §9). Called at startup by
     /// [`ScriptHost::load`]; a script appended at runtime never reaches it,
     /// because the registry is sealed by then (why such a script's
     /// commands/options still need a restart).
@@ -355,6 +355,34 @@ impl LoadedScript {
     /// its hooks, because a broken registration is no reason to drop a working
     /// `on_request` (spec §8's error policy, applied to load).
     pub(crate) fn run_load(&self, reg: &mut Registry) {
+        // The failure is already logged and recorded as `last_error`; at
+        // startup there is no caller to hand it to.
+        let _ = self.load_into(reg);
+    }
+
+    /// Re-run the script's `load(reg)` after `script.reload` swapped in its
+    /// recompiled AST, so the checks the new source declares replace the ones
+    /// the old source did in the live catalogue (plan call B9: a reload swaps
+    /// exactly that script's checks) and its declared option defaults join the
+    /// options its hooks read.
+    ///
+    /// The platform `Registry` is sealed by now — it is shared read-only
+    /// (`Arc<Registry>`) with every frontend — so a command or option the
+    /// `load` registers has nowhere to land and still needs a restart, as the
+    /// `script.reload` / `script.save` contracts say. The bridge installs them
+    /// into a scratch registry that is dropped here; the checks go to the
+    /// shared [`CheckRegistry`] and the options to this script, both of which
+    /// are live. The failure, if any, is logged and recorded as `last_error`
+    /// like a failed hook, and returned so the command can report it.
+    pub(crate) fn rerun_load(&self) -> Result<(), ScriptError> {
+        let mut sealed_stand_in = Registry::new();
+        self.load_into(&mut sealed_stand_in)
+    }
+
+    /// The `load(reg)` bridge run shared by startup and reload: run the hook
+    /// over `reg`, record a failure on the error sink, and store the merged
+    /// options for the hooks.
+    fn load_into(&self, reg: &mut Registry) -> Result<(), ScriptError> {
         let ast = self.handle.current();
         // `load(reg)` can reach a seam host fn (`option`, …); `run_load` seeds this
         // boundary with the script's authoring trust (plus the options tag and the
@@ -368,7 +396,8 @@ impl LoadedScript {
         if let Some((checks, origin)) = &self.checks {
             handle = handle.with_checks(Arc::clone(checks), origin.clone());
         }
-        if let Err(err) = handle.run_load(&self.engine, &ast) {
+        let outcome = handle.run_load(&self.engine, &ast);
+        if let Err(err) = &outcome {
             tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
             // `script.list` shows it as `last_error`, like a failed hook; a
             // command script has no hook that would ever surface it otherwise.
@@ -376,6 +405,7 @@ impl LoadedScript {
         }
         // Defaults the script declared join the options its hooks read.
         self.options.store(Arc::new(handle.into_options()));
+        outcome
     }
 
     /// Run `hook` over `state` the way the spec's bridge describes: the whole
@@ -584,10 +614,16 @@ impl ScriptSet {
     /// The handle of the loaded script named `name`, if any — the lookup
     /// `script.reload` / `script.enable` / `script.disable` share.
     pub fn find_handle(&self, name: &str) -> Option<Arc<ScriptHandle>> {
+        self.find(name).map(|s| s.handle())
+    }
+
+    /// The loaded script named `name`, if any — what `script.reload` needs
+    /// beyond the handle, to re-run the script's `load(reg)` after the swap.
+    pub fn find(&self, name: &str) -> Option<Arc<LoadedScript>> {
         self.snapshot()
             .iter()
             .find(|s| s.name() == name)
-            .map(|s| s.handle())
+            .map(Arc::clone)
     }
 
     /// The loaded script names, in chain order — for the "no such script" miss

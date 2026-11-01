@@ -203,16 +203,24 @@ impl<'a> ScriptRegHandle<'a> {
     /// command and option it registered. A `load` that throws installs
     /// nothing and is reported as a `ScriptError` on hook `load`.
     ///
+    /// A script with no `load` declares no checks, and the catalogue is made
+    /// to say so: whatever this script registered before is dropped. At
+    /// startup that is a no-op; on a reload that removed `load`, it is how the
+    /// old checks leave the catalogue with the code that declared them.
+    ///
     /// `load` is called from `Proxy::build`, on the thread driving `main`'s
     /// future — inside the runtime. It crosses the same bridge as every other
     /// entry point (`engine::blocking`), so a guarded async verb in `load`
     /// works instead of panicking the proxy at startup, and it reads the
     /// configured options like a hook does.
     pub fn run_load(&mut self, engine: &Arc<Engine>, ast: &Arc<AST>) -> Result<(), ScriptError> {
+        let script = ast.source().unwrap_or("script").to_string();
         if !ast.iter_functions().any(|f| f.name == LOAD_HOOK) {
+            if let Some((registry, _)) = &self.checks {
+                registry.remove_source(&script);
+            }
             return Ok(());
         }
-        let script = ast.source().unwrap_or("script").to_string();
         let collector = RegCollector::default();
 
         // Seed the per-eval caller trust (the script's authoring trust) plus the
