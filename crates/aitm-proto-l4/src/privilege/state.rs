@@ -216,9 +216,17 @@ pub(crate) struct Shared {
     /// The SIGINT hold (spec §5.5): raised around a launcher child, read by
     /// the binary's shutdown future through a clone.
     hold: Mutex<HoldCount>,
+    /// The launcher child while its prompt is up (spec §5.5, panel 2): what
+    /// [`PrivilegeState::cancel_prompt`] sends SIGINT to. Set by the watcher
+    /// when a request's child is watched, cleared with the hold.
+    prompt_child: Mutex<Option<SharedChild>>,
     /// A watcher thread is running (a request in flight or a helper serving).
     watching: AtomicBool,
 }
+
+/// A watched child, shared between the watcher thread (which steps it) and
+/// `cancel_prompt` (which signals it).
+type SharedChild = Arc<Mutex<Box<dyn Child>>>;
 
 /// What `report()` keeps between probes.
 #[derive(Default)]
@@ -279,6 +287,7 @@ impl Shared {
             last_linux: Mutex::new(None),
             session_failure: Mutex::new(None),
             hold: Mutex::new(HoldCount::default()),
+            prompt_child: Mutex::new(None),
             watching: AtomicBool::new(false),
         })
     }
@@ -347,6 +356,33 @@ impl Shared {
     /// The SIGINT hold; clones share the count.
     fn sigint_hold(&self) -> HoldCount {
         lock(&self.hold).clone()
+    }
+
+    /// The launcher child whose prompt is up, if one is.
+    pub(crate) fn prompt_child(&self) -> Option<SharedChild> {
+        lock(&self.prompt_child).clone()
+    }
+
+    fn set_prompt_child(&self, child: Option<SharedChild>) {
+        *lock(&self.prompt_child) = child;
+    }
+
+    /// Move a still-`pending` request to `failed` with `message`; any other
+    /// progress (or none) is left as it is.
+    fn fail_if_pending(&self, message: &str) {
+        let mut cache = self.lock_cache();
+        if cache
+            .request
+            .as_ref()
+            .is_some_and(|req| req.state == RequestState::Pending)
+        {
+            cache.request = Some(RequestProgress {
+                state: RequestState::Failed,
+                at: self.now(),
+                message: message.to_string(),
+            });
+            cache.dirty = true;
+        }
     }
 
     fn watching(&self) -> bool {
@@ -419,6 +455,18 @@ impl PrivilegeState {
     #[must_use]
     pub fn sigint_hold(&self) -> HoldCount {
         self.shared.sigint_hold()
+    }
+
+    /// Cancel the prompt a held Ctrl-C was meant for (spec §5.5, panel 2):
+    /// when the core alone received the Ctrl-C (no shared foreground process
+    /// group), send the live launcher child SIGINT itself, so the prompt ends
+    /// now instead of at the 300 s timeout and the watcher records
+    /// `dismissed` through the §5.5 table. With no launcher alive (no request
+    /// in flight, or a directly started file-caps helper) this does nothing.
+    pub fn cancel_prompt(&self) {
+        if let Some(child) = self.shared.prompt_child() {
+            lock(&child).interrupt();
+        }
     }
 
     /// The one capture/inject backend every production caller holds (spec §2.1,
@@ -1031,19 +1079,19 @@ fn start_watch_with(shared: Arc<Shared>, pending: PendingWatch, progress: bool) 
     } = pending;
     shared.watching.store(true, Ordering::SeqCst);
     let thread_shared = Arc::clone(&shared);
+    // `run_watcher`'s guard clears `watching` when the thread ends, however
+    // it ends (a panic included).
     let built = std::thread::Builder::new()
         .name("l4-privilege-watch".to_string())
         .spawn(move || {
-            let watched = Arc::clone(&thread_shared);
             run_watcher(
-                watched,
+                thread_shared,
                 child,
                 Box::new(listener),
                 hold,
                 started_ms,
                 progress,
             );
-            thread_shared.watching.store(false, Ordering::SeqCst);
         });
     if let Err(err) = built {
         // The child handle went with the closure; its connect will find no
@@ -1085,57 +1133,54 @@ impl Acceptor for HelperListener {
 ///   `warn` at the first, then the child is killed and the progress is
 ///   `failed` with the socket error.
 ///
-/// In every terminal arm the listener is dropped (its socket path unlinked)
+/// Every terminal arm ends through one epilogue, [`Watch::end_request`]: the
+/// hold is released, the listener is dropped (its socket path unlinked)
 /// **before** the terminal progress row is written and before any reap, so a
 /// re-request that binds the same path never has it unlinked by this one.
+/// The [`Watch`] is also the thread's unwind guard (spec §5.5, panel 2): a
+/// panic releases the hold and the listener, moves a still-`pending` request
+/// to `failed` and clears `watching`.
 ///
 /// `progress` is false for a direct file-capability start, which nobody
-/// requested: it logs instead of writing request progress.
+/// requested: it logs instead of writing request progress, and its child is
+/// not a prompt, so it is never registered for `cancel_prompt`.
 pub(crate) fn run_watcher(
     shared: Arc<Shared>,
-    mut child: Box<dyn Child>,
+    child: Box<dyn Child>,
     acceptor: Box<dyn Acceptor>,
     hold: Box<dyn Any + Send>,
     started_ms: u64,
     progress: bool,
 ) {
-    let mut hold = Some(hold);
+    let mut watch = Watch::new(shared, child, acceptor, hold, started_ms, progress);
     let mut accept_errors = 0usize;
-    let record = |state: RequestState, message: &str| {
-        if progress {
-            shared.set_progress(state, message);
-        }
-    };
     loop {
-        match acceptor.accept(child.id(), ACCEPT_SLICE) {
+        match watch.accept() {
             Ok(session) => {
-                drop(hold.take());
-                match attach_session(&shared, session) {
+                watch.release_prompt();
+                match attach_session(&watch.shared, session) {
                     Ok(backend) => {
-                        shared.set_live(Some(Arc::clone(&backend) as Arc<dyn LiveBackend>));
-                        record(RequestState::Approved, msg::APPROVED);
-                        shared.mark_dirty();
+                        watch
+                            .shared
+                            .set_live(Some(Arc::clone(&backend) as Arc<dyn LiveBackend>));
+                        watch.record(RequestState::Approved, msg::APPROVED);
+                        watch.shared.mark_dirty();
                         tracing::info!("L4 packet-capture helper connected");
-                        drop(acceptor);
+                        drop(watch.acceptor.take());
                         while backend.is_live() {
                             std::thread::sleep(LIVE_POLL);
                         }
-                        shared.set_live(None);
-                        shared.mark_dirty();
+                        watch.shared.set_live(None);
+                        watch.shared.mark_dirty();
                         tracing::info!("L4 packet-capture helper session ended");
-                        reap(child.as_mut());
+                        watch.reap();
                     }
                     Err(message) => {
                         tracing::warn!(
                             reason = %message,
                             "the packet-capture helper connected but could not be attached"
                         );
-                        // The listener (and its socket path) goes before the
-                        // terminal row: a re-request may bind the same path.
-                        drop(acceptor);
-                        record(RequestState::Failed, &message);
-                        child.kill();
-                        reap(child.as_mut());
+                        watch.end_request(RequestState::Failed, &message, true);
                     }
                 }
                 return;
@@ -1156,28 +1201,19 @@ pub(crate) fn run_watcher(
                     tracing::warn!(error = %err, "the packet-capture socket failed to accept");
                 }
                 if accept_errors >= ACCEPT_ERRORS_MAX {
-                    drop(hold.take());
-                    child.kill();
-                    drop(acceptor);
                     let message = format!(
                         "{} ({})",
                         msg::SOCKET_FAILED,
                         bounded_text(&err.to_string(), TEXT_BOUND)
                     );
-                    tracing::info!(
-                        state = RequestState::Failed.as_str(),
-                        reason = %message,
-                        "L4 packet-capture request ended"
-                    );
-                    record(RequestState::Failed, &message);
-                    reap(child.as_mut());
+                    watch.end_request(RequestState::Failed, &message, true);
                     return;
                 }
                 std::thread::sleep(ACCEPT_SLICE);
             }
         }
 
-        match watch_step(child.as_mut(), started_ms, shared.now()) {
+        match watch.step() {
             WatchOutcome::Waiting => {}
             WatchOutcome::Ended {
                 reason,
@@ -1190,24 +1226,134 @@ pub(crate) fn run_watcher(
                          authentication agent"
                     );
                 }
-                drop(hold.take());
-                // The listener unlinks the socket path on drop: it must be
-                // gone before the terminal row is readable (a reader may
-                // re-request at once and bind the same path) and before the
-                // reap, which can wait up to `REAP_WAIT`.
-                drop(acceptor);
-                tracing::info!(
-                    state = state.as_str(),
-                    reason = %message,
-                    "L4 packet-capture request ended"
-                );
-                record(state, &message);
-                if reason == ExitClass::TimedOut {
-                    reap(child.as_mut());
-                }
+                // A timed-out child was killed by `watch_step`; any other
+                // ending was the child's own. Either way the epilogue reaps.
+                watch.end_request(state, &message, false);
                 return;
             }
         }
+    }
+}
+
+/// One watch, owned by the watcher thread: the child (shared with
+/// `cancel_prompt` while it is a prompt), the listener, the SIGINT hold, and
+/// the thread's unwind guard. Its `Drop` is the panic path: whatever the
+/// watcher was doing, the hold and the listener go, a still-`pending` request
+/// reads `failed`, and `watching` is cleared.
+struct Watch {
+    shared: Arc<Shared>,
+    child: SharedChild,
+    acceptor: Option<Box<dyn Acceptor>>,
+    hold: Option<Box<dyn Any + Send>>,
+    started_ms: u64,
+    progress: bool,
+}
+
+impl Watch {
+    fn new(
+        shared: Arc<Shared>,
+        child: Box<dyn Child>,
+        acceptor: Box<dyn Acceptor>,
+        hold: Box<dyn Any + Send>,
+        started_ms: u64,
+        progress: bool,
+    ) -> Self {
+        let child: SharedChild = Arc::new(Mutex::new(child));
+        if progress {
+            // A request's child is a prompt: a held Ctrl-C may cancel it.
+            shared.set_prompt_child(Some(Arc::clone(&child)));
+        }
+        Watch {
+            shared,
+            child,
+            acceptor: Some(acceptor),
+            hold: Some(hold),
+            started_ms,
+            progress,
+        }
+    }
+
+    /// One checked accept slice on the listener.
+    fn accept(&self) -> Result<HelperSession, SessionError> {
+        let Some(acceptor) = &self.acceptor else {
+            return Err(SessionError::Timeout);
+        };
+        let pid = lock(&self.child).id();
+        acceptor.accept(pid, ACCEPT_SLICE)
+    }
+
+    /// One [`watch_step`] on the injected clock.
+    fn step(&self) -> WatchOutcome {
+        watch_step(
+            lock(&self.child).as_mut(),
+            self.started_ms,
+            self.shared.now(),
+        )
+    }
+
+    /// Write request progress; a direct start writes none.
+    fn record(&self, state: RequestState, message: &str) {
+        if self.progress {
+            self.shared.set_progress(state, message);
+        }
+    }
+
+    /// The prompt is over (the helper connected, or the child ended): release
+    /// the SIGINT hold and unregister the child from `cancel_prompt`.
+    fn release_prompt(&mut self) {
+        drop(self.hold.take());
+        if self.progress {
+            self.shared.set_prompt_child(None);
+        }
+    }
+
+    /// The one epilogue of every terminal arm (S1 ordering): the prompt is
+    /// over, the listener (and its socket path) goes **before** the terminal
+    /// row, the child is killed when `kill` says so, one `info` line names
+    /// the end, the row is recorded, and the child is reaped (bounded).
+    fn end_request(&mut self, state: RequestState, message: &str, kill: bool) {
+        self.release_prompt();
+        drop(self.acceptor.take());
+        if kill {
+            lock(&self.child).kill();
+        }
+        tracing::info!(
+            state = state.as_str(),
+            reason = %message,
+            "L4 packet-capture request ended"
+        );
+        self.record(state, message);
+        self.reap();
+    }
+
+    /// Wait, bounded, for an ended or killed child to be reaped; a launcher
+    /// that refused the kill (another user) is left to the OS. The child's
+    /// lock is taken per poll, never across the wait.
+    fn reap(&self) {
+        let deadline = Instant::now() + REAP_WAIT;
+        loop {
+            match lock(&self.child).try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => return,
+                Ok(None) => {}
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        // The normal arms have already released everything; this is the
+        // unwind path, and the idempotent tail of the normal one.
+        let panicking = std::thread::panicking();
+        self.release_prompt();
+        drop(self.acceptor.take());
+        if panicking && self.progress {
+            tracing::warn!("the packet-capture watcher ended unexpectedly");
+            self.shared.fail_if_pending(msg::ENDED_UNEXPECTEDLY);
+        }
+        self.shared.watching.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1235,19 +1381,6 @@ fn attach_session(
     HelperBackend::new(Arc::new(session), guard)
         .map(Arc::new)
         .map_err(|err| err.to_string())
-}
-
-/// Wait, bounded, for an ended or killed child to be reaped; a launcher that
-/// refused the kill (another user) is left to the OS.
-fn reap(child: &mut dyn Child) {
-    let deadline = Instant::now() + REAP_WAIT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if Instant::now() >= deadline => return,
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
 }
 
 /// The platform this build runs on, in the report's vocabulary.
@@ -1966,6 +2099,206 @@ mod tests {
         }
     }
 
+    // ---- fix task C 2026-11-01 (p1b panel 2): C4 cancel on a held Ctrl-C,
+    // C5 the watcher's unwind guard ----------------------------------------
+
+    /// Plan P1b.14 `held_ctrl_c_alone_cancels_the_prompt` (panel 2; spec §5.5
+    /// as amended): a Ctrl-C that reaches the core alone must still end the
+    /// prompt. With a launcher child alive and the hold at 1,
+    /// `cancel_prompt()` sends that child SIGINT (not SIGKILL, so the §5.5
+    /// table records `dismissed`); the watcher then records `dismissed`,
+    /// "Approval was cancelled", and the hold is 0. With no child it changes
+    /// nothing, before the request and after it. A directly started
+    /// file-caps helper is not a prompt and is never signalled.
+    #[test]
+    fn held_ctrl_c_alone_cancels_the_prompt() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(6_000, Ordering::SeqCst);
+        let holds = HoldCount::default();
+
+        // No child yet: a no-op.
+        state.cancel_prompt();
+        assert_eq!(state.report().request, None);
+
+        let child = FakeChild::alive(4242);
+        let signals = Arc::clone(&child.signals);
+        let killed = Arc::clone(&child.killed);
+        let hold = holds.hold();
+        let shared = Arc::clone(&state.shared);
+        let watcher = std::thread::spawn(move || {
+            run_watcher(shared, Box::new(child), Box::new(NoPeer), hold, 6_000, true);
+        });
+        until("the launcher to be registered as the prompt", || {
+            state.shared.prompt_child().is_some()
+        });
+        assert_eq!(holds.count(), 1, "the prompt is up");
+
+        state.cancel_prompt();
+        watcher.join().expect("the watcher ended the request");
+        assert_eq!(
+            *signals.lock().unwrap(),
+            vec![crate::privilege::linux::SIGINT],
+            "the child got exactly one SIGINT"
+        );
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            0,
+            "never SIGKILL for a cancel"
+        );
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Dismissed,
+                at: 6_000,
+                message: "Approval was cancelled".to_string(),
+            })
+        );
+        assert_eq!(holds.count(), 0, "the hold is released with the child");
+        assert!(
+            state.shared.prompt_child().is_none(),
+            "no prompt left to cancel"
+        );
+
+        // After the request: a no-op again.
+        state.cancel_prompt();
+        assert_eq!(
+            state.report().request.map(|r| r.state),
+            Some(RequestState::Dismissed)
+        );
+
+        // A direct (launcher-less) start is not a prompt: never registered,
+        // never signalled, no progress written.
+        let (state, _now) = state_over(vec![row6()]);
+        let child = FakeChild {
+            ticks_left: 3,
+            exit: Some(ChildExit::Exited(0)),
+            ..FakeChild::alive(4243)
+        };
+        let signals = Arc::clone(&child.signals);
+        let registered = Arc::new(AtomicBool::new(false));
+        struct SeesPrompt(Arc<Shared>, Arc<AtomicBool>);
+        impl Acceptor for SeesPrompt {
+            fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+                if self.0.prompt_child().is_some() {
+                    self.1.store(true, Ordering::SeqCst);
+                }
+                Err(SessionError::Timeout)
+            }
+        }
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(child),
+            Box::new(SeesPrompt(
+                Arc::clone(&state.shared),
+                Arc::clone(&registered),
+            )),
+            Box::new(()),
+            0,
+            false,
+        );
+        assert!(
+            !registered.load(Ordering::SeqCst),
+            "a direct start is no prompt"
+        );
+        state.cancel_prompt();
+        assert!(signals.lock().unwrap().is_empty());
+        assert_eq!(state.report().request, None);
+    }
+
+    /// A child whose `try_wait` panics (a broken `waitpid` wrapper, a bug).
+    struct PanicsOnWait;
+
+    impl Child for PanicsOnWait {
+        fn id(&self) -> u32 {
+            4244
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
+            panic!("try_wait blew up");
+        }
+        fn kill(&mut self) {}
+        fn interrupt(&mut self) {}
+        fn stderr_tail(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// Plan P1b.14 `watcher_panic_releases_hold_and_ends_pending` (panel 2;
+    /// spec §5.5 as amended): the watcher thread carries an unwind guard. A
+    /// panic mid-watch leaves the request `failed` ("The packet-capture
+    /// request ended unexpectedly"), never `pending`; the hold is 0, the
+    /// prompt slot and the `watching` flag are clear, and the next
+    /// `request()` is accepted (not answered `pending`). A request that was
+    /// not pending is left as it was.
+    #[test]
+    fn watcher_panic_releases_hold_and_ends_pending() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(7_000, Ordering::SeqCst);
+        state.set_request(Some(RequestProgress {
+            state: RequestState::Pending,
+            at: 6_900,
+            message: msg::PENDING_DIALOG.to_string(),
+        }));
+        state.shared.watching.store(true, Ordering::SeqCst);
+        let holds = HoldCount::default();
+        let hold = holds.hold();
+        let shared = Arc::clone(&state.shared);
+        let crashed = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(PanicsOnWait),
+                Box::new(NoPeer),
+                hold,
+                7_000,
+                true,
+            );
+        })
+        .join();
+        assert!(crashed.is_err(), "the watcher panicked");
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 7_000,
+                message: "The packet-capture request ended unexpectedly".to_string(),
+            })
+        );
+        assert_eq!(holds.count(), 0, "the hold is released");
+        assert!(!state.shared.watching(), "no watcher is running");
+        assert!(state.shared.prompt_child().is_none());
+        let outcome = state.request();
+        assert_ne!(
+            outcome.outcome,
+            Outcome::Pending,
+            "a new request is accepted"
+        );
+
+        // Not pending (already dismissed): untouched by the guard.
+        let (state, now) = state_over(vec![row6()]);
+        now.store(8_000, Ordering::SeqCst);
+        let dismissed = RequestProgress {
+            state: RequestState::Dismissed,
+            at: 7_900,
+            message: msg::CANCELLED.to_string(),
+        };
+        state.set_request(Some(dismissed.clone()));
+        let shared = Arc::clone(&state.shared);
+        let hold = holds.hold();
+        let crashed = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(PanicsOnWait),
+                Box::new(NoPeer),
+                hold,
+                8_000,
+                true,
+            );
+        })
+        .join();
+        assert!(crashed.is_err());
+        assert_eq!(state.report().request, Some(dismissed));
+        assert_eq!(holds.count(), 0);
+    }
+
     /// Tester: a connection from a process other than the spawned launcher
     /// (the peer uid or pid check fails) is dropped and the watcher keeps
     /// waiting; the request's end is still decided by the launcher's exit.
@@ -2403,6 +2736,7 @@ mod tests {
             fn kill(&mut self) {
                 self.killed = true;
             }
+            fn interrupt(&mut self) {}
             fn stderr_tail(&mut self) -> String {
                 String::new()
             }

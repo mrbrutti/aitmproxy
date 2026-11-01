@@ -66,10 +66,12 @@ pcap = "2.5"
 nfq = "0.2.5"
 # Core end of the privileged helper session (privilege plan P1b.12): the
 # `SO_PEERCRED` check on the accepted socket (`socket`) and the core's own uid
-# to compare it against (`user`). Safe API, so `#![forbid(unsafe_code)]` holds.
-# 0.31 is already locked in the workspace (via `mac_address`); only the feature
-# set and this edge are new.
-nix = { version = "0.31", features = ["socket", "user"] }
+# to compare it against (`user`); `signal` for the SIGINT a held Ctrl-C sends
+# the launcher child (`PrivilegeState::cancel_prompt`, spec §5.5, panel 2;
+# `nix::sys::signal::kill` is a safe fn). Safe API, so `#![forbid(unsafe_code)]`
+# holds. 0.31 is already locked in the workspace (via `mac_address`); only the
+# feature set and this edge are new.
+nix = { version = "0.31", features = ["socket", "user", "signal"] }
 
 [dev-dependencies]
 # The command tests build a core `CommandHost`, whose `ProxyClient` seam returns a

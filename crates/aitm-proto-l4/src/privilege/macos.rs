@@ -185,37 +185,89 @@ fn read_receipt() -> Option<Receipt> {
     Receipt::parse(&bytes).ok()
 }
 
-/// What the facts cache is keyed on: the bundle directory's identity and the
-/// parts a replaced bundle changes. The directory's own mtime is not among
-/// them: swapping `Contents/MacOS/<exe>` or `Info.plist` in place leaves it
-/// alone, and a fresh copy with the same mtime is a different inode.
+/// The app bundle's main executable, relative to the bundle: the
+/// `CFBundleExecutable` of `apps/mac/Info.plist.in`. Read as a fixed path
+/// rather than from the plist, which would cost a `plutil` run per probe.
+pub const APP_EXECUTABLE_REL: &str = "Contents/MacOS/Aitmproxy";
+
+/// The code signature's resource list: the fallback stamp when the main
+/// executable is not where [`APP_EXECUTABLE_REL`] says (it is rewritten by
+/// every re-sign).
+pub const CODE_RESOURCES_REL: &str = "Contents/_CodeSignature/CodeResources";
+
+/// One file's mtime and size, as a bundle part is stamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    /// Last modification.
+    pub mtime: SystemTime,
+    /// `st_size`.
+    pub size: u64,
+}
+
+impl FileStamp {
+    /// The stamp of a file as its metadata describes it (`None` when the
+    /// filesystem reports no mtime).
+    #[must_use]
+    pub fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        Some(FileStamp {
+            mtime: meta.modified().ok()?,
+            size: meta.len(),
+        })
+    }
+}
+
+/// [`FileStamp`] of the file at `path`, `None` when it cannot be read.
+#[must_use]
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| FileStamp::of(&meta))
+}
+
+/// The executable part of a [`BundleStamp`]: the main executable's stamp
+/// when it exists, else the code signature's resource list, else nothing.
+#[must_use]
+pub fn executable_stamp(
+    main_executable: Option<FileStamp>,
+    code_resources: Option<FileStamp>,
+) -> Option<FileStamp> {
+    main_executable.or(code_resources)
+}
+
+/// What the facts cache is keyed on (spec §2.3, panel 2): the bundle
+/// directory's identity and the parts a replaced or re-signed bundle changes.
+/// The directory's own mtime is not among them: swapping the executable or
+/// `Info.plist` in place leaves it alone, and a fresh copy with the same
+/// mtime is a different inode. The main executable is stamped by mtime
+/// **and** size, so an in-place overwrite is a new key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleStamp {
     /// `st_dev` of the bundle directory.
-    pub dev: u64,
+    dev: u64,
     /// `st_ino` of the bundle directory.
-    pub ino: u64,
+    ino: u64,
     /// mtime of `Contents/Info.plist`, when it exists.
-    pub info_plist_mtime: Option<SystemTime>,
-    /// mtime of `Contents/MacOS` (the executables' directory), else of
-    /// `Contents`.
-    pub executable_mtime: Option<SystemTime>,
+    info_plist_mtime: Option<SystemTime>,
+    /// [`executable_stamp`]: the main executable, else `CodeResources`.
+    executable: Option<FileStamp>,
 }
 
-/// The pure key builder behind the facts cache; see [`BundleStamp`].
-#[must_use]
-pub fn bundle_stamp(
-    dev: u64,
-    ino: u64,
-    info_plist_mtime: Option<SystemTime>,
-    macos_dir_mtime: Option<SystemTime>,
-    contents_mtime: Option<SystemTime>,
-) -> BundleStamp {
-    BundleStamp {
-        dev,
-        ino,
-        info_plist_mtime,
-        executable_mtime: macos_dir_mtime.or(contents_mtime),
+impl BundleStamp {
+    /// The key for a bundle directory with identity `(dev, ino)`, its
+    /// `Info.plist` mtime and its executable stamp (see [`executable_stamp`]).
+    #[must_use]
+    pub fn new(
+        dev: u64,
+        ino: u64,
+        info_plist_mtime: Option<SystemTime>,
+        executable: Option<FileStamp>,
+    ) -> Self {
+        BundleStamp {
+            dev,
+            ino,
+            info_plist_mtime,
+            executable,
+        }
     }
 }
 
@@ -246,17 +298,14 @@ fn app_facts(path: &Path) -> AppFacts {
             team_ok: false,
         };
     }
-    let mtime_of = |rel: &str| {
-        std::fs::metadata(path.join(rel))
-            .and_then(|m| m.modified())
-            .ok()
-    };
-    let stamp = bundle_stamp(
+    let stamp = BundleStamp::new(
         meta.dev(),
         meta.ino(),
-        mtime_of("Contents/Info.plist"),
-        mtime_of("Contents/MacOS"),
-        mtime_of("Contents"),
+        file_stamp(&path.join("Contents/Info.plist")).map(|plist| plist.mtime),
+        executable_stamp(
+            file_stamp(&path.join(APP_EXECUTABLE_REL)),
+            file_stamp(&path.join(CODE_RESOURCES_REL)),
+        ),
     );
 
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -509,37 +558,87 @@ mod tests {
 
     // ---- fix task 2026-11-01: S3 (facts cache key), S4 (canonical path first) ----
 
-    /// S3: the facts cache is keyed on the bundle's identity and contents,
-    /// not the directory's own mtime: `(dev, ino)` of the bundle, the mtime
-    /// of `Contents/Info.plist`, and the mtime of `Contents/MacOS` (falling
-    /// back to `Contents`). Any change of any part is a new key.
+    /// S3, as amended by panel 2 (C7): the facts cache is keyed on the
+    /// bundle's identity and contents, not the directory's own mtime:
+    /// `(dev, ino)` of the bundle, the mtime of `Contents/Info.plist`, and the
+    /// mtime **and size** of the main executable (`Contents/MacOS/Aitmproxy`),
+    /// falling back to `Contents/_CodeSignature/CodeResources` when there is
+    /// none. Any change of any part is a new key; an executable overwritten in
+    /// place (same directory, same inode) is seen through its own stamp.
     #[test]
     fn bundle_stamp_keys_on_identity_plist_and_executable() {
         use std::time::{Duration, UNIX_EPOCH};
-        let t = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+        let t = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        let exe = |s: u64, size: u64| Some(FileStamp { mtime: t(s), size });
 
-        let base = bundle_stamp(5, 100, t(10), t(20), t(30));
-        assert_eq!(base, bundle_stamp(5, 100, t(10), t(20), t(30)));
-        assert_ne!(base, bundle_stamp(6, 100, t(10), t(20), t(30)), "device");
-        assert_ne!(base, bundle_stamp(5, 101, t(10), t(20), t(30)), "inode");
+        let base = BundleStamp::new(5, 100, Some(t(10)), exe(20, 4_096));
+        assert_eq!(base, BundleStamp::new(5, 100, Some(t(10)), exe(20, 4_096)));
         assert_ne!(
             base,
-            bundle_stamp(5, 100, t(11), t(20), t(30)),
-            "Info.plist"
-        );
-        assert_ne!(base, bundle_stamp(5, 100, t(10), t(21), t(30)), "MacOS");
-        // Contents is the fallback only when MacOS is missing.
-        assert_eq!(base, bundle_stamp(5, 100, t(10), t(20), t(31)));
-        assert_eq!(
-            bundle_stamp(5, 100, t(10), None, t(30)).executable_mtime,
-            t(30)
+            BundleStamp::new(6, 100, Some(t(10)), exe(20, 4_096)),
+            "device"
         );
         assert_ne!(
-            bundle_stamp(5, 100, t(10), None, t(30)),
-            bundle_stamp(5, 100, t(10), None, t(31))
+            base,
+            BundleStamp::new(5, 101, Some(t(10)), exe(20, 4_096)),
+            "inode"
         );
-        // No plist at all is a different key from any plist.
-        assert_ne!(base, bundle_stamp(5, 100, None, t(20), t(30)));
+        assert_ne!(
+            base,
+            BundleStamp::new(5, 100, Some(t(11)), exe(20, 4_096)),
+            "Info.plist mtime"
+        );
+        assert_ne!(
+            base,
+            BundleStamp::new(5, 100, Some(t(10)), exe(21, 4_096)),
+            "executable mtime"
+        );
+        assert_ne!(
+            base,
+            BundleStamp::new(5, 100, Some(t(10)), exe(20, 4_097)),
+            "executable size"
+        );
+        assert_ne!(
+            base,
+            BundleStamp::new(5, 100, None, exe(20, 4_096)),
+            "no plist at all is a different key from any plist"
+        );
+        assert_ne!(
+            base,
+            BundleStamp::new(5, 100, Some(t(10)), None),
+            "no executable at all is a different key from any executable"
+        );
+
+        // The executable stamp: the main executable when it exists, else the
+        // code signature's resource list, else nothing.
+        assert_eq!(
+            executable_stamp(exe(20, 4_096), exe(30, 512)),
+            exe(20, 4_096)
+        );
+        assert_eq!(executable_stamp(None, exe(30, 512)), exe(30, 512));
+        assert_eq!(executable_stamp(None, None), None);
+        assert_eq!(APP_EXECUTABLE_REL, "Contents/MacOS/Aitmproxy");
+        assert_eq!(CODE_RESOURCES_REL, "Contents/_CodeSignature/CodeResources");
+    }
+
+    /// `FileStamp::of` reads mtime and size off real metadata, and
+    /// `file_stamp` is `None` for a missing path.
+    #[test]
+    fn file_stamp_reads_mtime_and_size() {
+        let dir = std::env::temp_dir().join(format!("aitm-file-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let exe = dir.join("Aitmproxy");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        let stamp = file_stamp(&exe).expect("a stamp for an existing file");
+        assert_eq!(stamp.size, 10);
+        assert_eq!(
+            stamp.mtime,
+            std::fs::metadata(&exe)
+                .and_then(|m| m.modified())
+                .expect("mtime")
+        );
+        assert_eq!(file_stamp(&dir.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// S4: the handoff app's path is canonicalized before anything is

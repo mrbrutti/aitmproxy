@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::privilege::contract::LINUX_HELPER_PATH;
 use crate::privilege::derive::{text, LinuxInputs};
@@ -138,7 +138,7 @@ pub(crate) fn gather_linux(helper_path: Option<&Path>, session_connected: bool) 
         .map(|path| {
             let root_owned = path_chain(&path).is_some_and(|chain| root_owned_chain(&chain));
             // The probe runs only a helper root alone could have placed (it
-            // executes the file), and once per `(path, mtime)`.
+            // executes the file), and once per path identity (`ProbeKey`).
             let file_caps_net_raw = root_owned && probe_file_caps_cached(&path);
             HelperCandidate {
                 at_policy_path: path == Path::new(LINUX_HELPER_PATH),
@@ -205,29 +205,57 @@ fn path_chain(path: &Path) -> Option<Vec<PathMeta>> {
     Some(chain)
 }
 
-/// Answers of the helper's `probe`, one per `(path, mtime)`: the probe is a
-/// subprocess and must not run on every re-probe of the report (1 s TTL).
-/// A file that changed (new mtime) is probed again.
+/// A helper file's identity for the probe cache (spec §2.2, panel 2): device,
+/// inode, size, mtime and ctime off `symlink_metadata`. mtime alone is
+/// settable by the file's owner; ctime is the kernel's and moves on every
+/// content or metadata change, and a replaced file is a new inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeKey {
+    /// `st_dev`.
+    pub dev: u64,
+    /// `st_ino`.
+    pub ino: u64,
+    /// `st_size`.
+    pub size: u64,
+    /// `(st_mtime, st_mtime_nsec)`.
+    pub mtime: (i64, i64),
+    /// `(st_ctime, st_ctime_nsec)`.
+    pub ctime: (i64, i64),
+}
+
+impl ProbeKey {
+    /// The key of a file as its metadata describes it.
+    #[must_use]
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        ProbeKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+/// Answers of the helper's `probe`, one per `(path, ProbeKey)`: the probe is
+/// a subprocess and must not run on every re-probe of the report (1 s TTL).
+/// A file whose identity changed in any part is probed again.
 #[derive(Debug, Default)]
 pub struct ProbeCache {
-    seen: HashMap<PathBuf, (SystemTime, bool)>,
+    seen: HashMap<PathBuf, (ProbeKey, bool)>,
 }
 
 impl ProbeCache {
-    /// The cached answer for `path` at `mtime`, else `probe()`'s, remembered.
-    pub fn file_caps(
-        &mut self,
-        path: &Path,
-        mtime: SystemTime,
-        probe: impl FnOnce() -> bool,
-    ) -> bool {
+    /// The cached answer for `path` under `key`, else `probe()`'s, remembered.
+    pub fn file_caps(&mut self, path: &Path, key: ProbeKey, probe: impl FnOnce() -> bool) -> bool {
         if let Some((seen, answer)) = self.seen.get(path) {
-            if *seen == mtime {
+            if *seen == key {
                 return *answer;
             }
         }
         let answer = probe();
-        self.seen.insert(path.to_path_buf(), (mtime, answer));
+        self.seen.insert(path.to_path_buf(), (key, answer));
         answer
     }
 }
@@ -240,14 +268,16 @@ fn probe_file_caps_cached(helper: &Path) -> bool {
 
     static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
 
-    let Ok(mtime) = std::fs::metadata(helper).and_then(|meta| meta.modified()) else {
+    let Ok(meta) = std::fs::symlink_metadata(helper) else {
         return false;
     };
     CACHE
         .get_or_init(|| Mutex::new(ProbeCache::default()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .file_caps(helper, mtime, || probe_reports_net_raw(helper))
+        .file_caps(helper, ProbeKey::of(&meta), || {
+            probe_reports_net_raw(helper)
+        })
 }
 
 /// Run `<helper> probe` as this user with a bounded wait and read the
@@ -338,6 +368,11 @@ pub trait Child: Send {
     fn try_wait(&mut self) -> io::Result<Option<ChildExit>>;
     /// Ask the child to die. Best effort, never waits.
     fn kill(&mut self);
+    /// Send the child the Ctrl-C it did not get itself (spec §5.5, panel 2:
+    /// a held Ctrl-C delivered to the core alone): SIGINT, so the launcher
+    /// ends as a cancelled prompt and the §5.5 table records `dismissed`,
+    /// never SIGKILL. Best effort, never waits.
+    fn interrupt(&mut self);
     /// The last [`STDERR_TAIL_BYTES`] of the child's stderr so far.
     fn stderr_tail(&mut self) -> String;
 }
@@ -594,6 +629,28 @@ impl Child for StdChild {
         let _ = self.child.kill();
     }
 
+    /// SIGINT to the child's pid through `nix`'s safe `kill` wrapper (Linux,
+    /// the only platform a launcher is spawned on). A child that already
+    /// ended, or one that refuses the signal (another user), is left to the
+    /// watcher, which reads its exit. Off Linux there is no launcher; the
+    /// portable fallback is `kill`.
+    fn interrupt(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.exited {
+                return;
+            }
+            if let Ok(pid) = i32::try_from(self.child.id()) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGINT,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.kill();
+    }
+
     fn stderr_tail(&mut self) -> String {
         if self.exited {
             self.done.wait(DRAIN_SETTLE);
@@ -676,6 +733,9 @@ pub mod msg {
     pub const NO_GUARD: &str = "no L4 guard attached to the privilege state";
     /// `cannot_prompt`: the spawn itself failed; the OS text follows.
     pub const SPAWN_FAILED: &str = "The packet-capture helper could not be started";
+    /// `failed`: the watcher thread unwound while the request was pending
+    /// (spec §5.5, panel 2: a panic never leaves a request `pending`).
+    pub const ENDED_UNEXPECTEDLY: &str = "The packet-capture request ended unexpectedly";
     /// `failed`: the listener kept failing `accept`; the socket error follows.
     pub const SOCKET_FAILED: &str = "The packet-capture helper socket failed";
 }
@@ -911,15 +971,19 @@ pub(crate) mod fakes {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use super::{Child, ChildExit, HoldCount, Spawner};
+    use super::{Child, ChildExit, HoldCount, Spawner, SIGINT};
 
     /// A child that answers `try_wait` with `None` `ticks` times, then `exit`.
+    /// `kill` only counts; `interrupt` records SIGINT and, like a launcher at
+    /// a prompt, makes the child end `Signaled(SIGINT)` on the next step.
     pub(crate) struct FakeChild {
         pub(crate) pid: u32,
         pub(crate) ticks_left: u32,
         pub(crate) exit: Option<ChildExit>,
         pub(crate) stderr: String,
         pub(crate) killed: Arc<AtomicUsize>,
+        /// Every signal number sent to this child, in order (`kill` is 9).
+        pub(crate) signals: Arc<Mutex<Vec<i32>>>,
     }
 
     impl FakeChild {
@@ -930,6 +994,7 @@ pub(crate) mod fakes {
                 exit: None,
                 stderr: String::new(),
                 killed: Arc::new(AtomicUsize::new(0)),
+                signals: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -947,6 +1012,12 @@ pub(crate) mod fakes {
         }
         fn kill(&mut self) {
             self.killed.fetch_add(1, Ordering::SeqCst);
+            self.signals.lock().unwrap().push(9);
+        }
+        fn interrupt(&mut self) {
+            self.signals.lock().unwrap().push(SIGINT);
+            self.ticks_left = 0;
+            self.exit = Some(ChildExit::Signaled(SIGINT));
         }
         fn stderr_tail(&mut self) -> String {
             self.stderr.clone()
@@ -1787,6 +1858,7 @@ mod tests {
                 Err(std::io::Error::other("waitpid: ECHILD"))
             }
             fn kill(&mut self) {}
+            fn interrupt(&mut self) {}
             fn stderr_tail(&mut self) -> String {
                 String::new()
             }
@@ -1864,14 +1936,17 @@ mod tests {
         assert!(!shared.is_held());
     }
 
-    // ---- fix task 2026-11-01: S2 (the file-caps probe is cached per path+mtime) ----
+    // ---- fix task 2026-11-01: S2 (the file-caps probe is cached per path identity);
+    // panel 2 (C6): the key is (dev, ino, size, mtime, ctime), not mtime alone ----
 
-    /// The helper's `probe` is a subprocess; it runs once per `(path, mtime)`
-    /// and again only when the file changed, not on every 1 s re-probe.
+    /// The helper's `probe` is a subprocess; it runs once per path identity
+    /// `(dev, ino, size, mtime, ctime)` and again only when any of those
+    /// changed, not on every 1 s re-probe. mtime alone is settable by the
+    /// file's owner (`touch -d`); ctime is the kernel's and moves on every
+    /// metadata or content change, so a replaced-in-place helper with a
+    /// forged mtime is still probed again.
     #[test]
     fn file_caps_probe_runs_once_per_path_and_mtime() {
-        use std::time::{Duration, UNIX_EPOCH};
-
         let mut cache = ProbeCache::default();
         let runs = std::cell::Cell::new(0);
         let runs = &runs;
@@ -1881,30 +1956,106 @@ mod tests {
                 answer
             }
         };
+        let key = |dev: u64, ino: u64, size: u64, mtime: i64, ctime: i64| ProbeKey {
+            dev,
+            ino,
+            size,
+            mtime: (mtime, 0),
+            ctime: (ctime, 0),
+        };
         let helper = Path::new("/usr/lib/aitmproxy/aitm-l4-helper");
-        let t1 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let t2 = t1 + Duration::from_secs(60);
+        let base = key(7, 42, 10_240, 1_700_000_000, 1_700_000_000);
 
-        assert!(cache.file_caps(helper, t1, probe(true)));
+        assert!(cache.file_caps(helper, base, probe(true)));
         assert!(
-            cache.file_caps(helper, t1, probe(false)),
+            cache.file_caps(helper, base, probe(false)),
             "cached: the probe did not run"
         );
         assert_eq!(runs.get(), 1);
 
-        // The file changed: probed again, and the new answer is kept.
-        assert!(!cache.file_caps(helper, t2, probe(false)));
+        // The file changed (mtime): probed again, and the new answer is kept.
+        let touched = key(7, 42, 10_240, 1_700_000_060, 1_700_000_060);
+        assert!(!cache.file_caps(helper, touched, probe(false)));
         assert_eq!(runs.get(), 2);
-        assert!(!cache.file_caps(helper, t2, probe(true)));
+        assert!(!cache.file_caps(helper, touched, probe(true)));
         assert_eq!(runs.get(), 2);
+
+        // A ctime change alone (chmod, chown, a rewrite with a forged mtime):
+        // probed again.
+        let chmodded = key(7, 42, 10_240, 1_700_000_060, 1_700_000_061);
+        assert!(cache.file_caps(helper, chmodded, probe(true)));
+        assert_eq!(runs.get(), 3, "a ctime change re-probes");
+
+        // So do a size change, a new inode (a replaced file) and a new device,
+        // each alone.
+        assert!(cache.file_caps(
+            helper,
+            key(7, 42, 10_241, 1_700_000_060, 1_700_000_061),
+            probe(true)
+        ));
+        assert_eq!(runs.get(), 4, "size");
+        assert!(cache.file_caps(
+            helper,
+            key(7, 43, 10_240, 1_700_000_060, 1_700_000_061),
+            probe(true)
+        ));
+        assert_eq!(runs.get(), 5, "inode");
+        assert!(cache.file_caps(
+            helper,
+            key(8, 42, 10_240, 1_700_000_060, 1_700_000_061),
+            probe(true)
+        ));
+        assert_eq!(runs.get(), 6, "device");
+        // Nanoseconds count too.
+        let mut ns = base;
+        ns.ctime.1 = 1;
+        assert!(cache.file_caps(helper, ns, probe(true)));
+        assert_eq!(runs.get(), 7);
 
         // Another path is its own entry.
         assert!(cache.file_caps(
             Path::new("/run/wrappers/bin/aitm-l4-helper"),
-            t1,
+            base,
             probe(true)
         ));
-        assert_eq!(runs.get(), 3);
+        assert_eq!(runs.get(), 8);
+    }
+
+    /// `ProbeKey::of` reads the five fields off real metadata: a content
+    /// change moves size and mtime (and ctime); a permission change moves
+    /// ctime alone; an untouched file keys the same twice.
+    #[test]
+    fn probe_key_follows_the_files_metadata() {
+        let dir = std::env::temp_dir().join(format!("aitm-probe-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("helper");
+        std::fs::write(&file, b"v1").expect("write");
+        let meta = || std::fs::symlink_metadata(&file).expect("metadata");
+        let first = ProbeKey::of(&meta());
+        assert_eq!(first, ProbeKey::of(&meta()), "stable while untouched");
+        assert_eq!(first.size, 2);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut perms = meta().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&file, perms).expect("chmod");
+        let chmodded = ProbeKey::of(&meta());
+        assert_eq!(
+            (chmodded.dev, chmodded.ino, chmodded.size),
+            (first.dev, first.ino, first.size)
+        );
+        assert_eq!(chmodded.mtime, first.mtime, "chmod leaves mtime alone");
+        assert_ne!(chmodded.ctime, first.ctime, "chmod moves ctime");
+        assert_ne!(chmodded, first);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file, b"v2-longer").expect("rewrite");
+        let rewritten = ProbeKey::of(&meta());
+        assert_eq!(rewritten.size, 9);
+        assert_ne!(rewritten.mtime, chmodded.mtime);
+        assert_ne!(rewritten, chmodded);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- fix task 2026-11-01: Q2 (the exit class is an enum, not a text) ----
@@ -1961,6 +2112,7 @@ mod tests {
                 Err(std::io::Error::other("waitpid: ECHILD"))
             }
             fn kill(&mut self) {}
+            fn interrupt(&mut self) {}
             fn stderr_tail(&mut self) -> String {
                 String::new()
             }
