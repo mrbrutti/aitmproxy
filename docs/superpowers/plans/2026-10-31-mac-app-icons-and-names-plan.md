@@ -767,6 +767,9 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | PR #268 | spec (delta) | Minor | SPD-M4 — the resolver's `seen` set was only in the Amendments line; Constraints, D1 `enriched` doc, D1 storage comment and D3 still described two caches and "one poll" | fixed in docs (this commit) |
 | PR #268 | spec (delta) | Minor | SPD-M5 — plan Task 3 "Depends on: Task 1" while the Q-I1 fix made it call `ClientTree.clients` | fixed in docs (this commit): Tasks 1 and 2 |
 | PR #268 | spec (delta) | Minor | SPD-M6 — Open question 4 was inserted before item 3 | fixed in docs (this commit): reordered |
+| PR #268 | security (final, 99e5b3be) | — | note: `tooltipText` caps 256 `Character`s, so an identifier of combining marks (Mn, not stripped) can exceed 256 scalars in the tooltip; cosmetic, no regression over PR B's uncapped last component | accepted; tighten to `unicodeScalars.prefix` if ever wanted; PASS stands for `681dff57..99e5b3be` |
+| PR #268 | spec (final, 99e5b3be) | Minor | SPD2-M1 — two stale words after the reorder and the widening: OQ preamble "both" with three forks; D1 "(Task 5)" on the already-landed `Session.clients` one-liner | fixed in docs (this commit); PASS for `681dff57..99e5b3be` |
+| PR #268 | quality (final, 99e5b3be) | — | Q-M1, QD1–QD3 verified closed; nothing new | PASS, 0 open |
 
 ## Shipped
 
