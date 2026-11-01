@@ -601,6 +601,46 @@ mod tests {
         }
     }
 
+    /// An h2 origin that answers `serves` streams in full and then, on the
+    /// next one, sends the response head and a partial body before dropping
+    /// the whole connection — a peer that dies *after* it has begun answering.
+    ///
+    /// The distinction from [`h2_origin_goaway_after`] is the whole point: that
+    /// peer says nothing at all, this one has already put the request on its
+    /// own record.
+    async fn h2_origin_dying_after_the_head(io: DuplexStream, seen: Seen, serves: usize) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        let mut served = 0usize;
+        while let Some(accepted) = conn.accept().await {
+            let Ok((req, mut respond)) = accepted else {
+                break;
+            };
+            let (parts, rbody) = req.into_parts();
+            drop(rbody);
+            record(&seen, &parts, Vec::new());
+            let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                return;
+            };
+            let Ok(mut send) = respond.send_response(resp, false) else {
+                return;
+            };
+            served += 1;
+            if served > serves {
+                // The head is out and a body frame with it; then the peer dies
+                // without ending the stream.
+                let _ = send.send_data(Bytes::from_static(b"partial"), false);
+                // Drive the connection briefly so both are actually written.
+                let _ = tokio::time::timeout(Duration::from_millis(50), conn.accept()).await;
+                drop(send);
+                drop(conn);
+                return;
+            }
+            let _ = send.send_data(Bytes::from_static(b"hi"), true);
+        }
+    }
+
     /// A resolver whose answer a test can change between sends.
     struct SwitchableResolver(Mutex<IpAddr>);
 
@@ -1249,6 +1289,75 @@ mod tests {
         assert!(
             seen.lock().expect("seen").is_empty(),
             "the healthy origin must never have been reached"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
+    /// Q1, the other half of the rule, and the one that makes the redial safe
+    /// at all: the fall-through is only for a pooled connection that said
+    /// **nothing**. Once any part of a response has arrived the request is on
+    /// the record at the origin — a `POST` has already been applied — so the
+    /// send fails rather than putting it on the wire a second time.
+    ///
+    /// Tester pass over fix round F2: without this, deleting `send_impl`'s
+    /// `Err(e) if saw_response => return Err(e)` arm left all 226 lib tests
+    /// green while the sender silently resent a non-idempotent request.
+    #[tokio::test]
+    async fn a_pooled_connection_that_dies_after_the_head_is_never_resent() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        // Serves the first stream whole (so the connection gets pooled), then
+        // answers the second one's head and dies with the body still open.
+        let first = tokio::spawn(h2_origin_dying_after_the_head(server1, seen.clone(), 1));
+        // A healthy origin queued behind it: a wrong resend would find it, the
+        // send would wrongly succeed, and `/b` would reach an origin twice.
+        let second = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let mut post = h2c_get("/b");
+        post.method = "POST".into();
+        post.body = Body::Bytes(b"charge=1".to_vec());
+
+        let first_resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first h2c exchange succeeds");
+        assert_eq!(first_resp.status, 200);
+        assert_eq!(dialer.calls(), 1, "the connection is now pooled");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&post, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a connection that dies after the head fails the send");
+        assert!(
+            !crate::sender::is_h2_not_negotiated(&err),
+            "a transport failure must not be classified as a version failure: {err}"
+        );
+        assert_eq!(
+            dialer.calls(),
+            1,
+            "a request the origin had already begun answering must never be redialled and resent"
+        );
+        let paths: Vec<String> = seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/a".to_string(), "/b".to_string()],
+            "the POST reached an origin exactly once"
         );
         drop(sender);
         first.abort();

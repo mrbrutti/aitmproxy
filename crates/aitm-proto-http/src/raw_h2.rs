@@ -1028,13 +1028,27 @@ mod tests {
     use super::*;
 
     /// Q4: the raw driver shares the sender's dialer, but not its 30 s connect
-    /// timeout — a probe gives a target ten seconds to answer and no more.
+    /// timeout — a probe gives a target ten seconds to answer and no more, and
+    /// that has to leave room inside the whole-probe cap for the handshake and
+    /// the streams.
+    ///
+    /// Residual gap (tester pass over fix round F2, reported to the Coder):
+    /// nothing here pins that `RawH2Client::new` passes *this* constant to its
+    /// dialer. Swapping the argument at the construction site for
+    /// `Duration::from_secs(30)` leaves the whole lib suite green, because the
+    /// dialer behind `Arc<dyn Dialer>` cannot be inspected from a test.
     #[test]
     fn the_raw_driver_keeps_its_own_connect_timeout() {
         assert_eq!(RAW_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert!(
+            RAW_CONNECT_TIMEOUT < RAW_TOTAL_TIMEOUT,
+            "a connect timeout of {RAW_CONNECT_TIMEOUT:?} outlives the whole-probe cap of \
+             {RAW_TOTAL_TIMEOUT:?}, which would make it unreachable"
+        );
         assert_eq!(
             TcpDialer::new(RAW_CONNECT_TIMEOUT).connect_timeout(),
-            Duration::from_secs(10)
+            RAW_CONNECT_TIMEOUT,
+            "the shared dialer carries the timeout it was built with"
         );
     }
 

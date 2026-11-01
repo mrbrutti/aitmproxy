@@ -1438,6 +1438,72 @@ mod tests {
         assert!(!is_h2_not_negotiated(&anyhow!("connect refused")));
     }
 
+    /// Q6 took the request by value so one send clones it once; the
+    /// normalisation it does must be unchanged by that. Checked directly, not
+    /// through a version path: on the h1 path `prepare_h1`'s `Connection:
+    /// close` and on the h2 path `translate::h2_request_from`'s hop-by-hop
+    /// strip both mask whether `prepare_common` itself still drops the
+    /// inherited names, so deleting either `remove` here is invisible from
+    /// the wire (tester pass over fix round F2).
+    #[test]
+    fn prepare_common_drops_the_inherited_host_and_connection_fields() {
+        let mut req = request(
+            "GET",
+            "/x",
+            &[
+                ("Host", "stale.example:1234"),
+                ("Connection", "keep-alive, x-custom"),
+                ("X-Custom", "kept"),
+            ],
+            Body::Empty,
+        );
+        req.authority = "real.example:8443".into();
+
+        let out = prepare_common(req);
+
+        assert_eq!(
+            out.headers.get("Host"),
+            Some("real.example:8443"),
+            "the Host field is rebuilt from the authority, not inherited"
+        );
+        assert_eq!(
+            out.headers
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("host"))
+                .count(),
+            1,
+            "exactly one Host field: {:?}",
+            out.headers
+        );
+        assert_eq!(
+            out.headers.get("Connection"),
+            None,
+            "an inherited Connection field never survives into a reissue"
+        );
+        assert_eq!(
+            out.headers.get("X-Custom"),
+            Some("kept"),
+            "every other field is left alone"
+        );
+    }
+
+    /// Userinfo in the authority is credential material: the `Host` field
+    /// `prepare_common` builds must carry the host and port only.
+    #[test]
+    fn prepare_common_strips_userinfo_from_the_host_field() {
+        let mut req = request("GET", "/x", &[], Body::Empty);
+        req.authority = "user:s3cret@real.example:8443".into();
+
+        let out = prepare_common(req);
+
+        assert_eq!(out.headers.get("Host"), Some("real.example:8443"));
+        let rendered = format!("{:?}", out.headers);
+        assert!(
+            !rendered.contains("s3cret"),
+            "the password reached a header: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn h1_still_sends_connection_close() {
         let (_sender, _results, logs, _dialer) =
@@ -1935,5 +2001,101 @@ mod tests {
         let resp = result.expect("the capped exchange succeeds");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.buffered_len(), Some(MAX_RESPONSE_BYTES));
+    }
+
+    /// A resolver that answers every name with one chosen address.
+    struct AnswerWith(IpAddr);
+
+    impl HostResolver for AnswerWith {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            let ip = self.0;
+            Box::pin(async move { Ok(vec![ip]) })
+        }
+    }
+
+    /// `with_ssrf` on the plain reissue path, in process: with the gate
+    /// configured and **nothing** in scope, a public name that answers the
+    /// cloud metadata address is refused before the dialer is ever asked, and
+    /// the refusal does not name the address it resolved to.
+    ///
+    /// The crate's integration cover for the reissue gate
+    /// (`tests/sender.rs`) binds a real port, so the lift half of it cannot
+    /// run in a sandbox; this pair runs over `tokio::io::duplex` (tester pass
+    /// over fix round F2).
+    #[tokio::test]
+    async fn an_empty_scope_refuses_a_metadata_address_before_dialing() {
+        use aitm_core::{SsrfPolicy, StdGuard};
+
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::new()));
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(AnswerWith(IpAddr::V4(Ipv4Addr::new(
+                169, 254, 169, 254,
+            )))))
+            .with_dialer(dialer.clone())
+            .with_ssrf(SsrfPolicy::default(), Arc::new(StdGuard::default()));
+
+        let mut req = get_x();
+        req.authority = "origin.test:80".into();
+
+        let err = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect_err("an empty scope lifts nothing: the metadata address is refused");
+
+        assert!(err.to_string().contains("SSRF"), "error was {err}");
+        assert!(
+            !err.to_string().contains("169.254.169.254"),
+            "the refusal must not name the resolved address: {err}"
+        );
+        assert_eq!(dialer.calls(), 0, "a refused reissue never dials");
+    }
+
+    /// The other half: an operator who scoped the IP literal lifts the block,
+    /// and the plain HTTP/1.1 reissue then runs to completion.
+    #[tokio::test]
+    async fn an_in_scope_ip_literal_lifts_the_reissue_ssrf_block() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let (client, server) = duplex(64 * 1024);
+        let origin = tokio::spawn(origin(
+            server,
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec()],
+        ));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(AnswerWith(IpAddr::V4(Ipv4Addr::LOCALHOST))))
+            .with_dialer(dialer.clone())
+            .with_ssrf(SsrfPolicy::default(), guard.clone());
+
+        let mut req = get_x();
+        req.authority = "origin.test:80".into();
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect("a scoped loopback literal passes the gate");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"hi".to_vec());
+        assert_eq!(dialer.calls(), 1, "the gate let the dial through");
+        let seen = String::from_utf8_lossy(&origin.await.expect("the origin task")).to_string();
+        assert!(
+            seen.contains("Host: origin.test:80\r\n"),
+            "the reissue carried the requested authority: {seen:?}"
+        );
+
+        // Unscope the literal and the very same send is refused — so the
+        // success above was the scope entry's doing, not an absent gate.
+        assert!(guard.remove_scope("127.0.0.1"), "the entry was present");
+        let err = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect_err("with the literal unscoped the loopback answer is refused again");
+        assert!(err.to_string().contains("SSRF"), "error was {err}");
+        assert_eq!(dialer.calls(), 1, "a refused reissue never dials");
     }
 }
