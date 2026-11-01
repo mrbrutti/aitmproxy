@@ -327,7 +327,7 @@ pub fn origin_choices(scope: &[String], flows: &[FlowRow]) -> Vec<OriginChoice> 
             continue;
         };
         push(
-            origin("https", &host, port.filter(|p| *p != 443)),
+            origin("https", &host, port),
             OriginSource::FromScope,
             &mut out,
         );
@@ -339,7 +339,7 @@ pub fn origin_choices(scope: &[String], flows: &[FlowRow]) -> Vec<OriginChoice> 
                 continue;
             }
             push(
-                origin("http", &host, flow_port.filter(|p| *p != 80)),
+                origin("http", &host, flow_port),
                 OriginSource::FromFlows,
                 &mut out,
             );
@@ -459,9 +459,13 @@ pub fn out_of_scope(scope: &[String], raw: &str) -> Option<String> {
     }
 }
 
-/// `scheme://host[:port]`.
+/// `scheme://host[:port]`, the port dropped when it is the scheme's default
+/// (443 for https, 80 for http): the one spelling the picker's and the typed
+/// origins share (fix round G, G31), so `https://h:443` and `h` name one
+/// origin.
 fn origin(scheme: &str, host: &str, port: Option<u16>) -> String {
-    match port {
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    match port.filter(|p| *p != default_port) {
         Some(p) => format!("{scheme}://{host}:{p}"),
         None => format!("{scheme}://{host}"),
     }
@@ -476,10 +480,12 @@ fn authority_of(rest: &str) -> &str {
 /// bracketed IPv6 literal (`[::1]`, `[::1]:8080`) and a bare one (`::1`)
 /// both give the bracketed, normalised address; `host:digits` with one
 /// colon gives the host and its port; a host left with a colon after that
-/// (`host:abc`, `a:b:c`), or an empty host, is [`ORIGIN_HOST_ERROR`]; a port
-/// outside 1 to 65535 is [`ORIGIN_PORT_ERROR`]. Pure, so the Site map's
-/// legacy nodes and the origin rule parse an authority one way.
-pub fn authority_parts(authority: &str) -> Result<(String, Option<u16>), String> {
+/// (`host:abc`, `a:b:c`), an empty host, or one carrying `@`, `/`, `?`, `#`
+/// or whitespace (userinfo, a path or a query smuggled into the host; fix
+/// round G, G18) is [`ORIGIN_HOST_ERROR`]; a port outside 1 to 65535 is
+/// [`ORIGIN_PORT_ERROR`]. Pure, so the Site map's legacy nodes and the
+/// origin rule parse an authority one way.
+pub(crate) fn authority_parts(authority: &str) -> Result<(String, Option<u16>), String> {
     let s = authority.trim();
     if let Some(rest) = s.strip_prefix('[') {
         let (v6, tail) = rest.split_once(']').ok_or(ORIGIN_HOST_ERROR)?;
@@ -498,7 +504,7 @@ pub fn authority_parts(authority: &str) -> Result<(String, Option<u16>), String>
         }
         _ => (s, None),
     };
-    if host.is_empty() {
+    if host.is_empty() || host.chars().any(is_host_delimiter) {
         return Err(ORIGIN_HOST_ERROR.to_string());
     }
     if let Ok(ip) = host.parse::<Ipv6Addr>() {
@@ -508,6 +514,13 @@ pub fn authority_parts(authority: &str) -> Result<(String, Option<u16>), String>
         return Err(ORIGIN_HOST_ERROR.to_string());
     }
     Ok((host.to_string(), port))
+}
+
+/// A character no host may carry (G18): the URL delimiters that would make
+/// the rest of the string userinfo, a path, a query or a fragment, and
+/// whitespace.
+fn is_host_delimiter(c: char) -> bool {
+    matches!(c, '@' | '/' | '?' | '#') || c.is_whitespace()
 }
 
 /// A port from its digits: 1 to 65535, else [`ORIGIN_PORT_ERROR`].
@@ -872,15 +885,21 @@ impl ProfileEditor {
     }
 }
 
-/// `ip:port/proto[ grammar]`, the way [`parse_l4_target`] reads it.
+/// `ip:port/proto[ grammar]`, the way [`parse_l4_target`] reads it back:
+/// an IPv6 address is bracketed (fix round G, G33), so the text round-trips.
 pub fn l4_target_text(t: &L4TargetSpec) -> String {
     let proto = match t.proto {
         L4Transport::Tcp => "tcp",
         L4Transport::Udp => "udp",
     };
+    let ip = if t.ip.parse::<Ipv6Addr>().is_ok() {
+        format!("[{}]", t.ip)
+    } else {
+        t.ip.clone()
+    };
     match &t.grammar {
-        Some(g) => format!("{}:{}/{proto} {g}", t.ip, t.port),
-        None => format!("{}:{}/{proto}", t.ip, t.port),
+        Some(g) => format!("{ip}:{}/{proto} {g}", t.port),
+        None => format!("{ip}:{}/{proto}", t.port),
     }
 }
 
@@ -1210,7 +1229,10 @@ mod tests {
             Ok(("[fe80::1:8080]".to_string(), None)),
             "an unbracketed v6 with a trailing group is the address, not a port"
         );
-        for bad in ["h:abc", "a:b:c", "", "[::1", "[zz]", "[::1]x"] {
+        for bad in [
+            "h:abc", "a:b:c", "", "[::1", "[zz]", "[::1]x", "a@b", "a/b", "a?b", "a#b", "a b",
+            "a\tb",
+        ] {
             assert_eq!(
                 authority_parts(bad),
                 Err(ORIGIN_HOST_ERROR.to_string()),
@@ -1308,10 +1330,88 @@ mod tests {
             Err(ORIGIN_SCHEME_ERROR.to_string())
         );
         assert_eq!(
-            typed_origin("HTTPS://H:443", &[]),
-            Ok("https://H:443".to_string()),
-            "a typed port is kept as typed"
+            typed_origin("HTTPS://H:8443", &[]),
+            Ok("https://H:8443".to_string()),
+            "a typed non-default port is kept"
         );
+    }
+
+    /// Fix round G, G31: typed and bare origins normalise the scheme's
+    /// default port the same way, through one `origin()`: `:443` leaves an
+    /// https origin and `:80` an http one, any other port stays.
+    #[test]
+    fn typed_and_bare_origins_drop_the_default_port_alike() {
+        assert_eq!(
+            typed_origin("https://h:443", &[]),
+            Ok("https://h".to_string())
+        );
+        assert_eq!(typed_origin("http://h:80", &[]), Ok("http://h".to_string()));
+        assert_eq!(
+            typed_origin("http://h:443", &[]),
+            Ok("http://h:443".to_string())
+        );
+        assert_eq!(typed_origin("h:443", &[]), Ok("https://h".to_string()));
+        assert_eq!(
+            origin_choices(&["h:443".into()], &[])[0].origin,
+            "https://h"
+        );
+    }
+
+    /// Fix round G, G18: a delimiter or whitespace in a host is refused on
+    /// the typed path too, before anything reaches the wire.
+    #[test]
+    fn typed_origin_refuses_userinfo_and_whitespace_hosts() {
+        for bad in ["http://a@b", "http://a b", "a@b", "a b"] {
+            assert_eq!(
+                typed_origin(bad, &[]),
+                Err(ORIGIN_HOST_ERROR.to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Fix round G, G21 (D8 as amended): a scope entry carrying a port
+    /// keeps it in its https origin.
+    #[test]
+    fn a_scope_entry_with_a_port_keeps_it_in_its_https_origin() {
+        assert_eq!(
+            origin_choices(&["api.test:8443".into()], &[])[0].origin,
+            "https://api.test:8443"
+        );
+    }
+
+    /// Fix round G, G33: `l4_target_text` reads back through
+    /// `parse_l4_target` for every accepted shape, an IPv6 target bracketed.
+    #[test]
+    fn l4_target_text_round_trips_every_accepted_target() {
+        for line in [
+            "127.0.0.1:7000/tcp",
+            "10.0.0.1:53/udp dns",
+            "[::1]:9000",
+            "[fe80::1]:443/udp quic",
+        ] {
+            let target = parse_l4_target(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            let text = l4_target_text(&target);
+            assert_eq!(
+                parse_l4_target(&text),
+                Ok(target.clone()),
+                "{line} -> {text}"
+            );
+        }
+        let v6 = parse_l4_target("[::1]:9000").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(l4_target_text(&v6), "[::1]:9000/tcp");
+    }
+
+    /// Fix round G, G35: every field `kind()` says cycles or toggles does,
+    /// and no other field does.
+    #[test]
+    fn cycle_moves_exactly_the_cycle_and_toggle_fields() {
+        for f in EDITOR_FIELDS {
+            let mut e = ProfileEditor::new(ScanProfile::default(), None, false);
+            let expected = matches!(f.kind(), FieldKind::Cycle | FieldKind::Toggle);
+            assert_eq!(e.cycle(f), expected, "{f:?}");
+            assert_eq!(e.dirty, expected, "{f:?}");
+        }
     }
 
     #[test]
