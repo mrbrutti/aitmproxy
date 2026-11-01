@@ -1953,8 +1953,9 @@ impl McpServer {
             // by content before it reaches the ring/durable log/pushed line (RF#3),
             // then capped so an echoed megabyte cannot fill the ring. Only its first
             // bytes are scrubbed: the pass costs several times the length of the text.
-            AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict(
-                &crate::redact_args::bound_text(reason, crate::redact_args::REASON_EXAMINE_BYTES),
+            AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict_bounded(
+                reason,
+                crate::redact_args::REASON_EXAMINE_BYTES,
             )))
         } else {
             AuditResult::Ok

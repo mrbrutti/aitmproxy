@@ -33,28 +33,29 @@
 //!    so is a container nested in a list of values (a list of scalars and strings is
 //!    the multi-value form of the header and stays). The names stay, but each name
 //!    inside a collection (a map key, a pair name, a `name`/`key`/`header` member, the
-//!    keys of a header object) passes the strict text pass and is cut at
-//!    [`NAME_EXAMINE_BYTES`] bytes. The shapes a header takes:
+//!    keys of a header object) passes the strict text pass and is cut at 256 bytes.
+//!    The shapes a header takes:
 //!    - a plain map (an object with no name member) in an array, or a map under a
 //!      collection key: each member is a header, rule D by key;
 //!    - an array of two or more elements whose first element is a string, **whatever
 //!      the types of the rest** (`["X-N", 5]`, `["X-Zed", "a", "b"]`): the first
 //!      element is the name and rule D decides **every** later element by it. It is
 //!      also read when it is the whole value of the key (`"headers": ["X-Debug",
-//!      "v"]`) and its first element is a header token, or when it is exactly two
-//!      strings and the first holds no `:` (`["My Cookie", "v"]`: a name that is not
-//!      a token is never benign, so the value is hidden). A line such as
-//!      `["Cookie: a=b", "X-Debug: c"]` is two lines, below; a bare list of two header
-//!      names reads as a name and its value, an accepted over-redaction. In that direct
-//!      form, a later element that is a raw header line (`name:` then a blank or the
-//!      end, so `https://x/` is not one) is judged as a line by its name;
+//!      "v"]`) and its first element, as the text pass leaves it, holds no `:`
+//!      (`["My Cookie", "v"]`, `["X-Api Key", "a", "b"]`, of any length: a name that is
+//!      not a token is never benign, so every value is hidden). A first element with
+//!      a `:` makes it a list of lines, below (`["Cookie: a=b", "X-Debug: c"]`); a bare
+//!      list of two header names reads as a name and its value, an accepted
+//!      over-redaction. In that direct form, a later element that is a raw header line
+//!      (`name:` then a blank or the end, so `https://x/` is not one) is judged as a
+//!      line by its name;
 //!    - an object with a `name`, `key` or `header` member: its members other than
 //!      the name members keep their value only when the name keeps its value, and
 //!      are otherwise **all** replaced by `"<redacted>"` (a `values` list and any
 //!      other member included);
 //!    - a string `Name: value` (a raw header line): split at the first `:`, and when
 //!      the name (blanks around it trimmed) is a header token, or any other non-empty
-//!      name of at most [`NAME_EXAMINE_BYTES`] bytes with no line break (`X Debug`,
+//!      name of at most 256 bytes with no line break (`X Debug`,
 //!      `Xé`, `日本`: a name that is not a token is never benign), the value is kept
 //!      for a name that keeps its value and otherwise reads `Name: [redacted]`, the
 //!      text-mask literal a line already carries. Any other string is a block of header
@@ -78,23 +79,28 @@
 //! hidden is still decided on the original key). Numbers, booleans and nulls are
 //! untouched.
 //!
-//! **The work is bounded** (Design 14.6): a string leaf is examined only up to its
-//! first [`LEAF_EXAMINE_BYTES`] bytes and the whole value only up to
-//! [`TOTAL_EXAMINE_BYTES`] bytes of string text, in the order the walk visits it
-//! (the object's own iteration order, so the same arguments always give the same
-//! entry). Text beyond the bound is dropped and shown as the single character `…`;
-//! once the total is spent every later string leaf is `…`. The text a leaf is shown as
-//! is cut at the same bound (a mask can lengthen text), so a second pass over the
-//! result changes nothing. Numbers, booleans, nulls and values that are replaced by
-//! `"<redacted>"` cost nothing. A name string inside a header collection (a pair name,
-//! a `name` member) is a string leaf, cut at [`NAME_EXAMINE_BYTES`] and charged to that
-//! budget; object keys are cut at the same size and charged to pools of their own
-//! ([`TOTAL_EXAMINE_BYTES`] bytes each for the keys inside header collections and for
-//! the others), so they cost the leaves nothing. Two names that become the same text
-//! after the cut or the mask share one key in the output: the later one overwrites the
-//! earlier (a collision can lose a name, never reveal a value). A container nested
-//! deeper than [`MAX_DEPTH`] levels is replaced by `"<redacted>"`, so hostile nesting
-//! cannot exhaust the stack.
+//! **The work is bounded** (Design 14.6 of `docs/superpowers/specs/2026-10-31-durable-audit-design.md`): a string leaf is examined
+//! only up to its first 4096 bytes and the whole value only up to 64 KiB of string text,
+//! in the order the walk visits it (the object's own iteration order, so the same
+//! arguments always give the same entry). Text beyond the bound is dropped and shown as
+//! the single character `…`; once the total is spent every later string leaf is `…`.
+//! The text a leaf is shown as is cut at the same bound (a mask can lengthen text).
+//! Numbers, booleans, nulls and values that are replaced by `"<redacted>"` cost
+//! nothing. A name string inside a header collection (a pair name, a `name` member) is
+//! a string leaf, cut at 256 bytes and charged to that budget; object keys are cut at
+//! the same size and charged to pools of their own (64 KiB each, for the keys inside
+//! header collections and for the others), so they cost the leaves nothing. Two names
+//! that become the same text after the cut or the mask share one key in the output: the
+//! later one overwrites the earlier (a collision can lose a name, never reveal a
+//! value). A container nested deeper than 64 levels is replaced by `"<redacted>"`, so
+//! hostile nesting cannot exhaust the stack.
+//!
+//! **The result is a fixed point.** The walk is run again over its own result until a
+//! round leaves it alone (the first walk and at most three more, each with the budgets
+//! of a fresh call), because text can be masked into a different shape: a colon that a
+//! mask removes changes how a header array reads on the next walk. A value that does
+//! not settle in those rounds is returned as the last round left it, as the strict text
+//! pass itself does after its four rounds; no input is known to reach that.
 //!
 //! The function is `pub`, and not private to the server, because the durable
 //! writer reuses it: for an `args` text that parses as JSON it applies this same
@@ -102,7 +108,9 @@
 //!
 //! Every pass runs on decoded string content, never on JSON text.
 
-use aitm_core::redact_strict::{is_benign_header, is_secret_key_strict, scrub_strict};
+use aitm_core::redact_strict::{
+    is_benign_header, is_secret_key_strict, scrub_strict, scrub_strict_bounded,
+};
 use serde_json::{Map, Value};
 
 /// The literal that replaces a value this module hides, the one a secret-named
@@ -119,11 +127,11 @@ const TEXT_REDACTED: &str = "[redacted]";
 const ELLIPSIS: char = '…';
 
 /// The most bytes of any one string leaf that are examined, and that a leaf is shown
-/// as (Design 14.6).
+/// as (Design 14.6 of `docs/superpowers/specs/2026-10-31-durable-audit-design.md`).
 const LEAF_EXAMINE_BYTES: usize = 4096;
 
-/// The most bytes of string text that are examined in one [`redact_value`] call
-/// (Design 14.6).
+/// The most bytes of string text that are examined in one walk (Design 14.6 of
+/// `docs/superpowers/specs/2026-10-31-durable-audit-design.md`).
 const TOTAL_EXAMINE_BYTES: usize = 64 * 1024;
 
 /// The most bytes of one name that are examined, and that a name is shown as: an
@@ -135,8 +143,13 @@ const NAME_EXAMINE_BYTES: usize = 256;
 const MAX_DEPTH: usize = 64;
 
 /// The most bytes of an error reason that are scrubbed for the audit entry (the call
-/// path must not pay for a megabyte echoed back): see [`bound_text`].
+/// path must not pay for a megabyte echoed back): the bound the server gives
+/// `scrub_strict_bounded`.
 pub(crate) const REASON_EXAMINE_BYTES: usize = 8192;
+
+/// The most further walks [`redact_value`] runs over its own result to reach a fixed
+/// point, after the first.
+const SETTLE_ROUNDS: usize = 3;
 
 /// The most extra passes the text a leaf is shown as gets to settle within its bound.
 const OUTPUT_ROUNDS: usize = 4;
@@ -158,12 +171,29 @@ const HEADER_NAME_KEYS: [&str; 3] = ["name", "key", "header"];
 /// rule, the strict text pass over every kept string and every key, and the bounds on
 /// the work; see the module doc).
 ///
-/// Idempotent: `redact_value(&redact_value(v)) == redact_value(v)`. (The one
-/// exception is text so large that the bounds reached into it and a mask lengthened
-/// the text it hid several times over; the output of a leaf is then cut at the bound
-/// as a last resort and may read differently on a second pass.)
+/// Idempotent: `redact_value(&redact_value(v)) == redact_value(v)`, because the walk is
+/// run again over its own result until a round leaves it alone (`settle`). The
+/// one exception is a value that does not settle within the rounds, which is returned
+/// as the last round left it; no input is known to do that.
 pub fn redact_value(value: &Value) -> Value {
-    walk(value, &mut Budget::new())
+    settle(walk(value, &mut Budget::new()), |round| {
+        walk(round, &mut Budget::new())
+    })
+}
+
+/// Run `again` over `value` until a round leaves it unchanged, and return that value:
+/// at most [`SETTLE_ROUNDS`] rounds, so a value that never settles is returned as the
+/// last round left it, unconfirmed. A value that is already settled costs one round.
+fn settle(first: Value, again: impl Fn(&Value) -> Value) -> Value {
+    let mut current = first;
+    for _ in 0..SETTLE_ROUNDS {
+        let next = again(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+    current
 }
 
 // ---- budget and bounds ---------------------------------------------------------
@@ -264,30 +294,36 @@ impl Granted<'_> {
     fn render(self, limit: usize, pass: impl Fn(&str) -> String) -> String {
         match self {
             Granted::Nothing => ELLIPSIS.to_string(),
-            Granted::Head { head, cut } => bounded_pass(&marked(head, cut), limit, pass),
+            Granted::Head { head, cut } => {
+                let text = if cut {
+                    with_marker(head)
+                } else {
+                    head.to_owned()
+                };
+                bounded_pass(&text, limit, pass)
+            }
         }
     }
 }
 
-/// The examined start of a string, with the `…` marker appended when text beyond it
-/// was dropped. The marker reaches the text pass, so a value the cut left unfinished
-/// (`password=abc` of `password=abcdef`) is masked as an unquoted value that the marker
-/// ends.
-fn marked(head: &str, cut: bool) -> String {
+/// The examined start of a string that was cut, with the `…` marker appended. The
+/// marker reaches the text pass, so a value the cut left unfinished (`password=abc` of
+/// `password=abcdef`) is masked as an unquoted value that the marker ends.
+fn with_marker(head: &str) -> String {
     let mut text = String::with_capacity(head.len() + ELLIPSIS.len_utf8());
     text.push_str(head);
-    if cut {
-        text.push(ELLIPSIS);
-    }
+    text.push(ELLIPSIS);
     text
 }
 
-/// `pass` over `marked`, with the result kept within `limit` bytes as well: a mask can
+/// `pass` over `text`, with the result kept within `limit` bytes as well: a mask can
 /// lengthen text (`token=x ` becomes `token=[redacted] `), so a result that does not
-/// fit is cut like an input and passed again, a few times at most. That makes a second
-/// pass over the result change nothing. If it still does not fit, it is cut for good.
-fn bounded_pass(marked: &str, limit: usize, pass: impl Fn(&str) -> String) -> String {
-    let mut text = pass(marked);
+/// fit is cut like an input and passed again, a few times at most, which makes a second
+/// pass over the result leave it alone. If it still does not fit it is cut for good,
+/// and a pass over that may read differently: a text that does not settle is returned
+/// as the last round left it, as `scrub_strict` itself does after its four rounds.
+fn bounded_pass(text: &str, limit: usize, pass: impl Fn(&str) -> String) -> String {
+    let mut text = pass(text);
     for _ in 0..OUTPUT_ROUNDS {
         if fits(&text, limit) {
             return text;
@@ -308,14 +344,13 @@ fn fits(text: &str, limit: usize) -> bool {
 }
 
 /// `text` cut to at most `max_bytes` on a char boundary, with the `…` marker appended
-/// only when something was cut. The audit entry uses it to bound an error reason before
-/// the strict text pass ([`REASON_EXAMINE_BYTES`]).
-pub(crate) fn bound_text(text: &str, max_bytes: usize) -> String {
+/// only when something was cut.
+fn bound_text(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
     let end = char_boundary_at_or_before(text, max_bytes);
-    marked(&text[..end], true)
+    with_marker(&text[..end])
 }
 
 /// Run `walk` one container level deeper, or replace the subtree when that passes
@@ -479,6 +514,15 @@ impl Siblings {
 
 // ---- rule D: header collections ------------------------------------------------
 
+/// Where an array sits in a header collection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayValue {
+    /// The array is the whole value of a header key (`"headers": [..]`).
+    Whole,
+    /// The array is one element of a collection array.
+    Element,
+}
+
 /// Whether a key makes what is below it a header collection: its name contains
 /// `header` or `hdr` (`headers`, `extra_headers`, `hdrs`, `req_hdrs`), or is
 /// `trailer` or `trailers`, whatever the case.
@@ -532,7 +576,7 @@ fn is_header_token(name: &str) -> bool {
 fn walk_header_collection(value: &Value, budget: &mut Budget) -> Value {
     match value {
         Value::Object(map) => nested(budget, |b| Value::Object(walk_header_map(map, b))),
-        Value::Array(items) => nested(budget, |b| walk_header_array(items, true, b)),
+        Value::Array(items) => nested(budget, |b| walk_header_array(items, ArrayValue::Whole, b)),
         Value::String(text) => header_block(text, budget),
         other => other.clone(),
     }
@@ -543,7 +587,7 @@ fn walk_header_collection(value: &Value, budget: &mut Budget) -> Value {
 /// header line ([`header_line`]); a number, a boolean or a null stays.
 fn walk_header_entry(entry: &Value, budget: &mut Budget) -> Value {
     match entry {
-        Value::Array(items) => nested(budget, |b| walk_header_array(items, false, b)),
+        Value::Array(items) => nested(budget, |b| walk_header_array(items, ArrayValue::Element, b)),
         Value::Object(map) => nested(budget, |b| {
             Value::Object(if is_header_object(map) {
                 walk_header_object(map, b)
@@ -556,16 +600,18 @@ fn walk_header_entry(entry: &Value, budget: &mut Budget) -> Value {
     }
 }
 
-/// An array in a header collection. One that reads as a name and its values (see
-/// [`reads_as_name_and_values`]) is a header array; any other is a list of entries,
-/// each read by its shape. `direct` says the array is the whole value of a header key
-/// (`"headers": [..]`), not an element of a collection array.
-fn walk_header_array(items: &[Value], direct: bool, budget: &mut Budget) -> Value {
+/// An array in a header collection. One that reads as a name and its values is a
+/// header array: any array of two or more elements that is an element of a collection
+/// array and starts with a string, and a whole-value array whose first element reads as
+/// a name ([`reads_as_name_and_values`]). Any other is a list of entries, each read by
+/// its shape.
+fn walk_header_array(items: &[Value], array: ArrayValue, budget: &mut Budget) -> Value {
     match items {
         [Value::String(name), rest @ ..]
-            if !rest.is_empty() && (!direct || reads_as_name_and_values(name, rest)) =>
+            if !rest.is_empty()
+                && (array == ArrayValue::Element || reads_as_name_and_values(name)) =>
         {
-            header_values(name, rest, direct, budget)
+            header_values(name, rest, array, budget)
         }
         _ => Value::Array(
             items
@@ -576,14 +622,17 @@ fn walk_header_array(items: &[Value], direct: bool, budget: &mut Budget) -> Valu
     }
 }
 
-/// Whether a direct header array, whose first element is the string `name` and which
-/// has the elements `rest` after it, is a header name and its values: the name is a
-/// header token (`["X-Debug", "v"]`), or the array is exactly two strings and the first
-/// holds no `:` (`["My Cookie", "v"]`: a name that is not a token is never benign, so
-/// the value is hidden). A first element with a `:` is a line, and the array a list of
-/// lines.
-fn reads_as_name_and_values(name: &str, rest: &[Value]) -> bool {
-    is_header_token(name) || (matches!(rest, [Value::String(_)]) && !name.contains(':'))
+/// Whether a whole-value header array, whose first element is the string `name`, is a
+/// header name and its values, whatever its length: the first element holds no `:` once
+/// the text pass has been over it (`["X-Debug", "v"]`, `["My Cookie", "a", "b"]`; a name
+/// that is not a token is never benign, so every value is hidden). A first element with
+/// a `:` is a line, and the array a list of lines.
+///
+/// The text pass decides, not the raw text: masking can remove the only colon (one
+/// inside a quoted value or a private key block), and the array would read differently
+/// the next time it is walked. Only the start of the name is examined, as it is shown.
+fn reads_as_name_and_values(name: &str) -> bool {
+    !scrub_strict_bounded(name, NAME_EXAMINE_BYTES).contains(':')
 }
 
 /// A map of headers: each member is a header, rule D by its key, and the key is a name
@@ -663,14 +712,16 @@ fn walk_name(value: &Value, budget: &mut Budget) -> Value {
 
 /// A header array `[name, value, ..]`: the name is a name ([`name_string`]), and rule D
 /// decides **every** later element by it, whatever its type: kept (as a kept value)
-/// for a name that keeps its value, replaced by `"<redacted>"` otherwise. With
-/// `direct` (the array is the whole value of a header key) a kept element that is a raw
-/// header line is judged as a line by its name ([`is_header_line_text`]).
-fn header_values(name: &str, rest: &[Value], direct: bool, budget: &mut Budget) -> Value {
+/// for a name that keeps its value, replaced by `"<redacted>"` otherwise. In a
+/// whole-value array a kept element that is a raw header line is judged as a line by
+/// its name ([`is_header_line_text`]).
+fn header_values(name: &str, rest: &[Value], array: ArrayValue, budget: &mut Budget) -> Value {
     let mut shown = vec![name_string(name, budget)];
     if keeps_value_of(name) {
         shown.extend(rest.iter().map(|value| match value {
-            Value::String(text) if direct && is_header_line_text(text) => header_line(text, budget),
+            Value::String(text) if array == ArrayValue::Whole && is_header_line_text(text) => {
+                header_line(text, budget)
+            }
             other => walk_kept(other, budget),
         }));
     } else {
@@ -695,10 +746,19 @@ fn key_text(key: &str, budget: &mut Budget) -> String {
 /// by name and then the strict text pass, so a credential used as a name and a name
 /// that carries a line break and a header line are masked. `…` once the pool is spent.
 fn name_text(granted: Granted<'_>) -> String {
-    granted.render(NAME_EXAMINE_BYTES, header_pass(false))
+    granted.render(NAME_EXAMINE_BYTES, header_pass(FirstLine::Judged))
 }
 
 // ---- header text: raw lines, blocks, names -------------------------------------
+
+/// How the first line of header text is read.
+#[derive(Clone, Copy)]
+enum FirstLine {
+    /// Judged by its name like every other line: a block of header text.
+    Judged,
+    /// The value of a header the name of which keeps its value: left alone.
+    Value,
+}
 
 /// How the name part of a `Name: value` line is read.
 #[derive(Clone, Copy)]
@@ -784,7 +844,7 @@ fn header_line(line: &str, budget: &mut Budget) -> Value {
     };
     let Some(parts) = split_header_line(head, NameShape::Any) else {
         let block = Granted::Head { head, cut };
-        return Value::String(block.render(LEAF_EXAMINE_BYTES, header_pass(false)));
+        return Value::String(block.render(LEAF_EXAMINE_BYTES, header_pass(FirstLine::Judged)));
     };
     Value::String(if keeps_value_of(parts.name) {
         // The line stays within the leaf bound as a whole: the prefix is part of it.
@@ -793,7 +853,7 @@ fn header_line(line: &str, budget: &mut Budget) -> Value {
             head: parts.value,
             cut,
         }
-        .render(limit, header_pass(true));
+        .render(limit, header_pass(FirstLine::Value));
         format!("{}{value}", parts.prefix)
     } else {
         scrub_strict(&hidden_line(parts.name_part))
@@ -801,33 +861,33 @@ fn header_line(line: &str, budget: &mut Budget) -> Value {
 }
 
 /// The text pass over header text: the lines are judged by name first
-/// ([`hide_header_lines`], skipping the first line when `skip_first_line`), so a hidden
-/// line takes the cut marker with its value and a kept line keeps it, and then the
-/// whole text takes the strict text pass (so a private key block that has header lines
-/// inside is still masked whole).
-fn header_pass(skip_first_line: bool) -> impl Fn(&str) -> String {
-    move |text| scrub_strict(&hide_header_lines(text, skip_first_line))
+/// ([`hide_header_lines`], with the first line read as `first` says), so a hidden line
+/// takes the cut marker with its value and a kept line keeps it, and then the whole
+/// text takes the strict text pass (so a private key block that has header lines inside
+/// is still masked whole).
+fn header_pass(first: FirstLine) -> impl Fn(&str) -> String {
+    move |text| scrub_strict(&hide_header_lines(text, first))
 }
 
 /// Header text as a string leaf: examined within the budget, then [`header_pass`].
-fn header_text(text: &str, skip_first_line: bool, budget: &mut Budget) -> Value {
+fn header_text(text: &str, first: FirstLine, budget: &mut Budget) -> Value {
     Value::String(
         budget
             .take(text)
-            .render(LEAF_EXAMINE_BYTES, header_pass(skip_first_line)),
+            .render(LEAF_EXAMINE_BYTES, header_pass(first)),
     )
 }
 
 /// A block of header text: a string under a header-collection key, an element that is
 /// not a `Name: value` line.
 fn header_block(text: &str, budget: &mut Budget) -> Value {
-    header_text(text, false, budget)
+    header_text(text, FirstLine::Judged, budget)
 }
 
 /// A KEPT header value: its first line is the value itself, the lines after its first
 /// break are judged by name.
 fn kept_value(text: &str, budget: &mut Budget) -> Value {
-    header_text(text, true, budget)
+    header_text(text, FirstLine::Value, budget)
 }
 
 /// `text` split at every line break (`\r\n`, `\r` or `\n`): each line with the break
@@ -860,9 +920,9 @@ fn split_lines(text: &str) -> Vec<(&str, &str)> {
 /// blank) goes with it, break included; every other line stays, and so does every line
 /// break. With line breaks in `text` any non-empty name makes a line
 /// ([`NameShape::Any`]); a single line takes a header token only ([`NameShape::Token`]),
-/// so a descriptive string stays prose. With `skip_first_line` the first line is left
-/// alone (it is the value of a header the name of which keeps its value).
-fn hide_header_lines(text: &str, skip_first_line: bool) -> String {
+/// so a descriptive string stays prose. With [`FirstLine::Value`] the first line is
+/// left alone (it is the value of a header the name of which keeps its value).
+fn hide_header_lines(text: &str, first: FirstLine) -> String {
     let lines = split_lines(text);
     let shape = if lines.len() > 1 {
         NameShape::Any
@@ -872,7 +932,7 @@ fn hide_header_lines(text: &str, skip_first_line: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut after_hidden = false;
     for (index, (line, line_break)) in lines.into_iter().enumerate() {
-        if index == 0 && skip_first_line {
+        if index == 0 && matches!(first, FirstLine::Value) {
             out.push_str(line);
             out.push_str(line_break);
             continue;
@@ -1173,7 +1233,7 @@ mod tests {
         );
     }
 
-    // ---- the bounded traversal (Design 14.6)
+    // ---- the bounded traversal (Design 14.6 of the durable audit spec)
 
     /// The single character that stands for text the bound dropped.
     const CUT: &str = "…";
@@ -1440,14 +1500,14 @@ mod tests {
             (
                 "a string with no header name keeps the general text pass",
                 json!({"headers": [
-                    "just prose",
                     ": no name",
+                    "just prose",
                     "",
                     format!("set the password={c} now"),
                 ]}),
                 json!({"headers": [
-                    "just prose",
                     ": no name",
+                    "just prose",
                     "",
                     "set the password=[redacted] now",
                 ]}),
@@ -1872,19 +1932,22 @@ mod tests {
                 json!({"a": spent(), "headers": CUT}),
             ),
             (
-                "a raw line, a pair name and a hidden value after the budget",
-                json!({"a": spent(), "headers": ["X-Debug: c", ["X-Zed", "z"], "Host: x"]}),
-                json!({"a": spent(), "headers": [CUT, [CUT, r], CUT]}),
+                "a pair name, a raw line and a hidden value after the budget",
+                json!({"a": spent(), "headers": [["X-Zed", "z"], "X-Debug: c", "Host: x"]}),
+                json!({"a": spent(), "headers": [[CUT, r], CUT, CUT]}),
             ),
             (
                 "a kept value after the budget",
                 json!({"a": spent(), "headers": {"Host": "x\r\nX-Debug: c"}}),
                 json!({"a": spent(), "headers": {"Host": CUT}}),
             ),
+            // `X-Debug: [redacted]\r\n…` is longer than the 12 bytes that are left, so the
+            // walk that confirms the result cuts it again: the settled text is the hidden
+            // line alone.
             (
                 "a block cut by what is left of the budget",
                 json!({"a": nearly(), "headers": "X-Debug: c\r\nHost: xyz"}),
-                json!({"a": nearly(), "headers": "X-Debug: [redacted]\r\n…"}),
+                json!({"a": nearly(), "headers": "X-Debug: [redacted]"}),
             ),
         ]);
     }
@@ -2334,9 +2397,24 @@ mod tests {
                 json!({"headers": [["My Cookie", r]]}),
             ),
             (
-                "a second element that is no string is not read as a pair",
+                "a second element that is no string is hidden too",
                 json!({"headers": ["My Cookie", 5]}),
-                json!({"headers": ["My Cookie", 5]}),
+                json!({"headers": ["My Cookie", r]}),
+            ),
+            (
+                "three elements: a name that is no token hides every later one",
+                json!({"headers": ["X-Api Key", c, "CNRY2"]}),
+                json!({"headers": ["X-Api Key", r, r]}),
+            ),
+            (
+                "three elements, a cookie name with a blank",
+                json!({"headers": ["Set Cookie", format!("a={c}"), "b=CNRY2"]}),
+                json!({"headers": ["Set Cookie", r, r]}),
+            ),
+            (
+                "a first element with a colon stays a list of lines, whatever its length",
+                json!({"headers": ["Host: x", "just prose", "more"]}),
+                json!({"headers": ["Host: x", "just prose", "more"]}),
             ),
         ]
     }
@@ -2774,22 +2852,101 @@ mod tests {
         assert_eq!(bounded_pass("abc", 8, str::to_uppercase), "ABC");
     }
 
-    /// An error reason is bounded before the text pass: a frame that starts early and
-    /// whose value runs past the cut is masked as an unquoted value, and a secret that
-    /// starts past the cut is not there.
-    #[test]
-    fn a_bounded_reason_still_masks_a_frame_that_runs_past_the_cut() {
-        assert_eq!(
-            REASON_EXAMINE_BYTES, 8192,
-            "the bytes of a reason that are scrubbed"
-        );
-        let early = format!("{} password={}", "a".repeat(1000), CANARY.repeat(2000));
-        let shown = scrub_strict(&bound_text(&early, REASON_EXAMINE_BYTES));
-        assert_eq!(shown, format!("{} password=[redacted]", "a".repeat(1000)));
+    /// A direct header array changes shape when masking removes the only `:` of its
+    /// first element: that colon is part of a masked quoted value, or of a private key
+    /// block. The shape is decided on the text as it is shown, so the result is the one
+    /// a second pass leaves alone and the second element is hidden in the first.
+    fn settling_rows() -> Vec<(&'static str, Value, Value)> {
+        let c = CANARY;
+        vec![
+            (
+                "a colon inside a masked quoted value",
+                json!({"headers": [format!("password=\"{c}: x"), "X-Zed"]}),
+                json!({"headers": ["password=\"[redacted] x", KEY_REDACTED]}),
+            ),
+            (
+                "a colon inside a private key block",
+                json!({"extra_headers": ["-----BEGIN PRIVATE KEY-----\nabc: d", c]}),
+                json!({"extra_headers": ["[redacted]", KEY_REDACTED]}),
+            ),
+        ]
+    }
 
-        let late = format!("{} password={CANARY}", "a".repeat(REASON_EXAMINE_BYTES));
-        let shown = scrub_strict(&bound_text(&late, REASON_EXAMINE_BYTES));
-        assert_eq!(shown, format!("{}…", "a".repeat(REASON_EXAMINE_BYTES)));
+    #[test]
+    fn a_direct_array_whose_colon_is_masked_reads_as_a_name_and_its_values() {
+        check(settling_rows());
+    }
+
+    /// One walk is already the fixed point for those shapes: the loop that settles the
+    /// result is a guarantee for what is not known, not what makes these rows pass.
+    #[test]
+    fn one_walk_settles_the_known_divergences() {
+        let failures: Vec<String> = settling_rows()
+            .into_iter()
+            .filter_map(|(label, input, expected)| {
+                let once = walk(&input, &mut Budget::new());
+                (once != expected).then(|| format!("{label}: one walk gave {once}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// `settle` runs a further round until one leaves the value alone: a value that
+    /// needs two changes is returned after the third round has confirmed it, and one
+    /// that never settles is returned after the third round, as that round left it.
+    #[test]
+    fn settle_stops_at_a_fixed_point_or_after_three_rounds() {
+        let rounds = std::cell::Cell::new(0);
+        let grow_to_three = |value: &Value| {
+            rounds.set(rounds.get() + 1);
+            let text = value.as_str().unwrap_or_default();
+            json!(if text.len() < 3 {
+                format!("{text}x")
+            } else {
+                text.to_owned()
+            })
+        };
+        assert_eq!(settle(json!("x"), grow_to_three), json!("xxx"));
+        assert_eq!(
+            rounds.get(),
+            3,
+            "two changes and the round that confirms them"
+        );
+
+        let rounds = std::cell::Cell::new(0);
+        let never = |value: &Value| {
+            rounds.set(rounds.get() + 1);
+            json!(format!("{}x", value.as_str().unwrap_or_default()))
+        };
+        assert_eq!(settle(json!(""), never), json!("xxx"));
+        assert_eq!(
+            rounds.get(),
+            3,
+            "no fixed point: three rounds, then it gives up"
+        );
+
+        let rounds = std::cell::Cell::new(0);
+        let already = |value: &Value| {
+            rounds.set(rounds.get() + 1);
+            value.clone()
+        };
+        assert_eq!(settle(json!("done"), already), json!("done"));
+        assert_eq!(
+            rounds.get(),
+            1,
+            "a settled value costs one confirming round"
+        );
+    }
+
+    /// A spent pool grants nothing, even to an empty string: after 64 KiB of leaves the
+    /// next leaf is `…` whatever it is.
+    #[test]
+    fn a_spent_pool_shows_an_ellipsis_even_for_an_empty_string() {
+        let mut leaves = vec![json!("a".repeat(4096)); 16];
+        let mut expected = leaves.clone();
+        leaves.push(json!(""));
+        expected.push(json!(CUT));
+        assert_eq!(redact_value(&Value::Array(leaves)), Value::Array(expected));
     }
 
     /// The rows of the direct-pair, key, sibling and loose-name tables that redaction
@@ -2802,6 +2959,7 @@ mod tests {
             .chain(plain_key_rows())
             .chain(sibling_value_rows())
             .chain(loose_name_rows())
+            .chain(settling_rows())
             .filter(|(_, input, expected)| input != expected)
             .map(|(label, input, _)| (label, input))
             .collect();
