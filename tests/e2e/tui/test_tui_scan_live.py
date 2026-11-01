@@ -81,8 +81,11 @@ Capability gates -> exit 77 (SKIP), nothing claimed:
 A v2 core lacking scan.sitemap / scan.issues / scan.issue FAILS the step that reads it.
 
 Attaches to a runner core (AITM_BUS_ADDR + AITM_BUS_OPERATOR_TOKEN + AITM_PROXY_ADDR +
-AITM_TARGET_URL) or self-boots Target("vulnerable") + Aitm.server(CoreConfig(..)). Uses a
-real pty and real ports, so it runs from a real shell or rig, NEVER from the sandbox
+AITM_TARGET_URL) or self-boots the seeded `vulnerable` origin + Aitm.server(CoreConfig(..)):
+through `aitm_e2e.scan.ScanTarget(latency_ms=40)` when the harness offers it, so an
+intrusive scan takes ten seconds or more and the "while running" checks never race a
+fast job (H81; the summary head names the latency), else `Target("vulnerable")` at full
+speed with a `note`. Uses a real pty and real ports, so it runs from a real shell or rig, NEVER from the sandbox
 (which denies socket binds). Evidence (screen captures, status brackets, push counts,
 summary) is written to $AITM_E2E_ARTIFACTS, else to a temp dir named on stdout; the
 seeded secrets are redacted from everything written or printed, and are never printed.
@@ -101,7 +104,8 @@ Site map node and marker, the wire-confirm overlay and its wrapped prompt (H79),
 fallback toast's ref (H78), the crawl `browser` line, the strip banner, the Site map settle
 rule (H54) and head-first wait (H63), the T7-16 sampling rule (H80), the prompt bar and the
 Fields `origins`/`l4`/`speed`/`intensity` lines), the failure-screen writer, the self-boot
-`CoreConfig` (H78), the L4 scope read and add arguments (H59), the prompt, `browser`, `speed`
+`CoreConfig` (H78), the target booter (the `ScanTarget` lever, its argv and the fallback,
+H81), the L4 scope read and add arguments (H59), the prompt, `browser`, `speed`
 and `intensity` key helpers
 against a scripted terminal (H49, H44, H62, H70), the launch's landing wait against
 scripted screens and a scripted scan.list (H72), the tab markers against footers painted
@@ -115,6 +119,7 @@ from __future__ import annotations
 
 import codecs
 import fcntl
+import inspect
 import io
 import json
 import os
@@ -131,6 +136,7 @@ import tempfile
 import termios
 import threading
 import time
+import types
 import urllib.parse
 
 E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2504,6 +2510,72 @@ def quietly(step):
         pass
 
 
+# H81: the eighth live run's target answered a thorough intrusive scan in about two
+# seconds, so the T7-16/T7-17 "while running" observations raced the job under load. No
+# cell-side timing trick is reliable; the lever is a slower target: T10's
+# `aitm-testtarget-serve --latency-ms N` (a per-response sleep on the HTTP and WS
+# listeners), reached through `aitm_e2e.scan.ScanTarget(mode, latency_ms=)`. 40 ms a
+# response makes an intrusive scan take ten seconds or more. The harness copy under test
+# may predate the flag (today's main has no `aitm_e2e.scan`), so the cell boots with the
+# lever when it exists and falls back to `Target("vulnerable")` at full speed with a note.
+TARGET_LATENCY_MS = 40
+TARGET_FAST_NOTE = ("target boots at full speed: this harness has no ScanTarget(latency_ms=), so the "
+                    "T7-16 and T7-17 while-running checks may race a fast job (H81)")
+
+
+def slow_target_class(module=None):
+    """`(ScanTarget, "")` when the harness module (`aitm_e2e.scan` unless one is given)
+    has a `ScanTarget` whose constructor takes `latency_ms`; else `(None, why)`."""
+    if module is None:
+        try:
+            from aitm_e2e import scan as module  # noqa: PLC0415  (the lever lands with T10)
+        except Exception as e:  # noqa: BLE001  (an older harness, or one half landed)
+            return None, f"aitm_e2e.scan is not importable: {type(e).__name__}: {e}"
+    cls = getattr(module, "ScanTarget", None)
+    if cls is None:
+        return None, "the harness has no ScanTarget"
+    try:
+        params = inspect.signature(cls).parameters
+    except (TypeError, ValueError) as e:
+        return None, f"ScanTarget's signature is unreadable: {e}"
+    if "latency_ms" not in params:
+        return None, "ScanTarget takes no latency_ms"
+    return cls, ""
+
+
+def boot_seeded_target(slow_cls, fallback=Target, mode="vulnerable"):
+    """Boot the seeded origin: `(target, latency_ms)`. With `slow_cls` (the harness's
+    `ScanTarget`, H81) it serves `mode` over plain HTTP only (no TLS pair, no control
+    origin: the cell reads nothing from them, as with `Target` today) with
+    `--latency-ms TARGET_LATENCY_MS`; without it, `fallback(mode)` at full speed and 0.
+    Both expose `base` and `authority`, which is all the cell reads."""
+    if slow_cls is not None:
+        return slow_cls(mode, tls=False, control=False, latency_ms=TARGET_LATENCY_MS), TARGET_LATENCY_MS
+    return fallback(mode), 0
+
+
+def latency_words(latency_ms):
+    """The summary head's target-latency segment: the cell's own target with the lever,
+    without it (0), or a runner's target the cell did not boot (None)."""
+    if latency_ms is None:
+        return "target latency unknown (runner core)"
+    if not latency_ms:
+        return "target latency none (full speed)"
+    return f"target latency {latency_ms} ms"
+
+
+def record_target_latency(c, latency_ms, why):
+    """One `ok` line when the target boots with the lever (a record, not a probe: the
+    flag is on the argv the harness built), the `TARGET_FAST_NOTE` with `why` when it
+    boots at full speed, nothing for a runner core's target (H81)."""
+    if latency_ms is None:
+        return
+    if latency_ms:
+        c.check(f"target boots with {latency_ms} ms per response (H81)", True)
+    else:
+        c.note(TARGET_FAST_NOTE, why)
+
+
 def self_boot_config(work, authority, ports):
     """The self-booted core's `CoreConfig`: the three ports (proxy, browser proxy, bus),
     the target's authority and loopback in scope, the findings store under `work`, the
@@ -2523,6 +2595,7 @@ def self_boot_config(work, authority, ports):
 def run(tui, ev, marker, cookie_secret):
     booted = tgt = bus = push_client = pushes = term = ctx = None
     work = token_file = None
+    latency_ms, lever_why = None, ""  # the runner core's target is not the cell's to slow
     try:
         if os.environ.get("AITM_BUS_ADDR"):
             bus_addr = os.environ["AITM_BUS_ADDR"].strip()
@@ -2540,7 +2613,8 @@ def run(tui, ev, marker, cookie_secret):
                 skip77("no aitm-testtarget-serve binary (build it: cargo build -p aitm-testtarget, "
                        "or set AITM_TESTTARGET_BIN)")
             work = tempfile.mkdtemp(prefix="aitm-tui-scan-run-")
-            tgt = Target("vulnerable")
+            slow_cls, lever_why = slow_target_class()
+            tgt, latency_ms = boot_seeded_target(slow_cls)
             cfg = self_boot_config(work, tgt.authority, (free_port(), free_port(), free_port()))
             try:
                 booted = Aitm.server(cfg)
@@ -2594,6 +2668,7 @@ def run(tui, ev, marker, cookie_secret):
         ctx = Ctx(c, term, bus, pushes, ev, proxy_port, target, origin, target_port, names)
         ctx.marker, ctx.cookie_secret = marker, cookie_secret
 
+        record_target_latency(c, latency_ms, lever_why)
         if subscribed:
             c.note("push: the second bus client holds no flow.subscribe subscription "
                    "(the T7-16 push counts will be empty)", subscribed)
@@ -2614,6 +2689,7 @@ def run(tui, ev, marker, cookie_secret):
         head = (("PASS" if not failed else "FAIL")
                 + f": {n_ok} ok, {n_noted} noted, {n_failed} failed"
                 + f"; aitm-tui Scan surface on bus {tui_bus}: jobs {sorted(ctx.jobs.values())}"
+                + f"; {latency_words(latency_ms)}"
                 + ("" if not failed else f"; failed: {failed}")
                 + ("" if not c.files else f"; failure screens: {c.files}"))
         ev.write("summary.txt", "\n".join(c.lines() + ["", head]
@@ -3352,6 +3428,97 @@ def selftest():
             and (boot_cfg.proxy_port, boot_cfg.browser_proxy_port, boot_cfg.bus_port) == (18080, 18081, 19001)
             and 'dir: "/work/run/findings/scan/pocs"' in boot_cfg.to_yaml(),
             f"poc_dir {boot_cfg.poc_dir!r} findings_dir {boot_cfg.findings_dir!r}")
+
+    # Cell item H81, the "sampling races a fast job" class: the eighth live run's target
+    # answered a thorough intrusive scan in about two seconds, so every "while running"
+    # observation raced the job. The lever is T10's `aitm-testtarget-serve --latency-ms N`
+    # behind `aitm_e2e.scan.ScanTarget(mode, latency_ms=)`; the cell boots with it when
+    # the harness offers it and falls back to `Target("vulnerable")` with a note when not.
+    class SlowStandIn:
+        """`aitm_e2e.scan.ScanTarget` as T10 ships it: its own argv assembly (`--port 0`,
+        the TLS pair and the control port on request, `--latency-ms N` when asked)."""
+
+        booted = []
+
+        def __init__(self, mode="vulnerable", *, tls=True, control=True, l4=False,
+                     start_timeout=15.0, latency_ms=None):
+            argv = ["aitm-testtarget-serve", "--mode", mode, "--port", "0"]
+            if tls:
+                argv += ["--tls-port", "0", "--tls-h1-port", "0"]
+            if control:
+                argv += ["--control-port", "0"]
+            if l4:
+                argv.append("--l4")
+            if latency_ms:
+                argv += ["--latency-ms", str(int(latency_ms))]
+            self.argv, self.base = argv, "http://127.0.0.1:50795"
+            SlowStandIn.booted.append(self)
+
+        @property
+        def authority(self):
+            return "127.0.0.1:50795"
+
+    class OldStandIn:
+        """A `ScanTarget` from before the flag: no `latency_ms` keyword."""
+
+        def __init__(self, mode="vulnerable", *, tls=True, control=True):
+            self.mode = mode
+
+    class FastStandIn:
+        """`aitm_e2e.target.Target`: `(mode, start_timeout)`, `base_url`, `base`, `authority`."""
+
+        booted = []
+
+        def __init__(self, mode="vulnerable", start_timeout=15.0):
+            self.mode, self.base_url = mode, "http://127.0.0.1:50796/"
+            FastStandIn.booted.append(self)
+
+        @property
+        def base(self):
+            return self.base_url
+
+        @property
+        def authority(self):
+            return "127.0.0.1:50796"
+
+    picked, why = slow_target_class(types.SimpleNamespace(ScanTarget=SlowStandIn))
+    old, why_old = slow_target_class(types.SimpleNamespace(ScanTarget=OldStandIn))
+    none, why_none = slow_target_class(types.SimpleNamespace())
+    c.check("selftest: H81: the harness's ScanTarget is the booter only when it takes `latency_ms`; "
+            "one without the keyword, or a harness without the class, names why it is not",
+            picked is SlowStandIn and why == "" and old is None and "latency_ms" in why_old
+            and none is None and "ScanTarget" in why_none,
+            f"picked {picked!r} {why!r}; old {old!r} {why_old!r}; none {none!r} {why_none!r}")
+    slow, slow_ms = boot_seeded_target(SlowStandIn, fallback=FastStandIn)
+    c.check("selftest: H81: with the lever the target boots `vulnerable` over plain HTTP, no TLS or "
+            "control listener, with `--latency-ms 40`, and the cell reads the same `base` and "
+            "`authority` it reads from Target",
+            slow_ms == TARGET_LATENCY_MS == 40 and isinstance(slow, SlowStandIn)
+            and slow.argv == ["aitm-testtarget-serve", "--mode", "vulnerable", "--port", "0",
+                              "--latency-ms", "40"]
+            and slow.base.rstrip("/") == "http://127.0.0.1:50795" and slow.authority == "127.0.0.1:50795"
+            and FastStandIn.booted == [],
+            f"latency {slow_ms!r}; argv {getattr(slow, 'argv', None)!r}")
+    fast, fast_ms = boot_seeded_target(None, fallback=FastStandIn)
+    c.check("selftest: H81: without the lever (today's main) the fallback `Target(\"vulnerable\")` "
+            "boots at full speed, and the cell reads `base` and `authority` from it as before",
+            fast_ms == 0 and isinstance(fast, FastStandIn) and fast.mode == "vulnerable"
+            and fast.base.rstrip("/") == "http://127.0.0.1:50796" and fast.authority == "127.0.0.1:50796"
+            and len(SlowStandIn.booted) == 1,
+            f"latency {fast_ms!r}; {fast!r}")
+    rec = Checks(out=io.StringIO())
+    record_target_latency(rec, TARGET_LATENCY_MS, "")
+    record_target_latency(rec, 0, "aitm_e2e.scan has no ScanTarget")
+    record_target_latency(rec, None, "")
+    c.check("selftest: H81: the record is the `ok` line `target boots with 40 ms per response (H81)` "
+            "with the lever, a `note` that the timing checks may race a fast job without it, "
+            "nothing for a runner core; the summary head names the latency in each case",
+            rec.results == [("target boots with 40 ms per response (H81)", "ok"), (TARGET_FAST_NOTE, "note")]
+            and "may race a fast job" in TARGET_FAST_NOTE and "(H81)" in TARGET_FAST_NOTE
+            and latency_words(40) == "target latency 40 ms"
+            and latency_words(0) == "target latency none (full speed)"
+            and latency_words(None) == "target latency unknown (runner core)",
+            f"results {rec.results!r}; words {latency_words(40)!r} {latency_words(0)!r} {latency_words(None)!r}")
 
     # Cell item from the seventh live smoke run: H79. The engine's prompt names the origin
     # (`.. traffic to http://127.0.0.1:50795 and may disrupt the target. Continue?`), longer
