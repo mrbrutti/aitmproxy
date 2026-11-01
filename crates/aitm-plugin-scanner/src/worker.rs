@@ -22,6 +22,7 @@
 //! new reading through [`raise`] and can never walk it back.
 
 use std::any::Any;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,14 +30,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use aitm_core::{
-    BrowserDriver, CommandHost, Flow, FlowStore, HttpFlow, ProxyClient, ScopeRateGuard,
+    BrowserDriver, CommandHost, Flow, FlowId, FlowStore, HttpFlow, ProxyClient, ScopeRateGuard,
 };
 use aitm_scan_model::{
     scan_error, Canary, CheckMeta, Confidence, Discovery, Evidence, InsertionPoint, IssueLocation,
     IssueTarget, JobCtx, JobEvent, JobNotification, JobState, JobStatus, L4Counters, Lane,
     LaneKind, OnLost, Outcome, Payload, ProbeHost, ProbeResponse, RawProbe, RecordProbes,
     ScanErrorCode, ScanProfile, SessionMaterial, SessionMode, SessionStatus, SiteNode,
-    StoppedReason, Technique, Verdict, JOB_KIND_SCAN,
+    StoppedReason, Technique, UseBrowser, Verdict, JOB_KIND_SCAN,
 };
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -230,9 +231,25 @@ pub struct JobRuntime {
     /// Set by [`JobCtx::report_session_lost`] or by the `scan: session_lost: `
     /// error prefix; the worker reads it between items.
     session_lost: AtomicBool,
-    /// Budget units a lane charged outside an HTTP send (browser navigations,
-    /// T3's observe-only streams), so `crawl.pages` can account for them.
+    /// Budget units a lane charged outside an HTTP send (WebSocket frames, L4
+    /// cases, browser navigations), in total. Added to the probe meter's
+    /// reading for `probes.sent`, so a non-HTTP stimulus shows in
+    /// `scan.status` exactly as an HTTP probe does (spec D5).
     lane_charges: AtomicU64,
+    /// The same units, split by the lane that spent them, for
+    /// `probes.by_lane`. A charge made while no lane is running is counted in
+    /// `lane_charges` alone rather than attributed to a guess.
+    charges_by_lane: Mutex<BTreeMap<LaneKind, u64>>,
+    /// The lane the worker is running right now: whose discovery is in
+    /// flight, or whose point the scheduled item belongs to. The worker runs
+    /// lanes one at a time, so this is who a charge belongs to.
+    current_lane: Mutex<Option<LaneKind>>,
+    /// Set while the crawling phase is running, so a charge made then can be
+    /// told from one made during the audit.
+    in_crawl: AtomicBool,
+    /// Charges the HTTP lane made during the crawling phase: one per browser
+    /// navigation, which is the page count of a browser crawl (spec D5).
+    crawl_charges: AtomicU64,
 }
 
 impl JobRuntime {
@@ -250,6 +267,35 @@ impl JobRuntime {
     /// Budget units lanes charged outside an HTTP send.
     fn lane_charges(&self) -> u64 {
         self.lane_charges.load(Ordering::SeqCst)
+    }
+
+    /// Those units, by the lane that spent them.
+    fn charges_by_lane(&self) -> BTreeMap<LaneKind, u64> {
+        self.charges_by_lane
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Note which lane the worker is running, so its charges are attributed
+    /// to it. Called before a lane's discovery and before each scheduled item.
+    fn set_lane(&self, lane: LaneKind) {
+        *self.current_lane.lock().unwrap_or_else(|e| e.into_inner()) = Some(lane);
+    }
+
+    /// The lane whose stimulus is in flight, if any.
+    fn current_lane(&self) -> Option<LaneKind> {
+        *self.current_lane.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Open and close the crawling phase, for [`JobRuntime::crawl_charges`].
+    fn set_crawling(&self, crawling: bool) {
+        self.in_crawl.store(crawling, Ordering::SeqCst);
+    }
+
+    /// Units the HTTP lane charged during the crawling phase.
+    fn crawl_charges(&self) -> u64 {
+        self.crawl_charges.load(Ordering::SeqCst)
     }
 
     /// Edit the session block of the status, creating it when the profile runs
@@ -289,15 +335,44 @@ impl JobCtx for JobRuntime {
         self.session.clone()
     }
 
-    /// One budget for the whole job: a browser navigation a lane charges here
-    /// spends exactly the unit an HTTP probe would (coordinator item (d)).
+    /// One budget for the whole job: a WebSocket frame, an L4 case or a
+    /// browser navigation charged here spends exactly the unit an HTTP probe
+    /// would (spec D5, coordinator item (d)).
+    ///
+    /// A charge that succeeds is a stimulus that went out, so it is counted
+    /// in `probes.sent` and in `probes.by_lane` under the lane that is
+    /// running — the half of `scan.status` a WebSocket job was missing (stage
+    /// 6, live run 2). An HTTP send never comes through here: the `JobClient`
+    /// charges the budget directly and the probe meter counts it, so no
+    /// stimulus is counted twice.
     fn charge(&self, units: u32) -> bool {
-        if self.budget.charge(units) {
-            self.lane_charges
-                .fetch_add(u64::from(units), Ordering::SeqCst);
+        if !self.budget.charge(units) {
+            return false;
+        }
+        if units == 0 {
             return true;
         }
-        false
+        let units = u64::from(units);
+        self.lane_charges.fetch_add(units, Ordering::SeqCst);
+        let lane = self.current_lane();
+        if let Some(lane) = lane {
+            let mut by_lane = self
+                .charges_by_lane
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            bump(by_lane.entry(lane).or_insert(0), units);
+            if lane == LaneKind::Http && self.in_crawl.load(Ordering::SeqCst) {
+                self.crawl_charges.fetch_add(units, Ordering::SeqCst);
+            }
+        }
+        // Live, rather than at the next counter sync, so a long lane run is
+        // honest about what it has already spent.
+        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+        bump(&mut status.probes.sent, units);
+        if let Some(lane) = lane {
+            bump(status.probes.by_lane.entry(lane).or_insert(0), units);
+        }
+        true
     }
 
     fn budget_left(&self) -> u32 {
@@ -492,6 +567,10 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         markers: AtomicU64::new(0),
         session_lost: AtomicBool::new(false),
         lane_charges: AtomicU64::new(0),
+        charges_by_lane: Mutex::new(BTreeMap::new()),
+        current_lane: Mutex::new(None),
+        in_crawl: AtomicBool::new(false),
+        crawl_charges: AtomicU64::new(0),
     });
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
@@ -499,10 +578,12 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     emit(progress, JobEvent::Started, &status, None);
 
     // --- crawling -----------------------------------------------------------
-    let pages_before = store.count() as u64;
+    let before: HashSet<FlowId> = store.list().into_iter().collect();
+    runtime.set_crawling(true);
     let mut points: Vec<InsertionPoint> = Vec::new();
     let mut nodes: Vec<SiteNode> = Vec::new();
     for lane in &lanes {
+        runtime.set_lane(lane.lane());
         match bounded_await(
             deadline,
             &cancel,
@@ -535,16 +616,16 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
                     crate::client::AwaitEnd::Cancelled => StoppedReason::Cancelled,
                     _ => StoppedReason::Time,
                 };
-                sync_counters(&status, &meter, &engine.issues, &job);
+                runtime.set_crawling(false);
+                sync_counters(&status, &meter, &runtime, &engine.issues, &job);
                 finish_terminal(&engine, &status, progress, &job, &started_by, Some(reason));
                 return;
             }
         }
     }
+    runtime.set_crawling(false);
     {
-        let pages = (store.count() as u64)
-            .saturating_sub(pages_before)
-            .saturating_add(runtime.lane_charges());
+        let pages = crawl_pages(&runtime, store.as_ref(), &before, &job, &profile);
         let mut guarded = status.write().unwrap_or_else(|e| e.into_inner());
         bump(&mut guarded.crawl.pages, pages);
         bump(&mut guarded.points.found, points.len() as u64);
@@ -629,7 +710,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         aitm_scan_model::Phase::Reporting,
     );
     emit(progress, JobEvent::Phase, &status, None);
-    sync_counters(&status, &meter, &engine.issues, &job);
+    sync_counters(&status, &meter, &runtime, &engine.issues, &job);
 
     let reason = match (stopped, cancel.is_cancelled()) {
         (Some(reason), _) => Some(reason),
@@ -665,7 +746,13 @@ struct RunCtx<'a> {
 impl RunCtx<'_> {
     /// Copy the live meters onto the status.
     fn sync(&self) {
-        sync_counters(self.status, self.meter, &self.engine.issues, self.job);
+        sync_counters(
+            self.status,
+            self.meter,
+            self.runtime,
+            &self.engine.issues,
+            self.job,
+        );
     }
 
     /// The questions spec D5 asks about the job itself: cancellation, the
@@ -751,6 +838,9 @@ impl RunCtx<'_> {
             self.item_done(item.point, owed, &meta.id);
             return;
         };
+        // Whatever this item charges belongs to this lane (spec D5,
+        // `probes.by_lane`).
+        self.runtime.set_lane(lane.lane());
 
         let host = match lane.probe_host_for(point, Arc::clone(self.job_ctx)) {
             Ok(host) => ArcHost(Arc::from(host)),
@@ -1140,19 +1230,88 @@ fn observe_session(store: &dyn FlowStore, profile: &ScanProfile) -> Option<Obser
         .find_map(|origin| session::pick_observed(store, origin, from_flow))
 }
 
+/// How many pages the crawling phase fetched, counting each page **once**
+/// (spec D5; stage 6 finding, Coder/client crawl).
+///
+/// The two crawl paths leave different traces, so they are read differently
+/// and never added together:
+///
+/// * A **browser** crawl charges one unit per navigation and leaves every
+///   capture the page made — its subresources included — in the store, so its
+///   charges are the page count and its store growth is not.
+/// * A **client** crawl charges nothing of its own (its GETs go through the
+///   `JobClient`, which counts them as probes) and leaves exactly one
+///   crawl-marked capture per page, so its store growth is the page count.
+///
+/// Growth is read by mark, not by size: only a flow added during this phase
+/// carrying both this job's `scan:<job>` mark and the `crawl` mark is a page,
+/// so a probe recorded under `record_probes: all` is never miscounted as one.
+fn crawl_pages(
+    runtime: &JobRuntime,
+    store: &dyn FlowStore,
+    before: &HashSet<FlowId>,
+    job: &str,
+    profile: &ScanProfile,
+) -> u64 {
+    let browser_crawls =
+        runtime.browser.is_some() && profile.crawl.use_browser != UseBrowser::Never;
+    if browser_crawls {
+        return runtime.crawl_charges();
+    }
+    let job_mark = format!("scan:{job}");
+    store
+        .list()
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .filter_map(|id| store.get(id))
+        .filter(|flow| is_crawl_capture(flow, &job_mark))
+        .count() as u64
+}
+
+/// Whether `flow` is one of this job's crawl captures: both this job's mark
+/// and the `crawl` mark, which only the crawl paths put on a flow.
+fn is_crawl_capture(flow: &Flow, job_mark: &str) -> bool {
+    let marks = &flow.metadata().marks;
+    marks.iter().any(|mark| mark == job_mark)
+        && marks
+            .iter()
+            .any(|mark| mark == crate::interim_lane::CRAWL_MARK)
+}
+
 /// Copy the live meters onto the status, monotonically.
-/// `probes.sent` is the **meter's** reading, not the budget's: a lane charge
-/// (a browser navigation) spends the same budget but is not an HTTP send, and
-/// it is counted in `crawl.pages` instead.
+///
+/// `probes.sent` is the probe meter's reading **plus** the units lanes
+/// charged: an HTTP send is counted by the meter inside the `JobClient`, and
+/// every other stimulus — a WebSocket frame, an L4 case, a browser navigation
+/// — by [`JobCtx::charge`]. The two paths are disjoint (the client charges
+/// the `JobBudget` directly and never calls `charge`), so no stimulus is
+/// counted twice. `probes.by_lane` splits the same total: the meter's sends
+/// are the HTTP lane's, each lane's charges are its own (spec D5).
 fn sync_counters(
     status: &Arc<RwLock<JobStatus>>,
     meter: &ProbeMeter,
+    runtime: &JobRuntime,
     issues: &IssueStore,
     job: &str,
 ) {
     let found = issues.for_job(job);
+    let charges = runtime.charges_by_lane();
+    let sent = meter.sent.load(Ordering::SeqCst);
     let mut guarded = status.write().unwrap_or_else(|e| e.into_inner());
-    raise(&mut guarded.probes.sent, meter.sent.load(Ordering::SeqCst));
+    raise(
+        &mut guarded.probes.sent,
+        sent.saturating_add(runtime.lane_charges()),
+    );
+    for (lane, units) in &charges {
+        raise(guarded.probes.by_lane.entry(*lane).or_insert(0), *units);
+    }
+    if sent > 0 {
+        let http = sent.saturating_add(charges.get(&LaneKind::Http).copied().unwrap_or(0));
+        raise(
+            guarded.probes.by_lane.entry(LaneKind::Http).or_insert(0),
+            http,
+        );
+    }
     raise(
         &mut guarded.probes.errors,
         meter.errors.load(Ordering::SeqCst),
@@ -1305,8 +1464,8 @@ mod tests {
 
     use aitm_core::{AgentPolicy, Flow, FlowStore};
     use aitm_scan_model::{
-        JobEvent, JobNotification, JobState, JobStatus, L4Counters, OnLost, Phase, RecordProbes,
-        StoppedReason,
+        JobEvent, JobNotification, JobState, JobStatus, L4Counters, LaneKind, OnLost, Phase,
+        RecordProbes, StoppedReason,
     };
 
     /// AC T1-1 (spec D3/D5): `scan.start` returns while the job is still
@@ -2157,6 +2316,100 @@ mod tests {
         assert_eq!(h.engine.issues.for_job(&started.job).len(), 2);
         // The `fake.hit` runs sent one probe each; `fake.boom` sent none.
         assert_eq!(h.client.calls(), 2);
+    }
+
+    /// Stage 6 finding (live run 2, p13): a stimulus a lane charges through
+    /// [`JobCtx::charge`] — a WebSocket frame, an L4 case, a browser
+    /// navigation — is a probe of the one job budget, so it is counted in
+    /// `probes.sent` and attributed to the lane that spent it (spec D5:
+    /// "WS and L4 stimuli go through the lane's own transport ... metered by
+    /// the same job budget"). Before the fix a 13-check WebSocket job
+    /// reported `sent: 0`, `by_lane: {}` while raising issues.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn charged_stimuli_count_in_probes_sent_and_by_lane() {
+        let h = Harness::new().with_lane(FakeLane::ws().with_check(FakeCheck::on_lane(
+            "fake.ws",
+            "demo",
+            LaneKind::Ws,
+            FakeRun::clean().with_probes(0).with_charge(3),
+        )));
+        h.bind();
+
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::Ws];
+        let started =
+            crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.done, 1, "the ws check ran");
+        assert_eq!(h.client.calls(), 0, "a ws frame is no HTTP send");
+        assert_eq!(status.probes.sent, 3);
+        assert_eq!(
+            status.probes.by_lane,
+            std::collections::BTreeMap::from([(LaneKind::Ws, 3)])
+        );
+    }
+
+    /// The other half of the same rule: an HTTP send is counted by the probe
+    /// meter inside the `JobClient` and by nothing else, so the two paths
+    /// never count one stimulus twice (spec D5, "One `probes` budget per job
+    /// across lanes; `JobClient` charges one unit per stimulus").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_probes_and_charges_are_not_double_counted() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_points(vec![fake_point("p1", "q", "http://scan.test/search")])
+                .with_check(FakeCheck::new(
+                    "fake.http",
+                    "demo",
+                    FakeRun::clean().with_probes(2).with_charge(0),
+                )),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(h.client.calls(), 2);
+        assert_eq!(status.probes.sent, 2);
+        assert_eq!(
+            status.probes.by_lane,
+            std::collections::BTreeMap::from([(LaneKind::Http, 2)])
+        );
+    }
+
+    /// Stage 6 finding (Coder, client crawl): `crawl.pages` was store growth
+    /// **plus** the lane's charges, so a crawl page that both charged and left
+    /// a capture counted twice. A page counts once (spec D5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crawl_pages_count_each_page_once() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_points(Vec::new())
+                .with_discover_charge(2)
+                .with_crawl_flows(2),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.crawl.pages, 2, "two pages, counted once each");
     }
 
     fn value_to_json(value: aitm_core::Value) -> serde_json::Value {

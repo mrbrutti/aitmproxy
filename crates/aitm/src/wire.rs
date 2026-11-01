@@ -139,7 +139,7 @@ impl Default for Features {
 /// Each lane crate owns a `lane()` entry point returning `Option<Arc<dyn Lane>>`;
 /// this is the one place that calls them, so a lane track lands by filling its own
 /// crate and edits no shared file ("Registration without shared files"). A slot
-/// that answers `None` — every slot while its track is unimplemented — is skipped,
+/// that answers `None` — a track whose lane this build does not ship — is skipped,
 /// and `scan.start` refuses that lane with `lane_unavailable`.
 ///
 /// The two L4 slots are called with the shared guard and flow store from
@@ -208,8 +208,9 @@ pub fn ws_tls_policy(cfg: &Config) -> TlsPolicy {
 /// The native (compiled-in) scanner v2 checks this build ships (spec D1).
 ///
 /// `aitm-scan-checks-http` contributes checks to the HTTP lane's catalogue rather
-/// than a second lane, so its slot is `checks()`, not `lane()`. Empty until track
-/// T3 lands.
+/// than a second lane, so its slot is `checks()`, not `lane()`. It answers the
+/// checks track T3 has landed, which is none while that crate ships an empty
+/// catalogue.
 #[must_use]
 pub fn collect_native_checks() -> Vec<Arc<dyn aitm_scan_model::Check>> {
     aitm_scan_checks_http::checks()
