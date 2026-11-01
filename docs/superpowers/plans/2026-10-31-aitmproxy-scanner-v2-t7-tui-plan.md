@@ -760,6 +760,7 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | live smoke | run 7 | 52 ok, 3 failed: cancel live on the intrusive job with pushes counted; T7-17 live through `u` with the cursor holding; T7-19 complete incl. the inspector; left: `P` fallback toast treated as failure, the confirm text wraps across rows, phase text constant over three samples | H78-H80 (cell) |
 | H (cell) | fix round | done | H78-H80 in `70e558a5`; `--selftest` 71 ok; cell complete | live run 8 |
 | 17 | core gap | relayed | `poc.list` cannot see the engine's per-run PoC subdirectories; `P`'s strong branch unreachable on every UI | coordinator (core track); the fallback toast passes |
+| 15 | live smoke | run 8 | 57 ok, 1 noted, 3 failed: all three are the two-second scan racing the "while running" observations (run 7 passed those); everything else live incl. `P`'s fallback toast | ruling asked: target latency option (T10) or timing-sensitive checks recorded per run |
 
 ## Shipped
 
