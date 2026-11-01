@@ -265,7 +265,10 @@ crates/aitm-scan-http/
   harvest), D8.1 client engine "HTML link/form extractor".
 - **Depends on:** Task 1.
 - **Files:** `crates/aitm-scan-http/src/crawl/extract.rs`.
-- **Change:** a tag-aware tokenizer (skip `<!-- -->`, `<script>` and `<style>` bodies, decode
+- **Change:** a tag-aware tokenizer (skip `<!-- -->`, `<script>`, `<style>` and, since S-I2/R-M2, the
+  raw-text bodies of `textarea`, `title`, `noscript`, `xmp`, `iframe`, `noembed`, `noframes`, `plaintext`,
+  so extractor form indices match the live DOM; a form reachable only inside `<noscript>` is crawled by
+  neither engine; decode
   `&amp; &lt; &gt; &quot; &#39; &#NN;` in attribute values), mined from legacy
   `crawl.rs::harvest_links`/`tag_attribute`, extended to forms:
   ```
@@ -515,7 +518,12 @@ crates/aitm-scan-http/
   `connection`, `cookie`, `content-type` (call A8), `keep-alive`, `proxy-connection`, `te`,
   `trailer`, `upgrade`, `expect`, and any name starting with `:`. Path points: every non-empty
   segment is `path_segment` (name = the segment text, `path` = its 1-based index as a string)
-  except the last when `looks_like_filename` (then `path_filename`). Traits: `traits_for(value)`
+  except the last when `looks_like_filename` (then `path_filename`); amended 2026-11-01 (S-M2/R-M1): an
+  id-like segment is named by its template placeholder (`{id}`, `{uuid}`, `{oid}`) and an opaque
+  segment (hex run >= 16, base64) `{token}`, via one `template::path_segment_token`; the example is
+  withheld for every placeholder except `{id}`. Consequence recorded as call A20: templated segments
+  share one `(kind, name)`, so the engine's frequent-point rule and dedupe key treat `/account/1` and
+  `/account/2` as one point (Burp's behaviour). Traits: `traits_for(value)`
   plus `Json` on every `json_value` point (decision 10) plus `Session` when the name equals a
   session cookie name (cookie kind) or a session header name (header kind, case-insensitive) in
   `opts.session`, or `is_secret_name(name)`. `example` = `redact::example(kind, name, value)`;
@@ -1237,6 +1245,16 @@ is touched by Task 20 alone (the one literal), so every commit on the branch kee
   The browser engine submits whatever the page does.
 - **A19** The stored-flow seeding (decision 6 (i)) also feeds up to 256 captured `GET` URLs into
   the crawl frontier as seeds, so proxied traffic widens the crawl and not only the site map.
+  Amended 2026-11-01 (S-M7): the stored pass is newest-first, capped at `MAX_STORED_FLOWS` (2048)
+  with response bodies cleared, so the seeds are the newest 256 captured `GET` URLs.
+- **A20** (orchestrator, 2026-11-01) Signature drift accepted from the panel fix rounds: `CrawlReport
+  { stopped_reason: Option<StopReason>, forms_skipped, .. }` and `Step::Stop(StopReason)` (the enum's
+  `as_str` yields A14's nine literals; `NoBrowser` is lane-only); `Frontier` has no `attempts`;
+  `tag_form_js` returns the live form's `action`/`method`/`enctype`/control names and `submit_form_js`
+  submits the tagged element through `HTMLFormElement.prototype`; `StoreDiff::mark_new(&mut self)`
+  with one snapshot per page; `values::chosen_fields`, `url_norm::parts`, `client::crawl_get`,
+  `SessionMonitor::force_lost`, `MonitorTable`, `limits::job_mark`/`MAX_STORED_FLOWS`/
+  `MAX_LOST_MONITOR_IDS`; test doubles gained `LiveFormScript`, `with_capture_body`, `with_live_form`.
 
 ## Questions for Matt
 
@@ -1268,20 +1286,26 @@ Kept by the main session during stage 6. One row per finding.
 | 20 | Coder (stage 4) | Minor | R3: a crawl that failed mid-way lost the captures it had already produced | fixed in 1f753ce1 (store re-queried on `Err`; `Crawlers` injection seam for the test) |
 | 21 prep | Tester (stage 5) | Important | N1: `session.mode: none` still replayed a captured flow's own `Cookie`/`Authorization`, so AC T2-4's `none` half could not hold for a seed captured while logged in | fixed in bfe7b789 (strip at host construction and on `probe_raw`); plan amended (d1f5d359, 292e0d9d) |
 | 21 prep | Tester (stage 5) | Minor | N2: client crawler posted `multipart/form-data` forms as urlencoded (A18) | fixed in 171c8689 (multipart body with an inert file part) |
-| whole branch | Security + Quality (stage 6) | Critical | C1: `extract.rs::refresh_target` slices a byte index inside a multibyte char (`content="0;éé"`), panicking the discovery future | fix round A (pending SHA) |
-| whole branch | Security (stage 6) | Important | S-I1: JSON/XML secret detection reads the leaf name, not the path (`session.id`, `auth.value` leak an example and are mutated) | fix round B (pending SHA) |
-| whole branch | Security (stage 6) | Important | S-I2: browser form submission trusts the extractor's form index against a re-navigated live page; a JS-mounted third-party form could be posted off-origin before `left_scope` | fix round A: live form attributes verified before fill/submit; raw-text elements in the extractor |
-| whole branch | Security (stage 6) | Important | S-I3: browser crawl report holds every produced flow with full bodies (client engine truncates) | fix round A: shared held-copy truncation |
-| whole branch | Security (stage 6) | Minor | S-M1 path-segment `%` passthrough of SP/CR/LF; `probe_raw` method unvalidated | fix round B |
-| whole branch | Security (stage 6) | Minor | S-M2 path-borne tokens exposed as point name/example | fix round B: placeholder names for id-like segments, redacted examples for uuid/oid/hex/base64 |
-| whole branch | Security (stage 6) | Minor | S-M3 derived `Debug` on `JsonLeaf`, `SplitPath`, `Frontier` could print values/URLs | fix rounds A+B |
-| whole branch | Security (stage 6) | Minor | S-M4 `safe_query` matches keys before percent-decoding | fix round B |
-| whole branch | Security + Quality (stage 6) | Minor | S-M5 `SessionMonitors` eviction forgets a live job's lost state (>16 jobs) | fix round B: bounded lost-job set, rebuilt monitors start lost |
-| whole branch | Security (stage 6) | Minor | S-M6 `StoreDiff::snapshot` is O(store) per browser action | fix round A: one snapshot per page, running set |
-| whole branch | Security (stage 6) | Minor | S-M7 `stored_flows` uncapped clone with bodies | fix round A: `MAX_STORED_FLOWS` newest-first, bodies cleared |
-| whole branch | Quality (stage 6) | Minor | Q: job mark formatted in four places; stop reasons as literals; duplicate crawl request builders (+ seed sends ignoring `http.version`, Spec Minor); `attempts` counted in two places; `in_scope(&str)`; permit comment lie; checkbox rule twice; test-only `len/is_empty`; profile clone per host; hand-rolled `scrub_error`; visibility nits | fix rounds A+B |
+| whole branch | Security + Quality (stage 6) | Critical | C1: `extract.rs::refresh_target` slices a byte index inside a multibyte char (`content="0;éé"`), panicking the discovery future | fixed in ffa47559 (`str::get` on every page-text slice; multibyte pins) |
+| whole branch | Security (stage 6) | Important | S-I1: JSON/XML secret detection reads the leaf name, not the path (`session.id`, `auth.value` leak an example and are mutated) | fixed in 3556023a (`path_is_secret` on the dotted path) |
+| whole branch | Security (stage 6) | Important | S-I2: browser form submission trusts the extractor's form index against a re-navigated live page; a JS-mounted third-party form could be posted off-origin before `left_scope` | fixed in 93ba7e8d (live form attributes/controls verified before fill/submit; `textarea`/`title`/`noscript`/`xmp` raw text); residual R-I1 (submit by index) fixed in round 3 |
+| whole branch | Security (stage 6) | Important | S-I3: browser crawl report holds every produced flow with full bodies (client engine truncates) | fixed in 67da5b4f (`frontier::held_copy` shared by both engines); round 3 clears the body and caps the count |
+| whole branch | Security (stage 6) | Minor | S-M1 path-segment `%` passthrough of SP/CR/LF; `probe_raw` method unvalidated | fixed in 4072c5d6 |
+| whole branch | Security (stage 6) | Minor | S-M2 path-borne tokens exposed as point name/example | fixed in c1b2915e + 09d490b6 (placeholder names for id-like segments, examples withheld for uuid/oid/hex/base64); round 3 names opaque tokens `{token}` (one predicate) |
+| whole branch | Security (stage 6) | Minor | S-M3 derived `Debug` on `JsonLeaf`, `SplitPath`, `Frontier` could print values/URLs | fixed in 8fdc7a91 + 40db5472 |
+| whole branch | Security (stage 6) | Minor | S-M4 `safe_query` matches keys before percent-decoding | fixed in 770f689e |
+| whole branch | Security + Quality (stage 6) | Minor | S-M5 `SessionMonitors` eviction forgets a live job's lost state (>16 jobs) | fixed in 7c3d3244 (bounded lost-job set, rebuilt monitors start lost); round 3 moves the bound to `limits.rs` and the invariants into `MonitorTable` methods |
+| whole branch | Security (stage 6) | Minor | S-M6 `StoreDiff::snapshot` is O(store) per browser action | fixed in 2645b8a9 (one snapshot per page, running `seen` set); residual `store.list()` per action accepted by the orchestrator 2026-11-01: a `list_since` store cursor is a core seam outside this track |
+| whole branch | Security (stage 6) | Minor | S-M7 `stored_flows` uncapped clone with bodies | fixed in a699f77a (`MAX_STORED_FLOWS` 2048 newest-first, bodies cleared) |
+| whole branch | Quality (stage 6) | Minor | Q: job mark formatted in four places; stop reasons as literals; duplicate crawl request builders (+ seed sends ignoring `http.version`, Spec Minor); `attempts` counted in two places; `in_scope(&str)`; permit comment lie; checkbox rule twice; test-only `len/is_empty`; profile clone per host; hand-rolled `scrub_error`; visibility nits | fixed in bf7c5381, 2278ec01, a127250d, 68222f73, c678b0be, 5c1bc6b9, 641a68ba, 0bd42b9b, f1418b91, 557e7e16, 1eecfde4, 28724188, db4b30a0, f12fe35d |
 | whole branch | Quality (stage 6) | Minor | Three byte-search helpers and two `splice`s with different bad-span semantics; `visit`/`landed_page` repetition; constants pinned twice in tests | accepted by the orchestrator (autonomous mandate) 2026-11-01: `mutate.rs` guards every span before splicing (`checked_span`) so no runtime defect; a cross-parser helper refactor is out of proportion for this PR; `limits_match_the_plan` is the plan's own pin |
-| whole branch | Spec (stage 6) | Minor | `expect` missing from `EXCLUDED_HEADERS`; seed fetches ignore `http.version`; A18/Task 14 vs N2; Task 10 `url` wording; `Cargo.lock` under Task 1; `USER_AGENT` not in the constant list | code items in fix rounds A/B; plan items fixed in this commit |
+| whole branch | Spec (stage 6) | Minor | `expect` missing from `EXCLUDED_HEADERS`; seed fetches ignore `http.version`; A18/Task 14 vs N2; Task 10 `url` wording; `Cargo.lock` under Task 1; `USER_AGENT` not in the constant list | Sp1 fixed in 0711ef94; Sp2 in 68222f73; Sp3-Sp6 plan edits in 663426eb |
+| fix range | Tester (stage 5 re-run) | - | Every round-1/2 fix has a mutation-sensitive reproducing test; 8 pins added | a0c5c2ac |
+| fix range | Security (re-review) | Important | R-I1: `submit_form_js` submits `document.forms[i]` by index, not the element `tag_form_js` verified (a form injected between the two evals could be submitted off-origin) | fix round 3 |
+| fix range | Security (re-review) | Minor | R-M1 opaque path token still the point `name`; R-M2 raw-text set misses `iframe`/`noembed`/`noframes`/`plaintext`; R-M3 browser report flow count unbounded and held bodies unread; S-M6 residual `store.list()` per action | R-M1..R-M3 fix round 3; S-M6 residual accepted (see its row) |
+| fix range | Quality (re-review) | Minor | `LiveForm::as_spec` duplicates the extractor's form normalisation; `MonitorTable` invariants inline; fifth `tchar` copy; `StoreDiff` built field-by-field; `StopReason` `NoBrowser`/`Display` story; dead `is_empty`s; misplaced test doc; two token predicates | fix round 3 (R-M5 uses `aitm_core::header::is_valid_name`; the rhai/poc `tchar` copies are a follow-up outside this track) |
+| fix range | Quality (re-review) | - | Files rewritten in the worktree mid-review | the concurrent Tester's instructed mutation checks (reverted byte-for-byte); the final panel runs on a quiesced tree |
+| fix range | Spec (re-review) | Minor | Plan text behind the fixes: Task 10 path naming, Task 4 raw-text set, `MAX_LOST_MONITOR_IDS` outside `limits.rs`, Task 16/18/20 and A14/A19 signature drift | plan amended in this commit; constant moved in round 3 |
 
 ## Shipped
 
