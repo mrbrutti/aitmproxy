@@ -1628,6 +1628,8 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 24 (PR 4a) | quality (re-run) | Minor | `Endpoint.address` rendered a bare IPv6 host its own parser rejects; `settingsPort` truncated a fractional port where the wire path rejects | fixed in the follow-up commit (bracketed on render; `Int(exactly:)`) |
+| 24 (PR 4a) | quality (re-run) | Minor | a second definition of "loopback spelling" beside `EmbeddedCoreLaunch.isLoopbackHost` | accepted (recorded) with a cross-reference comment; the two callers have different stakes (dial guard vs display match) |
 | 24 (PR 4a) | quality | Important | `init?(compact:)` took `[String: Any]` and truncated ports; the Kit decodes bus objects as `JSONValue` with exact ints | fixed in c8ed92f4 |
 | 24 (PR 4a) | spec | Important | `other` reported at our own listen address routed `.thisCore` (§D6 partial case) | fixed in c8ed92f4 (nil = unknown); spec §D13 paragraph states the rule |
 | 24 (PR 4a) | spec | Important | spec §D13 / plan Task 24 / sibling plan Task 1 described an enum and claimed to create the files | docs amended in c5d30c99; sibling plan Files lines to be updated by the attribution session (text sent) |
