@@ -20,11 +20,15 @@ public struct DecryptStatus: Hashable, Sendable {
     }
 
     /// Nil unless `json` is the `decrypt` object: it always carries `scope_hosts`. A missing
-    /// `decrypting` defaults to `scopeHosts > 0`; a null or missing `advice` is nil.
+    /// `decrypting` defaults to `scopeHosts > 0`; a null, missing, empty or whitespace-only `advice`
+    /// is nil — an empty string is no sentence, and reading it as one would print an empty Scope row
+    /// and a blank banner, where `ConnectionSummary.nothingDecryptedAdvice` is the fallback. A real
+    /// sentence is kept verbatim (D3), padding included.
     public init?(json: JSONValue) {
         guard let scopeHosts = json["scope_hosts"]?.intValue else { return nil }
+        let advice = json["advice"]?.stringValue.flatMap { $0.allSatisfy(\.isWhitespace) ? nil : $0 }
         self.init(scopeHosts: scopeHosts,
                   decrypting: json["decrypting"]?.boolValue ?? (scopeHosts > 0),
-                  advice: json["advice"]?.stringValue)
+                  advice: advice)
     }
 }

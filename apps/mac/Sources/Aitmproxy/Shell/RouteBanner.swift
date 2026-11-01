@@ -4,8 +4,9 @@ import SwiftUI
 /// The one banner line above every flow list (Flows, Pinned, Domains, Apps) while flows exist and a
 /// known route is closed, every row is a tunnel with an empty Scope, or the CA is not trusted (spec
 /// 2026-10-31-mac-traffic-route-advice-design D5/D8). The text is `TrafficRoutes.banner` — the shown
-/// facts' state words only — and the one button is `bannerAction`; both come from `Session.trafficRoutes`,
-/// the only thing this file reads, so no route word is spelled here and the caller draws the `Rule`.
+/// facts' state words only — the one button is `bannerAction`, and the tooltip's second line is
+/// `bannerDetail`; all three come from `Session.trafficRoutes`, the only thing this file reads, so no
+/// route word is spelled here, nothing re-derives the shown set, and the caller draws the `Rule`.
 struct RouteBanner: View {
     @Environment(Session.self) private var session
     @Environment(\.openSettings) private var openSettings
@@ -32,32 +33,16 @@ struct RouteBanner: View {
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.Row.dense)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .help(Self.help(banner: banner, shown: Self.shownEntries(routes)))
+        .help(Self.help(banner: banner, detail: routes.bannerDetail))
         .accessibilityIdentifier("route-banner")
     }
 
-    /// The tooltip: the full banner (the line truncates), then the shown entries' details joined " · ".
-    static func help(banner: String, shown: [TrafficRoute]) -> String {
-        let details = shown.map(\.detail).joined(separator: " · ")
-        return details.isEmpty ? banner : "\(banner)\n\(details)"
+    /// The tooltip: the full banner (the line truncates), then the Kit's `bannerDetail` — the shown entries'
+    /// details joined " · " — on a second line when there is one.
+    static func help(banner: String, detail: String?) -> String {
+        guard let detail else { return banner }
+        return "\(banner)\n\(detail)"
     }
-
-    /// The entries the banner names, in its order. The Kit joins the shown entries' `state`s with " · " in
-    /// `advice` order (spec D5), so walking `advice` and consuming each state that heads the remaining text
-    /// recovers that list without a second derivation of the banner predicate.
-    static func shownEntries(_ routes: TrafficRoutes) -> [TrafficRoute] {
-        guard let banner = routes.banner else { return [] }
-        var rest = Substring(banner)
-        var shown: [TrafficRoute] = []
-        for entry in routes.advice where rest.hasPrefix(entry.state) {
-            shown.append(entry)
-            rest = rest.dropFirst(entry.state.count)
-            if rest.hasPrefix(Self.separator) { rest = rest.dropFirst(Self.separator.count) }
-        }
-        return shown
-    }
-
-    private static let separator = " · "
 }
 
 /// Runs a route action from the Flows surfaces the way the Status page runs its steps: through

@@ -47,4 +47,25 @@ import Testing
         let none = try #require(DecryptStatus(json: ["scope_hosts": 0]))
         #expect(none.decrypting == false)
     }
+
+    /// An empty `advice` string is no sentence: it decodes as nil, the same as a null or missing key, so the
+    /// Scope line falls back to the Kit's own words instead of printing an empty row and a blank banner.
+    @Test func anEmptyAdviceStringDecodesAsNil() throws {
+        let empty = try #require(DecryptStatus(json: ["scope_hosts": 0, "decrypting": false, "advice": ""]))
+        #expect(empty.scopeHosts == 0)
+        #expect(empty.decrypting == false)
+        #expect(empty.advice == nil)
+        #expect(empty == DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil))
+    }
+
+    /// Whitespace-only advice is empty too. A real sentence stays verbatim (D3), padding included: only an
+    /// all-whitespace value reads as absent.
+    @Test func aWhitespaceOnlyAdviceDecodesAsNil() throws {
+        let blank = try #require(DecryptStatus(json: ["scope_hosts": 0, "decrypting": false, "advice": "  \n"]))
+        #expect(blank.advice == nil)
+        #expect(blank == DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil))
+        #expect(try #require(DecryptStatus(json: ["scope_hosts": 0, "advice": "\t"])).advice == nil)
+        let padded = try #require(DecryptStatus(json: ["scope_hosts": 0, "advice": " Nothing is decrypted until a host is in Scope. "]))
+        #expect(padded.advice == " Nothing is decrypted until a host is in Scope. ")
+    }
 }

@@ -181,24 +181,30 @@ public struct TrafficRoutes: Hashable, Sendable {
     /// The closed entries we know about — system proxy, All Apps, Scope, CA, in that order: the Flows
     /// empty-state lines. Empty unless the bus lane is `.ok`.
     public let advice: [TrafficRoute]
+    /// The entries the one-line banner names (D5's predicate), in banner order; empty when there is no
+    /// banner (no rows, bus not ok, nothing closed). The banner text, its button and its tooltip detail
+    /// are all read off this list, so a view never re-derives the shown set from the banner's text.
+    public let shown: [TrafficRoute]
+
     /// The one-line banner text above the Flows table, or nil: the shown entries' `state`s joined " · ".
-    public let banner: String?
+    public var banner: String? { shown.isEmpty ? nil : shown.map(\.state).joined(separator: " · ") }
     /// The banner's one button: the first shown entry that has an action, its `actions.first` (nil when
     /// none has one). Priority: system proxy (PR4's Set as System Proxy, once filled), All Apps, Scope, CA.
-    public let bannerAction: ConnectionAction?
+    public var bannerAction: ConnectionAction? { shown.first { !$0.actions.isEmpty }?.actions.first }
+    /// The banner's tooltip detail: the shown entries' `detail`s joined " · "; nil when nothing is shown.
+    public var bannerDetail: String? { shown.isEmpty ? nil : shown.map(\.detail).joined(separator: " · ") }
 
     /// Whether a known route is open; the two facts do not count.
     public var anyOpen: Bool { [systemProxy, allApps].compactMap { $0 }.contains(where: \.open) }
 
     public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?,
-                advice: [TrafficRoute], banner: String?, bannerAction: ConnectionAction?) {
+                advice: [TrafficRoute], shown: [TrafficRoute]) {
         self.systemProxy = systemProxy
         self.allApps = allApps
         self.scope = scope
         self.caTrust = caTrust
         self.advice = advice
-        self.banner = banner
-        self.bannerAction = bannerAction
+        self.shown = shown
     }
 }
 
@@ -446,11 +452,11 @@ public struct ConnectionSummary: Hashable, Sendable {
         var shown = closedRoutes
         if !scope.open, !closedRoutes.isEmpty || allTunnels { shown.append(scope) }
         if let caTrust, !caTrust.open { shown.append(caTrust) }
+        // A banner needs rows and a bus that is ok; `TrafficRoutes` joins the shown states, picks the button
+        // and the tooltip detail from this one list.
         let bannerShown = flowCount > 0 && busOK && !shown.isEmpty
-        return TrafficRoutes(
-            systemProxy: systemProxyRoute, allApps: allApps, scope: scope, caTrust: caTrust, advice: closedFacts,
-            banner: bannerShown ? shown.map(\.state).joined(separator: " · ") : nil,
-            bannerAction: bannerShown ? shown.first { !$0.actions.isEmpty }?.actions.first : nil)
+        return TrafficRoutes(systemProxy: systemProxyRoute, allApps: allApps, scope: scope, caTrust: caTrust,
+                             advice: closedFacts, shown: bannerShown ? shown : [])
     }
 
     /// D3's system-proxy table. The closed entries carry no action in this PR (PR4 fills `.setSystemProxy`).

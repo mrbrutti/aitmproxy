@@ -50,6 +50,16 @@ import Testing
         return facts
     }
 
+    /// D5 as ONE derivation: the banner is exactly the shown entries' `state`s joined " · " (nil when nothing is
+    /// shown), the button is the first shown entry's first action, and the tooltip detail is their `detail`s
+    /// joined " · " (nil when nothing is shown). A view reads `shown`; it never re-derives the set from the text.
+    private func expectOneDerivation(_ r: TrafficRoutes, _ label: String = "", sourceLocation: SourceLocation = #_sourceLocation) {
+        #expect(r.banner == (r.shown.isEmpty ? nil : r.shown.map(\.state).joined(separator: " · ")), "\(label)", sourceLocation: sourceLocation)
+        #expect(r.bannerAction == r.shown.first { !$0.actions.isEmpty }?.actions.first, "\(label)", sourceLocation: sourceLocation)
+        #expect(r.bannerDetail == (r.shown.isEmpty ? nil : r.shown.map(\.detail).joined(separator: " · ")), "\(label)", sourceLocation: sourceLocation)
+        #expect((r.banner == nil) == r.shown.isEmpty, "\(label)", sourceLocation: sourceLocation)
+    }
+
     // MARK: Core lane
 
     @Test func coreWords() {
@@ -277,11 +287,14 @@ import Testing
 
     /// TR-AC4: one `make` per row of spec D10.
     @Test func predicateTable() {
+        var produced: [TrafficRoutes] = []
         func row(kind: ActiveCoreKind = .embedded, bus: BusState = .connected("x"), role: String? = "operator", roleWarning: Bool = false,
                  _ capability: CaptureCapability, supported: Bool = true, systemProxy: SystemProxyState? = nil,
                  hosts: Int = 0, flows: Int = 0, tunnelled: Int = 0) -> TrafficRoutes {
-            make(kind: kind, bus: bus, role: role, roleWarning: roleWarning, capability: capability, supported: supported,
-                 hosts: hosts, flows: flows, systemProxy: systemProxy, tunnelled: tunnelled).routes
+            let routes = make(kind: kind, bus: bus, role: role, roleWarning: roleWarning, capability: capability, supported: supported,
+                              hosts: hosts, flows: flows, systemProxy: systemProxy, tunnelled: tunnelled).routes
+            produced.append(routes)
+            return routes
         }
         let off = row(.inactive, systemProxy: .off)
         #expect(off.allApps?.line == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)")
@@ -364,6 +377,11 @@ import Testing
         #expect(bothClosedScopeSet.bannerAction == .openCaptureSettings)
         #expect(row(.inactive, systemProxy: .off, hosts: 0, flows: 3).banner
                 == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.")
+
+        // One derivation over every row above: banner, button and detail all read off `shown`.
+        #expect(produced.count == 26, "every row above is checked; the table has \(produced.count) rows")
+        #expect(produced.contains { !$0.shown.isEmpty } && produced.contains { $0.shown.isEmpty })
+        for (i, routes) in produced.enumerated() { expectOneDerivation(routes, "row \(i)") }
     }
 
     /// TR-AC5: the Getting-started steps carry the route words and details.
@@ -649,5 +667,77 @@ import Testing
         let none = routes(.capturing, systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3, caTrust: try caFacts(scope: "user"))
         #expect(none.banner == nil)
         #expect(none.bannerAction == nil)
+    }
+
+    // MARK: Fix task (tester's whole-branch report)
+
+    /// A core that serialises `advice: ""` while nothing is decrypted: the decoded status reads as absent, so the
+    /// Scope line is the Kit's own sentence and the all-tunnels banner is that sentence — never an empty row or a
+    /// blank banner with an Add Host… button.
+    @Test func anEmptyCoreAdviceFallsBackToTheKitSentenceNeverAnEmptyLine() throws {
+        let decoded = try #require(DecryptStatus(json: ["scope_hosts": 0, "decrypting": false, "advice": ""]))
+        #expect(decoded == DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil))
+        func routes(flows: Int, tunnelled: Int, decrypt: DecryptStatus) -> TrafficRoutes {
+            make(bus: .connected("127.0.0.1:60745"), role: "operator", capability: .capturing, hosts: 0, flows: flows,
+                 systemProxy: both("127.0.0.1", 8080), tunnelled: tunnelled, decrypt: decrypt).routes
+        }
+        for status in [decoded, DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil)] {
+            let empty = routes(flows: 0, tunnelled: 0, decrypt: status)
+            #expect(empty.scope.open == false)
+            #expect(empty.scope.line == "Nothing is decrypted until a host is in Scope.")
+            #expect(empty.scope.state == "Nothing is decrypted until a host is in Scope.")
+            #expect(empty.advice.map(\.line) == ["Nothing is decrypted until a host is in Scope."])
+            #expect(empty.banner == nil)
+            let tunnels = routes(flows: 4, tunnelled: 4, decrypt: status)
+            #expect(tunnels.banner == "Nothing is decrypted until a host is in Scope.")
+            #expect(tunnels.banner?.isEmpty == false)
+            #expect(tunnels.bannerAction == .addScopeHost)
+            #expect(tunnels.shown.map(\.kind) == [.scope])
+        }
+    }
+
+    /// The entries the banner names are the Kit's `shown` (D5's predicate, banner order), and the tooltip detail
+    /// is their `detail`s joined " · ". The RouteBanner view reads these; nothing re-derives them from the text.
+    @Test func shownEntriesAndBannerDetail() throws {
+        let notTrusted = try caFacts()
+        func routes(_ capability: CaptureCapability, systemProxy: SystemProxyState? = .off, hosts: Int = 0, flows: Int = 0,
+                    tunnelled: Int = 0, caTrust: CATrustFacts? = nil) -> TrafficRoutes {
+            make(bus: .connected("x"), role: "operator", capability: capability, hosts: hosts, flows: flows,
+                 systemProxy: systemProxy, caTrust: caTrust, tunnelled: tunnelled).routes
+        }
+        // Fresh install (system proxy unknown until PR4): All Apps off · Scope · CA not trusted.
+        let fresh = routes(.inactive, systemProxy: nil, hosts: 0, flows: 3, caTrust: notTrusted)
+        #expect(fresh.shown.map(\.kind) == [.allApps, .scope, .caTrust])
+        #expect(fresh.banner == "All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(fresh.bannerDetail == "in-scope hosts of every app"
+                + " · Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"
+                + " · HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
+        #expect(fresh.bannerAction == .openCaptureSettings)
+        expectOneDerivation(fresh, "fresh")
+        // Every row a tunnel with both routes open: the Scope fact alone.
+        let tunnels = routes(.capturing, systemProxy: both("127.0.0.1", 8080), hosts: 0, flows: 3, tunnelled: 3)
+        #expect(tunnels.shown.map(\.kind) == [.scope])
+        #expect(tunnels.bannerDetail
+                == "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel")
+        expectOneDerivation(tunnels, "tunnels")
+        // Routes open, Scope set, CA not trusted: the CA fact alone.
+        let caOnly = routes(.capturing, systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3, caTrust: notTrusted)
+        #expect(caOnly.shown.map(\.kind) == [.caTrust])
+        #expect(caOnly.bannerDetail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
+        #expect(caOnly.bannerAction == .trustCA)
+        expectOneDerivation(caOnly, "caOnly")
+        // No banner: nothing shown, no detail.
+        let none = routes(.capturing, systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3)
+        #expect(none.banner == nil)
+        #expect(none.shown == [])
+        #expect(none.bannerDetail == nil)
+        expectOneDerivation(none, "none")
+        // No rows: the same closed facts are the empty state's advice, not shown.
+        let noRows = routes(.inactive, systemProxy: nil, hosts: 0, flows: 0, caTrust: notTrusted)
+        #expect(noRows.advice.map(\.kind) == [.allApps, .scope, .caTrust])
+        #expect(noRows.shown == [])
+        #expect(noRows.bannerDetail == nil)
+        // The shown entries are the routes' own values, not copies with other words.
+        #expect(fresh.shown == [fresh.allApps, fresh.scope, fresh.caTrust].compactMap { $0 })
     }
 }
