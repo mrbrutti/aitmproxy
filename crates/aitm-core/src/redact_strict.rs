@@ -283,7 +283,9 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   length: a JWT or compact JWE, an AWS access key id, GitHub, GitLab, Slack,
 ///   Stripe, `sk-` and Google API keys. It must start at a boundary, a byte that is
 ///   not an ASCII alphanumeric (`_` included, so `KEY_ghp_...` is still masked, and
-///   `task-<uuid>` is not an `sk-` key). A run shape ends at a boundary by
+///   `task-<uuid>` is not an `sk-` key), or the letter of an escaped line break (a
+///   backslash and `n`, `r` or `t`, any number of backslashes: `x\nghp_...` is a token
+///   on a line of its own; `nghp_...` with no backslash is a word that ends in `n`). A run shape ends at a boundary by
 ///   construction; an exact-length one (AWS, Google) must be followed by one,
 ///   unless an alphanumeric that opens another credential follows it. A JWE is a
 ///   header and four more segments, to its tag.
@@ -1276,10 +1278,15 @@ fn folded_end(bytes: &[u8], mut line_end: usize) -> usize {
 /// backslashes is not counted: a request escaped twice writes its break `\\n`, and a
 /// name read a little too eagerly is a mask too many, never one too few.
 fn glued_line_escape(bytes: &[u8], start: usize, end: usize) -> bool {
-    start > 0
-        && bytes[start - 1] == b'\\'
-        && matches!(bytes[start], b'n' | b'r' | b't')
-        && end - start > 1
+    is_escape_letter(bytes, start) && end - start > 1
+}
+
+/// Whether the byte at `at` is the letter of an escaped line break: a lower-case `n`,
+/// `r` or `t` with a backslash right before it. It is an alphanumeric, so a rule that
+/// wants a boundary in front of a candidate (the left edge of a P5 credential) must
+/// not take it for the end of a word: `\nghp_...` is a token on a line of its own.
+fn is_escape_letter(bytes: &[u8], at: usize) -> bool {
+    at > 0 && bytes[at - 1] == b'\\' && matches!(bytes[at], b'n' | b'r' | b't')
 }
 
 /// Where the key starts in the name run `start..end` that a pair scan has read: one
@@ -1794,10 +1801,12 @@ fn shape_end_at(text: &str, at: usize, from: usize, jwt_dead_until: &mut usize) 
         return None;
     }
     // The previous byte must not be an ASCII alphanumeric, so a prefix in the middle
-    // of a word (`task-` for `sk-`) is not one. At `from` the previous byte is the
-    // end of a credential that is masked by then, and `]` is a boundary: judging the
-    // candidate by the byte that stood there would leave it for the next call.
-    if at > from && bytes[at - 1].is_ascii_alphanumeric() {
+    // of a word (`task-` for `sk-`) is not one, unless that byte is the letter of an
+    // escaped line break (`\nghp_...`), which ends a line as a real break does. At
+    // `from` the previous byte is the end of a credential that is masked by then, and
+    // `]` is a boundary: judging the candidate by the byte that stood there would
+    // leave it for the next call.
+    if at > from && bytes[at - 1].is_ascii_alphanumeric() && !is_escape_letter(bytes, at - 1) {
         return None;
     }
     if bytes[at..].starts_with(JWT_PREFIX) {
@@ -1950,8 +1959,8 @@ mod tests {
     use std::cell::Cell;
 
     use super::{
-        converge, glued_line_escape, key_start_after_escape, scrub_round, scrub_strict, MAX_ROUNDS,
-        SHAPES,
+        converge, glued_line_escape, is_escape_letter, key_start_after_escape, scrub_round,
+        scrub_strict, MAX_ROUNDS, SHAPES,
     };
 
     /// `converge` over `round`, and how many times it called it.
@@ -2046,6 +2055,70 @@ mod tests {
                 "{text:?} {start}..{end}"
             );
         }
+    }
+
+    #[test]
+    fn the_letter_of_an_escaped_break_is_n_r_or_t_after_a_backslash() {
+        // `(text, index of the byte asked about)`.
+        for (text, at, want) in [
+            (r"\nx", 1, true),
+            (r"\tx", 1, true),
+            (r"\rx", 1, true),
+            (r"\\nx", 2, true),
+            (r"ab\nx", 3, true),
+            (r"\n", 1, true),
+            // No backslash in front, or another letter, or upper case.
+            (r"nx", 0, false),
+            (r"anx", 1, false),
+            (r"\xx", 1, false),
+            (r"\Nx", 1, false),
+            (r"\bnx", 2, false),
+            // The backslash itself, and a byte that is no letter.
+            (r"\nx", 0, false),
+            (r"\nx", 2, false),
+        ] {
+            assert_eq!(
+                is_escape_letter(text.as_bytes(), at),
+                want,
+                "{text:?} at {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_entry_of_the_shape_table_is_found_after_an_escaped_break() {
+        // The same walk as above with an escaped break in front: the shortest body is
+        // masked, one byte less is not a credential, and the letter without its
+        // backslash is still the end of a word.
+        let mut failures = Vec::new();
+        for shape in SHAPES {
+            for prefix in shape.prefixes {
+                let full = format!("{prefix}{}", "A".repeat(shape.min));
+                let short = format!("{prefix}{}", "A".repeat(shape.min - 1));
+                for escape in [r"\n", r"\r", r"\t", r"\\n", r"\r\n"] {
+                    let escaped = format!("{escape}{full}");
+                    let escaped_short = format!("{escape}{short}");
+                    let want = format!("{escape}[redacted]");
+                    for (label, input, want) in [
+                        ("shortest body", &escaped, want.as_str()),
+                        ("one byte short", &escaped_short, escaped_short.as_str()),
+                    ] {
+                        let got = scrub_strict(input);
+                        if got != want {
+                            failures.push(format!(
+                                "{prefix} {escape} {label}: {input:?} gives {got:?}"
+                            ));
+                        }
+                    }
+                }
+                let letter = format!("n{full}");
+                let got = scrub_strict(&letter);
+                if got != letter {
+                    failures.push(format!("{prefix} letter alone: {letter:?} gives {got:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

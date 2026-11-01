@@ -938,6 +938,152 @@ fn a_pair_after_an_escaped_line_break_is_masked_whatever_its_key() {
 }
 
 #[test]
+fn a_credential_shape_after_an_escaped_line_break_is_masked() {
+    // A token on a line of its own in a string that holds a raw request escaped: the
+    // break is a backslash and `n`, `r` or `t`, and the letter is an alphanumeric glued
+    // to the prefix, so the left boundary of P5 (a byte that is not an alphanumeric)
+    // was not met and the token was written whole. The letter of an escaped break is a
+    // boundary, as the line break itself is. Every literal is the text itself.
+    let gh = format!("ghp_{}", "a".repeat(36));
+    let aws = format!("AKIA{}", "A".repeat(16));
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl";
+    let sk = format!("sk-{}", "a".repeat(32));
+    let glpat = format!("glpat-{}", "a".repeat(20));
+    let aiza = format!("AIza{}", "a".repeat(35));
+    let gho = format!("gho_{}", "a".repeat(36));
+    let jwe = "eyJhbGciOiJSU0EtT0FFUCJ9.encryptedkeyaaaa.ivaaaaaaaa.ciphertextaaaa.tagaaaaaaaaaa";
+    let mut t = Table::default();
+
+    // The reviewer's shapes.
+    t.row(&format!(r"\n{gh}"), r"\n[redacted]");
+    t.row(&format!(r"x\n{aws}"), r"x\n[redacted]");
+    t.row(&format!(r"\n{jwt}"), r"\n[redacted]");
+    t.row(&format!(r"\n{sk}"), r"\n[redacted]");
+    t.row(r"\nxoxb-111111111111", r"\n[redacted]");
+    t.row(&format!(r"\n{glpat}"), r"\n[redacted]");
+    t.row(&format!(r"\r\n{aiza}"), r"\r\n[redacted]");
+    t.row(&format!(r"\t{gho}"), r"\t[redacted]");
+    t.row(&format!(r"\n{jwe}"), r"\n[redacted]");
+
+    // Two backslashes, three, a letter after any text, and every escape.
+    t.row(&format!(r"\\n{gh}"), r"\\n[redacted]");
+    t.row(&format!(r"\\\n{gh}"), r"\\\n[redacted]");
+    t.row(&format!(r"\\n{jwt}"), r"\\n[redacted]");
+    t.row(&format!(r"\\n{jwe}"), r"\\n[redacted]");
+    t.row(r"\\nxoxb-111111111111", r"\\n[redacted]");
+    t.row(&format!(r"abc\n{aws}"), r"abc\n[redacted]");
+    t.row(
+        &format!(r"GET /a HTTP/1.1\r\n{gh}"),
+        r"GET /a HTTP/1.1\r\n[redacted]",
+    );
+    t.row(&format!(r"\r{gh}"), r"\r[redacted]");
+    t.row(&format!(r"\n\n{gh}"), r"\n\n[redacted]");
+    t.row(
+        &format!(r"\n{gh} and\n{aws}"),
+        r"\n[redacted] and\n[redacted]",
+    );
+    t.row(
+        r"\nsk_live_aaaaaaaaaaaaaaaa and\nrk_test_aaaaaaaaaaaaaaaa",
+        r"\n[redacted] and\n[redacted]",
+    );
+    t.row(&format!(r"\nrk_live_{}", "a".repeat(16)), r"\n[redacted]");
+    t.row(&format!(r"\nxoxp-{}", "1".repeat(10)), r"\n[redacted]");
+    t.row(
+        &format!(r"\ngithub_pat_{}", "a".repeat(22)),
+        r"\n[redacted]",
+    );
+    t.row(&format!(r"\nASIA{}", "A".repeat(16)), r"\n[redacted]");
+
+    // What stood before keeps its mask: after a real break, a space, `_` or `=`.
+    t.row(&format!("\n{gh}"), "\n[redacted]");
+    t.row(&format!("x {gh}"), "x [redacted]");
+    t.row(&format!("token_{gh}"), "token_[redacted]");
+    t.row(&format!("KEY_{gh}"), "KEY_[redacted]");
+
+    // The right edge. An exact-length key id needs a boundary after it: an escaped
+    // break is one, an alphanumeric is not (unless it opens another credential).
+    t.row(&format!(r"\n{aws}\nfoo"), r"\n[redacted]\nfoo");
+    t.row(&format!(r"\n{aws}\n{gh}"), r"\n[redacted]\n[redacted]");
+    t.row(&format!(r"\n{aws}{gh}"), r"\n[redacted][redacted]");
+    t.unchanged(&format!(r"\n{aws}A"));
+    // The letters of an escape glued to the end are letters: no boundary.
+    t.unchanged(&format!(r"\n{aws}n"));
+    t.unchanged(&format!("{aws}t"));
+    t.unchanged(&format!(r"\n{aiza}r"));
+    t.unchanged(&format!(r"\n{aiza}A"));
+    t.row(&format!(r"\n{aiza}\nfoo"), r"\n[redacted]\nfoo");
+
+    // P3 and P4 never had the boundary: they stay masked.
+    t.row(r"\nBasic dXNlcjpwYXNz", r"\nBasic [redacted]");
+    t.row(r"\nbasic dXNlcjpwYXNz", r"\nbasic [redacted]");
+    t.row(
+        r"\nNegotiate AAAAAAAAAAAAAAAAAAAA",
+        r"\nNegotiate [redacted]",
+    );
+    t.row(r"\nNTLM AAAAAAAAAAAAAAAAAAAA", r"\nNTLM [redacted]");
+    t.row(
+        r"\nhttps://user:hunter2@host.test/p",
+        r"\nhttps://user:[redacted]@host.test/p",
+    );
+    t.row(
+        r"\nhttps://abcdefghijklmnopqrst@host.test/",
+        r"\nhttps://[redacted]@host.test/",
+    );
+
+    // Look-alikes. Without a backslash the letter is a letter: a word that ends in `n`,
+    // `r` or `t` in front of a prefix is the middle of a word, as before. Only the
+    // pair of characters is a boundary, in lower case; a short body is no credential.
+    t.unchanged(&format!("n{gh}"));
+    t.unchanged(&format!("t{aws}"));
+    t.unchanged(&format!("xn{gh}"));
+    t.unchanged(&format!(r"\N{gh}"));
+    t.unchanged(&format!(r"\x{gh}"));
+    t.unchanged(&format!(r"\bn{gh}"));
+    t.unchanged(&format!("Ghp_{}", "a".repeat(36)));
+    t.unchanged(r"\nghp_short");
+    t.unchanged(&format!(r"\nghp_{}", "a".repeat(35)));
+    t.unchanged(&format!(r"\nsk-{}", "a".repeat(31)));
+    t.unchanged(&format!(r"\n{}", &aws[..19]));
+    t.unchanged(r"\nxoxb-111111111");
+    t.unchanged(r"C:\temp\nsk-prod-eu-1");
+    t.unchanged(r"\neyJabc.eyJabc.sig");
+    t.unchanged(r"\nghp_");
+    t.unchanged(r"\neyJ");
+
+    // Hostile, 2 MiB each: a candidate that fails costs a constant, one that is
+    // masked is skipped whole.
+    let times = |unit: &str| unit.repeat((2 << 20) / unit.len());
+    for (label, unit) in [
+        (r"`\nghp_` x N", r"\nghp_"),
+        (r"`\neyJ` x N", r"\neyJ"),
+        (r"`\nxoxb-` x N", r"\nxoxb-"),
+        (r"`\nAKIA` x N", r"\nAKIA"),
+        (r"`\neyJaaaaaaaa.` x N", r"\neyJaaaaaaaa."),
+    ] {
+        t.hostile_settles(label, times(unit), times(unit));
+    }
+    for (label, unit) in [
+        (r"`\nxoxb-1111111111` x N", r"\nxoxb-1111111111"),
+        (
+            r"`\nghp_` and 36 a x N",
+            "\\nghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            r"`\n` and a JWT x N",
+            "\\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl",
+        ),
+        (r"`\nAKIA` and 16 A x N", "\\nAKIAAAAAAAAAAAAAAAAA"),
+    ] {
+        t.hostile_settles(
+            label,
+            times(unit),
+            r"\n[redacted]".repeat((2 << 20) / unit.len()),
+        );
+    }
+    t.finish();
+}
+
+#[test]
 fn a_private_key_block_is_masked_whole_whatever_precedes_it() {
     // The block is masked before `scrub_text` and P2 run, so a key name in front of
     // it (whose own mask would eat the BEGIN line) cannot leave the key body behind.
