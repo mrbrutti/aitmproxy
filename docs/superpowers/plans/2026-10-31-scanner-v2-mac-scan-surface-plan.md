@@ -242,6 +242,36 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2–3 | tester | Important | `applyList` kept any job the core stopped listing, not only locally started ones (F1) | fixed in dd236e96 (`locallyStarted` set) |
+| 2–3 | tester | Minor | `ScanCanary` throws on an unknown `kind` (F2) | accepted (orchestrator, autonomous mode): the canary is a two-variant tag; pinned as current behaviour |
+| 2–3 | tester | Minor | blank origin read as "Out of scope — add  to scope" (F3); lanes == [] text (F4) | fixed in dd236e96 |
+| 2–3 | tester | Minor | MS-AC2 "nothing reaches commandRunner" not provable in the Kit range (F5) | accepted: proven by reading + live MS-AC9/11 (spec P7) |
+| 2–10 | security | Minor | Int overflow traps on core-supplied tallies/timestamps (S1) | fixed in 293da993 (whole numbers clamped to 0...2^53 at parse) |
+| 2–10 | security | Minor | consumed `_confirm` token visible in the Activity Log (S2) | accepted for this PR (token is single-use and already consumed); scrub lands with the Task 12 follow-on (`Activity.swift` / Session hooks are unclaimed) |
+| 2–10 | security | Minor | `confirmLaunch` had no in-flight guard; Cancel live during the confirmed call (S3) | fixed in 293da993 |
+| 2–10 | security | Minor | `{profile_name}` launch was a TOCTOU vs the gate-checked origins (S4) | fixed in 293da993: always `{profile}`; spec D4 amended in 3312f0a1 |
+| 2–10 | security | Minor | Duplicate… name unvalidated (S5) | fixed in 293da993 (`ScanSurface.isValidProfileName`) |
+| 2–10 | security | Minor | push lines for unknown jobs grew `lastSeq` / fanned out `scan.status`; tables never pruned (S6) | fixed in 293da993 (unknown job → list refresh only; `applyList` prunes) |
+| 2–10 | quality | Important | `openPoC` compared the core `finding_id` with a mac-local UUID: dead branch (Q1) | fixed in 293da993 (`ScanFindingLink.match` by `poc_ref`; one Open PoC button) |
+| 2–10 | quality | Important | tapping the selected profile row reloaded it and wiped edits (Q2) | fixed in 293da993 |
+| 2–10 | quality | Important | field chrome / section title / inline error / stat copied across the five views (Q3) | fixed in 293da993 (`scanFieldChrome`, `ScanSectionTitle`, `ScanInlineError`, `ScanStat` once) |
+| 2–10 | quality | Minor | `ScanIssue` copied 16 summary fields (Q4) | fixed in 293da993 (composes `summary`) |
+| 2–10 | quality | Minor | `scan.profile.delete` result ignored (Q5) | fixed in 293da993 |
+| 2–10 | quality | Minor | list/get/checks failures shared one slot and wording (Q6) | fixed in 293da993 (`checksError`, per-profile wording) |
+| 2–10 | quality | Minor | cancelled poll generation finished its serial reads (Q7) | fixed in 293da993 |
+| 2–10 | quality | Minor | Site map job menu re-sorted in the view (Q8) | fixed in 293da993 |
+| 2–10 | quality | Minor | row accessibility labels built in views (Q9) | fixed in 293da993 (`ScanFormat.*AccessibilityLabel`) |
+| 2–10 | quality | Minor | repeated empty-state copy; view-local placeholders (Q10) | fixed in 293da993 |
+| 2–10 | quality | Minor | `BySeverity.zero` spelled out (Q11); empty `profileName` never read as `—` (Q12); Issues tab's own grid area (Q13) | fixed in 293da993 |
+| 2–10 | quality | Minor | vocabularies hand-mirror two switches (Q14) | accepted (orchestrator): both directions pinned by `everyVocabularySpellsTheWireBothWays` |
+| 2–10 | quality | Minor | `ScanModel.swift` size; duplicated test helper (Q15) | size accepted this round (seams marked); helper deduped in 293da993 |
+| 2–10 | spec | Important | `scan: <code>` never rendered beside a launch error (P1) | fixed in 293da993 (`launchError` kept; code in tertiary) |
+| 2–10 | spec | Important | words/states outside D11/D12 (P2) | accepted via spec amendment 3312f0a1 (D12 "Words added by the implementation") |
+| 2–10 | spec | Minor | D11 empty sentences split (P3) | fixed in 293da993 (full sentence as the title) |
+| 2–10 | spec | Minor | Site map Job menu defaulted to All jobs (P4) | fixed in 293da993 (`seedSitemapJobIfNeeded`) |
+| 2–10 | spec | Minor | "Open this flow in the inspector" help absent on reused rows (P5) | fixed in 293da993 (`ScanEndpointRow.help`) |
+| 2–10 | spec | Minor | public API beyond D15 (P6); MS-AC2 clause by reading (P7); MS-AC1 three literals for one-field files (P8); plan body edit 19→20 rows (P10); ⌥⌘. on the detail button ahead of Task 12 (P11) | accepted (orchestrator, autonomous mode); P11: Task 12 removes the button binding |
+| 2–10 | spec | Minor | S-082 "has finding" phrase; S-083 default job (P9) | fixed in 3312f0a1 (S-082) and 293da993 (P4) |
 
 ## Shipped
 
