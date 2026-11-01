@@ -357,7 +357,7 @@ def main():
                      "AITM_TARGET_URL are incomplete")
         else:
             tgt = Target("vulnerable")
-            cfg = CoreConfig(proxy_port=free_port(), bus_port=free_port(),
+            cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(), bus_port=free_port(),
                              scope_entries=[tgt.authority, "127.0.0.1"])
             booted = Aitm.server(cfg)
             h, p = booted.bus_addr

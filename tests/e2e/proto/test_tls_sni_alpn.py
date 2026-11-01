@@ -389,7 +389,8 @@ def obtain_core():
     # to_yaml emits them); set them directly rather than appending, which used to
     # duplicate the `ca` / `ssl_insecure` keys once the base started emitting them and
     # made the core refuse to start ("duplicate field `ca`").
-    cfg = CoreConfig(proxy_port=free_port(), scope_entries=["localhost", "127.0.0.1"],
+    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                     scope_entries=["localhost", "127.0.0.1"],
                      ssl_insecure=True, ca_dir=ca_dir)
     core = Aitm.server(cfg)
     core.proxy_host = "127.0.0.1"

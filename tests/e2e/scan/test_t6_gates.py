@@ -66,7 +66,7 @@ DEAD_LANE_CANDIDATES = ("l4_packet", "ws")
 
 def boot(**kw) -> Aitm:
     """One core on free ports with the given L4 / scanner configuration."""
-    return Aitm.server(CoreConfig(proxy_port=free_port(), **kw))
+    return Aitm.server(CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(), **kw))
 
 
 def stream_args(target: ScanTarget, lanes: list[str] | None = None) -> dict:

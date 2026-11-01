@@ -42,7 +42,8 @@ def main() -> int:
     with open(os.path.join(scripts_dir, "tagger.rhai"), "w", encoding="utf-8") as f:
         f.write(TAGGER_RHAI)
 
-    cfg = CoreConfig(proxy_port=free_port(), rhai_scripts_dir=scripts_dir)
+    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                     rhai_scripts_dir=scripts_dir)
     core = None
     bus = None
     try:

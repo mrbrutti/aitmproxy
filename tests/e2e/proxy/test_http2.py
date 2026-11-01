@@ -43,6 +43,7 @@ def main() -> int:
         section("boot: real aitm + real node HTTP/2 upstream (dual-protocol)")
         cfg = c.ProxyConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[h2_auth, "127.0.0.1"],
             ca_dir=ca_dir,
         )

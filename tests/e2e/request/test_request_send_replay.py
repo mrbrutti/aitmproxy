@@ -72,6 +72,7 @@ def main() -> int:
         section("boot: real aitm core + real loopback echo-record upstream (in scope)")
         cfg = CoreConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             # The upstream IP literal + authority in scope lifts the loopback SSRF
             # guard exactly as the browser connector / flow.replay path requires.
             scope_entries=[up.authority, "127.0.0.1"],

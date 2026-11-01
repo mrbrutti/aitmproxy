@@ -50,7 +50,8 @@ def main() -> int:
     up = Target("vulnerable")
     core = None
     try:
-        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[up.authority, "127.0.0.1"])
+        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                         scope_entries=[up.authority, "127.0.0.1"])
         core = Aitm.server(cfg)
 
         section("aitm_e2e.tls.curl_code: real status through the real proxy")

@@ -158,7 +158,8 @@ def _boot_shared_core(child_env: dict):
     from seeded import TestTarget  # noqa: E402
 
     target = TestTarget("vulnerable")
-    cfg = CoreConfig(proxy_port=free_port(), scope_entries=["127.0.0.1", target.host()],
+    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                     scope_entries=["127.0.0.1", target.host()],
                      allow_agent_widen=True, ssl_insecure=True)
     core = Aitm.server(cfg)
     host, port = core.bus_addr

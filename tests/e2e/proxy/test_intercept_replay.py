@@ -54,6 +54,7 @@ def main() -> int:
         section("boot: real aitm + plain HTTP/1.1 upstream observer (in scope)")
         cfg = c.ProxyConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[up.authority, "127.0.0.1"],
         )
         core = Aitm.server(cfg)

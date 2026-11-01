@@ -189,6 +189,7 @@ def main() -> int:
 
         cfg = CoreConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             l4_enabled=True,
             l4_scope_entries=[l4_inject_entry()],  # 127.0.0.1/32, ports 1-65535, inject
         )

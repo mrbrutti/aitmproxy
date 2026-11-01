@@ -262,6 +262,7 @@ def main() -> int:
         # is the pin and not `out_of_scope`.
         cfg = PassthroughConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=["localhost", mitm_authority, "127.0.0.1"],
             ca_dir=ca_dir,
             passthrough_hosts=["localhost"],

@@ -66,6 +66,7 @@ def main() -> int:
         vhost, vport = _authority_parts(v.authority)
         cfg = CoreConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[v.authority],
         )
         with Aitm.server(cfg) as core:

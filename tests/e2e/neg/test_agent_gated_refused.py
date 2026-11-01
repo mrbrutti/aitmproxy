@@ -102,6 +102,7 @@ def main() -> int:
         section("boot: a real aitm core (dedicated ports) with the upstream in scope")
         cfg = CoreConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[up.authority],
             poc_dir=str(poc_dir),
             poc_out_dir=str(work / "poc-out"),

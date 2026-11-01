@@ -400,6 +400,7 @@ class Rig:
             return self
         cfg = CoreConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[origin_authority, "127.0.0.1"],
         )
         try:

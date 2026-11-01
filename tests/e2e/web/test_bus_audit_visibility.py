@@ -117,7 +117,8 @@ def main() -> int:
     o = None
     try:
         section("boot aitm web (operator link enabled by the config's operator token)")
-        cfg = CoreConfig(proxy_port=free_port(), scope_entries=["127.0.0.1"])
+        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                         scope_entries=["127.0.0.1"])
         core = Aitm.web(cfg)
         ok(f"aitm web on :{core.web_port}, proxy :{cfg.proxy_port}")
 

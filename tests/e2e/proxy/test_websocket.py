@@ -45,6 +45,7 @@ def main() -> int:
         section("boot: real aitm + real ws:// echo origin (in scope)")
         cfg = c.ProxyConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[ws.authority, "127.0.0.1"],
         )
         core = Aitm.server(cfg)

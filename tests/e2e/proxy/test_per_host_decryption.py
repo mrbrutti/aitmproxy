@@ -256,6 +256,7 @@ def main() -> int:
         section("boot: real aitm with an EMPTY Scope + TLS echo origin + plain HTTP upstream")
         cfg = c.ProxyConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[],
         )
         core = Aitm.server(cfg)

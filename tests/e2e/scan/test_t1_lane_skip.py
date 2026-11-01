@@ -61,7 +61,8 @@ def main() -> int:
     try:
         section("arrange: vulnerable target + own core (l4 layer enabled)")
         target = boot_target("vulnerable")
-        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[target.authority], l4_enabled=True)
+        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                         scope_entries=[target.authority], l4_enabled=True)
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
         require_verbs(op, "scan.start", "scan.status", "scan.checks")

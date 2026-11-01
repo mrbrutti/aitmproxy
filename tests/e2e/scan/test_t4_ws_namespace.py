@@ -88,6 +88,7 @@ def main() -> int:
             (scripts_dir / "e2e-ws.rhai").write_text(E2E_WS_RHAI, encoding="utf-8")
             cfg = CoreConfig(
                 proxy_port=free_port(),
+                browser_proxy_port=free_port(),
                 scope_entries=[v.authority],  # the Canary is deliberately NOT in scope
                 rhai_scripts_dir=str(scripts_dir),
             )

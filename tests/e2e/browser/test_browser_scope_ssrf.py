@@ -128,7 +128,8 @@ def main() -> int:
     orig: list = []
     try:
         section("boot: aitm core + seeded loopback target with an EMPTY scope (target starts blocked)")
-        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[], allow_agent_widen=False)
+        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                         scope_entries=[], allow_agent_widen=False)
         core = Aitm.server(cfg)
         agent = BusClient.agent(core)
         op = BusClient.operator(core)

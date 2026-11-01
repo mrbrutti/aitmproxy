@@ -128,7 +128,8 @@ def main() -> int:
     resumed = False
     try:
         section("boot: aitm web + seeded target; agent + operator /bus bridges + loopback witness")
-        cfg = CoreConfig(proxy_port=free_port(), bus_port=free_port(), scope_entries=[tgt.authority, "127.0.0.1"])
+        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
+                         bus_port=free_port(), scope_entries=[tgt.authority, "127.0.0.1"])
         core = Aitm.web(cfg)
         web_host, web_port = "127.0.0.1", core.web_port
         target = tgt.base.rstrip("/")

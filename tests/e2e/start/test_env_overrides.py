@@ -372,7 +372,8 @@ def leg_core_a(work: Path) -> None:
     l4_id = None
     try:
         cfg = StartConfig(
-            proxy_port=free_port(), agent_token=secrets.token_hex(16), operator_token=secrets.token_hex(16),
+            proxy_port=free_port(), browser_proxy_port=free_port(),
+            agent_token=secrets.token_hex(16), operator_token=secrets.token_hex(16),
             allow_agent_widen=False, ca_allow_agent_install=False, l4=l4_block(False),
             ca_dir=str(work / "a-ca"), ca_audit_log=str(work / "a-ca-audit.jsonl"),
         )
@@ -431,7 +432,8 @@ def leg_core_b(work: Path) -> None:
     audit_path = work / "b-ca-audit.jsonl"
     try:
         cfg = StartConfig(
-            proxy_port=free_port(), agent_token=secrets.token_hex(16), operator_token=secrets.token_hex(16),
+            proxy_port=free_port(), browser_proxy_port=free_port(),
+            agent_token=secrets.token_hex(16), operator_token=secrets.token_hex(16),
             allow_agent_widen=True, ca_allow_agent_install=True, l4=l4_block(True),
             ca_dir=str(work / "b-ca"), ca_audit_log=str(audit_path),
         )
@@ -502,7 +504,8 @@ def leg_core_c(work: Path) -> None:
                 fail(f"temp path {p} contains ':', which AITM_SCRIPTS uses as its separator; set TMPDIR elsewhere")
 
         cfg = StartConfig(
-            proxy_port=free_port(), agent_token=secrets.token_hex(16), operator_token=secrets.token_hex(16),
+            proxy_port=free_port(), browser_proxy_port=free_port(),
+            agent_token=secrets.token_hex(16), operator_token=secrets.token_hex(16),
             scope_entries=[up.authority],  # the client path is scope-free; scripts see in-scope flows
             ca_dir=str(work / "c-ca"), ca_audit_log=str(work / "c-ca-audit.jsonl"),
             rhai_strict=True, scripts=[str(file_rhai)],

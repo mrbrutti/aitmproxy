@@ -41,7 +41,7 @@ def main() -> int:
     expected = set(parse_expected_tools(CONTRACT))
     ok(f"parsed {len(expected)} tools from the Rust EXPECTED_TOOLS contract (no hardcoded count)")
 
-    cfg = CoreConfig(proxy_port=free_port())
+    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port())
     core = Aitm.server(cfg)
     bus = None
     op = None

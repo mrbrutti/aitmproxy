@@ -188,6 +188,7 @@ def main() -> int:
     try:
         cfg = CoreConfig(
             proxy_port=free_port(),
+            browser_proxy_port=free_port(),
             scope_entries=[v.tls_authority, v.authority, p.tls_authority, p.authority],
             ssl_insecure=True,
         )

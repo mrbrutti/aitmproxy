@@ -114,6 +114,7 @@ def check_emitter_literals() -> None:
 def check_core_b_l4_scope() -> None:
     cfg_b = CoreConfig(
         proxy_port=free_port(),
+        browser_proxy_port=free_port(),
         l4_enabled=True,
         l4_scope_entries=[l4_inject_entry()],
     )
@@ -143,6 +144,7 @@ def check_core_a_scanner(v: ScanTarget, work: str) -> None:
     # require_verbs can SKIP cleanly; only then is core A (with the section) booted.
     probe_cfg = CoreConfig(
         proxy_port=free_port(),
+        browser_proxy_port=free_port(),
         scope_entries=[v.authority],
     )
     with Aitm.server(probe_cfg) as probe:
@@ -153,6 +155,7 @@ def check_core_a_scanner(v: ScanTarget, work: str) -> None:
     findings_dir = os.path.join(work, "findings")
     cfg_a = CoreConfig(
         proxy_port=free_port(),
+        browser_proxy_port=free_port(),
         scanner=ScannerSection(ceilings={"probes": CEILING}, default_profile="standard", max_jobs=1),
         scope_entries=[v.authority],
         findings_dir=findings_dir,
