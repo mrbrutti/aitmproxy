@@ -551,18 +551,6 @@ struct ResponsePane: View {
                 // Parked at the response head, but the cached detail predates the park:
                 // the refreshed detail is on its way (`refreshParkedResponse`).
                 LoadingLines()
-            } else if row.state == .paused, let previous = previousResponse {
-                // The previous response is a reference, not this flow's content: the
-                // badge says so beside the caption, and the trailing slot stays empty.
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
-                        Badge(text: "Reference", pair: ColorPair(fg: Tok.Ink.secondary, bg: Tok.Ground.raised), uppercase: false)
-                        Hint(text: "No response yet — the request is paused. Showing the last response to this endpoint for reference.")
-                    }
-                    .padding(.leading, Space.md)
-                    .padding(.top, Space.xs)
-                    CodeView(lines: BodyLines.body(previous), header: nil, footer: nil)
-                }
             } else if row.state == .pending || detail == nil {
                 LoadingLines()
             } else {
@@ -623,14 +611,6 @@ struct ResponsePane: View {
             return
         }
         tree = (row.id, JSONTreeState(root: root))
-    }
-
-    /// Fixture-only reference while the live detail (F5) cannot look up the previous flow.
-    /// Guarded by `Store.usesFixtures` so a live flow that happens to hit the fixture
-    /// hostname never shows a canned "previous response".
-    private var previousResponse: HTTPMessage? {
-        guard Store.usesFixtures else { return nil }
-        return row.authority == "auth.shop-staging.test" && row.path == "/api/auth/login" ? Fixtures.previousLoginResponse : nil
     }
 }
 

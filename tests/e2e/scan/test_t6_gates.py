@@ -15,7 +15,8 @@ parent-spec-D3 error code (`scan: <code>: <message>`, parsed by
   (d) a profile naming only a lane whose crate returns `None` -> `lane_unavailable`
   (e) `l4.enabled: true` + an entry `interface: "*"`, `direction: outbound`,
       the target CIDR/port and `Inject`, with both agent flags set: the same
-      job STARTS (`dry_run == False`) and is then cancelled.
+      job STARTS (`dry_run == False`) and is then cancelled, or has already
+      finished (the TLV target is tiny).
 
 The INDEPENDENT observer is the speaker's own accept log: after (a) to (d),
 `/log/l4` for `l4-tlv-crash` must still show `accepts == []` and
@@ -45,6 +46,7 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig, ScannerSection, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    TERMINAL_STATES,
     ScanTarget,
     boot_target,
     cancel,
@@ -207,13 +209,21 @@ def main() -> int:
               f"(e) the started L4 job reports dry_run false (got {started.get('dry_run')!r})")
         check((started.get("lanes") or {}).get("run") == ["l4_stream"],
               f"(e) the job runs the l4_stream lane (got {(started.get('lanes') or {}).get('run')!r})")
-        cancelled = cancel(op, "operator", job)
-        check(cancelled.get("state") in {"cancelling", "cancelled"},
-              f"(e) scan.cancel moved the job to cancelling/cancelled "
-              f"(got {cancelled.get('state')!r})")
-        final = wait_terminal(op, "operator", job, timeout=60.0)
-        check(final.get("state") == "cancelled",
-              f"(e) the job settled as `cancelled` (got {final.get('state')!r})")
+        # The TLV target is tiny (6 points, 1-2 cases each): the job can be `done`
+        # within a second, before the cancel lands. Either outcome proves "the job
+        # started"; a cancel on a still-running job must still settle as `cancelled`.
+        status = scan_call(op, "operator", "scan.status", {"job": job})
+        if status.get("state") in TERMINAL_STATES:
+            check(status.get("state") == "done",
+                  f"(e) the job already ran to `done` before the cancel (got {status.get('state')!r})")
+        else:
+            cancelled = cancel(op, "operator", job)
+            check(cancelled.get("state") in {"cancelling", "cancelled", "done"},
+                  f"(e) scan.cancel moved the job to cancelling/cancelled "
+                  f"(got {cancelled.get('state')!r})")
+            final = wait_terminal(op, "operator", job, timeout=60.0)
+            check(final.get("state") in {"cancelled", "done"},
+                  f"(e) the job settled as `cancelled` (or finished first; got {final.get('state')!r})")
     finally:
         for c in (ag, op):
             if c:
@@ -224,7 +234,7 @@ def main() -> int:
             vuln.stop()
 
     ok("T6-5: refused_l4, out_of_scope, agent flags, lane_unavailable -- no socket opened; "
-       "the authorised job started and cancelled")
+       "the authorised job started and was cancelled or finished")
     return 0
 
 
