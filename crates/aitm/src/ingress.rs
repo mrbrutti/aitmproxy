@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
-use aitm_proto_l4::craft::PacketSpec;
+use aitm_proto_l4::craft::{PacketEndpoints, PacketSpec};
 use aitm_proto_l4::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::types::{L4Action, L4Target};
@@ -301,7 +301,7 @@ impl CoreIngress {
         match &self.l4 {
             None => IngressOutcome::Unhandled,
             Some(l4) => {
-                if l4.guard.check(L4Action::Capture, target).is_ok() {
+                if l4.admits(target, &[]) {
                     IngressOutcome::Captured
                 } else {
                     IngressOutcome::Refused
@@ -373,12 +373,45 @@ struct L4Dispatch {
 }
 
 impl L4Dispatch {
-    /// Route one L4 unit through the **same** guard a `pcap`-fed packet passes. An
-    /// out-of-scope or non-`Capture` packet is refused here and nothing is stored; an
-    /// authorized one is appended to the capture flow. The momentary `Capture` permit
-    /// is dropped at once (a capture spends no injection budget).
+    /// Whether a unit to `target` carrying `bytes` may be recorded: it must pass the
+    /// self-exclusion choke point **and** the `Capture` scope check, in that order.
+    ///
+    /// The ingress is a recorder (the macOS NE feeder appends every admitted
+    /// datagram to the store `l4.flow.get` serves bytes from), so, like the capture
+    /// loop and the send_recv reply capture, it asks
+    /// [`L4Guard::admit_endpoints`](aitm_proto_l4::guard::L4Guard::admit_endpoints)
+    /// before the scope check, whatever the scope says (L4PAR-AC34, spec §2.1): a
+    /// unit to or from one of the core's own listener ports on a loopback address or
+    /// interface — the bus port, whose first line is an operator client's plaintext
+    /// `{"token": …}` — is refused and nothing is stored. The NE feeder hands flows,
+    /// not raw frames, so the endpoints the choke point decides on are the dispatch
+    /// target's own (destination, port, protocol) under the interface the ingress
+    /// labels the unit with. `bytes` is **also** asked of
+    /// [`L4Guard::admit_frame`](aitm_proto_l4::guard::L4Guard::admit_frame) for a
+    /// backend that does hand a whole frame; the target-derived test stays
+    /// authoritative, so a payload crafted to decode as some other frame cannot
+    /// talk the ingress out of refusing. The scope check is the same `(Capture,
+    /// target)` a `pcap`-fed packet passes; its momentary permit is dropped at once
+    /// (a capture spends no injection budget).
+    fn admits(&self, target: &L4Target, bytes: &[u8]) -> bool {
+        let from_target = PacketEndpoints {
+            proto: Some(target.proto),
+            src: None,
+            dst: target.dst,
+            src_port: None,
+            dst_port: target.dst_port,
+        };
+        self.guard.admit_endpoints(&target.interface, &from_target)
+            && self.guard.admit_frame(&target.interface, bytes)
+            && self.guard.check(L4Action::Capture, target).is_ok()
+    }
+
+    /// Route one L4 unit through the **same** guard a `pcap`-fed packet passes. The
+    /// core's own traffic, an out-of-scope or a non-`Capture` packet is refused here
+    /// ([`admits`](Self::admits)) and nothing is stored; an authorized one is appended
+    /// to the capture flow.
     fn record(&self, target: &L4Target, bytes: Vec<u8>) -> IngressOutcome {
-        if self.guard.check(L4Action::Capture, target).is_err() {
+        if !self.admits(target, &bytes) {
             return IngressOutcome::Refused;
         }
         let flow_id = self.ensure_flow(&target.interface);
@@ -470,6 +503,86 @@ mod tests {
         CapturedUnit::L4 {
             target: l4_target(host),
             bytes: b"probe".to_vec(),
+        }
+    }
+
+    /// [`l4_target`] to an explicit port.
+    fn l4_target_to(host: &str, port: u16) -> L4Target {
+        L4Target {
+            dst_port: Some(port),
+            ..l4_target(host)
+        }
+    }
+
+    /// L4PAR-AC34 / spec §2.1 (security Critical, second half): the ingress is a
+    /// recorder — the macOS NE feeder appends every admitted datagram to the L4
+    /// flow store, which `l4.flow.get` serves bytes from — so it asks the one
+    /// self-exclusion choke point before the scope check and before anything is
+    /// stored. A unit to one of the core's own listener ports on the loopback host
+    /// (the bus port: its first line is the operator client's plaintext
+    /// `{"token": …}`) is refused by `accept`, by `dispatch_udp` and by the
+    /// pre-buffer `udp_admits`, and no flow is even created; a unit to another
+    /// loopback port in the very same scope is recorded.
+    #[test]
+    fn ingress_refuses_the_cores_own_loopback_traffic() {
+        const BUS_PORT: u16 = 27431;
+        let mut cfg = L4Config::default();
+        cfg.scope.push(capture_entry("127.0.0.1"));
+        let guard = Arc::new(L4Guard::new(&cfg));
+        guard.set_self_ports([BUS_PORT]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let ingress = CoreIngress::with_l4(guard, store.clone());
+
+        let token_line = br#"{"token":"operator-secret"}"#.to_vec();
+        assert_eq!(
+            ingress.udp_admits(&l4_target_to("127.0.0.1", BUS_PORT)),
+            IngressOutcome::Refused,
+            "the pre-buffer admission refuses a flow to the bus port"
+        );
+        assert_eq!(
+            ingress.accept(CapturedUnit::L4 {
+                target: l4_target_to("127.0.0.1", BUS_PORT),
+                bytes: token_line.clone(),
+            }),
+            IngressOutcome::Refused,
+            "a unit to the bus port is refused"
+        );
+        assert_eq!(
+            ingress.dispatch_udp(CapturedUdpFlow {
+                target: l4_target_to("127.0.0.1", BUS_PORT),
+                datagrams: vec![token_line.clone(), b"second".to_vec()],
+                peer_identity: Some("com.example.client".to_string()),
+            }),
+            IngressOutcome::Refused,
+            "a UDP flow to the bus port is refused datagram by datagram"
+        );
+        assert!(
+            store.list().is_empty(),
+            "nothing of the core's own creates a flow, let alone a packet"
+        );
+
+        // The same host, another loopback port, the same scope: recorded.
+        assert_eq!(
+            ingress.udp_admits(&l4_target_to("127.0.0.1", 9053)),
+            IngressOutcome::Captured
+        );
+        assert_eq!(
+            ingress.accept(CapturedUnit::L4 {
+                target: l4_target_to("127.0.0.1", 9053),
+                bytes: b"probe".to_vec(),
+            }),
+            IngressOutcome::Captured
+        );
+        let flows = store.list();
+        assert_eq!(flows.len(), 1, "one capture flow for the admitted unit");
+        let flow = store.get(flows[0]).expect("capture flow present");
+        assert_eq!(flow.packets.len(), 1, "only the 9053 datagram is stored");
+        assert_eq!(flow.packets[0].bytes, b"probe".to_vec());
+        for p in &flow.packets {
+            assert!(
+                !p.bytes.windows(5).any(|w| w == b"token"),
+                "no recorded packet carries the bus's token line"
+            );
         }
     }
 

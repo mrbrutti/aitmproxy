@@ -33,6 +33,7 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +44,7 @@ use aitm_core::{
     McpTransport, PipelineClient, Proxy, ProxyClient, Registry, ScopeRateGuard,
 };
 use aitm_mcp::{ConnCtx, McpServer};
+use aitm_proto_l4::guard::L4Guard;
 use aitm_tui::{RunOptions, TransportChoice};
 use tracing::{info, warn};
 
@@ -344,6 +346,23 @@ pub fn build_servers(
     (agent, handler)
 }
 
+/// What [`run`] does with the agent transport's bound address, through the agent
+/// `McpServer`'s `on_bound`: the same `FnOnce(SocketAddr)` that method takes.
+pub type BoundHook = Box<dyn FnOnce(SocketAddr) + Send + 'static>;
+
+/// The [`BoundHook`] that unions the agent transport's bound port into the live
+/// L4 guard's self ports ([`L4Guard::add_self_ports`]), so a loopback capture
+/// never records the bus's own frames — its plaintext `{"token": …}` first line
+/// among them — under `aitm tui` any more than under the `main.rs` server path
+/// (L4PAR-AC34, spec §2.1). The bound port is the configured one or the
+/// ephemeral port a `port: 0` resolved to, which only `on_bound` can know.
+#[must_use]
+pub fn self_port_hook(guard: Arc<L4Guard>) -> BoundHook {
+    Box::new(move |addr: SocketAddr| {
+        guard.add_self_ports([addr.port()]);
+    })
+}
+
 /// Build the two servers over the shared `services` and run the proxy, the
 /// agent transport (loopback TCP or streamable HTTP) and the TUI side by side
 /// until one of them ends — the TUI returning on operator quit is the ordinary
@@ -354,6 +373,11 @@ pub fn build_servers(
 /// The caller launches and reaps the browser, as it does for the server path,
 /// and pre-binds the proxy and browser listeners so a port conflict is reported
 /// before the terminal UI takes over the screen.
+///
+/// `on_agent_bound` is attached to the agent server's `on_bound`, so the caller
+/// learns the port the transport actually bound; `main.rs` passes
+/// [`self_port_hook`] over the live L4 guard, as it does on the server path
+/// (L4PAR-AC34). With no agent server (stdio) the hook is dropped unused.
 pub async fn run(
     cfg: &Config,
     proxy: &Proxy,
@@ -361,9 +385,14 @@ pub async fn run(
     governance: Governance,
     main_listener: tokio::net::TcpListener,
     browser_listener: tokio::net::TcpListener,
+    on_agent_bound: Option<BoundHook>,
 ) -> anyhow::Result<()> {
     let startup_note = services.log.startup_note();
     let (agent, handler) = build_servers(cfg, services, governance);
+    let agent = match (agent, on_agent_bound) {
+        (Some(server), Some(hook)) => Some(server.on_bound(hook)),
+        (agent, _) => agent,
+    };
     let agent_serve = async move {
         match agent {
             Some(server) => server.serve().await,
@@ -399,6 +428,67 @@ pub async fn run(
 mod tests {
     use super::*;
     use aitm_core::{AgentPolicy, AuditResult};
+
+    /// L4PAR-AC34 / spec §2.1 (security Critical, second half): the hook `run`
+    /// hands the agent `McpServer`'s `on_bound` unions the bound port — the
+    /// ephemeral one a `port: 0` resolved to included — into the live L4 guard's
+    /// self ports, so a loopback capture under `aitm tui` never records the bus's
+    /// plaintext token line. Port 0 is never a bound listener and stays out.
+    #[test]
+    fn the_bound_port_hook_adds_the_agent_port_to_the_l4_guard() {
+        let guard = Arc::new(L4Guard::new(&aitm_proto_l4::config::L4Config::default()));
+        assert_eq!(guard.self_ports(), Vec::<u16>::new());
+
+        let hook = self_port_hook(guard.clone());
+        hook("127.0.0.1:41234".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![41234]);
+
+        // A second bind (a later run on the same guard) adds, never replaces.
+        self_port_hook(guard.clone())("127.0.0.1:27431".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![27431, 41234]);
+
+        self_port_hook(guard.clone())("127.0.0.1:0".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![27431, 41234], "port 0 is ignored");
+    }
+
+    /// Tripwire for the wiring the test above cannot exercise without binding a
+    /// port: `run` attaches the caller's hook to the agent server's `on_bound`,
+    /// and the hook is the one that calls `L4Guard::add_self_ports`. `aitm tui`'s
+    /// agent server is built by `build_servers`, not the `main.rs` server path,
+    /// so without this it would be the one bus listener a loopback capture could
+    /// record.
+    #[test]
+    fn run_wires_the_bound_port_hook_into_the_agent_server() {
+        let src = include_str!("tui.rs");
+        let run_body = src
+            .split("pub async fn run(")
+            .nth(1)
+            .expect("tui.rs defines `run`");
+        let run_body = run_body
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows `run`");
+        assert!(
+            run_body.contains("on_agent_bound"),
+            "`run` takes the bound-port hook"
+        );
+        assert!(
+            run_body.contains(".on_bound("),
+            "`run` attaches the hook to the agent server's `on_bound`"
+        );
+        let hook_body = src
+            .split("pub fn self_port_hook(")
+            .nth(1)
+            .expect("tui.rs defines `self_port_hook`");
+        assert!(
+            hook_body
+                .split("\n}\n")
+                .next()
+                .expect("a function body")
+                .contains("add_self_ports"),
+            "the hook adds the bound port with `L4Guard::add_self_ports`"
+        );
+    }
 
     /// SEC-3: the default log is per process (`aitm-tui-<pid>.log`), so two
     /// `aitm tui` runs never share a file in the world-writable temp dir;

@@ -515,8 +515,19 @@ async fn run() -> anyhow::Result<()> {
         // its calls land in `agent.activity`. `push_tx` is not fed to it
         // (follow-up "tui-mode push"): a loopback subscriber still gets the
         // `notifications/aitm/agent` lines but no `notifications/aitm/flow`.
+        // Its bound port joins the L4 self-port set through `on_bound`, exactly
+        // as the server path's does below (L4PAR-AC34).
+        let on_agent_bound = l4_live_guard.clone().map(tui::self_port_hook);
         tokio::select! {
-            result = tui::run(&cfg, &proxy, services, governance, proxy_listener, browser_listener) => result,
+            result = tui::run(
+                &cfg,
+                &proxy,
+                services,
+                governance,
+                proxy_listener,
+                browser_listener,
+                on_agent_bound,
+            ) => result,
             never = capture_run => match never {},
         }
     } else {
