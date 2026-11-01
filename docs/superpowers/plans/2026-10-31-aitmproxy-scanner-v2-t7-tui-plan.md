@@ -326,51 +326,51 @@ Kept by the main session during stage 6. One row per finding.
 | 5 | spec | Minor | `four_progress_lines_yield_one_inflight_status` counts only `scan.status` tags | fixed in dba0525c (fix round B): count every `CallTagged` |
 | fix A | security/quality/spec | re-review | all 21 fix round A findings closed as prescribed (three PASS verdicts; spec `L4Confirm` text and two plan Task 4 bullets re-aligned in 3aaeffe7) | closed |
 | fix A | spec | Minor | A3/A12 edited `ui/scan/sitemap.rs` as a required consequence without the report naming it | accepted; recorded here |
-| fix A | quality | Minor | `tab_error` clones a `ScanError` twice per frame | fix round C: compute once per frame, pass `Option<&ScanError>` |
-| fix A | quality | Minor | missing-verb sentence still spelled twice (`ui::scan::missing_verb` vs `ScanError::missing_verb`) | fix round C: `degraded()` uses `ScanError::missing_verb(verb).wording()`; delete the UI helper and make `MISSING_VERB` private |
+| fix A | quality | Minor | `tab_error` clones a `ScanError` twice per frame | fixed in 3f7ce097 (fix round C): compute once per frame, pass `Option<&ScanError>` |
+| fix A | quality | Minor | missing-verb sentence still spelled twice (`ui::scan::missing_verb` vs `ScanError::missing_verb`) | fixed in 3f7ce097 (fix round C): `degraded()` uses `ScanError::missing_verb(verb).wording()`; delete the UI helper and make `MISSING_VERB` private |
 | fix A | quality | Minor | `wording()` detects the missing-verb case by `starts_with` on the detail | fix round C: `==`, or a `Kind { Coded, Uncoded, MissingVerb }` |
-| fix A | quality | Minor | `step(forward: bool)` forces `d > 0` conversions at four sites | fix round C: `pub(crate) enum Dir { Next, Prev }` |
-| fix A | quality | Minor | `ScanTab::index()` is dead production code | fix round C: delete it and its test loop |
+| fix A | quality | Minor | `step(forward: bool)` forces `d > 0` conversions at four sites | fixed in e147e027 (fix round C): `pub(crate) enum Dir { Next, Prev }` |
+| fix A | quality | Minor | `ScanTab::index()` is dead production code | fixed in 3f7ce097 (fix round C): delete it and its test loop |
 | fix A | quality | Minor | `fixture!` macro in three test files | fix round B (B10) moves it to `tests/common` |
-| fix A | quality | Minor | confirm overlay classifies the call family twice | fix round C: one `Family::of(&call)` giving title, footnote and hue |
-| fix A | quality | Minor | A2 test's `Down` assertions cannot fail with one fixture node | fix round C: second node, legacy endpoints non-empty, assert `node_cursor == 1` |
+| fix A | quality | Minor | confirm overlay classifies the call family twice | fixed in e147e027 (fix round C): one `Family::of(&call)` giving title, footnote and hue |
+| fix A | quality | Minor | A2 test's `Down` assertions cannot fail with one fixture node | fixed in d4300f4a (fix round C): second node, legacy endpoints non-empty, assert `node_cursor == 1` |
 | fix A | quality | Minor | `ui/scan/sitemap.rs::render` decides by list emptiness, not `MapSource` | Task 9 renders by `SitemapState::source(app.scan_offer())` (hand-off recorded in Task 9) |
-| fix A | quality | Minor | `SitemapState::source(offer)` reads no state | fix round C: `impl From<ScanOffer> for MapSource` |
-| fix A | quality | Minor | `pane_rule` infers orientation from the rule width | fix round C: `Panes` carries `side_by_side: bool` |
-| fix A | quality | Minor | `Disconnected` drops the confirm token only when the overlay is the current mode | fix round C: take `wire_confirm` regardless of mode, restore the mode only when it was `WireConfirm` |
-| fix A | quality | Minor | fix-round provenance tags in six production doc comments | fix round C: drop the tags, keep the why |
+| fix A | quality | Minor | `SitemapState::source(offer)` reads no state | fixed in e147e027 (fix round C): `impl From<ScanOffer> for MapSource` |
+| fix A | quality | Minor | `pane_rule` infers orientation from the rule width | fixed in e147e027 (fix round C): `Panes` carries `side_by_side: bool` |
+| fix A | quality | Minor | `Disconnected` drops the confirm token only when the overlay is the current mode | fixed in 359cd53f (fix round C): take `wire_confirm` regardless of mode, restore the mode only when it was `WireConfirm` |
+| fix A | quality | Minor | fix-round provenance tags in six production doc comments | fixed in e147e027 (fix round C): drop the tags, keep the why |
 | fix A | security | Minor | `scan_host` now forwards a colon-bearing host (`host:abc`, bare `::1`) into the `http://{host}/` seed | Task 9 (D8 seed): bracket an `Ipv6Addr` host, refuse any other colon-bearing host with a toast and no call (hand-off recorded in Task 9) |
 | fix A | security | note | `tester_pass2::browser_screenshot_of_non_png_bytes_is_labelled_not_trusted` races on a shared temp path under load (outside the range) | known flake for the Tester; re-run alone; not changed by this track |
-| fix B | coder note | Minor | under the 16-cap, jobs past position 16 are starved while earlier ones answer fast | fix round C: rotating start index for the timer's follow-ups (Architect's number stays 16) |
-| fix B | coder note | Minor | `tests/scan_v2_matrix.rs` still has its own `fixture!` macro | fix round C: use `common::fixture` |
+| fix B | coder note | Minor | under the 16-cap, jobs past position 16 are starved while earlier ones answer fast | fixed in fd731eca (fix round C): rotating start index for the timer's follow-ups (Architect's number stays 16) |
+| fix B | coder note | Minor | `tests/scan_v2_matrix.rs` still has its own `fixture!` macro | fixed in d4300f4a (fix round C): use `common::fixture` |
 | fix B | coder note | note | `a_terminal_line_on_the_issues_tab_requests_issues` will need re-pinning once Task 7 fetches on entering Issues | Task 7 settles the entering-Issues fetch first in that test |
 | fix B | security | re-review | B1, B2, B3, B4, B7 closed; worst case against a hostile core is about 18 `scan.status` per second plus one per push line, no amplification | closed |
-| fix B | security | Minor | outside `Mode::Scan` push-driven unknown jobs are never pruned (no `scan.list` arrives), so state grows one entry per pushed id | fix round C: in `on_job_line`, a job not in `order`/`started_here` gets a `scan.status` only in `Mode::Scan`; elsewhere the line is a trigger for the next list |
+| fix B | security | Minor | outside `Mode::Scan` push-driven unknown jobs are never pruned (no `scan.list` arrives), so state grows one entry per pushed id | fixed in fd731eca (fix round C): in `on_job_line`, a job not in `order`/`started_here` gets a `scan.status` only in `Mode::Scan`; elsewhere the line is a trigger for the next list |
 | fix B | quality | re-review | B1 to B10 closed as prescribed | closed |
-| fix B | quality | Minor | `live()` still chains `summaries`/`full` keys though both are retained to `order` | fix round C: iterate cursor then `order` only; invariant in the field docs plus a `debug_assert!` in `fold_list` |
-| fix B | quality | Minor | `ScanError` tag assigned twice; the four-field literal spelled at three sites; `.tagged()` is a caller convention | fix round C: constructors take the tag and derive `verb` from `tag_parts`; `ScanError::uncoded(tag, detail)`; delete `tagged()` |
-| fix B | quality | Minor | `request_scan_statuses` generic over an iterator both callers build the same way | fix round C: take `&[JobId]` |
-| fix B | quality | Minor | three more fix-round provenance tags in production doc comments | fix round C (same row as the six from round A) |
-| fix B | quality | Minor | `scan_v2_cadence.rs` hand-builds the bus envelopes in nine places; mid-file helpers; two expectations computed with `tag_keyed` | fix round C: `job_line()`, `list_reply()`, `status_reply_for()` helpers at the top; literal `format!("scan.status:{id}")` expectations |
-| fix B | quality | Minor | stale binding name `text` in `scan_v2_parse.rs` after B10 | fix round C |
+| fix B | quality | Minor | `live()` still chains `summaries`/`full` keys though both are retained to `order` | fixed in fd731eca (fix round C): iterate cursor then `order` only; invariant in the field docs plus a `debug_assert!` in `fold_list` |
+| fix B | quality | Minor | `ScanError` tag assigned twice; the four-field literal spelled at three sites; `.tagged()` is a caller convention | fixed in 3f7ce097 (fix round C): constructors take the tag and derive `verb` from `tag_parts`; `ScanError::uncoded(tag, detail)`; delete `tagged()` |
+| fix B | quality | Minor | `request_scan_statuses` generic over an iterator both callers build the same way | fixed in fd731eca (fix round C): take `&[JobId]` |
+| fix B | quality | Minor | three more fix-round provenance tags in production doc comments | fixed in e147e027 (fix round C) (same row as the six from round A) |
+| fix B | quality | Minor | `scan_v2_cadence.rs` hand-builds the bus envelopes in nine places; mid-file helpers; two expectations computed with `tag_keyed` | fixed in fd731eca (fix round C): `job_line()`, `list_reply()`, `status_reply_for()` helpers at the top; literal `format!("scan.status:{id}")` expectations |
+| fix B | quality | Minor | stale binding name `text` in `scan_v2_parse.rs` after B10 | fixed in d4300f4a (fix round C) |
 | fix B | spec | re-review | B1 to B10 closed with the report's literals; D6 ordering parenthetical, "lowercase", and the D3 `ScanError` shape re-aligned in this commit | closed |
 | fix B | spec | Minor | `pub const OTHER_JOB` and `ScanError::tagged` are unrequested public helpers | accepted (`tagged()` goes in fix round C's constructor change; `OTHER_JOB` stays, consistent with `NO_SCANNER`/`MISSING_VERB`) |
-| 6 | security | Minor | per-frame joins, measures and `elide_middle` over unbounded core strings (`targets`, `profile_name`); `detail_len()` allocates every line on each key | fix round C (C20): bound at row construction, count without allocating |
-| 6 | coder note | Minor | `already <state>` notice rides the error channel and reads `scan.cancel: already done` | fix round C (C19): non-error `notice` slot in the banner |
+| 6 | security | Minor | per-frame joins, measures and `elide_middle` over unbounded core strings (`targets`, `profile_name`); `detail_len()` allocates every line on each key | fixed in 81e07c32 (fix round C) (C20): bound at row construction, count without allocating |
+| 6 | coder note | Minor | `already <state>` notice rides the error channel and reads `scan.cancel: already done` | fixed in 3f7ce097 (fix round C) (C19): non-error `notice` slot in the banner |
 | 6 | spec | Minor | detail pane carries `started by`, `probes` and `done/scheduled` lines the list did not name | accepted by the T7 session (useful operator facts, data already parsed); spec D11 amended in this commit |
 | 6 | spec | Minor | width-adaptive column collapse anticipates Task 14 | accepted (spec leaves widths to the builder); Task 14 still pins the 90x40 row shape and the detail first line in `scan_v2_layout.rs` |
 | 6 | spec | Minor | eleven helpers public beyond the plan's four names | accepted (crate modules are all `pub`; tests reach `App` internals) |
-| 6 | quality | Important | the view parses the row's display text to rebuild the probe bar and splits it by a glyph literal | fix round C (C21): typed `probe_fill` on `JobRow` |
-| 6 | quality | Important | Jobs `split()` re-implements the stacked branch of `panes()` and builds `Panes` by struct literal | fix round C (C22): shared `stacked(area, list_rows)` |
-| 6 | quality | Minor | `severity_bar` has no production caller; `severity_spans` re-implements it | fix round C (C23) |
-| 6 | quality | Minor | `detail_lines` allocates static labels; `detail_len()` builds every line; model/view disagree without a status | fix round C (C24) |
-| 6 | quality | Minor | Jobs-detail `navigate` branch repeats the six-arm cursor walk | fix round C (C25) |
-| 6 | quality | Minor | local `state_text` shadows the function | fix round C (C26) |
-| 6 | quality | Minor | `row_of` `(None, Some)` arm unreachable | fix round C (C27) |
-| 6 | quality | Minor | module doc claims a narrow-only detail first line the code draws always | fix round C (C28) |
-| 6 | quality | Minor | `Columns::measure`/`total()` coupling; opaque test literals | fix round C (C29) |
-| 6 | quality | Minor | cancel test reads its expectation from the fixture | fix round C (C30) |
-| 6 | quality | Minor | clamped cursor twice, per-row `String` clone, `pub lane_name` | fix round C (C31) |
+| 6 | quality | Important | the view parses the row's display text to rebuild the probe bar and splits it by a glyph literal | fixed in 81e07c32 (fix round C) (C21): typed `probe_fill` on `JobRow` |
+| 6 | quality | Important | Jobs `split()` re-implements the stacked branch of `panes()` and builds `Panes` by struct literal | fixed in e147e027 (fix round C) (C22): shared `stacked(area, list_rows)` |
+| 6 | quality | Minor | `severity_bar` has no production caller; `severity_spans` re-implements it | fixed in 81e07c32 (fix round C) (C23) |
+| 6 | quality | Minor | `detail_lines` allocates static labels; `detail_len()` builds every line; model/view disagree without a status | fixed in 81e07c32 (fix round C) (C24) |
+| 6 | quality | Minor | Jobs-detail `navigate` branch repeats the six-arm cursor walk | fixed in 81e07c32 (fix round C) (C25) |
+| 6 | quality | Minor | local `state_text` shadows the function | fixed in 81e07c32 (fix round C) (C26) |
+| 6 | quality | Minor | `row_of` `(None, Some)` arm unreachable | fixed in fd731eca (fix round C) (C27) |
+| 6 | quality | Minor | module doc claims a narrow-only detail first line the code draws always | fixed in 81e07c32 (fix round C) (C28) |
+| 6 | quality | Minor | `Columns::measure`/`total()` coupling; opaque test literals | fixed in 81e07c32 (fix round C) (C29) |
+| 6 | quality | Minor | cancel test reads its expectation from the fixture | fixed in 81e07c32 (fix round C) (C30) |
+| 6 | quality | Minor | clamped cursor twice, per-row `String` clone, `pub lane_name` | fixed in 81e07c32 (fix round C) (C31) |
 | 7 | security | Important | `fetched` and `scan.issue:*` in-flight tags grow without bound, keyed on unvalidated core-supplied issue ids | fix round D (D1): `is_issue_id`, prune `fetched` on fold, one `scan.issue` in flight (spec D6 amended) |
 | 7 | security | Minor | `limit: 512` not enforced client-side; every frame rebuilds every row from unbounded strings | fix round D (D2): truncate the page to `ISSUES_PAGE_LIMIT`, bound row strings at fold time |
 | 7 | security | note | U+202E-class format characters pass ratatui's control-char filter TUI-wide (pre-existing, flow list too) | follow-up outside this track: a filter in `ui/text.rs` |
