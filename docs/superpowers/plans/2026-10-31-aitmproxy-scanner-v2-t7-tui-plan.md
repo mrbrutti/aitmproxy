@@ -390,37 +390,37 @@ Kept by the main session during stage 6. One row per finding.
 | 7 | quality | Minor | tests `contains` where a row literal exists; one `assert!(a == b)` | fixed in 65abf477 (fix round D) (D13) |
 | 7 | quality | Minor | four overstated doc comments; small hygiene | fixed in 9a10c8c4 (fix round D) (D14) |
 | fix C | security | re-review | C1, C2, C3, C20, C21, C22 closed | closed |
-| fix C | security | Minor | C20 residual: Jobs rows are still built at render over the raw strings, so per-frame CPU is linear in the retained text | fix round E (E1): bound `profile_name` and `targets` in `fold_status` (or store a prebuilt `JobRow`), and make `ui::text::truncate` early-exit |
-| fix C | security | Minor | C2 doc says `ceil(n/16)` firings; with the cursor's job riding out of turn the bound is `ceil((n-1)/15)` | fix round E (E2): doc wording |
+| fix C | security | Minor | C20 residual: Jobs rows are still built at render over the raw strings, so per-frame CPU is linear in the retained text | fixed in a40eccc6 (fix round E) (E1): bound `profile_name` and `targets` in `fold_status` (or store a prebuilt `JobRow`), and make `ui::text::truncate` early-exit |
+| fix C | security | Minor | C2 doc says `ceil(n/16)` firings; with the cursor's job riding out of turn the bound is `ceil((n-1)/15)` | fixed in 500070e3 (fix round E) (E2): doc wording |
 | fix C | spec | re-review | C1 to C31 closed with the report's literals; D3/D6/D13 re-aligned in this commit (C1/C2 cadence rules, `from_message(tag, ..)`, notice clearing) | closed |
 | fix C | spec | Minor | seven supporting public items beyond the report's names | accepted (as for Tasks 6 and 7) |
 | fix C | quality | re-review | C1 to C31 closed (deviations weighed and accepted) | closed |
-| fix C | quality | Minor | the model imports `ui::text::truncate` | fix round E (E4): `ui/text.rs` becomes `crate::text`, re-exported from `ui` |
-| fix C | quality | Minor | three public readings of one Detail pane | fix round E (E5) |
-| fix C | quality | Minor | notice cleared by any parsed `scan.*` reply, contradicting the docs; a status poll erases `already done` within a second | ruling (a): key-clear only; fix round E (E3) |
-| fix C | quality | Minor | `summaries` field doc contradicts the invariant | fix round E (E6) |
-| fix C | quality | Minor | `live()` dedupe condition hard to read | fix round E (E7) |
-| fix C | quality | Minor | `d`/`dir` pair, gap spelled twice, one fully qualified `Style` | fix round E (E8) |
-| fix C | quality | Minor | `forty_running_jobs` mid-file; one six-property test | fix round E (E9) |
-| fix D | coder note | Minor | a landing suppressed while a read is pending is not retried when the reply lands (row under the cursor stays unread) | ruling: re-land once on a successful reply when the cursor's id differs from the reply's; fix round E (E10) |
+| fix C | quality | Minor | the model imports `ui::text::truncate` | fixed in 4aadfa15 (fix round E) (E4): `ui/text.rs` becomes `crate::text`, re-exported from `ui` |
+| fix C | quality | Minor | three public readings of one Detail pane | fixed in 500070e3 (fix round E) (E5) |
+| fix C | quality | Minor | notice cleared by any parsed `scan.*` reply, contradicting the docs; a status poll erases `already done` within a second | ruling (a): key-clear only; spec D3 clearing rule was self-contradictory; D3 fixed in this commit, the code change moves to fix round F (F15) |
+| fix C | quality | Minor | `summaries` field doc contradicts the invariant | fixed in 500070e3 (fix round E) (E6) |
+| fix C | quality | Minor | `live()` dedupe condition hard to read | fixed in 500070e3 (fix round E) (E7) |
+| fix C | quality | Minor | `d`/`dir` pair, gap spelled twice, one fully qualified `Style` | fixed in 500070e3 (fix round E) (E8) |
+| fix C | quality | Minor | `forty_running_jobs` mid-file; one six-property test | fixed in 500070e3 (fix round E) (E9) |
+| fix D | coder note | Minor | a landing suppressed while a read is pending is not retried when the reply lands (row under the cursor stays unread) | ruling: re-land once on a successful reply when the cursor's id differs from the reply's; fixed in 0263c577 (fix round E) (E10) |
 | fix D | coder note | note | with `scan.issues` present and `scan.issue` absent the list draws while the banner names the missing verb | accepted: the list is content, the banner is the state |
 | fix D | coder note | note | the legacy Jobs key line is a fifth tertiary line not routed through `hint` | Task 14 replaces it with the `bars.rs` hints |
 | fix D | security | re-review | D1, D2, D3, D9 closed; bounds: at most one `scan.issues` and one `scan.issue` in flight, `read` at most 513 full issues | closed |
-| fix D | security | Minor | a width-0 string (U+200B and kin) passes the cell-based `truncate` whole, so a hostile page defeats D2's per-frame bound in bytes | fix round E (E1): `truncate` also caps at `4 * w` chars; `read` capped at 64 entries (drop the oldest) |
+| fix D | security | Minor | a width-0 string (U+200B and kin) passes the cell-based `truncate` whole, so a hostile page defeats D2's per-frame bound in bytes | fixed in a40eccc6 (fix round E) (E1): `truncate` also caps at `4 * w` chars; `read` capped at 64 entries (drop the oldest) |
 | fix D | spec | re-review | D1 to D14 closed with the report's literals; the D1 Up-after-Down rewording proves the claim | closed |
 | fix D | spec | Minor | spec D6 and D10 still named `fetched`/`issues.detail` | re-aligned in this commit |
 | fix D | spec | Minor | the filtered-out-job test proves the `forget_job` pin, not the filtered-out clause (indistinguishable under the prune) | accepted; name kept as a regression pin |
 | fix D | spec | note | plan Task 7 "Change" paragraph still describes `fetched`/`detail`/`pub CONFIDENCE_GLYPHS` | accepted as history; the Review log and Task 8 text carry the current shapes |
 | fix D | quality | re-review | D1 to D14 closed | closed |
-| fix D | quality | Minor | `read` can hold an id the page no longer lists until the next fold | fix round E (E11) |
-| fix D | quality | Minor | `flow_cursor` reset by whichever read answers | fix round E (E12) |
-| fix D | quality | Minor | `count_of` lost exhaustiveness | fix round E (E13) |
-| fix D | quality | Minor | `scan_reply_keyed` threads `name` only to assert it | fix round E (E14) |
-| fix D | quality | Minor | `list`/`rows` parallel vectors; `list` retains the raw strings | fix round E (E15): keep both, document, assert lengths |
-| fix D | quality | Minor | test-file hygiene (stale cadence doc, inlined `app()`, synthetic pages twice) and small hygiene | fix round E (E16) |
+| fix D | quality | Minor | `read` can hold an id the page no longer lists until the next fold | fixed in 0263c577 (fix round E) (E11) |
+| fix D | quality | Minor | `flow_cursor` reset by whichever read answers | fixed in 0263c577 (fix round E) (E12) |
+| fix D | quality | Minor | `count_of` lost exhaustiveness | fixed in edecb09f (fix round E) (E13) |
+| fix D | quality | Minor | `scan_reply_keyed` threads `name` only to assert it | fixed in edecb09f (fix round E) (E14) |
+| fix D | quality | Minor | `list`/`rows` parallel vectors; `list` retains the raw strings | fixed in edecb09f (fix round E) (E15): keep both, document, assert lengths |
+| fix D | quality | Minor | test-file hygiene (stale cadence doc, inlined `app()`, synthetic pages twice) and small hygiene | fixed in edecb09f (fix round E) (E16) |
 | 8 | coder note | note | `detail_lines`/`detail_line_count` renamed `issue_detail_lines`/`issue_detail_line_count` (glob re-export clash with `jobs::*`); `IssuesState.detail_scroll` added | plan Task 8 and spec D3 amended in this commit |
-| 8 | coder note | Minor | Issues degraded text names `scan.issues`/`scan.issue` but not `scan.issue.update` | fix round E (E17) |
-| 8 | coder note | Minor | Issues List-pane `Enter` is inert | fix round E (E18): `Enter` on the list focuses the Detail pane |
+| 8 | coder note | Minor | Issues degraded text names `scan.issues`/`scan.issue` but not `scan.issue.update` | fixed in edecb09f (fix round E) (E17) |
+| 8 | coder note | Minor | Issues List-pane `Enter` is inert | fixed in 0263c577 (fix round E) (E18): `Enter` on the list focuses the Detail pane |
 | 8 | coder note | note | the developer fixture answers `scan.issue.update` with a missing-tool error | accepted: the fixture is development only; the pty cell runs against a real core |
 | 8 | spec | Minor | flow list drawn after `seen`, not between the evidence and `poc` as D11 orders | fix round F (F1): move the flow list to its D11 position |
 | 8 | spec | Minor | an unrequested `target` line in the detail | accepted by the T7 session; spec D11 amended in this commit |

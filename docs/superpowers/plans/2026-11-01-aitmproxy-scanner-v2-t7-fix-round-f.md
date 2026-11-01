@@ -34,6 +34,8 @@ F13. Tests assert `contains` where the literal is on screen; the unit fixture lo
 
 F14. The Findings `Enter` arm duplicates `open_scan_flow` minus `reset_view()` (`crates/aitm-tui/src/app.rs`): rename `open_scan_flow` to `open_flow(id, missing_toast: &str)` and have the Findings arm call it with its existing toast text (`finding capture is not in the flow store`), adding the `reset_view()` the other callers get; existing Findings tests are the guard.
 
+F15. **The notice is cleared by any parsed `scan.*` reply** (`crates/aitm-tui/src/app.rs` `scan_reply`, `crates/aitm-tui/src/scan/mod.rs` field doc; carried over from E3 now that spec D3 reads "cleared by the next key only, never by a reply"): remove the `self.scan.notice = None` line in `scan_reply`; reword the field doc. Test (`tests/scan_v2_jobs.rs`): job A done and job B running, `x` on A, then a `scan.status:B` reply leaves the banner reading `already done`; `Down` clears it.
+
 ## Not in this round
 
 Items the fix round E re-review adds are appended below when it reports.
