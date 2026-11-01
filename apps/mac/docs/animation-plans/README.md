@@ -54,6 +54,7 @@ Nothing in either plan touches the files other sessions hold on 2026-10-31
 - **Menus work without activation.** `AXUIElementPerformAction(kAXPressAction)` on a menu-bar
   item arms intercept, resumes, disarms and quits the dev app without bringing it forward.
   Quit through the app's own Quit item so `applicationWillTerminate` reaps the embedded core.
-- **Arm intercept from the app**, not over the bus, when the test needs the intercept bar: the
-  app only learns the armed state from its own `setIntercept` (audit ▸ Found on the way).
+- **Either arming path shows the bar** from `5eac2a50` on (#196 polls `proxy.status.intercept_armed`).
+  On the `1854fae7` bundle only the app's own Flow ▸ Arm Intercept did, which is why the audit's
+  measurements armed from the app through an AX menu press.
 - **Idle CPU** with `top -l N -s 2 -pid`; attribute with `sample <pid> 3`.

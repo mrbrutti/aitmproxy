@@ -132,10 +132,13 @@ breath: 600 ms down, 600 ms up); removed under Reduce Motion".
 
 Generated Swift: `tools/gen-tokens.swift` already emits every `cubicBezier` as
 `static func <name>(_ duration: Double) -> Animation`. Extend the generator so a cubicBezier
-also emits a `CAMediaTimingFunction`:
+also emits a `CAMediaTimingFunction`, as a computed property (`CAMediaTimingFunction` is not
+`Sendable`, so a stored static would lean on the target's MainActor default isolation):
 
 ```swift
-static let pulseTiming = CAMediaTimingFunction(controlPoints: 0.42, 0, 0.58, 1)
+static var pulseTiming: CAMediaTimingFunction {
+    CAMediaTimingFunction(controlPoints: 0.42, 0.0, 0.58, 1.0)
+}
 ```
 
 (Emit `<name>Timing` for every cubicBezier; `easeOutTiming` and `easeInOutTiming` become
@@ -166,8 +169,8 @@ available too. `Tokens.swift` already imports AppKit, which brings QuartzCore.)
    `interceptPulse` description (values above).
 2. `apps/mac/tools/gen-tokens.swift`: in the `case "cubicBezier":` branch, after the existing
    `Animation` function, also emit
-   `static let \(ident(key))Timing = CAMediaTimingFunction(controlPoints: a, b, c, d)` with the
-   four values formatted as `Float` literals. Regenerate `UI/Tokens.swift` and confirm the diff
+   `static var \(ident(key))Timing: CAMediaTimingFunction { CAMediaTimingFunction(controlPoints: a, b, c, d) }`
+   with the four values interpolated as they are (they are `Double`s from the JSON). Regenerate `UI/Tokens.swift` and confirm the diff
    adds exactly `pulse(_:)`, `pulseTiming`, `easeOutTiming`, `easeInOutTiming` and the doc
    comment change.
 3. `Shell/InterceptBar.swift`: add `PulseDot` (code above), replace the `Circle()` block in
@@ -186,8 +189,8 @@ available too. `Tokens.swift` already imports AppKit, which brings QuartzCore.)
   `Panels/StatusPanel.swift`, `SettingsView.swift`, `Bus/BusService.swift`,
   `AitmproxyKit/ContentCategory.swift`, `Shell/SidebarView.swift`, `Session.swift`.
 - Do NOT change the bar's layout, words, colours or actions — the dot's implementation only.
-- Do NOT add dependencies. Do NOT run `./build.sh` (it installs over the operator's app); use
-  `DEV_TAG=<tag> tools/snap-dev.sh`.
+- Do NOT add dependencies. Do NOT run `./build.sh` (it installs over the operator's app); build
+  with plain `swift build` and the hand-assembled dev bundle described under Verification.
 - If `InterceptBar.swift` no longer matches the excerpt above, STOP and report.
 
 ## Verification
@@ -207,7 +210,7 @@ available too. `Tokens.swift` already imports AppKit, which brings QuartzCore.)
     (was 17–23 %).
   - A window-id recording of the bar shows the dot's opacity changing smoothly across
     consecutive frames over ~1.2 s per breath (it still pulses).
-  - Toggle System Settings ▸ Accessibility ▸ Display ▸ Reduce Motion **on** while the bar is
+  - Toggle System Settings ▸ Accessibility ▸ Motion ▸ Reduce motion **on** while the bar is
     showing: within a frame or two the dot is static at full opacity (recording: no further
     changed frames in the dot's rect). Toggle it **off** again: the dot breathes again. Restore
     the setting to what it was.
