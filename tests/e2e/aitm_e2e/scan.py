@@ -138,7 +138,7 @@ WS_CSWSH_CLASS = "ws-cswsh"
 WS_INJECTION_CLASS = "ws-injection"
 
 _CONTRACT = Path(repo_root()) / "crates" / "aitm" / "tests" / "frontends.rs"
-_ERROR_CODE_RE = re.compile(r"scan: ([a-z_]+):")
+_ERROR_CODE_RE = re.compile(r"scan: ([a-z0-9_]+):")
 _HTTP_TIMEOUT = 5.0
 
 
