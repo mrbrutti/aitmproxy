@@ -655,6 +655,12 @@ Kept by the main session during stage 6. One row per finding.
 | G-C | quality | Minor | sample tags are the caller's expectation | fix round H (H3, widened) |
 | G-C | quality | Minor | `cursor_row` re-inlines `CURSOR_ROW_RE` | fix round H (H7) |
 | G-C | quality | Minor | `harness_scan_start` catches programming errors | fix round H (H8) |
+| G-C | spec re-review | FAIL | G95, G100 a/b/d/e, G94, G96, G97, G98, G93, G101 verified; G99's `>` poll and G101's node-under-cursor broken in effect | fix round H (H9 Critical, H10, H11) |
+| G-C | spec | Critical | line-anchored `>` regexes never match inside the boxed, sidebar-offset Scan view; T7-16 dies at the first profile open | fix round H (H9): box-relative reader plus an offline frame self-test |
+| G-C | spec | Important | `P` fallback counts the issue name anywhere on the Findings screen | fix round H (H10) |
+| G-C | spec | Minor | `EDITOR_HEAD_RE` matches the no-editor hint | fix round H (H4) |
+| G-C | spec | Minor | T7-19 tab marker waited before `J` pins the job | fix round H (H11) |
+| G-C | spec | note | prefix needle widths, glyph allowance, candidate cap, sample count and timeouts | ratified in round H's text |
 
 ## Shipped
 
