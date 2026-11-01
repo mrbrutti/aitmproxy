@@ -1,7 +1,13 @@
-//! AC-F11.1 / Review focus #5: a passthrough host is tunnelled byte-for-byte —
-//! the client's TLS peer certificate is the **upstream's real cert** and the store
-//! holds no decrypted `HttpFlow` for it — while a non-passthrough host on the same
-//! proxy is still MITM'd (a leaf issued by the aitm CA, its request captured).
+//! AC-F11.1 / Review focus #5, and spec 2026-10-31 per-host decryption AC1/AC7: a
+//! pinned or out-of-scope host is tunnelled byte-for-byte — the client's TLS peer
+//! certificate is the **upstream's real cert**, the store holds no decrypted
+//! `HttpFlow` for it, and the connection is one `CONNECT` row whose
+//! `metadata.tunnel` is `passthrough` (reason `pinned` / `out_of_scope`) with the
+//! relay's byte counts — while an in-scope, unpinned host on the same proxy is
+//! still MITM'd (a leaf issued by the aitm CA, its request captured).
+//!
+//! These tests bind loopback sockets and run real TLS, so they need a Terminal
+//! run (the Claude Bash sandbox cannot bind sockets).
 //!
 //! The proxy here is a minimal acceptor that mirrors `aitm_core::Proxy`'s next-
 //! layer selection (`modules.iter().find(|m| m.matches(&hint))`) over the real
@@ -15,8 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aitm_core::{
-    ByteStream, Chain, Flow, FlowStore, MemFlowStore, ModuleCtx, NextLayerHint, ProtocolModule,
-    Registry, ScopeEntry, ScopeRateGuard, StdGuard, UpstreamConnector,
+    ByteStream, Chain, Flow, FlowStore, HttpFlow, MemFlowStore, ModuleCtx, NextLayerHint,
+    ProtocolModule, Registry, ScopeEntry, ScopeRateGuard, StdGuard, TunnelMode, TunnelReason,
+    UpstreamConnector,
 };
 use aitm_plugin_passthrough::{PassthroughList, PassthroughModule};
 use aitm_proto_http::{CertAuthority, HttpModule};
@@ -331,8 +338,19 @@ async fn passthrough_tunnels_mitm_still_decrypts() {
     );
 
     // The store must hold the decrypted MITM flow (GET /secret) but NO decrypted
-    // flow for the passthrough host.
-    let flows = collect_flows(store.as_ref()).await;
+    // flow for the passthrough host. Wait for both the MITM response and the
+    // passthrough row's close (its `duration`) before judging.
+    let flows = collect_flows(store.as_ref(), |flows| {
+        let has_mitm = flows.iter().any(
+            |f| matches!(f, Flow::Http(h) if h.request.path == "/secret" && h.response.is_some()),
+        );
+        let tunnel_closed = flows.iter().any(|f| {
+            matches!(f, Flow::Http(h)
+            if h.metadata.tunnel.is_some() && h.metadata.duration.is_some())
+        });
+        has_mitm && tunnel_closed
+    })
+    .await;
 
     let mitm_flow = flows.iter().find_map(|f| match f {
         Flow::Http(h) if h.request.path == "/secret" => Some(h),
@@ -360,22 +378,113 @@ async fn passthrough_tunnels_mitm_still_decrypts() {
         "a passthrough host must never produce a decrypted HttpFlow"
     );
 
-    // A minimal tunnel marker was recorded so a UI can show "tunnelled".
-    let tunnel = flows.iter().any(|f| match f {
-        Flow::Http(h) => {
-            h.metadata.marks.iter().any(|m| m == "tunnelled")
-                && authority_host(&h.request.authority) == "localhost"
-        }
-        _ => false,
-    });
+    // AC7: the passthrough connection is one `CONNECT` row, `passthrough` with
+    // reason `pinned` (the host is in Scope too, and pins win), acknowledged with
+    // a 200, closed with the relay's byte counts and a duration once the client
+    // hung up; no `tunnelled` mark.
+    let row = tunnel_row(&flows, "localhost");
+    let tunnel = row.metadata.tunnel.as_ref().expect("a tunnel row");
+    assert_eq!(tunnel.mode, TunnelMode::Passthrough);
+    assert_eq!(tunnel.reason, Some(TunnelReason::Pinned));
     assert!(
-        tunnel,
-        "the passthrough connection should record a tunnel flow"
+        tunnel.bytes_up.is_some_and(|b| b > 0) && tunnel.bytes_down.is_some_and(|b| b > 0),
+        "the relay moved bytes both ways: {tunnel:?}"
+    );
+    assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+    assert!(
+        row.metadata.duration.is_some(),
+        "the row closes when the client hangs up"
+    );
+    assert!(
+        row.metadata.marks.is_empty(),
+        "no `tunnelled` mark any more"
     );
 }
 
-/// Snapshot every stored flow, waiting briefly for the pipeline to settle.
-async fn collect_flows(store: &dyn FlowStore) -> Vec<Flow> {
+/// AC1 (socket half): a host that is neither pinned nor in Scope is tunnelled with
+/// reason `out_of_scope` — the client sees the origin's own cert and no decrypted
+/// row exists for it; the only row for the host is the `CONNECT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn out_of_scope_host_is_tunnelled_with_reason_out_of_scope() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let (origin_addr, origin_cert) = spawn_tls_fixture("localhost").await;
+
+    // Nothing pinned; Scope names some other host, so "localhost" is out of scope.
+    let mut by_host = HashMap::new();
+    by_host.insert("localhost".to_string(), origin_addr);
+    let (proxy, store) =
+        run_split_proxy(Vec::new(), vec!["scoped.example".to_string()], by_host, ca).await;
+
+    let authority = format!("localhost:{}", origin_addr.port());
+    let tcp = open_tunnel(proxy, &authority).await;
+    let (peer_cert, status) = tls_get(tcp, "localhost", accept_any_client()).await;
+    assert_eq!(status, 200, "the origin answers through the tunnel");
+    assert_eq!(
+        peer_cert.as_ref(),
+        origin_cert.as_ref(),
+        "an out-of-scope host is never decrypted: the client sees the origin's cert"
+    );
+
+    let flows = collect_flows(store.as_ref(), |flows| {
+        flows.iter().any(|f| {
+            matches!(f, Flow::Http(h)
+            if h.metadata.tunnel.is_some() && h.metadata.duration.is_some())
+        })
+    })
+    .await;
+
+    let for_host: Vec<&HttpFlow> = flows
+        .iter()
+        .filter_map(|f| match f {
+            Flow::Http(h) if authority_host(&h.request.authority) == "localhost" => Some(h),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        for_host.len(),
+        1,
+        "exactly one row for the host, the CONNECT: {for_host:?}"
+    );
+    let row = for_host[0];
+    assert_eq!(row.request.method, "CONNECT");
+    assert_eq!(row.request.authority, authority);
+    let tunnel = row.metadata.tunnel.as_ref().expect("a tunnel row");
+    assert_eq!(tunnel.mode, TunnelMode::Passthrough);
+    assert_eq!(tunnel.reason, Some(TunnelReason::OutOfScope));
+    assert!(
+        tunnel.bytes_up.is_some_and(|b| b > 0) && tunnel.bytes_down.is_some_and(|b| b > 0),
+        "the relay moved bytes both ways: {tunnel:?}"
+    );
+    assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+    assert!(row.metadata.duration.is_some());
+    assert!(
+        !flows
+            .iter()
+            .any(|f| matches!(f, Flow::Http(h) if h.request.path == "/secret")),
+        "no decrypted request row exists for an out-of-scope host"
+    );
+}
+
+/// The `CONNECT` tunnel row for `host`.
+fn tunnel_row<'a>(flows: &'a [Flow], host: &str) -> &'a HttpFlow {
+    flows
+        .iter()
+        .find_map(|f| match f {
+            Flow::Http(h)
+                if h.request.method == "CONNECT"
+                    && authority_host(&h.request.authority) == host =>
+            {
+                Some(h)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a CONNECT tunnel row for {host}"))
+}
+
+/// Snapshot every stored flow, polling briefly (up to 5 s) until `settled` says
+/// the pipeline has caught up — a tunnel row closes only after the client's
+/// hang-up reaches the relay, so the caller names the state it waits for.
+async fn collect_flows(store: &dyn FlowStore, settled: impl Fn(&[Flow]) -> bool) -> Vec<Flow> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let flows: Vec<Flow> = store
@@ -383,16 +492,7 @@ async fn collect_flows(store: &dyn FlowStore) -> Vec<Flow> {
             .into_iter()
             .filter_map(|id| store.get(id))
             .collect();
-        let has_mitm = flows.iter().any(
-            |f| matches!(f, Flow::Http(h) if h.request.path == "/secret" && h.response.is_some()),
-        );
-        let has_tunnel = flows.iter().any(
-            |f| matches!(f, Flow::Http(h) if h.metadata.marks.iter().any(|m| m == "tunnelled")),
-        );
-        if has_mitm && has_tunnel {
-            return flows;
-        }
-        if Instant::now() >= deadline {
+        if settled(&flows) || Instant::now() >= deadline {
             return flows;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
