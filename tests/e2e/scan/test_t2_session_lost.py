@@ -118,8 +118,11 @@ def main() -> None:
                 # from the window: no re-arm -> the seed's own ARMED - 1 (the cell's
                 # second GET used one); re-arm(s) -> exactly ARMED /account 200s after
                 # the last re-arm. The request that reaches 0 is still a 200.
+                # Only a replay of the captured arm counts (`n=20`): a mutated `n` is a
+                # 400 anyway, and a different parseable n would arm a different count.
                 rearms = [e for e in reqs if e.get("path") == "/logout-after" and with_session(e)
-                          and e.get("status") == 200 and int(e.get("seq", 0)) < first_seq]
+                          and e.get("status") == 200 and e.get("query") == f"n={ARMED}"
+                          and int(e.get("seq", 0)) < first_seq]
                 if rearms:
                     last_rearm_seq = int(rearms[-1].get("seq", 0))
                     after_rearm = [e for e in before if int(e.get("seq", 0)) > last_rearm_seq]
