@@ -25,8 +25,9 @@ client that refuses our CA) or that is tunnelled produces **no flow at all**, wh
 is exactly the "Safari shows zero rows" mystery of v0.5.3–v0.5.5.
 
 This change makes Scope the decryption list: the proxy decrypts **only** hosts in
-Scope, tunnels every other CONNECT byte-for-byte, and emits **every** CONNECT as a
-visible row with its outcome (`decrypted`, `passthrough`, `failed` + reason). The
+Scope, tunnels every other **TLS** CONNECT byte-for-byte (a CONNECT whose first inner
+byte is not a TLS record is refused, D1), and emits **every** CONNECT as a visible row
+with its outcome (`decrypted`, `passthrough`, `failed` + reason). The
 flip is live: `scope.add` decrypts the next connection, `scope.remove` tunnels it.
 The Network Extension already claims only in-scope hosts, so the capture path and
 the explicit-proxy path now agree.
@@ -446,7 +447,9 @@ What a row renderer needs and gets:
    `status null`, `duration_ms` not null. [e2e + unit]
 6. **AC6 (other failures are rows).** Unit tests per code: `client_closed` (CONNECT
    then EOF), `upstream_unreachable` (dial refused), `upstream_tls_failed`,
-   `protocol_error` (malformed CONNECT line); passthrough dial failure yields
+   `protocol_error` (malformed CONNECT line; and, per D1's TLS-only rule, a non-TLS
+   first byte inside an out-of-scope or pinned CONNECT, with the origin receiving
+   nothing — both producers); passthrough dial failure yields
    `failed/upstream_unreachable`, not a `passthrough` row. [unit]
 7. **AC7 (pins win).** A host both in Scope and on `tls.passthrough` is a
    `passthrough` row with `tunnel_reason "pinned"`. [unit, passthrough crate]
