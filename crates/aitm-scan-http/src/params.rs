@@ -72,12 +72,23 @@ pub(crate) fn serialize_cookies(pairs: &[(String, String)]) -> String {
 // --- JSON leaves and paths ------------------------------------------------
 
 /// A scalar found in a JSON document, with the path that addresses it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct JsonLeaf {
     /// Dotted/indexed path, e.g. `profile.address.city` or `items[0].name`.
     pub path: String,
     /// The scalar itself, with its JSON type.
     pub value: Value,
+}
+
+// `Debug` prints lengths only: the path can name a secret and the value is body
+// content, neither of which may reach a log line (S-M3).
+impl std::fmt::Debug for JsonLeaf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonLeaf")
+            .field("path_len", &self.path.len())
+            .field("value_len", &self.value.to_string().len())
+            .finish()
+    }
 }
 
 /// Every scalar leaf (string, number, bool, null) of `root`, in document order.
@@ -325,12 +336,23 @@ fn number_value(text: &str) -> Option<Value> {
 // --- request path and body ------------------------------------------------
 
 /// A request target split into its path and its raw query string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SplitPath<'a> {
     /// The path, without the `?`.
     pub path: &'a str,
     /// The raw query string after the first `?`, if any.
     pub query: Option<&'a str>,
+}
+
+// `Debug` prints lengths only: the raw query carries credential values that may
+// not reach a log line (S-M3).
+impl std::fmt::Debug for SplitPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitPath")
+            .field("path_len", &self.path.len())
+            .field("query_len", &self.query.map(str::len))
+            .finish()
+    }
 }
 
 /// Split `path?query` (the `HttpRequest::path` shape) at the first `?`.
@@ -448,6 +470,22 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// `JsonLeaf` and `SplitPath` carry a body value and a raw query: their
+    /// `Debug` must print lengths only, never the content (S-M3).
+    #[test]
+    fn debug_never_prints_a_value_or_a_query() {
+        let leaf = JsonLeaf {
+            path: "session.id".to_string(),
+            value: json!("3f9c-secret-value"),
+        };
+        let shown = format!("{leaf:?}");
+        assert!(!shown.contains("3f9c-secret-value"), "{shown}");
+
+        let split = split_path("/a?token=supersecret");
+        let shown = format!("{split:?}");
+        assert!(!shown.contains("supersecret"), "{shown}");
     }
 
     #[test]
