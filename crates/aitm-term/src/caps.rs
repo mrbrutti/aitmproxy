@@ -76,14 +76,12 @@ impl Caps {
     ///
     /// The width is measured only after `stderr` is known to be a terminal
     /// (crossterm opens `/dev/tty` first and would return a width for a pipe;
-    /// spec T5). A reported width of zero counts as unknown.
+    /// spec T5). A reported width of zero counts as unknown; [`Caps::from_parts`]
+    /// applies that rule.
     pub fn detect_stderr(color: ColorChoice) -> Caps {
         let tty = std::io::stderr().is_terminal();
         let width = if tty {
-            crossterm::terminal::size()
-                .ok()
-                .map(|(cols, _rows)| cols)
-                .filter(|cols| *cols > 0)
+            crossterm::terminal::size().ok().map(|(cols, _rows)| cols)
         } else {
             None
         };
@@ -102,6 +100,9 @@ impl Caps {
     ///    than plain; it does not depend on colour.
     /// 6. Glyphs are rich when any of `LC_ALL`, `LC_CTYPE`, `LANG` ends in
     ///    `UTF-8`/`UTF8` (case-insensitive) and `TERM` is not `linux`.
+    ///
+    /// The width is `measured_width` when it is known; `None` and a zero
+    /// measurement both count as unknown and yield 80 (spec T5).
     pub fn from_parts(
         stream_is_tty: bool,
         measured_width: Option<u16>,
@@ -147,7 +148,9 @@ impl Caps {
             color,
             unicode,
             animate,
-            width: measured_width.unwrap_or(DEFAULT_WIDTH),
+            width: measured_width
+                .filter(|cols| *cols > 0)
+                .unwrap_or(DEFAULT_WIDTH),
             ci,
         }
     }
@@ -457,5 +460,23 @@ mod tests {
                 ..rich()
             }
         );
+    }
+
+    #[test]
+    fn caps_treats_a_zero_width_as_unknown() {
+        // A TTY that reports zero columns has not been measured: spec T5's
+        // 80 applies, not a width that truncates every line to an ellipsis.
+        let zero = Caps::from_parts(true, Some(0), ColorChoice::Auto, &env_of(TTY_ENV));
+        assert_eq!(zero.width, 80);
+        assert_eq!(
+            zero,
+            Caps {
+                width: 80,
+                ..rich()
+            }
+        );
+        // A real measurement is still taken as is.
+        let measured = Caps::from_parts(true, Some(120), ColorChoice::Auto, &env_of(TTY_ENV));
+        assert_eq!(measured.width, 120);
     }
 }
