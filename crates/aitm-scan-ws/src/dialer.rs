@@ -678,10 +678,21 @@ impl WsConn {
             FrameKind::Binary => Message::Binary(Bytes::from(frame.payload.clone())),
             FrameKind::Ping => Message::Ping(Bytes::from(frame.payload.clone())),
             FrameKind::Pong => Message::Pong(Bytes::from(frame.payload.clone())),
-            FrameKind::Close => Message::Close(Some(CloseFrame {
-                code: CloseCode::Normal,
-                reason: String::from_utf8_lossy(&frame.payload).into_owned().into(),
-            })),
+            // The model payload is the RFC 6455 layout (code, then reason), the
+            // same bytes `close_payload` records; shorter than a code is a
+            // plain normal close.
+            FrameKind::Close => Message::Close(match frame.payload.get(..2) {
+                Some(&[high, low]) => Some(CloseFrame {
+                    code: CloseCode::from(u16::from_be_bytes([high, low])),
+                    reason: String::from_utf8_lossy(frame.payload.get(2..).unwrap_or_default())
+                        .into_owned()
+                        .into(),
+                }),
+                _ => Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: String::new().into(),
+                }),
+            }),
         };
         tracing::debug!(kind = ?frame.kind, bytes = frame.payload.len(), "ws send");
         self.stream
@@ -910,9 +921,16 @@ impl WsConn {
     }
 }
 
-/// The reason text of a Close frame, as bytes (empty when there is no frame).
+/// A Close frame's payload in the RFC 6455 section 5.5.1 layout: the two-byte
+/// big-endian code, then the reason (empty when there is no frame). The same
+/// bytes `aitm-proto-ws` records for a captured Close, so a scan replay flow
+/// matches a captured one and a check can read the code (plan call 34).
 fn close_payload(frame: Option<&CloseFrame>) -> Vec<u8> {
-    frame.map_or_else(Vec::new, |frame| frame.reason.as_bytes().to_vec())
+    frame.map_or_else(Vec::new, |frame| {
+        let mut payload = u16::from(frame.code).to_be_bytes().to_vec();
+        payload.extend_from_slice(frame.reason.as_bytes());
+        payload
+    })
 }
 
 /// The core opcode a model frame kind records as.
@@ -1306,6 +1324,43 @@ mod tests {
             log.received(),
             vec![b"p".to_vec()],
             "the dialer answers a ping with exactly one pong"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_frame_payload_carries_code_and_reason() {
+        // A collected Close frame's payload is the RFC 6455 section 5.5.1
+        // layout — two big-endian code bytes then the reason — exactly what
+        // `aitm-proto-ws` records for a captured Close, so a check can read the
+        // code and a replay flow matches a captured one (plan call 34).
+        let (transport, _log) = ws_server(None, |conn| async move {
+            let mut ws = conn.ws().await;
+            ws.send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Size,
+                reason: "too big".into(),
+            })))
+            .await
+            .expect("server close");
+        });
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let mut conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
+
+        let collected = conn
+            .collect(Duration::from_secs(1), soon(), &|| false)
+            .await;
+
+        assert_eq!(collected.ended, CollectEnd::Close { code: Some(1009) });
+        let close = collected
+            .frames
+            .iter()
+            .find(|frame| frame.kind == FrameKind::Close)
+            .expect("the peer's Close is collected");
+        assert_eq!(
+            close.payload,
+            vec![0x03, 0xF1, b't', b'o', b'o', b' ', b'b', b'i', b'g'],
+            "code 1009 (0x03F1) big-endian, then the reason"
         );
     }
 
