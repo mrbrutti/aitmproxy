@@ -646,6 +646,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             first_bytes: vec![0x16, 0x03, 0x01],
             peer_identity: None,
+            interface: "test-if".to_string(),
         };
         assert_eq!(
             ingress.dispatch_tcp(flow).await,

@@ -119,6 +119,60 @@ public struct ClientInfo: Hashable, Sendable {
     }
 }
 
+/// `source_app` on the wire (spec 2026-10-31-ne-source-app-on-the-wire, D5): the signing
+/// identifier the capture backend observed for the process that opened the connection,
+/// turned into the client the sidebar's Apps group keys on.
+extension ClientInfo {
+    /// Identifiers whose last dotted component is not the app's name. Safari opens its
+    /// sockets from the WebKit networking process, so without the entry a Safari visit
+    /// would group as `Networking`. The raw identifier stays in `bundleID` either way.
+    public static let knownSourceApps: [String: String] = [
+        "com.apple.WebKit.Networking": "Safari",
+        "org.mozilla.firefox": "Firefox",
+    ]
+
+    /// The client for a flow whose `source_app` is `identifier`: the name from
+    /// `displayName(forSourceApp:)`, the default monogram (its first character), the
+    /// identifier as `bundleID`, no pid. Equal identifiers give equal clients, so
+    /// `Session.clients` counts them as one group.
+    public init(sourceApp identifier: String) {
+        self.init(name: ClientInfo.displayName(forSourceApp: identifier), bundleID: identifier)
+    }
+
+    /// The name shown for a source-app identifier. Rule: `knownSourceApps` first; else
+    /// control and format characters (Unicode categories Cc and Cf: C0/C1 controls, bidi
+    /// overrides, zero-width marks) are removed from a copy — `bundleID` keeps the raw
+    /// text; then the text after the last `.`, casing kept as sent (`com.apple.curl` →
+    /// `curl`, `com.apple.Safari` → `Safari`); with no `.`, or nothing after the last one
+    /// (`trailing.`), the whole cleaned identifier; if nothing printable is left,
+    /// `unnamedSourceApp`.
+    public static func displayName(forSourceApp identifier: String) -> String {
+        if let known = knownSourceApps[identifier] { return known }
+        // The identifier is signer-chosen text: strip C0/C1 controls and Unicode bidi
+        // formatting characters from what is SHOWN (never from `bundleID`), so a name
+        // cannot carry an RTL override or a control sequence into the sidebar.
+        let shown = Self.withoutControlAndBidi(identifier)
+        guard !shown.isEmpty else { return unnamedSourceApp }
+        guard let dot = shown.lastIndex(of: ".") else { return shown }
+        let tail = shown[shown.index(after: dot)...]
+        return tail.isEmpty ? shown : String(tail)
+    }
+
+    /// Shown when an identifier has no printable character left after cleaning.
+    public static let unnamedSourceApp = "unknown app"
+
+    /// `text` without control (Cc) and format (Cf) characters — the C0/C1 controls and
+    /// the bidi overrides, marks and zero-width characters that could disguise a name.
+    private static func withoutControlAndBidi(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter { scalar in
+            switch scalar.properties.generalCategory {
+            case .control, .format: return false
+            default: return true
+            }
+        }))
+    }
+}
+
 /// One row of the flow list: everything the columns show. Fields the bus
 /// does not report yet (F5) are optional and render as a grey dash.
 public struct FlowRow: Identifiable, Hashable, Sendable {

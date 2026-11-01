@@ -175,7 +175,10 @@ fn detail(flow: &Flow, mode: BodyMode) -> Value {
                 "response".into(),
                 response(f.response.as_ref(), mode, f.metadata.truncated),
             );
-            obj.insert("client_conn".into(), conn(&f.client_conn, true));
+            obj.insert(
+                "client_conn".into(),
+                conn(&f.client_conn, Some(f.metadata.source_app.as_deref())),
+            );
             obj.insert("server_conn".into(), opt_conn(f.server_conn.as_ref()));
             obj.insert("meta".into(), meta(&f.metadata));
             obj.insert("intercept".into(), Value::Str(f.intercept.label().into()));
@@ -188,7 +191,10 @@ fn detail(flow: &Flow, mode: BodyMode) -> Value {
                 "messages".into(),
                 Value::Array(f.messages.iter().map(|m| ws_message(m, mode)).collect()),
             );
-            obj.insert("client_conn".into(), conn(&f.client_conn, true));
+            obj.insert(
+                "client_conn".into(),
+                conn(&f.client_conn, Some(f.metadata.source_app.as_deref())),
+            );
             obj.insert("server_conn".into(), opt_conn(f.server_conn.as_ref()));
             obj.insert("meta".into(), meta(&f.metadata));
             obj.insert("intercept".into(), Value::Str(f.intercept.label().into()));
@@ -304,24 +310,27 @@ fn headers(h: &HeaderMap) -> Value {
     )
 }
 
-fn conn(c: &ConnInfo, with_process: bool) -> Value {
+/// `process` is `Some(..)` for the client side only: the source app the capture
+/// backend observed (`FlowMeta.source_app`, the same string `flow.get` emits), so the
+/// TUI and web Client columns, which read `client_conn.process`, agree with the mac
+/// app; `Some(None)` is a stable null for a proxied flow. The server side has no
+/// process and omits the key.
+fn conn(c: &ConnInfo, process: Option<Option<&str>>) -> Value {
     let mut obj = BTreeMap::new();
     obj.insert("peer".into(), Value::Str(c.peer.to_string()));
     obj.insert("sni".into(), opt_str(c.sni.as_deref()));
     obj.insert("alpn".into(), opt_str(c.alpn.as_deref()));
     obj.insert("tls".into(), Value::Bool(c.tls));
     obj.insert("established".into(), rfc3339(c.established));
-    if with_process {
-        // Peer→process (the Client column) is deferred (foundation Q6): a stable
-        // null until core resolves the owning process.
-        obj.insert("process".into(), Value::Null);
+    if let Some(process) = process {
+        obj.insert("process".into(), opt_str(process));
     }
     Value::Object(obj)
 }
 
 fn opt_conn(c: Option<&ConnInfo>) -> Value {
     match c {
-        Some(c) => conn(c, false),
+        Some(c) => conn(c, None),
         None => Value::Null,
     }
 }
