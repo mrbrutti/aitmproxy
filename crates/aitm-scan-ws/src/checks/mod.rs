@@ -18,9 +18,19 @@ pub mod subprotocol;
 
 /// Every native WebSocket check, in the order the lane registers them.
 ///
-/// Empty until the checks land: filled by task 17 of the T4 plan, once tasks 9
-/// to 16 have written the eight check bodies.
+/// Handshake checks first (they need only the upgrade), then the payload
+/// checks over frame content, then the two observational ones. The engine
+/// filters this list by profile; the lane returns all of it.
 #[must_use]
 pub fn all() -> Vec<Arc<dyn Check>> {
-    Vec::new()
+    vec![
+        cswsh::check(),
+        auth_bypass::check(),
+        reflection::check(),
+        sql_error::check(),
+        ssti::check(),
+        cmdi_echo::check(),
+        oversize::check(),
+        subprotocol::check(),
+    ]
 }
