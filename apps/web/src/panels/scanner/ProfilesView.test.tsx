@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { AppProvider } from '~/state/context';
 import { stubApp } from './testkit';
 import { scanStore, type ScanStore } from './store';
-import { AGENT_NOTE, CONFIRM_NOTE } from './helpers';
+import { AGENT_NOTE, CONFIRM_NOTE, PROFILE_NAME_HINT } from './helpers';
 import { parseScanProfile, type ScanProfile } from './model';
 import { ProfilesView } from './ProfilesView';
 
@@ -388,6 +388,32 @@ describe('ProfileEditor: save, delete and session preview (D-T8.5, W-12, W-13)',
     // A built-in offers no Delete at all.
     fireEvent.click(h.container.querySelector<HTMLElement>('[data-profile="standard"]')!);
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull());
+  });
+
+  it('save_name_rule: a name the engine would refuse keeps Save off and shows the hint; a builtin name too', async () => {
+    const h = await mount();
+    const save = () => screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement;
+    // The pre-flight reason is a `note` too, so the hint is found by its own marker.
+    const hint = () => h.container.querySelector<HTMLElement>('[data-name-hint]');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save as' }));
+    const name = screen.getByLabelText('Profile name') as HTMLInputElement;
+    await waitFor(() => expect(name.readOnly).toBe(false));
+
+    fireEvent.input(name, { target: { value: 'My-API' } });
+    await waitFor(() => expect(save().disabled).toBe(true));
+    expect(hint()).not.toBeNull();
+    expect(hint()!.getAttribute('role')).toBe('note');
+    expect(hint()!.textContent).toBe(PROFILE_NAME_HINT);
+
+    fireEvent.input(name, { target: { value: 'my-api' } });
+    await waitFor(() => expect(save().disabled).toBe(false));
+    expect(hint()).toBeNull();
+
+    // A built-in's name is never a save target, even typed by hand after `Save as`.
+    fireEvent.input(name, { target: { value: 'standard' } });
+    await waitFor(() => expect(save().disabled).toBe(true));
+    expect(hint()).not.toBeNull();
   });
 
   it('preview_names_only: the preview prints names and the canary, never a value (W-13)', async () => {

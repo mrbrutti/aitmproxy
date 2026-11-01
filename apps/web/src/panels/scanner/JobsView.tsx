@@ -308,6 +308,7 @@ export const JobsView: Component = () => {
                         <Fact k="queued" v={st().crawl.queued} mono />
                         <Fact k="depth" v={st().crawl.depth} mono />
                         <Fact k="forms submitted" v={st().crawl.forms_submitted} mono />
+                        <Fact k="errors" v={st().crawl.errors} field="crawl-errors" mono />
                       </dl>
                     </Section>
                   )}

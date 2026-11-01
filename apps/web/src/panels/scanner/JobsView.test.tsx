@@ -153,6 +153,18 @@ describe('JobsView: detail texts (W-14)', () => {
     expect(h.field(h.row(JOB), 'state')).toBe('failed');
   });
 
+  it('crawl_errors: the Crawl section prints crawl.errors, and 0 as `0` rather than a dash', async () => {
+    const h = mount();
+    await tick();
+    expect(h.field(h.detail(), 'crawl-errors')).toBe('0');
+
+    const raw = statusFixture();
+    const crawl = raw.crawl as Record<string, unknown>;
+    h.reply('scan.status', { ...raw, crawl: { ...crawl, errors: 2 } });
+    await h.s.refreshStatus(JOB);
+    expect(h.field(h.detail(), 'crawl-errors')).toBe('2');
+  });
+
   it('start_notice: the after-start notice lists clamped, skipped lanes, and can be dismissed', async () => {
     const h = mount();
     await tick();

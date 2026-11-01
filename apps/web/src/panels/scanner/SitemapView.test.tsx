@@ -102,6 +102,16 @@ describe('SitemapView', () => {
     expect(within(row).getByTitle('authenticated')).toBeTruthy();
   });
 
+  it('job_in_header: the list title names the job the map belongs to', async () => {
+    await mount();
+    const title = screen.getByText('Site map', { exact: false, selector: `.${css.listTitle}` });
+    const job = title.querySelector<HTMLElement>('[data-field=sitemap-job]');
+    expect(job).not.toBeNull();
+    expect(job!.textContent).toBe(JOB);
+    expect(job!.classList.contains(css.n!)).toBe(true);
+    expect(job!.classList.contains(css.mono!)).toBe(true);
+  });
+
   it('points_render_verbatim', async () => {
     await mount();
     const rows = pointRows();

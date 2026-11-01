@@ -108,6 +108,23 @@ export const L4_HINT =
 /** Printed under the launch buttons when the draft will trigger the `_confirm` handshake. */
 export const CONFIRM_NOTE = 'The core will ask for confirmation.';
 
+/* ------------------------------------------------------------------ profile names */
+
+/**
+ * The engine's rule for a saved profile name: `^[a-z0-9][a-z0-9._-]{0,63}$`, lowercase only. Anything
+ * else is refused with `invalid_profile`, so the editor dims `Save` ahead of the round trip. A
+ * built-in name is refused too, but that is a list lookup the editor does itself.
+ */
+const PROFILE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+export function isValidProfileName(name: string): boolean {
+  return PROFILE_NAME.test(name);
+}
+
+/** The one sentence shown under the name field while the typed name fails the rule. */
+export const PROFILE_NAME_HINT =
+  'lowercase letters, digits, . _ - ; 1-64 characters, starting with a letter or digit';
+
 /**
  * Every `scan:` error code as the editor's result block and the toast print it (D-T8.6, W-3). An
  * unknown code (`null`) prints the core's message verbatim — the UI never invents a reason.

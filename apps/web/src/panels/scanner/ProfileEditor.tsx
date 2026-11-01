@@ -20,7 +20,7 @@ import { ConfirmInject } from '~/panels/l4/ConfirmInject';
 import { AddHost } from '~/panels/scope/AddHost';
 import { useApp } from '~/state/context';
 import { CheckTree } from './CheckTree';
-import { AGENT_NOTE, L4_HINT, hostInScope, originHost, unknownSelectors } from './helpers';
+import { AGENT_NOTE, L4_HINT, PROFILE_NAME_HINT, hostInScope, isValidProfileName, originHost, unknownSelectors } from './helpers';
 import { preflight, type LaunchMode } from './launch';
 import {
   ACCURACIES,
@@ -298,9 +298,15 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
     ),
   );
 
-  /** A built-in is never overwritten: saving it needs `Save as` and a different name. */
-  const canSave = () =>
-    p().name.trim() !== '' && props.dirty && !(isBuiltin() && p().name === props.name) && !s.busy();
+  /** Whether the typed name is one the engine would save: the name rule, and not a built-in's name. */
+  const nameIsBuiltin = () => s.profiles().some((e) => e.builtin && e.name === p().name);
+  const nameOk = () => isValidProfileName(p().name) && !nameIsBuiltin();
+  /** The hint shows only while the name is being authored (after `Save as`, or on a saved profile). */
+  const nameEditable = () => !isBuiltin() || renaming();
+  const showNameHint = () => nameEditable() && !nameOk();
+
+  /** A built-in is never overwritten: saving it needs `Save as` and a name the engine accepts. */
+  const canSave = () => nameOk() && props.dirty && !(isBuiltin() && p().name === props.name) && !s.busy();
 
   /* -------------------------------------------------------------- targets */
 
@@ -466,6 +472,11 @@ const EditorForm: Component<{ name: string; profile: ScanProfile; dirty: boolean
               readOnly={isBuiltin() && !renaming()}
               onValue={(v) => setField('name', v)}
             />
+            <Show when={showNameHint()}>
+              <p class={css.note} role="note" data-name-hint>
+                {PROFILE_NAME_HINT}
+              </p>
+            </Show>
             <Show when={isBuiltin()}>
               <p class={css.note}>A built-in profile is never overwritten — `Save as` stores it under a new name.</p>
             </Show>

@@ -130,6 +130,9 @@ export const SitemapView: Component = () => {
         <div class={css.listHead}>
           <span class={css.listTitle}>
             Site map
+            <span class={`${css.n} ${css.mono}`} data-field="sitemap-job">
+              {job()}
+            </span>
             <span class={css.n}>· {ordered().length}</span>
           </span>
           <Show when={disabled()}>

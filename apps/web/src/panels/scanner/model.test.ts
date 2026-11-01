@@ -56,6 +56,16 @@ describe('parseJobStatus', () => {
     expect(status!.lanes.skipped[0]!.lane).toBe('ws');
     expect(status!.stopped_reason).toBeNull();
     expect(status!.l4).toBeNull();
+    // The fixture predates `crawl.errors`: absent on the wire reads as 0, never undefined.
+    expect(status!.crawl.errors).toBe(0);
+  });
+
+  it('reads crawl.errors when the wire carries it (a failed browser crawl counts here)', () => {
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const crawl = raw.crawl as Record<string, unknown>;
+    const status = parseJobStatus({ ...raw, crawl: { ...crawl, errors: 2 } });
+    expect(status!.crawl.errors).toBe(2);
+    expect(status!.crawl.pages).toBe(37);
   });
 
   it('reads scan.cancel.json as a cancelling job', () => {

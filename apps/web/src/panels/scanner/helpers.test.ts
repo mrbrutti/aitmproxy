@@ -18,6 +18,7 @@ import {
   CONFIRM_NOTE,
   EMPTY_FILTER,
   L4_HINT,
+  PROFILE_NAME_HINT,
   applyCheckToggle,
   checkIsOn,
   filterIssues,
@@ -28,6 +29,7 @@ import {
   isLive,
   isStale,
   isTerminal,
+  isValidProfileName,
   jobTone,
   l4Covered,
   l4EntryCovers,
@@ -168,6 +170,29 @@ describe('fixed texts', () => {
     expect(CONFIRM_NOTE).toBe('The core will ask for confirmation.');
     expect(AGENT_NOTE).toBe(
       'Agent session: the core refuses active scans unless scanner.allow_agent_active is set; intrusive is operator-only',
+    );
+  });
+});
+
+describe('isValidProfileName (the engine’s saved-profile name rule)', () => {
+  it('accepts lowercase names of 1-64 chars from [a-z0-9._-] starting with a letter or digit', () => {
+    expect(isValidProfileName('my-api')).toBe(true);
+    expect(isValidProfileName('a')).toBe(true);
+    expect(isValidProfileName('x.y_z-1')).toBe(true);
+    expect(isValidProfileName('a'.repeat(64))).toBe(true);
+  });
+
+  it('refuses empty, uppercase, a leading separator, 65 chars, and a space', () => {
+    expect(isValidProfileName('')).toBe(false);
+    expect(isValidProfileName('My-API')).toBe(false);
+    expect(isValidProfileName('-x')).toBe(false);
+    expect(isValidProfileName('a'.repeat(65))).toBe(false);
+    expect(isValidProfileName('has space')).toBe(false);
+  });
+
+  it('PROFILE_NAME_HINT is the one sentence the editor shows', () => {
+    expect(PROFILE_NAME_HINT).toBe(
+      'lowercase letters, digits, . _ - ; 1-64 characters, starting with a letter or digit',
     );
   });
 });

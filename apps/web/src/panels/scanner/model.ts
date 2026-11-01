@@ -197,6 +197,8 @@ export interface CrawlCounters {
   queued: number;
   depth: number;
   forms_submitted: number;
+  /** Crawl errors, a failed browser crawl among them (the client crawl then stands in). Absent → 0. */
+  errors: number;
 }
 
 export interface SkippedPoints {
@@ -786,6 +788,7 @@ function crawlCounters(v: unknown): CrawlCounters {
     queued: num(o.queued),
     depth: num(o.depth),
     forms_submitted: num(o.forms_submitted),
+    errors: num(o.errors),
   };
 }
 
