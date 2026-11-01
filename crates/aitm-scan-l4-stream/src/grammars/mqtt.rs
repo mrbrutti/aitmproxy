@@ -200,7 +200,11 @@ fn push_varint(out: &mut Vec<u8>, value: usize) {
 }
 
 /// The remaining length encoded at `at`, and the offset just after it.
-fn read_varint(buf: &[u8], at: usize) -> Option<(usize, usize)> {
+///
+/// `pub(crate)` because [`crate::denylist`]'s MQTT rules decode the same
+/// packets from the fixed header out and must do it the same way this
+/// grammar does.
+pub(crate) fn read_varint(buf: &[u8], at: usize) -> Option<(usize, usize)> {
     let mut value = 0usize;
     let mut end = at;
     for step in 0..VARINT_MAX_BYTES {
@@ -215,9 +219,16 @@ fn read_varint(buf: &[u8], at: usize) -> Option<(usize, usize)> {
 }
 
 /// An MQTT string at `at`: its bytes and the offset just after them.
-fn read_string(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    let len = usize::from(u16::from_be_bytes([*buf.get(at)?, *buf.get(at + 1)?]));
-    let start = at + 2;
+///
+/// `None` when the two length bytes are not there or the length runs past the
+/// end of the buffer; every offset is checked, so a hostile length cannot
+/// overflow its way to a panic. Shared with [`crate::denylist`], as
+/// [`read_varint`] is.
+pub(crate) fn read_string(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
+    let high = *buf.get(at)?;
+    let low = *buf.get(at.checked_add(1)?)?;
+    let len = usize::from(u16::from_be_bytes([high, low]));
+    let start = at.checked_add(2)?;
     let end = start.checked_add(len)?;
     Some((buf.get(start..end)?, end))
 }
@@ -228,7 +239,7 @@ fn connect_flags(bytes: &[u8]) -> Option<u8> {
     let (_, after_length) = read_varint(bytes, 1)?;
     let (_, after_name) = read_string(bytes, after_length)?;
     // The protocol level sits between the name and the flags.
-    bytes.get(after_name + 1).copied()
+    bytes.get(after_name.checked_add(1)?).copied()
 }
 
 /// The packet type of `bytes`, or `None` for an empty buffer.

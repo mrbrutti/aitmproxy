@@ -20,6 +20,7 @@
 
 use std::net::IpAddr;
 
+use crate::grammars::mqtt::{read_string, read_varint};
 use crate::spec::GrammarKind;
 
 // ---------------------------------------------------------------------------
@@ -361,44 +362,24 @@ fn mqtt(rendered: &[u8]) -> Option<&'static str> {
         return Some("publish retain");
     }
 
-    let after_length = mqtt_remaining_length(rendered, 1)?;
+    // Past the 7-bit continuation-encoded remaining length is the variable
+    // header. The decoder is the `mqtt` grammar's own, so a packet this rule
+    // walks is walked exactly as the grammar walks it.
+    let (_, after_length) = read_varint(rendered, 1)?;
     match packet_type {
         // PUBLISH: the variable header starts with the topic.
         3 => {
-            let topic = mqtt_string(rendered, after_length)?.0;
+            let topic = read_string(rendered, after_length)?.0;
             (topic.first() == Some(&b'$')).then_some("publish $topic")
         }
         // CONNECT: protocol name, level, then the connect flags.
         1 => {
-            let (_, after_name) = mqtt_string(rendered, after_length)?;
-            let connect_flags = *rendered.get(after_name + 1)?;
+            let (_, after_name) = read_string(rendered, after_length)?;
+            let connect_flags = *rendered.get(after_name.checked_add(1)?)?;
             (connect_flags & 0x20 != 0).then_some("connect will-retain")
         }
         _ => None,
     }
-}
-
-/// Skip MQTT's 7-bit continuation-encoded remaining length, returning the
-/// offset of the variable header.
-fn mqtt_remaining_length(buf: &[u8], at: usize) -> Option<usize> {
-    let mut end = at;
-    for _ in 0..4 {
-        let byte = *buf.get(end)?;
-        end += 1;
-        if byte & 0x80 == 0 {
-            return Some(end);
-        }
-    }
-    None
-}
-
-/// An MQTT UTF-8 string: a big-endian u16 length and that many bytes. Returns
-/// the bytes and the offset after them.
-fn mqtt_string(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    let len = usize::from(u16::from_be_bytes([*buf.get(at)?, *buf.get(at + 1)?]));
-    let start = at + 2;
-    let end = start.checked_add(len)?;
-    Some((buf.get(start..end)?, end))
 }
 
 /// The DNS rules: the opcode nibble of header byte 2, and the first question's
@@ -572,6 +553,54 @@ mod tests {
             Some("qtype ixfr")
         );
         assert_eq!(refuses(GrammarKind::Dns, &dns_query(0x00, 1)), None);
+    }
+
+    /// The MQTT rules decode the packet with the `mqtt` grammar's own reader,
+    /// so there is one varint/string decoder in the crate rather than two.
+    /// A PUBLISH whose declared topic length runs past the end of the buffer
+    /// is refused by both without panicking, and the retain rule — which the
+    /// fixed header alone decides — still fires on a truncated packet.
+    #[test]
+    fn mqtt_rules_use_the_grammar_decoder() {
+        use crate::grammars::mqtt::{read_string, read_varint};
+
+        // 0x30 PUBLISH, remaining length 5, topic length 0xffff, three bytes.
+        let truncated: Vec<u8> = vec![0x30, 0x05, 0xff, 0xff, b'a', b'b', b'c'];
+        assert_eq!(read_varint(&truncated, 1), Some((5, 2)));
+        assert_eq!(read_string(&truncated, 2), None);
+        assert_eq!(refuses(GrammarKind::Mqtt, &truncated), None);
+        // The tree parser takes what is there and records the overrun as a
+        // broken relation rather than reading past the buffer; it renders
+        // back byte for byte, as every parse in this crate must.
+        let tree = crate::grammars::mqtt::grammar()
+            .parse(&truncated)
+            .expect("a short PUBLISH still parses, with its length marked broken");
+        assert_eq!(crate::tree::render(&tree), truncated);
+        assert!(
+            tree.get(&crate::tree::FieldPath::new("variable.publish.topic.len"))
+                .expect("the topic length is a node")
+                .relation_broken
+        );
+
+        // The same packet with the retain bit is refused on the first byte,
+        // before the topic is read at all.
+        let mut retained = truncated.clone();
+        retained[0] = 0x31;
+        assert_eq!(
+            refuses(GrammarKind::Mqtt, &retained),
+            Some("publish retain")
+        );
+
+        // A two-byte varint remaining length, and the string just after it.
+        let long: Vec<u8> = vec![0x30, 0x80, 0x01, 0x00, 0x03, b'a', b'/', b'b', b'v'];
+        assert_eq!(read_varint(&long, 1), Some((128, 3)));
+        assert_eq!(read_string(&long, 3), Some((&b"a/b"[..], 8)));
+        assert_eq!(refuses(GrammarKind::Mqtt, &long), None);
+
+        // Nothing at all, and a fixed header with no length byte.
+        assert_eq!(read_varint(&[], 0), None);
+        assert_eq!(refuses(GrammarKind::Mqtt, &[0x30]), None);
+        assert_eq!(read_string(&[0x00], 0), None);
     }
 
     /// `<first byte> <remaining length> <u16 topic len> <topic> <payload>`.
