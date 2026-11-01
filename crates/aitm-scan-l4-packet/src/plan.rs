@@ -405,9 +405,10 @@ pub fn is_decodable(frame: &[u8]) -> bool {
 /// `profile.l4.fields.clone()` once `origin/main` carries it. Until then every
 /// job fuzzes the default table, because [`crate::fields::validate_fields`]
 /// reads an empty request as the defaults.
-// Task 7 (`discover.rs`) is the first caller; the shim and its test land here
-// so the profile wiring is a one-line change at integration.
-#[allow(dead_code)]
+// Task 11 (`lane.rs`) is the first caller — it passes the result on to
+// `discover::discover_all`, which stays pure of the profile — and task 13
+// flips this body. The shim and its test live here so the profile wiring is a
+// one-line change at integration.
 pub(crate) fn requested_fields(profile: &ScanProfile) -> Vec<String> {
     let _ = profile;
     Vec::new()
