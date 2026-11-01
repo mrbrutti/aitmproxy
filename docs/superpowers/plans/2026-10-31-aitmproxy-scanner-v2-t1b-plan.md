@@ -1569,6 +1569,7 @@ Kept by the main session during stage 6. One row per finding.
 | 8 | Security | Note | Zero ceilings/budgets must not divide by zero or spin in the pacer | routed to Task 8 (in flight) 2026-11-01 |
 | 13 | Coder (gap) | Important | Plan Task 13 Files list omitted `tests/api_catalog.rs`, whose `receiver_type` panics on the new `probe` prefix; `serde_yaml` is dev-only; no error variant named for a duplicate id | plan amended 2026-11-01 (Task 13 amendments a-d); call B30 extended to the test file |
 | 1-4 | Tester | PASS | Every plan-named test present with literal values; 30 tests added (803cbdd7); `HELP_CHECK_META` omits `targets_session`/`scope` and `origin` is host-supplied | fixed in 5960c928 |
+| 13 | T3 live run (external) | Important | `check_bridge.rs` `META_KEYS` omits `remediation`, so every script declaring the optional key is refused at load | fix dispatched 2026-11-01 (multi-verdict coder): key added; a test pins `META_KEYS` == every `CheckMeta` field except `origin` |
 
 ## Shipped
 
