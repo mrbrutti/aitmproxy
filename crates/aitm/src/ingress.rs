@@ -301,7 +301,7 @@ impl CoreIngress {
         match &self.l4 {
             None => IngressOutcome::Unhandled,
             Some(l4) => {
-                if l4.admits(target, &[]) {
+                if l4.admits(target) {
                     IngressOutcome::Captured
                 } else {
                     IngressOutcome::Refused
@@ -373,8 +373,12 @@ struct L4Dispatch {
 }
 
 impl L4Dispatch {
-    /// Whether a unit to `target` carrying `bytes` may be recorded: it must pass the
-    /// self-exclusion choke point **and** the `Capture` scope check, in that order.
+    /// Whether a unit to `target` may be recorded: it must pass the self-exclusion
+    /// choke point **and** the `Capture` scope check, in that order. The decision
+    /// is the **target's alone**: the NE feeder hands datagram payloads, not
+    /// frames, so a unit's bytes are opaque here and are never decoded to decide
+    /// admission (a payload that happens to decode as some other frame neither
+    /// earns nor loses admission).
     ///
     /// The ingress is a recorder (the macOS NE feeder appends every admitted
     /// datagram to the store `l4.flow.get` serves bytes from), so, like the capture
@@ -383,17 +387,12 @@ impl L4Dispatch {
     /// before the scope check, whatever the scope says (L4PAR-AC34, spec §2.1): a
     /// unit to or from one of the core's own listener ports on a loopback address or
     /// interface — the bus port, whose first line is an operator client's plaintext
-    /// `{"token": …}` — is refused and nothing is stored. The NE feeder hands flows,
-    /// not raw frames, so the endpoints the choke point decides on are the dispatch
-    /// target's own (destination, port, protocol) under the interface the ingress
-    /// labels the unit with. `bytes` is **also** asked of
-    /// [`L4Guard::admit_frame`](aitm_proto_l4::guard::L4Guard::admit_frame) for a
-    /// backend that does hand a whole frame; the target-derived test stays
-    /// authoritative, so a payload crafted to decode as some other frame cannot
-    /// talk the ingress out of refusing. The scope check is the same `(Capture,
-    /// target)` a `pcap`-fed packet passes; its momentary permit is dropped at once
-    /// (a capture spends no injection budget).
-    fn admits(&self, target: &L4Target, bytes: &[u8]) -> bool {
+    /// `{"token": …}` — is refused and nothing is stored. The endpoints the choke
+    /// point decides on are the dispatch target's own (destination, port,
+    /// protocol) under the interface the ingress labels the unit with. The scope
+    /// check is the same `(Capture, target)` a `pcap`-fed packet passes; its
+    /// momentary permit is dropped at once (a capture spends no injection budget).
+    fn admits(&self, target: &L4Target) -> bool {
         let from_target = PacketEndpoints {
             proto: Some(target.proto),
             src: None,
@@ -402,7 +401,6 @@ impl L4Dispatch {
             dst_port: target.dst_port,
         };
         self.guard.admit_endpoints(&target.interface, &from_target)
-            && self.guard.admit_frame(&target.interface, bytes)
             && self.guard.check(L4Action::Capture, target).is_ok()
     }
 
@@ -411,7 +409,7 @@ impl L4Dispatch {
     /// ([`admits`](Self::admits)) and nothing is stored; an authorized one is appended
     /// to the capture flow.
     fn record(&self, target: &L4Target, bytes: Vec<u8>) -> IngressOutcome {
-        if !self.admits(target, &bytes) {
+        if !self.admits(target) {
             return IngressOutcome::Refused;
         }
         let flow_id = self.ensure_flow(&target.interface);
@@ -584,6 +582,56 @@ mod tests {
                 "no recorded packet carries the bus's token line"
             );
         }
+
+        // The decision is the target's alone: the NE feeder hands datagram
+        // payloads, not frames, so their bytes are opaque. A payload to 9053 that
+        // happens to decode as a TCP frame to the bus port is recorded; a unit
+        // whose target is the bus port is refused whatever its bytes decode as.
+        let looks_like_a_bus_frame = tcp_frame_to(BUS_PORT);
+        assert_eq!(
+            ingress.accept(CapturedUnit::L4 {
+                target: l4_target_to("127.0.0.1", 9053),
+                bytes: looks_like_a_bus_frame.clone(),
+            }),
+            IngressOutcome::Captured,
+            "an in-scope unit is admitted by its target; its bytes are payload, not a frame"
+        );
+        let flow = store.get(flows[0]).expect("capture flow present");
+        assert_eq!(flow.packets.len(), 2);
+        assert_eq!(flow.packets[1].bytes, looks_like_a_bus_frame);
+        assert_eq!(
+            ingress.accept(CapturedUnit::L4 {
+                target: l4_target_to("127.0.0.1", BUS_PORT),
+                bytes: tcp_frame_to(9053),
+            }),
+            IngressOutcome::Refused,
+            "a unit to the bus port is refused whatever its bytes decode as"
+        );
+        assert_eq!(store.get(flows[0]).expect("flow").packets.len(), 2);
+    }
+
+    /// A crafted loopback TCP frame `127.0.0.1:51000 → 127.0.0.1:dp`, as a
+    /// datagram payload might coincidentally decode.
+    fn tcp_frame_to(dp: u16) -> Vec<u8> {
+        use aitm_proto_l4::craft::{Ipv4Spec, Layer, TcpSpec};
+        use std::net::Ipv4Addr;
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::LOCALHOST),
+                    dst: Some(Ipv4Addr::LOCALHOST),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(51000),
+                    dst_port: Some(dp),
+                    ..TcpSpec::default()
+                }),
+                Layer::Raw(b"payload".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds")
     }
 
     /// AC17: the boundary dispatches an L4 unit through the deny-by-default `L4Guard`
