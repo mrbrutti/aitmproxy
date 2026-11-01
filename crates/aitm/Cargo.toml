@@ -33,6 +33,9 @@ aitm-plugin-maprules.workspace = true
 aitm-plugin-scanner.workspace = true
 aitm-browser.workspace = true
 aitm-ca.workspace = true
+# System proxy automation: `config_file.rs` parses the `system_proxy:` section
+# into its `SystemProxyConfig`; `wire.rs` builds its `SystemProxy` engine.
+aitm-sysproxy.workspace = true
 aitm-poc.workspace = true
 # The persistent findings store; the binary registers `FindingsPlugin` so
 # `findings.record`/`get`/`remove`/`list` reach the shipped bus.

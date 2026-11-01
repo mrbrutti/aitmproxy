@@ -50,6 +50,7 @@ dependencies = [
  "aitm-proto-l4",
  "aitm-proto-ws",
  "aitm-rules",
+ "aitm-sysproxy",
  "aitm-testtarget",
  "aitm-tui",
  "anyhow",

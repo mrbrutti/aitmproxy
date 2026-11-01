@@ -157,6 +157,8 @@ async fn run() -> anyhow::Result<()> {
         rhai: mut rhai_cfg,
         mut l4,
         macos_capture,
+        // Read by `wire.rs` from Task 10 on (the `SystemProxy` engine).
+        system_proxy: _,
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
