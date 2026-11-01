@@ -17,8 +17,10 @@
 //! [`is_secret_name`] are one-line indirections to `aitm_core::redact`, which is
 //! the single source of truth shared with the audit log, the findings store and
 //! the PoC builder. They are the only two call sites of that module in this
-//! crate, so widening the vocabulary (PR #199's `_wide` pair, task 22) is a
-//! two-line edit in this file.
+//! crate, and both read the vocabulary *wide* (`scrub_text_wide`,
+//! `is_secret_key_wide`, spec Constraints "Sequencing pins (a)"): an example
+//! shown beside a parameter name and a URL in a log line are places where a
+//! masked innocent value costs nothing and a missed credential leaks.
 
 use aitm_core::flow::HttpRequest;
 use aitm_scan_model::InsertionKind;
@@ -33,11 +35,11 @@ use crate::limits::{MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
 pub(crate) const REDACTED: &str = "<redacted>";
 
 /// Mask credential material embedded inside `text` (`password=…`, `Bearer …`,
-/// `"sid":"…"`), using the shared vocabulary.
-///
-/// Task 22 flips this to `scrub_text_wide` once PR #199 is on `origin/main`.
+/// `"sid":"…"`), using the shared vocabulary read wide: a pair whose key merely
+/// contains a short secret word (`userSession=…`, `author=…`) is masked too,
+/// with the same `[redacted]` token the standard scan emits.
 pub(crate) fn scrub(text: &str) -> String {
-    aitm_core::redact::scrub_text(text)
+    aitm_core::redact::scrub_text_wide(text)
 }
 
 /// A foreign error's text, flattened with its context chain and scrubbed, for a
@@ -53,11 +55,12 @@ pub(crate) fn scrub_error(err: &anyhow::Error) -> String {
 }
 
 /// Whether a parameter, header or cookie name reads as a secret, using the
-/// shared vocabulary.
-///
-/// Task 22 flips this to `is_secret_key_wide` once PR #199 is on `origin/main`.
+/// shared vocabulary read wide: every name `is_secret_key` accepts, plus any
+/// name that contains a short secret word as a substring (`userSession`,
+/// `X-Authority`, `sidebar`). Over-matching is the point here: the only cost
+/// is a withheld example or a `<redacted>` query value in a log line.
 pub(crate) fn is_secret_name(name: &str) -> bool {
-    aitm_core::redact::is_secret_key(name)
+    aitm_core::redact::is_secret_key_wide(name)
 }
 
 /// The `example` an `InsertionPoint` may carry for `(kind, name, value)`.
@@ -424,6 +427,39 @@ mod tests {
             safe_url("http://t/x?next=/cb?sid=abc&q=1"),
             "http://t/x?next=/cb?sid=[redacted]&q=1"
         );
+    }
+
+    /// Task 22 (spec Constraints "Sequencing pins (a)"): the lane reads the
+    /// vocabulary wide. `userSession` and `author` are wide-only names in
+    /// `aitm_core::redact` (`is_secret_key` says no, `is_secret_key_wide` says
+    /// yes), so under the narrow pair an example or a logged URL would carry
+    /// their values; under the wide pair the name rule withholds the whole value
+    /// and the scrub masks the pair nested in a kept value.
+    #[test]
+    fn wide_vocabulary_catches_names_the_narrow_pair_misses() {
+        assert_eq!(
+            example(InsertionKind::Query, "userSession", "S3SS10N9"),
+            "<redacted>"
+        );
+        assert_eq!(
+            example(InsertionKind::Header, "X-Authority", "abc"),
+            "<redacted>"
+        );
+        assert_eq!(
+            example(InsertionKind::Query, "next", "/cb?userSession=S3SS10N9"),
+            "/cb?userSession=[redacted]"
+        );
+        assert_eq!(
+            safe_url("http://t/x?userSession=abc&q=1"),
+            "http://t/x?userSession=<redacted>&q=1"
+        );
+        assert_eq!(
+            safe_url("http://t/x?next=/cb?author=bob&q=1"),
+            "http://t/x?next=/cb?author=[redacted]&q=1"
+        );
+        let err = anyhow::anyhow!("rejected document.cookie = \"userSession=S3SS10N9\"");
+        let text = scrub_error(&err);
+        assert!(!text.contains("S3SS10N9"), "{text}");
     }
 
     /// The macro invocations this lint inspects: every line that opens a
