@@ -21,6 +21,10 @@ aitm-poc.workspace = true
 # static catalog is needed here; `aitm-proto-l4` depends on `aitm-plugin` +
 # `aitm-core`, never back on this crate, so the library graph stays acyclic.
 aitm-proto-l4.workspace = true
+# Scanner v2 T4: the `ws` namespace's static catalog (`WsLanguage::for_catalog()`), for
+# `production_languages()` / `rhai.api.json`. `aitm-scan-ws` depends on `aitm-plugin`, not on this
+# crate, so there is no cycle (T4 integration task, plan call 13 as amended by the coordinator).
+aitm-scan-ws.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 # `time`: every guarded host call is wrapped in `tokio::time::timeout` for the
