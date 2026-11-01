@@ -16,7 +16,7 @@ use aitm_scan_model::{
 
 use super::{lane_token, scan_host, step, wire_token, Dir, ScanError};
 use crate::model::{scope_covers, FlowRow};
-use crate::text::{truncate, width};
+use crate::text::{cut_to, width};
 
 /// The most `scan.profile.list` rows kept at fold (spec D6, hostile-core
 /// bounds; the builder's number: a profile directory of a few dozen files
@@ -1281,12 +1281,11 @@ pub(crate) fn usable_selector(s: &str) -> bool {
     !s.is_empty() && s.len() <= SELECTOR_MAX && !s.chars().any(char::is_control)
 }
 
-/// [`truncate`] to [`VALUE_MAX`], skipping the walk when the string is
-/// within the cap in bytes.
+/// Bound a display string to [`VALUE_MAX`] cells with its control
+/// characters stripped ([`cut_to`]; fix round H, H22: the check
+/// catalogue's and the session preview's strings are cleaned too).
 fn cut(s: &mut String) {
-    if s.len() > VALUE_MAX {
-        *s = truncate(s, VALUE_MAX);
-    }
+    cut_to(s, VALUE_MAX);
 }
 
 /// A session name as the line may show it: cut at the first `=`, `;` or

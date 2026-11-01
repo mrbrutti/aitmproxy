@@ -13,7 +13,7 @@ use aitm_scan_model::{
 use super::{
     is_job_id, lane_token, severity_counts, severity_token, DETAIL_VALUE_MAX, SEVERITY_ORDER,
 };
-use crate::text::{clean, truncate};
+use crate::text::{clean, cut_to, truncate};
 
 /// Which pane of the Jobs tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,16 +336,7 @@ impl Deref for ReadStatus {
 fn bound_status(status: &mut JobStatus) -> StatusDropped {
     dedup_lanes(&mut status.lanes.requested);
     dedup_lanes(&mut status.lanes.run);
-    let cut = |s: &mut String| {
-        if s.chars().any(char::is_control) {
-            *s = clean(s);
-        }
-        // A char is never more cells than bytes, so a string within the
-        // cap in bytes needs no walk.
-        if s.len() > DETAIL_VALUE_MAX {
-            *s = truncate(s, DETAIL_VALUE_MAX);
-        }
-    };
+    let cut = |s: &mut String| cut_to(s, DETAIL_VALUE_MAX);
     status.profile_name = truncate(&clean(&status.profile_name), PROFILE_MAX);
     let dropped = StatusDropped {
         running: cap(&mut status.checks.running),

@@ -18,7 +18,7 @@ use super::{
     wire_token, Dir, ScanError, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT, SEVERITY_ORDER,
 };
 use crate::action::Action;
-use crate::text::{clean, truncate};
+use crate::text::{clean, cut_to, truncate};
 
 /// How many `Tick`s between two `scan.issues` refreshes while the Issues tab
 /// is shown and a job is live (spec D6: five seconds).
@@ -678,18 +678,7 @@ impl DetailLayout {
 /// alone; `job`, a free string on the wire, is cut like the rest (G1). The
 /// per-frame line building then runs over bounded text only.
 fn bound_issue(issue: &mut Issue) -> Dropped {
-    let cut = |s: &mut String| {
-        // Control characters go first (fix round G, G10): a tab or an
-        // escape would move the cursor or shift a column on screen.
-        if s.chars().any(char::is_control) {
-            *s = clean(s);
-        }
-        // A char is never more cells than bytes, so a string within the cap
-        // in bytes needs no walk and no new allocation.
-        if s.len() > DETAIL_VALUE_MAX {
-            *s = truncate(s, DETAIL_VALUE_MAX);
-        }
-    };
+    let cut = |s: &mut String| cut_to(s, DETAIL_VALUE_MAX);
     let loc = &mut issue.location;
     let mut fields: Vec<&mut String> = vec![
         &mut issue.description,

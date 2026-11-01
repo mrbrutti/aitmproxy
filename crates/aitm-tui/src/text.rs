@@ -37,6 +37,20 @@ pub fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// Bound a core string in place for the screen (fix round H, H22; the one
+/// fold-time cut the Scan tabs share): control characters stripped
+/// ([`clean`]) when there are any, then cut to `max` cells ([`truncate`])
+/// when it runs past `max` bytes (a char is never more cells than bytes,
+/// so a string within the cap in bytes needs no walk and no allocation).
+pub(crate) fn cut_to(s: &mut String, max: usize) {
+    if s.chars().any(char::is_control) {
+        *s = clean(s);
+    }
+    if s.len() > max {
+        *s = truncate(s, max);
+    }
+}
+
 /// Cut `s` to at most `w` cells, ending in `…` when anything was removed.
 ///
 /// Bounded in work and in output (D6 hostile-core bounds; fix round E, E1):
@@ -157,6 +171,25 @@ mod tests {
         assert_eq!(clean("a\tb\u{1b}[2Jc\nd"), "ab[2Jcd");
         assert_eq!(clean("plain"), "plain");
         assert_eq!(clean(""), "");
+    }
+
+    /// Fix round H, H22: `cut_to` strips control characters, cuts past
+    /// `max` cells with an ellipsis, and leaves a short clean string as it
+    /// is.
+    #[test]
+    fn cut_to_cleans_then_bounds() {
+        let mut s = "a\tb\u{1b}c".to_string();
+        cut_to(&mut s, 10);
+        assert_eq!(s, "abc");
+        let mut s = "x".repeat(50);
+        cut_to(&mut s, 8);
+        assert_eq!(s, "xxxxxxx…");
+        let mut s = "\t".repeat(20) + "abcdefghij";
+        cut_to(&mut s, 4);
+        assert_eq!(s, "abc…");
+        let mut s = "plain".to_string();
+        cut_to(&mut s, 5);
+        assert_eq!(s, "plain");
     }
 
     #[test]

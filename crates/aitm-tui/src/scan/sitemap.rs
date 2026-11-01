@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 use super::legacy::LegacyState;
 use super::profiles::{authority_of, authority_parts, default_port};
 use super::{wire_token, ScanError, ScanOffer};
-use crate::text::truncate;
+use crate::text::cut_to;
 
 /// How many `Tick`s between two `scan.sitemap` refreshes while the Site map
 /// is shown and a job is crawling (spec D6: forty ticks, ten seconds).
@@ -420,13 +420,11 @@ fn bound_point(point: &mut InsertionPoint) {
     }
 }
 
-/// [`truncate`] to [`SITEMAP_VALUE_MAX`], skipping the walk when the
-/// string is within the cap in bytes (a char is never more cells than
-/// bytes).
+/// Bound a node or point string to [`SITEMAP_VALUE_MAX`] cells with its
+/// control characters stripped ([`cut_to`]; fix round H, H22: the Site
+/// map's strings are cleaned too).
 fn cut(s: &mut String) {
-    if s.len() > SITEMAP_VALUE_MAX {
-        *s = truncate(s, SITEMAP_VALUE_MAX);
-    }
+    cut_to(s, SITEMAP_VALUE_MAX);
 }
 
 /// Sort `nodes` into group order (D11; fix round G, G22): every node of
