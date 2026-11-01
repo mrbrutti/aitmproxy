@@ -22,6 +22,16 @@
 //! resolver: macOS attributes an app's DNS lookup to that app *with the looked-up name
 //! attached*, so a host token would otherwise match the port-53 datagram and
 //! black-hole the lookup (observed live, 2026-10-31).
+//!
+//! **Provider rule set.** The IP tokens `l4_token` emits also select the provider's
+//! **UDP rule set**. The provider installs a TCP-only catch-all `NENetworkRule` by
+//! default, plus one `.UDP` host rule per IP token it could claim a datagram through
+//! (`ip` → any port, `ip:port` → that port). `ip:53`, `ip:5353` and `ip:853` tokens
+//! contribute no UDP rule (the provider never claims those datagrams), and host/suffix
+//! tokens never do — so the default rule set is TCP-only and UDP enters the provider
+//! **only** when the operator scopes an L4 UDP target. Accepted edge: a bare `ip`
+//! token's any-port rule also diverts that IP's port-53 datagrams, which the provider
+//! then declines. Design: `docs/superpowers/specs/2026-11-01-ne-tcp-only-catch-all-design.md`.
 
 use std::net::{IpAddr, SocketAddr};
 
