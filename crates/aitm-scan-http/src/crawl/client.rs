@@ -43,7 +43,7 @@ use aitm_scan_model::JobCtx;
 use crate::crawl::extract::{extract, FieldKind, FormSpec};
 use crate::crawl::frontier::{fingerprint, remaining, CrawlReport, Crawler, Frontier, Limits};
 use crate::crawl::values::{form_action, form_pairs_for};
-use crate::limits::{MARK_CRAWL, MAX_DOM_BYTES, MAX_HELD_CRAWL_BODY, USER_AGENT};
+use crate::limits::{job_mark, MARK_CRAWL, MAX_DOM_BYTES, MAX_HELD_CRAWL_BODY, USER_AGENT};
 use crate::url_norm::{guard_authority, origin_key, resolve, same_origin};
 use crate::{multipart, params, redact, session};
 
@@ -116,7 +116,7 @@ impl<'a> Run<'a> {
             marker: job.marker(),
             send: SendOptions {
                 record: RecordPolicy::Always,
-                marks: vec![format!("scan:{}", job.job_id()), MARK_CRAWL.to_string()],
+                marks: vec![job_mark(job.job_id()), MARK_CRAWL.to_string()],
                 version: job.profile().http.version.into(),
             },
             frontier: Frontier::new(),

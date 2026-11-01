@@ -50,7 +50,7 @@ use crate::crawl::client::ClientCrawler;
 use crate::crawl::frontier::{limits_for, Crawler};
 use crate::crawl::seeds::fetch_seeds;
 use crate::host::{HttpProbeHost, SessionMonitors};
-use crate::limits::{MARK_CRAWL, MAX_SEED_URLS};
+use crate::limits::{job_mark, MARK_CRAWL, MAX_SEED_URLS};
 use crate::points::{enumerate_v2, CompiledIgnore, EnumerateOptions};
 use crate::redact;
 use crate::sitemap::{is_authenticated, SiteMapBuilder};
@@ -205,7 +205,7 @@ async fn discover_origin(
     builder: &mut SiteMapBuilder,
     crawlers: Crawlers,
 ) {
-    let job_mark = format!("scan:{}", job.job_id());
+    let job_mark = job_mark(job.job_id());
 
     // (i) What the proxy already captured for this origin.
     let mut stored = stored_flows(job, origin, &job_mark);

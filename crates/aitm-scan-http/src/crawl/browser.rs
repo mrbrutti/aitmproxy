@@ -57,7 +57,7 @@ use crate::crawl::extract::{extract, Extracted, FieldKind, FieldSpec, FormSpec};
 use crate::crawl::frontier::{fingerprint, remaining, CrawlReport, Crawler, Frontier, Limits};
 use crate::crawl::values::{form_action, value_for};
 use crate::limits::{
-    MARK_CRAWL, MAX_CLICKABLES_LISTED, MAX_DOM_BYTES, SETTLE_MAX_MS, SETTLE_POLL_MS,
+    job_mark, MARK_CRAWL, MAX_CLICKABLES_LISTED, MAX_DOM_BYTES, SETTLE_MAX_MS, SETTLE_POLL_MS,
 };
 use crate::redact::{safe_url, scrub_error};
 use crate::session::{browser_cookie_statements, browser_partial};
@@ -372,7 +372,7 @@ impl<'a> Run<'a> {
             limits,
             frontier: Frontier::new(),
             report: CrawlReport::default(),
-            marks: vec![format!("scan:{}", job.job_id()), MARK_CRAWL.to_string()],
+            marks: vec![job_mark(job.job_id()), MARK_CRAWL.to_string()],
             guard_refused: 0,
         }
     }

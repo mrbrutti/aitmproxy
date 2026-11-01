@@ -97,6 +97,16 @@ pub(crate) const MAX_HELD_CRAWL_BODY: usize = 64 * 1024;
 /// The mark put on every request the crawler makes (spec D5, "crawl marks").
 pub(crate) const MARK_CRAWL: &str = "crawl";
 
+/// The prefix of the job mark: every flow a job produces carries
+/// `scan:<job id>` (spec D5, AC T1-9).
+pub(crate) const JOB_MARK_PREFIX: &str = "scan:";
+
+/// The job mark for `job_id`, built here and nowhere else so the lane, the two
+/// crawl engines and the probe host cannot drift on its shape.
+pub(crate) fn job_mark(job_id: &str) -> String {
+    format!("{JOB_MARK_PREFIX}{job_id}")
+}
+
 /// The `User-Agent` every request the lane makes itself carries — a crawl page
 /// fetch, a form submission, a `robots.txt` or `sitemap.xml` read.
 ///
@@ -109,7 +119,8 @@ pub(crate) const USER_AGENT: &str = "aitm-scan";
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        CANARY_EVERY, MAX_AWAIT, MAX_DOM_BYTES, MAX_FRONTIER, MAX_HELD_FLOWS, MAX_LINKS_PER_PAGE,
+        job_mark, CANARY_EVERY, JOB_MARK_PREFIX, MAX_AWAIT, MAX_DOM_BYTES, MAX_FRONTIER,
+        MAX_HELD_FLOWS, MAX_LINKS_PER_PAGE,
     };
     use std::time::Duration;
 
@@ -121,5 +132,14 @@ mod tests {
         assert_eq!(MAX_HELD_FLOWS, 16);
         assert_eq!(CANARY_EVERY, 25);
         assert_eq!(MAX_AWAIT, Duration::from_secs(30));
+    }
+
+    /// The job mark is built in one place (Q1): the literal every other crate
+    /// and every test asserts against is `scan:<job id>`.
+    #[test]
+    fn job_mark_pins() {
+        assert_eq!(JOB_MARK_PREFIX, "scan:");
+        assert_eq!(job_mark("scan-1a2b3c4d"), "scan:scan-1a2b3c4d");
+        assert_eq!(job_mark(""), "scan:");
     }
 }
