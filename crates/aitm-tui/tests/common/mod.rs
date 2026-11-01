@@ -360,6 +360,7 @@ pub fn connect(app: &mut App, tool_names: &[&str], listening: Option<&str>) -> V
             capturing: true,
             paused: 0,
             flows: 0,
+            system_proxy: None,
         })));
     }
     out

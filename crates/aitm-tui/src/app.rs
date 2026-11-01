@@ -5431,6 +5431,7 @@ mod tests {
             capturing,
             paused,
             flows: 3,
+            system_proxy: None,
         }
     }
 

@@ -563,6 +563,74 @@ impl FlowDetail {
     }
 }
 
+/// The compact `proxy.status.system_proxy` sub-object (spec §D6): what the
+/// OS-level system proxy points at, and whether this core manages it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SystemProxyWord {
+    /// `off | points_at_us | other | unsupported | needs_privilege | unknown`.
+    pub state: String,
+    /// The effective endpoint host; present only for `other`.
+    pub host: Option<String>,
+    /// The effective endpoint port; present only for `other`.
+    pub port: Option<u16>,
+    /// The state file exists and every service still reads back what we wrote.
+    pub managed_by_us: bool,
+    /// A set/unset is in flight in the core (another client's call).
+    pub setting: bool,
+    /// The platform has a mechanism (`mechanism != none`).
+    pub supported: bool,
+    /// The core's one-line description of the effective state.
+    pub detail: String,
+}
+
+impl SystemProxyWord {
+    /// Parse the sub-object. `None` when the value is absent or not an
+    /// object; a missing field inside it reads as the quiet default.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let b = |k: &str| obj.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let s = |k: &str| {
+            obj.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        Some(Self {
+            state: s("state"),
+            host: obj.get("host").and_then(Value::as_str).map(str::to_string),
+            port: obj
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|p| u16::try_from(p).ok()),
+            managed_by_us: b("managed_by_us"),
+            setting: b("setting"),
+            supported: b("supported"),
+            detail: s("detail"),
+        })
+    }
+
+    /// The §D12 pill word that follows the listening address. `in_flight`
+    /// is this TUI's own pending set/unset; the core's `setting` flag
+    /// (another client's call) renders the same word. `None` for
+    /// `unsupported`, `unknown` and anything unrecognised: those show nothing.
+    pub fn pill(&self, in_flight: bool) -> Option<String> {
+        if in_flight || self.setting {
+            return Some("· sys-proxy setting…".to_string());
+        }
+        match self.state.as_str() {
+            "points_at_us" => Some("· sys-proxy → us".to_string()),
+            "other" => {
+                let host = self.host.as_deref()?;
+                let port = self.port?;
+                Some(format!("· sys-proxy → {host}:{port}"))
+            }
+            "off" => Some("· sys-proxy off".to_string()),
+            "needs_privilege" => Some("· sys-proxy needs admin".to_string()),
+            _ => None,
+        }
+    }
+}
+
 /// `proxy.status` as the control plugin (F7) reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyStatus {
@@ -578,6 +646,8 @@ pub struct ProxyStatus {
     pub paused: u64,
     /// Visible flows in the store.
     pub flows: u64,
+    /// The system-proxy word (§D6/§D12); `None` when the core did not send it.
+    pub system_proxy: Option<SystemProxyWord>,
 }
 
 impl ProxyStatus {
@@ -593,6 +663,7 @@ impl ProxyStatus {
             capturing: b("capturing", true),
             paused: n("paused"),
             flows: n("flows"),
+            system_proxy: v.get("system_proxy").and_then(SystemProxyWord::from_json),
         }
     }
 }
@@ -1209,7 +1280,8 @@ mod tests {
                 intercept_armed: false,
                 capturing: true,
                 paused: 2,
-                flows: 15
+                flows: 15,
+                system_proxy: None,
             }
         );
         let off = ProxyStatus::from_json(&json!({"listening":false,"address":null}));
@@ -1217,6 +1289,80 @@ mod tests {
         assert_eq!(off.address, None);
         assert!(off.capturing, "an absent capture state is not 'paused'");
         assert_eq!(off.paused, 0);
+    }
+
+    /// Task 16 (plan 2026-10-31-system-proxy-automation): the compact
+    /// `proxy.status.system_proxy` sub-object (§D6) parses into
+    /// `SystemProxyWord` and renders the §D12 pill word.
+    #[test]
+    fn system_proxy_word_parses_and_renders() {
+        let other = ProxyStatus::from_json(&json!({"listening":true,"address":"127.0.0.1:8080",
+            "system_proxy":{"state":"other","host":"127.0.0.1","port":9090,"managed_by_us":false,
+                            "setting":false,"supported":true,
+                            "detail":"HTTP and HTTPS → 127.0.0.1:9090 (not this core)"}}));
+        let word = other.system_proxy.as_ref().unwrap();
+        assert_eq!(
+            *word,
+            SystemProxyWord {
+                state: "other".into(),
+                host: Some("127.0.0.1".into()),
+                port: Some(9090),
+                managed_by_us: false,
+                setting: false,
+                supported: true,
+                detail: "HTTP and HTTPS → 127.0.0.1:9090 (not this core)".into(),
+            }
+        );
+        assert_eq!(
+            word.pill(false),
+            Some("· sys-proxy → 127.0.0.1:9090".into())
+        );
+
+        let with_state = |state: &str| {
+            ProxyStatus::from_json(&json!({"listening":true,"address":"127.0.0.1:8080",
+                "system_proxy":{"state":state,"host":null,"port":null,"managed_by_us":true,
+                                "setting":false,"supported":true,"detail":"d"}}))
+            .system_proxy
+            .unwrap()
+        };
+        assert_eq!(
+            with_state("points_at_us").pill(false),
+            Some("· sys-proxy → us".into())
+        );
+        assert_eq!(
+            with_state("off").pill(false),
+            Some("· sys-proxy off".into())
+        );
+        assert_eq!(
+            with_state("needs_privilege").pill(false),
+            Some("· sys-proxy needs admin".into())
+        );
+        assert_eq!(with_state("unsupported").pill(false), None);
+        assert_eq!(with_state("unknown").pill(false), None);
+
+        // Any state with a change in flight reads "setting…".
+        for state in [
+            "other",
+            "points_at_us",
+            "off",
+            "needs_privilege",
+            "unsupported",
+            "unknown",
+        ] {
+            assert_eq!(
+                with_state(state).pill(true),
+                Some("· sys-proxy setting…".into()),
+                "state {state}"
+            );
+        }
+        assert_eq!(word.pill(true), Some("· sys-proxy setting…".into()));
+
+        // A `proxy.status` without the key, or with a non-object, has no word.
+        let bare = ProxyStatus::from_json(&json!({"listening":true,"address":"127.0.0.1:8080"}));
+        assert_eq!(bare.system_proxy, None);
+        let wrong = ProxyStatus::from_json(&json!({"listening":true,"system_proxy":"off"}));
+        assert_eq!(wrong.system_proxy, None);
+        assert_eq!(SystemProxyWord::from_json(&json!(null)), None);
     }
 
     #[test]
