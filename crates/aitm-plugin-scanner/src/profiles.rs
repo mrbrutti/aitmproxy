@@ -188,8 +188,12 @@ impl Profiles {
     /// human-readable YAML (spec D3 `scan.profile.save`).
     ///
     /// Refused with `invalid_profile` when the profile has no name, when the
-    /// name is a built-in's or is not a valid file name, when the profile does
-    /// not [`validate`], or when there is no findings directory to write to.
+    /// name is a built-in's or is not a valid file name, when the profile fails
+    /// [`validate_shape`], or when there is no findings directory to write to.
+    ///
+    /// A saved profile is a template, so it is held to the shape rules only — it
+    /// may carry no target, exactly like the built-ins; `scan.start` fills the
+    /// target in and enforces its presence then (spec D2/D3, finding 2).
     pub fn save(&self, profile: &ScanProfile) -> anyhow::Result<ProfileSaveResult> {
         let name = profile.name.as_str();
         if name.is_empty() {
@@ -206,7 +210,7 @@ impl Profiles {
                  start with a letter or digit, and be at most {MAX_PROFILE_NAME} characters"
             )));
         }
-        validate(profile).map_err(invalid)?;
+        validate_shape(profile).map_err(invalid)?;
         // The one place a saved profile's path is built is `saved_path`, so
         // `save`, `get` and `delete` can never disagree about where it lives.
         let path = self.saved_path(name).ok_or_else(|| {
@@ -357,18 +361,32 @@ pub fn normalize_origin(s: &str) -> Result<String, String> {
     Ok(origin)
 }
 
-/// Whether a profile is runnable, with a message naming the field that is not
-/// (spec D3 `invalid_profile`, call B23).
+/// The shape rules that hold for a profile whether it is saved as a template or
+/// run (spec D3 `invalid_profile`, call B23), with a message naming the field
+/// that is not valid.
+///
+/// A saved profile is a template whose `target` `scan.start` fills in, exactly
+/// as the built-ins are (spec D2). Two rules therefore do **not** live here,
+/// because a template is allowed to omit the target it will later be given:
+///
+/// - target *presence* (`target has no origins and no l4 targets`) is a
+///   start-time rule [`validate`] adds, once the `target` selector or
+///   `overrides` have filled it in;
+/// - an l4 lane that has no `target.l4` is enforced by [`crate::jobs::start`]
+///   against the lanes that will actually *run*, so an l4 lane this build does
+///   not have is skipped rather than failing the whole job (finding 1, spec
+///   D1/D3/D5).
+///
+/// The reverse — a `target.l4` that names no l4 lane — stays here: its entries
+/// would never be scanned, a contradiction at any time, and it is only ever
+/// checked when `target.l4` is non-empty.
 ///
 /// Everything here is checkable without touching the network or the scope: scope
 /// (`out_of_scope`) and lane availability (`lane_unavailable`) are separate
 /// refusals the caller makes afterwards.
-pub fn validate(p: &ScanProfile) -> Result<(), String> {
+pub fn validate_shape(p: &ScanProfile) -> Result<(), String> {
     if p.name.trim().is_empty() {
         return Err("a profile needs a `name`".to_string());
-    }
-    if p.target.origins.is_empty() && p.target.l4.is_empty() {
-        return Err("target has no origins and no l4 targets".to_string());
     }
     for origin in &p.target.origins {
         normalize_origin(origin).map_err(|e| format!("`target.origins`: {e}"))?;
@@ -380,9 +398,6 @@ pub fn validate(p: &ScanProfile) -> Result<(), String> {
         .lanes
         .iter()
         .any(|lane| matches!(lane, LaneKind::L4Packet | LaneKind::L4Stream));
-    if has_l4_lane && p.target.l4.is_empty() {
-        return Err("an l4 lane needs at least one `target.l4` entry".to_string());
-    }
     if !p.target.l4.is_empty() && !has_l4_lane {
         return Err("`target.l4` is set but `lanes` names no l4 lane".to_string());
     }
@@ -401,6 +416,21 @@ pub fn validate(p: &ScanProfile) -> Result<(), String> {
     }
     if p.budget.check_timeout_s < 1 {
         return Err("`budget.check_timeout_s` must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+/// Whether a profile is runnable: the [`validate_shape`] rules plus the
+/// start-time rule that the profile names a target (spec D3 `invalid_profile`,
+/// call B23). By the time this runs the caller has already filled a template's
+/// `target` in through the `target` selector or `overrides`.
+///
+/// `name` is checked before `target` (by `validate_shape`), so a profile missing
+/// both is refused for its name first — the historical order B23 asserts.
+pub fn validate(p: &ScanProfile) -> Result<(), String> {
+    validate_shape(p)?;
+    if p.target.origins.is_empty() && p.target.l4.is_empty() {
+        return Err("target has no origins and no l4 targets".to_string());
     }
     Ok(())
 }
@@ -616,6 +646,80 @@ mod tests {
         assert!(
             err.to_string().starts_with("scan: invalid_profile:"),
             "wire form: {err}"
+        );
+    }
+
+    /// Finding 2 (T1b fix): a saved profile is a template, exactly like a
+    /// built-in (spec D2), so `save` accepts one with no target and the target
+    /// is supplied at start time. Before the fix `save` refused a targetless
+    /// profile with `invalid_profile: target has no origins and no l4 targets`,
+    /// which broke cloning a built-in (`test_t10_harness_config.py`).
+    #[test]
+    fn a_targetless_template_can_be_saved_and_started_with_a_target() {
+        let tmp = TempFindings::new();
+        let cfg = tmp.config();
+        let profiles = Profiles::new(&cfg);
+
+        // A template carries no target (the built-ins' shape, spec D2).
+        let template = ScanProfile {
+            name: "my-template".to_string(),
+            ..ScanProfile::default()
+        };
+        assert!(
+            template.target.origins.is_empty() && template.target.l4.is_empty(),
+            "the template has no target"
+        );
+        let saved = profiles
+            .save(&template)
+            .expect("a targetless template saves");
+        assert_eq!(saved.saved, "my-template");
+
+        // Started with a target applied through `overrides` — the way a named
+        // template's target is filled (spec D3 "the target selector/overrides").
+        let resolved = profiles
+            .resolve(
+                &cfg,
+                StartArgs {
+                    profile_name: Some("my-template".to_string()),
+                    overrides: Some(serde_json::json!({
+                        "target": { "origins": ["http://127.0.0.1:8080"] }
+                    })),
+                    ..StartArgs::default()
+                },
+            )
+            .expect("the template resolves once a target is applied");
+        assert_eq!(resolved.name, "my-template");
+        assert_eq!(
+            resolved.target.origins,
+            vec!["http://127.0.0.1:8080".to_string()]
+        );
+    }
+
+    /// Finding 2 (T1b fix): the target *presence* rule is a start-time rule, so
+    /// resolving a targetless template by name with no target supplied is still
+    /// `invalid_profile`, naming the missing target (a built-in is a targetless
+    /// template, so `light-http` with no `target`/`overrides` stands in for one).
+    #[test]
+    fn start_without_any_target_is_still_invalid_profile() {
+        let cfg = ScannerConfig::default();
+        let profiles = Profiles::new(&cfg);
+
+        let err = profiles
+            .resolve(
+                &cfg,
+                StartArgs {
+                    profile_name: Some("light-http".to_string()),
+                    ..StartArgs::default()
+                },
+            )
+            .expect_err("a targetless template with no target is refused");
+        assert!(
+            err.to_string().starts_with("scan: invalid_profile:"),
+            "wire form: {err}"
+        );
+        assert!(
+            err.to_string().contains("target"),
+            "the message names the target: {err}"
         );
     }
 
@@ -1085,8 +1189,14 @@ mod tests {
         assert_eq!(profile.budget.check_timeout_s, 30);
     }
 
-    /// An L4 lane needs an L4 target and an L4 target needs an L4 lane; a profile
-    /// with neither pairing is refused before a packet is built.
+    /// An L4 target needs an L4 lane: a `target.l4` that names no l4 lane is a
+    /// contradiction `validate` refuses at any time (its entries would never be
+    /// scanned). The matching forward rule — an l4 lane that has no `target.l4`
+    /// — is **not** `validate`'s any more: availability is unknown here, so it
+    /// moved to `jobs::start`, which applies it to the lanes that will run (see
+    /// `jobs::tests::an_available_l4_lane_without_a_target_is_invalid_profile`
+    /// and `an_unavailable_l4_lane_is_skipped_not_validated`). So a template that
+    /// names an l4 lane but no target passes `validate` here (finding 1).
     #[test]
     fn l4_lane_and_target_must_agree() {
         let lane_only = ScanProfile {
@@ -1098,8 +1208,11 @@ mod tests {
             },
             ..ScanProfile::default()
         };
-        let err = validate(&lane_only).expect_err("an L4 lane with no L4 target is refused");
-        assert!(err.contains("l4"), "{err}");
+        assert_eq!(
+            validate(&lane_only),
+            Ok(()),
+            "the l4-lane-needs-a-target rule is deferred to jobs::start"
+        );
 
         let target_only = ScanProfile {
             name: "target-only".to_string(),

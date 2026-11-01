@@ -689,7 +689,10 @@ pub fn start(
     }
     catalogue.validate_selection(&profile.checks)?;
 
-    // (3) Lane availability. A profile with one available lane runs.
+    // (3) Lane availability. A profile with one available lane runs. This is
+    // resolved **before** any lane-specific validation, so a requested lane this
+    // build does not have is skipped and reported, never a reason to refuse the
+    // whole job (finding 1, spec D1/D3/D5).
     let (run, lanes) = engine.resolve_lanes(&profile.lanes);
     if run.is_empty() {
         let names = profile
@@ -701,6 +704,24 @@ pub fn start(
         return Err(scan_error(
             ScanErrorCode::LaneUnavailable,
             format!("no requested lane is available on this build: {names}"),
+        ));
+    }
+    // From here the job runs only the lanes that resolved; the skipped ones are
+    // reported in `lanes.skipped` and must not drive any downstream gate (the l4
+    // target rule below, the l4 layer gate, the l4 counters on the status).
+    profile.lanes = lanes.run.clone();
+
+    // The l4-lane/target rule, applied to the lanes that will run: an *available*
+    // l4 lane with no `target.l4` is still `invalid_profile` (the rule moved here
+    // from `profiles::validate` so an *unavailable* l4 lane is skipped instead).
+    let l4_will_run = profile
+        .lanes
+        .iter()
+        .any(|lane| matches!(lane, LaneKind::L4Packet | LaneKind::L4Stream));
+    if l4_will_run && profile.target.l4.is_empty() {
+        return Err(scan_error(
+            ScanErrorCode::InvalidProfile,
+            "an l4 lane needs at least one `target.l4` entry",
         ));
     }
     // A lane that cannot run this profile says so now, synchronously, rather
@@ -1048,6 +1069,10 @@ pub(crate) mod test_support {
         pub(crate) probes: u32,
         /// The payload each of those probes carries.
         pub(crate) payload: &'static str,
+        /// Budget units the run charges through [`ProbeHost::charge`] before
+        /// it probes, as a non-HTTP stimulus does (a WebSocket frame, an L4
+        /// case, a browser navigation).
+        pub(crate) charge: u32,
     }
 
     impl FakeRun {
@@ -1056,6 +1081,7 @@ pub(crate) mod test_support {
                 outcome: Outcome::Clean,
                 probes: 1,
                 payload: PROBE_PAYLOAD,
+                charge: 0,
             }
         }
 
@@ -1073,6 +1099,13 @@ pub(crate) mod test_support {
 
         pub(crate) fn with_payload(mut self, payload: &'static str) -> Self {
             self.payload = payload;
+            self
+        }
+
+        /// Charge `units` through [`ProbeHost::charge`], the way a lane meters
+        /// a stimulus that never goes through the job client.
+        pub(crate) fn with_charge(mut self, units: u32) -> Self {
+            self.charge = units;
             self
         }
     }
@@ -1097,6 +1130,28 @@ pub(crate) mod test_support {
         pub(crate) fn new(id: &str, class: &str, fallback: FakeRun) -> Arc<Self> {
             Arc::new(Self {
                 meta: fake_meta(id, class),
+                script: Mutex::new(VecDeque::new()),
+                fallback,
+                runs: AtomicU64::new(0),
+                block_until_cancelled: false,
+                panics: false,
+                hint: None,
+                locations: Vec::new(),
+            })
+        }
+
+        /// A check of class `class` that runs on `lane` rather than HTTP, so a
+        /// non-HTTP lane's stimuli can be metered in a test.
+        pub(crate) fn on_lane(
+            id: &str,
+            class: &str,
+            lane: LaneKind,
+            fallback: FakeRun,
+        ) -> Arc<Self> {
+            let mut meta = fake_meta(id, class);
+            meta.lanes = vec![lane];
+            Arc::new(Self {
+                meta,
                 script: Mutex::new(VecDeque::new()),
                 fallback,
                 runs: AtomicU64::new(0),
@@ -1231,6 +1286,9 @@ pub(crate) mod test_support {
                     .expect("script lock")
                     .pop_front()
                     .unwrap_or_else(|| self.fallback.clone());
+                if run.charge > 0 && !host.charge(run.charge) {
+                    return verdict(Outcome::Error, "the budget refused the stimulus");
+                }
                 for _ in 0..run.probes {
                     let payload = Payload {
                         value: run.payload.to_string(),
@@ -1405,6 +1463,11 @@ pub(crate) mod test_support {
         fn client(&self) -> Option<Arc<dyn ProxyClient>> {
             Some(self.job.client())
         }
+
+        /// The engine's host charges the job budget, so the fake does too.
+        fn charge(&self, units: u32) -> bool {
+            self.job.charge(units)
+        }
     }
 
     /// A [`Lane`] that discovers a scripted point list and ships scripted checks.
@@ -1419,6 +1482,13 @@ pub(crate) mod test_support {
         validate_error: Option<String>,
         l4_reports: Vec<L4Counters>,
         discoveries: AtomicU64,
+        /// Budget units `discover` charges through [`JobCtx::charge`], as a
+        /// browser crawl charges one unit per navigation.
+        discover_charge: u32,
+        /// Crawl captures `discover` leaves in the store, each carrying this
+        /// job's `scan:<job>` mark and the `crawl` mark, as both crawl paths
+        /// leave behind.
+        crawl_flows: u32,
     }
 
     impl FakeLane {
@@ -1437,6 +1507,30 @@ pub(crate) mod test_support {
                 validate_error: None,
                 l4_reports: Vec::new(),
                 discoveries: AtomicU64::new(0),
+                discover_charge: 0,
+                crawl_flows: 0,
+            }
+        }
+
+        /// An l4 lane crate, so a build that *has* the l4 lane can be exercised
+        /// (the default harness has none, which is "l4 unavailable on this
+        /// build"). Only its `lane()` kind matters to the start-path tests.
+        /// A WebSocket lane over one point, so a non-HTTP lane's stimuli can
+        /// be followed through `scan.status`.
+        pub(crate) fn ws() -> Self {
+            let mut point = fake_point("w1", "msg", "http://scan.test/socket");
+            point.lane = LaneKind::Ws;
+            Self {
+                kind: LaneKind::Ws,
+                points: vec![point],
+                ..Self::http()
+            }
+        }
+
+        pub(crate) fn l4_packet() -> Self {
+            Self {
+                kind: LaneKind::L4Packet,
+                ..Self::http()
             }
         }
 
@@ -1470,6 +1564,20 @@ pub(crate) mod test_support {
             self.l4_reports = reports;
             self
         }
+
+        /// Charge `units` from `discover`, as a browser crawl charges one unit
+        /// per navigation.
+        pub(crate) fn with_discover_charge(mut self, units: u32) -> Self {
+            self.discover_charge = units;
+            self
+        }
+
+        /// Leave `pages` crawl captures in the store from `discover`, marked
+        /// the way both crawl paths mark a page they fetched.
+        pub(crate) fn with_crawl_flows(mut self, pages: u32) -> Self {
+            self.crawl_flows = pages;
+            self
+        }
     }
 
     impl Lane for FakeLane {
@@ -1486,6 +1594,12 @@ pub(crate) mod test_support {
                 self.discoveries.fetch_add(1, Ordering::SeqCst);
                 for counters in &self.l4_reports {
                     job.report_l4(*counters);
+                }
+                if self.discover_charge > 0 {
+                    job.charge(self.discover_charge);
+                }
+                for page in 0..self.crawl_flows {
+                    job.store().insert(crawl_capture(job.job_id(), page));
                 }
                 if self.discover_panic {
                     panic!("{PANIC_TEXT}");
@@ -1524,6 +1638,23 @@ pub(crate) mod test_support {
                 None => Ok(()),
             }
         }
+    }
+
+    /// One crawl capture of page `page`, marked the way both crawl paths mark
+    /// a page they fetched: this job's `scan:<job>` mark and `crawl`.
+    pub(crate) fn crawl_capture(job: &str, page: u32) -> Flow {
+        let mut flow = stub_flow(HttpRequest {
+            method: "GET".to_string(),
+            scheme: "http".to_string(),
+            authority: "scan.test".to_string(),
+            path: format!("/page{page}"),
+            version: HttpVersion::Http11,
+            headers: HeaderMap::new(),
+            body: Body::Empty,
+            timestamp: SystemTime::now(),
+        });
+        flow.metadata.marks = vec![format!("scan:{job}"), "crawl".to_string()];
+        Flow::Http(flow)
     }
 
     /// A query insertion point named `name` on `url`.
@@ -1956,6 +2087,65 @@ mod tests {
             h.client.calls(),
             0,
             "the fake lane and a refused start send nothing"
+        );
+    }
+
+    /// Finding 1 (T1b fix): lane availability is resolved **before** any l4
+    /// target validation, so a profile naming an l4 lane this build does not
+    /// have — with no `target.l4` — is not refused. The l4 lane is skipped and
+    /// the http lane runs (spec D1/D3/D5). Before the fix this failed with
+    /// `scan: invalid_profile: an l4 lane needs at least one target.l4 entry`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unavailable_l4_lane_is_skipped_not_validated() {
+        // The default harness has one http lane and no l4 lane (l4 unavailable);
+        // `bind` leaves the l4 layer unbound too.
+        let h = Harness::new();
+        h.bind();
+
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::Http, LaneKind::L4Packet];
+        assert!(profile.target.l4.is_empty(), "the profile has no l4 target");
+
+        let started = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect("the unavailable l4 lane is skipped, not validated");
+        assert_eq!(started.lanes.run, vec![LaneKind::Http]);
+        assert_eq!(
+            started.lanes.skipped,
+            vec![SkippedLane {
+                lane: LaneKind::L4Packet,
+                reason: "lane not available on this build".into(),
+            }]
+        );
+        assert_eq!(
+            started.lanes.requested,
+            vec![LaneKind::Http, LaneKind::L4Packet]
+        );
+    }
+
+    /// The flip side of finding 1: when the l4 lane **is** available on this
+    /// build, a profile that names it with no `target.l4` is still
+    /// `invalid_profile` — the rule only moved from `profiles::validate` to the
+    /// lanes that will run, so the refusal is reached before the job spawns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_available_l4_lane_without_a_target_is_invalid_profile() {
+        let h = Harness::new().with_lane(FakeLane::l4_packet());
+        h.bind();
+
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::L4Packet];
+        assert!(profile.target.l4.is_empty(), "the profile has no l4 target");
+
+        let err = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect_err("an available l4 lane with no target is refused");
+        assert_eq!(code(&err), ScanErrorCode::InvalidProfile);
+        assert!(
+            err.to_string().contains("l4"),
+            "the message names the l4 target rule: {err}"
+        );
+        assert_eq!(
+            h.engine.registry.active_count(),
+            0,
+            "nothing spawned on the refusal"
         );
     }
 
