@@ -435,21 +435,26 @@ fn stored_seeds(stored: &[HttpFlow]) -> Vec<Url> {
 }
 
 /// Put the job's session into the browser profile before the browser engine
-/// walks, and warn with the cookie **names** the profile did not take.
+/// walks, warn with the cookie **names** the profile did not take, and report
+/// them to the job.
 ///
 /// A missing cookie means the crawl is about to browse unauthenticated, which an
-/// operator reading a thin site map needs to know (spec **D7**). Only names are
-/// logged; a value never reaches a line.
+/// operator reading a thin site map needs to know (spec **D7**): the report sets
+/// `JobStatus.session.browser_partial`. Only names are logged and only names are
+/// reported; a value never reaches a line or a status.
 async fn prime_browser(job: &dyn JobCtx, origin: &Url, session: Option<&SessionMaterial>) {
     let (Some(browser), Some(material)) = (job.browser(), session) else {
         return;
     };
     match prime_session(browser.as_ref(), origin, material, job).await {
-        Ok(missing) if !missing.is_empty() => tracing::warn!(
-            job = job.job_id(),
-            cookies = missing.join(","),
-            "scan: http lane: the browser profile did not take these session cookies (names only)"
-        ),
+        Ok(missing) if !missing.is_empty() => {
+            tracing::warn!(
+                job = job.job_id(),
+                cookies = missing.join(","),
+                "scan: http lane: the browser profile did not take these session cookies (names only)"
+            );
+            job.report_session_browser_partial(missing);
+        }
         Ok(_) => {}
         Err(error) => tracing::warn!(
             job = job.job_id(),
@@ -471,7 +476,7 @@ mod tests {
         ParamRef, ProfileTarget, ScanProfile, SessionMaterial, SiteNode, UseBrowser,
     };
 
-    use super::{stored_flows, Crawlers, HttpLane};
+    use super::{prime_browser, stored_flows, Crawlers, HttpLane};
     use crate::crawl::frontier::{CrawlReport, Crawler, Limits};
     use crate::limits::{job_mark, MARK_CRAWL, MAX_STORED_FLOWS};
     use crate::testutil::{
@@ -821,6 +826,50 @@ mod tests {
             browser.log_lines().contains(&"cookie-set sid".to_string()),
             "{:?}",
             browser.log_lines()
+        );
+    }
+
+    /// Task 22: the session cookies the browser profile would not take are
+    /// reported to the job by **name**, once, so the engine can set
+    /// `JobStatus.session.browser_partial` (spec D7). A profile that keeps
+    /// every cookie reports nothing at all.
+    #[tokio::test]
+    async fn a_partial_browser_priming_is_reported() {
+        let material = SessionMaterial {
+            cookies: vec![
+                ("sid".to_string(), "S3".to_string()),
+                ("hs".to_string(), "H".to_string()),
+            ],
+            headers: Vec::new(),
+        };
+        let origin = parse_absolute(ORIGIN).unwrap();
+        let page = || vec![("http://t:8080/", PageScript::new("<p>root</p>"))];
+
+        // `hs` is `HttpOnly`: `document.cookie` cannot set it.
+        let partial = Arc::new(FakeBrowser::new(page()).refusing_cookies(&["hs"]));
+        let job = FakeJob::new(profile(|_| {}), Arc::new(site(&[])))
+            .with_browser(Arc::clone(&partial))
+            .with_session(material.clone());
+
+        prime_browser(&job, &origin, Some(&material)).await;
+
+        assert_eq!(
+            job.reported_browser_partials(),
+            vec![vec!["hs".to_string()]],
+            "the names the profile did not take, reported once"
+        );
+
+        let full = Arc::new(FakeBrowser::new(page()));
+        let job = FakeJob::new(profile(|_| {}), Arc::new(site(&[])))
+            .with_browser(Arc::clone(&full))
+            .with_session(material.clone());
+
+        prime_browser(&job, &origin, Some(&material)).await;
+
+        assert!(
+            job.reported_browser_partials().is_empty(),
+            "a profile that took every cookie is not partial: {:?}",
+            job.reported_browser_partials()
         );
     }
 

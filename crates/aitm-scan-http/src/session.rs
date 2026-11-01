@@ -18,8 +18,9 @@
 //! [`SessionMonitor::lost_error`], whose message starts with
 //! [`SESSION_LOST_PREFIX`]; T1b's engine maps that to
 //! `stopped_reason: session_lost` (cross-track seam S1). The token is the
-//! contract; a `JobCtx::report_session_lost` hook is wired in task 22, once
-//! T1b lands it.
+//! contract; on top of it, the host that saw the loss reports it once through
+//! `JobCtx::report_session_lost` ([`CanaryOutcome::Lost`] carries `first` so
+//! only that one call does), which sets `JobStatus.session.lost` (spec D7).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -182,15 +183,13 @@ fn escape_cookie_value(value: &str) -> String {
 pub(crate) struct CanaryRequest {
     /// The request to replay, body already forced empty.
     pub request: HttpRequest,
-    /// `GET` or `HEAD`, never a method that could mutate state. Read only by
-    /// [`SessionMonitor::canary`], which waits on seam S1.
-    #[allow(dead_code)]
+    /// `GET` or `HEAD`, never a method that could mutate state. Read by
+    /// [`SessionMonitor::canary`], which reports the shape to the job.
     pub method: CanaryMethod,
     /// The request's path *without* the query, for the status shape: the
     /// contract names a path, and a query string can carry a value. The replay
-    /// still goes to `request.path`, query and all. Read only by
-    /// [`SessionMonitor::canary`], which waits on seam S1.
-    #[allow(dead_code)]
+    /// still goes to `request.path`, query and all. Read by
+    /// [`SessionMonitor::canary`], which reports the shape to the job.
     pub path: String,
     /// The status the replay is expected to answer with.
     pub expected_status: u16,
@@ -332,6 +331,11 @@ pub(crate) enum CanaryOutcome {
         before: u16,
         /// The status it answers with now.
         after: u16,
+        /// Whether *this* check flipped the monitor's lost flag. True for
+        /// exactly one check of a job, so the caller that sees it is the one
+        /// that reports the loss through `JobCtx::report_session_lost`
+        /// (spec D7); a later check of the same lost monitor sees `false`.
+        first: bool,
     },
 }
 
@@ -387,13 +391,21 @@ impl SessionMonitor {
         self.lost.load(Ordering::SeqCst)
     }
 
+    /// Mark this monitor lost, reporting whether *this* call flipped the flag.
+    ///
+    /// The flip is the one-shot the loss report hangs off: concurrent probes
+    /// share the monitor, and only the one that flipped it tells the job.
+    pub(crate) fn mark_lost(&self) -> bool {
+        !self.lost.swap(true, Ordering::SeqCst)
+    }
+
     /// Mark this monitor lost without running a check.
     ///
     /// Used when a lost monitor is evicted from the registry and later rebuilt
     /// for the same job: the rebuilt monitor starts lost, so probing does not
     /// resume after a `session_lost` stop (S-M5).
     pub(crate) fn force_lost(&self) {
-        self.lost.store(true, Ordering::SeqCst);
+        let _ = self.mark_lost();
     }
 
     /// Whether the job must stop: the session is lost and `on_lost` is `stop`.
@@ -403,11 +415,10 @@ impl SessionMonitor {
 
     /// The canary's wire shape (a method, a path and a status — never a value).
     ///
-    /// The lane never reads it: `Canary` is a *results* type, and nothing on
-    /// [`aitm_scan_model::JobCtx`] lets a lane hand one back, so the engine
-    /// cannot see the canary this job armed (cross-track seam S1). Kept so the
-    /// shape exists the moment that seam does.
-    #[allow(dead_code)]
+    /// Reported to the job once, when its monitor is built, through
+    /// `JobCtx::report_session_canary`; the engine mirrors it into
+    /// `JobStatus.session.canary` (spec D5). [`Canary::None`] says auth-lost
+    /// detection is off for this job.
     pub(crate) fn canary(&self) -> Canary {
         match &self.canary {
             None => Canary::None,
@@ -426,7 +437,9 @@ impl SessionMonitor {
     /// status `0`, which counts as lost only when the canary was observed
     /// answering `2xx`: a canary that was never `2xx` cannot prove a loss. The
     /// loss is logged once, at warn, naming the path through
-    /// [`redact::safe_request_url`] and the two statuses.
+    /// [`redact::safe_request_url`] and the two statuses, and the outcome's
+    /// `first` says whether this call is the one that flipped the monitor's
+    /// lost flag (so exactly one caller reports the loss to the job).
     pub(crate) async fn check(
         &self,
         client: &dyn ProxyClient,
@@ -457,7 +470,7 @@ impl SessionMonitor {
             return CanaryOutcome::Ok;
         }
 
-        self.lost.store(true, Ordering::SeqCst);
+        let first = self.mark_lost();
         if !self.logged.swap(true, Ordering::SeqCst) {
             tracing::warn!(
                 canary = %redact::safe_request_url(&canary.request),
@@ -466,7 +479,11 @@ impl SessionMonitor {
                 "scan: session lost: the canary stopped answering 2xx"
             );
         }
-        CanaryOutcome::Lost { before, after }
+        CanaryOutcome::Lost {
+            before,
+            after,
+            first,
+        }
     }
 
     /// The error every probe of a lost job returns: [`SESSION_LOST_PREFIX`]
@@ -802,7 +819,8 @@ mod tests {
                 .await,
             CanaryOutcome::Lost {
                 before: 200,
-                after: 302
+                after: 302,
+                first: true
             }
         );
         assert!(monitor.is_lost());
@@ -849,11 +867,59 @@ mod tests {
                 .await,
             CanaryOutcome::Lost {
                 before: 200,
-                after: 302
+                after: 302,
+                first: true
             }
         );
         assert!(lenient.is_lost());
         assert!(!lenient.should_stop());
+    }
+
+    /// Task 22: only the check that flips the lost flag is `first`, so only
+    /// one caller reports the loss to the job (spec D7).
+    #[tokio::test]
+    async fn only_the_first_loss_flips_the_flag() {
+        let canary = CanaryRequest {
+            request: request("GET", "http://t:8080/me", &[("cookie", "sid=S3")], None),
+            method: CanaryMethod::Get,
+            path: "/me".to_string(),
+            expected_status: 200,
+        };
+        let monitor = SessionMonitor::new(Some(canary), OnLost::Continue, 1);
+        let gone = ScriptedClient::new(|_req| Ok(response(302, &[], b"")));
+        let timeout = Duration::from_secs(5);
+
+        assert_eq!(
+            monitor.check(&gone, SendOptions::default(), timeout).await,
+            CanaryOutcome::Lost {
+                before: 200,
+                after: 302,
+                first: true
+            }
+        );
+        assert_eq!(
+            monitor.check(&gone, SendOptions::default(), timeout).await,
+            CanaryOutcome::Lost {
+                before: 200,
+                after: 302,
+                first: false
+            },
+            "the second check finds the flag already set"
+        );
+
+        // `force_lost` flips it just the same: a check after it is not first.
+        let forced = SessionMonitor::new(
+            Some(CanaryRequest {
+                request: request("GET", "http://t:8080/me", &[("cookie", "sid=S3")], None),
+                method: CanaryMethod::Get,
+                path: "/me".to_string(),
+                expected_status: 200,
+            }),
+            OnLost::Continue,
+            1,
+        );
+        assert!(forced.mark_lost(), "the first mark flips the flag");
+        assert!(!forced.mark_lost(), "a second mark does not");
     }
 
     #[tokio::test]
@@ -900,7 +966,8 @@ mod tests {
                 .await,
             CanaryOutcome::Lost {
                 before: 200,
-                after: 0
+                after: 0,
+                first: true
             }
         );
         assert!(monitor.should_stop());
@@ -913,7 +980,8 @@ mod tests {
                 .await,
             CanaryOutcome::Lost {
                 before: 200,
-                after: 401
+                after: 401,
+                first: true
             }
         );
 
@@ -948,7 +1016,8 @@ mod tests {
                 .await,
             CanaryOutcome::Lost {
                 before: 200,
-                after: 0
+                after: 0,
+                first: true
             }
         );
         assert!(

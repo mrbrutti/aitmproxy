@@ -35,7 +35,7 @@ use aitm_core::{
     HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, NavOutcome,
     ProxyClient, RecordPolicy, ScopeEntry, ScopeRateGuard, SendOptions, StdGuard, Value,
 };
-use aitm_scan_model::{JobCtx, ScanProfile, SessionMaterial};
+use aitm_scan_model::{Canary, JobCtx, ScanProfile, SessionMaterial};
 
 /// The job id every double reports, so a test can assert the `scan:<id>` mark
 /// as a literal.
@@ -416,6 +416,9 @@ pub(crate) struct FakeBrowser {
     pub log: Mutex<Vec<String>>,
     current: Mutex<String>,
     cookies: Mutex<String>,
+    /// Cookie names the profile silently refuses to keep, standing in for the
+    /// `HttpOnly` cookies `document.cookie` cannot set.
+    refused: Vec<String>,
     store: Option<Arc<dyn FlowStore>>,
 }
 
@@ -442,8 +445,16 @@ impl FakeBrowser {
             log: Mutex::new(Vec::new()),
             current: Mutex::new(String::new()),
             cookies: Mutex::new(String::new()),
+            refused: Vec::new(),
             store: None,
         }
+    }
+
+    /// The same browser whose profile silently drops `names`, as it would an
+    /// `HttpOnly` cookie assigned through `document.cookie`.
+    pub(crate) fn refusing_cookies(mut self, names: &[&str]) -> Self {
+        self.refused = names.iter().map(|name| (*name).to_string()).collect();
+        self
     }
 
     /// Insert each reached page's `captures` into `store`, standing in for the
@@ -499,6 +510,9 @@ impl FakeBrowser {
         let Some((name, _)) = pair.split_once('=') else {
             return;
         };
+        if self.refused.iter().any(|refused| refused == name) {
+            return;
+        }
         let mut jar = self.cookies.lock().unwrap();
         let mut kept: Vec<String> = jar
             .split(';')
@@ -785,6 +799,14 @@ pub(crate) struct FakeJob {
     pub charges: AtomicU32,
     pub cancelled: AtomicBool,
     pub deadline: Instant,
+    /// Every canary reported through `JobCtx::report_session_canary`, in order
+    /// (the engine mirrors them into `JobStatus.session.canary`).
+    pub session_canaries: Mutex<Vec<Canary>>,
+    /// How many times `JobCtx::report_session_lost` was called.
+    pub session_lost: AtomicU32,
+    /// Every `JobCtx::report_session_browser_partial` call's cookie **names**,
+    /// in order; a value never reaches this double.
+    pub browser_partials: Mutex<Vec<Vec<String>>>,
 }
 
 impl FakeJob {
@@ -809,6 +831,9 @@ impl FakeJob {
             charges: AtomicU32::new(0),
             cancelled: AtomicBool::new(false),
             deadline: Instant::now() + Duration::from_secs(60),
+            session_canaries: Mutex::new(Vec::new()),
+            session_lost: AtomicU32::new(0),
+            browser_partials: Mutex::new(Vec::new()),
         }
     }
 
@@ -839,6 +864,21 @@ impl FakeJob {
     /// The same job already cancelled.
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// The canaries reported so far, in order.
+    pub(crate) fn reported_canaries(&self) -> Vec<Canary> {
+        self.session_canaries.lock().unwrap().clone()
+    }
+
+    /// How many session-lost reports the lane made.
+    pub(crate) fn session_lost_reports(&self) -> u32 {
+        self.session_lost.load(Ordering::SeqCst)
+    }
+
+    /// The cookie-name lists reported as browser-partial, in order.
+    pub(crate) fn reported_browser_partials(&self) -> Vec<Vec<String>> {
+        self.browser_partials.lock().unwrap().clone()
     }
 }
 
@@ -900,6 +940,18 @@ impl JobCtx for FakeJob {
 
     fn marker(&self) -> String {
         MARKER.to_string()
+    }
+
+    fn report_session_lost(&self) {
+        self.session_lost.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn report_session_canary(&self, canary: Canary) {
+        self.session_canaries.lock().unwrap().push(canary);
+    }
+
+    fn report_session_browser_partial(&self, cookie_names: Vec<String>) {
+        self.browser_partials.lock().unwrap().push(cookie_names);
     }
 }
 

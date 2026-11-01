@@ -44,7 +44,9 @@
 //! [`CANARY_EVERY`] sends; once it reports a loss under `OnLost::Stop`, every
 //! later `baseline`/`probe`/`probe_raw` of every host of that job returns an
 //! error starting with [`session::SESSION_LOST_PREFIX`] and sends nothing
-//! (cross-track seam S1, AC T2-5).
+//! (cross-track seam S1, AC T2-5). The check that flips the monitor's lost
+//! flag also reports the loss to the job once, and building a job's monitor
+//! reports the canary it armed, so `JobStatus.session` shows both (spec D5).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -175,8 +177,17 @@ impl HttpProbeHost {
                 .monitor
                 .check(client.as_ref(), self.send_options(), self.bound())
                 .await;
-            if matches!(outcome, CanaryOutcome::Lost { .. }) && self.monitor.should_stop() {
-                return Err(self.monitor.lost_error(what));
+            if let CanaryOutcome::Lost { first, .. } = outcome {
+                // The monitor is shared by every host of the job, so the one
+                // check that flipped its lost flag is the one that tells the
+                // job: `JobStatus.session.lost` is set once, not once per
+                // probe (spec D7).
+                if first {
+                    self.job.report_session_lost();
+                }
+                if self.monitor.should_stop() {
+                    return Err(self.monitor.lost_error(what));
+                }
             }
         }
 
@@ -553,6 +564,12 @@ impl SessionMonitors {
             monitor.force_lost();
         }
         table.insert(key, Arc::clone(&monitor));
+        // The build is the one moment the canary is decided, so the job hears
+        // it once — a later host of the same job finds the monitor above and
+        // reports nothing (spec D5). Reported with the table lock dropped: the
+        // job's own lock is not this registry's business.
+        drop(table);
+        job.report_session_canary(monitor.canary());
         monitor
     }
 
@@ -578,9 +595,9 @@ mod tests {
         Flow, FlowStore, HttpRequest, MemFlowStore, ProxyClient, RecordPolicy, ScopeRateGuard,
     };
     use aitm_scan_model::{
-        CanaryMethod, FlowRef, InsertionKind, InsertionPoint, JobCtx, LaneKind, OnLost, Payload,
-        PayloadMode, ProbeHost, RawProbe, RecordProbes, ScanProfile, SessionMaterial, SessionMode,
-        MAX_MATCH_BODY,
+        Canary, CanaryMethod, FlowRef, InsertionKind, InsertionPoint, JobCtx, LaneKind, OnLost,
+        Payload, PayloadMode, ProbeHost, RawProbe, RecordProbes, ScanProfile, SessionMaterial,
+        SessionMode, MAX_MATCH_BODY,
     };
 
     use crate::host::{HttpProbeHost, SessionMonitors};
@@ -1080,6 +1097,100 @@ mod tests {
             inner: job,
             id: id.to_string(),
         }
+    }
+
+    /// Task 22: the canary the lane armed is reported to the job once, when
+    /// that job's monitor is **built**, so the engine can mirror it into
+    /// `JobStatus.session.canary` (spec D5). A second host of the same job
+    /// looks the monitor up and reports nothing.
+    #[test]
+    fn a_built_monitor_reports_its_canary_once() {
+        let fx = fixture(ok_200());
+        fx.store.insert(Flow::Http(captured_flow(
+            request(
+                "GET",
+                "http://t:8080/account",
+                &[("cookie", "sid=S3")],
+                None,
+            ),
+            200,
+            &[],
+            b"account",
+        )));
+
+        let monitors = SessionMonitors::new();
+        let first_origin = url::Url::parse("http://t:8080/").unwrap();
+        let second_origin = url::Url::parse("http://t:8080/other").unwrap();
+
+        let first = monitors.for_job(&*fx.job, &first_origin);
+        let second = monitors.for_job(&*fx.job, &second_origin);
+        assert!(Arc::ptr_eq(&first, &second), "one monitor per job");
+
+        assert_eq!(
+            fx.job.reported_canaries(),
+            vec![Canary::Flow {
+                method: CanaryMethod::Get,
+                path: "/account".to_string(),
+                expected_status: Some(200),
+            }],
+            "the picked canary is reported exactly once, on the build"
+        );
+    }
+
+    /// Task 22: a job with `session.mode: none` arms no canary, and reports
+    /// that — `Canary::None`, once — rather than nothing at all.
+    #[test]
+    fn an_unarmed_monitor_reports_canary_none_once() {
+        let mut profile = ScanProfile::default();
+        profile.session.mode = SessionMode::None;
+        let fx = fixture_full(profile, ok_200(), 60);
+
+        let monitors = SessionMonitors::new();
+        let origin = url::Url::parse("http://t:8080/").unwrap();
+        monitors.for_job(&*fx.job, &origin);
+        monitors.for_job(&*fx.job, &origin);
+
+        assert_eq!(fx.job.reported_canaries(), vec![Canary::None]);
+    }
+
+    /// Task 22: the first probe that sees the canary lose the session reports
+    /// it once; no later probe reports it again, under either `on_lost`
+    /// (spec D7).
+    #[tokio::test]
+    async fn a_lost_session_is_reported_once_per_job() {
+        let fx = fixture(canary_lost_client());
+        let host =
+            HttpProbeHost::new(&fx.point, fx.ctx(), canary_monitor(2, OnLost::Stop)).unwrap();
+
+        host.probe(&replace("one")).await.unwrap();
+        assert_eq!(fx.job.session_lost_reports(), 0, "no loss yet");
+
+        host.probe(&replace("two"))
+            .await
+            .expect_err("the second probe runs the canary and finds the session lost");
+        assert_eq!(fx.job.session_lost_reports(), 1);
+
+        host.probe(&replace("three"))
+            .await
+            .expect_err("a stopped job refuses every later probe");
+        assert_eq!(
+            fx.job.session_lost_reports(),
+            1,
+            "a refused probe is not a second loss"
+        );
+
+        // `continue`: probing goes on, the second check loses again, and the
+        // job still hears about the loss exactly once.
+        let fx = fixture(canary_lost_client());
+        let host =
+            HttpProbeHost::new(&fx.point, fx.ctx(), canary_monitor(2, OnLost::Continue)).unwrap();
+        for index in 0..4 {
+            host.probe(&replace(&format!("p{index}")))
+                .await
+                .unwrap_or_else(|e| panic!("probe {index} must still run: {e:#}"));
+        }
+        assert_eq!(fx.sent().len(), 6, "four probes and two canary checks");
+        assert_eq!(fx.job.session_lost_reports(), 1);
     }
 
     #[test]
