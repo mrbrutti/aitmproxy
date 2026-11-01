@@ -10,21 +10,31 @@ that holds a flow.subscribe subscription and counts notifications/aitm/job lines
 seeded test target itself. This cell is the only acceptance evidence for the TUI Scan
 surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
 
-  T7-16 (UI-1) :scan, 1, cursor to `standard`, Enter, o <origin>, Enter, the crawl
-        `browser` field set to `never` with e (H42, every HTTP launch below too), s -> a
-        Jobs row with the id scan.list reports; three or more screen samples whose
-        on-screen `sent/budget` is non-decreasing and inside a scan.status bracket taken
-        around the sample; the state/phase cell changes at least once; x yields
-        `cancelled` on screen and in scan.status (on a fresh job cancelled in its first
-        second when the sampled one finished before x, H37); the second client saw a
-        `progress` and a `cancelled` line for the cancelled job.
-  T7-17 (UI-2) a second `standard` job: while scan.status still says `running`, the Issues
-        tab shows a reflected-xss issue (else one carrying a payload and a probe flow)
-        under its severity header, the detail shows the evidence payload scan.issue
-        reports, Tab + Enter opens the first probe flow in the inspector (Request and
-        Response panes, the flow's method and path, the Scan strip gone), f ->
-        false_positive, u -> open (screen AND scan.issue), P opens Findings on the PoC
-        or records the toast.
+  The steps run T7-17, T7-16, T7-18, T7-19 (H65): the engine dedupes issues across jobs
+  by class and location, and the FIRST job that finds an issue owns it (`issue.job`); a
+  later job that re-finds it emits an `issue` push line, but `scan.issues {job}` and
+  `scan.status.issues` for that later job show nothing (T1b, 2026-11-01; `Issue.jobs`
+  membership lands on a later head). So T7-17's job is the fresh core's first finder,
+  and T7-16's sampled and cancelled jobs follow it, their issue counts irrelevant.
+
+  T7-17 (UI-2) :scan, 1, cursor to `standard`, Enter, o <origin>, Enter, the crawl
+        `browser` field set to `never` and the `speed` field to `thorough` with e (H42,
+        H62/H65; the Fields walk every HTTP launch below repeats), s: while scan.status
+        still says `running`, the Issues tab (J pinned to this job) shows a reflected-xss
+        issue (else one carrying a payload and a probe flow) under its severity header,
+        the detail shows the evidence payload scan.issue reports, Tab + Enter opens the
+        first probe flow in the inspector (Request and Response panes, the flow's method
+        and path, the Scan strip gone), f -> false_positive, u -> open (screen AND
+        scan.issue), P opens Findings on the PoC or records the toast.
+  T7-16 (UI-1) the held `standard` editor re-entered (never assumed fresh), `browser
+        never` and `speed thorough` asserted on their Fields lines, s -> a Jobs row with
+        the id scan.list reports, sampled as soon as it is on screen at 1.0 s spacing
+        (H62): three or more screen samples whose on-screen `sent/budget` is
+        non-decreasing and inside a scan.status bracket taken around the sample; the
+        state/phase cell changes at least once; x right after the third sample yields
+        `cancelled` on screen and in scan.status (on a fresh `thorough` job cancelled in
+        its first second when the sampled one finished before x, H37); the second client
+        saw a `progress` and a `cancelled` line for the cancelled job.
   T7-18 (UI-3) `l4-stream-safe` + t 127.0.0.1:<port>/tcp: the D7 gate text is on screen and
         s starts nothing (scan.list unchanged for 3 s); after the harness adds an inject
         L4 scope entry (removed again at the end of the run), s shows the confirm overlay
@@ -36,10 +46,12 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
   T7-19 (UI-5) a `map-only` job that reached `done`: every host, `METHOD path_template` and
         point name of the harness's live scan.sitemap read is in the rendered text (never
         a fixture); Enter on the node under the cursor opens its first flow in the
-        inspector. The wait after `3`/`J` ends on the job's `{n} nodes` head, or on a
-        strip banner that CHANGED to an error wording since the snapshot taken before
-        the keys (a wording already on the strip is stale, H54); a head that never draws
-        is reported with the banner, the Jobs cursor's job and the harness's own node
+        inspector. The wait after `3`/`J` is head-first (H63): the job's `{n} nodes` head
+        alone ends it, for the whole SITEMAP_HEAD_S (an engine refusing the tab-entry
+        `scan.sitemap {}` request changes the strip banner a moment before `J`'s head
+        lands); a head that never draws is reported with the banner, read as an error
+        only when it CHANGED since the snapshot taken before the keys (a wording already
+        on the strip is stale, H54), the Jobs cursor's job and the harness's own node
         counts (H39).
   T7-20 hygiene: the seeded Cookie value (and its first 12 hex chars) never appears in
         any screen sample taken on the Scan surface (every sample is kept, tagged with
@@ -74,12 +86,13 @@ Exit 0 PASS / 1 FAIL / 77 SKIP.
 `python3 -I tests/e2e/tui/test_tui_scan_live.py --selftest` runs the screen readers
 (cursor row, severity group, editor header, surface tag, inspector, Findings head, the
 Site map node and marker, the wire-confirm overlay, the crawl `browser` line, the strip
-banner, the Site map settle rule (H54), the prompt bar and the Fields `origins`/`l4`
-lines), the failure-screen writer, the L4 scope read and add arguments (H59), the prompt
-and `browser` key helpers against a scripted terminal (H49, H44) and the push-counting
-thread against a scripted bus client with the harness's per-line read (H46, H57), against
-frames painted with the TUI's real geometry (the boxed Scan view, its pane rule, a
-sidebar offset), with no core and no pty, one line per assertion; exit 0 when all hold.
+banner, the Site map settle rule (H54) and head-first wait (H63), the prompt bar and the
+Fields `origins`/`l4`/`speed` lines), the failure-screen writer, the L4 scope read and
+add arguments (H59), the prompt, `browser` and `speed` key helpers against a scripted
+terminal (H49, H44, H62) and the push-counting thread against a scripted bus client with
+the harness's blocking per-line read (H46, H57, H64), against frames painted with the
+TUI's real geometry (the boxed Scan view, its pane rule, a sidebar offset), with no core
+and no pty, one line per assertion; exit 0 when all hold.
 """
 from __future__ import annotations
 
@@ -93,6 +106,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -122,12 +136,17 @@ CONNECT_TIMEOUT = 60.0
 UI_SETTLE = 0.35
 JOB_APPEAR_S = 30.0
 ROW_APPEAR_S = 20.0
-SAMPLE_GAP_S = 1.5
+# Between two T7-16 samples: the `standard` job finishes its 182 probes in about a second
+# with the client crawl (the fourth live run), so the sampled job runs `thorough` and is
+# sampled at this spacing, the first sample as soon as its row is on screen (H62).
+SAMPLE_GAP_S = 1.0
 SAMPLES_MIN, SAMPLES_MAX = 3, 6
 CATCHUP_S = 8.0
 CANCEL_S = 25.0
 ISSUE_WAIT_S = 150.0
 MAP_WAIT_S = 150.0
+# The whole wait for the pinned job's `{n} nodes` head after `3`/`J` (H63).
+SITEMAP_HEAD_S = 15.0
 QUIET_WINDOW_S = 3.0
 L4_SCOPE_S = 5.0
 GATE_CLEAR_S = 25.0
@@ -218,6 +237,15 @@ EDITOR_FIELDS = ("name", "origins", "l4_targets", "lane_http", "lane_ws", "lane_
 # editor sets `never` first and asserts the line (H42).
 BROWSER_FIELD_RE = re.compile(r"· browser (auto|always|never) ·")
 BROWSER_RING = ("auto", "always", "never")
+# The `intensity` Fields line (`field_lines`: `<intensity>   speed <v>   accuracy <v>`); `e`
+# on the `speed` field cycles the ring fast, normal, thorough (`crates/aitm-scan-model/src/
+# vocab.rs` `Speed`, `scan/profiles.rs` `SPEEDS`). With the client crawl a `standard` job
+# finishes its 182 probes in about a second (the fourth live run), too fast for T7-16's
+# three samples and its `x`, so the sampled job and the fresh cancel job run `thorough`
+# (H62), and so does T7-17's first-finder job (H65). The Profiles list header's bare
+# `speed` is followed by a pad or the pane rule, never a ring word, so it never reads.
+SPEED_FIELD_RE = re.compile(r"\bspeed (fast|normal|thorough)\b")
+SPEED_RING = ("fast", "normal", "thorough")
 # The Scan prompts' bar (`ui/bars.rs` `prompt`): while `Mode::Prompt` is up the status
 # row (the screen's last) reads ` <label> <typed>` with the label one of `origin:` (o),
 # `l4 target:` (t), `profile name:` (w) or `value:` (e on a text or number field).
@@ -555,18 +583,30 @@ class Checks:
 
 JOB_PUSH = "notifications/aitm/job"
 PUSH_SAMPLES = 3
-# One socket read of the push thread: `BusClient.wait_notification(JOB_PUSH, timeout)`,
+# One socket read of the push thread: `BusClient.wait_notification(JOB_PUSH, PUSH_READ_S)`,
 # the per-line read T1b's `tests/e2e/scan/test_t1_push.py` receives the job lines with
-# (`aitm_e2e/scan.py` `collect_push`, whose timeout is the remaining deadline; here a
-# short one so `stop()` is noticed). The third live run's thread read with
-# `drain_notifications(0.5)`, which returns only after 0.5 s of silence on the socket:
-# the TUI's polling fans a `notifications/aitm/agent` audit line out to the subscriber
-# every ~150 ms (2342 lines in that run), so the drain never returned while the TUI
-# lived, the T7-16 check read zero lines, and all 2518 lines landed in one batch after
-# `q` (H57).
-PUSH_READ_S = 1.0
-PUSH_READ = (f"BusClient.wait_notification({JOB_PUSH!r}, {PUSH_READ_S} s) per line, the client's "
-             "stash folded around each read (T1b collect_push)")
+# (`aitm_e2e/scan.py` `collect_push`, which passes the REMAINING budget as the timeout,
+# so it never times out mid-read). The harness's `_read_line` is `_rfile.readline()` on
+# a buffered file over the socket, and after ONE read timeout that reader is broken:
+# `OSError: cannot read from timed out object` at once on every later read, which
+# `wait_notification` swallows into an instant None. The fourth live run's thread read
+# with a 1.0 s timeout and spun 32 million instant `None`s, seeing no job line. So the
+# read blocks for the cell's own budget, the thread never reads again after a None (a
+# timeout, or that swallowed error), and `stop()` wakes the blocked read by shutting the
+# client's socket down (`shutdown(SHUT_RDWR)`: the readline returns "" and `_read_line`
+# raises `BusError`) before joining the thread. `close()` alone would not: the buffered
+# reader's lock is held through the read, so `_rfile.close()` waits for it, and
+# `socket.close()` under an open `makefile` does not close the fd (H64). The third live
+# run's thread read with `drain_notifications(0.5)`, which returns only after 0.5 s of
+# silence on the socket: the TUI's polling fans a `notifications/aitm/agent` audit line
+# out to the subscriber every ~150 ms (2342 lines in that run), so the drain never
+# returned while the TUI lived and all 2518 lines landed in one batch after `q` (H57).
+PUSH_READ_S = 600.0
+# A None back sooner than this never waited on the socket: the broken reader (H64).
+PUSH_WAITED_S = 0.5
+PUSH_READ = (f"BusClient.wait_notification({JOB_PUSH!r}, {PUSH_READ_S:.0f} s) per line, blocking, the "
+             "client's stash folded around each read (T1b collect_push); never read again after a "
+             "None; stop() shuts the socket down under the read")
 
 
 class Pushes:
@@ -575,22 +615,28 @@ class Pushes:
     engine fans `{job, kind, event, seq, status, issue?}` out to every connection
     holding any flow.subscribe, no replay). It subscribes as T1b's cell does (one
     `flow.subscribe {}` on a second operator `BusClient`) and reads as T1b's
-    `collect_push` does: one `wait_notification(JOB_PUSH, ..)` per job line, the lines
-    it stashes meanwhile (replies, flow and agent lines) folded from the client's
-    stash around each read, never a drain that waits for a quiet socket (H57; `read`
-    in the snapshot names the mechanism, `idle_reads` counts the reads that returned
-    nothing). The TUI's own connection is no observer: it polls and holds no
-    subscription, so it sees no push. Its own state is visible (H46): every line
-    counted by method, the first PUSH_SAMPLES raw job params kept, the flow.subscribe
-    reply, the lines the client could not parse and the messages the fold rejected
-    (each counted and read past, never fatal), and why the thread stopped: `stop()`,
-    or `<Type>: <text>` when an exception ended `_run` (the socket closed by the core
-    is a `BusError`). The first live run recorded `{}` with none of this, so an empty
-    count could not be told from a dead thread."""
+    `collect_push` does: one `wait_notification(JOB_PUSH, read_s)` per job line, the
+    read BLOCKING for the cell's budget (PUSH_READ_S; the harness's reader is broken
+    after one timeout, H64), the lines it stashes meanwhile (replies, flow and agent
+    lines) folded from the client's stash around each read and once more when the
+    thread ends, never a drain that waits for a quiet socket (H57; `read` in the
+    snapshot names the mechanism, `idle_reads` counts a read that waited and returned
+    nothing). A read that returns None is the last: `stopped_by` says whether it timed
+    out or ended at once (the broken reader, a swallowed socket error). The TUI's own
+    connection is no observer: it polls and holds no subscription, so it sees no push.
+    Its own state is visible (H46): every line counted by method, the first
+    PUSH_SAMPLES raw job params kept, the flow.subscribe reply, the lines the client
+    could not parse and the messages the fold rejected (each counted and read past,
+    never fatal), and why the thread stopped: `stop()` (which shuts the socket down
+    under the blocked read), the None, or `<Type>: <text>` when an exception ended
+    `_run` (the socket closed by the core is a `BusError`). The first live run
+    recorded `{}` with none of this, so an empty count could not be told from a dead
+    thread."""
 
-    def __init__(self, client, subscribe_reply=None):
+    def __init__(self, client, subscribe_reply=None, read_s=PUSH_READ_S):
         self.client = client
         self.subscribe_reply = subscribe_reply
+        self.read_s = read_s
         self.counts = {}  # job -> event -> n
         self.by_method = {}  # method (or `<reply>`) -> lines
         self.lines = 0
@@ -611,23 +657,45 @@ class Pushes:
                 # The stash first: `wait_notification` answers a stashed job line without
                 # removing it, so the stash must hold no job line when it is called.
                 self._fold_stash()
+                started = time.monotonic()
                 try:
-                    m = self.client.wait_notification(JOB_PUSH, timeout=PUSH_READ_S)
+                    m = self.client.wait_notification(JOB_PUSH, timeout=self.read_s)
                 except (ValueError, AttributeError) as e:
                     # One line `_recv` could not parse, or parsed to no object: the socket
                     # is intact and the line consumed; read on.
                     self._error("bad_lines", e)
                     continue
                 if m is None:
-                    with self._lock:
-                        self.idle_reads += 1
-                else:
-                    self._fold_one(m)
+                    self._none(time.monotonic() - started)
+                    return
+                self._fold_one(m)
                 self._fold_stash()
         except Exception as e:  # noqa: BLE001  the socket died or the client is gone
-            self._end(f"{type(e).__name__}: {e}")
+            # `stop()` shuts the socket down under the read: that `BusError` is the stop.
+            self._end("stop()" if self._stop.is_set() else f"{type(e).__name__}: {e}")
             return
+        finally:
+            # Whatever the client read past while blocking (agent and flow lines) counts.
+            self._fold_stash()
         self._end("stop()")
+
+    def _none(self, waited):
+        """A read that returned None ends the thread; it never reads again (H64). After
+        `stop()` it is the shut-down socket; one that waited counts as the idle read
+        and, at the whole timeout, is the timeout; one back at once is the harness's
+        reader broken by an earlier timeout, or a socket error it swallowed."""
+        if self._stop.is_set():
+            self._end("stop()")
+            return
+        if waited >= PUSH_WAITED_S:
+            with self._lock:
+                self.idle_reads += 1
+        if waited >= self.read_s * 0.9:
+            self._end(f"read timeout: no job line in {waited:.1f} s; the thread never reads again "
+                      "after a None (H64)")
+        else:
+            self._end(f"read ended with None after {waited:.3f} s (the harness reader swallowed a socket "
+                      "error, or is broken by an earlier timeout); the thread never reads again (H64)")
 
     def _fold_stash(self):
         """Fold and empty the client's stash (what `wait_notification` read past)."""
@@ -701,7 +769,18 @@ class Pushes:
                 f"{JOB_PUSH} params {s['first_job_params']}")
 
     def stop(self):
+        """End the thread: the stop flagged, then the client's socket (the harness's
+        `_sock`, the one its `close()` would close) shut down so the blocked read
+        returns at once with a `BusError`, then the join. The client itself is closed
+        by the run's cleanup once the thread is gone (its `close()` would otherwise
+        wait for the read, see PUSH_READ_S; H64)."""
         self._stop.set()
+        sock = getattr(self.client, "_sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         self._thread.join(timeout=3)
 
 
@@ -946,6 +1025,13 @@ def browser_value(text):
     return m.group(1) if m else None
 
 
+def speed_value(text):
+    """The held editor's `speed` value as its `intensity` Fields line reads it (`fast`,
+    `normal`, `thorough`), or None without an editor on screen (H62)."""
+    m = SPEED_FIELD_RE.search(text)
+    return m.group(1) if m else None
+
+
 def prompt_open(text):
     """The label of the Scan prompt the status row carries (`origin:`, `l4 target:`,
     `profile name:`, `value:`), or None when no Scan prompt is up (H49, H44). The bar
@@ -987,19 +1073,31 @@ def banner_is_error(banner):
 
 
 def sitemap_settled(text, marker, banner_before):
-    """How the Site map tab has settled after `3`/`J`, or None while it has not (H54):
-    `head` when the job's `{n} nodes` marker is on the screen; `error` when the strip
-    banner is an error wording (`banner_is_error`) AND differs from `banner_before`,
-    the banner snapshotted before the keys. A wording that was already on the strip is
-    stale (the third live run: the T7-18 L4 launch's `lane_unavailable` text, shown on
-    every tab by the `last_error` fallback the Rust item H56 removes) and settles
-    nothing; a quiet banner settles nothing either."""
+    """How the Site map tab reads after `3`/`J` and the head wait (H54, H63): `head` when
+    the job's `{n} nodes` marker is on the screen; `error` when the strip banner is an
+    error wording (`banner_is_error`) AND differs from `banner_before`, the banner
+    snapshotted before the keys; None otherwise. A wording that was already on the
+    strip is stale (the third live run: the T7-18 L4 launch's `lane_unavailable` text,
+    shown on every tab by the `last_error` fallback the Rust item H56 removed) and reads
+    as nothing; so does a quiet banner. The wait itself is `wait_sitemap_head`; this
+    names the outcome in the failure detail once the head never came."""
     if marker in text:
         return "head"
     now = banner_of(text)
     if now != banner_before and banner_is_error(now):
         return "error"
     return None
+
+
+def wait_sitemap_head(term, marker, timeout):
+    """Poll the Site map tab for the pinned job's `{n} nodes` head for the whole
+    `timeout`; True once it is on screen (H63). The head alone ends the wait, never the
+    strip banner: an engine that refuses the tab-entry `scan.sitemap {}` request (the
+    fourth live run: `give either job or target`) changes the banner a moment before
+    `J`'s own request lands its head, so a wait that also settled on a changed error
+    banner raced the head and lost. The banner is read only after the head never came
+    (`sitemap_settled`, in the failure detail)."""
+    return poll(lambda: marker in term.text(), timeout)
 
 
 def sitemap_node_count(bus, args):
@@ -1157,22 +1255,22 @@ def type_l4_target(ctx, spec, timeout=10):
                          lambda t: spec.split("/")[0] in (field_line(t, "l4") or ""), timeout)
 
 
-def set_browser_never(ctx, step, what="the editor"):
-    """The held editor's crawl `use_browser` set to `never` with `e` (H42), recorded as
-    the check `<step>: <what>'s crawl `browser` field reads `never` before the launch
-    (H42)`; the answer is whether it passed. The Fields pane is focused by construction,
-    not read (focus is a style): one `Esc` to the List pane (`focus_profiles_list`,
-    draft kept; nothing while a prompt is up, H49), then one Tab (`step_pane`: List,
-    Fields, Origins, Checks); `g` puts the field cursor on the first field and `j`
-    walks it to `use_browser` (EDITOR_FIELDS, counted, since the cursor is a
-    highlight); then `e` round the ring until the crawl line reads `browser never`,
-    each press checked to have moved the value. An `e` that opens a prompt instead
-    (`value:`: the cursor was on a text or number field, not `use_browser`) is
-    answered by one Esc and no more keys; the check fails naming the prompt and the
-    prompt screen is kept as `screen-<step>-stray-prompt.txt` (H44; the second live run
-    typed `s` into that prompt)."""
+def set_ring_field(ctx, step, field, want, ring, value_of, label, tag, what="the editor"):
+    """The held editor's ring field `field` (an EDITOR_FIELDS name) set to `want` with
+    `e`, recorded as the check `<step>: <what>'s <label> field reads `<want>` before the
+    launch (<tag>)`; the answer is whether it passed. The Fields pane is focused by
+    construction, not read (focus is a style): one `Esc` to the List pane
+    (`focus_profiles_list`, draft kept; nothing while a prompt is up, H49), then one
+    Tab (`step_pane`: List, Fields, Origins, Checks); `g` puts the field cursor on the
+    first field and `j` walks it to `field` (EDITOR_FIELDS, counted, since the cursor
+    is a highlight); then `e` round `ring` until `value_of(text)` (the field's value
+    off its Fields line) reads `want`, each press checked to have moved the value. An
+    `e` that opens a prompt instead (`value:`: the cursor was on a text or number
+    field, not `field`) is answered by one Esc and no more keys; the check fails naming
+    the prompt and the prompt screen is kept as `screen-<step>-stray-prompt.txt` (H44;
+    the second live run typed `s` into that prompt)."""
     c, term = ctx.c, ctx.term
-    name = f"{step}: {what}'s crawl `browser` field reads `never` before the launch (H42)"
+    name = f"{step}: {what}'s {label} field reads `{want}` before the launch ({tag})"
     if not focus_profiles_list(ctx):
         return c.check(name, False, f"the Profiles List pane never took focus (prompt up: "
                                     f"{prompt_open(term.text())!r}); {ctx.screen(step.lower())}")
@@ -1180,28 +1278,42 @@ def set_browser_never(ctx, step, what="the editor"):
     time.sleep(UI_SETTLE)
     term.press("g")
     time.sleep(UI_SETTLE)
-    term.press("j" * EDITOR_FIELDS.index("use_browser"))
+    term.press("j" * EDITOR_FIELDS.index(field))
     time.sleep(UI_SETTLE)
-    for _ in range(len(BROWSER_RING)):
-        was = browser_value(term.text())
-        if was is None or was == "never":
+    for _ in range(len(ring)):
+        was = value_of(term.text())
+        if was is None or was == want:
             break
         term.press("e")
-        poll(lambda: browser_value(term.text()) not in (None, was) or prompt_open(term.text()) is not None,
+        poll(lambda: value_of(term.text()) not in (None, was) or prompt_open(term.text()) is not None,
              5, 0.1)
-        label = prompt_open(term.text())
-        if label is not None:
+        prompt = prompt_open(term.text())
+        if prompt is not None:
             stray = ctx.snap(f"{step.lower()}-stray-prompt")
             bar = stray.rsplit("\n", 1)[-1].strip()
             kept = ctx.ev.write(f"screen-{step}-stray-prompt.txt", stray)
             term.press(ESC)
-            return c.check(name, False, f"`e` opened the `{label}` prompt (bar {bar!r}): the Fields "
-                                        f"cursor was not on `use_browser` (H44); Esc pressed, no more "
+            return c.check(name, False, f"`e` opened the `{prompt}` prompt (bar {bar!r}): the Fields "
+                                        f"cursor was not on `{field}` (H44); Esc pressed, no more "
                                         f"keys; the prompt screen is {kept}")
-        if browser_value(term.text()) in (None, was):
+        if value_of(term.text()) in (None, was):
             break
-    value = browser_value(term.text())
-    return c.check(name, value == "never", f"the crawl line reads browser {value!r}; {ctx.screen(step.lower())}")
+    value = value_of(term.text())
+    return c.check(name, value == want, f"the Fields line reads {label} {value!r}; {ctx.screen(step.lower())}")
+
+
+def set_browser_never(ctx, step, what="the editor"):
+    """The held editor's crawl `use_browser` set to `never` (`set_ring_field`): the ring
+    auto, always, never read off the crawl line (H42)."""
+    return set_ring_field(ctx, step, "use_browser", "never", BROWSER_RING, browser_value,
+                          "crawl `browser`", "H42", what)
+
+
+def set_speed_thorough(ctx, step, what="the editor"):
+    """The held editor's `speed` set to `thorough` (`set_ring_field`): the ring fast,
+    normal, thorough read off the `intensity` line, so the job outlives T7-16's three
+    samples and its `x` (H62) and T7-17's job is observed while running (H65)."""
+    return set_ring_field(ctx, step, "speed", "thorough", SPEED_RING, speed_value, "`speed`", "H62", what)
 
 
 def launch(ctx, key, timeout=JOB_APPEAR_S):
@@ -1283,41 +1395,55 @@ def step_seed(ctx):
 
 
 def step_t7_16(ctx):
-    """T7-16 (UI-1): launch from the editor, watch the counters, cancel."""
+    """T7-16 (UI-1): launch from the held editor, watch the counters, cancel. It runs
+    after T7-17 (H65), so the editor is re-entered (`ensure_editor`, as T7-17 did
+    before) and never assumed fresh; the sampled job and the fresh cancel job run
+    `thorough`, since a `standard` job with the client crawl is `done` in about a
+    second (H62)."""
     c, term = ctx.c, ctx.term
     if not open_scan(ctx):
         c.fatal("T7-16: `:scan` never opened the Scan view", ctx.screen("t7-16"))
-    if not open_profile(ctx, "standard"):
-        c.fatal("T7-16: the `standard` profile editor never opened (1, cursor, Enter)",
-                ctx.screen("t7-16"))
-    c.check("T7-16: `o` accepted the target origin into the editor", type_origin(ctx, ctx.origin),
-            ctx.screen("t7-16"))
+    if not ensure_editor(ctx, "standard", ctx.origin):
+        c.fatal("T7-16: the held `standard` editor with the target origin was not available "
+                "(1, cursor, Enter, `o` <origin>, Enter)", ctx.screen("t7-16"))
+    c.check("T7-16: the held `standard` editor carries the target origin on its `origins` line",
+            ctx.origin in (field_line(term.text(), "origins") or ""), ctx.screen("t7-16"))
     set_browser_never(ctx, "T7-16")
+    set_speed_thorough(ctx, "T7-16")
 
     job = launch(ctx, "s")
     if not job:
         c.fatal("T7-16: `s` started no job (scan.list gained no id)", ctx.screen("t7-16"))
     ctx.jobs["standard"] = job
     c.check("T7-16: scan.list reports a job id in the engine's form", bool(JOB_ID_RE.fullmatch(job)), job)
-    # A launch lands on the Jobs tab (app.rs: `scan.tab = ScanTab::Jobs` on the start
-    # reply); its footer is the tab's own text, so the row is read on the Jobs tab (H5).
-    on_jobs = term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S)
-    c.check(f"T7-16: the Jobs tab drew and carries the row for {job}",
-            on_jobs and poll(lambda: row_tail(term.text(), job) is not None, ROW_APPEAR_S),
-            f"jobs tab {on_jobs}; {ctx.screen('t7-16')}")
 
     samples = []
     for n in range(SAMPLES_MAX):
         before = status_of(ctx.bus, job)
         b_sent = sent_of(before)
-        # The TUI polls scan.status about once a second: wait for its paint to carry a
-        # value at least as fresh as the `before` read, so the bracket is a real bracket
-        # (a frozen or invented number can never satisfy it; an over-large one fails the
-        # upper bound below).
-        caught_up = poll(lambda: (row_probes(term.text(), job) or (-1, 0))[0] >= (b_sent or 0),
-                         CATCHUP_S, 0.2)
+
+        def fresh_enough():
+            # The TUI polls scan.status about once a second: the paint must carry a value
+            # at least as fresh as the `before` read, so the bracket is a real bracket (a
+            # frozen or invented number can never satisfy it; an over-large one fails the
+            # upper bound below).
+            return (row_probes(term.text(), job) or (-1, 0))[0] >= (b_sent or 0)
+
+        if n == 0:
+            # A launch lands on the Jobs tab (app.rs: `scan.tab = ScanTab::Jobs` on the
+            # start reply); its footer is the tab's own text, so the row is read on the
+            # Jobs tab (H5). That wait is folded into the first sample's poll: the sample
+            # is taken as soon as the row is on screen, nothing between (H62).
+            caught_up = poll(lambda: re.search(TAB_MARKERS["2"], term.text()) is not None and fresh_enough(),
+                             ROW_APPEAR_S, 0.1)
+        else:
+            caught_up = poll(fresh_enough, CATCHUP_S, 0.2)
         text = ctx.snap(f"t7-16-{n}")
         after = status_of(ctx.bus, job)
+        if n == 0:
+            on_jobs = re.search(TAB_MARKERS["2"], text) is not None
+            c.check(f"T7-16: the Jobs tab drew and carries the row for {job}",
+                    on_jobs and row_tail(text, job) is not None, f"jobs tab {on_jobs}; {ctx.screen('t7-16')}")
         probes = row_probes(text, job)
         state = row_state(text, job)
         samples.append({"n": n, "screen_sent": None if probes is None else probes[0],
@@ -1334,6 +1460,21 @@ def step_t7_16(ctx):
         if (after.get("state") or "") in TERMINAL_STATES:
             break
         time.sleep(SAMPLE_GAP_S)
+
+    # `x` cancels the job under the Jobs cursor, and it goes RIGHT after the third sample
+    # (H62): the bracketing read and the key come before the sample checks below. Against
+    # the small target a `standard` job can finish inside the sampling window (the first
+    # live run: 182 probes in about 6 s; the fourth: in about a second), and `x` on a
+    # terminal job is inert (`already <state>`). So when the bracketing read taken before
+    # `x` already shows a terminal state, a fresh job is launched from the held editor
+    # (`thorough` too) and `x` goes within its first second, as soon as its row is drawn
+    # (the launch lands on the Jobs tab with the new job under the cursor, `land_started`);
+    # the cancel checks and the push counts then name that job (H37).
+    cancel_job = job
+    pre_x = status_of(ctx.bus, job)
+    sampled_terminal = (pre_x.get("state") or "") in TERMINAL_STATES
+    if not sampled_terminal:
+        term.press("x")
     ctx.ev.write_json("status-pairs.json", samples)
 
     c.check(f"T7-16: at least {SAMPLES_MIN} screen samples carry the row's probes cell",
@@ -1350,17 +1491,7 @@ def step_t7_16(ctx):
     phases = phases_of(samples)
     c.check("T7-16: the row's state/phase text changed at least once", len(set(phases)) > 1, phases)
 
-    # `x` cancels the job under the Jobs cursor. Against the small target the `standard`
-    # job can finish inside the sampling window (the first live run: 182 probes in about
-    # 6 s, `done` by the third sample), and `x` on a terminal job is inert (`already
-    # <state>`). So when the bracketing read taken before `x` already shows a terminal
-    # state, a fresh job is launched from the held editor and `x` goes within its first
-    # second, as soon as its row is drawn (the launch lands on the Jobs tab with the new
-    # job under the cursor, `land_started`); the cancel checks and the push counts then
-    # name that job (H37).
-    cancel_job = job
-    pre_x = status_of(ctx.bus, job)
-    if (pre_x.get("state") or "") in TERMINAL_STATES:
+    if sampled_terminal:
         c.note(f"T7-16: {job} read `{pre_x.get('state')}` before `x`; a fresh `standard` job is "
                "cancelled in its place (H37)", f"probes {sent_of(pre_x)}")
         if not ensure_editor(ctx, "standard", ctx.origin):
@@ -1368,6 +1499,7 @@ def step_t7_16(ctx):
                     ctx.screen("t7-16"))
             return
         set_browser_never(ctx, "T7-16", "the fresh job's editor")
+        set_speed_thorough(ctx, "T7-16", "the fresh job's editor")
         fresh = launch(ctx, "s")
         if not fresh:
             c.check("T7-16: `s` started the fresh job for the cancel (scan.list gained an id)", False,
@@ -1378,7 +1510,7 @@ def step_t7_16(ctx):
                   and poll(lambda: row_tail(term.text(), fresh) is not None, ROW_APPEAR_S, 0.1))
         c.check(f"T7-16: the Jobs tab drew the fresh job {fresh} under the cursor",
                 on_row and on_cursor(term.text(), fresh), ctx.screen("t7-16"))
-    term.press("x")
+        term.press("x")
     cancelled = poll(lambda: "cancelled" in (row_state(term.text(), cancel_job) or ""), CANCEL_S, 0.3)
     text = ctx.snap("t7-16-cancel")
     ctx.ev.write("screen-T7-16-cancel.txt", text)
@@ -1423,18 +1555,26 @@ def pick_issue(ctx, job, found):
 
 
 def step_t7_17(ctx):
-    """T7-17 (UI-2): a live issue, its evidence, a probe flow, the status round trip."""
+    """T7-17 (UI-2): a live issue, its evidence, a probe flow, the status round trip. It
+    is the first launch of the run (H65: the engine dedupes issues across jobs and the
+    first finder owns them, so a job launched after T7-16's could never own one), so it
+    opens the Scan view and the editor itself; its job runs `thorough` so it is still
+    running when the Issues tab is read (H62/H65)."""
     c, term = ctx.c, ctx.term
     for verb in ("scan.issues", "scan.issue"):
         if verb not in ctx.names:
             c.check(f"T7-17: the core offers {verb} (the ground truth this step reads)", False,
                     "absent from tools/list")
             return
+    if not open_scan(ctx):
+        c.check("T7-17: `:scan` opened the Scan view", False, ctx.screen("t7-17"))
+        return
     if not ensure_editor(ctx, "standard", ctx.origin):
-        c.check("T7-17: the `standard` editor with the target origin was available", False,
-                ctx.screen("t7-17"))
+        c.check("T7-17: the `standard` editor with the target origin was available (1, cursor, "
+                "Enter, `o` <origin>, Enter)", False, ctx.screen("t7-17"))
         return
     set_browser_never(ctx, "T7-17")
+    set_speed_thorough(ctx, "T7-17")
     job = launch(ctx, "s")
     if not job:
         c.check("T7-17: the second `s` started a job", False, ctx.screen("t7-17"))
@@ -1879,15 +2019,16 @@ def step_t7_19(ctx):
     term.press("3")
     term.press("J")
     marker = SITEMAP_MARKER.format(n=len(nodes))
-    # The tab settles two ways (`sitemap_settled`): the head, or a strip banner that
-    # changed to an error wording (a `scan.sitemap` failure lands there, D9/D13); the
-    # failure then says which, with the banner before and after, the strip row, whether
-    # the body still reads `no site map yet`, the Jobs cursor's job as the Jobs tab shows
-    # it (the job `J` pinned) and the harness's own node counts for `scan.sitemap {}` and
-    # `{job}` (H39).
-    poll(lambda: sitemap_settled(term.text(), marker, banner_before) is not None, 15)
+    # The wait is head-first (`wait_sitemap_head`, H63): the head alone ends it, for the
+    # whole SITEMAP_HEAD_S. Only once it never came does the failure read the strip
+    # (`sitemap_settled`: a banner that changed to an error wording, where a
+    # `scan.sitemap` failure lands, D9/D13), with the banner before and after, the strip
+    # row, whether the body still reads `no site map yet`, the Jobs cursor's job as the
+    # Jobs tab shows it (the job `J` pinned) and the harness's own node counts for
+    # `scan.sitemap {}` and `{job}` (H39).
+    drew = wait_sitemap_head(term, marker, SITEMAP_HEAD_S)
     text = ctx.snap("t7-19-sitemap")
-    drew = marker in text
+    drew = drew and marker in text
     detail = ""
     if not drew:
         ctx.ev.write("screen-T7-19-sitemap.txt", text)
@@ -1975,12 +2116,14 @@ def step_t7_20(ctx):
 
 
 def scenario(ctx):
-    """The steps in order. T7-20 (no secret on screen, exit 0) runs even when an earlier
-    step gave up, so the hygiene claim covers every sample taken."""
+    """The steps in order: T7-17 before T7-16, so its job is the fresh core's first finder
+    and owns the issues it finds (the engine's cross-job dedupe, H65). T7-20 (no secret
+    on screen, exit 0) runs even when an earlier step gave up, so the hygiene claim
+    covers every sample taken."""
     try:
         step_seed(ctx)
-        step_t7_16(ctx)
         step_t7_17(ctx)
+        step_t7_16(ctx)
         step_t7_18(ctx)
         step_t7_19(ctx)
     except Fatal:
@@ -2240,12 +2383,13 @@ def scan_box(f, tab, offset=0, banner="idle"):
 ORIGIN = "http://127.0.0.1:8080"
 
 
-def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none"):
+def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none", speed="normal"):
     """Profiles (ui/scan/profiles.rs): the column header, three rows with `standard`
     under the cursor, and on the detail side either the no-editor hint over the D7
     gate text and the key footer, or the held editor's header and Fields block (its
     `origins` and `l4` rows as `text_of` writes them, `none` when empty, H49; its
-    `crawl` row carrying `browser` as `field_lines` writes it, H42)."""
+    `crawl` row carrying `browser` as `field_lines` writes it, H42; its `intensity`
+    row carrying `speed` the same way, H62)."""
     f = Frame()
     chrome(f)
     lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 1, offset)
@@ -2253,17 +2397,17 @@ def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none"):
     rows = [("standard", "http ws", "balanced", "normal"),
             ("map-only", "http", "passive", "normal"),
             ("l4-stream-safe", "l4_stream", "cautious", "slow")]
-    for k, (name, lanes, inten, speed) in enumerate(rows):
+    for k, (name, lanes, inten, row_speed) in enumerate(rows):
         mark = ">" if k == 0 else " "
         editing = "*" if editor and k == 0 else " "
-        f.put(lx, y + 1 + k, f"{mark}{name:<14} {editing}·{GAP_TEXT}{lanes:<9}{GAP_TEXT}{inten:<9}{GAP_TEXT}{speed:<8}")
+        f.put(lx, y + 1 + k, f"{mark}{name:<14} {editing}·{GAP_TEXT}{lanes:<9}{GAP_TEXT}{inten:<9}{GAP_TEXT}{row_speed:<8}")
     if editor:
         f.put(dx, y, " profile standard (builtin)")
         f.put(dx + dw - 6, y, "dirty")
         f.put(dx, y + 1, f" {'origins':<9} {origins}")
         f.put(dx, y + 2, f" {'l4':<9} {l4}")
         f.put(dx, y + 3, f" {'lanes':<9} [x] http  [x] ws  [ ] l4_packet  [ ] l4_stream")
-        f.put(dx, y + 4, f" {'intensity':<9} balanced   speed normal   accuracy balanced")
+        f.put(dx, y + 4, f" {'intensity':<9} balanced   speed {speed}   accuracy balanced")
         f.put(dx, y + 5, f" {'checks':<9} all (12)")
         f.put(dx, y + 6, f" {'crawl':<9} normal · browser {browser} · depth 3 · pages 200 · forms on")
     else:
@@ -2472,19 +2616,24 @@ class ScriptedTerm:
     Enter closes it and lands the value on its Fields line only after `lag` further
     `text()` reads (the TUI processes Enter after the bar echoed the typed value, the
     live H49 failure) unless `refuse` (`submit_retrying` keeps the bar up with the line
-    cleared); Esc closes it and drops the value (H43). `e` cycles the crawl `browser`
-    ring when `on_field`, else opens the `value:` prompt prefilled with the name (the
-    Fields cursor on `name`, the live H44 failure)."""
+    cleared); Esc closes it and drops the value (H43). The Fields cursor is tracked the
+    way `app.rs` moves it: `g` to the first field, each `j` one field down
+    (EDITOR_FIELDS); `e` acts on the field under it when `on_field`: the crawl
+    `browser` ring on `use_browser`, the `speed` ring on `speed` (H62), the `value:`
+    prompt prefilled with the name on any other. With `on_field` False the cursor
+    never left `name`, so `e` opens that prompt (the live H44 failure)."""
 
     def __init__(self, on_field=True, refuse=False, lag=2):
         self.keys = []
         self.on_field, self.refuse, self.lag = on_field, refuse, lag
-        self.origins, self.l4, self.browser = "none", "none", "auto"
+        self.origins, self.l4, self.browser, self.speed = "none", "none", "auto", "normal"
+        self.field = 0  # the Fields cursor: an EDITOR_FIELDS index
         self.prompt = None  # (label, typed)
         self._pending = None  # (label, typed, reads left) after Enter
 
     def _frame(self):
-        return profiles_frame(editor=True, browser=self.browser, origins=self.origins, l4=self.l4)
+        return profiles_frame(editor=True, browser=self.browser, origins=self.origins, l4=self.l4,
+                              speed=self.speed)
 
     def text(self):
         if self._pending is not None:
@@ -2522,11 +2671,45 @@ class ScriptedTerm:
             self.prompt = ("origin:", "")
         elif keys == "t":
             self.prompt = ("l4 target:", "")
+        elif keys == "g":
+            self.field = 0
+        elif keys and set(keys) == {"j"}:
+            self.field = min(self.field + len(keys), len(EDITOR_FIELDS) - 1)
         elif keys == "e":
-            if self.on_field:
+            under = EDITOR_FIELDS[self.field] if self.on_field else "name"
+            if under == "use_browser":
                 self.browser = BROWSER_RING[(BROWSER_RING.index(self.browser) + 1) % len(BROWSER_RING)]
+            elif under == "speed":
+                self.speed = SPEED_RING[(SPEED_RING.index(self.speed) + 1) % len(SPEED_RING)]
             else:
                 self.prompt = ("value:", "standard")
+
+
+class ScriptedScreens:
+    """A `Terminal` stand-in for `wait_sitemap_head` (H63): `text()` serves the scripted
+    frames in order, one per read, and repeats the last."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.reads = 0
+
+    def text(self):
+        self.reads += 1
+        return self.frames[min(self.reads, len(self.frames)) - 1]
+
+
+class ScriptedSocket:
+    """The `_sock` the harness's `BusClient` holds, as far as `Pushes.stop()` touches it:
+    `shutdown` wakes the blocked read (on the real socket the readline returns "" and
+    `_read_line` raises `BusError`, H64)."""
+
+    def __init__(self):
+        self.closed = threading.Event()
+        self.shutdowns = 0
+
+    def shutdown(self, how):
+        self.shutdowns += 1
+        self.closed.set()
 
 
 class ScriptedPushClient:
@@ -2536,24 +2719,40 @@ class ScriptedPushClient:
     notification on `notifications` (a reply, a flow or agent line) and returns the
     first that is; a scripted exception is raised in its turn (a `ValueError` is one
     line `_recv` could not parse, a `BusError` the socket closed by the core; a parsed
-    line that is not an object fails `m.get`, as it would there); the script exhausted,
-    the read returns None after a pause, like a quiet socket. It has no
-    `drain_notifications`: a thread that still called it would die at once."""
+    line that is not an object fails `m.get`, as it would there), except an `OSError`,
+    which `wait_notification` swallows into a None the way the harness does, and from
+    which its reader is broken: every later read is an instant None (the fourth live
+    run's `cannot read from timed out object`, H64). The script exhausted, the read
+    BLOCKS like a quiet socket: until `_sock.shutdown` (a `BusError`, the socket closed
+    under the read) or the timeout (a None, and the reader broken from then on, as the
+    harness's buffered reader is after one timeout). It has no `drain_notifications`: a
+    thread that still called it would die at once."""
 
     def __init__(self, script):
         self.script = list(script)
         self.pending = []
         self.notifications = []
         self.reads = 0
+        self.broken = False
+        self._sock = ScriptedSocket()
 
     def wait_notification(self, method_contains, timeout=6.0):
         self.reads += 1
+        if self.broken:
+            return None
         while True:
             if not self.pending:
+                if self._sock.closed.is_set():
+                    raise BusError("bus connection closed by the core")
                 if not self.script:
-                    time.sleep(0.01)
+                    if self._sock.closed.wait(timeout):
+                        raise BusError("bus connection closed by the core")
+                    self.broken = True
                     return None
                 item = self.script.pop(0)
+                if isinstance(item, OSError):
+                    self.broken = True
+                    return None
                 if isinstance(item, BaseException):
                     raise item
                 self.pending.extend(item)
@@ -2768,6 +2967,20 @@ def selftest():
             and sitemap_settled(sitemap_frame(count=13), marker3, "idle") is None,
             f"{sitemap_settled(pending, marker3, stale)!r} {sitemap_settled(failed, marker3, stale)!r} "
             f"{sitemap_settled(failed, marker3, banner_of(failed))!r} {sitemap_settled(sitemap, marker3, stale)!r}")
+    # Cell item from the fourth live smoke run: H63. The engine's refusal of the
+    # tab-entry `scan.sitemap {}` request changed the banner a moment before `J`'s head
+    # landed, so a wait that settled on the changed banner lost the race.
+    raced = ScriptedScreens([pending, failed, failed, failed, sitemap])
+    late = ScriptedScreens([pending, failed])
+    raced_head = wait_sitemap_head(raced, marker3, 3.0)
+    late_head = wait_sitemap_head(late, marker3, 0.5)
+    c.check("selftest: wait_sitemap_head is head-first: a banner that changed to an error wording "
+            "before the `{n} nodes` head does not end the wait, the head three reads later does; "
+            "a head that never comes runs the whole timeout and the detail then reads the "
+            "changed banner as `error` (H63)",
+            raced_head is True and raced.reads == 5 and late_head is False and late.reads >= 3
+            and sitemap_settled(late.text(), marker3, stale) == "error",
+            f"raced {raced_head} after {raced.reads} reads; late {late_head} after {late.reads} reads")
 
     # Cell item H59: the inject L4 scope entry carries `inject_rate_pps` (the engine's
     # default 0 is the fail-closed value) when the schema declares it, and the exact
@@ -2908,6 +3121,36 @@ def selftest():
                 and walk_checks.tally() == (1, 0, 0)
                 and walked.keys[:3] == [ESC, "\t", "g"] and walked.keys[3] == "j" * EDITOR_FIELDS.index("use_browser"),
                 f"{walk_ok} browser {walked.browser!r} keys {walked.keys!r}")
+
+        # Cell item from the fourth live smoke run: H62. The `standard` job finished its 182
+        # probes in about a second, so the sampled job runs `thorough`, set through the
+        # same Fields walk as `browser never`.
+        c.check("selftest: speed_value reads the held editor's `speed` from its `intensity` Fields "
+                "row (`normal`, `thorough`) and nothing from the list header's bare `speed` (H62)",
+                speed_value(held) == "normal" and speed_value(profiles_frame(editor=True, speed="thorough")) == "thorough"
+                and speed_value(plain) is None,
+                f"{speed_value(held)!r} {speed_value(plain)!r}")
+        sped, sped_checks, sped_ctx = scripted(on_field=True)
+        sped_ok = set_speed_thorough(sped_ctx, "T7-16")
+        c.check("selftest: set_speed_thorough: Esc, Tab, `g`, then EDITOR_FIELDS.index('speed') `j`s land "
+                "on `speed`; one `e` turns `normal` into `thorough`, the H62 check passes and the "
+                "crawl `browser` line is untouched (H62)",
+                sped_ok is True and sped.speed == "thorough" and sped.browser == "auto"
+                and sped.keys.count("e") == 1 and sped_checks.tally() == (1, 0, 0)
+                and sped.keys[:3] == [ESC, "\t", "g"] and sped.keys[3] == "j" * EDITOR_FIELDS.index("speed")
+                and speed_value(sped.text()) == "thorough",
+                f"{sped_ok} speed {sped.speed!r} browser {sped.browser!r} keys {sped.keys!r}")
+        both, both_checks, both_ctx = scripted(on_field=True)
+        both_ok = set_browser_never(both_ctx, "T7-16") and set_speed_thorough(both_ctx, "T7-16")
+        c.check("selftest: the T7-16 launch sequence, `browser never` then `speed thorough` on one "
+                "held editor, leaves both on the Fields lines with three `e` presses and two passed "
+                "checks; a second pass presses no `e` and both checks pass again (H62)",
+                both_ok is True and both.browser == "never" and both.speed == "thorough"
+                and both.keys.count("e") == 3 and both_checks.tally() == (2, 0, 0)
+                and set_browser_never(both_ctx, "T7-16", "the fresh job's editor") is True
+                and set_speed_thorough(both_ctx, "T7-16", "the fresh job's editor") is True
+                and both.keys.count("e") == 3 and both_checks.tally() == (4, 0, 0),
+                f"{both_ok} browser {both.browser!r} speed {both.speed!r} keys {both.keys!r}")
     finally:
         shutil.rmtree(script_dir, ignore_errors=True)
 
@@ -2945,32 +3188,67 @@ def selftest():
             and dead.reads == 8 and "stopped_by: BusError" in dead_pushes.describe()
             and "'<reply>': 1" in dead_pushes.describe(),
             f"reads {dead.reads}; {json.dumps(snap, default=str)[:600]}")
-    quiet_pushes = Pushes(ScriptedPushClient([]), "this bus has no flow.subscribe")
-    was_alive = poll(lambda: quiet_pushes.alive() and quiet_pushes.snapshot()["idle_reads"] > 0, 2, 0.05)
+    # The fourth live run's thread spun 32 million instant `None` reads: the harness's
+    # buffered reader is broken after one read timeout (H64). The read now blocks for the
+    # cell's budget, so a quiet socket holds the thread in ONE read, with nothing idle
+    # counted, until `stop()` shuts the socket down under it.
+    quiet = ScriptedPushClient([])
+    quiet_pushes = Pushes(quiet, "this bus has no flow.subscribe")
+    time.sleep(0.4)
+    blocked = quiet_pushes.alive() and quiet.reads == 1 and quiet_pushes.snapshot()["idle_reads"] == 0
     quiet_pushes.stop()
-    c.check("selftest: Pushes: a quiet socket keeps the thread alive and counts its idle reads; "
-            "`stop()` ends it with `stopped_by: stop()` and nothing counted (H46, H57)",
-            was_alive and not quiet_pushes.alive() and quiet_pushes.snapshot()["stopped_by"] == "stop()"
+    c.check("selftest: Pushes: a quiet socket holds the thread in one blocking read (alive, one read, "
+            "no idle read after 0.4 s); `stop()` shuts the socket down under it and the thread ends "
+            "at once with `stopped_by: stop()` and nothing counted; `read` names the blocking "
+            "mechanism (H64, H46)",
+            blocked and not quiet_pushes.alive() and quiet_pushes.snapshot()["stopped_by"] == "stop()"
+            and quiet._sock.shutdowns == 1 and quiet.reads == 1
             and quiet_pushes.snapshot()["by_method"] == {} and quiet_pushes.snapshot()["lines"] == 0
-            and quiet_pushes.snapshot()["read"] == PUSH_READ,
-            json.dumps(quiet_pushes.snapshot(), default=str))
+            and quiet_pushes.snapshot()["read"] == PUSH_READ and "blocking" in PUSH_READ,
+            f"blocked {blocked} reads {quiet.reads} shutdowns {quiet._sock.shutdowns}; "
+            f"{json.dumps(quiet_pushes.snapshot(), default=str)}")
+    broken = ScriptedPushClient([[job_line("scan-00000004", "progress")], OSError(9, "Bad file descriptor")])
+    broken_pushes = Pushes(broken, {"sub_id": 1})
+    broken_pushes._thread.join(3)
+    b_snap = broken_pushes.snapshot()
+    c.check("selftest: Pushes: a read the harness reader swallowed into an instant None (a socket "
+            "error, or the reader broken by an earlier timeout) marks the thread dead with its "
+            "reason, after exactly that one more read and no idle read, instead of spinning (H64)",
+            not broken_pushes.alive() and (b_snap["stopped_by"] or "").startswith("read ended with None")
+            and broken.reads == 2 and b_snap["idle_reads"] == 0
+            and broken_pushes.of("scan-00000004") == {"progress": 1},
+            f"reads {broken.reads}; {json.dumps(b_snap, default=str)[:400]}")
+    slow = ScriptedPushClient([])
+    slow_pushes = Pushes(slow, None, read_s=0.6)
+    slow_pushes._thread.join(3)
+    s_snap = slow_pushes.snapshot()
+    c.check("selftest: Pushes: a read that waited its whole timeout counts the one idle read and "
+            "ends the thread with `stopped_by: read timeout ..`; the thread never reads again "
+            "after a None (H64)",
+            not slow_pushes.alive() and (s_snap["stopped_by"] or "").startswith("read timeout")
+            and s_snap["idle_reads"] == 1 and slow.reads == 1,
+            f"reads {slow.reads}; {json.dumps(s_snap, default=str)[:400]}")
     # The third live run's socket: the TUI's polling fans an agent audit line out every
     # ~150 ms (2342 in the run), so a drain that returns only after 0.5 s of silence never
     # returned and the T7-16 check read zero lines (H57). Per-line reads count the job
-    # line as soon as it is read, with the agent lines around it counted by method.
+    # line as soon as it is read; the agent lines the client read past while blocking
+    # are folded from its stash when the thread ends (H64).
     agent = {"jsonrpc": "2.0", "method": "notifications/aitm/agent", "params": {"verb": "scan.status"}}
     busy = ScriptedPushClient([[agent] * 100 + [job_line("scan-00000003", "progress")] + [agent] * 100])
     busy_pushes = Pushes(busy, {"sub_id": 1})
     counted = poll(lambda: busy_pushes.of("scan-00000003") == {"progress": 1}, 3, 0.05)
-    settled_all = poll(lambda: busy_pushes.snapshot()["by_method"].get("notifications/aitm/agent") == 200, 3, 0.05)
+    time.sleep(0.2)
+    still = busy_pushes.alive() and busy.reads == 2
     busy_pushes.stop()
     c.check("selftest: Pushes: a socket that is never quiet (100 agent lines, one job line, 100 "
-            "more) has the job line counted without waiting for a silence; the agent lines are "
-            "counted by method; `read` names the per-line mechanism (H57)",
-            counted and settled_all and busy_pushes.snapshot()["lines"] == 201
+            "more) has the job line counted without waiting for a silence and the thread still "
+            "blocked in its second read; after `stop()` every agent line is counted by method "
+            "(200) and `lines` is 201 (H57, H64)",
+            counted and still and busy_pushes.snapshot()["lines"] == 201
+            and busy_pushes.snapshot()["by_method"].get("notifications/aitm/agent") == 200
             and busy_pushes.snapshot()["read"] == PUSH_READ and "wait_notification" in PUSH_READ
             and busy_pushes.snapshot()["stopped_by"] == "stop()",
-            json.dumps(busy_pushes.snapshot(), default=str)[:400])
+            f"still {still} reads {busy.reads}; {json.dumps(busy_pushes.snapshot(), default=str)[:400]}")
 
     n_ok, n_noted, n_failed = c.tally()
     print(f"{'PASS' if not n_failed else 'FAIL'}: selftest {n_ok} ok, {n_failed} failed", flush=True)
