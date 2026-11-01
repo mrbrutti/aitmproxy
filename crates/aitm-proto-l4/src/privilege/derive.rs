@@ -101,6 +101,17 @@ pub struct HelperCandidate {
     pub file_caps_net_raw: bool,
 }
 
+impl HelperCandidate {
+    /// File capabilities this core may rely on (and start a helper over):
+    /// `probe` reports `CAP_NET_RAW` **and** the path chain is one root alone
+    /// could have written (S2 of the p1b panel). The one spelling of the rule,
+    /// for the `derive` row and the direct start alike.
+    #[must_use]
+    pub fn trusted_file_caps(&self) -> bool {
+        self.file_caps_net_raw && self.root_owned_chain
+    }
+}
+
 /// The literal reasons and labels of spec §2.2. They are the only text a
 /// frontend shows for these rows, so they live here as named constants.
 pub mod text {
@@ -233,8 +244,7 @@ fn derive_linux(enabled: bool, linux: &LinuxInputs) -> (Capability, Capability, 
     // File capabilities count only on a path root alone could have written:
     // a user-writable helper is the untrusted-path row whatever its `probe`
     // says (S2 of the p1b panel).
-    let file_caps =
-        candidate.is_some_and(|helper| helper.file_caps_net_raw && helper.root_owned_chain);
+    let file_caps = candidate.is_some_and(HelperCandidate::trusted_file_caps);
     // The packaged install, complete: the only thing the request ever runs
     // through polkit is the policy's exec path, so every part must be in place
     // and the path must be one root alone can write.

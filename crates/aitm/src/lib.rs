@@ -138,13 +138,6 @@ pub async fn shutdown_signal_unless_held(hold: PromptHold) {
     }
 }
 
-/// The decision behind [`shutdown_signal_unless_held`]: a Ctrl-C ends the run
-/// unless a packet-capture prompt holds it.
-#[must_use]
-pub fn should_shut_down(held: bool) -> bool {
-    !held
-}
-
 /// Resolves on the first interrupt event that arrives while `held()` is
 /// false. An event while held is logged once each, answered with one
 /// `on_held()` (the prompt's cancel) and swallowed. A stream that ends (no
@@ -159,7 +152,8 @@ pub async fn interrupt_unless_held(
     loop {
         match events.next().await {
             None => std::future::pending::<()>().await,
-            Some(()) if should_shut_down(held()) => return,
+            // A Ctrl-C ends the run unless a packet-capture prompt holds it.
+            Some(()) if !held() => return,
             Some(()) => {
                 info!("Ctrl-C cancelled the packet-capture prompt; the core keeps serving");
                 on_held();
@@ -175,14 +169,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-
-    /// L4 privilege spec §5.5 (P1b.14 correction): Ctrl-C ends the run unless
-    /// a packet-capture prompt holds it.
-    #[test]
-    fn ctrl_c_shuts_down_only_when_not_held() {
-        assert!(should_shut_down(false));
-        assert!(!should_shut_down(true));
-    }
 
     /// The interrupt future over an injected event stream: the first Ctrl-C
     /// while held is swallowed (the core keeps serving); the next one, once

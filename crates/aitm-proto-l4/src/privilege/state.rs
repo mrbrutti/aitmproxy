@@ -17,7 +17,6 @@
 //! guard), the thread itself ([`run_watcher`]), and the lazy direct start of a
 //! file-capability helper on first use.
 
-use std::any::Any;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +34,7 @@ use crate::helper::client::{
 use crate::privilege::derive::{derive, text, LinuxInputs, ProbeInputs, SessionFailure};
 use crate::privilege::linux::{
     direct_helper_argv, gather_linux, msg, request_linux, watch_step, Child, ExitClass, HoldCount,
-    Spawned, Spawner, StdSpawner, WatchOutcome,
+    HoldToken, Spawned, Spawner, StdSpawner, WatchOutcome,
 };
 use crate::privilege::macos::gather_mac;
 use crate::privilege::report::{
@@ -117,7 +116,7 @@ impl Outcome {
 /// and the Linux `pkexec` spawn (plan P1b.14) implement it behind
 /// [`PlatformRequester`]; a fixed-input module or a test installs its own
 /// through [`PrivilegeState::with_requester`] (a seam, like `with_prober`).
-pub trait Requester: Send + Sync {
+pub(crate) trait Requester: Send + Sync {
     fn request(&self, cfg: &PrivilegeConfig, report: &PrivilegeReport) -> (Outcome, String);
 
     /// Called by the state right after the answer of `request` was recorded
@@ -139,7 +138,7 @@ pub trait Requester: Send + Sync {
 /// whether its session is still open. One slot serves both readers: the
 /// routed backend (as a [`CaptureInjectBackend`]) and the prober's
 /// `session_connected` (through `is_live`).
-pub trait LiveBackend: CaptureInjectBackend {
+pub(crate) trait LiveBackend: CaptureInjectBackend {
     /// The helper session behind this backend is open right now.
     fn is_live(&self) -> bool;
 }
@@ -431,11 +430,12 @@ impl PrivilegeState {
         }
     }
 
-    /// Replace the platform requester (the spawner and request seams); tests
-    /// and fixed-input modules script one. Reachable in production builds so
-    /// the seam is one code path.
+    /// Replace the platform requester (the spawner and request seams); the
+    /// crate's tests script one. A test seam: production always runs the
+    /// [`PlatformRequester`] `assemble` installs.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_requester(mut self, requester: Box<dyn Requester>) -> Self {
+    pub(crate) fn with_requester(mut self, requester: Box<dyn Requester>) -> Self {
         self.requester = requester;
         self
     }
@@ -496,8 +496,10 @@ impl PrivilegeState {
 
     /// Set (or clear) the helper session's backend: the one slot the routed
     /// backend takes for `Available { via: Helper }` from the next call on and
-    /// the prober reads `session_connected` from.
-    pub fn set_helper_backend(&self, backend: Option<Arc<dyn LiveBackend>>) {
+    /// the prober reads `session_connected` from. A test seam: in production
+    /// only the watcher thread fills and clears the slot.
+    #[cfg(test)]
+    pub(crate) fn set_helper_backend(&self, backend: Option<Arc<dyn LiveBackend>>) {
         self.shared.set_live(backend);
     }
 
@@ -802,7 +804,7 @@ pub(crate) fn direct_start_target(
     inputs
         .helper
         .as_ref()
-        .filter(|helper| helper.file_caps_net_raw && helper.root_owned_chain)
+        .filter(|helper| helper.trusted_file_caps())
         .map(|helper| helper.path.clone())
 }
 
@@ -943,6 +945,12 @@ impl Requester for PlatformRequester {
         }
     }
 
+    /// The direct start goes through this requester's own spawner, so a
+    /// scripted one sees that spawn too.
+    fn spawner(&self) -> Arc<dyn Spawner> {
+        Arc::clone(&self.spawner)
+    }
+
     fn after_recorded(&self) {
         let Some(pending) = lock(&self.pending).take() else {
             return;
@@ -1055,10 +1063,7 @@ fn spawn_direct(
     start_watch_with(
         Arc::clone(shared),
         PendingWatch {
-            spawned: Spawned {
-                child,
-                hold: Box::new(()),
-            },
+            spawned: Spawned { child, hold: None },
             listener,
             started_ms: shared.now(),
         },
@@ -1148,7 +1153,7 @@ pub(crate) fn run_watcher(
     shared: Arc<Shared>,
     child: Box<dyn Child>,
     acceptor: Box<dyn Acceptor>,
-    hold: Box<dyn Any + Send>,
+    hold: Option<HoldToken>,
     started_ms: u64,
     progress: bool,
 ) {
@@ -1244,7 +1249,8 @@ struct Watch {
     shared: Arc<Shared>,
     child: SharedChild,
     acceptor: Option<Box<dyn Acceptor>>,
-    hold: Option<Box<dyn Any + Send>>,
+    /// The SIGINT hold while the child is a prompt; `None` for a direct start.
+    hold: Option<HoldToken>,
     started_ms: u64,
     progress: bool,
 }
@@ -1254,7 +1260,7 @@ impl Watch {
         shared: Arc<Shared>,
         child: Box<dyn Child>,
         acceptor: Box<dyn Acceptor>,
-        hold: Box<dyn Any + Send>,
+        hold: Option<HoldToken>,
         started_ms: u64,
         progress: bool,
     ) -> Self {
@@ -1267,7 +1273,7 @@ impl Watch {
             shared,
             child,
             acceptor: Some(acceptor),
-            hold: Some(hold),
+            hold,
             started_ms,
             progress,
         }
@@ -1680,7 +1686,9 @@ mod tests {
             Some(RequestProgress {
                 state: RequestState::Failed,
                 at: 300,
-                message: outcome.message.clone(),
+                message: "Install the Aitmproxy app (DMG or Homebrew cask); it asks macOS for \
+                          packet-capture permission"
+                    .to_string(),
             })
         );
 
@@ -1715,7 +1723,6 @@ mod tests {
 
     // ---- Task P1b.14: the watcher, the guard seam, the recorded hook ----
 
-    use std::any::Any;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -1727,7 +1734,7 @@ mod tests {
     use crate::helper::client::{HelperSession, SessionError};
     use crate::helper::proto::{encode, read_msg, Msg, PROTO};
     use crate::privilege::linux::fakes::{FakeChild, FakeSpawner};
-    use crate::privilege::linux::{ChildExit, HoldCount, SignalGuard};
+    use crate::privilege::linux::{ChildExit, HoldCount};
 
     /// Generous: the machine running these may be under heavy load.
     const WAIT: Duration = Duration::from_secs(30);
@@ -1800,7 +1807,7 @@ mod tests {
             Arc::clone(&state.shared),
             Box::new(child),
             Box::new(NoPeer),
-            hold,
+            Some(hold),
             1_000,
             true,
         );
@@ -1841,7 +1848,7 @@ mod tests {
                 shared,
                 Box::new(child),
                 Box::new(acceptor),
-                hold,
+                Some(hold),
                 5_000,
                 true,
             );
@@ -1894,7 +1901,7 @@ mod tests {
             Arc::clone(&state.shared),
             Box::new(child),
             Box::new(OnePeer(Mutex::new(Some(session)))),
-            hold,
+            Some(hold),
             9_000,
             true,
         );
@@ -2009,7 +2016,6 @@ mod tests {
         let (state, _now) = state_over(vec![row6()]);
         let state = state.with_requester(Box::new(Plain));
         assert_eq!(state.request().outcome, Outcome::CannotPrompt);
-        let _: Box<dyn Any + Send> = Box::new(());
     }
     // ---- tester (privilege unit p1b): a helper that misbehaves at Hello, a
     // foreign peer at the socket -----------------------------------------------
@@ -2075,7 +2081,7 @@ mod tests {
                 Arc::clone(&state.shared),
                 Box::new(child),
                 Box::new(OnePeer(Mutex::new(Some(session)))),
-                hold,
+                Some(hold),
                 11_000,
                 true,
             );
@@ -2126,7 +2132,14 @@ mod tests {
         let hold = holds.hold();
         let shared = Arc::clone(&state.shared);
         let watcher = std::thread::spawn(move || {
-            run_watcher(shared, Box::new(child), Box::new(NoPeer), hold, 6_000, true);
+            run_watcher(
+                shared,
+                Box::new(child),
+                Box::new(NoPeer),
+                Some(hold),
+                6_000,
+                true,
+            );
         });
         until("the launcher to be registered as the prompt", || {
             state.shared.prompt_child().is_some()
@@ -2192,7 +2205,7 @@ mod tests {
                 Arc::clone(&state.shared),
                 Arc::clone(&registered),
             )),
-            Box::new(()),
+            None,
             0,
             false,
         );
@@ -2247,7 +2260,7 @@ mod tests {
                 shared,
                 Box::new(PanicsOnWait),
                 Box::new(NoPeer),
-                hold,
+                Some(hold),
                 7_000,
                 true,
             );
@@ -2288,7 +2301,7 @@ mod tests {
                 shared,
                 Box::new(PanicsOnWait),
                 Box::new(NoPeer),
-                hold,
+                Some(hold),
                 8_000,
                 true,
             );
@@ -2333,7 +2346,7 @@ mod tests {
             Arc::clone(&state.shared),
             Box::new(child),
             Box::new(ForeignThenNobody(Arc::clone(&accepts))),
-            hold,
+            Some(hold),
             2_000,
             true,
         );
@@ -2488,13 +2501,16 @@ mod tests {
             1,
             "a fresh state's request() probes exactly once"
         );
-        // The reply still carries the progress the request recorded.
+        // The reply still carries the progress the request recorded: row 6's
+        // remedy label, as `failed`.
         assert_eq!(
             outcome.privilege.request,
             Some(RequestProgress {
                 state: RequestState::Failed,
                 at: 300,
-                message: outcome.message.clone(),
+                message: "Install the Aitmproxy app (DMG or Homebrew cask); it asks macOS for \
+                          packet-capture permission"
+                    .to_string(),
             })
         );
         assert_eq!(outcome.privilege.helper.status, HelperStatus::NotInstalled);
@@ -2574,7 +2590,7 @@ mod tests {
                 ..FakeChild::alive(4242)
             }),
             Box::new(OnePeer(Mutex::new(Some(session)))),
-            holds.hold(),
+            Some(holds.hold()),
             11_000,
             true,
         );
@@ -2604,7 +2620,7 @@ mod tests {
                 ..FakeChild::alive(4242)
             }),
             Box::new(OnePeer(Mutex::new(Some(session)))),
-            holds.hold(),
+            Some(holds.hold()),
             11_000,
             true,
         );
@@ -2632,7 +2648,7 @@ mod tests {
                     ..FakeChild::alive(4242)
                 }),
                 Box::new(OnePeer(Mutex::new(Some(session)))),
-                hold,
+                Some(hold),
                 11_000,
                 true,
             );
@@ -2701,7 +2717,7 @@ mod tests {
             Arc::clone(&state.shared),
             Box::new(child),
             Box::new(acceptor),
-            holds.hold(),
+            Some(holds.hold()),
             3_000,
             true,
         );
@@ -2758,7 +2774,7 @@ mod tests {
                 dropped_at_reap: Arc::clone(&dropped_at_reap),
             }),
             Box::new(acceptor),
-            holds.hold(),
+            Some(holds.hold()),
             0,
             true,
         );
@@ -3050,7 +3066,7 @@ mod tests {
                 shared,
                 Box::new(child),
                 Box::new(Broken(accepts_in)),
-                hold,
+                Some(hold),
                 4_000,
                 true,
             );
@@ -3098,7 +3114,7 @@ mod tests {
             Arc::clone(&state.shared),
             Box::new(child),
             Box::new(Flaky(Arc::new(AtomicUsize::new(0)))),
-            holds.hold(),
+            Some(holds.hold()),
             5_000,
             true,
         );
@@ -3486,7 +3502,7 @@ mod tests {
                 shared: Arc::clone(&state.shared),
                 progress_at_drop: Arc::clone(&progress_at_drop),
             }),
-            holds.hold(),
+            Some(holds.hold()),
             12_000,
             true,
         );

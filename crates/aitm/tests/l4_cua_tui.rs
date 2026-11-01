@@ -587,18 +587,30 @@ async fn tui_l4_cua_against_a_live_core() {
             "confirm shows the scope: {ov}"
         );
         cua.key(KeyCode::Char('y')).await;
-        cua.pump(Duration::from_millis(400)).await;
+        // The confirmed re-issue is a round trip to the live core; under load
+        // (Terminal gate 2) it took more than one fixed 400 ms pump. Pump in
+        // 100 ms slices until the overlay closes, bounded at 5 s, and say how
+        // long it took.
+        let closed_after = {
+            let started = Instant::now();
+            let bound = Duration::from_secs(5);
+            while cua.app.mode == Mode::L4Confirm && started.elapsed() < bound {
+                cua.pump(Duration::from_millis(100)).await;
+            }
+            started.elapsed()
+        };
+        eprintln!("[inject] confirm overlay closed after {closed_after:?} (bound 5 s)");
         cua.snapshot("L4 inject — honest L4Unavailable degradation after confirm");
+        assert_ne!(
+            cua.app.mode,
+            Mode::L4Confirm,
+            "the overlay closes once the confirmed verb is re-issued (waited {closed_after:?})"
+        );
         let screen = cua.screen().to_lowercase();
         assert!(
             screen.contains("unavailable"),
             "the wire verb surfaces the typed L4Unavailable reason: {}",
             cua.screen()
-        );
-        assert_ne!(
-            cua.app.mode,
-            Mode::L4Confirm,
-            "the overlay closes once the confirmed verb is re-issued"
         );
         eprintln!(
             "[inject] confirm overlay shown (AC27), then honest degradation: l4.inject → L4Unavailable (no fake success)"

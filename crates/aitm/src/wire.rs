@@ -1198,7 +1198,7 @@ mod tests {
     /// (`aitm-proto-l4/tests/surface.rs::L4_COMMANDS`); the plan's "25 + 2 = 27"
     /// counted parity verbs that are not on this branch, so this pins
     /// 22 + 2 = 24. The tool-contract pins carry the same +2 in `EXPECTED_TOOLS`
-    /// and `CORE_TOOLS` (and the bus fixture).
+    /// and `CORE_TOOLS`.
     #[test]
     fn l4_on_registers_24_l4_names() {
         let mut cfg = Config::default();

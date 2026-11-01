@@ -10,7 +10,6 @@
 //! probe; only the policy's exec path is ever run through polkit, by
 //! [`request_linux`] below (plan P1b.14), whose argv is [`pkexec_argv`].
 
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -338,7 +337,7 @@ fn probe_reports_net_raw(helper: &Path) -> bool {
 //
 // Everything that decides is pure and tested on every OS: the argv builders,
 // the pre-spawn refusals in [`request_linux`], the §5.5 exit table in
-// [`classify_exit`] and the watcher's step in [`watch_step`]. The one piece of
+// [`classify_exit_full`] and the watcher's step in [`watch_step`]. The one piece of
 // I/O is [`StdSpawner`], which runs the argv it is given (never a shell) with
 // stderr on a pipe drained into a bounded [`StderrTail`].
 
@@ -386,7 +385,7 @@ pub trait Spawner: Send + Sync {
     fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>>;
 }
 
-/// The SIGINT seam of spec §5.5 (S7, corrected in the p1b review log): while
+/// The SIGINT hold of spec §5.5 (S7, corrected in the p1b review log): while
 /// a launcher child is alive, Ctrl-C must cancel the prompt without ending
 /// the core, and `SIG_IGN` is never installed (it would be inherited across
 /// `execve` and make the prompt un-cancellable).
@@ -394,27 +393,22 @@ pub trait Spawner: Send + Sync {
 /// The `aitm` binary already owns SIGINT through tokio's `ctrl_c`
 /// (`shutdown_signal` in `crates/aitm/src/lib.rs`), so the signal never kills
 /// the process by itself: what ends the run is the shutdown future. The hold
-/// is therefore a count, [`HoldCount`], that the request raises for the
-/// child's lifetime and the shutdown future consults: a Ctrl-C while held is
-/// logged and the core keeps serving; the child, with the default disposition
-/// restored across exec, dies of it and the watcher records `dismissed`. No
-/// `unsafe`, no `sigaction`, no new crate (plan Rule 8 holds).
-///
-/// The trait has one operation, `hold`; nothing can install an ignore through
-/// it. Tests count holds through the same type.
-pub trait SignalGuard: Send + Sync {
-    /// Take a hold for one child's lifetime; dropping the token releases it.
-    fn hold(&self) -> Box<dyn Any + Send>;
-}
-
-/// The production [`SignalGuard`]: a shared count of live holds. Clones share
-/// the counter, so the binary's shutdown future can hold one clone while the
-/// privilege state holds another.
+/// is therefore a count that the request raises for the child's lifetime
+/// ([`HoldCount::hold`]) and the shutdown future consults: a Ctrl-C while
+/// held is logged and the core keeps serving; the child, with the default
+/// disposition restored across exec, dies of it and the watcher records
+/// `dismissed`. No `unsafe`, no `sigaction`, no new crate (plan Rule 8
+/// holds). The one operation is `hold`; nothing can install an ignore
+/// through it. Clones share the counter, so the binary's shutdown future
+/// can hold one clone while the privilege state holds another.
 #[derive(Debug, Default, Clone)]
 pub struct HoldCount(Arc<AtomicUsize>);
 
-/// One hold on a [`HoldCount`]; dropping it releases the hold.
-struct HoldToken(Arc<AtomicUsize>);
+/// One hold on a [`HoldCount`] for one child's lifetime; dropping it
+/// releases the hold.
+#[must_use = "dropping the token releases the hold at once"]
+#[derive(Debug)]
+pub struct HoldToken(Arc<AtomicUsize>);
 
 impl Drop for HoldToken {
     fn drop(&mut self) {
@@ -423,6 +417,12 @@ impl Drop for HoldToken {
 }
 
 impl HoldCount {
+    /// Take a hold for one child's lifetime; dropping the token releases it.
+    pub fn hold(&self) -> HoldToken {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        HoldToken(Arc::clone(&self.0))
+    }
+
     /// At least one hold is out: a prompt is up, Ctrl-C must not end the core.
     #[must_use]
     pub fn is_held(&self) -> bool {
@@ -433,13 +433,6 @@ impl HoldCount {
     #[must_use]
     pub fn count(&self) -> usize {
         self.0.load(Ordering::SeqCst)
-    }
-}
-
-impl SignalGuard for HoldCount {
-    fn hold(&self) -> Box<dyn Any + Send> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Box::new(HoldToken(Arc::clone(&self.0)))
     }
 }
 
@@ -522,9 +515,9 @@ pub fn drain_into(mut pipe: impl Read, tail: &Mutex<StderrTail>) {
 /// `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY` are passed so a graphical
 /// agent lookup sees the same session the core runs in. Deliberately absent:
 /// `SHELL` (pkexec refuses a value not in `/etc/shells`), `LANG`/`LC_*` (the
-/// C locale keeps the stderr texts [`classify_exit`] matches as spike S7
+/// C locale keeps the stderr texts [`classify_exit_full`] matches as spike S7
 /// measured them), `PATH` (the program is absolute), and everything else.
-pub const PASSED_ENV: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
+pub(crate) const PASSED_ENV: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
 
 /// The real spawner: `std::process::Command` over `argv[0]`, environment
 /// cleared down to [`PASSED_ENV`], stdin and stdout inherited (the textual
@@ -757,8 +750,9 @@ pub const APPROVAL_TIMEOUT_MS: u64 = 300_000;
 pub struct Spawned {
     /// The launcher (or the direct helper).
     pub child: Box<dyn Child>,
-    /// Released when the child ends or connects.
-    pub hold: Box<dyn Any + Send>,
+    /// Released when the child ends or connects; `None` for a direct start
+    /// (no prompt, no hold).
+    pub hold: Option<HoldToken>,
 }
 
 impl std::fmt::Debug for Spawned {
@@ -796,15 +790,15 @@ impl LinuxRequest {
 /// prompt possible is `cannot_prompt` with the no-prompt text; a helper that
 /// is not the root-owned policy exec path, a missing policy file or launcher
 /// is `cannot_prompt` with the package label; otherwise a SIGINT hold is
-/// taken and exactly [`pkexec_argv`]`(socket)` is spawned, answering
-/// `Pending` with the dialog text when `display_set` (`DISPLAY` or
+/// taken on `hold` and exactly [`pkexec_argv`]`(socket)` is spawned,
+/// answering `Pending` with the dialog text when `display_set` (`DISPLAY` or
 /// `WAYLAND_DISPLAY` non-empty) else the terminal text. `socket` is the
 /// listener's absolute path, bound by the caller before this spawns.
 pub fn request_linux(
     cfg: &PrivilegeConfig,
     inputs: &LinuxInputs,
     spawner: &dyn Spawner,
-    signal: &dyn SignalGuard,
+    hold: &HoldCount,
     socket: &Path,
     display_set: bool,
 ) -> LinuxRequest {
@@ -824,7 +818,7 @@ pub fn request_linux(
         return LinuxRequest::refuse(text::LINUX_NO_PROMPT);
     }
 
-    let hold = signal.hold();
+    let token = hold.hold();
     match spawner.spawn(&pkexec_argv(socket)) {
         Ok(child) => LinuxRequest {
             outcome: Outcome::Pending,
@@ -833,10 +827,13 @@ pub fn request_linux(
             } else {
                 msg::PENDING_TERMINAL.to_string()
             },
-            spawned: Some(Spawned { child, hold }),
+            spawned: Some(Spawned {
+                child,
+                hold: Some(token),
+            }),
         },
         Err(err) => {
-            drop(hold);
+            drop(token);
             LinuxRequest::refuse(&format!("{} ({err})", msg::SPAWN_FAILED))
         }
     }
@@ -845,7 +842,7 @@ pub fn request_linux(
 /// Which §5.5 row ended the watch; what the watcher branches on (never the
 /// message text).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitClass {
+pub(crate) enum ExitClass {
     /// Cancel, Ctrl-D or Ctrl-C at the prompt.
     Dismissed,
     /// Wrong password, or the caller is not an administrator.
@@ -867,7 +864,10 @@ pub enum ExitClass {
 /// EOF, not authorized (the EOF text is followed by the same "Not authorized"
 /// line).
 #[must_use]
-pub fn classify_exit_full(exit: ChildExit, stderr_tail: &str) -> (ExitClass, RequestState, String) {
+pub(crate) fn classify_exit_full(
+    exit: ChildExit,
+    stderr_tail: &str,
+) -> (ExitClass, RequestState, String) {
     match exit {
         ChildExit::Exited(126) => (
             ExitClass::Dismissed,
@@ -907,17 +907,10 @@ pub fn classify_exit_full(exit: ChildExit, stderr_tail: &str) -> (ExitClass, Req
     }
 }
 
-/// [`classify_exit_full`] without the class: the progress and the message.
-#[must_use]
-pub fn classify_exit(exit: ChildExit, stderr_tail: &str) -> (RequestState, String) {
-    let (_, state, message) = classify_exit_full(exit, stderr_tail);
-    (state, message)
-}
-
 /// What one watcher step decided. A connected session is not a step outcome:
 /// the watcher learns of it from its own `accept`, not from the child.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WatchOutcome {
+pub(crate) enum WatchOutcome {
     /// Nothing yet; step again.
     Waiting,
     /// The child ended (or was killed at the deadline); record this progress.
@@ -935,7 +928,7 @@ pub enum WatchOutcome {
 /// [`classify_exit_full`]ed over its stderr tail; else [`APPROVAL_TIMEOUT_MS`]
 /// after `started_ms` on the injected clock the child is killed and the
 /// request `failed` with the timeout text; else wait.
-pub fn watch_step(child: &mut dyn Child, started_ms: u64, now_ms: u64) -> WatchOutcome {
+pub(crate) fn watch_step(child: &mut dyn Child, started_ms: u64, now_ms: u64) -> WatchOutcome {
     match child.try_wait() {
         Ok(Some(exit)) => {
             let tail = child.stderr_tail();
@@ -1381,10 +1374,17 @@ mod tests {
         );
     }
 
+    /// The §5.5 row without its class, for the tests that pin state and
+    /// message only.
+    fn pair(exit: ChildExit, stderr_tail: &str) -> (RequestState, String) {
+        let (_, state, message) = classify_exit_full(exit, stderr_tail);
+        (state, message)
+    }
+
     #[test]
     fn exit_126_is_dismissed() {
         assert_eq!(
-            classify_exit(
+            pair(
                 ChildExit::Exited(126),
                 "Error executing command as another user: Request dismissed\n"
             ),
@@ -1400,7 +1400,7 @@ mod tests {
         let stderr = "polkit-agent-helper-1: pam_authenticate failed: Authentication failure\n\
                       ==== AUTHENTICATION FAILED ====\n\
                       Error executing command as another user: Not authorized\n";
-        let (state, message) = classify_exit(ChildExit::Exited(127), stderr);
+        let (state, message) = pair(ChildExit::Exited(127), stderr);
         assert_eq!(state, RequestState::Failed);
         assert_eq!(
             message,
@@ -1418,7 +1418,7 @@ mod tests {
                       ==== AUTHENTICATION FAILED ====\n\
                       Error executing command as another user: Not authorized\n";
         assert_eq!(
-            classify_exit(ChildExit::Exited(127), stderr),
+            pair(ChildExit::Exited(127), stderr),
             (
                 RequestState::Dismissed,
                 "Approval was cancelled".to_string()
@@ -1430,7 +1430,7 @@ mod tests {
     fn no_agent_text_is_failed() {
         let stderr = "Error creating textual authentication agent: Error opening current \
                       controlling terminal for the process (`/dev/tty'): No such device or address\n";
-        let (state, message) = classify_exit(ChildExit::Exited(127), stderr);
+        let (state, message) = pair(ChildExit::Exited(127), stderr);
         assert_eq!(state, RequestState::Failed);
         assert_eq!(
             message,
@@ -1442,7 +1442,7 @@ mod tests {
     #[test]
     fn sigint_is_dismissed() {
         assert_eq!(
-            classify_exit(ChildExit::Signaled(SIGINT), ""),
+            pair(ChildExit::Signaled(SIGINT), ""),
             (
                 RequestState::Dismissed,
                 "Approval was cancelled".to_string()
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn other_exit_is_failed() {
         assert_eq!(
-            classify_exit(ChildExit::Exited(2), "pkexec --version\n"),
+            pair(ChildExit::Exited(2), "pkexec --version\n"),
             (
                 RequestState::Failed,
                 "The packet-capture helper did not start (pkexec exit 2)".to_string()
@@ -1462,14 +1462,14 @@ mod tests {
         );
         // 127 with none of the known texts is the generic row too.
         assert_eq!(
-            classify_exit(ChildExit::Exited(127), "something else entirely"),
+            pair(ChildExit::Exited(127), "something else entirely"),
             (
                 RequestState::Failed,
                 "The packet-capture helper did not start (pkexec exit 127)".to_string()
             )
         );
         assert_eq!(
-            classify_exit(ChildExit::Signaled(9), ""),
+            pair(ChildExit::Signaled(9), ""),
             (
                 RequestState::Failed,
                 "The packet-capture helper did not start (killed by signal 9)".to_string()
@@ -1531,11 +1531,11 @@ mod tests {
             .any(|arg| arg.to_string_lossy().contains("pkexec")));
     }
 
-    /// Spec §5.5 as corrected (p1b review log, P1b.14 SIGINT): the guard is
+    /// Spec §5.5 as corrected (p1b review log, P1b.14 SIGINT): the hold is
     /// the production [`HoldCount`], not a fake. Its only operation is `hold`
     /// (nothing can install `SIG_IGN` through it); the spawn happens under
-    /// exactly one hold, the token releases it, and the binary's shutdown
-    /// future reads the same count through a clone.
+    /// exactly one hold, the [`HoldToken`] releases it, and the binary's
+    /// shutdown future reads the same count through a clone.
     #[test]
     fn sigint_handler_installed_not_ignored() {
         let holds = HoldCount::default();
@@ -1758,7 +1758,7 @@ mod tests {
     #[test]
     fn classify_exit_precedence_and_exit_zero() {
         assert_eq!(
-            classify_exit(ChildExit::Exited(126), "Not authorized").0,
+            pair(ChildExit::Exited(126), "Not authorized").0,
             RequestState::Dismissed
         );
         let all_three = format!(
@@ -1768,20 +1768,17 @@ mod tests {
             stderr_text::NOT_AUTHORIZED
         );
         assert_eq!(
-            classify_exit(ChildExit::Exited(127), &all_three),
+            pair(ChildExit::Exited(127), &all_three),
             (RequestState::Failed, msg::NO_PROMPT_SHOWN.to_string())
         );
         let eof_and_auth = format!("{}\n{}\n", stderr_text::EOF, stderr_text::NOT_AUTHORIZED);
         assert_eq!(
-            classify_exit(ChildExit::Exited(127), &eof_and_auth),
+            pair(ChildExit::Exited(127), &eof_and_auth),
             (RequestState::Dismissed, msg::CANCELLED.to_string())
         );
+        assert_eq!(pair(ChildExit::Exited(127), "").0, RequestState::Failed);
         assert_eq!(
-            classify_exit(ChildExit::Exited(127), "").0,
-            RequestState::Failed
-        );
-        assert_eq!(
-            classify_exit(ChildExit::Exited(0), ""),
+            pair(ChildExit::Exited(0), ""),
             (
                 RequestState::Failed,
                 "The packet-capture helper did not start (pkexec exit 0)".to_string()
@@ -1793,10 +1790,7 @@ mod tests {
             stderr_text::NOT_AUTHORIZED,
             "y".repeat(2000)
         );
-        assert_eq!(
-            classify_exit(ChildExit::Exited(127), &noisy).1,
-            msg::AUTH_FAILED
-        );
+        assert_eq!(pair(ChildExit::Exited(127), &noisy).1, msg::AUTH_FAILED);
     }
 
     /// Tester: when the launcher itself cannot be started (no `pkexec` binary,
@@ -1910,9 +1904,9 @@ mod tests {
 
     // ---- fix task 2026-11-01: I2 (the production SIGINT hold) ----
 
-    /// The production `SignalGuard` is a hold count the binary's shutdown
-    /// future consults: `hold` increments, the token's drop decrements, a
-    /// clone shares the counter, `is_held` is "any token out".
+    /// The production hold is a count the binary's shutdown future consults:
+    /// `hold` increments, the token's drop decrements, a clone shares the
+    /// counter, `is_held` is "any token out".
     #[test]
     fn hold_count_tokens_increment_and_decrement_on_drop() {
         let hold = HoldCount::default();
@@ -2084,13 +2078,14 @@ mod tests {
         assert_eq!(class(ChildExit::Exited(127), ""), ExitClass::Other);
         assert_eq!(class(ChildExit::Signaled(9), ""), ExitClass::Other);
 
-        // The full form agrees with the pair form on state and message.
-        let (reason, state, message) =
-            classify_exit_full(ChildExit::Exited(127), stderr_text::NO_AGENT);
-        assert_eq!(reason, ExitClass::NoAgent);
+        // The class travels with the row's state and message.
         assert_eq!(
-            (state, message),
-            classify_exit(ChildExit::Exited(127), stderr_text::NO_AGENT)
+            classify_exit_full(ChildExit::Exited(127), stderr_text::NO_AGENT),
+            (
+                ExitClass::NoAgent,
+                RequestState::Failed,
+                msg::NO_PROMPT_SHOWN.to_string()
+            )
         );
 
         // Timed out and a broken child carry their classes through watch_step.

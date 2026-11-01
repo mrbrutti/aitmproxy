@@ -159,14 +159,14 @@ pub enum Action {
 
 /// The most of a peer-supplied text (helper refusal, capture close reason,
 /// receipt error) that reaches an operator: 512 bytes.
-pub const TEXT_BOUND: usize = 512;
+pub(crate) const TEXT_BOUND: usize = 512;
 
 /// Bound a text that came from a peer for an operator's eyes: every control
 /// character becomes a space, surrounding whitespace is trimmed, and the
 /// result is cut to `max` bytes at a character boundary. May be empty; see
 /// [`bounded_text_or`] for a fallback.
 #[must_use]
-pub fn bounded_text(text: &str, max: usize) -> String {
+pub(crate) fn bounded_text(text: &str, max: usize) -> String {
     let cleaned: String = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -181,7 +181,7 @@ pub fn bounded_text(text: &str, max: usize) -> String {
 
 /// [`bounded_text`], with `fallback` when nothing printable is left.
 #[must_use]
-pub fn bounded_text_or(text: &str, max: usize, fallback: &str) -> String {
+pub(crate) fn bounded_text_or(text: &str, max: usize, fallback: &str) -> String {
     let bounded = bounded_text(text, max);
     if bounded.is_empty() {
         fallback.to_string()

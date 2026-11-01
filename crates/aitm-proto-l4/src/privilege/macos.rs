@@ -83,20 +83,21 @@ pub enum HandoffRefusal {
 /// The handoff app's canonical path (symlinks and `/var` → `/private/var`
 /// resolved), so the checks below see the real location; a path that cannot
 /// be canonicalized does not exist for us: `Missing`.
-pub fn canonicalize_or_missing(path: &Path) -> Result<PathBuf, HandoffRefusal> {
+pub(crate) fn canonicalize_or_missing(path: &Path) -> Result<PathBuf, HandoffRefusal> {
     std::fs::canonicalize(path).map_err(|_| HandoffRefusal::Missing)
 }
 
 /// Canonicalize, refuse by the canonical path's shape (temporary tree, `.app`
-/// suffix) **before** any fact is gathered about it, then validate against
-/// `facts(&canonical)`. `Ok` carries the canonical path to use from here on.
-pub fn validated_handoff(
+/// suffix) **before** any fact is gathered about it, then validate the facts
+/// gathered for the canonical path. Each check runs once. `Ok` carries the
+/// canonical path to use from here on.
+pub(crate) fn validated_handoff(
     path: &Path,
     facts: impl FnOnce(&Path) -> AppFacts,
 ) -> Result<PathBuf, HandoffRefusal> {
     let canonical = canonicalize_or_missing(path)?;
     refuse_by_path(&canonical)?;
-    validate_handoff_app(&canonical, &facts(&canonical))?;
+    validate_facts(&facts(&canonical))?;
     Ok(canonical)
 }
 
@@ -112,13 +113,9 @@ fn refuse_by_path(path: &Path) -> Result<(), HandoffRefusal> {
     Ok(())
 }
 
-/// Validate a handoff app against the facts gathered about it. Pure: the path
-/// shape is checked first (temporary tree, `.app` suffix), then the facts
-/// (exists, bundle id, signature), so a path we would never use is refused
-/// before anything about it is trusted. Callers give it the **canonical**
-/// path ([`validated_handoff`] does).
-pub fn validate_handoff_app(path: &Path, facts: &AppFacts) -> Result<(), HandoffRefusal> {
-    refuse_by_path(path)?;
+/// The facts half of [`validate_handoff_app`]: exists, bundle id, signature,
+/// in that order.
+fn validate_facts(facts: &AppFacts) -> Result<(), HandoffRefusal> {
     if !facts.is_dir {
         return Err(HandoffRefusal::Missing);
     }
@@ -131,6 +128,16 @@ pub fn validate_handoff_app(path: &Path, facts: &AppFacts) -> Result<(), Handoff
         return Err(HandoffRefusal::BadSignature);
     }
     Ok(())
+}
+
+/// Validate a handoff app against the facts gathered about it. Pure: the path
+/// shape is checked first ([`refuse_by_path`]: temporary tree, `.app`
+/// suffix), then the facts ([`validate_facts`]: exists, bundle id,
+/// signature), so a path we would never use is refused before anything about
+/// it is trusted. Callers give it the **canonical** path.
+pub fn validate_handoff_app(path: &Path, facts: &AppFacts) -> Result<(), HandoffRefusal> {
+    refuse_by_path(path)?;
+    validate_facts(facts)
 }
 
 fn is_app_bundle_path(path: &Path) -> bool {
@@ -645,7 +652,11 @@ mod tests {
     /// checked; a path that cannot be canonicalized is `Missing`, and the
     /// temporary-tree refusal applies to the canonical path (so a symlink or
     /// `/var` spelling into a temp tree is still refused) before any facts
-    /// are gathered about it.
+    /// are gathered about it. The bundle is built under a member of
+    /// `TEMP_PREFIXES` (the process's temp dir, which canonicalizes into
+    /// `/private/var/folders` or `/private/tmp` on macOS and `/tmp` on
+    /// Linux), so the outcome here is `TempPath` only; the outside-a-temp-tree
+    /// case is the pure literal call below.
     #[test]
     fn handoff_path_is_canonicalized_before_the_checks() {
         assert_eq!(
@@ -658,26 +669,29 @@ mod tests {
         std::fs::create_dir_all(&app).expect("temp app dir");
         let canonical = canonicalize_or_missing(&app).expect("canonical");
         assert!(canonical.is_absolute());
-        let in_temp_tree = TEMP_PREFIXES
-            .iter()
-            .any(|prefix| canonical.starts_with(prefix));
+        assert!(
+            TEMP_PREFIXES
+                .iter()
+                .any(|prefix| canonical.starts_with(prefix)),
+            "this test builds its bundle inside a TEMP_PREFIXES member; the temp dir \
+             canonicalizes to {canonical:?}"
+        );
         let facts_asked = std::cell::Cell::new(false);
         let result = validated_handoff(&app, |_| {
             facts_asked.set(true);
             good()
         });
         let _ = std::fs::remove_dir_all(&dir);
-        if in_temp_tree {
-            assert_eq!(result, Err(HandoffRefusal::TempPath), "{canonical:?}");
-            assert!(!facts_asked.get(), "refused before any facts were gathered");
-        } else {
-            // A TMPDIR outside the known trees: the canonical path is what
-            // the facts are gathered for, and good facts pass.
-            assert_eq!(result, Ok(canonical));
-            assert!(facts_asked.get());
-        }
+        assert_eq!(result, Err(HandoffRefusal::TempPath), "{canonical:?}");
+        assert!(!facts_asked.get(), "refused before any facts were gathered");
 
-        // The pure check on a canonical spelling.
+        // Outside every temporary tree (pure, literal): good facts pass.
+        assert_eq!(
+            validate_handoff_app(Path::new("/Applications/Aitmproxy.app"), &good()),
+            Ok(())
+        );
+
+        // The pure check on a canonical spelling into a temp tree.
         assert_eq!(
             validate_handoff_app(Path::new("/private/tmp/Aitmproxy.app"), &good()),
             Err(HandoffRefusal::TempPath)

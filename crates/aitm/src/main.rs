@@ -1966,7 +1966,6 @@ mod tests {
     /// `tui_shutdown_arm_consults_the_prompt_hold`.
     #[test]
     fn the_prompt_hold_handed_to_the_shutdown_arms_is_the_states() {
-        use aitm_proto_l4::privilege::linux::SignalGuard;
         let (state, prompt) = super::privilege_state_with_hold(&PrivilegeConfig {
             enabled: false,
             l4: Default::default(),

@@ -66,10 +66,11 @@ pub const CAPTURE_OPEN_DIRECTION: L4Direction = L4Direction::Inbound;
 pub const CAPTURE_ENDED: &str = "helper capture ended: ";
 
 /// After [`CAPTURE_ENDED`] when the helper's close reason was blank.
-pub const CAPTURE_CLOSED_NO_REASON: &str = "no reason given";
+pub(crate) const CAPTURE_CLOSED_NO_REASON: &str = "no reason given";
 
 /// The `WireWrite` text when the helper refused an inject with a blank error.
-pub const INJECT_REFUSED_NO_REASON: &str = "the helper refused the inject and gave no reason";
+pub(crate) const INJECT_REFUSED_NO_REASON: &str =
+    "the helper refused the inject and gave no reason";
 
 /// `sent_gen` before the first `ScopeSet` went out.
 const NEVER_SENT: u64 = u64::MAX;
@@ -140,18 +141,13 @@ impl HelperBackend {
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
-
-    /// True while the helper session is open: what the privilege prober's
-    /// `session_connected` input reads through the state's helper slot.
-    #[must_use]
-    pub fn is_live(&self) -> bool {
-        !self.session.is_closed()
-    }
 }
 
 impl LiveBackend for HelperBackend {
+    /// True while the helper session is open: what the privilege prober's
+    /// `session_connected` input reads through the state's helper slot.
     fn is_live(&self) -> bool {
-        HelperBackend::is_live(self)
+        !self.session.is_closed()
     }
 }
 

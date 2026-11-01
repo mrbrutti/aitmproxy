@@ -75,9 +75,13 @@ COMMAND_WORDS = re.compile(r"\b(sudo|setcap|chmod|chgrp|chown|dseditgroup|launch
 # "The packet-capture helper did not start (pkexec exit <n>)" / "(killed by signal <n>)".
 # That literal names `pkexec` by design, so the command-word scan of a *progress message*
 # (`request.message`, and the request reply's `message` when it is the same text) exempts
-# exactly this prefix. Reasons, labels, prompts, start-up lines and one-shot output keep the
-# full scan (`names_a_command`).
-PINNED_FAILED_PREFIX = "The packet-capture helper did not start ("
+# exactly those literals (panel 2: the whole message, anchored, not a prefix). The third
+# form is `linux.rs`'s `watch_step` row for a failed wait (`waitpid: <ERRNO>`); it names
+# no command, so it would pass the full scan anyway. Reasons, labels, prompts, start-up
+# lines and one-shot output keep the full scan (`names_a_command`).
+PINNED_FAILED_MESSAGE = re.compile(
+    r"^The packet-capture helper did not start \((pkexec exit -?\d+|killed by signal \d+|waitpid: [A-Z]+)\)$"
+)
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 CAPABILITY_STATES = ("available", "needs_approval", "unsupported")
@@ -256,10 +260,11 @@ def names_a_command(text) -> bool:
 
 
 def progress_message_names_a_command(text) -> bool:
-    """`names_a_command` for a request progress message: the spec-§5.5 pinned failure text
-    "The packet-capture helper did not start (...)" is exempt (it names pkexec by spec);
-    anything else is scanned in full."""
-    if isinstance(text, str) and text.startswith(PINNED_FAILED_PREFIX):
+    """`names_a_command` for a request progress message: the spec-§5.5 pinned failure texts
+    "The packet-capture helper did not start (pkexec exit <n> | killed by signal <n> |
+    waitpid: <ERRNO>)" are exempt, whole and anchored (the first names pkexec by spec);
+    anything else, a longer message with that prefix included, is scanned in full."""
+    if isinstance(text, str) and PINNED_FAILED_MESSAGE.fullmatch(text):
         return False
     return names_a_command(text)
 
