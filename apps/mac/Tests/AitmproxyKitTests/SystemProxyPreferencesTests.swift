@@ -85,7 +85,8 @@ import Testing
         #expect(SystemProxyPreferences.bypassHosts("\r\n\t ,\r\n") == [])
     }
 
-    /// The parser does not validate: a quote, a backslash, a wildcard, an IDN label, a CIDR or a bracketed v6
+    /// The parser does not validate host SYNTAX (the two drops are control scalars and a leading dash, tested
+    /// below): a quote, a backslash, a wildcard, an IDN label, a CIDR or a bracketed v6
     /// literal pass through untouched. The YAML escaper (`EmbeddedCoreLaunch.yamlDoubleQuoted`) owns the quoting
     /// and the core owns the matching rules.
     @Test func hostsPassThroughUnvalidated() {

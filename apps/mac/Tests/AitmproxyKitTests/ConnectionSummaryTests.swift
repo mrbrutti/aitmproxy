@@ -848,10 +848,11 @@ import Testing
 
     /// `make` with the verb facts beside the CFNetwork read: the core ready, the bus connected as operator.
     private func withFacts(_ facts: SystemProxyFacts?, systemProxy: SystemProxyState? = nil, capability: CaptureCapability = .capturing,
-                           extensionSupported: Bool = true, hosts: Int = 2, flows: Int = 0) -> ConnectionSummary {
-        ConnectionSummary.make(core: core(.ready), activeKind: .embedded, bus: .connected("x"), role: "operator", roleWarning: false,
-                               capability: capability, captureSupported: extensionSupported, scopeHostCount: hosts, flowCount: flows,
-                               listenAddress: "127.0.0.1:8080", systemProxy: systemProxy, systemProxyFacts: facts)
+                           extensionSupported: Bool = true, hosts: Int = 2, flows: Int = 0,
+                           listening: String = "127.0.0.1:8080") -> ConnectionSummary {
+        ConnectionSummary.make(core: core(.ready, proxy: listening), activeKind: .embedded, bus: .connected("x"), role: "operator",
+                               roleWarning: false, capability: capability, captureSupported: extensionSupported, scopeHostCount: hosts,
+                               flowCount: flows, listenAddress: listening, systemProxy: systemProxy, systemProxyFacts: facts)
     }
 
     /// The verb facts for one word. `state` is what `SystemProxyFacts(compact:listenAddress:)` derives: both protocols at
@@ -1118,13 +1119,6 @@ import Testing
     }
 
     // MARK: System proxy — edges a bus client must survive (tester, stage 5)
-
-    /// `make` against another listen address (a core on a wildcard or IPv6 listen, or one the app cannot parse).
-    private func withFacts(_ facts: SystemProxyFacts?, listening listen: String, flows: Int = 0) -> ConnectionSummary {
-        ConnectionSummary.make(core: core(.ready, proxy: listen), activeKind: .embedded, bus: .connected("x"), role: "operator",
-                               roleWarning: false, capability: .capturing, captureSupported: true, scopeHostCount: 2,
-                               flowCount: flows, listenAddress: listen, systemProxyFacts: facts)
-    }
 
     private let systemProxyDetail = "every proxy-aware app, regardless of Scope"
     private let plainPointer = "Point a client at 127.0.0.1:8080, or open the browser"

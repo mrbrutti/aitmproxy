@@ -289,7 +289,7 @@ final class BusService: FlowActions {
         if let facts = status["system_proxy"].flatMap({ SystemProxyFacts(compact: $0, listenAddress: session.effectiveListenAddress) }) {
             session.applySystemProxyFacts(facts)
         } else if session.systemProxyFacts != nil {
-            session.systemProxyFacts = nil
+            session.forgetSystemProxy()
         }
     }
 

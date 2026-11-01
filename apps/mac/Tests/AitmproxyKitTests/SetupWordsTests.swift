@@ -8,7 +8,7 @@ import Testing
         #expect(SetupWords.scopeCaption == "Nothing is decrypted until a host is in Scope")
     }
 
-    /// PR 4 Task 28 (spec §D13 "First-run sheet"): row 1's title while the route is unknown, and the caption
+    /// PR 4 Task 28 (spec §D13 "First-run sheet"): row 1's title (unconditional since F-mac: Matt's words), and the caption
     /// under its button — the sheet's Set button turns on the launch preference, and says so, verbatim.
     @Test func systemProxyRowWordsAreTheSpecLiterals() {
         #expect(SetupWords.systemProxyRowTitle == "Set aitmproxy as the system proxy")
@@ -19,7 +19,7 @@ import Testing
         #expect(SetupWords.systemProxyAutoCaption.unicodeScalars.contains("\u{201D}"))
         #expect(SetupWords.systemProxyAutoCaption.unicodeScalars.contains("\u{25B8}"))
         #expect(!SetupWords.systemProxyAutoCaption.contains("\""))
-        // Row 1's fallback title is the Getting-started row's §D13 words minus its ", or open the browser" clause,
+        // Row 1's title is the Getting-started row's §D13 words minus its ", or open the browser" clause,
         // so the sheet and the Status list never say two different things.
         #expect("Set aitmproxy as the system proxy, or open the browser".hasPrefix(SetupWords.systemProxyRowTitle))
     }

@@ -16,10 +16,7 @@ extension Session {
     /// Setting the system proxy is a bus call that changes the OS: live while the bus is connected AS the
     /// operator, the core has reported a mechanism (`supported`), and no change is in flight — neither
     /// ours (`systemProxySetting`) nor another client's (the facts' `setting`).
-    var systemProxyControlLive: Bool {
-        guard case .connected = bus, resolvedRole == "operator", let facts = systemProxyFacts, facts.supported else { return false }
-        return !systemProxySetting && !facts.setting
-    }
+    var systemProxyControlLive: Bool { systemProxyNotLiveCause == nil }
 
     /// The verb's word is `points_at_us`: the menu item reads "Restore System Proxy" and the Settings toggle
     /// is on. No facts (no verb, no bus) → false, never a guess from the CFNetwork read.
@@ -41,8 +38,13 @@ extension Session {
     /// The two mutating verbs, for the surfaces that must not offer them generically (the palette's
     /// Commands list, the Agent log's Approve), like `isCATrustVerb`.
     static func isSystemProxyVerb(_ name: String) -> Bool {
-        name == "proxy.system.set" || name == "proxy.system.unset"
+        name == "\(verbPrefix)set" || name == "\(verbPrefix)unset"
     }
+
+    /// The verb family's one spelling: the two mutating verbs and `proxy.system.status` share it, and
+    /// `clearOwnError` recognises this path's own `lastError` lines by it.
+    private static let verbPrefix = "proxy.system."
+
 
     /// Point every service at this core, with the Settings ▸ Proxy bypass list (D5).
     func setSystemProxy() async { await changeSystemProxy("proxy.system.set") }
@@ -79,9 +81,10 @@ extension Session {
         systemProxySetting = false
     }
 
-    /// The one write of the facts, change-guarded like the poll's writes (an @Observable set notifies
-    /// even when equal): the poll, the status re-read and the set/unset replies all come here. A
-    /// compact object keeps the last full read's `guidance`/`remedy` while the word is unchanged.
+    /// The one write of a non-nil value, change-guarded like the poll's writes (an @Observable set
+    /// notifies even when equal): the poll, the status re-read and the set/unset replies all come here;
+    /// `forgetSystemProxy()` is the one write of nil. A compact object keeps the last full read's
+    /// `guidance`/`remedy` while the word is unchanged.
     func applySystemProxyFacts(_ facts: SystemProxyFacts) {
         let merged = facts.keepingFullFields(from: systemProxyFacts)
         if merged != systemProxyFacts { systemProxyFacts = merged }
@@ -89,8 +92,8 @@ extension Session {
 
     private func changeSystemProxy(_ command: String) async {
         guard !systemProxySetting, case .connected = bus else { return }
-        guard systemProxyControlLive else {
-            lastError = "\(command): \((systemProxyNotLiveCause ?? .waitingForCore).sentence)"
+        if let cause = systemProxyNotLiveCause {
+            lastError = "\(command): \(cause.sentence)"
             return
         }
         systemProxySetting = true
@@ -128,7 +131,7 @@ extension Session {
     /// Success clears only this path's own line: `lastError` is the app's one shared error, and another
     /// surface's unread failure is not ours to blank (the CA path keeps its own `caTrustLastError`).
     private func clearOwnError() {
-        if let line = lastError, line.hasPrefix("proxy.system.") { lastError = nil }
+        if let line = lastError, line.hasPrefix(Self.verbPrefix) { lastError = nil }
     }
 }
 
