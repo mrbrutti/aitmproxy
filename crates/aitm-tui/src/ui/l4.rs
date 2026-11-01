@@ -334,12 +334,19 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     } else {
         None
     };
+    // `s` is refused locally while `l4.capture.status` (capture + inject) says
+    // unavailable (L4 parity B10 / AC33); the hint says which it is.
+    let inject = if app.l4.capture.available {
+        "s inject (guarded)"
+    } else {
+        "s inject (unavailable)"
+    };
     let header = match parked {
         Some(p) => format!(
-            "PacketSpec (YAML) — b build · s inject (guarded) · m apply to parked {} · u revert",
+            "PacketSpec (YAML) — b build · {inject} · m apply to parked {} · u revert",
             inert(&p.id)
         ),
-        None => "PacketSpec (YAML) — b build · s inject (guarded)".to_string(),
+        None => format!("PacketSpec (YAML) — b build · {inject}"),
     };
     buf.set_string(
         editor.x + 1,

@@ -2204,6 +2204,15 @@ fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
                      "layers": ["IPv4", "UDP", "Raw"]}]
     })]));
     app.selected = Some("l4-1".into());
+    // Capture/inject available (L4 parity B10 refuses `s` locally before the
+    // scope check while `l4.capture.status` says otherwise).
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: aitm_tui::l4::L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "captures": []}),
+        ),
+        intercept: app.l4.intercept.clone(),
+        captures: vec![],
+    });
     // A capture-only scope entry: refused locally, nothing on the wire.
     let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
         "interface": "lo0", "capability": "capture", "cidr": "127.0.0.1/32",

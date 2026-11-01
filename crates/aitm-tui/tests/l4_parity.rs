@@ -1631,6 +1631,110 @@ fn mutate_craft_pane_lists_the_keys_only_when_they_can_act() {
     assert!(!text.contains("u revert"), "{text}");
 }
 
+// ------------------------------------------------------------- inject_gate
+
+/// A craft-ready app (flow `F` on `lo` selected, `EDITOR_SPEC` in the editor)
+/// whose L4 scope also authorises inject on `lo`, so the capture/inject
+/// availability is the only thing standing between `s` and the bus.
+fn inject_ready(capture: L4Availability) -> App {
+    let mut app = craft_ready(vec![]);
+    let _ = app.on_bus(BusEvent::L4Scope(vec![
+        json!({
+            "interface": "lo", "capability": "intercept", "cidr": "127.0.0.1/32",
+            "ports": "9000-9999", "direction": "inbound"
+        }),
+        json!({
+            "interface": "lo", "capability": "inject", "cidr": "127.0.0.1/32",
+            "ports": "9000-9999", "direction": "outbound"
+        }),
+    ]));
+    set_capture(&mut app, capture, &[]);
+    app
+}
+
+/// The `l4.inject` call the available path sends: the editor's spec, the
+/// flow's interface and the spec's IPv4 destination.
+fn inject_args() -> Value {
+    json!({"spec": editor_spec(), "interface": "lo", "dst": "127.0.0.1"})
+}
+
+/// B10 / AC33: with capture `needs_privilege` (reason `R`), the craft pane's
+/// `s` key puts nothing on the bus, the toast is `inject unavailable: R`, no
+/// inject is left pending and no confirm opens. The same before the first
+/// status reply (pending is not available).
+#[test]
+fn inject_gate_refuses_locally_while_capture_is_unavailable() {
+    let mut app = inject_ready(unavailable("R"));
+    let action = keys::map(press('s'), Mode::Inspector).expect("`s` is bound in the inspector");
+    assert_eq!(action, Action::L4Inject);
+    let out = app.update(action);
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "inject unavailable: R");
+    assert!(app.l4.pending.is_none(), "{:?}", app.l4.pending);
+    assert!(app.l4.confirm.is_none());
+    assert_ne!(app.mode, Mode::L4Confirm);
+
+    let mut fresh = inject_ready(L4Availability::pending());
+    let out = fresh.update(Action::L4Inject);
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&fresh),
+        "inject unavailable: Reading L4 availability…"
+    );
+    assert!(fresh.l4.pending.is_none());
+}
+
+/// With capture available, `s` is exactly the `l4.inject` call as before
+/// (L4OPS-AC10): spec, interface and dst, left pending for the core's
+/// `needs_confirmation` reply; no refusal toast.
+#[test]
+fn inject_gate_available_sends_l4_inject_as_before() {
+    let mut app = inject_ready(available());
+    let out = app.update(Action::L4Inject);
+    assert_eq!(
+        out,
+        vec![BusRequest::Call {
+            name: "l4.inject".into(),
+            args: inject_args(),
+        }]
+    );
+    assert_eq!(
+        app.l4.pending,
+        Some(("l4.inject".to_string(), inject_args()))
+    );
+    assert!(
+        !toast_text(&app).contains("unavailable"),
+        "{}",
+        toast_text(&app)
+    );
+}
+
+/// The craft header offers `s inject (guarded)` only while capture/inject is
+/// available; otherwise it reads `s inject (unavailable)` (AC33: nothing that
+/// can only fail is offered as if it could act). The parked-packet keys keep
+/// their own rule beside it.
+#[test]
+fn inject_gate_craft_header_shows_the_matching_hint() {
+    let off = inject_ready(unavailable("R"));
+    let text = render_inspector(&off);
+    assert!(text.contains("s inject (unavailable)"), "{text}");
+    assert!(!text.contains("s inject (guarded)"), "{text}");
+
+    let on = inject_ready(available());
+    let text = render_inspector(&on);
+    assert!(text.contains("s inject (guarded)"), "{text}");
+    assert!(!text.contains("inject (unavailable)"), "{text}");
+
+    // Intercept available + `P1` parked, capture unavailable (`X`): both hints
+    // on one header line, each telling its own truth.
+    let parked = craft_ready(vec![parked_p1()]);
+    let text = render_inspector(&parked);
+    assert!(
+        text.contains("s inject (unavailable) · m apply to parked P1 · u revert"),
+        "{text}"
+    );
+}
+
 // ------------------------------------------------------------ scope_add_l4
 
 /// The operator L4 scope add (spec §3 / AC13, AC39). With a core whose

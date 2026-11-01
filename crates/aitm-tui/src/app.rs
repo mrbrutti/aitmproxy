@@ -2017,13 +2017,27 @@ impl App {
         }
     }
 
-    /// Inject the crafted packet via `l4.inject` only (L4OPS-AC10). Gated by L4
-    /// scope-as-authorisation; the guard's own refusal still surfaces verbatim
-    /// from the server, and the operator confirms over the wire before it sends.
+    /// Inject the crafted packet via `l4.inject` only (L4OPS-AC10). Refused
+    /// locally while `l4.capture.status` says unavailable (the status contract's
+    /// `needs_privilege` covers capture *and* inject, L4 parity spec §1; the
+    /// toast carries the core's reason, so nothing that can only fail reaches
+    /// the bus, AC33). Then gated by L4 scope-as-authorisation; the guard's own
+    /// refusal still surfaces verbatim from the server, and the operator
+    /// confirms over the wire before it sends.
     fn l4_inject(&mut self) -> Vec<BusRequest> {
         let Some(flow) = self.selected_l4().cloned() else {
             return Vec::new();
         };
+        if !self.l4.capture.available {
+            let reason = self
+                .l4
+                .capture
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            self.toast(Level::Warn, format!("inject unavailable: {reason}"));
+            return Vec::new();
+        }
         if !self.has_tool("l4.inject") {
             self.toast(Level::Warn, "l4.inject is not on this bus");
             return Vec::new();

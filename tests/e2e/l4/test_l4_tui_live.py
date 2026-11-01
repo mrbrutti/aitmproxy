@@ -22,6 +22,11 @@ the proxy, the reasons are the core's, the ring is the core's.
         macOS), so the keys are pressed in the inspector of a real HTTP row, where the L4
         verbs are no-ops and the HTTP verbs find nothing paused; the live verdict on a parked
         packet is [Linux].
+  B10   the craft pane's `s` (inject) is refused locally while `l4.capture.status` says
+        unavailable: NO `l4.inject` from `aitm-tui` on the ring after the key; the toast
+        `inject unavailable: <l4.capture.status.reason>` needs the craft pane of an L4 row,
+        which this rig cannot have, so that half is reported [skipped] (unit: `--test
+        l4_parity inject_gate`; the real-core key walk is crates/aitm/tests/l4_cua_tui.rs).
   AC14  with real HTTP rows: the chip bar shows `TCP UDP L4`, help (`?`) and the filter hint
         list `~l4 ~tcp ~udp ~icmp`, `/~l4` leaves `0 rows` (the tagged row is gone from the
         screen), Esc brings it back.
@@ -529,6 +534,11 @@ def scenario(term: Terminal, op, state: dict, facts: SimpleNamespace) -> None:
     time.sleep(0.3)
     term.press("u")
     time.sleep(0.3)
+    # B10: the inject key. On an L4 row's craft pane it is refused locally with the
+    # core's `l4.capture.status.reason`; on this rig (no L4 row) it is a no-op in the
+    # HTTP inspector and, either way, nothing named `l4.inject` may reach the ring.
+    term.press("s")
+    time.sleep(0.3)
     if paused in (0, None):
         term.press("a")
         expect(term.wait_for(re.escape(NOTHING_PAUSED), 5), "ui: `a` (Forward on L4 / Resume on HTTP) finds nothing paused", screen())
@@ -542,6 +552,17 @@ def scenario(term: Terminal, op, state: dict, facts: SimpleNamespace) -> None:
     show("ring: aitm-tui commands since the keys", histogram(since_keys))
     verdicts = [c for c in commands_matching(since_keys, "l4.intercept.") if c != INTERCEPT_POLL]
     expect(verdicts == [], f"ring: NO `l4.intercept.*` other than the §1 `{INTERCEPT_POLL}` poll from aitm-tui after a/d/m/u", verdicts)
+    injects = commands_matching(since_keys, "l4.inject")
+    expect(injects == [], "ring: NO `l4.inject` from aitm-tui after `s` (B10: refused locally while capture/inject is unavailable)", injects)
+    if facts.capture["available"]:
+        skipped_check("B10 `s` toast `inject unavailable: <reason>`", "capture is available here; the inject walk is [D0]'s")
+    elif isinstance(l4_rows, list) and l4_rows:
+        skipped_check("B10 `s` toast `inject unavailable: <reason>`",
+                      "an L4 row exists but the keys were pressed on the HTTP row; the L4 craft walk is crates/aitm/tests/l4_cua_tui.rs STEP 4")
+    else:
+        skipped_check("B10 `s` toast `inject unavailable: <reason>`",
+                      f"the craft pane needs an L4 row and this rig cannot have one (l4.capture.status: {facts.capture.get('code')!r}); "
+                      "the real-core key walk is crates/aitm/tests/l4_cua_tui.rs STEP 4")
     expect(not [c for c in commands_matching(since_keys, "flow.") if c in ("flow.kill", "flow.resume", "flow.mutate")],
            "ring: no flow.kill/resume/mutate from aitm-tui either (the HTTP verbs found nothing paused)")
     rows_after = flows_with(op, tag)

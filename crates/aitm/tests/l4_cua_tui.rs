@@ -37,8 +37,9 @@
 //! - the YAML craft editor builds a `PacketSpec` through the real, pure
 //!   `l4.craft` into a hex preview (AC8);
 //! - inject reaches the wire **only** through `l4.inject`, and on this
-//!   unprivileged host the wire verb surfaces the typed `L4Unavailable` reason —
-//!   no fake success, no panic (AC10 / AC18);
+//!   unprivileged host the `s` key is refused locally with the core's
+//!   `l4.capture.status` reason (L4 parity B10 / AC33): no `l4.inject` on the
+//!   ring, no `L4 unavailable` result, no fake success, no panic (AC10 / AC18);
 //! - scope-as-authorisation: a capture-only flow refuses inject with the scope
 //!   reason, and the real guard refuses an out-of-scope capture at the ingress
 //!   outright — stronger than the UI's dimming (AC9);
@@ -47,13 +48,15 @@
 //!
 //! **Privilege reality (CLI/Linux-first).** This macOS dev host cannot open
 //! `/dev/bpf` for raw L4, so the spawned core's startup probe reports
-//! capture/inject unavailable and the wire verbs fail closed with a typed
-//! `L4Unavailable` — a **required** scenario here (AC18). Because the gated
-//! wrapper suppresses the operator confirm-prompt while unavailable, the inject
-//! **confirm overlay** (dest + summary + scope + permit budget) and the real
-//! packet round-trip against the `aitm-testtarget` L4 service are the
+//! capture/inject unavailable (`l4.capture.status` → `needs_privilege` + reason)
+//! and the wire verbs fail closed with a typed `L4Unavailable` — a **required**
+//! scenario here (AC18). The TUI reads that status every slow poll and refuses
+//! `s` locally with the same reason (B10), so the honest-degradation claim is
+//! the witness's `l4.capture.status`, not a wire call that can only fail. The
+//! inject **confirm overlay** (dest + summary + scope + permit budget) and the
+//! real packet round-trip against the `aitm-testtarget` L4 service are the
 //! **privileged/Linux-gated** half: driven for real only under `AITM_L4_TESTS=1`
-//! on an elevated host; asserted-degraded otherwise. The parked-packet verdicts
+//! on an elevated host; asserted-refused otherwise. The parked-packet verdicts
 //! (Forward/Drop on a real parked packet) are Linux NFQUEUE only.
 //!
 //! **Sandbox.** The Claude sandbox cannot bind TCP; when the bus bind is refused
@@ -874,57 +877,100 @@ async fn tui_l4_cua_against_a_live_core() {
         cua.app.l4.craft.preview_layers
     );
 
-    // ---- STEP 4: inject reaches the wire ONLY via l4.inject; honest degradation ----
+    // ---- STEP 4: inject reaches the wire ONLY via l4.inject; refused locally while unavailable ----
     step(
         4,
-        "`s` injects via l4.inject only; the wire verb degrades honestly (AC10/AC18)",
+        "`s` injects via l4.inject only; while capture/inject is unavailable it is refused locally with the core's reason (AC10/AC18, L4 parity B10/AC33)",
     );
+    let craft_header = cua.screen();
+    let ring_before = tui_ring(&witness, t0).await;
+    let injects_before = commands(&ring_before, |c| c == "l4.inject").len();
     let sent = cua.key(KeyCode::Char('s')).await; // L4Inject
-    assert_eq!(
-        calls(&sent, |n| n.starts_with("l4.")),
-        vec!["l4.inject".to_string()],
-        "the inject key reaches the wire only through l4.inject"
-    );
-    if privileged_wire() && cua.app.mode == Mode::L4Confirm {
-        // Privileged host: the confirm overlay shows the wire summary, then `y`
-        // re-issues with the `_confirm` token and the real packet reaches the
-        // target. (Linux / elevated only.)
-        cua.snapshot("L4 inject — confirm overlay (privileged)");
-        let ov = cua.screen();
+    if cua.app.l4.capture.available {
         assert!(
-            ov.contains("127.0.0.1"),
-            "confirm shows the destination: {ov}"
+            craft_header.contains("s inject (guarded)"),
+            "the craft header offers the guarded inject: {craft_header}"
         );
-        assert!(
-            ov.to_lowercase().contains("scope"),
-            "confirm shows the scope: {ov}"
+        assert_eq!(
+            calls(&sent, |n| n.starts_with("l4.")),
+            vec!["l4.inject".to_string()],
+            "the inject key reaches the wire only through l4.inject"
         );
-        assert!(
-            ov.contains("budget"),
-            "confirm shows the permit budget: {ov}"
-        );
-        cua.key(KeyCode::Char('y')).await;
-        cua.pump(Duration::from_millis(400)).await;
-        cua.snapshot("L4 inject — after confirm (privileged real packet)");
-        eprintln!("[inject] privileged path: confirmed and sent a real packet");
+        if privileged_wire() && cua.app.mode == Mode::L4Confirm {
+            // Privileged host: the confirm overlay shows the wire summary, then
+            // `y` re-issues with the `_confirm` token and the real packet
+            // reaches the target. (Linux / elevated only.)
+            cua.snapshot("L4 inject — confirm overlay (privileged)");
+            let ov = cua.screen();
+            assert!(
+                ov.contains("127.0.0.1"),
+                "confirm shows the destination: {ov}"
+            );
+            assert!(
+                ov.to_lowercase().contains("scope"),
+                "confirm shows the scope: {ov}"
+            );
+            assert!(
+                ov.contains("budget"),
+                "confirm shows the permit budget: {ov}"
+            );
+            cua.key(KeyCode::Char('y')).await;
+            cua.pump(Duration::from_millis(400)).await;
+            cua.snapshot("L4 inject — after confirm (privileged real packet)");
+            eprintln!("[inject] privileged path: confirmed and sent a real packet");
+        } else {
+            cua.pump(Duration::from_millis(400)).await;
+            cua.snapshot("L4 inject — sent; awaiting the core's confirm reply");
+            eprintln!("[inject] capture available but the confirm overlay did not open; the wire reply is the core's");
+        }
     } else {
-        // This macOS host: the gated wrapper suppresses the confirm-prompt while
-        // unavailable, so inject goes straight to the wire verb, which fails
-        // closed with the typed reason — no overlay, no fake success, no panic.
-        cua.pump(Duration::from_millis(400)).await;
-        cua.snapshot("L4 inject — honest L4Unavailable degradation");
-        let screen = cua.screen().to_lowercase();
+        // This host: `l4.capture.status` says capture/inject is unavailable
+        // (`needs_privilege`, the witness read it in STEP 0). The TUI refuses
+        // the key locally with that reason: no `l4.inject` on the bus, no
+        // overlay, no fake success, no panic. The honest-degradation claim is
+        // the core's status, not a wire call that can only fail (AC33).
+        let reason = core_capture.reason.clone().unwrap_or_default();
         assert!(
-            screen.contains("unavailable"),
-            "the wire verb surfaces the typed L4Unavailable reason: {}",
-            cua.screen()
+            craft_header.contains("s inject (unavailable)"),
+            "the craft header says inject is unavailable: {craft_header}"
+        );
+        assert!(
+            !craft_header.contains("s inject (guarded)"),
+            "no guarded hint while unavailable: {craft_header}"
+        );
+        assert!(
+            calls(&sent, |n| n.starts_with("l4.")).is_empty(),
+            "`s` put no l4.* call on the bus while unavailable: {sent:?}"
+        );
+        assert_eq!(
+            cua.toast(),
+            format!("inject unavailable: {reason}"),
+            "the toast is the plan's literal plus the core's l4.capture.status reason"
         );
         assert_ne!(
             cua.app.mode,
             Mode::L4Confirm,
             "no overlay without privilege"
         );
-        eprintln!("[inject] honest degradation: l4.inject → L4Unavailable (no fake success)");
+        assert!(cua.app.l4.pending.is_none(), "no inject left pending");
+        cua.pump(Duration::from_millis(400)).await;
+        cua.snapshot("L4 inject — refused locally with the core's reason");
+        let ring = tui_ring(&witness, t0).await;
+        let injects = commands(&ring, |c| c == "l4.inject");
+        assert_eq!(
+            injects.len(),
+            injects_before,
+            "the witness sees no new l4.inject from `{TUI_LABEL}`: {injects:?}"
+        );
+        let bad = unavailable_results(&ring);
+        assert!(
+            bad.is_empty(),
+            "no `L4 unavailable` result for anything the TUI called (AC33): {bad:?}"
+        );
+        eprintln!(
+            "[inject] refused locally: `inject unavailable: {reason}`; l4.capture.status code {:?}; no l4.inject on the ring",
+            core_capture.code
+        );
     }
 
     // ---- STEP 5: scope-as-authorisation — the guard refuses out-of-scope capture (AC9) ----
@@ -997,9 +1043,10 @@ async fn tui_l4_cua_against_a_live_core() {
     eprintln!("\n########## TUI L4 CUA: all steps passed against the live core ##########");
     if !privileged_wire() {
         eprintln!(
-            "NOTE: wire verbs degraded honestly (L4Unavailable) on this unprivileged host; the \
-             confirm overlay + real-packet round-trip + in-path intercept bar are the \
-             privileged/Linux-gated half — run with AITM_L4_TESTS=1 on an elevated Linux host."
+            "NOTE: on this unprivileged host the TUI refused inject locally with the core's \
+             l4.capture.status reason (no wire call that can only fail); the confirm overlay + \
+             real-packet round-trip + in-path intercept bar are the privileged/Linux-gated half \
+             — run with AITM_L4_TESTS=1 on an elevated Linux host."
         );
     }
 
