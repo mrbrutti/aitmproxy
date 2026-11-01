@@ -144,9 +144,10 @@ struct ProviderRuleSet: Equatable {
         if wildcardAddresses.contains(address) || address == limitedBroadcast { return true }
         switch host {
         case .ipv4(let v4):
-            // `isLoopback` matches only 127.0.0.1 on the macOS 27 SDK (pinned by the
-            // 127.200.1.2 vector); the whole 127/8 block is loopback, so test the octet.
-            return v4.isLoopback || v4.rawValue.first == 127 || v4.isMulticast
+            // `IPv4Address.isLoopback` matches only 127.0.0.1 on the macOS 27 SDK (pinned
+            // by the 127.200.1.2 vector); the whole 127/8 block is loopback, so the first
+            // octet is tested instead -- it subsumes `isLoopback` (fix R2-4).
+            return v4.rawValue.first == 127 || v4.isMulticast
         case .ipv6(let v6): return v6.isLoopback || v6.isMulticast
         case .name: return true
         @unknown default: return true
