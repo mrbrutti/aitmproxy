@@ -42,7 +42,7 @@ use crate::intercept::{
     start_intercept, InterceptBackend, InterceptHandle, InterceptParams, NfqueueBackend, ParkedId,
     ParkedPacket,
 };
-use crate::module::L4Availability;
+use crate::module::AvailabilitySource;
 use crate::types::{L4Action, L4Direction};
 
 /// How the `start` command obtains the in-path backend for a queue number. The
@@ -302,17 +302,14 @@ impl Command for InterceptStop {
 /// Never privilege-gated (spec §1): it always answers.
 pub(crate) struct InterceptStatus {
     sessions: Arc<InterceptSessions>,
-    availability: L4Availability,
+    source: AvailabilitySource,
 }
 
 impl InterceptStatus {
     /// A status command over the shared session registry and the in-path class's
-    /// availability from the module's cached probe.
-    pub(crate) fn new(sessions: Arc<InterceptSessions>, availability: L4Availability) -> Self {
-        Self {
-            sessions,
-            availability,
-        }
+    /// [`AvailabilitySource`], read on every invoke (L4PAR-AC38).
+    pub(crate) fn new(sessions: Arc<InterceptSessions>, source: AvailabilitySource) -> Self {
+        Self { sessions, source }
     }
 }
 
@@ -354,7 +351,7 @@ impl Command for InterceptStatus {
         // Stable, caller-friendly order (the registry is a HashMap).
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(super::availability_object(
-            &self.availability,
+            &(self.source)(),
             "sessions",
             out.into_iter().map(|(_, v)| v).collect(),
         ))
@@ -741,7 +738,7 @@ pub(crate) fn intercept_commands(
     store: Arc<dyn L4FlowStore>,
     sessions: Arc<InterceptSessions>,
     config: Option<InterceptConfig>,
-    availability: L4Availability,
+    availability: AvailabilitySource,
 ) -> Vec<Arc<dyn Command>> {
     let start = InterceptStart::new(guard.clone(), store, sessions.clone(), config);
     commands_over(start, guard, sessions, availability)
@@ -749,12 +746,12 @@ pub(crate) fn intercept_commands(
 
 /// The eight intercept commands over one start command + session registry. The
 /// guard is threaded to `forward` so a staged mutation is re-checked before reinject;
-/// `availability` (the in-path class, from the module's cached probe) to `status`.
+/// `availability` (the in-path class's source, read at invoke time) to `status`.
 fn commands_over(
     start: InterceptStart,
     guard: Arc<L4Guard>,
     sessions: Arc<InterceptSessions>,
-    availability: L4Availability,
+    availability: AvailabilitySource,
 ) -> Vec<Arc<dyn Command>> {
     vec![
         Arc::new(start),
@@ -1259,7 +1256,7 @@ mod tests {
             store,
             sessions,
             Some(cfg(0)),
-            L4Availability::available(),
+            Arc::new(|| crate::module::L4Availability::Available),
         );
         let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
         assert_eq!(

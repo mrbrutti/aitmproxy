@@ -40,7 +40,7 @@ use std::sync::Arc;
 use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
-use crate::module::L4Availability;
+use crate::module::{AvailabilitySource, L4Availability};
 use crate::types::{
     IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
 };
@@ -424,15 +424,15 @@ fn gate_for(name: &str) -> Option<AgentGate> {
 /// Build the ordered list of Task 10 wire commands (`l4.capture.*`, `l4.inject`,
 /// `l4.send_recv`) over the shared guard + store, a fresh libpcap wire backend, and
 /// one shared [`CaptureRegistry`](crate::capture::CaptureRegistry) the capture
-/// commands manage together. `capture` is the capture/inject class's availability
-/// from the module's cached probe; `l4.capture.status` reports it. Kept additive to
+/// commands manage together. `capture` is the capture/inject class's
+/// [`AvailabilitySource`]; `l4.capture.status` reads it at invoke time. Kept additive to
 /// [`active_commands`] so the two registration lists merge cleanly;
 /// [`crate::module::L4Module::load`] registers both. The backend construction is
 /// pure (no privilege, fail-closed at call time).
 pub(crate) fn wire_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
-    capture: L4Availability,
+    capture: AvailabilitySource,
 ) -> Vec<Arc<dyn Command>> {
     let backend: Arc<dyn crate::backend::CaptureInjectBackend> =
         Arc::new(crate::backend::pcap::PcapBackend::new());
@@ -462,10 +462,11 @@ pub(crate) fn availability_object(
 ) -> Value {
     let mut obj = BTreeMap::new();
     obj.insert("available".to_string(), Value::Bool(av.is_available()));
-    obj.insert("code".to_string(), Value::Str(av.code.as_str().to_string()));
+    obj.insert("code".to_string(), Value::Str(av.code_str().to_string()));
     obj.insert(
         "reason".to_string(),
-        av.reason.clone().map_or(Value::Null, Value::Str),
+        av.reason()
+            .map_or(Value::Null, |reason| Value::Str(reason.to_string())),
     );
     let payload = if av.is_available() { payload } else { vec![] };
     obj.insert(payload_key.to_string(), Value::Array(payload));

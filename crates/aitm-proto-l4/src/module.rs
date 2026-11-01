@@ -83,13 +83,13 @@ impl L4Privilege {
     }
 }
 
-/// Why a capability class is or is not usable on this core, as the status verbs
-/// report it in `code` (spec §1, L4PAR-AC3/AC4). A closed vocabulary so a UI can
-/// attach behaviour (D0's "Allow packet capture") without matching on `reason` text.
+/// Why a capability class is **not** usable on this core, as the status verbs report
+/// it in `code` (spec §1, L4PAR-AC3/AC4). A closed vocabulary so a UI can attach
+/// behaviour (D0's "Allow packet capture") without matching on `reason` text. The
+/// `available` case is [`L4Availability::Available`], so an "available with a
+/// reason" or "unavailable with no reason" state cannot be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L4AvailabilityCode {
-    /// The class works on this core now.
-    Available,
+pub enum UnavailableCode {
     /// The platform supports the class; this process lacks the privilege.
     NeedsPrivilege,
     /// No backend for the class on this platform (e.g. in-path on macOS).
@@ -98,12 +98,11 @@ pub enum L4AvailabilityCode {
     NotConfigured,
 }
 
-impl L4AvailabilityCode {
+impl UnavailableCode {
     /// The wire string, in vocabulary order.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Available => "available",
             Self::NeedsPrivilege => "needs_privilege",
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::NotConfigured => "not_configured",
@@ -111,34 +110,55 @@ impl L4AvailabilityCode {
     }
 }
 
-/// One capability class's availability: the [`code`](L4AvailabilityCode) plus the
-/// exact `reason` text the gated verbs return in `L4 unavailable: <reason>` (`None`
-/// when available). Derived from the cached [`L4Privilege`], so the status verbs and
-/// the gated verbs can never disagree.
+/// One capability class's availability: either usable now, or unusable for a
+/// closed-vocabulary [`UnavailableCode`] with the exact `reason` text the gated
+/// verbs return in `L4 unavailable: <reason>`. Derived from the cached
+/// [`L4Privilege`] through an [`AvailabilitySource`], so the status verbs and the
+/// gated verbs can never disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct L4Availability {
-    /// The closed-vocabulary classification.
-    pub code: L4AvailabilityCode,
-    /// The gated verbs' exact refusal text; `None` when available.
-    pub reason: Option<String>,
+pub enum L4Availability {
+    /// The class works on this core now.
+    Available,
+    /// The class does not work on this core now; `reason` is the gated verbs' text.
+    Unavailable {
+        /// The closed-vocabulary classification.
+        code: UnavailableCode,
+        /// The gated verbs' exact refusal text.
+        reason: String,
+    },
 }
 
 impl L4Availability {
-    /// The class is usable now.
+    /// The wire `code`: `"available"`, or the [`UnavailableCode`]'s string.
     #[must_use]
-    pub fn available() -> Self {
-        Self {
-            code: L4AvailabilityCode::Available,
-            reason: None,
+    pub fn code_str(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable { code, .. } => code.as_str(),
         }
     }
 
-    /// Whether the class is usable now (`code == Available`).
+    /// The gated verbs' exact refusal text; `None` when available.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable { reason, .. } => Some(reason.as_str()),
+        }
+    }
+
+    /// Whether the class is usable now.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        self.code == L4AvailabilityCode::Available
+        matches!(self, Self::Available)
     }
 }
+
+/// Where a status verb reads one capability class's availability **at invoke time**
+/// (spec §1, L4PAR-AC38). Today [`L4Module::load`] builds one per class over a clone
+/// of the cached [`L4Privilege`]; the privilege spec (D0) swaps in a live
+/// `PrivilegeState` without touching the commands.
+pub type AvailabilitySource = Arc<dyn Fn() -> L4Availability + Send + Sync>;
 
 impl L4Privilege {
     /// The capture/inject class's availability. A `Some` reason is `NeedsPrivilege`
@@ -147,14 +167,14 @@ impl L4Privilege {
     #[must_use]
     pub fn capture_availability(&self) -> L4Availability {
         match &self.capture_inject {
-            None => L4Availability::available(),
-            Some(reason) => L4Availability {
+            None => L4Availability::Available,
+            Some(reason) => L4Availability::Unavailable {
                 code: if cfg!(any(target_os = "macos", target_os = "linux")) {
-                    L4AvailabilityCode::NeedsPrivilege
+                    UnavailableCode::NeedsPrivilege
                 } else {
-                    L4AvailabilityCode::UnsupportedPlatform
+                    UnavailableCode::UnsupportedPlatform
                 },
-                reason: Some(reason.clone()),
+                reason: reason.clone(),
             },
         }
     }
@@ -167,19 +187,19 @@ impl L4Privilege {
     #[must_use]
     pub fn intercept_availability(&self, configured: bool) -> L4Availability {
         match &self.intercept {
-            Some(reason) => L4Availability {
+            Some(reason) => L4Availability::Unavailable {
                 code: if cfg!(target_os = "linux") {
-                    L4AvailabilityCode::NeedsPrivilege
+                    UnavailableCode::NeedsPrivilege
                 } else {
-                    L4AvailabilityCode::UnsupportedPlatform
+                    UnavailableCode::UnsupportedPlatform
                 },
-                reason: Some(reason.clone()),
+                reason: reason.clone(),
             },
-            None if !configured => L4Availability {
-                code: L4AvailabilityCode::NotConfigured,
-                reason: Some(crate::commands::intercept::INTERCEPT_NOT_CONFIGURED.to_string()),
+            None if !configured => L4Availability::Unavailable {
+                code: UnavailableCode::NotConfigured,
+                reason: crate::commands::intercept::INTERCEPT_NOT_CONFIGURED.to_string(),
             },
-            None => L4Availability::available(),
+            None => L4Availability::Available,
         }
     }
 }
@@ -443,16 +463,23 @@ impl Plugin for L4Module {
         // privilege gate (`gate`, outer) so an unprivileged core returns a typed
         // `L4Unavailable` before the flag is even consulted. The operator who opted in
         // still sees an honest, drivable surface (amended M5 Task 13).
-        // Both availability objects come from the one cached probe the gate below
-        // reads, so `l4.capture.status` / `l4.intercept.status` (never gated) and the
-        // gated verbs' `L4Unavailable` reason cannot disagree (spec §1).
-        let capture_availability = self.privilege.capture_availability();
-        let intercept_availability = self
-            .privilege
-            .intercept_availability(self.intercept_cfg.is_some());
+        // Both availability sources close over a clone of the one cached probe the
+        // gate below reads, and the status verbs query them at invoke time (spec §1,
+        // L4PAR-AC38): `l4.capture.status` / `l4.intercept.status` (never gated) and
+        // the gated verbs' `L4Unavailable` reason cannot disagree, and D0 swaps in a
+        // live `PrivilegeState` here without touching the commands.
+        let capture_source: AvailabilitySource = {
+            let privilege = self.privilege.clone();
+            Arc::new(move || privilege.capture_availability())
+        };
+        let intercept_source: AvailabilitySource = {
+            let privilege = self.privilege.clone();
+            let configured = self.intercept_cfg.is_some();
+            Arc::new(move || privilege.intercept_availability(configured))
+        };
         for cmd in gate(
             crate::commands::agent_gate(
-                crate::commands::wire_commands(self.guard(), self.store(), capture_availability),
+                crate::commands::wire_commands(self.guard(), self.store(), capture_source),
                 &gates,
             ),
             self.privilege.capture_inject.as_deref(),
@@ -470,7 +497,7 @@ impl Plugin for L4Module {
                     self.store(),
                     self.sessions.clone(),
                     self.intercept_cfg.clone(),
-                    intercept_availability,
+                    intercept_source,
                 ),
                 &gates,
             ),
@@ -1052,14 +1079,38 @@ mod tests {
     #[test]
     fn macos_probe_intercept_is_unsupported_platform() {
         let av = L4Privilege::probe().intercept_availability(false);
-        assert_eq!(av.code, L4AvailabilityCode::UnsupportedPlatform);
-        assert_eq!(av.code.as_str(), "unsupported_platform");
         assert_eq!(
-            av.reason.as_deref(),
+            av,
+            L4Availability::Unavailable {
+                code: UnavailableCode::UnsupportedPlatform,
+                reason: "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / \
+                         NFQUEUE only)"
+                    .into(),
+            }
+        );
+        assert_eq!(av.code_str(), "unsupported_platform");
+        assert_eq!(
+            av.reason(),
             Some(
                 "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)"
             )
         );
+        assert!(!av.is_available());
+    }
+
+    /// L4PAR-AC4 (plan A14): on Linux, the only NFQUEUE platform, a probe that found
+    /// `CAP_NET_ADMIN` missing classifies in-path as `needs_privilege` even when the
+    /// `l4.intercept` block is configured (privilege outranks configuration).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_intercept_without_cap_net_admin_needs_privilege() {
+        let av = L4Privilege {
+            capture_inject: None,
+            intercept: Some("missing CAP_NET_ADMIN".into()),
+        }
+        .intercept_availability(true);
+        assert_eq!(av.code_str(), "needs_privilege");
+        assert_eq!(av.reason(), Some("missing CAP_NET_ADMIN"));
         assert!(!av.is_available());
     }
 

@@ -26,7 +26,7 @@ use crate::backend::CaptureInjectBackend;
 use crate::capture::{start_capture, CaptureParams, CaptureRegistry};
 use crate::flow::L4FlowStore;
 use crate::guard::L4Guard;
-use crate::module::L4Availability;
+use crate::module::AvailabilitySource;
 use crate::types::L4Direction;
 
 /// `l4.capture.start {interface, direction?}` → start a scoped, filtered capture;
@@ -167,17 +167,14 @@ impl Command for CaptureStop {
 /// refuse without calling it.
 pub struct CaptureStatus {
     registry: Arc<CaptureRegistry>,
-    availability: L4Availability,
+    source: AvailabilitySource,
 }
 
 impl CaptureStatus {
     /// A command over the shared capture registry and the capture/inject class's
-    /// availability from the module's cached probe.
-    pub fn new(registry: Arc<CaptureRegistry>, availability: L4Availability) -> Self {
-        Self {
-            registry,
-            availability,
-        }
+    /// [`AvailabilitySource`], read on every invoke (L4PAR-AC38).
+    pub fn new(registry: Arc<CaptureRegistry>, source: AvailabilitySource) -> Self {
+        Self { registry, source }
     }
 }
 
@@ -211,7 +208,7 @@ impl Command for CaptureStatus {
             .map(|id| Value::Str(super::flow_id_to_string(id)))
             .collect();
         Ok(super::availability_object(
-            &self.availability,
+            &(self.source)(),
             "captures",
             captures,
         ))
@@ -252,7 +249,13 @@ mod tests {
     use crate::config::L4Config;
     use crate::flow::{InMemoryL4FlowStore, L4FlowKind};
     use crate::guard::L4GuardError;
+    use crate::module::{L4Availability, UnavailableCode};
     use crate::types::{IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, PortRange, RateCap};
+
+    /// An availability source that always answers `Available`.
+    fn always_available() -> AvailabilitySource {
+        Arc::new(|| L4Availability::Available)
+    }
 
     /// A capture backend that opens a source yielding no frames (it idles like a real
     /// read timeout). `available == false` simulates missing privilege (fail-closed).
@@ -346,7 +349,7 @@ mod tests {
         let registry = Arc::new(CaptureRegistry::new());
 
         let start = CaptureStart::new(guard, backend, store.clone(), registry.clone());
-        let status = CaptureStatus::new(registry.clone(), L4Availability::available());
+        let status = CaptureStatus::new(registry.clone(), always_available());
         let stop = CaptureStop::new(registry.clone());
 
         let mem = aitm_core::MemFlowStore::new();
@@ -427,12 +430,66 @@ mod tests {
         );
     }
 
+    /// L4PAR-AC38 (plan A14): `l4.capture.status` reads its availability through the
+    /// `AvailabilitySource` **at invoke time**, never a value captured at build time.
+    /// The source here reads an `AtomicBool`: the first invoke answers
+    /// `needs_privilege`, flipping the bool makes the *same* command (no rebuild)
+    /// answer `available`.
+    #[test]
+    fn status_reads_source_at_invoke_time() {
+        let privileged = Arc::new(AtomicBool::new(false));
+        let flag = privileged.clone();
+        let source: AvailabilitySource = Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                L4Availability::Available
+            } else {
+                L4Availability::Unavailable {
+                    code: UnavailableCode::NeedsPrivilege,
+                    reason: "missing CAP_NET_RAW".into(),
+                }
+            }
+        });
+        let status = CaptureStatus::new(Arc::new(CaptureRegistry::new()), source);
+
+        let mem = aitm_core::MemFlowStore::new();
+        let client = StubClient;
+        let core = aitm_core::StdGuard::default();
+        let h = host(&mem, &client, &core);
+
+        let status_value = |available: bool, code: &str, reason: Option<&str>| {
+            let mut m = BTreeMap::new();
+            m.insert("available".to_string(), Value::Bool(available));
+            m.insert("code".to_string(), Value::Str(code.into()));
+            m.insert(
+                "reason".to_string(),
+                reason.map_or(Value::Null, |r| Value::Str(r.into())),
+            );
+            m.insert("captures".to_string(), Value::Array(vec![]));
+            Value::Object(m)
+        };
+
+        let first = status
+            .invoke(Params::default(), &h)
+            .expect("status answers while unavailable");
+        assert_eq!(
+            first,
+            status_value(false, "needs_privilege", Some("missing CAP_NET_RAW"))
+        );
+
+        privileged.store(true, Ordering::SeqCst);
+
+        let second = status
+            .invoke(Params::default(), &h)
+            .expect("status answers once available");
+        assert_eq!(second, status_value(true, "available", None));
+    }
+
     /// The Task-10 wire commands are all registered by `wire_commands`.
     #[test]
     fn wire_commands_registered() {
         let guard = Arc::new(L4Guard::new(&L4Config::default()));
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let cmds = super::super::wire_commands(guard, store, L4Availability::available());
+        let cmds = super::super::wire_commands(guard, store, always_available());
         let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
         for want in [
             "l4.capture.start",
