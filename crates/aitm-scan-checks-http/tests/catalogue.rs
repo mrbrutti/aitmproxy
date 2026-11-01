@@ -337,7 +337,7 @@ fn the_raw_runner_and_h2_checks_document_their_gate_contract() {
     }
 }
 
-/// What the crate exposes is the two slots, the check modules, and
+/// What the crate exposes is the one slot, the check modules, and
 /// `timing` — the latter because the plan's D4 contract offers
 /// `timing::{fit, correlated}` to the Rhai bridge. `matching` is the checks'
 /// own toolbox and stays crate-private, so no second scrub entry point exists

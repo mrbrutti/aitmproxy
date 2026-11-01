@@ -206,7 +206,7 @@ impl SsrfGate {
     }
 
     /// [`check`](Self::check), then the scope guard's own live permit for
-    /// `host`: for a caller that has no guarded client upstream — the raw
+    /// `authority` (`host:port`): for a caller that has no guarded client upstream — the raw
     /// HTTP/2 observe probe — this is the scope check and the pacing, taken
     /// at the moment of the dial, so a `scope.remove` after the baseline
     /// still stops the connection and the probe counts against the host's
@@ -225,7 +225,7 @@ impl SsrfGate {
         // so a bare host would never be admitted by it.
         self.scope
             .check_active(authority)
-            .map_err(|e| anyhow!("scope: refusing {what} to {host}: {e}"))
+            .map_err(|e| anyhow!("scope: refusing {what} to {authority}: {e}"))
     }
 }
 

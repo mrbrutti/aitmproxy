@@ -631,8 +631,8 @@ async fn a_family_answered_5xx_is_abandoned_on_its_first_probe() {
     assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
     assert_eq!(
         verdict.detail,
-        "2 of 2 payload families were abandoned after a 5xx answer (on probe 1 of 4): the \
-         payload breaks the query rather than delaying it, which is the error-based check's \
+        "2 of 2 payload families were abandoned after a 5xx answer (the last on probe 1 of 4): \
+         the payload breaks the query rather than delaying it, which is the error-based check's \
          territory, so no delay was measured for them"
     );
     // One probe per family and not one more: the sqli check ships two families.

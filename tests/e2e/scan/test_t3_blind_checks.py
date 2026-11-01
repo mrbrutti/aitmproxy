@@ -100,10 +100,14 @@ def delay_probes_per_point(target, seq0: int) -> dict:
     counts: dict = {}
     for e in target.logs.scanner_requests(seq0):
         query = e.get("query") or ""
-        if any(tok in query.lower() for tok in DELAY_TOKENS):
-            param = query.split("=", 1)[0] if "=" in query else ""
-            key = (e.get("path"), param)
-            counts[key] = counts.get(key, 0) + 1
+        # The parameter whose *value* carries the delay token, so a probe aimed
+        # at the second parameter of a two-parameter query is counted under it
+        # and not under the first name.
+        for pair in query.split("&"):
+            name, _, value = pair.partition("=")
+            if any(tok in value.lower() for tok in DELAY_TOKENS):
+                key = (e.get("path"), name)
+                counts[key] = counts.get(key, 0) + 1
     return counts
 
 

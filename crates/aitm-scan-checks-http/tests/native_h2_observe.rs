@@ -1732,6 +1732,53 @@ async fn rapid_reset_reads_a_dropped_connection_as_clean_once_a_pair_was_observe
 /// a malformed header block (live run 2026-11-01). The variant in flight counts
 /// as rejected, the later ones as not tried, and the verdict is Clean with
 /// both facts in the detail; a GOAWAY(NO_ERROR) is not a rejection.
+/// Only a header-block rejection code (PROTOCOL_ERROR 1, FRAME_SIZE_ERROR 6,
+/// COMPRESSION_ERROR 9) reads as the peer rejecting the variant in flight. A
+/// rate-limit GOAWAY (`ENHANCE_YOUR_CALM`, 11) or an internal error says
+/// nothing about the variant and is Inconclusive naming the code; a graceful
+/// GOAWAY(NO_ERROR) with nothing observed is a plain close (F9, security
+/// review of PR 2a).
+#[tokio::test]
+async fn only_a_header_block_rejection_code_counts_as_a_connection_level_rejection() {
+    for code in [1u32, 6, 9] {
+        let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+        o.goaway = Some((0, code));
+        o.connection_closed = true;
+        let runner = FakeRunner::answering(o);
+        let check = check_named(&runner, "h2-header-crlf-tolerance");
+        let v = run(&check, &h2host()).await;
+        assert_eq!(v.outcome, Outcome::Clean, "code {code}: {}", v.detail);
+        assert!(
+            v.detail.contains(&format!("(GOAWAY error_code={code})")),
+            "code {code}: {}",
+            v.detail
+        );
+    }
+    for code in [2u32, 7, 11, 13] {
+        let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+        o.goaway = Some((0, code));
+        o.connection_closed = true;
+        let runner = FakeRunner::answering(o);
+        let check = check_named(&runner, "h2-header-crlf-tolerance");
+        let v = run(&check, &h2host()).await;
+        assert_eq!(
+            v.outcome,
+            Outcome::Inconclusive,
+            "code {code}: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.starts_with(&format!(
+                "the peer sent GOAWAY(error_code={code}) while variant 0 ("
+            )) && v.detail.ends_with(
+                "which is not a header-block rejection; 2 of 2 variants did not reach an outcome"
+            ),
+            "code {code}: {}",
+            v.detail
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_malformed_variant_rejected_at_the_connection_level_is_clean_and_says_so() {
     let mut o = obs(vec![StreamOutcome::Timeout; 2]);

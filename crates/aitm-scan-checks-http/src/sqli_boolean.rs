@@ -234,11 +234,20 @@ fn divergence(baseline: &str, other: &str) -> String {
         }
         text[from..to].replace(ECHO_MARK, "<value>")
     };
+    let (ours, theirs) = (cut(baseline), cut(other));
+    if ours.is_empty() && theirs.is_empty() {
+        // The scrub collapsed the only difference: say that rather than quote
+        // two empty windows.
+        return format!(
+            "true arm reproduced the baseline; false arm differed only in scrubbed text \
+             ({} vs {} bytes)",
+            baseline.len(),
+            other.len()
+        );
+    }
     format!(
         "true arm reproduced the baseline; false arm differed at byte {common} of the scrubbed \
-         body: baseline \"{}\" vs \"{}\"",
-        cut(baseline),
-        cut(other)
+         body: baseline \"{ours}\" vs \"{theirs}\""
     )
 }
 
@@ -567,7 +576,13 @@ impl Check for SqliBoolean {
                 body: normalized(&baseline_resp, &[&example]),
                 flow: baseline_resp.flow,
             };
-            let signature = if normalized(&control, &[&example]) == baseline.body {
+            // A value over `MAX_ECHO_FORM` has no echo forms, so a page that
+            // echoes it could never compare equal to its baseline under the
+            // content rule: that point is read by length, which the scrub
+            // does not touch.
+            let signature = if echo_forms(&example).is_empty() {
+                Signature::Length
+            } else if normalized(&control, &[&example]) == baseline.body {
                 Signature::Content
             } else {
                 Signature::Length
@@ -696,6 +711,10 @@ impl Check for SqliBoolean {
                 // The repeat disagreed: noise, not a finding. Next pair.
             }
 
+            // A run the job cut short says so first, whatever else it saw.
+            if let Some(unfinished) = tally.unfinished() {
+                return unfinished;
+            }
             if errored_pairs > 0 {
                 return no_finding(
                     Outcome::Inconclusive,

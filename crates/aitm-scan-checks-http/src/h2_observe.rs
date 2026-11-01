@@ -519,33 +519,36 @@ impl Check for H2Check {
         &self.meta
     }
 
-    /// Nine gates stand between a point and the raw connection, in this
+    /// Ten gates stand between a point and the raw connection, in this
     /// order, and each one that fails returns `Inconclusive` with nothing
     /// sent:
     ///
     /// 1. **url** — the point's URL must name a dialable `http(s)` authority
     ///    ([`Target::parse`]);
-    /// 2. **stop gate** — not cancelled, budget for at least one stimulus,
+    /// 2. **version** — the profile does not force `http.version: h1`
+    ///    (an HTTP/2 probe would contradict it);
+    /// 3. **stop gate** — not cancelled, budget for at least one stimulus,
     ///    before the deadline ([`crate::gate::may_send`]);
-    /// 3. **profile origin** — the authority is one of the profile's own
+    /// 4. **profile origin** — the authority is one of the profile's own
     ///    `target.origins`, compared canonically ([`Target::is_a_profile_origin`]);
-    /// 4. **guard seen** — no live once-per-authority claim for this origin;
-    /// 5. **baseline** — `host.baseline()` succeeds through the lane's guarded
+    /// 5. **guard seen** — no live once-per-authority claim for this origin;
+    /// 6. **baseline** — `host.baseline()` succeeds through the lane's guarded
     ///    client, so scope has cleared the authority before a raw byte moves;
-    /// 6. **cancel/deadline re-check** — the baseline took time; a job that
+    /// 7. **cancel/deadline re-check** — the baseline took time; a job that
     ///    stopped meanwhile sends nothing;
-    /// 7. **budget** — the budget left covers one unit per stream the plan
-    ///    will open (the raw connection cannot charge the job itself);
-    /// 8. **guard claim** — the origin is claimed, atomically;
-    /// 9. **dial** — the runner opens the one connection.
+    /// 8. **budget** — the budget left covers one unit per stream the plan
+    ///    will open (the job is charged in PR 2b);
+    /// 9. **guard claim** — the origin is claimed, atomically;
+    /// 10. **dial** — the runner opens the one connection, behind the
+    ///     driver's own SSRF check and the scope guard's live permit.
     ///
-    /// `claim` is last because a claim lasts ten minutes and must not be
-    /// burnt by a refused baseline, a stopped job or a short budget: an
-    /// authority that was never actually probed stays probe-able. It is
-    /// still before the dial, and atomic, so two points of one origin that
-    /// race through gates 1–7 open one connection, not two.
+    /// `claim` is last before the dial because a claim lasts ten minutes and
+    /// must not be burnt by a refused baseline, a stopped job or a short
+    /// budget: an authority that was never actually probed stays probe-able.
+    /// It is atomic, so two points of one origin that race through gates 1–8
+    /// open one connection, not two.
     ///
-    /// The re-check at 6 tests cancellation and the deadline but not the
+    /// The re-check at 7 tests cancellation and the deadline but not the
     /// budget, because gate 7 immediately tests the budget against the
     /// plan's real stream count, which is at least the one unit gate 2
     /// asked for; a `budget_left() >= 1` clause there would be subsumed.
@@ -869,13 +872,16 @@ fn read_stream(outcome: &StreamOutcome) -> Reading {
     }
 }
 
-/// The shared rule of the three malformed-header checks.
 /// The GOAWAY error codes a conforming server uses to reject a malformed
 /// header block at the connection level (RFC 9113 section 7): a protocol
 /// violation, an oversized frame, an HPACK failure. Any other code — rate
-/// limiting (`ENHANCE_YOUR_CALM`), an internal error, a graceful close — says
-/// nothing about the variant in flight.
-const HEADER_BLOCK_REJECTION_CODES: [u32; 3] = [1, 6, 9];
+/// limiting (`ENHANCE_YOUR_CALM`, 11), an internal error (2), a graceful
+/// close (0) — says nothing about the variant in flight.
+const HEADER_BLOCK_REJECTION_CODES: [u32; 3] = [
+    1, // PROTOCOL_ERROR
+    6, // FRAME_SIZE_ERROR
+    9, // COMPRESSION_ERROR
+];
 
 /// The shared rule of the three malformed-header checks.
 ///

@@ -2534,7 +2534,7 @@ mod driver_tests {
 
         assert!(
             err.to_string()
-                .starts_with("scope: refusing raw h2 probe to origin.test"),
+                .starts_with("scope: refusing raw h2 probe to origin.test:80"),
             "{err}"
         );
         assert_eq!(dialer.calls(), 0, "a refused probe never dials");

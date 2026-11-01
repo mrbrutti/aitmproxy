@@ -216,8 +216,8 @@ pub fn ws_tls_policy(cfg: &Config) -> TlsPolicy {
 /// operator's `browser.ssrf` policy (the one [`SsrfPolicy`] in `Config`, the
 /// same one the browser engine and `aitm browser confine` read) and `guard` is
 /// the proxy's live scope guard, handed in as a [`LateGuard`] and bound right
-/// after `Proxy::build` like Map Remote's. `checks()` on that crate is the
-/// gate-free empty slot and is never called by the binary.
+/// after `Proxy::build` like Map Remote's. It is the crate's only slot: no
+/// constructor omits the gate.
 #[must_use]
 pub fn collect_native_checks(
     ssrf: SsrfPolicy,
