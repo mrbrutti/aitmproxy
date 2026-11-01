@@ -56,33 +56,10 @@ pub(crate) trait PlatformOps: Send + Sync {
     ) -> Result<Vec<String>, WriteError>;
 }
 
-/// The live rows a snapshot describes, named as `StateFile::service_names`
-/// spells them: the macOS rows themselves; the `gsettings` row parsed from
-/// the six keys; the `kde` row from kioslaverc plus `gsettings` when
-/// mirrored. A snapshot is the live read it was taken from, so this is how
-/// a `set` over an existing file judges which services are still ours
-/// without running a second read.
-pub(crate) fn rows_of(previous: &Previous) -> Vec<ServiceRow> {
-    match previous {
-        Previous::Networksetup { services } => services.clone(),
-        Previous::Gsettings { keys } => vec![linux::gsettings_row(keys)],
-        Previous::Kde {
-            kioslaverc,
-            gsettings,
-        } => {
-            let mut rows = vec![linux::kde_row(kioslaverc)];
-            if let Some(keys) = gsettings {
-                rows.push(linux::gsettings_row(keys));
-            }
-            rows
-        }
-    }
-}
-
 // "Does a live row still equal what we wrote" has one implementation,
 // `crate::service_equals_wrote` (plan C3); the engine and the watchdog both
-// judge a whole file against a live read through `watchdog::decide`, so the
-// trait carries no per-mechanism equality hook.
+// judge a whole file against a live read through `watchdog::partition`, so
+// the trait carries no per-mechanism equality hook.
 
 /// The ops for a bare mechanism word: what the watchdog has (the state file
 /// names the mechanism, nothing else) and what the public

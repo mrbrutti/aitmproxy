@@ -13,6 +13,7 @@ use anyhow::Context;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::platform::linux;
 use crate::{Mechanism, ServiceRow, Wrote};
 
 /// The snapshot taken before the first mutating command, per mechanism.
@@ -31,6 +32,29 @@ pub enum Previous {
         kioslaverc: BTreeMap<String, String>,
         gsettings: Option<BTreeMap<String, String>>,
     },
+}
+
+/// The live rows a snapshot describes, named as [`StateFile::service_names`]
+/// spells them: the macOS rows themselves; the `gsettings` row parsed from
+/// the six keys; the `kde` row from kioslaverc plus `gsettings` when
+/// mirrored. A snapshot is the live read it was taken from, so this is how
+/// a `set` over an existing file judges which services are still ours
+/// without running a second read.
+pub(crate) fn rows_of(previous: &Previous) -> Vec<ServiceRow> {
+    match previous {
+        Previous::Networksetup { services } => services.clone(),
+        Previous::Gsettings { keys } => vec![linux::gsettings_row(keys)],
+        Previous::Kde {
+            kioslaverc,
+            gsettings,
+        } => {
+            let mut rows = vec![linux::kde_row(kioslaverc)];
+            if let Some(keys) = gsettings {
+                rows.push(linux::gsettings_row(keys));
+            }
+            rows
+        }
+    }
 }
 
 /// The §D7 document: what we wrote, what was there before, and who wrote
@@ -72,6 +96,25 @@ impl StateFile {
     /// logged at `warn`, and reported as absent. Only a failed quarantine is
     /// an error.
     pub fn load(path: &Path) -> anyhow::Result<Option<StateFile>> {
+        // `symlink_metadata` does not follow a link: anything at the path
+        // that is not a regular file (a symlink planted to make us read or
+        // move another file, a FIFO that would block the read, a directory)
+        // is moved aside unread.
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(meta) => {
+                let what = if meta.file_type().is_symlink() {
+                    "a symlink"
+                } else if meta.is_dir() {
+                    "a directory"
+                } else {
+                    "not a regular file"
+                };
+                return quarantine(path, what).map(|()| None);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return quarantine(path, &format!("unreadable: {e}")).map(|()| None),
+        }
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -131,20 +174,12 @@ impl StateFile {
 
     /// The services `previous` can restore: each macOS row by name;
     /// `gsettings`; `kde` (plus `gsettings` when the KDE snapshot has one).
+    /// The names of [`rows_of`], so the two can never disagree.
     pub fn service_names(&self) -> Vec<String> {
-        match &self.previous {
-            Previous::Networksetup { services } => {
-                services.iter().map(|row| row.service.clone()).collect()
-            }
-            Previous::Gsettings { .. } => vec!["gsettings".to_string()],
-            Previous::Kde { gsettings, .. } => {
-                let mut names = vec!["kde".to_string()];
-                if gsettings.is_some() {
-                    names.push("gsettings".to_string());
-                }
-                names
-            }
-        }
+        rows_of(&self.previous)
+            .into_iter()
+            .map(|row| row.service)
+            .collect()
     }
 }
 
@@ -227,23 +262,25 @@ fn quarantine(path: &Path, why: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create-or-truncate `path` readable by the owner only, write, fsync.
+/// Create `path` fresh, readable by the owner only, write, fsync. Whatever
+/// is at the temp name first (a leftover from an earlier crash, or a
+/// symlink planted there) is removed, then `create_new` (`O_EXCL`, which
+/// never follows a symlink) creates the file with mode `0600`, so no other
+/// file is ever opened or truncated through this path.
 fn write_private(path: &Path, body: &[u8]) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        // `mode` applies only when the file is created; an existing temp
-        // file from an earlier crash keeps its old bits unless we set them.
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
     file.write_all(body)?;
     file.sync_all()?;
     Ok(())
@@ -666,6 +703,56 @@ mod tester_tests {
                 0o600
             );
         }
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// S1: a symlink planted at the temp name (`<file>.tmp-<pid>`) is never
+    /// followed: the save replaces the link and the file it pointed at keeps
+    /// its bytes and its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_temp_path_is_not_followed() {
+        let dir = temp_dir("tmp-symlink");
+        let path = dir.join(STATE_FILE_NAME);
+        let victim = dir.join("victim");
+        fs::write(&victim, b"victim\n").expect("write victim");
+        let tmp = temp_path(&path);
+        std::os::unix::fs::symlink(&victim, &tmp).expect("plant the link");
+
+        small_file().save_atomic(&path).expect("save");
+
+        assert_eq!(fs::read(&victim).expect("victim"), b"victim\n");
+        let meta = fs::symlink_metadata(&path).expect("state file meta");
+        assert!(meta.is_file(), "a regular file, not a link");
+        assert!(!tmp.exists(), "no temp entry left");
+        assert_eq!(StateFile::load(&path).expect("load"), Some(small_file()));
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// S1: a symlink at the state path is not read through: it is moved
+    /// aside like a corrupt file (the link itself, not its target), reported
+    /// absent, and the target is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_state_path_is_moved_aside_and_the_target_untouched() {
+        let dir = temp_dir("state-symlink");
+        let path = dir.join(STATE_FILE_NAME);
+        let victim = dir.join("victim.json");
+        let body = serde_json::to_string(&small_file()).expect("encode");
+        fs::write(&victim, &body).expect("write victim");
+        std::os::unix::fs::symlink(&victim, &path).expect("plant the link");
+
+        assert_eq!(
+            StateFile::load(&path).expect("quarantine is not an error"),
+            None,
+            "a link is never a state file, however valid its target"
+        );
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the link is gone from the state path"
+        );
+        assert_eq!(corrupt_count(&dir), 1, "moved aside");
+        assert_eq!(fs::read_to_string(&victim).expect("victim"), body);
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 

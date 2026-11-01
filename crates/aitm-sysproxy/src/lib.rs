@@ -12,7 +12,6 @@ pub mod state;
 pub mod watchdog;
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,8 +24,8 @@ use aitm_core::Value;
 
 use platform::linux::{GSETTINGS_SERVICE, KDE_SERVICE};
 use platform::{ops_for, PlatformOps, Snapshot};
-use state::{Previous, StateFile};
-use watchdog::{decide, Decision, WatchdogHandle};
+use state::{rows_of, Previous, StateFile};
+use watchdog::{partition, WatchdogHandle};
 
 pub use config::SystemProxyConfig;
 
@@ -234,6 +233,11 @@ pub struct Status {
 impl Status {
     /// The §D6 object. `host`/`port` are present only for `other`.
     pub fn to_value(&self) -> Value {
+        Value::Object(self.to_map())
+    }
+
+    /// The §D6 object's fields, for a verb that adds its own beside them.
+    pub fn to_map(&self) -> BTreeMap<String, Value> {
         let mut map = BTreeMap::from([
             (
                 "state".to_string(),
@@ -279,7 +283,7 @@ impl Status {
             map.insert("host".to_string(), Value::Str(host.clone()));
             map.insert("port".to_string(), Value::Int(i64::from(*port)));
         }
-        Value::Object(map)
+        map
     }
 
     /// The compact view of this status.
@@ -327,10 +331,15 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// Why a write or restore stopped. `NeedsPrivilege` carries the remedy.
+/// Why a write or restore stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
-    NeedsPrivilege(String),
+    /// macOS refused the mutation (`networksetup` printed its admin error);
+    /// `line` is the rendered command that was refused. The §D3 remedy
+    /// sentence is the engine's ([`remedy`]), filled into `Status.remedy`.
+    NeedsPrivilege {
+        line: String,
+    },
     ToolMissing(String),
     Failed(String),
     /// The command outlived the mutate timeout; the message names the
@@ -341,7 +350,7 @@ pub enum WriteError {
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WriteError::NeedsPrivilege(m) => write!(f, "needs privilege: {m}"),
+            WriteError::NeedsPrivilege { line } => write!(f, "needs privilege: {line}"),
             WriteError::ToolMissing(m) => write!(f, "tool missing: {m}"),
             WriteError::Failed(m) => write!(f, "write failed: {m}"),
             WriteError::Hung(m) => write!(f, "command hung: {m}"),
@@ -436,12 +445,19 @@ pub fn classify(effective: &Effective, ours: &Endpoint) -> (State, String) {
     (state, detail)
 }
 
-/// C3: a service still equals what we wrote when both protocol endpoints
-/// (`enabled`, `host`, `port`) match; the bypass list is not compared.
-pub fn service_equals_wrote(row: &ServiceRow, wrote: &Wrote) -> bool {
-    [&row.http, &row.https]
+/// C3: a pair of protocol endpoints still equals what we wrote when both
+/// are enabled at `wrote`'s host and port; the bypass list is not compared.
+/// The one rule behind [`service_equals_wrote`] (a per-service row) and the
+/// effective view's "still ours" in [`SystemProxy::summary`].
+pub fn endpoints_equal_wrote(http: &ProtocolProxy, https: &ProtocolProxy, wrote: &Wrote) -> bool {
+    [http, https]
         .iter()
         .all(|p| p.enabled && p.host == wrote.host && p.port == wrote.port)
+}
+
+/// C3 for a service row: [`endpoints_equal_wrote`] over its two protocols.
+pub fn service_equals_wrote(row: &ServiceRow, wrote: &Wrote) -> bool {
+    endpoints_equal_wrote(&row.http, &row.https, wrote)
 }
 
 /// §D5: the ordered, de-duplicated union, `previous` first.
@@ -455,7 +471,14 @@ pub fn merge_bypass(previous: &[String], extra: &[String]) -> Vec<String> {
     out
 }
 
-fn strings(items: &[String]) -> Value {
+/// §D5 as every mechanism writes it: `previous` ∪ [`BYPASS_DEFAULT`] ∪
+/// `extra`, in that order, de-duplicated. The one bypass union behind the
+/// macOS, gsettings and KDE writes.
+pub(crate) fn bypass_for(previous: &[String], extra: &[String]) -> Vec<String> {
+    merge_bypass(&merge_bypass(previous, &defaults()), extra)
+}
+
+pub(crate) fn strings(items: &[String]) -> Value {
     Value::Array(items.iter().map(|s| Value::Str(s.clone())).collect())
 }
 
@@ -470,14 +493,18 @@ fn opt_port(p: Option<u16>) -> Value {
 // ---- the engine ---------------------------------------------------------------
 
 /// How long a [`SystemProxy::summary`] is served from the cache (§D6).
-pub const SUMMARY_TTL: Duration = Duration::from_secs(5);
+pub(crate) const SUMMARY_TTL: Duration = Duration::from_secs(5);
+/// How long an agent's `proxy.system.status` is served from the last full
+/// read ([`SystemProxy::status_cached`]): a polling loop cannot spawn a
+/// `networksetup` storm. Trusted control surfaces always read fresh.
+pub(crate) const STATUS_TTL: Duration = Duration::from_secs(2);
 /// `unset` with no state file (§D6).
-pub const NOT_MANAGED_DETAIL: &str = "not managed by this core; nothing to restore";
+pub(crate) const NOT_MANAGED_DETAIL: &str = "not managed by this core; nothing to restore";
 /// A second `set`/`unset` while one is running (§D6).
-pub const IN_FLIGHT_MSG: &str = "a system-proxy change is already in flight";
+pub(crate) const IN_FLIGHT_MSG: &str = "a system-proxy change is already in flight";
 /// The `unsupported` detail on a Linux (or other non-Windows) host where
 /// §D4's table matched nothing; `guidance` carries the env-var line.
-pub const NO_MECHANISM_DETAIL: &str =
+pub(crate) const NO_MECHANISM_DETAIL: &str =
     "no supported system-proxy mechanism on this host (needs gsettings with a session bus, or KDE's kwriteconfig)";
 
 /// What [`SystemProxy::recover_at_startup`] (§D9 (c)) and
@@ -527,6 +554,8 @@ pub struct SystemProxy {
     needs_privilege: AtomicBool,
     watchdog: Mutex<Option<WatchdogHandle>>,
     cache: Mutex<Option<(Instant, Summary)>>,
+    /// The last full [`Status`], for [`Self::status_cached`].
+    status_cache: Mutex<Option<(Instant, Status)>>,
     last_change_ms: Mutex<Option<i64>>,
 }
 
@@ -584,16 +613,28 @@ impl SystemProxy {
         env: &dyn Fn(&str) -> Option<String>,
     ) -> SystemProxy {
         let ops: Box<dyn PlatformOps> = match target_os {
-            "macos" => Box::new(platform::macos::MacosOps),
+            "macos" => ops_for(Mechanism::Networksetup),
             "linux" => {
-                let path = env("PATH");
-                let on_path =
-                    |tool: &str| platform::linux::on_path_in(path.as_deref().map(OsStr::new), tool);
-                platform::linux::detect(target_os, env, &on_path)
-                    .ops()
-                    .unwrap_or_else(|| Box::new(platform::windows::NoneOps))
+                // KDE is the one mechanism a bare `Mechanism` cannot carry
+                // (which tool major, whether gsettings is mirrored), and its
+                // tools are spawned by the absolute path resolved here.
+                let path = env("PATH").map(std::ffi::OsString::from);
+                let resolve = |tool: &str| platform::linux::resolve_on_path(path.as_deref(), tool);
+                match platform::linux::detect(target_os, env, &|tool| resolve(tool).is_some()) {
+                    platform::linux::Detected::Kde {
+                        kwrite,
+                        kread,
+                        gsettings_too,
+                    } => Box::new(platform::linux::KdeOps::resolved(
+                        kwrite,
+                        kread,
+                        gsettings_too,
+                        &resolve,
+                    )),
+                    other => ops_for(other.mechanism()),
+                }
             }
-            _ => Box::new(platform::windows::NoneOps),
+            _ => ops_for(Mechanism::None),
         };
         Self::with_ops(exec, cfg, ours, watchdog_exe, target_os, ops)
     }
@@ -645,6 +686,7 @@ impl SystemProxy {
             needs_privilege: AtomicBool::new(false),
             watchdog: Mutex::new(None),
             cache: Mutex::new(None),
+            status_cache: Mutex::new(None),
             last_change_ms: Mutex::new(None),
         }
     }
@@ -740,7 +782,30 @@ impl SystemProxy {
     /// `proxy.system.status`: a fresh read of the effective view and, where
     /// the mechanism has them, the per-service rows (§D6).
     pub fn status(&self) -> Status {
-        self.read_status(self.is_setting())
+        let status = self.read_status(self.is_setting());
+        self.remember_status(&status);
+        status
+    }
+
+    /// `proxy.system.status` for a caller that is not a trusted control
+    /// surface: the last full status when it is at most [`STATUS_TTL`] old
+    /// (whoever read it), else a fresh [`Self::status`]. An agent polling in
+    /// a loop therefore costs one `networksetup` round per two seconds at
+    /// most. `setting` is always live.
+    pub fn status_cached(&self) -> Status {
+        if let Some((at, cached)) = lock(&self.status_cache).as_ref() {
+            if at.elapsed() <= STATUS_TTL {
+                return Status {
+                    setting: self.is_setting(),
+                    ..cached.clone()
+                };
+            }
+        }
+        self.status()
+    }
+
+    fn remember_status(&self, status: &Status) {
+        *lock(&self.status_cache) = Some((Instant::now(), status.clone()));
     }
 
     fn read_status(&self, setting: bool) -> Status {
@@ -748,22 +813,57 @@ impl SystemProxy {
             return self.unsupported_status(setting);
         }
         let file = self.load_file();
+        self.status_with(file.as_ref(), None, setting)
+    }
+
+    /// The §D6 status over `file` (already loaded) and the live reads. The
+    /// effective view is always read here; the per-service rows come from
+    /// `rows` when the caller has them in hand (the snapshot a `set` just
+    /// took), else from `read_services`. macOS rows are reported; Linux's
+    /// synthetic rows only judge `managed_by_us` (§D6: `services` is empty
+    /// on Linux), so they are read only when there is a file to judge
+    /// against. Zero enabled macOS services is `unknown` with the §D3
+    /// detail; any other per-service failure keeps the classification,
+    /// leaves `managed_by_us` false, is logged, and is named in `detail`
+    /// when a file exists (so "not managed" is visibly "could not judge").
+    fn status_with(
+        &self,
+        file: Option<&StateFile>,
+        rows: Option<Vec<ServiceRow>>,
+        setting: bool,
+    ) -> Status {
         let mut status = match self.ops.read_effective(self.exec.as_ref()) {
             Ok(effective) => {
                 let (state, detail) = classify(&effective, &self.ours);
                 let mut status = self.blank_status(state, detail, setting);
                 status.effective = Some(effective);
-                // macOS rows are reported; Linux's synthetic rows only judge
-                // `managed_by_us` (§D6: `services` is empty on Linux), so
-                // they are read only when there is a file to judge against.
                 let is_macos = self.mechanism() == Mechanism::Networksetup;
                 if is_macos || file.is_some() {
-                    if let Ok(live) = self.ops.read_services(self.exec.as_ref()) {
-                        if let Some(file) = &file {
-                            status.managed_by_us = all_still_ours(file, &live);
+                    let live = match rows {
+                        Some(rows) => Ok(rows),
+                        None => self.ops.read_services(self.exec.as_ref()),
+                    };
+                    match live {
+                        Ok(live) => {
+                            if let Some(file) = file {
+                                status.managed_by_us = all_still_ours(file, &live);
+                            }
+                            if is_macos {
+                                status.services = live;
+                            }
                         }
-                        if is_macos {
-                            status.services = live;
+                        Err(ReadError::Unavailable(m))
+                            if m == platform::macos::NO_ENABLED_SERVICE =>
+                        {
+                            status.state = State::Unknown;
+                            status.detail = m;
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "aitm_sysproxy", error = %e, "per-service read failed; managed_by_us unknown");
+                            if file.is_some() {
+                                status.detail =
+                                    format!("{}; services unreadable: {e}", status.detail);
+                            }
                         }
                     }
                 }
@@ -808,13 +908,8 @@ impl SystemProxy {
                 // Without per-service rows, "managed" is: a file exists and
                 // the effective view still equals what it says we wrote.
                 if let Some(file) = self.load_file() {
-                    let row = ServiceRow {
-                        service: String::new(),
-                        http: effective.http.clone(),
-                        https: effective.https.clone(),
-                        bypass: Vec::new(),
-                    };
-                    status.managed_by_us = service_equals_wrote(&row, &file.wrote);
+                    status.managed_by_us =
+                        endpoints_equal_wrote(&effective.http, &effective.https, &file.wrote);
                 }
                 status
             }
@@ -824,10 +919,16 @@ impl SystemProxy {
         status.summary()
     }
 
+    /// After a change (or a verb's read): both caches hold this status, so
+    /// the next `proxy.status` and the next agent `proxy.system.status`
+    /// see the outcome at once.
     fn refresh_cache(&self, status: &Status) {
         let mut summary = status.summary();
         summary.setting = false;
         *lock(&self.cache) = Some((Instant::now(), summary));
+        let mut full = status.clone();
+        full.setting = false;
+        self.remember_status(&full);
     }
 
     /// Take the in-flight flag or refuse (§D6).
@@ -881,6 +982,11 @@ impl SystemProxy {
     /// and `unsupported` are `Ok` with the state; a tool that cannot start
     /// or hangs, a change already in flight, and a rollback that failed are
     /// `Err`.
+    ///
+    /// Reads: one snapshot round before the writes and one verify round
+    /// after (Q4). The snapshot is the live read, so with a file on disk it
+    /// also serves the idempotency check (its rows judge `managed_by_us`)
+    /// and `merge_previous`; nothing is read a third time.
     pub fn set(&self, req: &SetRequest) -> anyhow::Result<(Status, bool, Vec<String>)> {
         let _guard = self.begin()?;
         if !self.supported() {
@@ -889,18 +995,17 @@ impl SystemProxy {
             return Ok((status, false, Vec::new()));
         }
         let existing = StateFile::load(&self.state_file)?;
-        if existing.is_some() {
-            let status = self.read_status(false);
+        let Snapshot { previous, skipped } = self
+            .ops
+            .snapshot(self.exec.as_ref())
+            .map_err(|e| anyhow::anyhow!("cannot snapshot the current system proxy: {e}"))?;
+        if let Some(file) = &existing {
+            let status = self.status_with(Some(file), Some(rows_of(&previous)), false);
             if status.state == State::PointsAtUs {
                 self.refresh_cache(&status);
                 return Ok((status, false, Vec::new()));
             }
         }
-
-        let Snapshot { previous, skipped } = self
-            .ops
-            .snapshot(self.exec.as_ref())
-            .map_err(|e| anyhow::anyhow!("cannot snapshot the current system proxy: {e}"))?;
         // A re-set over our own file must not record our own endpoint as
         // "previous": keep the file's row for every service still ours.
         let previous = match &existing {
@@ -928,7 +1033,9 @@ impl SystemProxy {
                 self.needs_privilege.store(false, Ordering::SeqCst);
                 Self::log_commands(&lines);
                 self.ensure_watchdog();
-                let mut status = self.read_status(false);
+                // The verify round (§D3): the file just written is the one
+                // on disk, so it is judged without reloading it.
+                let mut status = self.status_with(Some(&file), None, false);
                 for service in &skipped {
                     status.detail =
                         format!("{}; skipped {service}: authenticated proxy", status.detail);
@@ -946,7 +1053,7 @@ impl SystemProxy {
                 self.refresh_cache(&status);
                 Ok((status, true, lines))
             }
-            Err(WriteError::NeedsPrivilege(_)) => {
+            Err(WriteError::NeedsPrivilege { .. }) => {
                 // Nothing of ours is on the OS; the file must not claim otherwise.
                 if let Err(e) = StateFile::remove(&self.state_file) {
                     tracing::warn!(target: "aitm_sysproxy", error = %e, "could not remove the state file after a privilege refusal");
@@ -1000,7 +1107,7 @@ impl SystemProxy {
                 }
             }
             Err(rollback) => {
-                if matches!(rollback, WriteError::NeedsPrivilege(_)) {
+                if matches!(rollback, WriteError::NeedsPrivilege { .. }) {
                     self.needs_privilege.store(true, Ordering::SeqCst);
                 }
                 tracing::error!(target: "aitm_sysproxy", error = %cause, rollback_error = %rollback, file = %path, "system proxy write failed and the rollback failed; state file kept");
@@ -1040,7 +1147,7 @@ impl SystemProxy {
         let started = Instant::now();
         let lines = match self.ops.restore(self.exec.as_ref(), &file.previous, &only) {
             Ok(lines) => lines,
-            Err(WriteError::NeedsPrivilege(_)) => {
+            Err(WriteError::NeedsPrivilege { .. }) => {
                 self.needs_privilege.store(true, Ordering::SeqCst);
                 let status = self.read_status(false);
                 tracing::info!(target: "aitm_sysproxy", outcome = "needs_privilege", "system proxy not restored: macOS asks for an administrator; state file kept");
@@ -1162,7 +1269,7 @@ impl SystemProxy {
         match self.ops.restore(self.exec.as_ref(), &file.previous, &only) {
             Ok(lines) => Self::log_commands(&lines),
             Err(e) => {
-                if matches!(e, WriteError::NeedsPrivilege(_)) {
+                if matches!(e, WriteError::NeedsPrivilege { .. }) {
                     self.needs_privilege.store(true, Ordering::SeqCst);
                 }
                 return Recovery::Failed(format!("{e}; the state file {path} is kept"));
@@ -1230,26 +1337,16 @@ impl SystemProxy {
     }
 }
 
-/// The §D6 unset rule over a file and a live read: the services still equal
-/// to `wrote` (to restore) and the rest (to leave alone). One implementation
-/// with the watchdog's: [`watchdog::decide`].
-fn partition(file: &StateFile, live: &[ServiceRow]) -> (Vec<String>, Vec<String>) {
-    match decide(Some(file), live) {
-        Decision::Restore { only, left_alone } => (only, left_alone),
-        Decision::Exit0 => (Vec::new(), Vec::new()),
-    }
-}
-
 /// A `set` over an existing file: the file's `previous` is the real
 /// before-state for every service whose live row still equals the file's
 /// `wrote` (our own endpoint is never recorded as "previous"); a service
 /// another tool took over since takes its live row. `fresh` is the snapshot
 /// just read, which is also the live read it is judged by
-/// ([`platform::rows_of`]). The Linux key sets follow the same rule per
-/// synthetic service: the file's keys while the live keys still equal what
-/// we wrote, else the fresh ones.
+/// ([`rows_of`]). The Linux key sets follow the same rule per synthetic
+/// service: the file's keys while the live keys still equal what we wrote,
+/// else the fresh ones.
 fn merge_previous(file: &StateFile, fresh: Previous) -> Previous {
-    let still_ours: Vec<String> = platform::rows_of(&fresh)
+    let still_ours: Vec<String> = rows_of(&fresh)
         .into_iter()
         .filter(|row| service_equals_wrote(row, &file.wrote))
         .map(|row| row.service)
@@ -1307,7 +1404,8 @@ fn merge_previous(file: &StateFile, fresh: Previous) -> Previous {
     }
 }
 
-/// `managed_by_us` (§D6): every service the file lists still equals `wrote`.
+/// `managed_by_us` (§D6): every service the file lists still equals `wrote`
+/// (the §D6 unset rule, [`partition`], shared with the watchdog).
 fn all_still_ours(file: &StateFile, live: &[ServiceRow]) -> bool {
     let (_, left_alone) = partition(file, live);
     left_alone.is_empty()
@@ -1580,6 +1678,29 @@ mod tests {
                 "::1",
                 "corp.test"
             ]
+        );
+    }
+
+    /// §D5 as every mechanism writes it (Q2): previous ∪ default ∪ extra,
+    /// in that order, de-duplicated; empty inputs yield exactly the defaults.
+    #[test]
+    fn bypass_for_folds_the_defaults_in_between() {
+        let s = |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(
+            bypass_for(&s(&["*.local", "169.254/16"]), &s(&["corp.test"])),
+            s(&[
+                "*.local",
+                "169.254/16",
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "corp.test"
+            ])
+        );
+        assert_eq!(bypass_for(&[], &[]), s(&BYPASS_DEFAULT));
+        assert_eq!(
+            bypass_for(&s(&["localhost"]), &s(&["localhost", "::1"])),
+            s(&["localhost", "127.0.0.1", "::1", "*.local", "169.254/16"])
         );
     }
 
@@ -2068,15 +2189,14 @@ mod engine_tests {
     /// and takes the live row for the rest.
     #[test]
     fn set_over_a_file_keeps_the_real_previous_for_services_still_ours() {
-        // The status read before the set says `other`; the verify read after
-        // it says `points_at_us`.
+        // The effective read before the set says `other`; the verify read
+        // after it says `points_at_us`.
         let exec = ScriptedExecutor::new()
             .respond(SCUTIL, 0, &scutil_out("10.0.0.5", 3128), "")
             .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "");
         // Live: `Display Ethernet` still at what we wrote, `Wi-Fi` taken
-        // over by another tool. One round for the status read, one for the
-        // snapshot, then the verify round.
-        let exec = answer_round(exec, ("127.0.0.1", 8080), ("10.0.0.5", 3128));
+        // over by another tool. One snapshot round (which also judges the
+        // idempotency check), then the verify round (Q4).
         let exec = answer_round(exec, ("127.0.0.1", 8080), ("10.0.0.5", 3128));
         let r = macos_rig("reset-previous", at_us_round(exec));
         d7_file().save_atomic(&r.file).expect("seed file");
@@ -2103,6 +2223,45 @@ mod engine_tests {
         );
         assert_eq!(file.wrote.port, 8080);
         assert_eq!(file.pid, std::process::id());
+    }
+
+    /// Q4: a set over an existing file whose live state no longer points at
+    /// us reads every service exactly twice: the snapshot round (which is
+    /// also the live read the idempotency check and `merge_previous` judge
+    /// by) and the verify round after the writes; never a third round.
+    #[test]
+    fn re_set_over_a_file_reads_each_service_once_before_and_once_after() {
+        let exec = ScriptedExecutor::new()
+            .respond(SCUTIL, 0, &scutil_out("10.0.0.5", 3128), "")
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "");
+        let exec = at_us_round(answer_round(exec, ("127.0.0.1", 8080), ("10.0.0.5", 3128)));
+        let r = macos_rig("re-set-rounds", exec);
+        d7_file().save_atomic(&r.file).expect("seed file");
+
+        let (status, changed, commands) = r.sp.set(&SetRequest::default()).expect("set");
+        assert!(changed);
+        assert_eq!(commands, set_lines(""));
+        assert_eq!(status.state, State::PointsAtUs);
+        assert!(status.managed_by_us);
+
+        let runs = r.exec.runs();
+        assert_eq!(r.exec.count(LIST), 2, "{runs:?}");
+        assert_eq!(
+            runs.iter().filter(|l| l.contains(" -get")).count(),
+            12,
+            "two services × three gets × (snapshot + verify): {runs:?}"
+        );
+        assert_eq!(
+            r.exec.count(SCUTIL),
+            2,
+            "the idempotency check and the verify"
+        );
+        let mut expected = read_round();
+        expected.push(SCUTIL.to_string());
+        expected.extend(set_lines(""));
+        expected.push(SCUTIL.to_string());
+        expected.extend(read_round());
+        assert_eq!(runs, expected);
     }
 
     /// SP-AC8: partial takeover → only `Wi-Fi` restored, the file removed.
@@ -2694,6 +2853,38 @@ mod engine_tests {
         assert!(!r.sp.summary().setting);
     }
 
+    /// I2: a per-service read that fails (other than "no enabled service")
+    /// is not swallowed: the effective classification stands,
+    /// `managed_by_us` is false, and with a state file on disk the `detail`
+    /// names the failure so an operator sees why "managed" is unknown.
+    #[test]
+    fn read_services_failure_is_named_in_detail_when_a_file_exists() {
+        let exec = ScriptedExecutor::new()
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "")
+            .respond(LIST, 1, "", "boom");
+        let r = macos_rig("services-unreadable", exec);
+
+        let status = r.sp.status();
+        assert_eq!(status.state, State::PointsAtUs);
+        assert_eq!(
+            status.detail, "HTTP and HTTPS → 127.0.0.1:8080 (this core)",
+            "no file: nothing to judge, the detail is the classification alone"
+        );
+        assert!(status.services.is_empty());
+        assert!(!status.managed_by_us);
+
+        d7_file().save_atomic(&r.file).expect("seed file");
+        let status = r.sp.status();
+        assert_eq!(status.state, State::PointsAtUs);
+        assert_eq!(
+            status.detail,
+            "HTTP and HTTPS → 127.0.0.1:8080 (this core); services unreadable: read failed: /usr/sbin/networksetup -listallnetworkservices: exit Some(1): boom"
+        );
+        assert!(!status.managed_by_us, "unjudgeable is not managed");
+        assert_eq!(status.watchdog_pid, None);
+        assert_eq!(r.exec.count(LIST), 2, "{:?}", r.exec.runs());
+    }
+
     #[test]
     fn engine_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
@@ -3005,8 +3196,11 @@ mod tester_tests {
             "in-flight guard released on the error path"
         );
 
+        // §D3: zero enabled services is `unknown` with the spec's detail,
+        // never the effective view's classification (I1).
         let status = r.sp.status();
-        assert_eq!(status.state, other("127.0.0.1", 9090));
+        assert_eq!(status.state, State::Unknown);
+        assert_eq!(status.detail, "no enabled network service");
         assert!(status.services.is_empty());
         assert!(!status.managed_by_us);
         let (_, changed, _) = r.sp.unset().expect("unset is a no-op");

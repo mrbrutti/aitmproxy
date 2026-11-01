@@ -8,8 +8,7 @@ use aitm_ca::exec::{CmdLine, Executor};
 use crate::platform::{cmd, PlatformOps, Snapshot};
 use crate::state::Previous;
 use crate::{
-    merge_bypass, remedy, Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow,
-    WriteError, BYPASS_DEFAULT,
+    bypass_for, Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow, WriteError,
 };
 
 /// Spawned by absolute path so a planted `networksetup` on `PATH` never wins.
@@ -19,7 +18,7 @@ pub const SCUTIL: &str = "/usr/sbin/scutil";
 /// settings; the only text that maps to `NeedsPrivilege`.
 pub const ADMIN_ERROR: &str = "** Error: Command requires admin privileges.";
 /// The `detail` for zero enabled services (§D3).
-pub const NO_ENABLED_SERVICE: &str = "no enabled network service";
+pub(crate) const NO_ENABLED_SERVICE: &str = "no enabled network service";
 
 /// Printed by `networksetup` and `scutil` when the caller has no
 /// SystemConfiguration session (the Claude sandbox, research 16 §2.4).
@@ -257,9 +256,10 @@ fn run_query(exec: &dyn Executor, line: &CmdLine) -> Result<String, ReadError> {
 }
 
 /// Run one mutating line. `ADMIN_ERROR` anywhere in the output is
-/// `NeedsPrivilege(remedy)`; any other non-zero exit is `Failed` naming the
-/// line; an executor error that timed out is `Hung`, any other is `Failed`.
-fn run_mutating(exec: &dyn Executor, line: &CmdLine, remedy: &str) -> Result<String, WriteError> {
+/// `NeedsPrivilege` naming the refused line (the engine fills the §D3
+/// remedy sentence); any other non-zero exit is `Failed` naming the line;
+/// an executor error that timed out is `Hung`, any other is `Failed`.
+fn run_mutating(exec: &dyn Executor, line: &CmdLine) -> Result<String, WriteError> {
     let rendered = line.render();
     let out = match exec.run(line) {
         Ok(out) => out,
@@ -267,7 +267,7 @@ fn run_mutating(exec: &dyn Executor, line: &CmdLine, remedy: &str) -> Result<Str
         Err(e) => return Err(WriteError::Failed(format!("{rendered}: {e}"))),
     };
     if out.stdout.contains(ADMIN_ERROR) || out.stderr.contains(ADMIN_ERROR) {
-        return Err(WriteError::NeedsPrivilege(remedy.to_string()));
+        return Err(WriteError::NeedsPrivilege { line: rendered });
     }
     if !out.success() {
         return Err(WriteError::Failed(format!(
@@ -390,26 +390,18 @@ impl PlatformOps for MacosOps {
         bypass_extra: &[String],
     ) -> Result<Vec<String>, WriteError> {
         let services = networksetup_services(previous)?;
-        let remedy = remedy(ours);
-        let extra: Vec<String> = BYPASS_DEFAULT
-            .iter()
-            .map(|s| s.to_string())
-            .chain(bypass_extra.iter().cloned())
-            .collect();
         let mut ran = Vec::with_capacity(services.len() * 3);
         for row in services {
-            let bypass = merge_bypass(&row.bypass, &extra);
+            let bypass = bypass_for(&row.bypass, bypass_extra);
             for line in render_write(&row.service, ours, &bypass) {
-                ran.push(run_mutating(exec, &line, &remedy)?);
+                ran.push(run_mutating(exec, &line)?);
             }
         }
         Ok(ran)
     }
 
     /// The [`render_restore`] lines for `only`, run in order; stops at the
-    /// first failure. `restore` is given no `ours`, so a `NeedsPrivilege`
-    /// here carries the failing rendered line rather than the §D3 sentence;
-    /// the engine fills `Status.remedy` from `crate::remedy(&ours)`.
+    /// first failure.
     fn restore(
         &self,
         exec: &dyn Executor,
@@ -419,8 +411,7 @@ impl PlatformOps for MacosOps {
         let services = networksetup_services(previous)?;
         let mut ran = Vec::new();
         for line in render_restore(services, only) {
-            let rendered = line.render();
-            ran.push(run_mutating(exec, &line, &rendered)?);
+            ran.push(run_mutating(exec, &line)?);
         }
         Ok(ran)
     }
@@ -477,6 +468,10 @@ mod tests {
 
     fn rendered(lines: &[CmdLine]) -> Vec<String> {
         lines.iter().map(CmdLine::render).collect()
+    }
+
+    fn err_text(e: &WriteError) -> String {
+        e.to_string()
     }
 
     const SCUTIL_FULL: &str = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : *.local\n    1 : 169.254/16\n  }\n  FTPPassive : 1\n  HTTPEnable : 1\n  HTTPPort : 9090\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 9090\n  HTTPSProxy : 127.0.0.1\n}\n";
@@ -647,11 +642,19 @@ mod tests {
             services: d7_previous(),
         };
         let err = MacosOps.write(&exec, &previous, &ours(), &[]).unwrap_err();
-        let WriteError::NeedsPrivilege(remedy) = err else {
+        let WriteError::NeedsPrivilege { line } = err else {
             panic!("expected NeedsPrivilege, got {err:?}");
         };
-        assert!(remedy.contains("Require an administrator password"));
-        assert!(remedy.contains("127.0.0.1:8080"));
+        // Q3: the variant carries the rendered line that was refused; the
+        // §D3 sentence is the engine's (`crate::remedy`), not the mechanism's.
+        assert_eq!(
+            line,
+            "/usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 8080"
+        );
+        assert_eq!(
+            err_text(&WriteError::NeedsPrivilege { line: line.clone() }),
+            format!("needs privilege: {line}")
+        );
         let sets: Vec<_> = exec
             .runs()
             .into_iter()
@@ -1177,20 +1180,28 @@ mod tester_tests {
 
         let first = "/usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 8080";
         let exec = ScriptedExecutor::new().respond(first, 1, "", ADMIN_ERROR);
-        assert!(matches!(
+        assert_eq!(
             MacosOps.write(&exec, &d7_previous(), &ours(), &[]),
-            Err(WriteError::NeedsPrivilege(r)) if r.contains("127.0.0.1:8080")
-        ));
+            Err(WriteError::NeedsPrivilege {
+                line: first.to_string()
+            }),
+            "the admin text on stderr is NeedsPrivilege naming the refused line"
+        );
         assert_eq!(exec.runs().len(), 1);
 
-        // A restore that hits the admin error carries the failing line (the
-        // engine fills the §D3 sentence), and stops.
+        // A restore that hits the admin error carries the failing line too
+        // (the engine fills the §D3 sentence), and stops.
         let restore_line = "/usr/sbin/networksetup -setwebproxystate Wi-Fi off";
         let exec = ScriptedExecutor::new().respond(restore_line, 1, ADMIN_ERROR, "");
         let err = MacosOps
             .restore(&exec, &d7_previous(), &["Wi-Fi".to_string()])
             .unwrap_err();
-        assert_eq!(err, WriteError::NeedsPrivilege(restore_line.to_string()));
+        assert_eq!(
+            err,
+            WriteError::NeedsPrivilege {
+                line: restore_line.to_string()
+            }
+        );
         assert_eq!(exec.runs().len(), 1);
 
         // A snapshot of another mechanism is refused before any run.

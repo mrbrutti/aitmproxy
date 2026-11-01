@@ -28,7 +28,7 @@ use time::OffsetDateTime;
 
 use crate::platform::{ops_for, PlatformOps};
 use crate::state::StateFile;
-use crate::{service_equals_wrote, ServiceRow, WATCHDOG_LOG_NAME};
+use crate::{service_equals_wrote, Mechanism, ServiceRow, WATCHDOG_LOG_NAME};
 
 /// The restore could not be completed; the state file is left for the
 /// next-start recovery (§D9 (c)).
@@ -63,11 +63,18 @@ pub fn decide(file: Option<&StateFile>, live: &[ServiceRow]) -> Decision {
     let Some(file) = file else {
         return Decision::Exit0;
     };
-    let (only, left_alone) = file.service_names().into_iter().partition(|name| {
+    let (only, left_alone) = partition(file, live);
+    Decision::Restore { only, left_alone }
+}
+
+/// [`decide`] for a file that is present: the services to restore and the
+/// ones to leave alone. The engine's `unset`, `recover_at_startup` and
+/// `managed_by_us` use this directly.
+pub(crate) fn partition(file: &StateFile, live: &[ServiceRow]) -> (Vec<String>, Vec<String>) {
+    file.service_names().into_iter().partition(|name| {
         live.iter()
             .any(|row| &row.service == name && service_equals_wrote(row, &file.wrote))
-    });
-    Decision::Restore { only, left_alone }
+    })
 }
 
 /// The parsed `aitm sysproxy-watchdog` arguments.
@@ -195,18 +202,36 @@ pub fn run(args: &WatchdogArgs) -> i32 {
     let mut log = open_log(&args.state);
     let exec = RealExecutor::with_timeouts(QUERY_TIMEOUT, MUTATE_TIMEOUT);
     wait_for_death(args, &exec);
-    let ops = match StateFile::load(&args.state) {
-        Ok(Some(file)) => ops_for(file.mechanism),
-        // No file (or a quarantined one): the shared path logs `file-gone`.
-        Ok(None) => ops_for(crate::Mechanism::None),
-        // A corrupt file that could not be moved aside: nothing to restore
-        // from, and nothing a later start can do either; say so and leave.
-        Err(_) => {
-            log_line(&mut log, "restore-failed", 0, Instant::now());
-            return EXIT_RESTORE_FAILED;
+    wake(&args.state, &exec, &ops_for, &mut log)
+}
+
+/// The wake: load the file once, pick the ops its `mechanism` names, and
+/// run the restore rule. No file (or a quarantined one) is `file-gone`,
+/// exit 0; a corrupt file that could not be moved aside has nothing to
+/// restore from and nothing a later start can do either, so it is
+/// `restore-failed`, exit 3. Separated from [`run`] so the path is
+/// unit-tested with scripted ops.
+pub(crate) fn wake(
+    state: &Path,
+    exec: &dyn Executor,
+    ops_for: &dyn Fn(Mechanism) -> Box<dyn PlatformOps>,
+    log: &mut Option<File>,
+) -> i32 {
+    let started = Instant::now();
+    match StateFile::load(state) {
+        Ok(Some(file)) => {
+            let ops = ops_for(file.mechanism);
+            run_after_wake(state, &file, exec, ops.as_ref(), log)
         }
-    };
-    run_after_wake(&args.state, &exec, ops.as_ref(), &mut log)
+        Ok(None) => {
+            log_line(log, "file-gone", 0, started);
+            0
+        }
+        Err(_) => {
+            log_line(log, "restore-failed", 0, started);
+            EXIT_RESTORE_FAILED
+        }
+    }
 }
 
 /// Block until the core is gone: stdin EOF, or (with `no_pipe`) the pid no
@@ -231,27 +256,19 @@ fn wait_for_death(args: &WatchdogArgs, exec: &dyn Executor) {
     }
 }
 
-/// After the wake: load the file, read the live services through `ops`,
-/// [`decide`], restore, remove the file, log. Separated from [`run`] so the
-/// restore path is unit-tested with scripted ops.
+/// The restore rule over a loaded `file`: read the live services through
+/// `ops`, [`partition`], restore, remove the file, log. One C8 line per
+/// decision: `restored` for the services put back, `left-alone` for the
+/// rest, and `left-alone services=0` when there was nothing to put back
+/// at all (a file naming no service), so every wake leaves a line.
 pub(crate) fn run_after_wake(
     state: &Path,
+    file: &StateFile,
     exec: &dyn Executor,
     ops: &dyn PlatformOps,
     log: &mut Option<File>,
 ) -> i32 {
     let started = Instant::now();
-    let file = match StateFile::load(state) {
-        Ok(file) => file,
-        Err(_) => {
-            log_line(log, "restore-failed", 0, started);
-            return EXIT_RESTORE_FAILED;
-        }
-    };
-    let Some(file) = file else {
-        log_line(log, "file-gone", 0, started);
-        return 0;
-    };
     let live = match ops.read_services(exec) {
         Ok(live) => live,
         Err(_) => {
@@ -260,10 +277,7 @@ pub(crate) fn run_after_wake(
             return EXIT_RESTORE_FAILED;
         }
     };
-    let Decision::Restore { only, left_alone } = decide(Some(&file), &live) else {
-        log_line(log, "file-gone", 0, started);
-        return 0;
-    };
+    let (only, left_alone) = partition(file, &live);
     if !only.is_empty() {
         if ops.restore(exec, &file.previous, &only).is_err() {
             log_line(log, "restore-failed", only.len(), started);
@@ -271,7 +285,7 @@ pub(crate) fn run_after_wake(
         }
         log_line(log, "restored", only.len(), started);
     }
-    if !left_alone.is_empty() {
+    if only.is_empty() || !left_alone.is_empty() {
         log_line(log, "left-alone", left_alone.len(), started);
     }
     if StateFile::remove(state).is_err() {
@@ -310,14 +324,26 @@ pub(crate) fn is_alive_on(os: &str, pid: u32, exec: &dyn Executor) -> bool {
     }
 }
 
-/// Create-or-truncate the log beside the state file. `None` when it cannot
-/// be opened: the watchdog still restores, it just cannot say so.
+/// Create the log fresh beside the state file. "Truncate" is remove, then
+/// `create_new` (`O_EXCL`, which never follows a symlink), so a link
+/// planted at the log name never gets another file truncated through it.
+/// `None` when it cannot be opened: the watchdog still restores, it just
+/// cannot say so.
 pub(crate) fn open_log(state: &Path) -> Option<File> {
     let path = state.with_file_name(WATCHDOG_LOG_NAME);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = fs::create_dir_all(parent);
     }
-    File::create(path).ok()
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .ok()
 }
 
 /// Append one C8 line: `<rfc3339> <decision> services=<n> ms=<n>`.
@@ -774,6 +800,17 @@ mod tests {
         (dir, state)
     }
 
+    /// `run_after_wake` over the file saved at `state`, as `wake` loads it.
+    fn after_wake(
+        state: &Path,
+        exec: &dyn Executor,
+        ops: &dyn PlatformOps,
+        log: &mut Option<File>,
+    ) -> i32 {
+        let file = StateFile::load(state).expect("load").expect("a saved file");
+        run_after_wake(state, &file, exec, ops, log)
+    }
+
     /// §D9 (b) + C8: live equal → every service restored, file removed, one line.
     #[test]
     fn after_wake_restores_all_and_logs_restored() {
@@ -781,7 +818,7 @@ mod tests {
         let exec = ScriptedExecutor::new();
         let ops = FakeOps::new(live_equal());
         let mut log = open_log(&state);
-        assert_eq!(run_after_wake(&state, &exec, &ops, &mut log), 0);
+        assert_eq!(after_wake(&state, &exec, &ops, &mut log), 0);
         assert_eq!(
             ops.restore_calls(),
             vec![vec!["Display Ethernet".to_string(), "Wi-Fi".to_string()]]
@@ -803,7 +840,7 @@ mod tests {
             row("Wi-Fi", "127.0.0.1", 8080),
         ]);
         let mut log = open_log(&state);
-        assert_eq!(run_after_wake(&state, &exec, &ops, &mut log), 0);
+        assert_eq!(after_wake(&state, &exec, &ops, &mut log), 0);
         assert_eq!(ops.restore_calls(), vec![vec!["Wi-Fi".to_string()]]);
         assert!(!state.exists());
         let lines = log_lines(&state);
@@ -823,7 +860,7 @@ mod tests {
             row("Wi-Fi", "10.0.0.5", 3128),
         ]);
         let mut log = open_log(&state);
-        assert_eq!(run_after_wake(&state, &exec, &ops, &mut log), 0);
+        assert_eq!(after_wake(&state, &exec, &ops, &mut log), 0);
         assert!(ops.restore_calls().is_empty(), "no restore call");
         assert!(!state.exists());
         let lines = log_lines(&state);
@@ -841,7 +878,7 @@ mod tests {
         ops.restore_result = Err(WriteError::Failed("networksetup exit 1".into()));
         let mut log = open_log(&state);
         assert_eq!(
-            run_after_wake(&state, &exec, &ops, &mut log),
+            after_wake(&state, &exec, &ops, &mut log),
             EXIT_RESTORE_FAILED
         );
         assert_eq!(EXIT_RESTORE_FAILED, 3);
@@ -861,7 +898,7 @@ mod tests {
         let mut ops = FakeOps::new(vec![]);
         ops.live = Err(ReadError::Unavailable("networksetup missing".into()));
         let mut log = open_log(&state);
-        assert_eq!(run_after_wake(&state, &exec, &ops, &mut log), 3);
+        assert_eq!(after_wake(&state, &exec, &ops, &mut log), 3);
         assert!(ops.restore_calls().is_empty());
         assert!(state.exists());
         let lines = log_lines(&state);
@@ -870,19 +907,46 @@ mod tests {
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
-    /// `file-gone` through the shared path, and the log is truncated on open.
+    /// `file-gone` through the wake path (the file is loaded exactly once,
+    /// there), no ops are built for it, and the log is truncated on open.
     #[test]
-    fn after_wake_file_gone_is_exit_0_and_log_is_truncated_on_open() {
+    fn wake_without_a_file_is_exit_0_and_log_is_truncated_on_open() {
         let dir = temp_dir("file-gone");
         let state = dir.join(STATE_FILE_NAME);
         fs::write(state.with_file_name(WATCHDOG_LOG_NAME), "stale line\n").expect("seed log");
         let exec = ScriptedExecutor::new();
-        let ops = FakeOps::new(live_equal());
+        let ops_for = |_: Mechanism| -> Box<dyn PlatformOps> { panic!("no file, no ops") };
         let mut log = open_log(&state);
-        assert_eq!(run_after_wake(&state, &exec, &ops, &mut log), 0);
-        assert!(ops.restore_calls().is_empty());
+        assert_eq!(wake(&state, &exec, &ops_for, &mut log), 0);
+        assert!(exec.runs().is_empty(), "nothing read: {:?}", exec.runs());
         let lines = log_lines(&state);
         assert_eq!(lines.len(), 1, "stale line gone: {lines:?}");
+        assert_c8_line(&lines[0], "file-gone", 0);
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// S1: the log is truncated at start by removing and re-creating it, so
+    /// a symlink planted at the log name is never followed: the file it
+    /// points at keeps its bytes and the log is a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_does_not_follow_a_symlink_at_the_log_path() {
+        let dir = temp_dir("log-symlink");
+        let state = dir.join(STATE_FILE_NAME);
+        let log_path = state.with_file_name(WATCHDOG_LOG_NAME);
+        let victim = dir.join("victim");
+        fs::write(&victim, b"victim\n").expect("write victim");
+        std::os::unix::fs::symlink(&victim, &log_path).expect("plant the link");
+
+        let mut log = open_log(&state);
+        assert!(log.is_some(), "the log opens");
+        log_line(&mut log, "file-gone", 0, Instant::now());
+
+        assert_eq!(fs::read(&victim).expect("victim"), b"victim\n");
+        let meta = fs::symlink_metadata(&log_path).expect("log meta");
+        assert!(meta.is_file(), "a regular file, not a link");
+        let lines = log_lines(&state);
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert_c8_line(&lines[0], "file-gone", 0);
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
@@ -927,6 +991,7 @@ mod tester_tests {
 
     use super::*;
     use crate::platform::macos::MacosOps;
+    use crate::platform::PlatformOps;
     use crate::state::{Previous, StateFile};
     use crate::{Mechanism, Wrote, STATE_FILE_NAME, WATCHDOG_LOG_NAME};
 
@@ -970,7 +1035,8 @@ mod tester_tests {
         fs::write(&state, "not json").expect("seed a corrupt file");
         let exec = one_service_exec();
         let mut log = open_log(&state);
-        assert_eq!(run_after_wake(&state, &exec, &MacosOps, &mut log), 0);
+        let macos = |_: Mechanism| -> Box<dyn PlatformOps> { Box::new(MacosOps) };
+        assert_eq!(wake(&state, &exec, &macos, &mut log), 0);
         assert!(
             exec.runs().is_empty(),
             "nothing read for an unjudgeable file: {:?}",
@@ -1019,25 +1085,26 @@ mod tester_tests {
         .expect("save");
         let exec = one_service_exec();
         let mut log = open_log(&state);
+        let file = StateFile::load(&state).expect("load").expect("saved");
         assert_eq!(
-            decide(StateFile::load(&state).expect("load").as_ref(), &[]),
+            decide(Some(&file), &[]),
             Decision::Restore {
                 only: vec![],
                 left_alone: vec![],
             }
         );
-        assert_eq!(run_after_wake(&state, &exec, &MacosOps, &mut log), 0);
+        assert_eq!(run_after_wake(&state, &file, &exec, &MacosOps, &mut log), 0);
         assert_eq!(exec.runs().len(), 4, "list + three gets: {:?}", exec.runs());
         assert!(!exec.runs().iter().any(|l| l.contains(" -set")));
         assert!(!state.exists(), "the empty file is forgotten");
-        // Nothing to restore and nothing left alone: the C8 log stays empty
-        // for this edge (observed; reported to the reviewers, not a spec row).
+        // Nothing to restore: the wake still leaves one C8 line behind, the
+        // `left-alone` decision over zero services (Q5).
         let lines = log_lines(&state);
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines
-                .iter()
-                .all(|l| !l.contains("restored") && !l.contains("restore-failed")),
-            "{lines:?}"
+            lines[0].contains(" left-alone services=0 ms="),
+            "{}",
+            lines[0]
         );
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }

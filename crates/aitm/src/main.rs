@@ -143,6 +143,17 @@ fn manages_system_proxy(mode: &Mode) -> bool {
     matches!(mode, Mode::Server | Mode::Tui | Mode::Web)
 }
 
+/// What the pre-bind block of `run` hands back once every service port is
+/// ours: the listeners and the addresses they actually bound.
+struct Bound {
+    proxy_listener: TcpListener,
+    browser_listener: TcpListener,
+    /// `aitm web`: the UI listener and its bound address.
+    web_listener: Option<(TcpListener, std::net::SocketAddr)>,
+    proxy_addr: std::net::SocketAddr,
+    browser_addr: std::net::SocketAddr,
+}
+
 /// Pre-bind every service port, then — and only then — run the §D9 (c)
 /// startup recovery (plan 2026-10-31-system-proxy-automation, fix F2). `bind`
 /// is the whole pre-bind block of `run`; when it fails (the "already in use"
@@ -167,33 +178,12 @@ where
     Ok(bound)
 }
 
-/// One log line per recovery outcome: `warn!` when it failed, `info!`
-/// otherwise. `phase` is `startup` (§D9 (c)) or `exit` (§D9 (a)).
+/// A recovery that failed is worth a `warn!` here; every other outcome the
+/// engine already logs at `info` as it happens (plan Q1: one line per
+/// event, not two). `phase` is `startup` (§D9 (c)) or `exit` (§D9 (a)).
 fn log_recovery(phase: &str, recovery: &Recovery) {
-    match recovery {
-        Recovery::Nothing => info!(phase, "system proxy: nothing to do"),
-        Recovery::Set(status) => info!(
-            phase,
-            state = status.state.as_str(),
-            "system proxy: set to this core (system_proxy.auto)"
-        ),
-        Recovery::Adopted { pid } => {
-            info!(phase, pid, "system proxy: adopted the leftover setting")
-        }
-        Recovery::Restored {
-            restored,
-            left_alone,
-        } => info!(
-            phase,
-            restored = restored.len(),
-            left_alone = left_alone.len(),
-            "system proxy: restored the previous setting"
-        ),
-        Recovery::Forgot => info!(
-            phase,
-            "system proxy: another tool owns the system proxy; forgot the state file"
-        ),
-        Recovery::Failed(msg) => warn!(phase, "system proxy: {msg}"),
+    if let Recovery::Failed(msg) = recovery {
+        warn!(phase, "system proxy: {msg}");
     }
 }
 
@@ -220,20 +210,22 @@ fn parse_operator_token(rest: &[String]) -> Result<Mode, String> {
     }
 }
 
-/// The runtime is built by hand rather than with `#[tokio::main]` so its
-/// workers get a stack sized for script evaluation: a hook runs on the worker
-/// that dispatches it (`block_in_place`), and Rhai recurses once per nesting
-/// level of a value — see `aitm_plugin_rhai::engine::WORKER_STACK_SIZE`.
-fn main() -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(aitm_plugin_rhai::engine::WORKER_STACK_SIZE)
-        .build()?;
-    runtime.block_on(run())
+/// What `main` settles from `argv` before any runtime, tracing sink or
+/// service exists: the global flags split off, `aitm web`'s options parsed,
+/// and the mode classified.
+struct Invocation {
+    config_arg: Option<PathBuf>,
+    script_args: Vec<PathBuf>,
+    bus_endpoint_file: Option<PathBuf>,
+    web_args: Option<WebArgs>,
+    mode: Mode,
 }
 
-async fn run() -> anyhow::Result<()> {
-    let (config_arg, argv) = split_config_arg(std::env::args().skip(1).collect())?;
+/// Classify `argv`. `None` when `aitm web --help` printed its usage and
+/// there is nothing to run. A mode usage error prints its line and exits 2
+/// (nothing has been built yet, so nothing needs tearing down).
+fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
+    let (config_arg, argv) = split_config_arg(argv)?;
     let (script_args, argv) = split_script_args(argv)?;
     let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
     // `aitm web …` is the server path with the web UI attached; its options
@@ -243,15 +235,11 @@ async fn run() -> anyhow::Result<()> {
         Some("web") => match web::parse_args(&argv[1..])? {
             WebCommand::Help => {
                 print!("{}", web::USAGE);
-                return Ok(());
+                return Ok(None);
             }
             WebCommand::Run(args) => Some(args),
         },
         _ => None,
-    };
-    let web_settings = match &web_args {
-        Some(args) => Some(args.resolve(|k| std::env::var(k).ok())?),
-        None => None,
     };
     let mode = match parse_mode(argv) {
         Ok(mode) => mode,
@@ -259,6 +247,60 @@ async fn run() -> anyhow::Result<()> {
             eprintln!("{usage}");
             std::process::exit(2);
         }
+    };
+    Ok(Some(Invocation {
+        config_arg,
+        script_args,
+        bus_endpoint_file,
+        web_args,
+        mode,
+    }))
+}
+
+/// The runtime is built by hand rather than with `#[tokio::main]` so its
+/// workers get a stack sized for script evaluation: a hook runs on the worker
+/// that dispatches it (`block_in_place`), and Rhai recurses once per nesting
+/// level of a value — see `aitm_plugin_rhai::engine::WORKER_STACK_SIZE`.
+fn main() -> anyhow::Result<()> {
+    let Some(invocation) = parse_invocation(std::env::args().skip(1).collect())? else {
+        return Ok(());
+    };
+    // The system-proxy watchdog (spec §D9 (b)) needs no config, no tracing,
+    // no service and no runtime: it sleeps on stdin until the core dies,
+    // then shells out to restore, so it is dispatched before the runtime is
+    // built. Its parent nulled its stdout/stderr, so it never prints; its
+    // exit code is the whole report (0 done, 2 bad arguments, 3 restore
+    // failed).
+    if let Mode::SysproxyWatchdog {
+        pid,
+        state,
+        no_pipe,
+    } = &invocation.mode
+    {
+        std::process::exit(watchdog::run(&WatchdogArgs {
+            pid: *pid,
+            state: state.clone(),
+            no_pipe: *no_pipe,
+        }));
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(aitm_plugin_rhai::engine::WORKER_STACK_SIZE)
+        .build()?;
+    runtime.block_on(run(invocation))
+}
+
+async fn run(invocation: Invocation) -> anyhow::Result<()> {
+    let Invocation {
+        config_arg,
+        script_args,
+        bus_endpoint_file,
+        web_args,
+        mode,
+    } = invocation;
+    let web_settings = match &web_args {
+        Some(args) => Some(args.resolve(|k| std::env::var(k).ok())?),
+        None => None,
     };
     // `operator-token generate` edits the config file and exits before any
     // service, tracing sink or scripting tier is built — it never needs them,
@@ -272,24 +314,8 @@ async fn run() -> anyhow::Result<()> {
         println!("{}", operator_token::confirmation_message(&written));
         return Ok(());
     }
-    // The system-proxy watchdog (spec §D9 (b)) needs no config, no tracing
-    // and no service: the state file carries everything it restores from.
-    // Its parent nulled its stdout/stderr, so it never prints; its exit code
-    // is the whole report (0 done, 2 bad arguments, 3 restore failed).
-    if let Mode::SysproxyWatchdog {
-        pid,
-        state,
-        no_pipe,
-    } = &mode
-    {
-        std::process::exit(watchdog::run(&WatchdogArgs {
-            pid: *pid,
-            state: state.clone(),
-            no_pipe: *no_pipe,
-        }));
-    }
-
     // The TUI owns the terminal, so its subscriber must not write there.
+    // (`SysproxyWatchdog` never reaches here: `main` dispatched it.)
     let tui_log = match mode {
         Mode::Tui => tui::init_tracing(),
         Mode::Server
@@ -521,60 +547,65 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(config_file::default_config_path)
         .display()
         .to_string();
-    let (proxy_listener, browser_listener, web_listener, proxy_addr, browser_addr) =
-        bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
-            let proxy_listener = bind_service_port(
-                cfg.listen,
-                "the proxy",
-                &format!("Free it, or set `listen:` to another address in {config_display}."),
-            )
-            .await?;
-            let browser_listener = bind_service_port(
-                cfg.browser.proxy_addr,
-                "the embedded browser's proxy",
-                &format!(
-                    "Free it, or set `browser.proxy_addr:` to another address in {config_display}."
-                ),
-            )
-            .await?;
-            // `aitm web`: the UI port is pre-bound here too, so a web-port conflict is
-            // caught before obscura spawns, not after. The collision against the proxy /
-            // browser ports is named here because a shared address would otherwise
-            // surface only as a bare "address in use".
-            let web_listener = match &web_settings {
-                Some(settings) => {
-                    for (what, addr) in [
-                        ("proxy listen", cfg.listen),
-                        ("browser.proxy_addr", cfg.browser.proxy_addr),
-                    ] {
-                        anyhow::ensure!(
-                            settings.listen != addr,
-                            "web UI --listen {} collides with {what} ({addr}); pick another port",
-                            settings.listen
-                        );
-                    }
-                    let listener = bind_service_port(
-                        settings.listen,
-                        "the web UI",
-                        "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
-                    )
-                    .await?;
-                    let bound = listener.local_addr()?;
-                    Some((listener, bound))
-                }
-                None => None,
-            };
-            let proxy_addr = proxy_listener.local_addr()?;
-            let browser_addr = browser_listener.local_addr()?;
-            Ok((
-                proxy_listener,
-                browser_listener,
-                web_listener,
-                proxy_addr,
-                browser_addr,
-            ))
-        })
+    let Bound {
+        proxy_listener,
+        browser_listener,
+        web_listener,
+        proxy_addr,
+        browser_addr,
+    } = bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
+        let proxy_listener = bind_service_port(
+            cfg.listen,
+            "the proxy",
+            &format!("Free it, or set `listen:` to another address in {config_display}."),
+        )
         .await?;
+        let browser_listener = bind_service_port(
+            cfg.browser.proxy_addr,
+            "the embedded browser's proxy",
+            &format!(
+                "Free it, or set `browser.proxy_addr:` to another address in {config_display}."
+            ),
+        )
+        .await?;
+        // `aitm web`: the UI port is pre-bound here too, so a web-port conflict is
+        // caught before obscura spawns, not after. The collision against the proxy /
+        // browser ports is named here because a shared address would otherwise
+        // surface only as a bare "address in use".
+        let web_listener = match &web_settings {
+            Some(settings) => {
+                for (what, addr) in [
+                    ("proxy listen", cfg.listen),
+                    ("browser.proxy_addr", cfg.browser.proxy_addr),
+                ] {
+                    anyhow::ensure!(
+                        settings.listen != addr,
+                        "web UI --listen {} collides with {what} ({addr}); pick another port",
+                        settings.listen
+                    );
+                }
+                let listener = bind_service_port(
+                    settings.listen,
+                    "the web UI",
+                    "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
+                )
+                .await?;
+                let bound = listener.local_addr()?;
+                Some((listener, bound))
+            }
+            None => None,
+        };
+        let proxy_addr = proxy_listener.local_addr()?;
+        let browser_addr = browser_listener.local_addr()?;
+        Ok(Bound {
+            proxy_listener,
+            browser_listener,
+            web_listener,
+            proxy_addr,
+            browser_addr,
+        })
+    })
+    .await?;
 
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.

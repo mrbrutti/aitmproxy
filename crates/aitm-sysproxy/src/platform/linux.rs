@@ -4,20 +4,22 @@
 //! mechanisms are unit-tested on any host.
 //!
 //! `gsettings` is spawned by its absolute path; the KDE tools and
-//! `dbus-send` by name on `PATH` (§D2). An executor `Err` that starts with
+//! `dbus-send` are named on `PATH` (§D2) but resolved to their absolute
+//! paths once, at detection, and spawned by those (a `PATH` that changes
+//! afterwards cannot swap the tool). An executor `Err` that starts with
 //! `could not start` is the tool missing. No privilege is ever needed here,
 //! so `NeedsPrivilege` is never produced.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::path::PathBuf;
 
 use aitm_ca::exec::{CmdLine, Executor};
 
 use crate::platform::{cmd, PlatformOps, Snapshot};
 use crate::state::Previous;
 use crate::{
-    merge_bypass, Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow, WriteError,
-    BYPASS_DEFAULT,
+    bypass_for, Effective, Endpoint, Mechanism, ProtocolProxy, ReadError, ServiceRow, WriteError,
 };
 
 pub const GSETTINGS: &str = "/usr/bin/gsettings";
@@ -38,8 +40,8 @@ pub const KDE_KEYS: [&str; 4] = ["ProxyType", "httpProxy", "httpsProxy", "NoProx
 
 /// The synthetic service names Linux rows carry (the state file's
 /// `service_names()` spells them the same way).
-pub const GSETTINGS_SERVICE: &str = "gsettings";
-pub const KDE_SERVICE: &str = "kde";
+pub(crate) const GSETTINGS_SERVICE: &str = "gsettings";
+pub(crate) const KDE_SERVICE: &str = "kde";
 
 const KIOSLAVERC: &str = "kioslaverc";
 const KDE_GROUP: &str = "Proxy Settings";
@@ -48,7 +50,9 @@ const NOT_PERSISTED: &str = "gsettings did not persist the change (no dconf sess
 
 /// What [`detect`] found: the mechanism plus the facts a bare
 /// [`Mechanism`] cannot carry (which KDE tool major is on `PATH`, whether
-/// `gsettings` is there too). `SystemProxy::detect_with` is the caller.
+/// `gsettings` is there too). `SystemProxy::detect_with` is the caller; it
+/// builds a KDE's ops with [`KdeOps::resolved`] and every other mechanism's
+/// with `platform::ops_for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Detected {
     Gsettings,
@@ -66,23 +70,6 @@ impl Detected {
             Detected::Gsettings => Mechanism::Gsettings,
             Detected::Kde { .. } => Mechanism::Kde,
             Detected::None => Mechanism::None,
-        }
-    }
-
-    /// The ops for what was detected; `None` for [`Detected::None`].
-    pub(crate) fn ops(&self) -> Option<Box<dyn PlatformOps>> {
-        match *self {
-            Detected::Gsettings => Some(Box::new(GsettingsOps)),
-            Detected::Kde {
-                kwrite,
-                kread,
-                gsettings_too,
-            } => Some(Box::new(KdeOps {
-                kwrite,
-                kread,
-                gsettings_too,
-            })),
-            Detected::None => None,
         }
     }
 }
@@ -124,51 +111,47 @@ pub(crate) fn detect(
     Detected::None
 }
 
-/// Is `tool` a file in one of `path`'s entries? The `PATH` probe behind
-/// detection (`Path::is_file`, no command run). Empty entries are skipped:
-/// a leading or doubled `:` must not make the working directory a tool
-/// source.
-pub(crate) fn on_path_in(path: Option<&OsStr>, tool: &str) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    std::env::split_paths(path).any(|dir| !dir.as_os_str().is_empty() && dir.join(tool).is_file())
+/// The first of `path`'s entries that has `tool` as a file, joined with
+/// it: the `PATH` walk behind detection (`Path::is_file`, no command run),
+/// and the absolute path the KDE tools are then spawned by. Empty entries
+/// are skipped: a leading or doubled `:` must not make the working
+/// directory a tool source.
+pub(crate) fn resolve_on_path(path: Option<&OsStr>, tool: &str) -> Option<PathBuf> {
+    let path = path?;
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
 }
 
 /// The ops for a bare [`Mechanism::Kde`], which names the mechanism but
 /// not the tool major (the state file, the `with_mechanism` constructor):
-/// the §D4 [`detect`] over `os`, `env` and `on_path` when it says KDE;
+/// the §D4 [`detect`] over `os`, `env` and `resolve` when it says KDE;
 /// otherwise (the desktop word is absent from this environment, or the OS
 /// word is not `linux` on a test host) `PATH` alone picks the major,
 /// `kwriteconfig6` unless only `kwriteconfig5` is present, and no gsettings
 /// mirror is assumed: a restore follows the snapshot's content regardless.
+/// Either way the tools are stored by the absolute path `resolve` found.
 pub(crate) fn kde_ops_resolved(
     os: &str,
     env: &dyn Fn(&str) -> Option<String>,
-    on_path: &dyn Fn(&str) -> bool,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> KdeOps {
+    let on_path = |tool: &str| resolve(tool).is_some();
     if let Detected::Kde {
         kwrite,
         kread,
         gsettings_too,
-    } = detect(os, env, on_path)
+    } = detect(os, env, &on_path)
     {
-        return KdeOps {
-            kwrite,
-            kread,
-            gsettings_too,
-        };
+        return KdeOps::resolved(kwrite, kread, gsettings_too, resolve);
     }
     let (kwrite, kread) = if !on_path("kwriteconfig6") && on_path("kwriteconfig5") {
         ("kwriteconfig5", "kreadconfig5")
     } else {
         ("kwriteconfig6", "kreadconfig6")
     };
-    KdeOps {
-        kwrite,
-        kread,
-        gsettings_too: false,
-    }
+    KdeOps::resolved(kwrite, kread, false, resolve)
 }
 
 /// [`kde_ops_resolved`] over this process: `std::env::consts::OS`, the real
@@ -178,7 +161,7 @@ pub(crate) fn kde_ops_from_host() -> KdeOps {
     kde_ops_resolved(
         std::env::consts::OS,
         &|name| std::env::var(name).ok(),
-        &|tool| on_path_in(path.as_deref(), tool),
+        &|tool| resolve_on_path(path.as_deref(), tool),
     )
 }
 
@@ -332,15 +315,6 @@ fn read_as_write(e: ReadError) -> WriteError {
     }
 }
 
-fn defaults() -> Vec<String> {
-    BYPASS_DEFAULT.iter().map(|s| s.to_string()).collect()
-}
-
-/// §D5: previous ∪ default ∪ extra, ordered, de-duplicated.
-fn merged_bypass(previous: &[String], extra: &[String]) -> Vec<String> {
-    merge_bypass(&merge_bypass(previous, &defaults()), extra)
-}
-
 // ---- gsettings ---------------------------------------------------------------
 
 /// The state-file key for one gsettings key: `<schema> <key>` (§D7).
@@ -461,7 +435,7 @@ fn gsettings_write(
         "org.gnome.system.proxy",
         "ignore-hosts",
     ));
-    let bypass = merged_bypass(&previous_list, bypass_extra);
+    let bypass = bypass_for(&previous_list, bypass_extra);
     let written = gsettings_write_values(ours, &bypass);
     for (schema, key, value) in &written {
         let line = gsettings_set(schema, key, value);
@@ -530,12 +504,12 @@ impl PlatformOps for GsettingsOps {
         ours: &Endpoint,
         bypass_extra: &[String],
     ) -> Result<Vec<String>, WriteError> {
-        let previous_keys = match previous {
-            Previous::Gsettings { keys } => Some(keys),
-            Previous::Kde { gsettings, .. } => gsettings.as_ref(),
-            Previous::Networksetup { .. } => None,
+        let Previous::Gsettings { keys } = previous else {
+            return Err(WriteError::Failed(
+                "previous state is not a gsettings snapshot".to_string(),
+            ));
         };
-        gsettings_write(exec, previous_keys, ours, bypass_extra)
+        gsettings_write(exec, Some(keys), ours, bypass_extra)
     }
 
     fn restore(
@@ -565,12 +539,16 @@ impl PlatformOps for GsettingsOps {
 
 // ---- KDE -----------------------------------------------------------------------
 
-/// `kwrite`/`kread` are `kwriteconfig6`/`kreadconfig6` or the 5 variants;
-/// `gsettings_too` mirrors the writes into gsettings for GTK apps (§D4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `kwrite`/`kread` are `kwriteconfig6`/`kreadconfig6` or the 5 variants
+/// and `dbus_send` the KIO signal tool, each the absolute path detection
+/// resolved on `PATH` (a tool not found keeps its bare name, so the spawn
+/// failure names it); `gsettings_too` mirrors the writes into gsettings
+/// for GTK apps (§D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KdeOps {
-    pub kwrite: &'static str,
-    pub kread: &'static str,
+    pub kwrite: PathBuf,
+    pub kread: PathBuf,
+    pub dbus_send: PathBuf,
     pub gsettings_too: bool,
 }
 
@@ -607,10 +585,36 @@ fn parse_kde_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// `name` as `resolve` finds it on `PATH`, else the bare name.
+fn tool_path(name: &str, resolve: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {
+    resolve(name).unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// A resolved path as the `program` of a [`CmdLine`].
+fn program(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 impl KdeOps {
+    /// The ops for the tool names [`detect`] chose, each resolved to its
+    /// absolute path on `PATH` through `resolve` (`dbus-send` too).
+    pub(crate) fn resolved(
+        kwrite: &str,
+        kread: &str,
+        gsettings_too: bool,
+        resolve: &dyn Fn(&str) -> Option<PathBuf>,
+    ) -> KdeOps {
+        KdeOps {
+            kwrite: tool_path(kwrite, resolve),
+            kread: tool_path(kread, resolve),
+            dbus_send: tool_path(DBUS_SEND, resolve),
+            gsettings_too,
+        }
+    }
+
     fn kread_line(&self, key: &str) -> CmdLine {
         cmd(
-            self.kread,
+            &program(&self.kread),
             &["--file", KIOSLAVERC, "--group", KDE_GROUP, "--key", key],
             false,
         )
@@ -618,7 +622,7 @@ impl KdeOps {
 
     fn kwrite_line(&self, key: &str, value: &str) -> CmdLine {
         cmd(
-            self.kwrite,
+            &program(&self.kwrite),
             &[
                 "--file", KIOSLAVERC, "--group", KDE_GROUP, "--key", key, value,
             ],
@@ -626,9 +630,9 @@ impl KdeOps {
         )
     }
 
-    fn signal_line() -> CmdLine {
+    fn signal_line(&self) -> CmdLine {
         cmd(
-            DBUS_SEND,
+            &program(&self.dbus_send),
             &[
                 "--type=signal",
                 "/KIO/Scheduler",
@@ -661,7 +665,7 @@ impl KdeOps {
             lines.push(line.render());
             run_write(exec, &line)?;
         }
-        let signal = Self::signal_line();
+        let signal = self.signal_line();
         lines.push(signal.render());
         run_write(exec, &signal)
     }
@@ -722,22 +726,29 @@ impl PlatformOps for KdeOps {
         ours: &Endpoint,
         bypass_extra: &[String],
     ) -> Result<Vec<String>, WriteError> {
-        let (kioslaverc, gsettings) = match previous {
-            Previous::Kde {
-                kioslaverc,
-                gsettings,
-            } => (Some(kioslaverc), gsettings.as_ref()),
-            _ => (None, None),
+        let Previous::Kde {
+            kioslaverc,
+            gsettings,
+        } = previous
+        else {
+            return Err(WriteError::Failed(
+                "previous state is not a KDE snapshot".to_string(),
+            ));
         };
         let mut lines = Vec::new();
         if self.gsettings_too {
-            lines.extend(gsettings_write(exec, gsettings, ours, bypass_extra)?);
+            lines.extend(gsettings_write(
+                exec,
+                gsettings.as_ref(),
+                ours,
+                bypass_extra,
+            )?);
         }
         let previous_list = kioslaverc
-            .and_then(|m| m.get("NoProxyFor"))
+            .get("NoProxyFor")
             .map(|v| parse_kde_list(v))
             .unwrap_or_default();
-        let bypass = merged_bypass(&previous_list, bypass_extra);
+        let bypass = bypass_for(&previous_list, bypass_extra);
         let proxy = kde_proxy_value(ours);
         let values = [
             ("ProxyType", "1".to_string()),
@@ -834,6 +845,35 @@ mod tests {
     fn tools_of(names: &[&str]) -> impl Fn(&str) -> bool {
         let set: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         move |t: &str| set.iter().any(|s| s == t)
+    }
+
+    /// A resolver that finds `names` under `/fake/bin`, like a `PATH` with
+    /// one entry would.
+    fn tools_at(names: &[&str]) -> impl Fn(&str) -> Option<std::path::PathBuf> {
+        let set: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        move |t: &str| {
+            set.iter()
+                .any(|s| s == t)
+                .then(|| std::path::Path::new("/fake/bin").join(t))
+        }
+    }
+
+    /// `KdeOps` for tools resolved under `/fake/bin`; a tool not in `found`
+    /// keeps its bare name (so a missing one is still reported by name).
+    fn kde_at(kwrite: &str, kread: &str, found: &[&str], gsettings_too: bool) -> KdeOps {
+        let at = |t: &str| {
+            if found.contains(&t) {
+                std::path::Path::new("/fake/bin").join(t)
+            } else {
+                std::path::PathBuf::from(t)
+            }
+        };
+        KdeOps {
+            kwrite: at(kwrite),
+            kread: at(kread),
+            dbus_send: at("dbus-send"),
+            gsettings_too,
+        }
     }
 
     /// SP-AC10: the §D4 detection table, pure over (os, env, PATH).
@@ -933,8 +973,9 @@ mod tests {
     /// F1.3: the `PATH` probe behind detection, on a real directory. Only a
     /// file in a listed entry counts; a directory of that name, an entry
     /// that does not exist, an empty entry and an absent `PATH` do not.
+    /// S2: the resolved form is the file's absolute path.
     #[test]
-    fn on_path_in_finds_files_in_path_entries_only() {
+    fn resolve_on_path_finds_files_in_path_entries_only() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after 1970")
@@ -950,15 +991,25 @@ mod tests {
             dir.clone(),
         ])
         .expect("join paths");
-        assert!(on_path_in(Some(&path), "kwriteconfig5"));
+        assert!(resolve_on_path(Some(&path), "kwriteconfig5").is_some());
+        assert_eq!(
+            resolve_on_path(Some(&path), "kwriteconfig5"),
+            Some(dir.join("kwriteconfig5")),
+            "the resolved form is the file in the PATH entry that has it"
+        );
+        assert_eq!(resolve_on_path(Some(&path), "kwriteconfig6"), None);
+        assert_eq!(resolve_on_path(None, "kwriteconfig5"), None);
         assert!(
-            !on_path_in(Some(&path), "kwriteconfig6"),
+            resolve_on_path(Some(&path), "kwriteconfig6").is_none(),
             "a directory is not a tool"
         );
-        assert!(!on_path_in(Some(&path), "gsettings"));
-        assert!(!on_path_in(None, "kwriteconfig5"), "no PATH, no tools");
+        assert!(resolve_on_path(Some(&path), "gsettings").is_none());
         assert!(
-            !on_path_in(Some(std::ffi::OsStr::new("")), "kwriteconfig5"),
+            resolve_on_path(None, "kwriteconfig5").is_none(),
+            "no PATH, no tools"
+        );
+        assert!(
+            resolve_on_path(Some(std::ffi::OsStr::new("")), "kwriteconfig5").is_none(),
             "an empty PATH entry is not the working directory"
         );
 
@@ -973,25 +1024,24 @@ mod tests {
     #[test]
     fn kde_ops_resolved_follows_detection_then_path() {
         let kde = env_of(&[("XDG_CURRENT_DESKTOP", "KDE")]);
+        // S2: every tool found on PATH is stored by its absolute path; one
+        // not found keeps its bare name so the error still names it.
+        let found5 = ["kwriteconfig5", "kreadconfig5", "dbus-send"];
         assert_eq!(
-            kde_ops_resolved("linux", &kde, &tools_of(&["kwriteconfig5"])),
-            KdeOps {
-                kwrite: "kwriteconfig5",
-                kread: "kreadconfig5",
-                gsettings_too: false
-            }
+            kde_ops_resolved("linux", &kde, &tools_at(&found5)),
+            kde_at("kwriteconfig5", "kreadconfig5", &found5, false)
         );
+        let all6 = [
+            "kwriteconfig6",
+            "kreadconfig6",
+            "kwriteconfig5",
+            "kreadconfig5",
+            "gsettings",
+            "dbus-send",
+        ];
         assert_eq!(
-            kde_ops_resolved(
-                "linux",
-                &kde,
-                &tools_of(&["kwriteconfig6", "kwriteconfig5", "gsettings"])
-            ),
-            KdeOps {
-                kwrite: "kwriteconfig6",
-                kread: "kreadconfig6",
-                gsettings_too: true
-            }
+            kde_ops_resolved("linux", &kde, &tools_at(&all6)),
+            kde_at("kwriteconfig6", "kreadconfig6", &all6, true)
         );
         // No desktop word (a core started from a unit file, a watchdog with
         // a trimmed environment): PATH decides the major; no mirror is
@@ -1000,29 +1050,32 @@ mod tests {
             kde_ops_resolved(
                 "linux",
                 &env_of(&[]),
-                &tools_of(&["kwriteconfig5", "gsettings"])
+                &tools_at(&["kwriteconfig5", "kreadconfig5", "gsettings"])
             ),
-            KdeOps {
-                kwrite: "kwriteconfig5",
-                kread: "kreadconfig5",
-                gsettings_too: false
-            }
+            kde_at(
+                "kwriteconfig5",
+                "kreadconfig5",
+                &["kwriteconfig5", "kreadconfig5"],
+                false
+            )
         );
         assert_eq!(
-            kde_ops_resolved("linux", &env_of(&[]), &tools_of(&["kwriteconfig6"])),
-            KdeOps {
-                kwrite: "kwriteconfig6",
-                kread: "kreadconfig6",
-                gsettings_too: false
-            }
+            kde_ops_resolved(
+                "linux",
+                &env_of(&[]),
+                &tools_at(&["kwriteconfig6", "kreadconfig6"])
+            ),
+            kde_at(
+                "kwriteconfig6",
+                "kreadconfig6",
+                &["kwriteconfig6", "kreadconfig6"],
+                false
+            )
         );
         assert_eq!(
-            kde_ops_resolved("macos", &env_of(&[]), &tools_of(&[])),
-            KdeOps {
-                kwrite: "kwriteconfig6",
-                kread: "kreadconfig6",
-                gsettings_too: false
-            }
+            kde_ops_resolved("macos", &env_of(&[]), &tools_at(&[])),
+            kde_at("kwriteconfig6", "kreadconfig6", &[], false),
+            "nothing found: bare names, so a spawn failure names the tool"
         );
         assert_eq!(
             crate::platform::ops_for(Mechanism::Kde).mechanism(),
@@ -1245,10 +1298,109 @@ mod tests {
 
     fn kde6() -> KdeOps {
         KdeOps {
-            kwrite: "kwriteconfig6",
-            kread: "kreadconfig6",
+            kwrite: "kwriteconfig6".into(),
+            kread: "kreadconfig6".into(),
+            dbus_send: "dbus-send".into(),
             gsettings_too: false,
         }
+    }
+
+    /// S2: the lines a detected KDE renders spawn the tools by the absolute
+    /// path detection resolved on `PATH`, never by a bare name the spawn
+    /// would look up again.
+    #[test]
+    fn kde_tools_render_by_their_resolved_absolute_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aitm-sysproxy-kde-path-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for tool in ["kwriteconfig6", "kreadconfig6", "dbus-send"] {
+            std::fs::write(dir.join(tool), b"#!/bin/sh\n").expect("write tool");
+        }
+        let path = dir.clone().into_os_string();
+        let resolve = |tool: &str| resolve_on_path(Some(&path), tool);
+        let kde = kde_ops_resolved(
+            "linux",
+            &env_of(&[("XDG_CURRENT_DESKTOP", "KDE")]),
+            &resolve,
+        );
+        assert_eq!(
+            kde,
+            KdeOps {
+                kwrite: dir.join("kwriteconfig6"),
+                kread: dir.join("kreadconfig6"),
+                dbus_send: dir.join("dbus-send"),
+                gsettings_too: false,
+            }
+        );
+        let kw = dir.join("kwriteconfig6").to_string_lossy().into_owned();
+        let kr_path = dir.join("kreadconfig6").to_string_lossy().into_owned();
+        let dbus_path = dir.join("dbus-send").to_string_lossy().into_owned();
+
+        let exec = ScriptedExecutor::new();
+        let lines = kde
+            .write(&exec, &previous_kde(), &ours(), &[])
+            .expect("write");
+        let kioslaverc = ["--file", "kioslaverc", "--group", "Proxy Settings", "--key"];
+        let kw_line = |key: &str, value: &str| {
+            let mut args = kioslaverc.to_vec();
+            args.push(key);
+            args.push(value);
+            line(&kw, &args)
+        };
+        assert_eq!(
+            lines,
+            vec![
+                kw_line("ProxyType", "1"),
+                kw_line("httpProxy", "http://127.0.0.1 8080"),
+                kw_line("httpsProxy", "http://127.0.0.1 8080"),
+                kw_line("NoProxyFor", "localhost,127.0.0.1,::1,*.local,169.254/16"),
+                line(
+                    &dbus_path,
+                    &[
+                        "--type=signal",
+                        "/KIO/Scheduler",
+                        "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                        "string:",
+                    ],
+                ),
+            ]
+        );
+        assert_eq!(exec.runs(), lines);
+
+        let exec = ScriptedExecutor::new();
+        kde.read_effective(&exec).expect("read");
+        let mut read_args = kioslaverc.to_vec();
+        read_args.push("ProxyType");
+        assert_eq!(exec.runs()[0], line(&kr_path, &read_args));
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Q7: a `write` handed another mechanism's snapshot is refused before
+    /// any run, as `restore` already is on both Linux mechanisms.
+    #[test]
+    fn write_refuses_a_mismatched_previous_kind_before_any_run() {
+        let exec = ScriptedExecutor::new();
+        assert!(matches!(
+            GsettingsOps.write(&exec, &previous_kde(), &ours(), &[]),
+            Err(WriteError::Failed(m)) if m.contains("not a gsettings snapshot")
+        ));
+        assert!(matches!(
+            kde6().write(&exec, &previous_gsettings(), &ours(), &[]),
+            Err(WriteError::Failed(m)) if m.contains("not a KDE snapshot")
+        ));
+        let mac = Previous::Networksetup { services: vec![] };
+        assert!(matches!(
+            GsettingsOps.write(&exec, &mac, &ours(), &[]),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(matches!(
+            kde6().write(&exec, &mac, &ours(), &[]),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(exec.runs().is_empty(), "{:?}", exec.runs());
     }
 
     fn previous_kde() -> Previous {
@@ -1379,8 +1531,9 @@ mod tests {
 
         // gsettings_too: snapshot carries the six keys; write mirrors first.
         let both = KdeOps {
-            kwrite: "kwriteconfig6",
-            kread: "kreadconfig6",
+            kwrite: "kwriteconfig6".into(),
+            kread: "kreadconfig6".into(),
+            dbus_send: "dbus-send".into(),
             gsettings_too: true,
         };
         let exec = scripted_gsettings(Some([
@@ -1770,8 +1923,9 @@ mod tester_tests {
     #[test]
     fn kde_write_failure_is_failed_and_the_signal_is_not_sent() {
         let kde = KdeOps {
-            kwrite: "kwriteconfig6",
-            kread: "kreadconfig6",
+            kwrite: "kwriteconfig6".into(),
+            kread: "kreadconfig6".into(),
+            dbus_send: "dbus-send".into(),
             gsettings_too: false,
         };
         let failing = line(

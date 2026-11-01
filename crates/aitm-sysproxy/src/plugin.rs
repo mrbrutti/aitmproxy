@@ -6,7 +6,6 @@
 //! process that is not serving (`listening == false`, §D10), because a
 //! one-shot process would exit and restore at once.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -16,7 +15,7 @@ use aitm_core::{
 };
 use anyhow::bail;
 
-use crate::{SetRequest, SystemProxy};
+use crate::{strings, SetRequest, SystemProxy};
 
 /// `proxy.system.set` refused for an agent (SP-AC15).
 pub const OPERATOR_ONLY_MSG: &str =
@@ -72,7 +71,10 @@ fn refuse_agents(host: &CommandHost, msg: &'static str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `proxy.system.status` (§D6): a fresh read, no side effects.
+/// `proxy.system.status` (§D6): a read, no side effects. Fresh for a
+/// present human control surface; for anyone else (an agent over MCP)
+/// served from the engine's short-lived status cache, so a polling loop
+/// cannot spawn a process storm (S3).
 pub(crate) struct ProxySystemStatus {
     sp: Arc<SystemProxy>,
 }
@@ -96,8 +98,13 @@ impl Command for ProxySystemStatus {
         Sensitivity::Read
     }
 
-    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        Ok(self.sp.status().to_value())
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        let status = if host.caller_is_trusted_control() {
+            self.sp.status()
+        } else {
+            self.sp.status_cached()
+        };
+        Ok(status.to_value())
     }
 }
 
@@ -157,7 +164,7 @@ impl Command for ProxySystemSet {
         }
         let bypass = Self::parse_bypass(&args)?;
         let (status, changed, commands) = self.sp.set(&SetRequest { bypass })?;
-        let mut map = object(status.to_value());
+        let mut map = status.to_map();
         map.insert("changed".to_string(), Value::Bool(changed));
         map.insert("commands".to_string(), strings(&commands));
         Ok(Value::Object(map))
@@ -208,7 +215,7 @@ impl Command for ProxySystemUnset {
     fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         refuse_agents(host, OPERATOR_ONLY_UNSET_MSG)?;
         let (outcome, changed, commands) = self.sp.unset()?;
-        let mut map = object(outcome.status.to_value());
+        let mut map = outcome.status.to_map();
         map.insert("changed".to_string(), Value::Bool(changed));
         map.insert("commands".to_string(), strings(&commands));
         map.insert("restored".to_string(), strings(&outcome.restored));
@@ -243,17 +250,6 @@ impl Command for ProxySystemUnset {
 }
 
 // --- Value helpers -------------------------------------------------------
-
-fn object(v: Value) -> BTreeMap<String, Value> {
-    match v {
-        Value::Object(map) => map,
-        other => BTreeMap::from([("status".to_string(), other)]),
-    }
-}
-
-fn strings(items: &[String]) -> Value {
-    Value::Array(items.iter().map(|s| Value::Str(s.clone())).collect())
-}
 
 fn get<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
     match v {
@@ -519,6 +515,51 @@ mod tests {
         );
         assert_eq!(err.to_string(), NEEDS_RUNNING_CORE_MSG);
         assert!(r.exec.runs().is_empty(), "ran: {:?}", r.exec.runs());
+    }
+
+    /// S3: an agent's `proxy.system.status` is served from a short-lived
+    /// cache of the full status, so a polling loop cannot spawn a process
+    /// storm; a present operator (any trusted control surface) always gets
+    /// a fresh read.
+    #[test]
+    fn agent_status_is_cached_two_seconds_operator_status_is_fresh() {
+        let exec = ScriptedExecutor::new().respond(SCUTIL, 0, &scutil_out("127.0.0.1", 9090), "");
+        let r = rig("mcp-status-cache", before_round(exec), true);
+
+        let first = r
+            .call("proxy.system.status", Frontend::Mcp, Params::default())
+            .expect("status");
+        let one_round = r.exec.runs().len();
+        assert_eq!(
+            one_round,
+            8,
+            "scutil + list + three gets × two services: {:?}",
+            r.exec.runs()
+        );
+        assert_eq!(field(&first, "state"), &Value::Str("other".into()));
+
+        let second = r
+            .call("proxy.system.status", Frontend::Mcp, Params::default())
+            .expect("status");
+        assert_eq!(second, first, "the same full status, from the cache");
+        assert_eq!(
+            r.exec.runs().len(),
+            one_round,
+            "the second agent read within 2 s ran nothing: {:?}",
+            r.exec.runs()
+        );
+
+        r.call("proxy.system.status", Frontend::Operator, Params::default())
+            .expect("status");
+        assert_eq!(
+            r.exec.runs().len(),
+            2 * one_round,
+            "an operator read is a fresh read round"
+        );
+        r.call("proxy.system.status", Frontend::Cli, Params::default())
+            .expect("status");
+        assert_eq!(r.exec.runs().len(), 3 * one_round, "and so is the CLI's");
+        assert_eq!(crate::STATUS_TTL, std::time::Duration::from_secs(2));
     }
 
     /// SP-AC15 / §D10: status and unset work one-shot.
