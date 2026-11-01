@@ -33,12 +33,16 @@
 //! libpcap reports for Linux `lo` (`DLT_EN10MB`); the destination it routes on is
 //! compared with the guard's own parse of the same frame, so a buffer the guard
 //! read differently — or could not decode at all — is refused rather than
-//! injected. The raw socket is bound to the named device (`SO_BINDTODEVICE`), so
-//! this path can reach only what `sendpacket` on that device could. Residual,
-//! recorded in the plan and not on this path: `L4Guard::admit_endpoints`, the
-//! capture-side decision whether a frame may be *recorded*, admits an
-//! undecodable frame blindly (pre-existing); injection refuses anything the
-//! admitting parser cannot decode.
+//! injected. The path reaches only loopback destinations, on the bound device:
+//! a destination outside `127.0.0.0/8` / `::1` is refused before any socket is
+//! opened ([`loopback_destination`]), and the raw socket is bound to the named
+//! device (`SO_BINDTODEVICE`) as defence in depth — rig run 4 (Ubuntu 24.04,
+//! kernel 6.8) showed the kernel still *emits* a non-local destination on the
+//! bound loopback device, where it dies unobserved, so the binding alone is not
+//! a refusal. Residual, recorded in the plan and not on this path:
+//! `L4Guard::admit_endpoints`, the capture-side decision whether a frame may be
+//! *recorded*, admits an undecodable frame blindly (pre-existing); injection
+//! refuses anything the admitting parser cannot decode.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -92,12 +96,13 @@ impl CaptureInjectBackend for PcapBackend {
     /// **Both views are compared**: that header read is cross-checked against the
     /// destination the guard's own parse of the same bytes decodes
     /// ([`admitted_destination`]), and a disagreement — or a frame that parse
-    /// cannot decode — is refused rather than sent. **The device is the
-    /// operator's**: the raw socket is bound to the named device
-    /// (`SO_BINDTODEVICE`), so the new path can reach only what `sendpacket` on
-    /// that device could; an off-host destination on a loopback device fails
-    /// `ENETUNREACH` and is a [`L4Error::WireWrite`], never a packet out of the
-    /// real NIC. **Privilege is reported as such**: `EPERM` from the raw socket is
+    /// cannot decode — is refused rather than sent. **Only loopback, on the
+    /// operator's device**: a destination that is not a loopback address is
+    /// refused before any socket is opened ([`loopback_destination`]) as a
+    /// [`L4Error::WireWrite`], and the raw socket is bound to the named device
+    /// (`SO_BINDTODEVICE`) besides, so the new path can reach only what
+    /// `sendpacket` on that device could — never a packet out of the real NIC.
+    /// **Privilege is reported as such**: `EPERM` from the raw socket is
     /// [`L4Error::Unavailable`], the same variant the `sendpacket` path returns.
     /// **No handle outlives a guard decision**: both the pcap handle and the raw
     /// socket are opened inside this call and dropped when it returns, so nothing
@@ -274,6 +279,27 @@ fn admitted_destination(frame: &[u8], dst: IpAddr) -> Result<(), L4Error> {
     }
 }
 
+/// Refuse a destination that is not a loopback address (`127.0.0.0/8`, `::1`).
+///
+/// The layer-3 path exists only for a device libpcap flags `IFF_LOOPBACK`, and
+/// the packet lane only ever targets loopback ([`crate::discover::resolve_target`]),
+/// so a non-loopback destination here is never legitimate. The device binding
+/// ([`bind_to_device`]) stays as defence in depth, but it is not a refusal: rig
+/// run 4 (Ubuntu 24.04, kernel 6.8) showed the kernel *accepts* a `send_to` to
+/// `10.255.255.254` on a socket bound to `lo` and emits the frame on `lo`, where
+/// it dies — `send_to` returned `Ok`. So the refusal must be ours, deterministic
+/// and before any socket is opened. Pure: no payload byte, no address, reaches
+/// the message.
+fn loopback_destination(dst: IpAddr) -> Result<(), L4Error> {
+    if dst.is_loopback() {
+        Ok(())
+    } else {
+        Err(L4Error::WireWrite(
+            "linux loopback inject: destination is not a loopback address".to_string(),
+        ))
+    }
+}
+
 /// Classify a raw-socket failure on the Linux loopback path. `EPERM`
 /// (`PermissionDenied`: no `CAP_NET_RAW`) is [`L4Error::Unavailable`], the
 /// variant this crate documents for "no privilege" and the one the `sendpacket`
@@ -328,6 +354,7 @@ fn inject_ip_packet(iface: &str, frame: &[u8]) -> Result<(), L4Error> {
 
     let packet = strip_link_header(frame)?;
     let dst = ip_destination(packet)?;
+    loopback_destination(dst.ip())?;
     admitted_destination(frame, dst.ip())?;
 
     let domain = if dst.is_ipv4() {
@@ -640,6 +667,60 @@ mod tests {
             "and so does our own header read"
         );
         assert_eq!(admitted_destination(&frame, dst.ip()), Ok(()));
+    }
+
+    /// Rig run 4 (Ubuntu 24.04, kernel 6.8): with the raw socket bound to `lo`
+    /// the kernel still *accepted* a datagram to `10.255.255.254` and emitted it
+    /// on `lo`, where it died — confinement held, but `send_to` returned `Ok`.
+    /// So the refusal of a non-loopback destination is ours, before any socket:
+    /// `127.0.0.0/8` and `::1` pass, everything else is the one exact
+    /// `WireWrite` literal.
+    #[test]
+    fn loopback_destination_accepts_127_and_v6_loopback_only() {
+        let refused = Err(L4Error::WireWrite(
+            "linux loopback inject: destination is not a loopback address".to_string(),
+        ));
+
+        for ok in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 255, 255, 254)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert_eq!(loopback_destination(ok), Ok(()), "{ok} is loopback");
+        }
+
+        for bad in [
+            IpAddr::V4(Ipv4Addr::new(10, 255, 255, 254)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert_eq!(loopback_destination(bad), refused, "{bad} is not loopback");
+        }
+    }
+
+    /// The same rule through `inject_ip_packet` itself: a well-formed crafted
+    /// frame to `10.255.255.254` — both destination reads agree, so the
+    /// cross-check passes — is refused with the loopback literal. The refusal
+    /// comes before `Socket::new`, which is why this runs unprivileged and on
+    /// every OS (off Linux the socket step would fail differently, as
+    /// `Unavailable` from [`bind_to_device`] or `EPERM`).
+    #[test]
+    fn inject_ip_packet_refuses_a_non_loopback_destination_before_any_socket() {
+        let off_host = ether_ipv4_udp_frame_to(Ipv4Addr::new(10, 255, 255, 254), 40001, b"stray");
+        assert_eq!(
+            PacketSpec::endpoints(&off_host).dst,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 254))),
+            "the guard's parse and the header read agree, so only the loopback rule refuses it"
+        );
+
+        assert_eq!(
+            inject_ip_packet("lo", &off_host),
+            Err(L4Error::WireWrite(
+                "linux loopback inject: destination is not a loopback address".to_string()
+            ))
+        );
     }
 
     /// Amendment 49, round 2: when the guard's parser reads the same bytes as a
@@ -1002,10 +1083,11 @@ mod tests {
     /// asserts a bound UDP socket receives the payload; part two re-injects to the
     /// now-closed port and asserts the kernel answers ICMP destination unreachable
     /// / port unreachable (type 3, code 3). Before this fix both halves were
-    /// silent. Part three (security panel M1): the raw socket is bound to `lo`,
-    /// so a datagram to `10.255.255.254` — RFC 1918, no route via `lo` — is
-    /// refused `ENETUNREACH` as a `WireWrite` instead of leaving through the
-    /// real NIC. Needs `CAP_NET_RAW`: unprivileged, the raw socket's `EPERM` is
+    /// silent. Part three (security panel M1, rig run 4): a datagram to
+    /// `10.255.255.254` — RFC 1918, not loopback — is refused as a `WireWrite`
+    /// before any socket is opened ([`loopback_destination`]); the device-bound
+    /// socket alone would have *emitted* it on `lo`, where it dies unobserved.
+    /// Needs `CAP_NET_RAW`: unprivileged, the raw socket's `EPERM` is
     /// classified `L4Error::Unavailable` ([`socket_error`]) and the test skips
     /// through the crate's fail-closed path.
     #[cfg(target_os = "linux")]
@@ -1071,12 +1153,20 @@ mod tests {
             "the closed port answers ICMP destination unreachable / port unreachable"
         );
 
-        // Part three: the socket is bound to `lo`, so an off-host destination
-        // has no route through it and the write is refused, fail-closed.
+        // Part three: the kernel would emit a non-loopback destination on the
+        // bound device (rig run 4), so the injector refuses it before opening a
+        // socket, fail-closed.
         let off_host = ether_ipv4_udp_frame_to(Ipv4Addr::new(10, 255, 255, 254), port, b"stray");
+        let refusal = backend.inject("lo", &off_host);
         assert!(
-            matches!(backend.inject("lo", &off_host), Err(L4Error::WireWrite(_))),
-            "an off-host destination is refused by the device-bound socket"
+            matches!(refusal, Err(L4Error::WireWrite(_))),
+            "an off-host destination is refused before any socket is opened"
+        );
+        assert_eq!(
+            refusal,
+            Err(L4Error::WireWrite(
+                "linux loopback inject: destination is not a loopback address".to_string()
+            ))
         );
     }
 }
