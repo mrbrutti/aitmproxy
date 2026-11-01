@@ -148,6 +148,20 @@ struct ProviderRuleSet: Equatable {
 
 #if DEBUG
 extension HandoffSelfCheck {
+    /// The remote endpoint of `rule` as `"<address>|<port>"` from the read-back
+    /// `.hostPort(host:port:)`; `"nil"` for no remote. Shared by the rule groups so
+    /// every literal pin reads the same rendering.
+    private static func remoteText(_ rule: NENetworkRule) -> String {
+        guard let endpoint = rule.matchRemoteHostOrNetworkEndpoint else { return "nil" }
+        guard case let .hostPort(host, port) = endpoint else { return "not hostPort: \(endpoint)" }
+        switch host {
+        case .ipv4(let address): return "\(address)|\(port.rawValue)"
+        case .ipv6(let address): return "\(address)|\(port.rawValue)"
+        case .name(let name, _): return "name \(name)|\(port.rawValue)"
+        @unknown default: return "unknown host|\(port.rawValue)"
+        }
+    }
+
     /// TR-AC1 of spec 2026-11-01-ne-tcp-only-catch-all-design: `ProviderRuleSet` is a pure
     /// function of the matcher, canonical under token order and duplicates, and the
     /// `NENetworkRule`s it builds read back with the literal protocol, direction, remote
@@ -214,22 +228,12 @@ extension HandoffSelfCheck {
         r.check("providerRules: wanted(for: nil) == .tcpOnly", ProviderRuleSet.wanted(for: nil) == .tcpOnly)
 
         // -- networkRules() read-back (Design A) ---------------------------------
-        // The remote endpoint is rendered as "<address>|<port>" from the read-back
-        // `.hostPort(host:port:)`; "nil" for no remote. The literals are asserted.
-        func remote(_ rule: NENetworkRule) -> String {
-            guard let endpoint = rule.matchRemoteHostOrNetworkEndpoint else { return "nil" }
-            guard case let .hostPort(host, port) = endpoint else { return "not hostPort: \(endpoint)" }
-            switch host {
-            case .ipv4(let address): return "\(address)|\(port.rawValue)"
-            case .ipv6(let address): return "\(address)|\(port.rawValue)"
-            case .name(let name, _): return "name \(name)|\(port.rawValue)"
-            @unknown default: return "unknown host|\(port.rawValue)"
-            }
-        }
+        // `remoteText` renders the read-back remote endpoint as "<address>|<port>";
+        // "nil" for no remote. The literals are asserted.
         func checkTCP(_ rule: NENetworkRule, _ label: String) {
             r.check("\(label) protocol .TCP", rule.matchProtocol == .TCP, "\(rule.matchProtocol.rawValue)")
             r.check("\(label) direction .outbound", rule.matchDirection == .outbound, "\(rule.matchDirection.rawValue)")
-            r.check("\(label) nil remote", rule.matchRemoteHostOrNetworkEndpoint == nil, remote(rule))
+            r.check("\(label) nil remote", rule.matchRemoteHostOrNetworkEndpoint == nil, remoteText(rule))
             r.check("\(label) remote prefix 0", rule.matchRemotePrefix == 0, "\(rule.matchRemotePrefix)")
             r.check("\(label) nil local", rule.matchLocalNetworkEndpoint == nil,
                   "\(String(describing: rule.matchLocalNetworkEndpoint))")
@@ -237,7 +241,7 @@ extension HandoffSelfCheck {
         func checkUDP(_ rule: NENetworkRule, _ label: String, host: String, port: UInt16, prefix: Int) {
             r.check("\(label) protocol .UDP", rule.matchProtocol == .UDP, "\(rule.matchProtocol.rawValue)")
             r.check("\(label) direction .outbound", rule.matchDirection == .outbound, "\(rule.matchDirection.rawValue)")
-            r.check("\(label) remote \(host) port \(port)", remote(rule) == "\(host)|\(port)", remote(rule))
+            r.check("\(label) remote \(host) port \(port)", remoteText(rule) == "\(host)|\(port)", remoteText(rule))
             r.check("\(label) remote prefix \(prefix)", rule.matchRemotePrefix == prefix, "\(rule.matchRemotePrefix)")
             r.check("\(label) nil local", rule.matchLocalNetworkEndpoint == nil,
                   "\(String(describing: rule.matchLocalNetworkEndpoint))")
@@ -273,16 +277,6 @@ extension HandoffSelfCheck {
     /// the rule count.
     static func providerRulesEdges(_ r: Recorder) {
         typealias Target = ProviderRuleSet.UDPTarget
-        func remote(_ rule: NENetworkRule) -> String {
-            guard let endpoint = rule.matchRemoteHostOrNetworkEndpoint else { return "nil" }
-            guard case let .hostPort(host, port) = endpoint else { return "not hostPort: \(endpoint)" }
-            switch host {
-            case .ipv4(let address): return "\(address)|\(port.rawValue)"
-            case .ipv6(let address): return "\(address)|\(port.rawValue)"
-            case .name(let name, _): return "name \(name)|\(port.rawValue)"
-            @unknown default: return "unknown host|\(port.rawValue)"
-            }
-        }
 
         // -- Oversized, shuffled, duplicated input: no cap, canonical order ----------
         var distinct: [(address: String, port: UInt16?, token: String)] = []
@@ -320,13 +314,13 @@ extension HandoffSelfCheck {
                   bigRules[0].matchProtocol == .TCP && bigRules[0].matchRemoteHostOrNetworkEndpoint == nil
                       && bigRules[0].matchRemotePrefix == 0)
             r.check("providerRulesEdges: big rule 1 is the text-first address 10.1.0.9:4000 /32",
-                  bigRules[1].matchProtocol == .UDP && remote(bigRules[1]) == "10.1.0.9|4000"
+                  bigRules[1].matchProtocol == .UDP && remoteText(bigRules[1]) == "10.1.0.9|4000"
                       && bigRules[1].matchRemotePrefix == 32,
-                  remote(bigRules[1]))
+                  remoteText(bigRules[1]))
             r.check("providerRulesEdges: big rule 72 is the text-last address [2001:db8::8]:any /128",
-                  bigRules[72].matchProtocol == .UDP && remote(bigRules[72]) == "2001:db8::8|0"
+                  bigRules[72].matchProtocol == .UDP && remoteText(bigRules[72]) == "2001:db8::8|0"
                       && bigRules[72].matchRemotePrefix == 128,
-                  remote(bigRules[72]))
+                  remoteText(bigRules[72]))
             r.check("providerRulesEdges: every big rule is outbound with nil local",
                   bigRules.allSatisfy { $0.matchDirection == .outbound && $0.matchLocalNetworkEndpoint == nil })
         }
@@ -347,8 +341,8 @@ extension HandoffSelfCheck {
         let mappedRules = mapped.networkRules()
         r.check("providerRulesEdges: IPv4-mapped rule is .UDP to 198.51.100.7:443 /32",
               mappedRules.count == 2 && mappedRules[1].matchProtocol == .UDP
-                  && remote(mappedRules[1]) == "198.51.100.7|443" && mappedRules[1].matchRemotePrefix == 32,
-              mappedRules.count == 2 ? remote(mappedRules[1]) + " /\(mappedRules[1].matchRemotePrefix)" : "\(mappedRules.count) rules")
+                  && remoteText(mappedRules[1]) == "198.51.100.7|443" && mappedRules[1].matchRemotePrefix == 32,
+              mappedRules.count == 2 ? remoteText(mappedRules[1]) + " /\(mappedRules[1].matchRemotePrefix)" : "\(mappedRules.count) rules")
 
         // -- Only never-claimed, wildcard and malformed tokens: TCP-only -------------
         let junk = "[2001:db8::3 198.51.100.7:0 198.51.100.7:65536 10.0.0.1:53 10.0.0.2:5353 10.0.0.3:853 "
