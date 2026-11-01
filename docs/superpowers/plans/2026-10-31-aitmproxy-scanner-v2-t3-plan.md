@@ -1409,7 +1409,7 @@ superseded. SQL injection stays one class `sqli` across `sqli-boolean`, `sqli-ti
 the Rhai error-based `sqli` so boolean + error hits on one parameter dedupe into one
 issue (T1-7); D6's `sqli-error` is read as the check id. Full list: reflected-xss,
 open-redirect, sqli, cmdi, ssti, path-traversal, xxe, crlf, nosqli, ldapi, ssrf, cors,
-security-headers, http-methods, sensitive-paths, h2-settings, h2-pseudo-header,
+information-disclosure (for `headers`, `methods`, `paths`; coordinator pin 2026-11-01, superseding security-headers/http-methods/sensitive-paths), h2-settings, h2-pseudo-header,
 h2-header-crlf, h2-smuggling-indicator, h2-rapid-reset. Applied in F3 (`xss.rs`) and in
 the Rhai drafts.
 
