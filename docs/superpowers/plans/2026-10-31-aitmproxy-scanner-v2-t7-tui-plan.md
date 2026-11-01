@@ -744,6 +744,8 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | quality review (H50-H56) | PASS | every H52 sub-item and H56's shape verified | three Minors to H67-H69 |
 | H (Rust) | quality | Minor | `last_error` doc claims a toast reader; slot dispatch written thrice; H50 test proves two things | fix round H Rust (H67, H68, H69) |
 | H (Rust) | spec review (H50-H56) | PASS | H56 behaviour and tests, T7-7 and T7-13 intact, H50/H52/H53 exact | three doc Minors: D13, D3 shapes and D6 wording amended |
+| H (cell) | fix round | done | H62-H65 in `85800f80`; `--selftest` 54 ok | live run 5 |
+| H (cell) | coder note | Minor | `stop()` uses `shutdown(SHUT_RDWR)` (measured: `close()` hangs behind the reader); `set_ring_field` generalised; T7-17 first with `thorough` | ratified |
 
 ## Shipped
 
