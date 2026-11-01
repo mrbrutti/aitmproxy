@@ -46,7 +46,6 @@
 //! `FindingRecord`.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
@@ -56,6 +55,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::gate::{self, ProbeTally};
 use crate::matching::{body_text, length_differs};
 
 /// The hard ceiling on stimuli this check spends on one insertion point,
@@ -192,26 +192,19 @@ impl SqliBoolean {
 
 /// Whether the check may spend `need` more stimuli right now.
 ///
-/// Four reasons to stop, and the check owns all four: the job was cancelled, it
-/// is out of budget, it is past its deadline, or this point has had its share
-/// ([`MAX_BOOLEAN_PROBES`]). `need` is 2 for a pair, because half a pair proves
-/// nothing and must never be sent.
+/// Four reasons to stop, and the check owns all four: the shared gate's three
+/// (the job was cancelled, it is out of budget, it is past its deadline) plus
+/// this check's own — the point has had its share, [`MAX_BOOLEAN_PROBES`].
+/// `need` is 2 for a pair, because half a pair proves nothing and must never
+/// be sent.
 fn may_send(host: &dyn ProbeHost, spent: u32, need: u32) -> bool {
-    !host.cancelled()
-        && host.budget_left() >= need
-        && Instant::now() < host.deadline()
-        && spent.saturating_add(need) <= MAX_BOOLEAN_PROBES
+    gate::may_send(host, need) && spent.saturating_add(need) <= MAX_BOOLEAN_PROBES
 }
 
-/// A verdict with no evidence and no hint.
+/// A verdict with no evidence and no hint; always `tentative`, because a
+/// verdict that concluded nothing has nothing to be confident about.
 fn no_finding(outcome: Outcome, detail: String) -> Verdict {
-    Verdict {
-        outcome,
-        confidence: Confidence::Tentative,
-        evidence: Evidence::default(),
-        detail,
-        poc_hint: None,
-    }
+    gate::no_finding(outcome, Confidence::Tentative, detail)
 }
 
 /// The lengths of one run of a pair, kept so the reported evidence is the run
@@ -385,22 +378,23 @@ impl Check for SqliBoolean {
             let pairs = condition_pairs();
             let planned = pairs_allowed(host.profile().speed).min(pairs.len());
             let wanted = confirmations(host.profile().accuracy);
-            let mut tried = 0usize;
-            let mut failed = 0usize;
+            let mut tally = ProbeTally::new("condition pairs", planned).also_stopped_by(format!(
+                "this point had spent its {MAX_BOOLEAN_PROBES} probes"
+            ));
 
             for (true_arm, false_arm) in pairs.iter().take(planned) {
                 if !may_send(host, spent, 2) {
                     break;
                 }
                 spent += 2;
-                tried += 1;
+                tally.attempted();
                 let first =
                     match SqliBoolean::run_pair(host, true_arm, false_arm, baseline_len).await {
                         PairOutcome::Hit(run) => run,
                         PairOutcome::Miss => continue,
                         PairOutcome::Failed => {
                             // One refused arm is not a verdict; try the next pair.
-                            failed += 1;
+                            tally.refused();
                             continue;
                         }
                     };
@@ -459,29 +453,10 @@ impl Check for SqliBoolean {
                 // The repeat disagreed: noise, not a finding. Next pair.
             }
 
-            if tried > 0 && failed == tried {
-                return no_finding(
-                    Outcome::Error,
-                    format!("every one of the {tried} condition pairs was refused"),
-                );
-            }
-            if tried < planned {
-                return no_finding(
-                    Outcome::Inconclusive,
-                    format!(
-                        "stopped after {tried} of {planned} condition pairs: the job was \
-                         cancelled, out of budget, past its deadline, or this point had spent \
-                         its {MAX_BOOLEAN_PROBES} probes"
-                    ),
-                );
-            }
-            no_finding(
-                Outcome::Clean,
-                format!(
-                    "no always-true/always-false pair changed the response length after \
-                     {planned} pairs against a {baseline_len}-byte baseline"
-                ),
-            )
+            tally.conclude(format!(
+                "no always-true/always-false pair changed the response length after \
+                 {planned} pairs against a {baseline_len}-byte baseline"
+            ))
         })
     }
 }

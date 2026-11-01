@@ -527,6 +527,37 @@ async fn a_stopped_timing_check_does_not_even_take_a_baseline() {
     }
 }
 
+/// "Every probe was refused" is only a target `Error` when every probe the
+/// plan asked for was actually attempted. Here the first probe is refused and
+/// the job is cancelled immediately after it: one refused probe out of three
+/// says nothing about the target, and calling it `Error` would feed the
+/// per-host error ladder (spec D5) with the scanner's own stop.
+#[tokio::test]
+async fn a_single_refused_probe_before_a_cancellation_is_inconclusive_not_an_error() {
+    for check in value_checks() {
+        let id = check.meta().id.clone();
+        if id == "sqli-boolean" {
+            // Its first stimulus is the control re-send, whose refusal is its
+            // own verdict (`native_sqli_boolean.rs` pins it).
+            continue;
+        }
+        let host = ScriptedHost::new()
+            .with_marker(MARKER)
+            .with_probe_refused_at(1)
+            .with_cancel_after(1);
+
+        let verdict = check.run(&q(), &host).await;
+
+        assert_eq!(host.sent().len(), 1, "{id}");
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Inconclusive,
+            "{id}: {}",
+            verdict.detail
+        );
+    }
+}
+
 /// Cancellation that lands *during* a run: the check finishes the probe in
 /// flight and stops, rather than running its schedule out. The host reports the
 /// job cancelled from the moment the first stimulus has been sent.

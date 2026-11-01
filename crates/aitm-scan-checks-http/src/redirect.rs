@@ -26,7 +26,6 @@
 //! substring.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use aitm_poc::{Assertion, MatchPart, Severity};
 use aitm_scan_model::{
@@ -36,6 +35,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::gate::{may_send, ProbeTally};
 use crate::matching::{header, scrub};
 
 /// The absolute canary target. RFC 2606 reserves `.invalid`, so this name
@@ -125,11 +125,6 @@ fn canary_forms() -> [&'static str; 3] {
     ]
 }
 
-/// Whether the check may send another probe right now (see `xss::may_send`).
-fn may_send(host: &dyn ProbeHost) -> bool {
-    !host.cancelled() && host.budget_left() > 0 && Instant::now() < host.deadline()
-}
-
 /// The lower-case authority host a `Location` points at, or `None` when it is
 /// relative and therefore stays on the origin.
 ///
@@ -199,17 +194,6 @@ fn redirected(
     }
 }
 
-/// A verdict that concluded nothing, with no evidence and no hint.
-fn no_finding(outcome: Outcome, confidence: Confidence, detail: String) -> Verdict {
-    Verdict {
-        outcome,
-        confidence,
-        evidence: Evidence::default(),
-        detail,
-        poc_hint: None,
-    }
-}
-
 impl Check for OpenRedirect {
     fn meta(&self) -> &CheckMeta {
         &self.meta
@@ -223,11 +207,10 @@ impl Check for OpenRedirect {
         Box::pin(async move {
             let forms = canary_forms();
             let planned = forms.len();
-            let mut sent = 0usize;
-            let mut failed = 0usize;
+            let mut tally = ProbeTally::new("canary probes", planned);
 
             for form in forms {
-                if !may_send(host) {
+                if !may_send(host, 1) {
                     break;
                 }
                 let payload = Payload {
@@ -235,9 +218,9 @@ impl Check for OpenRedirect {
                     mode: PayloadMode::Replace,
                     bytes: None,
                 };
-                sent += 1;
+                tally.attempted();
                 let Ok(resp) = host.probe(&payload).await else {
-                    failed += 1;
+                    tally.refused();
                     continue;
                 };
                 if let Some((status, location)) = redirects_to_canary(&resp) {
@@ -245,28 +228,9 @@ impl Check for OpenRedirect {
                 }
             }
 
-            if sent > 0 && failed == sent {
-                return no_finding(
-                    Outcome::Error,
-                    Confidence::Tentative,
-                    format!("every one of the {sent} canary probes was refused"),
-                );
-            }
-            if sent < planned {
-                return no_finding(
-                    Outcome::Inconclusive,
-                    Confidence::Tentative,
-                    format!(
-                        "stopped after {sent} of {planned} canary probes: the job was \
-                         cancelled, out of budget or past its deadline"
-                    ),
-                );
-            }
-            no_finding(
-                Outcome::Clean,
-                Confidence::Tentative,
-                format!("the target did not redirect to the canary host in {planned} forms"),
-            )
+            tally.conclude(format!(
+                "the target did not redirect to the canary host in {planned} forms"
+            ))
         })
     }
 }

@@ -424,7 +424,7 @@ impl Check for H2Check {
             let Some(target) = point.url.as_deref().and_then(Target::parse) else {
                 return inconclusive("the point has no usable http(s) url");
             };
-            if !may_send(host) {
+            if !crate::gate::may_send(host, 1) {
                 return inconclusive(STOPPED);
             }
             // The profile gate, before anything at all is sent: a raw probe
@@ -473,12 +473,6 @@ const STOPPED: &str = "stopped: the job was cancelled, out of budget or past its
 const ALREADY_OBSERVED: &str = "already observed for this authority";
 const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
 const BUDGET_TOO_LOW: &str = "budget too low for the raw probe";
-
-/// Whether the check may send another request right now (copy of the gate
-/// `xss.rs` keeps; folding both into one helper is a later round).
-fn may_send(host: &dyn ProbeHost) -> bool {
-    !host.cancelled() && host.budget_left() > 0 && Instant::now() < host.deadline()
-}
 
 /// Where a raw probe goes, cut from a point's URL by [`crate::url`].
 #[derive(Debug, PartialEq, Eq)]
@@ -554,13 +548,7 @@ fn inconclusive(detail: &str) -> Verdict {
 
 /// A verdict that concluded nothing, with no evidence and no hint.
 fn no_finding(outcome: Outcome, detail: &str) -> Verdict {
-    Verdict {
-        outcome,
-        confidence: Confidence::Tentative,
-        evidence: Evidence::default(),
-        detail: detail.to_string(),
-        poc_hint: None,
-    }
+    crate::gate::no_finding(outcome, Confidence::Tentative, detail.to_string())
 }
 
 /// The name of a SETTINGS identifier (RFC 9113 section 6.5.2, RFC 8441).

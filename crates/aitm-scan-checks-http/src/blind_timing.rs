@@ -40,7 +40,6 @@
 //! already asks for each delay twice, and the cap leaves no room for more.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
@@ -50,6 +49,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::gate::{may_send, no_finding, ProbeTally};
 use crate::timing::{correlated, fit};
 
 /// The hard per-point probe ceiling for a timing check (AC T3-4).
@@ -268,15 +268,6 @@ fn schedule(speed: Speed) -> [f32; PROBES_PER_FAMILY] {
     }
 }
 
-/// Whether the check may send another probe right now.
-///
-/// The host enforces all three of these itself, but a check that keeps asking
-/// after a cancellation has still wasted the job's time, and `Check::run`'s
-/// contract is to stop (spec D2).
-fn may_send(host: &dyn ProbeHost) -> bool {
-    !host.cancelled() && host.budget_left() > 0 && Instant::now() < host.deadline()
-}
-
 /// The longest delay in a schedule: the payload an operator re-sends by hand to
 /// watch the pause for themselves.
 fn longest(delays: &[f32]) -> f32 {
@@ -317,17 +308,6 @@ fn tracked(
     }
 }
 
-/// A verdict that concluded nothing, with no evidence and no hint.
-fn no_finding(outcome: Outcome, detail: String) -> Verdict {
-    Verdict {
-        outcome,
-        confidence: Confidence::Tentative,
-        evidence: Evidence::default(),
-        detail,
-        poc_hint: None,
-    }
-}
-
 impl Check for TimingCheck {
     fn meta(&self) -> &CheckMeta {
         &self.meta
@@ -346,9 +326,10 @@ impl Check for TimingCheck {
             // Nothing at all, not even a baseline, once the job has stopped:
             // the gate goes above every request a check makes, as it does in
             // `sqli_boolean.rs` and `h2_observe.rs` (tester finding B1).
-            if !may_send(host) {
+            if !may_send(host, 1) {
                 return no_finding(
                     Outcome::Inconclusive,
+                    Confidence::Tentative,
                     "the job was cancelled, out of budget or past its deadline before the \
                      baseline"
                         .to_string(),
@@ -364,8 +345,7 @@ impl Check for TimingCheck {
                 Err(_) => (Vec::new(), None),
             };
 
-            let mut sent = 0usize;
-            let mut failed = 0usize;
+            let mut tally = ProbeTally::new("delay probes", planned);
             // Families whose schedule was broken by a *refused* probe rather
             // than by the job stopping. They cost their probes and taught
             // nothing, so they may not be counted as a quiet target.
@@ -378,7 +358,7 @@ impl Check for TimingCheck {
                 let mut refused_here = 0usize;
 
                 for delay in delays {
-                    if !may_send(host) {
+                    if !may_send(host, 1) {
                         break;
                     }
                     let payload = Payload {
@@ -388,11 +368,11 @@ impl Check for TimingCheck {
                         mode: PayloadMode::Suffix,
                         bytes: None,
                     };
-                    sent += 1;
+                    tally.attempted();
                     let Ok(resp) = host.probe(&payload).await else {
                         // One refused probe is not a verdict, but it does cost
                         // this family its complete series.
-                        failed += 1;
+                        tally.refused();
                         refused_here += 1;
                         continue;
                     };
@@ -417,20 +397,8 @@ impl Check for TimingCheck {
                 }
             }
 
-            if sent > 0 && failed == sent {
-                return no_finding(
-                    Outcome::Error,
-                    format!("every one of the {sent} delay probes was refused"),
-                );
-            }
-            if sent < planned {
-                return no_finding(
-                    Outcome::Inconclusive,
-                    format!(
-                        "stopped after {sent} of {planned} delay probes: the job was \
-                         cancelled, out of budget or past its deadline"
-                    ),
-                );
+            if let Some(unfinished) = tally.unfinished() {
+                return unfinished;
             }
             // Every probe the plan asked for was sent, but a family that lost
             // one of them was never fitted. `Clean` would claim the response
@@ -441,6 +409,7 @@ impl Check for TimingCheck {
                 let was = if abandoned == 1 { "was" } else { "were" };
                 return no_finding(
                     Outcome::Inconclusive,
+                    Confidence::Tentative,
                     format!(
                         "{abandoned} of {total} payload families {was} abandoned: a probe was \
                          refused part-way through its schedule, so the series could not be \
@@ -449,14 +418,11 @@ impl Check for TimingCheck {
                     ),
                 );
             }
-            no_finding(
-                Outcome::Clean,
-                format!(
-                    "the response time did not track the requested delay over {planned} \
-                     probes in {families} payload families",
-                    families = families.len()
-                ),
-            )
+            tally.conclude(format!(
+                "the response time did not track the requested delay over {planned} \
+                 probes in {families} payload families",
+                families = families.len()
+            ))
         })
     }
 }

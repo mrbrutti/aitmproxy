@@ -27,7 +27,6 @@
 //! because a unique canary needs nothing to be compared against.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use aitm_poc::{Assertion, MatchPart, Severity};
 use aitm_scan_model::{
@@ -37,6 +36,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::gate::{may_send, ProbeTally};
 use crate::matching::{body_text, excerpt_around, is_html};
 
 /// The prefix every scanner canary carries, so an operator reading a response
@@ -114,15 +114,6 @@ fn context_probes(tag: &str) -> [String; 3] {
     ]
 }
 
-/// Whether the check may send another probe right now.
-///
-/// The host enforces all three of these itself, but a check that keeps asking
-/// after a cancellation has still wasted the job's time, and `Check::run`'s
-/// contract is to stop (spec D2).
-fn may_send(host: &dyn ProbeHost) -> bool {
-    !host.cancelled() && host.budget_left() > 0 && Instant::now() < host.deadline()
-}
-
 /// The verdict for a canary that came back intact.
 fn reflected(
     point: &InsertionPoint,
@@ -172,17 +163,6 @@ fn reflected(
     }
 }
 
-/// A verdict that concluded nothing, with no evidence and no hint.
-fn no_finding(outcome: Outcome, confidence: Confidence, detail: String) -> Verdict {
-    Verdict {
-        outcome,
-        confidence,
-        evidence: Evidence::default(),
-        detail,
-        poc_hint: None,
-    }
-}
-
 impl Check for XssReflected {
     fn meta(&self) -> &CheckMeta {
         &self.meta
@@ -197,11 +177,10 @@ impl Check for XssReflected {
             let tag = format!("{CANARY_PREFIX}{}", host.marker());
             let probes = context_probes(&tag);
             let planned = probes.len();
-            let mut sent = 0usize;
-            let mut failed = 0usize;
+            let mut tally = ProbeTally::new("reflection probes", planned);
 
             for probe in &probes {
-                if !may_send(host) {
+                if !may_send(host, 1) {
                     break;
                 }
                 let payload = Payload {
@@ -209,10 +188,10 @@ impl Check for XssReflected {
                     mode: PayloadMode::Replace,
                     bytes: None,
                 };
-                sent += 1;
+                tally.attempted();
                 let Ok(resp) = host.probe(&payload).await else {
                     // One refused probe is not a verdict; try the next context.
-                    failed += 1;
+                    tally.refused();
                     continue;
                 };
                 // Data is not markup: the same bytes in JSON or plain text are
@@ -229,31 +208,10 @@ impl Check for XssReflected {
                 }
             }
 
-            if sent > 0 && failed == sent {
-                return no_finding(
-                    Outcome::Error,
-                    Confidence::Tentative,
-                    format!("every one of the {sent} reflection probes was refused"),
-                );
-            }
-            if sent < planned {
-                return no_finding(
-                    Outcome::Inconclusive,
-                    Confidence::Tentative,
-                    format!(
-                        "stopped after {sent} of {planned} reflection probes: the job was \
-                         cancelled, out of budget or past its deadline"
-                    ),
-                );
-            }
-            no_finding(
-                Outcome::Clean,
-                Confidence::Tentative,
-                format!(
-                    "the canary was not reflected unencoded into an HTML response after \
-                     {planned} context probes"
-                ),
-            )
+            tally.conclude(format!(
+                "the canary was not reflected unencoded into an HTML response after \
+                 {planned} context probes"
+            ))
         })
     }
 }

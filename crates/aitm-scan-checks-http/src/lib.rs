@@ -38,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+mod gate;
 pub mod matching;
 pub mod timing;
 mod url;
