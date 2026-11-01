@@ -1,6 +1,6 @@
 # scrub_text nested-pair leak implementation plan
 
-**Status:** approved (2026-11-01, self-approved by the orchestrating session under Matt's autonomous-approve mode)
+**Status:** approved (2026-11-01, self-approved by the orchestrating session under Matt's autonomous-approve mode); "Fix tasks (post-panel)" approved the same way on 2026-11-01, including the Architect's call P1 (no differential re-run for the comments-and-tests-only Fix 1, conditional on the identity check)
 **Spec:** `docs/superpowers/specs/2026-11-01-scrub-text-nested-pair-leak-design.md` (approved 2026-11-01, committed `bdd231db`)
 **Branch / worktree:** `claude/heuristic-panini-828774`, in the NESTED directory
 `/Users/matt/Security/aitmproxy/.claude/worktrees/heuristic-panini-828774/wt` (called `WT` below).
@@ -931,6 +931,607 @@ Applies to any finding from the Tester or the panel.
   the three Open questions' defaults for Matt: closing the wide next-line leak (17 named core rows, 10 scanner rows and four expectations change; `author:\nJohn` masks `John` in a PoC), accepting label churn in
   chains of secret keys, and leaving non-secret children readable (`auth:\n  user: bob`).
 - Keep the notes-folder `diff-tools/` copy until the PR merges; copy it to a durable place only if Matt wants the tooling kept.
+
+## Fix tasks (post-panel)
+
+Stage 6 on head `a2181852` returned: spec PASS (P-1 to P-3, Minor), quality PASS (Q-1 to Q-9, Minor), security FAIL
+(S-1 Important and spec-shaped; S-2 to S-4 Minor). Inputs for the Coder and the re-run: the orchestrator's consolidated
+findings (`/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_ee73bb50-38b3-4011-be40-9e8688764e8f/F4-panel-round1-findings.md`),
+the security reviewer's differential beside it (`F4-security-differential.md`), the Tester's report (`F4-tester-report.md`).
+Per Fix-task protocol 4 the spec-shaped finding S-1 went to the Architect first: the spec is amended (Amendment 1, read it
+first) and it **changes no production line**. **This section and the amended spec need the orchestrator's approval before
+any Coder starts.**
+
+### What this section corrects in the rest of the plan (read before Tasks 1 to 9)
+
+Tasks 1 to 9 stay as written; where they disagree with this, this governs.
+
+- **Base.** After the merge `f3c4a9c0` the base for every diff from the Tester's run on is `ecbf58ac` (`origin/main` at the
+  merge). `61a35571` remains right for the three edited files (`git diff --stat 61a35571 ecbf58ac -- crates/aitm-core/src/redact.rs
+  crates/aitm-plugin-scanner/src/reproduce.rs crates/aitm-poc` is empty, checked), so every line number and anchor of Tasks 1 to
+  7 holds; `git diff --stat 61a35571 HEAD -- crates` shows 40 files because of the merge, `git diff --stat ecbf58ac HEAD -- crates`
+  shows exactly the three. Use `ecbf58ac` in every command below.
+- **Counts** (measured from git with the Task 4 name recipe, and from the Tester's runs; the plan's "Counts" table is right for
+  the original cut `61a35571` before the merge):
+
+  | | base `ecbf58ac` | S7 `85b81815` | head `a2181852` | after Fix 1 |
+  |---|---|---|---|---|
+  | `redact::tests` (names in `redact.rs`) | 54 | 64 | 69 | 68 |
+  | `cargo test -p aitm-core --lib redact` | 67 | 77 | 82 | 81 |
+  | `cargo test -p aitm-plugin-scanner --lib` (names in `reproduce.rs`) | 197 (45) | 201 (49) | 203 (51) | 203 (51) |
+  | `cargo test -p aitm-poc --test builder` | 23 | 24 | 26 | 26 |
+
+  The filter row adds the 11 lib tests of `redact_strict` (durable-audit, merged by `f3c4a9c0`) and 2 `tunnel` tests; at
+  `61a35571` it was 56 and 66. The nine tests the Tester added are the difference between S7 and head (core 5, scanner 2,
+  builder 2: names 64 to 69, 49 to 51, 24 to 26).
+- **Spec gaps 1 and 2 of this plan** ("63 and 65"; AC19's "three expectations" naming four values) are settled by spec
+  Amendment 1, item 4. **AC8's repeat counts** (Task 3, item 5) give four families under 1 MiB (1,000,000, 500,000, 524,306,
+  1,000,002 bytes) although the same item says "keep every family at 1 MiB or more": the floor binds, Fix 1 makes it true.
+- **Mutant red sets, measured** (the Tester's `RESULTS-all.txt`; the condensed report understates four): M1 20 red (a slice panic
+  `byte range starts at 24 but ends at 17` is in `logs/M1-core.log`), M3 2 (AC10 and the Tester's prefix test), M4 14 (the nine and
+  the Tester's five), M5 6 (the five and the prefix test). After Fix 1 the deleted mebibyte test leaves M1 at 19 and M4 at 13.
+- **Task 9's "no prior review report"** and the dispatch of Task 8 and 9 were for the first pass; Tasks 8b and 9b below are the
+  re-run with the prior report in hand.
+
+### Order, files, independence
+
+| Step | Depends on | Files (all under `crates/`) | Independent of |
+|---|---|---|---|
+| Fix 1 | spec and plan amendment committed by the orchestrator (docs only), on top of `a2181852` | `aitm-core/src/redact.rs` (docs, comments and tests; **no production line**); `aitm-plugin-scanner/src/reproduce.rs` (tests and comments); `aitm-poc/tests/builder.rs` (tests) | none |
+| Task 8b (Tester) | Fix 1 committed (`SF`) | test modules of the three files; scratch copies outside the repo | none |
+| Task 9b (panel) | Task 8b PASS | none (read-only; scratch outside the repo) | the three reviewers with each other |
+
+One Coder, one commit. The three file parts of Fix 1 are mutually independent (disjoint files, no shared symbol) and could be
+three Coders; they are not worth splitting (the diff is comments, docs and tests, and one identity check covers it). Each
+writer commits by explicit path; the rules of "Where each command runs" and "Code constraints for every task" apply, and
+**the list of existing tests that may be edited is extended by exactly the sites below and no other**.
+
+### Dispositions of the findings (proposed; the orchestrator records them in the Review log)
+
+| Finding | Disposition |
+|---|---|
+| S-1 Important, spec-shaped | no code change; spec Amendment 1 item 1 (restated ownership-aware invariant), Residual risks 3 and 4, Design 9 I1 and I5, Open question 4 for Matt; docs by Fix 1; re-rated by Task 9b |
+| S-2 Minor (G2, G3) | Amendment 1 item 2, Residual risks 3; docs by Fix 1 (A2, A6); no test |
+| S-3 and P-1 Minor | Amendment 1 item 3, Design 6 rows 29 and 30; the Tester's three `token="sid:"x` rows stay |
+| S-4 Minor and Q-3 | Fix 1 A2 to A4 |
+| P-2 Minor | Amendment 1 item 4 and the corrected facts above; no edit of AC8, AC12, AC19 |
+| P-3 Minor | the orchestrator cites the raw red sets (corrected facts above) in the Review log; nothing to build |
+| Open evidence item (workspace gate, three load-flaky failures on crates this branch does not touch) | Task 8b step 6: re-run alone and compare on `main` before AC24 is marked passed on the final head |
+| Q-1, Q-2, Q-9 | Fix 1 A1, A5, A6, A8, A9 |
+| Q-4 | Fix 1 B1 to B3 |
+| Q-5 | Fix 1 B4, C1, C2, D1 |
+| Q-6 | Fix 1 B5, C3 |
+| Q-7 | the production change is **ACCEPTED** (not made) by the orchestrator under Matt's autonomous-approve mode: a change to the scan loop would re-open the differential; Fix 1 A7 adds the comment-only sentence |
+| Q-8(a) | Fix 1 C4 |
+| Q-8(b) | **ACCEPTED** by the orchestrator: the three `token="sid:"x` rows stay (they pin a mask and are a char-boundary check; spec Design 6 row 29 is their basis) |
+
+### Fix 1: docs, comments and tests; no production line
+
+- **Satisfies:** AC8 (restated: one test, every family at 1 MiB or more, both scrubs), AC12 (as spec Amendment 1 item 7 reads
+  it), AC14 (the count of `reading` in `mask_secret_pairs` stays `3`), AC24 (the docs grep and the banned phrases), spec Design 7
+  items 1 and 3 as amended; findings Q-1 to Q-6, Q-8(a), Q-9, S-2 and S-4 (docs), and the comment-only half of Q-7.
+- **Depends on:** the orchestrator's docs commit of the amended spec and plan. **Dispatch inputs:** the findings report path (in
+  place of a task number), the amended spec path, this plan path, `WT`, start SHA `a2181852` (or its docs-only descendant),
+  base `ecbf58ac`.
+- **Files:** `crates/aitm-core/src/redact.rs`, `crates/aitm-plugin-scanner/src/reproduce.rs`, `crates/aitm-poc/tests/builder.rs`.
+- **Start checks (paste):** `git -C WT rev-parse --show-toplevel` prints `WT`; `git -C WT diff --stat a2181852 HEAD -- crates` prints
+  nothing; `git -C WT status --short` prints nothing. Baselines (sandbox): `cargo test -p aitm-core --offline --lib
+  redact::tests` prints `test result: ok. 69 passed`; `cargo test -p aitm-plugin-scanner --offline --lib` prints `203 passed`;
+  `cargo test -p aitm-poc --offline --test builder` prints `26 passed` (the `proxy::tests::acceptor_attaches_the_scope_guard_to_the_module_ctx`
+  and the other socket tests are NOT RUN (socket), as before).
+- **The one rule that stops the Coder.** Fix 1 changes **no production line** of `redact.rs` or `reproduce.rs`: only comments and
+  doc comments above `#[cfg(test)]`, and anything below it. Mechanical check, to be run after every step and pasted at the end
+  (temp files, not process substitution; `WT` is the literal path):
+
+  ```
+  git -C WT show a2181852:crates/aitm-core/src/redact.rs | awk '/^#\[cfg\(test\)\]/ {exit} {print}' | grep -vE '^[[:space:]]*(//.*)?$' > "$TMPDIR/prod-before.txt"
+  awk '/^#\[cfg\(test\)\]/ {exit} {print}' WT/crates/aitm-core/src/redact.rs | grep -vE '^[[:space:]]*(//.*)?$' > "$TMPDIR/prod-after.txt"
+  diff "$TMPDIR/prod-before.txt" "$TMPDIR/prod-after.txt"
+  wc -l < "$TMPDIR/prod-before.txt"
+  shasum -a 256 "$TMPDIR/prod-before.txt" "$TMPDIR/prod-after.txt"
+  ```
+
+  `diff` prints nothing and exits 0, `wc -l` prints `248`, and both `shasum` lines print
+  `6ea6d72a3c39a9072e81b95eadcfe75e3bbee4b50946cb57897fcbaa3dfffa65` (I ran it: head, S7 and the worktree file agree). The filter
+  removes blank lines and lines whose first non-blank characters are `//` (so `//!`, `///` and `//`), and nothing else; the
+  production section has no trailing comment on a code line (checked). **A hunk that changes any line this filter keeps stops the
+  Coder: report the hunk, change nothing else.** For `reproduce.rs` the check is stricter and mechanical too: `git -C WT diff -U0
+  a2181852 -- crates/aitm-plugin-scanner/src/reproduce.rs | sed -n 's/^@@ -\([0-9][0-9]*\).*/\1/p' | sort -n | head -1` prints a
+  number at least `486` (its `#[cfg(test)]` is at 486; no hunk above it); `builder.rs` has no production section. For `redact.rs`
+  the hunks below `#[cfg(test)]` (line 559) are tests; the hunks above it are the nine doc and comment sites A1 to A9 and no others:
+  `git -C WT diff -U0 a2181852 -- crates/aitm-core/src/redact.rs | sed -n 's/^@@ -\([0-9][0-9]*\).*/\1/p'` lists every hunk start; each start
+  below 559 lies, give or take one line, in 23 to 34, 157 to 182, 190 to 226, 234 to 237, 428 to 445, 479 to 482 or 513 to 515; any
+  other start below 559 stops the Coder.
+- **Change.** Every replacement text below is comment text, exact, for the lines of `a2181852`; anchor by the old text if a line
+  drifts. No banned phrase of "Code constraints for every task" (`by construction` and the AC24 phrases included) in any line you
+  add; no line you add contains the word `unsafe`; **the word `reading` appears in no comment you add inside the body of
+  `mask_secret_pairs`** (A9; the doc above the function may use it); no raw non-ASCII character in test source (write escapes).
+
+  **A. `redact.rs`, production section: docs and comments only.**
+
+  A1. Module doc, lines 23 to 34 (Q-1, and the ownership-aware phrase in place of "masks everything `scrub_text` masks"). Replace the
+  twelve lines `//! [`scrub_text_wide`] is two scans ...` to `... and in the key test inside a masked value.` with:
+
+  ```text
+  //! [`scrub_text_wide`] is two scans of one private pair scanner, over the output
+  //! of the regex passes. The first judges a key run by the standard reading,
+  //! except a run that begins inside a value it has just masked, which it judges by
+  //! the wide one; the second judges every key run by the wide reading. A key
+  //! *governs* the value after its separator. On well-formed input
+  //! [`scrub_text_wide`] masks every value that a key accepted by [`is_secret_key`]
+  //! governs, as [`scrub_text`] does, and then more. A scan judges each key *run* by
+  //! the predicate of its reading; a string that the predicate accepts can be
+  //! several runs (`user[sid]` is two), so a scrubber and its predicate can differ on
+  //! text that is not one run. The two scans share every blank rule, value rule and
+  //! quote rule: every whitespace character is a blank beside a separator, a line
+  //! break included, so `sid:\nabc` takes `abc` in both. They differ in the key test
+  //! outside a masked value and in the host:port exemption (the second scan has
+  //! none).
+  ```
+
+  A2. `scrub_text` doc, lines 157 to 160 (Q-3, S-4: the malformed-quote residual, next to the `password='x password'=S3CR3T` one). Replace
+  the four lines `/// follows its quote. A next key with only a closing quote ...` to `... quote never closes, runs to the first
+  whitespace, `&`, `;`, `,`, quote, or `}`.` with:
+
+  ```text
+  /// follows its quote. A next key with only a closing quote is a residual: in
+  /// `password='x password'=S3CR3T` the first value closes at that quote and
+  /// `S3CR3T` is left in the clear. A quote that is unmatched, unescaped, or shaped
+  /// like an opener, and two kinds of quote interleaved (`Token:Jwt:'token="'id"`),
+  /// are residuals of the same kind: the scan can pair them differently inside a
+  /// masked value than outside one, and a value that a secret key governs can then
+  /// be left in the clear in a rare malformed input. An unquoted value, or one whose
+  /// opening quote never closes, runs to the first whitespace, `&`, `;`, `,`, quote,
+  /// or `}`.
+  ```
+
+  A3. `scrub_text` doc, lines 165 to 172 (Q-3: the empty sentence "What the nested pair does not read stays as it was." goes). Replace
+  with:
+
+  ```text
+  /// A secret pair that begins inside a value just masked is read too: in
+  /// `auth:\n  password: hunter2` the value of `auth:` is the token `password:`, and
+  /// the pair `password: hunter2` inside it masks `hunter2`, so the output is
+  /// `auth:\n  [redacted] [redacted]`. A nested key that is not secret keeps its
+  /// value (`auth:\n  user: bob` keeps `bob`). A value that looks like a pair stays
+  /// masked whole (`token:\n  AApwdBB==` masks all of `AApwdBB==`), because a pair
+  /// whose value would start inside the masked text, its closing quote included, is
+  /// left alone.
+  ```
+
+  A4. `scrub_text` doc, lines 179 to 182 (S-4: the ownership-aware phrase and the G1 sentence). Replace with:
+
+  ```text
+  /// Conservative by design: it over-redacts (any pair whose key reads as secret)
+  /// rather than risk letting a secret through. A key *governs* the value after its
+  /// separator, and on well-formed input every value that a secret key governs, read
+  /// by the value rule above, is masked. Residual limit: a bare credential with no
+  /// recognisable `key=` or `Bearer`/`Authorization` framing cannot be detected, so
+  /// a token that no secret key governs stays visible wherever it sits, after a
+  /// quoted value that ends in a key and a separator (`"x-pwd:"`) included. Work is
+  /// linear in the length of `text`.
+  ```
+
+  A5. `scrub_text_wide` doc, lines 190 to 193 (the ownership-aware phrase). Replace with:
+
+  ```text
+  /// [`scrub_text`] with a wider key test. On well-formed input it masks every value
+  /// that a key accepted by [`is_secret_key`] governs, as [`scrub_text`] does, and
+  /// then every pair whose key reads as secret under [`is_secret_key_wide`], so it
+  /// also masks keys that merely contain a short secret word (`author`, `sidebar`).
+  ```
+
+  A6. `scrub_text_wide` doc, lines 216 to 226 (Q-2 a and b; G1, G2, G3). Replace the eleven lines `/// It over-redacts by design ...` to `... A
+  well-formed JSON body, form or query has no such quote.` with:
+
+  ```text
+  /// It over-redacts by design: use it where a masked innocent value costs nothing
+  /// and a missed credential leaks (a PoC meant to be shared), never on text that
+  /// goes to an agent, an audit record, or a finding, where `authority=` and
+  /// `author=3` are ordinary. Its running time is linear in the length of `text`.
+  ///
+  /// A residual, on malformed quotes: a quote that is unmatched, unescaped, or that
+  /// closes a value but reads as an opener (it follows `=` or `:`, a value character
+  /// follows it, and no delimiter does), and two kinds of quote interleaved
+  /// (`Token:Jwt:'token="'id"`), can make a scan pair the quotes inside a masked
+  /// value differently from the way it pairs them outside one, and so leave a value
+  /// that a secret key governs in the clear in a rare malformed input. A well-formed
+  /// input is not affected: a quoted value that ends in a key and a separator
+  /// (`"x-pwd:"`) is read whole, and what follows its closing quote is read by its
+  /// own keys, so a token that no secret key governs stays visible after it.
+  ```
+
+  A7. `Reading` doc, lines 234 to 237 (Q-7, comment only). Replace with:
+
+  ```text
+  /// Which reading of the vocabulary a scan applies. See [`mask_secret_pairs`]. The
+  /// three variants differ in the key test and the host:port exemption only; all
+  /// three skip every whitespace character beside a separator, a line break
+  /// included, and share every value rule and quote rule. A new variant must decide
+  /// both: the key test is a `match` over every variant, but the host:port exemption
+  /// is applied to every variant except `Wide`, so a variant added later is exempt
+  /// unless that condition changes.
+  ```
+
+  A8. `mask_secret_pairs` doc, lines 428 to 445 (Q-9: split the long linearity paragraph at "A byte is read once"). Replace with these two
+  paragraphs; the words are the old ones, only the break and the line wrap move:
+
+  ```text
+  /// The work is linear. The scan index strictly increases: after a masked pair it is
+  /// the value's start, which is past the pair's key end. So key starts strictly
+  /// increase too, and a pair reaches a closing-quote search only when its value
+  /// starts at or after the end of the masked text, which is at or after `copied`.
+  /// Searches therefore start at strictly increasing positions, and successful ones
+  /// never overlap: each starts after the previous masked text. A failed search for a
+  /// quote character reads to the end of the text once, and is remembered: a later
+  /// search for the same character starts further on and so considers a subset of the
+  /// candidates, and a candidate is judged on its neighbouring characters alone, so it
+  /// would fail too and is not run. [`is_opening_quote`] must therefore stay a pure
+  /// function of the text around the quote.
+  ///
+  /// A byte is read once to find the end of a value and once more when the scan walks
+  /// the masked value; masked values are disjoint and increasing, so a byte lies in at
+  /// most one. Blank runs are read by the lookahead after a key run and by the loop's
+  /// own steps. The slice `text[copied..value_start]` needs `value_start >= copied`,
+  /// which the exact guard gives. The vocabulary is consulted only for a key run whose
+  /// separator follows it and does not end inside the masked text, so no allocation is
+  /// spent on the rest of the text.
+  ```
+
+  A9. The two guards named in their code comments (Q-9). Inside the body of `mask_secret_pairs`; comment text only, and **no word
+  `reading`** (the AC14 count stays `3`). Lines 479 to 482, replace with:
+
+  ```text
+          // The early guard (see the doc above): a pair whose separator ends inside
+          // the masked text is left alone before the vocabulary costs an allocation
+          // for each key of a long masked value. The exact guard below would leave
+          // it alone as well, so this one changes no output.
+  ```
+
+  Lines 513 to 515, replace with:
+
+  ```text
+          // The exact guard (see the doc above): a value that would start inside the
+          // masked text is no value: it is part of the parent's own value, or its
+          // closing quote. Leave the pair alone, as for a key that is not secret, so
+          // no closing-quote search starts there.
+  ```
+
+  **B. `redact.rs`, `mod tests`.**
+
+  B1. **Q-4: `scrub_text_stays_linear_on_nested_pair_shapes` (AC8; the name is spec-fixed; body and doc replaced).** Seven families, in the
+  order and with the failure messages they have now (the wide assertion's message is the same with `wide: ` in front). Each family
+  is: its unit or shape; `n` from `mebibyte_copies` (never a literal count); `assert!(input.len() >= 1 << 20 && input.len() <= 1 <<
+  21)`; then `scrub_text(&input) == expected` **and** `scrub_text_wide(&input) == expected`, with `assert!(a == b, "short message")`,
+  never `assert_eq!`. I ran all seven through both scrubs in a scratch copy of `a2181852`: the two outputs agree. The expected
+  values are formulas over the repeat counts, not literals:
+
+  | # | input | repeat count (measured) | size in bytes | expected |
+  |---|---|---|---|---|
+  | 1 | `"auth:\n  password: x\n".repeat(n)` | `n` = 52,429 | 1,048,580 | `"auth:\n  [redacted] [redacted]\n".repeat(n)` |
+  | 2 | `"sid:\n".repeat(n)` | `n` = 209,716 | 1,048,580 | `"sid:\n".to_string() + &"[redacted]\n".repeat(n - 1)` |
+  | 3 | `"password:\n password:\n".repeat(n)` | `n` = 49,933 | 1,048,593 | `"password:\n [redacted]\n".to_string() + &"[redacted]\n [redacted]\n".repeat(n - 1)` |
+  | 4 | `format!("auth:{breaks}  password: x")`, `breaks` = `"\n".repeat(mebibyte_copies("\n"))` | 1,048,577 breaks | 1,048,595 | `format!("auth:{breaks}  [redacted] [redacted]")` |
+  | 5 | `format!("token=\"{words}\"")`, `words` = `"a=".repeat(mebibyte_copies("a="))` | 524,289 copies | 1,048,586 | `token="[redacted]"` |
+  | 6 | `format!("{}x\"", "sid:\"".repeat(n))` | `n` = 209,716 | 1,048,582 | `sid:"[redacted]"` |
+  | 7 | `"token=\"sid: \" tail=\"x\" ".repeat(n)` | `n` = 45,591 | 1,048,593 | `"token=\"[redacted]\" tail=\"x\" ".repeat(n)` |
+
+  New doc, replacing the old one (which says "a megabyte and more"):
+
+  ```text
+      /// Nested pairs over inputs of a mebibyte and more: the scan reads each byte a
+      /// constant number of times, so these finish, and each comes out as the scan's
+      /// rules say, through both scrubs. Every family is sized by `mebibyte_copies`, so
+      /// none is under a mebibyte or over two.
+  ```
+
+  Debug-build time, measured by me in a scratch copy (this machine, load average about 20): this one test alone, 1.56, 1.59 and
+  1.59 s; the two tests it replaces, 1.10 s and 1.44 s alone; `redact::tests` as a whole 6 to 10 s either way (load noise is larger
+  than the difference). The Coder reports the number it sees; **more than 10 s for this test alone in a debug build at a load
+  average under 60 stops the Coder** (report, do not shrink a family below 1 MiB).
+
+  B2. **Q-4: delete** `scrub_text_stays_linear_on_nested_pair_shapes_of_a_mebibyte_or_more` with its doc comment (lines 3095 to 3187
+  on `a2181852`: the doc is wrong about itself on two counts) and the blank line after it. `redact::tests` goes from 69 to 68.
+
+  B3. Move the helper `fn mebibyte_copies(unit: &str) -> usize` with its doc, text unchanged, to directly above the AC8 test (it is
+  defined 100 lines below it now and the AC8 test is its only user once B2 is done).
+
+  B4. **Q-5: one private helper, `leaking_prefixes`.** Signature, placed above the first test that uses it, with this doc comment:
+
+  ```text
+      /// Cut each of `docs` at every char boundary and scrub the cut. Returns how many
+      /// cuts were scrubbed and, for each cut whose output still holds a `Q`, its
+      /// length and its output. Every credential in these texts is a run of `Q` and
+      /// `Q` is nowhere else in them, so a returned cut is a leak.
+      fn leaking_prefixes<'a>(
+          docs: impl IntoIterator<Item = &'a str>,
+          scrub: fn(&str) -> String,
+      ) -> (usize, Vec<(usize, String)>)
+  ```
+
+  It replaces the loops of `scrub_text_masks_a_nested_credential_on_every_prefix_of_the_text` (the standard documents through
+  `scrub_text` and through `scrub_text_wide`, the wide documents through `scrub_text_wide`) and of
+  `scrub_text_masks_a_nested_credential_after_a_malformed_quote` (its documents through both). Keep every row of the first test's
+  `standard` and `wide` tables, the whole-text assertions, the superset check (`runs_left_by_wide`, its own loop: it is not the
+  leak loop), and every threshold, applied to the same quantity as now (the first test's `cuts >= 300` counts the prefixes of the
+  standard documents and of the wide documents, each once: 254 + 126 = 380; the second's `cuts >= 80` counts its documents'
+  prefixes). `grep -c 'leaks.push' redact.rs` goes from 3 to `1`. I prototyped this in a scratch copy: the module passes (68), and
+  with `mask_secret_pairs` made a no-op the malformed-quote test fails with `a credential survived`.
+
+  B5. **Q-6, comments (core).** Old text, then new text:
+
+  - line 2181, inside `PAIR_ACROSS_A_LINE_BREAK`: `// A standard key still reads across a line break.` becomes
+    `// A standard-secret key takes the next line's token as well.`
+  - lines 2277 to 2282, the doc of `scrub_text_wide_reads_a_pair_across_a_line_break_beside_non_ascii_spaces`:
+
+    ```text
+        /// The wide scan reads a pair across a line break, with a non-ASCII space
+        /// before or after the line break as much as without one, and the standard
+        /// scan still reads a standard key across the line break. The expected texts
+        /// follow from the scan's rules (a wide-only key takes the next line's token
+        /// as its value, and a key inside that value is read as a key), not from a
+        /// recording.
+    ```
+
+    becomes
+
+    ```text
+        /// The wide scan reads a pair across a line break, with a non-ASCII space
+        /// before or after the line break as much as without one, and a standard key
+        /// takes the next line's token the same way. The expected texts follow from the
+        /// scan's rules (a wide-only key takes the next line's token as its value, and
+        /// a key inside that value is read as a key), not from a recording.
+    ```
+  - lines 2365 to 2368, the doc of `scrub_text_wide_stays_linear_when_both_scans_have_work` (a pre-existing test: **this doc
+    comment is the only edit to it**, spec Amendment 1 item 7):
+
+    ```text
+        /// Hostile text that gives both scans work: standard keys with a quote that
+        /// never closes, and a standard key beside a wide-only one. The standard scan
+        /// masks the first, and the wide scan reads the masked output. Each family
+        /// finishes, and each comes out as the scan's rules say.
+    ```
+
+    becomes
+
+    ```text
+        /// Hostile text that gives both scans work: standard keys with a quote that
+        /// never closes, and a standard key beside a wide-only one. The first scan
+        /// masks the standard keys, and the second reads its output and masks the
+        /// wide-only ones. Each family finishes, and each comes out as the scan's rules
+        /// say.
+    ```
+  - lines 2878 to 2880, the section comment (retitled by content):
+
+    ```text
+        // ---- Tester additions: the edges a pair that begins inside a masked value has
+        // ---- to survive. A text cut short, a text of a mebibyte and more, a value or a
+        // ---- key that is not ASCII, and a quote at the end of the text.
+    ```
+
+    becomes
+
+    ```text
+        // ---- Edges a pair that begins inside a masked value has to survive: a text cut
+        // ---- short, a text of a mebibyte and more, a value or a key that is not ASCII,
+        // ---- and a quote at the end of the text.
+    ```
+
+  **C. `reproduce.rs`, `mod tests` only.**
+
+  C1. **Q-5: one private helper, `leaking_cuts`** (the scanner has two loops of the same bookkeeping: the text prefixes and the body
+  cut at every byte). Signature, above the first test that uses it:
+
+  ```text
+      /// Count the cuts in `outputs`, each a cut position and the scrubbed text of
+      /// that cut, and collect the ones whose text still holds a `Q`. Every credential
+      /// in these texts is a run of `Q` and `Q` is nowhere else in them.
+      fn leaking_cuts(
+          outputs: impl IntoIterator<Item = (usize, String)>,
+      ) -> (usize, Vec<(usize, String)>)
+  ```
+
+  It replaces the `cuts`/`leaks` bookkeeping of `scrub_embedded_masks_a_nested_credential_on_every_prefix_of_the_text` (outputs are
+  `(prefix.len(), scrub_embedded(prefix))`) and of the byte-cut loop of
+  `build_poc_masks_a_nested_credential_in_a_header_and_in_a_body_cut_at_every_byte` (outputs are `(cut, the PoC body text for
+  that cut)`). `grep -c 'leaks.push' reproduce.rs` goes from 2 to `1`.
+
+  C2. **Q-5: the scanner's prefix test keeps only the userinfo rows.** In `scrub_embedded_masks_a_nested_credential_on_every_prefix_of_the_text`
+  keep the first two rows of `docs` (`see http://u:pw@host/x\nauth:\n  password: QQQQ` and `auth:\n  password: http://u:pw@host/QQQQ`),
+  remove the other six (they are copies of rows of core's `scrub_text_masks_a_nested_credential_on_every_prefix_of_the_text`, and
+  `scrub_embedded` is `scrub_text_wide(&strip_userinfo(text))`: the userinfo strip is the only thing the scanner adds). The two
+  documents have 46 + 40 = 86 prefixes: the floor `cuts >= 250` becomes `cuts >= 80`. Its doc keeps its text and gains, at the end:
+
+  ```text
+      /// The documents are the two that hold userinfo, the one thing `scrub_embedded`
+      /// adds to `scrub_text_wide`; core's
+      /// `scrub_text_masks_a_nested_credential_on_every_prefix_of_the_text` cuts the
+      /// nested shapes.
+  ```
+
+  C3. **Q-6, comments (scanner).** Old text, then new text:
+
+  - lines 2358 to 2362, the doc of `scrub_embedded_keeps_the_output_it_had_for_a_value_that_looks_like_a_pair` (the test name is
+    spec-fixed): `... a standard pair that follows its parent keeps the output the embedded scrub gave when this test was written.
+    These rows hold on any rule that reads a nested pair.` becomes
+
+    ```text
+        /// A next-line value that only looks like a pair (a padded base64 tail, a
+        /// colon inside the value, a credential-shaped word) is masked whole under
+        /// a secret parent, and a standard pair that follows its parent keeps its
+        /// output. These rows hold on any rule that reads a nested pair.
+    ```
+  - lines 2387 to 2391, the doc of `scrub_embedded_nested_pair_changes_are_exactly_these`: the last two lines `... pipeline at `15009b2`
+    printed. None of them is in [`RECORDED_SCRUB_EMBEDDED`] any more.` become
+
+    ```text
+        /// pipeline at `15009b2` printed. None of them is in
+        /// [`RECORDED_SCRUB_EMBEDDED`], which keeps the rows whose output did not move.
+    ```
+  - lines 2567 to 2568, the section comment:
+
+    ```text
+        // ---- Tester additions: a nested credential in a text cut short, and on the
+        // ---- surfaces of a PoC that the nested-pair tests above do not reach.
+    ```
+
+    becomes
+
+    ```text
+        // ---- A nested credential in a text cut short, and on the surfaces of a PoC
+        // ---- that the nested-pair tests above do not reach.
+    ```
+
+  C4. **Q-8(a).** Line 2378, `assert!(rows.len() == 8, "the table changed: {} rows", rows.len());` becomes
+  `assert!(rows.len() >= 8, "the table lost a row: {} rows", rows.len());` (the table is an inline literal; `==` blocks adding rows,
+  which this plan allows).
+
+  **D. `builder.rs`, tests only.**
+
+  D1. **Q-5: one private helper, `built_body`.** `builder.rs` has one copy of the cut loop, so a `leaking_cuts` there would have one call
+  site; what repeats in this file is the build sequence of a `Body::Bytes` flow, three times (the cut loop, the whole-body assertion
+  after it, and `build_masks_a_nested_credential_in_an_oversized_opaque_body`). Signature, above the first of them:
+
+  ```text
+  /// The body text of the PoC step that `StdPocBuilder` builds from a flow whose body is
+  /// `bytes` (`/x`, `basic_spec()`), or `None` when the step has no body.
+  fn built_body(bytes: &[u8]) -> Option<String>
+  ```
+
+  and the three sites call it (`built_body(&body[..cut]).unwrap_or_default()`, `built_body(body)`, `built_body(body.as_bytes())` with the
+  existing `.expect("a body")`). The inline `cuts`/`leaks` bookkeeping of the cut loop stays (one copy in this crate). No assertion,
+  value or message changes.
+
+  **Not changed by Fix 1:** any production line; Q-7's production change; the three `token="sid:"x` rows; `RECORDED_SCRUB_TEXT` and
+  `RECORDED_SCRUB_EMBEDDED`; any assertion, row or input of an existing test other than the ones above; the spec and this plan.
+- **Evidence.** There is no red run: nothing here changes behaviour. The evidence, pasted in the Coder's report, in this order: (1) the
+  baselines above; (2) after A1 to A9 the identity check (outputs as given) and `cargo test -p aitm-core --offline --lib redact::tests`
+  printing `69 passed`; (3) after B1 to B5 the same check and `68 passed`, and the debug-build time of the AC8 test; (4) after C1 to C4
+  `cargo test -p aitm-plugin-scanner --offline --lib` printing `203 passed`; (5) after D1 `cargo test -p aitm-poc --offline --test builder`
+  printing `26 passed`; (6) **the bite check of the two leak helpers, in a scratch copy outside the repo** (`SCRATCH="$TMPDIR/fix1-bite"`; `git -C WT archive HEAD |
+  tar -x -C "$SCRATCH"`, then copy your three edited files over it, so the copy holds Fix 1; `CARGO_TARGET_DIR="$SCRATCH/target"`). Two edits, in the copy
+  only, each to one call of a helper so that the helper is handed unscrubbed text: (a) in `scrub_text_masks_a_nested_credential_after_a_malformed_quote`
+  pass the identity closure `|text| text.to_string()` instead of `scrub_text` to `leaking_prefixes`, and run `cargo test -p aitm-core --offline --lib
+  after_a_malformed_quote`: it must fail with `a credential survived`; (b) in `scrub_embedded_masks_a_nested_credential_on_every_prefix_of_the_text`
+  feed `leaking_cuts` `(prefix.len(), prefix.to_string())` instead of the scrubbed prefix, and run `cargo test -p aitm-plugin-scanner --offline --lib
+  nested_credential_on_every_prefix`: it must fail with `a credential survived a cut`. (A no-op `mask_secret_pairs` would redden these tests on a whole-text
+  assertion first, which proves nothing about the helpers; `builder.rs` has no leak helper to bite.) Paste the two failures, then `rm -rf "$SCRATCH"`. The branch is
+  untouched by the bite check (`git -C WT status --short` shows only your own files).
+- **Checks (paste each output):**
+  - the identity check and the hunk-start check above, after the last edit;
+  - names, from git, with the Task 4 recipe: core `54` on `ecbf58ac`, `69` on `a2181852`, `68` now; `comm -23` of the `a2181852` list against the
+    new list prints exactly `scrub_text_stays_linear_on_nested_pair_shapes_of_a_mebibyte_or_more`, `comm -13` prints nothing; `reproduce.rs` `51` and `builder.rs`
+    `26`, both lists unchanged;
+  - `grep -c 'leaks.push'` prints `1` for each of `redact.rs`, `reproduce.rs`, `builder.rs`;
+  - Q-1 to Q-3 and Q-6 are gone: `grep -nE "Tester additions|when this test was written|any more\.|A standard key still reads|The standard scan$|scan still reads a standard key|What the nested pair does not read|each doubling|has no such quote|and in the key test inside a masked value" crates/aitm-core/src/redact.rs crates/aitm-plugin-scanner/src/reproduce.rs`
+    prints nothing (I ran it on `a2181852`: it matches exactly the eleven lines the replacements above rewrite, `redact.rs` 34, 168, 219, 226, 2181, 2279, 2366, 2878 and `reproduce.rs` 2361,
+    2391, 2567);
+  - AC14: `grep -n skip_pair_blanks crates/aitm-core/src/redact.rs` prints nothing; `sed -n '/^fn mask_secret_pairs/,/^}/p'
+    crates/aitm-core/src/redact.rs | grep -c reading` prints `3`;
+  - AC24 and the banned phrases over the lines you added: `git -C WT diff -U0 a2181852 -- crates | grep '^+' | grep -nE
+    "reads a pair on one line|one line by the wide|line break as a boundary|three declared|skip_pair_blanks|by construction|only knows|widened locally|needle layer|two vocabularies|vocabulary consolidation|stays until|cannot diverge|cannot disagree|in nothing else|narrower list|only two differences|the only ones whose|one-scan|before the scanner stopped|Pins taken before|before PR 171 none|unsafe"`
+    prints nothing; and `grep -rnE "reads a pair on one line|one line by the wide|line break as a boundary|three declared|skip_pair_blanks" crates/aitm-core/src/redact.rs crates/aitm-plugin-scanner/src`
+    prints nothing;
+  - no `pub` added: `git -C WT diff -U0 a2181852 -- crates | grep -E '^\+[[:space:]]*pub[ (]'` prints nothing; `git -C WT diff --stat ecbf58ac -- crates`
+    names exactly the three files; `git -C WT diff --stat a2181852 -- '*.toml' Cargo.lock` prints nothing.
+- **Gate (sandbox):** `rustfmt --edition 2021` then `--check` on each of the three files exits 0; `cargo clippy -p aitm-core -p aitm-plugin-scanner -p aitm-poc
+  --all-targets --offline -- -D warnings` exits 0; `cargo test -p aitm-core -p aitm-plugin-scanner --offline --no-fail-fast` fails only the socket test named in "Where each
+  command runs"; `cargo test -p aitm-poc --offline --test builder`.
+- **Commit:** `fix(redact): docs, comments and tests after the panel on a2181852 (plan 2026-11-01-scrub-text-nested-pair-leak)`, with the trailer; the three paths
+  explicitly. Report `SF`.
+- **Done when:** the six pieces of evidence, every check and the gate are quoted, no production line changed (the identity check), and the commit is made. If the identity check
+  fails, or a replacement text cannot be applied because the file has drifted, the Coder stops and reports; the differential is then re-run on the new head.
+
+### Task 8b (Stage 5 re-run): Tester, on the fix
+
+- **Satisfies:** AC8 (restated), AC12, AC13 (M2, M4 and the AC8 mutant M9), AC14, AC22, AC24, and the coverage of every Fix 1 item.
+- **Depends on:** Fix 1 committed (`SF`). **Files:** tests only; scratch copies outside the repo. Never change production code. **Dispatch inputs:** the amended spec
+  path, this plan path, `WT`, base `ecbf58ac`, head `SF`, "Fix 1, then whole branch", the Coder report of Fix 1, the prior Tester report (`F4-tester-report.md`) and the
+  findings report.
+- **Work:**
+  1. **Coverage of the fix.** One row per finding of the dispositions table (Q-1 to Q-6, Q-8(a), Q-9, S-2 and S-4 docs, the Q-7 comment) with the grep or the diff hunk that shows
+     it done; Q-7's production change and Q-8(b) shown **not** made (the three rows still in `scrub_text_reads_the_edges_of_a_nested_pair`; `Reading` has three variants).
+  2. **Counts** of the table above: `redact::tests` 68, `cargo test -p aitm-core --lib redact` 81, scanner 203, `builder.rs` 26; the name recipes of Fix 1.
+  3. **Test quality of what Fix 1 touched.** The AC8 test: seven families, every one asserted `>= 1 << 20` and `<= 1 << 21` in the test, both scrubs, expected values formulas
+     over `n` (no literal million-character string), `assert!` on `==`; the helpers are called at every site and no copy of the loop remains; the scanner prefix test still
+     fails when a prefix leaks (it holds the two userinfo documents); no test pins a leak; no `Q` left in the output is accepted anywhere.
+  4. **Mutants, in a scratch copy of `SF`, never in the branch** (as Task 8: `git archive`, `CARGO_TARGET_DIR` inside the scratch, a pristine copy, `diff -u` saved, red set,
+     restored byte for byte with `cmp -s` and equal `shasum -a 256`, a green re-run). Re-run **M2** and **M4** (Task 8's table) and the new **M9**; the other mutants need not be
+     re-run (the production section is byte-identical to `a2181852`, so M1, M3, M5 to M8 behave as the Tester measured, except for the red counts the deleted test and the smaller
+     scanner prefix test change; run them only as information):
+
+     | Mutant | Edit in the scratch copy | Result that must hold |
+     |---|---|---|
+     | M2 | `masked_to` is `value_end` for a quoted value too | core: exactly one red, AC7 `scrub_text_does_not_read_the_closing_quote_of_a_masked_value_as_an_opener` |
+     | M4 | resume at `value_end` again (`i = value_end`) | core: exactly **13** red: the nine of Task 8 (AC1, AC2, AC3, AC6b, AC8, AC10 and the three AC11 tests) and the Tester's four (`scrub_text_masks_a_nested_credential_after_a_malformed_quote`, `scrub_text_masks_a_nested_credential_on_every_prefix_of_the_text`, `scrub_text_reads_an_oversized_nested_key_and_blank_run`, `scrub_text_reads_the_edges_of_a_nested_pair`); the mebibyte test no longer exists. Scanner and builder, as information only: expected 5 and 3 red (by reading; the Tester measured 5 and 3 on `a2181852`) |
+     | M9, the AC8 mutant | delete the early guard (`if j < copied { continue; }`, as M8) **and** move the exact guard (`if j < masked_to { continue; }`) below the closing-quote search: keep the index `j` before the opening-quote handling in a local and test that local against `masked_to` right after `closer` is computed. The output is unchanged and the cost is quadratic on the `sid:"` chain | `scrub_text_stays_linear_on_nested_pair_shapes` **does not finish**: run it alone with a wall limit of 90 s (macOS has no `timeout`: `python3 -I` with `subprocess.run(..., timeout=90)`, or `perl -e 'alarm 90; exec @ARGV'`) and record "did not finish". I measured it in a scratch copy: unmutated 1.4 s, M9 timed out at 90 s (debug build). The rest of `redact::tests` (the AC8 test skipped) did not finish in 200 s under M9 either, so never run the module unbounded under M9. Run the unmutated copy first and record its time |
+
+     A mutant that leaves a listed result unmet is a finding: strengthen the test, commit separately, re-run. The branch is untouched: `git -C WT status --short` prints nothing before and
+     after.
+  5. **Structural checks**, literal outputs: the identity check of Fix 1 (`diff` empty, `248`, both hashes `6ea6d72a3c39a9072e81b95eadcfe75e3bbee4b50946cb57897fcbaa3dfffa65`), re-run
+     from `git show` by the Tester, not copied from the Coder; the same for `reproduce.rs` (hunk start at least `486`; its production section hash, by the same filter,
+     `6119d4755d38c6dc1633e027d699d66951c0cb8fff1b788c190c1c46931ae420` on `a2181852` and on `SF`); the AC14 greps; the AC24 greps; no `unsafe`, no added `pub`; `git diff --stat ecbf58ac SF -- crates`
+     names exactly the three files; `crawl.rs` and `commands.rs` have an empty diff; no edit under `docs/superpowers/` except this plan and its spec.
+  6. **The gate.** Sandbox, per package, as Task 8 step 5, pasted verbatim with each socket failure named "NOT RUN (socket)". The orchestrator then runs the workspace gate in the Terminal
+     (detached, log, `gate-exit=`) **on the final head** and pastes the tail: it must end with `gate-exit=0`. The Stage 6 gate on `a2181852` ended with three load-flaky failures on
+     crates this branch does not touch (`web_bus_write_deadline`, twice, in `aitm`; the 5000-flow `perf` test in `aitm-tui`; load average about 169): if the workspace gate shows
+     any of them, re-run that test alone and on `main` before AC24 is marked passed, and say so; AC24 is not passed on `a2181852`.
+- **Report:** the coverage table; the counts; each mutant's patch, red set and restored green (`cmp` result); the gate output verbatim; PASS or FAIL.
+- **Done when:** every Fix 1 item has evidence, M2 and M4 are killed as listed, M9 does not finish, the identity checks hold, the workspace gate prints `gate-exit=0`, and the verdict is PASS.
+
+### Task 9b (Stage 6 re-run): panel on the fix, prior report in hand
+
+- **Satisfies:** AC23 (by the differential of `a2181852`, which stands: below), the AC14 and AC24 review items, and the panel gate of WORKFLOW stage 6.
+- **Depends on:** Task 8b PASS (head `S8b`: the Tester's last commit, or `SF` if it adds none). **Files:** none; reviewers are read-only on the branch.
+- **Dispatch:** to each of the three reviewers in parallel, fresh context: the amended spec path, this plan path, `WT`, base `ecbf58ac`, head `S8b`, "whole branch, and the fix
+  `a2181852..S8b`", the Coder reports (Tasks 1 to 7 and Fix 1), the Tester reports (Task 8 and 8b), and **the prior review report**: the findings file, with `F4-security-differential.md` for the
+  security reviewer.
+- **Security reviewer.** (1) **Verifies that production code outside comments is byte-identical to `a2181852`** with the identity check of Fix 1, run by the reviewer from `git show` and
+  the worktree (the same `diff`, `248`, hash `6ea6d72a...fa65`), and that `reproduce.rs` has no hunk above its `#[cfg(test)]`. **If so the differential of `a2181852` stands and is not re-run:**
+  this narrows Fix-task protocol 3 (which re-runs it when a fix touches `redact.rs`) because the diff is mechanically comments and tests; the narrowing is the Architect's call P1 below and
+  the orchestrator approves it with this section. If the check fails, the differential is re-run with I1' and I5' (spec Amendment 1) as the pass criteria. (2) Re-checks the doc
+  claims against his own results: the ownership-aware sentences of the module doc and of the `scrub_text` and `scrub_text_wide` docs against I1' = 0 and I5' = 0; the residual wording of
+  A2 and A6 against his families G1, G2, G3 (each named, with his minimal reproducers); "linear" against his I4 timings (no number is claimed); the `Reading` sentence (A7) against the
+  condition `reading != Reading::Wide`; Design 6 rows 29 and 30 and the Amendment's tables against his own runs (the inputs are in the Amendment; he runs them on `ecbf58ac` and `a2181852`).
+  (3) Re-rates S-1: closed by the amendment, or still open with the reason; S-2 to S-4.
+- **Quality reviewer.** Q-1 to Q-9 one by one against the diff (the greps of Fix 1 and the hunks); the docs accurate and no overclaim, in particular "on well-formed input" now carries the
+  ownership-aware meaning and no sentence says "masks everything `scrub_text` masks"; the helpers (`leaking_prefixes`, `leaking_cuts`, `built_body`) used at every site and no copy of
+  the loop left; the AC8 test one test with formula expectations; the retitled section comments and the rewritten test docs accurate; his own Minors; the amended spec for the same
+  accuracy.
+- **Spec reviewer.** P-1 to P-3 against the amended spec: Amendment 1 present and consistent with the body; Design 6 rows 29 and 30; Residual risks 3, 4 and 10; Design 9 I1 and I5; AC numbers
+  and names unchanged and no AC25 (the reasoning of Amendment 1 item 6); the counts table of this section against `git`; Open questions 1 to 4 (the PR flags four defaults for Matt);
+  Design 7 items 1 and 3 as amended against the docs of Fix 1; `git diff --stat ecbf58ac S8b -- docs` names only this plan and its spec; the edited existing tests are exactly the ones Fix 1 names.
+- **Done when:** three reports are in, every finding is in the Review log, no Critical or Important finding is open, each Minor is fixed or accepted in writing in the Review log, and the
+  workspace gate of Task 8b step 6 prints `gate-exit=0` on the head the panel read.
+
+### SHA hand-off for the fix round
+
+| SHA | Commit | State | Must be an ancestor of HEAD before |
+|---|---|---|---|
+| `a2181852` | head under review (S7, the merge, three Tester commits) | green except the load-flaky workspace failures | Fix 1 |
+| `SD` | the orchestrator's docs commit of the amended spec and plan (no crate changes) | n/a | Fix 1 starts (the Coder reads it) |
+| `SF` | Fix 1 | green; production section identical to `a2181852` | Task 8b |
+| `S8b` | the Tester's last commit, or `SF` if it adds none | green | Task 9b (the panel's head) |
+
+### Architect's calls in this section (for Matt to correct)
+
+- **P1.** The Stage 6 differential of `a2181852` is not re-run after Fix 1, because the security reviewer proves the production section byte-identical (comments and blank lines
+  aside) and a2181852's equals S7's. This narrows Fix-task protocol 3 for this fix only; it reverts to the protocol (re-run) the moment the check fails.
+- **P2.** One Coder for Fix 1, one commit: the diff is comments, docs and tests in three files.
+- **P3.** `scrub_text_wide`'s doc says "linear" with no number (spec Design 7 item 3 amended); the I4 bound stays a Stage 6 check.
+- **P4.** The scanner's prefix test keeps only its two userinfo rows and `builder.rs` gets `built_body` instead of a one-site `leaking_cuts`: Q-5 as worded does not fit those two files.
+  The scanner keeps `scrub_embedded`'s userinfo prefixes; the nested shapes are cut once, in core.
+- **P5.** M9, the AC8 mutant, is new (the Tester's M8 survives by design; no listed mutant makes a nested family quadratic). It is in Task 8b only because the AC8 test changed
+  meaningfully (sizes, both scrubs, one test).
+- **P6.** No AC25 (spec Amendment 1 item 6).
+
+### Notes for the orchestrator (not tasks)
+
+- The PR body flags **four** defaults for Matt: the three Open questions and Open question 4 (the ownership-aware reading), and says that the fix round changed no production line, with the
+  identity check's output. It cites the real runs only and says that no live end-to-end through a running `aitm` was run.
+- Review log rows owed: P-3 with the raw red sets (M1 20, M3 2, M4 14, M5 6); Q-7's production change and Q-8(b) as accepted; the open evidence item (the workspace gate) until Task 8b step 6.
+- The spec's Status line should read "amended after the Stage 6 panel (Amendment 1, 2026-11-01)" once the amendment is approved (the Status line is yours; I did not touch it).
+- If `origin/main` is merged again before Task 9b, give the Tester and the panel the new merge-base and re-check the three files; a move of any of them re-opens the differential.
 
 ## Review log
 
