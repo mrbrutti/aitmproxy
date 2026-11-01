@@ -130,16 +130,21 @@ public struct GettingStartedStep: Hashable, Sendable {
 }
 
 /// One way traffic reaches the core (the system proxy, All Apps) or one fact that gates what a
-/// route carries (Scope → decryption, the CA → HTTPS), as one line with its actions. Both pages —
-/// the Status steps and the Flows empty state / banner — print `line` verbatim (spec
-/// 2026-10-31-mac-traffic-route-advice-design D2–D5).
+/// route carries (Scope → decryption, the CA → HTTPS), as its state words, an optional remedy clause
+/// and its actions. Both pages — the Status steps and the Flows empty state / banner — print `line`
+/// verbatim (spec 2026-10-31-mac-traffic-route-advice-design D2–D5).
 public struct TrafficRoute: Hashable, Sendable {
     public enum Kind: String, Hashable, Sendable, CaseIterable { case systemProxy, allApps, scope, caTrust }
 
     public let kind: Kind
     public let open: Bool
-    /// The one line, verbatim on both pages.
-    public let line: String
+    /// The state words: "system proxy off", "All Apps waiting for approval", the quoted Scope sentence
+    /// (verbatim with its period), the CA line. The one-line banner is the shown entries' states joined
+    /// with " · "; remedies are never text there.
+    public let state: String
+    /// The remedy clause a closed route's line carries after " — "; nil for an open entry and for the two
+    /// facts (the Scope fact's remedy is the Add Host… button, the CA fact's its Trust button).
+    public let remedy: String?
     /// What this route carries (the lane principle), the same on every state of the route:
     /// systemProxy → "every proxy-aware app, regardless of Scope"; allApps → "in-scope hosts of every app".
     public let detail: String
@@ -147,18 +152,15 @@ public struct TrafficRoute: Hashable, Sendable {
     /// until PR4 fills `.setSystemProxy`.
     public let actions: [ConnectionAction]
 
-    /// The state words: `line` up to its first " — " ("system proxy off", "All Apps off"), or the whole
-    /// line when it has none (the quoted Scope sentence, verbatim with its period; the CA line). The
-    /// one-line banner is the shown entries' states joined with " · "; remedies are never text there.
-    public var state: String {
-        guard let clause = line.range(of: " — ") else { return line }
-        return String(line[..<clause.lowerBound])
-    }
+    /// The one line, verbatim on both pages: the state, then " — " and the remedy when there is one. Composed
+    /// from the two stored parts and never parsed back, so a core sentence that itself contains " — " stays whole.
+    public var line: String { remedy.map { "\(state) — \($0)" } ?? state }
 
-    public init(kind: Kind, open: Bool, line: String, detail: String, actions: [ConnectionAction]) {
+    public init(kind: Kind, open: Bool, state: String, remedy: String? = nil, detail: String, actions: [ConnectionAction]) {
         self.kind = kind
         self.open = open
-        self.line = line
+        self.state = state
+        self.remedy = remedy
         self.detail = detail
         self.actions = actions
     }
@@ -194,8 +196,14 @@ public struct TrafficRoutes: Hashable, Sendable {
     /// The banner's tooltip detail: the shown entries' `detail`s joined " · "; nil when nothing is shown.
     public var bannerDetail: String? { shown.isEmpty ? nil : shown.map(\.detail).joined(separator: " · ") }
 
-    /// Whether a known route is open; the two facts do not count.
-    public var anyOpen: Bool { [systemProxy, allApps].compactMap { $0 }.contains(where: \.open) }
+    /// Whether a known route is open; the two facts do not count. The same list `ConnectionSummary.routes`
+    /// derives the closed routes from, so the banner's gate and this flag can never disagree.
+    public var anyOpen: Bool { Self.knownRoutes(systemProxy: systemProxy, allApps: allApps).contains(where: \.open) }
+
+    /// The known routes, in banner order: a nil entry is unknown (never named), not closed.
+    static func knownRoutes(systemProxy: TrafficRoute?, allApps: TrafficRoute?) -> [TrafficRoute] {
+        [systemProxy, allApps].compactMap { $0 }
+    }
 
     public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?,
                 advice: [TrafficRoute], shown: [TrafficRoute]) {
@@ -291,11 +299,14 @@ public struct ConnectionSummary: Hashable, Sendable {
         let advice = CaptureAdvice.make(capability: capability, supported: captureSupported, scopeHostCount: scopeHostCount)
         let capture = captureLane(advice, capability: capability, activeKind: activeKind,
                                   scopeHostCount: scopeHostCount, coreCapture: coreCapture)
-        let routes = self.routes(systemProxy: systemProxy, caTrust: caTrust, advice: advice, activeKind: activeKind, bus: busLane,
-                                 scopeHostCount: scopeHostCount, flowCount: flowCount, tunnelledFlowCount: tunnelledFlowCount,
-                                 decrypt: decrypt, listenAddress: listenAddress)
-        let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice, routes: routes, caTrust: caTrust,
-                               flowCount: flowCount, listenAddress: listenAddress)
+        // The All Apps words come from the route table once. An external core runs no extension, so the route
+        // is not ours to show (`routes.allApps` nil, D10) while the Status step still prints the same words.
+        let allApps = allAppsRoute(advice)
+        let routes = self.routes(systemProxy: systemProxy, caTrust: caTrust, allApps: activeKind == .external ? nil : allApps,
+                                 bus: busLane, scopeHostCount: scopeHostCount, flowCount: flowCount,
+                                 tunnelledFlowCount: tunnelledFlowCount, decrypt: decrypt, listenAddress: listenAddress)
+        let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice, allApps: allApps, routes: routes,
+                               caTrust: caTrust, flowCount: flowCount, listenAddress: listenAddress)
         return ConnectionSummary(core: core, bus: busLane, capture: capture, steps: steps, routes: routes, listenAddress: listenAddress)
     }
 
@@ -429,28 +440,31 @@ public struct ConnectionSummary: Hashable, Sendable {
     private static let allAppsDetail = "in-scope hosts of every app"
     private static let scopeDetail = "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"
 
-    private static func routes(systemProxy: SystemProxyState?, caTrust: CATrustFacts?, advice: CaptureAdvice, activeKind: ActiveCoreKind,
+    /// `allApps` is the route table's All Apps entry, or nil when it is not ours to show (no extension in this
+    /// build, an external core).
+    private static func routes(systemProxy: SystemProxyState?, caTrust: CATrustFacts?, allApps: TrafficRoute?,
                                bus: ConnectionLane, scopeHostCount: Int, flowCount: Int, tunnelledFlowCount: Int,
                                decrypt: DecryptStatus?, listenAddress: String) -> TrafficRoutes {
         let busOK = bus.state == .ok
         let systemProxyRoute = systemProxy.map { systemProxyRoute($0, listenAddress: listenAddress) }
-        // An external core runs no extension: the All Apps route is not ours to show.
-        let allApps = activeKind == .external ? nil : allAppsRoute(advice)
         // The Scope fact is known only through the bus: a `decrypt` value is ignored unless the bus lane is ok
         // (the one `BusService` line has no disconnect reset), and the fallback is the live scope count.
         let scope = scopeRoute(busOK ? decrypt : nil, scopeHostCount: scopeHostCount)
         // The CA fact is PR D's `Session.caTrust`: nil while `ca.status` is unread or every store is unknown.
         let caTrust = caTrust.map(caTrustRoute)
 
-        // The Flows empty-state lines: every closed fact, in priority order, whatever the row count.
-        let closedFacts = busOK ? [systemProxyRoute, allApps, scope, caTrust].compactMap { $0 }.filter { !$0.open } : []
+        // The known routes, once (`TrafficRoutes.anyOpen` reads the same list): the closed ones, in order, are
+        // the head of the empty-state advice and — unless another known route is open — of the banner.
+        let known = TrafficRoutes.knownRoutes(systemProxy: systemProxyRoute, allApps: allApps)
+        let closedRoutes = known.filter { !$0.open }
+        // The Flows empty-state lines: every closed entry, routes then facts, whatever the row count.
+        let closedFacts = busOK ? closedRoutes + [scope, caTrust].compactMap { $0 }.filter { !$0.open } : []
 
-        // D5: name only what is known closed; an unknown system proxy (nil) is never named.
-        let knownOpenRoute = (systemProxyRoute?.open ?? false) || (allApps?.open ?? false)
-        let closedRoutes = knownOpenRoute ? [] : [systemProxyRoute, allApps].compactMap { $0 }.filter { !$0.open }
+        // D5: name only what is known closed; an unknown system proxy (nil) is never named, and a closed route
+        // is not named while another known route is open (rows are readable through it).
         let allTunnels = flowCount > 0 && tunnelledFlowCount == flowCount
-        var shown = closedRoutes
-        if !scope.open, !closedRoutes.isEmpty || allTunnels { shown.append(scope) }
+        var shown = known.contains(where: \.open) ? [] : closedRoutes
+        if !scope.open, !shown.isEmpty || allTunnels { shown.append(scope) }
         if let caTrust, !caTrust.open { shown.append(caTrust) }
         // A banner needs rows and a bus that is ok; `TrafficRoutes` joins the shown states, picks the button
         // and the tooltip detail from this one list.
@@ -464,17 +478,17 @@ public struct ConnectionSummary: Hashable, Sendable {
         let remedy = "set \(listenAddress) as the system proxy, or point a client at it"
         switch state.route(to: listenAddress) {
         case .off:
-            return TrafficRoute(kind: .systemProxy, open: false, line: "system proxy off — \(remedy)",
+            return TrafficRoute(kind: .systemProxy, open: false, state: "system proxy off", remedy: remedy,
                                 detail: systemProxyDetail, actions: [])
         case .other(let host, let port):
             let address = SystemProxyState.Endpoint(host: host, port: port).address
-            return TrafficRoute(kind: .systemProxy, open: false, line: "system proxy on · \(address), not this core — \(remedy)",
-                                detail: systemProxyDetail, actions: [])
+            return TrafficRoute(kind: .systemProxy, open: false, state: "system proxy on · \(address), not this core",
+                                remedy: remedy, detail: systemProxyDetail, actions: [])
         case .thisCore(let http, let https):
-            var line = "system proxy on · \(listenAddress)"
-            if http, !https { line += " · HTTP only" }
-            if https, !http { line += " · HTTPS only" }
-            return TrafficRoute(kind: .systemProxy, open: true, line: line, detail: systemProxyDetail, actions: [])
+            var state = "system proxy on · \(listenAddress)"
+            if http, !https { state += " · HTTP only" }
+            if https, !http { state += " · HTTPS only" }
+            return TrafficRoute(kind: .systemProxy, open: true, state: state, detail: systemProxyDetail, actions: [])
         }
     }
 
@@ -486,33 +500,35 @@ public struct ConnectionSummary: Hashable, Sendable {
         case .unsupported:
             return nil
         case .off:
-            return TrafficRoute(kind: .allApps, open: false,
-                                line: "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)",
+            return TrafficRoute(kind: .allApps, open: false, state: "All Apps off",
+                                remedy: "turn it on to capture every app's traffic (macOS asks you to approve its extension)",
                                 detail: allAppsDetail, actions: [.openCaptureSettings])
         case .awaitingApproval:
-            return TrafficRoute(kind: .allApps, open: false,
-                                line: "All Apps waiting for approval — approve the extension in System Settings",
+            return TrafficRoute(kind: .allApps, open: false, state: "All Apps waiting for approval",
+                                remedy: "approve the extension in System Settings",
                                 detail: allAppsDetail, actions: [.approveInSystemSettings])
         case .degraded(let reason):
-            return TrafficRoute(kind: .allApps, open: false, line: "All Apps degraded — \(reason)",
+            return TrafficRoute(kind: .allApps, open: false, state: "All Apps degraded", remedy: reason,
                                 detail: allAppsDetail, actions: [.openCaptureSettings])
         case .onEmptyScope, .on:
-            return TrafficRoute(kind: .allApps, open: true, line: "All Apps on", detail: allAppsDetail, actions: [])
+            return TrafficRoute(kind: .allApps, open: true, state: "All Apps on", detail: allAppsDetail, actions: [])
         }
     }
 
     /// D3's Scope fact. `decrypt` is the core's own account (already nil here when the bus lane is not ok):
     /// closed iff it says nothing is decrypted, else iff the scope count is 0; N comes from it when present.
     /// The closed line is the core's sentence verbatim, or our same-words fallback; the remedy is the
-    /// button `Add Host…`, never appended text.
+    /// button `Add Host…`, never appended text. A blank sentence is no sentence whichever door it came
+    /// through (the decoder drops one; the memberwise init does not), so the row and the banner are never empty.
     private static func scopeRoute(_ decrypt: DecryptStatus?, scopeHostCount: Int) -> TrafficRoute {
         let open = decrypt.map(\.decrypting) ?? (scopeHostCount > 0)
         let hosts = decrypt?.scopeHosts ?? scopeHostCount
         if open {
-            return TrafficRoute(kind: .scope, open: true, line: "Scope: \(Format.count(hosts, "host")) decrypted",
+            return TrafficRoute(kind: .scope, open: true, state: "Scope: \(Format.count(hosts, "host")) decrypted",
                                 detail: scopeDetail, actions: [])
         }
-        return TrafficRoute(kind: .scope, open: false, line: decrypt?.advice ?? nothingDecryptedAdvice,
+        let sentence = decrypt?.advice.flatMap { $0.allSatisfy(\.isWhitespace) ? nil : $0 }
+        return TrafficRoute(kind: .scope, open: false, state: sentence ?? nothingDecryptedAdvice,
                             detail: scopeDetail, actions: [.addScopeHost, .openScope])
     }
 
@@ -526,15 +542,18 @@ public struct ConnectionSummary: Hashable, Sendable {
     /// order, and its `step.done`), so an uninstall in flight reads "trusting CA…", not done.
     private static func caTrustRoute(_ facts: CATrustFacts) -> TrafficRoute {
         let open = facts.trusted && !facts.installing
-        return TrafficRoute(kind: .caTrust, open: open, line: facts.text,
+        return TrafficRoute(kind: .caTrust, open: open, state: facts.text,
                             detail: open ? caTrustedDetail : CATrustFacts.notTrustedLine,
                             actions: open ? [] : facts.actions)
     }
 
     // MARK: Steps (spec D4)
 
+    /// `allApps` is the route table's All Apps entry whether or not `routes` shows it (external core); its words
+    /// and detail are the step's. `advice` picks the step's action, which differs from the route's button.
     private static func steps(core: ConnectionLane, bus: ConnectionLane, activeKind: ActiveCoreKind, advice: CaptureAdvice,
-                              routes: TrafficRoutes, caTrust: CATrustFacts?, flowCount: Int, listenAddress: String) -> [GettingStartedStep] {
+                              allApps: TrafficRoute?, routes: TrafficRoutes, caTrust: CATrustFacts?, flowCount: Int,
+                              listenAddress: String) -> [GettingStartedStep] {
         // An external core is the operator's; it counts as running once the bus reaches it.
         let coreDone = core.state == .ok || (activeKind == .external && bus.state == .ok)
         let busDone = bus.state == .ok
@@ -551,8 +570,6 @@ public struct ConnectionSummary: Hashable, Sendable {
             steps.append(GettingStartedStep(kind: .systemProxy, title: systemProxy.line, done: systemProxy.open,
                                             action: nil, detail: systemProxy.detail))
         }
-        // The All Apps words come from the route table even when the route itself is not shown (external core).
-        let allApps = routes.allApps ?? allAppsRoute(advice)
         let extensionAction: ConnectionAction?
         switch advice {
         case .on, .onEmptyScope, .unsupported: extensionAction = nil

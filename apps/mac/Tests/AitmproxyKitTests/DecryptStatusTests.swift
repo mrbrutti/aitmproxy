@@ -68,4 +68,27 @@ import Testing
         let padded = try #require(DecryptStatus(json: ["scope_hosts": 0, "advice": " Nothing is decrypted until a host is in Scope. "]))
         #expect(padded.advice == " Nothing is decrypted until a host is in Scope. ")
     }
+
+    /// A negative `scope_hosts` is not a count: the object is not read as the decrypt object (nil), so the Kit
+    /// falls back to the live scope list rather than print a negative host count anywhere.
+    @Test func aNegativeScopeHostsIsNotADecryptObject() {
+        #expect(DecryptStatus(json: ["scope_hosts": -3, "decrypting": false, "advice": nil]) == nil)
+        #expect(DecryptStatus(json: ["scope_hosts": -1]) == nil)
+        #expect(DecryptStatus(json: ["scope_hosts": 0])?.scopeHosts == 0)
+        #expect(DecryptStatus(json: ["scope_hosts": 7])?.scopeHosts == 7)
+    }
+
+    /// The advice is one display line: a newline becomes a space, and it is cut at 512 characters (a display
+    /// bound for the banner and the Scope row, not a protocol rule). Within that it stays verbatim.
+    @Test func adviceIsOneLineAndCappedAt512Characters() throws {
+        let long = String(repeating: "x", count: 1000)
+        let capped = try #require(DecryptStatus(json: ["scope_hosts": 0, "decrypting": false, "advice": .string(long)]))
+        #expect(capped.advice?.count == 512)
+        #expect(capped.advice == String(repeating: "x", count: 512))
+        let exact = try #require(DecryptStatus(json: ["scope_hosts": 0, "advice": .string(String(repeating: "y", count: 512))]))
+        #expect(exact.advice == String(repeating: "y", count: 512))
+        let twoLines = try #require(DecryptStatus(json: ["scope_hosts": 0, "decrypting": false, "advice": "a\nb"]))
+        #expect(twoLines.advice == "a b")
+        #expect(try #require(DecryptStatus(json: ["scope_hosts": 0, "advice": "one\r\ntwo\nthree"])).advice == "one two three")
+    }
 }

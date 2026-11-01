@@ -5,36 +5,42 @@ import SwiftUI
 /// known route is closed, every row is a tunnel with an empty Scope, or the CA is not trusted (spec
 /// 2026-10-31-mac-traffic-route-advice-design D5/D8). The text is `TrafficRoutes.banner` — the shown
 /// facts' state words only — the one button is `bannerAction`, and the tooltip's second line is
-/// `bannerDetail`; all three come from `Session.trafficRoutes`, the only thing this file reads, so no
-/// route word is spelled here, nothing re-derives the shown set, and the caller draws the `Rule`.
+/// `bannerDetail`; all three come from `routes`, the `Session.trafficRoutes` value `MainView.flows` reads
+/// once and hands down, so no route word is spelled here, nothing re-derives the shown set, and the caller
+/// draws the `Rule`. Nothing renders when `banner` is nil. The session is read only to run the button.
 struct RouteBanner: View {
+    var routes: TrafficRoutes
     @Environment(Session.self) private var session
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        let routes = session.trafficRoutes
-        let banner = routes.banner ?? ""
-        HStack(spacing: Space.sm) {
+        if let banner = routes.banner {
             HStack(spacing: Space.sm) {
-                Image(systemName: "network").font(.system(size: Tok.Size.iconInline))
-                Text(banner)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                Label {
+                    Text(banner)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                } icon: {
+                    Image(systemName: "network").font(.system(size: Tok.Size.iconInline))
+                }
+                .labelStyle(RouteLabelStyle())
+                Spacer(minLength: Space.sm)
+                if let action = routes.bannerAction {
+                    SmallButton(action.title) { RouteActions.run(action, session: session, openSettings: openSettings) }
+                        // Trusting is a bus call the operator makes: the button stands down while the bus is not the
+                        // operator's (`Session.trustCA()` refuses it then), as the Status page's row does.
+                        .disabled(action == .trustCA && !session.caTrustControlLive)
+                        .accessibilityIdentifier("route-banner-action")
+                }
             }
-            .accessibilityElement(children: .combine)
-            Spacer(minLength: Space.sm)
-            if let action = routes.bannerAction {
-                SmallButton(action.title) { RouteActions.run(action, session: session, openSettings: openSettings) }
-                    .accessibilityIdentifier("route-banner-action")
-            }
+            .font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(Tok.Ink.tertiary.color)
+            .padding(.horizontal, Space.md)
+            .frame(height: Tok.Size.Row.dense)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(Self.help(banner: banner, detail: routes.bannerDetail))
+            .accessibilityIdentifier("route-banner")
         }
-        .font(Tok.Face.ui(Tok.Typography.Size.sm))
-        .foregroundStyle(Tok.Ink.tertiary.color)
-        .padding(.horizontal, Space.md)
-        .frame(height: Tok.Size.Row.dense)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .help(Self.help(banner: banner, detail: routes.bannerDetail))
-        .accessibilityIdentifier("route-banner")
     }
 
     /// The tooltip: the full banner (the line truncates), then the Kit's `bannerDetail` — the shown entries'
@@ -62,10 +68,26 @@ enum RouteActions {
     }
 }
 
+/// Icon then text on the grid (`Space.sm` apart), the icon in a fixed slot when `iconWidth` is set so the
+/// detail line beneath a `RouteAdviceRow` aligns under its text.
+struct RouteLabelStyle: LabelStyle {
+    var iconWidth: CGFloat? = nil
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: Space.sm) {
+            configuration.icon.frame(width: iconWidth)
+            configuration.title
+        }
+    }
+}
+
 /// One closed route or fact in the Flows empty state (spec D4): its glyph, the line verbatim, every action
-/// as a `SmallButton`, and the detail beneath in a smaller tertiary line.
+/// as a `SmallButton`, and the detail beneath in a smaller tertiary line. A pure function of its inputs:
+/// `controlLive` is `Session.caTrustControlLive` (the Trust button stands down without it) and `run` is the
+/// caller's `RouteActions.run`.
 struct RouteAdviceRow: View {
     var route: TrafficRoute
+    var controlLive: Bool
     var run: (ConnectionAction) -> Void
 
     static func glyph(_ kind: TrafficRoute.Kind) -> String {
@@ -80,16 +102,20 @@ struct RouteAdviceRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
             HStack(spacing: Space.sm) {
-                Image(systemName: Self.glyph(route.kind))
-                    .font(.system(size: Tok.Size.iconInline))
-                    .frame(width: Tok.Size.icon)
-                    .accessibilityHidden(true)
-                Text(route.line)
-                    .font(Tok.Face.ui(Tok.Typography.Size.md))
-                    .foregroundStyle(Tok.Ink.secondary.color)
-                    .allowsHitTesting(false)
+                Label {
+                    Text(route.line)
+                        .font(Tok.Face.ui(Tok.Typography.Size.md))
+                        .foregroundStyle(Tok.Ink.secondary.color)
+                        .allowsHitTesting(false)
+                } icon: {
+                    Image(systemName: Self.glyph(route.kind))
+                        .font(.system(size: Tok.Size.iconInline))
+                        .accessibilityHidden(true)
+                }
+                .labelStyle(RouteLabelStyle(iconWidth: Tok.Size.icon))
                 ForEach(route.actions, id: \.self) { action in
                     SmallButton(action.title) { run(action) }
+                        .disabled(action == .trustCA && !controlLive)
                 }
             }
             Text(route.detail)

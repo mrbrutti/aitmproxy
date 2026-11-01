@@ -13,8 +13,8 @@
 #         (Matt, 2026-10-31: "status in the top AND the sidebar AND the status bar — pick one")
 #         must not mention it, `LaneDot`, `LaneState` or `ConnectionSummary` at all.
 # Rule 3: one route derivation (§D9, TR-AC7). `trafficRoutes` is defined exactly once, in
-#         Session+Connection.swift, as `connectionSummary.routes`; the views (Shell/ShellView.swift,
-#         Shell/RouteBanner.swift) read `trafficRoutes` and never `connectionSummary`.
+#         Session+Connection.swift, as `connectionSummary.routes`; Shell/ShellView.swift reads `trafficRoutes`
+#         once and hands the value to Shell/RouteBanner.swift, and neither reads `connectionSummary`.
 # Exit 0 + PASS on a clean tree; exit 1 listing each offence otherwise.
 set -u
 set -o pipefail
@@ -39,8 +39,11 @@ fi
 
 # Rule 1, route words (spec §D9): an opening quote followed by a route line's head. Same scan root
 # and the same exclusions as `words`; the Kit (TrafficRoutes in ConnectionSummary.swift) is outside it.
+# Allow-list: none yet. A view that must spell one of these for a reason that is not a route word adds its
+# file here with a comment saying why (the `words` rule's FilterRow exclusion is a flow-state query; no route
+# prefix is one, so it does not apply here).
 prefixes='"(system proxy off|system proxy on|All Apps on|All Apps off|All Apps waiting|All Apps degraded|Nothing is decrypted|Scope:|HTTPS is not captured|Trust the aitmproxy CA|CA trusted|trusting CA|CA trust needs)'
-rhits=$(grep -rnE --include='*.swift' -e "$prefixes" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -vE '^Sources/Aitmproxy/SelfTest(\+[A-Za-z]+)?\.swift:' | grep -vE ':[0-9]+:.*FilterRow\(\.[a-z]+,' ; echo "rc=${PIPESTATUS[0]}")
+rhits=$(grep -rnE --include='*.swift' -e "$prefixes" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -vE '^Sources/Aitmproxy/SelfTest(\+[A-Za-z]+)?\.swift:' ; echo "rc=${PIPESTATUS[0]}")
 rrc=${rhits##*rc=}; rhits=${rhits%rc=*}
 if [ "$rrc" -gt 1 ]; then
   echo "FAIL check-connection-words: grep could not read Sources/Aitmproxy for route words (exit $rrc)"
@@ -48,7 +51,7 @@ if [ "$rrc" -gt 1 ]; then
 fi
 if [ -n "${rhits//[[:space:]]/}" ]; then
   printf '%s\n' "$rhits"
-  echo "FAIL check-connection-words: a view spells a route word; read it from ConnectionSummary.routes instead"
+  echo "FAIL check-connection-words: a view spells a route-line prefix; if this is a route word read it from TrafficRoutes, otherwise add it to this rule's allow-list with a comment"
   status=1
 fi
 

@@ -178,9 +178,10 @@ import Testing
 
     // MARK: D5 invariants over a grid
 
-    /// D5 over a grid of inputs: no words without an ok bus; a banner needs rows; the banner is the closed
-    /// entries' states in `advice` order joined " · ", never remedy text, never a second line; the button is
-    /// the first shown entry's first action, and there is none without a banner.
+    /// D5 over a grid of inputs, with `shown` as the oracle (a view reads it; the text is derived from it): no
+    /// words without an ok bus; a banner needs rows; every shown entry is closed and is an advice entry, in
+    /// advice order; the banner is exactly the shown states joined " · ", the button the first shown entry's
+    /// first action, the tooltip detail the shown details; a state word carries no remedy clause or second line.
     @Test func bannerInvariantsHoldAcrossTheGrid() throws {
         let notTrusted = try notTrusted()
         let capabilities: [CaptureCapability] = [.capturing, .inactive, .pendingApproval, .degraded("x — y")]
@@ -201,21 +202,27 @@ import Testing
                                     let label = "\(capability) proxy=\(String(describing: proxy)) \(bus) supported=\(supported) "
                                         + "hosts=\(hosts) flows=\(row.flows)/\(row.tunnelled) ca=\(ca != nil)"
                                     #expect(r.advice.allSatisfy { !$0.open }, "advice lists closed facts only: \(label)")
+                                    #expect(r.shown.allSatisfy { !$0.open }, "shown lists closed entries only: \(label)")
+                                    let shownKinds = r.shown.map(\.kind)
+                                    #expect(Set(shownKinds).isSubset(of: Set(r.advice.map(\.kind))), "every shown entry is an advice entry: \(label)")
+                                    #expect(r.advice.filter { shownKinds.contains($0.kind) } == r.shown, "shown is advice, in advice order: \(label)")
+                                    #expect(r.banner == (r.shown.isEmpty ? nil : r.shown.map(\.state).joined(separator: " · ")),
+                                            "the banner is the shown states: \(label)")
+                                    #expect(r.bannerAction == r.shown.first { !$0.actions.isEmpty }?.actions.first, "the first shown entry's button: \(label)")
+                                    #expect(r.bannerDetail == (r.shown.isEmpty ? nil : r.shown.map(\.detail).joined(separator: " · ")),
+                                            "the tooltip detail is the shown details: \(label)")
                                     if case .connected = bus {} else {
-                                        #expect(r.advice.isEmpty && r.banner == nil && r.bannerAction == nil, "no words without the bus: \(label)")
+                                        #expect(r.advice.isEmpty && r.shown.isEmpty, "no words without the bus: \(label)")
                                     }
-                                    guard let banner = r.banner else {
-                                        #expect(r.bannerAction == nil, "no button without a banner: \(label)")
+                                    guard !r.shown.isEmpty else {
+                                        #expect(r.banner == nil && r.bannerAction == nil && r.bannerDetail == nil, "nothing shown, nothing said: \(label)")
                                         continue
                                     }
                                     banners += 1
                                     #expect(row.flows > 0, "a banner needs rows: \(label)")
-                                    #expect(!banner.contains(" — ") && !banner.contains("\n"), "states only, one line: \(label)")
-                                    let shown = r.advice.filter { banner.contains($0.state) }
-                                    #expect(banner == shown.map(\.state).joined(separator: " · "), "closed states in advice order: \(label)")
-                                    #expect(r.bannerAction == shown.first { !$0.actions.isEmpty }?.actions.first, "the first shown entry's button: \(label)")
+                                    #expect(r.shown.allSatisfy { !$0.state.contains(" — ") && !$0.state.contains("\n") }, "states only, one line: \(label)")
                                     if row.tunnelled != row.flows, r.anyOpen {
-                                        #expect(!shown.contains { $0.kind == .scope }, "a readable row keeps the Scope fact off the banner: \(label)")
+                                        #expect(!shownKinds.contains(.scope), "a readable row keeps the Scope fact off the banner: \(label)")
                                     }
                                 }
                             }

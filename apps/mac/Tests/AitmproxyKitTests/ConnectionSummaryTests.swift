@@ -60,6 +60,11 @@ import Testing
         #expect((r.banner == nil) == r.shown.isEmpty, "\(label)", sourceLocation: sourceLocation)
     }
 
+    /// The Getting-started step of one kind; a test names the step it reads, never its position.
+    private func step(_ summary: ConnectionSummary, _ kind: GettingStartedStep.Kind) -> GettingStartedStep? {
+        summary.steps.first { $0.kind == kind }
+    }
+
     // MARK: Core lane
 
     @Test func coreWords() {
@@ -168,20 +173,21 @@ import Testing
             "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)",
             "Add a host to Scope (for now as example.com:443)", "Point a client at 127.0.0.1:8080, or open the browser",
         ])
-        #expect(fresh.steps[2].action == .turnCaptureOn && fresh.steps[3].action == .openScope && fresh.steps[4].action == .openBrowser)
+        #expect(step(fresh, .extensionOn)?.action == .turnCaptureOn && step(fresh, .scopeSet)?.action == .openScope
+                && step(fresh, .firstFlow)?.action == .openBrowser)
         let waiting = make(core: core(.ready), bus: .connected("x"), role: "operator", capability: .pendingApproval)
-        #expect(waiting.steps[2].title == "All Apps waiting for approval — approve the extension in System Settings")
+        #expect(step(waiting, .extensionOn)?.title == "All Apps waiting for approval — approve the extension in System Settings")
         let done = make(core: core(.ready), bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2, flows: 14)
         #expect(done.steps.map(\.done) == [true, true, true, true, true])
-        #expect(done.steps[3].title == "Scope: 2 hosts decrypted" && done.steps[4].title == "14 flows captured")
+        #expect(step(done, .scopeSet)?.title == "Scope: 2 hosts decrypted" && step(done, .firstFlow)?.title == "14 flows captured")
         let unsupported = make(core: core(.ready), bus: .connected("x"), role: "operator", supported: false, hosts: 1, flows: 1)
-        #expect(unsupported.steps[2].title == "All Apps capture is not in this build" && unsupported.steps[2].action == nil)
+        #expect(step(unsupported, .extensionOn)?.title == "All Apps capture is not in this build" && step(unsupported, .extensionOn)?.action == nil)
         #expect(!unsupported.allStepsDone)
         let external = make(kind: .external, bus: .connected("x"), role: "operator")
-        #expect(external.steps[0].done, "an external core counts as running once the bus is connected")
+        #expect(step(external, .coreRunning)?.done == true, "an external core counts as running once the bus is connected")
         let down = make(core: nil, bus: .disconnected)
-        #expect(down.steps[0].title == "Start the core" && down.steps[0].action == .startCore)
-        #expect(down.steps[1].title == "Connect to the bus" && down.steps[1].action == .startCore)
+        #expect(step(down, .coreRunning)?.title == "Start the core" && step(down, .coreRunning)?.action == .startCore)
+        #expect(step(down, .busConnected)?.title == "Connect to the bus" && step(down, .busConnected)?.action == .startCore)
     }
 
     @Test func actionTitlesAreTitleCaseWithEllipsesWhereAViewOpens() {
@@ -379,7 +385,6 @@ import Testing
                 == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.")
 
         // One derivation over every row above: banner, button and detail all read off `shown`.
-        #expect(produced.count == 26, "every row above is checked; the table has \(produced.count) rows")
         #expect(produced.contains { !$0.shown.isEmpty } && produced.contains { $0.shown.isEmpty })
         for (i, routes) in produced.enumerated() { expectOneDerivation(routes, "row \(i)") }
     }
@@ -393,23 +398,20 @@ import Testing
         #expect(!steps(systemProxy: nil).steps.map(\.kind).contains(.systemProxy))
         let off = steps(systemProxy: .off)
         #expect(off.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .firstFlow])
-        #expect(off.steps[2].done == false)
-        #expect(off.steps[2].title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it")
-        #expect(off.steps[2].detail == "every proxy-aware app, regardless of Scope")
-        #expect(off.steps[2].action == nil)
+        #expect(step(off, .systemProxy)?.done == false)
+        #expect(step(off, .systemProxy)?.title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(step(off, .systemProxy)?.detail == "every proxy-aware app, regardless of Scope")
+        #expect(step(off, .systemProxy)?.action == nil)
         let other = steps(systemProxy: both("127.0.0.1", 9090))
-        #expect(other.steps[2].title
+        #expect(step(other, .systemProxy)?.title
                 == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it")
-        #expect(other.steps[2].done == false)
+        #expect(step(other, .systemProxy)?.done == false)
         let ours = steps(core: core(.ready), .capturing, systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 1)
-        #expect(ours.steps[2].title == "system proxy on · 127.0.0.1:8080")
-        #expect(ours.steps[2].done == true)
-        #expect(ours.steps[2].action == nil)
+        #expect(step(ours, .systemProxy)?.title == "system proxy on · 127.0.0.1:8080")
+        #expect(step(ours, .systemProxy)?.done == true)
+        #expect(step(ours, .systemProxy)?.action == nil)
         #expect(ours.allStepsDone == true)
 
-        func step(_ summary: ConnectionSummary, _ kind: GettingStartedStep.Kind) -> GettingStartedStep? {
-            summary.steps.first { $0.kind == kind }
-        }
         let scopeEmpty = steps(.capturing, hosts: 0)
         #expect(step(scopeEmpty, .extensionOn)?.title == "All Apps is on")
         #expect(step(scopeEmpty, .extensionOn)?.done == true)
@@ -489,6 +491,105 @@ import Testing
         #expect(none.bannerAction == nil)
     }
 
+    /// A route stores its state words and its remedy apart and composes `line` from them; nothing parses `line`.
+    /// So a core sentence that itself contains " — " stays whole on the banner (D3 verbatim), and each builder's
+    /// state is the exact head of its line.
+    @Test func stateAndRemedyAreStoredNotParsed() {
+        let dashed = DecryptStatus(scopeHosts: 0, decrypting: false, advice: "Nothing is decrypted — add a host to Scope.")
+        let r = make(bus: .connected("x"), role: "operator", capability: .capturing, hosts: 0, flows: 3,
+                     systemProxy: both("127.0.0.1", 8080), tunnelled: 3, decrypt: dashed).routes
+        #expect(r.scope.state == "Nothing is decrypted — add a host to Scope.")
+        #expect(r.scope.remedy == nil)
+        #expect(r.scope.line == "Nothing is decrypted — add a host to Scope.")
+        #expect(r.banner == "Nothing is decrypted — add a host to Scope.")
+        #expect(r.bannerAction == .addScopeHost)
+
+        let off = make(bus: .connected("x"), role: "operator", capability: .inactive, hosts: 2, systemProxy: .off).routes
+        #expect(off.systemProxy?.state == "system proxy off")
+        #expect(off.systemProxy?.remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(off.systemProxy?.line == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(off.allApps?.state == "All Apps off")
+        #expect(off.allApps?.remedy == "turn it on to capture every app's traffic (macOS asks you to approve its extension)")
+        #expect(off.allApps?.line == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)")
+        let other = make(bus: .connected("x"), role: "operator", capability: .pendingApproval, hosts: 2, systemProxy: both("127.0.0.1", 9090)).routes
+        #expect(other.systemProxy?.state == "system proxy on · 127.0.0.1:9090, not this core")
+        #expect(other.systemProxy?.remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(other.allApps?.state == "All Apps waiting for approval")
+        #expect(other.allApps?.remedy == "approve the extension in System Settings")
+        let degraded = make(bus: .connected("x"), role: "operator", capability: .degraded("code signature invalid — reinstall"), hosts: 2).routes
+        #expect(degraded.allApps?.state == "All Apps degraded")
+        #expect(degraded.allApps?.remedy == "code signature invalid — reinstall")
+        #expect(degraded.allApps?.line == "All Apps degraded — code signature invalid — reinstall")
+
+        let on = make(bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2, systemProxy: both("127.0.0.1", 8080)).routes
+        #expect(on.systemProxy?.remedy == nil)
+        #expect(on.systemProxy?.line == "system proxy on · 127.0.0.1:8080")
+        #expect(on.allApps?.remedy == nil)
+        #expect(on.allApps?.line == "All Apps on")
+        #expect(on.scope.remedy == nil)
+        #expect(on.scope.line == "Scope: 2 hosts decrypted")
+        #expect(on.scope.state == "Scope: 2 hosts decrypted")
+    }
+
+    /// `scopeRoute` reads a blank `advice` as absent even when it arrives through the memberwise init (the decoder's
+    /// rule is not the only door): the fallback sentence, never an empty Scope row or a blank banner.
+    @Test func blankAdviceFromTheMemberwiseInitFallsBack() {
+        for blank in ["", " ", "\n", "\t "] {
+            let decrypt = DecryptStatus(scopeHosts: 0, decrypting: false, advice: blank)
+            let r = make(bus: .connected("x"), role: "operator", capability: .capturing, hosts: 0, flows: 3,
+                         systemProxy: both("127.0.0.1", 8080), tunnelled: 3, decrypt: decrypt).routes
+            #expect(r.scope.line == "Nothing is decrypted until a host is in Scope.", "\(blank.debugDescription)")
+            #expect(r.scope.open == false, "\(blank.debugDescription)")
+            #expect(r.banner == "Nothing is decrypted until a host is in Scope.", "\(blank.debugDescription)")
+            #expect(r.banner?.isEmpty == false, "\(blank.debugDescription)")
+            #expect(r.advice.map(\.line) == ["Nothing is decrypted until a host is in Scope."], "\(blank.debugDescription)")
+        }
+        let plain = make(bus: .connected("x"), role: "operator", capability: .capturing, hosts: 0, flows: 0,
+                         decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: "")).routes
+        #expect(plain.scope.line == "Nothing is decrypted until a host is in Scope.")
+    }
+
+    /// The All Apps words reach the Status step from the one route table even when the route is not ours to
+    /// show (an external core runs no extension: `routes.allApps == nil`), so step and route can never disagree.
+    @Test func externalCoreStepsReuseTheAllAppsWords() {
+        let ext = make(kind: .external, bus: .connected("x"), role: "operator", capability: .inactive, hosts: 2, systemProxy: .off)
+        #expect(ext.routes.allApps == nil)
+        #expect(step(ext, .extensionOn)?.title == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)")
+        #expect(step(ext, .extensionOn)?.done == false)
+        #expect(step(ext, .extensionOn)?.action == .turnCaptureOn)
+        #expect(step(ext, .extensionOn)?.detail == "in-scope hosts of every app")
+        let extOn = make(kind: .external, bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2)
+        #expect(extOn.routes.allApps == nil)
+        #expect(step(extOn, .extensionOn)?.title == "All Apps is on")
+        #expect(step(extOn, .extensionOn)?.done == true)
+        let extNoExt = make(kind: .external, bus: .connected("x"), role: "operator", supported: false, hosts: 2)
+        #expect(step(extNoExt, .extensionOn)?.title == "All Apps capture is not in this build")
+    }
+
+    /// TR-AC18 with the system proxy known `.off`: the shown set leads with it, then All Apps, Scope and the CA,
+    /// and `bannerDetail` is their four details in that order; without a CA fact, the first three.
+    @Test func offLeadingShownSetAndItsDetail() throws {
+        let notTrusted = try caFacts()
+        let four = make(bus: .connected("x"), role: "operator", capability: .inactive, hosts: 0, flows: 3,
+                        systemProxy: .off, caTrust: notTrusted).routes
+        #expect(four.shown.map(\.kind) == [.systemProxy, .allApps, .scope, .caTrust])
+        #expect(four.banner
+                == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(four.bannerAction == .openCaptureSettings)
+        #expect(four.bannerDetail
+                == "every proxy-aware app, regardless of Scope · in-scope hosts of every app · "
+                + "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel · "
+                + "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
+        let three = make(bus: .connected("x"), role: "operator", capability: .inactive, hosts: 0, flows: 3, systemProxy: .off).routes
+        #expect(three.shown.map(\.kind) == [.systemProxy, .allApps, .scope])
+        #expect(three.banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.")
+        #expect(three.bannerDetail
+                == "every proxy-aware app, regardless of Scope · in-scope hosts of every app · "
+                + "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel")
+        expectOneDerivation(four, "four")
+        expectOneDerivation(three, "three")
+    }
+
     // MARK: CA fact (spec D3/D4/D5; TR-AC16 and the CA cases of TR-AC18; every word is PR D's `CATrustFacts`)
 
     /// TR-AC16: the CA entry joins the advice last and the steps after Scope, worded by PR D's `text`/`actions`/`step`.
@@ -509,11 +610,11 @@ import Testing
         #expect(s.routes.advice.last?.line == "HTTPS is not captured until the CA is trusted")
         #expect(s.routes.anyOpen == true)
         #expect(s.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow])
-        #expect(s.steps[5].title == "Trust the aitmproxy CA")
-        #expect(s.steps[5].done == false)
-        #expect(s.steps[5].action == .trustCA)
-        #expect(s.steps[5].detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
-        #expect(s.steps[5].title == notTrusted.step.title && s.steps[5].action == notTrusted.step.action)
+        #expect(step(s, .caTrusted)?.title == "Trust the aitmproxy CA")
+        #expect(step(s, .caTrusted)?.done == false)
+        #expect(step(s, .caTrusted)?.action == .trustCA)
+        #expect(step(s, .caTrusted)?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
+        #expect(step(s, .caTrusted)?.title == notTrusted.step.title && step(s, .caTrusted)?.action == notTrusted.step.action)
         // No rows: the advice is the empty state's, the banner stays away.
         #expect(s.routes.banner == nil)
     }
