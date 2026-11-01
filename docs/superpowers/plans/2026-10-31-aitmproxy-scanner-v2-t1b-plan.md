@@ -1432,6 +1432,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 
 **Amendments after Task 17 (orchestrator, 2026-11-01, 974f2c1c):** `Assembled` also exposes a read-only `scanner_engine: Arc<OnceLock<Arc<Engine>>>` (from `ScannerPlugin::engine_cell()`) so the plan's own `scanner_config_reaches_the_plugin` test can read the loaded config; `tui::services` gained the `Arc<JobBus>` parameter, and its eleven call sites under `crates/aitm/tests/**` (not on any file list; a compile consequence) are updated by Task 17's coder passing `assembled.job_bus`; `main.rs` names `scanner_engine` in the `Assembled` destructure (clippy). The main merge at 87ae0dd7 brings T10's harness (`aitm_e2e/scan.py`, the `scanner:` emitter, `run.py scan` ledger) and 38 cells: `python3 tests/e2e/run.py scan` is the authoritative live proof for Task 19; the `$TMPDIR` scripts are supplementary evidence.
 
+**Coordinator ruling 2026-11-01 (check ids):** check ids follow spec D8.2's literal names; the interim lane's two active check ids become `xss-reflected` and `open-redirect` (classes stay `reflected-xss`/`open-redirect`; manual verb `check.xss-reflected`); the three interim passive ids stay (`reflection`, `security-header`, `cookie-flag`, marked interim). Task 19 fixes `tests/e2e/scan/test_t1_catalogue.py` as a SUBSET assertion (`NATIVE_IDS ⊆ live ids`, every live id with complete `CheckMeta`), notes the integration-shared edit in the PR body, and lists the scope-port fix under the PR's fixes; the three contract counts go to the coordinator with the PR number.
+
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
 (Task 14) and wave 5 (Task 15); `crates/aitm-plugin-scanner/Cargo.toml` in wave 1 (Task 3) and
@@ -1630,7 +1632,7 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | Coder (Task 16) | Important | `run_job` has no panic supervision: a panicking lane leaves the job in `cancelling` forever and its origin `busy` | fixed in 10e97b21 (job-level catch_unwind + per-check catch) |
 | 14 | Proof prep (Task 19) | Critical | `jobs::start` strips the port before `guard.in_scope`, so a `host:port` scope entry never admits a `scan.start` origin (every e2e cell seeds one) | fix dispatched 2026-11-01: the start-time check uses the full authority (explicit or scheme-default port) like the request-time guard; three literal tests |
 | 19 | Proof prep | Note | P12 must use MITM'd HTTPS (`missing-hsts` is guarded on `https://`); P3 "zero issues on Patched" means zero active-class issues (passive ones may fire); P9 is `EXPECTED_TOOLS ⊆ live` (frontends.rs builds a server without the Rhai/findings plugins) with the `scan.*` slice equal; the relay is a second wire witness only (the target's control log is on main) | plan wording amended for Task 19 |
-| T10 cell | Proof prep (external) | Important | `tests/e2e/scan/test_t1_catalogue.py` pins `NATIVE_IDS = {"xss-reflected", ...}`; the interim ids are `reflected-xss` etc. | raised with the coordinator 2026-11-01 (one-line cell fix; owner to be decided) |
+| T10 cell | Proof prep (external) | Important | `tests/e2e/scan/test_t1_catalogue.py` pins `NATIVE_IDS = {"xss-reflected", ...}`; the interim ids are `reflected-xss` etc. | coordinator 2026-11-01: interim ids renamed to `xss-reflected`/`open-redirect` (rename task after the scope fix); Task 19 makes the cell a subset assertion |
 
 ## Shipped
 
