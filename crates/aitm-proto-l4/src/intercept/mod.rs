@@ -40,19 +40,18 @@ pub use nfqueue_linux::NfqueueBackend;
 pub use unsupported::NfqueueBackend;
 
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{NetSlice, SlicedPacket};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
-use crate::craft::PacketSpec;
+use crate::craft::{endpoints_of, PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::{L4Guard, L4Permit};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
@@ -95,6 +94,13 @@ pub struct ParkedPacket {
     pub state: L4InterceptState,
     /// When `on_timeout` applies if no verdict arrives first.
     pub deadline: SystemTime,
+    /// Arrival sequence, **process-wide**: assigned from one monotonic counter
+    /// shared by every session when the packet is parked, so `l4.intercept.list`
+    /// orders parked packets oldest first across sessions (the id is a random
+    /// uuid and carries no order).
+    pub parked_seq: u64,
+    /// When the packet was parked (`l4.intercept.list` reports it as epoch ms).
+    pub parked_at: SystemTime,
 }
 
 /// The platform `InterceptState` model, at the packet level. A `backup` of the
@@ -216,10 +222,85 @@ struct ParkedEntry {
     parked: ParkedPacket,
 }
 
+/// The arrival sequence every parked packet is stamped from (spec §4 / AC37).
+/// Stamps are unique and increasing process-wide — one counter for every
+/// session, so `l4.intercept.list` interleaves sessions in true arrival order —
+/// and within one table they follow insertion order, because the stamp is taken
+/// in [`ParkedTable::park`] under that table's lock. `fetch_add` is atomic
+/// whatever its ordering, and no other memory is published through it, so
+/// `Relaxed` suffices.
+static NEXT_PARKED_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// The parked-packet table shared between the reader thread and the handle: the
 /// thread inserts/expires, commands read ([`InterceptHandle::parked`]) and submit
-/// verdicts.
-type ParkedTable = HashMap<ParkedId, ParkedEntry>;
+/// verdicts. [`ParkedTable::park`] is the only way in; it stamps the arrival
+/// sequence from [`NEXT_PARKED_SEQ`].
+#[derive(Debug, Default)]
+struct ParkedTable {
+    entries: HashMap<ParkedId, ParkedEntry>,
+}
+
+impl ParkedTable {
+    /// Park `packet` as `id` behind the backend `handle`, stamping its arrival
+    /// sequence and `parked_at`. The only way a packet enters the table.
+    fn park(
+        &mut self,
+        handle: u32,
+        id: ParkedId,
+        flow: L4FlowId,
+        packet: L4Packet,
+        parked_at: SystemTime,
+        deadline: SystemTime,
+    ) {
+        // `&mut self` means the caller holds the table lock, so the sequence is
+        // taken and the entry inserted with nothing in between.
+        let parked_seq = NEXT_PARKED_SEQ.fetch_add(1, Ordering::Relaxed);
+        let parked = ParkedPacket {
+            id,
+            flow,
+            packet: packet.clone(),
+            state: L4InterceptState::Parked {
+                backup: Box::new(packet),
+            },
+            deadline,
+            parked_seq,
+            parked_at,
+        };
+        self.entries.insert(id, ParkedEntry { handle, parked });
+    }
+
+    /// Take `id` out of the table (for a verdict), if it is still parked.
+    fn remove(&mut self, id: ParkedId) -> Option<ParkedEntry> {
+        self.entries.remove(&id)
+    }
+
+    /// How many packets are parked.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The ids of every parked packet (unordered).
+    fn ids(&self) -> Vec<ParkedId> {
+        self.entries.keys().copied().collect()
+    }
+
+    /// A snapshot (clones) of every parked packet (unordered), for the
+    /// [`InterceptHandle::parked`] API.
+    fn parked(&self) -> Vec<ParkedPacket> {
+        self.entries.values().map(|e| e.parked.clone()).collect()
+    }
+
+    /// The ids of every live packet whose deadline is at or before `now`, read by
+    /// reference: the reader thread asks this every poll, so it must not clone a
+    /// table of payloads the way [`parked`](Self::parked) does. Removes nothing.
+    fn due(&self, now: SystemTime) -> Vec<ParkedId> {
+        self.entries
+            .values()
+            .filter(|e| e.parked.state.is_live() && e.parked.deadline <= now)
+            .map(|e| e.parked.id)
+            .collect()
+    }
+}
 
 /// A verdict a command submits for a parked packet (M5 Task 12 routes through
 /// here). Applied on the reader thread so the backend stays single-owner.
@@ -259,9 +340,7 @@ impl InterceptHandle {
         self.parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .map(|e| e.parked.clone())
-            .collect()
+            .parked()
     }
 
     /// Submit a verdict for the parked packet `id` (M5 Task 12's `forward`/`drop`).
@@ -330,7 +409,7 @@ pub fn start_intercept(
     };
     let permit = guard.check(L4Action::Intercept, &bind_target)?;
 
-    let parked: Arc<Mutex<ParkedTable>> = Arc::new(Mutex::new(ParkedTable::new()));
+    let parked: Arc<Mutex<ParkedTable>> = Arc::new(Mutex::new(ParkedTable::default()));
     let stop = Arc::new(AtomicBool::new(false));
     let (verdict_tx, verdict_rx) = mpsc::channel::<VerdictRequest>();
     let (open_tx, open_rx) = mpsc::channel::<Result<L4FlowId, L4Error>>();
@@ -454,7 +533,7 @@ fn apply_submitted(
     let entry = parked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .remove(&req.id);
+        .remove(req.id);
     if let Some(entry) = entry {
         let _ = queue.verdict(entry.handle, wire_of(req.verdict, req.mutated));
     }
@@ -463,20 +542,15 @@ fn apply_submitted(
 /// Forward or drop every parked packet whose deadline has passed, per `on_timeout`
 /// (default Forward — fail open). Removes them from the table.
 fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_timeout: Verdict) {
-    let now = SystemTime::now();
-    let due: Vec<ParkedId> = {
-        let table = parked.lock().unwrap_or_else(PoisonError::into_inner);
-        table
-            .iter()
-            .filter(|(_, e)| e.parked.state.is_live() && e.parked.deadline <= now)
-            .map(|(id, _)| *id)
-            .collect()
-    };
+    let due = parked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .due(SystemTime::now());
     for id in due {
         let entry = parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
+            .remove(id);
         if let Some(entry) = entry {
             let _ = queue.verdict(entry.handle, wire_of(on_timeout, None));
         }
@@ -486,17 +560,12 @@ fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_ti
 /// Fail-open forward every packet still parked (used on session shutdown so a
 /// held packet is never black-holed).
 fn drain_forward(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>) {
-    let ids: Vec<ParkedId> = parked
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .keys()
-        .copied()
-        .collect();
+    let ids = parked.lock().unwrap_or_else(PoisonError::into_inner).ids();
     for id in ids {
         let entry = parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
+            .remove(id);
         if let Some(entry) = entry {
             let _ = queue.verdict(entry.handle, WireVerdict::Forward(None));
         }
@@ -504,8 +573,10 @@ fn drain_forward(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>) {
 }
 
 /// Decode a queued packet and, if the **same** guard authorizes it for `Intercept`,
-/// park it; otherwise auto-forward it untouched (AC14). Overflow past `max_parked`
-/// fails open per `on_overflow`.
+/// park it; otherwise auto-forward it untouched (AC14). The core's own traffic is
+/// forwarded untouched first of all — never parked, never recorded, never listed
+/// (spec §2.1, L4PAR-AC34). Overflow past `max_parked` fails open per
+/// `on_overflow`.
 #[allow(clippy::too_many_arguments)]
 fn process_packet(
     qp: QueuedPacket,
@@ -516,12 +587,21 @@ fn process_packet(
     params: &InterceptParams,
     flow_id: L4FlowId,
 ) {
-    // A packet that carries no IP target cannot be in a CIDR-scoped interception —
-    // forward it untouched rather than park it.
-    let Some(target) = ip_target(&qp.bytes, &params.interface, params.direction) else {
+    // Decoded once, with the L3-only parse an NFQUEUE payload needs. A packet
+    // that carries no IP layer cannot be in a CIDR-scoped interception — forward
+    // it untouched rather than park it.
+    let Some(endpoints) = ip_endpoints(&qp.bytes) else {
         let _ = queue.verdict(qp.handle, WireVerdict::Forward(None));
         return;
     };
+    // The self-exclusion choke point: a packet to or from one of the core's own
+    // listener ports on a loopback interface or address goes through untouched
+    // before anything else looks at it.
+    if !guard.admit_endpoints(&params.interface, &endpoints) {
+        let _ = queue.verdict(qp.handle, WireVerdict::Forward(None));
+        return;
+    }
+    let target = target_of(&endpoints, &params.interface, params.direction);
     // The second scope boundary (the `nft` rule is the first): only in-scope packets
     // park. An out-of-scope packet is auto-forwarded untouched, never parked (AC14).
     // A dropped momentary `Intercept` permit keeps the guard's in-flight gauge even.
@@ -546,26 +626,15 @@ fn process_packet(
         bytes: qp.bytes.clone(),
         injected: false,
     };
-    let id = ParkedId::new();
-    let parked_pkt = ParkedPacket {
-        id,
-        flow: flow_id,
-        packet: packet.clone(),
-        state: L4InterceptState::Parked {
-            backup: Box::new(packet.clone()),
-        },
-        deadline: now + params.config.verdict_timeout,
-    };
-    parked
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(
-            id,
-            ParkedEntry {
-                handle: qp.handle,
-                parked: parked_pkt,
-            },
-        );
+    // Park under the table's lock, which stamps the arrival sequence (AC37).
+    parked.lock().unwrap_or_else(PoisonError::into_inner).park(
+        qp.handle,
+        ParkedId::new(),
+        flow_id,
+        packet.clone(),
+        now,
+        now + params.config.verdict_timeout,
+    );
     // Record the parked packet in the interception flow (observed, not injected).
     store.append_packet(flow_id, packet);
 }
@@ -578,10 +647,34 @@ fn wire_of(verdict: Verdict, mutated: Option<Vec<u8>>) -> WireVerdict {
     }
 }
 
+/// Decode an NFQUEUE payload (an IP packet — no L2 header) once, to its
+/// endpoints: addresses, ports (TCP/UDP) and transport. `None` for a buffer that
+/// carries no IP layer (such a packet is out of a CIDR-scoped interception by
+/// definition); `src` and `dst` are always `Some` otherwise. The one parse behind
+/// [`process_packet`]'s self-exclusion and scope checks and behind [`ip_target`].
+fn ip_endpoints(payload: &[u8]) -> Option<PacketEndpoints> {
+    SlicedPacket::from_ip(payload)
+        .ok()
+        .filter(|p| matches!(p.net, Some(NetSlice::Ipv4(_) | NetSlice::Ipv6(_))))
+        .map(|p| endpoints_of(&p))
+}
+
+/// The `L4Target` the guard checks for a payload whose decoded endpoints are
+/// `ep`: destination address, destination port (TCP/UDP), and protocol (`Raw`
+/// when the transport is unknown).
+fn target_of(ep: &PacketEndpoints, interface: &str, direction: L4Direction) -> L4Target {
+    L4Target {
+        interface: interface.to_string(),
+        direction,
+        dst: ep.dst,
+        dst_port: ep.dst_port,
+        proto: ep.proto.unwrap_or(L4Proto::Raw),
+    }
+}
+
 /// Resolve an NFQUEUE payload (an IP packet — no L2 header) to the `L4Target` the
-/// guard checks: destination address, destination port (TCP/UDP), and protocol.
-/// `None` for a buffer that carries no IP layer (such a packet is out of a
-/// CIDR-scoped interception by definition).
+/// guard checks; `None` for a buffer that carries no IP layer. A thin wrapper over
+/// [`ip_endpoints`] + [`target_of`], the parse [`process_packet`] uses.
 ///
 /// `pub(crate)` so the command layer can re-resolve a *mutated* packet's target and
 /// re-check it against the guard before reinjecting it (M5 Task 12 forward path).
@@ -590,26 +683,40 @@ pub(crate) fn ip_target(
     interface: &str,
     direction: L4Direction,
 ) -> Option<L4Target> {
-    let parsed = SlicedPacket::from_ip(payload).ok()?;
-    let dst = match parsed.net? {
-        NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().destination_addr()),
-        NetSlice::Ipv6(ip) => IpAddr::V6(ip.header().destination_addr()),
-        NetSlice::Arp(_) => return None,
-    };
-    let (dst_port, proto) = match parsed.transport {
-        Some(TransportSlice::Tcp(t)) => (Some(t.destination_port()), L4Proto::Tcp),
-        Some(TransportSlice::Udp(u)) => (Some(u.destination_port()), L4Proto::Udp),
-        Some(TransportSlice::Icmpv4(_)) => (None, L4Proto::Icmp),
-        Some(TransportSlice::Icmpv6(_)) => (None, L4Proto::IcmpV6),
-        _ => (None, L4Proto::Raw),
-    };
-    Some(L4Target {
-        interface: interface.to_string(),
-        direction,
-        dst: Some(dst),
-        dst_port,
-        proto,
-    })
+    Some(target_of(&ip_endpoints(payload)?, interface, direction))
+}
+
+// Test-only seams. They sit after every production item on purpose: the AC21
+// tripwire in `tests/hard_gates.rs` audits the text before the first test-only
+// `cfg` attribute as the production code.
+#[cfg(test)]
+impl ParkedId {
+    /// A deterministic id for tests that need to control uuid string order.
+    #[must_use]
+    pub fn from_u128(v: u128) -> Self {
+        Self(Uuid::from_u128(v))
+    }
+}
+
+#[cfg(test)]
+impl InterceptHandle {
+    /// Park `packet` under a caller-chosen `id` with no backend packet behind it
+    /// (the kernel handle is a sentinel), through the same [`ParkedTable::park`]
+    /// path the reader uses, so the command layer can prove arrival ordering with
+    /// deterministic ids. A verdict on it is a no-op at the mock queue.
+    pub(crate) fn park_for_test(&self, id: ParkedId, packet: L4Packet, deadline: SystemTime) {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .park(
+                u32::MAX,
+                id,
+                self.flow_id,
+                packet,
+                SystemTime::now(),
+                deadline,
+            );
+    }
 }
 
 #[cfg(test)]
@@ -620,7 +727,7 @@ mod tests {
     use crate::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
     use crate::flow::InMemoryL4FlowStore;
     use crate::types::{IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, PortRange, RateCap};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::AtomicU32;
 
     const IFACE: &str = "eth0";
@@ -660,14 +767,21 @@ mod tests {
     /// A crafted IPv4/UDP packet (starting at L3, exactly as NFQUEUE delivers) to
     /// `dst:9`.
     fn ip_udp(dst: &str) -> Vec<u8> {
+        ip_udp_to(dst, 9)
+    }
+
+    /// A crafted IPv4/UDP packet 127.0.0.1 → `dst:dst_port` (L3, as NFQUEUE
+    /// delivers).
+    fn ip_udp_to(dst: &str, dst_port: u16) -> Vec<u8> {
         PacketSpec {
             layers: vec![
                 Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::LOCALHOST),
                     dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
                     ..Ipv4Spec::default()
                 }),
                 Layer::Udp(UdpSpec {
-                    dst_port: Some(9),
+                    dst_port: Some(dst_port),
                     ..UdpSpec::default()
                 }),
                 Layer::Raw(b"probe".to_vec()),
@@ -842,6 +956,194 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    /// Security fix (spec §2.1, L4PAR-AC34): the in-path reader forwards the
+    /// core's own traffic untouched **before** parking — a queued packet to the
+    /// bus port on a loopback address is verdicted `Forward`, never parked, never
+    /// appended to the intercept flow (so never listed), while the in-scope packet
+    /// behind it parks and is recorded as usual. Hermetic (mock backend).
+    #[test]
+    fn self_port_packet_is_forwarded_never_parked() {
+        let guard = guard_with(vec![intercept_entry(("127.0.0.1", 32))]);
+        guard.set_self_ports([27431]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (backend, verdicts, drained) = MockBackend::with(vec![
+            ip_udp_to("127.0.0.1", 27431), // the bus: the core's own traffic
+            ip_udp_to("127.0.0.1", 9),     // in scope
+        ]);
+
+        let handle = start_intercept(
+            guard,
+            store.clone(),
+            backend,
+            params(intercept_config(Duration::from_secs(10), Verdict::Forward)),
+        )
+        .expect("authorized bind starts");
+
+        wait_for(&drained);
+        wait_until(
+            || !verdicts.lock().unwrap().is_empty(),
+            "the forward verdict for the self-port packet",
+        );
+        assert_eq!(
+            verdicts.lock().unwrap().as_slice(),
+            &[(0, VKind::Forward)],
+            "the self-port packet is forwarded untouched, nothing else is verdicted"
+        );
+        wait_until(|| handle.parked().len() == 1, "the in-scope packet to park");
+        let parked = handle.parked();
+        assert_eq!(
+            PacketSpec::endpoints(&parked[0].packet.bytes).dst_port,
+            Some(9),
+            "only the in-scope packet is parked"
+        );
+        let flow = store.get(handle.flow_id()).expect("the intercept flow");
+        assert_eq!(
+            flow.packets.len(),
+            1,
+            "the self-port packet is never appended to the intercept flow"
+        );
+        assert_eq!(
+            PacketSpec::endpoints(&flow.packets[0].bytes).dst_port,
+            Some(9)
+        );
+
+        handle.stop();
+    }
+
+    /// `ip_endpoints` is the one L3-only parse behind `process_packet` (the
+    /// self-exclusion choke point, then the scope check) and `ip_target`: for an
+    /// IP payload it agrees with `PacketSpec::endpoints`, `ip_target` is derived
+    /// from it, and a buffer with no IP layer is `None` for both.
+    #[test]
+    fn ip_endpoints_is_the_one_parse_behind_ip_target() {
+        let bytes = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(10, 0, 0, 5)),
+                    dst: Some(Ipv4Addr::new(10, 0, 0, 9)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(40000),
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+
+        let ep = ip_endpoints(&bytes).expect("an IP payload decodes");
+        assert_eq!(ep, PacketSpec::endpoints(&bytes));
+        assert_eq!(ep.proto, Some(L4Proto::Udp));
+        assert_eq!(ep.src, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert_eq!(ep.dst, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+        assert_eq!(ep.src_port, Some(40000));
+        assert_eq!(ep.dst_port, Some(9));
+
+        let target = ip_target(&bytes, IFACE, L4Direction::Outbound).expect("an IP target");
+        assert_eq!(target.interface, IFACE);
+        assert_eq!(target.direction, L4Direction::Outbound);
+        assert_eq!(target.dst, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+        assert_eq!(target.dst_port, Some(9));
+        assert_eq!(target.proto, L4Proto::Udp);
+
+        for junk in [&[][..], &[0xde, 0xad][..]] {
+            assert!(ip_endpoints(junk).is_none(), "{junk:?} has no IP layer");
+            assert!(ip_target(junk, IFACE, L4Direction::Outbound).is_none());
+        }
+    }
+
+    /// `ParkedTable::due(now)` names exactly the live packets whose deadline is at
+    /// or before `now`, by reference (no packet clone), leaving the table intact;
+    /// a packet whose deadline is `now` exactly is due, one a step later is not.
+    #[test]
+    fn parked_table_due_names_only_the_expired_packets() {
+        let mut t = ParkedTable::default();
+        let now = SystemTime::now();
+        let flow = L4FlowId::new();
+        let packet = || L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: now,
+            decoded: PacketSpec::summarize(b"x"),
+            bytes: b"x".to_vec(),
+            injected: false,
+        };
+        let (past, exact, future) = (ParkedId::new(), ParkedId::new(), ParkedId::new());
+        t.park(0, past, flow, packet(), now, now - Duration::from_secs(1));
+        t.park(1, exact, flow, packet(), now, now);
+        t.park(
+            2,
+            future,
+            flow,
+            packet(),
+            now,
+            now + Duration::from_secs(60),
+        );
+
+        let by_uuid = |ids: &mut Vec<ParkedId>| ids.sort_by_key(|id| id.0);
+        let mut due = t.due(now);
+        by_uuid(&mut due);
+        let mut want = vec![past, exact];
+        by_uuid(&mut want);
+        assert_eq!(
+            due, want,
+            "the past and the exact deadline are due, the future is not"
+        );
+        assert_eq!(t.len(), 3, "due() only names ids; it removes nothing");
+
+        assert!(
+            t.due(now - Duration::from_secs(2)).is_empty(),
+            "nothing is due before the earliest deadline"
+        );
+        let mut all = t.due(now + Duration::from_secs(60));
+        by_uuid(&mut all);
+        let mut everyone = vec![past, exact, future];
+        by_uuid(&mut everyone);
+        assert_eq!(all, everyone);
+    }
+
+    /// Spec §4 / L4PAR-AC37: the arrival sequence is **process-wide**, so two
+    /// sessions' parked packets interleave in true arrival order: A1, A2 parked
+    /// in one table and then B1 in another read strictly increasing `parked_seq`.
+    #[test]
+    fn parked_seq_is_process_wide_and_monotonic() {
+        let mut a = ParkedTable::default();
+        let mut b = ParkedTable::default();
+        let now = SystemTime::now();
+        let flow = L4FlowId::new();
+        let packet = || L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: now,
+            decoded: PacketSpec::summarize(b"x"),
+            bytes: b"x".to_vec(),
+            injected: false,
+        };
+        let (a1, a2, b1) = (ParkedId::new(), ParkedId::new(), ParkedId::new());
+        a.park(0, a1, flow, packet(), now, now);
+        a.park(1, a2, flow, packet(), now, now);
+        b.park(0, b1, flow, packet(), now, now);
+        let seq = |t: &ParkedTable, id: ParkedId| {
+            t.parked()
+                .into_iter()
+                .find(|p| p.id == id)
+                .expect("parked")
+                .parked_seq
+        };
+        assert!(seq(&a, a1) < seq(&a, a2), "A1 before A2");
+        assert!(
+            seq(&a, a2) < seq(&b, b1),
+            "B1 (parked last, in another table) sequences after A2"
+        );
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a.ids().len(), 2);
+        assert!(a.remove(a1).is_some());
+        assert!(a.remove(a1).is_none(), "remove is idempotent");
+        assert_eq!(a.ids(), vec![a2]);
     }
 
     /// Pinned (plan Task 11, AC15): a parked packet past its deadline gets

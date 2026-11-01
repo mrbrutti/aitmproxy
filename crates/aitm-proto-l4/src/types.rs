@@ -52,6 +52,23 @@ pub enum L4Proto {
     Raw,
 }
 
+impl L4Proto {
+    /// The name `l4.flow.get` puts on the wire for a packet's transport: the
+    /// same names [`PacketSpec::summarize`](crate::craft::PacketSpec::summarize)
+    /// uses, so a flow row and its packet detail agree.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            L4Proto::Tcp => "TCP",
+            L4Proto::Udp => "UDP",
+            L4Proto::Icmp => "ICMP",
+            L4Proto::IcmpV6 => "ICMPv6",
+            L4Proto::Other(_) => "other",
+            L4Proto::Raw => "raw",
+        }
+    }
+}
+
 /// A deny-by-default scope entry. Nothing captures, injects, or intercepts until
 /// an entry exists and matches; Capture / Inject / Intercept are distinct
 /// capabilities on the entry.
@@ -143,4 +160,21 @@ pub struct IpCidr {
 pub struct RateCap {
     pub pps: u32,
     pub burst: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::L4Proto;
+
+    /// A15 (L4PAR-AC1): the names `l4.flow.get` puts on the wire for the four
+    /// transports `PacketSpec::endpoints` decodes, the same as `summarize`'s.
+    #[test]
+    fn wire_names() {
+        assert_eq!(
+            [L4Proto::Tcp, L4Proto::Udp, L4Proto::Icmp, L4Proto::IcmpV6].map(L4Proto::wire_name),
+            ["TCP", "UDP", "ICMP", "ICMPv6"]
+        );
+        assert_eq!(L4Proto::Other(47).wire_name(), "other");
+        assert_eq!(L4Proto::Raw.wire_name(), "raw");
+    }
 }

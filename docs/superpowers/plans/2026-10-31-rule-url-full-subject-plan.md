@@ -126,7 +126,7 @@ report is in.
 
 - **Satisfies:** AC11 (Swift side), AC7 and AC6 as the preview sees them
 - **Depends on:** Task 1 (the case table)
-- **Files:** `apps/mac/Sources/AitmproxyKit/BreakpointRules.swift` (modify: `matches(_:)` and `wildcardMatches(pattern:text:)` and their doc comments only; `arguments`, `validationError` and the types stay as they are), `apps/mac/Tests/AitmproxyKitTests/BreakpointRulesTests.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/BreakpointRuleCasesTests.swift` (create)
+- **Files:** `apps/mac/Sources/AitmproxyKit/BreakpointRules.swift` (modify: `matches(_:)` and `wildcardMatches(pattern:text:)` and their doc comments only; `validationError` and the types stay as they are; `arguments`' wildcard arm changed at the merge with #202, see the Review log), `apps/mac/Tests/AitmproxyKitTests/BreakpointRulesTests.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/BreakpointRuleCasesTests.swift` (create)
 - **Change:**
   - `matches(_ row: FlowRow)`: subjects are `row.url` and
     `row.path + (row.query.map { "?" + $0 } ?? "")`; the rule matches when
@@ -239,6 +239,12 @@ Kept by the orchestrating session during stage 6. One row per finding.
 | Fix task B | tester | Minor | the two `rules` param texts had no pin | fixed by the tester (`rules_param_text_names_every_rejection_cause` in `aitm-plugins` and `aitm-plugin-wsctl`) |
 | Fix task B | spec | Minor | `Cargo.lock` was a branch-only file no task declared | fixed in the plan (Task 1 Files line) |
 | Fix task B | spec | Minor | the caps' documentation home had no spec anchor and no pin | fixed in the spec (Bounded input names the `rules` param text and SKILL.md) and by the tester's pins |
+| merge d593fd4a | security | — | no findings: the resolution is confined to the two Kit files; an as-typed wildcard reaches the core's escaping and caps instead of an app-built regex | — |
+| merge d593fd4a | quality | Minor | `apps/mac/docs/FIXLOG.md` still described #202's `{regex}` wire form | fixed in this docs PR (dated supersession line) |
+| merge d593fd4a | quality | Minor | two preview-matcher assertions sit in `noticeAndWireForm` | accepted (autonomous mode, 2026-10-31): cosmetic; the metacharacter cases are also in the case table |
+| merge d593fd4a | spec | Important | `arguments` was reconciled with #202 but the spec's Non-goals/Constraints and this plan's Task 3 said the wire form was untouched | fixed in this docs PR (spec Non-goals and Constraints notes, Task 3 Files line) |
+| merge d593fd4a | spec | Minor | FIXLOG stale (same as quality's) | fixed in this docs PR |
+| merge d593fd4a | spec | Minor | no post-merge run of the app's own live self-test (`tools/selftest-live.sh`) on the merged build; the Python live proof and the Kit tests cover the wire form | routed to the improve-loop session with the preview live-check follow-up (the orchestrator) |
 
 ## Shipped
 

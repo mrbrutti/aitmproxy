@@ -208,6 +208,75 @@ fn unprivileged_wire_verbs_unavailable_pure_verbs_work() {
         );
     }
 
+    // L4PAR-AC3 / AC4 / AC9 (plan A4): the two status verbs are NOT `L4Gated`. They
+    // answer `Ok` with the availability object whose `reason` is the exact text the
+    // gated verbs return, and a `code` derived from the capability class + OS.
+    let expect_status = |name: &str, code: &str, reason: &str, payload_key: &str| {
+        let got = reg
+            .command(name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+            .invoke(Params::default(), &host)
+            .unwrap_or_else(|e| panic!("{name} must answer Ok when unprivileged, got {e:?}"));
+        let mut want = BTreeMap::new();
+        want.insert("available".to_string(), Value::Bool(false));
+        want.insert("code".to_string(), Value::Str(code.into()));
+        want.insert("reason".to_string(), Value::Str(reason.into()));
+        want.insert(payload_key.to_string(), Value::Array(vec![]));
+        assert_eq!(got, Value::Object(want), "{name} availability object");
+    };
+    // Capture/inject: the platform supports it (macOS / Linux), the process lacks it.
+    let capture_code = if cfg!(any(target_os = "macos", target_os = "linux")) {
+        "needs_privilege"
+    } else {
+        "unsupported_platform"
+    };
+    expect_status(
+        "l4.capture.status",
+        capture_code,
+        "missing CAP_NET_RAW / /dev/bpf access",
+        "captures",
+    );
+    // In-path: Linux-only, so `needs_privilege` there and `unsupported_platform`
+    // everywhere else (macOS included).
+    let intercept_code = if cfg!(target_os = "linux") {
+        "needs_privilege"
+    } else {
+        "unsupported_platform"
+    };
+    expect_status(
+        "l4.intercept.status",
+        intercept_code,
+        "missing CAP_NET_ADMIN",
+        "sessions",
+    );
+
+    // Tester (stage 5), L4PAR-AC3/AC4 unit half: the gated verbs refuse with
+    // exactly `L4 unavailable: ` + the `reason` the status verb reports, so a UI
+    // can show the status reason and know it is the text the button would return.
+    for (name, params, reason) in [
+        (
+            "l4.capture.start",
+            one("interface", Value::Str("lo0".into())),
+            "missing CAP_NET_RAW / /dev/bpf access",
+        ),
+        (
+            "l4.intercept.start",
+            one("interface", Value::Str("lo0".into())),
+            "missing CAP_NET_ADMIN",
+        ),
+    ] {
+        let err = reg
+            .command(name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+            .invoke(params, &host)
+            .expect_err(&format!("{name} must fail closed without privilege"));
+        assert_eq!(
+            err.to_string(),
+            format!("L4 unavailable: {reason}"),
+            "{name}"
+        );
+    }
+
     // Every pure / read / scope verb still works without privilege.
     reg.command("l4.interfaces")
         .unwrap()

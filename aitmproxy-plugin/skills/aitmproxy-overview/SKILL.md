@@ -1,6 +1,6 @@
 ---
 name: aitmproxy-overview
-description: Drive aitmproxy — the intercepting HTTP/WebSocket proxy for AUTHORIZED security testing — end to end over MCP. Use when the user wants to inspect captured web traffic, intercept and mutate live requests or responses, replay or craft requests, or build reproducible PoCs and record findings against an engagement they are authorized to test. Explains the capture → intercept → replay → findings workflow, names the key MCP tools per stage, the scope gating and agent policy, and how output renders across hosts.
+description: Drive aitmproxy — the intercepting HTTP/WebSocket proxy for AUTHORIZED security testing — end to end over MCP. Use when the user wants to inspect captured web traffic, intercept and mutate live requests or responses, replay or craft requests, or build reproducible PoCs and record findings against an engagement they are authorized to test. Explains the capture → intercept → replay → findings workflow, names the key MCP tools per stage, the scope gating and agent policy, the raw L4 (TCP/UDP) packet family and its status/scope/gate rules when the core enables it, and how output renders across hosts.
 ---
 
 # aitmproxy overview
@@ -73,6 +73,101 @@ show new captures.
 `scan.discover --target <url>` crawls an in-scope target through the embedded
 browser and returns the reachable endpoints and the injection points seen in
 captured requests. It is **discovery only** — it never fuzzes or injects.
+
+## L4 (raw TCP/UDP)
+
+A core started with `l4.enabled: true` in `config.yaml` also registers the
+`l4.*` family: raw packet capture, crafting and injection, send/receive, and
+(Linux only) in-path packet interception. Without that line the verbs are not in
+`tools/list`; only the three bundled Rhai scripts `l4.recon`, `l4.tcp_probe` and
+`l4.udp_probe` are, and they need the module to do anything. The family is
+deny-by-default and gated separately from the HTTP tools. What an agent must know:
+
+**Ask the status verbs first.** `l4.capture.status` and `l4.intercept.status`
+always answer (never `L4 unavailable`) with `{available, code, reason,
+captures|sessions}`:
+
+- `available` (bool): the capability works on this core right now.
+- `code`: `available`, or one of `needs_privilege` (the platform supports it but
+  this process lacks the privilege: read+write `/dev/bpf*` on macOS, `CAP_NET_RAW`
+  on Linux, `CAP_NET_ADMIN` for intercept), `unsupported_platform` (no backend on
+  this OS: in-path intercept on macOS and on everything but Linux; capture
+  outside macOS and Linux) or `not_configured` (supported and privileged, but the
+  config has no `l4.intercept` block).
+- `reason`: the exact text the gated verbs would return after `L4 unavailable: `;
+  null when available.
+- `captures` (running capture flow ids) or `sessions` (intercept sessions with
+  their parked counts); `[]` when unavailable.
+
+When `available` is false, report the `code` and `reason` to the user and stop;
+`l4.capture.start` / `l4.intercept.start` return that same reason as an error.
+Re-read the status verbs instead of remembering them: privilege can change while
+the core runs.
+
+**Scope and the agent gates.** L4 scope is separate from HTTP scope.
+`l4.scope.list` shows the entries, each with `source: config | runtime`; scope is
+normally declared in `config.yaml`. Runtime `l4.scope.add` is refused for every
+caller (`runtime L4 scope widening is disabled; declare scope in the l4.scope
+config …`) unless the operator opened the Widen gate with
+`l4.agent.set {capability: widen, allowed: true}`. The operator-confirmed
+`l4.scope.add` (a confirm prompt, no Widen gate for a confirmed operator or CLI
+call, still refused to an agent) is designed but not shipped yet (unit (a') of
+the L4 parity fixes); until it lands, ask the operator to declare the entry in
+config or to open the Widen gate. Narrowing with `l4.scope.remove` is never
+Widen-gated (agent policy still applies). Four per-capability gates govern the
+agent path: `inject`, `capture`, `intercept` and `widen`. `l4.agent.status`
+reads them; only the operator can flip them with `l4.agent.set`. The agent can
+never open its own gates; respect a closed one.
+
+**Capture and read packets.** `l4.capture.start {interface, direction?}`
+(Capture gate) returns a capture flow id; `l4.capture.stop {id}` ends it.
+`l4.flow.list` lists every L4 flow id, oldest first. `l4.flow.get {id, offset?,
+limit?}` returns the flow header (`kind`, `started_at`, `proto`, `src`, `dst`,
+`src_port`, `dst_port`, `packet_count`, the total) and a window of packets.
+`limit` defaults to 256 and is clamped to 4096; pass `limit: 0` when listing
+(header only, `packets: []`) and fetch a window only to inspect one flow. Each
+packet carries `dir`, `length`, `injected`, `layers`, `timestamp` (epoch ms),
+`proto`, `src`, `dst`, `src_port`, `dst_port` and, when you may see them,
+`bytes` (the on-wire frame as padded base64). The bytes rule is per packet: the
+operator and the CLI always get `bytes`; an agent gets `bytes` for a captured
+packet (`injected: false`) only while its Capture gate is open, and for an
+injected packet (`injected: true`) only while its Inject gate is open. A packet
+you may not read keeps every other field and simply has no `bytes` key; a
+missing key is not an empty packet. One reply carries at most 4 MiB of raw
+bytes; when that cuts the window short the reply has `truncated: true` and
+`next_offset`. To read a whole flow keep advancing `offset` until it reaches
+`packet_count`; `truncated`/`next_offset` only mark a window the byte budget
+cut short. The core excludes its own listener ports (proxy, bus, web UI, MCP)
+on loopback from every L4 recorder, so operator bus traffic never appears in a
+capture.
+
+**Craft, inject, send/recv.** `l4.interfaces` lists the capture-capable
+interfaces. `l4.craft {spec}` is pure: it builds bytes and a summary with no
+privilege and no wire. `l4.inject {spec, dst, interface, port?, count?}` (Inject
+gate; scope, dangerous-destination denylist and rate caps apply) and
+`l4.send_recv {spec, dst, interface, port?, timeout_ms?, expect?}` (the agent's
+**Inject gate only**; the guard additionally needs an Inject and a Capture
+*scope* entry for the interface, scope, not gates; bounded by `timeout_ms`;
+returns `flow_id` and an `outcome` classification, not the payload) are
+**active egress**. Read the reply with `l4.flow.get {id: <flow_id>}`; the reply
+is a captured packet, so an agent sees its `bytes` only while its Capture gate
+is open. Apply the same authorization discipline as for `request.send`.
+
+**In-path intercept (Linux NFQUEUE only).** `l4.intercept.*` parks live packets
+in a kernel queue for a verdict. It exists only on Linux with `CAP_NET_ADMIN`
+and an `l4.intercept` config block; on macOS `l4.intercept.status` reports
+`unsupported_platform` and nothing in this paragraph applies.
+`l4.intercept.start {interface, direction?, queue_num?}` (Intercept gate, needs
+an `Intercept` scope entry) returns a session flow id; `l4.intercept.stop {flow}`
+ends the session and forwards whatever is still parked. `l4.intercept.list
+{flow?}` returns the parked packets in arrival order, oldest first, each
+`{id, flow, state: parked | mutated, dir, length, layers, parked_at}`. The
+verdict verbs `l4.intercept.forward {id}`, `l4.intercept.drop {id}`,
+`l4.intercept.mutate {id, spec | bytes}` and `l4.intercept.revert {id}` take the
+**parked id** (the `id` of an `l4.intercept.list` entry), never the session's
+flow id. Work the oldest first: a parked packet is live traffic waiting on you.
+Parked packets are captured packets, so an agent sees their `bytes` in
+`l4.flow.get` only with its Capture gate open.
 
 ## How output renders
 
