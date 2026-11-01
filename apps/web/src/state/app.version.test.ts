@@ -2,25 +2,20 @@
 // (it used to say 0.3.0 while the binary was 0.5.0).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMockBus } from '~/bus/mock';
 import type { BusClient } from '~/bus/types';
 import { createAppStore } from './app';
-
-/** What the mock bus's `proxy.status` reports: synthetic on purpose, so it can't pass for a real build. */
-const MOCK_VERSION = '0.0.0-fixtures';
+import { memoryBus, TEST_VERSION } from './bridgeBus.testkit';
 
 /**
- * The mock bus with `proxy.status` rewritten, standing in for cores that report another version or
- * none. It pushes nothing (like the /bus bridge), so on a real address the poll loop is the live source.
+ * The in-memory bus with `proxy.status` rewritten, standing in for cores that report another version
+ * or none. It pushes nothing (like the /bus bridge), so the poll loop is the live source.
  */
-function withStatus(rewrite: (status: Record<string, unknown>) => Record<string, unknown>, address = 'fixtures'): BusClient {
-  const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
+function withStatus(rewrite: (status: Record<string, unknown>) => Record<string, unknown>): BusClient {
+  const mem = memoryBus();
   return {
-    ...mock,
-    address,
-    onNotification: () => () => {},
+    ...mem,
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
-      const result = await mock.call<T>(tool, args);
+      const result = await mem.call<T>(tool, args);
       return (tool === 'proxy.status' ? rewrite(result as Record<string, unknown>) : result) as T;
     },
   };
@@ -49,12 +44,12 @@ describe('app store — core version', () => {
 
     await tick(200); // bootstrap: tools/list, then proxy.status
 
-    expect(app.proxy.version).toBe(MOCK_VERSION);
+    expect(app.proxy.version).toBe(TEST_VERSION);
   });
 
   it('follows a changed version on the status poll (a core restarted on a new binary)', async () => {
     let reported = '1.2.3';
-    const app = start(withStatus((s) => ({ ...s, version: reported }), '127.0.0.1:8082'));
+    const app = start(withStatus((s) => ({ ...s, version: reported })));
     await tick(200);
     expect(app.proxy.version).toBe('1.2.3');
 
@@ -71,7 +66,7 @@ describe('app store — core version', () => {
       withStatus((s) => {
         reads++;
         return { ...s, version: reported };
-      }, '127.0.0.1:8082'), // a real address, so proxy.status is also read by the poll loop, not just at bootstrap
+      }),
     );
     await tick(200);
     expect(app.proxy.version).toBe('1.2.3');

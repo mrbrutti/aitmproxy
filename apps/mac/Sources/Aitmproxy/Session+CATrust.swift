@@ -132,7 +132,7 @@ extension Session {
     /// the OS store has answered and says the CA is not trusted, and neither `Store.defaults`
     /// key (shared with the system-proxy step) says it was shown or suppressed.
     var setupSheetDue: Bool {
-        guard !Store.usesFixtures, embeddedCoreActive, coreHealth.connection?.status == .ready,
+        guard embeddedCoreActive, coreHealth.connection?.status == .ready,
               caTrustControlLive, let facts = caTrust, !facts.trusted else { return false }
         let defaults = Store.defaults
         return !defaults.bool(forKey: Self.setupSheetShownKey) && !defaults.bool(forKey: Self.setupSheetSuppressedKey)

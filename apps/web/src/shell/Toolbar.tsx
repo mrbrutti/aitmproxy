@@ -11,6 +11,7 @@ import { Popover } from '~/components/Popover';
 import { StatusDot } from '~/components/StatusDot';
 import { rectAnchor, type AnchorRect } from '~/components/floating';
 import { pluralize } from '~/lib/format';
+import { caPillWord } from '~/state/caTrust';
 import css from './Toolbar.module.css';
 
 const POLICY_LABEL: Record<AgentPolicy, string> = { all: 'Allow all tools', readonly: 'Read-only', paused: 'Paused' };
@@ -107,6 +108,7 @@ export const Toolbar: Component = () => {
             <b class={css.mono}>{app.proxy.address}</b>
           </Show>
           <Show when={app.proxy.protocol}> · {app.proxy.protocol}</Show>
+          <Show when={caPillWord(app.ca, app.caInstalling)}>{(word) => <> {word()}</>}</Show>
           <Show when={app.proxy.armed}> · intercept armed</Show>
         </span>
       </div>

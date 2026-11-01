@@ -6,6 +6,7 @@ import { AppProvider } from '~/state/context';
 import type { AppStore, FlowEntry } from '~/state/app';
 import type { ToolDef } from '~/bus/types';
 import type { FlowSummary } from '~/model/flow';
+import { MALFORMED_CONFIRM_MESSAGE, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
 import { CommandPalette } from './CommandPalette';
 
 const tool = (name: string, description: string, props: Record<string, unknown> = {}, required: string[] = [], mutates = true, confirm: string | null = null): ToolDef => ({
@@ -20,8 +21,12 @@ const TOOLS: ToolDef[] = [
   tool('flow.list', 'List captured flow ids.', {}, [], false),
   tool('flow.replay', 'Send a captured request again.', { id: { type: 'string', 'x-aitm': 'FlowId' } }, ['id']),
   tool('flow.kill', 'Abort a flow.', { id: { type: 'string' }, mode: { type: 'string', enum: ['reset', '429', '503'] } }, ['id']),
-  tool('ca.install', 'Install the root CA.', { store: { type: 'string' } }, [], true, 'This changes the system trust store.'),
+  tool('ca.install', 'Install the root CA.', { scope: { type: 'string' } }, [], true, 'This changes the system trust store.'),
+  tool('ca.uninstall', 'Remove the root CA.', { scope: { type: 'string' } }, [], true, 'This changes the system trust store.'),
 ];
+
+/** What `ca.status` parsed to on a Mac whose login keychain does not trust the CA yet. */
+const CA_UNTRUSTED = { trusted: false, scope: null, platform: 'macos', fingerprint: 'AB:CD' } as const;
 
 const flow = (seq: number, p: Partial<FlowSummary> = {}): FlowEntry => {
   const raw: FlowSummary = {
@@ -56,11 +61,11 @@ const flow = (seq: number, p: Partial<FlowSummary> = {}): FlowEntry => {
   return { id: raw.id, flow: store, raw, set };
 };
 
-function stubApp() {
+function stubApp(ca: AppStore['ca'] = null) {
   const entries = [flow(1), flow(2, { authority: 'auth.shop-staging.test', path: '/login', method: 'POST' })];
   const [version] = createSignal(0);
   const [ui, setUi] = createStore({ paletteOpen: true, theme: 'light', density: 'dense', layout: 'horizontal' });
-  const call = vi.fn(async (name: string, args?: Record<string, unknown>) => {
+  const call = vi.fn(async (name: string, args?: Record<string, unknown>): Promise<unknown> => {
     if (name === 'flow.replay') return 'f2';
     if (name === 'flow.list') return ['f1', 'f2'];
     return { ok: true, name, args };
@@ -68,6 +73,10 @@ function stubApp() {
   const app = {
     ui,
     proxy: { tools: TOOLS, armed: false, scope: [] },
+    ca,
+    caInstalling: false,
+    setCAInstalling: vi.fn(),
+    refreshCA: vi.fn(async () => true),
     version,
     entries,
     byId: new Map(entries.map((e) => [e.id, e])),
@@ -87,10 +96,65 @@ function stubApp() {
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+
+/**
+ * The bus as an operator connection sees a confirm-gated verb (bus spec D4): the first call is
+ * answered with a non-error `needs_confirmation` envelope and runs nothing; only the identical
+ * call re-sent with `_confirm: <token>` runs. `order` records every call in sequence.
+ */
+const handshakeBus = (app: ReturnType<typeof stubApp>, order: string[] = []) =>
+  app.call.mockImplementation(async (name: string, args?: Record<string, unknown>) => {
+    order.push(`call:${name}`);
+    if (args && typeof args._confirm === 'string') return { changed: true, confirmed_with: args._confirm };
+    return { status: 'needs_confirmation', prompt: `${name} changes the trust store of this machine. Confirm?`, confirm_token: 'tok-7f3a' };
+  });
 const mount = async (app: AppStore) => {
   render(() => <AppProvider store={app}><CommandPalette /></AppProvider>);
   await tick(); // Portal content lands after the first render
   return screen; // render() binds its queries to the container; portals land in document.body
+};
+
+/** A bus that answers nothing on its own: each call is recorded in `order` and its reply held until the test resolves it. */
+const heldBus = (app: ReturnType<typeof stubApp>, order: string[]) => {
+  const replies: ((v: unknown) => void)[] = [];
+  app.call.mockImplementation((name: string) => {
+    order.push(`call:${name}`);
+    return new Promise<unknown>((r) => {
+      replies.push(r);
+    });
+  });
+  return replies;
+};
+
+const ENVELOPE = { status: 'needs_confirmation', prompt: 'ca.install changes the trust store of this machine. Confirm?', confirm_token: 'tok-7f3a' };
+
+/** Records the CA flag and read-back into `order`, alongside the calls `handshakeBus` already records. */
+const traceCA = (app: ReturnType<typeof stubApp>, order: string[]) => {
+  app.setCAInstalling.mockImplementation((on: boolean) => order.push(`installing:${on}`));
+  app.refreshCA.mockImplementation(async () => {
+    order.push('refreshCA');
+    return true;
+  });
+};
+
+/**
+ * The Setup action taken as far as the bus's own prompt: Run, the tool's Confirm, the first
+ * `ca.install` answered with `needs_confirmation`. The flag is up, nothing has run yet.
+ */
+const atServerPrompt = async (app: ReturnType<typeof stubApp>, order: string[]) => {
+  traceCA(app, order);
+  handshakeBus(app, order);
+  const s = await mount(app);
+  fireEvent.click(s.getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+  await tick();
+  fireEvent.click(s.getByText('Run').closest('button')!);
+  await tick();
+  fireEvent.click(s.getByText('Confirm').closest('button')!);
+  await tick();
+  await tick();
+  expect(s.getByRole('alert').textContent).toBe('ca.install changes the trust store of this machine. Confirm?');
+  expect(order).toEqual(['installing:true', 'call:ca.install']);
+  return s;
 };
 
 // This jsdom has no localStorage; the palette persists recents and pins through it.
@@ -115,7 +179,7 @@ describe('CommandPalette grouping', () => {
     expect(getByText('Setup')).toBeTruthy();
     expect(queryByText('Recent')).toBeNull();
     const options = getAllByRole('option');
-    expect(options.map((o) => o.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('flow.replay'), expect.stringContaining('Install CA')]));
+    expect(options.map((o) => o.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('flow.replay'), expect.stringContaining('Trust the aitmproxy CA')]));
     // read-only hint on non-mutating tools
     expect(getByText('flow.list').closest('[role="option"]')!.textContent).toContain('read-only');
     // flows newest first
@@ -213,6 +277,491 @@ describe('CommandPalette grouping', () => {
     await tick();
     expect(app.call).toHaveBeenCalledWith('ca.install', {});
     expect(queryByText('Confirm')).toBeNull();
+  });
+
+  it('the Setup action prefills scope: user on macOS, holds the in-flight flag around the call, then re-reads ca.status (D17.1, D17.5, D17.12)', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    app.setCAInstalling.mockImplementation((on: boolean) => order.push(`installing:${on}`));
+    app.refreshCA.mockImplementation(async () => {
+      order.push('refreshCA');
+      return true;
+    });
+    app.call.mockImplementation(async (name: string) => {
+      order.push(`call:${name}`);
+      return { changed: true };
+    });
+    const { getByRole, getByText } = await mount(app);
+    const option = getByText('Trust the aitmproxy CA').closest('[role="option"]')!;
+    expect(option.textContent).toContain('Install the root CA into your user trust store; HTTPS is not captured until then');
+    fireEvent.click(option);
+    await tick();
+    expect(getByRole('dialog').querySelector<HTMLInputElement>('#palette-ca-install-scope')!.value).toBe('user');
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call).toHaveBeenCalledWith('ca.install', { scope: 'user' });
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(getByRole('status').textContent).toContain('ok');
+  });
+
+  it('a cancelled macOS dialog is an info notice, not an error (D17.4)', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const msg = 'ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted';
+    app.call.mockImplementation(async () => {
+      throw new Error(msg);
+    });
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.notice).toHaveBeenCalledWith(msg, 'info');
+    expect(queryByRole('status')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.refreshCA).toHaveBeenCalledTimes(1);
+    expect(app.setCAInstalling).toHaveBeenLastCalledWith(false);
+  });
+
+  it('any other ca.install failure stays an error result and still re-reads ca.status', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    app.call.mockImplementation(async () => {
+      throw new Error('ca.install refused: ca.install is refused from an agent frontend');
+    });
+    const { getByRole, getByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.notice).not.toHaveBeenCalled();
+    expect(getByRole('status').textContent).toContain('error');
+    expect(app.refreshCA).toHaveBeenCalledTimes(1);
+  });
+
+  it('the Setup action passes no scope on Linux (D17.1)', async () => {
+    const app = stubApp({ trusted: false, scope: null, platform: 'linux-debian', fingerprint: 'AB:CD' });
+    const { getByRole, getByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    expect(getByRole('dialog').querySelector<HTMLInputElement>('#palette-ca-install-scope')!.value).toBe('');
+  });
+
+  it('ca.install from an operator connection completes the bus confirm handshake: the server prompt replaces the tool’s, Confirm re-sends the call with _confirm, the flag spans both calls', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, getByText, queryByText, queryByRole } = await atServerPrompt(app, order);
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(queryByText('This changes the system trust store.')).toBeNull();
+    expect(queryByRole('status')).toBeNull();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([
+      ['ca.install', { scope: 'user' }],
+      ['ca.install', { scope: 'user', _confirm: 'tok-7f3a' }],
+    ]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(getByRole('status').textContent).toContain('ok');
+    expect(getByText(/"confirmed_with": "tok-7f3a"/)).toBeTruthy();
+    expect(app.notice).not.toHaveBeenCalled();
+  });
+
+  it('cancelling the server prompt sends nothing more, returns to the list, and still clears the flag after one re-read', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, getByText, queryByRole } = await atServerPrompt(app, order);
+    fireEvent.click(getByText('Cancel').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(queryByRole('status')).toBeNull();
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.notice).not.toHaveBeenCalled();
+  });
+
+  it('closing the palette while the server prompt is up sends nothing more and still releases the flag', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    await atServerPrompt(app, order);
+    cleanup();
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+  });
+
+  it('closing the palette while the first call is still in flight: the late needs_confirmation reply opens no prompt and releases the flag', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    const replies = heldBus(app, order);
+    const { getByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install']);
+    cleanup();
+    replies[0]!(ENVELOPE);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+  });
+
+  it('a second needs_confirmation in reply to the confirming call is a stale token: an error result, no third call, the flag released', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, getByText, queryByRole } = await atServerPrompt(app, order);
+    app.call.mockImplementation(async (name: string) => {
+      order.push(`call:${name}`);
+      return { status: 'needs_confirmation', prompt: 'ca.install changes the trust store of this machine. Confirm?', confirm_token: 'tok-9c1d' };
+    });
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([
+      ['ca.install', { scope: 'user' }],
+      ['ca.install', { scope: 'user', _confirm: 'tok-7f3a' }],
+    ]);
+    expect(getByRole('status').textContent).toContain('error');
+    expect(getByRole('status').textContent).toContain('confirmation was not accepted (stale or reused token)');
+    expect(queryByRole('alert')).toBeNull();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:ca.install', 'refreshCA', 'installing:false']);
+  });
+
+  it('typing in the search box while the server prompt is up declines it: back to the list, nothing more sent, the flag released', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, queryByRole } = await atServerPrompt(app, order);
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.notice).not.toHaveBeenCalled();
+  });
+
+  it('typing in the search box while the first call is still in flight: the late needs_confirmation opens no prompt, sends nothing more, releases the flag', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    const replies = heldBus(app, order);
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    replies[0]!(ENVELOPE);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.notice).not.toHaveBeenCalled();
+  });
+
+  it('Esc on the server prompt declines it: back to the list, nothing more sent, the flag released after one re-read', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, queryByRole } = await atServerPrompt(app, order);
+    fireEvent.keyDown(getByRole('dialog'), { key: 'Escape' });
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.openPalette).not.toHaveBeenCalled();
+    expect(app.notice).not.toHaveBeenCalled();
+  });
+
+  it('a needs_confirmation that arrives while a newer run is in flight is not shown as that run’s prompt: the CA run ends, the newer run’s result lands', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    const replies = heldBus(app, order);
+    const { getByRole, getByText, queryByRole, queryByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow.list' } });
+    await tick();
+    fireEvent.keyDown(getByRole('dialog'), { key: 'Enter' });
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:flow.list']);
+    replies[0]!(ENVELOPE);
+    await tick();
+    await tick();
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByText('Running…')).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:flow.list', 'refreshCA', 'installing:false']);
+    replies[1]!(['f1', 'f2']);
+    await tick();
+    await tick();
+    expect(getByRole('status').textContent).toContain('ok');
+    expect(getByText(/"f1"/)).toBeTruthy();
+    expect(queryByText('ca.install')).toBeNull();
+    expect(app.call.mock.calls).toEqual([
+      ['ca.install', { scope: 'user' }],
+      ['flow.list', {}],
+    ]);
+  });
+
+  it('a late result from an abandoned run never overwrites the newer run’s stage; an abandoned ca.install that still owns the flag releases it', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    const replies = heldBus(app, order);
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow.replay' } });
+    await tick();
+    fireEvent.keyDown(getByRole('dialog'), { key: 'Enter' });
+    await tick();
+    const picker = document.querySelector<HTMLInputElement>('input[role="combobox"][placeholder^="Search flows"]')!;
+    fireEvent.input(picker, { target: { value: 'f1' } });
+    fireEvent.keyDown(picker, { key: 'Enter' });
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:flow.replay']);
+    replies[0]!({ changed: true });
+    await tick();
+    await tick();
+    expect(queryByRole('status')).toBeNull();
+    expect(getByText('Running…')).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:flow.replay', 'refreshCA', 'installing:false']);
+    replies[1]!('f2');
+    await tick();
+    await tick();
+    expect(getByRole('status').textContent).toContain('ok');
+    expect(getByText('flow.replay')).toBeTruthy();
+    expect(getByRole('status').querySelector('pre')!.textContent).toBe('f2');
+  });
+
+  it('a done reply for a run the operator typed away from writes nothing: the list stays, no result appears', async () => {
+    const app = stubApp();
+    const order: string[] = [];
+    const replies = heldBus(app, order);
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow.list' } });
+    await tick();
+    fireEvent.keyDown(getByRole('dialog'), { key: 'Enter' });
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    replies[0]!(['f1', 'f2']);
+    await tick();
+    await tick();
+    expect(queryByRole('status')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.notice).not.toHaveBeenCalled();
+    expect(order).toEqual(['call:flow.list']);
+  });
+
+  it('a failed reply for a run the operator typed away from is an error notice, never silently lost, and writes no stage', async () => {
+    const app = stubApp();
+    const order: string[] = [];
+    let fail!: (e: Error) => void;
+    app.call.mockImplementation((name: string) => {
+      order.push(`call:${name}`);
+      return new Promise<unknown>((_, reject) => {
+        fail = reject;
+      });
+    });
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow.list' } });
+    await tick();
+    fireEvent.keyDown(getByRole('dialog'), { key: 'Enter' });
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    fail(new Error('bus: connection reset'));
+    await tick();
+    await tick();
+    expect(queryByRole('status')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.notice).toHaveBeenCalledTimes(1);
+    expect(app.notice).toHaveBeenCalledWith('bus: connection reset', 'error');
+  });
+
+  it('a superseded ca.install ending late does not release the flag a newer ca.install holds; the newer run releases it once', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    const replies = heldBus(app, order);
+    const { getAllByText, getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    fireEvent.input(getByRole('combobox'), { target: { value: '' } });
+    await tick();
+    fireEvent.click(getAllByText('Trust the aitmproxy CA')[0]!.closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'installing:true', 'call:ca.install']);
+    replies[0]!(ENVELOPE);
+    await tick();
+    await tick();
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByText('Running…')).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'installing:true', 'call:ca.install']);
+    replies[1]!({ changed: true });
+    await tick();
+    await tick();
+    expect(getByRole('status').textContent).toContain('ok');
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(app.call.mock.calls).toEqual([
+      ['ca.install', { scope: 'user' }],
+      ['ca.install', { scope: 'user' }],
+    ]);
+  });
+
+  it('ca.uninstall holds the in-flight flag across the handshake, then re-reads ca.status (D17.12)', async () => {
+    const app = stubApp({ trusted: true, scope: 'user', platform: 'macos', fingerprint: 'AB:CD' });
+    const order: string[] = [];
+    app.setCAInstalling.mockImplementation((on: boolean) => order.push(`installing:${on}`));
+    app.refreshCA.mockImplementation(async () => {
+      order.push('refreshCA');
+      return true;
+    });
+    handshakeBus(app, order);
+    const { getByRole, getByText } = await mount(app);
+    fireEvent.input(getByRole('combobox'), { target: { value: '>ca.uninstall' } });
+    await tick();
+    fireEvent.keyDown(getByRole('dialog'), { key: 'Enter' });
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(getByRole('alert').textContent).toBe('ca.uninstall changes the trust store of this machine. Confirm?');
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([
+      ['ca.uninstall', {}],
+      ['ca.uninstall', { _confirm: 'tok-7f3a' }],
+    ]);
+    expect(order).toEqual(['installing:true', 'call:ca.uninstall', 'call:ca.uninstall', 'refreshCA', 'installing:false']);
+    expect(getByRole('status').textContent).toContain('ok');
+  });
+
+  it('says so when ca.status could not be re-read after the run, so a stale word is never silent', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    app.refreshCA.mockImplementation(async () => false);
+    app.call.mockImplementation(async () => ({ changed: true }));
+    const { getByRole, getByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.notice).toHaveBeenCalledTimes(1);
+    expect(app.notice).toHaveBeenCalledWith('ca.status could not be re-read; the CA word may be stale', 'error');
+    expect(getByRole('status').textContent).toContain('ok');
+    expect(app.setCAInstalling).toHaveBeenLastCalledWith(false);
+  });
+
+  it('a stale second envelope for a confirming call the operator typed away from is an error notice, never silent: no result stage, the flag released once', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, getByText, queryByRole } = await atServerPrompt(app, order);
+    const replies = heldBus(app, order);
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    replies[0]!({ ...ENVELOPE, confirm_token: 'tok-9c1d' });
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([
+      ['ca.install', { scope: 'user' }],
+      ['ca.install', { scope: 'user', _confirm: 'tok-7f3a' }],
+    ]);
+    expect(app.notice).toHaveBeenCalledTimes(1);
+    expect(app.notice).toHaveBeenCalledWith(STALE_CONFIRM_MESSAGE, 'error');
+    expect(queryByRole('status')).toBeNull();
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:ca.install', 'refreshCA', 'installing:false']);
+  });
+
+  it('a needs_confirmation envelope without its token is malformed: an error result saying so, no prompt, the flag released after one re-read', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    app.call.mockImplementation(async (name: string) => {
+      order.push(`call:${name}`);
+      return { status: 'needs_confirmation', prompt: 'ca.install changes the trust store of this machine. Confirm?' };
+    });
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('status').textContent).toContain('error');
+    expect(getByRole('status').textContent).toContain(MALFORMED_CONFIRM_MESSAGE);
+    expect(getByRole('status').textContent).toContain('malformed confirmation envelope');
+    expect(app.notice).not.toHaveBeenCalled();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
   });
 
   it('Esc closes from the list and returns to the list from a form', async () => {

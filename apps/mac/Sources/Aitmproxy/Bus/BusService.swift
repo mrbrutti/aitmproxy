@@ -205,14 +205,14 @@ final class BusService: FlowActions {
     /// core's `scope.list` as of the operator's last Scope action — written from
     /// `addScope`/`removeScope` only after the verb and the refresh both succeeded; never
     /// on connect or poll, never while the client points at an external core (the callers
-    /// also require that intent to have held across the whole round trip), never in
-    /// fixture/snapshot/self-test runs. A failed save is an error of the action: it throws
-    /// `BusError.tool("Scope change not saved: …")`, which `Session.perform` lands in
-    /// `lastError`, because a silently failed save after a remove would resurrect the host
-    /// at the next launch. By then the core has accepted the change and the refresh has
-    /// set `session.scopeHosts`, so the in-memory scope stays right for this run.
+    /// also require that intent to have held across the whole round trip). A failed save
+    /// is an error of the action: it throws `BusError.tool("Scope change not saved: …")`,
+    /// which `Session.perform` lands in `lastError`, because a silently failed save after
+    /// a remove would resurrect the host at the next launch. By then the core has accepted
+    /// the change and the refresh has set `session.scopeHosts`, so the in-memory scope
+    /// stays right for this run.
     private func persistEmbeddedScope() throws {
-        guard preferEmbedded, !Store.usesFixtures else { return }
+        guard preferEmbedded else { return }
         do {
             try EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
         } catch {

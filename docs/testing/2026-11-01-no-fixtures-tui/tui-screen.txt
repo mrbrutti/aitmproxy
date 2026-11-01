@@ -1,0 +1,39 @@
+aitm tui — binary built from chore/no-fixtures-tui with main merged in (head 727f5ac7), real run 2026-11-01 17:45 local
+config: listen 127.0.0.1:18280, scope entries 127.0.0.1 / 127.0.0.1:8099, browser proxy 127.0.0.1:18281, in-process bus (operator)
+traffic: curl -x 127.0.0.1:18280 http://127.0.0.1:8099/ (200), /index.html (200), /missing (404) against python3 -m http.server 8099
+screen read back from the Terminal panel right after the three requests:
+
+ ›•‹ aitmproxy  ● rec  ✎ compose  ⌫ clear         ● aitmproxy · listening 127.0.0.1:18280          [⚙ Agent · n/a (F1)]
+  All 1 │ HTTP2 HTTPS3 WebSocket4 │ h15 h26 │ JSON7 Form8 XML9 JS0 CSS GraphQL Document Media Other          ⌕ / filter
+ ›•‹ aitmproxy             │        # URL                                          Client   Method  Status Time
+                           │  ●     1 http://127.0.0.1:8099/                       —         GET    200    17:45:38.529
+ Working                   │  ●     2 http://127.0.0.1:8099/index.html             —         GET    200    17:45:38.549
+  Pinned                   │  ●     3 http://127.0.0.1:8099/missing                —         GET    404    17:45:38.568
+  Saved                 F10│
+                           │
+ All                       │
+  All flows               3│
+  Apps                    1│
+  Domains                 1│
+                           │
+ aitmproxy                 │
+  Scope                   2│
+  Findings                0│
+  Browser                 —│────────────────────────────────────────────────────────────────────────────────────────────
+  Scripts                M3│  GET   404 Not Found   http://12 HTTP/1.1 · plain · req 0 B · resp 460 B · 1 ms · in scope
+  Agent                  F1│ Request  Headers  Cookies  Query  Body  Raw  Summary  Timing (F5)  Connection
+  Scan                    —│host             : 127.0.0.1:8099
+                           │user-agent       : curl/8.7.1
+                           │accept           : */*
+                           │proxy-connection : Keep-Alive
+                           │
+                           │ Response  Headers  Set-Cookie  Body  Raw  JSON  Hex  Diff
+                           │   1 <!DOCTYPE HTML>
+                           │   2 <html lang="en">
+                           │   3     <head>
+ [ ] move  b hide          │   4         <meta charset="utf-8">                                            ↓ 14 more
+ ? help  i intercept  e edit  r replay      3 / 3 rows · 3 in scope     612 B ↑ — ↓ — (F4)  ● bus in-process · operator
+
+the built aitm-tui binary from the same gate run:
+  aitm-tui --fixture            → unknown argument `--fixture`  + usage, exit 2
+  aitm-tui --snapshot out.svg   → unknown argument `--snapshot` + usage, exit 2

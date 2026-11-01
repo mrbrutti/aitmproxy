@@ -29,10 +29,7 @@
 #
 # The four rules, as built:
 #   1. The quoted literals "ca.install" and "ca.uninstall" appear in Session+CATrust.swift
-#      only. The fixture tool list (AitmproxyKit/Fixtures+Tools.swift) and the fixture
-#      activity log (AitmproxyKit/Fixtures+Agent.swift) still name `ca.install` as DATA
-#      (a tool descriptor, a pending agent entry); both are allowed by file, without an
-#      expect, until the fake-data-removal PR deletes them.
+#      only (the fixture data files that once named them are gone with the fake-data removal).
 #   2. `.trustCA(` / `.untrustCA(` are called from Panels/CAPanel.swift,
 #      Shell/SetupSheet.swift, Panels/StatusPanel.swift and App.swift only (each with an
 #      expect). An UNDOTTED `trustCA(` / `untrustCA(` (a call from inside an `extension
@@ -53,8 +50,7 @@
 #      ca.install | ca.uninstall | trustCA | untrustCA. CommandMap.swift carries the menu
 #      TITLE "Trust the aitmproxy CA" only, which the pattern does not match;
 #      `Session.isCATrustVerb` (the palette's and the Agent log's guard) does not match it
-#      either. The two fixture files of rule 1 are allowed here for the same reason, by
-#      file, and skipped once deleted.
+#      either.
 set -u
 set -o pipefail
 export LC_ALL=C
@@ -117,9 +113,6 @@ ca_panel=Sources/Aitmproxy/Panels/CAPanel.swift
 setup_sheet=Sources/Aitmproxy/Shell/SetupSheet.swift
 status_panel=Sources/Aitmproxy/Panels/StatusPanel.swift
 app_swift=Sources/Aitmproxy/App.swift
-# Fixture DATA that still names the verbs (rule 1 note); deleted by the fake-data-removal PR.
-fixture_tools=Sources/AitmproxyKit/Fixtures+Tools.swift
-fixture_agent=Sources/AitmproxyKit/Fixtures+Agent.swift
 
 violations=0
 checked=0
@@ -195,20 +188,9 @@ deny() {
   done
 }
 
-# deny_present RULE REGEX FILE...
-# `deny` for fixture DATA scheduled for deletion: a missing file is skipped with a note.
-deny_present() {
-  local rule=$1 regex=$2 f present=()
-  shift 2
-  for f in "$@"; do
-    if [ -f "$f" ]; then present+=("$f"); else echo "NOTE: fixture file gone, skipped: $f" >&2; fi
-  done
-  [ "${#present[@]}" -gt 0 ] && deny "$rule" "$regex" "${present[@]}"
-}
-
 # ---- 1. the verbs' quoted literals: Session+CATrust.swift only -----------------------
 verb_re='"ca\.(install|uninstall)"'
-scan "1 ca.install/ca.uninstall literal" "$verb_re" "$ca_trust" "$fixture_tools" "$fixture_agent"
+scan "1 ca.install/ca.uninstall literal" "$verb_re" "$ca_trust"
 expect "1 ca.install/ca.uninstall literal" "$ca_trust" '"ca\.install"' 'the "ca.install" literal'
 expect "1 ca.install/ca.uninstall literal" "$ca_trust" '"ca\.uninstall"' 'the "ca.uninstall" literal'
 
@@ -239,23 +221,17 @@ deny "3 user scope" '"system"' "$ca_trust"
 scan "3 user scope" '\.string\("system"\)'
 
 # ---- 4. the agent-reachable surfaces reference none of it ----------------------------
-# FixtureBus.swift is the bus's stand-in in fixture, snapshot and self-test runs (the test
-# adapter behind Session.commandRunner), so it is held to the same rule as BusService.swift;
-# the self-test, the snapshot scenes and the fixture session drive Session without an operator.
+# The self-tests drive Session without an operator, so they are held to the same rule as
+# BusService.swift (the fixture bus, the snapshot scenes and the fixture session are gone).
 deny "4 agent-reachable surface" 'ca\.install|ca\.uninstall|trustCA|untrustCA' \
   Sources/Aitmproxy/Bus/BusService.swift \
-  Sources/Aitmproxy/Bus/FixtureBus.swift \
   Sources/AitmproxyKit/CommandMap.swift \
   Sources/Aitmproxy/Shell/CommandPalette.swift \
   Sources/Aitmproxy/Session+Palette.swift \
   Sources/Aitmproxy/Session+Verbs.swift \
   Sources/Aitmproxy/Panels/AgentPanel.swift \
   Sources/Aitmproxy/SelfTest.swift \
-  Sources/Aitmproxy/SelfTest+Live.swift \
-  Sources/Aitmproxy/SnapshotScenes.swift \
-  Sources/Aitmproxy/Session+Fixtures.swift
-# The two fixture DATA files of rule 1: not a call path, but they must not grow one either.
-deny_present "4 agent-reachable surface" 'trustCA|untrustCA|runCommand|commandRunner' "$fixture_tools" "$fixture_agent"
+  Sources/Aitmproxy/SelfTest+Live.swift
 
 if [ "$violations" -ne 0 ]; then
   echo "FAIL check-ca-trust-path: $violations violation(s). CA trust has one call path and one scope."

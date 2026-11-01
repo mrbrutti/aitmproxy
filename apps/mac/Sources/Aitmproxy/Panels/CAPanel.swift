@@ -19,7 +19,6 @@ struct CAPanel: View {
     /// The session's read-back; "No certificate" only for a connected core that has no `ca.status`
     /// verb at all, and the loading lines until the first read lands otherwise.
     private var status: CAStatus? {
-        if Store.usesFixtures { return Fixtures.caStatus }
         if let live = session.caStatus { return live }
         guard case .connected = session.bus, !session.tools.contains(where: { $0.name == "ca.status" }) else { return nil }
         return CAStatus(fingerprint: "", installed: false, trusted: false, exists: false)
@@ -193,10 +192,6 @@ struct CAPanel: View {
     // MARK: Actions
 
     private func load() {
-        if Store.usesFixtures {
-            agentMayInstall = Fixtures.caStatus.allowAgentInstall
-            return
-        }
         agentMayInstall = configFlag()
         Task {
             await session.refreshCAStatus()

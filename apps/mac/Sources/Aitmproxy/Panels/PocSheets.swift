@@ -94,8 +94,8 @@ struct BuildPoCSheet: View {
 
     private var row: FlowRow? { session.rows.first { $0.id == flowID } }
     private var candidates: [String] {
-        guard let row else { return [] }
-        return PocParameters.candidates(for: session.details[flowID] ?? Fixtures.detail(for: row), row: row)
+        guard let row, let detail = session.details[flowID] else { return [] }
+        return PocParameters.candidates(for: detail, row: row)
     }
     private var inScope: Bool { row?.inScope ?? false }
 

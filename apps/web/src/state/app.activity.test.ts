@@ -182,7 +182,7 @@ describe('app store — activity intake', () => {
     bus.ctl.activityWire = wire;
 
     const refreshed = app.refreshSide();
-    await tick(50); // the side reads answer with the mock's few ms of latency
+    await tick(50); // the side reads answer with the test bus's few ms of latency
     await refreshed;
 
     const list = app.proxy.activity;

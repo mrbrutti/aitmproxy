@@ -46,11 +46,7 @@ struct CommandPalette: View {
         .overlay(RoundedRectangle(cornerRadius: Tok.Radius.floating).strokeBorder(Tok.Line.border.color))
         .shadow(color: .black.opacity(colorScheme == .dark ? Tok.Shadow.floating.darkOpacity : Tok.Shadow.floating.lightOpacity),
                 radius: Tok.Shadow.floating.radius, y: Tok.Shadow.floating.y)
-        .onAppear {
-            fieldFocused = true
-            // A scene can hand the palette an opening query (palette-flows snapshot); consumed once.
-            if let seed = session.paletteSeedQuery { query = seed; session.paletteSeedQuery = nil }
-        }
+        .onAppear { fieldFocused = true }
         .onExitCommand { if form != nil { form = nil } else { session.paletteVisible = false } }
         .onKeyPress(.downArrow) { highlighted = min(highlighted + 1, max(items.count - 1, 0)); return .handled }
         .onKeyPress(.upArrow) { highlighted = max(highlighted - 1, 0); return .handled }
@@ -82,7 +78,7 @@ struct CommandPalette: View {
                         }
                     }
                     if items.isEmpty {
-                        Text(session.tools.isEmpty && !Store.usesFixtures ? "Bus offline — connect in Settings ▸ Bus" : "No match")
+                        Text(session.tools.isEmpty ? "Bus offline — connect in Settings ▸ Bus" : "No match")
                             .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
                             .padding(Space.lg)
                     }

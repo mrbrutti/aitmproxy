@@ -32,7 +32,7 @@ if [ -n "${hits//[[:space:]]/}" ]; then
 fi
 
 # Rule 2: one home. Readers of connectionSummary, by file.
-readers='^Sources/Aitmproxy/(Shell/ShellToolbar|Shell/SetupSheet|Panels/StatusPanel|Panels/CoreLogPanel|SettingsView|Session\+Connection|SelfTest|SnapshotScenes)\.swift$'
+readers='^Sources/Aitmproxy/(Shell/ShellToolbar|Shell/SetupSheet|Panels/StatusPanel|Panels/CoreLogPanel|SettingsView|Session\+Connection)\.swift$'
 others=$(grep -rlE --include='*.swift' -e 'connectionSummary' Sources/Aitmproxy | grep -vE "$readers" || true)
 if [ -n "$others" ]; then
   printf '%s\n' "$others"

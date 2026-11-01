@@ -37,14 +37,6 @@ final class ScanPanelState {
         form.sync(tool: session.tools.first { $0.name == ScanForm.toolName }, scopeHosts: session.scopeHosts)
     }
 
-    /// Fixture sessions open with a finished crawl, the way Findings opens with runs.
-    func loadFixture() {
-        syncForm()
-        guard let result = try? ScanResult(json: Fixtures.scanDiscover) else { return }
-        model.begin(target: form.normalizedTarget)
-        model.finish(result)
-    }
-
     // MARK: Intents
 
     /// The in-flight crawl, held so Cancel can stop waiting on it.
