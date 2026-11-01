@@ -7,8 +7,11 @@
 //! window and back on the same port by +6 s, with exactly one `downtime`
 //! entry in `/log/l4`; in Patched mode the same trigger gets the row's
 //! protocol-error reply, the speaker closes with reason `error`, the listener
-//! stays up and `downtime` is empty. Plus the D5 denylist observation and an
-//! MQTT CONNECT / PUBLISH / DISCONNECT session.
+//! stays up and `downtime` is empty. Plus the D5 denylist observation, an
+//! MQTT CONNECT / PUBLISH / DISCONNECT session, and the T10 PR C contract:
+//! malformed (non-trigger) input is answered before the close in both
+//! modes, a partial line keeps the connection open until its CRLF arrives,
+//! and a high-bit byte in an argument gets the normal reply.
 //!
 //! Binds loopback ports, so it runs in the Terminal panel, never in the Bash
 //! sandbox (bind is EPERM there). The per-service flows run concurrently
@@ -954,4 +957,399 @@ async fn mqtt_connect_publish_disconnect() {
         .filter_map(|m| m["verb"].as_str())
         .collect();
     assert_eq!(verbs, vec!["CONNECT", "PUBLISH", "DISCONNECT"]);
+}
+
+// --- T10 PR C: no silent close on non-trigger input ---------------------------------
+
+/// How long a partial line must keep the connection open before the rest
+/// of it is sent ("still open after 1 s").
+const PARTIAL_HOLD: Duration = Duration::from_secs(1);
+
+/// The `conn_id` of our connection (by its local address in `accepts`).
+fn conn_id_of(log: &Value, local: SocketAddr) -> Res<String> {
+    array(log, "accepts")?
+        .iter()
+        .find(|a| a["peer"] == local.to_string())
+        .and_then(|a| a["conn_id"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("no accepts entry with peer {local}"))
+}
+
+/// The `closes` entry for `conn_id`, if the speaker has closed it.
+fn close_of<'a>(log: &'a Value, conn_id: &str) -> Res<Option<&'a Value>> {
+    Ok(array(log, "closes")?
+        .iter()
+        .find(|c| c["conn_id"] == conn_id))
+}
+
+/// Run `flow` for every row against one `mode` target, sequentially, and
+/// fail with every failing row named by its service and label.
+async fn run_rows<R, F, Fut>(mode: SeedMode, rows: Vec<R>, flow: F)
+where
+    R: RowInfo,
+    F: Fn(R, SocketAddr, String) -> Fut,
+    Fut: Future<Output = Res<()>>,
+{
+    let target = start(mode).await;
+    let control = target.control_url().expect("control url").to_string();
+    let mut failures = Vec::new();
+    for row in rows {
+        let (service, label) = (row.service(), row.label());
+        let addr = service_addr(&target, service, Proto::Tcp);
+        if let Err(e) = flow(row, addr, control.clone()).await {
+            failures.push(format!("{service} [{label}]: {e}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing row(s) in {mode:?}:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+    drop(target);
+}
+
+trait RowInfo {
+    fn service(&self) -> &'static str;
+    fn label(&self) -> &'static str;
+}
+
+/// Malformed, non-trigger input: the speaker writes `expect`, then closes
+/// with reason `error`; the listener never goes down.
+struct Malformed {
+    service: &'static str,
+    label: &'static str,
+    banner: Option<&'static [u8]>,
+    send: Vec<u8>,
+    expect: Vec<u8>,
+}
+
+impl RowInfo for Malformed {
+    fn service(&self) -> &'static str {
+        self.service
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+fn malformed_rows() -> Vec<Malformed> {
+    vec![
+        Malformed {
+            service: "l4-resp",
+            label: "array header without CRLF before `$`",
+            banner: None,
+            send: b"*1$4\r\nPING\r\n".to_vec(),
+            expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "element without `$`",
+            banner: None,
+            send: b"*1\r\n4\r\nPING\r\n".to_vec(),
+            expect: b"-ERR Protocol error: expected '$', got '4'\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "garbled bulk length",
+            banner: None,
+            send: b"*1\r\n$abc\r\n".to_vec(),
+            expect: b"-ERR Protocol error: invalid bulk length\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "negative array count",
+            banner: None,
+            send: b"*-1\r\n".to_vec(),
+            expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+        },
+    ]
+}
+
+async fn malformed_flow(row: Malformed, addr: SocketAddr, control: String) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    let local = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    stream
+        .write_all(&row.send)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut stream, CLOSE_WITHIN).await;
+    if bytes != row.expect {
+        return Err(format!(
+            "reply: got {} expected {}",
+            hex(&bytes),
+            hex(&row.expect)
+        ));
+    }
+    if !closed {
+        return Err("speaker did not close within 1 s after the reply".to_string());
+    }
+    // Not a trigger: the listener is up and nothing was logged as downtime.
+    tcp_open(addr, row.banner).await?;
+    let log = l4_log(&control, row.service).await?;
+    let downtime = array(&log, "downtime")?;
+    if !downtime.is_empty() {
+        return Err(format!("downtime is not empty: {downtime:?}"));
+    }
+    let conn_id = conn_id_of(&log, local)?;
+    let close =
+        close_of(&log, &conn_id)?.ok_or_else(|| format!("no closes entry for {conn_id}"))?;
+    if close["reason"] != "error" {
+        return Err(format!("close reason: {}", close["reason"]));
+    }
+    let last_in = array(&log, "messages")?
+        .iter()
+        .rfind(|m| m["conn_id"] == conn_id && m["dir"] == "in")
+        .ok_or_else(|| format!("no `in` message on {conn_id}"))?;
+    if last_in["classified"] != "protocol_error" {
+        return Err(format!("classified {}", last_in["classified"]));
+    }
+    Ok(())
+}
+
+/// Malformed, non-trigger input is answered with the row's protocol error
+/// and then closed with reason `error`, in both modes; never a silent
+/// close, never a crash window (T10 PR C, the T6 oracle's contract).
+#[tokio::test]
+async fn malformed_input_is_answered_before_the_close() {
+    run_rows(SeedMode::Patched, malformed_rows(), malformed_flow).await;
+    run_rows(SeedMode::Vulnerable, malformed_rows(), malformed_flow).await;
+}
+
+/// A line sent in two pieces: `first` has no CRLF, the connection must
+/// still be open and silent after 1 s, then `second` completes it and
+/// `expect` comes back on the same connection.
+struct Partial {
+    service: &'static str,
+    label: &'static str,
+    banner: Option<&'static [u8]>,
+    first: Vec<u8>,
+    second: Vec<u8>,
+    expect: Vec<u8>,
+}
+
+impl RowInfo for Partial {
+    fn service(&self) -> &'static str {
+        self.service
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+fn partial_rows() -> Vec<Partial> {
+    vec![
+        Partial {
+            service: "l4-smtp",
+            label: "NOO + P",
+            banner: Some(SMTP_BANNER),
+            first: b"NOO".to_vec(),
+            second: b"P\r\n".to_vec(),
+            expect: b"250 OK\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-smtp",
+            label: "damaged terminator \\r\\t then CRLF",
+            banner: Some(SMTP_BANNER),
+            first: b"NOOP\r\t".to_vec(),
+            second: b"\r\n".to_vec(),
+            expect: b"250 OK\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-ftp",
+            label: "NOO + P",
+            banner: Some(FTP_BANNER),
+            first: b"NOO".to_vec(),
+            second: b"P\r\n".to_vec(),
+            expect: b"200 ok\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-ftp",
+            label: "damaged terminator \\r\\t then CRLF",
+            banner: Some(FTP_BANNER),
+            first: b"USER a\r\t".to_vec(),
+            second: b"\r\n".to_vec(),
+            expect: b"331 password required\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-memcached",
+            label: "get mykey without CRLF",
+            banner: None,
+            first: b"get mykey".to_vec(),
+            second: b"\r\n".to_vec(),
+            expect: b"END\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-memcached",
+            label: "set waiting for its data",
+            banner: None,
+            first: b"set k 0 0 2\r\nh".to_vec(),
+            second: b"i\r\n".to_vec(),
+            expect: b"STORED\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-resp",
+            label: "inline PIN + G",
+            banner: None,
+            first: b"PIN".to_vec(),
+            second: b"G\r\n".to_vec(),
+            expect: b"+PONG\r\n".to_vec(),
+        },
+    ]
+}
+
+async fn partial_flow(row: Partial, addr: SocketAddr, control: String) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    let local = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    stream
+        .write_all(&row.first)
+        .await
+        .map_err(|e| format!("write first: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut stream, PARTIAL_HOLD).await;
+    if closed {
+        return Err(format!(
+            "closed within 1 s on a partial line (wrote {})",
+            hex(&bytes)
+        ));
+    }
+    if !bytes.is_empty() {
+        return Err(format!("wrote {} on a partial line", hex(&bytes)));
+    }
+    let got = exchange(&mut stream, &row.second, REPLY_IDLE).await?;
+    if got != row.expect {
+        return Err(format!(
+            "completed line: got {} expected {}",
+            hex(&got),
+            hex(&row.expect)
+        ));
+    }
+    // The wait was not logged as a message, and the connection is open.
+    let log = l4_log(&control, row.service).await?;
+    let conn_id = conn_id_of(&log, local)?;
+    if let Some(close) = close_of(&log, &conn_id)? {
+        return Err(format!("closed before we hung up: {close}"));
+    }
+    let ins: Vec<&Value> = array(&log, "messages")?
+        .iter()
+        .filter(|m| m["conn_id"] == conn_id && m["dir"] == "in")
+        .collect();
+    if ins.len() != 1 {
+        return Err(format!(
+            "{} `in` messages for the one completed line: {ins:?}",
+            ins.len()
+        ));
+    }
+    // A waiting connection is still torn down when the peer hangs up.
+    drop(stream);
+    let deadline = Instant::now() + CLOSE_WITHIN;
+    loop {
+        let log = l4_log(&control, row.service).await?;
+        if let Some(close) = close_of(&log, &conn_id)? {
+            if close["reason"] != "eof" {
+                return Err(format!(
+                    "close reason after our hang-up: {}",
+                    close["reason"]
+                ));
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("no closes entry within 1 s of our hang-up".to_string());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A partial line (no CRLF yet, or a damaged terminator) keeps the
+/// connection open and silent past the 200 ms idle; when the CRLF arrives
+/// the command completes on the same connection; a peer hang-up still
+/// closes it `eof` (T10 PR C).
+#[tokio::test]
+async fn partial_line_waits_then_completes_the_command() {
+    run_rows(SeedMode::Patched, partial_rows(), partial_flow).await;
+    run_rows(SeedMode::Vulnerable, partial_rows(), partial_flow).await;
+}
+
+/// A high-bit byte in an argument: the normal reply, connection kept.
+struct HighBit {
+    service: &'static str,
+    label: &'static str,
+    banner: Option<&'static [u8]>,
+    send: Vec<u8>,
+    expect: Vec<u8>,
+}
+
+impl RowInfo for HighBit {
+    fn service(&self) -> &'static str {
+        self.service
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+fn high_bit_rows() -> Vec<HighBit> {
+    vec![
+        HighBit {
+            service: "l4-smtp",
+            label: "EHLO x\\xff",
+            banner: Some(SMTP_BANNER),
+            send: b"EHLO x\xff\r\n".to_vec(),
+            expect: b"250 target.test\r\n".to_vec(),
+        },
+        HighBit {
+            service: "l4-ftp",
+            label: "USER a\\xff",
+            banner: Some(FTP_BANNER),
+            send: b"USER a\xff\r\n".to_vec(),
+            expect: b"331 password required\r\n".to_vec(),
+        },
+        HighBit {
+            service: "l4-memcached",
+            label: "get k\\xff",
+            banner: None,
+            send: b"get k\xff\r\n".to_vec(),
+            expect: b"END\r\n".to_vec(),
+        },
+        HighBit {
+            service: "l4-resp",
+            label: "ECHO \\xff",
+            banner: None,
+            send: b"ECHO \xff\r\n".to_vec(),
+            expect: b"$1\r\n\xff\r\n".to_vec(),
+        },
+    ]
+}
+
+async fn high_bit_flow(row: HighBit, addr: SocketAddr, _control: String) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    stream
+        .write_all(&row.send)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut stream, REPLY_IDLE).await;
+    if bytes != row.expect {
+        return Err(format!(
+            "reply: got {} expected {}",
+            hex(&bytes),
+            hex(&row.expect)
+        ));
+    }
+    if closed {
+        return Err("speaker closed after a well-formed command".to_string());
+    }
+    Ok(())
+}
+
+/// A high-bit byte in a command's argument never breaks verb matching:
+/// the row's normal reply comes back and the connection stays open, in
+/// both modes (T10 PR C; T6's `BitFlip(command.arg)`).
+#[tokio::test]
+async fn high_bit_argument_gets_the_normal_reply() {
+    run_rows(SeedMode::Patched, high_bit_rows(), high_bit_flow).await;
+    run_rows(SeedMode::Vulnerable, high_bit_rows(), high_bit_flow).await;
 }
