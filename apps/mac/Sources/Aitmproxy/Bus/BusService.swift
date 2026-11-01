@@ -277,6 +277,10 @@ final class BusService: FlowActions {
         if let armed = status["intercept_armed"]?.boolValue, armed != session.interceptArmed {
             session.interceptArmed = armed
         }
+        // Change-guarded like every other per-tick write here: an @Observable set
+        // notifies even when the value is equal, and every route surface reads it.
+        let decrypt = status["decrypt"].flatMap(DecryptStatus.init)
+        if session.decrypt != decrypt { session.decrypt = decrypt }
     }
 
     // MARK: FlowActions
