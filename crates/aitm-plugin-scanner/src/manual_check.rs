@@ -154,9 +154,15 @@ impl Command for ManualCheck {
 
         let request = synthetic_request(raw_url, &param, &value)?;
         let origin = util::origin_key(&request.scheme, &request.authority);
-        let (host_name, _) = util::split_authority(&request.authority);
-        // Deny-by-default, before anything is synthesized or sent.
-        if !services.guard.in_scope(host_name) {
+        // Deny-by-default, before anything is synthesized or sent. The guard is
+        // asked about the same `host:port` it will see at request time (the
+        // explicit port, else the scheme default): a ported scope entry matches
+        // only on port equality, so a bare host would never be admitted by it.
+        let (host_name, port) = util::split_authority(&request.authority);
+        let port = port
+            .or_else(|| util::default_port(&request.scheme))
+            .unwrap_or(0);
+        if !services.guard.in_scope(&format!("{host_name}:{port}")) {
             return Err(scan_error(
                 ScanErrorCode::OutOfScope,
                 format!("{origin} is not in the HTTP scope"),
@@ -684,5 +690,50 @@ mod tests {
         );
         // The other four are still the scanner's.
         assert!(reg.command("check.open-redirect").is_some());
+    }
+
+    /// Panel fix (2026-11-01): the manual check asks the guard about the same
+    /// `host:port` the request-time guard sees. A ported entry admits the url
+    /// on that port and refuses another port; an explicit `:443` entry admits
+    /// a default-port https url.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_check_ported_scope_entry_matches_on_port() {
+        let h = Harness::new();
+        h.guard.add_scope(ScopeEntry {
+            host: "127.0.0.1:8080".into(),
+        });
+        h.guard.add_scope(ScopeEntry {
+            host: "secure.test:443".into(),
+        });
+
+        let err = h
+            .call(
+                "check.reflected-xss",
+                &[
+                    ("url", s("http://127.0.0.1:8081/search")),
+                    ("param", s("q")),
+                ],
+            )
+            .expect_err("another port is not the scoped one");
+        assert_eq!(code(&err), ScanErrorCode::OutOfScope);
+        assert!(h.client.payloads().is_empty());
+
+        h.call(
+            "check.reflected-xss",
+            &[
+                ("url", s("http://127.0.0.1:8080/search")),
+                ("param", s("q")),
+            ],
+        )
+        .expect("the ported entry admits the url on that port");
+        h.call(
+            "check.reflected-xss",
+            &[("url", s("https://secure.test/search")), ("param", s("q"))],
+        )
+        .expect("the 443 entry admits the default-port https url");
+        assert!(
+            !h.client.payloads().is_empty(),
+            "the admitted checks were sent"
+        );
     }
 }

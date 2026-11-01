@@ -716,8 +716,15 @@ pub fn start(
     for origin in &profile.target.origins {
         let normalized = profiles::normalize_origin(origin)
             .map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
-        let host = host_of(&normalized);
-        if !services.guard.in_scope(&host) {
+        // Ask the guard about the same `host:port` the request-time guard will
+        // see (the explicit port, else the scheme default), through the one
+        // parser the crawl seed and `inject` use. A ported scope entry such as
+        // `127.0.0.1:54010` matches only on port equality, so a bare host
+        // would never be admitted by it. An origin the parser cannot fold is
+        // refused (deny-by-default) rather than checked on a guess.
+        let admitted = crate::crawl::guard_authority_for(&normalized)
+            .is_some_and(|authority| services.guard.in_scope(&authority));
+        if !admitted {
             return Err(scan_error(
                 ScanErrorCode::OutOfScope,
                 format!("{normalized} is not in the HTTP scope"),
@@ -895,18 +902,6 @@ fn check_l4_target(
             )
         })?;
     Ok(())
-}
-
-/// The host of a normalized `scheme://host[:port]` origin.
-fn host_of(origin: &str) -> String {
-    origin
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(origin)
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or_else(|| origin.split_once("://").map(|(_, r)| r).unwrap_or(origin))
-        .to_string()
 }
 
 /// The wire token of a lane, for the `lane_unavailable` message.
@@ -1843,7 +1838,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use aitm_core::{AgentPolicy, Frontend};
+    use aitm_core::{AgentPolicy, Frontend, ScopeRateGuard};
     use aitm_scan_model::{Intensity, LaneKind, ScanErrorCode, SessionMode, SkippedLane};
 
     /// Spec D5, call B3: the services are bound by the binary after the proxy
@@ -2325,5 +2320,78 @@ mod tests {
         assert_eq!(started.lanes.requested, vec![LaneKind::Http]);
         assert_eq!(started.lanes.run, vec![LaneKind::Http]);
         assert!(started.lanes.skipped.is_empty());
+    }
+
+    /// Panel fix (2026-11-01): the start-time scope check must ask the guard
+    /// about the SAME `host:port` the request-time guard sees. A ported entry
+    /// (`127.0.0.1:8080`, what every real e2e cell seeds) admits the origin on
+    /// that port and refuses another port; stripping the port made the entry
+    /// admit nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ported_scope_entry_admits_the_matching_origin_and_refuses_another_port() {
+        let h = Harness::new();
+        h.bind();
+        h.guard.add_scope(aitm_core::ScopeEntry {
+            host: "127.0.0.1:8080".into(),
+        });
+
+        let err = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://127.0.0.1:8081"]),
+            operator(),
+            true,
+        )
+        .expect_err("another port is not the scoped one");
+        assert_eq!(code(&err), ScanErrorCode::OutOfScope);
+        assert!(err.to_string().starts_with("scan: out_of_scope: "), "{err}");
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://127.0.0.1:8080"]),
+            operator(),
+            true,
+        )
+        .expect("the ported entry admits the origin on that port");
+        assert_eq!(started.lanes.run, vec![LaneKind::Http]);
+        h.cancel_all();
+    }
+
+    /// A portless entry still covers every port of its host (the
+    /// `Authority::matches_scope_entry` rule), so the fix is not a tightening.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_portless_entry_still_admits_any_port() {
+        let h = Harness::new();
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test:9000"]),
+            operator(),
+            true,
+        )
+        .expect("`scan.test` covers every port");
+        assert_eq!(started.lanes.run, vec![LaneKind::Http]);
+        h.cancel_all();
+    }
+
+    /// An origin that elides its port is checked on the scheme default, so an
+    /// explicit `secure.test:443` entry admits `https://secure.test`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn https_default_port_matches_a_443_entry() {
+        let h = Harness::new();
+        h.bind();
+        h.guard.add_scope(aitm_core::ScopeEntry {
+            host: "secure.test:443".into(),
+        });
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["https://secure.test"]),
+            operator(),
+            true,
+        )
+        .expect("the 443 entry admits the default-port https origin");
+        assert_eq!(started.lanes.run, vec![LaneKind::Http]);
+        h.cancel_all();
     }
 }
