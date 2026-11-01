@@ -126,3 +126,13 @@ orchestrator re-runs `run.py scan` in the Terminal (`/tmp/claude/t10-scan-run3.l
   row; the copy stays with a comment naming its source.
 - `TargetLogs.last_seq()` unused by cells but pinned by D7: kept.
 - `fail`/`skip` `NoReturn` annotations live in `aitm_e2e/__init__.py` (not T10's); follow-up for the e2e framework owner.
+
+## Already done by the stage-5 tester (commit after 2c7a3251): do not redo
+- Item 2 (`/ws` block) and item 4 (28-id 404 sweep on both origins) are implemented in
+  `test_t10_target_selfcheck.py` (`check_ws`, `check_manifest_404`); item 1 (all seed rows) and item 3 (nine
+  speakers) remain. Keep the tester's helpers; add the missing rows and speakers table-driven beside them.
+- `test_t4_points.py` observer, `test_t4_ws_namespace.py` cap assertion, `test_t1_record_policy.py` and
+  `test_t6_denylist_real_servers.py` non-vacuity, the bundled cell's P-side attribution closure: done; items 10 and
+  15 (cap) are satisfied; still assert `wait_terminal(...)["state"] == "done"` in the T4 cells.
+- The tester changed the bundled cell's tag to `needs=ws`; the orchestrator's ruling is `needs=http` (plan B4 amended):
+  set it back to `# e2e: tier=T1 surface=scan needs=http`.
