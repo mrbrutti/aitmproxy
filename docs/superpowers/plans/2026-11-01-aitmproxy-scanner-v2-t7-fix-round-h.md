@@ -115,6 +115,14 @@ H57 (cell). The second subscriber drained zero lines of any method while the TUI
 
 H58 (contract, relayed to the coordinator). The engine at 8be3e070 refuses `scan.sitemap {}` with `scan: invalid_profile: give either job or target`, while the umbrella D3 declares both optional (`{ job?, target?, cursor?, limit? }`) and the TUI's D6 sends `{}` on entering the Site map tab for the all-jobs map. Either the engine accepts `{}` (all jobs) per the umbrella, or the umbrella and D6 change to "one of `job`/`target` required" and the TUI sends the Jobs cursor's job on tab entry. Until ruled, the TUI's tab-entry request fails harmlessly (the error shows on the Site map banner) and `J` works.
 
+## Coordinator contract notes (2026-11-01)
+
+H59 (cell). `l4_add_args` sends `inject_rate_pps` explicitly when `tools/list` declares it for `l4.scope.add` (the default 0 is the fail-closed value and the guard's refusal does not yet name the field): `inject_rate_pps: 10` so the confirmed launch can inject for real; `l4_entry_matching`'s tuple includes it when echoed.
+
+H60 (Rust, at Task 17 after the integration merge brings the model). `Issue.location.l4 = { ip, port, proto, grammar, field_path, mutation }` arrives with T1b's final head: the Issues detail renders a `l4` line (`ip:port/proto · grammar · field_path · mutation`, each part only when present, bounded like the other detail values) when `location.l4` is `Some`; test with a fixture issue carrying it. Not doable before the model lands on main (this branch's `IssueLocation` has no `l4`).
+
+Satisfied already: `poc_ref` not in the Findings list toasts the ref path (`POC_TOAST_MAX`), the spec's fallback.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
