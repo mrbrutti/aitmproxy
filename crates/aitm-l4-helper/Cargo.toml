@@ -22,8 +22,10 @@ pcap = "2.5"
 # Local-destination inject on Linux (spec S1 from spike S7, plan A6): a raw IP
 # socket with IP_HDRINCL through socket2's safe API (`set_header_included_v4`),
 # because `pcap_inject` of an L2 frame on `lo` is dropped as a martian. Already
-# in `Cargo.lock` (tokio/hyper); no new transitive code.
-socket2 = "0.6"
+# in `Cargo.lock` (tokio/hyper); no new transitive code. `set_header_included_*`
+# live behind socket2's `all` feature; declared here rather than inherited from
+# tokio's enabling of it elsewhere in the graph.
+socket2 = { version = "0.6", features = ["all"] }
 
 [lints]
 workspace = true

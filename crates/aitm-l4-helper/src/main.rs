@@ -4,7 +4,8 @@
 //! One binary, five subcommands (spec §1): `bpf-permissions` and `bpf-revert`
 //! (macOS), `serve` (Linux), `probe` and `version`. This file only parses the
 //! command line and dispatches; `probe` lives in `probe.rs`, the bpf modes in
-//! `bpf.rs` / `bpf_exec.rs` / `log.rs`, and `serve` arrives in a later task.
+//! `bpf.rs` / `bpf_exec.rs` / `log.rs`, and `serve` in `serve.rs` (start-up)
+//! and `serve_loop.rs` (the session).
 #![forbid(unsafe_code)]
 
 // The bpf modes run only on macOS; elsewhere `main` refuses them before
@@ -20,15 +21,13 @@ mod probe;
 // `serve` runs only on Linux; the pure checks it exports are unused elsewhere.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod serve;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod serve_loop;
 
 use std::process::ExitCode;
 
 /// Exit status for a rejected command line (the conventional usage code).
 const EXIT_USAGE: u8 = 2;
-/// Exit status for a mode this build does not implement yet (the `serve`
-/// loop, task P2.7).
-#[cfg(target_os = "linux")]
-const EXIT_NOT_IMPLEMENTED: u8 = 70;
 /// Exit status when `probe` could not gather its inputs.
 const EXIT_PROBE_FAILED: u8 = 1;
 /// Exit status when `bpf-permissions` or `bpf-revert` (or their `--dry-run`)
@@ -37,7 +36,8 @@ const EXIT_BPF_FAILED: u8 = 1;
 /// Exit status for a mode on a platform that cannot run it: a bpf mode where
 /// there is no `/dev/bpf*`, `serve` off Linux (`EX_UNAVAILABLE`).
 const EXIT_WRONG_PLATFORM: u8 = 69;
-/// Exit status when `serve` start-up (spec §5.1 steps 1–6) failed.
+/// Exit status when `serve` start-up (spec §5.1 steps 1–6) failed, or the
+/// session ended on a protocol violation or a socket write failure.
 #[cfg(target_os = "linux")]
 const EXIT_SERVE_FAILED: u8 = 1;
 
@@ -78,19 +78,37 @@ fn main() -> ExitCode {
     }
 }
 
-/// `serve` on Linux (spec §5.1): start-up first, which exits non-zero before
-/// any other I/O on failure. The serve loop itself arrives in task P2.7; until
-/// then a successful start-up reports that and exits non-zero.
+/// `serve` on Linux (spec §5.1, §5.2): start-up first, which exits non-zero
+/// before any other I/O on failure; then the session over the real wire
+/// until the core closes the socket (exit 0) or breaks the protocol.
 #[cfg(target_os = "linux")]
 fn run_serve(connect: &std::path::Path) -> ExitCode {
+    use std::sync::Arc;
+
     let pkexec_uid = std::env::var_os("PKEXEC_UID");
-    match serve::startup(connect, pkexec_uid.as_deref()) {
-        Ok(_stream) => {
-            eprintln!("aitm-l4-helper: serve loop arrives in task P2.7");
-            ExitCode::from(EXIT_NOT_IMPLEMENTED)
-        }
+    let stream = match serve::startup(connect, pkexec_uid.as_deref()) {
+        Ok(stream) => stream,
         Err(err) => {
             eprintln!("aitm-l4-helper: serve: {err}");
+            return ExitCode::from(EXIT_SERVE_FAILED);
+        }
+    };
+    let writer = match stream.try_clone() {
+        Ok(writer) => writer,
+        Err(err) => {
+            eprintln!("aitm-l4-helper: serve: cannot clone the socket: {err}");
+            return ExitCode::from(EXIT_SERVE_FAILED);
+        }
+    };
+    match serve_loop::serve_loop(
+        stream,
+        writer,
+        Arc::new(serve_loop::PcapWire),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(exit) => {
+            eprintln!("aitm-l4-helper: serve: {exit}");
             ExitCode::from(EXIT_SERVE_FAILED)
         }
     }
