@@ -261,7 +261,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
      and a `moka::sync::Cache<String, Negotiated>` field built with
      `.time_to_live(ALPN_CACHE_TTL)` (`const ALPN_CACHE_TTL: Duration =
      Duration::from_secs(600)`) and `.max_capacity(1024)`. `moka` is already a
-     dependency of this crate. Test accessor `pub fn negotiated_for(&self, authority: &str) -> Option<Negotiated>`.
+     dependency of this crate. Test accessor `pub fn negotiated_for(&self, scheme: &str, authority: &str) -> Option<Negotiated>`.
   4. `fn client_config(&self, alpn: &[&[u8]]) -> Result<Arc<ClientConfig>>` takes the
      ALPN list (the body is today's, with `cfg.alpn_protocols` from the argument).
      Offers: `Auto` on a cached-miss `https` origin -> `[b"h2", b"http/1.1"]`;
@@ -303,12 +303,12 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
   returning `127.0.0.1`, and a local `server_config(alpn)` copied from
   `module.rs`'s test helper):
   - `auto_offers_both_protocols_and_caches_h2`: server ALPN `[b"h2", b"http/1.1"]`;
-    after the send, `sender.negotiated_for("origin.test:443") == Some(Negotiated::H2)`
+    after the send, `sender.negotiated_for("https", "origin.test:443") == Some(Negotiated::H2)`
     and the ALPN list the server saw is `["h2", "http/1.1"]`.
   - `auto_falls_back_to_h1_when_the_server_picks_http11`: server ALPN
     `[b"http/1.1"]`; the exchange returns `status == 200`,
     `resp.version == aitm_core::HttpVersion::Http11`, and
-    `negotiated_for(..) == Some(Negotiated::H1)`.
+    `negotiated_for("https", ..) == Some(Negotiated::H1)`.
   - `the_second_send_offers_only_the_cached_protocol`: two sends to one authority;
     the recorded offered lists are exactly
     `vec![vec!["h2".to_string(), "http/1.1".to_string()], vec!["http/1.1".to_string()]]`
@@ -459,7 +459,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
     `connection` key (S1/D8.2: `Connection: close` is h1-only).
   - `a_forced_h1_send_does_not_pollute_the_alpn_cache` (`sender.rs` tests): a
     `VersionPolicy::H1` send to an h2-capable origin leaves
-    `negotiated_for("origin.test:443") == None`, and the following `Auto` send offers
+    `negotiated_for("https", "origin.test:443") == None`, and the following `Auto` send offers
     `["h2", "http/1.1"]` and caches `Some(Negotiated::H2)`.
 - **Done when:** `cargo test -p aitm-proto-http --offline` passes and the full gate passes.
 
@@ -1377,6 +1377,11 @@ Kept by the main session during stage 6. One row per finding.
 | 7 | Coder (Task 7 report) | Minor | The "every repeat must agree" branch (a hit that does not reproduce) is untestable with the stateless `ScriptedHost` | Open for the fix round: add `on_nth(needle, n, resp)` to `tests/support/mod.rs` and the test |
 | 7 | Coder (Task 7 report) | Minor | `cost: Medium` ("at most ten probes") versus a boolean probe cap of 12 | Decided (T3 session 2026-11-01): lower the cap to 10 in the fix round so the meta is honest (ZAP's medium strength is 6 payloads); common-case hit costs 3/5/7 |
 | 7 | Coder (Task 7 report) | Minor | `Evidence.payload` carries the false arm; a point without `example` sends an empty control | Accepted |
+| 1,3,4,6,9a,F1 | Spec reviewer (sender panel) | Minor | `pub const FRAME_HEADER_LEN` in `raw_h2.rs` is public API the plan did not list | Open for fix round F2: make it `pub(crate)`, keep `-> [u8; 9]` in the public signature |
+| 1,3,4,6,9a,F1 | Spec reviewer (sender panel) | Minor | Plan Task 1 still showed `negotiated_for(&self, authority)`; F1.2 changed it to `(scheme, authority)`; `with_alpn_cache_ttl` authorised only by the F1.3 row | Fixed in the plan text (this commit): Task 1 item 3 and its test descriptions now carry the shipped signature; F1.3's builder recorded here as an accepted addition |
+| 1,3,4,6,9a,F1 | Spec reviewer (sender panel) | Minor | The coder fact sheet claimed 212 lib tests; a post-`cargo clean -p` run shows 206 (the pre-9a baseline was 200, not 206) | Fixed: fact sheet corrected to 206; the whole-branch tester quotes a post-clean count |
+| 1,3,4,6,9a,F1 | Spec reviewer (sender panel) | Minor | No AC evidence exists in this range by design (duplex-only tests) | Agreed: ACs T3-1..T3-3 stay open until Task 17's real-bus cells are quoted; this panel accepts the range against its plan tasks only |
+| 1,3,4,6,9a,F1 | Spec reviewer (sender panel) | — | Verdict PASS: scope exactly the four T3 files, every D8.2/D9.1 behaviour mapped to a literal test, alias intact, caps retained | Recorded |
 | 3 | Coder (Task 3 report) | Minor | ALPN cache and h2 pool are keyed by `host:port` without scheme; one sender driving `http://h:p` (h2c) and `https://h:p` would collide on one key | Fixed in eb5b1f40 (F1.2): `conn_key(scheme, authority)` for cache and pool; `negotiated_for(scheme, authority)`; two tests |
 | 1,2,4 | Coder (Tasks 2 and 4 reports) | Important (process) | Parallel coders share one git index; a `git add <path>` + bare `git commit` swept a sibling's staged files into commit 25a42279 | Fixed by the Task 4 coder (rebuilt as 013a338e, single file); every later brief requires `git commit -- <paths>`; orchestrator audits each commit's stat |
 
