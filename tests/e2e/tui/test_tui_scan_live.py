@@ -36,11 +36,16 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
   T7-19 (UI-5) a `map-only` job that reached `done`: every host, `METHOD path_template` and
         point name of the harness's live scan.sitemap read is in the rendered text (never
         a fixture); Enter on the node under the cursor opens its first flow in the
-        inspector. A Site map head that never draws is reported with the strip banner,
-        the Jobs cursor's job and the harness's own node counts (H39).
+        inspector. The wait after `3`/`J` ends on the job's `{n} nodes` head, or on a
+        strip banner that CHANGED to an error wording since the snapshot taken before
+        the keys (a wording already on the strip is stale, H54); a head that never draws
+        is reported with the banner, the Jobs cursor's job and the harness's own node
+        counts (H39).
   T7-20 hygiene: the seeded Cookie and Authorization values (and their first 12 hex
         chars) never appear in any screen sample taken on the Scan surface (every sample
         is kept, tagged with its surface, and grepped), and q ends the process with exit 0.
+        The values are seeded on `GET /` (the session-bearing flow the engine's session
+        reuse reads); the reflected `GET /search?q=<marker>` goes without them (H55).
 
 Capability gates -> exit 77 (SKIP), nothing claimed:
   * no aitm-tui binary (AITM_TUI_BIN, a build output, or PATH);
@@ -67,9 +72,10 @@ Exit 0 PASS / 1 FAIL / 77 SKIP.
 `python3 -I tests/e2e/tui/test_tui_scan_live.py --selftest` runs the screen readers
 (cursor row, severity group, editor header, surface tag, inspector, Findings head, the
 Site map node and marker, the wire-confirm overlay, the crawl `browser` line, the strip
-banner, the prompt bar and the Fields `origins`/`l4` lines), the failure-screen writer,
-the L4 scope read, the prompt and `browser` key helpers against a scripted terminal
-(H49, H44) and the push-counting thread against a scripted bus client (H46), against
+banner, the Site map settle rule (H54), the prompt bar and the Fields `origins`/`l4`
+lines), the failure-screen writer, the L4 scope read and add arguments (H59), the prompt
+and `browser` key helpers against a scripted terminal (H49, H44) and the push-counting
+thread against a scripted bus client with the harness's per-line read (H46, H57), against
 frames painted with the TUI's real geometry (the boxed Scan view, its pane rule, a
 sidebar offset), with no core and no pty, one line per assertion; exit 0 when all hold.
 """
@@ -421,11 +427,11 @@ class Evidence:
     with the surface its text shows (`surface_of`: `scan`, the four tabs; `inspector`, a
     flow detail; `other`, Flows, Findings, the exit), and written REDACTED to the
     artifacts dir, so no file and no printed line can carry a seeded secret. An overlay
-    is tagged by the body under it: the wire confirm of a Scan launch draws over
-    `main_region` today (`ui/mod.rs` `render` has no `Mode::WireConfirm` body arm), so
-    its sample tags `other` or `inspector` and leaves the T7-20 grep until H18 draws the
-    Scan view under it (H15). A secret is matched whole and by its first SECRET_PREFIX
-    hex chars, so a pane that truncates the value is still caught."""
+    is tagged by the body under it, which is the view the launch came from (`ui/mod.rs`
+    `render` draws the body of `wire_confirm_from` under `Mode::WireConfirm`, H18): a
+    Scan launch's wire confirm tags `scan` and is in the T7-20 grep; an L4 confirm from
+    Flows tags `other` or `inspector` (H15). A secret is matched whole and by its first
+    SECRET_PREFIX hex chars, so a pane that truncates the value is still caught."""
 
     def __init__(self, secret_values, directory=None):
         self.secrets = [s for s in secret_values if s]
@@ -547,20 +553,38 @@ class Checks:
 
 JOB_PUSH = "notifications/aitm/job"
 PUSH_SAMPLES = 3
+# One socket read of the push thread: `BusClient.wait_notification(JOB_PUSH, timeout)`,
+# the per-line read T1b's `tests/e2e/scan/test_t1_push.py` receives the job lines with
+# (`aitm_e2e/scan.py` `collect_push`, whose timeout is the remaining deadline; here a
+# short one so `stop()` is noticed). The third live run's thread read with
+# `drain_notifications(0.5)`, which returns only after 0.5 s of silence on the socket:
+# the TUI's polling fans a `notifications/aitm/agent` audit line out to the subscriber
+# every ~150 ms (2342 lines in that run), so the drain never returned while the TUI
+# lived, the T7-16 check read zero lines, and all 2518 lines landed in one batch after
+# `q` (H57).
+PUSH_READ_S = 1.0
+PUSH_READ = (f"BusClient.wait_notification({JOB_PUSH!r}, {PUSH_READ_S} s) per line, the client's "
+             "stash folded around each read (T1b collect_push)")
 
 
 class Pushes:
     """The second bus client: holds a flow.subscribe subscription and tallies
     notifications/aitm/job lines by job and params.event (spec D3 push kind; the
     engine fans `{job, kind, event, seq, status, issue?}` out to every connection
-    holding any flow.subscribe, no replay). Its own state is visible (H46): every
-    drained line counted by method, the first PUSH_SAMPLES raw job params kept, the
-    flow.subscribe reply, the lines the client could not parse and the messages the
-    fold rejected (each counted and read past, never fatal), and why the thread
-    stopped: `stop()`, or `<Type>: <text>` when an exception ended `_run` (the socket
-    closed by the core is a `BusError`). The client's own stash is cleared after each
-    drain. The first live run recorded `{}` with none of this, so an empty count could
-    not be told from a dead thread."""
+    holding any flow.subscribe, no replay). It subscribes as T1b's cell does (one
+    `flow.subscribe {}` on a second operator `BusClient`) and reads as T1b's
+    `collect_push` does: one `wait_notification(JOB_PUSH, ..)` per job line, the lines
+    it stashes meanwhile (replies, flow and agent lines) folded from the client's
+    stash around each read, never a drain that waits for a quiet socket (H57; `read`
+    in the snapshot names the mechanism, `idle_reads` counts the reads that returned
+    nothing). The TUI's own connection is no observer: it polls and holds no
+    subscription, so it sees no push. Its own state is visible (H46): every line
+    counted by method, the first PUSH_SAMPLES raw job params kept, the flow.subscribe
+    reply, the lines the client could not parse and the messages the fold rejected
+    (each counted and read past, never fatal), and why the thread stopped: `stop()`,
+    or `<Type>: <text>` when an exception ended `_run` (the socket closed by the core
+    is a `BusError`). The first live run recorded `{}` with none of this, so an empty
+    count could not be told from a dead thread."""
 
     def __init__(self, client, subscribe_reply=None):
         self.client = client
@@ -568,6 +592,7 @@ class Pushes:
         self.counts = {}  # job -> event -> n
         self.by_method = {}  # method (or `<reply>`) -> lines
         self.lines = 0
+        self.idle_reads = 0
         self.bad_lines = 0
         self.bad_messages = 0
         self.last_error = ""
@@ -581,23 +606,39 @@ class Pushes:
     def _run(self):
         try:
             while not self._stop.is_set():
+                # The stash first: `wait_notification` answers a stashed job line without
+                # removing it, so the stash must hold no job line when it is called.
+                self._fold_stash()
                 try:
-                    msgs = self.client.drain_notifications(0.5)
-                except ValueError as e:
-                    # One line `_recv` could not parse: the socket is intact and the line
-                    # consumed (the harness's drain loses the batch before it); read on.
+                    m = self.client.wait_notification(JOB_PUSH, timeout=PUSH_READ_S)
+                except (ValueError, AttributeError) as e:
+                    # One line `_recv` could not parse, or parsed to no object: the socket
+                    # is intact and the line consumed; read on.
                     self._error("bad_lines", e)
                     continue
-                for m in msgs:
-                    try:
-                        self._fold(m)
-                    except Exception as e:  # noqa: BLE001  one bad message, never the thread
-                        self._error("bad_messages", e)
-                self.client.notifications.clear()
+                if m is None:
+                    with self._lock:
+                        self.idle_reads += 1
+                else:
+                    self._fold_one(m)
+                self._fold_stash()
         except Exception as e:  # noqa: BLE001  the socket died or the client is gone
             self._end(f"{type(e).__name__}: {e}")
             return
         self._end("stop()")
+
+    def _fold_stash(self):
+        """Fold and empty the client's stash (what `wait_notification` read past)."""
+        stash = self.client.notifications
+        msgs, stash[:] = list(stash), []
+        for m in msgs:
+            self._fold_one(m)
+
+    def _fold_one(self, m):
+        try:
+            self._fold(m)
+        except Exception as e:  # noqa: BLE001  one bad message, never the thread
+            self._error("bad_messages", e)
 
     def _fold(self, m):
         if not isinstance(m, dict):
@@ -642,6 +683,7 @@ class Pushes:
         with self._lock:
             return {"by_job": {j: dict(ev) for j, ev in self.counts.items()},
                     "by_method": dict(self.by_method), "lines": self.lines,
+                    "idle_reads": self.idle_reads, "read": PUSH_READ,
                     "bad_lines": self.bad_lines, "bad_messages": self.bad_messages,
                     "last_error": self.last_error, "stopped_by": self.stopped_by,
                     "subscribe_reply": self.subscribe_reply,
@@ -651,7 +693,8 @@ class Pushes:
         """The state as one failure detail (redacted by the check that prints it)."""
         s = self.snapshot()
         return (f"push thread stopped_by: {s['stopped_by'] or 'running'}; {s['lines']} lines by method "
-                f"{s['by_method']}; bad lines {s['bad_lines']}, bad messages {s['bad_messages']}, last "
+                f"{s['by_method']}; {s['idle_reads']} idle reads of {s['read']}; bad lines "
+                f"{s['bad_lines']}, bad messages {s['bad_messages']}, last "
                 f"error {s['last_error']!r}; flow.subscribe reply {s['subscribe_reply']!r}; first "
                 f"{JOB_PUSH} params {s['first_job_params']}")
 
@@ -941,6 +984,22 @@ def banner_is_error(banner):
     return bool(banner) and BANNER_QUIET_RE.match(banner) is None
 
 
+def sitemap_settled(text, marker, banner_before):
+    """How the Site map tab has settled after `3`/`J`, or None while it has not (H54):
+    `head` when the job's `{n} nodes` marker is on the screen; `error` when the strip
+    banner is an error wording (`banner_is_error`) AND differs from `banner_before`,
+    the banner snapshotted before the keys. A wording that was already on the strip is
+    stale (the third live run: the T7-18 L4 launch's `lane_unavailable` text, shown on
+    every tab by the `last_error` fallback the Rust item H56 removes) and settles
+    nothing; a quiet banner settles nothing either."""
+    if marker in text:
+        return "head"
+    now = banner_of(text)
+    if now != banner_before and banner_is_error(now):
+        return "error"
+    return None
+
+
 def sitemap_node_count(bus, args):
     """The node count of the harness's own `scan.sitemap` read with `args`, or the
     error text (H39)."""
@@ -1175,30 +1234,49 @@ def phases_of(samples):
 
 
 def step_seed(ctx):
-    """One real GET through the proxy carrying session material: the flow the scanner
-    reuses, the /search node the crawl finds, and the T7-20 secrets."""
+    """Two real GETs through the proxy. First `GET /` carrying the session material
+    (`Cookie: sid=..`, `Authorization: Bearer ..`): the flow the engine's session reuse
+    reads and picks its canary from, and the source of the T7-20 secrets. Then
+    `GET /search?q=<marker>` WITHOUT session headers: the /search node the crawl finds
+    and the one reflected-xss point the audit must attack. The third live run seeded
+    the material on /search itself; the engine made that flow the session canary
+    (`session reused · canary GET /search?q=..` in the Jobs detail), a canary is not
+    attacked, and the job raised nothing (H55)."""
     c = ctx.c
-    url = f"{ctx.target}/search?q={ctx.marker}"
-    headers = {"Cookie": f"sid={ctx.cookie_secret}",
-               "Authorization": f"Bearer {ctx.auth_secret}",
-               "Connection": "close"}
+    session_headers = {"Cookie": f"sid={ctx.cookie_secret}",
+                       "Authorization": f"Bearer {ctx.auth_secret}",
+                       "Connection": "close"}
     try:
-        resp = via_proxy(ctx.proxy_port, "GET", url, headers=headers)
+        session = via_proxy(ctx.proxy_port, "GET", f"{ctx.target}/", headers=session_headers)
+    except OSError as e:
+        c.fatal("seed: the session-bearing GET / through the proxy failed", str(e))
+    c.check("seed: GET / with the session headers (Cookie, Authorization) answered 200 (H55)",
+            session.status == 200, f"status {session.status}")
+    url = f"{ctx.target}/search?q={ctx.marker}"
+    try:
+        resp = via_proxy(ctx.proxy_port, "GET", url, headers={"Connection": "close"})
     except OSError as e:
         c.fatal("seed: the GET through the proxy failed", str(e))
     body = resp.body.decode("utf-8", "replace")
-    c.check("seed: GET /search answered 200 and reflected the marker",
+    c.check("seed: GET /search (no session headers, H55) answered 200 and reflected the marker",
             resp.status == 200 and ctx.marker in body, f"status {resp.status}")
 
-    def row():
+    def flows():
         try:
-            rows = ctx.bus.call("flow.table").get("flows", [])
+            return ctx.bus.call("flow.table").get("flows", [])
         except (ToolError, BusError):
-            return None
-        return next((r for r in rows if ctx.marker in (r.get("path") or "")), None)
+            return []
+
+    def row():
+        return next((r for r in flows() if ctx.marker in (r.get("path") or "")), None)
+
+    def session_row():
+        return next((r for r in flows() if (r.get("path") or "") == "/" and r.get("method") == "GET"), None)
 
     c.check("seed: the core captured the seeded flow (flow.table)",
             poll(lambda: row() is not None, 20), "no row carries the marker")
+    c.check("seed: the core captured the session-bearing GET / (flow.table; the T7-20 source, H55)",
+            poll(lambda: session_row() is not None, 20), "no GET / row")
     c.check("seed: the TUI painted the seeded flow", poll(lambda: ctx.marker in ctx.term.text(), 20),
             ctx.screen("seed"))
 
@@ -1496,10 +1574,32 @@ def step_t7_17(ctx):
     cancel_quietly(ctx.bus, job)
 
 
-def l4_add_args(bus, cidr, ports):
-    """The l4.scope.add arguments, built from the names tools/list declares."""
+# The injection rate the cell's inject entry carries (`l4.scope.add` `inject_rate_pps`,
+# crates/aitm-proto-l4/src/commands/scope.rs: "0 => refuse. Default 0"): the engine's
+# default is the fail-closed value and the guard's refusal does not yet name the field,
+# so an entry added without it clears the D7 gate but can never inject (H59).
+L4_INJECT_RATE_PPS = 10
+
+
+def l4_args_for(declared, cidr, ports):
+    """The l4.scope.add arguments for a schema declaring the property names `declared`
+    (None or empty when tools/list could not be read or does not list the verb): the
+    five tuple fields (`interface`, `direction`, `capability`, `cidr`, `ports`), cut to
+    the declared names when known, plus `inject_rate_pps: L4_INJECT_RATE_PPS` only when
+    the schema declares it (H59). Also the tuple fields the schema lacks (`unknown`)."""
     wanted = {"interface": "*", "direction": "outbound", "capability": "inject",
               "cidr": cidr, "ports": ports}
+    if not declared:
+        return wanted, []
+    unknown = sorted(k for k in wanted if k not in declared)
+    args = {k: v for k, v in wanted.items() if k in declared}
+    if "inject_rate_pps" in declared:
+        args["inject_rate_pps"] = L4_INJECT_RATE_PPS
+    return args, unknown
+
+
+def l4_add_args(bus, cidr, ports):
+    """The l4.scope.add arguments, built from the names tools/list declares (`l4_args_for`)."""
     declared = None
     try:
         tools = bus.tools()
@@ -1510,13 +1610,22 @@ def l4_add_args(bus, cidr, ports):
             schema = t.get("inputSchema") or {}
             props = schema.get("properties") or {}
             declared = set(props.keys())
-    if not declared:
-        return wanted, []
-    unknown = sorted(k for k in wanted if k not in declared)
-    return {k: v for k, v in wanted.items() if k in declared}, unknown
+    return l4_args_for(declared, cidr, ports)
 
 
 L4_TUPLE_KEYS = ("cidr", "ports", "interface", "direction", "capability")
+
+
+def echoed_pps(entry):
+    """The injection rate an l4.scope.list entry echoes, as an int: `inject_rate.pps`
+    (the core's shape, crates/aitm-proto-l4/src/commands/mod.rs) or a flat
+    `inject_rate_pps`; None when the entry echoes neither or it is not a number (H59)."""
+    rate = entry.get("inject_rate")
+    raw = rate.get("pps") if isinstance(rate, dict) else entry.get("inject_rate_pps")
+    try:
+        return int(raw) if raw is not None and not isinstance(raw, bool) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def l4_entries(bus):
@@ -1540,7 +1649,9 @@ def l4_entry_matching(bus, args):
     (`cidr`, `ports` as the core echoes them, `lo-hi`, `interface`, `direction`,
     `capability`) and whose `source` is `runtime` (added over the bus), or None: the
     exact match H2 allows for a lost `l4.scope.add` reply, never the loose one G97
-    ruled out. None too when any tuple key was not sent."""
+    ruled out. None too when any tuple key was not sent. When `inject_rate_pps` was
+    sent and the entry echoes a rate (`echoed_pps`), the rate is part of the tuple,
+    compared as integers (H59)."""
     if any(k not in args for k in L4_TUPLE_KEYS):
         return None
     ports = str(args["ports"])
@@ -1548,10 +1659,15 @@ def l4_entry_matching(bus, args):
         ports = f"{ports}-{ports}"
     want = (str(args["cidr"]), ports, str(args["interface"]), str(args["direction"]),
             str(args["capability"]), "runtime")
+    sent_pps = args.get("inject_rate_pps")
     for e in l4_entries(bus):
         got = tuple(str(e.get(k, "")) for k in L4_TUPLE_KEYS + ("source",))
-        if got == want and e.get("id"):
-            return str(e["id"])
+        if got != want or not e.get("id"):
+            continue
+        pps = echoed_pps(e)
+        if sent_pps is not None and pps is not None and pps != int(sent_pps):
+            continue
+        return str(e["id"])
     return None
 
 
@@ -1753,18 +1869,22 @@ def step_t7_19(ctx):
     nodes = [n for n in (live.get("nodes") or []) if isinstance(n, dict)]
     points = [p for p in (live.get("points") or []) if isinstance(p, dict)]
 
+    # The strip banner as it reads BEFORE the keys: a wording already there (the T7-18
+    # launch's refusal, in the third live run) is stale and must not end the wait (H54).
+    banner_before = banner_of(term.text())
     # `3`, then `J` (follow the Jobs cursor's job, the one the harness read), then the
     # job's own node count as the tab's marker: a wait on a bare `N nodes` before the pin
     # would ride on the job-less `scan.sitemap {}` answer (H11).
     term.press("3")
     term.press("J")
     marker = SITEMAP_MARKER.format(n=len(nodes))
-    # The tab settles two ways: the head, or an error wording on the strip banner (a
-    # `scan.sitemap` failure lands there, D9/D13); the failure then says which, with
-    # the strip row, whether the body still reads `no site map yet`, the Jobs cursor's
-    # job as the Jobs tab shows it (the job `J` pinned) and the harness's own node
-    # counts for `scan.sitemap {}` and `{job}` (H39).
-    poll(lambda: marker in term.text() or banner_is_error(banner_of(term.text())), 15)
+    # The tab settles two ways (`sitemap_settled`): the head, or a strip banner that
+    # changed to an error wording (a `scan.sitemap` failure lands there, D9/D13); the
+    # failure then says which, with the banner before and after, the strip row, whether
+    # the body still reads `no site map yet`, the Jobs cursor's job as the Jobs tab shows
+    # it (the job `J` pinned) and the harness's own node counts for `scan.sitemap {}` and
+    # `{job}` (H39).
+    poll(lambda: sitemap_settled(term.text(), marker, banner_before) is not None, 15)
     text = ctx.snap("t7-19-sitemap")
     drew = marker in text
     detail = ""
@@ -1775,10 +1895,12 @@ def step_t7_19(ctx):
         if tab(ctx, "2", 5):
             jobs_cursor = (cursor_row(term.text()) or "").split(" ", 1)[0] or None
         ctx.ev.write("screen-T7-19-jobs.txt", ctx.snap("t7-19-jobs"))
-        detail = (f"banner {banner_of(text)!r} (error wording: {banner_is_error(banner_of(text))}); "
-                  f"body reads `no site map yet`: {'no site map yet' in text}; Jobs cursor job "
-                  f"{jobs_cursor!r} (map job {job}); harness scan.sitemap {{}} {all_count} nodes, "
-                  f"{{job}} {len(nodes)} nodes; strip row {(line_with(text, SCAN_STRIP) or '').strip()!r}")
+        detail = (f"settled: {sitemap_settled(text, marker, banner_before)!r}; banner before `3`/`J` "
+                  f"{banner_before!r}, after {banner_of(text)!r} (error wording: "
+                  f"{banner_is_error(banner_of(text))}); body reads `no site map yet`: "
+                  f"{'no site map yet' in text}; Jobs cursor job {jobs_cursor!r} (map job {job}); "
+                  f"harness scan.sitemap {{}} {all_count} nodes, {{job}} {len(nodes)} nodes; strip row "
+                  f"{(line_with(text, SCAN_STRIP) or '').strip()!r}")
     if not c.check(f"T7-19: the Site map tab drew the live read's {len(nodes)} nodes for this job "
                    f"(`{marker}` on the Nodes pane head after `J`)", drew, detail):
         return
@@ -2285,8 +2407,9 @@ def wire_confirm_over(body_text):
     """The wire-confirm overlay (ui/scan/confirm.rs `render`) over `body_text`:
     `centered(screen, 90, 16)` at 200x50 (x 55, y 17), `boxed` (cleared, the title on
     the top border), then the call line, the prompt, the footnote and the key line.
-    `ui/mod.rs` `render` draws it last over whatever body the mode drew; today
-    `Mode::WireConfirm` has no body arm, so that body is `main_region` (H15/H18)."""
+    `ui/mod.rs` `render` draws it last over the body of the view the launch came from
+    (`wire_confirm_from`, H18): the Scan view for a Scan launch, `main_region` for an
+    L4 confirm from Flows (H15)."""
     f = Frame.from_text(body_text)
     w, h = min(COLS - 10, 90), min(ROWS - 8, 16)
     x, y = (COLS - w) // 2, (ROWS - h) // 2
@@ -2407,25 +2530,39 @@ class ScriptedTerm:
 
 
 class ScriptedPushClient:
-    """A bus client stand-in for `Pushes`: each `drain_notifications` call returns the
-    next scripted batch, or raises the scripted exception (a `ValueError` is one line
-    `_recv` could not parse, a `BusError` the socket closed by the core); the script
-    exhausted, it returns nothing, like a quiet socket."""
+    """A bus client stand-in for `Pushes` with the harness's `wait_notification` shape
+    (`aitm_e2e/bus.py`), the read T1b's `collect_push` relies on (H57): each call reads
+    the scripted lines one by one, stashes every line that is not a `method_contains`
+    notification on `notifications` (a reply, a flow or agent line) and returns the
+    first that is; a scripted exception is raised in its turn (a `ValueError` is one
+    line `_recv` could not parse, a `BusError` the socket closed by the core; a parsed
+    line that is not an object fails `m.get`, as it would there); the script exhausted,
+    the read returns None after a pause, like a quiet socket. It has no
+    `drain_notifications`: a thread that still called it would die at once."""
 
     def __init__(self, script):
         self.script = list(script)
+        self.pending = []
         self.notifications = []
-        self.drains = 0
+        self.reads = 0
 
-    def drain_notifications(self, _timeout):
-        self.drains += 1
-        if not self.script:
-            return []
-        item = self.script.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        self.notifications.extend(item)
-        return item
+    def wait_notification(self, method_contains, timeout=6.0):
+        self.reads += 1
+        while True:
+            if not self.pending:
+                if not self.script:
+                    time.sleep(0.01)
+                    return None
+                item = self.script.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                self.pending.extend(item)
+                continue
+            m = self.pending.pop(0)
+            # The harness's own test, verbatim (bus.py `wait_notification`).
+            if m.get("id") is None and method_contains in (m.get("method") or ""):
+                return m
+            self.notifications.append(m)
 
 
 def selftest():
@@ -2539,14 +2676,14 @@ def selftest():
             "T7-18 polls for, whatever body it is drawn over",
             all(CONFIRM_TITLE in t and "may disrupt the target" in t
                 for t in (over_insp, over_flows, over_scan)), row_of(over_insp, "disrupt"))
-    c.check("selftest: wire confirm over main_region (today's body, H18 pending): the sample "
+    c.check("selftest: wire confirm over main_region (an L4 confirm from Flows, H18): the sample "
             "tags the body under the box, `inspector` or `other` and never `scan`, and the "
             "inspector's secret prefix shows beside the box (H15)",
             surface_of(over_insp) == "inspector" and surface_of(over_flows) == "other"
             and secret[:SECRET_PREFIX] in over_insp,
             f"{surface_of(over_insp)} {surface_of(over_flows)}")
-    c.check("selftest: wire confirm over the Scan view (the body H18 adds): the sample tags "
-            "`scan` and the T7-20 grep covers it (H15)",
+    c.check("selftest: wire confirm over the Scan view (a Scan launch's body since H18): the "
+            "sample tags `scan` and the T7-20 grep covers it (H15)",
             surface_of(over_scan) == "scan", surface_of(over_scan))
 
     class DownBus:
@@ -2606,6 +2743,84 @@ def selftest():
             and banner_is_error(banner_of(erred)) and banner_of(erred).startswith("scan.sitemap: ")
             and banner_of(insp) is None,
             f"{banner_of(sitemap)!r} {banner_of(noticed)!r} {banner_of(erred)!r}")
+
+    # Cell item from the third live smoke run: H54. The T7-18 L4 launch's refusal wording
+    # sat on the strip when `3` was pressed; the old wait took it for the Site map's own
+    # error and returned before the TUI had drawn anything.
+    stale = REFUSAL_WORDINGS["lane_unavailable"] + "; pick other lanes or a build that has them"
+    marker3 = SITEMAP_MARKER.format(n=len(SITEMAP_NODES))
+    pending = sitemap_frame(count=0, banner=stale)
+    # No head drawn yet (count 0) and the Site map's own failure on the strip.
+    failed = sitemap_frame(count=0, banner="scan.sitemap: reply did not match the contract (missing field `nodes`)")
+    c.check("selftest: Site map settle: the banner snapshotted before `3`/`J` still on the strip "
+            "does not settle the wait, nor does a quiet banner; a banner that CHANGED to an "
+            "error wording settles it as `error`; the job's `{n} nodes` head settles it as "
+            "`head` whatever the banner (H54)",
+            sitemap_settled(pending, marker3, stale) is None
+            and sitemap_settled(sitemap_frame(count=0, banner="idle"), marker3, stale) is None
+            and sitemap_settled(sitemap_frame(count=0, banner="refreshing scan.sitemap..."), marker3, "idle") is None
+            and sitemap_settled(failed, marker3, stale) == "error"
+            and sitemap_settled(failed, marker3, None) == "error"
+            and sitemap_settled(failed, marker3, banner_of(failed)) is None
+            and sitemap_settled(sitemap, marker3, stale) == "head"
+            and sitemap_settled(sitemap_frame(banner=stale), marker3, stale) == "head"
+            and sitemap_settled(erred, marker3, stale) == "head"
+            and sitemap_settled(sitemap_frame(count=13), marker3, "idle") is None,
+            f"{sitemap_settled(pending, marker3, stale)!r} {sitemap_settled(failed, marker3, stale)!r} "
+            f"{sitemap_settled(failed, marker3, banner_of(failed))!r} {sitemap_settled(sitemap, marker3, stale)!r}")
+
+    # Cell item H59: the inject L4 scope entry carries `inject_rate_pps` (the engine's
+    # default 0 is the fail-closed value) when the schema declares it, and the exact
+    # match of a lost reply compares it as an integer when the entry echoes it.
+    five = {"cidr", "ports", "interface", "direction", "capability"}
+    with_rate, unknown_with = l4_args_for(five | {"inject_rate_pps", "inject_rate_burst"}, "127.0.0.1/32", "8080")
+    without, unknown_without = l4_args_for(five, "127.0.0.1/32", "8080")
+    unread, unknown_unread = l4_args_for(None, "127.0.0.1/32", "8080")
+    c.check("selftest: L4: `l4_add_args` carries `inject_rate_pps: 10` when `tools/list` declares "
+            "it for l4.scope.add and omits it otherwise (an unreadable schema too); the five "
+            "tuple fields are sent as before (H59)",
+            with_rate == {"interface": "*", "direction": "outbound", "capability": "inject",
+                          "cidr": "127.0.0.1/32", "ports": "8080", "inject_rate_pps": L4_INJECT_RATE_PPS}
+            and L4_INJECT_RATE_PPS == 10 and unknown_with == []
+            and without == {"interface": "*", "direction": "outbound", "capability": "inject",
+                            "cidr": "127.0.0.1/32", "ports": "8080"} and unknown_without == []
+            and unread == without and unknown_unread == []
+            and l4_args_for({"cidr", "ports", "inject_rate_pps"}, "10.0.0.0/8", "1-2")
+            == ({"cidr": "10.0.0.0/8", "ports": "1-2", "inject_rate_pps": 10}, ["capability", "direction", "interface"]),
+            f"{with_rate} {without} {unread}")
+
+    class ScopeBus:
+        """A bus whose l4.scope.list answers the given entries."""
+
+        def __init__(self, entries):
+            self.entries = entries
+
+        def call(self, name, _args=None):
+            assert name == "l4.scope.list", name
+            return {"entries": self.entries}
+
+    def entry(entry_id, **extra):
+        e = {"id": entry_id, "cidr": "127.0.0.1/32", "ports": "8080-8080", "interface": "*",
+             "direction": "outbound", "capability": "inject", "source": "runtime"}
+        e.update(extra)
+        return e
+
+    echo_ok = ScopeBus([entry("e-zero", inject_rate={"pps": 0, "burst": 0}),
+                        entry("e-ten", inject_rate={"pps": 10, "burst": 10})])
+    echo_flat = ScopeBus([entry("e-flat", inject_rate_pps=10)])
+    echo_none = ScopeBus([entry("e-plain")])
+    c.check("selftest: L4: `l4_entry_matching` includes the echoed rate in the tuple, compared as "
+            "an integer (`inject_rate.pps` or a flat `inject_rate_pps`): the entry echoing 10 "
+            "matches, the one echoing 0 does not; an entry that echoes no rate matches on the "
+            "five; without the field sent the rate is not compared (H59)",
+            l4_entry_matching(echo_ok, with_rate) == "e-ten"
+            and l4_entry_matching(echo_flat, with_rate) == "e-flat"
+            and l4_entry_matching(echo_none, with_rate) == "e-plain"
+            and l4_entry_matching(ScopeBus([entry("e-zero", inject_rate={"pps": 0, "burst": 0})]), with_rate) is None
+            and l4_entry_matching(echo_ok, without) == "e-zero"
+            and l4_entry_matching(ScopeBus([entry("e-cfg", source="config", inject_rate={"pps": 10})]), with_rate) is None,
+            f"{l4_entry_matching(echo_ok, with_rate)!r} {l4_entry_matching(echo_flat, with_rate)!r} "
+            f"{l4_entry_matching(echo_none, with_rate)!r} {l4_entry_matching(echo_ok, without)!r}")
 
     # Cell items from the second live smoke run: H41, H44, H46, H49.
     c.check("selftest: Findings: the box title is `Findings · PoCs and runs` (H40) and the live "
@@ -2701,38 +2916,61 @@ def selftest():
         params.update(extra)
         return {"jsonrpc": "2.0", "method": "notifications/aitm/job", "params": params}
 
+    # Eight reads: the first job line; a flow line stashed then a non-object line (a bad
+    # line, consumed); the reply stashed then the scripted ValueError (a bad line); the
+    # `cancelled` line; a job line whose params are not an object (counted by method,
+    # then a bad message); two `progress` lines of the second job; the dead socket.
     dead = ScriptedPushClient([
         [job_line("scan-00000001", "progress"), {"jsonrpc": "2.0", "method": "notifications/aitm/flow"},
          "not an object", {"jsonrpc": "2.0", "id": 7, "result": {}}],
         ValueError("Expecting value: line 1 column 1 (char 0)"),
-        [job_line("scan-00000001", "cancelled", issue={"name": "x"}), job_line("scan-00000002", "progress"),
-         job_line("scan-00000002", "progress")],
+        [job_line("scan-00000001", "cancelled", issue={"name": "x"}),
+         {"jsonrpc": "2.0", "method": JOB_PUSH, "params": "x"},
+         job_line("scan-00000002", "progress"), job_line("scan-00000002", "progress")],
         BusError("bus connection closed by the core"),
     ])
     dead_pushes = Pushes(dead, {"subscribed": True})
     dead_pushes._thread.join(5)
     snap = dead_pushes.snapshot()
-    c.check("selftest: Pushes: a bad line and a bad message are counted and read past; the "
+    c.check("selftest: Pushes: two bad lines and a bad message are counted and read past; the "
             "dead socket ends the thread with `stopped_by: BusError: ..`; counts, by_method, the "
-            "subscribe reply and the first three job params are in the snapshot (H46)",
+            "subscribe reply and the first three job params are in the snapshot (H46, H57)",
             not dead_pushes.alive() and (snap["stopped_by"] or "").startswith("BusError: bus connection closed")
             and dead_pushes.of("scan-00000001") == {"progress": 1, "cancelled": 1}
             and dead_pushes.of("scan-00000002") == {"progress": 2}
-            and snap["by_method"] == {"notifications/aitm/job": 4, "notifications/aitm/flow": 1, "<reply>": 1}
-            and snap["lines"] == 6 and snap["bad_lines"] == 1 and snap["bad_messages"] == 1
+            and snap["by_method"] == {"notifications/aitm/job": 5, "notifications/aitm/flow": 1, "<reply>": 1}
+            and snap["lines"] == 7 and snap["bad_lines"] == 2 and snap["bad_messages"] == 1
             and snap["subscribe_reply"] == {"subscribed": True}
             and [p["job"] for p in snap["first_job_params"]] == ["scan-00000001", "scan-00000001", "scan-00000002"]
-            and dead.drains == 4 and "stopped_by: BusError" in dead_pushes.describe()
+            and dead.reads == 8 and "stopped_by: BusError" in dead_pushes.describe()
             and "'<reply>': 1" in dead_pushes.describe(),
-            json.dumps(snap, default=str)[:600])
+            f"reads {dead.reads}; {json.dumps(snap, default=str)[:600]}")
     quiet_pushes = Pushes(ScriptedPushClient([]), "this bus has no flow.subscribe")
-    was_alive = poll(lambda: quiet_pushes.alive(), 1, 0.05)
+    was_alive = poll(lambda: quiet_pushes.alive() and quiet_pushes.snapshot()["idle_reads"] > 0, 2, 0.05)
     quiet_pushes.stop()
-    c.check("selftest: Pushes: a quiet socket keeps the thread alive; `stop()` ends it with "
-            "`stopped_by: stop()` and nothing counted (H46)",
+    c.check("selftest: Pushes: a quiet socket keeps the thread alive and counts its idle reads; "
+            "`stop()` ends it with `stopped_by: stop()` and nothing counted (H46, H57)",
             was_alive and not quiet_pushes.alive() and quiet_pushes.snapshot()["stopped_by"] == "stop()"
-            and quiet_pushes.snapshot()["by_method"] == {} and quiet_pushes.snapshot()["lines"] == 0,
+            and quiet_pushes.snapshot()["by_method"] == {} and quiet_pushes.snapshot()["lines"] == 0
+            and quiet_pushes.snapshot()["read"] == PUSH_READ,
             json.dumps(quiet_pushes.snapshot(), default=str))
+    # The third live run's socket: the TUI's polling fans an agent audit line out every
+    # ~150 ms (2342 in the run), so a drain that returns only after 0.5 s of silence never
+    # returned and the T7-16 check read zero lines (H57). Per-line reads count the job
+    # line as soon as it is read, with the agent lines around it counted by method.
+    agent = {"jsonrpc": "2.0", "method": "notifications/aitm/agent", "params": {"verb": "scan.status"}}
+    busy = ScriptedPushClient([[agent] * 100 + [job_line("scan-00000003", "progress")] + [agent] * 100])
+    busy_pushes = Pushes(busy, {"sub_id": 1})
+    counted = poll(lambda: busy_pushes.of("scan-00000003") == {"progress": 1}, 3, 0.05)
+    settled_all = poll(lambda: busy_pushes.snapshot()["by_method"].get("notifications/aitm/agent") == 200, 3, 0.05)
+    busy_pushes.stop()
+    c.check("selftest: Pushes: a socket that is never quiet (100 agent lines, one job line, 100 "
+            "more) has the job line counted without waiting for a silence; the agent lines are "
+            "counted by method; `read` names the per-line mechanism (H57)",
+            counted and settled_all and busy_pushes.snapshot()["lines"] == 201
+            and busy_pushes.snapshot()["read"] == PUSH_READ and "wait_notification" in PUSH_READ
+            and busy_pushes.snapshot()["stopped_by"] == "stop()",
+            json.dumps(busy_pushes.snapshot(), default=str)[:400])
 
     n_ok, n_noted, n_failed = c.tally()
     print(f"{'PASS' if not n_failed else 'FAIL'}: selftest {n_ok} ok, {n_failed} failed", flush=True)
