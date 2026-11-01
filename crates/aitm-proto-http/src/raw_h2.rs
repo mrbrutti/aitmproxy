@@ -396,10 +396,17 @@ pub struct RawH2Target {
 }
 
 /// What the probe does once the SETTINGS exchange is done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawH2Mode {
-    /// One HEADERS frame on stream 1, then wait for its outcome.
+    /// One HEADERS frame on stream 1 carrying `RawH2Plan::headers`, then wait
+    /// for its outcome.
     SingleRequest,
+    /// One stream per block, opened in order on stream ids 1, 3, 5, ...; each
+    /// stream is awaited to its [`StreamOutcome`] before the next opens, so a
+    /// check that sends several malformed variants learns which one the peer
+    /// tolerated. `RawH2Plan::headers` is ignored. Never more than
+    /// [`MAX_RAW_STREAMS`] blocks, refused before the dial (plan amendment A3).
+    Blocks(Vec<Vec<RawHeader>>),
     /// `pairs` HEADERS frames, each immediately cancelled with
     /// `RST_STREAM(CANCEL)`. Never more than [`MAX_RAW_STREAMS`] pairs, and
     /// never repeated: the check looks for a mitigation signal, not a flood.
@@ -413,11 +420,22 @@ pub enum RawH2Mode {
 
 impl RawH2Mode {
     /// How many streams this mode opens.
-    fn stream_count(self) -> usize {
+    fn stream_count(&self) -> usize {
         match self {
             RawH2Mode::SettingsOnly => 0,
             RawH2Mode::SingleRequest => 1,
-            RawH2Mode::RapidReset { pairs } => pairs as usize,
+            RawH2Mode::RapidReset { pairs } => *pairs as usize,
+            RawH2Mode::Blocks(blocks) => blocks.len(),
+        }
+    }
+
+    /// The header blocks this mode writes, one per stream, in order.
+    fn blocks<'a>(&'a self, headers: &'a [RawHeader]) -> Vec<&'a [RawHeader]> {
+        match self {
+            RawH2Mode::SettingsOnly => Vec::new(),
+            RawH2Mode::SingleRequest => vec![headers],
+            RawH2Mode::RapidReset { pairs } => vec![headers; *pairs as usize],
+            RawH2Mode::Blocks(blocks) => blocks.iter().map(Vec::as_slice).collect(),
         }
     }
 }
@@ -663,7 +681,9 @@ fn validate(plan: &RawH2Plan) -> Result<usize> {
         );
     }
 
-    for header in &plan.headers {
+    let mut blocks = plan.mode.blocks(&plan.headers);
+    blocks.push(&plan.headers);
+    for header in blocks.into_iter().flatten() {
         let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
         for forbidden in FORBIDDEN_HEADERS {
             if name == forbidden {
@@ -805,50 +825,97 @@ async fn converse(
         return Ok(());
     }
 
-    // One HEADERS block, reused on every stream this plan opens.
-    let block = encode_block(&plan.headers);
-    let block_len = u32::try_from(block.len()).unwrap_or(u32::MAX);
-    if block.len() > MAX_FRAME_BYTES {
-        anyhow::bail!(
-            "raw h2 HEADERS block of {} bytes exceeds the {MAX_FRAME_BYTES}-byte frame cap",
-            block.len()
-        );
+    // Encode every block up front: an oversized one is refused before any
+    // HEADERS frame is written.
+    let mut encoded = Vec::with_capacity(streams);
+    for block in plan.mode.blocks(&plan.headers) {
+        let bytes = encode_block(block);
+        if bytes.len() > MAX_FRAME_BYTES {
+            anyhow::bail!(
+                "raw h2 HEADERS block of {} bytes exceeds the {MAX_FRAME_BYTES}-byte frame cap",
+                bytes.len()
+            );
+        }
+        encoded.push(bytes);
     }
     let rapid_reset = matches!(plan.mode, RawH2Mode::RapidReset { .. });
 
-    let mut id: u32 = 1;
-    for _ in 0..streams {
-        let mut out = frame_header(
-            block_len,
-            FrameType::Headers,
-            flags::END_HEADERS | flags::END_STREAM,
-            id,
-        )
-        .to_vec();
-        out.extend_from_slice(&block);
-        if rapid_reset {
-            out.extend_from_slice(&frame_header(4, FrameType::RstStream, 0x00, id));
-            out.extend_from_slice(&RST_CANCEL.to_be_bytes());
+    if let RawH2Mode::Blocks(_) = plan.mode {
+        // Sequential: one stream at a time, each awaited to its outcome before
+        // the next opens. A silent or closed peer ends the probe; the blocks not
+        // yet written stay `Timeout` and cost the target nothing.
+        for (index, block) in encoded.iter().enumerate() {
+            let id = u32::try_from(index * 2 + 1).unwrap_or(u32::MAX);
+            write_headers(stream, id, block, false).await?;
+            if !read_outcomes(stream, &mut reader, obs, index + 1).await? {
+                return Ok(());
+            }
         }
-        stream.write_all(&out).await.context("raw h2 headers")?;
-        id += 2;
+        return Ok(());
     }
-    stream.flush().await.context("raw h2 headers")?;
 
-    // Read until every stream has an outcome, or the connection ends.
-    let mut pending = streams;
-    while pending > 0 {
+    // Batch: every stream's HEADERS back to back, then read until each has an
+    // outcome or the connection ends.
+    for (index, block) in encoded.iter().enumerate() {
+        let id = u32::try_from(index * 2 + 1).unwrap_or(u32::MAX);
+        write_headers(stream, id, block, rapid_reset).await?;
+    }
+    read_outcomes(stream, &mut reader, obs, streams).await?;
+    Ok(())
+}
+
+/// Write one HEADERS frame (END_HEADERS | END_STREAM) carrying `block` on
+/// stream `id`, followed by `RST_STREAM(CANCEL)` when `reset` (a rapid-reset
+/// pair), and flush.
+async fn write_headers(
+    stream: &mut dyn ProbeStream,
+    id: u32,
+    block: &[u8],
+    reset: bool,
+) -> Result<()> {
+    let block_len = u32::try_from(block.len()).unwrap_or(u32::MAX);
+    let mut out = frame_header(
+        block_len,
+        FrameType::Headers,
+        flags::END_HEADERS | flags::END_STREAM,
+        id,
+    )
+    .to_vec();
+    out.extend_from_slice(block);
+    if reset {
+        out.extend_from_slice(&frame_header(4, FrameType::RstStream, 0x00, id));
+        out.extend_from_slice(&RST_CANCEL.to_be_bytes());
+    }
+    stream.write_all(&out).await.context("raw h2 headers")?;
+    stream.flush().await.context("raw h2 headers")?;
+    Ok(())
+}
+
+/// Read frames until at least `want_filled` streams have an outcome, or the
+/// connection ends. Returns whether the connection is still usable.
+async fn read_outcomes(
+    stream: &mut dyn ProbeStream,
+    reader: &mut FrameReader,
+    obs: &mut RawH2Observation,
+    want_filled: usize,
+) -> Result<bool> {
+    let mut filled = obs
+        .streams
+        .iter()
+        .filter(|o| **o != StreamOutcome::Timeout)
+        .count();
+    while filled < want_filled {
         match reader.next(stream).await? {
             Next::Frame(frame) => match FrameType::from_u8(frame.kind) {
                 Some(FrameType::GoAway) => {
                     obs.goaway = parse_goaway(&frame.payload);
                     obs.connection_closed = true;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Some(FrameType::Headers) => {
                     let status = parse_status_indexed(&frame.payload);
                     if record(obs, frame.stream, StreamOutcome::Headers { status }) {
-                        pending -= 1;
+                        filled += 1;
                     }
                 }
                 Some(FrameType::RstStream) => {
@@ -859,7 +926,7 @@ async fn converse(
                             StreamOutcome::Reset { error_code: code }
                         };
                         if record(obs, frame.stream, outcome) {
-                            pending -= 1;
+                            filled += 1;
                         }
                     }
                 }
@@ -870,11 +937,11 @@ async fn converse(
             },
             Next::Eof | Next::Idle | Next::Budget => {
                 obs.connection_closed = true;
-                return Ok(());
+                return Ok(false);
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A real TCP connection, bounded by [`RAW_CONNECT_TIMEOUT`]. (The sender's
@@ -1100,6 +1167,8 @@ mod driver_tests {
     struct ServerLog {
         preface: Vec<u8>,
         headers_streams: Vec<u32>,
+        /// The HEADERS payload (the encoded block) per HEADERS frame, in order.
+        headers_blocks: Vec<Vec<u8>>,
         rst_streams: Vec<u32>,
         settings_acks: usize,
         bytes_written: usize,
@@ -1183,10 +1252,11 @@ mod driver_tests {
                         None
                     }
                     Some(FrameType::Headers) => {
-                        log.lock()
-                            .expect("server log")
-                            .headers_streams
-                            .push(frame.stream);
+                        {
+                            let mut log = log.lock().expect("server log");
+                            log.headers_streams.push(frame.stream);
+                            log.headers_blocks.push(frame.payload.clone());
+                        }
                         match script.answer {
                             Answer::Nothing => None,
                             Answer::Reset(code) => Some(framed(
@@ -1672,5 +1742,136 @@ mod driver_tests {
             "unexpected error: {err}"
         );
         assert_eq!(dialer.calls(), 1);
+    }
+
+    /// Plan amendment A3: `Blocks` opens one stream per block, in order, each
+    /// carrying its own encoded block, all on the one connection.
+    fn three_variants() -> Vec<Vec<RawHeader>> {
+        let base = |path: &str| {
+            vec![
+                RawHeader::new(":method", "GET"),
+                RawHeader::new(":scheme", "http"),
+                RawHeader::new(":authority", "origin.test"),
+                RawHeader::new(":path", path),
+            ]
+        };
+        vec![base("/a"), base("/b"), base("/c")]
+    }
+
+    #[tokio::test]
+    async fn blocks_open_one_stream_per_block_in_order_on_one_connection() {
+        let (client, dialer, log) = peer(Script::new(vec![(3, 100)], Answer::Status(0x88)));
+        let variants = three_variants();
+        let expected: Vec<Vec<u8>> = variants.iter().map(|b| encode_block(b)).collect();
+
+        let obs = client
+            .probe(&plan(RawH2Mode::Blocks(variants), 3))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: Some(200) }; 3]
+        );
+        assert_eq!(dialer.calls(), 1);
+        settled(&log, |l| l.headers_streams.len() == 3).await;
+        let log = log.lock().expect("server log");
+        assert_eq!(log.headers_streams, vec![1, 3, 5]);
+        assert_eq!(
+            log.headers_blocks, expected,
+            "each stream carries its own block"
+        );
+        assert!(log.rst_streams.is_empty(), "no reset pairs in Blocks mode");
+    }
+
+    #[tokio::test]
+    async fn blocks_record_a_reset_per_variant() {
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Reset(0x1)));
+
+        let obs = client
+            .probe(&plan(RawH2Mode::Blocks(three_variants()), 3))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(obs.streams, vec![StreamOutcome::Reset { error_code: 1 }; 3]);
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocks_refuse_more_than_eight_before_the_dial() {
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let nine: Vec<Vec<RawHeader>> = (0..9).map(|_| three_variants().remove(0)).collect();
+
+        let err = client
+            .probe(&plan(RawH2Mode::Blocks(nine), 8))
+            .await
+            .expect_err("nine blocks are refused");
+
+        assert!(
+            err.to_string().contains("at most 8 streams"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(dialer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn blocks_refuse_a_cookie_header_in_any_block() {
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let mut variants = three_variants();
+        variants[1].push(RawHeader::new("Cookie", "sid=secret"));
+
+        let err = client
+            .probe(&plan(RawH2Mode::Blocks(variants), 3))
+            .await
+            .expect_err("a cookie in the second block is refused");
+
+        assert!(
+            err.to_string().contains("cookie"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("secret"),
+            "the error must not echo the value: {err}"
+        );
+        assert_eq!(dialer.calls(), 0);
+    }
+
+    /// Each block is awaited before the next opens: a peer that never answers
+    /// the first stream sees exactly one HEADERS frame, the remaining variants
+    /// stay `Timeout`, and the probe ends within one read timeout of the cap.
+    #[tokio::test(start_paused = true)]
+    async fn blocks_stop_after_a_silent_stream_without_opening_the_rest() {
+        let (client, dialer, log) = peer(Script::new(vec![(3, 100)], Answer::Nothing));
+
+        let started = tokio::time::Instant::now();
+        let obs = client
+            .probe(&plan(RawH2Mode::Blocks(three_variants()), 3))
+            .await
+            .expect("the probe completes");
+        let waited = started.elapsed();
+
+        assert_eq!(obs.streams, vec![StreamOutcome::Timeout; 3]);
+        assert!(obs.connection_closed);
+        assert!(
+            waited <= RAW_READ_TIMEOUT + Duration::from_secs(1),
+            "the probe took {waited:?}, one silent stream should cost one read timeout"
+        );
+        assert_eq!(dialer.calls(), 1);
+        settled(&log, |l| l.headers_streams.len() == 1).await;
+        assert_eq!(log.lock().expect("server log").headers_streams, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn blocks_ignore_the_plan_headers_field() {
+        let (client, _dialer, log) = peer(Script::new(vec![], Answer::Status(0x88)));
+        let variants = vec![three_variants().remove(2)];
+        let expected = vec![encode_block(&variants[0])];
+        let mut p = plan(RawH2Mode::Blocks(variants), 1);
+        p.headers.push(RawHeader::new("x-ignored", "yes"));
+
+        client.probe(&p).await.expect("the probe completes");
+
+        settled(&log, |l| l.headers_streams.len() == 1).await;
+        assert_eq!(log.lock().expect("server log").headers_blocks, expected);
     }
 }
