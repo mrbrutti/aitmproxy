@@ -122,10 +122,16 @@ def run_blind(op, target) -> tuple[list, int, dict]:
     sitemap = scan_call(op, "operator", "scan.sitemap", {"job": job})
     points_per_key: dict = {}
     for node in (sitemap.get("nodes") or []):
-        for param in (node.get("params") or []):
+        params = node.get("params") or []
+        # A node lists each parameter name once but may carry several points
+        # for it (`/search` has `q` from its link and from its form: two captured
+        # flows, `points: 2`), so the node's point count is shared among its
+        # names.
+        each = max(1, round(int(node.get("points") or 0) / max(1, len(params))))
+        for param in params:
             name = param.get("name") if isinstance(param, dict) else str(param)
             key = (node.get("path_template"), name)
-            points_per_key[key] = points_per_key.get(key, 0) + 1
+            points_per_key[key] = points_per_key.get(key, 0) + each
     return issues(op, "operator", job=job), seq0, points_per_key
 
 
