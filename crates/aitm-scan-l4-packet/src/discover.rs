@@ -1381,6 +1381,37 @@ mod tests {
         assert_eq!(plans[0].target.port, 40_000);
     }
 
+    /// Tester (T5 stage 5): the search walks past a run of excluded ports and
+    /// still never lands on the target's own, and it terminates — the loop is
+    /// bounded by `checked_add`, so an exhausted range breaks instead of
+    /// spinning. Every port the lane picks must also stay outside the core's
+    /// own listeners (call C25), both rules at once.
+    #[test]
+    fn src_port_walks_past_a_run_of_excluded_ports() {
+        let guard = loopback_guard("*", 100);
+        guard.set_self_ports([40_000, 40_001, 40_002]);
+
+        assert_eq!(
+            choose_src_port(&guard, 0, 40_003),
+            40_004,
+            "three self ports and the target's own are all skipped"
+        );
+        assert_eq!(
+            choose_src_port(&guard, 0, 9),
+            40_003,
+            "without the target in the way the first free port wins"
+        );
+        for index in 0..8usize {
+            let target_port = 40_000 + u16::try_from(index).expect("a small index");
+            let port = choose_src_port(&guard, index, target_port);
+            assert_ne!(port, target_port, "index {index}");
+            assert!(
+                !guard.self_ports().contains(&port),
+                "index {index}: {port} is a core listener"
+            );
+        }
+    }
+
     #[test]
     fn probe_privilege_unavailable() {
         let guard = loopback_guard("*", 100);

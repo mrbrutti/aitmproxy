@@ -683,4 +683,53 @@ mod tests {
             serde_json::from_str(r#"{"cases": 5, "icmp_pace_ms": 2000}"#).expect("the knob parses");
         assert_eq!(set.icmp_pace_ms, 2000);
     }
+
+    /// Tester (T5 stage 5): the new knob keeps `L4Options`' own contract —
+    /// `deny_unknown_fields`, so a near-miss spelling is reported by name
+    /// instead of silently taking the default pace; and `u32`, so a negative or
+    /// out-of-range value is an error rather than a wrapped one. The round trip
+    /// through JSON and YAML returns the same options.
+    #[test]
+    fn l4_options_rejects_a_mistyped_pace_key_and_an_unrepresentable_value() {
+        for key in ["icmp_pace", "icmp_pace_msec", "icmpPaceMs", "pace_ms"] {
+            let json = format!(r#"{{"cases": 5, "{key}": 2000}}"#);
+            let err = serde_json::from_str::<L4Options>(&json)
+                .expect_err("a mistyped key is an error, never a silent default");
+            assert!(
+                err.to_string().contains(key),
+                "the error should name {key}: {err}"
+            );
+        }
+
+        for value in ["-1", "1.5", "4294967296", "\"1100\"", "null"] {
+            let json = format!(r#"{{"icmp_pace_ms": {value}}}"#);
+            assert!(
+                serde_json::from_str::<L4Options>(&json).is_err(),
+                "{value} is not a pace in milliseconds"
+            );
+        }
+
+        let max: L4Options = serde_json::from_str(r#"{"icmp_pace_ms": 4294967295}"#)
+            .expect("the largest representable pace parses");
+        assert_eq!(max.icmp_pace_ms, u32::MAX);
+
+        let options = L4Options {
+            icmp_pace_ms: 2500,
+            ..L4Options::default()
+        };
+        let json = serde_json::to_string(&options).expect("options serialize");
+        assert!(
+            json.contains("\"icmp_pace_ms\":2500"),
+            "the wire key is snake_case: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<L4Options>(&json).expect("round trip"),
+            options
+        );
+        let yaml = serde_yaml::to_string(&options).expect("options serialize as yaml");
+        assert_eq!(
+            serde_yaml::from_str::<L4Options>(&yaml).expect("yaml round trip"),
+            options
+        );
+    }
 }

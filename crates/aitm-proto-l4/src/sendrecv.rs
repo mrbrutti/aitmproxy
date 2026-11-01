@@ -1441,6 +1441,241 @@ mod tests {
         );
     }
 
+    /// Tester (T5 stage 5, plan Task 1 `send_recv_echoed_stimulus_alone_is_silence`):
+    /// a capture that delivers the self-echo and nothing else is **silence in
+    /// every match mode** — the await runs the whole window, reports how long it
+    /// waited, and the flow holds exactly one packet, the injected stimulus.
+    /// `Any` is the mode that would otherwise answer `Response` to any decodable
+    /// frame, which on loopback is always our own.
+    #[test]
+    fn send_recv_echoed_stimulus_alone_is_silence() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        let timeout = Duration::from_millis(80);
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![stimulus.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend.clone(),
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => assert!(
+                    waited >= timeout,
+                    "{expect:?}: waited {waited:?} < timeout {timeout:?}"
+                ),
+                other => panic!("{expect:?}: expected silence past the self-echo, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(flow.packets.len(), 1, "{expect:?}: the stimulus alone");
+            assert!(flow.packets[0].injected, "{expect:?}: and it is ours");
+            assert_eq!(flow.packets[0].bytes, stimulus);
+            assert_eq!(backend.injected(), vec![stimulus.clone()]);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// Tester (plan Task 1 `send_recv_same_direction_frame_is_ignored`): the rule
+    /// is the **direction**, not byte equality. A frame that is not our stimulus
+    /// byte for byte — a different payload, a different IP id — but still runs
+    /// `our src:src_port -> dst:dst_port` over our protocol is a copy of ours
+    /// (a re-framed, re-checksummed or retransmitted one) and is ignored in every
+    /// mode; the genuine reply behind it is still the `Response`.
+    #[test]
+    fn send_recv_same_direction_frame_is_ignored() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        // Same tuple, different payload: byte equality cannot catch this one.
+        let same_direction = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe-rewritten");
+        assert_ne!(same_direction, stimulus);
+        let echo = udp_reply("127.0.0.1", 9, b"probe");
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            // Alone it is silence.
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![same_direction.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let timeout = Duration::from_millis(80);
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => {
+                    assert!(waited >= timeout, "{expect:?}: waited {waited:?}");
+                }
+                other => panic!("{expect:?}: a same-direction frame is no reply, got {other:?}"),
+            }
+            assert_eq!(
+                store.get(flow_id).expect("flow present").packets.len(),
+                1,
+                "{expect:?}: nothing of ours is recorded as a reply"
+            );
+
+            // Ahead of the real reply it does not end the await either.
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![same_direction.clone(), echo.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, Duration::from_secs(10)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => {
+                    assert_eq!(p.bytes, echo, "{expect:?}: the reply, not our own copy");
+                }
+                other => panic!("{expect:?}: expected the echo as Response, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(flow.packets.len(), 2, "{expect:?}: stimulus + reply");
+            assert_eq!(flow.packets[1].bytes, echo);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// Tester (the echo case the self-echo rule must not eat): a legitimate reply
+    /// whose source port **is** our destination port and whose destination port
+    /// is our source port is the reversed tuple — the only shape a reply can
+    /// have — and must correlate even when it carries byte-identical payload.
+    /// The documented limit is pinned beside it: a stimulus whose source port
+    /// equals the target's port makes its own echo indistinguishable from
+    /// itself, so that one reads as silence (the lane's liveness probe uses the
+    /// unmutated seed, and `choose_src_port` never picks the target's port, so
+    /// no crash follows).
+    #[test]
+    fn send_recv_reply_on_the_reversed_tuple_is_never_taken_for_the_stimulus() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        // Identical payload, reversed ports: an echo service's answer.
+        let echo = udp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, b"probe");
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![stimulus.clone(), echo.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (_, outcome) = send_recv(
+                &g,
+                backend,
+                store,
+                raw_spec(&stimulus, 9, expect, Duration::from_secs(10)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => assert_eq!(
+                    p.bytes, echo,
+                    "{expect:?}: a reply to our source port is a reply"
+                ),
+                other => panic!("{expect:?}: expected the echo as Response, got {other:?}"),
+            }
+        }
+
+        // The documented limit: source port == the target's port.
+        let symmetric = udp_from_to("127.0.0.1", 9, "127.0.0.1", 9, b"probe");
+        let symmetric_echo = udp_from_to("127.0.0.1", 9, "127.0.0.1", 9, b"probe-back");
+        let c = Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            Some(9),
+            L4Proto::Udp,
+            ReplyMatch::FiveTuple,
+            symmetric.clone(),
+        );
+        assert!(
+            matches!(c.classify(&symmetric_echo), Classified::Ignore),
+            "known limit: a symmetric tuple cannot tell the echo from the stimulus"
+        );
+    }
+
+    /// Tester (edge cases a capture must survive): the frames a real interface
+    /// hands the correlator include empty reads, truncated headers, non-IP link
+    /// traffic and an oversized buffer. None of them may panic, none may be
+    /// taken for the reply, and the real reply behind them must still correlate
+    /// inside the window.
+    #[test]
+    fn malformed_empty_and_oversized_frames_never_correlate() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        let echo = udp_reply("127.0.0.1", 9, b"probe");
+        let junk: Vec<Vec<u8>> = vec![
+            Vec::new(),                               // an empty read
+            vec![0xFF],                               // one byte
+            vec![0x45, 0x00, 0x00],                   // an IPv4 version nibble, nothing else
+            vec![0x45; 19],                           // one byte short of an IPv4 header
+            vec![0x60; 39],                           // one byte short of an IPv6 header
+            vec![0xAA; 1500],                         // a full-MTU frame of noise
+            vec![0x00; 65_535],                       // the largest buffer a capture can hand us
+            b"\x08\x06arp-ish not a packet".to_vec(), // non-IP link traffic
+        ];
+
+        let mut frames = junk.clone();
+        frames.push(echo.clone());
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(frames);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            raw_spec(&stimulus, 9, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Response(p) => assert_eq!(p.bytes, echo, "the reply, not the noise"),
+            other => panic!("expected the echo as Response behind the noise, got {other:?}"),
+        }
+        let flow = store.get(flow_id).expect("flow present");
+        assert_eq!(flow.packets.len(), 2, "no malformed frame is recorded");
+        assert_eq!(g.in_flight(), 0);
+
+        // The same noise with nothing behind it is silence, not a reply and not
+        // a panic — in every match mode, `Any` included.
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(junk.clone());
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let timeout = Duration::from_millis(80);
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => {
+                    assert!(waited >= timeout, "{expect:?}: waited {waited:?}");
+                }
+                other => panic!("{expect:?}: undecodable noise is not a reply, got {other:?}"),
+            }
+            assert_eq!(store.get(flow_id).expect("flow present").packets.len(), 1);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
     /// C3 (security): a stimulus whose crafted IP destination is a denylisted host,
     /// sent with an in-scope `spec.dst`, is refused — the guard gates the packet's real
     /// destination, not the `dst` field. Nothing reaches the wire.

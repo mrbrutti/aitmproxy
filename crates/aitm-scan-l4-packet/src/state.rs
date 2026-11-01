@@ -1109,6 +1109,71 @@ mod tests {
         assert!(printed.contains("4 bytes"), "{printed}");
     }
 
+    /// Tester (T5 stage 5, amendment 46): the note's operator wording is
+    /// `no_reply (icmp_ratelimit)` — the string the crash and reaction details
+    /// are asserted on — `no_reply_count` counts noted cases and nothing else,
+    /// and `Debug` prints the note while still hiding the wire bytes.
+    #[test]
+    fn case_note_label_counts_and_debug() {
+        assert_eq!(
+            CaseNote::NoReply {
+                reason: ICMP_RATELIMIT
+            }
+            .label(),
+            "no_reply (icmp_ratelimit)"
+        );
+
+        let mut noted = case(1, CaseClass::Silence);
+        noted.note = Some(CaseNote::NoReply {
+            reason: ICMP_RATELIMIT,
+        });
+        let run = PointRun {
+            point_id: "p0".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 1,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Icmp {
+                icmp_type: 3,
+                code: 3,
+            }),
+            cases: vec![
+                case(
+                    0,
+                    CaseClass::Icmp {
+                        icmp_type: 3,
+                        code: 3,
+                    },
+                ),
+                noted.clone(),
+                case(2, CaseClass::Silence),
+            ],
+            crash: None,
+            stopped: None,
+        };
+        assert_eq!(
+            run.no_reply_count(),
+            1,
+            "only the noted case counts, not every silence"
+        );
+        assert_eq!(
+            PointRun {
+                cases: Vec::new(),
+                ..run
+            }
+            .no_reply_count(),
+            0
+        );
+
+        let printed = format!("{noted:?}");
+        assert!(
+            printed.contains("NoReply") && printed.contains("icmp_ratelimit"),
+            "the note is printed: {printed}"
+        );
+        assert!(!printed.contains("deadbeef"), "the hex is not: {printed}");
+    }
+
     #[test]
     fn run_cache_round_trip() {
         let state = LaneState::new();

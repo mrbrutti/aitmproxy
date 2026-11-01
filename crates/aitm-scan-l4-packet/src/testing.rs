@@ -1123,6 +1123,71 @@ mod tests {
         assert!(!tcp_rst(&pkt));
     }
 
+    /// Tester (T5 stage 5): the rate-limiting mock the two amendment-46
+    /// differentials rest on answers **at most one ICMP error per window per
+    /// target** and is silent in between, and the self-echo is delivered
+    /// either way — so a lane test cannot mistake a suppressed error for a
+    /// dropped stimulus. Without this the "unpaced reads silence / paced reads
+    /// icmp(3,3)" pair would prove nothing about the pace.
+    #[test]
+    fn icmp_ratelimit_answers_once_per_window() {
+        let window = Duration::from_millis(500);
+        let backend = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        backend.icmp_ratelimit(window);
+        let mut source = backend
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        let stimulus = udp_stimulus(b"probe");
+
+        // The first stimulus of the window draws the port-unreachable.
+        backend
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source.as_mut(), &stimulus);
+        let frame = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("an icmp reply");
+        assert_eq!(icmp_error(&captured(frame)), Some((3, 3)));
+
+        // Two more inside the same window: the echo, and nothing behind it.
+        for _ in 0..2 {
+            backend
+                .inject(IFACE, &stimulus)
+                .expect("the mock accepts the inject");
+            expect_self_echo(source.as_mut(), &stimulus);
+            expect_silence(source.as_mut(), Duration::from_millis(20));
+        }
+
+        // Past the window the kernel's token is back.
+        std::thread::sleep(window);
+        backend
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source.as_mut(), &stimulus);
+        let frame =
+            wait_frame(source.as_mut(), Duration::from_millis(500)).expect("the window reopened");
+        assert_eq!(icmp_error(&captured(frame)), Some((3, 3)));
+        assert_eq!(backend.inject_count(), 4);
+
+        // Unlimited by default: three in a row, three errors.
+        let open = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        let mut source = open
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        for _ in 0..3 {
+            open.inject(IFACE, &stimulus)
+                .expect("the mock accepts the inject");
+            expect_self_echo(source.as_mut(), &stimulus);
+            let frame =
+                wait_frame(source.as_mut(), Duration::from_millis(500)).expect("an icmp reply");
+            assert_eq!(icmp_error(&captured(frame)), Some((3, 3)));
+        }
+    }
+
     #[test]
     fn rst_mock_resets() {
         let backend = MockBackend::new(MockReply::Rst);

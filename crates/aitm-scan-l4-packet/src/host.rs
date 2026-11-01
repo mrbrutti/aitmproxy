@@ -3344,4 +3344,80 @@ mod tests {
         );
         assert_eq!(mock.inject_count(), 21);
     }
+
+    /// Tester (T5 stage 5, amendment 46's blast radius): the pace applies to an
+    /// **ICMP baseline only**. A point whose baseline is `Reset` (a closed TCP
+    /// port) or `Clean` (a live service) runs at full speed even with a minute
+    /// of configured pace, and the lane keeps its crash rule on such a point.
+    ///
+    /// The profile pace is a minute and the job's deadline ten seconds, so a
+    /// pace wrongly applied here would sleep into the deadline and the run
+    /// would come back `StopReason::Deadline` with cases missing — the
+    /// assertions below are what fails, not a hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_point_whose_baseline_is_not_icmp_is_never_paced() {
+        for (reply, target, field, expected, probes_per_case) in [
+            (
+                MockReply::Rst,
+                tcp_target(80),
+                "tcp.flags",
+                CaseClass::Reset,
+                1,
+            ),
+            (MockReply::Echo, udp_target(9), "raw", CaseClass::Clean, 0),
+        ] {
+            let mock = MockBackend::new(reply);
+            let mut profile = l4_profile(vec![target], 6);
+            // A minute of pace: only an ICMP baseline may act on it.
+            profile.l4.icmp_pace_ms = 60_000;
+            let (shared, job, plans, disc) =
+                setup(Arc::clone(&mock), profile, &fields(&[field]), 1000);
+            // `icmp_pace: None` is production behaviour: the profile's value,
+            // raised to the floor. `fast_timing` would have zeroed it.
+            let shared = Arc::new(Shared {
+                timing: Timing {
+                    icmp_pace: None,
+                    ..shared.timing
+                },
+                ..(*shared).clone()
+            });
+            assert_eq!(
+                shared.timing.icmp_pace_for(&job.profile().l4),
+                Duration::from_secs(60),
+                "{expected:?}: the pace that must not be applied"
+            );
+            let job = Arc::clone(&job).with_deadline(Instant::now() + Duration::from_secs(10));
+            let runner = runner_for(&shared, &job, &plans, &disc.points, field);
+
+            let started = Instant::now();
+            let run = runner.run_point().await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(run.baseline, Some(expected));
+            assert!(
+                run.stopped.is_none(),
+                "{expected:?}: an unpaced point never runs into the deadline: {:?}",
+                run.stopped
+            );
+            assert_eq!(run.cases.len(), 6, "{expected:?}: every case was sent");
+            assert!(
+                run.cases.iter().all(|case| case.class() == Some(expected)),
+                "{expected:?}: classes {:?}",
+                labels(&run)
+            );
+            assert!(
+                run.cases.iter().all(|case| case.note.is_none()),
+                "{expected:?}: no `no_reply (icmp_ratelimit)` note off an ICMP baseline"
+            );
+            assert_eq!(
+                mock.inject_count(),
+                1 + 6 + 6 * probes_per_case,
+                "{expected:?}: baseline + cases + the liveness probes the class earns"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "{expected:?}: six cases cost milliseconds unpaced; the run took {elapsed:?}"
+            );
+        }
+    }
 }
