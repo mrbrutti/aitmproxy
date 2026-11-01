@@ -139,7 +139,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   - `apps/mac/Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (modify)
 - **Change:** exactly spec D2/D2a/D3/D4/D5 **without** the `caTrust` input or derivation: declare
   `TrafficRoute.Kind.caTrust`, `TrafficRoutes.caTrust: TrafficRoute?` (always nil from this task's
-  `make`) and `GettingStartedStep.Kind.caTrust` (never emitted yet) so Task 3's views compile against
+  `make`) and `GettingStartedStep.Kind.caTrusted` (provided by the CA-trust session's PR D, never emitted by Task 1) so Task 3's views compile against
   the full vocabulary; `make` has no `caTrust:` parameter until Task 1b. Foundation only (no CFNetwork, SystemConfiguration,
   SwiftUI, AppKit import anywhere in the Kit).
 
@@ -217,7 +217,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   }
 
   public struct GettingStartedStep {
-      public enum Kind: String, …, CaseIterable { case coreRunning, busConnected, systemProxy, extensionOn, scopeSet, caTrust, firstFlow }
+      public enum Kind: String, …, CaseIterable { case coreRunning, busConnected, systemProxy, extensionOn, scopeSet, caTrusted, firstFlow }
       public let detail: String?                                      // NEW
       public init(kind: Kind, title: String, done: Bool, action: ConnectionAction? = nil, detail: String? = nil)
   }
@@ -388,7 +388,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   `"All Apps on"` (closed lines only for `.off`/`.awaitingApproval`/`.degraded`). `shown` = closed routes
   when `routesClosed`, + `scope` when `scopeHostCount == 0 ∧ (routesClosed ∨ allTunnels)` where
   `allTunnels = flowCount > 0 ∧ tunnelledFlowCount == flowCount`, + CA when closed; priority system
-  proxy > All Apps > Scope > CA. Step `caTrust`
+  proxy > All Apps > Scope > CA. Step `caTrusted` (the CA-trust session's `GettingStartedStep.Kind.caTrusted`)
   after `scopeSet`, omitted when `routes.caTrust == nil`; `title` = `"Trust the aitmproxy CA"` when
   not done, the route line when done; `detail` = the route detail; `action = nil`.
 
@@ -400,7 +400,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   - `caTrustJoinsAdviceAndSteps`: TR-AC3 inputs + `caTrust: notTrusted` → `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"`,
     `routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`,
     `routes.caTrust?.actions == []`, `advice.map(\.kind) == [.systemProxy, .scope, .caTrust]`, `anyOpen == true`,
-    `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrust, .firstFlow]`,
+    `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow]`,
     `steps[5].title == "Trust the aitmproxy CA"`, `steps[5].done == false`, `steps[5].action == nil`, `steps[5].detail == <the detail string>`;
   - `caTrustBanner`: same + `flows: 6` → `banner == "HTTPS is not captured until the CA is trusted"`; same + `flows: 6, tunnelled: 6` → `banner == "Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one"`;
     same + `.inactive, flows: 6` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
