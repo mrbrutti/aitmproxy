@@ -343,3 +343,62 @@ fn an_l4_confirm_from_flows_still_shows_the_flow_list() {
         );
     }
 }
+
+/// Fix round H, H34 (D6 hostile-core bounds): the server's prompt is
+/// bounded once, in `WireConfirm::from_reply`, to `PROMPT_MAX` cells with
+/// control characters stripped, and the overlay wraps it to the box's rows
+/// only. A 1 MiB prompt of words renders in the box ending in an ellipsis
+/// at 200x50, every row within the box's width, and the footer line is
+/// still drawn under it.
+#[test]
+fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
+    use aitm_tui::scan::launch::PROMPT_MAX;
+    use aitm_tui::text::width;
+
+    let words = "word\t".repeat(1 << 18);
+    assert!(words.len() >= 1 << 20);
+    let reply = json!({
+        "status": "needs_confirmation",
+        "prompt": words,
+        "confirm_token": "tok-9",
+    });
+    let confirm =
+        WireConfirm::from_reply("scan.start", &json!({ "profile_name": "standard" }), &reply)
+            .expect("a confirmation handshake");
+    assert_eq!(PROMPT_MAX, 2000);
+    assert!(
+        width(&confirm.prompt) <= PROMPT_MAX,
+        "{} cells",
+        width(&confirm.prompt)
+    );
+    assert!(confirm.prompt.ends_with('…'), "cut once at fold");
+    assert!(!confirm.prompt.contains('\t'), "tabs stripped");
+
+    let mut app = fixture_app_core(200, 50);
+    app.wire_confirm = Some(confirm);
+    app.mode = Mode::WireConfirm;
+    let text = screen(&app, 200, 50);
+    let title = text
+        .lines()
+        .position(|l| l.contains("Confirm over the wire: scan launch"))
+        .expect("the box title");
+    let rows: Vec<&str> = text
+        .lines()
+        .skip(title + 1)
+        .take_while(|l| !l.contains('└'))
+        .collect();
+    assert!(
+        rows.iter().any(|l| l.contains("wordwordword")),
+        "the cleaned prompt is drawn: {text}"
+    );
+    assert!(
+        rows.iter()
+            .filter(|l| l.contains("wordword"))
+            .any(|l| l.contains('…')),
+        "a prompt the box cannot hold ends in an ellipsis: {text}"
+    );
+    assert!(
+        text.contains("y confirm (re-issues with _confirm)"),
+        "the footer survives under the prompt: {text}"
+    );
+}

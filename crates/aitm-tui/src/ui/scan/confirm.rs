@@ -82,12 +82,13 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         ),
         Line::raw(""),
     ];
-    // Wrap the server's prompt to the panel width, shown verbatim, by cell
-    // width (fix round G, G55); an empty prompt keeps its one blank row.
+    // Wrap the server's prompt (bounded at fold, fix round H, H34) to the
+    // panel width by cell width (fix round G, G55) and to no more rows than
+    // the box has; an empty prompt keeps its one blank row.
     let mut chunks = wrap(
         &c.prompt,
         usize::from(inner.width).saturating_sub(2),
-        usize::MAX,
+        usize::from(inner.height),
     );
     if chunks.is_empty() {
         chunks.push(String::new());

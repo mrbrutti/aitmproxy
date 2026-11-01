@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use crate::action::CONFIRM_KEY;
 use crate::l4::L4ScopeEntry;
 use crate::scan::profiles::ProfileEditor;
+use crate::text::{clean, truncate};
 
 /// The UI-3 reason when the bus has no L4 layer (spec D7, first clause).
 pub const GATE_NO_LAYER: &str =
@@ -22,6 +23,10 @@ pub const GATE_NO_TARGET: &str = "L4 launch disabled: add an L4 target (ip, port
 /// no targets to check, so the operator opens the profile first.
 pub const GATE_OPEN_PROFILE: &str =
     "L4 launch disabled: open the profile (⏎) to check its L4 target and scope";
+/// The widest a wire-confirm `prompt` grows, in cells (fix round H, H34;
+/// D6 hostile-core bounds): bounded once in [`WireConfirm::from_reply`],
+/// so the overlay wraps bounded text each frame.
+pub const PROMPT_MAX: usize = 2000;
 /// The capability word an L4 scope entry needs for a launch (spec D7).
 const INJECT: &str = "inject";
 
@@ -177,19 +182,21 @@ pub struct WireConfirm {
 
 impl WireConfirm {
     /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
-    /// `None` when the reply is not a confirmation handshake.
+    /// `None` when the reply is not a confirmation handshake. The prompt is
+    /// bounded here, once (fix round H, H34): control characters stripped
+    /// and the text cut to [`PROMPT_MAX`] cells.
     pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
         if reply.get("status").and_then(Value::as_str) != Some("needs_confirmation") {
             return None;
         }
+        let prompt = reply
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("Confirm this action?");
         Some(Self {
             call: call.to_string(),
             args: args.clone(),
-            prompt: reply
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or("Confirm this action?")
-                .to_string(),
+            prompt: truncate(&clean(prompt), PROMPT_MAX),
             token: reply
                 .get("confirm_token")
                 .and_then(Value::as_str)?
