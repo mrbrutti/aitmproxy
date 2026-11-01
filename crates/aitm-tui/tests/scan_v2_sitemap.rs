@@ -740,3 +740,44 @@ fn the_point_cursor_is_an_offset_within_the_selected_node() {
     assert!(reqs.is_empty());
     assert_eq!(app.mode, Mode::Scan, "Enter on no point opens nothing");
 }
+
+/// Fix round H, H20 (G19): on a v2 bus that also offers `scan.discover`
+/// (the `m` fallback when `scan.map` is absent) a legacy reply fills
+/// `legacy.*` and leaves the folded v2 Site map lists exactly as they were;
+/// only a legacy bus draws the legacy result as nodes and points (D12).
+#[test]
+fn a_legacy_discover_reply_never_overwrites_the_v2_site_map() {
+    let mut tools = TOOLS.to_vec();
+    tools.push("scan.discover");
+    let mut app = app_with(&tools);
+    open_site_map(&mut app);
+    let nodes = app.scan.sitemap.nodes.clone();
+    let lines = app.scan.sitemap.lines.clone();
+    assert_eq!(nodes.len(), 1, "the v2 page is folded");
+    assert!(!lines.is_empty(), "the v2 page is lined");
+
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "scan.discover".into(),
+        value: json!({
+            "endpoints": ["https://auth.shop-staging.test/login", "https://auth.shop-staging.test/account"],
+            "endpoint_flows": { "https://auth.shop-staging.test/login": NODE_FLOW },
+            "injection_points": [],
+        }),
+    });
+    assert_eq!(
+        app.scan.legacy.endpoints,
+        vec![
+            "https://auth.shop-staging.test/login".to_string(),
+            "https://auth.shop-staging.test/account".to_string(),
+        ],
+        "the legacy result lands in legacy.*"
+    );
+    assert_eq!(
+        app.scan.sitemap.nodes, nodes,
+        "the v2 nodes are untouched by a legacy reply"
+    );
+    assert_eq!(
+        app.scan.sitemap.lines, lines,
+        "the v2 node lines are untouched by a legacy reply"
+    );
+}

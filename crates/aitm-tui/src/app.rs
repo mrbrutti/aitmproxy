@@ -4108,9 +4108,16 @@ impl App {
                             .legacy
                             .endpoint_cursor
                             .min(self.scan.legacy.endpoints.len().saturating_sub(1));
-                        // The Site map draws the result as nodes and
-                        // points (D12), built once here.
-                        self.scan.sitemap.show_legacy(&self.scan.legacy);
+                        // On a legacy bus the Site map draws the result as
+                        // nodes and points (D12), built once here; on a v2
+                        // bus that also offers `scan.discover` (the `m`
+                        // fallback) the result stays in `legacy.*` and the
+                        // folded v2 lists are kept (fix round H, H20; G19).
+                        if crate::scan::MapSource::from(self.scan_offer())
+                            == crate::scan::MapSource::Legacy
+                        {
+                            self.scan.sitemap.show_legacy(&self.scan.legacy);
+                        }
                         self.toast(
                             Level::Info,
                             format!(
