@@ -89,9 +89,10 @@ fn browser(key: KeyEvent) -> Option<Action> {
 
 /// The Scan view's shared keys (spec D11): `1`..`4` pick a tab, Tab/BackTab
 /// walk the active tab's panes, ↑↓ walk the focused pane, ⏎ opens or acts,
-/// `r` launches the legacy scope-bound crawl, `F` jumps to the findings pane,
-/// `:` palette, `?` help, Esc/`q` closes the focused pane or leaves the view.
-/// Each tab's own keys are added to this one function by its task.
+/// `r` launches the legacy scope-bound crawl, `x` cancels the Jobs cursor's
+/// job, `F` jumps to the findings pane, `:` palette, `?` help, Esc/`q` closes
+/// the focused pane or leaves the view. Each tab's own keys are added to this
+/// one function by its task.
 fn scan(key: KeyEvent) -> Option<Action> {
     if let Some(a) = nav(key) {
         return Some(a);
@@ -99,6 +100,7 @@ fn scan(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
+        KeyCode::Char('x') => Action::ScanCancel,
         KeyCode::Char('1') => Action::ScanTab(crate::scan::ScanTab::Profiles),
         KeyCode::Char('2') => Action::ScanTab(crate::scan::ScanTab::Jobs),
         KeyCode::Char('3') => Action::ScanTab(crate::scan::ScanTab::SiteMap),

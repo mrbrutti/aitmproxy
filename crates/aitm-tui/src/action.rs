@@ -81,6 +81,11 @@ pub enum Action {
     ScanPaneNext,
     /// Scan view BackTab: focus the active tab's previous pane.
     ScanPanePrev,
+    /// Jobs tab `x`: cancel the job under the cursor over the wire,
+    /// `scan.cancel {job}` tagged `scan.cancel:<job>` (spec D11). Idempotent
+    /// with no extra prompt: the tag dedupe sends it once until the reply; on
+    /// a terminal job the key is inert and the banner reads `already <state>`.
+    ScanCancel,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,

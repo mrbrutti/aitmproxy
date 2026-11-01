@@ -28,9 +28,9 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_result, step, tag_keyed, tag_parts, ScanError, ScanOffer, ScanState, ScanTab,
-    ISSUES_PAGE_LIMIT, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_JOB,
-    STATUS_POLL_TICKS,
+    is_job_id, parse_result, state_text, step, tag_keyed, tag_parts, JobPane, ScanError, ScanOffer,
+    ScanState, ScanTab, ISSUES_PAGE_LIMIT, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER,
+    OTHER_JOB, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -1429,15 +1429,25 @@ impl App {
                         }
                     }
                 }
-                // Scan: ⏎ acts per tab (D11). On Site map it opens the
-                // focused list's selected flow in the inspector, read from
-                // the same lists the cursor keys walk (A2), which on a
-                // legacy bus is exactly today's behaviour (D12): the
-                // injection point's flow in the Points pane, the endpoint's
-                // linked flow (AC3) in the Nodes pane. An endpoint with no
-                // linked flow opens nothing; a flow no longer in the store is
-                // refused, not selected. The other tabs act in their own
-                // tasks.
+                // Scan: ⏎ acts per tab (D11). On Jobs it opens the Issues
+                // tab filtered to the cursor's job and asks for its issues
+                // once (D6, "entering Issues, any filter change"); the
+                // legacy Jobs row has no job, so nothing happens there (D12).
+                Mode::Scan if self.scan.tab == ScanTab::Jobs => {
+                    if let Some(job) = self.scan.jobs.cursor_job().cloned() {
+                        self.scan.issues.filters.job = Some(job);
+                        self.scan.tab = ScanTab::Issues;
+                        self.request_issues(&mut out);
+                    }
+                }
+                // On Site map it opens the focused list's selected flow in
+                // the inspector, read from the same lists the cursor keys
+                // walk (A2), which on a legacy bus is exactly today's
+                // behaviour (D12): the injection point's flow in the Points
+                // pane, the endpoint's linked flow (AC3) in the Nodes pane.
+                // An endpoint with no linked flow opens nothing; a flow no
+                // longer in the store is refused, not selected. The other
+                // tabs act in their own tasks.
                 Mode::Scan => {
                     if let Some(id) = self.scan.sitemap_selected_flow(self.scan_offer()) {
                         if self.row(&id).is_some() {
@@ -1757,6 +1767,7 @@ impl App {
             Action::ScanTab(tab) => self.scan.tab = tab,
             Action::ScanPaneNext => self.scan.step_pane(true),
             Action::ScanPanePrev => self.scan.step_pane(false),
+            Action::ScanCancel => self.scan_cancel(&mut out),
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2710,7 +2721,25 @@ impl App {
                 // chrome rows.
                 let page = usize::from(self.height.saturating_sub(SCAN_CHROME_ROWS)).max(1);
                 let offer = self.scan_offer();
-                if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
+                let jobs_detail =
+                    self.scan.tab == ScanTab::Jobs && self.scan.jobs.pane == JobPane::Detail;
+                if jobs_detail {
+                    // The Jobs Detail pane scrolls its lines instead of
+                    // moving a cursor (D11); the last line is the floor.
+                    let n = self.scan.jobs.detail_len();
+                    let c = usize::from(self.scan.jobs.detail_scroll);
+                    let next = match action {
+                        Action::Up => c.saturating_sub(1),
+                        Action::Down => c + 1,
+                        Action::PageUp => c.saturating_sub(page),
+                        Action::PageDown => c + page,
+                        Action::Home => 0,
+                        Action::End => n,
+                        _ => c,
+                    }
+                    .min(n.saturating_sub(1));
+                    self.scan.jobs.detail_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+                } else if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
                     if n > 0 {
                         let c = *cursor;
                         *cursor = match action {
@@ -2722,6 +2751,11 @@ impl App {
                             Action::End => n - 1,
                             _ => c,
                         };
+                        // A new job under the Jobs cursor shows its detail
+                        // from the top.
+                        if *cursor != c && self.scan.tab == ScanTab::Jobs {
+                            self.scan.jobs.detail_scroll = 0;
+                        }
                     }
                 }
             }
@@ -3954,8 +3988,48 @@ impl App {
             JobEvent::Issue | JobEvent::Finished | JobEvent::Cancelled | JobEvent::Failed
         );
         if settles && self.issues_wanted() {
-            let args = self.scan_issues_args();
-            self.scan_poll("scan.issues".to_string(), "scan.issues", args, out);
+            self.request_issues(out);
+        }
+    }
+
+    /// `scan.issues {filters, limit}` under its single-slot tag (spec D6):
+    /// the one spelling the Jobs `Enter`, the settling push line and the
+    /// Issues tab (Task 7) share. Quiet when the bus lacks the verb: the
+    /// Issues banner already says so (D2), and the tag dedupe keeps one
+    /// request in flight.
+    fn request_issues(&mut self, out: &mut Vec<BusRequest>) {
+        let args = self.scan_issues_args();
+        self.scan_poll("scan.issues".to_string(), "scan.issues", args, out);
+    }
+
+    /// Jobs `x` (spec D11): `scan.cancel {job}` for the cursor's job under
+    /// the tag `scan.cancel:<job>`, idempotent through the tag dedupe and
+    /// with no extra prompt (the engine's cancel is itself idempotent). A
+    /// terminal job makes the key inert: the Jobs banner reads
+    /// `scan.cancel: already <state>` through the same uncoded-error channel
+    /// the missing-verb refusal uses, cleared by the next reply under that
+    /// tag. Only the Jobs tab has a job under its cursor; elsewhere, and on
+    /// the legacy row (D12), the key does nothing.
+    fn scan_cancel(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Jobs {
+            return;
+        }
+        let Some(job) = self.scan.jobs.cursor_job().cloned() else {
+            return;
+        };
+        let tag = tag_keyed("scan.cancel", &job);
+        match self.scan.jobs.state_of(&job) {
+            Some(state) if state.is_terminal() => {
+                self.scan.set_error(ScanError {
+                    tag,
+                    verb: "scan.cancel".to_string(),
+                    code: None,
+                    detail: format!("already {}", state_text(state)),
+                });
+            }
+            _ => {
+                self.scan_call(tag, "scan.cancel", json!({ "job": job }), out);
+            }
         }
     }
 
