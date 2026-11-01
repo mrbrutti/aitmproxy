@@ -609,7 +609,8 @@ fn a_success_clears_the_error() {
 /// Fix round H, H56 (spec D13 as ruled 2026-11-01): a tab's banner shows
 /// that tab's own error only. A `refused_l4` on `scan.start` is the
 /// Profiles tab's; the Jobs, Site map and Issues banners never carry it,
-/// while `last_error` keeps it for the toast.
+/// while `last_error`, the view-wide record the tests read, keeps it (the
+/// toast was built from the `ScanError` in `on_scan_failed`; H67).
 #[test]
 fn a_refused_launch_shows_on_profiles_and_no_other_tab() {
     let mut app = opened();
@@ -619,7 +620,7 @@ fn a_refused_launch_shows_on_profiles_and_no_other_tab() {
     assert_eq!(
         app.scan.last_error.as_ref().map(|e| e.wording()),
         Some(wording.to_string()),
-        "last_error keeps it for the toast"
+        "last_error, the view-wide record, keeps it"
     );
     let shown = screen(&app);
     assert!(

@@ -180,8 +180,10 @@ fn legacy_jobs_error(app: &App) -> Option<ScanError> {
 
 /// The active tab's own error and nothing else (spec D13 as ruled
 /// 2026-11-01, fix round H, H56: another tab's error never sits on this
-/// banner; `ScanState::last_error` feeds the toast alone). `legacy` is
-/// [`legacy_jobs_error`], the Jobs tab's on a legacy bus.
+/// banner; `ScanState::last_error` is the view-wide record the tests
+/// read, never drawn here; the toast is built from the `ScanError` in
+/// `App::on_scan_failed`). `legacy` is [`legacy_jobs_error`], the Jobs
+/// tab's on a legacy bus.
 fn tab_error<'a>(app: &'a App, legacy: Option<&'a ScanError>) -> Option<&'a ScanError> {
     let own = app.scan.error_slot(app.scan.tab).as_ref();
     if app.scan.tab == ScanTab::Jobs {

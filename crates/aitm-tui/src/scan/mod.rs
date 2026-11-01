@@ -131,11 +131,13 @@ pub struct ScanState {
     pub legacy: LegacyState,
     /// Tags of tagged calls awaiting their reply (dedupe, D6).
     pub inflight: BTreeSet<String>,
-    /// The most recent `scan.*` failure, kept until the next successful
-    /// reply under the same tag (D13: a keyed verb's error outlives a
-    /// sibling key's success). It feeds the toast and the tests; a banner
-    /// reads its tab's own slot only (D13 as ruled 2026-11-01, fix round
-    /// H, H56), never this.
+    /// The view-wide record of the last `scan.*` failure, kept until the
+    /// next successful reply under the same tag (D13: a keyed verb's error
+    /// outlives a sibling key's success). Read by the tests only (fix
+    /// round H, H67): the toast is built from the `ScanError` in
+    /// `App::on_scan_failed`, and a banner reads its tab's own slot
+    /// ([`ScanState::error_slot`]; D13 as ruled 2026-11-01, fix round H,
+    /// H56), never this.
     pub last_error: Option<ScanError>,
     /// A non-error notice for the banner (D11: `already <state>` when `x`
     /// lands on a terminal job): the answer to one key, cleared by the next
@@ -155,8 +157,9 @@ pub struct ScanState {
 
 impl ScanState {
     /// Record a `scan.*` failure where its tab shows it: the owning tab's
-    /// error slot (every tab has one) and `last_error`, which the toast
-    /// path and the tests read.
+    /// error slot (every tab has one) and `last_error`, the view-wide
+    /// record the tests read (the toast is built from the `ScanError` in
+    /// `App::on_scan_failed`, not from either; H67).
     pub fn set_error(&mut self, err: ScanError) {
         *self.error_slot_mut(owning_tab(&err.verb)) = Some(err.clone());
         self.last_error = Some(err);
