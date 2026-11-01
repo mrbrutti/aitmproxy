@@ -60,6 +60,33 @@ offers; a certificate trusted for `ssl` only by hand would read as not trusted.
 
 _(Matt's words and date go here; until then the live install step has not run.)_
 
+## Task 41 first half: the not-trusted state, live (2026-11-01 ~23:40, Matt's Mac, display lock held)
+
+Dev bundle `/tmp/Aitmproxy-dev-ca.app` (debug app from `claude/ca-trust-mac` e4647ce6, release core
+from `claude/ca-trust-first-run-6b7cf3` 02695642), isolated `APP_STORE=/tmp/ca-store`, launched
+from the Terminal; nothing installed, no `ca.install`, login and System keychains held 0
+aitmproxy certificates before and after, `scutil --proxy` unchanged (HTTP/HTTPS off). Artifacts in
+`/tmp/claude/ca-proof/`:
+
+- `1-sheet.png`: the first-run sheet "Set up aitmproxy on this Mac" appeared on its own: step 1
+  "Trust the aitmproxy CA" with the amber fact "HTTPS is not captured until the CA is trusted",
+  the remedy line, the button, the QUIC caveat; step 2 "Add a host to Scope — Nothing is decrypted
+  until a host is in Scope" with Open Scope…; "Not Now".
+- `2-status.png`: Status page, Core card "running · Embedded · proxy 127.0.0.1:61763", under it
+  the CA fact row (amber dot, the line, the remedy, buttons "Trust the aitmproxy CA" and
+  "Certificate Authority…"); Getting started: Core ✓, Bus ✓, "Trust the aitmproxy CA" (button)
+  between Bus and All Apps, then Scope and the first-flow step.
+- `3-ca-panel.png`: Certificate Authority panel: badge "Not installed", SHA-256, the remedy in
+  amber, the QUIC caveat, Install… / Export.
+- `shots.txt`: System Events read `{"Trust the aitmproxy CA", enabled: true}` from the Proxy menu.
+- `bus-1-before.json` (token never read into any log): `ca.status` → `exists: true`, `platform:
+  macos`, `stores.user = {installed: absent, trusted: no, location: …/login.keychain-db}`,
+  `stores.system = {installed: absent, trusted: no}`, `detail[0]` = the new DETAIL line;
+  `proxy.status.version` 0.5.8. On every installed release this read `trusted: unknown`.
+
+Second half (press Trust → macOS dialog → trusted → Safari HTTPS rows on a non-h3 host →
+Uninstall) waits for Matt's explicit yes; it runs only through the app's own step.
+
 ## Spec and plan corrections (decided by this session under the standing mandate; for the Architect to fold into §D17)
 
 1. **D17.3 / Task 34 policy.** `verify-cert` runs with `-p basic`, not `-p ssl` (Task 32 result above); the `DETAIL` constant names the basic policy.
@@ -77,6 +104,8 @@ _(Matt's words and date go here; until then the live install step has not run.)_
 12. **D17.8 / D17.9 / Task 42 order.** The first-run sheet and the Status checklist use Matt's order: 1 set the system proxy, 2 trust the CA, 3 add a host to Scope (nothing is decrypted until a host is in Scope); the operator docs already say so.
 13. **D17.5 / D17.8 / D17.9 homes.** `CATrustFacts` and the two `CAStatus` fields ship in this session's PR D (`AitmproxyKit/CATrustFacts.swift`), not mac-attribution's; the sheet file is `Shell/SetupSheet.swift` (PR 4's `SystemProxySheet.swift` does not exist yet); the three enum cases in `ConnectionSummary.swift` land in PR D before mac-attribution's PR (orchestrator's ruling, 2026-11-01).
 14. **Linux `sudo` from a bus client** keeps prompting on the core's own terminal (pre-existing, D17.13); `sudo -n` for non-CLI frontends is a follow-up, not in C1.
+
+15. **D17.4 cancelled prefix.** Frontends accept `ca.(install|uninstall) cancelled`; the core emits only the install form today, and classifying a cancelled `remove-trusted-cert` dialog as `Cancelled` is a core follow-up.
 
 ## Review log
 
