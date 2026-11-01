@@ -192,6 +192,77 @@ fn refreshing(app: &App) -> Option<&'static str> {
     (empty && waiting).then_some(verb)
 }
 
+/// A status-bar hint: a key and what it does, in the shape `bars::status`
+/// draws for every mode.
+pub type Hint = (&'static str, &'static str);
+
+/// The status-bar hints of the Scan view (D11: the hints list the active
+/// tab's keys): the tab's keys most important first, `Esc back` last so it
+/// is the first to go when the bar is narrow. On a legacy bus the Jobs tab
+/// carries the one-shot's keys instead (D12; the in-pane key line it
+/// replaced was accepted until this landed, Task 4 panel).
+pub fn hints(app: &App) -> Vec<Hint> {
+    if app.scan_offer() == ScanOffer::Legacy && app.scan.tab == ScanTab::Jobs {
+        return vec![
+            ("r", "scan"),
+            ("3", "site map"),
+            ("F", "findings"),
+            ("Esc", "back"),
+        ];
+    }
+    match app.scan.tab {
+        ScanTab::Profiles => vec![
+            ("s", "start"),
+            ("m", "map"),
+            ("w", "save"),
+            ("e", "edit"),
+            ("Space", "toggle"),
+            ("Esc", "back"),
+        ],
+        ScanTab::Jobs => vec![
+            ("x", "cancel"),
+            ("⏎", "issues"),
+            ("s", "start"),
+            ("m", "map"),
+            ("Esc", "back"),
+        ],
+        ScanTab::SiteMap => vec![
+            ("⏎", "flow"),
+            ("n", "next page"),
+            ("J", "job"),
+            ("Esc", "back"),
+        ],
+        ScanTab::Issues => vec![
+            ("c", "confirm"),
+            ("f", "false positive"),
+            ("u", "reopen"),
+            ("P", "PoC"),
+            ("S C L T J", "filters"),
+            ("Esc", "back"),
+        ],
+    }
+}
+
+/// The help overlay's Scan section (D11): the keys every tab shares, then
+/// one line per tab, as `(key, what)` pairs the overlay draws under its
+/// `Scan` heading.
+pub const HELP: &[(&str, &str)] = &[
+    (
+        "1 2 3 4",
+        "Profiles · Jobs · Site map · Issues tabs · Tab/BackTab pane · Esc back",
+    ),
+    (
+        "Profiles",
+        "s start · m map · w save · e edit · Space toggle · N new · D delete · o origin · t L4 target",
+    ),
+    ("Jobs", "x cancel · ⏎ issues of this job · s start · m map"),
+    ("Site map", "⏎ open flow · n next page · J job filter"),
+    (
+        "Issues",
+        "c confirm · f false positive · u reopen · P PoC · S C L T J filters · R reset",
+    ),
+];
+
 /// A tab body split into its list and detail panes, with the rule between
 /// them (D11). Both panes exclude the rule; `rule` is `None` when the body is
 /// too small to leave a cell for it. Built only by [`panes`] and

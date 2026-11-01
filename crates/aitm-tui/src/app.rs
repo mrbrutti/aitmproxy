@@ -5802,7 +5802,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "scan",
-        "Scan view: scope-bound scan.discover (r crawls; :scan <host> crawls a host)",
+        "Scan view: profiles, jobs, site map, issues (s starts scan.start; :scan <origin> starts against an origin)",
     ),
     ("layout h|v", "Inspector below or right"),
     ("split", "Split view (not built in this pass)"),

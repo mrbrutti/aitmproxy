@@ -326,8 +326,14 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
         theme.text_primary().add_modifier(Modifier::BOLD),
     )];
     if !table_full {
+        // The two columns the narrow table dropped, cut to what the id
+        // leaves of the row (the targets are the long part).
+        let rest = w.saturating_sub(width(&row.id) + 2);
         first.push(Span::styled(
-            format!("  {}  {}", row.profile, row.targets),
+            format!(
+                "  {}",
+                truncate(&format!("{}  {}", row.profile, row.targets), rest)
+            ),
             theme.text_secondary(),
         ));
     }
@@ -374,8 +380,9 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
     }
 }
 
-/// The legacy one-shot as one row: its state, the target it crawled and the
-/// key that launches it (D2's legacy launcher).
+/// The legacy one-shot as one row: its state and the target it crawled
+/// (D2's legacy launcher); its keys are the status bar's hints, like every
+/// other tab's (D11; the in-pane key line went with Task 14).
 fn legacy(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.height == 0 {
         return;
@@ -412,16 +419,6 @@ fn legacy(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             ),
         ]),
     );
-    if area.height > 2 {
-        put(
-            buf,
-            Rect::new(area.x, area.y + 2, area.width, 1),
-            Line::styled(
-                " r scan (scope-bound) · 3 Site map shows what it found · F findings",
-                theme.text_tertiary(),
-            ),
-        );
-    }
 }
 
 #[cfg(test)]

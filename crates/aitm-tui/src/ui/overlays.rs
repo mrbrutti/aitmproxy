@@ -106,7 +106,9 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
 }
 
 pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let area = centered(screen, 96, 36);
+    // 34 lines of keys and commands, the six Scan lines, a blank and the
+    // closing line, inside the box's two border rows.
+    let area = centered(screen, 110, 42);
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let k = |a: &str, b: &str| key_line(theme, a, b);
     let mut lines = vec![
@@ -129,7 +131,7 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         k("P", "build a PoC from the selected flow"),
         k(
             "F / S / @",
-            "findings · scope · agent panels · :scan scan panel (r crawls, ⏎ opens a point's flow)",
+            "findings · scope · agent panels · :scan the Scan view (keys below)",
         ),
         k("1-9 0 Tab", "content-type chips"),
         k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
@@ -149,6 +151,10 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             Span::styled(format!("   :{cmd:<26}"), theme.accent()),
             Span::styled((*detail).to_string(), theme.text_tertiary()),
         ]));
+    }
+    lines.push(heading(theme, "Scan"));
+    for (key, what) in crate::ui::scan::HELP {
+        lines.push(k(key, what));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
