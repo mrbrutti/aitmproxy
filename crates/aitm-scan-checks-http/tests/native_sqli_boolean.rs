@@ -93,9 +93,19 @@ async fn a_true_matching_and_false_diverging_pair_is_firm() {
         Some(FALSE_ARM.to_string()),
         "the payload that produced the reaction is the diverging arm"
     );
-    assert_eq!(
-        verdict.evidence.matched, None,
-        "a blind technique matched no text"
+    // A byte-stable page is compared by content, so the evidence names where
+    // the false arm parted from the baseline (the lengths alone could be
+    // identical, as the live seed's were); a length hit carries no excerpt.
+    assert!(
+        verdict
+            .evidence
+            .matched
+            .as_deref()
+            .is_some_and(|m| m.starts_with(
+                "true arm reproduced the baseline; false arm differed at byte 120: baseline \"xxxx"
+            )),
+        "{:?}",
+        verdict.evidence.matched
     );
     assert!(
         verdict.poc_hint.is_none(),
@@ -791,14 +801,15 @@ async fn a_true_arm_that_changes_a_stable_page_is_not_a_hit() {
     assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
 }
 
-/// A point that answers 5xx to both arms of a pair is breaking the query, not
-/// evaluating a condition: that is the error-based check's finding. The check
-/// stops at that pair with an Inconclusive that says so, instead of spending
-/// the remaining pairs on server errors the host's error ladder counts (live
-/// run 2026-11-01: the seeded error-based `/products` tripped the ladder for
-/// the whole job).
+/// A pair answered 5xx on both arms is a syntax family that breaks this
+/// point's query, not a condition being evaluated. One such pair is dropped
+/// and the next family still gets its turn (a quoted pair on a numeric
+/// parameter must not hide the numeric pair's differential); two end the
+/// point as error-based territory, so the host's error ladder is not fed the
+/// remaining pairs (live run 2026-11-01: the seeded error-based `/products`
+/// tripped the ladder for the whole job; panel review of PR 2a).
 #[tokio::test]
-async fn a_pair_answered_5xx_on_both_arms_ends_the_point_as_error_based_territory() {
+async fn two_pairs_answered_5xx_on_both_arms_end_the_point_as_error_based_territory() {
     let host = ScriptedHost::new()
         .with_baseline(html(200, "<p>product 1</p>"))
         .on(EXAMPLE, html(200, "<p>product 1</p>"))
@@ -806,6 +817,8 @@ async fn a_pair_answered_5xx_on_both_arms_ends_the_point_as_error_based_territor
         .on("1=2", html(200, "<p>product 1</p>"))
         .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
         .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .on("\"1\"=\"1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("\"1\"=\"2", html(500, "<pre>SQL syntax error</pre>"))
         .with_fallback(html(200, "<p>product 1</p>"));
     let point = point(InsertionKind::Query, "id", TARGET_URL);
 
@@ -814,11 +827,93 @@ async fn a_pair_answered_5xx_on_both_arms_ends_the_point_as_error_based_territor
     assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
     assert!(
         verdict.detail.starts_with(
-            "the point answered 5xx to both arms of \"' AND '1'='1\" / \"' AND '1'='2\""
+            "the point answered 5xx to both arms of 2 condition pairs, the last \
+             \"\" AND \"1\"=\"1\" / \"\" AND \"1\"=\"2\""
         ),
         "{}",
         verdict.detail
     );
-    // Control, the numeric pair, the quoted pair: nothing after the 5xx pair.
-    assert_eq!(host.sent().len(), 5, "{:?}", host.sent());
+    // Control, the numeric pair, the two quoted pairs: nothing after the second
+    // 5xx pair (the OR pair was never sent).
+    assert_eq!(host.sent().len(), 7, "{:?}", host.sent());
+}
+
+/// One 5xx pair among pairs that showed nothing is not Clean: part of the
+/// point was never tested as a boolean differential, and the detail says so.
+#[tokio::test]
+async fn one_pair_answered_5xx_keeps_the_point_inconclusive_not_clean() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>product 1</p>"))
+        .on(EXAMPLE, html(200, "<p>product 1</p>"))
+        .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .with_fallback(html(200, "<p>product 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "1 of 4 condition pairs was answered 5xx on both arms (error-based territory) and the \
+         rest showed no differential against the 16-byte baseline"
+    );
+    // Every one of the four pairs was still sent: control + 4 pairs.
+    assert_eq!(host.sent().len(), 9, "{:?}", host.sent());
+}
+
+/// A numeric point whose quoted pair errors still gets its numeric
+/// differential found: the erroring pair is dropped, not the point.
+#[tokio::test]
+async fn an_erroring_quoted_pair_does_not_hide_a_later_differential() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>items: 1</p>"))
+        .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .on("OR 1=1", html(200, "<p>items: 1</p>"))
+        .on("OR 1=2", html(200, "<p>items: 0</p>"))
+        .on("1=1", html(200, "<p>items: 1</p>"))
+        .on("1=2", html(200, "<p>items: 1</p>"))
+        .with_fallback(html(200, "<p>items: 1</p>"))
+        // The hit is the fourth pair: control + 4 pairs = 9 probes, so the
+        // ten-probe cap leaves no room for a confirming repeat.
+        .with_accuracy(Accuracy::FewerFalseNegatives);
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload, Some(" OR 1=2".to_string()));
+}
+
+/// The repo's own escaper (and OWASP's) prints the apostrophe as `&#x27;`; the
+/// project's Patched seed echoes that way. The scrub recognises it, so the
+/// differential behind the echo is still found (panel review of PR 2a).
+#[tokio::test]
+async fn an_echo_escaped_with_hex_apostrophes_is_still_scrubbed() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(
+            "' AND '1'='1",
+            html(
+                200,
+                "<p>you sent seed&#x27; AND &#x27;1&#x27;=&#x27;1</p><p>items: 1</p>",
+            ),
+        )
+        .on(
+            "' AND '1'='2",
+            html(
+                200,
+                "<p>you sent seed&#x27; AND &#x27;1&#x27;=&#x27;2</p><p>items: 0</p>",
+            ),
+        )
+        .with_fallback(html(200, "<p>you sent seed</p><p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload, Some("' AND '1'='2".to_string()));
 }

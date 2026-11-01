@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aitm_core::{ScopeRateGuard, SsrfPolicy, StdGuard};
-use aitm_scan_checks_http::{checks, checks_with};
+use aitm_scan_checks_http::checks_with;
 use aitm_scan_model::{Check, CheckOrigin, Intensity, LaneKind};
 use regex::Regex;
 
@@ -64,7 +64,7 @@ fn class_of(id: &str) -> String {
     gated()
         .into_iter()
         .find(|check| check.meta().id == id)
-        .unwrap_or_else(|| panic!("checks() has no check with id {id}"))
+        .unwrap_or_else(|| panic!("checks_with() has no check with id {id}"))
         .meta()
         .class
         .clone()
@@ -84,22 +84,12 @@ fn checks_with_returns_every_native_id() {
     assert_eq!(ids, NATIVE_IDS, "the sorted native ids");
 }
 
-/// The ungated slot is what `crates/aitm/src/wire.rs::collect_native_checks`
-/// calls today, and in this PR it is empty: the binary collects the catalogue
-/// through `checks_with(policy, guard)` in a follow-up once the engine lands,
-/// so until then no native check — gate-free or not — is reachable from the
-/// binary, and `wire.rs`'s skeleton test keeps asserting zero.
+/// `checks_with` returns the ten: the five h2 checks exist only where a
+/// policy and a guard were supplied, and the five gate-free ones ride along
+/// with them. There is no other slot (T3 PR 2a), so nothing the binary can
+/// reach omits the gate.
 #[test]
-fn checks_is_empty_until_the_binary_collects_checks_with() {
-    assert!(checks().is_empty(), "the ungated slot must stay empty");
-}
-
-/// `checks_with` returns the ten and `checks` returns none: the five h2
-/// checks exist only where a policy and a guard were supplied, and the five
-/// gate-free ones ride along with them rather than through a slot the binary
-/// could reach without the gate.
-#[test]
-fn the_gated_slot_returns_the_ten_and_the_ungated_one_none() {
+fn the_gated_slot_returns_the_ten() {
     let all: BTreeSet<String> = gated().iter().map(|c| c.meta().id.clone()).collect();
     assert_eq!(all, NATIVE_IDS.iter().map(|s| (*s).to_string()).collect());
 
@@ -111,8 +101,6 @@ fn the_gated_slot_returns_the_ten_and_the_ungated_one_none() {
         .map(String::as_str)
         .collect();
     assert_eq!(gate_free, GATE_FREE_IDS);
-
-    assert_eq!(checks().len(), 0);
 }
 
 #[test]
@@ -206,7 +194,7 @@ fn checks_come_back_sorted_and_unique() {
 
     assert!(
         ids.windows(2).all(|pair| pair[0] < pair[1]),
-        "checks() is not strictly ascending by id: {ids:?}"
+        "checks_with() is not strictly ascending by id: {ids:?}"
     );
     let distinct: BTreeSet<&String> = ids.iter().collect();
     assert_eq!(distinct.len(), ids.len(), "duplicate check id in {ids:?}");
@@ -382,8 +370,7 @@ fn the_public_modules_are_the_checks_and_timing() {
 
 /// The five gate-free checks `checks_with` returns carry exactly the metadata
 /// their modules declare: the gated slot does not re-shape them, it only adds
-/// the h2 five. (`checks()` is empty in this PR, so the comparison is against
-/// the modules' own constructors, not the other slot.)
+/// the h2 five. (The comparison is against the modules' own constructors.)
 #[test]
 fn the_gated_slot_leaves_the_gate_free_five_untouched() {
     let declared: Vec<Arc<dyn Check>> = vec![
@@ -402,5 +389,21 @@ fn the_gated_slot_leaves_the_gate_free_five_untouched() {
             .unwrap_or_else(|| panic!("{} missing from checks_with", check.meta().id));
         assert_eq!(twin.meta(), check.meta(), "{}", check.meta().id);
     }
-    assert!(checks().is_empty());
+}
+
+/// Coordinator decision 3 (2026-11-01): the five observe-only h2 checks are
+/// properties of an origin and run once per origin; the other five run per
+/// insertion point.
+#[test]
+fn the_h2_five_are_origin_scoped_and_the_rest_point_scoped() {
+    use aitm_scan_model::CheckScope;
+    for check in gated() {
+        let meta = check.meta();
+        let expected = if meta.id.starts_with("h2-") {
+            CheckScope::Origin
+        } else {
+            CheckScope::Point
+        };
+        assert_eq!(meta.scope, expected, "{}", meta.id);
+    }
 }

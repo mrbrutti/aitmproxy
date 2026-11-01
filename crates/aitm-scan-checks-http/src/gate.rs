@@ -65,6 +65,14 @@ pub(crate) fn no_finding(outcome: Outcome, detail: impl Into<String>) -> Verdict
     }
 }
 
+/// Whether the server answered a stimulus with a 5xx: the payload broke the
+/// request rather than being evaluated, which is the error-based techniques'
+/// territory and, for the host's error ladder (spec D5), one more failure.
+/// One predicate for every check that gives a point up on it (F8c).
+pub(crate) fn is_server_error(resp: &aitm_scan_model::ProbeResponse) -> bool {
+    resp.status.is_some_and(|status| status >= 500)
+}
+
 /// What a run of `planned` stimuli actually managed, and how it ends.
 ///
 /// `unit` names the stimulus in the operator-facing detail ("reflection
@@ -75,6 +83,10 @@ pub(crate) struct ProbeTally {
     planned: usize,
     sent: usize,
     failed: usize,
+    /// Planned stimuli the check decided not to send (a family abandoned
+    /// after a 5xx). They count towards the plan being met, not against it,
+    /// and the plan itself keeps its original size for the detail.
+    skipped: usize,
     /// A check-specific extra reason a run can stop early (the per-point probe
     /// cap), appended to the standard three.
     extra_stop: Option<String>,
@@ -88,6 +100,7 @@ impl ProbeTally {
             planned,
             sent: 0,
             failed: 0,
+            skipped: 0,
             extra_stop: None,
         }
     }
@@ -109,10 +122,10 @@ impl ProbeTally {
     }
 
     /// `n` planned stimuli the check decided not to send — a family abandoned
-    /// after a 5xx, say. They leave the plan, so a run that skipped them on
-    /// purpose is not read as a run the job cut short.
+    /// after a 5xx, say. A run that skipped them on purpose is not read as a
+    /// run the job cut short, and the detail still names the original plan.
     pub(crate) fn skipped(&mut self, n: usize) {
-        self.planned = self.planned.saturating_sub(n);
+        self.skipped = self.skipped.saturating_add(n);
     }
 
     /// The verdict for a run that did not reach its own plan, in this order:
@@ -127,7 +140,7 @@ impl ProbeTally {
     /// so a single refused probe followed by a cancellation must not be read
     /// as a failing target (review finding Q-M2).
     pub(crate) fn unfinished(&self) -> Option<Verdict> {
-        if self.sent < self.planned {
+        if self.sent + self.skipped < self.planned {
             let reason = match &self.extra_stop {
                 // The list form of the same sentence, with the extra reason
                 // as its last item: "cancelled, out of budget, past its

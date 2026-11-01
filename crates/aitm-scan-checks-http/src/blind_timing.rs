@@ -356,6 +356,8 @@ impl Check for TimingCheck {
             // would be one more server error for a host whose error ladder
             // the job shares with every other check (live run 2026-11-01).
             let mut errored = 0usize;
+            // Which probe of its schedule the last such family broke on.
+            let mut errored_at: Option<(usize, usize)> = None;
 
             for family in families {
                 let mut requested: Vec<f32> = Vec::with_capacity(delays.len());
@@ -384,8 +386,9 @@ impl Check for TimingCheck {
                         refused_here += 1;
                         continue;
                     };
-                    if resp.status.is_some_and(|status| status >= 500) {
+                    if crate::gate::is_server_error(&resp) {
                         errored += 1;
+                        errored_at = Some((attempted_here, delays.len()));
                         // The rest of this family leaves the plan on purpose.
                         tally.skipped(delays.len().saturating_sub(attempted_here));
                         break;
@@ -416,12 +419,14 @@ impl Check for TimingCheck {
             }
             if errored > 0 {
                 let was = if errored == 1 { "was" } else { "were" };
+                let (probe, of) = errored_at.unwrap_or((1, delays.len()));
                 return no_finding(
                     Outcome::Inconclusive,
                     format!(
-                        "{errored} of {total} payload families {was} answered 5xx on the first \
-                         probe and abandoned: the payload breaks the query rather than delaying \
-                         it, which is the error-based check's territory, so no delay was measured",
+                        "{errored} of {total} payload families {was} abandoned after a 5xx answer \
+                         (on probe {probe} of {of}): the payload breaks the query rather than \
+                         delaying it, which is the error-based check's territory, so no delay \
+                         was measured for them",
                         total = families.len()
                     ),
                 );

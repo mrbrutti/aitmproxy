@@ -55,6 +55,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::gate::is_server_error;
 use crate::gate::{self, no_finding, point_label, ProbeTally, STOPPED};
 use crate::matching::{body_text, length_differs};
 
@@ -67,6 +68,10 @@ use crate::matching::{body_text, length_differs};
 /// is atomic, so the cap lands on a control plus four whole pairs. It is the
 /// check's own promise, independent of whatever budget the job still has.
 const MAX_BOOLEAN_PROBES: u32 = 10;
+
+/// Condition pairs answered 5xx on both arms before the point is given up as
+/// error-based territory (F8c; panel review of PR 2a).
+const MAX_ERRORED_PAIRS: usize = 2;
 
 /// The condition pairs, in the order they are tried, before the parenthesised
 /// variants are appended.
@@ -147,15 +152,42 @@ enum Signature {
 struct Baseline {
     len: usize,
     body: String,
+    flow: Option<aitm_scan_model::FlowRef>,
 }
 
 /// The marker every echo of the sent value becomes before two bodies are
 /// compared. A control character no HTML page carries.
 const ECHO_MARK: &str = "\u{1}";
 
-/// A response body with every echo of each of `sent` — raw, percent-encoded
-/// (both `%20` and `+` for a space) and HTML-escaped — replaced by
-/// [`ECHO_MARK`], bounded like [`body_len`] is.
+/// The longest sent value whose echoes are scrubbed. A parameter value longer
+/// than this is not something a page echoes back as a unit, and the forms of
+/// an unbounded value would be the one target-controlled cost in this path
+/// (security review of PR 2a).
+const MAX_ECHO_FORM: usize = 4096;
+
+/// The forms a page may print `value` in: raw, percent-encoded (upper- and
+/// lower-case hex, and `+` for a space), and HTML-escaped with the
+/// apostrophe as `&#x27;` (the project's own escaper and OWASP's), `&#39;`
+/// or `&apos;`. Empty when `value` is empty or over [`MAX_ECHO_FORM`].
+fn echo_forms(value: &str) -> Vec<String> {
+    if value.is_empty() || value.len() > MAX_ECHO_FORM {
+        return Vec::new();
+    }
+    let upper = aitm_poc::dsl::url_encode(value);
+    let escaped = aitm_poc::dsl::html_escape(value);
+    vec![
+        value.to_string(),
+        upper.replace("%20", "+"),
+        upper.to_ascii_lowercase(),
+        upper,
+        escaped.replace("&#x27;", "&#39;"),
+        escaped.replace("&#x27;", "&apos;"),
+        escaped,
+    ]
+}
+
+/// A response body with every echo of each of `sent` (in every form of
+/// [`echo_forms`]) replaced by [`ECHO_MARK`], bounded like [`body_len`] is.
 ///
 /// Every body of one point is scrubbed of the point's own value, and an arm's
 /// body of the whole value it sent as well, so the three bodies are scrubbed
@@ -167,18 +199,12 @@ fn normalized(resp: &ProbeResponse, sent: &[&str]) -> String {
     let mut text = body_text(resp).into_owned();
     let mut forms: Vec<String> = sent
         .iter()
-        .filter(|value| !value.is_empty())
-        .flat_map(|value| {
-            [
-                (*value).to_string(),
-                percent_encode(value, false),
-                percent_encode(value, true),
-                html_escape(value),
-            ]
-        })
+        .flat_map(|value| echo_forms(value))
+        .filter(|form| form.len() <= text.len())
         .collect();
-    // Longest first, so a form that contains another is replaced whole.
-    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    // Longest first, so a form that contains another is replaced whole; equal
+    // lengths in lexical order, so `dedup` sees every duplicate adjacent.
+    forms.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     forms.dedup();
     for form in forms {
         text = text.replace(&form, ECHO_MARK);
@@ -186,36 +212,31 @@ fn normalized(resp: &ProbeResponse, sent: &[&str]) -> String {
     text
 }
 
-/// `value` as a query component would carry it: unreserved bytes kept,
-/// everything else `%XX` (upper-case), and a space as `+` when `plus` is set.
-fn percent_encode(value: &str, plus: bool) -> String {
-    let mut out = String::with_capacity(value.len() * 3);
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char);
-            }
-            b' ' if plus => out.push('+'),
-            _ => out.push_str(&format!("%{byte:02X}")),
+/// Where two scrubbed bodies first part, for the evidence of a content hit:
+/// a bounded slice of each from the first differing byte, so the reader sees
+/// the digit that moved and not two identical lengths.
+fn divergence(baseline: &str, other: &str) -> String {
+    let common = baseline
+        .bytes()
+        .zip(other.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let cut = |text: &str| {
+        let mut from = common.min(text.len());
+        while !text.is_char_boundary(from) {
+            from -= 1;
         }
-    }
-    out
-}
-
-/// `value` as an HTML-escaping page would print it.
-fn html_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            other => out.push(other),
+        let mut to = (from + 48).min(text.len());
+        while !text.is_char_boundary(to) {
+            to -= 1;
         }
-    }
-    out
+        text[from..to].replace(ECHO_MARK, "<value>")
+    };
+    format!(
+        "true arm reproduced the baseline; false arm differed at byte {common}: baseline \"{}\" vs \"{}\"",
+        cut(baseline),
+        cut(other)
+    )
 }
 
 /// Whether a pair's run is the boolean signature under `signature`.
@@ -372,11 +393,6 @@ impl SqliBoolean {
     }
 }
 
-/// Whether the server answered with a 5xx.
-fn is_server_error(resp: &ProbeResponse) -> bool {
-    resp.status.is_some_and(|status| status >= 500)
-}
-
 /// Append `condition` to the point's value and return the response, or `None`
 /// if the host refused the probe.
 async fn send_condition(host: &dyn ProbeHost, condition: &str) -> Option<ProbeResponse> {
@@ -388,13 +404,12 @@ async fn send_condition(host: &dyn ProbeHost, condition: &str) -> Option<ProbeRe
     host.probe(&payload).await.ok()
 }
 
-/// One confirmed pair: the run that hit, how many runs agreed, the signature
-/// it was read with, and the baseline's flow for the evidence.
+/// One confirmed pair: the run that hit, how many runs agreed and the
+/// signature it was read with.
 struct Hit<'a> {
     run: &'a PairRun,
     runs: u32,
     signature: Signature,
-    baseline_flow: Option<aitm_scan_model::FlowRef>,
 }
 
 /// The verdict for a pair that hit and reproduced.
@@ -426,13 +441,21 @@ fn confirmed(
         confidence: Confidence::Firm,
         evidence: Evidence {
             payload: Some(false_arm.to_string()),
-            matched: None,
+            // A content hit's lengths can be identical (the live seed's were),
+            // so the evidence names where the bodies parted; a length hit's
+            // `Diff` is its whole proof.
+            matched: match hit.signature {
+                Signature::Content => Some(Evidence::excerpt(&crate::matching::scrub(
+                    &divergence(&baseline.body, &run.false_body),
+                ))),
+                Signature::Length => None,
+            },
             probe_flows: run
                 .true_flow
                 .into_iter()
                 .chain(run.false_flow)
                 .collect::<Vec<_>>(),
-            baseline_flow: hit.baseline_flow,
+            baseline_flow: baseline.flow,
             diff: Some(Diff {
                 baseline_len: to_u32(baseline_len),
                 true_len: to_u32(run.true_len),
@@ -475,14 +498,14 @@ impl Check for SqliBoolean {
                 );
             }
 
-            let Ok(baseline) = host.baseline().await else {
+            let Ok(baseline_resp) = host.baseline().await else {
                 return no_finding(
                     Outcome::Error,
                     "the point's baseline could not be fetched, so there is nothing to \
                      compare against",
                 );
             };
-            let baseline_len = body_len(&baseline);
+            let baseline_len = body_len(&baseline_resp);
 
             // Step 2: the control re-send. The point's own value goes back out
             // and must reproduce the baseline.
@@ -530,10 +553,10 @@ impl Check for SqliBoolean {
             // reproduced the baseline byte for byte (the sent value scrubbed
             // out of both), length when the page varies between identical
             // requests but stays within the tolerance.
-            let baseline_flow = baseline.flow;
             let baseline = Baseline {
                 len: baseline_len,
-                body: normalized(&baseline, &[&example]),
+                body: normalized(&baseline_resp, &[&example]),
+                flow: baseline_resp.flow,
             };
             let signature = if normalized(&control, &[&example]) == baseline.body {
                 Signature::Content
@@ -548,6 +571,14 @@ impl Check for SqliBoolean {
             let mut tally = ProbeTally::new("condition pairs", planned).also_stopped_by(format!(
                 "this point had spent its {MAX_BOOLEAN_PROBES} probes"
             ));
+            // Pairs the server answered 5xx on both arms. One is a syntax
+            // family that breaks this point's query (a quoted pair on a
+            // numeric parameter, say); the next family may still show the
+            // differential, so the pair is dropped and the run goes on. Two
+            // are the point erroring on the technique, and every further pair
+            // would be two more 5xx for the host's error ladder (F8c, panel
+            // review of PR 2a).
+            let mut errored_pairs = 0usize;
 
             for (true_arm, false_arm) in pairs.iter().take(planned) {
                 if !may_send(host, spent, 2) {
@@ -568,15 +599,20 @@ impl Check for SqliBoolean {
                         continue;
                     }
                     PairOutcome::Errored => {
-                        return no_finding(
-                            Outcome::Inconclusive,
-                            format!(
-                                "the point answered 5xx to both arms of \"{true_arm}\" / \
-                                 \"{false_arm}\": the payload breaks the query rather than \
-                                 being evaluated as a condition, which is the error-based \
-                                 check's territory, not a boolean differential"
-                            ),
-                        );
+                        errored_pairs += 1;
+                        if errored_pairs >= MAX_ERRORED_PAIRS {
+                            return no_finding(
+                                Outcome::Inconclusive,
+                                format!(
+                                    "the point answered 5xx to both arms of {errored_pairs} \
+                                     condition pairs, the last \"{true_arm}\" / \
+                                     \"{false_arm}\": the payloads break the query rather than \
+                                     being evaluated as a condition, which is the error-based \
+                                     check's territory, not a boolean differential"
+                                ),
+                            );
+                        }
+                        continue;
                     }
                 };
 
@@ -603,12 +639,24 @@ impl Check for SqliBoolean {
                         // all. Treating it as a miss would let a refused
                         // request end the run `Clean` over a candidate SQL
                         // injection, so the run stops here and says so.
-                        PairOutcome::Failed | PairOutcome::Errored => {
+                        PairOutcome::Failed => {
                             return no_finding(
                                 Outcome::Inconclusive,
                                 format!(
                                     "the pair \"{true_arm}\" / \"{false_arm}\" differed once \
                                      but a repeat could not be sent"
+                                ),
+                            )
+                        }
+                        // A repeat answered 5xx on both arms: the page that
+                        // differed once now errors on the same payloads, so
+                        // the candidate is neither confirmed nor noise.
+                        PairOutcome::Errored => {
+                            return no_finding(
+                                Outcome::Inconclusive,
+                                format!(
+                                    "the pair \"{true_arm}\" / \"{false_arm}\" differed once \
+                                     but a repeat was answered 5xx on both arms"
                                 ),
                             )
                         }
@@ -624,7 +672,6 @@ impl Check for SqliBoolean {
                             run: &first,
                             runs: agreed,
                             signature,
-                            baseline_flow,
                         },
                     );
                 }
@@ -640,9 +687,24 @@ impl Check for SqliBoolean {
                 // The repeat disagreed: noise, not a finding. Next pair.
             }
 
+            if errored_pairs > 0 {
+                return no_finding(
+                    Outcome::Inconclusive,
+                    format!(
+                        "{errored_pairs} of {planned} condition pairs {was} answered 5xx on both \
+                         arms (error-based territory) and the rest showed no differential \
+                         against the {baseline_len}-byte baseline",
+                        was = if errored_pairs == 1 { "was" } else { "were" },
+                    ),
+                );
+            }
             tally.conclude(format!(
-                "no always-true/always-false pair changed the response length after \
-                 {planned} pairs against a {baseline_len}-byte baseline"
+                "no always-true/always-false pair changed the response {compared} after \
+                 {planned} pairs against a {baseline_len}-byte baseline",
+                compared = match signature {
+                    Signature::Content => "content",
+                    Signature::Length => "length",
+                },
             ))
         })
     }
@@ -719,6 +781,7 @@ mod tests {
         let base = Baseline {
             len: baseline,
             body: String::new(),
+            flow: None,
         };
         let run = PairRun {
             true_len,
@@ -736,6 +799,7 @@ mod tests {
         let base = Baseline {
             len: baseline.len(),
             body: baseline.to_string(),
+            flow: None,
         };
         let run = PairRun {
             true_len: true_body.len(),

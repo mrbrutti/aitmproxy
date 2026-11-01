@@ -42,13 +42,14 @@
 //! # What the raw probe costs the job
 //!
 //! The streams a raw probe opens are requests the job made, but they do not
-//! go through [`ProbeHost`] and nothing charges them: the trait has no
-//! `charge`, so a check cannot spend the job's budget on them and the job's
-//! pacing does not apply to them. Until the engine grows that hook (raised
-//! with the coordinator as a T1b follow-up, plan amendment A5 item T3-6,
-//! which replaces this with `host.charge(streams.max(1))`), each check does
-//! the one thing it can from this side: it refuses to open a connection the
-//! remaining budget could not have paid for, one unit per stream.
+//! go through [`ProbeHost::probe`]. The trait's `charge(units)` and
+//! `baseline_peer_addr()` hooks exist (they arrived with T1b) and PR 2b wires
+//! them in (plan amendment A5, T3-6/T3-7: `host.charge(streams.max(1))`
+//! before the dial, and the dial to the address the guarded baseline
+//! validated). Until then each check does the one thing it can from this
+//! side: it refuses to open a connection the remaining budget could not have
+//! paid for, one unit per stream; the connection is paced through the scope
+//! guard's `check_active` by the driver's gate.
 //!
 //! # One connection per authority
 //!
@@ -557,15 +558,16 @@ impl Check for H2Check {
             let Some(target) = point.url.as_deref().and_then(Target::parse) else {
                 return inconclusive("the point has no usable http(s) url");
             };
-            if !crate::gate::may_send(host, 1) {
-                return stopped();
-            }
             // The profile forced HTTP/1.1 (spec D8.2 `http.version`): an HTTP/2
-            // observe probe would contradict it, so none is sent. Found live
-            // (T3-2 cell, 2026-11-01): these checks were the only h2 traffic
-            // in a forced-h1 job.
+            // observe probe would contradict it, so none is sent — decided
+            // before the stop gate, since it costs nothing. Found live (T3-2
+            // cell, 2026-11-01): these checks were the only h2 traffic in a
+            // forced-h1 job.
             if matches!(host.profile().http.version, HttpVersionPolicy::H1) {
                 return inconclusive(FORCED_H1);
+            }
+            if !crate::gate::may_send(host, 1) {
+                return stopped();
             }
             // The profile gate, before anything at all is sent: a raw probe
             // bypasses the lane's guarded client, so the authority it would
@@ -584,9 +586,11 @@ impl Check for H2Check {
             if host.cancelled() || Instant::now() >= host.deadline() {
                 return stopped();
             }
-            // The raw connection cannot charge the job — `ProbeHost` has no
-            // `charge` — so the check refuses to open one the budget could not
-            // have paid for, counting one unit per stream the plan will open
+            // The raw connection is not yet charged to the job: the
+            // `ProbeHost::charge` and `baseline_peer_addr` hooks arrived with
+            // T1b and are wired in PR 2b (plan amendment A5, T3-6/T3-7). Until
+            // then the check refuses to open a connection the remaining budget
+            // could not have paid for, one unit per stream the plan will open
             // (security review SEC-C2; see the module header).
             let Planned { plan, labels } = self.plan(&target);
             if host.budget_left() < u32::from(plan.streams).max(1) {
@@ -866,31 +870,34 @@ fn read_stream(outcome: &StreamOutcome) -> Reading {
 }
 
 /// The shared rule of the three malformed-header checks.
+/// The GOAWAY error codes a conforming server uses to reject a malformed
+/// header block at the connection level (RFC 9113 section 7): a protocol
+/// violation, an oversized frame, an HPACK failure. Any other code — rate
+/// limiting (`ENHANCE_YOUR_CALM`), an internal error, a graceful close — says
+/// nothing about the variant in flight.
+const HEADER_BLOCK_REJECTION_CODES: [u32; 3] = [1, 6, 9];
+
+/// The shared rule of the three malformed-header checks.
+///
+/// Every variant is read on its own stream: answered 2xx/3xx means tolerated,
+/// a reset, a refusal or an error status means rejected, nothing means
+/// unobserved. One connection-level case is read as well (live run against
+/// hyper, 2026-11-01): a GOAWAY with one of [`HEADER_BLOCK_REJECTION_CODES`]
+/// while the sequential blocks were in flight is the peer rejecting the
+/// variant it was reading — the strictest rejection there is — and the slots
+/// after it were never written, since the driver opens one connection per
+/// probe and the peer took it down.
 fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
     let mut tolerated = Vec::new();
-    let mut unobserved = labels.len().saturating_sub(obs.streams.len());
-    // A GOAWAY with an error code while the sequential blocks were in
-    // flight is the peer rejecting the variant it was reading at the
-    // connection level — the strictest rejection there is, and what a
-    // conforming server does with a malformed header block (live run
-    // against hyper, 2026-11-01). The rejected variant is the first slot
-    // without an outcome; the slots after it were never written, since the
-    // driver opens one connection per probe and the peer took it down.
-    let connection_rejected =
-        obs.connection_closed && matches!(obs.goaway, Some((_, code)) if code != 0);
-    let mut at_connection: Option<usize> = None;
-    let mut not_tried = 0usize;
+    let mut unobserved: Vec<usize> = (obs.streams.len()..labels.len()).collect();
     for (index, outcome) in obs.streams.iter().enumerate().take(labels.len()) {
         match read_stream(outcome) {
             Reading::Rejected => {}
-            Reading::Unobserved if connection_rejected && at_connection.is_none() => {
-                at_connection = Some(index);
-            }
-            Reading::Unobserved if at_connection.is_some() => not_tried += 1,
-            Reading::Unobserved => unobserved += 1,
+            Reading::Unobserved => unobserved.push(index),
             Reading::Tolerated(how) => tolerated.push((index, how)),
         }
     }
+    unobserved.sort_unstable();
     if !tolerated.is_empty() {
         let detail = tolerated
             .iter()
@@ -920,31 +927,47 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
             more: Vec::new(),
         };
     }
-    if let (Some(index), 0) = (at_connection, unobserved) {
-        let code = obs.goaway.map_or(0, |(_, code)| code);
+    let Some(&in_flight) = unobserved.first() else {
         return no_finding(
             Outcome::Clean,
-            format!(
-                "variant {index} ({}) was rejected at the connection level (GOAWAY \
-                 error_code={code}); {not_tried} later variant(s) could not be tried on \
-                 that connection",
-                labels[index]
-            ),
+            format!("all {} variants were rejected", labels.len()),
         );
+    };
+    // The peer took the connection down while `in_flight` was being read.
+    if let (true, Some((_, code))) = (obs.connection_closed, obs.goaway) {
+        let not_tried = unobserved.len() - 1;
+        if HEADER_BLOCK_REJECTION_CODES.contains(&code) {
+            return no_finding(
+                Outcome::Clean,
+                format!(
+                    "variant {in_flight} ({}) was rejected at the connection level (GOAWAY \
+                     error_code={code}); {not_tried} later variant(s) could not be tried on \
+                     that connection",
+                    labels[in_flight]
+                ),
+            );
+        }
+        if code != 0 {
+            return inconclusive(format!(
+                "the peer sent GOAWAY(error_code={code}) while variant {in_flight} ({}) was in \
+                 flight, which is not a header-block rejection; {} of {} variants did not \
+                 reach an outcome",
+                labels[in_flight],
+                unobserved.len(),
+                labels.len()
+            ));
+        }
     }
-    let unobserved = unobserved + not_tried + usize::from(at_connection.is_some());
-    if unobserved > 0 {
-        let why = if obs.peer_silent {
-            "were not answered within the read timeout; the peer stayed silent"
-        } else {
-            "did not reach an outcome before the probe stopped"
-        };
-        return inconclusive(format!("{unobserved} of {} variants {why}", labels.len()));
-    }
-    no_finding(
-        Outcome::Clean,
-        format!("all {} variants were rejected", labels.len()),
-    )
+    let why = if obs.peer_silent {
+        "were not answered within the read timeout; the peer stayed silent"
+    } else {
+        "did not reach an outcome before the probe stopped"
+    };
+    inconclusive(format!(
+        "{} of {} variants {why}",
+        unobserved.len(),
+        labels.len()
+    ))
 }
 
 #[cfg(test)]
