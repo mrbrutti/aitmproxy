@@ -14,7 +14,7 @@ use crate::l4::{L4Flow, L4Pane};
 use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::bars::{put, put_sides};
-use crate::ui::overlays::{boxed, lines_into};
+use crate::ui::overlays::lines_into;
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, truncate};
 use crate::viewers;
@@ -349,70 +349,4 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
             lines_into(buf, area, &lines, 0);
         }
     }
-}
-
-/// The inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10): the
-/// server's wire summary (destination, packet summary, count, scope entry,
-/// permit budget). `y` re-issues with `_confirm`; `n` / Esc cancels.
-pub fn confirm(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let Some(c) = &app.l4.confirm else {
-        return;
-    };
-    let area = crate::ui::centered(
-        screen,
-        screen.width.saturating_sub(10).clamp(40, 90),
-        screen.height.saturating_sub(8).clamp(7, 14),
-    );
-    let inner = boxed(
-        theme,
-        "Confirm over the wire — guarded L4 action",
-        area,
-        buf,
-    );
-    let mut lines = vec![
-        Line::styled(
-            format!(" {}", c.call),
-            theme.l4().add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-    ];
-    // Wrap the server's wire summary to the panel width.
-    for chunk in wrap(&c.prompt, usize::from(inner.width).saturating_sub(2)) {
-        lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " This reaches the wire only through l4.inject; the guard enforces scope.",
-        theme.text_tertiary(),
-    ));
-    lines.push(Line::styled(
-        " y confirm (re-issues with _confirm) · n / Esc cancel",
-        theme.accent().add_modifier(Modifier::BOLD),
-    ));
-    lines_into(buf, inner, &lines, 0);
-}
-
-/// Greedy word-wrap to `width` columns.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }

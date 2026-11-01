@@ -4,6 +4,8 @@
 //! Findings/Browser panels' shape and reuses the shared list rendering; the
 //! scanner engine is `aitm-plugin-scanner` and this only surfaces its result.
 
+pub mod confirm;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;

@@ -36,7 +36,7 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Scan => scan(key),
         // Read-only: back, palette, help.
         Mode::Config => panel(key),
-        Mode::L4Confirm => l4_confirm(key),
+        Mode::WireConfirm => wire_confirm(key),
         // Any key closes help (README); `:` goes straight to the palette.
         Mode::Help => Some(match key.code {
             KeyCode::Char(':') => Action::PaletteOpen,
@@ -201,12 +201,12 @@ fn inspector(key: KeyEvent) -> Option<Action> {
     })
 }
 
-/// The L4 inject confirm overlay: `y` confirms (re-issues with `_confirm`),
+/// The wire-confirm overlay: `y` confirms (re-issues with `_confirm`),
 /// `n` / Esc cancels.
-fn l4_confirm(key: KeyEvent) -> Option<Action> {
+fn wire_confirm(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => Action::L4Confirm(true),
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::L4Confirm(false),
+        KeyCode::Char('y') | KeyCode::Char('Y') => Action::WireConfirm(true),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::WireConfirm(false),
         _ => return None,
     })
 }

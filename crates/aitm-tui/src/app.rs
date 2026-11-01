@@ -78,9 +78,10 @@ pub enum Mode {
     Scan,
     Help,
     QuickLook,
-    /// The L4 inject confirm-over-the-wire overlay (ui-ext §3.4, L4OPS-AC10):
-    /// shows the server's wire summary; `y` re-issues with `_confirm`.
-    L4Confirm,
+    /// The confirm-over-the-wire overlay (spec D3, D7), shared by the `l4.*`
+    /// guarded verbs and the `scan.*` launches: shows the server's prompt; `y`
+    /// re-issues with `_confirm`.
+    WireConfirm,
 }
 
 /// What the one-line prompt is collecting.
@@ -962,6 +963,14 @@ pub struct App {
     /// The Scan view's state (scanner-integration Stage 1). Inert until the bus
     /// offers `scan.discover`.
     pub scan: ScanState,
+    /// The pending confirm-over-the-wire handshake (spec D3, D7), shared by the
+    /// `l4.*` guarded verbs and the `scan.*` launches; `Some` while the overlay
+    /// is open.
+    pub wire_confirm: Option<crate::scan::launch::WireConfirm>,
+    /// The mode to return to when the wire-confirm overlay closes: `l4_inject`
+    /// and `l4_intercept_verb` set `Mode::Inspector`, the scanner launch (Task
+    /// 12) sets `Mode::Scan`.
+    pub wire_confirm_from: Mode,
 }
 
 impl App {
@@ -1024,6 +1033,8 @@ impl App {
             poc_build_pending: VecDeque::new(),
             l4: crate::l4::L4State::default(),
             scan: ScanState::default(),
+            wire_confirm: None,
+            wire_confirm_from: Mode::Flows,
         }
     }
 
@@ -1897,7 +1908,7 @@ impl App {
             }
             Action::L4Build => out.extend(self.l4_build()),
             Action::L4Inject => out.extend(self.l4_inject()),
-            Action::L4Confirm(yes) => out.extend(self.l4_answer_confirm(yes)),
+            Action::WireConfirm(yes) => out.extend(self.answer_wire_confirm(yes)),
             Action::L4ToggleGate(gate) => out.extend(self.l4_toggle_gate(gate)),
         }
         out
@@ -1965,17 +1976,21 @@ impl App {
             args["dst"] = Value::String(dst);
         }
         self.l4.pending = Some(("l4.inject".to_string(), args.clone()));
+        self.wire_confirm_from = Mode::Inspector;
         vec![BusRequest::Call {
             name: "l4.inject".into(),
             args,
         }]
     }
 
-    /// Answer the inject confirm overlay (L4OPS-AC10): `yes` re-issues the
-    /// identical call plus the reserved `_confirm` token; `no` cancels.
-    fn l4_answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
-        self.mode = Mode::Inspector;
-        let Some(c) = self.l4.confirm.take() else {
+    /// Answer the wire-confirm overlay (spec D3, D7): `yes` re-issues the
+    /// identical call plus the reserved `_confirm` token; `no` cancels with a
+    /// `<call> cancelled` toast. Returns to the mode the launch came from. The
+    /// `l4.*` verbs re-issue with `BusRequest::Call`; Task 12 adds the tagged
+    /// branch for the `scan.*` launches.
+    fn answer_wire_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
+        self.mode = self.wire_confirm_from;
+        let Some(c) = self.wire_confirm.take() else {
             return Vec::new();
         };
         if yes {
@@ -2032,6 +2047,7 @@ impl App {
         }
         let args = json!({ "id": flow.id });
         self.l4.pending = Some((tool.to_string(), args.clone()));
+        self.wire_confirm_from = Mode::Inspector;
         vec![BusRequest::Call {
             name: tool.to_string(),
             args,
@@ -2383,8 +2399,8 @@ impl App {
                 let _ = self.answer_confirm(false);
                 return;
             }
-            Mode::L4Confirm => {
-                let _ = self.l4_answer_confirm(false);
+            Mode::WireConfirm => {
+                let _ = self.answer_wire_confirm(false);
                 return;
             }
             Mode::Prompt(kind) => {
@@ -3771,10 +3787,10 @@ impl App {
                             .pending
                             .take()
                             .unwrap_or((name.clone(), Value::Null));
-                        match crate::l4::L4Confirm::from_reply(&call, &args, &value) {
+                        match crate::scan::launch::WireConfirm::from_reply(&call, &args, &value) {
                             Some(confirm) => {
-                                self.l4.confirm = Some(confirm);
-                                self.mode = Mode::L4Confirm;
+                                self.wire_confirm = Some(confirm);
+                                self.mode = Mode::WireConfirm;
                                 return out;
                             }
                             None => {

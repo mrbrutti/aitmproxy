@@ -201,7 +201,7 @@ fn inject_shows_confirm() {
         name: "l4.inject".into(),
         value: reply,
     });
-    assert_eq!(app.mode, Mode::L4Confirm, "the confirm overlay opens");
+    assert_eq!(app.mode, Mode::WireConfirm, "the confirm overlay opens");
     let text = screen(&app);
     assert!(text.contains("127.0.0.1"), "destination shown: {text}");
     assert!(
@@ -211,7 +211,7 @@ fn inject_shows_confirm() {
     assert!(text.contains("budget"), "permit budget shown: {text}");
 
     // Confirming re-issues the identical call plus the `_confirm` token.
-    let reqs = app.update(Action::L4Confirm(true));
+    let reqs = app.update(Action::WireConfirm(true));
     assert_eq!(reqs.len(), 1);
     let BusRequest::Call { name, args } = &reqs[0] else {
         panic!("expected a Call, got {reqs:?}");

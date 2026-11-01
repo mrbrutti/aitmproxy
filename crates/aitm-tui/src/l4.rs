@@ -327,54 +327,10 @@ impl L4Gates {
     }
 }
 
-/// A pending inject confirm-over-the-wire handshake (M4 D4, L4OPS-AC10). The
-/// first `l4.inject` (without `_confirm`) returns a `needs_confirmation` reply
-/// whose `prompt` is the wire summary — destination, packet summary, count,
-/// matched scope entry, minted permit budget. The overlay shows it; on confirm
-/// the UI re-issues the identical call plus the reserved `_confirm` token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct L4Confirm {
-    /// The tool to re-issue (`l4.inject`, `l4.intercept.forward`, …).
-    pub call: String,
-    /// The original args, re-sent verbatim plus `_confirm`.
-    pub args: Value,
-    /// The wire summary the server built, shown to the operator.
-    pub prompt: String,
-    /// The single-use confirm token bound to the pending call.
-    pub token: String,
-}
-
-impl L4Confirm {
-    /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
-    /// `None` when the reply is not a confirmation handshake.
-    pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
-        if reply.get("status").and_then(Value::as_str) != Some("needs_confirmation") {
-            return None;
-        }
-        Some(Self {
-            call: call.to_string(),
-            args: args.clone(),
-            prompt: reply
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or("Confirm this action?")
-                .to_string(),
-            token: reply
-                .get("confirm_token")
-                .and_then(Value::as_str)?
-                .to_string(),
-        })
-    }
-
-    /// The args to re-send on confirm: the originals plus the `_confirm` token.
-    pub fn confirmed_args(&self) -> Value {
-        let mut args = self.args.clone();
-        if let Value::Object(map) = &mut args {
-            map.insert("_confirm".to_string(), Value::String(self.token.clone()));
-        }
-        args
-    }
-}
+/// The confirm-over-the-wire handshake (M4 D4, L4OPS-AC10) is now the generic
+/// [`crate::scan::launch::WireConfirm`], shared with the scanner launches (spec
+/// D3). This alias keeps the L4 call sites reading in L4 terms.
+pub type L4Confirm = crate::scan::launch::WireConfirm;
 
 /// The default `PacketSpec` the craft editor opens with: a loopback UDP probe,
 /// valid for `l4.craft` (outermost layer first; `raw` is a byte list).
@@ -474,8 +430,6 @@ pub struct L4State {
     pub craft: CraftBuffer,
     /// A pending inject (call, args) awaiting the `needs_confirmation` reply.
     pub pending: Option<(String, Value)>,
-    /// The confirm-over-the-wire overlay, once the reply arrives.
-    pub confirm: Option<L4Confirm>,
 }
 
 impl L4State {
@@ -554,18 +508,6 @@ mod tests {
         assert!(g.present);
         assert!(g.get(L4Gate::Capture));
         assert!(!g.get(L4Gate::Inject));
-    }
-
-    #[test]
-    fn confirm_round_trip_adds_the_token() {
-        let args = json!({"spec": {"layers": []}, "dst": "127.0.0.1", "port": 7});
-        let reply = json!({"status": "needs_confirmation", "prompt": "Inject 1 UDP to 127.0.0.1:7?", "confirm_token": "tok-9"});
-        let c = L4Confirm::from_reply("l4.inject", &args, &reply).unwrap();
-        assert_eq!(c.token, "tok-9");
-        assert_eq!(c.confirmed_args()["_confirm"], "tok-9");
-        assert_eq!(c.confirmed_args()["dst"], "127.0.0.1");
-        // A plain success is not a confirmation handshake.
-        assert!(L4Confirm::from_reply("l4.inject", &args, &json!({"injected": 1})).is_none());
     }
 
     #[test]

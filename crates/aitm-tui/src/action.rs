@@ -118,8 +118,8 @@ pub enum Action {
     L4Build,
     /// Inject the crafted packet (`l4.inject`), triggering confirm-over-the-wire.
     L4Inject,
-    /// Answer the inject confirm overlay: `true` re-issues with `_confirm`.
-    L4Confirm(bool),
+    /// Answer the wire-confirm overlay: `true` re-issues with `_confirm`.
+    WireConfirm(bool),
     /// Toggle one per-feature agent gate in the Agent view (`l4.agent.set`).
     L4ToggleGate(crate::l4::L4Gate),
 }
