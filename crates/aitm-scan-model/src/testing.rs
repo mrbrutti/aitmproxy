@@ -283,16 +283,21 @@ pub fn query_point(url: &str, name: &str) -> InsertionPoint {
 /// budget saturates at zero and the host keeps answering, because it is a
 /// recorder, not an enforcer. A baseline costs nothing and is recorded nowhere.
 ///
-/// A `probe` may be answered from a payload-keyed table instead of the canned
-/// reply ([`RecordingHost::with_reply_for`]), so a multi-path check can be
-/// driven to distinct answers per path; `baseline` and `probe_raw` always give
-/// the canned reply.
+/// A `probe` or `probe_raw` may be answered from a needle-keyed table instead
+/// of the canned reply ([`RecordingHost::with_reply_for`],
+/// [`RecordingHost::with_reply_for_headers`]), so a multi-path check can be
+/// driven to distinct answers per path; the needle is matched against a
+/// probe's payload value or a raw probe's URL. `baseline` always gives the
+/// canned reply, with the headers [`RecordingHost::with_baseline_headers`] set.
 pub struct RecordingHost {
     /// An owning handle to this host, when it was built by
-    /// [`RecordingHost::shared_new`]; otherwise dangling, so `shared()` is `None`.
+    /// [`RecordingHost::shared_new`] or moved behind one by
+    /// [`RecordingHost::into_shared`]; otherwise dangling, so `shared()` is `None`.
     me: Weak<RecordingHost>,
     status: u16,
     body: Vec<u8>,
+    /// Headers on the canned reply (baseline and unmatched probes).
+    headers: Vec<(String, String)>,
     /// Payload values from `probe`, in order.
     sent: Mutex<Vec<String>>,
     /// URLs from `probe_raw`, in order.
@@ -302,9 +307,18 @@ pub struct RecordingHost {
     /// The address the canned baseline is pretended to have come from, when a
     /// test pinned one with [`RecordingHost::with_peer`]. `None` otherwise.
     peer: Option<SocketAddr>,
-    /// `(needle, status, body)` in registration order; the first needle that is
-    /// a substring of a probe's payload value answers that probe.
-    replies: Vec<(String, u16, Vec<u8>)>,
+    /// Table entries in registration order; the first needle that is a
+    /// substring of a probe's payload value, or of a raw probe's URL, answers
+    /// that probe.
+    replies: Vec<Reply>,
+}
+
+/// One entry of [`RecordingHost`]'s reply table.
+struct Reply {
+    needle: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
 impl RecordingHost {
@@ -314,6 +328,7 @@ impl RecordingHost {
             me: Weak::new(),
             status,
             body: body.as_bytes().to_vec(),
+            headers: Vec::new(),
             sent: Mutex::new(Vec::new()),
             raw: Mutex::new(Vec::new()),
             budget: AtomicU32::new(RECORDING_BUDGET),
@@ -323,14 +338,40 @@ impl RecordingHost {
         }
     }
 
-    /// The same host, answering `status`/`body` to any `probe` whose payload
-    /// value contains `needle`. Entries are consulted in the order they were
-    /// added and the first match wins; a payload no needle matches gets the
-    /// canned reply. `baseline` and `probe_raw` never consult the table.
+    /// The same host, answering `status`/`body` with no headers to any `probe`
+    /// whose payload value contains `needle` and any `probe_raw` whose URL does.
+    /// Entries are consulted in the order they were added and the first match
+    /// wins; a probe no needle matches gets the canned reply. `baseline` never
+    /// consults the table.
     #[must_use]
-    pub fn with_reply_for(mut self, needle: &str, status: u16, body: &str) -> Self {
-        self.replies
-            .push((needle.to_string(), status, body.as_bytes().to_vec()));
+    pub fn with_reply_for(self, needle: &str, status: u16, body: &str) -> Self {
+        self.with_reply_for_headers(needle, status, Vec::new(), body)
+    }
+
+    /// [`RecordingHost::with_reply_for`] with response `headers`, so a check
+    /// that reads a header off the answer can be driven to see it.
+    #[must_use]
+    pub fn with_reply_for_headers(
+        mut self,
+        needle: &str,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: &str,
+    ) -> Self {
+        self.replies.push(Reply {
+            needle: needle.to_string(),
+            status,
+            headers,
+            body: body.as_bytes().to_vec(),
+        });
+        self
+    }
+
+    /// The same host, carrying `headers` on its canned reply, so a check that
+    /// reads a header off the baseline (or an unmatched probe) can see one.
+    #[must_use]
+    pub fn with_baseline_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -347,9 +388,17 @@ impl RecordingHost {
     /// handle back — what a scripting bridge holding the host in a thread-local
     /// needs (spec D9.3, plan call B5).
     pub fn shared_new(status: u16, body: &str) -> Arc<RecordingHost> {
+        RecordingHost::new(status, body).into_shared()
+    }
+
+    /// This host, as configured so far, moved behind an `Arc` that it holds a
+    /// `Weak` to — so a host built with `with_peer`/`with_reply_for`/... on the
+    /// stack still answers [`ProbeHost::shared`] with `Some`. Every field,
+    /// including anything already recorded, moves across.
+    pub fn into_shared(self) -> Arc<RecordingHost> {
         Arc::new_cyclic(|me| RecordingHost {
             me: me.clone(),
-            ..RecordingHost::new(status, body)
+            ..self
         })
     }
 
@@ -366,25 +415,28 @@ impl RecordingHost {
 
     /// The canned response.
     fn response(&self) -> ProbeResponse {
-        self.response_with(self.status, self.body.clone())
+        Self::response_with(self.status, self.headers.clone(), self.body.clone())
     }
 
-    /// The table's reply for `payload` when a needle matches, else the canned one.
-    fn response_for(&self, payload: &str) -> ProbeResponse {
+    /// The table's reply for `subject` (a payload value or a raw URL) when a
+    /// needle matches, else the canned one.
+    fn response_for(&self, subject: &str) -> ProbeResponse {
         match self
             .replies
             .iter()
-            .find(|(needle, _, _)| payload.contains(needle.as_str()))
+            .find(|reply| subject.contains(reply.needle.as_str()))
         {
-            Some((_, status, body)) => self.response_with(*status, body.clone()),
+            Some(reply) => {
+                Self::response_with(reply.status, reply.headers.clone(), reply.body.clone())
+            }
             None => self.response(),
         }
     }
 
-    fn response_with(&self, status: u16, body: Vec<u8>) -> ProbeResponse {
+    fn response_with(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> ProbeResponse {
         ProbeResponse {
             status: Some(status),
-            headers: Vec::new(),
+            headers,
             body,
             elapsed_ms: 1,
             flow: None,
@@ -428,7 +480,7 @@ impl ProbeHost for RecordingHost {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(req.url.clone());
             self.charge_one();
-            Ok(self.response())
+            Ok(self.response_for(&req.url))
         })
     }
 
@@ -651,7 +703,8 @@ mod tests {
     /// Coordinator item (2026-11-01): a payload-keyed reply table, so a test
     /// can drive a multi-path check — `/.git/` answers one body, `/.env`
     /// another — and a payload nothing matches still gets the canned default.
-    /// Only `probe` consults the table.
+    /// `probe` and (since the T3 track's request) `probe_raw` consult the
+    /// table; `baseline` never does.
     #[test]
     fn recording_host_answers_by_payload_needle() {
         let host = RecordingHost::new(200, "default")
@@ -683,7 +736,11 @@ mod tests {
             body: Vec::new(),
         }))
         .expect("the stub answers");
-        assert_eq!(raw.body, b"default".to_vec(), "probe_raw ignores the table");
+        assert_eq!(
+            raw.body,
+            b"ref: refs/heads/main".to_vec(),
+            "probe_raw consults the table by URL"
+        );
 
         assert_eq!(
             host.payloads(),
@@ -717,5 +774,104 @@ mod tests {
         }))
         .expect_err("the lent client sends nothing");
         assert!(err.to_string().contains("no client"), "{err}");
+    }
+
+    /// T3 track (2026-11-01): a host configured on the stack (`with_peer`,
+    /// `with_reply_for`, ...) can be moved behind an `Arc` afterwards and keeps
+    /// every setting, so a bridge test no longer has to choose between
+    /// `shared()` working and the reply table being populated.
+    #[test]
+    fn into_shared_keeps_configuration_and_is_shared() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().expect("a literal address");
+        let host = RecordingHost::new(200, "b")
+            .with_peer(addr)
+            .with_reply_for("X", 418, "teapot")
+            .into_shared();
+
+        let shared = host.shared().expect("into_shared owns a handle");
+        assert_eq!(shared.budget_left(), 16);
+        assert_eq!(host.baseline_peer_addr(), Some(addr));
+
+        let teapot = block_on(host.probe(&payload("X"))).expect("the stub answers");
+        assert_eq!(teapot.status, Some(418));
+        assert_eq!(teapot.body, b"teapot".to_vec());
+        assert_eq!(host.payloads(), vec!["X".to_string()]);
+    }
+
+    /// T3 track (2026-11-01): the reply table answers raw probes by URL
+    /// substring and can carry headers, so a header-reading check driven over
+    /// `probe_raw` sees exactly the response a test scripted for that URL.
+    #[test]
+    fn raw_probes_are_answered_by_url_needle_with_headers() {
+        let host = RecordingHost::new(200, "ok").with_reply_for_headers(
+            "/admin",
+            403,
+            vec![("x-denied".to_string(), "1".to_string())],
+            "no",
+        );
+
+        let denied = block_on(host.probe_raw(RawProbe {
+            method: "GET".to_string(),
+            url: "http://127.0.0.1:8080/admin".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }))
+        .expect("the stub answers");
+        assert_eq!(denied.status, Some(403));
+        assert_eq!(
+            denied.headers,
+            vec![("x-denied".to_string(), "1".to_string())]
+        );
+        assert_eq!(denied.body, b"no".to_vec());
+
+        let other = block_on(host.probe_raw(RawProbe {
+            method: "GET".to_string(),
+            url: "http://127.0.0.1:8080/index".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }))
+        .expect("the stub answers");
+        assert_eq!(other.status, Some(200));
+        assert!(other.headers.is_empty(), "the canned reply has no headers");
+        assert_eq!(other.body, b"ok".to_vec());
+
+        assert_eq!(
+            host.raw_urls(),
+            vec![
+                "http://127.0.0.1:8080/admin".to_string(),
+                "http://127.0.0.1:8080/index".to_string()
+            ]
+        );
+        assert!(host.payloads().is_empty(), "a raw probe is not a payload");
+        assert_eq!(host.budget_left(), 14);
+    }
+
+    /// T3 track (2026-11-01): the canned reply can carry headers, so a
+    /// header-reading check sees them on the baseline and on a probe no
+    /// needle matches; a table hit carries its own headers instead.
+    #[test]
+    fn baseline_headers_ride_the_canned_reply_only() {
+        let host = RecordingHost::new(200, "ok")
+            .with_baseline_headers(vec![("server".to_string(), "nginx".to_string())])
+            .with_reply_for("hit", 201, "made");
+
+        let baseline = block_on(host.baseline()).expect("the stub answers");
+        assert_eq!(
+            baseline.headers,
+            vec![("server".to_string(), "nginx".to_string())]
+        );
+
+        let miss = block_on(host.probe(&payload("miss"))).expect("the stub answers");
+        assert_eq!(
+            miss.headers,
+            vec![("server".to_string(), "nginx".to_string())]
+        );
+
+        let hit = block_on(host.probe(&payload("hit"))).expect("the stub answers");
+        assert_eq!(hit.status, Some(201));
+        assert!(
+            hit.headers.is_empty(),
+            "a table hit carries its own headers"
+        );
     }
 }
