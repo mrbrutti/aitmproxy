@@ -333,7 +333,7 @@ Spec §7(b) file list. `tests/l4_parity.rs` builds the app with `App::new(TermCa
 
 - **Satisfies:** AC14
 - **Depends on:** B6
-- **Files:** `crates/aitm-tui/src/{app,filter,keys}.rs`, `src/ui/{bars,complete,flows}.rs` (`flows.rs` only if the row needs the proto), `tests/l4_parity.rs`
+- **Files:** `crates/aitm-tui/src/{app,filter,keys}.rs`, `src/ui/{bars,complete,flows,overlays}.rs` (`flows.rs` only if the row needs the proto; `overlays.rs` for the help text: the filter atoms, the craft keys `b/s/m/u` B4/B5 added without a help line), `src/ui/l4.rs` (confirm footer only: the ` This reaches the wire only through l4.inject; the guard enforces scope.` line is shown for an `l4.scope.add` confirm since B6; show it only for `l4.inject`), `tests/l4_parity.rs`
 - **Change:** `Chip::{Tcp, Udp, L4}` after `WebSocket` (`Chip::ALL` 18 long: `All, Http, Https, WebSocket, Tcp, Udp, L4, H1, H2, Json, …`), labels `TCP`, `UDP`, `L4`; `L4` matches `row.kind == FlowKind::L4`, `Tcp`/`Udp` match `row.l4.proto`. `filter.rs` atoms `~l4 ~tcp ~udp ~icmp` (`Expr::L4`, `Expr::L4Proto(&'static str)`). Help and the filter hint list `~l4 ~tcp ~udp ~icmp`.
 - **Test first** (`--test l4_parity chips_filters`, `--lib filter`): with an L4 row from `FlowRow::from_l4` (TCP layers) and an HTTP row: `parse("~l4")` matches the L4 row only; `~tcp` matches it, `~udp` does not; `~icmp` parses; `Chip::L4.matches(<http row>) == false`; `Chip::ALL[4..7]` labels `["TCP","UDP","L4"]`; help contains `~l4 ~tcp ~udp ~icmp`.
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
