@@ -44,7 +44,9 @@ use crate::mutate::{boundary_cases, random_case, Mutation, DEFAULT_MAX_RAW_BYTES
 use crate::oracle::{classify, liveness_passes, CaseClass, LatencyWindow};
 use crate::plan::{is_decodable, send_recv_spec, SeedSpec, TargetPlan};
 use crate::rng::{derive_seed, Rng};
-use crate::state::{report_counters, CaseRecord, CrashRecord, LaneState, PointRun, StopReason};
+use crate::state::{
+    report_counters, Candidate, CaseRecord, CrashRecord, LaneState, PointRun, StopReason,
+};
 
 /// How long one case waits for its reply (spec D8.4's reply window).
 pub const CASE_REPLY_WINDOW: Duration = Duration::from_millis(500);
@@ -405,7 +407,7 @@ impl PointRunner {
                 sent: false,
                 elapsed_ms: 0,
                 latency_outlier: false,
-                liveness: None,
+                candidate: Candidate::No,
             });
         }
         run
@@ -516,7 +518,7 @@ impl PointRunner {
             sent: false,
             elapsed_ms: 0,
             latency_outlier: false,
-            liveness: None,
+            candidate: Candidate::No,
         };
         if !is_decodable(&bytes) {
             if counted == Counted::Case {
@@ -702,6 +704,14 @@ impl PointRunner {
         let mut alive = true;
 
         for index in 0..allocated {
+            // The ceiling is job-wide and this point's triage spends from it
+            // too, so it is re-read every case: a replay shrinks the loop
+            // instead of making the next case trip the cap job-wide (review
+            // finding Q2). Running out here is the allocation ending, not a
+            // stop (tester finding on the last loop case).
+            if self.shared.state.cases_remaining(job_id) == Some(0) {
+                break;
+            }
             let liveness_before = alive;
             let Some((seed, mutation)) = self.case_at(index, &boundary, &mut rng) else {
                 break;
@@ -723,7 +733,7 @@ impl PointRunner {
                     sent: false,
                     elapsed_ms: 0,
                     latency_outlier: false,
-                    liveness: None,
+                    candidate: Candidate::No,
                 });
                 continue;
             };
@@ -754,7 +764,7 @@ impl PointRunner {
                         sent: false,
                         elapsed_ms: 0,
                         latency_outlier: false,
-                        liveness: None,
+                        candidate: Candidate::No,
                     });
                     continue;
                 }
@@ -774,9 +784,13 @@ impl PointRunner {
 
             if class.is_candidate() && stop.is_none() {
                 let (first, second, probe_stop) = self.probe_pair(false).await;
-                record.liveness = Some((first, second));
+                let probes = (first, second);
                 alive = first || second;
                 if let Some(reason) = probe_stop {
+                    record.candidate = Candidate::Interrupted {
+                        probes,
+                        stop: reason.clone(),
+                    };
                     run.cases.push(record);
                     run.stopped = Some(reason);
                     break;
@@ -788,6 +802,9 @@ impl PointRunner {
                 // next case, keeping this one's `(false, false)` liveness for
                 // `checks::CrashCheck` to report as inconclusive (review
                 // finding G1).
+                if !first && !second && reproduce_count == 0 {
+                    record.candidate = Candidate::Unjudged { probes };
+                }
                 if !first && !second && reproduce_count > 0 {
                     let triage = self
                         .triage(&spec, &seed.id, &chain, index, reproduce_count)
@@ -798,6 +815,10 @@ impl PointRunner {
                     // finding F1). `checks::CrashCheck` surfaces the
                     // unconfirmed candidate as inconclusive.
                     if let Some(reason) = triage.stop {
+                        record.candidate = Candidate::Interrupted {
+                            probes,
+                            stop: reason.clone(),
+                        };
                         run.cases.push(record);
                         run.stopped = Some(reason);
                         break;
@@ -805,6 +826,22 @@ impl PointRunner {
                     let crashed = !triage.recovered
                         || (triage.attempts == reproduce_count
                             && triage.reproduced == triage.attempts);
+                    record.candidate = if crashed {
+                        Candidate::Confirmed {
+                            probes,
+                            reproduced: triage.reproduced,
+                            attempts: triage.attempts,
+                        }
+                    } else {
+                        // The triage ran and the candidate did not come back:
+                        // that is the lane's answer, and no later stop reopens
+                        // it (review finding Q2).
+                        Candidate::NotReproduced {
+                            probes,
+                            reproduced: triage.reproduced,
+                            attempts: triage.attempts,
+                        }
+                    };
                     if crashed {
                         self.shared.state.record_crash(job_id, &self.point.id);
                         run.crash = Some(CrashRecord {
@@ -1217,7 +1254,7 @@ mod tests {
     use crate::fields::FieldPath;
     use crate::oracle::CaseClass;
     use crate::plan::{point_id, TargetPlan};
-    use crate::state::{LaneState, StopReason};
+    use crate::state::{Candidate, LaneState, StopReason};
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
         MockReply, TestJob,
@@ -1483,7 +1520,14 @@ mod tests {
 
         let run = runner.run_point().await;
 
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::NotReproduced {
+                probes: (false, false),
+                reproduced: 0,
+                attempts: 3,
+            }
+        );
         assert!(run.crash.is_none());
         assert_eq!(
             shared
@@ -1494,12 +1538,16 @@ mod tests {
             0
         );
         // The three replays are cases of this job (call C10), so they come
-        // out of the same ceiling of ten: the fuzz loop gets seven, and the
-        // eighth is the send the cap refuses (spec D8.4; review finding G2 —
+        // out of the same ceiling of ten: the fuzz loop gets seven of them
+        // and the triage the other three (spec D8.4; review finding G2 —
         // before it the triage spent its replays on top of the ceiling and
-        // the job sent thirteen cases against a cap of ten).
+        // the job sent thirteen cases against a cap of ten). The loop re-reads
+        // the ceiling every case, so the eighth is never asked for and the
+        // point ends cleanly instead of stopping the whole job on the cap
+        // (review finding Q2 — before it this run stopped on `CaseCap(10)`).
         assert_eq!(run.cases.len(), 7, "{:?}", run.cases);
-        assert_eq!(run.stopped, Some(StopReason::CaseCap(10)));
+        assert_eq!(run.stopped, None);
+        assert_eq!(shared.state.stopped(job.job_id()), None);
         assert_eq!(
             shared.state.counters(job.job_id()).expect("counters").cases,
             10
@@ -1545,7 +1593,7 @@ mod tests {
         assert_eq!(
             run.cases
                 .iter()
-                .filter(|case| case.liveness == Some((false, false)))
+                .filter(|case| matches!(case.candidate, Candidate::Unjudged { .. }))
                 .map(|case| case.chain.join(";"))
                 .collect::<Vec<_>>(),
             [
@@ -1566,7 +1614,12 @@ mod tests {
             .iter()
             .find(|case| case.chain == vec!["grow:8".to_string()])
             .expect("the grow:8 case");
-        assert_eq!(candidate.liveness, Some((false, false)));
+        assert_eq!(
+            candidate.candidate,
+            Candidate::Unjudged {
+                probes: (false, false)
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1898,7 +1951,13 @@ mod tests {
         assert_eq!(mock.inject_count(), 5);
         assert_eq!(job.charged(), 5);
         assert_eq!(run.cases.len(), 2);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::Budget,
+            }
+        );
         assert_eq!(run.stopped, Some(StopReason::Budget));
         assert!(
             run.crash.is_none(),
@@ -1940,7 +1999,13 @@ mod tests {
             run.crash
         );
         assert_eq!(run.cases.len(), 2);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::CaseCap(2),
+            }
+        );
         assert_eq!(
             shared.state.counters(job.job_id()),
             Some(L4Counters {
@@ -2002,7 +2067,13 @@ mod tests {
         let run = runner.run_point().await;
 
         assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::Deadline,
+            }
+        );
         assert_eq!(run.stopped, Some(StopReason::Deadline));
         assert_eq!(
             shared.state.stopped(job.job_id()),
@@ -2067,7 +2138,13 @@ mod tests {
         );
         assert_eq!(job.charged(), 5);
         assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::Cancelled,
+            }
+        );
         assert_eq!(run.stopped, Some(StopReason::Cancelled));
         assert_eq!(
             shared.state.stopped(job.job_id()),
@@ -2111,7 +2188,13 @@ mod tests {
         assert_eq!(mock.inject_count(), 6, "the replay never went out");
         assert_eq!(job.charged(), 6);
         assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::Budget,
+            }
+        );
         assert_eq!(run.stopped, Some(StopReason::Budget));
         assert_eq!(shared.state.stopped(job.job_id()), Some(StopReason::Budget));
         assert!(
@@ -2154,7 +2237,13 @@ mod tests {
         assert_eq!(job.charged(), 7);
         // The replay is not a record of the run; the loop's two cases are.
         assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::Budget,
+            }
+        );
         assert_eq!(run.stopped, Some(StopReason::Budget));
         assert!(
             run.crash.is_none(),
@@ -2200,7 +2289,13 @@ mod tests {
         let run = first.run_point().await;
 
         assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
-        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::Interrupted {
+                probes: (false, false),
+                stop: StopReason::CaseCap(4),
+            }
+        );
         assert_eq!(run.stopped, Some(StopReason::CaseCap(4)));
         assert!(
             run.crash.is_none(),

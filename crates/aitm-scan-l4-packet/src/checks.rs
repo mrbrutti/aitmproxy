@@ -23,7 +23,7 @@ use aitm_scan_model::{
 use futures::future::BoxFuture;
 
 use crate::host::RunnerRegistry;
-use crate::state::{CrashRecord, PointRun};
+use crate::state::{Candidate, CrashRecord, PointRun};
 
 /// The crash check's catalogue id.
 pub const CRASH_CHECK_ID: &str = "l4-packet-crash";
@@ -150,7 +150,7 @@ impl Check for CrashCheck {
             if run.dry_run {
                 return dry_run_verdict(&run);
             }
-            if let Some(verdict) = candidate_verdict(&run, host.profile().l4.reproduce_count) {
+            if let Some(verdict) = candidate_verdict(&run) {
                 return verdict;
             }
             if let Some(verdict) = stopped_verdict(&run) {
@@ -330,35 +330,35 @@ fn dry_run_verdict(run: &PointRun) -> Verdict {
     }
 }
 
-/// The verdict for a run whose crash triage a stop cut short: the candidate
-/// case left the target silent on both liveness probes, but no replay ever
-/// confirmed it, so the point is neither clean nor crashed —
-/// `inconclusive`/`tentative`, naming the stop that interrupted the triage
-/// (tester finding F1).
+/// The verdict for a candidate the triage never answered: the case left the
+/// target silent on both liveness probes, but no replay ever judged it, so the
+/// point is neither clean nor crashed — `inconclusive`/`tentative`, saying why
+/// (tester finding F1, review finding G1).
 ///
-/// The candidate carried is the most recent one, which is the case the
-/// interrupted triage was reproducing. `Evidence.l4` stays `None`: an
-/// `L4Evidence` asserts a reproduction count, and nothing was reproduced.
-/// A candidate also goes unconfirmed with no stop at all when the profile
-/// asks for no replay: `reproduce_count: 0` means the triage never ran, so
-/// spec call 14's reproduction never happened and the point is inconclusive
-/// rather than clean (review finding G1).
+/// Read off the cases themselves, never inferred from the run's stop: a
+/// triage that ran and did not reproduce its candidate
+/// ([`Candidate::NotReproduced`]) is the lane's answer, and a stop afterwards
+/// does not reopen it (review finding Q2). The candidate carried is the most
+/// recent unanswered one, which is the case an interrupted triage was
+/// reproducing. `Evidence.l4` stays `None`: an `L4Evidence` asserts a
+/// reproduction count, and nothing was reproduced.
 ///
-/// `None` when the run holds no silent candidate, or when it holds one the
-/// triage did get to judge — a replay ran and did not reproduce it, which is
-/// the lane's answer, not an open question. The caller has already returned
-/// for a run that does hold a crash.
-fn candidate_verdict(run: &PointRun, reproduce_count: u32) -> Option<Verdict> {
-    let why = match run.stopped.as_ref() {
-        Some(reason) => format!("{reason} before reproduction"),
-        None if reproduce_count == 0 => "not reproduced (reproduce_count is 0)".to_string(),
-        None => return None,
-    };
-    let case = run
+/// `None` when every candidate of the run was answered, or there was none.
+/// The caller has already returned for a run that holds a crash.
+fn candidate_verdict(run: &PointRun) -> Option<Verdict> {
+    let (case, why) = run
         .cases
         .iter()
         .rev()
-        .find(|case| case.liveness == Some((false, false)))?;
+        .find_map(|case| match &case.candidate {
+            Candidate::Interrupted { stop, .. } => {
+                Some((case, format!("{stop} before reproduction")))
+            }
+            Candidate::Unjudged { .. } => {
+                Some((case, "not reproduced (reproduce_count is 0)".to_string()))
+            }
+            Candidate::No | Candidate::NotReproduced { .. } | Candidate::Confirmed { .. } => None,
+        })?;
     Some(Verdict {
         outcome: Outcome::Inconclusive,
         confidence: Confidence::Tentative,
@@ -483,7 +483,7 @@ mod tests {
     use crate::fields::FieldPath;
     use crate::host::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
     use crate::plan::{point_id, TargetPlan};
-    use crate::state::{LaneState, StopReason};
+    use crate::state::{Candidate, LaneState, StopReason};
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
         MockReply, TestJob,
@@ -762,7 +762,12 @@ mod tests {
             .iter()
             .find(|case| case.chain == vec!["grow:8:repeat".to_string()])
             .expect("the grow:8:repeat case");
-        assert_eq!(candidate.liveness, Some((false, false)));
+        assert_eq!(
+            candidate.candidate,
+            Candidate::Unjudged {
+                probes: (false, false)
+            }
+        );
         assert_eq!(verdict.evidence.payload, Some(candidate.sent_hex.clone()));
         assert_eq!(
             verdict.detail,
@@ -777,6 +782,49 @@ mod tests {
                 .expect("counters")
                 .crashes,
             0
+        );
+    }
+
+    /// Review finding Q2: once the triage has judged a candidate the answer is
+    /// the lane's, and a later stop cannot turn it back into an open question.
+    /// A flaky candidate that three replays did not reproduce, followed by the
+    /// job running out of budget, is a clean point — not "stopped before
+    /// reproduction", which the triage disproves (spec call 14).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn judged_candidate_then_stop_is_clean() {
+        let mock = MockBackend::new(MockReply::Echo);
+        // `repeat: false`: the pattern kills the target once, so no replay
+        // reproduces it.
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, false);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 10), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // 1 baseline + 2 cases + 2 failed probes + 1 recovery poll +
+        // 3 x (replay + 2 probes) = 15: the triage finishes, and the next
+        // loop case is the charge the budget refuses.
+        let job = job.with_budget(15);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let run = runner.run_point().await;
+        assert_eq!(run.stopped, Some(StopReason::Budget));
+        assert!(run.crash.is_none(), "{:?}", run.crash);
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::NotReproduced {
+                probes: (false, false),
+                reproduced: 0,
+                attempts: 3,
+            }
+        );
+
+        let verdict = run_check(&CrashCheck::new(registry), &runner).await;
+
+        assert_eq!(verdict.outcome, Outcome::Clean);
+        assert_eq!(verdict.confidence, Confidence::Firm);
+        assert!(
+            !verdict.detail.contains("crash candidate"),
+            "the triage judged it: {}",
+            verdict.detail
         );
     }
 
@@ -1028,7 +1076,7 @@ mod tests {
             sent: true,
             elapsed_ms: 1,
             latency_outlier: outlier,
-            liveness: None,
+            candidate: Candidate::No,
         };
         let icmp = CaseClass::Icmp {
             icmp_type: 3,

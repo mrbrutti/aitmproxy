@@ -107,8 +107,58 @@ pub struct CaseRecord {
     pub elapsed_ms: u32,
     /// Whether the round trip was a latency outlier.
     pub latency_outlier: bool,
-    /// The two liveness probes a crash candidate spent, `(immediate, retry)`.
-    pub liveness: Option<(bool, bool)>,
+    /// What the triage ladder made of this case: the lane's own answer,
+    /// recorded here rather than inferred later from the run's stop (review
+    /// finding Q2).
+    pub candidate: Candidate,
+}
+
+/// How far the crash ladder got with one case — the case's own verdict.
+///
+/// Every variant past [`Candidate::No`] carries `probes`, the two liveness
+/// probes the candidate spent, `(immediate, retry)`; both are `false`, because
+/// a candidate whose target answered is no candidate at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidate {
+    /// No crash candidate: the oracle did not flag the case, or a liveness
+    /// probe answered, or the case never went out.
+    No,
+    /// Both liveness probes failed and no replay ever ran: the profile asked
+    /// for none (`reproduce_count: 0`), so spec call 14's reproduction never
+    /// happened and the case is an open question (review finding G1).
+    Unjudged {
+        /// The candidate's two liveness probes.
+        probes: (bool, bool),
+    },
+    /// A triage that started and a stop cut short: nothing is proven either
+    /// way (tester finding F1).
+    Interrupted {
+        /// The candidate's two liveness probes.
+        probes: (bool, bool),
+        /// The stop that interrupted the triage.
+        stop: StopReason,
+    },
+    /// The triage ran its replays and the candidate did not come back: the
+    /// lane's answer is "not a crash", and no later stop changes it (spec
+    /// call 14; review finding G1).
+    NotReproduced {
+        /// The candidate's two liveness probes.
+        probes: (bool, bool),
+        /// How many replays reproduced the silence.
+        reproduced: u32,
+        /// How many replays went out.
+        attempts: u32,
+    },
+    /// The triage confirmed the crash: every replay reproduced it, or the
+    /// target never came back at all.
+    Confirmed {
+        /// The candidate's two liveness probes.
+        probes: (bool, bool),
+        /// How many replays reproduced the silence.
+        reproduced: u32,
+        /// How many replays went out.
+        attempts: u32,
+    },
 }
 
 impl fmt::Debug for CaseRecord {
@@ -125,7 +175,7 @@ impl fmt::Debug for CaseRecord {
             .field("sent", &self.sent)
             .field("elapsed_ms", &self.elapsed_ms)
             .field("latency_outlier", &self.latency_outlier)
-            .field("liveness", &self.liveness)
+            .field("candidate", &self.candidate)
             .finish()
     }
 }
@@ -618,7 +668,7 @@ mod tests {
             sent: true,
             elapsed_ms: 1,
             latency_outlier: false,
-            liveness: None,
+            candidate: Candidate::No,
         }
     }
 
