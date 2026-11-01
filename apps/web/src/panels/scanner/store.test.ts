@@ -7,7 +7,7 @@
 // run here says the store holds the contract, not that any scan ever ran (fixtures/README.md).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppStore } from '~/state/app';
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { findingsState } from '~/panels/findings/state';
 import { fixture, stubApp } from './testkit';
 import { parseScanProfile, type ScanProfile } from './model';

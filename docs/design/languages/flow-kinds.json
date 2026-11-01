@@ -7,7 +7,7 @@
       "status": "response status code in class colour; Paused / Killed badges when applicable",
       "req_size": "request body size",
       "resp_size": "response body size",
-      "ssl": "padlock: open = MITM'd, closed = tunnelled, warning = pinned/failed"
+      "ssl": "padlock from `tunnel`: open = decrypted (and every inner row), closed = passthrough (`tunnel_reason` out_of_scope offers Add to Scope; pinned does not), warning = failed (`tunnel_reason` text); `passive` rows are dimmed and read-only"
     },
     "inspector": {
       "panes": ["request", "response"],

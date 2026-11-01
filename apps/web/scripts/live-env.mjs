@@ -353,12 +353,25 @@ export async function startAitm({
   };
 }
 
-/** Minimal JSON-RPC client over the /bus bridge (same wire as the UI's ws.ts). */
+/**
+ * Minimal JSON-RPC client over the /bus bridge (same wire as the UI's ws.ts). `token` is a bridge
+ * token: the agent one (`startAitm().token`) connects as `Frontend::Mcp`, the operator one
+ * (`startAitm().operatorToken`) as `Frontend::Operator`. `role` is the role the server echoed in
+ * the `initialize` result (`"operator"` / `"mcp"` / …), the same field ws.ts reads; a refused token
+ * (`{"id":null,"error":{"code":-32001,…}}` then a Policy close) fails every call in flight with
+ * the bridge's text instead of hanging `initialize`.
+ */
 export async function connectBus(busUrl, token) {
   const ws = new WebSocket(busUrl, { headers: { Origin: `http://${new URL(busUrl).host}` } });
   let id = 0;
   const pending = new Map();
   const notifications = [];
+  const failAll = (why) => {
+    for (const [n, p] of pending) {
+      pending.delete(n);
+      p.reject(new Error(`rpc ${p.method}: ${why}`));
+    }
+  };
   ws.onmessage = (ev) => {
     for (const line of String(ev.data).split('\n')) {
       if (!line.trim()) continue;
@@ -367,9 +380,14 @@ export async function connectBus(busUrl, token) {
         const p = pending.get(m.id);
         pending.delete(m.id);
         m.error ? p.reject(new Error(`rpc ${p.method}: ${JSON.stringify(m.error)}`)) : p.resolve(m.result);
+      } else if (m.id === null && m.error) {
+        // The bridge's reply to a bad token line is addressed to no request and the connection
+        // ends right after it.
+        failAll(`bus refused the token: ${JSON.stringify(m.error)}`);
       } else notifications.push(m);
     }
   };
+  ws.onclose = (ev) => failAll(`bus closed (code ${ev.code}${ev.reason ? `, ${ev.reason}` : ''})`);
   await new Promise((r, j) => ((ws.onopen = r), (ws.onerror = () => j(new Error('bus connect failed')))));
   ws.send(JSON.stringify({ token }) + '\n');
   const rpc = (method, params = {}) =>
@@ -378,7 +396,8 @@ export async function connectBus(busUrl, token) {
       pending.set(n, { resolve, reject, method });
       ws.send(JSON.stringify({ jsonrpc: '2.0', id: n, method, params }) + '\n');
     });
-  await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'live-env', version: '0' } });
+  const info = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'live-env', version: '0' } });
+  const role = typeof info?.role === 'string' ? info.role : null;
   const tools = async () => (await rpc('tools/list', {})).tools;
   /** Calls a tool; throws on isError with the tool's message. Returns structuredContent (or text). */
   const call = async (name, args = {}) => {
@@ -392,7 +411,7 @@ export async function connectBus(busUrl, token) {
       return t;
     }
   };
-  return { rpc, call, tools, notifications, close: () => ws.close() };
+  return { rpc, call, tools, notifications, role, close: () => ws.close() };
 }
 
 /** Polls `fn` until it returns a truthy value or the deadline passes. */

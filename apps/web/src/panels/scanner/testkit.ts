@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppStore } from '~/state/app';
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import type { BusRole, BusState, NotificationHandler, ToolDef } from '~/bus/types';
 
 /** A canned answer: a value, or a function of the call's arguments (paging, echoes). */

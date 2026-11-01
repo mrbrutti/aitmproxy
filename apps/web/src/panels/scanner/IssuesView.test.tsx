@@ -11,7 +11,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@solidjs/te
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { AppProvider } from '~/state/context';
 import { IssuesView } from './IssuesView';
 import { scanStore, type ScanStore } from './store';

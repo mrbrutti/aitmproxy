@@ -220,7 +220,7 @@ pub(crate) fn parse_cidr(s: &str) -> anyhow::Result<IpCidr> {
 }
 
 /// `addr/prefix` for display / round-trip.
-fn cidr_to_string(cidr: &IpCidr) -> String {
+pub(crate) fn cidr_to_string(cidr: &IpCidr) -> String {
     format!("{}/{}", cidr.addr, cidr.prefix)
 }
 
@@ -266,7 +266,7 @@ fn capability_to_string(cap: L4Capability) -> &'static str {
 pub(crate) fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
     let s = s.trim();
     if s.is_empty() || s == "*" || s.eq_ignore_ascii_case("any") {
-        return Ok(PortRange { lo: 0, hi: 65535 });
+        return Ok(PortRange::ANY);
     }
     if let Some((lo, hi)) = s.split_once('-') {
         let lo = lo
@@ -290,7 +290,7 @@ pub(crate) fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
 }
 
 /// `lo-hi` for display / round-trip.
-fn ports_to_string(ports: &PortRange) -> String {
+pub(crate) fn ports_to_string(ports: &PortRange) -> String {
     format!("{}-{}", ports.lo, ports.hi)
 }
 
@@ -394,8 +394,11 @@ pub(crate) fn active_commands(
     let gates = guard.agent_gates();
     vec![
         Arc::new(L4Interfaces),
-        // `ScopeAdd` is thin: the widen gate (reading the shared gates) and the forced
-        // `source = Runtime` live in `L4Guard::add_runtime_scope`.
+        // `ScopeAdd` is thin. The widen gate lives in the guard
+        // (`L4Guard::add_runtime_scope`, reading the shared gates) and applies to
+        // every untrusted caller and to script/PoC callers; a confirmed operator or
+        // CLI call takes `L4Guard::add_operator_scope` and skips it. Both paths force
+        // `source = Runtime` through the guard's `push_runtime`.
         Arc::new(ScopeAdd::new(guard.clone())),
         Arc::new(ScopeRemove::new(guard.clone())),
         Arc::new(ScopeList::new(guard)),
@@ -410,9 +413,11 @@ pub(crate) fn active_commands(
 /// applies this to the wire + intercept command lists before the privilege gate, so
 /// an untrusted (agent) caller, i.e. any caller `Frontend::is_trusted_control` does
 /// not trust, is refused a gated verb unless its `l4.allow_agent_*` flag is on; the
-/// trusted-control roles (operator and CLI) bypass it. Scope-add's widen gate lives
-/// inside the command (it refuses every runtime caller when off); everything here
-/// is gated for an untrusted caller only.
+/// trusted-control roles (operator and CLI) bypass it. `l4.scope.add` is not in this
+/// list: its widen gate lives in the guard (`add_runtime_scope`), where it applies to
+/// untrusted and script/PoC callers alike, while a confirmed operator or CLI call
+/// skips it (`add_operator_scope`); both paths force `source = Runtime` via
+/// `push_runtime`. Everything here is gated for an untrusted caller only.
 pub(crate) fn agent_gate(
     cmds: Vec<Arc<dyn Command>>,
     gates: &Arc<L4AgentGates>,
@@ -427,7 +432,8 @@ pub(crate) fn agent_gate(
 
 /// The per-capability [`AgentGate`] that governs a command, if it is one of the
 /// Mcp-only gated verbs. Read-only / `Write` commands return `None` (never gated by a
-/// flag), as does `l4.scope.add` (its widen gate lives in the command itself).
+/// flag), as does `l4.scope.add` (its widen gate lives in the guard, see
+/// [`agent_gate`]).
 fn gate_for(name: &str) -> Option<AgentGate> {
     match name {
         "l4.inject" | "l4.send_recv" => Some(AgentGate::Inject),

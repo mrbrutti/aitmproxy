@@ -66,29 +66,34 @@ pub(crate) fn run(exec: &dyn Executor, cmd: &CmdLine) -> Result<CmdOutput, Trust
     Ok(out)
 }
 
-/// The last few non-empty lines of stderr, joined — enough to explain a
-/// failure without echoing a whole tool dump into an error message.
-pub(crate) fn stderr_tail(out: &CmdOutput) -> String {
-    let lines: Vec<&str> = out
-        .stderr
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+/// The last five non-empty lines of `lines`, trimmed and joined with
+/// `" | "` — enough to explain a failure without echoing a whole tool dump
+/// into an error message.
+pub(crate) fn tail_of<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let lines: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
     let start = lines.len().saturating_sub(5);
     lines[start..].join(" | ")
 }
 
-/// `` `<rendered>` exited <code>: <stderr tail> `` for a command that ran
-/// and failed.
-pub(crate) fn failure_text(cmd: &CmdLine, out: &CmdOutput) -> String {
+/// [`tail_of`] over stderr alone.
+pub(crate) fn stderr_tail(out: &CmdOutput) -> String {
+    tail_of(out.stderr.lines())
+}
+
+/// `` `<rendered>` exited <code>: <tail> `` for a command that ran and
+/// failed, with the caller's choice of tail; no colon when it is empty.
+pub(crate) fn failure_text_with_tail(cmd: &CmdLine, out: &CmdOutput, tail: &str) -> String {
     let code = out
         .code
         .map_or_else(|| "on a signal".to_string(), |c| c.to_string());
-    let tail = stderr_tail(out);
     if tail.is_empty() {
         format!("`{}` exited {code}", cmd.render())
     } else {
         format!("`{}` exited {code}: {tail}", cmd.render())
     }
+}
+
+/// [`failure_text_with_tail`] with the stderr tail.
+pub(crate) fn failure_text(cmd: &CmdLine, out: &CmdOutput) -> String {
+    failure_text_with_tail(cmd, out, &stderr_tail(out))
 }

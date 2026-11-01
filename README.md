@@ -11,7 +11,7 @@ Rust; runs on macOS and Linux.
 **Website: [mrbrutti.github.io/aitmproxy](https://mrbrutti.github.io/aitmproxy/)**
 — features, documentation, demos and downloads.
 
-![release](https://img.shields.io/badge/release-v0.5.7-555?style=flat-square)
+![release](https://img.shields.io/badge/release-v0.5.9-555?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-555?style=flat-square)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-555?style=flat-square)
 
@@ -145,8 +145,8 @@ then install it. Packages place `aitm` and `aitm-tui` on your `PATH` with obscur
 beside them.
 
 ```bash
-sudo apt install ./aitm-0.5.7-amd64.deb     # Debian / Ubuntu
-sudo dnf install ./aitm-0.5.7-x86_64.rpm    # Fedora / RHEL
+sudo apt install ./aitm-0.5.9-amd64.deb     # Debian / Ubuntu
+sudo dnf install ./aitm-0.5.9-x86_64.rpm    # Fedora / RHEL
 ```
 
 The release also ships `aitm-<version>-<target>.tar.gz` for Linux and macOS, and
