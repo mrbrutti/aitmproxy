@@ -487,4 +487,466 @@ mod tests {
             assert_eq!(err.to_string(), text);
         }
     }
+
+    // ---- Tester edge cases (stage 5, unit p1a) ----------------------------
+    //
+    // Hand-built headers, so the fields a hostile peer controls (lengths,
+    // IHL, flags, next-header chains) can lie in ways `craft` keeps honest.
+
+    use crate::craft::TcpSpec;
+
+    /// An IPv4 header 127.0.0.1 → 127.0.0.1 with `ihl` words (options padded
+    /// with NOPs), the given `total_len`, `protocol` and flags/fragment word.
+    /// The checksum is left zero: etherparse does not verify it.
+    fn ipv4_header(ihl: u8, total_len: u16, protocol: u8, flags_frag: u16) -> Vec<u8> {
+        let mut h = vec![0x40 | (ihl & 0x0f), 0x00];
+        h.extend_from_slice(&total_len.to_be_bytes());
+        h.extend_from_slice(&[0x00, 0x01]);
+        h.extend_from_slice(&flags_frag.to_be_bytes());
+        h.extend_from_slice(&[64, protocol, 0, 0]);
+        h.extend_from_slice(&[127, 0, 0, 1, 127, 0, 0, 1]);
+        if ihl > 5 {
+            h.extend(std::iter::repeat_n(0x01u8, (usize::from(ihl) - 5) * 4));
+        }
+        h
+    }
+
+    /// A UDP header with the given length field and a zero checksum.
+    fn udp_header(src: u16, dst: u16, len: u16) -> Vec<u8> {
+        let mut h = Vec::with_capacity(8);
+        h.extend_from_slice(&src.to_be_bytes());
+        h.extend_from_slice(&dst.to_be_bytes());
+        h.extend_from_slice(&len.to_be_bytes());
+        h.extend_from_slice(&[0, 0]);
+        h
+    }
+
+    /// A fixed IPv6 header ::1 → ::1 with `next_header` and `payload_len`.
+    fn ipv6_header(next_header: u8, payload_len: u16) -> Vec<u8> {
+        let mut h = vec![0x60, 0, 0, 0];
+        h.extend_from_slice(&payload_len.to_be_bytes());
+        h.push(next_header);
+        h.push(64);
+        h.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        h.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        h
+    }
+
+    /// `header` then a UDP header 40000 → `dst_port` with `udp_len` and the
+    /// payload `probe`.
+    fn with_udp(mut header: Vec<u8>, dst_port: u16, udp_len: u16) -> Vec<u8> {
+        header.extend_from_slice(&udp_header(40_000, dst_port, udp_len));
+        header.extend_from_slice(b"probe");
+        header
+    }
+
+    fn udp_target(interface: &str, dst: IpAddr, port: u16) -> L4Target {
+        L4Target {
+            interface: interface.to_string(),
+            direction: L4Direction::Outbound,
+            dst: Some(dst),
+            dst_port: Some(port),
+            proto: L4Proto::Udp,
+        }
+    }
+
+    const V4_LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const V6_LOOPBACK: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+    #[test]
+    fn tester_hand_built_headers_match_the_crafted_ones() {
+        // The builders above must agree with `craft` on a plain IPv4/UDP
+        // packet, or every assertion below would be testing the builders.
+        let hand = with_udp(ipv4_header(5, 33, 17, 0), 9053, 13);
+        assert_eq!(hand.len(), v4_udp(9053).len());
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &hand, MAX),
+            inject_target("lo0", LinkType::Raw, &v4_udp(9053), MAX)
+        );
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &hand, MAX),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+    }
+
+    #[test]
+    fn tester_empty_buffer_is_truncated_and_max_len_zero_refuses_any_byte() {
+        for link in [LinkType::Null, LinkType::Ethernet, LinkType::Raw] {
+            assert_eq!(
+                inject_target("lo0", link, &[], MAX),
+                Err(FrameError::Truncated),
+                "{link:?}"
+            );
+            // `max_packet_bytes: 0`: nothing with a byte in it passes.
+            assert_eq!(
+                inject_target("lo0", link, &[0x45], 0),
+                Err(FrameError::Oversized(1)),
+                "{link:?}"
+            );
+            assert_eq!(
+                inject_target("lo0", link, &v4_udp(9053), 0),
+                Err(FrameError::Oversized(33)),
+                "{link:?}"
+            );
+            // An empty buffer under a zero ceiling is not oversized; it is
+            // truncated.
+            assert_eq!(
+                inject_target("lo0", link, &[], 0),
+                Err(FrameError::Truncated),
+                "{link:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tester_ipv4_total_length_lying_about_the_buffer() {
+        // Shorter than its own header.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 10, 17, 0), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::Truncated)
+        );
+        // Longer than the buffer.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 65_535, 17, 0), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::Truncated)
+        );
+        // Header only, though UDP bytes follow: the transport is outside the
+        // packet the header describes.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 20, 17, 0), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::Truncated)
+        );
+        // IP says 28 bytes but UDP says 13: the transport header overruns.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 28, 17, 0), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::Truncated)
+        );
+        // IP says 28 and UDP says 8: consistent; the 5 trailing bytes past
+        // `total_len` are not part of the packet and are ignored.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 28, 17, 0), 9053, 8),
+                MAX
+            ),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+        // Trailing bytes after a crafted packet (Ethernet padding) are ignored.
+        let mut padded = dlt_null(2, &v4_udp(9053));
+        padded.extend_from_slice(&[0u8; 10]);
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, &padded, MAX),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+    }
+
+    #[test]
+    fn tester_ipv4_options_ihl_above_five() {
+        // IHL 6: a 24-byte header with four NOP options, then UDP.
+        let ihl6 = with_udp(ipv4_header(6, 37, 17, 0), 9053, 13);
+        assert_eq!(ihl6.len(), 37);
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, &dlt_null(2, &ihl6), MAX),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+        // IHL 15: the largest header, 60 bytes.
+        let ihl15 = with_udp(ipv4_header(15, 73, 17, 0), 9053, 13);
+        assert_eq!(ihl15.len(), 73);
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &ihl15, MAX),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+        // IHL 15 over a buffer that only holds 28 bytes: the options overrun.
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &ihl15[..28], MAX),
+            Err(FrameError::Truncated)
+        );
+        // IHL 4 is below the minimum header: malformed, not IP.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(4, 33, 17, 0), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::NotIp)
+        );
+    }
+
+    #[test]
+    fn tester_ipv4_fragments_are_no_transport() {
+        // More Fragments set, offset 0: the first fragment carries a UDP
+        // header, but the helper refuses to name a transport for a fragment.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 33, 17, 0x2000), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::NoTransport)
+        );
+        // A later fragment (offset 185 x 8), no MF.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 33, 17, 0x00b9), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::NoTransport)
+        );
+        // Don't Fragment alone is not a fragment.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv4_header(5, 33, 17, 0x4000), 9053, 13),
+                MAX
+            ),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+    }
+
+    #[test]
+    fn tester_ipv6_hop_by_hop_header_before_udp_gives_the_target() {
+        // IPv6 (next 0) → Hop-by-Hop (next 17, one PadN option) → UDP.
+        let mut ip = ipv6_header(0, 8 + 13);
+        ip.extend_from_slice(&[17, 0, 1, 4, 0, 0, 0, 0]);
+        let ip = with_udp(ip, 9053, 13);
+        assert_eq!(ip.len(), 40 + 8 + 13);
+        let want = Ok(udp_target("lo0", V6_LOOPBACK, 9053));
+        assert_eq!(inject_target("lo0", LinkType::Raw, &ip, MAX), want);
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, &dlt_null(30, &ip), MAX),
+            want
+        );
+        let mut eth = vec![0u8; 12];
+        eth.extend_from_slice(&0x86DDu16.to_be_bytes());
+        eth.extend_from_slice(&ip);
+        assert_eq!(inject_target("lo0", LinkType::Ethernet, &eth, MAX), want);
+        // Two chained extension headers: Hop-by-Hop → Destination Options → UDP.
+        let mut ip = ipv6_header(0, 8 + 8 + 13);
+        ip.extend_from_slice(&[60, 0, 1, 4, 0, 0, 0, 0]);
+        ip.extend_from_slice(&[17, 0, 1, 4, 0, 0, 0, 0]);
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &with_udp(ip, 9053, 13), MAX),
+            want
+        );
+    }
+
+    #[test]
+    fn tester_ipv6_fragment_header_is_no_transport() {
+        // Fragment header (44): next 17, reserved, offset 0 with M set, id.
+        let mut ip = ipv6_header(44, 8 + 13);
+        ip.extend_from_slice(&[17, 0, 0x00, 0x01, 0, 0, 0, 4]);
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &with_udp(ip, 9053, 13), MAX),
+            Err(FrameError::NoTransport)
+        );
+        // A later fragment: offset 181, M clear.
+        let mut ip = ipv6_header(44, 8 + 13);
+        ip.extend_from_slice(&[17, 0, 0x05, 0xa8, 0, 0, 0, 4]);
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &with_udp(ip, 9053, 13), MAX),
+            Err(FrameError::NoTransport)
+        );
+    }
+
+    #[test]
+    fn tester_ipv6_payload_length_lying_about_the_buffer() {
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv6_header(17, 65_535), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::Truncated)
+        );
+        // Shorter than a UDP header.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv6_header(17, 4), 9053, 13),
+                MAX
+            ),
+            Err(FrameError::Truncated)
+        );
+        // Consistent (8-byte UDP, no payload) with 5 trailing bytes ignored.
+        assert_eq!(
+            inject_target(
+                "lo0",
+                LinkType::Raw,
+                &with_udp(ipv6_header(17, 8), 9053, 8),
+                MAX
+            ),
+            Ok(udp_target("lo0", V6_LOOPBACK, 9053))
+        );
+    }
+
+    #[test]
+    fn tester_ipv6_shorter_than_its_fixed_header_is_truncated() {
+        // Long enough for the link header plus a minimal IPv4 header, so
+        // `strip_link` passes, but short of the 40 IPv6 bytes it names.
+        let short = &ipv6_header(17, 13)[..30];
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, &dlt_null(30, short), MAX),
+            Err(FrameError::Truncated)
+        );
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &ipv6_header(17, 13)[..39], MAX),
+            Err(FrameError::Truncated)
+        );
+        let mut eth = vec![0u8; 12];
+        eth.extend_from_slice(&0x86DDu16.to_be_bytes());
+        eth.extend_from_slice(&ipv6_header(17, 13)[..39]);
+        assert_eq!(
+            inject_target("lo0", LinkType::Ethernet, &eth, MAX),
+            Err(FrameError::Truncated)
+        );
+    }
+
+    #[test]
+    fn tester_icmpv6_echo_is_a_target_without_a_port() {
+        let mut ip = ipv6_header(58, 8);
+        ip.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, &dlt_null(30, &ip), MAX),
+            Ok(L4Target {
+                interface: "lo0".to_string(),
+                direction: L4Direction::Outbound,
+                dst: Some(V6_LOOPBACK),
+                dst_port: None,
+                proto: L4Proto::IcmpV6,
+            })
+        );
+    }
+
+    #[test]
+    fn tester_tcp_syn_gives_a_tcp_target() {
+        let ip = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::LOCALHOST),
+                    dst: Some(Ipv4Addr::LOCALHOST),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(40_000),
+                    dst_port: Some(9053),
+                    flags: Some(0x02),
+                    ..TcpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, &dlt_null(2, &ip), MAX),
+            Ok(L4Target {
+                interface: "lo0".to_string(),
+                direction: L4Direction::Outbound,
+                dst: Some(V4_LOOPBACK),
+                dst_port: Some(9053),
+                proto: L4Proto::Tcp,
+            })
+        );
+        // The same packet with its TCP header cut to 10 of 20 bytes.
+        let cut = &dlt_null(2, &ip)[..4 + 20 + 10];
+        assert_eq!(
+            inject_target("lo0", LinkType::Null, cut, MAX),
+            Err(FrameError::Truncated)
+        );
+    }
+
+    #[test]
+    fn tester_vlan_tag_and_mismatched_ethertype_are_not_ip() {
+        // 802.1Q: EtherType 0x8100, then a tag whose inner type is IPv4. The
+        // helper does not look through tags; the kernel would send a VLAN frame.
+        let mut vlan = vec![0u8; 12];
+        vlan.extend_from_slice(&0x8100u16.to_be_bytes());
+        vlan.extend_from_slice(&[0x00, 0x01, 0x08, 0x00]);
+        vlan.extend_from_slice(&v4_udp(9053));
+        assert_eq!(
+            inject_target("en0", LinkType::Ethernet, &vlan, MAX),
+            Err(FrameError::NotIp)
+        );
+        // EtherType IPv6 over IPv4 bytes, and IPv4 over IPv6 bytes.
+        let mut eth = vec![0u8; 12];
+        eth.extend_from_slice(&0x86DDu16.to_be_bytes());
+        eth.extend_from_slice(&v4_udp(9053));
+        assert_eq!(
+            inject_target("en0", LinkType::Ethernet, &eth, MAX),
+            Err(FrameError::NotIp)
+        );
+        let mut eth = vec![0u8; 12];
+        eth.extend_from_slice(&0x0800u16.to_be_bytes());
+        eth.extend_from_slice(&with_udp(ipv6_header(17, 13), 9053, 13));
+        assert_eq!(
+            inject_target("en0", LinkType::Ethernet, &eth, MAX),
+            Err(FrameError::NotIp)
+        );
+    }
+
+    #[test]
+    fn tester_udp_length_field_edge_cases() {
+        let udp = |length: Option<u16>| {
+            PacketSpec {
+                layers: vec![
+                    Layer::Ipv4(Ipv4Spec {
+                        src: Some(Ipv4Addr::LOCALHOST),
+                        dst: Some(Ipv4Addr::LOCALHOST),
+                        ..Ipv4Spec::default()
+                    }),
+                    Layer::Udp(UdpSpec {
+                        src_port: Some(40_000),
+                        dst_port: Some(9053),
+                        length,
+                        ..UdpSpec::default()
+                    }),
+                    Layer::Raw(b"probe".to_vec()),
+                ],
+            }
+            .build()
+            .expect("craft builds")
+        };
+        // A UDP length past the packet overruns: truncated.
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &udp(Some(1000)), MAX),
+            Err(FrameError::Truncated)
+        );
+        // Below the 8-byte header: truncated.
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &udp(Some(4)), MAX),
+            Err(FrameError::Truncated)
+        );
+        // Zero (RFC 8085 UDP-Lite style): etherparse takes the slice length.
+        assert_eq!(
+            inject_target("lo0", LinkType::Raw, &udp(Some(0)), MAX),
+            Ok(udp_target("lo0", V4_LOOPBACK, 9053))
+        );
+    }
 }

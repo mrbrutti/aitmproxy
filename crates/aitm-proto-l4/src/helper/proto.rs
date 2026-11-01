@@ -910,4 +910,524 @@ mod tests {
         let mut reader = Cursor::new(bytes);
         assert_eq!(read_msg(&mut reader), Err(ProtoError::BadBinary));
     }
+
+    // ---- Tester edge cases (stage 5, unit p1a) ----------------------------
+
+    /// One message on the wire: 4-byte big-endian length (type byte
+    /// included), the type byte, then `payload`.
+    fn framed(ty: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.extend_from_slice(&((payload.len() + 1) as u32).to_be_bytes());
+        out.push(ty);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn hello() -> Msg {
+        Msg::Hello {
+            proto: PROTO,
+            core_version: "0.5.9".to_string(),
+        }
+    }
+
+    /// A reader driven by a script of deliveries and failures, so a peer that
+    /// dies mid-write, dribbles bytes, or is interrupted can be staged.
+    enum Step {
+        Data(Vec<u8>),
+        Fail(std::io::ErrorKind, &'static str),
+    }
+
+    struct Scripted(std::collections::VecDeque<Step>);
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Step::Fail(kind, msg)) => Err(std::io::Error::new(kind, msg)),
+                Some(Step::Data(mut data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    if n < data.len() {
+                        let rest = data.split_off(n);
+                        self.0.push_front(Step::Data(rest));
+                    }
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    fn scripted(steps: Vec<Step>) -> Scripted {
+        Scripted(steps.into_iter().collect())
+    }
+
+    #[test]
+    fn tester_too_long_is_refused_with_the_body_unread() {
+        // MAX_FRAME + 1 with the whole body present: refused on the number, and
+        // the reader has consumed exactly the 4 length bytes, so nothing of
+        // that size was read or allocated (AC18).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((MAX_FRAME + 1) as u32).to_be_bytes());
+        bytes.push(TYPE_FRAME);
+        bytes.extend(std::iter::repeat_n(0u8, MAX_FRAME));
+        assert_eq!(bytes.len(), 4 + MAX_FRAME + 1);
+        let mut reader = Cursor::new(bytes);
+        assert_eq!(
+            read_msg(&mut reader),
+            Err(ProtoError::TooLong(MAX_FRAME + 1))
+        );
+        assert_eq!(reader.position(), 4, "only the length was consumed");
+
+        // u32::MAX followed by a body: the same, without a 4 GiB allocation.
+        let mut bytes = u32::MAX.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[TYPE_HELLO, b'{', b'}']);
+        let mut reader = Cursor::new(bytes);
+        assert_eq!(
+            read_msg(&mut reader),
+            Err(ProtoError::TooLong(4_294_967_295))
+        );
+        assert_eq!(reader.position(), 4);
+        assert_eq!(
+            ProtoError::TooLong(4_294_967_295).to_string(),
+            "frame length 4294967295 exceeds the 262144-byte maximum"
+        );
+    }
+
+    #[test]
+    fn tester_max_frame_boundary_on_an_inject() {
+        // The largest Inject that fits: type + id + name length + "lo0" + body.
+        let fill = MAX_FRAME - 1 - 8 - 2 - 3;
+        let msg = Msg::Inject {
+            request_id: 7,
+            interface: "lo0".to_string(),
+            bytes: vec![0xAB; fill],
+        };
+        let wire = encode(&msg);
+        assert_eq!(wire.len(), 4 + MAX_FRAME);
+        assert_eq!(&wire[..4], &(MAX_FRAME as u32).to_be_bytes());
+        let mut reader = Cursor::new(wire);
+        assert_eq!(read_msg(&mut reader), Ok(msg));
+        assert_eq!(read_msg(&mut reader), Err(ProtoError::Eof));
+
+        // One byte more: encode writes MAX_FRAME + 1 and the peer refuses it.
+        let wire = encode(&Msg::Inject {
+            request_id: 7,
+            interface: "lo0".to_string(),
+            bytes: vec![0xAB; fill + 1],
+        });
+        assert_eq!(&wire[..4], &((MAX_FRAME + 1) as u32).to_be_bytes());
+        let mut reader = Cursor::new(wire);
+        assert_eq!(
+            read_msg(&mut reader),
+            Err(ProtoError::TooLong(MAX_FRAME + 1))
+        );
+    }
+
+    #[test]
+    fn tester_inject_payload_shorter_than_its_header_is_bad_binary() {
+        let whole = encode(&Msg::Inject {
+            request_id: 12,
+            interface: "lo0".to_string(),
+            bytes: vec![1, 2, 3],
+        });
+        // The binary header is 8 + 2 + 3 = 13 payload bytes; every cut inside
+        // it is BadBinary.
+        for cut in 0..13 {
+            let mut reader = Cursor::new(framed(TYPE_INJECT, &whole[5..5 + cut]));
+            assert_eq!(
+                read_msg(&mut reader),
+                Err(ProtoError::BadBinary),
+                "an Inject cut to {cut} payload bytes"
+            );
+        }
+        // Exactly the header: an Inject carrying no frame bytes.
+        let mut reader = Cursor::new(framed(TYPE_INJECT, &whole[5..18]));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::Inject {
+                request_id: 12,
+                interface: "lo0".to_string(),
+                bytes: Vec::new(),
+            })
+        );
+        // The minimum header: an id and a zero-length name.
+        let mut body = 12u64.to_be_bytes().to_vec();
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let mut reader = Cursor::new(framed(TYPE_INJECT, &body));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::Inject {
+                request_id: 12,
+                interface: String::new(),
+                bytes: Vec::new(),
+            })
+        );
+        // A Frame of exactly its 16-byte header carries no bytes.
+        let mut body = 11u64.to_be_bytes().to_vec();
+        body.extend_from_slice(&22u64.to_be_bytes());
+        let mut reader = Cursor::new(framed(TYPE_FRAME, &body));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::Frame {
+                capture_id: 11,
+                ts_us: 22,
+                bytes: Vec::new(),
+            })
+        );
+        // A type byte alone (length 1): BadBinary for the binary types,
+        // BadJson for every control type. Never a default message.
+        for ty in [TYPE_FRAME, TYPE_INJECT] {
+            let mut reader = Cursor::new(framed(ty, &[]));
+            assert_eq!(
+                read_msg(&mut reader),
+                Err(ProtoError::BadBinary),
+                "type {ty:#04x}"
+            );
+        }
+        for ty in [
+            TYPE_HELLO,
+            TYPE_HELLO_ACK,
+            TYPE_SCOPE_SET,
+            TYPE_CAPTURE_OPEN,
+            TYPE_CAPTURE_CLOSE,
+            TYPE_CAPTURE_CLOSED,
+            TYPE_INJECT_RESULT,
+        ] {
+            let mut reader = Cursor::new(framed(ty, &[]));
+            assert!(
+                matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))),
+                "type {ty:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn tester_interface_name_at_the_u16_boundary() {
+        // Exactly u16::MAX bytes round-trips with its literal length field.
+        let name = "a".repeat(65_535);
+        let msg = Msg::Inject {
+            request_id: 1,
+            interface: name,
+            bytes: vec![0x45],
+        };
+        let wire = encode(&msg);
+        assert_eq!(&wire[13..15], &[0xff, 0xff]);
+        assert_eq!(wire.len(), 4 + 1 + 8 + 2 + 65_535 + 1);
+        let mut reader = Cursor::new(wire);
+        assert_eq!(read_msg(&mut reader), Ok(msg));
+
+        // One byte over: the encoder writes a 0xFFFF length and no name at
+        // all; a peer whose frame bytes cannot satisfy it answers BadBinary.
+        let wire = encode(&Msg::Inject {
+            request_id: 1,
+            interface: "a".repeat(65_536),
+            bytes: vec![0x45, 0x00],
+        });
+        assert_eq!(wire.len(), 4 + 1 + 8 + 2 + 2, "the name is not written");
+        assert_eq!(&wire[13..15], &[0xff, 0xff]);
+        let mut reader = Cursor::new(wire);
+        assert_eq!(read_msg(&mut reader), Err(ProtoError::BadBinary));
+
+        // The length is bytes, not chars: 21845 three-byte chars fill a u16.
+        let euro = "\u{20ac}".repeat(21_845);
+        assert_eq!(euro.len(), 65_535);
+        let msg = Msg::Inject {
+            request_id: 2,
+            interface: euro,
+            bytes: Vec::new(),
+        };
+        let mut reader = Cursor::new(encode(&msg));
+        assert_eq!(read_msg(&mut reader), Ok(msg));
+    }
+
+    #[test]
+    fn tester_scope_set_json_edge_cases() {
+        let set = scope_set();
+        let base: serde_json::Value =
+            serde_json::from_slice(&to_json(&set)).expect("a ScopeSet serializes");
+        let read = |v: &serde_json::Value| {
+            let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, v.to_string().as_bytes()));
+            read_msg(&mut reader)
+        };
+
+        // Unknown fields, at the top and inside an entry, are ignored and the
+        // known fields decode to the literal set. (A `filter` key in
+        // particular is ignored: the helper takes no filter from the core.)
+        let mut v = base.clone();
+        v["unexpected"] = serde_json::json!({"deep": [1, 2]});
+        v["filter"] = serde_json::json!("not port 22");
+        v["scope"][0]["filter"] = serde_json::json!("not port 22");
+        assert_eq!(read(&v), Ok(Msg::ScopeSet(set.clone())));
+
+        // Every required top-level field missing is BadJson naming it.
+        for field in [
+            "scope",
+            "global_inject_pps",
+            "max_packet_bytes",
+            "max_packets_per_call",
+            "self_ports",
+        ] {
+            let mut v = base.clone();
+            v.as_object_mut().expect("object").remove(field);
+            match read(&v) {
+                Err(ProtoError::BadJson(msg)) => assert!(
+                    msg.starts_with(&format!("missing field `{field}`")),
+                    "{field}: {msg}"
+                ),
+                other => panic!("missing {field} must be BadJson, got {other:?}"),
+            }
+        }
+
+        // Wrong types and out-of-range numbers: BadJson, never a clamp.
+        let bad: [(&str, serde_json::Value); 9] = [
+            ("global_inject_pps", serde_json::json!(-1)),
+            ("global_inject_pps", serde_json::json!(4_294_967_296u64)),
+            ("max_packet_bytes", serde_json::json!(-1)),
+            ("max_packet_bytes", serde_json::json!(1.5)),
+            ("max_packets_per_call", serde_json::json!("8")),
+            ("self_ports", serde_json::json!([70_000])),
+            ("self_ports", serde_json::json!([-1])),
+            ("self_ports", serde_json::json!(8080)),
+            ("scope", serde_json::json!({})),
+        ];
+        for (field, value) in bad {
+            let mut v = base.clone();
+            v[field] = value.clone();
+            assert!(
+                matches!(read(&v), Err(ProtoError::BadJson(_))),
+                "{field} = {value} must be BadJson"
+            );
+        }
+        // Inside an entry: an unknown direction, capability, a prefix over
+        // 255 and a port over 65535.
+        let bad_entry: [(&str, serde_json::Value); 5] = [
+            ("direction", serde_json::json!("sideways")),
+            ("capability", serde_json::json!("root")),
+            ("interface", serde_json::json!(0)),
+            (
+                "cidr",
+                serde_json::json!({"addr": "127.0.0.1", "prefix": 300}),
+            ),
+            ("ports", serde_json::json!({"lo": 0, "hi": 65_536})),
+        ];
+        for (field, value) in bad_entry {
+            let mut v = base.clone();
+            v["scope"][0][field] = value.clone();
+            assert!(
+                matches!(read(&v), Err(ProtoError::BadJson(_))),
+                "scope[0].{field} = {value} must be BadJson"
+            );
+        }
+        // A non-object document.
+        for doc in ["[]", "null", "1", "\"scope\""] {
+            let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, doc.as_bytes()));
+            assert!(
+                matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))),
+                "{doc}"
+            );
+        }
+
+        // An empty scope is a legal set (the helper then denies everything).
+        let mut v = base.clone();
+        v["scope"] = serde_json::json!([]);
+        assert_eq!(
+            read(&v),
+            Ok(Msg::ScopeSet(ScopeSet {
+                scope: Vec::new(),
+                ..set.clone()
+            }))
+        );
+    }
+
+    #[test]
+    fn tester_control_json_shape_edge_cases() {
+        // Trailing bytes after a well-formed body.
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO,
+            br#"{"proto":1,"core_version":"0.5.9"}garbage"#,
+        ));
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert!(msg.starts_with("trailing characters"), "{msg}");
+            }
+            other => panic!("trailing bytes must be BadJson, got {other:?}"),
+        }
+
+        // The decoder passes any proto through: the mismatch is the session's
+        // decision (spec §5.2), not the framing's.
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO,
+            br#"{"proto":2,"core_version":"9.9.9","future":true}"#,
+        ));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::Hello {
+                proto: 2,
+                core_version: "9.9.9".to_string(),
+            })
+        );
+        // But not a proto that is not a u32.
+        for body in [
+            &br#"{"proto":-1,"core_version":"x"}"#[..],
+            br#"{"proto":4294967296,"core_version":"x"}"#,
+            br#"{"proto":"1","core_version":"x"}"#,
+        ] {
+            let mut reader = Cursor::new(framed(TYPE_HELLO, body));
+            assert!(
+                matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+
+        // The type byte is the only discriminant: a CaptureOpen body under
+        // the Hello type is BadJson, not a CaptureOpen.
+        let open = br#"{"id":11,"interface":"lo0","direction":"inbound","read_timeout_ms":250}"#;
+        let mut reader = Cursor::new(framed(TYPE_HELLO, open));
+        assert!(matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))));
+        let mut reader = Cursor::new(framed(TYPE_CAPTURE_OPEN, open));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::CaptureOpen {
+                id: 11,
+                interface: "lo0".to_string(),
+                direction: L4Direction::Inbound,
+                read_timeout_ms: 250,
+            })
+        );
+
+        // CaptureOpen: an unknown direction, a negative timeout, an id past u64.
+        for body in [
+            &br#"{"id":11,"interface":"lo0","direction":"sideways","read_timeout_ms":250}"#[..],
+            br#"{"id":11,"interface":"lo0","direction":"inbound","read_timeout_ms":-1}"#,
+            br#"{"id":18446744073709551616,"interface":"lo0","direction":"inbound","read_timeout_ms":1}"#,
+            br#"{"id":11,"interface":null,"direction":"inbound","read_timeout_ms":1}"#,
+        ] {
+            let mut reader = Cursor::new(framed(TYPE_CAPTURE_OPEN, body));
+            assert!(
+                matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // CaptureClose with a string id.
+        let mut reader = Cursor::new(framed(TYPE_CAPTURE_CLOSE, br#"{"id":"11"}"#));
+        assert!(matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))));
+
+        // InjectResult: a missing or null `error` is `None` (success); a
+        // non-string error is refused.
+        for body in [
+            &br#"{"request_id":1}"#[..],
+            br#"{"request_id":1,"error":null}"#,
+        ] {
+            let mut reader = Cursor::new(framed(TYPE_INJECT_RESULT, body));
+            assert_eq!(
+                read_msg(&mut reader),
+                Ok(Msg::InjectResult {
+                    request_id: 1,
+                    error: None,
+                }),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let mut reader = Cursor::new(framed(TYPE_INJECT_RESULT, br#"{"request_id":1,"error":5}"#));
+        assert!(matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))));
+
+        // HelloAck: caps must be an array of strings; an empty one is legal.
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO_ACK,
+            br#"{"proto":1,"helper_version":"0.5.9","caps":"cap_net_raw"}"#,
+        ));
+        assert!(matches!(read_msg(&mut reader), Err(ProtoError::BadJson(_))));
+        let mut reader = Cursor::new(framed(
+            TYPE_HELLO_ACK,
+            br#"{"proto":1,"helper_version":"0.5.9","caps":[]}"#,
+        ));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::HelloAck {
+                proto: 1,
+                helper_version: "0.5.9".to_string(),
+                caps: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn tester_transport_failure_mid_message_is_io_never_eof() {
+        let wire = encode(&hello());
+
+        // The peer dies after the length and type: Io carrying the message.
+        let mut r = scripted(vec![
+            Step::Data(wire[..5].to_vec()),
+            Step::Fail(std::io::ErrorKind::ConnectionReset, "peer vanished"),
+        ]);
+        assert_eq!(
+            read_msg(&mut r),
+            Err(ProtoError::Io("peer vanished".to_string()))
+        );
+        assert_eq!(
+            ProtoError::Io("peer vanished".to_string()).to_string(),
+            "helper socket I/O error: peer vanished"
+        );
+
+        // A failure on the very first byte is a failure, not a clean close.
+        let mut r = scripted(vec![Step::Fail(std::io::ErrorKind::BrokenPipe, "pipe")]);
+        assert_eq!(read_msg(&mut r), Err(ProtoError::Io("pipe".to_string())));
+
+        // The stream ends inside the length word: Io, not Eof.
+        let mut r = scripted(vec![Step::Data(wire[..2].to_vec())]);
+        match read_msg(&mut r) {
+            Err(ProtoError::Io(msg)) => {
+                assert!(msg.contains("failed to fill whole buffer"), "{msg}");
+            }
+            other => panic!("a cut length word must be Io, got {other:?}"),
+        }
+
+        // EINTR before the first byte, and again inside the payload, is
+        // retried: the message still decodes.
+        let mut r = scripted(vec![
+            Step::Fail(std::io::ErrorKind::Interrupted, "eintr"),
+            Step::Data(wire[..1].to_vec()),
+            Step::Fail(std::io::ErrorKind::Interrupted, "eintr"),
+            Step::Data(wire[1..9].to_vec()),
+            Step::Fail(std::io::ErrorKind::Interrupted, "eintr"),
+            Step::Data(wire[9..].to_vec()),
+        ]);
+        assert_eq!(read_msg(&mut r), Ok(hello()));
+        assert_eq!(read_msg(&mut r), Err(ProtoError::Eof));
+
+        // One byte per read: the framing reassembles it.
+        let mut r = scripted(wire.iter().map(|b| Step::Data(vec![*b])).collect());
+        assert_eq!(read_msg(&mut r), Ok(hello()));
+        assert_eq!(read_msg(&mut r), Err(ProtoError::Eof));
+    }
+
+    #[test]
+    fn tester_read_msg_stops_at_the_boundary_after_a_refusal() {
+        // A refused message consumes exactly its own bytes, so the next one on
+        // the stream is still readable (the caller closes anyway; this pins
+        // that the reader never over- or under-reads).
+        let refusals: [(Vec<u8>, ProtoError); 3] = [
+            (framed(0x7f, b"junk"), ProtoError::UnknownType(0x7f)),
+            (
+                framed(TYPE_FRAME, &11u64.to_be_bytes()),
+                ProtoError::BadBinary,
+            ),
+            (
+                framed(TYPE_HELLO, b"{"),
+                ProtoError::BadJson("EOF while parsing an object at line 1 column 1".to_string()),
+            ),
+        ];
+        for (bad, err) in refusals {
+            let mut stream = bad.clone();
+            stream.extend_from_slice(&encode(&hello()));
+            let mut reader = Cursor::new(stream);
+            assert_eq!(read_msg(&mut reader), Err(err));
+            assert_eq!(reader.position() as usize, bad.len());
+            assert_eq!(read_msg(&mut reader), Ok(hello()));
+            assert_eq!(read_msg(&mut reader), Err(ProtoError::Eof));
+        }
+    }
 }

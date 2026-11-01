@@ -213,4 +213,307 @@ mod tests {
         // The URL the app answers is part of this contract (spec section 3.2).
         assert_eq!(ALLOW_URL, "aitmproxy://packet-capture/allow");
     }
+
+    // ---- Tester edge cases (stage 5, unit p1a) ----------------------------
+    //
+    // `Receipt::parse` reads a file any root process could have written. None
+    // of these inputs may panic, and every refusal must be `Json` (bad shape)
+    // or `Schema` (wrong version), never a silently defaulted receipt.
+
+    /// A complete schema-1 document with `schema` replaced by `schema_json`
+    /// and `extra` spliced in after it.
+    fn doc(schema_json: &str, extra: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schema":{schema_json},{extra}"helper_version":"0.5.9","applied_at":1762000000000,"group":"access_bpf","gid":504,"nodes":256,"members_added":["matt"],"errors":[]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// The parsed form of [`doc`] when nothing in it is hostile.
+    fn expected() -> Receipt {
+        Receipt {
+            schema: 1,
+            helper_version: "0.5.9".to_string(),
+            applied_at: 1_762_000_000_000,
+            group: "access_bpf".to_string(),
+            gid: 504,
+            nodes: 256,
+            members_added: vec!["matt".to_string()],
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tester_baseline_doc_parses_to_the_literal_receipt() {
+        // The helper the hostile cases below lean on must itself be sound.
+        assert_eq!(Receipt::parse(&doc("1", "")), Ok(expected()));
+    }
+
+    #[test]
+    fn tester_truncated_json_carries_serdes_literal_message() {
+        // Stronger than `contains("EOF") || !is_empty()`: the exact parser text.
+        assert_eq!(
+            Receipt::parse(b"{"),
+            Err(ReceiptError::Json(
+                "EOF while parsing an object at line 1 column 1".to_string()
+            ))
+        );
+        assert_eq!(
+            Receipt::parse(b""),
+            Err(ReceiptError::Json(
+                "EOF while parsing a value at line 1 column 0".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn tester_schema_of_the_wrong_json_type_is_a_json_error_not_a_schema_error() {
+        // A string "1" is not the u32 1: it is refused as malformed, so a
+        // writer cannot slip past the version check by quoting the number.
+        for schema in [r#""1""#, "1.0", "-1", "true", "null", "[1]", r#"{"v":1}"#] {
+            match Receipt::parse(&doc(schema, "")) {
+                Err(ReceiptError::Json(msg)) => assert!(
+                    msg.contains("invalid type") || msg.contains("invalid value"),
+                    "schema {schema}: {msg}"
+                ),
+                other => panic!("schema {schema} must be a Json error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tester_schema_out_of_u32_range_is_a_json_error() {
+        // 2^32 does not fit the u32 field; it must not wrap to schema 0.
+        assert!(
+            matches!(
+                Receipt::parse(&doc("4294967296", "")),
+                Err(ReceiptError::Json(_))
+            ),
+            "2^32 must not wrap"
+        );
+        // 2^64 + 1 is beyond every integer serde_json carries.
+        assert!(matches!(
+            Receipt::parse(&doc("18446744073709551617", "")),
+            Err(ReceiptError::Json(_))
+        ));
+        // The largest u32 is a legal (unsupported) schema, refused by version.
+        assert_eq!(
+            Receipt::parse(&doc("4294967295", "")),
+            Err(ReceiptError::Schema(u32::MAX))
+        );
+        assert_eq!(Receipt::parse(&doc("0", "")), Err(ReceiptError::Schema(0)));
+    }
+
+    #[test]
+    fn tester_schema_check_wins_over_garbage_fields_only_for_other_schemas() {
+        // Schema 2 with every other field of the wrong type: refused by version.
+        let garbage = br#"{"schema":2,"helper_version":7,"applied_at":"x","group":[],"gid":-1,"nodes":null,"members_added":"matt","errors":{}}"#;
+        assert_eq!(Receipt::parse(garbage), Err(ReceiptError::Schema(2)));
+        // The same garbage at schema 1 is a Json error, never a defaulted receipt.
+        let garbage_1 = br#"{"schema":1,"helper_version":7,"applied_at":"x","group":[],"gid":-1,"nodes":null,"members_added":"matt","errors":{}}"#;
+        assert!(matches!(
+            Receipt::parse(garbage_1),
+            Err(ReceiptError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn tester_each_field_with_a_wrong_type_or_out_of_range_value_is_a_json_error() {
+        let cases: [&[u8]; 12] = [
+            // gid: 2^32, negative, string
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":4294967296,"nodes":1,"members_added":[],"errors":[]}"#,
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":-1,"nodes":1,"members_added":[],"errors":[]}"#,
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":"504","nodes":1,"members_added":[],"errors":[]}"#,
+            // nodes: 2^32, float
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":4294967296,"members_added":[],"errors":[]}"#,
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1.5,"members_added":[],"errors":[]}"#,
+            // applied_at: negative, 2^64
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":-1,"group":"g","gid":1,"nodes":1,"members_added":[],"errors":[]}"#,
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":18446744073709551616,"group":"g","gid":1,"nodes":1,"members_added":[],"errors":[]}"#,
+            // helper_version / group: not strings
+            br#"{"schema":1,"helper_version":59,"applied_at":1,"group":"g","gid":1,"nodes":1,"members_added":[],"errors":[]}"#,
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":null,"gid":1,"nodes":1,"members_added":[],"errors":[]}"#,
+            // members_added: a string, an array of numbers
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1,"members_added":"matt","errors":[]}"#,
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1,"members_added":[501],"errors":[]}"#,
+            // errors: null
+            br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1,"members_added":[],"errors":null}"#,
+        ];
+        for (i, bytes) in cases.iter().enumerate() {
+            assert!(
+                matches!(Receipt::parse(bytes), Err(ReceiptError::Json(_))),
+                "case {i}: {}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn tester_missing_fields_name_the_field() {
+        match Receipt::parse(br#"{"schema":1}"#) {
+            Err(ReceiptError::Json(msg)) => assert_eq!(
+                msg, "missing field `helper_version` at line 1 column 12",
+                "the first missing field is named"
+            ),
+            other => panic!("a schema-only receipt must be a Json error, got {other:?}"),
+        }
+        // Every field is required: drop `members_added` alone.
+        let without = br#"{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1,"errors":[]}"#;
+        match Receipt::parse(without) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("missing field `members_added`"), "{msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tester_duplicate_keys_are_refused_not_last_wins() {
+        // If the second `schema` silently won, a writer could put a passing
+        // schema first and a refused one second (or the reverse) and have the
+        // two readers disagree. serde refuses the duplicate outright.
+        match Receipt::parse(&doc("1", r#""schema":2,"#)) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("duplicate field `schema`"), "{msg}");
+            }
+            other => panic!("duplicate schema must be a Json error, got {other:?}"),
+        }
+        match Receipt::parse(&doc("1", r#""gid":0,"#)) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("duplicate field `gid`"), "{msg}");
+            }
+            other => panic!("duplicate gid must be a Json error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tester_deep_nesting_never_overflows_the_stack() {
+        // 100k nested arrays, far past any recursion limit a naive recursive
+        // parser would survive. Pinned outcomes: inside an ignored field the
+        // value is skipped iteratively and the receipt is the literal one; as a
+        // typed field it is refused at the first bracket; unbalanced it is an
+        // EOF error. None of them panics or overflows.
+        let open = "[".repeat(100_000);
+        let close = "]".repeat(100_000);
+        assert_eq!(
+            Receipt::parse(&doc("1", &format!(r#""junk":{open}{close},"#))),
+            Ok(expected())
+        );
+        assert_eq!(
+            Receipt::parse(format!(r#"{{"schema":{open}{close}}}"#).as_bytes()),
+            Err(ReceiptError::Json(
+                "invalid type: sequence, expected u32 at line 1 column 10".to_string()
+            ))
+        );
+        let typed = format!(
+            r#"{{"schema":1,"helper_version":"0.5.9","applied_at":1,"group":"g","gid":1,"nodes":1,"members_added":{open}{close},"errors":[]}}"#
+        );
+        assert_eq!(
+            Receipt::parse(typed.as_bytes()),
+            Err(ReceiptError::Json(
+                "invalid type: sequence, expected a string at line 1 column 99".to_string()
+            ))
+        );
+        let unbalanced = format!(r#"{{"schema":1,"x":{open}"#);
+        match Receipt::parse(unbalanced.as_bytes()) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("EOF while parsing a list"), "{msg}");
+            }
+            other => panic!("unbalanced nesting must be a Json error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tester_trailing_bytes_and_non_object_documents_are_json_errors() {
+        let mut trailing = doc("1", "");
+        trailing.extend_from_slice(b" {\"schema\":1}");
+        match Receipt::parse(&trailing) {
+            Err(ReceiptError::Json(msg)) => {
+                assert!(msg.starts_with("trailing characters"), "{msg}");
+            }
+            other => panic!("two documents must be a Json error, got {other:?}"),
+        }
+        for bytes in [
+            &b"null"[..],
+            b"[]",
+            b"1",
+            b"\"schema\"",
+            b"[{\"schema\":1}]",
+            &[0xff, 0xfe, 0x00][..],
+        ] {
+            assert!(
+                matches!(Receipt::parse(bytes), Err(ReceiptError::Json(_))),
+                "{bytes:?}"
+            );
+        }
+        // A megabyte of noise is refused promptly and without panic.
+        let noise = vec![b'a'; 1 << 20];
+        assert!(matches!(Receipt::parse(&noise), Err(ReceiptError::Json(_))));
+    }
+
+    #[test]
+    fn tester_unknown_fields_at_the_current_schema_are_ignored() {
+        // Forward compatibility within a schema: a helper of this schema that
+        // records one more thing is still readable, and the known fields are
+        // exactly what was written.
+        assert_eq!(
+            Receipt::parse(&doc("1", r#""rotations":7,"note":{"a":[1,2]},"#)),
+            Ok(expected())
+        );
+    }
+
+    #[test]
+    fn tester_extreme_but_legal_values_round_trip() {
+        let receipt = Receipt {
+            schema: RECEIPT_SCHEMA,
+            helper_version: String::new(),
+            applied_at: u64::MAX,
+            group: "grüppe \"quoted\" \\ \n\t\u{0}".to_string(),
+            gid: u32::MAX,
+            nodes: 0,
+            members_added: (0..1000).map(|i| format!("user{i}")).collect(),
+            errors: vec!["line one\nline two".to_string(), String::new()],
+        };
+        let bytes = receipt.to_json();
+        assert_eq!(Receipt::parse(&bytes), Ok(receipt.clone()));
+        // The literal JSON carries the extremes unchanged.
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(
+            text.contains(r#""applied_at":18446744073709551615"#),
+            "{text}"
+        );
+        assert!(text.contains(r#""gid":4294967295"#), "{text}");
+        assert!(text.contains(r#""nodes":0"#), "{text}");
+        assert!(text.contains(r#""helper_version":"""#), "{text}");
+    }
+
+    #[test]
+    fn tester_contract_constants_are_the_spec_literals() {
+        // Spec §3.1, §5.4 and §2: every constant is a name another component
+        // (plist, policy file, app, packaging) must match byte for byte.
+        assert_eq!(BPF_GROUP, "access_bpf");
+        assert_eq!(RECEIPT_DIR, "/Library/Application Support/Aitmproxy");
+        assert_eq!(
+            RECEIPT_PATH,
+            "/Library/Application Support/Aitmproxy/l4-helper.json"
+        );
+        assert!(RECEIPT_PATH.starts_with(RECEIPT_DIR));
+        assert_eq!(RECEIPT_SCHEMA, 1);
+        assert_eq!(HELPER_LABEL, "com.mrbrutti.aitmproxy.l4-helper");
+        assert_eq!(REVERT_LABEL, "com.mrbrutti.aitmproxy.l4-helper-revert");
+        assert_eq!(HELPER_IDENTIFIER, "com.mrbrutti.aitmproxy.l4-helper");
+        assert_eq!(TEAM_ID, "995PCLM9KH");
+        assert_eq!(APP_BUNDLE_ID, "com.mrbrutti.aitmproxy");
+        assert_eq!(
+            HELPER_PLIST_REL,
+            "Contents/Library/LaunchDaemons/com.mrbrutti.aitmproxy.l4-helper.plist"
+        );
+        assert!(HELPER_PLIST_REL.ends_with(&format!("{HELPER_LABEL}.plist")));
+        assert_eq!(LINUX_HELPER_PATH, "/usr/lib/aitmproxy/aitm-l4-helper");
+        assert_eq!(POLKIT_ACTION, "com.mrbrutti.aitmproxy.l4-helper.run");
+        assert_eq!(
+            DOWNLOAD_URL,
+            "https://mrbrutti.github.io/aitmproxy/download.html"
+        );
+    }
 }
