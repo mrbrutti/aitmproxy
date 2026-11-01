@@ -35,9 +35,10 @@ use crate::scan::{
     parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
     tag_parts, typed_origin, usable_selector, walk, Dir, EditorField, FieldKind, IssueFilterKey,
     IssuePane, JobPane, Launch, LaunchVerb, MapPane, PendingLaunch, ProfileEditor, ProfilePane,
-    ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
-    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
-    OTHER_SAVED, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
+    ScanError, ScanOffer, ScanState, ScanTab, CLAMPED_FIELD_MAX, CLAMPED_MAX, ISSUES_POLL_TICKS,
+    LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN,
+    OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX, SAVED_PATH_MAX, SITEMAP_POLL_TICKS,
+    STATUS_POLL_TICKS,
 };
 use crate::text::truncate;
 use crate::theme::Theme;
@@ -191,37 +192,15 @@ pub struct BrowserState {
 /// one spare footer row (spec D11, plan task 4).
 const SCAN_CHROME_ROWS: u16 = 10;
 
-/// The widest a profile name grows in a `saved` / `deleted` toast, in cells
-/// (D6 hostile-core bounds; plan task 10).
-const SAVED_NAME_MAX: usize = 80;
-
-/// The widest a saved profile's path grows in its toast, in cells.
-const SAVED_PATH_MAX: usize = 200;
-
-/// The most `clamped` entries a `StartResult` toast names, and the cells a
-/// clamped field name may take (a hostile core's list is cut, not echoed).
-const CLAMPED_MAX: usize = 8;
-const CLAMPED_FIELD_MAX: usize = 64;
+// `SAVED_NAME_MAX`, `SAVED_PATH_MAX`, `CLAMPED_MAX` and `CLAMPED_FIELD_MAX`
+// live with the other profile bounds in `scan::profiles` (fix round G,
+// G41, G70).
 
 /// The local refusal while a launch waits for its reply (spec D7).
 const LAUNCH_IN_FLIGHT: &str = "a launch is already in flight";
 
 /// What the Profiles keys say when no editor is open (plan task 10).
 const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
-
-/// The tag a confirmed `scan.*` call leaves under (spec D4), so the
-/// one-line `y/N` prompt and the tagged path meet: `scan.profile.delete`
-/// is keyed by the `name` it deletes. `None` for a call that is not a
-/// scanner verb, which keeps the plain `Call` path.
-fn scan_confirm_tag(name: &str, args: &Value) -> Option<String> {
-    match name {
-        "scan.profile.delete" => Some(tag_keyed(
-            name,
-            args.get("name").and_then(Value::as_str).unwrap_or_default(),
-        )),
-        _ => None,
-    }
-}
 
 /// The toast the Scan views raise when `⏎` names a flow the store no
 /// longer holds (D11): the one "not in the flow list" wording.
@@ -258,6 +237,10 @@ pub struct ConfirmCall {
     pub args: Value,
     /// Where to go after the answer.
     pub return_to: Mode,
+    /// The tag a `scan.*` call leaves under on `y` (spec D4; fix round G,
+    /// G38): set by the caller that knows the key, `None` for a plain
+    /// `Call`.
+    pub tag: Option<String>,
 }
 
 /// Inspector placement; the TUI has horizontal and vertical only (§2.6).
@@ -2341,6 +2324,7 @@ impl App {
                 description,
                 args,
                 return_to,
+                tag: None,
             });
             self.open_prompt(PromptKind::Confirm);
             return Vec::new();
@@ -2454,7 +2438,7 @@ impl App {
         let target = match typed_origin(&raw, &self.flows) {
             Ok(target) => target,
             Err(reason) => {
-                self.toast(Level::Warn, reason);
+                self.toast(Level::Warn, reason.to_string());
                 return;
             }
         };
@@ -2517,7 +2501,7 @@ impl App {
         if yes {
             // A `scan.*` verb leaves through the tagged path (spec D4):
             // `scan.profile.delete` under `scan.profile.delete:<name>`.
-            if let Some(tag) = scan_confirm_tag(&c.name, &c.args) {
+            if let Some(tag) = c.tag {
                 let mut out = Vec::new();
                 self.scan_call(tag, &c.name, c.args, &mut out);
                 return out;
@@ -2800,39 +2784,32 @@ impl App {
                     self.browser_call("browser.eval", json!({ key: text }), &mut out);
                 }
             }
-            Mode::Prompt(PromptKind::ScanOrigin) => {
-                self.close_prompt();
-                self.submit_scan_origin(&text, &mut out);
-            }
             // A blank line is a "no" (nothing changes, the prompt closes,
             // like every other prompt); a refused value keeps the prompt
             // open with the line cleared (the filter prompt's convention),
-            // so the operator tries again or leaves with Esc.
-            Mode::Prompt(PromptKind::ScanField) if text.is_empty() => self.close_prompt(),
-            Mode::Prompt(PromptKind::ScanField) => match self.submit_scan_field(&text) {
-                Ok(()) => self.close_prompt(),
-                Err(e) => {
-                    self.toast(Level::Error, e);
-                    self.prompt.clear();
-                }
-            },
-            Mode::Prompt(PromptKind::ScanL4Target) if text.is_empty() => self.close_prompt(),
-            Mode::Prompt(PromptKind::ScanL4Target) => match self.submit_scan_l4_target(&text) {
-                Ok(()) => self.close_prompt(),
-                Err(e) => {
-                    self.toast(Level::Error, e);
-                    self.prompt.clear();
-                }
-            },
-            Mode::Prompt(PromptKind::ScanProfileName) if text.is_empty() => self.close_prompt(),
+            // so the operator tries again or leaves with Esc: the one rule
+            // the four Scan prompts share (fix round G, G34).
+            Mode::Prompt(
+                PromptKind::ScanOrigin
+                | PromptKind::ScanField
+                | PromptKind::ScanL4Target
+                | PromptKind::ScanProfileName,
+            ) if text.is_empty() => self.close_prompt(),
+            Mode::Prompt(PromptKind::ScanOrigin) => {
+                let result = self.submit_scan_origin(&text, &mut out);
+                self.submit_retrying(result);
+            }
+            Mode::Prompt(PromptKind::ScanField) => {
+                let result = self.submit_scan_field(&text);
+                self.submit_retrying(result);
+            }
+            Mode::Prompt(PromptKind::ScanL4Target) => {
+                let result = self.submit_scan_l4_target(&text);
+                self.submit_retrying(result);
+            }
             Mode::Prompt(PromptKind::ScanProfileName) => {
-                match self.submit_scan_profile_name(&text, &mut out) {
-                    Ok(()) => self.close_prompt(),
-                    Err(e) => {
-                        self.toast(Level::Error, e);
-                        self.prompt.clear();
-                    }
-                }
+                let result = self.submit_scan_profile_name(&text, &mut out);
+                self.submit_retrying(result);
             }
             Mode::Compose => {
                 if self.compose.field < 3 {
@@ -4566,16 +4543,9 @@ impl App {
             ProfilePane::Fields => self.scan_edit(out),
             ProfilePane::Origins => self.scan_origin_add(out),
             ProfilePane::Checks => {
-                let Some(selector) = self.scan.profiles.cursor_node().map(|n| n.selector.clone())
-                else {
-                    return;
-                };
-                // A collapsed node expands; any other cycles its state.
-                if self.scan.profiles.set_collapsed(&selector, false) {
-                    return;
+                if self.scan.profiles.enter_node() {
+                    self.recompute_launch_gate();
                 }
-                self.scan.profiles.toggle_node(&selector);
-                self.recompute_launch_gate();
             }
         }
     }
@@ -4731,7 +4701,7 @@ impl App {
         let target = match typed_origin(raw, &self.flows) {
             Ok(target) => target,
             Err(reason) => {
-                self.toast(Level::Warn, reason);
+                self.toast(Level::Warn, reason.to_string());
                 return;
             }
         };
@@ -4902,18 +4872,7 @@ impl App {
         if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Checks {
             return;
         }
-        let Some((selector, kind)) = self
-            .scan
-            .profiles
-            .cursor_node()
-            .map(|n| (n.selector.clone(), n.kind))
-        else {
-            return;
-        };
-        if kind == crate::scan::NodeKind::Check {
-            return;
-        }
-        self.scan.profiles.set_collapsed(&selector, collapse);
+        self.scan.profiles.fold_node(collapse);
     }
 
     /// Profiles `o` (D11): the typed-origin prompt; needs an editor.
@@ -4929,31 +4888,40 @@ impl App {
     }
 
     /// The `o` prompt's line (D8): the typed origin keeps its scheme, a bare
-    /// host gets the rule's; a host the scope does not cover is refused
-    /// with the one toast and nothing changes; otherwise the origin joins
-    /// the draft and the picker, and an observed session reads its preview.
-    fn submit_scan_origin(&mut self, text: &str, out: &mut Vec<BusRequest>) {
-        if text.is_empty() {
-            return;
-        }
-        let origin = match typed_origin(text, &self.flows) {
-            Ok(origin) => origin,
-            Err(reason) => {
-                self.toast(Level::Warn, reason);
-                return;
-            }
-        };
+    /// host gets the rule's; a host, port or scheme the rule refuses is the
+    /// `Err` the prompt retries on; a host the scope does not cover is
+    /// refused with the one D8 toast and the prompt closes (scope is fixed
+    /// elsewhere, so there is nothing to retype), as is a missing editor;
+    /// otherwise the origin joins the draft and the picker, and an observed
+    /// session reads its preview.
+    fn submit_scan_origin(&mut self, text: &str, out: &mut Vec<BusRequest>) -> Result<(), String> {
+        let origin = typed_origin(text, &self.flows).map_err(|e| e.to_string())?;
         if self.scope_host(&origin).is_none() {
-            return;
+            // Close-on-refusal: the toast already names the host to add.
+            return Ok(());
         }
         let Some(editor) = self.scan.profiles.editor.as_mut() else {
             self.toast(Level::Info, NO_EDITOR);
-            return;
+            return Ok(());
         };
         editor.note_typed_origin(&origin);
         if editor.add_origin(&origin) {
             self.recompute_launch_gate();
             self.request_session_preview(out);
+        }
+        Ok(())
+    }
+
+    /// Settle a Scan prompt's submit (fix round G, G34): `Ok` closes the
+    /// prompt, `Err` toasts the reason and keeps the prompt open with the
+    /// line cleared, so the operator retypes or leaves with Esc.
+    fn submit_retrying(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.close_prompt(),
+            Err(e) => {
+                self.toast(Level::Error, e);
+                self.prompt.clear();
+            }
         }
     }
 
@@ -5006,7 +4974,7 @@ impl App {
 
     /// The `t` prompt's line: parsed by [`parse_l4_target`], added once.
     fn submit_scan_l4_target(&mut self, text: &str) -> Result<(), String> {
-        let target = parse_l4_target(text)?;
+        let target = parse_l4_target(text).map_err(|e| e.to_string())?;
         let Some(editor) = self.scan.profiles.editor.as_mut() else {
             return Err(NO_EDITOR.to_string());
         };
@@ -5023,7 +4991,7 @@ impl App {
             return Err(NO_EDITOR.to_string());
         };
         let field = editor.field();
-        editor.set_text(field, text)?;
+        editor.set_text(field, text).map_err(|e| e.to_string())?;
         self.recompute_launch_gate();
         Ok(())
     }
@@ -5035,18 +5003,20 @@ impl App {
         if self.scan.tab != ScanTab::Profiles {
             return;
         }
-        let Some(editor) = self.scan.profiles.editor.as_ref() else {
+        let Some((builtin, name)) = self
+            .scan
+            .profiles
+            .editor
+            .as_ref()
+            .map(|e| (e.builtin, e.draft.name.trim().to_string()))
+        else {
             self.toast(Level::Info, NO_EDITOR);
             return;
         };
-        if !self.has_tool("scan.profile.save") {
-            let err = ScanError::missing_verb("scan.profile.save");
-            self.toast(Level::Warn, err.wording());
-            self.scan.set_error(err);
+        if !self.scan_verb_or_toast("scan.profile.save") {
             return;
         }
-        let name = editor.draft.name.trim();
-        if editor.builtin || name.is_empty() || is_builtin_name(name) {
+        if builtin || name.is_empty() || self.scan.profiles.is_builtin(&name) {
             self.open_prompt(PromptKind::ScanProfileName);
             return;
         }
@@ -5069,7 +5039,9 @@ impl App {
         let Some(editor) = self.scan.profiles.editor.as_mut() else {
             return Err(NO_EDITOR.to_string());
         };
-        editor.set_text(EditorField::Name, name)?;
+        editor
+            .set_text(EditorField::Name, name)
+            .map_err(|e| e.to_string())?;
         self.send_profile_save(out);
         Ok(())
     }
@@ -5106,19 +5078,7 @@ impl App {
         if self.scan.tab != ScanTab::Profiles {
             return;
         }
-        let target = if self.scan.profiles.pane == ProfilePane::List {
-            self.scan
-                .profiles
-                .cursor_entry()
-                .map(|p| (p.name.clone(), p.builtin))
-        } else {
-            self.scan.profiles.editor.as_ref().and_then(|e| {
-                e.loaded_from
-                    .as_ref()
-                    .map(|name| (name.clone(), e.builtin || is_builtin_name(name)))
-            })
-        };
-        let Some((name, builtin)) = target else {
+        let Some((name, builtin)) = self.scan.profiles.delete_target() else {
             return;
         };
         if builtin {
@@ -5131,17 +5091,17 @@ impl App {
             );
             return;
         }
-        if !self.has_tool("scan.profile.delete") {
-            let err = ScanError::missing_verb("scan.profile.delete");
-            self.toast(Level::Warn, err.wording());
-            self.scan.set_error(err);
+        if !self.scan_verb_or_toast("scan.profile.delete") {
             return;
         }
+        // Keyed by the name it deletes (spec D4), so the `y` leaves through
+        // the tagged path (fix round G, G38).
         self.confirm = Some(ConfirmCall {
             name: "scan.profile.delete".to_string(),
             description: format!("delete profile {}? y/N", truncate(&name, SAVED_NAME_MAX)),
             args: json!({ "name": name }),
             return_to: Mode::Scan,
+            tag: Some(tag_keyed("scan.profile.delete", &name)),
         });
         self.open_prompt(PromptKind::Confirm);
     }
@@ -5275,10 +5235,22 @@ impl App {
         self.has_tool(name) && self.scan_call(tag, name, args, out)
     }
 
+    /// Whether the bus offers `name` (spec D2; fix round G, G40): when it
+    /// does not, the missing verb is recorded as `<name> is not on this
+    /// bus` in the owning tab's error line and toasted, once, here.
+    fn scan_verb_or_toast(&mut self, name: &str) -> bool {
+        if self.has_tool(name) {
+            return true;
+        }
+        let err = ScanError::missing_verb(name);
+        self.toast(Level::Warn, err.wording());
+        self.scan.set_error(err);
+        false
+    }
+
     /// The one way a `scan.*` call leaves the reducer (spec D4). A verb the
-    /// bus lacks is recorded as `<name> is not on this bus` in the owning
-    /// tab's error line and toasted; a tag already in flight is not
-    /// re-issued. Returns whether the call was pushed.
+    /// bus lacks is [`App::scan_verb_or_toast`]'s refusal; a tag already in
+    /// flight is not re-issued. Returns whether the call was pushed.
     fn scan_call(
         &mut self,
         tag: String,
@@ -5286,10 +5258,7 @@ impl App {
         args: Value,
         out: &mut Vec<BusRequest>,
     ) -> bool {
-        if !self.has_tool(name) {
-            let err = ScanError::missing_verb(name);
-            self.toast(Level::Warn, err.wording());
-            self.scan.set_error(err);
+        if !self.scan_verb_or_toast(name) {
             return false;
         }
         if self.scan.inflight.contains(&tag) {
@@ -5411,13 +5380,7 @@ impl App {
                     match fold_profile(tag, profile) {
                         Ok(profile) => {
                             let name = profile.name.clone();
-                            let builtin = self
-                                .scan
-                                .profiles
-                                .list
-                                .iter()
-                                .find(|p| p.name == name)
-                                .map_or_else(|| is_builtin_name(&name), |p| p.builtin);
+                            let builtin = self.scan.profiles.is_builtin(&name);
                             self.open_editor(ProfileEditor::new(profile, Some(name), builtin), out);
                         }
                         Err(err) => self.scan.set_error(err),
@@ -5440,9 +5403,7 @@ impl App {
                         let path = truncate(&saved.path, SAVED_PATH_MAX);
                         self.toast(Level::Info, format!("saved {name} at {path}"));
                         if let Some(editor) = self.scan.profiles.editor.as_mut() {
-                            editor.dirty = false;
-                            editor.builtin = false;
-                            editor.loaded_from = Some(saved.saved);
+                            editor.saved_as(saved.saved);
                         }
                     } else {
                         self.scan.set_error(ScanError::uncoded(tag, OTHER_SAVED));
@@ -5460,16 +5421,9 @@ impl App {
                     } else {
                         self.toast(Level::Warn, format!("{shown} was not a saved profile"));
                     }
-                    // The editor over the deleted profile is stale: close it.
-                    if self
-                        .scan
-                        .profiles
-                        .editor
-                        .as_ref()
-                        .is_some_and(|e| e.loaded_from.as_deref() == Some(name.as_str()))
-                    {
-                        self.scan.profiles.editor = None;
-                        self.scan.profiles.pane = ProfilePane::List;
+                    // The editor over the deleted profile is stale: it
+                    // closes, and the launch key is re-gated on the row.
+                    if self.scan.profiles.on_deleted(&name) {
                         self.recompute_launch_gate();
                     }
                     self.request_profile_list(out);

@@ -23,9 +23,9 @@ use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::model::FlowRow;
 use aitm_tui::scan::{
-    origin_choices, typed_origin, IssueFilterKey, MapPane, OriginChoice, OriginSource, ScanTab,
-    AUDITED_MARK, ORIGIN_HOST_ERROR, POINT_TRAITS_MAX, SITEMAP_PAGE_LIMIT, SITEMAP_POLL_TICKS,
-    SITEMAP_TOTAL_LIMIT, SITEMAP_VALUE_MAX,
+    origin_choices, typed_origin, IssueFilterKey, MapPane, OriginChoice, OriginError, OriginSource,
+    ScanTab, AUDITED_MARK, ORIGIN_HOST_ERROR, POINT_TRAITS_MAX, SITEMAP_PAGE_LIMIT,
+    SITEMAP_POLL_TICKS, SITEMAP_TOTAL_LIMIT, SITEMAP_VALUE_MAX,
 };
 use common::*;
 use serde_json::{json, Value};
@@ -573,7 +573,7 @@ fn typed_origins_keep_their_scheme() {
     for bad in ["host:abc", "http://a:b:c/", "https://", ""] {
         assert_eq!(
             typed_origin(bad, &[]),
-            Err(ORIGIN_HOST_ERROR.to_string()),
+            Err(OriginError::Host),
             "{bad:?} is refused"
         );
     }

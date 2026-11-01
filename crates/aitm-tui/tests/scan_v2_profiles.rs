@@ -23,9 +23,10 @@ use aitm_tui::app::{App, Mode, PromptKind};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::scan::{
-    check_tree, parse_l4_target, session_line, tri_state, EditorField, OriginSource, ProfilePane,
-    ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITING_MARK, EDITOR_FIELDS,
-    L4_TARGET_ERROR, OPEN_MARK, PROFILES_MAX,
+    check_tree, parse_l4_target, session_line, tri_state, EditorField, L4TargetError, OriginSource,
+    ProfilePane, ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITING_MARK,
+    EDITOR_FIELDS, L4_TARGET_ERROR, OPEN_MARK, ORIGIN_HOST_ERROR, ORIGIN_SCHEME_ERROR,
+    PROFILES_MAX,
 };
 use aitm_tui::ui::selection_bg;
 use common::*;
@@ -646,11 +647,7 @@ fn l4_target_prompt_parses() {
         "127.0.0.1:80/tcp a b",
         "",
     ] {
-        assert_eq!(
-            parse_l4_target(bad),
-            Err(L4_TARGET_ERROR.to_string()),
-            "{bad:?}"
-        );
+        assert_eq!(parse_l4_target(bad), Err(L4TargetError), "{bad:?}");
     }
     assert_eq!(
         L4_TARGET_ERROR,
@@ -1859,4 +1856,52 @@ fn a_bare_star_scope_entry_is_greyed_not_offered() {
     let line = line_with(&text, "type an origin (o)")
         .unwrap_or_else(|| panic!("the wildcard row is drawn:\n{text}"));
     assert!(line.contains("*  type an origin (o)"), "{line:?}");
+}
+
+/// Fix round G, G34: the four prompt submits share one retry rule. A host
+/// or scheme refusal in the `o` prompt keeps the prompt open with the line
+/// cleared (the operator tries again or leaves with Esc), like the field,
+/// L4-target and profile-name prompts; the out-of-scope refusal closes it
+/// (the D8 toast answers the operator, scope is fixed elsewhere).
+#[test]
+fn an_origin_refused_by_the_rule_keeps_the_prompt_open_but_out_of_scope_closes_it() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["127.0.0.1".into()]));
+    let _ = app.update(Action::ScanNewProfile);
+    let _ = app.update(Action::ScanOriginPrompt);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanOrigin));
+    type_text(&mut app, "http://a b");
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(
+        app.mode,
+        Mode::Prompt(PromptKind::ScanOrigin),
+        "a host refusal keeps the prompt open"
+    );
+    assert!(
+        app.prompt.is_empty(),
+        "with the line cleared: {:?}",
+        app.prompt
+    );
+    assert_eq!(toast(&app), ORIGIN_HOST_ERROR);
+    type_text(&mut app, "ftp://127.0.0.1");
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanOrigin));
+    assert_eq!(toast(&app), ORIGIN_SCHEME_ERROR);
+    type_text(&mut app, "https://evil.test");
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(app.mode, Mode::Scan, "out of scope closes the prompt");
+    assert_eq!(
+        toast(&app),
+        "Out of scope: add `evil.test` to scope to scan it"
+    );
+    assert!(app
+        .scan
+        .profiles
+        .editor
+        .as_ref()
+        .expect("editor")
+        .draft
+        .target
+        .origins
+        .is_empty());
 }

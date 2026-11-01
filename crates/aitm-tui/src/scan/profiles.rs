@@ -4,12 +4,14 @@
 //! `:scan <origin>` command and the legacy seed share.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 
 use aitm_scan_model::{
-    Accuracy, Canary, CheckMeta, CheckSelection, ChecksResult, CrawlStrategy, HttpVersionPolicy,
-    Intensity, L4Seed, L4TargetSpec, L4Transport, LaneKind, OnLost, ProfileListEntry,
-    ProfileListResult, RecordProbes, ScanProfile, SessionMode, SessionProfile, Speed, UseBrowser,
+    is_builtin_name, Accuracy, Canary, CheckMeta, CheckSelection, ChecksResult, CrawlStrategy,
+    HttpVersionPolicy, Intensity, L4Seed, L4TargetSpec, L4Transport, LaneKind, OnLost,
+    ProfileListEntry, ProfileListResult, RecordProbes, ScanProfile, SessionMode, SessionProfile,
+    Speed, UseBrowser,
 };
 
 use super::{lane_token, scan_host, step, wire_token, Dir, ScanError};
@@ -34,7 +36,24 @@ pub const SELECTOR_MAX: usize = 128;
 /// The widest any display-only string of a folded reply grows, in cells
 /// (a check's name, description and remediation, a session's names and
 /// canary path, a save reply's path).
-const VALUE_MAX: usize = 200;
+pub const VALUE_MAX: usize = 200;
+
+/// The widest a profile name grows in a toast (the save, delete and start
+/// toasts; builder's bound, Task 10; fix round G, G41: beside the other
+/// profile bounds).
+pub const SAVED_NAME_MAX: usize = 80;
+/// The widest a saved profile's path grows in the save toast, and the
+/// whole start toast: the one displayed-string cap ([`VALUE_MAX`]).
+pub const SAVED_PATH_MAX: usize = VALUE_MAX;
+/// The most `clamped` entries the start toast names (fix round G, G70;
+/// D6 hostile-core bounds).
+pub const CLAMPED_MAX: usize = 8;
+/// The widest a clamped field name grows in the start toast (G70).
+pub const CLAMPED_FIELD_MAX: usize = 64;
+/// The most entries a check's `kinds` and `wants_traits` lists keep at
+/// fold (fix round G, G41; the vocabularies are shorter, so a longer list
+/// is a hostile core's).
+const CHECK_LISTS_MAX: usize = 32;
 
 /// The most cookie and header names a session preview keeps.
 const SESSION_NAMES_MAX: usize = 32;
@@ -342,6 +361,65 @@ pub const ORIGIN_HOST_ERROR: &str =
 /// is named as a port, not as a host).
 pub const ORIGIN_PORT_ERROR: &str = "origin port must be a number from 1 to 65535";
 
+/// Why a typed origin or a scope authority is refused (fix round G, G26):
+/// the host, the port or the scheme. `Display` is the operator wording
+/// ([`ORIGIN_HOST_ERROR`], [`ORIGIN_PORT_ERROR`], [`ORIGIN_SCHEME_ERROR`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginError {
+    Host,
+    Port,
+    Scheme,
+}
+
+impl fmt::Display for OriginError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OriginError::Host => ORIGIN_HOST_ERROR,
+            OriginError::Port => ORIGIN_PORT_ERROR,
+            OriginError::Scheme => ORIGIN_SCHEME_ERROR,
+        })
+    }
+}
+
+impl std::error::Error for OriginError {}
+
+/// Why a field edit is refused (fix round G, G43), `Display` carrying the
+/// operator wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldError {
+    /// A number field given something that is not a number.
+    NotANumber(EditorField),
+    /// A field that is not edited as text (`e` cycles or toggles it).
+    NotText(EditorField),
+    /// A profile name outside the engine's rule ([`PROFILE_NAME_RULE`]).
+    Name,
+}
+
+impl fmt::Display for FieldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldError::NotANumber(field) => write!(f, "{} must be a number", field.label()),
+            FieldError::NotText(field) => write!(f, "{} is not a text field", field.label()),
+            FieldError::Name => f.write_str(PROFILE_NAME_RULE),
+        }
+    }
+}
+
+impl std::error::Error for FieldError {}
+
+/// An L4 target line outside `ip:port[/tcp|udp][ grammar]` (fix round G,
+/// G43); `Display` is [`L4_TARGET_ERROR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L4TargetError;
+
+impl fmt::Display for L4TargetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(L4_TARGET_ERROR)
+    }
+}
+
+impl std::error::Error for L4TargetError {}
+
 /// The scheme of a typed origin must be `http` or `https` (builder's rule:
 /// the scan lanes speak HTTP; an L4 target is the profile's `l4_targets`
 /// field, not an origin).
@@ -402,13 +480,13 @@ pub fn origin_choices(scope: &[String], flows: &[FlowRow]) -> Vec<OriginChoice> 
 /// still carrying a colon after the port rule, or an empty one, is
 /// [`ORIGIN_HOST_ERROR`]. The scheme must be `http` or `https`
 /// ([`ORIGIN_SCHEME_ERROR`]).
-pub fn typed_origin(raw: &str, flows: &[FlowRow]) -> Result<String, String> {
+pub fn typed_origin(raw: &str, flows: &[FlowRow]) -> Result<String, OriginError> {
     let s = raw.trim();
     match s.split_once("://") {
         Some((scheme, rest)) => {
             let scheme = scheme.to_ascii_lowercase();
             if scheme != "http" && scheme != "https" {
-                return Err(ORIGIN_SCHEME_ERROR.to_string());
+                return Err(OriginError::Scheme);
             }
             let (host, port) = authority_parts(authority_of(rest))?;
             Ok(origin(&scheme, &host, port))
@@ -420,7 +498,7 @@ pub fn typed_origin(raw: &str, flows: &[FlowRow]) -> Result<String, String> {
                 .into_iter()
                 .next()
                 .map(|c| c.origin)
-                .ok_or_else(|| ORIGIN_HOST_ERROR.to_string())
+                .ok_or(OriginError::Host)
         }
     }
 }
@@ -541,14 +619,14 @@ pub(super) fn default_port(scheme: &str) -> u16 {
 /// round G, G18) is [`ORIGIN_HOST_ERROR`]; a port outside 1 to 65535 is
 /// [`ORIGIN_PORT_ERROR`]. Pure, so the Site map's legacy nodes and the
 /// origin rule parse an authority one way.
-pub(crate) fn authority_parts(authority: &str) -> Result<(String, Option<u16>), String> {
+pub(crate) fn authority_parts(authority: &str) -> Result<(String, Option<u16>), OriginError> {
     let s = authority.trim();
     if let Some(rest) = s.strip_prefix('[') {
-        let (v6, tail) = rest.split_once(']').ok_or(ORIGIN_HOST_ERROR)?;
-        let ip: Ipv6Addr = v6.parse().map_err(|_| ORIGIN_HOST_ERROR)?;
+        let (v6, tail) = rest.split_once(']').ok_or(OriginError::Host)?;
+        let ip: Ipv6Addr = v6.parse().map_err(|_| OriginError::Host)?;
         let port = match tail {
             "" => None,
-            t => Some(parse_port(t.strip_prefix(':').ok_or(ORIGIN_HOST_ERROR)?)?),
+            t => Some(parse_port(t.strip_prefix(':').ok_or(OriginError::Host)?)?),
         };
         return Ok((format!("[{ip}]"), port));
     }
@@ -561,13 +639,13 @@ pub(crate) fn authority_parts(authority: &str) -> Result<(String, Option<u16>), 
         _ => (s, None),
     };
     if host.is_empty() || host.chars().any(is_host_delimiter) {
-        return Err(ORIGIN_HOST_ERROR.to_string());
+        return Err(OriginError::Host);
     }
     if let Ok(ip) = host.parse::<Ipv6Addr>() {
         return Ok((format!("[{ip}]"), port));
     }
     if host.contains(':') {
-        return Err(ORIGIN_HOST_ERROR.to_string());
+        return Err(OriginError::Host);
     }
     Ok((host.to_string(), port))
 }
@@ -580,10 +658,10 @@ fn is_host_delimiter(c: char) -> bool {
 }
 
 /// A port from its digits: 1 to 65535, else [`ORIGIN_PORT_ERROR`].
-fn parse_port(digits: &str) -> Result<u16, String> {
+fn parse_port(digits: &str) -> Result<u16, OriginError> {
     match digits.parse::<u16>() {
         Ok(p) if p > 0 => Ok(p),
-        _ => Err(ORIGIN_PORT_ERROR.to_string()),
+        _ => Err(OriginError::Port),
     }
 }
 
@@ -837,14 +915,12 @@ impl ProfileEditor {
     /// field's width; a number field given anything else is refused with
     /// `<label> must be a number`, and a field that is not text at all
     /// with `<label> is not a text field`. A write marks the draft dirty.
-    pub fn set_text(&mut self, field: EditorField, text: &str) -> Result<(), String> {
+    pub fn set_text(&mut self, field: EditorField, text: &str) -> Result<(), FieldError> {
         let text = text.trim();
-        let number = || format!("{} must be a number", field.label());
+        let number = || FieldError::NotANumber(field);
         let d = &mut self.draft;
         match field {
-            EditorField::Name if !valid_profile_name(text) => {
-                return Err(PROFILE_NAME_RULE.to_string())
-            }
+            EditorField::Name if !valid_profile_name(text) => return Err(FieldError::Name),
             EditorField::Name => d.name = text.to_string(),
             EditorField::MaxDepth => d.crawl.max_depth = text.parse().map_err(|_| number())?,
             EditorField::MaxPages => d.crawl.max_pages = text.parse().map_err(|_| number())?,
@@ -853,10 +929,18 @@ impl ProfileEditor {
             EditorField::BudgetMaxIssues => {
                 d.budget.max_issues = text.parse().map_err(|_| number())?
             }
-            other => return Err(format!("{} is not a text field", other.label())),
+            other => return Err(FieldError::NotText(other)),
         }
         self.dirty = true;
         Ok(())
+    }
+
+    /// A `scan.profile.save` reply adopted (fix round G, G39): the draft is
+    /// clean, no longer a builtin's, and loaded from `saved`.
+    pub fn saved_as(&mut self, saved: String) {
+        self.dirty = false;
+        self.builtin = false;
+        self.loaded_from = Some(saved);
     }
 
     /// Add `origin` to the draft unless it is there already. Returns
@@ -981,8 +1065,8 @@ pub fn l4_target_text(t: &L4TargetSpec) -> String {
 /// an IPv4 or bracketed IPv6 address, a port from 1 to 65535, `tcp` when
 /// no transport is named, and at most one word of grammar after a space.
 /// Anything else is [`L4_TARGET_ERROR`].
-pub fn parse_l4_target(s: &str) -> Result<L4TargetSpec, String> {
-    let err = || L4_TARGET_ERROR.to_string();
+pub fn parse_l4_target(s: &str) -> Result<L4TargetSpec, L4TargetError> {
+    let err = || L4TargetError;
     let mut words = s.split_whitespace();
     let head = words.next().ok_or_else(err)?;
     let grammar = words.next().map(str::to_string);
@@ -1265,9 +1349,9 @@ impl ProfilesState {
             }
             check.lanes.sort();
             check.lanes.dedup();
-            check.kinds.truncate(32);
+            check.kinds.truncate(CHECK_LISTS_MAX);
             if let Some(t) = check.wants_traits.as_mut() {
-                t.truncate(32);
+                t.truncate(CHECK_LISTS_MAX);
             }
         }
         self.checks = result.checks;
@@ -1338,6 +1422,74 @@ impl ProfilesState {
     }
 
     /// The row under the list cursor.
+    /// Whether `name` is a builtin profile (fix round G, G39: the one
+    /// rule the get, save and delete paths share): the list row's flag
+    /// when the list has the row, else the engine's builtin-name rule.
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.list
+            .iter()
+            .find(|p| p.name == name)
+            .map_or_else(|| is_builtin_name(name), |p| p.builtin)
+    }
+
+    /// What `D` would delete (spec D11; fix round G, G39): the List row
+    /// under the cursor while the List pane is focused, else the open
+    /// editor's profile (the one it was loaded from); with whether it is a
+    /// builtin, which is refused. `None` with nothing to delete.
+    pub fn delete_target(&self) -> Option<(String, bool)> {
+        if self.pane == ProfilePane::List {
+            let row = self.cursor_entry()?;
+            Some((row.name.clone(), row.builtin))
+        } else {
+            let editor = self.editor.as_ref()?;
+            let name = editor.loaded_from.as_ref()?;
+            Some((name.clone(), editor.builtin || self.is_builtin(name)))
+        }
+    }
+
+    /// A profile was deleted (fix round G, G39): the editor over it is
+    /// stale and closes, the List pane takes the focus. Returns whether an
+    /// editor closed, so the reducer re-gates the launch key.
+    pub fn on_deleted(&mut self, name: &str) -> bool {
+        let over_it = self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.loaded_from.as_deref() == Some(name));
+        if over_it {
+            self.editor = None;
+            self.pane = ProfilePane::List;
+        }
+        over_it
+    }
+
+    /// `⏎` on the Checks pane (spec D11; fix round G, G39): a collapsed
+    /// node expands, any other cycles its tri-state. Returns whether a
+    /// state changed (the reducer re-gates the launch key then).
+    pub fn enter_node(&mut self) -> bool {
+        let Some(selector) = self.cursor_node().map(|n| n.selector.clone()) else {
+            return false;
+        };
+        if self.set_collapsed(&selector, false) {
+            return false;
+        }
+        self.toggle_node(&selector);
+        true
+    }
+
+    /// `h` / `l` on the Checks pane (fix round G, G39): collapse or expand
+    /// the lane or class node under the cursor; a check node has nothing
+    /// under it.
+    pub fn fold_node(&mut self, collapse: bool) {
+        let Some((selector, kind)) = self.cursor_node().map(|n| (n.selector.clone(), n.kind))
+        else {
+            return;
+        };
+        if kind == NodeKind::Check {
+            return;
+        }
+        self.set_collapsed(&selector, collapse);
+    }
+
     pub fn cursor_entry(&self) -> Option<&ProfileListEntry> {
         self.list.get(self.cursor)
     }
@@ -1381,18 +1533,10 @@ mod tests {
             "h:abc", "a:b:c", "", "[::1", "[zz]", "[::1]x", "a@b", "a/b", "a?b", "a#b", "a b",
             "a\tb",
         ] {
-            assert_eq!(
-                authority_parts(bad),
-                Err(ORIGIN_HOST_ERROR.to_string()),
-                "{bad:?}"
-            );
+            assert_eq!(authority_parts(bad), Err(OriginError::Host), "{bad:?}");
         }
         for bad in ["h:0", "h:65536", "[::1]:99999"] {
-            assert_eq!(
-                authority_parts(bad),
-                Err(ORIGIN_PORT_ERROR.to_string()),
-                "{bad:?}"
-            );
+            assert_eq!(authority_parts(bad), Err(OriginError::Port), "{bad:?}");
         }
     }
 
@@ -1473,10 +1617,8 @@ mod tests {
 
     #[test]
     fn typed_origin_refuses_a_scheme_other_than_http() {
-        assert_eq!(
-            typed_origin("ftp://h/", &[]),
-            Err(ORIGIN_SCHEME_ERROR.to_string())
-        );
+        assert_eq!(typed_origin("ftp://h/", &[]), Err(OriginError::Scheme));
+        assert_eq!(OriginError::Scheme.to_string(), ORIGIN_SCHEME_ERROR);
         assert_eq!(
             typed_origin("HTTPS://H:8443", &[]),
             Ok("https://H:8443".to_string()),
@@ -1510,11 +1652,7 @@ mod tests {
     #[test]
     fn typed_origin_refuses_userinfo_and_whitespace_hosts() {
         for bad in ["http://a@b", "http://a b", "a@b", "a b"] {
-            assert_eq!(
-                typed_origin(bad, &[]),
-                Err(ORIGIN_HOST_ERROR.to_string()),
-                "{bad:?}"
-            );
+            assert_eq!(typed_origin(bad, &[]), Err(OriginError::Host), "{bad:?}");
         }
     }
 
@@ -1739,12 +1877,27 @@ mod tests {
         assert!(e.dirty);
         assert_eq!(
             e.set_text(EditorField::Speed, "fast"),
-            Err("speed is not a text field".to_string())
+            Err(FieldError::NotText(EditorField::Speed))
+        );
+        assert_eq!(
+            FieldError::NotText(EditorField::Speed).to_string(),
+            "speed is not a text field"
         );
         assert_eq!(
             e.set_text(EditorField::BudgetTimeS, "-1"),
-            Err("budget_time_s must be a number".to_string())
+            Err(FieldError::NotANumber(EditorField::BudgetTimeS))
         );
+        assert_eq!(
+            FieldError::NotANumber(EditorField::BudgetTimeS).to_string(),
+            "budget_time_s must be a number"
+        );
+        assert_eq!(
+            e.set_text(EditorField::Name, "Bad Name"),
+            Err(FieldError::Name)
+        );
+        assert_eq!(FieldError::Name.to_string(), PROFILE_NAME_RULE);
+        assert_eq!(parse_l4_target("nope"), Err(L4TargetError));
+        assert_eq!(L4TargetError.to_string(), L4_TARGET_ERROR);
         assert_eq!(e.set_text(EditorField::BudgetTimeS, " 90 "), Ok(()));
         assert_eq!(e.draft.budget.time_s, 90);
     }
