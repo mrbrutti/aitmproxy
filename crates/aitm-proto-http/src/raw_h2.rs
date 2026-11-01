@@ -565,21 +565,34 @@ pub struct RawH2Client {
     /// Set by the first `probe` that runs without an SSRF gate, so the
     /// warning about it is logged once per client, not once per probe.
     warned_no_gate: AtomicBool,
+    /// The connect timeout the default dialer was built with, kept so a test
+    /// can inspect what `new` handed it (review findings QM-7, T-D2).
+    #[cfg(test)]
+    connect_timeout: Duration,
 }
 
 impl RawH2Client {
     /// A client that dials real TCP and resolves through the system resolver.
     #[must_use]
     pub fn new(verify: TlsVerify) -> Self {
+        // The sender's dialer, with the raw driver's own, shorter connect
+        // timeout: one implementation, two postures (review finding Q4).
+        let connect_timeout = RAW_CONNECT_TIMEOUT;
         Self {
             tls: verify,
-            // The sender's dialer, with the raw driver's own, shorter connect
-            // timeout: one implementation, two postures (review finding Q4).
-            dialer: Arc::new(TcpDialer::new(RAW_CONNECT_TIMEOUT)),
+            dialer: Arc::new(TcpDialer::new(connect_timeout)),
             resolver: Arc::new(SystemResolver),
             ssrf: None,
             warned_no_gate: AtomicBool::new(false),
+            #[cfg(test)]
+            connect_timeout,
         }
+    }
+
+    /// The connect timeout the default dialer was built with.
+    #[cfg(test)]
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 
     /// Enforce the SSRF policy against `scope` on every probe: refuse a
@@ -1053,11 +1066,9 @@ mod tests {
     /// that has to leave room inside the whole-probe cap for the handshake and
     /// the streams.
     ///
-    /// Residual gap (tester pass over fix round F2, reported to the Coder):
-    /// nothing here pins that `RawH2Client::new` passes *this* constant to its
-    /// dialer. Swapping the argument at the construction site for
-    /// `Duration::from_secs(30)` leaves the whole lib suite green, because the
-    /// dialer behind `Arc<dyn Dialer>` cannot be inspected from a test.
+    /// QM-7 / T-D2: the client built by `RawH2Client::new` is what is
+    /// inspected, not the constant against itself, so swapping the argument
+    /// at the construction site is what this test catches.
     #[test]
     fn the_raw_driver_keeps_its_own_connect_timeout() {
         assert_eq!(RAW_CONNECT_TIMEOUT, Duration::from_secs(10));
@@ -1065,6 +1076,11 @@ mod tests {
             RAW_CONNECT_TIMEOUT < RAW_TOTAL_TIMEOUT,
             "a connect timeout of {RAW_CONNECT_TIMEOUT:?} outlives the whole-probe cap of \
              {RAW_TOTAL_TIMEOUT:?}, which would make it unreachable"
+        );
+        assert_eq!(
+            RawH2Client::new(TlsVerify::WebPki).connect_timeout(),
+            RAW_CONNECT_TIMEOUT,
+            "a default client dials with the raw driver's own connect timeout"
         );
         assert_eq!(
             TcpDialer::new(RAW_CONNECT_TIMEOUT).connect_timeout(),
@@ -2022,8 +2038,7 @@ mod driver_tests {
         assert_eq!(dialer.calls(), 1);
     }
 
-    /// Plan amendment A3: `Blocks` opens one stream per block, in order, each
-    /// carrying its own encoded block, all on the one connection.
+    /// Three `Blocks` variants told apart by their `:path`.
     fn three_variants() -> Vec<Vec<RawHeader>> {
         let base = |path: &str| {
             vec![
@@ -2041,6 +2056,8 @@ mod driver_tests {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Plan amendment A3: `Blocks` opens one stream per block, in order, each
+    /// carrying its own encoded block, all on the one connection.
     #[tokio::test]
     async fn blocks_open_one_stream_per_block_in_order_on_one_connection() {
         let (client, dialer, log) = peer(Script::new(vec![(3, 100)], Answer::Status(0x88)));
