@@ -11,7 +11,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use aitm_core::HttpFlow;
+use aitm_core::{Body, HttpFlow};
 use aitm_scan_model::{CrawlOptions, CrawlStrategy, JobCtx};
 use futures::future::BoxFuture;
 use url::Url;
@@ -19,7 +19,7 @@ use url::Url;
 use crate::hash::fnv1a64;
 use crate::limits::{
     CLICKS_PER_PAGE_NORMAL, CLICKS_PER_PAGE_THOROUGH, FORMS_PER_PAGE_NORMAL,
-    FORMS_PER_PAGE_THOROUGH, MAX_AWAIT, MAX_FRONTIER,
+    FORMS_PER_PAGE_THOROUGH, MAX_AWAIT, MAX_FRONTIER, MAX_HELD_CRAWL_BODY,
 };
 use crate::url_norm::page_key;
 
@@ -308,6 +308,23 @@ impl fmt::Debug for CrawlReport {
             .field("depth_reached", &self.depth_reached)
             .finish()
     }
+}
+
+/// The flow as a [`CrawlReport`] keeps it: the response body cut to
+/// [`MAX_HELD_CRAWL_BODY`], so a crawl of a few hundred large pages cannot
+/// grow the job's memory for the life of discovery (S-I3).
+///
+/// Both engines hold their produced flows through this one function. The
+/// stored flow (recorded by the client, or captured through the proxy) is
+/// untouched; this copy only feeds the site-map builder, which reads the
+/// request alone.
+pub(crate) fn held_copy(mut flow: HttpFlow) -> HttpFlow {
+    if let Some(response) = flow.response.as_mut() {
+        if let Body::Bytes(bytes) = &mut response.body {
+            bytes.truncate(MAX_HELD_CRAWL_BODY);
+        }
+    }
+    flow
 }
 
 /// One crawl engine.

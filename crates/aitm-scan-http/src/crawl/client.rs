@@ -41,9 +41,11 @@ use aitm_core::{
 use aitm_scan_model::JobCtx;
 
 use crate::crawl::extract::{extract, FieldKind, FormSpec};
-use crate::crawl::frontier::{fingerprint, remaining, CrawlReport, Crawler, Frontier, Limits};
+use crate::crawl::frontier::{
+    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits,
+};
 use crate::crawl::values::{form_action, form_pairs_for};
-use crate::limits::{job_mark, MARK_CRAWL, MAX_DOM_BYTES, MAX_HELD_CRAWL_BODY, USER_AGENT};
+use crate::limits::{job_mark, MARK_CRAWL, MAX_DOM_BYTES, USER_AGENT};
 use crate::url_norm::{guard_authority, origin_key, resolve, same_origin};
 use crate::{multipart, params, redact, session};
 
@@ -210,7 +212,7 @@ impl<'a> Run<'a> {
     /// and its forms.
     fn absorb(&mut self, flow: HttpFlow, page: &Url, depth: u32) {
         let digest = Digest::of(&flow);
-        self.report.flows.push(held(flow));
+        self.report.flows.push(held_copy(flow));
         let Some(digest) = digest else {
             self.failures = self.failures.saturating_add(1);
             return;
@@ -364,19 +366,6 @@ fn is_html(headers: &HeaderMap) -> bool {
             .to_ascii_lowercase();
         mime == "text/html" || mime == "application/xhtml+xml"
     })
-}
-
-/// The flow as the report keeps it: the response body cut to
-/// [`MAX_HELD_CRAWL_BODY`] so a crawl of a few hundred large pages cannot grow
-/// the job's memory without bound. The stored flow (recorded by the client) is
-/// untouched; this copy only feeds the site-map builder.
-fn held(mut flow: HttpFlow) -> HttpFlow {
-    if let Some(response) = flow.response.as_mut() {
-        if let Body::Bytes(bytes) = &mut response.body {
-            bytes.truncate(MAX_HELD_CRAWL_BODY);
-        }
-    }
-    flow
 }
 
 /// The request one form submission sends.
@@ -563,6 +552,7 @@ mod tests {
     use aitm_scan_model::{CrawlStrategy, ScanProfile, SessionMaterial, UseBrowser};
 
     use crate::crawl::frontier::limits_for;
+    use crate::limits::MAX_HELD_CRAWL_BODY;
     use crate::testutil::{site, FakeJob, JOB_ID};
     use crate::url_norm::parse_absolute;
 

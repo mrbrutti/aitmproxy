@@ -277,6 +277,9 @@ pub(crate) struct PageScript {
     /// Requests inserted into the store as captured flows when this page is
     /// reached, standing in for what the proxy would have captured.
     pub captures: Vec<HttpRequest>,
+    /// The response body every capture of this page is stored with (empty by
+    /// default; a test about held-body bounds makes it large).
+    pub capture_body: Vec<u8>,
     /// What the *live* form at an index reports when the crawler tags it
     /// (S-I2). Without an entry the double derives the answer from `html`
     /// with the real extractor, so the live form is the declared form; a test
@@ -327,8 +330,15 @@ impl PageScript {
             clickables: Vec::new(),
             forms: Vec::new(),
             captures: Vec::new(),
+            capture_body: Vec::new(),
             live_forms: HashMap::new(),
         }
+    }
+
+    /// The same page whose captures are stored with `body` as their response.
+    pub(crate) fn with_capture_body(mut self, body: Vec<u8>) -> Self {
+        self.capture_body = body;
+        self
     }
 
     /// The same page whose live form `index` reports `live` instead of what
@@ -437,7 +447,12 @@ impl FakeBrowser {
         *self.current.lock().unwrap() = landed;
         if let Some(store) = &self.store {
             for req in &page.captures {
-                store.insert(Flow::Http(captured_flow(req.clone(), 200, &[], b"")));
+                store.insert(Flow::Http(captured_flow(
+                    req.clone(),
+                    200,
+                    &[],
+                    &page.capture_body,
+                )));
             }
         }
         page.status
