@@ -567,7 +567,8 @@ impl<'a> Run<'a> {
             }
         };
 
-        let Some(landed) = self.in_scope(&outcome.final_url) else {
+        let landed = parse_absolute(&outcome.final_url).filter(|url| self.in_scope(url));
+        let Some(landed) = landed else {
             // The browser is on that page now; the next click would be a click
             // on a third party.
             self.collect();
@@ -632,7 +633,7 @@ impl<'a> Run<'a> {
             let Some(target) = crate::url_norm::resolve(&base, href) else {
                 continue;
             };
-            if self.in_scope(target.as_str()).is_none() {
+            if !self.in_scope(&target) {
                 continue;
             }
             self.frontier
@@ -852,7 +853,7 @@ impl<'a> Run<'a> {
             return Ok(Step::Continue);
         }
 
-        let Some(landed) = self.in_scope(landing) else {
+        let Some(landed) = parse_absolute(landing).filter(|url| self.in_scope(url)) else {
             tracing::info!(
                 target: "scan",
                 job = self.job.job_id(),
@@ -954,17 +955,10 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// `candidate` as a URL when it is this crawl's origin and the scope guard
-    /// still admits it, `None` otherwise.
-    fn in_scope(&self, candidate: &str) -> Option<Url> {
-        let url = parse_absolute(candidate)?;
-        if !same_origin(&url, self.origin) {
-            return None;
-        }
-        if !self.guard.in_scope(&guard_authority(&url)) {
-            return None;
-        }
-        Some(url)
+    /// Whether `url` is this crawl's origin and the scope guard still admits
+    /// it.
+    fn in_scope(&self, url: &Url) -> bool {
+        same_origin(url, self.origin) && self.guard.in_scope(&guard_authority(url))
     }
 
     /// Mark what the last action on this page captured and keep those flows
