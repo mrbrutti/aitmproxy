@@ -2370,4 +2370,33 @@ mod tests {
         let body = http_step(&poc).body.clone().expect("a body");
         assert!(!body.contains("TRUNCPW8"), "a cut JSON body leaked: {body}");
     }
+
+    /// A next-line value that only looks like a pair (a padded base64 tail, a
+    /// colon inside the value, a credential-shaped word) is masked whole under
+    /// a secret parent, and a standard pair that follows its parent keeps the
+    /// output the embedded scrub gave when this test was written. These rows
+    /// hold on any rule that reads a nested pair.
+    #[test]
+    fn scrub_embedded_keeps_the_output_it_had_for_a_value_that_looks_like_a_pair() {
+        let rows: &[(&str, &str)] = &[
+            ("token:\n  YWJj=", "token:\n  [redacted]"),
+            ("password:\n  s3cr:et", "password:\n  [redacted]"),
+            ("token:\n  AApwdBB=", "token:\n  [redacted]"),
+            ("password:\n  sid:abc", "password:\n  [redacted]"),
+            ("password:\n  user:pass", "password:\n  [redacted]"),
+            ("token:\n  dXNlcjpwYXNz", "token:\n  [redacted]"),
+            ("auth:\n  user: bob", "auth:\n  [redacted] bob"),
+            (
+                "auth:\n  creds:\n    password: hunter2",
+                "auth:\n  [redacted]\n    password: [redacted]",
+            ),
+        ];
+        assert!(rows.len() == 8, "the table changed: {} rows", rows.len());
+
+        let bad = embedded_mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "rows that differ from the pinned output (input, expected, actual): {bad:#?}"
+        );
+    }
 }
