@@ -688,6 +688,53 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| whole branch | spec | Minor | `ws.*` handles outlive the call (30 s idle reap) while D8.3 says "closed when the call ends" | accepted (T4 session, 2026-11-01): the seam exposes no end-of-call signal; same class as the hook-signal gap (call 17); hand-off to T1b, recorded as call 39 |
+| whole branch | spec | Minor | rustls/tokio-rustls/rustls-pki-types/webpki-roots/form_urlencoded/httparse/rcgen/rhai declared per-crate, not via `[workspace.dependencies]` | accepted (T4 session): T1a did not declare them and no lane track edits the root manifest; promotion is a hand-off for the next integration-shared edit |
+| whole branch | spec | Minor | unrequested public API: `TcpTransport::tls_policy`, `html_escape_min`, `WsProbeHost::point`, `REDACTED`/`EXAMPLE_CHARS`, `testing.rs` accessors | fixed in a5a8a25e, bbc18c06: `tls_policy` and `html_escape_min` made `pub(crate)`; the rest accepted (test accessors on a `#[doc(hidden)]` harness; named constants for the plan's literals) |
+| whole branch | spec | Minor | `wire.rs` re-pin landed in task 17's commit, not task 19's | accepted (T4 session): the content is the pre-authorised A23 edit; done early so the full gate could pass before review |
+| whole branch | quality | Important | `ws.dial` panics on a URL whose byte 5/6 is inside a multi-byte char (`url[..5]`) | fixed in 5cf7783b: `get(..n)` + `eq_ignore_ascii_case`; test `ws_dial_rejects_a_non_ascii_scheme_without_panicking` |
+| whole branch | quality | Important | lane point registry clones `HttpFlow`+`WsFlow` per point and is never pruned (process-lifetime leak) | fixed in a5a8a25e: registry holds `PointSpec` only, keyed per job with eviction past 16 jobs; `probe_host_for` re-reads both flows from `job.store()` and errors when gone |
+| whole branch | quality | Important | `ws.*` driver executes commands serially; a long `ws.recv` starves other handles and misreports "ws driver unavailable" | fixed in 5cf7783b: `LocalSet` + `spawn_local` per command, per-handle async mutex; test overlapping recv/send on two handles |
+| whole branch | quality | Minor | eight copies of stop/inconclusive/first-data-frame helpers and of test `host_for`; three authority derivations | fixed in a5a8a25e: `checks/common.rs`, `testing::host_for`, `dialer::request_authority` shared |
+| whole branch | quality | Minor | deadline arm, `DialError::Timeout`, `CollectEnd::Deadline` untested; `TestJob` has no deadline knob | fixed in 844720e9: `TestJob::with_deadline`, deadline tests |
+| whole branch | quality | Minor | `WsConn::send` copies the payload twice; owned returns from `response_headers`/`subprotocol` | fixed in 844720e9 |
+| whole branch | quality | Minor | `build_request` errors surface as `DialError::Handshake` | fixed in 844720e9: `DialError::Request` |
+| whole branch | quality | Minor | hygiene: stale mutate.rs note, wrong `clamp_timeout` doc, hard-coded "4", double `last_used` write | fixed in 5cf7783b, a5a8a25e |
+| whole branch | quality | Minor | live tests never drain the child's stdout after `ready`; no ready timeout; helpers duplicated | fixed in a5a8a25e: drain thread, bounded ready loop, helpers in `testing.rs` |
+| whole branch | security | Important | captured URL incl. query quoted into `DialError::Handshake` and every check's `detail` when the replay request cannot be built | fixed in 844720e9: context names scheme + authority only; test that a `?token=` path never reaches the error text |
+| whole branch | security | Important | `TlsPolicy::AcceptAny` unconditional; the `Http1Sender` parity claim was false (it verifies by default, relaxes under `ssl_insecure`); verifier skipped signature verification | fixed in 844720e9: default `Verify` for lane and language, `build_with(TlsPolicy)` for the `ssl_insecure` wiring (hand-off: `wire.rs`/`main.rs` pass `cfg.ssl_insecure`), `AcceptAnyVerifier` verifies the handshake signature with the provider, docs corrected |
+| whole branch | security | Important | dialer connects by name with no resolve-time SSRF/private-address check | fixed in 844720e9: dialer resolves with `lookup_host`, runs `aitm_core` `ssrf_check` per candidate against the guard's scope list, connects the transport to the validated `SocketAddr` |
+| whole branch | security | Important | `ws.dial` panics on a non-ASCII URL prefix (same as quality Important 1) | fixed in 5cf7783b |
+| whole branch | security | Important | received-frame volume unbounded per collect and for a script handle's life | fixed in 844720e9, 5cf7783b: per-collect byte and frame ceiling -> `CollectEnd::Limit`; the language drains `recorded` after each `recv` |
+| whole branch | security | Minor | `ws.dial` echoes the script URL (userinfo, query) into `BadArgs` | fixed in 5cf7783b: scheme + authority only |
+| whole branch | security | Minor | `InsertionPoint.url` carries the captured query string | fixed in a5a8a25e: query stripped from `url` |
+| whole branch | security | Minor | guard concurrency permit taken before the up-to-deadline wait for a dialer slot | fixed in 844720e9: slot first, then guard |
+| whole branch | tester | Important | D8.3 "a hook cannot call ws.*" not enforced (no run-kind signal in the seam) | accepted (T4 session, coordinator decision 3): T1b exposes the run kind; `WsSeamGuard::permit` has the arm; hand-off recorded |
+| whole branch | tester | Important | `profile.ws.max_frame_bytes` bounds incoming frames only; an outgoing frame of any length can be sent | fixed in 844720e9: `WsConn::send` refuses a frame longer than the dial limit; test |
+| whole branch | tester | Minor | two verdict-table deviations from D8.3 text (encoded reflection Clean; no-subprotocol upgrade Clean) recorded in the plan, not the spec | accepted (T4 session): plan calls 33/36 are the record; spec amendment listed in the hand-off |
+| whole branch | tester | Minor | one justified `expect` in `transport.rs` on a static provider capability | accepted (T4 session): mirrors `ClientConfig::builder()`; no input reaches it |
+| whole branch | tester | Minor | sweeps do not model the scheduler's `kinds` filter | accepted (T4 session): D4 is the engine's; the wider sweep strengthens the redaction grep |
+| whole branch | tester | Minor | held flows carry the replayed cookie | accepted (call 38), countersigned by the security review ("by design, D5") |
+| whole branch | tester | Info | acceptance via path B (real target binary), not the T10 cells | recorded in the PR and Shipped; path A pending T1b on main |
+| fix range | quality (re-review) | Minor | module doc still says commands travel over `std::sync::mpsc` | fixed in bbc18c06 |
+| fix range | quality (re-review) | Minor | `testing::live` (process spawner) compiled into the shipped library | fixed in bbc18c06: moved to `tests/common/live.rs` |
+| fix range | quality (re-review) | Minor | blocking `control_json` inside the async lane proof; two HTTP clients for one origin | fixed in bbc18c06: one async helper |
+| fix range | quality (re-review) | Minor | `common::connect_error`/`first_data_frame` push fix-ups back into checks | fixed in bbc18c06: `connect_error(e, probe_flows)`, `first_data_frame(&ProbeResponse)` |
+| fix range | quality (re-review) | Minor | `host_for`/`point_and_host_for` transport parameter mismatch forces casts and `.1` | fixed in bbc18c06: both take `Arc<dyn WsTransport>` |
+| fix range | quality (re-review) | Minor | same-handle contention reported as "ws driver unavailable" | fixed in bbc18c06: `try_lock` -> "websocket handle N is busy" |
+| fix range | quality (re-review) | Minor | driver start failures logged at debug, never retried | fixed in bbc18c06: `warn!` + sender cleared so the next dial retries |
+| fix range | quality (re-review) | Minor | concurrency test discards thread A's result | fixed in bbc18c06 |
+| fix range | quality (re-review) | Minor | hygiene: catalog strings hard-code 4/30000, `host_err` unused in one test, fixture wrappers, `send` Close arm tail, `TestJob::named` duplication | fixed in bbc18c06 |
+| fix range | security (re-review) | Important | S9: a non-ASCII captured header value reaches `DialError::Handshake` (and every `detail`) through tungstenite's `generate_request` error text | fixed in bbc18c06: third-party error text never passed through (fixed sentence / `DialError::Request` naming the header); both `build_request`s require visible-ASCII values; fixture gains a non-ASCII cookie so the redaction sweep covers it |
+| fix range | security (re-review) | Minor | `testing::live` process-spawning harness compiled into the library | fixed in bbc18c06: moved to `tests/common/live.rs` (same as quality N2) |
+| fix range | quality (re-review 2, `a5a8a25e..bbc18c06`) | Important | the N7 fix hands the driver thread a strong `Arc` to the slot holding its own sender, so the command channel never disconnects and the driver outlives the language | fixed in FIX3SHA: the thread holds a `Weak`; test `the_driver_ends_when_the_language_drops` |
+| fix range | quality (re-review 2) | Minor | visible-ASCII header rule written twice (dialer and language) | fixed in FIX3SHA: `dialer::visible_ascii_header_value` shared |
+| fix range | quality (re-review 2) | Minor | `auth_bypass` files the baseline flow under `probe_flows` on a connect error | fixed in FIX3SHA: `baseline_flow` via struct update, `probe_flows` empty |
+| fix range | quality (re-review 2) | Minor | `live_language.rs` blocks the tokio test runtime on `engine.eval` | fixed in FIX3SHA: evals under `spawn_blocking` |
+| fix range | quality (re-review 2) | Minor | `WsConn::unrecorded` is test-only while its counter is shipped | fixed in FIX3SHA: `pub(crate)` accessor, host logs the truncation count at debug |
+| fix range | security (re-review 2, `a5a8a25e..bbc18c06`) | - | PASS: S9 and the Minor fixed; no new finding (observation for follow-ups: tungstenite's own `trace!` logs the full upgrade head under its target) | recorded |
+| fix range | spec (re-review, `80fd0816..a5a8a25e`) | Important | plan not amended for the fix round (TLS default, transport/registry/driver signatures, `checks/common.rs` ownership, call 35 premise) | fixed in b3caedf8 (calls 39-46, ownership rows) |
+| fix range | spec (re-review) | Minor | `with_ssrf`/`take_recorded`/`unrecorded`/`request_authority` public; `testing::live` in the library | fixed in bbc18c06: `request_authority`, `take_recorded`, `unrecorded` `pub(crate)`; live harness in `tests/common/live.rs`; `with_ssrf`, `build_with` kept `pub` as hand-off seams |
 
 ## Shipped
 
