@@ -52,7 +52,7 @@ use crate::{multipart, redact, xml};
 /// `content-type` is excluded by plan call A8 because changing it changes which
 /// kind the body parses to. Any name starting with `:` is an HTTP/2 pseudo
 /// header and is excluded too.
-const EXCLUDED_HEADERS: [&str; 11] = [
+const EXCLUDED_HEADERS: [&str; 12] = [
     "host",
     "content-length",
     "transfer-encoding",
@@ -64,6 +64,7 @@ const EXCLUDED_HEADERS: [&str; 11] = [
     "te",
     "trailer",
     "upgrade",
+    "expect",
 ];
 
 /// [`PointTrait`]'s declaration order, so two points with the same traits always
@@ -931,6 +932,33 @@ mod tests {
                 session: None,
             },
         )
+    }
+
+    /// `Expect` is a framing header (plan Task 10 lists it): mutating it changes
+    /// the request's shape, not the application's input, so it is never a point
+    /// (Sp1).
+    #[test]
+    fn expect_header_is_not_a_point() {
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[("Expect", "100-continue"), ("X-Client", "abc")],
+                None,
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions::from_profile(&profile, &ignore, None),
+        );
+
+        assert!(!has_named(&out, Header, "Expect"));
+        assert!(has_named(&out, Header, "X-Client"));
     }
 
     #[test]
