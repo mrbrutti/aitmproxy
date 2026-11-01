@@ -227,8 +227,8 @@ impl ProtocolLanguage for L4Language {
         for (verb, gate) in VERBS {
             let live = self.live.clone();
             let verb_name = (*verb).to_string();
-            let f: HostFn = Box::new(move |_ctx: &HostCallCtx, args: &[Value]| {
-                host_fn(&live, &verb_name, args)
+            let f: HostFn = Box::new(move |ctx: &HostCallCtx, args: &[Value]| {
+                host_fn(&live, &verb_name, ctx, args)
             });
             let guard = L4SeamGuard {
                 gates: self.live.guard.agent_gates(),
@@ -327,8 +327,15 @@ fn agent_gate_check(
 
 /// Dispatch a `l4.<verb>(...)` Rhai call (arguments already marshalled to
 /// [`Value`]) to the shared verb logic. The agent gate already ran in
-/// [`L4SeamGuard::permit`]; the `L4Guard` scope check runs inside the verb.
-fn host_fn(live: &L4Live, verb: &str, args: &[Value]) -> Result<Value, HostError> {
+/// [`L4SeamGuard::permit`]; the `L4Guard` scope check runs inside the verb. `ctx`
+/// carries the live caller trust, which `flow.get` reads to decide whether this
+/// caller sees packet bytes (spec §2.2).
+fn host_fn(
+    live: &L4Live,
+    verb: &str,
+    ctx: &HostCallCtx,
+    args: &[Value],
+) -> Result<Value, HostError> {
     match verb {
         "interfaces" => Ok(do_interfaces()),
         "craft" => {
@@ -347,7 +354,11 @@ fn host_fn(live: &L4Live, verb: &str, args: &[Value]) -> Result<Value, HostError
         "flow.list" => Ok(do_flow_list(live)),
         "flow.get" => {
             let id = str_arg(args.first(), "id")?;
-            do_flow_get(live, &id)
+            let with_bytes = crate::commands::flow::bytes_visible(
+                ctx.caller().is_trusted_control(),
+                &live.guard.agent_gates(),
+            );
+            do_flow_get(live, &id, with_bytes)
         }
         "inject" => {
             let spec = parse_spec_arg(args.first())?;
@@ -497,8 +508,9 @@ fn do_flow_list(live: &L4Live) -> Value {
     )
 }
 
-/// `l4.flow.get` — a summary of one stored L4 flow.
-fn do_flow_get(live: &L4Live, id: &str) -> Result<Value, HostError> {
+/// `l4.flow.get` — a summary of one stored L4 flow; packet `bytes` only when
+/// `with_bytes` (the §2.2 rule, decided by the caller from its `HostCallCtx`).
+fn do_flow_get(live: &L4Live, id: &str, with_bytes: bool) -> Result<Value, HostError> {
     let id = crate::commands::flow_id_from_str(id).map_err(bad)?;
     let flow = live
         .store
@@ -507,6 +519,7 @@ fn do_flow_get(live: &L4Live, id: &str) -> Result<Value, HostError> {
     Ok(crate::commands::flow::flow_to_value(
         &flow,
         crate::commands::flow::PacketWindow::default(),
+        with_bytes,
     ))
 }
 
@@ -1459,5 +1472,91 @@ mod tests {
         let body: serde_yaml::Value =
             serde_yaml::from_str("op: craft\ninterface: en0").expect("the step parses");
         assert_eq!(step_interface(&body), "en0");
+    }
+
+    // ---- L4PAR-AC35: the Rhai `l4.flow.get` applies the bytes rule -----------
+
+    /// A tag-less call source for building a [`HostCallCtx`] in a test.
+    struct NoSource;
+    impl aitm_plugin::language::HostCallContextSource for NoSource {
+        fn tag(&self) -> Option<Value> {
+            None
+        }
+        fn call_source(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// The first packet object of a `l4.flow.get` reply made through the Rhai
+    /// dispatch as `caller`.
+    fn rhai_flow_get_packet(
+        live: &L4Live,
+        caller: aitm_core::CallerTrust,
+        id: &str,
+    ) -> BTreeMap<String, Value> {
+        let src = NoSource;
+        let ctx = HostCallCtx::new(caller, &src);
+        let got =
+            host_fn(live, "flow.get", &ctx, &[Value::Str(id.to_string())]).expect("flow.get ok");
+        let Value::Object(flow) = got else {
+            panic!("flow.get returns an object, got {got:?}");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array: {flow:?}");
+        };
+        let Some(Value::Object(packet)) = packets.first() else {
+            panic!("one packet object: {packets:?}");
+        };
+        packet.clone()
+    }
+
+    /// L4PAR-AC35 (spec §2.2) — the Rhai face follows the command path: an agent
+    /// caller with the Capture gate closed gets no `bytes`; an operator does; an
+    /// agent with the gate open does.
+    #[test]
+    fn rhai_flow_get_bytes_only_for_trusted_or_capture_gate() {
+        use crate::flow::{L4Bind, L4Meta, L4Packet};
+        use aitm_core::CallerTrust;
+
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let bytes = vec![0xde, 0xad];
+        let id = store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind: L4FlowKind::Capture,
+            bind: L4Bind {
+                interface: "lo0".into(),
+                filter: None,
+                queue: None,
+            },
+            packets: std::collections::VecDeque::from(vec![L4Packet {
+                dir: L4Direction::Inbound,
+                timestamp: std::time::SystemTime::now(),
+                decoded: PacketSpec::summarize(&bytes),
+                bytes: bytes.clone(),
+                injected: false,
+            }]),
+            metadata: L4Meta::default(),
+        });
+        let id = crate::commands::flow_id_to_string(id);
+        let live = L4Live {
+            guard: Arc::new(L4Guard::new(&L4Config::default())),
+            backend: Arc::new(PcapBackend::new()),
+            store,
+        };
+        assert!(!live.guard.agent_gates().allowed(AgentGate::Capture));
+
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &id);
+        assert_eq!(packet.get("length"), Some(&Value::Int(2)));
+        assert!(
+            !packet.contains_key("bytes"),
+            "a Rhai agent caller with the Capture gate closed gets no `bytes`, got {packet:?}"
+        );
+
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Operator, &id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(bytes.clone())));
+
+        live.guard.agent_gates().set(AgentGate::Capture, true);
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(bytes)));
     }
 }

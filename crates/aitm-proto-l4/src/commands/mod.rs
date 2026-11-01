@@ -373,6 +373,9 @@ pub(crate) fn active_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
 ) -> Vec<Arc<dyn Command>> {
+    // `l4.flow.get` reads the shared agent gates at invoke time: packet bytes reach
+    // an agent only while its Capture gate is open (spec §2.2).
+    let gates = guard.agent_gates();
     vec![
         Arc::new(L4Interfaces),
         // `ScopeAdd` is thin: the widen gate (reading the shared gates) and the forced
@@ -381,7 +384,7 @@ pub(crate) fn active_commands(
         Arc::new(ScopeRemove::new(guard.clone())),
         Arc::new(ScopeList::new(guard)),
         Arc::new(FlowList::new(store.clone())),
-        Arc::new(FlowGet::new(store)),
+        Arc::new(FlowGet::new(store, gates)),
         Arc::new(Craft),
     ]
 }

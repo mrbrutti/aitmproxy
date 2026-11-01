@@ -15,6 +15,7 @@ use aitm_core::{
 
 use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Flow, L4FlowStore};
+use crate::gates::{AgentGate, L4AgentGates};
 
 /// How many packets `l4.flow.get` returns when the caller gives no `limit`.
 pub(crate) const FLOW_GET_DEFAULT_LIMIT: usize = 256;
@@ -105,15 +106,30 @@ impl Command for FlowList {
 }
 
 /// `l4.flow.get {id}` → a summary of one L4 flow and its packets.
+///
+/// Packet `bytes` reach only a trusted-control caller (operator, CLI) or an agent
+/// whose Capture gate is open (spec §2.2, L4PAR-AC35): an agent that could not
+/// capture the bytes itself must not read them, and in particular must not read
+/// the bus-token line off a loopback capture. Every other packet field is
+/// reported to every caller.
 pub struct FlowGet {
     store: Arc<dyn L4FlowStore>,
+    gates: Arc<L4AgentGates>,
 }
 
 impl FlowGet {
-    /// A command over the shared flow store.
-    pub fn new(store: Arc<dyn L4FlowStore>) -> Self {
-        Self { store }
+    /// A command over the shared flow store, reading the shared agent gates to
+    /// decide whether this caller sees packet bytes.
+    pub fn new(store: Arc<dyn L4FlowStore>, gates: Arc<L4AgentGates>) -> Self {
+        Self { store, gates }
     }
+}
+
+/// Whether a caller sees packet `bytes` (spec §2.2): trusted control always, an
+/// agent only while the Capture gate is open. Shared by the command path and the
+/// Rhai `l4.flow.get`, so the two faces cannot drift.
+pub(crate) fn bytes_visible(caller_is_trusted_control: bool, gates: &L4AgentGates) -> bool {
+    caller_is_trusted_control || gates.allowed(AgentGate::Capture)
 }
 
 impl Command for FlowGet {
@@ -158,7 +174,7 @@ impl Command for FlowGet {
         }
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let id_str = args.get_str("id")?;
         let id = super::flow_id_from_str(id_str)?;
         let window = PacketWindow::from_params(&args)?;
@@ -166,7 +182,8 @@ impl Command for FlowGet {
             .store
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no L4 flow with id {id_str}"))?;
-        Ok(flow_to_value(&flow, window))
+        let with_bytes = bytes_visible(host.caller_is_trusted_control(), &self.gates);
+        Ok(flow_to_value(&flow, window, with_bytes))
     }
 }
 
@@ -273,8 +290,9 @@ fn flow_fields() -> Vec<ParamDef> {
                 field(
                     "bytes",
                     TypeDesc::Bytes,
-                    true,
-                    "The on-wire bytes (base64 over MCP).",
+                    false,
+                    "The on-wire bytes (base64 over MCP). Present for the operator, the CLI, \
+                     or an agent whose Capture gate is open; absent otherwise.",
                 ),
                 field(
                     "timestamp",
@@ -356,7 +374,8 @@ fn insert_endpoints(o: &mut BTreeMap<String, Value>, e: &PacketEndpoints) {
 /// An [`L4Flow`] as a transport-neutral object carrying the `window` slice of
 /// its packet log. `packet_count`, `injected_count` and the flow-level endpoints
 /// are over the whole log, so a `limit: 0` read still names the flow's target.
-pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow) -> Value {
+/// Each packet carries `bytes` only when `with_bytes` (see [`bytes_visible`]).
+pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow, with_bytes: bool) -> Value {
     use crate::flow::L4FlowKind;
     use crate::types::L4Direction;
 
@@ -394,7 +413,9 @@ pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow) -> Value {
                 "layers".to_string(),
                 Value::Array(p.decoded.layers.iter().cloned().map(Value::Str).collect()),
             );
-            o.insert("bytes".to_string(), Value::Bytes(p.bytes.clone()));
+            if with_bytes {
+                o.insert("bytes".to_string(), Value::Bytes(p.bytes.clone()));
+            }
             o.insert("timestamp".to_string(), Value::Int(epoch_ms(p.timestamp)));
             insert_endpoints(&mut o, &endpoints);
             Value::Object(o)
@@ -443,12 +464,15 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use aitm_core::{CommandHost, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+    use aitm_core::{
+        CommandHost, Frontend, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard,
+    };
     use futures::future::BoxFuture;
 
     use super::*;
     use crate::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
     use crate::flow::{InMemoryL4FlowStore, L4Bind, L4FlowId, L4FlowKind, L4Meta, L4Packet};
+    use crate::gates::{AgentGate, L4AgentGates};
     use crate::types::L4Direction;
 
     /// The l4 commands never reissue HTTP; the core host still requires a client.
@@ -516,8 +540,13 @@ mod tests {
         (store, super::super::flow_id_to_string(id))
     }
 
-    /// Invoke `l4.flow.get {id}` over `store` and return the flow object and its
-    /// first packet object.
+    /// The deny-by-default agent gates (every `l4.allow_agent_*` false).
+    fn closed_gates() -> Arc<L4AgentGates> {
+        L4AgentGates::from_config(&crate::config::L4Config::default())
+    }
+
+    /// Invoke `l4.flow.get {id}` over `store` as the operator and return the flow
+    /// object and its first packet object.
     fn get(
         store: Arc<dyn L4FlowStore>,
         id: &str,
@@ -525,10 +554,10 @@ mod tests {
         let mem = MemFlowStore::new();
         let client = StubClient;
         let core = StdGuard::default();
-        let host = CommandHost::new(&mem, &client, &core, None);
+        let host = CommandHost::new(&mem, &client, &core, None).with_frontend(Frontend::Operator);
         let mut m = BTreeMap::new();
         m.insert("id".to_string(), Value::Str(id.to_string()));
-        let got = FlowGet::new(store)
+        let got = FlowGet::new(store, closed_gates())
             .invoke(Params::new(m), &host)
             .expect("flow.get ok");
         let Value::Object(flow) = got else {
@@ -621,7 +650,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("packet field `{n}` in the schema"))
         };
         assert!(matches!(pk("bytes").ty, TypeDesc::Bytes), "bytes is Bytes");
-        assert!(pk("bytes").required);
+        assert!(!pk("bytes").required, "bytes is optional (spec §2.2)");
         assert!(
             matches!(pk("timestamp").ty, TypeDesc::Int),
             "timestamp is Int"
@@ -674,8 +703,8 @@ mod tests {
         (store, super::super::flow_id_to_string(id))
     }
 
-    /// Invoke `l4.flow.get` with `id` plus the given extra params, the way a bus
-    /// caller does, returning the raw command result.
+    /// Invoke `l4.flow.get` with `id` plus the given extra params, the way an
+    /// operator bus caller does, returning the raw command result.
     fn get_window(
         store: Arc<dyn L4FlowStore>,
         id: &str,
@@ -684,13 +713,13 @@ mod tests {
         let mem = MemFlowStore::new();
         let client = StubClient;
         let core = StdGuard::default();
-        let host = CommandHost::new(&mem, &client, &core, None);
+        let host = CommandHost::new(&mem, &client, &core, None).with_frontend(Frontend::Operator);
         let mut m = BTreeMap::new();
         m.insert("id".to_string(), Value::Str(id.to_string()));
         for (k, v) in extra {
             m.insert((*k).to_string(), Value::Int(*v));
         }
-        FlowGet::new(store).invoke(Params::new(m), &host)
+        FlowGet::new(store, closed_gates()).invoke(Params::new(m), &host)
     }
 
     /// The flow object and the number of packets it carries.
@@ -841,7 +870,7 @@ mod tests {
     #[test]
     fn window_schema_params_are_id_offset_limit() {
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let schema = FlowGet::new(store).schema();
+        let schema = FlowGet::new(store, closed_gates()).schema();
         let names: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["id", "offset", "limit"]);
         let by = |n: &str| schema.params.iter().find(|p| p.name == n).expect(n);
@@ -858,6 +887,133 @@ mod tests {
                 .iter()
                 .any(|f| f.name == "offset" && matches!(f.ty, TypeDesc::Int)),
             "the reply schema lists `offset`"
+        );
+    }
+
+    // ---- L4PAR-AC35: bytes only to trusted callers ---------------------------
+
+    /// A TCP packet 127.0.0.1:51000 → 127.0.0.1:27431 (the bus port): the payload
+    /// an agent must never read off a loopback capture.
+    fn bus_bound_tcp() -> Vec<u8> {
+        use crate::craft::TcpSpec;
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(51000),
+                    dst_port: Some(27431),
+                    ..TcpSpec::default()
+                }),
+                Layer::Raw(b"Authorization: Bearer secret-token".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds")
+    }
+
+    /// Invoke `l4.flow.get {id}` as `frontend` over `store` with the given gates,
+    /// returning the first packet object.
+    fn get_as(
+        store: Arc<dyn L4FlowStore>,
+        gates: Arc<L4AgentGates>,
+        frontend: Frontend,
+        id: &str,
+    ) -> BTreeMap<String, Value> {
+        let mem = MemFlowStore::new();
+        let client = StubClient;
+        let core = StdGuard::default();
+        let host = CommandHost::new(&mem, &client, &core, None).with_frontend(frontend);
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Str(id.to_string()));
+        let got = FlowGet::new(store, gates)
+            .invoke(Params::new(m), &host)
+            .expect("flow.get ok");
+        let Value::Object(flow) = got else {
+            panic!("l4.flow.get returns an object, got {got:?}");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array: {flow:?}");
+        };
+        let Some(Value::Object(packet)) = packets.first() else {
+            panic!("one packet object: {packets:?}");
+        };
+        packet.clone()
+    }
+
+    /// L4PAR-AC35 — an agent (`Frontend::Mcp`) with the Capture gate closed gets
+    /// every other §2 field but no `bytes` key; opening the gate reveals `bytes`;
+    /// the operator always gets `bytes`; and an agent reading a flow whose packets
+    /// carry the bus port gets no bytes.
+    #[test]
+    fn flow_get_bytes_only_for_trusted_or_capture_gate() {
+        let (store, id) = one_packet_flow(vec![0xde, 0xad]);
+        let gates = closed_gates();
+        assert!(!gates.allowed(AgentGate::Capture), "gates start closed");
+
+        // Agent, gate closed: headers, addresses and length, no `bytes` key.
+        let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
+        assert_eq!(packet.get("length"), Some(&Value::Int(2)));
+        assert_eq!(
+            packet.get("timestamp"),
+            Some(&Value::Int(1_700_000_000_123))
+        );
+        assert_eq!(packet.get("dir"), Some(&Value::Str("inbound".into())));
+        for key in ["proto", "src", "dst", "src_port", "dst_port"] {
+            assert_eq!(packet.get(key), Some(&Value::Null), "packet.{key}");
+        }
+        assert!(
+            !packet.contains_key("bytes"),
+            "an agent with the Capture gate closed must get no `bytes`, got {packet:?}"
+        );
+
+        // Agent, Capture gate open: the bytes it could capture itself.
+        gates.set(AgentGate::Capture, true);
+        let packet = get_as(store.clone(), gates.clone(), Frontend::Mcp, &id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(vec![0xde, 0xad])));
+
+        // Operator, gates closed: always bytes.
+        gates.set(AgentGate::Capture, false);
+        let packet = get_as(store, gates.clone(), Frontend::Operator, &id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(vec![0xde, 0xad])));
+
+        // The bus-token line: a TCP packet to port 27431, read as an agent.
+        let bytes = bus_bound_tcp();
+        let (store, id) = one_packet_flow(bytes.clone());
+        let packet = get_as(store, gates, Frontend::Mcp, &id);
+        assert_eq!(packet.get("proto"), Some(&Value::Str("TCP".into())));
+        assert_eq!(packet.get("src_port"), Some(&Value::Int(51000)));
+        assert_eq!(packet.get("dst_port"), Some(&Value::Int(27431)));
+        assert_eq!(packet.get("length"), Some(&Value::Int(bytes.len() as i64)));
+        assert!(
+            !packet.contains_key("bytes"),
+            "an agent must not read the bus-bound payload, got {packet:?}"
+        );
+    }
+
+    /// L4PAR-AC35 — the schema says `bytes` is optional and why.
+    #[test]
+    fn flow_get_schema_bytes_is_optional_for_agents() {
+        let fields = flow_fields();
+        let packets = fields
+            .iter()
+            .find(|f| f.name == "packets")
+            .expect("packets field");
+        let TypeDesc::Array(inner) = &packets.ty else {
+            panic!("packets is an array");
+        };
+        let TypeDesc::Object(pf) = inner.as_ref() else {
+            panic!("packets holds objects");
+        };
+        let bytes = pf.iter().find(|f| f.name == "bytes").expect("bytes field");
+        assert!(!bytes.required, "bytes is optional on the wire");
+        assert!(
+            bytes.description.contains("Capture gate"),
+            "the description names the Capture gate, got {}",
+            bytes.description
         );
     }
 }

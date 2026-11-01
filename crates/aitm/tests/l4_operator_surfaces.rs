@@ -461,3 +461,92 @@ fn flow_get_bytes_are_base64_on_the_wire() {
         );
     }
 }
+
+/// L4PAR-AC35 — over the real MCP server, an agent (`Frontend::Mcp`) `l4.flow.get`
+/// with the Capture gate closed (the default) returns the packet's headers, length
+/// and time but **no `bytes`** key; the same flow read as the operator carries them.
+/// An agent must not read the bus-token line off a loopback capture by default.
+#[test]
+fn agent_flow_get_has_no_bytes() {
+    use std::collections::VecDeque;
+    use std::time::SystemTime;
+
+    use aitm_proto_l4::craft::PacketSpec;
+    use aitm_proto_l4::flow::{
+        InMemoryL4FlowStore, L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet,
+    };
+    use aitm_proto_l4::guard::L4Guard;
+
+    let cfg = l4_cfg();
+    assert!(!cfg.allow_agent_capture, "the Capture gate starts closed");
+    let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+    let module = L4Module::with_shared(
+        Arc::new(L4Guard::new(&cfg)),
+        store.clone(),
+        None,
+        L4Privilege::available(),
+    );
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(module));
+    let srv = McpServer::new(Arc::new(reg), McpTransport::Stdio).with_services(
+        Arc::new(MemFlowStore::new()),
+        Arc::new(StubClient),
+        Arc::new(StdGuard::default()),
+        None,
+    );
+
+    let bytes = vec![0xde, 0xad];
+    let id = store.insert(L4Flow {
+        id: L4FlowId::new(),
+        kind: L4FlowKind::Capture,
+        bind: L4Bind {
+            interface: "lo0".into(),
+            filter: None,
+            queue: None,
+        },
+        packets: VecDeque::from(vec![L4Packet {
+            dir: L4Direction::Inbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&bytes),
+            bytes,
+            injected: false,
+        }]),
+        metadata: L4Meta::default(),
+    });
+    let id_str = serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .expect("L4FlowId serialises as a string");
+
+    let flow = call(&srv, Frontend::Mcp, "l4.flow.get", json!({"id": id_str}));
+    assert!(!is_error(&flow), "agent flow.get failed: {}", text(&flow));
+    let packet = flow["structuredContent"]["packets"][0]
+        .as_object()
+        .expect("packets[0] is an object");
+    assert!(
+        !packet.contains_key("bytes"),
+        "an agent with the Capture gate closed must get no `bytes`, got {}",
+        flow["structuredContent"]
+    );
+    assert_eq!(packet["length"], json!(2));
+    assert_eq!(packet["dir"], json!("inbound"));
+    assert!(packet["timestamp"].is_i64(), "timestamp present");
+    assert!(packet.contains_key("proto"), "proto present (null here)");
+
+    // The operator reading the same flow still gets the bytes.
+    let flow = call(
+        &srv,
+        Frontend::Operator,
+        "l4.flow.get",
+        json!({"id": id_str}),
+    );
+    assert!(
+        !is_error(&flow),
+        "operator flow.get failed: {}",
+        text(&flow)
+    );
+    assert_eq!(
+        flow["structuredContent"]["packets"][0]["bytes"],
+        json!("3q0=")
+    );
+}
