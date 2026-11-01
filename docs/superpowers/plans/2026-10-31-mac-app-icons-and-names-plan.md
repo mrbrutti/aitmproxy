@@ -690,6 +690,16 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | docs #242 | quality | Minor | this plan's `subItem(… mark: Monogram(text: "◎"))` vs the declared `@ViewBuilder mark: () -> Mark` | fixed in 644b9c90: `mark: { Monogram(text: "◎") }` in Task 5 and spec D5 |
 | docs #242 | quality | Minor | research 22 line citations drifted | fixed in 644b9c90 (research 22: proxy.rs:360, build.sh:241) |
 | docs #242 | quality | Minor | Swift gate scratch paths differ between spec ACs and plans | fixed in 644b9c90: this spec's AI-AC23 = this plan's `test-build-icons`; traffic-route TR-AC9 = `test-build-routes` |
+| docs #242 | spec (2nd pass) | Important | gate 2's PR #246 bullet contradicted gate 5 (`init?(compact:listenAddress:)` ships in #246) | fixed in 2ce11b30 |
+| docs #242 | spec (2nd pass) | Minor | gate 5 head/test count stale (c8ed92f4 / 31 tests); Review-log rows lacked the fix SHA | fixed in 2ce11b30 |
+| docs #242 | spec (2nd pass) | Minor | residual: PR #246's two listen-address vectors (bare IPv6 literal without brackets → nil; `:::8080` → nil, the core prints `[::]:8080`) missing from TR-AC2 | fixed in (this pass): both literals added to TR-AC2 |
+| docs #242 | quality (2nd pass) | Important | PR D's API mis-cited against `CATrustFacts.swift` 4ae616d3: the line helper is `text` (PR D's `state` is a `LaneState`); `needsAdmin` → `actions == [.openCAPanel]` and step action `.openCAPanel`; the string is `"CA trusted (System keychain)"`; the needs-admin line is `text`, not `remedy`; `platform: String` has no default | fixed in (this pass) in the traffic-route spec/plan quote PR D verbatim (`line` = `text`; needs-admin `[.openCAPanel]`; capital S; `platform: "macos"` in every test value; an open CA entry stores `actions = []`) |
+| docs #242 | quality (2nd pass) | Minor | hand-over position unstated (PR D inserts the CA step after `busConnected`; ours sits after `scopeSet`); PR D's nil-facts rows (`unknownStep()` / `notGeneratedStep()`) undecided | fixed in (this pass): D4 and Task 2b state the move; the nil-facts rows are dropped from the list (Architect's call, open question 21 — `make` reads `Session.caTrust` alone; the first-run sheet and CA page keep them) |
+| docs #242 | quality (2nd pass) | Minor | Amendments-log preamble named only four superseded items | fixed in (this pass): the preamble names every superseded item (predicate names, `— set …` suffix, period handling, `… — add one`, start SHA `8175eea3`, `Open Network Settings…` as a button, our own `CATrustFacts.remedy` contract) |
+| docs #242 | quality (2nd pass) | Minor | Goal "the same actions" vs the All Apps route `[.openCaptureSettings]` and step `.turnCaptureOn` | fixed in (this pass): "the same lines; each step keeps its existing action" |
+| docs #242 | quality (2nd pass) | Minor | D6 "~2 s effective" (the poll is 500 ms, `refreshProxyStatus()` every tick) | fixed in (this pass): dropped, cadence stated as the 500 ms tick |
+| docs #242 | quality (2nd pass) | Minor | icons spec AI-AC11 `Overview(rows:).clients` — the type is `OverviewStats` | fixed in (this pass) |
+| docs #242 | quality (2nd pass) | Minor | `flowTable` overlay anchor "~258"/"~261" | fixed in (this pass): `ShellView.swift:258` in spec D7 and plan Task 3 |
 
 ## Shipped
 
