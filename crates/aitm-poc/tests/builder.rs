@@ -822,3 +822,87 @@ fn build_drops_credential_in_duplicate_json_key() {
         serde_json::json!("ok")
     );
 }
+
+/// A credential nested under a secret parent (`auth:`, a line break, then `password: v`) is
+/// masked on every surface the builder scrubs: the url, a JSON body (an object value and an
+/// array element), a form body and a text body. Each surface is its own flow, and the canary
+/// of each is absent from the serialized PoC.
+#[test]
+fn build_masks_a_credential_nested_under_a_secret_parent_on_every_surface() {
+    let body_of = |poc: &aitm_poc::Poc| http_step(poc).body.clone().expect("a body");
+
+    // url: the path carries a real line break.
+    let poc = StdPocBuilder
+        .build(
+            &flow_with("/go?q=hello&note=auth:\n  password: URLPW1", Body::Empty),
+            basic_spec(),
+        )
+        .expect("build");
+    assert_eq!(
+        http_step(&poc).url,
+        "{{target}}/go?{{param}}=hello&note=auth:\n  [redacted] [redacted]"
+    );
+    assert!(
+        !serde_json::to_string(&poc).unwrap().contains("URLPW1"),
+        "url canary leaked"
+    );
+
+    // JSON: the escapes are JSON text, decoded by the parse.
+    let json_body =
+        r#"{"note":"auth:\n  password: JSONPW2","list":["credentials:\r\n\tsecret: JSONSEC9"]}"#;
+    let poc = StdPocBuilder
+        .build(
+            &flow_with("/x", Body::Bytes(json_body.as_bytes().to_vec())),
+            basic_spec(),
+        )
+        .expect("build");
+    let out = body_of(&poc);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("not valid JSON: {e}: {out}"));
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "note": "auth:\n  [redacted] [redacted]",
+            "list": ["credentials:\r\n\t[redacted] [redacted]"]
+        }),
+        "json body: {out}"
+    );
+    let serialized = serde_json::to_string(&poc).unwrap();
+    assert!(
+        !serialized.contains("JSONPW2") && !serialized.contains("JSONSEC9"),
+        "json canary leaked"
+    );
+
+    // form
+    let poc = StdPocBuilder
+        .build(
+            &flow_with(
+                "/x",
+                Body::Bytes(b"note=auth:\n  password: FORMPW3&page=2".to_vec()),
+            ),
+            basic_spec(),
+        )
+        .expect("build");
+    assert_eq!(
+        body_of(&poc),
+        "note=auth:\n  [redacted] [redacted]&page=2",
+        "form body"
+    );
+    assert!(
+        !serde_json::to_string(&poc).unwrap().contains("FORMPW3"),
+        "form canary leaked"
+    );
+
+    // text
+    let poc = StdPocBuilder
+        .build(
+            &flow_with("/x", Body::Bytes(b"auth:\n  password: RAWPW4".to_vec())),
+            basic_spec(),
+        )
+        .expect("build");
+    assert_eq!(body_of(&poc), "auth:\n  [redacted] [redacted]", "text body");
+    assert!(
+        !serde_json::to_string(&poc).unwrap().contains("RAWPW4"),
+        "text canary leaked"
+    );
+}
