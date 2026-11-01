@@ -201,6 +201,23 @@ Option<SocketAddr>` arrive with T1b):**
 Until the merge, F3 implements the `budget_left() >= streams` pre-check (SEC-C2) and
 the normalised profile-origin match (C6/SEC-C3) as the interim.
 
+
+**Amendment A6 (T3 session, 2026-11-01, from the Rhai drafts).** Task 15's four
+origin-level scripts (`cors`, `headers`, `methods`, `paths`) declare `kinds: ["query"]`
+(the point is only the carrier) and `scope: "origin"` (T1b's `CheckMeta.scope`), with the
+coordinator-pinned classes `cors`, `missing-security-headers`, `risky-http-methods`,
+`exposed-path`; the plan's `security-headers`/`http-methods`/`sensitive-paths` tokens and
+the five-kind list are superseded. `nosqli`/`ldapi`/`nosqli-json` declare
+`technique: "boolean"` (the differential is the general detector; the error signature is
+the refinement, stated in prose). `header-reflection` matches a verbatim marker in an
+HTML body only (a non-HTML echo is Clean); the response-header arm is a follow-up.
+`methods` returns `inconclusive` when OPTIONS carries no `Allow`. `paths` lists every
+exposed path in `evidence.matched` with the count in `detail` until the bridge's
+multi-verdict form (`Verdict.more` + `location`, T1b) lands, then returns one verdict per
+path. Probe-less `headers` carries `evidence.payload = "GET <url>"`. Drafts live under
+`/tmp/claude/t3-rhai/` (harness `tests/support/mod.rs`, tests `tests/rhai_checks.rs`, 15
+scripts under `active/`), 23 harness tests green; Task 11 moves them in.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
