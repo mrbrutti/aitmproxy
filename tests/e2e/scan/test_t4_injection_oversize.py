@@ -136,9 +136,9 @@ def main() -> int:
                   f"one lane in-frame per WS point has len == 2*{v_max} == {2 * v_max} "
                   f"({len(oversize)} of {len(lane_in)} lane frames; {n_points} point(s))")
             v_oversize_issues = [i for i in v_issues if i.get("check_id") == WS_OVERSIZE_CHECK_ID]
-            check(len(v_oversize_issues) <= 1,
-                  f"{WS_OVERSIZE_CHECK_ID} contributes at most one issue per job "
-                  f"({len(v_oversize_issues)})")
+            check(1 <= len(v_oversize_issues) <= n_points,
+                  f"{WS_OVERSIZE_CHECK_ID} contributes at most one issue per WS point "
+                  f"({len(v_oversize_issues)} issue(s), {n_points} point(s))")
 
             section("P: HTML-escaped, so no ws-input-reflection")
             p_cookie = login(f"http://{p.authority}")
