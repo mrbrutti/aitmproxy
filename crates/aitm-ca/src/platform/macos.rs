@@ -1,16 +1,16 @@
-//! macOS: `security find-certificate` / `add-trusted-cert` /
+//! macOS: `security find-certificate` / `verify-cert` / `add-trusted-cert` /
 //! `remove-trusted-cert` / `delete-certificate` against the login and System
 //! keychains.
 //!
-//! Presence is what `find-certificate -a -Z` prints; trust settings are not
-//! verified (`verify-cert` and `dump-trust-settings` were inconclusive in
-//! research 07 §3.1 — `verify-cert` exited 1 for both a trusted Apple root and
-//! an untrusted self-signed CA, so its result is not a trust signal), so
-//! `trusted` is always `Unknown` here. Rather than leave that `Unknown`
-//! unexplained (audit minor e), a `status` that finds the certificate *present*
-//! says so in `detail`: present but trust UNCONFIRMED, with the one reliable way
-//! to confirm it (Keychain Access). Every mutation is check-first, which keeps
-//! the design independent of what a duplicate `add-trusted-cert` does.
+//! Presence is what `find-certificate -a -Z` prints. Trust is one
+//! `verify-cert -l -L -p basic` evaluation, run only when the certificate is
+//! present (spec D17.3). The policy is `basic`, not `ssl`, because Task 32's
+//! probe showed `-p ssl` rejects every CA certificate with "Invalid Extended
+//! Key Usage for policy", trusted or not; our install sets both policies, so a
+//! `basic` verdict reflects HTTPS trust for every path the app offers. Trust
+//! settings are per user and per certificate hash, not per keychain, so both
+//! scopes report the same evaluation. Every mutation is check-first, which
+//! keeps the design independent of what a duplicate `add-trusted-cert` does.
 
 use crate::cert::CaCert;
 use crate::exec::{CmdLine, CmdOutput, Executor};
@@ -27,18 +27,20 @@ static PLATFORM: Platform = Platform::MacOs;
 const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
 const LOGIN_KEYCHAIN: &str = "Library/Keychains/login.keychain-db";
 
-/// Shown on every status answer: presence is not trust on macOS.
-const DETAIL: &str = "macOS: keychain presence is reported; trust settings are not verified. \
-                      Open Keychain Access to confirm \"Always Trust\".";
+/// Shown on every status answer: what ran for presence and what ran for trust.
+const DETAIL: &str = "macOS: presence from `security find-certificate`; trust from `security \
+                      verify-cert` (basic policy, local only; our install sets the ssl and \
+                      basic policies together)";
 
-/// Added when the certificate is present: name the UNCONFIRMED trust explicitly
-/// and how to confirm it, so `Trust::Unknown` is never a silent dead end (audit
-/// minor e). `security verify-cert` is not used: research 07 §3.1 found it
-/// exits 1 for a trusted root too, so it cannot confirm trust.
-const PRESENT_TRUST_UNCONFIRMED: &str =
-    "The certificate is present, but macOS exposes no reliable CLI check of its \
-     trust settings, so its trust is UNCONFIRMED here. Confirm \"Always Trust\" in \
-     Keychain Access (or that `aitm ca install` reported success).";
+/// `verify-cert`'s stdout contains this on exit 0 (Task 32's literal).
+const VERIFY_SUCCESS: &str = "certificate verification successful";
+
+/// What `add-trusted-cert` says (case-insensitively) when the authentication
+/// dialog was dismissed; Apple spells it "canceled".
+const CANCEL_MARKER: &str = "cancel";
+
+const CANCELLED_MESSAGE: &str = "ca.install cancelled: the macOS authentication dialog was \
+                                 dismissed; the CA is not trusted";
 
 const HEADLESS_HINT: &str = "macOS refused to change trust settings without a GUI session; run \
                              aitm ca install from a terminal in a logged-in desktop session";
@@ -105,6 +107,33 @@ impl<'a> Op<'a> {
         );
         let out = self.run(&cmd)?;
         Ok((cmd, out))
+    }
+
+    /// `security verify-cert -c <cert> -l -L -p basic`, never `sudo`: `-l`
+    /// marks the leaf as a CA, `-L` keeps the evaluation local. `Yes` on exit 0
+    /// with [`VERIFY_SUCCESS`] in stdout; otherwise `No` with a detail line;
+    /// `Err` only when the tool could not run (the caller reports `Unknown`).
+    fn verify_trust(&mut self) -> Result<(Trust, Option<String>), TrustError> {
+        let path = self.cert.path.display().to_string();
+        let cmd = cmd(
+            "security",
+            &["verify-cert", "-c", &path, "-l", "-L", "-p", "basic"],
+            false,
+        );
+        let out = self.run(&cmd)?;
+        if !out.success() {
+            return Ok((Trust::No, Some(verify_failure_text(&cmd, &out))));
+        }
+        if out.stdout.contains(VERIFY_SUCCESS) {
+            return Ok((Trust::Yes, None));
+        }
+        Ok((
+            Trust::No,
+            Some(format!(
+                "`{}` exited 0 without \"{VERIFY_SUCCESS}\" in its output",
+                cmd.render()
+            )),
+        ))
     }
 
     /// Presence, or `ToolFailed` when the query itself failed: a mutation
@@ -185,6 +214,32 @@ fn is_headless(out: &CmdOutput) -> bool {
     HEADLESS_MARKERS.iter().any(|m| stderr.contains(m))
 }
 
+fn is_cancelled(out: &CmdOutput) -> bool {
+    out.stderr.to_lowercase().contains(CANCEL_MARKER)
+}
+
+/// `verify-cert` prints its verdict (`Cert Verify Result: …`) on stdout, so a
+/// failed evaluation's tail is taken from both streams, stdout first.
+fn verify_failure_text(cmd: &CmdLine, out: &CmdOutput) -> String {
+    let lines: Vec<&str> = out
+        .stdout
+        .lines()
+        .chain(out.stderr.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(5);
+    let tail = lines[start..].join(" | ");
+    let code = out
+        .code
+        .map_or_else(|| "on a signal".to_string(), |c| c.to_string());
+    if tail.is_empty() {
+        format!("`{}` exited {code}", cmd.render())
+    } else {
+        format!("`{}` exited {code}: {tail}", cmd.render())
+    }
+}
+
 impl TrustStore for MacOsStore {
     fn platform(&self) -> &Platform {
         &PLATFORM
@@ -200,19 +255,28 @@ impl TrustStore for MacOsStore {
         let (cmd, out) = op.query()?;
         let installed = parse_presence(&out, cert);
         let mut detail = vec![DETAIL.to_string()];
-        match installed {
-            Presence::Present => detail.push(PRESENT_TRUST_UNCONFIRMED.to_string()),
-            Presence::Unknown => detail.push(failure_text(&cmd, &out)),
-            _ => {}
-        }
+        let trusted = match installed {
+            Presence::Present => match op.verify_trust() {
+                Ok((trust, line)) => {
+                    detail.extend(line);
+                    trust
+                }
+                Err(e) => {
+                    detail.push(e.to_string());
+                    Trust::Unknown
+                }
+            },
+            Presence::Unknown => {
+                detail.push(failure_text(&cmd, &out));
+                Trust::Unknown
+            }
+            Presence::Absent | Presence::Stale => Trust::No,
+        };
         Ok(StoreStatus {
             scope,
             location: op.keychain,
             installed,
-            // Always `Unknown`: macOS has no reliable CLI trust check (see the
-            // module docs and `PRESENT_TRUST_UNCONFIRMED`). When present, `detail`
-            // now says so explicitly instead of leaving it unexplained.
-            trusted: Trust::Unknown,
+            trusted,
             detail,
         })
     }
@@ -249,11 +313,20 @@ impl TrustStore for MacOsStore {
             ));
         }
 
-        let headless = is_headless(&out);
-        let mut message = failure_text(&cmd, &out);
-        if headless {
-            message = format!("{HEADLESS_HINT} ({message})");
-        }
+        let kind = if is_headless(&out) {
+            TrustErrorKind::HeadlessAuth
+        } else if is_cancelled(&out) {
+            TrustErrorKind::Cancelled
+        } else {
+            TrustErrorKind::ToolFailed
+        };
+        let mut message = match kind {
+            TrustErrorKind::HeadlessAuth => {
+                format!("{HEADLESS_HINT} ({})", failure_text(&cmd, &out))
+            }
+            TrustErrorKind::Cancelled => CANCELLED_MESSAGE.to_string(),
+            _ => failure_text(&cmd, &out),
+        };
 
         // Rollback, best effort: a failed add-trusted-cert can leave the
         // certificate in the keychain without trust settings, where it
@@ -274,11 +347,6 @@ impl TrustStore for MacOsStore {
             }
         }
 
-        let kind = if headless {
-            TrustErrorKind::HeadlessAuth
-        } else {
-            TrustErrorKind::ToolFailed
-        };
         Err(TrustError::new(kind, message).into())
     }
 

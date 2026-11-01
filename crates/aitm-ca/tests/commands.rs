@@ -41,6 +41,16 @@ fn add_user() -> String {
     format!("security add-trusted-cert -r trustRoot -p ssl -p basic -k {K_USER} /ca/ca.crt")
 }
 
+/// `find-certificate -a -Z` output holding the fixture, so the login keychain
+/// reads as present.
+fn present_user_output() -> String {
+    format!(
+        "SHA-256 hash: {}\nSHA-1 hash: {}\nkeychain: \"{K_USER}\"\n",
+        FIXTURE_FP256.replace(':', ""),
+        FIXTURE_FP1.replace(':', "")
+    )
+}
+
 /// Spec §D8 "Policy gate", exact.
 fn refusal(cmd: &str, verb: &str) -> String {
     format!(
@@ -1196,4 +1206,194 @@ fn registers_four_commands() {
     assert!(debug.contains("CaPlugin"), "{debug}");
     assert!(debug.contains("/ca"), "{debug}");
     let _cloned = plugin.clone();
+}
+
+// SP-AC29 (D17.2): an operator-token connection is a present human, so the
+// agent gate lets it through with the flag off.
+#[test]
+fn operator_install_passes_the_agent_gate() {
+    let h = Harness::scripted(false);
+    let v = h.call("ca.install", Frontend::Operator, &[]).unwrap();
+    assert!(flag(&v, "changed"));
+    assert_eq!(text(&v, "scope"), "user");
+    assert_eq!(h.exec.runs(), vec![Q_USER.to_string(), add_user()]);
+
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].command, "ca.install");
+    assert_eq!(records[0].frontend, "operator");
+    assert_eq!(records[0].outcome, "ok");
+
+    // The sibling verb is gated the same way.
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(Q_USER, 0, "", ""),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.uninstall", Frontend::Operator, &[]).unwrap();
+    assert!(flag(&v, "changed"));
+    assert_eq!(h.records()[0].frontend, "operator");
+    assert_eq!(h.records()[0].outcome, "ok");
+}
+
+// SP-AC29, second half: the agent frontend is still refused without the flag
+// and still passes with dry_run.
+#[test]
+fn mcp_install_is_still_refused_without_the_flag() {
+    let h = Harness::scripted(false);
+    let e = err_text(h.call("ca.install", Frontend::Mcp, &[]));
+    assert!(e.starts_with("ca.install refused"), "got: {e}");
+    assert_eq!(h.exec.runs(), Vec::<String>::new());
+
+    let h = Harness::scripted(false);
+    let v = h
+        .call(
+            "ca.install",
+            Frontend::Mcp,
+            &[("dry_run", Value::Bool(true))],
+        )
+        .unwrap();
+    assert!(flag(&v, "dry_run"));
+}
+
+// SP-AC30 (D17.1): scope resolution per platform, through the plugin.
+#[test]
+fn scope_resolution_per_platform() {
+    // macOS, no scope: user.
+    let h = Harness::scripted(false);
+    let v = h.call("ca.install", Frontend::Cli, &[]).unwrap();
+    assert_eq!(text(&v, "scope"), "user");
+    assert!(
+        h.exec.runs().iter().all(|line| !line.starts_with("sudo")),
+        "{:?}",
+        h.exec.runs()
+    );
+
+    // macOS, scope user: user.
+    let h = Harness::scripted(false);
+    let v = h
+        .call("ca.install", Frontend::Cli, &[("scope", str_arg("user"))])
+        .unwrap();
+    assert_eq!(text(&v, "scope"), "user");
+    assert!(h.exec.runs().iter().all(|line| !line.starts_with("sudo")));
+
+    // Debian, scope user: refused with the Linux hint.
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let err = h
+        .call("ca.install", Frontend::Cli, &[("scope", str_arg("user"))])
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::UnsupportedScope),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Linux has no per-user OS trust store; use --scope system"
+    );
+
+    // Debian, no scope: system.
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.install", Frontend::Cli, &[]).unwrap();
+    assert_eq!(text(&v, "scope"), "system");
+}
+
+// SP-AC31 (command level): the scripted read-back surfaces as
+// `stores.user.trusted == "yes"`.
+#[test]
+fn ca_status_json_reports_user_trust_yes() {
+    const VERIFY_USER: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(
+                VERIFY_USER,
+                0,
+                "/ca/ca.crt: certificate verification successful.",
+                "",
+            ),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    let user = field(field(&v, "stores"), "user");
+    assert_eq!(text(user, "installed"), "present");
+    assert_eq!(text(user, "trusted"), "yes");
+    // The System keychain answered empty: absent, so not trusted, no read-back.
+    let system = field(field(&v, "stores"), "system");
+    assert_eq!(text(system, "installed"), "absent");
+    assert_eq!(text(system, "trusted"), "no");
+    assert_eq!(
+        h.exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            Q_SYS.to_string()
+        ]
+    );
+    let detail = strings(&v, "detail");
+    assert!(
+        detail
+            .iter()
+            .any(|d| d.contains("trust from `security verify-cert`")),
+        "{detail:?}"
+    );
+    assert!(h.records().is_empty());
+}
+
+// SP-AC32 (command level): the audit record and the WARN line name the kind
+// `cancelled`; the message starts with the calm literal.
+#[test]
+fn cancelled_install_warns_with_kind_cancelled() {
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE).respond(
+            &add_user(),
+            1,
+            "",
+            "SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.",
+        ),
+        MemoryAuditLog::new(),
+    );
+    let (result, capture) = traced(|| h.call("ca.install", Frontend::Operator, &[]));
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::Cancelled),
+        "{err:#}"
+    );
+    assert!(
+        err.to_string().starts_with("ca.install cancelled"),
+        "got: {err}"
+    );
+
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].frontend, "operator");
+    assert_eq!(records[0].outcome, "error");
+    assert!(
+        records[0].detail.starts_with("ca.install cancelled"),
+        "{}",
+        records[0].detail
+    );
+
+    let warns = capture.at(Level::WARN, "aitm_ca");
+    assert_eq!(warns.len(), 1, "{capture:?}");
+    let f = &warns[0].fields;
+    assert_eq!(f.get("kind").map(String::as_str), Some("cancelled"));
+    assert_eq!(f.get("command").map(String::as_str), Some("ca.install"));
 }

@@ -221,3 +221,17 @@ fn durable_line_has_the_same_keys_as_to_value() {
     assert!(none.as_object().unwrap().contains_key("connection_id"));
     assert_eq!(none["connection_id"], serde_json::Value::Null);
 }
+
+// D17.2: an operator-token connection is audited as "operator", and the
+// crate's own reader accepts the record back.
+#[test]
+fn operator_frontend_round_trips() {
+    let rec = AuditRecord {
+        frontend: "operator",
+        ..record("changed=true")
+    };
+    let json = serde_json::to_string(&rec).unwrap();
+    assert!(json.contains("\"frontend\":\"operator\""), "{json}");
+    let back: AuditRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, rec);
+}

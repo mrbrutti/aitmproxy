@@ -6,8 +6,11 @@
 //! args → open the audit log (failure ⇒ refuse) → policy gate → load `ca.crt`
 //! → platform → scope → store op (through `DryRunExecutor` when `dry_run`) →
 //! audit record → `tracing` → result. No subprocess runs before the gate
-//! passes. `ca.export` has the same shape without the gate and platform
-//! steps; `ca.status` is read-only and not audited.
+//! passes. Policy gate (spec §D17.2): refused from an agent frontend (MCP)
+//! unless `ca.allow_agent_install` is set; the CLI and an operator-token
+//! connection (a present human) are not gated. `ca.export` has the same
+//! shape without the gate and platform steps; `ca.status` is read-only and
+//! not audited.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -177,11 +180,12 @@ fn no_cert_message(path: &Path) -> String {
     )
 }
 
-/// The frontend as the audit log names it. A frontend that is not the human
-/// CLI is agent-driven for every purpose here (the gated posture).
+/// The frontend as the audit log names it. A variant that is neither the
+/// human CLI nor an operator-token connection is agent-driven here.
 fn frontend_label(frontend: Frontend) -> &'static str {
     match frontend {
         Frontend::Cli => "cli",
+        Frontend::Operator => "operator",
         _ => "mcp",
     }
 }
@@ -377,9 +381,16 @@ fn location_for(platform: &Platform, scope: Scope, exec: &dyn Executor) -> Optio
 }
 
 /// The `TrustErrorKind` behind an error, for the failure log line.
+/// `Cancelled` is `"cancelled"` (spec D17.4, the word every frontend keys
+/// on); the other kinds keep their Debug names.
 fn kind_name(err: &anyhow::Error) -> String {
-    err.downcast_ref::<TrustError>()
-        .map_or_else(|| "Other".to_string(), |e| format!("{:?}", e.kind))
+    err.downcast_ref::<TrustError>().map_or_else(
+        || "Other".to_string(),
+        |e| match e.kind {
+            TrustErrorKind::Cancelled => "cancelled".to_string(),
+            kind => format!("{kind:?}"),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -723,9 +734,10 @@ impl Op {
             "{what} (macOS keychain via `security`, Linux ca-certificates anchors, Windows Root \
              store via certutil); {effect}. Idempotent; identifies the certificate by \
              fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless \
-             ca.allow_agent_install is set in the aitmproxy config; dry_run is always allowed \
-             and lists the commands that would run. The embedded obscura browser does not use \
-             the OS store (it trusts the CA through --ca-cert) and is unaffected."
+             ca.allow_agent_install is set; the CLI and an operator-token connection (a \
+             present human) are not gated. dry_run is always allowed and lists the commands \
+             that would run. The embedded obscura browser does not use the OS store (it \
+             trusts the CA through --ca-cert) and is unaffected."
         )
     }
 
@@ -821,7 +833,9 @@ impl Command for Change {
                     "scope",
                     TypeDesc::Str,
                     false,
-                    "user | system. Default: user on macOS and Windows, system on Linux.",
+                    "user | system. Default: user on macOS and Windows (the login keychain / \
+                     CurrentUser store; the OS shows its own authentication dialog), system \
+                     on Linux (needs root).",
                 ),
                 param(
                     "dry_run",
@@ -892,9 +906,10 @@ impl Command for Change {
             fingerprint_sha256: None,
         };
 
-        // The policy gate. Nothing runs on the host before it passes; the
-        // fingerprint for the record comes from ca.crt alone.
-        if frontend != Frontend::Cli && !args.dry_run && !shared.cfg.allow_agent_install {
+        // The policy gate (spec §D17.2): only an autonomous agent is gated.
+        // Nothing runs on the host before it passes; the fingerprint for the
+        // record comes from ca.crt alone.
+        if !frontend.is_trusted_control() && !args.dry_run && !shared.cfg.allow_agent_install {
             audit.fingerprint_sha256 = CaCert::load(&shared.cfg.dir, shared.exec())
                 .ok()
                 .flatten()

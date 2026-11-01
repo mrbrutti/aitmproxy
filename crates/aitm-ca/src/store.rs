@@ -363,6 +363,8 @@ pub enum TrustErrorKind {
     NoCertificate,
     NeedsRoot,
     HeadlessAuth,
+    /// The OS authentication dialog was dismissed (macOS, spec D17.4).
+    Cancelled,
     ToolMissing,
     ToolFailed,
     Timeout,
