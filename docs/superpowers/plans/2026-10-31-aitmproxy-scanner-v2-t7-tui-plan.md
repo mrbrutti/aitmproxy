@@ -720,6 +720,8 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | coder note | Minor | `const fn join` in `key_table!`; `OnceLock` help rows; `rows` locals renamed `table`; 11 s `JOBS_MAX` test | ratified |
 | H (Rust) | fix round | done | H47 `f954c766`, H48 `03757f77`; crate gate green (530 tests) | final Rust re-review over `fbdc4513..03757f77` |
 | H (Rust) | coder note | Minor | the H35 test reads the banner on the tab-strip row; `POC_TOAST_MAX` stays the tighter PoC cut under `TOAST_MAX`; `Toast.text` is `pub` so the bars fix also covers direct pushes | ratified |
+| H (Rust) | security re-review | PASS | every H bound verified (lanes, prompt, legacy error, JOBS_MAX vs started_here, toasts, cut_to byte-vs-cell contract, legacy gate); body dispatch cannot panic or draw an overlay from a stale mode | one Minor to H50 |
+| H (Rust) | security | Minor | a maximal prompt hides the confirm key line | fix round H Rust (H50) |
 
 ## Shipped
 

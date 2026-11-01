@@ -89,6 +89,10 @@ H49 (cell). `type_origin` (and `type_l4_target`, the `w` name prompt) must wait 
 
 **Rust H47-H48 result (2026-11-01):** done, `f954c766` (TOAST_MAX = 400 in `App::toast`, saturating sums in `bars.rs`; the bars overflow proven with a scratch test) and `03757f77` (`E_NEEDS_FIELDS` toast, no-editor toast keeps precedence); crate gate green (530 tests). Round H's Rust range is `0817f035..03757f77` plus H18-H21 (`c55c6695..0817f035`): final re-review over `fbdc4513..03757f77 -- crates/`.
 
+## Round H Rust re-review residuals
+
+H50 (Rust). A maximal wire-confirm prompt pushes the key line out of the box (`ui/scan/confirm.rs`): wrap the prompt into `inner.height.saturating_sub(5)` rows (two header and three trailer rows) so `y confirm (re-issues with _confirm) · n / Esc cancel` is always the last drawn row; one assertion in `a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box` that the `y confirm` line is on screen.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
