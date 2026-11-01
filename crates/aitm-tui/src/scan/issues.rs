@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
-    BySeverity, Confidence, InsertionKind, Issue, IssueId, IssueStatus, IssueSummary, IssuesResult,
-    JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind, Timing,
+    BySeverity, Confidence, FlowRef, InsertionKind, Issue, IssueId, IssueStatus, IssueSummary,
+    IssuesResult, JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind, Timing,
 };
 use serde_json::{json, Map, Value};
 
@@ -32,23 +32,28 @@ pub const NAME_MAX: usize = 40;
 pub const LOCATION_MAX: usize = 32;
 /// The widest a row's `kind:name` cell grows before it is cut.
 pub const POINT_MAX: usize = 24;
-/// The widest any one detail value grows before it is cut (D6 hostile-core
-/// bounds: a detail line is built from the core's strings when the pane is
-/// drawn, so every value is cut here before the view measures it).
-pub const DETAIL_VALUE_MAX: usize = 400;
+/// The widest any one string of a read issue grows before it is cut (D6
+/// hostile-core bounds): every string the detail lines read off an
+/// `Issue` is cut to this many cells once, when the issue enters `read`
+/// ([`bound_issue`]), so the per-frame line building runs over bounded
+/// text only.
+const DETAIL_VALUE_MAX: usize = 400;
 /// The most full issues `IssuesState::read` holds between folds (D6
 /// hostile-core bounds; fix round E, E1): a cheap memory bound beside the
 /// per-fold prune, the oldest inserted leaving first.
 pub const READ_MAX: usize = 64;
 /// The most rows of the timing table [`issue_detail_lines`] prints; a longer
 /// series ends in a `... n more` line.
-pub const TIMING_ROWS_MAX: usize = 12;
-/// The most mutators of an L4 mutation chain [`issue_detail_lines`] prints.
+const TIMING_ROWS_MAX: usize = 12;
+/// The most mutators of an L4 mutation chain [`issue_detail_lines`] prints;
+/// [`bound_issue`] keeps one more than that, so the line can end in `...`
+/// without holding the whole chain.
 const MUTATIONS_MAX: usize = 16;
-/// The tag of a probe flow in [`flow_refs`].
-pub const PROBE: &str = "probe";
-/// The tag of the baseline flow in [`flow_refs`].
-pub const BASELINE: &str = "baseline";
+/// The most probe flows a read issue keeps (D6 hostile-core bounds; fix
+/// round F, F4): [`bound_issue`] cuts `evidence.probe_flows` to this many
+/// and counts the rest into [`ReadIssue::dropped_flows`], which the view
+/// renders once as `... n more` under the flow list.
+const FLOWS_MAX: usize = 64;
 
 /// The confidence glyph pair, indexed tentative, firm, certain (spec D11,
 /// "Left to the builder"): two flat monochrome dots, filled as the verdict
@@ -360,6 +365,44 @@ pub fn issue_row(i: &IssueSummary) -> IssueRow {
     }
 }
 
+/// A full issue as `IssuesState::read` holds it (fix round F, F4): the
+/// `Issue` with its strings bounded by [`bound_issue`], and how many probe
+/// flows that bound dropped, so the detail pane can say `... n more` under
+/// the [`FLOWS_MAX`] it kept. Derefs to the `Issue`, so a reader that wants
+/// a field writes `read.name` as before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadIssue {
+    pub issue: Issue,
+    /// Probe flows the fold dropped past [`FLOWS_MAX`]; 0 when none were.
+    pub dropped_flows: usize,
+}
+
+impl std::ops::Deref for ReadIssue {
+    type Target = Issue;
+
+    fn deref(&self) -> &Issue {
+        &self.issue
+    }
+}
+
+/// Which flow of the detail's walkable list an entry is (spec D11): a probe
+/// flow, or the baseline the probes were compared against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowTag {
+    Probe,
+    Baseline,
+}
+
+impl FlowTag {
+    /// The word the flow list prints beside the id.
+    pub fn label(self) -> &'static str {
+        match self {
+            FlowTag::Probe => "probe",
+            FlowTag::Baseline => "baseline",
+        }
+    }
+}
+
 /// The Issues tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct IssuesState {
@@ -384,24 +427,32 @@ pub struct IssuesState {
     /// The list cursor.
     pub cursor: usize,
     pub pane: IssuePane,
-    /// The full issues received from `scan.issue` (and from
-    /// `scan.issue.update`, which Task 8 adds), by id: inserted on a reply
-    /// only, never on send, only while the page lists the id, and pruned by
+    /// The full issues received from `scan.issue` and `scan.issue.update`,
+    /// by id, each bounded as a [`ReadIssue`]: inserted on a reply only,
+    /// never on send, only while the page lists the id, and pruned by
     /// every fold to the page's ids, so `read.len() <= list.len()` (spec
     /// D3, D6; fix round D, D1; fix round E, E11). An entry also leaves on
     /// a terminal line for its job ([`IssuesState::forget_job`]) or as the
     /// oldest once [`READ_MAX`] are held.
-    pub read: BTreeMap<IssueId, Issue>,
+    pub read: BTreeMap<IssueId, ReadIssue>,
     /// The keys of `read` in insertion order, oldest first: the eviction
     /// order once `read` holds [`READ_MAX`] entries (fix round E, E1). Kept
     /// in step with `read` by every insert and prune.
     pub read_order: VecDeque<IssueId>,
-    /// Cursor over the detail's probe flows ([`flow_refs`]), walked by
-    /// `Up`/`Down` while the Detail pane is focused (spec D11).
+    /// Cursor over the detail's flow list ([`flow_at`]), walked by
+    /// `Up`/`Down` while the Detail pane is focused (spec D11); read
+    /// clamped through [`IssuesState::flow_index`].
     pub flow_cursor: usize,
-    /// The first detail line on screen; the paging keys scroll it while
-    /// the Detail pane is focused (plan task 8), a new row resets it.
+    /// The first detail line on screen, exactly what the view draws; the
+    /// paging keys scroll it while the Detail pane is focused (plan task
+    /// 8), a new row resets it.
     pub detail_scroll: u16,
+    /// Whether the view pulls the scroll so the flow under `flow_cursor`
+    /// is on screen (fix round F, F7): set by `Up`/`Down` with the Detail
+    /// pane focused (a flow key moves a cursor the operator must see),
+    /// cleared by the paging keys and by a new row, so `detail_scroll`
+    /// alone decides what is drawn after `PageUp`/`PageDown`/`Home`/`End`.
+    pub follow_flow: bool,
     /// The tick of the last `scan.issues` request this tab sent; `None`
     /// until the tab was first opened (spec D6: "when the Issues tab was
     /// ever opened" reads `is_some()`, and the 20-tick timer counts from
@@ -453,7 +504,7 @@ impl IssuesState {
     /// The full issue of the row under the cursor, when `scan.issue` has
     /// answered for it: what the detail pane shows, so it is always the row
     /// under the cursor and never the issue read last (fix round D, D1).
-    pub fn detail(&self) -> Option<&Issue> {
+    pub fn detail(&self) -> Option<&ReadIssue> {
         self.read.get(&self.cursor_issue()?.id)
     }
 
@@ -463,21 +514,27 @@ impl IssuesState {
     /// the status the reply carries. An issue the page does not list is
     /// dropped, not read (fix round E, E11): the D1 invariant
     /// `read.len() <= list.len()` then holds between folds as well.
-    /// Hostile-core bounds (D6; fix round E, E1, E19): the strings the
-    /// detail lines are built from are cut here, once ([`bound_issue`]),
-    /// and `read` keeps at most [`READ_MAX`] entries, the oldest inserted
-    /// leaving first.
+    /// Hostile-core bounds (D6; fix round E, E1, E19; fix round F, F4):
+    /// every string the detail lines read and the probe flow list are cut
+    /// here, once ([`bound_issue`]), and `read` keeps at most [`READ_MAX`]
+    /// entries, the oldest inserted leaving first. When the folded issue
+    /// is the cursor's, the flow cursor is clamped to the flow list it now
+    /// has (fix round F, F6).
     pub fn fold_issue(&mut self, mut issue: Issue) {
         let Some(k) = self.list.iter().position(|row| row.id == issue.id) else {
             return;
         };
-        bound_issue(&mut issue);
+        let dropped_flows = bound_issue(&mut issue);
         let summary = issue.summary();
         self.rows[k] = issue_row(&summary);
         self.list[k] = summary;
         let id = issue.id.clone();
-        if self.read.insert(id.clone(), issue).is_none() {
-            self.read_order.push_back(id);
+        let read = ReadIssue {
+            issue,
+            dropped_flows,
+        };
+        if self.read.insert(id.clone(), read).is_none() {
+            self.read_order.push_back(id.clone());
             while self.read.len() > READ_MAX {
                 match self.read_order.pop_front() {
                     Some(oldest) => {
@@ -493,15 +550,44 @@ impl IssuesState {
                 }
             }
         }
+        if k == self.cursor {
+            self.flow_cursor = self.flow_cursor.min(self.flow_count().saturating_sub(1));
+        }
+    }
+
+    /// How many flows the detail's walkable list has: the kept probe flows
+    /// and the baseline; 0 while the row under the cursor is unread.
+    pub fn flow_count(&self) -> usize {
+        self.detail().map_or(0, |i| flow_count_of(i))
+    }
+
+    /// `flow_cursor` clamped to the flow list: the index of the flow the
+    /// Detail pane highlights, `None` when the list is empty.
+    pub fn flow_index(&self) -> Option<usize> {
+        let n = self.flow_count();
+        (n > 0).then(|| self.flow_cursor.min(n - 1))
+    }
+
+    /// The flow under the (clamped) flow cursor and its tag: what `Enter`
+    /// opens with the Detail pane focused (spec D11; fix round F, F9).
+    /// Indexes the list directly, never builds it.
+    pub fn flow_under_cursor(&self) -> Option<(FlowRef, FlowTag)> {
+        flow_at(self.detail()?, self.flow_index()?)
     }
 
     /// How many lines the Detail pane has for the row under the cursor:
-    /// [`issue_detail_lines`]' count plus the flow list ([`flow_refs`] under its
-    /// label), counted without building them; 0 while the row is unread.
-    /// The reducer clamps `detail_scroll` to it.
+    /// the head line, the lines before the flows, the `flows` label, one
+    /// line per flow, the `... n more` line when the fold dropped any, and
+    /// the lines after the flows ([`issue_detail_lines`]), counted without
+    /// building them; 0 while the row is unread. The reducer clamps
+    /// `detail_scroll` to it.
     pub fn detail_len(&self) -> usize {
-        self.detail()
-            .map_or(0, |i| issue_detail_line_count(i) + flow_list_len(i))
+        self.detail().map_or(0, |read| {
+            1 + detail_line_count(read)
+                + 1
+                + flow_count_of(read)
+                + usize::from(read.dropped_flows > 0)
+        })
     }
 
     /// Drop every read issue that belongs to `job` (spec D6: a terminal
@@ -513,14 +599,20 @@ impl IssuesState {
     }
 }
 
-/// Cut the strings [`issue_detail_lines`] reads off an `Issue` to
-/// [`DETAIL_VALUE_MAX`] cells (and so at most four times that in chars),
-/// once, when the issue enters `read` (D6 hostile-core bounds; fix round E,
-/// E19): `description`, `evidence.payload`, `evidence.matched`,
-/// `remediation` and `note`, the free-text fields a core fills; the rest
-/// are ids, enums and numbers the contract already bounds. The per-frame
-/// line building then runs over bounded text only.
-fn bound_issue(issue: &mut Issue) {
+/// Cut every string [`issue_detail_lines`], [`issue_head`] and [`flow_at`]
+/// read off an `Issue` to [`DETAIL_VALUE_MAX`] cells (and so at most four
+/// times that in chars), once, when the issue enters `read` (D6
+/// hostile-core bounds; fix round E, E19; fix round F, F4): the free-text
+/// fields a core fills (`description`, `evidence.payload`,
+/// `evidence.matched`, `remediation`, `note`) and every other string that
+/// reaches the screen (`name`, `class`, `check_id`, the target, the
+/// location and its L4 point, `poc_ref`, `finding_id`, the L4 evidence's
+/// seed, scope and hex, each mutator). The mutation chain keeps
+/// [`MUTATIONS_MAX`] plus one, the probe flow list [`FLOWS_MAX`]; the
+/// probe flows dropped are returned, so the pane can count them. Ids,
+/// enums and numbers the contract already bounds are left alone. The
+/// per-frame line building then runs over bounded text only.
+fn bound_issue(issue: &mut Issue) -> usize {
     let cut = |s: &mut String| {
         // A char is never more cells than bytes, so a string within the cap
         // in bytes needs no walk and no new allocation.
@@ -528,114 +620,167 @@ fn bound_issue(issue: &mut Issue) {
             *s = truncate(s, DETAIL_VALUE_MAX);
         }
     };
-    cut(&mut issue.description);
-    for field in [
-        issue.evidence.payload.as_mut(),
-        issue.evidence.matched.as_mut(),
-        issue.remediation.as_mut(),
-        issue.note.as_mut(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    let loc = &mut issue.location;
+    let mut fields: Vec<&mut String> = vec![
+        &mut issue.description,
+        &mut issue.name,
+        &mut issue.class,
+        &mut issue.check_id,
+        &mut issue.target.scheme,
+        &mut issue.target.host,
+        &mut loc.path,
+        &mut loc.path_template,
+        &mut loc.name,
+    ];
+    fields.extend(
+        [
+            issue.evidence.payload.as_mut(),
+            issue.evidence.matched.as_mut(),
+            issue.remediation.as_mut(),
+            issue.note.as_mut(),
+            issue.poc_ref.as_mut(),
+            issue.finding_id.as_mut(),
+            loc.method.as_mut(),
+            loc.field_path.as_mut(),
+            loc.ws_path.as_mut(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    if let Some(l4) = &mut loc.l4 {
+        fields.push(&mut l4.ip);
+        fields.extend(
+            [
+                l4.grammar.as_mut(),
+                l4.field_path.as_mut(),
+                l4.mutation.as_mut(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    if let Some(l4) = &mut issue.evidence.l4 {
+        l4.mutation_chain.truncate(MUTATIONS_MAX + 1);
+        fields.push(&mut l4.seed_id);
+        fields.push(&mut l4.scope_entry);
+        fields.push(&mut l4.sent_hex);
+        fields.extend(l4.mutation_chain.iter_mut());
+    }
+    for field in fields {
         cut(field);
+    }
+    let flows = &mut issue.evidence.probe_flows;
+    let dropped = flows.len().saturating_sub(FLOWS_MAX);
+    flows.truncate(FLOWS_MAX);
+    dropped
+}
+
+/// The detail's first line as parts (spec D11; fix round F, F5, F8): the
+/// name, then the severity, confidence and status the view styles from the
+/// typed values, so a name that spells a verdict cannot forge the hue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueHead<'a> {
+    pub name: &'a str,
+    pub severity: Severity,
+    pub confidence: Confidence,
+    pub status: IssueStatus,
+}
+
+/// The head line of `issue` ([`IssueHead`]).
+pub fn issue_head(issue: &Issue) -> IssueHead<'_> {
+    IssueHead {
+        name: &issue.name,
+        severity: issue.severity,
+        confidence: issue.confidence,
+        status: issue.status,
     }
 }
 
-/// The `label` column every detail line after the first is written with
-/// (`payload  <script>...`): the labels are padded to it so the values line
-/// up, as in the D11 mockup.
-pub const DETAIL_LABEL_W: usize = 11;
+/// One `label value` pair of the Detail pane; the view lays the two out
+/// (fix round F, F8: the model bakes no layout into strings). An empty
+/// label is a continuation line (a timing row).
+pub type DetailLine = (&'static str, String);
 
-/// One `label value` detail line, the label padded to [`DETAIL_LABEL_W`] and the
-/// value cut to [`DETAIL_VALUE_MAX`].
-fn line(label: &str, value: &str) -> String {
-    format!(
-        "{label:<DETAIL_LABEL_W$} {}",
-        truncate(value, DETAIL_VALUE_MAX)
-    )
+/// The Detail pane's lines for a read issue (spec D11, plan task 8), split
+/// where the walkable flow list sits (fix round F, F1): `before_flows` is
+/// class, check id and lane; the target; the location; the description;
+/// the evidence (`payload`, `matched`, the timing table, the diff lengths,
+/// the L4 fields) when present; `after_flows` is the PoC and finding refs,
+/// remediation and note when present, then occurrences with first and last
+/// seen. The head is [`issue_head`]; the flows are [`flow_at`]. Built from
+/// the strings [`bound_issue`] cut once at fold time; the view cuts each
+/// line to the pane. Nothing but the named fields of the `Issue` is ever
+/// rendered, so no cookie or header value can reach the screen from here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DetailLines {
+    pub before_flows: Vec<DetailLine>,
+    pub after_flows: Vec<DetailLine>,
 }
 
-/// The lines of the Issues Detail pane for `issue` (spec D11, plan task 8),
-/// in this order: the name with `severity · confidence · status`; class,
-/// check id and lane; the target; the location; the description; the
-/// evidence (`payload`, `matched`, the timing table, the diff lengths, the
-/// L4 fields) when present; the PoC and finding refs; remediation and note
-/// when present; occurrences with first and last seen. The flows are not
-/// here: [`flow_refs`] lists them, and the view draws them as the walkable
-/// list under these lines. Every value is cut to [`DETAIL_VALUE_MAX`]
-/// (D6 hostile-core bounds); the view cuts each line to the pane. Nothing
-/// but the named fields of the `Issue` is ever rendered, so no cookie or
-/// header value can reach the screen from here.
-pub fn issue_detail_lines(issue: &Issue) -> Vec<String> {
-    let mut out = Vec::with_capacity(issue_detail_line_count(issue));
-    out.push(format!(
-        "{}   {} · {} · {}",
-        truncate(&issue.name, DETAIL_VALUE_MAX),
-        severity_token(issue.severity),
-        confidence_token(issue.confidence),
-        status_token(issue.status)
-    ));
-    out.push(line(
+/// The lines of the Issues Detail pane for `issue` ([`DetailLines`]).
+pub fn issue_detail_lines(issue: &Issue) -> DetailLines {
+    let mut before: Vec<DetailLine> = Vec::with_capacity(BEFORE_FIXED_LINES + 8);
+    before.push((
         "class",
-        &format!(
+        format!(
             "{} · check {} · lane {}",
             issue.class,
             issue.check_id,
             lane_token(issue.lane)
         ),
     ));
-    out.push(line(
+    before.push((
         "target",
-        &format!(
+        format!(
             "{}://{}:{}",
             issue.target.scheme, issue.target.host, issue.target.port
         ),
     ));
-    out.push(line("location", &location_text(issue)));
-    out.push(line("description", &issue.description));
+    before.push(("location", location_text(issue)));
+    before.push(("description", issue.description.clone()));
     let ev = &issue.evidence;
     if let Some(p) = &ev.payload {
-        out.push(line("payload", p));
+        before.push(("payload", p.clone()));
     }
     if let Some(m) = &ev.matched {
-        out.push(line("matched", m));
+        before.push(("matched", m.clone()));
     }
     if let Some(t) = &ev.timing {
-        timing_lines(t, &mut out);
+        timing_lines(t, &mut before);
     }
     if let Some(d) = &ev.diff {
-        out.push(line(
+        before.push((
             "diff",
-            &format!(
+            format!(
                 "baseline {} · true {} · false {} (response lengths)",
                 d.baseline_len, d.true_len, d.false_len
             ),
         ));
     }
     if let Some(l4) = &ev.l4 {
-        l4_lines(l4, &mut out);
+        l4_lines(l4, &mut before);
     }
-    out.push(line(
+    let mut after: Vec<DetailLine> = Vec::with_capacity(AFTER_FIXED_LINES + 2);
+    after.push((
         "poc",
-        &issue
+        issue
             .poc_ref
             .as_deref()
             .map_or_else(|| "none".to_string(), |r| format!("{r} (P)")),
     ));
-    out.push(line(
+    after.push((
         "finding",
-        issue.finding_id.as_deref().unwrap_or("none"),
+        issue.finding_id.as_deref().unwrap_or("none").to_string(),
     ));
     if let Some(r) = &issue.remediation {
-        out.push(line("remediation", r));
+        after.push(("remediation", r.clone()));
     }
     if let Some(n) = &issue.note {
-        out.push(line("note", n));
+        after.push(("note", n.clone()));
     }
-    out.push(line(
+    after.push((
         "seen",
-        &format!(
+        format!(
             "{} occurrence{} · first {} · last {}",
             issue.occurrences,
             if issue.occurrences == 1 { "" } else { "s" },
@@ -643,19 +788,25 @@ pub fn issue_detail_lines(issue: &Issue) -> Vec<String> {
             seen_text(issue.last_seen)
         ),
     ));
-    out
+    DetailLines {
+        before_flows: before,
+        after_flows: after,
+    }
 }
 
-/// The lines every [`issue_detail_lines`] has: the name line, class, target,
-/// location, description, poc, finding, seen.
-const DETAIL_FIXED_LINES: usize = 8;
+/// The lines every `before_flows` has: class, target, location,
+/// description.
+const BEFORE_FIXED_LINES: usize = 4;
+/// The lines every `after_flows` has: poc, finding, seen.
+const AFTER_FIXED_LINES: usize = 3;
 
-/// How many lines [`issue_detail_lines`] builds for `issue`, counted without
-/// building them (the reducer clamps the scroll on every key). Pinned to
-/// `issue_detail_lines(issue).len()` by a unit test.
-pub fn issue_detail_line_count(issue: &Issue) -> usize {
+/// How many lines [`issue_detail_lines`] builds for `issue`, both runs
+/// together, counted without building them (the reducer clamps the scroll
+/// on every key). Pinned to the built lines by a unit test.
+fn detail_line_count(issue: &Issue) -> usize {
     let ev = &issue.evidence;
-    DETAIL_FIXED_LINES
+    BEFORE_FIXED_LINES
+        + AFTER_FIXED_LINES
         + usize::from(ev.payload.is_some())
         + usize::from(ev.matched.is_some())
         + ev.timing.as_ref().map_or(0, timing_line_count)
@@ -713,15 +864,18 @@ fn l4_location_text(l4: &L4Location) -> String {
 /// (`requested_s | observed_ms | baseline_ms`, a series shorter than the
 /// longest reads `-`), at most [`TIMING_ROWS_MAX`] of them with a
 /// `... n more` line past that, then `slope`/`r`.
-fn timing_lines(t: &Timing, out: &mut Vec<String>) {
-    out.push(line("timing", "requested_s | observed_ms | baseline_ms"));
+fn timing_lines(t: &Timing, out: &mut Vec<DetailLine>) {
+    out.push((
+        "timing",
+        "requested_s | observed_ms | baseline_ms".to_string(),
+    ));
     let rows = timing_rows(t);
     let shown = rows.min(TIMING_ROWS_MAX);
     for k in 0..shown {
         let cell = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
-        out.push(line(
+        out.push((
             "",
-            &format!(
+            format!(
                 "{:>11} | {:>11} | {:>11}",
                 cell(t.requested_s.get(k).map(|v| format!("{v:.1}"))),
                 cell(t.observed_ms.get(k).map(ToString::to_string)),
@@ -730,12 +884,9 @@ fn timing_lines(t: &Timing, out: &mut Vec<String>) {
         ));
     }
     if rows > shown {
-        out.push(line("", &format!("... {} more", rows - shown)));
+        out.push(("", format!("... {} more", rows - shown)));
     }
-    out.push(line(
-        "",
-        &format!("slope {:.1} ms/s · r {:.2}", t.slope, t.r),
-    ));
+    out.push(("", format!("slope {:.1} ms/s · r {:.2}", t.slope, t.r)));
 }
 
 /// The sample count of a timing table: its longest series.
@@ -759,11 +910,12 @@ const L4_LINES: usize = 5;
 
 /// The L4 evidence (spec D11, "L4 evidence fields when present"): the seed
 /// and reproduction counts, the oracle's reading, the liveness probes, the
-/// mutation chain and the bytes sent (hex, cut like every value).
-fn l4_lines(l4: &L4Evidence, out: &mut Vec<String>) {
-    out.push(line(
+/// mutation chain (the first [`MUTATIONS_MAX`], then `...` when
+/// [`bound_issue`] kept the one past them) and the bytes sent (hex).
+fn l4_lines(l4: &L4Evidence, out: &mut Vec<DetailLine>) {
+    out.push((
         "l4 case",
-        &format!(
+        format!(
             "seed {} · rng {} · prior messages {} · reproduced {}/{} · scope {}",
             l4.seed_id,
             l4.rng_seed,
@@ -773,11 +925,11 @@ fn l4_lines(l4: &L4Evidence, out: &mut Vec<String>) {
             l4.scope_entry
         ),
     ));
-    out.push(line("oracle", &oracle_text(l4.oracle)));
+    out.push(("oracle", oracle_text(l4.oracle)));
     let yes_no = |b: bool| if b { "passed" } else { "failed" };
-    out.push(line(
+    out.push((
         "liveness",
-        &format!(
+        format!(
             "before {} · after {}",
             yes_no(l4.liveness_before),
             yes_no(l4.liveness_after)
@@ -791,16 +943,13 @@ fn l4_lines(l4: &L4Evidence, out: &mut Vec<String>) {
         .collect::<Vec<_>>()
         .join(" > ");
     if l4.mutation_chain.len() > MUTATIONS_MAX {
-        chain.push_str(&format!(
-            " > ... {} more",
-            l4.mutation_chain.len() - MUTATIONS_MAX
-        ));
+        chain.push_str(" > ...");
     }
     if chain.is_empty() {
         chain.push_str("none");
     }
-    out.push(line("mutations", &chain));
-    out.push(line("sent hex", &l4.sent_hex));
+    out.push(("mutations", chain));
+    out.push(("sent hex", l4.sent_hex.clone()));
 }
 
 /// How an L4 oracle read the reaction, in words.
@@ -815,34 +964,28 @@ fn oracle_text(o: L4Oracle) -> String {
     }
 }
 
-/// The flows the Detail pane lists (spec D11): every probe flow tagged
-/// [`PROBE`] in wire order, then the baseline flow tagged [`BASELINE`]. The
-/// ids are the `FlowRef` UUIDs, already validated by the parse.
-pub fn flow_refs(issue: &Issue) -> Vec<(String, &'static str)> {
+/// The `k`th flow of the detail's walkable list (spec D11): the kept probe
+/// flows in wire order, then the baseline flow; `None` past the end. The
+/// refs are UUIDs the parse already validated, so a frame indexes the two
+/// fields directly and never builds the list (fix round F, F4, F9).
+pub fn flow_at(issue: &Issue, k: usize) -> Option<(FlowRef, FlowTag)> {
     let ev = &issue.evidence;
-    let mut out = Vec::with_capacity(ev.probe_flows.len() + 1);
-    out.extend(ev.probe_flows.iter().map(|f| (f.to_string(), PROBE)));
-    if let Some(b) = &ev.baseline_flow {
-        out.push((b.to_string(), BASELINE));
+    match ev.probe_flows.get(k) {
+        Some(probe) => Some((*probe, FlowTag::Probe)),
+        None if k == ev.probe_flows.len() => ev.baseline_flow.map(|b| (b, FlowTag::Baseline)),
+        None => None,
     }
-    out
 }
 
-/// How many flows [`flow_refs`] lists, counted without building them.
-pub fn flow_refs_len(issue: &Issue) -> usize {
+/// How many flows [`flow_at`] indexes for `issue`.
+fn flow_count_of(issue: &Issue) -> usize {
     issue.evidence.probe_flows.len() + usize::from(issue.evidence.baseline_flow.is_some())
-}
-
-/// The lines the view's flow list takes: its `flows` label line and one
-/// line per flow ([`flow_refs_len`]), or the label alone reading none.
-pub fn flow_list_len(issue: &Issue) -> usize {
-    1 + flow_refs_len(issue)
 }
 
 /// A wire timestamp (Unix milliseconds) as `YYYY-MM-DD HH:MM:SS` UTC: the
 /// civil-date arithmetic written out, so the crate needs no time
 /// dependency for one read-only line.
-pub fn seen_text(ms: u64) -> String {
+fn seen_text(ms: u64) -> String {
     let secs = ms / 1000;
     let days = secs / 86_400;
     let rem = secs % 86_400;
@@ -981,43 +1124,85 @@ mod tests {
         assert_eq!(kind_token(InsertionKind::WsJsonValue), "ws_json_value");
     }
 
-    /// The contract pack's issue, parsed.
+    /// The contract pack's issue, parsed; a missing or malformed file is a
+    /// test bug and panics with its path (fix round F, F13).
     fn fixture_issue() -> Issue {
-        let text = std::fs::read_to_string(concat!(
+        let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../aitm-scan-model/fixtures/scan.issue.json"
-        ))
-        .unwrap_or_default();
+        );
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("scan.issue.json: cannot read {path}: {e}"));
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("scan.issue.json: {e}"))
     }
 
-    /// Task 8: the detail lines in their order, the labels padded, the
-    /// flows listed probes first then the baseline, and the counts equal
-    /// to what is built.
+    /// `(label, value)` pairs from literals, for the pins below.
+    fn pairs(lines: &[(&'static str, &str)]) -> Vec<DetailLine> {
+        lines.iter().map(|(l, v)| (*l, (*v).to_string())).collect()
+    }
+
+    /// Task 8 (fix round F, F1, F8): the detail pairs in their D11 order
+    /// around the flow list, the head as typed parts, the flows indexed
+    /// probes first then the baseline, and the counts equal to what is
+    /// built.
     #[test]
     fn detail_lines_read_the_fixture_issue() {
         let issue = fixture_issue();
+        assert_eq!(
+            issue_head(&issue),
+            IssueHead {
+                name: "Reflected cross-site scripting",
+                severity: Severity::High,
+                confidence: Confidence::Certain,
+                status: IssueStatus::Open,
+            }
+        );
         let lines = issue_detail_lines(&issue);
         assert_eq!(
-            lines,
-            vec![
-                "Reflected cross-site scripting   high · certain · open".to_string(),
-                "class       reflected-xss · check http.reflected-xss · lane http".into(),
-                "target      http://127.0.0.1:8080".into(),
-                "location    GET /search · query q".into(),
-                "description A request parameter is reflected into the response unescaped.".into(),
-                "payload     <script>aitm-canary()</script>".into(),
-                "matched     reflected marker aitm-canary in an HTML text node".into(),
-                "poc         poc-3b1c (P)".into(),
-                "finding     finding-7a21".into(),
-                "remediation Contextually encode output and set a strict CSP.".into(),
-                "seen        1 occurrence · first 2025-10-31 08:40:00 · last 2025-10-31 08:40:00"
-                    .into(),
-            ]
+            lines.before_flows,
+            pairs(&[
+                (
+                    "class",
+                    "reflected-xss · check http.reflected-xss · lane http"
+                ),
+                ("target", "http://127.0.0.1:8080"),
+                ("location", "GET /search · query q"),
+                (
+                    "description",
+                    "A request parameter is reflected into the response unescaped."
+                ),
+                ("payload", "<script>aitm-canary()</script>"),
+                (
+                    "matched",
+                    "reflected marker aitm-canary in an HTML text node"
+                ),
+            ])
         );
-        assert_eq!(issue_detail_line_count(&issue), lines.len());
         assert_eq!(
-            flow_refs(&issue),
+            lines.after_flows,
+            pairs(&[
+                ("poc", "poc-3b1c (P)"),
+                ("finding", "finding-7a21"),
+                (
+                    "remediation",
+                    "Contextually encode output and set a strict CSP."
+                ),
+                (
+                    "seen",
+                    "1 occurrence · first 2025-10-31 08:40:00 · last 2025-10-31 08:40:00"
+                ),
+            ])
+        );
+        assert_eq!(
+            detail_line_count(&issue),
+            lines.before_flows.len() + lines.after_flows.len()
+        );
+        let flows: Vec<(String, &str)> = (0..4)
+            .filter_map(|k| flow_at(&issue, k))
+            .map(|(id, tag)| (id.to_string(), tag.label()))
+            .collect();
+        assert_eq!(
+            flows,
             vec![
                 ("550e8400-e29b-41d4-a716-446655440000".to_string(), "probe"),
                 ("7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(), "probe"),
@@ -1027,20 +1212,40 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(flow_refs_len(&issue), 3);
-        assert_eq!(flow_list_len(&issue), 4);
+        assert_eq!(flow_count_of(&issue), 3);
         let mut state = IssuesState::default();
         assert_eq!(state.detail_len(), 0, "an unread row has no detail");
+        assert_eq!(state.flow_count(), 0);
+        assert_eq!(state.flow_index(), None);
+        assert_eq!(state.flow_under_cursor(), None);
         state.list = vec![issue.summary()];
         state.rows = vec![issue_row(&state.list[0])];
-        state.read.insert(issue.id.clone(), issue);
-        assert_eq!(state.detail_len(), 11 + 4);
+        state.fold_issue(issue);
+        assert_eq!(
+            state.detail_len(),
+            1 + 10 + 1 + 3,
+            "head, pairs, label, flows"
+        );
+        assert_eq!(state.flow_count(), 3);
+        state.flow_cursor = 9;
+        assert_eq!(state.flow_index(), Some(2), "clamped to the baseline");
+        assert_eq!(
+            state
+                .flow_under_cursor()
+                .map(|(id, tag)| (id.to_string(), tag)),
+            Some((
+                "16fd2706-8baf-433b-82eb-8c7fada847da".to_string(),
+                FlowTag::Baseline
+            ))
+        );
     }
 
     /// Task 8: timing, diff and L4 evidence render as their table and
     /// fields; a long series is cut to `TIMING_ROWS_MAX` with an overflow
-    /// line; the count still equals the lines built; a 1 MiB value is cut
-    /// to `DETAIL_VALUE_MAX` cells.
+    /// line; the count still equals the lines built; a 1 MiB description is
+    /// cut to 400 cells at fold time (fix round F, F4), and so is every
+    /// other string the pane reads; the mutation chain keeps one past
+    /// `MUTATIONS_MAX` and the line ends in `...`.
     #[test]
     fn detail_lines_render_timing_diff_and_l4_evidence() {
         use aitm_scan_model::{Diff, Evidence};
@@ -1080,52 +1285,114 @@ mod tests {
         };
         issue.remediation = None;
         issue.description = "D".repeat(1 << 20);
+        issue.check_id = "C".repeat(1 << 20);
+        assert_eq!(bound_issue(&mut issue), 0, "no probe flows to drop");
         let lines = issue_detail_lines(&issue);
-        assert_eq!(issue_detail_line_count(&issue), lines.len());
         assert_eq!(
-            &lines[5..10],
-            &[
-                "timing      requested_s | observed_ms | baseline_ms".to_string(),
-                "                    1.0 |        1010 |          12".into(),
-                "                    2.0 |        2020 |          11".into(),
-                "                    3.0 |           - |          13".into(),
-                "            slope 1004.5 ms/s · r 1.00".into(),
-            ]
+            detail_line_count(&issue),
+            lines.before_flows.len() + lines.after_flows.len()
         );
         assert_eq!(
-            lines[10],
-            "diff        baseline 1200 · true 1200 · false 980 (response lengths)"
+            &lines.before_flows[4..9],
+            &pairs(&[
+                ("timing", "requested_s | observed_ms | baseline_ms"),
+                ("", "        1.0 |        1010 |          12"),
+                ("", "        2.0 |        2020 |          11"),
+                ("", "        3.0 |           - |          13"),
+                ("", "slope 1004.5 ms/s · r 1.00"),
+            ])[..]
         );
         assert_eq!(
-            &lines[11..16],
-            &[
-                "l4 case     seed hello · rng 42 · prior messages 3 · reproduced 2/3 · scope l4-1"
-                    .to_string(),
-                "oracle      icmp type 3 code 3".into(),
-                "liveness    before passed · after failed".into(),
-                "mutations   flip > truncate".into(),
-                "sent hex    deadbeef".into(),
-            ]
+            lines.before_flows[9],
+            (
+                "diff",
+                "baseline 1200 · true 1200 · false 980 (response lengths)".to_string()
+            )
         );
-        let description = &lines[4];
         assert_eq!(
-            description.chars().count(),
-            DETAIL_LABEL_W + 1 + DETAIL_VALUE_MAX,
-            "{description:?}"
+            &lines.before_flows[10..15],
+            &pairs(&[
+                (
+                    "l4 case",
+                    "seed hello · rng 42 · prior messages 3 · reproduced 2/3 · scope l4-1"
+                ),
+                ("oracle", "icmp type 3 code 3"),
+                ("liveness", "before passed · after failed"),
+                ("mutations", "flip > truncate"),
+                ("sent hex", "deadbeef"),
+            ])[..]
         );
+        assert_eq!(lines.before_flows.len(), 15);
+        let (label, description) = &lines.before_flows[3];
+        assert_eq!(*label, "description");
+        assert_eq!(description.chars().count(), 400, "{description:?}");
         assert!(description.ends_with('…'));
-        assert!(flow_refs(&issue).is_empty());
-        assert_eq!(flow_list_len(&issue), 1);
+        let (_, class) = &lines.before_flows[0];
+        assert_eq!(
+            class.chars().count(),
+            "reflected-xss · check ".chars().count() + 400 + " · lane http".chars().count()
+        );
+        assert!(class.contains("CCCC… · lane http"), "{class:?}");
+        assert_eq!(flow_at(&issue, 0), None);
+        assert_eq!(flow_count_of(&issue), 0);
 
+        let l4 = issue.evidence.l4.as_mut().unwrap_or_else(|| panic!("l4"));
+        l4.mutation_chain = (0..1000).map(|k| format!("m{k}")).collect();
         let timing = issue
             .evidence
             .timing
             .as_mut()
             .unwrap_or_else(|| panic!("timing"));
         timing.observed_ms = vec![0; 40];
+        bound_issue(&mut issue);
+        let l4 = issue.evidence.l4.as_ref().unwrap_or_else(|| panic!("l4"));
+        assert_eq!(l4.mutation_chain.len(), MUTATIONS_MAX + 1);
         let lines = issue_detail_lines(&issue);
-        assert_eq!(issue_detail_line_count(&issue), lines.len());
-        assert_eq!(lines[5 + 1 + TIMING_ROWS_MAX], "            ... 28 more");
+        assert_eq!(
+            detail_line_count(&issue),
+            lines.before_flows.len() + lines.after_flows.len()
+        );
+        assert_eq!(
+            lines.before_flows[4 + 1 + TIMING_ROWS_MAX],
+            ("", "... 28 more".to_string())
+        );
+        let mutations = lines
+            .before_flows
+            .iter()
+            .find(|(l, _)| *l == "mutations")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            mutations,
+            "m0 > m1 > m2 > m3 > m4 > m5 > m6 > m7 > m8 > m9 > m10 > m11 > m12 > m13 > m14 > m15 > ..."
+        );
+    }
+
+    /// Fix round F, F4: the probe flow list is cut to `FLOWS_MAX` at fold
+    /// time and the dropped count kept beside the issue; the baseline
+    /// survives as the last flow and the detail counts the `... n more`
+    /// line.
+    #[test]
+    fn fold_issue_keeps_flows_max_probe_flows_and_counts_the_rest() {
+        let mut issue = fixture_issue();
+        let probe = issue.evidence.probe_flows[0];
+        issue.evidence.probe_flows = vec![probe; 1000];
+        assert!(issue.evidence.baseline_flow.is_some());
+        let mut state = IssuesState::default();
+        state.list = vec![issue.summary()];
+        state.rows = vec![issue_row(&state.list[0])];
+        state.flow_cursor = 999;
+        state.fold_issue(issue);
+        let read = state.detail().unwrap_or_else(|| panic!("read"));
+        assert_eq!(read.evidence.probe_flows.len(), 64);
+        assert_eq!(read.dropped_flows, 936);
+        assert_eq!(state.flow_count(), 65);
+        assert_eq!(state.flow_cursor, 64, "clamped to the baseline (F6)");
+        assert_eq!(
+            state.flow_under_cursor().map(|(_, tag)| tag),
+            Some(FlowTag::Baseline)
+        );
+        assert_eq!(state.detail_len(), 1 + 10 + 1 + 65 + 1);
     }
 
     #[test]
@@ -1133,6 +1400,8 @@ mod tests {
         assert_eq!(seen_text(0), "1970-01-01 00:00:00");
         assert_eq!(seen_text(1_761_900_000_000), "2025-10-31 08:40:00");
         assert_eq!(seen_text(951_782_400_000), "2000-02-29 00:00:00");
+        assert_eq!(seen_text(946_684_799_000), "1999-12-31 23:59:59");
+        assert_eq!(seen_text(4_107_542_400_000), "2100-03-01 00:00:00");
     }
 
     /// Task 8: a folded issue replaces its list row and display row.

@@ -23,7 +23,7 @@ use crate::scan::{ScanError, ScanOffer, ScanTab, NO_SCANNER};
 use crate::theme::Theme;
 use crate::ui::bars::put;
 use crate::ui::overlays::boxed;
-use crate::ui::text::truncate;
+use crate::ui::text::{fit, truncate, width};
 
 /// The blank cells between the tab strip and the state banner (D11).
 const GAP: usize = 4;
@@ -321,9 +321,68 @@ pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
     hint(theme, area, text, buf);
 }
 
+/// One `label value` line of a Detail pane (fix round F, F8), the one
+/// layout the Jobs and Issues panes share: a pad cell, the label in
+/// secondary text, one space, the value in primary text cut so the whole
+/// line fits `w` cells. With `label_w` the label is padded to that column,
+/// so the values line up (the Issues pane, as in the D11 mockup; an empty
+/// label then indents a continuation line); with `None` the label takes
+/// its own width and the line reads as the sentence it is (the Jobs pane).
+pub fn labelled(
+    theme: &Theme,
+    label: &str,
+    value: &str,
+    w: usize,
+    label_w: Option<usize>,
+) -> Line<'static> {
+    let (label_text, label_cells) = match label_w {
+        Some(lw) => (fit(label, lw), lw),
+        None => (label.to_string(), width(label)),
+    };
+    let value_w = w.saturating_sub(1 + label_cells + 1);
+    Line::from(vec![
+        Span::styled(format!(" {label_text}"), theme.text_secondary()),
+        Span::styled(
+            format!(" {}", truncate(value, value_w)),
+            theme.text_primary(),
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix round F, F8: the one `label value` layout. Without a column the
+    /// label takes its width; with one it is padded (an empty label indents
+    /// a continuation line); the value is cut so the line fits `w`.
+    #[test]
+    fn labelled_lays_out_the_label_column_and_cuts_the_value() {
+        let theme = Theme::new(true);
+        let text = |line: Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert_eq!(
+            text(labelled(&theme, "lanes", "requested http", 40, None)),
+            " lanes requested http"
+        );
+        assert_eq!(
+            text(labelled(&theme, "payload", "<x>", 40, Some(11))),
+            " payload     <x>"
+        );
+        assert_eq!(
+            text(labelled(&theme, "", "1.0 | 2", 40, Some(11))),
+            "             1.0 | 2"
+        );
+        let cut = text(labelled(&theme, "note", &"n".repeat(50), 20, Some(11)));
+        assert_eq!(cut.chars().count(), 20, "{cut:?}");
+        assert_eq!(cut, " note        nnnnnn…");
+        assert_eq!(
+            text(labelled(&theme, "a", "bcd", 3, None)),
+            " a ",
+            "no room: the value is empty"
+        );
+    }
 
     /// Fix round A, A12: the split is computed in `u32`, so a very wide
     /// terminal (1500 columns overflows `u16` at `width * 45`) neither

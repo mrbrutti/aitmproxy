@@ -29,8 +29,8 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    flow_refs, flow_refs_len, is_job_id, parse_result, state_text, status_token, step, tag_keyed,
-    tag_parts, Dir, IssueFilterKey, IssuePane, JobPane, ScanError, ScanOffer, ScanState, ScanTab,
+    is_job_id, parse_result, state_text, status_token, step, tag_keyed, tag_parts, Dir,
+    IssueFilterKey, IssuePane, JobPane, ScanError, ScanOffer, ScanState, ScanTab,
     ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
     STATUS_POLL_TICKS,
 };
@@ -190,6 +190,14 @@ fn walk(action: &Action, cursor: usize, len: usize, page: usize) -> usize {
         _ => cursor,
     }
     .min(last)
+}
+
+/// One step of a Scan Detail pane's scroll over `len` lines: [`walk`] on
+/// the `u16` the pane keeps, saturating at the type's end (fix round F,
+/// F11). The Jobs and Issues Detail panes share it.
+fn scroll(scroll: &mut u16, action: &Action, len: usize, page: usize) {
+    let next = walk(action, usize::from(*scroll), len, page);
+    *scroll = u16::try_from(next).unwrap_or(u16::MAX);
 }
 
 /// Whether the browser view counts a call as in flight: exactly the calls
@@ -1480,16 +1488,8 @@ impl App {
                 // focus (D11 "⏎ open or act"; fix round E, E18).
                 Mode::Scan if self.scan.tab == ScanTab::Issues => {
                     if self.scan.issues.pane == IssuePane::Detail {
-                        let flow = self
-                            .scan
-                            .issues
-                            .detail()
-                            .and_then(|i| {
-                                flow_refs(i).into_iter().nth(self.scan.issues.flow_cursor)
-                            })
-                            .map(|(id, _)| id);
-                        if let Some(id) = flow {
-                            self.open_scan_flow(id, &mut out);
+                        if let Some((id, _)) = self.scan.issues.flow_under_cursor() {
+                            self.open_scan_flow(id.to_string(), &mut out);
                         }
                     } else {
                         self.scan.issues.pane = IssuePane::Detail;
@@ -2781,25 +2781,24 @@ impl App {
                     // The Jobs Detail pane scrolls its lines instead of
                     // moving a cursor (D11); the last line is the floor.
                     let n = self.scan.jobs.detail_len();
-                    let c = usize::from(self.scan.jobs.detail_scroll);
-                    let next = walk(action, c, n, page);
-                    self.scan.jobs.detail_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+                    scroll(&mut self.scan.jobs.detail_scroll, action, n, page);
                 } else if issues_detail {
                     // The Issues Detail pane: Up/Down walk the flow list
-                    // (D11, "a walkable list"), the paging keys scroll the
-                    // lines (plan task 8); the view keeps the flow under the
-                    // cursor on screen.
+                    // (D11, "a walkable list") and ask the view to keep the
+                    // flow under the cursor on screen; the paging keys
+                    // scroll the lines (plan task 8) and take that back, so
+                    // the scroll is what is drawn (fix round F, F7).
                     let issues = &mut self.scan.issues;
-                    let flows = issues.detail().map_or(0, flow_refs_len);
                     match action {
                         Action::Up | Action::Down => {
+                            let flows = issues.flow_count();
                             issues.flow_cursor = walk(action, issues.flow_cursor, flows, page);
+                            issues.follow_flow = true;
                         }
                         _ => {
                             let n = issues.detail_len();
-                            let c = usize::from(issues.detail_scroll);
-                            let next = walk(action, c, n, page);
-                            issues.detail_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+                            scroll(&mut issues.detail_scroll, action, n, page);
+                            issues.follow_flow = false;
                         }
                     }
                 } else if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
@@ -2817,6 +2816,7 @@ impl App {
                         if moved && self.scan.tab == ScanTab::Issues {
                             self.scan.issues.flow_cursor = 0;
                             self.scan.issues.detail_scroll = 0;
+                            self.scan.issues.follow_flow = false;
                             self.issue_cursor_landed(out);
                         }
                     }

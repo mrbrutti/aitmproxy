@@ -19,9 +19,8 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::model::Finding;
-use aitm_tui::scan::{
-    is_issue_id, IssueFilterKey, IssueFilters, IssuePane, ScanTab, DETAIL_VALUE_MAX, READ_MAX,
-};
+use aitm_tui::scan::{is_issue_id, IssueFilterKey, IssueFilters, IssuePane, ScanTab, READ_MAX};
+use aitm_tui::snapshot::to_text;
 use common::*;
 use serde_json::{json, Value};
 
@@ -159,6 +158,15 @@ fn page_of(n: usize, id_of: impl Fn(usize) -> String) -> Value {
 
 fn screen(app: &App) -> String {
     text_of(app, 200, 50)
+}
+
+/// A line of the 200x50 detail pane (the text right of the pane rule),
+/// found by `needle` and trimmed of the pane padding and the box edge, so
+/// a test pins the whole literal (fix round F, F13).
+fn detail_line<'a>(text: &'a str, needle: &str) -> &'a str {
+    let line = line_with(text, needle).unwrap_or_else(|| panic!("no line with {needle:?}: {text}"));
+    let rule = line.rfind('│').unwrap_or_default();
+    line[..rule].rsplit('│').next().unwrap_or_default().trim()
 }
 
 /// The Issues filter line as drawn in the list pane: the row cut at the
@@ -670,9 +678,9 @@ fn read_keeps_at_most_read_max_entries_dropping_the_oldest() {
 /// Fix round E, E19 (D6 hostile-core bounds): the `Issue` strings the
 /// detail lines are built from are bounded once when the reply is folded
 /// into `read`, so a 1 MiB `description`, `payload`, `matched`,
-/// `remediation` and `note` leave an entry of at most `DETAIL_VALUE_MAX`
-/// cells (and four times that in chars) each, and the pane still draws the
-/// description cut with an ellipsis.
+/// `remediation` and `note` leave an entry of at most 400 cells (the
+/// model's `DETAIL_VALUE_MAX`, and four times that in chars) each, and the
+/// pane still draws the description cut with an ellipsis.
 #[test]
 fn read_issue_strings_are_bounded_at_fold_time() {
     let mut app = app();
@@ -695,7 +703,7 @@ fn read_issue_strings_are_bounded_at_fold_time() {
         .read
         .get(XSS)
         .unwrap_or_else(|| panic!("the reply was folded"));
-    let bounded = |s: &str| s.chars().count() <= 4 * DETAIL_VALUE_MAX && s.ends_with('…');
+    let bounded = |s: &str| s.chars().count() <= 4 * 400 && s.ends_with('…');
     assert!(
         bounded(&read.description),
         "description: {} chars",
@@ -931,31 +939,25 @@ fn app_with_xss_read() -> App {
 fn detail_shows_evidence_and_status_round_trips() {
     let mut app = app_with_xss_read();
     let text = screen(&app);
-    let payload = line_with(&text, "payload").unwrap_or_else(|| panic!("no payload line: {text}"));
-    assert!(
-        payload.contains("<script>aitm-canary()</script>"),
-        "the payload line carries the payload: {payload:?}"
+    // The detail pane's lines, trimmed of the pane padding, pinned
+    // literally (fix round F, F13).
+    assert_eq!(
+        detail_line(&text, "payload"),
+        "payload     <script>aitm-canary()</script>"
     );
-    assert!(
-        line_with(&text, "matched")
-            .is_some_and(|l| l.contains("reflected marker aitm-canary in an HTML text node")),
-        "the matched line: {text}"
+    assert_eq!(
+        detail_line(&text, "matched"),
+        "matched     reflected marker aitm-canary in an HTML text node"
     );
-    assert!(
-        line_with(
-            &text,
-            "Reflected cross-site scripting   high · certain · open"
-        )
-        .is_some(),
-        "the detail's first line names the issue and its verdict: {text}"
+    assert_eq!(
+        detail_line(&text, "Reflected cross-site scripting   "),
+        "Reflected cross-site scripting   high · certain · open",
+        "the detail's first line names the issue and its verdict"
     );
-    assert!(
-        line_with(
-            &text,
-            "c confirm · f false positive · u reopen · ⏎ open flow · P PoC"
-        )
-        .is_some(),
-        "the detail footer: {text}"
+    assert_eq!(
+        detail_line(&text, "c confirm"),
+        "c confirm · f false positive · u reopen · ⏎ open flow · P PoC",
+        "the detail footer"
     );
 
     let reqs = app.update(Action::ScanIssueStatus(IssueStatus::FalsePositive));
@@ -996,17 +998,15 @@ fn detail_shows_evidence_and_status_round_trips() {
         row.contains("false_positive"),
         "the row shows the new status: {row:?}"
     );
-    assert!(
-        line_with(
-            &text,
-            "Reflected cross-site scripting   high · certain · false_positive"
-        )
-        .is_some(),
-        "the detail shows the new status: {text}"
+    assert_eq!(
+        detail_line(&text, "Reflected cross-site scripting   "),
+        "Reflected cross-site scripting   high · certain · false_positive",
+        "the detail shows the new status"
     );
-    assert!(
-        line_with(&text, "note").is_some_and(|l| l.contains("intended behaviour")),
-        "the update's note is shown: {text}"
+    assert_eq!(
+        detail_line(&text, "note "),
+        "note        intended behaviour",
+        "the update's note is shown"
     );
 
     // `c` and `u` travel under their own tokens.
@@ -1133,4 +1133,260 @@ fn open_poc_switches_to_findings_or_toasts() {
     let _ = app.update(Action::ScanOpenPoc);
     assert_eq!(app.mode, Mode::Scan);
     assert_eq!(toast(&app), "this issue has no PoC");
+}
+
+/// Fix round F, F1 (D11 order): the walkable flow list sits between the
+/// evidence and the refs, so on the 200x50 detail the `flows` label's row
+/// lies after the `matched` row and before the `poc` row.
+#[test]
+fn flow_list_is_drawn_between_the_evidence_and_the_poc_ref() {
+    let app = app_with_xss_read();
+    let text = screen(&app);
+    let matched = line_index(&text, "matched     reflected marker")
+        .unwrap_or_else(|| panic!("no matched line: {text}"));
+    let flows =
+        line_index(&text, "flows       ").unwrap_or_else(|| panic!("no flows label: {text}"));
+    let poc = line_index(&text, "poc         poc-3b1c (P)")
+        .unwrap_or_else(|| panic!("no poc line: {text}"));
+    assert!(
+        matched < flows && flows < poc,
+        "matched {matched}, flows {flows}, poc {poc}: {text}"
+    );
+    // The three flows follow the label, probes first then the baseline.
+    assert_eq!(line_index(&text, PROBE_1), Some(flows + 1));
+    assert_eq!(
+        line_index(&text, "16fd2706-8baf-433b-82eb-8c7fada847da"),
+        Some(flows + 3)
+    );
+}
+
+/// Fix round F, F2: before any `scan.issue` reply the detail pane reads the
+/// neutral `no detail read for this row` (true while a read is in flight,
+/// after a failed one and when the verb is missing; the banner says which).
+#[test]
+fn detail_placeholder_is_neutral_before_a_read() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert_eq!(app.scan.issues.detail(), None);
+    let text = screen(&app);
+    assert!(
+        line_with(&text, "no detail read for this row").is_some(),
+        "{text}"
+    );
+    assert!(
+        line_with(&text, "waiting for scan.issue").is_none(),
+        "the old wording is gone: {text}"
+    );
+}
+
+/// Fix round F, F4 (D6 hostile-core bounds): an issue with 100 000 probe
+/// flows folds to `FLOWS_MAX` (64) kept, the rest counted once as a
+/// `... 99936 more` line under the list, and the pane renders at 200x50.
+#[test]
+fn probe_flows_are_bounded_at_fold_time_with_a_more_line() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let mut issue = fixture("scan.issue.json");
+    let flows: Vec<String> = (0..100_000u32)
+        .map(|k| format!("550e8400-e29b-41d4-a716-4466{k:08x}"))
+        .collect();
+    issue["evidence"]["probe_flows"] = json!(flows);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: issue,
+    });
+    let read = app
+        .scan
+        .issues
+        .read
+        .get(XSS)
+        .unwrap_or_else(|| panic!("the reply was folded"));
+    assert_eq!(read.evidence.probe_flows.len(), 64);
+    assert_eq!(read.dropped_flows, 99_936);
+    // `End` lands on the last line; one page up shows the end of the flow
+    // list with its count.
+    let _ = app.update(Action::ScanPaneNext);
+    let _ = app.update(Action::End);
+    let _ = app.update(Action::PageUp);
+    let text = screen(&app);
+    assert_eq!(detail_line(&text, "... 99936 more"), "... 99936 more");
+    assert!(
+        line_with(&text, "550e8400-e29b-41d4-a716-44660000003f").is_some(),
+        "the 64th kept flow: {text}"
+    );
+    assert!(
+        line_with(&text, "550e8400-e29b-41d4-a716-446600000040").is_none(),
+        "the 65th was dropped: {text}"
+    );
+}
+
+/// Fix round F, F5 (D13: hue on data): a name that spells a verdict
+/// (`Debug marker   critical · certain · confirmed`) cannot forge the head
+/// line's hue; the verdict cell takes the issue's real severity hue
+/// (`info`) and the name stays primary text.
+#[test]
+fn head_line_verdict_hue_comes_from_the_typed_severity_not_the_name() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let mut issue = fixture("scan.issue.json");
+    issue["name"] = json!("Debug marker   critical · certain · confirmed");
+    issue["severity"] = json!("info");
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: issue,
+    });
+    let buf = draw(&app, 200, 50);
+    let text = to_text(&buf);
+    let head =
+        line_with(&text, "Debug marker   critical").unwrap_or_else(|| panic!("no head: {text}"));
+    let y = line_index(&text, "Debug marker   critical").unwrap_or_default();
+    assert!(
+        head.contains("Debug marker   critical · certain · confirmed   info · certain · open"),
+        "{head:?}"
+    );
+    let forged = col_of(head, "critical").unwrap_or_default();
+    let real = col_of(head, "   info").unwrap_or_default() + 3;
+    let theme = theme();
+    assert_eq!(
+        Some(cell(&buf, real, y).fg),
+        theme.severity("info").fg,
+        "the verdict cell wears the real severity"
+    );
+    assert_eq!(
+        Some(cell(&buf, forged, y).fg),
+        theme.text_primary().fg,
+        "the forged word in the name is plain primary text"
+    );
+    assert_ne!(
+        Some(cell(&buf, forged, y).fg),
+        theme.severity("critical").fg
+    );
+}
+
+/// Fix round F, F6 and F9: the flow cursor is clamped when an update shrinks
+/// the flow list. Cursor on flow 3 of 3, a `scan.issue.update` reply with a
+/// single probe flow and no baseline: `Enter` opens that one flow.
+#[test]
+fn an_update_that_shrinks_the_flow_list_clamps_the_flow_cursor() {
+    const ONLY: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+    let mut app = app_with_xss_read();
+    let _ = app.on_bus(BusEvent::Flows(vec![summary(
+        ONLY,
+        "GET",
+        "127.0.0.1:8080",
+        "/search?q=x",
+        Some(200),
+        "none",
+    )]));
+    let _ = app.update(Action::ScanPaneNext);
+    let _ = app.update(Action::Down);
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.issues.flow_cursor, 2, "the baseline, flow 3 of 3");
+    let mut update = fixture("scan.issue.update.json");
+    update["evidence"]["probe_flows"] = json!([ONLY]);
+    update["evidence"]["baseline_flow"] = Value::Null;
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue.update:{XSS}"),
+        name: "scan.issue.update".into(),
+        value: update,
+    });
+    assert_eq!(app.scan.issues.flow_cursor, 0, "clamped to the one flow");
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector);
+    assert_eq!(app.selected.as_deref(), Some(ONLY));
+}
+
+/// The fixture issue made tall: twelve timing rows, L4 evidence and its
+/// three flows, read under the XSS row.
+fn app_with_tall_xss_read() -> App {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let mut issue = fixture("scan.issue.json");
+    issue["evidence"]["timing"] = json!({
+        "requested_s": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        "observed_ms": [1010, 2020, 3030, 4040, 5050, 6060, 7070, 8080, 9090, 10100, 11110, 12120],
+        "baseline_ms": [12, 11, 13, 12, 11, 13, 12, 11, 13, 12, 11, 13],
+        "slope": 1004.5,
+        "r": 0.998
+    });
+    issue["evidence"]["l4"] = json!({
+        "sent_hex": "deadbeef",
+        "seed_id": "hello",
+        "rng_seed": 42,
+        "mutation_chain": ["flip", "truncate"],
+        "prior_messages": 3,
+        "oracle": { "kind": "reset" },
+        "liveness_before": true,
+        "liveness_after": false,
+        "reproduced": [2, 3],
+        "scope_entry": "l4-1"
+    });
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: issue,
+    });
+    assert!(
+        app.scan
+            .issues
+            .detail()
+            .is_some_and(|i| i.evidence.l4.is_some()),
+        "the tall issue was read"
+    );
+    app
+}
+
+/// Fix round F, F7: `detail_scroll` is what is drawn; the view follows the
+/// flow cursor only after a flow key. On the tall detail at 90x40 with
+/// Detail focused: `End` leaves the name line, `Home` shows it again with
+/// the flows off screen, `Down` brings the flow row back on screen, and
+/// `PageUp` scrolls away from it again.
+#[test]
+fn paging_keys_reach_the_top_of_a_tall_detail_and_down_follows_the_flow() {
+    let mut app = app_with_tall_xss_read();
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.issues.pane, IssuePane::Detail);
+    const NAME: &str = "Reflected cross-site scripting   high";
+    const FLOW_2: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+    let _ = app.update(Action::End);
+    let text = text_of(&app, 90, 40);
+    assert!(line_with(&text, NAME).is_none(), "End left the top: {text}");
+    assert!(
+        line_with(&text, "seen        1 occurrence").is_some(),
+        "{text}"
+    );
+
+    let _ = app.update(Action::Home);
+    assert_eq!(app.scan.issues.detail_scroll, 0);
+    let text = text_of(&app, 90, 40);
+    assert!(
+        line_with(&text, NAME).is_some(),
+        "Home shows the name: {text}"
+    );
+    assert!(
+        line_with(&text, FLOW_2).is_none(),
+        "the flows are below the fold: {text}"
+    );
+
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.issues.flow_cursor, 1);
+    let text = text_of(&app, 90, 40);
+    assert!(
+        line_with(&text, FLOW_2).is_some_and(|l| l.contains("> ")),
+        "Down brings the flow under the cursor on screen: {text}"
+    );
+
+    let _ = app.update(Action::PageUp);
+    let text = text_of(&app, 90, 40);
+    assert!(
+        line_with(&text, FLOW_2).is_none(),
+        "PageUp scrolls away from the flow again: {text}"
+    );
 }

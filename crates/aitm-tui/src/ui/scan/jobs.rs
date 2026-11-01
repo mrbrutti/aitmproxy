@@ -28,7 +28,7 @@ use crate::scan::{
 use crate::theme::Theme;
 use crate::tokens::color::status;
 use crate::ui::bars::put;
-use crate::ui::scan::{hint, note, pane_rule, stacked, stacked_share, Panes};
+use crate::ui::scan::{hint, labelled, note, pane_rule, stacked, stacked_share, Panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, elide_middle, fit, right, truncate, width};
 
@@ -330,14 +330,7 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
         }
         // `label value`, one space between (the D11 mockup's shape): no
         // label column, so the line reads as the sentence it is.
-        let value_w = w.saturating_sub(1 + width(label) + 1);
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {label}"), theme.text_secondary()),
-            Span::styled(
-                format!(" {}", truncate(&value, value_w)),
-                theme.text_primary(),
-            ),
-        ]));
+        lines.push(labelled(theme, label, &value, w, None));
     }
     let has_footer = area.height >= 2;
     let body_h = usize::from(area.height) - usize::from(has_footer);

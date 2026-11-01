@@ -1,11 +1,12 @@
 //! The Issues tab (spec D2, D11, D13). The list half: the rows sit under
 //! the five severity headers with their `by_severity` counts, a zero header
 //! greyed rather than hidden (spec call 11); the filter banner tops the pane
-//! and the filter keys foot it. The detail half: the read issue's lines
-//! (`scan::issue_detail_lines`, bounded by the model) over the walkable
-//! flow list (`scan::flow_refs`), scrolled by `detail_scroll` with the flow
-//! under the cursor kept on screen, and the status-control footer. The
-//! degraded states are the state banner's (D13: one state on screen).
+//! and the filter keys foot it. The detail half: the read issue's head and
+//! `label value` pairs (`scan::issue_head`, `scan::issue_detail_lines`,
+//! bounded by the model at fold time) around the walkable flow list
+//! (`scan::flow_at`), scrolled by `detail_scroll` with the flow under the
+//! cursor kept on screen, and the status-control footer. The degraded
+//! states are the state banner's (D13: one state on screen).
 //!
 //! Row layout (builder's call, from the D11 mockup): `>` cursor mark, the
 //! confidence glyph pair, the name, `METHOD path_template`, `kind:name` and
@@ -16,6 +17,7 @@
 //! tokens.
 
 use aitm_poc::Severity;
+use aitm_scan_model::FlowRef;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -23,12 +25,13 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::scan::{
-    count_of, flow_refs, grouped, issue_detail_lines, severity_header, IssuePane, IssueRow,
-    ScanOffer, DETAIL_LABEL_W, LOCATION_MAX, NAME_MAX, POINT_MAX,
+    confidence_token, count_of, flow_at, grouped, issue_detail_lines, issue_head, severity_header,
+    severity_token, status_token, DetailLines, FlowTag, IssueHead, IssuePane, IssueRow, ReadIssue,
+    ScanOffer, LOCATION_MAX, NAME_MAX, POINT_MAX,
 };
 use crate::theme::Theme;
 use crate::ui::bars::put;
-use crate::ui::scan::{hint, note, pane_rule, panes};
+use crate::ui::scan::{hint, labelled, note, pane_rule, panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, fit, truncate, width};
 
@@ -44,12 +47,16 @@ const FOOTER: &str = "S severity · C confidence · L lane · T status · J job 
 /// The detail pane's footer (D11): the status controls, the flow open and
 /// the PoC jump.
 const DETAIL_FOOTER: &str = "c confirm · f false positive · u reopen · ⏎ open flow · P PoC";
-/// The detail pane's one line while the cursor's row has no read yet (the
+/// The detail pane's one line while the cursor's row has no read (the
 /// `scan.issue` is in flight, failed, or the verb is missing: the banner
-/// says which).
-const WAITING_FOR_ISSUE: &str = "waiting for scan.issue...";
-/// The label of the flow list, padded like the model's labels.
+/// says which, so this stays neutral; fix round F, F2).
+const NO_DETAIL: &str = "no detail read for this row";
+/// The label of the flow list.
 const FLOWS_LABEL: &str = "flows";
+/// The `label` column every detail line after the head is written with
+/// (`payload     <script>...`): the labels are padded to it so the values
+/// line up, as in the D11 mockup.
+const DETAIL_LABEL_W: usize = 11;
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     match app.scan_offer() {
@@ -207,12 +214,16 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
 }
 
-/// The Detail pane (D11): the read issue's lines over its flow list, or the
-/// waiting line while the row under the cursor has no read; the footer
-/// takes the last row when there are two or more. The scroll is
-/// `detail_scroll`, pulled so the flow under `flow_cursor` is on screen
-/// while the Detail pane is focused (the flow keys would otherwise move a
-/// cursor the operator cannot see).
+/// The Detail pane (D11): the read issue's head line, the lines before the
+/// flows, the walkable flow list (its `flows` label, one line per flow, a
+/// `... n more` line when the fold dropped any), then the lines after the
+/// flows (fix round F, F1), or the placeholder while the row under the
+/// cursor has no read; the footer takes the last row when there are two
+/// or more. The scroll is `detail_scroll`, exactly as drawn, except that
+/// while the Detail pane is focused and `follow_flow` is set (the last key
+/// was a flow key; fix round F, F7) it is pulled so the flow under the
+/// flow cursor is on screen. Only the rows on screen are built (fix round
+/// F, F4).
 fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
@@ -222,55 +233,59 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let body_h = usize::from(area.height) - usize::from(has_footer);
     let body = Rect::new(area.x, area.y, area.width, cells(body_h));
     match issues.detail() {
-        None => note(theme, body, WAITING_FOR_ISSUE, buf),
-        Some(issue) => {
+        None => note(theme, body, NO_DETAIL, buf),
+        Some(read) => {
             let focused = issues.pane == IssuePane::Detail;
-            let w = usize::from(area.width) - 1;
-            let mut lines: Vec<Line<'static>> = issue_detail_lines(issue)
-                .iter()
-                .enumerate()
-                .map(|(k, text)| {
-                    if k == 0 {
-                        head_line(theme, text, w)
-                    } else {
-                        labelled_line(theme, text, w)
+            let w = usize::from(area.width);
+            let lines = issue_detail_lines(read);
+            let layout = DetailLayout::of(&lines, read);
+            let flow_index = issues.flow_index();
+            let mut top = usize::from(issues.detail_scroll).min(layout.total.saturating_sub(1));
+            if focused && issues.follow_flow {
+                if let Some(f) = flow_index {
+                    let flow_line = layout.first_flow + f;
+                    if flow_line < top {
+                        top = flow_line;
+                    } else if flow_line >= top + body_h {
+                        top = flow_line + 1 - body_h;
                     }
-                })
-                .collect();
-            let flows = flow_refs(issue);
-            let first_flow = lines.len() + 1;
-            lines.push(Line::styled(
-                format!(
-                    " {FLOWS_LABEL:<DETAIL_LABEL_W$}{}",
-                    if flows.is_empty() { " none" } else { "" }
-                ),
-                theme.text_secondary(),
-            ));
-            let flow_cursor = issues.flow_cursor.min(flows.len().saturating_sub(1));
-            for (k, (id, tag)) in flows.iter().enumerate() {
-                let under = k == flow_cursor;
-                let mark = if under { ">" } else { " " };
-                let id_w = w.saturating_sub(1 + 1 + 2 + width(tag));
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{mark} "), theme.accent()),
-                    Span::styled(truncate(id, id_w), theme.text_primary()),
-                    Span::styled(format!("  {tag}"), theme.text_tertiary()),
-                ]));
-            }
-            let mut top = usize::from(issues.detail_scroll).min(lines.len().saturating_sub(1));
-            if focused && !flows.is_empty() {
-                let flow_line = first_flow + flow_cursor;
-                if flow_line < top {
-                    top = flow_line;
-                } else if flow_line >= top + body_h {
-                    top = flow_line + 1 - body_h;
                 }
             }
-            for (k, line) in lines.into_iter().enumerate().skip(top).take(body_h) {
+            for k in top..(top + body_h).min(layout.total) {
                 let line_area = Rect::new(area.x, area.y + cells(k - top), area.width, 1);
-                if focused && k == first_flow + flow_cursor && !flows.is_empty() {
+                let row = layout.row(k);
+                if focused && matches!(row, DetailRow::Flow(f) if Some(f) == flow_index) {
                     buf.set_style(line_area, selection_bg(theme));
                 }
+                let line = match row {
+                    DetailRow::Head => head_line(theme, &issue_head(read), w),
+                    DetailRow::Before(i) => {
+                        let (label, value) = &lines.before_flows[i];
+                        labelled(theme, label, value, w, Some(DETAIL_LABEL_W))
+                    }
+                    DetailRow::FlowsLabel => labelled(
+                        theme,
+                        FLOWS_LABEL,
+                        if layout.flows == 0 { "none" } else { "" },
+                        w,
+                        Some(DETAIL_LABEL_W),
+                    ),
+                    DetailRow::Flow(f) => match flow_at(read, f) {
+                        Some((id, tag)) => flow_line(theme, &id, tag, Some(f) == flow_index, w),
+                        None => Line::default(),
+                    },
+                    DetailRow::More => labelled(
+                        theme,
+                        "",
+                        &format!("... {} more", read.dropped_flows),
+                        w,
+                        Some(DETAIL_LABEL_W),
+                    ),
+                    DetailRow::After(i) => {
+                        let (label, value) = &lines.after_flows[i];
+                        labelled(theme, label, value, w, Some(DETAIL_LABEL_W))
+                    }
+                };
                 put(buf, line_area, line);
             }
         }
@@ -285,41 +300,103 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
 }
 
-/// The detail's first line: the name bold, then `severity · confidence ·
-/// status` with the severity in its hue (D13: hue on data).
-fn head_line(theme: &Theme, text: &str, w: usize) -> Line<'static> {
-    let text = truncate(text, w);
-    let Some((name, verdict)) = text.split_once("   ") else {
-        return Line::styled(format!(" {text}"), theme.text_primary());
-    };
-    let mut spans = vec![Span::styled(
-        format!(" {name}   "),
-        theme.text_primary().add_modifier(Modifier::BOLD),
-    )];
-    match verdict.split_once(" · ") {
-        Some((severity, rest)) => {
-            spans.push(Span::styled(severity.to_string(), theme.severity(severity)));
-            spans.push(Span::styled(format!(" · {rest}"), theme.text_secondary()));
-        }
-        None => spans.push(Span::styled(verdict.to_string(), theme.text_secondary())),
-    }
-    Line::from(spans)
+/// What one row of the Detail pane is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailRow {
+    Head,
+    /// `before_flows[i]`.
+    Before(usize),
+    FlowsLabel,
+    /// The `f`th flow of [`flow_at`].
+    Flow(usize),
+    /// The `... n more` line under the flows.
+    More,
+    /// `after_flows[i]`.
+    After(usize),
 }
 
-/// A `label value` detail line: the label column (the model pads it to
-/// `DETAIL_LABEL_W`) in secondary text, the value in primary, cut to `w`.
-fn labelled_line(theme: &Theme, text: &str, w: usize) -> Line<'static> {
-    let split = text
-        .char_indices()
-        .nth(DETAIL_LABEL_W)
-        .map_or(text.len(), |(b, _)| b);
-    let (label, value) = text.split_at(split);
+/// The row arithmetic of the Detail pane: where each run starts, so a frame
+/// maps a row index to what it draws without building the rows before it.
+struct DetailLayout {
+    /// The row of the `flows` label.
+    flows_label: usize,
+    /// The row of the first flow.
+    first_flow: usize,
+    /// How many flows are listed.
+    flows: usize,
+    /// Whether a `... n more` row follows the flows.
+    more: bool,
+    /// The rows in all; `IssuesState::detail_len` counts the same.
+    total: usize,
+}
+
+impl DetailLayout {
+    fn of(lines: &DetailLines, read: &ReadIssue) -> Self {
+        let flows_label = 1 + lines.before_flows.len();
+        let first_flow = flows_label + 1;
+        let flows =
+            read.evidence.probe_flows.len() + usize::from(read.evidence.baseline_flow.is_some());
+        let more = read.dropped_flows > 0;
+        let total = first_flow + flows + usize::from(more) + lines.after_flows.len();
+        Self {
+            flows_label,
+            first_flow,
+            flows,
+            more,
+            total,
+        }
+    }
+
+    fn row(&self, k: usize) -> DetailRow {
+        if k == 0 {
+            DetailRow::Head
+        } else if k < self.flows_label {
+            DetailRow::Before(k - 1)
+        } else if k == self.flows_label {
+            DetailRow::FlowsLabel
+        } else if k < self.first_flow + self.flows {
+            DetailRow::Flow(k - self.first_flow)
+        } else if self.more && k == self.first_flow + self.flows {
+            DetailRow::More
+        } else {
+            DetailRow::After(k - self.first_flow - self.flows - usize::from(self.more))
+        }
+    }
+}
+
+/// The detail's first line: the name bold, then `severity · confidence ·
+/// status` with the severity in its hue (D13: hue on data), each part
+/// styled from the typed value, so a name that spells a verdict cannot
+/// forge the hue (fix round F, F5); the name gives way when the pane is
+/// narrow.
+fn head_line(theme: &Theme, head: &IssueHead<'_>, w: usize) -> Line<'static> {
+    let severity = severity_token(head.severity);
+    let rest = format!(
+        " · {} · {}",
+        confidence_token(head.confidence),
+        status_token(head.status)
+    );
+    let name_w = w.saturating_sub(1 + 3 + width(severity) + width(&rest));
     Line::from(vec![
-        Span::styled(format!(" {label}"), theme.text_secondary()),
         Span::styled(
-            truncate(value, w.saturating_sub(DETAIL_LABEL_W)),
-            theme.text_primary(),
+            format!(" {}   ", truncate(head.name, name_w)),
+            theme.text_primary().add_modifier(Modifier::BOLD),
         ),
+        Span::styled(severity.to_string(), theme.severity(severity)),
+        Span::styled(rest, theme.text_secondary()),
+    ])
+}
+
+/// One flow of the walkable list: the cursor mark, the id cut to the room
+/// the tag leaves, then the tag.
+fn flow_line(theme: &Theme, id: &FlowRef, tag: FlowTag, under: bool, w: usize) -> Line<'static> {
+    let mark = if under { ">" } else { " " };
+    let tag = tag.label();
+    let id_w = w.saturating_sub(1 + 1 + 2 + width(tag) + 1);
+    Line::from(vec![
+        Span::styled(format!("{mark} "), theme.accent()),
+        Span::styled(truncate(&id.to_string(), id_w), theme.text_primary()),
+        Span::styled(format!("  {tag}"), theme.text_tertiary()),
     ])
 }
 
