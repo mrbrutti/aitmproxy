@@ -348,6 +348,10 @@ pub struct JobState {
     pub points_total: AtomicU32,
     /// Why each node's grammar was selected, keyed by node id.
     pub selection: Mutex<HashMap<String, String>>,
+    /// Why a profile seed yielded nothing, keyed by node id: one note per
+    /// seed `corpus::seeds_from_profile` skipped. Counts and reasons only —
+    /// a note never carries a seed byte (spec S9, C11).
+    pub seed_notes: Mutex<HashMap<String, Vec<String>>>,
     /// The discovery cache `probe_host_for` reads, keyed by point id.
     pub points: Mutex<HashMap<String, DiscoveredPoint>>,
     /// The grammar each node speaks, keyed by node id. Only the per-endpoint
@@ -403,6 +407,7 @@ impl JobState {
             campaigns: Mutex::new(HashMap::new()),
             points_total: AtomicU32::new(0),
             selection: Mutex::new(HashMap::new()),
+            seed_notes: Mutex::new(HashMap::new()),
             points: Mutex::new(HashMap::new()),
             grammars: Mutex::new(HashMap::new()),
             created_seq,
@@ -507,6 +512,7 @@ impl fmt::Debug for JobState {
             .field("latency", &lock(&self.latency).len())
             .field("campaigns", &lock(&self.campaigns).len())
             .field("points_total", &self.points_total.load(Ordering::Relaxed))
+            .field("seed_notes", &lock(&self.seed_notes).len())
             .field("points", &lock(&self.points).len())
             .field("grammars", &lock(&self.grammars).len())
             .field("cancelled", &self.cancelled.load(Ordering::Relaxed))

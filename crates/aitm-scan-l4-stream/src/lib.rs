@@ -228,7 +228,7 @@ impl L4StreamLane {
             if let Some(store) = self.store.as_deref() {
                 seeds.extend(corpus::seeds_from_store(store, ip, spec.port, spec.proto));
             }
-            let (profile_seeds, _notes) = corpus::seeds_from_profile(&job.profile().l4.seeds)?;
+            let (profile_seeds, seed_notes) = corpus::seeds_from_profile(&job.profile().l4.seeds)?;
             seeds.extend(profile_seeds);
             dedupe_seeds(&mut seeds);
 
@@ -263,6 +263,7 @@ impl L4StreamLane {
                 reason = %selection,
                 seeds = seeds.len(),
                 seeds_dropped_credential = dropped_credential,
+                seeds_skipped = seed_notes.len(),
                 points = points.len(),
                 points_dropped,
                 "l4_stream discover"
@@ -273,6 +274,9 @@ impl L4StreamLane {
             // back the pending stub (spec S5.5).
             lock(&job_state.grammars).insert(node_id.clone(), Arc::clone(&grammar));
             lock(&job_state.selection).insert(node_id.clone(), selection);
+            if !seed_notes.is_empty() {
+                lock(&job_state.seed_notes).insert(node_id.clone(), seed_notes);
+            }
             {
                 let mut held = lock(&job_state.points);
                 for point in &points {

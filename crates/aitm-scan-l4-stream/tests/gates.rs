@@ -956,3 +956,100 @@ fn count_from_names_the_count_field_in_the_shipped_grammars() {
             .map(|args| args.children.len()))
     );
 }
+
+// ---------------------------------------------------------------------------
+// SPEC-I2 / QUAL-I2: a skipped profile seed is reported, not dropped
+// ---------------------------------------------------------------------------
+
+/// A seed the corpus could not use is counted on the discovery line and named
+/// in the verdict, so an operator who wrote one learns why nothing came of it.
+///
+/// `flow:` seeds are the case that bites: the HTTP lanes take them, this lane
+/// seeds from captured **L4** packets, and until now the note explaining that
+/// was computed and thrown away.
+#[tokio::test]
+async fn a_skipped_profile_seed_is_counted_and_named() {
+    use aitm_core::FlowId;
+    use aitm_scan_model::FlowRef;
+
+    let (_guard, lines) = common::capture_tracing();
+
+    // Port 9008 is this test's alone: the capture sink is global and the
+    // other tests in this binary run beside it.
+    let mut profile = profile_for(
+        "127.0.0.1",
+        9008,
+        Some("raw"),
+        10,
+        &hex_seeds(&[b"\x00\xff"]),
+    );
+    profile.l4.seeds.insert(
+        0,
+        L4Seed::Flow {
+            flow: FlowRef(FlowId::new()),
+        },
+    );
+
+    let target = profile.target.clone();
+    let client = Arc::new(CountingClient::dry_run());
+    let lane = lane_with_client(
+        Some(common::wildcard_guard(&[9008])),
+        None,
+        Arc::clone(&client) as Arc<dyn StreamClient>,
+    );
+    // The deadline has already passed, so the campaign stops at its baseline
+    // and the verdict is the S6.5 detail line and nothing else.
+    let job: Arc<dyn JobCtx> = Arc::new(
+        TestJob::new(profile)
+            .with_job_id("22seed")
+            .with_marker("aitm22seed")
+            .with_deadline(Instant::now() - Duration::from_secs(1)),
+    );
+    let discovery = lane
+        .discover(&target, job.as_ref())
+        .await
+        .expect("an unusable seed is skipped, not a discovery failure");
+    assert_eq!(
+        discovery.points.len(),
+        1,
+        "the one usable seed is still a point"
+    );
+
+    let recorded = lines.lock().expect("the capture sink").clone();
+    assert!(
+        !recorded.is_empty(),
+        "the capture recorded nothing at all, so nothing below is proven"
+    );
+    let mine: Vec<&String> = recorded
+        .iter()
+        .filter(|line| {
+            line.contains("l4_stream discover") && line.contains("node=l4s-tcp-127.0.0.1-9008")
+        })
+        .collect();
+    assert_eq!(mine.len(), 1, "one discovery line per endpoint: {mine:?}");
+    assert!(
+        mine[0].contains("seeds_skipped=1"),
+        "the discovery line does not count the skipped seed: {}",
+        mine[0]
+    );
+
+    let point = &discovery.points[0];
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts the point");
+    let verdict = check_by_id(&lane.checks(), "l4-crash")
+        .run(point, host.as_ref())
+        .await;
+
+    assert!(
+        verdict.detail.contains("flow seeds are not L4 flows"),
+        "the verdict does not say why the seed was skipped: {}",
+        verdict.detail
+    );
+    assert!(
+        verdict.detail.contains("seed_notes=["),
+        "the notes are not in the S6.5 detail line: {}",
+        verdict.detail
+    );
+    assert_eq!(client.count(), 0, "a passed deadline opens no exchange");
+}

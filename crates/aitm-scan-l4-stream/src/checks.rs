@@ -64,6 +64,9 @@ const MAX_PAYLOAD_HEX: usize = 256;
 /// The bound on the reply excerpt kept for `Evidence::matched` (spec S6.3).
 const MAX_REPLY_EXCERPT: usize = 256;
 
+/// The bound on the `seed_notes=[...]` clause of the S6.5 detail line.
+const MAX_SEED_NOTES: usize = 2048;
+
 /// How often the recovery wait re-probes a target that went away (S6.2).
 const RECOVERY_POLL: Duration = Duration::from_secs(1);
 
@@ -1184,7 +1187,7 @@ fn detail_base(campaign: &Campaign, job: &JobState, dp: Option<&DiscoveredPoint>
             "unknown".to_string(),
         ),
     };
-    format!(
+    let line = format!(
         "l4_stream {grammar} {endpoint} point={path} cases={sent}/{planned} \
          skipped_denylisted={denylisted} skipped_too_large={too_large} \
          liveness_probes={probes} liveness_failures={failures} rate_waits={waits} \
@@ -1198,7 +1201,27 @@ fn detail_base(campaign: &Campaign, job: &JobState, dp: Option<&DiscoveredPoint>
         waits = campaign.rate_waits,
         skipped_framing = campaign.latency_skipped_framing,
         stop = campaign.stopped.token(),
-    )
+    );
+    match seed_notes(job, dp) {
+        Some(notes) => format!("{line} seed_notes=[{notes}]"),
+        None => line,
+    }
+}
+
+/// The endpoint's skipped-seed notes, bounded (spec S5.2, SPEC-I2).
+///
+/// A profile seed this lane cannot use — a `flow:` reference, an empty or
+/// over-long one — is skipped at discovery with a note saying why. The note
+/// is the operator's only sign that the seed they wrote yielded nothing, so
+/// it rides the verdict as well as the discovery line. Reasons and indices
+/// only: `corpus::seeds_from_profile` never puts a seed byte in one.
+fn seed_notes(job: &JobState, dp: Option<&DiscoveredPoint>) -> Option<String> {
+    let node_id = &dp?.node_id;
+    let notes = lock(&job.seed_notes).get(node_id)?.join("; ");
+    if notes.is_empty() {
+        return None;
+    }
+    Some(truncate(notes, MAX_SEED_NOTES))
 }
 
 /// `tcp` or `udp`.
