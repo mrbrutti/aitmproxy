@@ -1560,7 +1560,7 @@ impl App {
                 let ours = self
                     .system_proxy
                     .as_ref()
-                    .is_some_and(|w| w.state == "points_at_us");
+                    .is_some_and(SystemProxyWord::points_at_us);
                 let line = if ours { "sysproxy off" } else { "sysproxy on" };
                 out.extend(self.run_command(line));
             }
@@ -3338,6 +3338,16 @@ impl App {
                     return out;
                 }
                 if tool != "proxy.system.status" {
+                    // One change at a time: ours in flight, or the core's
+                    // `setting` flag from another client's call. The core
+                    // would refuse the second call anyway, and that refusal
+                    // would wrongly settle the first one's pill.
+                    let in_flight = self.sysproxy_setting
+                        || self.system_proxy.as_ref().is_some_and(|w| w.setting);
+                    if in_flight {
+                        self.toast(Level::Warn, "system proxy change already in flight");
+                        return out;
+                    }
                     self.sysproxy_setting = true;
                 }
                 out.push(BusRequest::Call {
@@ -3753,7 +3763,12 @@ impl App {
                         }
                         self.toast(Level::Info, sysproxy_detail(&name, &value));
                     }
+                    // A status reply is a read: it refreshes the word when it
+                    // parses but never settles our in-flight flag.
                     "proxy.system.status" => {
+                        if let Some(word) = SystemProxyWord::from_json(&value) {
+                            self.system_proxy = Some(word);
+                        }
                         self.toast(Level::Info, sysproxy_detail(&name, &value));
                     }
                     "flow.clear" => {
@@ -4159,7 +4174,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("agent", "Open the agent panel and activity log"),
     (
         "sysproxy on|off|status",
-        "set / restore the OS system proxy (key s)",
+        "Set / restore the OS system proxy (s)",
     ),
     ("ca", "CA panel: status, export, install, uninstall"),
     ("config", "Config panel: the redacted config.get view"),
@@ -6297,6 +6312,137 @@ mod tests {
         assert_eq!(
             app.system_proxy, None,
             "a poll without the key clears the word"
+        );
+    }
+
+    /// F-tui 1 (review log, plan 2026-10-31-system-proxy-automation): a
+    /// second `s` / `:sysproxy on|off` while a change is in flight — ours or
+    /// the core's `setting` flag — is refused with a Warn toast and no call;
+    /// `:sysproxy status` still goes through mid-flight.
+    #[test]
+    fn a_second_toggle_mid_flight_is_refused_with_a_warn_toast() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting);
+
+        // The second toggle: no call, the Warn toast, the flag untouched.
+        assert!(app.update(Action::ToggleSysProxy).is_empty());
+        let t = app.current_toast().expect("the in-flight toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "system proxy change already in flight");
+        assert!(
+            app.sysproxy_setting,
+            "the refusal does not settle our flight"
+        );
+
+        // The same for both typed forms.
+        assert!(app.run_command(":sysproxy on").is_empty());
+        assert!(app.run_command(":sysproxy off").is_empty());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("system proxy change already in flight")
+        );
+
+        // `status` only reads; it is allowed mid-flight.
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+        assert!(app.sysproxy_setting);
+
+        // The core's own `setting` flag (another client's call) guards too,
+        // and the refusal does not raise our flag.
+        app.sysproxy_setting = false;
+        app.system_proxy = Some(SystemProxyWord {
+            setting: true,
+            ..sysproxy_word("off")
+        });
+        assert!(app.run_command(":sysproxy on").is_empty());
+        let t = app.current_toast().expect("the core-flag toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "system proxy change already in flight");
+        assert!(!app.sysproxy_setting);
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+    }
+
+    /// F-tui 4: a `proxy.system.status` reply that parses updates the word
+    /// (the toast stays `detail`) and never touches our in-flight flag.
+    #[test]
+    fn status_reply_updates_the_word_without_touching_the_flag() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+        let reply = json!({"state": "other", "host": "127.0.0.1", "port": 9090,
+            "managed_by_us": false, "setting": false, "supported": true,
+            "detail": "HTTP and HTTPS → 127.0.0.1:9090 (not this core)"});
+
+        // Not in flight: the word follows the reply, the flag stays down.
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: reply.clone(),
+        });
+        assert!(!app.sysproxy_setting);
+        let word = app.system_proxy.as_ref().expect("the reply's word");
+        assert_eq!(word.state, "other");
+        assert_eq!(word.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(word.port, Some(9090));
+        assert_eq!(
+            word.pill(app.sysproxy_setting).as_deref(),
+            Some("· sys-proxy → 127.0.0.1:9090")
+        );
+        let t = app.current_toast().expect("the status toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "HTTP and HTTPS → 127.0.0.1:9090 (not this core)");
+
+        // Mid-flight: the word still follows, the flag stays up.
+        app.system_proxy = Some(sysproxy_word("off"));
+        let _ = app.run_command(":sysproxy on");
+        assert!(app.sysproxy_setting);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: reply,
+        });
+        assert!(
+            app.sysproxy_setting,
+            "a status reply is not our set's reply"
+        );
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("other")
+        );
+
+        // A reply that does not parse keeps the word (and the fallback toast).
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: json!(null),
+        });
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("other")
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("proxy.system.status: ok")
         );
     }
 }

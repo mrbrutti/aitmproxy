@@ -609,6 +609,12 @@ impl SystemProxyWord {
         })
     }
 
+    /// Whether the OS system proxy points at this core (`state ==
+    /// points_at_us`); the toggle's only question (§D14 `off` when ours).
+    pub fn points_at_us(&self) -> bool {
+        self.state == "points_at_us"
+    }
+
     /// The §D12 pill word that follows the listening address. `in_flight`
     /// is this TUI's own pending set/unset; the core's `setting` flag
     /// (another client's call) renders the same word. `None` for
@@ -1363,6 +1369,37 @@ mod tests {
         let wrong = ProxyStatus::from_json(&json!({"listening":true,"system_proxy":"off"}));
         assert_eq!(wrong.system_proxy, None);
         assert_eq!(SystemProxyWord::from_json(&json!(null)), None);
+    }
+
+    /// F-tui 3: `points_at_us()` is the one place that knows the state's
+    /// spelling; the toggle in `app.rs` asks it instead of comparing a literal.
+    #[test]
+    fn system_proxy_word_points_at_us_is_exact() {
+        let with_state = |state: &str| SystemProxyWord {
+            state: state.into(),
+            supported: true,
+            ..SystemProxyWord::default()
+        };
+        assert!(with_state("points_at_us").points_at_us());
+        for s in [
+            "other",
+            "off",
+            "needs_privilege",
+            "unsupported",
+            "unknown",
+            "",
+            "Points_At_Us",
+            "points_at_us ",
+        ] {
+            assert!(!with_state(s).points_at_us(), "{s:?} must not read as ours");
+        }
+        // `setting` and `managed_by_us` do not change the answer.
+        let ours = SystemProxyWord {
+            setting: true,
+            managed_by_us: false,
+            ..with_state("points_at_us")
+        };
+        assert!(ours.points_at_us());
     }
 
     #[test]

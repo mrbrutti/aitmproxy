@@ -38,10 +38,7 @@ fn word(state: &str) -> SystemProxyWord {
 
 /// The toolbar row at 160 columns, styles dropped, trailing spaces trimmed.
 fn toolbar_text(app: &App) -> String {
-    let area = Rect::new(0, 0, 160, 1);
-    let mut buf = Buffer::empty(area);
-    toolbar(app, &theme(), area, &mut buf);
-    to_text(&buf).trim_end().to_string()
+    toolbar_at(app, 160)
 }
 
 #[test]
@@ -94,28 +91,47 @@ fn pill_shows_the_word_table() {
     );
 }
 
+/// The toolbar row at `cols` columns, styles dropped, trailing spaces trimmed.
+fn toolbar_at(app: &App, cols: u16) -> String {
+    let area = Rect::new(0, 0, cols, 1);
+    let mut buf = Buffer::empty(area);
+    toolbar(app, &theme(), area, &mut buf);
+    to_text(&buf).trim_end().to_string()
+}
+
 /// The `: palette · layout · b sidebar` hints are a courtesy: at 160 columns
-/// they show beside a bare listening pill and yield when the system-proxy
-/// word would otherwise be clipped against the agent toggle.
+/// they show beside a bare listening pill and yield when a long `other`
+/// word would otherwise be clipped against the agent toggle; at 220 columns
+/// the same word and the hints both fit, so both render.
 #[test]
 fn toolbar_hints_yield_to_the_pill_word() {
     let mut app = listening_app();
-    let t = toolbar_text(&app);
+    let t = toolbar_at(&app, 160);
     assert!(t.contains("listening 127.0.0.1:8080"), "{t:?}");
     assert!(t.contains("b sidebar"), "hints shown without a word: {t:?}");
 
+    // A corporate proxy host drives the yield, not ambient text widths.
     app.system_proxy = Some(SystemProxyWord {
-        host: Some("127.0.0.1".into()),
-        port: Some(9090),
+        host: Some("proxy.corp.example.internal".into()),
+        port: Some(3128),
         ..word("other")
     });
-    let t = toolbar_text(&app);
+    let t = toolbar_at(&app, 160);
     assert!(
-        t.contains("· sys-proxy → 127.0.0.1:9090"),
+        t.contains("listening 127.0.0.1:8080 · sys-proxy → proxy.corp.example.internal:3128"),
         "the word is whole: {t:?}"
     );
     assert!(!t.contains("b sidebar"), "hints yielded: {t:?}");
     assert!(t.contains("[⚙ Agent"), "the agent toggle stays: {t:?}");
+
+    // The other direction: wide enough for both, both are present.
+    let t = toolbar_at(&app, 220);
+    assert!(
+        t.contains("listening 127.0.0.1:8080 · sys-proxy → proxy.corp.example.internal:3128"),
+        "the word is whole at 220: {t:?}"
+    );
+    assert!(t.contains("b sidebar"), "hints return at 220: {t:?}");
+    assert!(t.contains("[⚙ Agent"), "the agent toggle at 220: {t:?}");
 }
 
 #[test]
@@ -140,13 +156,41 @@ fn help_overlay_names_key_s_and_keeps_its_footer() {
     );
 }
 
+/// The palette entry's exact tuple; the neighbours' casing ("Set the agent
+/// policy", "Open the scope panel") and the bare key in parentheses. The
+/// tester's `palette_finds_sysproxy_by_name_and_description_and_enter_shows_usage`
+/// drives the same text through the overlay.
 #[test]
 fn palette_lists_the_sysproxy_command() {
     assert!(
         BUILTIN_COMMANDS.contains(&(
             "sysproxy on|off|status",
-            "set / restore the OS system proxy (key s)"
+            "Set / restore the OS system proxy (s)"
         )),
         "BUILTIN_COMMANDS: {BUILTIN_COMMANDS:?}"
     );
+}
+
+/// F-tui 2: `toolbar` adds four widths; a host wide enough to saturate
+/// `cells()` must not overflow the sum (a debug-build panic before the fix).
+/// The agent toggle and the left cluster still render; the word is clipped.
+#[test]
+fn toolbar_survives_a_host_that_saturates_the_cell_width() {
+    let mut app = listening_app();
+    app.system_proxy = Some(SystemProxyWord {
+        host: Some("h".repeat(70_000)),
+        port: Some(3128),
+        ..word("other")
+    });
+    for cols in [1u16, 80, 150, 160, 240, u16::MAX] {
+        let area = Rect::new(0, 0, cols, 1);
+        let mut buf = Buffer::empty(area);
+        toolbar(&app, &theme(), area, &mut buf);
+        let t = to_text(&buf);
+        if cols >= 160 {
+            assert!(t.contains("aitmproxy"), "left cluster at {cols}: {t:?}");
+            assert!(t.contains("[⚙ Agent"), "agent toggle at {cols}: {t:?}");
+            assert!(!t.contains("b sidebar"), "hints must yield at {cols}");
+        }
+    }
 }

@@ -616,7 +616,7 @@ fn palette_finds_sysproxy_by_name_and_description_and_enter_shows_usage() {
     let items = app.palette_items();
     let first = items.first().expect("a match");
     assert_eq!(first.label, ":sysproxy on|off|status");
-    assert_eq!(first.detail, "set / restore the OS system proxy (key s)");
+    assert_eq!(first.detail, "Set / restore the OS system proxy (s)");
     assert_eq!(
         first.kind,
         PaletteKind::Command("sysproxy on|off|status".into())
@@ -625,7 +625,7 @@ fn palette_finds_sysproxy_by_name_and_description_and_enter_shows_usage() {
     let line = line_with(&text, ":sysproxy on|off|status")
         .unwrap_or_else(|| panic!("palette overlay lacks the entry:\n{text}"));
     assert!(
-        line.contains("set / restore the OS system proxy (key s)"),
+        line.contains("Set / restore the OS system proxy (s)"),
         "{line:?}"
     );
 
@@ -637,7 +637,7 @@ fn palette_finds_sysproxy_by_name_and_description_and_enter_shows_usage() {
     assert_eq!(app.mode, Mode::Flows);
 
     // By description, and by the key hint.
-    for q in ["system proxy", "key s", "restore"] {
+    for q in ["system proxy", "(s)", "restore"] {
         app.prompt = q.into();
         assert!(
             app.palette_items()
