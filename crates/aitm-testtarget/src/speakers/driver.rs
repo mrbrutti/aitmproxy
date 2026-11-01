@@ -98,6 +98,7 @@ impl L4Services {
                     let addr = listener.local_addr()?;
                     let task = tokio::spawn(run_tcp(
                         def,
+                        addr,
                         listener,
                         mode,
                         log.clone(),
@@ -413,30 +414,31 @@ async fn read_event(stream: &mut TcpStream, scratch: &mut [u8], pending: bool) -
     }
 }
 
-/// Accept loop with the crash window: serve `listener` until a connection
-/// crashes, then drop it, signal every open connection, wait out the window
-/// and rebind the same address.
+/// Accept loop with the crash window: serve `first` (bound on `addr`) until
+/// a connection crashes, then drop it, signal every open connection, wait
+/// out the window and rebind `addr`.
 async fn run_tcp(
     def: ServiceDef,
+    addr: SocketAddr,
     first: TcpListener,
     mode: SeedMode,
     log: Arc<ControlLog>,
     window: Arc<CrashWindow>,
     conn_ids: Arc<AtomicU64>,
 ) {
-    let Ok(addr) = first.local_addr() else {
-        return;
-    };
     let mut next = Some(first);
     loop {
         let listener = match next.take() {
             Some(listener) => listener,
             None => match rebind(addr).await {
-                Some(listener) => listener,
+                Ok(listener) => listener,
                 // The port could not be reclaimed within the budget; the
                 // service stays down rather than moving ports under the
-                // operator.
-                None => return,
+                // operator, and says so where the harness can see it.
+                Err(err) => {
+                    log_rebind_failure(&log, def.name, &err);
+                    return;
+                }
             },
         };
         let (down_tx, down_rx) = watch::channel(false);
@@ -485,18 +487,26 @@ async fn run_tcp(
 }
 
 /// Bind `addr` again after a crash window, retrying `AddrInUse` every
-/// [`REBIND_RETRY`] for up to [`REBIND_BUDGET`].
-async fn rebind(addr: SocketAddr) -> Option<TcpListener> {
+/// [`REBIND_RETRY`] for up to [`REBIND_BUDGET`]; the last error otherwise.
+async fn rebind(addr: SocketAddr) -> io::Result<TcpListener> {
     let deadline = Instant::now() + REBIND_BUDGET;
     loop {
         match TcpListener::bind(addr).await {
-            Ok(listener) => return Some(listener),
+            Ok(listener) => return Ok(listener),
             Err(e) if e.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
                 sleep(REBIND_RETRY).await;
             }
-            Err(_) => return None,
+            Err(e) => return Err(e),
         }
     }
+}
+
+/// Make a dead service observable: one open-ended `downtime` row (`conn_id`
+/// `-`, `up_at_ms` `u64::MAX`, an empty trigger) on `/log/l4`, and one line
+/// on stderr with the `io::Error`.
+fn log_rebind_failure(log: &ControlLog, service: &str, err: &io::Error) {
+    log.l4_downtime(service, "-", ControlLog::now_ms(), u64::MAX, &[]);
+    eprintln!("aitm-testtarget: {service}: cannot rebind after the crash window ({err}); the service stays down");
 }
 
 // --- UDP ---------------------------------------------------------------------
@@ -716,6 +726,31 @@ mod tests {
         assert_eq!(svc.addr("l4-resp"), Some(a));
         assert_eq!(svc.addr("l4-dns-fault"), Some(b));
         assert_eq!(svc.addr("l4-mqtt"), None);
+    }
+
+    #[test]
+    fn rebind_failure_writes_an_open_ended_downtime_row() {
+        // A speaker that cannot reclaim its port after the window must not
+        // vanish silently: one `downtime` row with no end and no trigger.
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let err = io::Error::new(io::ErrorKind::AddrInUse, "address in use");
+        log_rebind_failure(&log, "l4-resp", &err);
+        let l4 = log.l4_json(Some("l4-resp"));
+        let rows = l4["services"]["l4-resp"]["downtime"]
+            .as_array()
+            .cloned()
+            .expect("downtime array");
+        assert_eq!(rows.len(), 1, "{l4}");
+        let row = &rows[0];
+        assert_eq!(row["service"], serde_json::json!("l4-resp"));
+        assert_eq!(row["conn_id"], serde_json::json!("-"));
+        assert_eq!(row["up_at_ms"], serde_json::json!(u64::MAX));
+        let down_at = row["down_at_ms"].as_u64().expect("down_at_ms");
+        assert!(down_at > 0 && down_at <= ControlLog::now_ms(), "{row}");
+        assert_eq!(
+            row["trigger_sha256"],
+            serde_json::json!(crate::log::sha256_hex(b""))
+        );
     }
 
     // --- Tester additions (stage 5) ---
