@@ -12,6 +12,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod checks;
+pub mod client;
+pub mod codec;
+pub mod corpus;
+pub mod denylist;
+pub mod frame;
+pub mod grammar;
+pub mod grammars;
+pub mod host;
+pub mod infer;
+pub mod mutate;
+pub mod oracle;
+pub mod spec;
+pub mod state;
+pub mod tree;
+
 use std::sync::Arc;
 
 use aitm_proto_l4::flow::L4FlowStore;
