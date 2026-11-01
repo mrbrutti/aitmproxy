@@ -537,4 +537,192 @@ mod tests {
         assert_eq!(names_a_command("run sudo now"), Some("sudo"));
         assert_eq!(names_a_command("PKEXEC_UID is 0"), None);
     }
+
+    // ---- Tester edge cases (stage 5, unit p2) ------------------------------
+
+    #[test]
+    fn tester_uid_max_is_an_ordinary_uid_for_both_checks() {
+        assert_eq!(invoking_user(u32::MAX, env("0")), Ok(u32::MAX));
+        assert_eq!(invoking_user(u32::MAX, None), Ok(u32::MAX));
+        let dir = PathMeta {
+            uid: u32::MAX,
+            ..good_dir()
+        };
+        assert_eq!(check_socket_path(&good_socket(), &dir, u32::MAX), Ok(()));
+        assert_eq!(
+            check_socket_path(&good_socket(), &dir, 1000),
+            Err(
+                "socket directory is owned by uid 4294967295, not the invoking user 1000"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            check_socket_path(&good_socket(), &good_dir(), u32::MAX),
+            Err(
+                "socket directory is owned by uid 1000, not the invoking user 4294967295"
+                    .to_string()
+            )
+        );
+        // uid 0 is refused upstream by invoking_user; the path check itself
+        // treats it as any other owner.
+        let root_dir = PathMeta {
+            uid: 0,
+            ..good_dir()
+        };
+        assert_eq!(check_socket_path(&good_socket(), &root_dir, 0), Ok(()));
+        assert_eq!(
+            check_socket_path(&good_socket(), &root_dir, 1000),
+            Err("socket directory is owned by uid 0, not the invoking user 1000".to_string())
+        );
+    }
+
+    #[test]
+    fn tester_special_mode_bits_on_the_directory_are_ignored_by_design() {
+        // Only the low nine bits are compared (the existing design, see
+        // `mode_check_compares_only_the_permission_bits`): a setuid, setgid
+        // or sticky bit on an otherwise 0700 directory passes. Tester finding
+        // for the panel: spec §5.1 says "mode 0700"; decide whether the
+        // special bits should refuse too.
+        for mode in [0o044_700_u32, 0o042_700, 0o041_700, 0o047_700] {
+            assert_eq!(
+                check_socket_path(&good_socket(), &PathMeta { mode, ..good_dir() }, 1000),
+                Ok(()),
+                "{mode:o}"
+            );
+        }
+        // Any difference in the nine bits is refused, naming those bits only.
+        for (mode, text) in [
+            (0o044_000_u32, "socket directory mode is 0000, not 0700"),
+            (0o040_777, "socket directory mode is 0777, not 0700"),
+            (0o040_600, "socket directory mode is 0600, not 0700"),
+            (0o040_701, "socket directory mode is 0701, not 0700"),
+            (0o040_070, "socket directory mode is 0070, not 0700"),
+        ] {
+            assert_eq!(
+                check_socket_path(&good_socket(), &PathMeta { mode, ..good_dir() }, 1000),
+                Err(text.to_string()),
+                "{mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn tester_check_order_is_socket_first_then_directory() {
+        // Every property wrong at once: the socket's symlink check speaks
+        // first, then its type, then the directory's symlink, type, owner
+        // and mode, each named alone.
+        let bad = PathMeta {
+            is_socket: false,
+            is_dir: false,
+            is_symlink: true,
+            uid: 7,
+            mode: 0o120_777,
+        };
+        assert_eq!(
+            check_socket_path(&bad, &bad, 1000),
+            Err("socket path is a symlink".to_string())
+        );
+        let not_sock = PathMeta {
+            is_symlink: false,
+            ..bad
+        };
+        assert_eq!(
+            check_socket_path(&not_sock, &bad, 1000),
+            Err("socket path is not a Unix socket".to_string())
+        );
+        assert_eq!(
+            check_socket_path(&good_socket(), &bad, 1000),
+            Err("socket directory is a symlink".to_string())
+        );
+        let not_dir = PathMeta {
+            is_symlink: false,
+            ..bad
+        };
+        assert_eq!(
+            check_socket_path(&good_socket(), &not_dir, 1000),
+            Err("socket directory is not a directory".to_string())
+        );
+        let foreign = PathMeta {
+            is_dir: true,
+            ..not_dir
+        };
+        assert_eq!(
+            check_socket_path(&good_socket(), &foreign, 1000),
+            Err("socket directory is owned by uid 7, not the invoking user 1000".to_string())
+        );
+        let wide = PathMeta {
+            uid: 1000,
+            ..foreign
+        };
+        assert_eq!(
+            check_socket_path(&good_socket(), &wide, 1000),
+            Err("socket directory mode is 0777, not 0700".to_string())
+        );
+        // The socket's own owner and mode are not part of the check.
+        let odd_socket = PathMeta {
+            uid: 7,
+            mode: 0o140_000,
+            ..good_socket()
+        };
+        assert_eq!(check_socket_path(&odd_socket, &good_dir(), 1000), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tester_pkexec_uid_odd_encodings() {
+        use std::os::unix::ffi::OsStrExt;
+        // Leading zeros are still a decimal u32 (pkexec writes %d, so this
+        // never arrives; harmless either way).
+        assert_eq!(invoking_user(0, env("0001000")), Ok(1000));
+        // Non-ASCII digits, valid UTF-8, are not a decimal uid.
+        assert_eq!(
+            invoking_user(0, env("١٠٠٠")),
+            Err("PKEXEC_UID is not a decimal uid".to_string())
+        );
+        assert_eq!(
+            invoking_user(0, env("１０００")),
+            Err("PKEXEC_UID is not a decimal uid".to_string())
+        );
+        // Non-UTF-8 of every shape: a lone continuation byte, an overlong
+        // encoding, a truncated sequence, a digit after a bad byte.
+        for bad in [
+            &[0xff][..],
+            &[0xc0, 0x80],
+            &[b'1', 0xe2, 0x82],
+            &[0x80, b'1'],
+            &[b'1', b'0', b'0', b'0', 0xff],
+        ] {
+            assert_eq!(
+                invoking_user(0, Some(OsStr::from_bytes(bad))),
+                Err("PKEXEC_UID is not a decimal uid".to_string()),
+                "{bad:?}"
+            );
+            // A caller that is not root ignores it entirely.
+            assert_eq!(
+                invoking_user(1000, Some(OsStr::from_bytes(bad))),
+                Ok(1000),
+                "{bad:?}"
+            );
+        }
+        // An embedded NUL cannot come from the environment; the parser does
+        // not care either way.
+        assert_eq!(
+            invoking_user(0, env("10\u{0}00")),
+            Err("PKEXEC_UID is not a decimal uid".to_string())
+        );
+        // All zeros is still zero.
+        assert_eq!(
+            invoking_user(0, env("0000")),
+            Err("PKEXEC_UID is 0: the helper never serves as root".to_string())
+        );
+        // u32::MAX + 1 and a 40-digit value are refused as not a uid.
+        assert_eq!(
+            invoking_user(0, env("4294967296")),
+            Err("PKEXEC_UID is not a decimal uid".to_string())
+        );
+        assert_eq!(
+            invoking_user(0, env(&"9".repeat(40))),
+            Err("PKEXEC_UID is not a decimal uid".to_string())
+        );
+    }
 }

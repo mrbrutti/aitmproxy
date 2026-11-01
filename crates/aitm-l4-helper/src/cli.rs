@@ -292,4 +292,177 @@ mod tests {
             }
         }
     }
+
+    // ---- Tester edge cases (stage 5, unit p2) ------------------------------
+
+    #[test]
+    fn tester_connect_given_twice_is_an_unexpected_argument() {
+        let err = parse(&args(&["serve", "--connect", "/a", "--connect", "/b"]))
+            .expect_err("second --connect refused");
+        assert_eq!(err, UsageError::UnexpectedArgument("--connect".to_string()));
+        assert_eq!(err.to_string(), "unexpected argument: --connect");
+        // Any flag after the path is refused the same way.
+        let err = parse(&args(&["serve", "--connect", "/a", "--dry-run"]))
+            .expect_err("flag after the path refused");
+        assert_eq!(err.to_string(), "unexpected argument: --dry-run");
+    }
+
+    #[test]
+    fn tester_connect_path_limit_counts_bytes_not_characters() {
+        // "/" + 53 x "é" (2 bytes each) = 107 bytes but only 54 characters.
+        let path = format!("/{}", "é".repeat(53));
+        assert_eq!(path.len(), 107);
+        assert_eq!(path.chars().count(), 54);
+        assert_eq!(
+            parse(&args(&["serve", "--connect", &path])),
+            Ok(Mode::Serve {
+                connect: PathBuf::from(&path)
+            })
+        );
+        // One more ASCII byte: 108 bytes, refused.
+        let long = format!("{path}a");
+        assert_eq!(long.len(), 108);
+        assert_eq!(
+            parse(&args(&["serve", "--connect", &long])),
+            Err(UsageError::ConnectPathTooLong)
+        );
+        // "/" + 26 x "😀" (4 bytes each) + "aa" = 107 bytes, 29 characters.
+        let emoji = format!("/{}aa", "😀".repeat(26));
+        assert_eq!(emoji.len(), 107);
+        assert_eq!(emoji.chars().count(), 29);
+        assert!(parse(&args(&["serve", "--connect", &emoji])).is_ok());
+        let emoji_long = format!("/{}aaa", "😀".repeat(26));
+        assert_eq!(emoji_long.len(), 108);
+        assert_eq!(
+            parse(&args(&["serve", "--connect", &emoji_long])),
+            Err(UsageError::ConnectPathTooLong)
+        );
+    }
+
+    #[test]
+    fn tester_double_dash_is_never_special() {
+        assert_eq!(
+            parse(&args(&["--"])),
+            Err(UsageError::UnknownSubcommand("--".to_string()))
+        );
+        assert_eq!(
+            parse(&args(&["serve", "--", "--connect", "/a"])),
+            Err(UsageError::ServeShape)
+        );
+        assert_eq!(
+            parse(&args(&["probe", "--"])),
+            Err(UsageError::UnexpectedArgument("--".to_string()))
+        );
+        assert_eq!(
+            parse(&args(&["serve", "--connect", "/a", "--"])),
+            Err(UsageError::UnexpectedArgument("--".to_string()))
+        );
+        // A path literally named "--" is a relative path.
+        assert_eq!(
+            parse(&args(&["serve", "--connect", "--"])),
+            Err(UsageError::ConnectPathNotAbsolute)
+        );
+    }
+
+    #[test]
+    fn tester_subcommands_are_case_sensitive_and_help_flags_are_unknown() {
+        for bad in [
+            "Probe",
+            "PROBE",
+            "Version",
+            "BPF-Permissions",
+            "Serve",
+            "bpf_permissions",
+            "bpf-permission",
+            "-h",
+            "--help",
+            "--version",
+            " probe",
+            "probe ",
+        ] {
+            assert_eq!(
+                parse(&args(&[bad])),
+                Err(UsageError::UnknownSubcommand(bad.to_string())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tester_empty_or_relative_connect_path_is_refused_before_the_length_check() {
+        assert_eq!(
+            parse(&args(&["serve", "--connect", ""])),
+            Err(UsageError::ConnectPathNotAbsolute)
+        );
+        let long_relative = "a".repeat(200);
+        assert_eq!(
+            parse(&args(&["serve", "--connect", &long_relative])),
+            Err(UsageError::ConnectPathNotAbsolute)
+        );
+        // "/" alone is absolute and short: the parser accepts it (the path
+        // check in serve::startup refuses it later as not a socket).
+        assert_eq!(
+            parse(&args(&["serve", "--connect", "/"])),
+            Ok(Mode::Serve {
+                connect: PathBuf::from("/")
+            })
+        );
+    }
+
+    #[test]
+    fn tester_dry_run_twice_or_out_of_place_is_an_unexpected_argument() {
+        assert_eq!(
+            parse(&args(&["bpf-permissions", "--dry-run", "--dry-run"])),
+            Err(UsageError::UnexpectedArgument("--dry-run".to_string()))
+        );
+        assert_eq!(
+            parse(&args(&["bpf-revert", "--dry-run", "x"])),
+            Err(UsageError::UnexpectedArgument("x".to_string()))
+        );
+        assert_eq!(
+            parse(&args(&["bpf-revert", "x", "--dry-run"])),
+            Err(UsageError::UnexpectedArgument("x".to_string()))
+        );
+        assert_eq!(
+            parse(&args(&["bpf-revert", "--Dry-Run"])),
+            Err(UsageError::UnexpectedArgument("--Dry-Run".to_string()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tester_non_utf8_subcommand_is_unknown_and_a_non_utf8_path_still_parses() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'p', 0xff, b'r', b'o', b'b', b'e']);
+        let err = parse(&[bad]).expect_err("non-UTF-8 subcommand refused");
+        assert_eq!(
+            err,
+            UsageError::UnknownSubcommand("p\u{fffd}robe".to_string())
+        );
+        assert_eq!(
+            err.to_string(),
+            "unknown subcommand: p\u{fffd}robe (expected one of: bpf-permissions, bpf-revert, serve, probe, version)"
+        );
+        // A socket path is bytes: absolute and within the limit, it parses
+        // even when it is not UTF-8.
+        let path = OsString::from_vec(b"/tmp/\xff.sock".to_vec());
+        let mode = parse(&[
+            OsString::from("serve"),
+            OsString::from("--connect"),
+            path.clone(),
+        ])
+        .expect("non-UTF-8 absolute path parses");
+        assert_eq!(
+            mode,
+            Mode::Serve {
+                connect: PathBuf::from(path)
+            }
+        );
+        // A non-UTF-8 flag where --connect belongs is the serve shape error.
+        let flag = OsString::from_vec(b"--conn\xffect".to_vec());
+        assert_eq!(
+            parse(&[OsString::from("serve"), flag, OsString::from("/a")]),
+            Err(UsageError::ServeShape)
+        );
+    }
 }

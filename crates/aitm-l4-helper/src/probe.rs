@@ -225,4 +225,108 @@ mod tests {
         assert!(line.ends_with("\"}"), "{line}");
         assert!(!line.contains('\n'), "{line:?}");
     }
+
+    // ---- Tester edge cases (stage 5, unit p2) ------------------------------
+
+    /// The line starts with the literal `prefix` (the three decided fields),
+    /// then the version field, then the closing brace, and nothing else.
+    fn assert_line(got: &str, prefix: &str) {
+        assert!(got.starts_with(prefix), "{got}");
+        let tail = &got[prefix.len()..];
+        assert!(tail.starts_with("\"version\":\""), "{got}");
+        assert!(tail.ends_with("\"}"), "{got}");
+        // Four keys and one string value: ten double quotes, four colons,
+        // three commas, one brace pair; so a parser sees exactly four fields.
+        assert_eq!(got.matches('"').count(), 10, "{got}");
+        assert_eq!(got.matches(':').count(), 4, "{got}");
+        assert_eq!(got.matches(',').count(), 3, "{got}");
+        assert_eq!(got.matches('{').count(), 1, "{got}");
+        assert_eq!(got.matches('}').count(), 1, "{got}");
+    }
+
+    #[test]
+    fn tester_all_capability_bits_set_reports_both_true() {
+        assert_line(
+            &probe_json(Some(u64::MAX), Some(true)),
+            "{\"cap_net_raw\":true,\"cap_net_admin\":true,\"bpf_rw\":true,",
+        );
+        assert_line(
+            &probe_json(Some(u64::MAX), Some(false)),
+            "{\"cap_net_raw\":true,\"cap_net_admin\":true,\"bpf_rw\":false,",
+        );
+        assert_line(
+            &probe_json(Some(u64::MAX), None),
+            "{\"cap_net_raw\":true,\"cap_net_admin\":true,\"bpf_rw\":null,",
+        );
+    }
+
+    #[test]
+    fn tester_zero_and_absent_cap_eff_give_the_same_false_pair() {
+        for cap_eff in [None, Some(0)] {
+            assert_line(
+                &probe_json(cap_eff, None),
+                "{\"cap_net_raw\":false,\"cap_net_admin\":false,\"bpf_rw\":null,",
+            );
+            assert_line(
+                &probe_json(cap_eff, Some(true)),
+                "{\"cap_net_raw\":false,\"cap_net_admin\":false,\"bpf_rw\":true,",
+            );
+            assert_line(
+                &probe_json(cap_eff, Some(false)),
+                "{\"cap_net_raw\":false,\"cap_net_admin\":false,\"bpf_rw\":false,",
+            );
+        }
+    }
+
+    #[test]
+    fn tester_neighbouring_bits_do_not_leak_into_the_two_flags() {
+        // Bits 11 and 14, the neighbours of 12 and 13.
+        assert_line(
+            &probe_json(Some((1 << 11) | (1 << 14)), None),
+            "{\"cap_net_raw\":false,\"cap_net_admin\":false,\"bpf_rw\":null,",
+        );
+        assert_line(
+            &probe_json(Some(1 << 13), Some(false)),
+            "{\"cap_net_raw\":true,\"cap_net_admin\":false,\"bpf_rw\":false,",
+        );
+        assert_line(
+            &probe_json(Some(1 << 12), Some(true)),
+            "{\"cap_net_raw\":false,\"cap_net_admin\":true,\"bpf_rw\":true,",
+        );
+        assert_line(
+            &probe_json(Some(1 << 63), Some(true)),
+            "{\"cap_net_raw\":false,\"cap_net_admin\":false,\"bpf_rw\":true,",
+        );
+    }
+
+    #[test]
+    fn tester_parse_cap_eff_edge_cases() {
+        // CRLF line endings: trim removes the \r.
+        assert_eq!(parse_cap_eff("CapEff:\t0000000000002000\r\n"), Some(0x2000));
+        // Uppercase hex.
+        assert_eq!(
+            parse_cap_eff("CapEff:\t000001FFFFFFFFFF\n"),
+            Some(0x0000_01ff_ffff_ffff)
+        );
+        // Sixteen f's is u64::MAX; seventeen digits overflow and are refused.
+        assert_eq!(parse_cap_eff("CapEff:\tffffffffffffffff\n"), Some(u64::MAX));
+        assert_eq!(parse_cap_eff("CapEff:\t10000000000000000\n"), None);
+        // /proc never prints a 0x prefix, a sign or an empty value.
+        assert_eq!(parse_cap_eff("CapEff:\t0x2000\n"), None);
+        assert_eq!(parse_cap_eff("CapEff:\t-1\n"), None);
+        assert_eq!(parse_cap_eff("CapEff:\t\n"), None);
+        assert_eq!(parse_cap_eff("CapEff:"), None);
+        // No tab after the colon is still the value.
+        assert_eq!(parse_cap_eff("CapEff:2000\n"), Some(0x2000));
+        // The first CapEff line wins over a second one.
+        assert_eq!(
+            parse_cap_eff("CapEff:\t0000000000002000\nCapEff:\t0000000000003000\n"),
+            Some(0x2000)
+        );
+        // The key must start the line.
+        assert_eq!(parse_cap_eff("Name:\tCapEff:\t2000\n"), None);
+        assert_eq!(parse_cap_eff(" CapEff:\t2000\n"), None);
+        // A lowercase key is not the key.
+        assert_eq!(parse_cap_eff("capeff:\t2000\n"), None);
+    }
 }

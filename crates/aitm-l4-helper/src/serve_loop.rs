@@ -563,7 +563,9 @@ mod tests {
     use aitm_proto_l4::craft::{EtherSpec, Ipv4Spec, Layer, PacketSpec, UdpSpec};
     use aitm_proto_l4::helper::enforce::HelperGuard;
     use aitm_proto_l4::helper::frame::LinkType;
-    use aitm_proto_l4::helper::proto::{encode, read_msg, Msg, ProtoError, ScopeSet, PROTO};
+    use aitm_proto_l4::helper::proto::{
+        encode, read_msg, Msg, ProtoError, ScopeSet, MAX_FRAME, PROTO,
+    };
     use aitm_proto_l4::types::{
         IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
         RateCap,
@@ -780,6 +782,12 @@ mod tests {
         injects: Mutex<Vec<(String, Vec<u8>)>>,
         /// What the next scripted capture yields.
         frames: Mutex<Vec<Vec<u8>>>,
+        /// Tester: frame lists for the opens after the first, in order.
+        later_frames: Mutex<std::collections::VecDeque<Vec<Vec<u8>>>>,
+        /// Tester: when set, every `open` is recorded, then fails with this.
+        fail_open: Mutex<Option<String>>,
+        /// Tester: when set, every `inject` is recorded, then fails with this.
+        fail_inject: Mutex<Option<String>>,
     }
 
     impl FakeWire {
@@ -788,6 +796,28 @@ mod tests {
                 frames: Mutex::new(frames),
                 ..Self::default()
             })
+        }
+        /// Tester: one frame list per `open`, in order; later opens get none.
+        fn with_scripted(lists: Vec<Vec<Vec<u8>>>) -> Arc<Self> {
+            let mut lists = lists.into_iter();
+            let first = lists.next().unwrap_or_default();
+            Arc::new(Self {
+                frames: Mutex::new(first),
+                later_frames: Mutex::new(lists.collect()),
+                ..Self::default()
+            })
+        }
+        fn set_fail_open(&self, why: Option<&str>) {
+            *self
+                .fail_open
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = why.map(str::to_string);
+        }
+        fn set_fail_inject(&self, why: Option<&str>) {
+            *self
+                .fail_inject
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = why.map(str::to_string);
         }
         fn opens(&self) -> Vec<(String, Option<String>, Duration)> {
             self.opens
@@ -814,8 +844,26 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((iface.to_string(), filter.map(str::to_string), timeout));
-            let frames =
-                std::mem::take(&mut *self.frames.lock().unwrap_or_else(PoisonError::into_inner));
+            if let Some(why) = self
+                .fail_open
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+            {
+                return Err(why);
+            }
+            let frames = {
+                let mut first = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+                if first.is_empty() {
+                    self.later_frames
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .pop_front()
+                        .unwrap_or_default()
+                } else {
+                    std::mem::take(&mut *first)
+                }
+            };
             Ok(Box::new(ScriptedSource {
                 frames: frames.into_iter(),
             }))
@@ -825,6 +873,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((iface.to_string(), bytes.to_vec()));
+            if let Some(why) = self
+                .fail_inject
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+            {
+                return Err(why);
+            }
             Ok(())
         }
         fn link(&self, _iface: &str) -> LinkType {
@@ -1165,5 +1221,585 @@ mod tests {
             }
         );
         assert_eq!(wire.injects().len(), 1);
+    }
+
+    // ---- Tester edge cases (stage 5, unit p2) ------------------------------
+
+    /// A writer whose first `ok_left` writes succeed and every later one
+    /// fails as a socket whose peer vanished.
+    struct FlakyWriter {
+        ok_left: usize,
+    }
+
+    impl Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.ok_left == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "peer gone",
+                ));
+            }
+            self.ok_left -= 1;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn inject_results(msgs: &[Msg]) -> Vec<(u64, Option<String>)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::InjectResult { request_id, error } => Some((*request_id, error.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frames_of(id: u64, msgs: &[Msg]) -> Vec<Vec<u8>> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Frame {
+                    capture_id, bytes, ..
+                } if *capture_id == id => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tester_two_captures_stream_independently_and_closing_one_leaves_the_other() {
+        let a1 = eth_udp(9001);
+        let a2 = eth_udp(9002);
+        let b1 = eth_udp(9011);
+        let wire = FakeWire::with_scripted(vec![vec![a1.clone(), a2.clone()], vec![b1.clone()]]);
+        let out = SharedBuf::default();
+        let (tx, reader) = ChanReader::new();
+        let loop_out = out.clone();
+        let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
+        let handle = thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION));
+
+        for m in [
+            hello(),
+            Msg::ScopeSet(scope_set()),
+            capture_open(5, "lo"),
+            capture_open(6, "lo"),
+        ] {
+            tx.send(encode(&m)).expect("loop is reading");
+        }
+        let msgs = out.wait_until("three frames", |msgs| {
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Frame { .. }))
+                .count()
+                == 3
+        });
+        assert_eq!(frames_of(5, &msgs), vec![a1, a2]);
+        assert_eq!(frames_of(6, &msgs), vec![b1]);
+        assert_eq!(wire.opens().len(), 2);
+
+        // Close 5 only.
+        tx.send(encode(&Msg::CaptureClose { id: 5 }))
+            .expect("loop is reading");
+        let msgs = out.wait_until("CaptureClosed 5", |msgs| {
+            msgs.iter()
+                .any(|m| matches!(m, Msg::CaptureClosed { capture_id: 5, .. }))
+        });
+        assert!(msgs.contains(&Msg::CaptureClosed {
+            capture_id: 5,
+            reason: "closed".to_string()
+        }));
+        // 6 is still open: it has not closed, re-opening 6 is a duplicate,
+        // and id 5 is free again.
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !out.messages()
+                .iter()
+                .any(|m| matches!(m, Msg::CaptureClosed { capture_id: 6, .. })),
+            "{:?}",
+            out.messages()
+        );
+        tx.send(encode(&capture_open(6, "lo")))
+            .expect("loop is reading");
+        out.wait_until("duplicate refusal", |msgs| {
+            msgs.contains(&Msg::CaptureClosed {
+                capture_id: 6,
+                reason: "capture 6 is already open".to_string(),
+            })
+        });
+        assert_eq!(
+            wire.opens().len(),
+            2,
+            "the duplicate never reached the wire"
+        );
+        tx.send(encode(&capture_open(5, "lo")))
+            .expect("loop is reading");
+        out.wait_until("third open", |_| wire.opens().len() == 3);
+
+        // The core closes: the loop returns Ok and every remaining capture
+        // is stopped and reports "closed".
+        drop(tx);
+        assert_eq!(handle.join().expect("loop thread"), Ok(()));
+        out.wait_until("both remaining captures closed", |msgs| {
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::CaptureClosed { reason, .. } if reason == "closed"))
+                .count()
+                == 3
+        });
+    }
+
+    #[test]
+    fn tester_capture_close_for_an_unknown_id_is_ignored_and_the_session_continues() {
+        let wire: Arc<FakeWire> = Arc::default();
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::CaptureClose { id: 99 },
+                Msg::ScopeSet(scope_set()),
+                Msg::CaptureClose { id: u64::MAX },
+                Msg::CaptureClose { id: 0 },
+                inject(1, "lo", eth_udp(9053)),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(
+            out[1],
+            Msg::InjectResult {
+                request_id: 1,
+                error: None
+            }
+        );
+        assert_eq!(wire.injects().len(), 1);
+    }
+
+    #[test]
+    fn tester_inject_on_an_interface_the_scope_does_not_cover_is_refused_before_the_wire() {
+        // The scope covers `lo` only and the frame is in range: a valid name
+        // on another interface is the guard's refusal, not the name check's.
+        let wire: Arc<FakeWire> = Arc::default();
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set()),
+                inject(21, "eth0", eth_udp(9053)),
+                inject(22, "lo0", eth_udp(9053)),
+                inject(23, "lo", eth_udp(9053)),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            inject_results(&out),
+            vec![
+                (21, Some("target 127.0.0.1 is out of L4 scope".to_string())),
+                (22, Some("target 127.0.0.1 is out of L4 scope".to_string())),
+                (23, None),
+            ]
+        );
+        assert_eq!(wire.injects(), vec![("lo".to_string(), eth_udp(9053))]);
+    }
+
+    #[test]
+    fn tester_a_second_scope_set_narrows_what_an_earlier_one_allowed() {
+        let wire: Arc<FakeWire> = Arc::default();
+        let narrow = ScopeSet {
+            scope: vec![
+                entry("lo", L4Capability::Capture, 10),
+                L4ScopeEntry {
+                    ports: PortRange { lo: 9100, hi: 9999 },
+                    ..entry("lo", L4Capability::Inject, 10)
+                },
+            ],
+            ..scope_set()
+        };
+        let empty = ScopeSet {
+            scope: Vec::new(),
+            ..scope_set()
+        };
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set()),
+                inject(31, "lo", eth_udp(9053)),
+                Msg::ScopeSet(narrow),
+                inject(32, "lo", eth_udp(9053)),
+                inject(33, "lo", eth_udp(9150)),
+                Msg::ScopeSet(empty),
+                inject(34, "lo", eth_udp(9150)),
+                capture_open(35, "lo"),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            inject_results(&out),
+            vec![
+                (31, None),
+                // The Capture entry still covers 9053, so the guard names the
+                // missing capability rather than the scope.
+                (
+                    32,
+                    Some("scope matches but does not grant the Inject capability".to_string())
+                ),
+                (33, None),
+                (34, Some("target 127.0.0.1 is out of L4 scope".to_string())),
+            ]
+        );
+        assert_eq!(wire.injects().len(), 2);
+        // The empty scope governs captures too.
+        assert!(out.contains(&Msg::CaptureClosed {
+            capture_id: 35,
+            reason: "interface lo is outside the capture scope".to_string(),
+        }));
+        assert_eq!(wire.opens().len(), 0);
+    }
+
+    #[test]
+    fn tester_writer_failure_ends_the_loop_with_io() {
+        // The very first write (the HelloAck) fails.
+        let result = serve_loop(
+            Cursor::new(encode(&hello())),
+            FlakyWriter { ok_left: 0 },
+            Arc::new(FakeWire::default()) as Arc<dyn Wire>,
+            VERSION,
+        );
+        assert_eq!(result, Err(ServeExit::Io("peer gone".to_string())));
+        assert_eq!(
+            result.expect_err("io").to_string(),
+            "socket write failed: peer gone"
+        );
+        // A later write fails (the first InjectResult): the inject itself
+        // already happened, then the loop ends with Io instead of reading on.
+        let wire: Arc<FakeWire> = Arc::default();
+        let mut bytes = Vec::new();
+        for m in [
+            hello(),
+            Msg::ScopeSet(scope_set()),
+            inject(1, "lo", eth_udp(9053)),
+            inject(2, "lo", eth_udp(9054)),
+        ] {
+            bytes.extend(encode(&m));
+        }
+        let result = serve_loop(
+            Cursor::new(bytes),
+            FlakyWriter { ok_left: 1 },
+            Arc::clone(&wire) as Arc<dyn Wire>,
+            VERSION,
+        );
+        assert_eq!(result, Err(ServeExit::Io("peer gone".to_string())));
+        assert_eq!(wire.injects().len(), 1, "the second Inject was never read");
+    }
+
+    #[test]
+    fn tester_second_hello_is_a_protocol_violation_with_the_literal_text() {
+        let (result, out) = run(&[hello(), hello()], Arc::default());
+        assert_eq!(
+            protocol_text(result),
+            "unexpected Hello after the handshake"
+        );
+        assert_eq!(out.len(), 1);
+        // Even after a scope was set, and whatever proto it claims.
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set()),
+                Msg::Hello {
+                    proto: 2,
+                    core_version: "x".to_string(),
+                },
+            ],
+            Arc::default(),
+        );
+        assert_eq!(
+            protocol_text(result),
+            "unexpected Hello after the handshake"
+        );
+        assert_eq!(out.len(), 1);
+        // The first-message texts name the message that arrived instead.
+        let (result, out) = run(&[Msg::ScopeSet(scope_set())], Arc::default());
+        assert_eq!(protocol_text(result), "expected Hello first, got ScopeSet");
+        assert_eq!(out, Vec::<Msg>::new());
+        let wire: Arc<FakeWire> = Arc::default();
+        let (result, _) = run(&[inject(1, "lo", eth_udp(9053))], Arc::clone(&wire));
+        assert_eq!(protocol_text(result), "expected Hello first, got Inject");
+        assert_eq!(wire.injects().len(), 0);
+        let (result, _) = run(&[capture_open(1, "lo")], Arc::clone(&wire));
+        assert_eq!(
+            protocol_text(result),
+            "expected Hello first, got CaptureOpen"
+        );
+        assert_eq!(wire.opens().len(), 0);
+    }
+
+    #[test]
+    fn tester_frame_length_exactly_max_frame_is_read_and_answered() {
+        // An Inject whose declared length is exactly MAX_FRAME (262 144):
+        // type byte + 8-byte id + 2-byte name length + "lo" + payload.
+        let overhead = encode(&inject(7, "lo", Vec::new())).len() - 4;
+        assert_eq!(overhead, 1 + 8 + 2 + 2);
+        let payload = vec![0u8; MAX_FRAME - overhead];
+        let msg = inject(7, "lo", payload);
+        let encoded = encode(&msg);
+        assert_eq!(
+            u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]),
+            262_144
+        );
+        let wire: Arc<FakeWire> = Arc::default();
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set()),
+                msg,
+                inject(8, "lo", eth_udp(9053)),
+            ],
+            Arc::clone(&wire),
+        );
+        // The loop read it whole, the guard refused it against the ScopeSet's
+        // 1500-byte ceiling, and the session went on.
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            inject_results(&out),
+            vec![
+                (
+                    7,
+                    Some("inject frame of 262131 bytes exceeds the limit".to_string())
+                ),
+                (8, None),
+            ]
+        );
+        assert_eq!(wire.injects().len(), 1);
+
+        // One more byte in the declared length is the exit, with the literal
+        // text, before any of the payload is read.
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&262_145_u32.to_be_bytes());
+        bytes.extend_from_slice(&encoded[4..]);
+        bytes.push(0);
+        let (result, out) = run_raw(bytes, Arc::default());
+        assert_eq!(
+            protocol_text(result),
+            "frame length 262145 exceeds the 262144-byte maximum"
+        );
+        assert_eq!(out.len(), 1);
+        // And so is u32::MAX.
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            protocol_text(run_raw(bytes, Arc::default()).0),
+            "frame length 4294967295 exceeds the 262144-byte maximum"
+        );
+    }
+
+    #[test]
+    fn tester_stream_cut_mid_message_is_a_protocol_exit_not_a_clean_close() {
+        // The header promises 100 bytes, 10 arrive, then EOF: the core (or
+        // the socket) went away in the middle of a message.
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&100_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0x03; 10]);
+        let (result, out) = run_raw(bytes, Arc::default());
+        let text = protocol_text(result);
+        assert!(text.starts_with("helper socket I/O error: "), "{text}");
+        assert_eq!(out.len(), 1);
+        // Cut inside the 4-byte length header itself.
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&[0, 0]);
+        let text = protocol_text(run_raw(bytes, Arc::default()).0);
+        assert!(text.starts_with("helper socket I/O error: "), "{text}");
+        // Cut inside the Hello itself: nothing is sent at all.
+        let hello_bytes = encode(&hello());
+        let (result, out) = run_raw(
+            hello_bytes[..hello_bytes.len() - 1].to_vec(),
+            Arc::default(),
+        );
+        assert!(
+            protocol_text(result).starts_with("helper socket I/O error: "),
+            "a truncated Hello is not a clean close"
+        );
+        assert_eq!(out, Vec::<Msg>::new());
+        // A clean EOF before any Hello is Ok, and nothing is sent.
+        let (result, out) = run_raw(Vec::new(), Arc::default());
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, Vec::<Msg>::new());
+    }
+
+    #[test]
+    fn tester_zero_length_unknown_type_and_malformed_json_each_end_the_session() {
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            protocol_text(run_raw(bytes, Arc::default()).0),
+            "malformed binary message payload"
+        );
+
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.push(0x7f);
+        assert_eq!(
+            protocol_text(run_raw(bytes, Arc::default()).0),
+            "unknown message type 0x7f"
+        );
+
+        // A ScopeSet with one unknown key (strict body, plan A7): take the
+        // real encoding and splice a key in before the closing brace.
+        let encoded = encode(&Msg::ScopeSet(scope_set()));
+        let mut body = encoded[5..].to_vec();
+        assert_eq!(body.last(), Some(&b'}'));
+        body.pop();
+        body.extend_from_slice(br#","extra":1}"#);
+        let mut bytes = encode(&hello());
+        bytes.extend_from_slice(&u32::try_from(body.len() + 1).expect("fits").to_be_bytes());
+        bytes.push(encoded[4]);
+        bytes.extend_from_slice(&body);
+        let (result, out) = run_raw(bytes, Arc::default());
+        let text = protocol_text(result);
+        assert!(text.starts_with("malformed message JSON: "), "{text}");
+        assert!(text.contains("extra"), "{text}");
+        assert_eq!(out.len(), 1);
+
+        // A Hello with an unknown key is tolerated (plan A7) and answered.
+        let encoded = encode(&hello());
+        let mut body = encoded[5..].to_vec();
+        body.pop();
+        body.extend_from_slice(br#","future":true}"#);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::try_from(body.len() + 1).expect("fits").to_be_bytes());
+        bytes.push(encoded[4]);
+        bytes.extend_from_slice(&body);
+        let (result, out) = run_raw(bytes, Arc::default());
+        assert_eq!(result, Ok(()));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Msg::HelloAck { .. }));
+    }
+
+    #[test]
+    fn tester_wire_open_failure_is_a_capture_closed_and_frees_the_id() {
+        let wire: Arc<FakeWire> = Arc::default();
+        wire.set_fail_open(Some(
+            "pcap open: lo: You don't have permission to capture on that device",
+        ));
+        let out = SharedBuf::default();
+        let (tx, reader) = ChanReader::new();
+        let loop_out = out.clone();
+        let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
+        let handle = thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION));
+        for m in [hello(), Msg::ScopeSet(scope_set()), capture_open(4, "lo")] {
+            tx.send(encode(&m)).expect("loop is reading");
+        }
+        out.wait_until("wire refusal", |msgs| {
+            msgs.contains(&Msg::CaptureClosed {
+                capture_id: 4,
+                reason: "pcap open: lo: You don't have permission to capture on that device"
+                    .to_string(),
+            })
+        });
+        assert_eq!(wire.opens().len(), 1, "the wire was asked once");
+        // The id is free again: the same id opens once the wire allows it.
+        wire.set_fail_open(None);
+        tx.send(encode(&capture_open(4, "lo")))
+            .expect("loop is reading");
+        out.wait_until("second open", |_| wire.opens().len() == 2);
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !out.messages().iter().any(|m| matches!(
+                m,
+                Msg::CaptureClosed { capture_id: 4, reason } if reason == "capture 4 is already open"
+            )),
+            "{:?}",
+            out.messages()
+        );
+        drop(tx);
+        assert_eq!(handle.join().expect("loop thread"), Ok(()));
+    }
+
+    #[test]
+    fn tester_wire_inject_failure_is_passed_through_as_the_inject_error() {
+        let wire: Arc<FakeWire> = Arc::default();
+        wire.set_fail_inject(Some("pcap sendpacket: send: Message too long"));
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set()),
+                inject(5, "lo", eth_udp(9053)),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            inject_results(&out),
+            vec![(
+                5,
+                Some("pcap sendpacket: send: Message too long".to_string())
+            )]
+        );
+        assert_eq!(
+            wire.injects().len(),
+            1,
+            "the guard admitted it; the wire refused it"
+        );
+    }
+
+    #[test]
+    fn tester_capture_only_scope_opens_the_capture_but_refuses_the_inject() {
+        let wire: Arc<FakeWire> = Arc::default();
+        let capture_only = ScopeSet {
+            scope: vec![entry("lo", L4Capability::Capture, 10)],
+            ..scope_set()
+        };
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(capture_only),
+                capture_open(1, "lo"),
+                inject(2, "lo", eth_udp(9053)),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(wire.opens().len(), 1);
+        assert_eq!(
+            inject_results(&out),
+            vec![(
+                2,
+                Some("scope matches but does not grant the Inject capability".to_string())
+            )]
+        );
+        assert_eq!(wire.injects().len(), 0);
+    }
+
+    #[test]
+    fn tester_empty_frame_and_wildcard_name_are_refused_before_the_wire() {
+        let wire: Arc<FakeWire> = Arc::default();
+        let (result, out) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set_on("*")),
+                inject(1, "lo", Vec::new()),
+                inject(2, "*", eth_udp(9053)),
+                inject(3, "lo", vec![0u8; 14]),
+                inject(4, "lo", vec![0xffu8; 1500]),
+                inject(5, "lo", vec![0u8; 1501]),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            inject_results(&out),
+            vec![
+                (1, Some("inject frame is truncated".to_string())),
+                (
+                    2,
+                    Some("interface name contains a character outside [A-Za-z0-9._-]".to_string())
+                ),
+                (3, Some("inject frame is truncated".to_string())),
+                (4, Some("inject frame carries no IP packet".to_string())),
+                (
+                    5,
+                    Some("inject frame of 1501 bytes exceeds the limit".to_string())
+                ),
+            ]
+        );
+        assert_eq!(wire.injects().len(), 0);
     }
 }

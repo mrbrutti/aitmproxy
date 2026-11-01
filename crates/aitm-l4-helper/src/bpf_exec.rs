@@ -598,6 +598,15 @@ mod tests {
         gid_after_create: Option<u32>,
         console: Option<ConsoleUser>,
         receipt: RefCell<Option<Vec<u8>>>,
+        /// Tester: when set, `chown` of this node is recorded, then fails.
+        fail_chown_at: Option<u32>,
+        /// Tester: when set, a `dseditgroup` whose argv holds this operation
+        /// word (`create` or `edit`) is recorded, then fails.
+        fail_dseditgroup_op: Option<&'static str>,
+        /// Tester: when set, `group_gid` fails with this text.
+        group_gid_error: Option<String>,
+        /// Tester: when set, `console_user` fails with this text.
+        console_error: Option<String>,
     }
 
     impl Fake {
@@ -611,6 +620,10 @@ mod tests {
                 gid_after_create: gid,
                 console,
                 receipt: RefCell::new(None),
+                fail_chown_at: None,
+                fail_dseditgroup_op: None,
+                group_gid_error: None,
+                console_error: None,
             }
         }
 
@@ -649,6 +662,9 @@ mod tests {
         }
         fn chown(&self, n: u32, uid: u32, gid: u32) -> Result<(), String> {
             self.record(Call::Chown { n, uid, gid });
+            if self.fail_chown_at == Some(n) {
+                return Err(format!("the fake refused node {n}"));
+            }
             Ok(())
         }
         fn chmod(&self, n: u32, mode: u32) -> Result<(), String> {
@@ -657,12 +673,20 @@ mod tests {
         }
         fn group_gid(&self) -> Result<Option<u32>, String> {
             self.record(Call::GroupGid);
+            if let Some(err) = &self.group_gid_error {
+                return Err(err.clone());
+            }
             Ok(*self.gid.borrow())
         }
         fn run_dseditgroup(&self, argv: &[&str]) -> Result<(), String> {
             let mut full = vec![DSEDITGROUP.to_string()];
             full.extend(argv.iter().map(|a| (*a).to_string()));
             self.record(Call::Dseditgroup(full));
+            if let Some(op) = self.fail_dseditgroup_op {
+                if argv.contains(&op) {
+                    return Err("the fake refused the directory service change".to_string());
+                }
+            }
             if argv.get(1) == Some(&"create") {
                 *self.gid.borrow_mut() = self.gid_after_create;
             }
@@ -670,6 +694,9 @@ mod tests {
         }
         fn console_user(&self) -> Result<Option<ConsoleUser>, String> {
             self.record(Call::ConsoleUser);
+            if let Some(err) = &self.console_error {
+                return Err(err.clone());
+            }
             Ok(self.console.clone())
         }
         fn read_receipt(&self) -> Result<Option<Vec<u8>>, String> {
@@ -1296,5 +1323,420 @@ mod tests {
             sys.receipt.borrow().is_some(),
             "the receipt is still there after a dry run"
         );
+    }
+
+    // ---- Tester edge cases (stage 5, unit p2) ------------------------------
+
+    /// The words plan Rule 2 forbids, matched as whole words.
+    fn names_a_command(msg: &str) -> Option<&'static str> {
+        const FORBIDDEN: [&str; 8] = [
+            "sudo",
+            "setcap",
+            "chmod",
+            "chgrp",
+            "chown",
+            "dseditgroup",
+            "launchctl",
+            "pkexec",
+        ];
+        msg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find_map(|word| FORBIDDEN.iter().copied().find(|f| *f == word))
+    }
+
+    fn is_mutation(c: &Call) -> bool {
+        matches!(
+            c,
+            Call::Chown { .. } | Call::Chmod { .. } | Call::WriteReceipt(_) | Call::Dseditgroup(_)
+        )
+    }
+
+    #[test]
+    fn tester_chown_failure_mid_run_stops_before_the_receipt() {
+        let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        sys.fail_chown_at = Some(5);
+        let err =
+            apply(&sys, "0.5.9", 1_762_000_000_000).expect_err("a failed chown stops the run");
+        assert_eq!(err, "the fake refused node 5");
+        let calls = sys.calls();
+        for n in 0..5 {
+            assert!(
+                calls.contains(&Call::Chown {
+                    n,
+                    uid: 0,
+                    gid: 701
+                }),
+                "/dev/bpf{n} was chowned before the failure"
+            );
+            assert!(
+                calls.contains(&Call::Chmod { n, mode: 0o660 }),
+                "/dev/bpf{n} was chmodded before the failure"
+            );
+        }
+        // The failing chown is the last call: no chmod of node 5, nothing on
+        // node 6 or later, no member added, no receipt.
+        assert_eq!(
+            calls.last(),
+            Some(&Call::Chown {
+                n: 5,
+                uid: 0,
+                gid: 701
+            })
+        );
+        assert!(!calls.contains(&Call::Chmod { n: 5, mode: 0o660 }));
+        assert!(!calls
+            .iter()
+            .any(|c| matches!(c, Call::Chown { n, .. } | Call::Chmod { n, .. } if *n > 5)));
+        assert_eq!(dseditgroup_calls(&calls), Vec::<Vec<String>>::new());
+        assert!(!calls.iter().any(|c| matches!(c, Call::WriteReceipt(_))));
+        assert!(sys.receipt.borrow().is_none());
+    }
+
+    #[test]
+    fn tester_add_member_failure_leaves_no_receipt_so_the_next_run_retries() {
+        let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        sys.fail_dseditgroup_op = Some("edit");
+        let err = apply(&sys, "0.5.9", 1_762_000_000_000).expect_err("a failed add stops the run");
+        assert_eq!(err, "the fake refused the directory service change");
+        let calls = sys.calls();
+        assert_eq!(
+            dseditgroup_calls(&calls),
+            vec![argv(&[
+                "/usr/sbin/dseditgroup",
+                "-o",
+                "edit",
+                "-a",
+                "matt",
+                "-t",
+                "user",
+                "access_bpf",
+            ])]
+        );
+        assert!(!calls.iter().any(|c| matches!(c, Call::WriteReceipt(_))));
+        assert!(sys.receipt.borrow().is_none());
+        // Every node was already set; the next launch finds no receipt and
+        // plans the add again.
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, Call::Chmod { mode: 0o660, .. }))
+                .count(),
+            256
+        );
+    }
+
+    #[test]
+    fn tester_create_group_failure_touches_no_node() {
+        let mut sys = Fake::new(all_nodes(), None, Some(admin("matt")));
+        sys.gid_after_create = Some(702);
+        sys.fail_dseditgroup_op = Some("create");
+        let err =
+            apply(&sys, "0.5.9", 1_762_000_000_000).expect_err("a failed create stops the run");
+        assert_eq!(err, "the fake refused the directory service change");
+        let calls = sys.calls();
+        assert_eq!(dseditgroup_calls(&calls).len(), 1);
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                Call::Chown { .. } | Call::Chmod { .. } | Call::WriteReceipt(_)
+            )),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn tester_create_group_without_a_gid_says_so_literally_and_stops_at_once() {
+        let mut sys = Fake::new(all_nodes(), None, Some(admin("matt")));
+        sys.gid_after_create = None;
+        let err = apply(&sys, "0.5.9", 1_762_000_000_000).expect_err("no gid after create");
+        assert_eq!(
+            err,
+            "group access_bpf was created but has no gid; no node was changed"
+        );
+        let calls = sys.calls();
+        // The gid was read once before the plan and once after the create;
+        // that re-read is the last call.
+        assert_eq!(calls.iter().filter(|c| **c == Call::GroupGid).count(), 2);
+        assert_eq!(calls.last(), Some(&Call::GroupGid));
+    }
+
+    #[test]
+    fn tester_group_lookup_failure_stops_apply_before_any_node_change() {
+        let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        sys.group_gid_error = Some("could not look up group access_bpf: eServerError".to_string());
+        assert_eq!(
+            apply(&sys, "0.5.9", 1),
+            Err("could not look up group access_bpf: eServerError".to_string())
+        );
+        assert!(!sys.calls().iter().any(is_mutation), "{:?}", sys.calls());
+        // Likewise a console lookup failure (after the gid, before the plan).
+        let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        sys.console_error = Some("could not resolve console uid 501 to a name".to_string());
+        assert_eq!(
+            apply(&sys, "0.5.9", 1),
+            Err("could not resolve console uid 501 to a name".to_string())
+        );
+        assert!(!sys.calls().iter().any(is_mutation), "{:?}", sys.calls());
+    }
+
+    #[test]
+    fn tester_revert_with_a_schema_2_receipt_touches_nothing() {
+        let sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        *sys.receipt.borrow_mut() = Some(br#"{"schema":2,"helper_version":"9.9.9"}"#.to_vec());
+        let err = revert(&sys).expect_err("a newer receipt is refused");
+        assert!(err.starts_with("existing receipt not readable: "), "{err}");
+        assert!(err.contains("schema 2"), "{err}");
+        assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta, Call::ReadReceipt]);
+        assert!(
+            sys.receipt.borrow().is_some(),
+            "the receipt stays for the newer helper that wrote it"
+        );
+    }
+
+    #[test]
+    fn tester_malformed_receipts_stop_both_modes_before_any_change() {
+        for bad in [
+            &b""[..],
+            b"{",
+            b"[]",
+            b"null",
+            br#"{"schema":"1"}"#,
+            br#"{"schema":1}"#,
+            b"\xff\xfe",
+            b"{\"schema\":1,\"helper_version\":\"0.5.9\",\"applied_at\":1,\"group\":\"access_bpf\",\"gid\":701,\"nodes\":256,\"members_added\":\"matt\",\"errors\":[]}",
+        ] {
+            let sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+            *sys.receipt.borrow_mut() = Some(bad.to_vec());
+            let err = apply(&sys, "0.5.9", 1).expect_err("malformed refused by apply");
+            assert!(err.starts_with("existing receipt not readable: "), "{bad:?}: {err}");
+            assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta, Call::ReadReceipt], "{bad:?}");
+
+            let sys = Fake::new(all_nodes(), Some(701), None);
+            *sys.receipt.borrow_mut() = Some(bad.to_vec());
+            let err = revert(&sys).expect_err("malformed refused by revert");
+            assert!(err.starts_with("existing receipt not readable: "), "{bad:?}: {err}");
+            assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta, Call::ReadReceipt], "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn tester_remove_member_failure_keeps_the_receipt() {
+        // A user the receipt names but the directory service will not remove
+        // (left the group by other means, or the account is gone): the nodes
+        // are already back to root:wheel, the run stops, and the receipt
+        // stays so the next revert tries again instead of forgetting who was
+        // added.
+        let mut sys = Fake::new(all_nodes(), Some(701), None);
+        *sys.receipt.borrow_mut() = Some(receipt(&["matt"]).to_json());
+        sys.fail_dseditgroup_op = Some("edit");
+        let err = revert(&sys).expect_err("a failed remove stops the run");
+        assert_eq!(err, "the fake refused the directory service change");
+        let calls = sys.calls();
+        assert!(!calls.contains(&Call::DeleteReceipt), "{calls:?}");
+        assert!(sys.receipt.borrow().is_some());
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, Call::Chmod { mode: 0o600, .. }))
+                .count(),
+            256
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, Call::Chown { uid: 0, gid: 0, .. }))
+                .count(),
+            256
+        );
+    }
+
+    #[test]
+    fn tester_dry_runs_call_no_mutating_method_even_when_every_fact_is_missing() {
+        // Missing directory, missing group, nobody at the console, four nodes.
+        let nodes: Vec<NodeFacts> = (0..4).map(|n| node(n, BPF_MAJOR)).collect();
+        let mut sys = Fake::new(nodes.clone(), None, None);
+        sys.dir = None;
+        let lines = dry_run_apply(&sys).expect("dry run");
+        assert_eq!(
+            sys.calls(),
+            vec![
+                Call::ReceiptDirMeta,
+                Call::ListNodes,
+                Call::GroupGid,
+                Call::ConsoleUser
+            ]
+        );
+        assert_eq!(
+            lines[0],
+            "receipt directory /Library/Application Support/Aitmproxy is missing; bpf-permissions would create it"
+        );
+        assert_eq!(
+            lines[1],
+            "4 of 256 nodes exist; bpf-permissions would create the rest first"
+        );
+        assert_eq!(lines[2], "create group access_bpf");
+        assert_eq!(lines[3], "chown root:access_bpf /dev/bpf0");
+        assert_eq!(lines.len(), 3 + 4 * 2 + 1);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("write receipt /Library/Application Support/Aitmproxy/l4-helper.json")
+        );
+
+        let mut sys = Fake::new(nodes, None, None);
+        sys.dir = None;
+        let lines = dry_run_revert(&sys).expect("dry run");
+        assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta, Call::ListNodes]);
+        assert_eq!(
+            lines[0],
+            "receipt directory /Library/Application Support/Aitmproxy is missing; there is no receipt to read"
+        );
+        assert_eq!(lines[1], "chown root:wheel /dev/bpf0");
+        assert_eq!(lines.len(), 1 + 4 * 2 + 1);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("delete receipt /Library/Application Support/Aitmproxy/l4-helper.json")
+        );
+    }
+
+    #[test]
+    fn tester_dry_run_turns_group_and_console_failures_into_lines_and_plans_conservatively() {
+        // What the live dry run on a sandboxed Mac shows: dscl fails, so the
+        // group is planned as absent; a console failure adds nobody.
+        let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+        sys.group_gid_error = Some(
+            "could not look up group access_bpf: Operation failed with error: eServerError"
+                .to_string(),
+        );
+        sys.console_error = Some("could not resolve console uid 501 to a name".to_string());
+        let lines = dry_run_apply(&sys).expect("dry run");
+        assert_eq!(
+            lines[0],
+            "group access_bpf could not be looked up (could not look up group access_bpf: Operation failed with error: eServerError); planning as if it were absent"
+        );
+        assert_eq!(
+            lines[1],
+            "console user could not be determined (could not resolve console uid 501 to a name); planning as if nobody were logged in"
+        );
+        assert_eq!(lines[2], "create group access_bpf");
+        assert_eq!(lines[3], "chown root:access_bpf /dev/bpf0");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("add ")),
+            "nobody is added when the console is unknown: {lines:?}"
+        );
+        assert_eq!(lines.len(), 3 + 256 * 2 + 1);
+        assert!(!sys.calls().iter().any(touches_the_machine));
+    }
+
+    #[test]
+    fn tester_apply_with_no_nodes_writes_a_zero_node_receipt() {
+        // No /dev/bpf* at all (not a real macOS state): the planner refuses
+        // nothing because there is nothing to judge, and the receipt records
+        // 0 nodes, no error, and the member that was added. Pinned so a
+        // change here is deliberate.
+        let sys = Fake::new(Vec::new(), Some(701), Some(admin("matt")));
+        let receipt = apply(&sys, "0.5.9", 1_762_000_000_000).expect("apply");
+        assert_eq!(receipt.nodes, 0);
+        assert_eq!(receipt.errors, Vec::<String>::new());
+        assert_eq!(receipt.members_added, vec!["matt".to_string()]);
+        assert!(!sys
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::Chown { .. } | Call::Chmod { .. })));
+    }
+
+    #[test]
+    fn tester_every_node_refused_still_writes_the_receipt_with_every_error() {
+        // /dev/bpf0 missing: every node refused, none set, 255 errors in the
+        // receipt, and no chown or chmod at all. The admin is still added
+        // (the plan does not condition AddMember on a node being set).
+        let nodes: Vec<NodeFacts> = (1..256).map(|n| node(n, BPF_MAJOR)).collect();
+        let sys = Fake::new(nodes, Some(701), Some(admin("matt")));
+        let receipt = apply(&sys, "0.5.9", 1_762_000_000_000).expect("apply");
+        assert_eq!(receipt.nodes, 0);
+        assert_eq!(receipt.errors.len(), 255);
+        assert_eq!(receipt.errors[0], "/dev/bpf1: /dev/bpf0 is missing");
+        assert_eq!(receipt.errors[254], "/dev/bpf255: /dev/bpf0 is missing");
+        assert_eq!(receipt.members_added, vec!["matt".to_string()]);
+        let calls = sys.calls();
+        assert!(!calls
+            .iter()
+            .any(|c| matches!(c, Call::Chown { .. } | Call::Chmod { .. })));
+        assert_eq!(dseditgroup_calls(&calls).len(), 1);
+    }
+
+    #[test]
+    fn tester_receipt_dir_refusals_are_literal_and_name_no_command() {
+        let cases: [(DirMeta, &str); 5] = [
+            (
+                DirMeta {
+                    is_dir: false,
+                    is_symlink: true,
+                    ..good_dir()
+                },
+                "/Library/Application Support/Aitmproxy is a symlink; nothing was changed",
+            ),
+            (
+                DirMeta {
+                    is_dir: false,
+                    ..good_dir()
+                },
+                "/Library/Application Support/Aitmproxy is not a directory; nothing was changed",
+            ),
+            (
+                DirMeta {
+                    uid: 501,
+                    ..good_dir()
+                },
+                "/Library/Application Support/Aitmproxy is owned by uid 501 gid 0 (expected root:wheel); nothing was changed",
+            ),
+            (
+                DirMeta {
+                    gid: 80,
+                    ..good_dir()
+                },
+                "/Library/Application Support/Aitmproxy is owned by uid 0 gid 80 (expected root:wheel); nothing was changed",
+            ),
+            (
+                DirMeta {
+                    mode: 0o777,
+                    ..good_dir()
+                },
+                "/Library/Application Support/Aitmproxy has mode 0777 (expected 0755); nothing was changed",
+            ),
+        ];
+        let mut messages = Vec::new();
+        for (dir, expected) in cases {
+            let mut sys = Fake::new(all_nodes(), Some(701), None);
+            sys.dir = Some(dir.clone());
+            let err = apply(&sys, "0.5.9", 1).expect_err("refused by apply");
+            assert_eq!(err, expected);
+            assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta]);
+            messages.push(err);
+            let mut sys = Fake::new(all_nodes(), Some(701), None);
+            sys.dir = Some(dir);
+            let err = revert(&sys).expect_err("refused by revert");
+            assert_eq!(err, expected);
+            assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta]);
+            messages.push(err);
+        }
+        // The executor's own messages (not the fake's) from the other stop
+        // points, for the Rule 2 check.
+        let mut sys = Fake::new(all_nodes(), None, None);
+        sys.gid_after_create = None;
+        messages.push(apply(&sys, "0.5.9", 1).expect_err("no gid"));
+        let sys = Fake::new(all_nodes(), Some(701), None);
+        *sys.receipt.borrow_mut() = Some(br#"{"schema":2}"#.to_vec());
+        messages.push(apply(&sys, "0.5.9", 1).expect_err("schema 2"));
+        let sys = Fake::new(all_nodes(), Some(701), None);
+        *sys.receipt.borrow_mut() = Some(b"{".to_vec());
+        messages.push(revert(&sys).expect_err("malformed"));
+        assert_eq!(messages.len(), 13);
+        for msg in &messages {
+            assert_eq!(
+                names_a_command(msg),
+                None,
+                "message {msg:?} names a command"
+            );
+        }
+        assert_eq!(names_a_command("run dseditgroup now"), Some("dseditgroup"));
     }
 }

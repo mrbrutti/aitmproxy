@@ -551,4 +551,202 @@ mod tests {
             ]
         );
     }
+
+    // ---- Tester edge cases (stage 5, unit p2) ------------------------------
+
+    #[test]
+    fn tester_empty_node_list_plans_only_the_bookkeeping_steps() {
+        // No node at all: nothing to change and nothing to refuse (there is
+        // no /dev/bpf0 to judge against, but also no node to judge). The
+        // group and receipt steps still come out; bpf_exec then writes a
+        // receipt with `nodes: 0` (see its tester test).
+        assert_eq!(
+            plan_apply(&[], Some(504), None, None),
+            vec![Step::WriteReceipt]
+        );
+        assert_eq!(
+            plan_apply(&[], None, None, Some(&admin("matt"))),
+            vec![
+                Step::CreateGroup,
+                Step::AddMember("matt".to_string()),
+                Step::WriteReceipt
+            ]
+        );
+        assert_eq!(plan_revert(&[], None), vec![Step::DeleteReceipt]);
+        assert_eq!(
+            plan_revert(&[], Some(&receipt(&["matt"]))),
+            vec![Step::RemoveMember("matt".to_string()), Step::DeleteReceipt]
+        );
+        assert_eq!(
+            render(&plan_apply(&[], Some(504), None, None)),
+            vec!["write receipt /Library/Application Support/Aitmproxy/l4-helper.json"]
+        );
+    }
+
+    #[test]
+    fn tester_bpf0_is_the_reference_wherever_it_sits_in_the_list() {
+        // The reference is found by number, not by position, and the steps
+        // keep the list's order.
+        let nodes = [
+            node(7, true, BPF_MAJOR),
+            node(0, true, BPF_MAJOR),
+            node(2, true, 42),
+        ];
+        assert_eq!(
+            plan_apply(&nodes, Some(504), None, None),
+            vec![
+                Step::Chown {
+                    n: 7,
+                    gid: Some(504)
+                },
+                Step::Chmod { n: 7, mode: 0o660 },
+                Step::Chown {
+                    n: 0,
+                    gid: Some(504)
+                },
+                Step::Chmod { n: 0, mode: 0o660 },
+                Step::Refuse {
+                    n: 2,
+                    why: "major 42 differs from /dev/bpf0's major 23".to_string(),
+                },
+                Step::WriteReceipt,
+            ]
+        );
+    }
+
+    #[test]
+    fn tester_duplicate_node_numbers_are_judged_one_by_one_against_the_first_bpf0() {
+        // `list_nodes` on a real machine cannot repeat a number; a list that
+        // does is judged entry by entry against the FIRST entry numbered 0.
+        let nodes = [
+            node(0, true, BPF_MAJOR),
+            node(0, true, 42),
+            node(1, true, BPF_MAJOR),
+            node(1, false, BPF_MAJOR),
+        ];
+        assert_eq!(
+            plan_apply(&nodes, Some(504), None, None),
+            vec![
+                Step::Chown {
+                    n: 0,
+                    gid: Some(504)
+                },
+                Step::Chmod { n: 0, mode: 0o660 },
+                Step::Refuse {
+                    n: 0,
+                    why: "major 42 differs from /dev/bpf0's major 23".to_string(),
+                },
+                Step::Chown {
+                    n: 1,
+                    gid: Some(504)
+                },
+                Step::Chmod { n: 1, mode: 0o660 },
+                Step::Refuse {
+                    n: 1,
+                    why: "not a character device".to_string(),
+                },
+                Step::WriteReceipt,
+            ]
+        );
+        // A first bpf0 that is not a character device refuses everything,
+        // including a later, valid entry numbered 0.
+        let nodes = [node(0, false, BPF_MAJOR), node(0, true, BPF_MAJOR)];
+        assert_eq!(
+            plan_apply(&nodes, Some(504), None, None),
+            vec![
+                Step::Refuse {
+                    n: 0,
+                    why: "/dev/bpf0 is not a character device".to_string(),
+                },
+                Step::Refuse {
+                    n: 0,
+                    why: "/dev/bpf0 is not a character device".to_string(),
+                },
+                Step::WriteReceipt,
+            ]
+        );
+    }
+
+    #[test]
+    fn tester_revert_plans_from_the_receipt_alone_even_for_a_member_the_group_lost() {
+        // The planner is never told about current membership: a receipt
+        // naming a user who has since left the group (or whose account is
+        // gone) still yields RemoveMember for them; the executor's
+        // dseditgroup call decides. Duplicates come out twice, in order.
+        let nodes = [node(0, true, BPF_MAJOR)];
+        let prior = receipt(&["gone", "matt", "gone"]);
+        assert_eq!(
+            plan_revert(&nodes, Some(&prior)),
+            vec![
+                Step::Chown { n: 0, gid: Some(0) },
+                Step::Chmod { n: 0, mode: 0o600 },
+                Step::RemoveMember("gone".to_string()),
+                Step::RemoveMember("matt".to_string()),
+                Step::RemoveMember("gone".to_string()),
+                Step::DeleteReceipt,
+            ]
+        );
+    }
+
+    #[test]
+    fn tester_console_none_with_a_prior_receipt_and_without_the_group() {
+        // A boot-time run (nobody at the console), not the first (receipt
+        // present), on a machine that lost the group: CreateGroup first and
+        // Chown with the gid unresolved; nobody is added.
+        let nodes = [node(0, true, BPF_MAJOR)];
+        let prior = receipt(&["matt"]);
+        let steps = plan_apply(&nodes, None, Some(&prior), None);
+        assert_eq!(
+            steps,
+            vec![
+                Step::CreateGroup,
+                Step::Chown { n: 0, gid: None },
+                Step::Chmod { n: 0, mode: 0o660 },
+                Step::WriteReceipt,
+            ]
+        );
+        assert_eq!(
+            render(&steps),
+            vec![
+                "create group access_bpf",
+                "chown root:access_bpf /dev/bpf0",
+                "chmod 0660 /dev/bpf0",
+                "write receipt /Library/Application Support/Aitmproxy/l4-helper.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn tester_render_distinguishes_wheel_from_every_other_gid() {
+        assert_eq!(
+            render(&[Step::Chown { n: 5, gid: Some(0) }]),
+            vec!["chown root:wheel /dev/bpf5"]
+        );
+        assert_eq!(
+            render(&[Step::Chown { n: 5, gid: Some(1) }]),
+            vec!["chown root:access_bpf /dev/bpf5"]
+        );
+        assert_eq!(
+            render(&[Step::Chown { n: 255, gid: None }]),
+            vec!["chown root:access_bpf /dev/bpf255"]
+        );
+        assert_eq!(
+            render(&[Step::Chmod {
+                n: 255,
+                mode: 0o600
+            }]),
+            vec!["chmod 0600 /dev/bpf255"]
+        );
+        assert_eq!(render(&[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tester_bpf_major_at_the_edges() {
+        assert_eq!(bpf_major(u64::MAX), 255);
+        assert_eq!(bpf_major(0x00ff_ffff), 0);
+        assert_eq!(bpf_major(0x0100_0000), 1);
+        assert_eq!(bpf_major(0xff00_0000), 255);
+        assert_eq!(bpf_major(0x1_0000_0000), 0);
+        assert_eq!(bpf_major(0x1_2300_0000), 0x23);
+    }
 }
