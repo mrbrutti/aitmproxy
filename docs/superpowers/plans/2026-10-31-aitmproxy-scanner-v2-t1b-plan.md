@@ -1555,7 +1555,7 @@ Kept by the main session during stage 6. One row per finding.
 | 1 | Quality | Minor | `RecordingHost::probe_raw` records URLs into `payloads()` | fixed in 5960c928 |
 | 4 | Quality | Minor | `check_meta_error_names_the_key` uses `contains`; `run_kind` test never covers `RunKind::Check` | fixed in 5960c928 (Display pinned; the `Check` arm was already pinned by the Tester's `run_kind_maps_check_load_and_poc_step`) |
 | 4 | Quality | Minor | `HostRunKind` hand-mirrors `engine::RunKind` with a variant-for-variant match | accepted by orchestrator 2026-11-01: `RunKind` is the rhai engine's own enum and the exhaustive match turns drift into a compile error; the seam enum stays in `aitm-plugin` per call B29 |
-| 1 | Quality | Minor | `ScanErrorCode::as_str` indexes the table by discriminant on a test-held invariant | fixed in 5960c928 |
+| 1 | Quality | Minor | `ScanErrorCode::as_str` indexes the table by discriminant on a test-held invariant | accepted by orchestrator 2026-11-01 with the `const _: () = assert!(len == 9)` added in 5960c928 plus the round-trip test as the pin; the index stays |
 | 4 | Quality | Minor | `block_on_browser` doc points at `block_on_send` instead of `drive` | fixed in 5960c928 |
 | 1 | Quality | Minor | `scan_error` erases the code into a string callers must re-parse | fixed in 5960c928 |
 | 3 | Spec | Minor | `tempfile = "3"` dev-dep not added and the fallback not recorded | accepted by orchestrator 2026-11-01: not in the offline cache at Task 3 time; seeded from the Terminal before wave 2; Tasks 6/7 may add it or use `std::env::temp_dir()` + a uuid subdir |
@@ -1596,6 +1596,16 @@ Kept by the main session during stage 6. One row per finding.
 | 11 | Security (w2+3) | Minor | PoC artefacts default to the system temp dir | fix (wave-2/3 fix task): `out_dir: None` → skip with a note; Task 14 passes `<findings.dir>/scan/pocs` |
 | 6 | Security (w2+3) | Minor | `check_timeout_s: 0` passes validation | fix (wave-2/3 fix task): floor at 1 |
 | 5,13,3 | Security (w2+3) | Minor | No `#![forbid(unsafe_code)]` attribute in `aitm-plugin-scanner`, `aitm-plugin-rhai`, `aitm-mcp` | fix (wave-2/3 fix task): add the attribute (the workspace lint already forbids it; belt and braces) |
+| 13 | Spec (w2+3) | Critical | `META_KEYS` omits `remediation` (spec D4 lists it) | same fix as the T3/quality rows (in flight); the pin test `meta_keys_cover_every_check_meta_field_but_origin` closes the class |
+| 13 | Spec (w2+3) | Important | Plan test `add_check_registers_a_script_check_with_meta` dropped the `loader.checks()`/`tier.checks` assertions; B9/B17 wiring untested | fix dispatched 2026-11-01 (host_probe coder): `tests/loader_checks.rs` through the real loader, origin `bundled`/`custom`, reload swap |
+| 13 | Spec (w2+3) | Important | Unrequested `probe.send(#{ value, mode })` overload | accepted by orchestrator 2026-11-01: requested by the T3 track for the converted scripts; maps 1:1 onto the T1a `Payload.mode` the lane host already honours; documented in `rhai.api.json` and tested |
+| 6 | Spec (w2+3) | Minor | `normalize_origin` drops a scheme-default port (plan said "explicit port kept") | accepted by orchestrator 2026-11-01: `http://h:80` and `http://h` are one origin; the wave-2/3 fix task centralises the rule in `util` |
+| 13 | Spec (w2+3) | Minor | Bridge refuses unknown meta keys (stricter than the plan) | accepted by orchestrator 2026-11-01: D4 "keys are exactly"; a typo'd optional key must not be a silent no-op |
+| 13 | Spec (w2+3) | Minor | Small unrequested surface (`convert_checks` error, `CheckCtx` re-export, `ScriptCheck::new` pub, `reg.add_check` catalogue entry) | accepted by orchestrator 2026-11-01 (the catalogue entry is required by the bijection) |
+| 7 | Spec (w2+3) | Minor | `query` clamps `limit` to `1..=1024` | accepted by orchestrator 2026-11-01: a zero page never advances |
+| 11 | Spec (w2+3) | Minor | Additions beyond the plan text (`MAX_POC_NAME_CHARS`, `bindings_for`, `frontend_of`, `secret_var_name` pub(crate)) | accepted by orchestrator 2026-11-01: each required by the plan's own `poc_text_is_scrubbed` or `aitm_poc`'s precheck |
+| 1 | Spec (w2+3) | Minor | Wave-1 disposition for `as_str` overstated: a const assert was added, the index stays | disposition reworded 2026-11-01: accepted with the const assert + round-trip test as the pin |
+| 5-12 | Spec (w2+3) | Minor | Declared deviations (B21 alias unused, `override` test via `target`, allowlist in get/list, `delete` without dir, cookie excluded from headers, canary header drops, `from_flow` fallback, no `shared: Weak`, `confidence_max`) | accepted by orchestrator 2026-11-01: each required by the plan's own tests or recorded as an amendment |
 
 ## Shipped
 
