@@ -289,7 +289,9 @@ fn admitted_destination(frame: &[u8], dst: IpAddr) -> Result<(), L4Error> {
 /// `10.255.255.254` on a socket bound to `lo` and emits the frame on `lo`, where
 /// it dies — `send_to` returned `Ok`. So the refusal must be ours, deterministic
 /// and before any socket is opened. Pure: no payload byte, no address, reaches
-/// the message.
+/// the message. `Ipv6Addr::is_loopback` is `::1` only, so `::ffff:127.0.0.1`
+/// and `fe80::1` are refused — fail-closed, and correct for an `AF_INET6` raw
+/// socket, which has no business with a mapped IPv4 or link-local destination.
 fn loopback_destination(dst: IpAddr) -> Result<(), L4Error> {
     if dst.is_loopback() {
         Ok(())
@@ -306,7 +308,10 @@ fn loopback_destination(dst: IpAddr) -> Result<(), L4Error> {
 /// path returns for the same condition, so the lane stops with
 /// `StopReason::Unavailable` and the privilege probe reads it correctly. Every
 /// other kind is [`L4Error::WireWrite`]. The message carries the context and the
-/// `io::Error` text only — never a payload byte.
+/// `io::Error` text only — never a payload byte. `EPERM` from `send_to` can also
+/// be a netfilter (`OUTPUT` `REJECT`/`DROP`) or LSM denial, which this reports
+/// as [`L4Error::Unavailable`] too: fail-closed, but the "no privilege"
+/// diagnosis may mislead on a firewalled host.
 fn socket_error(context: &str, e: &std::io::Error) -> L4Error {
     let message = format!("linux loopback inject: {context}: {e}");
     if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -322,10 +327,14 @@ fn bind_context(iface: &str) -> String {
     format!("bind to {iface} failed")
 }
 
-/// Bind the raw socket to `iface` (`SO_BINDTODEVICE`), so the kernel routes
-/// only through the device the operator named: a destination with no route via
-/// that device fails `ENETUNREACH` at `send_to` instead of leaving through
-/// another NIC (security panel M1). socket2 exposes `bind_device` on Linux only.
+/// Bind the raw socket to `iface` (`SO_BINDTODEVICE`), so whatever passes is
+/// confined to the device the operator named and can never leave through
+/// another NIC (security panel M1). This is confinement, not a refusal: the
+/// kernel does not fail an off-host destination on a device-bound socket (rig
+/// run 4: `send_to` to `10.255.255.254` returned `Ok` and the frame went out on
+/// `lo`, where it died). The refusal of a non-loopback destination is
+/// [`loopback_destination`], applied before the socket is opened; the binding
+/// stays as defence in depth. socket2 exposes `bind_device` on Linux only.
 #[cfg(target_os = "linux")]
 fn bind_to_device(socket: &Socket, iface: &str) -> Result<(), L4Error> {
     socket
@@ -837,7 +846,9 @@ mod tests {
         assert_eq!(
             socket_error("send_to", &Error::from(ErrorKind::NetworkUnreachable)),
             L4Error::WireWrite("linux loopback inject: send_to: network unreachable".to_string()),
-            "ENETUNREACH from the device-bound socket is a refused write"
+            "a wire error from the device-bound socket is a failed write (the \
+             kernel gives no ENETUNREACH for an off-host destination on `lo`; \
+             that refusal is `loopback_destination`, before any socket)"
         );
         assert_eq!(
             socket_error("IP_HDRINCL", &Error::other("boom")),
