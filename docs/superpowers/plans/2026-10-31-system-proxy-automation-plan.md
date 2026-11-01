@@ -782,8 +782,7 @@ Task 8 (plugin) → Task 9 (wiring) → {Task 10 main.rs ∥ Task 11 pins} → T
 ## PR 2 — TUI (`:sysproxy`, key `s`, pill word)
 
 **WAIT:** after the fake-data-removal TUI PR and l4-parity's TUI unit have merged;
-rebase onto main first. **Never touch `crates/aitm-tui/src/fixture.rs`.** If a task
-needs it, stop and report.
+rebase onto main first. **`crates/aitm-tui/src/fixture.rs` and `fixtures/bus-fixture.json` were removed from main by #244 (2026-11-01); no fixture pin remains. Tests build on `App::new()`.**
 
 ### Task 16: model — `SystemProxyWord`
 
@@ -1625,6 +1624,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 16 | coder (stop-on-gap) | Minor | Task 16 declared only `model.rs`, but `ProxyStatus` is built with exhaustive struct literals in `src/app.rs` (test helper), `tests/core_sync.rs`, `tests/common/mod.rs`; adding `system_proxy` there is required to compile | file list extended to those three one-line edits, orchestrator 2026-11-01 |
 | 7 | quality (F4) | Minor | `decide` rustdoc misstates the call graph; the `else { return 0 }` after `decide(Some(..))` is unreachable | accepted (recorded), orchestrator 2026-10-31; fold into the scaffolding follow-up (reword doc or `unreachable!`) |
 | crate | quality (F4) | Minor | rustdoc intra-doc links to `pub(crate)` items (not gated) | accepted (recorded); `#![allow(rustdoc::private_intra_doc_links)]` or plain backticks in the follow-up |
 | 10 | quality (F4) | Minor | config-path resolution spelled in both `main` and `run` | accepted (recorded); `Invocation::config_path()` in the follow-up |
