@@ -552,6 +552,9 @@ Kept by the main session during stage 6. One row per finding.
 | PR B whole branch | security | Minor x3 | eight cells leaked temp dirs; canary parsed `Content-Length` before recording the hit; `urlopen` honoured `http_proxy` env | fixed in a65be945 (one `work` dir + `rmtree`; hit-first, 1 MiB cap; module-level proxy-free no-redirect opener) |
 | PR B whole branch | security / quality | accepted | `EXPECTED_TOOLS` regex copy (sharing edits a file outside T10's row); `TargetLogs.last_seq()` pinned by D7; `NoReturn` on `fail`/`skip` lives in `aitm_e2e/__init__.py` (framework owner follow-up) | accepted by the orchestrator 2026-11-01 |
 | PR B fix round 1 (coder, self-check) | orchestrator | note | the Fable coder's single Write of the fixture tables was stopped by the safety classifier and the agent kept appending chunks after its hand-back; stopped, file restored, tables written by the orchestrator | 0c047042 |
+| PR B fix round 1 (2c7a3251..a65be945) | security (re-review) | PASS, Minor x2 | `test_t1_cancel.py` planted the canary link with bare `urlopen` (proxy env, redirect followed); its failure line dumped full canary hit records | fixed in 96d22bd7 (`post_form_direct` in scan.py; hit paths only) |
+| PR B fix round 1 | quality (re-review) | PASS, Minor x2 | self-check `do_login` is its own login (it is the assertion); SEEDS failure line prints the observed value, not the expected literal | accepted by the orchestrator 2026-11-01 (the literal table is adjacent; `do_login` asserts the Set-Cookie shape itself) |
+| PR B fix round 1 | spec (re-review) | PASS, Minor x2 | D7 helper row lagged `scan.py` (`split_addr`, `packet_lane_gate(*verbs)`, `brief(issue_rows)`, `read_capture_packets(page=)`, `ledger_flush` note wording); `/whoami` row drove `User-Agent` only | fixed in 01326012 + the D7 `ledger_flush` reword and the `X-Forwarded-For` assertion (this commit) |
 
 ## Shipped
 

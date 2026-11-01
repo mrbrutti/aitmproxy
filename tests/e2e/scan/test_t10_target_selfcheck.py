@@ -436,12 +436,14 @@ def check_seeds(v: ScanTarget, p: ScanTarget) -> None:
           f"V: 200 text/plain + {traversal_marker} (got {sv} {header(hdrv, 'content-type')!r} {text(bv)!r})")
     check(sp == 400, f"P: 400, no file served (got {sp} {text(bp)!r})")
 
-    section("header-reflection `/whoami` User-Agent: V reflects raw, P escapes")
-    sv, _, bv = http1(v.base, "GET", "/whoami", headers={"user-agent": MARK})
-    sp, _, bp = http1(p.base, "GET", "/whoami", headers={"user-agent": MARK})
-    check(sv == 200 and f"<p>agent: {MARK}</p>" in text(bv), f"V: raw User-Agent reflected (got {text(bv)!r})")
-    check(sp == 200 and MARK_ESC in text(bp) and MARK not in text(bp),
-          f"P: User-Agent HTML-escaped (got {text(bp)!r})")
+    section("header-reflection `/whoami` User-Agent + X-Forwarded-For: V reflects raw, P escapes")
+    hdrs = {"user-agent": MARK, "x-forwarded-for": MARK}
+    sv, _, bv = http1(v.base, "GET", "/whoami", headers=hdrs)
+    sp, _, bp = http1(p.base, "GET", "/whoami", headers=hdrs)
+    check(sv == 200 and f"<p>agent: {MARK}</p><p>from: {MARK}</p>" in text(bv),
+          f"V: raw User-Agent and X-Forwarded-For reflected (got {text(bv)!r})")
+    check(sp == 200 and text(bp).count(MARK_ESC) == 2 and MARK not in text(bp),
+          f"P: both headers HTML-escaped (got {text(bp)!r})")
 
     section("session gate `/account?tab=`: reachable only with the login cookie; V raw, P escapes")
     tab = urllib.parse.quote(MARK, safe="")
