@@ -160,8 +160,12 @@ name, never by index.
 brief forbids touching the system proxy and Proxyman's settings, and the
 agreed hand-over is that Matt quits Proxyman from its own menu so it restores
 the proxy itself (without the helper that path is `networksetup`). The
-review session was told at 09:09 and again at 09:15; the post-quit reading
-is theirs to record.
+review session was told at 09:09 and again at 09:15. **Post-quit reading
+(review session, from Matt's shell, ~09:40):** Matt quit Proxyman from its
+own menu; no Proxyman process, `HTTPEnable 0 / HTTPSEnable 0`, nothing
+listening on 127.0.0.1:9090. The `networksetup` path reverts on quit even
+with the helper not installed; only a crash would leave the override behind
+(BUNDLE §3.4).
 
 Reading for aitmproxy: "override at launch" in Proxyman means "whenever a
 session window appears", and without the helper the revert on quit is
