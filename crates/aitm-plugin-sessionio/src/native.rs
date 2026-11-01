@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use aitm_core::{
     Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
-    HttpVersion, InterceptState, WsDir, WsFlow, WsMessage, WsOpcode,
+    HttpVersion, InterceptState, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow, WsMessage,
+    WsOpcode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +137,32 @@ pub struct MetaRec {
     pub duration: Option<Duration>,
     pub truncated: bool,
     pub edited: bool,
+    /// Absent in documents written before capture attribution existed: loads as `None`.
+    #[serde(default)]
+    pub source_app: Option<String>,
+    /// Absent in documents written before capture attribution existed: loads as `None`.
+    #[serde(default)]
+    pub capture_interface: Option<String>,
+    /// Observed only, nothing acted on it (spec D4). Absent in documents written
+    /// before per-host decryption existed: loads as `false`.
+    #[serde(default)]
+    pub passive: bool,
+    /// The tunnel fields of a `CONNECT` row (spec D5). Absent in documents written
+    /// before per-host decryption existed: loads as `None`.
+    #[serde(default)]
+    pub tunnel: Option<TunnelRec>,
+}
+
+/// Serde mirror of [`TunnelInfo`]. `mode` and `reason` are the wire labels
+/// ([`TunnelMode::label`], [`TunnelReason::label`]), so a document reads the same
+/// as the bus. A code this build does not know loads as "not a tunnel row"
+/// ([`rec_to_tunnel`] yields `None`) rather than failing the whole document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelRec {
+    pub mode: String,
+    pub reason: Option<String>,
+    pub bytes_up: Option<u64>,
+    pub bytes_down: Option<u64>,
 }
 
 /// Serde mirror of [`WsMessage`].
@@ -354,6 +381,10 @@ fn meta_to_rec(m: &FlowMeta) -> MetaRec {
         duration: m.duration,
         truncated: m.truncated,
         edited: m.edited,
+        source_app: m.source_app.clone(),
+        capture_interface: m.capture_interface.clone(),
+        passive: m.passive,
+        tunnel: m.tunnel.as_ref().map(tunnel_to_rec),
     }
 }
 
@@ -366,7 +397,38 @@ fn rec_to_meta(m: &MetaRec) -> FlowMeta {
         duration: m.duration,
         truncated: m.truncated,
         edited: m.edited,
+        source_app: m.source_app.clone(),
+        capture_interface: m.capture_interface.clone(),
+        passive: m.passive,
+        // An unknown code is "not a tunnel row", never a failed load.
+        tunnel: m.tunnel.as_ref().and_then(rec_to_tunnel),
     }
+}
+
+fn tunnel_to_rec(t: &TunnelInfo) -> TunnelRec {
+    TunnelRec {
+        mode: t.mode.label().to_string(),
+        reason: t.reason.map(|r| r.label().to_string()),
+        bytes_up: t.bytes_up,
+        bytes_down: t.bytes_down,
+    }
+}
+
+/// The inverse of the labels (`TunnelMode::from_label`, `TunnelReason::from_label`):
+/// `None` when `mode`, or a present `reason`, is not a code this build knows (a
+/// newer writer or a hand-edited file).
+fn rec_to_tunnel(t: &TunnelRec) -> Option<TunnelInfo> {
+    let mode = TunnelMode::from_label(&t.mode)?;
+    let reason = match &t.reason {
+        None => None,
+        Some(code) => Some(TunnelReason::from_label(code)?),
+    };
+    Some(TunnelInfo {
+        mode,
+        reason,
+        bytes_up: t.bytes_up,
+        bytes_down: t.bytes_down,
+    })
 }
 
 fn ws_msg_to_rec(m: &WsMessage) -> WsMsgRec {
@@ -404,5 +466,116 @@ fn rec_to_ws_msg(m: &WsMsgRec) -> WsMessage {
         data: m.data.clone(),
         timestamp: m.timestamp,
         injected: m.injected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `meta` object in the shape written before `source_app` /
+    /// `capture_interface` existed (SA-AC7). `serde_json` renders `SystemTime` as
+    /// `{secs_since_epoch, nanos_since_epoch}`, which is what an older document holds.
+    const PRE_ATTRIBUTION_META: &str = r#"{
+        "marks": ["m"],
+        "comment": null,
+        "is_replay": false,
+        "created": {"secs_since_epoch": 1, "nanos_since_epoch": 0},
+        "duration": null,
+        "truncated": false,
+        "edited": false
+    }"#;
+
+    /// An older document's `meta` (no attribution keys) still loads, as `None`/`None`.
+    #[test]
+    fn meta_rec_without_attribution_loads_as_none() {
+        let rec: MetaRec =
+            serde_json::from_str(PRE_ATTRIBUTION_META).expect("the pre-change shape parses");
+        let meta = rec_to_meta(&rec);
+        assert_eq!(meta.source_app, None);
+        assert_eq!(meta.capture_interface, None);
+        assert_eq!(meta.marks, vec!["m".to_string()], "the rest still loads");
+    }
+
+    /// The two attribution fields survive `meta_to_rec` → serialise → deserialise →
+    /// `rec_to_meta` unchanged (SA-AC7).
+    #[test]
+    fn attribution_round_trips_the_native_format() {
+        let meta = FlowMeta {
+            source_app: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&meta_to_rec(&meta)).expect("serialises");
+        let rec: MetaRec = serde_json::from_str(&text).expect("deserialises");
+        let back = rec_to_meta(&rec);
+        assert_eq!(back.source_app.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(back.capture_interface.as_deref(), Some("macos-ne"));
+    }
+
+    // ---- Tester additions (whole-branch stage 5) -----------------------------
+
+    /// SA-AC7 edge: an explicit `null` for either key — what this version writes
+    /// for a proxied flow — loads as `None` as well.
+    #[test]
+    fn meta_rec_with_explicit_null_attribution_loads_as_none() {
+        let doc = PRE_ATTRIBUTION_META.replacen(
+            "\"edited\": false",
+            "\"edited\": false, \"source_app\": null, \"capture_interface\": null",
+            1,
+        );
+        let rec: MetaRec = serde_json::from_str(&doc).expect("explicit nulls parse");
+        let meta = rec_to_meta(&rec);
+        assert_eq!(meta.source_app, None);
+        assert_eq!(meta.capture_interface, None);
+    }
+
+    /// Malformed input: a non-string value for either key is a parse error the
+    /// loader reports — not a panic, and not a value coerced into an identifier.
+    #[test]
+    fn meta_rec_rejects_a_non_string_attribution() {
+        for bad in [
+            "42",
+            "true",
+            "[\"com.apple.Safari\"]",
+            "{\"id\": \"com.apple.Safari\"}",
+        ] {
+            let doc = PRE_ATTRIBUTION_META.replacen(
+                "\"edited\": false",
+                &format!("\"edited\": false, \"source_app\": {bad}"),
+                1,
+            );
+            assert!(
+                serde_json::from_str::<MetaRec>(&doc).is_err(),
+                "source_app = {bad} must not parse"
+            );
+            let doc = PRE_ATTRIBUTION_META.replacen(
+                "\"edited\": false",
+                &format!("\"edited\": false, \"capture_interface\": {bad}"),
+                1,
+            );
+            assert!(
+                serde_json::from_str::<MetaRec>(&doc).is_err(),
+                "capture_interface = {bad} must not parse"
+            );
+        }
+    }
+
+    /// The attribution text round-trips byte for byte: quotes, CR/LF, a NUL,
+    /// non-ASCII and a 64 KiB identifier come back exactly as stored — nothing is
+    /// escaped twice, trimmed or truncated.
+    #[test]
+    fn attribution_round_trips_hostile_text() {
+        let hostile = format!("com.evil.\"q\"\r\n\u{0}日本語.{}", "x".repeat(64 * 1024));
+        let meta = FlowMeta {
+            source_app: Some(hostile.clone()),
+            capture_interface: Some(" macos-ne\t".into()),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&meta_to_rec(&meta)).expect("serialises");
+        let rec: MetaRec = serde_json::from_str(&text).expect("deserialises");
+        let back = rec_to_meta(&rec);
+        assert_eq!(back.source_app.as_deref(), Some(hostile.as_str()));
+        assert_eq!(back.capture_interface.as_deref(), Some(" macos-ne\t"));
     }
 }

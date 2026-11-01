@@ -37,14 +37,6 @@ final class ScanPanelState {
         form.sync(tool: session.tools.first { $0.name == ScanForm.toolName }, scopeHosts: session.scopeHosts)
     }
 
-    /// Fixture sessions open with a finished crawl, the way Findings opens with runs.
-    func loadFixture() {
-        syncForm()
-        guard let result = try? ScanResult(json: Fixtures.scanDiscover) else { return }
-        model.begin(target: form.normalizedTarget)
-        model.finish(result)
-    }
-
     // MARK: Intents
 
     /// The in-flight crawl, held so Cancel can stop waiting on it.
@@ -351,7 +343,7 @@ struct ScanEndpointRow: View {
                 }
                 .buttonStyle(PressStyle())
                 .disabled(!openable)
-                .help(openable ? "Open flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
+                .help(openable ? "Open Flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
             } else {
                 label.textSelection(.enabled)
             }
@@ -367,15 +359,14 @@ struct ScanEndpointRow: View {
                 Button("Open Flow", action: open).disabled(!openable)
             }
             Button("Copy URL") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(url, forType: .string)
+                Pasteboard.copy(url, sensitive: true)
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(url)
         .accessibilityAddTraits(linked ? .isButton : [])
         .accessibilityActions {
-            if linked { Button("Open flow", action: open) }
+            if linked { Button("Open Flow", action: open) }
         }
     }
 
@@ -559,7 +550,7 @@ struct ScanPointDetail: View {
                 .lineLimit(1)
             Badge(text: point.location, pair: Tok.Severity.info, uppercase: false)
             Spacer(minLength: Space.sm)
-            FlatButton("Open flow") { state.open(point) }
+            FlatButton("Open Flow") { state.open(point) }
                 .disabled(!state.canOpen(point))
         }
         .padding(.horizontal, Space.md)

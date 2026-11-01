@@ -1,10 +1,12 @@
 import Foundation
 
-/// The content-type chip bar (foundation §2.7): `All | HTTP HTTPS WebSocket |
-/// h1 h2 | JSON Form XML JS CSS GraphQL Document Media Other`.
+/// The content-type chip bar (foundation §2.7; spec 2026-10-31 status page §4b): `All | HTTP
+/// HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON Form XML JS CSS GraphQL Document Media Other`.
 public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifiable {
     case all
     case http, https, websocket
+    /// Raw-L4 flows by transport; `l4` is every packet-level flow (ICMP, raw and other included).
+    case tcp, udp, l4
     case h1, h2
     case json, form, xml, js, css, graphql, document, media, other
 
@@ -16,6 +18,9 @@ public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifia
         case .http: "HTTP"
         case .https: "HTTPS"
         case .websocket: "WebSocket"
+        case .tcp: "TCP"
+        case .udp: "UDP"
+        case .l4: "L4"
         case .h1: "h1"
         case .h2: "h2"
         case .json: "JSON"
@@ -30,13 +35,43 @@ public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifia
         }
     }
 
-    /// The bar's groups, separated by a hairline.
+    /// The chip's hover help: what it keeps, starting with a verb.
+    public var help: String {
+        switch self {
+        case .all: "Show every flow"
+        case .http: "Keep plain HTTP flows"
+        case .https: "Keep HTTPS flows"
+        case .websocket: "Keep WebSocket connections"
+        case .tcp: "Keep raw TCP sessions captured at L4"
+        case .udp: "Keep raw UDP flows captured at L4"
+        case .l4: "Keep every packet-level flow: TCP, UDP, ICMP and raw"
+        case .h1: "Keep HTTP/1.x flows"
+        case .h2: "Keep HTTP/2 flows"
+        case .json: "Keep flows whose body is JSON"
+        case .form: "Keep flows whose body is a form"
+        case .xml: "Keep flows whose body is XML"
+        case .js: "Keep JavaScript"
+        case .css: "Keep style sheets"
+        case .graphql: "Keep GraphQL flows"
+        case .document: "Keep HTML, text and Markdown documents"
+        case .media: "Keep images, video, audio and fonts"
+        case .other: "Keep every other content type"
+        }
+    }
+
+    /// The bar's groups, separated by a hairline: application protocols, then transport
+    /// (raw L4), then HTTP versions, then content types.
     public static let groups: [[ContentCategory]] = [
         [.all],
         [.http, .https, .websocket],
+        [.tcp, .udp, .l4],
         [.h1, .h2],
         [.json, .form, .xml, .js, .css, .graphql, .document, .media, .other],
     ]
+
+    /// ⌘1…⌘9: the first nine chips in bar order — the one owner of that rule (the View ▸ Chip
+    /// menu and the command map both read it), so adding a chip moves the later shortcuts once.
+    public static let shortcutChips: [ContentCategory] = Array(groups.flatMap { $0 }.prefix(9))
 
     /// Classifies a response (or request) content type.
     public static func classify(contentType: String?) -> ContentCategory {
@@ -53,13 +88,18 @@ public enum ContentCategory: String, CaseIterable, Hashable, Sendable, Identifia
         return .other
     }
 
-    /// Whether a row passes this chip. Protocol chips look at scheme/kind/version; type chips at the content type.
+    /// Whether a row passes this chip. Protocol chips look at scheme/kind/version; the three
+    /// L4 chips read one field, `row.l4` (set on every packet-level row), so L4 is exactly the
+    /// union of TCP, UDP and the other transports; type chips at the content type.
     public func matches(row: FlowRow, contentType: String?, httpVersion: String?) -> Bool {
         switch self {
         case .all: true
         case .http: row.scheme == "http"
         case .https: row.scheme == "https"
         case .websocket: row.kind == .websocket
+        case .tcp: row.l4?.proto == .tcp
+        case .udp: row.l4?.proto == .udp
+        case .l4: row.l4 != nil
         case .h1: httpVersion?.hasPrefix("HTTP/1") ?? false
         case .h2: httpVersion?.hasPrefix("HTTP/2") ?? false
         default: Self.classify(contentType: contentType) == self

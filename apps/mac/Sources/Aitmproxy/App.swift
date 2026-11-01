@@ -4,10 +4,8 @@ import SwiftUI
 
 // Aitmproxy — the native macOS operator app for the aitmproxy command bus.
 //   Aitmproxy                       the app (connects to the bus from Settings or config.yaml)
-//   APP_FIXTURES=1 Aitmproxy        show the fixture session instead of a live bus
 //   APP_STORE=<dir> Aitmproxy       keep local state (pins, saved filters) elsewhere (tests)
-//   APP_SNAPSHOT=<dir> Aitmproxy    save a PNG of every sidebar page and Settings tab in light and dark, then quit
-//   Aitmproxy --selftest            run the self-test and quit with 0 or 1 (tools/selftest.sh)
+//   APP_LIVE=1 Aitmproxy --selftest run the live self-test against a running aitm and quit with 0 or 1 (tools/selftest-live.sh)
 //   APP_ACCENT=<id> Aitmproxy       run with another accent from Theme.all (UI/Theme.swift)
 //   APP_GRID=1 Aitmproxy            draw the 8 pt grid and the layout probes over the window
 
@@ -55,9 +53,23 @@ struct AitmproxyApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Fail closed first (spec D3 items 8 and 5), before the process even becomes a
+        // foreground app and before any window, BusService, connection model or
+        // ExtensionController exists: a removed fake-data switch, or a `--selftest`
+        // without its harness, must never run the live stack on the operator's real
+        // defaults. `exit` flushes the one printed line.
+        if let why = RemovedModes.refusal(environment: ProcessInfo.processInfo.environment) {
+            print(why)
+            exit(1)
+        }
+        if SelfTest.requested, let why = SelfTest.refusal() {
+            print(why)
+            exit(1)
+        }
         // Started from a terminal, the process is not a foreground app yet.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
+        SelfTest.armWatchdog()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -71,10 +83,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Where surface-local state lives (pins, saved filters, compose history):
 /// ~/Library/Application Support/Aitmproxy/. Flows never persist here; they live in the proxy.
 enum Store {
-    /// True when APP_STORE points somewhere else (tests, snapshots).
+    /// True when APP_STORE points somewhere else (tests, the dev bundle).
     static var isOverridden: Bool {
         !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
     }
+
+    /// The store for the connection settings (`bus.*`, `proxy.*`, `capture.enabled`):
+    /// the operator's real defaults in a normal launch, an isolated suite in a
+    /// harness run (`APP_STORE` / `APP_LIVE`; `SettingsDomain`), so stale Settings ▸ Bus
+    /// residue never steers a test and a test never overwrites it. `UserDefaults` is
+    /// thread-safe but not marked `Sendable`, hence `unsafe`; the embedded core reads
+    /// it off the main actor.
+    nonisolated(unsafe) static let defaults: UserDefaults = {
+        let env = ProcessInfo.processInfo.environment
+        return SettingsDomain.select(environment: env).makeDefaults(registering: SettingsDomain.registration(environment: env))
+    }()
 
     static var url: URL {
         if let path = ProcessInfo.processInfo.environment["APP_STORE"], !path.isEmpty {
@@ -84,14 +107,6 @@ enum Store {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
-
-    /// Fixture mode: APP_FIXTURES=1, or any snapshot/self-test run — unless
-    /// APP_LIVE=1 asks a snapshot to capture the live bus instead.
-    static var usesFixtures: Bool {
-        let env = ProcessInfo.processInfo.environment
-        if env["APP_LIVE"] == "1" { return false }
-        return env["APP_FIXTURES"] == "1" || env["APP_SNAPSHOT"] != nil || SelfTest.requested
-    }
 }
 
 /// Menu bar items for every flow action, with the shortcuts the foundation
@@ -99,11 +114,11 @@ enum Store {
 struct FlowCommands: Commands {
     let session: Session
     /// The persisted capture choice (Settings ▸ Capture), read here for the Enable/Disable label.
-    @AppStorage("capture.enabled") private var captureEnabled = false
+    @AppStorage("capture.enabled", store: Store.defaults) private var captureEnabled = false
     /// The active core kind (Settings ▸ Bus), read exactly as `ProxySettings` reads it: capture
-    /// belongs to the embedded core, so the Enable/Disable Capture command stands down unless
+    /// belongs to the embedded core, so the Turn On/Off Capture command stands down unless
     /// that is the active one.
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
@@ -127,64 +142,48 @@ struct FlowCommands: Commands {
                 .disabled(session.rows.isEmpty)
         }
         CommandMenu("Flow") {
+            // Row verbs read the verb table (titles, shortcuts, enabled); the rest are session intents.
+            // Resume and Kill act on the intercept bar's target, every other verb on the focused row.
+            let focused = session.focused
+            let target = session.interceptTarget?.id
+            let focusedItems = session.verbItems(for: focused)
+            let targetItems = session.verbItems(for: target)
+            let verb: (FlowVerb, FlowID?, [VerbItem]) -> VerbButton = { v, id, items in
+                VerbButton(item: VerbTable.item(v, in: items)) { if let id { session.perform(v, on: id) } }
+            }
             Button(session.interceptArmed ? "Disarm Intercept" : "Arm Intercept") {
                 session.arm(!session.interceptArmed)
             }
             .keyboardShortcut("i", modifiers: [])
-            Button(session.interceptTarget.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume") {
-                if let target = session.interceptTarget { session.applyAndResume(target.id) }
-            }
-            .keyboardShortcut(.return, modifiers: .command)
-            .disabled(session.interceptTarget == nil)
+            verb(.resume, target, targetItems)
             Button("Resume All") { session.resumeAll() }
                 .keyboardShortcut(.return, modifiers: [.command, .option])
                 .disabled(session.paused.isEmpty)
-            Button("Edit Paused Request") { if let id = session.focused { session.perform(.edit, on: id) } }
-                .keyboardShortcut("e", modifiers: [])
-                .disabled(session.focusedRow?.state != .paused)
+            verb(.edit, focused, focusedItems)
             // ⌘Z stays Undo inside the request editor; the item reverts the whole draft.
             Button("Revert to Original") { if let id = session.focused { session.revertDraft(id) } }
                 .disabled(session.focused.map { session.pendingEditCount($0) > 0 } != true)
-            Button("Kill") { if let target = session.interceptTarget { session.perform(.kill, on: target.id) } }
-                .keyboardShortcut("\\", modifiers: .command)
-                .disabled(session.interceptTarget == nil)
+            verb(.kill, target, targetItems)
             Divider()
-            Button("Replay") { if let id = session.focused { session.perform(.replay, on: id) } }
-                .keyboardShortcut("r", modifiers: [])
-                .disabled(session.focused == nil)
-            Button("Edit & Replay…") { if let id = session.focused { session.editAndReplay(id) } }
-                .keyboardShortcut("r", modifiers: .shift)
-                .disabled(session.focused == nil)
+            verb(.replay, focused, focusedItems)
+            verb(.editAndReplay, focused, focusedItems)
             Divider()
-            Button("Resume Selected") { session.resumeSelected() }
-                .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
-            Button("Kill Selected") { session.killSelected() }
-                .disabled(session.selectedRows.allSatisfy { $0.state != .paused })
-            Button(session.focusedRow.map { $0.state == .paused || $0.state == .pending } == true ? "Kill" : "Delete") {
-                if let id = session.focused { session.deleteOrKill(id) }
-            }
-            .keyboardShortcut("d", modifiers: [])
-            .disabled(session.focused == nil)
-            Button("Build PoC from Flow…") { if let id = session.focused { session.perform(.buildPoC, on: id) } }
-                .keyboardShortcut("p", modifiers: [])
-                .disabled(session.focused == nil)
+            verb(.resumeSelected, focused, focusedItems)
+            verb(.killSelected, focused, focusedItems)
+            verb(.delete, focused, focusedItems)
+            verb(.buildPoC, focused, focusedItems)
             Divider()
-            Menu("Mark") {
+            let mark = VerbTable.item(.mark(nil), in: focusedItems)
+            Menu(mark.title) {
                 ForEach(MarkColor.allCases, id: \.self) { color in
-                    Button(color.title) { if let id = session.focused { session.perform(.mark(color), on: id) } }
+                    Button(color.title) { if let focused { session.perform(.mark(color), on: focused) } }
                 }
                 Divider()
-                Button("Clear Mark") { if let id = session.focused { session.perform(.mark(nil), on: id) } }
+                Button("Clear Mark") { if let focused { session.perform(.mark(nil), on: focused) } }
             }
-            .disabled(session.focused == nil)
-            Button("Comment…") { if let id = session.focused { session.perform(.comment, on: id) } }
-                .keyboardShortcut("l", modifiers: .command)
-                .disabled(session.focused == nil)
-            Button(session.focusedRow.map { session.isPinned(.host($0.authority)) } == true ? "Unpin Host" : "Pin Host") {
-                if let id = session.focused { session.perform(.pinHost, on: id) }
-            }
-            .keyboardShortcut("p", modifiers: .shift)
-            .disabled(session.focused == nil)
+            .disabled(!mark.enabled)
+            verb(.comment, focused, focusedItems)
+            verb(.pinHost, focused, focusedItems)
             Button("Add Host to Scope…") { session.addFocusedHostToScope() }
                 .keyboardShortcut("s", modifiers: .shift)
                 .disabled(session.focused == nil)
@@ -201,10 +200,11 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(!session.canDiffSelected)
             // Space on the focused list; a menu shortcut would take Space from every field.
-            Button("Quick Look Body") { if let id = session.focused { session.perform(.quickLook, on: id) } }
-                .disabled(session.focused == nil)
+            verb(.quickLook, focused, focusedItems)
         }
         CommandMenu("Proxy") {
+            Button("Status") { session.show(.status) }
+                .keyboardShortcut("0", modifiers: .command)
             Button("Breakpoint Rules…") { session.rulesVisible = true }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
             Button("Scope…") { if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) } }
@@ -231,13 +231,13 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .control, .shift])
                 .disabled(session.coreHealth.connection == nil)
             Divider()
-            // The same steps as Settings ▸ Capture's toggle (CaptureSwitch). ⌃⌘C: none of
+            // The same steps as Settings ▸ All Apps' toggle (CaptureSwitch). ⌃⌘A: none of
             // the reconnect/restart/pause/replay chords on R, and no other C chord but ⇧⌘C.
-            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Disable Capture" : "Enable Capture") {
+            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Stop Capturing All Apps" : "Capture All Apps") {
                 let on = !(session.coreHealth.captureChoice ?? captureEnabled)
                 Task { await CaptureSwitch.set(on, session: session) }
             }
-            .keyboardShortcut("c", modifiers: [.command, .control])
+            .keyboardShortcut("a", modifiers: [.command, .control])
             .disabled(!session.coreHealth.captureControlsAvailable || session.coreHealth.captureBusy || !usesEmbedded)
         }
         CommandMenu("Agent") {
@@ -270,7 +270,7 @@ struct FlowCommands: Commands {
             Divider()
             // ⌘1…⌘9: the first nine chips, in chip-bar order (foundation §2.7).
             Menu("Chip") {
-                ForEach(Array(ContentCategory.groups.flatMap { $0 }.prefix(9).enumerated()), id: \.offset) { index, chip in
+                ForEach(Array(ContentCategory.shortcutChips.enumerated()), id: \.offset) { index, chip in
                     Toggle(chip.title, isOn: Binding(get: { session.chip == chip }, set: { _ in session.chip = chip }))
                         .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
@@ -292,8 +292,41 @@ struct FlowCommands: Commands {
             }
             Toggle("Auto-select", isOn: Binding(get: { session.autoSelect }, set: { session.autoSelect = $0 }))
                 .keyboardShortcut("a", modifiers: [.command, .shift])
-            Button(session.capturing ? "Pause Capture" : "Resume Capture") { session.setCapturing(!session.capturing) }
+            Button(session.capturing ? "Pause Proxy" : "Resume Proxy") { session.setCapturing(!session.capturing) }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
         }
+    }
+}
+
+/// One Flow-menu item for a row verb: title, key equivalent and enabled state from `VerbTable`,
+/// so the menu bar can never drift from the row menu or the intercept bar.
+private struct VerbButton: View {
+    let item: VerbItem
+    let action: () -> Void
+
+    var body: some View {
+        Button(item.title, action: action)
+            .keyboardShortcut(item.shortcut.flatMap(KeyboardShortcut.init))
+            .disabled(!item.enabled)
+    }
+}
+
+extension KeyboardShortcut {
+    /// The Kit's `Shortcut` as SwiftUI binds it; nil for a key that is not one character.
+    init?(_ shortcut: Shortcut) {
+        guard shortcut.key.count == 1, let character = shortcut.key.first else { return nil }
+        let key: KeyEquivalent = switch character {
+        case "\r": .return
+        case "\u{8}": .delete
+        case " ": .space
+        case "\u{1b}": .escape
+        default: KeyEquivalent(character)
+        }
+        var modifiers: EventModifiers = []
+        if shortcut.command { modifiers.insert(.command) }
+        if shortcut.shift { modifiers.insert(.shift) }
+        if shortcut.option { modifiers.insert(.option) }
+        if shortcut.control { modifiers.insert(.control) }
+        self.init(key, modifiers: modifiers)
     }
 }

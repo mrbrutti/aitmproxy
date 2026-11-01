@@ -9,6 +9,8 @@
 //! The shape matches the surfaces' recorded expectation (ui-tui architecture note,
 //! web FlowDetail): `request`/`response` objects for HTTP, `messages` for a
 //! WebSocket, `client_conn`/`server_conn`, `meta`, `intercept` and `edited`.
+//! `meta` carries the per-host decryption keys of spec D7: `passive` (bool) and
+//! `tunnel` (`{mode, reason, bytes_up, bytes_down}` for a `CONNECT` row, else null).
 //! Peer→process resolution and per-flow origin are deferred (Q6 / F2) and reported
 //! as `null` rather than omitted, so a surface renders a stable shape.
 //!
@@ -20,11 +22,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse, HttpVersion,
-    ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value, WsMessage,
+    saturating_i64, Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse,
+    HttpVersion, ParamDef, ParamSchema, Params, Plugin, Registry, TunnelInfo, TypeDesc, Value,
+    WsMessage,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -175,7 +178,10 @@ fn detail(flow: &Flow, mode: BodyMode) -> Value {
                 "response".into(),
                 response(f.response.as_ref(), mode, f.metadata.truncated),
             );
-            obj.insert("client_conn".into(), conn(&f.client_conn, true));
+            obj.insert(
+                "client_conn".into(),
+                conn(&f.client_conn, Some(f.metadata.source_app.as_deref())),
+            );
             obj.insert("server_conn".into(), opt_conn(f.server_conn.as_ref()));
             obj.insert("meta".into(), meta(&f.metadata));
             obj.insert("intercept".into(), Value::Str(f.intercept.label().into()));
@@ -188,7 +194,10 @@ fn detail(flow: &Flow, mode: BodyMode) -> Value {
                 "messages".into(),
                 Value::Array(f.messages.iter().map(|m| ws_message(m, mode)).collect()),
             );
-            obj.insert("client_conn".into(), conn(&f.client_conn, true));
+            obj.insert(
+                "client_conn".into(),
+                conn(&f.client_conn, Some(f.metadata.source_app.as_deref())),
+            );
             obj.insert("server_conn".into(), opt_conn(f.server_conn.as_ref()));
             obj.insert("meta".into(), meta(&f.metadata));
             obj.insert("intercept".into(), Value::Str(f.intercept.label().into()));
@@ -304,24 +313,27 @@ fn headers(h: &HeaderMap) -> Value {
     )
 }
 
-fn conn(c: &ConnInfo, with_process: bool) -> Value {
+/// `process` is `Some(..)` for the client side only: the source app the capture
+/// backend observed (`FlowMeta.source_app`, the same string `flow.get` emits), so the
+/// TUI and web Client columns, which read `client_conn.process`, agree with the mac
+/// app; `Some(None)` is a stable null for a proxied flow. The server side has no
+/// process and omits the key.
+fn conn(c: &ConnInfo, process: Option<Option<&str>>) -> Value {
     let mut obj = BTreeMap::new();
     obj.insert("peer".into(), Value::Str(c.peer.to_string()));
     obj.insert("sni".into(), opt_str(c.sni.as_deref()));
     obj.insert("alpn".into(), opt_str(c.alpn.as_deref()));
     obj.insert("tls".into(), Value::Bool(c.tls));
     obj.insert("established".into(), rfc3339(c.established));
-    if with_process {
-        // Peer→process (the Client column) is deferred (foundation Q6): a stable
-        // null until core resolves the owning process.
-        obj.insert("process".into(), Value::Null);
+    if let Some(process) = process {
+        obj.insert("process".into(), opt_str(process));
     }
     Value::Object(obj)
 }
 
 fn opt_conn(c: Option<&ConnInfo>) -> Value {
     match c {
-        Some(c) => conn(c, false),
+        Some(c) => conn(c, None),
         None => Value::Null,
     }
 }
@@ -337,13 +349,33 @@ fn meta(m: &FlowMeta) -> Value {
     obj.insert("created".into(), rfc3339(m.created));
     obj.insert(
         "duration_ms".into(),
-        m.duration
-            .map_or(Value::Null, |d| Value::Int(duration_ms(d))),
+        m.duration_ms().map_or(Value::Null, Value::Int),
     );
     obj.insert("truncated".into(), Value::Bool(m.truncated));
     obj.insert("edited".into(), Value::Bool(m.edited));
     // Per-flow origin (human vs agent) is deferred to the audit work (F2).
     obj.insert("origin".into(), Value::Null);
+    // Per-host decryption (spec D7): observed-only flag and the tunnel object.
+    obj.insert("passive".into(), Value::Bool(m.passive));
+    obj.insert(
+        "tunnel".into(),
+        m.tunnel.as_ref().map_or(Value::Null, tunnel),
+    );
+    Value::Object(obj)
+}
+
+/// `meta.tunnel` for a tunnel row (spec D7): `{mode, reason, bytes_up,
+/// bytes_down}` with the wire codes of `TunnelMode::label` / `TunnelReason::label`,
+/// `reason` null for a decrypted tunnel, the byte counts null until a passthrough
+/// tunnel closes. Counts saturate at `i64::MAX` rather than wrap
+/// (`aitm_core::saturating_i64`, the rule every surface shares).
+fn tunnel(t: &TunnelInfo) -> Value {
+    let count = |n: Option<u64>| n.map_or(Value::Null, |n| Value::Int(saturating_i64(n)));
+    let mut obj = BTreeMap::new();
+    obj.insert("mode".into(), Value::Str(t.mode.label().into()));
+    obj.insert("reason".into(), opt_str(t.reason.map(|r| r.label())));
+    obj.insert("bytes_up".into(), count(t.bytes_up));
+    obj.insert("bytes_down".into(), count(t.bytes_down));
     Value::Object(obj)
 }
 
@@ -356,10 +388,6 @@ fn version(v: HttpVersion) -> &'static str {
         HttpVersion::Http11 => "HTTP/1.1",
         HttpVersion::H2 => "HTTP/2",
     }
-}
-
-fn duration_ms(d: Duration) -> i64 {
-    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// A `SystemTime` as an RFC3339 UTC string, or `Null` for a time outside the

@@ -31,8 +31,21 @@ aitm-plugin-maprules.workspace = true
 # The deterministic scanner (scan.discover): a command-only plugin registered in
 # `wire.rs` so discovery auto-exposes over MCP/CLI/UI.
 aitm-plugin-scanner.workspace = true
+# Scanner v2 lane slots (spec D1): the binary calls each crate's `lane()` /
+# `checks()` / `language()` entry point at startup, so a lane track lands by
+# filling its own crate and edits no shared file. Each returns `None` (or an
+# empty list) until its track lands.
+aitm-scan-model.workspace = true
+aitm-scan-http.workspace = true
+aitm-scan-checks-http.workspace = true
+aitm-scan-ws.workspace = true
+aitm-scan-l4-packet.workspace = true
+aitm-scan-l4-stream.workspace = true
 aitm-browser.workspace = true
 aitm-ca.workspace = true
+# System proxy automation: `config_file.rs` parses the `system_proxy:` section
+# into its `SystemProxyConfig`; `wire.rs` builds its `SystemProxy` engine.
+aitm-sysproxy.workspace = true
 aitm-poc.workspace = true
 # The persistent findings store; the binary registers `FindingsPlugin` so
 # `findings.record`/`get`/`remove`/`list` reach the shipped bus.
@@ -60,7 +73,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
-tokio-tungstenite = "0.28"
+tokio-tungstenite.workspace = true
 # Bridge token generation (two v4 UUIDs).
 uuid.workspace = true
 
@@ -88,6 +101,10 @@ aitm-testtarget.workspace = true
 # (`aitm_tui::keys::map`) with crossterm `KeyEvent`s against a spawned core — the
 # same crossterm the TUI itself reads keys through.
 crossterm = { version = "0.29", features = ["event-stream"] }
+# `tests/l4_cua_tui.rs` reads the TUI's screen by drawing `aitm_tui::ui::render`
+# into an off-screen `ratatui::buffer::Buffer` — the same ratatui `aitm-tui`
+# pins, so Cargo.lock only gains the edge.
+ratatui = "0.30"
 # The HTTPS fixture behind the obscura MITM tests (M2 Task 24): same crates and
 # features as aitm-proto-http, so nothing new enters the tree.
 rcgen = "0.14"

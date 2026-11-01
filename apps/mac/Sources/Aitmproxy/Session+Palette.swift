@@ -32,7 +32,7 @@ extension Session {
         let locals: [(String, String, String?, () -> Void)] = [
             (interceptArmed ? "Disarm Intercept" : "Arm Intercept", "Stop or start parking every request", "i", { [self] in arm(!interceptArmed) }),
             ("Compose Request…", "Write and send a new request", "⌘N", { [self] in openCompose() }),
-            (capturing ? "Pause Capture" : "Resume Capture", "Stop or start recording flows", "⇧⌘R", { [self] in setCapturing(!capturing) }),
+            (capturing ? "Pause Proxy" : "Resume Proxy", "Stop or start recording flows; traffic still passes", "⇧⌘R", { [self] in setCapturing(!capturing) }),
             ("Clear Session", "Drop every flow", "⌘⌫", { [self] in clearSession(confirm: ClearConfirmation.ask) }),
             (autoSelect ? "Stop Auto-select" : "Auto-select New Flows", "Follow the newest flow as it arrives", "⇧⌘A", { [self] in autoSelect.toggle() }),
             ("Filter Bar", "Stack filters over the list", "⌘F", { [self] in filterBarVisible.toggle() }),
@@ -85,8 +85,16 @@ extension Session {
             ranked = recent.sorted { recentPaletteIDs.firstIndex(of: String($0.0.id.dropFirst(7))) ?? 0 < recentPaletteIDs.firstIndex(of: String($1.0.id.dropFirst(7))) ?? 0 } + ranked
         }
         let order = PaletteSection.allCases
+        // A literal hit on the title (a URL containing "shop", a verb containing "repl") outranks
+        // a fuzzy subsequence hit from another section, so typing a host surfaces its flows
+        // before commands whose descriptions happen to spell the letters.
+        func literal(_ item: PaletteItem) -> Bool {
+            !trimmed.isEmpty && item.title.localizedCaseInsensitiveContains(trimmed)
+        }
         return ranked
             .sorted { a, b in
+                let la = literal(a.0), lb = literal(b.0)
+                if la != lb { return la }
                 let sa = order.firstIndex(of: a.0.section) ?? 0, sb = order.firstIndex(of: b.0.section) ?? 0
                 return sa == sb ? a.1 > b.1 : sa < sb
             }

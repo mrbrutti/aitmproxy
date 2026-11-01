@@ -17,10 +17,11 @@ use crate::flow::{Flow, FlowId, InterceptState};
 
 /// A shared, queryable store of captured flows.
 ///
-/// Every method is required: a store that silently no-ops `clear`, the capture
-/// toggle, or hidden-marking would lie to the operator (e.g. `scope.remove`
-/// reporting success while leaving a host in scope), so the trait forces each
-/// implementation to make a real choice.
+/// Every primitive is required: a store that silently no-ops `clear`, the
+/// capture toggle, or hidden-marking would lie to the operator (e.g.
+/// `scope.remove` reporting success while leaving a host in scope), so the trait
+/// forces each implementation to make a real choice. The one provided method,
+/// `abandon_response`, is a fixed rule written in terms of `update`.
 pub trait FlowStore: Send + Sync {
     /// Store a flow, keyed by its own id; returns that id. The flow is always
     /// retained so the pipeline can `get`/`update` it. When capture is paused a
@@ -53,6 +54,32 @@ pub trait FlowStore: Send + Sync {
     fn count(&self) -> usize;
     /// The number of flows currently intercepted (parked), without cloning.
     fn intercepted_count(&self) -> usize;
+
+    /// Finalise a stored HTTP flow's response that ended before its body was
+    /// complete: the body becomes the `captured` bytes (or `Empty`), the flow is
+    /// marked `truncated` and given a `duration`
+    /// ([`crate::flow::HttpFlow::abandon_response`]). This is the store-side of
+    /// `is_terminal`: a response that ended early is a finished, truncated
+    /// response, so afterwards `clear` and the memory-budget eviction can remove
+    /// the flow and `flow.get` reports a concrete `response_bytes`. Returns `true`
+    /// if the flow was finalised; `false` (changing nothing) for an unknown id, a
+    /// WebSocket flow, a flow with no response yet, or a body already buffered.
+    ///
+    /// Callers run this **before** dispatching any error event about the flow, so
+    /// a push or refetch built from the store on that event sees the finished
+    /// flow. Provided in terms of `update`, so implementers need no change.
+    fn abandon_response(&self, id: FlowId, captured: Vec<u8>) -> bool {
+        // `update` takes an `FnMut`, so the vector is moved out on the first (and
+        // only) call rather than cloned.
+        let mut taken = Some(captured);
+        let mut out = false;
+        self.update(id, &mut |flow| {
+            if let (Flow::Http(f), Some(bytes)) = (flow, taken.take()) {
+                out = f.abandon_response(bytes);
+            }
+        });
+        out
+    }
 }
 
 /// The outcome of [`FlowStore::clear`].
@@ -224,13 +251,21 @@ fn is_visible(id: &FlowId, flow: &Flow, hidden: &HashSet<FlowId>) -> bool {
 /// once it is killed or has a fully-buffered response — **except a `101` upgrade**,
 /// whose `HttpFlow` the WebSocket module reads *after* the response is set
 /// (`WsModule::drive` → `get(handshake)`), so clearing it mid-handoff would drop
-/// the socket. A WebSocket flow qualifies once killed (there is no end marker on
-/// the flow yet — see the F-list retention gap).
+/// the socket. An abandoned response (one that ended early and was buffered by
+/// `FlowStore::abandon_response` as a truncated body) is terminal like a
+/// completed one. A **tunnel row** (`metadata.tunnel` set, spec D5) is terminal
+/// iff its `duration` is set — closed or failed: its `200` is the acknowledgement
+/// of an open tunnel whose relay still has to close the row, not a finished
+/// exchange, and a failed row has no response at all. A WebSocket flow qualifies
+/// once killed (there is no end marker on the flow yet — see the F-list retention
+/// gap).
 fn is_terminal(flow: &Flow) -> bool {
     match flow {
         Flow::Http(f) => match &f.intercept {
             InterceptState::Intercepted { .. } => false,
             InterceptState::Killed => true,
+            // A tunnel row (spec D5) is finished iff its `duration` is set.
+            _ if f.metadata.tunnel.is_some() => f.metadata.tunnel_is_closed(),
             _ => f
                 .response
                 .as_ref()

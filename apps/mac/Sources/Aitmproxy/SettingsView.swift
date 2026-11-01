@@ -36,7 +36,7 @@ struct SettingsView: View {
     }
 }
 
-/// The Settings tabs. Snapshot mode walks through every case.
+/// The Settings tabs.
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general, bus, proxy
     /// L4 capture: the operator's on/off, its state, and the extension's uninstall.
@@ -50,7 +50,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "General"
         case .bus: "Bus"
         case .proxy: "Proxy"
-        case .capture: "Capture"
+        case .capture: "All Apps"
         case .appearance: "Appearance"
         }
     }
@@ -87,18 +87,18 @@ struct GeneralSettings: View {
 /// (Task 7, AC10).
 struct BusSettings: View {
     @Environment(Session.self) private var session
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
-    @AppStorage("bus.host") private var host = "127.0.0.1"
-    @AppStorage("bus.port") private var port = 9090
-    @AppStorage("bus.tokenFile") private var tokenFile = ""
-    @AppStorage("bus.fromConfig") private var fromConfig = true
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage(BusEndpointSettings.Key.host, store: Store.defaults) private var host = "127.0.0.1"
+    @AppStorage(BusEndpointSettings.Key.port, store: Store.defaults) private var port = 9090
+    @AppStorage(BusEndpointSettings.Key.tokenFile, store: Store.defaults) private var tokenFile = ""
+    @AppStorage(BusEndpointSettings.Key.fromConfig, store: Store.defaults) private var fromConfig = true
     /// The operator token, pasted by a human. Empty ⇒ connect as agent with the
     /// config token (spec Decision E). A `SecureField` keeps it off the screen;
     /// it is never printed or logged.
-    @AppStorage("bus.operatorToken") private var operatorToken = ""
+    @AppStorage(BusEndpointSettings.Key.operatorToken, store: Store.defaults) private var operatorToken = ""
     /// What role the operator expects the connection to resolve to. Client-side
     /// only — it never travels to the server, it only drives the warning.
-    @AppStorage("bus.expectedRole") private var expectedRole = ExpectedRole.agent.rawValue
+    @AppStorage(BusEndpointSettings.Key.expectedRole, store: Store.defaults) private var expectedRole = ExpectedRole.agent.rawValue
 
     private var activeKind: ActiveCoreKind { ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded }
     private var usesExternal: Bool { activeKind == .external }
@@ -110,7 +110,7 @@ struct BusSettings: View {
                 set: { kind in
                     activeKindRaw = kind.rawValue
                     // Drive the live start/stop + make-active transition. The model
-                    // persists the choice too; it is nil only in fixture/snapshot runs.
+                    // persists the choice too; it is nil only until the shell has built the live stack.
                     session.connection?.select(kind)
                 }
             )) {
@@ -121,6 +121,12 @@ struct BusSettings: View {
                  : "The app runs its own bundled core. Choose External to use your own.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            // The bus lane as the Status page words it; the detail carries the address and role.
+            LabeledContent("Connection") {
+                let lane = session.connectionSummary.bus
+                Text("\(lane.word) · \(lane.detail)")
+                    .foregroundStyle(lane.state == .ok ? Color.secondary : lane.state.color.color)
+            }
         }
         Section("External connection") {
             Toggle("Read address and token from aitmproxy's config.yaml", isOn: $fromConfig)
@@ -153,15 +159,15 @@ struct BusSettings: View {
 /// its own config.yaml, so the controls are read-only then.
 struct ProxySettings: View {
     @Environment(Session.self) private var session
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
-    @AppStorage("proxy.preferredPort") private var port = 8080
-    @AppStorage("proxy.verifyUpstreamTLS") private var verifyTLS = true
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage("proxy.preferredPort", store: Store.defaults) private var port = 8080
+    @AppStorage("proxy.verifyUpstreamTLS", store: Store.defaults) private var verifyTLS = true
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
     /// Apply & Restart is live only for the embedded core and only once an edit
     /// diverges from what the running core was started with. With no applied
-    /// snapshot yet (no core up, or a fixture) it stays live so a first Apply can
+    /// snapshot yet (no core up) it stays live so a first Apply can
     /// start the core.
     private var canApply: Bool {
         guard usesEmbedded else { return false }
@@ -206,9 +212,9 @@ struct ProxySettings: View {
 
 /// Settings ▸ Capture: the operator's switch for L4 capture on this Mac, what the capture
 /// extension is doing, and its uninstall (Task 17, NE-AC15). Capture is off until the
-/// operator turns it on here or with Proxy ▸ Enable Capture. Reads the capability the
+/// operator turns it on here, with Proxy ▸ Capture All Apps or the toolbar's All Apps switch. Reads the capability the
 /// `ExtensionController` pushes into `CoreHealthState`. With no extension in this build
-/// (a development build, fixture and snapshot runs) the controls give way to a note: a
+/// (a development build) the controls give way to a note: a
 /// toggle that does nothing is never shown.
 ///
 /// Turning capture on or off, and uninstalling, are the operator's controls and nothing
@@ -221,10 +227,10 @@ struct ProxySettings: View {
 /// is disabled and a note says where to change it.
 struct CaptureSettings: View {
     @Environment(Session.self) private var session
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
     /// The persisted choice, `false` until the operator turns capture on. Read here only:
     /// `CaptureSwitch` writes it, at the point in its steps where it must be written.
-    @AppStorage("capture.enabled") private var captureEnabled = false
+    @AppStorage("capture.enabled", store: Store.defaults) private var captureEnabled = false
     @State private var confirming = false
     @State private var removing = false
 
@@ -233,9 +239,13 @@ struct CaptureSettings: View {
     var body: some View {
         let health = session.coreHealth
         let capability = health.captureCapability
+        // The honest sentence about capture: on + empty scope captures nothing (the
+        // extension is deny-by-default on scope), which must never read as "Capturing".
+        let advice = CaptureAdvice.make(
+            capability: capability, supported: health.captureSupported, scopeHostCount: session.scopeHosts.count)
         Section("Network extension") {
             if health.captureControlsAvailable {
-                Toggle("Capture L4 traffic", isOn: Binding(
+                Toggle("Capture traffic from all apps", isOn: Binding(
                     get: { health.captureChoice ?? captureEnabled },
                     set: { on in Task { await CaptureSwitch.set(on, session: session) } }
                 ))
@@ -255,13 +265,31 @@ struct CaptureSettings: View {
                         } icon: {
                             ProgressView().controlSize(.small)
                         }
-                    } else {
+                    } else if advice.offersScope {
+                        // On, but nothing in scope: the row must not read as a working "Capturing".
                         Label {
-                            Text(capability.title)
+                            Text("On, nothing in scope")
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(Color.secondary)
+                        }
+                    } else {
+                        // The capture lane's word, the same one the Status page shows.
+                        Label {
+                            Text(session.connectionSummary.capture.word)
                         } icon: {
                             Image(systemName: symbol(for: capability))
                                 .foregroundStyle(capability.isCaptureOn ? Palette.accent : Color.secondary)
                         }
+                    }
+                }
+                if advice.offersScope {
+                    Text("\(advice.headline). \(advice.detail)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    // Same action as Proxy ▸ Scope…: the Scope page in the main window.
+                    Button("Open Scope…") {
+                        if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) }
                     }
                 }
                 if let reason = capability.degradedReason {
@@ -270,7 +298,7 @@ struct CaptureSettings: View {
                         .foregroundStyle(.secondary)
                 }
                 if capability.canUninstall {
-                    Button(removing ? "Removing…" : "Uninstall Capture Extension…", role: .destructive) {
+                    Button(removing ? "Removing…" : "Uninstall Extension…", role: .destructive) {
                         confirming = true
                     }
                     .disabled(removing || health.captureBusy)
@@ -283,7 +311,7 @@ struct CaptureSettings: View {
                     }
                 }
             } else {
-                LabeledContent("Capture L4 traffic", value: "Not available in this build")
+                LabeledContent("Capture traffic from all apps", value: "Not available in this build")
                 Text("L4 capture needs the signed Aitmproxy app with its capture extension. This build does not include it.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -311,9 +339,9 @@ struct CaptureSettings: View {
     }
 }
 
-/// The operator's capture on, off and uninstall, in one place so Settings ▸ Capture and
-/// Proxy ▸ Enable/Disable Capture run identical steps. Operator-only: those two callers
-/// are all there is. No bus verb, `Session` action or palette entry reaches `enable()`,
+/// The operator's capture on, off and uninstall, in one place so Settings ▸ Capture, Proxy ▸
+/// Capture All Apps, the Status page and the toolbar's All Apps switch run identical
+/// steps. Operator-only: those callers are all there is. No bus verb, `Session` action or palette entry reaches `enable()`,
 /// `disable()`, `uninstall()` or the persisted `capture.enabled` choice (see
 /// `ExtensionController`).
 ///
@@ -331,7 +359,7 @@ enum CaptureSwitch {
     /// (embedded when unset). The toggle and the menu command, which cannot see the views'
     /// `@AppStorage`, gate on this.
     static var embeddedCoreActive: Bool {
-        (UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded
+        (UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded) == .embedded
     }
 
     /// ON: persist the choice, activate the extension, then respawn the core so its capture
@@ -343,8 +371,14 @@ enum CaptureSwitch {
     /// and cannot lock turning capture on out.
     static func set(_ on: Bool, session: Session) async {
         let health = session.coreHealth
+        // The toolbar switch shows the extension's state, Settings shows the choice; when the two
+        // disagree a click asks for what is already chosen. Say so instead of doing nothing.
+        if !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
+           on == (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false) {
+            session.lastError = "All Apps is already \(on ? "on" : "off") in Settings ▸ All Apps; the extension reports otherwise — turn it off and on again there"
+        }
         guard !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
-              on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)
+              on != (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false)
         else { return }
         health.captureBusy = true
         health.captureChoice = on
@@ -353,11 +387,11 @@ enum CaptureSwitch {
             health.captureBusy = false
         }
         if on {
-            UserDefaults.standard.set(true, forKey: "capture.enabled")
+            Store.defaults.set(true, forKey: "capture.enabled")
             health.extensionController?.enable()
             session.restartCoreTick += 1
         } else {
-            UserDefaults.standard.set(false, forKey: "capture.enabled")
+            Store.defaults.set(false, forKey: "capture.enabled")
             await health.extensionController?.disable()
             session.restartCoreTick += 1
         }
@@ -375,9 +409,9 @@ enum CaptureSwitch {
         defer { health.captureBusy = false }
         await health.extensionController?.uninstall()
         guard health.captureCapability == .extensionNotInstalled,
-              UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false
+              Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false
         else { return }
-        UserDefaults.standard.set(false, forKey: "capture.enabled")
+        Store.defaults.set(false, forKey: "capture.enabled")
         if embeddedCoreActive { session.restartCoreTick += 1 }
     }
 }

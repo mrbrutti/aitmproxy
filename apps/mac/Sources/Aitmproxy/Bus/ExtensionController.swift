@@ -28,8 +28,7 @@ import SystemExtensions
 /// `Contents/Library/SystemExtensions/com.mrbrutti.aitmproxy.ne.systemextension`
 /// (`build.sh` embeds it only for a Developer ID NE build, Task 14), so `start()`
 /// reports `.extensionNotInstalled` and returns *without submitting any request*
-/// and without any system prompt. It is likewise a no-op in fixture, snapshot and
-/// self-test runs.
+/// and without any system prompt. It is likewise a no-op in self-test runs.
 ///
 /// **Off until the operator turns it on.** Even in an embedded build, capture is
 /// opt-in: the persisted `capture.enabled` switch defaults to off, and while it is off
@@ -120,18 +119,15 @@ final class ExtensionController: NSObject {
     func start() {
         guard !started else { return }
         started = true
-        // Never fire in fixture, snapshot or self-test runs. `APP_LIVE=1` can make a
-        // snapshot run non-fixture, so the snapshot env var is checked directly too.
-        guard !Store.usesFixtures, !SelfTest.requested,
-              ProcessInfo.processInfo.environment["APP_SNAPSHOT"] == nil
-        else { return }
+        // Never fire in a self-test run: the live self-test must not start the extension.
+        guard !SelfTest.requested else { return }
         // The dev app has no embedded extension: report that and stay inert.
         guard CaptureExtension.isEmbedded(inApp: bundleURL) else {
             health.captureCapability = .extensionNotInstalled
             return
         }
         health.extensionController = self
-        if UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false {
+        if Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false {
             enable()
         } else {
             health.captureCapability = .extensionNotInstalled

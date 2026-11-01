@@ -6,9 +6,10 @@ import Foundation
 /// supervised exactly as `tui`/`web` own their in-process cores — just as a
 /// child process (spec C2). One actor owns one child's whole lifecycle:
 ///
-/// - **Launch.** Fresh CSPRNG bus token, an auto-picked free proxy port, a
-///   `0600` per-launch config in the app container, then spawn the bundled
-///   `aitm` with a loopback bus on an ephemeral port.
+/// - **Launch.** Fresh CSPRNG bus token, an auto-picked free proxy port, the
+///   operator's persisted scope (`scope.json`, read fresh every spawn), a `0600`
+///   per-launch config in the app container, then spawn the bundled `aitm` with
+///   a loopback bus on an ephemeral port.
 /// - **Rendezvous.** The child publishes its bound bus `host:port` (token-free)
 ///   to a file after bind (Task 3); the actor watches it, pairs the address with
 ///   the token it already holds, and emits `.ready`.
@@ -70,6 +71,10 @@ actor EmbeddedCore {
     // MARK: State
 
     private let binaries: Binaries
+    /// Where the operator's persisted embedded scope lives (`EmbeddedScope.url(in: Store.url)`),
+    /// injected by the controller: `Store` is main-actor isolated, and reading it here would
+    /// put a suspension point between `spawn()`'s `stopping` guard and `process.run()`.
+    private let scopeURL: URL
     /// Immutable and `Sendable`, so a consumer reads it without hopping onto the actor.
     nonisolated let events: AsyncStream<Event>
     private let emit: AsyncStream<Event>.Continuation
@@ -97,8 +102,9 @@ actor EmbeddedCore {
         }
     }
 
-    init(binaries: Binaries, defaultProxyPort: UInt16 = 8080, defaultBrowserProxyPort: UInt16 = 8083) {
+    init(binaries: Binaries, scopeURL: URL, defaultProxyPort: UInt16 = 8080, defaultBrowserProxyPort: UInt16 = 8083) {
         self.binaries = binaries
+        self.scopeURL = scopeURL
         self.defaultProxyPort = defaultProxyPort
         self.defaultBrowserProxyPort = defaultBrowserProxyPort
         (events, emit) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(256))
@@ -153,7 +159,7 @@ actor EmbeddedCore {
         // Operator-editable (Settings ▸ Proxy), read fresh each spawn so Apply &
         // Restart Core picks them up: the preferred listen port and whether to verify
         // upstream TLS. Unset values fall back to the secure defaults.
-        let defaults = UserDefaults.standard
+        let defaults = Store.defaults
         let savedPort = defaults.integer(forKey: "proxy.preferredPort")
         let preferredPort = (savedPort > 0 && savedPort <= 65535) ? UInt16(savedPort) : defaultProxyPort
         let sslInsecure = !(defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true)
@@ -162,6 +168,10 @@ actor EmbeddedCore {
         // that does not embed the capture extension (a development build sharing this
         // defaults domain with a signed one) never opens the gate, whatever the key says.
         let captureEnabled = (defaults.object(forKey: "capture.enabled") as? Bool ?? false) && CaptureExtension.isEmbedded(inApp: Bundle.main.bundleURL)
+        // The operator's persisted scope rides the per-launch config, read fresh every spawn
+        // so relaunch, crash-restart and Apply & Restart Core all keep it; nothing is pushed
+        // over the bus (D3). `load` already dropped anything unsafe to emit.
+        let scopeHosts = EmbeddedScope.load(from: scopeURL).hosts
         guard let proxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: preferredPort),
               let browserProxyPort = EmbeddedCoreLaunch.pickProxyPort(preferred: defaultBrowserProxyPort)
         else {
@@ -187,7 +197,8 @@ actor EmbeddedCore {
                 operatorToken: operatorToken,
                 endpointFile: endpointURL,
                 sslInsecure: sslInsecure,
-                captureEnabled: captureEnabled
+                captureEnabled: captureEnabled,
+                scopeHosts: scopeHosts
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {

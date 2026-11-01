@@ -80,7 +80,7 @@ export interface ServerInfo {
   role?: BusRole;
 }
 
-/** Push events (§4.4, F4). The bridge relays them verbatim; the mock bus emits the same shapes. */
+/** Push events (§4.4, F4). The bridge relays them verbatim. */
 export type FlowEventKind =
   | 'created'
   | 'request'
@@ -97,9 +97,11 @@ export interface FlowNotification {
   event: FlowEventKind;
   id: string;
   /**
-   * Sparse, and a trigger only. The server sends `{id, kind:"http", method, authority, path,
-   * status}` or `{id, kind:"ws", handshake, messages}` (`"ws"` is not the model's `websocket`);
-   * the store refetches the row instead of applying it. Only the fixture bus sends a full model.
+   * The full `flow.get` object for the flow, same keys and spelling (`kind:"http"` with method,
+   * scheme, authority, path, status, request_bytes, response_bytes, started_at, duration_ms;
+   * `kind:"websocket"` with handshake, messages, started_at, duration_ms). On a real bus the store
+   * still treats the push as a trigger and refetches the row by id; that is a deliberate choice
+   * (one fetch path for push and poll), not a workaround for a sparse summary.
    */
   summary?: unknown;
 }
@@ -108,10 +110,10 @@ export interface FlowNotification {
  * One audit line, in the model the Activity log renders. The server's wire shape differs
  * (`crates/aitm-core/src/audit.rs`): `at` is epoch ms, the label is `client_label`, `args` is a
  * redacted JSON string and `result` is `"ok"` or `{error}`; `toAgentEntry` in `bus/normalize.ts`
- * converts it. The fixture bus emits this model directly.
+ * converts it; a line already in this model shape is accepted as it is.
  */
 export interface AgentNotification {
-  /** `operator`, `mcp` and `cli` are what the server records; the rest are fixture frontends. */
+  /** `operator`, `mcp` and `cli` are what the server records; `mac`, `web` and `tui` are frontend labels the model shape may carry, shown by name (only `mcp` renders as the agent). */
   origin: 'mcp' | 'cli' | 'operator' | 'mac' | 'web' | 'tui';
   /** The caller's `initialize.clientInfo.name`; `null` for an unlabelled connection (the bridge today). */
   clientLabel?: string | null;
@@ -136,6 +138,31 @@ export interface StateNotification {
   memory_bytes?: number;
 }
 
+/** One trust store of `ca.status.stores` (`crates/aitm-ca/src/commands.rs`): `user` or `system`. */
+export interface CAStoreWire {
+  /** present | absent | stale | unknown. */
+  installed: string;
+  /** yes | no | unknown. */
+  trusted: string;
+  /** The keychain, anchor file, or store. */
+  location: string;
+}
+
+/** The `ca.status` reply. `stores` is empty without a certificate or on an unsupported platform. */
+export interface CAStatusWire {
+  exists: boolean;
+  dir: string;
+  path: string;
+  /** Colon-separated uppercase hex; null without a certificate. */
+  fingerprint_sha256: string | null;
+  fingerprint_sha1: string | null;
+  /** macos | linux-debian | linux-fedora | windows | unsupported. */
+  platform: string;
+  stores: Record<string, CAStoreWire>;
+  /** What was and was not verified. */
+  detail: string[];
+}
+
 export class BusError extends Error {
   constructor(
     message: string,
@@ -150,7 +177,7 @@ export class BusError extends Error {
 export type NotificationHandler = (method: string, params: unknown) => void;
 
 export interface BusClient {
-  /** Human-readable endpoint for the status bar (`bus 127.0.0.1:9090` or `fixtures`). */
+  /** Human-readable endpoint for the status bar: the bridge's host (`127.0.0.1:8082`). */
   readonly address: string;
   readonly state: Accessor<BusState>;
   /** Last connection error text, for the status bar tooltip. */
@@ -191,4 +218,29 @@ export const PROTOCOL_VERSION = '2025-06-18';
  */
 export function asRole(v: string | null | undefined): BusRole | null {
   return v === 'operator' || v === 'agent' ? v : null;
+}
+
+/**
+ * One PoC as the Findings panel models it: a `poc.list` library entry, with its `poc.get` source
+ * and the latest `poc.run` result of this session folded in by the store.
+ */
+export interface PocRun {
+  id: string;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  target: string;
+  passed: boolean;
+  at: number;
+  origin: 'human' | 'agent';
+  poc_path: string;
+  yaml: string;
+  finding_capture: string;
+  screenshot_path: string | null;
+  evaluated: { assertion: string; matched: boolean }[];
+  /** Built in this session but not yet saved under poc.dir (the core returns YAML text only). */
+  local?: boolean;
+  /** The PoC's description text, when its `poc.list` entry carries one (`poc.get` answers it too, but only its YAML is kept); absent when none exists. */
+  description?: string;
+  /** Set when this entry has a run result in this session (poc.run keeps no history). */
+  ran?: boolean;
 }

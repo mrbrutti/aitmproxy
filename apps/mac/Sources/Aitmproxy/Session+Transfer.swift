@@ -13,7 +13,8 @@ extension Session {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = Self.importTypes
-        panel.message = "Import flows from a HAR file (mitmproxy, Proxyman and Charles files need the proxy, F10)."
+        // Other formats wait on `flow.import` (F10); the copy says what to do instead.
+        panel.message = "Import flows from a HAR file. Capture mitmproxy, Proxyman or Charles traffic through the proxy instead."
         guard panel.runModal() == .OK else { return }
         importFiles(panel.urls)
     }
@@ -66,7 +67,8 @@ extension Session {
 
     private func refuse(_ message: String) {
         lastError = message
-        guard !Store.usesFixtures else { return }
+        // The live self-test must not hang on a modal alert; `lastError` already carries the message.
+        guard !SelfTest.requested else { return }
         let alert = NSAlert()
         alert.messageText = "Import failed"
         alert.informativeText = message

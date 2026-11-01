@@ -12,6 +12,9 @@ struct DetachedInspector: View {
             InspectorView()
         }
         .background(Tok.Ground.surface.color)
+        // The window names its content (rule 19): the focused flow, else the pane's name.
+        .navigationTitle(session.focusedRow.map { "\($0.method.label) \($0.path.isEmpty ? $0.authority : $0.path)" } ?? "Inspector")
+        .navigationSubtitle(session.focusedRow.map { $0.path.isEmpty ? "" : $0.site } ?? "")
         .onAppear { if session.layout != .detached { session.layout = .detached } }
         .onDisappear { if session.layout == .detached { session.layout = session.attachedLayout } }
     }

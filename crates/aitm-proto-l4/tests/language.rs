@@ -20,7 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aitm_core::{CallerTrust, Value};
-use aitm_plugin::language::{PocStepInputs, ProtocolLanguage};
+use aitm_plugin::language::{
+    Guarded, HostCallContextSource, HostCallCtx, HostFn, PocStepInputs, ProtocolLanguage,
+    RegisterError, ScriptHostRegistry,
+};
 use aitm_plugin_rhai::{
     build_engine_with_languages, production_languages, registered_host_fns, seed_call_context,
     RhaiLimits,
@@ -36,7 +39,10 @@ use aitm_proto_l4::types::{
     IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange, RateCap,
 };
 
-const IFACE: &str = "lo";
+/// The scope interface: the per-OS loopback the `l4:` step defaults to
+/// (`lo0` on macOS/BSD, `lo` on Linux), so the normative no-`interface`
+/// step bodies below prove the default on the OS the tests compiled for.
+const IFACE: &str = aitm_proto_l4::language::DEFAULT_INTERFACE;
 
 // --- a hermetic capture/inject backend (no socket, no privilege) ------------
 
@@ -163,10 +169,14 @@ fn synack_reply() -> Vec<u8> {
 
 /// A Rhai UDP `send_recv` stimulus to 127.0.0.1:9 (the serde `PacketSpec` form,
 /// mirroring the `l4.craft`/`l4.send_recv` command arguments).
-const SEND_RECV_SCRIPT: &str = r#"
-    let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
-    l4.send_recv(spec, "127.0.0.1", "lo", 9, 50)
-"#;
+fn send_recv_script() -> String {
+    format!(
+        r#"
+    let spec = #{{ layers: [ #{{ ipv4: #{{ dst: "127.0.0.1" }} }}, #{{ udp: #{{ dst_port: 9 }} }} ] }};
+    l4.send_recv(spec, "127.0.0.1", "{IFACE}", 9, 50)
+"#
+    )
+}
 
 #[test]
 fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
@@ -184,7 +194,7 @@ fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
     // the closed inject gate refuses this call.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
-        .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+        .eval::<rhai::Dynamic>(&send_recv_script())
         .expect_err("a closed agent gate refuses l4.send_recv");
     let msg = err.to_string();
     assert!(
@@ -210,7 +220,7 @@ fn ac4_sensitive_verb_runs_when_agent_gate_open() {
     // Seed `Agent`: with the inject gate open, the live-trust gate admits the call.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let out = engine
-        .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+        .eval::<rhai::Dynamic>(&send_recv_script())
         .expect("an open agent gate admits l4.send_recv");
     let map = out
         .try_cast::<rhai::Map>()
@@ -260,7 +270,7 @@ fn ac4_operator_engine_bypasses_the_agent_gate() {
     // Seed `Operator`: the closed agent gate is bypassed for operator trust.
     let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let _ = engine
-        .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+        .eval::<rhai::Dynamic>(&send_recv_script())
         .expect("operator engine bypasses the agent gate");
 }
 
@@ -279,15 +289,17 @@ fn ac4_out_of_scope_send_recv_refusal_surfaces_to_the_script() {
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
-    let script = r#"
-        let spec = #{ layers: [ #{ ipv4: #{ dst: "10.9.9.9" } }, #{ udp: #{ dst_port: 9 } } ] };
-        l4.send_recv(spec, "10.9.9.9", "lo", 9, 50)
-    "#;
+    let script = format!(
+        r#"
+        let spec = #{{ layers: [ #{{ ipv4: #{{ dst: "10.9.9.9" }} }}, #{{ udp: #{{ dst_port: 9 }} }} ] }};
+        l4.send_recv(spec, "10.9.9.9", "{IFACE}", 9, 50)
+    "#
+    );
     // Seed `Agent` with the inject gate OPEN, so the refusal under test is the scope
     // check, not the agent gate or the missing-context fail-closed.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
-        .eval::<rhai::Dynamic>(script)
+        .eval::<rhai::Dynamic>(&script)
         .expect_err("an out-of-scope send_recv is refused");
     assert!(
         err.to_string().contains("out of L4 scope"),
@@ -313,14 +325,16 @@ fn inject_count_zero_is_a_no_op() {
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
-    let script = r#"
-        let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
-        l4.inject(spec, "127.0.0.1", "lo", 0)
-    "#;
+    let script = format!(
+        r#"
+        let spec = #{{ layers: [ #{{ ipv4: #{{ dst: "127.0.0.1" }} }}, #{{ udp: #{{ dst_port: 9 }} }} ] }};
+        l4.inject(spec, "127.0.0.1", "{IFACE}", 0)
+    "#
+    );
     // Seed `Operator` so dispatch reaches the inject no-op.
     let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let out = engine
-        .eval::<rhai::Dynamic>(script)
+        .eval::<rhai::Dynamic>(&script)
         .expect("inject with count:0 runs and is a no-op");
     let map = out.try_cast::<rhai::Map>().expect("inject returns a map");
     let sent = map
@@ -374,7 +388,7 @@ fn per_call_trust_decides_on_one_rhai_registration() {
     {
         let _seed = seed_call_context(CallerTrust::Agent, None, None);
         let err = engine
-            .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+            .eval::<rhai::Dynamic>(&send_recv_script())
             .expect_err("an Agent caller is refused by the closed inject gate");
         let msg = err.to_string();
         assert!(
@@ -392,13 +406,98 @@ fn per_call_trust_decides_on_one_rhai_registration() {
     {
         let _seed = seed_call_context(CallerTrust::Operator, None, None);
         let _ok = engine
-            .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+            .eval::<rhai::Dynamic>(&send_recv_script())
             .expect("an Operator caller bypasses the agent gate on the same registration");
     }
     assert_eq!(
         backend.injected().len(),
         1,
         "the admitted Operator call reached the (mock) wire exactly once"
+    );
+}
+
+/// A [`ScriptHostRegistry`] that captures what a language registers, so a test can
+/// drive one production-registered `<ns>.<name>` host fn (guard permit, then the fn)
+/// exactly as the Rhai dispatcher does — needed for dotted names such as
+/// `scope.add`, which Rhai's `ns.name(...)` syntax cannot spell.
+#[derive(Default)]
+struct CapturingRegistry {
+    fns: BTreeMap<(String, String), Guarded<HostFn>>,
+}
+impl ScriptHostRegistry for CapturingRegistry {
+    fn register(&mut self, ns: &str, name: &str, f: Guarded<HostFn>) -> Result<(), RegisterError> {
+        self.fns.insert((ns.to_string(), name.to_string()), f);
+        Ok(())
+    }
+}
+
+/// A tag-less call source for a [`HostCallCtx`].
+struct NoSource;
+impl HostCallContextSource for NoSource {
+    fn tag(&self) -> Option<Value> {
+        None
+    }
+    fn call_source(&self) -> &str {
+        "test"
+    }
+}
+
+/// L4PAR-AC6 (plan A6) — the language face (Rhai and the PoC `l4:` step share it)
+/// keeps calling `add_runtime_scope`: a script cannot be confirmed, so even a
+/// **trusted-control** caller (`Operator`) is still refused by the widen gate when
+/// it is off, and so is an `Agent`. Only the `l4.scope.add` *command* (behind the
+/// operator handshake / CLI confirmer) reaches the ungated path. Driven through the
+/// production `register_host_fns` seam.
+///
+/// pin: green before and after A6; the compiler forbids this path from minting
+/// `OperatorConfirmed`.
+#[test]
+fn language_scope_add_trusted_caller_still_widen_gated() {
+    let guard = loopback_guard(false); // allow_agent_widen defaults to false
+    let lang = L4Language::new(
+        guard.clone(),
+        MockBackend::with_replies(vec![]),
+        Arc::new(InMemoryL4FlowStore::new()),
+    );
+    let mut reg = CapturingRegistry::default();
+    lang.register_host_fns(&mut reg)
+        .expect("the L4 language registers its host fns");
+    let (gate, scope_add) = reg
+        .fns
+        .remove(&("l4".to_string(), "scope.add".to_string()))
+        .expect("`l4.scope.add` is registered")
+        .into_parts();
+
+    let entry: BTreeMap<String, Value> = [
+        ("cidr", "127.0.0.1/32"),
+        ("ports", "9100-9199"),
+        ("interface", IFACE),
+        ("direction", "inbound"),
+        ("capability", "capture"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), Value::Str(v.to_string())))
+    .collect();
+    let before = guard.list_scope().len();
+    let src = NoSource;
+
+    for caller in [CallerTrust::Operator, CallerTrust::Agent] {
+        let ctx = HostCallCtx::new(caller, &src);
+        gate.permit(&ctx, "scope.add")
+            .expect("scope.add carries no agent gate of its own; the widen gate is the guard's");
+        let err = scope_add(&ctx, &[Value::Object(entry.clone())])
+            .expect_err("a Rhai scope.add is widen-gated for every caller");
+        assert_eq!(
+            err.to_string(),
+            "`l4` guard refused the call: runtime L4 scope widening is disabled; declare scope \
+             in the `l4.scope` config block or set `l4.allow_agent_widen`",
+            "{caller:?}"
+        );
+    }
+    assert_eq!(
+        guard.list_scope().len(),
+        before,
+        "a refused Rhai scope.add widens nothing"
     );
 }
 

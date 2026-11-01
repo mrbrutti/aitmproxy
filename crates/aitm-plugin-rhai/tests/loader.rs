@@ -16,13 +16,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    Body, CallerTrust, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, HeaderMap, HttpFlow,
-    HttpRequest, HttpVersion, InterceptState, MemFlowStore, ProxyClient, StdGuard, Value, Verdict,
+    Body, CallerTrust, CommandHost, ConnInfo, Event, Flow, FlowCtx, FlowId, FlowMeta, HeaderMap,
+    HttpFlow, HttpRequest, HttpVersion, InterceptState, MemFlowStore, Params, Plugin, ProxyClient,
+    Registry, StdGuard, Value, Verdict,
 };
 use aitm_plugin_rhai::config::{RhaiConfig, RhaiLimits, ScriptEntry};
 use aitm_plugin_rhai::error::ScriptError;
 use aitm_plugin_rhai::host_core::{MemoryFindingSink, ScriptServices};
 use aitm_plugin_rhai::loader::{Registers, RhaiLoader};
+use aitm_plugin_rhai::plugin::{ErrorSink, ScriptHost, ScriptSet};
 
 const TAGGER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tagger.rhai");
 const BROKEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/broken.rhai");
@@ -486,6 +488,44 @@ fn api_satisfies_compares_versions() {
     assert!(api_satisfies("10", "2"), "numeric, not lexicographic");
     assert!(!api_satisfies("beta", "1"));
     assert!(api_satisfies("beta", "beta"));
+    // Dotted versions: component-wise, missing components are zero. An API-1
+    // script meets the L4 namespace's "0.1.0"; it does not meet "1.1".
+    assert!(api_satisfies("1", "0.1.0"));
+    assert!(!api_satisfies("0.1.0", "1"));
+    assert!(api_satisfies("1.0", "1"));
+    assert!(api_satisfies("1.2", "1.1"));
+    assert!(!api_satisfies("1", "1.1"));
+    assert!(
+        !api_satisfies("1.", "1"),
+        "a malformed version matches nothing numerically"
+    );
+    // More shapes a script's `const API` or a namespace's `min_api` can take.
+    assert!(
+        api_satisfies("1.0.0", "1"),
+        "trailing zero components are equal"
+    );
+    assert!(
+        api_satisfies("2", "1.9.9"),
+        "a higher first component beats any later ones"
+    );
+    assert!(
+        !api_satisfies("", "1"),
+        "an empty version satisfies nothing"
+    );
+    assert!(
+        !api_satisfies("1", ""),
+        "an empty requirement is not numeric: exact match only"
+    );
+    assert!(
+        !api_satisfies("1..0", "1"),
+        "an empty component is malformed"
+    );
+    assert!(
+        !api_satisfies("4294967296", "1"),
+        "a component past u32 is not numeric: exact match only"
+    );
+    assert!(!api_satisfies(" 1", "1"), "whitespace is not trimmed");
+    assert!(!api_satisfies("1", "1 "), "whitespace is not trimmed");
 }
 
 /// A path that does not exist is a `Compile` error naming the path, with the
@@ -567,4 +607,224 @@ async fn config_loaded_script_defaults_to_agent_authorship() {
         CallerTrust::Agent,
         "load_all must seed a config-loaded script's authorship as Agent, never Operator"
     );
+}
+
+/// A script's top-level literal constants are visible inside its hook
+/// functions (as values and as method receivers) and inside a `load(reg)`
+/// closure — through the loader, the plugin's hook path (hooks run with an
+/// empty scope) and the command the closure becomes. Without the engine's
+/// constant resolver every one of these fails with `Variable not found`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_level_literal_consts_are_visible_in_hooks_and_closures() {
+    let script = TempScript::new(
+        "consts",
+        r#"
+        const NAME = "const-probe";
+        const API = "1";
+        const TAG = "v";
+        const PATHS = ["/a", "/b", "/c"];
+        fn on_request(flow) {
+            flow.request.headers.set("X-Tag", TAG);
+            flow.request.headers.set("X-N", `${PATHS.len()}`);
+            flow.request.headers.set("X-Has", `${PATHS.contains("/b")}`);
+        }
+        fn load(reg) {
+            reg.add_command("probe.tag", "returns TAG", |args| TAG);
+        }
+        "#,
+    );
+    let loader = loader(Vec::new(), false);
+    let sink = Arc::new(ErrorSink::default());
+    let plugin = loader
+        .load_one(&ScriptEntry::new(script.path()))
+        .expect("the script loads")
+        .with_error_sink(sink.clone());
+    assert_eq!(
+        plugin.meta().name,
+        "const-probe",
+        "metadata is still read off the constants"
+    );
+
+    let mut flow = http_flow();
+    let id = flow.id();
+    plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(
+        sink.last_error("const-probe"),
+        None,
+        "the hook must run cleanly"
+    );
+    assert_eq!(http(&flow).request.headers.get("X-Tag"), Some("v"));
+    assert_eq!(http(&flow).request.headers.get("X-N"), Some("3"));
+    assert_eq!(http(&flow).request.headers.get("X-Has"), Some("true"));
+
+    let mut registry = Registry::new();
+    ScriptHost::new(ScriptSet::new(vec![plugin])).load(&mut registry);
+    let cmd = registry
+        .command("probe.tag")
+        .expect("load(reg) ran to completion and registered the command");
+    let (store, client, guard) = (MemFlowStore::new(), StubClient, StdGuard::default());
+    let host = CommandHost::new(&store, &client, &guard, None);
+    assert_eq!(
+        cmd.invoke(Params::default(), &host).expect("invokes"),
+        Value::Str("v".into())
+    );
+}
+
+/// A function parameter that shares a constant's name keeps meaning the
+/// parameter, as any local shadows an outer name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parameter_named_like_a_const_keeps_meaning_the_parameter() {
+    let script = TempScript::new(
+        "shadow",
+        r#"
+        const X = 1;
+        fn pick(X) { X }
+        fn on_request(flow) { flow.request.headers.set("X-Pick", `${pick(2)}`); }
+        "#,
+    );
+    let loader = loader(Vec::new(), false);
+    let plugin = loader
+        .load_one(&ScriptEntry::new(script.path()))
+        .expect("the script loads");
+    let mut flow = http_flow();
+    let id = flow.id();
+    plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(http(&flow).request.headers.get("X-Pick"), Some("2"));
+}
+
+/// Only literal constants reach functions. One computed by a call is a plain
+/// Rhai global: invisible inside a function, and the hook fails the usual way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn computed_const_is_not_visible_in_functions() {
+    let script = TempScript::new(
+        "computed",
+        r#"
+        const Z = [1, 2].len();
+        fn on_request(flow) { flow.request.headers.set("X-Z", `${Z}`); }
+        "#,
+    );
+    let loader = loader(Vec::new(), false);
+    let sink = Arc::new(ErrorSink::default());
+    let plugin = loader
+        .load_one(&ScriptEntry::new(script.path()))
+        .expect("the script loads")
+        .with_error_sink(sink.clone());
+    let mut flow = http_flow();
+    let id = flow.id();
+    plugin.dispatch(&Event::Request(id), &mut FlowCtx::new(&mut flow), MAX_BODY);
+    assert_eq!(http(&flow).request.headers.get("X-Z"), None);
+    let err = sink
+        .last_error(&plugin.meta().name)
+        .expect("the hook's failure is recorded");
+    assert!(err.contains("Variable not found: Z"), "{err}");
+}
+
+/// A `load(reg)` that throws is the script's `last_error`, the way a failed
+/// hook is — so `script.list` shows it and a command script's broken load is
+/// not only a log line. And it installs nothing: a command registered before
+/// the throw is discarded with the rest of the collector (the guide's "a
+/// `load(reg)` that throws … registers nothing").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_load_is_the_scripts_last_error() {
+    let script = TempScript::new(
+        "badload",
+        r#"
+        fn load(reg) {
+            reg.add_command("half.cmd", "registered before the throw", |args| 1);
+            throw "boom";
+        }
+        "#,
+    );
+    let loader = loader(Vec::new(), false);
+    let sink = Arc::new(ErrorSink::default());
+    let plugin = loader
+        .load_one(&ScriptEntry::new(script.path()))
+        .expect("the script loads")
+        .with_error_sink(sink.clone());
+    let name = plugin.meta().name.clone();
+    let mut registry = Registry::new();
+    ScriptHost::new(ScriptSet::new(vec![plugin])).load(&mut registry);
+    let err = sink.last_error(&name).expect("a failed load is recorded");
+    assert!(err.contains("hook 'load' failed"), "{err}");
+    assert!(err.contains("boom"), "{err}");
+    assert!(
+        registry.command("half.cmd").is_none(),
+        "a load that throws installs nothing, not even what it registered first"
+    );
+}
+
+/// Two scripts declare the same constant name with different values. Their
+/// `load(reg)` commands are invoked later, each in its own run, after the
+/// load-time guards dropped and after *both* scripts' hooks ran (installing
+/// and dropping each table in turn, B's last). Every command sees its own
+/// script's constant: the closure that captured `TAG` when it was created, and
+/// the one that reaches `TAG` through a named function resolved only when the
+/// command runs — the path that depends on the invoke opening its own script's
+/// table rather than the last one installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_scripts_command_sees_its_own_constants_after_other_scripts_ran() {
+    fn source(name: &str, value: &str, prefix: &str) -> String {
+        format!(
+            r#"
+            const NAME = "{name}";
+            const API = "1";
+            const TAG = "{value}";
+            fn tag() {{ TAG }}
+            fn on_request(flow) {{ flow.request.headers.set("X-Tag", TAG); }}
+            fn load(reg) {{
+                reg.add_command("{prefix}.direct", "TAG captured when the closure was created", |args| TAG);
+                reg.add_command("{prefix}.via_fn", "TAG resolved when the command runs", |args| tag());
+            }}
+            "#
+        )
+    }
+    let a = TempScript::new("iso-a", &source("iso-a", "alpha", "iso_a"));
+    let b = TempScript::new("iso-b", &source("iso-b", "beta", "iso_b"));
+    let loader = loader(Vec::new(), false);
+    let sink = Arc::new(ErrorSink::default());
+    let plugins: Vec<_> = [a.path(), b.path()]
+        .into_iter()
+        .map(|path| {
+            loader
+                .load_one(&ScriptEntry::new(path))
+                .expect("the script loads")
+                .with_error_sink(sink.clone())
+        })
+        .collect();
+
+    let mut host = ScriptHost::new(ScriptSet::new(plugins));
+    let mut registry = Registry::new();
+    host.load(&mut registry);
+    assert_eq!(sink.last_error("iso-a"), None, "a's load must run cleanly");
+    assert_eq!(sink.last_error("iso-b"), None, "b's load must run cleanly");
+
+    // Both scripts' hooks run before any command is invoked: A's table, then
+    // B's, each installed and dropped. The last table installed was B's.
+    let mut flow = http_flow();
+    let id = flow.id();
+    host.on_event(&Event::Request(id), &mut FlowCtx::new(&mut flow));
+    assert_eq!(
+        http(&flow).request.headers.get("X-Tag"),
+        Some("beta"),
+        "b's hook ran last and saw its own constant"
+    );
+
+    let (store, client, guard) = (MemFlowStore::new(), StubClient, StdGuard::default());
+    let cmd_host = CommandHost::new(&store, &client, &guard, None);
+    let invoke = |name: &str| {
+        registry
+            .command(name)
+            .unwrap_or_else(|| panic!("{name} was registered by load(reg)"))
+            .invoke(Params::default(), &cmd_host)
+            .unwrap_or_else(|err| panic!("{name} invokes: {err}"))
+    };
+    // A first: its table is not the one that was installed last.
+    assert_eq!(invoke("iso_a.via_fn"), Value::Str("alpha".into()));
+    assert_eq!(invoke("iso_a.direct"), Value::Str("alpha".into()));
+    assert_eq!(invoke("iso_b.via_fn"), Value::Str("beta".into()));
+    assert_eq!(invoke("iso_b.direct"), Value::Str("beta".into()));
+    // And back: an invoke leaves nothing behind that the next one reads.
+    assert_eq!(invoke("iso_a.via_fn"), Value::Str("alpha".into()));
+    assert_eq!(sink.last_error("iso-a"), None);
+    assert_eq!(sink.last_error("iso-b"), None);
 }

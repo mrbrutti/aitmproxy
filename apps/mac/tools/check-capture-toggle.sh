@@ -3,7 +3,7 @@
 # docs/superpowers/specs/2026-10-30-macos-ne-ship-and-toggle-design.md):
 # TG-AC3 spawn reads the choice fresh, TG-AC4 first run OFF asks nothing, TG-AC5 ON,
 # TG-AC6 OFF, TG-AC8 persisted OFF default and idempotent, TG-AC10 menu + shortcut,
-# TG-AC11 the four snapshot states; and the stage-6 fixes: disable() honest and stops capture first,
+# and the stage-6 fixes: disable() honest and stops capture first,
 # an OFF launch converges the tunnel to off, the toggle and the menu command stand down unless the
 # embedded core is active, spawn() never opens the gate in a build without the extension,
 # CaptureSwitch reads the choice as spawn() does, and Uninstall's ratified clear-and-restart.
@@ -38,9 +38,7 @@ health=Sources/Aitmproxy/Bus/CoreHealthState.swift
 settings=Sources/Aitmproxy/SettingsView.swift
 app=Sources/Aitmproxy/App.swift
 shell=Sources/Aitmproxy/Shell/ShellView.swift
-snap=Sources/Aitmproxy/Snapshot.swift
-scenes=Sources/Aitmproxy/SnapshotScenes.swift
-for f in "$ext" "$core" "$core_ctl" "$health" "$settings" "$app" "$shell" "$snap" "$scenes"; do
+for f in "$ext" "$core" "$core_ctl" "$health" "$settings" "$app" "$shell"; do
     [ -f "$f" ] || { echo "FAIL: $f not found; update this script"; exit 1; }
 done
 
@@ -285,11 +283,11 @@ has "TG-AC6 deactivate() submits the deactivation request" "$deactivate" 'deacti
 # @AppStorage default of true would arm capture on a fresh install.
 equals "TG-AC8 no capture.enabled read defaults to true or registers a default" \
     "$(grep -rn -E --include='*.swift' 'capture\.enabled.*(\?\? true|register)|register.*capture\.enabled' Sources | grep -v -E ':[0-9]+:[[:space:]]*//' | head -n 1)" ""
-storage=$(grep -rn -F --include='*.swift' '@AppStorage("capture.enabled")' Sources | grep -v -E ':[0-9]+:[[:space:]]*//')
+storage=$(grep -rn -F --include='*.swift' '@AppStorage("capture.enabled", store: Store.defaults)' Sources | grep -v -E ':[0-9]+:[[:space:]]*//')
 if [ "$(grep -c . <<<"$storage")" -ge 2 ]; then
-    pass "TG-AC8 the Settings toggle and the menu label both bind @AppStorage(\"capture.enabled\")"
+    pass "TG-AC8 the Settings toggle and the menu label both bind @AppStorage(\"capture.enabled\", store: Store.defaults)"
 else
-    fail "TG-AC8 expected @AppStorage(\"capture.enabled\") in SettingsView and App (found: ${storage:-none})"
+    fail "TG-AC8 expected @AppStorage(\"capture.enabled\", store: Store.defaults) in SettingsView and App (found: ${storage:-none})"
 fi
 equals "TG-AC8 every @AppStorage(\"capture.enabled\") defaults to false" \
     "$(grep -v -E '= false[[:space:]]*$' <<<"$storage")" ""
@@ -308,14 +306,14 @@ ordered "TG-AC8 the guard is the first thing set() does (before the busy flag is
     "$l_return" "$(line_of "$sw" 'captureBusy = true')"
 has "TG-AC8 set() ignores a request made while another capture action runs" "$sw_guard" '!health.captureBusy'
 has "TG-AC8/#6 set() ignores a request for the state already in force, reading the key as spawn() does" "$sw_guard" \
-    'on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)'
+    'on != (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false)'
 hasnt "#6 CaptureSwitch never reads capture.enabled with bool(forKey:) (a non-Bool stored value must read as off)" \
     "$(code_lines "$settings")" 'bool[(]forKey: "capture[.]enabled"'
 has "#3 set() does nothing unless the embedded core is the active kind" "$sw_guard" 'embeddedCoreActive'
 active_kind=$(body_of "$settings" '^[[:space:]]*static var embeddedCoreActive')
 found "#3 CaptureSwitch.embeddedCoreActive" "$active_kind"
 has "#3 embeddedCoreActive reads the persisted active kind the way ActiveConnectionModel does (embedded when unset)" \
-    "$active_kind" '(UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded'
+    "$active_kind" '(UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded) == .embedded'
 has "TG-AC8 enable() submits no second request while one is outstanding or capture is on" "$enable" \
     'guard pendingActivity == nil, !health.captureCapability.isCaptureOn'
 has "TG-AC8 enable() refuses while a disable() or uninstall() runs" "$enable" '!uninstalling, !disabling'
@@ -327,19 +325,17 @@ launch=$(body_of "$health" '^[[:space:]]*(private )?static func launchSupportsCa
 found "visibility CoreHealthState.launchSupportsCapture()" "$launch"
 has "visibility captureSupported comes from the launch guards, not a constant" \
     "$(code_lines "$health")" 'var captureSupported: Bool = CoreHealthState.launchSupportsCapture()'
-has "visibility fixtures are never capture-capable" "$launch" 'Store.usesFixtures'
 has "visibility self-test runs are never capture-capable" "$launch" 'SelfTest.requested'
-has "visibility snapshot runs are never capture-capable" "$launch" 'APP_SNAPSHOT'
 has "visibility only a build that embeds the extension is capture-capable" "$launch" 'CaptureExtension.isEmbedded(inApp: Bundle.main.bundleURL)'
 cs_body=$(body_of "$settings" '^struct CaptureSettings')
 found "visibility CaptureSettings view" "$cs_body"
 l_avail=$(line_of "$cs_body" 'if health[.]captureControlsAvailable [{]')
-l_toggle=$(line_of "$cs_body" 'Toggle[(]"Capture L4 traffic"')
+l_toggle=$(line_of "$cs_body" 'Toggle[(]"Capture traffic from all apps"')
 l_note=$(line_of "$cs_body" 'Not available in this build')
 ordered "visibility the live Toggle sits inside the captureControlsAvailable branch" "$l_avail" "$l_toggle"
 ordered "visibility the 'Not available in this build' note follows the live Toggle (else branch)" "$l_toggle" "$l_note"
 has "#3 the Capture view reads the active core kind exactly as ProxySettings does" "$cs_body" \
-    '@AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
+    '@AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
 has "#3 the Capture view's usesEmbedded is ProxySettings's" "$cs_body" \
     'private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }'
 toggle_text=$(sed -n "${l_toggle:-1},$((${l_toggle:-1} + 6))p" "$settings")
@@ -348,17 +344,17 @@ has "#3 the Capture toggle is disabled unless the embedded core is the active ki
 has "#3 the Capture tab says why the toggle is disabled when the core is not embedded" "$cs_body" 'if !usesEmbedded {'
 hasnt "TG-AC5 the Settings status line never hard-codes 'Capturing' (it shows CaptureCapability.title)" \
     "$cs_body" '"Capturing"'
-has "TG-AC5 the Settings status line shows CaptureCapability.title" "$cs_body" 'Text(capability.title)'
+has "TG-AC5 the Settings status line shows the capture lane word (ConnectionSummary, one vocabulary)" "$cs_body" 'Text(session.connectionSummary.capture.word)'
 has "TG-AC5 a running action reads Working, never Capturing" "$cs_body" 'Text("Working…")'
 
 # ============================ TG-AC10: menu command + non-colliding shortcut ===========
 proxy_menu_start=$(grep -n -F 'CommandMenu("Proxy")' "$app" | head -n 1 | cut -d: -f1)
 next_menu=$(awk -v a="${proxy_menu_start:-0}" 'NR > a && /CommandMenu[(]/ { print NR; exit }' "$app")
-menu_item=$(grep -n -E 'Button[(].*"Disable Capture" : "Enable Capture"|Button[(].*"Enable Capture" : "Disable Capture"' "$app" | head -n 1 | cut -d: -f1)
+menu_item=$(grep -n -E 'Button[(].*"Stop Capturing All Apps" : "Capture All Apps"|Button[(].*"Capture All Apps" : "Stop Capturing All Apps"' "$app" | head -n 1 | cut -d: -f1)
 if [ -n "$menu_item" ]; then
-    pass "TG-AC10 App.swift has the Enable/Disable Capture menu command (line $menu_item)"
+    pass "TG-AC10 App.swift has the Capture All Apps menu command (line $menu_item)"
 else
-    fail "TG-AC10 App.swift has no 'Enable Capture' / 'Disable Capture' menu Button"
+    fail "TG-AC10 App.swift has no 'Capture All Apps' / 'Stop Capturing All Apps' menu Button"
 fi
 if [ -n "$proxy_menu_start" ] && [ -n "$next_menu" ] && [ -n "$menu_item" ] \
     && [ "$menu_item" -gt "$proxy_menu_start" ] && [ "$menu_item" -lt "$next_menu" ]; then
@@ -376,7 +372,7 @@ if [ -n "$menu_item" ]; then
     has "#3 the command stands down unless the embedded core is the active kind" \
         "$(grep -F '.disabled(' <<<"$item_text")" '!usesEmbedded'
     has "#3 the menu reads the active core kind exactly as ProxySettings does" "$(code_lines "$app")" \
-        '@AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
+        '@AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
     has "#3 the menu's usesEmbedded is ProxySettings's" "$(code_lines "$app")" \
         'private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }'
 else
@@ -399,6 +395,10 @@ chord_of() {
     key=${key// /}
     echo "$key|$(grep -o -E '[.][a-zA-Z]+' <<<"$mods" | sort -u | paste -s -d + -)"
 }
+
+# Comment-stripped sources the NS-AC pins read; defined once so every section may use them.
+settings_code=$(code_lines "$settings")
+shell_code=$(code_lines "$shell")
 if [ -n "${shortcut_line:-}" ]; then
     mine=$(chord_of "${shortcut_line#*.keyboardShortcut(}")
     pass "TG-AC10 the command has a keyboard shortcut ($mine)"
@@ -419,15 +419,140 @@ else
     fail "TG-AC10 the capture command has no .keyboardShortcut within its Button"
 fi
 
-# ============================ TG-AC11: the four snapshot states ========================
-has "TG-AC11 the snapshot states are off, awaiting, active and failed" "$(code_lines "$scenes")" 'case off, awaiting, active, failed'
-for seeded in '.inactive' '.pendingApproval' '.capturing' '.degraded('; do
-    has "TG-AC11 a snapshot state seeds $seeded" "$(code_lines "$scenes")" "captureCapability = $seeded"
+# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).
+has "NS-AC4 the Settings status row stops reading Capturing when the scope is empty" "$settings_code" 'Text("On, nothing in scope")'
+has "security-3 the poll loop refreshes the scope so the advice never argues with the core" "$(code_lines Sources/Aitmproxy/Bus/BusService.swift)" 'await refreshScope()'
+
+# ============ NS-AC2/3/4/8: honest "on but scope is empty" state (hotfix spec 2026-10-31) ====
+# Spec docs/superpowers/specs/2026-10-31-ne-no-scope-honest-state-design.md. The extension is
+# deny-by-default on scope, so capture ON with an EMPTY scope captures nothing; both operator
+# surfaces must say so, and the Apps page must never hide captured flows behind a placeholder.
+has "NS-AC2 Settings computes the advice from the published capability, support and live scope" "$settings_code" 'CaptureAdvice.make('
+has "NS-AC2 Settings shows the empty-scope callout only when the advice offers Scope" "$settings_code" 'if advice.offersScope {'
+has "NS-AC2 Settings offers Open Scope" "$settings_code" 'Button("Open Scope'
+has "NS-AC2 Open Scope goes to the Scope page like Proxy > Scope" "$settings_code" 'session.show(.scope)'
+has "NS-AC3 the Apps banner view exists" "$shell_code" 'struct AppsAttributionBanner: View'
+has "NS-AC3 the Apps empty state view exists" "$shell_code" 'struct AppsEmptyState: View'
+banner_body=$(body_of "$shell" 'struct AppsAttributionBanner: View')
+empty_body=$(body_of "$shell" 'struct AppsEmptyState: View')
+found "NS-AC3 AppsAttributionBanner body" "$banner_body"
+found "NS-AC3 AppsEmptyState body" "$empty_body"
+for view in banner empty; do
+    eval "body=\$${view}_body"
+    has "NS-AC3 the Apps $view view computes the advice itself" "$body" 'CaptureAdvice.make('
+    has "NS-AC3 the Apps $view view offers Scope when the advice says so" "$body" 'if advice.offersScope {'
+    has "NS-AC3 the Apps $view view offers Settings when capture is off" "$body" 'advice.offersSettings'
+    has "NS-AC3 the Apps $view view's Open Settings lands on the Capture tab" "$body" 'session.settingsTab = .capture'
+    has "NS-AC3 the Apps $view view's Open Settings opens Settings" "$body" 'openSettings()'
+    hasnt "NS-AC3 the Apps $view view never toggles capture" "$body" 'CaptureSwitch|capture\.enabled|extensionController'
 done
-has "TG-AC11 every state is captured" "$(code_lines "$snap")" 'for state in CaptureSnapshotState.allCases'
-has "TG-AC11 each capture is written as settings-capture-<state>-<mode>.png" "$(code_lines "$snap")" \
-    'settings-capture-\(state.rawValue)-\(mode).png'
-has "TG-AC11 the capture loop runs in light and dark" "$(code_lines "$snap")" 'for mode in ["light", "dark"]'
+has "NS-AC3 the banner never promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'carry no source app'
+hasnt "NS-AC3 no advice copy promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'attribute flows to apps|flows are attributed|needs the (macOS )?capture extension'
+has "NS-AC8 with flows present the Apps page keeps the table and shows the banner" "$shell_code" 'session.clients.isEmpty, !session.rows.isEmpty'
+has "NS-AC8 the full empty state shows only when there are no flows at all" "$shell_code" 'session.clients.isEmpty, session.rows.isEmpty'
+hasnt "NS-AC4 ShellView reads no capture.enabled key" "$shell_code" 'capture\.enabled'
+hasnt "NS-AC4 ShellView never calls the toggle glue" "$shell_code" 'CaptureSwitch'
+hasnt "NS-AC4 ShellView never touches the controller handle" "$shell_code" 'extensionController'
+# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).
+
+# ---- NS-AC2/3/5/8 scoped pins (Tester, stage 5) ---------------------------------------------
+# The file-level pins above cannot tell the Apps banner from the Apps empty state, Settings from
+# the rest of its file, a view that exists from a view that is rendered, or one switch case from
+# its siblings. Each check below is cut to the one struct, function or case it is about.
+# Mutation-tested against 25 realistic regressions (see the Tester report for stage 5).
+case_body() { # case_body FILE ERE: one switch case, from its label to the next case or the switch's closing brace
+    awk -v lab="$2" '
+        !f && $0 ~ lab { f = 1 }
+        f {
+            if (started && $0 ~ /^[[:space:]]*(case |default:|[}])/) exit
+            started = 1
+            code = $0
+            sub(/\/\/.*/, "", code)
+            print NR ":" code
+        }
+    ' "$1"
+}
+
+# NS-AC2: Settings > Capture. The callout sits under the Status row, only for the empty-scope advice.
+cap_body=$(body_of "$settings" '^struct CaptureSettings: View')
+found "NS-AC2 CaptureSettings" "$cap_body"
+has "NS-AC2 Settings feeds the advice the published capability" "$cap_body" 'capability: capability,'
+has "NS-AC2 Settings feeds the advice whether this build embeds the extension" "$cap_body" 'supported: health.captureSupported'
+has "NS-AC2 Settings feeds the advice the live scope size, not a constant" "$cap_body" 'scopeHostCount: session.scopeHosts.count'
+has "NS-AC2 the callout reads the advice headline" "$cap_body" 'advice.headline'
+has "NS-AC2 the callout reads the advice detail" "$cap_body" 'advice.detail'
+cap_status=$(line_of "$cap_body" 'LabeledContent[(]"Status"[)]')
+cap_gate=$(line_of "$cap_body" 'if advice[.]offersScope [{]')
+cap_button=$(line_of "$cap_body" 'Button[(]"Open Scope')
+cap_show=$(line_of "$cap_body" 'session[.]show[(][.]scope[)]')
+cap_reason=$(line_of "$cap_body" 'if let reason = capability[.]degradedReason')
+ordered "NS-AC2 the callout comes after the Status row" "$cap_status" "$cap_gate"
+ordered "NS-AC2 Open Scope sits inside the callout's offersScope gate" "$cap_gate" "$cap_button"
+ordered "NS-AC2 Open Scope calls session.show(.scope)" "$cap_button" "$cap_show"
+ordered "NS-AC2 the callout closes before the degraded reason line" "$cap_show" "$cap_reason"
+
+# NS-AC3/4: the two Apps surfaces. Each is advice-driven, offers each action only through its gate,
+# carries no hard-coded "extension" wording of its own, and never reaches the capture toggle.
+apps_surface() { # apps_surface <label> <struct body>
+    local label=$1 body=$2 g b sg sb
+    found "NS-AC3 $label" "$body"
+    has "NS-AC3 $label feeds the advice the published capability" "$body" 'capability: health.captureCapability'
+    has "NS-AC3 $label feeds the advice whether this build embeds the extension" "$body" 'supported: health.captureSupported'
+    has "NS-AC3 $label feeds the advice the live scope size, not a constant" "$body" 'scopeHostCount: session.scopeHosts.count'
+    g=$(line_of "$body" 'if advice[.]offersScope [{]')
+    b=$(line_of "$body" 'Button[(]"Open Scope')
+    sg=$(line_of "$body" 'else if advice[.]offersSettings [{]')
+    sb=$(line_of "$body" 'Button[(]"Open Settings')
+    ordered "NS-AC3 $label offers Open Scope only inside the offersScope gate" "$g" "$b"
+    ordered "NS-AC3 $label's Settings branch follows the Scope branch" "$b" "$sg"
+    ordered "NS-AC3 $label offers Open Settings only inside the offersSettings gate" "$sg" "$sb"
+    has "NS-AC3 $label's Open Scope opens the Scope page" "$(grep -F 'Button("Open Scope' <<<"$body")" 'session.show(.scope)'
+    has "NS-AC3 $label's Open Settings opens Settings (from its button on, in whatever shape the closure takes)" "$(awk -F: -v a="$sb" '$1 >= a' <<<"$body")" 'openSettings()'
+    hasnt "NS-AC3 $label has no hard-coded extension wording (the advice owns the words)" "$body" '"[^"]*[Ee]xtension'
+    hasnt "NS-AC4 $label never toggles capture or reads its stored choice" "$body" \
+        'CaptureSwitch|extensionController|capture[.]enabled|UserDefaults|AppStorage|[.]enable[(]|[.]disable[(]|restartCoreTick|captureChoice'
+}
+banner_body=$(body_of "$shell" '^struct AppsAttributionBanner: View')
+empty_body=$(body_of "$shell" '^struct AppsEmptyState: View')
+apps_surface "the Apps banner" "$banner_body"
+apps_surface "the Apps empty state" "$empty_body"
+has "NS-AC3 the Apps banner shows the one-line banner text" "$banner_body" 'Text(advice.banner)'
+has "NS-AC3 the Apps empty state shows the advice headline" "$empty_body" 'Label(advice.headline,'
+has "NS-AC3 the Apps empty state shows the advice detail" "$empty_body" 'Text(advice.detail)'
+
+# NS-AC8: MainView renders the banner above the table when flows exist, the empty state only when
+# there are none, and the flow table is the fallback. A view that exists but is never rendered fails here.
+main_body=$(body_of "$shell" '^struct MainView: View')
+found "NS-AC8 MainView" "$main_body"
+equals "NS-AC8 the banner is rendered exactly once" "$(grep -c -F 'AppsAttributionBanner()' <<<"$main_body")" "1"
+equals "NS-AC8 the empty state is rendered exactly once" "$(grep -c -F 'AppsEmptyState()' <<<"$main_body")" "1"
+main_bcond=$(line_of "$main_body" 'session[.]page == [.]apps, session[.]clients[.]isEmpty, !session[.]rows[.]isEmpty [{]')
+main_bcall=$(line_of "$main_body" 'AppsAttributionBanner[(][)]')
+main_split=$(line_of "$main_body" 'if session[.]splitView [{]')
+main_econd=$(line_of "$main_body" 'else if session[.]page == [.]apps, session[.]clients[.]isEmpty, session[.]rows[.]isEmpty [{]')
+main_ecall=$(line_of "$main_body" 'AppsEmptyState[(][)]')
+main_table=$(line_of "$main_body" '^[0-9]+:[[:space:]]*flowTable[[:space:]]*$')
+ordered "NS-AC8 the banner condition (flows present) guards the banner" "$main_bcond" "$main_bcall"
+ordered "NS-AC8 the banner sits above the flow table" "$main_bcall" "$main_split"
+ordered "NS-AC8 the empty-state condition (no flows) guards the empty state" "$main_econd" "$main_ecall"
+ordered "NS-AC8 the flow table is the fallback after the empty state" "$main_ecall" "$main_table"
+
+# TG-AC11 / NS-AC5 snapshot-scene pins removed 2026-10-31 with the fixture modes (spec 2026-10-31-remove-fake-data-ui-modes).
+
+# Scoped companions for the stage-6 fixes (Tester): the file-level pins above cannot tell a call in
+# pollLoop from the other refreshScope() callers, or the Status row branch from the generic one.
+poll_body=$(body_of Sources/Aitmproxy/Bus/BusService.swift 'private func pollLoop[(]')
+found "security-3 BusService.pollLoop" "$poll_body"
+poll_refresh=$(line_of "$poll_body" 'await refreshScope[(][)]')
+poll_flows=$(line_of "$poll_body" 'flow[.]list')
+ordered "security-3 pollLoop refreshes the scope on every pass, before it reads flows (inScope reads scopeHosts)" "$poll_refresh" "$poll_flows"
+status_empty=$(line_of "$cap_body" '[}] else if advice[.]offersScope [{]')
+status_text=$(line_of "$cap_body" 'Text[(]"On, nothing in scope"[)]')
+status_title=$(line_of "$cap_body" 'Text[(]session[.]connectionSummary[.]capture[.]word[)]')
+ordered "NS-AC2 the Status row's empty-scope branch is tested first" "$status_empty" "$status_text"
+ordered "NS-AC2 the Status row reads 'On, nothing in scope' before the generic lane-word branch" "$status_text" "$status_title"
+has "NS-AC3 the Apps banner stays on one line and truncates (a long degraded reason must not wrap into the fixed-height row)" "$banner_body" '.lineLimit(1)'
+has "NS-AC3 the Apps banner truncates at the tail" "$banner_body" '.truncationMode(.tail)'
 
 echo
 if [ "$failures" -eq 0 ]; then

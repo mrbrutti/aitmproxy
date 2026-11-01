@@ -19,15 +19,6 @@ public enum CoreHealth: Hashable, Sendable, CaseIterable {
         case .degraded, .stopped: self = .failed
         }
     }
-
-    /// The health word, matching the three dot states the spec names.
-    public var title: String {
-        switch self {
-        case .running: "Running"
-        case .restarting: "Restarting"
-        case .failed: "Failed"
-        }
-    }
 }
 
 extension CoreConnection.Status {

@@ -1,7 +1,7 @@
 import Foundation
 
 /// One HTTP message as the inspector shows it. Comes from F5 `flow.detail`
-/// on the live bus; from fixtures until then.
+/// on the live bus.
 public struct HTTPMessage: Hashable, Sendable {
     /// `POST /api/auth/login HTTP/2` or `HTTP/2 200 OK`.
     public var startLine: String

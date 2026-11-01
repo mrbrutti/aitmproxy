@@ -45,3 +45,34 @@ public struct ColumnLayout: Codable, Hashable, Sendable {
 
     public func isHidden(_ id: String) -> Bool { hidden.contains(id) }
 }
+
+/// Which fixed-width columns to hide so a list fits its pane without a horizontal scroll bar.
+/// The user's own hidden set stays apart from this one, so a header menu can tell them apart.
+public enum ColumnFit {
+    public struct Column: Hashable, Sendable {
+        public var id: String
+        public var width: Double
+        /// Hidden by the user: already out of the sum, never auto-hidden.
+        public var userHidden: Bool
+
+        public init(id: String, width: Double, userHidden: Bool = false) {
+            self.id = id
+            self.width = width
+            self.userHidden = userHidden
+        }
+    }
+
+    /// Hides columns in `priority` order (first = first to go) until the visible fixed widths plus
+    /// `flexibleMin` (the flexible column's minimum) fit `available`. Columns not in `priority`
+    /// never hide. Returns the ids to hide; empty when everything fits.
+    public static func autoHidden(available: Double, columns: [Column], flexibleMin: Double, priority: [String]) -> Set<String> {
+        var hidden: Set<String> = []
+        var needed = columns.filter { !$0.userHidden }.reduce(0) { $0 + $1.width } + flexibleMin
+        for id in priority where needed > available {
+            guard let column = columns.first(where: { $0.id == id && !$0.userHidden }) else { continue }
+            hidden.insert(id)
+            needed -= column.width
+        }
+        return hidden
+    }
+}

@@ -2,27 +2,30 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
-@Suite struct ColumnLayoutTests {
-    @Test func unknownIdsAreIgnoredAndMissingOnesAppended() {
-        let layout = ColumnLayout(order: ["url", "ghost", "seq"], widths: ["url": 320, "ghost": 50], hidden: ["ghost", "ssl"])
-        #expect(layout.resolvedOrder(known: ["dot", "seq", "url", "ssl"]) == ["url", "seq", "dot", "ssl"])
-        #expect(layout.width(for: "url", default: 100) == 320)
-        #expect(layout.width(for: "seq", default: 52) == 52)
-        #expect(layout.isHidden("ssl"))
-        #expect(!layout.isHidden("url"))
-    }
-
-    @Test func roundTripsThroughAFile() throws {
-        let url = FileManager.default.temporaryDirectory.appending(path: "columns-\(UUID().uuidString).json")
-        let layout = ColumnLayout(order: ["seq", "url"], widths: ["url": 240.5], hidden: ["mark"])
-        try layout.save(to: url)
-        #expect(ColumnLayout.load(from: url) == layout)
-        #expect(ColumnLayout.load(from: url.appendingPathExtension("missing")) == nil)
-    }
+/// Nine rows for `FlowSortTests`: six finished with a status (101 … 502), three with none
+/// (killed, paused, pending); a duration and a response size on five of them.
+private enum FlowSortInputs {
+    static let rows: [FlowRow] = [
+        Make.row(seq: 1, host: "api.shop-staging.test", path: "/api/products", status: 200,
+                 duration: .milliseconds(89), responseBytes: 18_200),
+        Make.row(seq: 2, host: "cdn.shop-staging.test", path: "/assets/app.js", status: 304,
+                 duration: .milliseconds(21), responseBytes: 0),
+        Make.row(seq: 3, method: .post, host: "telemetry.vendor-analytics.example", path: "/v2/batch", status: 204,
+                 duration: .milliseconds(143), responseBytes: 0, inScope: false),
+        Make.row(seq: 4, host: "api.shop-staging.test", path: "/api/orders", status: 502,
+                 duration: .milliseconds(1_210), responseBytes: 1_900),
+        Make.row(seq: 5, host: "api.shop-staging.test", path: "/api/orders", status: 200, isReplay: true,
+                 duration: .milliseconds(412), responseBytes: 22_700),
+        Make.row(seq: 6, kind: .websocket, method: .ws, scheme: "wss", host: "api.shop-staging.test",
+                 path: "/ws/notifications", status: 101),
+        Make.row(seq: 7, method: .delete, host: "api.shop-staging.test", path: "/api/account/delete", state: .killed),
+        Make.row(seq: 8, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login", state: .paused),
+        Make.row(seq: 9, host: "cdn.shop-staging.test", path: "/assets/hero.webp", state: .pending),
+    ]
 }
 
 @Suite struct FlowSortTests {
-    let rows = Fixtures.rows
+    let rows = FlowSortInputs.rows
 
     @Test func captureOrderIsIdentity() {
         #expect(FlowSort.captureOrder.sorted(rows).map(\.seq) == rows.map(\.seq))

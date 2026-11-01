@@ -253,14 +253,19 @@ enum HandoffMessages {
 
     /// Decode a core->provider control body.
     static func decodeCore(_ body: Data) throws -> CoreMessage {
-        // Any single-key externally-tagged object is well-formed; a variant we don't
-        // act on (whatever its payload shape) is ignored for forward compatibility —
-        // only a malformed non-single-key object tears the channel down.
+        // A single-key externally-tagged object is the only well-formed frame. A
+        // variant we don't act on (whatever its payload shape) is ignored for forward
+        // compatibility. The one variant we do act on, `Scope`, must carry an object
+        // with a string `spec`: a `Scope` with any other payload is malformed and, like
+        // a non-single-key object, tears the channel down.
         guard let object = try? JSONSerialization.jsonObject(with: body),
               let dict = object as? [String: Any], dict.count == 1 else {
             throw HandoffError.malformed("control frame is not a single externally-tagged object")
         }
-        if let scope = dict["Scope"] as? [String: Any] {
+        if let payload = dict["Scope"] {
+            guard let scope = payload as? [String: Any] else {
+                throw HandoffError.malformed("Scope payload is not an object")
+            }
             guard let spec = scope["spec"] as? String else {
                 throw HandoffError.malformed("Scope without a string spec")
             }
@@ -497,6 +502,17 @@ struct FlowEndpoint: Equatable {
 /// case-insensitively against the flow's `remoteHostname`; `*.example.com` matches
 /// sub-domains only, not `example.com`; IPs compare against the flow's remote IP.
 /// A bare `*`, malformed entries, and an empty spec match nothing.
+///
+/// CLAIM RULE BY TRANSPORT (spec 2026-10-31-ne-claim-rule, D1-D3): `host`,
+/// `host:port`, and `*.suffix` tokens claim TCP flows only. An IP token (`ip` or
+/// `ip:port`, what the core emits from the L4 scope) claims both TCP and UDP. A
+/// datagram (UDP) flow to port 53, 5353, or 853 is never claimed, whatever the spec
+/// says (`neverClaimedDatagramPorts`, consulted before any entry). Why: macOS
+/// attributes an app's resolver lookup to the app itself with the looked-up name
+/// attached (`type = datagram, app = com.apple.curl, name = www.example.com,
+/// … <-> 192.0.2.1:53`), and the embedded core has no UDP backend, so a host token
+/// that matched that datagram black-holed the app's DNS. TCP to port 53 is still
+/// claimed as before (the core's stream path passes it through).
 struct ScopeMatcher: Equatable {
     enum Target: Equatable {
         case host(String)
@@ -510,6 +526,11 @@ struct ScopeMatcher: Equatable {
 
     let entries: [Entry]
 
+    /// Datagram remote ports the provider never claims, independent of scope: the
+    /// system resolver's DNS (53), mDNS (5353), and DNS-over-TLS (853). The embedded
+    /// core cannot answer a DNS query, so claiming one could only break the client.
+    static let neverClaimedDatagramPorts: Set<UInt16> = [53, 5353, 853]
+
     init(spec: String) {
         let separators = CharacterSet(charactersIn: ",;").union(.whitespacesAndNewlines)
         entries = spec.components(separatedBy: separators)
@@ -517,18 +538,24 @@ struct ScopeMatcher: Equatable {
             .compactMap { ScopeMatcher.parse($0.lowercased()) }
     }
 
-    func matches(hostname: String?, ip: String, port: UInt16) -> Bool {
+    func matches(kind: FlowOpenMessage.Kind, hostname: String?, ip: String, port: UInt16) -> Bool {
+        // 1. A datagram to a DNS port is never claimed, before any entry is consulted
+        //    (fail open independent of scope).
+        if kind == .udp, Self.neverClaimedDatagramPorts.contains(port) { return false }
         let host = hostname.map(ScopeMatcher.normalizeHost)
         let flowIP = IPText.canonical(text: ip) ?? ip
         for entry in entries {
+            // 2. Per-entry port filter.
             if let wanted = entry.port, wanted != port { continue }
             switch entry.target {
+            // 3. IP tokens claim either transport.
             case .ip(let address):
                 if address == flowIP { return true }
+            // 4. Host and suffix tokens claim TCP only.
             case .host(let name):
-                if let host, host == name { return true }
+                if kind == .tcp, let host, host == name { return true }
             case .suffix(let suffix):
-                if let host, host.hasSuffix("." + suffix) { return true }
+                if kind == .tcp, let host, host.hasSuffix("." + suffix) { return true }
             }
         }
         return false
@@ -1258,7 +1285,8 @@ final class FlowHandoff: @unchecked Sendable {
     ///   4. DataHandshake as the first frame on the data socket
     func claim(_ flow: FlowDescriptor) -> ClaimedFlow? {
         guard let attachment = link.current() else { return nil }
-        guard attachment.scope.matches(hostname: flow.remoteHostname,
+        guard attachment.scope.matches(kind: flow.kind,
+                                       hostname: flow.remoteHostname,
                                        ip: flow.remote.scopeFreeIP,
                                        port: flow.remote.port) else { return nil }
 
@@ -1315,7 +1343,12 @@ final class FlowHandoff: @unchecked Sendable {
     }
 
     /// `handleNewUDPFlow` (macOS 15+ hands us the initial remote endpoint). True =>
-    /// the handoff owns the flow.
+    /// the handoff owns the flow. A UDP flow is claimable only through an IP token in
+    /// the scope and never when its remote port is 53, 5353, or 853; host and
+    /// `*.suffix` entries never claim it (`ScopeMatcher.matches(kind: .udp, …)`).
+    /// macOS attributes an app's DNS lookup to the app with the looked-up name
+    /// attached, and the embedded core has no UDP backend, so claiming that datagram
+    /// would black-hole the app's resolver; returning false lets the system carry it.
     func handleUDP(_ flow: NEAppProxyUDPFlow, initialRemote: FlowNWEndpoint) -> Bool {
         guard let remote = FlowEndpoint(nw: initialRemote) else { return false }
         let descriptor = FlowDescriptor(kind: .udp, remote: remote,
@@ -1361,13 +1394,13 @@ final class FlowHandoff: @unchecked Sendable {
 
 // MARK: - Self-check (DEBUG only; never part of the shipped extension)
 //
-// Run with a throwaway driver (see the task report): compile this file plus a
-// one-line `main.swift` calling `HandoffSelfCheck.run()` with `-D DEBUG`. It drives
+// Run with `apps/mac/tools/ne-selfcheck.sh`: it builds these sources minus `main.swift`
+// plus a generated driver that calls `HandoffSelfCheck.run()`, with `-DDEBUG`. It drives
 // the real code over real socketpairs with a fake core and fake NE flows, and
 // asserts LITERAL expected wire bytes. It needs no root, no entitlement, no NE.
 //
 // Co-located deliberately: the Extension has no separate test target (it is built by
-// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no `-D DEBUG`, so this whole
+// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no DEBUG define, so this whole
 // block is excluded from the release binary). Splitting it into its own `#if DEBUG`
 // file is a tracked readability cleanup (plan Review log, Task 11 Minor).
 #if DEBUG
@@ -1405,6 +1438,13 @@ enum HandoffSelfCheck {
         }
     }
 
+    /// Bound a blocking `readFrame` on a test socket: a frame that never arrives must
+    /// FAIL the check (readExactly throws `io(EAGAIN)`), not hang the whole run.
+    static func setRecvTimeout(_ fd: Int32, seconds: Int) {
+        var tv = timeval(tv_sec: seconds, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
     static func ownIdentifierRequirement() -> String? {
         var selfCode: SecCode?
         guard SecCodeCopySelf([], &selfCode) == errSecSuccess, let code = selfCode else { return nil }
@@ -1436,6 +1476,7 @@ enum HandoffSelfCheck {
         wire(r)
         framing(r)
         scope(r)
+        claimRule(r)
         endpoints(r)
         peerAuth(r)
         rendezvous(r)
@@ -1491,8 +1532,7 @@ enum HandoffSelfCheck {
 
     private static func framing(_ r: Recorder) {
         guard let (a, b) = pair() else { r.fail("FAIL framing: no socketpair"); return }
-        var rcvTimeout = timeval(tv_sec: 3, tv_usec: 0)   // a broken cap must FAIL, not hang
-        _ = setsockopt(b.fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+        setRecvTimeout(b.fd, seconds: 3)   // a broken cap must FAIL, not hang
         // round trip
         try? FDIO.writeFrame(a.fd, Data("hello".utf8), max: 100)
         r.check("frame roundtrip", (try? FDIO.readFrame(b.fd, max: 100)).flatMap { $0 }.map(string) == "hello")
@@ -1540,27 +1580,141 @@ enum HandoffSelfCheck {
     private static func scope(_ r: Recorder) {
         let m = ScopeMatcher(spec: "example.com, *.api.test:8443\n93.184.216.34;[2001:db8::1]:443 ::1")
         r.check("scope entries parsed", m.entries.count == 5, "\(m.entries)")
-        r.check("host exact + case + trailing dot", m.matches(hostname: "EXAMPLE.com.", ip: "1.1.1.1", port: 80))
-        r.check("host no hostname", !m.matches(hostname: nil, ip: "1.1.1.1", port: 80))
-        r.check("suffix match", m.matches(hostname: "x.api.test", ip: "1.1.1.1", port: 8443))
-        r.check("suffix wrong port", !m.matches(hostname: "x.api.test", ip: "1.1.1.1", port: 443))
-        r.check("suffix not apex", !m.matches(hostname: "api.test", ip: "1.1.1.1", port: 8443))
-        r.check("suffix not substring", !m.matches(hostname: "evilapi.test", ip: "1.1.1.1", port: 8443))
-        r.check("ipv4 any port", m.matches(hostname: nil, ip: "93.184.216.34", port: 1))
-        r.check("ipv6 port", m.matches(hostname: nil, ip: "2001:db8::1", port: 443))
-        r.check("ipv6 wrong port", !m.matches(hostname: nil, ip: "2001:db8::1", port: 80))
-        r.check("ipv6 non-canonical", m.matches(hostname: nil, ip: "2001:0DB8:0:0:0:0:0:1", port: 443))
-        r.check("bare ipv6", m.matches(hostname: nil, ip: "::1", port: 9))
-        r.check("v4-mapped unmapped", m.matches(hostname: nil, ip: "::ffff:93.184.216.34", port: 80))
-        r.check("unrelated", !m.matches(hostname: "other.org", ip: "8.8.8.8", port: 443))
+        r.check("host exact + case + trailing dot", m.matches(kind: .tcp, hostname: "EXAMPLE.com.", ip: "1.1.1.1", port: 80))
+        r.check("host no hostname", !m.matches(kind: .tcp, hostname: nil, ip: "1.1.1.1", port: 80))
+        r.check("suffix match", m.matches(kind: .tcp, hostname: "x.api.test", ip: "1.1.1.1", port: 8443))
+        r.check("suffix wrong port", !m.matches(kind: .tcp, hostname: "x.api.test", ip: "1.1.1.1", port: 443))
+        r.check("suffix not apex", !m.matches(kind: .tcp, hostname: "api.test", ip: "1.1.1.1", port: 8443))
+        r.check("suffix not substring", !m.matches(kind: .tcp, hostname: "evilapi.test", ip: "1.1.1.1", port: 8443))
+        r.check("ipv4 any port", m.matches(kind: .tcp, hostname: nil, ip: "93.184.216.34", port: 1))
+        r.check("ipv6 port", m.matches(kind: .tcp, hostname: nil, ip: "2001:db8::1", port: 443))
+        r.check("ipv6 wrong port", !m.matches(kind: .tcp, hostname: nil, ip: "2001:db8::1", port: 80))
+        r.check("ipv6 non-canonical", m.matches(kind: .tcp, hostname: nil, ip: "2001:0DB8:0:0:0:0:0:1", port: 443))
+        r.check("bare ipv6", m.matches(kind: .tcp, hostname: nil, ip: "::1", port: 9))
+        r.check("v4-mapped unmapped", m.matches(kind: .tcp, hostname: nil, ip: "::ffff:93.184.216.34", port: 80))
+        r.check("unrelated", !m.matches(kind: .tcp, hostname: "other.org", ip: "8.8.8.8", port: 443))
         for spec in ["", "*", "*.*", "foo:0", "foo:99999", "*.", "[::1", "a..b", "ex ample!"] {
             let matcher = ScopeMatcher(spec: spec)
             r.check("deny-by-default spec '\(spec)'",
-                  !matcher.matches(hostname: "foo", ip: "1.1.1.1", port: 80) || spec == "ex ample!",
+                  !matcher.matches(kind: .tcp, hostname: "foo", ip: "1.1.1.1", port: 80) || spec == "ex ample!",
                   "\(matcher.entries)")
         }
         r.check("star claims nothing",
-              !ScopeMatcher(spec: "*").matches(hostname: "anything.com", ip: "1.2.3.4", port: 443))
+              !ScopeMatcher(spec: "*").matches(kind: .tcp, hostname: "anything.com", ip: "1.2.3.4", port: 443))
+    }
+
+    // -- claim rule by transport (spec 2026-10-31-ne-claim-rule, CR-AC1) -----
+    //
+    // Host and `*.suffix` tokens claim TCP only; a UDP flow is claimable only
+    // through an IP token; a datagram to 53, 5353, or 853 is never claimed, even
+    // through a matching IP token. TCP is unchanged (TCP:53 stays claimable).
+
+    private static func claimRule(_ r: Recorder) {
+        let m = ScopeMatcher(spec: "example.com, *.api.test, 93.184.216.34, 198.51.100.7:443, [2001:db8::1]:443, www.example.com:80")
+        r.check("claim rule spec parsed", m.entries.count == 6, "\(m.entries)")
+
+        // UDP through a host or suffix token: never, on a DNS port or any other.
+        let hostUDPPorts: [UInt16] = [53, 5353, 853, 443, 1234]
+        for p in hostUDPPorts {
+            r.check("bare host never claims UDP :\(p)",
+                  !m.matches(kind: .udp, hostname: "example.com", ip: "203.0.113.5", port: p))
+        }
+        r.check("suffix never claims UDP",
+              !m.matches(kind: .udp, hostname: "x.api.test", ip: "203.0.113.5", port: 443))
+
+        // UDP through an IP token (the L4 scope path): claimed, port filter intact.
+        r.check("bare IP token claims UDP", m.matches(kind: .udp, hostname: nil, ip: "93.184.216.34", port: 443))
+        r.check("IP token ignores hostname",
+              m.matches(kind: .udp, hostname: "unrelated.org", ip: "93.184.216.34", port: 4433))
+        r.check("ip:port token, that port", m.matches(kind: .udp, hostname: nil, ip: "198.51.100.7", port: 443))
+        r.check("ip:port token, other port", !m.matches(kind: .udp, hostname: nil, ip: "198.51.100.7", port: 444))
+        r.check("IPv6 token claims UDP", m.matches(kind: .udp, hostname: nil, ip: "2001:db8::1", port: 443))
+
+        // UDP to a DNS port: never, even through a matching IP token.
+        let dnsPorts: [UInt16] = [53, 5353, 853]
+        for p in dnsPorts {
+            r.check("DNS never, even by IP :\(p)",
+                  !m.matches(kind: .udp, hostname: nil, ip: "93.184.216.34", port: p))
+        }
+
+        // TCP: unchanged. Bare host any port (53 included), host:port that port only,
+        // suffix on sub-domains, IP token on 53.
+        let tcpHostPorts: [UInt16] = [443, 8080, 53]
+        for p in tcpHostPorts {
+            r.check("TCP bare host any port :\(p)",
+                  m.matches(kind: .tcp, hostname: "example.com", ip: "203.0.113.5", port: p))
+        }
+        r.check("TCP host:port that port", m.matches(kind: .tcp, hostname: "www.example.com", ip: "203.0.113.5", port: 80))
+        r.check("TCP host:port other port", !m.matches(kind: .tcp, hostname: "www.example.com", ip: "203.0.113.5", port: 443))
+        r.check("TCP suffix", m.matches(kind: .tcp, hostname: "x.api.test", ip: "203.0.113.5", port: 8443))
+        r.check("TCP IP token on 53", m.matches(kind: .tcp, hostname: nil, ip: "93.184.216.34", port: 53))
+
+        // -- tester additions (stage 5, 2026-10-31) ----------------------------
+
+        // The constant itself, exactly: DNS (53), mDNS (5353), DNS-over-TLS (853).
+        r.check("neverClaimedDatagramPorts is exactly {53, 5353, 853}",
+              ScopeMatcher.neverClaimedDatagramPorts == [53, 5353, 853],
+              "\(ScopeMatcher.neverClaimedDatagramPorts.sorted())")
+
+        // host:port and suffix tokens are TCP-only too, on a DNS port or not.
+        r.check("host:port token never claims UDP on its own port",
+              !m.matches(kind: .udp, hostname: "www.example.com", ip: "203.0.113.5", port: 80))
+        r.check("suffix never claims UDP on a DNS port",
+              !m.matches(kind: .udp, hostname: "x.api.test", ip: "203.0.113.5", port: 53))
+
+        // "Whatever the spec says": an operator token that names a DNS port explicitly
+        // still never claims the datagram (rule 1 runs before any entry), while the
+        // same token still claims TCP on that port (D3).
+        let dnsToken = ScopeMatcher(spec: "198.51.100.7:53")
+        r.check("ip:53 token parsed", dnsToken.entries.count == 1, "\(dnsToken.entries)")
+        r.check("ip:53 token never claims UDP 53",
+              !dnsToken.matches(kind: .udp, hostname: nil, ip: "198.51.100.7", port: 53))
+        r.check("ip:53 token still claims TCP 53",
+              dnsToken.matches(kind: .tcp, hostname: nil, ip: "198.51.100.7", port: 53))
+        let dotToken = ScopeMatcher(spec: "198.51.100.7:853")
+        r.check("ip:853 token never claims UDP 853",
+              !dotToken.matches(kind: .udp, hostname: nil, ip: "198.51.100.7", port: 853))
+        r.check("ip:853 token still claims TCP 853",
+              dotToken.matches(kind: .tcp, hostname: nil, ip: "198.51.100.7", port: 853))
+
+        // The exclusion is datagram-only for all three ports, not just 53.
+        for p: UInt16 in [5353, 853] {
+            r.check("TCP bare host on :\(p) still claimed",
+                  m.matches(kind: .tcp, hostname: "example.com", ip: "203.0.113.5", port: p))
+            r.check("TCP IP token on :\(p) still claimed",
+                  m.matches(kind: .tcp, hostname: nil, ip: "93.184.216.34", port: p))
+        }
+
+        // The UDP IP path uses the same canonicalisation as TCP: a bare IPv6 token
+        // matches a non-canonical spelling and a v4-mapped remote unmaps -- and
+        // neither can claim a DNS port.
+        let v6 = ScopeMatcher(spec: "2001:db8::1")
+        r.check("bare IPv6 token claims UDP (non-canonical remote)",
+              v6.matches(kind: .udp, hostname: nil, ip: "2001:0DB8:0:0:0:0:0:1", port: 443))
+        r.check("bare IPv6 token never claims UDP 53",
+              !v6.matches(kind: .udp, hostname: nil, ip: "2001:db8::1", port: 53))
+        r.check("v4-mapped remote claims UDP via IPv4 token",
+              m.matches(kind: .udp, hostname: nil, ip: "::ffff:93.184.216.34", port: 443))
+        r.check("v4-mapped remote never claims UDP 53",
+              !m.matches(kind: .udp, hostname: nil, ip: "::ffff:93.184.216.34", port: 53))
+
+        // Degenerate remotes: an empty or garbage IP matches no IP token, a name alone
+        // never claims a datagram, and TCP still claims by name whatever the IP text.
+        for ip in ["", "not-an-ip", "999.1.1.1", "::ffff:999.1.1.1"] {
+            r.check("UDP host token + remote '\(ip)' never claims",
+                  !m.matches(kind: .udp, hostname: "example.com", ip: ip, port: 443))
+            r.check("UDP no name + remote '\(ip)' never claims",
+                  !m.matches(kind: .udp, hostname: nil, ip: ip, port: 443))
+            r.check("TCP host token + remote '\(ip)' still claims by name",
+                  m.matches(kind: .tcp, hostname: "example.com", ip: ip, port: 443))
+        }
+        // An empty hostname string (not nil) claims nothing by name on either transport.
+        r.check("UDP empty hostname claims nothing", !m.matches(kind: .udp, hostname: "", ip: "203.0.113.5", port: 443))
+        r.check("TCP empty hostname claims nothing", !m.matches(kind: .tcp, hostname: "", ip: "203.0.113.5", port: 443))
+        // An empty spec claims nothing for either transport.
+        let none = ScopeMatcher(spec: "")
+        r.check("empty spec claims no UDP", !none.matches(kind: .udp, hostname: nil, ip: "93.184.216.34", port: 443))
+        r.check("empty spec claims no TCP", !none.matches(kind: .tcp, hostname: "example.com", ip: "93.184.216.34", port: 443))
     }
 
     // -- endpoints -----------------------------------------------------------
@@ -1734,6 +1888,9 @@ enum HandoffSelfCheck {
         // 2. Verified control peer: Hello is exactly the contract, Scope arms it,
         //    losing the channel fails open again.
         guard let (core, provider) = pair() else { return }
+        // A Hello/FlowOpen that never arrives must FAIL its check, not hang the run
+        // (a claim refused by a broken rule would otherwise block readFrame forever).
+        setRecvTimeout(core.fd, seconds: 5)
         let link = CoreLink(requirement: own)
         let done = DispatchSemaphore(value: 0)
         let serveResult = Box<Bool>()
@@ -1757,6 +1914,9 @@ enum HandoffSelfCheck {
             FlowHandoff(link: link, requirement: requirement, dial: { path in
                 dialPaths.append(path)
                 guard let (dataCore, dataProvider) = pair() else { throw HandoffError.unavailable("pair") }
+                // Every fake-core data fd is bounded here, where the pair is minted, so a
+                // wrong refusal downstream fails instead of hanging the gate.
+                setRecvTimeout(dataCore.fd, seconds: 5)
                 dataPairs.append((dataCore, dataProvider))
                 return dataProvider
             })
@@ -1783,6 +1943,57 @@ enum HandoffSelfCheck {
         } else {
             r.fail("FAIL claim: no data socket")
         }
+
+        // 4b. claim(): a datagram is never claimed through the armed host token
+        //     (`example.com`), on a DNS port or any other, and no data socket is
+        //     dialed (spec 2026-10-31-ne-claim-rule, CR-AC1). dialPaths still holds
+        //     exactly the one TCP dial from step 4.
+        let udpDNS = FlowDescriptor(kind: .udp, remote: FlowEndpoint(ip: "93.184.216.34", port: 53),
+                                    remoteHostname: "example.com", sourceApp: "com.apple.curl", local: nil)
+        r.check("UDP DNS with matching name fails open", handoff.claim(udpDNS) == nil)
+        r.check("UDP DNS never dials", dialPaths.all == ["/run/aitm/data.sock"], "\(dialPaths.all)")
+        let udp443 = FlowDescriptor(kind: .udp, remote: FlowEndpoint(ip: "93.184.216.34", port: 443),
+                                    remoteHostname: "example.com", sourceApp: "com.apple.curl", local: nil)
+        r.check("UDP 443 with matching name fails open", handoff.claim(udp443) == nil)
+        r.check("UDP 443 never dials", dialPaths.all == ["/run/aitm/data.sock"], "\(dialPaths.all)")
+
+        // 4c. (tester, stage 5) UDP stays reachable through an IP token -- the L4 scope
+        //     path the spec keeps open. Re-arm the link with a second Scope that adds
+        //     the remote's IP: the SAME datagram to :443 is now claimed end to end
+        //     (data socket dialed, FlowOpen says "Udp" with the real kind from the
+        //     descriptor, handshake first on the data socket), while datagrams to :53
+        //     and :853 at that same IP are still refused with no dial -- DNS is never
+        //     claimed, even by IP, at the claim level too.
+        let rearmed = ScopeMatcher(spec: "example.com, 93.184.216.34")
+        try? FDIO.writeFrame(core.fd, Data(#"{"Scope":{"spec":"example.com, 93.184.216.34"}}"#.utf8), max: 1 << 20)
+        var rearmedOK = false
+        for _ in 0..<100 where !rearmedOK {
+            if link.current()?.scope == rearmed { rearmedOK = true } else { usleep(20_000) }
+        }
+        r.check("second Scope re-arms the link with the IP token", rearmedOK,
+              "\(String(describing: link.current()?.scope.entries))")
+        let udpClaimed = handoff.claim(udp443)
+        r.check("UDP 443 via IP token is claimed", udpClaimed?.id == 2, "\(String(describing: udpClaimed?.id))")
+        r.check("UDP claim dials the data socket",
+              dialPaths.all == ["/run/aitm/data.sock", "/run/aitm/data.sock"], "\(dialPaths.all)")
+        let udpOpen = (try? FDIO.readFrame(core.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+        r.check("UDP FlowOpen on the wire says Udp",
+              udpOpen == #"{"FlowOpen":{"flow_id":2,"kind":"Udp","remote":"93.184.216.34:443","remote_hostname":"example.com","source_app":"com.apple.curl","local":null}}"#,
+              udpOpen ?? "nil")
+        let udpPairs = dataPairs.all
+        if udpPairs.count == 2 {
+            let hs = (try? FDIO.readFrame(udpPairs[1].0.fd, max: 1 << 20)).flatMap { $0 }.map(string)
+            r.check("UDP handshake is the first data frame", hs == #"{"flow_id":2}"#, hs ?? "nil")
+        } else {
+            r.fail("FAIL UDP claim: expected exactly 2 data sockets, got \(udpPairs.count)")
+        }
+        udpClaimed?.socket.shutdownBoth()
+        r.check("UDP DNS via IP token still fails open", handoff.claim(udpDNS) == nil)
+        let udpDoT = FlowDescriptor(kind: .udp, remote: FlowEndpoint(ip: "93.184.216.34", port: 853),
+                                    remoteHostname: nil, sourceApp: "com.apple.curl", local: nil)
+        r.check("UDP 853 via IP token still fails open", handoff.claim(udpDoT) == nil)
+        r.check("refused datagrams never dial",
+              dialPaths.all == ["/run/aitm/data.sock", "/run/aitm/data.sock"], "\(dialPaths.all)")
 
         // 5. DECOY data peer (control verified, data fails the production
         //    requirement): the claim fails open, the data peer gets ZERO bytes and

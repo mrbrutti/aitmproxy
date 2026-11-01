@@ -20,7 +20,7 @@ struct RunAgainPopover: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.md) {
-            Text("Run again").font(Tok.Face.ui(Tok.Typography.Size.md, .semibold)).foregroundStyle(Tok.Ink.primary.color)
+            Text("Run Again").font(Tok.Face.ui(Tok.Typography.Size.md, .semibold)).foregroundStyle(Tok.Ink.primary.color)
             field("Target") {
                 TextField("https://host", text: $form.target).textFieldStyle(.plain)
                     .font(Tok.Face.data(Tok.Typography.Size.md)).focused($targetFocused)
@@ -94,8 +94,8 @@ struct BuildPoCSheet: View {
 
     private var row: FlowRow? { session.rows.first { $0.id == flowID } }
     private var candidates: [String] {
-        guard let row else { return [] }
-        return PocParameters.candidates(for: session.details[flowID] ?? Fixtures.detail(for: row), row: row)
+        guard let row, let detail = session.details[flowID] else { return [] }
+        return PocParameters.candidates(for: detail, row: row)
     }
     private var inScope: Bool { row?.inScope ?? false }
 

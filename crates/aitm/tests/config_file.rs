@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use aitm::config_file::{default_config_path, load, parse};
+use aitm::config_file::{default_config_path, load, parse, parse_settings};
 use aitm_core::{BrowserEngine, Config, McpTransport};
 
 /// Point the per-user config dir at a temp dir, once, before any test reads
@@ -227,6 +227,123 @@ fn operator_gate_knobs_load() {
     // Unknown keys under these sections are still rejected (deny_unknown_fields).
     assert!(parse("scope:\n  bogus: 1\n").is_err());
     assert!(parse("poc:\n  bogus: 1\n").is_err());
+}
+
+/// SP-AC7 of the macOS Scope-persistence spec
+/// (`docs/superpowers/specs/2026-10-31-macos-scope-persistence-design.md`): the
+/// core parses the exact bytes the macOS app's `EmbeddedCoreLaunch.Config.yaml()`
+/// emits for a persisted embedded scope. The literal below is the shared block the
+/// Swift mirror test
+/// `EmbeddedCoreLaunchTests.scope_block_is_byte_identical_to_the_core_parse_input`
+/// asserts as the YAML suffix; its sibling tripwire
+/// `scope_block_text_is_what_the_core_round_trip_test_parses` greps this file for
+/// this exact spelling, so keep it one plain string literal (no concatenation, no
+/// raw string). Also SP-AC5 `[rust]`: the block never turns on `allow_agent_widen`.
+#[test]
+fn scope_entries_block_round_trips() {
+    redirect_home();
+    let cfg = parse(
+        "scope:\n  entries:\n    - \"api.example.test\"\n    - \"*.shop.test\"\n    - \"localhost:8099\"\n",
+    )
+    .expect("parse scope entries");
+    let hosts: Vec<&str> = cfg.scope.entries.iter().map(|e| e.host.as_str()).collect();
+    assert_eq!(hosts, ["api.example.test", "*.shop.test", "localhost:8099"]);
+    assert!(!cfg.scope.allow_agent_widen);
+    // An explicit empty list is accepted and yields no entries.
+    assert!(parse("scope:\n  entries: []\n")
+        .expect("parse empty entries")
+        .scope
+        .entries
+        .is_empty());
+    // Composition with a sibling top-level key the app also emits.
+    let both = parse("ssl_insecure: true\nscope:\n  entries:\n    - \"api.example.test\"\n")
+        .expect("parse");
+    assert!(both.ssl_insecure);
+    let both_hosts: Vec<&str> = both.scope.entries.iter().map(|e| e.host.as_str()).collect();
+    assert_eq!(both_hosts, ["api.example.test"]);
+}
+
+/// Tester (SP-AC7, SP-AC17): the escaping `EmbeddedCoreLaunch.yamlDoubleQuoted` applies
+/// (`\` → `\\`, `"` → `\"`) and the characters it leaves alone (an IDN, mixed case, `#`,
+/// `'`) all come back out of the core's parse as the original host — so what the app
+/// quotes is what the guard is seeded with. Swift mirrors:
+/// `EmbeddedCoreLaunchTests.scope_block_escapes_quotes_and_backslashes` and
+/// `scope_block_emits_unicode_and_yaml_specials_verbatim_inside_quotes`.
+#[test]
+fn scope_entries_quoting_survives_the_parse() {
+    redirect_home();
+    let cfg = parse(
+        "scope:\n  entries:\n    - \"a\\\"b.test\"\n    - \"c\\\\d.test\"\n    - \"bücher.example\"\n    - \"API.Example.TEST\"\n    - \"a#b.test\"\n    - \"o'neil.test\"\n",
+    )
+    .expect("parse quoted entries");
+    let hosts: Vec<&str> = cfg.scope.entries.iter().map(|e| e.host.as_str()).collect();
+    assert_eq!(
+        hosts,
+        [
+            "a\"b.test",
+            "c\\d.test",
+            "bücher.example",
+            "API.Example.TEST",
+            "a#b.test",
+            "o'neil.test",
+        ]
+    );
+}
+
+/// Tester (SP-AC4, SP-AC13): the exact tail the app writes when every operator opt-in is
+/// on — `ssl_insecure`, then `macos_capture`, then `scope`, each tail prefixed with its own
+/// newline so a blank line separates the blocks — parses as all three at once, through
+/// `parse_settings` (the entry point that also returns `macos_capture`). Mirrors
+/// `EmbeddedCoreLaunchTests.scope_block_follows_the_ssl_and_capture_tails`.
+#[test]
+fn scope_entries_compose_with_every_other_tail_the_app_emits() {
+    redirect_home();
+    let settings = parse_settings(
+        "listen: \"127.0.0.1:8080\"\nssl_insecure: true\n\nmacos_capture:\n  enabled: true\n\nscope:\n  entries:\n    - \"api.example.test\"\n    - \"localhost:8099\"\n",
+    )
+    .expect("parse every tail");
+    assert!(settings.core.ssl_insecure);
+    assert!(settings.macos_capture.enabled);
+    let hosts: Vec<&str> = settings
+        .core
+        .scope
+        .entries
+        .iter()
+        .map(|e| e.host.as_str())
+        .collect();
+    assert_eq!(hosts, ["api.example.test", "localhost:8099"]);
+    assert!(!settings.core.scope.allow_agent_widen);
+}
+
+/// Tester (anti-goal "a corrupt or tampered file wedges the core"): shapes the app never
+/// emits but a hand-edited config could carry are refused loudly, never read as an empty or
+/// widened scope — a string where the list goes, a mapping item, an unknown key beside
+/// `entries`, and a mis-indented `entries` that would otherwise land as a top-level key.
+#[test]
+fn scope_entries_malformed_shapes_are_errors_not_defaults() {
+    redirect_home();
+    assert!(parse("scope:\n  entries: \"api.example.test\"\n").is_err());
+    assert!(parse("scope:\n  entries:\n    - host: api.example.test\n").is_err());
+    assert!(parse("scope:\n  entries: []\n  entrees: []\n").is_err());
+    assert!(parse("scope:\nentries:\n  - \"api.example.test\"\n").is_err());
+}
+
+/// Tester (oversized input): a long but valid list parses whole and in order — no silent
+/// cap anywhere between the app's file and the guard.
+#[test]
+fn scope_entries_long_list_parses_whole_and_in_order() {
+    redirect_home();
+    let hosts: Vec<String> = (0..5_000).map(|i| format!("h{i}.example.test")).collect();
+    let mut yaml = String::from("scope:\n  entries:\n");
+    for host in &hosts {
+        yaml.push_str("    - \"");
+        yaml.push_str(host);
+        yaml.push_str("\"\n");
+    }
+    let cfg = parse(&yaml).expect("parse long list");
+    let parsed: Vec<&str> = cfg.scope.entries.iter().map(|e| e.host.as_str()).collect();
+    let expected: Vec<&str> = hosts.iter().map(String::as_str).collect();
+    assert_eq!(parsed, expected);
 }
 
 /// Panel finding #2: the additive `session_io.allow_agent_file_io` gate parses from

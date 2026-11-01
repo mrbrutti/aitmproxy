@@ -99,15 +99,8 @@ private struct AccentPreview: View {
                                 in: RoundedRectangle(cornerRadius: Tok.Radius.control))
                 Spacer()
                 Text("Agent").font(.caption).foregroundStyle(.secondary)
-                Capsule()
-                    .fill(Tok.Agent.base.color)
-                    .frame(width: Tok.Metric.switchWidth, height: Tok.Metric.switchHeight)
-                    .overlay(alignment: .trailing) {
-                        // White knob, matching the real Agent toggle (ShellToolbar).
-                        Circle().fill(.white)
-                            .frame(width: Tok.Metric.switchKnob, height: Tok.Metric.switchKnob)
-                            .padding(2)
-                    }
+                // The real toolbar switch glyph (ShellToolbar), so the preview cannot drift.
+                SwitchGlyph(on: true, tint: Tok.Agent.base.color)
             }
         }
         .padding(Space.md)

@@ -14,7 +14,7 @@ the operator-commands merge (PR #6, `tools/list` = 34).
 ## Status legend
 
 - **✅ live** — works today against a running `aitm` over the bus (verified by the live self-test).
-- **🟡 app-ready, core-blocked** — the mac UI is built; waits on a named core item. Works on fixtures.
+- **🟡 app-ready, core-blocked** — the mac UI is built; waits on a named core item.
 - **🧩 planned** — story exists, not built.
 - **⛔ not in v1** — deliberately deferred (`docs/BRIEF.md`).
 - **— none** — no support anywhere yet.
@@ -35,39 +35,35 @@ the operator-commands merge (PR #6, `tools/list` = 34).
    `APP_LIVE_STRICT=1`: "flow.kill denies the client a response (curl exit 52,
    row killed)".
 
-## Verification & CUA automation coverage boundary
+## Verification
 
 The operator workflow is verified two ways, both repeatable:
-- **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (21 checks): intercept →
+- **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (90 checks on 2026-11-01, 44 of them the menu audit): intercept →
   `flow.detail` review → edit a paused request → resume, plus mark/comment,
   pause/clear, kill (strict), activity log.
-- **Human UI (computer-use)** — `tools/cua-clickthrough.sh` with `tools/cgclick.swift`,
-  two layers, both real input events:
-  - **Pixel path (no Accessibility tree):** normalize the window to a known origin,
-    then **CGEvent-click computed row pixels**; selection is verified by
-    screenshotting the inspector region and confirming it changed (`screencapture`
-    + `md5`, across rows 3/8/1). This clicks pixels, so it has no SwiftUI-AX
-    limitation and selects any rendered element. Proof shots: `/tmp/cua-row*.png`.
-  - **Menu path:** real Accessibility menu-bar clicks (Resume, Build PoC opens a sheet).
-- **Deterministic human-input** — the in-app self-test's menu audit (every action
+- **Human UI (computer-use)** — `tools/cua-ne-drive.sh <pid> [host]`: real input
+  events on the INSTALLED app (a dev bundle embeds no extension). System Events (AX)
+  menu and keystroke actions open Settings ▸ Capture, add a host through the
+  Proxy ▸ Scope… sheet and browse it in Safari, and `tools/winshot.swift <pid>` reads
+  the real window after each step (shots `/tmp/aitm-ne-5.png`, `-6`, `-7`). The
+  fixture-session click-through `cua-clickthrough.sh` (a pixel path that CGEvent-clicked
+  computed row pixels and verified the selection with an inspector-region screenshot
+  diff, and a menu path through Resume and Build PoC) was removed 2026-10-31 and has
+  no replacement.
+- **Deterministic human-input** — the live self-test's menu audit (every action
   has a menu item + shortcut) and key-event checks.
-
-**CUA automation coverage boundary (now closed for selection):** The **coordinate
-path** (screenshot → compute pixel → CGEvent click) does not touch the AX tree, so
-it reliably selects any rendered row — the pixel gate verifies this with a
-`screencapture`+`md5` inspector-region diff across three distinct rows (green every
-run). That is the deterministic coverage.
 
 Stable `.accessibilityIdentifier`s are set on the key views — flow rows
 (`flow-row-<i>-seq<n>`), the inspector URL (`inspector-url`), the Raw editor
 (`raw-request-editor`), the edit-status (`edit-status`), and the Resume/Edit
 buttons — for VoiceOver and for XCUITest. Note: **AppleScript / System Events does
 not surface SwiftUI's `AXIdentifier`** (verified — reads return NOTFOUND), and the
-NSTableView AX descent is timing-sensitive, so the scripted *read-back* uses the
-screenshot diff rather than by-identifier AX reads. A fully by-identifier
-deterministic UI test would be an **XCUITest** target (which does read these
-identifiers); the end-to-end "an edit reaches the client" assertion already lives
-in the agent `tools/selftest-live.sh` (edit → `flow.mutate` → `flow.resume`).
+NSTableView AX descent is timing-sensitive, so the removed click-through's scripted
+*read-back* used a screenshot diff rather than by-identifier AX reads (removed
+2026-10-31; today the proof is `winshot` shots read by a person). A fully
+by-identifier deterministic UI test would be an **XCUITest** target (which does read
+these identifiers); the end-to-end "an edit reaches the client" assertion already
+lives in the agent `tools/selftest-live.sh` (edit → `flow.mutate` → `flow.resume`).
 
 ## 1. Our core command surface (post-merge, 34 tools)
 
@@ -121,7 +117,7 @@ Not yet on the bus: `flow.subscribe` (F4 live push), `ws.send` (F9),
 | Certificate Authority | ✅ live | — |
 | Configuration | ✅ live | `config.get` (F7) |
 | Overview, Connection Log | ✅ (derived) | richer = F4 |
-| Pause/Resume capture; Clear session | ✅ live | F7 |
+| Pause/Resume proxy (the toolbar's Proxy switch); Clear session | ✅ live | F7 |
 | Import/Export (HAR, CSV, cURL) + drop | ✅ app-side | full formats/sessions = F10 |
 
 ## 4. Proxyman parity matrix

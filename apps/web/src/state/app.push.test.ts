@@ -1,26 +1,30 @@
 // Push as a trigger: on a real bus a `notifications/aitm/flow` line never writes its (sparse) summary
 // into the list. It queues the id; a 100 ms coalescer refetches through the same helper the poll uses
 // (`flow.detail {id, body:'none'}`, or `flow.get` without the catalogue entry), in waves of 16, under
-// the same failure hold-off, with stale replies discarded by ticket and `cleared` by epoch. The
-// `fixtures` bus keeps the old direct-apply path. The poll loop itself is covered by
-// `app.polling.test.ts`; this file only checks that push and poll coexist (the heartbeat case).
+// the same failure hold-off, with stale replies discarded by ticket and `cleared` by epoch. The poll
+// loop itself is covered by `app.polling.test.ts`; this file only checks that push and poll coexist
+// (the heartbeat case).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FlowEventKind } from '~/bus/types';
 import { createAppStore } from './app';
 import { FLOW_PING, bridgeBus, captureInFlight, captureSilently, complete, gate, tick, type TestBus } from './bridgeBus.testkit';
 
-/** What the server really sends with a flow event: a thin summary, `kind:"ws"` spelled its way, no times, no sizes. */
+/**
+ * The sparse summary an OLDER core sends with a flow event (`kind:"ws"`, no times, no sizes). A
+ * current core sends the full `flow.get` object with `kind:"websocket"`; the store treats either as
+ * a trigger, and the old shape is kept here because it is the one a direct apply would corrupt.
+ */
 const sparse = (id: string) => ({ id, kind: 'ws', method: 'GET', authority: 'x.test', path: '/p', status: null });
 const push = (bus: TestBus, event: FlowEventKind, id: string) => bus.emit('notifications/aitm/flow', { event, id, summary: sparse(id) });
 
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {
   open.push(bus);
-  // The real core's flow.detail / flow.get replies carry no `seq`; the fixture flows do, and
-  // `toSummary` prefers a reply's own `seq` to the store's position. Strip it, so the `seq`
-  // assertions below prove the store's numbering (`entries.length + 1` / the poll's position)
-  // and not the fixture's.
+  // The real core's flow.detail / flow.get replies carry no `seq`, and neither do the testkit's flows;
+  // `toSummary` prefers a reply's own `seq` to the store's position, so `stripSeq` removes one a case
+  // writes into a flow by hand. The `seq` assertions below then prove the store's numbering
+  // (`entries.length + 1` / the poll's position) and nothing else.
   bus.ctl.stripSeq = true;
   return { bus, app: createAppStore(bus) };
 };
@@ -48,7 +52,7 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(bus.callArgs('flow.detail')).toEqual([{ id: 'f_1', body: 'none' }]);
     expect(bus.count('flow.list')).toBe(lists); // no list scan for a push
     // The row is what the core has, not what the push said.
-    expect(app.byId.get('f_1')!.raw).toMatchObject({ id: 'f_1', kind: 'http', method: 'GET', authority: 'cdn.shop-staging.test', path: '/assets/app.css', status: 304 });
+    expect(app.byId.get('f_1')!.raw).toMatchObject({ id: 'f_1', kind: 'http', method: 'GET', authority: 'api.example.test', path: '/v1/items', status: 200 });
   });
 
   it('a sparse push does not overwrite a rich row', async () => {
@@ -60,8 +64,9 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(before.seq).toBe(1);
 
     push(bus, 'meta', 'f_1');
-    // Not even for an instant: the sparse summary (`kind:"ws"`, no times, no sizes) is never written, so
-    // the row is intact before the refetch answers, not merely repaired by it.
+    // Not even for an instant: the summary (here the sparse old shape, which a direct apply would
+    // corrupt) is never written, so the row is intact before the refetch answers, not merely
+    // repaired by it.
     expect(app.byId.get('f_1')!.raw).toEqual(before);
     await tick(250);
 
@@ -121,7 +126,7 @@ describe('app store — a flow push is a trigger, never data', () => {
   it('a steady stream of pushes is flushed every window, not starved by a debounce', async () => {
     const { bus, app } = start();
     await tick(200);
-    const ids = Array.from({ length: 20 }, (_, i) => captureSilently(bus, i + 1)); // (fixture ids are base 36)
+    const ids = Array.from({ length: 20 }, (_, i) => captureSilently(bus, i + 1));
 
     // A new flow every 40 ms for 800 ms. A debounce would re-arm on each push and flush only once the
     // stream went quiet; the throttle's first timer is not re-armed by traffic, so ids[0] lands in ~100 ms.
@@ -327,12 +332,12 @@ describe('app store — a flow push is a trigger, never data', () => {
       bus.emit('notifications/aitm/flow', FLOW_PING); // push stays fresh, so only the 10 s heartbeat polls
       await tick(1000);
     }
-    expect(app.byId.get('f_1')!.raw.status).toBe(304); // the heartbeat re-read the pending row
+    expect(app.byId.get('f_1')!.raw.status).toBe(200); // the heartbeat re-read the pending row
 
     g.release(); // the older reply lands now
     await tick(50);
 
-    expect(app.byId.get('f_1')!.raw.status).toBe(304);
+    expect(app.byId.get('f_1')!.raw.status).toBe(200);
   });
 
   it('a cleared event drops pending and in-flight fetches', async () => {
@@ -470,74 +475,6 @@ describe('app store — a flow push is a trigger, never data', () => {
     await tick(150);
     expect(bus.callArgs('flow.detail').slice(details)).toEqual([{ id: 'f_2', body: 'none' }]);
     expect(app.byId.has('f_2')).toBe(true);
-  });
-
-  it('the fixtures bus still applies the summary directly', async () => {
-    const { bus, app } = start(bridgeBus('fixtures'));
-    await tick(200);
-    const id = captureSilently(bus, 1);
-
-    bus.emit('notifications/aitm/flow', { event: 'created', id, summary: bus.flowsById().get(id) });
-    await tick(0);
-
-    expect(app.byId.has(id)).toBe(true);
-    expect(bus.count('flow.detail')).toBe(0);
-  });
-
-  // The fixtures bus keeps the pre-push direct-apply path (spec D3): complete summaries land synchronously
-  // and the same post-event work still runs from them (`cleared`, detail invalidation, `pausedIds`).
-  describe('on the fixtures bus', () => {
-    /** The mock's own flow as the summary of a push: complete and correctly spelled, as the fixtures bus sends it. */
-    const fx = (bus: TestBus, event: FlowEventKind, id: string, over: Record<string, unknown> = {}) =>
-      bus.emit('notifications/aitm/flow', { event, id, summary: { ...bus.flowsById().get(id), ...over } });
-
-    it('a cleared push empties the list, and a later push applies again', async () => {
-      const { bus, app } = start(bridgeBus('fixtures'));
-      await tick(200);
-      const id = captureSilently(bus, 1);
-      fx(bus, 'created', id);
-      expect(app.entries.map((e) => e.id)).toEqual([id]);
-
-      bus.emit('notifications/aitm/flow', { event: 'cleared', id: '' });
-      expect(app.entries).toHaveLength(0);
-      expect(app.byId.size).toBe(0);
-
-      fx(bus, 'created', id);
-      expect(app.entries.map((e) => e.id)).toEqual([id]);
-    });
-
-    it('a response push drops the cached detail and reloads the inspected flow', async () => {
-      const { bus, app } = start(bridgeBus('fixtures'));
-      await tick(200);
-      const id = captureSilently(bus, 1);
-      fx(bus, 'created', id);
-      app.select(id);
-      await tick(50);
-      expect(app.details[id]).toBeDefined();
-      const before = bus.callArgs('flow.detail').length;
-
-      fx(bus, 'response', id);
-      expect(app.details[id]).toBeUndefined(); // dropped at once, before the reload answers
-      await tick(50);
-
-      expect(bus.callArgs('flow.detail').slice(before)).toEqual([{ id }]); // the inspector reload only: no row refetch
-      expect(app.details[id]).toBeDefined();
-    });
-
-    it('intercepted and released pushes recompute pausedIds from the applied row', async () => {
-      const { bus, app } = start(bridgeBus('fixtures'));
-      await tick(200);
-      const id = captureSilently(bus, 1);
-      fx(bus, 'created', id);
-      expect(app.proxy.pausedIds).toEqual([]);
-
-      fx(bus, 'intercepted', id, { intercept: 'paused' });
-      expect(app.proxy.pausedIds).toEqual([id]); // synchronous: the summary is applied, not fetched
-
-      fx(bus, 'released', id, { intercept: 'resumed' });
-      expect(app.proxy.pausedIds).toEqual([]);
-      expect(bus.count('flow.detail')).toBe(0);
-    });
   });
 
   it('a flush does nothing while the bus is not open', async () => {

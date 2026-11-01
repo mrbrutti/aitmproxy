@@ -5,7 +5,7 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Term | Means | Not |
 | --- | --- | --- |
 | Flow | One captured exchange: a request and its response, or a WebSocket connection | request, entry, transaction, row (the row *shows* a flow) |
-| Capture | The proxy recording flows; it can be paused and resumed | recording, logging |
+| Proxy | The listener (127.0.0.1:8080) recording flows; on, or paused by the toolbar's Proxy switch / Pause Proxy (⇧⌘R): traffic still passes, nothing new is recorded | capture (that is the extension), recording, logging |
 | Clear | Drop every flow from the session | reset, delete all |
 | Intercept | Parking every new request until the operator acts; armed or disarmed | breakpoint (that is a *rule*), hold |
 | Arm / Disarm | Turn intercept on / off (`i`) | enable, start |
@@ -34,7 +34,8 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Pin | Keep a host or app under Working (⇧P) | favourite, star, bookmark |
 | Working | The sidebar group for Pinned and Saved | session, favourites |
 | Saved session | A capture saved to disk and reopened later | project, archive, export |
-| Chip | One content-type quick filter in the bar under the toolbar | tag, pill, tab |
+| Chip | One protocol or content-type quick filter in the bar under the toolbar: All · HTTP HTTPS WebSocket · TCP UDP L4 · h1 h2 · types | tag, pill, tab |
+| L4 | A packet-level flow (TCP, UDP, ICMP, raw) from an L4 capture; the L4 chip keeps them all, TCP/UDP one transport | raw, packets, layer 4 |
 | Filter | A stacked set of field · operator · value rows, or its expression form | search, query |
 | Saved filter | A named filter | preset, bookmark |
 | Palette | The ⌘K command palette | launcher, spotlight, quick open |
@@ -55,6 +56,12 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | Approve Pending Request | Run the oldest gated agent command (⌥⏎) | accept, allow once |
 | Bus | The proxy's command bus the app talks to; connected, connecting or offline | server, backend, MCP server (in UI text) |
 | Listening | The proxy's client-facing address, shown in the toolbar pill | endpoint, port |
+| Connection cluster | The toolbar's pill plus the Proxy and Capture switches: the one place that shows core, bus and extension state and changes it; click the pill for Status | status strip, indicators, dots |
 | Column | A flow-list column; reorder, resize, hide from the header's context menu | field |
 | Sort | Order the list by a column; `#` ascending is capture order | arrange, group |
 | Apps / Domains | Sidebar groups: flows by client process / by host | clients, sources, hosts |
+| Status | The page that shows Core, Bus and Capture with their controls and what to do next (⌘0, or the toolbar pill) | dashboard, home, overview (that is the traffic page) |
+| Core | The aitm proxy process: embedded (the app runs it) or external (the operator runs it) | server, daemon, backend |
+| All Apps | System-wide capture through the macOS network extension: every Mac app's traffic, including apps that ignore proxy settings, and the source of the Apps page's per-app grouping; on, off, waiting for approval, or degraded. Toolbar switch, Status lane and Settings tab all say "All Apps"; "the extension" names the mechanism only where macOS does (approval, uninstall) | Capture, Extension, NE, sysext, transparent proxy (in UI text) |
+| Capture All Apps / Stop Capturing All Apps | The operator's switch for All Apps: the toolbar's All Apps switch, Settings ▸ All Apps, Proxy ▸ Capture All Apps (⌃⌘A), the Status card | enable, disable, turn on capture, pause (that is the proxy) |
+| Getting started | The Status page's live checklist: core, bus, extension, scope, first flow | onboarding, wizard, tour |

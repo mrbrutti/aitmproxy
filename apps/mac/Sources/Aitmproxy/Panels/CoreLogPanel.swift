@@ -40,7 +40,8 @@ struct CoreLogPanel: View {
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.vertical, Space.xs)
-                                    .padding(.horizontal, Space.md)
+                                    // Shares the PageHeader's leading edge.
+                                    .padding(.horizontal, Space.margin)
                                     .id(line.id)
                             }
                         }
@@ -65,14 +66,11 @@ struct CoreLogPanel: View {
 
     private var header: some View {
         PageHeader("Core Log") {
-            if let connection = state.connection {
-                HStack(spacing: Tok.Metric.gapTight) {
-                    Circle().fill(connection.health.dotColor.color)
-                        .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                    Text(connection.status.healthTitle)
-                        .font(Tok.Face.data(Tok.Typography.Size.sm))
-                        .foregroundStyle(Tok.Ink.secondary.color)
-                }
+            if state.connection != nil {
+                // The same word the Status page, pill and status bar use for the core.
+                LaneDot(lane: session.connectionSummary.core)
+                    .font(Tok.Face.data(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
             }
         }
     }
@@ -83,7 +81,7 @@ struct CoreLogPanel: View {
             .foregroundStyle(Tok.Status.serverError.color)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, Space.md)
+            .padding(.horizontal, Space.margin)
             .padding(.vertical, Space.sm)
     }
 

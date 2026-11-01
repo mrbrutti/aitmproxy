@@ -25,16 +25,12 @@ final class PocPanelState {
     /// The draft differs from the saved YAML of the selected finding.
     var isDirty: Bool { selectedFinding.map { $0.yaml != yamlDraft } ?? false }
 
-    /// Fixtures, or `findings.json` plus this session's runs; `poc.list` fills
-    /// the rest once F13 lands (the tool appears in `session.tools`).
+    /// `findings.json` plus this session's runs; `poc.list` fills the rest once
+    /// F13 lands (the tool appears in `session.tools`).
     func load() {
-        if Store.usesFixtures {
-            findings = Fixtures.findings
-        } else {
-            findings = (try? store.load()) ?? []
-            if session.tools.contains(where: { $0.name == "poc.list" }) {
-                Task { await refreshFromBus() }
-            }
+        findings = (try? store.load()) ?? []
+        if session.tools.contains(where: { $0.name == "poc.list" }) {
+            Task { await refreshFromBus() }
         }
         if selected == nil { select(findings.first?.id) }
         session.findingsCount = findings.count
@@ -75,7 +71,7 @@ final class PocPanelState {
             if let param, !param.isEmpty { args["param"] = .string(param) }
             let returned = try await session.runCommand("poc.build", args).stringValue ?? ""
             let row = session.rows.first { $0.id == flowID }
-            let (yaml, path) = resolveBuilt(returned, name: name, param: param)
+            let (yaml, path) = try resolveBuilt(returned, name: name)
             let info = PocYAML.info(in: yaml)
             let finding = Finding(
                 title: info["name"] ?? name,
@@ -90,7 +86,8 @@ final class PocPanelState {
         }
     }
 
-    /// `poc.run {poc_path, target, vars?}` → a new finding that selects itself.
+    /// `poc.run {poc_path, target, vars?}` → a new finding that selects itself. An
+    /// answer without a `passed` verdict records nothing: a result is never synthesized.
     func run(_ finding: Finding, target: String, vars: [String: String]) async {
         running = true
         defer { running = false }
@@ -98,8 +95,11 @@ final class PocPanelState {
             var args: [String: JSONValue] = ["poc_path": .string(finding.pocPath), "target": .string(target)]
             if !vars.isEmpty { args["vars"] = .object(vars.mapValues { .string($0) }) }
             let result = try await session.runCommand("poc.run", args)
-            let json = result.objectValue?["passed"] != nil ? result : syntheticResult(for: finding)
-            var new = Finding.fromRunResult(json, pocPath: finding.pocPath, target: target,
+            guard result.objectValue?["passed"] != nil else {
+                session.lastError = "poc.run returned no verdict (no passed field)"
+                return
+            }
+            var new = Finding.fromRunResult(result, pocPath: finding.pocPath, target: target,
                                             yaml: finding.id == selected ? yamlDraft : finding.yaml, origin: .human)
             new.screenshot = screenshotData(new.screenshotPath) ?? finding.screenshot
             insert(new)
@@ -109,14 +109,12 @@ final class PocPanelState {
         }
     }
 
-    /// Save the edited YAML back to the finding and, on the live bus, to its file.
+    /// Save the edited YAML back to the finding and to its file.
     func save() {
         guard let id = selected, let index = findings.firstIndex(where: { $0.id == id }) else { return }
         findings[index].yaml = yamlDraft
-        if !Store.usesFixtures {
-            do { try yamlDraft.write(toFile: findings[index].pocPath, atomically: true, encoding: .utf8) }
-            catch { session.lastError = "save PoC: \(error.localizedDescription)" }
-        }
+        do { try yamlDraft.write(toFile: findings[index].pocPath, atomically: true, encoding: .utf8) }
+        catch { session.lastError = "save PoC: \(error.localizedDescription)" }
         persist()
     }
 
@@ -139,11 +137,38 @@ final class PocPanelState {
         }
     }
 
+    /// Export… — ask for a folder, then write the selected finding's bundle into it
+    /// (S-051). Shared by the detail header and the row's context menu.
+    func exportViaPanel() {
+        guard selectedFinding != nil else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        panel.message = "Choose a folder for the YAML, screenshot and HAR"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        exportBundle(to: url)
+    }
+
     /// Open the finding capture in the inspector: select the flow, switch to Apps.
     func openCapture() {
         guard let id = selectedFinding?.captureID else { return }
         session.select(id)
         session.show(.apps)
+    }
+
+    /// Copy the finding's target URL to the clipboard.
+    func copyTarget(_ finding: Finding) {
+        Pasteboard.copy(finding.target, sensitive: true)
+    }
+
+    /// Move the selection up or down one row (arrow keys on the list).
+    func moveSelection(by offset: Int) {
+        guard !findings.isEmpty else { return }
+        let index = findings.firstIndex { $0.id == selected } ?? (offset > 0 ? -1 : findings.count)
+        let next = min(max(index + offset, 0), findings.count - 1)
+        select(findings[next].id)
     }
 
     // MARK: Helpers
@@ -156,30 +181,38 @@ final class PocPanelState {
         persist()
     }
 
-    private func persist() { if !Store.usesFixtures { try? store.save(findings) } }
+    private func persist() { try? store.save(findings) }
+
+    /// Why a `poc.build` answer could not be turned into a finding. The app's own
+    /// judgement, not something the core reported, so not a `BusError`.
+    private enum PocBuildError: LocalizedError {
+        case unreadable(String)
+        case noYAMLOrPath
+        var errorDescription: String? {
+            switch self {
+            case .unreadable(let path): "could not read \(path)"
+            case .noYAMLOrPath: "poc.build returned neither YAML nor a path"
+            }
+        }
+    }
 
     /// `poc.build` returns YAML text or a path, depending on the build. Derive
-    /// both so the panel always has something to show and save.
-    private func resolveBuilt(_ returned: String, name: String, param: String?) -> (yaml: String, path: String) {
+    /// both from what the core returned and never synthesize YAML: a path that
+    /// cannot be read, or an answer that is neither YAML nor a path, throws a
+    /// `PocBuildError`; the caller's `catch` shows it in the status bar
+    /// (`build PoC: …`) and inserts no finding.
+    private func resolveBuilt(_ returned: String, name: String) throws -> (yaml: String, path: String) {
         let slug = Finding(title: name, severity: .medium, target: "", passed: false, ranAt: Date(), origin: .human, pocPath: "", yaml: "").slug
         if returned.contains("\n"), returned.contains("id:") {
             return (returned, "\(Store.url.path)/pocs/\(slug).poc.yaml")
         }
         if returned.hasSuffix(".yaml") || returned.hasSuffix(".yml") {
-            let yaml = (try? String(contentsOfFile: returned, encoding: .utf8)) ?? Fixtures.pocYAML(name: name, param: param ?? "q")
+            guard let yaml = try? String(contentsOfFile: returned, encoding: .utf8) else {
+                throw PocBuildError.unreadable(returned)
+            }
             return (yaml, returned)
         }
-        return (Fixtures.pocYAML(name: name, param: param ?? "q"), "\(Store.url.path)/pocs/\(slug).poc.yaml")
-    }
-
-    private func syntheticResult(for finding: Finding) -> JSONValue {
-        .object([
-            "passed": .bool(true),
-            "finding_capture": finding.captureID.map { .string($0.raw) } ?? .null,
-            "poc_path": .string(finding.pocPath),
-            "screenshot_path": .string(finding.screenshotPath ?? ""),
-            "evaluated": .array(finding.assertions.map { .object(["assertion": .string($0.text), "matched": .bool(true)]) }),
-        ])
+        throw PocBuildError.noYAMLOrPath
     }
 
     private func loadScreenshot(for id: Finding.ID?) {
@@ -211,6 +244,9 @@ extension Severity {
 /// PoC runs on the left, the selected finding's detail on the right.
 struct FindingsPanel: View {
     @Bindable var state: PocPanelState
+    @FocusState private var listFocused: Bool
+    /// The row whose Run Again… popover is open (from its context menu).
+    @State private var runAgainID: Finding.ID?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -244,11 +280,56 @@ struct FindingsPanel: View {
                     ForEach(state.findings) { finding in
                         FindingRow(finding: finding, selected: finding.id == state.selected)
                             .contentShape(Rectangle())
-                            .onTapGesture { state.select(finding.id) }
+                            .onTapGesture {
+                                state.select(finding.id)
+                                listFocused = true
+                            }
+                            .contextMenu { rowMenu(finding) }
+                            .popover(isPresented: runAgainBinding(finding.id), arrowEdge: .trailing) {
+                                RunAgainPopover(state: state, finding: finding, isPresented: runAgainBinding(finding.id))
+                            }
                     }
                 }
             }
+            // Arrow keys walk the selection once the list has focus (rule 33, as Scope does).
+            .focusable()
+            .focused($listFocused)
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                switch direction {
+                case .up: state.moveSelection(by: -1)
+                case .down: state.moveSelection(by: 1)
+                default: break
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Findings")
         }
+    }
+
+    /// The row's verbs — the same four actions as the detail header, acting on
+    /// this row (selecting it first, since the state's intents act on the selection).
+    @ViewBuilder private func rowMenu(_ finding: Finding) -> some View {
+        Button("Open Capture") {
+            state.select(finding.id)
+            state.openCapture()
+        }
+        .disabled(finding.captureID == nil)
+        Button("Run Again…") {
+            state.select(finding.id)
+            runAgainID = finding.id
+        }
+        Button("Export…") {
+            state.select(finding.id)
+            state.exportViaPanel()
+        }
+        Divider()
+        Button("Copy Target URL") { state.copyTarget(finding) }
+            .disabled(finding.target.isEmpty)
+    }
+
+    private func runAgainBinding(_ id: Finding.ID) -> Binding<Bool> {
+        Binding(get: { runAgainID == id }, set: { if !$0, runAgainID == id { runAgainID = nil } })
     }
 }
 

@@ -8,10 +8,10 @@
 
 import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
-import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
+import type { BusClient, AgentNotification, CAStatusWire, FlowEventKind, FlowNotification, PocRun, StateNotification, ToolDef } from '~/bus/types';
 import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
 import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
-import type { PocRun } from '~/bus/mock';
+import { parseCATrust, type CATrustStatus } from './caTrust';
 import {
   contentFamily,
   type ContentFamily,
@@ -118,7 +118,7 @@ interface ProxyState {
   findings: PocRun[];
   activity: ActivityEntry[];
   tools: ToolDef[];
-  /** True while the poll loop is the live source (no push notifications arriving); false on push or on the static fixtures bus. */
+  /** True while the poll loop is the live source (no push notifications arriving); false while push notifications are fresh. */
   polling: boolean;
   /** The core's version, from `proxy.status`; empty until it answers (never a made-up number). */
   version: string;
@@ -240,6 +240,11 @@ export function createAppStore(bus: BusClient) {
     });
     let activitySeq = 0;
 
+    // CA trust (§D17.12): the last `ca.status` reading, and whether a `ca.install` / `ca.uninstall`
+    // run is in flight. The word always comes from the read-back, never from the install's reply.
+    const [caStatus, setCaStatus] = createSignal<CATrustStatus | null>(null);
+    const [caInstalling, setCAInstalling] = createSignal(false);
+
     const [toast, setToast] = createSignal<{ text: string; kind: 'error' | 'info' } | null>(null);
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
     const notice = (text: string, kind: 'error' | 'info' = 'info') => {
@@ -302,28 +307,12 @@ export function createAppStore(bus: BusClient) {
       if (untrack(selectedId) === id) void loadDetail(id, true);
     }
 
-    function onFlowEvent(n: FlowNotification) {
-      if (bus.address !== 'fixtures') {
-        onFlowTrigger(n);
-        return;
-      }
-      // The fixtures bus pushes complete, correctly-spelled summaries, and the dev UI and the perf
-      // harness rely on them landing synchronously: apply the summary directly.
-      if (n.event === 'cleared') {
-        clearFlows();
-        return;
-      }
-      if (!n.summary) return;
-      const s = toSummary(n.summary, entries.length + 1);
-      upsert(s);
-      if (changesDetail(n.event)) invalidateDetail(s.id);
-      if (changesPause(n.event)) recomputePaused();
-    }
-
     /**
-     * A real bus: the push is a trigger, never data. The server's summary is sparse (`kind:"ws"`,
-     * no times, no sizes) and would regress a rich row, so it is ignored; the id is queued and the
-     * coalescer refetches it through the same helper the poll uses.
+     * A real bus: the push is a trigger, never data. The server's summary is the full `flow.get`
+     * object (same keys, `kind:"websocket"`), but it is still not applied: refetching by id keeps
+     * one fetch path for push and poll, a deliberate choice rather than a workaround for a sparse
+     * summary (applying it is follow-up F4). The id is queued and the coalescer refetches it
+     * through the same helper the poll uses.
      */
     function onFlowTrigger(n: FlowNotification) {
       if (n.event === 'cleared') {
@@ -469,7 +458,7 @@ export function createAppStore(bus: BusClient) {
           // Validated before the clock moves: a malformed line proves nothing about the stream.
           if (!isFlowNotification(params)) break;
           lastFlowPushAt = Date.now();
-          onFlowEvent(params);
+          onFlowTrigger(params);
           break;
         case 'notifications/aitm/state':
           if ((params as { lagged?: unknown } | null | undefined)?.lagged === true) {
@@ -495,17 +484,17 @@ export function createAppStore(bus: BusClient) {
     // ---- live updates: push as a trigger, poll unless push is demonstrably flowing -------------
     // The bus client subscribes (`flow.subscribe`, in ws.ts) on every open, and a flow notification
     // is treated as a trigger: the id is queued and refetched (`onFlowTrigger`, `flushPush`), never
-    // applied from the push's sparse summary. The outcome of the subscribe is not surfaced, and a
-    // confirmed subscription cannot be told from a dispatcher that is not fed until a push arrives, so
-    // every real bus is still polled. The loop skips the flow poll only while a FLOW notification
-    // arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a bridge that
-    // pushes just throughput ticks must not slow the list down). Even then a heartbeat runs every
-    // PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. When the bus
-    // (re)opens both clocks are reset and the pending set dropped, so the first tick after an outage
-    // takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight with
-    // the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus that is
-    // reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
-    // catalogue. The static `fixtures` bus is a snapshot and is never polled.
+    // applied from the push's summary (`onFlowTrigger` says why). The outcome of the subscribe is not
+    // surfaced, and a confirmed subscription cannot be told from a dispatcher that is not fed until a
+    // push arrives, so every real bus is still polled. The loop skips the flow poll only while a FLOW
+    // notification arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a
+    // bridge that pushes just throughput ticks must not slow the list down). Even then a heartbeat
+    // runs every PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. When
+    // the bus (re)opens both clocks are reset and the pending set dropped, so the first tick after an
+    // outage takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight
+    // with the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus
+    // that is reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
+    // catalogue.
     const POLL_MS = 500;
     const STATUS_EVERY_MS = 2000; // while the state stream is not pushing
     const PUSH_FRESH_MS = 10_000;
@@ -843,7 +832,7 @@ export function createAppStore(bus: BusClient) {
         jobs.push(
           bus
             .call<unknown>('scope.list')
-            // The bus returns an array of host strings; fixtures add rate-limit/back-off objects.
+            // The bus returns an array of host strings; an object entry with `host` is also accepted.
             .then((s) => setProxy('scope', Array.isArray(s) ? s.map((e) => (typeof e === 'string' ? { host: e } : (e as ProxyState['scope'][number]))) : []))
             .catch(() => {}),
         );
@@ -907,12 +896,29 @@ export function createAppStore(bus: BusClient) {
       await Promise.all(jobs);
     }
 
+    /**
+     * Re-read `ca.status` into `ca` (D17.5); true when the read-back landed. A missing tool leaves
+     * the reading untouched and a failed read keeps the last one, both false, so the caller that
+     * just changed the trust store can say the word may be stale. Each read costs the core one
+     * trust evaluation per store, so it runs only at bootstrap and after a `ca.install` /
+     * `ca.uninstall` run, not on every side refresh.
+     */
+    async function refreshCA(): Promise<boolean> {
+      if (!proxy.tools.some((t) => t.name === 'ca.status')) return false;
+      try {
+        setCaStatus(parseCATrust(await bus.call<CAStatusWire>('ca.status')));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     /** The tool catalogue, then everything read through it. Shared by bootstrap and the loop's heal. */
     async function loadCatalogue() {
       const tools = await bus.tools();
       setProxy('tools', tools);
       toolsLoaded = true;
-      await refreshSide();
+      await Promise.all([refreshSide(), refreshCA()]);
     }
 
     async function bootstrap() {
@@ -925,7 +931,7 @@ export function createAppStore(bus: BusClient) {
       }
       // Outside the try on purpose: a failed bootstrap (tools/list rejected, say) must not leave the
       // list frozen. The loop keeps trying every tick, and `flow.list` needs no catalogue.
-      if (bus.address !== 'fixtures') startPolling();
+      startPolling();
     }
     void bootstrap();
 
@@ -1459,6 +1465,9 @@ export function createAppStore(bus: BusClient) {
       scanDiscover: (args: Record<string, unknown>) => guarded('scan', () => bus.call<unknown>('scan.discover', args)),
       ensurePocSource,
       refreshSide,
+      refreshCA,
+      /** Set by the palette for the duration of a `ca.install` / `ca.uninstall` run and its re-read. */
+      setCAInstalling: (on: boolean) => setCAInstalling(on),
       /** The lifted L4 store calls this on each refresh so selection/list routing knows L4 ids. */
       setL4Ids: (ids: readonly FlowId[]) => setL4IdsSig(new Set<FlowId>(ids)),
       call: <T,>(tool: string, args?: Record<string, unknown>) => bus.call<T>(tool, args),
@@ -1486,6 +1495,13 @@ export function createAppStore(bus: BusClient) {
       oldestPaused,
       details,
       toast,
+      /** The last `ca.status` reading; null before the first read, without the tool, or when no store reports. */
+      get ca(): CATrustStatus | null {
+        return caStatus();
+      },
+      get caInstalling(): boolean {
+        return caInstalling();
+      },
       ...actions,
     };
   });

@@ -1829,6 +1829,78 @@ fn subscribe_on_an_open_sink_still_works() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
+/// SA-AC2 (spec D4): a `notifications/aitm/flow` line's `params.summary`
+/// mirrors `source_app` and `capture_interface` from the stored flow's
+/// `FlowMeta` — the provider's identifier and the backend name on a captured
+/// flow, `null` (key present, never absent) on a proxied flow — on both the
+/// HTTP and the WebSocket arm of `flow_summary`.
+#[test]
+fn pushed_summary_mirrors_source_app_and_capture_interface() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    assert_subscribed(&subscribe_on(&srv, &conn, json!({})));
+
+    // Push `event` and return the one `summary` object the sink received.
+    let pushed_summary = |event: Event| -> JsonValue {
+        srv.push_flow_event(&event);
+        let lines = sink.drain();
+        assert_eq!(lines.len(), 1, "exactly one line was pushed: {lines:?}");
+        let note: JsonValue = serde_json::from_str(&lines[0]).expect("the push is JSON");
+        assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+        note["params"]["summary"].clone()
+    };
+    let attributed = |mut flow: Flow| -> Flow {
+        flow.metadata_mut().source_app = Some("com.apple.Safari".into());
+        flow.metadata_mut().capture_interface = Some("macos-ne".into());
+        flow
+    };
+
+    // A captured HTTP flow: the identifier and the backend name, verbatim.
+    let cap_id = store.insert(attributed(http_flow("example.com:443", "/cap")));
+    let summary = pushed_summary(Event::RequestHeaders(cap_id));
+    assert_eq!(summary["id"], cap_id.to_string(), "{summary}");
+    assert_eq!(summary["source_app"], "com.apple.Safari", "{summary}");
+    assert_eq!(summary["capture_interface"], "macos-ne", "{summary}");
+
+    // A proxied HTTP flow: both keys present and null, never absent.
+    let proxied_id = store.insert(http_flow("example.com:443", "/proxied"));
+    let summary = pushed_summary(Event::RequestHeaders(proxied_id));
+    assert_eq!(summary["id"], proxied_id.to_string(), "{summary}");
+    assert_eq!(
+        summary.get("source_app"),
+        Some(&JsonValue::Null),
+        "{summary}"
+    );
+    assert_eq!(
+        summary.get("capture_interface"),
+        Some(&JsonValue::Null),
+        "{summary}"
+    );
+
+    // The WebSocket arm mirrors the same two fields.
+    let ws_id = store.insert(attributed(Flow::WebSocket(WsFlow {
+        id: aitm_core::FlowId::new(),
+        handshake: cap_id,
+        messages: vec![],
+        client_conn: ConnInfo {
+            peer: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta::default(),
+        intercept: InterceptState::Observed,
+    })));
+    let summary = pushed_summary(Event::WsStart(ws_id));
+    assert_eq!(summary["kind"], "websocket", "{summary}");
+    assert_eq!(summary["source_app"], "com.apple.Safari", "{summary}");
+    assert_eq!(summary["capture_interface"], "macos-ne", "{summary}");
+}
+
 /// `tools/call flow.unsubscribe {sub_id}` on `conn`, parsed.
 fn unsubscribe_on(srv: &McpServer, conn: &ConnCtx, sub_id: u64) -> JsonValue {
     let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
@@ -8255,5 +8327,509 @@ fn a_visible_agent_line_gaps_a_paused_agent_a_hidden_one_does_not_and_trusted_co
         rv_drain_with_origin(&agent.sink),
         ["agent mcp agent.status"],
         "no marker: the only line suppressed was one the agent may not see"
+    );
+}
+
+// ------------------------------------------------ flow finish and timing, Task 5: push mirrors flow.get
+
+use aitm_core::{
+    FlowError, HttpResponse, StreamBody, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow,
+    WsMessage, WsOpcode,
+};
+use aitm_plugins::CapturePlugin;
+use std::time::UNIX_EPOCH;
+
+/// `flow.get` for `id`, computed by the real `CapturePlugin` through a `Registry`
+/// over `store`, rendered the way the MCP tool path renders it (`to_json`). The
+/// value the push summary is locked to.
+fn capture_flow_get(store: &MemFlowStore, id: aitm_core::FlowId) -> JsonValue {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let client = StubClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(store, &client, &guard, None);
+    let mut args = BTreeMap::new();
+    args.insert("id".to_string(), Value::Str(id.to_string()));
+    let got = reg
+        .command("flow.get")
+        .expect("flow.get is registered by the capture plugin")
+        .invoke(Params::new(args), &host)
+        .expect("flow.get ok");
+    to_json(&got)
+}
+
+/// Subscribe with `{}` on an open push connection and check the reply.
+async fn subscribe_all(w: &mut WriteHalf<DuplexStream>, lines: &mut ClientReader) {
+    write_req(
+        w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let reply = next_json(lines).await;
+    assert_eq!(reply["id"], 1);
+    assert_subscribed(&reply);
+}
+
+/// Spec AC12: the `summary` of a `notifications/aitm/flow` line is field for
+/// field the `flow.get` object, for an HTTP flow with every field populated and
+/// for a WebSocket flow. `flow_summary` is a hand-written mirror of `summarize`
+/// (aitm-mcp must not depend on aitm-plugins); this is the lock that fails on any
+/// drift on either side. The literal `started_at`/`duration_ms`/`kind` checks on
+/// the expected side keep the comparison from passing on two empty objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
+    let created = UNIX_EPOCH + Duration::from_millis(1_761_908_698_120);
+    let store = Arc::new(MemFlowStore::new());
+
+    let mut http = http_flow("example.com:443", "/mirror?q=1");
+    let Flow::Http(f) = &mut http else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.body = Body::Bytes(vec![b'x'; 412]);
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Bytes(vec![0u8; 2048]),
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(412));
+    f.metadata.is_replay = true;
+    let http_id = store.insert(http);
+
+    let message = |dir: WsDir| WsMessage {
+        dir,
+        opcode: WsOpcode::Text,
+        data: b"hi".to_vec(),
+        timestamp: SystemTime::now(),
+        injected: false,
+    };
+    let ws_id = store.insert(Flow::WebSocket(WsFlow {
+        id: aitm_core::FlowId::new(),
+        handshake: http_id,
+        messages: vec![
+            message(WsDir::ClientToServer),
+            message(WsDir::ServerToClient),
+        ],
+        client_conn: ConnInfo {
+            peer: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta {
+            created,
+            ..FlowMeta::default()
+        },
+        intercept: InterceptState::Observed,
+    }));
+
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    subscribe_all(&mut w, &mut lines).await;
+
+    // HTTP: the expected side is the real flow.get, with its values pinned.
+    let expected_http = capture_flow_get(&store, http_id);
+    assert_eq!(expected_http["kind"], "http");
+    assert_eq!(expected_http["started_at"], json!(1_761_908_698_120_i64));
+    assert_eq!(expected_http["duration_ms"], json!(412));
+    assert_eq!(expected_http["request_bytes"], json!(412));
+    assert_eq!(expected_http["response_bytes"], json!(2048));
+    assert_eq!(expected_http["is_replay"], json!(true));
+    // Spec D7: the tunnel keys are present (null) on an ordinary request, and
+    // `passive` is a literal false. `.get` distinguishes "absent" from "null".
+    let http_obj = expected_http.as_object().expect("flow.get is an object");
+    for key in ["tunnel", "tunnel_reason", "bytes_up", "bytes_down"] {
+        assert_eq!(
+            http_obj.get(key),
+            Some(&JsonValue::Null),
+            "`{key}` is present and null on an ordinary request: {expected_http}"
+        );
+    }
+    assert_eq!(http_obj.get("passive"), Some(&json!(false)));
+    srv.push_flow_event(&Event::RequestHeaders(http_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["id"], http_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_http,
+        "the HTTP push summary is the flow.get object, field for field"
+    );
+
+    // WebSocket: kind is spelled `websocket` (not the old `ws`), duration is null.
+    let expected_ws = capture_flow_get(&store, ws_id);
+    assert_eq!(expected_ws["kind"], "websocket");
+    assert_eq!(expected_ws["started_at"], json!(1_761_908_698_120_i64));
+    assert_eq!(expected_ws["duration_ms"], JsonValue::Null);
+    assert_eq!(expected_ws["messages"], json!(2));
+    assert_eq!(expected_ws["handshake"], http_id.to_string());
+    srv.push_flow_event(&Event::WsStart(ws_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], ws_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_ws,
+        "the WebSocket push summary is the flow.get object, field for field"
+    );
+    let ws_obj = expected_ws.as_object().expect("flow.get is an object");
+    for key in ["tunnel", "tunnel_reason", "bytes_up", "bytes_down"] {
+        assert_eq!(
+            ws_obj.get(key),
+            Some(&JsonValue::Null),
+            "`{key}` is present and null on a WebSocket flow: {expected_ws}"
+        );
+    }
+    assert_eq!(ws_obj.get("passive"), Some(&json!(false)));
+
+    // Per-host decryption, spec D7 / AC11: a passthrough row (closed, with byte
+    // counts), a failed row (no response), a decrypted row and a passive
+    // cleartext flow carry `tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down`
+    // and `passive` on both sides with the literal wire codes.
+    let mut passthrough = http_flow_with_method("origin.test:443", "", "CONNECT");
+    let Flow::Http(f) = &mut passthrough else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.scheme = "https".into();
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(1500));
+    f.metadata.tunnel = Some(TunnelInfo {
+        mode: TunnelMode::Passthrough,
+        reason: Some(TunnelReason::OutOfScope),
+        bytes_up: Some(10),
+        bytes_down: Some(20),
+    });
+    let passthrough_id = store.insert(passthrough);
+    let expected_passthrough = capture_flow_get(&store, passthrough_id);
+    assert_eq!(expected_passthrough["method"], "CONNECT");
+    assert_eq!(expected_passthrough["status"], json!(200));
+    assert_eq!(expected_passthrough["duration_ms"], json!(1500));
+    assert_eq!(expected_passthrough["tunnel"], json!("passthrough"));
+    assert_eq!(expected_passthrough["tunnel_reason"], json!("out_of_scope"));
+    assert_eq!(expected_passthrough["bytes_up"], json!(10));
+    assert_eq!(expected_passthrough["bytes_down"], json!(20));
+    assert_eq!(expected_passthrough["passive"], json!(false));
+    srv.push_flow_event(&Event::Response(passthrough_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], passthrough_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_passthrough,
+        "the passthrough push summary is the flow.get object, field for field"
+    );
+
+    let mut failed = http_flow_with_method("pinned.test:443", "", "CONNECT");
+    let Flow::Http(f) = &mut failed else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.scheme = "https".into();
+    f.response = None;
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(37));
+    f.metadata.tunnel = Some(TunnelInfo::failed(TunnelReason::ClientRejectedCertificate));
+    let failed_id = store.insert(failed);
+    let expected_failed = capture_flow_get(&store, failed_id);
+    let failed_obj = expected_failed.as_object().expect("flow.get is an object");
+    assert_eq!(expected_failed["tunnel"], json!("failed"));
+    assert_eq!(
+        expected_failed["tunnel_reason"],
+        json!("client_rejected_certificate")
+    );
+    assert_eq!(failed_obj.get("status"), Some(&JsonValue::Null));
+    assert_eq!(failed_obj.get("bytes_up"), Some(&JsonValue::Null));
+    assert_eq!(failed_obj.get("bytes_down"), Some(&JsonValue::Null));
+    assert_eq!(expected_failed["duration_ms"], json!(37));
+    assert_eq!(expected_failed["passive"], json!(false));
+    srv.push_flow_event(&Event::Response(failed_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], failed_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_failed,
+        "the failed-tunnel push summary is the flow.get object, field for field"
+    );
+
+    // A decrypted row (panel P4; AC11 names all five kinds): the `200` ack, a
+    // duration once closed, `tunnel == "decrypted"`, and null `tunnel_reason`,
+    // `bytes_up`, `bytes_down` (its inner requests are their own rows).
+    let mut decrypted = http_flow_with_method("secure.test:443", "", "CONNECT");
+    let Flow::Http(f) = &mut decrypted else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.scheme = "https".into();
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(900));
+    f.metadata.tunnel = Some(TunnelInfo::decrypted());
+    let decrypted_id = store.insert(decrypted);
+    let expected_decrypted = capture_flow_get(&store, decrypted_id);
+    let decrypted_obj = expected_decrypted
+        .as_object()
+        .expect("flow.get is an object");
+    assert_eq!(expected_decrypted["method"], "CONNECT");
+    assert_eq!(expected_decrypted["authority"], "secure.test:443");
+    assert_eq!(expected_decrypted["status"], json!(200));
+    assert_eq!(expected_decrypted["duration_ms"], json!(900));
+    assert_eq!(expected_decrypted["tunnel"], json!("decrypted"));
+    assert_eq!(decrypted_obj.get("tunnel_reason"), Some(&JsonValue::Null));
+    assert_eq!(decrypted_obj.get("bytes_up"), Some(&JsonValue::Null));
+    assert_eq!(decrypted_obj.get("bytes_down"), Some(&JsonValue::Null));
+    assert_eq!(decrypted_obj.get("passive"), Some(&json!(false)));
+    srv.push_flow_event(&Event::Response(decrypted_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], decrypted_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_decrypted,
+        "the decrypted-tunnel push summary is the flow.get object, field for field"
+    );
+    assert_eq!(note["params"]["summary"]["tunnel"], json!("decrypted"));
+    assert_eq!(note["params"]["summary"]["tunnel_reason"], JsonValue::Null);
+    assert_eq!(note["params"]["summary"]["bytes_up"], JsonValue::Null);
+    assert_eq!(note["params"]["summary"]["bytes_down"], JsonValue::Null);
+    assert_eq!(note["params"]["summary"]["passive"], json!(false));
+
+    let mut passive = http_flow("plain.test", "/p");
+    passive.metadata_mut().created = created;
+    passive.metadata_mut().passive = true;
+    let passive_id = store.insert(passive);
+    let expected_passive = capture_flow_get(&store, passive_id);
+    let passive_obj = expected_passive.as_object().expect("flow.get is an object");
+    assert_eq!(expected_passive["passive"], json!(true));
+    assert_eq!(passive_obj.get("tunnel"), Some(&JsonValue::Null));
+    assert_eq!(passive_obj.get("tunnel_reason"), Some(&JsonValue::Null));
+    srv.push_flow_event(&Event::RequestHeaders(passive_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], passive_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_passive,
+        "the passive-flow push summary is the flow.get object, field for field"
+    );
+
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// Spec AC13: a response the upstream abandoned mid-body is finalised in the
+/// store (`FlowStore::abandon_response`) before the error event about it is
+/// dispatched, so the `killed` push built from the store carries the concrete
+/// `response_bytes`, the status, and a duration instead of nulls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_on_error_carries_the_abandoned_response_sizes() {
+    let store = Arc::new(MemFlowStore::new());
+    let mut flow = http_flow("example.com:443", "/stream");
+    let Flow::Http(f) = &mut flow else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Streamed(StreamBody),
+        timestamp: SystemTime::now(),
+    });
+    let id = store.insert(flow);
+
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    subscribe_all(&mut w, &mut lines).await;
+
+    assert!(
+        store.abandon_response(id, vec![1, 2, 3]),
+        "a streamed response is finalised"
+    );
+    srv.push_flow_event(&Event::Error {
+        flow: id,
+        kind: FlowError::Upstream("x".into()),
+    });
+
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["event"], "killed", "{note}");
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
+    let summary = &note["params"]["summary"];
+    assert_eq!(summary["response_bytes"], json!(3), "{summary}");
+    assert_eq!(summary["status"], json!(200), "{summary}");
+    assert!(
+        summary["duration_ms"].is_i64(),
+        "duration_ms is an integer once the response is abandoned: {summary}"
+    );
+
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// Tester addition. AC12's lock on the paths the fully-populated fixtures never
+/// reach: the null rules (no response: null `status`, `response_bytes` and
+/// `duration_ms`; a body still streaming: null `response_bytes`; a clock before
+/// the epoch: null `started_at`), a non-`observed` intercept label, and
+/// saturation (a duration past `i64::MAX` ms). Each pushed summary must equal
+/// the real `flow.get` object; the literal checks on the expected side keep the
+/// comparison from passing on two objects that both got a rule wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_summary_equals_flow_get_on_the_null_and_saturated_paths() {
+    let store = Arc::new(MemFlowStore::new());
+
+    // (a) No response yet: observed, not a replay, nothing timed.
+    let pending_id = store.insert(http_flow("example.com:443", "/pending"));
+
+    // (b) The head is stored but the body still streams; created before the epoch.
+    let mut streaming = http_flow("example.com:443", "/streaming");
+    let Flow::Http(f) = &mut streaming else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.response = Some(HttpResponse {
+        status: 206,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Streamed(StreamBody),
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = UNIX_EPOCH - Duration::from_secs(1);
+    let streaming_id = store.insert(streaming);
+
+    // (c) A killed flow whose duration does not fit an i64 of milliseconds.
+    let mut absurd = http_flow("example.com:443", "/absurd");
+    let Flow::Http(f) = &mut absurd else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.response = Some(HttpResponse {
+        status: 500,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.duration = Some(Duration::MAX);
+    f.intercept = InterceptState::Killed;
+    let absurd_id = store.insert(absurd);
+
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    subscribe_all(&mut w, &mut lines).await;
+
+    // (a)
+    let expected = capture_flow_get(&store, pending_id);
+    assert_eq!(expected.get("status"), Some(&JsonValue::Null), "{expected}");
+    assert_eq!(
+        expected.get("response_bytes"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    assert_eq!(
+        expected.get("duration_ms"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    assert_eq!(expected["request_bytes"], json!(0));
+    assert_eq!(expected["intercept"], "observed");
+    assert_eq!(expected["is_replay"], json!(false));
+    assert!(expected["started_at"].is_i64(), "{expected}");
+    srv.push_flow_event(&Event::RequestHeaders(pending_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], pending_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected,
+        "no response: null status, null response_bytes, null duration_ms"
+    );
+
+    // (b)
+    let expected = capture_flow_get(&store, streaming_id);
+    assert_eq!(expected["status"], json!(206));
+    assert_eq!(
+        expected.get("response_bytes"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    assert_eq!(
+        expected.get("started_at"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    srv.push_flow_event(&Event::ResponseHeaders(streaming_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], streaming_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected,
+        "a streaming body is a null size; a pre-epoch clock is a null started_at"
+    );
+
+    // (c)
+    let expected = capture_flow_get(&store, absurd_id);
+    assert_eq!(expected["duration_ms"], json!(i64::MAX), "{expected}");
+    assert_eq!(expected["intercept"], "killed");
+    assert_eq!(expected["response_bytes"], json!(0));
+    assert_eq!(expected["status"], json!(500));
+    srv.push_flow_event(&Event::Response(absurd_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], absurd_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected,
+        "a saturated duration and a killed label render the same on both sides"
+    );
+
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// Tester addition (whole-branch stage 5, SA-AC2 edge). The push is line-delimited
+/// JSON and `source_app` is text a capture backend supplied about a client. A
+/// value carrying CR/LF, a quote, a NUL and non-ASCII must still arrive as exactly
+/// one line that parses back to the identical string — never a second line (which
+/// a reader would take for another notification), never a truncated or altered one.
+#[test]
+fn pushed_summary_keeps_a_hostile_source_app_on_one_line() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    assert_subscribed(&subscribe_on(&srv, &conn, json!({})));
+
+    let hostile = format!("com.evil.\"q\"\r\n\u{0}日本語.{}", "x".repeat(4096));
+    let mut flow = http_flow("example.com:443", "/hostile");
+    flow.metadata_mut().source_app = Some(hostile.clone());
+    flow.metadata_mut().capture_interface = Some("macos-ne\n".into());
+    let id = store.insert(flow);
+
+    srv.push_flow_event(&Event::RequestHeaders(id));
+    let lines = sink.drain();
+    assert_eq!(lines.len(), 1, "exactly one line was pushed: {lines:?}");
+    let line = lines[0].trim_end_matches(['\r', '\n']);
+    assert!(
+        !line.contains('\n') && !line.contains('\r'),
+        "the line carries no raw line break: {line:?}"
+    );
+    let note: JsonValue = serde_json::from_str(line).expect("the push is JSON");
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"]["source_app"],
+        JsonValue::String(hostile),
+        "{note}"
+    );
+    assert_eq!(
+        note["params"]["summary"]["capture_interface"], "macos-ne\n",
+        "{note}"
     );
 }

@@ -4,7 +4,8 @@
 Discovers suites under tests/e2e/<surface>/ and runs each as a subprocess,
 classifying by EXIT CODE: 0 = PASS, 77 = SKIP, anything else = FAIL. Exits
 non-zero iff a required (non-skipped) suite FAILs. SKIPs are LOUD (reason + why)
-and never read as green.
+and never read as green. After a run that includes the `scan` surface it prints the
+per-verb scan ledger (which cells called each scan.* verb, at which role).
 
 A suite is any file named test_*.py (run with python3) or *.sh (run with bash)
 under a surface directory. A suite may tag itself in its first ~20 lines:
@@ -30,9 +31,12 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -112,8 +116,8 @@ def _repo_root() -> str:
 
 def preflight(build: bool) -> None:
     """Ensure the binaries the suites need exist. `aitm` is required by every
-    suite; `aitm-testtarget-serve` only by ca/poc/findings/scripting, so a miss
-    there is a loud warning, not a hard stop. `--build` builds both first."""
+    suite; `aitm-testtarget-serve` only by ca/poc/findings/scripting/scan, so a
+    miss there is a loud warning, not a hard stop. `--build` builds both first."""
     repo = _repo_root()
     aitm = os.environ.get("AITM_BIN") or os.path.join(repo, "target", "debug", "aitm")
     tgt = (os.environ.get("AITM_TESTTARGET_BIN")
@@ -130,7 +134,7 @@ def preflight(build: bool) -> None:
         sys.exit(1)
     if not os.path.exists(tgt):
         print(f"WARNING: aitm-testtarget-serve missing: {tgt}\n"
-              "  ca/poc/findings/scripting will FAIL without it — "
+              "  ca/poc/findings/scripting/scan will FAIL without it — "
               "build: cargo build -p aitm-testtarget  (or --build, or set AITM_TESTTARGET_BIN)",
               flush=True)
 
@@ -220,6 +224,8 @@ def main() -> int:
     child_env["PYTHONPATH"] = E2E_DIR + os.pathsep + child_env.get("PYTHONPATH", "")
     if manual:
         child_env["AITM_E2E_MANUAL"] = "1"
+    ledger_dir = tempfile.mkdtemp(prefix="aitm-e2e-ledger-")
+    child_env["AITM_E2E_LEDGER_DIR"] = ledger_dir
 
     shared = _boot_shared_core(child_env) if shared_core else None
     nfail = 0
@@ -266,10 +272,72 @@ def main() -> int:
                 print(f"  FAIL {label} ({why})")
             elif kind == "skip":
                 print(f"  skip {label} ({why})")
+        if any(s["surface"] == "scan" for s in to_run):
+            print_ledger(ledger_dir)
     finally:
         if shared:
             shared.stop()
+        shutil.rmtree(ledger_dir, ignore_errors=True)
     return 1 if nfail else 0
+
+
+def print_ledger(ledger_dir: str) -> None:
+    """The per-verb scan ledger (T10 spec D7 / parent Verification "Ledger"): one
+    line per `scan.*` verb of the EXPECTED_TOOLS contract naming the cells that
+    called it and at which role, `UNCALLED` otherwise, then `called/total`. Cells
+    write `$AITM_E2E_LEDGER_DIR/<cell>.json` via aitm_e2e.scan.ledger_flush(). A
+    called verb that is NOT in the contract is still listed, flagged, so a call the
+    contract does not know about is never hidden (it does not count toward total).
+
+    The roll-up is a REPORT, not a gate: anything that goes wrong reading it prints
+    one line and leaves the run's own pass/skip/fail summary standing."""
+    try:
+        _print_ledger(ledger_dir)
+    except Exception as e:  # noqa: BLE001  (never let a report break the run)
+        print(f"ledger: could not print ({e})", flush=True)
+
+
+def _print_ledger(ledger_dir: str) -> None:
+    if E2E_DIR not in sys.path:
+        sys.path.insert(0, E2E_DIR)
+    # The runner is not a cell: it records no scan call, and aitm_e2e.scan's atexit
+    # flush is silent with nothing recorded, so importing it here changes no output.
+    from aitm_e2e.scan import ROLES, expected_scan_verbs  # noqa: E402
+
+    expected = expected_scan_verbs()
+    calls: dict[str, dict[str, list[str]]] = {}
+    for name in sorted(os.listdir(ledger_dir)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(ledger_dir, name), encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"ledger: unreadable {name}: {e}", flush=True)
+            continue
+        cell = doc.get("cell") or name[: -len(".json")]
+        for c in doc.get("calls") or []:
+            verb, role = c.get("verb"), c.get("role")
+            if not isinstance(verb, str) or not isinstance(role, str):
+                continue
+            cells = calls.setdefault(verb, {}).setdefault(role, [])
+            if cell not in cells:
+                cells.append(cell)
+
+    def line(verb: str) -> str:
+        roles = calls.get(verb)
+        if not roles:
+            return f"  {verb:<26}UNCALLED"
+        order = [r for r in ROLES if r in roles] + sorted(r for r in roles if r not in ROLES)
+        return f"  {verb:<26}" + " | ".join(f"{role}: {', '.join(roles[role])}" for role in order)
+
+    print("\nscan verb ledger (spec D3):")
+    for verb in expected:
+        print(line(verb))
+    for verb in sorted(set(calls) - set(expected)):
+        print(line(verb) + "  (not in EXPECTED_TOOLS)")
+    called = sum(1 for v in expected if v in calls)
+    print(f"ledger: {called}/{len(expected)} scan verbs called by at least one cell", flush=True)
 
 
 def _last_line(text: str, marker: str) -> str:

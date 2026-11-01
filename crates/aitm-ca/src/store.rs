@@ -363,10 +363,32 @@ pub enum TrustErrorKind {
     NoCertificate,
     NeedsRoot,
     HeadlessAuth,
+    /// The OS authentication dialog was dismissed (macOS, spec D17.4).
+    Cancelled,
     ToolMissing,
     ToolFailed,
     Timeout,
     CopiesRemain,
+}
+
+impl TrustErrorKind {
+    /// The word the audit record and the failure log line carry: the
+    /// variant name, except `Cancelled`, which is `"cancelled"` (spec D17.4,
+    /// the word every frontend keys on).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "UnsupportedPlatform",
+            Self::UnsupportedScope => "UnsupportedScope",
+            Self::NoCertificate => "NoCertificate",
+            Self::NeedsRoot => "NeedsRoot",
+            Self::HeadlessAuth => "HeadlessAuth",
+            Self::Cancelled => "cancelled",
+            Self::ToolMissing => "ToolMissing",
+            Self::ToolFailed => "ToolFailed",
+            Self::Timeout => "Timeout",
+            Self::CopiesRemain => "CopiesRemain",
+        }
+    }
 }
 
 /// A store operation's failure. `Display` is the message.

@@ -18,7 +18,7 @@ struct ChipBar: View {
                             Rectangle().fill(Tok.Line.border.color).frame(width: 1, height: Tok.Metric.chipSeparator).padding(.horizontal, Tok.Metric.gapTight)
                         }
                         ForEach(group) { chip in
-                            Chip(title: chip.title, on: selected == chip) { selected = chip }
+                            Chip(title: chip.title, on: selected == chip, help: chip.help) { selected = chip }
                                 .fixedSize()
                         }
                     }
@@ -36,7 +36,7 @@ struct ChipBar: View {
                 .frame(height: Tok.Metric.chip)
             }
             .buttonStyle(.plain)
-            .help("Filter bar (⌘F)")
+            .help(filterActive ? "Hide the filter bar (⌘F)" : "Show the filter bar (⌘F)")
         }
         .padding(.horizontal, Tok.Metric.padInner)
         .frame(height: Tok.Size.filterBar)
@@ -49,6 +49,8 @@ struct ChipBar: View {
 struct Chip: View {
     var title: String
     var on: Bool
+    /// What the chip keeps (`ContentCategory.help`); empty shows no tooltip.
+    var help = ""
     var action: () -> Void
 
     var body: some View {
@@ -62,5 +64,7 @@ struct Chip: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .help(help)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 }

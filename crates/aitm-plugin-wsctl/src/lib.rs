@@ -46,7 +46,7 @@ use aitm_core::{
     ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value, Verdict, WsDir, WsOpcode,
 };
 use aitm_proto_ws::{InjectFrame, InjectRegistry};
-use aitm_rules::{bus, compile, CompiledRule, Phase, Rule};
+use aitm_rules::{bus, check_rule_count, compile, CompiledRule, Phase, Rule};
 
 /// State the plugin (which parks frames on events) shares with its commands
 /// (which arm it and release parked frames).
@@ -170,7 +170,9 @@ impl Command for WsIntercept {
                     required: false,
                     description: "Rules whose matching frames are parked. Each: {id?, name?, \
                                   enabled?, phase?, ws_dir?, url?, method?, host?}; phase \
-                                  defaults to ws_frame. An invalid regex is rejected."
+                                  defaults to ws_frame. More than 256 rules, a pattern over 4096 \
+                                  bytes, an empty url pattern or an invalid regex rejects the \
+                                  whole call; the active rules are unchanged."
                         .into(),
                 },
             ],
@@ -204,6 +206,7 @@ impl Command for WsIntercept {
                 Value::Array(a) => a,
                 other => anyhow::bail!("param `rules` must be an array, got {other:?}"),
             };
+            check_rule_count(arr.len())?;
             let mut compiled = Vec::with_capacity(arr.len());
             for (pos, item) in arr.iter().enumerate() {
                 let obj = match item {
@@ -507,7 +510,8 @@ fn rule_fields() -> Vec<ParamDef> {
         field(
             "url",
             TypeDesc::Any,
-            "wildcard string, or {wildcard|regex}.",
+            "wildcard string, or {wildcard|regex}; matched against the full request URL \
+             (scheme://host[:port]/path?query) and against the path alone.",
         ),
         field("method", TypeDesc::Str, "case-insensitive method."),
         field("host", TypeDesc::Any, "exact string, or {exact|wildcard}."),
@@ -636,6 +640,83 @@ mod tests {
         assert!(bus::parse_phase("bogus").is_err());
         assert!(parse_dir("sideways").is_err());
         assert!(parse_opcode("nope").is_err());
+    }
+
+    /// AC18: `ws.intercept` turns away more than 256 rules before compiling any,
+    /// and the previously armed set survives the rejected call; 256 is accepted.
+    #[test]
+    fn more_than_256_rules_are_rejected_and_leave_the_active_set() {
+        use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+        use futures::future::BoxFuture;
+
+        struct StubClient;
+        impl ProxyClient for StubClient {
+            fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+                Box::pin(async { anyhow::bail!("stub client") })
+            }
+        }
+        let store = MemFlowStore::new();
+        let client = StubClient;
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = WsIntercept {
+            shared: Arc::default(),
+        };
+        let rules = |n: usize| {
+            Value::Array(
+                (0..n)
+                    .map(|_| Value::Object(obj(&[("ws_dir", Value::Str("c2s".into()))])))
+                    .collect(),
+            )
+        };
+        let params = |rules: Value| Params::new(obj(&[("rules", rules)]));
+
+        cmd.invoke(params(rules(1)), &host).expect("one rule arms");
+        let err = cmd
+            .invoke(params(rules(257)), &host)
+            .expect_err("257 rules are rejected");
+        assert!(
+            err.to_string().contains("limit is 256"),
+            "the error names the cap: {err}"
+        );
+        assert_eq!(
+            lock(&cmd.shared.rules).len(),
+            1,
+            "the armed set survives the rejected call"
+        );
+        cmd.invoke(params(rules(256)), &host)
+            .expect("256 rules is the cap, inclusive");
+        assert_eq!(lock(&cmd.shared.rules).len(), 256);
+    }
+
+    /// The `rules` param description names every cause that rejects the whole
+    /// call (the 256-rule cap, the 4096-byte pattern cap, the empty pattern, the
+    /// invalid regex) and that the active rules survive it; `tools/list` shows
+    /// this string verbatim.
+    #[test]
+    fn rules_param_text_names_every_rejection_cause() {
+        let cmd = WsIntercept {
+            shared: Arc::default(),
+        };
+        let schema = cmd.schema();
+        let rules = schema
+            .params
+            .iter()
+            .find(|p| p.name == "rules")
+            .expect("ws.intercept has a `rules` param");
+        for phrase in [
+            "256",
+            "4096",
+            "empty url pattern",
+            "invalid regex",
+            "unchanged",
+        ] {
+            assert!(
+                rules.description.contains(phrase),
+                "the ws.intercept `rules` description must name `{phrase}`; got: {}",
+                rules.description
+            );
+        }
     }
 
     #[test]

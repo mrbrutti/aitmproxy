@@ -8,6 +8,7 @@ import SwiftUI
 /// open/close never animates.
 struct CommandPalette: View {
     @Environment(Session.self) private var session
+    @Environment(\.colorScheme) private var colorScheme
     @State private var query = ""
     @State private var highlighted = 0
     @State private var form: PaletteForm?
@@ -43,7 +44,8 @@ struct CommandPalette: View {
         .frame(maxHeight: 440)
         .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.floating))
         .overlay(RoundedRectangle(cornerRadius: Tok.Radius.floating).strokeBorder(Tok.Line.border.color))
-        .shadow(color: .black.opacity(Tok.Shadow.floating.lightOpacity), radius: Tok.Shadow.floating.radius, y: Tok.Shadow.floating.y)
+        .shadow(color: .black.opacity(colorScheme == .dark ? Tok.Shadow.floating.darkOpacity : Tok.Shadow.floating.lightOpacity),
+                radius: Tok.Shadow.floating.radius, y: Tok.Shadow.floating.y)
         .onAppear { fieldFocused = true }
         .onExitCommand { if form != nil { form = nil } else { session.paletteVisible = false } }
         .onKeyPress(.downArrow) { highlighted = min(highlighted + 1, max(items.count - 1, 0)); return .handled }
@@ -56,28 +58,34 @@ struct CommandPalette: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     let grouped = Dictionary(grouping: items.enumerated().map { ($0.offset, $0.element) }, by: { $0.1.section })
-                    ForEach(PaletteSection.allCases, id: \.self) { section in
+                    // Sections appear in the order the ranking produced them, so a literal hit
+                    // (a host typed into the field) leads with its flows instead of sitting
+                    // under every fuzzy command match.
+                    let order = items.reduce(into: [PaletteSection]()) { if !$0.contains($1.section) { $0.append($1.section) } }
+                    ForEach(order, id: \.self) { section in
                         if let rows = grouped[section], !rows.isEmpty {
                             Text(section.title.uppercased())
                                 .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
                                 .foregroundStyle(Tok.Ink.tertiary.color)
                                 .padding(.horizontal, Space.lg).padding(.top, Space.md).padding(.bottom, Space.xs)
-                            ForEach(rows, id: \.0) { index, item in
+                            // Rows are identified by the item, not the slot, so a re-ranked list
+                            // (the query changed) re-renders every row instead of reusing stale ones.
+                            ForEach(rows, id: \.1.id) { index, item in
                                 PaletteRow(item: item, highlighted: index == highlighted)
-                                    .id(index)
+                                    .id(item.id)
                                     .onTapGesture { highlighted = index; activate() }
                             }
                         }
                     }
                     if items.isEmpty {
-                        Text(session.tools.isEmpty && !Store.usesFixtures ? "Bus offline — connect in Settings ▸ Bus" : "No match")
+                        Text(session.tools.isEmpty ? "Bus offline — connect in Settings ▸ Bus" : "No match")
                             .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
                             .padding(Space.lg)
                     }
                 }
                 .padding(.bottom, Space.sm)
             }
-            .onChange(of: highlighted) { proxy.scrollTo(highlighted) }
+            .onChange(of: highlighted) { if items.indices.contains(highlighted) { proxy.scrollTo(items[highlighted].id) } }
         }
     }
 
@@ -124,6 +132,7 @@ struct CommandPalette: View {
 struct PaletteRow: View {
     var item: PaletteItem
     var highlighted: Bool
+    @State private var hovered = false
 
     var body: some View {
         HStack(spacing: Space.md) {
@@ -141,8 +150,10 @@ struct PaletteRow: View {
         }
         .padding(.horizontal, Space.lg)
         .frame(height: Tok.Size.toolbar)
-        .background(highlighted ? Tok.Ground.active.color : .clear)
+        // Keyboard highlight wins; the pointer only tints an unhighlighted row (D3).
+        .background(highlighted ? Tok.Ground.active.color : (hovered ? Tok.Ground.hover.color : .clear))
         .contentShape(Rectangle())
+        .onHover { hovered = $0 }
     }
 }
 

@@ -92,6 +92,8 @@ fn upgrade_hint() -> NextLayerHint {
         alpn: vec!["websocket".to_string()],
         first_bytes: Vec::new(),
         from_upgrade: true,
+        peer_identity: None,
+        capture_interface: None,
     }
 }
 

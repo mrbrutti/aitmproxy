@@ -40,7 +40,7 @@ final class EmbeddedCoreController {
         guard let binaries = EmbeddedCore.discoverBundled() else { return nil }
         self.bus = bus
         self.health = health
-        self.core = EmbeddedCore(binaries: binaries)
+        self.core = EmbeddedCore(binaries: binaries, scopeURL: EmbeddedScope.url(in: Store.url))
         self.connection = CoreConnection(
             id: coreID,
             kind: .embedded,
@@ -118,7 +118,7 @@ final class EmbeddedCoreController {
             // Snapshot the Settings ▸ Proxy values this core was started with, so the
             // Proxy tab can disable Apply & Restart until an edit actually diverges.
             // Read the same keys and defaults EmbeddedCore reads at spawn.
-            let defaults = UserDefaults.standard
+            let defaults = Store.defaults
             // 8080 matches Settings ▸ Proxy's @AppStorage default and EmbeddedCore's default port.
             let appliedPort = defaults.object(forKey: "proxy.preferredPort") as? Int ?? 8080
             let appliedVerifyTLS = defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true

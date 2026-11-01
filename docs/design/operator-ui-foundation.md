@@ -320,10 +320,16 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | Feature | Source | Bus | mac | web | tui | Notes |
 |---|---|---|---|---|---|---|
 | SSL column: decrypted / tunnelled / pinned-or-failed | P m | F5 | ✓ | ✓ | ✓ | from `ConnInfo.tls` + error |
-| CA status, export (PEM/DER), install, uninstall, audit log | a | ✓ `ca.*` | ✓ | ✓ | ✓ | install/uninstall confirm via `confirm_prompt`; agent gated by `ca.allow_agent_install` |
+| CA status, export (PEM/DER), install, uninstall, audit log | a | ✓ `ca.*` | ✓ | ✓ | ✓ | install/uninstall confirm via `confirm_prompt`; `ca.allow_agent_install` gates agents (MCP) only, see below |
 | SSL include/exclude list (which hosts to MITM) | P m | F11 | ✓ | ✓ | ✓ | |
 | `ssl_insecure` upstream toggle | a | F7 | ✓ | ✓ | ✓ | config exists |
 | Setup guides: iOS/Android/browser/terminal env | P | — | ✓ | ✓ | ✓ text | content only |
+
+`ca.allow_agent_install` gates agents (MCP) only: the CLI and operator-token frontends (mac app, TUI, web) install after their own confirmation and the OS dialog. An agent that is refused by the flag cannot install or uninstall, and the flag does not slow a person down.
+
+**First run on macOS.** Three steps, in this order. First, set aitmproxy as the system proxy (`proxy.system.set`, the "Set system proxy" control). Second, trust the aitmproxy CA. It goes into the login keychain, and macOS asks for your password. The trust state shown in the app is read back from the keychain with `security verify-cert` under the basic policy, never from a client flag, so a cancelled dialog leaves the state untrusted and says so. Third, add a host to Scope. Nothing is decrypted until a host is in Scope. HTTPS apps that use QUIC are not captured until the CA is trusted; browsers fall back to TCP once it is.
+
+**Linux.** The trust store needs root, so the TUI and web show "CA trust needs an administrator". The way to install is `aitm ca install` from a terminal where sudo can prompt. Two follow-ups are not done yet: a polkit/pkexec prompt, and the Firefox and Chromium NSS databases.
 
 ### 3.7 WebSocket
 
@@ -386,7 +392,7 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | Command | Params → result | Drives |
 |---|---|---|
 | `flow.list` | `{}` → `[FlowId]` oldest first | flow list ids (today the whole list every poll) |
-| `flow.get` | `{id}` → summary `{id, kind: http\|websocket, intercept, is_replay, method, scheme, authority, path, status?, request_bytes?, response_bytes?, handshake?, messages?}` | a row's cells. **No headers, body, timing, conn or metadata** → F5 |
+| `flow.get` | `{id}` → summary `{id, kind: http\|websocket, intercept, is_replay, method, scheme, authority, path, status?, request_bytes?, response_bytes?, started_at?, duration_ms?, handshake?, messages?, source_app?, capture_interface?}`; `source_app`/`capture_interface` are set on NE-captured flows, null on proxied ones | a row's cells. **No headers, body, conn or metadata** → F5 |
 | `flow.intercept` | `{enabled?: bool}` → `bool` | arm/disarm; parks **every request** while armed |
 | `flow.resume` | `{id}` → ok | the bar's Resume |
 | `flow.kill` | `{id}` → ok | Kill (connection reset) |
@@ -397,7 +403,11 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | `browser.navigate/click/type/eval/get_dom/screenshot` | per schema → text / png bytes | Browser view |
 | `poc.build` | `{flow_id, name, param}` → PoC YAML path | Build PoC from flow |
 | `poc.run` | `{poc_path, target, vars?}` → `{passed, finding_capture: FlowId, poc_path, screenshot_path, evaluated: [{assertion, matched}]}` | Findings panel; `finding_capture` opens in the inspector |
-| `ca.status/export/install/uninstall` | per schema; install/uninstall have `confirm_prompt` and the MCP gate `ca.allow_agent_install` | CA panel / setup |
+| `ca.status/export/install/uninstall` | per schema; install/uninstall have `confirm_prompt` and the MCP gate `ca.allow_agent_install` (agents only; the CLI and operator-token frontends are not gated by it) | CA panel / setup |
+| `capture.status` | `{}` → `{enabled, feeder: {state: off\|listening\|bind_failed, reason?}, provider: {state: detached\|attached, attached_at?, team_id?}, scope_entries, scope_tokens: [String], flows_handed_off: {tcp, udp}, last_handoff_at?, capability, capability_reason?}`; times are epoch ms | Settings ▸ Capture status and the Core/Bus/NE status UI (read-only; the on-switch stays `macos_capture.enabled` in the config file; `proxy.status.capturing` is the record toggle, not this) |
+| `proxy.system.status` | `{}` → `{state: off\|points_at_us\|other\|unsupported\|needs_privilege\|unknown, host?, port?, detail, ours: {host, port}, mechanism: networksetup\|gsettings\|kde\|none, supported, managed_by_us, setting, effective, services, bypass_default, guidance?, remedy?, last_change_ms?, watchdog_pid?, state_file}`; `proxy.status` carries a compact `system_proxy` sub-object with the first seven of these | System-proxy status in Settings and the status bar; `guidance` is the headless-Linux line to show as copyable text, never run: `export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080 no_proxy=localhost,127.0.0.1,::1` |
+| `proxy.system.set` | `{bypass?: [String]}` → the status object plus `{changed, commands}`; operator-only, serving processes only (one-shot `aitm proxy system set` is refused) | the "Set system proxy" control; the launch-time on-switch is `system_proxy.auto` in the config file (`system_proxy: {auto, bypass, state_file}`; `state_file` defaults to beside the CA audit log) |
+| `proxy.system.unset` | `{}` → the status object plus `{changed, commands, restored: [service], left_alone: [service]}`; operator-only; works one-shot | the "Restore" control; the previous setting is restored on quit, after a crash by a watchdog, and at the next start; `aitm proxy system unset` restores by hand |
 
 ### 4.4 Live flow list — polling today, subscription after F4
 

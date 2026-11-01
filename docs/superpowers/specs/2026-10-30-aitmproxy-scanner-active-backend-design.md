@@ -1,6 +1,6 @@
 # Scanner active backend (passive / report / inject / run / status) design
 
-**Status:** draft
+**Status:** Superseded by 2026-10-31-aitmproxy-scanner-v2-design.md (2026-10-31)
 **Research inputs:** `docs/research/05-synthesis.md`;
 `docs/superpowers/specs/2026-10-29-aitmproxy-scanner-plugin-design.md` (the
 authoritative scope design — command surface, tiering, the two-layer agent gate,

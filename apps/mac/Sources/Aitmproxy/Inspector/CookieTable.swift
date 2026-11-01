@@ -1,19 +1,28 @@
 import AitmproxyKit
 import SwiftUI
 
-/// Cookies / Set-Cookie as a table (S-019): Name · Value · Domain · Path ·
-/// Expires · Flags. Names in `syntax.key`, values in ink; a long value
+/// Cookies / Set-Cookie as a table (S-019). A request's `Cookie` header only
+/// carries Name · Value, so that is all it shows; `Set-Cookie` adds Domain ·
+/// Path · Expires · Flags. Names in `syntax.key`, values in ink; a long value
 /// truncates with the whole of it in a tooltip. Empty: "No cookies".
 struct CookieTable: View {
     var cookies: [Cookie]
     var bodySize: CGFloat = Tok.Typography.Size.md
+    /// Request cookies have no attributes: Name · Value only, with Value taking the rest of the row.
+    var isRequest = false
 
-    // Flags are folded into icons, so this column is narrow; the Value keeps a real
-    // width so the cookie value is always readable (a flexible Value collapses to
-    // nothing once the other columns fill a ~600 pt pane).
-    private static let columns: [(title: String, width: CGFloat?)] = [
-        ("Name", 120), ("Value", 200), ("Domain", 160), ("Path", 72), ("Expires", 160), ("Flags", 88),
+    // Flags are folded into icons, so this column is narrow. Value is the flexible
+    // column (nil width); for Set-Cookie it keeps a 160 pt floor so the cookie value
+    // stays readable once the attribute columns fill a narrow pane.
+    private static let setCookieColumns: [(title: String, width: CGFloat?)] = [
+        ("Name", 120), ("Value", nil), ("Domain", 160), ("Path", 72), ("Expires", 160), ("Flags", 88),
     ]
+    private static let requestColumns: [(title: String, width: CGFloat?)] = [
+        ("Name", 120), ("Value", nil),
+    ]
+
+    private var columns: [(title: String, width: CGFloat?)] { isRequest ? Self.requestColumns : Self.setCookieColumns }
+    private var valueMinWidth: CGFloat { isRequest ? 0 : 160 }
 
     var body: some View {
         if cookies.isEmpty {
@@ -30,7 +39,7 @@ struct CookieTable: View {
             GeometryReader { viewport in
                 ScrollView([.vertical, .horizontal]) {
                     VStack(spacing: 0) {
-                        ColumnHeads(columns: Self.columns)
+                        ColumnHeads(columns: columns, flexibleMinWidth: valueMinWidth)
                         ForEach(Array(cookies.enumerated()), id: \.offset) { _, cookie in
                             row(cookie)
                         }
@@ -44,12 +53,13 @@ struct CookieTable: View {
     private func row(_ cookie: Cookie) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: Space.md) {
             cell(cookie.name, width: 120).foregroundStyle(Tok.Syntax.key.color)
-            cell(cookie.value, width: 200)
-            cell(cookie.domain ?? Format.dash, width: 160, dim: cookie.domain == nil)
-            cell(cookie.path ?? Format.dash, width: 72, dim: cookie.path == nil)
-            cell(expires(cookie), width: 160, dim: cookie.expires == nil && cookie.maxAge == nil)
-            flags(cookie)
-            Spacer(minLength: 0)
+            flexibleCell(cookie.value, minWidth: valueMinWidth)
+            if !isRequest {
+                cell(cookie.domain ?? Format.dash, width: 160, dim: cookie.domain == nil)
+                cell(cookie.path ?? Format.dash, width: 72, dim: cookie.path == nil)
+                cell(expires(cookie), width: 160, dim: cookie.expires == nil && cookie.maxAge == nil)
+                flags(cookie)
+            }
         }
         .font(Tok.Face.data(bodySize))
         .padding(.horizontal, Space.md)
@@ -66,6 +76,17 @@ struct CookieTable: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(width: width, alignment: .leading)
+            .help(text)
+            .textSelection(.enabled)
+    }
+
+    /// The flexible column: takes the rest of the row, never less than `minWidth`.
+    private func flexibleCell(_ text: String, minWidth: CGFloat) -> some View {
+        Text(text)
+            .foregroundStyle(Tok.Ink.primary.color)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(minWidth: minWidth, maxWidth: .infinity, alignment: .leading)
             .help(text)
             .textSelection(.enabled)
     }
@@ -101,21 +122,32 @@ struct CookieTable: View {
 }
 
 /// A column-head row in the flow list's header style: 11/500 tracked
-/// capitals in the tertiary tier, 28 tall, a 1 px border under.
+/// capitals in the tertiary tier, 28 tall, a 1 px border under. A column with
+/// a nil width is the flexible one: it takes the rest of the row, never less
+/// than `flexibleMinWidth`, so its head stays over its cells.
 struct ColumnHeads: View {
     var columns: [(title: String, width: CGFloat?)]
+    var flexibleMinWidth: CGFloat = 0
 
     var body: some View {
         HStack(spacing: Space.md) {
             ForEach(Array(columns.enumerated()), id: \.offset) { _, column in
-                Text(column.title.uppercased())
+                let head = Text(column.title.uppercased())
                     .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
                     .tracking(0.6)
                     .foregroundStyle(Tok.Ink.tertiary.color)
                     .lineLimit(1)
-                    .frame(width: column.width, alignment: .leading)
+                if let width = column.width {
+                    head.frame(width: width, alignment: .leading)
+                } else {
+                    head.frame(minWidth: flexibleMinWidth, maxWidth: .infinity, alignment: .leading)
+                }
             }
-            Spacer(minLength: 0)
+            // A flexible column already takes the slack; a Spacer beside it would
+            // split the row and push the heads after it off their cells.
+            if !columns.contains(where: { $0.width == nil }) {
+                Spacer(minLength: 0)
+            }
         }
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.columnHeader)

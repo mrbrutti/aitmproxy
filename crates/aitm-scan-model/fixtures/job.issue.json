@@ -1,0 +1,79 @@
+{
+  "job": "scan-1a2b3c4d",
+  "kind": "scan",
+  "event": "issue",
+  "seq": 4,
+  "ts_ms": 1761900000004,
+  "status": {
+    "job": "scan-1a2b3c4d",
+    "state": "running",
+    "phase": "auditing",
+    "elapsed_ms": 42000,
+    "probes": {
+      "sent": 418,
+      "budget": 2000,
+      "errors": 2,
+      "timeouts": 1,
+      "rate_waits": 0,
+      "by_lane": {
+        "http": 418
+      }
+    },
+    "points": {
+      "found": 120,
+      "queued": 40,
+      "audited": 80,
+      "skipped": {
+        "ignored": 5,
+        "frequent": 3,
+        "limit": 0
+      }
+    },
+    "issues": {
+      "total": 3,
+      "by_severity": {
+        "critical": 0,
+        "high": 1,
+        "medium": 1,
+        "low": 1,
+        "info": 0
+      },
+      "by_confidence": {
+        "certain": 1,
+        "firm": 1,
+        "tentative": 1
+      }
+    }
+  },
+  "issue": {
+    "id": "issue-9f8e7d6c",
+    "job": "scan-1a2b3c4d",
+    "check_id": "http.reflected-xss",
+    "class": "reflected-xss",
+    "name": "Reflected cross-site scripting",
+    "severity": "high",
+    "confidence": "certain",
+    "status": "open",
+    "lane": "http",
+    "target": {
+      "scheme": "http",
+      "host": "127.0.0.1",
+      "port": 8080
+    },
+    "location": {
+      "method": "GET",
+      "path": "/search",
+      "path_template": "/search",
+      "kind": "query",
+      "name": "q",
+      "field_path": null,
+      "ws_path": null,
+      "l4": null
+    },
+    "first_seen": 1761900000000,
+    "last_seen": 1761900000000,
+    "occurrences": 1,
+    "poc_ref": "poc-3b1c",
+    "finding_id": "finding-7a21"
+  }
+}

@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use aitm_core::{
     Body, CommandHost, Config, Event, Flow, FlowCtx, FlowId, FlowStore, Frontend, HeaderMap,
     HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
-    Proxy, ProxyClient, Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, Value,
-    Verdict,
+    Proxy, ProxyClient, Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, TunnelInfo,
+    Value, Verdict,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_sessionio::SessionIoPlugin;
@@ -231,6 +231,55 @@ async fn spawn_closing_origin(alpn: Vec<Vec<u8>>) -> SocketAddr {
     addr
 }
 
+/// A TLS h2 origin that accepts one stream, reads its request, sends a 200 head
+/// and one DATA frame (`abc`) **without** END_STREAM, drives the connection long
+/// enough for those frames to be on the wire, then drops the connection with the
+/// stream still open — the proxy's response body read then fails mid-body.
+async fn spawn_partial_body_origin(alpn: Vec<Vec<u8>>) -> SocketAddr {
+    let acceptor = origin_tls(alpn);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                if let Some(Ok((req, mut respond))) = conn.accept().await {
+                    let (_parts, mut rbody) = req.into_parts();
+                    while let Some(Ok(chunk)) = rbody.data().await {
+                        let _ = rbody.flow_control().release_capacity(chunk.len());
+                    }
+                    let head = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("fixture head");
+                    let Ok(mut send) = respond.send_response(head, false) else {
+                        return;
+                    };
+                    if send.send_data(Bytes::from_static(b"abc"), false).is_err() {
+                        return;
+                    }
+                    // Drive the connection so the HEADERS and DATA frames are
+                    // flushed; nothing else arrives, so this simply times out.
+                    let _ = tokio::time::timeout(Duration::from_millis(200), conn.accept()).await;
+                    drop(send);
+                }
+                // Drop `conn` (and the TLS stream) with the stream still open: the
+                // proxy sees the upstream vanish mid-body.
+            });
+        }
+    });
+    addr
+}
+
 /// A plugin that records the flow id of every `Event::Error` the chain dispatches,
 /// so a test can assert a failed stream reached the typed error bus.
 struct ErrorRecorder {
@@ -422,12 +471,14 @@ async fn https_get_h1(
     (status, body)
 }
 
-/// The first captured HTTP flow that has a response, waiting briefly for it.
+/// The first captured request flow that has a response, waiting briefly for it.
+/// The `CONNECT` that carried it is its own tunnel row (spec D5) and is skipped,
+/// here and in every picker below.
 async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let found = store.list().into_iter().find_map(|id| match store.get(id) {
-            Some(Flow::Http(f)) if f.response.is_some() => Some(f),
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_none() && f.response.is_some() => Some(f),
             _ => None,
         });
         if let Some(flow) = found {
@@ -438,7 +489,36 @@ async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
     }
 }
 
-/// Wait until the store holds at least `n` flows that each have a response.
+/// Wait until the store holds an `HttpFlow` whose response body is **buffered**
+/// (not `Body::Streamed`), i.e. a finished or abandoned response. Unlike
+/// [`wait_for_flow`], a staged head whose body is still streaming does not count.
+async fn wait_for_buffered_response(store: &dyn FlowStore) -> HttpFlow {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = store.list().into_iter().find_map(|id| match store.get(id) {
+            Some(Flow::Http(f))
+                if f.metadata.tunnel.is_none()
+                    && f.response
+                        .as_ref()
+                        .is_some_and(|r| !matches!(r.body, Body::Streamed(_))) =>
+            {
+                Some(f)
+            }
+            _ => None,
+        });
+        if let Some(flow) = found {
+            return flow;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no HttpFlow with a buffered (finished or abandoned) response captured"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until the store holds at least `n` request flows (tunnel rows excluded)
+/// that each have a response.
 async fn wait_for_n_flows(store: &dyn FlowStore, n: usize) -> Vec<HttpFlow> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -446,7 +526,9 @@ async fn wait_for_n_flows(store: &dyn FlowStore, n: usize) -> Vec<HttpFlow> {
             .list()
             .into_iter()
             .filter_map(|id| match store.get(id) {
-                Some(Flow::Http(f)) if f.response.is_some() => Some(f),
+                Some(Flow::Http(f)) if f.metadata.tunnel.is_none() && f.response.is_some() => {
+                    Some(f)
+                }
                 _ => None,
             })
             .collect();
@@ -457,6 +539,42 @@ async fn wait_for_n_flows(store: &dyn FlowStore, n: usize) -> Vec<HttpFlow> {
             Instant::now() < deadline,
             "only {} of {n} flows captured",
             flows.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The stored tunnel rows (`CONNECT`, spec D5), oldest first.
+fn tunnel_rows(store: &dyn FlowStore) -> Vec<HttpFlow> {
+    store
+        .list()
+        .into_iter()
+        .filter_map(|id| match store.get(id) {
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_some() => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Poll up to 3 s until the store holds a tunnel row that has closed
+/// (`metadata.duration` set: the connection it recorded has ended, spec D5), and
+/// return it.
+async fn wait_for_closed_tunnel_row(store: &dyn FlowStore) -> HttpFlow {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(row) = tunnel_rows(store)
+            .into_iter()
+            .find(|row| row.metadata.duration.is_some())
+        {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no tunnel row closed; tunnel rows: {:?}",
+            tunnel_rows(store)
+                .iter()
+                .map(|row| (row.metadata.tunnel.clone(), row.metadata.duration))
+                .collect::<Vec<_>>()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -586,6 +704,11 @@ async fn three_concurrent_streams_three_flows() {
     for f in &flows {
         assert!(f.response.is_some(), "each flow has its own response");
     }
+    // Spec D5: the one h2 connection is one decrypted tunnel row, not a request.
+    let rows = tunnel_rows(store.as_ref());
+    assert_eq!(rows.len(), 1, "one CONNECT carried the three streams");
+    assert_eq!(rows[0].request.method, "CONNECT");
+    assert_eq!(rows[0].metadata.tunnel, Some(TunnelInfo::decrypted()));
 }
 
 // --- AC-H2.7 (Map Local short-circuit) ---------------------------------------
@@ -1285,6 +1408,93 @@ async fn upstream_closing_early_emits_flow_error() {
     }
 }
 
+/// AC8 (flow-finish-and-timing): an upstream that sends a 200 head and one DATA
+/// frame, then drops the connection mid-body, leaves a flow whose response is
+/// finalised in the store as a truncated, **buffered** body — so it is terminal
+/// for `clear` — and the failure still reaches the error bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_dropping_mid_body_finalises_the_flow_as_truncated() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_partial_body_origin(vec![ALPN_H2.to_vec()]).await;
+    let (proxy, store) = run_proxy(
+        ca,
+        vec![Box::new(ErrorRecorder {
+            errors: errors.clone(),
+        })],
+        None,
+    )
+    .await;
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let result = h2_try_get(&send_req, origin, "/partial").await;
+    assert!(
+        result.is_err(),
+        "a stream whose upstream dropped mid-body must not complete: {result:?}"
+    );
+
+    // The staged head is finalised: the bytes forwarded before the drop are
+    // stored as a truncated body with a duration, not left `Streamed` for good.
+    let flow = wait_for_buffered_response(store.as_ref()).await;
+    let response = flow
+        .response
+        .as_ref()
+        .expect("the response head was stored");
+    assert_eq!(response.status, 200);
+    match &response.body {
+        Body::Bytes(bytes) => assert_eq!(
+            bytes, b"abc",
+            "the bytes forwarded before the drop are the stored body"
+        ),
+        other => panic!("an abandoned response body must be Bytes(abc), got {other:?}"),
+    }
+    assert!(
+        flow.metadata.truncated,
+        "a response that ended early is marked truncated"
+    );
+    assert!(
+        flow.metadata.duration.is_some(),
+        "an abandoned response gets a duration"
+    );
+
+    // The CONNECT that carried the stream is its own row (spec D5), in flight —
+    // and so kept by `clear` — until the connection closes. Hang up: dropping the
+    // last h2 handle sends GOAWAY, the proxy's `serve_h2` returns, and the row
+    // closes with its duration.
+    drop(send_req);
+    let tunnel = wait_for_closed_tunnel_row(store.as_ref()).await;
+    assert_eq!(tunnel.metadata.tunnel, Some(TunnelInfo::decrypted()));
+    assert_eq!(
+        store.count(),
+        2,
+        "the store holds the abandoned flow and its tunnel row"
+    );
+
+    // Terminal for the store: `clear` removes the abandoned flow — and the closed
+    // tunnel row — instead of skipping either in flight.
+    let outcome = store.clear();
+    assert_eq!(
+        outcome.cleared, 2,
+        "the abandoned flow and the closed tunnel row are terminal"
+    );
+    assert_eq!(outcome.skipped_in_flight, 0);
+    assert!(store.list().is_empty(), "nothing is left after clear");
+
+    // And the failure was still dispatched on the error bus for that flow.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if errors.lock().unwrap().contains(&flow.id) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Event::Error was emitted for the abandoned flow"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 // --- Task 4: Map Remote cross-origin over h2 (AC-H2.8) ------------------------
 //
 // A Map Remote rule rewrites a matching request's authority to a *different* host.
@@ -1590,13 +1800,14 @@ fn sessionio_invoke(reg: &Registry, store: &dyn FlowStore, command: &str, args: 
         .unwrap_or_else(|e| panic!("{command} failed: {e}"))
 }
 
-/// The single captured HTTP flow in `store` (panics if there is not exactly one).
+/// The single captured request flow in `store`, its `CONNECT` tunnel row set
+/// aside (panics if there is not exactly one).
 fn only_http_flow(store: &dyn FlowStore) -> HttpFlow {
     let flows: Vec<HttpFlow> = store
         .list()
         .into_iter()
         .filter_map(|id| match store.get(id) {
-            Some(Flow::Http(f)) => Some(f),
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_none() => Some(f),
             _ => None,
         })
         .collect();
@@ -1670,7 +1881,10 @@ async fn h2_flow_session_round_trips() {
 
 /// AC-H2.11 (HAR) — `flow.export {format:"har"}` of an h2 flow tags both the
 /// request and the response `httpVersion` as `"HTTP/2"`, and `flow.import` of those
-/// same HAR bytes round-trips the flow back as `HttpVersion::H2`.
+/// same HAR bytes round-trips the flow back as `HttpVersion::H2`. The export holds
+/// the whole store, so the `CONNECT` tunnel row that carried the stream (spec D5)
+/// is an entry of its own — tagged `HTTP/1.1`, as the CONNECT exchange was on the
+/// wire — and every version check is scoped to its entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_flow_har_version_tag() {
     let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
@@ -1705,19 +1919,53 @@ async fn h2_flow_har_version_tag() {
         other => panic!("flow.export must return an object, got {other:?}"),
     };
     let doc = String::from_utf8(bytes.clone()).expect("HAR document is UTF-8 JSON");
-    // The one entry carries httpVersion on BOTH its request and response, so the
-    // exact pretty-printed tag must appear twice and the h1 tag never.
+    // One pretty-printed entry per flow, each opening with its `startedDateTime`:
+    // the tunnel row and the h2 flow. Every version check is scoped to its entry.
+    let entries: Vec<&str> = doc.split("\"startedDateTime\"").skip(1).collect();
     assert_eq!(
-        doc.matches("\"httpVersion\": \"HTTP/2\"").count(),
+        entries.len(),
         2,
-        "HAR must tag the h2 request and response as HTTP/2: {doc}"
+        "the export holds the CONNECT tunnel row and the h2 flow: {doc}"
+    );
+    let connect: Vec<&&str> = entries
+        .iter()
+        .filter(|entry| entry.contains("\"method\": \"CONNECT\""))
+        .collect();
+    assert_eq!(
+        connect.len(),
+        1,
+        "exactly one CONNECT entry, the tunnel that carried the stream: {doc}"
     );
     assert!(
-        !doc.contains("\"httpVersion\": \"HTTP/1.1\""),
-        "no part of an h2 flow may be tagged HTTP/1.1: {doc}"
+        connect[0].contains(&format!("\"url\": \"https://{origin}\"")),
+        "the tunnel entry names the origin it was opened to: {}",
+        connect[0]
+    );
+    assert_eq!(
+        connect[0].matches("\"httpVersion\": \"HTTP/1.1\"").count(),
+        2,
+        "the CONNECT exchange is HTTP/1.1 on the wire, request and response: {}",
+        connect[0]
+    );
+    let h2_entry = entries
+        .iter()
+        .find(|entry| entry.contains(&format!("\"url\": \"https://{origin}/har\"")))
+        .unwrap_or_else(|| panic!("no entry for the h2 flow: {doc}"));
+    assert!(h2_entry.contains("\"method\": \"GET\""));
+    // The entry carries httpVersion on BOTH its request and response, so the
+    // exact pretty-printed tag must appear twice and the h1 tag never.
+    assert_eq!(
+        h2_entry.matches("\"httpVersion\": \"HTTP/2\"").count(),
+        2,
+        "HAR must tag the h2 request and response as HTTP/2: {h2_entry}"
+    );
+    assert!(
+        !h2_entry.contains("\"httpVersion\": \"HTTP/1.1\""),
+        "no part of an h2 flow may be tagged HTTP/1.1: {h2_entry}"
     );
 
-    // The same HAR bytes import back into a fresh store as an h2 flow.
+    // The same HAR bytes import back into a fresh store: the h2 flow as h2, and
+    // the tunnel entry as the CONNECT it was (HAR carries no tunnel outcome).
     let fresh = MemFlowStore::new();
     sessionio_invoke(
         &reg,
@@ -1728,7 +1976,25 @@ async fn h2_flow_har_version_tag() {
             ("format", Value::Str("har".into())),
         ]),
     );
-    let imported = only_http_flow(&fresh);
+    let imported: Vec<HttpFlow> = fresh
+        .list()
+        .into_iter()
+        .filter_map(|id| match fresh.get(id) {
+            Some(Flow::Http(f)) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(imported.len(), 2, "both entries import as flows");
+    let connect = imported
+        .iter()
+        .find(|f| f.request.method == "CONNECT")
+        .expect("the tunnel entry imports as a CONNECT flow");
+    assert_eq!(connect.request.authority, origin.to_string());
+    assert_eq!(connect.request.version, HttpVersion::Http11);
+    let imported = imported
+        .iter()
+        .find(|f| f.request.path == "/har")
+        .expect("the h2 entry imports as the /har flow");
     assert_eq!(
         imported.request.version,
         HttpVersion::H2,

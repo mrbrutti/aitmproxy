@@ -31,9 +31,11 @@ struct ConfigPanel: View {
                 }
                 // Anchored to the viewport: a two-axis ScrollView otherwise centres short content.
                 GeometryReader { viewport in
+                    // The env gutter is only held open when some line carries an override.
+                    let hasEnv = document.lines.contains(where: \.isEnv)
                     ScrollView([.vertical, .horizontal]) {
                         VStack(alignment: .leading, spacing: 0) {
-                            ForEach(document.lines) { line in ConfigLine(line: line) }
+                            ForEach(document.lines) { line in ConfigLine(line: line, showsGutter: hasEnv) }
                         }
                         .padding(.vertical, Space.sm)
                         .textSelection(.enabled)
@@ -89,11 +91,6 @@ struct ConfigPanel: View {
 
     private func load() {
         reloadedAt = Date()
-        if Store.usesFixtures {
-            document = ConfigDocument(yaml: Fixtures.configYAML, path: "config.yaml", envOverrides: [])
-            note = nil
-            return
-        }
         if session.tools.contains(where: { $0.name == "config.get" }) {
             Task {
                 if let yaml = try? await session.runCommand("config.get", [:]).stringValue {
@@ -113,7 +110,8 @@ struct ConfigPanel: View {
         let url = BusService.configURL
         let yaml = (try? String(contentsOf: url, encoding: .utf8)) ?? "# no config.yaml at \(url.path)"
         document = ConfigDocument(yaml: yaml, path: url.path, envOverrides: [])
-        note = "from \(url.path); the proxy's effective config needs config.get (F7)"
+        // F7: config.get serves the proxy's effective configuration.
+        note = "Read from \(url.path) — the proxy's effective configuration arrives when the core can report it"
     }
 }
 
@@ -121,15 +119,20 @@ struct ConfigPanel: View {
 /// YAML-coloured text, with a wash on the listen / bus lines.
 private struct ConfigLine: View {
     var line: ConfigDocument.Line
+    /// False when no line in the document has an env override: the gutter collapses.
+    var showsGutter = true
 
     var body: some View {
         HStack(alignment: .center, spacing: 0) {
             // A reserved gutter: EmptyView ignores .frame, so the chip rides in an
-            // overlay over a clear box that always holds the 44 pt column open.
-            Color.clear
-                .frame(width: 44, height: Tok.Metric.countChip) // grid: ok gutter width from the foundation
-                .overlay(alignment: .trailing) { if line.isEnv { envChip } }
-                .padding(.trailing, Tok.Metric.gapMeta)
+            // overlay over a clear box that holds the 44 pt column open while any
+            // line needs it.
+            if showsGutter {
+                Color.clear
+                    .frame(width: 44, height: Tok.Metric.countChip) // grid: ok gutter width from the foundation
+                    .overlay(alignment: .trailing) { if line.isEnv { envChip } }
+                    .padding(.trailing, Tok.Metric.gapMeta)
+            }
             text
                 .font(Tok.Face.data(Tok.Typography.Size.md))
                 .lineLimit(1)

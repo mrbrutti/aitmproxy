@@ -1,9 +1,10 @@
 import AitmBusClient
 import AitmproxyKit
+import AppKit
 import SwiftUI
 
 /// The Scripts page (S-060): a master list of Rhai scripts on the left (name,
-/// rule, phases, status dot, enable switch) and a detail pane on the right that
+/// rule, phases, status word, enable switch) and a detail pane on the right that
 /// shows the selected script's status, its *full* error (the list shows only a
 /// one-line summary), its rule and phases. Live source and console land when the
 /// core serves `script.get` / `script.log` (F8).
@@ -73,18 +74,31 @@ struct ScriptsPanel: View {
     private func row(_ script: ScriptInfo) -> some View {
         Button { selected = script.id } label: {
             HStack(alignment: .center, spacing: Space.md) {
-                Circle().fill(dotColor(script).color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
                 VStack(alignment: .leading, spacing: Space.xs) {
                     HStack(spacing: Space.sm) {
+                        // The name wins the width; the phase chips give way first.
                         Text(script.name).font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
                             .foregroundStyle(Tok.Ink.primary.color).lineLimit(1)
+                            .layoutPriority(1)
+                            .help(script.name)
                         ForEach(script.phases, id: \.self) { phase in
                             Badge(text: phase, pair: Self.phaseChip, uppercase: false)
                         }
                     }
-                    Text(script.ruleSummary)
-                        .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
-                        .lineLimit(1).truncationMode(.middle)
+                    HStack(spacing: Space.sm) {
+                        Text(script.ruleSummary)
+                            .font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+                            .lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: Space.sm)
+                        // The same word + symbol the detail header uses, so status is never
+                        // colour alone; hue only on the error.
+                        Label(script.statusWord, systemImage: script.statusSymbol)
+                            .labelStyle(.titleAndIcon)
+                            .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
+                            .foregroundStyle((script.error != nil ? Tok.Status.serverError : Tok.Ink.secondary).color)
+                            .fixedSize()
+                            .help(script.statusText)
+                    }
                 }
                 Spacer(minLength: Space.sm)
                 Toggle(script.name, isOn: Binding(get: { script.enabled }, set: { setEnabled(script, $0) }))
@@ -100,12 +114,13 @@ struct ScriptsPanel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button(script.enabled ? "Disable" : "Enable") { setEnabled(script, !script.enabled) }
+            Button("Copy Rule") {
+                Pasteboard.copy(script.ruleSummary)
+            }
+        }
         .accessibilityAddTraits(script.id == selected ? .isSelected : [])
-    }
-
-    private func dotColor(_ script: ScriptInfo) -> DynamicColor {
-        if script.error != nil { return Tok.Status.serverError }
-        return script.enabled ? Tok.Status.success : Tok.Ink.tertiary
     }
 
     private func load() async {
@@ -117,12 +132,9 @@ struct ScriptsPanel: View {
             } catch {
                 session.lastError = "script.list: \(BusService.describe(error))"
             }
-        } else if Store.usesFixtures {
-            scripts = Fixtures.scripts
-            note = "Fixture list — the live list needs script.list (F8)"
         } else {
             scripts = []
-            note = "Scripts need script.list on the bus (F8)"
+            note = "The core does not list scripts yet" // F8 script.list
         }
         // Lead with a failing script so its fault is visible, else the first script.
         if selected == nil || !scripts.contains(where: { $0.id == selected }) {
@@ -137,7 +149,6 @@ struct ScriptsPanel: View {
         let previous = scripts[index].enabled
         scripts[index].enabled = on
         syncCount()
-        if Store.usesFixtures, !hasBusToggle { return }
         guard hasBusToggle else {
             scripts[index].enabled = previous
             syncCount()
@@ -194,9 +205,9 @@ private struct ScriptDetail: View {
                         }
                     }
                     section("Source")
-                    Hint(text: "The script's source appears here once the core serves script.get (F8).")
+                    Hint(text: "The script's source appears here once the core can serve it.") // F8 script.get
                     section("Console")
-                    Hint(text: "Live script output appears here once the core serves script.log (F8).")
+                    Hint(text: "Live script output appears here once the core can stream it.") // F8 script.log
                 }
                 .padding(Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -219,20 +230,12 @@ private struct ScriptDetail: View {
             Spacer(minLength: Space.sm)
             // One status, consistent with the sidebar's "N active": an erroring script
             // reads "Error", never "Enabled", and the icon carries the colour.
-            Label(statusWord(script), systemImage: statusSymbol(script))
+            Label(script.statusWord, systemImage: script.statusSymbol)
                 .labelStyle(.titleAndIcon)
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
                 .foregroundStyle(statusColor(script).color)
                 .help(script.statusText)
         }
-    }
-
-    private func statusWord(_ s: ScriptInfo) -> String {
-        s.error != nil ? "Error" : s.enabled ? "Active" : "Disabled"
-    }
-
-    private func statusSymbol(_ s: ScriptInfo) -> String {
-        s.error != nil ? "exclamationmark.triangle.fill" : s.enabled ? "checkmark.circle.fill" : "circle"
     }
 
     private func statusColor(_ s: ScriptInfo) -> DynamicColor {
@@ -242,5 +245,17 @@ private struct ScriptDetail: View {
     private func section(_ title: String) -> some View {
         Text(title.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
             .foregroundStyle(Tok.Ink.tertiary.color)
+    }
+}
+
+/// One status vocabulary for the list row and the detail header: an erroring
+/// script reads "Error", never "Active".
+private extension ScriptInfo {
+    var statusWord: String {
+        error != nil ? "Error" : enabled ? "Active" : "Disabled"
+    }
+
+    var statusSymbol: String {
+        error != nil ? "exclamationmark.triangle.fill" : enabled ? "checkmark.circle.fill" : "circle"
     }
 }

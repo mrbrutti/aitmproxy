@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, ProxyClient,
-    StdGuard, Value, WsDir, WsFlow, WsMessage, WsOpcode,
+    StdGuard, TunnelInfo, TunnelMode, TunnelReason, Value, WsDir, WsFlow, WsMessage, WsOpcode,
 };
 use aitm_plugins::{DetailPlugin, MutatePlugin};
 use futures::future::BoxFuture;
@@ -158,7 +158,7 @@ fn http_detail_inline_has_headers_bodies_conn_meta() {
     assert_eq!(cc.get("sni"), Some(&Value::Str("api.ex.test".into())));
     assert_eq!(cc.get("alpn"), Some(&Value::Str("h2".into())));
     assert_eq!(cc.get("tls"), Some(&Value::Bool(true)));
-    // Peer→process resolution is deferred (Q6/F2); reported as null, not omitted.
+    // A proxied flow has no source app: `process` is null, not omitted.
     assert_eq!(cc.get("process"), Some(&Value::Null));
 
     let sc = obj(&d, "server_conn");
@@ -177,6 +177,26 @@ fn http_detail_inline_has_headers_bodies_conn_meta() {
         created.contains('T') && created.ends_with('Z'),
         "created={created}"
     );
+}
+
+#[test]
+fn client_conn_process_is_the_source_app_the_backend_observed() {
+    // `flow.detail` must agree with `flow.get`: the TUI and web Client columns read
+    // `client_conn.process`, so an NE-captured flow names its app there too.
+    let store = MemFlowStore::new();
+    let mut flow = flow_with_bodies();
+    flow.metadata_mut().source_app = Some("com.apple.Safari".into());
+    flow.metadata_mut().capture_interface = Some("macos-ne".into());
+    let id = store.insert(flow);
+    let d = detail(&store, id, Some("none"));
+    let cc = obj(&d, "client_conn");
+    assert_eq!(
+        cc.get("process"),
+        Some(&Value::Str("com.apple.Safari".into()))
+    );
+    // The server side has no process at all.
+    let sc = obj(&d, "server_conn");
+    assert_eq!(sc.get("process"), None);
 }
 
 #[test]
@@ -536,4 +556,184 @@ fn http_detail_request_object_is_unchanged_by_trailers() {
         obj(&trailed_d, "request").get("headers"),
         obj(&plain_d, "request").get("headers")
     );
+}
+
+// ---- per-host decryption (spec D7 / AC11): `meta.tunnel` and `meta.passive` ----
+
+/// `flow_with_bodies()` turned into a `CONNECT` row (spec D5): `CONNECT
+/// api.ex.test:443`, scheme `https`, empty path, no bodies, the given tunnel
+/// outcome, `200` when established (`None` when failed), closed.
+fn connect_row(tunnel: TunnelInfo, status: Option<u16>) -> Flow {
+    let mut flow = flow_with_bodies();
+    let Flow::Http(f) = &mut flow else {
+        panic!("flow_with_bodies builds an HTTP flow");
+    };
+    f.request.method = "CONNECT".into();
+    f.request.authority = "api.ex.test:443".into();
+    f.request.path = String::new();
+    f.request.body = Body::Empty;
+    f.response = status.map(|status| HttpResponse {
+        status,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: std::time::SystemTime::now(),
+    });
+    f.metadata.tunnel = Some(tunnel);
+    flow
+}
+
+/// A `meta.tunnel` object as `flow.detail` renders it.
+fn tunnel_object(mode: &str, reason: Value, bytes_up: Value, bytes_down: Value) -> Value {
+    let mut o = BTreeMap::new();
+    o.insert("mode".to_string(), Value::Str(mode.into()));
+    o.insert("reason".to_string(), reason);
+    o.insert("bytes_up".to_string(), bytes_up);
+    o.insert("bytes_down".to_string(), bytes_down);
+    Value::Object(o)
+}
+
+/// Spec D7: `flow.detail`'s `meta` carries `passive` (bool) and `tunnel`, an
+/// object `{mode, reason, bytes_up, bytes_down}` for a tunnel row and `null` for
+/// every other flow, with the literal wire codes of D5, beside the existing keys.
+#[test]
+fn detail_meta_reports_tunnel_object_and_passive() {
+    let store = MemFlowStore::new();
+    let passthrough = store.insert(connect_row(
+        TunnelInfo {
+            mode: TunnelMode::Passthrough,
+            reason: Some(TunnelReason::OutOfScope),
+            bytes_up: Some(10),
+            bytes_down: Some(20),
+        },
+        Some(200),
+    ));
+    let failed = store.insert(connect_row(
+        TunnelInfo::failed(TunnelReason::ClientRejectedCertificate),
+        None,
+    ));
+    let decrypted = store.insert(connect_row(TunnelInfo::decrypted(), Some(200)));
+    let ordinary = store.insert(flow_with_bodies());
+    let mut observed = flow_with_bodies();
+    observed.metadata_mut().passive = true;
+    let passive = store.insert(observed);
+
+    let d = detail(&store, passthrough, Some("none"));
+    assert_eq!(
+        obj(&d, "request").get("method"),
+        Some(&Value::Str("CONNECT".into()))
+    );
+    assert_eq!(
+        obj(&d, "response").get("status"),
+        Some(&Value::Int(200)),
+        "an established tunnel carries its 200 acknowledgement"
+    );
+    let meta = obj(&d, "meta");
+    assert_eq!(meta.get("passive"), Some(&Value::Bool(false)));
+    assert_eq!(
+        meta.get("tunnel"),
+        Some(&tunnel_object(
+            "passthrough",
+            Value::Str("out_of_scope".into()),
+            Value::Int(10),
+            Value::Int(20)
+        )),
+        "meta.tunnel on a passthrough row: {meta:?}"
+    );
+    // Pin the literal key set of `meta`, so two equally wrong objects cannot pass.
+    let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "comment",
+            "created",
+            "duration_ms",
+            "edited",
+            "is_replay",
+            "marks",
+            "origin",
+            "passive",
+            "truncated",
+            "tunnel",
+        ]
+    );
+
+    let d = detail(&store, failed, Some("none"));
+    assert_eq!(
+        d.get("response"),
+        Some(&Value::Null),
+        "a failed tunnel has no response"
+    );
+    let meta = obj(&d, "meta");
+    assert_eq!(meta.get("passive"), Some(&Value::Bool(false)));
+    assert_eq!(
+        meta.get("tunnel"),
+        Some(&tunnel_object(
+            "failed",
+            Value::Str("client_rejected_certificate".into()),
+            Value::Null,
+            Value::Null
+        )),
+        "meta.tunnel on a failed row: {meta:?}"
+    );
+
+    let d = detail(&store, decrypted, Some("none"));
+    let meta = obj(&d, "meta");
+    assert_eq!(
+        meta.get("tunnel"),
+        Some(&tunnel_object(
+            "decrypted",
+            Value::Null,
+            Value::Null,
+            Value::Null
+        )),
+        "meta.tunnel on a decrypted row: {meta:?}"
+    );
+
+    let d = detail(&store, ordinary, Some("none"));
+    let meta = obj(&d, "meta");
+    assert_eq!(meta.get("passive"), Some(&Value::Bool(false)));
+    assert_eq!(
+        meta.get("tunnel"),
+        Some(&Value::Null),
+        "an ordinary request is not a tunnel row: the key is present and null"
+    );
+
+    let d = detail(&store, passive, Some("none"));
+    let meta = obj(&d, "meta");
+    assert_eq!(meta.get("passive"), Some(&Value::Bool(true)), "{meta:?}");
+    assert_eq!(meta.get("tunnel"), Some(&Value::Null));
+}
+
+/// A WebSocket flow's `meta` carries the same two keys: `passive` as stamped on
+/// its own metadata (the WS module copies it from the handshake) and `tunnel`
+/// null, since a WebSocket is never a tunnel row.
+#[test]
+fn websocket_detail_meta_reports_passive_and_null_tunnel() {
+    let store = MemFlowStore::new();
+    let caddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let id = store.insert(Flow::WebSocket(WsFlow {
+        id: FlowId::new(),
+        handshake: FlowId::new(),
+        messages: Vec::new(),
+        client_conn: ConnInfo {
+            peer: caddr,
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta {
+            passive: true,
+            ..FlowMeta::default()
+        },
+        intercept: InterceptState::Observed,
+    }));
+    let d = detail(&store, id, Some("none"));
+    assert_eq!(d.get("kind"), Some(&Value::Str("websocket".into())));
+    let meta = obj(&d, "meta");
+    assert_eq!(meta.get("passive"), Some(&Value::Bool(true)), "{meta:?}");
+    assert_eq!(meta.get("tunnel"), Some(&Value::Null), "{meta:?}");
 }

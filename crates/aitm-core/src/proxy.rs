@@ -243,6 +243,10 @@ async fn handle_conn(
         alpn: Vec::new(),
         first_bytes: first.to_vec(),
         from_upgrade: false,
+        // The explicit-proxy path knows nothing about the client process or a
+        // capture backend: both stay `None` so a proxied flow reports null.
+        peer_identity: None,
+        capture_interface: None,
     };
 
     let Some(module) = inner.modules.iter().find(|m| m.matches(&hint)).cloned() else {
@@ -259,9 +263,13 @@ async fn handle_conn(
     } else {
         Arc::new(PassiveConnector)
     };
+    // The proxy's own guard rides the ctx (spec D2): a module that re-checks
+    // Scope before terminating TLS answers from the live scope `scope.add` /
+    // `scope.remove` mutate, not the seam's deny-by-default.
     let ctx = ModuleCtx::new(inner.store.clone(), inner.chain.clone(), connector)
         .with_modules(inner.modules.clone())
-        .with_hint(hint);
+        .with_hint(hint)
+        .with_scope(inner.guard.clone());
     let io: ByteStream = Box::pin(stream);
     module.spawn(io, ctx).await
 }
@@ -274,8 +282,10 @@ async fn handle_conn(
 /// bounds-checked through `get`/`?`, so a truncated or malformed hello yields
 /// `None`, never a panic — this runs on attacker-controlled bytes. No TLS library
 /// is pulled into `aitm-core`; this is a read-only walk of the handshake layout
-/// (RFC 8446 §4.1.2, RFC 6066 §3), not a TLS implementation.
-fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
+/// (RFC 8446 §4.1.2, RFC 6066 §3), not a TLS implementation. Public so the HTTP
+/// module can read the SNI of a raw-TLS ClientHello it buffers itself when the
+/// hello did not fit the acceptor's peek (spec D2).
+pub fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
     // TLS record header: content_type(1)=0x16 handshake, version(2), length(2).
     if buf.first() != Some(&0x16) {
         return None;
@@ -311,13 +321,30 @@ fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
             let name_len = u16::from_be_bytes([*list.get(1)?, *list.get(2)?]) as usize;
             let name = list.get(3..3 + name_len)?;
             if name_type == 0x00 {
-                return std::str::from_utf8(name).ok().map(str::to_string);
+                return std::str::from_utf8(name)
+                    .ok()
+                    .filter(|name| is_dns_name(name))
+                    .map(str::to_string);
             }
             return None;
         }
         ext = ext.get(4 + ext_len..)?;
     }
     None
+}
+
+/// Whether `name` is what an SNI `host_name` must be (RFC 6066 §3: an ASCII
+/// DNS name, no IP literal): non-empty, at most 253 bytes, every byte an ASCII
+/// letter or digit, `-` or `.`. The SNI keys tunnel rows and is echoed into
+/// error text, so anything else — a control byte, a space, a non-ASCII byte, an
+/// over-long name — is treated as no SNI at all (panel S8). An IDNA name is its
+/// `xn--` A-label on the wire and passes.
+fn is_dns_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -445,13 +472,17 @@ impl ProxyBuilder {
 #[cfg(test)]
 mod tests {
     use super::{is_benign_disconnect, parse_client_hello_sni, Proxy};
-    use crate::config::Config;
+    use crate::config::{Config, ScopeEntry};
     use crate::error::GuardError;
     use crate::protocol::{ModuleCtx, NextLayerHint, ProtocolModule};
     use crate::stream::ByteStream;
     use futures::future::BoxFuture;
     use std::io;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
 
     /// A no-op protocol module that claims nothing — enough to assert the proxy
     /// exposes its registered module list, event sink, and a guarded connector.
@@ -484,6 +515,76 @@ mod tests {
         // The sink and a guarded connector construct without panicking.
         let _sink = proxy.event_sink();
         let _conn = proxy.upstream_connector(true);
+    }
+
+    /// Claims everything; when spawned, reports whether two authorities are in
+    /// scope according to its context — the question a module asks before it
+    /// terminates TLS (spec D2).
+    struct ScopeProbe {
+        answers: Mutex<Option<oneshot::Sender<(bool, bool)>>>,
+    }
+
+    impl ProtocolModule for ScopeProbe {
+        fn id(&self) -> &str {
+            "scope-probe"
+        }
+        fn matches(&self, _hint: &NextLayerHint) -> bool {
+            true
+        }
+        fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>> {
+            let probed = (
+                ctx.in_scope("example.com:443"),
+                ctx.in_scope("other.test:443"),
+            );
+            if let Some(tx) = self.answers.lock().ok().and_then(|mut s| s.take()) {
+                let _ = tx.send(probed);
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// AC14: the acceptor attaches the proxy's guard — the `StdGuard` seeded from
+    /// config and mutated by `scope.add` — to every `ModuleCtx` it spawns a module
+    /// with, so `ctx.in_scope` answers from the live Scope (`true` for the seeded
+    /// host, `false` for another), not the seam's deny-by-default `false`.
+    /// Binds a loopback listener: run it from a shell that may bind sockets.
+    #[tokio::test]
+    async fn acceptor_attaches_the_scope_guard_to_the_module_ctx() {
+        let mut cfg = Config::default();
+        cfg.scope.entries.push(ScopeEntry {
+            host: "example.com".to_string(),
+        });
+        let (tx, rx) = oneshot::channel();
+        let proxy = Proxy::builder()
+            .with_config(cfg)
+            .register_module(Arc::new(ScopeProbe {
+                answers: Mutex::new(Some(tx)),
+            }))
+            .build()
+            .expect("build proxy");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move { proxy.run_on(listener).await });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect the proxy");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("send a request line for the peek");
+
+        let answers = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the probe module is spawned within 5s")
+            .expect("the probe reports its answers");
+        assert_eq!(
+            answers,
+            (true, false),
+            "the acceptor's ModuleCtx answers in_scope from the proxy's own guard"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -649,5 +750,65 @@ mod tests {
     fn non_tls_bytes_yield_none() {
         assert_eq!(parse_client_hello_sni(b"GET / HTTP/1.1\r\n\r\n"), None);
         assert_eq!(parse_client_hello_sni(b""), None);
+    }
+
+    /// Panel S8, mirroring `Authority`'s `rejects_ascii_control_characters_in_the_host`:
+    /// the SNI is echoed into error text and keyed rows, so only an ASCII DNS
+    /// name is accepted — letters, digits, `-` and `.`, at most 253 bytes. A
+    /// terminal escape or any other control byte, a space, a slash, a colon, a
+    /// non-ASCII byte, an empty name or one past the DNS limit is `None`; a
+    /// plain name, an IDNA `xn--` A-label and a 253-byte name still parse.
+    #[test]
+    fn rejects_sni_that_is_not_an_ascii_dns_name() {
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("\x1b[2Jevil.example")),
+            None,
+            "a terminal escape in the SNI"
+        );
+        for c in [
+            '\x01', '\x07', '\x08', '\x0b', '\x0c', '\x1b', '\x7f', '\0', '\r', '\n', '\t', ' ',
+            '/', ':', '_',
+        ] {
+            let name = format!("evil{c}example.test");
+            assert_eq!(
+                parse_client_hello_sni(&client_hello_with_sni(&name)),
+                None,
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("bücher.example")),
+            None,
+            "a non-ASCII byte (a U-label is not what the wire carries)"
+        );
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("")),
+            None,
+            "an empty name"
+        );
+        let over = format!("{}.example", "a".repeat(246)); // 254 bytes
+        assert_eq!(over.len(), 254);
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni(&over)),
+            None,
+            "254 bytes is past the DNS limit"
+        );
+
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("pinned.example")).as_deref(),
+            Some("pinned.example")
+        );
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni("xn--bcher-kva.example")).as_deref(),
+            Some("xn--bcher-kva.example"),
+            "an IDNA A-label is ASCII and parses"
+        );
+        let max = format!("{}.example", "a".repeat(245)); // 253 bytes
+        assert_eq!(max.len(), 253);
+        assert_eq!(
+            parse_client_hello_sni(&client_hello_with_sni(&max)).as_deref(),
+            Some(max.as_str()),
+            "253 bytes is the DNS limit and parses"
+        );
     }
 }

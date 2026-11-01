@@ -42,7 +42,10 @@ libc = "0.2"
 
 [dev-dependencies]
 uuid.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `test-util` (dev-only) pauses the clock for the read-timeout test of `serve`
+# (`#[tokio::test(start_paused = true)]`), so the 30 s `READ_TIMEOUT` is
+# reached in virtual time.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 # The real intercept plugin + its flow.intercept/mutate/resume/kill commands,
 # driven through the registry so h2 interception is tested end to end against the
 # same plugin set the chain dispatches through (M7 Task 3).

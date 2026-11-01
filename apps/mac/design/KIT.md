@@ -4,9 +4,8 @@ The parts of the native macOS operator app, with their sizes and states, as
 built. Agents build from this page and review against it. Which token to
 use when is in `DESIGN-SYSTEM.md`; the values are in
 `docs/design/tokens.json` (generated into `UI/Tokens.swift`, never edited by
-hand). The gallery `DesignKit/KitGallery.swift` shows every part below in
-every state it can take; `APP_KIT_GALLERY=1` with the snapshot command
-captures it light and dark.
+hand). Parts are reviewed in the real app (dev bundle, real core); there is
+no parts gallery.
 
 ## Feel
 
@@ -79,7 +78,7 @@ Every text tier holds 4.5:1 or better on its surface in both modes.
 | `Tok.Size` | toolbar 44 · filterBar 36 · columnHeader 28 · Row.dense 28 / default 32 / comfortable 40 / card 64 · inspectorHeader 40 · tabBar 36 · interceptBar 40 · statusBar 28 · control 28 · controlLg 32 · badge 18 · statusDot 8 · icon 16 / iconInline 12 / iconToolbar 18 · sidebar 240 (200–320) · splitterHit 6 | fixed shell dimensions; `Density` moves row height and body size together (28/13, 32/13, 40/14) |
 | `Tok.Radius` | badge 4 · control 6 · panel 8 · floating 10 · pill (Capsule) | pill only for the listening pill, chips, count chips |
 | `Tok.Shadow.floating` | y 8, blur 24, 0.12 / 0.5 | menus, popovers, palette, sheets. Nothing that rests |
-| `Tok.Motion` | press 120 ms · hover 100 · popover 160 · sheet 220 · rowArrive 0 · interceptPulse 1200; `easeOut` (.23,1,.32,1) · `easeInOut` (.77,0,.175,1) | feedback only; no entrances; keyboard actions never animate |
+| `Tok.Motion` | press 120 ms · hover 100 · popover 160 · sheet 220 · rowArrive 0 · interceptPulse 1200; `easeOut` (.23,1,.32,1) · `easeInOut` (.77,0,.175,1) · `pulse` (.42,0,.58,1, Core Animation only: `pulseTiming` on the dot's layer, never a SwiftUI repeatForever); each curve also as `…Timing` | feedback only; no entrances; keyboard actions never animate; `hover`, `popover`, `sheet` are reserved (hover fills snap, popovers and sheets are system) |
 | `Tok.Metric` (TokenMapping.swift) | chip 22 · barButton 26 · smallButton 20 · countChip 18 · switch 26 × 16, knob 12 · padInner 10 · gapTight 6 · gapMeta 14 · chipSeparator 14 | the dense numbers between the 4 pt steps |
 | `Tok.Face` (TokenMapping.swift) | `ui(size, weight)` SF Pro · `data(size, weight)` SF Mono; `nsUI` / `nsData` for AppKit | chrome / every URL, header, body, time, size, id, method, status |
 
@@ -249,7 +248,7 @@ The one saturated element; hidden when disarmed.
 | State | Fill | Text | Content |
 | --- | --- | --- | --- |
 | armed, nothing paused | `Intercept.tint` | `Intercept.deep` 13 | hand glyph 13 · "Intercept armed — every request pauses here" · Rules… · Disarm i (ghosts in deep) |
-| paused | `Intercept.base` | `Intercept.onBase` 13 | dot 8 pulsing 1 → 0.45 over 1200 ms (still under Reduce Motion) · "N paused" semibold · target method + URL mono, 0.9 opacity, middle truncation · Resume ⌘⏎ / Apply & Resume (primary) · Resume all · Kill ⌘\ ▾ · Rules… · Disarm i |
+| paused | `Intercept.base` | `Intercept.onBase` 13 | dot 8 pulsing 1 → 0.45 over 1200 ms (a Core Animation opacity animation, curve `pulse`; removed under Reduce Motion) · "N paused" semibold · target method + URL mono, 0.9 opacity, middle truncation · Resume ⌘⏎ / Apply & Resume (primary) · Resume all · Kill ⌘\ ▾ · Rules… · Disarm i |
 
 ### Primary button (`PrimaryButton`)
 Label 12/500 `Ink.onInverse` + optional shortcut at 0.85 opacity, 6 apart;

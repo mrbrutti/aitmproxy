@@ -1,0 +1,46 @@
+{
+  "job": "scan-1a2b3c4d",
+  "kind": "scan",
+  "event": "phase",
+  "seq": 2,
+  "ts_ms": 1761900000002,
+  "status": {
+    "job": "scan-1a2b3c4d",
+    "state": "running",
+    "phase": "passive",
+    "elapsed_ms": 42000,
+    "probes": {
+      "sent": 0,
+      "budget": 0,
+      "errors": 0,
+      "timeouts": 0,
+      "rate_waits": 0,
+      "by_lane": {}
+    },
+    "points": {
+      "found": 0,
+      "queued": 0,
+      "audited": 0,
+      "skipped": {
+        "ignored": 0,
+        "frequent": 0,
+        "limit": 0
+      }
+    },
+    "issues": {
+      "total": 0,
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "info": 0
+      },
+      "by_confidence": {
+        "certain": 0,
+        "firm": 0,
+        "tentative": 0
+      }
+    }
+  }
+}
