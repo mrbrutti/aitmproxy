@@ -131,6 +131,12 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 
 24. **PR D after M2.** New Kit type `CATrustFailure { command, message, line, resolved(by:) }`: the last trust failure is keyed to its verb, so a trusted read-back clears an install failure and a not-trusted read-back clears an uninstall failure, and nothing else does; `Session.caTrustLastError` is that type. `Tests/AitmproxyKitTests/SetupWordsTests.swift` holds the sheet-words pin. `Session.forgetCATrust()` resets the read-back, the latch and the failure when the bus connection ends; `LaneDot(state:word:title:)` and `RemedyText` are the two parts every CA surface uses. `refreshCAStatus` logs a failed or undecodable `ca.status` read at debug (`os.Logger`, subsystem `com.mrbrutti.aitmproxy`, category `ca-trust`; the error text only, never the token or the reply) so a "could not be read" report has a cause. `CATrustFacts.storesUnknownLine` names a read-back that landed with every store `unknown`.
 
+## SP-AC38, read-only half (2026-11-01, Matt's Mac)
+
+- **TUI (PR #248, head d6708402):** the real `aitm tui` (proxy + TUI, one process) with its own config (listen 127.0.0.1:38080, loopback bus 38090), inside tmux; captured toolbar line `● aitmproxy · listening 127.0.0.1:38080 · CA trusted`; `ca.status` over its bus: user present/trusted yes, system absent/no. No install, uninstall or proxy change; exited on `q`. Artifacts `/tmp/claude/ca-proof/tui/`.
+- **Web (PR #247):** the real `aitm web` from head 204960cb (this branch's `dist` embedded) at 127.0.0.1:38082 against its own core (listen 38084, bus 38092); a real Chromium (the Code tab's browser pane) with the `#t=` token shows the toolbar status `aitmproxy · listening 127.0.0.1:38084 · CA trusted`; `ca.status` over that bus: user present/trusted yes, system absent/no. No install, uninstall or proxy change. Artifacts `/tmp/claude/ca-proof/web/`.
+- The TUI/web-driven install → `· CA trusting…` → flip → uninstall stays pending Matt's yes for a change driven from those frontends.
+
 ## Review log
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
