@@ -181,8 +181,7 @@ def main() -> int:
     core = bus = ui = None
     try:
         section("boot: aitm web + seeded target; witness on the loopback bus, inspector over /bus")
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         bus_port=free_port(), scope_entries=[tgt.authority, "127.0.0.1"])
+        cfg = CoreConfig(proxy_port=free_port(), bus_port=free_port(), scope_entries=[tgt.authority, "127.0.0.1"])
         core = Aitm.web(cfg)
         target = tgt.base.rstrip("/")
         u = urllib.parse.urlsplit(target)

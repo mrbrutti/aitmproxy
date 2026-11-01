@@ -304,7 +304,6 @@ def make_config(work: str, tag: str) -> tuple[CoreConfig, str]:
     base = os.path.join(work, tag)
     cfg = CoreConfig(
         proxy_port=free_port(),
-        browser_proxy_port=free_port(),
         bus_port=0,
         agent_token=secrets.token_hex(24),
         operator_token=secrets.token_hex(24),

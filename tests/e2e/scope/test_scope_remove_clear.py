@@ -96,7 +96,6 @@ def attach_or_boot():
         return core
     cfg = CoreConfig(
         proxy_port=free_port(),
-        browser_proxy_port=free_port(),
         allow_agent_widen=False,  # the shipped fail-closed posture
     )
     core = Aitm.server(cfg)

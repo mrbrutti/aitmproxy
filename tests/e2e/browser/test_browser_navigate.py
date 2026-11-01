@@ -76,8 +76,7 @@ def main() -> int:
     core = agent = None
     try:
         section("boot: aitm core + seeded target (obscura discovered from env / sibling if present)")
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         scope_entries=[tgt.authority, "127.0.0.1"], allow_agent_widen=True)
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[tgt.authority, "127.0.0.1"], allow_agent_widen=True)
         core = Aitm.server(cfg)
         agent = BusClient.agent(core)
         if "browser.navigate" not in agent.tool_names():

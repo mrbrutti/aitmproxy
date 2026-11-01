@@ -103,7 +103,6 @@ def main() -> int:
         section("boot: two real upstreams + a real aitm core (map authoring on)")
         cfg = _MapsCoreConfig(
             proxy_port=free_port(),
-            browser_proxy_port=free_port(),
             # The rewrite target must be in scope: map-remote passes the scope
             # guard before it rewrites. origin is in scope too (tidy, not required
             # for passive capture).

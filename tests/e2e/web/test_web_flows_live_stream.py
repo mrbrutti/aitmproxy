@@ -167,8 +167,7 @@ def main() -> None:
             # bus to a known free port (bus_port=0 would be ephemeral and unknowable);
             # the witness BusClient connects there while the UI uses the /bus bridge.
             up = Upstream().start()
-            cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                             bus_port=free_port(), scope_entries=[up.authority, "127.0.0.1"])
+            cfg = CoreConfig(proxy_port=free_port(), bus_port=free_port(), scope_entries=[up.authority, "127.0.0.1"])
             aitm = Aitm.web(cfg)
             bus_host, bus_port = "127.0.0.1", cfg.bus_port
             bus_token = cfg.agent_token

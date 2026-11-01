@@ -106,7 +106,7 @@ def acquire_core():
             skip("the runner's core has no AITM_BUS_OPERATOR_TOKEN: scope.add needs the operator "
                  "role (the agent is refused fail-closed), so added entries cannot be driven")
         return EnvCore(addr, agent_token, op_token), f"runner-provided core at {addr} (nothing booted)"
-    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(), allow_agent_widen=False)
+    cfg = CoreConfig(proxy_port=free_port(), allow_agent_widen=False)
     core = Aitm.server(cfg)
     core.owned = True  # type: ignore[attr-defined]
     return core, f"dedicated core (no AITM_BUS_ADDR in env): bus {core.bus_addr}, proxy 127.0.0.1:{cfg.proxy_port}"

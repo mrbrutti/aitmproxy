@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from . import free_port
+
 
 def _yaml_str(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -86,12 +88,15 @@ def l4_capture_entry(
 
 @dataclass
 class CoreConfig:
-    """The inputs to one `aitm` config.yaml. Ports default to None -> caller fills
-    them with free_port() before writing."""
+    """The inputs to one `aitm` config.yaml. The caller picks `proxy_port` (usually
+    `free_port()`); the browser proxy port defaults to a FREE port too, because a
+    fixed default collides with other sessions' cores on a shared machine and
+    obscura then talks to the wrong proxy (every browser crawl times out; T2 live
+    diagnosis, 2026-11-01)."""
 
     proxy_port: int
     bus_port: int = 0  # 0 = ephemeral; read the real port from --bus-endpoint-file
-    browser_proxy_port: int = 0
+    browser_proxy_port: int = field(default_factory=free_port)
     agent_token: str = "e2e-agent-token"
     operator_token: str = "e2e-operator-secret"
     scope_entries: list[str] = field(default_factory=list)

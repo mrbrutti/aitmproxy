@@ -91,7 +91,6 @@ def main() -> int:
     with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
-            browser_proxy_port=free_port(),
             scope_entries=[v.authority, p.authority],
         )
         with Aitm.server(cfg) as core:

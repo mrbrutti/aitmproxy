@@ -93,8 +93,7 @@ def main() -> int:
     try:
         section("arrange: vulnerable target + own core on free ports")
         target = boot_target("vulnerable")
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         scope_entries=[target.authority], findings_dir=findings_dir)
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[target.authority], findings_dir=findings_dir)
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
         require_verbs(op, "scan.start", "scan.status", "scan.issues", "scan.issue", "scan.issue.update")
@@ -150,8 +149,7 @@ def main() -> int:
         op = None
         core.stop()
         core = None
-        cfg2 = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                          scope_entries=[target.authority], findings_dir=findings_dir)
+        cfg2 = CoreConfig(proxy_port=free_port(), scope_entries=[target.authority], findings_dir=findings_dir)
         core2 = Aitm.server(cfg2)
         op2 = BusClient.operator(core2)
         got = issue(op2, "operator", x1["id"])

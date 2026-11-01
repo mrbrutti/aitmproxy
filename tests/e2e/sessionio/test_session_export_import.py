@@ -607,8 +607,7 @@ class Rig:
             self._operator_token = os.environ.get("AITM_BUS_OPERATOR_TOKEN") or None
             self.shared = True
             return self
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         scope_entries=list(scope_entries) + ["127.0.0.1"])
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=list(scope_entries) + ["127.0.0.1"])
         try:
             self.core = Aitm.server(cfg)
         except FileNotFoundError as e:

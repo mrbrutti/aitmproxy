@@ -92,8 +92,7 @@ def main() -> int:
         section("arrange: V + P targets, own core with findings.dir set")
         v = boot_target("vulnerable")
         p = boot_target("patched")
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         scope_entries=[v.authority, p.authority], findings_dir=findings_dir)
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[v.authority, p.authority], findings_dir=findings_dir)
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
         require_verbs(op, "scan.start", "scan.status", "scan.issues", "scan.checks")

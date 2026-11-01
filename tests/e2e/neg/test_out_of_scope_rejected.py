@@ -71,7 +71,6 @@ def main() -> int:
         # genuinely out of scope even though it is a live, reachable loopback origin.
         cfg = CoreConfig(
             proxy_port=free_port(),
-            browser_proxy_port=free_port(),
             scope_entries=[allowed.authority],
         )
         core = Aitm.server(cfg)

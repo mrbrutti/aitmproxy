@@ -256,7 +256,6 @@ def main() -> int:
             cfg = ConfigUnderTest(
                 proxy_port=free_port(),
                 bus_port=free_port(),  # explicit, so the configured port and the bound port can be compared
-                browser_proxy_port=free_port(),
                 agent_token=secrets.token_hex(16),
                 operator_token=secrets.token_hex(16),
                 scope_entries=["e2e-config.invalid", "*.e2e-config.example"],  # never contacted

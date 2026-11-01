@@ -66,8 +66,7 @@ def main() -> int:
     try:
         section("arrange: vulnerable target + own core on free ports")
         target = boot_target("vulnerable")
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         scope_entries=[target.authority])
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[target.authority])
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
         require_verbs(op, "scan.start", "scan.status")

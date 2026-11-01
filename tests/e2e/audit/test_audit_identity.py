@@ -111,7 +111,6 @@ def main() -> int:
         section("boot: a fresh real aitm core of our own, three connections (A, B agent-token; O operator)")
         cfg = CoreConfig(
             proxy_port=free_port(),
-            browser_proxy_port=free_port(),
             scope_entries=["127.0.0.1"],
         )
         core = Aitm.server(cfg)

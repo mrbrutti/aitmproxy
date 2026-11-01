@@ -41,7 +41,7 @@ def obscura_discoverable() -> str | None:
 
 
 def main() -> int:
-    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port())
+    cfg = CoreConfig(proxy_port=free_port())
 
     section("boot: aitm web starts cleanly and binds")
     core = Aitm.web(cfg)  # raises (with aitm stderr) if it does not bind in time

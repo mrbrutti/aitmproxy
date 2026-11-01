@@ -186,7 +186,7 @@ def acquire_core():
             fail("AITM_BUS_ADDR is set but AITM_BUS_TOKEN (the agent token) is not")
         core = EnvCore(addr, agent_token, os.environ.get("AITM_BUS_OPERATOR_TOKEN") or None)
         return core, f"runner-provided core at {addr} (nothing booted)"
-    cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port())
+    cfg = CoreConfig(proxy_port=free_port())
     core = Aitm.server(cfg)
     core.owned = True  # type: ignore[attr-defined]
     return core, f"dedicated core (no AITM_BUS_ADDR in env): bus {core.bus_addr}, proxy 127.0.0.1:{cfg.proxy_port}"

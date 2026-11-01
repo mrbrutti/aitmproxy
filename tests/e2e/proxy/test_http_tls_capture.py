@@ -44,7 +44,6 @@ def main() -> int:
         section("boot: real aitm (ssl_insecure, per-run CA) + plain + TLS upstreams")
         cfg = c.ProxyConfig(
             proxy_port=free_port(),
-            browser_proxy_port=free_port(),
             scope_entries=[up.authority, https_auth, "127.0.0.1"],
             ca_dir=ca_dir,
         )

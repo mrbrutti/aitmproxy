@@ -104,8 +104,7 @@ def main() -> int:
     ws2 = None
     try:
         section("boot aitm web + upstream (upstream in scope)")
-        cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                         scope_entries=[up.authority, "127.0.0.1"])
+        cfg = CoreConfig(proxy_port=free_port(), scope_entries=[up.authority, "127.0.0.1"])
         core = Aitm.web(cfg)
         ok(f"aitm web on :{core.web_port}, proxy :{cfg.proxy_port}, upstream {up.base}")
         # The only client of this core is this one /bus connection: no browser is
