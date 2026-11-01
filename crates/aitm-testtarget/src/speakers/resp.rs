@@ -653,4 +653,102 @@ mod tests {
             );
         }
     }
+
+    // --- Tester additions (stage 5, T10 PR C) ---
+
+    /// `expected '$', got '<c>'` quotes exactly one printable char: a
+    /// control byte (DEL, TAB, NUL) is dropped, a lone high-bit byte or a
+    /// truncated UTF-8 lead becomes U+FFFD, a complete multi-byte char is
+    /// quoted whole. The reply is always a single well-formed error line
+    /// (no raw byte, no embedded CR/LF), then the connection closes, in
+    /// both modes.
+    #[test]
+    fn resp_expected_dollar_quotes_one_printable_char() {
+        let reply = |got: &str| {
+            Step::Fault(format!("-ERR Protocol error: expected '$', got '{got}'\r\n").into_bytes())
+        };
+        let cases: [(&[u8], usize, Step); 8] = [
+            (b"*1\r\n\x7fPING\r\n", 11, reply("")),
+            (b"*1\r\n\tPING\r\n", 11, reply("")),
+            (b"*1\r\n\x00PING\r\n", 11, reply("")),
+            (b"*1\r\n\xffPING\r\n", 11, reply("\u{FFFD}")),
+            (b"*1\r\n\xc3PING\r\n", 11, reply("\u{FFFD}")),
+            (b"*1\r\n\xc3\xa9\r\n", 8, reply("\u{e9}")),
+            (b"*1\r\n:1\r\n", 8, reply(":")),
+            (b"*2\r\n$4\r\nPING\r\n-x\r\n", 18, reply("-")),
+        ];
+        for (buf, consumed, step) in cases {
+            for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+                let got = parse(mode, buf);
+                assert_eq!(
+                    got,
+                    Parsed::Message {
+                        consumed,
+                        verb: None,
+                        step: step.clone(),
+                    },
+                    "{mode:?} {:?}",
+                    String::from_utf8_lossy(buf)
+                );
+                // The reply is one line: no CR/LF before its terminator.
+                let Parsed::Message {
+                    step: Step::Fault(bytes),
+                    ..
+                } = got
+                else {
+                    unreachable!()
+                };
+                let body = &bytes[..bytes.len() - 2];
+                assert!(
+                    !body.iter().any(|b| *b == b'\r' || *b == b'\n'),
+                    "{:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+        // The literal bytes of the U+FFFD case: EF BF BD inside the quotes.
+        assert_eq!(
+            parse(SeedMode::Patched, b"*1\r\n\xffPING\r\n"),
+            Parsed::Message {
+                consumed: 11,
+                verb: None,
+                step: Step::Fault(
+                    b"-ERR Protocol error: expected '$', got '\xef\xbf\xbd'\r\n".to_vec()
+                ),
+            }
+        );
+    }
+
+    /// The speaker never waits past its `max_buffer()` (spec D5): an inline
+    /// buffer one byte over the cap is `too big inline request` (reply,
+    /// then close) in both modes, never `Wait`; an array over the cap is
+    /// the row's bug. So the driver's `CloseOversize` containment path
+    /// (a silent close) is unreachable through this speaker.
+    #[test]
+    fn resp_never_waits_past_its_buffer_cap() {
+        let over = Resp.max_buffer() + 1;
+        let inline = vec![b'a'; over];
+        let too_big = Step::Fault(b"-ERR Protocol error: too big inline request\r\n".to_vec());
+        // `*2`: a 64-byte first element, then a 1 MiB second element still
+        // 22 bytes short of complete when the buffer is one over the cap.
+        let mut array = b"*2\r\n$64\r\n".to_vec();
+        array.extend(std::iter::repeat_n(b'p', 64));
+        array.extend_from_slice(b"\r\n$1048576\r\n");
+        array.resize(over, b'x');
+        assert_eq!(Resp.parse(SeedMode::Patched, &array), Parsed::Incomplete);
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(Resp.on_idle(mode, &inline), too_big, "{mode:?}");
+            assert_ne!(Resp.on_idle(mode, &array), Step::Wait, "{mode:?}");
+        }
+        assert_eq!(Resp.on_idle(SeedMode::Vulnerable, &array), Step::Trigger);
+        assert_eq!(
+            Resp.on_idle(SeedMode::Patched, &array),
+            Step::Fault(b"-ERR Protocol error: incomplete multibulk\r\n".to_vec())
+        );
+        // Exactly the cap, no CRLF: still a line that could complete.
+        assert_eq!(
+            Resp.on_idle(SeedMode::Vulnerable, &inline[..MAX_BULK]),
+            Step::Wait
+        );
+    }
 }

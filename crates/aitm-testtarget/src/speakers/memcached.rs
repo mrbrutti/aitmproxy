@@ -376,4 +376,66 @@ mod tests {
             );
         }
     }
+
+    // --- Tester additions (stage 5, T10 PR C) ---
+
+    /// The largest completable `set` (a 2048-byte command line, its CRLF, a
+    /// 1 MiB data block, its CRLF) is exactly `max_buffer()` bytes: stalled
+    /// on its final LF it is `Incomplete` and waits in both modes, one byte
+    /// later it is `STORED`. One byte more on the command line is the
+    /// over-long-line bug, so no incomplete message can ever exceed the cap
+    /// and a `Wait` past it is unreachable through this speaker.
+    #[test]
+    fn mc_cap_sized_set_stalled_on_its_final_crlf_waits_then_stores() {
+        // `set <key> 0 0 1048576` padded to exactly MAX_LINE bytes.
+        let key = "k".repeat(MAX_LINE - "set ".len() - " 0 0 1048576".len());
+        let mut line = format!("set {key} 0 0 1048576").into_bytes();
+        assert_eq!(line.len(), MAX_LINE);
+        line.extend_from_slice(b"\r\n");
+        let mut stalled = line.clone();
+        stalled.extend(std::iter::repeat_n(b'x', MAX_DATA));
+        stalled.push(b'\r');
+        assert_eq!(stalled.len(), Memcached.max_buffer() - 1);
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(parse(mode, &stalled), Parsed::Incomplete, "{mode:?}");
+            assert_eq!(Memcached.on_idle(mode, &stalled), Step::Wait, "{mode:?}");
+        }
+        let mut complete = stalled.clone();
+        complete.push(b'\n');
+        assert_eq!(complete.len(), Memcached.max_buffer());
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                parse(mode, &complete),
+                msg(
+                    Memcached.max_buffer(),
+                    "set",
+                    Step::Reply(b"STORED\r\n".to_vec())
+                ),
+                "{mode:?}"
+            );
+        }
+        // One more byte on the command line: the CRLF lies past the cap, so
+        // this is the row's bug (crash in V, `line too long` then close in
+        // P), not a wait, however much data follows.
+        let mut long_line = format!("set k{key} 0 0 1048576\r\n").into_bytes();
+        long_line.extend(std::iter::repeat_n(b'x', MAX_DATA));
+        long_line.extend_from_slice(b"\r\n");
+        assert!(long_line.len() > Memcached.max_buffer());
+        assert_eq!(
+            parse(SeedMode::Vulnerable, &long_line),
+            Parsed::Message {
+                consumed: long_line.len(),
+                verb: None,
+                step: Step::Trigger,
+            }
+        );
+        assert_eq!(
+            parse(SeedMode::Patched, &long_line),
+            Parsed::Message {
+                consumed: long_line.len(),
+                verb: None,
+                step: Step::Fault(b"CLIENT_ERROR line too long\r\n".to_vec()),
+            }
+        );
+    }
 }

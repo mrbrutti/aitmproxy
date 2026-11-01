@@ -336,4 +336,74 @@ mod tests {
             }
         );
     }
+
+    // --- Tester additions (stage 5, T10 PR C) ---
+
+    /// At the 1024-byte cap: a line of exactly the cap plus a lone CR is
+    /// still a partial line (its LF may arrive) and waits in both modes;
+    /// with the LF it is the largest completable line, `max_buffer()`
+    /// bytes, answered as an unknown command with the connection kept. A
+    /// damaged terminator at or past the cap (`\r\t`) can no longer
+    /// complete within the cap, so it is the over-long-line bug (crash in
+    /// V, `500 line too long` then close in P), never a wait. So no
+    /// incomplete buffer ever exceeds `max_buffer()` and a `Wait` past it
+    /// is unreachable through this speaker.
+    #[test]
+    fn smtp_never_waits_past_its_buffer_cap() {
+        let mut s = Smtp;
+        let cap = MAX_LINE;
+        let mut lone_cr = vec![b'a'; cap];
+        lone_cr.push(b'\r');
+        assert_eq!(lone_cr.len(), s.max_buffer() - 1);
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(s.parse(mode, &lone_cr), Parsed::Incomplete, "{mode:?}");
+            assert_eq!(s.on_idle(mode, &lone_cr), Step::Wait, "{mode:?}");
+        }
+        let mut complete = lone_cr.clone();
+        complete.push(b'\n');
+        assert_eq!(complete.len(), s.max_buffer());
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                s.parse(mode, &complete),
+                msg(
+                    s.max_buffer(),
+                    &"A".repeat(cap),
+                    Step::ProtocolError(b"500 unknown command\r\n".to_vec())
+                ),
+                "{mode:?}"
+            );
+        }
+        // Damaged terminators that can no longer complete within the cap.
+        let mut at_cap = vec![b'a'; cap];
+        at_cap.extend_from_slice(b"\r\t");
+        let mut one_short = vec![b'a'; cap - 1];
+        one_short.extend_from_slice(b"\r\t");
+        for buf in [&at_cap, &one_short] {
+            assert_eq!(
+                s.parse(SeedMode::Vulnerable, buf),
+                Parsed::Message {
+                    consumed: buf.len(),
+                    verb: None,
+                    step: Step::Trigger,
+                },
+                "len {}",
+                buf.len()
+            );
+            assert_eq!(
+                s.parse(SeedMode::Patched, buf),
+                Parsed::Message {
+                    consumed: buf.len(),
+                    verb: None,
+                    step: Step::Fault(b"500 line too long\r\n".to_vec()),
+                },
+                "len {}",
+                buf.len()
+            );
+        }
+        // Under the cap the same damaged terminator is just a partial line.
+        let mut short = b"NOOP".to_vec();
+        short.extend_from_slice(b"\r\t");
+        assert_eq!(s.parse(SeedMode::Patched, &short), Parsed::Incomplete);
+        assert_eq!(s.on_idle(SeedMode::Patched, &short), Step::Wait);
+    }
 }

@@ -1063,6 +1063,42 @@ fn malformed_rows() -> Vec<Malformed> {
             send: b"*-1\r\n".to_vec(),
             expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
         },
+        // --- Tester additions (stage 5) ---
+        Malformed {
+            service: "l4-resp",
+            label: "garbled array count",
+            banner: None,
+            send: b"*abc\r\n".to_vec(),
+            expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "empty element line: nothing to quote",
+            banner: None,
+            send: b"*1\r\n\r\nPING\r\n".to_vec(),
+            expect: b"-ERR Protocol error: expected '$', got ''\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "simple-string element `+PING`",
+            banner: None,
+            send: b"*1\r\n+PING\r\n".to_vec(),
+            expect: b"-ERR Protocol error: expected '$', got '+'\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "high-bit byte where `$` should be is quoted as U+FFFD",
+            banner: None,
+            send: b"*1\r\n\xffPING\r\n".to_vec(),
+            expect: b"-ERR Protocol error: expected '$', got '\xef\xbf\xbd'\r\n".to_vec(),
+        },
+        Malformed {
+            service: "l4-resp",
+            label: "inline line one byte past 1 MiB with no CRLF (at the 200 ms idle)",
+            banner: None,
+            send: vec![b'a'; RESP_MAX_BULK + 1],
+            expect: b"-ERR Protocol error: too big inline request\r\n".to_vec(),
+        },
     ]
 }
 
@@ -1196,6 +1232,33 @@ fn partial_rows() -> Vec<Partial> {
             first: b"PIN".to_vec(),
             second: b"G\r\n".to_vec(),
             expect: b"+PONG\r\n".to_vec(),
+        },
+        // --- Tester additions (stage 5) ---
+        Partial {
+            service: "l4-memcached",
+            label: "cap-sized set (1 MiB) stalled on its final LF",
+            banner: None,
+            first: {
+                let mut first = format!("set k 0 0 {MC_MAX_DATA}\r\n").into_bytes();
+                first.extend(std::iter::repeat_n(b'x', MC_MAX_DATA));
+                first.push(b'\r');
+                first
+            },
+            second: b"\n".to_vec(),
+            expect: b"STORED\r\n".to_vec(),
+        },
+        Partial {
+            service: "l4-resp",
+            label: "inline line of exactly 1 MiB waits, then its CRLF makes it an unknown command",
+            banner: None,
+            first: vec![b'a'; RESP_MAX_BULK],
+            second: b"\r\n".to_vec(),
+            expect: {
+                let mut expect = b"-ERR unknown command '".to_vec();
+                expect.extend(std::iter::repeat_n(b'a', 128));
+                expect.extend_from_slice(b"'\r\n");
+                expect
+            },
         },
     ]
 }
@@ -1352,4 +1415,300 @@ async fn high_bit_flow(row: HighBit, addr: SocketAddr, _control: String) -> Res<
 async fn high_bit_argument_gets_the_normal_reply() {
     run_rows(SeedMode::Patched, high_bit_rows(), high_bit_flow).await;
     run_rows(SeedMode::Vulnerable, high_bit_rows(), high_bit_flow).await;
+}
+
+// --- Tester additions (stage 5): the idle timer re-arms; the crash window still wins ---
+
+/// Spec D5: RESP bulk / inline cap and memcached data cap (1 MiB).
+const RESP_MAX_BULK: usize = 1_048_576;
+const MC_MAX_DATA: usize = 1_048_576;
+/// Gap between dribbled bytes: past the speaker's 200 ms idle, so every
+/// byte lands on a connection that has already returned `Wait` at least once.
+const DRIBBLE_GAP: Duration = Duration::from_millis(300);
+/// A waiting connection must be past its first idle before the trigger.
+const WAIT_SETTLE: Duration = Duration::from_millis(400);
+
+/// A line delivered one byte at a time, each after more than the idle.
+struct Dribble {
+    service: &'static str,
+    label: &'static str,
+    banner: Option<&'static [u8]>,
+    line: Vec<u8>,
+    expect: Vec<u8>,
+}
+
+impl RowInfo for Dribble {
+    fn service(&self) -> &'static str {
+        self.service
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+fn dribble_rows() -> Vec<Dribble> {
+    vec![
+        Dribble {
+            service: "l4-smtp",
+            label: "NOOP byte by byte",
+            banner: Some(SMTP_BANNER),
+            line: b"NOOP\r\n".to_vec(),
+            expect: b"250 OK\r\n".to_vec(),
+        },
+        Dribble {
+            service: "l4-ftp",
+            label: "NOOP byte by byte",
+            banner: Some(FTP_BANNER),
+            line: b"NOOP\r\n".to_vec(),
+            expect: b"200 ok\r\n".to_vec(),
+        },
+        Dribble {
+            service: "l4-memcached",
+            label: "version byte by byte",
+            banner: None,
+            line: b"version\r\n".to_vec(),
+            expect: b"VERSION 1.6.0-aitm\r\n".to_vec(),
+        },
+        Dribble {
+            service: "l4-resp",
+            label: "inline PING byte by byte",
+            banner: None,
+            line: b"PING\r\n".to_vec(),
+            expect: b"+PONG\r\n".to_vec(),
+        },
+    ]
+}
+
+async fn dribble_flow(row: Dribble, addr: SocketAddr, control: String) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    let local = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    let (last, head) = row
+        .line
+        .split_last()
+        .ok_or_else(|| "empty line".to_string())?;
+    for (i, byte) in head.iter().enumerate() {
+        stream
+            .write_all(&[*byte])
+            .await
+            .map_err(|e| format!("write byte {}: {e}", i + 1))?;
+        // Every gap is longer than the idle: the speaker must return `Wait`
+        // each time, writing nothing and keeping the connection.
+        let (bytes, closed) = read_until_idle(&mut stream, DRIBBLE_GAP).await;
+        if closed {
+            return Err(format!(
+                "closed after byte {} of {} (wrote {})",
+                i + 1,
+                row.line.len(),
+                hex(&bytes)
+            ));
+        }
+        if !bytes.is_empty() {
+            return Err(format!("wrote {} after byte {}", hex(&bytes), i + 1));
+        }
+    }
+    let got = exchange(&mut stream, &[*last], REPLY_IDLE).await?;
+    if got != row.expect {
+        return Err(format!(
+            "completed line: got {} expected {}",
+            hex(&got),
+            hex(&row.expect)
+        ));
+    }
+    let log = l4_log(&control, row.service).await?;
+    let conn_id = conn_id_of(&log, local)?;
+    if let Some(close) = close_of(&log, &conn_id)? {
+        return Err(format!("closed before we hung up: {close}"));
+    }
+    // None of the waits was logged: one `in` message, the whole line.
+    let ins: Vec<&Value> = array(&log, "messages")?
+        .iter()
+        .filter(|m| m["conn_id"] == conn_id && m["dir"] == "in")
+        .collect();
+    if ins.len() != 1 {
+        return Err(format!(
+            "{} `in` messages for one dribbled line: {ins:?}",
+            ins.len()
+        ));
+    }
+    if ins[0]["sha256"] != sha256_hex(&row.line) {
+        return Err(format!(
+            "`in` sha256 {} != sha256(line) {}",
+            ins[0]["sha256"],
+            sha256_hex(&row.line)
+        ));
+    }
+    Ok(())
+}
+
+/// The idle timer re-arms on every byte: a line dribbled one byte per
+/// 300 ms (each gap past the 200 ms idle) is answered only when its LF
+/// arrives, nothing is written or logged meanwhile, and the whole line is
+/// the one `in` message, in both modes (spec D5 `Step::Wait`).
+#[tokio::test]
+async fn dribbled_line_re_arms_the_idle_timer() {
+    run_rows(SeedMode::Patched, dribble_rows(), dribble_flow).await;
+    run_rows(SeedMode::Vulnerable, dribble_rows(), dribble_flow).await;
+}
+
+/// A connection parked in `Wait` while another connection fires the V
+/// trigger.
+struct WaitingThenCrash {
+    service: &'static str,
+    label: &'static str,
+    banner: Option<&'static [u8]>,
+    partial: Vec<u8>,
+    trigger: Vec<u8>,
+}
+
+impl RowInfo for WaitingThenCrash {
+    fn service(&self) -> &'static str {
+        self.service
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+fn waiting_then_crash_rows() -> Vec<WaitingThenCrash> {
+    vec![
+        WaitingThenCrash {
+            service: "l4-smtp",
+            label: "NOO waiting, long line on another connection",
+            banner: Some(SMTP_BANNER),
+            partial: b"NOO".to_vec(),
+            trigger: long_line(),
+        },
+        WaitingThenCrash {
+            service: "l4-ftp",
+            label: "USER a waiting, long line on another connection",
+            banner: Some(FTP_BANNER),
+            partial: b"USER a".to_vec(),
+            trigger: long_line(),
+        },
+        WaitingThenCrash {
+            service: "l4-memcached",
+            label: "set waiting for its data, long line on another connection",
+            banner: None,
+            partial: b"set k 0 0 2\r\nh".to_vec(),
+            trigger: long_line(),
+        },
+        WaitingThenCrash {
+            service: "l4-resp",
+            label: "inline PIN waiting, $2000000 on another connection",
+            banner: None,
+            partial: b"PIN".to_vec(),
+            trigger: b"*1\r\n$2000000\r\n".to_vec(),
+        },
+    ]
+}
+
+async fn waiting_then_crash_flow(
+    row: WaitingThenCrash,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
+    let mut waiting = tcp_open(addr, row.banner).await?;
+    let waiting_local = waiting
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    waiting
+        .write_all(&row.partial)
+        .await
+        .map_err(|e| format!("write partial: {e}"))?;
+    // Past the idle: the speaker has returned `Wait`, silent and open.
+    let (bytes, closed) = read_until_idle(&mut waiting, WAIT_SETTLE).await;
+    if closed {
+        return Err(format!(
+            "closed on the partial line (wrote {})",
+            hex(&bytes)
+        ));
+    }
+    if !bytes.is_empty() {
+        return Err(format!("wrote {} on the partial line", hex(&bytes)));
+    }
+
+    // The trigger on a second connection: closes with no bytes.
+    let mut trigger = tcp_open(addr, row.banner).await?;
+    let trigger_local = trigger
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    trigger
+        .write_all(&row.trigger)
+        .await
+        .map_err(|e| format!("write trigger: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut trigger, CLOSE_WITHIN).await;
+    if !closed {
+        return Err("trigger connection still open after 1 s".to_string());
+    }
+    if !bytes.is_empty() {
+        return Err(format!(
+            "V wrote {} before closing the trigger",
+            hex(&bytes)
+        ));
+    }
+
+    // The crash window tears the waiting connection down too: EOF, no
+    // bytes, within 500 ms of the trigger; the listener refuses.
+    let (bytes, closed) = read_until_idle(&mut waiting, DOWN_WITHIN).await;
+    if !closed {
+        return Err("waiting connection still open 500 ms after the crash".to_string());
+    }
+    if !bytes.is_empty() {
+        return Err(format!("V wrote {} to the waiting connection", hex(&bytes)));
+    }
+    if !connect_refused(addr).await {
+        return Err("listener still accepting after the crash".to_string());
+    }
+
+    let log = l4_log(&control, row.service).await?;
+    let waiting_id = conn_id_of(&log, waiting_local)?;
+    let trigger_id = conn_id_of(&log, trigger_local)?;
+    for (what, id) in [("waiting", &waiting_id), ("trigger", &trigger_id)] {
+        let close =
+            close_of(&log, id)?.ok_or_else(|| format!("no closes entry for {what} {id}"))?;
+        if close["reason"] != "trigger" {
+            return Err(format!("{what} close reason: {}", close["reason"]));
+        }
+    }
+    // The wait itself was never a logged message.
+    let waiting_ins = array(&log, "messages")?
+        .iter()
+        .filter(|m| m["conn_id"] == waiting_id && m["dir"] == "in")
+        .count();
+    if waiting_ins != 0 {
+        return Err(format!(
+            "{waiting_ins} `in` messages logged for the waiting connection"
+        ));
+    }
+    let downtime = array(&log, "downtime")?;
+    if downtime.len() != 1 {
+        return Err(format!(
+            "downtime has {} entries: {downtime:?}",
+            downtime.len()
+        ));
+    }
+    if downtime[0]["conn_id"] != trigger_id {
+        return Err(format!(
+            "downtime.conn_id {} is not the trigger connection {trigger_id}",
+            downtime[0]["conn_id"]
+        ));
+    }
+    Ok(())
+}
+
+/// `Wait` never outlives the crash window: a connection parked on a partial
+/// line is torn down with no bytes (close reason `trigger`, never logged
+/// as a message) when another connection fires the Vulnerable trigger, and
+/// the listener is refusing by then (spec D5 `Step::Wait`: "the driver ...
+/// still ends the connection ... on the crash window").
+#[tokio::test]
+async fn crash_window_tears_down_a_waiting_connection() {
+    run_rows(
+        SeedMode::Vulnerable,
+        waiting_then_crash_rows(),
+        waiting_then_crash_flow,
+    )
+    .await;
 }
