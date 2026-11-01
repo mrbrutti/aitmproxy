@@ -11,14 +11,14 @@
 //! [`request_linux`] below (plan P1b.14), whose argv is [`pkexec_argv`].
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::privilege::contract::LINUX_HELPER_PATH;
 use crate::privilege::derive::{text, LinuxInputs};
@@ -135,11 +135,17 @@ pub(crate) fn gather_linux(helper_path: Option<&Path>, session_connected: bool) 
     let helper = candidates(helper_path, &exe_dir)
         .into_iter()
         .find(|path| path.is_file())
-        .map(|path| HelperCandidate {
-            at_policy_path: path == Path::new(LINUX_HELPER_PATH),
-            root_owned_chain: path_chain(&path).is_some_and(|chain| root_owned_chain(&chain)),
-            file_caps_net_raw: probe_reports_net_raw(&path),
-            path,
+        .map(|path| {
+            let root_owned = path_chain(&path).is_some_and(|chain| root_owned_chain(&chain));
+            // The probe runs only a helper root alone could have placed (it
+            // executes the file), and once per `(path, mtime)`.
+            let file_caps_net_raw = root_owned && probe_file_caps_cached(&path);
+            HelperCandidate {
+                at_policy_path: path == Path::new(LINUX_HELPER_PATH),
+                root_owned_chain: root_owned,
+                file_caps_net_raw,
+                path,
+            }
         });
 
     LinuxInputs {
@@ -197,6 +203,51 @@ fn path_chain(path: &Path) -> Option<Vec<PathMeta>> {
         });
     }
     Some(chain)
+}
+
+/// Answers of the helper's `probe`, one per `(path, mtime)`: the probe is a
+/// subprocess and must not run on every re-probe of the report (1 s TTL).
+/// A file that changed (new mtime) is probed again.
+#[derive(Debug, Default)]
+pub struct ProbeCache {
+    seen: HashMap<PathBuf, (SystemTime, bool)>,
+}
+
+impl ProbeCache {
+    /// The cached answer for `path` at `mtime`, else `probe()`'s, remembered.
+    pub fn file_caps(
+        &mut self,
+        path: &Path,
+        mtime: SystemTime,
+        probe: impl FnOnce() -> bool,
+    ) -> bool {
+        if let Some((seen, answer)) = self.seen.get(path) {
+            if *seen == mtime {
+                return *answer;
+            }
+        }
+        let answer = probe();
+        self.seen.insert(path.to_path_buf(), (mtime, answer));
+        answer
+    }
+}
+
+/// [`probe_reports_net_raw`] through the process-wide [`ProbeCache`]. A
+/// helper whose metadata cannot be read is not probed.
+#[cfg(target_os = "linux")]
+fn probe_file_caps_cached(helper: &Path) -> bool {
+    use std::sync::OnceLock;
+
+    static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
+
+    let Ok(mtime) = std::fs::metadata(helper).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    CACHE
+        .get_or_init(|| Mutex::new(ProbeCache::default()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .file_caps(helper, mtime, || probe_reports_net_raw(helper))
 }
 
 /// Run `<helper> probe` as this user with a bounded wait and read the
@@ -1711,5 +1762,48 @@ mod tests {
         assert_eq!(hold.count(), 0);
         assert!(!hold.is_held());
         assert!(!shared.is_held());
+    }
+
+    // ---- fix task 2026-11-01: S2 (the file-caps probe is cached per path+mtime) ----
+
+    /// The helper's `probe` is a subprocess; it runs once per `(path, mtime)`
+    /// and again only when the file changed, not on every 1 s re-probe.
+    #[test]
+    fn file_caps_probe_runs_once_per_path_and_mtime() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let mut cache = ProbeCache::default();
+        let runs = std::cell::Cell::new(0);
+        let runs = &runs;
+        let probe = |answer: bool| {
+            move || {
+                runs.set(runs.get() + 1);
+                answer
+            }
+        };
+        let helper = Path::new("/usr/lib/aitmproxy/aitm-l4-helper");
+        let t1 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t2 = t1 + Duration::from_secs(60);
+
+        assert!(cache.file_caps(helper, t1, probe(true)));
+        assert!(
+            cache.file_caps(helper, t1, probe(false)),
+            "cached: the probe did not run"
+        );
+        assert_eq!(runs.get(), 1);
+
+        // The file changed: probed again, and the new answer is kept.
+        assert!(!cache.file_caps(helper, t2, probe(false)));
+        assert_eq!(runs.get(), 2);
+        assert!(!cache.file_caps(helper, t2, probe(true)));
+        assert_eq!(runs.get(), 2);
+
+        // Another path is its own entry.
+        assert!(cache.file_caps(
+            Path::new("/run/wrappers/bin/aitm-l4-helper"),
+            t1,
+            probe(true)
+        ));
+        assert_eq!(runs.get(), 3);
     }
 }

@@ -403,3 +403,24 @@ fn optional_str(text: Option<&str>) -> Value {
 fn epoch_ms(ms: u64) -> Value {
     Value::Int(i64::try_from(ms).unwrap_or(i64::MAX))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- fix task 2026-11-01: S5 (bounded operator-facing texts) ----
+
+    #[test]
+    fn bounded_text_cleans_trims_and_cuts_at_a_char_boundary() {
+        assert_eq!(bounded_text("  a\nb\tc\u{7}d  ", 512), "a b c d");
+        assert_eq!(bounded_text(&"x".repeat(600), 512).len(), 512);
+        // Cut lands inside a 2-byte char: back off to the boundary.
+        let s = format!("{}é", "a".repeat(511));
+        assert_eq!(bounded_text(&s, 512), "a".repeat(511));
+        assert_eq!(bounded_text("", 10), "");
+        assert_eq!(bounded_text(" \n\t ", 10), "");
+        assert_eq!(bounded_text_or(" \n ", 10, "fallback"), "fallback");
+        assert_eq!(bounded_text_or("ok", 10, "fallback"), "ok");
+        assert_eq!(TEXT_BOUND, 512);
+    }
+}

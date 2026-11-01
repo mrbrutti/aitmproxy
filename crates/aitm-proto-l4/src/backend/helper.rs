@@ -29,8 +29,10 @@
 //!
 //! A closed session, a write failure or an unanswered inject is
 //! [`L4Error::Unavailable`]; the helper's own guard or wire refusal text is
-//! [`L4Error::WireWrite`] verbatim, so a scope refusal reads exactly as the
-//! core's would.
+//! [`L4Error::WireWrite`], so a scope refusal reads as the core's would. Texts
+//! the helper supplies (a refusal, a capture's close reason) are bounded
+//! before an operator sees them ([`bounded_text_or`]: 512 bytes, no control
+//! characters, a fallback for a blank).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -41,6 +43,7 @@ use super::{CaptureInjectBackend, CaptureSource, L4Error};
 use crate::guard::L4Guard;
 use crate::helper::client::{CaptureEvent, HelperSession, SessionError};
 use crate::helper::proto::Msg;
+use crate::privilege::report::{bounded_text_or, TEXT_BOUND};
 use crate::privilege::PrivilegeState;
 use crate::types::L4Direction;
 
@@ -61,6 +64,12 @@ pub const CAPTURE_OPEN_DIRECTION: L4Direction = L4Direction::Inbound;
 
 /// Prefix of the `Unavailable` text once the helper ended a capture.
 pub const CAPTURE_ENDED: &str = "helper capture ended: ";
+
+/// After [`CAPTURE_ENDED`] when the helper's close reason was blank.
+pub const CAPTURE_CLOSED_NO_REASON: &str = "no reason given";
+
+/// The `WireWrite` text when the helper refused an inject with a blank error.
+pub const INJECT_REFUSED_NO_REASON: &str = "the helper refused the inject and gave no reason";
 
 /// `sent_gen` before the first `ScopeSet` went out.
 const NEVER_SENT: u64 = u64::MAX;
@@ -196,7 +205,11 @@ impl CaptureInjectBackend for HelperBackend {
             .inject(request_id, iface, bytes, INJECT_TIMEOUT)
         {
             Ok(None) => Ok(()),
-            Ok(Some(text)) => Err(L4Error::WireWrite(text)),
+            Ok(Some(text)) => Err(L4Error::WireWrite(bounded_text_or(
+                &text,
+                TEXT_BOUND,
+                INJECT_REFUSED_NO_REASON,
+            ))),
             Err(err) => Err(unavailable(err)),
         }
     }
@@ -220,7 +233,10 @@ impl CaptureSource for HelperCapture {
         let reason = match self.rx.recv_timeout(self.read_timeout) {
             Ok(CaptureEvent::Frame { bytes, .. }) => return Ok(Some(bytes)),
             Err(RecvTimeoutError::Timeout) => return Ok(None),
-            Ok(CaptureEvent::Closed { reason }) => format!("{CAPTURE_ENDED}{reason}"),
+            Ok(CaptureEvent::Closed { reason }) => format!(
+                "{CAPTURE_ENDED}{}",
+                bounded_text_or(&reason, TEXT_BOUND, CAPTURE_CLOSED_NO_REASON)
+            ),
             // The session dropped our sender without a `Closed`: it is gone.
             Err(RecvTimeoutError::Disconnected) => {
                 format!("{CAPTURE_ENDED}{}", SessionError::Closed)
@@ -781,5 +797,77 @@ mod tests {
             .inject("lo", &[2])
             .expect("the next inject is answered");
         drop(t.join().expect("peer"));
+    }
+
+    // ---- fix task 2026-11-01: S5 (bounded operator-facing texts) ----
+
+    /// The helper's inject refusal and capture-close reason reach an operator
+    /// bounded: 512 bytes, control characters gone, and a blank text replaced
+    /// by this backend's own fallback.
+    #[test]
+    fn helper_texts_are_bounded_before_they_reach_an_operator() {
+        let (session, mut peer) = open_session();
+        let backend = backend_over(Arc::clone(&session), guard(), &mut peer);
+        let long = format!("{}\n\u{7}tail", "r".repeat(2_000));
+        let t = std::thread::spawn(move || {
+            for (id, error) in [(1u64, long.clone()), (2, "  \n ".to_string())] {
+                let msg = read_msg(&mut peer).expect("inject");
+                assert!(matches!(msg, Msg::Inject { request_id, .. } if request_id == id));
+                peer.write_all(&encode(&Msg::InjectResult {
+                    request_id: id,
+                    error: Some(error),
+                }))
+                .expect("result");
+            }
+            peer
+        });
+        let err = backend.inject("lo", &[1]).expect_err("refused");
+        let L4Error::WireWrite(text) = &err else {
+            panic!("expected WireWrite, got {err:?}");
+        };
+        assert_eq!(text.len(), 512);
+        assert!(text.chars().all(|c| c == 'r'), "{text:?}");
+        let err = backend.inject("lo", &[2]).expect_err("refused");
+        assert_eq!(
+            err,
+            L4Error::WireWrite(INJECT_REFUSED_NO_REASON.to_string())
+        );
+        let mut peer = t.join().expect("peer");
+
+        // Capture close reasons: long, with control characters, and blank.
+        let mut source = backend
+            .open_capture("lo", None, Duration::from_millis(500))
+            .expect("open");
+        assert!(matches!(
+            read_msg(&mut peer).expect("capture open"),
+            Msg::CaptureOpen { id: 3, .. }
+        ));
+        peer.write_all(&encode(&Msg::CaptureClosed {
+            capture_id: 3,
+            reason: format!("{}\r\nmore", "q".repeat(2_000)),
+        }))
+        .expect("closed");
+        let ended = source.next_frame().expect_err("ended");
+        let text = unavailable_text(&ended);
+        assert!(text.starts_with(CAPTURE_ENDED), "{text:?}");
+        assert_eq!(text.len(), CAPTURE_ENDED.len() + 512);
+        assert!(!text.contains('\n'));
+
+        let mut source = backend
+            .open_capture("lo", None, Duration::from_millis(500))
+            .expect("open");
+        assert!(matches!(
+            read_msg(&mut peer).expect("capture open"),
+            Msg::CaptureOpen { id: 4, .. }
+        ));
+        peer.write_all(&encode(&Msg::CaptureClosed {
+            capture_id: 4,
+            reason: " \t ".to_string(),
+        }))
+        .expect("closed");
+        assert_eq!(
+            unavailable_text(&source.next_frame().expect_err("ended")),
+            format!("{CAPTURE_ENDED}{CAPTURE_CLOSED_NO_REASON}")
+        );
     }
 }

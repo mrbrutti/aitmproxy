@@ -696,16 +696,10 @@ impl PrivilegeState {
     /// goes wrong is one `warn`; the caller then reads an empty slot and the
     /// routed backend refuses fail-closed.
     fn lazy_start_helper(&self) {
-        if self.cfg.lifetime != ProcessLifetime::Serving {
-            return;
-        }
         let Some(inputs) = self.shared.last_linux() else {
             return;
         };
-        if inputs.cap_net_raw {
-            return;
-        }
-        let Some(helper) = inputs.helper.filter(|helper| helper.file_caps_net_raw) else {
+        let Some(helper) = direct_start_target(self.cfg.lifetime, &inputs) else {
             return;
         };
 
@@ -714,7 +708,7 @@ impl PrivilegeState {
             return;
         }
         if !self.shared.watching() {
-            match spawn_direct(&self.shared, &helper.path) {
+            match spawn_direct(&self.shared, &helper) {
                 Ok(()) => tracing::info!(
                     "starting the packet-capture helper directly (file capabilities)"
                 ),
@@ -730,6 +724,26 @@ impl PrivilegeState {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// The direct start's one decision, pure (spec §5.6; S2 of the p1b panel):
+/// `Some(helper path)` when this process serves, holds no `CAP_NET_RAW` of
+/// its own, and discovery found a helper whose `probe` reports `CAP_NET_RAW`
+/// **and** whose path chain only root could have written. File capabilities
+/// on a user-writable path are never trusted, let alone executed.
+#[must_use]
+pub(crate) fn direct_start_target(
+    lifetime: ProcessLifetime,
+    inputs: &LinuxInputs,
+) -> Option<PathBuf> {
+    if lifetime != ProcessLifetime::Serving || inputs.cap_net_raw {
+        return None;
+    }
+    inputs
+        .helper
+        .as_ref()
+        .filter(|helper| helper.file_caps_net_raw && helper.root_owned_chain)
+        .map(|helper| helper.path.clone())
 }
 
 /// The start-up line (spec §2.4, AC24): `Some` only when L4 is enabled and
@@ -1039,6 +1053,10 @@ impl Acceptor for HelperListener {
 /// - [`crate::privilege::linux::APPROVAL_TIMEOUT_MS`] pass: the child is
 ///   killed and the progress is `failed` with the timeout text.
 ///
+/// In every terminal arm the listener is dropped (its socket path unlinked)
+/// **before** the terminal progress row is written and before any reap, so a
+/// re-request that binds the same path never has it unlinked by this one.
+///
 /// `progress` is false for a direct file-capability start, which nobody
 /// requested: it logs instead of writing request progress.
 pub(crate) fn run_watcher(
@@ -1083,6 +1101,9 @@ pub(crate) fn run_watcher(
                             reason = %message,
                             "the packet-capture helper connected but could not be attached"
                         );
+                        // The listener (and its socket path) goes before the
+                        // terminal row: a re-request may bind the same path.
+                        drop(acceptor);
                         record(RequestState::Failed, &message);
                         child.kill();
                         reap(child.as_mut());
@@ -1110,6 +1131,11 @@ pub(crate) fn run_watcher(
                     );
                 }
                 drop(hold.take());
+                // The listener unlinks the socket path on drop: it must be
+                // gone before the terminal row is readable (a reader may
+                // re-request at once and bind the same path) and before the
+                // reap, which can wait up to `REAP_WAIT`.
+                drop(acceptor);
                 tracing::info!(
                     state = state.as_str(),
                     reason = %message,
@@ -2215,5 +2241,209 @@ mod tests {
         let report = state.report();
         assert_eq!(report.helper.status, HelperStatus::Installed);
         assert_eq!(report.helper.detail, None);
+    }
+
+    // ---- fix task 2026-11-01: S1 (listener gone before the terminal row), S2 ----
+
+    /// An acceptor that never sees a peer and, when dropped, records the
+    /// request progress as it stands and raises a flag.
+    struct DropWatch {
+        shared: Arc<Shared>,
+        dropped: Arc<AtomicBool>,
+        progress_at_drop: Arc<Mutex<Option<Option<RequestState>>>>,
+    }
+
+    impl Acceptor for DropWatch {
+        fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+            Err(SessionError::Timeout)
+        }
+    }
+
+    impl Drop for DropWatch {
+        fn drop(&mut self) {
+            let state = self.shared.lock_cache().request.as_ref().map(|r| r.state);
+            *self.progress_at_drop.lock().unwrap() = Some(state);
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// S1: in the `Ended` arm the listener (which unlinks the socket path on
+    /// drop) is gone **before** the terminal progress row is written and
+    /// before the child is reaped, so a re-request that binds the same path
+    /// can never have it unlinked under its feet by the old listener.
+    #[test]
+    fn watcher_drops_the_acceptor_before_the_terminal_row_and_the_reap() {
+        // Dismissed by exit: the acceptor is dropped while the progress is
+        // still the one before the end (none here).
+        let (state, now) = state_over(vec![row6()]);
+        now.store(3_000, Ordering::SeqCst);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let progress_at_drop = Arc::new(Mutex::new(None));
+        let acceptor = DropWatch {
+            shared: Arc::clone(&state.shared),
+            dropped: Arc::clone(&dropped),
+            progress_at_drop: Arc::clone(&progress_at_drop),
+        };
+        let child = FakeChild {
+            ticks_left: 1,
+            exit: Some(ChildExit::Exited(126)),
+            stderr: "Request dismissed".to_string(),
+            ..FakeChild::alive(4242)
+        };
+        let holds = HoldCount::default();
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(child),
+            Box::new(acceptor),
+            holds.hold(),
+            3_000,
+            true,
+        );
+        assert_eq!(
+            *progress_at_drop.lock().unwrap(),
+            Some(None),
+            "the acceptor was dropped before the dismissed row was recorded"
+        );
+        assert_eq!(
+            state.report().request.map(|r| r.state),
+            Some(RequestState::Dismissed)
+        );
+
+        // Timed out: the acceptor is dropped before the reap's `try_wait`.
+        struct Reapable {
+            killed: bool,
+            dropped: Arc<AtomicBool>,
+            dropped_at_reap: Arc<AtomicBool>,
+        }
+        impl Child for Reapable {
+            fn id(&self) -> u32 {
+                7
+            }
+            fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
+                if self.killed {
+                    self.dropped_at_reap
+                        .store(self.dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                    return Ok(Some(ChildExit::Signaled(9)));
+                }
+                Ok(None)
+            }
+            fn kill(&mut self) {
+                self.killed = true;
+            }
+            fn stderr_tail(&mut self) -> String {
+                String::new()
+            }
+        }
+        let (state, now) = state_over(vec![row6()]);
+        now.store(1_000_000, Ordering::SeqCst);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_at_reap = Arc::new(AtomicBool::new(false));
+        let acceptor = DropWatch {
+            shared: Arc::clone(&state.shared),
+            dropped: Arc::clone(&dropped),
+            progress_at_drop: Arc::new(Mutex::new(None)),
+        };
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(Reapable {
+                killed: false,
+                dropped: Arc::clone(&dropped),
+                dropped_at_reap: Arc::clone(&dropped_at_reap),
+            }),
+            Box::new(acceptor),
+            holds.hold(),
+            0,
+            true,
+        );
+        assert!(
+            dropped_at_reap.load(Ordering::SeqCst),
+            "the acceptor was dropped before the killed child was reaped"
+        );
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 1_000_000,
+                message: "No approval within 5 minutes".to_string(),
+            })
+        );
+        assert!(!holds.is_held());
+    }
+
+    /// S2: the direct (launcher-less) start is decided by one pure function:
+    /// a serving process, no process capability, and a helper whose `probe`
+    /// reports `CAP_NET_RAW` **and** whose path chain only root could have
+    /// written. A user-writable helper with file caps is never started.
+    #[test]
+    fn direct_start_requires_a_root_owned_file_caps_helper() {
+        let trusted = LinuxInputs {
+            helper: Some(HelperCandidate {
+                path: PathBuf::from("/opt/aitm/aitm-l4-helper"),
+                at_policy_path: false,
+                root_owned_chain: true,
+                file_caps_net_raw: true,
+            }),
+            ..linux_nothing()
+        };
+        assert_eq!(
+            direct_start_target(ProcessLifetime::Serving, &trusted),
+            Some(PathBuf::from("/opt/aitm/aitm-l4-helper"))
+        );
+        assert_eq!(
+            direct_start_target(ProcessLifetime::OneShot, &trusted),
+            None
+        );
+
+        let user_writable = LinuxInputs {
+            helper: Some(HelperCandidate {
+                root_owned_chain: false,
+                ..trusted.helper.clone().unwrap()
+            }),
+            ..linux_nothing()
+        };
+        assert_eq!(
+            direct_start_target(ProcessLifetime::Serving, &user_writable),
+            None,
+            "file caps on a path root does not own are not trusted"
+        );
+
+        let no_caps = LinuxInputs {
+            helper: Some(HelperCandidate {
+                file_caps_net_raw: false,
+                ..trusted.helper.clone().unwrap()
+            }),
+            ..linux_nothing()
+        };
+        assert_eq!(
+            direct_start_target(ProcessLifetime::Serving, &no_caps),
+            None
+        );
+
+        let in_process = LinuxInputs {
+            cap_net_raw: true,
+            ..trusted.clone()
+        };
+        assert_eq!(
+            direct_start_target(ProcessLifetime::Serving, &in_process),
+            None,
+            "a core with CAP_NET_RAW needs no helper"
+        );
+        assert_eq!(
+            direct_start_target(ProcessLifetime::Serving, &linux_nothing()),
+            None
+        );
+    }
+
+    fn linux_nothing() -> LinuxInputs {
+        LinuxInputs {
+            cap_net_raw: false,
+            cap_net_admin: false,
+            session_connected: false,
+            helper: None,
+            policy_file_present: false,
+            pkexec_present: false,
+            prompt_possible: false,
+            last_session_error: None,
+        }
     }
 }

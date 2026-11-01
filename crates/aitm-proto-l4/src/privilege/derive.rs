@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use crate::helper::proto::PROTO;
 use crate::privilege::contract::{Receipt, DOWNLOAD_URL};
 use crate::privilege::report::{
-    Action, Capability, Helper, HelperKind, HelperStatus, How, HowKind, Platform, PrivilegeReport,
-    RequestProgress, RequestState, Via,
+    bounded_text, Action, Capability, Helper, HelperKind, HelperStatus, How, HowKind, Platform,
+    PrivilegeReport, RequestProgress, RequestState, Via, TEXT_BOUND,
 };
 
 /// Everything `derive` looks at. Gathered by the platform files, never here.
@@ -186,10 +186,13 @@ fn derive_macos(
     } else if mac.bpf_rw_opens {
         Capability::Available { via: Via::Process }
     } else if let Some(receipt) = &mac.receipt {
+        // The first non-blank error, bounded for an operator's eyes; blanks
+        // only fall back to the spec literal.
         let reason = receipt
             .errors
-            .first()
-            .cloned()
+            .iter()
+            .map(|error| bounded_text(error, TEXT_BOUND))
+            .find(|error| !error.is_empty())
             .unwrap_or_else(|| text::MAC_RECEIPT_NOT_USABLE.to_string());
         needs_approval(
             reason,
@@ -226,7 +229,11 @@ fn derive_macos(
 /// The Linux table of spec §2.2: `(capture-and-inject, intercept, helper)`.
 fn derive_linux(enabled: bool, linux: &LinuxInputs) -> (Capability, Capability, Helper) {
     let candidate = linux.helper.as_ref();
-    let file_caps = candidate.is_some_and(|helper| helper.file_caps_net_raw);
+    // File capabilities count only on a path root alone could have written:
+    // a user-writable helper is the untrusted-path row whatever its `probe`
+    // says (S2 of the p1b panel).
+    let file_caps =
+        candidate.is_some_and(|helper| helper.file_caps_net_raw && helper.root_owned_chain);
     // The packaged install, complete: the only thing the request ever runs
     // through polkit is the policy's exec path, so every part must be in place
     // and the path must be one root alone can write.
@@ -1512,5 +1519,92 @@ mod tests {
             },
         ));
         assert_eq!(report.helper.status, HelperStatus::VersionMismatch);
+    }
+
+    // ---- fix task 2026-11-01: S2 (root chain gates file caps), S5 (receipt text) ----
+
+    /// S2: a helper whose `probe` reports `CAP_NET_RAW` but whose path chain
+    /// is not root-owned is **not** `available via helper`: it is the untrusted
+    /// path row (package remedy, `not_installed` naming the path), and its
+    /// kind is the pkexec helper, not the cap helper.
+    #[test]
+    fn file_caps_without_a_root_owned_chain_is_not_available() {
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                helper: Some(candidate(HOME_HELPER, false, false, true)),
+                ..linux_nothing()
+            },
+        ));
+        assert_linux_common(&report);
+        let (reason, how) = needs(&report);
+        assert_eq!(
+            reason,
+            "Install the aitm .deb or .rpm to get the packet-capture helper"
+        );
+        assert_eq!(how.kind, HowKind::Package);
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(report.helper.status, HelperStatus::NotInstalled);
+        assert_eq!(report.helper.detail.as_deref(), Some(HOME_HELPER));
+
+        // The same helper on a root-owned chain is the file-caps row.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                helper: Some(candidate("/opt/aitm/aitm-l4-helper", false, true, true)),
+                ..linux_nothing()
+            },
+        ));
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+        assert_eq!(report.helper.kind, HelperKind::LinuxCapHelper);
+    }
+
+    /// S5 (Tester): the receipt's reason is its first **non-blank** error,
+    /// bounded for an operator's eyes; blanks only fall back to the spec
+    /// literal.
+    #[test]
+    fn receipt_reason_is_the_first_non_blank_error_bounded() {
+        let long = "x".repeat(2_000);
+        let report = derive(&inputs(
+            true,
+            mac(
+                false,
+                Some(receipt(vec![
+                    "",
+                    "  \n\t",
+                    "could not add\nmatt to access_bpf",
+                    &long,
+                ])),
+                true,
+            ),
+            None,
+        ));
+        let (reason, _) = match &report.capture {
+            Capability::NeedsApproval { reason, how } => (reason.as_str(), how),
+            other => panic!("expected needs_approval, got {other:?}"),
+        };
+        assert_eq!(reason, "could not add matt to access_bpf");
+
+        let report = derive(&inputs(
+            true,
+            mac(false, Some(receipt(vec!["\t", "   "])), false),
+            None,
+        ));
+        assert_eq!(
+            report.capture.reason(),
+            Some(
+                "Packet capture is set up but this account cannot use it yet; open the \
+                 Aitmproxy app to finish"
+            )
+        );
+
+        let report = derive(&inputs(
+            true,
+            mac(false, Some(receipt(vec![&long])), false),
+            None,
+        ));
+        let reason = report.capture.reason().expect("reason");
+        assert_eq!(reason.len(), 512);
+        assert!(reason.chars().all(|c| c == 'x'));
     }
 }

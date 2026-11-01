@@ -8,6 +8,7 @@
 //! system state and never runs a shell.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::privilege::contract::APP_BUNDLE_ID;
 #[cfg(target_os = "macos")]
@@ -79,17 +80,45 @@ pub enum HandoffRefusal {
     BadSignature,
 }
 
-/// Validate a handoff app against the facts gathered about it. Pure: the path
-/// shape is checked first (temporary tree, `.app` suffix), then the facts
-/// (exists, bundle id, signature), so a path we would never use is refused
-/// before anything about it is trusted.
-pub fn validate_handoff_app(path: &Path, facts: &AppFacts) -> Result<(), HandoffRefusal> {
+/// The handoff app's canonical path (symlinks and `/var` → `/private/var`
+/// resolved), so the checks below see the real location; a path that cannot
+/// be canonicalized does not exist for us: `Missing`.
+pub fn canonicalize_or_missing(path: &Path) -> Result<PathBuf, HandoffRefusal> {
+    std::fs::canonicalize(path).map_err(|_| HandoffRefusal::Missing)
+}
+
+/// Canonicalize, refuse by the canonical path's shape (temporary tree, `.app`
+/// suffix) **before** any fact is gathered about it, then validate against
+/// `facts(&canonical)`. `Ok` carries the canonical path to use from here on.
+pub fn validated_handoff(
+    path: &Path,
+    facts: impl FnOnce(&Path) -> AppFacts,
+) -> Result<PathBuf, HandoffRefusal> {
+    let canonical = canonicalize_or_missing(path)?;
+    refuse_by_path(&canonical)?;
+    validate_handoff_app(&canonical, &facts(&canonical))?;
+    Ok(canonical)
+}
+
+/// The path-shape half of [`validate_handoff_app`]: a temporary tree, then
+/// the `.app` suffix.
+fn refuse_by_path(path: &Path) -> Result<(), HandoffRefusal> {
     if TEMP_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
         return Err(HandoffRefusal::TempPath);
     }
     if !is_app_bundle_path(path) {
         return Err(HandoffRefusal::NotAnApp);
     }
+    Ok(())
+}
+
+/// Validate a handoff app against the facts gathered about it. Pure: the path
+/// shape is checked first (temporary tree, `.app` suffix), then the facts
+/// (exists, bundle id, signature), so a path we would never use is refused
+/// before anything about it is trusted. Callers give it the **canonical**
+/// path ([`validated_handoff`] does).
+pub fn validate_handoff_app(path: &Path, facts: &AppFacts) -> Result<(), HandoffRefusal> {
+    refuse_by_path(path)?;
     if !facts.is_dir {
         return Err(HandoffRefusal::Missing);
     }
@@ -118,8 +147,10 @@ fn is_app_bundle_path(path: &Path) -> bool {
 pub(crate) fn gather_mac(macos_app_path: &Path) -> MacInputs {
     let exe = std::env::current_exe().ok();
     let app = handoff_target(exe.as_deref(), macos_app_path);
-    let handoff_app_embeds_helper = validate_handoff_app(&app, &app_facts(&app)).is_ok()
-        && app.join(HELPER_PLIST_REL).is_file();
+    // Canonical path first: the temporary-tree refusal applies to where the
+    // bundle really is, and the facts are gathered for that path.
+    let handoff_app_embeds_helper = validated_handoff(&app, app_facts)
+        .is_ok_and(|canonical| canonical.join(HELPER_PLIST_REL).is_file());
     MacInputs {
         bpf_rw_opens: bpf_rw_opens(),
         receipt: read_receipt(),
@@ -154,18 +185,52 @@ fn read_receipt() -> Option<Receipt> {
     Receipt::parse(&bytes).ok()
 }
 
+/// What the facts cache is keyed on: the bundle directory's identity and the
+/// parts a replaced bundle changes. The directory's own mtime is not among
+/// them: swapping `Contents/MacOS/<exe>` or `Info.plist` in place leaves it
+/// alone, and a fresh copy with the same mtime is a different inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleStamp {
+    /// `st_dev` of the bundle directory.
+    pub dev: u64,
+    /// `st_ino` of the bundle directory.
+    pub ino: u64,
+    /// mtime of `Contents/Info.plist`, when it exists.
+    pub info_plist_mtime: Option<SystemTime>,
+    /// mtime of `Contents/MacOS` (the executables' directory), else of
+    /// `Contents`.
+    pub executable_mtime: Option<SystemTime>,
+}
+
+/// The pure key builder behind the facts cache; see [`BundleStamp`].
+#[must_use]
+pub fn bundle_stamp(
+    dev: u64,
+    ino: u64,
+    info_plist_mtime: Option<SystemTime>,
+    macos_dir_mtime: Option<SystemTime>,
+    contents_mtime: Option<SystemTime>,
+) -> BundleStamp {
+    BundleStamp {
+        dev,
+        ino,
+        info_plist_mtime,
+        executable_mtime: macos_dir_mtime.or(contents_mtime),
+    }
+}
+
 /// Ask macOS about a bundle: its `CFBundleIdentifier` via `plutil`, and whether
 /// `codesign --verify --strict` accepts it under a requirement pinning the
 /// project's team. Both are absolute program paths with a bounded wait and no
-/// shell. Results are cached by `(path, mtime)` so the signature check does not
-/// run on every re-probe **(Architect's call)**.
+/// shell. Results are cached by path under a [`BundleStamp`] so the signature
+/// check does not run on every re-probe **(Architect's call)**.
 #[cfg(target_os = "macos")]
 fn app_facts(path: &Path) -> AppFacts {
     use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::{Mutex, OnceLock};
-    use std::time::SystemTime;
 
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, AppFacts)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (BundleStamp, AppFacts)>>> = OnceLock::new();
 
     let Ok(meta) = std::fs::metadata(path) else {
         return AppFacts {
@@ -181,12 +246,23 @@ fn app_facts(path: &Path) -> AppFacts {
             team_ok: false,
         };
     }
-    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let mtime_of = |rel: &str| {
+        std::fs::metadata(path.join(rel))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let stamp = bundle_stamp(
+        meta.dev(),
+        meta.ino(),
+        mtime_of("Contents/Info.plist"),
+        mtime_of("Contents/MacOS"),
+        mtime_of("Contents"),
+    );
 
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = cache.lock() {
         if let Some((seen, facts)) = map.get(path) {
-            if *seen == mtime {
+            if *seen == stamp {
                 return facts.clone();
             }
         }
@@ -202,7 +278,7 @@ fn app_facts(path: &Path) -> AppFacts {
     let mut map = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.insert(path.to_path_buf(), (mtime, facts.clone()));
+    map.insert(path.to_path_buf(), (stamp, facts.clone()));
     facts
 }
 
@@ -428,6 +504,88 @@ mod tests {
         assert_eq!(
             handoff_target(None, configured),
             PathBuf::from("/Applications/Aitmproxy.app")
+        );
+    }
+
+    // ---- fix task 2026-11-01: S3 (facts cache key), S4 (canonical path first) ----
+
+    /// S3: the facts cache is keyed on the bundle's identity and contents,
+    /// not the directory's own mtime: `(dev, ino)` of the bundle, the mtime
+    /// of `Contents/Info.plist`, and the mtime of `Contents/MacOS` (falling
+    /// back to `Contents`). Any change of any part is a new key.
+    #[test]
+    fn bundle_stamp_keys_on_identity_plist_and_executable() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+
+        let base = bundle_stamp(5, 100, t(10), t(20), t(30));
+        assert_eq!(base, bundle_stamp(5, 100, t(10), t(20), t(30)));
+        assert_ne!(base, bundle_stamp(6, 100, t(10), t(20), t(30)), "device");
+        assert_ne!(base, bundle_stamp(5, 101, t(10), t(20), t(30)), "inode");
+        assert_ne!(
+            base,
+            bundle_stamp(5, 100, t(11), t(20), t(30)),
+            "Info.plist"
+        );
+        assert_ne!(base, bundle_stamp(5, 100, t(10), t(21), t(30)), "MacOS");
+        // Contents is the fallback only when MacOS is missing.
+        assert_eq!(base, bundle_stamp(5, 100, t(10), t(20), t(31)));
+        assert_eq!(
+            bundle_stamp(5, 100, t(10), None, t(30)).executable_mtime,
+            t(30)
+        );
+        assert_ne!(
+            bundle_stamp(5, 100, t(10), None, t(30)),
+            bundle_stamp(5, 100, t(10), None, t(31))
+        );
+        // No plist at all is a different key from any plist.
+        assert_ne!(base, bundle_stamp(5, 100, None, t(20), t(30)));
+    }
+
+    /// S4: the handoff app's path is canonicalized before anything is
+    /// checked; a path that cannot be canonicalized is `Missing`, and the
+    /// temporary-tree refusal applies to the canonical path (so a symlink or
+    /// `/var` spelling into a temp tree is still refused) before any facts
+    /// are gathered about it.
+    #[test]
+    fn handoff_path_is_canonicalized_before_the_checks() {
+        assert_eq!(
+            canonicalize_or_missing(Path::new("/nonexistent/Aitmproxy.app")),
+            Err(HandoffRefusal::Missing)
+        );
+
+        let dir = std::env::temp_dir().join(format!("aitm-s4-{}", std::process::id()));
+        let app = dir.join("Aitmproxy.app");
+        std::fs::create_dir_all(&app).expect("temp app dir");
+        let canonical = canonicalize_or_missing(&app).expect("canonical");
+        assert!(canonical.is_absolute());
+        let in_temp_tree = TEMP_PREFIXES
+            .iter()
+            .any(|prefix| canonical.starts_with(prefix));
+        let facts_asked = std::cell::Cell::new(false);
+        let result = validated_handoff(&app, |_| {
+            facts_asked.set(true);
+            good()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if in_temp_tree {
+            assert_eq!(result, Err(HandoffRefusal::TempPath), "{canonical:?}");
+            assert!(!facts_asked.get(), "refused before any facts were gathered");
+        } else {
+            // A TMPDIR outside the known trees: the canonical path is what
+            // the facts are gathered for, and good facts pass.
+            assert_eq!(result, Ok(canonical));
+            assert!(facts_asked.get());
+        }
+
+        // The pure check on a canonical spelling.
+        assert_eq!(
+            validate_handoff_app(Path::new("/private/tmp/Aitmproxy.app"), &good()),
+            Err(HandoffRefusal::TempPath)
+        );
+        assert_eq!(
+            validated_handoff(Path::new("/nonexistent/Aitmproxy.app"), |_| good()),
+            Err(HandoffRefusal::Missing)
         );
     }
 }
