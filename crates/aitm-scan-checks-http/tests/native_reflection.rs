@@ -152,6 +152,35 @@ async fn xss_reflected_is_clean_when_the_js_probe_is_echoed_outside_a_script() {
     assert_eq!(host.sent().len(), 3, "all three contexts were tried");
 }
 
+/// A literal `<script>` the tokenizer never reads as a tag — inside an HTML
+/// comment, or in the RCDATA body of a `<title>` — opens no script context, so
+/// a text echo after it is still text, even with a real script element later
+/// on the page (F7-2).
+#[tokio::test]
+async fn xss_reflected_is_clean_when_the_only_script_before_the_echo_is_a_decoy() {
+    for body in [
+        "<title><script></title><p>you searched for ';aitmabcd//</p><script>init()</script>",
+        "<!-- <script> --><p>';aitmabcd//</p><script>x()</script>",
+    ] {
+        let host = ScriptedHost::new()
+            .with_marker(MARKER)
+            .with_fallback(html(200, body));
+        let point = point(InsertionKind::Query, "q", TARGET_URL);
+
+        let verdict = aitm_scan_checks_http::xss::check().run(&point, &host).await;
+
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Clean,
+            "a <script> in a comment or RCDATA body is text, not an element: {body}: {}",
+            verdict.detail
+        );
+        assert_eq!(verdict.poc_hint, None);
+        assert_eq!(verdict.evidence.payload, None);
+        assert_eq!(host.sent().len(), 3, "all three contexts were tried");
+    }
+}
+
 #[tokio::test]
 async fn xss_reflected_is_certain_when_the_js_probe_is_echoed_inside_a_script() {
     let body = "<html><body><script>var q='';aitmabcd//';</script></body></html>";

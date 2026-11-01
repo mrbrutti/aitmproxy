@@ -34,7 +34,7 @@
 //! payload that asks PostgreSQL to wait — and that is the point: what the
 //! module asks a target for is written out where an operator can read it.
 //!
-//! **Cost.** Four probes per family, [`MAX_TIMING_PROBES_PER_POINT`] per point,
+//! **Cost.** Four probes per family, `MAX_TIMING_PROBES_PER_POINT` per point,
 //! hence at most two families tried per point (AC T3-4's "<= 8 probes per
 //! point"). There is no repeat loop on top of that: the alternating schedule
 //! already asks for each delay twice, and the cap leaves no room for more.

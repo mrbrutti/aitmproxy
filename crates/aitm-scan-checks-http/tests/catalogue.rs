@@ -375,7 +375,7 @@ fn the_public_modules_are_the_checks_and_timing() {
         ])
     );
     assert!(
-        lib.contains("\npub(crate) mod matching;\n"),
+        lib.contains("\nmod matching;\n"),
         "matching must be crate-private"
     );
 }

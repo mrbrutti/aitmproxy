@@ -10,7 +10,7 @@
 //!
 //! The sender negotiates the HTTP version with ALPN: by default it offers
 //! `h2, http/1.1`, caches what the authority settled on for
-//! [`ALPN_CACHE_TTL`], and dispatches the exchange to the h1 path or the h2
+//! `ALPN_CACHE_TTL`, and dispatches the exchange to the h1 path or the h2
 //! path accordingly. A caller that needs a particular version passes a
 //! [`VersionPolicy`]; a forced `h2` against a peer that will not speak it fails
 //! with [`SendError::H2NotNegotiated`], which the scanner surfaces as a probe
@@ -89,7 +89,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProbeStream for T {}
 
 /// Address → stream. The seam that lets the whole negotiate/cache/dispatch
 /// path be exercised over `tokio::io::duplex` without binding a port;
-/// production uses [`TcpDialer`].
+/// production uses `TcpDialer`.
 pub trait Dialer: Send + Sync {
     fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>>;
 }
@@ -275,7 +275,7 @@ impl HttpSender {
     }
 
     /// How long a negotiated protocol is remembered before the sender offers
-    /// both again (default [`ALPN_CACHE_TTL`], ten minutes). Rebuilds the
+    /// both again (default `ALPN_CACHE_TTL`, ten minutes). Rebuilds the
     /// cache, so it is empty afterwards — call it while configuring the
     /// sender, not mid-run. A seam for tests, which cannot wait out the
     /// default.

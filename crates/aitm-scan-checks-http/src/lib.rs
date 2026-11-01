@@ -54,7 +54,7 @@
 #![forbid(unsafe_code)]
 
 mod gate;
-pub(crate) mod matching;
+mod matching;
 pub mod timing;
 mod url;
 

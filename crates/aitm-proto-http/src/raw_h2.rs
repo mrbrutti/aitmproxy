@@ -638,7 +638,7 @@ impl RawH2Client {
     /// more than [`MAX_RAW_STREAMS`] streams, when its mode opens more streams
     /// than it declares, when it carries a forbidden header, or when the target
     /// is unusable (bad scheme, bad authority, no address). After that it
-    /// errors only on a transport failure, or when [`RAW_TOTAL_TIMEOUT`] runs
+    /// errors only on a transport failure, or when `RAW_TOTAL_TIMEOUT` runs
     /// out before a connection exists (there is nothing to observe); a peer
     /// that resets, goes away or says nothing is an observation, not an error.
     pub async fn probe(&self, plan: &RawH2Plan) -> Result<RawH2Observation> {
@@ -2559,14 +2559,54 @@ mod driver_tests {
             .collect()
     }
 
+    /// Installs a `LogCapture` on this thread that the gate warning is
+    /// proven to reach, and returns its guard and its (emptied) event log.
+    ///
+    /// `tracing` caches one `Interest` per callsite for the whole process,
+    /// and every other driver test probes through an ungated client with no
+    /// subscriber on its thread. If one of them first-registers the warning's
+    /// callsite while a gate test is installing its capture, the callsite
+    /// stays cached as "never" and the warning is dropped before any
+    /// subscriber sees it (4 failures in 22 runs; the same race
+    /// `h2_sender`'s GOAWAY log test hit). So, as there: rebuild the cache
+    /// with this capture registered, then replay a fresh ungated probe —
+    /// bounded — until its warning lands. Only then is the capture handed to
+    /// the test, emptied, for the real assertion.
+    async fn live_gate_capture() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    ) {
+        let capture = LogCapture::default();
+        let events = capture.events.clone();
+        let guard = tracing::subscriber::set_default(capture);
+
+        let mut landed = false;
+        for _ in 0..8 {
+            tracing::callsite::rebuild_interest_cache();
+            let (ungated, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+            ungated
+                .probe(&plan(RawH2Mode::SingleRequest, 1))
+                .await
+                .expect("the warm-up probe completes");
+            if !gate_warnings(&events).is_empty() {
+                landed = true;
+                break;
+            }
+        }
+        assert!(
+            landed,
+            "the gate warning never reached the capture in eight replays"
+        );
+        events.lock().expect("events").clear();
+        (guard, events)
+    }
+
     /// SEC-13: a client probing without `with_ssrf` says so, once, at `warn`
     /// — so a mis-wired runner shows in the logs rather than silently probing
     /// unguarded — and a second probe on the same client does not repeat it.
     #[tokio::test]
     async fn probing_without_an_ssrf_gate_warns_exactly_once_per_client() {
-        let capture = LogCapture::default();
-        let events = capture.events.clone();
-        let _guard = tracing::subscriber::set_default(capture);
+        let (_guard, events) = live_gate_capture().await;
 
         let (client, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
         client
@@ -2595,9 +2635,7 @@ mod driver_tests {
     async fn probing_with_an_ssrf_gate_does_not_warn() {
         use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
 
-        let capture = LogCapture::default();
-        let events = capture.events.clone();
-        let _guard = tracing::subscriber::set_default(capture);
+        let (_guard, events) = live_gate_capture().await;
 
         let (client, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
         let scope = Arc::new(StdGuard::default());
@@ -2617,11 +2655,10 @@ mod driver_tests {
         );
 
         // The positive control, without which this test would also pass if
-        // nothing at all reached the capture (`tracing` caches one `Interest`
-        // per callsite for the whole process, and every other driver test
-        // probes through an ungated client): an ungated client on a fresh
+        // nothing at all reached the capture: an ungated client on a fresh
         // peer must produce the warning the gated one did not (tester
-        // whole-branch pass).
+        // whole-branch pass). `live_gate_capture` proved the callsite live
+        // before the gated probe; this proves it stayed so through it.
         let (ungated, _dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
         ungated
             .probe(&plan(RawH2Mode::SingleRequest, 1))

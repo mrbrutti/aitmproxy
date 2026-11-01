@@ -113,7 +113,7 @@ pub trait RawH2Runner: Send + Sync {
 /// reissue path's posture: scope-confined egress is a browser-only rule).
 /// Condition 1 of this module's documentation — the raw connection goes to
 /// the point's own authority, and that authority is one of the profile's
-/// `target.origins` — is enforced by [`H2Check::run`] before it hands a plan
+/// `target.origins` — is enforced by `H2Check::run` before it hands a plan
 /// to the runner, not by the runner itself; a caller that builds a plan by
 /// hand gets the address gate and nothing more (security review FS-3).
 ///
@@ -157,7 +157,7 @@ impl RawH2Runner for RealRawH2Runner {
 /// Each call builds fresh checks with fresh once-per-authority guards.
 ///
 /// The contract between the checks and the runner: each check's
-/// [`H2Check::run`] enforces, before it hands the runner a plan, that the
+/// `H2Check::run` enforces, before it hands the runner a plan, that the
 /// target is the point's own authority **and a profile origin** (condition 1
 /// of the module documentation), that `host.baseline()` succeeded through
 /// the scope-guarded job client (condition 2), and that the plan carries no

@@ -5,7 +5,7 @@
 //! conclusive and harmless: it asks the target to redirect to a **canary host
 //! that does not exist**, and reads the `Location` the target answers with.
 //!
-//! [`REDIRECT_CANARY`] is under `.invalid`, the top-level domain RFC 2606
+//! `REDIRECT_CANARY` is under `.invalid`, the top-level domain RFC 2606
 //! reserves for exactly this — it is guaranteed never to resolve, so a browser,
 //! a crawler or an automated client that follows the redirect reaches nothing
 //! and contacts nobody. **This check never sends a request to the canary.** The
@@ -22,7 +22,7 @@
 //! **authority** is the canary host. A `Location` that merely mentions the
 //! canary — carried back as a query parameter of a same-origin URL, say — is
 //! the application reflecting input, not redirecting to it, and is clean. That
-//! is why [`location_host`] parses the authority instead of searching for a
+//! is why `location_host` parses the authority instead of searching for a
 //! substring.
 
 use std::sync::Arc;

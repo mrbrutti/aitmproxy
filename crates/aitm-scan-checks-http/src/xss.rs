@@ -39,6 +39,7 @@
 //! (`needs_baseline: false`) because a unique canary needs nothing to be
 //! compared against.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use aitm_poc::{Assertion, MatchPart, Severity};
@@ -136,12 +137,24 @@ impl Context {
     /// is markup wherever in an HTML body it lands. The JavaScript-string
     /// context needs the bytes **and** a `<script>` element around them; any
     /// one occurrence inside a script is enough, however many sit outside.
+    ///
+    /// The body is target-controlled, so the script rule is linear in it: one
+    /// lower-casing, one pass that lists the script contents
+    /// ([`script_content_ranges`]), then one pass that places each echo in
+    /// them. Nothing here is repeated per echo.
     fn reflected_in(self, body: &str, probe: &str) -> bool {
         match self {
             Context::Element | Context::Attribute => body.contains(probe),
-            Context::JsString => body
-                .match_indices(probe)
-                .any(|(at, _)| inside_script_element(body, at)),
+            Context::JsString => {
+                // ASCII lower-casing keeps every byte offset, so ranges found
+                // in the lowered copy index the original body too.
+                let ranges = script_content_ranges(&body.to_ascii_lowercase());
+                if ranges.is_empty() {
+                    return false;
+                }
+                body.match_indices(probe)
+                    .any(|(at, _)| within_any(&ranges, at))
+            }
         }
     }
 
@@ -157,35 +170,100 @@ impl Context {
     }
 }
 
-/// Whether byte offset `at` of `body` lies inside a `<script>` element: after
-/// the `>` that closes the nearest preceding `<script ...>` open tag, with no
-/// `</script` between that `>` and `at`, and with a `</script` somewhere
-/// after `at`.
+/// The elements whose body the tokenizer reads as RCDATA up to the matching
+/// end tag, paired with that end tag: a `<script` inside one is text, not a
+/// tag, and must not open a script context.
+const RCDATA_ELEMENTS: [(&str, &str); 2] = [("title", "</title"), ("textarea", "</textarea")];
+
+/// The byte ranges of `lower` — an ASCII-lower-cased HTML body — that are the
+/// content of a `<script>` element: from just after the `>` that closes each
+/// `<script ...>` open tag to the `</script` that ends it. One forward pass,
+/// so the cost is linear in the body however many script tags or echoes it
+/// holds; the ranges come out in document order and never overlap.
 ///
-/// The rule follows the HTML tokenizer, not JavaScript: inside a script
-/// element the tokenizer ends the element at the first `</script` it sees,
-/// quoted or not, so a `</script` inside an earlier string literal ends the
-/// element here too. Tag names match ASCII case-insensitively (`<SCRIPT>` is
-/// a script), and `<script` counts only when a delimiter follows it, so
-/// `<scripty>` is not one. The open tag ends at the first `>` after
-/// `<script`; a `>` inside one of its attribute values is not special-cased.
-fn inside_script_element(body: &str, at: usize) -> bool {
-    // ASCII lower-casing keeps every byte offset, so `at` indexes both.
-    let lower = body.to_ascii_lowercase();
-    let before = &lower[..at];
-    let Some((open, _)) = before.rmatch_indices("<script").find(|(i, found)| {
-        before
-            .as_bytes()
-            .get(i + found.len())
-            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/')
-    }) else {
-        return false;
-    };
-    let Some(tag_end) = before[open..].find('>') else {
-        return false;
-    };
-    let inner = &before[open + tag_end + 1..];
-    !inner.contains("</script") && lower[at..].contains("</script")
+/// The rule follows the HTML tokenizer, not JavaScript:
+///
+/// - Inside a script element the tokenizer ends the element at the first
+///   `</script` it sees, quoted or not, so a `</script` inside an earlier
+///   string literal ends it here too. An element that never closes, and an
+///   open tag that never ends, contribute nothing.
+/// - Tag names match ASCII case-insensitively (`<SCRIPT>` is a script), and
+///   `<script` counts only when a delimiter — whitespace, `>` or `/` —
+///   follows it, so `<scripty>` is not one.
+/// - A `<script` inside an HTML comment (`<!-- ... -->`, including the
+///   abruptly closed `<!-->` and `<!--->`) or inside the RCDATA body of a
+///   `<title>` or `<textarea>` is text, not a tag, and opens nothing. A
+///   comment or RCDATA body that never closes swallows the rest of the
+///   document, as it does for the tokenizer.
+///
+/// Two tokenizer states are not modelled, and both can only hide a
+/// reflection, never invent one: the open tag ends at the first `>` after
+/// `<script`, so a `>` inside one of its attribute values ends the tag early
+/// (the content then begins there, and a `</script` in the rest of the tag's
+/// attributes would end it); and the double-escaped state a `<!--<script>`
+/// inside a script enters, where the tokenizer needs a second `</script>`
+/// before the element ends, is read here as ending at the first one.
+fn script_content_ranges(lower: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while let Some(lt) = lower[i..].find('<').map(|off| i + off) {
+        let rest = &lower[lt..];
+        if rest.starts_with("<!--") {
+            // The search starts at the comment's own dashes so that `<!-->`
+            // and `<!--->` close it, as they do for the tokenizer.
+            let Some(off) = lower[lt + 2..].find("-->") else {
+                break;
+            };
+            i = lt + 2 + off + "-->".len();
+            continue;
+        }
+        if let Some((_, end_tag)) = RCDATA_ELEMENTS
+            .iter()
+            .find(|(name, _)| opens_element(rest, name))
+        {
+            let Some(tag_end) = rest.find('>') else {
+                break;
+            };
+            let content = lt + tag_end + 1;
+            let Some(off) = lower[content..].find(end_tag) else {
+                break;
+            };
+            i = content + off + end_tag.len();
+            continue;
+        }
+        if opens_element(rest, "script") {
+            let Some(tag_end) = rest.find('>') else {
+                break;
+            };
+            let content = lt + tag_end + 1;
+            let Some(off) = lower[content..].find("</script") else {
+                break;
+            };
+            ranges.push(content..content + off);
+            i = content + off + "</script".len();
+            continue;
+        }
+        i = lt + 1;
+    }
+    ranges
+}
+
+/// Whether `rest`, which starts at a `<`, opens an element named `name`: the
+/// name must be followed by a delimiter (whitespace, `>` or `/`), so that
+/// `<scripty>` does not open a `script`.
+fn opens_element(rest: &str, name: &str) -> bool {
+    rest.strip_prefix('<')
+        .and_then(|r| r.strip_prefix(name))
+        .and_then(|r| r.bytes().next())
+        .is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/')
+}
+
+/// Whether `at` lies in one of `ranges`, which are in order and disjoint (as
+/// [`script_content_ranges`] returns them), by binary search.
+fn within_any(ranges: &[Range<usize>], at: usize) -> bool {
+    // The first range that ends after `at` is the only one that can hold it.
+    let i = ranges.partition_point(|r| r.end <= at);
+    ranges.get(i).is_some_and(|r| r.contains(&at))
 }
 
 /// The three context break-out canaries, each paired with the context it is
@@ -310,7 +388,9 @@ impl Check for XssReflected {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_probes, inside_script_element, Context, CANARY_PREFIX};
+    use std::ops::Range;
+
+    use super::{context_probes, script_content_ranges, within_any, Context, CANARY_PREFIX};
 
     /// The canary is the prefix plus the job marker, and every probe carries it
     /// whole — a probe that dropped the tag would match any page. Each probe is
@@ -395,6 +475,34 @@ mod tests {
         body.find(needle).expect("the needle is in the body")
     }
 
+    /// The containment oracle the check applies, built on the ranges: whether
+    /// byte offset `at` of `body` is script content.
+    fn inside_script_element(body: &str, at: usize) -> bool {
+        within_any(&script_content_ranges(&body.to_ascii_lowercase()), at)
+    }
+
+    /// The pass lists exactly the content spans, in order, whatever the case
+    /// of the tags, and an echo is placed by the span it falls in.
+    #[test]
+    fn script_content_ranges_are_the_spans_between_each_open_and_close_tag() {
+        let body = "<p>a</p><script>x</script><SCRIPT y>z</SCRIPT>";
+        let ranges = script_content_ranges(&body.to_ascii_lowercase());
+        assert_eq!(ranges, vec![16..17, 36..37]);
+        assert_eq!(&body[16..17], "x");
+        assert_eq!(&body[36..37], "z");
+
+        assert!(within_any(&ranges, 16));
+        assert!(within_any(&ranges, 36));
+        for outside in [0, 15, 17, 35, 37, 45, 1000] {
+            assert!(!within_any(&ranges, outside), "{outside}");
+        }
+        assert!(!within_any(&[], 0));
+        assert_eq!(
+            script_content_ranges("<p>no script here</p>"),
+            Vec::<Range<usize>>::new()
+        );
+    }
+
     /// The containment rule and its edges: case, attributes on the open tag,
     /// a `</script` that an earlier string literal "contains", a look-alike
     /// tag name, an unclosed element, and an echo after the element.
@@ -432,5 +540,87 @@ mod tests {
         ] {
             assert!(!inside_script_element(body, at(body, js)), "{body}");
         }
+    }
+
+    /// A literal `<script>` that the tokenizer never reads as a tag — inside
+    /// an HTML comment, or inside the RCDATA body of a `<title>` or
+    /// `<textarea>` — opens no script context, so an echo after it in a
+    /// paragraph is still text (F7-2). The same echo inside a real script
+    /// element that follows the decoy is still the finding.
+    #[test]
+    fn a_script_tag_in_a_comment_or_rcdata_body_opens_no_script_context() {
+        let js = "';aitmabcd//";
+
+        for body in [
+            "<title><script></title><p>you searched for ';aitmabcd//</p><script>init()</script>",
+            "<textarea><script></textarea><p>';aitmabcd//</p><script>init()</script>",
+            "<!-- <script> --><p>';aitmabcd//</p><script>x()</script>",
+            // An unterminated comment swallows the rest of the document.
+            "<!-- <script><p>';aitmabcd//</p><script>x()</script>",
+            // An unterminated RCDATA body does too.
+            "<title><script><p>';aitmabcd//</p><script>x()</script>",
+        ] {
+            assert!(!Context::JsString.reflected_in(body, js), "{body}");
+        }
+
+        for body in [
+            "<!-- <script> --><script>var q='';aitmabcd//';</script>",
+            "<title><script></title><script>var q='';aitmabcd//';</script>",
+            "<TITLE>x</TITLE><SCRIPT>var q='';aitmabcd//';</SCRIPT>",
+            // A decoy before, a real echo inside, a text echo after.
+            "<!-- <script> --><p>';aitmabcd//</p><script>q='';aitmabcd//';</script><p>';aitmabcd//</p>",
+        ] {
+            assert!(Context::JsString.reflected_in(body, js), "{body}");
+        }
+    }
+
+    /// One mebibyte of nothing but the probe, with no script element at all,
+    /// resolves clean in well under the bound: the containment rule is one
+    /// pass over the body, not one pass per echo (F7-1; the quadratic version
+    /// took 16 s on this input).
+    #[test]
+    fn a_body_of_repeated_echoes_and_no_script_resolves_clean_in_bounded_time() {
+        let js = "';aitmabcd//";
+        let body = js.repeat((1 << 20) / js.len() + 1);
+        assert!(body.len() >= 1 << 20, "{}", body.len());
+
+        let started = std::time::Instant::now();
+        let hit = Context::JsString.reflected_in(&body, js);
+        let took = started.elapsed();
+
+        assert!(!hit);
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "took {took:?}"
+        );
+    }
+
+    /// One mebibyte with ten thousand text echoes and one script element around
+    /// the last of them resolves vulnerable in well under the bound (F7-1).
+    #[test]
+    fn a_body_of_many_echoes_with_one_script_echo_resolves_vulnerable_in_bounded_time() {
+        let js = "';aitmabcd//";
+        let filler = "x".repeat(85);
+        let mut body = String::with_capacity(1 << 20);
+        for _ in 0..9_999 {
+            body.push_str("<p>';aitmabcd//</p>");
+            body.push_str(&filler);
+        }
+        body.push_str("<script>var q='';aitmabcd//';</script>");
+        while body.len() < 1 << 20 {
+            body.push_str(&filler);
+        }
+        assert_eq!(body.matches(js).count(), 10_000);
+        assert!(body.len() >= 1 << 20, "{}", body.len());
+
+        let started = std::time::Instant::now();
+        let hit = Context::JsString.reflected_in(&body, js);
+        let took = started.elapsed();
+
+        assert!(hit);
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "took {took:?}"
+        );
     }
 }
