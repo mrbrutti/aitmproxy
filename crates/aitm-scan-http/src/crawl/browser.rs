@@ -32,10 +32,15 @@
 //! returns to the page only when another form or click is still waiting on it,
 //! and that return is charged like any other navigation.
 //!
-//! Form submission goes through `document.forms[i].requestSubmit()` on a form
-//! tagged with `data-aitm-form` (plan call **A4**) rather than through clicking
-//! a submit control: it is deterministic across layouts and still fires the
-//! page's own submit handlers. Values come from [`crate::crawl::values`], which
+//! Form submission goes through `requestSubmit()` on the form element tagged
+//! with `data-aitm-form` (plan call **A4**) rather than through clicking a
+//! submit control: it is deterministic across layouts and still fires the
+//! page's own submit handlers. The submit expression addresses the tagged
+//! element, never a `document.forms` index (that collection is live, so a
+//! consent banner or a re-render between the tag eval and the submit eval
+//! would put another form at the index), re-reads its `action` in the same
+//! eval and refuses one that resolves off the page's origin before anything
+//! is submitted (R-I1). Values come from [`crate::crawl::values`], which
 //! generates inert ones.
 //!
 //! Nothing here logs a URL that has not been through [`safe_url`], and no DOM
@@ -354,15 +359,74 @@ impl LiveForm {
     }
 }
 
-/// Submit `document.forms[index]` the way the page expects (plan call **A4**).
+/// What [`submit_form_js`] answered: whether the tagged form was found,
+/// admitted and submitted, and the `action` its live element carried at that
+/// moment, for the lane to judge by [`form_action`] once more (R-I1).
+struct Submitted {
+    ok: bool,
+    action: Option<String>,
+}
+
+impl Submitted {
+    /// The answer in `value`, or `None` when the page answered anything but
+    /// the object [`submit_form_js`] builds.
+    fn from_value(value: &Value) -> Option<Self> {
+        let Value::Object(fields) = value else {
+            return None;
+        };
+        let Some(Value::Bool(ok)) = fields.get("ok") else {
+            return None;
+        };
+        let action = match fields.get("action") {
+            Some(Value::Str(action)) => Some(action.clone()),
+            _ => None,
+        };
+        Some(Self { ok: *ok, action })
+    }
+}
+
+/// Submit the form [`tag_form_js`] tagged `index` the way the page expects
+/// (plan call **A4**), and answer `{ok, action}`.
+///
+/// The element is found by its tag, `form[data-aitm-form="index"]`, never by
+/// `document.forms[index]`: that collection is live, so a form injected or
+/// re-rendered between the tag eval and this one (a consent banner, a chat
+/// widget, an SPA re-render) would be submitted in the tagged form's place,
+/// possibly off-origin (R-I1). No tagged element answers `{ok:false}`.
+///
+/// The live `action` is read back through `Element.prototype.getAttribute`
+/// and resolved against the document's base URL the way the browser will; one
+/// that resolves off `location.origin` answers `{ok:false, action}` **before**
+/// anything is submitted, so the check and the submit are one eval round and
+/// a script cannot retarget the form between them. The lane judges the
+/// returned `action` by [`form_action`] once more, the rule that admitted the
+/// extracted form.
 ///
 /// `requestSubmit()` fires the page's `submit` handlers and its validation, so
 /// a single-page app that intercepts the submit behaves as it does for a human;
-/// `submit()` is the fallback for an engine that does not have it.
+/// `submit()` is the fallback for an engine that does not have it. Both are
+/// called through `HTMLFormElement.prototype`, so a control named `submit` or
+/// `requestSubmit` cannot shadow them. Marked `/*aitm-submit-form*/` for the
+/// same reason as [`CLICKABLES_JS`].
 pub(crate) fn submit_form_js(index: usize) -> String {
     format!(
-        "document.forms[{index}].requestSubmit ? \
-         document.forms[{index}].requestSubmit() : document.forms[{index}].submit()"
+        concat!(
+            "/*aitm-submit-form*/(function(){{",
+            "var f=document.querySelector(\"form[data-aitm-form=\\\"{index}\\\"]\");",
+            "if(!f){{return {{ok:false}};}}",
+            "var action=Element.prototype.getAttribute.call(f,\"action\");",
+            "var base=Object.getOwnPropertyDescriptor(Node.prototype,\"baseURI\")",
+            ".get.call(document);",
+            "var target;",
+            "try{{target=new URL(action===null?\"\":action,base);}}",
+            "catch(e){{return {{ok:false,action:action}};}}",
+            "if(target.origin!==location.origin){{return {{ok:false,action:action}};}}",
+            "if(HTMLFormElement.prototype.requestSubmit){{",
+            "HTMLFormElement.prototype.requestSubmit.call(f);}}",
+            "else{{HTMLFormElement.prototype.submit.call(f);}}",
+            "return {{ok:true,action:action}};}})()"
+        ),
+        index = index
     )
 }
 
@@ -700,15 +764,47 @@ impl<'a> Run<'a> {
             if !self.job.charge(1) {
                 return Ok(Step::Stop(StopReason::Budget));
             }
-            let submitted = bounded(self.job, self.browser.eval(&submit_form_js(form.index))).await;
-            if let Err(err) = submitted {
-                self.collect();
+            let answer =
+                match bounded(self.job, self.browser.eval(&submit_form_js(form.index))).await {
+                    Ok(value) => Submitted::from_value(&value),
+                    Err(err) => {
+                        self.collect();
+                        tracing::debug!(
+                            target: "scan",
+                            job = self.job.job_id(),
+                            url = %safe_url(page.as_str()),
+                            error = %err,
+                            "crawl: a form submission failed"
+                        );
+                        continue;
+                    }
+                };
+            // The submit eval addressed the tagged element and re-read its
+            // live action (R-I1): a form that vanished or was retargeted since
+            // the tag eval is refused there, and the action it did carry is
+            // judged here by the rule that admitted the extracted form. Either
+            // refusal is a skip: nothing to settle on, nothing to collect.
+            let admitted = answer.as_ref().is_some_and(|answer| {
+                answer.ok
+                    && form_action(
+                        &FormSpec {
+                            action: answer.action.clone(),
+                            ..form.clone()
+                        },
+                        page,
+                        self.origin,
+                        extracted.base.as_deref(),
+                    )
+                    .is_some()
+            });
+            if !admitted {
+                self.report.forms_skipped = self.report.forms_skipped.saturating_add(1);
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
                     url = %safe_url(page.as_str()),
-                    error = %err,
-                    "crawl: a form submission failed"
+                    form = form.index,
+                    "crawl: the tagged form was gone or retargeted at submit time; skipped"
                 );
                 continue;
             }
@@ -1017,7 +1113,7 @@ mod tests {
     use crate::limits::{MAX_CLICKABLES_LISTED, MAX_HELD_CRAWL_BODY};
     use crate::testutil::{
         captured_flow, request, response, FakeBrowser, FakeJob, LiveFormScript, PageScript,
-        ScriptedClient, CLICKABLES_MARKER, TAG_FORM_MARKER,
+        ScriptedClient, CLICKABLES_MARKER, SUBMIT_FORM_MARKER, TAG_FORM_MARKER,
     };
     use crate::url_norm::parse_absolute;
 
@@ -1203,6 +1299,7 @@ mod tests {
                 method: Some("post".to_string()),
                 enctype: None,
                 names: vec!["q".to_string()],
+                ..LiveFormScript::default()
             },
         );
         let browser =
@@ -1265,6 +1362,7 @@ mod tests {
                 method: Some("get".to_string()),
                 enctype: None,
                 names: vec!["q".to_string(), "card_number".to_string()],
+                ..LiveFormScript::default()
             },
         );
         let browser =
@@ -1302,6 +1400,7 @@ mod tests {
                 method: Some("GeT".to_string()),
                 enctype: None,
                 names: vec!["q".to_string()],
+                ..LiveFormScript::default()
             },
         );
         let browser =
@@ -1318,6 +1417,161 @@ mod tests {
         assert_eq!(report.forms_submitted, 1);
         assert_eq!(report.forms_skipped, 0);
         assert_eq!(job.charges.load(Ordering::SeqCst), 5);
+    }
+
+    // --- R-I1: the submit addresses the tagged element, not an index ---------
+
+    /// The live form that matched at tag time; `rest` says what the page did to
+    /// it before the submit eval.
+    fn matching_live_form() -> LiveFormScript {
+        LiveFormScript {
+            action: Some("/search".to_string()),
+            method: Some("get".to_string()),
+            enctype: None,
+            names: vec!["q".to_string()],
+            ..LiveFormScript::default()
+        }
+    }
+
+    /// No flow in `store` addresses `evil.test` or `/search`.
+    fn assert_nothing_left_for_search_or_evil(store: &MemFlowStore) {
+        for id in store.list() {
+            let Some(Flow::Http(flow)) = store.get(id) else {
+                panic!("the double stores HTTP flows");
+            };
+            assert!(
+                !flow.request.authority.contains("evil"),
+                "{:?}",
+                flow.request.path
+            );
+            assert!(
+                !flow.request.path.starts_with("/search"),
+                "{:?}",
+                flow.request.path
+            );
+        }
+    }
+
+    /// The form matched when it was tagged, but a re-render replaced it before
+    /// the submit eval: the tagged element is gone, so nothing is submitted
+    /// (whatever `document.forms[0]` is now), the skip is counted, and the
+    /// crawl goes on from the same page without a return navigation.
+    #[tokio::test]
+    async fn live_form_gone_at_submit_is_skipped() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = home().with_live_form(0, matching_live_form().gone_at_submit());
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert_eq!(
+            driving(&browser),
+            vec![
+                "navigate http://t:8080/".to_string(),
+                "type form[data-aitm-form=\"0\"] [name=\"q\"] = aitm-aitm7f3a".to_string(),
+                "click body > button:nth-child(3)".to_string(),
+                "navigate http://t:8080/a".to_string(),
+            ]
+        );
+        assert!(
+            !browser
+                .log_lines()
+                .iter()
+                .any(|line| line.starts_with("submit ")),
+            "{:?}",
+            browser.log_lines()
+        );
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.forms_skipped, 1);
+        assert_eq!(report.clicks, 1);
+        assert_eq!(report.stopped_reason, None);
+        // The submit attempt is still charged: the page, the submit, the click
+        // and the `/a` navigation.
+        assert_eq!(job.charges.load(Ordering::SeqCst), 4);
+        assert_nothing_left_for_search_or_evil(&store);
+    }
+
+    /// The form matched when it was tagged, but a script pointed its `action`
+    /// at a third party before the submit eval: the expression re-reads the
+    /// live action and refuses, the lane counts the skip, and no request
+    /// leaves for `evil.test` or `/search`.
+    #[tokio::test]
+    async fn live_form_retargeted_at_submit_is_skipped() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = home().with_live_form(
+            0,
+            matching_live_form().with_action_at_submit("https://evil.test/collect"),
+        );
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert!(
+            !browser
+                .log_lines()
+                .iter()
+                .any(|line| line.starts_with("submit ")),
+            "{:?}",
+            browser.log_lines()
+        );
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.forms_skipped, 1);
+        assert_eq!(report.clicks, 1);
+        assert_eq!(report.stopped_reason, None, "the browser never left");
+        assert_nothing_left_for_search_or_evil(&store);
+    }
+
+    /// The lane's reading of the submit expression's answer: `ok` and the live
+    /// `action` when it is a string; anything but that object is no answer.
+    #[test]
+    fn submit_answer_pins() {
+        let object = |pairs: &[(&str, Value)]| {
+            Value::Object(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), value.clone()))
+                    .collect(),
+            )
+        };
+        let done = Submitted::from_value(&object(&[
+            ("ok", Value::Bool(true)),
+            ("action", Value::Str("/search".to_string())),
+        ]))
+        .expect("an object answer parses");
+        assert!(done.ok);
+        assert_eq!(done.action.as_deref(), Some("/search"));
+
+        let gone = Submitted::from_value(&object(&[("ok", Value::Bool(false))]))
+            .expect("an object answer parses");
+        assert!(!gone.ok);
+        assert_eq!(gone.action, None);
+
+        let no_action = Submitted::from_value(&object(&[
+            ("ok", Value::Bool(true)),
+            ("action", Value::Null),
+        ]))
+        .expect("an object answer parses");
+        assert!(no_action.ok);
+        assert_eq!(no_action.action, None);
+
+        // A missing `ok` is not a submission.
+        assert!(
+            Submitted::from_value(&object(&[("action", Value::Str("/x".to_string()))])).is_none()
+        );
+        assert!(Submitted::from_value(&Value::Null).is_none());
+        assert!(Submitted::from_value(&Value::Bool(true)).is_none());
     }
 
     // --- Q7 (tester): the browser engine's half of the group rule -----------
@@ -1733,10 +1987,36 @@ mod tests {
         ] {
             assert!(!tag.contains(forbidden), "{forbidden}: {tag}");
         }
-        assert_eq!(
-            submit_form_js(1),
-            "document.forms[1].requestSubmit ? document.forms[1].requestSubmit() : document.forms[1].submit()"
-        );
+        // Submitting addresses the element the tag eval marked, never a live
+        // `document.forms` index (R-I1), re-reads its `action` through the
+        // prototype getter, refuses an action that resolves off the page's
+        // origin, and submits through the prototype methods so a control named
+        // `submit` or `requestSubmit` cannot clobber them.
+        let submit = submit_form_js(1);
+        assert!(submit.starts_with(SUBMIT_FORM_MARKER), "{submit}");
+        for needed in [
+            "document.querySelector(\"form[data-aitm-form=\\\"1\\\"]\")",
+            "return {ok:false}",
+            "Element.prototype.getAttribute.call(f,\"action\")",
+            "Node.prototype,\"baseURI\"",
+            "location.origin",
+            "HTMLFormElement.prototype.requestSubmit.call(f)",
+            "HTMLFormElement.prototype.submit.call(f)",
+            "return {ok:true,action:action}",
+        ] {
+            assert!(submit.contains(needed), "{needed}: {submit}");
+        }
+        for forbidden in [
+            "document.forms[",
+            "f.requestSubmit(",
+            "f.submit(",
+            ".action",
+            "fetch(",
+            "XMLHttpRequest",
+            "innerHTML",
+        ] {
+            assert!(!submit.contains(forbidden), "{forbidden}: {submit}");
+        }
         assert_eq!(
             field_selector(0, "q"),
             "form[data-aitm-form=\"0\"] [name=\"q\"]"

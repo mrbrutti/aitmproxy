@@ -22,7 +22,7 @@
 // library paths that handle network and user input.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -288,16 +288,36 @@ pub(crate) struct PageScript {
 }
 
 /// The attributes and control names the live form at one index reports back
-/// to the crawler's tagging expression.
+/// to the crawler's tagging expression, and what has become of it by the time
+/// the crawler submits it (R-I1).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LiveFormScript {
     pub action: Option<String>,
     pub method: Option<String>,
     pub enctype: Option<String>,
     pub names: Vec<String>,
+    /// The tagged element is gone by submit time (a re-render replaced it):
+    /// the submit expression finds no `form[data-aitm-form]` and answers
+    /// `{ok:false}` without submitting anything.
+    pub missing_at_submit: bool,
+    /// The tagged element's `action` at submit time, when a script changed it
+    /// after the tag eval; `None` means it still reads `action`.
+    pub action_at_submit: Option<String>,
 }
 
 impl LiveFormScript {
+    /// The same live form whose tagged element has vanished by submit time.
+    pub(crate) fn gone_at_submit(mut self) -> Self {
+        self.missing_at_submit = true;
+        self
+    }
+
+    /// The same live form whose `action` reads `action` by submit time.
+    pub(crate) fn with_action_at_submit(mut self, action: &str) -> Self {
+        self.action_at_submit = Some(action.to_string());
+        self
+    }
+
     /// The `Value` the tagging expression answers with.
     fn to_value(&self) -> Value {
         let text = |value: &Option<String>| match value {
@@ -395,6 +415,10 @@ pub(crate) const CLICKABLES_MARKER: &str = "/*aitm-clickables*/";
 /// its live attributes back.
 pub(crate) const TAG_FORM_MARKER: &str = "/*aitm-tag-form*/";
 
+/// The comment a crawler puts in the expression that submits the tagged form
+/// (R-I1).
+pub(crate) const SUBMIT_FORM_MARKER: &str = "/*aitm-submit-form*/";
+
 impl FakeBrowser {
     /// A browser serving `pages`, keyed by exact URL, starting on no page.
     pub(crate) fn new<K: Into<String>>(pages: Vec<(K, PageScript)>) -> Self {
@@ -476,6 +500,83 @@ impl FakeBrowser {
     }
 }
 
+impl FakeBrowser {
+    /// The live form at `index` on the current page: the test's override when
+    /// it set one, otherwise what the page's markup declares, read with the
+    /// real extractor; `None` when the page has no form there.
+    fn live_form(&self, index: usize) -> Option<LiveFormScript> {
+        let current = self.current_url();
+        let page = self.pages.get(&current)?;
+        if let Some(live) = page.live_forms.get(&index) {
+            return Some(live.clone());
+        }
+        let declared = crate::crawl::extract::extract(&page.html)
+            .forms
+            .into_iter()
+            .find(|form| form.index == index)?;
+        Some(LiveFormScript {
+            action: declared.action.clone(),
+            method: Some(declared.method.clone()),
+            enctype: declared.enctype.clone(),
+            names: declared
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect(),
+            ..LiveFormScript::default()
+        })
+    }
+
+    /// What the crawler's tagged submit expression does on this page, as the
+    /// real expression would: no tagged element answers `{ok:false}` and
+    /// submits nothing; an element whose `action` now resolves off the page's
+    /// origin answers `{ok:false, action}` and submits nothing; otherwise the
+    /// form is submitted (logged `submit <index>`, landing where the page's
+    /// `forms` entry says) and the answer is `{ok:true, action}` (R-I1).
+    fn submit_tagged(&self, index: usize) -> Value {
+        let answer = |ok: bool, action: Option<&str>| {
+            let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+            fields.insert("ok".to_string(), Value::Bool(ok));
+            if let Some(action) = action {
+                fields.insert("action".to_string(), Value::Str(action.to_string()));
+            }
+            Value::Object(fields)
+        };
+        let Some(live) = self.live_form(index) else {
+            return answer(false, None);
+        };
+        if live.missing_at_submit {
+            return answer(false, None);
+        }
+        let action = live.action_at_submit.clone().or(live.action.clone());
+        let current = self.current_url();
+        let here = crate::url_norm::parse_absolute(&current);
+        let target = match (&here, action.as_deref().map(str::trim)) {
+            (Some(here), None | Some("")) => Some(here.clone()),
+            (Some(here), Some(action)) => crate::url_norm::resolve(here, action),
+            (None, _) => None,
+        };
+        let same_origin = match (&here, &target) {
+            (Some(here), Some(target)) => crate::url_norm::same_origin(target, here),
+            _ => false,
+        };
+        if !same_origin {
+            return answer(false, action.as_deref());
+        }
+        self.log_line(format!("submit {index}"));
+        let lands_on = self.pages.get(&current).and_then(|page| {
+            page.forms
+                .iter()
+                .find(|(i, _)| *i == index)
+                .map(|(_, lands_on)| lands_on.clone())
+        });
+        if let Some(lands_on) = lands_on {
+            self.land_on(&lands_on);
+        }
+        answer(true, action.as_deref())
+    }
+}
+
 /// The text between the first quote pair in `expr`, if any.
 fn quoted(expr: &str) -> Option<&str> {
     let start = expr.find(['"', '\''])?;
@@ -485,14 +586,21 @@ fn quoted(expr: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-/// The index in `document.forms[N]`, defaulting to 0 when the expression names
-/// none.
+/// The form index an expression names: the `N` of `data-aitm-form="N"` (the
+/// tagged selector the submit expression uses) or of `document.forms[N]` (the
+/// tag expression), defaulting to 0 when it names none.
 fn form_index(expr: &str) -> usize {
-    let Some(open) = expr.find("forms[") else {
+    let after = expr
+        .find("data-aitm-form=\"")
+        .map(|open| open + "data-aitm-form=\"".len())
+        .or_else(|| expr.find("forms[").map(|open| open + "forms[".len()));
+    let Some(after) = after else {
         return 0;
     };
-    let rest = &expr[open + "forms[".len()..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = expr[after..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().unwrap_or(0)
 }
 
@@ -598,27 +706,9 @@ impl BrowserDriver for FakeBrowser {
             }
             if expr.contains(TAG_FORM_MARKER) {
                 let index = form_index(&expr);
-                let current = self.current_url();
-                let Some(page) = self.pages.get(&current) else {
-                    return Ok(Value::Null);
-                };
-                if let Some(live) = page.live_forms.get(&index) {
-                    return Ok(live.to_value());
-                }
-                // No override: the live form is the one the markup declares.
-                let declared = crate::crawl::extract::extract(&page.html)
-                    .forms
-                    .into_iter()
-                    .find(|form| form.index == index);
-                return Ok(declared.map_or(Value::Null, |form| {
-                    LiveFormScript {
-                        action: form.action.clone(),
-                        method: Some(form.method.clone()),
-                        enctype: form.enctype.clone(),
-                        names: form.fields.iter().map(|field| field.name.clone()).collect(),
-                    }
-                    .to_value()
-                }));
+                return Ok(self
+                    .live_form(index)
+                    .map_or(Value::Null, |live| live.to_value()));
             }
             // A `set_checked_js` expression: logged as `check <selector>` so a
             // test can see which group members the engine checked (Q7).
@@ -630,6 +720,9 @@ impl BrowserDriver for FakeBrowser {
                     .unwrap_or_default();
                 self.log_line(format!("check {selector}"));
                 return Ok(Value::Null);
+            }
+            if expr.contains(SUBMIT_FORM_MARKER) {
+                return Ok(self.submit_tagged(form_index(&expr)));
             }
             if expr.contains("requestSubmit") || expr.contains(".submit()") {
                 let index = form_index(&expr);
