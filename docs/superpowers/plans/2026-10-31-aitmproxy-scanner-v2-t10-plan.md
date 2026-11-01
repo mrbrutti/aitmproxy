@@ -16,7 +16,7 @@ PR A makes `aitm-testtarget` the proving ground: a logging core (`log.rs`), a co
 |---|---|---|
 | A-0 | A0 (crate skeleton: `Cargo.toml` deps, every module placeholder, `lib.rs` `mod` lines) | none |
 | A-1 | A1 (seed + manifest tables), A2 (`log.rs`), A3 (`speakers/mod.rs` trait + crash window), A4 (`ws.rs` codec) | A0 |
-| A-2 | A5 (`app.rs` router refactor + `routes/` stubs + `ws::serve_upgrade` stub), A6 (`control.rs`), A7 (tlv + udp_payload), A8 (dns), A9 (resp + memcached), A10 (modbus), A11 (mqtt), A12 (smtp + ftp) | A5: A1, A2, A4; A6: A2; A7-A12: A3 |
+| A-2 | A1b (legacy `tests/target.rs` + `tests/grader.rs` scoped to the legacy six), A5 (`app.rs` router refactor + `routes/` stubs + `ws::serve_upgrade` stub), A6 (`control.rs`), A7 (tlv + udp_payload), A8 (dns), A9 (resp + memcached), A10 (modbus), A11 (mqtt), A12 (smtp + ftp) | A1b: A1; A5: A1, A2, A4; A6: A2; A7-A12: A3 |
 | A-3 | A13 (`routes/inject.rs`), A14 (`routes/reflect.rs`), A15 (`routes/session.rs`), A16 (`routes/misc.rs`), A17 (`ws.rs` upgrade), A18 (`tls.rs`), A19 (`speakers/driver.rs`) | A13-A16: A5; A17: A4, A5; A18: A5; A19: A3, A7-A12 |
 | A-4 | A20 (`lib.rs` builder + `main.rs` flags), A22 (`tests/speakers_live.rs`) | A20: A6, A17, A18, A19; A22: A19 |
 | A-5 | A21 (`tests/scan_http.rs` socket tests) | A20 |
@@ -64,6 +64,15 @@ PR A makes `aitm-testtarget` the proving ground: a logging core (`log.rs`), a co
 - **Change:** `seed.rs` adds `pub const SQLI_ERROR_SIGNAL: &str = "SQL syntax error near"`, `CMDI_MARKER = "uid=0(root) gid=0(root)"`, `TRAVERSAL_MARKER = "root:x:0:0:root:/root:/bin/bash"`, `NOSQLI_MARKER = "NOSQLI-LOGIN-MARKER-4b1d"`, `LDAPI_ALL_USERS_MARKER = "LDAP-ALL-USERS-MARKER-77c2"`, `LDAPI_ERROR_SIGNAL = "Bad search filter"`, `SESSION_USER = "alice"`, `SESSION_PASS = "wonderland"`, `SSTI_PROBE = "{{7*7}}"`, `SSTI_SIGNAL = "Hello 49"`. `manifest.rs`: `PlantedVuln` rows for every D3 row (ids/classes/paths exactly as the table; `trigger_hint` from the trigger column; `success_signal` the marker or signal text), `ws-cswsh` (`cswsh`, `/ws`) and `ws-input-reflection` (`ws-input-reflection`, `/ws`), the three passive rows (`passive-missing-hsts` class `missing-hsts` path `/`, etc.); `L4Asset` gains `pub grammar: Option<String>, pub trigger: String` (legacy two: `grammar: None`, trigger `"none"`); `l4_manifest()` adds the nine D5 services with `proto`, `grammar`, `behaviour` (the benign column) and `trigger` (the V trigger column). New `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)] pub enum Discovery { Anchor, Form, Script, Click, Ws }`, `pub struct SeedRoute { pub id: &'static str, pub method: &'static str, pub path: &'static str, pub discovery: Discovery }` and `pub fn seed_index() -> &'static [SeedRoute]` (one row per seed with the D3 *disc.* column; `/items` once; `/ws` as `Ws`).
 - **Test** (`manifest.rs` `#[cfg(test)]`): `manifest_has_every_class` asserts `manifest().iter().map(|v| v.class.as_str()).collect::<BTreeSet<_>>()` equals the literal set `{"reflected-xss","stored-xss","ssrf","idor","auth-bypass","open-redirect","sqli","cmdi","ssti","path-traversal","xxe","crlf","nosqli","ldapi","xss","cswsh","ws-input-reflection","missing-hsts","missing-csp","missing-nosniff"}` and ids are unique; `l4_manifest_lists_nine_grammars` asserts the grammar set equals `{"tlv","dns","raw","resp","memcached","modbus","mqtt","smtp","ftp"}` and `l4_manifest().len() == 11`; `seed_index_covers_manifest` asserts every `manifest()` id with a non-`/` path appears in `seed_index()`.
 - **Done when:** `cargo test -p aitm-testtarget --lib --offline` passes (existing tests included) and the existing `tests/grader.rs` still compiles (`cargo test -p aitm-testtarget --no-run --offline`).
+
+### Task A1b: legacy socket suites scoped to the legacy six rows
+
+- **Satisfies:** S1 (the crate's Terminal suite stays green after A1 grew `manifest()` to 28 rows); found by the A1 coder, 2026-10-31.
+- **Depends on:** A1.
+- **Files:** `crates/aitm-testtarget/tests/target.rs` (modify), `crates/aitm-testtarget/tests/grader.rs` (modify).
+- **Change:** `tests/target.rs`: `const LEGACY_IDS: [&str; 6] = ["reflected-xss-search-q", "stored-xss-comments", "ssrf-fetch-preview", "idor-account", "auth-bypass-admin-role", "open-redirect-next"]`; `each_vuln_path_triggers_in_vulnerable_mode` and `each_patched_path_is_safe` iterate `manifest().iter().filter(|v| LEGACY_IDS.contains(&v.id.as_str()))` (the new rows are proven by A21's `tests/scan_http.rs` and the route unit tests); `manifest_not_served` keeps iterating **every** row (every id and `/manifest*` are 404). `tests/grader.rs` `grade_counts_reproduced`: `planted == manifest().len()`, `found == 6`, `reproduced == 6`, `false_positives == 0`, and `missing` equals the ids of every manifest row not in `LEGACY_IDS`, in manifest order (so the grader's "missing" semantics for the new rows are pinned, not hidden).
+- **Test:** `cargo test -p aitm-testtarget --no-run --offline` compiles (sandbox); `cargo test -p aitm-testtarget --test target --test grader` passes in the Terminal (the orchestrator runs it and quotes it).
+- **Done when:** both commands are quoted green.
 
 ### Task A2: `log.rs` (control log, rings, redaction)
 
@@ -430,6 +439,7 @@ PR A makes `aitm-testtarget` the proving ground: a logging core (`log.rs`), a co
 |---|---|
 | A0 | `Cargo.toml`, `src/lib.rs` (`mod` lines), every placeholder under `src/` listed in A0 |
 | A1 | `src/seed.rs`, `src/manifest.rs`, `src/lib.rs` (one `pub use` line) |
+| A1b | `tests/target.rs`, `tests/grader.rs` |
 | A2 | `src/log.rs` |
 | A3 | `src/speakers/mod.rs` |
 | A4 | `src/ws.rs` |
