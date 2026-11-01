@@ -169,7 +169,10 @@ Three decisions, all **(Architect's call)**:
   (`RuleError::PatternTooLong`); an exact `host` is a string compare, not a
   pattern, and is not capped; `flow.intercept` and
   `ws.intercept` reject more than 256 rules in one call. A rejected call leaves
-  the active rules unchanged. (The compiled-size cap only applies after the
+  the active rules unchanged. The `rules` param description of `flow.intercept`
+  and `ws.intercept`, and the intercept SKILL.md, name the three rejections and
+  the unchanged active set (pinned by `rules_param_text_names_every_rejection_cause`
+  in both plugins). (The compiled-size cap only applies after the
   parser has walked the whole pattern; with case folding a 1 MiB literal took
   263 ms to reject.)
 - **No empty pattern.** An empty `url` wildcard or regex is rejected at compile

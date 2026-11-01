@@ -388,6 +388,43 @@ fn too_many_rules_is_error() {
     }
 }
 
+/// The `rules` param description (what `tools/list` shows an agent or operator
+/// before they call) names every cause that rejects the whole call, not only
+/// the invalid regex: the 256-rule cap, the 4096-byte pattern cap and the empty
+/// pattern, and says the active rules survive the rejection. The MCP layer
+/// copies the string verbatim (`rule_schemas_state_the_full_url_subject` in
+/// `crates/aitm/tests/intercept_url_rules_mcp.rs` shows that for `rules[].url`),
+/// so the pin lives at the schema.
+#[test]
+fn rules_param_text_names_every_rejection_cause() {
+    let reg = registry();
+    let schema = reg
+        .command("flow.intercept")
+        .expect("flow.intercept registered")
+        .schema();
+    let rules = schema
+        .params
+        .iter()
+        .find(|p| p.name == "rules")
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
+            panic!("flow.intercept has a `rules` param; got {names:?}")
+        });
+    for phrase in [
+        "256",
+        "4096",
+        "empty url pattern",
+        "invalid regex",
+        "unchanged",
+    ] {
+        assert!(
+            rules.description.contains(phrase),
+            "the flow.intercept `rules` description must name `{phrase}`; got: {}",
+            rules.description
+        );
+    }
+}
+
 /// AC19 at the plugin level: an empty `url` pattern in any of its three bus
 /// spellings (`""`, `{wildcard: ""}`, `{regex: ""}`) makes `flow.intercept`
 /// return `Err` naming the empty pattern, and the previously armed rule stays

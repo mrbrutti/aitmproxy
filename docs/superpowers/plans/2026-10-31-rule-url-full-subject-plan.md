@@ -22,7 +22,7 @@ report is in.
 
 - **Satisfies:** AC1–AC11 (Rust side), AC15 (module docs)
 - **Depends on:** none
-- **Files:** `crates/aitm-rules/src/lib.rs` (modify), `crates/aitm-rules/Cargo.toml` (modify: add `serde_json = "1"` under a new `[dev-dependencies]` section), `crates/aitm-rules/tests/matches.rs` (modify), `crates/aitm-rules/tests/cases/url-match-cases.json` (create), `crates/aitm-rules/tests/url_match_cases.rs` (create)
+- **Files:** `crates/aitm-rules/src/lib.rs` (modify), `crates/aitm-rules/Cargo.toml` (modify: add `serde_json = "1"` under a new `[dev-dependencies]` section), `Cargo.lock` (the one-line consequence of that dev-dependency; declared 2026-10-31 after panel 3), `crates/aitm-rules/tests/matches.rs` (modify), `crates/aitm-rules/tests/cases/url-match-cases.json` (create), `crates/aitm-rules/tests/url_match_cases.rs` (create)
 - **Change:**
   - Module docs: replace the "URL match subject" section with the spec's
     subject, wildcard and regex rules (full URL `scheme://authority path`,
@@ -233,6 +233,12 @@ Kept by the orchestrating session during stage 6. One row per finding.
 | Fix task A | spec | Important | AC19's Kit clause (empty pattern matches no row) has no Swift test | FIX (Fix task B, B1) |
 | Fix task A | spec | Minor | site omits the leading-`/` rule and the `//` boundary | accepted (autonomous mode, 2026-10-31): the site sentence is the overview; module docs, schema text and SKILL.md carry the rule |
 | Fix task A | spec | Minor | spec did not say which patterns the 4096-byte cap covers | fixed in the spec (Bounded input now names url wildcard, url regex and host wildcard; exact host uncapped) |
+| Fix task B | security | — | no findings (panel-2 Minor closed by B6) | — |
+| Fix task B | quality | Minor | SKILL.md fourth `url` sub-bullet unlabelled and mixes "omit `url`" with the limits | fixed by the orchestrating session (docs: `Limits:` label; "omit `url`" moved to the Subject bullet) |
+| Fix task B | tester | Minor | the Kit empty-pattern guard is defence-in-depth (Foundation's `contains("")` and an empty `NSRegularExpression` already yield false); the test pins the spec'd behaviour | accepted (autonomous mode, 2026-10-31): the behaviour, not the mutation, is what AC19 requires |
+| Fix task B | tester | Minor | the two `rules` param texts had no pin | fixed by the tester (`rules_param_text_names_every_rejection_cause` in `aitm-plugins` and `aitm-plugin-wsctl`) |
+| Fix task B | spec | Minor | `Cargo.lock` was a branch-only file no task declared | fixed in the plan (Task 1 Files line) |
+| Fix task B | spec | Minor | the caps' documentation home had no spec anchor and no pin | fixed in the spec (Bounded input names the `rules` param text and SKILL.md) and by the tester's pins |
 
 ## Shipped
 

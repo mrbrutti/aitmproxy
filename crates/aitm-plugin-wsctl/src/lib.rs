@@ -689,6 +689,36 @@ mod tests {
         assert_eq!(lock(&cmd.shared.rules).len(), 256);
     }
 
+    /// The `rules` param description names every cause that rejects the whole
+    /// call (the 256-rule cap, the 4096-byte pattern cap, the empty pattern, the
+    /// invalid regex) and that the active rules survive it; `tools/list` shows
+    /// this string verbatim.
+    #[test]
+    fn rules_param_text_names_every_rejection_cause() {
+        let cmd = WsIntercept {
+            shared: Arc::default(),
+        };
+        let schema = cmd.schema();
+        let rules = schema
+            .params
+            .iter()
+            .find(|p| p.name == "rules")
+            .expect("ws.intercept has a `rules` param");
+        for phrase in [
+            "256",
+            "4096",
+            "empty url pattern",
+            "invalid regex",
+            "unchanged",
+        ] {
+            assert!(
+                rules.description.contains(phrase),
+                "the ws.intercept `rules` description must name `{phrase}`; got: {}",
+                rules.description
+            );
+        }
+    }
+
     #[test]
     fn url_string_is_wildcard_and_host_string_is_exact() {
         let rule = parse_rule(
