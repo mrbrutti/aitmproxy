@@ -11,6 +11,7 @@
 //! trait gaining a method is one edit, and so the lane and scripting tracks can
 //! test a `Check` implementation against the same stubs the model tests use.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -291,6 +292,9 @@ pub struct RecordingHost {
     raw: Mutex<Vec<String>>,
     budget: AtomicU32,
     profile: ScanProfile,
+    /// The address the canned baseline is pretended to have come from, when a
+    /// test pinned one with [`RecordingHost::with_peer`]. `None` otherwise.
+    peer: Option<SocketAddr>,
 }
 
 impl RecordingHost {
@@ -304,7 +308,17 @@ impl RecordingHost {
             raw: Mutex::new(Vec::new()),
             budget: AtomicU32::new(RECORDING_BUDGET),
             profile: ScanProfile::default(),
+            peer: None,
         }
+    }
+
+    /// The same host, pinned to the peer address its baseline came from, so a
+    /// test can assert a raw probe dialled exactly that address rather than
+    /// re-resolving the name (spec D7's DNS-rebinding window).
+    #[must_use]
+    pub fn with_peer(mut self, addr: SocketAddr) -> Self {
+        self.peer = Some(addr);
+        self
     }
 
     /// The same host behind an `Arc`, so [`ProbeHost::shared`] hands an owning
@@ -407,6 +421,21 @@ impl ProbeHost for RecordingHost {
     fn shared(&self) -> Option<Arc<dyn ProbeHost>> {
         self.me.upgrade().map(|host| host as Arc<dyn ProbeHost>)
     }
+
+    fn baseline_peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// The recorder charges for real, so a test can see a bypassing stimulus
+    /// spend budget. A charge the budget cannot cover is refused and spends
+    /// nothing, so the count never wraps.
+    fn charge(&self, units: u32) -> bool {
+        self.budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(units)
+            })
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +512,44 @@ mod tests {
 
         assert_eq!(NullLane.lane(), crate::vocab::LaneKind::Http);
         assert!(NullLane.checks().is_empty());
+    }
+
+    /// Coordinator decision (2026-11-01): the recorder can be pinned to a peer
+    /// address, so an engine test can prove a raw probe dialled the address the
+    /// baseline came from rather than re-resolving the name.
+    #[test]
+    fn recording_host_reports_its_peer() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().expect("a literal address");
+
+        let host = RecordingHost::new(200, "ok").with_peer(addr);
+        let dynamic: &dyn ProbeHost = &host;
+
+        assert_eq!(dynamic.baseline_peer_addr(), Some(addr));
+        assert_eq!(
+            dynamic.baseline_peer_addr().map(|a| a.to_string()),
+            Some("127.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            RecordingHost::new(200, "ok").baseline_peer_addr(),
+            None,
+            "a recorder nobody pinned knows no peer"
+        );
+    }
+
+    /// T3 security panel (2026-11-01): the recorder charges for real, so an
+    /// engine test can prove a raw-h2 stream spent a unit. A charge it cannot
+    /// cover is refused *and* spends nothing.
+    #[test]
+    fn recording_host_charge_spends_the_budget_and_refuses_what_it_cannot_cover() {
+        let host = RecordingHost::new(200, "ok");
+        let dynamic: &dyn ProbeHost = &host;
+        assert_eq!(dynamic.budget_left(), 16);
+
+        assert!(dynamic.charge(10), "ten of sixteen is affordable");
+        assert_eq!(dynamic.budget_left(), 6);
+
+        assert!(!dynamic.charge(7), "seven of six is not");
+        assert_eq!(dynamic.budget_left(), 6, "a refused charge spends nothing");
     }
 
     /// Tester: the recorder's budget saturates at zero and it keeps answering —

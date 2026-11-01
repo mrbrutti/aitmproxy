@@ -21,8 +21,11 @@
 //!
 //! T1b added [`ProbeHost::client`], [`ProbeHost::shared`], [`ProbeHost::captured`],
 //! [`JobCtx::report_l4`], [`JobCtx::report_session_lost`] and [`Lane::validate`]
-//! (all default-bodied) on 2026-10-31.
+//! (all default-bodied) on 2026-10-31, then [`ProbeHost::baseline_peer_addr`],
+//! [`JobCtx::report_session_canary`], [`JobCtx::report_session_browser_partial`]
+//! and [`ProbeHost::charge`] (default-bodied too) on 2026-11-01.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,7 +35,7 @@ use crate::check::{CheckMeta, Verdict};
 use crate::job::L4Counters;
 use crate::point::{InsertionPoint, Payload, ProbeResponse, RawProbe, SiteNode};
 use crate::profile::{ProfileTarget, ScanProfile};
-use crate::session::SessionMaterial;
+use crate::session::{Canary, SessionMaterial};
 use crate::vocab::LaneKind;
 
 /// One detection, run against one insertion point (spec D2).
@@ -151,6 +154,28 @@ pub trait ProbeHost: Send + Sync {
     fn captured(&self) -> Option<aitm_core::HttpFlow> {
         None
     }
+
+    /// The peer address the baseline response actually came from, when the host
+    /// knows it (an HTTP host fills it from the baseline flow's connection), so
+    /// a raw probe (T3's raw-h2 observe check) can dial exactly the validated
+    /// address instead of re-resolving the name; closes a DNS-rebinding window.
+    /// Default `None` = unknown.
+    fn baseline_peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// Spend `units` of the job's probe budget for a stimulus that bypasses
+    /// [`ProbeHost::probe`]/[`ProbeHost::probe_raw`] (T3's observe-only raw-h2
+    /// connections, one unit per stream) so it is budgeted, paced and counted
+    /// in `scan.status.probes`. Returns `false` when the budget cannot cover
+    /// it; the caller must then not send.
+    ///
+    /// The default only checks [`ProbeHost::budget_left`] and charges nothing
+    /// because the trait has no job handle; the engine's host overrides it to
+    /// charge the job's `JobBudget` and pace through the guard.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
+    }
 }
 
 /// The engine-owned, per-job surface a [`Lane`] consumes (spec D5).
@@ -222,6 +247,25 @@ pub trait JobCtx: Send + Sync {
     /// the audit with `stopped_reason: session_lost` (spec D7). A no-op by
     /// default.
     fn report_session_lost(&self) {}
+
+    /// The lane reports the D7 canary it picked ([`Canary::None`] when
+    /// auth-lost detection is off, or the GET/HEAD substitution) once, when the
+    /// job's first [`ProbeHost`] is built; the engine mirrors it into
+    /// `JobStatus.session.canary`.
+    ///
+    /// A no-op by default.
+    fn report_session_canary(&self, canary: Canary) {
+        let _ = canary;
+    }
+
+    /// The lane reports the HttpOnly session cookies `document.cookie` could
+    /// not set; the engine sets `JobStatus.session.browser_partial: true`.
+    /// Names only, never values.
+    ///
+    /// A no-op by default.
+    fn report_session_browser_partial(&self, cookie_names: Vec<String>) {
+        let _ = cookie_names;
+    }
 }
 
 /// What one lane's discovery pass found (spec D2).
@@ -300,6 +344,7 @@ mod tests {
 
     use crate::job::L4Counters;
     use crate::profile::{ProfileTarget, ScanProfile};
+    use crate::session::Canary;
     use crate::testing::{null_meta, query_point, NullCheck, NullHost, NullJob, NullLane};
     use crate::vocab::{Confidence, LaneKind, Outcome};
 
@@ -401,6 +446,18 @@ mod tests {
         assert!(dynamic.captured().is_none());
     }
 
+    /// Coordinator decision (2026-11-01): a raw probe that must dial the exact
+    /// address the baseline came from asks the host for it. A host that does
+    /// not know inherits `None`, so every lane written before this method
+    /// still compiles and still answers "unknown".
+    #[test]
+    fn probe_host_baseline_peer_addr_defaults_to_none() {
+        let host = NullHost::new();
+        let dynamic: &dyn ProbeHost = &host;
+
+        assert_eq!(dynamic.baseline_peer_addr(), None);
+    }
+
     /// Coordinator decision 1: a lane may report L4 counters or a lost session;
     /// a `JobCtx` that does not care inherits a no-op body. That both calls
     /// compile against `dyn JobCtx` on a stub that implements neither is the
@@ -417,6 +474,41 @@ mod tests {
         dynamic.report_session_lost();
 
         // The no-op changed nothing the engine reads.
+        assert_eq!(dynamic.budget_left(), 7);
+    }
+
+    /// T3 security panel (2026-11-01): a stimulus that bypasses `probe` must
+    /// still be budgeted. The default body only *checks* — it has no job handle
+    /// to charge — so a host written before this method refuses exactly what it
+    /// cannot afford and its budget is unchanged either way.
+    #[test]
+    fn probe_host_charge_default_checks_the_budget_and_spends_nothing() {
+        let host = NullHost::new();
+        let dynamic: &dyn ProbeHost = &host;
+        assert_eq!(dynamic.budget_left(), 3);
+
+        assert!(dynamic.charge(3), "the whole budget is affordable");
+        assert!(!dynamic.charge(4), "one unit more is not");
+        assert_eq!(
+            dynamic.budget_left(),
+            3,
+            "the default body charges nothing: it has no job handle"
+        );
+    }
+
+    /// Coordinator decision (2026-11-01): a lane reports the D7 canary it picked
+    /// and the HttpOnly cookies the browser could not set. A `JobCtx` that
+    /// mirrors neither into its status inherits a no-op body, so a lane written
+    /// before these methods still compiles.
+    #[test]
+    fn job_ctx_session_reports_default_to_no_ops() {
+        let job = NullJob::new();
+        let dynamic: &dyn JobCtx = &job;
+
+        dynamic.report_session_canary(Canary::None);
+        dynamic.report_session_browser_partial(vec!["sid".into()]);
+
+        // The no-ops changed nothing the engine reads.
         assert_eq!(dynamic.budget_left(), 7);
     }
 
