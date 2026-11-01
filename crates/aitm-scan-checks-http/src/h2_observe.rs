@@ -102,6 +102,24 @@ pub trait RawH2Runner: Send + Sync {
 
 /// The production runner: the frame-level driver, accepting any certificate
 /// under the four conditions in this module's documentation.
+///
+/// # What the gate it carries does, and does not do
+///
+/// The SSRF gate [`Self::with_ssrf`] installs is checked against **every
+/// address** the target's name resolves to, immediately before the dial. It
+/// refuses private, loopback and metadata addresses under the job's
+/// `SsrfPolicy`, exactly as the reissue path's gate does. It does **not**
+/// confine the probe to the job's scope (`confine_to_scope = false`, the
+/// reissue path's posture: scope-confined egress is a browser-only rule).
+/// Condition 1 of this module's documentation — the raw connection goes to
+/// the point's own authority, and that authority is one of the profile's
+/// `target.origins` — is enforced by [`H2Check::run`] before it hands a plan
+/// to the runner, not by the runner itself; a caller that builds a plan by
+/// hand gets the address gate and nothing more (security review FS-3).
+///
+/// Public because the integration tests build one to prove it refuses
+/// session material before dialling; the catalogue builds it only inside
+/// [`crate::checks_with`].
 pub struct RealRawH2Runner {
     client: RawH2Client,
 }
@@ -137,6 +155,19 @@ impl RawH2Runner for RealRawH2Runner {
 /// The five observe-only h2 checks, all probing through `runner`.
 ///
 /// Each call builds fresh checks with fresh once-per-authority guards.
+///
+/// The contract between the checks and the runner: each check's
+/// [`H2Check::run`] enforces, before it hands the runner a plan, that the
+/// target is the point's own authority **and a profile origin** (condition 1
+/// of the module documentation), that `host.baseline()` succeeded through
+/// the scope-guarded job client (condition 2), and that the plan carries no
+/// session header (condition 3). The runner adds only the address gate it
+/// carries — [`RealRawH2Runner`] refuses private, loopback and metadata
+/// addresses and does not confine to scope — so a runner that is handed a
+/// plan by anything other than these checks has not had conditions 1 to 3
+/// applied. Public because the tests script a fake runner through it; the
+/// catalogue calls it only from [`crate::checks_with`] (security review
+/// FS-3).
 #[must_use]
 pub fn h2_checks(runner: Arc<dyn RawH2Runner>) -> Vec<Arc<dyn Check>> {
     [

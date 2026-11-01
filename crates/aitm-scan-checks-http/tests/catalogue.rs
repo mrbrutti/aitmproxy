@@ -297,6 +297,55 @@ fn no_source_path_builds_an_ungated_raw_h2_runner() {
     );
 }
 
+/// `RealRawH2Runner` is public (the h2 tests build it to prove it refuses
+/// session material), so its doc must say exactly what the gate it carries
+/// does: refuse private, loopback and metadata addresses, **not** confine to
+/// scope (`confine_to_scope = false`, as the reissue path), with condition 1
+/// — target is a profile origin — enforced by `H2Check::run` and not by the
+/// runner. `h2_checks` is public for the same reason (the tests script a fake
+/// runner through it) and must carry that contract too (final security
+/// review FS-3).
+#[test]
+fn the_raw_runner_and_h2_checks_document_their_gate_contract() {
+    let h2 = include_str!("../src/h2_observe.rs");
+
+    let doc_of = |item: &str| -> String {
+        let at = h2.find(item).unwrap_or_else(|| panic!("{item} not found"));
+        // The doc comment block immediately above the item.
+        h2[..at]
+            .lines()
+            .rev()
+            .take_while(|line| {
+                line.trim_start().starts_with("///") || line.trim_start().starts_with('#')
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let runner = doc_of("pub struct RealRawH2Runner {");
+    for phrase in [
+        "confine_to_scope = false",
+        "private, loopback and metadata",
+        "H2Check::run",
+    ] {
+        assert!(
+            runner.contains(phrase),
+            "RealRawH2Runner doc lacks {phrase:?}:\n{runner}"
+        );
+    }
+
+    let checks = doc_of("pub fn h2_checks(");
+    for phrase in ["profile origin", "H2Check::run", "scope"] {
+        assert!(
+            checks.contains(phrase),
+            "h2_checks doc lacks {phrase:?}:\n{checks}"
+        );
+    }
+}
+
 /// What the crate exposes is the two slots, the check modules, and
 /// `timing` — the latter because the plan's D4 contract offers
 /// `timing::{fit, correlated}` to the Rhai bridge. `matching` is the checks'
