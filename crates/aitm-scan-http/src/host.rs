@@ -75,11 +75,9 @@ pub(crate) struct HttpProbeHost {
     point: InsertionPoint,
     /// The source's origin; a raw probe may not leave it.
     origin: Url,
-    /// The job: client, store, budget, deadline, cancellation, marker.
+    /// The job: client, store, budget, deadline, cancellation, marker, and the
+    /// profile every `profile()` hands out.
     job: Arc<dyn JobCtx>,
-    /// The job's profile, cloned so `ProbeHost::profile` can hand out a
-    /// reference that outlives a `job.profile()` borrow.
-    profile: ScanProfile,
     /// The job's session canary, shared by every host of the job.
     monitor: Arc<SessionMonitor>,
     /// The unmutated response, taken once per host.
@@ -109,9 +107,8 @@ impl HttpProbeHost {
             return Err(anyhow!("scan: source flow {flow_ref} is gone"));
         };
 
-        let profile = job.profile().clone();
         let mut source = flow.request;
-        match profile.session.mode {
+        match job.profile().session.mode {
             // The capture may itself be authenticated; an unauthenticated job
             // sheds that here, before the baseline exists, so no later path
             // can put it back (AC T2-4).
@@ -133,7 +130,6 @@ impl HttpProbeHost {
             point: point.clone(),
             origin,
             job,
-            profile,
             monitor,
             baseline: OnceCell::new(),
             held: Mutex::new(VecDeque::new()),
@@ -143,12 +139,12 @@ impl HttpProbeHost {
     /// The options every send of this host goes out with (D5, D9.1).
     fn send_options(&self) -> SendOptions {
         SendOptions {
-            record: match self.profile.http.record_probes {
+            record: match self.job.profile().http.record_probes {
                 RecordProbes::IssuesOnly => RecordPolicy::Never,
                 RecordProbes::All => RecordPolicy::Always,
             },
             marks: vec![format!("scan:{}", self.job.job_id())],
-            version: self.profile.http.version.into(),
+            version: self.job.profile().http.version.into(),
         }
     }
 
@@ -323,7 +319,7 @@ impl HttpProbeHost {
     /// Whether the job's profile says scan unauthenticated
     /// (`session.mode: none`).
     fn unauthenticated(&self) -> bool {
-        self.profile.session.mode == SessionMode::None
+        self.job.profile().session.mode == SessionMode::None
     }
 }
 
@@ -419,7 +415,7 @@ impl ProbeHost for HttpProbeHost {
     }
 
     fn deadline(&self) -> Instant {
-        let check_timeout = Duration::from_secs(self.profile.budget.check_timeout_s);
+        let check_timeout = Duration::from_secs(self.job.profile().budget.check_timeout_s);
         match Instant::now().checked_add(check_timeout) {
             Some(check) => self.job.deadline().min(check),
             // An absurd `check_timeout_s` cannot be added to `now`; the job's
@@ -429,7 +425,7 @@ impl ProbeHost for HttpProbeHost {
     }
 
     fn profile(&self) -> &ScanProfile {
-        &self.profile
+        self.job.profile()
     }
 
     fn cancelled(&self) -> bool {
