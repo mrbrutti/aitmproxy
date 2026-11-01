@@ -74,8 +74,10 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 - **`session.mode: none` means unauthenticated (orchestrator amendment 2026-11-01).** A captured
   source request may itself carry the operator's session (`Cookie`, `Authorization`, any
   `is_secret_name` header). Under `mode: none` the `ProbeHost` strips those from the source request
-  before building the baseline and every probe, and the `session`-trait points of such a request are
-  not produced; under `mode: observed` the material is merged as D7 says. Otherwise AC T2-4's
+  before building the baseline and every probe (fixed in bfe7b789); the `session`-trait points of such a
+  request are skipped by the default `audit.ignore` rule `{ trait: session }` (a point named after a
+  session cookie or secret-named header carries the trait regardless of mode), so no further
+  `points.rs` change is needed; under `mode: observed` the material is merged as D7 says. Otherwise AC T2-4's
   "with `session.mode: none` it is not reached" cannot hold for a seed captured while logged in.
 - **The session-lost token.** `session::SESSION_LOST_PREFIX = "scan: session_lost: "`. After a
   canary loss with `on_lost: stop`, every `probe`/`baseline`/`probe_raw` of every host of that job
