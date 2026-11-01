@@ -473,6 +473,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "rcgen",
+ "rhai",
  "rustls",
  "rustls-pki-types",
  "serde_json",
