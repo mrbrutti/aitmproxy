@@ -745,3 +745,183 @@ fn a_legacy_discover_reply_never_overwrites_the_v2_site_map() {
         "the v2 node lines are untouched by a legacy reply"
     );
 }
+
+/// Flow ids for the two-host page of [`two_host_page`], in the wire form.
+const FLOW_A: &str = "11111111-1111-4111-8111-111111111111";
+const FLOW_B: &str = "22222222-2222-4222-8222-222222222222";
+const FLOW_C: &str = "33333333-3333-4333-8333-333333333333";
+const POINT_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const POINT_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const POINT_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+/// A `scan.sitemap` page whose wire order differs from the group order
+/// the pane draws (fix round G, G22): `a` (h1, `GET /`), `b` (h2), `c`
+/// (h1, `POST /login`) arrive in that order and group as `a, c, b`, so
+/// the second row on screen is `c`, the reply's third node. One point per
+/// node, listed in yet another order (`c, a, b`), each carrying its own
+/// flow.
+fn two_host_page() -> Value {
+    let node = |id: &str, host: &str, method: &str, path: &str, flow: &str| {
+        json!({
+            "id": id, "method": method, "scheme": "http", "host": host, "port": 8080,
+            "path_template": path, "flows": [flow], "params": [], "auth": false,
+            "points": 1, "audited": false,
+        })
+    };
+    let point = |id: &str, node: &str, flow: &str| {
+        json!({
+            "id": id, "lane": "http", "kind": "query", "name": format!("q-{id}"),
+            "path": null, "example": "x", "flow": flow, "site_node": node,
+            "traits": [], "frequency": 1, "method": "GET", "url": "http://h/",
+        })
+    };
+    json!({
+        "nodes": [
+            node("a", "h1", "GET", "/", FLOW_A),
+            node("b", "h2", "GET", "/", FLOW_B),
+            node("c", "h1", "POST", "/login", FLOW_C),
+        ],
+        "points": [
+            point("p-c", "c", POINT_C),
+            point("p-a", "a", POINT_A),
+            point("p-b", "b", POINT_B),
+        ],
+        "next_cursor": null,
+    })
+}
+
+/// Fix round H, H73 (fifth live run: `Enter` on the row reading `POST
+/// /login` opened the `GET /` flow): the flow `Enter` opens is the one of
+/// the node whose row the cursor marks, in the group order the pane draws,
+/// not the reply's order. With `two_host_page` the second row is `c`
+/// (`POST /login`, the reply's third node): the screen marks that row and
+/// `Enter` selects exactly `c.flows[0]`. The third row is `b`, the reply's
+/// second node, and opens `b.flows[0]`.
+#[test]
+fn enter_opens_the_node_of_the_row_under_the_cursor_in_group_order() {
+    let mut app = app();
+    let reqs = app.update(Action::ScanTab(ScanTab::SiteMap));
+    assert_eq!(reqs, vec![sitemap_request(json!({}))]);
+    let _ = app.on_bus(sitemap_reply(two_host_page()));
+    let _ = app.on_bus(BusEvent::Flows(vec![
+        summary(FLOW_A, "GET", "h1:8080", "/", Some(200), "none"),
+        summary(FLOW_B, "GET", "h2:8080", "/", Some(200), "none"),
+        summary(FLOW_C, "POST", "h1:8080", "/login", Some(200), "none"),
+    ]));
+    let ids: Vec<&str> = app
+        .scan
+        .sitemap
+        .nodes
+        .iter()
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["a", "c", "b"], "group order, not the reply's");
+    assert_eq!(app.scan.sitemap.pane, MapPane::Nodes);
+
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.sitemap.node_cursor, 1);
+    let text = text_of(&app, 200, 50);
+    assert!(
+        pane_row(&text, "POST /login").starts_with('>'),
+        "the cursor marks the POST /login row:\n{text}"
+    );
+    app.selected = None;
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector, "{}", toast(&app));
+    assert_eq!(
+        app.selected.as_deref(),
+        Some(FLOW_C),
+        "the POST /login row opens its own node's first flow"
+    );
+
+    app.mode = Mode::Scan;
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.sitemap.node_cursor, 2);
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector, "{}", toast(&app));
+    assert_eq!(app.selected.as_deref(), Some(FLOW_B), "the third row is b");
+
+    // The live run's sequence: a walk to the end, `g` (Home), `Enter`.
+    // Home lands on the first row at once and Enter opens that row's node
+    // (`a`, `GET /`), not the row the walk left the cursor on.
+    app.mode = Mode::Scan;
+    let _ = app.update(Action::End);
+    assert_eq!(app.scan.sitemap.node_cursor, 2);
+    let _ = app.update(Action::Home);
+    assert_eq!(app.scan.sitemap.node_cursor, 0);
+    let text = text_of(&app, 200, 50);
+    assert!(
+        pane_row(&text, "GET  /  flows").starts_with('>'),
+        "Home marks the first row:\n{text}"
+    );
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector, "{}", toast(&app));
+    assert_eq!(
+        app.selected.as_deref(),
+        Some(FLOW_A),
+        "Enter after Home opens the first row's node"
+    );
+}
+
+/// H73 on the Points pane: `Enter` on a point opens that point's flow,
+/// the point being the one under the selected node in the drawn order
+/// (the points re-sorted under their nodes, G20/G24), whatever order the
+/// reply listed nodes and points in.
+#[test]
+fn enter_opens_the_point_under_the_cursor_in_group_order() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    let _ = app.on_bus(sitemap_reply(two_host_page()));
+    let _ = app.on_bus(BusEvent::Flows(vec![
+        summary(POINT_A, "GET", "h1:8080", "/?q-p-a=x", Some(200), "none"),
+        summary(POINT_B, "GET", "h2:8080", "/?q-p-b=x", Some(200), "none"),
+        summary(
+            POINT_C,
+            "GET",
+            "h1:8080",
+            "/login?q-p-c=x",
+            Some(200),
+            "none",
+        ),
+    ]));
+    let point_ids: Vec<&str> = app
+        .scan
+        .sitemap
+        .points
+        .iter()
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(
+        point_ids,
+        vec!["p-a", "p-c", "p-b"],
+        "points follow node order"
+    );
+
+    // Second node row (`c`), then the Points pane: its one point is `p-c`.
+    let _ = app.update(Action::Down);
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.sitemap.pane, MapPane::Points);
+    assert_eq!(
+        app.scan.sitemap.selected_point().map(|p| p.id.as_str()),
+        Some("p-c")
+    );
+    let text = text_of(&app, 200, 50);
+    assert!(
+        pane_row(&text, "q-p-c").starts_with('>'),
+        "the Points cursor marks p-c:\n{text}"
+    );
+    app.selected = None;
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector, "{}", toast(&app));
+    assert_eq!(app.selected.as_deref(), Some(POINT_C), "p-c's own flow");
+
+    // Back on Nodes, third row (`b`), Points again: `p-b`.
+    app.mode = Mode::Scan;
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.sitemap.pane, MapPane::Nodes);
+    let _ = app.update(Action::Down);
+    let _ = app.update(Action::ScanPaneNext);
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector, "{}", toast(&app));
+    assert_eq!(app.selected.as_deref(), Some(POINT_B), "p-b's own flow");
+}
