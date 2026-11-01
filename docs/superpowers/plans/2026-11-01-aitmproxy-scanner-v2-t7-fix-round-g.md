@@ -202,6 +202,12 @@ G80. Third copy of the `tagged`/`reply`/`failed`/`opened()` test scaffolding (`t
 
 G81. Test helper and doc hygiene (`tests/scan_v2_errors.rs`; `crates/aitm-tui/src/app.rs` `on_scan_failed` doc; `crates/aitm-tui/src/ui/scan/profiles.rs` footer comment): `footer_reason(text, needle)`; the two `unwrap_or_default()` in the hue assertion become `expect("the wording column")`/`expect("the theme sets a foreground")`; the `on_scan_failed` doc keeps the D9/D13 citations and the two whys (`started_here` removal, blocked-before-refused precedence) and drops the step list; the profiles footer comment likewise. G65's `blocked_footer` builds the refused `String` lazily (only when `blocked` is `None`).
 
+## Task 13 security panel
+
+G82. **Important, priority.** Core-controlled error `detail` is unbounded, held in four copies and walked per frame (`crates/aitm-tui/src/scan/mod.rs` `ScanError::new`/`from_message`; consumers in `app.rs` `on_scan_failed`, `ui/scan/profiles.rs` footer `wrap`, `ui/bars.rs` toast): bound at the one choke point: `pub const ERROR_DETAIL_MAX: usize = 240` cells; `ScanError::new` stores `detail` as `truncate(&detail, ERROR_DETAIL_MAX)` with control characters stripped (rides G10's `clean`) and `shrink_to_fit`, so the banner, toast, `wrap` and both clones all see bounded text. Test (`tests/scan_v2_errors.rs`): a `CallTaggedFailed` on `scan.start` with a 1 MiB detail renders at 240x50, `profiles.error.unwrap().detail.chars().count() <= 4 * ERROR_DETAIL_MAX`, and the toast text is likewise bounded.
+
+G83. The `not_found` self-heal is a request path that is neither timer- nor key-driven (`crates/aitm-tui/src/app.rs` `on_scan_failed`, `scan.list` arm; `crates/aitm-tui/src/scan/jobs.rs` `fold_list`): a core that lists a job and answers every `scan.status` for it with `not_found` drives a reply-paced list/status ping-pong (bounded, not amplified, but a flickering row and a stream of Error toasts). Add `JobsState.healed: BTreeSet<JobId>` filled by the self-heal and cleared by the 40-tick timer's `scan.list`; `fold_list` emits no `scan.status` follow-up for a healed id, so a listed-but-not-found id is polled at most once per timer window. Slots beside G74's `heal_pending`. Test: a list carrying the job right after a `not_found` yields no `scan.status` for it; the timer-driven list does.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

@@ -571,6 +571,8 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | quality | Minor | `footer_reason` hard-codes one wording; `unwrap_or_default()` hides the failure cause | fix round G (G81) |
 | 13 | quality | Minor | `scan.cancel:<job>` self-heal untested | fix round G (G75, already queued) |
 | 13 | quality | Minor | narrating `on_scan_failed` doc and footer comment | fix round G (G81) |
+| 13 | security | Important | core-controlled error `detail` unbounded, four copies, walked per frame by toast and footer | fix round G (G82, priority): bound in `ScanError::new` |
+| 13 | security | Minor | `not_found` self-heal allows a reply-paced list/status ping-pong | fix round G (G83, with G74): `healed` set skips follow-ups until the timer list |
 
 ## Shipped
 
