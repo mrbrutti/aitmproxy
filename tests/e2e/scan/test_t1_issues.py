@@ -14,8 +14,8 @@ Observers: the restarted core reading the issue store from disk, a file under
 hit `/search`). Own target + own cores on free ports; tokens never printed.
 
 SKIP 77: `aitm-testtarget-serve` not built; the v2 verbs absent (`missing verb ...`).
-Class tokens: T3 emits `xss` for every reflection kind, the T1a fixture pack and the
-interim lane say `reflected-xss`; the cell accepts both and prints which it saw.
+Class token: the pinned reflection vocabulary is `aitm_e2e.scan.REFLECTED_XSS_CLASSES`
+(`reflected-xss`); the cell filters client-side and prints the token it saw.
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    REFLECTED_XSS_CLASSES,
     ScanTarget,
     issue,
     issues,
@@ -42,7 +43,6 @@ from aitm_e2e.scan import (  # noqa: E402
     wait_terminal,
 )
 
-XSS_CLASSES = ("xss", "reflected-xss")
 JOB_TIMEOUT = 600.0
 
 
@@ -51,7 +51,7 @@ def xss_on_search(rows: list[dict]) -> list[dict]:
     out = []
     for i in rows:
         loc = i.get("location") or {}
-        if i.get("class") in XSS_CLASSES and loc.get("path") == "/search" \
+        if i.get("class") in REFLECTED_XSS_CLASSES and loc.get("path") == "/search" \
                 and loc.get("kind") == "query" and loc.get("name") == "q":
             out.append(i)
     return out

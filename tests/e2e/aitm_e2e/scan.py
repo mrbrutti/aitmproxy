@@ -44,6 +44,10 @@ from .target import testtarget_bin
 
 __all__ = [
     "SCAN_VERBS_D3",
+    "REFLECTED_XSS_CLASSES",
+    "WS_CSWSH_CLASS",
+    "WS_INJECTION_CLASS",
+    "WS_AUTH_BYPASS_CLASS",
     "JOB_NOTIFICATION_METHOD",
     "TERMINAL_STATES",
     "TERMINAL_EVENTS",
@@ -100,6 +104,19 @@ TERMINAL_EVENTS = frozenset({"finished", "cancelled", "failed"})
 TERMINAL_STATES = frozenset({"done", "cancelled", "failed"})
 
 ROLES = ("operator", "agent")
+
+# Issue-class vocabulary pinned by the coordinator (2026-11-01), D6. A cell selects
+# reflection issues CLIENT-SIDE with `i["class"] in REFLECTED_XSS_CLASSES` rather than
+# passing `class=` to `scan.issues`, so adding an alias stays a one-line change here.
+# The token is settled: `reflected-xss` is the only member today.
+REFLECTED_XSS_CLASSES: tuple[str, ...] = ("reflected-xss",)
+
+# The WebSocket issue families (D3 manifest rows `ws-cswsh` / `ws-input-reflection`,
+# whose classes are these). Check ids are a separate vocabulary: `ws-oversize-frame`
+# is a check id, not a class.
+WS_CSWSH_CLASS = "ws-cswsh"
+WS_INJECTION_CLASS = "ws-injection"
+WS_AUTH_BYPASS_CLASS = "ws-auth-bypass"
 
 _CONTRACT = Path(repo_root()) / "crates" / "aitm" / "tests" / "frontends.rs"
 _ERROR_CODE_RE = re.compile(r"scan: ([a-z_]+):")

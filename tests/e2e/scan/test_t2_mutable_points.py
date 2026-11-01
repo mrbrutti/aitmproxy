@@ -2,9 +2,10 @@
 # e2e: tier=T1 surface=scan needs=http
 """scan/t2_mutable_points -- AC T2-3: the seeded header reflection (`GET /whoami`,
 `User-Agent` / `X-Forwarded-For`) and cookie reflection (`GET /prefs`, cookie `theme`)
-are found on V as `class == "xss"` issues with `location.kind == "header"` on
-`/whoami` and `location.kind == "cookie"` on `/prefs`, and NOT found on P, after
-real proxied captures of both routes on both origins.
+are found on V as reflected-XSS issues (the pinned `REFLECTED_XSS_CLASSES`) with
+`location.kind == "header"` on `/whoami` and `location.kind == "cookie"` on
+`/prefs`, and NOT found on P, after real proxied captures of both routes on both
+origins.
 
 Observers: the target's control log (`/log/http`): the scanner's `/whoami`
 requests carry a `user-agent` or `x-forwarded-for` different from the captured
@@ -30,6 +31,7 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    REFLECTED_XSS_CLASSES,
     ScanTarget,
     issues,
     require_lane,
@@ -49,6 +51,11 @@ def capture(proxy: int, base: str) -> None:
     check(r.status == 200, f"GET /whoami through the proxy -> 200 on {base} (got {r.status})")
     r = via_proxy(proxy, "GET", base + "/prefs", headers={"Cookie": COOKIE})
     check(r.status == 200, f"GET /prefs through the proxy -> 200 on {base} (got {r.status})")
+
+
+def reflected(rows: list[dict]) -> list[dict]:
+    """The reflected-XSS issues, selected client-side on the pinned class token."""
+    return [i for i in rows if i.get("class") in REFLECTED_XSS_CLASSES]
 
 
 def reflections(xss: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -84,14 +91,14 @@ def main() -> None:
                 st = wait_terminal(op, "operator", job_v, timeout=900)
                 check(st.get("state") == "done", f"V job ended done (state={st.get('state')!r}, "
                                                  f"stopped_reason={st.get('stopped_reason')!r})")
-                xss_v = issues(op, "operator", job=job_v, **{"class": "xss"})
+                xss_v = reflected(issues(op, "operator", job=job_v))
                 hdr_v, ck_v = reflections(xss_v)
-                ok(f"V: {len(xss_v)} xss issues; locations = "
+                ok(f"V: {len(xss_v)} reflected-xss issues; locations = "
                    f"{sorted((i['location'].get('kind'), i['location'].get('path'), i['location'].get('name')) for i in xss_v)}")
-                check(bool(hdr_v), "V: an xss issue with location.kind == header on /whoami")
+                check(bool(hdr_v), "V: a reflected-xss issue with location.kind == header on /whoami")
                 check({str(i["location"].get("name")).lower() for i in hdr_v} & {"user-agent", "x-forwarded-for"} != set(),
                       f"V: the header issue names User-Agent or X-Forwarded-For ({[i['location'].get('name') for i in hdr_v]})")
-                check(bool(ck_v), "V: an xss issue with location.kind == cookie on /prefs")
+                check(bool(ck_v), "V: a reflected-xss issue with location.kind == cookie on /prefs")
                 check(all(i["location"].get("name") == "theme" for i in ck_v),
                       f"V: the cookie issue names theme ({[i['location'].get('name') for i in ck_v]})")
                 check(all(i.get("lane") == "http" for i in hdr_v + ck_v), "V: both issues are on the http lane")
@@ -119,10 +126,10 @@ def main() -> None:
                 st = wait_terminal(op, "operator", job_p, timeout=900)
                 check(st.get("state") == "done", f"P job ended done (state={st.get('state')!r}, "
                                                  f"stopped_reason={st.get('stopped_reason')!r})")
-                xss_p = issues(op, "operator", job=job_p, **{"class": "xss"})
+                xss_p = reflected(issues(op, "operator", job=job_p))
                 hdr_p, ck_p = reflections(xss_p)
-                check(not hdr_p, f"P: no header xss issue on /whoami ({len(hdr_p)})")
-                check(not ck_p, f"P: no cookie xss issue on /prefs ({len(ck_p)})")
+                check(not hdr_p, f"P: no header reflected-xss issue on /whoami ({len(hdr_p)})")
+                check(not ck_p, f"P: no cookie reflected-xss issue on /prefs ({len(ck_p)})")
                 reqs_p = P.logs.scanner_requests(seq_p)
                 check(any(e.get("path") == "/whoami" for e in reqs_p) and any(e.get("path") == "/prefs" for e in reqs_p),
                       f"P log shows the scanner probed /whoami and /prefs too ({len(reqs_p)} requests)")

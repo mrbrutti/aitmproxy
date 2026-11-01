@@ -9,7 +9,7 @@ target's certificate is self-signed) and every target authority in scope;
 default `standard` profile against that origin).
 
 Assert: `probes.by_lane.http > 0`; the seeded reflected XSS on `/search`
-(class `reflected-xss`, T3's corrected token) and the seeded SQLi error on
+(a `REFLECTED_XSS_CLASSES` class, the pinned token) and the seeded SQLi error on
 `/products` (class `sqli`) are found
 on V and neither is found on P; `flow.detail` of `evidence.probe_flows[0]` of one
 of those issues renders `request.version` as `h2` or `HTTP/2` (the cell prints
@@ -34,11 +34,14 @@ from aitm_e2e import check, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, issues, require_lane, require_verbs,  # noqa: E402
-                           scan_call, start_job, wait_terminal)
+from aitm_e2e.scan import (REFLECTED_XSS_CLASSES, ScanTarget, issues,  # noqa: E402
+                           require_lane, require_verbs, scan_call, start_job,
+                           wait_terminal)
 
-# The T3 check ids this cell needs in the live catalogue (parent spec D8.2).
+# The T3 check ids this cell needs in the live catalogue (parent spec D8.2). These are
+# CHECK ids, a vocabulary of their own; the issue class is `REFLECTED_XSS_CLASSES`.
 NEEDED_CHECKS = ("xss-reflected", "sqli")
+XSS_LABEL = "/".join(REFLECTED_XSS_CLASSES)
 JOB_TIMEOUT = 600.0
 
 
@@ -59,9 +62,11 @@ def brief(iss, limit: int = 12) -> str:
     return f"{len(rows)} kind(s): {shown}{' ...' if len(rows) > limit else ''}"
 
 
-def find(iss, cls: str, path: str) -> list:
+def find(iss, cls, path: str) -> list:
+    """Issues at `path` whose class is `cls` (one token) or is in `cls` (a tuple)."""
+    classes = (cls,) if isinstance(cls, str) else tuple(cls)
     return [i for i in iss
-            if i.get("class") == cls and (i.get("location") or {}).get("path") == path]
+            if i.get("class") in classes and (i.get("location") or {}).get("path") == path]
 
 
 def run_job(op, target, origin: str) -> tuple[str, dict]:
@@ -104,10 +109,10 @@ def main() -> None:
 
             section("the seeded vulns are found over h2 on V")
             iss_v = issues(op, "operator", job=job_v)
-            xss = find(iss_v, "reflected-xss", "/search")
+            xss = find(iss_v, REFLECTED_XSS_CLASSES, "/search")
             sqli = find(iss_v, "sqli", "/products")
             check(len(xss) >= 1,
-                  f"V: class 'reflected-xss' on /search found over h2 [{brief(iss_v)}]")
+                  f"V: class '{XSS_LABEL}' on /search found over h2 [{brief(iss_v)}]")
             check(len(sqli) >= 1, f"V: class 'sqli' on /products found over h2 [{brief(iss_v)}]")
 
             section("one issue's probe flow was captured as an h2 flow")
@@ -131,8 +136,8 @@ def main() -> None:
             section("the patched twin yields neither class over h2")
             job_p, ctx_p = run_job(op, p, p.tls_base)
             iss_p = issues(op, "operator", job=job_p)
-            check(not find(iss_p, "reflected-xss", "/search"),
-                  f"P: no 'reflected-xss' issue on /search [{brief(iss_p)}]")
+            check(not find(iss_p, REFLECTED_XSS_CLASSES, "/search"),
+                  f"P: no '{XSS_LABEL}' issue on /search [{brief(iss_p)}]")
             check(not find(iss_p, "sqli", "/products"),
                   f"P: no 'sqli' issue on /products [{brief(iss_p)}]")
             p_h2 = [e for e in p.logs.scanner_requests(ctx_p["seq0"])

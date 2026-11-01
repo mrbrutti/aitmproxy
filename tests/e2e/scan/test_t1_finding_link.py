@@ -14,7 +14,8 @@ Observers: files on disk under `findings_dir`, `scan.checks` for which checks ar
 passive, the target control logs. Own targets + own core; tokens never printed.
 
 SKIP 77: `aitm-testtarget-serve` not built; the v2 verbs absent (`missing verb ...`).
-Class tokens: T3 emits `xss`, the T1a fixtures/interim lane `reflected-xss`; both accepted.
+Class token: the pinned reflection vocabulary is `aitm_e2e.scan.REFLECTED_XSS_CLASSES`
+(`reflected-xss`); the cell filters client-side and prints the token it saw.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    REFLECTED_XSS_CLASSES,
     ScanTarget,
     issues,
     require_verbs,
@@ -39,13 +41,24 @@ from aitm_e2e.scan import (  # noqa: E402
     wait_terminal,
 )
 
-XSS_CLASSES = ("xss", "reflected-xss")
-HINTED_INTERIM = set(XSS_CLASSES) | {"open-redirect"}
+HINTED_INTERIM = set(REFLECTED_XSS_CLASSES) | {"open-redirect"}
+# Origin-level classes raised by checks that carry no PocHint (the coordinator's list,
+# 2026-11-01, beside the D3 passive row's `missing-hsts`). The hint-less fallback below
+# accepts them as hint-less issues: they must carry `finding_id == None`.
+ORIGIN_LEVEL_CLASSES = frozenset({
+    "missing-hsts",
+    "missing-security-headers",
+    "risky-http-methods",
+    "exposed-path",
+    "cors",
+    "information-disclosure",
+})
 JOB_TIMEOUT = 600.0
 
 
 def xss_on_search(rows: list[dict]) -> list[dict]:
-    return [i for i in rows if i.get("class") in XSS_CLASSES and (i.get("location") or {}).get("path") == "/search"]
+    return [i for i in rows if i.get("class") in REFLECTED_XSS_CLASSES
+            and (i.get("location") or {}).get("path") == "/search"]
 
 
 def finding_files(root: str) -> dict[str, str]:
@@ -114,6 +127,10 @@ def main() -> int:
         else:
             hintless = [i for i in iss_v if i.get("class") not in HINTED_INTERIM]
             if hintless:
+                origin_level = sorted({str(i.get("class")) for i in hintless
+                                       if i.get("class") in ORIGIN_LEVEL_CLASSES})
+                print(f"note: {len(hintless)} hint-less issue(s); origin-level classes among them = "
+                      f"{origin_level}", flush=True)
                 bad = [(i.get("id"), i.get("class"), i.get("finding_id")) for i in hintless if i.get("finding_id") is not None]
                 check(not bad, f"{len(hintless)} issue(s) outside the hinted interim classes carry finding_id == None "
                       f"(offenders: {bad[:3]})")

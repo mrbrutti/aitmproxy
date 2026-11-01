@@ -5,7 +5,7 @@
 `GET /account?tab=overview` through the proxy, `scan.session.preview` names the
 `session` cookie (names only, never the value) and a `scan.start` with
 `session.mode: observed` finds the authenticated-only seeded reflection behind
-`/account` (`class == "xss"`, `location.path == "/account"`, `kind == "query"`,
+`/account` (a `REFLECTED_XSS_CLASSES` class, `location.path == "/account"`, `kind == "query"`,
 `name == "tab"`); a second job with `session.mode: none` never reaches it.
 
 Observers: the target's control log (`/log/http`): with the observed session the
@@ -31,6 +31,7 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    REFLECTED_XSS_CLASSES,
     ScanTarget,
     issues,
     require_lane,
@@ -57,6 +58,11 @@ def login_via_proxy(proxy: int, base: str) -> str:
 
 def account_issues(xs: list[dict]) -> list[dict]:
     return [i for i in xs if (i.get("location") or {}).get("path") == "/account"]
+
+
+def reflected(rows: list[dict]) -> list[dict]:
+    """The reflected-XSS issues, selected client-side on the pinned class token."""
+    return [i for i in rows if i.get("class") in REFLECTED_XSS_CLASSES]
 
 
 def main() -> None:
@@ -99,11 +105,11 @@ def main() -> None:
                 sess = st1.get("session") or {}
                 check(sess.get("reused") is True, f"status.session.reused is true ({sess})")
                 check(sess.get("lost") is False, f"status.session.lost is false ({sess})")
-                xs1 = account_issues(issues(op, "operator", job=job1, **{"class": "xss"}))
-                ok(f"job 1: /account xss issues = "
+                xs1 = account_issues(reflected(issues(op, "operator", job=job1)))
+                ok(f"job 1: /account reflected-xss issues = "
                    f"{[(i['location'].get('kind'), i['location'].get('name')) for i in xs1]}")
                 check(any(i["location"].get("kind") == "query" and i["location"].get("name") == "tab" for i in xs1),
-                      "job 1: xss issue on /account query param tab")
+                      "job 1: reflected-xss issue on /account query param tab")
                 check(all(i["location"].get("method") in (None, "GET") for i in xs1),
                       "job 1: the /account issue is on the GET route")
 

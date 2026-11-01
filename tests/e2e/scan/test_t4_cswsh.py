@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=scan needs=ws
-"""AC T4-2: seeded Cross-Site WebSocket Hijacking is found on V (`cswsh`, `certain`)
+"""AC T4-2: seeded Cross-Site WebSocket Hijacking is found on V (`ws-cswsh`, `certain`)
 and not on P; the dialer regenerated `Sec-WebSocket-Key` and kept the `Cookie`.
 
 Real, never a fixture: the cell logs in to each target (`POST /login`
@@ -10,12 +10,12 @@ and the session cookie, recording its own `Sec-WebSocket-Key` K. A `scan.start`
 with `lanes: ["ws"]` runs the CSWSH check, which re-dials with a FOREIGN `Origin`
 and the captured cookie.
 
-- On V (`/ws` accepts any `Origin`): an issue `class == "cswsh"`, `confidence ==
+- On V (`/ws` accepts any `Origin`): an issue `class == "ws-cswsh"`, `confidence ==
   "certain"`; and the target's own WS handshake log (the independent observer) has a
   lane handshake whose `origin` is not V's own origin, whose `sec_websocket_key`
   differs from K (the dialer regenerated it), that kept the session cookie
   (`"session" in cookie_names`), and that was `accepted == True`.
-- On P (`/ws` rejects a foreign `Origin`): no `cswsh` issue, and every foreign-origin
+- On P (`/ws` rejects a foreign `Origin`): no `ws-cswsh` issue, and every foreign-origin
   handshake entry is `accepted == False`, `status == 403`.
 
 SKIP 77 when: the scanner verbs are absent, or the `ws` lane has no `scan.checks`
@@ -43,6 +43,7 @@ from aitm_e2e.bus import BusClient, BusError  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    WS_CSWSH_CLASS,
     ScanTarget,
     issues,
     require_lane,
@@ -137,7 +138,7 @@ def _ws_handshakes_since(target: ScanTarget, seq0: int) -> list[dict]:
 
 
 def main() -> int:
-    section("AC T4-2: CSWSH found on V (cswsh, certain), not on P; key regenerated, cookie kept")
+    section("AC T4-2: CSWSH found on V (ws-cswsh, certain), not on P; key regenerated, cookie kept")
     with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
@@ -159,10 +160,10 @@ def main() -> int:
                                        "target": {"origins": [v.base]},
                                        "lanes": ["ws"]})["job"]
             wait_terminal(op, "operator", v_job)
-            v_cswsh = [i for i in issues(op, "operator", job=v_job) if i.get("class") == "cswsh"]
-            check(len(v_cswsh) >= 1, f"V: a cswsh issue was raised ({len(v_cswsh)})")
+            v_cswsh = [i for i in issues(op, "operator", job=v_job) if i.get("class") == WS_CSWSH_CLASS]
+            check(len(v_cswsh) >= 1, f"V: a {WS_CSWSH_CLASS} issue was raised ({len(v_cswsh)})")
             check(all(i.get("confidence") == "certain" for i in v_cswsh),
-                  "V: the cswsh issue(s) are confidence == certain")
+                  f"V: the {WS_CSWSH_CLASS} issue(s) are confidence == certain")
 
             section("V: the target's own handshake log proves the regenerated key + kept cookie")
             v_hs = _ws_handshakes_since(v, v_seq0)
@@ -175,7 +176,7 @@ def main() -> int:
                   "V: a lane handshake used a foreign Origin, a key != the captured one, "
                   f"kept the session cookie, and was accepted ({len(lane_hs)} of {len(v_hs)})")
 
-            section("P: the same dial is rejected (403) and no cswsh issue is raised")
+            section("P: the same dial is rejected (403) and no ws-cswsh issue is raised")
             p_cookie = _login(p.authority)
             _authed_conversation(core.cfg.proxy_port, p.authority, p_cookie)
             p_origin = f"http://{p.authority}"
@@ -185,8 +186,9 @@ def main() -> int:
                                        "target": {"origins": [p.base]},
                                        "lanes": ["ws"]})["job"]
             wait_terminal(op, "operator", p_job)
-            p_cswsh = [i for i in issues(op, "operator", job=p_job) if i.get("class") == "cswsh"]
-            check(len(p_cswsh) == 0, f"P: no cswsh issue (patched rejects the foreign Origin) ({len(p_cswsh)})")
+            p_cswsh = [i for i in issues(op, "operator", job=p_job) if i.get("class") == WS_CSWSH_CLASS]
+            check(len(p_cswsh) == 0,
+                  f"P: no {WS_CSWSH_CLASS} issue (patched rejects the foreign Origin) ({len(p_cswsh)})")
             p_foreign = [e for e in _ws_handshakes_since(p, p_seq0)
                          if e.get("origin") and e.get("origin") != p_origin]
             check(len(p_foreign) >= 1, f"P: the lane attempted a foreign-origin dial ({len(p_foreign)})")

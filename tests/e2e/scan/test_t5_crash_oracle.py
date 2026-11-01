@@ -15,7 +15,7 @@ them, so one positive proof is not enough. This cell runs both halves:
       service (child spec D5: a UDP echo that drops every datagram for a 5 s window when a
       payload starts `DE AD BE EF` and is at least 8 bytes long), a job fuzzing the `raw`
       layer from the seed `deadbeef0000` reaches that trigger through the lane's
-      deterministic `raw:grow:8` case and records exactly one `l4-crash` issue, `critical`
+      deterministic `grow:8` case and records exactly one `l4-crash` issue, `critical`
       / `firm`, `oracle.kind == "liveness_failed"`, `reproduced == [3, 3]`,
       `liveness_before: true`, `liveness_after: false`; the element is then RETIRED
       (`status.l4.retired_elements == 1`) and never sent again.
@@ -61,10 +61,11 @@ from aitm_e2e.scan import (ScanTarget, issue, issues, require_lane,  # noqa: E40
 
 SERVICE = "l4-udp-payload-crash"
 # Child spec D5: the V trigger is a payload starting DE AD BE EF with len >= 8. The seed is
-# 6 bytes (benign: it is echoed), so only the lane's deterministic `raw:grow:8` case reaches
+# 6 bytes (benign: it is echoed), so only the lane's deterministic `grow:8` case reaches
 # the trigger -- a 4-byte magic is unreachable from `616263` by random mutation.
+# T5 committed the chain element as `grow:8` (the layer is not part of the token).
 SEED_HEX = "deadbeef0000"
-GROW_MUTATION = "raw:grow:8"
+GROW_MUTATION = "grow:8"
 TRIGGER_PAYLOAD = bytes.fromhex("deadbeef00000000")
 KERNEL_CASES = 10
 CRASH_CASES = 100
