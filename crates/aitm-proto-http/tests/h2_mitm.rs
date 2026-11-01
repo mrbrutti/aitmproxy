@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use aitm_core::{
     Body, CommandHost, Config, Event, Flow, FlowCtx, FlowId, FlowStore, Frontend, HeaderMap,
     HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
-    Proxy, ProxyClient, Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, Value,
-    Verdict,
+    Proxy, ProxyClient, Registry, ScopeConfig, ScopeEntry, ScopeRateGuard, StdGuard, TunnelInfo,
+    Value, Verdict,
 };
 use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_sessionio::SessionIoPlugin;
@@ -471,12 +471,14 @@ async fn https_get_h1(
     (status, body)
 }
 
-/// The first captured HTTP flow that has a response, waiting briefly for it.
+/// The first captured request flow that has a response, waiting briefly for it.
+/// The `CONNECT` that carried it is its own tunnel row (spec D5) and is skipped,
+/// here and in every picker below.
 async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let found = store.list().into_iter().find_map(|id| match store.get(id) {
-            Some(Flow::Http(f)) if f.response.is_some() => Some(f),
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_none() && f.response.is_some() => Some(f),
             _ => None,
         });
         if let Some(flow) = found {
@@ -495,9 +497,10 @@ async fn wait_for_buffered_response(store: &dyn FlowStore) -> HttpFlow {
     loop {
         let found = store.list().into_iter().find_map(|id| match store.get(id) {
             Some(Flow::Http(f))
-                if f.response
-                    .as_ref()
-                    .is_some_and(|r| !matches!(r.body, Body::Streamed(_))) =>
+                if f.metadata.tunnel.is_none()
+                    && f.response
+                        .as_ref()
+                        .is_some_and(|r| !matches!(r.body, Body::Streamed(_))) =>
             {
                 Some(f)
             }
@@ -514,7 +517,8 @@ async fn wait_for_buffered_response(store: &dyn FlowStore) -> HttpFlow {
     }
 }
 
-/// Wait until the store holds at least `n` flows that each have a response.
+/// Wait until the store holds at least `n` request flows (tunnel rows excluded)
+/// that each have a response.
 async fn wait_for_n_flows(store: &dyn FlowStore, n: usize) -> Vec<HttpFlow> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -522,7 +526,9 @@ async fn wait_for_n_flows(store: &dyn FlowStore, n: usize) -> Vec<HttpFlow> {
             .list()
             .into_iter()
             .filter_map(|id| match store.get(id) {
-                Some(Flow::Http(f)) if f.response.is_some() => Some(f),
+                Some(Flow::Http(f)) if f.metadata.tunnel.is_none() && f.response.is_some() => {
+                    Some(f)
+                }
                 _ => None,
             })
             .collect();
@@ -536,6 +542,18 @@ async fn wait_for_n_flows(store: &dyn FlowStore, n: usize) -> Vec<HttpFlow> {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The stored tunnel rows (`CONNECT`, spec D5), oldest first.
+fn tunnel_rows(store: &dyn FlowStore) -> Vec<HttpFlow> {
+    store
+        .list()
+        .into_iter()
+        .filter_map(|id| match store.get(id) {
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_some() => Some(f),
+            _ => None,
+        })
+        .collect()
 }
 
 // --- AC-H2.1 -----------------------------------------------------------------
@@ -662,6 +680,11 @@ async fn three_concurrent_streams_three_flows() {
     for f in &flows {
         assert!(f.response.is_some(), "each flow has its own response");
     }
+    // Spec D5: the one h2 connection is one decrypted tunnel row, not a request.
+    let rows = tunnel_rows(store.as_ref());
+    assert_eq!(rows.len(), 1, "one CONNECT carried the three streams");
+    assert_eq!(rows[0].request.method, "CONNECT");
+    assert_eq!(rows[0].metadata.tunnel, Some(TunnelInfo::decrypted()));
 }
 
 // --- AC-H2.7 (Map Local short-circuit) ---------------------------------------
@@ -1735,13 +1758,14 @@ fn sessionio_invoke(reg: &Registry, store: &dyn FlowStore, command: &str, args: 
         .unwrap_or_else(|e| panic!("{command} failed: {e}"))
 }
 
-/// The single captured HTTP flow in `store` (panics if there is not exactly one).
+/// The single captured request flow in `store`, its `CONNECT` tunnel row set
+/// aside (panics if there is not exactly one).
 fn only_http_flow(store: &dyn FlowStore) -> HttpFlow {
     let flows: Vec<HttpFlow> = store
         .list()
         .into_iter()
         .filter_map(|id| match store.get(id) {
-            Some(Flow::Http(f)) => Some(f),
+            Some(Flow::Http(f)) if f.metadata.tunnel.is_none() => Some(f),
             _ => None,
         })
         .collect();
