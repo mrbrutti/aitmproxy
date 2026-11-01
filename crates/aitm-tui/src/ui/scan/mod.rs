@@ -19,7 +19,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{ScanOffer, ScanTab, NO_SCANNER};
+use crate::scan::{ScanError, ScanOffer, ScanTab, NO_SCANNER};
 use crate::theme::Theme;
 use crate::ui::bars::put;
 use crate::ui::overlays::boxed;
@@ -65,21 +65,26 @@ fn tab_strip(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let room = usize::from(area.width).saturating_sub(used + GAP);
-    let text = banner(app);
+    // The active tab's error is found once per frame; the legacy Jobs tab's
+    // is built here from the text the legacy state kept, so the banner and
+    // its hue borrow the same value.
+    let legacy_error = legacy_jobs_error(app);
+    let error = tab_error(app, legacy_error.as_ref());
+    let text = banner(app, error);
     if room > 0 {
         spans.push(Span::raw(" ".repeat(GAP)));
         spans.push(Span::styled(
             truncate(&text, room),
-            banner_style(app, theme),
+            banner_style(theme, error),
         ));
     }
     put(buf, area, Line::from(spans));
 }
 
 /// The banner's hue: an error reads in the server-error colour, everything
-/// else is secondary text (D13: hue only on data).
-fn banner_style(app: &App, theme: &Theme) -> ratatui::style::Style {
-    if tab_error(app).is_some() {
+/// else (a notice included) is secondary text (D13: hue only on data).
+fn banner_style(theme: &Theme, error: Option<&ScanError>) -> ratatui::style::Style {
+    if error.is_some() {
         theme.fg(&crate::tokens::color::status::SERVER_ERROR)
     } else {
         theme.text_secondary()
@@ -94,17 +99,22 @@ const PROFILES_DEGRADED: &str = "profiles need scan.profile.list (scanner v2)";
 const ISSUES_DEGRADED: &str = "issues need scan.issues (scanner v2)";
 
 /// The one-line state of the active tab (D11, D13), in this order: no
-/// scanner at all, the last error of this tab, the tab's degraded text (a
-/// legacy bus, or a v2 bus missing the tab's verb), a refresh in flight over
-/// an empty pane, or `idle`. The banner is the one place a degraded state is
-/// written (D13: exactly one state on screen); the pane bodies never repeat
-/// it.
-fn banner(app: &App) -> String {
+/// scanner at all, the last error of this tab (`error`, found once per
+/// frame by [`tab_error`]), the notice a key left (`already <state>`, which
+/// answers the operator's last key and so outranks a standing degraded
+/// text), the tab's degraded text (a legacy bus, or a v2 bus missing the
+/// tab's verb), a refresh in flight over an empty pane, or `idle`. The
+/// banner is the one place a degraded state is written (D13: exactly one
+/// state on screen); the pane bodies never repeat it.
+fn banner(app: &App, error: Option<&ScanError>) -> String {
     if app.scan_offer() == ScanOffer::None {
         return NO_SCANNER.to_string();
     }
-    if let Some(e) = tab_error(app) {
+    if let Some(e) = error {
         return e.wording();
+    }
+    if let Some(notice) = &app.scan.notice {
+        return notice.clone();
     }
     if let Some(text) = degraded(app) {
         return text;
@@ -129,26 +139,35 @@ fn degraded(app: &App) -> Option<String> {
         (ScanOffer::V2, ScanTab::Issues) => "scan.issues",
         _ => return None,
     };
-    (!app.has_tool(verb)).then(|| missing_verb(verb))
+    (!app.has_tool(verb)).then(|| ScanError::missing_verb(verb).wording())
+}
+
+/// On a legacy bus the Jobs tab's error is the `scan.discover` failure the
+/// legacy state kept as text; the one `ScanError` built per frame, so the
+/// Jobs tab's row never has to keep an error of its own. `None` on a v2
+/// bus, where the Jobs tab reads `last_error` alone.
+fn legacy_jobs_error(app: &App) -> Option<ScanError> {
+    if app.scan.tab != ScanTab::Jobs || app.scan_offer() != ScanOffer::Legacy {
+        return None;
+    }
+    app.scan
+        .legacy
+        .error
+        .as_deref()
+        .map(|e| ScanError::from_message("scan.discover", e))
 }
 
 /// The active tab's last error, falling back to the view's for a tab that
-/// keeps none of its own. On a legacy bus the Jobs tab's error is the
-/// `scan.discover` failure the legacy state kept (fix round A, A13).
-fn tab_error(app: &App) -> Option<crate::scan::ScanError> {
+/// keeps none of its own; `legacy` is [`legacy_jobs_error`], the Jobs
+/// tab's on a legacy bus.
+fn tab_error<'a>(app: &'a App, legacy: Option<&'a ScanError>) -> Option<&'a ScanError> {
     let own = match app.scan.tab {
-        ScanTab::Profiles => app.scan.profiles.error.clone(),
-        ScanTab::Jobs if app.scan_offer() == ScanOffer::Legacy => app
-            .scan
-            .legacy
-            .error
-            .as_deref()
-            .map(|e| crate::scan::ScanError::from_message("scan.discover", e)),
-        ScanTab::Jobs => None,
-        ScanTab::SiteMap => app.scan.sitemap.error.clone(),
-        ScanTab::Issues => app.scan.issues.error.clone(),
+        ScanTab::Profiles => app.scan.profiles.error.as_ref(),
+        ScanTab::Jobs => legacy,
+        ScanTab::SiteMap => app.scan.sitemap.error.as_ref(),
+        ScanTab::Issues => app.scan.issues.error.as_ref(),
     };
-    own.or_else(|| app.scan.last_error.clone())
+    own.or(app.scan.last_error.as_ref())
 }
 
 /// The verb the active tab is waiting on while its pane is still empty.
@@ -244,11 +263,6 @@ pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
         truncate(text, usize::from(area.width).saturating_sub(2)),
         theme.text_tertiary(),
     );
-}
-
-/// The inline wording of a control whose verb this bus does not offer (D2).
-pub fn missing_verb(verb: &str) -> String {
-    format!("{verb} is not on this bus")
 }
 
 #[cfg(test)]

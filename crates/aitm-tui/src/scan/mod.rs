@@ -95,16 +95,6 @@ impl ScanTab {
             ScanTab::Issues => "Issues",
         }
     }
-
-    /// The tab's position in [`ScanTab::ALL`] (0-based).
-    pub fn index(self) -> usize {
-        match self {
-            ScanTab::Profiles => 0,
-            ScanTab::Jobs => 1,
-            ScanTab::SiteMap => 2,
-            ScanTab::Issues => 3,
-        }
-    }
 }
 
 /// Everything the Scan view holds (spec D3).
@@ -125,6 +115,11 @@ pub struct ScanState {
     /// reply under the same tag (D13: a keyed verb's error outlives a
     /// sibling key's success).
     pub last_error: Option<ScanError>,
+    /// A non-error notice for the banner (D11: `already <state>` when `x`
+    /// lands on a terminal job): the answer to one key, cleared by the next
+    /// key or by the next reply that changes the tab. Drawn in secondary
+    /// text, never in the error hue, and never recorded as a `ScanError`.
+    pub notice: Option<String>,
     /// The tick the view was first opened on; `None` until then.
     pub opened_at_tick: Option<u64>,
 }
@@ -364,8 +359,9 @@ pub enum ScanOffer {
 pub const NO_SCANNER: &str = "the scanner is not on this bus (scan.start / scan.discover)";
 
 /// The detail of a [`ScanError::missing_verb`]: the inline text D2 fixes for
-/// a control whose verb the bus lacks, minus the verb itself.
-pub const MISSING_VERB: &str = "is not on this bus";
+/// a control whose verb the bus lacks, minus the verb itself. Private: the
+/// one spelling is `ScanError::missing_verb(verb).wording()`.
+const MISSING_VERB: &str = "is not on this bus";
 
 /// The detail of the uncoded error a `scan.status` / `scan.cancel` reply gets
 /// when its `job` is not the key of the tag it answers (spec D6, hostile-core
@@ -390,42 +386,38 @@ pub struct ScanError {
 }
 
 impl ScanError {
-    /// Read a `CallTaggedFailed` message. A message that does not parse as
-    /// `scan: <code>: <detail>` is kept verbatim with `code: None`.
-    pub fn from_message(verb: &str, message: &str) -> Self {
-        match ScanErrorCode::parse_message(message) {
-            Some((code, detail)) => Self {
-                tag: verb.to_string(),
-                verb: verb.to_string(),
-                code: Some(code),
-                detail: detail.to_string(),
-            },
-            None => Self {
-                tag: verb.to_string(),
-                verb: verb.to_string(),
-                code: None,
-                detail: message.to_string(),
-            },
-        }
-    }
-
-    /// A verb this bus does not offer (spec D2): uncoded, with the detail
-    /// [`MISSING_VERB`], so [`ScanError::wording`] reads `<verb> is not on
-    /// this bus`.
-    pub fn missing_verb(verb: &str) -> Self {
+    /// An error under `tag`, the tag of the call that failed; the verb is
+    /// the tag's verb part ([`tag_parts`]), so a bare verb tags itself.
+    fn new(tag: &str, code: Option<ScanErrorCode>, detail: impl Into<String>) -> Self {
         Self {
-            tag: verb.to_string(),
-            verb: verb.to_string(),
-            code: None,
-            detail: MISSING_VERB.to_string(),
+            tag: tag.to_string(),
+            verb: tag_parts(tag).0.to_string(),
+            code,
+            detail: detail.into(),
         }
     }
 
-    /// The same error under the tag of the call that produced it (a keyed
-    /// verb's `<verb>:<key>`); the constructors default the tag to the verb.
-    pub fn tagged(mut self, tag: &str) -> Self {
-        self.tag = tag.to_string();
-        self
+    /// Read a `CallTaggedFailed` message under its `tag`. A message that
+    /// does not parse as `scan: <code>: <detail>` is kept verbatim with
+    /// `code: None`.
+    pub fn from_message(tag: &str, message: &str) -> Self {
+        match ScanErrorCode::parse_message(message) {
+            Some((code, detail)) => Self::new(tag, Some(code), detail),
+            None => Self::new(tag, None, message),
+        }
+    }
+
+    /// An uncoded error under `tag` with `detail` as its whole text after
+    /// the verb (a contract mismatch, a reply naming another key): what
+    /// [`parse_result`] and the hostile-core checks record.
+    pub fn uncoded(tag: &str, detail: impl Into<String>) -> Self {
+        Self::new(tag, None, detail)
+    }
+
+    /// A verb this bus does not offer (spec D2): uncoded under the bare
+    /// verb, so [`ScanError::wording`] reads `<verb> is not on this bus`.
+    pub fn missing_verb(verb: &str) -> Self {
+        Self::uncoded(verb, MISSING_VERB)
     }
 
     /// The operator wording (spec D9): the code's fixed text, then `: `, then
@@ -435,9 +427,7 @@ impl ScanError {
     pub fn wording(&self) -> String {
         match self.code {
             Some(code) => format!("{}: {}", code_wording(code), self.detail),
-            None if self.detail.starts_with(MISSING_VERB) => {
-                format!("{} {}", self.verb, self.detail)
-            }
+            None if self.detail == MISSING_VERB => format!("{} {}", self.verb, self.detail),
             None => format!("{}: {}", self.verb, self.detail),
         }
     }
@@ -477,19 +467,16 @@ fn code_wording(code: ScanErrorCode) -> &'static str {
 }
 
 /// Parse a `scan.*` reply into its D10 type. A mismatch is a [`ScanError`]
-/// with `code: None` and the serde message in the detail (the verb is not
-/// in the detail: `wording()` prefixes it); nothing panics on bus data. The
-/// reply is read in place, never cloned.
+/// under `tag` (the tag of the call the reply answers; a bare verb for a
+/// single-slot one) with `code: None` and the serde message in the detail
+/// (the verb is not in the detail: `wording()` prefixes it); nothing panics
+/// on bus data. The reply is read in place, never cloned.
 pub fn parse_result<T: serde::de::DeserializeOwned>(
-    verb: &str,
+    tag: &str,
     value: &Value,
 ) -> Result<T, ScanError> {
-    T::deserialize(value).map_err(|e| ScanError {
-        tag: verb.to_string(),
-        verb: verb.to_string(),
-        code: None,
-        detail: format!("reply did not match the contract ({e})"),
-    })
+    T::deserialize(value)
+        .map_err(|e| ScanError::uncoded(tag, format!("reply did not match the contract ({e})")))
 }
 
 /// Whether `s` is a job id in its wire form: `scan-` followed by exactly eight
@@ -553,10 +540,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tabs_index_their_strip_order() {
-        for (i, tab) in ScanTab::ALL.iter().enumerate() {
-            assert_eq!(tab.index(), i);
-        }
+    fn tabs_default_to_profiles_and_label_the_strip() {
         assert_eq!(ScanTab::default(), ScanTab::Profiles);
         assert_eq!(ScanTab::SiteMap.label(), "Site map");
     }

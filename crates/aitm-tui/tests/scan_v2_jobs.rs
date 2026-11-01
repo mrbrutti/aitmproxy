@@ -208,7 +208,10 @@ fn cancel_is_sent_once_until_the_reply() {
     assert_eq!(third, vec![cancel_request()]);
 }
 
-/// D11: on a terminal job `x` is inert and the banner reads `already <state>`.
+/// D11: on a terminal job `x` is inert and the banner reads `already <state>`
+/// as a notice, not through the error channel (fix round C, C19): no
+/// `scan.cancel:` prefix, no `ScanError` recorded, and the next key clears
+/// it.
 #[test]
 fn cancel_on_a_terminal_job_is_inert() {
     let mut app = app();
@@ -222,6 +225,17 @@ fn cancel_on_a_terminal_job_is_inert() {
         strip.contains("already done"),
         "the banner says why the key did nothing: {strip:?}"
     );
+    assert!(
+        !strip.contains("scan.cancel:"),
+        "a notice is not an error: {strip:?}"
+    );
+    assert_eq!(app.scan.last_error, None, "no error is recorded");
+    assert_eq!(app.scan.notice.as_deref(), Some("already done"));
+
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.notice, None, "the next key clears the notice");
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(!strip.contains("already done"), "{strip:?}");
 }
 
 /// T7-13: without `scan.cancel` on the bus `x` sends nothing and the screen

@@ -1338,6 +1338,11 @@ impl App {
     /// Apply a user action; returns the bus work it implies.
     pub fn update(&mut self, action: Action) -> Vec<BusRequest> {
         let mut out = Vec::new();
+        // A Scan banner notice answers one key (D11 `already <state>`): the
+        // next key clears it; the timer and a resize are not keys.
+        if !matches!(action, Action::Tick | Action::Resize(..)) {
+            self.scan.notice = None;
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tick => {
@@ -3956,8 +3961,10 @@ impl App {
             BusEvent::CallTaggedOk { tag, name, value } => {
                 self.on_scan_ok(&tag, &name, value, &mut out)
             }
-            BusEvent::CallTaggedFailed { tag, name, message } => {
-                self.on_scan_failed(&tag, &name, message, &mut out)
+            // The tag carries the verb (`tag_parts`), so the failure needs
+            // no `name`.
+            BusEvent::CallTaggedFailed { tag, message, .. } => {
+                self.on_scan_failed(&tag, message, &mut out)
             }
         }
         out
@@ -4109,11 +4116,10 @@ impl App {
     /// Jobs `x` (spec D11): `scan.cancel {job}` for the cursor's job under
     /// the tag `scan.cancel:<job>`, idempotent through the tag dedupe and
     /// with no extra prompt (the engine's cancel is itself idempotent). A
-    /// terminal job makes the key inert: the Jobs banner reads
-    /// `scan.cancel: already <state>` through the same uncoded-error channel
-    /// the missing-verb refusal uses, cleared by the next reply under that
-    /// tag. Only the Jobs tab has a job under its cursor; elsewhere, and on
-    /// the legacy row (D12), the key does nothing.
+    /// terminal job makes the key inert: the banner reads `already <state>`
+    /// as a notice (nothing failed, so no `ScanError` is recorded), cleared
+    /// by the next key. Only the Jobs tab has a job under its cursor;
+    /// elsewhere, and on the legacy row (D12), the key does nothing.
     fn scan_cancel(&mut self, out: &mut Vec<BusRequest>) {
         if self.scan.tab != ScanTab::Jobs {
             return;
@@ -4121,17 +4127,12 @@ impl App {
         let Some(job) = self.scan.jobs.cursor_job().cloned() else {
             return;
         };
-        let tag = tag_keyed("scan.cancel", &job);
         match self.scan.jobs.state_of(&job) {
             Some(state) if state.is_terminal() => {
-                self.scan.set_error(ScanError {
-                    tag,
-                    verb: "scan.cancel".to_string(),
-                    code: None,
-                    detail: format!("already {}", state_text(state)),
-                });
+                self.scan.notice = Some(format!("already {}", state_text(state)));
             }
             _ => {
+                let tag = tag_keyed("scan.cancel", &job);
                 self.scan_call(tag, "scan.cancel", json!({ "job": job }), out);
             }
         }
@@ -4178,9 +4179,9 @@ impl App {
         }
     }
 
-    /// `scan.status {job}` under its keyed tag (fix round B, B5: the one
-    /// spelling of the request the push line, the status timer and the
-    /// `scan.list` fold share). Returns whether the call left.
+    /// `scan.status {job}` under its keyed tag: the one spelling of the
+    /// request the push line, the status timer and the `scan.list` fold
+    /// share. Returns whether the call left.
     fn request_scan_status(&mut self, job: &str, out: &mut Vec<BusRequest>) -> bool {
         self.scan_poll(
             tag_keyed("scan.status", job),
@@ -4261,30 +4262,25 @@ impl App {
         self.scan.inflight.remove(tag);
         match name {
             "scan.status" | "scan.cancel" => {
-                if let Some(status) = self.scan_reply::<JobStatus>(tag, name, &value) {
+                if let Some(status) = self.scan_reply::<JobStatus>(tag, &value) {
                     // D6 hostile-core bound: the reply is folded only under
                     // the job the tag asked about, so a core cannot mint a
                     // new live job (and a new poll) per reply.
                     if Some(status.job.as_str()) == tag_parts(tag).1 {
                         self.scan.jobs.fold_status(status);
                     } else {
-                        self.scan.set_error(ScanError {
-                            tag: tag.to_string(),
-                            verb: name.to_string(),
-                            code: None,
-                            detail: OTHER_JOB.to_string(),
-                        });
+                        self.scan.set_error(ScanError::uncoded(tag, OTHER_JOB));
                     }
                 }
             }
             "scan.list" => {
-                if let Some(list) = self.scan_reply::<ListResult>(tag, name, &value) {
+                if let Some(list) = self.scan_reply::<ListResult>(tag, &value) {
                     let followups = self.scan.jobs.fold_list(list);
                     self.request_scan_statuses(&followups, out);
                 }
             }
             "scan.issues" => {
-                if let Some(result) = self.scan_reply::<IssuesResult>(tag, name, &value) {
+                if let Some(result) = self.scan_reply::<IssuesResult>(tag, &value) {
                     self.scan.issues.fold_result(result);
                     // The page arriving puts the cursor on a row: read it
                     // while the tab is on screen (D6, cursor landing).
@@ -4294,19 +4290,14 @@ impl App {
                 }
             }
             "scan.issue" => {
-                if let Some(issue) = self.scan_reply::<Issue>(tag, name, &value) {
+                if let Some(issue) = self.scan_reply::<Issue>(tag, &value) {
                     // The same hostile-core bound as `scan.status`: the
                     // detail is folded only under the id the tag asked for.
                     if Some(issue.id.as_str()) == tag_parts(tag).1 {
                         self.scan.issues.detail = Some(issue);
                         self.scan.issues.flow_cursor = 0;
                     } else {
-                        self.scan.set_error(ScanError {
-                            tag: tag.to_string(),
-                            verb: name.to_string(),
-                            code: None,
-                            detail: OTHER_ISSUE.to_string(),
-                        });
+                        self.scan.set_error(ScanError::uncoded(tag, OTHER_ISSUE));
                     }
                 }
             }
@@ -4314,24 +4305,25 @@ impl App {
         }
     }
 
-    /// Parse a `scan.*` reply into its D10 type (fix round B, B6: the one
-    /// parse / clear-or-set scaffold every verb arm shares). A match clears
-    /// the error this tag left behind (D13) and is returned for the fold; a
-    /// mismatch records the contract error under the tag and yields `None`,
-    /// so the prior state stays on screen.
+    /// Parse a `scan.*` reply into its D10 type: the one parse /
+    /// clear-or-set scaffold every verb arm shares. A match clears the error
+    /// this tag left behind (D13) and the banner notice (the reply changes
+    /// the tab) and is returned for the fold; a mismatch records the
+    /// contract error under the tag and yields `None`, so the prior state
+    /// stays on screen.
     fn scan_reply<T: serde::de::DeserializeOwned>(
         &mut self,
         tag: &str,
-        name: &str,
         value: &Value,
     ) -> Option<T> {
-        match parse_result::<T>(name, value) {
+        match parse_result::<T>(tag, value) {
             Ok(parsed) => {
                 self.scan.clear_error(tag);
+                self.scan.notice = None;
                 Some(parsed)
             }
             Err(e) => {
-                self.scan.set_error(e.tagged(tag));
+                self.scan.set_error(e);
                 None
             }
         }
@@ -4340,16 +4332,9 @@ impl App {
     /// A tagged `scan.*` call failed: settle the tag and record the error on
     /// its tab. Task 13 adds the D9 wording display and the `not_found`
     /// self-heal.
-    fn on_scan_failed(
-        &mut self,
-        tag: &str,
-        name: &str,
-        message: String,
-        _out: &mut Vec<BusRequest>,
-    ) {
+    fn on_scan_failed(&mut self, tag: &str, message: String, _out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
-        self.scan
-            .set_error(ScanError::from_message(name, &message).tagged(tag));
+        self.scan.set_error(ScanError::from_message(tag, &message));
     }
 
     /// A `browser.*` call answered: fill the view. A navigate re-reads the
