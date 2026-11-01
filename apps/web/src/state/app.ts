@@ -8,10 +8,9 @@
 
 import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
-import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, StateNotification, ToolDef } from '~/bus/types';
+import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, PocRun, StateNotification, ToolDef } from '~/bus/types';
 import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
 import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
-import type { PocRun } from '~/bus/mock';
 import {
   contentFamily,
   type ContentFamily,
@@ -118,7 +117,7 @@ interface ProxyState {
   findings: PocRun[];
   activity: ActivityEntry[];
   tools: ToolDef[];
-  /** True while the poll loop is the live source (no push notifications arriving); false on push or on the static fixtures bus. */
+  /** True while the poll loop is the live source (no push notifications arriving); false while push notifications are fresh. */
   polling: boolean;
   /** The core's version, from `proxy.status`; empty until it answers (never a made-up number). */
   version: string;
@@ -302,24 +301,6 @@ export function createAppStore(bus: BusClient) {
       if (untrack(selectedId) === id) void loadDetail(id, true);
     }
 
-    function onFlowEvent(n: FlowNotification) {
-      if (bus.address !== 'fixtures') {
-        onFlowTrigger(n);
-        return;
-      }
-      // The fixtures bus pushes complete, correctly-spelled summaries, and the dev UI and the perf
-      // harness rely on them landing synchronously: apply the summary directly.
-      if (n.event === 'cleared') {
-        clearFlows();
-        return;
-      }
-      if (!n.summary) return;
-      const s = toSummary(n.summary, entries.length + 1);
-      upsert(s);
-      if (changesDetail(n.event)) invalidateDetail(s.id);
-      if (changesPause(n.event)) recomputePaused();
-    }
-
     /**
      * A real bus: the push is a trigger, never data. The server's summary is the full `flow.get`
      * object (same keys, `kind:"websocket"`), but it is still not applied: refetching by id keeps
@@ -471,7 +452,7 @@ export function createAppStore(bus: BusClient) {
           // Validated before the clock moves: a malformed line proves nothing about the stream.
           if (!isFlowNotification(params)) break;
           lastFlowPushAt = Date.now();
-          onFlowEvent(params);
+          onFlowTrigger(params);
           break;
         case 'notifications/aitm/state':
           if ((params as { lagged?: unknown } | null | undefined)?.lagged === true) {
@@ -507,7 +488,7 @@ export function createAppStore(bus: BusClient) {
     // outage takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight
     // with the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus
     // that is reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
-    // catalogue. The static `fixtures` bus is a snapshot and is never polled.
+    // catalogue.
     const POLL_MS = 500;
     const STATUS_EVERY_MS = 2000; // while the state stream is not pushing
     const PUSH_FRESH_MS = 10_000;
@@ -845,7 +826,7 @@ export function createAppStore(bus: BusClient) {
         jobs.push(
           bus
             .call<unknown>('scope.list')
-            // The bus returns an array of host strings; fixtures add rate-limit/back-off objects.
+            // The bus returns an array of host strings; an object entry with `host` is also accepted.
             .then((s) => setProxy('scope', Array.isArray(s) ? s.map((e) => (typeof e === 'string' ? { host: e } : (e as ProxyState['scope'][number]))) : []))
             .catch(() => {}),
         );
@@ -927,7 +908,7 @@ export function createAppStore(bus: BusClient) {
       }
       // Outside the try on purpose: a failed bootstrap (tools/list rejected, say) must not leave the
       // list frozen. The loop keeps trying every tick, and `flow.list` needs no catalogue.
-      if (bus.address !== 'fixtures') startPolling();
+      startPolling();
     }
     void bootstrap();
 

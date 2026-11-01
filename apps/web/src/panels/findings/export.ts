@@ -2,7 +2,7 @@
 // an anchor; names are `<title-slug>-<yyyymmdd-HHMM>.<ext>` so repeated runs of one PoC sort by
 // time and never overwrite each other. HAR of the capture waits on the core follow-up.
 
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { base64ToBytes } from '~/lib/bytes';
 
 export type ExportExt = 'yaml' | 'png';
@@ -86,7 +86,7 @@ export function mimeForPath(path: string): string {
 }
 
 /**
- * The bus returns `poc.artifact` as bare base64 of the file's bytes (F13); an older fixture shape
+ * The bus returns `poc.artifact` as bare base64 of the file's bytes (F13); an older model shape
  * was `{mime, base64|text}`. Both become an Artifact; textual types also get `text`.
  */
 export function toArtifact(raw: unknown, path: string): Artifact {
