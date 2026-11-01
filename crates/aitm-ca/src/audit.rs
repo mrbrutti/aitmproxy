@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 /// back from disk is interned into them; anything else is a deserialization
 /// error, never a leak.
 const COMMANDS: &[&str] = &["ca.install", "ca.uninstall", "ca.export"];
-const FRONTENDS: &[&str] = &["cli", "mcp"];
+const FRONTENDS: &[&str] = &["cli", "mcp", "operator"];
 const OUTCOMES: &[&str] = &["ok", "refused", "error", "dry_run"];
 
 /// One audit line. Serializes to a JSON object with exactly these eight keys,
@@ -31,7 +31,7 @@ pub struct AuditRecord {
     pub ts: String,
     /// `"ca.install"` | `"ca.uninstall"` | `"ca.export"`.
     pub command: &'static str,
-    /// `"cli"` | `"mcp"`.
+    /// `"cli"` | `"mcp"` | `"operator"`.
     pub frontend: &'static str,
     /// `"ok"` | `"refused"` | `"error"` | `"dry_run"`.
     pub outcome: &'static str,
