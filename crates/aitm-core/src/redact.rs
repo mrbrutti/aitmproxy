@@ -2914,6 +2914,31 @@ mod tests {
         );
     }
 
+    /// The second scan of `scrub_text_wide` reads the output of the first. The
+    /// families of `scrub_text_stays_linear_on_nested_pair_shapes` hold standard
+    /// keys, which the first scan has masked before the second begins, so none of
+    /// them gives the second scan a nested opener to pass. A chain of quoted-value
+    /// openers under a wide-only key does: the first scan leaves it alone and the
+    /// second reads it as one quoted value that closes at the last quote. A scan
+    /// that starts a closing-quote search for each nested opener is quadratic here
+    /// and does not finish. The chain is sized by `mebibyte_copies`; the standard
+    /// scrub does not read `sidebar` as a key and leaves the text as it was.
+    #[test]
+    fn scrub_text_wide_stays_linear_on_a_chain_of_wide_only_quote_openers() {
+        let unit = "sidebar:\"";
+        let n = mebibyte_copies(unit);
+        let input = format!("{}x\"", unit.repeat(n));
+        assert!(input.len() >= 1 << 20 && input.len() <= 1 << 21);
+        assert!(
+            scrub_text(&input) == input,
+            "the standard scrub changed a chain of wide-only quote openers"
+        );
+        assert!(
+            scrub_text_wide(&input) == "sidebar:\"[redacted]\"",
+            "a run of wide-only quoted-value openers was not masked as one value"
+        );
+    }
+
     /// Under the wide reading the first token after a secret key is its value on
     /// the next line too, so a wide-only key masks the line after it.
     #[test]
