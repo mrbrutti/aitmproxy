@@ -25,6 +25,12 @@ to the script, never to the traffic; on a miss it prints the script's
 `script.list` row (`enabled`, `hooks`, `last_error`) and every finding `source`
 seen before failing.
 
+Until T1b's engine lands, the third script cannot fire (WebSocket flows expose an
+empty `request.url` to scripts); the cell proves the two header scripts fired, then
+SKIPs 77 naming that bug, gated on `scan.start` being absent from `tools/list`.
+Once `scan.start` is on the build the same miss is a hard FAIL: this cell is the
+acceptance test for T1b's fix.
+
 This cell boots its targets with `boot_target` from `aitm_e2e.scan`; it calls no `scan.*`
 verb, so its ledger file is `calls: []`. `script.findings` / `flow.get` /
 `script.list` are plain bus reads, not scan verbs.
@@ -246,10 +252,15 @@ def main() -> int:
             print(f"diag: findings with source == {sid!r}: {len(same_source)} "
                   f"(details: {[f.get('detail') for f in same_source][:3]!r}); "
                   f"all sources seen: {sorted({str(f.get('source')) for f in fs})}", flush=True)
-            if sid == "ws-cleartext-transport" and not same_source:
-                print("note: known: bundled ws-cleartext-transport never fires on a live WS flow "
-                      "(aitm-plugin-rhai exposes no request to Rhai hooks on WebSocket flows); "
-                      "T1b fix in flight", flush=True)
+            if sid == "ws-cleartext-transport" and not same_source and "scan.start" not in tools:
+                # The pre-T1b core: WebSocket flows expose an empty `request.url` to
+                # scripts, so the bundled WS detector cannot fire. T1b's engine PR
+                # (the one that adds `scan.start`) carries the fix; until it lands
+                # this is a loud SKIP, not a red main. The moment `scan.start` is on
+                # the build the same miss is a hard FAIL (the probe below is gone).
+                skip("bundled ws-cleartext-transport never fires on a live WS flow: ws flows expose an "
+                     "empty request.url to scripts; fixed by T1b's engine PR (scan.start absent from "
+                     "tools/list on this build)")
             check(False, f"V: bundled `{sid}` recorded a finding on V's host")
 
         section("the same two actions against the PATCHED target add none of the three")
