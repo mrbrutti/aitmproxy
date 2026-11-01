@@ -57,6 +57,10 @@ pub enum RunKind {
     Load,
     /// A script-registered command invoked from a frontend.
     Command,
+    /// A scanner check's `run` (D4): its probes route through the job's client
+    /// under the per-check wall budget, not the 2 s hook budget, and each probe
+    /// is bounded by [`probe_budget`].
+    Check,
     /// A PoC `script` step.
     PocStep,
 }
@@ -78,6 +82,18 @@ impl Budget {
             max_operations: cfg.limits.max_operations,
             hook_timeout: cfg.hook_timeout,
             browser_timeout: cfg.browser_timeout,
+        }
+    }
+
+    /// The budget a scanner check's `run` gets (D4 "Timing without `sleep`"):
+    /// the per-check wall budget (`check_timeout` from the profile, default
+    /// 60 s) as the run's `hook_timeout`, with every other field from `base`.
+    /// A check is bounded by this rather than the 2 s hook budget so a timing
+    /// probe can wait out a server-side delay without aborting the run.
+    pub fn for_check(base: Budget, check_timeout: Duration) -> Budget {
+        Budget {
+            hook_timeout: check_timeout,
+            ..base
         }
     }
 }
@@ -187,6 +203,18 @@ pub fn remaining_budget() -> Option<Duration> {
         cell.get()
             .map(|run| run.deadline.saturating_duration_since(Instant::now()))
     })
+}
+
+/// The hardest cap on a single scanner probe (D4): a probe never waits longer
+/// than this, whatever the check's wall budget leaves.
+pub const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The wall-clock a single scanner probe may take in the current run (D4):
+/// `min(remaining, 30 s)`, or `None` outside any run. A check's `http.send`
+/// awaits for this instead of the whole hook remainder, so one slow probe
+/// cannot consume the rest of the check's budget.
+pub fn probe_budget() -> Option<Duration> {
+    remaining_budget().map(|r| r.min(MAX_PROBE_TIMEOUT))
 }
 
 /// The wall-clock one `browser.*` host call may take in the current run

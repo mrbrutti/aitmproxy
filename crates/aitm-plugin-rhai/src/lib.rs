@@ -8,6 +8,7 @@
 //! Every module is declared here up front so later tasks never re-touch this file.
 
 pub mod catalog_assembly;
+pub mod check_bridge;
 pub mod command;
 pub mod commands;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod flow_api;
 pub mod flow_state;
 pub mod host_core;
 pub mod host_net;
+pub mod host_probe;
 pub mod host_registry;
 pub mod loader;
 pub mod marshal;
@@ -37,11 +39,15 @@ pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
 pub use dsl::{register_dsl, DslCapability};
-pub use engine::{build_engine_with_languages, Budget, RunKind, WORKER_STACK_SIZE};
+pub use engine::{
+    build_engine_with_languages, probe_budget, Budget, RunKind, MAX_PROBE_TIMEOUT,
+    WORKER_STACK_SIZE,
+};
 pub use error::ScriptError;
 pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
+pub use host_net::with_client;
 pub use host_registry::{registered_host_fns, seed_call_context, CallContextGuard, HostRegistry};
 pub use loader::{RhaiLoader, SUPPORTED_API};
 pub use plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
