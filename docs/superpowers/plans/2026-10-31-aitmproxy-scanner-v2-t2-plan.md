@@ -71,6 +71,11 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
   header value, cookie value or body. The model's `SessionMaterial`, `Payload`, `RawProbe` and
   `ProbeResponse` already have redacting `Debug` impls; never add a type that prints a value.
 - **Marks.** Job mark = `format!("scan:{}", job.job_id())`; crawl mark = the literal `crawl`.
+- **`session` trait rule (orchestrator amendment 2026-11-01, live-run L2).** A point carries the
+  `session` trait iff its name is secret-like (`redact::is_secret_name`), or its JSON/XML path is;
+  membership in the job's session material alone does not tag it (the engine's D7 pick labels every
+  cookie of the newest Cookie-bearing capture as material, so `theme=dark` would otherwise never be
+  audited); a material-named point still shows `<redacted>` as its example.
 - **`session.mode: none` means unauthenticated (orchestrator amendment 2026-11-01).** A captured
   source request may itself carry the operator's session (`Cookie`, `Authorization`, any
   `is_secret_name` header). Under `mode: none` the `ProbeHost` strips those from the source request
@@ -1328,6 +1333,11 @@ Kept by the main session during stage 6. One row per finding.
 | round 3 range | Spec (final pass) | Minor | Plan text behind round 3 (Task 1/16/18, Review log SHAs, Task 10 placeholder exemption, A20 additions) | fixed in 4b7623f3, 2d974783 |
 | round 4 range | Security (verification) | Minor | `document.querySelector`/`document.forms` in the tag/submit expressions are reachable through `Document`'s `[LegacyOverrideBuiltIns]` named-property surface (`<img name="querySelector">`); every variant traced to a skip (fail-closed, crawl coverage only) | accepted by the orchestrator (autonomous mandate) 2026-11-01; follow-up: `Document.prototype.querySelector.call(document, ..)` and the `forms` getter descriptor |
 | 22 | Coder (stage 4) | - | Step 2 redaction flip to `scrub_text_wide`/`is_secret_key_wide` (PR #199 on main at 5f89b2fc); wide-only pin test added; every existing literal held. Spec Constraints "Sequencing pins (a)" names the narrow `is_secret_key` beside `scrub_text_wide`; the plan's wide pair is what ships (over-matching `authority` costs only an example/log value) | done in c10f38f3 |
+| 21 live run | Orchestrator (stage 5 live, real core + seeded target + obscura) | Important | L1: canary `path` carried the query (`/account?tab=overview`); the status contract and T10's cell expect `/account` | fixed in bd26b340 (replay keeps the full target) |
+| 21 live run | Orchestrator (stage 5 live) | Important | L2: a point whose name merely matched a material cookie/header was tagged `session` and skipped; with no login the engine's D7 pick made `theme` "material", so the `cookie` kind vanished (T2-2) and the cookie reflection could not be probed (T2-3) | fixed in e7d5a0de: `Session` iff `is_secret_name(name)` (placeholders exempt, secret-by-path kept); a material name still gets a `<redacted>` example (coder's conservative call, accepted). Engine-side root cause (every cookie of the newest Cookie-bearing capture becomes material) reported to T1b |
+| 21 live run | Orchestrator (stage 5 live) | Minor | L3: the client extractor ignored `data-href`, so the click-only `/files/readme.txt` was unreachable without a browser | fixed in 43cdc3c5 (any element, capped, entity-decoded; raw-text bodies still skipped) |
+| 21 live run | Orchestrator (stage 5 live) | Minor | L4: with the browser primed, crawl captures carry the session and the newest one (`/slow?ms=10`) became the canary instead of the operator's `/account` | fix: `pick_canary` skips flows marked `crawl`/`scan:*` (pending SHA) |
+| 21 live run | Orchestrator (stage 5 live) | - | Not the lane, reported to the coordinator/T1b/T3/T10: `scan.map` forces `crawl.submit_forms = false` and ends at 30 s; the http catalogue is empty until T3's `checks_with` swap (merge order fixed: #232, T3 2a, #223, T3 2b); T3's `xss-reflected` lacks the `cookie` kind; harness `CoreConfig.browser_proxy_port` defaults to 0 so obscura is pointed at port 0 unless a cell sets it (`test_t2_crawl.py` does not); `browser.navigate` returns `status: None` on main | recorded; the proof branch carries the `checks_with` swap and the one-line cell port fix, never #223 |
 | whole branch | Panel (final) | - | Security PASS, Quality PASS, Spec PASS at 27afeff1; round-4 Minors fixed at a2686d7b; security verification of round 4 PASS (one Minor accepted); no open findings | ready for integration once the live proof (Task 21) has run |
 
 ## Shipped
