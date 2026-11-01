@@ -115,12 +115,21 @@ impl JobsState {
             .or_else(|| self.full.get(id).map(|s| s.state))
     }
 
-    /// Every job in `summaries` or `full` whose state is not terminal, in
-    /// `order` (D6: the jobs the status timer polls).
+    /// Every job in `summaries` or `full` whose state is not terminal: the
+    /// cursor's job first, then `order`, then any known only to the maps
+    /// (D6: the jobs the status timer polls, the first
+    /// [`super::MAX_STATUS_FOLLOWUPS`] not already in flight per firing).
     pub fn live(&self) -> Vec<JobId> {
-        let mut ids: Vec<JobId> = self.order.clone();
-        for id in self.summaries.keys().chain(self.full.keys()) {
-            if !ids.contains(id) {
+        let mut seen: BTreeSet<&JobId> = BTreeSet::new();
+        let mut ids: Vec<JobId> = Vec::with_capacity(self.order.len());
+        let under_cursor = self.order.get(self.cursor);
+        for id in under_cursor
+            .into_iter()
+            .chain(self.order.iter())
+            .chain(self.summaries.keys())
+            .chain(self.full.keys())
+        {
+            if seen.insert(id) {
                 ids.push(id.clone());
             }
         }

@@ -29,7 +29,7 @@ use crate::model::{
 use crate::open::{self, OpenTarget};
 use crate::scan::{
     is_job_id, parse_result, step, tag_keyed, tag_parts, ScanError, ScanOffer, ScanState, ScanTab,
-    LIST_POLL_TICKS, NO_SCANNER, OTHER_JOB, STATUS_POLL_TICKS,
+    LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_JOB, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -3947,12 +3947,7 @@ impl App {
         if !is_job_id(job) {
             return;
         }
-        self.scan_poll(
-            tag_keyed("scan.status", job),
-            "scan.status",
-            json!({ "job": job }),
-            out,
-        );
+        self.request_scan_status(job, out);
         let settles = matches!(
             line.event,
             JobEvent::Issue | JobEvent::Finished | JobEvent::Cancelled | JobEvent::Failed
@@ -4002,19 +3997,14 @@ impl App {
     }
 
     /// The D6 timers, run from every `Tick`: every [`STATUS_POLL_TICKS`] one
-    /// `scan.status` per live job, every [`LIST_POLL_TICKS`] a `scan.list`
-    /// while the Scan view is shown. Tasks 7 and 9 add the Issues and Site
-    /// map timers here.
+    /// `scan.status` per live job (the cursor's job first, then `order`, at
+    /// most [`MAX_STATUS_FOLLOWUPS`] leaving per firing; the rest wait for the
+    /// next one), every [`LIST_POLL_TICKS`] a `scan.list` while the Scan view
+    /// is shown. Tasks 7 and 9 add the Issues and Site map timers here.
     fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
         if t.is_multiple_of(STATUS_POLL_TICKS) {
-            for job in self.scan.jobs.live() {
-                self.scan_poll(
-                    tag_keyed("scan.status", &job),
-                    "scan.status",
-                    json!({ "job": job }),
-                    out,
-                );
-            }
+            let live = self.scan.jobs.live();
+            self.request_scan_statuses(live.iter().map(String::as_str), out);
         }
         if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
             self.request_scan_list(out);
@@ -4025,6 +4015,37 @@ impl App {
     fn request_scan_list(&mut self, out: &mut Vec<BusRequest>) {
         if self.scan_poll("scan.list".to_string(), "scan.list", json!({}), out) {
             self.scan.jobs.listed_at_tick = self.ticks;
+        }
+    }
+
+    /// `scan.status {job}` under its keyed tag (fix round B, B5: the one
+    /// spelling of the request the push line, the status timer and the
+    /// `scan.list` fold share). Returns whether the call left.
+    fn request_scan_status(&mut self, job: &str, out: &mut Vec<BusRequest>) -> bool {
+        self.scan_poll(
+            tag_keyed("scan.status", job),
+            "scan.status",
+            json!({ "job": job }),
+            out,
+        )
+    }
+
+    /// `scan.status` for each of `jobs` in turn until [`MAX_STATUS_FOLLOWUPS`]
+    /// have left (spec D6, hostile-core bounds): a job already in flight
+    /// costs nothing and the rest wait for the next firing.
+    fn request_scan_statuses<'a>(
+        &mut self,
+        jobs: impl IntoIterator<Item = &'a str>,
+        out: &mut Vec<BusRequest>,
+    ) {
+        let mut sent = 0;
+        for job in jobs {
+            if sent >= MAX_STATUS_FOLLOWUPS {
+                break;
+            }
+            if self.request_scan_status(job, out) {
+                sent += 1;
+            }
         }
     }
 
@@ -4095,14 +4116,8 @@ impl App {
             "scan.list" => match parse_result::<ListResult>(name, &value) {
                 Ok(list) => {
                     self.scan.clear_error(name);
-                    for job in self.scan.jobs.fold_list(list) {
-                        self.scan_poll(
-                            tag_keyed("scan.status", &job),
-                            "scan.status",
-                            json!({ "job": job }),
-                            out,
-                        );
-                    }
+                    let followups = self.scan.jobs.fold_list(list);
+                    self.request_scan_statuses(followups.iter().map(String::as_str), out);
                 }
                 Err(e) => self.scan.set_error(e),
             },

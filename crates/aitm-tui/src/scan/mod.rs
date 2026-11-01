@@ -51,6 +51,12 @@ pub const STATUS_POLL_TICKS: u64 = 4;
 /// shown (spec D6: ten seconds).
 pub const LIST_POLL_TICKS: u64 = 40;
 
+/// How many `scan.status` requests may leave the reducer per `scan.list` fold
+/// and per status-timer firing (spec D6, hostile-core bounds; the Architect's
+/// number). The rest wait for the next firing; the tag dedupe already keeps
+/// one request per job in flight.
+pub const MAX_STATUS_FOLLOWUPS: usize = 16;
+
 impl ScanTab {
     /// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
     /// tab"). Launch, list, status and cancel are the Jobs tab's; the Jobs

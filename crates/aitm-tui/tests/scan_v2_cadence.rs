@@ -17,7 +17,7 @@ use aitm_scan_model::{JobStatus, ListResult};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::App;
 use aitm_tui::caps::TermCaps;
-use aitm_tui::scan::{is_job_id, parse_result, JobsState};
+use aitm_tui::scan::{is_job_id, parse_result, tag_keyed, JobsState, MAX_STATUS_FOLLOWUPS};
 use common::*;
 use serde_json::{json, Value};
 
@@ -381,4 +381,70 @@ fn fold_list_unmarks_a_started_here_job_the_list_carries() {
         jobs.order,
         vec![JOB.to_string(), "scan-55667788".to_string()]
     );
+}
+
+/// The tags of every `scan.status` request in `reqs`, in order.
+fn status_tags(reqs: &[BusRequest]) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::CallTagged { tag, name, .. } if name == "scan.status" => Some(tag.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D6 hostile-core bounds (fix round B, B2): a `scan.list` of 40 running
+/// jobs yields exactly `MAX_STATUS_FOLLOWUPS` (16) `scan.status` requests on
+/// the fold and exactly 16 more, none repeated, on the next status firing,
+/// the cursor's job first; the rest wait for the firing after that.
+#[test]
+fn status_followups_are_capped_per_fold_and_per_firing() {
+    assert_eq!(MAX_STATUS_FOLLOWUPS, 16);
+    let mut app = app();
+    let template = fixture("scan.list.json")["jobs"][0].clone();
+    let ids: Vec<String> = (0..40).map(|n| format!("scan-000000{n:02}")).collect();
+    let jobs: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let mut row = template.clone();
+            row["job"] = json!(id);
+            row
+        })
+        .collect();
+    let reqs = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: json!({ "jobs": jobs }),
+    });
+    assert_eq!(app.scan.jobs.order, ids);
+    let first = status_tags(&reqs);
+    assert_eq!(
+        first.len(),
+        reqs.len(),
+        "only scan.status requests leave the fold"
+    );
+    let expected: Vec<String> = ids[..16]
+        .iter()
+        .map(|id| tag_keyed("scan.status", id))
+        .collect();
+    assert_eq!(first, expected, "the first 16 listed jobs, in list order");
+
+    for _ in 0..3 {
+        let quiet = tick(&mut app);
+        assert!(
+            quiet.is_empty(),
+            "no status timer before the 4th tick: {quiet:?}"
+        );
+    }
+    app.scan.jobs.cursor = 39;
+    let second = status_tags(&tick(&mut app));
+    let mut expected: Vec<String> = vec![tag_keyed("scan.status", &ids[39])];
+    expected.extend(ids[16..31].iter().map(|id| tag_keyed("scan.status", id)));
+    assert_eq!(
+        second, expected,
+        "the cursor's job first, then order, 16 in all"
+    );
+    let distinct: BTreeSet<&String> = first.iter().chain(second.iter()).collect();
+    assert_eq!(distinct.len(), 32, "none duplicated");
+    assert_eq!(app.scan.inflight.len(), 32);
 }
