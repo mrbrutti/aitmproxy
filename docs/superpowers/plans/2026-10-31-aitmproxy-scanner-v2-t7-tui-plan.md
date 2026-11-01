@@ -735,6 +735,8 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | coder note | Minor | H57 root cause: the harness drain waits for 0.5 s of silence the TUI's polling never allows; `wait_notification` per line instead | ratified; harness note for T10 stands |
 | H (cell) | coder note | note | run 3 pushes carried `issue` events while `scan.issues {job}` read zero | checked on run 4; T1b if it repeats |
 | 15 | live smoke | run 4 | 26 ok, 1 noted, 8 failed: the standard job finished in about a second (sampling and cancel too late), the push thread spun on an instant-`None` read after one timeout, the 8be3e070 engine still refuses `scan.sitemap {}` (fixed on later heads), zero issues again while run 3's pushes show 35 `issue` events for the same kind of job | H62, H63, H64 (cell); the issue contradiction put to T1b; proof core to the final head |
+| H (Rust) | fix round | done | H56 `7705cf0b`, H50 `c609d9fa`, H52 `e4923baa`, H53 `4cf42aa6`; crate gate green (532 tests) | final Rust panel over `03757f77..4cf42aa6` |
+| H (Rust) | coder note | Minor | legacy failure toast now 240 cells; `:scan` failure from Flows reaches Jobs by toast only; key line clipped at inner height <= 5 | ratified |
 
 ## Shipped
 
