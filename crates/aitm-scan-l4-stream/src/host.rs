@@ -365,6 +365,7 @@ impl StreamHost {
                 Ok(steps) => return Ok(steps),
                 Err(ClientError::Guard(L4GuardError::InjectionRateExceeded { retry_after })) => {
                     rate_waits += 1;
+                    self.state.rate_waits.fetch_add(1, Ordering::SeqCst);
                     if rate_waits > MAX_RATE_WAITS {
                         return Err(HostError::Guard(guard_message(
                             &L4GuardError::InjectionRateExceeded { retry_after },

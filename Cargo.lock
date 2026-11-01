@@ -441,6 +441,7 @@ name = "aitm-scan-l4-stream"
 version = "0.5.8"
 dependencies = [
  "aitm-core",
+ "aitm-poc",
  "aitm-proto-l4",
  "aitm-scan-model",
  "anyhow",

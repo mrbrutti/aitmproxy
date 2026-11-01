@@ -15,6 +15,12 @@ aitm-scan-model.workspace = true
 # `redact::{scrub_text, is_secret_key}` for every excerpt the lane reports
 # (spec Constraints).
 aitm-core.workspace = true
+# `CheckMeta.severity` is an `aitm_poc::Severity` (spec S6.3) and
+# `aitm-scan-model` imports the type privately, so the three checks cannot
+# name their severity without this crate. Already in the build graph through
+# `aitm-scan-model`; see the Task 19 report's note on the spec's dependency
+# list.
+aitm-poc.workspace = true
 
 anyhow.workspace = true
 futures.workspace = true

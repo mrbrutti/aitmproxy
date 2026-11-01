@@ -23,6 +23,7 @@ use aitm_scan_model::{InsertionPoint, JobCtx, L4Counters, L4Transport};
 use tokio::sync::Semaphore;
 
 use crate::checks::Campaign;
+use crate::grammar::Grammar;
 use crate::spec::GrammarKind;
 
 // ---------------------------------------------------------------------------
@@ -244,6 +245,9 @@ pub struct JobState {
     pub retired: Mutex<HashSet<String>>,
     /// Silent cases in a row, against the profile's `consecutive_timeouts`.
     pub consecutive_timeouts: AtomicU32,
+    /// How often the guard's injection-rate cap made an exchange wait and
+    /// retry (spec S5.4); reported in the S6.5 detail line.
+    pub rate_waits: AtomicU32,
     /// The job's [`MAX_CONNECTIONS`] connection permits.
     pub connections: Arc<Semaphore>,
     /// The byte pacer every write passes through.
@@ -260,6 +264,11 @@ pub struct JobState {
     pub selection: Mutex<HashMap<String, String>>,
     /// The discovery cache `probe_host_for` reads, keyed by point id.
     pub points: Mutex<HashMap<String, DiscoveredPoint>>,
+    /// The grammar each node speaks, keyed by node id. Only the per-endpoint
+    /// grammars need an entry — TLV, whose spec is inferred from that
+    /// endpoint's seeds, and `raw` — because every other kind is the
+    /// registry's (`grammar::by_kind`).
+    pub grammars: Mutex<HashMap<String, Arc<dyn Grammar>>>,
     /// Insertion order, for eviction ("oldest" is the smallest).
     pub created_seq: u64,
     /// The job's deadline, refreshed by [`LaneState::job_for`]; a state whose
@@ -301,6 +310,7 @@ impl JobState {
             parser_faults: AtomicU32::new(0),
             retired: Mutex::new(HashSet::new()),
             consecutive_timeouts: AtomicU32::new(0),
+            rate_waits: AtomicU32::new(0),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             pacer: Mutex::new(BytePacer::new(max_bytes_per_s)),
             latency: Mutex::new(VecDeque::with_capacity(LATENCY_WINDOW)),
@@ -308,6 +318,7 @@ impl JobState {
             points_total: AtomicU32::new(0),
             selection: Mutex::new(HashMap::new()),
             points: Mutex::new(HashMap::new()),
+            grammars: Mutex::new(HashMap::new()),
             created_seq,
             deadline: Mutex::new(Instant::now()),
             cancelled: AtomicBool::new(false),
@@ -404,12 +415,14 @@ impl fmt::Debug for JobState {
                 "consecutive_timeouts",
                 &self.consecutive_timeouts.load(Ordering::Relaxed),
             )
+            .field("rate_waits", &self.rate_waits.load(Ordering::Relaxed))
             .field("permits", &self.connections.available_permits())
             .field("pacer", &*lock(&self.pacer))
             .field("latency", &lock(&self.latency).len())
             .field("campaigns", &lock(&self.campaigns).len())
             .field("points_total", &self.points_total.load(Ordering::Relaxed))
             .field("points", &lock(&self.points).len())
+            .field("grammars", &lock(&self.grammars).len())
             .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
             .finish()
     }
