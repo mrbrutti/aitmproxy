@@ -1116,4 +1116,201 @@ import Testing
         #expect(ConnectionSummary.bypassFieldCopy
                 == "Hosts that skip the system proxy. Add the hosts your own tools talk to (today's incident: a tool whose API calls were routed to another proxy).")
     }
+
+    // MARK: System proxy — edges a bus client must survive (tester, stage 5)
+
+    /// `make` against another listen address (a core on a wildcard or IPv6 listen, or one the app cannot parse).
+    private func withFacts(_ facts: SystemProxyFacts?, listening listen: String, flows: Int = 0) -> ConnectionSummary {
+        ConnectionSummary.make(core: core(.ready, proxy: listen), activeKind: .embedded, bus: .connected("x"), role: "operator",
+                               roleWarning: false, capability: .capturing, captureSupported: true, scopeHostCount: 2,
+                               flowCount: flows, listenAddress: listen, systemProxyFacts: facts)
+    }
+
+    private let systemProxyDetail = "every proxy-aware app, regardless of Scope"
+    private let plainPointer = "Point a client at 127.0.0.1:8080, or open the browser"
+
+    /// (Matt, PR 4 re-base) The route model is not a lane: the three lanes, `overall`, `worst`, `tooltip` and
+    /// `spoken` never take the system-proxy facts' state, whatever the word — the toolbar pill shows lanes only.
+    @Test func theLanesAndOverallIgnoreTheSystemProxyFacts() {
+        let none = withFacts(nil)
+        #expect(none.overall == .ok)
+        #expect(none.lanes.map(\.kind) == [.core, .bus, .capture])
+        #expect(none.tooltip == "Core: running — Embedded · proxy 127.0.0.1:8080\nBus: connected — operator · x\n"
+                + "All Apps: all apps on · 2 hosts in scope — extension on · 2 hosts in scope")
+        let verbs = [
+            facts(.other, state: both("127.0.0.1", 9090), managed: false),
+            facts(.off, state: .off),
+            facts(.needsPrivilege, remedy: adminSentence),
+            facts(.off, state: .off, setting: true),
+            facts(.unsupported, supported: false),
+            facts(.unknown),
+            facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true),
+            facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: false),
+        ]
+        for verb in verbs {
+            let summary = withFacts(verb)
+            #expect(summary.overall == .ok, "\(verb.word)")
+            #expect(summary.lanes == none.lanes, "\(verb.word)")
+            #expect(summary.worst == none.worst, "\(verb.word)")
+            #expect(summary.tooltip == none.tooltip, "\(verb.word)")
+            #expect(summary.spoken == none.spoken, "\(verb.word)")
+        }
+    }
+
+    /// `setting` outranks every word, the two that carry no endpoint included: while a change is in flight the route
+    /// is named "setting system proxy…" even on an `unsupported`/`unknown` wire (a contradictory but transient
+    /// object), with nothing to press, and the first-flow row falls back to the plain pointer.
+    @Test func settingIsNamedForEveryWordIncludingUnsupportedAndUnknown() {
+        let words: [SystemProxyFacts.Word] = [.pointsAtUs, .other, .off, .unsupported, .needsPrivilege, .unknown]
+        for word in words {
+            let state: SystemProxyState? = word == .off ? .off : (word == .pointsAtUs ? both("127.0.0.1", 8080) : nil)
+            let verb = facts(word, state: state, managed: word == .pointsAtUs, setting: true, supported: word != .unsupported,
+                             remedy: word == .needsPrivilege ? adminSentence : nil)
+            let summary = withFacts(verb)
+            #expect(summary.routes.systemProxy == TrafficRoute(kind: .systemProxy, open: false, state: "setting system proxy…",
+                                                               detail: systemProxyDetail, actions: []), "\(word)")
+            #expect(step(summary, .systemProxy) == GettingStartedStep(kind: .systemProxy, title: "setting system proxy…", done: false,
+                                                                      action: nil, detail: systemProxyDetail), "\(word)")
+            #expect(step(summary, .firstFlow)?.title == plainPointer, "\(word)")
+            #expect(step(summary, .firstFlow)?.action == .openBrowser, "\(word)")
+            // Closed and shown: the empty state lists it first; with rows the banner names it, button-less.
+            let rows = withFacts(verb, capability: .inactive, hosts: 2, flows: 3).routes
+            #expect(rows.banner == "setting system proxy… · All Apps off", "\(word)")
+            #expect(rows.bannerAction == .openCaptureSettings, "\(word)")
+            #expect(rows.advice.first == summary.routes.systemProxy, "\(word)")
+        }
+    }
+
+    /// A contradictory `managed_by_us: true` beside `off` or `other`: the word is the core's verdict, so the route
+    /// is closed with Set as System Proxy — the flag is read only when the proxy points at us (Restore).
+    @Test func managedByUsIsReadOnlyWhenTheProxyPointsAtUs() {
+        #expect(withFacts(facts(.off, state: .off, managed: true)).routes.systemProxy
+                == TrafficRoute(kind: .systemProxy, open: false, state: "system proxy off", remedy: offRemedy,
+                                detail: systemProxyDetail, actions: [.setSystemProxy]))
+        #expect(withFacts(facts(.other, state: both("127.0.0.1", 9090), managed: true)).routes.systemProxy
+                == TrafficRoute(kind: .systemProxy, open: false, state: "system proxy on · 127.0.0.1:9090, not this core",
+                                remedy: otherRemedy, detail: systemProxyDetail, actions: [.setSystemProxy]))
+        #expect(withFacts(facts(.needsPrivilege, managed: true, remedy: adminSentence)).routes.systemProxy
+                == TrafficRoute(kind: .systemProxy, open: false, state: "system proxy needs an administrator", remedy: adminSentence,
+                                detail: systemProxyDetail, actions: []))
+        #expect(step(withFacts(facts(.off, state: .off, managed: true)), .firstFlow)?.title
+                == "Set aitmproxy as the system proxy, or open the browser")
+    }
+
+    /// From the wire to the words: the literal `proxy.status.system_proxy` objects the core serialises, parsed by
+    /// `SystemProxyFacts(compact:listenAddress:)` and rendered by `make`, land on §D12's rows verbatim; the
+    /// malformed shapes land on no route at all.
+    @Test func theWireObjectReachesTheRouteVerbatim() throws {
+        let listen = "127.0.0.1:8080"
+        func parsed(_ object: JSONValue) throws -> SystemProxyFacts {
+            try #require(SystemProxyFacts(compact: object, listenAddress: listen))
+        }
+
+        let other = try parsed(["state": "other", "host": "127.0.0.1", "port": 9090, "managed_by_us": false, "setting": false,
+                                "supported": true, "detail": "HTTP and HTTPS → 127.0.0.1:9090"])
+        #expect(withFacts(other).routes.systemProxy == TrafficRoute(
+            kind: .systemProxy, open: false, state: "system proxy on · 127.0.0.1:9090, not this core", remedy: otherRemedy,
+            detail: systemProxyDetail, actions: [.setSystemProxy]))
+
+        let managed = try parsed(["state": "points_at_us", "host": nil, "port": nil, "managed_by_us": true, "setting": false,
+                                  "supported": true, "detail": "HTTP and HTTPS → 127.0.0.1:8080 (this core)"])
+        #expect(withFacts(managed).routes.systemProxy == TrafficRoute(
+            kind: .systemProxy, open: true, state: "system proxy on · 127.0.0.1:8080", detail: systemProxyDetail,
+            actions: [.unsetSystemProxy]))
+        #expect(step(withFacts(managed), .firstFlow)?.title == "System proxy points at 127.0.0.1:8080 — waiting for the first flow")
+
+        let outside = try parsed(["state": "points_at_us", "host": nil, "port": nil, "managed_by_us": false, "setting": false,
+                                  "supported": true, "detail": "HTTP and HTTPS → 127.0.0.1:8080 (this core)"])
+        #expect(withFacts(outside).routes.systemProxy == TrafficRoute(
+            kind: .systemProxy, open: true, state: "system proxy on · 127.0.0.1:8080 · set outside the app",
+            detail: systemProxyDetail, actions: []))
+
+        let off = try parsed(["state": "off", "host": nil, "port": nil, "managed_by_us": false, "setting": false,
+                              "supported": true, "detail": "HTTP and HTTPS off"])
+        #expect(withFacts(off).routes.systemProxy == TrafficRoute(
+            kind: .systemProxy, open: false, state: "system proxy off", remedy: offRemedy, detail: systemProxyDetail,
+            actions: [.setSystemProxy]))
+
+        // The compact object carries no `remedy`: the administrator row has the state words alone.
+        let adminCompact = try parsed(["state": "needs_privilege", "host": nil, "port": nil, "managed_by_us": false,
+                                       "setting": false, "supported": true, "detail": "networksetup needs an administrator"])
+        #expect(withFacts(adminCompact).routes.systemProxy == TrafficRoute(
+            kind: .systemProxy, open: false, state: "system proxy needs an administrator", detail: systemProxyDetail, actions: []))
+        // The full object (a set reply, `proxy.system.status`) carries it.
+        let adminFull = try parsed(["state": "needs_privilege", "host": nil, "port": nil, "managed_by_us": false, "setting": false,
+                                    "supported": true, "detail": "networksetup needs an administrator", "mechanism": "networksetup",
+                                    "guidance": nil, "remedy": .string(adminSentence)])
+        #expect(withFacts(adminFull).routes.systemProxy?.line
+                == "system proxy needs an administrator — macOS asks for an administrator to change network settings on this Mac.")
+
+        // Never named: the unsupported full object, an unknown word, and the malformed shapes.
+        let malformed = try [
+            parsed(["state": "unsupported", "host": nil, "port": nil, "managed_by_us": false, "setting": false, "supported": false,
+                    "detail": "no supported mechanism on this system", "mechanism": "none",
+                    "guidance": "export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080", "remedy": nil]),
+            parsed(["state": "banana", "supported": true]),
+            parsed(["state": "other", "host": "localhost", "port": 8080, "supported": true]),   // our own address, spelled otherwise
+            parsed(["state": "other", "host": "[::1]", "port": 8080, "supported": true]),
+            parsed(["state": "other", "host": "10.0.0.5", "port": 99_999, "supported": true]), // huge port
+            parsed(["state": "other", "host": "10.0.0.5", "port": -1, "supported": true]),     // negative port
+            parsed(["state": "other", "host": "", "port": 3128, "supported": true]),           // empty host
+            parsed(["state": "other", "supported": true]),                                     // no endpoint at all
+        ]
+        for verb in malformed {
+            let summary = withFacts(verb)
+            #expect(summary.routes.systemProxy == nil, "\(verb)")
+            #expect(!summary.steps.map(\.kind).contains(.systemProxy), "\(verb)")
+            #expect(step(summary, .firstFlow)?.title == plainPointer, "\(verb)")
+            #expect(summary.routes.advice == [], "\(verb)")
+            #expect(summary.routes.banner == nil, "\(verb)")
+        }
+        // `points_at_us` against a listen address the app cannot parse: facts, but no route (never "on").
+        let unparsable = try #require(SystemProxyFacts(compact: ["state": "points_at_us", "managed_by_us": true, "supported": true],
+                                                       listenAddress: "garbage"))
+        let summary = withFacts(unparsable, listening: "garbage")
+        #expect(summary.routes.systemProxy == nil)
+        #expect(!summary.steps.map(\.kind).contains(.systemProxy))
+        #expect(step(summary, .firstFlow)?.title == "Point a client at garbage, or open the browser")
+    }
+
+    /// IPv6 and wildcard spellings in the route words: a bare v6 literal is bracketed in the state line; a core on
+    /// a wildcard listen that the services point at (as loopback) is named by its LISTEN spelling, `0.0.0.0:8080` —
+    /// pinned as today's behaviour (the CFNetwork words of #265 do the same); see the stage-5 report.
+    @Test func ipv6AndWildcardSpellingsInTheRouteWords() throws {
+        #expect(withFacts(facts(.other, state: both("::1", 9090), managed: false)).routes.systemProxy?.state
+                == "system proxy on · [::1]:9090, not this core")
+        #expect(withFacts(facts(.other, state: both("[fe80::1]", 3128), managed: false)).routes.systemProxy?.state
+                == "system proxy on · [fe80::1]:3128, not this core")
+        // A v6 loopback core, pointed at via the v6 spelling: open, named by the listen spelling.
+        let v6 = try #require(SystemProxyFacts(compact: ["state": "points_at_us", "managed_by_us": true, "supported": true],
+                                               listenAddress: "[::1]:8080"))
+        let v6Summary = withFacts(v6, listening: "[::1]:8080")
+        #expect(v6Summary.routes.systemProxy?.state == "system proxy on · [::1]:8080")
+        #expect(v6Summary.routes.systemProxy?.actions == [.unsetSystemProxy])
+        #expect(step(v6Summary, .firstFlow)?.title == "System proxy points at [::1]:8080 — waiting for the first flow")
+        // A wildcard listen: the parser puts the services at 127.0.0.1:8080, the words name 0.0.0.0:8080.
+        let wildcard = try #require(SystemProxyFacts(compact: ["state": "points_at_us", "managed_by_us": true, "supported": true],
+                                                     listenAddress: "0.0.0.0:8080"))
+        #expect(wildcard.state == both("127.0.0.1", 8080))
+        let wildcardSummary = withFacts(wildcard, listening: "0.0.0.0:8080")
+        #expect(wildcardSummary.routes.systemProxy?.open == true)
+        #expect(wildcardSummary.routes.systemProxy?.state == "system proxy on · 0.0.0.0:8080")
+        #expect(step(wildcardSummary, .firstFlow)?.title == "System proxy points at 0.0.0.0:8080 — waiting for the first flow")
+        // An `other` at 127.0.0.1:8080 while we listen on the wildcard is our own address: no route.
+        let ownViaWildcard = try #require(SystemProxyFacts(compact: ["state": "other", "host": "127.0.0.1", "port": 8080, "supported": true],
+                                                           listenAddress: "0.0.0.0:8080"))
+        #expect(withFacts(ownViaWildcard, listening: "0.0.0.0:8080").routes.systemProxy == nil)
+    }
+
+    /// `allStepsDone`: an open system proxy counts as done; a closed one is the one undone row.
+    @Test func allStepsDoneFollowsTheSystemProxyRow() {
+        let managed = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true), flows: 3)
+        #expect(managed.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .firstFlow])
+        #expect(managed.allStepsDone)
+        let off = withFacts(facts(.off, state: .off), flows: 3)
+        #expect(!off.allStepsDone)
+        #expect(off.steps.filter { !$0.done }.map(\.kind) == [.systemProxy])
+        // The CFNetwork read alone, at us: done too (the route, not the source).
+        #expect(withFacts(nil, systemProxy: both("127.0.0.1", 8080), flows: 3).allStepsDone)
+    }
 }

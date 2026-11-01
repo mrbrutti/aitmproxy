@@ -76,4 +76,51 @@ import Testing
         defaults.set("corp.test", forKey: SystemProxyPreferences.bypassKey)
         #expect(SystemProxyPreferences.bypassField(defaults) == "corp.test")
     }
+
+    // MARK: Edges a bus client must survive (tester, stage 5)
+
+    /// Tabs and CRLF are whitespace like any other; a pasted Windows line ending is not a host.
+    @Test func tabsAndCRLFAreSeparators() {
+        #expect(SystemProxyPreferences.bypassHosts("a.test\r\nb.test\tc.test") == ["a.test", "b.test", "c.test"])
+        #expect(SystemProxyPreferences.bypassHosts("\r\n\t ,\r\n") == [])
+    }
+
+    /// The parser does not validate: a quote, a backslash, a wildcard, an IDN label, a CIDR or a bracketed v6
+    /// literal pass through untouched. The YAML escaper (`EmbeddedCoreLaunch.yamlDoubleQuoted`) owns the quoting
+    /// and the core owns the matching rules.
+    @Test func hostsPassThroughUnvalidated() {
+        #expect(SystemProxyPreferences.bypassHosts("a\"b.test back\\slash.test *.local bücher.test 10.0.0.0/8 [::1]")
+                == ["a\"b.test", "back\\slash.test", "*.local", "bücher.test", "10.0.0.0/8", "[::1]"])
+    }
+
+    /// An oversized field (10 000 hosts) parses whole, in order, without truncation.
+    @Test func anOversizedFieldParsesWhole() {
+        let field = (0..<10_000).map { "h\($0).test" }.joined(separator: ", ")
+        let hosts = SystemProxyPreferences.bypassHosts(field)
+        #expect(hosts.count == 10_000)
+        #expect(hosts.first == "h0.test")
+        #expect(hosts[4_999] == "h4999.test")
+        #expect(hosts.last == "h9999.test")
+    }
+
+    /// A stored field that is only separators is kept as typed and is an empty host list for both the spawn
+    /// (no `bypass:` key) and the live set (no `bypass` param).
+    @Test func aStoredSeparatorOnlyFieldIsNoHosts() {
+        let suite = "com.mrbrutti.aitmproxy.tests.sysproxy-prefs-edge-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(" , ,\n", forKey: SystemProxyPreferences.bypassKey)
+        #expect(SystemProxyPreferences.bypassField(defaults) == " , ,\n")
+        #expect(SystemProxyPreferences.bypassHosts(SystemProxyPreferences.bypassField(defaults)) == [])
+    }
+
+    /// Security panel (PR 4): a piece with a control scalar would make the per-launch config
+    /// unparseable (the core fails to start until the field is edited); a leading `-` is an argv
+    /// flag to `networksetup`. Both are dropped; everything else is the core's to judge.
+    @Test func controlCharactersAndLeadingDashesAreDropped() {
+        #expect(SystemProxyPreferences.bypassHosts("a.test, b\u{01}.test, -setwebproxystate, c.test") == ["a.test", "c.test"])
+        #expect(SystemProxyPreferences.bypassHosts("del\u{7F}.test") == [])
+        #expect(SystemProxyPreferences.bypassHosts("-") == [])
+        #expect(SystemProxyPreferences.bypassHosts("a-b.test, *.corp.test") == ["a-b.test", "*.corp.test"], "an inner dash and a wildcard are fine")
+    }
 }

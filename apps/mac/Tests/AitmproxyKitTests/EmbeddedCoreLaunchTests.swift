@@ -727,6 +727,70 @@ import Testing
         #expect(picked != held)
         if let picked { #expect(EmbeddedCoreLaunch.isPortFree(picked)) }
     }
+
+    // MARK: System-proxy block — edges (tester, stage 5, SP-AC25)
+
+    @Test func systemProxyBypassHostsAreEscapedForTheDoubleQuotedScalar() throws {
+        // A quote or a backslash in a host is backslash-escaped inside its scalar (the scope hosts' rule), so a
+        // crafted host cannot close the scalar; everything else is written as typed.
+        let yaml = try config(systemProxyAuto: true, systemProxyBypass: ["a\"b.test", "back\\slash.test", "*.local", "bücher.test"]).yaml()
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: true\n  bypass:\n    - \"a\\\"b.test\"\n    - \"back\\\\slash.test\"\n"
+                               + "    - \"*.local\"\n    - \"bücher.test\"\n"))
+    }
+
+    @Test func systemProxyBypassKeepsOrderAndWritesEveryHost() throws {
+        let yaml = try config(systemProxyBypass: ["z.test", "a.test", "m.test"]).yaml()
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: false\n  bypass:\n    - \"z.test\"\n    - \"a.test\"\n    - \"m.test\"\n"))
+        // An oversized list is written whole: 500 hosts, one line each, four-space indented, nothing collapsed.
+        let many = (1...500).map { "h\($0).test" }
+        let big = try config(systemProxyAuto: true, systemProxyBypass: many).yaml()
+        let lines = big.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0.hasPrefix("    - \"h") && $0.hasSuffix(".test\"") }.count == 500)
+        #expect(lines.filter { $0 == "system_proxy:" }.count == 1)
+        #expect(lines.filter { $0 == "  bypass:" }.count == 1)
+        #expect(big.contains("system_proxy:\n  auto: true\n  bypass:\n    - \"h1.test\"\n    - \"h2.test\"\n"))
+        #expect(big.hasSuffix("    - \"h499.test\"\n    - \"h500.test\"\n"))
+    }
+
+    @Test func aCarriageReturnAloneInABypassHostThrows() {
+        // `\r` alone is a line break to a YAML parser that honours it; rejected like `\n`.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
+            try config(systemProxyBypass: ["evil.test\rx"]).yaml()
+        }
+        // The error names the offending host, not the first one, and a later good host does not rescue it.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("\n")) {
+            try config(systemProxyAuto: true, systemProxyBypass: ["ok.test", "\n", "also-ok.test"]).yaml()
+        }
+        // A newline in a SCOPE host and in a BYPASS host throw the same case, so one catch covers both; the scope
+        // host is checked first because its block is written first.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("scope\nhost")) {
+            try EmbeddedCoreLaunch.Config(
+                obscuraBinary: URL(fileURLWithPath: "/ok/obscura"), proxyPort: 8080, browserProxyPort: 8083,
+                token: "00", operatorToken: "11", endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+                scopeHosts: ["scope\nhost"], systemProxyAuto: true, systemProxyBypass: ["bypass\nhost"]
+            ).yaml()
+        }
+    }
+
+    @Test func anEmptyBypassHostIsWrittenAsAnEmptyScalar() throws {
+        // `Config` trusts its caller like `scopeHosts` does: the one filter is `SystemProxyPreferences.bypassHosts`,
+        // which `EmbeddedCore.spawn()` and the live set always go through, so an empty host never reaches a real
+        // config. Pinned so a change here is a deliberate one.
+        let yaml = try config(systemProxyBypass: [""]).yaml()
+        #expect(yaml.hasSuffix("system_proxy:\n  auto: false\n  bypass:\n    - \"\"\n"))
+        #expect(SystemProxyPreferences.bypassHosts("") == [])
+    }
+
+    @Test func systemProxyBlockLinesAreAtTheRightColumns() throws {
+        // The core's `deny_unknown_fields` parser needs `system_proxy:` at column 0, `auto:`/`bypass:` at two, the
+        // items at four; one stray space would make it a child of the previous key or an unknown one.
+        let yaml = try config(systemProxyAuto: true, systemProxyBypass: ["corp.test"]).yaml()
+        let lines = yaml.split(separator: "\n").map(String.init)
+        let start = try #require(lines.firstIndex(of: "system_proxy:"))
+        #expect(Array(lines[start...]) == ["system_proxy:", "  auto: true", "  bypass:", "    - \"corp.test\""])
+        // With no other tail the block follows the `browser` section directly (byte-exact, as the core parses it).
+        #expect(yaml.hasSuffix("    stop_timeout: 2\nsystem_proxy:\n  auto: true\n  bypass:\n    - \"corp.test\"\n"))
+    }
 }
 
 /// A minimal real listener that holds a TCP port for the duration of a test, so
