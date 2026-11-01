@@ -1232,6 +1232,15 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 8 | Coder (stage 4) | Minor | `traits_for` prose rule tags every email as `Filename`; pinned test says `[Email]` | accepted by the orchestrator (autonomous mandate) 2026-11-01: `Filename` suppressed for email-shaped values; plan amended |
+| 10 | Coder (stage 4) | Minor | Prefixed `xmlns:ns` declarations become `xml_attr` points (`XmlSlot` keeps only the local name); default `xmlns` is skipped | accepted (orchestrator, 2026-11-01): one wasted probe slot per prefixed declaration; `XmlSlot.is_namespace` is a follow-up in `xml.rs` |
+| 11 | Coder (stage 4) | Minor | Plan literal `content-length "7"` was the original body's length; mutated body is 9 bytes | fixed in the plan (4b81060b); code pins `"9"` |
+| 15 | Coder (stage 4) | Minor | Plan fixture named a cross-origin sitemap (`http://t/sm.xml` vs origin `:8080`) the same-origin rule can never follow | fixed in the plan (3d04ea61): served fixture is same-origin; rule unchanged |
+| 15 / 18 | Coder (stage 4) | Minor | Shared-index race: commit 2cb26e26 (task 15) carries task 18's final `crawl/browser.rs`; 0dfbe5a5 is task 18's empty provenance commit | accepted (orchestrator): history not rewritten with live writers; discipline rule added to the plan |
+| 17 | Coder (stage 4) | Minor | Form submissions counted as `attempts` (bounded by `max_pages`), wider than the plan's "per page" | accepted (orchestrator, 2026-11-01): keeps crawl traffic bounded, which justified call A2 |
+| 18 | Coder (stage 4) | Minor | `browser_crawl_pins` log token is `type <sel> = <text>` (the double's spelling); `prime_session_pins` uses a test-local scripted browser for the HttpOnly read-back; `budget_stops_crawl` uses a plain two-page site | accepted (orchestrator): same assertions, counts and order as the plan |
+| 19 | Coder (stage 4) | Minor | Sender errors scrubbed before they become `anyhow` messages; `probe_raw` keeps the capture's authority as `Host` | accepted (orchestrator): strengthens T2-6 |
+| 20 | Coder (stage 4) | Minor | `SessionMonitor::canary()` unreachable across the track boundary (no `JobCtx` seam) | T1b added `JobCtx::report_session_canary` / `report_session_browser_partial` on its branch (26b2a6a4); wired in Task 22 once on `main` |
 
 ## Shipped
 
