@@ -10,8 +10,10 @@
 //! illegal in HTTP/2 (so no `Connection: close` ever reaches an h2 origin).
 //!
 //! There is no retry loop here: a reused connection that fails is removed from
-//! the pool and the error is returned to the caller, which owns the retry
-//! policy (the scanner's probe-error ladder).
+//! the pool and the failure is returned to the caller as an
+//! [`ExchangeFailure`], which says whether the peer provably never processed
+//! the request. The caller ([`crate::sender::HttpSender`]) redials once on
+//! exactly that; everything else is the scanner's probe-error ladder's.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -26,6 +28,64 @@ use bytes::Bytes;
 use h2::client::SendRequest;
 
 use crate::sender::{ProbeStream, MAX_RESPONSE_BYTES};
+
+/// Why one exchange failed, and whether the request may be reissued.
+///
+/// `retryable` is the plan's amendment A7 rule, decided where the h2 error is
+/// in hand: true only when the failure **proves** the peer never processed the
+/// request — `ready()`/`send_request()` failed before anything was written; the
+/// stream was failed by a peer `GOAWAY` whose `last_stream_id` is below it; or
+/// the peer answered `RST_STREAM(REFUSED_STREAM)` (RFC 9113 §8.7) — and no
+/// byte of a response had arrived. A wire timeout, an I/O error, any other
+/// reset and anything after the response head are never retryable: the peer
+/// may have the request on its record.
+pub(crate) struct ExchangeFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) retryable: bool,
+}
+
+impl ExchangeFailure {
+    /// A failure after which the request must not go on the wire again.
+    fn settled(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            retryable: false,
+        }
+    }
+
+    /// A failure before this request's first byte was written.
+    fn not_processed(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            retryable: true,
+        }
+    }
+
+    /// An h2 error on a stream whose HEADERS may already be on the wire:
+    /// retryable only when the peer itself declined the stream.
+    fn after_headers(err: h2::Error, what: &'static str) -> Self {
+        let retryable = peer_declined_stream(&err);
+        Self {
+            error: anyhow::Error::new(err).context(what),
+            retryable,
+        }
+    }
+}
+
+/// Whether `err`, on a stream the client opened, is the peer's own statement
+/// that it did not process that stream.
+///
+/// `h2` fails a client stream on a received `GOAWAY` only when the stream id
+/// is above the frame's `last_stream_id` (streams at or below it keep running
+/// and fail later as I/O when the connection closes), so a remote `GOAWAY`
+/// error on the stream is exactly RFC 9113 §6.8's "not processed". A remote
+/// `RST_STREAM(REFUSED_STREAM)` is §8.7's. Library-initiated resets and
+/// GOAWAYs (a protocol error *we* noticed) say nothing about the peer.
+fn peer_declined_stream(err: &h2::Error) -> bool {
+    err.is_remote()
+        && (err.is_go_away()
+            || (err.is_reset() && err.reason() == Some(h2::Reason::REFUSED_STREAM)))
+}
 
 /// Mirrors `crate::h2`'s outbound settings (the constants there are private to
 /// that module, so the sender carries its own copies of the same values).
@@ -164,7 +224,8 @@ pub(crate) async fn exchange(
 ) -> Result<HttpResponse> {
     let send_req = handshake(stream, key).await?;
     let generation = pool.store(key, send_req.clone(), addr);
-    let mut saw_response = false;
+    // A connection this send dialled itself is never redialled, whatever the
+    // failure says: the marker is dropped here.
     exchange_pooled(
         pool,
         Checkout {
@@ -175,30 +236,27 @@ pub(crate) async fn exchange(
         key,
         req,
         deadline,
-        &mut saw_response,
     )
     .await
+    .map_err(|failure| failure.error)
 }
 
 /// Run one request/response exchange over an already-open connection taken
 /// from `pool`. A failure drops that connection from the pool and is returned
-/// as-is: the caller, not this layer, decides whether to try again.
+/// as an [`ExchangeFailure`]: the caller, not this layer, decides whether to
+/// try again, and `retryable` tells it whether that is safe.
 ///
 /// `deadline` is the caller's own whole-exchange deadline, not a second budget
 /// of this layer's own: [`crate::sender::HttpSender`] owns the cap on the whole
 /// exchange (it starts before the dial) and [`H2_WIRE_TIMEOUT`] caps a single
 /// await on the wire. Nothing in between sets a third one (review finding Q3).
-///
-/// `saw_response` is set once any part of a response has arrived, which is what
-/// tells the caller whether reissuing on a fresh connection is still safe.
 pub(crate) async fn exchange_pooled(
     pool: &H2Pool,
     checkout: Checkout,
     key: &str,
     req: &HttpRequest,
     deadline: tokio::time::Instant,
-    saw_response: &mut bool,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse, ExchangeFailure> {
     // Armed for the whole exchange: a deadline *above* this layer (the
     // sender's whole-exchange timeout, which starts before the dial and so
     // fires first on a real connect) drops this future instead of resuming it,
@@ -211,15 +269,13 @@ pub(crate) async fn exchange_pooled(
         generation: checkout.generation,
         armed: true,
     };
-    let result = match tokio::time::timeout_at(
-        deadline,
-        stream_exchange(checkout.send_req, req, saw_response),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("h2 exchange with {key} timed out")),
-    };
+    let result =
+        match tokio::time::timeout_at(deadline, stream_exchange(checkout.send_req, req)).await {
+            Ok(result) => result,
+            Err(_) => Err(ExchangeFailure::settled(anyhow!(
+                "h2 exchange with {key} timed out"
+            ))),
+        };
     if result.is_ok() {
         eviction.armed = false;
     }
@@ -281,46 +337,67 @@ async fn handshake(stream: Box<dyn ProbeStream>, key: &str) -> Result<SendReques
 }
 
 /// One stream on an open connection: send the head (and body), read the head,
-/// the body up to [`MAX_RESPONSE_BYTES`], and the trailers.
+/// the body up to [`MAX_RESPONSE_BYTES`], and the trailers. Decides
+/// [`ExchangeFailure::retryable`] at each failure point, where the h2 error is
+/// in hand.
 async fn stream_exchange(
     send_req: SendRequest<Bytes>,
     req: &HttpRequest,
-    saw_response: &mut bool,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse, ExchangeFailure> {
     let head = crate::translate::h2_request_from(req);
+    // A per-attempt copy of the body: the request is borrowed, and the one
+    // redial the sender may make has to send the same bytes again. Carrying
+    // `Bytes` end to end from `HttpRequest` would remove this copy.
     let body = match &req.body {
         Body::Bytes(bytes) => bytes.clone(),
         _ => Vec::new(),
     };
     let end_of_stream = body.is_empty();
 
-    let mut ready = wire("connection ready", send_req.ready())
-        .await?
-        .context("h2 connection not ready")?;
-    let (response, mut send_stream) = ready
-        .send_request(head, end_of_stream)
-        .context("send h2 request")?;
+    // Nothing of this request has been written until `send_request` returns:
+    // a connection that is not ready, or refuses to open the stream, proves
+    // the peer never saw it. A *timeout* waiting for readiness does not — the
+    // connection may be alive and merely slow.
+    let mut ready = match wire("connection ready", send_req.ready()).await {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(e)) => {
+            return Err(ExchangeFailure::not_processed(
+                anyhow::Error::new(e).context("h2 connection not ready"),
+            ))
+        }
+        Err(timeout) => return Err(ExchangeFailure::settled(timeout)),
+    };
+    let (response, mut send_stream) = ready.send_request(head, end_of_stream).map_err(|e| {
+        ExchangeFailure::not_processed(anyhow::Error::new(e).context("send h2 request"))
+    })?;
     if !end_of_stream {
         send_body(&mut send_stream, Bytes::from(body)).await?;
         send_stream
             .send_data(Bytes::new(), true)
-            .context("end h2 request")?;
+            .map_err(|e| ExchangeFailure::after_headers(e, "end h2 request"))?;
     }
 
-    let response = wire("response", response)
-        .await?
-        .context("await h2 response")?;
+    let response = match wire("response", response).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => return Err(ExchangeFailure::after_headers(e, "await h2 response")),
+        Err(timeout) => return Err(ExchangeFailure::settled(timeout)),
+    };
     // From here on the peer has answered: whatever goes wrong next, this
-    // request must not be put on the wire a second time.
-    *saw_response = true;
+    // request must not be put on the wire a second time, so every failure
+    // below is `settled`.
     let (parts, mut recv) = response.into_parts();
     // `response_from_h2` is what marks the result `HttpVersion::H2`.
     let head = crate::translate::response_from_h2(&parts);
 
     let mut buffered: Vec<u8> = Vec::new();
     let mut capped = false;
-    while let Some(chunk) = wire("response body read", recv.data()).await? {
-        let chunk = chunk.context("read h2 response body")?;
+    while let Some(chunk) = wire("response body read", recv.data())
+        .await
+        .map_err(ExchangeFailure::settled)?
+    {
+        let chunk = chunk
+            .context("read h2 response body")
+            .map_err(ExchangeFailure::settled)?;
         let room = MAX_RESPONSE_BYTES.saturating_sub(buffered.len());
         let take = room.min(chunk.len());
         buffered.extend_from_slice(&chunk[..take]);
@@ -338,8 +415,10 @@ async fn stream_exchange(
     let mut trailers = aitm_core::HeaderMap::new();
     if !capped {
         if let Some(fields) = wire("response trailers", recv.trailers())
-            .await?
-            .context("read h2 response trailers")?
+            .await
+            .map_err(ExchangeFailure::settled)?
+            .context("read h2 response trailers")
+            .map_err(ExchangeFailure::settled)?
         {
             for (name, value) in fields.iter() {
                 if let Ok(value) = value.to_str() {
@@ -363,20 +442,29 @@ async fn stream_exchange(
 
 /// Write `data` onto an h2 send stream, honouring flow control (a copy of
 /// `crate::h2`'s private `send_body`, which is not visible from here). Never
-/// sets end-of-stream; the caller sends the final empty frame.
-async fn send_body(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> Result<()> {
+/// sets end-of-stream; the caller sends the final empty frame. The HEADERS are
+/// already out, so a failure here is retryable only if the peer declined the
+/// stream.
+async fn send_body(
+    send: &mut h2::SendStream<Bytes>,
+    mut data: Bytes,
+) -> Result<(), ExchangeFailure> {
     while !data.is_empty() {
         send.reserve_capacity(data.len());
         let assigned = wire(
             "send capacity",
             std::future::poll_fn(|cx| send.poll_capacity(cx)),
         )
-        .await?
-        .ok_or_else(|| anyhow!("h2 stream closed before the body was sent"))?
-        .context("h2 send-capacity error")?;
+        .await
+        .map_err(ExchangeFailure::settled)?
+        .ok_or_else(|| {
+            ExchangeFailure::settled(anyhow!("h2 stream closed before the body was sent"))
+        })?
+        .map_err(|e| ExchangeFailure::after_headers(e, "h2 send-capacity error"))?;
         let take = assigned.min(data.len());
         let piece = data.split_to(take);
-        send.send_data(piece, false).context("send h2 data frame")?;
+        send.send_data(piece, false)
+            .map_err(|e| ExchangeFailure::after_headers(e, "send h2 data frame"))?;
     }
     Ok(())
 }
@@ -638,6 +726,142 @@ mod tests {
                 return;
             }
             let _ = send.send_data(Bytes::from_static(b"hi"), true);
+        }
+    }
+
+    /// An h2 origin that answers `serves` streams and then, on the next one,
+    /// reads the request and resets the stream with `reason` instead of
+    /// answering it — a peer that received the request and failed it.
+    async fn h2_origin_resetting_after(
+        io: DuplexStream,
+        seen: Seen,
+        serves: usize,
+        reason: h2::Reason,
+    ) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        let mut served = 0usize;
+        while let Some(accepted) = conn.accept().await {
+            let Ok((req, mut respond)) = accepted else {
+                break;
+            };
+            let (parts, rbody) = req.into_parts();
+            drop(rbody);
+            record(&seen, &parts, Vec::new());
+            served += 1;
+            if served > serves {
+                respond.send_reset(reason);
+                continue;
+            }
+            let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                return;
+            };
+            if let Ok(mut send) = respond.send_response(resp, false) {
+                let _ = send.send_data(Bytes::from_static(b"hi"), true);
+            }
+        }
+    }
+
+    /// An h2 origin that answers `serves` streams and then reads every later
+    /// request and holds it open without a byte of response — a peer that has
+    /// the request and is simply slow.
+    async fn h2_origin_stalling_after(io: DuplexStream, seen: Seen, serves: usize) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        let mut served = 0usize;
+        let mut held = Vec::new();
+        while let Some(accepted) = conn.accept().await {
+            let Ok((req, mut respond)) = accepted else {
+                break;
+            };
+            let (parts, rbody) = req.into_parts();
+            drop(rbody);
+            record(&seen, &parts, Vec::new());
+            served += 1;
+            if served > serves {
+                held.push(respond);
+                continue;
+            }
+            let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                return;
+            };
+            if let Ok(mut send) = respond.send_response(resp, false) {
+                let _ = send.send_data(Bytes::from_static(b"hi"), true);
+            }
+        }
+    }
+
+    /// A plaintext h2 peer scripted by hand, so that the `GOAWAY` it sends
+    /// names the stream it did **not** process: it answers stream 1 with
+    /// `:status 200` and, on the HEADERS for stream 3, sends
+    /// `GOAWAY(last_stream_id = 1, NO_ERROR)` and stays open. (`h2::server`
+    /// reports the last stream it *read* as processed, so it cannot script
+    /// this case.) Records the stream id of every HEADERS frame it read.
+    async fn h2_origin_declining_the_second_stream(
+        mut io: DuplexStream,
+        headers_seen: Arc<Mutex<Vec<u32>>>,
+    ) {
+        use crate::raw_h2::{flags, frame_header, parse_frame, FrameType, PREFACE};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut preface = vec![0u8; PREFACE.len()];
+        if io.read_exact(&mut preface).await.is_err() {
+            return;
+        }
+        if io
+            .write_all(&frame_header(0, FrameType::Settings, 0x00, 0))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            while let Ok(Some((frame, used))) = parse_frame(&buf) {
+                buf.drain(..used);
+                let reply: Option<Vec<u8>> = match FrameType::from_u8(frame.kind) {
+                    Some(FrameType::Settings) if frame.flags & flags::ACK == 0 => {
+                        Some(frame_header(0, FrameType::Settings, flags::ACK, 0).to_vec())
+                    }
+                    Some(FrameType::Headers) => {
+                        headers_seen
+                            .lock()
+                            .expect("headers seen")
+                            .push(frame.stream);
+                        if frame.stream == 1 {
+                            // One static-table indexed field: `:status 200`.
+                            let mut out = frame_header(
+                                1,
+                                FrameType::Headers,
+                                flags::END_HEADERS | flags::END_STREAM,
+                                1,
+                            )
+                            .to_vec();
+                            out.push(0x88);
+                            Some(out)
+                        } else {
+                            let mut out = frame_header(8, FrameType::GoAway, 0x00, 0).to_vec();
+                            out.extend_from_slice(&1u32.to_be_bytes());
+                            out.extend_from_slice(&0u32.to_be_bytes());
+                            Some(out)
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(bytes) = reply {
+                    if io.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    let _ = io.flush().await;
+                }
+            }
+            match io.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
         }
     }
 
@@ -1209,14 +1433,20 @@ mod tests {
         }
     }
 
-    /// Q1: a pooled connection the peer has since gone away on must not fail
-    /// an interactive reissue. The *same* send evicts it and dials once.
+    /// Q1 / SEC-10 (b): a pooled connection whose peer answers the next
+    /// stream with `GOAWAY` naming a `last_stream_id` *below* it has said, in
+    /// so many words, that the request was not processed. The *same* send
+    /// evicts the connection and dials once.
     #[tokio::test]
     async fn a_stale_pooled_connection_is_redialled_within_the_same_send() {
         let (client1, server1) = duplex(64 * 1024);
         let (client2, server2) = duplex(64 * 1024);
+        let headers_seen = Arc::new(Mutex::new(Vec::new()));
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-        let first = tokio::spawn(h2_origin_goaway_after(server1, seen.clone(), 1));
+        let first = tokio::spawn(h2_origin_declining_the_second_stream(
+            server1,
+            headers_seen.clone(),
+        ));
         let second = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
         let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
         let sender = sender_with(dialer.clone());
@@ -1245,6 +1475,11 @@ mod tests {
             2,
             "one redial, inside the one send the caller made"
         );
+        assert_eq!(
+            *headers_seen.lock().expect("headers seen"),
+            vec![1, 3],
+            "the declining peer read both streams and declined the second"
+        );
         let paths: Vec<String> = seen
             .lock()
             .expect("seen")
@@ -1253,8 +1488,8 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            vec!["/a".to_string(), "/b".to_string()],
-            "the redial carried the same request"
+            vec!["/b".to_string()],
+            "the redial carried the same request to the healthy origin, once"
         );
         drop(sender);
         first.abort();
@@ -1358,6 +1593,179 @@ mod tests {
             paths,
             vec!["/a".to_string(), "/b".to_string()],
             "the POST reached an origin exactly once"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
+    /// SEC-10 (plan amendment A7): a pooled peer that read the request and
+    /// then reset the stream with anything but `REFUSED_STREAM` may have
+    /// processed it. The send fails; the request is not put on the wire again.
+    #[tokio::test]
+    async fn a_pooled_peer_that_resets_after_reading_is_not_redialled() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let pooled_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let healthy_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let first = tokio::spawn(h2_origin_resetting_after(
+            server1,
+            pooled_seen.clone(),
+            1,
+            h2::Reason::INTERNAL_ERROR,
+        ));
+        let second = tokio::spawn(h2_origin(server2, b"hi", healthy_seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let first_resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first h2c exchange succeeds");
+        assert_eq!(first_resp.status, 200);
+        assert_eq!(dialer.calls(), 1, "the connection is now pooled");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/b"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a stream reset with INTERNAL_ERROR fails the send");
+        assert!(err.to_string().contains("h2"), "error was {err}");
+        assert_eq!(
+            dialer.calls(),
+            1,
+            "a reset that is not REFUSED_STREAM proves nothing: no redial"
+        );
+        let pooled_paths: Vec<String> = pooled_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(pooled_paths, vec!["/a".to_string(), "/b".to_string()]);
+        assert!(
+            healthy_seen.lock().expect("seen").is_empty(),
+            "the healthy origin must never have been reached"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
+    /// SEC-10: a pooled peer that read the request and never answered within
+    /// `H2_WIRE_TIMEOUT` may be processing it. A wire timeout is never a
+    /// licence to resend. Virtual time: the 30 s pass without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_pooled_peer_that_stalls_past_the_wire_timeout_is_not_redialled() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let pooled_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let healthy_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let first = tokio::spawn(h2_origin_stalling_after(server1, pooled_seen.clone(), 1));
+        let second = tokio::spawn(h2_origin(server2, b"hi", healthy_seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let first_resp = sender
+            .send_with(&h2c_get("/a"), VersionPolicy::H2c)
+            .await
+            .expect("the first h2c exchange succeeds");
+        assert_eq!(first_resp.status, 200);
+        assert_eq!(dialer.calls(), 1, "the connection is now pooled");
+
+        let started = tokio::time::Instant::now();
+        let err = sender
+            .send_with(&h2c_get("/b"), VersionPolicy::H2c)
+            .await
+            .expect_err("a peer that never answers times the stream out");
+        assert_eq!(
+            started.elapsed(),
+            H2_WIRE_TIMEOUT,
+            "the response wait is bounded by exactly the wire timeout"
+        );
+        assert!(err.to_string().contains("timed out"), "error was {err}");
+        assert_eq!(dialer.calls(), 1, "a wire timeout never redials");
+        let pooled_paths: Vec<String> = pooled_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            pooled_paths,
+            vec!["/a".to_string(), "/b".to_string()],
+            "the request went on the wire exactly once"
+        );
+        assert!(
+            healthy_seen.lock().expect("seen").is_empty(),
+            "the healthy origin must never have been reached"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
+    /// SEC-10: `RST_STREAM(REFUSED_STREAM)` is the peer's own statement that
+    /// it did not process the stream (RFC 9113 §8.7), so the same send dials
+    /// once more and the request reaches the healthy origin exactly once.
+    #[tokio::test]
+    async fn a_pooled_peer_refusing_the_stream_is_redialled_once() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let pooled_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let healthy_seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let first = tokio::spawn(h2_origin_resetting_after(
+            server1,
+            pooled_seen.clone(),
+            1,
+            h2::Reason::REFUSED_STREAM,
+        ));
+        let second = tokio::spawn(h2_origin(server2, b"hi", healthy_seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let first_resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first h2c exchange succeeds");
+        assert_eq!(first_resp.status, 200);
+        assert_eq!(dialer.calls(), 1, "the connection is now pooled");
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/b"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("a refused stream is redialled, not reported");
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"hi".to_vec());
+        assert_eq!(dialer.calls(), 2, "one redial for the refused stream");
+        let pooled_paths: Vec<String> = pooled_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(pooled_paths, vec!["/a".to_string(), "/b".to_string()]);
+        let healthy_paths: Vec<String> = healthy_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            healthy_paths,
+            vec!["/b".to_string()],
+            "the redial carried the same request, once"
         );
         drop(sender);
         first.abort();

@@ -426,28 +426,45 @@ impl HttpSender {
 
         let exchange = async {
             if let Some(checkout) = pooled {
-                let mut saw_response = false;
                 let result = crate::h2_sender::exchange_pooled(
                     &self.h2_pool,
                     checkout,
                     &key,
                     &req,
                     deadline,
-                    &mut saw_response,
                 )
                 .await;
                 match result {
                     Ok(resp) => return Ok(resp),
-                    // The peer had begun answering: the request is on the
-                    // record at the origin and is never put on the wire again.
-                    Err(e) if saw_response => return Err(e),
-                    // Nothing came back at all — the pooled connection was
-                    // stale (the peer had gone away since it was last used).
-                    // It is already evicted; fall through and dial, once. A
-                    // freshly dialled connection never reaches this arm, so
-                    // one failed send costs at most two connections (review
-                    // finding Q1).
-                    Err(_) => {}
+                    // The redial rule (plan amendment A7, review finding
+                    // SEC-10): a POOLED connection is redialled, once, only
+                    // when its failure PROVES the request was not processed —
+                    // `ready()`/`send_request()` failed before anything was
+                    // written, the peer's GOAWAY named a `last_stream_id`
+                    // below the stream, or it answered
+                    // `RST_STREAM(REFUSED_STREAM)` — and no byte of a
+                    // response had arrived. The h2 layer decides that where
+                    // the error is in hand; this is the only place that acts
+                    // on it. The stale connection is already evicted; fall
+                    // through and dial. A freshly dialled connection never
+                    // reaches this arm, so one failed send costs at most two
+                    // connections and one re-issued request (review finding
+                    // Q1).
+                    Err(failure) if failure.retryable => {
+                        // `Display` of an `anyhow::Error` is its outermost
+                        // context only — our own text, never the peer's
+                        // GOAWAY debug data (review finding SEC-7).
+                        tracing::debug!(
+                            peer = %key,
+                            error = %failure.error,
+                            "pooled h2 connection declined the request unprocessed; redialling once"
+                        );
+                    }
+                    // A wire timeout, an I/O error, any other reset, or
+                    // anything after the peer began answering: the request
+                    // may be on the record at the origin and is never put on
+                    // the wire again.
+                    Err(failure) => return Err(failure.error),
                 }
             }
             self.dial_and_exchange(&req, &leg).await
