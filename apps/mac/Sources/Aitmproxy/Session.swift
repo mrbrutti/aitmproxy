@@ -192,6 +192,14 @@ final class Session {
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
     var scopeHosts: [String] = []
+    /// The macOS system proxy as the core reports it. nil = unknown (never rendered as off); written by
+    /// the system-proxy session's PR4 from `proxy.status.system_proxy` and the `proxy.system.set`/`unset`
+    /// replies — nothing in this app writes it until then (traffic-route spec D6, plan call 4).
+    var systemProxy: SystemProxyState?
+    /// `proxy.status.decrypt` as last polled (traffic-route spec D6): how many hosts Scope decrypts and the
+    /// core's own empty-Scope sentence. nil until the first live read or on an older core; `make` ignores
+    /// it while the bus lane is not `.ok`, so no reset on disconnect is needed.
+    var decrypt: DecryptStatus?
     var findingsCount = 0
     var browserTabs = 0
     var activeScripts = 0
@@ -222,6 +230,23 @@ final class Session {
     @ObservationIgnored var actions: any FlowActions = OfflineActions()
     /// The last failed action, shown in the status bar until the next one succeeds.
     var lastError: String?
+
+    // MARK: CA trust (spec D17; the actions live in Session+CATrust.swift)
+
+    /// The last `ca.status` read-back: the poll's first tick and every 10th, and forced after
+    /// every trust change. `nil` until read, and again while the bus is down.
+    var caStatus: CAStatus?
+    /// A `ca.install` / `ca.uninstall` call is in flight; `CATrustFacts.installing` reads it.
+    var caTrustInstalling = false
+    /// The last change came back `HeadlessAuth` (macOS) or `NeedsRoot` (Linux).
+    var caTrustNeedsAdmin = false
+    /// The last change's failure other than a cancelled dialog, with the verb it came from. The CA
+    /// panel shows it until a `ca.status` read-back says that verb's end state holds
+    /// (`CATrustFailure.resolved(by:)`, applied in `refreshCAStatus`), a later change succeeds or
+    /// is cancelled, or the bus goes (`forgetCATrust`).
+    var caTrustLastError: CATrustFailure?
+    /// The first-run sheet (Shell/SetupSheet.swift) is up.
+    var setupSheetVisible = false
 
     init() {
         pins = Pins.load(from: pinsURL)

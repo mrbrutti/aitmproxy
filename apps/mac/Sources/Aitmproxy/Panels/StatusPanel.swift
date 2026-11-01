@@ -95,18 +95,19 @@ struct StatusPanel: View {
     // MARK: Getting started
 
     private func gettingStarted(_ summary: ConnectionSummary) -> some View {
-        VStack(alignment: .leading, spacing: Space.md) {
+        let steps = summary.steps
+        return VStack(alignment: .leading, spacing: Space.md) {
             TrackedLabel("Getting started").accessibilityAddTraits(.isHeader)
-            if summary.allStepsDone {
+            if steps.allSatisfy(\.done) {
                 Text("Everything is connected — \(Format.count(session.rows.count, "flow")) captured")
                     .font(Tok.Face.ui(Tok.Typography.Size.md))
                     .foregroundStyle(Tok.Ink.secondary.color)
                     .frame(height: Tok.Size.Row.default)
             } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(summary.steps, id: \.kind) { step in
+                    ForEach(steps, id: \.kind) { step in
                         StepRow(step: step, run: run)
-                        if step.kind != summary.steps.last?.kind {
+                        if step.kind != steps.last?.kind {
                             Rule(color: Tok.Line.rule)
                         }
                     }
@@ -189,7 +190,10 @@ struct StatusPanel: View {
             Task { await CaptureSwitch.set(false, session: session) }
         case .uninstallExtension:
             confirmingUninstall = true
-        case .showCoreLog, .reconnectBus, .openScope, .openBrowser, .copyListenAddress, .approveInSystemSettings:
+        case .trustCA:
+            // Operator-only, like the capture switch: the one call path (Session+CATrust.swift).
+            Task { await session.trustCA() }
+        case .showCoreLog, .reconnectBus, .openScope, .addScopeHost, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
             break // handled by Session.perform(connection:) above
         }
     }
@@ -304,6 +308,7 @@ private struct StepRow: View {
             }
         }
         .frame(height: Tok.Size.Row.default)
+        .help(step.detail ?? step.title)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(step.done ? "Done" : "To do"): \(step.title)")
     }

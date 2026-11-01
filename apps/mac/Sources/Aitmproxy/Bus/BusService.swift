@@ -13,6 +13,8 @@ final class BusService: FlowActions {
     private(set) var serverInfo: ServerInfo?
     /// How often the list is polled while connected.
     var pollInterval: Duration = .milliseconds(500)
+    /// `ca.status` is read on one poll tick in this many (spec D17.10: about every 5 s).
+    static let caStatusEveryTicks = 10
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
@@ -32,6 +34,11 @@ final class BusService: FlowActions {
     /// Settings core — so waiting for the embedded core to come up does not latch
     /// onto some other core the operator happens to be running.
     @ObservationIgnored private var preferEmbedded = false
+    /// The current run's number. `stop()` retires a run by bumping it; a run owns the
+    /// connection — and may write `client`, `session.bus`, the role, `serverInfo`, `tools`,
+    /// `session.listenAddress`, `session.commandRunner`, the poll's session data — iff its
+    /// `generation` still equals this. A superseded run owns nothing but its own socket.
+    @ObservationIgnored private var runGeneration = 0
 
     init(session: Session) { self.session = session }
 
@@ -65,21 +72,32 @@ final class BusService: FlowActions {
     /// Connects (and keeps reconnecting with back-off) until `stop()`.
     func start() {
         stop()
-        runTask = Task { await run() }
+        // Read now, not when the task first runs: the run's number is its own by construction.
+        let generation = runGeneration
+        runTask = Task { await run(generation: generation) }
     }
 
     func stop() {
         runTask?.cancel()
         runTask = nil
+        // Retire the run as well as wake it: cancellation makes its sleeps throw, the bump (the
+        // single bump site) takes its ownership, so whatever it still does, it writes nothing shared.
+        runGeneration += 1
         if let client { Task { await client.disconnect() } }
         client = nil
         session.bus = .disconnected
         session.applyResolvedRole(nil)
     }
 
-    private func run() async {
+    /// One connection after another until `stop()`. `generation` is this run's number: every
+    /// shared write after a suspension point happens only while it still equals `runGeneration`,
+    /// so a run that a later `start()` or `stop()` retired closes its own socket and does nothing else.
+    private func run(generation: Int) async {
+        func owns() -> Bool { generation == runGeneration }
         var backoff: Duration = .seconds(1)
-        while !Task.isCancelled {
+        // Cancellation is the wake-up (it is what makes the sleeps throw); ownership is the write
+        // permission. Both stay, so a cancelled task can never spin on sleeps that return at once.
+        while !Task.isCancelled && owns() {
             let resolved = preferEmbedded ? endpointOverride : (endpointOverride ?? Self.resolveEndpoint())
             guard let endpoint = resolved else {
                 session.bus = preferEmbedded ? .connecting("embedded core") : .failed("no bus configured")
@@ -100,24 +118,36 @@ final class BusService: FlowActions {
             }
             do {
                 let info = try await client.connect()
+                // A superseded run owns nothing but its own socket.
+                guard owns() else { await client.disconnect(); return }
                 serverInfo = info
                 session.bus = .connected(address)
                 session.applyResolvedRole(info.role)
                 session.listenAddress = Self.listenAddress() ?? session.listenAddress
-                tools = (try? await client.listTools()) ?? []
+                let listed = (try? await client.listTools()) ?? []
+                // Same: the tools and the palette's runner are the owner's to publish.
+                guard owns() else { await client.disconnect(); return }
+                tools = listed
                 session.tools = tools
                 session.commandRunner = { [weak self] name, args in
                     guard let self, let client = self.client else { throw BusError.disconnected }
                     return try await client.call(name, args)
                 }
                 await refreshScope()
+                // Same, before the poll takes over the session's rows.
+                guard owns() else { await client.disconnect(); return }
                 backoff = .seconds(1)
-                try await pollLoop(client)
+                try await pollLoop(client, generation: generation)
             } catch {
-                session.bus = .failed(Self.describe(error))
-                session.applyResolvedRole(nil)
+                // Only the owner reports a loss; a run retired mid-flight has nothing to say.
+                if owns() {
+                    session.bus = .failed(Self.describe(error))
+                    session.applyResolvedRole(nil)
+                }
             }
             await client.disconnect()
+            // Closing the socket was a superseded run's last act: `self.client` may already be the new run's.
+            guard owns() else { return }
             self.client = nil
             if Task.isCancelled { break }
             try? await Task.sleep(for: backoff)
@@ -127,29 +157,53 @@ final class BusService: FlowActions {
 
     /// Polls `flow.list`, fetches summaries for new and in-flight flows, and
     /// rebuilds the rows oldest-first. Finished flows are not re-fetched.
-    private func pollLoop(_ client: BusClient) async throws {
+    private func pollLoop(_ client: BusClient, generation: Int) async throws {
+        func owns() -> Bool { generation == runGeneration }
         throughput.reset()
         refetch.reset()
         // However this connection ends — stop(), or a core that went away — no
         // connection means no traffic: a stale rate must not sit under a failed badge.
+        // This runs for a superseded run too, by design (spec D2): after a bare stop()
+        // nobody owns, and a new run's first tick re-reads both the rates and the CA fact.
         defer {
             session.upBytesPerSecond = 0
             session.downBytesPerSecond = 0
+            // No connection means no fact: the CA row and step must not keep a stale store's word,
+            // nor the last change's latch and error.
+            session.forgetCATrust()
         }
-        while !Task.isCancelled {
+        var tick = 0
+        while !Task.isCancelled && owns() {
             // Scope first: `inScope` below and the capture advice (Settings ▸ Capture, the Apps
             // banner) read `scopeHosts`, and a host added from the CLI or another client must
             // not leave them claiming an empty scope.
             await refreshScope()
+            // The next refresh reads `self.client`, which a later start() may already own: a
+            // superseded run's call would land a frame ahead of the new client's token line.
+            guard owns() else { return }
             // The proxy's recording state is the core's fact, not this client's memory: a pause
             // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
             // one poll, and a relaunch against an already-paused core starts out saying so.
             await refreshProxyStatus()
+            // Same: `refreshCAStatus` reaches the bus through `session.commandRunner`, which reads `self.client`.
+            guard owns() else { return }
+            // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
+            // 10th (about every 5 s), because each read spawns `security` per store on the core side.
+            if tick % Self.caStatusEveryTicks == 0 { await session.refreshCAStatus() }
+            // From here the iteration is the owner's: the stop() that retired a superseded run is
+            // closing its socket, so whatever it still listed would only be dropped at the next guard.
+            guard owns() else { return }
+            tick &+= 1
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
+            // `FlowRefetchPolicy.shouldFetch` is `mutating`: even the first look at the cache below is a write, and the owner's.
+            guard owns() else { return }
             for id in ids {
                 let cached = summaries[id]
                 guard refetch.shouldFetch(id, cached: cached) else { continue }
-                if let json = try? await client.call("flow.get", ["id": .string(id.raw)]), let summary = FlowSummary(json: json) {
+                let json = try? await client.call("flow.get", ["id": .string(id.raw)])
+                // The cache, the meter and the refetch bookkeeping are the owner's.
+                guard owns() else { return }
+                if let json, let summary = FlowSummary(json: json) {
                     // ↑ is what clients sent (request bodies), ↓ what came back (response
                     // bodies): each flow's growth since its last summary joins the totals.
                     throughput.record(previous: cached, current: summary)
@@ -157,6 +211,8 @@ final class BusService: FlowActions {
                     refetch.didFetch(id, summary: summary)
                 }
             }
+            // Likewise the rows and rates this iteration publishes: no await from here to the sleep.
+            guard owns() else { return }
             let known = Set(ids)
             summaries = summaries.filter { known.contains($0.key) }
             refetch.retain(known)
@@ -221,6 +277,10 @@ final class BusService: FlowActions {
         if let armed = status["intercept_armed"]?.boolValue, armed != session.interceptArmed {
             session.interceptArmed = armed
         }
+        // Change-guarded like every other per-tick write here: an @Observable set
+        // notifies even when the value is equal, and every route surface reads it.
+        let decrypt = status["decrypt"].flatMap(DecryptStatus.init)
+        if session.decrypt != decrypt { session.decrypt = decrypt }
     }
 
     // MARK: FlowActions

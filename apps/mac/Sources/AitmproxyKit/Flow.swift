@@ -98,6 +98,40 @@ public enum TLSState: Hashable, Sendable {
     case pinnedOrFailed
 }
 
+/// What became of a `CONNECT` tunnel (per-host decryption, PR #228): the wire's `tunnel`
+/// code, spelled as `crates/aitm-core/src/flow.rs` `TunnelMode::label` emits it. A code
+/// this build does not know decodes as nil (`init?(rawValue:)`), never a crash.
+public enum TunnelMode: String, Hashable, Sendable {
+    /// TLS terminated with the proxy's leaf; the inner requests are their own rows.
+    case decrypted
+    /// Relayed byte for byte to the origin; the client saw the origin's own certificate.
+    case passthrough
+    /// The tunnel never became established.
+    case failed
+}
+
+/// Why a tunnel was passed through or failed: the wire's `tunnel_reason`, spelled as
+/// `TunnelReason::label` emits it. `outOfScope` and `pinned` accompany `.passthrough`; the
+/// six others accompany `.failed`. An unknown label decodes as nil, never a crash.
+public enum TunnelReason: String, Hashable, Sendable {
+    /// The authority is not in Scope, so the proxy did not decrypt it.
+    case outOfScope = "out_of_scope"
+    /// The host is on the `tls.passthrough` list; pins win over Scope.
+    case pinned
+    /// The client refused the proxy's CA (a certificate-family TLS alert).
+    case clientRejectedCertificate = "client_rejected_certificate"
+    /// EOF, reset or broken pipe from the client before the tunnel was established.
+    case clientClosed = "client_closed"
+    /// Any other client-side TLS alert or protocol error.
+    case clientTLSError = "client_tls_error"
+    /// DNS, refused, timed out or any I/O failure dialling the origin.
+    case upstreamUnreachable = "upstream_unreachable"
+    /// The origin's TLS handshake failed or timed out.
+    case upstreamTLSFailed = "upstream_tls_failed"
+    /// Anything else: a malformed `CONNECT` head, an h2-to-h1 mirror refusal, no usable SNI.
+    case protocolError = "protocol_error"
+}
+
 /// Proxyman's 11 mark colours (foundation §2.7, open question 8).
 public enum MarkColor: String, CaseIterable, Hashable, Sendable, Codable {
     case red, orange, yellow, green, mint, teal, cyan, blue, indigo, purple, pink
@@ -203,6 +237,17 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
     public var requestBytes: Int64?
     public var responseBytes: Int64?
     public var tls: TLSState
+    /// The outcome of a `CONNECT` row (wire `tunnel`, #228); nil for a row that is not a
+    /// tunnel and from a core older than #228. `tls` is derived from it when present.
+    public var tunnel: TunnelMode?
+    /// Why the tunnel was passed through or failed (wire `tunnel_reason`).
+    public var tunnelReason: TunnelReason?
+    /// Bytes relayed through a passthrough tunnel (wire `bytes_up` / `bytes_down`), nil
+    /// until it closes. Not the request/response body sizes.
+    public var tunnelBytesUp: Int64?
+    public var tunnelBytesDown: Int64?
+    /// The core observed this flow without decrypting it (wire `passive`; absent → false).
+    public var passive: Bool
     public var edited: Bool
     public var comment: String?
     public var mark: MarkColor?
@@ -219,6 +264,8 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         state: FlowState = .pending, isReplay: Bool = false, origin: FlowOrigin = .client,
         client: ClientInfo? = nil, startedAt: Date? = nil, duration: Duration? = nil,
         requestBytes: Int64? = nil, responseBytes: Int64? = nil, tls: TLSState = .decrypted,
+        tunnel: TunnelMode? = nil, tunnelReason: TunnelReason? = nil,
+        tunnelBytesUp: Int64? = nil, tunnelBytesDown: Int64? = nil, passive: Bool = false,
         edited: Bool = false, comment: String? = nil, mark: MarkColor? = nil, inScope: Bool = true,
         wsFrames: (sent: Int, received: Int)? = nil, l4: L4RowInfo? = nil,
         coreID: CoreID = .fixture
@@ -242,6 +289,11 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         self.requestBytes = requestBytes
         self.responseBytes = responseBytes
         self.tls = tls
+        self.tunnel = tunnel
+        self.tunnelReason = tunnelReason
+        self.tunnelBytesUp = tunnelBytesUp
+        self.tunnelBytesDown = tunnelBytesDown
+        self.passive = passive
         self.edited = edited
         self.comment = comment
         self.mark = mark
@@ -249,6 +301,9 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
         self.wsFrames = wsFrames
         self.l4 = l4
     }
+
+    /// Whether this row is a `CONNECT` tunnel the core reported as such (#228).
+    public var isTunnel: Bool { tunnel != nil }
 
     /// `https://host` — the part drawn in ink.
     public var site: String { "\(scheme)://\(authority)" }
@@ -273,6 +328,9 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
             && lhs.inScope == rhs.inScope && lhs.wsFrames?.sent == rhs.wsFrames?.sent
             && lhs.wsFrames?.received == rhs.wsFrames?.received && lhs.l4 == rhs.l4
             && lhs.client == rhs.client
+            && lhs.tunnel == rhs.tunnel && lhs.tunnelReason == rhs.tunnelReason
+            && lhs.tunnelBytesUp == rhs.tunnelBytesUp && lhs.tunnelBytesDown == rhs.tunnelBytesDown
+            && lhs.passive == rhs.passive
     }
 
     public func hash(into hasher: inout Hasher) {

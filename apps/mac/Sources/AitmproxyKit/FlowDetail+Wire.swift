@@ -16,7 +16,28 @@ extension FlowDetail {
         let response = json["response"].flatMap { $0.isNull ? nil : HTTPMessage(responseObject: $0) }
         let connection = ConnectionInfo(
             detailJSON: json, requestVersion: requestObj["version"]?.stringValue ?? "HTTP/1.1")
-        self.init(id: FlowID(idRaw), request: request, response: response, connection: connection, coreID: coreID)
+        // Per-host decryption (#228): `meta.passive` and `meta.tunnel`, both absent from an
+        // older core, `tunnel` null for a flow that is not a tunnel.
+        let meta = json["meta"]
+        self.init(id: FlowID(idRaw), request: request, response: response, connection: connection,
+                  tunnel: TunnelInfo(metaTunnel: meta?["tunnel"]),
+                  passive: meta?["passive"]?.boolValue ?? false,
+                  coreID: coreID)
+    }
+}
+
+extension TunnelInfo {
+    /// Decodes `meta.tunnel` (`{mode, reason, bytes_up, bytes_down}`,
+    /// `crates/aitm-plugins/src/detail.rs` `tunnel`). Nil for null, absent, or a `mode`
+    /// this build does not know; an unknown `reason` keeps the mode and reads as nil. The
+    /// byte counts take the same guards as the body sizes (`FlowSummary.size`).
+    init?(metaTunnel json: JSONValue?) {
+        guard let json, let mode = json["mode"]?.stringValue.flatMap(TunnelMode.init(rawValue:)) else { return nil }
+        self.init(
+            mode: mode,
+            reason: json["reason"]?.stringValue.flatMap(TunnelReason.init(rawValue:)),
+            bytesUp: FlowSummary.size(json["bytes_up"]),
+            bytesDown: FlowSummary.size(json["bytes_down"]))
     }
 }
 

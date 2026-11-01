@@ -117,7 +117,8 @@ poc:
 """)
         subprocess.run(["cargo", "build", "-q", "-p", "aitm"], cwd=ROOT, check=True)
         server = subprocess.Popen([os.path.join(ROOT, "target/debug/aitm"), "--config", cfg],
-                                  stdout=open(os.path.join(work, "server.log"), "w"), stderr=subprocess.STDOUT)
+                                  stdout=open(os.path.join(work, "server.log"), "w"), stderr=subprocess.STDOUT,
+                                  env={**os.environ, "AITM_AUDIT_LOG": "off"})
         time.sleep(1.5)
 
     try:

@@ -20,10 +20,16 @@ public struct CAStatus: Hashable, Sendable {
     /// The user-scope store's keychain / anchor file, for the confirmation text.
     public var location: String?
     public var detail: [String]
+    /// The first store whose `trusted` is `yes`, user before system (`"user"` | `"system"`); nil when none.
+    public var trustedScope: String?
+    /// Some store answered `yes` or `no` (spec D17.5): false when every store says `unknown`, so an
+    /// older core or a failed evaluation tool never renders as "not trusted".
+    public var trustReported: Bool
 
     public init(fingerprint: String, subject: String = "aitmproxy root CA", installed: Bool, trusted: Bool,
                 expires: Date? = nil, path: String? = nil, allowAgentInstall: Bool = false, exists: Bool = true,
-                platform: String = "macos", location: String? = nil, detail: [String] = []) {
+                platform: String = "macos", location: String? = nil, detail: [String] = [],
+                trustedScope: String? = nil, trustReported: Bool = false) {
         self.fingerprint = fingerprint
         self.subject = subject
         self.installed = installed
@@ -35,6 +41,8 @@ public struct CAStatus: Hashable, Sendable {
         self.platform = platform
         self.location = location
         self.detail = detail
+        self.trustedScope = trustedScope
+        self.trustReported = trustReported
     }
 
     /// Nil unless `json` is a `ca.status` object (it always carries `exists`).
@@ -42,6 +50,7 @@ public struct CAStatus: Hashable, Sendable {
         guard let exists = json["exists"]?.boolValue else { return nil }
         let stores = json["stores"]?.objectValue ?? [:]
         let user = stores["user"] ?? stores.values.first
+        let trust = { (scope: String) in stores[scope]?["trusted"]?.stringValue }
         self.init(
             fingerprint: json["fingerprint_sha256"]?.stringValue ?? "",
             subject: json["subject"]?.stringValue ?? "aitmproxy root CA",
@@ -53,7 +62,9 @@ public struct CAStatus: Hashable, Sendable {
             exists: exists,
             platform: json["platform"]?.stringValue ?? "unknown",
             location: user?["location"]?.stringValue,
-            detail: json["detail"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+            detail: json["detail"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+            trustedScope: ["user", "system"].first { trust($0) == "yes" },
+            trustReported: stores.values.contains { ["yes", "no"].contains($0["trusted"]?.stringValue ?? "") })
     }
 
     /// `Installed · trusted` / `Installed · not trusted` / `Not installed` / `No certificate`.
