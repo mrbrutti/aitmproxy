@@ -482,10 +482,19 @@ mod tests {
         };
         let shown = format!("{leaf:?}");
         assert!(!shown.contains("3f9c-secret-value"), "{shown}");
+        // Tester: the path can name a secret too, and the whole rendering is
+        // pinned so a field cannot creep back in.
+        assert!(!shown.contains("session"), "{shown}");
+        assert_eq!(shown, "JsonLeaf { path_len: 10, value_len: 19 }");
 
         let split = split_path("/a?token=supersecret");
         let shown = format!("{split:?}");
         assert!(!shown.contains("supersecret"), "{shown}");
+        assert_eq!(shown, "SplitPath { path_len: 2, query_len: Some(17) }");
+        assert_eq!(
+            format!("{:?}", split_path("/plain")),
+            "SplitPath { path_len: 6, query_len: None }"
+        );
     }
 
     #[test]

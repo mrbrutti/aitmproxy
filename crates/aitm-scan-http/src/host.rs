@@ -580,7 +580,7 @@ mod tests {
         MAX_MATCH_BODY,
     };
 
-    use crate::host::{HttpProbeHost, SessionMonitors};
+    use crate::host::{HttpProbeHost, SessionMonitors, MAX_LOST_MONITOR_IDS};
     use crate::limits::{MAX_HELD_FLOWS, MAX_SESSION_MONITORS};
     use crate::session::{CanaryRequest, SessionMonitor, SESSION_LOST_PREFIX};
     use crate::testutil::{captured_flow, request, response, FakeJob, ScriptedClient, JOB_ID};
@@ -838,6 +838,56 @@ mod tests {
         assert_eq!(fx.sent().len(), 0);
     }
 
+    /// S-M1 (tester): every non-token shape is refused with the one literal,
+    /// value-free message and nothing is sent; an unusual but legal token is
+    /// put on the request line as given.
+    #[tokio::test]
+    async fn probe_raw_method_token_rule_pins() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+        let raw = |method: &str| RawProbe {
+            method: method.to_string(),
+            url: "http://t:8080/raw".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        for bad in [
+            "",
+            "GE T",
+            "GET\r\nX-Injected: 1",
+            "GET\n",
+            "G\tET",
+            "GET/",
+            "GET;",
+            "G\u{c9}T",
+            "GET\u{0}",
+        ] {
+            let Err(refused) = host.probe_raw(raw(bad)).await else {
+                panic!("{bad:?} must be refused");
+            };
+            let message = format!("{refused:#}");
+            assert_eq!(
+                message, "scan: probe_raw: method is not a valid RFC 9110 token",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(fx.sent().len(), 0, "a refused method sends nothing");
+
+        for good in ["M-SEARCH", "PROPFIND", "get", "X!#$%&'*+.^_`|~1"] {
+            host.probe_raw(raw(good))
+                .await
+                .unwrap_or_else(|err| panic!("{good:?} is a token: {err:#}"));
+        }
+        let methods: Vec<String> = fx
+            .sent()
+            .into_iter()
+            .filter(|(req, _)| req.path == "/raw")
+            .map(|(req, _)| req.method)
+            .collect();
+        assert_eq!(methods, ["M-SEARCH", "PROPFIND", "get", "X!#$%&'*+.^_`|~1"]);
+    }
+
     #[tokio::test]
     async fn elapsed_is_measured() {
         let fx = fixture(ok_200().with_delay(Duration::from_millis(50)));
@@ -1081,6 +1131,64 @@ mod tests {
         let host = HttpProbeHost::new(&fx.point, fx.ctx(), rebuilt).unwrap();
         let err = host.probe(&replace("x")).await.unwrap_err().to_string();
         assert!(err.starts_with(SESSION_LOST_PREFIX), "{err}");
+    }
+
+    /// S-M5 (tester): only a *lost* monitor's eviction is remembered. A live
+    /// monitor evicted and rebuilt starts fresh, and the remembered set is
+    /// bounded at `MAX_LOST_MONITOR_IDS`: once that many later lost evictions
+    /// have happened, the oldest lost job is rebuilt fresh while the newer ones
+    /// still start lost.
+    #[test]
+    fn lost_eviction_memory_is_lost_only_and_bounded() {
+        let monitors = SessionMonitors::new();
+        let origin = url::Url::parse("http://t:8080/").unwrap();
+        let fill = |tag: &str, count: usize| {
+            for index in 0..count {
+                monitors.for_job(&id_job(&format!("scan-{tag}-{index:04x}"), true), &origin);
+            }
+        };
+
+        // A live monitor evicted is rebuilt fresh.
+        let live = id_job("scan-live0001", true);
+        let first = monitors.for_job(&live, &origin);
+        assert!(!first.is_lost());
+        fill("fill-a", MAX_SESSION_MONITORS);
+        let rebuilt = monitors.for_job(&live, &origin);
+        assert!(!Arc::ptr_eq(&first, &rebuilt), "the monitor was evicted");
+        assert!(
+            !rebuilt.is_lost(),
+            "a live eviction is not remembered as lost"
+        );
+        assert!(!rebuilt.should_stop());
+
+        // The oldest lost eviction.
+        let oldest = id_job("scan-lost0000", true);
+        monitors.for_job(&oldest, &origin).force_lost();
+        fill("fill-b", MAX_SESSION_MONITORS);
+        assert!(monitors.for_job(&oldest, &origin).should_stop());
+        // Rebuilding it put it back in the table; evict it again (it is still
+        // lost, and the set does not grow for a repeat).
+        fill("fill-c", MAX_SESSION_MONITORS);
+
+        // `MAX_LOST_MONITOR_IDS` further lost evictions, each pushed out by
+        // the next, then the last sixteen pushed out by fillers.
+        let later: Vec<IdJob> = (0..MAX_LOST_MONITOR_IDS)
+            .map(|index| id_job(&format!("scan-later-{index:04x}"), true))
+            .collect();
+        for job in &later {
+            monitors.for_job(job, &origin).force_lost();
+        }
+        fill("fill-d", MAX_SESSION_MONITORS);
+        assert_eq!(monitors.len(), MAX_SESSION_MONITORS);
+
+        assert!(
+            !monitors.for_job(&oldest, &origin).should_stop(),
+            "the oldest lost job fell out of the bounded set and is rebuilt fresh"
+        );
+        assert!(monitors.for_job(&later[0], &origin).should_stop());
+        assert!(monitors
+            .for_job(&later[MAX_LOST_MONITOR_IDS - 1], &origin)
+            .should_stop());
     }
 
     #[test]

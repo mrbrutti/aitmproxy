@@ -690,7 +690,7 @@ fn decode_one(tail: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{extract, FieldKind};
+    use super::{extract, refresh_target, FieldKind};
     use crate::limits::{
         MAX_FIELDS_PER_FORM, MAX_FORMS_PER_PAGE, MAX_LINKS_PER_PAGE, MAX_OPTIONS_PER_SELECT,
     };
@@ -772,6 +772,61 @@ mod tests {
             r#"<meta http-equiv="refresh" content="éé"><meta http-equiv="refresh" content="日本語=/x"><meta http-equiv="refresh" content="0; URL=/ok">"#,
         );
         assert_eq!(out.links, ["/ok"]);
+    }
+
+    /// C1 (tester): `refresh_target` is the function that panicked. Pinned
+    /// directly on the shapes that put a char boundary inside byte 3 and on the
+    /// shapes that must still resolve, so the `get` cannot quietly become an
+    /// index again.
+    #[test]
+    fn refresh_target_pins_multibyte_and_keyword_shapes() {
+        assert_eq!(refresh_target("0;éé"), None);
+        assert_eq!(refresh_target("0;é日"), None);
+        assert_eq!(refresh_target("éé"), None);
+        assert_eq!(refresh_target("日本語=/x"), None);
+        assert_eq!(refresh_target("uré=/x"), None);
+        assert_eq!(refresh_target("ur"), None);
+        assert_eq!(refresh_target(""), None);
+        assert_eq!(refresh_target("5"), None);
+        assert_eq!(refresh_target("0;url"), None);
+        assert_eq!(refresh_target("0;url="), None);
+        assert_eq!(refresh_target("0;url=/é"), Some("/é".to_string()));
+        assert_eq!(refresh_target("0; URL='/ok'"), Some("/ok".to_string()));
+        assert_eq!(refresh_target("url=/next"), Some("/next".to_string()));
+    }
+
+    /// C1 (tester): every indexed slice of page text in this module became a
+    /// `get`. A 2-, 3- and 4-byte char dropped at every char boundary of a
+    /// page that reaches each of them (comment, tag name, quoted and bare
+    /// attribute values, textarea, option, entities, meta refresh, raw text)
+    /// must never panic. A 2-byte char at offset 2 of `url` is the exact C1
+    /// shape (`ur` + `é` puts byte 3 inside the char).
+    #[test]
+    fn extract_never_panics_with_a_multibyte_char_anywhere() {
+        const PAGE: &str = concat!(
+            r#"<!-- <a href="/c"> --><meta http-equiv="refresh" content="0;url=/r">"#,
+            r#"<a href=/bare title='q'>x</a><base href="/b/"><form action="/f" method=post>"#,
+            r#"<textarea name="t">body &amp; &#233; &#xe9; &bogus; &#99999999;</textarea>"#,
+            r#"<select name="s"><option>one<option value="2">two</select>"#,
+            r#"<input name="r" type=radio checked><input name=unq value=v></form>"#,
+            r#"<style>a{}</style><title><a href="/t"></title><script src="/s.js"></script>"#,
+            r#"<a href="/unterminated"#,
+        );
+        let boundaries = PAGE
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(PAGE.len()));
+        for at in boundaries {
+            for insert in ["é", "日", "\u{10348}"] {
+                let mut page = String::with_capacity(PAGE.len() + insert.len());
+                page.push_str(&PAGE[..at]);
+                page.push_str(insert);
+                page.push_str(&PAGE[at..]);
+                // Only the absence of a panic is asserted: what the page means
+                // with a stray char in it is not this test's question.
+                let _ = extract(&page);
+            }
+        }
     }
 
     /// S-I2: the bodies of `textarea`, `title`, `noscript` and `xmp` are text,

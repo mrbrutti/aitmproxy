@@ -996,6 +996,97 @@ mod tests {
         assert_eq!(uuid.example.as_deref(), Some("<redacted>"));
     }
 
+    /// S-M2 (tester): the opaque-token boundary and the other token shapes.
+    /// A 24-hex object id is named `{oid}` and withheld; a 16-hex run is the
+    /// shortest hex the example is withheld for, 15 hex is shown; a base64
+    /// blob is withheld by its trait; a plain route word is shown as itself.
+    #[test]
+    fn path_token_redaction_pins_oid_hex_boundary_base64_and_plain() {
+        fn last_segment(url: &str) -> InsertionPoint {
+            let flow = captured_flow(request("GET", url, &[], None), 200, &[], b"");
+            let profile = ScanProfile::default();
+            let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+            let out = enumerate_v2(
+                &flow,
+                &EnumerateOptions::from_profile(&profile, &ignore, None),
+            );
+            out.points
+                .into_iter()
+                .rfind(|p| p.kind == PathSegment)
+                .unwrap_or_else(|| panic!("no trailing path segment for {url}"))
+        }
+
+        let oid = last_segment("http://t:8080/orders/507f1f77bcf86cd799439011");
+        assert_eq!(oid.name, "{oid}");
+        assert_eq!(oid.path.as_deref(), Some("2"));
+        assert_eq!(oid.example.as_deref(), Some("<redacted>"));
+
+        let hex16 = last_segment("http://t:8080/k/0123456789abcdef");
+        assert_eq!(hex16.name, "0123456789abcdef");
+        assert_eq!(hex16.example.as_deref(), Some("<redacted>"));
+
+        let hex15 = last_segment("http://t:8080/k/0123456789abcde");
+        assert_eq!(hex15.name, "0123456789abcde");
+        assert_eq!(hex15.example.as_deref(), Some("0123456789abcde"));
+
+        let b64 = last_segment("http://t:8080/dl/QUJDREVGR0hJSktMTU5PUA==");
+        assert_eq!(b64.name, "QUJDREVGR0hJSktMTU5PUA==");
+        assert!(b64.traits.contains(&PointTrait::Base64), "{:?}", b64.traits);
+        assert_eq!(b64.example.as_deref(), Some("<redacted>"));
+
+        let plain = last_segment("http://t:8080/account/settings");
+        assert_eq!(plain.name, "settings");
+        assert_eq!(plain.example.as_deref(), Some("settings"));
+    }
+
+    /// S-I1 (tester): the path rule covers an XML *attribute* too — its path
+    /// is `element@attr`, so `session@id` is session material while
+    /// `order@id` is not.
+    #[test]
+    fn secret_by_path_covers_xml_attributes() {
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[],
+                Some((
+                    "application/xml",
+                    b"<r><session id=\"3f9c9e\"/><order id=\"7\"/></r>",
+                )),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let empty = CompiledIgnore::compile(&[]).unwrap();
+        let out = xml_out_points(&flow, &empty, &profile);
+
+        let secret = out
+            .points
+            .iter()
+            .find(|p| p.kind == XmlAttr && p.path.as_deref() == Some("r.session@id"))
+            .unwrap_or_else(|| panic!("no r.session@id point in {:?}", triples(&out)));
+        assert!(
+            secret.traits.contains(&PointTrait::Session),
+            "{:?}",
+            secret.traits
+        );
+        assert_eq!(secret.example.as_deref(), Some("<redacted>"));
+
+        let plain = out
+            .points
+            .iter()
+            .find(|p| p.kind == XmlAttr && p.path.as_deref() == Some("r.order@id"))
+            .unwrap_or_else(|| panic!("no r.order@id point in {:?}", triples(&out)));
+        assert!(
+            !plain.traits.contains(&PointTrait::Session),
+            "{:?}",
+            plain.traits
+        );
+        assert_eq!(plain.example.as_deref(), Some("7"));
+    }
+
     #[test]
     fn expect_header_is_not_a_point() {
         let flow = captured_flow(

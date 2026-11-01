@@ -536,7 +536,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use aitm_core::{FlowStore, MemFlowStore, RecordPolicy};
+    use aitm_core::{Flow, FlowStore, MemFlowStore, RecordPolicy};
     use aitm_scan_model::{CrawlStrategy, ScanProfile, SessionMaterial, UseBrowser};
 
     use crate::crawl::frontier::limits_for;
@@ -771,8 +771,10 @@ mod tests {
             "{}<a href=\"/from-huge\">x</a>",
             "<p>pad</p>".repeat(MAX_DOM_BYTES / 10 + 1)
         );
-        let client = Arc::new(crate::testutil::ScriptedClient::new(
-            move |req: &HttpRequest| {
+        let huge_len = huge.len();
+        let store = Arc::new(MemFlowStore::new());
+        let client = Arc::new(
+            crate::testutil::ScriptedClient::new(move |req: &HttpRequest| {
                 Ok(match req.path.as_str() {
                     "/" => crate::testutil::response(
                         200,
@@ -795,9 +797,10 @@ mod tests {
                         b"<p>leaf</p>",
                     ),
                 })
-            },
-        ));
-        let job = FakeJob::new(profile(|_| {}), Arc::clone(&client));
+            })
+            .recording_into(Arc::clone(&store) as Arc<dyn FlowStore>),
+        );
+        let job = FakeJob::new(profile(|_| {}), Arc::clone(&client)).with_store(Arc::clone(&store));
 
         let report = crawl(&job).await;
 
@@ -820,6 +823,24 @@ mod tests {
                 );
             }
         }
+        // S-I3 (tester): the oversized page is cut to exactly the bound, not
+        // merely under it, and the stored flow keeps every byte.
+        let held = report
+            .flows
+            .iter()
+            .find(|flow| flow.request.path == "/huge")
+            .expect("the huge page was held");
+        let Some(Body::Bytes(held_body)) = held.response.as_ref().map(|r| &r.body) else {
+            panic!("the held flow keeps a bytes body");
+        };
+        assert_eq!(held_body.len(), MAX_HELD_CRAWL_BODY);
+        let Some(Flow::Http(stored)) = store.get(held.id) else {
+            panic!("the store holds the huge page");
+        };
+        let Some(Body::Bytes(stored_body)) = stored.response.as_ref().map(|r| &r.body) else {
+            panic!("the stored flow keeps a bytes body");
+        };
+        assert_eq!(stored_body.len(), huge_len);
     }
 
     /// A fetch that errors is one page the crawl did not get: the walk goes on

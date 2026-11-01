@@ -1320,6 +1320,52 @@ mod tests {
         assert_eq!(job.charges.load(Ordering::SeqCst), 5);
     }
 
+    // --- Q7 (tester): the browser engine's half of the group rule -----------
+
+    /// A form with two radio groups and two checkbox groups: a group the page
+    /// left unchecked gets exactly its first member checked, a group the page
+    /// checked is left alone, and nothing is typed into a radio or checkbox.
+    /// The one text control is typed as pinned and the form still submits.
+    #[tokio::test]
+    async fn browser_fill_checks_one_member_per_unchecked_group() {
+        const GROUPED: &str = "<html><body><form action=\"/search\" method=\"get\">\
+<input name=\"q\">\
+<input type=\"radio\" name=\"r\" value=\"x\"><input type=\"radio\" name=\"r\" value=\"y\">\
+<input type=\"checkbox\" name=\"c\" value=\"1\" checked><input type=\"checkbox\" name=\"c\" value=\"2\">\
+<input type=\"checkbox\" name=\"k\" value=\"a\"><input type=\"checkbox\" name=\"k\" value=\"b\">\
+<input type=\"radio\" name=\"z\" value=\"p\"><input type=\"radio\" name=\"z\" value=\"q\" checked>\
+</form></body></html>";
+        let store = Arc::new(MemFlowStore::new());
+        let home = PageScript::new(GROUPED)
+            .with_forms(&[(0, SEARCH)])
+            .with_captures(vec![request("GET", ROOT, &[], None)]);
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        let fills: Vec<String> = browser
+            .log_lines()
+            .into_iter()
+            .filter(|line| line.starts_with("check ") || line.starts_with("type "))
+            .collect();
+        assert_eq!(
+            fills,
+            vec![
+                format!("type {} = aitm-aitm7f3a", field_selector(0, "q")),
+                format!("check {}", escape_quoted(&field_selector(0, "r"))),
+                format!("check {}", escape_quoted(&field_selector(0, "k"))),
+            ]
+        );
+        assert_eq!(report.forms_submitted, 1);
+        assert_eq!(report.forms_skipped, 0);
+    }
+
     // --- S-I3: the report holds bounded copies, the store the real flow -------
 
     /// A page whose capture carries a 200 KiB response: the report's copy is

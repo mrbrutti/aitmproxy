@@ -390,6 +390,34 @@ mod tests {
         );
     }
 
+    /// S-M4 (tester): the decoded-key rule holds for upper-case hex, for a key
+    /// whose first byte is encoded, for `+` as a segment separator, and in the
+    /// middle of other pairs; a non-secret encoded key keeps its value, and a
+    /// malformed escape neither panics nor hides a plain secret next to it.
+    #[test]
+    fn safe_url_decoded_key_check_pins_variants() {
+        assert_eq!(
+            safe_url("http://t/x?S%45SSION=abc"),
+            "http://t/x?S%45SSION=<redacted>"
+        );
+        assert_eq!(
+            safe_url("http://t/x?%74oken=abc"),
+            "http://t/x?%74oken=<redacted>"
+        );
+        assert_eq!(
+            safe_url("http://t/x?x+session=abc"),
+            "http://t/x?x+session=<redacted>"
+        );
+        assert_eq!(
+            safe_url("http://t/x?a=1&p%61ssword=hunter2&n%61me=bob"),
+            "http://t/x?a=1&p%61ssword=<redacted>&n%61me=bob"
+        );
+        assert_eq!(
+            safe_url("http://t/x?%zz=1&token=abc"),
+            "http://t/x?%zz=1&token=<redacted>"
+        );
+    }
+
     #[test]
     fn safe_url_scrubs_kept_query_values() {
         assert_eq!(

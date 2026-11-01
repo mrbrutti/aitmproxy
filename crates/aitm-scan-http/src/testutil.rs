@@ -620,6 +620,17 @@ impl BrowserDriver for FakeBrowser {
                     .to_value()
                 }));
             }
+            // A `set_checked_js` expression: logged as `check <selector>` so a
+            // test can see which group members the engine checked (Q7).
+            if expr.contains(".checked=true") {
+                let selector = expr
+                    .split_once("querySelector(\"")
+                    .and_then(|(_, rest)| rest.split_once("\");"))
+                    .map(|(selector, _)| selector.to_string())
+                    .unwrap_or_default();
+                self.log_line(format!("check {selector}"));
+                return Ok(Value::Null);
+            }
             if expr.contains("requestSubmit") || expr.contains(".submit()") {
                 let index = form_index(&expr);
                 self.log_line(format!("submit {index}"));
