@@ -300,20 +300,25 @@ Kept by the main session during stage 6. One row per finding.
 | 1 | tester | Minor | negative counters pass through `num()` | fixed in `08ec7391` (clamp to 0) |
 | fix round | security (re-review) | — | both prior Minors verified fixed; no new finding | PASS |
 | fix round | quality (re-review) | — | all six Importants verified fixed | PASS; nine Minors below |
-| 10, 11 | quality (re-review) | Minor | "last good" came from view mount time, not read time | fixed in the quality-Minors commit (`profilesLoadedAt`/`jobsLoadedAt` set in the read) |
-| 11 | quality (re-review) | Minor | profile-load error not keyed to the profile it failed for | fixed in the quality-Minors commit (`profileError(name)`) |
-| 13 | quality + spec (re-review) | Minor | `issue` error source had no renderer (toast only) | fixed in the quality-Minors commit (`data-error="issue"` alert in the Status section) |
-| primitives | quality (re-review) | Minor | `Fact` dead boolean branch vs `yesNo` | fixed in the quality-Minors commit |
-| 9 | quality + spec (re-review) | Minor | `lastErrorText` public accessor used by nothing | fixed in the quality-Minors commit (deleted) |
-| 14 | quality (re-review) | Minor | header reconnect note bypassed `ReconnectNote` | fixed in the quality-Minors commit |
-| 11 | quality (re-review) | Minor | constant option lists rebuilt per section mount | fixed in the quality-Minors commit (hoisted) |
-| 4, 15 | quality (re-review) | Minor | script leftovers (`[url, url]` shim, optional `where`, synthesised status in step 5) | fixed in the quality-Minors commit |
-| tests | quality (re-review) | Minor | directory walk by `readdirSync` try/catch | fixed in the quality-Minors commit (`withFileTypes`) |
+| 10, 11 | quality (re-review) | Minor | "last good" came from view mount time, not read time | fixed in `42fb1da5` (`profilesLoadedAt`/`jobsLoadedAt` set in the read) |
+| 11 | quality (re-review) | Minor | profile-load error not keyed to the profile it failed for | fixed in `42fb1da5` (`profileError(name)`) |
+| 13 | quality + spec (re-review) | Minor | `issue` error source had no renderer (toast only) | fixed in `42fb1da5` (`data-error="issue"` alert in the Status section) |
+| primitives | quality (re-review) | Minor | `Fact` dead boolean branch vs `yesNo` | fixed in `42fb1da5` |
+| 9 | quality + spec (re-review) | Minor | `lastErrorText` public accessor used by nothing | fixed in `42fb1da5` (deleted) |
+| 14 | quality (re-review) | Minor | header reconnect note bypassed `ReconnectNote` | fixed in `42fb1da5` |
+| 11 | quality (re-review) | Minor | constant option lists rebuilt per section mount | fixed in `42fb1da5` (hoisted) |
+| 4, 15 | quality (re-review) | Minor | script leftovers (`[url, url]` shim, optional `where`, synthesised status in step 5) | fixed in `42fb1da5` |
+| tests | quality (re-review) | Minor | directory walk by `readdirSync` try/catch | fixed in `42fb1da5` (`withFileTypes`) |
 | 9 | spec (re-review) | Minor | plan Task 9 listed `clearError()`, never implemented | plan corrected (interface now names `errorFor`); accepted (orchestrator, 2026-11-01) |
 | 15 | spec (re-review) | Minor | the live harness starts the first core with `l4: { enabled: true }` (no entries); PA13 did not say so | plan Task 15 corrected; accepted (orchestrator, 2026-11-01): it is the spec's own 8a scenario |
 | tests | spec (re-review) | Minor | fix Coder adjusted two Tester expectations in `tester.edges.test.ts` (`43c8cd1e`) | accepted (orchestrator, 2026-11-01): the minimum to follow the accepted clamp and typed-error changes |
 | 4 | spec (re-review) | Minor | `parseOperatorUrl` also accepts the obsolete `web UI (operator):` line | accepted (orchestrator, 2026-11-01): harmless, both forms require `#t=`; dropped when the fixture of the old banner is gone |
-| 15 | live run 6 | Important | after the 8b restart the click on `l4-stream-safe` landed on `thorough` (the job strip appeared late and shifted the list) | fixed in the quality-Minors commit (`selectProfile` verifies `aria-selected`) |
+| 15 | live run 6 | Important | after the 8b restart the click on `l4-stream-safe` landed on `thorough` (the job strip appeared late and shifted the list) | fixed in `42fb1da5` (`selectProfile` verifies `aria-selected`) |
+| fix round | tester (re-test) | — | every W-criterion and amendment behaviour mapped to a test; 13 tests added (`d6b8eece`, incl. `tester.live-env.test.ts` for `parseOperatorUrl`/`renderConfig`) | PASS |
+| 1 | tester (re-test) | Minor | an id of `__proto__` is accepted by the parsers but dropped by Solid store writes | fixed in `eb379134` (`idStr`/`optId`/`idList` refuse it at every id position) |
+| primitives, 1 | tester (re-test) | Minor | duplicate ids trap `listboxKeys` ArrowDown; list parsers do not dedupe | fixed in `eb379134` (`uniqueRows`, walk to the next distinct id) |
+| 4 | tester (re-test) | Minor | PA12 claimed `parseOperatorUrl`/YAML quoting were tested; they were not | fixed by the tester's `tester.live-env.test.ts` (`d6b8eece`) |
+| 15 | live run 7 (`42fb1da5` web on T1b `ca852f71`) | — | 26 PASS · 0 FAIL · 1 GAP (8b `lane_unavailable`: the dialog showed the core's prompt, `_confirm` was sent, the core has no L4 lane built; the UI rendered the refusal) | accepted (orchestrator, 2026-11-01): the GAP the plan foresaw; final run on `eb379134` recorded in the PR |
 
 ## Shipped
 
