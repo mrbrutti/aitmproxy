@@ -648,6 +648,13 @@ Kept by the main session during stage 6. One row per finding.
 | G-C | security | Minor | a raising cleanup step skips the work-dir removal | fix round H (H1) |
 | G-C | security | Minor | a lost `l4.scope.add` reply leaves the entry on a runner core | fix round H (H2): exact-tuple removal on `BusError` only |
 | G-C | security | Minor | inspector failure sample tagged `inspector` when it did not open | fix round H (H3) |
+| G-C | quality re-review | PASS | G94/G95/G96 verified; markers checked against the renderers | seven Minors to fix round H |
+| G-C | quality | Minor | `EDITOR_HEAD_RE` matches the no-editor hint; every first Profiles visit exits and re-enters the view | fix round H (H4) |
+| G-C | quality | Minor | `TAB_MARKERS["2"]` unused | fix round H (H5) |
+| G-C | quality | Minor | `name[:20]` needle assumes 20 name cells; `J` pin failure is a note while the twin issue can satisfy the next check | fix round H (H6) |
+| G-C | quality | Minor | sample tags are the caller's expectation | fix round H (H3, widened) |
+| G-C | quality | Minor | `cursor_row` re-inlines `CURSOR_ROW_RE` | fix round H (H7) |
+| G-C | quality | Minor | `harness_scan_start` catches programming errors | fix round H (H8) |
 
 ## Shipped
 
