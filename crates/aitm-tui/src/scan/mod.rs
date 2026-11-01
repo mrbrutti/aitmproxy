@@ -60,24 +60,25 @@ pub const MAX_STATUS_FOLLOWUPS: usize = 16;
 /// The `limit` of every `scan.issues` page the TUI asks for (spec D6).
 pub const ISSUES_PAGE_LIMIT: usize = 512;
 
-impl ScanTab {
-    /// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
-    /// tab"). Launch, list, status and cancel are the Jobs tab's; the Jobs
-    /// tab keeps no error of its own and reads `ScanState::last_error`.
-    pub fn owning(verb: &str) -> ScanTab {
-        match verb {
-            "scan.profile.list"
-            | "scan.profile.get"
-            | "scan.profile.save"
-            | "scan.profile.delete"
-            | "scan.checks"
-            | "scan.session.preview" => ScanTab::Profiles,
-            "scan.sitemap" => ScanTab::SiteMap,
-            "scan.issues" | "scan.issue" | "scan.issue.update" => ScanTab::Issues,
-            _ => ScanTab::Jobs,
-        }
+/// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
+/// tab"; plan task 13). The profile verbs, the catalogue, the session
+/// preview and the two launch verbs are the Profiles tab's (a launch is
+/// made there, and a refused one is answered in its footer, D13); list,
+/// status and cancel are the Jobs tab's, which keeps no error of its own
+/// and reads `ScanState::last_error`; the site map and the issue verbs
+/// their tabs'. A verb outside the D3 set falls to Jobs.
+pub fn owning_tab(verb: &str) -> ScanTab {
+    match verb {
+        "scan.checks" | "scan.session.preview" | "scan.start" | "scan.map" => ScanTab::Profiles,
+        _ if verb.starts_with("scan.profile.") => ScanTab::Profiles,
+        "scan.list" | "scan.status" | "scan.cancel" => ScanTab::Jobs,
+        "scan.sitemap" => ScanTab::SiteMap,
+        "scan.issues" | "scan.issue" | "scan.issue.update" => ScanTab::Issues,
+        _ => ScanTab::Jobs,
     }
+}
 
+impl ScanTab {
     /// Every tab, in the order the strip shows them (`1` to `4`).
     pub const ALL: [ScanTab; 4] = [
         ScanTab::Profiles,
@@ -131,7 +132,7 @@ impl ScanState {
     /// error line (the Jobs tab has none of its own) and `last_error`, the
     /// view-wide fallback the banner reads.
     pub fn set_error(&mut self, err: ScanError) {
-        match ScanTab::owning(&err.verb) {
+        match owning_tab(&err.verb) {
             ScanTab::Profiles => self.profiles.error = Some(err.clone()),
             ScanTab::SiteMap => self.sitemap.error = Some(err.clone()),
             ScanTab::Issues => self.issues.error = Some(err.clone()),
@@ -149,12 +150,24 @@ impl ScanState {
         if same(&self.last_error) {
             self.last_error = None;
         }
-        match ScanTab::owning(tag_parts(tag).0) {
+        match owning_tab(tag_parts(tag).0) {
             ScanTab::Profiles if same(&self.profiles.error) => self.profiles.error = None,
             ScanTab::SiteMap if same(&self.sitemap.error) => self.sitemap.error = None,
             ScanTab::Issues if same(&self.issues.error) => self.issues.error = None,
             _ => {}
         }
+    }
+
+    /// The refused launch the Profiles footer answers (spec D13's refused
+    /// state): the Profiles tab's error when it is a launch verb's
+    /// `out_of_scope`, `refused_agent`, `refused_l4` or `confirm_required`.
+    /// It is cleared like any error, by the next success under its tag, so
+    /// the row leaves with the next launch that goes through.
+    pub fn refused_launch(&self) -> Option<&ScanError> {
+        self.profiles
+            .error
+            .as_ref()
+            .filter(|e| e.is_refused_launch())
     }
 
     /// The focused pane's cursor and its row count, for the shared `nav()`
@@ -426,6 +439,24 @@ impl ScanError {
     /// the detail; an uncoded error reads `<verb>: <detail>`, except a
     /// missing verb, which reads `<verb> is not on this bus` (D2's inline
     /// text, the verb named once).
+    /// Whether this is a launch (`scan.start` / `scan.map`) the core
+    /// refused with a code the operator can act on from the Profiles tab
+    /// (spec D13's refused state): `out_of_scope`, `refused_agent`,
+    /// `refused_l4` or `confirm_required`. The launch key stays live for
+    /// these; the footer shows the wording in the warning hue.
+    pub fn is_refused_launch(&self) -> bool {
+        matches!(self.verb.as_str(), "scan.start" | "scan.map")
+            && matches!(
+                self.code,
+                Some(
+                    ScanErrorCode::OutOfScope
+                        | ScanErrorCode::RefusedAgent
+                        | ScanErrorCode::RefusedL4
+                        | ScanErrorCode::ConfirmRequired
+                )
+            )
+    }
+
     pub fn wording(&self) -> String {
         match self.code {
             Some(code) => format!("{}: {}", code_wording(code), self.detail),
@@ -578,6 +609,42 @@ mod tests {
         assert_eq!(scan_host("fe80::1"), "fe80::1");
         assert_eq!(scan_host("[fe80::1]"), "fe80::1");
         assert_eq!(scan_host("host:abc"), "host:abc");
+    }
+
+    /// Plan task 13: every D3 verb has an owning tab; the launch verbs are
+    /// the Profiles tab's, the unknown fall to Jobs.
+    #[test]
+    fn owning_tab_routes_every_d3_verb() {
+        for verb in [
+            "scan.profile.list",
+            "scan.profile.get",
+            "scan.profile.save",
+            "scan.profile.delete",
+            "scan.checks",
+            "scan.session.preview",
+            "scan.start",
+            "scan.map",
+        ] {
+            assert_eq!(owning_tab(verb), ScanTab::Profiles, "{verb}");
+        }
+        for verb in ["scan.list", "scan.status", "scan.cancel", "scan.discover"] {
+            assert_eq!(owning_tab(verb), ScanTab::Jobs, "{verb}");
+        }
+        assert_eq!(owning_tab("scan.sitemap"), ScanTab::SiteMap);
+        for verb in ["scan.issues", "scan.issue", "scan.issue.update"] {
+            assert_eq!(owning_tab(verb), ScanTab::Issues, "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_refused_launch_is_one_of_four_codes_on_a_launch_verb() {
+        assert!(ScanError::from_message("scan.start", "scan: out_of_scope: x").is_refused_launch());
+        assert!(
+            ScanError::from_message("scan.map", "scan: confirm_required: x").is_refused_launch()
+        );
+        assert!(!ScanError::from_message("scan.start", "scan: busy: x").is_refused_launch());
+        assert!(!ScanError::from_message("scan.list", "scan: out_of_scope: x").is_refused_launch());
+        assert!(!ScanError::from_message("scan.start", "boom").is_refused_launch());
     }
 
     #[test]

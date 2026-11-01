@@ -16,12 +16,14 @@
 //! it, only while the Origins or the Checks pane is focused, a rule and
 //! that pane (the picker rows with their source, the wildcard scope entries
 //! greyed; or the lane to class to check tree with the tri-state glyphs and
-//! the collapse markers); at the bottom the `launch.blocked` reason, wrapped
-//! and in the warning hue, over the key footer. Without an editor the
-//! detail side says how to open one and keeps the footer, since `s` on the
-//! List launches the row's profile.
+//! the collapse markers); at the bottom the `launch.blocked` reason (or,
+//! when the gate is not holding, a refused launch's D9 wording, D13's
+//! refused state), wrapped and in the warning hue, over the key footer.
+//! Without an editor the detail side says how to open one and keeps the
+//! footer, since `s` on the List launches the row's profile.
 //!
-//! Hue only on data (D13): the blocked reason wears the warning hue, the
+//! Hue only on data (D13): the blocked and refused reasons wear the
+//! warning hue, the
 //! greyed wildcard rows tertiary text, everything else text tokens; the
 //! glyphs are flat monochrome. Every string is cut to its pane, and only
 //! the rows on screen are built.
@@ -36,8 +38,8 @@ use aitm_scan_model::{LaneKind, ProfileListEntry};
 use crate::app::App;
 use crate::scan::{
     lane_token, session_line, token, tri_state, EditorField, OriginSource, ProfileEditor,
-    ProfilePane, ProfilesState, ScanOffer, TreeNode, BUILTIN_MARK, COLLAPSED_MARK, EDITOR_FIELDS,
-    OPEN_MARK,
+    ProfilePane, ProfilesState, ScanError, ScanOffer, TreeNode, BUILTIN_MARK, COLLAPSED_MARK,
+    EDITOR_FIELDS, OPEN_MARK,
 };
 use crate::theme::Theme;
 use crate::tokens::color::status;
@@ -259,11 +261,17 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         return;
     }
     let w = usize::from(area.width) - 1;
+    // The UI-3 reason while the gate holds (the key is inert, D7); else the
+    // refused launch's wording (D13's refused state: the key stays live and
+    // the operator reads why the core said no, here where the launch is
+    // made). Both wrap the same way and wear the warning hue.
+    let refused = app.scan.refused_launch().map(ScanError::wording);
     let blocked = app
         .scan
         .launch
         .blocked
         .as_deref()
+        .or(refused.as_deref())
         .map(|text| wrap(text, w, BLOCKED_ROWS_MAX))
         .unwrap_or_default();
     let h = usize::from(area.height);

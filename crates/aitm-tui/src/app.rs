@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use aitm_scan_model::{
     is_builtin_name, ChecksResult, Issue, IssueStatus, IssuesResult, JobEvent, JobId,
     JobNotification, JobStatus, ListResult, Phase, ProfileDeleteResult, ProfileListResult,
-    ProfileSaveResult, ScanProfile, SessionMode, SessionProfile, SitemapResult, StartResult,
-    JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+    ProfileSaveResult, ScanErrorCode, ScanProfile, SessionMode, SessionProfile, SitemapResult,
+    StartResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -5555,14 +5555,23 @@ impl App {
         }
     }
 
-    /// A tagged `scan.*` call failed: settle the tag and record the error on
-    /// its tab. A failed `scan.issue` clears the pending read and reads
+    /// A tagged `scan.*` call failed (spec D9): settle the tag, record the
+    /// error on its owning tab (the banner shows its wording until the next
+    /// success under the same tag, D13) and toast the same wording as an
+    /// Error. A failed `scan.issue` clears the pending read and reads
     /// nothing, so the next landing on the row asks again (fix round D,
-    /// D3). Task 13 adds the D9 wording display and the `not_found`
-    /// self-heal.
-    fn on_scan_failed(&mut self, tag: &str, message: String, _out: &mut Vec<BusRequest>) {
+    /// D3). `not_found` on a keyed `scan.status` / `scan.cancel` is the
+    /// self-heal of spec call 8: the job leaves `order`, `summaries`,
+    /// `full` and `started_here` (else the next list would put it back at
+    /// the front) and one `scan.list {}` is asked for. A refused launch
+    /// (`out_of_scope`, `refused_agent`, `refused_l4`, `confirm_required`
+    /// on `scan.start` / `scan.map`) clears `pending` so the key is live
+    /// again; the Profiles footer reads the wording off the tab's error
+    /// (`ScanState::refused_launch`), so nothing more is kept for it here.
+    fn on_scan_failed(&mut self, tag: &str, message: String, out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
-        if tag_parts(tag).0 == "scan.issue" {
+        let (verb, key) = tag_parts(tag);
+        if verb == "scan.issue" {
             self.scan.issues.pending_read = None;
         }
         if tag == "scan.sitemap" {
@@ -5572,7 +5581,29 @@ impl App {
         if tag == "scan.start" || tag == "scan.map" {
             self.scan.launch.pending = None;
         }
-        self.scan.set_error(ScanError::from_message(tag, &message));
+        let err = ScanError::from_message(tag, &message);
+        if err.code == Some(ScanErrorCode::NotFound)
+            && matches!(verb, "scan.status" | "scan.cancel")
+        {
+            if let Some(job) = key {
+                self.drop_scan_job(job);
+                self.request_scan_list(out);
+            }
+        }
+        self.toast(Level::Error, err.wording());
+        self.scan.set_error(err);
+    }
+
+    /// Forget a job the core no longer knows (D9 `not_found`): out of
+    /// `order`, `summaries`, `full` and `started_here`, the cursor clamped
+    /// to what is left.
+    fn drop_scan_job(&mut self, job: &str) {
+        let jobs = &mut self.scan.jobs;
+        jobs.order.retain(|id| id != job);
+        jobs.summaries.remove(job);
+        jobs.full.remove(job);
+        jobs.started_here.remove(job);
+        jobs.cursor = jobs.cursor.min(jobs.order.len().saturating_sub(1));
     }
 
     /// A `browser.*` call answered: fill the view. A navigate re-reads the
