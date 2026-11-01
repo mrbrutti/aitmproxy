@@ -7,8 +7,11 @@
 //! window and back on the same port by +6 s, with exactly one `downtime`
 //! entry in `/log/l4`; in Patched mode the same trigger gets the row's
 //! protocol-error reply, the speaker closes with reason `error`, the listener
-//! stays up and `downtime` is empty. Plus the D5 denylist observation and an
-//! MQTT CONNECT / PUBLISH / DISCONNECT session.
+//! stays up and `downtime` is empty. Plus the D5 denylist observation, an
+//! MQTT CONNECT / PUBLISH / DISCONNECT session, and the T10 PR C contract:
+//! malformed (non-trigger) input is answered before the close in both
+//! modes, a partial line keeps the connection open until its CRLF arrives,
+//! and a high-bit byte in an argument gets the normal reply.
 //!
 //! Binds loopback ports, so it runs in the Terminal panel, never in the Bash
 //! sandbox (bind is EPERM there). The per-service flows run concurrently
@@ -296,6 +299,31 @@ async fn exchange(stream: &mut TcpStream, send: &[u8], read_timeout: Duration) -
         .await
         .map_err(|e| format!("write: {e}"))?;
     Ok(read_until_idle(stream, read_timeout).await.0)
+}
+
+/// Write `send`, wait up to `first_within` for the first byte of the reply,
+/// then collect the rest until `idle` passes without bytes or the peer
+/// closes. On success the read returns `idle` after the reply; only a
+/// failure waits out `first_within`.
+async fn exchange_within(
+    stream: &mut TcpStream,
+    send: &[u8],
+    first_within: Duration,
+    idle: Duration,
+) -> Res<Vec<u8>> {
+    stream
+        .write_all(send)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut buf = [0u8; 8192];
+    let mut out = match timeout(first_within, stream.read(&mut buf)).await {
+        Ok(Ok(0)) => return Err("closed before any reply byte".to_string()),
+        Ok(Err(e)) => return Err(format!("read: {e}")),
+        Err(_elapsed) => return Err(format!("no reply byte within {first_within:?}")),
+        Ok(Ok(n)) => buf[..n].to_vec(),
+    };
+    out.extend(read_until_idle(stream, idle).await.0);
+    Ok(out)
 }
 
 /// One fresh-connection TCP exchange: connect, read the banner if any, send,
@@ -625,15 +653,8 @@ async fn patched_flow(case: Case, addr: SocketAddr, control: String) -> Res<()> 
     let messages = array(&log, "messages")?;
     let trigger_msg = match trigger_conn {
         Some(local) => {
-            let conn_id = array(&log, "accepts")?
-                .iter()
-                .find(|a| a["peer"] == local.to_string())
-                .and_then(|a| a["conn_id"].as_str())
-                .ok_or_else(|| format!("no accepts entry with peer {local}"))?
-                .to_string();
-            let close = array(&log, "closes")?
-                .iter()
-                .find(|c| c["conn_id"] == conn_id)
+            let conn_id = conn_id_of(&log, local)?;
+            let close = close_of(&log, &conn_id)?
                 .ok_or_else(|| format!("no closes entry for {conn_id}"))?;
             if close["reason"] != "error" {
                 return Err(format!("close reason for {conn_id}: {}", close["reason"]));
@@ -954,4 +975,856 @@ async fn mqtt_connect_publish_disconnect() {
         .filter_map(|m| m["verb"].as_str())
         .collect();
     assert_eq!(verbs, vec!["CONNECT", "PUBLISH", "DISCONNECT"]);
+}
+
+// --- T10 PR C: no silent close on non-trigger input ---------------------------------
+
+/// How long a partial line must keep the connection open before the rest
+/// of it is sent ("still open after 1 s").
+const PARTIAL_HOLD: Duration = Duration::from_secs(1);
+
+/// The `conn_id` of our connection (by its local address in `accepts`).
+fn conn_id_of(log: &Value, local: SocketAddr) -> Res<String> {
+    array(log, "accepts")?
+        .iter()
+        .find(|a| a["peer"] == local.to_string())
+        .and_then(|a| a["conn_id"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("no accepts entry with peer {local}"))
+}
+
+/// The `closes` entry for `conn_id`, if the speaker has closed it.
+fn close_of<'a>(log: &'a Value, conn_id: &str) -> Res<Option<&'a Value>> {
+    Ok(array(log, "closes")?
+        .iter()
+        .find(|c| c["conn_id"] == conn_id))
+}
+
+/// A row of one of the tables below, with the service it targets and the
+/// label `run_rows` names it by in a failure.
+struct Labelled<R> {
+    service: &'static str,
+    label: &'static str,
+    row: R,
+}
+
+/// Run `flow(service, row, addr, control)` for every row against one `mode`
+/// target, sequentially, and fail with every failing row named by its
+/// service and label.
+async fn run_rows<R, F, Fut>(mode: SeedMode, rows: Vec<Labelled<R>>, flow: F)
+where
+    F: Fn(&'static str, R, SocketAddr, String) -> Fut,
+    Fut: Future<Output = Res<()>>,
+{
+    let target = start(mode).await;
+    let control = target.control_url().expect("control url").to_string();
+    let mut failures = Vec::new();
+    for Labelled {
+        service,
+        label,
+        row,
+    } in rows
+    {
+        let addr = service_addr(&target, service, Proto::Tcp);
+        if let Err(e) = flow(service, row, addr, control.clone()).await {
+            failures.push(format!("{service} [{label}]: {e}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing row(s) in {mode:?}:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// Reply budget for a row whose one write is an inline line around the
+/// RESP 1 MiB cap. The driver re-offers the buffer after every 8 KiB read
+/// and `l4-resp` scans it for a CRLF; before the per-connection scan memo
+/// (T10 PR C fix round 2) every one of the ~128 reads rescanned the whole
+/// buffer, which measured 2.4-5.2 s in an unoptimised build (~150 ms
+/// optimised) before the speaker could answer or the 200 ms idle could
+/// even start, while the client's `write_all` returns as soon as the
+/// loopback buffers have taken the bytes. With the memo the absorb is
+/// O(n), but the budget stays generous: it is only ever waited out on a
+/// failure (the read returns on the close), and a tight one would flake
+/// when the parallel live tests compete for the CPU.
+const LARGE_LINE_WITHIN: Duration = Duration::from_secs(20);
+
+/// One write on a fresh connection and the exact bytes that must come
+/// back: the malformed rows (`expect`, then a close with reason `error`)
+/// and the high-bit rows (`expect`, connection kept).
+struct Row {
+    banner: Option<&'static [u8]>,
+    send: Vec<u8>,
+    expect: Vec<u8>,
+    /// How long `read_until_idle` waits for more bytes or the close:
+    /// `CLOSE_WITHIN` for a reply-then-close row, `REPLY_IDLE` for a
+    /// reply-and-keep row, `LARGE_LINE_WITHIN` for a 1 MiB line.
+    read_idle: Duration,
+}
+
+/// Malformed, non-trigger input: the speaker writes `expect`, then closes
+/// with reason `error`; the listener never goes down.
+fn malformed_rows() -> Vec<Labelled<Row>> {
+    vec![
+        Labelled {
+            service: "l4-resp",
+            label: "array header without CRLF before `$`",
+            row: Row {
+                banner: None,
+                send: b"*1$4\r\nPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "element without `$`",
+            row: Row {
+                banner: None,
+                send: b"*1\r\n4\r\nPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got '4'\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "garbled bulk length",
+            row: Row {
+                banner: None,
+                send: b"*1\r\n$abc\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid bulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "negative array count",
+            row: Row {
+                banner: None,
+                send: b"*-1\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        // --- Tester additions (stage 5) ---
+        Labelled {
+            service: "l4-resp",
+            label: "garbled array count",
+            row: Row {
+                banner: None,
+                send: b"*abc\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "empty element line: nothing to quote",
+            row: Row {
+                banner: None,
+                send: b"*1\r\n\r\nPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got ''\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "simple-string element `+PING`",
+            row: Row {
+                banner: None,
+                send: b"*1\r\n+PING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got '+'\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "high-bit byte where `$` should be is not echoed",
+            row: Row {
+                banner: None,
+                send: b"*1\r\n\xffPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got ''\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "inline line one byte past 1 MiB with no CRLF (at the 200 ms idle)",
+            row: Row {
+                banner: None,
+                send: vec![b'a'; RESP_MAX_BULK + 1],
+                expect: b"-ERR Protocol error: too big inline request\r\n".to_vec(),
+                read_idle: LARGE_LINE_WITHIN,
+            },
+        },
+        // --- Over-long inline lines: complete, with their CRLF ---
+        Labelled {
+            service: "l4-resp",
+            label: "complete inline line one byte past 1 MiB (with its CRLF)",
+            row: Row {
+                banner: None,
+                send: {
+                    let mut line = vec![b'a'; RESP_MAX_BULK + 1];
+                    line.extend_from_slice(b"\r\n");
+                    line
+                },
+                expect: b"-ERR Protocol error: too big inline request\r\n".to_vec(),
+                read_idle: LARGE_LINE_WITHIN,
+            },
+        },
+    ]
+}
+
+async fn malformed_flow(
+    service: &'static str,
+    row: Row,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    let local = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    stream
+        .write_all(&row.send)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut stream, row.read_idle).await;
+    if bytes != row.expect {
+        return Err(format!(
+            "reply: got {} expected {}",
+            hex(&bytes),
+            hex(&row.expect)
+        ));
+    }
+    if !closed {
+        return Err(format!(
+            "speaker did not close within {:?} after the reply",
+            row.read_idle
+        ));
+    }
+    // Not a trigger: the listener is up and nothing was logged as downtime.
+    tcp_open(addr, row.banner).await?;
+    let log = l4_log(&control, service).await?;
+    let downtime = array(&log, "downtime")?;
+    if !downtime.is_empty() {
+        return Err(format!("downtime is not empty: {downtime:?}"));
+    }
+    let conn_id = conn_id_of(&log, local)?;
+    let close =
+        close_of(&log, &conn_id)?.ok_or_else(|| format!("no closes entry for {conn_id}"))?;
+    if close["reason"] != "error" {
+        return Err(format!("close reason: {}", close["reason"]));
+    }
+    let last_in = array(&log, "messages")?
+        .iter()
+        .rfind(|m| m["conn_id"] == conn_id && m["dir"] == "in")
+        .ok_or_else(|| format!("no `in` message on {conn_id}"))?;
+    if last_in["classified"] != "protocol_error" {
+        return Err(format!("classified {}", last_in["classified"]));
+    }
+    Ok(())
+}
+
+/// Malformed, non-trigger input is answered with the row's protocol error
+/// and then closed with reason `error`, in both modes; never a silent
+/// close, never a crash window (T10 PR C, the T6 oracle's contract).
+#[tokio::test]
+async fn malformed_input_is_answered_before_the_close() {
+    run_rows(SeedMode::Patched, malformed_rows(), malformed_flow).await;
+    run_rows(SeedMode::Vulnerable, malformed_rows(), malformed_flow).await;
+}
+
+/// A line sent in two pieces: `first` has no CRLF, the connection must
+/// still be open and silent after 1 s, then `second` completes it and
+/// `expect` comes back on the same connection, its first byte within
+/// `reply_within`. The 1 s hold proves "silent and open", not "reached the
+/// 200 ms idle": a 1 MiB `first` may still be being absorbed when the hold
+/// ends; `resp_never_waits_past_its_buffer_cap` (hermetic) is what pins the
+/// `Wait` at exactly the cap.
+struct Partial {
+    banner: Option<&'static [u8]>,
+    first: Vec<u8>,
+    second: Vec<u8>,
+    expect: Vec<u8>,
+    /// Budget for the first byte of the reply after `second` is written:
+    /// `REPLY_IDLE` for an ordinary row, `LARGE_LINE_WITHIN` when `first`
+    /// is a 1 MiB line the speaker may still be absorbing. Only a failure
+    /// waits it out.
+    reply_within: Duration,
+}
+
+fn partial_rows() -> Vec<Labelled<Partial>> {
+    vec![
+        Labelled {
+            service: "l4-smtp",
+            label: "NOO + P",
+            row: Partial {
+                banner: Some(SMTP_BANNER),
+                first: b"NOO".to_vec(),
+                second: b"P\r\n".to_vec(),
+                expect: b"250 OK\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-smtp",
+            label: "damaged terminator \\r\\t then CRLF",
+            row: Partial {
+                banner: Some(SMTP_BANNER),
+                first: b"NOOP\r\t".to_vec(),
+                second: b"\r\n".to_vec(),
+                expect: b"250 OK\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-ftp",
+            label: "NOO + P",
+            row: Partial {
+                banner: Some(FTP_BANNER),
+                first: b"NOO".to_vec(),
+                second: b"P\r\n".to_vec(),
+                expect: b"200 ok\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-ftp",
+            label: "damaged terminator \\r\\t then CRLF",
+            row: Partial {
+                banner: Some(FTP_BANNER),
+                first: b"USER a\r\t".to_vec(),
+                second: b"\r\n".to_vec(),
+                expect: b"331 password required\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-memcached",
+            label: "get mykey without CRLF",
+            row: Partial {
+                banner: None,
+                first: b"get mykey".to_vec(),
+                second: b"\r\n".to_vec(),
+                expect: b"END\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-memcached",
+            label: "set waiting for its data",
+            row: Partial {
+                banner: None,
+                first: b"set k 0 0 2\r\nh".to_vec(),
+                second: b"i\r\n".to_vec(),
+                expect: b"STORED\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "inline PIN + G",
+            row: Partial {
+                banner: None,
+                first: b"PIN".to_vec(),
+                second: b"G\r\n".to_vec(),
+                expect: b"+PONG\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        // --- Tester additions (stage 5) ---
+        Labelled {
+            service: "l4-memcached",
+            label: "cap-sized set (1 MiB) stalled on its final LF",
+            row: Partial {
+                banner: None,
+                first: {
+                    let mut first = format!("set k 0 0 {MC_MAX_DATA}\r\n").into_bytes();
+                    first.extend(std::iter::repeat_n(b'x', MC_MAX_DATA));
+                    first.push(b'\r');
+                    first
+                },
+                second: b"\n".to_vec(),
+                expect: b"STORED\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
+            },
+        },
+        // The hold proves the connection is silent and open after 1 s; the
+        // speaker may still be absorbing the 1 MiB (O(n) since the scan
+        // memo), so the reply gets the large-line budget, free on success.
+        Labelled {
+            service: "l4-resp",
+            label: "inline line of exactly 1 MiB waits, then its CRLF makes it an unknown command",
+            row: Partial {
+                banner: None,
+                first: vec![b'a'; RESP_MAX_BULK],
+                second: b"\r\n".to_vec(),
+                expect: {
+                    let mut expect = b"-ERR unknown command '".to_vec();
+                    expect.extend(std::iter::repeat_n(b'a', 128));
+                    expect.extend_from_slice(b"'\r\n");
+                    expect
+                },
+                reply_within: LARGE_LINE_WITHIN,
+            },
+        },
+    ]
+}
+
+async fn partial_flow(
+    service: &'static str,
+    row: Partial,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    let local = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    stream
+        .write_all(&row.first)
+        .await
+        .map_err(|e| format!("write first: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut stream, PARTIAL_HOLD).await;
+    if closed {
+        return Err(format!(
+            "closed within 1 s on a partial line (wrote {})",
+            hex(&bytes)
+        ));
+    }
+    if !bytes.is_empty() {
+        return Err(format!("wrote {} on a partial line", hex(&bytes)));
+    }
+    let got = exchange_within(&mut stream, &row.second, row.reply_within, REPLY_IDLE).await?;
+    if got != row.expect {
+        return Err(format!(
+            "completed line: got {} expected {}",
+            hex(&got),
+            hex(&row.expect)
+        ));
+    }
+    // The wait was not logged as a message, and the connection is open.
+    let log = l4_log(&control, service).await?;
+    let conn_id = conn_id_of(&log, local)?;
+    if let Some(close) = close_of(&log, &conn_id)? {
+        return Err(format!("closed before we hung up: {close}"));
+    }
+    let ins: Vec<&Value> = array(&log, "messages")?
+        .iter()
+        .filter(|m| m["conn_id"] == conn_id && m["dir"] == "in")
+        .collect();
+    if ins.len() != 1 {
+        return Err(format!(
+            "{} `in` messages for the one completed line: {ins:?}",
+            ins.len()
+        ));
+    }
+    // A waiting connection is still torn down when the peer hangs up.
+    drop(stream);
+    let deadline = Instant::now() + CLOSE_WITHIN;
+    loop {
+        let log = l4_log(&control, service).await?;
+        if let Some(close) = close_of(&log, &conn_id)? {
+            if close["reason"] != "eof" {
+                return Err(format!(
+                    "close reason after our hang-up: {}",
+                    close["reason"]
+                ));
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("no closes entry within 1 s of our hang-up".to_string());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A partial line (no CRLF yet, or a damaged terminator) keeps the
+/// connection open and silent past the 200 ms idle; when the CRLF arrives
+/// the command completes on the same connection; a peer hang-up still
+/// closes it `eof` (T10 PR C).
+#[tokio::test]
+async fn partial_line_waits_then_completes_the_command() {
+    run_rows(SeedMode::Patched, partial_rows(), partial_flow).await;
+    run_rows(SeedMode::Vulnerable, partial_rows(), partial_flow).await;
+}
+
+/// A high-bit byte in an argument: the normal reply, connection kept.
+fn high_bit_rows() -> Vec<Labelled<Row>> {
+    vec![
+        Labelled {
+            service: "l4-smtp",
+            label: "EHLO x\\xff",
+            row: Row {
+                banner: Some(SMTP_BANNER),
+                send: b"EHLO x\xff\r\n".to_vec(),
+                expect: b"250 target.test\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-ftp",
+            label: "USER a\\xff",
+            row: Row {
+                banner: Some(FTP_BANNER),
+                send: b"USER a\xff\r\n".to_vec(),
+                expect: b"331 password required\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-memcached",
+            label: "get k\\xff",
+            row: Row {
+                banner: None,
+                send: b"get k\xff\r\n".to_vec(),
+                expect: b"END\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "ECHO \\xff",
+            row: Row {
+                banner: None,
+                send: b"ECHO \xff\r\n".to_vec(),
+                expect: b"$1\r\n\xff\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
+        },
+    ]
+}
+
+async fn high_bit_flow(
+    _service: &'static str,
+    row: Row,
+    addr: SocketAddr,
+    _control: String,
+) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    stream
+        .write_all(&row.send)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut stream, row.read_idle).await;
+    if bytes != row.expect {
+        return Err(format!(
+            "reply: got {} expected {}",
+            hex(&bytes),
+            hex(&row.expect)
+        ));
+    }
+    if closed {
+        return Err("speaker closed after a well-formed command".to_string());
+    }
+    Ok(())
+}
+
+/// A high-bit byte in a command's argument never breaks verb matching:
+/// the row's normal reply comes back and the connection stays open, in
+/// both modes (T10 PR C; T6's `BitFlip(command.arg)`).
+#[tokio::test]
+async fn high_bit_argument_gets_the_normal_reply() {
+    run_rows(SeedMode::Patched, high_bit_rows(), high_bit_flow).await;
+    run_rows(SeedMode::Vulnerable, high_bit_rows(), high_bit_flow).await;
+}
+
+// --- Tester additions (stage 5): the idle timer re-arms; the crash window still wins ---
+
+/// Spec D5: RESP bulk / inline cap and memcached data cap (1 MiB).
+const RESP_MAX_BULK: usize = 1_048_576;
+const MC_MAX_DATA: usize = 1_048_576;
+/// Gap between dribbled bytes: past the speaker's 200 ms idle, so every
+/// byte lands on a connection that has already returned `Wait` at least once.
+const DRIBBLE_GAP: Duration = Duration::from_millis(300);
+/// A waiting connection must be past its first idle before the trigger.
+const WAIT_SETTLE: Duration = Duration::from_millis(400);
+
+/// A line delivered one byte at a time, each after more than the idle.
+struct Dribble {
+    banner: Option<&'static [u8]>,
+    line: Vec<u8>,
+    expect: Vec<u8>,
+}
+
+fn dribble_rows() -> Vec<Labelled<Dribble>> {
+    vec![
+        Labelled {
+            service: "l4-smtp",
+            label: "NOOP byte by byte",
+            row: Dribble {
+                banner: Some(SMTP_BANNER),
+                line: b"NOOP\r\n".to_vec(),
+                expect: b"250 OK\r\n".to_vec(),
+            },
+        },
+        Labelled {
+            service: "l4-ftp",
+            label: "NOOP byte by byte",
+            row: Dribble {
+                banner: Some(FTP_BANNER),
+                line: b"NOOP\r\n".to_vec(),
+                expect: b"200 ok\r\n".to_vec(),
+            },
+        },
+        Labelled {
+            service: "l4-memcached",
+            label: "version byte by byte",
+            row: Dribble {
+                banner: None,
+                line: b"version\r\n".to_vec(),
+                expect: b"VERSION 1.6.0-aitm\r\n".to_vec(),
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "inline PING byte by byte",
+            row: Dribble {
+                banner: None,
+                line: b"PING\r\n".to_vec(),
+                expect: b"+PONG\r\n".to_vec(),
+            },
+        },
+    ]
+}
+
+async fn dribble_flow(
+    service: &'static str,
+    row: Dribble,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
+    let mut stream = tcp_open(addr, row.banner).await?;
+    let local = stream
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    let (last, head) = row
+        .line
+        .split_last()
+        .ok_or_else(|| "empty line".to_string())?;
+    for (i, byte) in head.iter().enumerate() {
+        stream
+            .write_all(&[*byte])
+            .await
+            .map_err(|e| format!("write byte {}: {e}", i + 1))?;
+        // Every gap is longer than the idle: the speaker must return `Wait`
+        // each time, writing nothing and keeping the connection.
+        let (bytes, closed) = read_until_idle(&mut stream, DRIBBLE_GAP).await;
+        if closed {
+            return Err(format!(
+                "closed after byte {} of {} (wrote {})",
+                i + 1,
+                row.line.len(),
+                hex(&bytes)
+            ));
+        }
+        if !bytes.is_empty() {
+            return Err(format!("wrote {} after byte {}", hex(&bytes), i + 1));
+        }
+    }
+    let got = exchange(&mut stream, &[*last], REPLY_IDLE).await?;
+    if got != row.expect {
+        return Err(format!(
+            "completed line: got {} expected {}",
+            hex(&got),
+            hex(&row.expect)
+        ));
+    }
+    let log = l4_log(&control, service).await?;
+    let conn_id = conn_id_of(&log, local)?;
+    if let Some(close) = close_of(&log, &conn_id)? {
+        return Err(format!("closed before we hung up: {close}"));
+    }
+    // None of the waits was logged: one `in` message, the whole line.
+    let ins: Vec<&Value> = array(&log, "messages")?
+        .iter()
+        .filter(|m| m["conn_id"] == conn_id && m["dir"] == "in")
+        .collect();
+    if ins.len() != 1 {
+        return Err(format!(
+            "{} `in` messages for one dribbled line: {ins:?}",
+            ins.len()
+        ));
+    }
+    if ins[0]["sha256"] != sha256_hex(&row.line) {
+        return Err(format!(
+            "`in` sha256 {} != sha256(line) {}",
+            ins[0]["sha256"],
+            sha256_hex(&row.line)
+        ));
+    }
+    Ok(())
+}
+
+/// The idle timer re-arms on every byte: a line dribbled one byte per
+/// 300 ms (each gap past the 200 ms idle) is answered only when its LF
+/// arrives, nothing is written or logged meanwhile, and the whole line is
+/// the one `in` message, in both modes (spec D5 `Step::Wait`).
+#[tokio::test]
+async fn dribbled_line_re_arms_the_idle_timer() {
+    run_rows(SeedMode::Patched, dribble_rows(), dribble_flow).await;
+    run_rows(SeedMode::Vulnerable, dribble_rows(), dribble_flow).await;
+}
+
+/// A connection parked in `Wait` while another connection fires the V
+/// trigger.
+struct WaitingThenCrash {
+    banner: Option<&'static [u8]>,
+    partial: Vec<u8>,
+    trigger: Vec<u8>,
+}
+
+fn waiting_then_crash_rows() -> Vec<Labelled<WaitingThenCrash>> {
+    vec![
+        Labelled {
+            service: "l4-smtp",
+            label: "NOO waiting, long line on another connection",
+            row: WaitingThenCrash {
+                banner: Some(SMTP_BANNER),
+                partial: b"NOO".to_vec(),
+                trigger: long_line(),
+            },
+        },
+        Labelled {
+            service: "l4-ftp",
+            label: "USER a waiting, long line on another connection",
+            row: WaitingThenCrash {
+                banner: Some(FTP_BANNER),
+                partial: b"USER a".to_vec(),
+                trigger: long_line(),
+            },
+        },
+        Labelled {
+            service: "l4-memcached",
+            label: "set waiting for its data, long line on another connection",
+            row: WaitingThenCrash {
+                banner: None,
+                partial: b"set k 0 0 2\r\nh".to_vec(),
+                trigger: long_line(),
+            },
+        },
+        Labelled {
+            service: "l4-resp",
+            label: "inline PIN waiting, $2000000 on another connection",
+            row: WaitingThenCrash {
+                banner: None,
+                partial: b"PIN".to_vec(),
+                trigger: b"*1\r\n$2000000\r\n".to_vec(),
+            },
+        },
+    ]
+}
+
+async fn waiting_then_crash_flow(
+    service: &'static str,
+    row: WaitingThenCrash,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
+    let mut waiting = tcp_open(addr, row.banner).await?;
+    let waiting_local = waiting
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    waiting
+        .write_all(&row.partial)
+        .await
+        .map_err(|e| format!("write partial: {e}"))?;
+    // Past the idle: the speaker has returned `Wait`, silent and open.
+    let (bytes, closed) = read_until_idle(&mut waiting, WAIT_SETTLE).await;
+    if closed {
+        return Err(format!(
+            "closed on the partial line (wrote {})",
+            hex(&bytes)
+        ));
+    }
+    if !bytes.is_empty() {
+        return Err(format!("wrote {} on the partial line", hex(&bytes)));
+    }
+
+    // The trigger on a second connection: closes with no bytes.
+    let mut trigger = tcp_open(addr, row.banner).await?;
+    let trigger_local = trigger
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    trigger
+        .write_all(&row.trigger)
+        .await
+        .map_err(|e| format!("write trigger: {e}"))?;
+    let (bytes, closed) = read_until_idle(&mut trigger, CLOSE_WITHIN).await;
+    if !closed {
+        return Err("trigger connection still open after 1 s".to_string());
+    }
+    if !bytes.is_empty() {
+        return Err(format!(
+            "V wrote {} before closing the trigger",
+            hex(&bytes)
+        ));
+    }
+
+    // The crash window tears the waiting connection down too: EOF, no
+    // bytes, within 500 ms of the trigger; the listener refuses.
+    let (bytes, closed) = read_until_idle(&mut waiting, DOWN_WITHIN).await;
+    if !closed {
+        return Err("waiting connection still open 500 ms after the crash".to_string());
+    }
+    if !bytes.is_empty() {
+        return Err(format!("V wrote {} to the waiting connection", hex(&bytes)));
+    }
+    if !connect_refused(addr).await {
+        return Err("listener still accepting after the crash".to_string());
+    }
+
+    let log = l4_log(&control, service).await?;
+    let waiting_id = conn_id_of(&log, waiting_local)?;
+    let trigger_id = conn_id_of(&log, trigger_local)?;
+    for (what, id) in [("waiting", &waiting_id), ("trigger", &trigger_id)] {
+        let close =
+            close_of(&log, id)?.ok_or_else(|| format!("no closes entry for {what} {id}"))?;
+        if close["reason"] != "trigger" {
+            return Err(format!("{what} close reason: {}", close["reason"]));
+        }
+    }
+    // The wait itself was never a logged message.
+    let waiting_ins = array(&log, "messages")?
+        .iter()
+        .filter(|m| m["conn_id"] == waiting_id && m["dir"] == "in")
+        .count();
+    if waiting_ins != 0 {
+        return Err(format!(
+            "{waiting_ins} `in` messages logged for the waiting connection"
+        ));
+    }
+    let downtime = array(&log, "downtime")?;
+    if downtime.len() != 1 {
+        return Err(format!(
+            "downtime has {} entries: {downtime:?}",
+            downtime.len()
+        ));
+    }
+    if downtime[0]["conn_id"] != trigger_id {
+        return Err(format!(
+            "downtime.conn_id {} is not the trigger connection {trigger_id}",
+            downtime[0]["conn_id"]
+        ));
+    }
+    Ok(())
+}
+
+/// `Wait` never outlives the crash window: a connection parked on a partial
+/// line is torn down with no bytes (close reason `trigger`, never logged
+/// as a message) when another connection fires the Vulnerable trigger, and
+/// the listener is refusing by then (spec D5 `Step::Wait`: "the driver ...
+/// still ends the connection ... on the crash window").
+#[tokio::test]
+async fn crash_window_tears_down_a_waiting_connection() {
+    run_rows(
+        SeedMode::Vulnerable,
+        waiting_then_crash_rows(),
+        waiting_then_crash_flow,
+    )
+    .await;
 }
