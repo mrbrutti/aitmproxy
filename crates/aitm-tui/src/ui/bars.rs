@@ -503,7 +503,7 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         // The Profiles editor's prompts (scanner v2 spec D4, D11).
         PromptKind::ScanOrigin => ("origin:", "scheme://host[:port] · ⏎ add"),
         PromptKind::ScanField => ("value:", "⏎ set · Esc"),
-        PromptKind::ScanProfileName => ("profile name:", "⏎ save as (scan.profile.save)"),
+        PromptKind::ScanProfileName => ("profile name:", "a-z 0-9 . _ - lowercase · ⏎ save as"),
         PromptKind::ScanL4Target => ("l4 target:", "ip:port[/tcp|udp][ grammar] · ⏎ add"),
     };
     let text = match (kind, &app.confirm) {

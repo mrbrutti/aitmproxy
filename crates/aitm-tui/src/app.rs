@@ -33,10 +33,10 @@ use crate::open::{self, OpenTarget};
 use crate::scan::{
     fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
     parse_result, scan_host, state_text, status_token, step, tag_keyed, tag_parts, typed_origin,
-    Dir, FieldKind, IssueFilterKey, IssuePane, JobPane, MapSource, PendingLaunch, ProfileEditor,
-    ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
-    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
-    SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
+    usable_selector, Dir, EditorField, FieldKind, IssueFilterKey, IssuePane, JobPane, MapSource,
+    PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
+    ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
+    OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
 use crate::text::truncate;
 use crate::theme::Theme;
@@ -4591,9 +4591,11 @@ impl App {
     }
 
     /// `scan.session.preview {target: first origin}` under
-    /// `scan.session.preview:<origin>` when the draft's session is observed,
-    /// it has an origin and no preview for it is held (D6). Quiet when the
-    /// bus lacks the verb: the session line is a display.
+    /// `scan.session.preview:<origin>` when the draft's session is observed
+    /// and it has an origin (D6). A held preview never suppresses the read
+    /// (D11 as amended; fix round G, G50): re-opening a profile re-reads
+    /// the session, and only the in-flight dedupe holds a duplicate. Quiet
+    /// when the bus lacks the verb: the session line is a display.
     fn request_session_preview(&mut self, out: &mut Vec<BusRequest>) {
         let Some(editor) = self.scan.profiles.editor.as_ref() else {
             return;
@@ -4604,9 +4606,6 @@ impl App {
         let Some(origin) = editor.draft.target.origins.first().cloned() else {
             return;
         };
-        if self.scan.profiles.previews.contains_key(&origin) {
-            return;
-        }
         self.scan_poll(
             tag_keyed("scan.session.preview", &origin),
             "scan.session.preview",
@@ -5055,21 +5054,23 @@ impl App {
         self.send_profile_save(out);
     }
 
-    /// The `ScanProfileName` prompt's line: a non-empty name that is not a
-    /// builtin's replaces `draft.name`, then the draft is saved.
+    /// The `ScanProfileName` prompt's line: the trimmed name, when it is
+    /// not a builtin's and follows the engine's rule (`set_text`, which
+    /// refuses with `PROFILE_NAME_RULE`; fix round G, G42, G49), replaces
+    /// `draft.name`, then the draft is saved.
     fn submit_scan_profile_name(
         &mut self,
         text: &str,
         out: &mut Vec<BusRequest>,
     ) -> Result<(), String> {
-        if is_builtin_name(text) {
-            return Err(format!("{text} is a builtin profile; pick another name"));
+        let name = text.trim();
+        if is_builtin_name(name) {
+            return Err(format!("{name} is a builtin profile; pick another name"));
         }
         let Some(editor) = self.scan.profiles.editor.as_mut() else {
             return Err(NO_EDITOR.to_string());
         };
-        editor.draft.name = text.to_string();
-        editor.dirty = true;
+        editor.set_text(EditorField::Name, name)?;
         self.send_profile_save(out);
         Ok(())
     }
@@ -5139,7 +5140,7 @@ impl App {
         }
         self.confirm = Some(ConfirmCall {
             name: "scan.profile.delete".to_string(),
-            description: format!("delete profile {name}? y/N"),
+            description: format!("delete profile {}? y/N", truncate(&name, SAVED_NAME_MAX)),
             args: json!({ "name": name }),
             return_to: Mode::Scan,
         });
@@ -5424,14 +5425,27 @@ impl App {
                 }
             }
             "scan.profile.save" => {
+                // `saved` is adopted as `loaded_from` only when it is a
+                // usable selector naming the draft (fix round G, G46); any
+                // other reply is recorded, not adopted.
                 if let Some(saved) = self.scan_reply::<ProfileSaveResult>(tag, &value) {
-                    let name = truncate(&saved.saved, SAVED_NAME_MAX);
-                    let path = truncate(&saved.path, SAVED_PATH_MAX);
-                    self.toast(Level::Info, format!("saved {name} at {path}"));
-                    if let Some(editor) = self.scan.profiles.editor.as_mut() {
-                        editor.dirty = false;
-                        editor.builtin = false;
-                        editor.loaded_from = Some(saved.saved);
+                    let names_draft = self
+                        .scan
+                        .profiles
+                        .editor
+                        .as_ref()
+                        .is_some_and(|e| e.draft.name == saved.saved);
+                    if usable_selector(&saved.saved) && names_draft {
+                        let name = truncate(&saved.saved, SAVED_NAME_MAX);
+                        let path = truncate(&saved.path, SAVED_PATH_MAX);
+                        self.toast(Level::Info, format!("saved {name} at {path}"));
+                        if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                            editor.dirty = false;
+                            editor.builtin = false;
+                            editor.loaded_from = Some(saved.saved);
+                        }
+                    } else {
+                        self.scan.set_error(ScanError::uncoded(tag, OTHER_SAVED));
                     }
                     self.request_profile_list(out);
                 }

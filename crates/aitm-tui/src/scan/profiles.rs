@@ -72,6 +72,32 @@ pub const OTHER_ORIGIN: &str = "reply named a different origin";
 /// What a bad `t` line is refused with (plan task 10).
 pub const L4_TARGET_ERROR: &str = "L4 target must be ip:port[/tcp|udp][ grammar]";
 
+/// What a typed profile name outside [`valid_profile_name`]'s rule is
+/// refused with (fix round G, G49; D11 as amended): the `w` prompt and the
+/// name field's prompt both stay open with it.
+pub const PROFILE_NAME_RULE: &str = "profile name: a-z 0-9 . _ - only, lowercase, up to 64";
+
+/// The detail of the uncoded error a `scan.profile.save` reply gets when
+/// its `saved` is not the draft's name (fix round G, G46): `loaded_from`
+/// is not adopted from it.
+pub const OTHER_SAVED: &str = "save reply named a different profile";
+
+/// The engine's rule for a saved profile name (T1b, relayed 2026-11-01):
+/// `^[a-z0-9][a-z0-9._-]{0,63}$`, lowercase only, 1 to 64 bytes. The TUI
+/// refuses before calling and never lowercases on the operator's behalf
+/// (`Standard` is refused, not saved as `standard`); builtin names are the
+/// reducer's separate refusal.
+pub fn valid_profile_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    let lower_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    s.len() <= 64
+        && lower_alnum(first)
+        && bytes.all(|b| lower_alnum(b) || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Which pane of the Profiles tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProfilePane {
@@ -792,15 +818,19 @@ impl ProfileEditor {
     }
 
     /// Write `text` into a text or number field: the name as typed
-    /// (trimmed), a number parsed as the field's width; a number field
-    /// given anything else is refused with `<label> must be a number`, and
-    /// a field that is not text at all with `<label> is not a text field`.
-    /// A write marks the draft dirty.
+    /// (trimmed, and only under [`valid_profile_name`]'s rule, else
+    /// [`PROFILE_NAME_RULE`]; fix round G, G49), a number parsed as the
+    /// field's width; a number field given anything else is refused with
+    /// `<label> must be a number`, and a field that is not text at all
+    /// with `<label> is not a text field`. A write marks the draft dirty.
     pub fn set_text(&mut self, field: EditorField, text: &str) -> Result<(), String> {
         let text = text.trim();
         let number = || format!("{} must be a number", field.label());
         let d = &mut self.draft;
         match field {
+            EditorField::Name if !valid_profile_name(text) => {
+                return Err(PROFILE_NAME_RULE.to_string())
+            }
             EditorField::Name => d.name = text.to_string(),
             EditorField::MaxDepth => d.crawl.max_depth = text.parse().map_err(|_| number())?,
             EditorField::MaxPages => d.crawl.max_pages = text.parse().map_err(|_| number())?,
@@ -1147,9 +1177,10 @@ pub fn lanes_text(lanes: &[LaneKind]) -> String {
 }
 
 /// Whether a wire string may be used as a selector or a name the TUI sends
-/// back verbatim: non-empty and at most [`SELECTOR_MAX`] bytes.
-fn usable_selector(s: &str) -> bool {
-    !s.is_empty() && s.len() <= SELECTOR_MAX
+/// back verbatim: non-empty, at most [`SELECTOR_MAX`] bytes and without a
+/// control character (fix round G, G47).
+pub(crate) fn usable_selector(s: &str) -> bool {
+    !s.is_empty() && s.len() <= SELECTOR_MAX && !s.chars().any(char::is_control)
 }
 
 /// [`truncate`] to [`VALUE_MAX`], skipping the walk when the string is
@@ -1268,8 +1299,9 @@ impl ProfilesState {
 
     /// Fold a `scan.session.preview` reply for `origin` (the tag's key).
     /// Names only are kept, each cut at any `=` and bounded, at most
-    /// [`SESSION_NAMES_MAX`] of each kind; the map is emptied before it
-    /// would grow past [`PREVIEWS_MAX`] origins.
+    /// [`SESSION_NAMES_MAX`] of each kind; the canary path is cut at the
+    /// first `?` or `#`; the map is emptied before it would grow past
+    /// [`PREVIEWS_MAX`] origins.
     pub fn fold_preview(&mut self, origin: &str, mut preview: SessionProfile) {
         preview.cookies.truncate(SESSION_NAMES_MAX);
         preview.headers.truncate(SESSION_NAMES_MAX);
@@ -1278,6 +1310,11 @@ impl ProfilesState {
         }
         cut(&mut preview.origin);
         if let Canary::Flow { path, .. } = &mut preview.canary {
+            // The path alone: a query or fragment a core puts there would
+            // show on the session line (fix round G, G48).
+            if let Some(end) = path.find(['?', '#']) {
+                path.truncate(end);
+            }
             cut(path);
         }
         if self.previews.len() >= PREVIEWS_MAX && !self.previews.contains_key(origin) {
@@ -1592,6 +1629,29 @@ mod tests {
         assert_eq!(e.highlighted_origin(), Some("https://b.test"));
         e.refresh_origins(&[], &[]);
         assert_eq!(e.origin_cursor, 0, "a vanished origin clamps");
+    }
+
+    /// Fix round G, G49: the engine's name rule, byte for byte.
+    #[test]
+    fn valid_profile_name_mirrors_the_engine_rule() {
+        for ok in ["a", "team-x.v2", "my_api", "0day", &"n".repeat(64)] {
+            assert!(valid_profile_name(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "../../x",
+            "/abs",
+            ".hidden",
+            "-dash",
+            "_u",
+            "Standard",
+            "a b",
+            "a/b",
+            "é",
+            &"n".repeat(65),
+        ] {
+            assert!(!valid_profile_name(bad), "{bad:?}");
+        }
     }
 
     /// Fix round G, G35: every field `kind()` says cycles or toggles does,

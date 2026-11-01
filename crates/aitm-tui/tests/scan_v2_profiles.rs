@@ -762,7 +762,11 @@ fn save_on_a_builtin_asks_for_a_name_then_saves() {
     );
     assert_eq!(app.mode, Mode::Scan);
 
-    let save = fixture("scan.profile.save.json");
+    // The reply names the draft (fix round G, G46: one naming another
+    // profile is not adopted), at the fixture's path shape.
+    let mut save = fixture("scan.profile.save.json");
+    save["saved"] = json!("team-x");
+    save["path"] = json!("/Users/operator/.aitmproxy/findings/scan/profiles/team-x.yaml");
     let (saved, path) = (
         save["saved"].as_str().expect("saved"),
         save["path"].as_str().expect("path"),
@@ -802,6 +806,210 @@ fn save_on_a_builtin_asks_for_a_name_then_saves() {
     assert_eq!(args["profile"]["name"], json!("team-x"));
     assert_eq!(args["profile"]["crawl"]["max_depth"], json!(31));
     assert_eq!(app.mode, Mode::Scan, "no name prompt for a saved profile");
+}
+
+/// Fix round G, G49 and G42: a typed profile name must match the engine's
+/// rule `^[a-z0-9][a-z0-9._-]{0,63}$` (lowercase only, builtins refused,
+/// never lowercased on the operator's behalf); a refusal keeps the prompt
+/// open with the one toast, and the accepted name is trimmed like any
+/// field text.
+#[test]
+fn a_typed_profile_name_follows_the_engine_rule() {
+    const RULE: &str = "profile name: a-z 0-9 . _ - only, lowercase, up to 64";
+    let mut app = app();
+    open_standard(&mut app);
+    assert!(app.update(Action::ScanSave).is_empty());
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanProfileName));
+    let too_long = "n".repeat(65);
+    for bad in [
+        "../../x",
+        "/abs",
+        ".hidden",
+        "Standard",
+        too_long.as_str(),
+        "a b",
+    ] {
+        type_text(&mut app, bad);
+        assert!(app.update(Action::Submit).is_empty(), "{bad:?}");
+        assert_eq!(
+            app.mode,
+            Mode::Prompt(PromptKind::ScanProfileName),
+            "{bad:?} keeps the prompt open"
+        );
+        assert_eq!(toast(&app), RULE, "{bad:?}");
+        assert!(app.prompt.is_empty(), "{bad:?}: the line is cleared");
+    }
+    // A padded builtin name is still the builtin's (G42: trimmed first).
+    type_text(&mut app, "  thorough  ");
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanProfileName));
+    assert!(
+        toast(&app).contains("thorough is a builtin"),
+        "{}",
+        toast(&app)
+    );
+
+    type_text(&mut app, "  team-x.v2  ");
+    let reqs = app.update(Action::Submit);
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    let BusRequest::CallTagged { args, .. } = &reqs[0] else {
+        panic!("not a tagged call: {reqs:?}");
+    };
+    assert_eq!(args["profile"]["name"], json!("team-x.v2"), "trimmed");
+    assert_eq!(app.mode, Mode::Scan);
+    let text = text_of(&app, 200, 50);
+    assert!(!text.contains(RULE), "{text}");
+
+    // The same rule on the `e` prompt of the name field.
+    focus_field(&mut app, EditorField::Name);
+    let _ = app.update(Action::ScanEdit);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanField));
+    assert_eq!(app.prompt, "team-x.v2", "prefilled");
+    app.prompt.clear();
+    type_text(&mut app, "Bad Name");
+    assert!(app.update(Action::Submit).is_empty());
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanField));
+    assert_eq!(toast(&app), RULE);
+}
+
+/// Fix round G, G49: the `profile name:` prompt label spells the rule.
+#[test]
+fn the_profile_name_prompt_label_spells_the_rule() {
+    let mut app = app();
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanSave);
+    let text = text_of(&app, 200, 50);
+    let line = line_with(&text, "profile name:").unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        line.contains("a-z 0-9 . _ - lowercase · ⏎ save as"),
+        "{line:?}"
+    );
+}
+
+/// Fix round G, G46: a `scan.profile.save` reply naming another profile
+/// is not adopted as `loaded_from`; the uncoded error is recorded.
+#[test]
+fn a_save_reply_naming_another_profile_is_not_adopted() {
+    let mut app = app();
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanSave);
+    type_text(&mut app, "team-x");
+    let _ = app.update(Action::Submit);
+    let _ = app.on_bus(reply(
+        "scan.profile.save",
+        "scan.profile.save",
+        json!({ "saved": "other", "path": "/p/other.yaml" }),
+    ));
+    let editor = app.scan.profiles.editor.as_ref().expect("editor");
+    assert_eq!(editor.loaded_from.as_deref(), Some("standard"), "unchanged");
+    assert!(editor.dirty, "not marked saved");
+    let err = app.scan.profiles.error.as_ref().expect("recorded");
+    assert_eq!(err.tag, "scan.profile.save");
+    assert_eq!(err.detail, "save reply named a different profile");
+    assert_ne!(toast(&app), "saved other at /p/other.yaml");
+
+    let _ = app.on_bus(reply(
+        "scan.profile.save",
+        "scan.profile.save",
+        json!({ "saved": "team-x", "path": "/p/team-x.yaml" }),
+    ));
+    let editor = app.scan.profiles.editor.as_ref().expect("editor");
+    assert_eq!(editor.loaded_from.as_deref(), Some("team-x"));
+    assert!(!editor.dirty);
+    assert_eq!(
+        app.scan.profiles.error, None,
+        "the same-tag success clears it"
+    );
+}
+
+/// Fix round G, G47: a control character makes a name or a check selector
+/// unusable; the row or check is dropped at fold.
+#[test]
+fn control_characters_make_a_selector_unusable() {
+    let mut app = app();
+    let mut list = fixture("scan.profile.list.json");
+    list["profiles"][0]["name"] = json!("a\x1b[2Jb");
+    list["profiles"][1]["name"] = json!("tab\tbed");
+    let _ = app.on_bus(reply("scan.profile.list", "scan.profile.list", list));
+    let names: Vec<&str> = app
+        .scan
+        .profiles
+        .list
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names.len(), 5, "{names:?}");
+    assert!(names.iter().all(|n| !n.chars().any(char::is_control)));
+    let mut checks = fixture("scan.checks.json");
+    checks["checks"][0]["id"] = json!("http.x\u{7}");
+    let _ = app.on_bus(reply("scan.checks", "scan.checks", checks));
+    assert_eq!(app.scan.profiles.checks.len(), 2);
+}
+
+/// Fix round G, G48: a canary path is cut at the first `?` or `#` at fold,
+/// so a query string from a hostile core never reaches the session line.
+#[test]
+fn the_canary_path_is_cut_at_the_query() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["127.0.0.1".into()]));
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    type_text(&mut app, ORIGIN);
+    let _ = app.update(Action::Submit);
+    let mut preview = fixture("scan.session.preview.json");
+    preview["canary"]["path"] = json!("/account?token=abc#frag");
+    let _ = app.on_bus(reply(
+        &format!("scan.session.preview:{ORIGIN}"),
+        "scan.session.preview",
+        preview,
+    ));
+    let editor = app.scan.profiles.editor.as_ref().expect("editor");
+    let line = session_line(editor, &app.scan.profiles.previews);
+    assert_eq!(line, SESSION_LINE);
+    assert!(!line.contains("token"), "{line:?}");
+}
+
+/// Fix round G, G50 (D11 as amended): re-opening a profile re-reads its
+/// session preview; the cache never suppresses the read, only the
+/// in-flight dedupe does.
+#[test]
+fn reopening_a_profile_rereads_the_session_preview() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["127.0.0.1".into()]));
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    type_text(&mut app, ORIGIN);
+    let reqs = app.update(Action::Submit);
+    assert_eq!(reqs.len(), 1, "the first preview read: {reqs:?}");
+    let _ = app.on_bus(reply(
+        &format!("scan.session.preview:{ORIGIN}"),
+        "scan.session.preview",
+        fixture("scan.session.preview.json"),
+    ));
+    assert!(app.scan.profiles.previews.contains_key(ORIGIN));
+
+    let _ = app.update(Action::Back);
+    assert_eq!(app.scan.profiles.pane, ProfilePane::List);
+    let _ = app.update(Action::Enter);
+    let mut get = fixture("scan.profile.get.json");
+    get["target"]["origins"] = json!([ORIGIN]);
+    let reqs = app.on_bus(reply("scan.profile.get:standard", "scan.profile.get", get));
+    assert_eq!(
+        reqs,
+        vec![tagged(
+            &format!("scan.session.preview:{ORIGIN}"),
+            "scan.session.preview",
+            json!({ "target": ORIGIN })
+        )],
+        "a second preview read leaves despite the cached one"
+    );
+    // While it is in flight the dedupe holds a third.
+    let _ = app.update(Action::Back);
+    let _ = app.update(Action::Enter);
+    let mut get = fixture("scan.profile.get.json");
+    get["target"]["origins"] = json!([ORIGIN]);
+    let reqs = app.on_bus(reply("scan.profile.get:standard", "scan.profile.get", get));
+    assert!(reqs.is_empty(), "deduped while in flight: {reqs:?}");
 }
 
 /// D11: `D` on a non-builtin row asks `delete profile <name>? y/N` through
