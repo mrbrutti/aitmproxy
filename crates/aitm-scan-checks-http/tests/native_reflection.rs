@@ -26,6 +26,9 @@ use support::{html, json, point, redirect, response, ScriptedHost, TARGET_URL};
 const MARKER: &str = "abcd";
 /// The first context probe `xss-reflected` sends for that marker.
 const FIRST_XSS_PROBE: &str = "<aitmabcd>x</aitmabcd>";
+/// The JavaScript-string probe `xss-reflected` sends third. It carries no
+/// angle bracket, so a verbatim echo of it is evidence only inside a script.
+const JS_XSS_PROBE: &str = "';aitmabcd//";
 /// The absolute canary form `open-redirect` sends first.
 const CANARY: &str = "https://aitm-redirect.invalid/";
 
@@ -122,6 +125,92 @@ async fn xss_reflected_is_clean_on_a_json_content_type() {
         "verbatim reflection into JSON is not an HTML execution context"
     );
     assert_eq!(verdict.poc_hint, None);
+}
+
+/// The JavaScript-string probe has no angle bracket in it, so its bytes
+/// coming back verbatim prove nothing on their own: `';aitmabcd//` in a
+/// paragraph is text. It is a finding only when the echo sits inside a
+/// `<script>` element, where a closed quote and a comment reach the
+/// interpreter (final quality review FQ-1).
+#[tokio::test]
+async fn xss_reflected_is_clean_when_the_js_probe_is_echoed_outside_a_script() {
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .with_fallback(html(200, "<p>you searched for ';aitmabcd//</p>"));
+    let point = point(InsertionKind::Query, "q", TARGET_URL);
+
+    let verdict = aitm_scan_checks_http::xss::check().run(&point, &host).await;
+
+    assert_eq!(
+        verdict.outcome,
+        Outcome::Clean,
+        "a verbatim JS-string probe outside any script element is not a finding: {}",
+        verdict.detail
+    );
+    assert_eq!(verdict.poc_hint, None);
+    assert_eq!(verdict.evidence.payload, None);
+    assert_eq!(host.sent().len(), 3, "all three contexts were tried");
+}
+
+#[tokio::test]
+async fn xss_reflected_is_certain_when_the_js_probe_is_echoed_inside_a_script() {
+    let body = "<html><body><script>var q='';aitmabcd//';</script></body></html>";
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(JS_XSS_PROBE, html(200, body))
+        .with_fallback(html(200, "<p>nothing here</p>"));
+    let point = point(InsertionKind::Query, "q", TARGET_URL);
+
+    let verdict = aitm_scan_checks_http::xss::check().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.confidence, Confidence::Certain);
+    assert_eq!(verdict.evidence.payload, Some(JS_XSS_PROBE.to_string()));
+    assert_eq!(
+        verdict.detail,
+        "the Query point \"q\" reflected an unencoded canary into an HTML 200 response: the \
+         quote, semicolon and comment survived inside a <script> block"
+    );
+    assert_eq!(
+        host.sent(),
+        vec![
+            FIRST_XSS_PROBE.to_string(),
+            "\"><aitmabcd>".to_string(),
+            JS_XSS_PROBE.to_string(),
+        ],
+        "the first two contexts missed and the run stopped on the third"
+    );
+}
+
+/// The detail names the context whose evidence actually came back, so an
+/// operator reading "angle brackets survived" is never reading it about a
+/// probe that had none (FQ-1).
+#[tokio::test]
+async fn xss_reflected_detail_names_the_context_that_hit() {
+    let element = format!("<div>{FIRST_XSS_PROBE}</div>");
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(FIRST_XSS_PROBE, html(200, &element));
+    let point = point(InsertionKind::Query, "q", TARGET_URL);
+    let verdict = aitm_scan_checks_http::xss::check().run(&point, &host).await;
+    assert_eq!(
+        verdict.detail,
+        "the Query point \"q\" reflected an unencoded canary into an HTML 200 response: the \
+         tag survived byte for byte"
+    );
+
+    let attribute = "<input value=\"\"><aitmabcd>\">";
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on("\"><aitmabcd>", html(200, attribute))
+        .with_fallback(html(200, "<p>nothing here</p>"));
+    let verdict = aitm_scan_checks_http::xss::check().run(&point, &host).await;
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "the Query point \"q\" reflected an unencoded canary into an HTML 200 response: the \
+         quote and the tag survived"
+    );
 }
 
 #[tokio::test]
