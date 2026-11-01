@@ -3,9 +3,11 @@
 //! One hand-rolled, tag-aware tokenizer (spec D8.1, client engine "HTML
 //! link/form extractor"); the crate takes no HTML dependency. The scan walks
 //! tag openings and reads attributes only from the elements it cares about, so
-//! `data-href`, prose, HTML comments and the contents of `<script>`/`<style>`
-//! are never harvested — a commented-out anchor is not a link and
-//! `var action = "/api/delete-all"` is not a form.
+//! prose, HTML comments and the contents of `<script>`/`<style>` are never
+//! harvested — a commented-out anchor is not a link and
+//! `var action = "/api/delete-all"` is not a form. The one attribute read off
+//! any element is `data-href`: pages hang navigation off it with a click
+//! handler, and the browser engine already clicks it.
 //!
 //! The pass is linear in the page: the raw-text skip compares bytes in place
 //! instead of lowercasing or copying the rest of the DOM per tag, because this
@@ -31,8 +33,9 @@ pub(crate) struct Extracted {
     /// The first `<base href>` of the page, if it has one.
     pub base: Option<String>,
     /// Navigable references, in document order: `a[href]`, `area[href]`,
-    /// `iframe[src]`, `frame[src]`, the target of a `meta[http-equiv=refresh]`
-    /// and `button[formaction]` (plan call A6: a plain link, not a form).
+    /// `iframe[src]`, `frame[src]`, the target of a `meta[http-equiv=refresh]`,
+    /// `button[formaction]` (plan call A6: a plain link, not a form) and
+    /// `[data-href]` on any element.
     pub links: Vec<String>,
     /// Sub-resources, in document order: `link[href]` and `script[src]`.
     pub resources: Vec<String>,
@@ -231,12 +234,20 @@ pub(crate) fn extract(html: &str) -> Extracted {
             i = raw_text_end(html, &tag, scan_tag(html, j, None));
             continue;
         }
-        if !is_element_of_interest(&tag) {
-            i = scan_tag(html, j, None);
-            continue;
-        }
+        // An element the walk has no other business with is still read for
+        // one attribute, `data-href`, and nothing else: the filtered sink
+        // allocates only when the attribute is actually there, so a page of
+        // `<div class=... id=...>` costs what it always did.
+        let only = (!is_element_of_interest(&tag)).then_some(DATA_HREF);
         let mut attrs: Vec<Attr> = Vec::new();
-        i = scan_tag(html, j, Some(&mut attrs));
+        i = scan_tag(
+            html,
+            j,
+            Some(&mut AttrSink {
+                out: &mut attrs,
+                only,
+            }),
+        );
         i = walk.open(&tag, &attrs, i);
     }
 
@@ -307,6 +318,14 @@ impl<'a> Walk<'a> {
     /// Take an opening tag whose attributes end at `after`, and return the
     /// index the walk continues from.
     fn open(&mut self, tag: &str, attrs: &[Attr], after: usize) -> usize {
+        // `data-href` on *any* element, before the per-tag arms so an element
+        // whose body the walk skips (`<script>`, `<iframe>`) still gives it
+        // up. Pages hang navigation off it with a click handler
+        // (`<span data-href="/x" onclick="location.href=this.dataset.href">`);
+        // the browser engine already clicks `[data-href]`, so the client
+        // engine follows the same reference as a plain GET. It is capped and
+        // entity-decoded like every other link.
+        push_capped(&mut self.out.links, attr(attrs, DATA_HREF));
         match tag {
             "script" => {
                 push_capped(&mut self.out.resources, attr(attrs, "src"));
@@ -555,7 +574,7 @@ fn refresh_target(content: &str) -> Option<String> {
 /// Attribute names are matched whole by the caller, so `data-href` is not
 /// `href`. An unterminated tag consumes the rest of the page rather than
 /// rewinding, which is what keeps the walk finite.
-fn scan_tag(html: &str, from: usize, mut sink: Option<&mut Vec<Attr>>) -> usize {
+fn scan_tag(html: &str, from: usize, mut sink: Option<&mut AttrSink<'_>>) -> usize {
     let bytes = html.as_bytes();
     let mut i = from;
     while i < bytes.len() {
@@ -626,13 +645,32 @@ fn scan_tag(html: &str, from: usize, mut sink: Option<&mut Vec<Attr>>) -> usize 
     bytes.len()
 }
 
-/// Record one attribute in `sink`, if the caller asked for the attributes.
-fn record(sink: &mut Option<&mut Vec<Attr>>, name: &str, value: Option<&str>) {
+/// Where [`scan_tag`] puts the attributes it reads.
+struct AttrSink<'a> {
+    /// The attributes read so far.
+    out: &'a mut Vec<Attr>,
+    /// When set, the one (already lower-case) attribute name to record;
+    /// every other attribute is dropped before it is lower-cased or decoded.
+    only: Option<&'static str>,
+}
+
+/// The attribute the walk reads off an element it otherwise ignores.
+const DATA_HREF: &str = "data-href";
+
+/// Record one attribute in `sink`, if the caller asked for the attributes and
+/// the sink's filter accepts the name.
+fn record(sink: &mut Option<&mut AttrSink<'_>>, name: &str, value: Option<&str>) {
     if name.is_empty() {
         return;
     }
     if let Some(sink) = sink.as_mut() {
-        sink.push(Attr {
+        if sink
+            .only
+            .is_some_and(|only| !name.eq_ignore_ascii_case(only))
+        {
+            return;
+        }
+        sink.out.push(Attr {
             name: name.to_ascii_lowercase(),
             value: value.map(decode_entities),
         });
@@ -739,14 +777,23 @@ mod tests {
     /// entity decode and the whole form shape in one pass.
     #[test]
     fn extract_pins() {
-        let html = r#"<base href="/app/"><a href="/one">1</a><!-- <a href="/hidden">h</a> --><script>var s="<a href='/js'>";</script><form action="/search" method="get"><input name="q"><select name="s"><option value="a">A</option><option value="b">B</option></select><input type="hidden" name="h" value="1"><input type="radio" name="r" value="x" checked><input type="radio" name="r" value="y"><input type="submit"></form><meta http-equiv="refresh" content="0;url=/next"><iframe src="/frame"></iframe><link href="/s.css" rel="stylesheet"><script src="/app.js"></script><button formaction="/alt">b</button><a href="/amp?a=1&amp;b=2">x</a>"#;
+        let html = r#"<base href="/app/"><a href="/one">1</a><!-- <a href="/hidden">h</a> --><script>var s="<a href='/js'>";</script><form action="/search" method="get"><input name="q"><select name="s"><option value="a">A</option><option value="b">B</option></select><input type="hidden" name="h" value="1"><input type="radio" name="r" value="x" checked><input type="radio" name="r" value="y"><input type="submit"></form><meta http-equiv="refresh" content="0;url=/next"><iframe src="/frame"></iframe><link href="/s.css" rel="stylesheet"><script src="/app.js"></script><button formaction="/alt">b</button><a href="/amp?a=1&amp;b=2">x</a><span data-href="/files/readme.txt" onclick="location.href=this.dataset.href">files</span>"#;
 
         let out = extract(html);
 
         assert_eq!(out.base.as_deref(), Some("/app/"));
+        // `data-href` on any element is a plain GET the browser engine would
+        // reach by clicking it, so the client engine follows it too.
         assert_eq!(
             out.links,
-            ["/one", "/next", "/frame", "/alt", "/amp?a=1&b=2"]
+            [
+                "/one",
+                "/next",
+                "/frame",
+                "/alt",
+                "/amp?a=1&b=2",
+                "/files/readme.txt"
+            ]
         );
         assert_eq!(out.resources, ["/s.css", "/app.js"]);
         assert_eq!(out.forms.len(), 1);
@@ -773,6 +820,29 @@ mod tests {
         assert_eq!(form.fields[2].value.as_deref(), Some("1"));
         assert!(form.fields[3].checked);
         assert!(!form.fields[4].checked);
+    }
+
+    /// `data-href` is read off *any* element, decoded like an `href`, shares
+    /// the `links` cap, and is still not harvested from a comment or from the
+    /// body of a raw-text element.
+    #[test]
+    fn data_href_is_a_link_on_any_element() {
+        let out = extract(
+            r#"<span data-href="/a?x=1&amp;y=2">a</span><div DATA-HREF=/b>b</div><!-- <span data-href="/hidden"> --><style><span data-href="/css"></style><tr data-href="  ">blank</tr>"#,
+        );
+        assert_eq!(out.links, ["/a?x=1&y=2", "/b"]);
+
+        // An element that also carries a link of its own gives up both.
+        let out = extract(r#"<a href="/own" data-href="/data">x</a>"#);
+        assert_eq!(out.links, ["/data", "/own"]);
+
+        let mut html = String::new();
+        for i in 0..600 {
+            html.push_str(&format!("<span data-href=\"/p{i}\">x</span>"));
+        }
+        let out = extract(&html);
+        assert_eq!(out.links.len(), MAX_LINKS_PER_PAGE);
+        assert_eq!(out.links[MAX_LINKS_PER_PAGE - 1], "/p511");
     }
 
     /// A hostile page cannot grow the frontier without bound.
