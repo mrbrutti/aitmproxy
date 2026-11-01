@@ -5,4 +5,6 @@
 //! process or touches system state; the two ends link this one module so there
 //! is a single definition of the protocol rather than two that can drift.
 
+pub mod enforce;
+pub mod frame;
 pub mod proto;
