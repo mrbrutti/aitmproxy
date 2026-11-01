@@ -172,6 +172,19 @@ pub enum TriState {
 /// `passive-only ·`; the builder's glyph, flat monochrome).
 pub const BUILTIN_MARK: &str = "·";
 
+/// The mark after the name of the profile the held editor was loaded from
+/// (review log, Task 10: `Esc` keeps the editor; the row shows it). The
+/// buffer-modified convention; the header's `dirty` says whether it has
+/// unsaved changes.
+pub const EDITING_MARK: &str = "*";
+
+/// Whether a scope entry is a wildcard (`*.shop.test`, `*`), which cannot
+/// be an origin (D8): the picker skips it and the Origins pane greys it
+/// with the hint to type one, by this one rule (fix round G, G58).
+pub(crate) fn is_wildcard(entry: &str) -> bool {
+    entry.starts_with('*')
+}
+
 /// The tri-state glyphs of the check tree (spec "Left to the builder",
 /// `◆ ◇ ○` or similar; flat monochrome, D13): a filled diamond for a
 /// selector the profile includes, a hollow one for the engine's default,
@@ -352,7 +365,7 @@ pub fn origin_choices(scope: &[String], flows: &[FlowRow]) -> Vec<OriginChoice> 
         }
     };
     for entry in scope {
-        if entry.is_empty() || entry.starts_with("*.") {
+        if entry.is_empty() || is_wildcard(entry) {
             continue;
         }
         let Ok((host, port)) = authority_parts(entry) else {

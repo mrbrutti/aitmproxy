@@ -1020,7 +1020,9 @@ fn quick_look_shows_the_body_and_help_lists_the_keys() {
     assert!(text.contains("aitm-tui · keys and commands"), "{text}");
     assert!(text.contains("arm / disarm intercept"), "{text}");
     assert!(text.contains(":scope add <host>"), "{text}");
-    assert!(text.contains("Any key closes this help."), "{text}");
+    // The arrow, page and Home/End keys scroll the help (fix round G,
+    // G85); every other key closes it.
+    assert!(text.contains("any other key closes this help."), "{text}");
     assert_eq!(
         keys::map(press(KeyCode::Char('x')), Mode::Help),
         Some(Action::Back)

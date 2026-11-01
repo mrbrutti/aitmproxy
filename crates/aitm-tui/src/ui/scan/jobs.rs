@@ -25,20 +25,14 @@ use crate::scan::{
     severity_runs, JobPane, JobRow, LegacyRun, ScanOffer, BAR_EMPTY, BAR_FILLED, PROBE_BAR_CELLS,
     PROFILE_MAX, SEVERITY_BAR_CELLS, TARGETS_MAX,
 };
+use crate::text::{cells, elide_middle, fit, right, truncate, width};
 use crate::theme::Theme;
 use crate::tokens::color::status;
 use crate::ui::bars::put;
-use crate::ui::scan::{hint, labelled, note, pane_rule, stacked, stacked_share, Panes};
-use crate::ui::selection_bg;
-use crate::ui::text::{cells, elide_middle, fit, right, truncate, width};
-
-/// Blank cells between columns.
-const GAP: usize = 2;
-/// [`GAP`] as the text the header and the rows write between columns.
-const GAP_TEXT: &str = "  ";
-const _: () = assert!(GAP_TEXT.len() == GAP, "GAP_TEXT spells GAP cells");
-/// The Detail pane's footer (D11).
-const FOOTER: &str = "x cancel · ⏎ issues of this job · s start · m map";
+use crate::ui::scan::{
+    blocked_footer, key_text, labelled, launch_reason, note, pane_rule, stacked, stacked_share,
+    Panes, GAP, GAP_TEXT, JOBS_KEYS,
+};
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     match app.scan_offer() {
@@ -161,21 +155,12 @@ fn list(
         return;
     }
     let jobs = &app.scan.jobs;
-    let top = cursor.saturating_sub(body_h - 1);
     let focused = jobs.pane == JobPane::List;
-    for (k, row) in rows.iter().enumerate().skip(top).take(body_h) {
-        let y = area.y + 1 + cells(k - top);
-        let line_area = Rect::new(area.x, y, area.width, 1);
-        if k == cursor && focused {
-            buf.set_style(line_area, selection_bg(theme));
-        }
-        let state = jobs.state_of(&row.id);
-        put(
-            buf,
-            line_area,
-            row_line(theme, cols, row, state, k == cursor),
-        );
-    }
+    let body = Rect::new(area.x, area.y + 1, area.width, cells(body_h));
+    crate::ui::scan::rows(buf, theme, body, rows.len(), cursor, focused, |k| {
+        let row = &rows[k];
+        row_line(theme, cols, row, jobs.state_of(&row.id), k == cursor)
+    });
 }
 
 /// `job  profile  targets  state/phase  probes  points  issues  el.`, the
@@ -304,23 +289,18 @@ fn state_style(theme: &Theme, state: Option<JobState>) -> Style {
 /// with the profile and targets after it only when the table was too
 /// narrow to draw them (`table_full` is false), then the `label value`
 /// lines of `JobsState::detail_text` (the full status's lines, or the
-/// waiting placeholder), scrolled by `detail_scroll`. The footer takes the
-/// last row when there are two or more; while the UI-3 gate holds a reason
-/// (`launch.blocked`, D7) and there are three or more, the reason takes the
-/// row above the footer in the warning hue (D13's refused state), since
-/// `s` is live on this tab too.
+/// waiting placeholder), scrolled by `detail_scroll`, over the shared
+/// [`blocked_footer`]: the key footer, and above it the UI-3 or refused
+/// launch reason ([`launch_reason`]) wrapped in the warning hue, since `s`
+/// is live on this tab too (fix round G, G65).
 fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
     }
     let jobs = &app.scan.jobs;
-    let w = usize::from(area.width).saturating_sub(1);
-    let blocked = app
-        .scan
-        .launch
-        .blocked
-        .as_deref()
-        .filter(|_| area.height >= 3);
+    let w = usize::from(area.width);
+    let reason = launch_reason(app);
+    let body = blocked_footer(theme, area, reason.as_deref(), &key_text(&[JOBS_KEYS]), buf);
     let mut first = vec![Span::styled(
         format!(" {}", row.id),
         theme.text_primary().add_modifier(Modifier::BOLD),
@@ -328,7 +308,7 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
     if !table_full {
         // The two columns the narrow table dropped, cut to what the id
         // leaves of the row (the targets are the long part).
-        let rest = w.saturating_sub(width(&row.id) + 2);
+        let rest = w.saturating_sub(1 + width(&row.id) + 2);
         first.push(Span::styled(
             format!(
                 "  {}",
@@ -345,44 +325,22 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
         }
         // `label value`, one space between (the D11 mockup's shape): no
         // label column, so the line reads as the sentence it is.
-        lines.push(labelled(theme, label, &value, w, None));
+        lines.push(labelled(theme, label, &value, w, width(label)));
     }
-    let has_footer = area.height >= 2;
-    let foot_rows = usize::from(has_footer) + usize::from(blocked.is_some());
-    let body_h = usize::from(area.height) - foot_rows;
+    let body_h = usize::from(body.height);
     let scroll = usize::from(jobs.detail_scroll).min(lines.len().saturating_sub(1));
     for (k, line) in lines.into_iter().skip(scroll).take(body_h).enumerate() {
         put(
             buf,
-            Rect::new(area.x, area.y + cells(k), area.width, 1),
+            Rect::new(body.x, body.y + cells(k), body.width, 1),
             line,
-        );
-    }
-    if let Some(reason) = blocked {
-        // `status.clientError` is the `state.warning` foreground on both
-        // schemes (the Profiles footer draws the same reason with it).
-        put(
-            buf,
-            Rect::new(area.x, area.bottom() - 2, area.width, 1),
-            Line::styled(
-                format!(" {}", truncate(reason, w)),
-                theme.fg(&status::CLIENT_ERROR),
-            ),
-        );
-    }
-    if has_footer {
-        hint(
-            theme,
-            Rect::new(area.x, area.bottom() - 1, area.width, 1),
-            FOOTER,
-            buf,
         );
     }
 }
 
 /// The legacy one-shot as one row: its state and the target it crawled
 /// (D2's legacy launcher); its keys are the status bar's hints, like every
-/// other tab's (D11; the in-pane key line went with Task 14).
+/// other tab's (D11, D12).
 fn legacy(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.height == 0 {
         return;

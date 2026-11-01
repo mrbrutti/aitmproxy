@@ -4,9 +4,10 @@
 //! and the filter keys foot it. The detail half: the read issue's head and
 //! `label value` pairs (`scan::issue_head`, `scan::issue_detail_lines`,
 //! bounded by the model at fold time) around the walkable flow list
-//! (`scan::flow_at`), scrolled by `detail_scroll` with the flow under the
-//! cursor kept on screen, and the status-control footer. The degraded
-//! states are the state banner's (D13: one state on screen).
+//! (`scan::flow_at`), scrolled by `detail_scroll`, pulled to the flow under
+//! the flow cursor while `follow_flow` is set (the last key was a flow
+//! key), and the status-control footer. The degraded states are the state
+//! banner's (D13: one state on screen).
 //!
 //! Row layout (builder's call, from the D11 mockup): `>` cursor mark, the
 //! confidence glyph pair, the name, `METHOD path_template`, `kind:name` and
@@ -29,24 +30,19 @@ use crate::scan::{
     severity_token, status_token, DetailLines, FlowTag, IssueHead, IssuePane, IssueRow, ReadIssue,
     ScanOffer, LOCATION_MAX, NAME_MAX, POINT_MAX,
 };
+use crate::text::{cells, fit, truncate, width};
 use crate::theme::Theme;
 use crate::ui::bars::put;
-use crate::ui::scan::{hint, labelled, note, pane_rule, panes};
+use crate::ui::scan::{
+    hint, key_text, labelled, note, pane_rule, panes, GAP, ISSUES_FILTER_KEYS, ISSUES_KEYS,
+};
 use crate::ui::selection_bg;
-use crate::ui::text::{cells, fit, truncate, width};
 
-/// Blank cells between columns.
-const GAP: usize = 2;
 /// The widest a status cell grows: `false_positive`, the longest status
 /// token, is fourteen cells (pinned by a unit test).
 const STATUS_MAX: usize = 14;
 /// The narrowest a cut column is allowed to get before the next one goes.
 const COLUMN_MIN: usize = 8;
-/// The list pane's footer (D11): the filter keys.
-const FOOTER: &str = "S severity · C confidence · L lane · T status · J job · R reset";
-/// The detail pane's footer (D11): the status controls, the flow open and
-/// the PoC jump.
-const DETAIL_FOOTER: &str = "c confirm · f false positive · u reopen · ⏎ open flow · P PoC";
 /// The detail pane's one line while the cursor's row has no read (the
 /// `scan.issue` is in flight, failed, or the verb is missing: the banner
 /// says which, so this stays neutral; fix round F, F2).
@@ -172,15 +168,19 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         .iter()
         .position(|e| matches!(e, Entry::Row(k) if *k == cursor))
         .unwrap_or(0);
-    let top = cursor_line.saturating_sub(body_h - 1);
     let focused = issues.pane == IssuePane::List;
-    for (k, entry) in entries.iter().enumerate().skip(top).take(body_h) {
-        let y = area.y + 1 + cells(k - top);
-        let line_area = Rect::new(area.x, y, area.width, 1);
-        match entry {
+    let body = Rect::new(area.x, area.y + 1, area.width, cells(body_h));
+    crate::ui::scan::rows(
+        buf,
+        theme,
+        body,
+        entries.len(),
+        cursor_line,
+        focused,
+        |k| match entries[k] {
             Entry::Header(severity) => {
-                let n = count_of(&issues.by_severity, *severity);
-                let header = severity_header(*severity);
+                let n = count_of(&issues.by_severity, severity);
+                let header = severity_header(severity);
                 // A zero header is greyed, not hidden (spec call 11); a
                 // counted one wears its severity hue (D13: hue on data).
                 let style = if n == 0 {
@@ -188,27 +188,18 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                 } else {
                     theme.severity(header)
                 };
-                put(
-                    buf,
-                    line_area,
-                    Line::styled(format!(" {header} {n}"), style),
-                );
+                Line::styled(format!(" {header} {n}"), style)
             }
-            Entry::Row(idx) => {
-                if *idx == cursor && focused {
-                    buf.set_style(line_area, selection_bg(theme));
-                }
-                if let Some(row) = rows.get(*idx) {
-                    put(buf, line_area, row_line(theme, &cols, row, *idx == cursor));
-                }
-            }
-        }
-    }
+            Entry::Row(idx) => rows.get(idx).map_or_else(Line::default, |row| {
+                row_line(theme, &cols, row, idx == cursor)
+            }),
+        },
+    );
     if has_footer {
         hint(
             theme,
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
-            FOOTER,
+            &key_text(&[ISSUES_FILTER_KEYS]),
             buf,
         );
     }
@@ -261,14 +252,14 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                     DetailRow::Head => head_line(theme, &issue_head(read), w),
                     DetailRow::Before(i) => {
                         let (label, value) = &lines.before_flows[i];
-                        labelled(theme, label, value, w, Some(DETAIL_LABEL_W))
+                        labelled(theme, label, value, w, DETAIL_LABEL_W)
                     }
                     DetailRow::FlowsLabel => labelled(
                         theme,
                         FLOWS_LABEL,
                         if layout.flows == 0 { "none" } else { "" },
                         w,
-                        Some(DETAIL_LABEL_W),
+                        DETAIL_LABEL_W,
                     ),
                     DetailRow::Flow(f) => match flow_at(read, f) {
                         Some((id, tag)) => flow_line(theme, &id, tag, Some(f) == flow_index, w),
@@ -279,11 +270,11 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                         "",
                         &format!("... {} more", read.dropped_flows),
                         w,
-                        Some(DETAIL_LABEL_W),
+                        DETAIL_LABEL_W,
                     ),
                     DetailRow::After(i) => {
                         let (label, value) = &lines.after_flows[i];
-                        labelled(theme, label, value, w, Some(DETAIL_LABEL_W))
+                        labelled(theme, label, value, w, DETAIL_LABEL_W)
                     }
                 };
                 put(buf, line_area, line);
@@ -294,7 +285,7 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         hint(
             theme,
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
-            DETAIL_FOOTER,
+            &key_text(&[ISSUES_KEYS]),
             buf,
         );
     }
@@ -392,7 +383,7 @@ fn head_line(theme: &Theme, head: &IssueHead<'_>, w: usize) -> Line<'static> {
 fn flow_line(theme: &Theme, id: &FlowRef, tag: FlowTag, under: bool, w: usize) -> Line<'static> {
     let mark = if under { ">" } else { " " };
     let tag = tag.label();
-    let id_w = w.saturating_sub(1 + 1 + 2 + width(tag) + 1);
+    let id_w = w.saturating_sub(1 + 1 + 2 + width(tag));
     Line::from(vec![
         Span::styled(format!("{mark} "), theme.accent()),
         Span::styled(truncate(&id.to_string(), id_w), theme.text_primary()),

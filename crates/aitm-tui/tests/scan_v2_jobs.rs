@@ -592,3 +592,68 @@ fn a_status_reply_does_not_clear_the_notice() {
     let _ = app.update(Action::Down);
     assert_eq!(app.scan.notice, None, "the next key clears the notice");
 }
+
+/// Fix round G, G65: the Jobs Detail pane draws the UI-3 reason wrapped over
+/// its footer the way Profiles does, whole at 90x40 (no cut at 90 columns),
+/// and a refused launch (D13's refused state) the same way, since `s` is
+/// live on this tab too.
+#[test]
+fn jobs_detail_wraps_the_blocked_reason_and_the_refused_launch_over_its_footer() {
+    const FOOTER: &str = "x cancel · ⏎ issues of this job";
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let reason = "L4 launch disabled: no L4 scope entry with the inject capability. Add one with interface \"*\", direction outbound, 127.0.0.1/32 ports 7000, capability inject (l4.scope.add).";
+    app.scan.launch.blocked = Some(reason.to_string());
+    for (cols, rows) in [(200u16, 50u16), (90, 40)] {
+        let text = text_of(&app, cols, rows);
+        for want in [
+            "L4 launch disabled",
+            "interface \"*\"",
+            "direction outbound",
+            "127.0.0.1/32",
+            "7000",
+            "capability inject",
+            "(l4.scope.add)",
+        ] {
+            assert!(
+                text.contains(want),
+                "{cols}x{rows}: {want:?} missing from the Jobs tab:\n{text}"
+            );
+        }
+        let y = line_index(&text, "L4 launch disabled").expect("the reason row");
+        let footer = line_index(&text, FOOTER).expect("the Jobs footer");
+        assert!(
+            y < footer,
+            "{cols}x{rows}: the reason sits above the footer"
+        );
+        let x = col_of(text.lines().nth(y).expect("row"), "L4 launch").expect("column");
+        let buf = draw(&app, cols, rows);
+        assert_eq!(
+            cell(&buf, x, y).fg,
+            theme()
+                .fg(&aitm_tui::tokens::color::status::CLIENT_ERROR)
+                .fg
+                .expect("the theme sets a foreground"),
+            "{cols}x{rows}: the warning hue"
+        );
+    }
+
+    // A refused launch with no gate holding: the D9 wording takes the same
+    // rows (Task 13 ruling: both tabs draw it).
+    app.scan.launch.blocked = None;
+    let _ = app.on_bus(failed(
+        "scan.start",
+        "scan.start",
+        "scan: out_of_scope: evil.test is not in scope",
+    ));
+    let text = screen(&app);
+    // The banner and the toast carry the wording too (D13); the footer
+    // copy is the row within the four above the footer.
+    let footer = line_index(&text, FOOTER).expect("the Jobs footer");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        (footer.saturating_sub(4)..footer)
+            .any(|y| lines[y].contains("Out of scope: add the HTTP host to Scope (S)")),
+        "the refused wording sits in the footer rows:\n{text}"
+    );
+}

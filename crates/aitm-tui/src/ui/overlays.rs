@@ -166,8 +166,8 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         ]));
     }
     lines.push(heading(theme, "Scan"));
-    for (key, what) in crate::ui::scan::HELP {
-        lines.push(key_line(theme, key, what));
+    for (key, groups) in crate::ui::scan::HELP {
+        lines.push(key_line(theme, key, &crate::ui::scan::key_text(groups)));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(HELP_CLOSE, theme.text_tertiary()));

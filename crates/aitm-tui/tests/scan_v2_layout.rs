@@ -18,7 +18,7 @@ use aitm_tui::action::{Action, BusRequest};
 use aitm_tui::app::{App, Mode, BUILTIN_COMMANDS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::ScanTab;
-use aitm_tui::ui::scan::HELP;
+use aitm_tui::ui::scan::{key_text, HELP};
 use common::*;
 use crossterm::event::KeyCode;
 use serde_json::json;
@@ -313,6 +313,65 @@ fn hints_follow_the_tab() {
         !text.contains("r scan (scope-bound)"),
         "the in-pane key line is gone:\n{text}"
     );
+    // Fix round G, G86: the degraded tabs advertise only the keys they
+    // serve on a legacy bus; the Site map keeps the flow open without the
+    // v2 paging and job filter.
+    for (tab, want) in [
+        (ScanTab::Profiles, " s scan  m map  3 site map  Esc back"),
+        (ScanTab::Issues, " 3 site map  Esc back"),
+        (ScanTab::SiteMap, " ⏎ open flow  Esc back"),
+    ] {
+        let _ = legacy.update(Action::ScanTab(tab));
+        let text = text_of(&legacy, 200, 50);
+        let bottom = bottom_line(&text);
+        assert!(
+            bottom.starts_with(want),
+            "legacy {tab:?}: the bar reads {want:?}: {bottom:?}"
+        );
+        if tab == ScanTab::SiteMap {
+            assert!(
+                !bottom.contains("next page") && !bottom.contains("job"),
+                "legacy Site map: no v2 keys: {bottom:?}"
+            );
+        }
+    }
+}
+
+/// Fix round G, G84: the in-pane footers and the bar spell the same keys
+/// from one table per tab, so every `key what` pair a footer shows is in
+/// the bar too.
+#[test]
+fn footers_spell_their_keys_as_the_bar_does() {
+    let mut app = populated();
+    for (tab, needles) in [
+        (ScanTab::Profiles, &["w save as"][..]),
+        (ScanTab::Jobs, &["⏎ issues of this job"][..]),
+        (ScanTab::Issues, &["S severity", "c confirm"][..]),
+    ] {
+        let _ = app.update(Action::ScanTab(tab));
+        let text = screen_at(&mut app, 200, 50);
+        let bottom = bottom_line(&text);
+        let body: Vec<&str> = text.lines().take(text.lines().count() - 1).collect();
+        for needle in needles {
+            let line = body
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{tab:?}: no footer with {needle:?}:\n{text}"));
+            let footer = line
+                .split('│')
+                .find(|seg| seg.contains(needle))
+                .expect("the footer's pane")
+                .trim();
+            let bar_keys: Vec<&str> = bottom.split_whitespace().collect();
+            for pair in footer.split(" · ") {
+                let key = pair.split_whitespace().next().unwrap_or_default();
+                assert!(
+                    bar_keys.contains(&key),
+                    "{tab:?}: the footer's {key:?} ({pair:?}) is a key of the bar: {bottom:?}"
+                );
+            }
+        }
+    }
 }
 
 /// D11: `:scan` still opens the view with the open's reads; the palette
@@ -359,7 +418,8 @@ fn palette_and_help_name_the_surface() {
         "the tab keys sit right under the Scan heading:\n{text}"
     );
     assert!(!HELP.is_empty(), "the Scan help section has entries");
-    for (key, what) in HELP {
+    for (key, groups) in HELP {
+        let what = key_text(groups);
         // The overlay's key column: `│ <key padded to 10>` inside the box.
         let column = format!("│ {key:<10}");
         let line = text
@@ -369,7 +429,7 @@ fn palette_and_help_name_the_surface() {
             .unwrap_or_else(|| panic!("no help line for {key}:\n{text}"));
         // The entry's whole text is on the line: a clipped line fails.
         assert!(
-            line.contains(what),
+            line.contains(&what),
             "{key} help carries its whole text {what:?}: {line:?}"
         );
     }
@@ -383,10 +443,8 @@ fn palette_and_help_name_the_surface() {
             .iter()
             .find(|(k, _)| *k == key)
             .unwrap_or_else(|| panic!("no {key} entry in HELP: {HELP:?}"));
-        assert!(
-            entry.1.contains(word),
-            "{key} help names {word:?}: {entry:?}"
-        );
+        let text = key_text(entry.1);
+        assert!(text.contains(word), "{key} help names {word:?}: {text:?}");
     }
 }
 

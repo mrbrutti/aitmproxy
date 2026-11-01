@@ -13,6 +13,8 @@ pub mod jobs;
 pub mod profiles;
 pub mod sitemap;
 
+use std::borrow::Cow;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -20,13 +22,26 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::scan::{ScanError, ScanOffer, ScanTab, NO_SCANNER};
+use crate::text::{cells, fit, truncate, width};
 use crate::theme::Theme;
+use crate::tokens::color::status;
 use crate::ui::bars::put;
 use crate::ui::overlays::boxed;
-use crate::ui::text::{fit, truncate, width};
+use crate::ui::selection_bg;
 
 /// The blank cells between the tab strip and the state banner (D11).
-const GAP: usize = 4;
+const STRIP_GAP: usize = 4;
+
+/// Blank cells between the columns of a tab's list (fix round G, G59: the
+/// one pair the Profiles, Jobs and Issues tables share).
+pub const GAP: usize = 2;
+/// [`GAP`] as the text a header or a row writes between columns.
+pub const GAP_TEXT: &str = "  ";
+const _: () = assert!(GAP_TEXT.len() == GAP, "GAP_TEXT spells GAP cells");
+
+/// The most rows a blocked or refused reason wraps onto over a footer; the
+/// rest is cut ([`blocked_footer`]).
+pub const BLOCKED_ROWS_MAX: usize = 4;
 
 /// Draw the Scan view into `area`.
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
@@ -64,7 +79,7 @@ fn tab_strip(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         spans.push(Span::styled(format!(" {} {} ", k + 1, tab.label()), style));
     }
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let room = usize::from(area.width).saturating_sub(used + GAP);
+    let room = usize::from(area.width).saturating_sub(used + STRIP_GAP);
     // The active tab's error is found once per frame; the legacy Jobs tab's
     // is built here from the text the legacy state kept, so the banner and
     // its hue borrow the same value.
@@ -72,7 +87,7 @@ fn tab_strip(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let error = tab_error(app, legacy_error.as_ref());
     let text = banner(app, error);
     if room > 0 {
-        spans.push(Span::raw(" ".repeat(GAP)));
+        spans.push(Span::raw(" ".repeat(STRIP_GAP)));
         spans.push(Span::styled(
             truncate(&text, room),
             banner_style(theme, error),
@@ -196,71 +211,113 @@ fn refreshing(app: &App) -> Option<&'static str> {
 /// draws for every mode.
 pub type Hint = (&'static str, &'static str);
 
+/// `Esc back`, the last hint of every Scan bar (D11): last so it is the
+/// first to go when the bar is narrow.
+const ESC_BACK: Hint = ("Esc", "back");
+
+/// One key table per tab (fix round G, G84, G90): `$keys` is what the
+/// tab's in-pane footer spells and `$bar` the same pairs with [`ESC_BACK`]
+/// after them, the status bar's list. The help overlay joins the same
+/// tables ([`HELP`]), so a key is named once.
+macro_rules! key_table {
+    ($keys:ident, $bar:ident $(, [$($extra:expr),*])?: $($k:literal => $w:literal),+ $(,)?) => {
+        pub(crate) const $keys: &[Hint] = &[$(($k, $w)),+];
+        pub(crate) const $bar: &[Hint] = &[$(($k, $w)),+, $($($extra,)*)? ESC_BACK];
+    };
+}
+
+key_table!(PROFILES_KEYS, PROFILES_BAR:
+    "s" => "start", "m" => "map", "w" => "save as", "e" => "edit", "Space" => "toggle");
+/// The Profiles keys the help lists beyond the footer's.
+pub(crate) const PROFILES_MORE: &[Hint] = &[
+    ("N", "new"),
+    ("D", "delete"),
+    ("o", "origin"),
+    ("t", "L4 target"),
+];
+key_table!(JOBS_KEYS, JOBS_BAR:
+    "x" => "cancel", "⏎" => "issues of this job", "s" => "start", "m" => "map");
+key_table!(SITEMAP_KEYS, SITEMAP_BAR:
+    "⏎" => "open flow", "n" => "next page", "J" => "job filter");
+/// `R reset`, in the Issues list footer and in the bar.
+const RESET: Hint = ("R", "reset");
+/// The five filter keys as the bar and the help spell them, compactly.
+const FILTERS: Hint = ("S C L T J", "filters");
+key_table!(ISSUES_KEYS, ISSUES_BAR, [FILTERS, RESET]:
+    "c" => "confirm", "f" => "false positive", "u" => "reopen", "⏎" => "open flow", "P" => "PoC");
+/// The Issues list footer: the filter keys (D11).
+pub(crate) const ISSUES_FILTER_KEYS: &[Hint] = &[
+    ("S", "severity"),
+    ("C", "confidence"),
+    ("L", "lane"),
+    ("T", "status"),
+    ("J", "job"),
+    RESET,
+];
+/// The keys every tab shares, the help's first Scan line.
+const SHARED_KEYS: &[Hint] = &[
+    ("Profiles · Jobs · Site map · Issues", "tabs"),
+    ("Tab/BackTab", "pane"),
+    ESC_BACK,
+];
+
+/// The Jobs bar on a legacy bus: the one-shot's keys (D12).
+const LEGACY_JOBS_BAR: &[Hint] = &[
+    ("r", "scan"),
+    ("3", "site map"),
+    ("F", "findings"),
+    ESC_BACK,
+];
+/// The degraded Profiles tab on a legacy bus (fix round G, G86): `s`/`m`
+/// run the one-shot like `r` (Task 12 ruling), the rest of its keys have
+/// nothing to act on.
+const LEGACY_PROFILES_BAR: &[Hint] = &[("s", "scan"), ("m", "map"), ("3", "site map"), ESC_BACK];
+/// The degraded Issues tab on a legacy bus (G86).
+const LEGACY_ISSUES_BAR: &[Hint] = &[("3", "site map"), ESC_BACK];
+/// The Site map on a legacy bus (G86): the flow open without the v2
+/// paging and job filter.
+const LEGACY_SITEMAP_BAR: &[Hint] = &[SITEMAP_KEYS[0], ESC_BACK];
+
 /// The status-bar hints of the Scan view (D11: the hints list the active
 /// tab's keys): the tab's keys most important first, `Esc back` last so it
 /// is the first to go when the bar is narrow. On a legacy bus the Jobs tab
-/// carries the one-shot's keys instead (D12; the in-pane key line it
-/// replaced was accepted until this landed, Task 4 panel).
-pub fn hints(app: &App) -> Vec<Hint> {
-    if app.scan_offer() == ScanOffer::Legacy && app.scan.tab == ScanTab::Jobs {
-        return vec![
-            ("r", "scan"),
-            ("3", "site map"),
-            ("F", "findings"),
-            ("Esc", "back"),
-        ];
-    }
-    match app.scan.tab {
-        ScanTab::Profiles => vec![
-            ("s", "start"),
-            ("m", "map"),
-            ("w", "save"),
-            ("e", "edit"),
-            ("Space", "toggle"),
-            ("Esc", "back"),
-        ],
-        ScanTab::Jobs => vec![
-            ("x", "cancel"),
-            ("⏎", "issues"),
-            ("s", "start"),
-            ("m", "map"),
-            ("Esc", "back"),
-        ],
-        ScanTab::SiteMap => vec![
-            ("⏎", "flow"),
-            ("n", "next page"),
-            ("J", "job"),
-            ("Esc", "back"),
-        ],
-        ScanTab::Issues => vec![
-            ("c", "confirm"),
-            ("f", "false positive"),
-            ("u", "reopen"),
-            ("P", "PoC"),
-            ("S C L T J", "filters"),
-            ("Esc", "back"),
-        ],
+/// carries the one-shot's keys instead (D12) and the degraded tabs only
+/// the keys they serve (G86).
+pub fn hints(app: &App) -> &'static [Hint] {
+    let legacy = app.scan_offer() == ScanOffer::Legacy;
+    match (legacy, app.scan.tab) {
+        (true, ScanTab::Profiles) => LEGACY_PROFILES_BAR,
+        (true, ScanTab::Jobs) => LEGACY_JOBS_BAR,
+        (true, ScanTab::SiteMap) => LEGACY_SITEMAP_BAR,
+        (true, ScanTab::Issues) => LEGACY_ISSUES_BAR,
+        (false, ScanTab::Profiles) => PROFILES_BAR,
+        (false, ScanTab::Jobs) => JOBS_BAR,
+        (false, ScanTab::SiteMap) => SITEMAP_BAR,
+        (false, ScanTab::Issues) => ISSUES_BAR,
     }
 }
 
+/// `key what · key what ...`: the key groups joined the way a footer and a
+/// help line spell them.
+pub fn key_text(groups: &[&[Hint]]) -> String {
+    groups
+        .iter()
+        .flat_map(|g| g.iter())
+        .map(|(k, w)| format!("{k} {w}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// The help overlay's Scan section (D11): the keys every tab shares, then
-/// one line per tab, as `(key, what)` pairs the overlay draws under its
-/// `Scan` heading.
-pub const HELP: &[(&str, &str)] = &[
-    (
-        "1 2 3 4",
-        "Profiles · Jobs · Site map · Issues tabs · Tab/BackTab pane · Esc back",
-    ),
-    (
-        "Profiles",
-        "s start · m map · w save · e edit · Space toggle · N new · D delete · o origin · t L4 target",
-    ),
-    ("Jobs", "x cancel · ⏎ issues of this job · s start · m map"),
-    ("Site map", "⏎ open flow · n next page · J job filter"),
-    (
-        "Issues",
-        "c confirm · f false positive · u reopen · P PoC · S C L T J filters · R reset",
-    ),
+/// one line per tab, each a heading and the key groups [`key_text`] joins
+/// under the overlay's `Scan` heading. The groups are the tabs' own tables
+/// (G90), so the help never drifts from the bar or the footers.
+pub const HELP: &[(&str, &[&[Hint]])] = &[
+    ("1 2 3 4", &[SHARED_KEYS]),
+    ("Profiles", &[PROFILES_KEYS, PROFILES_MORE]),
+    ("Jobs", &[JOBS_KEYS]),
+    ("Site map", &[SITEMAP_KEYS]),
+    ("Issues", &[ISSUES_KEYS, &[FILTERS, RESET]]),
 ];
 
 /// A tab body split into its list and detail panes, with the rule between
@@ -393,31 +450,180 @@ pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
 }
 
 /// One `label value` line of a Detail pane (fix round F, F8), the one
-/// layout the Jobs and Issues panes share: a pad cell, the label in
-/// secondary text, one space, the value in primary text cut so the whole
-/// line fits `w` cells. With `label_w` the label is padded to that column,
-/// so the values line up (the Issues pane, as in the D11 mockup; an empty
-/// label then indents a continuation line); with `None` the label takes
-/// its own width and the line reads as the sentence it is (the Jobs pane).
+/// layout the Jobs and Issues panes share: a pad cell, the label fitted to
+/// `label_w` cells in secondary text, one space, the value in primary text
+/// cut so the whole line fits `w` cells. A fixed `label_w` lines the
+/// values up (the Issues pane, as in the D11 mockup; an empty label then
+/// indents a continuation line); `width(label)` lets the line read as the
+/// sentence it is (the Jobs pane).
 pub fn labelled(
     theme: &Theme,
     label: &str,
     value: &str,
     w: usize,
-    label_w: Option<usize>,
+    label_w: usize,
 ) -> Line<'static> {
-    let (label_text, label_cells) = match label_w {
-        Some(lw) => (fit(label, lw), lw),
-        None => (label.to_string(), width(label)),
-    };
-    let value_w = w.saturating_sub(1 + label_cells + 1);
+    let value_w = w.saturating_sub(1 + label_w + 1);
     Line::from(vec![
-        Span::styled(format!(" {label_text}"), theme.text_secondary()),
+        Span::styled(format!(" {}", fit(label, label_w)), theme.text_secondary()),
         Span::styled(
             format!(" {}", truncate(value, value_w)),
             theme.text_primary(),
         ),
     ])
+}
+
+/// The rows of a list pane (fix round G, G56): `total` rows scrolled so
+/// `cursor` is on screen (the rows above it give way first), the cursor
+/// row highlighted while `focused`, each row built by `line(k)` only when
+/// it is drawn. The one scroll-and-highlight loop every tab's list shares.
+pub fn rows(
+    buf: &mut Buffer,
+    theme: &Theme,
+    area: Rect,
+    total: usize,
+    cursor: usize,
+    focused: bool,
+    mut line: impl FnMut(usize) -> Line<'static>,
+) {
+    if area.height == 0 || area.width == 0 || total == 0 {
+        return;
+    }
+    let h = usize::from(area.height);
+    let cursor = cursor.min(total - 1);
+    let top = cursor.saturating_sub(h - 1);
+    for k in top..total.min(top + h) {
+        let row = Rect::new(area.x, area.y + cells(k - top), area.width, 1);
+        if k == cursor && focused {
+            buf.set_style(row, selection_bg(theme));
+        }
+        put(buf, row, line(k));
+    }
+}
+
+/// The reason a launch key cannot or did not go through, for a tab's
+/// footer (Task 13 ruling: Jobs and Profiles both draw it): the UI-3 text
+/// while the gate holds (`launch.blocked`, D7; the key is inert), else the
+/// refused launch's D9 wording (D13's refused state: the key stays live
+/// and the operator reads why the core said no). The wording is built
+/// only when no gate text stands (G81).
+pub fn launch_reason(app: &App) -> Option<Cow<'_, str>> {
+    app.scan
+        .launch
+        .blocked
+        .as_deref()
+        .map(Cow::Borrowed)
+        .or_else(|| app.scan.refused_launch().map(|e| Cow::Owned(e.wording())))
+}
+
+/// A Detail pane's bottom (fix round G, G65): the `footer` [`hint`] on the
+/// last row when there are two or more, and above it the `blocked` reason
+/// wrapped clause by clause ([`wrap`]) onto at most [`BLOCKED_ROWS_MAX`]
+/// rows in the warning hue (D13's refused state; `status.clientError` is
+/// the `state.warning` foreground on both schemes), always leaving at
+/// least one row to the body. Returns the body rect left above them.
+pub fn blocked_footer(
+    theme: &Theme,
+    area: Rect,
+    blocked: Option<&str>,
+    footer: &str,
+    buf: &mut Buffer,
+) -> Rect {
+    let h = usize::from(area.height);
+    if h < 2 || area.width < 2 {
+        return area;
+    }
+    let w = usize::from(area.width) - 1;
+    let reason = blocked.map_or_else(Vec::new, |text| wrap(text, w, BLOCKED_ROWS_MAX));
+    let foot_rows = (1 + reason.len()).min(h - 1);
+    let body = Rect::new(area.x, area.y, area.width, cells(h - foot_rows));
+    let foot_y = area.y + cells(h - foot_rows);
+    let warn = theme.fg(&status::CLIENT_ERROR);
+    for (k, row) in reason.iter().take(foot_rows - 1).enumerate() {
+        put(
+            buf,
+            Rect::new(area.x, foot_y + cells(k), area.width, 1),
+            Line::styled(format!(" {row}"), warn),
+        );
+    }
+    hint(
+        theme,
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        footer,
+        buf,
+    );
+    body
+}
+
+/// Wrap `text` into rows of at most `w` cells, at most `max_rows` of them.
+/// The units are the text's clauses (cut after a `,` `.` `:` or `;` that a
+/// space follows, so a dotted address stays whole), and the words of a
+/// clause wider than a row: the D7 reasons name the missing scope entry
+/// clause by clause (`direction outbound,`), and a clause kept on one row
+/// keeps each `field value` pair readable. A word wider than a row is cut,
+/// and when the units do not all fit the rows the last row ends in an
+/// ellipsis. Empty for an empty text, a zero width or no rows.
+pub fn wrap(text: &str, w: usize, max_rows: usize) -> Vec<String> {
+    if w == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    let mut units: Vec<&str> = Vec::new();
+    for clause in clauses(text) {
+        if width(clause) <= w {
+            units.push(clause);
+        } else {
+            units.extend(clause.split_whitespace());
+        }
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < units.len() && rows.len() < max_rows {
+        let mut row = String::new();
+        while i < units.len() {
+            let unit = units[i];
+            if row.is_empty() {
+                row = truncate(unit, w);
+            } else if width(&row) + 1 + width(unit) <= w {
+                row.push(' ');
+                row.push_str(unit);
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        rows.push(row);
+    }
+    if i < units.len() {
+        if let Some(last) = rows.last_mut() {
+            *last = truncate(&format!("{last} …"), w);
+        }
+    }
+    rows
+}
+
+/// `text` cut after every `,` `.` `:` or `;` that whitespace or the end
+/// follows, each piece trimmed, empty pieces dropped.
+fn clauses(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        let ends_clause = matches!(b, b',' | b'.' | b':' | b';')
+            && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace);
+        if ends_clause {
+            // `b` is ASCII, so `i + 1` is a char boundary.
+            let clause = text[start..=i].trim();
+            if !clause.is_empty() {
+                out.push(clause);
+            }
+            start = i + 1;
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -434,24 +640,171 @@ mod tests {
             line.spans.iter().map(|s| s.content.as_ref()).collect()
         };
         assert_eq!(
-            text(labelled(&theme, "lanes", "requested http", 40, None)),
+            text(labelled(&theme, "lanes", "requested http", 40, 5)),
             " lanes requested http"
         );
         assert_eq!(
-            text(labelled(&theme, "payload", "<x>", 40, Some(11))),
+            text(labelled(&theme, "payload", "<x>", 40, 11)),
             " payload     <x>"
         );
         assert_eq!(
-            text(labelled(&theme, "", "1.0 | 2", 40, Some(11))),
+            text(labelled(&theme, "", "1.0 | 2", 40, 11)),
             "             1.0 | 2"
         );
-        let cut = text(labelled(&theme, "note", &"n".repeat(50), 20, Some(11)));
+        let cut = text(labelled(&theme, "note", &"n".repeat(50), 20, 11));
         assert_eq!(cut.chars().count(), 20, "{cut:?}");
         assert_eq!(cut, " note        nnnnnn…");
         assert_eq!(
-            text(labelled(&theme, "a", "bcd", 3, None)),
+            text(labelled(&theme, "a", "bcd", 3, 1)),
             " a ",
             "no room: the value is empty"
+        );
+    }
+
+    /// Fix round G, G56: the one scroll arithmetic. The cursor row is the
+    /// last on screen once it is past the pane (`top = cursor - (h - 1)`),
+    /// only the rows on screen are built, and the cursor row is highlighted
+    /// only while focused.
+    #[test]
+    fn rows_scroll_to_the_cursor_and_highlight_it_while_focused() {
+        let theme = Theme::new(true);
+        let area = Rect::new(0, 0, 10, 3);
+        let mut buf = Buffer::empty(area);
+        let mut built = Vec::new();
+        rows(&mut buf, &theme, area, 10, 7, true, |k| {
+            built.push(k);
+            Line::raw(format!("row {k}"))
+        });
+        assert_eq!(built, vec![5, 6, 7], "top = 7 - (3 - 1)");
+        assert_eq!(buf.cell((0, 2)).map(|c| c.symbol()), Some("r"));
+        assert_eq!(
+            buf.cell((0, 2)).map(|c| c.bg),
+            Some(selection_bg(&theme).bg.unwrap_or_default()),
+            "the cursor row carries the selection"
+        );
+        assert_ne!(
+            buf.cell((0, 1)).map(|c| c.bg),
+            Some(selection_bg(&theme).bg.unwrap_or_default())
+        );
+
+        let mut buf = Buffer::empty(area);
+        let mut built = Vec::new();
+        rows(&mut buf, &theme, area, 10, 1, false, |k| {
+            built.push(k);
+            Line::raw("x")
+        });
+        assert_eq!(
+            built,
+            vec![0, 1, 2],
+            "a cursor inside the pane keeps top at 0"
+        );
+        assert_ne!(
+            buf.cell((0, 1)).map(|c| c.bg),
+            Some(selection_bg(&theme).bg.unwrap_or_default()),
+            "unfocused: no highlight"
+        );
+
+        let mut buf = Buffer::empty(area);
+        let mut built = Vec::new();
+        rows(&mut buf, &theme, area, 2, 99, true, |k| {
+            built.push(k);
+            Line::raw("x")
+        });
+        assert_eq!(built, vec![0, 1], "the cursor is clamped to the last row");
+        rows(&mut buf, &theme, area, 0, 0, true, |_| {
+            unreachable!("no rows")
+        });
+    }
+
+    /// The wrap keeps words whole, cuts a word wider than a row, stops at
+    /// the row cap and marks what it dropped; a wide glyph counts its cells.
+    #[test]
+    fn wrap_breaks_at_clauses_then_spaces_and_caps_the_rows() {
+        assert_eq!(wrap("a bb ccc", 5, 4), vec!["a bb", "ccc"]);
+        assert_eq!(wrap("abcdefgh ij", 5, 4), vec!["abcd…", "ij"]);
+        assert_eq!(wrap("one two three four", 9, 1), vec!["one two …"]);
+        assert_eq!(wrap("one two", 9, 1), vec!["one two"]);
+        assert!(wrap("x", 0, 4).is_empty());
+        assert!(wrap("", 9, 4).is_empty());
+        assert_eq!(
+            wrap("日本 日本", 5, 4),
+            vec!["日本", "日本"],
+            "two wide glyphs are four cells, two of them do not fit five"
+        );
+        // A clause that fits moves whole to the next row; a dotted address
+        // is not a clause end.
+        assert_eq!(
+            wrap("Add one with x, direction outbound, 10.0.0.1/32 y.", 22, 4),
+            vec!["Add one with x,", "direction outbound,", "10.0.0.1/32 y."]
+        );
+        assert_eq!(clauses("a: b, c.d; e"), vec!["a:", "b,", "c.d;", "e"]);
+    }
+
+    /// Fix round G, G65: the footer takes the last row, the reason the
+    /// rows above it up to the cap, and the body keeps at least one row.
+    #[test]
+    fn blocked_footer_leaves_the_body_above_the_reason_and_the_footer() {
+        let theme = Theme::new(true);
+        let area = Rect::new(0, 0, 8, 6);
+        let mut buf = Buffer::empty(area);
+        let body = blocked_footer(&theme, area, Some("one, two, three"), "k key", &mut buf);
+        assert_eq!(
+            body,
+            Rect::new(0, 0, 8, 2),
+            "three reason rows and the footer"
+        );
+        let row = |y: u16| -> String {
+            (0..8)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(2), " one,");
+        assert_eq!(row(4), " three");
+        assert_eq!(row(5), " k key");
+        let mut buf = Buffer::empty(area);
+        let body = blocked_footer(&theme, area, None, "k key", &mut buf);
+        assert_eq!(body.height, 5, "no reason: the footer alone");
+        let short = Rect::new(0, 0, 8, 2);
+        let mut buf = Buffer::empty(short);
+        let body = blocked_footer(&theme, short, Some("one, two"), "k key", &mut buf);
+        assert_eq!(body.height, 1, "the body keeps a row");
+        let one = Rect::new(0, 0, 8, 1);
+        assert_eq!(blocked_footer(&theme, one, Some("x"), "k", &mut buf), one);
+    }
+
+    /// Fix round G, G84: every key a footer spells is in its tab's bar,
+    /// and the help lines are joined from the same tables.
+    #[test]
+    fn footer_keys_are_a_subset_of_the_bar_keys() {
+        let keys = |t: &[Hint]| -> Vec<&str> {
+            t.iter().flat_map(|(k, _)| k.split_whitespace()).collect()
+        };
+        for (footer, bar) in [
+            (PROFILES_KEYS, PROFILES_BAR),
+            (JOBS_KEYS, JOBS_BAR),
+            (ISSUES_KEYS, ISSUES_BAR),
+            (ISSUES_FILTER_KEYS, ISSUES_BAR),
+            (SITEMAP_KEYS, SITEMAP_BAR),
+        ] {
+            let bar_keys = keys(bar);
+            for key in keys(footer) {
+                assert!(bar_keys.contains(&key), "{key} is in the bar {bar:?}");
+            }
+            assert_eq!(bar.last(), Some(&ESC_BACK));
+        }
+        assert_eq!(
+            key_text(&[JOBS_KEYS]),
+            "x cancel · ⏎ issues of this job · s start · m map"
+        );
+        assert_eq!(
+            key_text(&[ISSUES_KEYS, &[FILTERS, RESET]]),
+            "c confirm · f false positive · u reopen · ⏎ open flow · P PoC · S C L T J filters · R reset"
+        );
+        assert_eq!(
+            key_text(&[SHARED_KEYS]),
+            "Profiles · Jobs · Site map · Issues tabs · Tab/BackTab pane · Esc back"
         );
     }
 

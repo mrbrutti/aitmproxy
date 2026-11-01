@@ -332,7 +332,7 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             ("Esc", "back"),
         ],
         // The active tab's keys (D11), kept with the view that owns them.
-        Mode::Scan => crate::ui::scan::hints(app),
+        Mode::Scan => crate::ui::scan::hints(app).to_vec(),
         _ => vec![("Esc", "back")],
     };
     let hint_line = |hints: &[(&str, &str)]| -> Line<'static> {

@@ -13,6 +13,7 @@ use crate::app::App;
 use crate::theme::Theme;
 use crate::ui::centered;
 use crate::ui::overlays::{boxed, lines_into};
+use crate::ui::scan::wrap;
 
 /// The family of the call under confirmation, classified once from its
 /// name: it picks the title, the footnote and the hue of the call-name line.
@@ -80,8 +81,17 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         ),
         Line::raw(""),
     ];
-    // Wrap the server's prompt to the panel width, shown verbatim.
-    for chunk in wrap(&c.prompt, usize::from(inner.width).saturating_sub(2)) {
+    // Wrap the server's prompt to the panel width, shown verbatim, by cell
+    // width (fix round G, G55); an empty prompt keeps its one blank row.
+    let mut chunks = wrap(
+        &c.prompt,
+        usize::from(inner.width).saturating_sub(2),
+        usize::MAX,
+    );
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    for chunk in chunks {
         lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
     }
     lines.push(Line::raw(""));
@@ -94,29 +104,4 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         theme.accent().add_modifier(Modifier::BOLD),
     ));
     lines_into(buf, inner, &lines, 0);
-}
-
-/// Greedy word-wrap to `width` columns.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }

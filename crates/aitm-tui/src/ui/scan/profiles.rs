@@ -1,32 +1,17 @@
-//! The Profiles tab (spec D2, D8, D11, D13): the profile list on the left,
-//! the editor on the right. The degraded states (a legacy bus, a v2 bus
-//! without `scan.profile.list`) are the banner's (D13: one state on screen),
-//! so the body draws nothing then.
+//! The Profiles tab (spec D2, D8, D11, D13): the profile list on the left
+//! ([`list`]), the editor on the right ([`detail`]: the Fields block
+//! ([`fields`]), under it the Origins ([`origins`]) or Checks ([`checks`])
+//! pane while one is focused, and the shared [`blocked_footer`] with the
+//! launch reason over the key footer). The degraded states (a legacy bus,
+//! a v2 bus without `scan.profile.list`) are the banner's (D13: one state
+//! on screen), so the body draws nothing then.
 //!
-//! Layout (builder's call, from the D11 wide mockup). The List pane: a
-//! column header, then one row per profile as `name · lanes · intensity ·
-//! speed`, [`BUILTIN_MARK`] after a builtin's name, [`EDITING_MARK`] after
-//! the name of the profile the held editor was loaded from (`Esc` returns
-//! the pane to the List but keeps the editor; the mark says which row `Tab`
-//! returns to), the cursor row marked `>` and highlighted while the List is
-//! focused. The detail side: the Fields block (the `profile <name>
-//! (builtin)` header with `dirty` right-aligned, then the fields of
-//! `EDITOR_FIELDS` in order, grouped onto the mockup's lines, the segment
-//! under the Fields cursor highlighted while that pane is focused); under
-//! it, only while the Origins or the Checks pane is focused, a rule and
-//! that pane (the picker rows with their source, the wildcard scope entries
-//! greyed; or the lane to class to check tree with the tri-state glyphs and
-//! the collapse markers); at the bottom the `launch.blocked` reason (or,
-//! when the gate is not holding, a refused launch's D9 wording, D13's
-//! refused state), wrapped and in the warning hue, over the key footer.
-//! Without an editor the detail side says how to open one and keeps the
-//! footer, since `s` on the List launches the row's profile.
-//!
-//! Hue only on data (D13): the blocked and refused reasons wear the
-//! warning hue, the
-//! greyed wildcard rows tertiary text, everything else text tokens; the
-//! glyphs are flat monochrome. Every string is cut to its pane, and only
-//! the rows on screen are built.
+//! The view draws what the model built and bounded at fold (D6
+//! hostile-core bounds: `ProfilesState::lanes_text`/`widest`,
+//! `ProfileEditor::tree`, `text_of`), cut to its pane, only for the rows
+//! on screen ([`rows`]). Hue only on data (D13): the blocked and refused
+//! reasons wear the warning hue, the greyed wildcard rows tertiary text,
+//! everything else text tokens; the glyphs are flat monochrome.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -37,27 +22,25 @@ use aitm_scan_model::{LaneKind, ProfileListEntry};
 
 use crate::app::App;
 use crate::scan::{
-    lane_token, session_line, wire_token, EditorField, ListWidths, NodeKind, OriginSource,
-    ProfileEditor, ProfilePane, ProfilesState, ScanError, ScanOffer, TreeNode, BUILTIN_MARK,
-    COLLAPSED_MARK, OPEN_MARK,
+    is_wildcard, lane_token, session_line, wire_token, EditorField, ListWidths, NodeKind,
+    OriginSource, ProfileEditor, ProfilePane, ProfilesState, ScanOffer, TreeNode, BUILTIN_MARK,
+    COLLAPSED_MARK, EDITING_MARK, OPEN_MARK,
 };
+use crate::text::{cells, fit, truncate, width};
 use crate::theme::Theme;
-use crate::tokens::color::status;
 use crate::ui::bars::{put, put_sides};
-use crate::ui::scan::{hint, note, pane_rule, panes, stacked};
+use crate::ui::scan::hint;
+use crate::ui::scan::{
+    blocked_footer, key_text, launch_reason, note, pane_rule, panes, rows, stacked, GAP, GAP_TEXT,
+    PROFILES_KEYS,
+};
 use crate::ui::selection_bg;
-use crate::ui::text::{cells, fit, truncate, width};
 
-/// The mark after the name of the profile the held editor was loaded from
-/// (review log, Task 10: `Esc` keeps the editor; the row shows it). The
-/// buffer-modified convention; the header's `dirty` says whether it has
-/// unsaved changes.
-pub const EDITING_MARK: &str = "*";
-
-/// The detail side's footer (D11).
-const FOOTER: &str = "s start · m map · w save as · e edit · Space toggle";
 /// The detail side without an editor.
 const NO_EDITOR: &str = "⏎ opens the profile under the cursor · N new profile";
+/// The empty state (D13): only when the list is empty and no editor is
+/// open, since `N` opens an editor over an empty list.
+const NO_PROFILES: &str = "no profiles yet";
 /// The Origins pane's head: its keys.
 const ORIGINS_HEAD: &str = "origins  a add · d remove · o type";
 /// The Checks pane's head: its keys.
@@ -80,16 +63,10 @@ const LANES_MAX: usize = 19;
 const INTENSITY_W: usize = 9;
 /// The widest speed word (`thorough`).
 const SPEED_W: usize = 8;
-/// Blank cells between list columns.
-const GAP: &str = "  ";
-const GAP_W: usize = 2;
-const _: () = assert!(GAP.len() == GAP_W, "GAP spells GAP_W cells");
 /// The cells of a list row outside the name and lanes columns: the cursor
 /// mark, the held and builtin marks with their pad, three gaps, the
 /// intensity and the speed.
-const FIXED_W: usize = 1 + 3 + 3 * GAP_W + INTENSITY_W + SPEED_W;
-/// The most rows the blocked reason wraps onto; the rest is cut.
-const BLOCKED_ROWS_MAX: usize = 4;
+const FIXED_W: usize = 1 + 3 + 3 * GAP + INTENSITY_W + SPEED_W;
 /// The rows the Fields block takes: the header and nine field lines.
 const FIELDS_ROWS: u16 = 10;
 
@@ -101,7 +78,7 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ScanOffer::None | ScanOffer::Legacy => {}
         ScanOffer::V2 if !app.has_tool("scan.profile.list") => {}
         ScanOffer::V2 if profiles.list.is_empty() && profiles.editor.is_none() => {
-            note(theme, area, "no profiles yet", buf)
+            note(theme, area, NO_PROFILES, buf)
         }
         ScanOffer::V2 => {
             if area.height == 0 || area.width == 0 {
@@ -149,7 +126,9 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
     let profiles = &app.scan.profiles;
     if profiles.list.is_empty() {
-        note(theme, area, "no profiles yet", buf);
+        // An editor is open over an empty list (`N`): the list side alone
+        // says so.
+        note(theme, area, NO_PROFILES, buf);
         return;
     }
     let w = usize::from(area.width);
@@ -160,7 +139,7 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         clip(
             vec![Span::styled(
                 format!(
-                    " {}   {GAP}{}{GAP}{}{GAP}{}",
+                    " {}   {GAP_TEXT}{}{GAP_TEXT}{}{GAP_TEXT}{}",
                     fit("name", cols.name),
                     fit("lanes", cols.lanes),
                     fit("intensity", INTENSITY_W),
@@ -181,16 +160,17 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         .editor
         .as_ref()
         .and_then(|e| e.loaded_from.as_deref());
-    let top = cursor.saturating_sub(body_h - 1);
-    let rows = profiles.list.iter().zip(&profiles.lanes_text);
-    for (k, (p, lanes)) in rows.enumerate().skip(top).take(body_h) {
-        let row = Rect::new(area.x, area.y + 1 + cells(k - top), area.width, 1);
-        if k == cursor && focused {
-            buf.set_style(row, selection_bg(theme));
-        }
-        put(
-            buf,
-            row,
+    let body = Rect::new(area.x, area.y + 1, area.width, cells(body_h));
+    rows(
+        buf,
+        theme,
+        body,
+        profiles.list.len(),
+        cursor,
+        focused,
+        |k| {
+            let p = &profiles.list[k];
+            let lanes = profiles.lanes_text.get(k).map_or("", String::as_str);
             row_line(
                 theme,
                 &cols,
@@ -199,9 +179,9 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                 k == cursor,
                 held == Some(p.name.as_str()),
                 w,
-            ),
-        );
-    }
+            )
+        },
+    );
 }
 
 /// One list row: the cursor mark, the name, the held and builtin marks,
@@ -226,7 +206,7 @@ fn row_line(
             Span::styled(format!(" {editing}{builtin}"), theme.text_secondary()),
             Span::styled(
                 format!(
-                    "{GAP}{}{GAP}{}{GAP}{}",
+                    "{GAP_TEXT}{}{GAP_TEXT}{}{GAP_TEXT}{}",
                     fit(lanes, cols.lanes),
                     fit(&wire_token(&p.summary.intensity), INTENSITY_W),
                     fit(&wire_token(&p.summary.speed), SPEED_W),
@@ -238,60 +218,26 @@ fn row_line(
     )
 }
 
-/// The detail side: the editor (or the no-editor note) over the blocked
-/// reason and the footer. The footer takes the last row when there are two
-/// or more; the blocked reason the rows above it, wrapped, leaving at least
-/// one row to the body.
+/// The detail side: the editor (or the no-editor note) over the shared
+/// [`blocked_footer`], which draws the launch reason ([`launch_reason`]:
+/// the UI-3 text, D7, else a refused launch's D9 wording, D13) wrapped in
+/// the warning hue over the key footer, here where the launch is made.
 fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
     }
-    let w = usize::from(area.width) - 1;
-    // The UI-3 reason while the gate holds (the key is inert, D7); else the
-    // refused launch's wording (D13's refused state: the key stays live and
-    // the operator reads why the core said no, here where the launch is
-    // made). Both wrap the same way and wear the warning hue.
-    let refused = app.scan.refused_launch().map(ScanError::wording);
-    let blocked = app
-        .scan
-        .launch
-        .blocked
-        .as_deref()
-        .or(refused.as_deref())
-        .map(|text| wrap(text, w, BLOCKED_ROWS_MAX))
-        .unwrap_or_default();
-    let h = usize::from(area.height);
-    let foot_rows = if h >= 2 {
-        (1 + blocked.len()).min(h - 1)
-    } else {
-        0
-    };
-    let body = Rect::new(area.x, area.y, area.width, cells(h - foot_rows));
+    let reason = launch_reason(app);
+    let body = blocked_footer(
+        theme,
+        area,
+        reason.as_deref(),
+        &key_text(&[PROFILES_KEYS]),
+        buf,
+    );
     match app.scan.profiles.editor.as_ref() {
         None => note(theme, body, NO_EDITOR, buf),
         Some(editor) => editor_panes(app, editor, theme, body, buf),
     }
-    if foot_rows == 0 {
-        return;
-    }
-    let foot_y = area.y + cells(h - foot_rows);
-    // The reason's rows that fit over the footer, in the warning hue
-    // (D13's refused state; `status.clientError` is the `state.warning`
-    // foreground on both schemes).
-    let warn = theme.fg(&status::CLIENT_ERROR);
-    for (k, row) in blocked.iter().take(foot_rows - 1).enumerate() {
-        put(
-            buf,
-            Rect::new(area.x, foot_y + cells(k), area.width, 1),
-            Line::styled(format!(" {row}"), warn),
-        );
-    }
-    hint(
-        theme,
-        Rect::new(area.x, area.bottom() - 1, area.width, 1),
-        FOOTER,
-        buf,
-    );
 }
 
 /// The Fields block, and under it the Origins or the Checks pane while
@@ -347,7 +293,6 @@ fn fields(
     if area.height == 0 || area.width < 2 {
         return;
     }
-    let w = usize::from(area.width) - 1;
     let focused = profiles.pane == ProfilePane::Fields;
     let cursor = editor.field();
     let lines = field_lines(profiles, editor);
@@ -361,7 +306,7 @@ fn fields(
     let top = cursor_line.saturating_sub(h - 1);
     let highlight = |field: Option<EditorField>, base: Style| -> Style {
         if focused && field == Some(cursor) {
-            base.patch(selection_bg(theme)).add_modifier(Modifier::BOLD)
+            base.patch(selection_bg(theme))
         } else {
             base
         }
@@ -396,7 +341,11 @@ fn fields(
             };
             spans.push(Span::styled(s.text.clone(), highlight(s.field, base)));
         }
-        put(buf, Rect::new(area.x, y, area.width, 1), clip(spans, w + 1));
+        put(
+            buf,
+            Rect::new(area.x, y, area.width, 1),
+            clip(spans, usize::from(area.width)),
+        );
         y += 1;
     }
 }
@@ -409,6 +358,8 @@ fn header(editor: &ProfileEditor, theme: &Theme, name_style: Style, area: Rect, 
     } else {
         editor.draft.name.clone()
     };
+    // The name is bold as a title; the Fields cursor adds only the
+    // selection background on it (`highlight` adds BOLD itself).
     let mut left = vec![
         Span::styled(" profile ".to_string(), theme.text_secondary()),
         Span::styled(name, name_style.add_modifier(Modifier::BOLD)),
@@ -581,26 +532,22 @@ fn origins(app: &App, editor: &ProfileEditor, theme: &Theme, area: Rect, buf: &m
         .scope
         .iter()
         .map(String::as_str)
-        .filter(|s| s.starts_with("*."))
+        .filter(|s| is_wildcard(s))
         .collect();
     let choices = &editor.origin_choices;
     if choices.is_empty() && wildcards.is_empty() {
         note(theme, body, NO_ORIGINS, buf);
         return;
     }
-    let h = usize::from(body.height);
     let w = usize::from(body.width);
-    let focused = app.scan.profiles.pane == ProfilePane::Origins;
+    // The cursor walks the choices only; the wildcard rows under them are
+    // never highlighted (none to walk when there is no choice).
+    let focused = app.scan.profiles.pane == ProfilePane::Origins && !choices.is_empty();
     let cursor = editor.origin_cursor.min(choices.len().saturating_sub(1));
     let total = choices.len() + wildcards.len();
-    let top = cursor.saturating_sub(h - 1);
-    for k in top..total.min(top + h) {
-        let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
-        let line = if let Some(choice) = choices.get(k) {
+    rows(buf, theme, body, total, cursor, focused, |k| {
+        if let Some(choice) = choices.get(k) {
             let is_cursor = k == cursor;
-            if is_cursor && focused {
-                buf.set_style(row, selection_bg(theme));
-            }
             let mark = if is_cursor { ">" } else { " " };
             let tick = if editor.draft.target.origins.contains(&choice.origin) {
                 "[x]"
@@ -629,9 +576,8 @@ fn origins(app: &App, editor: &ProfileEditor, theme: &Theme, area: Rect, buf: &m
                 )],
                 w,
             )
-        };
-        put(buf, row, line);
-    }
+        }
+    });
 }
 
 /// The Checks pane (D11): the head, then the flattened tree, one row per
@@ -663,19 +609,12 @@ fn checks(
         note(theme, body, NO_CHECKS, buf);
         return;
     }
-    let h = usize::from(body.height);
     let w = usize::from(body.width);
     let focused = profiles.pane == ProfilePane::Checks;
     let cursor = editor.tree_cursor.min(tree.len() - 1);
-    let top = cursor.saturating_sub(h - 1);
-    for (k, node) in tree.into_iter().enumerate().skip(top).take(h) {
-        let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
-        let is_cursor = k == cursor;
-        if is_cursor && focused {
-            buf.set_style(row, selection_bg(theme));
-        }
-        put(buf, row, tree_line(theme, editor, node, is_cursor, w));
-    }
+    rows(buf, theme, body, tree.len(), cursor, focused, |k| {
+        tree_line(theme, editor, tree[k], k == cursor, w)
+    });
 }
 
 /// One tree row.
@@ -729,99 +668,9 @@ fn clip(spans: Vec<Span<'static>>, w: usize) -> Line<'static> {
     Line::from(out)
 }
 
-/// Wrap `text` into rows of at most `w` cells, at most `max_rows` of them.
-/// The units are the text's clauses (cut after a `,` `.` `:` or `;` that a
-/// space follows, so a dotted address stays whole), and the words of a
-/// clause wider than a row: the D7 reasons name the missing scope entry
-/// clause by clause (`direction outbound,`), and a clause kept on one row
-/// keeps each `field value` pair readable. A word wider than a row is cut,
-/// and when the units do not all fit the rows the last row ends in an
-/// ellipsis.
-fn wrap(text: &str, w: usize, max_rows: usize) -> Vec<String> {
-    if w == 0 || max_rows == 0 {
-        return Vec::new();
-    }
-    let mut units: Vec<&str> = Vec::new();
-    for clause in clauses(text) {
-        if width(clause) <= w {
-            units.push(clause);
-        } else {
-            units.extend(clause.split_whitespace());
-        }
-    }
-    let mut rows: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < units.len() && rows.len() < max_rows {
-        let mut row = String::new();
-        while i < units.len() {
-            let unit = units[i];
-            if row.is_empty() {
-                row = truncate(unit, w);
-            } else if width(&row) + 1 + width(unit) <= w {
-                row.push(' ');
-                row.push_str(unit);
-            } else {
-                break;
-            }
-            i += 1;
-        }
-        rows.push(row);
-    }
-    if i < units.len() {
-        if let Some(last) = rows.last_mut() {
-            *last = truncate(&format!("{last} …"), w);
-        }
-    }
-    rows
-}
-
-/// `text` cut after every `,` `.` `:` or `;` that whitespace or the end
-/// follows, each piece trimmed, empty pieces dropped.
-fn clauses(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, b) in bytes.iter().enumerate() {
-        let ends_clause = matches!(b, b',' | b'.' | b':' | b';')
-            && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace);
-        if ends_clause {
-            // `b` is ASCII, so `i + 1` is a char boundary.
-            let clause = text[start..=i].trim();
-            if !clause.is_empty() {
-                out.push(clause);
-            }
-            start = i + 1;
-        }
-    }
-    let tail = text[start..].trim();
-    if !tail.is_empty() {
-        out.push(tail);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The wrap keeps words whole, cuts a word wider than a row, stops at
-    /// the row cap and marks what it dropped.
-    #[test]
-    fn wrap_breaks_at_clauses_then_spaces_and_caps_the_rows() {
-        assert_eq!(wrap("a bb ccc", 5, 4), vec!["a bb", "ccc"]);
-        assert_eq!(wrap("abcdefgh ij", 5, 4), vec!["abcd…", "ij"]);
-        assert_eq!(wrap("one two three four", 9, 1), vec!["one two …"]);
-        assert_eq!(wrap("one two", 9, 1), vec!["one two"]);
-        assert!(wrap("x", 0, 4).is_empty());
-        assert!(wrap("", 9, 4).is_empty());
-        // A clause that fits moves whole to the next row; a dotted address
-        // is not a clause end.
-        assert_eq!(
-            wrap("Add one with x, direction outbound, 10.0.0.1/32 y.", 22, 4),
-            vec!["Add one with x,", "direction outbound,", "10.0.0.1/32 y."]
-        );
-        assert_eq!(clauses("a: b, c.d; e"), vec!["a:", "b,", "c.d;", "e"]);
-    }
 
     /// The clip keeps whole spans, cuts the crossing one with an ellipsis
     /// and drops the rest.

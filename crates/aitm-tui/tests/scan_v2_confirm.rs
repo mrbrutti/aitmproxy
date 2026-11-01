@@ -223,3 +223,38 @@ fn the_box_fits_both_widths() {
         assert_eq!(count, 1, "the title appears once at {cols}x{rows}: {text}");
     }
 }
+
+/// Fix round G, G55: the prompt is wrapped by cell width, not by character
+/// count, so a prompt of wide glyphs never overruns the box.
+#[test]
+fn the_prompt_wraps_by_cell_width_not_chars() {
+    let mut app = fixture_app_core(60, 20);
+    // Twelve words of two wide glyphs: 35 chars, which a char count would
+    // put on one 48-cell row and clip, but 95 cells, which wrap onto two.
+    let prompt = ["日本"; 12].join(" ");
+    app.wire_confirm = Some(WireConfirm {
+        call: "scan.start".into(),
+        args: json!({}),
+        prompt,
+        token: "tok-1".into(),
+    });
+    app.mode = Mode::WireConfirm;
+    let text = screen(&app, 60, 20);
+    // `to_text` writes a wide glyph as the glyph and one pad cell.
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains('日')).collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "a prompt wider than the box takes two rows:\n{text}"
+    );
+    let shown: usize = rows.iter().map(|r| r.matches('日').count()).sum();
+    assert_eq!(
+        shown, 12,
+        "every word is on screen, none clipped away:\n{text}"
+    );
+    assert_eq!(
+        rows[0].matches('日').count(),
+        9,
+        "nine words fill 44 of 48 cells"
+    );
+}

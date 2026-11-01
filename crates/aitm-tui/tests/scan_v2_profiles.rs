@@ -24,10 +24,9 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::scan::{
     check_tree, parse_l4_target, session_line, tri_state, EditorField, OriginSource, ProfilePane,
-    ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITOR_FIELDS, L4_TARGET_ERROR,
-    OPEN_MARK, PROFILES_MAX,
+    ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITING_MARK, EDITOR_FIELDS,
+    L4_TARGET_ERROR, OPEN_MARK, PROFILES_MAX,
 };
-use aitm_tui::ui::scan::profiles::EDITING_MARK;
 use aitm_tui::ui::selection_bg;
 use common::*;
 use crossterm::event::KeyCode;
@@ -1839,4 +1838,25 @@ fn profiles_view_draws_at_every_size() {
             let _ = text_of(&app, cols, rows);
         }
     }
+}
+
+/// Fix round G, G58: the wildcard rule is one function, so the Origins
+/// pane greys exactly what the picker skipped: a bare `*` entry is offered
+/// to nobody and listed greyed with the hint, like `*.host`.
+#[test]
+fn a_bare_star_scope_entry_is_greyed_not_offered() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["*".into()]));
+    let _ = app.update(Action::ScanNewProfile);
+    focus_pane(&mut app, EditorField::Origins, ProfilePane::Origins);
+    let editor = app.scan.profiles.editor.as_ref().expect("an editor");
+    assert!(
+        editor.origin_choices.is_empty(),
+        "`*` is not an origin choice: {:?}",
+        editor.origin_choices
+    );
+    let text = text_of(&app, 200, 50);
+    let line = line_with(&text, "type an origin (o)")
+        .unwrap_or_else(|| panic!("the wildcard row is drawn:\n{text}"));
+    assert!(line.contains("*  type an origin (o)"), "{line:?}");
 }
