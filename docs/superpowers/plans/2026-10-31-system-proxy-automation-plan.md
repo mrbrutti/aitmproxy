@@ -1042,6 +1042,9 @@ never evidence; Kit unit tests and the live run are. Do not edit `Fixtures.rows`
 - **Done when:** owner's `swift test` shows the three new tests passing and every
   existing `ConnectionSummaryTests` still passing.
 
+
+> PR 4a (2026-11-01) shipped `SystemProxyState` as a struct of two endpoints plus `SystemProxyRoute { off, thisCore(http:https:), other(host:port:) }` and `init?(compact:listenAddress:)`; `SystemProxyFacts` carries `route: SystemProxyRoute`, not an enum `state`. Expected literal: `.route == .other(host: "127.0.0.1", port: 9090)`.
+
 ### Task 25: Kit — `EmbeddedCoreLaunch.Config` emits the `system_proxy:` block
 
 - **Satisfies:** SP-AC25.
