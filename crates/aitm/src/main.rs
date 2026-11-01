@@ -31,7 +31,9 @@ use aitm::wire::{
     assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
 };
 use aitm::{config_file, env, operator_token, tui};
-use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
+use aitm_core::{
+    engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin, NOTHING_DECRYPTED_ADVICE,
+};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
@@ -405,10 +407,19 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             shared.store.clone(),
         )
     });
-    let languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = match &l4_language {
-        Some(lang) => vec![lang],
-        None => Vec::new(),
-    };
+    // Scanner v2's `ws.*` script language slot (spec D1 and D8.3). It is built with
+    // the SAME `LateHandles` the script tier uses as its scope/rate guard, so every
+    // `ws.*` host fn is guarded: a script cannot reach a host outside scope or past
+    // the rate limit. `None` while track T4 is unimplemented, and a `None` slot adds
+    // no language — the engine then has no `ws.*` namespace (deny-by-default).
+    let ws_language = aitm_scan_ws::language(handles.clone());
+    let mut languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = Vec::new();
+    if let Some(lang) = &l4_language {
+        languages.push(lang);
+    }
+    if let Some(lang) = &ws_language {
+        languages.push(lang.as_ref());
+    }
     let tier = aitm_plugin_rhai::wire::build_with_languages(rhai_cfg, script_services, &languages)?;
     // The language only had to live long enough to install its host fns on the engine
     // (which holds its own `Arc` clones of the shared state); drop the borrow so the
@@ -424,9 +435,17 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 r.register(std::sync::Arc::from(h));
             }
         }
+        // The same for the `ws.*` language's PoC step, from the same instance the
+        // engine installed, so a `ws:` step and a script share one guarded surface.
+        if let Some(lang) = &ws_language {
+            if let Some(h) = aitm_plugin::language::ProtocolLanguage::poc_step(lang.as_ref()) {
+                r.register(std::sync::Arc::from(h));
+            }
+        }
         r
     };
     drop(l4_language);
+    drop(ws_language);
     for err in &tier.errors {
         warn!(target: "aitm::scripts", "{err}");
     }
@@ -726,6 +745,21 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
 
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Spec D8: with an empty Scope nothing is decrypted, and that is said once at
+    // launch — as the `Scope` line of `aitm web`'s stdout summary below, or, where
+    // no summary is printed (bare `aitm`, `aitm tui`), as one `info` line on the
+    // `aitm` target. Never `warn`, never repeated: the live read is
+    // `proxy.status.decrypt`, which follows a later `scope.add`.
+    let launch_advice = cfg
+        .scope
+        .entries
+        .is_empty()
+        .then_some(NOTHING_DECRYPTED_ADVICE);
+    if mode != Mode::Web {
+        if let Some(advice) = launch_advice {
+            info!(target: "aitm", "{advice}");
+        }
+    }
     let result = if mode == Mode::Tui {
         // `aitm tui`: the loopback agent server is built by `tui::build_servers`
         // on the core's shared policy state and audit ring (the `governance`
@@ -840,7 +874,8 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                         operator_url.as_deref(),
                         proxy_addr,
                         browser_addr,
-                        "ready"
+                        "ready",
+                        launch_advice,
                     )
                 );
                 Some((listener, state))

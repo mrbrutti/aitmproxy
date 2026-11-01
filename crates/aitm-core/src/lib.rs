@@ -26,6 +26,7 @@ pub mod redact;
 pub mod registry;
 pub mod store;
 pub mod stream;
+pub mod tunnel;
 pub mod value;
 
 pub use agent::{AgentPolicy, AgentState};
@@ -38,12 +39,12 @@ pub use audit::{
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
 pub use chain::Chain;
-pub use client::{PipelineClient, RequestSender};
+pub use client::{PipelineClient, RecordPolicy, RequestSender, SendOptions, VersionPolicy};
 pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
     BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
     LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig,
-    ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig,
+    ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, NOTHING_DECRYPTED_ADVICE,
 };
 pub use ctx::{
     BrowserDriver, CallerTrust, ClickTarget, CommandHost, FindingDraft, FindingRecorder, FlowCtx,
@@ -53,8 +54,9 @@ pub use egress::{ConfinementToken, EgressConfinement};
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{
-    ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
-    InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
+    saturating_i64, ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse,
+    HttpVersion, InterceptState, ResumeHandle, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow,
+    WsMessage, WsOpcode,
 };
 pub use guard::{
     classify_host, engine_may_reach_private, ssrf_check, ActionPermit, HostClass, ScopeRateGuard,
@@ -67,6 +69,7 @@ pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
 pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
+pub use tunnel::{classify_client_failure, relay, RelayCounts, TunnelRequest, TunnelRow};
 pub use value::{Params, Value};
 
 /// The crate version, wired to the Cargo package version.

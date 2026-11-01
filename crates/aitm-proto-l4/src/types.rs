@@ -80,6 +80,10 @@ pub struct L4ScopeEntry {
     pub cidr: IpCidr,
     /// `Any` == `0..=65535`; matched for Tcp/Udp.
     pub ports: PortRange,
+    /// The interface name the entry covers, or `"*"` for any interface: an
+    /// unprivileged socket client cannot know its egress interface before
+    /// connecting, so the operator authorises a destination, not a NIC.
+    /// Direction, CIDR, ports and capability still apply.
     pub interface: String,
     pub direction: L4Direction,
     /// Capture | Inject | Intercept — the capability this entry grants.
@@ -136,11 +140,23 @@ pub enum L4Capability {
     Intercept,
 }
 
-/// An inclusive port range. `lo == 0 && hi == 65535` means "any port".
+/// An inclusive port range. [`PortRange::ANY`] (`0..=65535`) means "any port".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRange {
     pub lo: u16,
     pub hi: u16,
+}
+
+impl PortRange {
+    /// The full range, meaning "any port" (`*`, `any` or an omitted `ports` in
+    /// `l4.scope.add`; `all ports` in its confirm prompt).
+    pub const ANY: PortRange = PortRange { lo: 0, hi: 65535 };
+
+    /// Whether this is the full range, [`PortRange::ANY`].
+    #[must_use]
+    pub fn is_any(self) -> bool {
+        self == Self::ANY
+    }
 }
 
 /// A CIDR block: a base address plus a prefix length in bits.
@@ -160,7 +176,17 @@ pub struct RateCap {
 
 #[cfg(test)]
 mod tests {
-    use super::L4Proto;
+    use super::{L4Proto, PortRange};
+
+    /// `PortRange::ANY` is the full range and the only range `is_any` accepts.
+    #[test]
+    fn port_range_any() {
+        assert_eq!(PortRange::ANY, PortRange { lo: 0, hi: 65535 });
+        assert!(PortRange::ANY.is_any());
+        assert!(!PortRange { lo: 0, hi: 65534 }.is_any());
+        assert!(!PortRange { lo: 1, hi: 65535 }.is_any());
+        assert!(!PortRange { lo: 80, hi: 80 }.is_any());
+    }
 
     /// A15 (L4PAR-AC1): the names `l4.flow.get` puts on the wire for the four
     /// transports `PacketSpec::endpoints` decodes, the same as `summarize`'s.

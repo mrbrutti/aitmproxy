@@ -48,3 +48,50 @@ pub const AUTH_BYPASS_MARKER: &str = "ADMIN-AREA-MARKER-c6f0";
 /// browser to. The vulnerable variant honours it in `Location`; the patched
 /// variant allowlists and never emits it.
 pub const OPEN_REDIRECT_MARKER: &str = "redirect-marker-e2d9.example";
+
+// --- T10 seed markers and signals (child spec D3) ---------------------------
+//
+// Still inert sentinels. The "credentials" below are the test target's own
+// fixture login, not secrets: they are printed in the spec and the index form.
+
+/// Error-based SQLi: the substring the vulnerable `/products?id=` 500 page
+/// carries when `id` contains a quote. The patched variant answers 400
+/// `invalid id` and never emits it.
+pub const SQLI_ERROR_SIGNAL: &str = "SQL syntax error near";
+
+/// Command injection: appended to the vulnerable `/ping?host=` output when the
+/// injected command is `id`. The patched variant rejects any host outside
+/// `^[A-Za-z0-9.-]{1,253}$` with 400.
+pub const CMDI_MARKER: &str = "uid=0(root) gid=0(root)";
+
+/// Path traversal and XXE: the one "file" the target knows. The vulnerable
+/// `/static?file=` serves it for a `../`-containing path ending `etc/passwd`,
+/// and the vulnerable `/xml` expands `<!ENTITY e SYSTEM "file:///etc/passwd">`
+/// to it. No file is read; the constant is the entire filesystem.
+pub const TRAVERSAL_MARKER: &str = "root:x:0:0:root:/root:/bin/bash";
+
+/// NoSQL injection: the marker the vulnerable `/api/login` returns when
+/// `password` is a JSON object (an operator such as `{"$ne":""}`).
+pub const NOSQLI_MARKER: &str = "NOSQLI-LOGIN-MARKER-4b1d";
+
+/// LDAP injection: the marker the vulnerable `/ldap?user=` appends when the
+/// wildcard filter `(uid=*)` lists every user.
+pub const LDAPI_ALL_USERS_MARKER: &str = "LDAP-ALL-USERS-MARKER-77c2";
+
+/// LDAP injection, the error signal: the vulnerable `/ldap?user=` 500 body for
+/// an unbalanced or `)(`-broken filter.
+pub const LDAPI_ERROR_SIGNAL: &str = "Bad search filter";
+
+/// The fixture login `POST /login` accepts (`user=alice&pass=wonderland`); also
+/// the `user` named in the `/ws` hello frame and the `/api/login` success body.
+pub const SESSION_USER: &str = "alice";
+
+/// The fixture password for [`SESSION_USER`]. A fixture, not a secret.
+pub const SESSION_PASS: &str = "wonderland";
+
+/// SSTI: the probe the agent sends as `/greet?name=`; the vulnerable variant
+/// evaluates it, the patched one escapes it unevaluated.
+pub const SSTI_PROBE: &str = "{{7*7}}";
+
+/// SSTI: the evaluated result of [`SSTI_PROBE`] in the vulnerable `<h1>`.
+pub const SSTI_SIGNAL: &str = "Hello 49";

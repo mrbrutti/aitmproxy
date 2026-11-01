@@ -6,7 +6,8 @@
 //!
 //! - a cleartext `CONNECT` tunnel dials the `CONNECT` target, never the `Host`
 //!   header of the request inside it, and the SSRF-guarded listener judges that
-//!   target, not the `Host`;
+//!   target, not the `Host` (a target outside Scope is refused at `CONNECT`
+//!   time, before any acknowledgement, and leaves a failed tunnel row);
 //! - a complete response, or a partial head, that an origin writes in the same
 //!   read as the end of a legitimate response is neither forwarded nor parsed as
 //!   the next response, and the upstream it came from is replaced, over
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
     Body, Config, Flow, FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, Proxy,
-    RequestSender, ScopeConfig, ScopeEntry,
+    RequestSender, ScopeConfig, ScopeEntry, TunnelInfo, TunnelReason,
 };
 use aitm_proto_http::{CertAuthority, Http1Sender, HttpModule};
 use rustls::pki_types::pem::PemObject;
@@ -270,14 +271,22 @@ enum Egress {
 }
 
 /// Run a passive `Proxy` (see [`Egress::Passive`]) with the HTTP module (a fresh
-/// CA) and no plugins. The passive connector relays without a scope gate, so the
-/// origins need no scope entry. When `tls_handshake_timeout` is given, the module
-/// bounds its TLS handshake to an origin by it. Returns the proxy address, the
-/// CA's root PEM and the proxy's flow store.
+/// CA) and no plugins. Scope is the decryption list (per-host decryption), so
+/// `127.0.0.1` is in Scope: every loopback `CONNECT` here is decrypted — served
+/// by the proxy — rather than relayed byte for byte. The passive connector
+/// itself relays to any address without a scope gate. When
+/// `tls_handshake_timeout` is given, the module bounds its TLS handshake to an
+/// origin by it. Returns the proxy address, the CA's root PEM and the proxy's
+/// flow store.
 async fn run_proxy(
     tls_handshake_timeout: Option<Duration>,
 ) -> (SocketAddr, String, Arc<dyn FlowStore>) {
-    start_proxy(Egress::Passive, &[], tls_handshake_timeout).await
+    start_proxy(
+        Egress::Passive,
+        &["127.0.0.1".to_string()],
+        tls_handshake_timeout,
+    )
+    .await
 }
 
 /// Run an SSRF-guarded `Proxy` (see [`Egress::Guarded`]) whose scope is exactly
@@ -420,6 +429,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
     }
 }
 
+/// Like [`read_head`], but a connection that closes or fails before the blank
+/// line ends the read instead of failing it: the head read so far (empty when the
+/// peer closed without writing) is returned.
+async fn read_reply_or_close<S: AsyncRead + Unpin>(s: &mut S) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        match s.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        assert!(buf.len() < 64 * 1024, "head never terminated");
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Send `CONNECT authority` with `Host: host` through the proxy and return the
+/// raw stream and whatever reply head the proxy wrote (empty when it closed the
+/// connection without one). Unlike [`connect_tunnel`], the reply need not be a
+/// `200`; the exchange is bounded by `IO_TIMEOUT`.
+async fn try_connect_tunnel(
+    proxy: SocketAddr,
+    authority: SocketAddr,
+    host: SocketAddr,
+) -> (TcpStream, String) {
+    tokio::time::timeout(IO_TIMEOUT, async {
+        let mut tcp = TcpStream::connect(proxy).await.expect("connect proxy");
+        tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .expect("send CONNECT");
+        let reply = read_reply_or_close(&mut tcp).await;
+        (tcp, reply)
+    })
+    .await
+    .expect("the CONNECT exchange with the proxy timed out")
+}
+
 /// Open a CONNECT tunnel to `authority` through the proxy and return the raw
 /// stream, positioned just past the `200` reply.
 async fn connect_tunnel(proxy: SocketAddr, authority: SocketAddr) -> TcpStream {
@@ -485,8 +531,9 @@ fn has_captured_body(flow: &HttpFlow) -> bool {
     )
 }
 
-/// Poll up to `IO_TIMEOUT` until the store holds at least `n` HTTP flows whose
-/// response body is `Body::Bytes`, and return all such flows in insertion order.
+/// Poll up to `IO_TIMEOUT` until the store holds at least `n` request flows
+/// (never a `CONNECT` tunnel row, spec D5) whose response body is `Body::Bytes`,
+/// and return all such flows in insertion order.
 async fn wait_for_flows(store: &Arc<dyn FlowStore>, n: usize) -> Vec<HttpFlow> {
     let deadline = Instant::now() + IO_TIMEOUT;
     loop {
@@ -494,7 +541,9 @@ async fn wait_for_flows(store: &Arc<dyn FlowStore>, n: usize) -> Vec<HttpFlow> {
             .list()
             .into_iter()
             .filter_map(|id| match store.get(id) {
-                Some(Flow::Http(h)) if has_captured_body(&h) => Some(h),
+                Some(Flow::Http(h)) if h.metadata.tunnel.is_none() && has_captured_body(&h) => {
+                    Some(h)
+                }
                 _ => None,
             })
             .collect();
@@ -505,6 +554,30 @@ async fn wait_for_flows(store: &Arc<dyn FlowStore>, n: usize) -> Vec<HttpFlow> {
             Instant::now() < deadline,
             "the store never held {n} HTTP flows with a captured response body (it has {})",
             flows.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Poll up to `IO_TIMEOUT` until the store holds the `CONNECT` tunnel row (spec
+/// D5) for `authority`, and return it.
+async fn wait_for_tunnel_row(store: &Arc<dyn FlowStore>, authority: &str) -> HttpFlow {
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        let found = store.list().into_iter().find_map(|id| match store.get(id) {
+            Some(Flow::Http(h))
+                if h.metadata.tunnel.is_some() && h.request.authority == authority =>
+            {
+                Some(h)
+            }
+            _ => None,
+        });
+        if let Some(row) = found {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the store never held a tunnel row for {authority}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -585,14 +658,19 @@ async fn a_cleartext_tunnel_dials_the_connect_target_not_the_host_header() {
 }
 
 /// The SSRF-guarded listener (`Proxy::run_browser`) judges a cleartext CONNECT
-/// tunnel by its CONNECT target, never by the `Host` of the request inside it.
-/// Loopback is private, so the guard admits a loopback dial only when scope
-/// names that exact address and port. Two loopback origins, one in scope
-/// (`allowed`) and one not (`denied`), make both directions observable:
+/// tunnel by its CONNECT target, never by a `Host` header. Scope is the
+/// decryption list and loopback is private, so the guard admits a loopback dial
+/// only when Scope names that exact address and port. Two loopback origins, one
+/// in Scope (`allowed`) and one not (`denied`), make both directions observable:
 ///
-/// - a tunnel to `denied` whose request says `Host: <allowed>` is refused: the
-///   client sees the connection close and neither origin accepts anything. A
-///   proxy that handed the guard the `Host` would reach `allowed`.
+/// - a `CONNECT` to `denied` whose `Host` names `allowed` is refused at CONNECT
+///   time: `denied` is outside Scope, so the proxy does not decrypt the tunnel
+///   but relays it, and the relay dials the CONNECT target through the guarded
+///   connector first, which refuses a loopback address Scope does not name. The
+///   client gets no `200`, the connection closes, neither origin accepts
+///   anything, and the store holds a `failed/upstream_unreachable` tunnel row
+///   for `denied` (spec D5). A proxy that handed the guard the `Host` would
+///   reach `allowed`.
 /// - a tunnel to `allowed` whose request says `Host: <denied>` is answered by
 ///   `allowed`, and `denied` still accepts nothing. A proxy that handed the guard
 ///   the `Host` would refuse it.
@@ -600,17 +678,18 @@ async fn a_cleartext_tunnel_dials_the_connect_target_not_the_host_header() {
 async fn the_guard_judges_a_cleartext_tunnel_by_its_connect_target_not_the_host_header() {
     let allowed = spawn_plain_origin(Behaviour::Normal).await;
     let denied = spawn_plain_origin(Behaviour::Normal).await;
-    let (proxy, _root, _store) = run_guarded_proxy(&[allowed.addr.to_string()]).await;
+    let (proxy, _root, store) = run_guarded_proxy(&[allowed.addr.to_string()]).await;
 
     // CONNECT to the out-of-scope origin, with a `Host` naming the in-scope one.
-    let mut client = Client::new(connect_tunnel(proxy, denied.addr).await);
-    let why = client
-        .get("/refused", &allowed.addr.to_string())
-        .await
-        .expect_err("the guard must refuse the dial to the out-of-scope CONNECT target");
+    let (mut tcp, reply) = try_connect_tunnel(proxy, denied.addr, allowed.addr).await;
     assert!(
-        !why.starts_with("timed out"),
-        "the proxy must close a refused tunnel, not leave it hanging: {why}"
+        !reply.starts_with("HTTP/1.1 200"),
+        "a CONNECT to a loopback target outside Scope must not be acknowledged: {reply:?}"
+    );
+    let after = tokio::time::timeout(IO_TIMEOUT, tcp.read(&mut [0u8; 1])).await;
+    assert!(
+        matches!(after, Ok(Ok(0)) | Ok(Err(_))),
+        "the proxy must close a refused tunnel, not leave it hanging: {after:?}"
     );
     assert_eq!(
         denied.accepted(),
@@ -621,6 +700,17 @@ async fn the_guard_judges_a_cleartext_tunnel_by_its_connect_target_not_the_host_
         allowed.accepted(),
         0,
         "the Host header must not choose the tunnel's upstream"
+    );
+    let row = wait_for_tunnel_row(&store, &denied.addr.to_string()).await;
+    assert_eq!(row.request.method, "CONNECT");
+    assert_eq!(
+        row.metadata.tunnel,
+        Some(TunnelInfo::failed(TunnelReason::UpstreamUnreachable))
+    );
+    assert!(row.response.is_none(), "a refused tunnel reports no status");
+    assert!(
+        row.metadata.duration.is_some(),
+        "a failed tunnel row is closed"
     );
 
     // CONNECT to the in-scope origin, with a `Host` naming the out-of-scope one.

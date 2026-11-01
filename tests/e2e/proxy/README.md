@@ -56,6 +56,31 @@ Python stdlib has no h2 server).
   star-less substring) parks a real request on a real core: the UPSTREAM record is
   empty while the flow is parked and has the request after `flow.resume`; a rule
   naming another host leaves the request unpaused (`observed`, 200).
+- **test_per_host_decryption.py** — Scope is the decryption list, on a real core
+  booted with an EMPTY scope: an HTTPS request to an out-of-scope origin is
+  tunnelled, not decrypted (`curl --cacert <aitm ca>` fails to verify because the
+  client saw the ORIGIN's own cert; `curl -k` gets the origin's marker) and the bus
+  holds one `CONNECT` row per connection (one after the first curl, two after the
+  second), all `tunnel == "passthrough"`, `tunnel_reason == "out_of_scope"`,
+  status 200, `bytes_up`/`bytes_down` > 0, `duration_ms` set once the client
+  closed — never a decrypted `GET` row;
+  `scope.add` flips the NEXT connection live (a `decrypted` CONNECT row plus a
+  `GET` row with `passive == false`; the earlier passthrough row is untouched);
+  `scope.remove` flips it back (a new `passthrough` row, no new `GET`); a client
+  that refuses the aitm CA on an in-scope host is a `CONNECT` row with
+  `tunnel == "failed"`, `tunnel_reason == "client_rejected_certificate"`, status
+  null and `duration_ms` set; plain HTTP to an out-of-scope origin is captured
+  with `passive == true` and an armed breakpoint rule naming it does NOT park it
+  (the UPSTREAM record has the request at once, `proxy.status.paused == 0`), while
+  after `scope.add` the same request IS parked until `flow.resume` and its row has
+  `passive == false`; `proxy.status.decrypt` reads back `decrypting false` with
+  the exact advice sentence on the empty scope and `decrypting true`, `advice`
+  null, after `scope.add`; a `flow.subscribe` on the operator connection receives
+  the passthrough row as `created` then `response`, both carrying
+  `tunnel == "passthrough"`; and the launch line: booted with an empty Scope, bare
+  `aitm` logs "Nothing is decrypted until a host is in Scope." exactly once (the
+  core's own stdout + stderr, polled briefly after boot in case the line lags the
+  bus endpoint file).
 
 ## The kill-503 regression
 

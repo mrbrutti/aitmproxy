@@ -1,0 +1,74 @@
+{
+  "issues": [
+    {
+      "id": "issue-9f8e7d6c",
+      "job": "scan-1a2b3c4d",
+      "check_id": "http.reflected-xss",
+      "class": "reflected-xss",
+      "name": "Reflected cross-site scripting",
+      "severity": "high",
+      "confidence": "certain",
+      "status": "open",
+      "lane": "http",
+      "target": {
+        "scheme": "http",
+        "host": "127.0.0.1",
+        "port": 8080
+      },
+      "location": {
+        "method": "GET",
+        "path": "/search",
+        "path_template": "/search",
+        "kind": "query",
+        "name": "q",
+        "field_path": null,
+        "ws_path": null,
+        "l4": null
+      },
+      "first_seen": 1761900000000,
+      "last_seen": 1761900000000,
+      "occurrences": 1,
+      "poc_ref": "poc-3b1c",
+      "finding_id": "finding-7a21"
+    },
+    {
+      "id": "issue-4c3b2a19",
+      "job": "scan-1a2b3c4d",
+      "check_id": "http.open-redirect",
+      "class": "open-redirect",
+      "name": "Open redirect",
+      "severity": "medium",
+      "confidence": "firm",
+      "status": "open",
+      "lane": "http",
+      "target": {
+        "scheme": "http",
+        "host": "127.0.0.1",
+        "port": 8080
+      },
+      "location": {
+        "method": "GET",
+        "path": "/go",
+        "path_template": "/go",
+        "kind": "query",
+        "name": "next",
+        "field_path": null,
+        "ws_path": null,
+        "l4": null
+      },
+      "first_seen": 1761900000000,
+      "last_seen": 1761900000000,
+      "occurrences": 1,
+      "poc_ref": null,
+      "finding_id": null
+    }
+  ],
+  "next_cursor": null,
+  "by_severity": {
+    "critical": 0,
+    "high": 1,
+    "medium": 1,
+    "low": 0,
+    "info": 0
+  }
+}

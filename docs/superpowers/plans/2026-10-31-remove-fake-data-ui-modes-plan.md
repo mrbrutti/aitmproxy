@@ -165,6 +165,16 @@ Three independent groups, one per frontend, fan out to the three worktrees; with
 - **Test:** `grep -c "selftest-live.mjs\|npm run typecheck && npm test\|do not add one" apps/web/README.md` prints `3` or more; `grep -c "bus=mock\|createMockBus" apps/web/README.md` prints `0` (the README names `?bus=` only to say it is not read).
 - **Done when:** both greps match; the file exists in the PR.
 
+### Task W5: `scripts/selftest-live.mjs` tells the truth about the current core (added by the orchestrator 2026-11-01)
+
+- **Satisfies:** AC5 (the live half: "`node scripts/selftest-live.mjs` prints PASS and exits 0")
+- **Depends on:** W3
+- **Files:** `apps/web/scripts/selftest-live.mjs` (modify), `apps/web/scripts/live-env.mjs` (modify, only if the operator connection needs it), `apps/web/README.md` (modify, one line if the invocation changes)
+- **Why:** run against the real core built from this branch (`/tmp/claude/nofx-web-selftest-live.log`), the script reports 8 PASS / 13 FAIL / 4 SKIP, and every FAIL is the script's expectation lagging the core, not the UI: (1) `EXPECTED_TOOLS` pins 37 names while the core serves 73 (`missing=[] extra=[36]`); (2) seven steps call sensitive commands (`flow.intercept` ×2, `scope.remove`, `poc.run` and its `poc.artifact` consequence, `proxy.pause`, `flow.clear`) that the core refuses under the default `auto` agent policy because the script connects as an agent — the operator path exists (the config's `mcp.operator_token`; `aitm web` prints an operator URL with `&expect=operator`; read `crates/aitm/src/web/mod.rs` and `crates/aitm/src/web/bus.rs` for how the bridge resolves the operator role) and is what the real operator UI uses; (3) `findings.list` is called with a `limit` param the core rejects (`-32602 unknown param`); (4) the four "gap" steps (F3 response-phase intercept, F3 kill modes, F9 WebSocket tools, F1 agent tools) `fail(...)` because the core now HAS the feature — the gap closed. A gate that fails on `main` for reasons unrelated to the UI is not a gate.
+- **Change:** (1) replace the fixed 37-name pin by a check that `tools/list` is non-empty and contains every tool the script itself calls, reporting the full name list in DETAIL (the tool-set contract lives in `crates/aitm/tests/frontends.rs` and the TUI's `tui_live_bus`, not here); (2) generate `mcp.operator_token` in `live-env.mjs`'s config and connect the script's bus as the operator so the sensitive steps run as the real operator UI does — if a step is still refused as operator, the step FAILs honestly with the core's message; (3) drop the `limit` argument; (4) turn the four closed-gap steps into PASS steps that state the closure (`PASS gap F3 closed: flow.intercept takes rules; flow.mutate edits carry status`) with a one-call probe each where cheap (`flow.kill` with `mode`, `ws.*` present, `agent.status` answers), leaving genuinely open gaps (F4 push, F14 browser.tabs, header deletion) as SKIP exactly as today. No step may be weakened to pass: a refusal or an error is a FAIL with the core's text.
+- **Test:** the orchestrator reruns `AITM_BIN=<core built from this branch> node scripts/selftest-live.mjs` in the Terminal; the JSON summary line has `"fail":0`, the exit status is 0, and the PASS lines include capture-through-the-proxy, the intercept → mutate → resume round trip with the upstream seeing the edit, `poc.run`, `proxy.pause`/`proxy.resume` and `flow.clear`. In the sandbox the Coder can only run `node --check scripts/selftest-live.mjs scripts/live-env.mjs` and `npm run typecheck` (the scripts are not type-checked; they must still parse).
+- **Done when:** the Terminal run above shows `"fail":0` and exit 0, quoted in the PR body; `npm run typecheck && npm test` still pass.
+
 ---
 
 ## mac group — root worktree, branch `claude/nice-pare-a04795`
@@ -284,6 +294,24 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| W1–W4 | Tester | — | PASS on AC1/AC5-static/AC7/AC8/AC9/AC10; strengthened `src/bus/index.test.ts` (bridge host, expectRole, fragment edge cases) | tests committed in 77aed542 |
+| W1–W4 | Tester | note | AC5's live half not met at 77aed542: `scripts/selftest-live.mjs` lagged the core (37-tool pin, agent-role refusals, `findings.list limit`, closed-gap checks) | fixed by task W5 (0ec1dbdc): operator connection, current shapes → 23 PASS / 0 FAIL / 4 SKIP, exit 0 against the core built from this branch |
+| W1–W4 | Security | Minor | README called `?perf=1` dev-only; `src/viewers/perf.ts` logs inspector timings in any build | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `AgentNotification.origin` comment claimed `mac`/`web`/`tui` are read as human | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | three sample `ScriptInfo` rows and the toggle reply duplicated between `Scripts.test.tsx` and `Sidebar.test.tsx` | accepted (autonomous mode, orchestrator 2026-11-01): spec D6 asks each test for its own inline inputs |
+| W1–W4 | Quality | Minor | `MemoryBusOptions.flows` / `.status` had no caller | fixed in 1b49d25d (deleted) |
+| W1–W4 | Quality | Minor | dead `address` parameters on `bridgeBus()` / `withStatus()` | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `onFlowEvent` one-line shim with a single caller | fixed in 1b49d25d (`onFlowTrigger` called directly) |
+| W1–W4 | Quality | Minor | `index.test.ts` malformed-token case asserted `not.toBeNull()` | fixed in 1b49d25d (`'\uFFFD%A'` pinned) |
+| W1–W4 | Quality | Minor | redundant regex after an exact-text assertion in `Scripts.test.tsx` | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `SCRIPT_TOOLS`/`HOST_TOOLS` duplication and an unreachable `default` | fixed in 1b49d25d |
+| W1–W4 | Quality + Spec | Minor | `tools` replaced the default catalogue so callers re-spelt it; `SERVED_TOOLS` exported beyond the plan | fixed in 1b49d25d (`extraTools`; `SERVED_TOOLS` module-private) |
+| W1–W4 | Quality | Minor | `flow()` exported with one user; `lastError` a signal whose setter is discarded | `flow()` accepted (spec D6 names it); `lastError` fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `PocRun.description` carried a boolean's doc comment | fixed in 1b49d25d |
+| W1–W4 | Spec | Minor | README has two sections beyond the plan (Layout, `?perf=1`) | accepted (autonomous mode, orchestrator 2026-11-01): both accurate; the perf note records that the mock's `rate=` stream is gone |
+| W1–W4 | Spec | note | sanctioned deviations: `normalize.test.ts` reworded in W3, `export.ts:89` / `model.ts:34` comments in W4 (orchestrator additions); `app.resync.test.ts` listed as "modify" but never imported the mock | recorded |
+| W1–W5 | Spec | note | plan text drift after the fix task: `bridgeBus()` / `withStatus()` lost their `address` parameter, `MemoryBusOptions` is `{ tools?, extraTools?, scripts?, address? }`; W3's grep claim about `import.meta.env.DEV` hits the pre-existing `src/shell/perf.ts:59` | recorded; the code is the record |
+| W5 | Coder | note | F4 stays SKIP with honest text (the script does not subscribe); a `flow.subscribe` probe is a follow-up | recorded |
 | T1–T4 | Tester | — | PASS on AC1/AC6-static/AC7/AC8/AC9/AC10 and every T-task's named test; added `tests/cli_usage.rs` (the binary rejects the removed flags), three robustness tests, two helper contracts | tests committed in b1cbdf69 |
 | T1–T4 | Security | Minor | the deleted `tester_bus_task.rs` guarded a refused token (no retry), connect back-off (≥ 400 ms) and a malformed `flow.detail` reply; nothing re-pinned them | fixed in 897cb53c: `tests/bus_task.rs` with a file-local scripted `BusTransport` whose replies are literals (closes spec Q3 — no follow-up card needed) |
 | T1–T4 | Security | Minor | two reducer-level tests D7 allowed were dropped (`:scan` scope gate; non-image `browser.screenshot` placeholder) | fixed in 897cb53c (re-added in `robustness.rs` on inline inputs) |

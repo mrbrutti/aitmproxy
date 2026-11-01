@@ -1,0 +1,17 @@
+{
+  "origin": "http://127.0.0.1:8080",
+  "cookies": [
+    "sid"
+  ],
+  "headers": [
+    "authorization"
+  ],
+  "source_flow": "550e8400-e29b-41d4-a716-446655440000",
+  "observed_at": 1761900000000,
+  "canary": {
+    "kind": "flow",
+    "method": "GET",
+    "path": "/account",
+    "expected_status": 200
+  }
+}

@@ -23,6 +23,30 @@ pub const FIXTURE_FP256: &str =
 /// `openssl x509 -noout -fingerprint -sha1` prints it.
 pub const FIXTURE_FP1: &str = "B1:30:2C:92:2B:7C:A0:78:5D:76:E0:A0:00:43:01:51:1C:05:92:90";
 
+/// The macOS trust read-back line `MacOsStore` runs for the `/ca` fixture
+/// directory the tests use (`verify-cert`, basic policy, local only).
+pub const VERIFY_CMD: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
+
+/// `verify-cert`'s stdout on exit 0 for a trusted CA.
+pub const VERIFY_OK: &str = "/ca/ca.crt: certificate verification successful.";
+
+/// `verify-cert`'s output tail on a non-zero exit for an untrusted CA.
+pub const NOT_TRUSTED: &str = "Cert Verify Result: CSSMERR_TP_NOT_TRUSTED";
+
+/// What `add-trusted-cert` prints on stderr when the authentication dialog
+/// is dismissed (spec D17.4; Apple spells it "canceled").
+pub const CANCEL_STDERR: &str =
+    "SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.";
+
+/// The one `detail` line every macOS status answer starts with.
+pub const MACOS_DETAIL: &str = "macOS: presence from `security find-certificate`; trust from \
+                                `security verify-cert` (basic policy, local only; our install \
+                                sets the ssl and basic policies together)";
+
+/// What [`ScriptedExecutor::unspawnable`] fails [`VERIFY_CMD`] with.
+pub const VERIFY_SPAWN_FAILURE: &str = "could not start `security verify-cert -c /ca/ca.crt -l -L \
+                                        -p basic`: No such file or directory (os error 2)";
+
 /// A host made of canned answers. `run` never reaches the OS: responses are
 /// keyed by rendered command line, with a default for anything unlisted.
 /// Files, directories, home and root status are fixed by the builder
@@ -40,6 +64,7 @@ pub struct ScriptedExecutor {
     home: Option<PathBuf>,
     is_root: bool,
     real_fs: bool,
+    unspawnable: BTreeSet<String>,
     runs: Mutex<Vec<(String, Option<Vec<u8>>)>>,
     reads: Mutex<Vec<PathBuf>>,
 }
@@ -64,6 +89,7 @@ impl ScriptedExecutor {
             home: Some(PathBuf::from("/Users/t")),
             is_root: false,
             real_fs: false,
+            unspawnable: BTreeSet::new(),
             runs: Mutex::new(Vec::new()),
             reads: Mutex::new(Vec::new()),
         }
@@ -96,6 +122,14 @@ impl ScriptedExecutor {
 
     pub fn root(mut self, is_root: bool) -> Self {
         self.is_root = is_root;
+        self
+    }
+
+    /// Commands whose first argument is `subcommand` are recorded like every
+    /// other run, then refused the way `RealExecutor` refuses a program it
+    /// cannot start, so a store sees a missing tool mid-sequence.
+    pub fn unspawnable(mut self, subcommand: &str) -> Self {
+        self.unspawnable.insert(subcommand.to_string());
         self
     }
 
@@ -132,6 +166,13 @@ impl Executor for ScriptedExecutor {
     fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
         let rendered = cmd.render();
         lock(&self.runs).push((rendered.clone(), cmd.stdin.clone()));
+        if cmd
+            .args
+            .first()
+            .is_some_and(|sub| self.unspawnable.contains(sub))
+        {
+            bail!("could not start `{rendered}`: No such file or directory (os error 2)");
+        }
         let mut responses = lock(&self.responses);
         let out = match responses.get_mut(&rendered) {
             // Queued responses play in order; the last one repeats.
