@@ -20,6 +20,14 @@ D2. **Page limit not enforced client-side; rows rebuilt from unbounded strings e
 
 D3. A `CallTaggedFailed` for `scan.issue:<id>` leaves the id in `fetched` so the issue is unreadable until a terminal line (`crates/aitm-tui/src/app.rs` `on_scan_failed`): remove the id from `fetched` on failure (and clear `pending_read`). Test: a failed `scan.issue` then a cursor landing on the same row sends a second `scan.issue`.
 
+## Spec panel items
+
+D4. **A bus without `scan.issue` is never named on screen** (`crates/aitm-tui/src/ui/scan/mod.rs` `degraded()`): under V2 the Issues tab's degraded text names the first missing one of `scan.issues`, `scan.issue` (`<verb> is not on this bus`); `issue_cursor_landed` keeps the quiet `scan_poll` path (ruling: option b, plan amended). Test (`tests/scan_v2_matrix.rs` or `scan_v2_issues.rs`): tools with `scan.issues` but without `scan.issue`, Issues tab shown: the strip row ends with `scan.issue is not on this bus` and a cursor landing sends nothing.
+
+D5. **`scan.issue` fold-under-key has no test** (`tests/scan_v2_issues.rs`): `CallTaggedOk { tag: "scan.issue:issue-9f8e7d6c", value: scan.issue.json with "id" rewritten to "issue-4c3b2a19" }` leaves `detail == None` and sets the Issues error detail `reply named a different issue`.
+
+D6. **Three builder rules without pins** (`tests/scan_v2_issues.rs`): `S` on the Jobs tab sends nothing; `OpenScan` after `Back` from Issues sends `scan.issues`; `ScanPaneNext` (Detail focused) then `Down` sends no `scan.issue`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (`ui/text.rs`, pre-existing, flow list too): a follow-up outside this track, recorded in the Review log.
