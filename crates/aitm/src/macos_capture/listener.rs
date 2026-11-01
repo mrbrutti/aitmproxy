@@ -411,6 +411,13 @@ pub struct DataConnection {
 }
 
 impl DataConnection {
+    /// A data connection over an already-connected stream, for feeder tests that
+    /// need one without a bound listener.
+    #[cfg(test)]
+    pub(crate) fn for_test(flow_id: u64, stream: UnixStream) -> Self {
+        Self { flow_id, stream }
+    }
+
     /// Take the raw data stream (TCP: the client byte stream).
     #[must_use]
     pub fn into_stream(self) -> UnixStream {
