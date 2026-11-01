@@ -231,13 +231,13 @@ fn probe() -> L4Privilege {
     let has = |cap: u32| bits & (1u64 << cap) != 0;
     L4Privilege {
         capture_inject: (!has(CAP_NET_RAW)).then(|| {
-            "missing CAP_NET_RAW (raw capture/inject needs `setcap cap_net_raw+ep` on the \
-             binary, or root)"
+            "missing CAP_NET_RAW (raw capture and inject need the packet-capture helper or a \
+             privileged process)"
                 .to_string()
         }),
         intercept: (!has(CAP_NET_ADMIN)).then(|| {
-            "missing CAP_NET_ADMIN (in-path NFQUEUE needs `setcap cap_net_admin+ep` on the \
-             binary, or root)"
+            "missing CAP_NET_ADMIN (in-path interception needs the core itself to hold \
+             CAP_NET_ADMIN)"
                 .to_string()
         }),
     }
@@ -250,11 +250,7 @@ fn probe() -> L4Privilege {
 fn probe() -> L4Privilege {
     use std::io::ErrorKind;
 
-    let mut capture_inject = Some(
-        "no read+write access to any /dev/bpf* device (capture/inject needs it; install \
-         ChmodBPF or run with privilege)"
-            .to_string(),
-    );
+    let mut capture_inject = Some("no read+write access to any /dev/bpf* device".to_string());
     for n in 0..256u32 {
         let path = format!("/dev/bpf{n}");
         match std::fs::OpenOptions::new()

@@ -1148,4 +1148,245 @@ mod tests {
         // A Linux platform tagged with macOS inputs only is not a macOS report.
         assert_eq!(report.capture, no_backend);
     }
+
+    // ---- Task P1b.3: no reply names a command (spec AC3, Rule 2) ----
+
+    /// The commands the product must never tell an operator to run.
+    const COMMANDS: [&str; 8] = [
+        "sudo",
+        "setcap",
+        "chmod",
+        "chgrp",
+        "chown",
+        "dseditgroup",
+        "launchctl",
+        "pkexec",
+    ];
+
+    /// Every row of both tables plus the other-platform row, as `derive` builds
+    /// them.
+    fn every_row() -> Vec<PrivilegeReport> {
+        let mut rows = vec![
+            // macOS
+            derive(&inputs(false, mac(true, Some(receipt(vec![])), true), None)),
+            derive(&inputs(false, mac(false, None, false), None)),
+            derive(&inputs(true, mac(true, Some(receipt(vec![])), false), None)),
+            derive(&inputs(true, mac(true, None, true), None)),
+            derive(&inputs(
+                true,
+                mac(
+                    false,
+                    Some(receipt(vec!["could not add matt to access_bpf"])),
+                    true,
+                ),
+                None,
+            )),
+            derive(&inputs(
+                true,
+                mac(false, Some(receipt(vec![])), false),
+                None,
+            )),
+            derive(&inputs(true, mac(false, None, true), Some(handed_to_app()))),
+            derive(&inputs(true, mac(false, None, true), None)),
+            derive(&inputs(true, mac(false, None, false), None)),
+            // Linux
+            derive(&linux_inputs(
+                false,
+                LinuxInputs {
+                    cap_net_raw: true,
+                    cap_net_admin: true,
+                    ..linux_packaged()
+                },
+            )),
+            derive(&linux_inputs(false, linux_nothing())),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    cap_net_raw: true,
+                    ..linux_packaged()
+                },
+            )),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    session_connected: true,
+                    ..linux_packaged()
+                },
+            )),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    helper: Some(candidate(
+                        "/run/wrappers/bin/aitm-l4-helper",
+                        false,
+                        true,
+                        true,
+                    )),
+                    ..linux_nothing()
+                },
+            )),
+            derive(&linux_inputs(true, linux_packaged())),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    cap_net_admin: true,
+                    ..linux_packaged()
+                },
+            )),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    prompt_possible: false,
+                    ..linux_packaged()
+                },
+            )),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    policy_file_present: false,
+                    ..linux_packaged()
+                },
+            )),
+            derive(&linux_inputs(
+                true,
+                LinuxInputs {
+                    helper: Some(candidate(HOME_HELPER, false, false, false)),
+                    ..linux_nothing()
+                },
+            )),
+            derive(&linux_inputs(true, linux_nothing())),
+        ];
+        // Other platform, and macOS/Linux without their gatherer's inputs.
+        for platform in [Platform::Other, Platform::Macos, Platform::Linux] {
+            for enabled in [false, true] {
+                rows.push(derive(&ProbeInputs {
+                    enabled,
+                    platform,
+                    mac: None,
+                    linux: None,
+                    request: None,
+                    now_ms: NOW,
+                }));
+            }
+        }
+        rows
+    }
+
+    /// Every `reason` and `label` of one report (`detail`, `message` and the
+    /// enum wire strings are not operator text).
+    fn reasons_and_labels(report: &PrivilegeReport) -> Vec<String> {
+        let mut out = Vec::new();
+        for capability in [&report.capture, &report.inject, &report.intercept] {
+            if let Some(reason) = capability.reason() {
+                out.push(reason.to_string());
+            }
+            if let Some(how) = capability.how() {
+                out.push(how.label.clone());
+            }
+        }
+        out
+    }
+
+    /// The string literals inside every `fn probe` body of `module.rs`. A body
+    /// runs from `fn probe(` to the next `}` at column 0. A `\` before a
+    /// newline joins a continued literal, dropping the next line's indentation,
+    /// as rustc does; any other `\` keeps the escaped character.
+    fn probe_literals(source: &str) -> Vec<String> {
+        let mut literals = Vec::new();
+        for (start, _) in source.match_indices("fn probe(") {
+            let rest = &source[start..];
+            let end = rest.find("\n}").map_or(rest.len(), |i| i + 2);
+            let mut chars = rest[..end].chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '"' {
+                    continue;
+                }
+                let mut literal = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some('\n') => {
+                                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                                    chars.next();
+                                }
+                            }
+                            Some(escaped) => literal.push(escaped),
+                            None => break,
+                        },
+                        c => literal.push(c),
+                    }
+                }
+                literals.push(literal);
+            }
+        }
+        literals
+    }
+
+    fn is_word_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// The first command `text` names, as a whole word or as the start of a
+    /// word, ASCII case-insensitively: `sudo`, `setcap` and `ChmodBPF` all trip;
+    /// `CAP_NET_RAW` and `packet-capture` do not.
+    fn names_a_command(text: &str) -> Option<&'static str> {
+        text.split(|c: char| !is_word_char(c))
+            .filter(|word| !word.is_empty())
+            .find_map(|word| {
+                let word = word.to_ascii_lowercase();
+                COMMANDS
+                    .iter()
+                    .copied()
+                    .find(|command| word.starts_with(command))
+            })
+    }
+
+    #[test]
+    fn no_reason_or_label_names_a_command() {
+        // The matcher itself, both ways.
+        assert_eq!(names_a_command("run `sudo aitm`"), Some("sudo"));
+        assert_eq!(names_a_command("install ChmodBPF first"), Some("chmod"));
+        assert_eq!(
+            names_a_command("needs `setcap cap_net_raw+ep` on the binary"),
+            Some("setcap")
+        );
+        assert_eq!(names_a_command("in-path interception is Linux only"), None);
+        assert_eq!(
+            names_a_command("a desktop-session launchctl_free CAP_NET_RAW"),
+            Some("launchctl")
+        );
+
+        let rows = every_row();
+        assert!(
+            rows.len() >= 26,
+            "every row must be built, got {}",
+            rows.len()
+        );
+        let mut texts: Vec<String> = rows.iter().flat_map(reasons_and_labels).collect();
+        assert!(texts.iter().any(|t| t.contains("Allow packet capture")));
+
+        let probe = probe_literals(include_str!("../module.rs"));
+        // The three platform probes each carry at least one literal, and the
+        // scan joined the `\`-continued ones into single strings.
+        assert!(probe.len() >= 5, "probe literals not found: {probe:?}");
+        assert!(probe.iter().any(|l| l.starts_with("missing CAP_NET_RAW (")));
+        assert!(probe
+            .iter()
+            .any(|l| l.starts_with("missing CAP_NET_ADMIN (")));
+        assert!(probe
+            .iter()
+            .any(|l| l.starts_with("no read+write access to any /dev/bpf* device")));
+        assert!(probe.iter().all(|l| !l.ends_with('\\')));
+        texts.extend(probe);
+
+        let offending: Vec<(String, &str)> = texts
+            .into_iter()
+            .filter_map(|t| names_a_command(&t).map(|c| (t, c)))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "operator text names a command (Rule 2, AC3): {offending:#?}"
+        );
+    }
 }
