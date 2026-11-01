@@ -18,8 +18,8 @@ use crate::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use crate::caps::TermCaps;
 use crate::filter::{self, Expr};
 use crate::model::{
-    counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, Finding, FlowDetail,
-    FlowKind, FlowRow, Message, Severity, SystemProxyWord,
+    counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, CaTrustWord,
+    Finding, FlowDetail, FlowKind, FlowRow, Message, Severity, SystemProxyWord,
 };
 use crate::open::{self, OpenTarget};
 use crate::theme::Theme;
@@ -35,11 +35,16 @@ pub const SPLIT_COLS: u16 = 160;
 /// ones are dropped (they are fetched again on demand).
 pub const MAX_DETAILS: usize = 2_000;
 
+/// The tools that change the CA's trust-store state (§D17): they get the
+/// scope default, raise the pill's in-flight word, and are re-read after.
+pub(crate) const CA_TRUST_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
+
 /// Tools that ask the operator for a local `y/N` before they are sent
 /// (§4.2 step 4: the bus has no `confirm` on the wire until F1, and the
 /// TUI's server identity is `Frontend::Mcp`). A `dry_run` the tool's schema
-/// declares, given as the JSON boolean `true`, bypasses.
-pub const CONFIRM_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
+/// declares, given as the JSON boolean `true`, bypasses. Today these are
+/// exactly the CA-trust tools.
+pub const CONFIRM_TOOLS: &[&str] = CA_TRUST_TOOLS;
 
 /// The most PoC YAML the Findings panel reads from disk for one finding
 /// (`poc_path` on a loopback bus without `poc.get`).
@@ -946,8 +951,11 @@ pub struct App {
     pub confirm: Option<ConfirmCall>,
     /// What `o` asked to open; the run loop takes it with [`App::take_open_target`].
     pub pending_open: Option<OpenTarget>,
-    /// The last `ca.status` result, for the CA panel.
+    /// The last `ca.status` result, for the CA panel and the pill word.
     pub ca_status: Option<Value>,
+    /// A `ca.install`/`ca.uninstall` is on the wire: the pill reads
+    /// `· CA trusting…` until the reply (D17.6).
+    pub ca_installing: bool,
     /// The browser view (§2.7).
     pub browser: BrowserState,
     /// Hosts whose `scope.remove` is in flight, oldest first: the reply is a
@@ -1024,6 +1032,7 @@ impl App {
             confirm: None,
             pending_open: None,
             ca_status: None,
+            ca_installing: false,
             browser: BrowserState::default(),
             pending_scope_removals: VecDeque::new(),
             poc_get_inflight: VecDeque::new(),
@@ -1043,6 +1052,16 @@ impl App {
 
     pub fn narrow(&self) -> bool {
         self.width < NARROW_COLS
+    }
+
+    /// The toolbar pill's CA-trust word (§D17.6), from the last `ca.status`
+    /// and the in-flight flag; `None` while the trust state is unread.
+    pub fn ca_trust_word(&self) -> Option<String> {
+        self.ca_trust()?.pill(self.ca_installing)
+    }
+
+    fn ca_trust(&self) -> Option<CaTrustWord> {
+        CaTrustWord::from_json(self.ca_status.as_ref()?)
     }
 
     /// The server-resolved role for the live connection (`"operator"`/
@@ -2234,7 +2253,18 @@ impl App {
 
     /// Hold `name(args)` for a `y/N` when it is in [`CONFIRM_TOOLS`] (and not
     /// a dry run); otherwise send it.
-    fn call_tool(&mut self, name: &str, args: Value) -> Vec<BusRequest> {
+    fn call_tool(&mut self, name: &str, mut args: Value) -> Vec<BusRequest> {
+        // D17.1: the trust-store scope is explicit wherever the OS has a
+        // user store, unless the operator typed one.
+        if CA_TRUST_TOOLS.contains(&name) {
+            if let (Some(scope), Some(obj)) = (
+                self.ca_trust().and_then(|w| w.default_scope()),
+                args.as_object_mut(),
+            ) {
+                obj.entry("scope")
+                    .or_insert_with(|| Value::String(scope.to_string()));
+            }
+        }
         // A dry run bypasses the prompt only when the tool's schema declares
         // `dry_run` and the value is the JSON boolean `true` (SEC-4): a
         // string typed at the prompt against a schema without the parameter
@@ -2332,10 +2362,27 @@ impl App {
     }
 
     /// The bus went away (or came back): no call sent before now will be
-    /// answered, so the view stops waiting for them.
-    fn browser_forget_inflight(&mut self) {
+    /// answered, so nothing stays "in flight" — the browser view's counters,
+    /// the CA pill's `· CA trusting…` (D17.6) and the sys-proxy pill's
+    /// `· sys-proxy setting…` (D14) alike.
+    fn forget_inflight(&mut self) {
         self.browser.inflight = 0;
         self.browser.busy = None;
+        self.ca_installing = false;
+        // A `proxy.system.set|unset` reply that will never come must not
+        // keep the guard refusing `s` / `:sysproxy on|off` (F-tui 6).
+        self.sysproxy_setting = false;
+    }
+
+    /// Ask `ca.status` when the bus offers it (D17.5: the pill word is the
+    /// read-back, never a reply's claim).
+    fn ask_ca_status(&self, out: &mut Vec<BusRequest>) {
+        if self.has_tool("ca.status") {
+            out.push(BusRequest::Call {
+                name: "ca.status".into(),
+                args: json!({}),
+            });
+        }
     }
 
     /// Launch a scope-bound `scan.discover`. The target is bound to the
@@ -2402,6 +2449,9 @@ impl App {
         };
         self.mode = c.return_to;
         if yes {
+            if CA_TRUST_TOOLS.contains(&c.name.as_str()) {
+                self.ca_installing = true;
+            }
             vec![BusRequest::Call {
                 name: c.name,
                 args: c.args,
@@ -3284,12 +3334,7 @@ impl App {
             ),
             "ca" => {
                 self.mode = Mode::Ca;
-                if self.has_tool("ca.status") {
-                    out.push(BusRequest::Call {
-                        name: "ca.status".into(),
-                        args: json!({}),
-                    });
-                }
+                self.ask_ca_status(&mut out);
             }
             "browser" => out.extend(self.update(Action::OpenBrowser)),
             // `:scan` opens the Scan view only (viewing never crawls; `r`
@@ -3440,9 +3485,9 @@ impl App {
                 // A (re)connect is a new session: nothing sent before it
                 // will be answered — including a `proxy.system.set|unset`
                 // whose reply would have settled the pill.
-                self.browser_forget_inflight();
-                self.sysproxy_setting = false;
+                self.forget_inflight();
                 out.push(BusRequest::Refresh);
+                self.ask_ca_status(&mut out);
             }
             BusEvent::ProxyStatus(s) => {
                 if s.address.is_some() {
@@ -3463,8 +3508,7 @@ impl App {
             }
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
-                self.browser_forget_inflight();
-                self.sysproxy_setting = false;
+                self.forget_inflight();
                 self.toast(Level::Error, format!("bus: {why}"));
             }
             BusEvent::Flows(summaries) => {
@@ -3705,17 +3749,13 @@ impl App {
                         format!("CA exported: {}", value.as_str().unwrap_or("ok")),
                     ),
                     "ca.install" | "ca.uninstall" => {
+                        self.ca_installing = false;
                         let text = match &value {
                             Value::Null => "ok".to_string(),
                             other => value_text(other),
                         };
                         self.toast(Level::Info, format!("{name}: {text}"));
-                        if self.has_tool("ca.status") {
-                            out.push(BusRequest::Call {
-                                name: "ca.status".into(),
-                                args: json!({}),
-                            });
-                        }
+                        self.ask_ca_status(&mut out);
                     }
                     "flow.mutate" => self.toast(Level::Info, "Edit applied"),
                     "flow.resume" => self.toast(Level::Info, "Resumed"),
@@ -3962,6 +4002,18 @@ impl App {
                     "poc.artifact" => self.pending_artifact = None,
                     "poc.build" => {
                         self.poc_build_pending.pop_front();
+                    }
+                    // D17.4/D17.5: the word comes from the read-back, so every
+                    // reply re-asks; a dismissed OS dialog is information.
+                    "ca.install" | "ca.uninstall" => {
+                        self.ca_installing = false;
+                        self.ask_ca_status(&mut out);
+                        if message.starts_with("ca.install cancelled")
+                            || message.starts_with("ca.uninstall cancelled")
+                        {
+                            self.toast(Level::Info, "CA trust cancelled");
+                            return out;
+                        }
                     }
                     // A guard refusal (out-of-scope / rate / denylist / oversize /
                     // count) is surfaced verbatim; drop the pending confirm.
@@ -4880,6 +4932,270 @@ mod tests {
         );
         let _ = app.update(Action::Back);
         assert_eq!(app.mode, Mode::Flows);
+    }
+
+    fn ca_status_macos(trusted: &str) -> Value {
+        json!({"exists": true, "platform": "macos", "fingerprint_sha256": "AB:CD",
+            "stores": {"user": {"installed": "present", "trusted": trusted, "location": "login"},
+                       "system": {"installed": "absent", "trusted": "no", "location": "System"}}})
+    }
+
+    fn ca_status_debian() -> Value {
+        json!({"exists": true, "platform": "linux-debian",
+            "stores": {"system": {"installed": "absent", "trusted": "no", "location": "/usr/local/share/ca-certificates"}}})
+    }
+
+    fn ca_status_call() -> BusRequest {
+        BusRequest::Call {
+            name: "ca.status".into(),
+            args: json!({}),
+        }
+    }
+
+    /// SP-AC35 / D17.1: `ca.install` and `ca.uninstall` carry `scope: "user"`
+    /// when the reported platform has a user store (macOS, Windows) and none
+    /// was typed; a typed scope wins; the in-flight flag is up from `y` until
+    /// the reply and `n` never sets it.
+    #[test]
+    fn ca_install_scope_default_follows_the_reported_platform() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.ca_status = Some(ca_status_macos("no"));
+        assert!(app.run_command("ca.install").is_empty());
+        assert!(!app.ca_installing, "held for y/N: not in flight yet");
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"scope": "user"})
+            }]
+        );
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "ca.install".into(),
+            value: json!({"changed": true}),
+        });
+        assert!(!app.ca_installing, "the reply settles the flag");
+        assert_eq!(reqs, vec![ca_status_call(), BusRequest::Refresh]);
+
+        // `n` never sets the flag.
+        assert!(app.run_command("ca.uninstall").is_empty());
+        assert!(app.update(Action::Input('n')).is_empty());
+        assert!(!app.ca_installing);
+
+        // Uninstall carries the scope too.
+        assert!(app.run_command("ca.uninstall").is_empty());
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.uninstall".into(),
+                args: json!({"scope": "user"})
+            }]
+        );
+
+        // A typed scope wins.
+        assert!(app.run_command("ca.install scope=system").is_empty());
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"scope": "system"})
+            }]
+        );
+
+        // Windows has a user store too.
+        app.ca_status = Some(json!({"exists": true, "platform": "windows",
+            "stores": {"user": {"trusted": "no"}}}));
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"scope": "user"})
+            }]
+        );
+    }
+
+    /// SP-AC35 / D17.1: no scope is invented when the platform has only a
+    /// system store (Linux), when `ca.status` has not answered yet, or when an
+    /// older core reported the pre-D17 shape.
+    #[test]
+    fn ca_install_passes_no_scope_on_linux_or_without_status() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        let bare_install = vec![BusRequest::Call {
+            name: "ca.install".into(),
+            args: json!({}),
+        }];
+
+        // Linux: the only scope is system, so none is passed.
+        app.ca_status = Some(ca_status_debian());
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(app.update(Action::Input('y')), bare_install);
+
+        // No status yet: nothing is invented.
+        app.ca_status = None;
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(app.update(Action::Input('y')), bare_install);
+
+        // An older core's shape: nothing is invented either.
+        app.ca_status = Some(json!({"path": "/tmp/ca.pem", "installed": false}));
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(app.update(Action::Input('y')), bare_install);
+    }
+
+    /// Both CA-trust tools are the ones the operator confirms locally.
+    #[test]
+    fn ca_trust_tools_are_the_confirm_tools() {
+        assert_eq!(CA_TRUST_TOOLS, &["ca.install", "ca.uninstall"]);
+        assert_eq!(CONFIRM_TOOLS, CA_TRUST_TOOLS);
+    }
+
+    /// D17.6: a bus drop while `ca.install` is on the wire settles the
+    /// in-flight flag, so the reconnect's read-back is what the pill shows,
+    /// never a stale `· CA trusting…`.
+    #[test]
+    fn bus_drop_mid_dialog_clears_the_in_flight_flag() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.ca_status = Some(ca_status_macos("no"));
+        let _ = app.run_command("ca.install");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA trusting…"));
+
+        let _ = app.on_bus(BusEvent::Disconnected("connection reset".into()));
+        assert!(!app.ca_installing, "no reply will come: not in flight");
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA untrusted"));
+
+        app.ca_installing = true;
+        let reqs = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "ca.status", "ca.install"]),
+            role: Some("operator".into()),
+        });
+        assert!(!app.ca_installing, "a new session: nothing is in flight");
+        assert!(reqs.contains(&ca_status_call()), "{reqs:?}");
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "ca.status".into(),
+            value: ca_status_macos("no"),
+        });
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA untrusted"));
+    }
+
+    /// SP-AC35 / D17.11: a connect whose tool list offers `ca.status` asks it
+    /// exactly once; a bus without it is not asked.
+    #[test]
+    fn connect_asks_ca_status_once_when_the_bus_offers_it() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let reqs = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "flow.get", "ca.status", "ca.install"]),
+            role: Some("operator".into()),
+        });
+        assert_eq!(
+            reqs.iter().filter(|r| **r == ca_status_call()).count(),
+            1,
+            "{reqs:?}"
+        );
+        assert!(reqs.contains(&BusRequest::Refresh));
+        assert!(!app.ca_installing);
+
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.ca_installing = true;
+        let _ = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "ca.status"]),
+            role: Some("operator".into()),
+        });
+        assert!(!app.ca_installing, "a connect clears a stale flag");
+
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let reqs = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "flow.get"]),
+            role: Some("operator".into()),
+        });
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+    }
+
+    /// SP-AC35 / D17.6: the pill word follows the last `ca.status` and the
+    /// in-flight flag.
+    #[test]
+    fn ca_trust_word_follows_status_and_the_in_flight_flag() {
+        let mut app = app_with_flows();
+        assert_eq!(app.ca_trust_word(), None);
+        app.ca_status = Some(ca_status_macos("yes"));
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA trusted"));
+        app.ca_status = Some(ca_status_macos("no"));
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA untrusted"));
+        app.ca_installing = true;
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA trusting…"));
+        app.ca_installing = false;
+        app.ca_status = Some(ca_status_macos("unknown"));
+        assert_eq!(
+            app.ca_trust_word().as_deref(),
+            Some("· CA untrusted"),
+            "user unknown, System says no: a store says no and none yes"
+        );
+        app.ca_status = Some(json!({"exists": true, "platform": "macos",
+            "stores": {"user": {"trusted": "unknown"}, "system": {"trusted": "unknown"}}}));
+        assert_eq!(app.ca_trust_word(), None);
+        app.ca_status = Some(json!({"path": "/tmp/ca.pem", "installed": true}));
+        assert_eq!(app.ca_trust_word(), None, "an older core's shape: no word");
+    }
+
+    /// D17.4 / D17.5: a dismissed macOS dialog is an information toast, not
+    /// an error; every `ca.install` failure settles the flag and re-reads
+    /// `ca.status`.
+    #[test]
+    fn ca_install_cancelled_is_an_info_toast_and_rereads_status() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.ca_status = Some(ca_status_macos("no"));
+        let _ = app.run_command("ca.install");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.install".into(),
+            message: "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "CA trust cancelled");
+
+        // Any other failure stays an error, and still re-reads the status.
+        let _ = app.run_command("ca.install");
+        let _ = app.update(Action::Input('y'));
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.install".into(),
+            message: "ca.install refused: agent frontend".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Error);
+        assert_eq!(t.text, "ca.install refused: agent frontend");
+
+        // Record correction 15: the uninstall dialog can be dismissed too.
+        let _ = app.run_command("ca.uninstall");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.uninstall".into(),
+            message: "ca.uninstall cancelled: the macOS authentication dialog was dismissed; the CA is still trusted".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "CA trust cancelled");
     }
 
     /// S3: details follow the flows (vanished rows drop theirs) and never

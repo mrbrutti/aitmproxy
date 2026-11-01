@@ -27,19 +27,22 @@ import Testing
         #expect(detail.coreID == activeID)
     }
 
-    /// The ingestion seams default to the well-known fixture id, so sample and
-    /// offline data all share one stable originating connection.
+    /// The ingestion seams default to the well-known fixture id, so imported and
+    /// offline rows all share one stable originating connection.
     @Test func ingestion_defaults_to_the_fixture_core_id() throws {
         #expect(summary().row(seq: 1).coreID == .fixture)
         let detail = try #require(FlowDetail(detailJSON: FlowDetailWireTests.httpDetail))
         #expect(detail.coreID == .fixture)
     }
 
-    /// Every static fixture row and its detail carry the fixture id end-to-end.
-    @Test func fixture_rows_and_details_all_carry_the_fixture_core_id() {
-        for row in Fixtures.rows {
-            #expect(row.coreID == .fixture)
-            #expect(Fixtures.detail(for: row).coreID == .fixture)
-        }
+    /// A row or detail built without a core (an import, a test) carries the well-known id
+    /// by default, so such rows share one stable originating connection.
+    @Test func rows_and_details_built_without_a_core_carry_the_fixture_core_id() {
+        let row = FlowRow(id: FlowID("f1"), seq: 1, method: .get, scheme: "https", authority: "api.example.test",
+                          path: "/health")
+        #expect(row.coreID == .fixture)
+        let detail = FlowDetail(id: row.id, request: HTTPMessage(startLine: "GET /health HTTP/2", headers: []),
+                                connection: ConnectionInfo(httpVersion: "HTTP/2"))
+        #expect(detail.coreID == .fixture)
     }
 }

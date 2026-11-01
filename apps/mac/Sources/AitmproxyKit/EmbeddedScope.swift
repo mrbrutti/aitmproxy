@@ -4,8 +4,8 @@ import Foundation
 /// `pins.json`): JSON `{"hosts": [...]}`, pretty-printed with sorted keys like `Pins`.
 /// The app writes it after an operator Scope action (add/remove) and reads it at
 /// every embedded spawn to emit the per-launch config's `scope:` block. It is never
-/// written in fixture mode or for an external core, and the bus has no verb for it,
-/// so no agent can read or widen it.
+/// written for an external core, and the bus has no verb for it, so no agent can read
+/// or widen it.
 ///
 /// Caps (spec D1 amendments): `load` reads only a regular file — not a directory, a
 /// FIFO or a symlink — of at most `maxFileBytes` (1 MiB); anything else loads empty.
@@ -116,9 +116,9 @@ public struct EmbeddedScope: Codable, Hashable, Sendable {
     }
 
     /// Whether `Session.init` seeds `scopeHosts` from the file before the bus connects:
-    /// only for the embedded core, only when a bundled core is actually present, never
-    /// in fixture mode. The app passes in the three facts; the Kit reads no defaults.
-    public static func seedsAtLaunch(activeKind: ActiveCoreKind, bundledCorePresent: Bool, usesFixtures: Bool) -> Bool {
-        !usesFixtures && activeKind == .embedded && bundledCorePresent
+    /// only for the embedded core, only when a bundled core is actually present. The app
+    /// passes in the two facts; the Kit reads no defaults.
+    public static func seedsAtLaunch(activeKind: ActiveCoreKind, bundledCorePresent: Bool) -> Bool {
+        activeKind == .embedded && bundledCorePresent
     }
 }

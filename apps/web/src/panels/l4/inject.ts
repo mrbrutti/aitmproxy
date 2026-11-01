@@ -4,7 +4,8 @@
 // exactly what the core returns (a `needs_confirmation` prompt, a guard refusal verbatim, or the
 // sent result). The dimming/disabling the surface shows is a courtesy; the guard is the enforcement.
 
-import { isNeedsConfirm, type PacketSpec } from './model';
+import { isMalformedConfirm, isNeedsConfirm, MALFORMED_CONFIRM_MESSAGE, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
+import type { PacketSpec } from './model';
 
 export interface InjectArgs {
   spec: PacketSpec;
@@ -31,11 +32,14 @@ export type GuardedOutcome =
   | { kind: 'done'; result: unknown }
   | { kind: 'refused'; message: string };
 
+const MALFORMED_CONFIRM: GuardedOutcome = { kind: 'refused', message: MALFORMED_CONFIRM_MESSAGE };
+
 /** First phase for any confirm-gated verb: run it, and classify the result. */
 export async function beginGuarded(call: Call, tool: string, params: Record<string, unknown>): Promise<GuardedOutcome> {
   try {
     const result = await call(tool, params);
     if (isNeedsConfirm(result)) return { kind: 'confirm', prompt: result.prompt, token: result.confirm_token };
+    if (isMalformedConfirm(result)) return MALFORMED_CONFIRM;
     return { kind: 'done', result };
   } catch (e) {
     return { kind: 'refused', message: (e as Error).message };
@@ -46,7 +50,8 @@ export async function beginGuarded(call: Call, tool: string, params: Record<stri
 export async function confirmGuarded(call: Call, tool: string, params: Record<string, unknown>, token: string): Promise<GuardedOutcome> {
   try {
     const result = await call(tool, { ...params, _confirm: token });
-    if (isNeedsConfirm(result)) return { kind: 'refused', message: 'confirmation was not accepted (stale or reused token)' };
+    if (isNeedsConfirm(result)) return { kind: 'refused', message: STALE_CONFIRM_MESSAGE };
+    if (isMalformedConfirm(result)) return MALFORMED_CONFIRM;
     return { kind: 'done', result };
   } catch (e) {
     return { kind: 'refused', message: (e as Error).message };
@@ -92,7 +97,7 @@ export async function confirmInject(call: Call, args: InjectArgs, token: string)
     const result = await call('l4.inject', { ...wire(args), _confirm: token });
     const sent = asSent(result);
     if (sent) return sent;
-    if (isNeedsConfirm(result)) return { kind: 'refused', message: 'confirmation was not accepted (stale or reused token)' };
+    if (isNeedsConfirm(result)) return { kind: 'refused', message: STALE_CONFIRM_MESSAGE };
     return { kind: 'refused', message: 'l4.inject returned an unexpected result' };
   } catch (e) {
     return { kind: 'refused', message: (e as Error).message };

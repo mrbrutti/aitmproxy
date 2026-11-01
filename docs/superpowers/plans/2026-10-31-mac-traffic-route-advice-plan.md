@@ -139,6 +139,9 @@ the TR-AC8 structural greps, Task 6, and the diff review.
 
 ### Task 1: Kit model — `SystemProxyState`, `TrafficRoutes`, `make(systemProxy:tunnelledFlowCount:)`, the predicate table (no CA derivation)
 
+> **Amendment 2026-11-01 (system-proxy session, orchestrator ruling):** `SystemProxyState.swift` and `SystemProxyStateTests.swift` are CREATED by system-proxy PR 4a (#246, branch `claude/system-proxy-kit-type`); this task ADOPTS them as-is (fields are `let`; IPv6 brackets normalised in the match; `init?(compact: JSONValue, listenAddress:)` added) and creates neither file. Base this PR on #246's merge.
+
+
 - **Satisfies:** TR-AC1, TR-AC2, TR-AC3 (quoted and fallback), TR-AC4, TR-AC5, TR-AC6 (all but the `CommandMap` clause), TR-AC18 (non-CA cases), TR-AC21
 - **Depends on:** none (not gated on the CA-trust PR)
 - **Files:**

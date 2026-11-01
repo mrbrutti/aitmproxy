@@ -96,19 +96,24 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         (_, _, None) if app.has_tool("proxy.status") => "listen address unknown".to_string(),
         (_, _, None) => "listen address unknown (core follow-up F7)".to_string(),
     };
-    // The §D12 system-proxy word sits after the address and before the
-    // state; this TUI's own in-flight set/unset reads `setting…` (D14).
+    // The §D12 system-proxy word sits after the address; this TUI's own
+    // in-flight set/unset reads `setting…` (D14). The CA-trust word
+    // (§D17.6) follows it; the state closes the pill.
     let sysproxy = app
         .system_proxy
         .as_ref()
         .and_then(|w| w.pill(app.sysproxy_setting))
         .map(|p| format!(" {p}"))
         .unwrap_or_default();
+    let ca = app
+        .ca_trust_word()
+        .map(|w| format!(" {w}"))
+        .unwrap_or_default();
     let pill = Line::from(vec![
         Span::styled("● ", dot_style),
         Span::styled("aitmproxy", bold),
         Span::styled(
-            format!(" · {listen}{sysproxy}{state}"),
+            format!(" · {listen}{sysproxy}{ca}{state}"),
             theme.text_secondary(),
         ),
     ]);

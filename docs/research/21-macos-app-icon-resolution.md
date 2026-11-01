@@ -111,7 +111,7 @@ Measured `codesign -dv` **(V)**:
 Differences to expect: ad-hoc and linker-signed binaries take the file name plus a hex suffix
 (no dots, so the sibling's "last dotted component" rule would show the whole
 `node-5555...` string **(V)**, since the rule only strips on `.`); the xcode-select shim hides which
-tool ran; empty for some system processes (research 12). Unsigned Mach-O cannot run on Apple
+tool ran; empty for some system processes (research 23). Unsigned Mach-O cannot run on Apple
 Silicon, so "unsigned" in practice means ad-hoc **(U)**.
 
 ### Q3. `icon(forFile:)` vs `icon(forFileType:)` vs `NSRunningApplication.icon`
@@ -173,7 +173,7 @@ applies (not verified).
   "Generic glyph for CLI tools" is the brief's observation, not a documented fact **(U)**.
 - Charles: shows the client process only as text in a request's Notes area (Client Process tool),
   no icon **(W)** (charlesproxy.com/documentation/tools/client-process/).
-- Little Snitch 6.2.1 attributes helper processes to the parent app **(W)** (via research 12, secondary).
+- Little Snitch 6.2.1 attributes helper processes to the parent app **(W)** (via research 23, secondary).
 
 Glyph availability **(V)** (`CoreGlyphs.bundle/name_availability.plist` on this Mac): `terminal` (SF Symbols 2020,
 macOS 11.0), `apple.terminal` (2023, macOS 14.0), `app.dashed` (macOS 12), `questionmark.app.dashed`
@@ -196,7 +196,7 @@ app cannot tell a CLI from an uninstalled GUI; a hex suffix or a missing dot onl
 - Off-main use: `urlForApplication`, `icon(forFile:)` are documented any-thread **(D)**; 8 background threads ran
   clean **(V)**; `Bundle`/`FileManager` documented thread-safe **(D)**. Only the `NSImage` object and views need care.
 - Resolution must run in the app (it has the user's LaunchServices database). The sysex is root and sees every
-  user's flows (research 12), and cannot call these APIs for the GUI user **(U)**; apps from another user's home
+  user's flows (research 23), and cannot call these APIs for the GUI user **(U)**; apps from another user's home
   would not resolve in the active user's LS database **(U)**.
 - Sibling code to build on: `ClientInfo(sourceApp:)` keeps the raw id in `bundleID`, which is what the resolver
   needs; `ClientInfo` already has an unused `pid: Int32?`. `AppMark` (`SidebarView.swift:235`) uses only
@@ -223,7 +223,7 @@ resolver actor; the view reads the cached image synchronously and re-renders whe
 | Direction | For | Against |
 |---|---|---|
 | A. Bundle-id-only resolver (above), no wire change | Small, fully off-main, unit-testable with injected closures; covers Safari, Chrome, Electron, most named apps | Shared WebKit helper, xcode-select shim and `-hex` ids stay generic; the owner map goes stale |
-| B. Carry the audit-token pid (and pidversion) in `FlowOpen`; resolve in app by `NSRunningApplication(processIdentifier:)`, `proc_pidpath_audittoken` | Names WebKit hosts ("Mail Networking") and shim tools; `ClientInfo.pid` already exists | Wire and extension change; pid is dead after the flow, so resolve at flow open; cross-user flows (research 12); the sysex runs as root |
+| B. Carry the audit-token pid (and pidversion) in `FlowOpen`; resolve in app by `NSRunningApplication(processIdentifier:)`, `proc_pidpath_audittoken` | Names WebKit hosts ("Mail Networking") and shim tools; `ClientInfo.pid` already exists | Wire and extension change; pid is dead after the flow, so resolve at flow open; cross-user flows (research 23); the sysex runs as root |
 | C. A plus B only when A returns shared/ambiguous | Keeps the common path cheap | Two paths to test |
 | D. Monogram only (status quo), plus the real icon for running apps | No new risk | Does not meet the Proxyman-parity goal |
 
@@ -236,7 +236,7 @@ Apple-flavoured alternative. A monogram stays valid for ids that look like an ap
    `com.apple.Safari`; the sibling assumes the former. Needs a live capture with Safari **and** Mail logging both
    `sourceAppSigningIdentifier` and the audit-token pid.
 2. Is `sourceAppAuditToken` always present and does its pid match the socket owner or the responsible app?
-   (research 12 marks this unverified; `sourceProcessAuditToken` is filter-only.)
+   (research 23 marks this unverified; `sourceProcessAuditToken` is filter-only.)
 3. Display-name policy: "Code" (bundle) or "Visual Studio Code" (file name)? Product call.
 4. TCC prompts when reading bundles under `~/Downloads`/`~/Desktop`; needs a run on a signed build.
 5. Icon cache invalidation (app update, icon change): key by path plus bundle mtime, or listen to
@@ -254,5 +254,5 @@ Apple-flavoured alternative. A monogram stays valid for ids that look like an ap
 - Proxyman: https://proxyman.com/docs/advanced-features/network-extension , https://proxyman.com/posts/2026-10-06-introducing-network-extension , https://proxyman.com/changelog
 - Charles Client Process tool https://www.charlesproxy.com/documentation/tools/client-process/
 - electron-builder helper ids https://www.electron.build/docs/api/electron-builder.interface.macconfiguration/ (search summary only)
-- Repo: `apps/mac/Sources/Aitmproxy/Shell/SidebarView.swift`, `.../FlowTable/FlowCellView.swift`, `apps/mac/Aitmproxy.entitlements`, `apps/mac/build.sh`, `apps/mac/Package.swift`, `docs/research/experiments/2026-10-29-macos-ne-spike.md`, branch `fix/ne-source-app` `AitmproxyKit/Flow.swift`, branch `claude/heuristic-pare-835491` `docs/research/12-macos-observe-only-lane.md`
+- Repo: `apps/mac/Sources/Aitmproxy/Shell/SidebarView.swift`, `.../FlowTable/FlowCellView.swift`, `apps/mac/Aitmproxy.entitlements`, `apps/mac/build.sh`, `apps/mac/Package.swift`, `docs/research/experiments/2026-10-29-macos-ne-spike.md`, branch `fix/ne-source-app` `AitmproxyKit/Flow.swift`, branch `claude/heuristic-pare-835491` `docs/research/23-macos-observe-only-lane.md`
 - Local checks (2026-10-31, throwaway `swiftc` programs in `$TMPDIR`, `codesign -dv`, `defaults read`, `CoreGlyphs` plist): all rows marked **(V)**
