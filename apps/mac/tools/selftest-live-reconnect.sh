@@ -323,6 +323,14 @@ env NO_LAUNCH=1 DEV_TAG=$tag ${CORE_DIR:+CORE_DIR=$CORE_DIR} "$here/tools/snap-d
 [[ -x "$dev/Contents/Resources/core/aitm" ]] || setup_fail "no core bundled; set CORE_DIR"
 note "build: bundle $dev (core from $core_from)"
 
+# 1b. Tester — a core already running under THIS bundle path (an earlier run of the same DEV_TAG
+#     killed before its EXIT trap, or a snap-dev launch left open: NO_LAUNCH=1 reaps nothing) is
+#     the one discover_child would find at the rendezvous and its bus the one every observation
+#     would read, so the run would measure some other app. A rig problem: refuse (exit 2) and
+#     reap nothing — the only reap in this script stays quit_app's, of the app this run launched.
+stale=$(pgrep -f "$core_pattern" || true)
+[[ -z $stale ]] || setup_fail "a core already runs under $dev (pid ${stale//$'\n'/ }); quit that app first or use another DEV_TAG"
+
 # 2. Launch the bundle on a fresh, isolated store (the harness defaults suite is wiped under
 #    APP_STORE and defaults to the embedded core, so nothing is written to the defaults domain).
 #    The bundle id's saved window state goes exactly as snap-dev does on a launch (window state,
