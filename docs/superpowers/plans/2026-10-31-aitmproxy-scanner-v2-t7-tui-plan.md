@@ -747,6 +747,9 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | fix round | done | H62-H65 in `85800f80`; `--selftest` 54 ok | live run 5 |
 | H (cell) | coder note | Minor | `stop()` uses `shutdown(SHUT_RDWR)` (measured: `close()` hangs behind the reader); `set_ring_field` generalised; T7-17 first with `thorough` | ratified |
 | 15 | live smoke | run 5 | 36 ok, 1 noted, 7 failed: push read works (173 job lines), Site map renders every host/template/point live, UI-3 passes; `thorough` still finishes in ~2 s; `4` pressed before the StartResult's Jobs switch; Enter on a Site map node opened another node's flow | H70-H72 (cell), H73 (Rust) |
+| H (Rust) | fix round | done | H66 `cb2a836d`, H68 `3086cfda`, H67 `ffdc6bd5`, H69 `baadb193`, H73 tests `b2165007`; crate gate green (540 tests); Rust final pending Task 16 | Task 16 after run 6 |
+| H (Rust) | coder note | Minor | H66 clearing in `ScanState` wrappers (`app.rs` call sites switched); a job never listed has not left; list-reported terminal clears too | ratified; D13 letter |
+| H (Rust) | coder note | note | H73 not a TUI defect: the cell's post-`g` read raced Home | H74 (cell); the order tests stay as pins |
 
 ## Shipped
 
