@@ -19,6 +19,9 @@ struct SystemProxyStateTests {
         #expect(Endpoint(host: "127.0.0.1", port: 8080).address == "127.0.0.1:8080")
         #expect(Endpoint(host: "proxy.corp.example", port: 3128).address == "proxy.corp.example:3128")
         #expect(Endpoint(host: "[::1]", port: 8080).address == "[::1]:8080")
+        // A bare IPv6 host is bracketed for display; an already-bracketed one is not bracketed twice.
+        #expect(Endpoint(host: "::1", port: 8080).address == "[::1]:8080")
+        #expect(Endpoint(host: "2001:db8::1", port: 8080).address == "[2001:db8::1]:8080")
     }
 
     /// `host:port` splits at the last colon; a host with a colon in it (IPv6) must be bracketed,
@@ -103,6 +106,8 @@ struct SystemProxyStateTests {
         #expect(SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": "eighty"]).http == nil)
         #expect(SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 0]).http == nil)
         #expect(SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 70000]).http == nil)
+        // A fractional port is rejected here as it is on the wire path, not truncated.
+        #expect(SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080.7]).http == nil)
     }
 
     @Test func anEmptySettingsDictionaryIsOff() {

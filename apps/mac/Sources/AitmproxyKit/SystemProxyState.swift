@@ -13,11 +13,18 @@ import Foundation
 public struct SystemProxyState: Hashable, Sendable {
     /// One protocol's proxy: where its traffic is sent.
     public struct Endpoint: Hashable, Sendable {
+        /// The host as it was given (the raw spelling): `127.0.0.1`, `localhost`, `::1` or
+        /// `[::1]`. `SystemProxyRoute.other(host:port:)` carries it unchanged; `address` is the
+        /// display form.
         public let host: String
         public let port: Int
 
-        /// `host:port`, the spelling the word table and the listening pill use.
-        public var address: String { "\(host):\(port)" }
+        /// `host:port`, the spelling the word table and the listening pill use. A host that
+        /// contains a colon (an IPv6 literal) is bracketed, `[::1]:8080`, unless it already is.
+        public var address: String {
+            let shown = host.contains(":") && !SystemProxyState.isBracketed(host) ? "[\(host)]" : host
+            return "\(shown):\(port)"
+        }
 
         public init(host: String, port: Int) {
             self.host = host
@@ -136,6 +143,8 @@ public struct SystemProxyState: Hashable, Sendable {
 
     // MARK: Spellings
 
+    // Keep these spellings in step with `EmbeddedCoreLaunch.isLoopbackHost`, which answers the
+    // same question for the core's listen host.
     /// Comparable (lower-cased, unbracketed) spellings of the loopback host that all mean this machine.
     private static let loopbackHosts: Set<String> = ["127.0.0.1", "localhost", "::1"]
     /// Comparable spellings of a wildcard listen host; a core bound to one is reachable on loopback.
@@ -182,13 +191,14 @@ public struct SystemProxyState: Hashable, Sendable {
         nonEmpty(value as? String)
     }
 
-    /// A number or a numeric string in 1...65535.
+    /// An integral number (a fractional one is rejected, as on the wire path, not truncated)
+    /// or a numeric string, in 1...65535.
     private static func settingsPort(_ value: Any?) -> Int? {
         let number: Int?
         if let text = value as? String {
             number = Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
         } else if let n = value as? NSNumber {
-            number = n.intValue
+            number = Int(exactly: n.doubleValue)
         } else {
             number = nil
         }
@@ -214,6 +224,8 @@ public enum SystemProxyRoute: Hashable, Sendable {
     case off
     /// At least one protocol points at this core; the flags say which.
     case thisCore(http: Bool, https: Bool)
-    /// Both configured protocols point elsewhere; the HTTP endpoint, else the HTTPS one.
+    /// Both configured protocols point elsewhere; the HTTP endpoint, else the HTTPS one. `host`
+    /// is the endpoint's raw spelling (`Endpoint.host`, so a bare `::1` stays bare); format
+    /// with `Endpoint(host:port:).address` for display.
     case other(host: String, port: Int)
 }
