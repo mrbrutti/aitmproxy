@@ -163,6 +163,12 @@ pub struct ScopeConfig {
     pub allow_agent_widen: bool,
 }
 
+/// The one sentence every surface prints, verbatim, when Scope is empty and so
+/// nothing is decrypted (spec D8): `proxy.status.decrypt.advice`, the `Scope`
+/// line of `aitm web`'s startup summary, and bare `aitm`'s one launch `info`
+/// line. Frontends print it; they never compose their own.
+pub const NOTHING_DECRYPTED_ADVICE: &str = "Nothing is decrypted until a host is in Scope.";
+
 /// One scope entry: a host, `host:port`, or `*.wildcard`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeEntry {

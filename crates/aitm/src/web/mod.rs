@@ -223,12 +223,17 @@ pub fn log_listening(bound: SocketAddr) {
 /// operator reads to open the UI; the token is the one bus-auth secret and must
 /// stay here, out of every logging sink (see [`log_listening`], which omits it).
 /// Labels are padded so every value lines up in one column.
+///
+/// `advice` is the one decrypt-advice sentence
+/// ([`aitm_core::NOTHING_DECRYPTED_ADVICE`]) when Scope is empty at launch (spec
+/// D8): printed as its own `Scope` line, and omitted entirely when `None`.
 pub fn startup_summary(
     web_url: &str,
     operator_url: Option<&str>,
     proxy: SocketAddr,
     browser: SocketAddr,
     bus: &str,
+    advice: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let rule = "─".repeat(60);
@@ -245,6 +250,9 @@ pub fn startup_summary(
     let _ = writeln!(out, "  Proxy      {proxy}");
     let _ = writeln!(out, "  Browser    {browser}  (SSRF-filtered)");
     let _ = writeln!(out, "  Bus        {bus}");
+    if let Some(advice) = advice {
+        let _ = writeln!(out, "  Scope      {advice}");
+    }
     out.push_str(&rule);
     out
 }
@@ -390,6 +398,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             "127.0.0.1:8081".parse().unwrap(),
             "ready",
+            None,
         );
         assert!(s.contains("http://127.0.0.1:8082/#t=deadbeef"), "{s}");
         assert!(s.contains("127.0.0.1:8080"), "{s}");
@@ -408,11 +417,52 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             "127.0.0.1:8081".parse().unwrap(),
             "ready",
+            None,
         );
         assert!(s.contains("http://127.0.0.1:8082/#t=deadbeef"), "{s}");
         assert!(s.contains("127.0.0.1:8080"), "{s}");
         assert!(s.contains("127.0.0.1:8081"), "{s}");
         assert!(!s.contains("expect=operator"), "{s}");
+    }
+
+    /// AC13: the startup summary carries the one decrypt-advice sentence as its own
+    /// `Scope` line exactly when the caller hands it one (an empty Scope at launch),
+    /// and no `Scope` line at all otherwise. The summary prints the sentence, it
+    /// never composes it: `main` passes `aitm_core::NOTHING_DECRYPTED_ADVICE`.
+    #[test]
+    fn startup_summary_prints_the_advice_only_when_given() {
+        let advice = "Nothing is decrypted until a host is in Scope.";
+        let proxy: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let browser: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let with = startup_summary(
+            "http://127.0.0.1:8082/#t=deadbeef",
+            None,
+            proxy,
+            browser,
+            "ready",
+            Some(advice),
+        );
+        assert!(
+            with.lines()
+                .any(|l| l == "  Scope      Nothing is decrypted until a host is in Scope."),
+            "{with}"
+        );
+        assert_eq!(with.matches(advice).count(), 1, "said once: {with}");
+
+        let without = startup_summary(
+            "http://127.0.0.1:8082/#t=deadbeef",
+            None,
+            proxy,
+            browser,
+            "ready",
+            None,
+        );
+        assert!(!without.contains("Scope"), "{without}");
+        assert!(!without.contains(advice), "{without}");
+        // The advice is one extra line; everything else is the same block.
+        assert_eq!(with.lines().count(), without.lines().count() + 1);
+        assert!(with.starts_with(&without[..without.rfind('\n').unwrap()]));
     }
 
     /// C4 regression: the "listening" log carries the bound address but never

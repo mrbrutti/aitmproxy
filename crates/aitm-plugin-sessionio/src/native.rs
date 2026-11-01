@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use aitm_core::{
     Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
-    HttpVersion, InterceptState, WsDir, WsFlow, WsMessage, WsOpcode,
+    HttpVersion, InterceptState, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow, WsMessage,
+    WsOpcode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +143,26 @@ pub struct MetaRec {
     /// Absent in documents written before capture attribution existed: loads as `None`.
     #[serde(default)]
     pub capture_interface: Option<String>,
+    /// Observed only, nothing acted on it (spec D4). Absent in documents written
+    /// before per-host decryption existed: loads as `false`.
+    #[serde(default)]
+    pub passive: bool,
+    /// The tunnel fields of a `CONNECT` row (spec D5). Absent in documents written
+    /// before per-host decryption existed: loads as `None`.
+    #[serde(default)]
+    pub tunnel: Option<TunnelRec>,
+}
+
+/// Serde mirror of [`TunnelInfo`]. `mode` and `reason` are the wire labels
+/// ([`TunnelMode::label`], [`TunnelReason::label`]), so a document reads the same
+/// as the bus. A code this build does not know loads as "not a tunnel row"
+/// ([`rec_to_tunnel`] yields `None`) rather than failing the whole document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelRec {
+    pub mode: String,
+    pub reason: Option<String>,
+    pub bytes_up: Option<u64>,
+    pub bytes_down: Option<u64>,
 }
 
 /// Serde mirror of [`WsMessage`].
@@ -362,6 +383,8 @@ fn meta_to_rec(m: &FlowMeta) -> MetaRec {
         edited: m.edited,
         source_app: m.source_app.clone(),
         capture_interface: m.capture_interface.clone(),
+        passive: m.passive,
+        tunnel: m.tunnel.as_ref().map(tunnel_to_rec),
     }
 }
 
@@ -376,11 +399,50 @@ fn rec_to_meta(m: &MetaRec) -> FlowMeta {
         edited: m.edited,
         source_app: m.source_app.clone(),
         capture_interface: m.capture_interface.clone(),
-        // Not carried by the native format yet: a loaded flow is neither passive
-        // nor a tunnel row.
-        passive: false,
-        tunnel: None,
+        passive: m.passive,
+        // An unknown code is "not a tunnel row", never a failed load.
+        tunnel: m.tunnel.as_ref().and_then(rec_to_tunnel),
     }
+}
+
+fn tunnel_to_rec(t: &TunnelInfo) -> TunnelRec {
+    TunnelRec {
+        mode: t.mode.label().to_string(),
+        reason: t.reason.map(|r| r.label().to_string()),
+        bytes_up: t.bytes_up,
+        bytes_down: t.bytes_down,
+    }
+}
+
+/// The inverse of the labels: `None` when `mode`, or a present `reason`, is not a
+/// code this build knows (a newer writer or a hand-edited file).
+fn rec_to_tunnel(t: &TunnelRec) -> Option<TunnelInfo> {
+    const MODES: [TunnelMode; 3] = [
+        TunnelMode::Decrypted,
+        TunnelMode::Passthrough,
+        TunnelMode::Failed,
+    ];
+    const REASONS: [TunnelReason; 8] = [
+        TunnelReason::OutOfScope,
+        TunnelReason::Pinned,
+        TunnelReason::ClientRejectedCertificate,
+        TunnelReason::ClientClosed,
+        TunnelReason::ClientTlsError,
+        TunnelReason::UpstreamUnreachable,
+        TunnelReason::UpstreamTlsFailed,
+        TunnelReason::ProtocolError,
+    ];
+    let mode = MODES.into_iter().find(|m| m.label() == t.mode)?;
+    let reason = match &t.reason {
+        None => None,
+        Some(code) => Some(REASONS.into_iter().find(|r| r.label() == code)?),
+    };
+    Some(TunnelInfo {
+        mode,
+        reason,
+        bytes_up: t.bytes_up,
+        bytes_down: t.bytes_down,
+    })
 }
 
 fn ws_msg_to_rec(m: &WsMessage) -> WsMsgRec {

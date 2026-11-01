@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, ProxyClient,
-    Registry, StdGuard, Value,
+    Registry, StdGuard, TunnelInfo, TunnelMode, TunnelReason, Value,
 };
 use aitm_plugin_sessionio::SessionIoPlugin;
 use futures::future::BoxFuture;
@@ -556,4 +556,224 @@ fn attribution_exports_imports_and_an_older_document_loads_as_none() {
         201,
         "the rest loads"
     );
+}
+
+/// The restored flows of a document, keyed by request path, so a test can name
+/// each one regardless of store order.
+fn restored_by_path(store: &MemFlowStore, ids: &[FlowId]) -> BTreeMap<String, Flow> {
+    ids.iter()
+        .map(|id| {
+            let flow = store.get(*id).expect("imported flow present");
+            let Flow::Http(h) = &flow else {
+                panic!("expected http flow");
+            };
+            (h.request.path.clone(), flow)
+        })
+        .collect()
+}
+
+/// Spec D5/D8 persistence: `passive` and the three tunnel shapes (passthrough
+/// with bytes and a reason, failed with a reason, decrypted with neither) survive
+/// `flow.export` → `flow.import` of a native session, and the document carries
+/// the wire labels (`passthrough`, `out_of_scope`, …), not Rust names.
+#[test]
+fn tunnel_and_passive_round_trip_through_a_native_session() {
+    let store = MemFlowStore::new();
+    let mut passive = plain_flow("/passive");
+    passive.metadata_mut().passive = true;
+    store.insert(passive);
+    let mut passthrough = plain_flow("/passthrough");
+    passthrough.metadata_mut().tunnel = Some(TunnelInfo {
+        mode: TunnelMode::Passthrough,
+        reason: Some(TunnelReason::OutOfScope),
+        bytes_up: Some(1234),
+        bytes_down: Some(56789),
+    });
+    store.insert(passthrough);
+    let mut failed = plain_flow("/failed");
+    failed.metadata_mut().tunnel =
+        Some(TunnelInfo::failed(TunnelReason::ClientRejectedCertificate));
+    store.insert(failed);
+    let mut decrypted = plain_flow("/decrypted");
+    decrypted.metadata_mut().tunnel = Some(TunnelInfo::decrypted());
+    store.insert(decrypted);
+
+    let exported = export_native(&store);
+
+    // The document's tunnel objects are the wire labels.
+    let doc: serde_json::Value = serde_json::from_slice(&exported).expect("the export is JSON");
+    let flows = doc["flows"].as_array().expect("a flows array");
+    assert_eq!(flows.len(), 4);
+    let meta_of = |path: &str| -> &serde_json::Value {
+        &flows
+            .iter()
+            .find(|rec| rec["request"]["path"] == path)
+            .unwrap_or_else(|| panic!("no record for {path}"))["metadata"]
+    };
+    assert_eq!(meta_of("/passive")["passive"], serde_json::json!(true));
+    assert_eq!(meta_of("/passive")["tunnel"], serde_json::Value::Null);
+    assert_eq!(meta_of("/passthrough")["passive"], serde_json::json!(false));
+    assert_eq!(
+        meta_of("/passthrough")["tunnel"],
+        serde_json::json!({
+            "mode": "passthrough",
+            "reason": "out_of_scope",
+            "bytes_up": 1234,
+            "bytes_down": 56789
+        })
+    );
+    assert_eq!(
+        meta_of("/failed")["tunnel"],
+        serde_json::json!({
+            "mode": "failed",
+            "reason": "client_rejected_certificate",
+            "bytes_up": null,
+            "bytes_down": null
+        })
+    );
+    assert_eq!(
+        meta_of("/decrypted")["tunnel"],
+        serde_json::json!({
+            "mode": "decrypted",
+            "reason": null,
+            "bytes_up": null,
+            "bytes_down": null
+        })
+    );
+
+    // Round trip: the typed fields come back exactly.
+    let fresh = MemFlowStore::new();
+    let ids = import_native(&fresh, exported);
+    assert_eq!(ids.len(), 4);
+    let restored = restored_by_path(&fresh, &ids);
+    assert!(restored["/passive"].metadata().passive);
+    assert_eq!(restored["/passive"].metadata().tunnel, None);
+    assert!(!restored["/passthrough"].metadata().passive);
+    assert_eq!(
+        restored["/passthrough"].metadata().tunnel,
+        Some(TunnelInfo {
+            mode: TunnelMode::Passthrough,
+            reason: Some(TunnelReason::OutOfScope),
+            bytes_up: Some(1234),
+            bytes_down: Some(56789),
+        })
+    );
+    assert_eq!(
+        restored["/failed"].metadata().tunnel,
+        Some(TunnelInfo::failed(TunnelReason::ClientRejectedCertificate))
+    );
+    assert_eq!(
+        restored["/decrypted"].metadata().tunnel,
+        Some(TunnelInfo::decrypted())
+    );
+}
+
+/// A document written before `passive`/`tunnel` existed (the same export with
+/// the two keys removed) loads with the defaults — not passive, not a tunnel —
+/// and the rest of the flow intact. No `aitm-session/1` bump.
+#[test]
+fn legacy_document_without_the_fields_loads_as_defaults() {
+    let store = MemFlowStore::new();
+    let mut flow = seeded_flow();
+    flow.metadata_mut().passive = true;
+    flow.metadata_mut().tunnel = Some(TunnelInfo::passthrough(TunnelReason::Pinned));
+    store.insert(flow);
+    let exported = export_native(&store);
+
+    let mut doc: serde_json::Value = serde_json::from_slice(&exported).expect("the export is JSON");
+    let flows = doc["flows"].as_array_mut().expect("a flows array");
+    assert_eq!(flows.len(), 1);
+    let meta = flows[0]["metadata"]
+        .as_object_mut()
+        .expect("a metadata object");
+    assert_eq!(
+        meta.remove("passive"),
+        Some(serde_json::json!(true)),
+        "the export wrote passive"
+    );
+    assert_eq!(
+        meta.remove("tunnel"),
+        Some(serde_json::json!({
+            "mode": "passthrough",
+            "reason": "pinned",
+            "bytes_up": null,
+            "bytes_down": null
+        })),
+        "the export wrote tunnel"
+    );
+    let older = serde_json::to_vec(&doc).expect("re-serialise");
+    let text = String::from_utf8_lossy(&older);
+    assert!(!text.contains("\"passive\"") && !text.contains("\"tunnel\""));
+
+    let fresh = MemFlowStore::new();
+    let ids = import_native(&fresh, older);
+    assert_eq!(ids.len(), 1, "the older document imports its flow");
+    let restored = fresh.get(ids[0]).expect("imported flow present");
+    assert!(!restored.metadata().passive);
+    assert_eq!(restored.metadata().tunnel, None);
+    let Flow::Http(r) = &restored else {
+        panic!("expected http flow");
+    };
+    assert_eq!(
+        r.response.as_ref().expect("response").status,
+        201,
+        "the rest loads"
+    );
+}
+
+/// A tunnel object whose `mode` or `reason` is a code this build does not know
+/// (a newer writer, or a hand-edited file) loads as "not a tunnel row" rather
+/// than failing the whole document; the flow itself still imports. The sibling
+/// flow with a known code in the same document is the positive control: it
+/// restores as a tunnel, so the field is read and only the unknown code is dropped.
+#[test]
+fn a_tunnel_with_an_unknown_code_loads_as_no_tunnel() {
+    let store = MemFlowStore::new();
+    for path in ["/edited", "/control"] {
+        let mut flow = plain_flow(path);
+        flow.metadata_mut().tunnel = Some(TunnelInfo::passthrough(TunnelReason::OutOfScope));
+        store.insert(flow);
+    }
+    let exported = export_native(&store);
+
+    for (key, known, bogus) in [
+        ("mode", "passthrough", "quantum"),
+        ("reason", "out_of_scope", "cosmic_rays"),
+    ] {
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&exported).expect("the export is JSON");
+        let rec = doc["flows"]
+            .as_array_mut()
+            .expect("a flows array")
+            .iter_mut()
+            .find(|rec| rec["request"]["path"] == "/edited")
+            .expect("the /edited record");
+        // The export wrote the known code there; the edit replaces it.
+        assert_eq!(rec["metadata"]["tunnel"][key], serde_json::json!(known));
+        rec["metadata"]["tunnel"][key] = serde_json::json!(bogus);
+        let edited = serde_json::to_vec(&doc).expect("re-serialise");
+
+        let fresh = MemFlowStore::new();
+        let ids = import_native(&fresh, edited);
+        assert_eq!(
+            ids.len(),
+            2,
+            "unknown {key} {bogus:?} still imports both flows"
+        );
+        let restored = restored_by_path(&fresh, &ids);
+        assert_eq!(
+            restored["/edited"].metadata().tunnel,
+            None,
+            "unknown {key} {bogus:?} loads as no tunnel"
+        );
+        assert_eq!(
+            restored["/control"].metadata().tunnel,
+            Some(TunnelInfo::passthrough(TunnelReason::OutOfScope)),
+            "the known code beside it still loads as a tunnel"
+        );
+        let Flow::Http(r) = &restored["/edited"] else {
+            panic!("expected http flow");
+        };
+        assert_eq!(r.response.as_ref().expect("response").status, 200);
+    }
 }

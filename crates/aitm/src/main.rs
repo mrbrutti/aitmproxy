@@ -31,7 +31,9 @@ use aitm::wire::{
     assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
 };
 use aitm::{config_file, env, operator_token, tui};
-use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
+use aitm_core::{
+    engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin, NOTHING_DECRYPTED_ADVICE,
+};
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
@@ -726,6 +728,21 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
 
     // We are about to serve: `proxy.status.listening` now reports the truth.
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Spec D8: with an empty Scope nothing is decrypted, and that is said once at
+    // launch — as the `Scope` line of `aitm web`'s stdout summary below, or, where
+    // no summary is printed (bare `aitm`, `aitm tui`), as one `info` line on the
+    // `aitm` target. Never `warn`, never repeated: the live read is
+    // `proxy.status.decrypt`, which follows a later `scope.add`.
+    let launch_advice = cfg
+        .scope
+        .entries
+        .is_empty()
+        .then_some(NOTHING_DECRYPTED_ADVICE);
+    if mode != Mode::Web {
+        if let Some(advice) = launch_advice {
+            info!(target: "aitm", "{advice}");
+        }
+    }
     let result = if mode == Mode::Tui {
         // `aitm tui`: the loopback agent server is built by `tui::build_servers`
         // on the core's shared policy state and audit ring (the `governance`
@@ -840,7 +857,8 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                         operator_url.as_deref(),
                         proxy_addr,
                         browser_addr,
-                        "ready"
+                        "ready",
+                        launch_advice,
                     )
                 );
                 Some((listener, state))

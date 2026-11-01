@@ -1,8 +1,10 @@
 //! The control plugin (F7): proxy and session control over the bus.
 //!
 //! `proxy.status` reports the proxy's live state (whether it is listening and on
-//! what address, whether interception is armed, how many flows are paused, and
-//! whether capture is on) so a surface has a read-only way to learn it.
+//! what address, whether interception is armed, how many flows are paused,
+//! whether capture is on, and `decrypt`: how many hosts Scope — the decryption
+//! list — holds and the one advice sentence to print when it holds none) so a
+//! surface has a read-only way to learn it.
 //! `proxy.pause`/`proxy.resume` toggle whether new flows are *shown*: a paused
 //! flow still passes through the proxy and stays in memory (reachable by id), it
 //! is simply hidden from `list`/`status`/`count` and aged out by normal eviction.
@@ -15,7 +17,7 @@ use std::sync::Arc;
 
 use aitm_core::{
     BrowserEngine, Command, CommandHost, Config, McpTransport, ParamSchema, Params, Plugin,
-    Registry, TypeDesc, Value,
+    Registry, TypeDesc, Value, NOTHING_DECRYPTED_ADVICE,
 };
 use aitm_sysproxy::SystemProxy;
 
@@ -94,7 +96,10 @@ impl Command for ProxyStatus {
                           `version` (the aitm binary's version), and `system_proxy` (the OS \
                           proxy setting as this core sees it: `state` one of points_at_us/other/\
                           off/unknown/unsupported, `host`/`port` when `other`, `managed_by_us`, \
-                          `setting`, `supported`, `detail`; refreshed at most every 5 s)."
+                          `setting`, `supported`, `detail`; refreshed at most every 5 s), and \
+                          `decrypt` (`scope_hosts`: entries in Scope, the decryption list; \
+                          `decrypting`: scope_hosts > 0; `advice`: the one sentence to show \
+                          when nothing is decrypted, else null)."
                     .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),
@@ -132,6 +137,22 @@ impl Command for ProxyStatus {
         if let Some(sp) = &self.system_proxy {
             obj.insert("system_proxy".into(), sp.summary().to_value());
         }
+        // Scope is the decryption list (spec D8). The count is the live guard's,
+        // so a `scope.add` after launch shows at once; the advice is the one
+        // constant every surface prints verbatim, `null` once a host is in Scope.
+        let scope_hosts = host.guard().list_scope().len();
+        let mut decrypt = BTreeMap::new();
+        decrypt.insert("scope_hosts".into(), Value::Int(scope_hosts as i64));
+        decrypt.insert("decrypting".into(), Value::Bool(scope_hosts > 0));
+        decrypt.insert(
+            "advice".into(),
+            if scope_hosts == 0 {
+                Value::Str(NOTHING_DECRYPTED_ADVICE.into())
+            } else {
+                Value::Null
+            },
+        );
+        obj.insert("decrypt".into(), Value::Object(decrypt));
         Ok(Value::Object(obj))
     }
 }
