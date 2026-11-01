@@ -58,6 +58,7 @@ pub struct ScriptedHost {
     baseline_fails: bool,
     probes_fail: bool,
     probes_fail_after: Option<usize>,
+    probe_refused_at: Option<usize>,
     table: Vec<(String, ProbeResponse)>,
     nth_table: Vec<(String, usize, ProbeResponse)>,
     nth_seen: Mutex<HashMap<String, usize>>,
@@ -89,6 +90,7 @@ impl ScriptedHost {
             baseline_fails: false,
             probes_fail: false,
             probes_fail_after: None,
+            probe_refused_at: None,
             table: Vec::new(),
             nth_table: Vec::new(),
             nth_seen: Mutex::new(HashMap::new()),
@@ -133,6 +135,20 @@ impl ScriptedHost {
     #[must_use]
     pub fn with_probes_failing_after(mut self, n: usize) -> Self {
         self.probes_fail_after = Some(n);
+        self
+    }
+
+    /// Refuse exactly the `n`-th probe, counting from one, and answer every
+    /// other one from the script.
+    ///
+    /// One refused request in the middle of a series is the common real
+    /// failure — a dropped connection, a guard that paused the host for a
+    /// moment — and it is the case a check must not read as "the target was
+    /// quiet", so it needs to be scriptable on its own.
+    #[must_use]
+    pub fn with_probe_refused_at(mut self, n: usize) -> Self {
+        assert!(n >= 1, "with_probe_refused_at counts probes from one");
+        self.probe_refused_at = Some(n);
         self
     }
 
@@ -318,10 +334,12 @@ impl ScriptedHost {
         hit
     }
 
-    /// Whether the probe now being sent is past [`Self::with_probes_failing_after`].
+    /// Whether the probe now being sent is refused: past
+    /// [`Self::with_probes_failing_after`], or exactly the one
+    /// [`Self::with_probe_refused_at`] names.
     fn past_the_failure_point(&self) -> bool {
-        self.probes_fail_after
-            .is_some_and(|n| self.sent_probes().len() > n)
+        let so_far = self.sent_probes().len();
+        self.probes_fail_after.is_some_and(|n| so_far > n) || self.probe_refused_at == Some(so_far)
     }
 }
 

@@ -21,7 +21,9 @@
 //!    halves of the catalogue cannot disagree about one target.
 //! 3. **A partial series is never a verdict.** Two measurements fit any straight
 //!    line exactly, so a family whose schedule did not complete is dropped rather
-//!    than regressed. A run that was cut short says `inconclusive`.
+//!    than regressed. A run that was cut short says `inconclusive`, and so does
+//!    a run that sent every probe it planned but lost a family to a refused
+//!    one: `clean` means every family completed and none correlated.
 //!
 //! **This check never waits.** It asks the target for the delay and then reads
 //! the `elapsed_ms` the lane measured (spec D4, "Timing without `sleep`"), so a
@@ -352,11 +354,16 @@ impl Check for TimingCheck {
 
             let mut sent = 0usize;
             let mut failed = 0usize;
+            // Families whose schedule was broken by a *refused* probe rather
+            // than by the job stopping. They cost their probes and taught
+            // nothing, so they may not be counted as a quiet target.
+            let mut abandoned = 0usize;
 
             for family in families {
                 let mut requested: Vec<f32> = Vec::with_capacity(delays.len());
                 let mut observed: Vec<u32> = Vec::with_capacity(delays.len());
                 let mut probe_flows: Vec<FlowRef> = Vec::new();
+                let mut refused_here = 0usize;
 
                 for delay in delays {
                     if !may_send(host) {
@@ -374,6 +381,7 @@ impl Check for TimingCheck {
                         // One refused probe is not a verdict, but it does cost
                         // this family its complete series.
                         failed += 1;
+                        refused_here += 1;
                         continue;
                     };
                     requested.push(delay);
@@ -385,6 +393,9 @@ impl Check for TimingCheck {
                 // too few points for `r` to mean anything (two points fit any
                 // line exactly), so an interrupted family is dropped, not fitted.
                 if requested.len() < delays.len() {
+                    if refused_here > 0 {
+                        abandoned += 1;
+                    }
                     continue;
                 }
                 let timing = fit(&requested, &observed, &baseline_ms);
@@ -406,6 +417,23 @@ impl Check for TimingCheck {
                     format!(
                         "stopped after {sent} of {planned} delay probes: the job was \
                          cancelled, out of budget or past its deadline"
+                    ),
+                );
+            }
+            // Every probe the plan asked for was sent, but a family that lost
+            // one of them was never fitted. `Clean` would claim the response
+            // time did not track the delay for probes that were never
+            // compared, so an abandoned family makes the run inconclusive and
+            // the detail says how many.
+            if abandoned > 0 {
+                let was = if abandoned == 1 { "was" } else { "were" };
+                return no_finding(
+                    Outcome::Inconclusive,
+                    format!(
+                        "{abandoned} of {total} payload families {was} abandoned: a probe was \
+                         refused part-way through its schedule, so the series could not be \
+                         fitted",
+                        total = families.len()
                     ),
                 );
             }

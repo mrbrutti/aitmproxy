@@ -347,6 +347,33 @@ async fn an_exhausted_budget_stops_the_run() {
     assert!(host.sent().len() <= 2, "sent {}", host.sent().len());
 }
 
+/// One refused probe costs its family the complete series, and a family that
+/// could not be fitted is **not** evidence that the target was quiet. Here the
+/// third mysql probe is refused and the postgres family is flat: the run has
+/// sent every probe it planned, so the old epilogue called it `Clean` and said
+/// the response time did not track the delay over eight probes — a sentence
+/// that misstates what happened for four of them. It is `Inconclusive`, and
+/// the detail says how many families were abandoned.
+#[tokio::test]
+async fn a_family_abandoned_for_a_refused_probe_is_inconclusive_not_clean() {
+    let host = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_probe_refused_at(3)
+        .on("SLEEP(1)", timed(1040))
+        .on("SLEEP(3)", timed(3060))
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "1 of 2 payload families was abandoned: a probe was refused part-way \
+         through its schedule, so the series could not be fitted"
+    );
+    assert_eq!(host.sent().len(), 8);
+}
+
 /// Every probe refused is an error, not a clean bill of health.
 #[tokio::test]
 async fn a_host_that_refuses_every_probe_is_an_error() {
