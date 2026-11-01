@@ -111,6 +111,11 @@ impl Crawler for BrowserCrawler {
 /// around each navigation". The snapshot is the O(store) step; every id a
 /// `mark_new` sees joins `seen`, so the later actions of a page diff against a
 /// running set instead of re-listing the store each time (S-M6).
+///
+/// The `Default` diff has seen nothing, so it treats every flow in the store
+/// as new; a run starts from it and takes its first real snapshot on the first
+/// page.
+#[derive(Default)]
 pub(crate) struct StoreDiff {
     seen: HashSet<FlowId>,
 }
@@ -546,9 +551,7 @@ impl<'a> Run<'a> {
             report: CrawlReport::default(),
             marks: vec![job_mark(job.job_id()), MARK_CRAWL.to_string()],
             guard_refused: 0,
-            page_diff: StoreDiff {
-                seen: HashSet::new(),
-            },
+            page_diff: StoreDiff::default(),
         }
     }
 
@@ -1961,6 +1964,18 @@ mod tests {
                 "cookie-set hs".to_string(),
             ]
         );
+    }
+
+    /// An empty diff has seen nothing, so it marks every flow the store holds
+    /// (R-M8): the state `Run::new` starts from before the first snapshot.
+    #[test]
+    fn store_diff_default_treats_everything_as_new() {
+        let store = MemFlowStore::new();
+        let id = store.insert(Flow::Http(capture("http://t:8080/already")));
+        let produced = StoreDiff::default().mark_new(&store, &url(ROOT), &marks());
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].id, id);
+        assert_eq!(produced[0].metadata.marks, marks());
     }
 
     #[test]
