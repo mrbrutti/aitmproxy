@@ -66,11 +66,12 @@ pub fn scan_dir(findings_dir: &Path, sub: &str) -> PathBuf {
 /// error and push payload the engine emits goes through it, so a credential a
 /// probe echoed back never reaches an issue, a log or the bus.
 ///
-/// This is the one line Task 19 of the T1b plan flips to
-/// `aitm_core::redact::scrub_text_wide` once PR #199's wider vocabulary is on
-/// `main`; every call site then widens with it.
+/// `aitm_core::redact::scrub_text_wide` is the wide reading of the shared
+/// secret vocabulary (PR #199): it catches `sid`/`jwt`/`auth`-style pairs that
+/// the plain `scrub_text` lets through, so every call site widens with it
+/// (T1b plan, Task 19).
 pub fn scrub(text: &str) -> String {
-    aitm_core::redact::scrub_text(text)
+    aitm_core::redact::scrub_text_wide(text)
 }
 
 /// The serde wire token of a value, unquoted (`InsertionKind::Query` →
