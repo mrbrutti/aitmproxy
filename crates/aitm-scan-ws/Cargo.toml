@@ -6,14 +6,87 @@ license.workspace = true
 rust-version.workspace = true
 description = "Scanner v2 WebSocket lane (track T4): WS discovery and checks, plus the guarded `ws.*` script language. Skeleton slots handed over at T1a."
 
+# Final after task 1 of the T4 plan (call 10): every dependency the track needs
+# is declared here up front, each with the task that consumes it, so no later
+# task edits this manifest and wave 2 can fan out to parallel coders.
 [dependencies]
 # The `ScopeRateGuard` the `ws.*` host fns are `Guarded` through: `main.rs`
 # passes its `LateHandles` guard into `language()` (spec D8.3, call A17).
+# Also `FlowId`, `Flow`/`WsFlow`, `HeaderMap`, `ByteStream`, `redact::*`.
 aitm-core.workspace = true
-# The `ProtocolLanguage` seam the `ws.*` namespace is contributed through.
+# The `ProtocolLanguage` seam the `ws.*` namespace is contributed through. (8)
 aitm-plugin.workspace = true
-# The `Lane` trait this crate's `lane()` slot returns.
+# The `Lane` trait this crate's `lane()` slot returns. (3, 7, 9-17)
 aitm-scan-model.workspace = true
+# `CheckMeta.severity` is an `aitm_poc::Severity` (tasks 9-16; plan call 32).
+aitm-poc.workspace = true
+# Error type for the transport, dialer and probe host. (2, 6, 7)
+anyhow.workspace = true
+# `BoxFuture` for the object-safe async model traits, plus `SinkExt`/`StreamExt`
+# over the tungstenite stream. (2, 6, 7, 9-17)
+futures.workspace = true
+# JSON insertion points and JSON leaf mutation (call 15). (3, 4)
+serde_json.workspace = true
+# tungstenite 0.28's `Message::Binary` carries a `bytes::Bytes`. (6)
+bytes.workspace = true
+# `debug`-level diagnostics only; never a header value or a frame payload. (6, 7)
+tracing.workspace = true
+# TCP connect, the duplex test socket, the connection semaphore, the reply
+# window and recv timeouts. (2, 6, 7, 8)
+tokio = { workspace = true, features = [
+  "io-util",
+  "net",
+  "rt",
+  "sync",
+  "time",
+  "macros",
+] }
+# The WebSocket client (and, in tests, the server): `client_async_with_config`
+# over whatever `ByteStream` the transport returns. 0.28 has no TLS feature on;
+# TLS is ours. (2, 6)
+tokio-tungstenite.workspace = true
+# TLS for `wss://`, done by us over a `TcpStream` rather than by
+# tokio-tungstenite. Versions and features are identical to
+# `crates/aitm-proto-http/Cargo.toml`'s, deliberately: the `ring` provider is
+# selected explicitly everywhere so feature unification with another crate's
+# provider cannot change which one is used. (2)
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+  "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "tls12",
+  "logging",
+] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+# Root trust anchors for `TlsPolicy::Verify`. (2)
+webpki-roots = "0.26"
+# Form-encoded text frames: parsing pairs out and re-encoding them. (3, 4)
+form_urlencoded = "1"
+# Task 6: response head of the hand-driven upgrade (call 28)
+httparse = "1"
+
+[dev-dependencies]
+# Multi-threaded `#[tokio::test]`s driving a real tungstenite client and server
+# over one `tokio::io::duplex`. (2, 6, 7, 9-18)
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# A self-signed certificate for the TLS verifier tests. (2)
+rcgen = "0.14"
+# The Rhai engine the `ws.*` namespace is evaluated in; the version
+# `aitm-plugin-rhai` pins. (8, 18)
+rhai = { version = "1.27", features = ["sync"] }
+# `build_engine_with_languages` + `seed_call_context`, the harness the `ws.*`
+# host fns are driven through. (8, 18)
+aitm-plugin-rhai.workspace = true
+# The real HTTP/1.1 + TLS pipeline the live-proof test dials through. (18)
+aitm-proto-http.workspace = true
+# The real WebSocket protocol module the live-proof test captures with. (18)
+aitm-proto-ws.workspace = true
+# The seeded loopback target whose `/ws` endpoint the live proof runs against. (18)
+aitm-testtarget.workspace = true
 
 [lints]
 workspace = true

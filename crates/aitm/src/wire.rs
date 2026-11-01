@@ -396,11 +396,18 @@ pub fn assemble_with_scripts(
         cfg.maps.allow_agent_authoring,
         map_guard.clone(),
     );
+    // The passthrough module decides "pinned or not in Scope" per connection (spec
+    // D1/D2) against the same live guard, through the same late-bound pattern:
+    // bound to the proxy's real guard right after `build`, before anything is
+    // served. Until bound it reports nothing in scope, so the module would tunnel
+    // everything (deny-by-default) rather than decrypt it.
+    let tunnel_guard = Arc::new(LateGuard::default());
 
     let mut builder = Proxy::builder().with_config(cfg.clone());
     // Protocol modules, in registration order (first match claims the connection):
-    // PassthroughModule before HttpModule so a pinned host tunnels past MITM.
-    for module in ordered_modules(http, passthrough_list, inject) {
+    // PassthroughModule before HttpModule so a pinned or out-of-scope host tunnels
+    // past MITM.
+    for module in ordered_modules(http, passthrough_list, inject, tunnel_guard.clone()) {
         builder = builder.register_module(module);
     }
     // The `capture.status` handle: the writer leaves in `Assembled` for the macOS
@@ -544,10 +551,11 @@ pub fn assemble_with_scripts(
     }
 
     let proxy = builder.build()?;
-    // Bind the late guard to the proxy's real guard before anything is served, so
-    // Map Remote's `check_active` rides the same scope/rate guard the client path
-    // and every other command enforce.
+    // Bind the late guards to the proxy's real guard before anything is served, so
+    // Map Remote's `check_active` and the passthrough module's `in_scope` ride the
+    // same scope/rate guard the client path and every other command enforce.
     map_guard.bind(proxy.guard());
+    tunnel_guard.bind(proxy.guard());
 
     // The protocol-general capture ingress (L4OPS-AC17). Its stream/TCP half is wired
     // for **every** build, from the live proxy's shared module list, flow store, event
@@ -619,30 +627,33 @@ pub fn build_capture_session(
 }
 
 /// The protocol modules in registration order. [`PassthroughModule`] is **first**
-/// so its SNI/CONNECT-authority match wins over [`HttpModule`] for a pinned host
-/// (the acceptor picks the first module whose `matches` returns true); then
-/// `HttpModule` (MITM for every other host), then [`WsModule`] (post-upgrade
-/// only), sharing the `inject` registry [`WsCtlPlugin`] holds so `ws.send` reaches
-/// a live conversation. One source of module order for [`assemble_with_scripts`]
-/// and the wiring test.
+/// so its tunnel-authority match wins over [`HttpModule`] for a pinned or
+/// out-of-scope host (the acceptor picks the first module whose `matches` returns
+/// true); then `HttpModule` (MITM for every in-scope host), then [`WsModule`]
+/// (post-upgrade only), sharing the `inject` registry [`WsCtlPlugin`] holds so
+/// `ws.send` reaches a live conversation. `scope` is the live scope guard the
+/// passthrough module decides "in Scope" on (spec D1/D2). One source of module
+/// order for [`assemble_with_scripts`] and the wiring test.
 pub fn ordered_modules(
     http: HttpModule,
     passthrough: PassthroughList,
     inject: InjectRegistry,
+    scope: Arc<dyn ScopeRateGuard>,
 ) -> Vec<Arc<dyn ProtocolModule>> {
     vec![
-        Arc::new(PassthroughModule::new(passthrough)),
+        Arc::new(PassthroughModule::new(passthrough).with_scope(scope)),
         Arc::new(http),
         Arc::new(WsModule::new().with_inject_registry(inject)),
     ]
 }
 
-/// A [`ScopeRateGuard`] handle Map Remote can hold before the proxy (and thus its
-/// guard) exists. The guard is created inside `Proxy::build`; this forwards to it
-/// once [`bind`](LateGuard::bind) is called (immediately after build, before
-/// serving). Unbound it refuses every active check — a guard that cannot check
-/// must not permit (deny-by-default). Mirrors `scripts::LateHandles`' guard facet
-/// without pulling in its store/client/browser facets.
+/// A [`ScopeRateGuard`] handle Map Remote and the passthrough module can hold
+/// before the proxy (and thus its guard) exists. The guard is created inside
+/// `Proxy::build`; this forwards to it once [`bind`](LateGuard::bind) is called
+/// (immediately after build, before serving). Unbound it refuses every active
+/// check and reports nothing in scope — a guard that cannot check must not permit
+/// (deny-by-default). Mirrors `scripts::LateHandles`' guard facet without pulling
+/// in its store/client/browser facets.
 #[derive(Default)]
 struct LateGuard(OnceLock<Arc<dyn ScopeRateGuard>>);
 
@@ -1009,15 +1020,17 @@ mod tests {
         assert!(disabled.l4_guard.is_none());
     }
 
-    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// the T6 L4 stream lane (`aitm_scan_l4_stream::lane`) returns `Some` with or
-    /// without the L4 handles (it refuses at discovery when they are absent), and
-    /// the HTTP, WS and L4 packet slots are still skeletons returning `None`. A
-    /// `None` slot is skipped rather than collected. A lane track's landing flips
-    /// these literals; that track re-pins this test.
+    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot.
+    /// Two lanes return `Some` at this head: T4's WebSocket lane
+    /// (`aitm_scan_ws::lane`) and T6's L4 stream lane
+    /// (`aitm_scan_l4_stream::lane`, `Some` with or without the L4 handles; it
+    /// refuses at discovery when they are absent). The HTTP and L4 packet slots
+    /// are still skeletons returning `None`, which is skipped rather than
+    /// collected. Each lane track's landing bumps these literals; that track
+    /// re-pins this test.
     #[test]
     fn lane_slots_match_the_landed_lanes() {
-        assert_eq!(collect_lanes(None).len(), 1);
+        assert_eq!(collect_lanes(None).len(), 2);
         assert_eq!(collect_native_checks().len(), 0);
 
         let shared = L4Shared {
@@ -1027,7 +1040,7 @@ mod tests {
             })),
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 1);
+        assert_eq!(collect_lanes(Some(&shared)).len(), 2);
     }
 
     /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand

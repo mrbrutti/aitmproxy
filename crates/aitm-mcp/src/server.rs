@@ -14,9 +14,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
-    AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink, BrowserDriver, Command,
-    CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend,
-    McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
+    saturating_i64, AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink,
+    BrowserDriver, Command, CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery,
+    FlowStore, Frontend, McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity,
+    SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::{broadcast, Notify};
@@ -2642,8 +2643,11 @@ fn event_label(ev: &Event) -> &'static str {
 /// `FlowMeta::started_at_ms`, `FlowMeta::duration_ms`), so the null rules are
 /// shared by construction: a `Streamed` body is `null`; no response is a `null`
 /// status and `null` `response_bytes`; an in-flight flow has a `null`
-/// `duration_ms`; a pre-epoch clock is a `null` `started_at`. Full detail stays
-/// a `flow.detail` pull (F5).
+/// `duration_ms`; a pre-epoch clock is a `null` `started_at`. The per-host
+/// decryption keys (`tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down`,
+/// `passive`; spec D7) read `FlowMeta::tunnel` / `FlowMeta::passive` with the
+/// core's own wire codes (`TunnelMode::label`, `TunnelReason::label`). Full
+/// detail stays a `flow.detail` pull (F5).
 ///
 /// Kept hand-written because `aitm-mcp` must not depend on `aitm-plugins`. The
 /// key set and spelling of the two renderings are locked together by
@@ -2651,6 +2655,14 @@ fn event_label(ev: &Event) -> &'static str {
 /// `tests/mcp.rs`, which compares a pushed summary with the real `flow.get`
 /// value and fails on any drift on either side.
 fn flow_summary(flow: &Flow) -> JsonValue {
+    // Per-host decryption keys (spec D7), the same five on both kinds: a WebSocket
+    // is never a tunnel row, so its tunnel keys are null; `passive` is as stamped.
+    let tunnel = flow.metadata().tunnel.as_ref();
+    let tunnel_mode = tunnel.map(|t| t.mode.label());
+    let tunnel_reason = tunnel.and_then(|t| t.reason).map(|r| r.label());
+    let bytes_up = tunnel.and_then(|t| t.bytes_up).map(saturating_i64);
+    let bytes_down = tunnel.and_then(|t| t.bytes_down).map(saturating_i64);
+    let passive = flow.metadata().passive;
     match flow {
         Flow::Http(f) => json!({
             "id": f.id.to_string(),
@@ -2668,6 +2680,11 @@ fn flow_summary(flow: &Flow) -> JsonValue {
             "duration_ms": f.metadata.duration_ms(),
             "source_app": f.metadata.source_app,
             "capture_interface": f.metadata.capture_interface,
+            "tunnel": tunnel_mode,
+            "tunnel_reason": tunnel_reason,
+            "bytes_up": bytes_up,
+            "bytes_down": bytes_down,
+            "passive": passive,
         }),
         Flow::WebSocket(f) => json!({
             "id": f.id.to_string(),
@@ -2680,6 +2697,11 @@ fn flow_summary(flow: &Flow) -> JsonValue {
             "duration_ms": f.metadata.duration_ms(),
             "source_app": f.metadata.source_app,
             "capture_interface": f.metadata.capture_interface,
+            "tunnel": tunnel_mode,
+            "tunnel_reason": tunnel_reason,
+            "bytes_up": bytes_up,
+            "bytes_down": bytes_down,
+            "passive": passive,
         }),
     }
 }

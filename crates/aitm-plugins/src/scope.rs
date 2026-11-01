@@ -1,8 +1,10 @@
 //! The scope plugin: `scope.add`, `scope.remove`, and `scope.list` over the
 //! guard's scope set.
 //!
-//! Scope is deny-by-default (enforced by the guard); `scope.add` is the single,
-//! explicit escape hatch that brings a host into play for active actions. Because
+//! Scope is deny-by-default (enforced by the guard) and is also the decryption
+//! list: only a host in Scope is decrypted, every other TLS connection is
+//! tunnelled untouched. `scope.add` is the single, explicit escape hatch that
+//! brings a host into play for decryption and active actions. Because
 //! adding a host is an authorisation decision, `scope.add` is refused from an
 //! agent frontend (MCP) unless the operator set `scope.allow_agent_widen` — the
 //! same posture as `ca.allow_agent_install`. `scope.remove` only narrows scope,
@@ -73,8 +75,9 @@ impl Command for ScopeAdd {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Add a host, host:port, or *.wildcard to the active scope. Refused from \
-                          an agent frontend (MCP) unless scope.allow_agent_widen is set."
+            description: "Add a host, host:port, or *.wildcard to Scope. New connections to it \
+                          are decrypted from now on; hosts outside Scope are tunnelled. Refused \
+                          from an agent frontend (MCP) unless scope.allow_agent_widen is set."
                 .into(),
             params: vec![host_param("The scope entry to add.")],
             result: TypeDesc::Str,
@@ -109,7 +112,9 @@ impl Command for ScopeAdd {
 
     fn summarize(&self, _args: &Params, result: &Value) -> Option<String> {
         match result {
-            Value::Str(host) => Some(format!("added {host} to scope")),
+            Value::Str(host) => Some(format!(
+                "added {host} to scope (new connections to it are decrypted)"
+            )),
             _ => None,
         }
     }

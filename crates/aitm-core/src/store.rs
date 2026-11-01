@@ -253,13 +253,19 @@ fn is_visible(id: &FlowId, flow: &Flow, hidden: &HashSet<FlowId>) -> bool {
 /// (`WsModule::drive` → `get(handshake)`), so clearing it mid-handoff would drop
 /// the socket. An abandoned response (one that ended early and was buffered by
 /// `FlowStore::abandon_response` as a truncated body) is terminal like a
-/// completed one. A WebSocket flow qualifies once killed (there is no end marker
-/// on the flow yet — see the F-list retention gap).
+/// completed one. A **tunnel row** (`metadata.tunnel` set, spec D5) is terminal
+/// iff its `duration` is set — closed or failed: its `200` is the acknowledgement
+/// of an open tunnel whose relay still has to close the row, not a finished
+/// exchange, and a failed row has no response at all. A WebSocket flow qualifies
+/// once killed (there is no end marker on the flow yet — see the F-list retention
+/// gap).
 fn is_terminal(flow: &Flow) -> bool {
     match flow {
         Flow::Http(f) => match &f.intercept {
             InterceptState::Intercepted { .. } => false,
             InterceptState::Killed => true,
+            // A tunnel row (spec D5) is finished iff its `duration` is set.
+            _ if f.metadata.tunnel.is_some() => f.metadata.tunnel_is_closed(),
             _ => f
                 .response
                 .as_ref()
