@@ -743,7 +743,7 @@ fn literal_bytes(literal: &Literal) -> Vec<u8> {
 // Numbers
 // ---------------------------------------------------------------------------
 
-fn decode_number(kind: FieldKind, bytes: &[u8]) -> Option<i64> {
+pub(crate) fn decode_number(kind: FieldKind, bytes: &[u8]) -> Option<i64> {
     match kind {
         FieldKind::U8 => bytes.first().map(|b| i64::from(*b)),
         FieldKind::U16 { endian } => {
@@ -780,7 +780,7 @@ fn decode_number(kind: FieldKind, bytes: &[u8]) -> Option<i64> {
     }
 }
 
-fn encode_number(kind: FieldKind, value: i64) -> Option<Vec<u8>> {
+pub(crate) fn encode_number(kind: FieldKind, value: i64) -> Option<Vec<u8>> {
     match kind {
         FieldKind::U8 => u8::try_from(value).ok().map(|v| vec![v]),
         FieldKind::U16 { endian } => u16::try_from(value).ok().map(|v| match endian {
