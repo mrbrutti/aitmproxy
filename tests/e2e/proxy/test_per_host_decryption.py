@@ -34,6 +34,13 @@ reached the origin"), driven by real `curl` and read back over the operator bus:
   6. status: `proxy.status.decrypt` is `{scope_hosts: 0, decrypting: false, advice:
      "Nothing is decrypted until a host is in Scope."}` on the empty Scope and
      `{scope_hosts: 1, decrypting: true, advice: null}` after `scope.add`.
+  7. launch line (AC13, D8): with an empty Scope at launch, bare `aitm` logs that
+     same sentence exactly ONCE at `info` on the `aitm` target. Right after boot the
+     core's own output carries it with count 1 (the harness runs the core with
+     `RUST_LOG=info`; `tracing_subscriber::fmt()` writes to stdout by default, so
+     stdout and stderr are both read, polled briefly in case the line lags the bus
+     endpoint file). The seeded-Scope half of the "iff" is in
+     `tests/e2e/passthrough/test_tls_passthrough.py`.
 
 Every check names what was observed. Exit 0 pass, 77 skip (no curl / openssl),
 anything else fail. Ports are dedicated free ports; the bus token is never printed.
@@ -208,6 +215,27 @@ def wait_file(path: str, timeout: float = 10.0) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# the core's own output (AC13's launch line)
+# ---------------------------------------------------------------------------
+def core_logs(core) -> str:
+    """Everything the core has written so far. Bare `aitm` installs
+    `tracing_subscriber::fmt()` with no writer override, whose default is stdout,
+    so both streams are read (as the other startup cells do)."""
+    return core.stdout_text() + core.stderr_text()
+
+
+def wait_logs(core, pred, timeout: float = 5.0, delay: float = 0.05) -> str:
+    """Poll the core's output until `pred(text)` holds or `timeout` elapses (the
+    launch line can land a beat after the bus endpoint file); return the last text."""
+    deadline = time.time() + timeout
+    text = core_logs(core)
+    while not pred(text) and time.time() < deadline:
+        time.sleep(delay)
+        text = core_logs(core)
+    return text
+
+
 def main() -> int:
     if not have("curl"):
         skip("curl is required for the client")
@@ -241,6 +269,13 @@ def main() -> int:
         listed = bus.call("scope.list")
         check(listed == [], f"the core booted with an empty Scope (scope.list={listed})")
         ok(f"proxy 127.0.0.1:{cfg.proxy_port}, tls origin {tls_auth}, plain origin {plain.authority}")
+
+        section("7. launch line: bare aitm said the advice exactly once (empty Scope at launch)")
+        logs = wait_logs(core, lambda text: ADVICE in text)
+        count = logs.count(ADVICE)
+        check(count == 1,
+              f"the core's output carries {ADVICE!r} exactly once right after boot "
+              f"(count={count}; stdout {len(core.stdout_text())} B, stderr {len(core.stderr_text())} B)")
 
         sub = BusClient.operator(core)
         sub_id = sub.call("flow.subscribe", {})

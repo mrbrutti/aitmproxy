@@ -13,23 +13,34 @@
 //! ([`PassthroughModule::with_scope`]) nothing is in scope and every TLS/CONNECT
 //! connection is tunnelled (deny-by-default, spec D2).
 //!
+//! A passthrough relays **TLS only** (spec D1): after the acknowledgement the
+//! first byte the client sends must open a TLS handshake record (`0x16`), for a
+//! pinned host as much as an out-of-scope one. EOF before it is a client that
+//! gave up; any other byte is refused with nothing relayed, so the proxy never
+//! becomes a raw relay to an arbitrary `host:port`. A raw TLS connection (SNI,
+//! no CONNECT) is TLS by construction: the acceptor matched its ClientHello.
+//!
 //! Every connection it claims is a **tunnel row** (spec D5) recorded through the
 //! shared recorder in [`aitm_core::tunnel`]: a `CONNECT host:port` flow whose
 //! `metadata.tunnel` is `passthrough` with reason `pinned` or `out_of_scope`,
 //! carrying the `200 Connection Established` acknowledgement while the tunnel is
 //! open and, once either side closes, its `duration` and exact `bytes_up` /
-//! `bytes_down`. Every earlier exit is a `failed` row (no status, closed on
-//! insert): a CONNECT head that cannot be read (`client_closed`) or is oversized
-//! or malformed (`protocol_error`), keyed on the authority the acceptor peeked; a
-//! resolve or dial failure (`upstream_unreachable`), after which the client is
-//! dropped without an acknowledgement; an acknowledgement the client is no longer
-//! there to read (`client_closed`). The row's headers are the CONNECT head's; a
-//! captured connection's attribution (`source_app`, `capture_interface`) is
-//! carried over.
+//! `bytes_down` (the bytes read to decide on the first byte included). Every
+//! earlier exit is a `failed` row (no status, closed on insert): a CONNECT head
+//! that cannot be read (`client_closed`) or is oversized or malformed
+//! (`protocol_error`), keyed on the authority the acceptor peeked; a resolve or
+//! dial failure (`upstream_unreachable`), after which the client is dropped
+//! without an acknowledgement; an acknowledgement the client is no longer there
+//! to read, or a client gone before its first byte (`client_closed`); a first
+//! byte that is not TLS (`protocol_error`). The row's headers are the CONNECT
+//! head's; a captured connection's attribution (`source_app`,
+//! `capture_interface`) is carried over.
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskCx, Poll};
 use std::time::SystemTime;
 
 use aitm_core::{
@@ -39,12 +50,18 @@ use aitm_core::{
 };
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::list::PassthroughList;
 
 /// Largest CONNECT head accepted before tunnelling (matches the HTTP module's cap).
 const MAX_CONNECT_HEAD: usize = 16 * 1024;
+/// First byte of a TLS handshake record: what the first byte a client sends
+/// inside an acknowledged tunnel must be for the tunnel to be relayed (spec D1).
+const TLS_HANDSHAKE: u8 = 0x16;
+/// The most of the client's first bytes read ahead of the relay to decide on
+/// them: one TLS record (a 5-byte header and at most 2^14 bytes of payload).
+const FIRST_READ: usize = 5 + 16 * 1024;
 
 /// Tunnels a TLS connection byte-for-byte when its host is on the shared
 /// passthrough list **or not in Scope**, instead of decrypting it (spec D1/D2).
@@ -76,7 +93,7 @@ impl PassthroughModule {
     /// when the host is on the passthrough list (pins win over Scope), else
     /// `OutOfScope`. Meaningful only for an authority [`matches`](ProtocolModule::matches)
     /// accepted.
-    pub fn passthrough_reason(&self, authority: &Authority) -> TunnelReason {
+    pub(crate) fn passthrough_reason(&self, authority: &Authority) -> TunnelReason {
         if self.list.contains_host(&authority.host) {
             TunnelReason::Pinned
         } else {
@@ -86,11 +103,13 @@ impl PassthroughModule {
 
     /// Open the upstream and copy bytes both ways with no TLS termination,
     /// recording the connection as one tunnel row (spec D5/D6: parse → dial →
-    /// ack → row `passthrough` → relay → close with bytes and duration). Every
-    /// earlier exit is a `failed` row: a head that cannot be read or parsed
-    /// (`client_closed` / `protocol_error`, keyed on the authority the acceptor
-    /// peeked), a dial failure (`upstream_unreachable`), an acknowledgement that
-    /// cannot be written (`client_closed`).
+    /// ack → first byte → row `passthrough` → relay → close with bytes and
+    /// duration). Every earlier exit is a `failed` row: a head that cannot be
+    /// read or parsed (`client_closed` / `protocol_error`, keyed on the authority
+    /// the acceptor peeked), a dial failure (`upstream_unreachable`), an
+    /// acknowledgement that cannot be written or a client gone before its first
+    /// byte (`client_closed`), a first byte that does not open a TLS handshake
+    /// record (`protocol_error`, nothing relayed — spec D1, panel S1).
     async fn tunnel(&self, mut client: ByteStream, ctx: ModuleCtx) -> Result<()> {
         // The row's `created`, and what its `duration` is measured from.
         let opened_at = SystemTime::now();
@@ -193,6 +212,56 @@ impl PassthroughModule {
             }
         }
 
+        // Spec D1 (TLS only): the first byte the client sends inside the
+        // acknowledged tunnel must open a TLS handshake record. The stream has
+        // no peek, so what the first read yields is kept and put back in front
+        // of the relay (`Replayed`): the origin receives it first and `bytes_up`
+        // counts it. A raw TLS connection needs no check — the acceptor matched
+        // its ClientHello, which is what it opens with.
+        let mut client = if is_connect {
+            let mut first = vec![0u8; FIRST_READ];
+            let n = match client.read(&mut first).await {
+                Ok(n) => n,
+                Err(err) => {
+                    let err = anyhow::Error::from(err)
+                        .context("passthrough: reading the first byte inside the tunnel");
+                    TunnelRow::open(&ctx, req, TunnelInfo::failed(classify_client_failure(&err)))
+                        .await;
+                    return Err(err);
+                }
+            };
+            first.truncate(n);
+            match first.first() {
+                Some(&TLS_HANDSHAKE) => {}
+                None => {
+                    // EOF before the first byte: a speculative pre-connect, a
+                    // client that gave up. A row, but not an error worth a log.
+                    TunnelRow::open(&ctx, req, TunnelInfo::failed(TunnelReason::ClientClosed))
+                        .await;
+                    return Ok(());
+                }
+                Some(&other) => {
+                    // Not TLS (`curl -p http://…`): the proxy is not a raw relay
+                    // to an arbitrary host. Nothing has reached the origin.
+                    let authority = req.authority.to_string();
+                    req.client.tls = false;
+                    TunnelRow::open(&ctx, req, TunnelInfo::failed(TunnelReason::ProtocolError))
+                        .await;
+                    let _ = client.shutdown().await;
+                    return Err(anyhow!(
+                        "passthrough: refused to relay {authority}: the first byte inside the \
+                         tunnel is {other:#04x}, not a TLS handshake record"
+                    ));
+                }
+            }
+            Box::pin(Replayed {
+                prefix: first,
+                inner: client,
+            }) as ByteStream
+        } else {
+            client
+        };
+
         let reason = self.passthrough_reason(&req.authority);
         let row = TunnelRow::open(&ctx, req, TunnelInfo::passthrough(reason)).await;
 
@@ -275,6 +344,49 @@ async fn record_failed_head(
             TunnelInfo::failed(reason),
         )
         .await;
+    }
+}
+
+/// The client stream with the bytes already read from it (to decide on the
+/// first one) put back in front, so the relay — and its `bytes_up` count — sees
+/// the TLS record whole and in order. Writes go straight through.
+struct Replayed {
+    prefix: Vec<u8>,
+    inner: ByteStream,
+}
+
+impl AsyncRead for Replayed {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskCx<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.prefix.is_empty() {
+            let n = buf.remaining().min(this.prefix.len());
+            buf.put_slice(&this.prefix[..n]);
+            this.prefix.drain(..n);
+            return Poll::Ready(Ok(()));
+        }
+        this.inner.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Replayed {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskCx<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_shutdown(cx)
     }
 }
 
@@ -539,9 +651,16 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::task::JoinHandle;
 
+    /// The most a test waits for `spawn` to return where a regression would hang
+    /// it (a relay that should have been refused keeps both ends open).
+    const STALL_GUARD: std::time::Duration = std::time::Duration::from_secs(5);
+
     const CONNECT_HEAD: &str = "CONNECT 127.0.0.1:4443 HTTP/1.1\r\nHost: 127.0.0.1:4443\r\nProxy-Connection: keep-alive\r\n\r\n";
     const ACK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-    const UP: &[u8] = b"hello-up";
+    /// What the client sends inside the tunnel: a TLS handshake record (type
+    /// `0x16`, version 3.1, a 5-byte body) — the first byte decides whether the
+    /// tunnel is relayed at all (spec D1, panel S1).
+    const UP: &[u8] = &[0x16, 0x03, 0x01, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
     const DOWN: &[u8] = b"world-down";
 
     /// Records every event in order: the chain's role in these tests.
@@ -612,9 +731,10 @@ mod tests {
 
     /// Spawn the module on the module ends of two duplex pairs and return the
     /// test ends: the client connection and (when `dial_succeeds`) the origin.
+    /// The context carries no scope guard: the module decides on its own handle
+    /// (`with_scope`); `ModuleCtx::with_scope` is the HTTP module's seam.
     fn start(
         module: PassthroughModule,
-        scope: Option<Arc<dyn ScopeRateGuard>>,
         hint: NextLayerHint,
         dial_succeeds: bool,
     ) -> (DuplexStream, Option<DuplexStream>, Harness) {
@@ -626,11 +746,7 @@ mod tests {
             origin: Mutex::new(dial_succeeds.then(|| Box::pin(module_origin) as ByteStream)),
             asked: Mutex::new(None),
         });
-        let mut ctx =
-            ModuleCtx::new(store.clone(), sink.clone(), connector.clone()).with_hint(hint);
-        if let Some(guard) = scope {
-            ctx = ctx.with_scope(guard);
-        }
+        let ctx = ModuleCtx::new(store.clone(), sink.clone(), connector.clone()).with_hint(hint);
         let module = Arc::new(module);
         let task = tokio::spawn(async move {
             let io: ByteStream = Box::pin(module_client);
@@ -704,10 +820,8 @@ mod tests {
     #[tokio::test]
     async fn out_of_scope_connect_is_a_passthrough_row_with_exact_bytes() {
         let guard = guard_with(&["scoped.example"]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (client, origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
 
         let open = round_trip(client, origin.expect("origin"), &h).await;
         assert_eq!(open.response.as_ref().map(|r| r.status), Some(200));
@@ -766,9 +880,8 @@ mod tests {
     async fn pinned_in_scope_connect_is_a_passthrough_row_with_reason_pinned() {
         let guard = guard_with(&["127.0.0.1"]);
         let module = PassthroughModule::new(PassthroughList::new(vec!["127.0.0.1".to_string()]))
-            .with_scope(guard.clone());
-        let (client, origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+            .with_scope(guard);
+        let (client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
 
         round_trip(client, origin.expect("origin"), &h).await;
         h.finish().await.expect("a clean close is not an error");
@@ -792,10 +905,8 @@ mod tests {
     #[tokio::test]
     async fn dial_failure_is_a_failed_upstream_unreachable_row() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (mut client, origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), false);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), false);
         assert!(origin.is_none());
 
         client
@@ -841,10 +952,8 @@ mod tests {
     #[tokio::test]
     async fn connect_headers_land_on_the_row() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (client, origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
 
         round_trip(client, origin.expect("origin"), &h).await;
         h.finish().await.expect("a clean close is not an error");
@@ -867,12 +976,11 @@ mod tests {
     #[tokio::test]
     async fn captured_connect_carries_source_app_and_capture_interface() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
         let mut hint = connect_hint("127.0.0.1:4443");
         hint.peer_identity = Some("com.apple.Safari".to_string());
         hint.capture_interface = Some("macos-ne".to_string());
-        let (client, origin, mut h) = start(module, Some(guard), hint, true);
+        let (client, origin, mut h) = start(module, hint, true);
 
         round_trip(client, origin.expect("origin"), &h).await;
         h.finish().await.expect("a clean close is not an error");
@@ -899,10 +1007,8 @@ mod tests {
     #[tokio::test]
     async fn connect_head_eof_is_a_failed_client_closed_row() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (mut client, _origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, _origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
 
         // The peek saw the CONNECT line; the client hangs up before the blank
         // line that ends the head.
@@ -947,10 +1053,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_connect_head_is_a_failed_protocol_error_row() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (mut client, _origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, _origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
 
         // One byte over the cap and still no blank line.
         let mut head = b"CONNECT 127.0.0.1:4443 HTTP/1.1\r\nX-Pad: ".to_vec();
@@ -985,10 +1089,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_connect_head_is_a_failed_protocol_error_row() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (mut client, _origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, _origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
 
         client
             .write_all(b"CONNECT 127.0.0.1:4443 HTTP/1.1\r\nX-Bad: \xff\xfe\r\n\r\n")
@@ -1022,10 +1124,8 @@ mod tests {
     #[tokio::test]
     async fn ack_write_failure_is_a_failed_row() {
         let guard = guard_with(&[]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
-        let (mut client, origin, mut h) =
-            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
         let mut origin = origin.expect("origin");
 
         // The whole head goes in, then the client is gone: its bytes stay
@@ -1075,6 +1175,234 @@ mod tests {
         assert_eq!(rest, b"");
     }
 
+    // ---- Spec D1 "a passthrough relays TLS only" (panel S1) ----------------------
+
+    /// After the acknowledgement the client sends a cleartext `GET` (`curl -p
+    /// http://…` to an out-of-scope host) instead of a TLS handshake record. The
+    /// tunnel is refused: a `failed/protocol_error` row carrying the dialled
+    /// origin, the origin receives **nothing**, the client sees the acknowledgement
+    /// and then EOF, and `spawn` returns the refusal.
+    #[tokio::test]
+    async fn out_of_scope_connect_whose_first_byte_is_not_tls_is_refused() {
+        let guard = guard_with(&["scoped.example"]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:4443\r\n\r\n")
+            .await
+            .expect("client writes cleartext inside the tunnel");
+
+        let err = tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the refused tunnel hung")
+            .expect_err("a non-TLS tunnel is refused");
+        assert!(
+            format!("{err:#}").contains("not a TLS handshake record"),
+            "the refusal names itself: {err:#}"
+        );
+
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.expect("client read");
+        assert_eq!(
+            rest, b"",
+            "nothing but the acknowledgement reached the client"
+        );
+        let mut got = Vec::new();
+        origin.read_to_end(&mut got).await.expect("origin read");
+        assert_eq!(got, b"", "not one client byte reached the origin");
+
+        let row = h.row();
+        assert_eq!(row.request.method, "CONNECT");
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert_eq!(row.request.headers.get("host"), Some("127.0.0.1:4443"));
+        assert!(row.response.is_none(), "a failed tunnel has no status");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ProtocolError))
+        );
+        assert!(row.metadata.duration.is_some(), "closed on insert");
+        assert!(!row.client_conn.tls, "the client did not speak TLS");
+        assert_eq!(
+            row.server_conn.as_ref().map(|s| s.peer),
+            Some(origin_addr()),
+            "the origin had been dialled when the client was refused"
+        );
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// The rule holds for a pin too (the feature is *TLS* passthrough): a pinned,
+    /// in-scope host whose client sends cleartext inside the tunnel gets the same
+    /// `failed/protocol_error` row, never a `passthrough/pinned` one, and the
+    /// origin receives nothing.
+    #[tokio::test]
+    async fn pinned_connect_whose_first_byte_is_not_tls_is_refused() {
+        let guard = guard_with(&["127.0.0.1"]);
+        let module = PassthroughModule::new(PassthroughList::new(vec!["127.0.0.1".to_string()]))
+            .with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("client writes a cleartext h2 preface inside the tunnel");
+
+        let err = tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the refused tunnel hung")
+            .expect_err("a non-TLS tunnel is refused");
+        assert!(
+            format!("{err:#}").contains("not a TLS handshake record"),
+            "{err:#}"
+        );
+        let mut got = Vec::new();
+        origin.read_to_end(&mut got).await.expect("origin read");
+        assert_eq!(got, b"", "not one client byte reached the origin");
+
+        let row = h.row();
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ProtocolError)),
+            "a pin does not relay cleartext either"
+        );
+        assert!(row.response.is_none());
+        assert!(!row.client_conn.tls);
+        assert_eq!(
+            row.server_conn.as_ref().map(|s| s.peer),
+            Some(origin_addr())
+        );
+    }
+
+    /// EOF right after the acknowledgement (a speculative pre-connect that gave
+    /// up) is a `failed/client_closed` row carrying the dialled origin — not an
+    /// open passthrough row with zero bytes — and not an error.
+    #[tokio::test]
+    async fn out_of_scope_connect_then_eof_is_a_failed_client_closed_row() {
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        drop(client);
+
+        tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the abandoned tunnel hung")
+            .expect("a client that leaves before its first byte is not an error");
+        let mut got = Vec::new();
+        origin.read_to_end(&mut got).await.expect("origin read");
+        assert_eq!(got, b"", "nothing was relayed");
+
+        let row = h.row();
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert!(row.response.is_none(), "no 200 on a failed tunnel");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ClientClosed))
+        );
+        assert!(row.metadata.duration.is_some());
+        assert_eq!(
+            row.server_conn.as_ref().map(|s| s.peer),
+            Some(origin_addr()),
+            "the origin had been dialled"
+        );
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// The bytes the module reads to decide are the TLS record's own and must not
+    /// be lost: the client sends the record's first byte alone, waits for it at the
+    /// origin, then the rest. Everything reaches the origin in order and `bytes_up`
+    /// counts the decided-on byte too.
+    #[tokio::test]
+    async fn out_of_scope_connect_with_tls_first_byte_is_relayed_with_exact_counts() {
+        const REST: &[u8] = &[0x03, 0x01, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
+        let guard = guard_with(&["scoped.example"]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+
+        client
+            .write_all(&[0x16])
+            .await
+            .expect("the record type byte");
+        let mut first = [0u8; 1];
+        origin
+            .read_exact(&mut first)
+            .await
+            .expect("the decided-on byte reaches the origin");
+        assert_eq!(first, [0x16]);
+        client
+            .write_all(REST)
+            .await
+            .expect("the rest of the record");
+        let mut rest = vec![0u8; REST.len()];
+        origin
+            .read_exact(&mut rest)
+            .await
+            .expect("the rest reaches the origin behind it");
+        assert_eq!(rest, REST);
+        origin.write_all(DOWN).await.expect("origin writes");
+        let mut down = vec![0u8; DOWN.len()];
+        client
+            .read_exact(&mut down)
+            .await
+            .expect("origin bytes reach the client");
+        assert_eq!(down, DOWN);
+        drop(client);
+        drop(origin);
+        h.finish().await.expect("a clean close is not an error");
+
+        let row = h.row();
+        assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo {
+                mode: TunnelMode::Passthrough,
+                reason: Some(TunnelReason::OutOfScope),
+                bytes_up: Some(1 + REST.len() as u64),
+                bytes_down: Some(DOWN.len() as u64),
+            }),
+            "the first byte is counted with the rest"
+        );
+        assert!(row.client_conn.tls);
+        assert!(row.metadata.duration.is_some());
+    }
+
     // ---- Tester additions (whole-branch stage 5) ---------------------------------
 
     /// AC8 (IPv6): `CONNECT [::1]:4443` is claimed, dialled as the IPv6 literal it
@@ -1087,14 +1415,13 @@ mod tests {
         let v6_origin: SocketAddr = V6.parse().expect("v6 addr");
         // `127.0.0.1` is in Scope; `::1` is another host and is not.
         let guard = guard_with(&["127.0.0.1"]);
-        let module =
-            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
         let hint = connect_hint(V6);
         assert!(
             module.matches(&hint),
             "an out-of-scope IPv6 CONNECT is claimed"
         );
-        let (mut client, origin, mut h) = start(module, Some(guard), hint, true);
+        let (mut client, origin, mut h) = start(module, hint, true);
         let mut origin = origin.expect("origin");
 
         let mut head = format!("CONNECT {V6} HTTP/1.1\r\nHost: {V6}\r\n\r\n").into_bytes();

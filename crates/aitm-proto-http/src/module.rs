@@ -288,11 +288,12 @@ impl HttpModule {
 
     /// A `CONNECT` tunnel, spec D6 step by step. The head is read and its
     /// authority normalised (port 443 when absent); an authority outside the
-    /// live Scope is relayed to the origin untouched (D2: the module's own
-    /// relay, so the invariant does not depend on the passthrough module having
-    /// claimed the connection first); one in Scope is resolved, acknowledged and
-    /// decrypted — TLS through [`HttpModule::mitm`], cleartext served inside the
-    /// tunnel. Every outcome is a tunnel row; the ones decided here:
+    /// live Scope is relayed to the origin untouched by [`relay_out_of_scope`]
+    /// (D2: the module's own relay, so the invariant does not depend on the
+    /// passthrough module having claimed the connection first); one in Scope is
+    /// resolved, acknowledged and decrypted — TLS through [`HttpModule::mitm`],
+    /// cleartext served inside the tunnel. Every outcome is a tunnel row, through
+    /// [`fail_tunnel`] for the early exits decided here:
     ///
     /// - a head that cannot be read (EOF, reset, over the cap) or an authority
     ///   token that is not one → `failed`, with the reason the error's type
@@ -304,15 +305,19 @@ impl HttpModule {
     /// - cleartext inside an in-scope tunnel → `decrypted` with `client.tls =
     ///   false`, closed when the connection ends.
     ///
+    /// The row's `client.tls` is `false` until the first byte inside the tunnel
+    /// is seen to open a TLS handshake record, so a row for a failure before
+    /// that point says no TLS was seen.
+    ///
     /// A row needs an authority. A head that does not parse (no token after
     /// `CONNECT`, a non-UTF-8 header line) is a `failed/protocol_error` row
     /// keyed on the authority the acceptor's peek named, with no headers, as
     /// the passthrough module records it; one the peek did not name either
     /// ends the connection with the error and no row: there is nothing to key
-    /// a row on. An authority token that does not parse is recorded under
-    /// the label `Authority::new(raw, 443)` — the raw text, lowercased, as the
-    /// host — so the operator sees what the client asked for; it is never
-    /// dialled.
+    /// a row on ([`fail_before_authority`]). An authority token that does not
+    /// parse is recorded under the label `Authority::new(raw, 443)` — the raw
+    /// text, lowercased, as the host — so the operator sees what the client
+    /// asked for; it is never dialled.
     async fn tunnel(
         &self,
         mut client: Prefixed<ByteStream>,
@@ -320,24 +325,14 @@ impl HttpModule {
         peer: SocketAddr,
     ) -> Result<()> {
         let opened_at = SystemTime::now();
+        // What the acceptor's peek named: the key of a row whose head never parses.
+        let hinted = ctx.hint().and_then(NextLayerHint::tunnel_authority);
         let head = match client.read_head(MAX_CONNECT_HEAD).await {
             Ok(head) => head,
             Err(e) => {
                 let err = anyhow::Error::from(e);
-                if let Some(authority) = ctx.hint().and_then(NextLayerHint::tunnel_authority) {
-                    let head = TunnelHead {
-                        authority,
-                        headers: HeaderMap::new(),
-                        opened_at,
-                    };
-                    let reason = classify_client_failure(&err);
-                    TunnelRow::open(
-                        &ctx,
-                        tunnel_request(&ctx, peer, head, false),
-                        TunnelInfo::failed(reason),
-                    )
-                    .await;
-                }
+                let reason = classify_client_failure(&err);
+                fail_before_authority(&ctx, peer, hinted, opened_at, false, reason).await;
                 return Err(err);
             }
         };
@@ -347,24 +342,8 @@ impl HttpModule {
         } = match parse_connect(&head) {
             Ok(parsed) => parsed,
             Err(e) => {
-                // D5: a head that does not parse is still a row when the
-                // acceptor's peek named the authority (the request line fit the
-                // peek; a later line is what did not parse). With no authority
-                // from either source there is nothing to key a row on, so that
-                // connection stays rowless, as before.
-                if let Some(authority) = ctx.hint().and_then(NextLayerHint::tunnel_authority) {
-                    let head = TunnelHead {
-                        authority,
-                        headers: HeaderMap::new(),
-                        opened_at,
-                    };
-                    TunnelRow::open(
-                        &ctx,
-                        tunnel_request(&ctx, peer, head, false),
-                        TunnelInfo::failed(TunnelReason::ProtocolError),
-                    )
-                    .await;
-                }
+                let reason = TunnelReason::ProtocolError;
+                fail_before_authority(&ctx, peer, hinted, opened_at, false, reason).await;
                 return Err(e);
             }
         };
@@ -376,12 +355,8 @@ impl HttpModule {
                     headers,
                     opened_at,
                 };
-                TunnelRow::open(
-                    &ctx,
-                    tunnel_request(&ctx, peer, head, false),
-                    TunnelInfo::failed(TunnelReason::ProtocolError),
-                )
-                .await;
+                let request = tunnel_request(&ctx, peer, head, false);
+                fail_tunnel(&ctx, request, TunnelReason::ProtocolError).await;
                 bail!("malformed CONNECT authority: {e}");
             }
         };
@@ -390,67 +365,43 @@ impl HttpModule {
             headers,
             opened_at,
         };
+        // Nothing inside the tunnel has been seen yet: `tls` stays false until
+        // the first byte says otherwise.
+        let mut request = tunnel_request(&ctx, peer, head, false);
 
-        if !ctx.in_scope(&head.authority.to_string()) {
-            return relay_out_of_scope(client, &ctx, peer, head, true).await;
+        if !ctx.in_scope(&request.authority.to_string()) {
+            return relay_out_of_scope(client, &ctx, request, true).await;
         }
-        let target = match Target::from_authority(&head.authority).await {
+        let target = match Target::from_authority(&request.authority).await {
             Ok(target) => target,
             Err(e) => {
-                TunnelRow::open(
-                    &ctx,
-                    tunnel_request(&ctx, peer, head, false),
-                    TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
-                )
-                .await;
+                fail_tunnel(&ctx, request, TunnelReason::UpstreamUnreachable).await;
                 return Err(e);
             }
         };
-        if let Err(e) = acknowledge(&mut client).await {
-            let err = anyhow::Error::from(e);
-            let reason = classify_client_failure(&err);
-            TunnelRow::open(
-                &ctx,
-                tunnel_request(&ctx, peer, head, false),
-                TunnelInfo::failed(reason),
-            )
-            .await;
-            return Err(err);
-        }
-        let next = match client.peek(1).await {
-            Ok([first, ..]) => *first,
-            Ok([]) => {
+        let next = match first_byte_after_ack(&mut client).await {
+            Ok(Some(next)) => next,
+            Ok(None) => {
                 // EOF before the first byte: a speculative pre-connect, a client
                 // that gave up. A row, but not an error worth the acceptor's log.
-                TunnelRow::open(
-                    &ctx,
-                    tunnel_request(&ctx, peer, head, false),
-                    TunnelInfo::failed(TunnelReason::ClientClosed),
-                )
-                .await;
+                fail_tunnel(&ctx, request, TunnelReason::ClientClosed).await;
                 return Ok(());
             }
             Err(e) => {
                 let err = anyhow::Error::from(e);
-                let reason = classify_client_failure(&err);
-                TunnelRow::open(
-                    &ctx,
-                    tunnel_request(&ctx, peer, head, false),
-                    TunnelInfo::failed(reason),
-                )
-                .await;
+                fail_tunnel(&ctx, request, classify_client_failure(&err)).await;
                 return Err(err);
             }
         };
         if next == TLS_HANDSHAKE {
-            return self.mitm(client, ctx, peer, target, head).await;
+            request.client.tls = true;
+            return self.mitm(client, ctx, target, request).await;
         }
 
         // Cleartext inside the tunnel (`curl -p`): served as HTTP/1 with the
         // tunnel's route; the row is `decrypted` with a cleartext client side.
         let conn =
             Conn::plain(peer, Some((target.authority(), target.addr))).with_attribution(ctx.hint());
-        let mut request = tunnel_request(&ctx, peer, head, false);
         request.client = conn.client_conn.clone();
         let row = TunnelRow::open(&ctx, request, TunnelInfo::decrypted()).await;
         let served = serve(
@@ -471,12 +422,16 @@ impl HttpModule {
     /// capture destination's port, else `sni:443`); when the acceptor's peek
     /// did not hold the ClientHello, the module buffers its first record itself
     /// — it stays in the stream — and reads the SNI from it. Out of Scope → the
-    /// same relay as a CONNECT, with the buffered bytes going first; in Scope →
-    /// [`HttpModule::mitm`]. No SNI → `failed/protocol_error` and the error as
-    /// before: nothing names an origin to decrypt. A capture ingress knows the
-    /// destination, so that row is keyed on it; on the explicit-proxy path
-    /// `dst` is the client's own address, so there is no authority to key a row
-    /// on and the connection ends with the error alone.
+    /// same relay as a CONNECT, with the buffered bytes going first (TLS by
+    /// construction: `drive` routed here on the handshake byte, so no
+    /// acknowledgement and no first-byte check); in Scope → [`HttpModule::mitm`].
+    /// No SNI → `failed/protocol_error` and the error as before: nothing names
+    /// an origin to decrypt; a record the client cut off with a reset while it
+    /// was being buffered → `failed` with the reason the error's type gives
+    /// (panel Q5). A capture ingress knows the destination, so those rows are
+    /// keyed on it; on the explicit-proxy path `dst` is the client's own
+    /// address, so there is no authority to key a row on and the connection
+    /// ends with the error alone.
     async fn raw_tls(
         &self,
         mut client: Prefixed<ByteStream>,
@@ -488,28 +443,28 @@ impl HttpModule {
             .hint()
             .filter(|h| h.capture_interface.is_some())
             .map(|h| h.dst);
+        // What a row for a connection whose SNI never arrives is keyed on.
+        let captured = captured_dst.map(|dst| Authority::new(&dst.ip().to_string(), dst.port()));
         let authority = match ctx.hint().and_then(NextLayerHint::tunnel_authority) {
             Some(authority) => Some(authority),
             None => {
-                let hello = client.peek_tls_record(MAX_CLIENT_HELLO).await?;
                 let port = captured_dst.map_or(DEFAULT_TLS_PORT, |dst| dst.port());
-                parse_client_hello_sni(hello).map(|sni| Authority::new(&sni, port))
+                match client.peek_tls_record(MAX_CLIENT_HELLO).await {
+                    Ok(hello) => {
+                        parse_client_hello_sni(hello).map(|sni| Authority::new(&sni, port))
+                    }
+                    Err(e) => {
+                        let err = anyhow::Error::from(e);
+                        let reason = classify_client_failure(&err);
+                        fail_before_authority(&ctx, peer, captured, opened_at, true, reason).await;
+                        return Err(err);
+                    }
+                }
             }
         };
         let Some(authority) = authority else {
-            if let Some(dst) = captured_dst {
-                let head = TunnelHead {
-                    authority: Authority::new(&dst.ip().to_string(), dst.port()),
-                    headers: HeaderMap::new(),
-                    opened_at,
-                };
-                TunnelRow::open(
-                    &ctx,
-                    tunnel_request(&ctx, peer, head, true),
-                    TunnelInfo::failed(TunnelReason::ProtocolError),
-                )
-                .await;
-            }
+            let reason = TunnelReason::ProtocolError;
+            fail_before_authority(&ctx, peer, captured, opened_at, true, reason).await;
             bail!("TLS without CONNECT or SNI: no upstream to pick");
         };
         let head = TunnelHead {
@@ -517,46 +472,44 @@ impl HttpModule {
             headers: HeaderMap::new(),
             opened_at,
         };
+        // TLS by construction: `drive` routed here on the handshake byte.
+        let request = tunnel_request(&ctx, peer, head, true);
 
-        if !ctx.in_scope(&head.authority.to_string()) {
-            return relay_out_of_scope(client, &ctx, peer, head, false).await;
+        if !ctx.in_scope(&request.authority.to_string()) {
+            return relay_out_of_scope(client, &ctx, request, false).await;
         }
-        let target = match Target::from_authority(&head.authority).await {
+        let target = match Target::from_authority(&request.authority).await {
             Ok(target) => target,
             Err(e) => {
-                TunnelRow::open(
-                    &ctx,
-                    tunnel_request(&ctx, peer, head, true),
-                    TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
-                )
-                .await;
+                fail_tunnel(&ctx, request, TunnelReason::UpstreamUnreachable).await;
                 return Err(e);
             }
         };
-        self.mitm(client, ctx, peer, target, head).await
+        self.mitm(client, ctx, target, request).await
     }
 
-    /// TLS MITM of an in-scope tunnel (`target` is where `head.authority`
-    /// resolved): read the ClientHello (SNI), connect to the origin over TLS,
-    /// sniff its leaf's names, mint an impersonating leaf, finish the client
-    /// handshake, then serve HTTP between the two decrypted streams. The tunnel
-    /// row appears at the outcome (spec D5): `decrypted` once the client
-    /// handshake completes, closed with its duration when the connection ends;
-    /// or `failed` with the step that broke it ([`HttpModule::establish`]), the
-    /// connection ending with that step's error unchanged.
+    /// TLS MITM of an in-scope tunnel (`target` is where `request.authority`
+    /// resolved; the caller has seen the client's handshake byte, so
+    /// `request.client.tls` is already true): read the ClientHello (SNI),
+    /// connect to the origin over TLS, sniff its leaf's names, mint an
+    /// impersonating leaf, finish the client handshake, then serve HTTP between
+    /// the two decrypted streams. The tunnel row appears at the outcome (spec
+    /// D5): `decrypted` once the client handshake completes, closed with its
+    /// duration when the connection ends; or `failed` with the step that broke
+    /// it ([`HttpModule::establish`]), the connection ending with that step's
+    /// error unchanged.
     async fn mitm(
         &self,
         client: Prefixed<ByteStream>,
         ctx: ModuleCtx,
-        peer: SocketAddr,
         target: Target,
-        head: TunnelHead,
+        mut request: TunnelRequest,
     ) -> Result<()> {
-        let mut request = tunnel_request(&ctx, peer, head, true);
+        let peer = request.client.peer;
         let session = match self.establish(client, &ctx, &target, &mut request).await {
             Ok(session) => session,
             Err(Refused { reason, error }) => {
-                TunnelRow::open(&ctx, request, TunnelInfo::failed(reason)).await;
+                fail_tunnel(&ctx, request, reason).await;
                 return Err(error);
             }
         };
@@ -807,7 +760,9 @@ impl Refused {
 }
 
 /// The row request for `head` as a connection knows it before anything was
-/// dialled: the client peer with `tls` as given and no SNI yet, no origin, and
+/// dialled: the client peer with `tls` as given (whether a TLS handshake record
+/// has been seen from the client: a raw-TLS connection opened with one; a
+/// `CONNECT`'s is unknown until its first byte) and no SNI yet, no origin, and
 /// the hint's capture attribution. Producers fill in what they learn.
 fn tunnel_request(ctx: &ModuleCtx, peer: SocketAddr, head: TunnelHead, tls: bool) -> TunnelRequest {
     let (source_app, capture_interface) = ctx.hint().map_or((None, None), |h| {
@@ -830,52 +785,89 @@ fn tunnel_request(ctx: &ModuleCtx, peer: SocketAddr, head: TunnelHead, tls: bool
     }
 }
 
+/// Spec D5: a tunnel that was not established is a `failed` row with `reason`
+/// — closed on insert, no status — recorded here and nowhere else in this
+/// module, so every early exit of the CONNECT, raw-TLS and relay paths leaves
+/// the same row. The caller then ends the connection with its error unchanged
+/// (or with `Ok(())` for a client that simply left).
+async fn fail_tunnel(ctx: &ModuleCtx, request: TunnelRequest, reason: TunnelReason) {
+    TunnelRow::open(ctx, request, TunnelInfo::failed(reason)).await;
+}
+
+/// [`fail_tunnel`] for a tunnel that failed before its authority was read: the
+/// row is keyed on `authority` — what the acceptor's peek named for a `CONNECT`,
+/// the capture destination for a raw-TLS connection — with no headers. With
+/// `None` there is nothing to key a row on (a `CONNECT` the peek did not name,
+/// a raw-TLS connection on the explicit-proxy path; spec D6), so no row is
+/// recorded and the connection ends with the error alone.
+async fn fail_before_authority(
+    ctx: &ModuleCtx,
+    peer: SocketAddr,
+    authority: Option<Authority>,
+    opened_at: SystemTime,
+    tls: bool,
+    reason: TunnelReason,
+) {
+    if let Some(authority) = authority {
+        let head = TunnelHead {
+            authority,
+            headers: HeaderMap::new(),
+            opened_at,
+        };
+        fail_tunnel(ctx, tunnel_request(ctx, peer, head, tls), reason).await;
+    }
+}
+
 /// Write the `200 Connection Established` acknowledgement.
 async fn acknowledge<S: AsyncWrite + Unpin>(client: &mut S) -> io::Result<()> {
     client.write_all(CONNECT_ACK).await?;
     client.flush().await
 }
 
-/// Spec D2/D5: a tunnel whose authority is outside the live Scope is not
-/// decrypted. The origin is resolved and dialled through the connector (a
-/// failure there is `failed/upstream_unreachable`, answered with nothing), the
-/// `CONNECT` is acknowledged when `acknowledge_connect` is set (a raw-TLS
-/// connection expects no acknowledgement), the `passthrough/out_of_scope` row is
-/// opened, and the two streams are relayed byte for byte — whatever `client`
-/// has buffered (a ClientHello sent before the acknowledgement, or the one a
-/// raw-TLS connection opened with) goes first — until either side closes. The
-/// row then closes with the bytes moved and its duration. The client completes
-/// TLS with the origin's own certificate; nothing inside the tunnel becomes a
-/// row.
+/// Acknowledge the `CONNECT` and look at the first byte the client then sends
+/// inside the tunnel without consuming it — `None` when the client closed
+/// instead. What the tunnel becomes is decided on that byte (spec D1/D6).
+async fn first_byte_after_ack(client: &mut Prefixed<ByteStream>) -> io::Result<Option<u8>> {
+    acknowledge(client).await?;
+    Ok(client.peek(1).await?.first().copied())
+}
+
+/// Spec D1/D2/D5: a tunnel whose authority is outside the live Scope is not
+/// decrypted but relayed — and relays **TLS only**. The origin is resolved and
+/// dialled through the connector (a failure there is
+/// `failed/upstream_unreachable`, answered with nothing). On the `CONNECT`
+/// path (`connect`) the acknowledgement is then written and the first byte the
+/// client sends must open a TLS handshake record (`0x16`): EOF before it is
+/// `failed/client_closed` (a speculative pre-connect; a row, not an error), any
+/// other byte is `failed/protocol_error` with nothing relayed and the client
+/// shut down — the proxy is not a raw relay to an arbitrary `host:port` (panel
+/// S1) — and the row's `client.tls` is set only once that byte was seen. A
+/// raw-TLS connection expects no acknowledgement and opened with a TLS record
+/// by construction, so it skips the check. The `passthrough/out_of_scope` row
+/// is then opened and the two streams relayed byte for byte — whatever `client`
+/// has buffered (the peeked record, a ClientHello sent before the
+/// acknowledgement, the record a raw-TLS connection opened with) goes first —
+/// until either side closes; the row closes with the bytes moved and its
+/// duration. The client completes TLS with the origin's own certificate;
+/// nothing inside the tunnel becomes a row.
 async fn relay_out_of_scope(
-    client: Prefixed<ByteStream>,
+    mut client: Prefixed<ByteStream>,
     ctx: &ModuleCtx,
-    peer: SocketAddr,
-    head: TunnelHead,
-    acknowledge_connect: bool,
+    mut request: TunnelRequest,
+    connect: bool,
 ) -> Result<()> {
-    let mut request = tunnel_request(ctx, peer, head, true);
-    let target = match Target::from_authority(&request.authority).await {
-        Ok(target) => target,
+    let dialled = async {
+        let target = Target::from_authority(&request.authority).await?;
+        let upstream = ctx
+            .connect_upstream(&target.authority(), target.addr)
+            .await?;
+        anyhow::Ok((target, upstream))
+    }
+    .await;
+    let (target, mut upstream) = match dialled {
+        Ok(dialled) => dialled,
         Err(e) => {
-            TunnelRow::open(
-                ctx,
-                request,
-                TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
-            )
-            .await;
-            return Err(e);
-        }
-    };
-    let mut upstream = match ctx.connect_upstream(&target.authority(), target.addr).await {
-        Ok(upstream) => upstream,
-        Err(e) => {
-            TunnelRow::open(
-                ctx,
-                request,
-                TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
-            )
-            .await;
+            fail_tunnel(ctx, request, TunnelReason::UpstreamUnreachable).await;
             return Err(e);
         }
     };
@@ -886,13 +878,27 @@ async fn relay_out_of_scope(
         tls: true,
         established: SystemTime::now(),
     });
-    let mut client: ByteStream = Box::pin(client);
-    if acknowledge_connect {
-        if let Err(e) = acknowledge(&mut client).await {
-            let err = anyhow::Error::from(e);
-            let reason = classify_client_failure(&err);
-            TunnelRow::open(ctx, request, TunnelInfo::failed(reason)).await;
-            return Err(err);
+    if connect {
+        match first_byte_after_ack(&mut client).await {
+            Ok(Some(TLS_HANDSHAKE)) => request.client.tls = true,
+            Ok(Some(other)) => {
+                let authority = request.authority.to_string();
+                fail_tunnel(ctx, request, TunnelReason::ProtocolError).await;
+                let _ = client.shutdown().await;
+                bail!(
+                    "refused to relay {authority}: the first byte inside the tunnel is \
+                     {other:#04x}, not a TLS handshake record"
+                );
+            }
+            Ok(None) => {
+                fail_tunnel(ctx, request, TunnelReason::ClientClosed).await;
+                return Ok(());
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e);
+                fail_tunnel(ctx, request, classify_client_failure(&err)).await;
+                return Err(err);
+            }
         }
     }
     let row = TunnelRow::open(
@@ -901,6 +907,7 @@ async fn relay_out_of_scope(
         TunnelInfo::passthrough(TunnelReason::OutOfScope),
     )
     .await;
+    let mut client: ByteStream = Box::pin(client);
     let (counts, relayed) = relay(&mut client, &mut upstream).await;
     row.close(ctx, Some(counts)).await;
     relayed.map_err(Into::into)
@@ -2338,18 +2345,30 @@ mod tests {
     }
 
     /// `origin.test:8443` as a tunnel: where it resolved ([`origin_addr`]) and
-    /// the head `drive` would have handed `mitm` for it.
-    fn origin_tunnel() -> (Target, TunnelHead) {
+    /// the row request `drive` would have handed `mitm` for it — a TLS tunnel
+    /// from an unknown peer, nothing dialled yet.
+    fn origin_tunnel() -> (Target, TunnelRequest) {
+        let now = SystemTime::now();
         (
             Target {
                 host: "origin.test".into(),
                 port: 8443,
                 addr: origin_addr(),
             },
-            TunnelHead {
+            TunnelRequest {
                 authority: Authority::new("origin.test", 8443),
                 headers: HeaderMap::new(),
-                opened_at: SystemTime::now(),
+                client: ConnInfo {
+                    peer: unknown_peer(),
+                    sni: None,
+                    alpn: None,
+                    tls: true,
+                    established: now,
+                },
+                server: None,
+                opened_at: now,
+                source_app: None,
+                capture_interface: None,
             },
         )
     }
@@ -2547,10 +2566,10 @@ mod tests {
         });
         let proxy_side: ByteStream = Box::pin(proxy_side);
 
-        let (target, head) = origin_tunnel();
+        let (target, request) = origin_tunnel();
         let result = tokio::time::timeout(
             STALL_GUARD,
-            module.mitm(Prefixed::new(proxy_side), ctx, unknown_peer(), target, head),
+            module.mitm(Prefixed::new(proxy_side), ctx, target, request),
         )
         .await
         .expect("the handshake was never bounded");
@@ -7007,8 +7026,8 @@ mod tests {
                 body
             };
             let proxy_side: ByteStream = Box::pin(proxy_side);
-            let (target, head) = origin_tunnel();
-            let serving = module.mitm(Prefixed::new(proxy_side), ctx, unknown_peer(), target, head);
+            let (target, request) = origin_tunnel();
+            let serving = module.mitm(Prefixed::new(proxy_side), ctx, target, request);
             let (_served, body) =
                 tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
                     .await
@@ -8621,7 +8640,8 @@ mod tests {
         /// AC8 (IPv6), D5: `CONNECT [::1]:8443` to a host outside Scope is relayed
         /// under the bracketed authority `Authority` prints, dialled as the IPv6
         /// literal it is (no lookup), with exact byte counts once both ends close.
-        /// Raw bytes, not TLS: the relay is byte-agnostic.
+        /// Raw bytes behind a TLS record byte: past the first byte (spec D1, panel
+        /// S1) the relay is byte-agnostic.
         #[tokio::test]
         async fn out_of_scope_ipv6_connect_is_relayed_under_its_bracketed_authority() {
             const V6: &str = "[::1]:8443";
@@ -8638,13 +8658,13 @@ mod tests {
             let script = async {
                 let ack = connect(&mut client, V6).await;
                 assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
-                client.write_all(b"ping").await.expect("client writes");
-                let mut buf = [0u8; 4];
+                client.write_all(b"\x16ping").await.expect("client writes");
+                let mut buf = [0u8; 5];
                 origin
                     .read_exact(&mut buf)
                     .await
                     .expect("the client's bytes reach the origin");
-                assert_eq!(&buf, b"ping");
+                assert_eq!(&buf, b"\x16ping");
                 origin.write_all(b"pong!").await.expect("origin writes");
                 let mut buf = [0u8; 5];
                 client
@@ -8680,7 +8700,7 @@ mod tests {
                 Some(TunnelInfo {
                     mode: TunnelMode::Passthrough,
                     reason: Some(TunnelReason::OutOfScope),
-                    bytes_up: Some(4),
+                    bytes_up: Some(5),
                     bytes_down: Some(5),
                 })
             );
@@ -8782,10 +8802,10 @@ mod tests {
             let script = async {
                 let ack = connect(&mut client, ORIGIN).await;
                 assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
-                client.write_all(b"abc").await.expect("client writes");
-                let mut buf = [0u8; 3];
+                client.write_all(b"\x16abc").await.expect("client writes");
+                let mut buf = [0u8; 4];
                 origin.read_exact(&mut buf).await.expect("origin reads");
-                assert_eq!(&buf, b"abc");
+                assert_eq!(&buf, b"\x16abc");
                 origin.write_all(b"defgh").await.expect("origin writes");
                 let mut buf = [0u8; 5];
                 client.read_exact(&mut buf).await.expect("client reads");
@@ -8818,10 +8838,10 @@ mod tests {
                 Some(TunnelInfo {
                     mode: TunnelMode::Passthrough,
                     reason: Some(TunnelReason::OutOfScope),
-                    bytes_up: Some(7),
+                    bytes_up: Some(8),
                     bytes_down: Some(5),
                 }),
-                "counts survive the error: 3 + 4 read from the client, 5 written to it"
+                "counts survive the error: 4 + 4 read from the client, 5 written to it"
             );
             assert_eq!(
                 status(row),
@@ -8829,6 +8849,198 @@ mod tests {
                 "an established tunnel that broke later is not a failed tunnel"
             );
             assert!(row.metadata.duration.is_some(), "closed");
+        }
+
+        // ---- Spec D1 "a passthrough relays TLS only" (panel S1) -------------------
+
+        /// After the acknowledgement the client sends a cleartext `GET` (`curl -p
+        /// http://…` to an out-of-scope host) instead of a TLS handshake record.
+        /// The tunnel is refused, not relayed: the origin — already dialled —
+        /// receives **nothing**, the client sees the acknowledgement then EOF, the
+        /// row is `failed/protocol_error` naming the dialled origin, and the module
+        /// ends with the refusal.
+        #[tokio::test]
+        async fn out_of_scope_connect_whose_first_byte_is_not_tls_is_refused() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                client
+                    .write_all(get_request("/", ORIGIN).as_bytes())
+                    .await
+                    .expect("send cleartext inside the tunnel");
+                // The proxy closes without relaying: the client sees EOF…
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.expect("client read");
+                assert_eq!(
+                    rest, b"",
+                    "nothing but the acknowledgement reaches the client"
+                );
+                // …and the origin never saw a byte.
+                let mut got = Vec::new();
+                origin.read_to_end(&mut got).await.expect("origin read");
+                got
+            };
+            let (served, got) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the refused tunnel hung");
+            let err = served.expect_err("a non-TLS tunnel to an out-of-scope host is refused");
+            assert!(
+                err.to_string().contains("not a TLS handshake record"),
+                "the error names the refusal: {err:#}"
+            );
+            assert_eq!(got, b"", "not one client byte reached the origin");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert_eq!(row.request.headers.get("host"), Some(ORIGIN));
+            assert_failed(row, TunnelReason::ProtocolError);
+            assert!(!row.client_conn.tls, "the client did not speak TLS");
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer()),
+                "the origin had been dialled when the client was refused"
+            );
+            assert_eq!(
+                *dialed.lock().expect("dialed lock"),
+                vec![(ORIGIN.to_string(), origin_peer())]
+            );
+            assert!(
+                request_paths(&store).is_empty(),
+                "the cleartext request was not served either"
+            );
+            assert_eq!(store.count(), 1);
+        }
+
+        /// EOF right after the acknowledgement on the out-of-scope route (a
+        /// speculative pre-connect that gave up) is `failed/client_closed` with the
+        /// dialled origin on the row — not an open passthrough row with zero
+        /// bytes — and not an error.
+        #[tokio::test]
+        async fn out_of_scope_connect_then_eof_is_a_failed_client_closed_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, _dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                drop(client);
+                let mut got = Vec::new();
+                origin.read_to_end(&mut got).await.expect("origin read");
+                got
+            };
+            let (served, got) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the abandoned tunnel hung");
+            served.expect("a client that leaves before its first byte is not an error");
+            assert_eq!(got, b"", "nothing was relayed");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert_failed(row, TunnelReason::ClientClosed);
+            assert!(!row.client_conn.tls, "no TLS byte was ever seen");
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer()),
+                "the origin had been dialled"
+            );
+            assert_eq!(store.count(), 1);
+        }
+
+        /// The decided-on bytes are not lost: a client that sends its TLS record
+        /// right behind the CONNECT head — before the acknowledgement, as browsers
+        /// do — has the whole record relayed to the origin first and counted:
+        /// `bytes_up` is exactly the record, `bytes_down` exactly the reply, and
+        /// the row says the client spoke TLS.
+        #[tokio::test]
+        async fn out_of_scope_connect_with_tls_first_byte_is_relayed_with_exact_counts() {
+            const RECORD: &[u8] = &[
+                TLS_HANDSHAKE,
+                0x03,
+                0x01,
+                0x00,
+                0x05,
+                b'h',
+                b'e',
+                b'l',
+                b'l',
+                b'o',
+            ];
+            const REPLY: &[u8] = &[TLS_HANDSHAKE, 0x03, 0x03, 0x00, 0x02, b'o', b'k'];
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, _dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let mut head =
+                    format!("CONNECT {ORIGIN} HTTP/1.1\r\nHost: {ORIGIN}\r\n\r\n").into_bytes();
+                head.extend_from_slice(RECORD);
+                client
+                    .write_all(&head)
+                    .await
+                    .expect("send the head and the record in one write");
+                let ack = read_head(&mut client).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut got = vec![0u8; RECORD.len()];
+                origin
+                    .read_exact(&mut got)
+                    .await
+                    .expect("the whole record reaches the origin");
+                assert_eq!(got, RECORD);
+                origin.write_all(REPLY).await.expect("origin replies");
+                let mut reply = vec![0u8; REPLY.len()];
+                client
+                    .read_exact(&mut reply)
+                    .await
+                    .expect("the reply reaches the client");
+                assert_eq!(reply, REPLY);
+                drop(client);
+                let mut rest = Vec::new();
+                origin.read_to_end(&mut rest).await.expect("origin read");
+                assert!(rest.is_empty());
+                drop(origin);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the relay hung");
+            served.expect("a tunnel both ends closed is a clean close");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(
+                row.metadata.tunnel,
+                Some(TunnelInfo {
+                    mode: TunnelMode::Passthrough,
+                    reason: Some(TunnelReason::OutOfScope),
+                    bytes_up: Some(RECORD.len() as u64),
+                    bytes_down: Some(REPLY.len() as u64),
+                }),
+                "the first byte is counted with the rest"
+            );
+            assert_eq!(status(row), Some(200));
+            assert!(row.client_conn.tls, "the first byte was a TLS record");
+            assert!(row.metadata.duration.is_some());
         }
 
         // ---- The raw-TLS route (a capture ingress: no CONNECT) -----------------
@@ -9126,6 +9338,124 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_failed(&rows[0], TunnelReason::ProtocolError);
             assert_eq!(rows[0].request.authority, "127.0.0.1:8443");
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
+
+        /// The proxy side of a client connection that resets — `read` fails with
+        /// `ConnectionReset` — once `after` bytes have been delivered. Writes go
+        /// through.
+        struct ResetAfter {
+            inner: DuplexStream,
+            after: usize,
+            delivered: usize,
+        }
+
+        impl AsyncRead for ResetAfter {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut TaskCx<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.delivered >= this.after {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "client connection reset",
+                    )));
+                }
+                let before = buf.filled().len();
+                let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &polled {
+                    this.delivered += buf.filled().len() - before;
+                }
+                polled
+            }
+        }
+
+        impl AsyncWrite for ResetAfter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut TaskCx<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+
+        /// Panel Q5: the one wire read on the raw-TLS route that could end without
+        /// a row. A captured connection whose ClientHello the acceptor's peek
+        /// missed, reset by the client while the module buffers the record, is a
+        /// `failed/client_closed` row keyed on the capture destination — not
+        /// silence — and the module ends with the reset.
+        #[tokio::test]
+        async fn client_reset_while_buffering_the_client_hello_on_the_capture_path_is_a_failed_client_closed_row(
+        ) {
+            // A record header announcing a 1 KiB ClientHello, four bytes of it, then
+            // the reset.
+            const PARTIAL: &[u8] = &[
+                TLS_HANDSHAKE,
+                0x03,
+                0x01,
+                0x04,
+                0x00,
+                0x01,
+                0x00,
+                0x03,
+                0xfc,
+            ];
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&[]));
+            let ctx = ctx.with_hint(capture_tls_hint(None));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let resetting = ResetAfter {
+                inner: proxy_side,
+                after: PARTIAL.len(),
+                delivered: 0,
+            };
+            let serving = module.spawn(Box::pin(resetting), ctx);
+            let script = async {
+                client
+                    .write_all(PARTIAL)
+                    .await
+                    .expect("send the start of the hello");
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the reset hello hung");
+            let err = served.expect_err("the reset ends the connection");
+            assert_eq!(
+                io_kind(&err),
+                Some(io::ErrorKind::ConnectionReset),
+                "{err:#}"
+            );
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1, "a row, not silence");
+            let row = &rows[0];
+            assert_eq!(
+                row.request.authority, "127.0.0.1:8443",
+                "keyed on the capture dst"
+            );
+            assert!(row.request.headers.is_empty());
+            assert_failed(row, TunnelReason::ClientClosed);
+            assert!(
+                row.client_conn.tls,
+                "the connection opened with a TLS record"
+            );
+            assert!(row.server_conn.is_none(), "nothing was dialled");
+            assert_eq!(row.metadata.source_app.as_deref(), Some("com.apple.Safari"));
+            assert_eq!(row.metadata.capture_interface.as_deref(), Some("macos-ne"));
             assert!(dialed.lock().expect("dialed lock").is_empty());
         }
     }

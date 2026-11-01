@@ -18,7 +18,11 @@ the proxy cannot fabricate — never a fixture:
     mark is gone) and NO decrypted request flow leaked for it;
   - CONTRAST (so "not MITM'd" is meaningful): a non-passthrough host on the SAME
     proxy IS MITM'd — the client sees a CA-minted leaf (not the origin cert) and
-    the decrypted `GET /secret` is captured.
+    the decrypted `GET /secret` is captured;
+  - the launch advice is NOT said: Scope was seeded at launch, so the sentence
+    `Nothing is decrypted until a host is in Scope.` is absent from the core's
+    own output at the end of the run (AC13's "iff Scope is empty at launch"; the
+    empty-Scope half, count == 1, is in `tests/e2e/proxy/test_per_host_decryption.py`).
 
 Both hosts are seeded into Scope: since per-host decryption (spec
 2026-10-31-per-host-decryption-design, D1) the proxy decrypts ONLY hosts in Scope,
@@ -57,6 +61,8 @@ from aitm_e2e.core import Aitm  # noqa: E402
 
 ORIGIN_MARKER = "passthrough-e2e-origin-7f3a"
 SECRET_PATH = "/secret"
+# Spec D8's one sentence; said at launch iff Scope is empty then (AC13).
+ADVICE = "Nothing is decrypted until a host is in Scope."
 
 
 # --------------------------------------------------------------------------
@@ -346,6 +352,14 @@ def main() -> int:
         check(decrypted is not None,
               "the non-passthrough host IS decrypted and captured — so the "
               "passthrough host's missing decrypted flow is meaningful")
+
+        section("launch line: a Scope seeded at launch gets NO advice (AC13's iff)")
+        # Bare `aitm` logs through `tracing_subscriber::fmt()`, whose default writer
+        # is stdout; read both streams so the absence is of the whole output.
+        logs = core.stdout_text() + core.stderr_text()
+        check(ADVICE not in logs,
+              f"{ADVICE!r} is absent from the core's output: Scope had "
+              f"{len(cfg.scope_entries)} entries at launch (output {len(logs)} B)")
     finally:
         if bus:
             bus.close()
