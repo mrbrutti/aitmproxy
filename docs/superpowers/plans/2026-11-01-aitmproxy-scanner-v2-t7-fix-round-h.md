@@ -151,6 +151,16 @@ H69 (Rust). The H50 test proves two scenarios under one name with a shadowed `co
 
 **Cell H62-H65 result (2026-11-01):** done in `85800f80` (+441/-163); `--selftest` 54 ok with four mutation checks. Ratified: `stop()` unblocks the 600 s read with `shutdown(SHUT_RDWR)` rather than `close()` (measured on a socketpair: `close()` waits behind the buffered reader's lock for the read's own timeout; the probe also reproduced run 4's instant `None` after one timeout); `idle_reads` counts only reads that waited 0.5 s; a `None` ends the thread with the reason recorded; `set_ring_field` generalises the Fields walk (`use_browser`, `speed`); T7-16 asserts the held editor carries the origin instead of typing it; T7-17 runs first with `speed thorough`.
 
+## From the fifth live smoke run (`/tmp/claude/t7-live-smoke6`, 36 ok, 1 noted, 7 failed)
+
+H70 (cell). `thorough` alone still finishes in about 2 s (278 probes): the sampled T7-16 job and its fresh cancel job also cycle `intensity` to `intrusive` (same ring walk, asserted on the Fields line), samples are taken every 0.5 s from the moment the row is on screen, and `x` goes right after the third sample; T7-17 keeps `standard` with `thorough` only.
+
+H71 (cell). The tab markers are checked against the current footer literals (`ui/scan/mod.rs` key tables after G-B: the Issues list footer is `key_text(&[ISSUES_KEYS])`, the filter line `key_text(&[ISSUES_FILTER_KEYS])` = `S severity · C confidence · L lane · T status · J job`); fix any stale one and add a self-test row per marker painted from the Rust literal.
+
+H72 (cell). A `StartResult` switches the Scan tab to Jobs (D7); `4` pressed before it lands is undone, which is why run 5's T7-17 saw the Jobs tab: after every launch, wait for the Jobs tab marker and the new row before pressing another tab key.
+
+H73 (Rust). Enter on the Site map node whose row read `POST /login` opened the `GET /` flow in the inspector (run 5, `fail-7-t7-19.txt`: Inspector mode, `GET 200 OK http://127.0.0.1:61930/`, `1 / 125 rows`): the node under the cursor and the row under the cursor disagree, the G22 class (`group_nodes` permutes `nodes`, `node_lines`/`node_ranges` or the Enter arm read another order). Test first in `tests/scan_v2_sitemap.rs`: fold a two-host `scan.sitemap` reply whose reply order differs from group order, walk the Nodes cursor to the second row, press Enter, assert the opened flow id is that row's node's `flows[0]` (and the same for the Points pane's node); fix whatever the test exposes.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.

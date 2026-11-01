@@ -746,6 +746,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | spec review (H50-H56) | PASS | H56 behaviour and tests, T7-7 and T7-13 intact, H50/H52/H53 exact | three doc Minors: D13, D3 shapes and D6 wording amended |
 | H (cell) | fix round | done | H62-H65 in `85800f80`; `--selftest` 54 ok | live run 5 |
 | H (cell) | coder note | Minor | `stop()` uses `shutdown(SHUT_RDWR)` (measured: `close()` hangs behind the reader); `set_ring_field` generalised; T7-17 first with `thorough` | ratified |
+| 15 | live smoke | run 5 | 36 ok, 1 noted, 7 failed: push read works (173 job lines), Site map renders every host/template/point live, UI-3 passes; `thorough` still finishes in ~2 s; `4` pressed before the StartResult's Jobs switch; Enter on a Site map node opened another node's flow | H70-H72 (cell), H73 (Rust) |
 
 ## Shipped
 
