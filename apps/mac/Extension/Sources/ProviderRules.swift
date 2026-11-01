@@ -4,41 +4,22 @@ import NetworkExtension
 
 // MARK: - Provider rule set (spec 2026-11-01-ne-tcp-only-catch-all-design, Design A, G, H, I)
 //
-// The `NENetworkRule`s the transparent proxy installs decide which traffic the kernel
-// diverts to the provider at all. The shipped `.any` catch-all diverted every UDP flow
-// too, and while it was installed `setsockopt(IP_DONTFRAG)` on every connected
-// non-loopback UDP socket failed with ECONNRESET (research 24 §4), which costs Chromium
-// HTTP/3 system-wide even though the provider declines every datagram. So the default
-// rule set is TCP-only, and UDP enters the provider only for the targets it could
-// actually claim a datagram through.
+// Why TCP-only by default: the shipped `.any` catch-all diverted every UDP flow too, and
+// while it was installed `setsockopt(IP_DONTFRAG)` on every connected non-loopback UDP
+// socket failed with ECONNRESET (research 24 §4), which costs Chromium HTTP/3
+// system-wide even though the provider declines every datagram.
 //
-// ONE pure function builds every rule set (`wanted(for:)`); startup uses `tcpOnly`,
-// which is `wanted(for: nil)`. Nothing here touches the claim path: `CoreLink.current()`
-// and `ScopeMatcher.matches` still decide every flow, and detach stays instantly
-// fail-open whatever rules the kernel holds.
+// Why one `.UDP` rule per UDP-claimable IP token (R2) and not one UDP catch-all (R1): it
+// is exactly the matcher's UDP claim set, so the kernel diverts only what the provider
+// can claim and the defect is confined to sockets aimed at the operator's own target.
+// Under-inclusive is acceptable -- a skipped target is merely not captured, and the
+// claim path (`CoreLink.current()`, `ScopeMatcher.matches`) still decides every flow;
+// over-inclusive never. Accepted cost (Design I): a bare `ip` token's port-0 rule also
+// diverts that IP's port-53 datagrams, which the provider then declines (claim rule D2).
 //
-// Rule shape (Design A, R2): always one `.TCP` outbound rule with nil remote and nil
-// local (every TCP flow except loopback); then one `.UDP` outbound rule per
-// UDP-claimable IP token of the scope (`ScopeMatcher.udpClaimableIPEntries`: `.ip`
-// entries whose port is nil or not 53/5353/853), remote = that address with the token's
-// port or `0` (= any port, allowed because the address is not a wildcard), prefix 32 for
-// IPv4 and 128 for IPv6, nil local. Host and suffix tokens never yield a UDP rule; an
-// `ip:53` / `ip:5353` / `ip:853` token yields none (it could never claim a datagram, and
-// port "53" cannot even be named in an included rule). Under-inclusive is acceptable;
-// over-inclusive never.
-//
-// Skipped silently (Design H): the wildcard addresses `0.0.0.0` and `::` (the header
-// forbids them with port 0 and no real flow has that destination) and any address
-// `Network.NWEndpoint.Host` does not parse as `.ipv4`/`.ipv6` (cannot happen for
-// `IPText.canonical` output; kept as a guard).
-//
-// Canonical equality (Design G): `udpTargets` is sorted by address text then port with
-// nil first, and de-duplicated, so two scopes with the same claimable IP set compare
-// equal whatever the token order; the reconciler keys "nothing to apply" on that.
-//
-// Accepted consequence (Design I): a bare `ip` token yields a port-0 rule, which also
-// diverts that IP's port-53 datagrams; the provider then declines them (claim rule D2)
-// and such a socket suffers the IP_DONTFRAG defect. That is the operator's own target.
+// The rule shape, skip set, cap and canonical form are spec Design A/G/H and the doc
+// comments on `ProviderRuleSet` below; `wanted(for:)` is the ONE function that builds
+// every rule set, startup included (`tcpOnly == wanted(for: nil)`).
 
 struct ProviderRuleSet: Equatable {
     /// One UDP-claimable IP token of the scope: a canonical IP text (`IPText.canonical`
@@ -95,8 +76,10 @@ struct ProviderRuleSet: Equatable {
     private static let limitedBroadcast = "255.255.255.255"
 
     /// The rule set wanted for `scope`: the TCP catch-all plus one UDP rule per
-    /// claimable IP token, in canonical order, capped at `maxUDPTargets`. `nil` (no core
-    /// attached) is TCP-only. Skipped silently (spec Design H as amended): wildcards,
+    /// claimable IP token (`ScopeMatcher.udpClaimableIPEntries`: `.ip` entries whose
+    /// port is nil or not 53/5353/853; host and suffix tokens never qualify), in
+    /// canonical order, capped at `maxUDPTargets`. `nil` (no core attached) is TCP-only.
+    /// Skipped silently (spec Design H as amended): wildcards,
     /// loopback, multicast, the limited broadcast, and any text `Network.NWEndpoint.Host`
     /// does not read as an IP (cannot happen for `IPText.canonical` output; a guard).
     static func wanted(for scope: ScopeMatcher?) -> ProviderRuleSet {
@@ -114,8 +97,11 @@ struct ProviderRuleSet: Equatable {
         return ProviderRuleSet(udpTargets: kept, dropped: canonical.count - kept.count)
     }
 
-    /// The `NENetworkRule`s to install, TCP catch-all first, then one `.UDP` host rule
-    /// per target in `udpTargets` order. Uses the non-deprecated macOS 15+ initializer
+    /// The `NENetworkRule`s to install (spec Design A, R2): first the TCP catch-all --
+    /// `.TCP`, `.outbound`, nil remote, prefix 0, nil local (every TCP flow except
+    /// loopback) -- then one `.UDP` `.outbound` rule per target in `udpTargets` order,
+    /// remote = the target's address with its port or `0` (any), prefix 32 for IPv4 and
+    /// 128 for IPv6, nil local. Uses the non-deprecated macOS 15+ initializer
     /// (`…NetworkEndpoint:`, `Network.NWEndpoint`).
     func networkRules() -> [NENetworkRule] {
         var rules = [
