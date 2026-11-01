@@ -1479,6 +1479,19 @@ the Rhai drafts.
 
 **Live-proof routes (T10, 2026-11-01).** `aitm-testtarget-serve --mode V|P --port 0 --tls-port 0 --tls-h1-port 0 --control-port 0`; control origin `GET /services`, `/log/http` (per request `listener`, `version h1|h2`, `conn_req_index`, `query`, `cookie_names`), `/log/conns` (per connection `alpn`, `requests`), `POST /reset`. Seeds: sqli-error `/products?id=`, sqli-boolean `/items?id=` (never sleeps), sqli-time `/orders?id=` (`SLEEP(n)`/`pg_sleep(n)`/`WAITFOR DELAY '0:0:n'`, V sleeps min(n,5) s), cmdi echo+sleep `/ping?host=`, ssti `/greet?name=`, traversal `/static?file=`, crlf `/lang?set=`, xxe `POST /xml`, nosqli `POST /api/login` (JSON), ldapi `/ldap?user=`, header reflection `/whoami`, reflected XSS `/search?q=`, open redirect `/redirect?next=`. Cell `test_t3_blind_checks.py` expects `sqli-boolean` on `/items` and `sqli-time` on `/orders`, both class `sqli`.
 
+
+**Coordinator decision: split into two PRs (2026-11-01).** PR 1 (now, after F6 and a
+targeted re-review): `HttpSender` behind the alias, the raw-h2 driver with its SSRF gate,
+the ten native checks and `checks_with` in `aitm-scan-checks-http`, with `checks()`
+returning EMPTY and no edit to `crates/aitm/src/wire.rs` or any contract pin, so nothing is
+reachable from the binary yet (the AcceptAny sign-off condition is met trivially) and T1b
+sees no merge churn. PR 1 evidence: full gate, panel record, the sender live proof over the
+real bus. PR 2 (after T1b merges): the `checks_with` swap and native-check count re-pin in
+`wire.rs`, the fifteen Rhai conversions + README (Tasks 11-16), `Timing.correlated`, `scope`,
+A5 (`charge`, `baseline_peer_addr`), the bundled-startup and bundled-scripts pins, the
+recorded T3-1..T3-5 proof (Task 17). Plan Task 18 therefore runs twice (18a for PR 1,
+18b for PR 2).
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
