@@ -1665,6 +1665,24 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
+### PR 1 (core) — merged 2026-10-31 as squash 3d710ab (#214), ships in v0.5.8
+
+- Merged: Tasks 1–13, fixes F1–F4; crate `aitm-sysproxy`; verbs `proxy.system.status/set/unset`;
+  `proxy.status.system_proxy`; config `system_proxy`; hidden `aitm sysproxy-watchdog`; three
+  contract pins; docs. Gate green in the Terminal (fmt/clippy/238 suites). Panel: security,
+  quality, spec PASS after fixes; eight Minors accepted by the orchestrator (Review log).
+- Live proofs: SP-AC22 Linux in Lima `cis-lab` (set → `'manual'`/`127.0.0.1:18080`, unset → original
+  keys, `kill -9` → watchdog restore 126 ms). SP-AC20 core half + SP-AC21 macOS on Matt's Mac,
+  2026-10-31 22:44 on his explicit yes: auto-set at startup → SIGTERM restore; verb set (473 ms) →
+  unset (694 ms, both services) → set → `kill -9` → watchdog restore (761 ms); final per-service
+  state identical to before; no token in any output. Dumps in #214 (body + comment).
+- Cut from PR 1: nothing. Known limitation: the one-shot `aitm proxy system status` CLI run printed
+  no object to stdout in the proof (the bus verb is complete) — check the CLI renderer (follow-up).
+- Follow-ups: `SMAppService` root helper (standard users); KDE Plasma live proof; `testing` module
+  for the scripted-macOS fixtures; `set`/`unset` outcome structs; rustdoc private-link allow;
+  `Invocation::config_path()`; Matt's countersign on §D5 operator-critical hosts and the three
+  provisional answers. PR 2 (TUI), PR 3 (web), PR 4 (mac), PR 5 (CA trust) pending their gates.
+
 What merged, what was cut, follow-ups. Filled at stage 7.
 
 Follow-ups already known from the spec: a Plasma VM proof for the KDE mechanism
