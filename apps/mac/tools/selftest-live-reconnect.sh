@@ -32,15 +32,17 @@
 #   FAILED_BOUND   5 s   T3: kill -KILL → `bus failed`
 #   ACTION_BOUND  10 s   one menu click → `capturing` flips (measured from the click)
 #   MENU_BOUND     5 s   a menu item's title settles (Pause/Resume Proxy) before its one click
-#   QUIT_BOUND    15 s   quit Apple Event → app gone
+#   QUIT_BOUND    15 s   quit menu click → app gone
 #   QUIT_SLEEP   0.2 s   between app-gone checks, and once before the post-quit core check
 #
 # Hygiene (BR-AC8): nothing is written to the defaults domain; no path under the operator's
 # install or store directories appears here; the operator token is read from the 0600 config
 # into a variable, handed to python3 as an argv item and never printed; the only process reap
 # is by this bundle's own core path; a SIGTERM to the app would skip its AppKit teardown, so the
-# app is quit by a `quit` Apple Event addressed to the dev bundle's path (never a ⌘Q typed at
-# whatever happens to be frontmost on the operator's desktop) and the reap is the fallback.
+# app is quit by clicking the Quit item of its own app menu through System Events, scoped to the
+# dev bundle's process (the bundle id is shared with the installed app, which is usually running,
+# so a `quit` Apple Event could reach that one instead; no ⌘Q is typed at whatever happens to be
+# frontmost on the operator's desktop) and the reap is the fallback.
 #
 # Output: one `reconnect-live: <trigger>: <what was observed>` line per step (build, launch,
 # reconnect-bus, restart-core, crash-respawn, teardown); the last line is
@@ -70,7 +72,7 @@ CONNECT_BOUND=20   # trigger → `bus: connected`; T2/T3's respawn wait shares t
 FAILED_BOUND=5     # T3: kill -KILL → `bus failed`
 ACTION_BOUND=10    # one menu click → `capturing` flips
 MENU_BOUND=5       # a menu item's title settles (View ▸ Pause/Resume Proxy re-renders after the app handles its reply)
-QUIT_BOUND=15      # quit Apple Event → app gone
+QUIT_BOUND=15      # quit menu click → app gone
 QUIT_SLEEP=0.2     # between app-gone checks, and once before the post-quit core check
 AX_SLEEP=0.1       # between AX reads; an osascript read itself takes ~100 ms, so reads land ≤ 250 ms apart
 BUS_SLEEP=0.5      # between proxy.status polls
@@ -289,16 +291,19 @@ after_trigger() {
   shot "$trig"
 }
 
-# quit_app: a `quit` Apple Event addressed to the dev bundle's path (the normal terminate path, so
-# willTerminate reaps the child; never a ⌘Q typed at whatever happens to be frontmost on the
-# operator's desktop), bounded wait, then kill + a reap by this bundle's own core path as the
-# fallback. quit_clean=1 when the app left on its own and no core remained under the bundle path
-# before the fallback ran.
+# quit_app: click "Quit Aitmproxy" in the app menu (menu bar item 2 of menu bar 1) through the
+# process-scoped `se` helper, so only this dev bundle's process is addressed. That is the normal
+# terminate path, so willTerminate reaps the child. A `quit` Apple Event is not used: the bundle id
+# is shared with the operator's installed app, which is usually running, so Launch Services may
+# resolve the event to that instance. The click needs no focus and types nothing at whatever is
+# frontmost on the operator's desktop. Then a bounded wait, then kill + a reap by this bundle's own
+# core path as the fallback. quit_clean=1 when the app left on its own and no core remained under
+# the bundle path before the fallback ran.
 quit_app() {
   [[ -n $app_pid ]] || return 0
   local start=$EPOCHREALTIME
   quit_clean=""
-  if osascript -e "tell application \"$dev\" to quit" >/dev/null 2>&1; then
+  if se 'click menu item "Quit Aitmproxy" of menu 1 of menu bar item 2 of menu bar 1' >/dev/null 2>&1; then
     while kill -0 "$app_pid" 2>/dev/null; do  # bounded: gives up at start + QUIT_BOUND
       (( EPOCHREALTIME - start >= QUIT_BOUND )) && break
       sleep $QUIT_SLEEP
@@ -396,9 +401,9 @@ after_trigger crash-respawn
 # 7. Teardown: the normal quit path, then the verdict.
 quit_app
 if [[ -n $quit_clean ]]; then
-  note "teardown: app quit on the quit Apple Event; no core left under the bundle path"
+  note "teardown: app quit on the app menu's Quit click (process-scoped); no core left under the bundle path"
 else
-  note "teardown: app did not leave cleanly within ${QUIT_BOUND} s of the quit Apple Event (or a core remained);" \
+  note "teardown: app did not leave cleanly within ${QUIT_BOUND} s of the app menu's Quit click (or a core remained);" \
     "killed and reaped by the bundle path"
 fi
 print -r -- "RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn:" \
