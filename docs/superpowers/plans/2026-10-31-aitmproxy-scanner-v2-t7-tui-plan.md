@@ -371,6 +371,9 @@ Kept by the main session during stage 6. One row per finding.
 | 6 | quality | Minor | `Columns::measure`/`total()` coupling; opaque test literals | fix round C (C29) |
 | 6 | quality | Minor | cancel test reads its expectation from the fixture | fix round C (C30) |
 | 6 | quality | Minor | clamped cursor twice, per-row `String` clone, `pub lane_name` | fix round C (C31) |
+| 7 | security | Important | `fetched` and `scan.issue:*` in-flight tags grow without bound, keyed on unvalidated core-supplied issue ids | fix round D (D1): `is_issue_id`, prune `fetched` on fold, one `scan.issue` in flight (spec D6 amended) |
+| 7 | security | Minor | `limit: 512` not enforced client-side; every frame rebuilds every row from unbounded strings | fix round D (D2): truncate the page to `ISSUES_PAGE_LIMIT`, bound row strings at fold time |
+| 7 | security | note | U+202E-class format characters pass ratatui's control-char filter TUI-wide (pre-existing, flow list too) | follow-up outside this track: a filter in `ui/text.rs` |
 
 ## Shipped
 
