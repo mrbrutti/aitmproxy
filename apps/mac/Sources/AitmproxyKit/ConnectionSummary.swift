@@ -259,9 +259,10 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     // MARK: Make
 
-    /// `systemProxy` is `Session.systemProxy` (nil = unknown, never rendered as "off");
-    /// `tunnelledFlowCount` the rows whose `tls == .tunnelled`; `decrypt` the core's
-    /// `proxy.status.decrypt` (nil from an older core).
+    /// `systemProxy` is `Session.systemProxy` (nil = unknown, never rendered as "off"); `caTrust`
+    /// PR D's `Session.caTrust` (nil = `ca.status` unread or every store unknown, never rendered as
+    /// trusted or not trusted); `tunnelledFlowCount` the rows whose `tls == .tunnelled`; `decrypt`
+    /// the core's `proxy.status.decrypt` (nil from an older core).
     public static func make(
         core connection: CoreConnection?,
         activeKind: ActiveCoreKind,
@@ -275,6 +276,7 @@ public struct ConnectionSummary: Hashable, Sendable {
         listenAddress: String,
         coreCapture: CoreCaptureStatus? = nil,
         systemProxy: SystemProxyState? = nil,
+        caTrust: CATrustFacts? = nil,
         tunnelledFlowCount: Int = 0,
         decrypt: DecryptStatus? = nil
     ) -> ConnectionSummary {
@@ -283,10 +285,10 @@ public struct ConnectionSummary: Hashable, Sendable {
         let advice = CaptureAdvice.make(capability: capability, supported: captureSupported, scopeHostCount: scopeHostCount)
         let capture = captureLane(advice, capability: capability, activeKind: activeKind,
                                   scopeHostCount: scopeHostCount, coreCapture: coreCapture)
-        let routes = self.routes(systemProxy: systemProxy, advice: advice, activeKind: activeKind, bus: busLane,
+        let routes = self.routes(systemProxy: systemProxy, caTrust: caTrust, advice: advice, activeKind: activeKind, bus: busLane,
                                  scopeHostCount: scopeHostCount, flowCount: flowCount, tunnelledFlowCount: tunnelledFlowCount,
                                  decrypt: decrypt, listenAddress: listenAddress)
-        let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice, routes: routes,
+        let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice, routes: routes, caTrust: caTrust,
                                flowCount: flowCount, listenAddress: listenAddress)
         return ConnectionSummary(core: core, bus: busLane, capture: capture, steps: steps, routes: routes, listenAddress: listenAddress)
     }
@@ -421,9 +423,9 @@ public struct ConnectionSummary: Hashable, Sendable {
     private static let allAppsDetail = "in-scope hosts of every app"
     private static let scopeDetail = "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"
 
-    private static func routes(systemProxy: SystemProxyState?, advice: CaptureAdvice, activeKind: ActiveCoreKind, bus: ConnectionLane,
-                               scopeHostCount: Int, flowCount: Int, tunnelledFlowCount: Int, decrypt: DecryptStatus?,
-                               listenAddress: String) -> TrafficRoutes {
+    private static func routes(systemProxy: SystemProxyState?, caTrust: CATrustFacts?, advice: CaptureAdvice, activeKind: ActiveCoreKind,
+                               bus: ConnectionLane, scopeHostCount: Int, flowCount: Int, tunnelledFlowCount: Int,
+                               decrypt: DecryptStatus?, listenAddress: String) -> TrafficRoutes {
         let busOK = bus.state == .ok
         let systemProxyRoute = systemProxy.map { systemProxyRoute($0, listenAddress: listenAddress) }
         // An external core runs no extension: the All Apps route is not ours to show.
@@ -431,8 +433,8 @@ public struct ConnectionSummary: Hashable, Sendable {
         // The Scope fact is known only through the bus: a `decrypt` value is ignored unless the bus lane is ok
         // (the one `BusService` line has no disconnect reset), and the fallback is the live scope count.
         let scope = scopeRoute(busOK ? decrypt : nil, scopeHostCount: scopeHostCount)
-        // Task 1b derives the CA fact from PR D's `CATrustFacts`; until then it is unknown.
-        let caTrust: TrafficRoute? = nil
+        // The CA fact is PR D's `Session.caTrust`: nil while `ca.status` is unread or every store is unknown.
+        let caTrust = caTrust.map(caTrustRoute)
 
         // The Flows empty-state lines: every closed fact, in priority order, whatever the row count.
         let closedFacts = busOK ? [systemProxyRoute, allApps, scope, caTrust].compactMap { $0 }.filter { !$0.open } : []
@@ -508,10 +510,25 @@ public struct ConnectionSummary: Hashable, Sendable {
                             detail: scopeDetail, actions: [.addScopeHost, .openScope])
     }
 
+    private static let caTrustedDetail = "HTTPS on both routes"
+
+    /// D3's CA fact, worded by PR D's `CATrustFacts` helpers so every surface prints one vocabulary: `line` is
+    /// its `text`; the closed detail its `notTrustedLine`; a closed entry's `actions` are its `actions`; an open
+    /// entry stores none, like every other open entry (PR D's `[.openCAPanel]` on a trusted fact is the CA
+    /// page's affordance, not a route remedy).
+    /// Open iff trusted and no change is in flight: PR D's `installing` outranks `trusted` (D3's table row
+    /// order, and its `step.done`), so an uninstall in flight reads "trusting CA…", not done.
+    private static func caTrustRoute(_ facts: CATrustFacts) -> TrafficRoute {
+        let open = facts.trusted && !facts.installing
+        return TrafficRoute(kind: .caTrust, open: open, line: facts.text,
+                            detail: open ? caTrustedDetail : CATrustFacts.notTrustedLine,
+                            actions: open ? [] : facts.actions)
+    }
+
     // MARK: Steps (spec D4)
 
     private static func steps(core: ConnectionLane, bus: ConnectionLane, activeKind: ActiveCoreKind, advice: CaptureAdvice,
-                              routes: TrafficRoutes, flowCount: Int, listenAddress: String) -> [GettingStartedStep] {
+                              routes: TrafficRoutes, caTrust: CATrustFacts?, flowCount: Int, listenAddress: String) -> [GettingStartedStep] {
         // An external core is the operator's; it counts as running once the bus reaches it.
         let coreDone = core.state == .ok || (activeKind == .external && bus.state == .ok)
         let busDone = bus.state == .ok
@@ -548,6 +565,14 @@ public struct ConnectionSummary: Hashable, Sendable {
                                         title: scope.open ? scope.line : "Add a host to Scope (for now as \(scopeEntryHint))",
                                         done: scope.open, action: scope.open ? nil : .openScope,
                                         detail: scope.open ? scope.detail : scope.line))
+        // Omitted while the CA fact is unknown (D4): a step that cannot name its fix is noise. The title and action
+        // are PR D's `step` — "Trust the aitmproxy CA" / `.trustCA` for the plain not-trusted fact, `.openCAPanel`
+        // when an administrator is needed, PR D's `text` and nothing to press while a change is in flight.
+        if let caTrust, let route = routes.caTrust {
+            let step = caTrust.step
+            steps.append(GettingStartedStep(kind: .caTrusted, title: step.title, done: route.open,
+                                            action: route.open ? nil : step.action, detail: route.detail))
+        }
         steps.append(GettingStartedStep(kind: .firstFlow,
                                         title: flowCount > 0 ? "\(Format.count(flowCount, "flow")) captured"
                                                              : "Point a client at \(listenAddress), or open the browser",

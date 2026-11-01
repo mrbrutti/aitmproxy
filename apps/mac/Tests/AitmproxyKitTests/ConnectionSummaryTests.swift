@@ -14,11 +14,12 @@ import Testing
                       role: String? = nil, roleWarning: Bool = false,
                       capability: CaptureCapability = .extensionNotInstalled, supported: Bool = true,
                       hosts: Int = 0, flows: Int = 0, coreCapture: CoreCaptureStatus? = nil,
-                      systemProxy: SystemProxyState? = nil, tunnelled: Int = 0, decrypt: DecryptStatus? = nil) -> ConnectionSummary {
+                      systemProxy: SystemProxyState? = nil, caTrust: CATrustFacts? = nil, tunnelled: Int = 0,
+                      decrypt: DecryptStatus? = nil) -> ConnectionSummary {
         ConnectionSummary.make(core: core, activeKind: kind, bus: bus, role: role, roleWarning: roleWarning,
                                capability: capability, captureSupported: supported, scopeHostCount: hosts,
                                flowCount: flows, listenAddress: "127.0.0.1:8080", coreCapture: coreCapture,
-                               systemProxy: systemProxy, tunnelledFlowCount: tunnelled, decrypt: decrypt)
+                               systemProxy: systemProxy, caTrust: caTrust, tunnelledFlowCount: tunnelled, decrypt: decrypt)
     }
 
     /// HTTP and HTTPS both at `host:port` (PR #246's `SystemProxyState(http:https:)`).
@@ -34,6 +35,20 @@ import Testing
     private let systemProxyOffLine = "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it"
     private let allAppsOffLine = "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"
     private let allAppsWaitingLine = "All Apps waiting for approval — approve the extension in System Settings"
+    private let caNotTrustedDetail = "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"
+
+    /// PR D's facts as `Session.caTrust` publishes them. `CATrustFacts` declares only `init?(status:)` (in its body,
+    /// so Swift gives it no memberwise init); the value is built from a literal `CAStatus` and the two session
+    /// flags set afterwards. TR-AC16's `notTrusted` = `caFacts()`: trusted false, scope nil, fingerprint "AB:CD",
+    /// platform "macos", installing false, needsAdmin false; `trustedUser` = `caFacts(scope: "user")`.
+    private func caFacts(scope: String? = nil, installing: Bool = false, needsAdmin: Bool = false) throws -> CATrustFacts {
+        let status = CAStatus(fingerprint: "AB:CD", installed: scope != nil, trusted: scope != nil, platform: "macos",
+                              trustedScope: scope, trustReported: true)
+        var facts = try #require(CATrustFacts(status: status))
+        facts.installing = installing
+        facts.needsAdmin = needsAdmin
+        return facts
+    }
 
     // MARK: Core lane
 
@@ -452,6 +467,186 @@ import Testing
         #expect(noExtension.banner == "system proxy off")
         #expect(noExtension.bannerAction == nil)
         let none = routes(.capturing, hosts: 2, flows: 3)
+        #expect(none.banner == nil)
+        #expect(none.bannerAction == nil)
+    }
+
+    // MARK: CA fact (spec D3/D4/D5; TR-AC16 and the CA cases of TR-AC18; every word is PR D's `CATrustFacts`)
+
+    /// TR-AC16: the CA entry joins the advice last and the steps after Scope, worded by PR D's `text`/`actions`/`step`.
+    @Test func caTrustJoinsAdviceAndSteps() throws {
+        let notTrusted = try caFacts()
+        #expect(notTrusted.trusted == false && notTrusted.scope == nil && notTrusted.fingerprint == "AB:CD")
+        #expect(notTrusted.platform == "macos" && notTrusted.installing == false && notTrusted.needsAdmin == false)
+        let s = make(bus: .connected("127.0.0.1:60745"), role: "operator", capability: .capturing, hosts: 0, flows: 0,
+                     systemProxy: .off, caTrust: notTrusted)
+        #expect(s.routes.caTrust?.kind == .caTrust)
+        #expect(s.routes.caTrust?.open == false)
+        #expect(s.routes.caTrust?.line == "HTTPS is not captured until the CA is trusted")
+        #expect(s.routes.caTrust?.line == notTrusted.text)
+        #expect(s.routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
+        #expect(s.routes.caTrust?.actions == [.trustCA, .openCAPanel])
+        #expect(s.routes.caTrust?.actions == notTrusted.actions)
+        #expect(s.routes.advice.map(\.kind) == [.systemProxy, .scope, .caTrust])
+        #expect(s.routes.advice.last?.line == "HTTPS is not captured until the CA is trusted")
+        #expect(s.routes.anyOpen == true)
+        #expect(s.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow])
+        #expect(s.steps[5].title == "Trust the aitmproxy CA")
+        #expect(s.steps[5].done == false)
+        #expect(s.steps[5].action == .trustCA)
+        #expect(s.steps[5].detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then")
+        #expect(s.steps[5].title == notTrusted.step.title && s.steps[5].action == notTrusted.step.action)
+        // No rows: the advice is the empty state's, the banner stays away.
+        #expect(s.routes.banner == nil)
+    }
+
+    /// TR-AC16: the CA state joins the banner last whenever rows exist; alone it is the banner, with the Trust button.
+    @Test func caTrustBanner() throws {
+        let notTrusted = try caFacts()
+        let trustedUser = try caFacts(scope: "user")
+        func routes(_ capability: CaptureCapability = .capturing, systemProxy: SystemProxyState? = .off, hosts: Int = 0,
+                    flows: Int, tunnelled: Int = 0, caTrust: CATrustFacts?) -> TrafficRoutes {
+            make(bus: .connected("127.0.0.1:60745"), role: "operator", capability: capability, hosts: hosts, flows: flows,
+                 systemProxy: systemProxy, caTrust: caTrust, tunnelled: tunnelled).routes
+        }
+        let readable = routes(flows: 6, caTrust: notTrusted)
+        #expect(readable.banner == "HTTPS is not captured until the CA is trusted")
+        #expect(readable.bannerAction == .trustCA)
+        let tunnels = routes(flows: 6, tunnelled: 6, caTrust: notTrusted)
+        #expect(tunnels.banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(tunnels.bannerAction == .addScopeHost)
+        let allOff = routes(.inactive, flows: 6, caTrust: notTrusted)
+        #expect(allOff.banner
+                == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(allOff.bannerAction == .openCaptureSettings)
+        let freshUntilPR4 = routes(.inactive, systemProxy: nil, flows: 6, caTrust: notTrusted)
+        #expect(freshUntilPR4.banner
+                == "All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(freshUntilPR4.bannerAction == .openCaptureSettings)
+        let caOnly = routes(systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3, caTrust: notTrusted)
+        #expect(caOnly.banner == "HTTPS is not captured until the CA is trusted")
+        #expect(caOnly.bannerAction == .trustCA)
+        #expect(caOnly.anyOpen == true)
+        #expect(routes(systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3, caTrust: trustedUser).banner == nil)
+        let trustedTunnels = routes(systemProxy: .off, hosts: 0, flows: 3, tunnelled: 3, caTrust: trustedUser)
+        #expect(trustedTunnels.banner == "Nothing is decrypted until a host is in Scope.")
+        #expect(trustedTunnels.bannerAction == .addScopeHost)
+    }
+
+    /// TR-AC16: a trusted CA is an open entry — PR D's line, `HTTPS on both routes`, no stored action, a done step.
+    @Test func caTrusted() throws {
+        let trustedUser = try caFacts(scope: "user")
+        #expect(trustedUser.trusted == true && trustedUser.scope == "user" && trustedUser.platform == "macos")
+        let s = make(bus: .connected("x"), role: "operator", capability: .capturing, systemProxy: .off, caTrust: trustedUser)
+        #expect(s.routes.caTrust?.line == "CA trusted (user keychain)")
+        #expect(s.routes.caTrust?.open == true)
+        #expect(s.routes.caTrust?.detail == "HTTPS on both routes")
+        #expect(s.routes.caTrust?.actions == [])
+        #expect(trustedUser.actions == [.openCAPanel], "PR D offers the panel on a trusted fact; an open entry stores no remedy")
+        #expect(!s.routes.advice.contains { $0.kind == .caTrust })
+        #expect(s.routes.advice.map(\.kind) == [.systemProxy, .scope])
+        let step = try #require(s.steps.first { $0.kind == .caTrusted })
+        #expect(step.title == "CA trusted (user keychain)")
+        #expect(step.done == true)
+        #expect(step.action == nil)
+        #expect(step.detail == "HTTPS on both routes")
+        let system = make(bus: .connected("x"), role: "operator", capability: .capturing, caTrust: try caFacts(scope: "system"))
+        #expect(system.routes.caTrust?.line == "CA trusted (System keychain)")
+        #expect(system.steps.first { $0.kind == .caTrusted }?.title == "CA trusted (System keychain)")
+        let done = make(core: core(.ready), bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2, flows: 1,
+                        systemProxy: both("127.0.0.1", 8080), caTrust: trustedUser)
+        #expect(done.allStepsDone == true)
+        #expect(done.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow])
+    }
+
+    /// TR-AC16: an unread or unknown CA (nil) says nothing — no entry, no step, no CA words in the advice or the banner.
+    @Test func caUnknownSaysNothing() {
+        let s = make(bus: .connected("x"), role: "operator", capability: .inactive, hosts: 0, flows: 3, systemProxy: .off, caTrust: nil)
+        #expect(s.routes.caTrust == nil)
+        #expect(!s.steps.contains { $0.kind == .caTrusted })
+        #expect(s.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .firstFlow])
+        #expect(s.routes.advice.map(\.kind) == [.systemProxy, .allApps, .scope])
+        #expect(s.routes.banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.")
+        for text in s.routes.advice.map(\.line) + [s.routes.banner ?? ""] {
+            #expect(!text.contains("CA") && !text.contains("HTTPS"), "\(text)")
+        }
+        // The default: every existing call site passes no CA fact.
+        #expect(make(bus: .connected("x"), role: "operator", capability: .capturing, flows: 3).routes.caTrust == nil)
+    }
+
+    /// TR-AC16: PR D's session flags — `installing` outranks everything (nothing to press), `needsAdmin` offers the panel.
+    @Test func caSiblingStates() throws {
+        let installing = make(bus: .connected("x"), role: "operator", capability: .capturing, systemProxy: .off,
+                              caTrust: try caFacts(installing: true))
+        #expect(installing.routes.caTrust?.line == "trusting CA…")
+        #expect(installing.routes.caTrust?.open == false)
+        #expect(installing.routes.caTrust?.actions == [])
+        #expect(installing.routes.caTrust?.detail == caNotTrustedDetail)
+        let installingStep = try #require(installing.steps.first { $0.kind == .caTrusted })
+        #expect(installingStep.title == "trusting CA…")
+        #expect(installingStep.done == false)
+        #expect(installingStep.action == nil)
+        // An uninstall in flight: a trusted store, `installing` set — PR D's `text` and `step.done` say in flight, not done.
+        let untrusting = make(bus: .connected("x"), role: "operator", capability: .capturing, caTrust: try caFacts(scope: "user", installing: true))
+        #expect(untrusting.routes.caTrust?.line == "trusting CA…")
+        #expect(untrusting.routes.caTrust?.open == false)
+        #expect(untrusting.steps.first { $0.kind == .caTrusted }?.done == false)
+
+        let admin = make(bus: .connected("x"), role: "operator", capability: .capturing, systemProxy: .off,
+                         caTrust: try caFacts(needsAdmin: true))
+        #expect(admin.routes.caTrust?.line == "CA trust needs an administrator")
+        #expect(admin.routes.caTrust?.open == false)
+        #expect(admin.routes.caTrust?.actions == [.openCAPanel])
+        #expect(admin.routes.caTrust?.detail == caNotTrustedDetail)
+        let adminStep = try #require(admin.steps.first { $0.kind == .caTrusted })
+        #expect(adminStep.title == "CA trust needs an administrator")
+        #expect(adminStep.done == false)
+        #expect(adminStep.action == .openCAPanel)
+
+        let adminBanner = make(bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2, flows: 3,
+                               systemProxy: both("127.0.0.1", 8080), caTrust: try caFacts(needsAdmin: true)).routes
+        #expect(adminBanner.banner == "CA trust needs an administrator")
+        #expect(adminBanner.bannerAction == .openCAPanel)
+        let installingBanner = make(bus: .connected("x"), role: "operator", capability: .capturing, hosts: 2, flows: 3,
+                                    systemProxy: both("127.0.0.1", 8080), caTrust: try caFacts(installing: true)).routes
+        #expect(installingBanner.banner == "trusting CA…")
+        #expect(installingBanner.bannerAction == nil)
+    }
+
+    /// TR-AC18, CA cases: the CA state is its whole line; it joins the composed banner last; a single-fact banner is that state.
+    @Test func composedBannerWithCA() throws {
+        let notTrusted = try caFacts()
+        func routes(_ capability: CaptureCapability, supported: Bool = true, systemProxy: SystemProxyState? = .off,
+                    hosts: Int = 0, flows: Int = 0, tunnelled: Int = 0, caTrust: CATrustFacts? = nil) -> TrafficRoutes {
+            make(bus: .connected("x"), role: "operator", capability: capability, supported: supported,
+                 hosts: hosts, flows: flows, systemProxy: systemProxy, caTrust: caTrust, tunnelled: tunnelled).routes
+        }
+        let ca = routes(.capturing, caTrust: notTrusted).caTrust
+        #expect(ca?.state == ca?.line)
+        #expect(ca?.state == "HTTPS is not captured until the CA is trusted")
+        let freshWithPR4 = routes(.inactive, hosts: 0, flows: 3, caTrust: notTrusted)
+        #expect(freshWithPR4.banner
+                == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(freshWithPR4.bannerAction == .openCaptureSettings)
+        let freshUntilPR4 = routes(.inactive, systemProxy: nil, hosts: 0, flows: 3, caTrust: notTrusted)
+        #expect(freshUntilPR4.banner
+                == "All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(freshUntilPR4.bannerAction == .openCaptureSettings)
+        let readable = routes(.capturing, hosts: 0, flows: 3, caTrust: notTrusted)
+        #expect(readable.banner == "HTTPS is not captured until the CA is trusted")
+        #expect(readable.bannerAction == .trustCA)
+        let tunnels = routes(.capturing, hosts: 0, flows: 3, tunnelled: 3, caTrust: notTrusted)
+        #expect(tunnels.banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted")
+        #expect(tunnels.bannerAction == .addScopeHost)
+        // Single-fact banners equal that fact's state, never a line with its remedy clause.
+        let noExtension = routes(.capturing, supported: false, hosts: 2, flows: 3)
+        #expect(noExtension.banner == noExtension.systemProxy?.state)
+        #expect(noExtension.banner == "system proxy off")
+        #expect(noExtension.bannerAction == nil)
+        let caOnly = routes(.capturing, systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3, caTrust: notTrusted)
+        #expect(caOnly.banner == caOnly.caTrust?.state)
+        #expect(caOnly.bannerAction == .trustCA)
+        let none = routes(.capturing, systemProxy: both("127.0.0.1", 8080), hosts: 2, flows: 3, caTrust: try caFacts(scope: "user"))
         #expect(none.banner == nil)
         #expect(none.bannerAction == nil)
     }
