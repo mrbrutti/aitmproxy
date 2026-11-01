@@ -49,6 +49,8 @@ export const CommandPalette: Component = () => {
   let disposed = false;
   /** Bumped by every `run`; a reply whose run is no longer the latest ends that run without touching the stage. */
   let runSeq = 0;
+  /** The `run` that holds the CA in-flight flag (§D17.12); only its ending releases it, so a superseded CA run cannot release what a newer one holds. */
+  let caOwner = 0;
   const close = () => app.openPalette(false);
   onCleanup(() => {
     disposed = true;
@@ -100,22 +102,23 @@ export const CommandPalette: Component = () => {
   };
 
   /**
-   * Where a call's outcome takes the palette. The server's prompt is only shown to a palette still
-   * waiting for this very run; one that was closed, left, or moved on to a newer run meanwhile
-   * treats the reply as the end of the run, and a reply from a superseded run never writes the
-   * stage. A CA run (§D17.12) is released on every ending, never while the prompt is up.
+   * Where a call's outcome takes the palette. Only a palette still waiting for this very run is
+   * written to: one that was closed, left, or moved on to a newer run meanwhile treats the reply
+   * as the end of the run (a failure becomes a notice, a result is dropped). A CA run (§D17.12)
+   * is released on every ending while it owns the flag, never while the prompt is up.
    */
   const settle = async (tool: ToolDef, args: Record<string, unknown>, outcome: Outcome, t0: number, seq: number) => {
     const ca = isCATrustTool(tool.name);
-    const current = seq === runSeq;
+    // A snapshot is exact here: every setStage in this function precedes its first await.
+    const awaited = !disposed && seq === runSeq && stage().kind === 'running';
     const show = (s: Stage) => {
-      if (current) setStage(s);
+      if (awaited) setStage(s);
     };
     const result = (ok: boolean, value: unknown): Stage => ({ kind: 'result', tool, ok, value, ms: performance.now() - t0, args });
     switch (outcome.kind) {
       case 'ask':
-        if (!disposed && current && stage().kind === 'running') setStage({ kind: 'confirm', tool, args, prompt: outcome.prompt, token: outcome.token });
-        else if (ca) await releaseCA();
+        if (awaited) setStage({ kind: 'confirm', tool, args, prompt: outcome.prompt, token: outcome.token });
+        else if (ca && caOwner === seq) await releaseCA();
         return;
       case 'done':
         show(result(true, outcome.value));
@@ -129,10 +132,11 @@ export const CommandPalette: Component = () => {
           // The operator dismissed the OS dialog: calm (D17.4), nothing to inspect.
           app.notice(outcome.message, 'info');
           show({ kind: 'list' });
-        } else show(result(false, outcome.message));
+        } else if (awaited) setStage(result(false, outcome.message));
+        else app.notice(outcome.message, 'error');
         break;
     }
-    if (ca) await releaseCA();
+    if (ca && caOwner === seq) await releaseCA();
     setRecent(pushRecent(commandKey(tool.name)));
   };
 
@@ -141,7 +145,10 @@ export const CommandPalette: Component = () => {
     const seq = ++runSeq;
     setStage({ kind: 'running', tool });
     const t0 = performance.now();
-    if (phase.kind === 'begin' && isCATrustTool(tool.name)) app.setCAInstalling(true);
+    if (isCATrustTool(tool.name)) {
+      caOwner = seq;
+      if (phase.kind === 'begin') app.setCAInstalling(true);
+    }
     await settle(tool, args, await callFor(tool, args, phase), t0, seq);
   };
 
