@@ -38,7 +38,7 @@ MODE=${1:-all}
 case "$MODE" in
   lane|cells|all) ;;
   -h|--help|help)
-    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
     exit 0 ;;
   *)
     echo "usage: $0 [lane|cells|all]" >&2
@@ -187,7 +187,12 @@ run_lane() {
   step "lane 1/4: build the live_loopback test binary (no run yet)"
   local build_log="$OUT/lane-build.log" bin
   say "cargo test -p aitm-scan-l4-packet --test live_loopback --no-run   (log: $build_log)"
-  cargo test -p aitm-scan-l4-packet --test live_loopback --no-run > "$build_log" 2>&1
+  if ! cargo test -p aitm-scan-l4-packet --test live_loopback --no-run > "$build_log" 2>&1; then
+    tail -5 "$build_log"
+    rec "lane: the test binary did not build; read $build_log"
+    FAILS=$((FAILS + 1))
+    return
+  fi
   tail -3 "$build_log"
   bin=$(grep -o 'target/debug/deps/live_loopback-[0-9a-f]*' "$build_log" | tail -1)
   if [ -z "$bin" ] || [ ! -x "$ROOT/$bin" ]; then
@@ -236,6 +241,7 @@ run_cells() {
     FAILS=$((FAILS + 1))
     return
   fi
+  # shellcheck disable=SC2012  # two named files, human-readable listing is the point
   ls -l "$core" "$tt" | sed 's/^/  /' | tee -a "$SUMMARY"
 
   step "cells 2/4: file capabilities on the core only"
@@ -259,7 +265,7 @@ run_cells() {
   rec "summary line: $(grep -E '^e2e summary:' "$log" | tail -1)"
   rec "ledger (spec D3), from the runner:"
   sed -n '/^scan verb ledger (spec D3):/,/^ledger: /p' "$log" | sed 's/^/  /' | tee -a "$SUMMARY"
-  rec "ledger files: $(ls "$ledger" 2>/dev/null | tr '\n' ' ')"
+  rec "ledger files: $(find "$ledger" -maxdepth 1 -type f -printf '%f ' 2>/dev/null)"
   pcap_excerpts "$OUT/cells.pcap"
   local n_pass
   n_pass=$(grep -cE '^PASS +scan/test_t5_' "$log")

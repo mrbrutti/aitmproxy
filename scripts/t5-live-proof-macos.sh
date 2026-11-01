@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
     --out) shift; OUT_ROOT=${1:-} ;;
     --out=*) OUT_ROOT=${1#--out=} ;;
     -h|--help|help)
-      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+      awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
       exit 0 ;;
     *)
       echo "usage: $0 {record|verify|cells|restore-doc|all} [--record-only] [--out DIR]" >&2
@@ -307,7 +307,8 @@ do_cells() {
     rec "$f" "cells: a failure (see $OUT/scan.log and $OUT/lane.log)"
     exit 1
   fi
-  if grep -qF "$SKIP_REASON" "$OUT/scan.log" "$OUT/lane.log"; then
+  # The cells print the Python literal; the lane prints "SKIP 77: L4 packet lane live proof skipped: ...".
+  if grep -qF "$SKIP_REASON" "$OUT/scan.log" || grep -qE '^SKIP 77' "$OUT/lane.log"; then
     rec "$f" "cells skipped: $SKIP_REASON"
     say "exit 77: $SKIP_REASON"
     exit 77
