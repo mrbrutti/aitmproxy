@@ -32,12 +32,14 @@
 //! **Privilege reality (CLI/Linux-first).** This macOS dev host cannot open
 //! `/dev/bpf` for raw L4, so the spawned core's startup probe reports
 //! capture/inject unavailable and the wire verbs fail closed with a typed
-//! `L4Unavailable` — a **required** scenario here (AC18). Because the gated
-//! wrapper suppresses the operator confirm-prompt while unavailable, the inject
-//! **confirm overlay** (dest + summary + scope + permit budget) and the real
-//! packet round-trip against the `aitm-testtarget` L4 service are the
-//! **privileged/Linux-gated** half: driven for real only under `AITM_L4_TESTS=1`
-//! on an elevated host; asserted-degraded otherwise.
+//! `L4Unavailable` — a **required** scenario here (AC18). The gated wrapper
+//! forwards the wrapped command's `confirm_prompt` unchanged even while
+//! unavailable (l4-capture-privilege spec §2.4, L4PRIV-AC27), so the inject
+//! **confirm overlay** (dest + summary + scope) shows on every host; only the
+//! real packet round-trip against the `aitm-testtarget` L4 service after `y`
+//! is the **privileged/Linux-gated** half: driven for real only under
+//! `AITM_L4_TESTS=1` on an elevated host. Elsewhere `y` re-issues the verb,
+//! which fails closed with the typed `L4 unavailable` reason.
 //!
 //! **Sandbox.** The Claude sandbox cannot bind TCP; when the bus bind is refused
 //! the test prints a note and returns, as `tui_live_bus.rs` does. Run it for real
@@ -563,11 +565,30 @@ async fn tui_l4_cua_against_a_live_core() {
         cua.snapshot("L4 inject — after confirm (privileged real packet)");
         eprintln!("[inject] privileged path: confirmed and sent a real packet");
     } else {
-        // This macOS host: the gated wrapper suppresses the confirm-prompt while
-        // unavailable, so inject goes straight to the wire verb, which fails
-        // closed with the typed reason — no overlay, no fake success, no panic.
+        // This macOS host: `L4Gated` forwards the wrapped command's
+        // `confirm_prompt` even while capture is unavailable (spec §2.4,
+        // L4PRIV-AC27), so the operator sees the confirm overlay first; `y`
+        // re-issues with `_confirm` and the wire verb then fails closed with
+        // the typed reason — no fake success, no panic.
+        assert_eq!(
+            cua.app.mode,
+            Mode::L4Confirm,
+            "the gate forwards the confirm prompt even while unavailable (AC27): {}",
+            cua.screen()
+        );
+        cua.snapshot("L4 inject — confirm overlay (unprivileged, AC27)");
+        let ov = cua.screen();
+        assert!(
+            ov.contains("127.0.0.1"),
+            "confirm shows the destination: {ov}"
+        );
+        assert!(
+            ov.to_lowercase().contains("scope"),
+            "confirm shows the scope: {ov}"
+        );
+        cua.key(KeyCode::Char('y')).await;
         cua.pump(Duration::from_millis(400)).await;
-        cua.snapshot("L4 inject — honest L4Unavailable degradation");
+        cua.snapshot("L4 inject — honest L4Unavailable degradation after confirm");
         let screen = cua.screen().to_lowercase();
         assert!(
             screen.contains("unavailable"),
@@ -577,9 +598,11 @@ async fn tui_l4_cua_against_a_live_core() {
         assert_ne!(
             cua.app.mode,
             Mode::L4Confirm,
-            "no overlay without privilege"
+            "the overlay closes once the confirmed verb is re-issued"
         );
-        eprintln!("[inject] honest degradation: l4.inject → L4Unavailable (no fake success)");
+        eprintln!(
+            "[inject] confirm overlay shown (AC27), then honest degradation: l4.inject → L4Unavailable (no fake success)"
+        );
     }
 
     // ---- STEP 5: scope-as-authorisation — the guard refuses out-of-scope capture (AC9) ----

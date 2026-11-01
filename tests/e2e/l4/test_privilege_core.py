@@ -71,6 +71,13 @@ AGENT_REFUSED_POLICY_PREFIX = "`l4.privilege.request` refused: the agent policy 
 
 # Spec AC3 / plan Rule 2: no reply, label, message or log line names a command.
 COMMAND_WORDS = re.compile(r"\b(sudo|setcap|chmod|chgrp|chown|dseditgroup|launchctl|pkexec)\b")
+# Spec §5.5 pins the `failed` progress text for a pkexec child that died generically:
+# "The packet-capture helper did not start (pkexec exit <n>)" / "(killed by signal <n>)".
+# That literal names `pkexec` by design, so the command-word scan of a *progress message*
+# (`request.message`, and the request reply's `message` when it is the same text) exempts
+# exactly this prefix. Reasons, labels, prompts, start-up lines and one-shot output keep the
+# full scan (`names_a_command`).
+PINNED_FAILED_PREFIX = "The packet-capture helper did not start ("
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 CAPABILITY_STATES = ("available", "needs_approval", "unsupported")
@@ -210,7 +217,7 @@ def request_errors(req) -> list[str]:
     msg = req.get("message")
     if not isinstance(msg, str):
         errs.append(f"request.message {msg!r} is not a string")
-    elif COMMAND_WORDS.search(msg):
+    elif progress_message_names_a_command(msg):
         errs.append(f"request.message names a command: {msg!r}")
     return errs
 
@@ -246,6 +253,15 @@ def is_needs_confirmation(reply) -> bool:
 
 def names_a_command(text) -> bool:
     return isinstance(text, str) and COMMAND_WORDS.search(text) is not None
+
+
+def progress_message_names_a_command(text) -> bool:
+    """`names_a_command` for a request progress message: the spec-§5.5 pinned failure text
+    "The packet-capture helper did not start (...)" is exempt (it names pkexec by spec);
+    anything else is scanned in full."""
+    if isinstance(text, str) and text.startswith(PINNED_FAILED_PREFIX):
+        return False
+    return names_a_command(text)
 
 
 def startup_lines(log_text: str) -> list[str]:
@@ -494,7 +510,8 @@ def check_request(op, report: dict | None) -> None:
         msg = rep.get("message")
         print(f"note: request message, verbatim: {msg!r}", flush=True)
         expect(isinstance(msg, str) and bool(msg), "the message is a non-empty string", msg)
-        expect(not names_a_command(msg), "the message names no shell command (sudo/setcap/chmod/.../pkexec)", msg)
+        expect(not progress_message_names_a_command(msg),
+               "the message names no shell command (sudo/setcap/chmod/.../pkexec; spec §5.5 pinned text exempt)", msg)
         if IS_LINUX and not os.environ.get("AITM_E2E_PRIV_DOC_ACCEPTED"):
             expect("packet-capture.md" not in str(msg), "AC23: the message names no doc (none accepted yet)", msg)
         priv = rep.get("privilege")
@@ -514,7 +531,8 @@ def check_request(op, report: dict | None) -> None:
         expect(isinstance(req, dict) and req.get("state") in ("failed", "pending", "handed_to_app"),
                f"{READ_VERB}.request is a dict with state in {{failed, pending, handed_to_app}}", req)
         if isinstance(req, dict):
-            expect(not names_a_command(req.get("message")), "the recorded progress message names no command",
+            expect(not progress_message_names_a_command(req.get("message")),
+                   "the recorded progress message names no command (spec §5.5 pinned text exempt)",
                    req.get("message"))
     if IS_MAC:
         open_after = pgrep("-fl", "open -a")
