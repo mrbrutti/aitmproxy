@@ -22,6 +22,9 @@ use crate::app::{html, percent_decode, reflect, AppState, RequestInfo, Resp};
 const MAX_PARTS: usize = 64;
 /// Most header lines read per part before the rest are ignored.
 const MAX_PART_HEADER_LINES: usize = 32;
+/// Longest boundary accepted (RFC 2046 section 5.1.1: 1 to 70 characters);
+/// a longer one is a 400 like a missing one.
+const MAX_BOUNDARY: usize = 70;
 
 /// Dispatch the six reflection routes; `None` lets the router fall through.
 pub(crate) async fn route(info: &RequestInfo, state: &Arc<AppState>) -> Option<Resp> {
@@ -168,7 +171,8 @@ pub(crate) struct Part {
 }
 
 /// The `boundary` parameter of a `multipart/form-data` content type, quoted or
-/// bare; `None` when the type is not multipart or the parameter is absent/empty.
+/// bare; `None` when the type is not multipart or the parameter is absent,
+/// empty or longer than [`MAX_BOUNDARY`].
 pub(crate) fn multipart_boundary(content_type: &str) -> Option<String> {
     let mut params = content_type.split(';');
     let media_type = params.next()?.trim();
@@ -185,7 +189,7 @@ pub(crate) fn multipart_boundary(content_type: &str) -> Option<String> {
             .strip_prefix('"')
             .and_then(|v| v.strip_suffix('"'))
             .unwrap_or(value);
-        (!value.is_empty()).then(|| value.to_string())
+        (!value.is_empty() && value.len() <= MAX_BOUNDARY).then(|| value.to_string())
     })
 }
 
@@ -524,6 +528,40 @@ Content-Disposition: form-data; name=\"note\"\r\n\
             route(&post, &st).await.is_none(),
             "POST /docs/x is not routed"
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_boundary_longer_than_70_bytes_is_refused() {
+        // RFC 2046 section 5.1.1: a boundary is 1 to 70 characters.
+        let ok = "b".repeat(70);
+        let too_long = "b".repeat(71);
+        assert_eq!(
+            multipart_boundary(&format!("multipart/form-data; boundary={ok}")).as_deref(),
+            Some(ok.as_str())
+        );
+        assert_eq!(
+            multipart_boundary(&format!("multipart/form-data; boundary={too_long}")),
+            None
+        );
+        assert_eq!(
+            multipart_boundary(&format!("multipart/form-data; boundary=\"{too_long}\"")),
+            None
+        );
+        let ct = format!("multipart/form-data; boundary={too_long}");
+        let body = format!(
+            "--{too_long}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--{too_long}--\r\n"
+        );
+        let info = RequestInfo::test_request(
+            "POST",
+            "/upload",
+            &[("content-type", ct.as_str())],
+            body.as_bytes(),
+        );
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            let resp = call(mode, &info).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_string(resp).await, "expected multipart/form-data");
+        }
     }
 
     #[test]

@@ -478,12 +478,14 @@ where
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
-        // Drain every complete frame at the front of the buffer.
+        // Handle every complete frame at the front of the buffer, then drain
+        // them all at once (one memmove per read, not one per frame).
+        let mut consumed_total = 0usize;
         loop {
-            match decode_frame(&buf) {
+            match decode_frame(buf.get(consumed_total..).unwrap_or(&[])) {
                 Decoded::Incomplete => break,
                 Decoded::Frame { frame, consumed } => {
-                    buf.drain(..consumed);
+                    consumed_total += consumed;
                     match handle_frame(io, state, conn, mode, frame).await {
                         Next::Continue => {}
                         Next::End(code) => return code,
@@ -495,6 +497,7 @@ where
                 }
             }
         }
+        buf.drain(..consumed_total.min(buf.len()));
         // A frame within MAX_FRAME always fits MAX_BUFFER, so a full buffer
         // that still decodes as Incomplete cannot be honoured.
         let room = MAX_BUFFER.saturating_sub(buf.len());
@@ -1092,6 +1095,32 @@ mod tests {
         assert_eq!(op, Opcode::Close);
         assert_eq!(close, vec![0x03, 0xe8]);
 
+        assert_eq!(task.await.expect("loop task"), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn frame_loop_answers_two_frames_from_one_read() {
+        // Two complete frames in one write (and so, typically, one read) are
+        // both decoded and answered in order; the receive buffer is drained
+        // once per read, not per frame.
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:10".parse().expect("peer"));
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        let mut wire = masked(Opcode::Ping, b"one");
+        wire.extend_from_slice(&masked(Opcode::Text, br#"{"type":"echo","msg":"two"}"#));
+        wire.extend_from_slice(&masked(Opcode::Close, &1000u16.to_be_bytes()));
+        client.write_all(&wire).await.expect("write three frames");
+        let (op, pong) = read_frame(&mut client).await;
+        assert_eq!((op, pong.as_slice()), (Opcode::Pong, &b"one"[..]));
+        let (op, echo) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Text);
+        assert_eq!(echo, br#"{"type":"echo","msg":"two","html":"<b>two</b>"}"#);
+        let (op, close) = read_frame(&mut client).await;
+        assert_eq!((op, close), (Opcode::Close, vec![0x03, 0xe8]));
         assert_eq!(task.await.expect("loop task"), Some(1000));
     }
 

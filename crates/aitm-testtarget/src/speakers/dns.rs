@@ -3,8 +3,10 @@
 //! One datagram is one message. The header is parsed, then exactly one
 //! question (uncompressed labels, QTYPE, QCLASS). An A query is answered with
 //! `127.0.0.1` (TTL 60) and the question echoed; any other QTYPE is NOTIMP
-//! (RCODE 4); QDCOUNT != 1, a truncated header or question, or a compression
-//! pointer in the name is FORMERR (RCODE 1).
+//! (RCODE 4); QDCOUNT != 1, a truncated question, or a compression pointer in
+//! the name is FORMERR (RCODE 1). A datagram shorter than the 12-byte header
+//! gets no reply at all (a FORMERR would be larger than the probe: no
+//! amplification), only the `protocol_error` log entry.
 //!
 //! The deliberate bug: a label length byte that reaches **past the end of the
 //! datagram**. A careful parser answers FORMERR; the Vulnerable origin crashes
@@ -84,6 +86,8 @@ enum Query<'a> {
     Question { qtype: u16, question: &'a [u8] },
     /// Malformed in a way a careful parser rejects.
     Malformed,
+    /// Shorter than the header: not answered.
+    Truncated,
     /// The deliberate bug: a label length past the datagram end.
     LabelPastEnd,
 }
@@ -105,7 +109,7 @@ fn read_u16(buf: &[u8], at: usize) -> Option<u16> {
 /// Parse the header and the single question of `buf`.
 fn parse_query(buf: &[u8]) -> Query<'_> {
     if buf.len() < HEADER_LEN {
-        return Query::Malformed;
+        return Query::Truncated;
     }
     if read_u16(buf, 4) != Some(1) {
         return Query::Malformed;
@@ -161,6 +165,7 @@ impl Speaker for Dns {
                 Step::ProtocolError(notimp(id)),
             ),
             Query::Malformed => (None, Step::ProtocolError(formerr(id))),
+            Query::Truncated => (None, Step::ProtocolError(Vec::new())),
             Query::LabelPastEnd => (None, mode_bug(mode, formerr(id))),
         };
         Parsed::Message {
@@ -297,23 +302,28 @@ mod tests {
 
     #[test]
     fn malformed_is_a_protocol_error_not_a_crash() {
-        // Truncated header: id present, nothing else -> FORMERR with the id.
-        let short: &[u8] = &[0x12, 0x34, 0x01];
+        // Truncated header: a datagram shorter than the 12-byte header gets
+        // no reply at all (a 12-byte FORMERR to a 1-byte probe would amplify),
+        // only the `protocol_error` log entry.
+        for short in [&[0x12, 0x34, 0x01][..], &[0x12], &[0u8; 11]] {
+            assert_eq!(
+                parse(SeedMode::Vulnerable, short),
+                Parsed::Message {
+                    consumed: short.len(),
+                    verb: None,
+                    step: Step::ProtocolError(Vec::new()),
+                },
+                "{short:?}"
+            );
+        }
+        // A full header with QDCOUNT 1 and nothing else is FORMERR, with id.
+        let header_only: &[u8] = &[0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         assert_eq!(
-            parse(SeedMode::Vulnerable, short),
+            parse(SeedMode::Vulnerable, header_only),
             Parsed::Message {
-                consumed: 3,
+                consumed: 12,
                 verb: None,
                 step: Step::ProtocolError(formerr(0x1234)),
-            }
-        );
-        // One byte: no id -> FORMERR with id 0.
-        assert_eq!(
-            parse(SeedMode::Vulnerable, &[0x12]),
-            Parsed::Message {
-                consumed: 1,
-                verb: None,
-                step: Step::ProtocolError(formerr(0)),
             }
         );
         // QDCOUNT 2 -> FORMERR.

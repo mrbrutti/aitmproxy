@@ -14,7 +14,7 @@
 //! `route(&RequestInfo, &Arc<AppState>) -> Option<Resp>`; `/ws` is `ws.rs`.
 //! Every served request ends in one `request` entry on the control log (D2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -39,13 +39,16 @@ pub(crate) type Resp = Response<Full<Bytes>>;
 /// Largest request body any route accepts; beyond it the request is 413.
 pub(crate) const MAX_BODY: usize = 2 * 1024 * 1024;
 
+/// Most comments the stored-XSS store keeps; the oldest is dropped past it.
+pub(crate) const MAX_COMMENTS: usize = 1_000;
+
 /// Per-instance state shared across every connection to one target (plain,
 /// TLS and TLS-h1 listeners alike, so a login over TLS is valid over plain).
 pub(crate) struct AppState {
     pub mode: SeedMode,
     /// The stored-XSS comment store: what `POST /comments` appends and `GET
-    /// /comments` renders back.
-    pub comments: Mutex<Vec<String>>,
+    /// /comments` renders back; at most [`MAX_COMMENTS`], oldest dropped.
+    pub comments: Mutex<VecDeque<String>>,
     /// Login sessions (`POST /login`, `/account?tab=`, `/ws` `session_valid`).
     pub sessions: routes::session::SessionStore,
     /// `GET /flaky` request counter (every third request fails).
@@ -58,7 +61,7 @@ impl AppState {
     pub(crate) fn new(mode: SeedMode, log: Arc<ControlLog>) -> AppState {
         AppState {
             mode,
-            comments: Mutex::new(Vec::new()),
+            comments: Mutex::new(VecDeque::new()),
             sessions: routes::session::SessionStore::new(),
             flaky: AtomicU64::new(0),
             log,
@@ -355,7 +358,12 @@ fn legacy(info: &RequestInfo, state: &Arc<AppState>) -> Option<Resp> {
         // --- Planted: stored XSS ----------------------------------------
         ("POST", "/comments") => {
             let comment = info.form_param("comment").unwrap_or_default();
-            state.comments.lock().expect("comment store").push(comment);
+            let mut comments = state.comments.lock().expect("comment store");
+            if comments.len() >= MAX_COMMENTS {
+                comments.pop_front();
+            }
+            comments.push_back(comment);
+            drop(comments);
             redirect("/comments")
         }
         ("GET", "/comments") => {
@@ -1088,6 +1096,37 @@ mod tests {
         assert!(e["headers"].get("authorization").is_none(), "{e}");
         assert_eq!(e["cookie_sha256"].as_str().map(str::len), Some(16), "{e}");
         assert_eq!(e["auth_sha256"].as_str().map(str::len), Some(16), "{e}");
+    }
+
+    #[tokio::test]
+    async fn comment_store_keeps_the_newest_thousand() {
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        for i in 0..=MAX_COMMENTS {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/comments")
+                .body(Full::new(Bytes::from(format!("comment=c{i}"))))
+                .expect("valid request");
+            let resp = route(req, state.clone(), conn.clone())
+                .await
+                .expect("route is infallible");
+            assert_eq!(resp.status(), StatusCode::FOUND);
+        }
+        let resp = get_on(&state, &conn, "/comments").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("full body")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf-8 body");
+        assert_eq!(body.matches("<li>").count(), MAX_COMMENTS);
+        assert_eq!(MAX_COMMENTS, 1_000);
+        // The oldest was dropped, the newest kept, order preserved.
+        assert!(!body.contains("<li>c0</li>"), "oldest comment must be gone");
+        assert!(body.starts_with("<html><body><ul><li>c1</li><li>c2</li>"));
+        assert!(body.contains(&format!("<li>c{MAX_COMMENTS}</li></ul>")));
     }
 
     #[tokio::test]

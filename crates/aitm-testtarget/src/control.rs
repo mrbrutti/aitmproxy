@@ -1,9 +1,11 @@
 //! The control origin (spec D2): a second loopback HTTP/1 port that serves the
 //! target's own observer log as JSON to the e2e harness. It is never linked
 //! from `/`, never in the HTTP scope, never logs its own requests and never
-//! adds the P-mode headers. Six routes: `GET /services`, `GET /log/http`,
+//! adds the P-mode headers. Seven routes: `GET /services`, `GET /log/http`,
 //! `GET /log/ws`, `GET /log/l4[?service=NAME]`, `GET /log/conns`,
-//! `POST /reset`, `GET /mode`; anything else is a JSON 404.
+//! `POST /reset`, `GET /mode`; anything else is a JSON 404. A request that
+//! carries an `Origin` header (a browser page, never the harness) is a JSON
+//! 403 `cross-origin` whatever the route, so a page cannot `POST /reset`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -64,6 +66,12 @@ pub(crate) async fn route<B: Body>(
     req: Request<B>,
     log: Arc<ControlLog>,
 ) -> Result<Resp, Infallible> {
+    if req.headers().contains_key("origin") {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": "cross-origin" }),
+        ));
+    }
     let method = req.method();
     let path = req.uri().path();
     let query = req.uri().query();
@@ -297,6 +305,56 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ct, "application/json");
         assert_eq!(body, json!({ "mode": "patched" }));
+    }
+
+    #[tokio::test]
+    async fn a_request_with_an_origin_header_is_cross_origin_403() {
+        // A browser page cannot drive the control origin (CSRF on `/reset`):
+        // any request carrying `Origin` is refused, whatever the route. The
+        // harness never sends one.
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let conn = log.open_conn(Listener::Plain, None, addr(40002));
+        log.log_request(RequestEntry {
+            seq: 0,
+            ts_ms: 0,
+            conn_id: conn.conn_id.clone(),
+            listener: conn.listener,
+            version: HttpVersion::H1,
+            conn_req_index: conn.next_request_index(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: String::new(),
+            headers: Default::default(),
+            cookie_names: Vec::new(),
+            cookie_sha256: None,
+            auth_sha256: None,
+            body_len: 0,
+            body_sha256: sha256_hex(b""),
+            status: 200,
+        });
+        for (method, path) in [
+            ("POST", "/reset"),
+            ("GET", "/services"),
+            ("GET", "/log/http"),
+            ("GET", "/mode"),
+            ("GET", "/nope"),
+        ] {
+            for origin in ["http://127.0.0.1:1", "null", "http://evil.example"] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("origin", origin)
+                    .body(Full::new(Bytes::new()))
+                    .expect("valid request");
+                let (status, ct, body) = call(req, &log).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} {origin}");
+                assert_eq!(ct, "application/json");
+                assert_eq!(body, json!({ "error": "cross-origin" }));
+            }
+        }
+        // Nothing was reset by the refused POST.
+        let (_, _, http) = call(get("/log/http"), &log).await;
+        assert_eq!(http["entries"].as_array().map(Vec::len), Some(1));
     }
 
     // --- Tester additions (stage 5): the remaining D2 routes and non-routes ---

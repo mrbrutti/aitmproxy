@@ -26,7 +26,8 @@ use crate::seed::SeedMode;
 pub(crate) const RING_CAP: usize = 50_000;
 
 /// Request headers kept verbatim in a `request` entry (D2). Anything else
-/// except `x-*` is dropped; `cookie` / `authorization` are hashed, never kept.
+/// except `x-*` is dropped; `cookie` / `authorization` are hashed, never
+/// kept; the `x-*` names in [`X_CREDENTIAL_DENYLIST`] keep only their name.
 const HEADER_ALLOWLIST: &[&str] = &[
     "host",
     "origin",
@@ -40,6 +41,15 @@ const HEADER_ALLOWLIST: &[&str] = &[
     "sec-websocket-key",
     "sec-websocket-version",
     "sec-websocket-protocol",
+];
+
+/// `x-*` headers that carry a credential: kept as the name with the value
+/// `"<redacted>"`, never the value itself (names lower-cased).
+const X_CREDENTIAL_DENYLIST: &[&str] = &[
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-amz-security-token",
 ];
 
 // --- Tokens -----------------------------------------------------------------
@@ -455,8 +465,9 @@ pub(crate) struct Redacted {
 
 /// Apply the D2 header policy: keep the allowlist and `x-*` verbatim (names
 /// lower-cased; a non-UTF-8 value becomes `"<binary>"`; repeated headers are
-/// joined with `", "`), hash `cookie` / `authorization` (first 16 hex of
-/// SHA-256 over the raw value; several `cookie` headers are joined with
+/// joined with `", "`), except that an `x-*` name on [`X_CREDENTIAL_DENYLIST`]
+/// is kept as `"<redacted>"`; hash `cookie` / `authorization` (first 16 hex
+/// of SHA-256 over the raw value; several `cookie` headers are joined with
 /// `"; "` first) and list the cookie names sorted. Nothing else survives.
 pub(crate) fn redact_headers(h: &HeaderMap) -> Redacted {
     let mut out = Redacted::default();
@@ -477,6 +488,9 @@ pub(crate) fn redact_headers(h: &HeaderMap) -> Redacted {
                 }
             }
             "authorization" => append_raw(&mut auth_raw, b", ", value.as_bytes()),
+            n if X_CREDENTIAL_DENYLIST.contains(&n) => {
+                out.headers.insert(name.clone(), "<redacted>".to_string());
+            }
             n if HEADER_ALLOWLIST.contains(&n) || n.starts_with("x-") => {
                 let text = value.to_str().unwrap_or("<binary>");
                 out.headers
@@ -913,6 +927,44 @@ mod tests {
             !dumped.contains("Bearer"),
             "raw authorization leaked: {dumped}"
         );
+    }
+
+    #[test]
+    fn x_credential_headers_are_redacted_not_kept() {
+        // `x-*` is kept verbatim except the credential-bearing names, which
+        // survive only as `"<redacted>"` (name kept, value never stored).
+        let mut h = HeaderMap::new();
+        for (name, value) in [
+            ("x-api-key", "k-secret"),
+            ("X-Auth-Token", "t-secret"),
+            ("x-csrf-token", "c-secret"),
+            ("x-amz-security-token", "a-secret"),
+            ("x-request-id", "req-1"),
+        ] {
+            h.append(
+                HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderValue::from_static(value),
+            );
+        }
+        let r = redact_headers(&h);
+        for name in [
+            "x-api-key",
+            "x-auth-token",
+            "x-csrf-token",
+            "x-amz-security-token",
+        ] {
+            assert_eq!(
+                r.headers.get(name).map(String::as_str),
+                Some("<redacted>"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            r.headers.get("x-request-id").map(String::as_str),
+            Some("req-1")
+        );
+        let dumped = serde_json::to_string(&r.headers).expect("serialize headers");
+        assert!(!dumped.contains("secret"), "credential leaked: {dumped}");
     }
 
     #[test]

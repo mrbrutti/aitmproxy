@@ -9,7 +9,7 @@
 //! requests. That gives the scanner an observed-session-reuse seed (AC T2-4)
 //! and a deterministic auth-loss to detect (T2-5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,16 +22,50 @@ use sha1::{Digest as _, Sha1};
 use crate::app::{html, redirect, reflect, AppState, RequestInfo, Resp};
 use crate::seed::{SESSION_PASS, SESSION_USER};
 
+/// Most live sessions the store keeps; the oldest is evicted past it.
+pub(crate) const MAX_SESSIONS: usize = 10_000;
+
 /// One live login. `armed` is the number of authenticated requests left
 /// before the session is dropped (`None`: never expires).
 struct Session {
     armed: Option<u32>,
 }
 
+/// The live sessions plus their creation order, so the store can evict the
+/// oldest when it is full. `order` may hold ids already removed by hand;
+/// eviction skips those, and the queue is compacted when it grows past
+/// twice the cap.
+#[derive(Default)]
+struct Sessions {
+    live: HashMap<String, Session>,
+    order: VecDeque<String>,
+}
+
+impl Sessions {
+    /// Make room for one more session: evict the oldest live one when the
+    /// store is at [`MAX_SESSIONS`].
+    fn make_room(&mut self) {
+        while self.live.len() >= MAX_SESSIONS {
+            let Some(oldest) = self.order.pop_front() else {
+                // Cannot happen (every live id is queued), but never spin.
+                break;
+            };
+            if self.live.remove(&oldest).is_some() {
+                break;
+            }
+        }
+        if self.order.len() >= 2 * MAX_SESSIONS {
+            let live = &self.live;
+            self.order.retain(|id| live.contains_key(id));
+        }
+    }
+}
+
 /// Login sessions minted by `POST /login` and checked by `/account?tab=`,
-/// `/logout-after` and the `/ws` handshake.
+/// `/logout-after` and the `/ws` handshake. Bounded at [`MAX_SESSIONS`]
+/// live sessions; the oldest is evicted to make room.
 pub(crate) struct SessionStore {
-    inner: Mutex<HashMap<String, Session>>,
+    inner: Mutex<Sessions>,
     /// Mixed into every id so two logins in the same nanosecond still differ.
     counter: AtomicU64,
 }
@@ -39,14 +73,14 @@ pub(crate) struct SessionStore {
 impl SessionStore {
     pub(crate) fn new() -> Self {
         SessionStore {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Sessions::default()),
             counter: AtomicU64::new(0),
         }
     }
 
-    /// The map, recovering a poisoned lock (a panic elsewhere must not take
-    /// the login store with it).
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Session>> {
+    /// The sessions, recovering a poisoned lock (a panic elsewhere must not
+    /// take the login store with it).
+    fn lock(&self) -> MutexGuard<'_, Sessions> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -65,13 +99,22 @@ impl SessionStore {
         hasher.update(port_hint.to_be_bytes());
         let mut id = format!("{:x}", hasher.finalize());
         id.truncate(32);
-        self.lock().insert(id.clone(), Session { armed: None });
+        let mut sessions = self.lock();
+        sessions.make_room();
+        sessions.order.push_back(id.clone());
+        sessions.live.insert(id.clone(), Session { armed: None });
         id
+    }
+
+    /// How many sessions are live.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().live.len()
     }
 
     /// Whether `id` names a live session.
     pub(crate) fn is_valid(&self, id: &str) -> bool {
-        self.lock().contains_key(id)
+        self.lock().live.contains_key(id)
     }
 
     /// Count one authenticated request against `id`. Returns whether the
@@ -79,8 +122,8 @@ impl SessionStore {
     /// reaches zero here is removed, so the *next* call sees it invalid.
     pub(crate) fn touch(&self, id: &str) -> bool {
         let expired = {
-            let mut map = self.lock();
-            let Some(session) = map.get_mut(id) else {
+            let mut sessions = self.lock();
+            let Some(session) = sessions.live.get_mut(id) else {
                 return false;
             };
             match session.armed.as_mut() {
@@ -100,13 +143,13 @@ impl SessionStore {
     /// Arm `id` to expire after `n` further authenticated requests (`n == 0`
     /// drops it right away). Returns whether the session existed.
     pub(crate) fn arm(&self, id: &str, n: u32) -> bool {
-        let mut map = self.lock();
-        if !map.contains_key(id) {
+        let mut sessions = self.lock();
+        if !sessions.live.contains_key(id) {
             return false;
         }
         if n == 0 {
-            map.remove(id);
-        } else if let Some(session) = map.get_mut(id) {
+            sessions.live.remove(id);
+        } else if let Some(session) = sessions.live.get_mut(id) {
             session.armed = Some(n);
         }
         true
@@ -114,7 +157,7 @@ impl SessionStore {
 
     /// Drop `id` (a no-op for an unknown id).
     pub(crate) fn remove(&self, id: &str) {
-        self.lock().remove(id);
+        self.lock().live.remove(id);
     }
 }
 
@@ -414,6 +457,38 @@ mod tests {
             "n=0: deleted after zero further requests"
         );
         assert!(!store.is_valid(&id));
+    }
+
+    #[test]
+    fn session_store_evicts_the_oldest_past_ten_thousand() {
+        let store = SessionStore::new();
+        let first = store.create(1);
+        let second = store.create(1);
+        let mut last = String::new();
+        for _ in 3..=MAX_SESSIONS {
+            last = store.create(1);
+        }
+        // Exactly the cap: everything is still live.
+        assert_eq!(MAX_SESSIONS, 10_000);
+        assert_eq!(store.len(), MAX_SESSIONS);
+        assert!(store.is_valid(&first));
+        // One more evicts the oldest only.
+        let newest = store.create(1);
+        assert_eq!(store.len(), MAX_SESSIONS);
+        assert!(!store.is_valid(&first), "oldest session must be evicted");
+        assert!(store.is_valid(&second));
+        assert!(store.is_valid(&last));
+        assert!(store.is_valid(&newest));
+        // A session removed by hand does not count against the cap, and its
+        // stale slot is skipped when the next eviction comes due.
+        store.remove(&second);
+        assert_eq!(store.len(), MAX_SESSIONS - 1);
+        let filler = store.create(1);
+        assert_eq!(store.len(), MAX_SESSIONS);
+        assert!(store.is_valid(&last) && store.is_valid(&filler));
+        let overflow = store.create(1);
+        assert_eq!(store.len(), MAX_SESSIONS);
+        assert!(store.is_valid(&overflow) && store.is_valid(&newest));
     }
 
     // --- Tester additions (stage 5): bad `n`, n=0, no tab, login edge cases ---
