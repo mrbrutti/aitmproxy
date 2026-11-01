@@ -501,10 +501,10 @@ fn do_flow_list(live: &L4Live) -> Value {
     )
 }
 
-/// `l4.flow.get` — the `window` of one stored L4 flow; packet `bytes` only under
-/// the §2.2 rule (as amended) for this flow's kind and the caller's trust, decided
-/// by the same [`bytes_visible`](crate::commands::flow::bytes_visible) the
-/// command path uses.
+/// `l4.flow.get` — the `window` of one stored L4 flow; each packet's `bytes` only
+/// under the §2.2 rule (as amended) for **that packet** (injected or captured) and
+/// the caller's trust, decided by the same
+/// [`bytes_visible`](crate::commands::flow::bytes_visible) the command path uses.
 fn do_flow_get(
     live: &L4Live,
     id: &str,
@@ -516,13 +516,11 @@ fn do_flow_get(
         .store
         .get(id)
         .ok_or_else(|| HostError::BadArgs(format!("no L4 flow with id {id:?}")))?;
-    let with_bytes = crate::commands::flow::bytes_visible(
-        caller_is_trusted_control,
-        flow.kind,
-        &live.guard.agent_gates(),
-    );
     Ok(crate::commands::flow::flow_to_value(
-        &flow, window, with_bytes,
+        &flow,
+        window,
+        caller_is_trusted_control,
+        &live.guard.agent_gates(),
     ))
 }
 
@@ -1331,8 +1329,9 @@ fn catalog_host_fns() -> Vec<HostFnSig> {
             ],
             returns: "object".to_string(),
             description: "Summarize one stored L4 flow and a window of its packets (read-only); \
-                          packet bytes only for trusted callers or an agent holding the gate \
-                          that could have produced the flow."
+                          each packet's bytes only for trusted callers or an agent holding \
+                          the gate that could have produced that packet (Inject for an \
+                          injected one, Capture for a captured one)."
                 .to_string(),
         },
         HostFnSig {
@@ -1529,9 +1528,9 @@ mod tests {
         packet.clone()
     }
 
-    /// A one-packet flow of `kind` holding `bytes`, inserted into `store`; its id
-    /// string.
-    fn insert_flow(store: &dyn L4FlowStore, kind: L4FlowKind, bytes: &[u8]) -> String {
+    /// A flow of `kind` holding one packet per `(bytes, injected)` element, in
+    /// order, inserted into `store`; its id string.
+    fn insert_flow(store: &dyn L4FlowStore, kind: L4FlowKind, packets: &[(&[u8], bool)]) -> String {
         use crate::flow::{L4Bind, L4Meta, L4Packet};
         let id = store.insert(L4Flow {
             id: L4FlowId::new(),
@@ -1541,32 +1540,71 @@ mod tests {
                 filter: None,
                 queue: None,
             },
-            packets: std::collections::VecDeque::from(vec![L4Packet {
-                dir: L4Direction::Inbound,
-                timestamp: std::time::SystemTime::now(),
-                decoded: PacketSpec::summarize(bytes),
-                bytes: bytes.to_vec(),
-                injected: false,
-            }]),
+            packets: packets
+                .iter()
+                .map(|(bytes, injected)| L4Packet {
+                    dir: L4Direction::Inbound,
+                    timestamp: std::time::SystemTime::now(),
+                    decoded: PacketSpec::summarize(bytes),
+                    bytes: bytes.to_vec(),
+                    injected: *injected,
+                })
+                .collect(),
             metadata: L4Meta::default(),
         });
         crate::commands::flow_id_to_string(id)
     }
 
+    /// Each packet's `bytes` value (or `None`) from a Rhai `l4.flow.get` of `id`
+    /// as `caller`, in window order.
+    fn rhai_flow_get_bytes(
+        live: &L4Live,
+        caller: aitm_core::CallerTrust,
+        id: &str,
+    ) -> Vec<Option<Value>> {
+        let src = NoSource;
+        let ctx = HostCallCtx::new(caller, &src);
+        let got =
+            host_fn(live, "flow.get", &ctx, &[Value::Str(id.to_string())]).expect("flow.get ok");
+        let Value::Object(flow) = got else {
+            panic!("flow.get returns an object, got {got:?}");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array: {flow:?}");
+        };
+        packets
+            .iter()
+            .map(|p| match p {
+                Value::Object(o) => o.get("bytes").cloned(),
+                other => panic!("a packet object, got {other:?}"),
+            })
+            .collect()
+    }
+
     /// L4PAR-AC35 (spec §2.2 as amended) — the Rhai face follows the command
-    /// path's per-kind rule: with only the Inject gate open an agent reads the
-    /// `send_recv` flow's bytes but not the `capture` flow's; with only the
-    /// Capture gate open the reverse; an operator reads both; with every gate
-    /// closed neither.
+    /// path's **per-packet** rule. A `send_recv` flow holds an injected stimulus
+    /// and a captured reply: with only the Inject gate open an agent reads the
+    /// stimulus's bytes and not the reply's; with only the Capture gate open the
+    /// reverse; with every gate closed neither; an operator reads both. A
+    /// `capture` flow's packet follows the Capture gate alone.
     #[test]
-    fn rhai_flow_get_bytes_gate_is_per_flow_kind_spec_2_2_as_amended() {
+    fn rhai_flow_get_bytes_gate_is_per_packet() {
         use aitm_core::CallerTrust;
 
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let cap_bytes = vec![0xde, 0xad];
-        let sr_bytes = vec![0xbe, 0xef, 0x01];
-        let cap_id = insert_flow(store.as_ref(), L4FlowKind::Capture, &cap_bytes);
-        let sr_id = insert_flow(store.as_ref(), L4FlowKind::SendRecv, &sr_bytes);
+        let stimulus = vec![0xbe, 0xef, 0x01];
+        let reply = vec![0xca, 0xfe];
+        let cap_id = insert_flow(
+            store.as_ref(),
+            L4FlowKind::Capture,
+            &[(cap_bytes.as_slice(), false)],
+        );
+        let sr_id = insert_flow(
+            store.as_ref(),
+            L4FlowKind::SendRecv,
+            &[(stimulus.as_slice(), true), (reply.as_slice(), false)],
+        );
         let live = L4Live {
             guard: Arc::new(L4Guard::new(&L4Config::default())),
             backend: Arc::new(PcapBackend::new()),
@@ -1580,40 +1618,45 @@ mod tests {
         let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &cap_id);
         assert_eq!(packet.get("length"), Some(&Value::Int(2)));
         assert!(!packet.contains_key("bytes"), "capture, closed: {packet:?}");
-        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &sr_id);
-        assert_eq!(packet.get("length"), Some(&Value::Int(3)));
-        assert!(
-            !packet.contains_key("bytes"),
-            "send_recv, closed: {packet:?}"
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Agent, &sr_id),
+            vec![None, None],
+            "send_recv, closed"
         );
 
-        // Only Inject open: the send_recv flow's bytes, not the capture's.
+        // Only Inject open: the injected stimulus's bytes; not the captured
+        // reply's, not the capture's.
         gates.set(AgentGate::Inject, true);
-        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &sr_id);
-        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(sr_bytes.clone())));
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Agent, &sr_id),
+            vec![Some(Value::Bytes(stimulus.clone())), None],
+            "the Inject gate reveals the injected packet only"
+        );
         let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &cap_id);
         assert!(
             !packet.contains_key("bytes"),
             "the Inject gate must not reveal a capture's bytes, got {packet:?}"
         );
 
-        // Only Capture open: the reverse.
+        // Only Capture open: the captured reply and the capture; not the stimulus.
         gates.set(AgentGate::Inject, false);
         gates.set(AgentGate::Capture, true);
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Agent, &sr_id),
+            vec![None, Some(Value::Bytes(reply.clone()))],
+            "the Capture gate reveals the captured packet only"
+        );
         let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &cap_id);
         assert_eq!(packet.get("bytes"), Some(&Value::Bytes(cap_bytes.clone())));
-        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &sr_id);
-        assert!(
-            !packet.contains_key("bytes"),
-            "the Capture gate must not reveal a send_recv flow's bytes, got {packet:?}"
-        );
 
-        // Operator, every gate closed: both.
+        // Operator, every gate closed: everything.
         gates.set(AgentGate::Capture, false);
         let packet = rhai_flow_get_packet(&live, CallerTrust::Operator, &cap_id);
         assert_eq!(packet.get("bytes"), Some(&Value::Bytes(cap_bytes)));
-        let packet = rhai_flow_get_packet(&live, CallerTrust::Operator, &sr_id);
-        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(sr_bytes)));
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Operator, &sr_id),
+            vec![Some(Value::Bytes(stimulus)), Some(Value::Bytes(reply))]
+        );
     }
 
     /// The `l4.flow.get` reply's `(offset, packets.len())` for a Rhai call with
