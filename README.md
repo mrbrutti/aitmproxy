@@ -547,7 +547,9 @@ beside `target/debug` and `target/release`; `scripts/package.sh` builds a releas
   started, scripting and PoC references, demos, downloads.
 - [INSTALL.md](INSTALL.md) — install on macOS and Linux, build from source, point
   the app at an external core.
-- [docs/scanner.md](docs/scanner.md) — the automated scanner (`scan.discover`).
+- [docs/scanner.md](docs/scanner.md) — the scanner: scan jobs, the `scan.*`
+  and `check.<id>` verbs, profiles, the `scanner:` config section, issues,
+  and writing a check in Rhai.
 - [`aitmproxy-plugin/README.md`](aitmproxy-plugin/README.md) — the MCP plugin for
   ChatGPT, Claude Desktop / claude.ai and Claude Code.
 - [docs/design/languages/](docs/design/languages) — the canonical Rhai and

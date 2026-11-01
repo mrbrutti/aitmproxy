@@ -1,223 +1,550 @@
-# Automated scanner
+# The scanner
 
-The automated scanner is a **deterministic crawler and injection-point finder**
-built into aitmproxy as the `aitm-plugin-scanner` plugin — the discovery stage of
-a Burp-style scanner. It crawls an in-scope target and discovers **injection
-points** — the places in a request where a value can be tampered with — so an
-operator (human or AI) starts from a concrete map of the attack surface instead
-of a blank page. It does not attack anything: active fuzzing and injection are
-roadmap, not shipped.
+The scanner audits an authorized, in-scope target: it crawls it, enumerates the
+**insertion points** on what it found, runs checks against them, and records
+what it concludes as **issues**. It is a plugin (`aitm-plugin-scanner`), so its
+verbs are reachable from every frontend — MCP, the one-shot CLI, the TUI, the
+web UI and the macOS app — under the same scope, sensitivity and agent-policy
+rules as every other command.
 
-It is **deterministic and AI-free**: the same target and the same configuration
-produce the same crawl and the same injection points, driven only by the shape of
-the traffic, never by a model's judgement or a manifest. That is the point — the
-scanner **augments** an AI operator's own free-form detection; it does not
-replace it. The agent still decides what is interesting and how to exploit it.
-The scanner just makes sure nothing in scope is missed.
+Like everything else in aitmproxy the scanner is deny-by-default and
+scope-bound. Every origin in a profile is checked against the HTTP scope before
+a job is admitted, every L4 target against the L4 inject scope, and every probe
+goes out through the job's own client, which is scope-checked, paced, budgeted
+and bounded.
 
-> **Stage 1 — Discovery.** This documents the shipped first stage: **crawl +
-> injection-point discovery**, exposed as the `scan.discover` command. Discovery
-> is **read-only** — it navigates and enumerates, it never injects or mutates.
-> The **active** stages (fuzz / inject / campaign) are **not built yet** and are
-> on the roadmap, not present features; see
-> [Roadmap: the active stages](#roadmap-the-active-stages).
+## What a scan job is
 
-## Deny-by-default and scope-bound
+`scan.start` **accepts** work; it does not do it. It validates and clamps the
+profile, resolves the lanes, checks scope and the gates, mints a job id
+(`scan-<8 hex>`), hands the job to a worker and returns — normally with
+`state: queued`. Everything after that is read back from the job:
 
-Like every action in aitmproxy, the scanner is **deny-by-default and strictly
-scope-bound**. It will only touch hosts you have explicitly put in scope:
+- **`scan.status { job }`** is the truth: state, phase, elapsed, probe, crawl,
+  point, check and issue counters, the lane report, the clamps, the session
+  status and the stopped reason.
+- **`notifications/aitm/job`** is a **trigger, not the truth**. A subscribed
+  client gets one line per `started`, `phase`, `progress`, `issue`, `finished`,
+  `cancelled` or `failed` event, carrying `job`, `kind` (`"scan"`), `event`,
+  `seq` (strictly increasing within the job), `ts_ms`, a `JobSummary` and, on an
+  `issue` line, an `IssueSummary`. `progress` lines are coalesced to at most
+  **4 per second per job**, so a gap in `seq` is normal and a UI that
+  reconstructs job state from the lines alone will be wrong. Refresh from
+  `scan.status` and `scan.issues` when a line arrives.
+- **`scan.cancel { job }`** asks a job to stop. It is idempotent, it returns the
+  status (`cancelling`, then `cancelled`), and the issues the job already raised
+  are kept.
 
-- The target host is checked against the scope/rate guard (`check_active`)
-  **before any navigation**. An out-of-scope target fails immediately with
-  `GuardError::OutOfScope` — nothing is fetched.
-- Every page the crawl reaches is gated the same way; a link to an out-of-scope
-  or cross-origin host is skipped, not followed.
-- The crawl runs through the proxy's **scope-confined egress gate**: the
-  browser-facing listener refuses an out-of-scope *public* host rather than
-  relaying it (`confine_egress_to_scope`), so a redirect or sub-resource cannot
-  pull the crawl off-scope. This is the chokepoint that confines the whole crawl,
-  on top of the per-navigation guard checks above.
-- The crawl is **same-origin and in-scope only**, bounded by depth, page, and
-  time caps (below).
-- `scan.discover` is a `Write`-sensitivity command: it is bound by the agent
-  policy when an agent runs it (it runs under `all`, `auto` and `ask`; it is
-  refused under `readonly` and `paused`), and always by scope, rate and SSRF
-  checks.
+A job's lifecycle states are `queued`, `running`, `cancelling`, `done`,
+`cancelled`, `failed`; its phases are `queued`, `crawling`, `passive`,
+`auditing`, `reporting`, `done`. When a job ends early, `stopped_reason` is one
+of `budget`, `time`, `cancelled`, `session_lost`, `errors`, `policy`,
+`guard_refused`, `failed`.
 
-Discovered examples are **scrubbed of secrets**: credential-bearing values
-(`Authorization`, `Cookie` values, and parameters whose names look like session
-or auth material) are returned as `<redacted>`, never echoed in the result.
+Refusals are uniform: every `scan.*` verb fails with the string
+`scan: <code>: <message>`, where `<code>` is one of nine tokens — `not_found`,
+`busy`, `out_of_scope`, `refused_agent`, `refused_l4`, `lane_unavailable`,
+`invalid_profile`, `unknown_check`, `confirm_required`. Match on the code, never
+on the prose. Clamping and cancellation are not errors and have no code, and
+`confirm_required` is reserved for a frontend: the engine itself answers a
+missing confirmation through the bus `_confirm` handshake below.
 
-## Running it
+### What runs today
 
-`scan.discover` is a plugin command, so — like every command in aitmproxy — it is
-registered once and reachable from MCP, the one-shot CLI and the UIs, with the
-same scope and sensitivity rules. It is **operator-run and agent-taskable**.
+Every lane crate (`aitm-scan-http`, `aitm-scan-ws`, `aitm-scan-l4-packet`,
+`aitm-scan-l4-stream`) is still a skeleton that contributes no lane, and the
+native check slot (`aitm-scan-checks-http`) is still empty. The engine therefore
+falls back to the **interim HTTP lane** built into the scanner plugin, and a
+profile that asks for `ws`, `l4_packet` or `l4_stream` is not refused: those
+lanes are reported in `lanes.skipped` with the reason "lane not available on
+this build", and the job runs the lanes it has. The interim lane carries five
+checks — two active (`reflected-xss`, `open-redirect`) and three passive
+(`reflection`, `security-header`, `cookie-flag`) — and derives query and body
+points from captured requests.
 
-A real crawl needs a **running proxy with its embedded browser**: the bare `aitm`
-server (the MCP server), `aitm web` and `aitm tui` each launch the configured
-engine (obscura by default; see [INSTALL.md](../INSTALL.md) if it is not found)
-and register `scan.discover`. Drive it through one of those, not the one-shot CLI.
+Its crawl drives the **embedded browser**, so a real crawl needs a running core
+that has one. With no browser, with `crawl.use_browser: never`, or with
+`crawl.max_pages: 0`, the lane degrades rather than failing: it maps and audits
+what the proxy has already captured for the origin.
 
-### MCP
+## The verbs
 
-Call the `scan.discover` tool with the same parameters (`target`, and optionally
-`max_depth` and `max_pages`) from any connected agent or MCP client. It is both
-**agent-taskable** (an agent can run a discovery pass on its own) and
-**operator-driven**.
+| Verb | Tier | Parameters | Result | Refusal codes |
+|---|---|---|---|---|
+| `scan.start` | Sensitive | `profile?`, `profile_name?`, `target?`, `overrides?` | `StartResult`: `job`, `status`, `clamped`, `lanes`, `dry_run?` | `invalid_profile`, `not_found`, `unknown_check`, `lane_unavailable`, `out_of_scope`, `refused_l4`, `refused_agent`, `busy` |
+| `scan.map` | Write | the same four | `StartResult` | the same, minus `refused_l4` |
+| `scan.status` | Read | `job` | `JobStatus` | `not_found` |
+| `scan.list` | Read | `active_only?` (false), `limit?` (`scanner.history`) | `{ jobs: [JobSummary] }` | — |
+| `scan.cancel` | Write | `job` | `JobStatus` | `not_found` |
+| `scan.issues` | Read | `job?`, `target?`, `severity_min?`, `confidence_min?`, `class?`, `lane?`, `status?`, `since?`, `limit?` (100, max 1024), `cursor?` | `{ issues, next_cursor, by_severity }` | `invalid_profile`, `not_found` |
+| `scan.issue` | Read | `id` | `Issue` | `not_found` |
+| `scan.issue.update` | Write | `id`, `status`, `note?` | `Issue` | `not_found`, `invalid_profile` |
+| `scan.sitemap` | Read | `job?` or `target?`, `cursor?`, `limit?` (1024, max 4096) | `{ nodes, points, next_cursor }` | `invalid_profile`, `not_found` |
+| `scan.checks` | Read | `lane?`, `class?`, `origin?` | `{ checks: [CheckMeta] }` | `invalid_profile` |
+| `scan.profile.list` | Read | — | `{ profiles: [{ name, builtin, summary }] }` | — |
+| `scan.profile.get` | Read | `name` | `ScanProfile` | `not_found`, `invalid_profile` |
+| `scan.profile.save` | Write | `profile` | `{ saved, path }` | `invalid_profile` |
+| `scan.profile.delete` | Write | `name` | `{ deleted }` | `invalid_profile` |
+| `scan.session.preview` | Read | `target` | `SessionProfile` (names only) | `invalid_profile` |
+| `check.<id>` | Sensitive | `url`, `param`, `value?` (`1`) | `Verdict` | `invalid_profile`, `out_of_scope` |
+| `scan.discover` *(deprecated)* | Write | `target`, `max_depth?`, `max_pages?` | the Stage-1 discovery shape | the `scan.map` set, `busy` rephrased |
+| `scan.passive` | Read | `target?` | `{ findings: [...] }` | — |
+| `scan.report` | Read | `target?` | `{ report_md, index, issues_md }` | — |
 
-### CLI (one-shot, no crawl)
+Exactly one of `profile` (a complete profile inline), `profile_name` (a
+built-in, configured or saved profile) and `target` (one origin, scanned with
+`scanner.default_profile`) selects what a start-shaped verb runs; `overrides` is
+a partial profile merged over it key by key, and a mistyped override key is an
+`invalid_profile` naming the key rather than a line that silently does nothing.
 
-```bash
-aitm scan discover --target https://example.test/
-# optionally narrow the crawl:
-aitm scan discover --target https://example.test/ --max_depth 2 --max_pages 50
+`scan.map` is `scan.start` with `lanes: [http]` and `intensity: passive` forced:
+it crawls, runs the passive checks and enumerates insertion points, and sends no
+probe. Read its result with `scan.sitemap` and `scan.issues`.
+
+`scan.discover` is **deprecated**. It is now a `scan.map` job plus a bounded
+wait, kept so an older UI keeps working; the wait is bounded by the configured
+scan time budget, after which the job is cancelled and the result reports
+`stopped_reason = "time_budget"`. Use `scan.map` and poll `scan.status`.
+
+## Profiles
+
+A profile is the one knob an operator turns. It is operator-authored YAML:
+every field has a default, so a profile names only what it changes, and an
+unknown key is an error rather than a silently ignored line.
+
+### The built-ins
+
+Seven profiles ship with aitmproxy. Their names are reserved —
+`scan.profile.save` and `scan.profile.delete` refuse them.
+
+| Name | What it changes from the defaults |
+|---|---|
+| `passive-only` | `intensity: passive`, `crawl.max_pages: 0`, `crawl.use_browser: never` — passive checks over already-captured in-scope flows, no crawl, no probe |
+| `map-only` | `intensity: passive` — crawl and passive checks, no probe |
+| `light-http` | `intensity: light`, `speed: fast` |
+| `standard` | `lanes: [http, ws]` (the default `scanner.default_profile`) |
+| `thorough` | `lanes: [http, ws]`, `speed: thorough`, `accuracy: fewer_false_negatives`, `crawl.strategy: thorough` |
+| `l4-stream-safe` | `lanes: [l4_stream]`, `l4.cases: 200` |
+| `l4-full` | `lanes: [l4_packet, l4_stream]`, `l4.cases: 500` |
+
+Every built-in carries an empty `target`: `scan.start` fills it from the
+caller's origin or L4 endpoint.
+
+### The YAML
+
+Below is the whole tree with every default. A profile needs a `name`, at least
+one lane, and at least one origin or L4 target; `budget.probes`, `budget.time_s`
+and `budget.check_timeout_s` must each be at least 1; an `audit.ignore` rule
+that sets no key is refused, because it would ignore every point.
+
+```yaml
+name: my-api                  # required, non-empty
+target:                       # at least one origin or one l4 entry
+  origins: []                 # "http(s)://host[:port]", checked against the HTTP scope
+  l4: []                      # - { ip: "10.0.0.5", port: 9000, proto: tcp, grammar: null }
+lanes: [http]                 # http | ws | l4_packet | l4_stream
+intensity: medium             # passive | light | medium | intrusive
+speed: normal                 # fast | normal | thorough
+accuracy: normal              # fewer_false_negatives | normal | fewer_false_positives
+checks:
+  include: []                 # empty = every check the intensity and lanes allow
+  exclude: []                 # applied after include
+crawl:
+  strategy: normal            # fast | normal | thorough
+  max_depth: 3
+  max_pages: 200              # 0 disables crawling
+  submit_forms: true
+  click_handlers: true
+  robots: true
+  sitemap: true
+  use_browser: auto           # auto | always | never
+audit:
+  kinds:                      # the default is every insertion kind, in this order
+    [query, body_param, json_value, xml_value, xml_attr, multipart_value,
+     multipart_filename, header, cookie, path_segment, path_filename,
+     param_name_query, param_name_body, entire_body, ws_json_value, ws_text,
+     ws_form_param, ws_binary, ws_handshake_header, l4_field]
+  ignore:
+    - trait: session          # the default rule; write `ignore: []` to audit session points
+  max_points_per_request: 64
+  frequent_point_threshold: 8
+session:
+  mode: observed              # observed | none
+  from_flow: null             # a captured flow id to lift the session from
+  on_lost: stop               # stop | continue
+budget:
+  probes: 2000
+  time_s: 600
+  max_issues: 1024
+  check_timeout_s: 60
+  per_host_errors:
+    consecutive: 10           # consecutive errors from one host trip the breaker
+    ratio: 0.5                # or this error-to-probe ratio
+http:
+  version: auto               # auto | h1 | h2 | h2c
+  record_probes: issues_only  # issues_only | all
+ws:
+  reply_window_ms: 1500
+  max_frame_bytes: 1048576
+l4:
+  cases: 500
+  reproduce_count: 3
+  liveness_every: 25
+  consecutive_timeouts: 20
+  max_bytes_per_s: 65536
+  seeds: []                   # - { hex: "0001" } | { base64: "AAE=" } | { flow: <flow id> }
+  fields: []                  # empty = the lane's own default table
+  dry_run: false              # build and report every case, send nothing
 ```
 
-The `aitm <family> <verb>` form is a **one-shot, in-process** dispatch: it builds a
-fresh core with an empty flow store and **no browser**, runs this one command and
-exits. It never connects to a proxy you have running, so it cannot crawl and
-cannot see that proxy's flows. Against a target whose host is in scope it returns
-no endpoints, `pages_crawled: 0` and `stopped_reason: "no_browser"` (the
-store-only fallback has nothing to list); against any other host it fails with an
-out-of-scope error before fetching anything. The one-shot process takes its scope
-from `scope.entries` in `config.yaml`; an `aitm scope add` run in a separate
-process neither persists nor reaches the running proxy. Treat the CLI form as a
-way to check argument parsing and scope, and use MCP or a UI for actual scans.
+A `checks.include`/`exclude` entry is a check id, a check class, or
+`lane:<lane>`. An entry that names nothing the catalogue holds is refused with
+`unknown_check`, quoting the entry.
 
-### UIs
+### Where profiles come from
 
-All three operator UIs — the **web UI**, the **TUI**, and the **macOS app** —
-have a **Scan** view that launches `scan.discover` against an in-scope target and
-renders the result: the discovered endpoints and injection points. The
-injection-point rows **link back to the flow** they were found in, and an endpoint
-row links to the newest captured flow that served it (`endpoint_flows`), so an
-operator can jump straight from a discovered point to the captured request
-behind it. In the web UI the Scan item appears in the sidebar only when the
-connected core offers the `scan.discover` tool; in the TUI, `r` launches a scan
-from the Scan view.
+`scan.profile.get` and `scan.start { profile_name }` look in three places, in
+this order: a profile saved under `<findings.dir>/scan/profiles/<name>.yaml`,
+then the `scanner.profiles:` config section, then the built-ins. A saved profile
+shadows a configured one, which shadows a built-in. `scan.profile.list` returns
+all of them with `builtin: true|false`.
 
-### One discovery at a time
+`scan.profile.save` writes human-readable YAML to
+`<findings.dir>/scan/profiles/<name>.yaml`. The name must not be a built-in's,
+must be lowercase letters, digits, `.`, `_` or `-`, must start with a letter or
+digit, and the profile must validate; with no findings directory configured
+there is nowhere to save and the call is refused with `invalid_profile`.
 
-All crawls share the one embedded-browser page, so two at once would interleave
-their navigations and each would harvest the other's pages. A `scan.discover`
-started while another is still running is therefore **refused immediately** with
-`scan.discover is already running; wait for it to finish before starting
-another …` — it never touches the browser. The running scan gives the slot back
-however it ends, and the next one then runs normally; scans run back to back
-need no reset in between.
+### Clamping
 
-A scan is **not cancelled when its client goes away**. If you disconnect the MCP
-client or close the panel, the crawl keeps running and keeps the slot until it
-finishes or hits its time budget (default **10 minutes**), so you can be refused
-by your own earlier scan. Wait for it to end rather than retrying.
+A profile is the operator's dial; a **ceiling** is the administrator's wall. A
+profile figure above its ceiling is **clamped, not refused**: the job runs,
+bounded, and every cut is reported in `scan.start`'s `clamped` list as
+`{ field, requested, applied }` and kept on `JobStatus.clamped`. The clamped
+fields are `budget.probes`, `budget.time_s`, `budget.max_issues`,
+`budget.check_timeout_s`, `l4.cases`, `l4.max_bytes_per_s` and
+`ws.max_frame_bytes`. `budget.check_timeout_s` is clamped by the lower of
+`scanner.check_timeout_s` and `scanner.ceilings.time_s`: one check may never
+outlast the whole job.
 
-## Inputs
+## The `scanner:` config section
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `target` | string | yes | The seed URL to crawl (`scheme://host[:port]/path`). Its host must be in scope. |
-| `max_depth` | int | no | Crawl depth limit. Clamped to the configured cap (default **3**) — it can only lower the cap, never raise it. |
-| `max_pages` | int | no | Maximum pages to crawl. Clamped to the configured cap (default **200**). |
+The scanner's own section of `config.yaml`. An absent section, `scanner: {}`
+and `scanner: ~` all mean the defaults below; a misspelled key is an error
+naming the key.
 
-The remaining limit is a crawl time budget (default **10 minutes**). These
-defaults are built in: there is no `config.yaml` key for them, and `max_depth` /
-`max_pages` overrides are always clamped **down** to the caps — a caller can
-tighten a scan but never exceed them.
-
-## Output
-
-`scan.discover` returns a structured object:
-
-| Key | Type | Description |
+| Key | Default | What it does |
 |---|---|---|
-| `endpoints` | array of strings | The in-scope URLs the crawl reached. A link that redirects within the origin contributes both the URL the crawl requested and the page it landed on. |
-| `injection_points` | array of objects | The discovered injection points (below). Repeated scans of the same site do not accumulate: a point is unique per `(endpoint URL, location, name)` and carries the newest captured flow that showed it. |
-| `endpoint_flows` | object (URL to flow id) | Maps each endpoint URL (as in `endpoints`) to the id of the newest captured flow that served it. An endpoint with no capture is absent. |
-| `pages_crawled` | int | Number of pages successfully navigated. |
-| `stopped_reason` | string or null | Why the crawl stopped early: `"max_pages"`, `"max_depth"`, `"time_budget"`, `"left_scope"` (a navigation landed off-origin or out of scope, such as a redirect, and the crawl aborted there), `"navigation_failed"` (every navigation failed), `"guard_refused"` (the guard refused every link), or `"no_browser"` (no browser engine attached; see below). `null` if the reachable graph was exhausted. |
+| `allow_agent_active` | `false` | Let an agent (MCP) frontend start an active scan. |
+| `allow_agent_l4_fuzz` | `false` | Let an agent start a job whose profile runs an L4 fuzz lane. Independent of `allow_agent_active`. |
+| `max_jobs` | `2` | How many scan jobs may run at once; a further `scan.start` is `busy`. |
+| `history` | `50` | How many finished jobs the registry keeps, and `scan.list`'s default `limit`. |
+| `check_timeout_s` | `60` | Per-check wall-clock ceiling, in seconds. |
+| `default_profile` | `"standard"` | The profile `scan.start { target }` resolves. |
+| `profiles` | `{}` | Profiles declared in the config file, by name. |
+| `ceilings.probes` | `20000` | Maximum stimuli (probes, crawl requests, L4 cases) one job may send. |
+| `ceilings.time_s` | `7200` | Wall-clock ceiling for one job, in seconds. |
+| `ceilings.l4_cases` | `5000` | Maximum L4 fuzz cases one job may send. |
+| `ceilings.l4_bytes_per_s` | `1048576` | Maximum L4 send rate, in bytes per second. |
+| `ceilings.ws_frame_bytes` | `4194304` | Maximum WebSocket frame payload one job may send, in bytes. |
+| `ceilings.max_issues` | `4096` | Maximum issues one job may record. |
 
-Each array is capped at 1024 entries.
+Every ceiling key is independent: raising one leaves the other five alone.
 
-Each entry in `injection_points` is an object:
+```yaml
+scanner:
+  allow_agent_active: false
+  max_jobs: 2
+  default_profile: standard
+  ceilings:
+    probes: 20000
+    time_s: 7200
+  profiles:
+    my-api:
+      name: my-api
+      lanes: [http]
+      target:
+        origins: ["https://app.example"]
+```
 
-| Field | Type | Description |
-|---|---|---|
-| `flow` | string | The id of the captured flow the point was found in. |
-| `location` | string | Where in the request the value sits — one of `query`, `body_param`, `header`, `cookie`, `path_segment`, `redirect`. |
-| `name` | string | The parameter / header / cookie / segment name. |
-| `example` | string | An example value observed for it — `<redacted>` when the value is credential or session material. |
+Two values the scanner uses are **not** keys of this section: the state
+directory is `findings.dir`, copied in by the binary, and the agent L4 injection
+gate is `l4.allow_agent_inject`, read from the `l4:` section.
 
-### How injection points are found
+## Gates: operator versus agent
 
-Injection points come from the **shape of the captured request**, not from a
-template or manifest. For each in-scope flow the crawl produced, the enumerator
-reads the request and yields a point for each:
+`scan.start` is **`Sensitive`** whatever its profile does. The job's gate is
+taken once, at start, and the catalogue then runs every check — script checks
+included — without a per-call policy decision, so a profile that would only read
+is still started by a `Sensitive` verb. `check.<id>` is `Sensitive` for the same
+reason. `scan.map` and `scan.cancel` are `Write`; the read verbs are `Read`.
 
-- **`query`** — each URL query-string parameter (percent-decoded).
-- **`body_param`** — each form-encoded body parameter, and each top-level JSON
-  object key in a JSON body.
-- **`header`** — each request header other than `Cookie` and `Host` (a header whose
-  name reads as a secret, such as `Authorization`, carries `<redacted>`).
-- **`cookie`** — each request cookie (value always redacted).
-- **`path_segment`** — numeric path segments (likely identifiers), e.g. the `42`
-  in `/users/42/profile`.
-- **`redirect`** — a query or body parameter whose value is itself a URL
-  (starts with `http://`, `https://` or `//`; an open-redirect candidate).
+An **operator** (the CLI, or an operator-token bus connection) may start any
+profile. An **agent** (an MCP connection) is gated:
 
-Because discovery is driven purely by the request, it finds the same points a
-human would read off the traffic, every time.
+- Under `agent.policy: auto` an agent cannot start a scan at all — the refusal
+  is `refused_agent`, "the agent policy is `auto`; an operator can
+  switch to `all` with agent.set". A **`scan.map` job is exempt**
+  from everything below it, but not from the policy itself.
+- An active scan needs `scanner.allow_agent_active: true`, else
+  `refused_agent`, "an agent needs `scanner.allow_agent_active` to
+  start an active scan".
+- **`intensity: intrusive` is operator-only**: `refused_agent`,
+  "`intensity: intrusive` is operator-only".
+- An L4 lane needs `scanner.allow_agent_l4_fuzz: true` **and**
+  `l4.allow_agent_inject: true` — both, because packet and stream fuzzing is
+  the most invasive thing the scanner does.
 
-## Example
+An L4 lane also needs the L4 layer itself: with `l4.enabled: false` (the
+default) any L4 profile is `scan: refused_l4: the l4 layer is disabled`,
+whoever asks. Beyond that, **the stream lane needs an L4 scope entry with
+`interface: "*"`, `direction: outbound`, the target CIDR and port range, and the
+`Inject` capability**; every `target.l4` entry is checked against it before the
+job is admitted, and one that does not match is
+`scan: out_of_scope: <ip>:<port> is not in the l4 inject scope: ...`.
 
-```jsonc
-// scan.discover { "target": "https://example.test/" }
-{
-  "endpoints": [
-    "https://example.test/",
-    "https://example.test/search",
-    "https://example.test/account/",
-    "https://example.test/redirect"
-  ],
-  "endpoint_flows": { "https://example.test/": "…", "https://example.test/search": "…" },
-  "injection_points": [
-    { "flow": "…", "location": "query",    "name": "q",       "example": "test" },
-    { "flow": "…", "location": "cookie",   "name": "session", "example": "<redacted>" },
-    { "flow": "…", "location": "redirect", "name": "next",    "example": "https://example.test/home" }
-  ],
-  "pages_crawled": 4,
-  "stopped_reason": null
+```yaml
+l4:
+  enabled: true
+  allow_agent_inject: false     # leave false unless an agent must fuzz
+  scope:
+    - cidr: { addr: 10.0.0.5, prefix: 32 }
+      ports: { lo: 9000, hi: 9000 }
+      interface: "*"
+      direction: outbound
+      capability: inject
+```
+
+Finally, a job that runs an L4 lane or `intensity: intrusive` asks a human
+frontend to confirm first: *"This scan sends malformed traffic to &lt;targets&gt;
+and may disrupt the target. Continue?"* An operator connection answers it with
+the bus `_confirm` handshake; an agent is never offered the handshake and stays
+governed by the config gates above.
+
+Two more confinements are always on, whoever starts the job: the target origins
+are checked against the HTTP scope before anything is sent, and only one scan
+runs against a given origin at a time (a second is `busy`).
+
+## What a scan records
+
+`http.record_probes` decides what reaches the flow store:
+
+- **`issues_only`** (the default) — probes are sent with `record: Never`, so a
+  scan cannot evict an operator's real captures. A lane's crawl captures are
+  still recorded, and when a check concludes `vulnerable` the engine re-records
+  the probe flows it held in memory for that issue.
+- **`all`** — every probe is recorded.
+
+Recorded scan flows carry marks, so they can be filtered back out of the capture
+list: `scan:<job>` on every flow the job produced, `crawl` on a lane's crawl
+captures, and `issue:<id>` on the flows re-recorded as an issue's evidence.
+
+## Issues
+
+An issue is one weakness at one place. It carries a **class** (`sqli`,
+`reflected-xss`, ...), a **severity** (`info`, `low`, `medium`, `high`,
+`critical`) and a **confidence** (`tentative`, `firm`, `certain`, never above
+the check's declared `confidence_max`), the evidence that produced it (payload,
+a bounded scrubbed excerpt of what matched, timing correlation, response diff,
+the probe flows and the baseline flow), and its triage **status**: `open`,
+`confirmed` or `false_positive`, set with `scan.issue.update` and persisted.
+
+**Dedupe.** One weakness at one place is one issue however many checks report
+it: the dedupe key is a blake3 digest of the **class plus the location**, and
+the check id is deliberately not part of it, so a second check finding the same
+thing raises the occurrence count of the existing issue and keeps the
+higher-confidence evidence. The location is the origin, method, path template,
+insertion kind, parameter name and field path for an HTTP or WebSocket issue;
+just the origin for a passive issue (which lists the paths it saw in
+`evidence.matched` instead of splitting into one issue per path); and the
+target, transport, grammar field and mutation class for an L4 issue.
+
+**On disk.** With `findings.dir` configured the scanner writes
+`<findings.dir>/scan/jobs/<job>.json` (reloaded into `scan.list` at startup),
+`<findings.dir>/scan/issues/<id>.json` with a `key -> id` `index.json` beside
+them, `<findings.dir>/scan/profiles/<name>.yaml`, and reproduction PoCs under
+`<findings.dir>/scan/pocs/`. With no findings directory everything is in memory
+only and nothing is written.
+
+### Issue classes
+
+The class vocabulary is pinned. A UI may key off these tokens:
+
+| Class | Lane |
+|---|---|
+| `reflected-xss`, `stored-xss` | http |
+| `sqli`, `nosqli`, `ldapi`, `ssti`, `cmdi` | http |
+| `path-traversal`, `crlf`, `xxe`, `ssrf`, `open-redirect` | http |
+| `cors`, `missing-security-headers`, `risky-http-methods` | http |
+| `exposed-path` (one issue per path) | http |
+| `information-disclosure` (generic leaks only) | http |
+| `h2-settings`, `h2-pseudo-header`, `h2-header-crlf`, `h2-smuggling-indicator`, `h2-rapid-reset` | http |
+| `ws-cswsh`, `ws-auth-bypass`, `ws-injection` | ws |
+| `l4-parser-fault`, `l4-crash` | l4_stream, l4_packet |
+
+The **technique** a check used (`reflected`, `error`, `boolean`, `timing`,
+`handshake`, `malformed`, `observe`, `passive`) is never part of the class, and
+the dedupe key hashes class + location — so a timing-based and an error-based
+SQL injection at one parameter are one `sqli` issue, while `exposed-path` at
+`/.git/` and at `/.env` are two.
+
+The interim HTTP lane additionally emits `reflection`, `security-header` and
+`cookie-flag`. These three are **interim, removed with T2's integration** — do
+not pin them in a UI.
+
+## Writing a check in Rhai
+
+A script registers a check from its `load(reg)` hook. The check then sits in the
+same catalogue as a compiled-in one: `scan.checks` lists it, a profile selects
+it by id, class or lane, the scheduler runs it inside jobs, and it gets its own
+manual `check.<id>` command.
+
+```rhai
+fn load(reg) {
+    reg.add_check(#{
+        id: "demo.sleep-sqli",
+        name: "Time-based SQL injection",
+        class: "sqli",
+        lanes: ["http"],
+        kinds: ["query", "body_param"],
+        intensity: "medium",
+        cost: "medium",
+        technique: "timing",
+        severity: "high",
+        confidence_max: "firm",
+        description: "Asks the database to wait and checks whether it did.",
+        remediation: "Use parameterised queries.",
+        cwe: 89,
+    }, |point| {
+        let requested = [1, 3];
+        let observed = [];
+        for seconds in requested {
+            if probe.budget_left() < 1 { return "out of budget"; }
+            let r = probe.send("1' AND SLEEP(" + seconds + ")-- ");
+            observed.push(r.elapsed_ms);
+        }
+        let fit = probe.timing_fit(#{ requested_s: requested, observed_ms: observed });
+        if !fit.correlated { return #{ outcome: "clean", confidence: "firm" }; }
+        #{
+            outcome: "vulnerable",
+            confidence: "firm",
+            detail: "Response time tracks the requested delay (slope " + fit.slope + ").",
+            evidence: #{ payload: "1' AND SLEEP(3)-- ", matched: "delay honoured" },
+            poc_hint: #{ matchers: [#{ type: "status", status: 200 }] },
+        }
+    });
 }
 ```
 
-## How it crawls
+**The meta map.** Its keys are exactly `CheckMeta`'s wire names. Required:
+`id`, `name`, `class`, `lanes`, `kinds`, `intensity`, `cost`, `technique`,
+`severity`, `confidence_max`, `description`. Optional: `remediation`, `cwe`,
+`needs_baseline` (false), `wants_traits` (null — when set, the check is
+scheduled only on points carrying one of those traits, and the restriction is
+ignored at `speed: thorough`), `targets_session` (false), `scope` (`point`, or
+`node` to run once per site-map node, or `origin` to run once per origin). A
+script may **not** declare `origin`: aitm records where the script came from
+(`native`, `bundled` or `custom`). A missing or mistyped meta key is a **load
+error naming the key**, not a default — the catalogue cannot schedule what it
+cannot classify. An id a script already registered is a load error naming the
+source that holds it; an id that clashes across sources (lane checks, then the
+native checks, then bundled scripts, then custom scripts) is resolved in favour
+of the **first** claim, and the clash is logged and reported by
+`scan.checks`' catalogue at load.
 
-The crawl is a bounded breadth-first walk driven over aitmproxy's embedded
-[obscura browser](../README.md#embedded-browser): it navigates the seed,
-harvests same-origin in-scope links (tag-aware — only `<a>`/`<area>` `href` and
-`<form>` `action`, never script or comment bodies), and enqueues them under the
-depth / page / time caps. The browser proxies through aitmproxy, so each
-navigation produces captured flows that the enumerator then reads. When no
-browser engine is attached (obscura not found, or a one-shot CLI call), discovery
-does not navigate: it lists the distinct same-origin, in-scope request URLs
-already in the flow store (up to `max_pages`) and enumerates their injection
-points, reporting `stopped_reason: "no_browser"` and `pages_crawled: 0`. That
-store-only run still honours scope and rate state.
+**The point map.** The closure receives `#{ kind, name, path, url, method,
+example, traits }`. `path`, `url`, `method` and `example` are `()` when the lane
+has none; `traits` is an array of trait tokens (`url`, `filename`, `number`,
+`email`, `base64`, `json`, `id`, `session`).
 
-## Roadmap: the active stages
+**The verdict.** Return one of three things:
 
-Discovery (`scan.discover`) is the **only** scanner command that exists today.
-The **active** stages are designed but **not built yet** — they are on the
-roadmap, not present features. Do not expect these commands on a current build:
+- a **map** with `outcome` (required: `vulnerable`, `clean`, `inconclusive` or
+  `error`), `confidence` (default `tentative`), `detail`, `evidence`
+  (`#{ payload, matched }`; `matched` is bounded to 256 bytes by the model),
+  `poc_hint` and `location`;
+- a **plain string**, read as `inconclusive` with that string as the detail;
+- an **array of verdict maps**: the first is the root verdict and the rest are
+  its siblings, each becoming its own issue. A verdict's optional
+  `location: #{ path, name }` overrides the issue location, which is how an
+  origin-scoped check reports one `exposed-path` issue per path. Siblings nest
+  one level only.
 
-- **`scan.inject`** *(planned)* — send payloads to the discovered injection
-  points.
-- **`scan.run`** *(planned)* — run a bounded, scope-confined scan campaign over a
-  target.
-- **`scan.report`** *(planned)* — turn confirmed hits into reproducible PoCs and
-  recorded findings via the
-  [PoC engine](../README.md#scripting-and-reproducible-pocs).
+An unknown key in a verdict map, or a closure that throws, produces an `error`
+verdict naming the problem: a check never fails the job.
 
-Until those land, treat `scan.discover` as a **read-only reconnaissance** step:
-it tells you *where* to look; injection, confirmation, and reporting stay with
-the operator and the existing flow, scripting, and PoC tooling.
+`poc_hint` is `#{ matchers: [...], control: #{ payload, matchers: [...] } }`.
+`matchers` is a list in the PoC-YAML vocabulary (`type: status | word | regex |
+dsl`, plus `all`/`any`/`not`); a list is an implicit `all`. The optional
+`control` is a benign payload whose response must *not* look vulnerable. When a
+`vulnerable` verdict of confidence `firm` or better carries a hint, the engine
+reproduces the issue, runs the control, and links the resulting PoC and finding
+to the issue.
+
+**The `probe.*` functions.** They belong inside a check closure; the five that
+reach the job's host refuse anywhere else with *"probe.&lt;name&gt; is only
+available inside a check closure (reg.add_check); use http.send in a command"*.
+Every probe is spent from the job's budget, paced, scope-checked, marked and
+recorded under the job's record policy, and each is bounded by the smaller of
+the remaining check time and 30 seconds.
+
+| Function | Rule |
+|---|---|
+| `probe.send(payload)` | Place a payload at the point. A string replaces the observed value; `#{ value, mode }` with `mode` of `replace` (default), `prefix` or `suffix` chooses how it combines. Returns `#{ status, headers, body, elapsed_ms, flow_id }`. |
+| `probe.baseline()` | The point's unpayloaded response, cached per point, to diff against. |
+| `probe.raw(#{ method, url, headers, body })` | A request the check builds itself, for a handshake or header case a payload-at-a-point cannot express. Same origin, same budget. `method` must be an HTTP token (letters, digits and ``!#$%&'*+-.^_`\|~``, at most 32 bytes); default `GET`. |
+| `probe.marker()` | The job's collision-resistant marker token, for a reflection canary or callback label. |
+| `probe.budget_left()` | Probes still affordable for this point; zero means send nothing more. |
+| `probe.timing_fit(#{ requested_s, observed_ms })` | Fit observed times against the delays asked for; returns `#{ correlated, slope, r }`. The two arrays must be the same length. |
+| `probe.levenshtein_ratio(a, b)` | How alike two strings are, `1.0` identical and `0.0` nothing in common, for boolean-blind comparisons. Each input is truncated to 32 KiB. |
+
+Response **header names are lower-case** — index `r.headers["content-type"]`,
+not `r.headers["Content-Type"]` — `body` is lossy UTF-8, and `status` and
+`flow_id` are `()` when the lane had none (an L4 probe has no status; an
+unrecorded probe has no flow). There is **no `sleep`**: measure with
+`elapsed_ms` and conclude with `probe.timing_fit`. A closure's own `http.send`
+runs through the job's client too, so it is budgeted and marked exactly like a
+probe.
+
+## Session reuse
+
+Rather than ask for credentials, a job with `session.mode: observed` (the
+default) lifts a session from traffic the proxy already captured: the newest
+in-scope **captured** (never replayed) flow to the origin that carries a
+`Cookie` header or a secret-named header. `session.from_flow` names a specific
+flow instead.
+
+The **values** live in the worker's memory and nowhere else. No verb, push line,
+issue, PoC or log carries a session value — `scan.session.preview { target }`
+returns the cookie and header **names** only, the flow they came from, and the
+canary that would be used, and an origin with nothing observed comes back empty
+with `canary: none`, which is also how "auth-lost detection is off" reads.
+
+While the job runs, a body-less `GET`/`HEAD` canary — the chosen flow itself if
+it is one, else the newest `GET`/`HEAD` flow carrying the same material — is
+replayed **every 25 probes**. A `2xx` that turns into a redirect, a `401` or a
+`403` means the session is gone. Under `session.on_lost: stop` (the default) the
+job ends with `stopped_reason: session_lost`; under `continue` it keeps going
+unauthenticated.
+
+## Running one check by hand
+
+Every catalogue entry gets a uniform `check.<id>` command —
+`check.reflected-xss`, `check.open-redirect`, `check.demo.sleep-sqli` — so a
+check can be run against one **query parameter** by hand, without starting a
+job:
+
+```text
+check.reflected-xss { url: "https://app.example/search?q=1", param: "q" }
+```
+
+It is **not** a way around the job model. The command builds a one-shot job over
+the same client: the URL's origin must be in the HTTP scope (else
+`scan: out_of_scope:`), probes are budgeted to **64**, the run is bounded by
+`scanner.check_timeout_s`, and the record policy applies as usual. The request
+is synthesized in memory in a private store and never enters the operator's
+capture list. `param` must be a query parameter of `url` — the command sets it,
+replacing any value the URL already had — and `value` is its benign baseline
+value, `1` by default. The result is the check's `Verdict`. If a script has
+already registered a command of that name, the scanner leaves it alone and logs
+that it did.
