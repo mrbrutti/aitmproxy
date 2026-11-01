@@ -217,21 +217,8 @@ export function placeholderRow(id: string, kind: string): UnionRow {
 
 // ---- operator confirm-over-the-wire (§3.4) ------------------------------------------------------
 
-/** The non-error `needs_confirmation` envelope an operator `l4.inject` returns first. */
-export interface NeedsConfirm {
-  status: 'needs_confirmation';
-  prompt: string;
-  confirm_token: string;
-}
-
-export function isNeedsConfirm(v: unknown): v is NeedsConfirm {
-  return (
-    typeof v === 'object' &&
-    v !== null &&
-    (v as { status?: unknown }).status === 'needs_confirmation' &&
-    typeof (v as { confirm_token?: unknown }).confirm_token === 'string'
-  );
-}
+/** The non-error `needs_confirmation` envelope an operator `l4.inject` returns first (shared with every confirm-gated verb). */
+export { isNeedsConfirm, type NeedsConfirm } from '~/bus/confirm';
 
 // ---- human-friendly PacketSpec YAML (§3.2) ------------------------------------------------------
 //
