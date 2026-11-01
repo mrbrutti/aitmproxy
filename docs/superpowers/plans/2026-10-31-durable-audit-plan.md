@@ -1,8 +1,25 @@
 # Durable audit wiring implementation plan
 
 **Status:** approved (2026-10-31, self-approved by the orchestrating session under Matt's autonomous-approve mode; the Architect's decisions 1-4 are accepted as written: AC38/AC41 amended in the spec to name `run.py` and `test_bus_endpoint_file.py`; the `#[doc(hidden)] pub` `Tuning`/`start_tuned` seam; the R1-R4/W1-W18 task ids; the AC54(a) and AC61 readings of ambiguities 14 and 26 stand as the plan reads them. Panel cadence deviates from WORKFLOW's panel-per-task as recorded in the plan.)
+
+**Amendment 2 (chain R fix rounds, 2026-11-01; folded in from the code at `f9c1f5b4`).** The plan
+is brought in line with what the chain R fix rounds and the chain W tasks that have landed
+actually built; the code is the truth. It changes no task's purpose. Marked
+`[Amended: Amendment 2, chain R fix rounds]` where it appears: the header and Overview, the
+task-order notes, the merge protocol (origin/main was **merged**, not rebased), the Symbols, the AC
+coverage table (AC38, AC40, AC44 to AC46), the Files table, Calls 15 to 19, Ambiguities 29 to 40, the
+notes of R1 to R4 (the 42 benign names and the 60 s hostile guard in R1 and R2; a "Chain R fix
+rounds" list after R4: what each of the five rounds added, and what the bound constants are), W12 to
+W15 and W18 (the writer-side facts), H1 (two more harness files, nine in all), the risks and the
+clocks, and C1 (the fence numbers, the merge-base, mutations 32 to 43 and the survivor). Two
+facts the reader must know first: the corpus tasks **W14 and W15 have not landed**
+(`crates/aitm/tests/audit_log_redaction.rs` does not exist at `f9c1f5b4`), so AC52, AC55 to AC57
+and AC61 are not yet true; and "Fix 5" (the unquoted-value rule, spec Design 14.3) was being
+committed on `claude/durable-audit-redact` and is not in `f9c1f5b4`. Nothing in the numbered task
+texts below is rewritten wholesale: a superseded sentence stays, with the amendment beside it.
 **Spec:** `docs/superpowers/specs/2026-10-31-durable-audit-design.md` (approved, with Amendment 1:
-Design 14 "Strict redaction on disk" and AC44 to AC65; committed `83b9e28`)
+Design 14 "Strict redaction on disk" and AC44 to AC65; committed `83b9e28`; and Amendment 2, the
+chain R fix rounds, folded in 2026-11-01)
 **Branch / worktree:** two chains.
 - **Chain W** (the writer, wiring, plugins, docs, harness, closing): `claude/durable-audit-462ca8` in
   `/Users/matt/Security/aitmproxy/.claude/worktrees/durable-audit-462ca8` (the session worktree is the
@@ -11,7 +28,11 @@ Design 14 "Strict redaction on disk" and AC44 to AC65; committed `83b9e28`)
   worktree cut from the plan branch head (the orchestrator creates it, see "Parallel chains and the
   merge protocol"), merged back into the plan branch at merge point **M1**.
 Base SHA for every diff and Tester/panel dispatch: `83b9e28` (the spec as amended), until the
-orchestrator's rebase on `origin/main`, then the new merge-base.
+orchestrator's rebase on `origin/main`, then the new merge-base. **[Amended: Amendment 2, chain R
+fix rounds: there was no rebase. `origin/main` (v0.5.8) was merged into the plan branch
+(`b3a2a8df`), so the base for every fence and diff is the merge-base with `origin/main`,
+`f2c9d70b`, recomputed with `git merge-base HEAD origin/main` after any further merge; `83b9e28`
+and `031b09c` are history.]**
 
 ## Overview
 
@@ -26,6 +47,12 @@ rotation, re-check); W10 is the `SecretRegistry`; W11 the handle, `start` and th
 `args`); W14 and W15 are the 74-row corpus; W16, W17, W18 are the wiring proofs (in-process,
 `agent.status`, `main.rs` with the real binary). **D1** (stale comments), **D2** (README and INSTALL),
 **H1** (harness hermeticity) are independent; **C1** is the closing fence and mutation task.
+**[Amended: Amendment 2, chain R fix rounds]** Chain R did not stop at R4: the panel found
+shapes the four tasks missed, and each round was fixed as a named fix task on the chain R branch
+(`R2 fix`, `R4 fix`, `R4 fix 2`, `R fix 3A`/`3B`, `R fix 4A`/`4B`, then "Fix 5"; the list, with what
+each added, is under Task R4). They are not new task ids: they are fix tasks of the kind
+WORKFLOW's stage 6 describes, dispatched from a findings report. The task count above is
+unchanged.
 
 `audit_log.rs` and its three submodules (`audit_log/registry.rs`, `pipeline.rs`, `jsonscan.rs`; the spec
 allows "a submodule of it") are edited only by chain W, strictly in sequence. Every task leaves the
@@ -64,7 +91,7 @@ order table, so a bare `R<n>` inside the corpus tasks (W14, W15) and C1's mutati
 | D1 | stale comments (`server.rs`, `aitm-ca`) | independent; plan worktree | M1 | any W task |
 | D2 | README and INSTALL (audit log and redaction) | independent; plan worktree | W18 | H1 |
 | H1 | harness hermeticity | independent; plan worktree | none | any task |
-| C1 | whole-branch fences and 31 mutation checks | W | all | none |
+| C1 | whole-branch fences and 43 mutation checks (31 from the spec, 12 for the as-built rules; Amendment 2) | W | all | none |
 
 Valid orders: anything that respects Depends-on. **Default: chain R and chain W run concurrently in
 two worktrees (one fresh Coder at a time per worktree); M1 happens at a quiet point of chain W after
@@ -89,7 +116,9 @@ H1 and D1 change only comments, Markdown, Python, shell and one test line.
 4. **M1 (orchestrator, Terminal panel, in the plan worktree):** when R4's panel is clean and W11 is
    committed: `git merge --no-ff claude/durable-audit-redact -m "merge: strict redaction chain (plan
    2026-10-31-durable-audit)"`. A conflict, if any, is `crates/aitm-core/src/lib.rs` only, a line-local
-   union (keep W1's `pub use` lines and R1's `pub mod` line).
+   union (keep W1's `pub use` lines and R1's `pub mod` line). **[Amended: Amendment 2, chain R fix
+   rounds: M1 ran twice. The first merge (`bfe4483e`) brought in R1 to R4 and the fix rounds up to
+   round 3; a second (`a6c4f344`) brought in round 4 (`R fix 4A` and `4B`).]**
 5. **After M1,** in the plan worktree: `cargo check --workspace --all-targets`, then `cargo test -p
    aitm-core -p aitm-mcp` (non-socket tests; socket tests are the orchestrator's). Both green before
    W12 is dispatched. W12 depends on `aitm_core::redact_strict` and `aitm_mcp::redact_args` existing
@@ -99,7 +128,11 @@ H1 and D1 change only comments, Markdown, Python, shell and one test line.
    and `touch` edited sources before a red run). The R branch is not rebased and not pushed.
 7. **Rebase on `origin/main`** happens once after M1 (before W18, the first edit to `main.rs`) and
    again before the whole-branch panel, never on the R branch. A sibling's in-place edit of
-   `redact_value` is a manual merge into `redact_args.rs` (spec Rebase hazards).
+   `redact_value` is a manual merge into `redact_args.rs` (spec Rebase hazards). **[Amended: Amendment 2,
+   chain R fix rounds: `origin/main` (v0.5.8) was merged in (`b3a2a8df`), not rebased, because the plan
+   branch already carries merges of the R branch and a rebase would have replayed them. Where this
+   plan says "rebase on `origin/main`" read "merge `origin/main`"; every fence is measured against
+   the merge-base, `f2c9d70b`.]**
 8. **If chain R is not finished** when W11 is, W12 waits; W17, H1 and D1-after-M1 can be pulled forward.
 9. **Panel cadence (deviation from WORKFLOW's panel per task, accepted by the orchestrator under
    autonomous mode, as PR 171 ran):** a Tester after **every** task; the three-reviewer panel at the
@@ -330,13 +363,27 @@ write time, so a late registration is seen by the next field masked.
   deletions of R3's hunk; `record_audit` builds the reason as `AuditResult::Error(cap_reason(scrub_text(reason)))`
   at about line 1954; `redact_args(arguments)` clones the arguments into `redact_value` and cuts with
   `cap_text(.., 512)`.
+  **[Amended: Amendment 2, chain R fix rounds: as built at `f9c1f5b4` `redact_value` and the local
+  `is_secret_key` are gone from `server.rs`; the reason is `AuditResult::Error(cap_reason(aitm_core::
+  redact_strict::scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)))` at lines
+  1966 to 1969; `redact_args(arguments)` still clones the arguments into `redact_value` (now imported
+  from `crate::redact_args`) and cuts with `cap_text(.., 512)`.]**
+- **[Amended: Amendment 2, chain R fix rounds]** The strict API as built: `aitm_core::redact_strict::{
+  scrub_strict, scrub_strict_bounded(text, max_bytes), is_secret_key_strict, is_benign_header}`
+  (`MAX_ROUNDS` 6; 42 benign names plus the `sec-fetch-` and `sec-ch-` prefixes) and
+  `aitm_mcp::redact_args::redact_value` (`pub`; constants in Task R4's "bound as built"). The
+  writer: `aitm::audit_log::{start, start_at, start_tuned, bridge_token, AuditLogHandle, SHUTDOWN_BUDGET
+  (2 s), SecretRegistry, Registration}` and the crate-private `pipeline::render_line`,
+  `jsonscan::redact_args_text`, `registry::CUT_MARK` (`…`).
 - `aitm::wire`: `ScriptWiring { plugins, executor, poc_step_handlers, commands }` (`Default`);
   `commands: Vec<Box<dyn Plugin>>` is how a test registers its own stub commands into the assembled registry
   (`demo.accept`, `demo.fail`, `demo.echo`); `aitm_core::Plugin` has `name()` and `load(&mut self, &mut
   Registry)`.
 - `aitm::web`: `generate_token() -> String` (64 hex characters), `WebSettings { listen, token, insecure_bind }`
   (the `token` is the web agent bridge token, resolved in `main.rs` before the config is loaded);
-  `main.rs` mints the operator bridge token in the `web_server` block with `.then(web::generate_token)`.
+  `main.rs` mints the operator bridge token in the `web_server` block with `.then(web::generate_token)`. **[Amended: Amendment 2, chain R fix rounds: as built it is `.then(|| audit_log::bridge_token(audit.as_ref()))`
+  (`main.rs:834` at `f9c1f5b4`); `start` is called at line 563 with the web token and the environment pairs; the
+  tail flush is `handle.shutdown(audit_log::SHUTDOWN_BUDGET)` at line 920.]**
 - Bus handshake for the binary tests: the first line on a loopback-TCP connection is `{"token":"<t>"}`
   (exactly one key); the operator token class wins over the agent class.
 - `aitm_poc::builder::{PocBuilder, PocSpec, StdPocBuilder}`: `build(&self, &HttpFlow, PocSpec) ->
@@ -389,33 +436,33 @@ aitm-mcp --test audit_redaction`.
 | AC35 | W17 | `no_command_reads_or_reveals_the_audit_file` (`[guard]`; whole-registry supplement `no_registered_command_name_starts_with_audit` in W16) |
 | AC36 | W18 | `a_healthy_boot_says_one_line_and_never_the_token` (`[socket]`) |
 | AC37 | W18 | `an_explicit_bad_path_fails_the_boot_loudly` (no socket) |
-| AC38 | H1 | grep checks over seven files (C1 repeats them) |
+| AC38 | H1 | grep checks over seven files (C1 repeats them) **[Amended: Amendment 2, chain R fix rounds: nine files; the two orchestrator additions are `apps/web/scripts/live-env.mjs` and `apps/mac/tools/selftest-live-embedded.sh`]** |
 | AC39 | W1, D1, D2 | grep checks (W1: core `audit.rs`; D1: `server.rs`, `aitm-ca`; D2: README, INSTALL; C1 repeats) |
-| AC40 | C1 | the relaxed diff-fence commands of C1 Part A |
+| AC40 | C1 | the relaxed diff-fence commands of C1 Part A **[Amended: Amendment 2, chain R fix rounds: measured against the merge-base `f2c9d70b`; `grep -c '^+'` prints `6` and `grep -c '^-'` prints `24`; never count `@@` on the whole branch]** |
 | AC41 | C1 | the `git diff --name-status` checks of C1 Part A |
 | AC42 | C1 | the Rust gate |
 | AC43 | C1 | mutations 1 to 13 of C1 Part B |
-| AC44 | R1, R2 | `scrub_strict_masks_every_pass_and_keeps_the_benign` (`redact_strict.rs`; R1 the P2, P3 and benign rows, R2 the rest; extras `is_secret_key_strict_vocabulary`, `is_benign_header_table`) |
-| AC45 | R3 | `rules_s_and_d_redact_header_collections_and_siblings` (`audit_redaction.rs`) |
-| AC46 | R4 | `redaction_work_is_bounded` (`audit_redaction.rs`; deterministic reds: `a_leaf_beyond_4096_bytes_is_cut_with_an_ellipsis`, `after_64_kib_every_later_leaf_is_an_ellipsis`, `redaction_output_is_bounded_in_size`) |
+| AC44 | R1, R2 | `scrub_strict_masks_every_pass_and_keeps_the_benign` (`redact_strict.rs`; R1 the P2, P3 and benign rows, R2 the rest; extras `is_secret_key_strict_vocabulary`, `is_benign_header_table`) **[Amended: Amendment 2, chain R fix rounds: the `otp` row is the mid-line form; the fix rounds add 18 tests to `crates/aitm-core/tests/redact_strict.rs` (`shapes_found_by_fuzzing_are_fixed_points`, `a_private_key_block_is_masked_whole_whatever_precedes_it`, `userinfo_runs_to_the_last_at_of_the_authority`, `a_compact_jwe_is_masked_to_its_tag`, `rust_debug_wrappers_around_a_secret_are_masked_whole`, `escaped_quote_frames_are_masked_to_their_matching_closer`, `camel_case_keys_are_secret_keys_in_text`, `folded_header_lines_and_zero_width_blanks_are_part_of_the_header`, `xml_elements_with_a_secret_name_are_masked`, `multipart_fields_with_a_secret_name_are_masked`, `cli_flags_with_a_secret_name_are_masked`, `the_pair_value_rule_matches_scrub_text`, `every_prefix_of_every_shape_fires`, `a_bounded_scrub_cuts_first_and_masks_what_straddles_the_cut`, `bracketed_values_under_a_secret_key_are_masked_whole`, `bracket_notation_form_keys_are_pairs`, `userinfo_may_hold_a_quote_and_ends_at_the_quote_that_opened_the_url`, `curl_user_flags_mask_the_password_part`) and 4 in-module tests in `redact_strict.rs`]** |
+| AC45 | R3 | `rules_s_and_d_redact_header_collections_and_siblings` (`audit_redaction.rs`) **[Amended: Amendment 2, chain R fix rounds: widened shapes are pinned by `header_pairs_lines_and_objects_are_default_deny`, `multi_line_and_multi_value_headers_are_default_deny`, `header_collection_context_is_default_deny` and `header_hardening_is_default_deny` in the same file, and by 46 in-module tests of `redact_args.rs`]** |
+| AC46 | R4 | `redaction_work_is_bounded` (`audit_redaction.rs`; deterministic reds: `a_leaf_beyond_4096_bytes_is_cut_with_an_ellipsis`, `after_64_kib_every_later_leaf_is_an_ellipsis`, `redaction_output_is_bounded_in_size`) **[Amended: Amendment 2, chain R fix rounds: the clock is 20 s; the reason clause is `the_reason_work_is_bounded` (60 s clock), `the_reason_is_bounded_before_the_text_pass` and `a_frame_that_runs_past_the_cut_is_masked`]** |
 | AC47 | R3, W13, W14 | `redaction_is_idempotent_and_json_safe` (`audit_redaction.rs`, source half, R3); `an_honest_entry_is_written_unchanged` (writer half, W13); `corpus_args_are_idempotent_under_redact_value` (corpus values, W14) |
 | AC48 | W10 | `registry_tiers` |
 | AC49 | W10 | `registry_masks_every_encoding` |
 | AC50 | W12 | `a_late_registration_reaches_a_running_writer` |
 | AC51 | W11 | `a_secret_never_appears_in_debug_display_or_logs` (registry half earlier: W10's `registry_debug_prints_only_a_count`) |
-| AC52 | W15 | `start_registers_every_configured_source` (`audit_log_redaction.rs`; the registration mechanics are W11's `start_registers_the_configured_sources`) |
+| AC52 | W15 | `start_registers_every_configured_source` (`audit_log_redaction.rs`; the registration mechanics are W11's `start_registers_the_configured_sources`) **[Amended: Amendment 2, chain R fix rounds: pending; `audit_log_redaction.rs` is not in the branch at `f9c1f5b4` (W14, W15 have not landed)]** |
 | AC53 | W11 | `the_operator_bridge_token_is_registered_when_minted` |
 | AC54 | W13 | `cut_secrets_and_the_tolerant_scan` (the fragment mask is W12's `a_cut_registered_secret_is_masked_at_a_field_end`; (a) uses the Ambiguity 14 arithmetic) |
-| AC55 | W14, W15 | `no_canary_reaches_any_file_through_the_real_path` (`audit_log_redaction.rs`; W14 rows R1 to R39, R50, R51, R53, R54, W15 the other 35 of the 74; red by mutation) |
-| AC56 | W14 | `benign_values_survive_the_real_path_byte_for_byte` |
-| AC57 | W14 | `every_line_is_valid_json_with_the_same_shape` (covers W15's rows once they are added) |
+| AC55 | W14, W15 | `no_canary_reaches_any_file_through_the_real_path` (`audit_log_redaction.rs`; W14 rows R1 to R39, R50, R51, R53, R54, W15 the other 35 of the 74; red by mutation) **[Amended: Amendment 2, chain R fix rounds: pending; `audit_log_redaction.rs` is not in the branch at `f9c1f5b4` (W14, W15 have not landed)]** |
+| AC56 | W14 | `benign_values_survive_the_real_path_byte_for_byte` **[Amended: Amendment 2, chain R fix rounds: pending; `audit_log_redaction.rs` is not in the branch at `f9c1f5b4` (W14, W15 have not landed)]** |
+| AC57 | W14 | `every_line_is_valid_json_with_the_same_shape` (covers W15's rows once they are added) **[Amended: Amendment 2, chain R fix rounds: pending; `audit_log_redaction.rs` is not in the branch at `f9c1f5b4` (W14, W15 have not landed)]** |
 | AC58 | W18 | `the_generated_operator_bridge_token_never_reaches_disk` (`audit_log_binary.rs`, `[socket]`) |
 | AC59 | R3 | the `X-Audit-Marker` assertion of `tests/e2e/audit/test_audit_log.py` (`[e2e]`, Terminal panel: `python3 tests/e2e/run.py audit`; `py_compile` in the sandbox) |
 | AC60 | R3 | `the_reason_is_scrubbed_strictly_at_the_source` (`audit_redaction.rs`) |
-| AC61 | W15 | `a_built_poc_passes_through_the_audit_clean` (placeholder clause per Ambiguity 26) |
+| AC61 | W15 | `a_built_poc_passes_through_the_audit_clean` (placeholder clause per Ambiguity 26) **[Amended: Amendment 2, chain R fix rounds: pending; `audit_log_redaction.rs` is not in the branch at `f9c1f5b4` (W14, W15 have not landed)]** |
 | AC62 | R3, C1 | `[guard]` the existing redaction suites unmodified (R3's blast-radius runs; C1 Part A repeats them and the no-edit diff) |
 | AC63 | R2 | `the_strict_vocabulary_is_audit_only` (`redact_strict.rs`) |
-| AC64 | C1 | mutations 14 to 31 of C1 Part B (each AC64 clause maps to a numbered mutation) |
+| AC64 | C1 | mutations 14 to 31 of C1 Part B (each AC64 clause maps to a numbered mutation) **[Amended: Amendment 2, chain R fix rounds: and mutations 32 to 43 for the as-built rules; 43 is the expected survivor]** |
 | AC65 | D2 | grep checks (`<redacted>`, `Set-Cookie`, `tokens`, `bare credential` in the README) |
 
 ### Files each task may touch
@@ -435,17 +482,18 @@ Chain W tasks that share files are sequential. "(c)" is create, "(m)" is modify.
 | W4 to W9 | W | `crates/aitm/src/audit_log.rs` (m) only |
 | W10 | W | `crates/aitm/src/audit_log/registry.rs` (c), `crates/aitm/src/audit_log.rs` (m: `mod registry;` and one `pub use`) |
 | W11 | W | `crates/aitm/src/audit_log.rs` (m), `crates/aitm/tests/audit_log_config.rs` (m) |
-| W12 | W | `crates/aitm/src/audit_log/pipeline.rs` (c), `crates/aitm/src/audit_log/registry.rs` (m), `crates/aitm/src/audit_log.rs` (m) |
+| W12 | W | `crates/aitm/src/audit_log/pipeline.rs` (c), `crates/aitm/src/audit_log/registry.rs` (m), `crates/aitm/src/audit_log.rs` (m) **[Amended: Amendment 2, chain R fix rounds: as built W12 also created `crates/aitm/tests/audit_log_wiring.rs` (80 lines), so W13 modified it rather than created it]** |
 | W13 | W | `crates/aitm/src/audit_log/jsonscan.rs` (c), `crates/aitm/src/audit_log/pipeline.rs` (m), `crates/aitm/src/audit_log.rs` (m: `mod jsonscan;`), `crates/aitm/tests/audit_log_wiring.rs` (c) |
 | W14 | W | `crates/aitm/tests/audit_log_redaction.rs` (c) |
 | W15 | W | `crates/aitm/tests/audit_log_redaction.rs` (m) |
 | W16 | W | `crates/aitm/tests/audit_log_wiring.rs` (m) |
 | W17 | W | `crates/aitm-plugins/src/agent.rs` (m), `crates/aitm-plugins/tests/agent_status_durable.rs` (c) |
 | W18 | W | `crates/aitm/src/main.rs` (m), `crates/aitm/tests/audit_log_binary.rs` (c) |
-| D1 | indep. | `crates/aitm-mcp/src/server.rs` (m, comment lines), `crates/aitm-ca/src/audit.rs` (m, comment lines) |
+| D1 | indep. | `crates/aitm-mcp/src/server.rs` (m, comment lines), `crates/aitm-ca/src/audit.rs` (m, comment lines) **[Amended: Amendment 2, chain R fix rounds: as built D1 also edited comment lines of `crates/aitm-core/src/audit.rs` (17 lines: the `DEFAULT_AUDIT_CAPACITY` and `AuditSink` docs); no executable line changed]** |
 | D2 | indep. | `README.md` (m), `INSTALL.md` (m) |
-| H1 | indep. | `tests/e2e/aitm_e2e/core.py`, `tests/e2e/run.py`, `tests/e2e/cli/cli-startup.sh`, `tests/e2e/start/test_bus_endpoint_file.py`, `scripts/bus-agent-check.py`, `scripts/tui-live-check.sh`, `crates/aitm/tests/shutdown.rs` (one line) (all m) |
+| H1 | indep. | `tests/e2e/aitm_e2e/core.py`, `tests/e2e/run.py`, `tests/e2e/cli/cli-startup.sh`, `tests/e2e/start/test_bus_endpoint_file.py`, `scripts/bus-agent-check.py`, `scripts/tui-live-check.sh`, `crates/aitm/tests/shutdown.rs` (one line) (all m) **[Amended: Amendment 2, chain R fix rounds: nine files as built; the two orchestrator additions are `apps/web/scripts/live-env.mjs` and `apps/mac/tools/selftest-live-embedded.sh`, one line each]** |
 | C1 | W | none permanently; temporary mutations in the files each names |
+| R fix rounds 1 to 5 **[Amended: Amendment 2, chain R fix rounds]** | R | `crates/aitm-core/src/redact_strict.rs` (m), `crates/aitm-core/tests/redact_strict.rs` (m), `crates/aitm-mcp/src/redact_args.rs` (m), `crates/aitm-mcp/tests/audit_redaction.rs` (m), `crates/aitm-mcp/src/server.rs` (m: the one reason statement, fix 4B only). Round 5 touches only the first two |
 
 **Concurrency check.** Chain R's files and chain W's files are disjoint except two merge points, both
 resolved by the sequential `git merge` of M1: (1) `crates/aitm-core/src/lib.rs`: W1 edits the two `pub use`
@@ -501,6 +549,25 @@ file (see the compile caveat above).
     boundaries and on the whole branch), accepted by the orchestrator under autonomous mode, as PR 171 ran.
 14. **Interim `args_pass` identity (W12).** W12 passes `args` through unchanged until W13 lands, instead of
     running a text pass over JSON text; no intermediate commit is ever shipped (Ambiguity 23).
+
+15. **[Amended: Amendment 2, chain R fix rounds] Merge, not rebase.** `origin/main` (v0.5.8) was merged into the
+    plan branch (`b3a2a8df`) because the branch already carried a merge of chain R (`bfe4483e`) and a rebase would
+    have replayed it; chain R's last round came in by a second merge (`a6c4f344`). Every fence and diff is measured
+    against the merge-base with `origin/main`, `f2c9d70b`.
+16. **[Amended: Amendment 2, chain R fix rounds] The fix rounds are fix tasks, not new task ids.** Five rounds
+    (the list is under Task R4) were dispatched from panel findings reports to fresh Coders on the chain R branch,
+    as WORKFLOW's stage 6 describes. `R1` to `R4` stay the task ids; the commit names (`R2 fix`, `R4 fix`,
+    `R4 fix 2`, `R fix 3A`/`3B`, `R fix 4A`/`4B`) are the fix names.
+17. **[Amended: Amendment 2, chain R fix rounds] `MAX_ROUNDS` is 6.** Neither the spec nor this plan stated a round
+    count for `scrub_strict` ("idempotent" was the whole text). The code started at four (fix `R2 fix`) and has six
+    since fix 4A; the sibling bounds are `SETTLE_ROUNDS` 3 and `OUTPUT_ROUNDS` 4. A text that has not settled is
+    returned as the last round left it, and idempotence is a measured property, not a proof (spec Residual risks 22).
+18. **[Amended: Amendment 2, chain R fix rounds] The mutation list is 43, not 31.** C1 Part B keeps the spec's 31 and
+    adds 12 for the as-built rules (numbers 32 to 43), one of which (43, the tail `shutdown` in `main.rs`) is
+    **expected to survive**.
+19. **[Amended: Amendment 2, chain R fix rounds] Clocks.** AC46's body-bound clock is 20 s, the reason-work test's is
+    60 s, and the hostile-input guards of `redact_strict.rs` are `HOSTILE_SECS` = 60 s. They separate bounded work
+    from unbounded work and are generous on purpose; the deterministic tests carry the bound.
 
 ### Ambiguities and spec gaps
 
@@ -604,7 +671,49 @@ None blocks the build. Each has the default this plan chose and why. Items 1 to 
     becomes `"<redacted>"` (AC45's `{"X-N":5}` row), a non-string under a benign name is kept.
 28. **AC46 may not go red by time alone.** The unbounded 16 MiB scrub may finish inside 5 s on a fast host.
     **Default:** R4 adds deterministic tests (a 4096-byte cut, the 64 KiB budget, an output-size bound) beside
-    the spec's wall-clock one; C1 mutation 30 is judged on those.
+    the spec's wall-clock one; C1 mutation 30 is judged on those. **[Amended: Amendment 2, chain R fix rounds: the
+    clock is 20 s, not 5 s (fix 4B); the three deterministic tests are unchanged and still carry the bound.]**
+29. **[Amended: Amendment 2, chain R fix rounds] The AC44 `otp` row.** The spec's first text gave
+    `"otp: 123456 done"` gives `"otp: [redacted] done"`; beside P2 that cannot hold (at the start of a line P2
+    masks the whole line). **Default (done, `0b4b568`):** the row is the mid-line form `"x otp: 123456 done"`; the test's
+    own comment is reworded, which is a code-side edit outside this document.
+30. **[Amended: Amendment 2, chain R fix rounds] AC46's reason clause was missing.** The spec bounded the arguments
+    only; fix 3B bounded the reason before the strict scrub and fix 4B made the server call `scrub_strict_bounded`.
+    **Default:** the spec's AC46 gained a reason clause (`the_reason_work_is_bounded`,
+    `the_reason_is_bounded_before_the_text_pass`, `a_frame_that_runs_past_the_cut_is_masked`); R4's text above is the
+    first cut.
+31. **[Amended: Amendment 2, chain R fix rounds] The benign list is 42 names, not 43.** R1's text counts 43;
+    `sec-websocket-protocol` was removed in fix 3A (a bearer carrier). `is_benign_header_table` pins the list.
+32. **[Amended: Amendment 2, chain R fix rounds] The hostile guard is 60 s, not 20 s** (`HOSTILE_SECS` in
+    `crates/aitm-core/tests/redact_strict.rs`); R1 and R2 say 20 s.
+33. **[Amended: Amendment 2, chain R fix rounds] R4's single budget is three pools** (leaf and name text 64 KiB,
+    header-collection keys 64 KiB, other keys 64 KiB), with names and keys cut at 256 bytes, depth cut at 64 and
+    the walk settling in up to four rounds. R4's text describes the first cut.
+34. **[Amended: Amendment 2, chain R fix rounds] R3's "exactly three hunks" survives, but the reason statement is four
+    lines** (`scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)`). C1's fence numbers are
+    therefore `6` `+` lines and `24` `-` lines against `f2c9d70b`, not the "3 `+` lines" of the first text.
+35. **[Amended: Amendment 2, chain R fix rounds] The producer's `…` and the scan.** Ambiguity 15 sets the marker aside for
+    the fragment mask only. The tolerant scan needs the same: when the cap's cut falls after a `,`, inside a number or
+    inside a word, the marker is outside every string literal and the letter of spec 14.5 ("on anything else give up")
+    would have sent the text to the plain-text pass. **Default (as built, W13):** one trailing `…` is set aside before
+    the scan and restored; a word that is the start of `true`, `false` or `null` and runs to the end is the word the cut
+    interrupted.
+36. **[Amended: Amendment 2, chain R fix rounds] Environment values that are switches.** The spec registers every
+    variable whose name says "secret". **Default (as built, W12):** a value that is empty, one of `true`, `false`,
+    `null`, `none`, `yes`, `no`, `on`, `off`, `default`, `enabled`, `disabled` or `auto` (ASCII case-insensitive), or
+    only digits and under 8 bytes is not registered (`is_benign_env_value`); a configured token always is.
+37. **[Amended: Amendment 2, chain R fix rounds] Writer behaviours the spec leaves open, as built.** A pending `gap` is
+    also written at shutdown; failure warnings carry the error's own text and never an entry field; the explicit-path
+    error ends `; fix mcp.audit_log (or AITM_AUDIT_LOG) or set it to off`; `start` logs its one `info!` only when all
+    three streams opened and warns once per failed stream.
+38. **[Amended: Amendment 2, chain R fix rounds] The tolerant scan hides only the literal that directly follows a secret
+    key,** and gives up on junk (plain text through `scrub_strict`, escapes undecoded). A number, a word or a
+    container under a secret key is left alone there (spec Residual risks 17).
+39. **[Amended: Amendment 2, chain R fix rounds] The tail `shutdown` in `main.rs` has no observable test.** Removing it
+    leaves every test green; C1 mutation 43 is expected to survive and is recorded, not worked around.
+40. **[Amended: Amendment 2, chain R fix rounds] `MAX_ROUNDS` prose.** The constant is 6; one doc comment on
+    `scrub_strict` at `f9c1f5b4` still says "(four)". Fix 5 corrects it; a reviewer who reads "four" there reads a
+    stale comment, not the contract.
 
 ### Gate, commit and dispatch protocol
 
@@ -647,6 +756,9 @@ None blocks the build. Each has the default this plan chose and why. Items 1 to 
   `lib.rs`), `aitm/src/{config_file,env,main,lib}.rs` (W2, W3, W18), `aitm-plugins/src/agent.rs` (W17),
   `tests/e2e/aitm_e2e/core.py` `_spawn` (H1: keep it to the one statement, the e2e sessions own the file) and
   `tests/e2e/audit/test_audit_log.py` (R3: one assertion). Everything else is new files.
+- **[Amended: Amendment 2, chain R fix rounds: the orchestrator merged `origin/main` once (`b3a2a8df`, between W13 and
+  W18) instead of rebasing, and merges again before the whole-branch panel if `main` has moved; read "rebase" in the
+  rest of this bullet as "merge"; the semantic-merge trap below is unchanged.]**
 - **The orchestrator rebases on `origin/main`** once after M1 (before W18, the first edit to `main.rs`) and
   again before the whole-branch panel, never on the R branch. After each rebase re-run the scoped tests of
   every task whose files conflicted, then the full gate. Run `git fetch origin` and `git rebase origin/main`
@@ -661,7 +773,11 @@ None blocks the build. Each has the default this plan chose and why. Items 1 to 
   path is rule S alone (spec Open question 5). Over-scrub is guarded by AC44's benign table and AC56; a pass
   that changes a benign row is wrong.
 - **Call-path cost.** The source runs the strict passes inside `record_audit`; R4 bounds the work (4 KiB per
-  leaf, 64 KiB in all) and AC46 pins it. W12 and W13 run only on the writer threads.
+  leaf, 64 KiB in all) and AC46 pins it. W12 and W13 run only on the writer threads. **[Amended: Amendment 2, chain
+  R fix rounds: the bound is pools of 64 KiB (leaves and names, header-collection keys, other keys), a leaf cut at
+  4096 bytes, names and keys at 256, depth 64, 2 to 4 walks, up to 5 bounded passes per leaf of up to 6 rounds each,
+  and the reason cut to 8192 bytes before its pass; measured worst adversarial case 27 ms in a release build (the
+  coders' report, not an assertion).]**
 - **Two worktrees, two `target/` directories.** Each carries a full Rust build; the R worktree is removed at
   M1. Never share `CARGO_TARGET_DIR` across them; `touch` edited sources before a red or green run so cargo
   does not reuse a stale artifact.
@@ -670,7 +786,10 @@ None blocks the build. Each has the default this plan chose and why. Items 1 to 
   `shutdown.rs` (H1) and `audit_log_binary.rs` (W18, which sets `mcp.audit_log` and clears the environment).
 - **Timing assertions** in AC18 (2 s), AC19 (2 s), AC30 (1.5 s), AC37 (5 s), AC46 (5 s) and the hostile-input
   guards (20 s) are wall-clock bounds on work that takes milliseconds; they are generous on purpose. A Coder
-  who sees one flake reports it rather than raising the bound.
+  who sees one flake reports it rather than raising the bound. **[Amended: Amendment 2, chain R fix rounds: AC46's
+  clock is 20 s, the reason-work test's is 60 s and the hostile-input guards are 60 s (`HOSTILE_SECS`); they were
+  raised from the first text's 5 s (AC46) and 20 s (hostile guards), because the clock only has to tell bounded
+  work from unbounded work.]**
 - **Registered secrets live in process memory** (the registry), as the secrets already do; nothing prints
   them (AC51).
 
@@ -711,7 +830,11 @@ row of AC44 is the pass's bug, not the table's.
     `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-port`, `x-forwarded-proto`,
     `x-http-method-override`, `x-original-url`, `x-real-ip`, `x-requested-with`, `x-rewrite-url`) or a
     name that starts with `sec-fetch-` or `sec-ch-`. Callers (R3) combine it with
-    `is_secret_key_strict`; this function alone says only "on the list".
+    `is_secret_key_strict`; this function alone says only "on the list". **[Amended: Amendment 2, chain R fix rounds: the list is
+    **42** names, not 43. `sec-websocket-protocol` was removed in fix round 3 (`R fix 3A`) because its
+    subprotocol list carries bearer tokens (`base64url.bearer.authorization.k8s.io.<token>`); the
+    prefixes `sec-fetch-` and `sec-ch-` are unchanged. The test is `is_benign_header_table`, which says
+    so.]**
   - `pub fn scrub_strict(text: &str) -> String`: `crate::redact::scrub_text(text)` first, then, in
     this task, **P2** and **P3**; R2 appends P4, P5, P6 after them in that order.
   - **P2 header lines.** The name `authorization`, `proxy-authorization`, `cookie`, `cookie2` or
@@ -746,7 +869,9 @@ row of AC44 is the pass's bug, not the table's.
     `"author=bob&authority=example.com&inside=1&bypass=1&passed=true"`; `"{\"a\":1,\"b\":[true,null],\"c\":\"d\"}"`;
     `"{{target}}/login?user={{user}}"`. Every row also asserts `scrub_strict(scrub_strict(x)) ==
     scrub_strict(x)`. Hostile inputs, run on a thread that is given 20 s (a timeout fails the test, it
-    does not hang the run): 4 MiB each of `Basic ` and of `Cookie: ` return without panicking.
+    does not hang the run): 4 MiB each of `Basic ` and of `Cookie: ` return without panicking. **[Amended: Amendment 2, chain R fix rounds:
+    the guard is 60 s, the test's `HOSTILE_SECS` (the passes now run up to six rounds and two
+    pre-passes over a 4 MiB text); a timeout still fails the test rather than hanging the run.]**
   - `is_secret_key_strict_vocabulary` (extra): true for `passphrase`, `private_key`, `Private-Key`,
     `access_key`, `signing-key`, `pass`, `PW`, `otp`, `totp`, `x_pass`, `user.pw`, and for everything
     `is_secret_key` says (`token`, `sid`, `Cookie`, `Authorization`); false for `author`, `authority`,
@@ -821,6 +946,14 @@ row of AC44 is the pass's bug, not the table's.
 - **Green.** `cargo test -p aitm-core --test redact_strict` prints `test result: ok. 4 passed`; `cargo
   test -p aitm-core`; fmt; `cargo clippy -p aitm-core --all-targets -- -D warnings`.
 - **Do not touch:** `redact.rs`, `lib.rs`, any other crate.
+- **[Amended: Amendment 2, chain R fix rounds] As built after R2** (the rest is under "Chain R fix
+  rounds" after R4). The AC44 `otp` row is the mid-line form (`"x otp: 123456 done"` gives `"x otp:
+  [redacted] done"`; at the start of a line P2 masks the whole line, `"otp: 123456 done"` gives
+  `"otp: [redacted]"`); the test's own comment is reworded to say so, a code-side edit that is not part
+  of this document. The PEM block is **no longer a P5 shape**: it is a pre-pass that runs before
+  everything, with no word boundary (fix round 1). P4's userinfo runs to the **last** `@` of the
+  authority (fix round 1). P5's left boundary is any byte that is not an ASCII alphanumeric, and a JWT's
+  third segment may be empty (rounds 1 and 4).
 - **Done when:** the red and green runs are quoted.
 
 ### Task R3: `redact_args.rs` rules S and D, the `server.rs` hunk, the e2e flip
@@ -848,7 +981,10 @@ row of AC44 is the pass's bug, not the table's.
       second element replaced by `"<redacted>"`; an object with a string member among the sibling name
       keys whose value `is_secret_key_strict` has its members among the sibling value keys replaced by
       `"<redacted>"` (any JSON type); names and every other member stay;
-    - **rule D**: inside a header collection (an object under a header-collection key at any depth, or
+    - **rule D** **[Amended: Amendment 2, chain R fix rounds: the header-collection key is any key
+      whose lower-cased name *contains* `header` or `hdr`, or equals `trailer` or `trailers`, not the
+      seven names below, and the shapes are those of spec Design 14.2 "as built"; the text that
+      follows is the first cut]**: inside a header collection (an object under a header-collection key at any depth, or
       an array under such a key whose elements are two-string arrays or objects with a `name`, `key` or
       `header` member and a `value` member), a header's value is kept only if its name
       `is_benign_header` and not `is_secret_key_strict`, otherwise replaced by `"<redacted>"` whatever
@@ -857,7 +993,12 @@ row of AC44 is the pass's bug, not the table's.
       and names are untouched.
   - `server.rs`, **exactly these three hunks** (the AC40 fence): (a) the one reason line in
     `record_audit`, `AuditResult::Error(cap_reason(aitm_core::redact::scrub_text(reason)))` becomes
-    `AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict(reason)))`; (b) delete the
+    `AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict(reason)))` **[Amended:
+    Amendment 2, chain R fix rounds: as built it is `AuditResult::Error(cap_reason(aitm_core::
+    redact_strict::scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)))`,
+    which rustfmt wraps to four lines (fix 4B); still one hunk. `REASON_EXAMINE_BYTES` is 8192 and
+    `pub(crate)` in `redact_args.rs`, and `bound_text` stays private there, so `redact_args.rs` is
+    not a fourth `server.rs` hunk]**; (b) delete the
     bodies of `redact_value` and the local `is_secret_key` (and their doc comments); (c) add `use
     crate::redact_args::redact_value;` with the other `use` lines. `redact_args(arguments)` and
     `cap_text` keep calling `redact_value` and are not otherwise edited (do not remove the clone in
@@ -948,7 +1089,9 @@ row of AC44 is the pass's bug, not the table's.
     leaf returns a string of at most 4097 characters (the deterministic red: it is 16 MiB without the
     bound).
   - `redaction_work_is_bounded` (AC46, through the server): `demo.accept {"body": 16 MiB of "a"}` and
-    `demo.accept {"list": [500000 strings "x"]}` each return within 5 s with a ring entry of at most 515
+    `demo.accept {"list": [500000 strings "x"]}` each return within 5 s **[Amended: Amendment 2, chain R fix
+    rounds: 20 s as built (fix 4B); the clock only separates bounded from unbounded work, the deterministic
+    tests carry the bound]** with a ring entry of at most 515
     bytes whose `args_summary` begins `{"body":"aaaa` and `{"list":["x","x"` respectively; a leaf of
     5000 characters with `password=SECRET46` starting at character 4000 gives an entry that does not
     contain `SECRET46`, and with the secret starting at character 4100 the secret is absent from the
@@ -959,8 +1102,35 @@ row of AC44 is the pass's bug, not the table's.
   30) is judged on the three deterministic tests.
 - **Green.** `cargo test -p aitm-mcp --test audit_redaction` and `cargo test -p aitm-mcp --lib
   redact_args::` print `test result: ok`; the R3 blast-radius runs still pass; fmt and clippy clean.
-- **Do not touch:** `server.rs`, `redact_strict.rs`, any existing test.
+- **Do not touch:** `server.rs`, `redact_strict.rs`, any existing test. **[Amended: Amendment 2,
+  chain R fix rounds: this holds for R4 itself. The fix rounds below edited `server.rs` (the one reason
+  statement, fix 4B) and `redact_strict.rs` (every round) by orchestrator-approved fix tasks dispatched
+  from a findings report; a Coder of a numbered task still never touches them.]**
 - **Done when:** red and green are quoted. Then the orchestrator runs chain R's panel (security first).
+- **[Amended: Amendment 2, chain R fix rounds] The bound as built.** Constants in `redact_args.rs`:
+  `LEAF_EXAMINE_BYTES` 4096, `TOTAL_EXAMINE_BYTES` 64 KiB, `NAME_EXAMINE_BYTES` 256, `MAX_DEPTH` 64,
+  `SETTLE_ROUNDS` 3, `OUTPUT_ROUNDS` 4, `pub(crate) REASON_EXAMINE_BYTES` 8192; pools, per walk: leaf and name
+  text 64 KiB, header-collection keys 64 KiB, other keys 64 KiB (at most 192 KiB). The single "total
+  budget" of the R4 text above is the leaf pool; the two key pools are separate. `redact_value` runs 2 to 4 walks. Spec Design 14.6 states them.
+
+### Chain R fix rounds (Amendment 2): what each round added
+
+**[Amended: Amendment 2, chain R fix rounds]** Each round followed a panel on the chain R range (security
+first), was dispatched to a fresh Coder from the findings report, committed on
+`claude/durable-audit-redact` and merged into the plan branch (M1, twice). These are fix tasks in WORKFLOW's
+sense, not new plan tasks. The numbering is the commit names'.
+
+| Round | Commits | What it added |
+|---|---|---|
+| 1 | `R2 fix` (`a9d23f76`), `R4 fix` (`cec2e706`) | A PEM body can no longer survive a key name in front of it (the PEM pre-pass); `scrub_strict` repeats a round until stable (at most 4 then; 6 from round 4); URL userinfo runs to the last `@`; a compact JWE is masked through its tag. A header string with line breaks is judged line by line, an array of three or more items is judged by its first element, and later lines of a kept value are judged by name |
+| 2 | `R4 fix 2` (`2db8db86`) | Any key naming headers, `hdr` or trailers is a header collection; plain maps and nested containers inherit that context; a header line after a benign first element is judged by name; header names get the strict text pass |
+| 3 | `R fix 3B` (`a3bbe0f2`), `R fix 3A` (`460b95f2`) | 3B: rule S covers a direct header array with a non-token first element; keys outside header collections take the text pass; value siblings and `header_name`/`header_value` pairs are hidden; non-token raw header lines are judged by name; nesting is cut at depth 64; the reason is bounded before the strict scrub. 3A: Rust `Debug`-printed values, JSON-escaped nested credentials and camelCase keys are masked; obs-fold continuations follow a masked header; XML, multipart and CLI-flag frames; `sec-websocket-protocol` is no longer benign (42 names); a parity test ties P6's value rule to `scrub_text` |
+| 4 | `R fix 4B` (`ac13c6b3`), `R fix 4A` (`f2bc82df`) | 4B: `redact_value` settles to a fixed point; the reason statement calls `scrub_strict_bounded`, so the function the tests exercise is the one that runs; a direct header array reads as a name and its values at any length; the AC46 clock is 20 s. 4A: a list or object under a secret key is masked whole; `user[password]=...`-style keys are read as pairs; URL userinfo may hold an apostrophe; a secret XML start tag is scanned before its content; `curl -u user:pw` and multi-line multipart values are masked; the convergence cap is 6 |
+| 5 | "Fix 5", **not in `f9c1f5b4`** (being committed on `claude/durable-audit-redact`, in `redact_strict.rs` and its test file only) | An unquoted value under a strict-secret key continues across a quote followed by a non-delimiter (`password=O'Brien&remember=1`), in the frames pre-pass and in P6; a multipart field name is tested with `is_secret_key_strict` before the scan to the boundary (the scan was quadratic); group mode counts only `[`/`{` against `]`/`}` and Debug-wrapper mode keeps parentheses; the `MAX_ROUNDS` doc says six. Residuals it documents: a URL whose password holds the quote that opens it; `-u` and `-U` over-redact (`docker run -u 1000:1000 img`, `date -u +%H:%M`) |
+
+Check before relying on round 5: `grep -n "O'Brien" crates/aitm-core/src/redact_strict.rs` and the
+committed `scrub_strict` doc comment (at `f9c1f5b4` it still says "(four)" in one place; the constant is
+`MAX_ROUNDS: usize = 6`).
 
 ### Task W1: the ring hook and `AuditLogSetting` in `aitm-core`
 
@@ -1716,6 +1886,19 @@ row of AC44 is the pass's bug, not the table's.
   from W5 included); fmt and `cargo clippy -p aitm --all-targets -- -D warnings` clean.
 - **Do not touch:** `aitm-ca`, `aitm-core`, `aitm-mcp`, any other file; do not add `args` redaction here.
 - **Done when:** both reds and the green are quoted.
+- **[Amended: Amendment 2, chain R fix rounds] As built (`f21b1202`).** `render_line` is `render_with(entry, registry,
+  PASSES)`, where `PASSES` is `scrub_strict` for the text fields and `redact_args_text` for `args`; the label's
+  `LABEL` tail has no control step (`sanitize_client_label` already dropped them); every field of `AuditEntry` is
+  named in `render_with`, so a field added to it is a compile error until someone decides what the pipeline does with
+  it. The same commit adds the **environment value rule** to `start` (spec 14.4): `is_benign_env_value` keeps an
+  empty value, a switch literal (`true`, `false`, `null`, `none`, `yes`, `no`, `on`, `off`, `default`, `enabled`,
+  `disabled`, `auto`, ASCII case-insensitive) and an all-digit value under 8 bytes (`ENV_DIGITS_MIN_BYTES`) out of the
+  registry (pinned by `the_environment_rule_skips_values_that_are_not_secrets` and
+  `a_flag_like_environment_value_never_masks_ordinary_text`); a configured token is always registered. Extra tests
+  in `pipeline.rs`: `every_text_field_gets_the_strict_pass`, `no_text_pass_reads_more_than_the_bound`,
+  `a_label_the_pass_lengthens_is_cut_back_to_its_cap`, `a_field_is_bounded_before_any_pass_runs`,
+  `the_pipeline_never_scrubs_args_as_plain_text`, `controls_are_replaced_by_class`,
+  `caps_cut_on_a_character_boundary_and_mark_only_what_they_cut`, `hostile_args_of_a_megabyte_render_within_the_cap`.
 
 ### Task W13: the `args` pipeline: parse-first and the tolerant JSON-text scan
 
@@ -1790,8 +1973,31 @@ row of AC44 is the pass's bug, not the table's.
   clean.
 - **Do not touch:** `aitm-mcp`, `aitm-core`, `aitm-ca`, `entry_to_jsonl`, any other file.
 - **Done when:** the reds, the mutation proof and the green are quoted.
+- **[Amended: Amendment 2, chain R fix rounds] As built (`44ea8e06`).** `redact_args_text` is parse-first, then
+  `scan_json_text`, then `scrub_strict`. The scan sets one trailing `…` (`registry::CUT_MARK`) aside before it
+  walks and restores it after (Ambiguity 35); a word that starts `true`, `false` or `null` and runs to the end is the
+  word the cut interrupted; it tracks a three-state `Pair` (`Idle`, `Named`, `Hide`) so that **only the string
+  literal directly after a secret key** is hidden (`"<redacted>"`, or `"<redacted>` with no closing quote when cut),
+  and a number, a word or a container under a secret key ends the state and is left alone (Ambiguity 38). Hostile
+  nesting is scanned without recursion. Extra tests in `jsonscan.rs`:
+  `a_literal_is_encoded_the_way_serde_json_encodes_it`, `a_secret_key_hides_the_literal_that_follows_it`,
+  `a_text_cut_outside_a_literal_is_still_scanned`, `text_that_parses_goes_through_the_source_function`,
+  `no_plain_text_pass_runs_over_json_text`, `what_the_source_wrote_is_a_fixed_point_of_the_writer_pass`,
+  `a_text_cut_anywhere_by_the_cap_comes_back_unchanged`, `deeply_nested_text_is_scanned_without_recursion`,
+  `deeply_nested_text_goes_through_the_whole_pass`, `hostile_texts_are_scanned_in_linear_time`,
+  `generated_texts_hold_every_property_of_the_pass`, `the_hidden_value_is_what_the_source_writes`,
+  `a_literal_content_gets_the_strict_text_pass`.
 
 ### Task W14: the corpus, part A (`audit_log_redaction.rs`)
+
+- **[Amended: Amendment 2, chain R fix rounds] Status and what changed under it.** Not landed at `f9c1f5b4`:
+  `crates/aitm/tests/audit_log_redaction.rs` does not exist. The rows run against the **as-built** rules, not the
+  first cut: header collections are any key containing `header` or `hdr` (or `trailer`/`trailers`); rule D reads
+  pairs, `name`/`value` objects, plain maps, raw lines and line-broken text; the benign list is 42 names
+  (`Sec-WebSocket-Protocol` is hidden, so a row must not expect it kept); a hidden raw header line reads
+  `Name: [redacted]`; keys are masked and cut at 256 bytes. Re-derive every expected `args` from the as-built
+  rules when writing the row, and keep AC56's benign table unchanged (it uses none of the changed names). A
+  corpus row whose canary is a header value under an innocuous name is red by mutation of rule D (C1 mutation 14).
 
 - **Chain / worktree:** W, the plan worktree.
 - **Satisfies:** AC55 (rows R1 to R39, R50, R51, R53, R54), AC56, AC57 (and the corpus half of AC47)
@@ -1870,6 +2076,12 @@ row of AC44 is the pass's bug, not the table's.
 - **Done when:** the two mutation reds, the empty diffs and the green are quoted.
 
 ### Task W15: the corpus, part B (shapes, tools, known tokens, PoC) and source registration
+
+- **[Amended: Amendment 2, chain R fix rounds] Status.** Not landed at `f9c1f5b4` (see W14). The shape rows
+  (R40 to R49) exercise the as-built P5, whose JWT third segment may be empty and whose left boundary is any byte
+  that is not an ASCII alphanumeric (`_` counts: `KEY_ghp_...` is masked, `task-<uuid>` is not an `sk-` key). The
+  environment row (R72) and `start_registers_every_configured_source` follow the as-built **environment value
+  rule** (a switch literal or a short digit run is not registered): use a value that is a real-looking secret.
 
 - **Chain / worktree:** W, the plan worktree. The writer-group panel follows this task.
 - **Satisfies:** AC55 (rows R40 to R49, R52, R55 to R74), AC52, AC61
@@ -2027,7 +2239,8 @@ row of AC44 is the pass's bug, not the table's.
 
 ### Task W18: `main.rs` wiring and the real-binary tests
 
-- **Chain / worktree:** W, the plan worktree. The orchestrator rebases on `origin/main` first.
+- **Chain / worktree:** W, the plan worktree. The orchestrator rebases on `origin/main` first. **[Amended:
+  Amendment 2, chain R fix rounds: it merged `origin/main` instead (`b3a2a8df`); W18 landed as `7ff3eeea`.]**
 - **Satisfies:** AC31, AC36, AC37, AC58
 - **Depends on:** W11, W16 (and, for the tokens to be masked on disk, W12 to W15 and M1)
 - **Files:** `crates/aitm/src/main.rs` (modify), `crates/aitm/tests/audit_log_binary.rs` (create)
@@ -2110,6 +2323,13 @@ row of AC44 is the pass's bug, not the table's.
   `crates/aitm/tests/shutdown.rs` (Task H1 owns its one line).
 - **Done when:** the sandbox red and green are quoted, the Terminal outputs are pasted by the
   orchestrator, and fmt and clippy are clean.
+- **[Amended: Amendment 2, chain R fix rounds] As built (`7ff3eeea`).** `main.rs` changed in five places, 40 lines:
+  the module doc, the `use`, the `start` call with `env_pairs` (line 563), the `bridge_token` expression (line 834)
+  and the tail flush (line 920, `handle.shutdown(audit_log::SHUTDOWN_BUDGET)` then a `warn!` with
+  `estimated_left` only when the flush was incomplete). `audit_log_binary.rs` holds exactly the four tests above.
+  **The tail `shutdown` has no observable test**: removing it leaves every test green (C1 mutation 43, expected
+  to survive, spec Residual risks 24). `start` logs its one `info!` only when all three streams opened and warns
+  once per failed stream (Ambiguity 37).
 
 ### Task D1: stale comments
 
@@ -2240,7 +2460,7 @@ row of AC44 is the pass's bug, not the table's.
 - **Tests (AC38).** `grep -c AITM_AUDIT_LOG tests/e2e/aitm_e2e/core.py tests/e2e/run.py
   tests/e2e/cli/cli-startup.sh tests/e2e/start/test_bus_endpoint_file.py scripts/bus-agent-check.py
   scripts/tui-live-check.sh crates/aitm/tests/shutdown.rs` prints a count of at least `1` for each
-  of the seven files; `python3 -I -m py_compile tests/e2e/aitm_e2e/core.py tests/e2e/run.py
+  of the seven files **[Amended: Amendment 2, chain R fix rounds: nine, with `apps/web/scripts/live-env.mjs` and `apps/mac/tools/selftest-live-embedded.sh`]**; `python3 -I -m py_compile tests/e2e/aitm_e2e/core.py tests/e2e/run.py
   tests/e2e/start/test_bus_endpoint_file.py scripts/bus-agent-check.py` succeeds; `bash -n
   tests/e2e/cli/cli-startup.sh scripts/tui-live-check.sh` succeeds; `cargo test -p aitm --test
   shutdown --no-run` compiles. The orchestrator (Terminal panel, built `aitm`) runs `python3
@@ -2249,6 +2469,13 @@ row of AC44 is the pass's bug, not the table's.
 - **Do not touch:** any other e2e cell, any other test.
 - **Done when:** the greps, syntax checks and the compile are quoted with their output and the
   candidate-spawn report is in the Coder's report.
+- **[Amended: Amendment 2, chain R fix rounds] As built (`0ffd0d15`): nine files, not seven.** Two more
+  sites that spawn the real binary were added as orchestrator amendments, one line each:
+  `apps/web/scripts/live-env.mjs` (`AITM_AUDIT_LOG: process.env.AITM_AUDIT_LOG ?? 'off'` in the web live selftest's
+  child environment) and `apps/mac/tools/selftest-live-embedded.sh` (the embedded-core run is launched with
+  `AITM_AUDIT_LOG="${AITM_AUDIT_LOG:-off}"`). The AC38 grep therefore covers nine files: the seven above plus
+  these two; `python3 -I -m py_compile` still covers the four Python files, and `bash -n` the shell scripts. The
+  commit is 9 files, 12 insertions and 4 deletions.
 
 ### Task C1: whole-branch fences and mutation checks
 
@@ -2257,7 +2484,9 @@ row of AC44 is the pass's bug, not the table's.
 - **Depends on:** all
 - **Files:** none permanently. Mutations are temporary, in the files each names.
 - **Part A, fences and checks** (commands by the orchestrator in the Terminal panel; `<base>` is
-  the merge-base after the rebase). Literal expected output:
+  the merge-base after the rebase). Literal expected output: **[Amended: Amendment 2, chain R fix rounds:
+  `<base>` is `git merge-base HEAD origin/main`, which is `f2c9d70b` after the merge of v0.5.8 (no rebase
+  happened); recompute it, and every number below, after any further merge.]**
   - `git diff --stat <base>..HEAD` names only: `crates/aitm-core/src/{audit,config,lib,redact_strict}.rs`,
     `crates/aitm-core/tests/{durable_audit_hook,redact_strict}.rs`,
     `crates/aitm-mcp/src/{server,lib,redact_args}.rs`, `crates/aitm-mcp/tests/audit_redaction.rs`,
@@ -2265,7 +2494,9 @@ row of AC44 is the pass's bug, not the table's.
     `crates/aitm/src/audit_log/{registry,pipeline,jsonscan}.rs`,
     `crates/aitm/tests/{audit_log_config,audit_log_wiring,audit_log_binary,audit_log_redaction,shutdown}.rs`,
     `crates/aitm-plugins/src/agent.rs`, `crates/aitm-plugins/tests/agent_status_durable.rs`,
-    `crates/aitm-ca/src/audit.rs`, `README.md`, `INSTALL.md`, `tests/e2e/aitm_e2e/core.py`,
+    `crates/aitm-ca/src/audit.rs`, `README.md`, `INSTALL.md`, `apps/web/scripts/live-env.mjs`,
+    `apps/mac/tools/selftest-live-embedded.sh` **[Amended: Amendment 2, chain R fix rounds: the two
+    orchestrator additions of H1]**, `tests/e2e/aitm_e2e/core.py`,
     `tests/e2e/run.py`, `tests/e2e/cli/cli-startup.sh`, `tests/e2e/start/test_bus_endpoint_file.py`,
     `tests/e2e/audit/test_audit_log.py`, `scripts/bus-agent-check.py`, `scripts/tui-live-check.sh`,
     and the spec and plan.
@@ -2275,7 +2506,14 @@ row of AC44 is the pass's bug, not the table's.
     `redact_value` and the local `is_secret_key` in `server.rs`, one `-`/`+` pair for the reason
     line (`scrub_text` to `scrub_strict`), `+use crate::redact_args::redact_value;`, and `+pub mod
     redact_args;`. The same command piped through `grep '^+'` prints exactly those three `+` lines
-    (`... | grep '^+' | wc -l` prints `3`). Nothing under `crates/aitm/src/web`.
+    (`... | grep '^+' | wc -l` prints `3`). Nothing under `crates/aitm/src/web`. **[Amended: Amendment 2,
+    chain R fix rounds: the numbers on the whole branch, measured against `f2c9d70b`: the reason statement is
+    four lines (`scrub_strict_bounded(reason, crate::redact_args::REASON_EXAMINE_BYTES)`), so
+    `... | grep -c '^+'` prints `6` (`+pub mod redact_args;`, `+use crate::redact_args::redact_value;`, and the four
+    reason lines) and `... | grep -c '^-'` prints `24` (the replaced reason line and the deleted bodies of
+    `redact_value` and `is_secret_key`, blank lines included). Do not assert on a count of `@@` hunks on the whole
+    branch: D1's comment-only hunks add to them (the chain R range alone is exactly three `server.rs` hunks).
+    The first text above ("3 `+` lines") is superseded.]**
   - `git diff --stat <base>..HEAD -- crates/aitm-core/src/redact.rs crates/aitm-plugin-scanner
     crates/aitm-findings crates/aitm-poc crates/aitm/src/web crates/aitm/src/wire.rs
     crates/aitm/src/tui.rs` prints nothing (AC40, AC62); `git diff <base>..HEAD -- Cargo.lock
@@ -2289,7 +2527,10 @@ row of AC44 is the pass's bug, not the table's.
     `crates/aitm/tests/shutdown.rs`, `tests/e2e/start/test_bus_endpoint_file.py` (one environment
     line, orchestrator decision, see Ambiguity 20) and `tests/e2e/audit/test_audit_log.py` (the one
     AC59 assertion: `git diff <base>..HEAD -- tests/e2e/audit/test_audit_log.py` is one hunk that
-    names `X-Audit-Marker`); every other test file is `A`. `git diff <base>..HEAD --
+    names `X-Audit-Marker`); every other test file is `A`. **[Amended: Amendment 2, chain R fix rounds: the
+    command prints six `M` lines at `f9c1f5b4`, because `grep tests/` also matches three harness files that are
+    not tests: `tests/e2e/aitm_e2e/core.py`, `tests/e2e/run.py` and `tests/e2e/cli/cli-startup.sh` (H1's one-line
+    edits). The three test files above are the ones AC41 allows; the three harness files are AC38's.]** `git diff <base>..HEAD --
     crates/aitm-core/src/audit.rs | grep "^[-+].*#\[test\]"` prints nothing. These pass unmodified:
     `cargo test -p aitm-core --test trust_gate_scan --test classifier_wildcard_free` (prints `test
     result: ok` twice), `cargo test -p aitm-mcp --test mcp the_durable_audit_sink_keeps_every_entry`,
@@ -2352,11 +2593,24 @@ row of AC44 is the pass's bug, not the table's.
   | 27 | remove the tolerant scan (fall straight to plain text) | `cut_secrets_and_the_tolerant_scan` (b); corpus row R25 |
   | 28 | remove parse-first | `cut_secrets_and_the_tolerant_scan` (d) |
   | 29 | revert the reason line from `scrub_strict` to `scrub_text` | `the_reason_is_scrubbed_strictly_at_the_source` |
-  | 30 | remove the bound in `redact_value` | the in-module bound tests and `redaction_output_is_bounded_in_size` (and `redaction_work_is_bounded` if the unbounded work exceeds its 5 s) |
+  | 30 | remove the bound in `redact_value` | the in-module bound tests and `redaction_output_is_bounded_in_size` (and `redaction_work_is_bounded` if the unbounded work exceeds its 20 s **[Amended: Amendment 2, chain R fix rounds: was 5 s]**) |
   | 31 | revert the `server.rs` hunk to the old `redact_value` (the pre-R3 file) | `rules_s_and_d_redact_header_collections_and_siblings` |
+| 32 **[Amended: Amendment 2, chain R fix rounds; rows 32 to 43 are new]** | remove the PEM and PGP pre-pass from the round in `redact_strict.rs` | `a_private_key_block_is_masked_whole_whatever_precedes_it` and the PEM rows of `scrub_strict_masks_every_pass_and_keeps_the_benign` |
+| 33 | remove the frames pre-pass, one frame at a time (Debug wrapper, escaped quotes, `[..]`/`{..}` group, XML element, multipart field, CLI flag, curl `-u`) | the frame's own test: `rust_debug_wrappers_around_a_secret_are_masked_whole`, `escaped_quote_frames_are_masked_to_their_matching_closer`, `bracketed_values_under_a_secret_key_are_masked_whole`, `xml_elements_with_a_secret_name_are_masked`, `multipart_fields_with_a_secret_name_are_masked`, `cli_flags_with_a_secret_name_are_masked`, `curl_user_flags_mask_the_password_part` |
+| 34 | remove the camelCase reading from `is_secret_key_strict` | `camel_case_keys_are_secret_keys_in_text`, `is_secret_key_strict_vocabulary` |
+| 35 | set `MAX_ROUNDS` to 1 (one round, no repetition) | `rounds_repeat_until_the_output_equals_the_input`, `the_rounds_are_bounded`, `shapes_found_by_fuzzing_are_fixed_points` |
+| 36 | the reason statement in `record_audit` calls `scrub_strict` (unbounded) instead of `scrub_strict_bounded(.., REASON_EXAMINE_BYTES)` | `the_reason_is_bounded_before_the_text_pass` (the 12000-byte block keeps its tail) |
+| 37 | `SETTLE_ROUNDS` set to 0 (the walk is not repeated) | `settle_stops_at_a_fixed_point_or_after_three_rounds`, `one_walk_settles_the_known_divergences` |
+| 38 | narrow `is_header_collection_key` back to the seven exact names | `header_collection_context_is_default_deny`, `keys_naming_headers_or_trailers_are_header_collections` |
+| 39 | remove the bracket-notation key reading from P6 | `bracket_notation_form_keys_are_pairs` |
+| 40 | remove the `MAX_DEPTH` guard in `redact_value` | `hostile_nesting_is_cut_at_the_depth_bound` |
+| 41 | make `is_benign_env_value` always false (register every secret-named variable's value) | `the_environment_rule_skips_values_that_are_not_secrets`, `a_flag_like_environment_value_never_masks_ordinary_text` |
+| 42 | remove the trailing-`…` set-aside in `scan_json_text` (no `strip_suffix(CUT_MARK)`) | `a_text_cut_outside_a_literal_is_still_scanned`, `a_text_cut_anywhere_by_the_cap_comes_back_unchanged` |
+| 43 | remove the `handle.shutdown(..)` call from the tail of `main.rs` | **None: expected to survive.** No test observes the call (spec Residual risks 24); report the survivor, do not work around it, and do not count it as a failed check |
 
   Mutations 14 to 20 and 29 to 31 edit chain R's files, which are on the plan branch after M1; the
-  Coder works in the plan worktree. The report holds every red output, every restored green output
+  Coder works in the plan worktree. **[Amended: Amendment 2, chain R fix rounds: mutations 32 to 40 edit
+  chain R's files too, 41 and 42 the writer's, and 43 `main.rs`; 43 is the one expected survivor.]** The report holds every red output, every restored green output
   and every empty `diff`.
 - **Done when:** every Part A check is quoted with its output, every Part B mutation has its red,
   green and empty diff, and the orchestrator has confirmed `git status` shows no stray change.
