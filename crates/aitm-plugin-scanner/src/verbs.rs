@@ -1748,10 +1748,7 @@ mod tests {
             first_job,
             "`job` names the first finder"
         );
-        let jobs: Vec<&str> = as_array(obj(issue, "jobs"))
-            .iter()
-            .map(|j| as_str(j))
-            .collect();
+        let jobs: Vec<&str> = as_array(obj(issue, "jobs")).iter().map(as_str).collect();
         assert_eq!(jobs, vec![first_job.as_str(), second_job.as_str()]);
         assert_eq!(
             as_array(obj(
