@@ -464,6 +464,7 @@ dependencies = [
  "aitm-core",
  "aitm-plugin",
  "aitm-plugin-rhai",
+ "aitm-poc",
  "aitm-proto-http",
  "aitm-proto-ws",
  "aitm-scan-model",

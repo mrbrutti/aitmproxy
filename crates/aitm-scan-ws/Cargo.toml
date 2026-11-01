@@ -18,6 +18,8 @@ aitm-core.workspace = true
 aitm-plugin.workspace = true
 # The `Lane` trait this crate's `lane()` slot returns. (3, 7, 9-17)
 aitm-scan-model.workspace = true
+# `CheckMeta.severity` is an `aitm_poc::Severity` (tasks 9-16; plan call 32).
+aitm-poc.workspace = true
 # Error type for the transport, dialer and probe host. (2, 6, 7)
 anyhow.workspace = true
 # `BoxFuture` for the object-safe async model traits, plus `SinkExt`/`StreamExt`

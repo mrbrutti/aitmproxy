@@ -638,6 +638,12 @@ tungstenite 0.28's client handshake (`VerifyData::verify_response`, `handshake/c
 - **Call 31, the oversize probe's dial limit sits above the pad target.** The pad target stays `min(2 x largest observed client frame, profile.ws.max_frame_bytes)`, but the dial for a pad-sentinel probe uses `DialLimits { max_frame_bytes: max(2 x pad_target, pad_target + 4 KiB) }`, so an echo of the padded frame is readable by our own reader and a `Transport` end can only come from the server (otherwise `ws-oversize-frame` would report its own reader's limit as "connection dropped"). Test `pad_probe_raises_the_dial_limit_so_an_echo_is_readable`.
 - `RawProbe.method`/`.body` are ignored by the WS host (an upgrade is a bodyless GET); a send failure on the wire ends the conversation as data, not `Err` (call 18).
 
+### Tasks 9-16 amendment (T4 session, 2026-11-01): `aitm-poc` dependency, three check rulings
+
+- **Call 32.** `CheckMeta.severity` is `aitm_poc::Severity` and the model crate does not re-export it, so `crates/aitm-scan-ws/Cargo.toml` gains `aitm-poc.workspace = true` (call 10 amended a second time; the session made the edit once, before any check file used it). Checks name the type as `aitm_poc::Severity`.
+- `cswsh`: a probe that answers while the baseline was silent is `Vulnerable`/`Firm` ("differs from the baseline"); `Inconclusive` is gated on the *probe* having no data frame. The vulnerable test server models the seeded target (greets `{"type":"hello","user":"alice"}` after the upgrade when the cookie is present) rather than the bare echo handler; an extra test proves the Firm arm's excerpt is scrubbed (`sid=s3cr3t-cookie` never appears in `{:?}` of the verdict).
+- Handshake-header points are named by the lowercased header name (`origin`, `cookie`, `authorization`, `sec-websocket-protocol`); their chosen frame is the first client frame, so no prerequisite is replayed for them.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
