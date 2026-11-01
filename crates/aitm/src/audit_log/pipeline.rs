@@ -8,7 +8,8 @@
 //! 1. **Bound**: cut to [`FIELD_BOUND_BYTES`], so no step reads a megabyte.
 //! 2. **Pass**: a text pass over the *decoded* text: `scrub_strict` for the
 //!    reason, the command and the connection id; `sanitize_client_label` and then
-//!    `scrub_strict` for the label. `args` goes through [`args_pass`] (below).
+//!    `scrub_strict` for the label. `args` is JSON text and goes through
+//!    [`redact_args_text`] instead: parse first, then the tolerant scan.
 //! 3. **Registry**: every registered secret, in every stored form, is masked.
 //! 4. **Controls**: in `args`, the reason, the command and the connection id a
 //!    whitespace control becomes one blank and every other control character
@@ -23,10 +24,12 @@
 //! line is exactly what `entry_to_jsonl` renders (AC17): every cap here is the
 //! producer's own and cutting what a cut produced is a no-op.
 //!
-//! A text pass never runs over JSON text (Design 14.0): the shared plain-text
-//! scrubber is not safe there, because a line break is the two characters
-//! `\r\n` and a value is followed by `"}`. Only the registry (which knows the JSON form of a secret)
-//! and the control step read `args` as it is written.
+//! A plain-text pass never runs over JSON text (Design 14.0): the shared
+//! plain-text scrubber is not safe there, because a line break is the two
+//! characters `\r\n` and a value is followed by `"}`. `args` is parsed, or
+//! scanned literal by literal (see `jsonscan`), so a pass only ever reads decoded
+//! string content; the registry (which knows the JSON form of a secret) and the
+//! control step are the only steps that read `args` as it is written.
 
 use aitm_core::redact_strict::scrub_strict;
 use aitm_core::{
@@ -34,6 +37,7 @@ use aitm_core::{
     DEFAULT_RESULT_REASON_CAP, MAX_CLIENT_LABEL_CHARS,
 };
 
+use super::jsonscan::redact_args_text;
 use super::registry::{SecretRegistry, CUT_MARK};
 
 /// Every string field is cut to this many bytes before any pass reads it: the
@@ -127,10 +131,11 @@ struct Passes {
     args: fn(&str) -> String,
 }
 
-/// What the writer runs: `scrub_strict` over plain text, [`args_pass`] over `args`.
+/// What the writer runs: `scrub_strict` over plain text, [`redact_args_text`] over
+/// `args`.
 const PASSES: Passes = Passes {
     text: scrub_strict,
-    args: args_pass,
+    args: redact_args_text,
 };
 
 /// The line the writer appends for `entry`, without its line end: `entry` put
@@ -170,15 +175,6 @@ fn render_with(entry: &AuditEntry, registry: &SecretRegistry, passes: Passes) ->
         },
     };
     aitm_ca::audit::entry_to_jsonl(&rendered)
-}
-
-/// The text pass of `args` (Design 14.5 step 2). An identity for now: `args` is
-/// JSON text, and no plain-text pass (the shared scrubber, `scrub_strict`) may run
-/// over it (Design 14.0). The next task replaces this with the parse-first pass
-/// and the tolerant JSON-text scan; until it lands the registry, the controls and
-/// the cap are all `args` gets.
-fn args_pass(text: &str) -> String {
-    text.to_string()
 }
 
 /// `text` cut to [`FIELD_BOUND_BYTES`] on a character boundary.
@@ -622,6 +618,79 @@ mod tests {
         );
     }
 
+    /// Design 14.5 for hostile `args` of a megabyte: whatever the shape (nesting a
+    /// stack could not hold, one huge literal, a password in front of a megabyte,
+    /// a secret key whose value is cut by the bound), the line renders at once,
+    /// parses, holds no secret, and `args` is within its cap. The literal
+    /// expected values show what the pass made of each: the bound (64 KiB, no
+    /// marker) cuts first, then the pass, then the cap (512 bytes and `…`).
+    #[test]
+    fn hostile_args_of_a_megabyte_render_within_the_cap() {
+        const MEGA: usize = 1024 * 1024;
+        let valid_huge_string = serde_json::to_string(&"y".repeat(MEGA)).unwrap_or_default();
+        let rows: Vec<(&str, String, String)> = vec![
+            (
+                "open brackets",
+                "[".repeat(MEGA),
+                format!("{}…", "[".repeat(512)),
+            ),
+            (
+                "open objects",
+                "{\"a\":".repeat(MEGA / 5),
+                format!("{}…", "{\"a\":".repeat(512).get(..512).unwrap_or_default()),
+            ),
+            (
+                "one huge literal",
+                format!("{{\"a\":\"{}", "x".repeat(MEGA)),
+                format!("{{\"a\":\"{}…", "x".repeat(506)),
+            ),
+            (
+                "a password in front of a megabyte, not JSON",
+                format!(" password=ARGSECRET9 {}", "x".repeat(MEGA)),
+                format!(" password=[redacted] {}…", "x".repeat(491)),
+            ),
+            (
+                "a secret key whose value the bound cut",
+                format!("{{\"password\":\"ARGSECRET9{}", "x".repeat(MEGA)),
+                "{\"password\":\"<redacted>".to_string(),
+            ),
+            (
+                "a valid JSON string a megabyte long",
+                valid_huge_string,
+                format!("\"{}…", "y".repeat(511)),
+            ),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (row, args, want) in rows {
+            let hostile = AuditEntry {
+                args_summary: args,
+                ..entry("flow.get")
+            };
+            let started = std::time::Instant::now();
+            let line = render_line(&hostile, &SecretRegistry::new());
+            if started.elapsed() > Duration::from_secs(20) {
+                failures.push(format!("{row}: took {:?}", started.elapsed()));
+            }
+            let value = parsed(&line);
+            let got = string_at(&value, &["args"]);
+            if got != want {
+                failures.push(format!("{row}: left: {got:?}, right: {want:?}"));
+            }
+            if got.len() > 515 {
+                failures.push(format!("{row}: args is {} bytes", got.len()));
+            }
+            if line.contains("ARGSECRET9") {
+                failures.push(format!("{row}: the secret is in the line"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
     /// Design 6, 14.5 steps 4 and 5: the controls are replaced **before** the
     /// cap, so U+FFFD (three bytes) is counted by it: 400 of U+009B become 170
     /// of U+FFFD (510 bytes) and the marker, 513 bytes.
@@ -774,7 +843,7 @@ mod tests {
 
     /// The pipeline never runs a text pass over `args` as if it were plain text
     /// (Design 14.0): the honest JSON of the two AC47 shapes is the same line
-    /// after it. `args` is an identity until the JSON-aware pass of the next task.
+    /// after it, though `args` now has a real pass (parse first, then the scan).
     #[test]
     fn the_pipeline_never_scrubs_args_as_plain_text() {
         let mut failures: Vec<String> = Vec::new();

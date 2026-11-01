@@ -51,6 +51,7 @@ use aitm_core::{
 };
 use tracing::{info, warn};
 
+mod jsonscan;
 mod pipeline;
 mod registry;
 
@@ -7005,7 +7006,7 @@ mod tests {
         assert_eq!(args, ["{}", "note [redacted] end", "note [redacted] end"]);
     }
 
-    /// AC16, the text fields (the next task adds `args`): a hand-built hostile
+    /// AC16, the text fields (`args` is the whole-entry test below): a hand-built hostile
     /// entry reaches a real file with no secret in it, registered or shaped, no
     /// control byte other than the two line ends (the `start` marker's and the
     /// entry's), no DEL and no C1 character, and every field within its cap.
@@ -7081,6 +7082,222 @@ mod tests {
                 }
             }
             other => failures.push(format!("the last line is not the entry: {other:?}")),
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    // ---- the args pipeline: parse first, then the tolerant scan (Task W13) ----
+
+    /// `text` with the content of every string literal deleted (the quotes
+    /// stay): what two texts must agree on when only literal contents may differ.
+    fn without_literal_contents(text: &str) -> String {
+        let mut out = String::new();
+        let (mut inside, mut escaped) = (false, false);
+        for c in text.chars() {
+            if !inside {
+                out.push(c);
+                inside = c == '"';
+            } else if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                out.push(c);
+                inside = false;
+            }
+        }
+        out
+    }
+
+    /// AC16, the whole entry of the spec: a hand-built hostile entry (origin
+    /// `Mcp`, so the agent file) reaches a real file with no secret in it, the two
+    /// line ends of the file and no other control byte, no DEL and no C1 character,
+    /// and every field within its cap. Its `args` is not JSON (a password and a
+    /// megabyte of `x`), so Design 14.5 treats it as plain text and the key is
+    /// masked in it.
+    #[test]
+    fn a_hostile_entry_is_sanitised_before_it_is_written() {
+        let dir = scratch("hostile-entry");
+        let (ring, writer, paths) = fs_writer(&dir, Tuning::production());
+        let hostile = AuditEntry {
+            client_label: Some("web-bridge\u{202E}\n token=LABELSECRET9".to_string()),
+            connection_id: Some("c".repeat(10 * 1024)),
+            command: format!("a\nb{}", "z".repeat(200)),
+            args_summary: format!(" password=ARGSECRET9 {}", "x".repeat(1024 * 1024)),
+            result: AuditResult::Error(
+                "Bearer REASONSECRET9 \u{1b}[31m \u{9b}2J\u{7f}\nnext".to_string(),
+            ),
+            ..entry("unused", Frontend::Mcp, BASE_MS)
+        };
+        ring.append(hostile);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let raw = fs::read(&paths[1]).expect("read the agent file");
+        let mut failures: Vec<String> = Vec::new();
+        let ends = raw.iter().filter(|byte| **byte == b'\n').count();
+        if ends != 2 {
+            failures.push(format!("left: {ends} line ends, right: 2"));
+        }
+        if let Some(byte) = raw.iter().find(|b| **b < 0x20 && **b != b'\n') {
+            failures.push(format!("the file holds the control byte {byte:#04x}"));
+        }
+        if raw.contains(&0x7f) {
+            failures.push("the file holds DEL".to_string());
+        }
+        if raw.windows(2).any(|pair| pair == [0xC2, 0x9B]) {
+            failures.push("the file holds U+009B".to_string());
+        }
+        let text = String::from_utf8_lossy(&raw);
+        for secret in ["LABELSECRET9", "ARGSECRET9", "REASONSECRET9"] {
+            if text.contains(secret) {
+                failures.push(format!("{secret} is in the file"));
+            }
+        }
+        let lines = read_lines(&paths[1]);
+        match lines.last() {
+            Some(line) if line.get("command").is_some() => {
+                let field = |path: &[&str]| {
+                    let mut here = line;
+                    for key in path {
+                        here = &here[*key];
+                    }
+                    here.as_str().unwrap_or("").to_string()
+                };
+                for (name, path, max_chars, max_bytes) in [
+                    ("client_label", &["client_label"][..], 64, usize::MAX),
+                    ("args", &["args"][..], usize::MAX, 515),
+                    ("result.error", &["result", "error"][..], usize::MAX, 1027),
+                    ("connection_id", &["connection_id"][..], usize::MAX, 64),
+                    ("command", &["command"][..], 128, usize::MAX),
+                ] {
+                    let value = field(path);
+                    let (chars, bytes) = (value.chars().count(), value.len());
+                    if chars > max_chars || bytes > max_bytes {
+                        failures.push(format!(
+                            "{name}: {chars} chars, {bytes} bytes; at most {max_chars} chars, {max_bytes} bytes"
+                        ));
+                    }
+                }
+                // The password is masked in the plain text, and what the cap kept
+                // of the megabyte after it is the 491 bytes that fit.
+                let want_args = format!(" password=[redacted] {}…", "x".repeat(491));
+                let got_args = field(&["args"]);
+                if got_args != want_args {
+                    failures.push(format!("args: left: {got_args:?}, right: {want_args:?}"));
+                }
+            }
+            other => failures.push(format!("the last line is not the entry: {other:?}")),
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// AC54: a secret cut by a cap, and the tolerant scan of text that does not
+    /// parse, through the real writer and a real file. (a) The source's cap cut a
+    /// registered secret 10 bytes in and put its `…` after the cut (plan
+    /// Ambiguities 14 and 15): the written `args` has the fragment masked and the
+    /// marker back. (b) A cut text with a cookie in a header map and a cookie
+    /// line in a literal: no secret, the structure outside the literals is the
+    /// input's, and what rule D hides is not touched (it is a rule of the source).
+    /// (c) Text that is not JSON is plain text. (d) Text that parses goes through
+    /// the source's function.
+    #[test]
+    fn cut_secrets_and_the_tolerant_scan() {
+        const CUT: &str = "CUT54SECRETVALUE0123456789";
+        let dir = scratch("cut-secrets");
+        let (ring, writer, paths) = fs_writer(&dir, Tuning::production());
+        assert_eq!(
+            writer.registry().register("test.cut54", CUT),
+            Registration::Substring
+        );
+
+        // (a) `{"note":"` is 9 bytes: 493 `x` and the first 10 bytes of the secret
+        // are the 512 bytes before the cut.
+        let whole = format!("{{\"note\":\"{}{CUT}\"}}", "x".repeat(493));
+        let cut = format!("{}…", whole.get(..512).expect("a char boundary"));
+        assert!(cut.ends_with("CUT54SECRE…"), "the cut is mid-token: {cut}");
+        assert_eq!(cut.len(), 515);
+        let cut_a = format!("{{\"note\":\"{}[redacted]…", "x".repeat(493));
+
+        let cookie_cut = r#"{"headers":{"Cookie":"a=b; s=SECRET54","X":"v"},"note":"GET /\r\nCookie: a=b; z=SECRET54b\r\nHo"#;
+        let rows: [(&str, &str, String); 5] = [
+            ("a: the cap cut the registered secret", &cut, cut_a),
+            (
+                "b: a cookie map and a cookie line in a cut text",
+                cookie_cut,
+                r#"{"headers":{"Cookie":"<redacted>","X":"v"},"note":"GET /\r\nCookie: [redacted]\r\nHo"#
+                    .to_string(),
+            ),
+            (
+                "b: a secret key's value in a cut text",
+                r#"{"password":"SECRET54c","n":1"#,
+                r#"{"password":"<redacted>","n":1"#.to_string(),
+            ),
+            (
+                "c: not JSON",
+                " password=SECRET54d x",
+                " password=[redacted] x".to_string(),
+            ),
+            (
+                "d: complete text goes through the source function",
+                r#"{"headers":{"X-Custom":"SECRET54e"}}"#,
+                r#"{"headers":{"X-Custom":"<redacted>"}}"#.to_string(),
+            ),
+        ];
+        for (at, (_, args, _)) in rows.iter().enumerate() {
+            ring.append(AuditEntry {
+                args_summary: args.to_string(),
+                ..entry(&format!("row{at}"), Frontend::Mcp, BASE_MS + at as u64)
+            });
+        }
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let written: Vec<String> = read_lines(&paths[1])
+            .iter()
+            .filter(|line| line.get("command").is_some())
+            .map(|line| line["args"].as_str().unwrap_or("?").to_string())
+            .collect();
+        let mut failures: Vec<String> = Vec::new();
+        if written.len() != rows.len() {
+            failures.push(format!(
+                "{} entry lines, expected {}",
+                written.len(),
+                rows.len()
+            ));
+        }
+        for ((row, args, want), got) in rows.iter().zip(&written) {
+            if got != want {
+                failures.push(format!("{row}: left: {got:?}, right: {want:?}"));
+            }
+            if got.contains("CUT54S") || got.contains("SECRET54") {
+                failures.push(format!("{row}: a secret is in {got:?}"));
+            }
+            if !row.starts_with("a:")
+                && !row.starts_with("d:")
+                && !row.starts_with("c:")
+                && without_literal_contents(got) != without_literal_contents(args)
+            {
+                failures.push(format!(
+                    "{row}: the structure changed: {got:?} from {args:?}"
+                ));
+            }
+        }
+        if written
+            .get(1)
+            .is_some_and(|got| !got.contains(r#""X":"v""#))
+        {
+            failures.push("b: the header X was not left alone".to_string());
         }
         assert!(
             failures.is_empty(),

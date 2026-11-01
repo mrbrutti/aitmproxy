@@ -20,12 +20,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aitm::audit_log::{start_at, stream_path, AuditLogHandle, StreamKind};
 use aitm::tui::{self, Services, TuiLog};
-use aitm::wire::{assemble, Assembled};
-use aitm_core::{AgentPolicy, Config, Frontend, McpTransport};
+use aitm::wire::{assemble_with_scripts, Assembled, Features, ScriptWiring};
+use aitm_core::{
+    AgentPolicy, Command, CommandHost, Config, Frontend, McpTransport, ParamDef, ParamSchema,
+    Params, Plugin, Registry, Sensitivity, TypeDesc, Value as CoreValue,
+};
 use aitm_mcp::{ConnCtx, McpServer};
 use serde_json::{json, Value};
 
@@ -33,6 +37,51 @@ use serde_json::{json, Value};
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 /// The loopback transport's token. Made up; nothing is bound or served.
 const LOOPBACK_TOKEN: &str = "audit-wiring-test-loopback-token";
+
+/// `demo.echo`: a `Write` command that takes any of a few optional arguments of
+/// any type and answers `ok`. It stands for a command whose arguments carry
+/// whatever a caller sends, so what reaches the audit file is the shape of the
+/// arguments and nothing the command did.
+struct EchoCmd;
+
+impl Command for EchoCmd {
+    fn name(&self) -> &str {
+        "demo.echo"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Write
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Answers ok whatever it is given.".into(),
+            params: ["note", "raw", "headers", "a", "b", "c"]
+                .into_iter()
+                .map(|name| ParamDef {
+                    name: name.into(),
+                    ty: TypeDesc::Any,
+                    required: false,
+                    description: String::new(),
+                })
+                .collect(),
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<CoreValue> {
+        Ok(CoreValue::Str("ok".into()))
+    }
+}
+
+/// The plugin that registers `demo.echo`.
+struct DemoPlugin;
+
+impl Plugin for DemoPlugin {
+    fn name(&self) -> &str {
+        "demo"
+    }
+    fn load(&mut self, reg: &mut Registry) {
+        reg.add_command(Arc::new(EchoCmd));
+    }
+}
 
 /// A unique scratch directory that removes itself on drop.
 struct Scratch(PathBuf);
@@ -75,6 +124,12 @@ impl Rig {
     /// The agent transport is loopback TCP: `build_servers` serves an agent only
     /// on an addressable transport, and the other servers take it as a label.
     fn new(tag: &str) -> Rig {
+        Rig::with_commands(tag, ScriptWiring::default())
+    }
+
+    /// [`Rig::new`] with `scripts` wired in the way `main.rs` wires its command
+    /// providers (`assemble_with_scripts`).
+    fn with_commands(tag: &str, scripts: ScriptWiring) -> Rig {
         let scratch = Scratch::new(tag);
         let mut cfg = Config::default();
         cfg.mcp.policy = AgentPolicy::Auto;
@@ -85,7 +140,8 @@ impl Rig {
         };
         cfg.ca.dir = scratch.0.join("ca");
         cfg.ca.audit_log = scratch.0.join("ca-audit.jsonl");
-        let assembled = assemble(&cfg).expect("assemble");
+        let assembled =
+            assemble_with_scripts(&cfg, &Features::default(), scripts).expect("assemble");
         let base = scratch.0.join("audit").join("audit.jsonl");
         let handle = start_at(&assembled.audit_ring, &base, &cfg.ca.audit_log, true)
             .expect("the writer starts on a scratch directory")
@@ -439,15 +495,33 @@ fn no_registered_command_name_starts_with_audit() {
 /// exactly `entry_to_jsonl(&entry)`: the writer's field pipeline changes nothing
 /// an honest call carries. The calls cover every stream and both results (an
 /// operator's `agent.set`, an agent's `flow.list`, the agent's refused
-/// `agent.set`, and two refused sensitive calls, `scope.add` and `scope.remove`,
-/// whose `host` argument is one of the shapes where `scrub_text` over JSON text
-/// was not a no-op: an `Authorization` header in a value, and escaped line
-/// breaks around a `Cookie` header). The sorted set of entry lines over the
-/// three files equals the sorted set of `entry_to_jsonl` of what the ring holds,
-/// and the secret is in no file.
+/// `agent.set`, and refused sensitive calls whose `host` argument is one of the
+/// shapes where `scrub_text` over JSON text was not a no-op) and, through
+/// `demo.echo`, the shapes the `args` pass could disturb:
+///
+/// - the two AC47 shapes: an `Authorization` header in a value, and escaped line
+///   breaks around a `Cookie` header, which the source masks and the writer must
+///   leave as they are;
+/// - a header map, where rule D hides a value (`"<redacted>"`) and the writer
+///   applies the same function to the text again;
+/// - texts the source cut at 512 bytes, with a mask before the cut, cut in each of
+///   the places the cut can fall: inside a literal, after a closed literal, after a
+///   colon, after a comma, after an open brace, in a number and in a word. A cut
+///   outside a literal leaves the source's `…` outside every literal, where a
+///   scan that gave up on it would run the plain-text pass over JSON text and
+///   rewrite the mask.
+///
+/// The sorted set of entry lines over the three files equals the sorted set of
+/// `entry_to_jsonl` of what the ring holds, and the secret is in no file.
 #[test]
 fn an_honest_entry_is_written_unchanged() {
-    let rig = Rig::new("ac17");
+    let rig = Rig::with_commands(
+        "ac17",
+        ScriptWiring {
+            commands: vec![Box::new(DemoPlugin)],
+            ..ScriptWiring::default()
+        },
+    );
     let srv = rig.shared_server();
     let operator = streaming(&srv, Frontend::Operator, None);
     let agent = streaming(&srv, Frontend::Mcp, Some("wiring-agent"));
@@ -469,11 +543,65 @@ fn an_honest_entry_is_written_unchanged() {
         "scope.remove",
         json!({"host": "GET /\r\nCookie: a=b; z=SECRET47\r\nHost: x"}),
     );
+    call(
+        &agent,
+        "demo.echo",
+        json!({"note": "Authorization: Bearer SECRET47"}),
+    );
+    call(
+        &agent,
+        "demo.echo",
+        json!({"raw": "GET /\r\nCookie: a=b; z=SECRET47\r\nHost: x"}),
+    );
+    call(
+        &agent,
+        "demo.echo",
+        json!({
+            "headers": {"X-Custom": "SECRET47", "Accept": "text/html"},
+            "note": "plain",
+        }),
+    );
+
+    // Calls whose redacted text the 512-byte cap cuts. `head` is the text up to
+    // the pad; `tail` is what follows the pad inside the first 512 bytes; the pad
+    // is as long as it takes for the cut to fall right after `tail`.
+    let head = r#"{"a":"Authorization: [redacted]","b":""#;
+    let mut cut_texts = Vec::new();
+    for (tail, c) in [
+        ("", json!("z".repeat(600))),
+        ("\"", json!("zzz")),
+        ("\",\"c\":", json!(1)),
+        ("\",", json!("zzz")),
+        ("\",\"c\":{", json!({"d": 1})),
+        ("\",\"c\":-12", json!(-123_456_789)),
+        ("\",\"c\":tr", json!(true)),
+    ] {
+        let pad = "x".repeat(512 - head.len() - tail.len());
+        // A cut that falls inside the pad: the pad is longer than what fits.
+        let b = if tail.is_empty() {
+            format!("{pad}{}", "y".repeat(40))
+        } else {
+            pad.clone()
+        };
+        call(
+            &agent,
+            "demo.echo",
+            json!({"a": "Authorization: Bearer SECRET47", "b": b, "c": c}),
+        );
+        cut_texts.push(format!("{head}{pad}{tail}\u{2026}"));
+    }
 
     let files = rig.finish();
     files.assert_start_markers();
     let ring = rig.assembled.audit_ring.recent(None, None);
-    assert_eq!(ring.len(), 5, "five calls, five entries: {ring:?}");
+    assert_eq!(ring.len(), 15, "fifteen calls, fifteen entries: {ring:?}");
+    for cut in &cut_texts {
+        assert!(
+            ring.iter().any(|entry| entry.args_summary == *cut),
+            "the source cut a text as the arithmetic of this test says, ending {:?}",
+            cut.chars().rev().take(12).collect::<String>()
+        );
+    }
 
     let kinds = [StreamKind::Control, StreamKind::Agent, StreamKind::Reads];
     let mut written: Vec<String> = kinds
@@ -493,6 +621,13 @@ fn an_honest_entry_is_written_unchanged() {
     expected.sort();
     assert_eq!(written, expected);
 
+    let args_of = |command: &str| -> Vec<&str> {
+        entries(&files.agent)
+            .iter()
+            .filter(|line| line["command"] == json!(command))
+            .filter_map(|line| line["args"].as_str())
+            .collect()
+    };
     let hosts: Vec<&str> = entries(&files.agent)
         .iter()
         .filter(|line| matches!(line["command"].as_str(), Some("scope.add" | "scope.remove")))
@@ -505,6 +640,30 @@ fn an_honest_entry_is_written_unchanged() {
             r#"{"host":"GET /\r\nCookie: [redacted]\r\nHost: x"}"#,
         ]
     );
+    let echoes = args_of("demo.echo");
+    assert_eq!(echoes.len(), 10, "ten demo.echo lines: {echoes:?}");
+    // The two AC47 shapes, byte for byte, and valid JSON.
+    assert_eq!(echoes[0], r#"{"note":"Authorization: [redacted]"}"#);
+    assert_eq!(
+        echoes[1],
+        r#"{"raw":"GET /\r\nCookie: [redacted]\r\nHost: x"}"#
+    );
+    for text in &echoes[..2] {
+        assert!(
+            serde_json::from_str::<Value>(text).is_ok(),
+            "not JSON: {text}"
+        );
+    }
+    // Rule D's work is in the line, whatever order the members are written in.
+    let headers: Value = serde_json::from_str(echoes[2]).expect("the header call's args are JSON");
+    assert_eq!(
+        headers,
+        json!({"headers": {"X-Custom": "<redacted>", "Accept": "text/html"}, "note": "plain"})
+    );
+    // The cut texts are in the file as the source made them.
+    for (cut, line) in cut_texts.iter().zip(&echoes[3..]) {
+        assert_eq!(line, cut);
+    }
     for kind in kinds {
         let text = fs::read_to_string(stream_path(&rig.base, kind)).unwrap_or_default();
         assert!(
