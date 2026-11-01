@@ -254,7 +254,9 @@ impl HttpProbeHost {
     fn raw_request(&self, raw: &RawProbe) -> Result<HttpRequest> {
         // The method is taken verbatim onto the request line, so a malformed one
         // is refused here; the value is left out of the error (S-M1).
-        if !is_method_token(&raw.method) {
+        // A method is an RFC 9110 `token`, the same production as a header
+        // name, so the core's one tchar rule decides (S-M1, R-M5).
+        if !aitm_core::header::is_valid_name(&raw.method) {
             return Err(anyhow!(
                 "scan: probe_raw: method is not a valid RFC 9110 token"
             ));
@@ -323,34 +325,6 @@ impl HttpProbeHost {
     fn unauthenticated(&self) -> bool {
         self.job.profile().session.mode == SessionMode::None
     }
-}
-
-/// Whether `method` is a non-empty RFC 9110 token (`tchar`s only), so a
-/// malformed method never reaches the request line (S-M1).
-fn is_method_token(method: &str) -> bool {
-    !method.is_empty() && method.bytes().all(is_tchar)
-}
-
-/// RFC 9110 `tchar`: the characters a `token` (and thus a method) may contain.
-fn is_tchar(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
 }
 
 /// Whether `name` is a header a session rides in: `Cookie`, `Authorization`,
