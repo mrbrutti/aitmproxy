@@ -730,6 +730,7 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | live smoke | run 3 | 29 ok, 1 noted (the standard job finished before `x`; a fresh job was cancelled live), 3 failed: subscriber saw zero lines; zero issues (the seeded `/search?q=` became the session canary); Site map wait short-circuited by a stale cross-tab `lane_unavailable` banner, and the engine refuses `scan.sitemap {}` | H54, H55, H57 (cell); H56 (Rust, D13 ruling); H58 relayed to the coordinator |
 | 17 | coordinator | note | `l4.scope.add` needs explicit `inject_rate_pps`; `Issue.location.l4` arrives on T1b's final head; `poc_ref` fallback already the TUI's | H59 (cell), H60 (Rust at Task 17), none |
 | 17 | coordinator | ruling | `scan.sitemap {}` = newest job's map (umbrella amendment 27); D13 own-error ruling confirmed; canary and `wait_notification` fixes right | H58 closed; D6 amended; H61 at Task 17 |
+| 15 | engine | corrected | T1b: the canary is never excluded; the fabricated `Authorization: Bearer` on every probe made the target answer unauthenticated, so no reflection | H55 amended: Cookie-only seed on `GET /`; `scan.sitemap` gains a `job` field on the next head (H61) |
 
 ## Shipped
 
