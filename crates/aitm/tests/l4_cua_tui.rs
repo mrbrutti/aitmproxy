@@ -589,17 +589,21 @@ async fn tui_l4_cua_against_a_live_core() {
         cua.key(KeyCode::Char('y')).await;
         // The confirmed re-issue is a round trip to the live core; under load
         // (Terminal gate 2) it took more than one fixed 400 ms pump. Pump in
-        // 100 ms slices until the overlay closes, bounded at 5 s, and say how
-        // long it took.
+        // 100 ms slices until the overlay closes, bounded, and say how long
+        // it took. The bound is 20 s (Terminal gate 3 saw 6.0 s on a loaded
+        // Mac against 5 s): the first gated invoke after the privilege
+        // cache's 1 s TTL can pay the probe itself, and on macOS that probe
+        // runs `codesign --verify --strict` on /Applications/Aitmproxy.app,
+        // bounded at 5 s, synchronously in the claiming caller.
         let closed_after = {
             let started = Instant::now();
-            let bound = Duration::from_secs(5);
+            let bound = Duration::from_secs(20);
             while cua.app.mode == Mode::L4Confirm && started.elapsed() < bound {
                 cua.pump(Duration::from_millis(100)).await;
             }
             started.elapsed()
         };
-        eprintln!("[inject] confirm overlay closed after {closed_after:?} (bound 5 s)");
+        eprintln!("[inject] confirm overlay closed after {closed_after:?} (bound 20 s)");
         cua.snapshot("L4 inject — honest L4Unavailable degradation after confirm");
         assert_ne!(
             cua.app.mode,
