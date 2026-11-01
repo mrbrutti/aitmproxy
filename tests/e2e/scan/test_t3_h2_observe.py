@@ -171,7 +171,7 @@ def assert_connections(conns, label: str) -> None:
     check(counts == EXPECTED_REQUESTS,
           f"{label}: per-connection request counts are {EXPECTED_REQUESTS} "
           f"(observed {counts}) -- the exact list, so the <= 8 streams/connection "
-          f"bound holds by construction")
+          f"bound cannot be seen by the request counter for a rejected stream; it rests on the driver's pre-dial cap (`RawH2Plan.streams` refused above 8, unit-pinned) until T10 logs a per-connection stream counter")
 
 
 def main() -> None:

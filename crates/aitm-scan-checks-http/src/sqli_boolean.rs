@@ -212,9 +212,11 @@ fn normalized(resp: &ProbeResponse, sent: &[&str]) -> String {
     text
 }
 
-/// Where two scrubbed bodies first part, for the evidence of a content hit:
-/// a bounded slice of each from the first differing byte, so the reader sees
-/// the digit that moved and not two identical lengths.
+/// Where two bodies first part, for the evidence of a content hit: a bounded
+/// slice of each from the first differing byte, so the reader sees the digit
+/// that moved and not two identical lengths. The caller hands in bodies that
+/// are already echo-scrubbed *and* credential-scrubbed, so the byte offset
+/// counts in the scrubbed text and nothing cut here escapes the scrub.
 fn divergence(baseline: &str, other: &str) -> String {
     let common = baseline
         .bytes()
@@ -233,7 +235,8 @@ fn divergence(baseline: &str, other: &str) -> String {
         text[from..to].replace(ECHO_MARK, "<value>")
     };
     format!(
-        "true arm reproduced the baseline; false arm differed at byte {common}: baseline \"{}\" vs \"{}\"",
+        "true arm reproduced the baseline; false arm differed at byte {common} of the scrubbed \
+         body: baseline \"{}\" vs \"{}\"",
         cut(baseline),
         cut(other)
     )
@@ -445,8 +448,14 @@ fn confirmed(
             // so the evidence names where the bodies parted; a length hit's
             // `Diff` is its whole proof.
             matched: match hit.signature {
-                Signature::Content => Some(Evidence::excerpt(&crate::matching::scrub(
-                    &divergence(&baseline.body, &run.false_body),
+                // Scrub first, then cut (the `matching::excerpt_around` order):
+                // a credential whose key fell outside the window would
+                // otherwise pass the key-framed scrub unseen (security
+                // re-review of PR 2a). Two linear scrubs, on a confirmed hit
+                // only.
+                Signature::Content => Some(Evidence::excerpt(&divergence(
+                    &crate::matching::scrub(&baseline.body),
+                    &crate::matching::scrub(&run.false_body),
                 ))),
                 Signature::Length => None,
             },

@@ -69,8 +69,9 @@ TIMED_POINTS = (("/items", "id"), ("/orders", "id"), ("/ping", "host"))
 # point may see up to 16 delay-bearing requests, 8 from each (live run
 # 2026-11-01: /items?id saw exactly 16, 8 per check). A point is a (path,
 # parameter) pair read from the target's own log: `path` plus the name before
-# the first `=` of `query` (form fields are logged without a query, so a POST
-# point counts under its path alone).
+# the first `=` of `query`. Body points are outside this oracle: a form field's
+# probe is logged without a query, so its delay token is never seen here and
+# the bound is proven for query points only.
 MAX_DELAY_PROBES_PER_POINT = 16
 MIN_TIMING_R = 0.85
 JOB_TIMEOUT = 600.0
@@ -125,8 +126,10 @@ def run_blind(op, target) -> tuple[list, int, dict]:
         params = node.get("params") or []
         # A node lists each parameter name once but may carry several points
         # for it (`/search` has `q` from its link and from its form: two captured
-        # flows, `points: 2`), so the node's point count is shared among its
-        # names.
+        # flows, `points: 2`), so the node's point count is shared evenly among
+        # its names. That is a ceiling for the non-seeded points (a node with
+        # an uneven split lets one name borrow another's allowance); the three
+        # seeded points are held to the literal bound above.
         each = max(1, round(int(node.get("points") or 0) / max(1, len(params))))
         for param in params:
             name = param.get("name") if isinstance(param, dict) else str(param)

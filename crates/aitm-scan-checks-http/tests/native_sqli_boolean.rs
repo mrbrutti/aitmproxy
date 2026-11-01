@@ -102,7 +102,8 @@ async fn a_true_matching_and_false_diverging_pair_is_firm() {
             .matched
             .as_deref()
             .is_some_and(|m| m.starts_with(
-                "true arm reproduced the baseline; false arm differed at byte 120: baseline \"xxxx"
+                "true arm reproduced the baseline; false arm differed at byte 120 of the scrubbed \
+                 body: baseline \"xxxx"
             )),
         "{:?}",
         verdict.evidence.matched
