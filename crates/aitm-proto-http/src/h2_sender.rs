@@ -941,24 +941,6 @@ mod tests {
         }
     }
 
-    /// A dialer that takes `latency` to connect (virtual time under a paused
-    /// clock), so a connect + handshake costs time the way a real TCP dial does.
-    struct SlowDialer {
-        inner: Arc<DuplexDialer>,
-        latency: Duration,
-    }
-
-    impl Dialer for SlowDialer {
-        fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>> {
-            let latency = self.latency;
-            let next = self.inner.dial(addr);
-            Box::pin(async move {
-                tokio::time::sleep(latency).await;
-                next.await
-            })
-        }
-    }
-
     fn get(scheme: &str, authority: &str, path: &str) -> HttpRequest {
         let mut headers = HeaderMap::new();
         headers.set("Host", authority);
@@ -2067,15 +2049,9 @@ mod tests {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let healthy = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
         let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
-        // A 10 ms dial, as a real TCP connect costs: the sender's whole-exchange
-        // deadline is then earlier than the h2 layer's own, as in production.
-        let slow = Arc::new(SlowDialer {
-            inner: dialer.clone(),
-            latency: Duration::from_millis(10),
-        });
         let sender = HttpSender::new()
             .with_resolver(Arc::new(FixedResolver))
-            .with_dialer(slow)
+            .with_dialer(dialer.clone())
             .with_response_timeout(Duration::from_secs(5));
 
         let err = sender

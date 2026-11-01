@@ -372,12 +372,26 @@ impl HttpSender {
             .into());
         }
 
+        // One deadline for the whole send, taken before the resolve: every
+        // layer below — resolve, dial, handshake, exchange — works to this
+        // instant rather than starting a budget of its own (review findings
+        // Q3, SEC-12).
+        let deadline = tokio::time::Instant::now() + self.response_timeout;
+
         // Resolve once, then (when the SSRF gate is configured) refuse a
         // private/loopback/metadata address before connecting, and connect to
         // an address we actually validated — so the resolve-then-connect
         // (DNS-rebinding) window is closed and every reissue path that shares
-        // this sender is covered.
-        let ips = self.resolver.resolve(host.clone(), port).await?;
+        // this sender is covered. The resolve is inside the deadline: a name
+        // server that never answers must not hold the caller open.
+        let ips = tokio::time::timeout_at(deadline, self.resolver.resolve(host.clone(), port))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "resolve {host}:{port} timed out after {:?}",
+                    self.response_timeout
+                )
+            })??;
         if let Some(gate) = &self.ssrf {
             gate.check("reissue", &authority, &host, &ips)?;
         }
@@ -387,10 +401,6 @@ impl HttpSender {
             .map(|ip| SocketAddr::new(ip, port))
             .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
 
-        // One deadline for the whole exchange, taken before the dial: every
-        // layer below works to this instant rather than starting a budget of
-        // its own (review finding Q3).
-        let deadline = tokio::time::Instant::now() + self.response_timeout;
         let leg = ExchangeLeg {
             key: &key,
             host: &host,
@@ -469,7 +479,9 @@ impl HttpSender {
             }
             self.dial_and_exchange(&req, &leg).await
         };
-        tokio::time::timeout(self.response_timeout, exchange)
+        // The same `deadline` the h2 layer was handed, so the two caps are
+        // one cap (review finding QM-3).
+        tokio::time::timeout_at(deadline, exchange)
             .await
             .map_err(|_| {
                 anyhow!(
@@ -571,7 +583,7 @@ struct ExchangeLeg<'a> {
     addr: SocketAddr,
     tls: bool,
     version: VersionPolicy,
-    /// When the whole exchange must be done, counted from before the dial.
+    /// When the whole send must be done, counted from before the resolve.
     deadline: tokio::time::Instant,
 }
 
@@ -2039,6 +2051,47 @@ mod tests {
     /// (`tests/sender.rs`) binds a real port, so the lift half of it cannot
     /// run in a sandbox; this pair runs over `tokio::io::duplex` (tester pass
     /// over fix round F2).
+    /// A resolver that never answers.
+    struct HangingResolver;
+
+    impl HostResolver for HangingResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// SEC-12: the resolve is inside the exchange deadline. A name server
+    /// that never answers fails the send at exactly `response_timeout`, and
+    /// nothing is dialled. Virtual time; the outer guard turns a regression
+    /// (a send that hangs) into a red test rather than a hung one.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_that_never_answers_fails_the_send_within_the_response_timeout() {
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::new()));
+        let timeout = Duration::from_secs(5);
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(HangingResolver))
+            .with_dialer(dialer.clone())
+            .with_response_timeout(timeout);
+
+        let started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(timeout * 4, sender.send(&get_x()))
+            .await
+            .expect("the send must not outlive its response timeout")
+            .expect_err("a resolve that never completes fails the send");
+
+        assert_eq!(
+            started.elapsed(),
+            timeout,
+            "bounded by exactly the deadline"
+        );
+        assert!(err.to_string().contains("timed out"), "error was {err}");
+        assert!(
+            err.to_string().contains("resolve"),
+            "the error names the resolve, not the dial: {err}"
+        );
+        assert_eq!(dialer.calls(), 0, "nothing is dialled without an address");
+    }
+
     #[tokio::test]
     async fn an_empty_scope_refuses_a_metadata_address_before_dialing() {
         use aitm_core::{SsrfPolicy, StdGuard};
