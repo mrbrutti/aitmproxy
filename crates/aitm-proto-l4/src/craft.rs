@@ -535,6 +535,14 @@ fn build_ipv4(s: &Ipv4Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<
     use pnet_packet::ipv4::{checksum, MutableIpv4Packet};
     use pnet_packet::MutablePacket;
 
+    // `total_length` is a `u16`: a payload that would overflow it must be refused
+    // here, before `pnet` sizes its payload window from the wrapped value and
+    // `set_payload` panics on a window smaller than the payload.
+    if payload.len() > usize::from(u16::MAX) - 20 {
+        return Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+    }
     let total = 20 + payload.len();
     let mut buf = vec![0u8; total];
     {
@@ -582,6 +590,13 @@ fn build_ipv6(s: &Ipv6Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<
     use pnet_packet::ipv6::MutableIpv6Packet;
     use pnet_packet::MutablePacket;
 
+    // `payload_length` is a `u16`; see [`build_ipv4`] for why a wrap must not
+    // reach `pnet`.
+    if payload.len() > usize::from(u16::MAX) {
+        return Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+    }
     let total = 40 + payload.len();
     let mut buf = vec![0u8; total];
     {
@@ -654,6 +669,14 @@ fn build_tcp(s: &TcpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u
 fn build_udp(s: &UdpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u8>, CraftError> {
     use pnet_packet::udp::{ipv4_checksum, ipv6_checksum, MutableUdpPacket};
 
+    // The auto `length` is `8 + payload`, a `u16` on the wire: refuse the payload
+    // rather than stamp a wrapped length a caller never asked for. A *pinned*
+    // `length` still ships verbatim, wrong value and all.
+    if payload.len() > usize::from(u16::MAX) - 8 {
+        return Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+    }
     let total = 8 + payload.len();
     let mut buf = vec![0u8; total];
     {
@@ -1076,5 +1099,70 @@ mod tests {
                 "data_offset {v} must build"
             );
         }
+    }
+
+    /// An oversize payload is refused by the length guards, never by a wrapped
+    /// auto length: `20 + payload` (IPv4 `total_length`), `8 + payload` (UDP
+    /// `length`) and `payload` (IPv6 `payload_length`) are all `u16` on the wire,
+    /// so a payload that overflows one of them must return
+    /// [`CraftError::TooLarge`] before `pnet`'s payload window is sized from the
+    /// wrapped value (which panicked inside `set_payload`).
+    #[test]
+    fn oversize_payload_is_too_large_not_a_panic() {
+        // `[Raw(AF prefix), Ipv4, Udp, Raw(n)]` — the shape the loopback send path
+        // builds, so the four-byte prefix is counted the way production counts it.
+        let spec = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Raw(vec![0u8; 4]),
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+
+        // 65507: every auto length still fits in a `u16`; the finished frame is
+        // 65539 bytes, so the existing whole-packet cap refuses it.
+        assert_eq!(
+            spec(65_507).build(),
+            Err(CraftError::TooLarge {
+                max: MAX_PACKET_BYTES
+            }),
+            "65507 must stay a TooLarge from the whole-packet cap"
+        );
+        // 65508: `20 + 8 + 65508` wraps `total_length` to 0. 70000: it wraps the
+        // UDP `length` as well. Both panicked before the guards existed.
+        for n in [65_508usize, 70_000] {
+            assert_eq!(
+                spec(n).build(),
+                Err(CraftError::TooLarge {
+                    max: MAX_PACKET_BYTES
+                }),
+                "payload {n} must be TooLarge, not a panic"
+            );
+        }
+
+        // IPv6 carries the payload length alone, so it wraps one byte later.
+        let v6 = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Raw(vec![0u8; 65_536]),
+            ],
+        };
+        assert_eq!(
+            v6.build(),
+            Err(CraftError::TooLarge {
+                max: MAX_PACKET_BYTES
+            }),
+            "an IPv6 payload over 65535 bytes must be TooLarge, not a panic"
+        );
     }
 }
