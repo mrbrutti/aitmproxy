@@ -14,6 +14,8 @@
 //! policy (the scanner's probe-error ladder).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -38,6 +40,29 @@ const H2_WIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The response-body cap, matching the h1 path in [`crate::sender`].
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// One pooled connection.
+struct Pooled {
+    /// Which connection this is among the ones that have lived under this key.
+    /// Eviction names a generation, so a slow failure cannot drop the
+    /// *replacement* connection that took its place (review finding Q2).
+    generation: u64,
+    send_req: SendRequest<Bytes>,
+    /// The address this connection was dialled to — and that the SSRF gate
+    /// validated when it was dialled.
+    addr: SocketAddr,
+}
+
+/// A pooled connection checked out for one exchange.
+pub(crate) struct Checkout {
+    pub(crate) send_req: SendRequest<Bytes>,
+    /// The generation to evict if this exchange fails.
+    pub(crate) generation: u64,
+    /// Where this connection actually goes — not what the name resolves to
+    /// now. The sender re-checks it against the SSRF gate before reusing the
+    /// connection (review finding SEC-8).
+    pub(crate) addr: SocketAddr,
+}
+
 /// One live h2 connection per connection key (`scheme://host:port`, the
 /// identity the sender's `conn_key` builds), reused while idle.
 ///
@@ -45,7 +70,9 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// still runs on its own fresh connection, it is simply not remembered.
 #[derive(Default)]
 pub(crate) struct H2Pool {
-    conns: Mutex<HashMap<String, SendRequest<Bytes>>>,
+    conns: Mutex<HashMap<String, Pooled>>,
+    /// Hands out the generation of the next connection stored, pool-wide.
+    generations: AtomicU64,
 }
 
 /// How many authorities the sender keeps an open h2 connection to.
@@ -61,14 +88,18 @@ impl H2Pool {
     /// is dropped from the pool and `None` is returned, so the caller redials.
     /// `None` is also returned while the connection is merely busy — the caller
     /// opens a second one rather than queueing behind it.
-    pub(crate) fn take(&self, key: &str) -> Option<SendRequest<Bytes>> {
+    pub(crate) fn take(&self, key: &str) -> Option<Checkout> {
         let mut conns = self.conns.lock().ok()?;
         let entry = conns.get_mut(key)?;
         // A no-op waker: this is a readiness *probe*, not a wait. Nothing is
         // ever woken through it, and the next send polls again.
         let mut cx = Context::from_waker(Waker::noop());
-        match entry.poll_ready(&mut cx) {
-            Poll::Ready(Ok(())) => Some(entry.clone()),
+        match entry.send_req.poll_ready(&mut cx) {
+            Poll::Ready(Ok(())) => Some(Checkout {
+                send_req: entry.send_req.clone(),
+                generation: entry.generation,
+                addr: entry.addr,
+            }),
             Poll::Ready(Err(_)) => {
                 conns.remove(key);
                 None
@@ -77,21 +108,45 @@ impl H2Pool {
         }
     }
 
-    /// Remember `send_req` for `key`, replacing any previous handle.
-    fn store(&self, key: &str, send_req: SendRequest<Bytes>) {
+    /// Remember `send_req` for `key`, replacing any previous handle, and
+    /// return the generation it was stored under. The generation is handed out
+    /// whether or not the connection was remembered, so a caller over the
+    /// authority cap still has a value to evict with (it matches nothing).
+    fn store(&self, key: &str, send_req: SendRequest<Bytes>, addr: SocketAddr) -> u64 {
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut conns) = self.conns.lock() {
             if conns.len() >= MAX_POOLED_AUTHORITIES && !conns.contains_key(key) {
-                return;
+                return generation;
             }
-            conns.insert(key.to_string(), send_req);
+            conns.insert(
+                key.to_string(),
+                Pooled {
+                    generation,
+                    send_req,
+                    addr,
+                },
+            );
+        }
+        generation
+    }
+
+    /// Forget the connection under `key` — but only if it is still the one
+    /// `generation` names. A later connection stored under the same key is a
+    /// different connection and is left alone.
+    pub(crate) fn remove_if(&self, key: &str, generation: u64) {
+        if let Ok(mut conns) = self.conns.lock() {
+            if conns.get(key).is_some_and(|c| c.generation == generation) {
+                conns.remove(key);
+            }
         }
     }
 
-    /// Forget the connection under `key` (it failed mid-exchange).
-    fn remove(&self, key: &str) {
-        if let Ok(mut conns) = self.conns.lock() {
-            conns.remove(key);
-        }
+    /// The generation currently pooled under `key`, if any. A window into the
+    /// pool for tests, which otherwise cannot tell one connection from the
+    /// next.
+    #[cfg(test)]
+    pub(crate) fn generation_of(&self, key: &str) -> Option<u64> {
+        self.conns.lock().ok()?.get(key).map(|c| c.generation)
     }
 }
 
@@ -105,23 +160,46 @@ pub(crate) async fn exchange(
     pool: &H2Pool,
     stream: Box<dyn ProbeStream>,
     key: &str,
+    addr: SocketAddr,
     req: &HttpRequest,
-    response_timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<HttpResponse> {
     let send_req = handshake(stream, key).await?;
-    pool.store(key, send_req.clone());
-    exchange_pooled(pool, send_req, key, req, response_timeout).await
+    let generation = pool.store(key, send_req.clone(), addr);
+    let mut saw_response = false;
+    exchange_pooled(
+        pool,
+        Checkout {
+            send_req,
+            generation,
+            addr,
+        },
+        key,
+        req,
+        deadline,
+        &mut saw_response,
+    )
+    .await
 }
 
 /// Run one request/response exchange over an already-open connection taken
-/// from `pool`. A failure drops the connection from the pool and is returned
+/// from `pool`. A failure drops that connection from the pool and is returned
 /// as-is: the caller, not this layer, decides whether to try again.
+///
+/// `deadline` is the caller's own whole-exchange deadline, not a second budget
+/// of this layer's own: [`crate::sender::HttpSender`] owns the cap on the whole
+/// exchange (it starts before the dial) and [`H2_WIRE_TIMEOUT`] caps a single
+/// await on the wire. Nothing in between sets a third one (review finding Q3).
+///
+/// `saw_response` is set once any part of a response has arrived, which is what
+/// tells the caller whether reissuing on a fresh connection is still safe.
 pub(crate) async fn exchange_pooled(
     pool: &H2Pool,
-    send_req: SendRequest<Bytes>,
+    checkout: Checkout,
     key: &str,
     req: &HttpRequest,
-    response_timeout: Duration,
+    deadline: tokio::time::Instant,
+    saw_response: &mut bool,
 ) -> Result<HttpResponse> {
     // Armed for the whole exchange: a deadline *above* this layer (the
     // sender's whole-exchange timeout, which starts before the dial and so
@@ -132,14 +210,17 @@ pub(crate) async fn exchange_pooled(
     let mut eviction = PoolEviction {
         pool,
         key,
+        generation: checkout.generation,
         armed: true,
     };
-    let result = match tokio::time::timeout(response_timeout, stream_exchange(send_req, req)).await
+    let result = match tokio::time::timeout_at(
+        deadline,
+        stream_exchange(checkout.send_req, req, saw_response),
+    )
+    .await
     {
         Ok(result) => result,
-        Err(_) => Err(anyhow!(
-            "h2 exchange with {key} timed out after {response_timeout:?}"
-        )),
+        Err(_) => Err(anyhow!("h2 exchange with {key} timed out")),
     };
     if result.is_ok() {
         eviction.armed = false;
@@ -153,13 +234,17 @@ pub(crate) async fn exchange_pooled(
 struct PoolEviction<'a> {
     pool: &'a H2Pool,
     key: &'a str,
+    /// Only this connection is evicted: by the time a slow failure gets here
+    /// another send may already have dialled and pooled a healthy replacement
+    /// under the same key.
+    generation: u64,
     armed: bool,
 }
 
 impl Drop for PoolEviction<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.pool.remove(self.key);
+            self.pool.remove_if(self.key, self.generation);
         }
     }
 }
@@ -199,7 +284,11 @@ async fn handshake(stream: Box<dyn ProbeStream>, key: &str) -> Result<SendReques
 
 /// One stream on an open connection: send the head (and body), read the head,
 /// the body up to [`MAX_RESPONSE_BYTES`], and the trailers.
-async fn stream_exchange(send_req: SendRequest<Bytes>, req: &HttpRequest) -> Result<HttpResponse> {
+async fn stream_exchange(
+    send_req: SendRequest<Bytes>,
+    req: &HttpRequest,
+    saw_response: &mut bool,
+) -> Result<HttpResponse> {
     let head = crate::translate::h2_request_from(req);
     let body = match &req.body {
         Body::Bytes(bytes) => bytes.clone(),
@@ -223,6 +312,9 @@ async fn stream_exchange(send_req: SendRequest<Bytes>, req: &HttpRequest) -> Res
     let response = wire("response", response)
         .await?
         .context("await h2 response")?;
+    // From here on the peer has answered: whatever goes wrong next, this
+    // request must not be put on the wire a second time.
+    *saw_response = true;
     let (parts, mut recv) = response.into_parts();
     // `response_from_h2` is what marks the result `HttpVersion::H2`.
     let head = crate::translate::response_from_h2(&parts);
@@ -480,6 +572,57 @@ mod tests {
         }
     }
 
+    /// An h2 origin that answers `serves` streams and then goes away the
+    /// moment the next one arrives — a peer that was healthy when the
+    /// connection was pooled and is not when it is reused. Deterministic,
+    /// unlike waiting for a client task to notice a GOAWAY it has not polled
+    /// yet.
+    async fn h2_origin_goaway_after(io: DuplexStream, seen: Seen, serves: usize) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        let mut served = 0usize;
+        while let Some(accepted) = conn.accept().await {
+            let Ok((req, mut respond)) = accepted else {
+                break;
+            };
+            served += 1;
+            if served > serves {
+                conn.abrupt_shutdown(h2::Reason::NO_ERROR);
+                continue;
+            }
+            let (parts, rbody) = req.into_parts();
+            drop(rbody);
+            record(&seen, &parts, Vec::new());
+            let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                return;
+            };
+            if let Ok(mut send) = respond.send_response(resp, false) {
+                let _ = send.send_data(Bytes::from_static(b"hi"), true);
+            }
+        }
+    }
+
+    /// A resolver whose answer a test can change between sends.
+    struct SwitchableResolver(Mutex<IpAddr>);
+
+    impl SwitchableResolver {
+        fn new(ip: IpAddr) -> Self {
+            Self(Mutex::new(ip))
+        }
+
+        fn set(&self, ip: IpAddr) {
+            *self.0.lock().expect("resolver") = ip;
+        }
+    }
+
+    impl HostResolver for SwitchableResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            let ip = *self.0.lock().expect("resolver");
+            Box::pin(async move { Ok(vec![ip]) })
+        }
+    }
+
     /// An h2 origin that accepts streams and never answers them.
     async fn silent_h2_origin(io: DuplexStream) {
         let Ok(mut conn) = h2::server::handshake(io).await else {
@@ -587,6 +730,16 @@ mod tests {
         }
     }
 
+    /// The address the duplex "connections" in these tests stand in for.
+    fn test_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)
+    }
+
+    /// A whole-exchange deadline `secs` from now, as `send_impl` computes one.
+    fn in_secs(secs: u64) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(secs)
+    }
+
     /// A sender whose only way out is `dialer`.
     fn sender_with(dialer: Arc<DuplexDialer>) -> HttpSender {
         HttpSender::new()
@@ -605,8 +758,9 @@ mod tests {
             &pool,
             Box::new(client),
             "origin.test:443",
+            test_addr(),
             &https_get("/x"),
-            Duration::from_secs(10),
+            in_secs(10),
         )
         .await
         .expect("the h2 exchange succeeds");
@@ -640,8 +794,9 @@ mod tests {
             &pool,
             Box::new(client),
             "origin.test:443",
+            test_addr(),
             &req,
-            Duration::from_secs(10),
+            in_secs(10),
         )
         .await
         .expect("the h2 exchange succeeds");
@@ -744,8 +899,9 @@ mod tests {
             &pool,
             Box::new(client),
             "origin.test:443",
+            test_addr(),
             &https_get("/big"),
-            Duration::from_secs(60),
+            in_secs(60),
         )
         .await
         .expect("the h2 exchange succeeds");
@@ -794,8 +950,9 @@ mod tests {
             &pool,
             Box::new(client),
             "origin.test:443",
+            test_addr(),
             &https_get("/hang"),
-            Duration::from_secs(5),
+            in_secs(5),
         )
         .await
         .expect_err("a server that never answers must time the exchange out");
@@ -858,8 +1015,9 @@ mod tests {
             &pool,
             Box::new(client),
             "origin.test:443",
+            test_addr(),
             &https_get("/t"),
-            Duration::from_secs(10),
+            in_secs(10),
         )
         .await
         .expect("the h2 exchange succeeds");
@@ -1010,6 +1168,188 @@ mod tests {
         for origin in origins {
             origin.abort();
         }
+    }
+
+    /// Q1: a pooled connection the peer has since gone away on must not fail
+    /// an interactive reissue. The *same* send evicts it and dials once.
+    #[tokio::test]
+    async fn a_stale_pooled_connection_is_redialled_within_the_same_send() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let first = tokio::spawn(h2_origin_goaway_after(server1, seen.clone(), 1));
+        let second = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let first_resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first h2c exchange succeeds");
+        assert_eq!(first_resp.status, 200);
+        assert_eq!(dialer.calls(), 1);
+
+        let second_resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/b"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the stale pooled connection is redialled, not reported");
+        assert_eq!(second_resp.status, 200);
+        assert_eq!(body_bytes(&second_resp), b"hi".to_vec());
+        assert_eq!(
+            dialer.calls(),
+            2,
+            "one redial, inside the one send the caller made"
+        );
+        let paths: Vec<String> = seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/a".to_string(), "/b".to_string()],
+            "the redial carried the same request"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
+    /// Q1: a connection this send dialled itself is never redialled — one
+    /// failure, one error, at most two connections per send.
+    #[tokio::test]
+    async fn a_freshly_dialled_connection_that_fails_is_not_redialled() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        // This peer goes away on the very first stream — on a connection this
+        // send dialled itself.
+        let first = tokio::spawn(h2_origin_goaway_after(server1, seen.clone(), 0));
+        // A healthy origin is queued behind it: a wrong retry would find it
+        // and the send would wrongly succeed.
+        let second = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/a"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a peer that goes away on a fresh connection fails the send");
+        assert!(err.to_string().contains("h2"), "error was {err}");
+        assert_eq!(dialer.calls(), 1, "a fresh connection is never retried");
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "the healthy origin must never have been reached"
+        );
+        drop(sender);
+        first.abort();
+        second.abort();
+    }
+
+    /// Q2: eviction names a connection, not just a key. A failure that lands
+    /// after another send has already pooled a healthy replacement must not
+    /// drop the replacement.
+    #[tokio::test]
+    async fn evicting_an_older_generation_leaves_the_newer_connection_pooled() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let first = tokio::spawn(h2_origin(server1, b"hi", seen.clone(), false));
+        let second = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
+
+        let pool = H2Pool::new();
+        let older = handshake(Box::new(client1), "k")
+            .await
+            .expect("the first handshake");
+        let older_gen = pool.store("k", older, test_addr());
+        let newer = handshake(Box::new(client2), "k")
+            .await
+            .expect("the second handshake");
+        let newer_gen = pool.store("k", newer, test_addr());
+
+        assert_ne!(older_gen, newer_gen);
+        assert_eq!(pool.generation_of("k"), Some(newer_gen));
+
+        pool.remove_if("k", older_gen);
+        assert_eq!(
+            pool.generation_of("k"),
+            Some(newer_gen),
+            "the older connection's eviction must not drop its replacement"
+        );
+
+        pool.remove_if("k", newer_gen);
+        assert_eq!(
+            pool.generation_of("k"),
+            None,
+            "its own generation does evict it"
+        );
+        first.abort();
+        second.abort();
+    }
+
+    /// SEC-8: the gate sees what the name resolves to *now*; a pooled
+    /// connection goes where it was dialled. A pooled peer that has become
+    /// forbidden is refused even though the fresh answer would be allowed.
+    #[tokio::test]
+    async fn a_pooled_connection_to_a_now_forbidden_address_is_refused() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let (client, server) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let origin = tokio::spawn(h2_origin(server, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let resolver = Arc::new(SwitchableResolver::new(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let sender = HttpSender::new()
+            .with_resolver(resolver.clone())
+            .with_dialer(dialer.clone())
+            .with_ssrf(SsrfPolicy::default(), guard.clone());
+        let req = h2c_get("/a");
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("a scoped loopback literal passes the gate");
+        assert_eq!(resp.status, 200);
+        assert_eq!(dialer.calls(), 1);
+
+        // The operator unscoped the loopback literal, and the name now answers
+        // a public address the gate is perfectly happy with.
+        assert!(guard.remove_scope("127.0.0.1"), "the entry was present");
+        resolver.set(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("the pooled loopback connection is no longer allowed");
+        assert!(err.to_string().contains("SSRF"), "error was {err}");
+        assert_eq!(dialer.calls(), 1, "a refused send never dials");
+        assert_eq!(
+            seen.lock().expect("seen").len(),
+            1,
+            "no stream was opened for the refused send"
+        );
+        drop(sender);
+        origin.abort();
     }
 
     /// The SSRF gate runs on every send, including one that would ride a

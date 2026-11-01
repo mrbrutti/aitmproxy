@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    ssrf_check, Authority, Body, HeaderMap, HttpRequest, HttpResponse, RequestSender,
-    ScopeRateGuard, SsrfPolicy, VersionPolicy,
+    ssrf_check, Authority, Body, HttpRequest, HttpResponse, RequestSender, ScopeRateGuard,
+    SsrfPolicy, VersionPolicy,
 };
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
@@ -331,7 +331,7 @@ impl HttpSender {
     async fn send_impl(&self, req: HttpRequest, version: VersionPolicy) -> Result<HttpResponse> {
         let scheme = req.scheme.to_ascii_lowercase();
         let tls = scheme == "https";
-        let req = prepare_common(&req);
+        let req = prepare_common(req);
         let (host, port) = split_authority(&req.authority, &scheme)?;
         let authority = Authority::new(&host, port).to_string();
         // Everything connection-shaped — the ALPN cache and the h2 pool — is
@@ -364,6 +364,20 @@ impl HttpSender {
             .map(|ip| SocketAddr::new(ip, port))
             .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
 
+        // One deadline for the whole exchange, taken before the dial: every
+        // layer below works to this instant rather than starting a budget of
+        // its own (review finding Q3).
+        let deadline = tokio::time::Instant::now() + self.response_timeout;
+        let leg = ExchangeLeg {
+            key: &key,
+            host: &host,
+            authority: &authority,
+            addr,
+            tls,
+            version,
+            deadline,
+        };
+
         // When this send is going to speak h2 whatever ALPN says, a live
         // pooled connection to the authority serves it without a second dial.
         // The resolve and the SSRF gate above still run every time, so reuse
@@ -374,77 +388,46 @@ impl HttpSender {
             None
         };
 
+        // The gate above ran on what the name resolves to *now*; a pooled
+        // connection goes to the address it was dialled to back then. Check
+        // that address too, and refuse the send — dropping the connection —
+        // when it is no longer allowed. A fresh answer that passes does not
+        // make an open connection to a now-forbidden peer acceptable (review
+        // finding SEC-8).
+        if let (Some(checkout), Some(gate)) = (&pooled, &self.ssrf) {
+            if let Err(e) = gate.check("reissue", &authority, &host, &[checkout.addr.ip()]) {
+                self.h2_pool.remove_if(&key, checkout.generation);
+                return Err(e);
+            }
+        }
+
         let exchange = async {
-            if let Some(send_req) = pooled {
-                return crate::h2_sender::exchange_pooled(
+            if let Some(checkout) = pooled {
+                let mut saw_response = false;
+                let result = crate::h2_sender::exchange_pooled(
                     &self.h2_pool,
-                    send_req,
+                    checkout,
                     &key,
                     &req,
-                    self.response_timeout,
+                    deadline,
+                    &mut saw_response,
                 )
                 .await;
-            }
-            let stream = self.dialer.dial(addr).await?;
-            if tls {
-                let offer = self.alpn_offer(&key, version);
-                let name = ServerName::try_from(host.clone())
-                    .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
-                let tls_stream = match TlsConnector::from(self.client_config(&offer)?)
-                    .connect(name, stream)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => return Err(handshake_error(e, &authority, &host, &offer)),
-                };
-                let selected = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-                let negotiated = match selected.as_deref() {
-                    Some(ALPN_H2) => Negotiated::H2,
-                    _ => Negotiated::H1,
-                };
-                // Only an `Auto` send records what the authority settled on: a
-                // forced h1 or h2 offer carries one protocol, so what came
-                // back says nothing about what would have been negotiated and
-                // must not steer a later `Auto` send (plan Task 3, item 5).
-                if matches!(version, VersionPolicy::Auto) {
-                    self.alpn.insert(key.clone(), negotiated);
+                match result {
+                    Ok(resp) => return Ok(resp),
+                    // The peer had begun answering: the request is on the
+                    // record at the origin and is never put on the wire again.
+                    Err(e) if saw_response => return Err(e),
+                    // Nothing came back at all — the pooled connection was
+                    // stale (the peer had gone away since it was last used).
+                    // It is already evicted; fall through and dial, once. A
+                    // freshly dialled connection never reaches this arm, so
+                    // one failed send costs at most two connections (review
+                    // finding Q1).
+                    Err(_) => {}
                 }
-                match negotiated {
-                    Negotiated::H2 => {
-                        crate::h2_sender::exchange(
-                            &self.h2_pool,
-                            Box::new(tls_stream),
-                            &key,
-                            &req,
-                            self.response_timeout,
-                        )
-                        .await
-                    }
-                    // `h2c` over TLS is just `h2` (session call S2), so both
-                    // forced-h2 policies fail the same way here.
-                    Negotiated::H1 if matches!(version, VersionPolicy::H2 | VersionPolicy::H2c) => {
-                        Err(SendError::H2NotNegotiated {
-                            authority: authority.clone(),
-                            detail: match selected.as_deref() {
-                                Some(other) => format!(
-                                    "server negotiated {} instead of h2",
-                                    String::from_utf8_lossy(other)
-                                ),
-                                None => "server negotiated no ALPN protocol".into(),
-                            },
-                        }
-                        .into())
-                    }
-                    Negotiated::H1 => drive(tls_stream, &prepare_h1(&req)).await,
-                }
-            } else if matches!(version, VersionPolicy::H2c) {
-                // Prior-knowledge cleartext h2: no TLS, no ALPN, straight into
-                // the h2 preface on the raw stream.
-                crate::h2_sender::exchange(&self.h2_pool, stream, &key, &req, self.response_timeout)
-                    .await
-            } else {
-                drive(stream, &prepare_h1(&req)).await
             }
+            self.dial_and_exchange(&req, &leg).await
         };
         tokio::time::timeout(self.response_timeout, exchange)
             .await
@@ -455,6 +438,101 @@ impl HttpSender {
                 )
             })?
     }
+
+    /// Dial `leg.addr`, negotiate (for `https`) and run the exchange on the
+    /// fresh connection. The whole-exchange cap belongs to `send_impl`, which
+    /// wraps this.
+    async fn dial_and_exchange(
+        &self,
+        req: &HttpRequest,
+        leg: &ExchangeLeg<'_>,
+    ) -> Result<HttpResponse> {
+        let ExchangeLeg {
+            key,
+            host,
+            authority,
+            addr,
+            tls,
+            version,
+            deadline,
+        } = *leg;
+        let stream = self.dialer.dial(addr).await?;
+        if tls {
+            let offer = self.alpn_offer(key, version);
+            let name = ServerName::try_from(host.to_string())
+                .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
+            let tls_stream = match TlsConnector::from(self.client_config(&offer)?)
+                .connect(name, stream)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => return Err(handshake_error(e, authority, host, &offer)),
+            };
+            let selected = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+            let negotiated = match selected.as_deref() {
+                Some(ALPN_H2) => Negotiated::H2,
+                _ => Negotiated::H1,
+            };
+            // Only an `Auto` send records what the authority settled on: a
+            // forced h1 or h2 offer carries one protocol, so what came
+            // back says nothing about what would have been negotiated and
+            // must not steer a later `Auto` send (plan Task 3, item 5).
+            if matches!(version, VersionPolicy::Auto) {
+                self.alpn.insert(key.to_string(), negotiated);
+            }
+            match negotiated {
+                Negotiated::H2 => {
+                    crate::h2_sender::exchange(
+                        &self.h2_pool,
+                        Box::new(tls_stream),
+                        key,
+                        addr,
+                        req,
+                        deadline,
+                    )
+                    .await
+                }
+                // `h2c` over TLS is just `h2` (session call S2), so both
+                // forced-h2 policies fail the same way here.
+                Negotiated::H1 if matches!(version, VersionPolicy::H2 | VersionPolicy::H2c) => {
+                    Err(SendError::H2NotNegotiated {
+                        authority: authority.to_string(),
+                        detail: match selected.as_deref() {
+                            Some(other) => format!(
+                                "server negotiated {} instead of h2",
+                                String::from_utf8_lossy(other)
+                            ),
+                            None => "server negotiated no ALPN protocol".into(),
+                        },
+                    }
+                    .into())
+                }
+                Negotiated::H1 => drive(tls_stream, &prepare_h1(req)).await,
+            }
+        } else if matches!(version, VersionPolicy::H2c) {
+            // Prior-knowledge cleartext h2: no TLS, no ALPN, straight into
+            // the h2 preface on the raw stream.
+            crate::h2_sender::exchange(&self.h2_pool, stream, key, addr, req, deadline).await
+        } else {
+            drive(stream, &prepare_h1(req)).await
+        }
+    }
+}
+
+/// Everything one exchange needs that the request itself does not carry.
+struct ExchangeLeg<'a> {
+    /// `scheme://host:port`: the ALPN cache and h2 pool identity.
+    key: &'a str,
+    /// The host to put in SNI and in an error.
+    host: &'a str,
+    /// `host:port`, as an `h2_not_negotiated` names it.
+    authority: &'a str,
+    /// The validated address to dial.
+    addr: SocketAddr,
+    tls: bool,
+    version: VersionPolicy,
+    /// When the whole exchange must be done, counted from before the dial.
+    deadline: tokio::time::Instant,
 }
 
 impl RequestSender for HttpSender {
@@ -511,24 +589,16 @@ fn handshake_error(
 /// Normalise a request for sending, whatever the version: a `Host` header from
 /// the authority, and no inherited `Connection` header. Framing headers are
 /// left to the version-specific path.
-fn prepare_common(req: &HttpRequest) -> HttpRequest {
-    let mut headers = HeaderMap::new();
-    for (name, value) in req.headers.iter() {
-        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        let _ = headers.try_set(name, value);
-    }
+fn prepare_common(mut req: HttpRequest) -> HttpRequest {
+    req.headers.remove("host");
+    req.headers.remove("connection");
     let host = req
         .authority
         .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(&req.authority);
-    let _ = headers.try_set("Host", host);
-    HttpRequest {
-        headers,
-        ..req.clone()
-    }
+        .map(|(_, h)| h.to_string())
+        .unwrap_or_else(|| req.authority.clone());
+    let _ = req.headers.try_set("Host", &host);
+    req
 }
 
 /// The HTTP/1.1 form of [`prepare_common`]: add `Connection: close` so the
@@ -659,6 +729,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use aitm_core::HeaderMap;
     use tokio::io::{duplex, DuplexStream};
 
     /// A request for `path` on `127.0.0.1:8080`.
