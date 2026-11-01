@@ -1,6 +1,6 @@
 //! The Jobs tab's state (spec D3, D11) and the two text helpers its rows use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aitm_scan_model::{JobId, JobState, JobStatus, JobSummary, ListResult, Phase};
 
@@ -17,8 +17,10 @@ pub enum JobPane {
 /// The Jobs tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct JobsState {
-    /// `scan.list`'s order (newest first); jobs this TUI started are inserted
-    /// at the front until the next list.
+    /// The rows, newest first: `scan.list`'s order, with the `started_here`
+    /// ids the list omits kept at the front (spec D3). A `scan.status` reply
+    /// for a job not yet here puts it at the front until the next list, which
+    /// drops it unless it is marked.
     pub order: Vec<JobId>,
     /// The summary of every listed job.
     pub summaries: BTreeMap<JobId, JobSummary>,
@@ -31,6 +33,11 @@ pub struct JobsState {
     pub detail_scroll: u16,
     /// The tick of the last `scan.list` request.
     pub listed_at_tick: u64,
+    /// The jobs this TUI started (spec D3): a `StartResult` fold inserts the
+    /// id (Task 12), a `scan.list` that carries it removes it, and
+    /// [`JobsState::fold_list`] keeps at the front exactly the marked ids a
+    /// list omits.
+    pub started_here: BTreeSet<JobId>,
 }
 
 impl JobsState {
@@ -46,38 +53,47 @@ impl JobsState {
         self.full.insert(id, status);
     }
 
-    /// Fold a `scan.list` reply (spec D3, D10): `order` becomes the result's
-    /// order, `summaries` is replaced, `full` entries are kept. Returns the
-    /// listed ids that have no `full` entry yet, for one `scan.status` each.
-    ///
-    /// A job this TUI started that the list does not carry yet stays at the
-    /// front. The plan does not say how such a job is told apart from one the
-    /// core has since forgotten, and the state carries no "started here" mark;
-    /// the builder's rule is "in `order`, absent from the list, with a `full`
-    /// entry that is not terminal": a launch (Task 12) folds its `StartResult`
-    /// status into `full` before any list carries it, while a forgotten job
-    /// only ever reaches a terminal state before it leaves the retained list.
+    /// Fold a `scan.list` reply (spec D3, D10). `order` becomes the list's
+    /// order with, at the front, exactly the `started_here` ids the list
+    /// omits; a list that carries a marked id unmarks it. The list's rows
+    /// replace their `summaries`; `full` and `summaries` then keep only the
+    /// jobs in `order`, so a job the core forgot, or one learned only from a
+    /// reply or a push line, leaves with the list. A row whose id is not in
+    /// the wire form is skipped (D6 hostile-core bounds). Returns the listed
+    /// ids with no `full` entry yet, in list order, for one `scan.status`
+    /// each (the caller caps them at [`super::MAX_STATUS_FOLLOWUPS`]).
     pub fn fold_list(&mut self, mut list: ListResult) -> Vec<JobId> {
-        // D6 hostile-core bound: a row whose id is not in the wire form is
-        // skipped, never polled or listed.
         list.jobs.retain(|j| is_job_id(&j.job));
-        let listed: Vec<JobId> = list.jobs.iter().map(|j| j.job.clone()).collect();
-        let kept: Vec<JobId> = self
+        let listed: BTreeSet<JobId> = list.jobs.iter().map(|j| j.job.clone()).collect();
+        self.started_here.retain(|id| !listed.contains(id));
+        let known: BTreeSet<&JobId> = self.order.iter().collect();
+        let mut order: Vec<JobId> = self
             .order
             .iter()
-            .filter(|id| {
-                !listed.contains(id) && self.full.get(*id).is_some_and(|s| !s.state.is_terminal())
-            })
+            .filter(|id| self.started_here.contains(*id))
             .cloned()
             .collect();
-        self.order = kept;
-        self.order.extend(listed.iter().cloned());
-        self.summaries = list.jobs.into_iter().map(|j| (j.job.clone(), j)).collect();
+        order.extend(
+            self.started_here
+                .iter()
+                .filter(|id| !known.contains(id))
+                .cloned(),
+        );
+        order.extend(list.jobs.iter().map(|j| j.job.clone()));
+        for summary in list.jobs {
+            self.summaries.insert(summary.job.clone(), summary);
+        }
+        let kept: BTreeSet<&JobId> = order.iter().collect();
+        self.full.retain(|id, _| kept.contains(id));
+        self.summaries.retain(|id, _| kept.contains(id));
+        let followups = order
+            .iter()
+            .filter(|id| listed.contains(*id) && !self.full.contains_key(*id))
+            .cloned()
+            .collect();
+        self.order = order;
         self.cursor = self.cursor.min(self.order.len().saturating_sub(1));
-        listed
-            .into_iter()
-            .filter(|id| !self.full.contains_key(id))
-            .collect()
+        followups
     }
 
     /// The newest job in `order` whose summary is not terminal (spec D2: the

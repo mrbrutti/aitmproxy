@@ -13,10 +13,11 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use aitm_scan_model::{JobStatus, ListResult};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::App;
 use aitm_tui::caps::TermCaps;
-use aitm_tui::scan::is_job_id;
+use aitm_tui::scan::{is_job_id, parse_result, JobsState};
 use common::*;
 use serde_json::{json, Value};
 
@@ -304,5 +305,80 @@ fn a_list_row_with_a_forged_job_id_is_skipped() {
             name: "scan.status".into(),
             args: json!({ "job": JOB }),
         }]
+    );
+}
+
+/// A running `scan.status.json` body under `id`, parsed.
+fn running_status(id: &str) -> JobStatus {
+    let mut body = fixture("scan.status.json");
+    body["job"] = json!(id);
+    parse_result::<JobStatus>("scan.status", &body).expect("a running status")
+}
+
+/// `scan.list.json`, parsed.
+fn list_fixture() -> ListResult {
+    parse_result::<ListResult>("scan.list", &fixture("scan.list.json")).expect("the list")
+}
+
+/// D3 `started_here` rule (fix round B, B3, a): a job this TUI started that
+/// the list omits stays at the front of `order`, with its `full` entry.
+#[test]
+fn fold_list_keeps_a_started_here_job_the_list_omits_at_the_front() {
+    let mut jobs = JobsState::default();
+    jobs.fold_status(running_status("scan-aaaaaaaa"));
+    jobs.started_here.insert("scan-aaaaaaaa".to_string());
+    let followups = jobs.fold_list(list_fixture());
+    assert_eq!(
+        jobs.order,
+        vec![
+            "scan-aaaaaaaa".to_string(),
+            JOB.to_string(),
+            "scan-55667788".to_string()
+        ]
+    );
+    assert!(jobs.full.contains_key("scan-aaaaaaaa"));
+    assert!(jobs.summaries.contains_key("scan-aaaaaaaa"));
+    assert_eq!(
+        jobs.started_here,
+        BTreeSet::from(["scan-aaaaaaaa".to_string()]),
+        "a job the list still omits stays marked"
+    );
+    assert_eq!(
+        followups,
+        vec![JOB.to_string(), "scan-55667788".to_string()],
+        "the listed jobs without a full entry are polled once"
+    );
+}
+
+/// D3 `started_here` rule (fix round B, B3, b): a running job learned only
+/// from a reply (not started here) is dropped from `order`, `full` and
+/// `summaries` when a list omits it.
+#[test]
+fn fold_list_drops_a_running_job_the_list_omits_unless_started_here() {
+    let mut jobs = JobsState::default();
+    jobs.fold_status(running_status("scan-bbbbbbbb"));
+    assert_eq!(jobs.order, vec!["scan-bbbbbbbb".to_string()]);
+    let _ = jobs.fold_list(list_fixture());
+    assert_eq!(
+        jobs.order,
+        vec![JOB.to_string(), "scan-55667788".to_string()]
+    );
+    assert!(!jobs.full.contains_key("scan-bbbbbbbb"));
+    assert!(!jobs.summaries.contains_key("scan-bbbbbbbb"));
+    assert!(jobs.live().iter().all(|id| id != "scan-bbbbbbbb"));
+}
+
+/// D3 `started_here` rule (fix round B, B3, c): a list that carries the id
+/// removes it from `started_here`; `order` is the list's order.
+#[test]
+fn fold_list_unmarks_a_started_here_job_the_list_carries() {
+    let mut jobs = JobsState::default();
+    jobs.fold_status(running_status(JOB));
+    jobs.started_here.insert(JOB.to_string());
+    let _ = jobs.fold_list(list_fixture());
+    assert!(jobs.started_here.is_empty());
+    assert_eq!(
+        jobs.order,
+        vec![JOB.to_string(), "scan-55667788".to_string()]
     );
 }
