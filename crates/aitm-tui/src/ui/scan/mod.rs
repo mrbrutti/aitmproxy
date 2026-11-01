@@ -1,207 +1,192 @@
-//! The Scan operator surface (scanner-integration Stage 1, AC4): a scope-bound
-//! `scan.discover` launch header, the discovered endpoints (each openable to its
-//! linked flow, AC3) and the discovered injection points. It mirrors the
-//! Findings/Browser panels' shape and reuses the shared list rendering; the
-//! scanner engine is `aitm-plugin-scanner` and this only surfaces its result.
+//! The Scan operator surface (scanner v2 spec D2, D11, D13): one box with the
+//! four-tab strip, a one-line state banner and the active tab's view.
+//!
+//! This module owns only the chrome every tab shares; `profiles`, `jobs`,
+//! `sitemap` and `issues` draw one tab each, and `confirm` is the wire-confirm
+//! overlay. What the view can show at all is the feature matrix of D2: a bus
+//! with `scan.start` gets the v2 surface, a bus with only `scan.discover` the
+//! legacy one-shot (D12), a bus with neither is told so in the banner.
 
 pub mod confirm;
+pub mod issues;
+pub mod jobs;
+pub mod profiles;
+pub mod sitemap;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use crate::app::{App, ScanFocus};
+use crate::app::App;
+use crate::scan::{ScanOffer, ScanTab};
 use crate::theme::Theme;
 use crate::ui::bars::put;
 use crate::ui::overlays::boxed;
-use crate::ui::selection_bg;
-use crate::ui::text::{cells, truncate};
+use crate::ui::text::truncate;
+
+/// What a bus without any scanner is told, in the banner of every tab (D2).
+pub const NO_SCANNER: &str = "the scanner is not on this bus (scan.start / scan.discover)";
 
 /// Draw the Scan view into `area`.
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Scan — crawl & injection-point discovery", area, buf);
+    let inner = boxed(theme, "Scan", area, buf);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    // Degraded when the bus does not offer the scanner (never broken, §2.8).
-    if !app.has_tool("scan.discover") {
-        buf.set_string(
-            inner.x + 1,
-            inner.y + 1,
-            "scan.discover is not on this bus (needs the scanner plugin).",
-            theme.text_tertiary(),
-        );
+    let strip = Rect::new(inner.x, inner.y, inner.width, 1);
+    tab_strip(app, theme, strip, buf);
+    if inner.height < 2 {
         return;
     }
-    let [target_line, hint_line, lists] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(2),
-    ])
-    .areas(inner);
-
-    header(app, theme, target_line, hint_line, buf);
-
-    let [ep, ip] =
-        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(lists);
-    for y in ep.y..ep.bottom() {
-        buf.set_string(ep.right().saturating_sub(1), y, "│", theme.rule());
+    let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+    match app.scan.tab {
+        ScanTab::Profiles => profiles::render(app, theme, body, buf),
+        ScanTab::Jobs => jobs::render(app, theme, body, buf),
+        ScanTab::SiteMap => sitemap::render(app, theme, body, buf),
+        ScanTab::Issues => issues::render(app, theme, body, buf),
     }
-    endpoints(
-        app,
-        theme,
-        Rect::new(ep.x, ep.y, ep.width.saturating_sub(1), ep.height),
-        buf,
-    );
-    points(app, theme, ip, buf);
 }
 
-/// The launch header: the scope-bound target and the crawl state, then a hint
-/// (or the last error).
-fn header(app: &App, theme: &Theme, target_area: Rect, hint_area: Rect, buf: &mut Buffer) {
-    let state = if app.scan.running {
-        Span::styled(
-            "crawling…",
-            theme.text_secondary().add_modifier(Modifier::BOLD),
-        )
-    } else if app.scan.endpoints.is_empty() && app.scan.points.is_empty() {
-        Span::styled("idle", theme.text_tertiary())
+/// `1 Profiles  2 Jobs  3 Site map  4 Issues`, the active tab bold, with the
+/// state banner to its right (D11). A banner too long for what the strip
+/// leaves is cut rather than wrapped; the detail it names is always on the
+/// tab itself.
+fn tab_strip(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let mut spans = Vec::new();
+    for tab in ScanTab::ALL {
+        let active = app.scan.tab == tab;
+        let style = if active {
+            theme.text_primary().add_modifier(Modifier::BOLD)
+        } else {
+            theme.text_tertiary()
+        };
+        spans.push(Span::styled(
+            format!(" {} {} ", tab.index() + 1, tab.label()),
+            style,
+        ));
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let room = usize::from(area.width).saturating_sub(used + 4);
+    let text = banner(app);
+    if room > 0 {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            truncate(&text, room),
+            banner_style(app, theme),
+        ));
+    }
+    put(buf, area, Line::from(spans));
+}
+
+/// The banner's hue: an error reads in the server-error colour, everything
+/// else is secondary text (D13: hue only on data).
+fn banner_style(app: &App, theme: &Theme) -> ratatui::style::Style {
+    if tab_error(app).is_some() {
+        theme.fg(&crate::tokens::color::status::SERVER_ERROR)
     } else {
-        Span::styled(
-            format!(
-                "{} endpoints · {} injection points",
-                app.scan.endpoints.len(),
-                app.scan.points.len()
-            ),
-            theme.text_secondary(),
-        )
+        theme.text_secondary()
+    }
+}
+
+/// The one-line state of the active tab (D11, D13): no scanner at all, the
+/// last error of this tab, a refresh in flight over an empty pane, or `idle`.
+/// The degraded wording of a bus that is missing one verb belongs to the tab
+/// that needs it, not here.
+fn banner(app: &App) -> String {
+    if app.scan_offer() == ScanOffer::None {
+        return NO_SCANNER.to_string();
+    }
+    if let Some(e) = tab_error(app) {
+        return e.wording();
+    }
+    if let Some(verb) = refreshing(app) {
+        return format!("refreshing {verb}...");
+    }
+    "idle".to_string()
+}
+
+/// The active tab's last error, falling back to the view's for a tab that
+/// keeps none of its own.
+fn tab_error(app: &App) -> Option<&crate::scan::ScanError> {
+    let own = match app.scan.tab {
+        ScanTab::Profiles => app.scan.profiles.error.as_ref(),
+        ScanTab::Jobs => None,
+        ScanTab::SiteMap => app.scan.sitemap.error.as_ref(),
+        ScanTab::Issues => app.scan.issues.error.as_ref(),
     };
-    let target = app
+    own.or(app.scan.last_error.as_ref())
+}
+
+/// The verb the active tab is waiting on while its pane is still empty.
+fn refreshing(app: &App) -> Option<&'static str> {
+    let (verb, empty) = match app.scan.tab {
+        ScanTab::Profiles => ("scan.profile.list", app.scan.profiles.list.is_empty()),
+        ScanTab::Jobs => ("scan.list", app.scan.jobs.order.is_empty()),
+        ScanTab::SiteMap => ("scan.sitemap", app.scan.sitemap.nodes.is_empty()),
+        ScanTab::Issues => ("scan.issues", app.scan.issues.list.is_empty()),
+    };
+    let waiting = app
         .scan
-        .target
-        .as_deref()
-        .unwrap_or("no in-scope host — add one to scope (S)");
-    put(
-        buf,
-        target_area,
-        Line::from(vec![
-            Span::styled(" target ", theme.accent().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                truncate(target, usize::from(target_area.width).saturating_sub(24)),
-                theme.text_primary(),
-            ),
-            Span::raw("   "),
-            state,
-        ]),
-    );
-    let hint = match &app.scan.error {
-        Some(e) => Line::styled(
-            format!(" error: {e}"),
-            theme.fg(&crate::tokens::color::status::SERVER_ERROR),
-        ),
-        None => Line::styled(
-            " r scan (scope-bound) · Tab switch list · ↑↓ move · ⏎ open flow · F findings",
-            theme.text_tertiary(),
-        ),
-    };
-    put(buf, hint_area, hint);
+        .inflight
+        .iter()
+        .any(|tag| crate::scan::tag_parts(tag).0 == verb);
+    (empty && waiting).then_some(verb)
 }
 
-/// The reached endpoints: a cursor list of URLs rendered verbatim. When the
-/// endpoints list is focused (Tab), ⏎ opens the selected endpoint's linked flow
-/// in the inspector (AC3) — the cursor row is highlighted only while focused.
-fn endpoints(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    buf.set_string(
-        area.x + 1,
-        area.y,
-        "Endpoints",
-        theme.accent().add_modifier(Modifier::BOLD),
-    );
-    let body = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
-    if body.height == 0 {
-        return;
-    }
-    if app.scan.endpoints.is_empty() {
-        buf.set_string(
-            body.x + 1,
-            body.y,
-            "none yet — r scans an in-scope target",
-            theme.text_tertiary(),
+/// Split a tab's body into its list and detail panes: side by side (45/55)
+/// from 100 columns, stacked (40/60) below that, with one rule between them
+/// (D11). Both rects exclude the rule.
+pub fn panes(area: Rect) -> (Rect, Rect) {
+    if area.width >= 100 {
+        let left = area.width * 45 / 100;
+        let list = Rect::new(area.x, area.y, left, area.height);
+        let detail = Rect::new(
+            area.x + left + 1,
+            area.y,
+            area.width.saturating_sub(left + 1),
+            area.height,
         );
-        return;
-    }
-    let focused = app.scan.focus == ScanFocus::Endpoints;
-    let h = usize::from(body.height);
-    let cursor = app.scan.endpoint_cursor.min(app.scan.endpoints.len() - 1);
-    let top = cursor.saturating_sub(h.saturating_sub(1));
-    for (k, e) in app.scan.endpoints.iter().enumerate().skip(top).take(h) {
-        let y = body.y + cells(k - top);
-        if focused && k == cursor {
-            buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
-        }
-        let line = Line::from(vec![
-            Span::styled(" • ", theme.text_tertiary()),
-            Span::styled(
-                truncate(e, usize::from(body.width).saturating_sub(4)),
-                theme.text_primary(),
-            ),
-        ]);
-        buf.set_line(body.x, y, &line, body.width);
+        (list, detail)
+    } else {
+        let top = (area.height * 40 / 100).max(1);
+        let list = Rect::new(area.x, area.y, area.width, top);
+        let rest = area.height.saturating_sub(top + 1);
+        let detail = Rect::new(area.x, area.y + top + 1, area.width, rest);
+        (list, detail)
     }
 }
 
-/// The discovered injection points: a cursor list of location + name + a
-/// redacted example (the scanner redacts at the source; the UI never re-derives
-/// a raw value).
-fn points(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+/// Draw the rule [`panes`] leaves between the two panes.
+pub fn pane_rule(theme: &Theme, area: Rect, buf: &mut Buffer) {
+    if area.width >= 100 {
+        let x = area.x + area.width * 45 / 100;
+        for y in area.y..area.bottom() {
+            buf.set_string(x, y, "│", theme.rule());
+        }
+    } else {
+        let y = area.y + (area.height * 40 / 100).max(1);
+        if y < area.bottom() {
+            buf.set_string(area.x, y, "─".repeat(usize::from(area.width)), theme.rule());
+        }
+    }
+}
+
+/// One line of secondary text at the top of `area`: what a tab draws when it
+/// is empty, degraded or not served by this bus (D13).
+pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
+    if area.height == 0 || area.width < 2 {
+        return;
+    }
     buf.set_string(
         area.x + 1,
         area.y,
-        "Injection points",
-        theme.accent().add_modifier(Modifier::BOLD),
+        truncate(text, usize::from(area.width).saturating_sub(2)),
+        theme.text_tertiary(),
     );
-    let body = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
-    if body.height == 0 {
-        return;
-    }
-    if app.scan.points.is_empty() {
-        buf.set_string(body.x + 1, body.y, "none yet", theme.text_tertiary());
-        return;
-    }
-    let focused = app.scan.focus == ScanFocus::Points;
-    let h = usize::from(body.height);
-    let cursor = app.scan.cursor.min(app.scan.points.len() - 1);
-    let top = cursor.saturating_sub(h.saturating_sub(1));
-    for (k, p) in app.scan.points.iter().enumerate().skip(top).take(h) {
-        let y = body.y + cells(k - top);
-        if focused && k == cursor {
-            buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
-        }
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {:<12} ", truncate(&p.location, 12)),
-                theme.accent(),
-            ),
-            Span::styled(
-                format!("{} ", truncate(&p.name, 24)),
-                theme.text_primary().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                truncate(&p.example, usize::from(body.width).saturating_sub(40)),
-                theme.text_secondary(),
-            ),
-        ]);
-        buf.set_line(body.x, y, &line, body.width);
-    }
+}
+
+/// The inline wording of a control whose verb this bus does not offer (D2).
+pub fn missing_verb(verb: &str) -> String {
+    format!("{verb} is not on this bus")
 }

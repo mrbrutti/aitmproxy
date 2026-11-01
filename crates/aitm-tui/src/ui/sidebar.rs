@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{App, SidebarItem};
 use crate::model::AgentPolicy;
+use crate::scan::ScanOffer;
 use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::text::{fit, truncate};
@@ -185,14 +186,31 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         None => "F1".to_string(),
     };
     line(buf, item(app, SidebarItem::Agent, Some(agent_count), true));
-    // The Scan surface appears only when the bus offers the scanner plugin
-    // (`scan.discover`); its count is the injection points found this session.
-    if app.has_tool("scan.discover") {
-        let scan_count = if !app.scan.points.is_empty() {
-            app.scan.points.len().to_string()
-        } else {
-            "—".to_string()
-        };
+    // The Scan surface appears only when the bus offers a scanner (spec D2).
+    // Its count is the open issues of the newest job still running on a v2
+    // bus, and the injection points found this session on a legacy one.
+    let offer = app.scan_offer();
+    if offer != ScanOffer::None {
+        let scan_count = match offer {
+            ScanOffer::V2 => app
+                .scan
+                .jobs
+                .order
+                .iter()
+                .find(|j| {
+                    app.scan
+                        .jobs
+                        .summaries
+                        .get(*j)
+                        .is_some_and(|s| !s.state.is_terminal())
+                })
+                .and_then(|j| app.scan.jobs.summaries.get(j))
+                .map(|s| s.issues.total.to_string()),
+            ScanOffer::Legacy => (!app.scan.legacy.points.is_empty())
+                .then(|| app.scan.legacy.points.len().to_string()),
+            ScanOffer::None => None,
+        }
+        .unwrap_or_else(|| "-".to_string());
         line(buf, item(app, SidebarItem::Scan, Some(scan_count), false));
     }
 

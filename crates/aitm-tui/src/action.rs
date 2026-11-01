@@ -69,9 +69,12 @@ pub enum Action {
     /// Scan view `r`: launch a scope-bound `scan.discover` (deny-by-default:
     /// an out-of-scope target is refused; a running crawl blocks re-launch).
     ScanLaunch,
-    /// Scan view Tab: move the cursor between the endpoints list and the
-    /// injection-points list, so either can be walked and opened with ⏎.
-    ScanFocusToggle,
+    /// Scan view `1`..`4`: show that tab (spec D2, D11).
+    ScanTab(crate::scan::ScanTab),
+    /// Scan view Tab: focus the active tab's next pane (spec D11).
+    ScanPaneNext,
+    /// Scan view BackTab: focus the active tab's previous pane.
+    ScanPanePrev,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,

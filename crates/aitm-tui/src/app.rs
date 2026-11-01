@@ -23,6 +23,7 @@ use crate::model::{
     FlowKind, FlowRow, Message, Severity,
 };
 use crate::open::{self, OpenTarget};
+use crate::scan::{ScanOffer, ScanState, ScanTab};
 use crate::theme::Theme;
 use crate::viewers::json;
 
@@ -156,76 +157,11 @@ pub struct BrowserState {
     pub error: Option<String>,
 }
 
-/// One discovered injection point, mirroring an entry of `scan.discover`'s
-/// `injection_points` array (`{flow, location, name, example}`). The `example`
-/// is whatever the scanner handed us (redacted at the source for cookies and
-/// secret-named parameters); the UI renders it verbatim and never re-derives a
-/// raw value.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct InjectionPointRow {
-    /// The flow this point was discovered in.
-    pub flow: String,
-    /// Where it lives (`query`, `body_param`, `header`, `cookie`,
-    /// `path_segment`, `redirect`).
-    pub location: String,
-    /// The parameter / header / segment name.
-    pub name: String,
-    /// The observed (already-redacted) example value.
-    pub example: String,
-}
-
-impl InjectionPointRow {
-    /// Read one `injection_points` entry; missing fields read as empty.
-    fn from_json(v: &Value) -> Self {
-        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        Self {
-            flow: s("flow"),
-            location: s("location"),
-            name: s("name"),
-            example: s("example"),
-        }
-    }
-}
-
-/// Which of the Scan view's two lists holds the cursor. Tab toggles it; ↑↓ walk
-/// the focused list and ⏎ opens its selected row's flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScanFocus {
-    /// The reached-endpoints list (⏎ opens the endpoint's linked flow, AC3).
-    Endpoints,
-    /// The injection-points list (⏎ opens the point's flow). The default, so
-    /// the point list stays the first thing the operator walks.
-    #[default]
-    Points,
-}
-
-/// The Scan view's state (scanner-integration Stage 1): what `scan.discover`
-/// has reported so far. Plain data; `App::on_bus` fills it and `ui::scan` draws
-/// it. The model mirrors the scanner's `endpoints` + `injection_points` JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ScanState {
-    /// A `scan.discover` crawl is in flight; disables re-launch until it
-    /// settles (the Browser `busy` precedent).
-    pub running: bool,
-    /// The scope-bound target URL the last launch sent.
-    pub target: Option<String>,
-    /// The reached endpoints from the last result (each a flow in the store).
-    pub endpoints: Vec<String>,
-    /// AC3 endpoint→flow links from the last result: the scrubbed endpoint URL
-    /// (as it appears in `endpoints`) → the flow id it was reached as. Not every
-    /// endpoint has an entry; ⏎ on an unlinked endpoint opens nothing.
-    pub endpoint_flows: HashMap<String, String>,
-    /// The discovered injection points from the last result.
-    pub points: Vec<InjectionPointRow>,
-    /// The injection-point list cursor.
-    pub cursor: usize,
-    /// The endpoints-list cursor.
-    pub endpoint_cursor: usize,
-    /// Which list the cursor is on; Tab toggles it.
-    pub focus: ScanFocus,
-    /// The last `scan.discover` failure, shown until the next launch.
-    pub error: Option<String>,
-}
+/// The rows the Scan view spends on chrome rather than list body, so a
+/// PgUp/PgDn page is `height - SCAN_CHROME_ROWS`: the three bars, the two box
+/// edges, the tab strip, the state banner, the column header, and the pane
+/// rule plus the first detail line (spec D11, plan task 4).
+const SCAN_CHROME_ROWS: u16 = 10;
 
 /// Whether the browser view counts a call as in flight: exactly the calls
 /// [`browser_busy_label`] has a word for. The same predicate gates the
@@ -246,20 +182,6 @@ fn browser_busy_label(name: &str) -> Option<&'static str> {
         "browser.type" => "typing",
         _ => return None,
     })
-}
-
-/// The seed URL `scan.discover` is given for an in-scope host.
-fn scan_target_url(host: &str) -> String {
-    format!("http://{host}/")
-}
-
-/// Reduce a scan target (`host`, `host:port`, `http://host/path?q`) to the bare
-/// host the scope guard checks.
-fn scan_host(raw: &str) -> String {
-    let s = raw.trim();
-    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
-    let s = s.split(['/', '?', '#']).next().unwrap_or(s);
-    s.rsplit_once(':').map_or(s, |(h, _)| h).to_string()
 }
 
 /// A tool call held back for the operator's `y/N`.
@@ -960,8 +882,9 @@ pub struct App {
     /// The L4 operator surface's state (ui-ext Part 3): flows, scope, agent
     /// gates, craft editor, inject confirm. Inert until the bus offers `l4.*`.
     pub l4: crate::l4::L4State,
-    /// The Scan view's state (scanner-integration Stage 1). Inert until the bus
-    /// offers `scan.discover`.
+    /// The Scan view's state (spec D1, D3): the four tabs, the launch
+    /// bookkeeping and the legacy `scan.discover` one-shot. Inert until the
+    /// bus offers `scan.start` or `scan.discover` (D2).
     pub scan: ScanState,
     /// The pending confirm-over-the-wire handshake (spec D3, D7), shared by the
     /// `l4.*` guarded verbs and the `scan.*` launches; `Some` while the overlay
@@ -1486,23 +1409,31 @@ impl App {
                         }
                     }
                 }
-                // Scan: ⏎ opens the focused list's selected flow in the
-                // inspector — the injection point's flow, or the endpoint's
-                // linked flow (AC3). Parity with the web view's endpoint→flow
-                // links. An endpoint with no linked flow opens nothing; a flow
-                // no longer in the store is refused, not selected.
+                // Scan: ⏎ acts per tab (D11). On Site map it opens the
+                // focused list's selected flow in the inspector, which on a
+                // legacy bus is exactly today's behaviour (D12): the
+                // injection point's flow in the Points pane, the endpoint's
+                // linked flow (AC3) in the Nodes pane. An endpoint with no
+                // linked flow opens nothing; a flow no longer in the store is
+                // refused, not selected. The other tabs act in their own
+                // tasks.
                 Mode::Scan => {
-                    let id = match self.scan.focus {
-                        ScanFocus::Points => self
-                            .scan
-                            .points
-                            .get(self.scan.cursor)
-                            .map(|p| p.flow.clone()),
-                        ScanFocus::Endpoints => self
-                            .scan
-                            .endpoints
-                            .get(self.scan.endpoint_cursor)
-                            .and_then(|e| self.scan.endpoint_flows.get(e).cloned()),
+                    let id = match self.scan.tab {
+                        ScanTab::SiteMap => match self.scan.sitemap.pane {
+                            crate::scan::MapPane::Points => self
+                                .scan
+                                .legacy
+                                .points
+                                .get(self.scan.legacy.cursor)
+                                .map(|p| p.flow.clone()),
+                            crate::scan::MapPane::Nodes => self
+                                .scan
+                                .legacy
+                                .endpoints
+                                .get(self.scan.legacy.endpoint_cursor)
+                                .and_then(|e| self.scan.legacy.endpoint_flows.get(e).cloned()),
+                        },
+                        ScanTab::Profiles | ScanTab::Jobs | ScanTab::Issues => None,
                     };
                     if let Some(id) = id {
                         if self.row(&id).is_some() {
@@ -1782,29 +1713,42 @@ impl App {
             Action::OpenScan => {
                 self.mode = Mode::Scan;
                 self.sidebar = SidebarItem::Scan;
+                // The first open lands on the tab this bus can serve (D2):
+                // Profiles when it has the v2 scanner, Jobs otherwise. Later
+                // opens restore the tab the operator left on.
+                if self.scan.opened_at_tick.is_none() {
+                    if self.scan_offer() == ScanOffer::V2 {
+                        self.scan.tab = ScanTab::Profiles;
+                    } else {
+                        self.scan.tab = ScanTab::Jobs;
+                        // A legacy result is read through its injection
+                        // points first (today's default focus); the
+                        // endpoints are the Nodes pane, one Tab away.
+                        self.scan.sitemap.pane = crate::scan::MapPane::Points;
+                    }
+                    self.scan.opened_at_tick = Some(self.ticks);
+                }
                 // Viewing the panel never crawls: a `scan.discover` is up to
                 // hundreds of real browser navigations against the target. Seed
                 // the scope-bound target the header shows, so `r` (ScanLaunch)
                 // and `:scan <host>` are the only paths that reach the wire.
-                if self.scan.target.is_none() {
+                if self.scan.legacy.target.is_none() {
                     if let Some(host) = self.scan_target_host() {
-                        self.scan.target = Some(scan_target_url(&host));
+                        // Task 9 replaces this seed with the D8 origin rule.
+                        self.scan.legacy.target = Some(format!("http://{host}/"));
                     }
                 }
             }
             Action::ScanLaunch => {
-                if self.scan.running {
+                if self.scan.legacy.running {
                     self.toast(Level::Info, "a scan is already running");
                 } else {
                     self.scan_launch(None, &mut out);
                 }
             }
-            Action::ScanFocusToggle => {
-                self.scan.focus = match self.scan.focus {
-                    ScanFocus::Points => ScanFocus::Endpoints,
-                    ScanFocus::Endpoints => ScanFocus::Points,
-                };
-            }
+            Action::ScanTab(tab) => self.scan.tab = tab,
+            Action::ScanPaneNext => self.scan.step_pane(true),
+            Action::ScanPanePrev => self.scan.step_pane(false),
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2329,7 +2273,7 @@ impl App {
             return;
         }
         let host = match explicit {
-            Some(raw) => scan_host(&raw),
+            Some(raw) => crate::scan::scan_host(&raw),
             None => match self.scan_target_host() {
                 Some(h) => h,
                 None => {
@@ -2348,11 +2292,26 @@ impl App {
             );
             return;
         }
-        let target = scan_target_url(&host);
-        self.scan.running = true;
-        self.scan.error = None;
-        self.scan.target = Some(target.clone());
+        // Task 9 replaces this seed with the D8 origin rule.
+        let target = format!("http://{host}/");
+        self.scan.legacy.running = true;
+        self.scan.legacy.error = None;
+        self.scan.legacy.target = Some(target.clone());
         out.extend(self.call_tool("scan.discover", json!({ "target": target })));
+    }
+
+    /// What this bus can serve the Scan view (spec D2): the v2 scanner when
+    /// it offers `scan.start`, the legacy one-shot when it offers only
+    /// `scan.discover`, nothing otherwise. Each v2 control is gated by its
+    /// own verb on top of this.
+    pub fn scan_offer(&self) -> ScanOffer {
+        if self.has_tool("scan.start") {
+            ScanOffer::V2
+        } else if self.has_tool("scan.discover") {
+            ScanOffer::Legacy
+        } else {
+            ScanOffer::None
+        }
     }
 
     /// The host a scan targets when none is typed: the selected flow's host when
@@ -2367,7 +2326,7 @@ impl App {
         self.scope
             .iter()
             .find(|e| !e.starts_with("*.") && !e.is_empty())
-            .map(|e| scan_host(e))
+            .map(|e| crate::scan::scan_host(e))
     }
 
     /// The operator answered the confirm prompt.
@@ -2411,6 +2370,14 @@ impl App {
                 }
                 self.close_prompt();
                 return;
+            }
+            // Scan: Esc/`q` closes a focused detail, editor or points pane
+            // back to its list pane, and only then leaves the view (D11).
+            Mode::Scan => {
+                if self.scan.close_pane() {
+                    return;
+                }
+                Mode::Flows
             }
             Mode::Flows => {
                 if self.filter.is_some() {
@@ -2730,28 +2697,23 @@ impl App {
                 }
             }
             Mode::Scan => {
-                // ↑↓/paging walk whichever list Tab has focused.
-                let (n, cursor) = match self.scan.focus {
-                    ScanFocus::Points => (self.scan.points.len(), &mut self.scan.cursor),
-                    ScanFocus::Endpoints => {
-                        (self.scan.endpoints.len(), &mut self.scan.endpoint_cursor)
+                // ↑↓/paging walk the focused pane of the active tab (D11).
+                // A page is the list body: the terminal minus the view's
+                // chrome, which is SCAN_CHROME_ROWS = 10 rows.
+                let page = usize::from(self.height.saturating_sub(SCAN_CHROME_ROWS)).max(1);
+                if let Some((cursor, n)) = self.scan.cursor_mut() {
+                    if n > 0 {
+                        let c = *cursor;
+                        *cursor = match action {
+                            Action::Up => c.saturating_sub(1),
+                            Action::Down => (c + 1).min(n - 1),
+                            Action::PageUp => c.saturating_sub(page),
+                            Action::PageDown => (c + page).min(n - 1),
+                            Action::Home => 0,
+                            Action::End => n - 1,
+                            _ => c,
+                        };
                     }
-                };
-                if n > 0 {
-                    // A page is the list body: the terminal minus the panel
-                    // chrome (three bars, two box edges, the target and hint
-                    // lines, the list heading).
-                    let page = usize::from(self.height.saturating_sub(8)).max(1);
-                    let c = *cursor;
-                    *cursor = match action {
-                        Action::Up => c.saturating_sub(1),
-                        Action::Down => (c + 1).min(n - 1),
-                        Action::PageUp => c.saturating_sub(page),
-                        Action::PageDown => (c + page).min(n - 1),
-                        Action::Home => 0,
-                        Action::End => n - 1,
-                        _ => c,
-                    };
                 }
             }
             Mode::Compose => {
@@ -2871,9 +2833,9 @@ impl App {
     /// `Scope` sidebar item filters to in-scope"); the panel is `S`/`:scope`.
     fn sidebar_step(&mut self, d: i32, out: &mut Vec<BusRequest>) {
         let mut next = step(&SidebarItem::ALL, self.sidebar, d);
-        // The Scan row is drawn only when the bus offers `scan.discover`;
+        // The Scan row is drawn only when the bus offers a scanner (D2);
         // never land on a row the operator cannot see.
-        if next == SidebarItem::Scan && !self.has_tool("scan.discover") {
+        if next == SidebarItem::Scan && self.scan_offer() == ScanOffer::None {
             next = step(&SidebarItem::ALL, next, d);
         }
         self.sidebar = next;
@@ -3275,7 +3237,12 @@ impl App {
             "scan" => {
                 out.extend(self.update(Action::OpenScan));
                 if !rest.is_empty() {
-                    if self.scan.running {
+                    if self.scan_offer() == ScanOffer::None {
+                        self.toast(
+                            Level::Warn,
+                            "the scanner is not on this bus (scan.start / scan.discover)",
+                        );
+                    } else if self.scan.legacy.running {
                         self.toast(Level::Info, "a scan is already running");
                     } else {
                         self.scan_launch(Some(rest.to_string()), &mut out);
@@ -3807,9 +3774,9 @@ impl App {
                     // Scanner Stage 1: the crawl result — reached endpoints and
                     // the injection points enumerated from captured requests.
                     "scan.discover" => {
-                        self.scan.running = false;
-                        self.scan.error = None;
-                        self.scan.endpoints = value
+                        self.scan.legacy.running = false;
+                        self.scan.legacy.error = None;
+                        self.scan.legacy.endpoints = value
                             .get("endpoints")
                             .and_then(Value::as_array)
                             .map(|a| {
@@ -3820,7 +3787,7 @@ impl App {
                             .unwrap_or_default();
                         // AC3: endpoint URL → flow id. Keep only string→string
                         // pairs; a missing or garbage map leaves it empty.
-                        self.scan.endpoint_flows = value
+                        self.scan.legacy.endpoint_flows = value
                             .get("endpoint_flows")
                             .and_then(Value::as_object)
                             .map(|m| {
@@ -3831,25 +3798,31 @@ impl App {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        self.scan.points = value
+                        self.scan.legacy.points = value
                             .get("injection_points")
                             .and_then(Value::as_array)
-                            .map(|a| a.iter().map(InjectionPointRow::from_json).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .map(crate::scan::legacy::InjectionPointRow::from_json)
+                                    .collect()
+                            })
                             .unwrap_or_default();
-                        self.scan.cursor = self
+                        self.scan.legacy.cursor = self
                             .scan
+                            .legacy
                             .cursor
-                            .min(self.scan.points.len().saturating_sub(1));
-                        self.scan.endpoint_cursor = self
+                            .min(self.scan.legacy.points.len().saturating_sub(1));
+                        self.scan.legacy.endpoint_cursor = self
                             .scan
+                            .legacy
                             .endpoint_cursor
-                            .min(self.scan.endpoints.len().saturating_sub(1));
+                            .min(self.scan.legacy.endpoints.len().saturating_sub(1));
                         self.toast(
                             Level::Info,
                             format!(
                                 "scan.discover → {} endpoints · {} injection points",
-                                self.scan.endpoints.len(),
-                                self.scan.points.len()
+                                self.scan.legacy.endpoints.len(),
+                                self.scan.legacy.points.len()
                             ),
                         );
                     }
@@ -3899,8 +3872,8 @@ impl App {
                     // A refused or failed crawl clears the running flag and keeps
                     // the reason in the Scan view until the next launch.
                     "scan.discover" => {
-                        self.scan.running = false;
-                        self.scan.error = Some(message.clone());
+                        self.scan.legacy.running = false;
+                        self.scan.legacy.error = Some(message.clone());
                     }
                     _ => {}
                 }

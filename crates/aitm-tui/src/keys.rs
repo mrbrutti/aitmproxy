@@ -87,10 +87,11 @@ fn browser(key: KeyEvent) -> Option<Action> {
     })
 }
 
-/// The Scan view (scanner-integration Stage 1): ↑↓ walk the focused list, Tab
-/// switches focus between the endpoints and the injection points, `r` launches
-/// the scope-bound crawl (the only key that does), `F` jumps to the findings
-/// pane, `:` palette, `?` help, Esc/`q` back.
+/// The Scan view's shared keys (spec D11): `1`..`4` pick a tab, Tab/BackTab
+/// walk the active tab's panes, ↑↓ walk the focused pane, ⏎ opens or acts,
+/// `r` launches the legacy scope-bound crawl, `F` jumps to the findings pane,
+/// `:` palette, `?` help, Esc/`q` closes the focused pane or leaves the view.
+/// Each tab's own keys are added to this one function by its task.
 fn scan(key: KeyEvent) -> Option<Action> {
     if let Some(a) = nav(key) {
         return Some(a);
@@ -98,9 +99,14 @@ fn scan(key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
-        // Switch the cursor between the endpoints and injection-points lists.
-        KeyCode::Tab | KeyCode::BackTab => Action::ScanFocusToggle,
-        // Open the focused list's selected flow in the inspector.
+        KeyCode::Char('1') => Action::ScanTab(crate::scan::ScanTab::Profiles),
+        KeyCode::Char('2') => Action::ScanTab(crate::scan::ScanTab::Jobs),
+        KeyCode::Char('3') => Action::ScanTab(crate::scan::ScanTab::SiteMap),
+        KeyCode::Char('4') => Action::ScanTab(crate::scan::ScanTab::Issues),
+        // Move the cursor between the active tab's panes.
+        KeyCode::Tab => Action::ScanPaneNext,
+        KeyCode::BackTab => Action::ScanPanePrev,
+        // Open the focused pane's selected row.
         KeyCode::Enter | KeyCode::Right => Action::Enter,
         KeyCode::Char('F') => Action::OpenFindings,
         KeyCode::Char(':') => Action::PaletteOpen,

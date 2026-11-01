@@ -94,6 +94,167 @@ pub struct ScanState {
     pub opened_at_tick: Option<u64>,
 }
 
+impl ScanState {
+    /// The focused pane's cursor and its row count, for the shared `nav()`
+    /// keys (spec D11). `None` when the focused pane has no walkable list
+    /// here: the Jobs detail scroll is the Jobs task's and the Issues detail
+    /// flow cursor is the Issues task's, and an editor pane is dead while no
+    /// profile is open.
+    ///
+    /// The Site map panes walk the v2 lists when `scan.sitemap` has filled
+    /// them and the legacy `scan.discover` lists otherwise (D12: the legacy
+    /// result renders as nodes and points in the same two panes), which is
+    /// how today's endpoint and injection-point cursors survive the move.
+    pub fn cursor_mut(&mut self) -> Option<(&mut usize, usize)> {
+        match self.tab {
+            ScanTab::Profiles => match self.profiles.pane {
+                ProfilePane::List => {
+                    let n = self.profiles.list.len();
+                    Some((&mut self.profiles.cursor, n))
+                }
+                ProfilePane::Fields => {
+                    let n = EDITOR_FIELDS.len();
+                    self.profiles.editor.as_mut().map(|e| (&mut e.field, n))
+                }
+                ProfilePane::Origins => self.profiles.editor.as_mut().map(|e| {
+                    let n = e.origin_choices.len();
+                    (&mut e.origin_cursor, n)
+                }),
+                ProfilePane::Checks => {
+                    let n = self.profiles.checks.len();
+                    self.profiles
+                        .editor
+                        .as_mut()
+                        .map(|e| (&mut e.tree_cursor, n))
+                }
+            },
+            ScanTab::Jobs => match self.jobs.pane {
+                JobPane::List => {
+                    let n = self.jobs.order.len();
+                    Some((&mut self.jobs.cursor, n))
+                }
+                JobPane::Detail => None,
+            },
+            ScanTab::SiteMap => match self.sitemap.pane {
+                MapPane::Nodes => {
+                    if self.sitemap.nodes.is_empty() {
+                        let n = self.legacy.endpoints.len();
+                        Some((&mut self.legacy.endpoint_cursor, n))
+                    } else {
+                        let n = self.sitemap.nodes.len();
+                        Some((&mut self.sitemap.node_cursor, n))
+                    }
+                }
+                MapPane::Points => {
+                    if self.sitemap.points.is_empty() {
+                        let n = self.legacy.points.len();
+                        Some((&mut self.legacy.cursor, n))
+                    } else {
+                        let n = self.sitemap.points.len();
+                        Some((&mut self.sitemap.point_cursor, n))
+                    }
+                }
+            },
+            ScanTab::Issues => match self.issues.pane {
+                IssuePane::List => {
+                    let n = self.issues.list.len();
+                    Some((&mut self.issues.cursor, n))
+                }
+                IssuePane::Detail => None,
+            },
+        }
+    }
+
+    /// Tab / BackTab: focus the active tab's next (or previous) pane.
+    pub fn step_pane(&mut self, forward: bool) {
+        match self.tab {
+            ScanTab::Profiles => {
+                self.profiles.pane = step(
+                    &[
+                        ProfilePane::List,
+                        ProfilePane::Fields,
+                        ProfilePane::Origins,
+                        ProfilePane::Checks,
+                    ],
+                    self.profiles.pane,
+                    forward,
+                )
+            }
+            ScanTab::Jobs => {
+                self.jobs.pane = step(&[JobPane::List, JobPane::Detail], self.jobs.pane, forward)
+            }
+            ScanTab::SiteMap => {
+                self.sitemap.pane = step(
+                    &[MapPane::Nodes, MapPane::Points],
+                    self.sitemap.pane,
+                    forward,
+                )
+            }
+            ScanTab::Issues => {
+                self.issues.pane = step(
+                    &[IssuePane::List, IssuePane::Detail],
+                    self.issues.pane,
+                    forward,
+                )
+            }
+        }
+    }
+
+    /// Esc / `q`: close a focused secondary pane back to its list pane
+    /// (D11). `true` when one was open, so the caller knows the key was
+    /// spent here and the view stays.
+    pub fn close_pane(&mut self) -> bool {
+        match self.tab {
+            ScanTab::Profiles if self.profiles.pane != ProfilePane::List => {
+                self.profiles.pane = ProfilePane::List;
+                true
+            }
+            ScanTab::Jobs if self.jobs.pane != JobPane::List => {
+                self.jobs.pane = JobPane::List;
+                true
+            }
+            ScanTab::SiteMap if self.sitemap.pane != MapPane::Nodes => {
+                self.sitemap.pane = MapPane::Nodes;
+                true
+            }
+            ScanTab::Issues if self.issues.pane != IssuePane::List => {
+                self.issues.pane = IssuePane::List;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The next (or previous) entry of `all` after `cur`, wrapping. An entry not
+/// in `all` stays put.
+fn step<T: Copy + PartialEq>(all: &[T], cur: T, forward: bool) -> T {
+    match all.iter().position(|x| *x == cur) {
+        Some(i) => {
+            let n = all.len();
+            all[if forward {
+                (i + 1) % n
+            } else {
+                (i + n - 1) % n
+            }]
+        }
+        None => cur,
+    }
+}
+
+/// What the bus can serve the Scan view (spec D2): the v2 scanner, the legacy
+/// one-shot `scan.discover`, or nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOffer {
+    /// `scan.start` is on the bus: the full surface (each control still gated
+    /// by its own verb).
+    V2,
+    /// Only `scan.discover`: today's one-shot crawl, degraded elsewhere.
+    Legacy,
+    /// Neither verb: the sidebar row is hidden and every tab says so.
+    None,
+}
+
 /// A failed `scan.*` call, coded when the core's message carries a D9 code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanError {

@@ -5,9 +5,11 @@
 //! the UI that surfaces its `scan.discover` result.
 
 use aitm_tui::action::{Action, BusEvent, BusRequest};
-use aitm_tui::app::{App, InjectionPointRow, Mode, SidebarItem};
+use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::fixture_app_core;
 use aitm_tui::keys;
+use aitm_tui::scan::legacy::InjectionPointRow;
+use aitm_tui::scan::ScanTab;
 use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +21,40 @@ fn screen(app: &App) -> String {
 
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// Every verb of the scanner v2 contract: a file that means "the legacy
+/// `scan.discover` path" must keep meaning that when `CORE_TOOLS` gains them.
+const V2_TOOLS: &[&str] = &[
+    "scan.start",
+    "scan.map",
+    "scan.status",
+    "scan.list",
+    "scan.cancel",
+    "scan.issues",
+    "scan.issue",
+    "scan.issue.update",
+    "scan.sitemap",
+    "scan.checks",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.profile.save",
+    "scan.profile.delete",
+    "scan.session.preview",
+];
+
+/// The core fixture with every v2 scanner verb removed: a legacy bus.
+fn legacy_app(cols: u16, rows: u16) -> App {
+    let mut app = fixture_app_core(cols, rows);
+    app.tools.retain(|t| !V2_TOOLS.contains(&t.name.as_str()));
+    app
+}
+
+/// Open the view and show the Site map tab, where the legacy
+/// `scan.discover` result lives on a v2-shaped surface (spec D12).
+fn open_site_map(app: &mut App) {
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
 }
 
 /// The `scan.discover` requests among `reqs`, as their `target` arguments.
@@ -65,7 +101,7 @@ fn discover_result() -> Value {
 /// crawl, and sends nothing.
 #[test]
 fn open_scan_opens_without_launching() {
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     assert!(
         app.has_tool("scan.discover"),
         "fixture offers scan.discover"
@@ -74,7 +110,10 @@ fn open_scan_opens_without_launching() {
     let reqs = app.update(Action::OpenScan);
     assert_eq!(app.mode, Mode::Scan, "OpenScan enters the Scan view");
     assert_eq!(app.sidebar, SidebarItem::Scan);
-    assert!(!app.scan.running, "viewing the panel starts no crawl");
+    assert!(
+        !app.scan.legacy.running,
+        "viewing the panel starts no crawl"
+    );
     assert!(
         discover_targets(&reqs).is_empty(),
         "no scan.discover request on open: {reqs:?}"
@@ -82,7 +121,7 @@ fn open_scan_opens_without_launching() {
     // The header shows the scope-bound target an explicit launch would crawl:
     // the selected flow's host (f50, in scope).
     assert_eq!(
-        app.scan.target.as_deref(),
+        app.scan.legacy.target.as_deref(),
         Some("http://auth.shop-staging.test/"),
         "the target is seeded for display, not launched"
     );
@@ -90,10 +129,10 @@ fn open_scan_opens_without_launching() {
     assert!(text.contains("idle"), "the open state reads idle: {text}");
 
     // Bare `:scan` is the same open-only path.
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     let reqs = app.run_command("scan");
     assert_eq!(app.mode, Mode::Scan);
-    assert!(!app.scan.running, "`:scan` alone starts no crawl");
+    assert!(!app.scan.legacy.running, "`:scan` alone starts no crawl");
     assert!(
         discover_targets(&reqs).is_empty(),
         "no scan.discover request from bare `:scan`: {reqs:?}"
@@ -105,7 +144,7 @@ fn open_scan_opens_without_launching() {
 /// matching `CallOk` populates `endpoints`/`points` and clears running.
 #[test]
 fn explicit_launch_emits_discover_and_result_populates_state() {
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     let _ = app.update(Action::OpenScan);
     // `r` is the launch key the header hint names.
     assert_eq!(
@@ -114,7 +153,7 @@ fn explicit_launch_emits_discover_and_result_populates_state() {
     );
 
     let reqs = app.update(Action::ScanLaunch);
-    assert!(app.scan.running, "the launch sets the running flag");
+    assert!(app.scan.legacy.running, "the launch sets the running flag");
     assert_eq!(
         discover_targets(&reqs),
         vec!["http://auth.shop-staging.test/".to_string()],
@@ -132,35 +171,45 @@ fn explicit_launch_emits_discover_and_result_populates_state() {
         name: "scan.discover".into(),
         value: discover_result(),
     });
-    assert!(!app.scan.running, "the CallOk clears the running flag");
+    assert!(
+        !app.scan.legacy.running,
+        "the CallOk clears the running flag"
+    );
     assert_eq!(
-        app.scan.endpoints,
+        app.scan.legacy.endpoints,
         vec![
             "http://auth.shop-staging.test/".to_string(),
             "http://auth.shop-staging.test/login".to_string(),
         ],
         "endpoints populate from the result"
     );
-    assert_eq!(app.scan.points.len(), 2, "both injection points populate");
-    assert_eq!(app.scan.points[0].location, "query");
-    assert_eq!(app.scan.points[0].name, "next");
-    assert_eq!(app.scan.points[0].example, "/dashboard");
-    assert_eq!(app.scan.points[1].location, "cookie");
-    assert_eq!(app.scan.points[1].name, "session");
     assert_eq!(
-        app.scan.points[1].example, "<redacted>",
+        app.scan.legacy.points.len(),
+        2,
+        "both injection points populate"
+    );
+    assert_eq!(app.scan.legacy.points[0].location, "query");
+    assert_eq!(app.scan.legacy.points[0].name, "next");
+    assert_eq!(app.scan.legacy.points[0].example, "/dashboard");
+    assert_eq!(app.scan.legacy.points[1].location, "cookie");
+    assert_eq!(app.scan.legacy.points[1].name, "session");
+    assert_eq!(
+        app.scan.legacy.points[1].example, "<redacted>",
         "the redacted cookie example is carried through verbatim, not re-derived"
     );
 
     // A failed/refused crawl settles the flag and keeps the reason.
     let _ = app.update(Action::ScanLaunch);
-    assert!(app.scan.running);
+    assert!(app.scan.legacy.running);
     let _ = app.on_bus(BusEvent::CallFailed {
         name: "scan.discover".into(),
         message: "out of scope".into(),
     });
-    assert!(!app.scan.running, "a CallFailed clears the running flag");
-    assert_eq!(app.scan.error.as_deref(), Some("out of scope"));
+    assert!(
+        !app.scan.legacy.running,
+        "a CallFailed clears the running flag"
+    );
+    assert_eq!(app.scan.legacy.error.as_deref(), Some("out of scope"));
 }
 
 /// `:scan <target>` launches against that target, scope-gated: an in-scope
@@ -168,20 +217,23 @@ fn explicit_launch_emits_discover_and_result_populates_state() {
 /// toast and nothing reaches the wire (deny-by-default).
 #[test]
 fn scan_command_with_target_is_scope_gated() {
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     let reqs = app.run_command("scan https://api.shop-staging.test:8443/admin?x=1");
     assert_eq!(app.mode, Mode::Scan);
-    assert!(app.scan.running);
+    assert!(app.scan.legacy.running);
     assert_eq!(
         discover_targets(&reqs),
         vec!["http://api.shop-staging.test/".to_string()],
         "the typed target is reduced to its in-scope host: {reqs:?}"
     );
 
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     let reqs = app.run_command("scan evil.example");
     assert_eq!(app.mode, Mode::Scan, "the view still opens");
-    assert!(!app.scan.running, "an out-of-scope target is not launched");
+    assert!(
+        !app.scan.legacy.running,
+        "an out-of-scope target is not launched"
+    );
     assert!(
         discover_targets(&reqs).is_empty(),
         "nothing reaches the wire for an out-of-scope host: {reqs:?}"
@@ -203,7 +255,7 @@ fn scan_command_with_target_is_scope_gated() {
 /// injection points.
 #[test]
 fn scan_sidebar_row_and_view_regions_render() {
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
 
     // The sidebar (drawn with the flow list) shows a Scan row when the tool is
     // offered.
@@ -214,7 +266,7 @@ fn scan_sidebar_row_and_view_regions_render() {
     );
 
     // Open, launch explicitly, land a result, then render the Scan view.
-    let _ = app.update(Action::OpenScan);
+    open_site_map(&mut app);
     let _ = app.update(Action::ScanLaunch);
     let _ = app.on_bus(BusEvent::CallOk {
         name: "scan.discover".into(),
@@ -251,17 +303,17 @@ fn enter_opens_the_selected_injection_points_flow() {
             "{code:?} opens the point's flow"
         );
     }
-    let mut app = fixture_app_core(200, 50);
-    let _ = app.update(Action::OpenScan);
+    let mut app = legacy_app(200, 50);
+    open_site_map(&mut app);
     let _ = app.update(Action::ScanLaunch);
     let _ = app.on_bus(BusEvent::CallOk {
         name: "scan.discover".into(),
         value: discover_result(),
     });
-    app.scan.points[1].flow = "f-missing".into();
+    app.scan.legacy.points[1].flow = "f-missing".into();
     app.selected = None;
 
-    assert_eq!(app.scan.cursor, 0);
+    assert_eq!(app.scan.legacy.cursor, 0);
     let _ = app.update(Action::Enter);
     assert_eq!(
         app.selected.as_deref(),
@@ -273,7 +325,7 @@ fn enter_opens_the_selected_injection_points_flow() {
     // A point whose flow is gone from the list: stay put, say why.
     app.mode = Mode::Scan;
     let _ = app.update(Action::Down);
-    assert_eq!(app.scan.cursor, 1);
+    assert_eq!(app.scan.legacy.cursor, 1);
     let _ = app.update(Action::Enter);
     assert_eq!(app.mode, Mode::Scan, "no inspector for a missing flow");
     assert_eq!(app.selected.as_deref(), Some("f50"), "selection unchanged");
@@ -298,12 +350,12 @@ fn enter_opens_the_selected_endpoints_flow() {
     // Tab toggles which of the two Scan lists has the cursor.
     assert_eq!(
         keys::map(press(KeyCode::Tab), Mode::Scan),
-        Some(Action::ScanFocusToggle),
+        Some(Action::ScanPaneNext),
         "Tab switches focus between endpoints and injection points"
     );
 
-    let mut app = fixture_app_core(200, 50);
-    let _ = app.update(Action::OpenScan);
+    let mut app = legacy_app(200, 50);
+    open_site_map(&mut app);
     let _ = app.update(Action::ScanLaunch);
     let _ = app.on_bus(BusEvent::CallOk {
         name: "scan.discover".into(),
@@ -313,6 +365,7 @@ fn enter_opens_the_selected_endpoints_flow() {
     // `endpoint_flows` parsed into state, keyed by the scrubbed endpoint URL.
     assert_eq!(
         app.scan
+            .legacy
             .endpoint_flows
             .get("http://auth.shop-staging.test/login")
             .map(String::as_str),
@@ -321,6 +374,7 @@ fn enter_opens_the_selected_endpoints_flow() {
     );
     assert!(
         !app.scan
+            .legacy
             .endpoint_flows
             .contains_key("http://auth.shop-staging.test/"),
         "the root endpoint has no linked flow"
@@ -329,10 +383,10 @@ fn enter_opens_the_selected_endpoints_flow() {
     // Focus the endpoints list, move to /login (the second endpoint, the one
     // with a flow) and open it: parity with the injection-point ⏎ path.
     app.selected = None;
-    let _ = app.update(Action::ScanFocusToggle);
+    let _ = app.update(Action::ScanPaneNext);
     let _ = app.update(Action::Down);
     assert_eq!(
-        app.scan.endpoint_cursor, 1,
+        app.scan.legacy.endpoint_cursor, 1,
         "Down moves the endpoint cursor"
     );
     let _ = app.update(Action::Enter);
@@ -350,7 +404,10 @@ fn enter_opens_the_selected_endpoints_flow() {
     // An endpoint with no linked flow: stay put, select nothing.
     app.mode = Mode::Scan;
     let _ = app.update(Action::Up);
-    assert_eq!(app.scan.endpoint_cursor, 0, "back on the root endpoint");
+    assert_eq!(
+        app.scan.legacy.endpoint_cursor, 0,
+        "back on the root endpoint"
+    );
     app.selected = None;
     let _ = app.update(Action::Enter);
     assert_eq!(
@@ -365,9 +422,9 @@ fn enter_opens_the_selected_endpoints_flow() {
 /// (a page is the list body: the terminal height minus the panel chrome).
 #[test]
 fn page_keys_move_the_injection_point_cursor() {
-    let mut app = fixture_app_core(200, 50);
-    let _ = app.update(Action::OpenScan);
-    app.scan.points = (0..60)
+    let mut app = legacy_app(200, 50);
+    open_site_map(&mut app);
+    app.scan.legacy.points = (0..60)
         .map(|i| InjectionPointRow {
             flow: "f50".into(),
             location: "query".into(),
@@ -379,25 +436,26 @@ fn page_keys_move_the_injection_point_cursor() {
         keys::map(press(KeyCode::PageDown), Mode::Scan),
         Some(Action::PageDown)
     );
-    // 50 rows − 8 chrome rows (three bars, two box edges, target, hint,
-    // list heading) = a 42-row page.
+    // 50 rows - 10 chrome rows (three bars, two box edges, the tab strip,
+    // the banner, the column header, the pane rule and a detail line)
+    // = a 40-row page.
     let _ = app.update(Action::PageDown);
-    assert_eq!(app.scan.cursor, 42, "one page down");
+    assert_eq!(app.scan.legacy.cursor, 40, "one page down");
     let _ = app.update(Action::PageDown);
-    assert_eq!(app.scan.cursor, 59, "clamped at the last point");
+    assert_eq!(app.scan.legacy.cursor, 59, "clamped at the last point");
     let _ = app.update(Action::PageUp);
-    assert_eq!(app.scan.cursor, 17, "one page up");
+    assert_eq!(app.scan.legacy.cursor, 19, "one page up");
     let _ = app.update(Action::Home);
-    assert_eq!(app.scan.cursor, 0);
+    assert_eq!(app.scan.legacy.cursor, 0);
     let _ = app.update(Action::End);
-    assert_eq!(app.scan.cursor, 59);
+    assert_eq!(app.scan.legacy.cursor, 59);
 }
 
 /// `]`/`[` never land on the Scan row when the bus does not offer
 /// `scan.discover` (the row is not drawn then); with the tool they do.
 #[test]
 fn sidebar_step_skips_scan_when_the_tool_is_absent() {
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     app.tools.retain(|t| t.name != "scan.discover");
     assert!(!app.has_tool("scan.discover"));
     app.sidebar = SidebarItem::Agent;
@@ -414,7 +472,7 @@ fn sidebar_step_skips_scan_when_the_tool_is_absent() {
         "[ skips it on the way back"
     );
 
-    let mut app = fixture_app_core(200, 50);
+    let mut app = legacy_app(200, 50);
     app.sidebar = SidebarItem::Agent;
     let _ = app.update(Action::SidebarNext);
     assert_eq!(
