@@ -49,7 +49,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-use crate::gate::{may_send, ProbeTally};
+use crate::gate::{may_send, point_label, ProbeTally};
 use crate::matching::{body_text, excerpt_around, is_html};
 
 /// The prefix every scanner canary carries, so an operator reading a response
@@ -228,7 +228,7 @@ fn reflected(
             "the {kind:?} point \"{name}\" reflected an unencoded canary into an HTML {status} \
              response: {survived}",
             kind = point.kind,
-            name = point.name,
+            name = point_label(point),
             survived = context.survived(),
         ),
         poc_hint: Some(PocHint {

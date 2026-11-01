@@ -35,7 +35,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-use crate::gate::{may_send, ProbeTally};
+use crate::gate::{may_send, point_label, ProbeTally};
 use crate::matching::{header, scrub};
 
 /// The absolute canary target. RFC 2606 reserves `.invalid`, so this name
@@ -179,7 +179,7 @@ fn redirected(
              host {CANARY_HOST}; the redirect target is taken from the request and not \
              validated",
             kind = point.kind,
-            name = point.name,
+            name = point_label(point),
         ),
         poc_hint: Some(PocHint {
             assertions: vec![Assertion::Status(status), canary_matcher.clone()],

@@ -55,7 +55,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-use crate::gate::{self, no_finding, ProbeTally, STOPPED};
+use crate::gate::{self, no_finding, point_label, ProbeTally, STOPPED};
 use crate::matching::{body_text, length_differs};
 
 /// The hard ceiling on stimuli this check spends on one insertion point,
@@ -296,7 +296,7 @@ fn confirmed(
              always-false \"{false_arm}\" with {false_len} bytes; the pair reproduced {runs} \
              time(s), so the value is being evaluated as SQL",
             kind = point.kind,
-            name = point.name,
+            name = point_label(point),
             true_len = run.true_len,
             false_len = run.false_len,
         ),

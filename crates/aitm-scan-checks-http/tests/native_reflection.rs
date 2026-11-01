@@ -654,6 +654,47 @@ async fn neither_check_reports_clean_when_every_probe_fails() {
     }
 }
 
+/// A point's name is observed on the wire too — a parameter can be named
+/// after the credential it carries, or be as long as the target likes — so the
+/// `detail` that names it is bounded and scrubbed like `matched` (final
+/// security review FS-1).
+#[tokio::test]
+async fn details_scrub_and_bound_a_credential_shaped_point_name() {
+    let secret_name = format!("token={}", "A".repeat(2048));
+
+    let body = format!("<div>{FIRST_XSS_PROBE}</div>");
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(FIRST_XSS_PROBE, html(200, &body));
+    let secret_point = point(InsertionKind::Query, &secret_name, TARGET_URL);
+    let verdict = aitm_scan_checks_http::xss::check()
+        .run(&secret_point, &host)
+        .await;
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert!(
+        verdict.detail.contains("\"token=[redacted]\""),
+        "{}",
+        verdict.detail
+    );
+    assert!(!verdict.detail.contains("AAAA"), "{}", verdict.detail);
+    assert!(verdict.detail.len() <= 300, "{}", verdict.detail.len());
+
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(CANARY, redirect(302, CANARY));
+    let verdict = aitm_scan_checks_http::redirect::check()
+        .run(&secret_point, &host)
+        .await;
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert!(
+        verdict.detail.contains("\"token=[redacted]\""),
+        "{}",
+        verdict.detail
+    );
+    assert!(!verdict.detail.contains("AAAA"), "{}", verdict.detail);
+    assert!(verdict.detail.len() <= 300, "{}", verdict.detail.len());
+}
+
 /// Nothing a check writes may echo a value a target or an operator supplied
 /// beyond the bounded `Evidence` fields: a `detail` names the point, never the
 /// response.

@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use aitm_scan_model::{Confidence, Evidence, Outcome, ProbeHost, Verdict};
+use aitm_scan_model::{Confidence, Evidence, InsertionPoint, Outcome, ProbeHost, Verdict};
 
 /// The standing reason a run stopped early, in the words every check uses.
 ///
@@ -24,6 +24,19 @@ pub(crate) const STOPPED: &str = "the job was cancelled, out of budget or past i
 /// its own: `format!("{STOPPED_LIST}, or {extra}")`. Spelled out rather than
 /// edited out of [`STOPPED`] at run time, so each reads as written (FQ-2).
 pub(crate) const STOPPED_LIST: &str = "the job was cancelled, out of budget, past its deadline";
+
+/// The point's name as a `detail` may quote it: scrubbed with the core
+/// vocabulary and cut to [`Evidence::excerpt`]'s bound, exactly like a
+/// `matched` excerpt.
+///
+/// A name is observed on the wire — a parameter can be called after the
+/// credential it carries, or be as long as the target likes — and a `detail`
+/// is read by every surface an `Evidence` is, so it gets the same two
+/// treatments (spec D8.1, "Redaction"; final security review FS-1). One
+/// helper, used by every check that names its point.
+pub(crate) fn point_label(point: &InsertionPoint) -> String {
+    Evidence::excerpt(&crate::matching::scrub(&point.name))
+}
 
 /// Whether the check may spend `need` more stimuli right now.
 ///
@@ -147,7 +160,44 @@ impl ProbeTally {
 mod tests {
     use aitm_scan_model::{Confidence, Evidence, Outcome};
 
-    use super::{no_finding, ProbeTally, STOPPED, STOPPED_LIST};
+    use aitm_scan_model::{InsertionKind, InsertionPoint, LaneKind, MAX_EXCERPT_BYTES};
+
+    use super::{no_finding, point_label, ProbeTally, STOPPED, STOPPED_LIST};
+
+    fn named(name: &str) -> InsertionPoint {
+        InsertionPoint {
+            id: "p".to_string(),
+            lane: LaneKind::Http,
+            kind: InsertionKind::Query,
+            name: name.to_string(),
+            path: None,
+            example: None,
+            flow: None,
+            site_node: None,
+            traits: Vec::new(),
+            frequency: 1,
+            method: None,
+            url: None,
+        }
+    }
+
+    /// A point's name is observed on the wire, so a `detail` that quotes it is
+    /// bounded and scrubbed exactly like a `matched` excerpt: a credential-
+    /// shaped name is redacted, an overlong one is cut, a plain one is
+    /// untouched (final security review FS-1).
+    #[test]
+    fn a_point_label_is_scrubbed_and_bounded() {
+        assert_eq!(point_label(&named("q")), "q");
+
+        let secret = format!("token={}", "A".repeat(2048));
+        let label = point_label(&named(&secret));
+        assert_eq!(label, "token=[redacted]");
+
+        let long = "n".repeat(2048);
+        let label = point_label(&named(&long));
+        assert_eq!(label.len(), MAX_EXCERPT_BYTES);
+        assert_eq!(label, "n".repeat(MAX_EXCERPT_BYTES));
+    }
 
     /// A verdict that concluded nothing is always `tentative`: the caller
     /// names the outcome and the detail, and nothing else (Q2-1). Both a

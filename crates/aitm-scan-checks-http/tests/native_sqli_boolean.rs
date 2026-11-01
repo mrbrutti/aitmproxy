@@ -103,6 +103,27 @@ async fn a_true_matching_and_false_diverging_pair_is_firm() {
     );
 }
 
+/// The `detail` names the point, and a point's name is observed on the wire:
+/// a credential-shaped, 2 KiB name is redacted and bounded in it, like a
+/// `matched` excerpt would be (final security review FS-1).
+#[tokio::test]
+async fn the_detail_scrubs_and_bounds_a_credential_shaped_point_name() {
+    let host = vulnerable_host();
+    let secret_name = format!("token={}", "A".repeat(2048));
+    let point = point(InsertionKind::Query, &secret_name, TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert!(
+        verdict.detail.contains("\"token=[redacted]\""),
+        "{}",
+        verdict.detail
+    );
+    assert!(!verdict.detail.contains("AAAA"), "{}", verdict.detail);
+    assert!(verdict.detail.len() <= 400, "{}", verdict.detail.len());
+}
+
 /// The exact stimuli, in order: the control re-send, then the first pair, then
 /// the one repeat `Accuracy::Normal` asks for. The control is a `replace` of
 /// the point's own value; a condition is a `suffix` on it.
