@@ -1318,6 +1318,7 @@ Kept by the main session during stage 6. One row per finding.
 |---|---|---|---|---|
 | 1 | Coder (Task 1 report) | Important | A forced `H1`/`H2` send wrote the ALPN cache, so a later `Auto` send offered only the forced protocol for the TTL | Fixed by plan amendment: Task 3 item 5 narrows cache writes to `Auto` exchanges, test `a_forced_h1_send_does_not_pollute_the_alpn_cache` |
 | 2 | Coder (Task 2 report) | Minor | Plan wording implied the median-baseline correction affects the timing verdict; subtracting a constant moves only the intercept, which `Timing` does not carry | Accepted (T3 session 2026-11-01): behaviour as specified; `fit` doc states it; tests pin slope/r invariance and the median itself |
+| 3 | Coder (Task 3 report) | Minor | ALPN cache and h2 pool are keyed by `host:port` without scheme; one sender driving `http://h:p` (h2c) and `https://h:p` would collide on one key | Open for the panel: proposed fix is a `scheme://host:port` key in both maps (one line each) in the fix round |
 | 1,2,4 | Coder (Tasks 2 and 4 reports) | Important (process) | Parallel coders share one git index; a `git add <path>` + bare `git commit` swept a sibling's staged files into commit 25a42279 | Fixed by the Task 4 coder (rebuilt as 013a338e, single file); every later brief requires `git commit -- <paths>`; orchestrator audits each commit's stat |
 
 
