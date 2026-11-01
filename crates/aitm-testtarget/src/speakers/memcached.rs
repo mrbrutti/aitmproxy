@@ -6,8 +6,10 @@
 //! bug: a `set` announcing more than [`MAX_DATA`] bytes, or a line over
 //! [`MAX_LINE`] bytes (spec D5's over-long-line rule via
 //! [`super::take_line`]), crashes the Vulnerable origin; the Patched control
-//! answers the row's `CLIENT_ERROR` and closes. `flush_all` is answered with
-//! `CLIENT_ERROR denylisted` and logged `denylisted`.
+//! answers the row's `CLIENT_ERROR` and closes. A partial line or a `set`
+//! still waiting for its data at idle just waits ([`Step::Wait`], T10 PR
+//! C). `flush_all` is answered with `CLIENT_ERROR denylisted` and logged
+//! `denylisted`.
 
 use super::{mode_bug, take_line, LineScan, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
@@ -86,12 +88,19 @@ impl Speaker for Memcached {
     }
 
     fn on_idle(&mut self, _mode: SeedMode, _buf: &[u8]) -> Step {
-        // A stalled line or data block is not a protocol event; hang up.
-        Step::Close(None)
+        // A line without its CRLF yet, or a `set` still waiting for its
+        // data block, is not a protocol event; a real server waits. The
+        // over-long line and the over-cap `set` never get here: `parse`
+        // reports them as the bug.
+        Step::Wait
     }
 
     fn max_buffer(&self) -> usize {
-        MAX_DATA + MAX_LINE
+        // The largest message `parse` can still complete: a cap-length
+        // `set` line with its CRLF, a cap-length data block and its CRLF.
+        // Anything larger that is still incomplete is past every cap, so
+        // a `Wait` here can never be an unbounded one.
+        MAX_LINE + 2 + MAX_DATA + 2
     }
 }
 
@@ -175,7 +184,7 @@ mod tests {
         assert_eq!((DEF.new_conn)().name(), "l4-memcached");
         assert_eq!(MAX_LINE, 2048);
         assert_eq!(MAX_DATA, 1_048_576);
-        assert_eq!(Memcached.max_buffer(), 1_048_576 + 2048);
+        assert_eq!(Memcached.max_buffer(), 2048 + 2 + 1_048_576 + 2);
     }
 
     #[test]
@@ -332,14 +341,39 @@ mod tests {
     }
 
     #[test]
-    fn mc_idle_closes() {
-        assert_eq!(
-            Memcached.on_idle(SeedMode::Vulnerable, b"vers"),
-            Step::Close(None)
-        );
-        assert_eq!(
-            Memcached.on_idle(SeedMode::Patched, b"set k 0 0 2\r\nh"),
-            Step::Close(None)
-        );
+    fn mc_idle_waits() {
+        // A partial line, a line with a damaged terminator, or a `set`
+        // still waiting for its data: not a protocol event, wait silently
+        // in both modes (T10 PR C). `take_line` `TooLong` stays the bug.
+        for buf in [
+            &b"vers"[..],
+            b"get mykey",
+            b"get mykey\r\t",
+            b"set k 0 0 2\r\n",
+            b"set k 0 0 2\r\nh",
+        ] {
+            assert_eq!(Memcached.on_idle(SeedMode::Vulnerable, buf), Step::Wait);
+            assert_eq!(Memcached.on_idle(SeedMode::Patched, buf), Step::Wait);
+        }
+    }
+
+    /// A high-bit byte in an argument never breaks verb matching; one in
+    /// the verb is an ordinary `ERROR`: reply, keep (T10 PR C).
+    #[test]
+    fn mc_high_bit_bytes_get_a_normal_reply() {
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                parse(mode, b"get k\xff\r\n"),
+                msg(8, "get", Step::Reply(b"END\r\n".to_vec()))
+            );
+            assert_eq!(
+                parse(mode, b"set k\xff 0 0 2\r\nhi\r\n"),
+                msg(18, "set", Step::Reply(b"STORED\r\n".to_vec()))
+            );
+            assert_eq!(
+                parse(mode, b"g\xffet k\r\n"),
+                msg(8, "g\u{FFFD}et", Step::ProtocolError(b"ERROR\r\n".to_vec()))
+            );
+        }
     }
 }

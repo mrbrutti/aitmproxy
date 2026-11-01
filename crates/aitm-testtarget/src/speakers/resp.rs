@@ -9,7 +9,8 @@
 //! row's `-ERR Protocol error` and closes. Malformed framing that is not
 //! the bug (a garbled `*N` or `$len`, an element not starting with `$`) is
 //! answered with a specific `-ERR Protocol error: ...` and then closed in
-//! both modes: no close is ever silent (T10 PR C). Destructive commands get
+//! both modes: no close is ever silent, and a stalled inline line waits for
+//! its CRLF (T10 PR C). Destructive commands get
 //! `-ERR denylisted command` and are logged `denylisted` (spec D5).
 
 use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
@@ -47,6 +48,7 @@ const DENIED: &[u8] = b"-ERR denylisted command\r\n";
 const INVALID_BULK: &[u8] = b"-ERR Protocol error: invalid bulk length\r\n";
 const INCOMPLETE_MULTIBULK: &[u8] = b"-ERR Protocol error: incomplete multibulk\r\n";
 const INVALID_MULTIBULK: &[u8] = b"-ERR Protocol error: invalid multibulk length\r\n";
+const TOO_BIG_INLINE: &[u8] = b"-ERR Protocol error: too big inline request\r\n";
 
 fn new_conn() -> Box<dyn Speaker> {
     Box::new(Resp)
@@ -73,9 +75,14 @@ impl Speaker for Resp {
         if buf.first() == Some(&b'*') {
             // `*N` with fewer than N elements after the idle: the bug.
             mode_bug(mode, INCOMPLETE_MULTIBULK.to_vec())
+        } else if buf.len() > MAX_BULK {
+            // An inline line past the bulk cap can never be served (redis:
+            // "too big inline request"): say so, then close, both modes.
+            Step::Fault(TOO_BIG_INLINE.to_vec())
         } else {
-            // A stalled inline line is not a protocol event; just hang up.
-            Step::Close(None)
+            // A stalled inline line is not a protocol event; wait for its
+            // CRLF as redis does.
+            Step::Wait
         }
     }
 
@@ -443,10 +450,19 @@ mod tests {
             p.on_idle(SeedMode::Patched, b"*5\r\n$4\r\nPING\r\n"),
             Step::Fault(b"-ERR Protocol error: incomplete multibulk\r\n".to_vec())
         );
-        // A stalled inline line is not the bug: the connection just closes.
+        // A stalled inline line is not the bug and not a protocol event:
+        // wait for the CRLF silently, in both modes (T10 PR C).
+        assert_eq!(Resp.on_idle(SeedMode::Vulnerable, b"PIN"), Step::Wait);
+        assert_eq!(Resp.on_idle(SeedMode::Patched, b"PIN"), Step::Wait);
+        // An inline line that has outgrown the bulk cap can never be
+        // served: say so, then close, in both modes (never silently).
+        let too_big = vec![b'a'; MAX_BULK + 1];
+        let reply = Step::Fault(b"-ERR Protocol error: too big inline request\r\n".to_vec());
+        assert_eq!(Resp.on_idle(SeedMode::Vulnerable, &too_big), reply);
+        assert_eq!(Resp.on_idle(SeedMode::Patched, &too_big), reply);
         assert_eq!(
-            Resp.on_idle(SeedMode::Vulnerable, b"PIN"),
-            Step::Close(None)
+            Resp.on_idle(SeedMode::Patched, &too_big[..MAX_BULK]),
+            Step::Wait
         );
     }
 

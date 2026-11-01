@@ -177,7 +177,9 @@ pub(crate) enum Action {
 /// The driver's reading of a [`Step`] (spec D5 semantics, plan P2):
 /// `Reply`/`ProtocolError`/`Denylisted` write when non-empty and keep;
 /// `Fault` writes when non-empty and takes the fault close; `Close` writes
-/// when given and closes `quit`; `Trigger` crashes.
+/// when given and closes `quit`; `Trigger` crashes; `Wait` writes nothing
+/// and keeps (the TCP idle path short-circuits it before any logging, see
+/// [`idle_outcome`]).
 pub(crate) fn apply(step: Step) -> Vec<Action> {
     let write = |bytes: Vec<u8>| (!bytes.is_empty()).then_some(Action::Write(bytes));
     let (write, then) = match step {
@@ -185,8 +187,43 @@ pub(crate) fn apply(step: Step) -> Vec<Action> {
         Step::Fault(b) => (write(b), Action::Fault),
         Step::Close(b) => (b.and_then(write), Action::CloseConn(CloseReason::Quit)),
         Step::Trigger => (None, Action::Crash),
+        Step::Wait => (None, Action::Keep),
     };
     write.into_iter().chain(std::iter::once(then)).collect()
+}
+
+/// Why the driver handed a non-empty, incomplete buffer to `on_idle`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IdleCause {
+    /// [`IDLE_TIMEOUT`] passed without new bytes.
+    Timeout,
+    /// The buffer outgrew the speaker's `max_buffer()`.
+    Oversize,
+}
+
+/// What the driver does with an `on_idle` step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IdleOutcome {
+    /// Keep the connection and the buffer, log nothing, re-arm the idle
+    /// timer (T10 PR C: a partial line is not a protocol event).
+    Wait,
+    /// A speaker waited past its cap, which would buffer without bound:
+    /// contain the speaker bug by closing `oversize`.
+    CloseOversize,
+    /// Log the buffer as the `in` message and apply the step; a `Fault`
+    /// closes with this reason (`error` after an idle, `oversize` past the
+    /// cap).
+    Step(CloseReason),
+}
+
+/// The idle decision table: `Wait` is honoured only within the cap.
+pub(crate) fn idle_outcome(step: &Step, cause: IdleCause) -> IdleOutcome {
+    match (step, cause) {
+        (Step::Wait, IdleCause::Timeout) => IdleOutcome::Wait,
+        (Step::Wait, IdleCause::Oversize) => IdleOutcome::CloseOversize,
+        (_, IdleCause::Timeout) => IdleOutcome::Step(CloseReason::Error),
+        (_, IdleCause::Oversize) => IdleOutcome::Step(CloseReason::Oversize),
+    }
 }
 
 /// How many of the `pending` buffered bytes are the `in` message for
@@ -204,7 +241,8 @@ pub(crate) fn input_span(step: &Step, consumed: usize, pending: usize) -> usize 
 /// `ok|protocol_error|denylisted|trigger`; [`Classified`] serialises it).
 pub(crate) fn classified(step: &Step) -> Classified {
     match step {
-        Step::Reply(_) | Step::Close(_) => Classified::Ok,
+        // `Wait` is never logged; `Ok` is its defensive total mapping.
+        Step::Reply(_) | Step::Close(_) | Step::Wait => Classified::Ok,
         Step::ProtocolError(_) | Step::Fault(_) => Classified::ProtocolError,
         Step::Denylisted(_) => Classified::Denylisted,
         Step::Trigger => Classified::Trigger,
@@ -278,7 +316,7 @@ impl TcpConn {
                 Event::Eof => return self.close(CloseReason::Eof),
                 Event::ReadError => return self.close(CloseReason::Error),
                 Event::Idle => {
-                    if let Some(end) = self.idle(CloseReason::Error).await {
+                    if let Some(end) = self.idle(IdleCause::Timeout).await {
                         return end;
                     }
                 }
@@ -289,7 +327,7 @@ impl TcpConn {
                         return end;
                     }
                     if self.buf.len() > self.speaker.max_buffer() {
-                        if let Some(end) = self.idle(CloseReason::Oversize).await {
+                        if let Some(end) = self.idle(IdleCause::Oversize).await {
                             return end;
                         }
                     }
@@ -327,10 +365,20 @@ impl TcpConn {
     }
 
     /// Hand the whole pending buffer to `on_idle` (after [`IDLE_TIMEOUT`] or
-    /// past `max_buffer()`); a `Fault` then closes with `fault_reason`.
-    async fn idle(&mut self, fault_reason: CloseReason) -> Option<ConnEnd> {
+    /// past `max_buffer()`). A `Wait` within the cap keeps everything as it
+    /// is, unlogged; the next read re-arms the idle timer, and the
+    /// connection still ends on peer EOF, on the crash window, or when the
+    /// target drops (the task is aborted). Any other step is logged and
+    /// applied; a `Fault` closes with the cause's reason.
+    async fn idle(&mut self, cause: IdleCause) -> Option<ConnEnd> {
         let step = self.speaker.on_idle(self.mode, &self.buf);
-        self.step(self.buf.len(), None, step, fault_reason).await
+        match idle_outcome(&step, cause) {
+            IdleOutcome::Wait => None,
+            IdleOutcome::CloseOversize => Some(self.close(CloseReason::Oversize)),
+            IdleOutcome::Step(fault_reason) => {
+                self.step(self.buf.len(), None, step, fault_reason).await
+            }
+        }
     }
 
     /// Log the first `take` buffered bytes as the `in` message, carry out
@@ -597,7 +645,7 @@ async fn run_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::CloseReason;
+    use crate::log::{Classified, CloseReason};
     use crate::speakers::{Proto, Step};
 
     #[test]
@@ -689,6 +737,8 @@ mod tests {
         );
         // Trigger: crash.
         assert_eq!(apply(Step::Trigger), vec![Action::Crash]);
+        // Wait: nothing to write, keep the connection (T10 PR C).
+        assert_eq!(apply(Step::Wait), vec![Action::Keep]);
         // Close: write when given, then close with reason `quit`.
         assert_eq!(
             apply(Step::Close(None)),
@@ -765,6 +815,50 @@ mod tests {
             row["trigger_sha256"],
             serde_json::json!(crate::log::sha256_hex(b""))
         );
+    }
+
+    // --- T10 PR C: `Step::Wait` from `on_idle` ---
+
+    #[test]
+    fn idle_wait_keeps_the_connection_within_the_cap_and_closes_oversize_past_it() {
+        // A stalled partial line after the 200 ms idle: no log entry, no
+        // write, connection kept, the idle timer re-arms on the next read.
+        assert_eq!(
+            idle_outcome(&Step::Wait, IdleCause::Timeout),
+            IdleOutcome::Wait
+        );
+        // A speaker must never wait past its `max_buffer()`; the driver
+        // contains that bug by closing `oversize` rather than buffering
+        // without bound.
+        assert_eq!(
+            idle_outcome(&Step::Wait, IdleCause::Oversize),
+            IdleOutcome::CloseOversize
+        );
+        // Every other step is logged and applied with the cause's fault
+        // reason: `error` after an idle, `oversize` past the cap.
+        for step in [
+            Step::Trigger,
+            Step::Fault(b"x".to_vec()),
+            Step::Fault(vec![]),
+            Step::Close(None),
+            Step::ProtocolError(b"x".to_vec()),
+            Step::Reply(vec![]),
+        ] {
+            assert_eq!(
+                idle_outcome(&step, IdleCause::Timeout),
+                IdleOutcome::Step(CloseReason::Error),
+                "{step:?}"
+            );
+            assert_eq!(
+                idle_outcome(&step, IdleCause::Oversize),
+                IdleOutcome::Step(CloseReason::Oversize),
+                "{step:?}"
+            );
+        }
+        // `Wait` is never logged by the driver; its defensive mappings are
+        // the no-op ones.
+        assert_eq!(classified(&Step::Wait), Classified::Ok);
+        assert_eq!(input_span(&Step::Wait, 2, 10), 2);
     }
 
     // --- Tester additions (stage 5) ---

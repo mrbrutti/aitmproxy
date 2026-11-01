@@ -6,7 +6,8 @@
 //! deliberate bug is a command line longer than [`MAX_LINE`] bytes (CRLF past
 //! the cap, or no CRLF within cap + 1 bytes): the Vulnerable origin crashes
 //! ([`Step::Trigger`]), the Patched control answers `500 line too long` and
-//! closes ([`Step::Fault`]).
+//! closes ([`Step::Fault`]). A partial line at idle just waits
+//! ([`Step::Wait`], T10 PR C).
 
 use super::{mode_bug, take_line, LineScan, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
@@ -79,7 +80,10 @@ impl Speaker for Ftp {
     }
 
     fn on_idle(&mut self, _mode: SeedMode, _buf: &[u8]) -> Step {
-        Step::Close(None)
+        // A line without its CRLF yet (or with a damaged terminator) is not
+        // a protocol event; a real server waits for the rest. An over-long
+        // line never gets here: `take_line` reports it `TooLong` in `parse`.
+        Step::Wait
     }
 
     fn max_buffer(&self) -> usize {
@@ -186,8 +190,13 @@ mod tests {
         assert_eq!(s.parse(SeedMode::Vulnerable, b""), Parsed::Incomplete);
         assert_eq!(s.parse(SeedMode::Vulnerable, b"NOO"), Parsed::Incomplete);
         assert_eq!(s.parse(SeedMode::Vulnerable, b"NOOP\r"), Parsed::Incomplete);
-        assert_eq!(s.on_idle(SeedMode::Vulnerable, b"NOO"), Step::Close(None));
-        assert_eq!(s.on_idle(SeedMode::Patched, b"NOO"), Step::Close(None));
+        // A partial line after the idle is not a protocol event: wait for
+        // the CRLF silently, in both modes (T10 PR C). A damaged terminator
+        // (`\r\t`) is still just a partial line.
+        for buf in [&b"NOO"[..], b"NOOP\r", b"NOOP\r\t", b"USER a"] {
+            assert_eq!(s.on_idle(SeedMode::Vulnerable, buf), Step::Wait);
+            assert_eq!(s.on_idle(SeedMode::Patched, buf), Step::Wait);
+        }
         assert_eq!(
             s.parse(SeedMode::Vulnerable, b"\r\n"),
             Parsed::Message {
@@ -196,6 +205,36 @@ mod tests {
                 step: Step::ProtocolError(b"500 unknown command\r\n".to_vec()),
             }
         );
+    }
+
+    /// A high-bit byte (or a NUL) in an argument never breaks verb
+    /// matching; one in the verb is an ordinary unknown command: reply,
+    /// keep (T10 PR C).
+    #[test]
+    fn ftp_high_bit_bytes_get_a_normal_reply() {
+        let mut s = Ftp;
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                s.parse(mode, b"USER a\xff\r\n"),
+                msg(
+                    9,
+                    "USER",
+                    Step::Reply(b"331 password required\r\n".to_vec())
+                )
+            );
+            assert_eq!(
+                s.parse(mode, b"PASS b\x00c\r\n"),
+                msg(10, "PASS", Step::Reply(b"230 logged in\r\n".to_vec()))
+            );
+            assert_eq!(
+                s.parse(mode, b"US\xffER a\r\n"),
+                msg(
+                    9,
+                    "US\u{FFFD}ER",
+                    Step::ProtocolError(b"500 unknown command\r\n".to_vec())
+                )
+            );
+        }
     }
 
     #[test]

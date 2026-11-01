@@ -6,7 +6,8 @@
 //! accepted`) and `QUIT`. The one deliberate bug is a command line longer
 //! than [`MAX_LINE`] bytes (CRLF past the cap, or no CRLF within cap + 1
 //! bytes): the Vulnerable origin crashes ([`Step::Trigger`]), the Patched
-//! control answers `500 line too long` and closes ([`Step::Fault`]).
+//! control answers `500 line too long` and closes ([`Step::Fault`]). A
+//! partial line at idle just waits ([`Step::Wait`], T10 PR C).
 
 use super::{mode_bug, take_line, LineScan, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
@@ -84,7 +85,10 @@ impl Speaker for Smtp {
     }
 
     fn on_idle(&mut self, _mode: SeedMode, _buf: &[u8]) -> Step {
-        Step::Close(None)
+        // A line without its CRLF yet (or with a damaged terminator) is not
+        // a protocol event; a real server waits for the rest. An over-long
+        // line never gets here: `take_line` reports it `TooLong` in `parse`.
+        Step::Wait
     }
 
     fn max_buffer(&self) -> usize {
@@ -233,8 +237,18 @@ mod tests {
         assert_eq!(s.parse(SeedMode::Vulnerable, b""), Parsed::Incomplete);
         assert_eq!(s.parse(SeedMode::Vulnerable, b"NOO"), Parsed::Incomplete);
         assert_eq!(s.parse(SeedMode::Vulnerable, b"NOOP\r"), Parsed::Incomplete);
-        assert_eq!(s.on_idle(SeedMode::Vulnerable, b"NOO"), Step::Close(None));
-        assert_eq!(s.on_idle(SeedMode::Patched, b"NOO"), Step::Close(None));
+        // A partial line after the idle is not a protocol event: wait for
+        // the CRLF silently, in both modes (T10 PR C). A damaged terminator
+        // (`\r\t`) is still just a partial line.
+        for buf in [
+            &b"NOO"[..],
+            b"NOOP\r",
+            b"NOOP\r\t",
+            b"MAIL FROM:<a@target.test>",
+        ] {
+            assert_eq!(s.on_idle(SeedMode::Vulnerable, buf), Step::Wait);
+            assert_eq!(s.on_idle(SeedMode::Patched, buf), Step::Wait);
+        }
         assert_eq!(
             s.parse(SeedMode::Vulnerable, b"\r\n"),
             Parsed::Message {
@@ -243,6 +257,31 @@ mod tests {
                 step: Step::ProtocolError(b"500 unknown command\r\n".to_vec()),
             }
         );
+    }
+
+    /// A high-bit byte in an argument never breaks verb matching; one in
+    /// the verb is an ordinary unknown command: reply, keep (T10 PR C).
+    #[test]
+    fn smtp_high_bit_bytes_get_a_normal_reply() {
+        let mut s = Smtp;
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                s.parse(mode, b"EHLO x\xff\r\n"),
+                msg(9, "EHLO", Step::Reply(b"250 target.test\r\n".to_vec()))
+            );
+            assert_eq!(
+                s.parse(mode, b"MAIL FROM:<a\xff@target.test>\r\n"),
+                msg(28, "MAIL", Step::Reply(b"250 OK\r\n".to_vec()))
+            );
+            assert_eq!(
+                s.parse(mode, b"EH\xffLO x\r\n"),
+                msg(
+                    9,
+                    "EH\u{FFFD}LO",
+                    Step::ProtocolError(b"500 unknown command\r\n".to_vec())
+                )
+            );
+        }
     }
 
     #[test]
