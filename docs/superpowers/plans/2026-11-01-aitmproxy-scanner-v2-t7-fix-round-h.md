@@ -61,6 +61,8 @@ H38. A failing check keeps only a 700-character fragment of the screen, which is
 
 H39. T7-19's Site map head stayed blank after `3` then `J` while the harness's `scan.sitemap {job}` read had 1 node: before failing, the step records in the detail the tab-strip row (the banner carries any `scan.sitemap` error wording), the Jobs cursor's job id as the TUI shows it on the Jobs tab, and the harness's node count for `scan.sitemap {}` and `{job}`; it also waits for either the `{n} nodes` head or an error banner on the Site map tab, so the failure says which.
 
+H41 (cell, after H37-H39). The self-test's Findings frame literal follows H40: `Findings · PoCs and runs`; the live `P` poll keeps matching `PoCs and runs`.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
@@ -72,6 +74,10 @@ H20. **Critical (was G19, claimed by round G-A, not in the range).** `app.rs` `s
 H21. G2's prescribed unit test: in `scan/issues.rs` the L4 mirror test folds 100 probe flows through `IssuesState::fold_issue` and asserts `DetailLayout::of(read).total == detail_len()` and `layout.row(first_after) == DetailRow::After(0)`.
 
 Ratified from the G-A+G-B spec re-review: `ui::scan::{Hint, hints, HELP, key_text, rows, wrap, blocked_footer, launch_reason}` stay `pub` because `tests/scan_v2_layout.rs` (G88) reads `HELP`/`key_text` from outside the crate; `scroll(at, ..)` lives in `scan/mod.rs` as `pub(crate)` so `DetailView::scroll` can use it; `LaunchVerb::parse`, `ReadCache::is_empty`/`keys`, `CURSOR_TOO_LONG` and `GATE_OPEN_PROFILE` are accepted helpers.
+
+**Rust H18-H21 result (2026-11-01):** done in `c55c6695` (H18: the overlay body goes through the same mode match on `wire_confirm_from`), `99426dfd` (H19: 32 files; the 58 remaining `—` are the §2.8 missing-value glyph, ratified as foundation design, plus the `Findings — PoCs and runs` title, now H40, and the fixture's `Shop — staging` page data), `431cbbdd` (H20), `0817f035` (H21, with a mutation check); crate gate green (520 tests).
+
+H40. The Findings overlay title `Findings — PoCs and runs` (`ui/overlays.rs`, pin in `tests/tester_components.rs`) becomes `Findings · PoCs and runs` (the middle dot is the TUI's separator everywhere else); the cell's self-test literal follows in H41 (cell).
 
 ### Rust bounds (from the G-A+G-B security re-review; same Coder as the tidy, these first)
 

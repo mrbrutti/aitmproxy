@@ -705,6 +705,10 @@ Kept by the main session during stage 6. One row per finding.
 | G-A+G-B | security | Minor | confirm prompt wrapped whole per frame; legacy error re-bounded per frame; Site map `cut` without `clean`; `scan.list` uncapped | fix round H Rust (H34, H35, H22, H36) |
 | 15 | live smoke | run 1 | real `aitm-tui` on the real bus against T1b's engine at abaf5264 (throwaway merge): 21 of 26 ok incl. UI-3 end to end (gate, `l4.scope.add` with `*`, overlay, `y` matched the harness, `n`), Jobs row for a real job, probes inside the bracket, phase change, no secret leak, clean exit | cell items H37-H39; two engine questions to the coordinator (zero issues from `standard`, zero `notifications/aitm/job` on a second subscriber) |
 | 15 | live smoke | finding | `scan.profile.get` failed to parse on this branch's older contract crate (T1b added `l4.fields`, `ScanProfile` is `deny_unknown_fields`) | resolved by building against T1b's model; the integration merge of main after T1b lands carries it |
+| H (Rust) | fix round | done | H18 `c55c6695`, H19 `99426dfd`, H20 `431cbbdd`, H21 `0817f035`; crate gate green (520 tests) | H22-H36 and H40 next (one coder) |
+| H (Rust) | coder note | Minor | the overlay body runs through the same mode match on `wire_confirm_from` (Inspector draws the inspector, Scan draws Scan, else `main_region`) | ratified |
+| H (Rust) | coder note | Minor | the lone `—` missing-value glyph (§2.8) stays; `Findings — PoCs and runs` and the fixture's `Shop — staging` page data left | glyph ratified as foundation design; title becomes `Findings · PoCs and runs` (H40, cell H41); fixture data untouched |
+| H (Rust) | coder note | Minor | `rustfmt <file>` needs `--edition 2021` on files with `async fn` | noted for the parallel-coders memory |
 
 ## Shipped
 
