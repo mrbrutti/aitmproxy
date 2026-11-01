@@ -372,7 +372,7 @@ Spec §7(b) file list. `tests/l4_parity.rs` builds the app with `App::new(TermCa
 
 - **Satisfies:** AC33 (TUI half: "no `L4 unavailable` result for `aitm-tui` after any enabled control"); found by B9's live run (the craft pane's `s` sent `l4.inject` and got `L4 unavailable: …` back on an unprivileged host)
 - **Depends on:** B9
-- **Files:** `crates/aitm-tui/src/app.rs`, `src/ui/l4.rs` (craft header hint only), `tests/l4_parity.rs`
+- **Files:** `crates/aitm-tui/src/app.rs`, `src/ui/l4.rs` (craft header hint only), `tests/l4_parity.rs`, `tests/robustness.rs` (precondition only: `l4_inject_is_scope_gated_and_confirmed_over_the_wire` lands an available capture status before pressing `s`), `crates/aitm/tests/l4_cua_tui.rs` (STEP 4 branches on availability), `tests/e2e/l4/test_l4_tui_live.py` (one check)
 - **Change:** `App::l4_inject` (the `s` key and the confirm it opens) checks `self.l4.capture` availability first (the status contract's `needs_privilege` covers capture *and* inject, spec §1): when unavailable it emits nothing and toasts `inject unavailable: <reason>`; the craft header shows `s inject (unavailable)` instead of `s inject (guarded)`. Available → unchanged.
 - **Test first** (`--test l4_parity inject_gate`): with capture availability `needs_privilege` + reason `R`, `s` on an L4 row emits `vec![]` and the toast is `inject unavailable: R`; with availability available, `s` emits the `l4.inject` call as before; the rendered craft header contains the matching hint.
 - **Live check:** the B9 cell gains one check: `s` in the craft pane on this rig puts no `l4.inject` on the ring and the toast carries the core's reason (run on the rig; output quoted).
