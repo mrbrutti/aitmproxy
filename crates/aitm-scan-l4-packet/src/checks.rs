@@ -295,7 +295,7 @@ fn reaction_verdict(run: &PointRun, scope_entry: &str) -> Verdict {
     let Some(oracle) = class.oracle() else {
         return clean();
     };
-    let Some(case) = run.cases.iter().find(|case| case.class == Some(class)) else {
+    let Some(case) = run.cases.iter().find(|case| case.class() == Some(class)) else {
         return clean();
     };
     let evidence = L4Evidence {
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn detail_lines_are_literal() {
         use crate::oracle::CaseClass;
-        use crate::state::{CaseRecord, CrashRecord, PointRun};
+        use crate::state::{CaseRecord, CrashRecord, Outcome, PointRun};
         use aitm_scan_model::L4Evidence;
 
         let case = |index: u32, class: CaseClass, hex: &str, outlier: bool| CaseRecord {
@@ -999,10 +999,11 @@ mod tests {
             seed_id: "127.0.0.1:9/udp#0".to_string(),
             chain: vec![format!("case{index}")],
             sent_hex: hex.to_string(),
-            class: Some(class),
-            sent: true,
-            elapsed_ms: 1,
-            latency_outlier: outlier,
+            outcome: Outcome::Sent {
+                class,
+                elapsed_ms: 1,
+                latency_outlier: outlier,
+            },
             candidate: Candidate::No,
         };
         let icmp = CaseClass::Icmp {

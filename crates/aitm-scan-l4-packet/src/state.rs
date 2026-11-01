@@ -94,18 +94,87 @@ pub struct CaseRecord {
     pub chain: Vec<String>,
     /// The frame that was sent (or would have been, in a dry run), hex-encoded.
     pub sent_hex: String,
-    /// How the oracle read the reaction, `None` for a case that never went out.
-    pub class: Option<CaseClass>,
-    /// Whether the case was actually sent.
-    pub sent: bool,
-    /// The round trip in milliseconds, `0` for an unsent case.
-    pub elapsed_ms: u32,
-    /// Whether the round trip was a latency outlier.
-    pub latency_outlier: bool,
+    /// Whether the case went out and, if it did, how the oracle read it. A class
+    /// and an elapsed time exist only for a sent case, so an unsent case can
+    /// never carry a reaction and a sent one always does (review finding M2).
+    pub outcome: Outcome,
     /// What the triage ladder made of this case: the lane's own answer,
     /// recorded here rather than inferred later from the run's stop (review
     /// finding Q2).
     pub candidate: Candidate,
+}
+
+/// Whether a case reached the wire, and what came back when it did.
+///
+/// Modelling the two states as one enum is what keeps a class and a sent flag
+/// from ever disagreeing (review finding M2): an [`Outcome::Unsent`] case has no
+/// class and no timing, and only a [`Outcome::Sent`] case does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The case never reached the wire — undecodable, or the builder refused it.
+    Unsent,
+    /// The case went out and the oracle read its reply.
+    Sent {
+        /// How the oracle classified the reply.
+        class: CaseClass,
+        /// The round trip in milliseconds.
+        elapsed_ms: u32,
+        /// Whether the round trip was a latency outlier.
+        latency_outlier: bool,
+    },
+}
+
+impl CaseRecord {
+    /// A case that never reached the wire: undecodable, or the builder refused
+    /// it. The only constructor that yields no class, so an unsent case can
+    /// never carry a reaction (review finding M2).
+    #[must_use]
+    pub fn unsent(index: u32, seed_id: String, chain: Vec<String>, sent_hex: String) -> Self {
+        Self {
+            index,
+            seed_id,
+            chain,
+            sent_hex,
+            outcome: Outcome::Unsent,
+            candidate: Candidate::No,
+        }
+    }
+
+    /// How the oracle read this case, or `None` for a case that never went out.
+    #[must_use]
+    pub fn class(&self) -> Option<CaseClass> {
+        match self.outcome {
+            Outcome::Sent { class, .. } => Some(class),
+            Outcome::Unsent => None,
+        }
+    }
+
+    /// Whether the case actually reached the wire.
+    #[must_use]
+    pub fn sent(&self) -> bool {
+        matches!(self.outcome, Outcome::Sent { .. })
+    }
+
+    /// The round trip in milliseconds, `0` for an unsent case.
+    #[must_use]
+    pub fn elapsed_ms(&self) -> u32 {
+        match self.outcome {
+            Outcome::Sent { elapsed_ms, .. } => elapsed_ms,
+            Outcome::Unsent => 0,
+        }
+    }
+
+    /// Whether the round trip was a latency outlier.
+    #[must_use]
+    pub fn latency_outlier(&self) -> bool {
+        matches!(
+            self.outcome,
+            Outcome::Sent {
+                latency_outlier: true,
+                ..
+            }
+        )
+    }
 }
 
 /// How far the crash ladder got with one case — the case's own verdict.
@@ -166,10 +235,7 @@ impl fmt::Debug for CaseRecord {
                 "sent_hex",
                 &format_args!("<{} bytes>", self.sent_hex.len() / 2),
             )
-            .field("class", &self.class)
-            .field("sent", &self.sent)
-            .field("elapsed_ms", &self.elapsed_ms)
-            .field("latency_outlier", &self.latency_outlier)
+            .field("outcome", &self.outcome)
             .field("candidate", &self.candidate)
             .finish()
     }
@@ -259,7 +325,7 @@ impl PointRun {
     #[must_use]
     pub fn reactions(&self) -> Vec<(CaseClass, u32)> {
         let mut seen: Vec<(CaseClass, u32)> = Vec::new();
-        for class in self.cases.iter().filter_map(|case| case.class) {
+        for class in self.cases.iter().filter_map(CaseRecord::class) {
             if !matches!(class, CaseClass::Icmp { .. } | CaseClass::Reset) {
                 continue;
             }
@@ -275,7 +341,7 @@ impl PointRun {
     /// How many of the run's cases actually went out on the wire.
     #[must_use]
     pub fn sent_count(&self) -> u32 {
-        u32::try_from(self.cases.iter().filter(|case| case.sent).count()).unwrap_or(u32::MAX)
+        u32::try_from(self.cases.iter().filter(|case| case.sent()).count()).unwrap_or(u32::MAX)
     }
 
     /// How many of the run's cases came back outside the latency window.
@@ -284,7 +350,7 @@ impl PointRun {
         u32::try_from(
             self.cases
                 .iter()
-                .filter(|case| case.latency_outlier)
+                .filter(|case| case.latency_outlier())
                 .count(),
         )
         .unwrap_or(u32::MAX)
@@ -521,26 +587,24 @@ impl LaneState {
         self.with_job(job_id, |job| job.stats.cases_cap)
     }
 
-    /// Record one case's outcome.
+    /// Record a case that never reached the wire: counted apart from the sent
+    /// cases and never touching the stop ladder (review finding M2).
+    pub fn record_unsendable(&self, job_id: &str) {
+        self.with_job_mut(job_id, |job| job.stats.cases_unsendable += 1);
+    }
+
+    /// Record one sent case's class.
     ///
-    /// A sent case counts as a case; a silent one also advances the stop
-    /// ladder, any other class resets it. An unsendable case is counted apart
-    /// and never touches the ladder.
+    /// The case counts as a case; a silent one also advances the stop ladder,
+    /// any other class resets it. An unsent case is recorded with
+    /// [`Self::record_unsendable`] instead, so this method takes no "sent" flag
+    /// and never a dummy class (review finding M2).
     ///
     /// # Errors
     /// [`StopReason::ConsecutiveTimeouts`] once the ladder trips — the case is
     /// still counted, so the tripping case is never lost.
-    pub fn record_case(
-        &self,
-        job_id: &str,
-        class: CaseClass,
-        sent: bool,
-    ) -> Result<(), StopReason> {
+    pub fn record_case(&self, job_id: &str, class: CaseClass) -> Result<(), StopReason> {
         let tripped = self.with_job_mut(job_id, |job| {
-            if !sent {
-                job.stats.cases_unsendable += 1;
-                return None;
-            }
             job.stats.l4.cases += 1;
             if class == CaseClass::Silence {
                 job.stats.timeouts += 1;
@@ -692,10 +756,11 @@ mod tests {
             seed_id: "127.0.0.1:9/udp#0".to_string(),
             chain: vec!["grow:8".to_string()],
             sent_hex: "deadbeef".to_string(),
-            class: Some(class),
-            sent: true,
-            elapsed_ms: 1,
-            latency_outlier: false,
+            outcome: Outcome::Sent {
+                class,
+                elapsed_ms: 1,
+                latency_outlier: false,
+            },
             candidate: Candidate::No,
         }
     }
@@ -749,12 +814,12 @@ mod tests {
         assert_eq!(state.allocate_cases("scan-a"), Some(8));
 
         for _ in 0..96 {
-            assert_eq!(state.record_case("scan-a", CaseClass::Clean, true), Ok(()));
+            assert_eq!(state.record_case("scan-a", CaseClass::Clean), Ok(()));
         }
         assert_eq!(state.allocate_cases("scan-a"), Some(4));
 
         for _ in 0..4 {
-            assert_eq!(state.record_case("scan-a", CaseClass::Clean, true), Ok(()));
+            assert_eq!(state.record_case("scan-a", CaseClass::Clean), Ok(()));
         }
         assert_eq!(state.allocate_cases("scan-a"), Some(0));
     }
@@ -771,16 +836,10 @@ mod tests {
             false,
         );
 
+        assert_eq!(state.record_case("scan-t", CaseClass::Silence), Ok(()));
+        assert_eq!(state.record_case("scan-t", CaseClass::Silence), Ok(()));
         assert_eq!(
-            state.record_case("scan-t", CaseClass::Silence, true),
-            Ok(())
-        );
-        assert_eq!(
-            state.record_case("scan-t", CaseClass::Silence, true),
-            Ok(())
-        );
-        assert_eq!(
-            state.record_case("scan-t", CaseClass::Silence, true),
+            state.record_case("scan-t", CaseClass::Silence),
             Err(StopReason::ConsecutiveTimeouts(3))
         );
 
@@ -804,15 +863,9 @@ mod tests {
             3,
             false,
         );
-        assert_eq!(
-            state.record_case("scan-r", CaseClass::Silence, true),
-            Ok(())
-        );
-        assert_eq!(
-            state.record_case("scan-r", CaseClass::Silence, true),
-            Ok(())
-        );
-        assert_eq!(state.record_case("scan-r", CaseClass::Clean, true), Ok(()));
+        assert_eq!(state.record_case("scan-r", CaseClass::Silence), Ok(()));
+        assert_eq!(state.record_case("scan-r", CaseClass::Silence), Ok(()));
+        assert_eq!(state.record_case("scan-r", CaseClass::Clean), Ok(()));
         let stats = state.stats("scan-r").expect("the job is known");
         assert_eq!(stats.consecutive_timeouts, 0);
         assert_eq!(stats.timeouts, 2);
@@ -831,10 +884,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            state.record_case("scan-u", CaseClass::Silence, false),
-            Ok(())
-        );
+        state.record_unsendable("scan-u");
 
         let stats = state.stats("scan-u").expect("the job is known");
         assert_eq!(stats.l4.cases, 0);
@@ -856,7 +906,7 @@ mod tests {
         );
 
         for _ in 0..5 {
-            assert_eq!(state.record_case("scan-c", CaseClass::Clean, true), Ok(()));
+            assert_eq!(state.record_case("scan-c", CaseClass::Clean), Ok(()));
         }
         state.record_liveness("scan-c", false);
         state.record_liveness("scan-c", false);
@@ -897,10 +947,7 @@ mod tests {
         assert!(!state.point_known("scan-nope", "p0"));
         assert!(!state.is_retired("scan-nope", "p0"));
 
-        assert_eq!(
-            state.record_case("scan-nope", CaseClass::Silence, true),
-            Ok(())
-        );
+        assert_eq!(state.record_case("scan-nope", CaseClass::Silence), Ok(()));
         state.record_liveness("scan-nope", false);
         state.record_rate_wait("scan-nope");
         state.record_crash("scan-nope", "p0");
@@ -1074,10 +1121,10 @@ mod tests {
         );
         assert_eq!(state.allocate_cases("scan-p"), Some(1));
         for _ in 0..9 {
-            assert_eq!(state.record_case("scan-p", CaseClass::Clean, true), Ok(()));
+            assert_eq!(state.record_case("scan-p", CaseClass::Clean), Ok(()));
         }
         assert_eq!(state.allocate_cases("scan-p"), Some(1));
-        assert_eq!(state.record_case("scan-p", CaseClass::Clean, true), Ok(()));
+        assert_eq!(state.record_case("scan-p", CaseClass::Clean), Ok(()));
         assert_eq!(state.allocate_cases("scan-p"), Some(0));
         assert_eq!(state.stats("scan-p").expect("known").points, 14);
 
@@ -1124,10 +1171,7 @@ mod tests {
                 Some(CASES_CEILING - sent),
                 "after {sent} cases"
             );
-            assert_eq!(
-                state.record_case("scan-max", CaseClass::Clean, true),
-                Ok(())
-            );
+            assert_eq!(state.record_case("scan-max", CaseClass::Clean), Ok(()));
         }
         assert_eq!(state.allocate_cases("scan-max"), Some(0));
         let stats = state.stats("scan-max").expect("known");
@@ -1173,7 +1217,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            state.record_case("scan-0t", CaseClass::Silence, true),
+            state.record_case("scan-0t", CaseClass::Silence),
             Err(StopReason::ConsecutiveTimeouts(1))
         );
         state.begin_job(
@@ -1184,9 +1228,9 @@ mod tests {
             1,
             false,
         );
-        assert_eq!(state.record_case("scan-1t", CaseClass::Clean, true), Ok(()));
+        assert_eq!(state.record_case("scan-1t", CaseClass::Clean), Ok(()));
         assert_eq!(
-            state.record_case("scan-1t", CaseClass::Silence, true),
+            state.record_case("scan-1t", CaseClass::Silence),
             Err(StopReason::ConsecutiveTimeouts(1))
         );
     }
@@ -1208,12 +1252,9 @@ mod tests {
         state.mark_stopped("scan-s", StopReason::Deadline);
         assert_eq!(state.stopped("scan-s"), Some(StopReason::Budget));
 
+        assert_eq!(state.record_case("scan-s", CaseClass::Silence), Ok(()));
         assert_eq!(
-            state.record_case("scan-s", CaseClass::Silence, true),
-            Ok(())
-        );
-        assert_eq!(
-            state.record_case("scan-s", CaseClass::Silence, true),
+            state.record_case("scan-s", CaseClass::Silence),
             Err(StopReason::ConsecutiveTimeouts(2))
         );
         assert_eq!(state.stopped("scan-s"), Some(StopReason::Budget));
@@ -1234,7 +1275,7 @@ mod tests {
             false,
         );
         for _ in 0..5 {
-            assert_eq!(state.record_case("j-first", CaseClass::Clean, true), Ok(()));
+            assert_eq!(state.record_case("j-first", CaseClass::Clean), Ok(()));
         }
         state.record_crash("j-first", "p0");
         state.begin_job(
@@ -1322,29 +1363,17 @@ mod tests {
         );
 
         assert_eq!(state.cases_remaining("scan-rem"), Some(3));
-        assert_eq!(
-            state.record_case("scan-rem", CaseClass::Clean, true),
-            Ok(())
-        );
+        assert_eq!(state.record_case("scan-rem", CaseClass::Clean), Ok(()));
         assert_eq!(state.cases_remaining("scan-rem"), Some(2));
         // An unsendable case is counted apart and spends no room.
-        assert_eq!(
-            state.record_case("scan-rem", CaseClass::Silence, false),
-            Ok(())
-        );
+        state.record_unsendable("scan-rem");
         assert_eq!(state.cases_remaining("scan-rem"), Some(2));
         for _ in 0..2 {
-            assert_eq!(
-                state.record_case("scan-rem", CaseClass::Clean, true),
-                Ok(())
-            );
+            assert_eq!(state.record_case("scan-rem", CaseClass::Clean), Ok(()));
         }
         assert_eq!(state.cases_remaining("scan-rem"), Some(0));
         // The counter never wraps past the cap.
-        assert_eq!(
-            state.record_case("scan-rem", CaseClass::Clean, true),
-            Ok(())
-        );
+        assert_eq!(state.record_case("scan-rem", CaseClass::Clean), Ok(()));
         assert_eq!(state.cases_remaining("scan-rem"), Some(0));
         assert_eq!(state.cases_remaining("scan-nope"), None);
     }
@@ -1402,10 +1431,13 @@ mod tests {
     #[test]
     fn sent_and_outlier_counts_read_the_flags() {
         let mut unsent = case(0, CaseClass::Clean);
-        unsent.sent = false;
-        unsent.class = None;
+        unsent.outcome = Outcome::Unsent;
         let mut slow = case(1, CaseClass::Clean);
-        slow.latency_outlier = true;
+        slow.outcome = Outcome::Sent {
+            class: CaseClass::Clean,
+            elapsed_ms: 1,
+            latency_outlier: true,
+        };
         let run = PointRun {
             point_id: "p".to_string(),
             target: "t".to_string(),

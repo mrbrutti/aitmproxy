@@ -45,7 +45,7 @@ use crate::oracle::{classify, liveness_passes, CaseClass, LatencyWindow};
 use crate::plan::{is_decodable, send_recv_spec, PlanError, SeedSpec, TargetPlan};
 use crate::rng::{derive_seed, Rng};
 use crate::state::{
-    report_counters, Candidate, CaseRecord, CrashRecord, LaneState, PointRun, StopReason,
+    report_counters, Candidate, CaseRecord, CrashRecord, LaneState, Outcome, PointRun, StopReason,
 };
 use crate::sync::lock;
 
@@ -369,7 +369,7 @@ impl PointRunner {
                 self.field,
             )
             .await?;
-        let passed = match (*lock(&self.baseline), delivered.sent.record.class) {
+        let passed = match (*lock(&self.baseline), delivered.sent.record.class()) {
             (Some(baseline), Some(class)) => liveness_passes(baseline, class),
             // No baseline yet, or a case that never went out: not a pass.
             _ => false,
@@ -424,17 +424,12 @@ impl PointRunner {
                 .and_then(|spec| spec.build().ok())
                 .map(|bytes| hex_encode(&bytes))
                 .unwrap_or_default();
-            run.cases.push(CaseRecord {
+            run.cases.push(CaseRecord::unsent(
                 index,
-                seed_id: seed.id,
-                chain: vec![mutation.label()],
+                seed.id,
+                vec![mutation.label()],
                 sent_hex,
-                class: None,
-                sent: false,
-                elapsed_ms: 0,
-                latency_outlier: false,
-                candidate: Candidate::No,
-            });
+            ));
         }
         run
     }
@@ -535,25 +530,12 @@ impl PointRunner {
         let bytes = spec
             .build()
             .map_err(|err| HostError::Craft(err.to_string()))?;
-        let mut record = CaseRecord {
-            index,
-            seed_id: seed_id.to_string(),
-            chain,
-            sent_hex: hex_encode(&bytes),
-            class: None,
-            sent: false,
-            elapsed_ms: 0,
-            latency_outlier: false,
-            candidate: Candidate::No,
-        };
+        let mut record = CaseRecord::unsent(index, seed_id.to_string(), chain, hex_encode(&bytes));
         if !is_decodable(&bytes) {
             if counted == Counted::Case {
-                // `record_case` ignores the class of an unsent case; it counts
-                // it as unsendable and leaves the stop ladder alone.
-                let _ = self
-                    .shared
-                    .state
-                    .record_case(&job_id, CaseClass::Silence, false);
+                // An undecodable case is counted apart as unsendable and leaves
+                // the stop ladder alone.
+                self.shared.state.record_unsendable(&job_id);
             }
             return Ok(Delivery {
                 sent: Sent {
@@ -636,13 +618,15 @@ impl PointRunner {
         // (f) The oracle reads the reply, and the ladder gets its say — after
         // the record exists, so the tripping case is never lost.
         let classified = classify(&outcome, elapsed);
-        record.class = Some(classified.class);
-        record.sent = true;
-        record.elapsed_ms = classified.elapsed_ms;
+        record.outcome = Outcome::Sent {
+            class: classified.class,
+            elapsed_ms: classified.elapsed_ms,
+            latency_outlier: false,
+        };
         let stop = if counted == Counted::Case {
             self.shared
                 .state
-                .record_case(&job_id, classified.class, true)
+                .record_case(&job_id, classified.class)
                 .err()
         } else {
             None
@@ -704,7 +688,7 @@ impl PointRunner {
             .await
         {
             Ok(delivered) => {
-                run.baseline = delivered.sent.record.class;
+                run.baseline = delivered.sent.record.class();
                 *lock(&self.baseline) = run.baseline;
             }
             Err(HostError::Stopped(reason)) => {
@@ -745,21 +729,9 @@ impl PointRunner {
             let Ok(spec) = mutation.apply(&seed.spec, timing.max_raw_bytes) else {
                 // A case that cannot even be rendered is unsendable, exactly as
                 // one the wire would refuse: counted apart, never charged.
-                let _ = self
-                    .shared
-                    .state
-                    .record_case(job_id, CaseClass::Silence, false);
-                run.cases.push(CaseRecord {
-                    index,
-                    seed_id: seed.id,
-                    chain,
-                    sent_hex: String::new(),
-                    class: None,
-                    sent: false,
-                    elapsed_ms: 0,
-                    latency_outlier: false,
-                    candidate: Candidate::No,
-                });
+                self.shared.state.record_unsendable(job_id);
+                run.cases
+                    .push(CaseRecord::unsent(index, seed.id, chain, String::new()));
                 continue;
             };
 
@@ -783,35 +755,31 @@ impl PointRunner {
                 // an unsendable case, exactly as one `mutation.apply` could not
                 // render, instead of vanishing from the run (review finding Q1).
                 Err(HostError::Craft(_)) => {
-                    let _ = self
-                        .shared
-                        .state
-                        .record_case(job_id, CaseClass::Silence, false);
-                    run.cases.push(CaseRecord {
-                        index,
-                        seed_id: seed.id,
-                        chain,
-                        sent_hex: String::new(),
-                        class: None,
-                        sent: false,
-                        elapsed_ms: 0,
-                        latency_outlier: false,
-                        candidate: Candidate::No,
-                    });
+                    self.shared.state.record_unsendable(job_id);
+                    run.cases
+                        .push(CaseRecord::unsent(index, seed.id, chain, String::new()));
                     continue;
                 }
             };
             let mut record = delivered.sent.record;
             let stop = delivered.stop;
-            if !record.sent {
+            // An unsent case (undecodable) carries no reaction; it is logged and
+            // the loop moves on (review finding M2).
+            let Outcome::Sent {
+                class, elapsed_ms, ..
+            } = record.outcome
+            else {
                 run.cases.push(record);
                 continue;
-            }
+            };
             sent_cases += 1;
-            let class = record.class.unwrap_or(CaseClass::Silence);
             if class == CaseClass::Clean {
-                latency.record(record.elapsed_ms);
-                record.latency_outlier = latency.is_outlier(record.elapsed_ms);
+                latency.record(elapsed_ms);
+                record.outcome = Outcome::Sent {
+                    class,
+                    elapsed_ms,
+                    latency_outlier: latency.is_outlier(elapsed_ms),
+                };
             }
 
             if class.is_candidate() && stop.is_none() {
@@ -1037,7 +1005,7 @@ impl PointRunner {
             let candidate = delivered
                 .sent
                 .record
-                .class
+                .class()
                 .is_some_and(|class| class.is_candidate());
             let (first, second, probe_stop) = self.probe_pair(true).await;
             alive = first || second;
@@ -1120,17 +1088,17 @@ fn response_for(sent: &Sent) -> ProbeResponse {
         status: None,
         headers: Vec::new(),
         body,
-        elapsed_ms: sent.record.elapsed_ms,
+        elapsed_ms: sent.record.elapsed_ms(),
         flow: None,
         ws_frames: None,
         l4: sent
             .record
-            .class
+            .class()
             .and_then(|class| class.oracle())
             .map(|oracle| L4Reply {
                 bytes: sent.reply.clone(),
                 oracle,
-                elapsed_ms: sent.record.elapsed_ms,
+                elapsed_ms: sent.record.elapsed_ms(),
             }),
     }
 }
@@ -1374,9 +1342,9 @@ mod tests {
         assert!(
             run.cases
                 .iter()
-                .all(|case| case.class == Some(CaseClass::Clean)),
+                .all(|case| case.class() == Some(CaseClass::Clean)),
             "every case is clean: {:?}",
-            run.cases.iter().map(|c| c.class).collect::<Vec<_>>()
+            run.cases.iter().map(|c| c.class()).collect::<Vec<_>>()
         );
         assert_eq!(run.baseline, Some(CaseClass::Clean));
         assert!(run.crash.is_none());
@@ -1418,7 +1386,7 @@ mod tests {
             code: 3,
         };
         assert_eq!(run.cases.len(), 10);
-        assert!(run.cases.iter().all(|case| case.class == Some(icmp)));
+        assert!(run.cases.iter().all(|case| case.class() == Some(icmp)));
         assert_eq!(run.baseline, Some(icmp));
         assert_eq!(run.reactions(), vec![(icmp, 10)]);
         let counters = shared.state.counters(job.job_id()).expect("counters");
@@ -1734,7 +1702,7 @@ mod tests {
         assert!(run
             .cases
             .iter()
-            .all(|case| case.class == Some(CaseClass::Clean)));
+            .all(|case| case.class() == Some(CaseClass::Clean)));
         assert!(shared.state.stats(job.job_id()).expect("stats").rate_waits >= 1);
         assert_eq!(job.charged(), 5);
     }
@@ -1752,8 +1720,8 @@ mod tests {
         assert!(run.dry_run);
         assert_eq!(run.cases.len(), 50);
         for case in &run.cases {
-            assert!(!case.sent);
-            assert_eq!(case.class, None);
+            assert!(!case.sent());
+            assert_eq!(case.class(), None);
             assert!(!case.sent_hex.is_empty());
             assert_eq!(case.chain.len(), 1);
         }
@@ -1783,7 +1751,7 @@ mod tests {
                 .iter()
                 .find(|case| case.chain == vec![label.clone()])
                 .unwrap_or_else(|| panic!("a record for {label}"));
-            assert!(!case.sent, "{label} cannot be put on the wire");
+            assert!(!case.sent(), "{label} cannot be put on the wire");
         }
         let stats = shared.state.stats(job.job_id()).expect("stats");
         // Every one of the eight `ipv4.ihl` cases garbles the header length, so
@@ -2437,7 +2405,7 @@ mod tests {
         let run = runner.run_point().await;
 
         assert_eq!(run.cases.len(), 4, "{:?}", run.cases);
-        assert!(run.cases.iter().all(|case| case.sent), "{:?}", run.cases);
+        assert!(run.cases.iter().all(|case| case.sent()), "{:?}", run.cases);
         assert_eq!(run.stopped, None);
         assert_eq!(shared.state.stopped(job.job_id()), None);
         assert!(run.crash.is_none());
