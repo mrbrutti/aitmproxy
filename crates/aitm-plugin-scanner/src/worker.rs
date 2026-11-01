@@ -2669,7 +2669,10 @@ mod tests {
         .expect("the job starts");
         assert!(h.egress_confined(), "a running job holds the posture");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(2)).await;
+        // 10 s, not 2: the job is supervised through catch_unwind on a worker
+        // thread, and a load average near 300 (shared gate machine) stretched
+        // the hand-back past 2 s once (2026-11-01).
+        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
         assert_eq!(status.state, JobState::Failed);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Failed));
         assert_eq!(status.phase, Phase::Done);
