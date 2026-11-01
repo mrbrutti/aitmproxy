@@ -489,26 +489,9 @@ impl Session {
     }
 
     /// Drop arguments the tool's schema does not declare, so a form built for
-    /// a richer schema still works against an older core.
+    /// a richer schema still works against an older core ([`prune_args`]).
     fn prune(&self, name: &str, args: Value) -> Value {
-        let Some(tool) = self.tools.iter().find(|t| t.name == name) else {
-            return args;
-        };
-        let Some(props) = tool
-            .input_schema
-            .get("properties")
-            .and_then(Value::as_object)
-        else {
-            return args;
-        };
-        match args {
-            Value::Object(map) if !props.is_empty() => Value::Object(
-                map.into_iter()
-                    .filter(|(k, _)| props.contains_key(k))
-                    .collect(),
-            ),
-            other => other,
-        }
+        prune_args(self.tools.iter().find(|t| t.name == name), args)
     }
 
     async fn call_and_report(&mut self, name: &str, args: Value) -> Result<(), Outcome> {
@@ -574,9 +557,72 @@ fn error_text(e: BusError) -> String {
     }
 }
 
+/// The reserved confirm-over-the-wire acknowledgment (spec D4): the server
+/// strips it before schema enforcement, so no `inputSchema` declares it and
+/// [`prune_args`] must never drop it.
+const CONFIRM_KEY: &str = "_confirm";
+
+/// Drop the arguments `tool`'s `inputSchema` does not declare, so a form built
+/// for a richer schema still works against an older core. No tool, no
+/// `properties`, or an empty one: `args` pass untouched. [`CONFIRM_KEY`] is
+/// always kept: it is the MCP-local handshake token, not a tool argument.
+fn prune_args(tool: Option<&ToolInfo>, args: Value) -> Value {
+    let Some(tool) = tool else {
+        return args;
+    };
+    let Some(props) = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return args;
+    };
+    match args {
+        Value::Object(map) if !props.is_empty() => Value::Object(
+            map.into_iter()
+                .filter(|(k, _)| k == CONFIRM_KEY || props.contains_key(k))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The confirm-over-the-wire re-issue (`l4.inject`, `l4.scope.add`, …)
+    /// carries the reserved `_confirm` token, which no tool's `inputSchema`
+    /// declares (the server strips it before schema enforcement). Pruning must
+    /// keep it, or every confirmed call is re-sent bare and the core answers
+    /// with another `needs_confirmation` (live run on the L4 rig, task B9).
+    /// Undeclared ordinary keys are still dropped.
+    #[test]
+    fn prune_keeps_the_reserved_confirm_token() {
+        let tool = ToolInfo {
+            name: "l4.scope.add".into(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"cidr": {"type": "string"}, "ports": {"type": "string"}},
+                "required": ["cidr"]
+            }),
+            confirmable: true,
+        };
+        let pruned = prune_args(
+            Some(&tool),
+            json!({"cidr": "127.0.0.1/32", "ports": "9100-9199", "bogus": 1, "_confirm": "cfm_1"}),
+        );
+        assert_eq!(
+            pruned,
+            json!({"cidr": "127.0.0.1/32", "ports": "9100-9199", "_confirm": "cfm_1"})
+        );
+        // No schema to prune against: untouched, token included.
+        assert_eq!(
+            prune_args(None, json!({"a": 1, "_confirm": "t"})),
+            json!({"a": 1, "_confirm": "t"})
+        );
+    }
 
     /// The refusal reads for either intended role and never names a file as
     /// the only token source (AC1/AC2 surface, Decision B wording). Pinned so

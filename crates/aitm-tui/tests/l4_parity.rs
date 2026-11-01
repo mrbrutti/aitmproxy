@@ -1357,6 +1357,44 @@ fn parked_id_packet_pane_shows_section_2_fields_and_hex() {
     assert!(!text.contains("no bytes from this core"), "{text}");
 }
 
+/// The hex view fits a normal terminal (L4 parity B9 live run: at 200×60 the
+/// Packets pane showed `hex: 45 bytes` and ONE row; at 160×44 none). Through
+/// the whole-screen `ui::render`, in the default horizontal layout with the
+/// sidebar, a 45-byte packet's three hex rows are all visible at both sizes:
+/// the packet list takes only the rows it has, and the §2 fields take one line.
+#[test]
+fn parked_id_packet_pane_hex_fits_a_normal_terminal() {
+    let payload: Vec<u8> = (0..45u8).map(|i| b'a' + (i % 26)).collect();
+    for (cols, rows) in [(160u16, 44u16), (200, 60)] {
+        let mut app = intercept_ready(vec![parked_p1()]);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "l4.flow.get".into(),
+            value: section_2_flow("F", &payload),
+        });
+        let _ = app.update(Action::Resize(cols, rows));
+        app.mode = Mode::Inspector;
+        app.l4.pane = L4Pane::Packets;
+        let theme = Theme::new(true);
+        let area = Rect::new(0, 0, cols, rows);
+        let mut buf = Buffer::empty(area);
+        aitm_tui::ui::render(&app, &theme, area, &mut buf);
+        let text = buffer_text(&buf).join("\n");
+        assert!(text.contains("hex: 45 bytes"), "{cols}x{rows}: {text}");
+        for offset in ["00000000", "00000010", "00000020"] {
+            assert!(
+                text.contains(offset),
+                "{cols}x{rows}: hex row {offset} is visible: {text}"
+            );
+        }
+        // The §2 fields are still there, on one line.
+        assert!(
+            text.contains("127.0.0.1:40000 → 127.0.0.1:9053"),
+            "{cols}x{rows}: {text}"
+        );
+        assert!(text.contains("45 B"), "{cols}x{rows}: {text}");
+    }
+}
+
 /// A packet without `bytes` (withheld under §2.2, or an older core) says so.
 #[test]
 fn parked_id_packet_pane_is_honest_without_bytes() {

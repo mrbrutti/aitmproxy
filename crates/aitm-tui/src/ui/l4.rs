@@ -196,8 +196,15 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
     if area.height < 2 {
         return;
     }
+    // The packet list takes only the rows it has (at least one, at most 45 % of
+    // the pane), so the detail below — and its hex rows — gets the rest. A
+    // fixed split left the hex view one row at 200×60 and none at 160×44.
+    let cap = (area.height.saturating_mul(45) / 100).max(1);
+    let list_h = cells(flow.packets.len().max(1))
+        .min(cap)
+        .min(area.height.saturating_sub(2));
     let [list_area, detail_area] =
-        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
+        Layout::vertical([Constraint::Length(list_h), Constraint::Min(1)]).areas(area);
     // The packet list: dir arrow, length, decoded summary, injected tick.
     if flow.packets.is_empty() {
         buf.set_string(
@@ -264,14 +271,18 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
                 lines.push(Line::styled(l, style));
             }
             lines.push(Line::raw(""));
-            // The §2 fields (time, proto, src→dst with ports, length, injected),
-            // the core's text made inert before it reaches the terminal.
-            for (label, value) in crate::l4::packet_fields(p) {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{label:<10}"), theme.text_secondary()),
-                    Span::styled(inert(&value), theme.text_primary()),
-                ]));
+            // The §2 fields (time, proto, src→dst with ports, length, injected)
+            // on one line, the core's text made inert before it reaches the
+            // terminal, so the hex below keeps its rows on a normal terminal.
+            let mut fields: Vec<Span> = Vec::new();
+            for (i, (label, value)) in crate::l4::packet_fields(p).into_iter().enumerate() {
+                if i > 0 {
+                    fields.push(Span::styled(" · ", theme.text_tertiary()));
+                }
+                fields.push(Span::styled(format!("{label} "), theme.text_secondary()));
+                fields.push(Span::styled(inert(&value), theme.text_primary()));
             }
+            lines.push(Line::from(fields));
             lines.push(Line::raw(""));
             // The on-wire bytes (spec §2.3 / AC40): every row through
             // `hex_dump`, so no raw byte is ever written; absent `bytes` is
