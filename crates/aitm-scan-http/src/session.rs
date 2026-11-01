@@ -45,8 +45,10 @@ pub(crate) const SESSION_LOST_PREFIX: &str = "scan: session_lost: ";
 /// Session cookies that are absent are appended in the material's order behind
 /// the request's own, and the `Cookie` header is rewritten as a single header
 /// (`HeaderMap::set` appends, so a merge that did not remove first would send
-/// two). A request with no `Cookie` header gets one only when the material has
-/// cookies to put in it.
+/// two). The pairs of every `Cookie` header the request carries are merged in
+/// order first, so a second header (legal, common on h2) is never dropped by
+/// that rewrite. A request with no `Cookie` header gets one only when the
+/// material has cookies to put in it.
 ///
 /// Cookie names are compared exactly (RFC 6265 cookie names are
 /// case-sensitive); header names case-insensitively, as HTTP defines them.
@@ -57,11 +59,14 @@ pub(crate) fn apply_session(req: &mut HttpRequest, material: &SessionMaterial) {
         }
     }
 
-    let mut merged = req
+    // Every `Cookie` header, in order: a request may legally carry more than
+    // one (common on h2), and the rewrite below removes them all.
+    let mut merged: Vec<(String, String)> = req
         .headers
-        .get("cookie")
-        .map(params::cookie_pairs)
-        .unwrap_or_default();
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, value)| params::cookie_pairs(value))
+        .collect();
     for (name, value) in &material.cookies {
         if !merged.iter().any(|(existing, _)| existing == name) {
             merged.push((name.clone(), value.clone()));
@@ -513,6 +518,22 @@ mod tests {
         let mut none = request("GET", "http://t:8080/a", &[], None);
         apply_session(&mut none, &session_of(&[], &[("X-Tok", "T")]));
         assert!(!none.headers.has("cookie"));
+    }
+
+    /// Two `Cookie` headers (legal, common on h2) are merged in order before the
+    /// session fills the gaps; the rewrite leaves exactly one header, so the
+    /// second header's pairs are never dropped (stage-5 F4).
+    #[test]
+    fn apply_session_merges_every_cookie_header() {
+        let mut req = request(
+            "GET",
+            "http://t:8080/a",
+            &[("cookie", "a=1"), ("cookie", "b=2")],
+            None,
+        );
+        apply_session(&mut req, &session_of(&[("sid", "S3")], &[]));
+        assert_eq!(req.headers.get("cookie"), Some("a=1; b=2; sid=S3"));
+        assert_eq!(count_header(&req, "cookie"), 1);
     }
 
     #[test]
