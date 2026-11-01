@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use aitm_core::redact::scrub_text;
 use aitm_scan_model::{
+    CheckScope,
     Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
     Intensity, L4Evidence, L4Oracle, LaneKind, Outcome, Payload, PayloadMode, ProbeHost,
     ProbeResponse, Technique, Verdict,
@@ -1280,6 +1281,8 @@ fn verdict_for(
                 evidence: finding_evidence(finding),
                 detail: truncate(detail, MAX_DETAIL),
                 poc_hint: None,
+            location: None,
+            more: Vec::new(),
             }
         }
         None => {
@@ -1305,6 +1308,8 @@ fn verdict_for(
                 evidence: Evidence::default(),
                 detail: truncate(format!("{base} {clause}"), MAX_DETAIL),
                 poc_hint: None,
+            location: None,
+            more: Vec::new(),
             }
         }
     }
@@ -1339,6 +1344,8 @@ fn dry_run_verdict(
         evidence: Evidence::default(),
         detail,
         poc_hint: None,
+            location: None,
+            more: Vec::new(),
     }
 }
 
@@ -1451,6 +1458,8 @@ fn error_verdict(detail: String) -> Verdict {
         evidence: Evidence::default(),
         detail: truncate(detail, MAX_DETAIL),
         poc_hint: None,
+            location: None,
+            more: Vec::new(),
     }
 }
 
@@ -1476,6 +1485,7 @@ fn crash_meta() -> CheckMeta {
             .to_string(),
         remediation: Some(REMEDIATION.to_string()),
         origin: CheckOrigin::Native,
+        scope: CheckScope::Point,
     }
 }
 
@@ -1501,6 +1511,7 @@ fn parser_fault_meta() -> CheckMeta {
             .to_string(),
         remediation: Some(REMEDIATION.to_string()),
         origin: CheckOrigin::Native,
+        scope: CheckScope::Point,
     }
 }
 
@@ -1528,6 +1539,7 @@ fn latency_meta() -> CheckMeta {
             .to_string(),
         remediation: None,
         origin: CheckOrigin::Native,
+        scope: CheckScope::Point,
     }
 }
 

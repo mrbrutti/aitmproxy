@@ -1468,6 +1468,7 @@ mod tests {
                 max_bytes_per_s: u32::MAX,
                 seeds: Vec::new(),
                 dry_run: false,
+                ..aitm_scan_model::L4Options::default()
             },
             checks: aitm_scan_model::CheckSelection {
                 include: vec!["lane:l4_stream".to_string()],
