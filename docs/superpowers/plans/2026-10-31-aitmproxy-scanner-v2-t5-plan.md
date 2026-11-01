@@ -443,6 +443,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 9 | coder (Task 9 report) | Critical | `aitm_proto_l4::craft::build_ipv4`/`build_tcp` panic (pnet `assert!(vals.len() <= len)`) when a verbatim `ipv4.ihl` (6/7/15), `ipv4.total_length` (0/1/declared-1) or `tcp.data_offset` (6/7/15) shrinks the payload window; three default-table mutators abort `build()` instead of shipping the wrong length verbatim, and in a job the panic surfaces as `l4 unavailable`. `host::tests::unsendable_cases_are_not_charged` is `#[ignore]`d on it | fix task on `crates/aitm-proto-l4/src/craft.rs` (ownership extension requested from the coordinator 2026-11-01; file owned by no scanner-v2 track); disposition filled when the fix lands |
 | 4 | coder (Task 4 report) | Minor | plan typo: `INTERESTING_8` declared `[u8; 8]` while the same sentence and the `table_sizes` literal need six fixed values | plan corrected to `[u8; 6]` in this commit; code already `[u8; 6]` in 29449102 |
 | 2 | orchestrator (from the Task 2 coder's report) | Important | `PINNED` omits the bare `dst_port` and `interface` that spec D8.4 names non-fuzzable; they were refused as `unknown field path` instead of as pins (same `invalid_profile` code, wrong sentence) | fixed in 31076103 (`PINNED` is 10 entries; `pinned_paths_refused_by_name` covers both) |
 
