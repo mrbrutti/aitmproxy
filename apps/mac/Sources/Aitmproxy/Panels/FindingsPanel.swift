@@ -25,16 +25,12 @@ final class PocPanelState {
     /// The draft differs from the saved YAML of the selected finding.
     var isDirty: Bool { selectedFinding.map { $0.yaml != yamlDraft } ?? false }
 
-    /// Fixtures, or `findings.json` plus this session's runs; `poc.list` fills
-    /// the rest once F13 lands (the tool appears in `session.tools`).
+    /// `findings.json` plus this session's runs; `poc.list` fills the rest once
+    /// F13 lands (the tool appears in `session.tools`).
     func load() {
-        if Store.usesFixtures {
-            findings = Fixtures.findings
-        } else {
-            findings = (try? store.load()) ?? []
-            if session.tools.contains(where: { $0.name == "poc.list" }) {
-                Task { await refreshFromBus() }
-            }
+        findings = (try? store.load()) ?? []
+        if session.tools.contains(where: { $0.name == "poc.list" }) {
+            Task { await refreshFromBus() }
         }
         if selected == nil { select(findings.first?.id) }
         session.findingsCount = findings.count
@@ -75,7 +71,9 @@ final class PocPanelState {
             if let param, !param.isEmpty { args["param"] = .string(param) }
             let returned = try await session.runCommand("poc.build", args).stringValue ?? ""
             let row = session.rows.first { $0.id == flowID }
-            let (yaml, path) = resolveBuilt(returned, name: name, param: param)
+            let (yaml, path) = resolveBuilt(returned, name: name)
+            // Empty YAML means the core's answer was unusable; `resolveBuilt` has already set `lastError`.
+            guard !yaml.isEmpty else { return }
             let info = PocYAML.info(in: yaml)
             let finding = Finding(
                 title: info["name"] ?? name,
@@ -109,14 +107,12 @@ final class PocPanelState {
         }
     }
 
-    /// Save the edited YAML back to the finding and, on the live bus, to its file.
+    /// Save the edited YAML back to the finding and to its file.
     func save() {
         guard let id = selected, let index = findings.firstIndex(where: { $0.id == id }) else { return }
         findings[index].yaml = yamlDraft
-        if !Store.usesFixtures {
-            do { try yamlDraft.write(toFile: findings[index].pocPath, atomically: true, encoding: .utf8) }
-            catch { session.lastError = "save PoC: \(error.localizedDescription)" }
-        }
+        do { try yamlDraft.write(toFile: findings[index].pocPath, atomically: true, encoding: .utf8) }
+        catch { session.lastError = "save PoC: \(error.localizedDescription)" }
         persist()
     }
 
@@ -183,20 +179,27 @@ final class PocPanelState {
         persist()
     }
 
-    private func persist() { if !Store.usesFixtures { try? store.save(findings) } }
+    private func persist() { try? store.save(findings) }
 
     /// `poc.build` returns YAML text or a path, depending on the build. Derive
-    /// both so the panel always has something to show and save.
-    private func resolveBuilt(_ returned: String, name: String, param: String?) -> (yaml: String, path: String) {
+    /// both from what the core returned and never synthesize YAML: a path that
+    /// cannot be read, or an answer that is neither YAML nor a path, leaves
+    /// `yaml` empty with the reason in `session.lastError`, and the caller
+    /// inserts no finding.
+    private func resolveBuilt(_ returned: String, name: String) -> (yaml: String, path: String) {
         let slug = Finding(title: name, severity: .medium, target: "", passed: false, ranAt: Date(), origin: .human, pocPath: "", yaml: "").slug
         if returned.contains("\n"), returned.contains("id:") {
             return (returned, "\(Store.url.path)/pocs/\(slug).poc.yaml")
         }
         if returned.hasSuffix(".yaml") || returned.hasSuffix(".yml") {
-            let yaml = (try? String(contentsOfFile: returned, encoding: .utf8)) ?? Fixtures.pocYAML(name: name, param: param ?? "q")
+            guard let yaml = try? String(contentsOfFile: returned, encoding: .utf8) else {
+                session.lastError = "poc.build: could not read \(returned)"
+                return (yaml: "", path: returned)
+            }
             return (yaml, returned)
         }
-        return (Fixtures.pocYAML(name: name, param: param ?? "q"), "\(Store.url.path)/pocs/\(slug).poc.yaml")
+        session.lastError = "poc.build returned neither YAML nor a path"
+        return (yaml: "", path: "")
     }
 
     private func syntheticResult(for finding: Finding) -> JSONValue {

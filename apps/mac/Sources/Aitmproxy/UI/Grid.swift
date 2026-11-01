@@ -2,7 +2,6 @@ import SwiftUI
 
 /// The spacing scale. Every padding, spacing, and size sits on a 4 pt grid.
 ///   APP_GRID=1 Aitmproxy     draw the grid, margins, and probes over the window
-/// Snapshot mode also writes <page>-<mode>-layout.json, which tools/check-layout.swift checks.
 enum Space {
     static let xs: CGFloat = 4
     static let sm: CGFloat = 8
@@ -33,8 +32,7 @@ extension View {
 @Observable
 final class GridProbes {
     static let shared = GridProbes()
-    static let enabled = ProcessInfo.processInfo.environment["APP_SNAPSHOT"] != nil
-        || GridOverlay.enabled
+    static let enabled = GridOverlay.enabled
 
     enum Kind: String, Codable { case area, probe }
 

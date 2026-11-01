@@ -91,11 +91,6 @@ struct ConfigPanel: View {
 
     private func load() {
         reloadedAt = Date()
-        if Store.usesFixtures {
-            document = ConfigDocument(yaml: Fixtures.configYAML, path: "config.yaml", envOverrides: [])
-            note = nil
-            return
-        }
         if session.tools.contains(where: { $0.name == "config.get" }) {
             Task {
                 if let yaml = try? await session.runCommand("config.get", [:]).stringValue {

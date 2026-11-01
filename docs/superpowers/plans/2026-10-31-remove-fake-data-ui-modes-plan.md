@@ -197,7 +197,7 @@ Three independent groups, one per frontend, fan out to the three worktrees; with
 
 - **Satisfies:** AC1 (mac `Sources`, complete), AC2 (refusal and menu audit), AC8 (D3 items 1, 5), AC11 (`seedsAtLaunch` truth table)
 - **Depends on:** M1
-- **Files:** `apps/mac/Sources/Aitmproxy/Session+Fixtures.swift` (delete), `Bus/FixtureBus.swift` (delete), `Snapshot.swift` (delete), `SnapshotScenes.swift` (delete), `DesignKit/KitGallery.swift` (delete), `DesignKit/KitGalleryParts.swift` (delete), `Bus/FlowActions.swift` (modify), `Session.swift` (modify), `Shell/ShellView.swift` (modify), `App.swift` (modify), `SelfTest.swift` (modify), `SelfTest+Live.swift` (modify), `Panels/ScanPanel.swift` (modify), `SettingsView.swift` (modify, comments 113, 170, 217), `UI/Theme.swift` (modify, comment 70), `apps/mac/Sources/AitmBusClient/BusEndpointSettings.swift` (modify, comment 7), `apps/mac/Sources/AitmproxyKit/EmbeddedScope.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/EmbeddedScopeTests.swift` (modify)
+- **Files:** `apps/mac/Sources/Aitmproxy/Session+Fixtures.swift` (delete), `Bus/FixtureBus.swift` (delete), `Snapshot.swift` (delete), `SnapshotScenes.swift` (delete), `DesignKit/KitGallery.swift` (delete), `DesignKit/KitGalleryParts.swift` (delete), `Bus/FlowActions.swift` (modify), `Session.swift` (modify), `Shell/ShellView.swift` (modify), `App.swift` (modify), `SelfTest.swift` (modify), `SelfTest+Live.swift` (modify), `Panels/ScanPanel.swift` (modify), `Panels/FindingsPanel.swift` (modify, D3 item 7), `UI/Grid.swift` (modify, `GridProbes.write`), `SettingsView.swift` (modify, comments 113, 170, 217), `UI/Theme.swift` (modify, comment 70), `apps/mac/Sources/AitmBusClient/BusEndpointSettings.swift` (modify, comment 7), `apps/mac/Sources/AitmproxyKit/EmbeddedScope.swift` (modify), `apps/mac/Tests/AitmproxyKitTests/EmbeddedScopeTests.swift` (modify)
 - **Change:**
   - `Bus/FlowActions.swift`: delete `final class FixtureActions` (25–153); the protocol's doc comment (5–7) stops describing fixtures; add
     ```swift
@@ -210,6 +210,8 @@ Three independent groups, one per frontend, fan out to the three worktrees; with
   - `Shell/ShellView.swift`: lines 17–20 keep only the `VStack` (no `KitGallery.enabled` test); `.task` runs the `else` body unconditionally (77–79); delete `Snapshot.runIfRequested(…)` (105); `:185` → `} else if session.scopeHosts.isEmpty, case .connected = session.bus {`.
   - `App.swift`: delete header lines 7 and 9 and `Store.usesFixtures` (100–106). `isOverridden`, `defaults`, `url` untouched.
   - `Panels/ScanPanel.swift`: delete `loadFixture()` (40–46).
+  - `Panels/FindingsPanel.swift` (added by the orchestrator 2026-10-31, spec D3 item 7): in `run(_:target:vars:)` replace `let json = result.objectValue?["passed"] != nil ? result : syntheticResult(for: finding)` with `guard result.objectValue?["passed"] != nil else { session.lastError = "poc.run returned no verdict (no passed field)"; return }` and use `result` directly; delete `private func syntheticResult(for:)`.
+  - `UI/Grid.swift` (added by the orchestrator 2026-10-31): delete `GridProbes.write(to:window:)` and its doc comment — its only caller was `Snapshot.swift`, deleted in this task.
   - `SelfTest.swift`: delete lines 56–468 (the fixture pass); `runIfRequested` after the `isOverridden` guard becomes
     ```swift
     guard live else {
