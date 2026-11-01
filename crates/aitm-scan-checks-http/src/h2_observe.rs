@@ -162,20 +162,58 @@ enum Kind {
 }
 
 impl Kind {
-    /// The malformed variants a `Blocks` check sends, in stream order.
-    fn variant_labels(self) -> &'static [&'static str] {
+    /// The malformed variants a `Blocks` check sends to `target`, in stream
+    /// order, each paired with the label its verdict names it by.
+    ///
+    /// One list, so the label at index `i` can only ever describe the block
+    /// at index `i`: [`H2Check::plan`] takes the blocks from it and
+    /// [`malformed_verdict`] the labels (quality re-review Q2-4). The two
+    /// stream-less kinds have no variants.
+    fn variants(self, target: &Target) -> Vec<(&'static str, Vec<RawHeader>)> {
         match self {
-            Kind::PseudoHeader => &[
-                "missing :path",
-                "duplicate :method",
-                "pseudo-header after a regular header",
+            Kind::PseudoHeader => {
+                let mut no_path = target.base_headers(None);
+                no_path.pop();
+                let mut two_methods = target.base_headers(None);
+                two_methods.insert(1, RawHeader::new(":method", "GET"));
+                let mut late_pseudo = target.base_headers(None);
+                let path = late_pseudo.pop();
+                late_pseudo.push(RawHeader::new(PROBE_FIELD, "1"));
+                late_pseudo.extend(path);
+                vec![
+                    ("missing :path", no_path),
+                    ("duplicate :method", two_methods),
+                    ("pseudo-header after a regular header", late_pseudo),
+                ]
+            }
+            Kind::HeaderCrlf => vec![
+                (
+                    "CRLF in a header value",
+                    target.base_headers(Some(RawHeader::raw(
+                        PROBE_FIELD.as_bytes(),
+                        b"a\r\nx-aitm-injected: 1",
+                    ))),
+                ),
+                (
+                    "CRLF in a header name",
+                    target.base_headers(Some(RawHeader::raw(
+                        b"x-aitm-probe\r\nx-aitm-injected",
+                        b"1",
+                    ))),
+                ),
             ],
-            Kind::HeaderCrlf => &["CRLF in a header value", "CRLF in a header name"],
-            Kind::ClTe => &[
-                "content-length one byte longer than the body",
-                "transfer-encoding: chunked",
+            Kind::ClTe => vec![
+                (
+                    // The probe's body is empty, so "real + 1" is one.
+                    "content-length one byte longer than the body",
+                    target.base_headers(Some(RawHeader::new("content-length", "1"))),
+                ),
+                (
+                    "transfer-encoding: chunked",
+                    target.base_headers(Some(RawHeader::new("transfer-encoding", "chunked"))),
+                ),
             ],
-            Kind::Settings | Kind::RapidReset => &[],
+            Kind::Settings | Kind::RapidReset => Vec::new(),
         }
     }
 
@@ -384,79 +422,56 @@ impl H2Check {
         }
     }
 
-    /// The plan this check sends to `target`, requesting `path`.
-    fn plan(&self, target: &Target) -> RawH2Plan {
-        let base = |extra: Option<RawHeader>| -> Vec<RawHeader> {
-            let mut headers = vec![
-                RawHeader::new(":method", "GET"),
-                RawHeader::new(":scheme", &target.scheme),
-                RawHeader::new(":authority", &target.wire_authority()),
-                RawHeader::new(":path", &target.path),
-            ];
-            headers.extend(extra);
-            headers
-        };
-        let (headers, mode, streams) = match self.kind {
-            Kind::Settings => (Vec::new(), RawH2Mode::SettingsOnly, 0),
+    /// The plan this check sends to `target`, with the labels its verdict
+    /// will quote for a `Blocks` plan (empty for the other two modes).
+    fn plan(&self, target: &Target) -> Planned {
+        let (headers, mode, streams, labels) = match self.kind {
+            Kind::Settings => (Vec::new(), RawH2Mode::SettingsOnly, 0, Vec::new()),
             Kind::RapidReset => (
-                base(None),
+                target.base_headers(None),
                 RawH2Mode::RapidReset { pairs: RESET_PAIRS },
                 RESET_PAIRS,
+                Vec::new(),
             ),
-            Kind::PseudoHeader => {
-                let mut no_path = base(None);
-                no_path.pop();
-                let mut two_methods = base(None);
-                two_methods.insert(1, RawHeader::new(":method", "GET"));
-                let mut late_pseudo = base(None);
-                let path = late_pseudo.pop();
-                late_pseudo.push(RawHeader::new(PROBE_FIELD, "1"));
-                late_pseudo.extend(path);
-                (
-                    Vec::new(),
-                    RawH2Mode::Blocks(vec![no_path, two_methods, late_pseudo]),
-                    3,
-                )
-            }
-            Kind::HeaderCrlf => {
-                let value = base(Some(RawHeader::raw(
-                    PROBE_FIELD.as_bytes(),
-                    b"a\r\nx-aitm-injected: 1",
-                )));
-                let name = base(Some(RawHeader::raw(
-                    b"x-aitm-probe\r\nx-aitm-injected",
-                    b"1",
-                )));
-                (Vec::new(), RawH2Mode::Blocks(vec![value, name]), 2)
-            }
-            Kind::ClTe => {
-                // The probe's body is empty, so "real + 1" is one.
-                let length = base(Some(RawHeader::new("content-length", "1")));
-                let encoding = base(Some(RawHeader::new("transfer-encoding", "chunked")));
-                (Vec::new(), RawH2Mode::Blocks(vec![length, encoding]), 2)
+            Kind::PseudoHeader | Kind::HeaderCrlf | Kind::ClTe => {
+                let (labels, blocks): (Vec<_>, Vec<_>) =
+                    self.kind.variants(target).into_iter().unzip();
+                // At most three blocks; the driver's cap is the only bound
+                // that could ever be lower.
+                let streams = u8::try_from(blocks.len()).unwrap_or(MAX_RAW_STREAMS);
+                (Vec::new(), RawH2Mode::Blocks(blocks), streams, labels)
             }
         };
-        RawH2Plan {
-            target: RawH2Target {
-                scheme: target.scheme.clone(),
-                authority: target.wire_authority(),
+        Planned {
+            plan: RawH2Plan {
+                target: RawH2Target {
+                    scheme: target.scheme.clone(),
+                    authority: target.wire_authority(),
+                },
+                headers,
+                mode,
+                streams,
             },
-            headers,
-            mode,
-            streams,
+            labels,
         }
     }
 
-    /// Turn what the driver saw into this check's verdict.
-    fn verdict(&self, obs: &RawH2Observation) -> Verdict {
+    /// Turn what the driver saw into this check's verdict; `labels` are the
+    /// ones [`Self::plan`] handed back for the plan that produced `obs`.
+    fn verdict(&self, labels: &[&str], obs: &RawH2Observation) -> Verdict {
         match self.kind {
             Kind::Settings => settings_verdict(obs),
             Kind::RapidReset => rapid_reset_verdict(obs),
-            Kind::PseudoHeader | Kind::HeaderCrlf | Kind::ClTe => {
-                malformed_verdict(self.kind.variant_labels(), obs)
-            }
+            Kind::PseudoHeader | Kind::HeaderCrlf | Kind::ClTe => malformed_verdict(labels, obs),
         }
     }
+}
+
+/// What [`H2Check::plan`] builds: the plan for the driver and, for a `Blocks`
+/// plan, the label of each block in stream order, for the verdict.
+struct Planned {
+    plan: RawH2Plan,
+    labels: Vec<&'static str>,
 }
 
 impl Check for H2Check {
@@ -464,6 +479,36 @@ impl Check for H2Check {
         &self.meta
     }
 
+    /// Nine gates stand between a point and the raw connection, in this
+    /// order, and each one that fails returns `Inconclusive` with nothing
+    /// sent:
+    ///
+    /// 1. **url** — the point's URL must name a dialable `http(s)` authority
+    ///    ([`Target::parse`]);
+    /// 2. **stop gate** — not cancelled, budget for at least one stimulus,
+    ///    before the deadline ([`crate::gate::may_send`]);
+    /// 3. **profile origin** — the authority is one of the profile's own
+    ///    `target.origins`, compared canonically ([`Target::is_a_profile_origin`]);
+    /// 4. **guard seen** — no live once-per-authority claim for this origin;
+    /// 5. **baseline** — `host.baseline()` succeeds through the lane's guarded
+    ///    client, so scope has cleared the authority before a raw byte moves;
+    /// 6. **cancel/deadline re-check** — the baseline took time; a job that
+    ///    stopped meanwhile sends nothing;
+    /// 7. **budget** — the budget left covers one unit per stream the plan
+    ///    will open (the raw connection cannot charge the job itself);
+    /// 8. **guard claim** — the origin is claimed, atomically;
+    /// 9. **dial** — the runner opens the one connection.
+    ///
+    /// `claim` is last because a claim lasts ten minutes and must not be
+    /// burnt by a refused baseline, a stopped job or a short budget: an
+    /// authority that was never actually probed stays probe-able. It is
+    /// still before the dial, and atomic, so two points of one origin that
+    /// race through gates 1–7 open one connection, not two.
+    ///
+    /// The re-check at 6 tests cancellation and the deadline but not the
+    /// budget, because gate 7 immediately tests the budget against the
+    /// plan's real stream count, which is at least the one unit gate 2
+    /// asked for; a `budget_left() >= 1` clause there would be subsumed.
     fn run<'a>(
         &'a self,
         point: &'a InsertionPoint,
@@ -498,7 +543,7 @@ impl Check for H2Check {
             // `charge` — so the check refuses to open one the budget could not
             // have paid for, counting one unit per stream the plan will open
             // (security review SEC-C2; see the module header).
-            let plan = self.plan(&target);
+            let Planned { plan, labels } = self.plan(&target);
             if host.budget_left() < u32::from(plan.streams).max(1) {
                 return inconclusive(BUDGET_TOO_LOW);
             }
@@ -508,7 +553,7 @@ impl Check for H2Check {
                 return inconclusive(ALREADY_OBSERVED);
             }
             match self.runner.run(plan).await {
-                Ok(obs) => self.verdict(&obs),
+                Ok(obs) => self.verdict(&labels, &obs),
                 Err(error) => {
                     tracing::debug!(%error, check = %self.meta.id, "raw h2 probe did not complete");
                     inconclusive(NO_H2)
@@ -554,6 +599,20 @@ impl Target {
             scheme,
             path,
         })
+    }
+
+    /// The four pseudo-headers of a well-formed GET for this target, plus
+    /// `extra` when a variant adds one field. Every block a check sends
+    /// starts from this.
+    fn base_headers(&self, extra: Option<RawHeader>) -> Vec<RawHeader> {
+        let mut headers = vec![
+            RawHeader::new(":method", "GET"),
+            RawHeader::new(":scheme", &self.scheme),
+            RawHeader::new(":authority", &self.wire_authority()),
+            RawHeader::new(":path", &self.path),
+        ];
+        headers.extend(extra);
+        headers
     }
 
     /// `host[:port]` as a client writes it: the form that goes in the
@@ -781,8 +840,144 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
 
 #[cfg(test)]
 mod tests {
-    use super::{OncePerAuthority, Target, GUARD_TTL};
+    use super::{H2Check, Kind, OncePerAuthority, RawH2Runner, Target, GUARD_TTL};
+    use aitm_proto_http::raw_h2::{RawH2Mode, RawH2Observation, RawH2Plan, RawHeader};
+    use futures::future::BoxFuture;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// A runner for tests that never reach the wire.
+    struct NeverRuns;
+
+    impl RawH2Runner for NeverRuns {
+        fn run<'a>(&'a self, _: RawH2Plan) -> BoxFuture<'a, anyhow::Result<RawH2Observation>> {
+            Box::pin(async { anyhow::bail!("this test does not dial") })
+        }
+    }
+
+    fn names(block: &[RawHeader]) -> Vec<&[u8]> {
+        block.iter().map(|h| h.name.as_slice()).collect()
+    }
+
+    fn count(block: &[RawHeader], name: &str) -> usize {
+        block.iter().filter(|h| h.name == name.as_bytes()).count()
+    }
+
+    fn value_of<'a>(block: &'a [RawHeader], name: &str) -> Option<&'a [u8]> {
+        block
+            .iter()
+            .find(|h| h.name == name.as_bytes())
+            .map(|h| h.value.as_slice())
+    }
+
+    /// The labels a malformed-header verdict quotes and the blocks the plan
+    /// sends come from one list, so the label at index `i` can only describe
+    /// the block at index `i` (Q2-4). Each label is checked against the shape
+    /// of its own block, and the plan's `Blocks` are exactly those blocks.
+    #[test]
+    fn each_variant_label_names_the_block_at_its_index() {
+        let target = Target::parse("https://origin.test/x").expect("a usable url");
+        let runner: Arc<dyn RawH2Runner> = Arc::new(NeverRuns);
+
+        for kind in [Kind::PseudoHeader, Kind::HeaderCrlf, Kind::ClTe] {
+            let variants = kind.variants(&target);
+            assert!(!variants.is_empty(), "{kind:?} sends variants");
+            for (label, block) in &variants {
+                match *label {
+                    "missing :path" => assert_eq!(count(block, ":path"), 0, "{label}"),
+                    "duplicate :method" => assert_eq!(count(block, ":method"), 2, "{label}"),
+                    "pseudo-header after a regular header" => {
+                        let names = names(block);
+                        let first_regular = names
+                            .iter()
+                            .position(|n| !n.starts_with(b":"))
+                            .expect("a regular header");
+                        let last_pseudo = names
+                            .iter()
+                            .rposition(|n| n.starts_with(b":"))
+                            .expect("a pseudo-header");
+                        assert!(first_regular < last_pseudo, "{label}: {names:?}");
+                    }
+                    "CRLF in a header value" => {
+                        assert!(
+                            block
+                                .iter()
+                                .any(|h| h.value.windows(2).any(|w| w == b"\r\n")),
+                            "{label}"
+                        );
+                        assert!(
+                            block
+                                .iter()
+                                .all(|h| !h.name.windows(2).any(|w| w == b"\r\n")),
+                            "{label}: the name must be clean"
+                        );
+                    }
+                    "CRLF in a header name" => {
+                        assert!(
+                            block
+                                .iter()
+                                .any(|h| h.name.windows(2).any(|w| w == b"\r\n")),
+                            "{label}"
+                        );
+                    }
+                    "content-length one byte longer than the body" => {
+                        assert_eq!(
+                            value_of(block, "content-length"),
+                            Some(&b"1"[..]),
+                            "{label}"
+                        );
+                    }
+                    "transfer-encoding: chunked" => {
+                        assert_eq!(
+                            value_of(block, "transfer-encoding"),
+                            Some(&b"chunked"[..]),
+                            "{label}"
+                        );
+                    }
+                    other => panic!("{kind:?}: unexpected label {other:?}"),
+                }
+            }
+
+            // The plan is cut from the same list, in the same order.
+            let planned = H2Check::new(kind, Arc::clone(&runner)).plan(&target);
+            let blocks: Vec<Vec<RawHeader>> = variants.iter().map(|(_, b)| b.clone()).collect();
+            assert_eq!(planned.plan.mode, RawH2Mode::Blocks(blocks), "{kind:?}");
+            assert_eq!(
+                usize::from(planned.plan.streams),
+                variants.len(),
+                "{kind:?}"
+            );
+            let labels: Vec<&str> = variants.iter().map(|(l, _)| *l).collect();
+            assert_eq!(planned.labels, labels, "{kind:?}");
+        }
+
+        // The three documented orders, pinned so a reordering is a visible
+        // change to the issue text.
+        let labels = |kind: Kind| -> Vec<&'static str> {
+            kind.variants(&target).into_iter().map(|(l, _)| l).collect()
+        };
+        assert_eq!(
+            labels(Kind::PseudoHeader),
+            [
+                "missing :path",
+                "duplicate :method",
+                "pseudo-header after a regular header"
+            ]
+        );
+        assert_eq!(
+            labels(Kind::HeaderCrlf),
+            ["CRLF in a header value", "CRLF in a header name"]
+        );
+        assert_eq!(
+            labels(Kind::ClTe),
+            [
+                "content-length one byte longer than the body",
+                "transfer-encoding: chunked"
+            ]
+        );
+        assert!(Kind::Settings.variants(&target).is_empty());
+        assert!(Kind::RapidReset.variants(&target).is_empty());
+    }
 
     #[test]
     fn a_claim_expires_after_the_ttl_and_not_before() {
