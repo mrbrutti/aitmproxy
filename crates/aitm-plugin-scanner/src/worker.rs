@@ -21,7 +21,9 @@
 //! any of them changes: a phase that re-reads a meter raises the counter to the
 //! new reading through [`raise`] and can never walk it back.
 
+use std::any::Any;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -37,6 +39,7 @@ use aitm_scan_model::{
     StoppedReason, Technique, Verdict, JOB_KIND_SCAN,
 };
 use futures::future::BoxFuture;
+use futures::FutureExt;
 
 use crate::client::{bounded_await, JobBudget, JobClient, LadderState, ProbeMeter};
 use crate::issues::{IssueStore, NewIssue, Upsert};
@@ -51,6 +54,9 @@ pub const MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The most check ids `JobStatus.checks.running` carries (spec D5).
 const MAX_RUNNING_IDS: usize = 8;
+
+/// The most characters of a panic message that reach a status or a verdict.
+const MAX_PANIC_TEXT: usize = 256;
 
 /// Raise `counter` by `n`, saturating. The **only** way a job counter changes,
 /// so no phase can make a `scan.status` figure go backwards (spec D5).
@@ -351,7 +357,66 @@ enum ItemEnd {
 }
 
 /// Run one job to its terminal state (spec D5).
+///
+/// The supervisor around [`drive`]: the job body runs under `catch_unwind`,
+/// so a lane or a check that panics still leaves the job terminal — `failed`,
+/// with the panic named on `error` — with the terminal line pushed, the status
+/// persisted and the registry handles released (the egress hold, the origin's
+/// single-flight slot). Without it the task would die mid-flight and the job
+/// stay `running` for good, which is the spec's anti-goal of a job that
+/// outlives its budget, deadline or cancellation.
 pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
+    let job = ctx.job.clone();
+    let status = Arc::clone(&ctx.status);
+    // The publisher lives out here so the `failed` line a panic produces
+    // carries the job's own `seq`, after the lines the body already pushed.
+    let bus = engine
+        .late
+        .get()
+        .map(|s| Arc::clone(&s.jobs))
+        .unwrap_or_default();
+    let progress = Progress::new(bus, job.clone());
+
+    let body = drive(Arc::clone(&engine), ctx, &progress);
+    if let Err(payload) = AssertUnwindSafe(body).catch_unwind().await {
+        let message = format!("the scan worker panicked: {}", panic_text(payload.as_ref()));
+        tracing::error!(target: "aitm::scanner", job = %job, "{message}");
+        let already_terminal = status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .is_terminal();
+        if already_terminal {
+            // The panic landed inside the terminal transition itself (a
+            // persist that blew up): the status is final, so only the registry
+            // hand-back may still be owed.
+            engine.registry.finish(&job);
+        } else {
+            fail_job(&engine, &status, &progress, &job, &message);
+        }
+    }
+}
+
+/// The text of a panic payload, scrubbed and bounded, so what a buggy check
+/// formatted into its panic never reaches a status or the bus unredacted.
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    let raw = if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a non-string panic payload".to_string()
+    };
+    let scrubbed = util::scrub(&raw);
+    match scrubbed.char_indices().nth(MAX_PANIC_TEXT) {
+        Some((cut, _)) => format!("{}…", &scrubbed[..cut]),
+        None => scrubbed,
+    }
+}
+
+/// The body of one job: spec D5's phases, from `crawling` to the terminal
+/// transition. Only ever called from [`run_job`], which supervises it.
+async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     let JobStart {
         job,
         profile,
@@ -365,23 +430,20 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
 
     // The services were bound before `start` admitted the job; if they went
     // away the job fails loudly rather than silently doing nothing.
-    let (store, inner_client, guard, browser, bus, agent_policy, config) = match engine.late.get() {
+    let (store, inner_client, guard, browser, agent_policy, config) = match engine.late.get() {
         Ok(s) => (
             Arc::clone(&s.store),
             Arc::clone(&s.client),
             Arc::clone(&s.guard),
             s.browser.clone(),
-            Arc::clone(&s.jobs),
             Arc::clone(&s.agent_policy),
             Arc::clone(&s.config),
         ),
         Err(e) => {
-            let progress = Progress::new(Arc::new(aitm_core::JobBus::default()), job.clone());
-            fail_job(&engine, &status, &progress, &job, &e.to_string());
+            fail_job(&engine, &status, progress, &job, &e.to_string());
             return;
         }
     };
-    let progress = Progress::new(bus, job.clone());
 
     let deadline = Instant::now()
         .checked_add(crate::jobs::bounded_secs(profile.budget.time_s))
@@ -434,7 +496,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
     set_phase(&status, JobState::Running, aitm_scan_model::Phase::Crawling);
-    emit(&progress, JobEvent::Started, &status, None);
+    emit(progress, JobEvent::Started, &status, None);
 
     // --- crawling -----------------------------------------------------------
     let pages_before = store.count() as u64;
@@ -464,7 +526,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
                     }
                     LaneErrorKind::Other => text,
                 };
-                fail_job(&engine, &status, &progress, &job, &message);
+                fail_job(&engine, &status, progress, &job, &message);
                 return;
             }
             Err(end) => {
@@ -474,7 +536,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
                     _ => StoppedReason::Time,
                 };
                 sync_counters(&status, &meter, &engine.issues, &job);
-                finish_terminal(&engine, &status, &progress, &job, &started_by, Some(reason));
+                finish_terminal(&engine, &status, progress, &job, &started_by, Some(reason));
                 return;
             }
         }
@@ -519,7 +581,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
         job: &job,
         profile: &profile,
         status: &status,
-        progress: &progress,
+        progress,
         runtime: &runtime,
         job_ctx: &job_ctx,
         lanes: &lanes,
@@ -544,7 +606,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
             break;
         }
         set_phase(&status, JobState::Running, phase);
-        emit(&progress, JobEvent::Phase, &status, None);
+        emit(progress, JobEvent::Phase, &status, None);
         for item in items.iter() {
             if let ItemEnd::Stop(reason) = run.gate(item).await {
                 stopped = Some(reason);
@@ -552,7 +614,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
             }
             run.run_item(item, &mut owed).await;
             run.sync();
-            emit(&progress, JobEvent::Progress, &status, None);
+            emit(progress, JobEvent::Progress, &status, None);
             if let Some(reason) = run.stop_now(None) {
                 stopped = Some(reason);
                 break;
@@ -566,7 +628,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
         JobState::Running,
         aitm_scan_model::Phase::Reporting,
     );
-    emit(&progress, JobEvent::Phase, &status, None);
+    emit(progress, JobEvent::Phase, &status, None);
     sync_counters(&status, &meter, &engine.issues, &job);
 
     let reason = match (stopped, cancel.is_cancelled()) {
@@ -574,7 +636,7 @@ pub async fn run_job(engine: Arc<Engine>, ctx: JobStart) {
         (None, true) => Some(StoppedReason::Cancelled),
         (None, false) => None,
     };
-    finish_terminal(&engine, &status, &progress, &job, &started_by, reason);
+    finish_terminal(&engine, &status, progress, &job, &started_by, reason);
 }
 
 /// Everything one phase loop needs, gathered so the per-item code reads as the
@@ -706,19 +768,36 @@ impl RunCtx<'_> {
             ))
             .unwrap_or(self.budget.deadline)
             .min(self.budget.deadline);
-        let verdict = bounded_await(
+        // A check that panics is one `error` verdict, not a dead job: the
+        // item is still accounted for and the next one runs.
+        let verdict = AssertUnwindSafe(bounded_await(
             check_deadline,
             &self.budget.cancel,
             item.check.run(point, &host),
-        )
+        ))
+        .catch_unwind()
         .await;
         self.running_pop(&meta.id);
         self.item_done(item.point, owed, &meta.id);
 
-        let Ok(verdict) = verdict else {
+        let verdict = match verdict {
+            Ok(Ok(verdict)) => verdict,
             // A check that did not finish is not a verdict: the job's own
             // counters already recorded the time or the cancellation.
-            return;
+            Ok(Err(_)) => return,
+            Err(payload) => {
+                let detail = format!("the check panicked: {}", panic_text(payload.as_ref()));
+                tracing::warn!(target: "aitm::scanner", job = %self.job, check = %meta.id, "{detail}");
+                Verdict {
+                    outcome: Outcome::Error,
+                    confidence: Confidence::Tentative,
+                    evidence: Evidence::default(),
+                    detail,
+                    poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
+                }
+            }
         };
         if !matches!(verdict.outcome, Outcome::Vulnerable) {
             self.note_lane_text(&verdict.detail);
@@ -1953,6 +2032,133 @@ mod tests {
 
     /// The inverse of `util::json_to_value`, so a test can read the payload a
     /// push line carried back into the model type it was built from.
+    /// Stage 6 finding (Task 16 review): a lane that panics must not leave
+    /// the job `running` forever. The worker is supervised: the job ends
+    /// `failed` naming the panic, the terminal line is pushed, the status is
+    /// persisted, the egress hold is released and the origin is free again
+    /// (spec anti-goal: a job that outlives its budget, deadline or
+    /// cancellation; D5 terminal transitions).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_lane_ends_the_job_failed_and_frees_the_origin() {
+        let h = Harness::new()
+            .with_lane(FakeLane::http().with_discover_panic())
+            .with_egress()
+            .with_findings_dir();
+        h.bind();
+        let mut rx = h.bus.subscribe();
+        assert!(!h.egress_confined(), "no job, no hold");
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        assert!(h.egress_confined(), "a running job holds the posture");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(2)).await;
+        assert_eq!(status.state, JobState::Failed);
+        assert_eq!(status.stopped_reason, Some(StoppedReason::Failed));
+        assert_eq!(status.phase, Phase::Done);
+        assert!(
+            status.finished_at.is_some(),
+            "a terminal job has a finish time"
+        );
+        let error = status.error.as_deref().expect("the error names the panic");
+        assert!(error.contains("panicked"), "{error}");
+        assert!(error.contains(PANIC_TEXT), "{error}");
+        assert!(status.checks.running.is_empty());
+
+        // The hold is released with the job.
+        assert!(!h.egress_confined(), "the egress hold outlived the job");
+
+        // The terminal line reached the bus, after `started`, with a rising seq.
+        let mut lines: Vec<JobNotification> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            lines.push(
+                serde_json::from_value(value_to_json(event.payload))
+                    .expect("the payload is a JobNotification"),
+            );
+        }
+        assert_eq!(
+            lines.first().expect("a first line").event,
+            JobEvent::Started
+        );
+        let last = lines.last().expect("a last line");
+        assert_eq!(last.event, JobEvent::Failed);
+        assert!(last.seq > 1, "seq {}", last.seq);
+        assert_eq!(last.status.state, JobState::Failed);
+
+        // The status was persisted the way every other terminal state is.
+        let path = h
+            .findings_dir()
+            .join("scan")
+            .join("jobs")
+            .join(format!("{}.json", started.job));
+        let record: crate::jobs::PersistedJob =
+            serde_json::from_slice(&std::fs::read(&path).expect("the job file exists"))
+                .expect("the job file parses");
+        assert_eq!(record.status.state, JobState::Failed);
+
+        // The origin is not `busy`: a second job on it is admitted.
+        let again = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the origin is free once the failed job is terminal");
+        assert_ne!(again.job, started.job);
+        h.wait_terminal(&again.job, Duration::from_secs(2)).await;
+
+        // Cancelling the failed job is a no-op, not a hang.
+        let cancelled = h
+            .engine
+            .registry
+            .cancel(&started.job)
+            .expect("the job is still in the registry");
+        assert_eq!(cancelled.state, JobState::Failed);
+    }
+
+    /// Stage 6 finding (Task 16 review), the per-check half: one check that
+    /// panics is one `error` verdict; the job goes on to its next item and
+    /// finishes `done`, with the issue the next check found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_check_is_an_error_verdict_not_a_dead_job() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                // The catalogue is id-sorted: `fake.boom` runs before
+                // `fake.hit` on each point.
+                .with_check(FakeCheck::panicking("fake.boom", "demo"))
+                .with_check(FakeCheck::new("fake.hit", "other", FakeRun::vulnerable())),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(2)).await;
+        assert_eq!(status.state, JobState::Done, "{:?}", status.error);
+        assert_eq!(status.stopped_reason, None);
+        assert_eq!(status.error, None);
+        // Two points x two checks: every item, the panicking ones included,
+        // counts as done, and the point count follows.
+        assert_eq!(status.checks.scheduled, 4);
+        assert_eq!(status.checks.done, 4);
+        assert_eq!(status.points.audited, 2);
+        assert!(status.checks.running.is_empty());
+        // `fake.hit` still ran after `fake.boom` panicked on the same point.
+        assert_eq!(h.engine.issues.for_job(&started.job).len(), 2);
+        // The `fake.hit` runs sent one probe each; `fake.boom` sent none.
+        assert_eq!(h.client.calls(), 2);
+    }
+
     fn value_to_json(value: aitm_core::Value) -> serde_json::Value {
         use aitm_core::Value;
         match value {

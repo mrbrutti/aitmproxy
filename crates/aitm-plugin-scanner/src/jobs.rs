@@ -934,9 +934,9 @@ pub(crate) mod test_support {
     use std::time::{Instant, SystemTime};
 
     use aitm_core::{
-        AgentPolicy, Body, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap,
-        HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, JobBus, MemFlowStore,
-        ProxyClient, ScopeEntry, ScopeRateGuard, SendOptions, StdGuard,
+        AgentPolicy, Body, ConnInfo, EgressConfinement, Flow, FlowId, FlowMeta, FlowStore,
+        Frontend, HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState,
+        JobBus, MemFlowStore, ProxyClient, ScopeEntry, ScopeRateGuard, SendOptions, StdGuard,
     };
     use aitm_scan_model::{
         Check, CheckCost, CheckMeta, CheckOrigin, CheckRegistry, CheckScope, Confidence, Discovery,
@@ -961,6 +961,9 @@ pub(crate) mod test_support {
 
     /// The ordinary payload.
     pub(crate) const PROBE_PAYLOAD: &str = "probe";
+
+    /// What a panicking fake lane or check panics with.
+    pub(crate) const PANIC_TEXT: &str = "the fake blew up on purpose";
 
     /// A `ProxyClient` that answers every send with a canned `200` and counts
     /// what it was asked to do. No I/O, no network.
@@ -1086,6 +1089,8 @@ pub(crate) mod test_support {
         fallback: FakeRun,
         runs: AtomicU64,
         block_until_cancelled: bool,
+        /// Panic inside `run` instead of returning a verdict.
+        panics: bool,
         hint: Option<aitm_scan_model::PocHint>,
         /// Locations the verdict reports instead of the point's own: the first
         /// is the root verdict's, the rest ride in `more`.
@@ -1101,6 +1106,7 @@ pub(crate) mod test_support {
                 fallback,
                 runs: AtomicU64::new(0),
                 block_until_cancelled: false,
+                panics: false,
                 hint: None,
                 locations: Vec::new(),
             })
@@ -1115,6 +1121,7 @@ pub(crate) mod test_support {
                 fallback: FakeRun::vulnerable(),
                 runs: AtomicU64::new(0),
                 block_until_cancelled: false,
+                panics: false,
                 hint: Some(aitm_scan_model::PocHint {
                     assertions: vec![aitm_poc::Assertion::Status(200)],
                     control: None,
@@ -1132,6 +1139,7 @@ pub(crate) mod test_support {
                 fallback: FakeRun::vulnerable(),
                 runs: AtomicU64::new(0),
                 block_until_cancelled: false,
+                panics: false,
                 hint: None,
                 locations: locations.iter().map(|p| (*p).to_string()).collect(),
             })
@@ -1145,6 +1153,7 @@ pub(crate) mod test_support {
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
                 block_until_cancelled: false,
+                panics: false,
                 hint: None,
                 locations: Vec::new(),
             })
@@ -1163,6 +1172,7 @@ pub(crate) mod test_support {
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
                 block_until_cancelled: false,
+                panics: false,
                 hint: None,
                 locations: Vec::new(),
             })
@@ -1176,6 +1186,23 @@ pub(crate) mod test_support {
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
                 block_until_cancelled: true,
+                panics: false,
+                hint: None,
+                locations: Vec::new(),
+            })
+        }
+    }
+
+    impl FakeCheck {
+        /// A check whose `run` panics, as a buggy lane crate's check would.
+        pub(crate) fn panicking(id: &str, class: &str) -> Arc<Self> {
+            Arc::new(Self {
+                meta: fake_meta(id, class),
+                script: Mutex::new(VecDeque::new()),
+                fallback: FakeRun::clean(),
+                runs: AtomicU64::new(0),
+                block_until_cancelled: false,
+                panics: true,
                 hint: None,
                 locations: Vec::new(),
             })
@@ -1194,6 +1221,9 @@ pub(crate) mod test_support {
         ) -> BoxFuture<'a, Verdict> {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
+                if self.panics {
+                    panic!("{PANIC_TEXT}");
+                }
                 if self.block_until_cancelled {
                     while !host.cancelled() {
                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1389,6 +1419,8 @@ pub(crate) mod test_support {
         nodes: Vec<SiteNode>,
         checks: Vec<Arc<dyn Check>>,
         discover_error: Option<String>,
+        /// Panic inside `discover` instead of returning.
+        discover_panic: bool,
         validate_error: Option<String>,
         l4_reports: Vec<L4Counters>,
         discoveries: AtomicU64,
@@ -1406,6 +1438,7 @@ pub(crate) mod test_support {
                 nodes: vec![fake_node()],
                 checks: Vec::new(),
                 discover_error: None,
+                discover_panic: false,
                 validate_error: None,
                 l4_reports: Vec::new(),
                 discoveries: AtomicU64::new(0),
@@ -1424,6 +1457,12 @@ pub(crate) mod test_support {
 
         pub(crate) fn with_discover_error(mut self, text: &str) -> Self {
             self.discover_error = Some(text.to_string());
+            self
+        }
+
+        /// A lane whose `discover` panics with [`PANIC_TEXT`].
+        pub(crate) fn with_discover_panic(mut self) -> Self {
+            self.discover_panic = true;
             self
         }
 
@@ -1452,6 +1491,9 @@ pub(crate) mod test_support {
                 self.discoveries.fetch_add(1, Ordering::SeqCst);
                 for counters in &self.l4_reports {
                     job.report_l4(*counters);
+                }
+                if self.discover_panic {
+                    panic!("{PANIC_TEXT}");
                 }
                 if let Some(text) = &self.discover_error {
                     anyhow::bail!("{text}");
@@ -1553,6 +1595,8 @@ pub(crate) mod test_support {
         pub(crate) bus: Arc<JobBus>,
         pub(crate) policy: Arc<Mutex<AgentPolicy>>,
         pub(crate) scratch: Option<Arc<ScratchDir>>,
+        /// The egress posture a job holds confined, when a test binds one.
+        pub(crate) egress: Option<Arc<EgressConfinement>>,
         /// `(after n sends, policy)`: the live policy the engine reads flips
         /// once the stub client has served `n` probes, so a test can make the
         /// operator turn the policy *mid-job* without racing the worker.
@@ -1606,6 +1650,7 @@ pub(crate) mod test_support {
                 bus: Arc::new(JobBus::default()),
                 policy: Arc::new(Mutex::new(AgentPolicy::Ask)),
                 scratch: None,
+                egress: None,
                 flip: Arc::new(Mutex::new(None)),
                 cfg,
                 lane,
@@ -1626,6 +1671,12 @@ pub(crate) mod test_support {
         /// started job stays active for the length of the test.
         pub(crate) fn with_blocking_check(self) -> Self {
             self.with_lane(FakeLane::http().with_check(FakeCheck::blocking("blocker")))
+        }
+
+        /// Bind an egress posture, so a test can watch a job's hold on it.
+        pub(crate) fn with_egress(mut self) -> Self {
+            self.egress = Some(Arc::new(EgressConfinement::new(false)));
+            self
         }
 
         pub(crate) fn with_max_jobs(mut self, max_jobs: u32) -> Self {
@@ -1656,7 +1707,7 @@ pub(crate) mod test_support {
                 client: self.client.clone(),
                 guard: self.guard.clone(),
                 browser: None,
-                egress: None,
+                egress: self.egress.clone(),
                 l4: None,
                 jobs: self.bus.clone(),
                 agent_policy: Arc::new(move || {
@@ -1678,6 +1729,14 @@ pub(crate) mod test_support {
                     ..aitm_core::Config::default()
                 }),
             }));
+        }
+
+        /// Whether the bound egress posture is confined right now.
+        pub(crate) fn egress_confined(&self) -> bool {
+            self.egress
+                .as_ref()
+                .expect("the harness has an egress posture")
+                .confined()
         }
 
         /// The findings directory, when one was configured.
