@@ -4163,9 +4163,12 @@ impl App {
     /// the rotating `poll_offset`, at most [`MAX_STATUS_FOLLOWUPS`] leaving
     /// per firing; the rest are reached by the next firings, which start
     /// where this one stopped), every [`LIST_POLL_TICKS`] a `scan.list`
-    /// while the Scan view is shown, every [`ISSUES_POLL_TICKS`] a
-    /// `scan.issues` while the Issues tab is shown and the filtered job (any
-    /// job, without the filter) is live. Task 9 adds the Site map timer here.
+    /// while the Scan view is shown, and a `scan.issues` while the Issues
+    /// tab is shown and the filtered job (any job, without the filter) is
+    /// live, once [`ISSUES_POLL_TICKS`] have passed since the last
+    /// `scan.issues` left (`fetched_at_tick`, re-stamped by every request),
+    /// so entering the tab just before a modulo boundary does not fetch
+    /// twice (fix round D, D7). Task 9 adds the Site map timer here.
     fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
         if t.is_multiple_of(STATUS_POLL_TICKS) {
             let live = self.scan.jobs.live();
@@ -4175,7 +4178,12 @@ impl App {
         if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
             self.request_scan_list(out);
         }
-        if t.is_multiple_of(ISSUES_POLL_TICKS)
+        let issues_due = self
+            .scan
+            .issues
+            .fetched_at_tick
+            .is_some_and(|f| t.saturating_sub(f) >= ISSUES_POLL_TICKS);
+        if issues_due
             && self.mode == Mode::Scan
             && self.scan.tab == ScanTab::Issues
             && self.issues_live()
@@ -4274,15 +4282,17 @@ impl App {
         self.scan.inflight.remove(tag);
         match name {
             "scan.status" | "scan.cancel" => {
-                if let Some(status) = self.scan_reply::<JobStatus>(tag, &value) {
-                    // D6 hostile-core bound: the reply is folded only under
-                    // the job the tag asked about, so a core cannot mint a
-                    // new live job (and a new poll) per reply.
-                    if Some(status.job.as_str()) == tag_parts(tag).1 {
-                        self.scan.jobs.fold_status(status);
-                    } else {
-                        self.scan.set_error(ScanError::uncoded(tag, OTHER_JOB));
-                    }
+                // D6 hostile-core bound: the reply is folded only under the
+                // job the tag asked about, so a core cannot mint a new live
+                // job (and a new poll) per reply.
+                if let Some(status) = self.scan_reply_keyed::<JobStatus>(
+                    tag,
+                    name,
+                    &value,
+                    |s: &JobStatus| s.job.as_str(),
+                    OTHER_JOB,
+                ) {
+                    self.scan.jobs.fold_status(status);
                 }
             }
             "scan.list" => {
@@ -4304,15 +4314,17 @@ impl App {
             "scan.issue" => {
                 // The reply, ok or not, settles the one read in flight (D6).
                 self.scan.issues.pending_read = None;
-                if let Some(issue) = self.scan_reply::<Issue>(tag, &value) {
-                    // The same hostile-core bound as `scan.status`: the
-                    // issue is read only under the id the tag asked for.
-                    if Some(issue.id.as_str()) == tag_parts(tag).1 {
-                        self.scan.issues.flow_cursor = 0;
-                        self.scan.issues.read.insert(issue.id.clone(), issue);
-                    } else {
-                        self.scan.set_error(ScanError::uncoded(tag, OTHER_ISSUE));
-                    }
+                // The same hostile-core bound as `scan.status`: the issue
+                // is read only under the id the tag asked for.
+                if let Some(issue) = self.scan_reply_keyed::<Issue>(
+                    tag,
+                    name,
+                    &value,
+                    |i: &Issue| i.id.as_str(),
+                    OTHER_ISSUE,
+                ) {
+                    self.scan.issues.flow_cursor = 0;
+                    self.scan.issues.read.insert(issue.id.clone(), issue);
                 }
             }
             _ => {}
@@ -4340,6 +4352,32 @@ impl App {
                 self.scan.set_error(e);
                 None
             }
+        }
+    }
+
+    /// [`App::scan_reply`] for a keyed verb (`<name>:<key>`): the parsed
+    /// reply is returned only when `key` reads the tag's key off it (spec
+    /// D6, hostile-core bounds); otherwise the uncoded error `other`
+    /// (`OTHER_JOB`, `OTHER_ISSUE`) is recorded under the tag and nothing is
+    /// folded. `scan.status`, `scan.cancel` and `scan.issue` share it; the
+    /// Issues detail task's `scan.issue.update` will too (fix round D, D9).
+    /// `name` is the verb the bus echoed; the bus task echoes what the
+    /// reducer sent, so it is the tag's verb part by construction.
+    fn scan_reply_keyed<T: serde::de::DeserializeOwned>(
+        &mut self,
+        tag: &str,
+        name: &str,
+        value: &Value,
+        key: fn(&T) -> &str,
+        other: &'static str,
+    ) -> Option<T> {
+        debug_assert_eq!(tag_parts(tag).0, name, "a keyed tag carries its verb");
+        let parsed = self.scan_reply::<T>(tag, value)?;
+        if Some(key(&parsed)) == tag_parts(tag).1 {
+            Some(parsed)
+        } else {
+            self.scan.set_error(ScanError::uncoded(tag, other));
+            None
         }
     }
 

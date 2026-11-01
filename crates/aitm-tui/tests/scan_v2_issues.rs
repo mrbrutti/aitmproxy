@@ -117,6 +117,14 @@ fn screen(app: &App) -> String {
     text_of(app, 200, 50)
 }
 
+/// The Issues filter line as drawn, without the trailing pane padding and
+/// box edges, so a test pins the whole literal.
+fn filter_line(text: &str) -> &str {
+    line_with(text, "filters:")
+        .unwrap_or_default()
+        .trim_end_matches(['│', ' '])
+}
+
 /// T7-9, D6: `ScanTab(Issues)` sends exactly one `scan.issues {limit: 512}`
 /// (no filter is set, so only the page size travels).
 #[test]
@@ -162,13 +170,13 @@ fn issues_render_grouped_under_severity_headers_with_counts() {
         rows[1] < xss && xss < rows[2],
         "the high issue sits between HIGH and MEDIUM: {xss} in {rows:?}"
     );
+    // The row under the cursor, with the measured spacing (fix round D,
+    // D13): mark, glyph pair, name, location, point, status.
     let xss_line = text.lines().nth(xss).unwrap_or_default();
-    for literal in ["GET /search", "query:q", "open"] {
-        assert!(
-            xss_line.contains(literal),
-            "the XSS row lacks {literal:?}: {xss_line:?}"
-        );
-    }
+    assert!(
+        xss_line.starts_with("│>●● Reflected cross-site scripting  GET /search  query:q     open"),
+        "the XSS row: {xss_line:?}"
+    );
     let redirect = line_index(&text, "Open redirect").unwrap_or_else(|| panic!("no row: {text}"));
     assert!(
         rows[2] < redirect && redirect < rows[3],
@@ -197,10 +205,10 @@ fn filters_cycle_and_refetch() {
             json!({ "severity_min": "low", "limit": 512 })
         )]
     );
-    let text = screen(&app);
-    assert!(
-        text.contains("S low"),
-        "the banner prints the active severity filter: {text}"
+    assert_eq!(
+        filter_line(&screen(&app)),
+        "│ filters: S low · C none · L none · T none",
+        "the filter line prints the active severity filter"
     );
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
 
@@ -222,13 +230,10 @@ fn filters_cycle_and_refetch() {
             "limit": 512,
         })
     );
-    let text = screen(&app);
-    for literal in ["S low", "C firm", "L http", "T open"] {
-        assert!(
-            text.contains(literal),
-            "the banner lacks {literal:?}: {text}"
-        );
-    }
+    assert_eq!(
+        filter_line(&screen(&app)),
+        "│ filters: S low · C firm · L http · T open"
+    );
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
 
     let reqs = app.update(Action::ScanFilterReset);
@@ -250,7 +255,10 @@ fn j_toggles_the_job_filter_to_the_jobs_cursor() {
         reqs,
         vec![issues_request(json!({ "job": JOB, "limit": 512 }))]
     );
-    assert!(screen(&app).contains(&format!("job {JOB}")));
+    assert_eq!(
+        filter_line(&screen(&app)),
+        format!("│ filters: job {JOB} · S none · C none · L none · T none")
+    );
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
 
     let reqs = app.update(Action::ScanFilter(IssueFilterKey::Job));
@@ -511,24 +519,33 @@ fn detail_focused_down_sends_no_read() {
     assert_eq!(app.scan.issues.cursor, 0);
 }
 
-/// T7-9, D6: with a running job, the Issues tab refetches every 20 ticks;
-/// once the job is terminal the timer is quiet.
+/// T7-9, D6: with a running job, the Issues tab refetches twenty ticks
+/// after its last `scan.issues` left (entered at tick 0, so at tick 20 and
+/// not before; fix round D, D7); once the job is terminal the timer is
+/// quiet.
 #[test]
 fn issues_refresh_every_twenty_ticks_while_a_job_is_live() {
     let mut app = app();
     let _ = app.on_bus(status_reply(fixture("scan.status.json")));
     let reqs = app.update(Action::ScanTab(ScanTab::Issues));
     assert_eq!(issues_requests(&reqs).len(), 1);
+    assert_eq!(app.scan.issues.fetched_at_tick, Some(0));
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
 
-    let mut total = 0;
-    for _ in 0..20 {
+    let mut fired_at = Vec::new();
+    for tick in 1..=20u64 {
         let reqs = app.update(Action::Tick);
-        total += issues_requests(&reqs).len();
+        if !issues_requests(&reqs).is_empty() {
+            fired_at.push(tick);
+        }
         // Keep the status poll settled so it never blocks the count.
         let _ = app.on_bus(status_reply(fixture("scan.status.json")));
     }
-    assert_eq!(total, 1, "one scan.issues per 20 ticks while a job is live");
+    assert_eq!(
+        fired_at,
+        vec![20],
+        "one scan.issues, twenty ticks after the stamp"
+    );
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
 
     let mut done = fixture("scan.status.json");
@@ -618,4 +635,34 @@ fn a_bus_without_scan_issue_is_named_in_the_issues_banner() {
     );
     assert_eq!(app.scan.issues.pending_read, None);
     assert_eq!(app.scan.issues.list.len(), 2, "the list is still shown");
+}
+
+/// D7 (spec D6): the Issues timer counts from `fetched_at_tick`, so a tab
+/// entered at tick 19 is not fetched again at tick 20; the next fetch is at
+/// tick 39, twenty ticks after the stamp.
+#[test]
+fn issues_timer_counts_from_the_last_fetch_not_the_tick_modulo() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    for _ in 0..19 {
+        let reqs = app.update(Action::Tick);
+        assert_eq!(issues_requests(&reqs).len(), 0, "{reqs:?}");
+        let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    }
+    let reqs = app.update(Action::ScanTab(ScanTab::Issues));
+    assert_eq!(issues_requests(&reqs).len(), 1);
+    assert_eq!(app.scan.issues.fetched_at_tick, Some(19));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+
+    let mut fired_at = Vec::new();
+    for tick in 20..=40u64 {
+        let reqs = app.update(Action::Tick);
+        if !issues_requests(&reqs).is_empty() {
+            fired_at.push(tick);
+            let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+        }
+        let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    }
+    assert_eq!(fired_at, vec![39], "twenty ticks after the stamp, once");
+    assert_eq!(app.scan.issues.fetched_at_tick, Some(39));
 }
