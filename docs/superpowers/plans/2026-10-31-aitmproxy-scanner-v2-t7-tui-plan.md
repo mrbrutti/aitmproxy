@@ -360,6 +360,17 @@ Kept by the main session during stage 6. One row per finding.
 | 6 | spec | Minor | detail pane carries `started by`, `probes` and `done/scheduled` lines the list did not name | accepted by the T7 session (useful operator facts, data already parsed); spec D11 amended in this commit |
 | 6 | spec | Minor | width-adaptive column collapse anticipates Task 14 | accepted (spec leaves widths to the builder); Task 14 still pins the 90x40 row shape and the detail first line in `scan_v2_layout.rs` |
 | 6 | spec | Minor | eleven helpers public beyond the plan's four names | accepted (crate modules are all `pub`; tests reach `App` internals) |
+| 6 | quality | Important | the view parses the row's display text to rebuild the probe bar and splits it by a glyph literal | fix round C (C21): typed `probe_fill` on `JobRow` |
+| 6 | quality | Important | Jobs `split()` re-implements the stacked branch of `panes()` and builds `Panes` by struct literal | fix round C (C22): shared `stacked(area, list_rows)` |
+| 6 | quality | Minor | `severity_bar` has no production caller; `severity_spans` re-implements it | fix round C (C23) |
+| 6 | quality | Minor | `detail_lines` allocates static labels; `detail_len()` builds every line; model/view disagree without a status | fix round C (C24) |
+| 6 | quality | Minor | Jobs-detail `navigate` branch repeats the six-arm cursor walk | fix round C (C25) |
+| 6 | quality | Minor | local `state_text` shadows the function | fix round C (C26) |
+| 6 | quality | Minor | `row_of` `(None, Some)` arm unreachable | fix round C (C27) |
+| 6 | quality | Minor | module doc claims a narrow-only detail first line the code draws always | fix round C (C28) |
+| 6 | quality | Minor | `Columns::measure`/`total()` coupling; opaque test literals | fix round C (C29) |
+| 6 | quality | Minor | cancel test reads its expectation from the fixture | fix round C (C30) |
+| 6 | quality | Minor | clamped cursor twice, per-row `String` clone, `pub lane_name` | fix round C (C31) |
 
 ## Shipped
 
