@@ -47,7 +47,7 @@ use aitm_scan_model::{
 
 use crate::crawl::browser::{origin_root, prime_session, BrowserCrawler};
 use crate::crawl::client::ClientCrawler;
-use crate::crawl::frontier::{limits_for, Crawler};
+use crate::crawl::frontier::{limits_for, Crawler, StopReason};
 use crate::crawl::seeds::fetch_seeds;
 use crate::host::{HttpProbeHost, SessionMonitors};
 use crate::limits::{job_mark, MARK_CRAWL, MAX_SEED_URLS, MAX_STORED_FLOWS};
@@ -342,6 +342,7 @@ fn engine_for(job: &dyn JobCtx) -> Option<Engine> {
     }
     tracing::warn!(
         job = job.job_id(),
+        reason = StopReason::NoBrowser.as_str(),
         "scan: http lane: use_browser: always but the job has no browser; skipping the crawl"
     );
     None
@@ -409,7 +410,7 @@ async fn crawl_origin(
     if let Some(reason) = report.stopped_reason {
         tracing::info!(
             job = job.job_id(),
-            reason,
+            reason = reason.as_str(),
             "scan: http lane: the crawl stopped early"
         );
     }

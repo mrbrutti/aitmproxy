@@ -266,12 +266,60 @@ fn trim_spaces(bytes: &[u8]) -> &[u8] {
     bytes.get(start..end).unwrap_or(&[])
 }
 
+/// Why a crawl stopped before its frontier ran dry (spec D8.1).
+///
+/// [`StopReason::as_str`] is the literal the lane logs and the engine's
+/// report carries: `max_pages`, `max_depth`, `time`, `budget`, `cancelled`,
+/// `left_scope`, `navigation_failed`, `guard_refused`, `no_browser`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    /// `max_pages` attempts were spent.
+    MaxPages,
+    /// The frontier ran dry only because links deeper than `max_depth` were
+    /// refused.
+    MaxDepth,
+    /// The job's deadline passed.
+    Time,
+    /// The job's budget refused a charge.
+    Budget,
+    /// The job was cancelled.
+    Cancelled,
+    /// The browser landed outside the engagement.
+    LeftScope,
+    /// Nothing loaded at all.
+    NavigationFailed,
+    /// The frontier ran dry only because the scope guard refused pages.
+    GuardRefused,
+    /// The profile demanded a browser the job does not have.
+    NoBrowser,
+}
+
+impl StopReason {
+    /// The documented literal for this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxPages => "max_pages",
+            Self::MaxDepth => "max_depth",
+            Self::Time => "time",
+            Self::Budget => "budget",
+            Self::Cancelled => "cancelled",
+            Self::LeftScope => "left_scope",
+            Self::NavigationFailed => "navigation_failed",
+            Self::GuardRefused => "guard_refused",
+            Self::NoBrowser => "no_browser",
+        }
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What one crawl run did.
 ///
 /// `stopped_reason` is `None` when the crawl ran out of frontier on its own.
-/// The engines use exactly these literals: `"max_pages"`, `"max_depth"`,
-/// `"time"`, `"budget"`, `"cancelled"`, `"left_scope"`, `"navigation_failed"`,
-/// `"guard_refused"`, `"no_browser"`.
 #[derive(Default)]
 pub(crate) struct CrawlReport {
     /// Pages that loaded (a `2xx` or `3xx` response, or a browser navigation).
@@ -288,7 +336,7 @@ pub(crate) struct CrawlReport {
     /// The flows the crawl produced, for the lane to turn into site-map nodes.
     pub flows: Vec<HttpFlow>,
     /// Why the crawl stopped early, or `None` when it finished the frontier.
-    pub stopped_reason: Option<&'static str>,
+    pub stopped_reason: Option<StopReason>,
     /// The deepest level the crawl actually reached.
     pub depth_reached: u32,
 }
@@ -479,6 +527,27 @@ mod tests {
         assert_eq!(f.attempts, 0);
     }
 
+    /// Q2: the stop reasons are one enum whose `as_str` is the documented
+    /// literal the lane logs and the engine's report carries.
+    #[test]
+    fn stop_reason_literals_pin() {
+        let all = [
+            (StopReason::MaxPages, "max_pages"),
+            (StopReason::MaxDepth, "max_depth"),
+            (StopReason::Time, "time"),
+            (StopReason::Budget, "budget"),
+            (StopReason::Cancelled, "cancelled"),
+            (StopReason::LeftScope, "left_scope"),
+            (StopReason::NavigationFailed, "navigation_failed"),
+            (StopReason::GuardRefused, "guard_refused"),
+            (StopReason::NoBrowser, "no_browser"),
+        ];
+        for (reason, literal) in all {
+            assert_eq!(reason.as_str(), literal);
+            assert_eq!(reason.to_string(), literal);
+        }
+    }
+
     #[test]
     fn fingerprint_pins() {
         // Digit runs and whitespace runs do not change a page.
@@ -543,7 +612,7 @@ mod tests {
                 Ok(CrawlReport {
                     pages: seeds.len() as u32,
                     depth_reached: limits.max_depth,
-                    stopped_reason: Some("max_pages"),
+                    stopped_reason: Some(StopReason::MaxPages),
                     ..CrawlReport::default()
                 })
             })
@@ -566,7 +635,7 @@ mod tests {
 
         assert_eq!(report.pages, 1);
         assert_eq!(report.depth_reached, 3);
-        assert_eq!(report.stopped_reason, Some("max_pages"));
+        assert_eq!(report.stopped_reason, Some(StopReason::MaxPages));
         assert_eq!(report.attempts, 0);
         assert_eq!(report.forms_submitted, 0);
         assert_eq!(report.clicks, 0);
@@ -574,7 +643,7 @@ mod tests {
         // The report never prints a flow's bytes.
         assert_eq!(
             format!("{report:?}"),
-            "CrawlReport { pages: 1, attempts: 0, forms_submitted: 0, forms_skipped: 0, clicks: 0, flows: 0, stopped_reason: Some(\"max_pages\"), depth_reached: 3 }"
+            "CrawlReport { pages: 1, attempts: 0, forms_submitted: 0, forms_skipped: 0, clicks: 0, flows: 0, stopped_reason: Some(MaxPages), depth_reached: 3 }"
         );
     }
 }

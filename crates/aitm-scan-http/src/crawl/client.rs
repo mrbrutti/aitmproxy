@@ -42,7 +42,7 @@ use aitm_scan_model::JobCtx;
 
 use crate::crawl::extract::{extract, FieldKind, FormSpec};
 use crate::crawl::frontier::{
-    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits,
+    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits, StopReason,
 };
 use crate::crawl::values::{form_action, form_pairs_for};
 use crate::limits::{job_mark, MARK_CRAWL, MAX_DOM_BYTES, USER_AGENT};
@@ -136,15 +136,15 @@ impl<'a> Run<'a> {
     async fn walk(&mut self) {
         loop {
             if self.job.cancelled() {
-                self.report.stopped_reason = Some("cancelled");
+                self.report.stopped_reason = Some(StopReason::Cancelled);
                 return;
             }
             let Some(left) = remaining(self.job) else {
-                self.report.stopped_reason = Some("time");
+                self.report.stopped_reason = Some(StopReason::Time);
                 return;
             };
             if self.frontier.attempts >= self.limits.max_pages {
-                self.report.stopped_reason = Some("max_pages");
+                self.report.stopped_reason = Some(StopReason::MaxPages);
                 return;
             }
 
@@ -312,9 +312,9 @@ impl<'a> Run<'a> {
         self.report.attempts = self.frontier.attempts;
         if self.report.stopped_reason.is_none() {
             if self.frontier.depth_hit {
-                self.report.stopped_reason = Some("max_depth");
+                self.report.stopped_reason = Some(StopReason::MaxDepth);
             } else if self.report.pages == 0 && self.failures > 0 {
-                self.report.stopped_reason = Some("navigation_failed");
+                self.report.stopped_reason = Some(StopReason::NavigationFailed);
             }
         }
         self.report
@@ -658,7 +658,7 @@ mod tests {
         let report = crawl(&job).await;
 
         assert_eq!(report.attempts, 2);
-        assert_eq!(report.stopped_reason, Some("max_pages"));
+        assert_eq!(report.stopped_reason, Some(StopReason::MaxPages));
     }
 
     #[tokio::test]
@@ -677,7 +677,7 @@ mod tests {
             client.sent_paths()
         );
         assert_eq!(report.forms_submitted, 0);
-        assert_eq!(report.stopped_reason, Some("max_depth"));
+        assert_eq!(report.stopped_reason, Some(StopReason::MaxDepth));
     }
 
     #[tokio::test]
@@ -689,7 +689,7 @@ mod tests {
         let report = crawl(&job).await;
 
         assert_eq!(client.sent.lock().unwrap().len(), 0);
-        assert_eq!(report.stopped_reason, Some("cancelled"));
+        assert_eq!(report.stopped_reason, Some(StopReason::Cancelled));
     }
 
     #[tokio::test]
@@ -856,7 +856,7 @@ mod tests {
 
         assert_eq!(report.pages, 0);
         assert_eq!(report.attempts, 1);
-        assert_eq!(report.stopped_reason, Some("navigation_failed"));
+        assert_eq!(report.stopped_reason, Some(StopReason::NavigationFailed));
     }
 
     // --- N2: a `multipart/form-data` form is posted as multipart ------------

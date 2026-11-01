@@ -55,7 +55,7 @@ use url::Url;
 
 use crate::crawl::extract::{extract, Extracted, FieldKind, FieldSpec, FormSpec};
 use crate::crawl::frontier::{
-    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits,
+    fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits, StopReason,
 };
 use crate::crawl::values::{form_action, value_for};
 use crate::limits::{
@@ -449,9 +449,8 @@ enum Step {
     Continue,
     /// Abandon this page, keep crawling.
     NextPage,
-    /// Stop the crawl with this reason (one of the literals on
-    /// [`CrawlReport::stopped_reason`]).
-    Stop(&'static str),
+    /// Stop the crawl with this reason.
+    Stop(StopReason),
 }
 
 /// One crawl run: the browser, the frontier and the report being filled.
@@ -498,16 +497,16 @@ impl<'a> Run<'a> {
     }
 
     /// Drain the frontier, one page at a time, until something says stop.
-    async fn run_pages(&mut self) -> anyhow::Result<Option<&'static str>> {
+    async fn run_pages(&mut self) -> anyhow::Result<Option<StopReason>> {
         while let Some((page, depth)) = self.frontier.pop() {
             if self.job.cancelled() {
-                return Ok(Some("cancelled"));
+                return Ok(Some(StopReason::Cancelled));
             }
             if remaining(self.job).is_none() {
-                return Ok(Some("time"));
+                return Ok(Some(StopReason::Time));
             }
             if self.report.attempts >= self.limits.max_pages {
-                return Ok(Some("max_pages"));
+                return Ok(Some(StopReason::MaxPages));
             }
             self.report.attempts += 1;
             self.report.depth_reached = self.report.depth_reached.max(depth);
@@ -545,7 +544,7 @@ impl<'a> Run<'a> {
             }
         };
         if !self.job.charge(1) {
-            return Ok(Step::Stop("budget"));
+            return Ok(Step::Stop(StopReason::Budget));
         }
 
         // The one O(store) step of this page (S-M6): every later action on
@@ -578,7 +577,7 @@ impl<'a> Run<'a> {
                 url = %safe_url(&outcome.final_url),
                 "crawl: the browser landed outside the engagement; stopping"
             );
-            return Ok(Step::Stop("left_scope"));
+            return Ok(Step::Stop(StopReason::LeftScope));
         };
 
         self.report.pages += 1;
@@ -664,7 +663,7 @@ impl<'a> Run<'a> {
 
         for form in forms {
             if self.job.cancelled() {
-                return Ok(Step::Stop("cancelled"));
+                return Ok(Step::Stop(StopReason::Cancelled));
             }
             match self.return_to(page).await? {
                 Step::Continue => {}
@@ -695,7 +694,7 @@ impl<'a> Run<'a> {
             self.fill_form(&form).await;
 
             if !self.job.charge(1) {
-                return Ok(Step::Stop("budget"));
+                return Ok(Step::Stop(StopReason::Budget));
             }
             let submitted = bounded(self.job, self.browser.eval(&submit_form_js(form.index))).await;
             if let Err(err) = submitted {
@@ -790,14 +789,14 @@ impl<'a> Run<'a> {
             .take(self.limits.clicks_per_page as usize)
         {
             if self.job.cancelled() {
-                return Ok(Step::Stop("cancelled"));
+                return Ok(Step::Stop(StopReason::Cancelled));
             }
             match self.return_to(page).await? {
                 Step::Continue => {}
                 other => return Ok(other),
             }
             if !self.job.charge(1) {
-                return Ok(Step::Stop("budget"));
+                return Ok(Step::Stop(StopReason::Budget));
             }
             let clicked = bounded(
                 self.job,
@@ -860,7 +859,7 @@ impl<'a> Run<'a> {
                 url = %safe_url(landing),
                 "crawl: an interaction left the engagement; stopping"
             );
-            return Ok(Step::Stop("left_scope"));
+            return Ok(Step::Stop(StopReason::LeftScope));
         };
         if self.frontier.mark_visited(&landed) {
             self.report.pages = self.report.pages.saturating_add(1);
@@ -885,7 +884,7 @@ impl<'a> Run<'a> {
             return Ok(Step::Continue);
         }
         if !self.job.charge(1) {
-            return Ok(Step::Stop("budget"));
+            return Ok(Step::Stop(StopReason::Budget));
         }
         let outcome = bounded(self.job, self.browser.navigate(page.as_str())).await;
         self.collect();
@@ -978,12 +977,12 @@ impl<'a> Run<'a> {
     }
 
     /// The finished report, with the stop reason the run arrived at.
-    fn into_report(mut self, stopped: Option<&'static str>) -> CrawlReport {
+    fn into_report(mut self, stopped: Option<StopReason>) -> CrawlReport {
         self.report.stopped_reason = match stopped {
             Some(reason) => Some(reason),
             // The frontier ran dry, but not because there was nothing left.
-            None if self.frontier.depth_hit => Some("max_depth"),
-            None if self.guard_refused > 0 => Some("guard_refused"),
+            None if self.frontier.depth_hit => Some(StopReason::MaxDepth),
+            None if self.guard_refused > 0 => Some(StopReason::GuardRefused),
             None => None,
         };
         self.report
@@ -1432,7 +1431,7 @@ mod tests {
             .expect("a budget stop is not an error");
 
         assert_eq!(job.charges.load(Ordering::SeqCst), 1);
-        assert_eq!(report.stopped_reason, Some("budget"));
+        assert_eq!(report.stopped_reason, Some(StopReason::Budget));
         assert_eq!(report.attempts, 2);
         assert_eq!(report.pages, 1);
         assert_eq!(
@@ -1471,7 +1470,7 @@ mod tests {
             .await
             .expect("leaving scope is a stop, not an error");
 
-        assert_eq!(report.stopped_reason, Some("left_scope"));
+        assert_eq!(report.stopped_reason, Some(StopReason::LeftScope));
         assert_eq!(report.pages, 1);
         // `/b` was queued but never reached.
         assert_eq!(
