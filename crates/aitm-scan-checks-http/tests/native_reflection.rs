@@ -109,6 +109,31 @@ async fn xss_reflected_is_clean_when_the_marker_is_entity_encoded() {
     assert_eq!(verdict.evidence.payload, None);
 }
 
+/// A page that HTML-escapes its output echoes every probe in encoded form:
+/// the element probe as entities, the attribute probe with its quote and
+/// brackets encoded, the JS-string probe with its quote encoded even inside a
+/// real `<script>` element. None of those is an unencoded reflection, so the
+/// verdict is Clean with no hint and no payload (T4's live finding on the
+/// Patched seed: an escaped echo must never count).
+#[tokio::test]
+async fn xss_reflected_is_clean_when_every_probe_comes_back_html_escaped() {
+    let host = ScriptedHost::new().with_marker(MARKER).with_fallback(html(
+        200,
+        "<p>you searched for &lt;aitmabcd&gt;x&lt;/aitmabcd&gt;</p>\
+         <input value=\"&quot;&gt;&lt;aitmabcd&gt;x&lt;/aitmabcd&gt;\">\
+         <script>var q='&#39;;aitmabcd//';</script>\
+         <script>var r=\"&apos;;aitmabcd//\";</script>",
+    ));
+    let point = point(InsertionKind::Query, "q", TARGET_URL);
+
+    let verdict = aitm_scan_checks_http::xss::check().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean);
+    assert_eq!(verdict.poc_hint, None);
+    assert_eq!(verdict.evidence.payload, None);
+    assert_eq!(host.sent().len(), 3);
+}
+
 #[tokio::test]
 async fn xss_reflected_is_clean_on_a_json_content_type() {
     let body = format!("{{\"q\":\"{FIRST_XSS_PROBE}\"}}");
