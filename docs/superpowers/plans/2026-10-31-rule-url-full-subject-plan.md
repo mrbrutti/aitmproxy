@@ -194,6 +194,15 @@ report is in.
 - **Test:** the new AC17 rows fail on the current matcher, then pass; `PatternTooLong`/`EmptyPattern` tests; `rule_schemas_state_the_full_url_subject` and `operator_docs_state_the_full_url_subject` pin `whole URL`.
 - **Done when:** the crate-scoped tests pass and the Terminal gate, Swift suite, e2e cell and live proof are re-run green.
 
+### Fix task B (after panel 2, 2026-10-31): findings B1–B6
+
+- **Satisfies:** AC19 (Kit test), AC15 (`rules` param text), quality readability.
+- **Depends on:** Fix task A.
+- **Files:** `apps/mac/Tests/AitmproxyKitTests/BreakpointRulesTests.swift`, `crates/aitm-rules/src/lib.rs`, `crates/aitm-plugins/src/intercept.rs` (the `rules` ParamDef description only), `crates/aitm-plugins/tests/intercept_rules.rs`, `crates/aitm-plugin-wsctl/src/lib.rs` (the `rules` description and the cap unit test's assertion only), `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md`.
+- **Change:** the findings report `rule-url-panel-2-findings.md` in the shared notes folder is the input: B1 Swift test for the empty pattern on a literal row, B2 `compile_url` + `UrlSubject::for_wildcard`, B3 `RuleError` doc line, B4 plugin tests pin a fragment of the cap message, B5 SKILL.md sub-bullets, B6 `rules` param descriptions name the caps.
+- **Test:** `swift test --filter BreakpointRule` (Terminal) gains `emptyPatternMatchesNoRow`; every Rust test stays green.
+- **Done when:** crate-scoped tests pass and the Terminal gate, Swift suite, e2e cell and live proof are re-run green.
+
 ## Review log
 
 Kept by the orchestrating session during stage 6. One row per finding.
@@ -207,7 +216,7 @@ Kept by the orchestrating session during stage 6. One row per finding.
 | whole branch | security | Minor | path-intended patterns (`/admin`, `*/login*`) also match at the `//` of `scheme://`; Map rules act on it | FIX (Fix task A, F1: leading-`/` wildcard is path-only; `//` boundary documented and pinned; AC17) |
 | whole branch | security | Minor | pattern length unbounded before the compiled-size cap (263 ms per MiB with case folding); `rules[]` count unbounded | FIX (Fix task A, F2: 4096-byte pattern cap, 256-rule cap; AC18) |
 | whole branch | security | Minor | empty `url` pattern accepted and matches every flow | FIX (Fix task A, F3) |
-| whole branch | quality | Minor | size-cap tests assert on the regex crate's error wording | accepted (autonomous mode, 2026-10-31): the string is `regex`'s Display; a bump that rewords it fails with an obvious message; after F2 only `oversized_regex_rejected` depends on it |
+| whole branch | quality | Minor | size-cap tests assert on the regex crate's error wording | accepted (autonomous mode, 2026-10-31): the string is `regex`'s Display; a bump that rewords it fails with an obvious message (two tests depend on it after F2: `oversized_regex_rejected` and the at-cap case of `oversized_wildcards_rejected_under_size_cap`) |
 | whole branch | quality | Minor | `compile_pattern` takes a positional `bool` beside the `Anchor` enum | FIX (Fix task A, F4: `Case { Fold, Exact }`) |
 | whole branch | quality | Minor | `// Tester:` role prefixes in test comments | FIX (Fix task A, F5) |
 | whole branch | quality | Minor | Swift path subject re-joins `path?query` that `FlowRow.url` also joins | accepted (autonomous mode, 2026-10-31): the spec confines the Kit change to `matches`/`wildcardMatches`; a `FlowRow.target` helper belongs with the sibling Kit PR |
@@ -216,6 +225,14 @@ Kept by the orchestrating session during stage 6. One row per finding.
 | whole branch | spec | Important | AC15: the starred-pattern anchoring rule is missing from the schema text, SKILL.md and the site | FIX (Fix task A, F7) |
 | whole branch | spec | Important | Task 4 touched the undeclared `tests/e2e/proxy/README.md` | fixed in the plan (Task 4 Files line amended 2026-10-31; the hunk stays) |
 | whole branch | spec | Minor | spec silent on the empty `url` pattern | FIX (spec amended: rejected at compile, AC19; Fix task A, F3) |
+| Fix task A | security | Minor | `rules` param text names the regex rejection but not the 256-rule / 4096-byte caps | FIX (Fix task B, B6) |
+| Fix task A | quality | Minor | `compile`'s url arm carries three rules inline; a `compile_url` helper would read better | FIX (Fix task B, B2) |
+| Fix task A | quality | Minor | `RuleError` doc says "why `compile` rejected a rule" but `TooManyRules` comes from `check_rule_count` | FIX (Fix task B, B3) |
+| Fix task A | quality | Minor | the `TooManyRules` sentence is pinned verbatim in three crates | FIX (Fix task B, B4) |
+| Fix task A | quality | Minor | SKILL.md `url` rule is one ~95-word sentence | FIX (Fix task B, B5) |
+| Fix task A | spec | Important | AC19's Kit clause (empty pattern matches no row) has no Swift test | FIX (Fix task B, B1) |
+| Fix task A | spec | Minor | site omits the leading-`/` rule and the `//` boundary | accepted (autonomous mode, 2026-10-31): the site sentence is the overview; module docs, schema text and SKILL.md carry the rule |
+| Fix task A | spec | Minor | spec did not say which patterns the 4096-byte cap covers | fixed in the spec (Bounded input now names url wildcard, url regex and host wildcard; exact host uncapped) |
 
 ## Shipped
 

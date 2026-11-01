@@ -146,7 +146,8 @@ is authoritative and the shared case table uses only syntax both accept.
 
 ### What does not change
 
-`host`, `method`, `phase`, `ws_dir` and `enabled` keep their semantics.
+`host`, `method`, `phase`, `ws_dir` and `enabled` keep their semantics (the
+4096-byte cap on a `host` wildcard, added after panel 1, is the one addition).
 `bus.rs` parse and echo are untouched. Map Local/Remote and `ws.intercept`
 inherit the new `url` semantics through `CompiledRule::matches`.
 
@@ -163,8 +164,10 @@ Three decisions, all **(Architect's call)**:
   `//` boundary remains a legitimate match for `*/seg*` and for an unanchored
   regex (`*/login*` matches `https://login.example.com/x`). The docs say so and
   recommend a `host` clause, or a `^/` anchor, when only the path is meant.
-- **Bounded input.** A pattern longer than 4096 bytes is rejected before any
-  regex is built (`RuleError::PatternTooLong`); `flow.intercept` and
+- **Bounded input.** A wildcard or regex pattern, `url` or `host`, longer than
+  4096 bytes is rejected before any regex is built
+  (`RuleError::PatternTooLong`); an exact `host` is a string compare, not a
+  pattern, and is not capped; `flow.intercept` and
   `ws.intercept` reject more than 256 rules in one call. A rejected call leaves
   the active rules unchanged. (The compiled-size cap only applies after the
   parser has walked the whole pattern; with case folding a 1 MiB literal took
