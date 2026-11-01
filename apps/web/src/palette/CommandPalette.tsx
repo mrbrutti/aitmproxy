@@ -13,8 +13,9 @@ import { Kbd } from '~/components/Kbd';
 import { FlowLine } from '~/lib/schema-form/FlowLine';
 import { SchemaForm } from '~/lib/schema-form/SchemaForm';
 import { createFormState, type FormState, type RawValues } from '~/lib/schema-form/infer';
-import { isCACancelled } from '~/state/caTrust';
+import { isCACancelled, isCATrustTool } from '~/state/caTrust';
 import { segments } from '~/lib/fuzzy';
+import { isRecord } from '~/lib/isRecord';
 import { openedByPointer } from '~/lib/pointer';
 import { buildGroups, commandKey, compactJson, flatten, flowIdsIn, parseQuery, pushRecent, readPinned, readRecent, setupKey, togglePinned, type PaletteItem } from './groups';
 import { setupActions } from './setup';
@@ -23,8 +24,16 @@ import css from './palette.module.css';
 type Stage =
   | { kind: 'list' }
   | { kind: 'form'; tool: ToolDef; form: FormState; confirming: boolean }
+  | { kind: 'confirm'; tool: ToolDef; args: Record<string, unknown>; prompt: string; token: string }
   | { kind: 'running'; tool: ToolDef }
   | { kind: 'result'; tool: ToolDef; ok: boolean; value: unknown; ms: number; args: Record<string, unknown> };
+
+/**
+ * The bus's non-error reply to a confirm-gated call from an operator connection (bus spec D4):
+ * nothing ran; the identical call re-sent with `_confirm: token` runs it.
+ */
+const needsConfirmation = (v: unknown): { prompt: string | null; token: string } | null =>
+  isRecord(v) && v.status === 'needs_confirmation' && typeof v.confirm_token === 'string' ? { prompt: typeof v.prompt === 'string' ? v.prompt : null, token: v.confirm_token } : null;
 
 export const CommandPalette: Component = () => {
   const app = useApp();
@@ -41,6 +50,8 @@ export const CommandPalette: Component = () => {
   const close = () => app.openPalette(false);
   onCleanup(() => {
     if (previous && document.contains(previous)) previous.focus({ preventScroll: true });
+    const s = stage();
+    if (s.kind === 'confirm' && isCATrustTool(s.tool.name)) void releaseCA();
   });
   onMount(() => queueMicrotask(() => input?.focus()));
 
@@ -68,18 +79,32 @@ export const CommandPalette: Component = () => {
   // ---- running commands ----
   const toolByName = (name: string) => app.proxy.tools.find((t) => t.name === name) ?? null;
 
-  /** The two calls that change the OS trust store (§D17.12): in-flight word, then the `ca.status` re-read (D17.5). */
-  const changesCA = (tool: ToolDef) => tool.name === 'ca.install' || tool.name === 'ca.uninstall';
+  /** When a `ca.install` / `ca.uninstall` run ends, however it ends (§D17.12): the read-back the word comes from (D17.5), then the in-flight flag. */
+  const releaseCA = async () => {
+    if (!(await app.refreshCA())) app.notice('ca.status could not be re-read; the CA word may be stale', 'error');
+    app.setCAInstalling(false);
+  };
 
-  const run = async (tool: ToolDef, args: Record<string, unknown>) => {
+  /** One call; with `token`, the second phase of the bus confirm handshake carrying `_confirm`. */
+  const run = async (tool: ToolDef, args: Record<string, unknown>, token?: string) => {
     setStage({ kind: 'running', tool });
     const t0 = performance.now();
-    const ca = changesCA(tool);
-    if (ca) app.setCAInstalling(true);
+    const ca = isCATrustTool(tool.name);
+    if (ca && token === undefined) app.setCAInstalling(true);
+    let awaitingConfirm = false;
     try {
-      const value = await app.call(tool.name, args);
-      setStage({ kind: 'result', tool, ok: true, value, ms: performance.now() - t0, args });
-      if (tool.mutates !== false) void app.refreshSide();
+      const value = await app.call(tool.name, token === undefined ? args : { ...args, _confirm: token });
+      const ask = needsConfirmation(value);
+      if (ask && token === undefined) {
+        awaitingConfirm = true;
+        setStage({ kind: 'confirm', tool, args, prompt: ask.prompt ?? tool.confirm ?? `Confirm ${tool.name}?`, token: ask.token });
+        return;
+      }
+      if (ask) setStage({ kind: 'result', tool, ok: false, value: 'confirmation was not accepted (stale or reused token)', ms: performance.now() - t0, args });
+      else {
+        setStage({ kind: 'result', tool, ok: true, value, ms: performance.now() - t0, args });
+        if (tool.mutates !== false) void app.refreshSide();
+      }
     } catch (e) {
       const message = (e as Error).message;
       if (ca && isCACancelled(message)) {
@@ -88,12 +113,15 @@ export const CommandPalette: Component = () => {
         setStage({ kind: 'list' });
       } else setStage({ kind: 'result', tool, ok: false, value: message, ms: performance.now() - t0, args });
     } finally {
-      if (ca) {
-        await app.refreshCA();
-        app.setCAInstalling(false);
-      }
+      if (ca && !awaitingConfirm) await releaseCA();
     }
     setRecent(pushRecent(commandKey(tool.name)));
+  };
+
+  /** The operator declined the bus's prompt: nothing ran, nothing more is sent. */
+  const cancelConfirm = async (tool: ToolDef) => {
+    backToList();
+    if (isCATrustTool(tool.name)) await releaseCA();
   };
 
   /** Initial form values from a setup action's arguments: strings and booleans as they are, the rest as JSON text. */
@@ -155,6 +183,7 @@ export const CommandPalette: Component = () => {
       e.preventDefault();
       if (s.kind === 'list') close();
       else if (s.kind === 'form' && s.confirming && s.form.fields.length) setStage({ ...s, confirming: false });
+      else if (s.kind === 'confirm') void cancelConfirm(s.tool);
       else backToList();
       return;
     }
@@ -162,6 +191,7 @@ export const CommandPalette: Component = () => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         if (s.kind === 'form') submitForm();
+        else if (s.kind === 'confirm') void run(s.tool, s.args, s.token);
         else if (s.kind === 'result') void run(s.tool, s.args);
       }
       return;
@@ -237,7 +267,9 @@ export const CommandPalette: Component = () => {
             spellcheck={false}
             onInput={(e) => {
               setQuery(e.currentTarget.value);
-              if (stage().kind !== 'list') setStage({ kind: 'list' });
+              const s = stage();
+              if (s.kind === 'confirm') void cancelConfirm(s.tool);
+              else if (s.kind !== 'list') setStage({ kind: 'list' });
             }}
           />
           <Show when={mode() !== 'all'}>
@@ -371,6 +403,34 @@ export const CommandPalette: Component = () => {
                     <span class={css.spacer} />
                     <Button variant="primary" kbd="⌘⏎" onClick={submitForm} disabled={!st().form.result().valid && st().form.touched().size > 0} ref={(n) => st().form.fields.length === 0 && queueMicrotask(() => n.focus())}>
                       {st().confirming ? 'Confirm' : 'Run'}
+                    </Button>
+                  </div>
+                </div>
+              );
+            }}
+          </Match>
+
+          <Match when={stage().kind === 'confirm' && stage()}>
+            {(s) => {
+              const st = () => s() as Extract<Stage, { kind: 'confirm' }>;
+              return (
+                <div class={css.stage}>
+                  <div class={css.stageHead}>
+                    <span class={css.name}>{st().tool.name}</span>
+                    <span class={css.desc}>{st().tool.description}</span>
+                  </div>
+                  <div class={css.confirm} role="alert">
+                    {st().prompt}
+                  </div>
+                  <div class={css.stageFoot}>
+                    <button type="button" class={css.ghostBtn} onClick={() => void cancelConfirm(st().tool)}>
+                      <Icon name="chevron-right" size={12} style={{ transform: 'rotate(180deg)' }} />
+                      Cancel
+                      <Kbd>esc</Kbd>
+                    </button>
+                    <span class={css.spacer} />
+                    <Button variant="primary" kbd="⌘⏎" onClick={() => void run(st().tool, st().args, st().token)} ref={(n) => queueMicrotask(() => n.focus())}>
+                      Confirm
                     </Button>
                   </div>
                 </div>

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMockBus } from '~/bus/mock';
 import type { BusClient, ToolDef } from '~/bus/types';
 import { createAppStore } from './app';
-import { caInstallArgs, caPillWord, isCACancelled, parseCATrust, type CATrustStatus } from './caTrust';
+import { caInstallArgs, caPillWord, isCACancelled, isCATrustTool, parseCATrust, type CATrustStatus } from './caTrust';
 
 /** `ca.status` as the core answers it on a Mac with the CA in the login keychain and trusted. */
 const MAC_TRUSTED = {
@@ -17,6 +17,12 @@ const MAC_TRUSTED = {
   fingerprint_sha1: '12:34',
   stores: { user: { installed: 'present', trusted: 'yes', location: 'x' } },
   detail: [],
+};
+
+/** The same Mac before `security verify-cert` could say anything: every store `trusted: unknown`. */
+const MAC_ALL_UNKNOWN = {
+  ...MAC_TRUSTED,
+  stores: { user: { installed: 'present', trusted: 'unknown', location: 'x' }, system: { installed: 'absent', trusted: 'unknown', location: 'y' } },
 };
 
 const trusted: CATrustStatus = { trusted: true, scope: 'user', platform: 'macos', fingerprint: 'AB:CD' };
@@ -67,6 +73,7 @@ describe('caPillWord', () => {
     expect(caPillWord(notTrusted, true)).toBe('· CA trusting…');
     expect(caPillWord(null, true)).toBe('· CA trusting…');
     expect(caPillWord(null, false)).toBeNull();
+    expect(caPillWord(parseCATrust(MAC_ALL_UNKNOWN), false)).toBeNull();
   });
 });
 
@@ -80,10 +87,23 @@ describe('caInstallArgs', () => {
 });
 
 describe('isCACancelled', () => {
-  it('recognises the core’s cancelled message and nothing else', () => {
+  it('recognises the core’s cancelled message for both verbs and nothing else', () => {
     expect(isCACancelled('ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted')).toBe(true);
+    expect(isCACancelled('ca.uninstall cancelled: the macOS authentication dialog was dismissed; the CA is still trusted')).toBe(true);
     expect(isCACancelled('ca.install refused: ca.install is refused from an agent frontend')).toBe(false);
+    expect(isCACancelled('ca.status cancelled')).toBe(false);
+    expect(isCACancelled('the ca.install cancelled message, quoted')).toBe(false);
     expect(isCACancelled('')).toBe(false);
+  });
+});
+
+describe('isCATrustTool', () => {
+  it('names exactly the two calls that change the OS trust store', () => {
+    expect(isCATrustTool('ca.install')).toBe(true);
+    expect(isCATrustTool('ca.uninstall')).toBe(true);
+    expect(isCATrustTool('ca.status')).toBe(false);
+    expect(isCATrustTool('ca.export')).toBe(false);
+    expect(isCATrustTool('')).toBe(false);
   });
 });
 
@@ -145,7 +165,7 @@ describe('app store — CA trust', () => {
     const bus = caBus(() => MAC_TRUSTED, { withTool: false });
     const app = start(bus);
     await tick(200);
-    await app.refreshCA();
+    await expect(app.refreshCA()).resolves.toBe(false);
     expect(bus.reads()).toBe(0);
     expect(app.ca).toBeNull();
   });
@@ -158,16 +178,16 @@ describe('app store — CA trust', () => {
     expect(app.ca).toEqual(notTrusted);
 
     reply = MAC_TRUSTED;
-    await app.refreshCA();
+    await expect(app.refreshCA()).resolves.toBe(true);
     expect(bus.reads()).toBe(2);
     expect(app.ca).toEqual(trusted);
 
     reply = { ...MAC_TRUSTED, stores: { user: { installed: 'present', trusted: 'unknown', location: 'x' } } };
-    await app.refreshCA();
+    await expect(app.refreshCA()).resolves.toBe(true);
     expect(app.ca).toBeNull();
   });
 
-  it('keeps the last reading when the re-read fails', async () => {
+  it('keeps the last reading when the re-read fails, and says so', async () => {
     let fail = false;
     const bus = caBus(() => {
       if (fail) throw new Error('ca.status: bus closed (1006)');
@@ -176,7 +196,7 @@ describe('app store — CA trust', () => {
     const app = start(bus);
     await tick(200);
     fail = true;
-    await app.refreshCA();
+    await expect(app.refreshCA()).resolves.toBe(false);
     expect(app.ca).toEqual(trusted);
   });
 

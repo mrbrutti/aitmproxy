@@ -916,16 +916,19 @@ export function createAppStore(bus: BusClient) {
     }
 
     /**
-     * Re-read `ca.status` into `ca` (D17.5). A missing tool leaves the reading untouched; a failed
-     * read keeps the last one. Each read costs the core one trust evaluation per store, so it runs
-     * only at bootstrap and after a `ca.install` / `ca.uninstall` run, not on every side refresh.
+     * Re-read `ca.status` into `ca` (D17.5); true when the read-back landed. A missing tool leaves
+     * the reading untouched and a failed read keeps the last one, both false, so the caller that
+     * just changed the trust store can say the word may be stale. Each read costs the core one
+     * trust evaluation per store, so it runs only at bootstrap and after a `ca.install` /
+     * `ca.uninstall` run, not on every side refresh.
      */
-    async function refreshCA() {
-      if (!proxy.tools.some((t) => t.name === 'ca.status')) return;
+    async function refreshCA(): Promise<boolean> {
+      if (!proxy.tools.some((t) => t.name === 'ca.status')) return false;
       try {
         setCaStatus(parseCATrust(await bus.call<CAStatusWire>('ca.status')));
+        return true;
       } catch {
-        /* keep the last reading */
+        return false;
       }
     }
 

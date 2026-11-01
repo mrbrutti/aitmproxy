@@ -2,6 +2,8 @@
 // pill word of the D17.6 table, the scope argument of D17.1 and the cancelled message of D17.4.
 // Pure, so the words are unit-tested; `state/app.ts` only wires the reads.
 
+import { isRecord } from '~/lib/isRecord';
+
 export interface CATrustStatus {
   /** A store reports `trusted: yes`. */
   trusted: boolean;
@@ -12,8 +14,6 @@ export interface CATrustStatus {
   /** `fingerprint_sha256`, colon-separated uppercase hex; null without a certificate. */
   fingerprint: string | null;
 }
-
-const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 /**
  * The status a `ca.status` reply amounts to, or null when it is not that shape or no store
@@ -53,7 +53,10 @@ export function caInstallArgs(s: CATrustStatus | null): Record<string, unknown> 
   return s && (s.platform === 'macos' || s.platform === 'windows') ? { scope: 'user' } : {};
 }
 
-/** The core's reply when the operator dismissed the OS authentication dialog (D17.4). */
+/** The two calls that change the OS trust store: the palette holds the in-flight word around them and re-reads `ca.status` after (D17.5, D17.12). */
+export const isCATrustTool = (name: string): boolean => name === 'ca.install' || name === 'ca.uninstall';
+
+/** The core's reply when the operator dismissed the OS authentication dialog (D17.4), for either verb. */
 export function isCACancelled(message: string): boolean {
-  return message.startsWith('ca.install cancelled');
+  return /^ca\.(install|uninstall) cancelled/.test(message);
 }
