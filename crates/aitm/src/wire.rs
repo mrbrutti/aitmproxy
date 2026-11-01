@@ -32,10 +32,12 @@ use aitm_plugins::{
     MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin, SubscriptionPlugin,
 };
 use aitm_proto_http::{CertAuthority, HttpModule};
-use aitm_proto_l4::config::L4Config;
+use aitm_proto_l4::config::{L4Config, RequestMode};
 use aitm_proto_l4::flow::L4FlowStore;
 use aitm_proto_l4::guard::L4Guard;
-use aitm_proto_l4::{L4Module, L4Privilege};
+use aitm_proto_l4::privilege::report::{Capability, PrivilegeReport};
+use aitm_proto_l4::privilege::state::{startup_line, PrivilegeConfig, ProcessLifetime};
+use aitm_proto_l4::{L4Module, L4Privilege, PrivilegePlugin, PrivilegeState};
 use aitm_proto_ws::{InjectRegistry, WsModule};
 use aitm_sysproxy::plugin::SysProxyPlugin;
 use aitm_sysproxy::{SystemProxy, SystemProxyConfig};
@@ -61,9 +63,23 @@ pub struct Features {
     /// false by default, so the default feature set registers no `l4.*` command.
     /// When enabled, the module is registered on the live core (M5-AC17).
     pub l4: L4Config,
-    /// An explicit L4 capability-probe result. `None` (production default) runs the
-    /// real cheap startup probe; tests force a known privilege state here.
+    /// An explicit, **fixed** L4 capability-probe result for tests that pin the
+    /// literal reason strings they pass in (plan P1b.7 Review-log deviation):
+    /// `Some` builds the module over the `Fixed` constructors. `None` (production
+    /// and every default) builds it over the live [`Features::l4_privilege_state`].
     pub l4_privilege: Option<L4Privilege>,
+    /// The shared live privilege state (privilege spec §2.1): the one `l4.privilege`
+    /// answers from, `L4Gated` reads per call, the status verbs carry, and whose
+    /// routed backend every production wire verb holds. `None` (every caller using
+    /// `..Features::default()`) ⇒ assembly builds one from [`Features::l4`] and
+    /// [`Features::l4_lifetime`]; the binary builds it first (so the scripting
+    /// engine's `L4Language` takes `state.backend()`) and passes `Some`.
+    pub l4_privilege_state: Option<Arc<PrivilegeState>>,
+    /// How long this process lives, for the state assembly builds when
+    /// [`Features::l4_privilege_state`] is `None`: `Serving` by default; the
+    /// one-shot CLI path is `OneShot` (spec §2.4, a one-shot command cannot host
+    /// a helper session).
+    pub l4_lifetime: ProcessLifetime,
     /// A pre-built, shared L4 guard + flow store the `l4.*` command module must act
     /// over. `None` (every caller using `..Features::default()`) ⇒ the module builds
     /// its own; `Some` ⇒ the binary already built the state and installed a live
@@ -110,6 +126,8 @@ impl Default for Features {
             ca_plugin: None,
             l4: L4Config::default(),
             l4_privilege: None,
+            l4_privilege_state: None,
+            l4_lifetime: ProcessLifetime::Serving,
             l4_shared: None,
             l4_self_ports: Vec::new(),
             macos_capture: MacosCaptureConfig::default(),
@@ -501,41 +519,61 @@ pub fn assemble_with_scripts(
         builder = builder.register_plugin(commands);
     }
 
+    // The shared live privilege state (privilege spec §2.1, plan P1b.15): built here
+    // from the L4 config unless the binary built it first (so the scripting engine's
+    // `L4Language` already holds `state.backend()`). Building it probes nothing; the
+    // first `report()` does.
+    let privilege_state = features.l4_privilege_state.clone().unwrap_or_else(|| {
+        Arc::new(PrivilegeState::new(&PrivilegeConfig {
+            enabled: features.l4.enabled,
+            l4: features.l4.privilege.clone(),
+            lifetime: features.l4_lifetime,
+        }))
+    });
+    // `l4.privilege` and `l4.privilege.request` are registered whether or not
+    // `l4.enabled` (spec §2.2, L4PRIV-AC2), so a frontend can always ask and read
+    // "L4 is off in this core's config"; with L4 off the request answers
+    // `cannot_prompt` and these are the only `l4.*` names.
+    builder = builder.register_plugin(Box::new(PrivilegePlugin::new(Arc::clone(&privilege_state))));
+
     // L4 (raw packet) module: opt-in and fail-closed (M5-AC17). When disabled, it is
-    // not constructed and no `l4.*` command is registered. When enabled, it is always
-    // registered — even without the capture/inject or in-path privilege — so the
-    // operator who opted in sees an honest, drivable surface; the wire-touching verbs
-    // then fail closed with the specific missing-capability reason, cached from a
-    // cheap startup probe. The pure/read verbs work regardless. Registered before
-    // `build()` (which consumes the builder).
+    // not constructed and no other `l4.*` command is registered. When enabled, it is
+    // always registered — even without the capture/inject or in-path privilege — so
+    // the operator who opted in sees an honest, drivable surface; the wire-touching
+    // verbs then fail closed with the specific missing-capability reason, read from
+    // the live state on every call (so a later approval is seen without a restart,
+    // L4PRIV-AC7). The pure/read verbs work regardless. Registered before `build()`
+    // (which consumes the builder).
     // Capture the L4 module's guard + store before `build()` consumes the module via
     // `register_plugin`; the L4/UDP half of the capture ingress is bound to them below.
     let mut l4_half = None;
     if features.l4.enabled {
-        let privilege = features
-            .l4_privilege
-            .clone()
-            .unwrap_or_else(L4Privilege::probe);
-        match (&privilege.capture_inject, &privilege.intercept) {
-            (None, None) => info!("L4 enabled; capture/inject and in-path privilege present"),
-            (ci, ip) => warn!(
-                capture_inject = ci.as_deref().unwrap_or("present"),
-                in_path = ip.as_deref().unwrap_or("present"),
-                "L4 enabled but some privilege is absent; affected l4.* commands will report \
-                 L4Unavailable"
-            ),
-        }
-        // When the binary pre-built the L4 state (so the scripting engine's live
-        // `L4Language` shares it), build the module over that same guard + store;
-        // otherwise the module owns its own. Either way the privilege gate stands.
-        let module = match &features.l4_shared {
-            Some(shared) => L4Module::with_shared(
+        // The module rides the binary's pre-built guard + store when there is one
+        // (so the scripting engine's live `L4Language` shares it), else its own.
+        // Either way the privilege gate stands: over the live state in production,
+        // or over the fixed probe result a test forced (P1b.7 Review-log deviation:
+        // those tests pin the literal reason strings they pass in).
+        let module = match (&features.l4_privilege, &features.l4_shared) {
+            (None, Some(shared)) => {
+                log_l4_startup(&privilege_state);
+                L4Module::with_shared_state(
+                    shared.guard.clone(),
+                    shared.store.clone(),
+                    features.l4.intercept.clone(),
+                    Arc::clone(&privilege_state),
+                )
+            }
+            (None, None) => {
+                log_l4_startup(&privilege_state);
+                L4Module::with_state(&features.l4, Arc::clone(&privilege_state))
+            }
+            (Some(fixed), Some(shared)) => L4Module::with_shared(
                 shared.guard.clone(),
                 shared.store.clone(),
                 features.l4.intercept.clone(),
-                privilege,
+                fixed.clone(),
             ),
-            None => L4Module::with_privilege(&features.l4, privilege),
+            (Some(fixed), None) => L4Module::with_privilege(&features.l4, fixed.clone()),
         };
         // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports —
         // the proxy and browser-proxy ports from `cfg`, plus the bus / web UI / MCP
@@ -764,6 +802,33 @@ pub fn self_port_hook(guard: Arc<L4Guard>) -> BoundHook {
     Box::new(move |addr: std::net::SocketAddr| {
         guard.add_self_ports([addr.port()]);
     })
+}
+
+/// The one L4 start-up log line (spec Constraints "Quiet logs", §2.4, L4PRIV-AC24):
+/// with L4 enabled and packet capture needing approval, exactly one `warn` carrying
+/// the remedy's label (`startup_line`, never a command, never a token); with
+/// capture available, one `info`. Any other state (unsupported platform) logs
+/// nothing here: the status verbs and `l4.privilege` say why.
+fn log_l4_startup(state: &PrivilegeState) {
+    let report = state.report();
+    match startup_line(&report) {
+        Some(line) => warn!("{line}"),
+        None => {
+            if matches!(report.capture, Capability::Available { .. }) {
+                info!("L4 enabled; capture/inject privilege present");
+            }
+        }
+    }
+}
+
+/// Spec §2.4 `l4.privilege.request: at_start` (plan P1b.15): whether the core
+/// asks for the packet-capture privilege itself, once, right after assembly.
+/// True only when the operator wrote `at_start` into the config (so the ask is
+/// an operator act) AND capture currently `needs_approval`; `manual` never asks,
+/// and an `available` or `unsupported` capture has nothing to ask for.
+#[must_use]
+pub fn should_request_at_start(mode: RequestMode, report: &PrivilegeReport) -> bool {
+    mode == RequestMode::AtStart && matches!(report.capture, Capability::NeedsApproval { .. })
 }
 
 #[cfg(test)]
@@ -1095,6 +1160,104 @@ mod tests {
         let guard = assembled.l4_guard.expect("l4 enabled exposes the guard");
         assert_eq!(guard.self_ports(), vec![27431, 28180, 28181, 28182]);
         let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// The `l4.*` names in a proxy's registry, sorted.
+    fn l4_names(proxy: &Proxy) -> Vec<String> {
+        let mut names: Vec<String> = proxy
+            .registry()
+            .commands()
+            .map(|c| c.name().to_string())
+            .filter(|n| n.starts_with("l4."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Privilege spec §2.2 / L4PRIV-AC2 (plan P1b.15): the two privilege verbs
+    /// are registered by the binary whether or not `l4.enabled`, so a frontend
+    /// can always ask "is L4 off in this core's config?"; with L4 off they are
+    /// the ONLY `l4.*` names (the module itself is not constructed, M5-AC17).
+    #[test]
+    fn privilege_verbs_registered_with_l4_off() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("priv-verbs-l4-off");
+        let proxy = build_proxy_with(&cfg, &Features::default()).expect("build, l4 disabled");
+        assert_eq!(
+            l4_names(&proxy),
+            vec![
+                "l4.privilege".to_string(),
+                "l4.privilege.request".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// Plan P1b.15: with L4 enabled the registry carries the module's 22 parity
+    /// names plus the two privilege verbs. The module registers 22 today
+    /// (`aitm-proto-l4/tests/surface.rs::L4_COMMANDS`); the plan's "25 + 2 = 27"
+    /// counted parity verbs that have not landed on this branch, so this pins
+    /// 22 + 2 = 24 (P1b.16 moves the three tool-contract pins by the same +2).
+    #[test]
+    fn l4_on_registers_24_l4_names() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("priv-verbs-l4-on");
+        let features = Features {
+            l4: L4Config {
+                enabled: true,
+                ..L4Config::default()
+            },
+            l4_privilege: Some(L4Privilege::available()),
+            ..Features::default()
+        };
+        let proxy = build_proxy_with(&cfg, &features).expect("build, l4 enabled");
+        let names = l4_names(&proxy);
+        assert_eq!(names.len(), 24, "l4.* names: {names:?}");
+        for verb in [
+            "l4.privilege",
+            "l4.privilege.request",
+            "l4.craft",
+            "l4.inject",
+        ] {
+            assert!(names.iter().any(|n| n == verb), "{verb} missing: {names:?}");
+        }
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// A macOS `PrivilegeReport` derived from one table row, built in the test.
+    fn mac_report(bpf_rw_opens: bool) -> aitm_proto_l4::privilege::report::PrivilegeReport {
+        use aitm_proto_l4::privilege::derive::{derive, MacInputs, ProbeInputs};
+        use aitm_proto_l4::privilege::report::Platform;
+        derive(&ProbeInputs {
+            enabled: true,
+            platform: Platform::Macos,
+            mac: Some(MacInputs {
+                bpf_rw_opens,
+                receipt: None,
+                handoff_app_embeds_helper: false,
+            }),
+            linux: None,
+            request: None,
+            now_ms: 1_762_000_000_000,
+        })
+    }
+
+    /// Spec §2.4 `at_start` (plan P1b.15): the core asks once at start only when
+    /// the operator configured `at_start` AND capture needs approval. `manual`
+    /// never asks; an already-available capture has nothing to ask for.
+    #[test]
+    fn at_start_requests_only_when_capture_needs_approval() {
+        use aitm_proto_l4::config::RequestMode;
+        use aitm_proto_l4::privilege::report::Capability;
+        let row6 = mac_report(false);
+        assert!(matches!(row6.capture, Capability::NeedsApproval { .. }));
+        let available = mac_report(true);
+        assert!(matches!(available.capture, Capability::Available { .. }));
+
+        assert!(should_request_at_start(RequestMode::AtStart, &row6));
+        assert!(!should_request_at_start(RequestMode::Manual, &row6));
+        assert!(!should_request_at_start(RequestMode::AtStart, &available));
+        assert!(!should_request_at_start(RequestMode::Manual, &available));
     }
 
     /// `Assembled::governance` hands out the assembly's own `agent_state` and

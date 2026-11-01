@@ -28,7 +28,8 @@ use aitm::scripts::LateHandles;
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{
-    assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
+    assemble_with_scripts, build_capture_session, self_port_hook, should_request_at_start,
+    Assembled, Features, ScriptWiring,
 };
 use aitm::{config_file, env, operator_token, tui};
 use aitm_core::{
@@ -36,6 +37,8 @@ use aitm_core::{
 };
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
+use aitm_proto_l4::privilege::state::{PrivilegeConfig, ProcessLifetime};
+use aitm_proto_l4::PrivilegeState;
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
 use aitm_sysproxy::{Recovery, SystemProxy};
 use tokio::net::TcpListener;
@@ -355,8 +358,27 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
     // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
     // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
-    // binary-owned feature set below; `l4_privilege: None` runs the real startup probe.
+    // binary-owned feature set below over the live privilege state built here.
     env::apply_l4(&mut l4, |k| std::env::var(k).ok());
+    // The one shared privilege state (privilege spec §2.1, plan P1b.15): the
+    // scripting engine's `L4Language`, the `l4.*` command module, the status verbs
+    // and `l4.privilege` all read it, so a later approval is seen everywhere without
+    // a restart (L4PRIV-AC7). A one-shot `aitm <verb>` exits before a helper could
+    // serve it, so its lifetime is `OneShot` (spec §2.4); every serving mode is
+    // `Serving`. Building it probes nothing; the first `report()` does.
+    let l4_lifetime = match mode {
+        Mode::Cli(_) => ProcessLifetime::OneShot,
+        Mode::Server
+        | Mode::Tui
+        | Mode::Web
+        | Mode::OperatorToken { .. }
+        | Mode::SysproxyWatchdog { .. } => ProcessLifetime::Serving,
+    };
+    let privilege_state = Arc::new(PrivilegeState::new(&PrivilegeConfig {
+        enabled: l4.enabled,
+        l4: l4.privilege.clone(),
+        lifetime: l4_lifetime,
+    }));
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
     rhai_cfg.ssrf = cfg.browser.ssrf.clone();
@@ -400,10 +422,12 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         guard: Arc::new(aitm_proto_l4::guard::L4Guard::new(&l4)),
         store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
     });
+    // The language's wire verbs hold the state's routed backend (spec §2.1: every
+    // production caller takes `state.backend()`), never a bare `PcapBackend`.
     let l4_language = l4_shared.as_ref().map(|shared| {
         aitm_proto_l4::L4Language::new(
             shared.guard.clone(),
-            Arc::new(aitm_proto_l4::backend::pcap::PcapBackend::new()),
+            privilege_state.backend(),
             shared.store.clone(),
         )
     });
@@ -477,6 +501,10 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     let features = Features {
         l4,
         l4_shared,
+        // The live privilege state built above, so assembly registers the privilege
+        // verbs and gates the module over the SAME state the `L4Language` holds.
+        l4_privilege_state: Some(Arc::clone(&privilege_state)),
+        l4_lifetime,
         macos_capture,
         // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports the
         // config already names — the web UI port (`aitm web` only) and the agent
@@ -561,6 +589,20 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Spec §2.4 `l4.privilege.request: at_start`: the operator wrote it into the
+    // config, so the serving core asks for the packet-capture privilege itself,
+    // once, when capture needs approval (`should_request_at_start`). Non-blocking:
+    // the platform action is handed off (macOS app) or spawned (Linux pkexec) and
+    // the outcome is logged once; the message is the state's own (a remedy label
+    // or progress text), never a token. A one-shot process returned above.
+    if should_request_at_start(features.l4.privilege.request, &privilege_state.report()) {
+        let requested = privilege_state.request();
+        info!(
+            outcome = requested.outcome.as_str(),
+            "L4 privilege requested at start: {}", requested.message
+        );
     }
 
     // Pre-bind every service port up front, before obscura is spawned and before
