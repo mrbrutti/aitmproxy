@@ -18,3 +18,11 @@ aitm-proto-l4.workspace = true
 
 [lints]
 workspace = true
+
+# Unified-log line for the macOS permission modes (plan P2.4, spec §3.1 step 6):
+# subsystem `com.mrbrutti.aitmproxy.l4-helper`. Only the raw `OsLog` type is
+# used, so the `log`-facade/`logger` default features (and their `dashmap`
+# dependency) are off. The crate's own FFI `unsafe` stays internal; this crate
+# keeps the workspace `unsafe_code = "forbid"`.
+[target.'cfg(target_os = "macos")'.dependencies]
+oslog = { version = "0.2.0", default-features = false }
