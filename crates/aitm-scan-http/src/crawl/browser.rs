@@ -95,22 +95,25 @@ impl Crawler for BrowserCrawler {
     }
 }
 
-/// What the store held before a browser action, so the flows that action
-/// produced can be told apart from everything else in it.
+/// What the store held before this page's browser actions, so the flows each
+/// action produced can be told apart from everything else in it.
 ///
 /// A browser navigation is a real capture through the proxy listener, so the
-/// job's own client never sees it and cannot mark it. The lane brackets each
-/// action with a snapshot and a [`StoreDiff::mark_new`], which is the whole of
-/// spec **D5**'s "the lane diffs the store around each navigation".
+/// job's own client never sees it and cannot mark it. The lane takes one
+/// snapshot per page and calls [`StoreDiff::mark_new`] after each action on
+/// that page, which is the whole of spec **D5**'s "the lane diffs the store
+/// around each navigation". The snapshot is the O(store) step; every id a
+/// `mark_new` sees joins `seen`, so the later actions of a page diff against a
+/// running set instead of re-listing the store each time (S-M6).
 pub(crate) struct StoreDiff {
-    before: HashSet<FlowId>,
+    seen: HashSet<FlowId>,
 }
 
 impl StoreDiff {
     /// The ids the store holds right now.
     pub(crate) fn snapshot(store: &dyn FlowStore) -> Self {
         Self {
-            before: store.list().into_iter().collect(),
+            seen: store.list().into_iter().collect(),
         }
     }
 
@@ -118,19 +121,20 @@ impl StoreDiff {
     /// `origin`, and return those flows as the store now holds them, each as a
     /// [`held_copy`] with its response body bounded (S-I3).
     ///
-    /// Marks are a union: a flow that somehow falls in two windows keeps one
-    /// copy of each mark. A flow to another origin is left alone — the browser
-    /// fetches fonts, analytics and CDN assets while it renders, and those are
-    /// not this job's traffic.
+    /// Every id this call sees joins the running set, so the next call on the
+    /// same page reports only what arrived after it. Marks are a union: a
+    /// flow that already carries one keeps one copy of each. A flow to another
+    /// origin is left alone — the browser fetches fonts, analytics and CDN
+    /// assets while it renders, and those are not this job's traffic.
     pub(crate) fn mark_new(
-        &self,
+        &mut self,
         store: &dyn FlowStore,
         origin: &Url,
         marks: &[String],
     ) -> Vec<HttpFlow> {
         let mut produced = Vec::new();
         for id in store.list() {
-            if self.before.contains(&id) {
+            if !self.seen.insert(id) {
                 continue;
             }
             let Some(Flow::Http(flow)) = store.get(id) else {
@@ -464,6 +468,9 @@ struct Run<'a> {
     marks: Vec<String>,
     /// Pages the scope guard refused after the first one.
     guard_refused: u32,
+    /// The store diff of the page being worked: one snapshot per page, then a
+    /// running set across its navigation, submissions, clicks and returns.
+    page_diff: StoreDiff,
 }
 
 impl<'a> Run<'a> {
@@ -484,6 +491,9 @@ impl<'a> Run<'a> {
             report: CrawlReport::default(),
             marks: vec![job_mark(job.job_id()), MARK_CRAWL.to_string()],
             guard_refused: 0,
+            page_diff: StoreDiff {
+                seen: HashSet::new(),
+            },
         }
     }
 
@@ -538,13 +548,15 @@ impl<'a> Run<'a> {
             return Ok(Step::Stop("budget"));
         }
 
-        let diff = StoreDiff::snapshot(self.store.as_ref());
+        // The one O(store) step of this page (S-M6): every later action on
+        // it diffs against the running set `collect` extends.
+        self.page_diff = StoreDiff::snapshot(self.store.as_ref());
         let outcome = bounded(self.job, self.browser.navigate(page.as_str())).await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.guard.record_error(&authority);
-                self.collect(&diff);
+                self.collect();
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -559,7 +571,7 @@ impl<'a> Run<'a> {
         let Some(landed) = self.in_scope(&outcome.final_url) else {
             // The browser is on that page now; the next click would be a click
             // on a third party.
-            self.collect(&diff);
+            self.collect();
             tracing::info!(
                 target: "scan",
                 job = self.job.job_id(),
@@ -574,7 +586,7 @@ impl<'a> Run<'a> {
         let dom = match bounded(self.job, self.browser.get_dom()).await {
             Ok(dom) => dom,
             Err(err) => {
-                self.collect(&diff);
+                self.collect();
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -588,7 +600,7 @@ impl<'a> Run<'a> {
         // The permit covered the navigation and the DOM read; the per-page work
         // that follows takes its own as it goes.
         drop(permit);
-        self.collect(&diff);
+        self.collect();
 
         // A page already seen under another URL is counted but not mined again.
         let dom = truncate(&dom, MAX_DOM_BYTES);
@@ -685,10 +697,9 @@ impl<'a> Run<'a> {
             if !self.job.charge(1) {
                 return Ok(Step::Stop("budget"));
             }
-            let diff = StoreDiff::snapshot(self.store.as_ref());
             let submitted = bounded(self.job, self.browser.eval(&submit_form_js(form.index))).await;
             if let Err(err) = submitted {
-                self.collect(&diff);
+                self.collect();
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -700,7 +711,7 @@ impl<'a> Run<'a> {
             }
             let landing = self.settle().await;
             self.report.forms_submitted = self.report.forms_submitted.saturating_add(1);
-            self.collect(&diff);
+            self.collect();
 
             match self.landed_page(landing.as_deref(), page, depth).await? {
                 Step::Continue => {}
@@ -788,14 +799,13 @@ impl<'a> Run<'a> {
             if !self.job.charge(1) {
                 return Ok(Step::Stop("budget"));
             }
-            let diff = StoreDiff::snapshot(self.store.as_ref());
             let clicked = bounded(
                 self.job,
                 self.browser.click(ClickTarget::Selector(selector.clone())),
             )
             .await;
             if let Err(err) = clicked {
-                self.collect(&diff);
+                self.collect();
                 tracing::debug!(
                     target: "scan",
                     job = self.job.job_id(),
@@ -807,7 +817,7 @@ impl<'a> Run<'a> {
             }
             let landing = self.settle().await;
             self.report.clicks = self.report.clicks.saturating_add(1);
-            self.collect(&diff);
+            self.collect();
 
             match self.landed_page(landing.as_deref(), page, depth).await? {
                 Step::Continue => {}
@@ -877,9 +887,8 @@ impl<'a> Run<'a> {
         if !self.job.charge(1) {
             return Ok(Step::Stop("budget"));
         }
-        let diff = StoreDiff::snapshot(self.store.as_ref());
         let outcome = bounded(self.job, self.browser.navigate(page.as_str())).await;
-        self.collect(&diff);
+        self.collect();
         match outcome {
             Ok(_) => Ok(Step::Continue),
             Err(err) => {
@@ -959,9 +968,12 @@ impl<'a> Run<'a> {
         Some(url)
     }
 
-    /// Mark what the last action captured and keep those flows for the lane.
-    fn collect(&mut self, diff: &StoreDiff) {
-        let produced = diff.mark_new(self.store.as_ref(), self.origin, &self.marks);
+    /// Mark what the last action on this page captured and keep those flows
+    /// for the lane.
+    fn collect(&mut self) {
+        let produced = self
+            .page_diff
+            .mark_new(self.store.as_ref(), self.origin, &self.marks);
         self.report.flows.extend(produced);
     }
 
@@ -1164,6 +1176,16 @@ mod tests {
             }
         }
         assert_eq!(report.flows.len(), store.count() - 1);
+        // Each produced flow is reported exactly once (S-M6: no double marking
+        // across the actions of one page, no missed flow).
+        let reported: HashSet<FlowId> = report.flows.iter().map(|flow| flow.id).collect();
+        let expected: HashSet<FlowId> = store
+            .list()
+            .into_iter()
+            .filter(|id| *id != before)
+            .collect();
+        assert_eq!(reported.len(), report.flows.len());
+        assert_eq!(reported, expected);
     }
 
     /// The driving sequence `browser_crawl_pins` pins.
@@ -1609,7 +1631,7 @@ mod tests {
         let store = Arc::new(MemFlowStore::new());
         let old = store.insert(Flow::Http(capture("http://t:8080/old")));
 
-        let diff = StoreDiff::snapshot(store.as_ref());
+        let mut diff = StoreDiff::snapshot(store.as_ref());
         let fresh = store.insert(Flow::Http(capture("http://t:8080/new")));
         let foreign = store.insert(Flow::Http(capture("http://other:9/x")));
 
@@ -1625,10 +1647,22 @@ mod tests {
             assert!(flow.metadata.marks.is_empty(), "flow {untouched:?}");
         }
 
-        // Marks are a union, so marking the same flow twice does not duplicate.
+        // S-M6: one snapshot serves every action on a page. A second action's
+        // flow is the only thing the second diff reports: `fresh` is neither
+        // re-reported nor re-marked, and nothing is missed.
+        let later = store.insert(Flow::Http(capture("http://t:8080/later")));
         let again = diff.mark_new(store.as_ref(), &url(ROOT), &marks());
         assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, later);
         assert_eq!(again[0].metadata.marks, marks());
+        let Some(Flow::Http(first)) = store.get(fresh) else {
+            panic!("the double stores HTTP flows");
+        };
+        assert_eq!(first.metadata.marks, marks());
+        // A third diff with nothing new reports nothing.
+        assert!(diff
+            .mark_new(store.as_ref(), &url(ROOT), &marks())
+            .is_empty());
     }
 
     #[test]
