@@ -25,6 +25,7 @@ public enum ConnectionAction: Hashable, Sendable {
     case reconnectBus, openBusSettings
     case turnCaptureOn, turnCaptureOff, openScope, approveInSystemSettings, uninstallExtension, openCaptureSettings
     case openBrowser, copyListenAddress
+    case trustCA, openCAPanel
 
     /// The button title (title case; an ellipsis where another view opens).
     public var title: String {
@@ -43,6 +44,8 @@ public enum ConnectionAction: Hashable, Sendable {
         case .openCaptureSettings: "All Apps Settings…"
         case .openBrowser: "Open Browser"
         case .copyListenAddress: "Copy Address"
+        case .trustCA: "Trust the aitmproxy CA"
+        case .openCAPanel: "Certificate Authority…"
         }
     }
 
@@ -102,7 +105,7 @@ public struct ConnectionLane: Hashable, Sendable {
 /// or has one action that makes it true. Done rows stay — the list is live state, not a tour.
 public struct GettingStartedStep: Hashable, Sendable {
     public enum Kind: String, Hashable, Sendable, CaseIterable {
-        case coreRunning, busConnected, extensionOn, scopeSet, firstFlow
+        case coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow
     }
 
     public let kind: Kind

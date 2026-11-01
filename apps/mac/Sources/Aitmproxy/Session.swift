@@ -223,6 +223,23 @@ final class Session {
     /// The last failed action, shown in the status bar until the next one succeeds.
     var lastError: String?
 
+    // MARK: CA trust (spec D17; the actions live in Session+CATrust.swift)
+
+    /// The last `ca.status` read-back: the poll's first tick and every 10th, and forced after
+    /// every trust change. `nil` until read, and again while the bus is down.
+    var caStatus: CAStatus?
+    /// A `ca.install` / `ca.uninstall` call is in flight; `CATrustFacts.installing` reads it.
+    var caTrustInstalling = false
+    /// The last change came back `HeadlessAuth` (macOS) or `NeedsRoot` (Linux).
+    var caTrustNeedsAdmin = false
+    /// The last change's failure other than a cancelled dialog, with the verb it came from. The CA
+    /// panel shows it until a `ca.status` read-back says that verb's end state holds
+    /// (`CATrustFailure.resolved(by:)`, applied in `refreshCAStatus`), a later change succeeds or
+    /// is cancelled, or the bus goes (`forgetCATrust`).
+    var caTrustLastError: CATrustFailure?
+    /// The first-run sheet (Shell/SetupSheet.swift) is up.
+    var setupSheetVisible = false
+
     init() {
         pins = Pins.load(from: pinsURL)
         // The Scope page shows the embedded core's persisted scope before the bus

@@ -1,18 +1,22 @@
 # macOS app icons and display names for clients — implementation plan
 
-**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode)
+**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 (Review log)
 **Spec:** `docs/superpowers/specs/2026-10-31-mac-app-icons-and-names-design.md`
-(approved 2026-10-31, revision 2; acceptance criteria AI-AC1 … AI-AC24)
+(approved 2026-10-31, revision 2, amended 2026-11-01; acceptance criteria AI-AC1 … AI-AC24)
 **Branch / worktree:** this worktree, `claude/apps-attribution-8ab619`
-(`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), currently
-`main 5eac2a5` (PR #196, `claude/macos-connection-ux-rev2`, owner of `Shell/SidebarView.swift`
-and `Bus/BusService.swift`) + the research and spec commits. It ships as one PR to `main`.
+(`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), base `main 8e19c2e3`
+(PR #196 `5eac2a50` is the last owner of `Shell/SidebarView.swift` and `Bus/BusService.swift`; PR #197
+`9776a0e6` moved `Session.swift`'s navigation enums out).
+**PR shape:** two PRs from this branch — the traffic-route plan
+(`2026-10-31-mac-traffic-route-advice-plan.md`) ships **first**; this plan ships second and records that
+PR's merge SHA as gate 4. Its Tasks 5/6 share `Session.swift` / `Bus/BusService.swift` with the
+traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
 
-## Gate: nothing below starts until all three hold
+## Gate: nothing below starts until gates 1–3 hold; Tasks 5/6 also wait for gate 4
 
 1. **PR #195 `fix/ne-source-app` is on `main`** (`FlowSummary.sourceApp`, `FlowRow.client =
-   ClientInfo(sourceApp:)`, `ClientInfo.displayName(forSourceApp:)`). Record its merge SHA here:
-   `__________`. Every Kit task below calls `ClientInfo(sourceApp:)`; without it nothing compiles.
+   ClientInfo(sourceApp:)`, `ClientInfo.displayName(forSourceApp:)`). Merge SHA: **`3fe92f66`**
+   (released in v0.5.9). Every Kit task below calls `ClientInfo(sourceApp:)`; without it nothing compiles.
 2. **The fixture-removal PR is on `main` and this branch has rebased once onto its SHA**
    (record: `__________`). That PR deletes the mac app's fixture and sample-data modes
    (`Store.usesFixtures`, `APP_FIXTURES`/`APP_SNAPSHOT`, the Kit `Fixtures*.swift`,
@@ -22,6 +26,12 @@ and `Bus/BusService.swift`) + the research and spec commits. It ships as one PR 
 3. **The orchestrator session has approved the file claim** for `Shell/SidebarView.swift`,
    `Bus/BusService.swift`, `Session.swift`, `FlowTable/FlowCellView.swift` (the files PR #196 and
    the fixture-removal PR touched last).
+4. **The traffic-route PR is merged** (record its merge SHA here: `__________`) and this branch's
+   second PR is cut on top of it. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
+   have landed** — they share `Session.swift` (traffic-route: `systemProxy`, `decrypt`) and
+   `Bus/BusService.swift` (traffic-route: one `decrypt` line; PR D's `refreshCAStatus()` is also in
+   that file by then) — and never concurrently with them; whichever lands second rebases onto the
+   first. Tasks 1–4 and 7 do not wait for gate 4.
 
 Before Wave A the orchestrator runs the baseline gate once on the rebased tree (Swift gate below
 plus the three tripwires) so every later failure is attributable to this plan.
@@ -383,7 +393,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 
 - **Satisfies:** D4 (Session), D5, D7, D10 (sidebar rows); AI-AC13 (tripwires); proven live by
   AI-AC14, AI-AC15, AI-AC19, AI-AC20 (Task 8).
-- **Depends on:** Task 2 (`clientHost`, `ClientTree`, `Pins` mapping), Task 4 (`ClientMark`).
+- **Depends on:** Task 2 (`clientHost`, `ClientTree`, `Pins` mapping), Task 4 (`ClientMark`); **gate 4**
+  (the traffic-route PR merged; its Tasks 2/2b have edited `Session.swift` — this task rebases onto them).
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Session.swift` (modify)
   - `apps/mac/Sources/Aitmproxy/Shell/SidebarView.swift` (modify; claim approved per the gate)
@@ -413,7 +424,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       `"<name>, <count> flows[, pinned], expanded|collapsed"` plus `.accessibilityAction(named:)`
       "Expand"/"Collapse".
     - Under an expanded app (or, while querying, a matching app): one **domain sub-row** per
-      `session.hosts(forClient: key)` via `subItem(.clientHost(client: key, host: host), title: host, count: n, page: .apps, leadingInset: 52, mark: Monogram(text: "◎"))`,
+      `session.hosts(forClient: key)` via `subItem(.clientHost(client: key, host: host), title: host, count: n, page: .apps, leadingInset: 52, mark: { Monogram(text: "◎") })`,
       `.help(host)`, context menu "Pin Host"/"Unpin Host" (the `noun` for `.clientHost` is "Host").
       **Plan call (filter):** while querying, the sub-rows shown are the hosts matching the query;
       when the app matched only by name/key, all its hosts are shown. Matt may overturn.
@@ -423,7 +434,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       `.help(key)`; visible when the query matches the key or the current name; not expandable.
     - `subItem` signature becomes
       `private func subItem<Mark: View>(_ group: FlowGroup, title: String, count: Int?, page: SidebarPage, leadingInset: CGFloat = 28, help: String? = nil, @ViewBuilder mark: () -> Mark) -> some View`;
-      Domains rows and pinned hosts call it with `Monogram(text: "◎")` and the default inset —
+      Domains rows and pinned hosts call it with `mark: { Monogram(text: "◎") }` and the default inset —
       their rendering is unchanged.
     - `AppMark` is deleted. `Monogram` stays (hosts only).
     - Insets are `12`, `28`, `52` as literals derived from `Space` where a token exists
@@ -440,7 +451,9 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 ### Task 6: Poll-loop enrichment and the Client cell
 
 - **Satisfies:** D3, D6; AI-AC22 (diff shape); proven live by AI-AC17, AI-AC18, AI-AC21 (Task 8).
-- **Depends on:** Task 4 (`AppIdentityResolver`, `Tok.Glyph.process`).
+- **Depends on:** Task 4 (`AppIdentityResolver`, `Tok.Glyph.process`); **gate 4** (the traffic-route PR
+  merged; its one `BusService.swift` line and PR D's CA polling are already in the file — this task's
+  diff is still one added line on top of them).
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (modify; claim approved per the gate)
   - `apps/mac/Sources/Aitmproxy/FlowTable/FlowCellView.swift` (modify)
@@ -602,8 +615,10 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 | (no repo files; `/tmp/claude/icons-live/`) | | | | | | | | — |
 
 C = create, M = modify, G = regenerate. No file appears in two columns, so every wave's tasks can
-run as parallel Coders. Not touched by anyone: `AitmproxyKit/Flow.swift`,
-`AitmproxyKit/FlowSummary.swift`, `crates/**`, `apps/mac/Extension/**`.
+run as parallel Coders. Shared with the traffic-route plan on this branch: `Session.swift` and
+`Bus/BusService.swift` (its Tasks 2/2b) — that PR ships first; Tasks 5/6 here follow it (gate 4), never
+concurrently. Not touched by anyone: `AitmproxyKit/Flow.swift`, `AitmproxyKit/FlowSummary.swift`,
+`crates/**`, `apps/mac/Extension/**`.
 
 ## Acceptance-criteria coverage
 
@@ -638,8 +653,54 @@ run as parallel Coders. Not touched by anyone: `AitmproxyKit/Flow.swift`,
 
 Kept by the main session during stage 6. One row per finding.
 
+Rows dated 2026-11-01 are the stage-6 panel on docs PR #242 (range `dac90fe9..0bad920f`, merged as
+`7a5f8585`), which reviewed this plan together with the traffic-route plan; every finding is listed
+in both plans' logs, fixed in the follow-up docs PR from this branch.
+
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| docs #242 | spec | Critical | #1 (traffic-route) CA fact actions defined two incompatible ways | fixed in 644b9c90 in the traffic-route spec/plan: post-PR-D state everywhere (see that plan's log) |
+| docs #242 | spec | Important | #2 (traffic-route) TR-AC3 two action lists | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Important | #3 (traffic-route) D10 remedy suffix; `advice` list; Scope actions two ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Important | #4 (traffic-route) "Scope closed" derived two ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Important | #5 (traffic-route) numeric-string Port, no test | fixed in 644b9c90 (traffic-route; the test is PR #246's) |
+| docs #242 | spec | Important | #6 (traffic-route) Task 4 "Scan" anchor | superseded in 644b9c90: traffic-route Task 4 removed (`.openNetworkSettings` denied 2026-11-01) |
+| docs #242 | spec | Important | #7 (traffic-route) footprint exceeds the grant | fixed in 644b9c90 (traffic-route gate 2 records the orchestrator's 2026-11-01 answers) |
+| docs #242 | spec | Important | #8 this plan lacks the "traffic-route PR first" gate and the BusService/Session serialisation; both plans say "one PR" | fixed in 644b9c90: gate 4 added (traffic-route PR merged, SHA ___; Tasks 5/6 after traffic-route Tasks 2/2b); PR shape stated in both plans and the spec's Constraints |
+| docs #242 | spec | Minor | #9 (traffic-route) AC ordinals ≠ ids | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #10 (traffic-route) "16 cases" is 14 | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #11 (traffic-route) `.caTrust` step kind | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #12 (traffic-route) Task 1 declares vs PR D provides | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #13 (traffic-route) STORIES.md both ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #14 (traffic-route) `proxy.system.*` described as future | fixed in 644b9c90 (traffic-route: PR #214) |
+| docs #242 | spec | Minor | #15 (traffic-route) unreachable banner case | superseded in 644b9c90 (traffic-route D5 `knownOpenRoute`) |
+| docs #242 | spec | Minor | #16 (traffic-route) RouteBanner doc comment | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #17 stale line anchors (Session.swift post-#197 in this spec; this plan's base `5eac2a5`) | fixed in 644b9c90: spec D1/D4 cite `Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408 on `main 8e19c2e3`; this plan's base is `main 8e19c2e3` |
+| docs #242 | spec | Minor | #18 Status lines lack the 2026-11-01 amendment date | fixed in 644b9c90: spec and plan read "amended 2026-11-01 (self-approved, autonomous mode)" |
+| docs #242 | spec | Minor | #19 (traffic-route) `Endpoint.address` stored vs computed | fixed in 644b9c90 (traffic-route; PR #246's shape) |
+| docs #242 | quality | Important | (traffic-route) TR-AC3 two lists; CA reserved vs used; `.caTrust` vs `.caTrusted`; D10 remedy suffix; `scopeClosed` two ways; Task 4 "Scan" anchor | fixed / superseded in 644b9c90 (traffic-route; see spec #2/#1/#11/#3/#4/#6) |
+| docs #242 | quality | Important | (traffic-route) `Tok.Size.Row.dense` is 28 pt, not 40 | fixed in 644b9c90 (traffic-route: 28 / 56, `Tokens.swift:296`) |
+| docs #242 | quality | Important | this spec cites Session.swift:479-483 / :524-527 / :529-549 | fixed in 644b9c90: cited by symbol with `main 8e19c2e3` lines (see spec #17) |
+| docs #242 | quality | Minor | research 21/22 H1 titles say 13/14; 22 never cites `16-system-proxy.md`; bare "research 12" | fixed in 644b9c90 (research 21/22) |
+| docs #242 | quality | Minor | unlabelled inferences, incl. this spec's `exec` icon remark | fixed in 644b9c90: D9 labels it unverified; the traffic-route and research items are labelled or removed (see that plan's log) |
+| docs #242 | quality | Minor | stale sentences, incl. this spec's "PR B is not released" and this plan's gate 1 blank | fixed in 644b9c90: D7 says PR B is released (v0.5.9); gate 1 = `3fe92f66`; the traffic-route items in that plan's log |
+| docs #242 | quality | Minor | (traffic-route) numbering/ordering | fixed in 644b9c90 (traffic-route) |
+| docs #242 | quality | Minor | (traffic-route) STORIES.md both ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | quality | Minor | (traffic-route) StatusPanel footprint three ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | quality | Minor | this plan's `subItem(… mark: Monogram(text: "◎"))` vs the declared `@ViewBuilder mark: () -> Mark` | fixed in 644b9c90: `mark: { Monogram(text: "◎") }` in Task 5 and spec D5 |
+| docs #242 | quality | Minor | research 22 line citations drifted | fixed in 644b9c90 (research 22: proxy.rs:360, build.sh:241) |
+| docs #242 | quality | Minor | Swift gate scratch paths differ between spec ACs and plans | fixed in 644b9c90: this spec's AI-AC23 = this plan's `test-build-icons`; traffic-route TR-AC9 = `test-build-routes` |
+| docs #242 | spec (2nd pass) | Important | gate 2's PR #246 bullet contradicted gate 5 (`init?(compact:listenAddress:)` ships in #246) | fixed in 2ce11b30 |
+| docs #242 | spec (2nd pass) | Minor | gate 5 head/test count stale (c8ed92f4 / 31 tests); Review-log rows lacked the fix SHA | fixed in 2ce11b30 |
+| docs #242 | spec (2nd pass) | Minor | residual: PR #246's two listen-address vectors (bare IPv6 literal without brackets → nil; `:::8080` → nil, the core prints `[::]:8080`) missing from TR-AC2 | fixed in b57840e3: both literals added to TR-AC2 |
+| docs #242 | quality (2nd pass) | Important | PR D's API mis-cited against `CATrustFacts.swift` 4ae616d3: the line helper is `text` (PR D's `state` is a `LaneState`); `needsAdmin` → `actions == [.openCAPanel]` and step action `.openCAPanel`; the string is `"CA trusted (System keychain)"`; the needs-admin line is `text`, not `remedy`; `platform: String` has no default | fixed in b57840e3 in the traffic-route spec/plan quote PR D verbatim (`line` = `text`; needs-admin `[.openCAPanel]`; capital S; `platform: "macos"` in every test value; an open CA entry stores `actions = []`) |
+| docs #242 | quality (2nd pass) | Minor | hand-over position unstated (PR D inserts the CA step after `busConnected`; ours sits after `scopeSet`); PR D's nil-facts rows (`unknownStep()` / `notGeneratedStep()`) undecided | fixed in b57840e3: D4 and Task 2b state the move; the nil-facts rows are dropped from the list (Architect's call, open question 21 — `make` reads `Session.caTrust` alone; the first-run sheet and CA page keep them) |
+| docs #242 | quality (2nd pass) | Minor | Amendments-log preamble named only four superseded items | fixed in b57840e3: the preamble names every superseded item (predicate names, `— set …` suffix, period handling, `… — add one`, start SHA `8175eea3`, `Open Network Settings…` as a button, our own `CATrustFacts.remedy` contract) |
+| docs #242 | quality (2nd pass) | Minor | Goal "the same actions" vs the All Apps route `[.openCaptureSettings]` and step `.turnCaptureOn` | fixed in b57840e3: "the same lines; each step keeps its existing action" |
+| docs #242 | quality (2nd pass) | Minor | D6 "~2 s effective" (the poll is 500 ms, `refreshProxyStatus()` every tick) | fixed in b57840e3: dropped, cadence stated as the 500 ms tick |
+| docs #242 | quality (2nd pass) | Minor | icons spec AI-AC11 `Overview(rows:).clients` — the type is `OverviewStats` | fixed in b57840e3 |
+| docs #242 | quality (2nd pass) | Minor | `flowTable` overlay anchor "~258"/"~261" | fixed in b57840e3: `ShellView.swift:258` in spec D7 and plan Task 3 |
+| all | Spec (3rd pass) | Minor | `GettingStartedStep.Kind` listing showed `caTrusted` after `scopeSet`; PR D's enum is `coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow` | fixed in ad83ab78: listings use PR D's source order; the steps order stays make's |
 
 ## Shipped
 
