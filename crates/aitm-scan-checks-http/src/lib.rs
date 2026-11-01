@@ -27,12 +27,12 @@
 pub mod matching;
 pub mod timing;
 
-mod blind_timing;
+pub mod blind_timing;
 mod catalogue;
-mod h2_observe;
-mod redirect;
-mod sqli_boolean;
-mod xss;
+pub mod h2_observe;
+pub mod redirect;
+pub mod sqli_boolean;
+pub mod xss;
 
 pub use catalogue::checks;
 

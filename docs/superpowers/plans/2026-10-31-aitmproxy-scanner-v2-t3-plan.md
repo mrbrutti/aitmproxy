@@ -131,6 +131,17 @@ red and stay red until T1b's bridge exists. Therefore:
   (integration, part 2) re-pins again from live `tools/list` after the final merge.
   Every other task touches none of them.
 
+
+**Amendment A1 (T3 session, 2026-11-01, from the Task 5 report).** The check tasks'
+named tests live in `crates/aitm-scan-checks-http/tests/`, a separate crate that can
+reach only `pub` items; and a `pub(crate)` constructor with no caller before Task 10
+is `dead_code` under `-D warnings`. Therefore: (1) `lib.rs` declares
+`pub mod blind_timing; pub mod h2_observe; pub mod redirect; pub mod sqli_boolean;
+pub mod xss;` — applied once by the orchestrator in commit "A1" so no check task
+edits `lib.rs`; (2) every check constructor named in Tasks 5, 7, 8 and 9 is `pub fn`
+(the text below is updated accordingly); (3) Task 10 still owns `catalogue.rs` and
+`lib.rs` doc comments only.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
@@ -511,7 +522,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
      `Payload` sent in order (`pub fn sent(&self) -> Vec<String>`), with configurable
      `budget_left`, `deadline`, `cancelled` and a `baseline_fails: bool` switch.
      `pub fn point(kind: InsertionKind, name: &str, url: &str) -> InsertionPoint`.
-  2. `xss.rs`: `pub(crate) fn check() -> Arc<dyn Check>` over
+  2. `xss.rs`: `pub fn check() -> Arc<dyn Check>` over
      `struct XssReflected { meta: CheckMeta }`. Meta: `id "xss-reflected"`, `class "xss"`,
      `lanes [Http]`, `kinds [query, body_param, json_value, xml_value, multipart_value,
      header, path_segment, param_name_query]`, `intensity Light`, `cost Light`,
@@ -523,7 +534,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
      HTML. Verdict `Vulnerable`/`Certain` with
      `Evidence { payload, matched: excerpt_around(...), probe_flows }` and a
      `PocHint { assertions: vec![Assertion::Status(status), Assertion::Word { word: marker_probe, part: MatchPart::Body }], control: Some(ControlHint { payload: marker.clone(), expect: vec![Assertion::Not(Box::new(Assertion::Word { word: marker_probe, part: MatchPart::Body }))] }) }`.
-  3. `redirect.rs`: `pub(crate) fn check() -> Arc<dyn Check>` over
+  3. `redirect.rs`: `pub fn check() -> Arc<dyn Check>` over
      `struct OpenRedirect { meta: CheckMeta }`. Meta: `id "open-redirect"`,
      `class "open-redirect"`, `kinds [query, body_param, json_value, header]`,
      `intensity Light`, `cost Light`, `technique Reflected`, `severity Medium`,
@@ -631,7 +642,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
   landed, create the support module here instead and tell the orchestrator).
 - **Files:** `crates/aitm-scan-checks-http/src/sqli_boolean.rs` (modify),
   `crates/aitm-scan-checks-http/tests/native_sqli_boolean.rs` (create).
-- **Change:** `pub(crate) fn check() -> Arc<dyn Check>` over
+- **Change:** `pub fn check() -> Arc<dyn Check>` over
   `struct SqliBoolean { meta: CheckMeta }`. Meta: `id "sqli-boolean"`, `class "sqli"`,
   `kinds [query, body_param, json_value, xml_value, multipart_value, header, cookie,
   path_segment]`, `intensity Medium`, `cost Medium`, `technique Boolean`,
@@ -689,7 +700,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
   `crates/aitm-scan-checks-http/tests/native_timing.rs` (create).
 - **Change:** one generic `struct TimingCheck { meta: CheckMeta, families: Vec<Family> }`
   with `struct Family { name: &'static str, template: fn(f32) -> String }`, exposed as
-  `pub(crate) fn sqli_time() -> Arc<dyn Check>` and `pub(crate) fn cmdi_time() -> Arc<dyn Check>`.
+  `pub fn sqli_time() -> Arc<dyn Check>` and `pub fn cmdi_time() -> Arc<dyn Check>`.
   - `sqli-time`: `class "sqli"`, `technique Timing`, `severity Critical`,
     `confidence_max Firm`, `intensity Medium`, `cost Medium`, `needs_baseline true`,
     `cwe Some(89)`, kinds as `sqli-boolean`. Families in order: `mysql`
@@ -746,7 +757,7 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
 - **Change:**
   1. Test seam: `pub trait RawH2Runner: Send + Sync { fn run<'a>(&'a self, plan: RawH2Plan) -> BoxFuture<'a, anyhow::Result<RawH2Observation>>; }`
      and `pub struct RealRawH2Runner { client: aitm_proto_http::raw_h2::RawH2Client }`.
-     `pub(crate) fn h2_checks(runner: Arc<dyn RawH2Runner>) -> Vec<Arc<dyn Check>>`;
+     `pub fn h2_checks(runner: Arc<dyn RawH2Runner>) -> Vec<Arc<dyn Check>>`;
      `catalogue.rs` passes the real one.
   2. `struct OncePerAuthority { seen: Mutex<HashMap<String, Instant>> }` with a
      10-minute TTL: the first point of an authority runs the probe; later points
