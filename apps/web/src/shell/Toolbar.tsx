@@ -1,6 +1,7 @@
 // Toolbar (§2.7): sidebar toggle · record/pause · compose · clear | listening pill | Agent toggle ·
 // ⌘K · layout. Icons flat, 16px, secondary; nothing outlined except the Agent toggle and the
-// segmented control.
+// segmented control. The listening pill is a menu button (system-proxy spec D15): it appends the
+// D12 pill word after the address and opens the "Set as system proxy" menu; no icon beyond its dot.
 import { createSignal, Show, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import type { AgentPolicy } from '~/state/app';
@@ -11,6 +12,7 @@ import { Popover } from '~/components/Popover';
 import { StatusDot } from '~/components/StatusDot';
 import { rectAnchor, type AnchorRect } from '~/components/floating';
 import { pluralize } from '~/lib/format';
+import { menuState, pillWord } from '~/state/systemProxy';
 import css from './Toolbar.module.css';
 
 const POLICY_LABEL: Record<AgentPolicy, string> = { all: 'Allow all tools', readonly: 'Read-only', paused: 'Paused' };
@@ -73,8 +75,28 @@ export const ClearButton: Component<{ variant: 'toolbar' | 'small'; label?: stri
 export const Toolbar: Component = () => {
   const app = useApp();
   const [agentMenu, setAgentMenu] = createSignal<{ anchor: AnchorRect; kb: boolean } | null>(null);
+  const [sysMenu, setSysMenu] = createSignal<{ anchor: AnchorRect; kb: boolean } | null>(null);
 
   const dotHue = () => (app.proxy.armed ? 'armed' : app.proxy.listening ? 'success' : 'grey');
+  const sysWord = () => pillWord(app.proxy.systemProxy, app.proxy.systemProxySetting);
+
+  /** The D15 menu: the checkbox from `menuState`, the `detail` line, and "Copy env line" when `guidance` is present. */
+  const sysItems = () => {
+    const status = app.proxy.systemProxy;
+    const m = menuState(status, app.proxy.systemProxySetting, app.bus.role());
+    const guidance = status?.guidance;
+    return [
+      {
+        label: 'Set as system proxy',
+        checked: m.checked,
+        disabled: m.disabled,
+        title: m.title,
+        onSelect: () => void (m.checked ? app.unsetSystemProxy() : app.setSystemProxy()),
+      },
+      ...(status && status.detail ? [{ label: status.detail, disabled: true }] : []),
+      ...(m.showCopyEnv && guidance ? [{ label: 'Copy env line', onSelect: () => void navigator.clipboard.writeText(guidance) }] : []),
+    ];
+  };
 
   return (
     <header class={css.toolbar} role="toolbar" aria-label="Capture">
@@ -98,18 +120,29 @@ export const Toolbar: Component = () => {
       <ClearButton variant="toolbar" />
 
       <span class={css.spacer} />
-      <div class={css.listen} role="status" aria-live="polite">
+      <button
+        type="button"
+        class={`${css.listen} ${css.listenButton}`}
+        title="System proxy"
+        aria-haspopup="menu"
+        aria-expanded={sysMenu() != null}
+        onClick={(e) => setSysMenu({ anchor: rectAnchor(e.currentTarget.getBoundingClientRect()), kb: e.detail === 0 })}
+      >
         <StatusDot hue={dotHue()} />
-        <span>
+        <span role="status" aria-live="polite">
           <b>aitmproxy</b> · {app.proxy.listening ? 'listening' : 'paused'}
           <Show when={app.proxy.address}>
             {' '}
             <b class={css.mono}>{app.proxy.address}</b>
           </Show>
           <Show when={app.proxy.protocol}> · {app.proxy.protocol}</Show>
+          <Show when={sysWord()}> {sysWord()}</Show>
           <Show when={app.proxy.armed}> · intercept armed</Show>
         </span>
-      </div>
+      </button>
+      <Show when={sysMenu()}>
+        {(m) => <Menu anchor={m().anchor} placement="bottom-start" animate={!m().kb} label="System proxy" onClose={() => setSysMenu(null)} items={sysItems()} />}
+      </Show>
       <span class={css.spacer} />
 
       <button

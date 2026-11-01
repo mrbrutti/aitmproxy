@@ -36,6 +36,17 @@
 .listen .mono {
   font-family: var(--font-data);
 }
+/* The pill as a <button> (system-proxy menu): same look, a hover wash, no outline or icon. */
+.listenButton {
+  text-align: left;
+  flex: 0 1 auto;
+  transition: background-color var(--motion-hover) ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .listenButton:hover {
+    background: var(--color-ground-hover);
+  }
+}
 
 /* Agent toggle: switch + label + count. */
 .agent {
