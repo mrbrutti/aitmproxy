@@ -1585,6 +1585,17 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | Quality (w2+3) | Minor | `response_map` mirrors `host_net`'s private helpers | accepted by orchestrator 2026-11-01: parity pinned by `probe_response_has_the_http_send_shape`; helpers take core types the bridge does not have |
 | 5 | Quality (w2+3) | Minor | `JOB_NOTIFICATION_METHOD` literal duplicated across crates without a pin | fix: Task 19 adds the cross-crate `assert_eq!` in `crates/aitm/tests` |
 | 8 | Quality (w2+3) | Minor | 30 s timeout mapping tested on the helper, not through `send_opts` | accepted by orchestrator 2026-11-01: tokio `test-util` is not in the crate's dev-deps; the helper test pins the mapping and the bound is `MAX_AWAIT` |
+| 12 | Security (w2+3) | Important | Browser-crawl navigations charged after the fact; `crawl.max_pages` has no ceiling, so the crawl escapes the probes budget | fix (wave-2/3 fix task): cap `max_pages` by `budget_left()` before crawling, drain the budget if the charge is refused; test budget 3 / max_pages 50 → <= 3 navigations, `budget_left() == 0` |
+| 13 | Security (w2+3) | Important | `probe.levenshtein_ratio` is unbounded O(|a|·|b|) CPU on target-controlled bodies, uninterruptible | fix dispatched 2026-11-01 (host_probe coder): inputs capped at `LEVENSHTEIN_MAX_BYTES = 32 KiB`, two-row DP, bounded-time test; documented in `rhai.api.json` |
+| 13 | Security (w2+3) | Minor | A check whose host lends no client runs on the unbudgeted namespace client | fix routed to the in-flight Rhai coder: `client() == None` is an error verdict like `shared() == None` |
+| 13 | Security (w2+3) | Minor | `probe.raw` method reaches the wire unvalidated (request splitting on the in-scope peer) | fix dispatched (host_probe coder): RFC 9110 token only |
+| 7 | Security (w2+3) | Minor | `issues_md` renders attacker-controlled text as Markdown structure | fix (wave-2/3 fix task): `md_inline()` collapses CR/LF and escapes backticks for every interpolated field |
+| 7 | Security (w2+3) | Minor | Dedupe-key fields joined on U+001F without escaping | fix (wave-2/3 fix task): length-prefix each field |
+| 7 | Security (w2+3) | Minor | Issue ids read from disk trusted as file names | fix (wave-2/3 fix task): require `id == file stem` and `^issue-[0-9a-f]{8}$` on load |
+| 5 | Security (w2+3) | Minor | The `auto` exception keys on the bare name `scan.start`; the core registry does not refuse a Rhai script shadowing it | Task 15: `scan.start` refuses non-operator callers under `auto` before any work (B6); registry duplicate/prefix refusal is `aitm-core/registry.rs`, outside this track: follow-up for the coordinator (Shipped) |
+| 11 | Security (w2+3) | Minor | PoC artefacts default to the system temp dir | fix (wave-2/3 fix task): `out_dir: None` → skip with a note; Task 14 passes `<findings.dir>/scan/pocs` |
+| 6 | Security (w2+3) | Minor | `check_timeout_s: 0` passes validation | fix (wave-2/3 fix task): floor at 1 |
+| 5,13,3 | Security (w2+3) | Minor | No `#![forbid(unsafe_code)]` attribute in `aitm-plugin-scanner`, `aitm-plugin-rhai`, `aitm-mcp` | fix (wave-2/3 fix task): add the attribute (the workspace lint already forbids it; belt and braces) |
 
 ## Shipped
 
