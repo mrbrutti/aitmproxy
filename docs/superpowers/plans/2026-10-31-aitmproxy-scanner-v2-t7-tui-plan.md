@@ -617,6 +617,16 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | security | Minor | T7-18 `y` check accepts any refusal wording, never compared with the harness | fix round G-B (G95) |
 | 15 | security | Minor | push client's notification list unbounded for the run | fix round G-B (G98) |
 | 15 | security | note | `run.py` extracts skip reasons by `[SKIP]` while the cell prints `SKIP:`; `run.py` does not pass `-I` | follow-up for T10 (harness owner); the cell keeps the plan's `SKIP:` line |
+| 15 | spec | Critical | `cursor_to` on Profiles walks the editor's field cursor while an editor is held; T7-18 becomes a passing note, T7-19 fails | fix round G-C (G99): focus the List pane first; failure is a check |
+| 15 | spec | Important | inspector checks match the flow path anywhere on screen | fix round G-C (G100a) |
+| 15 | spec | Important | T7-17 compares against `issues[0]`, payload/probe sub-steps become notes | fix round G-C (G100b): the reflected-xss issue, checks not notes |
+| 15 | spec | Important | `P` asserts the Findings panel opened, not on the matching PoC | fix round G-C (G100c) |
+| 15 | spec | Important | T7-18 `y` never compared with the harness; refusal set wider than AC 18 | fix round G-C (G100d, with G95) |
+| 15 | spec | Important | `group_of` reads whole rows; the detail head defeats the header check | fix round G-C (G100e) |
+| 15 | spec | Minor | three unlisted skip paths | fix round G-C (G101): two ratified as capability skips, missing verbs FAIL the step |
+| 15 | spec | Minor | T7-19 opens `nodes[0]` of the reply, TUI renders in host-group order | fix round G-C (G101) |
+| 15 | spec | Minor | `tab()` markers present on every tab | fix round G-C (G96) |
+| 15 | spec | Minor | builder decisions unrecorded (Fatal policy, T7-18 ordering, child env, token file, skip format, `J` on Site map) | ratified in G101's text |
 
 ## Shipped
 
