@@ -12,6 +12,9 @@ workspace = true
 aitm-core = { workspace = true }
 aitm-findings = { workspace = true }
 aitm-poc = { workspace = true }
+# Scanner v2's shared data model: the `Lane` and `Check` traits whose handles the
+# binary collects from the lane crates and hands to `ScannerPlugin` (spec D1).
+aitm-scan-model = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
 # JSON request bodies are parsed with the same serializer the rest of the tree

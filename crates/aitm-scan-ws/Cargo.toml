@@ -1,0 +1,19 @@
+[package]
+name = "aitm-scan-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scanner v2 WebSocket lane (track T4): WS discovery and checks, plus the guarded `ws.*` script language. Skeleton slots handed over at T1a."
+
+[dependencies]
+# The `ScopeRateGuard` the `ws.*` host fns are `Guarded` through: `main.rs`
+# passes its `LateHandles` guard into `language()` (spec D8.3, call A17).
+aitm-core.workspace = true
+# The `ProtocolLanguage` seam the `ws.*` namespace is contributed through.
+aitm-plugin.workspace = true
+# The `Lane` trait this crate's `lane()` slot returns.
+aitm-scan-model.workspace = true
+
+[lints]
+workspace = true
