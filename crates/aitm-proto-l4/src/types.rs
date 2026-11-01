@@ -80,6 +80,10 @@ pub struct L4ScopeEntry {
     pub cidr: IpCidr,
     /// `Any` == `0..=65535`; matched for Tcp/Udp.
     pub ports: PortRange,
+    /// The interface name the entry covers, or `"*"` for any interface: an
+    /// unprivileged socket client cannot know its egress interface before
+    /// connecting, so the operator authorises a destination, not a NIC.
+    /// Direction, CIDR, ports and capability still apply.
     pub interface: String,
     pub direction: L4Direction,
     /// Capture | Inject | Intercept — the capability this entry grants.

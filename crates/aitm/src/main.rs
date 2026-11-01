@@ -405,10 +405,19 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             shared.store.clone(),
         )
     });
-    let languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = match &l4_language {
-        Some(lang) => vec![lang],
-        None => Vec::new(),
-    };
+    // Scanner v2's `ws.*` script language slot (spec D1 and D8.3). It is built with
+    // the SAME `LateHandles` the script tier uses as its scope/rate guard, so every
+    // `ws.*` host fn is guarded: a script cannot reach a host outside scope or past
+    // the rate limit. `None` while track T4 is unimplemented, and a `None` slot adds
+    // no language — the engine then has no `ws.*` namespace (deny-by-default).
+    let ws_language = aitm_scan_ws::language(handles.clone());
+    let mut languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = Vec::new();
+    if let Some(lang) = &l4_language {
+        languages.push(lang);
+    }
+    if let Some(lang) = &ws_language {
+        languages.push(lang.as_ref());
+    }
     let tier = aitm_plugin_rhai::wire::build_with_languages(rhai_cfg, script_services, &languages)?;
     // The language only had to live long enough to install its host fns on the engine
     // (which holds its own `Arc` clones of the shared state); drop the borrow so the
@@ -424,9 +433,17 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 r.register(std::sync::Arc::from(h));
             }
         }
+        // The same for the `ws.*` language's PoC step, from the same instance the
+        // engine installed, so a `ws:` step and a script share one guarded surface.
+        if let Some(lang) = &ws_language {
+            if let Some(h) = aitm_plugin::language::ProtocolLanguage::poc_step(lang.as_ref()) {
+                r.register(std::sync::Arc::from(h));
+            }
+        }
         r
     };
     drop(l4_language);
+    drop(ws_language);
     for err in &tier.errors {
         warn!(target: "aitm::scripts", "{err}");
     }
