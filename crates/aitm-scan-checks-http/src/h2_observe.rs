@@ -73,6 +73,8 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::gate::{no_finding, STOPPED};
+
 /// How long an authority stays "already observed" for one check instance.
 const GUARD_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -472,7 +474,7 @@ impl Check for H2Check {
                 return inconclusive("the point has no usable http(s) url");
             };
             if !crate::gate::may_send(host, 1) {
-                return inconclusive(STOPPED);
+                return stopped();
             }
             // The profile gate, before anything at all is sent: a raw probe
             // bypasses the lane's guarded client, so the authority it would
@@ -490,7 +492,7 @@ impl Check for H2Check {
                 return inconclusive("baseline refused; not probing");
             }
             if host.cancelled() || Instant::now() >= host.deadline() {
-                return inconclusive(STOPPED);
+                return stopped();
             }
             // The raw connection cannot charge the job — `ProbeHost` has no
             // `charge` — so the check refuses to open one the budget could not
@@ -516,7 +518,6 @@ impl Check for H2Check {
     }
 }
 
-const STOPPED: &str = "stopped: the job was cancelled, out of budget or past its deadline";
 const ALREADY_OBSERVED: &str = "already observed for this authority";
 const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
 const BUDGET_TOO_LOW: &str = "budget too low for the raw probe";
@@ -589,13 +590,15 @@ impl Target {
     }
 }
 
-fn inconclusive(detail: &str) -> Verdict {
+/// The verdict for a probe that was not sent, with nothing to show for it.
+fn inconclusive(detail: impl Into<String>) -> Verdict {
     no_finding(Outcome::Inconclusive, detail)
 }
 
-/// A verdict that concluded nothing, with no evidence and no hint.
-fn no_finding(outcome: Outcome, detail: &str) -> Verdict {
-    crate::gate::no_finding(outcome, Confidence::Tentative, detail.to_string())
+/// The verdict for a run the job stopped before the probe: the shared stop
+/// reason, prefixed so the detail reads as an event and not a cause.
+fn stopped() -> Verdict {
+    inconclusive(format!("stopped: {STOPPED}"))
 }
 
 /// The name of a SETTINGS identifier (RFC 9113 section 6.5.2, RFC 8441).
@@ -643,7 +646,7 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
     if let Some((last_stream, code)) = obs.goaway {
         return no_finding(
             Outcome::Clean,
-            &format!(
+            format!(
                 "the peer sent GOAWAY(last_stream_id={last_stream}, error_code={code}) during \
                  {RESET_PAIRS} reset pairs"
             ),
@@ -652,7 +655,7 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
     if obs.streams.contains(&StreamOutcome::Refused) {
         return no_finding(
             Outcome::Clean,
-            &format!("the peer refused a stream during {RESET_PAIRS} reset pairs"),
+            format!("the peer refused a stream during {RESET_PAIRS} reset pairs"),
         );
     }
     // A reset or an answer is an observed outcome for the pair; a timeout is
@@ -669,7 +672,7 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
     if obs.connection_closed {
         return no_finding(
             Outcome::Clean,
-            &format!(
+            format!(
                 "the peer closed the connection without a GOAWAY after {observed} of \
                  {RESET_PAIRS} reset pairs"
             ),
@@ -678,7 +681,7 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
     // Fewer than eight observed pairs is not the "complete repeated
     // observation" the `firm` verdict below stands on (spec review SP-3).
     if observed < usize::from(RESET_PAIRS) {
-        return inconclusive(&format!(
+        return inconclusive(format!(
             "only {observed} of {RESET_PAIRS} reset pairs reached an outcome before the probe \
              stopped"
         ));
@@ -765,14 +768,14 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
         };
     }
     if unobserved > 0 {
-        return inconclusive(&format!(
+        return inconclusive(format!(
             "{unobserved} of {} variants did not reach an outcome before the probe stopped",
             labels.len()
         ));
     }
     no_finding(
         Outcome::Clean,
-        &format!("all {} variants were rejected", labels.len()),
+        format!("all {} variants were rejected", labels.len()),
     )
 }
 
@@ -808,6 +811,19 @@ mod tests {
         }
         let len = guard.seen.lock().unwrap().len();
         assert_eq!(len, super::GUARD_CAP);
+    }
+
+    /// The h2 checks' "stopped" detail is the shared sentence with a prefix,
+    /// not a second spelling of it (Q2-2).
+    #[test]
+    fn the_stopped_detail_is_composed_from_the_shared_reason() {
+        let v = super::stopped();
+        assert_eq!(v.outcome, super::Outcome::Inconclusive);
+        assert_eq!(v.detail, format!("stopped: {}", crate::gate::STOPPED));
+        assert_eq!(
+            v.detail,
+            "stopped: the job was cancelled, out of budget or past its deadline"
+        );
     }
 
     #[test]

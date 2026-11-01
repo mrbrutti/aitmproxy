@@ -55,7 +55,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-use crate::gate::{self, ProbeTally};
+use crate::gate::{self, no_finding, ProbeTally, STOPPED};
 use crate::matching::{body_text, length_differs};
 
 /// The hard ceiling on stimuli this check spends on one insertion point,
@@ -202,12 +202,6 @@ fn may_send(host: &dyn ProbeHost, spent: u32, need: u32) -> bool {
     gate::may_send(host, need) && spent.saturating_add(need) <= MAX_BOOLEAN_PROBES
 }
 
-/// A verdict with no evidence and no hint; always `tentative`, because a
-/// verdict that concluded nothing has nothing to be confident about.
-fn no_finding(outcome: Outcome, detail: String) -> Verdict {
-    gate::no_finding(outcome, Confidence::Tentative, detail)
-}
-
 /// The lengths of one run of a pair, kept so the reported evidence is the run
 /// that was actually observed rather than a recomputed guess.
 struct PairRun {
@@ -327,9 +321,7 @@ impl Check for SqliBoolean {
             if !may_send(host, spent, 1) {
                 return no_finding(
                     Outcome::Inconclusive,
-                    "the job was cancelled, out of budget or past its deadline before the \
-                     baseline"
-                        .to_string(),
+                    format!("{STOPPED} before the baseline"),
                 );
             }
 
@@ -337,8 +329,7 @@ impl Check for SqliBoolean {
                 return no_finding(
                     Outcome::Error,
                     "the point's baseline could not be fetched, so there is nothing to \
-                     compare against"
-                        .to_string(),
+                     compare against",
                 );
             };
             let baseline_len = body_len(&baseline);
@@ -348,7 +339,7 @@ impl Check for SqliBoolean {
             if !may_send(host, spent, 1) {
                 return no_finding(
                     Outcome::Inconclusive,
-                    "the job stopped before the control re-send".to_string(),
+                    "the job stopped before the control re-send",
                 );
             }
             // The control is the point's *own observed value*. With none to
@@ -359,8 +350,7 @@ impl Check for SqliBoolean {
                 return no_finding(
                     Outcome::Inconclusive,
                     "the point carries no observed value to re-send as a control, so the \
-                     boolean differential has nothing stable to compare against"
-                        .to_string(),
+                     boolean differential has nothing stable to compare against",
                 );
             };
             spent += 1;
@@ -372,7 +362,7 @@ impl Check for SqliBoolean {
             let Ok(control) = host.probe(&control_payload).await else {
                 return no_finding(
                     Outcome::Error,
-                    "the control re-send of the point's own value was refused".to_string(),
+                    "the control re-send of the point's own value was refused",
                 );
             };
             if length_differs(body_len(&control), baseline_len, baseline_len) {

@@ -14,7 +14,11 @@ use std::time::Instant;
 use aitm_scan_model::{Confidence, Evidence, Outcome, ProbeHost, Verdict};
 
 /// The standing reason a run stopped early, in the words every check uses.
-const STOPPED: &str = "the job was cancelled, out of budget or past its deadline";
+///
+/// Spelled once. A check that needs a variant composes it from this
+/// (`format!("{STOPPED} before the baseline")`, `format!("stopped: {STOPPED}")`),
+/// so the sentence cannot drift between modules (Q2-2).
+pub(crate) const STOPPED: &str = "the job was cancelled, out of budget or past its deadline";
 
 /// Whether the check may spend `need` more stimuli right now.
 ///
@@ -28,13 +32,15 @@ pub(crate) fn may_send(host: &dyn ProbeHost, need: u32) -> bool {
     !host.cancelled() && host.budget_left() >= need && Instant::now() < host.deadline()
 }
 
-/// A verdict that concluded nothing: no evidence, no PoC hint.
-pub(crate) fn no_finding(outcome: Outcome, confidence: Confidence, detail: String) -> Verdict {
+/// A verdict that concluded nothing: no evidence, no PoC hint, and always
+/// `tentative`, because a verdict that concluded nothing has nothing to be
+/// confident about.
+pub(crate) fn no_finding(outcome: Outcome, detail: impl Into<String>) -> Verdict {
     Verdict {
         outcome,
-        confidence,
+        confidence: Confidence::Tentative,
         evidence: Evidence::default(),
-        detail,
+        detail: detail.into(),
         poc_hint: None,
     }
 }
@@ -96,14 +102,14 @@ impl ProbeTally {
     pub(crate) fn unfinished(&self) -> Option<Verdict> {
         if self.sent < self.planned {
             let reason = match &self.extra_stop {
-                Some(extra) => {
-                    format!("the job was cancelled, out of budget, past its deadline, or {extra}")
-                }
+                // The list form of the same sentence, with the extra reason
+                // as its last item: "cancelled, out of budget, past its
+                // deadline, or <extra>".
+                Some(extra) => format!("{}, or {extra}", STOPPED.replacen(" or ", ", ", 1)),
                 None => STOPPED.to_string(),
             };
             return Some(no_finding(
                 Outcome::Inconclusive,
-                Confidence::Tentative,
                 format!(
                     "stopped after {sent} of {planned} {unit}: {reason}",
                     sent = self.sent,
@@ -115,7 +121,6 @@ impl ProbeTally {
         if self.sent > 0 && self.failed == self.sent {
             return Some(no_finding(
                 Outcome::Error,
-                Confidence::Tentative,
                 format!(
                     "every one of the {sent} {unit} was refused",
                     sent = self.sent,
@@ -129,15 +134,49 @@ impl ProbeTally {
     /// [`Self::unfinished`], or a `Clean` verdict carrying `clean_detail`.
     pub(crate) fn conclude(self, clean_detail: String) -> Verdict {
         self.unfinished()
-            .unwrap_or_else(|| no_finding(Outcome::Clean, Confidence::Tentative, clean_detail))
+            .unwrap_or_else(|| no_finding(Outcome::Clean, clean_detail))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use aitm_scan_model::Outcome;
+    use aitm_scan_model::{Confidence, Evidence, Outcome};
 
-    use super::ProbeTally;
+    use super::{no_finding, ProbeTally, STOPPED};
+
+    /// A verdict that concluded nothing is always `tentative`: the caller
+    /// names the outcome and the detail, and nothing else (Q2-1). Both a
+    /// `&str` and a `String` are accepted, so no caller allocates to say
+    /// nothing.
+    #[test]
+    fn no_finding_is_tentative_with_no_evidence_and_no_hint() {
+        let v = no_finding(Outcome::Error, "the baseline was refused");
+        assert_eq!(v.outcome, Outcome::Error);
+        assert_eq!(v.confidence, Confidence::Tentative);
+        assert_eq!(v.detail, "the baseline was refused");
+        assert_eq!(v.evidence, Evidence::default());
+        assert!(v.poc_hint.is_none());
+
+        let owned = no_finding(
+            Outcome::Inconclusive,
+            format!("{STOPPED} before the baseline"),
+        );
+        assert_eq!(owned.confidence, Confidence::Tentative);
+        assert_eq!(
+            owned.detail,
+            "the job was cancelled, out of budget or past its deadline before the baseline"
+        );
+    }
+
+    /// The one spelling of the standing stop reason every check composes
+    /// its own sentence from (Q2-2).
+    #[test]
+    fn the_stop_reason_is_spelled_once() {
+        assert_eq!(
+            STOPPED,
+            "the job was cancelled, out of budget or past its deadline"
+        );
+    }
 
     fn tally(planned: usize, sent: usize, failed: usize) -> ProbeTally {
         let mut t = ProbeTally::new("canary probes", planned);

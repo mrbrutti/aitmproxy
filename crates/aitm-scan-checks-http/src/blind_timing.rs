@@ -49,7 +49,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-use crate::gate::{may_send, no_finding, ProbeTally};
+use crate::gate::{may_send, no_finding, ProbeTally, STOPPED};
 use crate::timing::{correlated, fit};
 
 /// The hard per-point probe ceiling for a timing check (AC T3-4).
@@ -322,10 +322,7 @@ impl Check for TimingCheck {
             if !may_send(host, 1) {
                 return no_finding(
                     Outcome::Inconclusive,
-                    Confidence::Tentative,
-                    "the job was cancelled, out of budget or past its deadline before the \
-                     baseline"
-                        .to_string(),
+                    format!("{STOPPED} before the baseline"),
                 );
             }
 
@@ -402,7 +399,6 @@ impl Check for TimingCheck {
                 let was = if abandoned == 1 { "was" } else { "were" };
                 return no_finding(
                     Outcome::Inconclusive,
-                    Confidence::Tentative,
                     format!(
                         "{abandoned} of {total} payload families {was} abandoned: a probe was \
                          refused part-way through its schedule, so the series could not be \
