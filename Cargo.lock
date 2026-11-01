@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-sysproxy"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-ca",
  "aitm-core",
