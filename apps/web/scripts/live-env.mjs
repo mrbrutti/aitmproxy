@@ -292,10 +292,6 @@ export async function startAitm({
   let stderr = '';
   let out = '';
   let operatorUiUrl = null;
-  const opMatch = () => {
-    const url = parseOperatorUrl(out);
-    return url ? [url, url] : null;
-  };
   child.stderr.on('data', (d) => {
     stderr += d;
     log(String(d).trimEnd());
@@ -306,8 +302,7 @@ export async function startAitm({
     // Resolve once the operator URL is captured, or on the generic listen/agent/Web UI line
     // (older builds / operator disabled).
     const check = () => {
-      const m = opMatch();
-      if (m) operatorUiUrl = m[1];
+      operatorUiUrl ??= parseOperatorUrl(out);
       if (operatorUiUrl || /web UI (listening|: http|\(agent\))/i.test(out + stderr) || /^\s*Web UI\s+http/m.test(out)) res();
     };
     child.stdout.on('data', (d) => {
@@ -320,9 +315,8 @@ export async function startAitm({
   });
   // The operator URL println can trail the stderr "listening" log we resolved on; give stdout a beat.
   for (let i = 0; i < 20 && !operatorUiUrl; i++) {
-    const m = opMatch();
-    if (m) operatorUiUrl = m[1];
-    else await new Promise((r) => setTimeout(r, 50));
+    operatorUiUrl = parseOperatorUrl(out);
+    if (!operatorUiUrl) await new Promise((r) => setTimeout(r, 50));
   }
   // The operator URL fragment is query-shaped: `#t=<token>&expect=operator`. The bus token is only `t`.
   const opHash = operatorUiUrl ? new URL(operatorUiUrl).hash.replace(/^#/, '') : '';

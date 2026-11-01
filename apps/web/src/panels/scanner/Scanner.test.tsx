@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render } from '@solidjs/testing-library';
 import { AppProvider } from '~/state/context';
 import { stubApp } from './testkit';
+import { RECONNECT_NOTE } from './primitives';
 import { scanStore, type ScanStore } from './store';
 import { Scanner } from './Scanner';
 import css from './scanner.module.css';
@@ -149,7 +150,11 @@ describe('Scanner shell', () => {
     h.setBusState('reconnecting');
     await tick();
     const section = h.r.getByRole('region', { name: 'Scanner' });
-    expect(section.querySelector(`.${css.reconnectNote}`)).not.toBeNull();
+    const note = section.querySelector(`.${css.reconnectNote}`);
+    expect(note).not.toBeNull();
+    // The header prints the shared sentence (D-T8.10), not a note of its own.
+    expect(note!.textContent).toBe(RECONNECT_NOTE);
+    expect(note!.querySelector('[role=status]')).not.toBeNull();
     const buttons = Array.from(section.querySelectorAll('button')) as HTMLButtonElement[];
     expect(buttons.length).toBeGreaterThan(0);
     expect(buttons.every((b) => b.disabled)).toBe(true);

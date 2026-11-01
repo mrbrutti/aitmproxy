@@ -147,7 +147,7 @@ describe('scanStore: profiles (D-T8.5)', () => {
     expect(h.s.lastError()!.text).toBe('Invalid profile: standard is a built-in profile');
     expect(h.s.lastError()!.code).toBe('invalid_profile');
     expect(h.s.lastError()!.source).toBe('save');
-    expect(h.s.lastErrorText()).toBe('Invalid profile: standard is a built-in profile');
+    expect(h.s.errorFor(['save'])()!.text).toBe('Invalid profile: standard is a built-in profile');
     expect(h.s.draft('standard')).not.toBeNull();
   });
 
@@ -177,6 +177,41 @@ describe('scanStore: profiles (D-T8.5)', () => {
     expect(h.s.draft('standard')).toBeNull();
     await h.s.loadProfile('standard');
     expect(h.count('scan.profile.get')).toBe(2);
+  });
+
+  it('profileError is keyed per name: a failed read lands on that profile only and clears on the next good one', async () => {
+    const h = harness();
+    await tick();
+    h.fail('scan.profile.get', 'scan: not_found: thorough');
+    await h.s.loadProfile('thorough');
+    expect(h.s.profileError('thorough')).toBe('Not found: thorough');
+    expect(h.s.profileError('standard')).toBeNull();
+    expect(h.s.draft('thorough')).toBeNull();
+    // The toast still goes out through the shared error channel.
+    expect(h.s.lastError()).toEqual({ source: 'profile', code: 'not_found', text: 'Not found: thorough' });
+
+    h.reply('scan.profile.get', { ...standard(), name: 'thorough' });
+    await h.s.loadProfile('thorough');
+    expect(h.s.profileError('thorough')).toBeNull();
+    expect(h.s.draft('thorough')!.profile.name).toBe('thorough');
+
+    // A profile named like an Object.prototype key reads its own slot, never the prototype (A5).
+    expect(h.s.profileError('constructor')).toBeNull();
+    expect(h.s.profileError('__proto__')).toBeNull();
+  });
+
+  it('profilesLoadedAt is the time of the last good list read, untouched by a failed one', async () => {
+    const T = Date.UTC(2026, 9, 31, 14, 3, 22);
+    vi.setSystemTime(T);
+    const h = harness();
+    expect(h.s.profilesLoadedAt()).toBeNull();
+    await h.s.loadProfiles();
+    expect(h.s.profilesLoadedAt()).toBe(T);
+    vi.setSystemTime(T + 60_000);
+    h.fail('scan.profile.list', 'bus closed');
+    await h.s.loadProfiles();
+    expect(h.s.profilesError()).toBe('bus closed');
+    expect(h.s.profilesLoadedAt()).toBe(T);
   });
 
   it('a draft equal to the loaded profile is not dirty', async () => {

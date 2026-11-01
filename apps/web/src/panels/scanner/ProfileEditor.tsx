@@ -114,6 +114,10 @@ const BoolField: Component<{ label: string; checked: boolean; onValue: (v: boole
 type Scheme = 'https' | 'http';
 const SCHEMES: readonly Scheme[] = ['https', 'http'];
 
+/** The Audit ignore-rule pickers: an empty option (no constraint) before every kind and trait. */
+const IGNORE_KINDS: readonly (InsertionKind | '')[] = ['', ...INSERTION_KINDS];
+const IGNORE_TRAITS: readonly (PointTrait | '')[] = ['', ...POINT_TRAITS];
+
 function Segmented<T extends string>(props: {
   label: string;
   options: readonly T[];
@@ -248,8 +252,6 @@ function blockSetter<B extends 'crawl' | 'audit' | 'session' | 'budget' | 'http'
 
 export const ProfileEditor: Component<{ name: string }> = (props) => {
   const s = scanStore(useApp());
-  /** The one store error this block owns (PA5): a failed `scan.profile.get`. */
-  const profileError = s.errorFor(['profile']);
   return (
     // Keyed on the name (PA9): the whole editor, and every section's half-typed state with it, is
     // recreated when the operator switches profiles. The draft itself lives in the store.
@@ -258,8 +260,10 @@ export const ProfileEditor: Component<{ name: string }> = (props) => {
         <Show
           when={s.draft(name)}
           fallback={
-            <Show when={profileError()} fallback={<LoadingBars label="Loading profile" />}>
-              {(error) => <ErrorBlock text={error().text} onRetry={() => void s.loadProfile(name)} disabled={!s.busOpen()} />}
+            // The one error this block owns (PA5), keyed on *this* name: another profile's failed
+            // read is never shown here while this one is still loading.
+            <Show when={s.profileError(name)} fallback={<LoadingBars label="Loading profile" />}>
+              {(error) => <ErrorBlock text={error()} onRetry={() => void s.loadProfile(name)} disabled={!s.busOpen()} />}
             </Show>
           }
         >
@@ -640,8 +644,6 @@ const AuditSection: Component<SectionProps> = (props) => {
     if (rule.kind === null && rule.name_regex === null && rule.trait === null) return;
     setAudit('ignore', [...audit().ignore, rule]);
   };
-  const IGNORE_KINDS: readonly (InsertionKind | '')[] = ['', ...INSERTION_KINDS];
-  const IGNORE_TRAITS: readonly (PointTrait | '')[] = ['', ...POINT_TRAITS];
   return (
     <Section title="Audit">
       <div class={css.field}>

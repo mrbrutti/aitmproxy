@@ -16,6 +16,7 @@ import { parseScanProfile, type ScanProfile } from './model';
 import { scanStore, type ScanStore } from './store';
 import { JobStrip } from './JobStrip';
 import { JobsView } from './JobsView';
+import { fmtLastGood } from './primitives';
 import css from './scanner.module.css';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -340,6 +341,33 @@ describe('JobsView: states (W-16)', () => {
     await tick();
     expect(h.count('scan.list')).toBe(before + 2);
     expect(h.r.container.querySelector(`.${css.errorBlock}`)).toBeNull();
+  });
+
+  it('jobs_last_good_is_read_time: a remounted view reports when the list was read, not when it mounted', async () => {
+    const T = Date.UTC(2026, 9, 31, 14, 3, 22);
+    const LATER = T + 30 * 60_000;
+    vi.setSystemTime(T);
+    const h = mount();
+    await tick();
+    expect(h.s.jobsLoadedAt()).toBe(T);
+
+    vi.setSystemTime(LATER);
+    h.r.unmount();
+    const r2 = render(() => (
+      <AppProvider store={h.app}>
+        <JobStrip />
+        <JobsView />
+      </AppProvider>
+    ));
+    await tick();
+    h.fail('scan.list', 'bus closed');
+    await h.s.refreshJobs();
+
+    const block = r2.container.querySelector(`.${css.errorBlock}`);
+    expect(block).not.toBeNull();
+    expect(block!.textContent).toContain(`last good: ${fmtLastGood(T)}`);
+    expect(block!.textContent).not.toContain(fmtLastGood(LATER));
+    expect(h.s.jobsLoadedAt()).toBe(T);
   });
 
   it('reconnecting: every button is disabled and a note says so; data is kept', async () => {

@@ -295,4 +295,23 @@ describe('IssueDetail', () => {
     expect(row.querySelector('[data-field="status"]')!.textContent).toBe('false_positive');
     expect(document.querySelector(`[data-issue="${REDIRECT}"] [data-field="status"]`)).toBeNull();
   });
+
+  it('update_error_renders_in_the_detail: a refused scan.issue.update prints the core text above the button', async () => {
+    const h = await mount();
+    await waitFor(() => expect(options()).toHaveLength(2));
+    const region = await openDetail(XSS);
+    h.fail('scan.issue.update', 'scan: not_found: x');
+    fireEvent.click(within(region).getByRole('button', { name: 'Update status' }));
+    await waitFor(() => expect(h.argsOf('scan.issue.update')).toHaveLength(1));
+
+    const alert = await waitFor(() => {
+      const el = region.querySelector('[data-error="issue"]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(alert.getAttribute('role')).toBe('alert');
+    expect(alert.textContent).toBe('Not found: x');
+    // The status shown is still the core's last word: the failed update changed nothing.
+    expect(region.querySelector('[data-field="status"]')!.textContent).toBe('open');
+  });
 });

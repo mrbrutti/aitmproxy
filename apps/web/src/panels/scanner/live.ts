@@ -99,6 +99,8 @@ export interface LiveModel {
   jobs: Accessor<JobSummary[]>;
   jobsLoaded: Accessor<boolean>;
   jobsError: Accessor<string | null>;
+  /** When `scan.list` last answered without an error (the "last good" of D-T8.10); `null` before it did. */
+  jobsLoadedAt: Accessor<number | null>;
   /** The last status the core gave for `job`, or `null` before the first read answered. */
   status: (job: string) => JobStatus | null;
   /**
@@ -140,6 +142,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
   const [jobs, setJobs] = createSignal<JobSummary[]>([]);
   const [jobsLoaded, setJobsLoaded] = createSignal(false);
   const [jobsError, setJobsError] = createSignal<string | null>(null);
+  const [jobsLoadedAt, setJobsLoadedAt] = createSignal<number | null>(null);
   const [liveCount, setLiveCount] = createSignal<number | null>(null);
   // Keyed by wire strings (job ids), so: no prototype, and every read through `own` (A5).
   const [statuses, setStatuses] = createStore<Record<string, JobStatus>>(emptyRecord());
@@ -188,6 +191,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
         setJobs(parsed.jobs);
         setJobsLoaded(true);
         setJobsError(null);
+        setJobsLoadedAt(Date.now());
         setLiveCount(parsed.jobs.filter((j) => isLive(j.state)).length);
       });
     } catch (e) {
@@ -466,6 +470,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
     jobs,
     jobsLoaded,
     jobsError,
+    jobsLoadedAt,
     status: (job: string) => own(statuses, job) ?? null,
     statusError: (job: string) => own(statusErrors, job) ?? null,
     liveCount,

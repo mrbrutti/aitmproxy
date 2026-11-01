@@ -15,7 +15,7 @@
 //   3. **Push is a trigger, poll is truth** (D-T8.3): every counter comes from `live.ts`, which
 //      reads it back from the core. This file adds no counter of its own.
 
-import { createEffect, createMemo, createRoot, createSignal, untrack, type Accessor } from 'solid-js';
+import { batch, createEffect, createMemo, createRoot, createSignal, untrack, type Accessor } from 'solid-js';
 import { createStore, produce } from 'solid-js/store';
 import type { AppStore } from '~/state/app';
 import { findingsState } from '~/panels/findings/state';
@@ -101,6 +101,14 @@ export interface ScanStore extends LiveModel {
   profiles: Accessor<ProfileListEntry[]>;
   profilesLoaded: Accessor<boolean>;
   profilesError: Accessor<string | null>;
+  /** When `scan.profile.list` last answered without an error (the "last good" of D-T8.10); `null` before it did. */
+  profilesLoadedAt: Accessor<number | null>;
+  /**
+   * Why the last `scan.profile.get` of `name` gave nothing — the rendered text of that refusal —
+   * or `null` while the last read of that profile answered. Keyed per name, so one profile's
+   * failure never shows under another's editor.
+   */
+  profileError(name: string): string | null;
   selectedProfile: Accessor<string | null>;
   setSelectedProfile(name: string | null): void;
   draft(name: string): ProfileDraft | null;
@@ -124,8 +132,6 @@ export interface ScanStore extends LiveModel {
 
   busy: Accessor<boolean>;
   lastError: Accessor<ScanError | null>;
-  /** `lastError()?.text`, for a caller that only renders. */
-  lastErrorText: Accessor<string | null>;
   /** `lastError()` when its `source` is one of `sources`, else `null`. */
   errorFor(sources: readonly ScanErrorSource[]): Accessor<ScanError | null>;
   startNotice: Accessor<StartResult | null>;
@@ -262,6 +268,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   const [profiles, setProfiles] = createSignal<ProfileListEntry[]>([]);
   const [profilesLoaded, setProfilesLoaded] = createSignal(false);
   const [profilesError, setProfilesError] = createSignal<string | null>(null);
+  const [profilesLoadedAt, setProfilesLoadedAt] = createSignal<number | null>(null);
   const [selectedProfile, setSelectedProfileSignal] = createSignal<string | null>(null);
   const [checks, setChecks] = createSignal<CheckMeta[]>([]);
   const [checksLoaded, setChecksLoaded] = createSignal(false);
@@ -277,6 +284,8 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   // Keyed by wire strings (profile names, issue ids), so: no prototype, every read via `own` (A5).
   const [drafts, setDrafts] = createStore<Record<string, ProfileDraft>>(emptyRecord());
+  /** `''` once a read of that name answered: a cleared slot, read back as `null`. */
+  const [profileErrors, setProfileErrors] = createStore<Record<string, string>>(emptyRecord());
   const [details, setDetails] = createStore<Record<string, Issue>>(emptyRecord());
   const [detailErrors, setDetailErrors] = createStore<Record<string, string>>(emptyRecord());
   /** The profile each draft is measured against: what `scan.profile.get` (or a save) last gave. */
@@ -336,6 +345,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
       }
       setProfiles(parsed.profiles);
       setProfilesError(null);
+      setProfilesLoadedAt(Date.now());
     } catch (e) {
       setProfilesLoaded(true);
       setProfilesError(errorText(e));
@@ -346,19 +356,26 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     setDrafts(name, { profile, dirty });
   }
 
-  /** A no-op while a draft exists: a read must never overwrite what the operator is editing. */
+  /**
+   * A no-op while a draft exists: a read must never overwrite what the operator is editing. A
+   * failure is reported once (the toast) and kept under its own name (`profileError`) until a
+   * read of that same name answers.
+   */
   async function loadProfile(name: string): Promise<void> {
     if (!ready() || own(drafts, name)) return;
     try {
       const parsed = parseScanProfile(await app.call<unknown>('scan.profile.get', { name }));
       if (!parsed) {
-        report('profile', shapeError('scan.profile.get'));
+        setProfileErrors(name, report('profile', shapeError('scan.profile.get')).text);
         return;
       }
       loaded.set(name, parsed);
-      putDraft(name, parsed, false);
+      batch(() => {
+        putDraft(name, parsed, false);
+        setProfileErrors(name, '');
+      });
     } catch (e) {
-      report('profile', errorText(e));
+      setProfileErrors(name, report('profile', errorText(e)).text);
     }
   }
 
@@ -653,6 +670,8 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     profiles,
     profilesLoaded,
     profilesError,
+    profilesLoadedAt,
+    profileError: (name: string) => own(profileErrors, name) || null,
     selectedProfile,
     setSelectedProfile: (name: string | null) => setSelectedProfileSignal(name),
     draft: (name: string) => own(drafts, name) ?? null,
@@ -675,7 +694,6 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
     busy: () => busyCount() > 0,
     lastError,
-    lastErrorText: () => lastError()?.text ?? null,
     errorFor,
     startNotice,
     dismissStartNotice: () => setStartNotice(null),

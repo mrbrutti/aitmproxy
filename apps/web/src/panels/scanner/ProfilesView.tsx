@@ -6,7 +6,7 @@
 // loads it (`store.loadProfile` never overwrites a draft in progress), and `standard` is selected
 // once, the first time a list arrives, so the surface opens on something runnable.
 
-import { createEffect, createMemo, createSignal, For, Match, onMount, Show, Switch, untrack, type Component } from 'solid-js';
+import { createEffect, createMemo, For, Match, onMount, Show, Switch, untrack, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import { ProfileEditor } from './ProfileEditor';
 import { ErrorBlock, listboxKeys, LoadingBars } from './primitives';
@@ -28,13 +28,6 @@ export const ProfilesView: Component = () => {
     void s.ensureProfiles();
     void s.ensureChecks();
     void s.ensureL4Scope();
-  });
-
-  // "Last good": when this view last saw the list answer without an error (D-T8.10).
-  const [lastGood, setLastGood] = createSignal<number | null>(null);
-  createEffect(() => {
-    s.profiles();
-    if (s.profilesLoaded() && s.profilesError() === null) setLastGood(Date.now());
   });
 
   /** Built-ins first, then saved; first-seen order inside each group (the sort is stable). */
@@ -79,9 +72,10 @@ export const ProfilesView: Component = () => {
             Profiles <span class={css.n}>{rows().length}</span>
           </span>
         </div>
-        {/* A failed reload keeps the rows (data kept, D-T8.10): the block sits above them. */}
+        {/* A failed reload keeps the rows (data kept, D-T8.10): the block sits above them, with the
+            time the list was last read without an error (the store's, not this mount's). */}
         <Show when={s.profilesLoaded() && s.profilesError()}>
-          {(error) => <ErrorBlock text={error()} lastGood={lastGood()} onRetry={() => void s.loadProfiles()} disabled={!s.busOpen()} />}
+          {(error) => <ErrorBlock text={error()} lastGood={s.profilesLoadedAt()} onRetry={() => void s.loadProfiles()} disabled={!s.busOpen()} />}
         </Show>
         <Switch>
           <Match when={!s.profilesLoaded()}>

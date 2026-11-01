@@ -184,18 +184,13 @@ const SRC_ROOT = resolve(__dirname, '../..');
 /** Every `.ts`/`.tsx` under `src/` that is not a test file, a test kit or an ambient declaration. */
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
-  for (const name of readdirSync(dir)) {
-    const path = join(dir, name);
-    let children: string[] | null = null;
-    try {
-      children = readdirSync(path);
-    } catch {
-      children = null; // ENOTDIR: a file
-    }
-    if (children !== null) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
       out.push(...sourceFiles(path));
       continue;
     }
+    const name = entry.name;
     if (!/\.tsx?$/.test(name)) continue;
     if (/\.test\.tsx?$/.test(name) || /\.d\.ts$/.test(name) || /\.testkit\.tsx?$/.test(name) || name === 'testkit.ts') continue;
     out.push(path);

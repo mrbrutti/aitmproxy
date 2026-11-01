@@ -9,14 +9,14 @@
 // status when none is held yet (a finished job is never polled, and its detail needs the fields
 // only `scan.status` carries); that read is gated on the bus being open inside `live.ts` (W-16).
 
-import { createEffect, createMemo, createSignal, For, Match, on, Show, Switch, type Component } from 'solid-js';
+import { createEffect, createMemo, For, Match, on, Show, Switch, type Component } from 'solid-js';
 import { Button } from '~/components';
 import { fmtWhenFull } from '~/panels/findings/model';
 import { useApp } from '~/state/context';
 import { fmtElapsed, isTerminal, stateWords, stoppedReasonText } from './helpers';
 import { jobOf, StateDot } from './JobStrip';
 import { SEVERITY_ORDER, type JobStatus, type JobSummary, type Lane, type StartResult } from './model';
-import { ErrorBlock, Fact, listboxKeys, LoadingBars, ReconnectNote, Section, yesNo } from './primitives';
+import { ErrorBlock, Fact, listboxKeys, LoadingBars, ReconnectNote, Section } from './primitives';
 import { SeverityBar } from './SeverityBar';
 import { scanStore } from './store';
 import css from './scanner.module.css';
@@ -69,13 +69,6 @@ export const JobsView: Component = () => {
     }),
   );
 
-  // "Last good": when this view last saw the list answer without an error (D-T8.10).
-  const [lastGood, setLastGood] = createSignal<number | null>(null);
-  createEffect(() => {
-    s.jobs();
-    if (s.jobsLoaded() && s.jobsError() === null) setLastGood(Date.now());
-  });
-
   let detailEl: HTMLDivElement | undefined;
 
   const select = (id: string) => s.setSelectedJob(id);
@@ -101,8 +94,10 @@ export const JobsView: Component = () => {
             <ReconnectNote />
           </Show>
         </div>
+        {/* The "last good" is when the list was last read without an error (D-T8.10): the store's
+            time, so a remount after a long gap does not pass itself off as fresh. */}
         <Show when={s.jobsError()}>
-          {(err) => <ErrorBlock text={err()} lastGood={lastGood()} onRetry={() => void s.refreshJobs()} disabled={offline()} />}
+          {(err) => <ErrorBlock text={err()} lastGood={s.jobsLoadedAt()} onRetry={() => void s.refreshJobs()} disabled={offline()} />}
         </Show>
         <div
           class={css.rows}
@@ -326,10 +321,10 @@ export const JobsView: Component = () => {
                         {(session) => (
                           <Section title="Session">
                             <dl class={css.facts}>
-                              <Fact label="reused" value={yesNo(session().reused)} />
-                              <Fact label="lost" value={yesNo(session().lost)} />
+                              <Fact label="reused" value={session().reused} />
+                              <Fact label="lost" value={session().lost} />
                               <Fact label="canary" value={canaryText(st())} mono />
-                              <Fact label="browser partial" value={yesNo(session().browser_partial)} />
+                              <Fact label="browser partial" value={session().browser_partial} />
                             </dl>
                           </Section>
                         )}

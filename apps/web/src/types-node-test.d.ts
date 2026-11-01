@@ -4,6 +4,7 @@
 // `URL` APIs the app relies on. Only the members the tests use are declared.
 declare module 'node:fs' {
   export function readFileSync(path: string, encoding: 'utf8' | 'utf-8'): string;
+  export function readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
   export function readdirSync(path: string): string[];
   export function existsSync(path: string): boolean;
 }

@@ -34,7 +34,7 @@ export const Fact: Component<{
     <dt>{props.label}</dt>
     <dd data-field={props.field} class={props.mono ? css.mono : undefined}>
       <Show when={props.value !== null && props.value !== undefined} fallback={<Dash />}>
-        {typeof props.value === 'boolean' ? String(props.value) : props.value}
+        {typeof props.value === 'boolean' ? yesNo(props.value) : props.value}
       </Show>
     </dd>
   </>

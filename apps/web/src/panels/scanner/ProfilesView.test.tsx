@@ -19,6 +19,7 @@ import { stubApp } from './testkit';
 import { scanStore, type ScanStore } from './store';
 import { AGENT_NOTE, CONFIRM_NOTE, PROFILE_NAME_HINT } from './helpers';
 import { parseScanProfile, type ScanProfile } from './model';
+import { fmtLastGood } from './primitives';
 import { ProfilesView } from './ProfilesView';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -175,6 +176,36 @@ describe('ProfilesView: the list (D-T8.5, D-T8.10)', () => {
     fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(h.count('scan.profile.list')).toBe(before + 1));
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
+
+  it('profiles_last_good_is_read_time: a remounted view reports when the list was read, not when it mounted', async () => {
+    const T = Date.UTC(2026, 9, 31, 14, 3, 22);
+    const LATER = T + 30 * 60_000;
+    // Only `Date` is faked: the view's `waitFor`/`findBy*` keep their real timers.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(T);
+      const h = await mount();
+      expect(h.s.profilesLoadedAt()).toBe(T);
+
+      vi.setSystemTime(LATER);
+      h.unmount();
+      render(() => (
+        <AppProvider store={h.app}>
+          <ProfilesView />
+        </AppProvider>
+      ));
+      await screen.findByLabelText('Profile name');
+      h.fail('scan.profile.list', 'bus closed');
+      await h.s.loadProfiles();
+
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent).toContain(`last good: ${fmtLastGood(T)}`);
+      expect(alert.textContent).not.toContain(fmtLastGood(LATER));
+      expect(h.s.profilesLoadedAt()).toBe(T);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('No profiles keeps the frame when the core has none', async () => {
@@ -364,6 +395,46 @@ describe('ProfileEditor: errors it does not own (PA5)', () => {
     expect(screen.getByRole('form', { name: 'Profile editor' }).textContent).not.toContain('Not found');
     // The editor is still bound and usable.
     expect((screen.getByLabelText('Profile name') as HTMLInputElement).value).toBe('standard');
+  });
+
+  it('profile_error_is_per_name: a failed scan.profile.get on one profile never shows while another loads', async () => {
+    const gate: { release: (() => void) | null } = { release: null };
+    const h = await mount({
+      replies: {
+        'scan.profile.get': (args: Record<string, unknown>) => {
+          if (args.name === 'thorough') return Promise.reject(new Error('scan: not_found: thorough'));
+          if (args.name === 'map-only') {
+            return new Promise((res) => {
+              gate.release = () => res({ ...(fixture('scan.profile.get.json') as object), name: 'map-only' });
+            });
+          }
+          return { ...(fixture('scan.profile.get.json') as object), name: args.name };
+        },
+      },
+    });
+    const row = (name: string): HTMLElement => h.container.querySelector(`[role=option][data-profile="${name}"]`) as HTMLElement;
+
+    fireEvent.click(row('thorough'));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Not found: thorough');
+    expect(h.s.profileError('thorough')).toBe('Not found: thorough');
+    expect(h.notice).toHaveBeenCalledWith('Not found: thorough', 'error');
+
+    // `map-only` is still loading: its editor shows the loading bars, not `thorough`'s error.
+    fireEvent.click(row('map-only'));
+    await screen.findByLabelText('Loading profile');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(h.s.profileError('map-only')).toBeNull();
+    gate.release!();
+    await screen.findByLabelText('Profile name');
+    expect((screen.getByLabelText('Profile name') as HTMLInputElement).value).toBe('map-only');
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    // Back on `thorough`: its own error is still there (and the read fails again).
+    fireEvent.click(row('thorough'));
+    const again = await screen.findByRole('alert');
+    expect(again.textContent).toContain('Not found: thorough');
+    expect(h.s.profileError('thorough')).toBe('Not found: thorough');
   });
 });
 

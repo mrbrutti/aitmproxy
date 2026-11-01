@@ -136,10 +136,11 @@ const j = JSON.stringify;
  * The run drives the web surface as a real `Frontend::Operator`, never as the agent: a core that
  * printed no `Operator` line (so `startAitm` has no operator URL) ends the run with a FAIL instead
  * of silently falling back to the agent token's URL (run 2 of the T8 proof was such a session).
+ * `where` names the moment (`at startup`, `after the 08b restart`) in the FAIL line.
  */
 function requireOperator(where) {
   if (env?.operatorUiUrl && env.operatorToken) return true;
-  fail('00 operator URL', `the core printed no Operator line${where ? ` (${where})` : ''}; this run would be an agent session`);
+  fail('00 operator URL', `the core printed no Operator line (${where}); this run would be an agent session`);
   return false;
 }
 
@@ -209,6 +210,40 @@ const valueOf = (sel) => d.ev(`document.querySelector(${j(sel)})?.value ?? null`
 // --- real-input interactions -----------------------------------------------------------------
 const goScan = () => d.click({ role: 'button', text: 'Scan', match: 'startsWith', within: SIDEBAR });
 const clickTab = (label) => d.click({ role: 'tab', text: label, match: 'startsWith', within: TABLIST });
+const JOBS_TAB = `${TABLIST} [role=tab][data-tab="jobs"]`;
+const SELECTED_PROFILE = `${PROFILES} [data-profile][aria-selected="true"]`;
+
+/**
+ * Waits for the panel's layout to settle after a mount: the Jobs tab count has loaded (its text no
+ * longer ends in `0`), or 2 s have passed (a core with no jobs reads `0` for good). A freshly
+ * (re)started core loads its persisted jobs a moment after the panel mounts, and the job strip
+ * that then appears pushes everything below it down — a click located before that lands on the
+ * wrong row (live run 6, step 08b: `l4-stream-safe` was located, `thorough` was clicked).
+ */
+const waitForJobsSettled = () =>
+  soft(async () => {
+    const t = await d.q('text', JOBS_TAB);
+    return typeof t === 'string' && t.trim() !== '' && !/0$/.test(t.trim()) ? true : null;
+  }, 2000);
+
+/**
+ * Selects a profile row the way an operator does and proves the selection landed: settle first,
+ * click the row, and expect `[data-profile=name][aria-selected=true]` within 1 s. A miss re-locates
+ * and clicks once more; a second miss FAILs the step naming the row that IS selected. Returns
+ * whether `name` is selected, so the caller can stop instead of editing another profile's draft.
+ */
+async function selectProfile(name, label) {
+  await waitForJobsSettled();
+  const sel = `${PROFILES} [data-profile="${name}"]`;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await d.click({ sel });
+    const picked = await soft(async () => ((await countOf(`${sel}[aria-selected="true"]`)) > 0 ? true : null), 1000);
+    if (picked) return true;
+    if (attempt === 1) out(`  ${name} is not selected after the click (selected: ${j(await attr(SELECTED_PROFILE, 'data-profile'))}); re-locating and clicking once more`);
+  }
+  fail(`${label} select ${name}`, `clicked ${sel} twice; the selected row is ${j(await attr(SELECTED_PROFILE, 'data-profile'))}`);
+  return false;
+}
 
 /** `true` when the page's focused element is the one `sel` selects. */
 const isFocused = (sel) => d.ev(`(() => { const e = document.querySelector(${j(sel)}); return !!e && document.activeElement === e; })()`);
@@ -595,7 +630,7 @@ async function run() {
     // The first job is long done by now (a standard scan of the test target lasts seconds), so the
     // cancel is proven on a SECOND standard job started here and cancelled within a second.
     await clickTab('Profiles');
-    await d.click({ sel: `${PROFILES} [data-profile="standard"]` });
+    if (!(await selectProfile('standard', '05'))) return;
     const want = `http://127.0.0.1:${target.port}`;
     let origins = await d.q('text', '[aria-label="Origins"]');
     if (!(origins ?? '').includes(want)) {
@@ -632,7 +667,12 @@ async function run() {
     expect(!!immediate, '05a the row or strip reads cancelling or cancelled immediately', `rendered ${j(await readBoth())}`);
     const settled = await soft(async () => (await readBoth()).find((t) => /^cancelled$/.test(t)) ?? null, 5000);
     expect(!!settled, '05b the row reads cancelled within 5 s', `rendered ${j(await readBoth())}`);
-    const st = (await soft(async () => ((await status(job2)).state === 'cancelled' ? true : null), 5000)) ? { state: 'cancelled' } : await status(job2);
+    // The witness's own reply is what is judged: the one that read `cancelled`, else the last one.
+    const st =
+      (await soft(async () => {
+        const s = await status(job2);
+        return s.state === 'cancelled' ? s : null;
+      }, 5000)) ?? (await status(job2));
     expect(st.state === 'cancelled', '05c the witness scan.status.state is cancelled', `witness state ${j(st.state)}`);
     // Steps 6 and 7 are about the FIRST job (its site map, its strip): re-select it in the Jobs list.
     await d.click({ sel: `${JOBS} [data-job="${jobId}"]` });
@@ -698,7 +738,7 @@ async function run() {
       gap('08a l4-stream-safe', 'this core does not offer the l4-stream-safe profile');
       return;
     }
-    await d.click({ sel: `${PROFILES} [data-profile="l4-stream-safe"]` });
+    if (!(await selectProfile('l4-stream-safe', '08a'))) return;
     // With neither an origin nor an L4 target the (correct) first reason is `add an origin or an L4
     // target`; the D11 coverage hint is the reason for a TARGET no L4 scope entry covers.
     await addL4Target();
@@ -733,8 +773,11 @@ async function run() {
     await d.open(env.operatorUiUrl);
     await waitFor(() => d.q('exists', 'span[title="bus open"]'), { timeoutMs: 20000, what: 'status bar "bus open" after the restart' });
     await goScan();
+    // The restarted core loads its persisted jobs a beat after the panel mounts: let the strip
+    // appear (or not) before the first click in the panel, so nothing moves under the pointer.
+    await waitForJobsSettled();
     await clickTab('Profiles');
-    await d.click({ sel: `${PROFILES} [data-profile="l4-stream-safe"]` });
+    if (!(await selectProfile('l4-stream-safe', '08b'))) return;
     // The fresh page has a fresh draft: the L4 target is added again.
     await addL4Target();
 

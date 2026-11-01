@@ -9,12 +9,13 @@
 // tabs pattern. While the bus is not open (D-T8.10) a one-line note appears and every control in the
 // surface is disabled; the views keep their data and re-enable when the bus returns.
 
-import { For, Match, Switch, onMount, type Component, type JSX } from 'solid-js';
+import { For, Match, Show, Switch, onMount, type Component, type JSX } from 'solid-js';
 import { Icon } from '~/components';
 import { useApp } from '~/state/context';
 import { IssuesView } from './IssuesView';
 import { JobStrip } from './JobStrip';
 import { JobsView } from './JobsView';
+import { ReconnectNote } from './primitives';
 import { ProfilesView } from './ProfilesView';
 import { SitemapView } from './SitemapView';
 import { scanStore, type Tab } from './store';
@@ -116,13 +117,12 @@ export const Scanner: Component = () => {
             }}
           </For>
         </div>
-        <Switch>
-          <Match when={!busOpen()}>
-            <p class={css.reconnectNote} role="status">
-              reconnecting…
-            </p>
-          </Match>
-        </Switch>
+        {/* The one reconnecting sentence every view prints (D-T8.10), in the header's slot. */}
+        <Show when={!busOpen()}>
+          <div class={css.reconnectNote}>
+            <ReconnectNote />
+          </div>
+        </Show>
       </header>
 
       <JobStrip />

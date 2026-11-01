@@ -13,7 +13,7 @@ import { fmtClock } from '~/lib/format';
 import { SeverityPill } from '~/panels/findings/SeverityPill';
 import { useApp } from '~/state/context';
 import { ISSUE_STATUSES, type Issue, type IssueStatus, type L4Oracle } from './model';
-import { Dash, ErrorBlock, Fact, LoadingBars, yesNo } from './primitives';
+import { Dash, ErrorBlock, Fact, LoadingBars } from './primitives';
 import { scanStore } from './store';
 import css from './scanner.module.css';
 
@@ -42,6 +42,8 @@ export const IssueDetail: Component<{ id: string }> = (props) => {
   const issue = (): Issue | null => s.issueDetail(props.id);
   const error = (): string | null => s.issueDetailError(props.id);
   const offline = (): boolean => !s.busOpen();
+  /** The one store error this detail owns (PA5): a refused `scan.issue.update`, beside the toast. */
+  const updateError = s.errorFor(['issue']);
 
   // The read is per id: a cached issue is shown at once and refreshed behind it.
   createEffect(on(() => props.id, (id) => void s.loadIssue(id)));
@@ -213,8 +215,8 @@ export const IssueDetail: Component<{ id: string }> = (props) => {
                       />
                       <Fact label="prior messages" value={String(l4().prior_messages)} />
                       <Fact label="oracle" value={oracleText(l4().oracle)} />
-                      <Fact label="liveness before" value={yesNo(l4().liveness_before)} />
-                      <Fact label="liveness after" value={yesNo(l4().liveness_after)} />
+                      <Fact label="liveness before" value={l4().liveness_before} />
+                      <Fact label="liveness after" value={l4().liveness_after} />
                       <Fact label="reproduced" value={`${l4().reproduced[0]}/${l4().reproduced[1]}`} />
                       <Fact label="scope entry" value={l4().scope_entry} mono />
                     </dl>
@@ -316,6 +318,13 @@ export const IssueDetail: Component<{ id: string }> = (props) => {
                     onInput={(e) => setDraftNote(e.currentTarget.value)}
                   />
                 </div>
+                <Show when={updateError()}>
+                  {(e) => (
+                    <p class={css.reason} role="alert" data-error="issue">
+                      {e().text}
+                    </p>
+                  )}
+                </Show>
                 <div class={css.footer}>
                   <Button variant="primary" disabled={offline() || s.busy()} onClick={update}>
                     Update status
