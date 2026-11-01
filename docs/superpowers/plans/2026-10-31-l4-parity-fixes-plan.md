@@ -19,7 +19,7 @@
 | # | Decision | Tasks |
 |---|---|---|
 | 1 | Status shape `{available, code, reason, captures\|sessions}` and the `code` vocabulary are (a)'s; the privilege spec only adds an optional `privilege` key. Tests assert `code`; literal reasons only in A9. | A4, A14, A9 |
-| 2 | `l4.flow.get` bytes: the core never records its own listeners; `bytes` only for trusted callers or an open agent Capture gate; at most 4 MiB of raw bytes per reply. | A10, A11, A12 |
+| 2 | `l4.flow.get` bytes: the core never records its own listeners; `bytes` per packet: trusted callers always; an agent sees captured packets with its Capture gate open and injected packets with its Inject gate open (spec §2.2 as amended after the re-panel); at most 4 MiB of raw bytes per reply. | A10, A11, A12 |
 | 3 | `l4.intercept.list` is arrival-ordered (oldest first, `parked_at`); every UI acts on the first listed entry for the flow (plan question 2, decided). | A13, B1, C1, M1 |
 | 4 | Availability is read through an `AvailabilitySource` at invoke time, so D0 swaps in `PrivilegeState` without touching commands. | A14 |
 | 5 | Operator scope add (fork ii, with Matt) moves to (a') as A6. A5 (`source` provenance on `l4.scope.list`) stays in (a): it landed as be9d15e4, is harmless on its own, and the UI units read `source` regardless of fork ii. UI scope-add controls render only when `tools/list` shows `l4.scope.add` `confirmable: true`. | A5, A6, B1, B6, C1, C7, M2, M7 |
@@ -163,6 +163,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 
 ### Task A10: self-exclusion of the core's own listeners
 
+> Amended after the panel (Review log): the choke point is `L4Guard::admit_frame`/`admit_endpoints`, used by every recorder (capture loop, send_recv reply listener, intercept park, NE ingress) and `main.rs`/`tui.rs` add bound ports with `add_self_ports`; files also include `sendrecv.rs`, `ingress.rs`, `tui.rs`.
+
+
 - **Satisfies:** AC34
 - **Depends on:** A15
 - **Files:** `crates/aitm-proto-l4/src/{capture,guard,module}.rs`, `crates/aitm/src/wire.rs`, `crates/aitm/src/main.rs` (both in spec §7(a); name them in the claim)
@@ -177,6 +180,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
 ### Task A11: bytes only to trusted callers
+
+> Amended after the re-panel (Review log): the gate is per packet (captured→Capture gate, injected→Inject gate), not per caller or per flow kind; tests `…_per_packet`.
+
 
 - **Satisfies:** AC35
 - **Depends on:** A10
@@ -196,6 +202,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 
 ### Task A13: `l4.intercept.list` in arrival order
 
+> Amended after the panel (Review log): the sequence is process-wide (`NEXT_PARKED_SEQ`), sort key `(parked_seq, id)`.
+
+
 - **Satisfies:** AC37
 - **Depends on:** A12
 - **Files:** `crates/aitm-proto-l4/src/intercept/mod.rs`, `src/commands/intercept.rs`
@@ -205,6 +214,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
 ### Task A9: unprivileged live checks and the blocked-aware privileged walk
+
+> Amended after the panel (Review log): the core cell asserts the 22 module verbs, not a total count; the AC6 agent scope-add check runs here and AC5 is skipped until (a').
+
 
 - **Satisfies:** AC2 (live), AC3, AC4, AC9, AC34 [D0] verdict, AC1/AC8 [D0] verdicts
 - **Depends on:** A13
@@ -599,7 +611,7 @@ Spec §7(e) file list. Starts after (a) is reviewed; merges after (a) and (a').
 - **Satisfies:** AC32 (second half)
 - **Depends on:** E1
 - **Files:** `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md`
-- **Change:** overview gains an "L4 (raw TCP/UDP)" section: the status verbs answer `available`, `code`, `reason` (and what `needs_privilege`, `unsupported_platform`, `not_configured` mean); `l4.scope.add` is operator-confirmed and an agent is refused unless the operator opened the Widen gate; `l4.intercept.*` is Linux NFQUEUE only; verdict verbs take the **parked id** from `l4.intercept.list` (oldest first), never the flow id; `l4.flow.get` takes `offset`/`limit` (`limit: 0` for listing), returns `bytes` only to the operator or an agent with the Capture gate open, and pages with `next_offset` when `truncated`. Intercept-mutate gains one paragraph separating HTTP `flow.intercept` / `flow.resume` from `l4.intercept.*`.
+- **Change:** overview gains an "L4 (raw TCP/UDP)" section: the status verbs answer `available`, `code`, `reason` (and what `needs_privilege`, `unsupported_platform`, `not_configured` mean); `l4.scope.add` is operator-confirmed and an agent is refused unless the operator opened the Widen gate; `l4.intercept.*` is Linux NFQUEUE only; verdict verbs take the **parked id** from `l4.intercept.list` (oldest first), never the flow id; `l4.flow.get` takes `offset`/`limit` (`limit: 0` for listing), returns `bytes` per packet: always to the operator or the CLI; to an agent only for captured packets when its Capture gate is open and for injected packets when its Inject gate is open, and pages with `next_offset` when `truncated`. Intercept-mutate gains one paragraph separating HTTP `flow.intercept` / `flow.resume` from `l4.intercept.*`.
 - **Test first (the check):** `grep -c` for `available`, `code`, `reason`, `l4.scope.add`, `parked`, `Linux`, `next_offset` in the overview; each 0 on `origin/main`.
 - **Live check:** each ≥ 1; human read-through by the spec reviewer.
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
@@ -610,9 +622,9 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| (a) A10/A11 | security | Critical | Self-exclusion guarded only the capture loop; send_recv replies, Linux parks and NE ingress units reach the same store that `l4.flow.get` now serves with bytes | fixed: `L4Guard::admit_frame`/`admit_endpoints` choke point + intercept forwards self traffic (d9f01f95); send_recv BPF + Ignore, NE ingress, tui on_bound (fix task 2, sha below) |
+| (a) A10/A11 | security | Critical | Self-exclusion guarded only the capture loop; send_recv replies, Linux parks and NE ingress units reach the same store that `l4.flow.get` now serves with bytes | fixed: `L4Guard::admit_frame`/`admit_endpoints` choke point + intercept forwards self traffic (d9f01f95); send_recv BPF + Ignore, NE ingress, tui on_bound (53a95d1a) |
 | (a) A11 | security | Important | Capture gate alone exposed bytes of intercept/craft flows an agent could not capture | fixed d9f01f95: bytes gate keyed on flow kind (Capture→Capture, SendRecv/craft→Inject, Intercept→Intercept); spec §2.2 amended |
-| (a) A10 | security | Important | `aitm tui` with an ephemeral bus port never added it to the self-port set | fixed in fix task 2 (tui.rs on_bound) |
+| (a) A10 | security | Important | `aitm tui` with an ephemeral bus port never added it to the self-port set | fixed 53a95d1a (tui.rs on_bound hook) |
 | (a) A13 | quality, spec | Important | `parked_seq` per session: unfiltered `l4.intercept.list` interleaved sessions | fixed d9f01f95: process-wide `NEXT_PARKED_SEQ`, sort `(parked_seq, id)`, tester's cross-session test un-ignored |
 | (a) A9 | spec | Important | priv cell's BPF assertion false-fails on a multi-port rig | fixed 8b5fed22 (tester): parses both filter forms |
 | (a) A9 | spec | Important | Agent scope-add live check (AC6) landed in (a) though planned for (a') | accepted by the orchestrator 2026-11-01: the check is correct and runs against R_WIDEN; A6's live check on (a') turns the AC5 skip into a pass |
@@ -620,9 +632,16 @@ Kept by the main session during stage 6. One row per finding.
 | (a) A4 | spec | Minor | macOS probe unit test asserted the literal reason | fixed d9f01f95: asserts `code` and a non-empty reason |
 | (a) A7 | spec | Minor | `pub const DEFAULT_INTERFACE` not recorded | accepted by the orchestrator 2026-11-01: recorded here; needed so both test files share one per-OS constant |
 | (a) A5 | spec | Minor | `commands/scope.rs` missing from §7(a); A5 filed under (a') | fixed: spec §7(a) lists it; A5 stays in (a) (Decision 5) |
-| (a) A2 | security | Minor | `l4.flow.get` clones the whole flow under the store lock whatever the window | accepted by the orchestrator 2026-11-01 as follow-up (windowed store accessor; `flow.rs` outside (a)) |
+| (a) A2 | security | Minor | `l4.flow.get` clones the whole flow under the store lock whatever the window | accepted by the orchestrator 2026-11-01 as follow-up (windowed store accessor in `src/flow.rs`, the store, outside (a)) |
 | (a) §2.1 | security | Minor | Other cores on the host and the CDP port are not excluded | accepted; recorded as a known limit in spec §2.1 |
 | (a) A14 | quality | Minor | `docs/design/languages/rhai.api.json` still lists `flow.get` with only `id` | follow-up for unit (e) (file outside (a)) |
+| (a) A11 (re-panel) | security | Important | Per-flow-kind bytes gate let an Inject-only agent read captured send_recv replies | fixed in fix task 3: per-packet rule (captured→Capture gate, injected→Inject gate); spec §2.2/AC35 amended |
+| (a) A13 (re-panel) | quality | Important | `expire_due` deep-cloned every parked packet per reader pass | fixed in fix task 3: `ParkedTable::due()` by reference |
+| (a) fix 2 (re-panel) | security | Minor ×2 | NE ingress ran the frame decoder over UDP payloads (crafted payload could suppress a record); intercept self-check parsed as Ethernet while `ip_target` parses L3 | fixed in fix task 3 (target-only admission; one L3 parse) |
+| (a) fix 2 (re-panel) | security | Minor | Intercept gate alone shows parked bytes | superseded by the per-packet rule (parked packets are captured → Capture gate) |
+| (a) fix 1/2 (re-panel) | quality | Minor ×9 | source-grep tui test, dead `is_self_traffic`, caller-side loopback check for the BPF clause, `&[]` frame marker in ingress, duplicated self-port hook, triple transport mapping, needless clones in scoped send_recv, SeqCst + overclaiming doc, fifth fixture builder | fixed in fix task 3 |
+| (a) docs (re-panel) | spec | Important | §2.2 amendment not carried into Goals, AC35, Decision 2, A11, E2 | fixed in this docs commit (per-packet rule everywhere) |
+| (a) docs (re-panel) | spec | Minor ×4 | AC34 names only the capture loop; Constraints bullet lacks tui/ingress; A10/A13/A9 task text drifted; Review log SHAs missing; `is_loopback_interface` pub | fixed in this docs commit; `is_loopback_interface` becomes `pub(crate)` in fix task 3 |
 
 ## Shipped
 
