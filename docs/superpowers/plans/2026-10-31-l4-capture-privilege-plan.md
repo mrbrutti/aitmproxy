@@ -739,7 +739,7 @@ capability's reason.
 - **Satisfies:** spec §2.1 (every production `PcapBackend::new()` caller takes `state.backend()`), AC8 (Linux via
   helper)
 - **Depends on:** P1b.7
-- **Files:** `crates/aitm-proto-l4/src/backend/routed.rs` (create), `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/mod.rs` (`wire_commands` takes a backend), `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm-proto-l4/src/module.rs`
+- **Files:** `crates/aitm-proto-l4/src/backend/routed.rs` (create), `crates/aitm-proto-l4/src/backend/mod.rs`, `crates/aitm-proto-l4/src/commands/mod.rs` (`wire_commands` takes a backend), `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm-proto-l4/src/module.rs`, `crates/aitm-proto-l4/src/commands/capture.rs` (test `wire_commands_registered` only: the fourth argument; added 2026-11-01 by the p1b orchestrator on the Coder's Rule 10 report, since the test call is `wire_commands`' second caller and P1b.9 touches the file only after P1b.8)
 - **Change:**
   - `pub struct RoutedBackend { state: Weak<…> or Arc<PrivilegeState> }` implements `CaptureInjectBackend`. Each
     `open_capture` / `inject` asks the state for its current backend: the in-process `PcapBackend` when
