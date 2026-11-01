@@ -1,31 +1,68 @@
 //! Shared helpers for the tester's integration tests. Everything here goes
 //! through `aitm-tui`'s public surface: `App::update` / `App::on_bus` for
-//! state, `snapshot::render` + `snapshot::to_text` for what the operator sees.
+//! state, `ui::render` into an off-screen `Buffer` for what the operator
+//! sees. There is no recorded data: every test writes the `BusEvent`s it
+//! needs as inline literals in the core's wire shapes.
 
 #![allow(dead_code)]
 
-use aitm_tui::action::{BusEvent, BusRequest, ToolInfo};
+use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
 use aitm_tui::app::App;
+use aitm_tui::caps::TermCaps;
 use aitm_tui::model::ProxyStatus;
-use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
+use aitm_tui::ui::render;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::Rect;
 use serde_json::{json, Value};
 
-/// The design palette: what every snapshot renders with.
+/// The design palette: what every off-screen draw renders with.
 pub fn theme() -> Theme {
     Theme::new(true)
 }
 
-/// Draw `app` off-screen at `cols`×`rows`.
+/// Draw `app` off-screen at `cols`×`rows`, exactly as `ui::view` would draw
+/// a terminal of that size.
 pub fn draw(app: &App, cols: u16, rows: u16) -> Buffer {
-    render(app, &theme(), cols, rows)
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+    render(app, &theme(), area, &mut buf);
+    buf
+}
+
+/// A drawn buffer as text, styles dropped: one symbol per cell, each line
+/// trimmed of trailing spaces, `\n`-joined and ending in `\n`.
+pub fn to_text(buf: &Buffer) -> String {
+    let area = buf.area;
+    let mut out = String::new();
+    for y in area.y..area.bottom() {
+        let mut line = String::new();
+        for x in area.x..area.right() {
+            if let Some(c) = buf.cell((x, y)) {
+                line.push_str(c.symbol());
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// The screen as text, styles dropped, one line per row.
 pub fn text_of(app: &App, cols: u16, rows: u16) -> String {
     to_text(&draw(app, cols, rows))
+}
+
+/// An [`App`] at `cols`×`rows`, connected to a bus that offers every
+/// [`CORE_TOOLS`] name (bus address `test`, so it is not a loopback bus).
+/// Flows, details, scope and findings are not part of it; each test feeds
+/// the `BusEvent`s it needs as inline literals.
+pub fn connected_app(cols: u16, rows: u16) -> App {
+    let mut app = App::new(TermCaps::full(), "test");
+    let _ = app.update(Action::Resize(cols, rows));
+    let _ = connect(&mut app, CORE_TOOLS, None);
+    app
 }
 
 /// The first line containing `needle`.

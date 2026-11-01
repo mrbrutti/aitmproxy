@@ -1,19 +1,17 @@
 //! Tester (stage 5) — malformed, empty and oversized input, and a key/reducer
-//! sweep. Nothing a proxy peer, a fixture file or the keyboard can send may
-//! panic the UI: a crash here is a crash of the operator's console mid-test.
+//! sweep. Nothing a proxy peer or the keyboard can send may panic the UI: a
+//! crash here is a crash of the operator's console mid-test. Every app here
+//! is built from inline literals in the core's wire shapes.
 
 mod common;
 
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use aitm_bus_client::BusTransport;
-use aitm_tui::action::Action;
+use aitm_tui::action::{Action, BusEvent};
 use aitm_tui::app::{parse_kv_args, App, ComposeForm, EditBuffer, Mode, PromptKind};
 use aitm_tui::base64;
 use aitm_tui::filter;
-use aitm_tui::fixture::{Fixture, FixtureTransport};
-use aitm_tui::fixture_app;
 use aitm_tui::keys;
 use aitm_tui::model::{
     scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Intercept,
@@ -25,13 +23,98 @@ use common::*;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MediaKeyCode, ModifierKeyCode,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 fn lines_text(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
     lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect()
+}
+
+/// A 200×50 app on today's bus with two flows and their details, both in
+/// scope — `f41`, a completed GET, and `f50`, a POST paused at intercept
+/// (selected) — plus one library PoC, so every mode and prompt is reachable
+/// the way the operator reaches it.
+fn sample_app() -> App {
+    let mut app = connected_app(200, 50);
+    let _ = app.on_bus(BusEvent::Scope(vec![
+        "api.shop-staging.test".into(),
+        "auth.shop-staging.test".into(),
+    ]));
+    let _ = app.on_bus(BusEvent::Flows(vec![
+        summary(
+            "f41",
+            "GET",
+            "api.shop-staging.test",
+            "/api/products?category=electronics&limit=20",
+            Some(200),
+            "observed",
+        ),
+        summary(
+            "f50",
+            "POST",
+            "auth.shop-staging.test",
+            "/api/auth/login",
+            None,
+            "intercepted",
+        ),
+    ]));
+    let products = br#"{"items":[{"id":101,"name":"USB-C dock","price":89.5}],"page":1,"total":1}"#;
+    let f41 = FlowDetail::from_json(&json!({
+        "id": "f41", "kind": "http", "intercept": "observed", "edited": false,
+        "request": {
+            "method": "GET", "scheme": "https", "authority": "api.shop-staging.test",
+            "path": "/api/products?category=electronics&limit=20", "version": "HTTP/2",
+            "headers": [["host", "api.shop-staging.test"], ["accept", "application/json"]],
+            "body": null, "body_size": 0, "body_truncated": false
+        },
+        "response": {
+            "status": 200, "version": "HTTP/2",
+            "headers": [["content-type", "application/json; charset=utf-8"]],
+            "body": base64::encode(products), "body_size": products.len(),
+            "body_truncated": false
+        },
+        "client_conn": {"peer": "127.0.0.1:52101", "sni": "api.shop-staging.test",
+                        "alpn": "h2", "tls": true, "process": "curl"},
+        "server_conn": {"peer": "203.0.113.10:443", "sni": "api.shop-staging.test",
+                        "alpn": "h2", "tls": true},
+        "meta": {"marks": [], "comment": null, "is_replay": false,
+                 "created": "2026-10-27T11:04:58.120Z", "duration_ms": 89,
+                 "truncated": false, "origin": "human"}
+    }))
+    .unwrap();
+    let login = br#"{"email":"ops@shop-staging.test","password":"correct-horse-battery"}"#;
+    let f50 = FlowDetail::from_json(&json!({
+        "id": "f50", "kind": "http", "intercept": "intercepted", "edited": false,
+        "request": {
+            "method": "POST", "scheme": "https", "authority": "auth.shop-staging.test",
+            "path": "/api/auth/login", "version": "HTTP/2",
+            "headers": [["host", "auth.shop-staging.test"],
+                        ["content-type", "application/json"], ["accept", "*/*"]],
+            "body": base64::encode(login), "body_size": login.len(),
+            "body_truncated": false
+        },
+        "response": null,
+        "client_conn": {"peer": "127.0.0.1:52114", "sni": "auth.shop-staging.test",
+                        "alpn": "h2", "tls": true, "process": "curl"},
+        "server_conn": null,
+        "meta": {"marks": [], "comment": null, "is_replay": false,
+                 "created": "2026-10-27T11:05:22.994Z", "duration_ms": null,
+                 "truncated": false, "origin": "human"}
+    }))
+    .unwrap();
+    let _ = app.on_bus(BusEvent::Detail(Box::new(f41)));
+    let _ = app.on_bus(BusEvent::Detail(Box::new(f50)));
+    // One library PoC (`poc.list`), never run, so `r` in Findings has a
+    // file to offer; the `poc.get` it asks for is left unanswered.
+    let _ = app.on_bus(BusEvent::Findings(vec![Finding::from_json(&json!({
+        "poc_path": "pocs/open-redirect-next.yaml", "id": "open-redirect-next",
+        "title": "Open redirect via next=", "severity": "low"
+    }))
+    .unwrap()]));
+    app.selected = Some("f50".into());
+    app
 }
 
 // ------------------------------------------------------------ model parsers
@@ -96,8 +179,12 @@ fn flow_detail_from_json_tolerates_empty_and_wrongly_typed_input() {
     assert_eq!(d.messages[2].dir, None);
 
     // Through the app: a malformed detail for a known flow leaves the row as it was.
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app();
     let before = app.row("f41").unwrap().clone();
+    assert!(
+        before.time.is_some() && before.req_size.is_some(),
+        "{before:?}"
+    );
     let d = FlowDetail::from_json(&json!({"id":"f41","request":"nope","response":"nope"})).unwrap();
     let _ = app.on_bus(aitm_tui::action::BusEvent::Detail(Box::new(d)));
     let after = app.row("f41").unwrap();
@@ -216,7 +303,7 @@ fn percent_decoding_survives_a_multibyte_character_after_the_percent_sign() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let direct = catch_unwind(|| viewers::percent_decode("%aé=1"));
-    let mut app = fixture_app(200, 50);
+    let mut app = connected_app(200, 50);
     let _ = app.on_bus(aitm_tui::action::BusEvent::Flows(vec![summary(
         "evil",
         "GET",
@@ -389,7 +476,7 @@ fn filter_parser_never_panics_and_names_each_error() {
     assert!(!filter::wild("?", ""));
     assert!(filter::wild("A.TEST", "https://a.test/p"));
     // The prompt applies live and swallows parse errors until Enter.
-    let mut app = fixture_app(200, 50);
+    let mut app = connected_app(200, 50);
     let _ = app.update(Action::FilterOpen);
     for c in "~m (".chars() {
         let _ = app.update(Action::Input(c));
@@ -402,113 +489,6 @@ fn filter_parser_never_panics_and_names_each_error() {
         "stays open on an error"
     );
     assert!(toast(&app).starts_with("filter: "), "{}", toast(&app));
-}
-
-// ----------------------------------------------------------- fixture bus
-
-async fn reply(t: &FixtureTransport, line: impl Into<String>) -> Value {
-    let raw = t
-        .send(line.into())
-        .await
-        .expect("fixture transport never fails")
-        .expect("a reply line");
-    serde_json::from_str(&raw).expect("reply is JSON")
-}
-
-#[tokio::test]
-async fn fixture_transport_answers_malformed_lines_with_json_rpc_errors() {
-    let t = FixtureTransport::new(Fixture::builtin().shared());
-    let v = reply(&t, "this is not json").await;
-    assert_eq!(v["error"]["code"], -32700);
-    assert!(v["id"].is_null());
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .starts_with("parse error"));
-    assert_eq!(reply(&t, "").await["error"]["code"], -32700);
-    assert_eq!(
-        reply(&t, "x".repeat(1 << 20)).await["error"]["code"],
-        -32700
-    );
-    assert_eq!(reply(&t, "{").await["error"]["code"], -32700);
-
-    // No id: a notification, no reply.
-    assert_eq!(
-        t.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string())
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        t.send(json!({"method":"tools/list"}).to_string())
-            .await
-            .unwrap(),
-        None,
-        "a request without an id gets no reply"
-    );
-    // Unknown method, unknown tool, missing arguments.
-    assert_eq!(
-        reply(
-            &t,
-            json!({"jsonrpc":"2.0","id":1,"method":"nope"}).to_string()
-        )
-        .await["error"]["code"],
-        -32601
-    );
-    let v = reply(
-        &t,
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope"}}).to_string(),
-    )
-    .await;
-    assert_eq!(v["error"]["code"], -32602);
-    let v = reply(
-        &t,
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flow.get","arguments":"not an object"}}).to_string(),
-    )
-    .await;
-    assert_eq!(v["result"]["isError"], true);
-    assert_eq!(v["result"]["content"][0]["text"], "missing `id`");
-    let v = reply(
-        &t,
-        json!({"jsonrpc":"2.0","id":4,"method":"tools/call"}).to_string(),
-    )
-    .await;
-    assert_eq!(v["error"]["code"], -32602, "no params at all");
-    // Ids of any JSON type are echoed.
-    assert_eq!(
-        reply(&t, json!({"id":"abc","method":"ping"}).to_string()).await["id"],
-        "abc"
-    );
-    assert_eq!(
-        reply(&t, json!({"id":{"a":1},"method":"ping"}).to_string()).await["id"],
-        json!({"a":1})
-    );
-
-    // Fixture documents: not JSON is an error; `{}` and `[]` give defaults.
-    assert!(Fixture::parse("nope").is_err());
-    let f = Fixture::parse("{}").unwrap();
-    assert!(f.flows.is_empty());
-    assert_eq!(f.listening, "127.0.0.1:8080");
-    assert!(!f.intercept_armed);
-    let f = Fixture::parse("[]").unwrap();
-    assert!(f.tools.is_empty());
-    // Non-numeric ids do not break id allocation.
-    let mut f =
-        Fixture::parse(r#"{"flows":[{"id":"abc"},{"id":"f7"}],"tools":[{"name":"flow.replay"}]}"#)
-            .unwrap();
-    let mut args = Map::new();
-    args.insert("id".into(), json!("abc"));
-    assert_eq!(f.call("flow.replay", &args).unwrap(), json!("f8"));
-    assert_eq!(f.flows.len(), 3);
-    assert!(f
-        .call("flow.get", &Map::new())
-        .unwrap_err()
-        .contains("missing `id`"));
-    args.insert("id".into(), json!("zzz"));
-    assert_eq!(
-        f.call("flow.kill", &args).unwrap_err(),
-        "no flow with id zzz"
-    );
 }
 
 // ------------------------------------------------------------ key sweep
@@ -595,9 +575,9 @@ fn every_mode() -> Vec<Mode> {
     v
 }
 
-/// The fixture app put into `mode` the way the operator would get there.
+/// The sample app put into `mode` the way the operator would get there.
 fn app_in(mode: Mode) -> App {
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app();
     match mode {
         Mode::Edit => {
             let _ = app.update(Action::Edit);
@@ -709,6 +689,11 @@ fn reducer_and_renderer_survive_every_key_in_every_mode() {
     let mut applied = 0usize;
     for mode in every_mode() {
         let base = app_in(mode);
+        assert_eq!(
+            text_of(&base, 200, 50).lines().count(),
+            50,
+            "{mode:?} draws the whole 200×50 screen"
+        );
         for code in &codes {
             for m in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
                 let Some(action) = keys::map(KeyEvent::new(*code, m), mode) else {
@@ -746,7 +731,7 @@ fn reducer_and_renderer_survive_every_key_in_every_mode() {
 #[test]
 fn a_random_key_walk_never_panics() {
     let codes = every_key_code();
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app();
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
         seed ^= seed << 13;
@@ -797,11 +782,39 @@ fn a_random_key_walk_never_panics() {
     }
     std::panic::set_hook(previous_hook);
     assert!(failure.is_none(), "{}", failure.unwrap());
+    let _ = app.update(Action::Resize(200, 50));
+    assert_eq!(
+        text_of(&app, 200, 50).lines().count(),
+        50,
+        "the whole 200×50 screen still draws after the walk"
+    );
 }
 
 #[test]
 fn run_command_survives_odd_lines_and_reports_each_problem() {
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app();
+    // Two verbs carry their `tools/list` input schema, because the asserts
+    // below ride on it: `flow.get` requires `id`; `flow.intercept` takes a
+    // boolean `enabled`. Every other tool keeps the empty schema.
+    for t in &mut app.tools {
+        match t.name.as_str() {
+            "flow.get" => {
+                t.input_schema = json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "The flow to summarize."}},
+                    "required": ["id"]
+                });
+            }
+            "flow.intercept" => {
+                t.input_schema = json!({
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean",
+                                               "description": "true to arm (default), false to disarm."}}
+                });
+            }
+            _ => {}
+        }
+    }
     let odd = [
         "",
         ":",
@@ -1026,7 +1039,7 @@ fn compose_kv_and_edit_buffer_edge_cases() {
     bin_edited.lines[2] = "typed over".into();
     assert!(bin_edited.to_edits().get("body").is_none());
     // Editing at the ends of lines and across lines.
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app();
     let _ = app.update(Action::Edit);
     for _ in 0..40 {
         let _ = app.update(Action::Right);
