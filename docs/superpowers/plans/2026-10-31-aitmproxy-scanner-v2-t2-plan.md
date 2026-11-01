@@ -164,7 +164,7 @@ crates/aitm-scan-http/
      `MAX_HELD_CRAWL_BODY: usize = 64 * 1024` (removed in round 3, d04362d4: held crawl copies carry
      no response body at all), `MARK_CRAWL: &str = "crawl"`; added later:
      `USER_AGENT: &str = "aitm-scan"` (Task 20 hoist), `JOB_MARK_PREFIX`/`job_mark()` and
-     `MAX_STORED_FLOWS: usize = 2048` (panel fix round).
+     `MAX_STORED_FLOWS: usize = 2048` and `MAX_LOST_MONITOR_IDS: usize = 256` (panel fix rounds).
   5. `hash.rs`: `pub(crate) fn fnv1a64(bytes: &[u8]) -> u64` (FNV-1a, 64-bit, offset basis
      `0xcbf2_9ce4_8422_2325`, prime `0x0000_0100_0000_01b3`).
 - **Test:** `hash::tests::fnv1a64_known_vectors`: `fnv1a64(b"") == 0xcbf2_9ce4_8422_2325`,
@@ -522,7 +522,9 @@ crates/aitm-scan-http/
   except the last when `looks_like_filename` (then `path_filename`); amended 2026-11-01 (S-M2/R-M1): an
   id-like segment is named by its template placeholder (`{id}`, `{uuid}`, `{oid}`) and an opaque
   segment (hex run >= 16, base64) `{token}`, via one `template::path_segment_token`; the example is
-  withheld for every placeholder except `{id}`. Consequence recorded as call A20: templated segments
+  withheld for every placeholder except `{id}`; a placeholder is the lane's label, not an application
+  name, so `is_secret_name` does not apply to it (`points::is_placeholder`; otherwise `{token}` would
+  be a `Session` point and never audited). Consequence recorded as call A20: templated segments
   share one `(kind, name)`, so the engine's frequent-point rule and dedupe key treat `/account/1` and
   `/account/2` as one point (Burp's behaviour). Traits: `traits_for(value)`
   plus `Json` on every `json_value` point (decision 10) plus `Session` when the name equals a
@@ -833,8 +835,8 @@ crates/aitm-scan-http/
   (when `limits.submit_forms`, first `forms_per_page` with a `form_action`) → `form_pairs_for`,
   then a `GET` with the pairs as the query or a `POST` `application/x-www-form-urlencoded` body,
   sent the same way, `forms_submitted += 1`, response processed like a page at `depth + 1`. Every
-  returned `HttpFlow` goes into `report.flows` with the response body truncated to
-  `MAX_HELD_CRAWL_BODY`; `pages` counts `2xx`/`3xx` responses. `stopped_reason` falls back to
+  returned `HttpFlow` goes into `report.flows` as a `frontier::held_copy` (response body dropped:
+  only the request is read; round 3, d04362d4); `pages` counts `2xx`/`3xx` responses. `stopped_reason` falls back to
   `"max_depth"` when `depth_hit`, `"navigation_failed"` when no page loaded and failures > 0.
 - **Test:** (FakeJob with `use_browser: Never`; `site()` pages: `/` → links `/a`, `/b#top`,
   `/ext` as `https://evil.test/x`, and the Task 4 form (`action /search`, GET, field `q`); `/a` →
@@ -895,7 +897,8 @@ crates/aitm-scan-http/
   `location.href` → if changed and same-origin/in-scope: record as a visited page, extract its DOM;
   if off-origin: stop `"left_scope"`; else if the DOM fingerprint changed: extract links from the
   new DOM. Processing order per page is links, forms, clicks (fixed so the charge counts below are
-  deterministic). `report.flows` are the marked flows read back from the store.
+  deterministic). `report.flows` are the marked flows read back from the store, as `held_copy`s,
+  bounded at `MAX_STORED_FLOWS` (oldest dropped, counted in a debug line; round 3).
 - **Test:** (FakeJob with a FakeBrowser whose pages carry `captures` so each navigate/click/submit
   inserts a captured flow to the origin; site: `/` has links `/a`, the Task 4 form to `/search`
   (GET, `q`), and a clickable `button[onclick]` (selector `body > button:nth-child(3)`) landing on
@@ -1255,7 +1258,11 @@ is touched by Task 20 alone (the one literal), so every commit on the branch kee
   submits the tagged element through `HTMLFormElement.prototype`; `StoreDiff::mark_new(&mut self)`
   with one snapshot per page; `values::chosen_fields`, `url_norm::parts`, `client::crawl_get`,
   `SessionMonitor::force_lost`, `MonitorTable`, `limits::job_mark`/`MAX_STORED_FLOWS`/
-  `MAX_LOST_MONITOR_IDS`; test doubles gained `LiveFormScript`, `with_capture_body`, `with_live_form`.
+  `MAX_LOST_MONITOR_IDS`; round 3 added `FormSpec::from_attrs` (one form normalisation), `StoreDiff: Default`,
+  the private `Submitted { ok, action }` answer of `submit_form_js` with `forms_skipped` counted on a
+  refused submit, `template::path_segment_token`, `points::is_placeholder`; test doubles gained
+  `LiveFormScript` (`gone_at_submit`, `with_action_at_submit`), `SUBMIT_FORM_MARKER`,
+  `with_capture_body`, `with_live_form`, `FakeBrowser::{live_form, submit_tagged}`.
 
 ## Questions for Matt
 
