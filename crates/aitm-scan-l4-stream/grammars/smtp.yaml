@@ -26,15 +26,15 @@ message:
         one_of:
           [EHLO, HELO, MAIL, RCPT, NOOP, RSET, VRFY, EXPN, HELP, QUIT, STARTTLS]
       # NOOP has no argument and NOOP<SP> is a different line, so the
-      # separator is a choice between one space and nothing at all. Neither
-      # alternative is mutable: moving the separator rewrites the framing
-      # rather than the field the point names.
+      # separator is a choice between one space and nothing at all. The space
+      # is a mutable `delim`, the node S6.4's delim_remove, delim_dup and
+      # delim_inject act on; the empty alternative is immutable, because there
+      # is no separator there to remove, double or move.
       - name: sp
         type: choice
-        mutable: false
         fields:
           - { name: present, type: delim, value: " " }
-          - { name: absent, type: bytes, size: 0 }
+          - { name: absent, type: bytes, size: 0, mutable: false }
       # Everything up to and including the CRLF, which belongs to the field.
       # This is the long-line point: SMTP line-length limits live here.
       - { name: arg, type: line, terminator: "\r\n" }

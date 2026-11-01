@@ -709,17 +709,53 @@ fn siblings_of<'a>(nodes: &'a [Node], target: &str) -> Option<&'a [Node]> {
 
 /// The text field immediately before the delimiter at `path`, the one
 /// `delim_inject` writes into.
+///
+/// A `choice` keeps only the alternative that parsed, so a delimiter written
+/// as one alternative of a choice (a line grammar's optional separator) opens
+/// a sibling list of its own. The search then steps out to the choice and
+/// takes the field before *it*: the text before the separator on the wire is
+/// the field `delim_inject` must write into, whatever container it is nested
+/// in. Nothing else is stepped out of — a delimiter that opens a group is the
+/// start of that group, and there is no text before it inside it.
 fn preceding_text_field(tree: &Tree, path: &FieldPath) -> Option<FieldPath> {
-    let siblings = siblings_of(&tree.root, path.as_str())?;
-    let at = siblings
-        .iter()
-        .position(|node| node.path.as_str() == path.as_str())?;
-    let previous = siblings.get(at.checked_sub(1)?)?;
-    matches!(
-        previous.kind,
-        FieldKind::Line | FieldKind::Bytes { .. } | FieldKind::Token | FieldKind::CString
-    )
-    .then(|| previous.path.clone())
+    let mut at_path = path.clone();
+    loop {
+        let siblings = siblings_of(&tree.root, at_path.as_str())?;
+        let at = siblings
+            .iter()
+            .position(|node| node.path.as_str() == at_path.as_str())?;
+        match at.checked_sub(1).and_then(|before| siblings.get(before)) {
+            Some(previous) => {
+                return matches!(
+                    previous.kind,
+                    FieldKind::Line
+                        | FieldKind::Bytes { .. }
+                        | FieldKind::Token
+                        | FieldKind::CString
+                )
+                .then(|| previous.path.clone())
+            }
+            None => {
+                let parent = parent_path(&at_path)?;
+                if tree.get(&parent)?.kind != FieldKind::Choice {
+                    return None;
+                }
+                at_path = parent;
+            }
+        }
+    }
+}
+
+/// The path of the container the node at `path` sits in, or `None` for a
+/// top-level field: `a.b.c` is in `a.b`, and `a.b[2]` is in `a.b`.
+fn parent_path(path: &FieldPath) -> Option<FieldPath> {
+    let text = path.as_str();
+    if text.ends_with(']') {
+        let open = text.rfind('[')?;
+        return Some(FieldPath::new(text.get(..open)?));
+    }
+    let dot = text.rfind('.')?;
+    Some(FieldPath::new(text.get(..dot)?))
 }
 
 /// Renumber a container's descendants after its children changed, so every
