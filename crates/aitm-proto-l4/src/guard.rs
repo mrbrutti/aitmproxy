@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::commands::scope::OperatorConfirmed;
 use crate::config::L4Config;
 use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::types::{
@@ -534,12 +535,40 @@ impl L4Guard {
     /// forced provenance live in the guard, a second in-process caller of the shared
     /// guard cannot bypass them (the bug the command-wrapper-only check left open).
     /// Returns the entry's id.
-    pub fn add_runtime_scope(&self, mut entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
+    pub fn add_runtime_scope(&self, entry: L4ScopeEntry) -> Result<L4ScopeId, L4GuardError> {
         if !self.agent_gates.allowed(crate::gates::AgentGate::Widen) {
             return Err(L4GuardError::ScopeWideningDisabled);
         }
+        Ok(self.push_runtime(entry))
+    }
+
+    /// Add a scope entry on behalf of a **confirmed operator** (spec §3, fork (ii)):
+    /// the operator confirm-over-the-wire handshake (or the CLI's `Confirmer`) has
+    /// already asked the human, so the agent **widen** gate — which means exactly
+    /// "may the *agent* widen" — does not apply. The `_proof` argument is the
+    /// [`OperatorConfirmed`] token only `commands::scope` can mint, so the compiler,
+    /// not a source grep, guarantees no other in-process caller (Rhai, the PoC `l4:`
+    /// step, a future command) reaches this ungated path. Like every runtime add it
+    /// funnels through [`push_runtime`](Self::push_runtime), so the entry is stored
+    /// as `Runtime` and never lifts the dangerous-destination denylist (pinned by
+    /// `commands::scope::tests::operator_scope_cannot_lift_denylist`, the one module
+    /// that can mint the proof).
+    pub(crate) fn add_operator_scope(
+        &self,
+        entry: L4ScopeEntry,
+        _proof: OperatorConfirmed,
+    ) -> L4ScopeId {
+        self.push_runtime(entry)
+    }
+
+    /// The one funnel for both runtime add paths (agent-gated
+    /// [`add_runtime_scope`](Self::add_runtime_scope) and operator-confirmed
+    /// [`add_operator_scope`](Self::add_operator_scope)): forces `source = Runtime`
+    /// so neither can mint operator (`Config`) provenance — the provenance the
+    /// dangerous-destination denylist trusts to be liftable — then pushes.
+    fn push_runtime(&self, mut entry: L4ScopeEntry) -> L4ScopeId {
         entry.source = L4ScopeSource::Runtime;
-        Ok(self.push_scope(entry))
+        self.push_scope(entry)
     }
 
     /// Seed a scope entry directly, trusting the caller's `source` — a **test-only**
