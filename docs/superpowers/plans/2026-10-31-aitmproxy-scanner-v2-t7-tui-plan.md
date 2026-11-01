@@ -487,6 +487,18 @@ Kept by the main session during stage 6. One row per finding.
 | 10 | coder note | note | builder decisions ratified by the T7 session: Right stays `Enter` in `Mode::Scan` (`h`/Left collapse, `l` expand; Enter on a collapsed node expands, else cycles); "first entry" = while the list or catalogue is empty; `scan.profile.get`/`scan.session.preview` folded under the tag key (`OTHER_PROFILE`/`OTHER_ORIGIN`); selectors over 128 bytes or empty dropped at fold; preview names cut at `=`/`;`/whitespace (32 max); save-as prompt also for an empty or builtin-named draft; delete targets the List row when the List pane is focused | accepted; spec D11 Profiles paragraph carries them (amended in this commit) |
 | 10 | coder note | Minor | `ScanState::cursor_mut`'s Checks-pane arm sizes by `checks.len()` and is dead now that `navigate` handles the tree | fix round G (G32): drop the arm or size it by `tree().len()` |
 | 10 | coder note | Minor | `Esc` returns the editor pane to List but keeps the editor held; a second `Esc` leaves the view | Task 11 shows the held editor in the list (a `dirty` mark on the row) and documents it |
+| 10 | quality | Minor | `l4_target_text` cannot be read back for IPv6 | fix round G (G33) |
+| 10 | quality | Minor | three identical prompt-submit arms; the origin arm closes on refusal | fix round G (G34) |
+| 10 | quality | Minor | `cycle` silently no-ops for a field `kind()` says cycles | fix round G (G35) |
+| 10 | quality | Minor | check tree rebuilt with three `String`s per node per call | fix round G (G36): cached tree |
+| 10 | quality | Minor | origin picker rebuilt on every `Flows` sweep; highlight can move | fix round G (G37) |
+| 10 | quality | Minor | `ConfirmCall` re-derives the tag from its JSON | fix round G (G38) |
+| 10 | quality | Minor | six reducer blocks that belong on `ProfilesState`/`ProfileEditor` | fix round G (G39) |
+| 10 | quality | Minor | missing-verb block copied twice | fix round G (G40) |
+| 10 | quality | Minor | bounds constants split across files; inline `32`s | fix round G (G41) |
+| 10 | quality | Minor | `w` prompt name bypasses trimming | fix round G (G42) |
+| 10 | quality | Minor | stringly-typed field and L4 target errors | fix round G (G43, with G26) |
+| 10 | quality | Minor | test fragments where literals exist; loose bounds | fix round G (G44) |
 
 ## Shipped
 

@@ -80,6 +80,32 @@ G31. `J` with no Jobs-cursor job refetches an unchanged query (`crates/aitm-tui/
 
 G32. `ScanState::cursor_mut`'s Checks-pane arm is dead (`crates/aitm-tui/src/scan/mod.rs`): `navigate` handles the tree itself; drop the arm (return `None` for the Checks pane) and say so in the doc.
 
+## Task 10 quality panel
+
+G33. `l4_target_text` cannot be read back for an IPv6 target (`crates/aitm-tui/src/scan/profiles.rs`): bracket an ip that parses as `Ipv6Addr`; round-trip test for every accepted case of `l4_target_prompt_parses`.
+
+G34. Three identical prompt-submit arms and a fourth with a different retry rule (`crates/aitm-tui/src/app.rs`): `submit_scan_origin` returns `Result<(), String>` like its siblings and all four route through one `submit_retrying(result)` helper; the out-of-scope refusal stays close-on-refusal with a comment, host/port/scheme refusals keep the prompt open.
+
+G35. `cycle` silently returns `false` for a field `kind()` says cycles (`crates/aitm-tui/src/scan/profiles.rs`): unit test iterating `EDITOR_FIELDS` and asserting `cycle(f)` is true for every `Cycle | Toggle` field.
+
+G36. The check tree is rebuilt with three `String`s per node on every call (`crates/aitm-tui/src/scan/profiles.rs`, `app.rs`): cache `tree: Vec<TreeNode>` on `ProfileEditor`, rebuilt only in `fold_checks` and on collapse/expand; `TreeNode { depth, selector, kind: Lane | Class | Check }` with label and id derived; `cursor_node() -> Option<&TreeNode>`; one `clamp_tree_cursor` helper.
+
+G37. The origin picker is rebuilt on every `Flows` sweep and can move the highlight (`crates/aitm-tui/src/app.rs`, `scan/profiles.rs`): refresh only when the `Flows` fold changed the row set and an editor is open; `refresh_origins` re-finds the previously highlighted origin by value.
+
+G38. `ConfirmCall` re-derives the tag from its own JSON (`crates/aitm-tui/src/app.rs`): `ConfirmCall.tag: Option<String>` set by `scan_delete`; `answer_confirm` routes through `scan_call` when set; delete `scan_confirm_tag`.
+
+G39. Reducer-on-state logic in `app.rs` that belongs on the model (`crates/aitm-tui/src/app.rs`, `scan/profiles.rs`): `ProfileEditor::enter_node`, `fold_node`, `saved_as`; `ProfilesState::is_builtin`, `delete_target`, `on_deleted`; the three builtin checks go through `is_builtin`.
+
+G40. Missing-verb block copied beside `scan_call` (`crates/aitm-tui/src/app.rs`): `fn scan_verb_or_toast(&mut self, name) -> bool` used by `scan_call`, `scan_save`, `scan_delete`.
+
+G41. Bounds constants split across two files; two inline `32`s (`crates/aitm-tui/src/app.rs`, `scan/profiles.rs`): move `SAVED_NAME_MAX`/`SAVED_PATH_MAX` to `profiles.rs` (reuse `VALUE_MAX` for the path); `CHECK_LISTS_MAX = 32` with a doc line.
+
+G42. A profile name typed into `w`'s prompt bypasses `set_text`'s trimming (`crates/aitm-tui/src/app.rs`): route through `editor.set_text(EditorField::Name, text)` and check `is_builtin_name` on the trimmed value; test the padded builtin name.
+
+G43. Stringly-typed `set_text`/`parse_l4_target` errors (`crates/aitm-tui/src/scan/profiles.rs`): `FieldError { NotANumber(EditorField), NotText(EditorField) }`, `L4TargetError`, with `Display` carrying today's wording (rides with G26).
+
+G44. Test hygiene in `tests/scan_v2_profiles.rs`: literals for the session line, the builtin-name toasts; `assert_eq!` for the exact `CHECKS_MAX`/`PROFILES_MAX`/`CHECKS_MAX + 2` counts; import `SELECTOR_MAX`; bound the description with `4 * VALUE_MAX`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
