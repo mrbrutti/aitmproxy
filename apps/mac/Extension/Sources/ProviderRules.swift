@@ -334,14 +334,26 @@ extension HandoffSelfCheck {
         let big = ScopeMatcher(spec: tokens.joined(separator: " "))
         r.check("providerRulesEdges: big spec parsed every token", big.entries.count == 72 * 4, "\(big.entries.count)")
         let wantedBig = ProviderRuleSet.wanted(for: big)
-        // Expected: the 72 distinct targets in plain string order of their address text
-        // (all addresses distinct here, so the port tiebreak is not involved).
-        let expected = distinct.sorted { $0.address < $1.address }.map { Target($0.address, $0.port) }
         r.check("providerRulesEdges: 72 distinct targets, none dropped, none duplicated",
               wantedBig.udpTargets.count == 72, "\(wantedBig.udpTargets.count)")
-        r.check("providerRulesEdges: big set is sorted by address text and de-duplicated",
-              wantedBig.udpTargets == expected,
-              "\(wantedBig.udpTargets.prefix(4)) ... \(wantedBig.udpTargets.suffix(2))")
+        // Literal canonical order, TEXT not numeric (fix F7: never computed with the
+        // comparator under test): "10.1.10.9" sorts right after "10.1.1.9", "10.1.19.9"
+        // is followed by "10.1.2.9", the last IPv4 text is "10.1.9.9", and every IPv6
+        // text ("2001…") sorts after every IPv4 text ("10.…").
+        r.check("providerRulesEdges: big targets 0-3 are 10.1.0.9:4000, 10.1.1.9:4001, 10.1.10.9:4010, 10.1.11.9:4011",
+              Array(wantedBig.udpTargets.prefix(4)) == [Target("10.1.0.9", 4000), Target("10.1.1.9", 4001),
+                                                        Target("10.1.10.9", 4010), Target("10.1.11.9", 4011)],
+              "\(wantedBig.udpTargets.prefix(4))")
+        r.check("providerRulesEdges: big targets 11-12 are 10.1.19.9:4019 then 10.1.2.9:4002",
+              wantedBig.udpTargets.count == 72 && wantedBig.udpTargets[11] == Target("10.1.19.9", 4019)
+                  && wantedBig.udpTargets[12] == Target("10.1.2.9", 4002),
+              wantedBig.udpTargets.count == 72 ? "\(wantedBig.udpTargets[11...12])" : "\(wantedBig.udpTargets.count)")
+        r.check("providerRulesEdges: big targets 63-64 are the last IPv4 10.1.9.9:4009 then the first IPv6 [2001:db8::1]:any",
+              wantedBig.udpTargets.count == 72 && wantedBig.udpTargets[63] == Target("10.1.9.9", 4009)
+                  && wantedBig.udpTargets[64] == Target("2001:db8::1", nil),
+              wantedBig.udpTargets.count == 72 ? "\(wantedBig.udpTargets[63...64])" : "\(wantedBig.udpTargets.count)")
+        r.check("providerRulesEdges: big target 71 is [2001:db8::8]:any",
+              wantedBig.udpTargets.last == Target("2001:db8::8", nil), "\(String(describing: wantedBig.udpTargets.last))")
         let bigRules = wantedBig.networkRules()
         r.check("providerRulesEdges: big set builds 73 rules (under the 256 cap)", bigRules.count == 73, "\(bigRules.count)")
         if bigRules.count == 73 {
