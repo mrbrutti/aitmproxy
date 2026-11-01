@@ -218,6 +218,24 @@ path. Probe-less `headers` carries `evidence.payload = "GET <url>"`. Drafts live
 `/tmp/claude/t3-rhai/` (harness `tests/support/mod.rs`, tests `tests/rhai_checks.rs`, 15
 scripts under `active/`), 23 harness tests green; Task 11 moves them in.
 
+
+**Amendment A7 (T3 session, 2026-11-01, from the sender re-review).** Task 3 item 2's
+"no retry loop" is narrowed: a POOLED h2 connection whose failure proves the request was
+NOT processed (the `send_request`/`ready` call failed before anything was written; the
+stream error `is_go_away()` with the stream id above the peer's `last_stream_id`; or
+`RST_STREAM(REFUSED_STREAM)`) is evicted and the same send dials once more; a connection
+this send dialled itself, any failure after the peer began answering, a wire timeout, an
+I/O error or any other reset returns the error. At most two connections and one
+re-issued request per caller send; the engine's probe-error ladder owns everything
+beyond that (fix round F4 SEC-10 implements the typed `NotProcessed` marker). Task 3 item
+3's shipped signatures: `exchange(pool, stream, key, addr, req, deadline)`,
+`exchange_pooled(pool, checkout, key, req, deadline, &mut saw_response)` (`key` =
+`scheme://host:port`, F1.2; `deadline: Instant`, F2 Q3; `addr`, F2 SEC-8). Task 6's
+`RawH2Client` surface gains `with_ssrf(SsrfPolicy, Arc<dyn ScopeRateGuard>)` (F2 SEC-1).
+A `no_application_protocol` refusal of a cache-narrowed `Auto` offer invalidates the ALPN
+cache entry so the next `Auto` send re-offers both protocols (F4; spec re-review Minor);
+forced sends are unaffected.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
@@ -1506,6 +1524,16 @@ Kept by the main session during stage 6. One row per finding.
 | 2,5,7,8,9b,10 | Tester (checks crate, 63101171) | — | PASS: 29 tests added (`check_hardening.rs`: bounds, redaction, budget ledger, deadline, mid-run cancel, malformed input, decision edges for all five value checks and the five h2 checks); 12 of 13 mutations caught, 1 equivalent; 150 tests post-clean | Recorded |
 | 11-13 (drafts) | T3 session (proof through T1b's real bridge at 26b2a6a4, throwaway checkout) | **Important (T1b-side)** | The bridge's `META_KEYS` omits `remediation`, refusing every script that declares one although its help text calls the key optional and `CheckMeta` has the field; zero of six drafts load verbatim | Reported to T1b 2026-11-01 (one-word fix in `check_bridge.rs`); with the line filtered in memory all six drafts load, register with the declared meta, return Vulnerable on their vulnerable shape and Clean on the patched one, and the five must-hint scripts' `PocHint`s (with controls and `not`) survive the bridge; anonymous closures are called |
 | 11-13 (drafts) | T3 session (same proof) | Minor | `rand_text_alpha` is truly random in the real engine; the draft harness stubs it deterministically, so marker-based fixtures (ssti, cmdi) are harness-specific; `RecordingHost` has a single canned reply | Task 11 keeps T3's own harness (with its RNG stub) in `crates/aitm-scan-checks-http/tests/`; live proof uses the real target, not fixtures |
+| F2 range | Security reviewer (sender re-review) | **Important** | The F2 redial keys on "no response byte", so a pooled request the origin already processed (response past the 30 s wire timeout; reset/drop after reading) is sent twice | Fix round F4 SEC-10: retry only on provably-unprocessed failures (send failed before write, GOAWAY above last_stream_id, REFUSED_STREAM) via a typed marker; tests for timeout-after-read, INTERNAL_ERROR-after-read (no redial) and REFUSED_STREAM (redial) |
+| F2 range | Security reviewer (sender re-review) | Minor | A raw probe that never connected (cap fired during resolve/dial/TLS) returns an observation shaped like a server hang-up | F4 SEC-11: return `Err` when the cap fires before the preface was written |
+| F2 range | Security reviewer (sender re-review) | Minor | The sender's resolve sits outside the exchange cap | F4 SEC-12: take the deadline before the resolve |
+| F2 range | Security reviewer (sender re-review) | Minor | Both SSRF gates are opt-in; SEC-1 is closed only if Task 18 wires `checks_with` in the same PR | Merge condition recorded; F4 SEC-13: one-shot `warn!` the first time a raw probe runs without a gate |
+| F2 range | Security reviewer (sender re-review) | — | SEC-1..SEC-9 all closed; offer-based mapping judged acceptable; `unsafe` none | Recorded |
+| F2 range | Spec reviewer (sender re-review) | **Important** | The redial contradicts Task 3 item 2's "no retry" text; the behaviour is within D8.2 and should stay | Fixed by amendment A7 (plan text) |
+| F2 range | Spec reviewer (sender re-review) | **Important** | The `saw_response` guard (no resend after a response byte) has no test | F4: covered by the SEC-10 tests (reset/timeout after the head arrived -> no redial, one request seen) |
+| F2 range | Spec reviewer (sender re-review) | Minor | `with_ssrf` and the shipped `exchange`/`exchange_pooled` signatures absent from the task text | Fixed by amendment A7 |
+| F2 range | Spec reviewer (sender re-review) | Minor | A cache-narrowed `Auto` send keeps failing `h2_not_negotiated` for the TTL after the origin stops speaking h2 | Decided (T3 session): option (b), invalidate the entry on that refusal; F4 |
+| F2 range | Spec reviewer (sender re-review) | — | S2 holds in full; caps unchanged; raw probe <= 1 connection / <= 8 streams; A3 implemented; prior Minors closed; ACs T3-1..T3-3 open until Task 17 | Recorded |
 | 3 | Coder (Task 3 report) | Minor | ALPN cache and h2 pool are keyed by `host:port` without scheme; one sender driving `http://h:p` (h2c) and `https://h:p` would collide on one key | Fixed in eb5b1f40 (F1.2): `conn_key(scheme, authority)` for cache and pool; `negotiated_for(scheme, authority)`; two tests |
 | 1,2,4 | Coder (Tasks 2 and 4 reports) | Important (process) | Parallel coders share one git index; a `git add <path>` + bare `git commit` swept a sibling's staged files into commit 25a42279 | Fixed by the Task 4 coder (rebuilt as 013a338e, single file); every later brief requires `git commit -- <paths>`; orchestrator audits each commit's stat |
 
