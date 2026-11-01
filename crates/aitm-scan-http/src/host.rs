@@ -60,7 +60,9 @@ use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use crate::limits::{job_mark, CANARY_EVERY, MAX_AWAIT, MAX_HELD_FLOWS, MAX_SESSION_MONITORS};
+use crate::limits::{
+    job_mark, CANARY_EVERY, MAX_AWAIT, MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS,
+};
 use crate::session::{CanaryOutcome, SessionMonitor};
 use crate::{mutate, redact, session, url_norm};
 
@@ -442,11 +444,6 @@ impl ProbeHost for HttpProbeHost {
     }
 }
 
-/// How many evicted-lost job ids the registry remembers, so a rebuilt monitor
-/// for one of them starts lost (S-M5). Bounded so the set cannot grow without
-/// limit over a long run.
-const MAX_LOST_MONITOR_IDS: usize = 256;
-
 /// The registry's contents, behind one lock: the per-job monitors in insertion
 /// order (so the oldest can be evicted) and a bounded record of the jobs whose
 /// monitor was lost when it was evicted, so a rebuilt monitor starts lost and
@@ -580,8 +577,8 @@ mod tests {
         MAX_MATCH_BODY,
     };
 
-    use crate::host::{HttpProbeHost, SessionMonitors, MAX_LOST_MONITOR_IDS};
-    use crate::limits::{MAX_HELD_FLOWS, MAX_SESSION_MONITORS};
+    use crate::host::{HttpProbeHost, SessionMonitors};
+    use crate::limits::{MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS};
     use crate::session::{CanaryRequest, SessionMonitor, SESSION_LOST_PREFIX};
     use crate::testutil::{captured_flow, request, response, FakeJob, ScriptedClient, JOB_ID};
 

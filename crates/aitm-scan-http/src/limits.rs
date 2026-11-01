@@ -91,6 +91,10 @@ pub(crate) const CANARY_EVERY: u32 = 25;
 /// Session monitors held for one job.
 pub(crate) const MAX_SESSION_MONITORS: usize = 16;
 
+/// Evicted-lost job ids the monitor registry remembers, so a rebuilt monitor
+/// for one of them starts lost (S-M5).
+pub(crate) const MAX_LOST_MONITOR_IDS: usize = 256;
+
 /// Captured same-origin flows the stored pass of one origin enumerates, newest
 /// first; older captures are left to the crawl to rediscover. Also the most
 /// flows a browser crawl's report holds, oldest dropped (R-M3).
@@ -122,7 +126,7 @@ pub(crate) const USER_AGENT: &str = "aitm-scan";
 mod tests {
     use super::{
         job_mark, CANARY_EVERY, JOB_MARK_PREFIX, MAX_AWAIT, MAX_DOM_BYTES, MAX_FRONTIER,
-        MAX_HELD_FLOWS, MAX_LINKS_PER_PAGE,
+        MAX_HELD_FLOWS, MAX_LINKS_PER_PAGE, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS,
     };
     use std::time::Duration;
 
@@ -134,6 +138,8 @@ mod tests {
         assert_eq!(MAX_HELD_FLOWS, 16);
         assert_eq!(CANARY_EVERY, 25);
         assert_eq!(MAX_AWAIT, Duration::from_secs(30));
+        assert_eq!(MAX_SESSION_MONITORS, 16);
+        assert_eq!(MAX_LOST_MONITOR_IDS, 256);
     }
 
     /// The job mark is built in one place (Q1): the literal every other crate
