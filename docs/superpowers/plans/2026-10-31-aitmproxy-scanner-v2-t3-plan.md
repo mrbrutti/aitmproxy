@@ -1401,6 +1401,18 @@ negation via a `not` combinator, no `negative` flag); `confidence` defaults to
 `tentative`; `probe.*` outside a check closure is an error; a Rhai check's id is used
 verbatim for `check.<id>`, so `id: "sqli"` keeps `check.sqli`. Tasks 11-16 follow this.
 
+
+**Class vocabulary alignment (2026-11-01, with T1b and T10).** The reflected-XSS class
+is `reflected-xss` (D6 spelling; the interim lane emits it, and D6 dedupes by class), for
+native `xss-reflected` and the `header-reflection` script; S3's `xss` token is
+superseded. SQL injection stays one class `sqli` across `sqli-boolean`, `sqli-time` and
+the Rhai error-based `sqli` so boolean + error hits on one parameter dedupe into one
+issue (T1-7); D6's `sqli-error` is read as the check id. Full list: reflected-xss,
+open-redirect, sqli, cmdi, ssti, path-traversal, xxe, crlf, nosqli, ldapi, ssrf, cors,
+security-headers, http-methods, sensitive-paths, h2-settings, h2-pseudo-header,
+h2-header-crlf, h2-smuggling-indicator, h2-rapid-reset. Applied in F3 (`xss.rs`) and in
+the Rhai drafts.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
