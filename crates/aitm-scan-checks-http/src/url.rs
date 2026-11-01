@@ -265,4 +265,232 @@ mod tests {
         };
         assert_eq!(authority_of("https://a.test"), Some(a));
     }
+
+    // -----------------------------------------------------------------------
+    // Tester pass over fix round F3: the shapes a URL parser that gates a raw
+    // socket must get right — IPv6 literals, userinfo, odd ports, control
+    // bytes and oversized input — none of which may panic or name a host the
+    // URL did not.
+    // -----------------------------------------------------------------------
+
+    /// An IPv6 literal with no port, userinfo in front of it and upper-case
+    /// hex inside it: the host is the lower-cased literal, the port is absent
+    /// and the canonical origin fills in the scheme's default port in the
+    /// bracketed form `[::1]:443`.
+    #[test]
+    fn an_ipv6_literal_without_a_port_folds_and_takes_the_default_port() {
+        let a = authority_of("https://User:Pw@[2001:DB8::1]/x").expect("parses");
+        assert_eq!(a.scheme.as_deref(), Some("https"));
+        assert_eq!(a.host, "2001:db8::1");
+        assert_eq!(a.port, None);
+        assert_eq!(a.host_literal(), "[2001:db8::1]");
+        assert_eq!(a.as_written(), "[2001:db8::1]");
+        assert_eq!(a.origin_key().as_deref(), Some("https://[2001:db8::1]:443"));
+
+        // The same origin written with the default port is the same key.
+        assert_eq!(
+            authority_of("https://[2001:db8::1]:443/y").and_then(|a| a.origin_key()),
+            a.origin_key()
+        );
+        // The loopback literal, the form the h2 tests dial.
+        assert_eq!(
+            authority_of("https://[::1]/")
+                .and_then(|a| a.origin_key())
+                .as_deref(),
+            Some("https://[::1]:443")
+        );
+    }
+
+    /// The core parser reads a multi-colon authority as an unbracketed IPv6
+    /// literal, so `https://::1/x` is accepted — **as the same origin as the
+    /// bracketed form**, never as a host with a port cut from the middle. An
+    /// unterminated bracket is unusable. (The strict reading, that an
+    /// unbracketed literal is no URL at all, is the tester finding pinned in
+    /// `lenient_authorities_should_be_unusable`.)
+    #[test]
+    fn an_unbracketed_ipv6_literal_is_read_as_the_bracketed_one() {
+        for (loose, bracketed) in [
+            ("https://::1/x", "https://[::1]/x"),
+            ("https://2001:db8::1/x", "https://[2001:db8::1]/x"),
+        ] {
+            let a = authority_of(loose).expect("accepted");
+            assert_eq!(a.port, None, "{loose}: no colon may be read as a port");
+            assert_eq!(
+                a.origin_key(),
+                authority_of(bracketed).and_then(|b| b.origin_key()),
+                "{loose} must be the origin {bracketed} names or nothing"
+            );
+            assert!(
+                a.host_literal().starts_with('['),
+                "{loose}: {}",
+                a.host_literal()
+            );
+        }
+        assert_eq!(parts("https://[::1/x"), None);
+    }
+
+    /// A host that is not an IPv6 address but carries two colons
+    /// (`origin.test:8443:9443`) is accepted as a literal by the core parser.
+    /// What must hold is that it can never be mistaken for the real origin
+    /// spelt any ordinary way: its canonical key is the bracketed garbage, so
+    /// the h2 gate refuses it against every profile that names the host.
+    #[test]
+    fn a_doubled_port_never_collides_with_a_real_origin() {
+        let a = authority_of("https://origin.test:8443:9443/x").expect("accepted");
+        let key = a.origin_key().expect("has a key");
+        assert_eq!(key, "https://[origin.test:8443:9443]:443");
+        for real in [
+            "https://origin.test",
+            "https://origin.test:8443",
+            "https://origin.test:9443",
+            "https://origin.test:443",
+        ] {
+            assert_ne!(
+                authority_of(real).and_then(|r| r.origin_key()).as_deref(),
+                Some(key.as_str()),
+                "{real} must not authorise origin.test:8443:9443"
+            );
+        }
+    }
+
+    /// Tester finding (F3 pass, Minor): four authorities the parser accepts
+    /// should be unusable — an IPv6 literal without brackets, a non-address
+    /// host with two colons (`host_is_usable` admits `:` for any host, not
+    /// only for one that parses as an `Ipv6Addr`), an authority whose
+    /// trailing CR/LF the core parser trims away, and `:0`, which the parser
+    /// reads as "no port" and so dials the scheme's default. Each is contained
+    /// today: the gated key is the dialled key, the wire authority is rebuilt
+    /// from the parsed host, and no plainly written profile origin equals the
+    /// garbage. Un-ignore with the fix.
+    #[test]
+    #[ignore = "tester finding: url.rs accepts unbracketed IPv6, host:p:p, a CR/LF-trailed authority and :0"]
+    fn lenient_authorities_should_be_unusable() {
+        for url in [
+            "https://::1/x",
+            "https://origin.test:8443:9443/x",
+            "https://origin.test\r\n/x",
+            "https://origin.test:0/x",
+        ] {
+            assert_eq!(parts(url), None, "{url:?}");
+        }
+    }
+
+    /// Everything before the *last* `@` is userinfo, however many `@` it
+    /// carries and whatever it looks like; the port after the host survives.
+    #[test]
+    fn userinfo_is_everything_before_the_last_at_sign() {
+        assert_eq!(
+            parts("https://a@b@origin.test:8443/"),
+            Some((
+                Some("https".to_string()),
+                "origin.test".to_string(),
+                Some(8443)
+            ))
+        );
+        // A would-be origin smuggled into the userinfo is not the host.
+        assert_eq!(
+            parts("https://origin.test@other.test/"),
+            Some((Some("https".to_string()), "other.test".to_string(), None))
+        );
+        // The scheme-relative form drops userinfo too (the redirect check
+        // reads `//user@canary/` as the canary).
+        assert_eq!(
+            parts("//user:pw@aitm-redirect.invalid/"),
+            Some((None, "aitm-redirect.invalid".to_string(), None))
+        );
+    }
+
+    /// A port that is empty, out of range or non-numeric makes the URL
+    /// unusable rather than being ignored: a gate that quietly dropped a bad
+    /// port would compare the wrong origin.
+    #[test]
+    fn a_malformed_port_makes_the_url_unusable() {
+        for url in [
+            "https://origin.test:/x",
+            "https://origin.test:65536/x",
+            "https://origin.test:-1/x",
+            "https://origin.test:44 3/x",
+            "https://origin.test\r\n:8443/x",
+        ] {
+            assert_eq!(parts(url), None, "{url}");
+        }
+        // The last legal port parses.
+        assert_eq!(
+            authority_of("https://origin.test:65535/").map(|a| a.port),
+            Some(Some(65535))
+        );
+    }
+
+    /// Control bytes and whitespace inside the authority are not a host; the
+    /// URL as a whole may be padded with whitespace, which is trimmed. A CR/LF
+    /// that *trails* the authority is trimmed by the core parser too (the
+    /// finding above); what must hold then is that the host that comes back,
+    /// and therefore anything written to the wire from it, carries none of it.
+    #[test]
+    fn control_bytes_in_the_authority_are_unusable_and_padding_is_trimmed() {
+        let trailed = authority_of("https://origin.test\r\n/x").expect("accepted");
+        assert_eq!(trailed.host, "origin.test");
+        assert!(!trailed.as_written().contains(['\r', '\n', ' ']));
+        for url in [
+            "https://origin\ttest/x",
+            "https://origin.test\u{0}/x",
+            "https://origin.test%0d%0a/x",
+            "https://orig in.test/x",
+        ] {
+            assert_eq!(parts(url), None, "{url:?}");
+        }
+        assert_eq!(
+            parts("  https://origin.test/x  \n"),
+            Some((Some("https".to_string()), "origin.test".to_string(), None))
+        );
+    }
+
+    /// Oversized input: a megabyte of host, path or userinfo neither panics
+    /// nor becomes a different host.
+    #[test]
+    fn oversized_urls_parse_in_bounded_time_without_panicking() {
+        let long_host = format!("https://{}.test/", "a".repeat(1024 * 1024));
+        let a = authority_of(&long_host).expect("a long label is still a host");
+        assert!(a.host.ends_with(".test"));
+        assert_eq!(a.host.len(), 1024 * 1024 + 5);
+
+        let long_path = format!("https://origin.test/{}", "p".repeat(1024 * 1024));
+        let (a, rest) = split_url(&long_path).expect("parses");
+        assert_eq!(a.host, "origin.test");
+        assert_eq!(rest.len(), 1024 * 1024 + 1);
+
+        let long_userinfo = format!("https://{}@origin.test/", "u".repeat(1024 * 1024));
+        assert_eq!(
+            authority_of(&long_userinfo).map(|a| a.host),
+            Some("origin.test".to_string())
+        );
+
+        let long_garbage = "x".repeat(1024 * 1024);
+        assert_eq!(parts(&long_garbage), None);
+    }
+
+    /// Only `scheme://` introduces a scheme. A `://` later in the text (a URL
+    /// carried in a query parameter) is not one, so a relative reference that
+    /// mentions an absolute URL still has no authority of its own.
+    #[test]
+    fn a_colon_slash_slash_inside_the_text_does_not_make_a_scheme() {
+        for url in [
+            "/login?next=https://aitm-redirect.invalid/",
+            "redirect?to=https://aitm-redirect.invalid/",
+            "?u=https://aitm-redirect.invalid/",
+        ] {
+            assert_eq!(parts(url), None, "{url}");
+        }
+        // Scheme-relative with an absolute URL in its query: the authority is
+        // the one before the path.
+        assert_eq!(
+            parts("//aitm-redirect.invalid/?next=https://origin.test/"),
+            Some((None, "aitm-redirect.invalid".to_string(), None))
+        );
+        // A scheme with a digit, `+`, `-` or `.` is a scheme.
+        assert_eq!(
+            parts("h2c+tls://origin.test/").map(|(s, _, _)| s),
+            Some(Some("h2c+tls".to_string()))
+        );
+    }
 }

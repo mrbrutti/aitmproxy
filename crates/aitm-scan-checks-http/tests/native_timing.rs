@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use aitm_scan_model::{
     Check, CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome,
-    ProbeResponse, Speed, Technique, Timing, Verdict,
+    ProbeHost, ProbeResponse, Speed, Technique, Timing, Verdict,
 };
 
 use support::{html, point, ScriptedHost, TARGET_URL};
@@ -315,6 +315,11 @@ fn no_sleep_call_in_the_source() {
         "tokio::time::sleep(",
         "thread::sleep(",
         "std::thread::sleep",
+        // And the imports that would let a sleep be spelled without its path:
+        // `use std::thread::{sleep, ..}` or `use tokio::time::sleep`.
+        "std::thread",
+        "tokio::time",
+        "futures_timer",
     ] {
         assert!(
             !src.contains(call),
@@ -458,4 +463,148 @@ fn sqli_check() -> std::sync::Arc<dyn Check> {
 
 fn cmdi_check() -> std::sync::Arc<dyn Check> {
     aitm_scan_checks_http::blind_timing::cmdi_time()
+}
+
+// ---------------------------------------------------------------------------
+// Tester pass over fix round F3: abandoned families at their edges
+// ---------------------------------------------------------------------------
+
+/// A refused probe in the *first* family does not hide a finding in the
+/// second: mysql loses a probe and is abandoned, postgres correlates, and the
+/// run reports postgres. A dropped request must never cost the point a real
+/// finding.
+#[tokio::test]
+async fn a_refused_probe_in_one_family_does_not_hide_a_hit_in_the_next() {
+    let host = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_probe_refused_at(1)
+        .on("pg_sleep(1)", timed(1040))
+        .on("pg_sleep(3)", timed(3060))
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert!(
+        verdict
+            .detail
+            .starts_with("postgres: observed delay tracks the requested delay"),
+        "{}",
+        verdict.detail
+    );
+    assert_eq!(
+        verdict.evidence.payload.as_deref(),
+        Some("'||pg_sleep(3)--")
+    );
+    assert_eq!(host.sent().len(), 8);
+}
+
+/// The abandoned-family rule applies to the second family as much as the
+/// first (postgres loses its last probe, mysql is flat), and when *both*
+/// families lose a probe the detail counts both, in the plural.
+#[tokio::test]
+async fn abandoned_families_are_counted_wherever_they_fall() {
+    let second_only = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_probe_refused_at(8)
+        .with_fallback(timed(45));
+    let verdict = sqli_check().run(&q(), &second_only).await;
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "1 of 2 payload families was abandoned: a probe was refused part-way \
+         through its schedule, so the series could not be fitted"
+    );
+    assert_eq!(second_only.sent().len(), 8);
+
+    let both = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_probe_refused_at(2)
+        .with_probe_refused_at(7)
+        .with_fallback(timed(45));
+    let verdict = sqli_check().run(&q(), &both).await;
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "2 of 2 payload families were abandoned: a probe was refused part-way \
+         through its schedule, so the series could not be fitted"
+    );
+    assert_eq!(both.sent().len(), 8);
+    assert_eq!(
+        verdict.evidence.timing, None,
+        "an abandoned family is never fitted"
+    );
+}
+
+/// The same rule for `cmdi-time`, whose families differ but whose loop is the
+/// one `sqli-time` runs: a refused `; sleep` probe abandons the `sh` family.
+#[tokio::test]
+async fn cmdi_time_abandons_a_family_for_a_refused_probe_too() {
+    let host = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_probe_refused_at(4)
+        .with_fallback(timed(45));
+
+    let verdict = cmdi_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert!(
+        verdict
+            .detail
+            .starts_with("1 of 2 payload families was abandoned"),
+        "{}",
+        verdict.detail
+    );
+    assert_eq!(host.sent().len(), 8);
+    assert!(host.sent()[0].starts_with("; sleep "), "{:?}", host.sent());
+}
+
+/// A refused probe *and* a stop in the same run: the stop is the scanner's
+/// own doing and wins — the verdict says the run stopped early, not that a
+/// family was abandoned, so the per-host error ladder is never fed by a
+/// cancellation.
+#[tokio::test]
+async fn a_stop_after_a_refused_probe_is_reported_as_the_stop() {
+    let host = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_probe_refused_at(2)
+        .with_cancel_after(5)
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert!(
+        verdict
+            .detail
+            .starts_with("stopped after 5 of 8 delay probes"),
+        "{}",
+        verdict.detail
+    );
+    assert_eq!(host.sent().len(), 5);
+}
+
+/// The stop gate counts the budget *before* the baseline, and the per-probe
+/// gate counts it before every delay probe: with exactly one family's worth
+/// of budget after the baseline, the first family completes (and, flat, does
+/// not correlate), the second never starts, and the run says so.
+#[tokio::test]
+async fn a_budget_for_exactly_one_family_runs_that_family_and_stops() {
+    let host = ScriptedHost::new()
+        .with_budget(5)
+        .with_baseline(timed(40))
+        .with_fallback(timed(45));
+
+    let verdict = sqli_check().run(&q(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert!(
+        verdict
+            .detail
+            .starts_with("stopped after 4 of 8 delay probes"),
+        "{}",
+        verdict.detail
+    );
+    assert_eq!(host.sent().len(), 4);
+    assert_eq!(host.budget_left(), 0);
 }

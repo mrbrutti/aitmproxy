@@ -818,3 +818,256 @@ async fn a_false_arm_that_tracks_the_true_arm_is_not_a_hit() {
     assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
     assert_eq!(verdict.evidence.diff, None);
 }
+
+// ---------------------------------------------------------------------------
+// 6. Tester pass over fix round F3: redaction at the match, and the gate at
+//    the byte
+// ---------------------------------------------------------------------------
+
+/// The scrub must never cost a finding. When the reflected canary sits
+/// *inside* credential-shaped text — the value of a `sid=` pair, the tail of
+/// an `Authorization:` line — the scrub swallows the canary out of the
+/// excerpt, and that is correct for the evidence; but the verdict is decided
+/// on the unscrubbed body, so the reflection is still reported, still
+/// `certain`, and still carries a reproducible hint.
+#[tokio::test]
+async fn a_reflection_inside_credential_shaped_text_is_still_reported_and_its_excerpt_is_clean() {
+    for (label, body_text) in [
+        (
+            "inside a sid= value",
+            format!("<p>sid={FIRST_XSS_PROBE} other=1</p>"),
+        ),
+        (
+            "after a bearer token on the same line",
+            format!("Authorization: Bearer abc.def.ghi {FIRST_XSS_PROBE}"),
+        ),
+        (
+            "as a JSON-quoted secret in an HTML page",
+            format!("<div>{{\"password\":\"{FIRST_XSS_PROBE}\"}}</div>"),
+        ),
+    ] {
+        let host = ScriptedHost::new()
+            .with_marker(MARKER)
+            .on(FIRST_XSS_PROBE, html(200, &body_text));
+
+        let verdict = aitm_scan_checks_http::xss::check().run(&q(), &host).await;
+
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Vulnerable,
+            "{label}: {}",
+            verdict.detail
+        );
+        assert_eq!(verdict.confidence, Confidence::Certain, "{label}");
+        assert!(verdict.poc_hint.is_some(), "{label}");
+        let matched = verdict
+            .evidence
+            .matched
+            .expect("the hit quotes its context");
+        assert_eq!(
+            matched,
+            aitm_core::redact::scrub_text(&matched),
+            "{label}: the excerpt carries unscrubbed material: {matched}"
+        );
+        assert!(!matched.contains("abc.def.ghi"), "{label}: {matched}");
+        assert!(matched.len() <= MAX_EXCERPT_BYTES, "{label}");
+    }
+}
+
+/// The scrub as the literal an operator sees: a `Location` to the canary that
+/// carries a token in its query is reported, and the evidence quotes the
+/// `Location` with the token replaced by `[redacted]` and nothing else
+/// changed — the host, the path and the other parameter survive.
+#[tokio::test]
+async fn a_canary_location_with_a_token_is_quoted_with_the_token_redacted() {
+    let location = format!("{CANARY}cb?token=abc123&page=2");
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(CANARY, redirect(302, &location));
+
+    let verdict = aitm_scan_checks_http::redirect::check()
+        .run(&q(), &host)
+        .await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    assert_eq!(verdict.confidence, Confidence::Certain);
+    assert_eq!(
+        verdict.evidence.matched.as_deref(),
+        Some("https://aitm-redirect.invalid/cb?token=[redacted]&page=2")
+    );
+    assert!(verdict.poc_hint.is_some());
+}
+
+/// An oversized `Location` — a hostile target can send one of any length —
+/// is still judged (the authority is the canary) and is quoted bounded.
+#[tokio::test]
+async fn an_oversized_location_is_judged_and_quoted_bounded() {
+    let location = format!("{CANARY}{}", "p".repeat(512 * 1024));
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(CANARY, redirect(302, &location));
+
+    let verdict = aitm_scan_checks_http::redirect::check()
+        .run(&q(), &host)
+        .await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    let matched = verdict
+        .evidence
+        .matched
+        .expect("the hit quotes the Location");
+    assert!(
+        matched.len() <= MAX_EXCERPT_BYTES,
+        "len was {}",
+        matched.len()
+    );
+    assert!(matched.starts_with(CANARY), "{matched}");
+    assert!(verdict.detail.len() < 1024, "{}", verdict.detail.len());
+}
+
+/// A response whose body is a megabyte of `key=value` credential pairs around
+/// the canary: the scrub is linear and the excerpt is bounded, so the check
+/// returns promptly with a 256-byte, fully scrubbed excerpt.
+#[tokio::test]
+async fn a_megabyte_of_credential_pairs_around_the_match_is_scrubbed_and_bounded() {
+    let pairs = "sid=s3cr3t&token=t0k3n&".repeat(20_000);
+    let huge = format!("{pairs}{FIRST_XSS_PROBE}{pairs}");
+    assert!(
+        huge.len() < MAX_MATCH_BODY,
+        "the canary must be inside the match cap"
+    );
+    let host = ScriptedHost::new()
+        .with_marker(MARKER)
+        .on(FIRST_XSS_PROBE, html(200, &huge));
+
+    let started = Instant::now();
+    let verdict = aitm_scan_checks_http::xss::check().run(&q(), &host).await;
+    let wall = started.elapsed();
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    let matched = verdict.evidence.matched.expect("quoted");
+    assert!(
+        matched.len() <= MAX_EXCERPT_BYTES,
+        "len was {}",
+        matched.len()
+    );
+    assert!(
+        !matched.contains("s3cr3t") && !matched.contains("t0k3n"),
+        "{matched}"
+    );
+    assert!(
+        wall < Duration::from_secs(10),
+        "scrubbing a megabyte took {wall:?}"
+    );
+}
+
+/// The budget gate is exact, not merely safe: a check with budget for exactly
+/// its plan runs the whole plan and concludes, and one unit short stops it one
+/// stimulus early with `Inconclusive`. `no_check_asks_for_a_probe_the_budget_
+/// cannot_pay_for` proves `<=`; this proves `==`, so an over-cautious gate
+/// that left budget unspent is caught too.
+#[tokio::test]
+async fn the_budget_gate_spends_exactly_the_plan_when_the_budget_allows_it() {
+    // xss-reflected: three probes, no baseline.
+    let exact = ScriptedHost::new()
+        .with_marker(MARKER)
+        .with_fallback(html(200, "nothing"))
+        .with_budget(3);
+    let v = aitm_scan_checks_http::xss::check().run(&q(), &exact).await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(exact.sent().len(), 3);
+    assert_eq!(exact.budget_left(), 0);
+
+    let short = ScriptedHost::new()
+        .with_marker(MARKER)
+        .with_fallback(html(200, "nothing"))
+        .with_budget(2);
+    let v = aitm_scan_checks_http::xss::check().run(&q(), &short).await;
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(short.sent().len(), 2);
+    assert!(
+        v.detail
+            .starts_with("stopped after 2 of 3 reflection probes"),
+        "{}",
+        v.detail
+    );
+
+    // open-redirect: the same three-probe shape.
+    let exact = ScriptedHost::new()
+        .with_marker(MARKER)
+        .with_fallback(html(200, "nothing"))
+        .with_budget(3);
+    let v = aitm_scan_checks_http::redirect::check()
+        .run(&q(), &exact)
+        .await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(exact.sent().len(), 3);
+
+    // sqli-time: a baseline plus two families of four.
+    let exact = ScriptedHost::new()
+        .with_baseline(timed(40))
+        .with_fallback(timed(45))
+        .with_budget(9);
+    let v = aitm_scan_checks_http::blind_timing::sqli_time()
+        .run(&q(), &exact)
+        .await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(exact.sent().len(), 8);
+    assert_eq!(exact.budget_left(), 0);
+
+    // sqli-boolean at normal speed on a stable page: baseline, control, four pairs.
+    let exact = ScriptedHost::new()
+        .with_baseline(html(200, &body(600)))
+        .with_fallback(html(200, &body(600)))
+        .with_budget(10);
+    let v = aitm_scan_checks_http::sqli_boolean::check()
+        .run(&q(), &exact)
+        .await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(exact.sent().len(), 9);
+    assert_eq!(exact.budget_left(), 0);
+}
+
+/// A deadline that passes *during* a run stops it after the probe in flight,
+/// exactly as a cancellation does: the host reports the deadline as passed
+/// from the moment `n` stimuli have been sent, and the check may send nothing
+/// after that — no second context probe, no second canary form, no next
+/// delay, and never the next boolean pair.
+#[tokio::test]
+async fn a_deadline_that_passes_mid_run_stops_after_the_probe_in_flight() {
+    let cases: Vec<(Arc<dyn Check>, usize)> = vec![
+        (aitm_scan_checks_http::xss::check(), 1),
+        (aitm_scan_checks_http::redirect::check(), 2),
+        // The control, then the deadline passes before the first pair.
+        (aitm_scan_checks_http::sqli_boolean::check(), 1),
+        (aitm_scan_checks_http::blind_timing::sqli_time(), 3),
+        (aitm_scan_checks_http::blind_timing::cmdi_time(), 5),
+    ];
+
+    for (check, after) in cases {
+        let id = check.meta().id.clone();
+        let host = ScriptedHost::new()
+            .with_marker(MARKER)
+            .with_baseline(html(200, &body(600)))
+            .with_fallback(html(200, &body(600)))
+            .with_budget(64)
+            .with_deadline_after(after);
+
+        let verdict = check.run(&q(), &host).await;
+
+        assert_eq!(
+            host.sent().len(),
+            after,
+            "{id}: sent {:?} after the deadline passed",
+            host.sent()
+        );
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Inconclusive,
+            "{id}: a run cut by its deadline proves nothing: {}",
+            verdict.detail
+        );
+        assert_eq!(verdict.confidence, Confidence::Tentative, "{id}");
+        assert!(verdict.poc_hint.is_none(), "{id}");
+    }
+}

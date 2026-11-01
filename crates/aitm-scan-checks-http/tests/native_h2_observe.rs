@@ -1269,3 +1269,361 @@ async fn no_h2_check_probes_a_stopped_job_or_burns_the_authority() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// tester pass over fix round F3: the origin gate and the budget pre-check at
+// their edges
+// ---------------------------------------------------------------------------
+
+/// The canonical origin of a dialled target, built the way the gate builds
+/// it: scheme, lower-case host, the scheme's default port filled in.
+fn dialled_origin(target: &RawH2Target) -> String {
+    let default = aitm_core::Authority::default_port(&target.scheme);
+    let authority = aitm_core::Authority::parse_with_default(&target.authority, default)
+        .expect("a dialled authority parses");
+    format!("{}://{authority}", target.scheme)
+}
+
+/// The invariant the whole accept-any argument rests on: **whatever the point
+/// URL looks like, the authority the driver is handed is one the profile
+/// names.** Userinfo, backslashes, a second `@`, upper-case, the default port
+/// written out or an IPv6 literal must either be refused before anything is
+/// opened or be dialled as exactly a profile origin — the parse that is gated
+/// is the parse that is dialled, so no spelling can pass the gate as one host
+/// and reach the wire as another.
+#[tokio::test]
+async fn every_dialled_authority_is_a_profile_origin_whatever_the_point_url_looks_like() {
+    let profile = [
+        "https://origin.test",
+        "http://origin.test",
+        "https://[2001:db8::1]",
+    ];
+    let allowed: std::collections::BTreeSet<String> = profile
+        .iter()
+        .map(|o| {
+            let url = format!("{o}/");
+            let scheme = url.split("://").next().unwrap().to_string();
+            let authority = url.split("://").nth(1).unwrap().trim_end_matches('/');
+            dialled_origin(&RawH2Target {
+                scheme,
+                authority: authority.to_string(),
+            })
+        })
+        .collect();
+
+    let urls = [
+        // Plain spellings of a profile origin.
+        "https://origin.test/x",
+        "https://ORIGIN.TEST:443/x",
+        "HTTPS://origin.test/",
+        "http://origin.test:80/x",
+        "https://[2001:DB8::1]/x",
+        "https://[2001:db8::1]:443/x",
+        // Userinfo and backslash tricks in both directions.
+        "https://origin.test@other.test/x",
+        "https://other.test@origin.test/x",
+        "https://origin.test\\@other.test/x",
+        "https://other.test\\@origin.test/x",
+        "https://a@b@origin.test/x",
+        "https://origin.test:443@other.test/",
+        // The lenient parses: a doubled port, a CR/LF-trailed authority, an
+        // unbracketed literal (see url.rs, `lenient_authorities_should_be_unusable`).
+        "https://origin.test:8443:9443/x",
+        "https://origin.test\r\n/x",
+        "https://::1/x",
+        "https://2001:db8::1/x",
+        // Off-origin, wrong scheme, wrong port, unusable.
+        "https://other.test/x",
+        "https://origin.test:8443/x",
+        "https://origin.test.evil.test/x",
+        "https://evil.test/?next=https://origin.test/",
+        "ftp://origin.test/x",
+        "https://origin.test:0/x",
+        "https:///x",
+        "",
+    ];
+
+    let mut dialled = 0usize;
+    for url in urls {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+        let host = ScriptedHost::new().with_origins(&profile);
+
+        let v = check
+            .run(&point(InsertionKind::Query, "q", url), &host)
+            .await;
+
+        for plan in runner.plans() {
+            dialled += 1;
+            let origin = dialled_origin(&plan.target);
+            assert!(
+                allowed.contains(&origin),
+                "{url:?} was dialled as {origin}, which the profile never named"
+            );
+            assert_eq!(v.outcome, Outcome::Vulnerable, "{url:?}");
+            assert!(
+                !format!("{plan:?}").contains("other.test")
+                    && !format!("{plan:?}").contains("evil.test"),
+                "{url:?}: a foreign host reached the wire: {plan:?}"
+            );
+            // Nothing the URL carried reaches the frame as a byte the parse did
+            // not produce: no CR, LF, space or colon-garbage in any header.
+            let forbidden = ['\r', '\n', ' ', '\t', '\0'];
+            assert!(
+                !plan.target.authority.contains(forbidden),
+                "{url:?}: {:?}",
+                plan.target.authority
+            );
+            for header in &plan.headers {
+                let value = String::from_utf8_lossy(&header.value);
+                assert!(!value.contains(forbidden), "{url:?}: {value:?}");
+            }
+        }
+        if runner.calls() == 0 {
+            assert_eq!(v.outcome, Outcome::Inconclusive, "{url:?}");
+            assert_eq!(
+                host.baseline_calls(),
+                0,
+                "{url:?}: refused points take no baseline"
+            );
+        }
+    }
+    // The gate is not vacuous: the in-profile spellings really were dialled.
+    assert!(
+        dialled >= 6,
+        "only {dialled} of the in-profile spellings dialled"
+    );
+}
+
+/// A profile origin is an operator-typed string: a trailing slash, an
+/// upper-case scheme, surrounding whitespace, an explicit default port or a
+/// path after it all still name the one origin, and an IPv6 literal written
+/// without its default port authorises one written with it (and the reverse).
+#[tokio::test]
+async fn a_profile_origin_is_read_however_the_operator_wrote_it() {
+    for (origin, url, wire_authority) in [
+        (
+            "https://origin.test/",
+            "https://origin.test/x",
+            "origin.test",
+        ),
+        (
+            "HTTPS://Origin.Test",
+            "https://origin.test/x",
+            "origin.test",
+        ),
+        (
+            "  https://origin.test  ",
+            "https://origin.test/x",
+            "origin.test",
+        ),
+        (
+            "https://origin.test:443/",
+            "https://origin.test/x",
+            "origin.test",
+        ),
+        (
+            "https://origin.test/some/path?q=1",
+            "https://origin.test/x",
+            "origin.test",
+        ),
+        ("https://[::1]", "https://[::1]:443/x", "[::1]:443"),
+        ("https://[::1]:443", "https://[::1]/x", "[::1]"),
+        (
+            "https://[2001:DB8::1]",
+            "https://[2001:db8::1]/x",
+            "[2001:db8::1]",
+        ),
+        (
+            "http://origin.test",
+            "http://ORIGIN.test:80/x",
+            "origin.test:80",
+        ),
+    ] {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+        let host = ScriptedHost::new().with_origins(&[origin]);
+
+        let v = check
+            .run(&point(InsertionKind::Query, "q", url), &host)
+            .await;
+
+        assert_eq!(
+            v.outcome,
+            Outcome::Vulnerable,
+            "{origin:?} vs {url}: {}",
+            v.detail
+        );
+        let plan = runner.only_plan();
+        assert_eq!(plan.target.authority, wire_authority, "{origin:?} vs {url}");
+        assert_eq!(
+            plan.headers[2],
+            h(":authority", wire_authority),
+            "{origin:?} vs {url}"
+        );
+    }
+}
+
+/// A profile origin that names no origin — bare host, wildcard, a scheme the
+/// driver cannot dial, garbage — authorises nothing, and neither does a list
+/// that mixes one such entry with the real one for a *different* host.
+#[tokio::test]
+async fn a_profile_entry_that_names_no_origin_authorises_nothing() {
+    for origins in [
+        vec!["origin.test"],
+        vec!["*.origin.test"],
+        vec!["https://*.origin.test"],
+        vec!["https://"],
+        vec!["https:///"],
+        vec!["ftp://origin.test"],
+        vec!["https://origin.test:https"],
+        vec!["https://other.test", "origin.test"],
+        vec![""],
+        vec!["   "],
+    ] {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+        let host = ScriptedHost::new().with_origins(&origins);
+
+        let v = run(&check, &host).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{origins:?}");
+        assert_eq!(
+            v.detail, "raw probe target is not a profile origin",
+            "{origins:?}"
+        );
+        assert_eq!(runner.calls(), 0, "{origins:?}");
+        assert_eq!(host.baseline_calls(), 0, "{origins:?}");
+    }
+}
+
+/// The budget pre-check at its exact boundary, for every check: after the
+/// baseline has spent one unit, `max(1, streams)` units must remain. One
+/// short refuses with nothing opened and the authority unclaimed; exactly
+/// enough runs. This is what pins `max(1, ..)` for the zero-stream settings
+/// probe and the `<` of the comparison.
+#[tokio::test]
+async fn the_budget_precheck_is_exact_for_every_stream_count() {
+    for (id, streams) in [
+        ("h2-settings-observe", 0u32),
+        ("h2-pseudo-header-validation", 3),
+        ("h2-header-crlf-tolerance", 2),
+        ("h2-cl-te-downgrade-indicator", 2),
+        ("h2-rapid-reset-mitigation", 8),
+    ] {
+        let need = streams.max(1);
+        let runner = FakeRunner::scripted(|plan| match &plan.mode {
+            RawH2Mode::SettingsOnly => Ok(obs(vec![])),
+            _ => Ok(resets(plan.streams as usize)),
+        });
+        let check = check_named(&runner, id);
+
+        // One unit for the baseline, then one short of what the probe needs.
+        let short = h2host().with_budget(need);
+        let v = run(&check, &short).await;
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id} with {} units", need);
+        assert_eq!(v.detail, "budget too low for the raw probe", "{id}");
+        assert_eq!(
+            short.baseline_calls(),
+            1,
+            "{id}: the baseline was taken first"
+        );
+        assert_eq!(runner.calls(), 0, "{id} dialled on a short budget");
+
+        // Exactly enough: the probe runs and charges nothing itself.
+        let enough = h2host().with_budget(1 + need);
+        let v = run(&check, &enough).await;
+        assert_ne!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
+        assert_eq!(runner.calls(), 1, "{id}");
+        assert_eq!(
+            enough.budget_left(),
+            need,
+            "{id}: only the baseline was charged"
+        );
+    }
+}
+
+/// A server that answers *more* streams than the plan opened (a phantom
+/// stream, a driver bug) must not turn a non-existent variant into a finding:
+/// only the first `labels.len()` outcomes are read, and nothing panics.
+#[tokio::test]
+async fn phantom_stream_outcomes_beyond_the_plan_are_ignored() {
+    let runner = FakeRunner::answering(obs(vec![
+        reset(),
+        reset(),
+        reset(),
+        StreamOutcome::Headers { status: Some(200) },
+        StreamOutcome::Headers { status: Some(200) },
+    ]));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+
+    let v = run(&check, &h2host()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(v.detail, "all 3 variants were rejected");
+    assert_eq!(v.evidence.matched, None);
+}
+
+/// An observation with no stream outcome at all — the connection went away
+/// before a single variant was answered — concludes nothing for the three
+/// malformed-header checks.
+#[tokio::test]
+async fn an_empty_observation_is_inconclusive_for_the_malformed_checks() {
+    for id in [
+        "h2-pseudo-header-validation",
+        "h2-header-crlf-tolerance",
+        "h2-cl-te-downgrade-indicator",
+    ] {
+        let mut o = obs(vec![]);
+        o.connection_closed = true;
+        let runner = FakeRunner::answering(o);
+        let check = check_named(&runner, id);
+
+        let v = run(&check, &h2host()).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
+        assert!(
+            v.detail.contains("did not reach an outcome"),
+            "{id}: {}",
+            v.detail
+        );
+    }
+}
+
+/// `h2-rapid-reset-mitigation`'s `firm` verdict is, per SP-3, "a complete
+/// repeated observation: 8 reset pairs, no GOAWAY, no refused stream". An
+/// observation that carries **fewer than eight stream outcomes** is not that
+/// observation, and a peer that **closed the connection** on the resets
+/// without a GOAWAY has mitigated by the bluntest means there is. Neither may
+/// be reported as "no reset-rate mitigation observed" at `firm`.
+///
+/// Tester finding (F3 pass): `rapid_reset_verdict` reads only `goaway` and
+/// `Refused`; it ignores `streams.len()` and `connection_closed`. Un-ignore
+/// with the fix.
+#[tokio::test]
+#[ignore = "tester finding: rapid_reset_verdict ignores a short series and a closed connection"]
+async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
+    // Two pairs answered, then nothing: not eight, so not a complete observation.
+    let runner = FakeRunner::answering(resets(2));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_ne!(
+        (v.outcome, v.confidence),
+        (Outcome::Vulnerable, Confidence::Firm),
+        "two observed pairs were reported as eight: {}",
+        v.detail
+    );
+
+    // Eight pairs, no GOAWAY, but the peer dropped the connection.
+    let mut o = resets(8);
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_ne!(
+        v.outcome,
+        Outcome::Vulnerable,
+        "a dropped connection is a mitigation, yet: {}",
+        v.detail
+    );
+}

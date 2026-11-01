@@ -58,7 +58,7 @@ pub struct ScriptedHost {
     baseline_fails: bool,
     probes_fail: bool,
     probes_fail_after: Option<usize>,
-    probe_refused_at: Option<usize>,
+    probe_refused_at: Vec<usize>,
     table: Vec<(String, ProbeResponse)>,
     nth_table: Vec<(String, usize, ProbeResponse)>,
     nth_seen: Mutex<HashMap<String, usize>>,
@@ -69,6 +69,7 @@ pub struct ScriptedHost {
     deadline: Instant,
     cancelled: bool,
     cancel_after: Option<usize>,
+    deadline_after: Option<usize>,
     profile: ScanProfile,
 }
 
@@ -90,7 +91,7 @@ impl ScriptedHost {
             baseline_fails: false,
             probes_fail: false,
             probes_fail_after: None,
-            probe_refused_at: None,
+            probe_refused_at: Vec::new(),
             table: Vec::new(),
             nth_table: Vec::new(),
             nth_seen: Mutex::new(HashMap::new()),
@@ -101,6 +102,7 @@ impl ScriptedHost {
             deadline: Instant::now() + Duration::from_secs(60),
             cancelled: false,
             cancel_after: None,
+            deadline_after: None,
             profile: ScanProfile::default(),
         }
     }
@@ -139,7 +141,8 @@ impl ScriptedHost {
     }
 
     /// Refuse exactly the `n`-th probe, counting from one, and answer every
-    /// other one from the script.
+    /// other one from the script. May be called more than once to refuse
+    /// several probes of one run.
     ///
     /// One refused request in the middle of a series is the common real
     /// failure — a dropped connection, a guard that paused the host for a
@@ -148,7 +151,7 @@ impl ScriptedHost {
     #[must_use]
     pub fn with_probe_refused_at(mut self, n: usize) -> Self {
         assert!(n >= 1, "with_probe_refused_at counts probes from one");
-        self.probe_refused_at = Some(n);
+        self.probe_refused_at.push(n);
         self
     }
 
@@ -229,6 +232,20 @@ impl ScriptedHost {
     #[must_use]
     pub fn with_cancel_after(mut self, n: usize) -> Self {
         self.cancel_after = Some(n);
+        self
+    }
+
+    /// Report the deadline as already passed from the moment `n` stimuli have
+    /// been sent.
+    ///
+    /// The sibling of [`Self::with_cancel_after`] for the clock: a job's
+    /// `time_s` runs out *between* two probes of a check far more often than
+    /// before its first, and the stop-after-the-probe-in-flight contract is
+    /// the same for both. Until then [`ProbeHost::deadline`] is the configured
+    /// one.
+    #[must_use]
+    pub fn with_deadline_after(mut self, n: usize) -> Self {
+        self.deadline_after = Some(n);
         self
     }
 
@@ -350,7 +367,8 @@ impl ScriptedHost {
     /// [`Self::with_probe_refused_at`] names.
     fn past_the_failure_point(&self) -> bool {
         let so_far = self.sent_probes().len();
-        self.probes_fail_after.is_some_and(|n| so_far > n) || self.probe_refused_at == Some(so_far)
+        self.probes_fail_after.is_some_and(|n| so_far > n)
+            || self.probe_refused_at.contains(&so_far)
     }
 }
 
@@ -411,6 +429,12 @@ impl ProbeHost for ScriptedHost {
     }
 
     fn deadline(&self) -> Instant {
+        if self
+            .deadline_after
+            .is_some_and(|n| self.sent_probes().len() >= n)
+        {
+            return Instant::now() - Duration::from_secs(1);
+        }
         self.deadline
     }
 

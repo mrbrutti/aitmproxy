@@ -242,3 +242,69 @@ fn no_id_carries_a_verb_separator() {
         assert!(id.len() <= 64, "{id} is too long for a verb suffix");
     }
 }
+
+/// Option A's whole point is that **no code path builds a raw h2 runner
+/// without the SSRF policy and the scope guard**. The type system cannot say
+/// "this struct has exactly one constructor", so the source is pinned the way
+/// `native_timing.rs` pins the absence of `sleep`: the accept-any client is
+/// constructed exactly once in the crate, on the line that gates it, there is
+/// no other `pub fn` on the runner, and the five h2 checks are built only
+/// inside `checks_with`.
+#[test]
+fn no_source_path_builds_an_ungated_raw_h2_runner() {
+    let h2 = include_str!("../src/h2_observe.rs");
+    let catalogue = include_str!("../src/catalogue.rs");
+    let lib = include_str!("../src/lib.rs");
+
+    let constructions: Vec<&str> = h2
+        .lines()
+        .filter(|line| line.contains("RawH2Client::new("))
+        .collect();
+    assert_eq!(
+        constructions.len(),
+        1,
+        "the raw client is built in exactly one place: {constructions:?}"
+    );
+    assert!(
+        constructions[0].contains(".with_ssrf(ssrf, guard)"),
+        "the one construction must be gated on the same line: {}",
+        constructions[0]
+    );
+    assert_eq!(
+        h2.matches("TlsVerify::AcceptAny").count() - h2.matches("`TlsVerify::AcceptAny`").count(),
+        1,
+        "accept-any appears in code exactly once (the rest is documentation)"
+    );
+    assert!(
+        !h2.contains("pub fn new(") && !h2.contains("impl Default for RealRawH2Runner"),
+        "RealRawH2Runner must have no constructor besides with_ssrf"
+    );
+
+    // The h2 checks are built only by the gated slot.
+    let callers: Vec<&str> = catalogue
+        .lines()
+        .filter(|line| line.contains("h2_checks(") && !line.trim_start().starts_with("//"))
+        .collect();
+    assert_eq!(callers.len(), 1, "{callers:?}");
+    assert!(callers[0].contains("h2_checks(runner)"), "{}", callers[0]);
+    assert!(
+        !lib.contains("h2_checks("),
+        "lib.rs must not build h2 checks itself"
+    );
+}
+
+/// The ten checks `checks_with` returns carry the same metadata whether they
+/// came through `checks()` or not: the gated slot does not re-shape the five
+/// gate-free checks, it only adds the h2 five.
+#[test]
+fn the_gated_slot_leaves_the_gate_free_five_untouched() {
+    let gate_free = checks();
+    let all = gated();
+    for check in &gate_free {
+        let twin = all
+            .iter()
+            .find(|c| c.meta().id == check.meta().id)
+            .unwrap_or_else(|| panic!("{} missing from checks_with", check.meta().id));
+        assert_eq!(twin.meta(), check.meta(), "{}", check.meta().id);
+    }
+}

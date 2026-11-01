@@ -485,3 +485,143 @@ async fn sqli_boolean_meta_is_the_task_7_entry() {
     assert_eq!(meta.origin, CheckOrigin::Native);
     assert!(meta.remediation.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Tester pass over fix round F3: the confirmation loop's other exits
+// ---------------------------------------------------------------------------
+
+/// The refused-repeat rule holds on the *second* repeat too, not only the
+/// first: `Accuracy::FewerFalsePositives` wants three agreeing runs, the
+/// first two agree and the third cannot be sent. Still `Inconclusive`, still
+/// naming the pair, still no `Diff`.
+#[tokio::test]
+async fn a_refused_second_repeat_is_inconclusive_too() {
+    let host = vulnerable_host()
+        .with_accuracy(Accuracy::FewerFalsePositives)
+        .with_speed(Speed::Fast)
+        // Control, pair, first repeat go through (five stimuli); the second
+        // repeat's true arm is refused.
+        .with_probes_failing_after(5);
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert_eq!(
+        verdict.detail,
+        "the pair \" AND 1=1\" / \" AND 1=2\" differed once but a repeat could not be sent"
+    );
+    assert_eq!(verdict.evidence.diff, None);
+    assert_eq!(host.sent().len(), 6, "it stopped at the refused arm");
+}
+
+/// A refusal during a pair that had *not* hit is not the same thing: the
+/// check moves on, and a later pair that hits and reproduces is still the
+/// finding. A single dropped request must not cost the point its verdict.
+#[tokio::test]
+async fn a_refused_first_pair_does_not_hide_a_later_hit() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, &body(600)))
+        .on(EXAMPLE, html(200, &body(600)))
+        // The second pair (single-quoted) is the real hit.
+        .on("'1'='1", html(200, &body(600)))
+        .on("'1'='2", html(200, &body(120)))
+        .with_fallback(html(200, &body(600)))
+        // The first pair's true arm (stimulus 2) is refused.
+        .with_probe_refused_at(2);
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(
+        verdict.evidence.payload.as_deref(),
+        Some("' AND '1'='2"),
+        "the finding is the pair that hit, not the one that was refused"
+    );
+    assert_eq!(
+        verdict.evidence.diff,
+        Some(Diff {
+            baseline_len: 600,
+            true_len: 600,
+            false_len: 120,
+        })
+    );
+    // Control, the refused true arm (the false arm is never sent once its
+    // partner failed), then the second pair twice.
+    assert_eq!(
+        host.sent(),
+        vec![
+            EXAMPLE.to_string(),
+            " AND 1=1".to_string(),
+            "' AND '1'='1".to_string(),
+            "' AND '1'='2".to_string(),
+            "' AND '1'='1".to_string(),
+            "' AND '1'='2".to_string(),
+        ]
+    );
+}
+
+/// A hit that does not reproduce is dropped — and the loop goes on. The next
+/// pair, which does reproduce, is reported, so a flaky first pair does not
+/// end the run `Clean` over a real finding further down the list.
+#[tokio::test]
+async fn an_unreproduced_hit_is_dropped_and_a_later_reproducing_pair_is_reported() {
+    let host = vulnerable_host()
+        .with_accuracy(Accuracy::Normal)
+        // The first pair's repeat does not diverge.
+        .on_nth(" AND 1=2", 2, html(200, &body(600)))
+        // The second pair hits every time.
+        .on("'1'='1", html(200, &body(600)))
+        .on("'1'='2", html(200, &body(120)));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload.as_deref(), Some("' AND '1'='2"));
+    assert!(
+        verdict.detail.contains("reproduced 2 time(s)"),
+        "{}",
+        verdict.detail
+    );
+    // Control + first pair twice + second pair twice = 9, inside the cap.
+    assert_eq!(host.sent().len(), 9);
+}
+
+/// The cap counts stimuli, not pairs, and the baseline is the lane's and is
+/// not one of them: a `thorough` run with a hit on the fourth pair at
+/// `Accuracy::Normal` needs a control plus four pairs plus one repeat, which
+/// is eleven — over the cap — so the repeat is refused and the run says the
+/// cap stopped it. Ten is the number the scheduler was promised.
+#[tokio::test]
+async fn the_cap_refuses_the_repeat_that_would_be_the_eleventh_probe() {
+    let host = ScriptedHost::new()
+        .with_speed(Speed::Thorough)
+        .with_accuracy(Accuracy::Normal)
+        .with_baseline(html(200, &body(600)))
+        .on(EXAMPLE, html(200, &body(600)))
+        // Only the fourth pair (the OR form) diverges.
+        .on(" OR 1=2", html(200, &body(120)))
+        .with_fallback(html(200, &body(600)))
+        .with_budget(64);
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert!(
+        verdict
+            .detail
+            .contains("differed once but the job stopped before it could be confirmed"),
+        "{}",
+        verdict.detail
+    );
+    assert_eq!(
+        host.sent().len(),
+        9,
+        "control plus four whole pairs; no eleventh"
+    );
+    assert!(host.sent().len() <= MAX_BOOLEAN_PROBES);
+}
