@@ -95,7 +95,7 @@ Only the 16 ANSI colours plus bold, dim and reverse; no truecolor, no 256-colour
 | bold | bold | weight | | | the wordmark, a card label the eye should land on |
 | plain | none | `text.primary` | | | everything else |
 
-Rules: colour goes on glyphs and state words, never on whole lines or chrome; never bright variants (`90–97`) because light themes lose them; never a background colour except the terminal's own reverse for nothing in wave 1. `NO_COLOR` set and non-empty disables colour; `CLICOLOR_FORCE` non-empty forces it when `NO_COLOR` is unset (anstream/uv precedence); `--color=always|never|auto` beats both **(Orchestrator's call)**.
+Rules: colour goes on glyphs and state words, never on whole lines or chrome; never bright variants (`90–97`) because light themes lose them; never a background colour except the terminal's own reverse for nothing in wave 1. `NO_COLOR` set and non-empty disables colour; `CLICOLOR_FORCE` non-empty forces it when `NO_COLOR` is unset (anstream/uv precedence); `--color=always|never|auto` beats both **(Orchestrator's call)**. Forcing applies only where the stream is a TTY: `CLICOLOR_FORCE` and `--color=always` never put an escape byte into a pipe or a file (D4; the mac Core Log and the e2e logs read those streams).
 
 ### T3. Spacing and layout
 
@@ -440,8 +440,9 @@ Rules, in precedence order **(Orchestrator's call, with the `AITM_TERM` hatch as
 2. `AITM_TERM=plain` → `color=false, unicode=false, animate=false`; `ascii` → `unicode=false`; `rich` → `unicode=true` (animation still needs a TTY).
 3. `NO_COLOR` non-empty → `color=false`; else `CLICOLOR_FORCE` non-empty → `color=true`.
 4. Otherwise `color = tty && TERM set && TERM != dumb`.
-5. `animate = tty && color-eligible-terminal (TERM set, not dumb) && CI unset && mode != Plain`. `CI` set → plain lines even on a TTY. `-v`/`-vv`/`RUST_LOG` active → `animate=false` (the raw stream and the live region never interleave; cargo-style collapse to lines) **(Architect's call)**.
+5. `animate = tty && color-eligible-terminal (TERM set, not dumb) && CI unset && mode != Plain`. `CI` set → plain lines even on a TTY. `-v`/`-vv`/`RUST_LOG` active → `animate=false` (the raw stream and the live region never interleave; cargo-style collapse to lines) **(Architect's call)**. Rules 1 and 3 can turn `color` on for a dumb TTY (`TERM=dumb CLICOLOR_FORCE=1`, `--color=always`), but never `animate`: animation needs a real, non-dumb TTY, so a forced-colour dumb terminal gets painted plain lines without cursor movement.
 6. `unicode` per T1. `width` per T5. `detect_stderr` uses `std::io::IsTerminal` on stderr and `crossterm::terminal::size()` only when that is true.
+7. `CLICOLOR_FORCE` and `--color=always` affect colour only where the stream is a TTY: a non-TTY stream renders through the plain path (D4), which never emits an escape byte, whatever `color` says. `Caps.color` may read `true` for a pipe under those settings; it is inert there.
 
 ### D3. Style and glyphs
 
@@ -685,7 +686,7 @@ Each is observable on the real binary unless marked (unit). W1 unless tagged.
 8. **AC-W1-8** The `System proxy` row shows `off`/`points at this proxy`/`points at <host>:<port>` per T7 and the `▸ aitm proxy system set` line only for `off` and `other`.
 9. **AC-W1-9** The header line is `›•‹ aitmproxy <version>` on a UTF-8 TTY and `aitmproxy <version>` when ASCII or plain (unit through the seam + the `script` capture).
 10. **AC-W1-10** `LANG=C aitm` (or `TERM=linux`) in a TTY uses only ASCII glyphs (`* o + x ! > - ...`, `- \ | /`), proved by a `script` capture containing no byte ≥ 0x80 outside the operator's own paths.
-11. **AC-W1-11** `NO_COLOR=1 aitm` in a TTY prints no SGR sequence; `CLICOLOR_FORCE=1 aitm 2>file` prints SGR into the file; `--color=never` beats `CLICOLOR_FORCE`; `--color=always` beats `NO_COLOR`; `CI=1 aitm` in a TTY prints plain lines (no cursor movement).
+11. **AC-W1-11** `NO_COLOR=1 aitm` in a TTY prints no SGR sequence; `TERM=dumb CLICOLOR_FORCE=1 aitm` in a TTY prints SGR (the force variable wins over the dumb-terminal rule) while `TERM=dumb aitm` prints none; in a TTY `--color=never` beats `CLICOLOR_FORCE` (no SGR) and `--color=always` beats `NO_COLOR` (SGR present); `CI=1 aitm` in a TTY prints plain lines (no cursor movement). A non-TTY stream never receives an escape byte under any of these variables (D4; the `2>file` form is proved by AC-W1-5).
 12. **AC-W1-12** `-q` suppresses the header, phases and card but not the port-in-use panel; `-v` prints the raw INFO stream on stderr plus plain phase lines; `-vv` adds DEBUG including the 49 `loaded script` records; `-v -q` exits 2 with a usage panel.
 13. **AC-W1-13** Exit codes: 0 for `--help`/`--version`; 2 for `aitm tui extra`, `aitm operator-token`, `aitm nonsense`, `aitm flow list --bogus 1`, `aitm --flag-first`; 1 for config errors, port in use, strict-script failure and command failures (`findings get --id nope`).
 14. **AC-W1-14** Mode usage errors (`tui`, `operator-token`, `sysproxy-watchdog`) print their existing `usage: …` line verbatim as the panel headline on stderr, exit 2 (the `sysproxy_watchdog_dispatch.rs:206` pin passes).
