@@ -239,7 +239,10 @@ public enum ScanFindingLink {
         let withExtension = ref + ".poc.yaml"
         return pocPaths.firstIndex { path in
             let file = path.split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? path
-            return file == ref || file == withExtension || path.hasSuffix("/" + ref)
+            // The engine's `poc_ref` is the PoC file's own path (seen live: an absolute
+            // `<findings.dir>/scan/pocs/<slug>/<name>.poc.yaml`), so equality comes first;
+            // a bare name or a `dir/name` tail still resolves for a relative reference.
+            return path == ref || file == ref || file == withExtension || path.hasSuffix("/" + ref)
         }
     }
 }

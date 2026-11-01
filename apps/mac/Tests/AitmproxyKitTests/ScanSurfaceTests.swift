@@ -1559,6 +1559,16 @@ extension ScanSurfaceTests {
     }
 
     /// Q1: the Issues detail resolves `poc_ref` to a listed PoC path in the Kit, not the view.
+    /// The engine's live `poc_ref` is the PoC file's absolute path (seen on 2026-11-01); it
+    /// resolves by equality, and a different file in the same folder does not.
+    @Test func anAbsolutePocRefResolvesByEquality() {
+        let a = "/tmp/f/scan/pocs/aitm-poc-reflected-cross-site-scripting-43248-1-1793548843269530000/reflected-cross-site-scripting.poc.yaml"
+        let b = "/tmp/f/scan/pocs/aitm-poc-open-redirect-99/open-redirect.poc.yaml"
+        #expect(ScanFindingLink.match(pocRef: a, in: [b, a]) == 1)
+        #expect(ScanFindingLink.match(pocRef: a, in: [b]) == nil)
+        #expect(ScanFindingLink.match(pocRef: "/tmp/other/reflected-cross-site-scripting.poc.yaml", in: [a]) == nil)
+    }
+
     @Test func pocRefResolvesToAListedPath() {
         let paths = ["/x/pocs/poc-3b1c.poc.yaml", "/x/pocs/other.poc.yaml"]
         #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: paths) == 0)
