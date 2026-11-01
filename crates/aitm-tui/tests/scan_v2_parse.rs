@@ -149,10 +149,12 @@ fn error_codes_get_fixed_wording() {
     );
 
     let table: [(&str, ScanErrorCode, &str); 9] = [
+        // On a launch tag no list is refreshed, so the clause is omitted
+        // (D9 as amended; fix round G, G75): the keyed form is pinned below.
         (
             "not_found",
             ScanErrorCode::NotFound,
-            "No longer known to the core (it may have restarted); the list is being refreshed",
+            "No longer known to the core (it may have restarted)",
         ),
         (
             "busy",
@@ -201,6 +203,13 @@ fn error_codes_get_fixed_wording() {
         assert_eq!(e.detail, "why", "{token}");
         assert_eq!(e.wording(), format!("{text}: why"), "{token}");
     }
+
+    let healed = ScanError::from_message("scan.status:scan-1a2b3c4d", "scan: not_found: why");
+    assert_eq!(
+        healed.wording(),
+        "No longer known to the core (it may have restarted); the list is being refreshed: why",
+        "a keyed status tag ran the self-heal"
+    );
 
     let plain = ScanError::from_message("scan.start", "boom");
     assert_eq!(plain.code, None);
