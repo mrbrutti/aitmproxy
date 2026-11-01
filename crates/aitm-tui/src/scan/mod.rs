@@ -430,13 +430,33 @@ pub fn tag_parts(tag: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Reduce a scan target (`host`, `host:port`, `http://host/path?q`) to the bare
-/// host the scope guard checks.
+/// Reduce a scan target (`host`, `host:port`, `http://host/path?q`,
+/// `[v6]:port`) to the bare host the scope guard checks.
+///
+/// A port is stripped only from a bracketed IPv6 literal (`[::1]:8080`) or
+/// from a `host:digits` pair holding exactly one colon; a bare IPv6 literal
+/// (`::1`, `fe80::1`) holds more and is kept whole (fix round A, A4; the
+/// finding's "remainder holds at most one colon" is read as "the whole
+/// authority holds at most one colon", which is what its own cases pin).
 pub fn scan_host(raw: &str) -> String {
     let s = raw.trim();
     let s = s.split_once("://").map_or(s, |(_, rest)| rest);
-    let s = s.split(['/', '?', '#']).next().unwrap_or(s);
-    s.rsplit_once(':').map_or(s, |(h, _)| h).to_string()
+    let s = s.find(['/', '?', '#']).map_or(s, |i| &s[..i]);
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((v6, _)) = rest.split_once(']') {
+            return v6.to_string();
+        }
+    }
+    match s.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && !host.contains(':') =>
+        {
+            host.to_string()
+        }
+        _ => s.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +477,18 @@ mod tests {
         assert_eq!(scan_host("http://127.0.0.1:8080/x?y#z"), "127.0.0.1");
         assert_eq!(scan_host(" example.test:443 "), "example.test");
         assert_eq!(scan_host("example.test"), "example.test");
+    }
+
+    /// Fix round A, A4: a bare IPv6 literal keeps its last group; only a
+    /// `host:digits` pair or a bracketed `[v6]:port` loses a port.
+    #[test]
+    fn scan_host_keeps_a_bare_ipv6_literal() {
+        assert_eq!(scan_host("::1"), "::1");
+        assert_eq!(scan_host("[::1]:8080"), "::1");
+        assert_eq!(scan_host("host:8080"), "host");
+        assert_eq!(scan_host("fe80::1"), "fe80::1");
+        assert_eq!(scan_host("[fe80::1]"), "fe80::1");
+        assert_eq!(scan_host("host:abc"), "host:abc");
     }
 
     #[test]
