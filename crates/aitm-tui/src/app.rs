@@ -1428,7 +1428,8 @@ impl App {
                     }
                 }
                 // Scan: ⏎ acts per tab (D11). On Site map it opens the
-                // focused list's selected flow in the inspector, which on a
+                // focused list's selected flow in the inspector, read from
+                // the same lists the cursor keys walk (A2), which on a
                 // legacy bus is exactly today's behaviour (D12): the
                 // injection point's flow in the Points pane, the endpoint's
                 // linked flow (AC3) in the Nodes pane. An endpoint with no
@@ -1436,24 +1437,7 @@ impl App {
                 // refused, not selected. The other tabs act in their own
                 // tasks.
                 Mode::Scan => {
-                    let id = match self.scan.tab {
-                        ScanTab::SiteMap => match self.scan.sitemap.pane {
-                            crate::scan::MapPane::Points => self
-                                .scan
-                                .legacy
-                                .points
-                                .get(self.scan.legacy.cursor)
-                                .map(|p| p.flow.clone()),
-                            crate::scan::MapPane::Nodes => self
-                                .scan
-                                .legacy
-                                .endpoints
-                                .get(self.scan.legacy.endpoint_cursor)
-                                .and_then(|e| self.scan.legacy.endpoint_flows.get(e).cloned()),
-                        },
-                        ScanTab::Profiles | ScanTab::Jobs | ScanTab::Issues => None,
-                    };
-                    if let Some(id) = id {
+                    if let Some(id) = self.scan.sitemap_selected_flow(self.scan_offer()) {
                         if self.row(&id).is_some() {
                             self.selected = Some(id);
                             self.mode = Mode::Inspector;
@@ -2396,7 +2380,7 @@ impl App {
             // Scan: Esc/`q` closes a focused detail, editor or points pane
             // back to its list pane, and only then leaves the view (D11).
             Mode::Scan => {
-                if self.scan.close_pane() {
+                if self.scan.close_pane(self.scan_offer()) {
                     return;
                 }
                 Mode::Flows
@@ -2723,7 +2707,8 @@ impl App {
                 // A page is the list body: the terminal minus the view's
                 // chrome, which is SCAN_CHROME_ROWS = 10 rows.
                 let page = usize::from(self.height.saturating_sub(SCAN_CHROME_ROWS)).max(1);
-                if let Some((cursor, n)) = self.scan.cursor_mut() {
+                let offer = self.scan_offer();
+                if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
                     if n > 0 {
                         let c = *cursor;
                         *cursor = match action {

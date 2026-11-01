@@ -2,7 +2,7 @@
 
 use aitm_scan_model::{InsertionPoint, JobId, SiteNode};
 
-use super::ScanError;
+use super::{ScanError, ScanOffer};
 
 /// Which pane of the Site map tab holds the cursor. The legacy lists (D12)
 /// are walked through the same pane from Task 4 on.
@@ -22,6 +22,16 @@ pub struct SitemapQuery {
     pub target: Option<String>,
 }
 
+/// Which lists the Site map's two panes walk: the legacy `scan.discover`
+/// endpoints and injection points (D12), or the v2 `scan.sitemap` nodes and
+/// points. Decided once, from the bus, so the cursor keys and `Enter` never
+/// disagree (fix round A, A2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapSource {
+    Legacy,
+    V2,
+}
+
 /// The Site map tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SitemapState {
@@ -37,4 +47,17 @@ pub struct SitemapState {
     pub fetched_at_tick: u64,
     /// This tab's last error.
     pub error: Option<ScanError>,
+}
+
+impl SitemapState {
+    /// The lists the panes walk on a bus offering `offer`: the v2 lists only
+    /// on a v2 bus, the legacy lists otherwise (a bus with no scanner has
+    /// empty legacy lists, which is the right answer too).
+    pub fn source(offer: ScanOffer) -> MapSource {
+        if offer == ScanOffer::V2 {
+            MapSource::V2
+        } else {
+            MapSource::Legacy
+        }
+    }
 }

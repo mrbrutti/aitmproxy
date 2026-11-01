@@ -9,12 +9,23 @@
 
 mod common;
 
-use aitm_tui::action::{Action, BusRequest};
+use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::fixture_app_core;
-use aitm_tui::scan::ScanTab;
+use aitm_tui::scan::{MapPane, ScanTab};
 use common::*;
+use serde_json::Value;
+
+macro_rules! fixture {
+    ($name:literal) => {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aitm-scan-model/fixtures/",
+            $name
+        ))
+    };
+}
 
 /// Every `scan.*` verb of the v2 contract: a test that means "a legacy bus"
 /// must keep meaning that after T1b re-pins `CORE_TOOLS`.
@@ -173,4 +184,52 @@ fn v2_first_open_lands_on_profiles_and_remembers_the_tab() {
         ScanTab::Jobs,
         "the second open restores the tab the operator left on"
     );
+}
+
+/// Fix round A, A2: the Site map's pane-to-list choice is made once, keyed on
+/// the bus. On a v2 bus with `scan.sitemap` nodes on screen and the legacy
+/// lists empty, `Down` walks the v2 nodes and `Enter` opens the selected
+/// node's first flow; no legacy row is ever read.
+#[test]
+fn v2_site_map_enter_opens_the_v2_nodes_first_flow() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["scan.start", "scan.sitemap", "flow.list"], None);
+    let sitemap: Value = serde_json::from_str(fixture!("scan.sitemap.json")).expect("fixture");
+    let result: aitm_scan_model::SitemapResult =
+        serde_json::from_value(sitemap).expect("fixture parses");
+    let flow_id = result.nodes[0].flows[0].to_string();
+    let _ = app.on_bus(BusEvent::Flows(vec![summary(
+        &flow_id,
+        "GET",
+        "127.0.0.1:8080",
+        "/account/1",
+        Some(200),
+        "none",
+    )]));
+    app.selected = None;
+
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    app.scan.sitemap.nodes = result.nodes;
+    app.scan.sitemap.points = result.points;
+    app.scan.sitemap.pane = MapPane::Nodes;
+    assert!(app.scan.legacy.endpoints.is_empty() && app.scan.legacy.points.is_empty());
+
+    let _ = app.update(Action::Down);
+    assert_eq!(
+        app.scan.sitemap.node_cursor, 0,
+        "one node: Down stays on it"
+    );
+    assert_eq!(
+        app.scan.legacy.endpoint_cursor, 0,
+        "the legacy cursor is not touched"
+    );
+    let _ = app.update(Action::Enter);
+    assert_eq!(
+        app.selected.as_deref(),
+        Some(flow_id.as_str()),
+        "Enter selects the v2 node's first flow"
+    );
+    assert_eq!(app.mode, Mode::Inspector, "and opens it in the inspector");
 }

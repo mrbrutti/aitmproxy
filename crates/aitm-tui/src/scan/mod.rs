@@ -154,11 +154,12 @@ impl ScanState {
     /// flow cursor is the Issues task's, and an editor pane is dead while no
     /// profile is open.
     ///
-    /// The Site map panes walk the v2 lists when `scan.sitemap` has filled
-    /// them and the legacy `scan.discover` lists otherwise (D12: the legacy
-    /// result renders as nodes and points in the same two panes), which is
-    /// how today's endpoint and injection-point cursors survive the move.
-    pub fn cursor_mut(&mut self) -> Option<(&mut usize, usize)> {
+    /// The Site map panes walk the lists [`SitemapState::source`] picks for
+    /// `offer`: the v2 nodes and points on a v2 bus, the legacy
+    /// `scan.discover` endpoints and injection points otherwise (D12: the
+    /// legacy result renders as nodes and points in the same two panes),
+    /// which is how today's cursors survive the move.
+    pub fn cursor_mut(&mut self, offer: ScanOffer) -> Option<(&mut usize, usize)> {
         match self.tab {
             ScanTab::Profiles => match self.profiles.pane {
                 ProfilePane::List => {
@@ -188,24 +189,22 @@ impl ScanState {
                 }
                 JobPane::Detail => None,
             },
-            ScanTab::SiteMap => match self.sitemap.pane {
-                MapPane::Nodes => {
-                    if self.sitemap.nodes.is_empty() {
-                        let n = self.legacy.endpoints.len();
-                        Some((&mut self.legacy.endpoint_cursor, n))
-                    } else {
-                        let n = self.sitemap.nodes.len();
-                        Some((&mut self.sitemap.node_cursor, n))
-                    }
+            ScanTab::SiteMap => match (SitemapState::source(offer), self.sitemap.pane) {
+                (MapSource::Legacy, MapPane::Nodes) => {
+                    let n = self.legacy.endpoints.len();
+                    Some((&mut self.legacy.endpoint_cursor, n))
                 }
-                MapPane::Points => {
-                    if self.sitemap.points.is_empty() {
-                        let n = self.legacy.points.len();
-                        Some((&mut self.legacy.cursor, n))
-                    } else {
-                        let n = self.sitemap.points.len();
-                        Some((&mut self.sitemap.point_cursor, n))
-                    }
+                (MapSource::Legacy, MapPane::Points) => {
+                    let n = self.legacy.points.len();
+                    Some((&mut self.legacy.cursor, n))
+                }
+                (MapSource::V2, MapPane::Nodes) => {
+                    let n = self.sitemap.nodes.len();
+                    Some((&mut self.sitemap.node_cursor, n))
+                }
+                (MapSource::V2, MapPane::Points) => {
+                    let n = self.sitemap.points.len();
+                    Some((&mut self.sitemap.point_cursor, n))
                 }
             },
             ScanTab::Issues => match self.issues.pane {
@@ -215,6 +214,40 @@ impl ScanState {
                 }
                 IssuePane::Detail => None,
             },
+        }
+    }
+
+    /// The flow `Enter` opens from the Site map's focused pane, read from the
+    /// same lists [`ScanState::cursor_mut`] walks for `offer` (spec D11,
+    /// D12; AC3 for the legacy endpoint link). `None` when the pane is empty,
+    /// the row names no flow, or the active tab is not the Site map.
+    pub fn sitemap_selected_flow(&self, offer: ScanOffer) -> Option<String> {
+        if self.tab != ScanTab::SiteMap {
+            return None;
+        }
+        match (SitemapState::source(offer), self.sitemap.pane) {
+            (MapSource::Legacy, MapPane::Nodes) => self
+                .legacy
+                .endpoints
+                .get(self.legacy.endpoint_cursor)
+                .and_then(|e| self.legacy.endpoint_flows.get(e).cloned()),
+            (MapSource::Legacy, MapPane::Points) => self
+                .legacy
+                .points
+                .get(self.legacy.cursor)
+                .map(|p| p.flow.clone()),
+            (MapSource::V2, MapPane::Nodes) => self
+                .sitemap
+                .nodes
+                .get(self.sitemap.node_cursor)
+                .and_then(|n| n.flows.first())
+                .map(ToString::to_string),
+            (MapSource::V2, MapPane::Points) => self
+                .sitemap
+                .points
+                .get(self.sitemap.point_cursor)
+                .and_then(|p| p.flow.as_ref())
+                .map(ToString::to_string),
         }
     }
 
@@ -255,8 +288,13 @@ impl ScanState {
 
     /// Esc / `q`: close a focused secondary pane back to its list pane
     /// (D11). `true` when one was open, so the caller knows the key was
-    /// spent here and the view stays.
-    pub fn close_pane(&mut self) -> bool {
+    /// spent here and the view stays. On a legacy bus nothing changes in
+    /// behaviour (D12): the key is never spent here, so one Esc leaves the
+    /// view as it did before the tabs (fix round A, A20).
+    pub fn close_pane(&mut self, offer: ScanOffer) -> bool {
+        if offer == ScanOffer::Legacy {
+            return false;
+        }
         match self.tab {
             ScanTab::Profiles if self.profiles.pane != ProfilePane::List => {
                 self.profiles.pane = ProfilePane::List;

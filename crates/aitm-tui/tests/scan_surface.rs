@@ -482,3 +482,19 @@ fn sidebar_step_skips_scan_when_the_tool_is_absent() {
     );
     assert_eq!(app.mode, Mode::Scan);
 }
+
+/// Fix round A, A20 (spec D12 "nothing changes in behaviour"): on a legacy bus
+/// the first `Esc` on the Site map leaves the view at once, even though the
+/// first open focuses the Points pane; it never spends the key flipping panes.
+#[test]
+fn first_esc_on_the_legacy_site_map_leaves_the_view() {
+    let mut app = legacy_app(200, 50);
+    open_site_map(&mut app);
+    assert_eq!(app.mode, Mode::Scan);
+    let _ = app.update(Action::Back);
+    assert_eq!(
+        app.mode,
+        Mode::Flows,
+        "one Esc leaves the legacy Site map (D12)"
+    );
+}
