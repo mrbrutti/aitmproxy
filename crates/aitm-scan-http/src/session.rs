@@ -186,7 +186,9 @@ pub(crate) struct CanaryRequest {
     /// [`SessionMonitor::canary`], which waits on seam S1.
     #[allow(dead_code)]
     pub method: CanaryMethod,
-    /// The request's path (with query), for the status shape. Read only by
+    /// The request's path *without* the query, for the status shape: the
+    /// contract names a path, and a query string can carry a value. The replay
+    /// still goes to `request.path`, query and all. Read only by
     /// [`SessionMonitor::canary`], which waits on seam S1.
     #[allow(dead_code)]
     pub path: String,
@@ -265,7 +267,9 @@ fn canary_from(flow: &Flow, origin: &Url, material: &SessionMaterial) -> Option<
     request.body = Body::Empty;
     request.headers.remove("content-length");
     request.headers.remove("transfer-encoding");
-    let path = request.path.clone();
+    // The status shape is the path alone: `/account?tab=overview` reports as
+    // `/account`, while the replay keeps the captured target.
+    let path = params::split_path(&request.path).path.to_string();
 
     Some(CanaryRequest {
         request,
@@ -582,10 +586,12 @@ mod tests {
             &[],
             b"older",
         )));
+        // Carries a query, so the canary's status `path` (the path alone) and
+        // its replayed request target (path plus query) are distinguishable.
         store.insert(Flow::Http(captured_flow(
             request(
                 "GET",
-                "http://t:8080/account",
+                "http://t:8080/account?tab=overview",
                 &[("cookie", "sid=S3")],
                 None,
             ),
@@ -657,7 +663,10 @@ mod tests {
         // Not `/replayed` (a replay), not `/pending` (no response to expect),
         // not `/login` (not a canary method), not `/public` (no session name),
         // and not the older `/older`.
+        // The status shape is the path alone; the replay still targets the
+        // captured request line, query and all.
         assert_eq!(picked.path, "/account");
+        assert_eq!(picked.request.path, "/account?tab=overview");
         assert_eq!(picked.expected_status, 200);
         assert_eq!(picked.method, CanaryMethod::Get);
         assert_eq!(picked.request.method, "GET");
@@ -763,8 +772,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("GET".to_string(), "/account".to_string(), true),
-                ("GET".to_string(), "/account".to_string(), true),
+                ("GET".to_string(), "/account?tab=overview".to_string(), true),
+                ("GET".to_string(), "/account?tab=overview".to_string(), true),
             ]
         );
 
