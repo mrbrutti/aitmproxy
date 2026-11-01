@@ -100,7 +100,7 @@
 //! of a fresh call), because text can be masked into a different shape: a colon that a
 //! mask removes changes how a header array reads on the next walk. A value that does
 //! not settle in those rounds is returned as the last round left it, as the strict text
-//! pass itself does after its four rounds; no input is known to reach that.
+//! pass itself does after its `MAX_ROUNDS` rounds; no input is known to reach that.
 //!
 //! The function is `pub`, and not private to the server, because the durable
 //! writer reuses it: for an `args` text that parses as JSON it applies this same
@@ -321,7 +321,7 @@ fn with_marker(head: &str) -> String {
 /// fit is cut like an input and passed again, a few times at most, which makes a second
 /// pass over the result leave it alone. If it still does not fit it is cut for good,
 /// and a pass over that may read differently: a text that does not settle is returned
-/// as the last round left it, as `scrub_strict` itself does after its four rounds.
+/// as the last round left it, as `scrub_strict` itself does after its `MAX_ROUNDS` rounds.
 fn bounded_pass(text: &str, limit: usize, pass: impl Fn(&str) -> String) -> String {
     let mut text = pass(text);
     for _ in 0..OUTPUT_ROUNDS {
