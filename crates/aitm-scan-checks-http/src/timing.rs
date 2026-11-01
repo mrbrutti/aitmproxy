@@ -29,14 +29,6 @@ pub const SLOPE_ERROR_RANGE: f32 = 0.30;
 /// time, in milliseconds, for every second requested.
 const IDEAL_SLOPE_MS_PER_S: f32 = 1000.0;
 
-/// The named handle for this module's algorithm (spec D4).
-///
-/// The oracle holds no state — the whole algorithm is [`fit`] plus
-/// [`correlated`] — so this is a marker a catalogue entry can name when it
-/// documents which oracle decided its verdict.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TimingOracle;
-
 /// Least-squares fit of the observed delay against the delay that was requested.
 ///
 /// `requested_s` is in seconds, `observed_ms` and `baseline_ms` in milliseconds.

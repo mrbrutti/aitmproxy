@@ -30,11 +30,12 @@
 //! The layout is one module per technique, plus two shared, dependency-light
 //! toolboxes every technique draws on:
 //!
-//! - [`timing`] — the least-squares [`timing::TimingOracle`] behind every blind
-//!   time-based technique. It is the same algorithm the Rhai host function
-//!   `probe.timing_fit` exposes (spec D4, "Timing without `sleep`"), so both
-//!   halves of the catalogue agree on what "correlated" means.
-//! - [`matching`] — bounded response matching. Every body a check reads is
+//! - [`timing`] — the least-squares [`timing::fit`] and its acceptance rule
+//!   [`timing::correlated`], behind every blind time-based technique. It is
+//!   the same algorithm the Rhai host function `probe.timing_fit` exposes
+//!   (spec D4, "Timing without `sleep`"), so both halves of the catalogue
+//!   agree on what "correlated" means.
+//! - [`matching`] — bounded, scrubbed response matching. Every body a check reads is
 //!   capped at [`aitm_scan_model::MAX_MATCH_BODY`] and every excerpt it quotes
 //!   is capped by [`aitm_scan_model::Evidence::excerpt`], so a hostile response
 //!   cannot grow an issue without limit.
