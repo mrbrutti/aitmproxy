@@ -1009,11 +1009,13 @@ mod tests {
         assert!(disabled.l4_guard.is_none());
     }
 
-    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// every slot is a skeleton returning `None`, so the collected list is empty.
-    /// A `None` slot is skipped rather than collected — with the L4 handles present
-    /// the two L4 slots are still called and still contribute nothing. A lane
-    /// track's landing flips these literals; that track re-pins this test.
+    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot.
+    /// T4 (`aitm-scan-ws`) is the first lane to return `Some`, so the collected
+    /// list holds exactly that one lane; every other slot is still a skeleton
+    /// returning `None`. A `None` slot is skipped rather than collected — with
+    /// the L4 handles present the two L4 slots are still called and still
+    /// contribute nothing. Each lane track's landing bumps these literals; that
+    /// track re-pins this test.
     #[test]
     fn skeleton_lane_slots_are_empty_today() {
         assert_eq!(collect_lanes(None).len(), 1);
