@@ -163,7 +163,7 @@ final class BusService: FlowActions {
             let coreID = session.activeCoreID
             func scoped(_ row: FlowRow) -> FlowRow {
                 var row = row
-                row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
+                row.inScope = session.scopeHosts.isEmpty || Scope.contains(row.authority, in: session.scopeHosts)
                 return row
             }
             let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
@@ -246,7 +246,7 @@ final class BusService: FlowActions {
         // `rules` is F3; the core rejects unknown arguments, so they travel only when there are any.
         var args: [String: JSONValue] = ["enabled": .bool(enabled)]
         if enabled, !rules.isEmpty {
-            args["rules"] = .array(rules.map { .object($0.arguments.mapValues { .string($0) }) })
+            args["rules"] = .array(rules.map { .object($0.arguments) })
         }
         let armed = try await call("flow.intercept", args).boolValue ?? enabled
         session.interceptArmed = armed
@@ -356,13 +356,6 @@ final class BusService: FlowActions {
             }
         }
         return nil
-    }
-
-    /// `host`, `host:port`, `*.wildcard` against a row's authority.
-    static func hostMatches(_ authority: String, _ entry: String) -> Bool {
-        let host = authority.split(separator: ":").first.map(String.init) ?? authority
-        if entry.hasPrefix("*.") { return host.hasSuffix(String(entry.dropFirst(1))) || host == String(entry.dropFirst(2)) }
-        return authority == entry || host == entry
     }
 
     static func describe(_ error: Error) -> String {

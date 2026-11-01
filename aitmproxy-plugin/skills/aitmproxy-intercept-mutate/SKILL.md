@@ -21,7 +21,20 @@ tools park for operator `agent.approve`; under `readonly`/`paused` they do not r
   `ws_frame`, `any`), `url` (a `*` wildcard string, or `{wildcard}` / `{regex}`),
   `method`, `host` (an exact authority string, or `{exact}` / `{wildcard}`),
   `ws_dir` (`c2s` / `s2c`), plus `id`, `name`, `enabled`. For example
-  `rules: [{ "method": "POST", "url": "*/api/cart/*" }]`.
+  `rules: [{ "method": "POST", "url": "*/api/cart/*" }]`. How `url` matches:
+  - Subject: the pattern is matched against the full URL
+    (`scheme://host[:port]/path?query`) and against the path alone; either
+    may match. Omit `url` to match any URL.
+  - Wildcard: `*` matches any run, every other character is literal, and
+    matching is case-insensitive. With a `*` the pattern must match the
+    whole URL or the whole path (write `*httpbin.org*`, not `*httpbin.org`);
+    without `*` it matches as a substring. A wildcard starting with `/`
+    matches the path only, while `*/x*` can also match a host that starts
+    with `x`, so add a `host` clause when the path is meant.
+  - Regex: searched, case-insensitive; `(?-i)` opts out.
+  - Limits: more than 256 rules, a pattern over 4096 bytes, an empty `url`
+    pattern or an invalid regex rejects the whole call and leaves the active
+    rules unchanged.
 - **`ws.intercept [--enabled] [--rules]`** does the same for WebSocket frames
   (Phase::WsFrame): which live frames are parked for `ws.frame`.
 
