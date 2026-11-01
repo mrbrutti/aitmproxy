@@ -30,7 +30,14 @@
 //! Accepted residuals, which no pass reads: a credential with no key, frame or known
 //! shape around it; percent-encoded frames and SQL (`SET PASSWORD = 'x'`); an XML
 //! attribute that holds a `<` (`<password a="x<y">C</password>`) and an element whose
-//! content starts with a comment or a child (`<password><!-- c -->C</password>`).
+//! content starts with a comment or a child (`<password><!-- c -->C</password>`); and a
+//! URL in quotes whose password holds the quote that opens it (`'https://u:O'C@h/x'`:
+//! the authority ends at that quote).
+//!
+//! Accepted over-redaction, in the safe direction: `-u` and `-U` mask the part after the
+//! first colon of the next word, so `docker run -u 1000:1000 img` becomes `-u
+//! 1000:[redacted]` and `date -u +%H:%M` loses its minutes; and an unquoted value that
+//! runs across a quote takes the text up to the next delimiter with it.
 
 use std::borrow::Cow;
 
@@ -225,7 +232,11 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   escaped quotes (`{\"password\":\"x\"}`, one level or two, to the quote with
 ///   the same run of backslashes) and a `[..]` or `{..}` group (`"tokens":["x"]`,
 ///   strings in either quote read, a group that is cut running to the end) are
-///   masked whole. Also an XML or HTML element with a secret name
+///   masked whole. A plain value that runs across a quote is masked whole too: an
+///   unquoted value goes on across a quote that something follows (`password=O'Brien`,
+///   `api_key=ab"cd`) and ends at one followed by whitespace, `&`, `;`, `,`, `}`, `]` or
+///   the end of the text, where `scrub_text` would end it at the first quote and keep
+///   the tail. Also an XML or HTML element with a secret name
 ///   (`<password>x</password>`, CDATA included; the start tag is scanned for frames
 ///   too), a multipart field (`name="password"`, then the part headers, a blank
 ///   line and the value, which runs to the boundary line), a command-line flag
@@ -267,7 +278,8 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   header and four more segments, to its tag.
 /// - **P6.** A `key=value`, `key: value` or `"key":"value"` pair whose key is a
 ///   strict secret key that `scrub_text` does not know (an extra word, a camelCase
-///   name) is masked with the value rule of `scrub_text`. A form field name written
+///   name) is masked with the value rule of `scrub_text`, an unquoted value running
+///   across a quote as in the frames pre-pass. A form field name written
 ///   with bracket groups (`user[password]=x`, `password[]=x`, `a[b][token]=x`) is
 ///   read as a pair under the whole vocabulary, shared words included, because
 ///   `scrub_text` never read it. P2 has already taken a `pass: value` that starts a
@@ -276,15 +288,15 @@ pub fn is_benign_header(name: &str) -> bool {
 /// Plain text only: never call this over JSON text, where a line break is the two
 /// characters `\r\n` and a value is followed by `"}`.
 ///
-/// The round is repeated until its output equals its input, at most `MAX_ROUNDS`
-/// (four) times. One round does not always settle a text, because a mask can change
-/// how a neighbour reads: masking a value that ends in a backslash un-escapes the
-/// quote after it, and masking a span can remove the `.` that made `scrub_text` read
-/// a host and a port, or a `/` that ended a P4 authority. A second call over the
-/// result changes nothing for every input in the tests and for the fuzz-found shapes
-/// there; no counter-example is known. A text the round leaves alone costs one round,
-/// and the work is at most four passes, each linear in the length of `text`. A text
-/// that has not settled after `MAX_ROUNDS` rounds is returned as the last one left it.
+/// The round is repeated until its output equals its input, at most `MAX_ROUNDS` (six)
+/// times. One round does not always settle a text, because a mask can change how a
+/// neighbour reads: masking a value that ends in a backslash un-escapes the quote after
+/// it, and masking a span can remove the `.` that made `scrub_text` read a host and a
+/// port, or a `/` that ended a P4 authority. A second call over the result changes
+/// nothing for every input in the tests and for the fuzz-found shapes there; no
+/// counter-example is known. A text the round leaves alone costs one round, and the
+/// work is at most `MAX_ROUNDS` passes, each linear in the length of `text`. A text that
+/// has not settled after `MAX_ROUNDS` rounds is returned as the last one left it.
 pub fn scrub_strict(text: &str) -> String {
     converge(text, scrub_round)
 }
@@ -405,9 +417,11 @@ fn skip_blanks_in_line(text: &str, from: usize) -> usize {
 
 /// Whether the name run `bytes[start..end]` is the host of a `host:port` rather
 /// than a header name: the run contains a `.`, the very next byte is `:`, and one
-/// to five ASCII digits follow it and then `/`, `?`, `#`, a blank or the end of
-/// the text. Reads at most seven bytes past the run.
-fn is_host_port(bytes: &[u8], start: usize, end: usize) -> bool {
+/// to five ASCII digits follow it and then `/`, `?`, `#`, a byte for which
+/// `ends_port` holds or the end of the text. Reads at most seven bytes past the run.
+/// P2 and P6 end a port at whitespace; the frames pre-pass, which stands in front of
+/// `scrub_text`, ends it where `scrub_text` does (`ends_value`).
+fn is_host_port(bytes: &[u8], start: usize, end: usize, ends_port: fn(u8) -> bool) -> bool {
     if !bytes[start..end].contains(&b'.') || bytes.get(end) != Some(&b':') {
         return false;
     }
@@ -422,7 +436,7 @@ fn is_host_port(bytes: &[u8], start: usize, end: usize) -> bool {
     (1..=5).contains(&digits)
         && bytes
             .get(digits_start + digits)
-            .is_none_or(|&b| matches!(b, b'/' | b'?' | b'#') || is_ascii_ws(b))
+            .is_none_or(|&b| matches!(b, b'/' | b'?' | b'#') || ends_port(b))
 }
 
 // What `scrub_text` does to a pair is private to `redact.rs`, which is not edited
@@ -430,12 +444,13 @@ fn is_host_port(bytes: &[u8], start: usize, end: usize) -> bool {
 // (`mask_extra_pairs`) read a pair with copies of its helpers: `is_name_byte` (its
 // `is_key_byte`), `is_ascii_ws` (its `is_ascii_blank`), `run_end`, `blank_len`,
 // `skip_blanks_and_breaks` (its `skip_blanks`), `ends_value`, `unquoted_value_end`,
-// `is_opening_quote` and `closing_quote`, and `is_host_port`, which here ends a port
-// at `/`, `?`, `#` or whitespace and not at the other value delimiters `scrub_text`
-// also accepts (P6 uses it only for keys `scrub_text` does not know, so the narrower
+// `is_opening_quote` and `closing_quote`, and `is_host_port`, which P2 and P6 end at
+// `/`, `?`, `#` or whitespace and not at the other value delimiters `scrub_text` also
+// accepts (P6 uses it only for keys `scrub_text` does not know, so the narrower
 // exemption masks more). They must end a value where `scrub_text` ends it, and the
 // test `the_pair_value_rule_matches_scrub_text` holds the two together. A change to
-// the value rule there is a change here.
+// the value rule there is a change here, with one deliberate difference: an unquoted
+// value runs across a quote that something follows (`unquoted_value_end_across_quotes`).
 
 /// The index where the run of characters starting at `from` ends: at the first
 /// ASCII byte for which `ascii_continues` is false, at the first whitespace
@@ -496,6 +511,71 @@ fn ends_value(b: u8) -> bool {
 /// The index where an unquoted value starting at `from` ends.
 fn unquoted_value_end(text: &str, from: usize) -> usize {
     run_end(text, from, |b| !ends_value(b))
+}
+
+/// Whether a quote followed by the text at `after` is part of an unquoted value rather
+/// than its end: something follows, and it is not whitespace, `&`, `;`, `,`, `}` or `]`
+/// (`O'Brien`, `ab"cd`). `scrub_text` ends an unquoted value at any quote, which keeps
+/// the tail of a password with an apostrophe in it.
+fn quote_continues_value(text: &str, after: usize) -> bool {
+    // `after` follows an ASCII quote, so it is a char boundary.
+    text[after..]
+        .chars()
+        .next()
+        .is_some_and(|c| !(c.is_whitespace() || matches!(c, '&' | ';' | ',' | '}' | ']')))
+}
+
+/// Where an unquoted value that starts at `from` ends, and whether it ran across a
+/// quote: the rule of `scrub_text` (`unquoted_value_end`) except that a quote for which
+/// [`quote_continues_value`] holds is part of the value. Each step consumes the quote
+/// it crosses, so the work is linear.
+fn unquoted_value_end_across_quotes(text: &str, from: usize) -> (usize, bool) {
+    let bytes = text.as_bytes();
+    let mut end = from;
+    let mut across = false;
+    loop {
+        end = unquoted_value_end(text, end);
+        match bytes.get(end) {
+            Some(b'"' | b'\'') if quote_continues_value(text, end + 1) => {
+                across = true;
+                end += 1;
+            }
+            _ => return (end, across),
+        }
+    }
+}
+
+/// Where the value of a pair starts, given the index just after its separator: after
+/// whitespace and an optional opening quote. With the end of the quoted value when that
+/// quote closes (the quoted rule of `scrub_text`, which is not changed). A failed search
+/// for a closing quote reads to the end of the text, and a later search for the same
+/// quote character would fail too (a candidate is judged on the characters around it
+/// alone), so `quote_unclosed` remembers it and the search is not run again.
+fn pair_value_start(
+    text: &str,
+    after_separator: usize,
+    quote_unclosed: &mut [bool; 2],
+) -> (usize, Option<usize>) {
+    let bytes = text.as_bytes();
+    let mut j = skip_blanks_and_breaks(text, after_separator);
+    let quote = match bytes.get(j) {
+        Some(&q) if matches!(q, b'"' | b'\'') => {
+            j += 1;
+            Some(q)
+        }
+        _ => None,
+    };
+    let value_start = j;
+    let closer = quote.and_then(|q| {
+        let unclosed = &mut quote_unclosed[usize::from(q == b'\'')];
+        if *unclosed {
+            return None;
+        }
+        let found = closing_quote(text, value_start, q);
+        *unclosed = found.is_none();
+        found
+    });
+    (value_start, closer)
 }
 
 /// Whether the unescaped quote at `quote_at` reads as the opening quote of a value
@@ -691,9 +771,11 @@ fn quoted_end(bytes: &[u8], open: usize) -> usize {
 }
 
 /// The index just past the bracketed group that opens at `open` (a `[` or a `{`):
-/// brackets of every kind are counted, strings in either quote are skipped whole, and
-/// a group that never closes runs to the end of the text, so a mask over it fails
-/// closed.
+/// `[` and `{` are counted against `]` and `}`, strings in either quote are skipped
+/// whole, and a group that never closes runs to the end of the text, so a mask over it
+/// fails closed. A parenthesis is not counted: in a flow list an unmatched one is text
+/// (`[a), b]`), and in `Debug` output, where parentheses balance, counting them would
+/// change nothing.
 fn bracket_end(bytes: &[u8], open: usize) -> usize {
     let mut depth = 0usize;
     let mut k = open;
@@ -703,8 +785,8 @@ fn bracket_end(bytes: &[u8], open: usize) -> usize {
                 k = quoted_end(bytes, k);
                 continue;
             }
-            b'[' | b'{' | b'(' => depth += 1,
-            b']' | b'}' | b')' => {
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return k + 1;
@@ -817,24 +899,63 @@ fn starts_frame(bytes: &[u8], value: usize) -> bool {
     bytes.get(value).copied().is_some_and(is_ident_start) && bytes.get(ident_end) == Some(&b'(')
 }
 
-/// The value span of a pair under a secret key whose value is a frame `scrub_text`
-/// reads wrongly: a value in escaped quotes, a Rust `Debug` wrapper, or a `[..]` or
-/// `{..}` group, which `scrub_text` would cut after its opening bracket. The shape of
-/// the frame is looked at first, then the key, and only then is the frame scanned to
-/// its end: a scan for a closer that a key which is not secret would cause, again and
-/// again, could add up to more than a pass over the text. A frame that is not closed
-/// runs to the end of the text, so a failed scan is never repeated either.
-fn pair_frame(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usize)> {
+/// What the frames pre-pass does with the value of a pair under a secret key.
+enum Pair {
+    /// Mask this span.
+    Mask(usize, usize),
+    /// Leave the value to the passes after: `scrub_text` or P6 mask it, and the scan
+    /// resumes at this index, as theirs do.
+    Skip(usize),
+}
+
+/// The value of a pair under a secret key, for the frames pre-pass: a frame that
+/// `scrub_text` reads wrongly (a value in escaped quotes, a Rust `Debug` wrapper, a
+/// `[..]` or `{..}` group, which it would cut after its opening bracket), or a plain
+/// value that runs across a quote (`password=O'Brien`, which it would cut at the
+/// apostrophe). A plain value that does not is left to the passes after, and the scan
+/// goes on after it, as theirs does: a secret key's value is masked whole, and a scan
+/// of it for every key inside it would be a pass per key. The exceptions are a host and
+/// port (`auth.example.com:8443`), whose value is not masked, and an empty value.
+///
+/// The key is judged first, since every key with a separator is now read; the frame
+/// shapes are cheap to see, a closer is scanned for only after, and a frame that is not
+/// closed runs to the end of the text, so a failed scan is never repeated either.
+fn pair_frame(
+    text: &str,
+    key_start: usize,
+    key_end: usize,
+    quote_unclosed: &mut [bool; 2],
+) -> Option<Pair> {
     let bytes = text.as_bytes();
     let separator = separator_after_key(text, key_end)?;
-    let value = skip_blanks_and_breaks(text, separator + 1);
-    if !starts_frame(bytes, value) || !is_secret_key_strict(&text[key_start..key_end]) {
+    if !is_secret_key_strict(&text[key_start..key_end]) {
         return None;
     }
-    let end = escaped_frame_end(bytes, value)
-        .or_else(|| wrapper_frame_end(text, value))
-        .or_else(|| matches!(bytes[value], b'[' | b'{').then(|| bracket_end(bytes, value)))?;
-    Some((value, end))
+    let value = skip_blanks_and_breaks(text, separator + 1);
+    if starts_frame(bytes, value) {
+        let frame = escaped_frame_end(bytes, value)
+            .or_else(|| wrapper_frame_end(text, value))
+            .or_else(|| matches!(bytes[value], b'[' | b'{').then(|| bracket_end(bytes, value)));
+        if let Some(end) = frame {
+            return Some(Pair::Mask(value, end));
+        }
+    }
+    if bytes[separator] == b':' && is_host_port(bytes, key_start, key_end, ends_value) {
+        return None;
+    }
+    let (value_start, closer) = pair_value_start(text, separator + 1, quote_unclosed);
+    if let Some(closer) = closer {
+        return Some(Pair::Skip(closer));
+    }
+    let (value_end, across) = unquoted_value_end_across_quotes(text, value_start);
+    if value_end == value_start {
+        return None;
+    }
+    Some(if across {
+        Pair::Mask(value_start, value_end)
+    } else {
+        Pair::Skip(value_end)
+    })
 }
 
 /// The index of the `>` that closes the tag whose name ends at `from`, or `None`
@@ -935,10 +1056,14 @@ fn boundary_or_end(bytes: &[u8], from: usize) -> usize {
 /// The value of a multipart field named by a secret key: `name="password"`, the rest
 /// of that line and any further part header lines, an empty line, then the value up to
 /// the boundary line, or to the end of the text when there is none (a value may run
-/// over several lines, and the first line is not all of it). The field name is read within
-/// [`MULTIPART_FIELD_MAX`] bytes and the blank line looked for within
-/// [`MULTIPART_HEADER_WINDOW`], so a field name repeated without a part body costs a
-/// constant each, and a masked value is consumed. `None` for an empty value.
+/// over several lines, and the first line is not all of it).
+///
+/// The cost is bounded for every field. The name is read within
+/// [`MULTIPART_FIELD_MAX`] bytes and judged first, so a field that is not secret costs
+/// that read and nothing else, however long the text after it. A secret field's blank
+/// line is looked for within [`MULTIPART_HEADER_WINDOW`] bytes, and its value, which
+/// can be as long as the text, is consumed by the mask, so no byte is scanned twice.
+/// `None` for an empty value.
 fn multipart_value(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     if !text[key_start..key_end].eq_ignore_ascii_case("name") || bytes.get(key_end) != Some(&b'=') {
@@ -955,15 +1080,17 @@ fn multipart_value(text: &str, key_start: usize, key_end: usize) -> Option<(usiz
     if bytes[field_start + field_len] != quote {
         return None;
     }
+    // The field is judged before anything after it is read: the scan to the boundary
+    // line is as long as the value, and for a field that is not secret it would be
+    // thrown away, once for every such field.
+    if !is_secret_key_strict(&text[field_start..field_start + field_len]) {
+        return None;
+    }
     let after_name = field_start + field_len + 1;
     let window = &bytes[after_name..bytes.len().min(after_name + MULTIPART_HEADER_WINDOW)];
     let value_start = after_name + empty_line_end(window)?;
     let value_end = boundary_or_end(bytes, value_start);
-    if value_end == value_start {
-        return None;
-    }
-    is_secret_key_strict(&text[field_start..field_start + field_len])
-        .then_some((value_start, value_end))
+    (value_end > value_start).then_some((value_start, value_end))
 }
 
 /// The word after a command-line flag whose name is a secret key: `--password x`,
@@ -1026,10 +1153,12 @@ fn userpass_value(text: &str, key_start: usize, key_end: usize) -> Option<(usize
 /// frames it does not read at all. See [`scrub_strict`] for what is masked.
 ///
 /// One left-to-right scan: an element opens at a `<`, anything else is read as a
-/// run of name bytes, and each rule looks at what follows the run. The key
-/// vocabulary is consulted only after the cheap shape of a rule is found. A masked
-/// span is skipped whole, a frame that never closes runs to the end of the text, and
-/// the multipart and element scans are bounded, so the work is linear.
+/// run of name bytes, and each rule looks at what follows the run. The multipart,
+/// flag and `user:password` rules look at the shape first and the key after; the pair
+/// rule judges the key as soon as a separator follows it. A masked span is skipped
+/// whole, a value that the passes after will mask is skipped too (see [`Pair`]), a
+/// frame that never closes runs to the end of the text, and the multipart and element
+/// scans are bounded, so the work is linear.
 ///
 /// A secret-named element's content is masked when the scan reaches it (`pending`),
 /// not when the element is found, so that the scan first reads the start tag, whose
@@ -1044,13 +1173,15 @@ fn mask_value_frames(text: &str) -> Cow<'_, str> {
     // so it always reaches the start before the end of the text, or a frame has
     // covered the content; nothing is left pending when the loop ends.
     let mut pending: Option<(usize, usize)> = None;
+    // Whether a search for a closing `"` (index 0) or `'` (index 1) has failed.
+    let mut quote_unclosed = [false; 2];
     let mut i = 0;
     while i < len {
         if let Some((start, end)) = pending.filter(|&(start, _)| i >= start) {
             pending = None;
             if start >= masks.copied {
                 masks.mask(start, end);
-                i = end;
+                i = i.max(end);
                 continue;
             }
         }
@@ -1074,13 +1205,18 @@ fn mask_value_frames(text: &str) -> Cow<'_, str> {
             continue;
         }
         i = key_end;
-        let span = multipart_value(text, key_start, key_end)
+        let found = multipart_value(text, key_start, key_end)
             .or_else(|| cli_value(text, key_start, key_end))
             .or_else(|| userpass_value(text, key_start, key_end))
-            .or_else(|| pair_frame(text, key_start, key_end));
-        if let Some((start, end)) = span {
-            masks.mask(start, end);
-            i = end;
+            .map(|(start, end)| Pair::Mask(start, end))
+            .or_else(|| pair_frame(text, key_start, key_end, &mut quote_unclosed));
+        match found {
+            Some(Pair::Mask(start, end)) => {
+                masks.mask(start, end);
+                i = end;
+            }
+            Some(Pair::Skip(to)) => i = to,
+            None => {}
         }
     }
     masks.finish()
@@ -1138,7 +1274,9 @@ fn mask_header_lines(text: &str) -> String {
         let masks = CREDENTIAL_HEADERS
             .iter()
             .any(|header| name.eq_ignore_ascii_case(header))
-            || (at_line_start && is_secret_key_strict(name) && !is_host_port(bytes, start, end));
+            || (at_line_start
+                && is_secret_key_strict(name)
+                && !is_host_port(bytes, start, end, is_ascii_ws));
         if !masks {
             continue;
         }
@@ -1721,33 +1859,18 @@ fn mask_extra_pairs(text: &str) -> String {
         if !secret {
             continue;
         }
-        if !bracketed && separator == b':' && is_host_port(bytes, key_start, key_end) {
+        if !bracketed && separator == b':' && is_host_port(bytes, key_start, key_end, is_ascii_ws) {
             continue;
         }
 
-        // Whitespace, an optional opening quote, then the value.
-        j = skip_blanks_and_breaks(text, j);
-        let quote = match bytes.get(j) {
-            Some(&q) if matches!(q, b'"' | b'\'') => {
-                j += 1;
-                Some(q)
-            }
-            _ => None,
-        };
-        let value_start = j;
-        let closer = quote.and_then(|q| {
-            let unclosed = &mut quote_unclosed[usize::from(q == b'\'')];
-            if *unclosed {
-                return None;
-            }
-            let found = closing_quote(text, value_start, q);
-            *unclosed = found.is_none();
-            found
-        });
+        // Whitespace, an optional opening quote, then the value: the quoted rule of
+        // `scrub_text`, or the unquoted one, which runs across a quote that something
+        // follows.
+        let (value_start, closer) = pair_value_start(text, j, &mut quote_unclosed);
         let value_end = match closer {
             Some(end) => end,
             // Unquoted, or an opening quote that never closes: the plain rule.
-            None => unquoted_value_end(text, value_start),
+            None => unquoted_value_end_across_quotes(text, value_start).0,
         };
         if value_end == value_start {
             continue;
