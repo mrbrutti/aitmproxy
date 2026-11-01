@@ -621,6 +621,12 @@ onwards are this plan's.
 4. Connection bound: shared 4 across concurrent WS jobs (call 23 stands).
 5. `ws-oversize-frame`: a drop without a Close frame stays `Vulnerable(Info, Firm)` (decision 6 stands); the detail names it as a robustness observation.
 
+### Coordinator decisions received 2026-10-31 (amend calls 13 and 17; Task 19)
+
+- **Call 13 amended.** `crates/aitm-plugin-rhai/src/catalog_assembly.rs::production_languages()` and `docs/design/languages/rhai.api.json` are **integration-shared files** (same status as the contract lists). Task 19 (not T1b) adds `Box::new(aitm_scan_ws::WsLanguage::for_catalog())` to `production_languages()`, adds `aitm-scan-ws` to `aitm-plugin-rhai`'s `[dependencies]` for that one call, regenerates the golden `namespaces.ws` block from `assemble_namespaces`, and keeps `cargo test -p aitm-plugin-rhai --test api_catalog` green. These edits happen only in the final integration commit, after T1b is on `main`.
+- **Call 17 amended.** T1b exposes the run kind (hook vs command/check) through a default-bodied method on `HostCallContextSource`; once it is on `main`, `WsSeamGuard::permit` refuses `ws.*` when the context reports a hook (Task 19 wires the one `match` arm if the method exists at integration time, otherwise it is the first follow-up). Until then `ws.*` stays scope-guarded, budgeted and bounded to 4 handles.
+- The `/ws` seed shape T4 sent to the coordinator was relayed to T10 verbatim; Task 18's live tests are written against it: `ws://<target>/ws`, JSON `{"type":"chat","msg":"<text>"}` echoed (V unencoded, P HTML-escaped), V accepts any `Origin` / P 403 on a foreign one, cookie login from `/login` (P 401 without it), a handshake log (Origin, `Sec-WebSocket-Key`, cookie present yes/no) and a connection open/close log readable by the harness, `Sec-WebSocket-Protocol` echoed verbatim in V and ignored in P.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
