@@ -46,13 +46,13 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{NetSlice, SlicedPacket};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
-use crate::craft::PacketSpec;
+use crate::craft::{transport_ports, transport_proto, PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::{L4Guard, L4Permit};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
@@ -588,19 +588,21 @@ fn process_packet(
     params: &InterceptParams,
     flow_id: L4FlowId,
 ) {
-    // The self-exclusion choke point: a packet to or from one of the core's own
-    // listener ports on a loopback interface or address goes through untouched
-    // before anything else looks at it.
-    if !guard.admit_frame(&params.interface, &qp.bytes) {
-        let _ = queue.verdict(qp.handle, WireVerdict::Forward(None));
-        return;
-    }
-    // A packet that carries no IP target cannot be in a CIDR-scoped interception —
-    // forward it untouched rather than park it.
-    let Some(target) = ip_target(&qp.bytes, &params.interface, params.direction) else {
+    // Decoded once, with the L3-only parse an NFQUEUE payload needs. A packet
+    // that carries no IP layer cannot be in a CIDR-scoped interception — forward
+    // it untouched rather than park it.
+    let Some(endpoints) = ip_endpoints(&qp.bytes) else {
         let _ = queue.verdict(qp.handle, WireVerdict::Forward(None));
         return;
     };
+    // The self-exclusion choke point: a packet to or from one of the core's own
+    // listener ports on a loopback interface or address goes through untouched
+    // before anything else looks at it.
+    if !guard.admit_endpoints(&params.interface, &endpoints) {
+        let _ = queue.verdict(qp.handle, WireVerdict::Forward(None));
+        return;
+    }
+    let target = target_of(&endpoints, &params.interface, params.direction);
     // The second scope boundary (the `nft` rule is the first): only in-scope packets
     // park. An out-of-scope packet is auto-forwarded untouched, never parked (AC14).
     // A dropped momentary `Intercept` permit keeps the guard's in-flight gauge even.
@@ -646,10 +648,56 @@ fn wire_of(verdict: Verdict, mutated: Option<Vec<u8>>) -> WireVerdict {
     }
 }
 
+/// Decode an NFQUEUE payload (an IP packet — no L2 header) once, to its
+/// endpoints: addresses, ports (TCP/UDP) and transport. `None` for a buffer that
+/// carries no IP layer (such a packet is out of a CIDR-scoped interception by
+/// definition); `src` and `dst` are always `Some` otherwise. The one parse behind
+/// [`process_packet`]'s self-exclusion and scope checks and behind [`ip_target`].
+fn ip_endpoints(payload: &[u8]) -> Option<PacketEndpoints> {
+    let parsed = SlicedPacket::from_ip(payload).ok()?;
+    let (src, dst) = match parsed.net? {
+        NetSlice::Ipv4(ip) => {
+            let h = ip.header();
+            (
+                IpAddr::V4(h.source_addr()),
+                IpAddr::V4(h.destination_addr()),
+            )
+        }
+        NetSlice::Ipv6(ip) => {
+            let h = ip.header();
+            (
+                IpAddr::V6(h.source_addr()),
+                IpAddr::V6(h.destination_addr()),
+            )
+        }
+        NetSlice::Arp(_) => return None,
+    };
+    let (src_port, dst_port) = transport_ports(&parsed.transport);
+    Some(PacketEndpoints {
+        proto: transport_proto(&parsed.transport),
+        src: Some(src),
+        dst: Some(dst),
+        src_port,
+        dst_port,
+    })
+}
+
+/// The `L4Target` the guard checks for a payload whose decoded endpoints are
+/// `ep`: destination address, destination port (TCP/UDP), and protocol (`Raw`
+/// when the transport is unknown).
+fn target_of(ep: &PacketEndpoints, interface: &str, direction: L4Direction) -> L4Target {
+    L4Target {
+        interface: interface.to_string(),
+        direction,
+        dst: ep.dst,
+        dst_port: ep.dst_port,
+        proto: ep.proto.unwrap_or(L4Proto::Raw),
+    }
+}
+
 /// Resolve an NFQUEUE payload (an IP packet — no L2 header) to the `L4Target` the
-/// guard checks: destination address, destination port (TCP/UDP), and protocol.
-/// `None` for a buffer that carries no IP layer (such a packet is out of a
-/// CIDR-scoped interception by definition).
+/// guard checks; `None` for a buffer that carries no IP layer. A thin wrapper over
+/// [`ip_endpoints`] + [`target_of`], the parse [`process_packet`] uses.
 ///
 /// `pub(crate)` so the command layer can re-resolve a *mutated* packet's target and
 /// re-check it against the guard before reinjecting it (M5 Task 12 forward path).
@@ -658,26 +706,7 @@ pub(crate) fn ip_target(
     interface: &str,
     direction: L4Direction,
 ) -> Option<L4Target> {
-    let parsed = SlicedPacket::from_ip(payload).ok()?;
-    let dst = match parsed.net? {
-        NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().destination_addr()),
-        NetSlice::Ipv6(ip) => IpAddr::V6(ip.header().destination_addr()),
-        NetSlice::Arp(_) => return None,
-    };
-    let (dst_port, proto) = match parsed.transport {
-        Some(TransportSlice::Tcp(t)) => (Some(t.destination_port()), L4Proto::Tcp),
-        Some(TransportSlice::Udp(u)) => (Some(u.destination_port()), L4Proto::Udp),
-        Some(TransportSlice::Icmpv4(_)) => (None, L4Proto::Icmp),
-        Some(TransportSlice::Icmpv6(_)) => (None, L4Proto::IcmpV6),
-        _ => (None, L4Proto::Raw),
-    };
-    Some(L4Target {
-        interface: interface.to_string(),
-        direction,
-        dst: Some(dst),
-        dst_port,
-        proto,
-    })
+    Some(target_of(&ip_endpoints(payload)?, interface, direction))
 }
 
 // Test-only seams. They sit after every production item on purpose: the AC21
@@ -1004,6 +1033,51 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    /// `ip_endpoints` is the one L3-only parse behind `process_packet` (the
+    /// self-exclusion choke point, then the scope check) and `ip_target`: for an
+    /// IP payload it agrees with `PacketSpec::endpoints`, `ip_target` is derived
+    /// from it, and a buffer with no IP layer is `None` for both.
+    #[test]
+    fn ip_endpoints_is_the_one_parse_behind_ip_target() {
+        let bytes = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(10, 0, 0, 5)),
+                    dst: Some(Ipv4Addr::new(10, 0, 0, 9)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(40000),
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+
+        let ep = ip_endpoints(&bytes).expect("an IP payload decodes");
+        assert_eq!(ep, PacketSpec::endpoints(&bytes));
+        assert_eq!(ep.proto, Some(L4Proto::Udp));
+        assert_eq!(ep.src, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert_eq!(ep.dst, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+        assert_eq!(ep.src_port, Some(40000));
+        assert_eq!(ep.dst_port, Some(9));
+
+        let target = ip_target(&bytes, IFACE, L4Direction::Outbound).expect("an IP target");
+        assert_eq!(target.interface, IFACE);
+        assert_eq!(target.direction, L4Direction::Outbound);
+        assert_eq!(target.dst, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+        assert_eq!(target.dst_port, Some(9));
+        assert_eq!(target.proto, L4Proto::Udp);
+
+        for junk in [&[][..], &[0xde, 0xad][..]] {
+            assert!(ip_endpoints(junk).is_none(), "{junk:?} has no IP layer");
+            assert!(ip_target(junk, IFACE, L4Direction::Outbound).is_none());
+        }
     }
 
     /// `ParkedTable::due(now)` names exactly the live packets whose deadline is at
