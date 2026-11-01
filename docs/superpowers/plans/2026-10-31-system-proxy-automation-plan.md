@@ -1,8 +1,8 @@
 # System proxy automation implementation plan
 
-**Status:** approved (2026-10-31, self-approved under Matt's mandate; see the spec's Status line)
+**Status:** approved (2026-10-31, self-approved under Matt's mandate; see the spec's Status line; addendum PR 5 / Tasks 32–42 added 2026-10-31 for spec D17 (CA trust), approved under the same mandate — Task 41 additionally needs Matt's explicit go)
 **Spec:** `docs/superpowers/specs/2026-10-31-system-proxy-automation-design.md`
-(approved 2026-10-31; acceptance criteria SP-AC1 … SP-AC28)
+(approved 2026-10-31; acceptance criteria SP-AC1 … SP-AC28, plus SP-AC29 … SP-AC38 from the D17 addendum)
 **Research:** `docs/research/16-system-proxy.md`
 **Branch / worktree (PR 1):** `claude/system-proxy-automation-a08c0c`
 (`/Users/matt/Security/aitmproxy/.claude/worktrees/system-proxy-automation-a08c0c`,
@@ -10,7 +10,7 @@ main merged at `b109ca80` v0.5.5, which already contains PR #200 `capture.status
 
 ## Overview
 
-Four PR groups, merged separately by the orchestrator, in this order:
+Five PR groups, merged separately by the orchestrator, in this order (PR 5 was added by the D17 addendum):
 
 | Group | What | Branch / gate |
 |---|---|---|
@@ -18,6 +18,7 @@ Four PR groups, merged separately by the orchestrator, in this order:
 | **PR 2 TUI** | `:sysproxy`, key `s`, pill word | WAIT: after the fake-data-removal TUI PR and l4-parity's TUI unit; never touch `crates/aitm-tui/src/fixture.rs` |
 | **PR 3 web** | pill menu button, `app.proxy.systemProxy` | WAIT: after the fake-data-removal web PR and l4-parity's web unit; never touch `apps/web/src/bus/mock.ts` or `apps/web/src/bus/noise.ts` |
 | **PR 4 mac** | `SystemProxyFacts`, Settings ▸ Proxy, first-run sheet, nudge, menu, tripwire | WAIT: after PR 1 merges, after the mac fake-data-removal PR, after mac-attribution's PR lands `AitmproxyKit/SystemProxyState.swift`; `Bus/BusService.swift` only after S-041; `Session+Verbs.swift` after l4-parity's mac unit |
+| **PR 5 CA trust** | `aitm-ca` operator gate + macOS trust read-back + `Cancelled`; TUI/web `· CA trusted` word and `scope: user`; mac `Session+CATrust.swift`, sheet CA row, `.trustCA`/`.openCAPanel`, tripwire; gated live proof | own branch from `main` after PR 1; core tasks unblocked; TUI task after PR 2, web task after PR 3; mac tasks after mac-attribution's `CATrustFacts` PR and PR 4 Task 28; **Task 41 only after Matt's explicit go** |
 
 Within PR 1 the order is: Task 1 (skeleton) → Wave B {2, 3, 4, 5, 12} in parallel →
 Task 7 (watchdog, needs 4) → Task 6 (the `SystemProxy` engine, needs 2, 3, 4, 7) →
@@ -54,6 +55,11 @@ Task 8 (plugin) → Task 9 (wiring) → {Task 10 main.rs ∥ Task 11 pins} → T
    empty.
 9. Shared Cargo `target/` across worktrees reuses stale artifacts: `touch` the files
    you changed before the gate if a result looks impossible.
+10. **Never touch Matt's keychains.** No task runs `ca.install`, `security add-trusted-cert`
+    or anything that writes a keychain or trust setting on Matt's Mac except Task 41,
+    and Task 41 only after Matt's explicit go, only through the app's own step and the
+    macOS dialog, and only into the login keychain (the System keychain is quoted
+    before and after and must stay empty). Task 32 is read-only by construction.
 
 ### Plan-level calls (Architect; how the spec is read where it left wording open)
 
@@ -1209,6 +1215,386 @@ never evidence; Kit unit tests and the live run are. Do not edit `Fixtures.rows`
 
 ---
 
+## PR 5 — CA trust (spec §D17, SP-AC29 … SP-AC38)
+
+**Branch:** `feat/ca-trust-first-run`, cut from `main` after PR 1 merges (the core tasks
+touch `crates/aitm-ca` only and share no file with PR 1–4). **WAIT** per group: the
+mac tasks after mac-attribution's PR lands `CATrustFacts.init?(status:)`,
+`CAStatus.trustedScope`/`trustReported`, the `.caTrusted` step and the Core-lane CA row
+in `ConnectionSummary.swift`, and after PR 4 Task 28 lands `Shell/SystemProxySheet.swift`;
+the TUI task after PR 2 (it appends to the same `toolbar` line); the web task after PR 3
+(same pill). **Task 41 (live proof) runs only after Matt explicitly says the CA may be
+trusted on his Mac** (spec D17.14, open question 6); until then nobody runs `ca.install`
+on his machine by any path.
+
+Order: {Task 32 (owner probe), Task 33, Task 35, Task 36, Task 42} in parallel →
+Task 34 (needs 32 for the literals and 33 for `commands.rs`) → Task 37 (Kit, after
+mac-attribution) → Task 38 → Task 39 (after PR 4 Task 28) → Task 40 → Task 41 (gated).
+
+### Task 32: read-only probe — which macOS trust read-back works outside the sandbox
+
+- **Satisfies:** the "probe" step of D17.3; fixes the literals SP-AC31 asserts.
+- **Depends on:** none. Owner-run in the Terminal panel on Matt's Mac. **Read-only:
+  nothing is installed, no keychain or trust setting is modified.**
+- **Files:** none in the tree; the quoted output and the decision go into this task's
+  "Result" line below (the orchestrator edits it) and into Task 34's dispatch.
+- **Terminal panel script shape:**
+  ```
+  set -u; T=/tmp/claude/ca-probe; mkdir -p $T
+  cargo build --release -p aitm
+  CA=$(./target/release/aitm ca status | python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])')   # the real ca.crt path; prints no token
+  security find-certificate -c "Apple Root CA" -p /System/Library/Keychains/SystemRootCertificates.keychain > $T/apple-root.pem
+  security verify-cert -c $T/apple-root.pem -l -L -p ssl; echo "apple-root exit=$?"        # expected: 0 + "...certificate verification successful."
+  security verify-cert -c "$CA" -l -L -p ssl; echo "aitm-ca exit=$?"                        # expected: non-zero (not trusted today)
+  security verify-cert -c "$CA" -l -L -p basic; echo "aitm-ca basic exit=$?"
+  security trust-settings-export $T/user.plist; echo "export exit=$?"; grep -c '<key>' $T/user.plist; grep -m3 -A1 'trustList' $T/user.plist
+  security dump-trust-settings; echo "dump exit=$?"
+  ```
+- **Decision table:** apple-root exit 0 with the success line **and** aitm-ca non-zero →
+  **`verify-cert`** is the read-back (SP-AC31's first reading; quote both stdout/stderr
+  lines as the literals). Otherwise, if `trust-settings-export` exits 0 and the plist
+  has a `trustList` dict → **`trust-settings-export`** (SP-AC31's second reading; quote
+  one key to settle whether keys are SHA-1 hex). Neither → stop; the Architect
+  re-opens D17.3. Note whether any command showed a dialog (none is expected: all are
+  reads).
+- **Result:** _(orchestrator fills: tool chosen, the quoted lines, date)_
+- **Done when:** the Result line is filled and Task 34's dispatch names the tool.
+
+### Task 33: core — `Frontend::Operator` passes the `ca.install`/`ca.uninstall` agent gate
+
+- **Satisfies:** SP-AC29, SP-AC30; D17.1, D17.2.
+- **Depends on:** none.
+- **Files:** `crates/aitm-ca/src/commands.rs` (modify the gate in `Change::invoke` and
+  its doc comment, the `scope` param description, `Op::refusal` unchanged),
+  `crates/aitm-ca/tests/commands.rs` (add tests).
+- **Change:** the condition
+  `frontend != Frontend::Cli && !args.dry_run && !shared.cfg.allow_agent_install`
+  becomes `frontend == Frontend::Mcp && !args.dry_run && !shared.cfg.allow_agent_install`;
+  the module doc's "Policy gate" sentence and the `schema` description say "Refused
+  from an agent frontend (MCP) unless ca.allow_agent_install is set; the CLI and an
+  operator-token connection (a present human) are not gated" — the `refusal()` text
+  stays byte-identical (a test pins it). The `scope` param description becomes
+  "user | system. Default: user on macOS and Windows (the login keychain / CurrentUser
+  store; the OS shows its own authentication dialog), system on Linux (needs root)."
+  No other behaviour changes.
+- **Test** (`tests/commands.rs`, using the file's `h.call(name, frontend, args)` harness
+  on a scripted macOS executor with `find-certificate` answering absent and
+  `add-trusted-cert` exit 0):
+  - `operator_install_passes_the_agent_gate` (SP-AC29): `h.call("ca.install", Frontend::Operator, &[])`
+    is `Ok`, `changed == true`, `scope == "user"`, the executor's `runs()` contain
+    `security add-trusted-cert -r trustRoot -p ssl -p basic -k <home>/Library/Keychains/login.keychain-db /ca/ca.crt`,
+    and the audit record has `frontend == "operator"`, `outcome == "ok"`.
+  - `mcp_install_is_still_refused_without_the_flag`: `Frontend::Mcp` → `Err` whose text
+    starts with `ca.install refused` and `runs()` is empty (extend the existing test if
+    one already asserts this); `Frontend::Mcp` with `dry_run: true` → `Ok`.
+  - `scope_resolution_per_platform` (SP-AC30): macOS, no scope → result `scope == "user"`;
+    macOS `scope: "user"` → `"user"`; Debian platform with `scope: "user"` → `Err` text
+    `Linux has no per-user OS trust store; use --scope system`; Debian, no scope →
+    `scope == "system"`; no rendered macOS user-scope line starts with `sudo`.
+- **Done when:** the three tests are green and quoted, red first; gate green.
+
+### Task 34: core — macOS trust read-back and the `Cancelled` kind
+
+- **Satisfies:** SP-AC31, SP-AC32; D17.3, D17.4.
+- **Depends on:** Task 32 (the tool and its literals), Task 33 (same `commands.rs`).
+- **Files:** `crates/aitm-ca/src/platform/macos.rs` (modify), `crates/aitm-ca/src/store.rs`
+  (add `TrustErrorKind::Cancelled`), `crates/aitm-ca/src/commands.rs` (`kind_name`
+  yields `"cancelled"` for it: map via `format!("{:?}", kind).to_lowercase()` for this
+  variant or a match arm; do not change the other names), `crates/aitm-ca/tests/macos.rs`
+  (modify `status_present_absent_sha1_only` and
+  `status_present_detail_names_unconfirmed_trust`, add tests).
+- **Change** (`macos.rs`), with `verify-cert` chosen by Task 32:
+  ```rust
+  const VERIFY_SUCCESS: &str = "certificate verification successful";   // substring of stdout on exit 0 (Task 32's literal)
+  const CANCEL_MARKER: &str = "cancel";                                   // case-insensitive, stderr
+  const CANCELLED_MESSAGE: &str = "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted";
+  const DETAIL: &str = "macOS: presence from `security find-certificate`; trust from `security verify-cert` (ssl policy, local only)";
+  impl Op<'_> {
+      /// `security verify-cert -c <cert> -l -L -p ssl`, never sudo. `Yes` on exit 0 with
+      /// VERIFY_SUCCESS in stdout; `No` on a non-zero exit (stderr tail returned for detail);
+      /// `Err` only when the tool could not run (→ the caller reports `Trust::Unknown`).
+      fn verify_trust(&mut self) -> Result<(Trust, Option<String>), TrustError>;
+  }
+  ```
+  `status`: presence as today; when `Present`, `trusted` and an optional detail line
+  come from `verify_trust` (`Err` → `Trust::Unknown` + the error text in `detail`);
+  when `Absent`/`Unknown`, `trusted = Trust::No` with no verify run (`Unknown`
+  presence keeps `Trust::Unknown`). `PRESENT_TRUST_UNCONFIRMED` is deleted.
+  `install`: after a failed `add-trusted-cert`, classify before the rollback:
+  headless markers → `HeadlessAuth` (as today); else stderr contains `CANCEL_MARKER`
+  (case-insensitive) → `Cancelled` with `CANCELLED_MESSAGE` as the message head (the
+  rollback suffix "; removed the untrusted copy it left behind" / "; an untrusted copy
+  may remain in the keychain" is appended exactly as today); else `ToolFailed`.
+  If Task 32 chose `trust-settings-export`, `verify_trust` instead runs
+  `security trust-settings-export <tmp>` with the executor's real fs (a temp file under
+  `std::env::temp_dir()`, removed after), parses the plist text for a `trustList` entry
+  keyed by `cert.sha1_hex_upper()` (fallback: an `issuerName` `<data>` equal to the
+  base64 of the subject DER), and treats an entry with empty `trustSettings` or no
+  `kSecTrustSettingsResult` of `3` as `Yes`; the DETAIL line names
+  `security trust-settings-export`.
+- **Test** (`tests/macos.rs`, scripted executor; the literals below are replaced by
+  Task 32's quoted ones):
+  - `status_reads_trust_with_verify_cert` (SP-AC31): present + `security verify-cert -c /ca/ca.crt -l -L -p ssl`
+    exit 0 stdout `/ca/ca.crt: certificate verification successful.` → `trusted == Trust::Yes`,
+    `runs()` ends with that line; present + exit 1 stderr `/ca/ca.crt: certificate verification failed.`
+    → `Trust::No` and `detail` contains the stderr; absent → `Trust::No` and no `verify-cert`
+    run; present + verify unspawnable → `Trust::Unknown` and `detail` contains the failure
+    text; every `detail` contains `` trust from `security verify-cert` ``.
+  - `install_cancelled_is_calm_and_rolls_back` (SP-AC32): `add-trusted-cert` exit 1
+    stderr `SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.`,
+    requery present, `delete-certificate` exit 0 → `Err` with `kind_of(&e) == TrustErrorKind::Cancelled`
+    and `e.to_string() == "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted; removed the untrusted copy it left behind"`;
+    the runs contain `security delete-certificate -Z <sha256> <K_USER>`; the headless
+    stderr still yields `HeadlessAuth` (`install_headless_rolls_back` unchanged).
+  - `ca_status_json_reports_user_trust_yes` (`tests/commands.rs` or `tests/macos.rs`):
+    through the plugin, `stores.user.trusted == "yes"` with the scripted success, and
+    `kind_name` → `"cancelled"` surfaces in the `warn!` test if one exists (else skip).
+  - Update the two existing status tests: their `assert_eq!(st.trusted, Trust::Unknown)`
+    lines become `Trust::No` (absent) / the scripted answer (present); the `detail`
+    assertion in `status_present_detail_names_unconfirmed_trust` becomes the new
+    `DETAIL` text and the test is renamed `status_present_detail_names_the_trust_check`.
+- **Done when:** red → green quoted for each new test; the full `aitm-ca` suite green;
+  gate green.
+
+### Task 35: TUI — `· CA trusted` / `· CA untrusted` pill word and `scope: user`
+
+- **Satisfies:** SP-AC35; D17.11.
+- **Depends on:** PR 2 merged (the pill line); independent of PR 5's core tasks (an
+  older core answers `unknown` → no word).
+- **Files:** `crates/aitm-tui/src/model.rs` (add `CaTrustWord`), `crates/aitm-tui/src/app.rs`
+  (connect-time `ca.status` request where `self.tools = tools` lands; `ca_installing: bool`;
+  the scope default in the `CONFIRM_TOOLS` path; the cancelled toast),
+  `crates/aitm-tui/src/ui/bars.rs` (append the word after the sys-proxy word). Never
+  `crates/aitm-tui/src/fixture.rs`.
+- **Change:**
+  ```rust
+  // model.rs
+  #[derive(Debug, Clone, PartialEq, Eq)]
+  pub struct CaTrustWord { pub platform: String, pub trusted: Option<bool> }   // None = every store unknown, or no stores
+  impl CaTrustWord {
+      pub fn from_json(v: &Value) -> Option<Self>;                 // None unless `exists` is a bool (the ca.status shape)
+      pub fn pill(&self, in_flight: bool) -> Option<String>;        // "· CA trusting…" | "· CA trusted" | "· CA untrusted" | None
+      pub fn default_scope(&self) -> Option<&'static str>;          // Some("user") for "macos" | "windows", None otherwise
+  }
+  // app.rs
+  pub ca_installing: bool,
+  pub fn ca_trust_word(&self) -> Option<String>;                   // from `ca_status` + `ca_installing`
+  ```
+  `run_command`/the `y` confirm for `ca.install`/`ca.uninstall`: when the parsed args
+  (the existing `key=value` parser) carry no `scope` and `CaTrustWord::default_scope()`
+  is `Some`, insert `"scope": "user"`; set `ca_installing = true` until the reply; a
+  reply error whose text starts with `ca.install cancelled` is a `Level::Info` toast
+  "CA trust cancelled". On connect, after `self.tools = tools`, push a `ca.status`
+  request when `has_tool("ca.status")`.
+- **Test:** `model.rs`: `ca_trust_word_parses_and_renders` — the `ca.status` JSON of
+  SP-AC36 → `pill(false) == Some("· CA trusted")`; `trusted: "no"` → `Some("· CA untrusted")`;
+  all `"unknown"` → `None`; `pill(true) == Some("· CA trusting…")`; `default_scope()`
+  is `Some("user")` for `macos`, `None` for `linux-debian`. `app.rs` tests beside
+  `ca_panel_shows_status_and_exports` (SP-AC35): with `ca_status` set to the macOS JSON,
+  `run_command("ca.install")` then `y` yields one `BusRequest::Call { name: "ca.install", args }`
+  with `args["scope"] == "user"`; with the Debian JSON, `args` has no `scope`;
+  `run_command("ca.install scope=system")` keeps `"system"`; the connect path with
+  `ca.status` in the tool list yields exactly one `ca.status` request.
+  `tests/sysproxy_pill.rs` (PR 2's) gains `pill_shows_the_ca_word`: `"… · sys-proxy → us · CA untrusted"`.
+- **Done when:** tests green and quoted; gate green in the sandbox and once in the Terminal.
+
+### Task 36: web — `state/caTrust.ts`, pill word, "Trust the aitmproxy CA" setup action
+
+- **Satisfies:** SP-AC36; D17.12.
+- **Depends on:** PR 3 merged (the pill). Independent of the core tasks.
+- **Files:** `apps/web/src/state/caTrust.ts` (create), `apps/web/src/state/caTrust.test.ts`
+  (create), `apps/web/src/bus/types.ts` (add `CAStatusWire`), `apps/web/src/state/app.ts`
+  (`ca: CATrustStatus | null`, `caInstalling: boolean`, `refreshCA()` after the tools
+  bootstrap when `ca.status` exists and after any `ca.install`/`ca.uninstall` call
+  completes), `apps/web/src/palette/groups.ts` (`SetupAction` gains `args?: Record<string, unknown>`),
+  `apps/web/src/palette/CommandPalette.tsx` (pass `item.action.args` as the form's
+  initial args when `item.action.tool` is selected), `apps/web/src/palette/setup.ts`
+  (relabel + args), `apps/web/src/shell/Toolbar.tsx` (append the word). Never
+  `apps/web/src/bus/mock.ts` / `noise.ts`.
+- **Change:**
+  ```ts
+  // caTrust.ts
+  export interface CATrustStatus { trusted: boolean; scope: 'user' | 'system' | null; platform: string; fingerprint: string | null; }
+  export function parseCATrust(v: unknown): CATrustStatus | null;        // null when not the ca.status shape OR every store is 'unknown'
+  export function caPillWord(s: CATrustStatus | null, inFlight: boolean): string | null;   // '· CA trusting…' | '· CA trusted' | '· CA untrusted' | null
+  export function caInstallArgs(s: CATrustStatus | null): Record<string, unknown>;          // { scope: 'user' } for macos|windows, {} otherwise
+  export function isCACancelled(message: string): boolean;                                   // startsWith('ca.install cancelled')
+  ```
+  `setup.ts`: `{ id: 'install-ca', label: 'Trust the aitmproxy CA', hint: 'Install the root CA into your user trust store; HTTPS is not captured until then', icon: 'lock', tool: 'ca.install', args: caInstallArgs(app.ca) }`;
+  the palette `run` for `ca.install`/`ca.uninstall` sets `caInstalling`, then calls
+  `app.refreshCA()`; a rejected call whose message `isCACancelled` is `app.notice(msg, 'info')`.
+  `Toolbar.tsx`: after the sys-proxy word, `caPillWord(app.ca, app.caInstalling)`.
+- **Test** (`caTrust.test.ts`, SP-AC36 verbatim): the eleven assertions listed there;
+  `palette/groups.test.ts` and `setup` tests updated for the new label (`'Install CA'`
+  → `'Trust the aitmproxy CA'` where asserted); `npm test` and `npm run build` green.
+- **Done when:** tests green and quoted; build green.
+
+### Task 37: mac Kit — `ConnectionAction.trustCA` / `.openCAPanel`, actions on the CA row and step, `caQuicCaveat`
+
+- **Satisfies:** SP-AC33 (PR 5's half); D17.6 actions, D17.7, D17.9.
+- **Depends on:** mac-attribution's PR merged (`CATrustFacts`, `CAStatus.trustedScope`,
+  the `.caTrusted` step, the CA row on the Core lane).
+- **Files:** `apps/mac/Sources/AitmproxyKit/ConnectionSummary.swift` (modify),
+  `apps/mac/Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (add one test).
+- **Change:**
+  ```swift
+  public enum ConnectionAction { …, case trustCA, openCAPanel }
+  // titles: .trustCA → "Trust the aitmproxy CA"; .openCAPanel → "Certificate Authority…"
+  public static let caQuicCaveat = "HTTPS apps that use QUIC are not captured until the CA is trusted; browsers fall back to TCP once it is."
+  ```
+  In mac-attribution's CA row: trusted → `actions: [.openCAPanel]`; not trusted →
+  `[.trustCA, .openCAPanel]`; installing → `[]`; needs an administrator → `[.openCAPanel]`.
+  In `steps`: the `.caTrusted` step's `action` is `.trustCA` when not trusted, `.openCAPanel`
+  when the facts are `nil` (title "CA trust unknown — open the Certificate Authority
+  panel") or need an administrator, `nil` when done. No other text changes (their words
+  stand).
+- **Test:** `caTrustActionsAndStepButton` exactly as SP-AC33 lists it (nine `#expect`s);
+  `actionTitlesAreTitleCaseWithEllipsesWhereAViewOpens` still passes with the two new
+  cases (`.openCAPanel` ends with an ellipsis, `.trustCA` does not).
+- **Done when:** owner's `swift test` green with the new test; `tools/check-connection-words.sh`
+  exits 0.
+
+### Task 38: mac app — `Session+CATrust.swift`, the one call path; CAPanel routes through it
+
+- **Satisfies:** D17.1, D17.4, D17.5, D17.10; the allow-list half of SP-AC34.
+- **Depends on:** Task 37.
+- **Files:** `apps/mac/Sources/Aitmproxy/Session+CATrust.swift` (create),
+  `apps/mac/Sources/Aitmproxy/Session.swift` (`var caTrustInstalling = false`; feed it
+  into `CATrustFacts.installing` where the facts are built), `apps/mac/Sources/Aitmproxy/Session+Connection.swift`
+  (`perform(connection:)`: `.trustCA` → `return false`; `.openCAPanel` → `show(.ca)`,
+  `return true`), `apps/mac/Sources/Aitmproxy/Panels/CAPanel.swift` (modify `change(install:status:)`).
+- **Change:**
+  ```swift
+  extension Session {
+      /// The only home of "ca.install": scope user on macOS/Windows, confirm-token re-call,
+      /// `caTrustInstalling` for the duration, a `ca.install cancelled` error is silent,
+      /// and the facts come from the forced `ca.status` re-read, never from the reply.
+      func trustCA() async
+      func untrustCA() async        // "ca.uninstall", same scope rule and re-read
+      var caTrustControlLive: Bool  // bus connected as operator && !caTrustInstalling
+      static func caScopeArgs(platform: String) -> [String: JSONValue]   // ["scope": .string("user")] for "macos"/"windows", [:] otherwise — pure, for the tripwire's `.string("user")` expectation
+  }
+  ```
+  The forced re-read calls the same `ca.status` entry mac-attribution's poll uses (their
+  refresh method on `Session`; if it is private, make it internal in this task and say so).
+  `CAPanel.change(install:status:)` keeps its `NSAlert`, then calls `session.trustCA()` /
+  `session.untrustCA()` and reloads from `session`'s facts; the hard-coded "Install
+  finished but the CA is not trusted in the login keychain yet…" line is replaced by the
+  facts' `remedy` shown only when the re-read says not trusted; the status block gains
+  `ConnectionSummary.caQuicCaveat` as a footnote. Errors other than cancelled keep the
+  panel's `actionError` path.
+- **Test:** app target — sandbox `swiftc -parse`; proven by Task 40's tripwire and
+  Task 41's live run.
+- **Done when:** `swiftc -parse` clean; owner's build clean; Task 40 passes.
+
+### Task 39: mac app — the sheet's CA row, Status routing, menu, Settings footnote
+
+- **Satisfies:** D17.7, D17.8, D17.9 (the view half), D17.10 menu; the allow-list half
+  of SP-AC34.
+- **Depends on:** Task 38; PR 4 Task 28 merged (`Shell/SystemProxySheet.swift` exists).
+- **Files:** `apps/mac/Sources/Aitmproxy/Shell/SystemProxySheet.swift` (modify),
+  `apps/mac/Sources/Aitmproxy/Shell/ShellToolbar.swift` (widen the show-condition),
+  `apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift` (`run(_:)`: `.trustCA` →
+  `Task { await session.trustCA() }`; `.openCAPanel` is handled by `perform`),
+  `apps/mac/Sources/Aitmproxy/App.swift` (Proxy menu: `Button("Trust the aitmproxy CA") { Task { await session.trustCA() } }.disabled(!session.caTrustControlLive || trusted)`
+  directly above the "Set as / Restore System Proxy" item), `apps/mac/Sources/AitmproxyKit/CommandMap.swift`
+  (entry `E("Proxy", "Trust the aitmproxy CA", <free shortcut>)`), `apps/mac/Sources/Aitmproxy/SettingsView.swift`
+  (Proxy tab: `ConnectionSummary.caQuicCaveat` as a footnote line under the lane sentence).
+- **Change (sheet):** title "Set up aitmproxy on this Mac"; row 1 "Trust the aitmproxy
+  CA": the CA fact's text from `summary.caTrust` (or the step title when the facts are
+  `nil`), `PrimaryButton("Trust the aitmproxy CA") { Task { await session.trustCA() } }`
+  hidden when trusted, disabled while installing (the text then reads "trusting CA…"),
+  `ConnectionSummary.caQuicCaveat` under it; row 2 = Task 28's checklist, caption and
+  "Set as System Proxy" button unchanged. Dismiss button "Not Now", retitled "Done"
+  when the CA is trusted and the system proxy points at us. Show-condition: Task 28's
+  **or** (`summary.caTrust != nil && !trusted`) under the same operator/ready/suppressed
+  guards; the two `Store.defaults` keys are reused. The sheet performs no `NSAlert`
+  before `trustCA()` (D17.8). The views spell no lane words beyond the button titles
+  (`ConnectionAction.trustCA.title`); the facts' text comes from the summary.
+- **Test:** `CommandMapTests` still pass with the new entry; Task 40's tripwire pins the
+  call sites; Task 41 proves the press.
+- **Done when:** owner's build clean; `tools/check-connection-words.sh` exits 0; Task 40 passes.
+
+### Task 40: tripwire — `apps/mac/tools/check-ca-trust-path.sh`
+
+- **Satisfies:** SP-AC34.
+- **Depends on:** Tasks 38, 39.
+- **Files:** `apps/mac/tools/check-ca-trust-path.sh` (create, executable).
+- **Change:** the shape of `check-capture-operator-only.sh` (`scan`, `expect`, `deny`,
+  `--self-check`): rule 1 — the literals `"ca.install"` and `"ca.uninstall"` appear only
+  in `Sources/Aitmproxy/Session+CATrust.swift` (two `expect` lines); rule 2 — `trustCA(`
+  and `untrustCA(` are called only from `Panels/CAPanel.swift`, `Shell/SystemProxySheet.swift`,
+  `Panels/StatusPanel.swift`, `App.swift` (each with an `expect`); rule 3 —
+  `Session+CATrust.swift` contains `.string("user")` (`expect`) and does not contain
+  `"system"` (`deny`); rule 4 — the agent-reachable surfaces of SP-AC24's rule 3
+  (`Bus/BusService.swift`, `AitmproxyKit/CommandMap.swift` title-only, `Shell/CommandPalette.swift`,
+  `Session+Palette.swift`, `Session+Verbs.swift`, `Panels/AgentPanel.swift`,
+  `AitmproxyKit/Fixtures+Agent.swift`, `AitmproxyKit/Fixtures+Tools.swift`) match none
+  of `ca\.install|ca\.uninstall|trustCA|untrustCA`, with a file-level allow for a fixture
+  tool list that still names `ca.install` if the fake-data-removal PR has not deleted it
+  (the Coder checks and records which). `--self-check` copies the tree to `$TMPDIR`,
+  plants `let _ = "ca.install"` in `Session+Verbs.swift`, expects exit 1.
+- **Test:** `tools/check-ca-trust-path.sh` prints `PASS`, exit 0; `--self-check` prints
+  the planted violation and `SELF-CHECK PASS`; `tools/check-connection-words.sh` exits 0.
+  All three outputs quoted.
+- **Done when:** the three runs are quoted in the Coder's report.
+
+### Task 41: live proof, macOS (SP-AC37) and TUI/web (SP-AC38) — gated on Matt's go
+
+- **Satisfies:** SP-AC37, SP-AC38; D17.14, D17.15 (the dialog question).
+- **Depends on:** Tasks 33–40 merged into the branch; a release build; **Matt's
+  explicit go** recorded in this task's "Go" line below. Without it the task does not
+  run and the PR says so.
+- **Go:** _(orchestrator fills: Matt's words, date)_
+- **Files:** none in the tree. Output goes into the PR body.
+- **Terminal panel script shape** (owner, Matt's real shell):
+  ```
+  set -u; T=/tmp/claude/ca-proof; mkdir -p $T
+  L=~/Library/Keychains/login.keychain-db; S=/Library/Keychains/System.keychain
+  q() { echo "== $1"; security find-certificate -a -c aitmproxy -Z "$2" | grep -E 'SHA-256|keychain' ; echo "(exit $?)"; }
+  q login-before $L | tee $T/before-login.txt; q system-before $S | tee $T/before-system.txt     # both expected empty
+  # dev bundle, fresh store (the sheet shows); Core card "running"
+  cd apps/mac && DEV_TAG=ca CORE_DIR=<repo>/target/release tools/snap-dev.sh none; cd -
+  APP_STORE=/tmp/ca-store /tmp/Aitmproxy-dev-ca.app/Contents/MacOS/Aitmproxy-ca > $T/app.log 2>&1 &
+  # 1. the sheet's row 1 reads "HTTPS is not captured until the CA is trusted". Press "Trust the aitmproxy CA"; in the macOS dialog press CANCEL once.
+  #    Expect: the row word unchanged, no error toast; the core log (Core Log… panel, or $T/app.log) has a warn line with kind=cancelled — copy its stderr text into $T/cancel.txt
+  # 2. Press again; authenticate. Expect: the row and the Status checklist read "CA trusted (user keychain)".
+  q login-after $L | tee $T/after-login.txt; q system-after $S | tee $T/after-system.txt       # login: one SHA-256 block; system: still empty
+  ./target/release/aitm --config <dev bundle's config> ca status | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["fingerprint_sha256"].replace(":",""));print(d["stores"]["user"])'   # equals the SHA-256 line; trusted == "yes"
+  # 3. Safari → an in-scope HTTPS host Safari has not loaded this session (system proxy at the core per SP-AC20, or All Apps on). Expect ≥ 1 https:// row for that host; note the host and the row's status in the PR body.
+  # 4. Certificate Authority panel → "Uninstall…" → Remove. Expect: the word returns to "HTTPS is not captured until the CA is trusted".
+  q login-uninstalled $L | tee $T/uninstalled-login.txt; q system-uninstalled $S | tee $T/uninstalled-system.txt   # both empty
+  # 5. SP-AC38: once in `aitm tui` (:ca, i, y; then u) and once in `aitm web` (palette "Trust the aitmproxy CA"), repeating q before/after each; the pill word flips to "· CA trusted" and back; the core's debug log line for ca.install shows scope=user.
+  grep -c "$(python3 -c 'import yaml,sys;print(yaml.safe_load(open(sys.argv[1]))["mcp"]["transport"]["loopback_tcp"]["token"])' <config>)" $T/*.txt   # must print 0 for every file
+  ```
+  If step 2 ends in `HeadlessAuth` instead of a dialog (D17.15), stop, quote the core's
+  warn line, and report; the follow-up spec is then opened and the row word is verified
+  to read "CA trust needs an administrator".
+- **Done when:** the PR body holds the six `q` dumps, the `ca status` lines, the cancel
+  stderr text, the Safari row statement, the TUI and web before/after pairs, and the
+  `0` token count; the System keychain dumps are all empty.
+
+### Task 42: operator docs — the CA step, the operator gate, the Linux limitation
+
+- **Satisfies:** D17.7, D17.13 (documentation), the `ca.allow_agent_install` wording after
+  D17.2.
+- **Depends on:** none (prose; names the shipped behaviour).
+- **Files:** `docs/design/operator-ui-foundation.md` (the one non-research doc that
+  documents `allow_agent_install` today) and the operator config reference Task 13 used.
+- **Change:** `ca.allow_agent_install` is described as gating **agents (MCP)** only — "the
+  CLI and operator-token frontends (mac app, TUI, web) install after their own
+  confirmation and the OS dialog"; a "First run on macOS" paragraph: Trust the
+  aitmproxy CA (login keychain, macOS asks for your password) then Set as System
+  Proxy, the D17.7 QUIC sentence verbatim, "trust state is read back from the keychain
+  with `security verify-cert`" (or the Task 32 tool); a "Linux" paragraph: the trust
+  store needs root, so the app/TUI/web show "CA trust needs an administrator" and
+  `aitm ca install` from a terminal is the way, with the polkit and NSS follow-ups named
+  as not yet done.
+- **Test:** none (prose); the Coder quotes `git diff --stat`.
+- **Done when:** the text matches the shipped strings exactly.
+
+---
+
 ## Independent task sets (fan-out)
 
 - **PR 1:** {Task 1} → **{Tasks 2, 3, 4, 5, 12} in parallel** (disjoint files) →
@@ -1220,8 +1606,14 @@ never evidence; Kit unit tests and the live run are. Do not edit `Fixtures.rows`
 - **PR 4:** **{Tasks 24, 25} in parallel** → {Task 26} → **{Tasks 27, 28, 30} in parallel**
   (27: SettingsView + EmbeddedCore; 28: StatusPanel + SystemProxySheet + ShellToolbar +
   App + CommandMap; 30: tests only) → {Task 29} → {Task 31}.
+- **PR 5:** **{Tasks 32, 33, 35, 36, 42} in parallel** (32 owner-run read-only probe;
+  33 `aitm-ca` commands; 35 TUI; 36 web; 42 docs — disjoint files) → {Task 34} (after
+  32 and 33) → {Task 37} (Kit, after mac-attribution's PR) → {Task 38} → {Task 39}
+  (after PR 4 Task 28) → {Task 40} → {Task 41} (gated on Matt's go). Tasks 33–34 are
+  independent of 35–36 and of 37–40 (no shared file).
 
-Task counts: PR 1 = 15 (Tasks 1–15), PR 2 = 4 (16–19), PR 3 = 4 (20–23), PR 4 = 8 (24–31).
+Task counts: PR 1 = 15 (Tasks 1–15), PR 2 = 4 (16–19), PR 3 = 4 (20–23), PR 4 = 8 (24–31),
+PR 5 = 11 (32–42).
 
 ## Review log
 
@@ -1237,4 +1629,7 @@ What merged, what was cut, follow-ups. Filled at stage 7.
 Follow-ups already known from the spec: a Plasma VM proof for the KDE mechanism
 (unit-tested only in this milestone); the privileged helper (`SMAppService`) for standard
 users and the "Require an administrator password" Mac; Windows (`platform/windows.rs` is
-a seam); PAC/WPAD/SOCKS left alone by design.
+a seam); PAC/WPAD/SOCKS left alone by design. From the D17 addendum: an in-process
+`SecTrustSettingsSetTrustSettings` path in the mac app if the embedded core's `security`
+child cannot surface the macOS dialog (D17.15); a polkit/`pkexec` prompt and the
+Firefox/Chromium NSS user databases on Linux (D17.13, research first).
