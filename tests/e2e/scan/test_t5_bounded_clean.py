@@ -19,7 +19,7 @@ Observers -- two, both outside the scanner:
 No fixture: a real `aitm` core, a real `aitm-testtarget-serve`, real packets, real kernel.
 
 SKIP (77) conditions, each naming the missing thing:
-  * the serve binary or the `aitm` binary is absent (FileNotFoundError from the harness);
+  * the serve binary is absent (`boot_target` SKIPs 77 naming the build command);
   * the core does not advertise the `scan.*` verbs this cell calls (pre-T1b core);
   * `scan.checks` lists no check for the `l4_packet` lane (the T5 lane is not on this build);
   * the L4 module is not enabled on the core (no `l4.capture.status`);
@@ -32,14 +32,9 @@ SKIP (77) conditions, each naming the missing thing:
 serial: it runs a privileged loopback capture and a packet fuzz run. Exit 0 / 1 / 77.
 Never prints a token.
 
-NOTE for the plan owner (reported, not redesigned): plan task B10 describes this cell as
-"service `l4-udp-payload-crash` addr (udp; ...)" and in the same sentence pins the profile
-to "`target: {l4: [{ip, port, proto: "tcp"}]}`". Those two cannot both hold: a TCP packet
-to that UDP service's port reaches a CLOSED TCP port, whose RST is an `l4-protocol-reaction`
-issue (that is exactly what test_t5_crash_oracle.py asserts), contradicting this cell's own
-pinned `issues.total == 0`. This cell therefore sends `proto` as the service's own declared
-transport from `/services` (asserted to be literally `udp`), which is the only reading under
-which the pinned assertions can hold.
+`proto` is the service's own declared transport from `/services` (asserted to be literally
+`udp`): a TCP packet to a UDP service's port reaches a CLOSED TCP port, and the RST would be
+an `l4-protocol-reaction` issue -- which is test_t5_crash_oracle's subject, not this cell's.
 """
 from __future__ import annotations
 
@@ -52,7 +47,15 @@ from aitm_e2e import fail, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient, BusError, ToolError  # noqa: E402
 from aitm_e2e.config import CoreConfig, l4_capture_entry, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import ScanTarget, start_job, require_lane, require_verbs, wait_terminal  # noqa: E402
+from aitm_e2e.scan import (  # noqa: E402
+    Expectations,
+    boot_target,
+    packet_lane_gate,
+    read_capture_packets,
+    split_addr,
+    start_job,
+    wait_terminal,
+)
 
 SERVICE = "l4-udp-payload-crash"
 CASES = 100
@@ -60,52 +63,16 @@ LIVENESS_EVERY = 25
 # 100 cases + 1 baseline + 4 scheduled liveness probes (cases 25, 50, 75, 100).
 EXPECTED_FRAMES = CASES + 1 + CASES // LIVENESS_EVERY
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
+JOB_TIMEOUT = 600.0
 
-_failures: list[str] = []
-
-
-def expect(cond, msg: str, detail="") -> bool:
-    if cond:
-        ok(msg)
-        return True
-    line = f"  [FAIL] {msg}"
-    if detail != "":
-        line += f"   -- {str(detail)[:300]}"
-    print(line, flush=True)
-    _failures.append(msg)
-    return False
-
-
-def note(label: str, value) -> None:
-    print(f"note: {label} = {str(value)[:400]}", flush=True)
+# One soft-assert collector for the whole cell: a failing expectation records itself
+# and the run continues, so one bad row never hides the rest of the evidence.
+EXPECT = Expectations()
+expect, note = EXPECT.expect, EXPECT.note
 
 
 def loopback_interface() -> str:
     return "lo0" if sys.platform == "darwin" else "lo"
-
-
-def split_addr(addr: str) -> tuple[str, int]:
-    """`127.0.0.1:54321` -> ("127.0.0.1", 54321)."""
-    host, _, port = str(addr).rpartition(":")
-    return host, int(port)
-
-
-def gate(op) -> dict:
-    """SKIP 77 unless this core can run the packet lane: the scan verbs, a live
-    `l4_packet` lane in `scan.checks`, the L4 module, and raw capture privilege.
-    Returns the `l4.capture.status` reply."""
-    require_verbs(op, *VERBS)
-    require_lane(op, "l4_packet")
-    if "l4.capture.status" not in set(op.tool_names()):
-        skip("the L4 module is not enabled on this core (no l4.capture.status): the packet lane "
-             "needs l4.enabled and the feature-compiled l4 module")
-    status, reply = op.try_call("l4.capture.status")
-    if status != "ok" or not isinstance(reply, dict):
-        skip(f"l4.capture.status did not answer with an availability object: {str(reply)[:200]}")
-    if reply.get("available") is not True:
-        skip(f"the L4 packet lane needs raw pcap privilege, and this core has none: {reply.get('reason')} "
-             "(macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW)")
-    return reply
 
 
 def skip_if_lane_skipped(started: dict) -> None:
@@ -117,30 +84,13 @@ def skip_if_lane_skipped(started: dict) -> None:
             skip(f"the core skipped the l4_packet lane for this job: {entry.get('reason')}")
 
 
-def read_packets(op, flow_id: str, page: int = 500) -> list[dict]:
-    """Every packet of a capture flow, walking `l4.flow.get {offset, limit}` while the
-    reply says `truncated`."""
-    out: list[dict] = []
-    offset = 0
-    while True:
-        doc = op.call("l4.flow.get", {"id": flow_id, "offset": offset, "limit": page})
-        if not isinstance(doc, dict):
-            raise ToolError(f"l4.flow.get: expected an object, got {type(doc).__name__}")
-        got = doc.get("packets") or []
-        out.extend(got)
-        nxt = doc.get("next_offset")
-        if not doc.get("truncated") or not isinstance(nxt, int) or nxt <= offset or not got:
-            return out
-        offset = nxt
-
-
 def main() -> int:
     iface = loopback_interface()
     target = core = op = None
     cap_id = None
     try:
         section("arrange: the PATCHED target with its L4 speakers, and an L4-enabled core")
-        target = ScanTarget("patched", l4=True)
+        target = boot_target("patched", l4=True)
         svc = target.service(SERVICE)
         ip, port = split_addr(svc["addr"])
         note(f"/services[{SERVICE}]", svc)
@@ -156,7 +106,7 @@ def main() -> int:
         )
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
-        status = gate(op)
+        status = packet_lane_gate(op, *VERBS)
         note("l4.capture.status", {k: v for k, v in status.items() if k != "reason"})
 
         section("observer 1: start the operator's own loopback capture before a single case is sent")
@@ -185,7 +135,7 @@ def main() -> int:
         expect("l4_packet" in ((started.get("lanes") or {}).get("run") or []),
                "the l4_packet lane is in lanes.run", started.get("lanes"))
 
-        final = wait_terminal(op, "operator", job, timeout=600)
+        final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
         note("scan.status (terminal)", {k: final.get(k) for k in ("state", "phase", "stopped_reason", "l4", "issues")})
 
         section("assert: the job finished done, clean, and inside its budget")
@@ -203,13 +153,11 @@ def main() -> int:
         running = (op.call("l4.capture.status") or {}).get("captures") or []
         expect(cap_id not in running, "the capture is no longer running after l4.capture.stop", running)
         cap_id_done, cap_id = cap_id, None
-        packets = read_packets(op, cap_id_done)
+        packets = read_capture_packets(op, cap_id_done)
         to_port = [p for p in packets if p.get("dst_port") == port]
         injected = [p for p in packets if p.get("injected") is True]
         note("capture", f"{len(packets)} packets total, {len(to_port)} to port {port}, "
                         f"{len(injected)} flagged injected")
-        expect(len(to_port) >= CASES,
-               f"the capture holds at least the {CASES} cases addressed to port {port}", len(to_port))
         expect(len(to_port) == EXPECTED_FRAMES,
                f"the capture holds exactly {EXPECTED_FRAMES} frames to port {port} "
                f"({CASES} cases + 1 baseline + {CASES // LIVENESS_EVERY} scheduled liveness probes)",
@@ -242,8 +190,7 @@ def main() -> int:
         if target is not None:
             target.stop()
 
-    if _failures:
-        fail(f"{len(_failures)} expectation(s) failed: " + "; ".join(_failures[:8]))
+    EXPECT.finish()
     ok("PASS: the packet lane stayed inside its case budget, on its pinned destination, and left P healthy")
     return 0
 
@@ -253,7 +200,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except FileNotFoundError as e:
-        skip(f"a real binary this cell needs is missing: {e}")
     except Exception as e:  # noqa: BLE001
         fail(f"{type(e).__name__}: {e}")

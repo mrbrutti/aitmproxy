@@ -46,7 +46,9 @@ from aitm_e2e.config import CoreConfig, ScannerSection, l4_inject_entry  # noqa:
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     ScanTarget,
+    boot_target,
     cancel,
+    l4_endpoint,
     require_lane,
     require_verbs,
     scan_call,
@@ -67,31 +69,20 @@ def boot(**kw) -> Aitm:
     return Aitm.server(CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(), **kw))
 
 
-def endpoint(target: ScanTarget) -> dict:
-    row = target.service(SERVICE)
-    host, _, port = str(row["addr"]).rpartition(":")
-    return {"ip": host, "port": int(port), "proto": row["proto"], "grammar": GRAMMAR}
-
-
 def stream_args(target: ScanTarget, lanes: list[str] | None = None) -> dict:
     """`scan.start` arguments for the stream job every sub-case tries."""
-    overrides: dict = {"target": {"l4": [endpoint(target)]}}
+    overrides: dict = {"target": {"l4": [l4_endpoint(target, SERVICE, GRAMMAR)]}}
     if lanes is not None:
         overrides["lanes"] = lanes
     return {"profile_name": "l4-stream-safe", "overrides": overrides}
 
 
 def refusal_code(client: BusClient, role: str, args: dict) -> tuple[str, object]:
-    """`scan.start` through `scan_try`, answering the operator confirm prompt if
-    one comes back first, and returning (code, payload). `code` is the parsed
-    `scan: <code>:` token, `"ok"` when the call succeeded, or `"?"` when the
-    error text is not in the `scan:` form."""
-    status, payload = scan_try(client, role, "scan.start", args)
-    if status == "ok" and isinstance(payload, dict) and payload.get("status") == "needs_confirmation":
-        token = payload.get("confirm_token")
-        if not token:
-            return ("?", "needs_confirmation without a confirm_token")
-        status, payload = scan_try(client, role, "scan.start", dict(args, _confirm=token))
+    """`scan.start` through `scan_try(confirm=True)` -- the confirm prompt is answered
+    first, so a refusal has to survive the confirmation -- as (code, payload). `code`
+    is the parsed `scan: <code>:` token, `"ok"` when the call succeeded, or `"?"` when
+    the error text is not in the `scan:` form."""
+    status, payload = scan_try(client, role, "scan.start", args, confirm=True)
     if status == "ok":
         return ("ok", payload)
     return (scan_error_code(str(payload)) or "?", payload)
@@ -107,8 +98,8 @@ def main() -> int:
     vuln = core = op = ag = None
     try:
         section("1. the seeded TLV speaker (the observer for every sub-case)")
-        vuln = ScanTarget("vulnerable", l4=True)
-        ep = endpoint(vuln)
+        vuln = boot_target("vulnerable", l4=True)
+        ep = l4_endpoint(vuln, SERVICE, GRAMMAR)
         ok(f"{SERVICE} on {ep['ip']}:{ep['port']} ({ep['proto']}), grammar {GRAMMAR}")
         vuln.logs.reset()
 
@@ -172,7 +163,7 @@ def main() -> int:
                 scanner=ScannerSection(allow_agent_active=True, allow_agent_l4_fuzz=fuzz),
             )
             op = BusClient.operator(core)
-            op.confirm("agent.set", {"policy": "all"})
+            op.call("agent.set", {"policy": "all"})
             ag = BusClient.agent(core)
             code, payload = refusal_code(ag, "agent", stream_args(vuln))
             check(code == "refused_l4",
@@ -206,7 +197,7 @@ def main() -> int:
         started = start_job(
             op, "operator",
             profile_name="l4-stream-safe",
-            overrides={"target": {"l4": [endpoint(vuln)]}},
+            overrides={"target": {"l4": [l4_endpoint(vuln, SERVICE, GRAMMAR)]}},
             confirm=True,
         )
         job = started.get("job")

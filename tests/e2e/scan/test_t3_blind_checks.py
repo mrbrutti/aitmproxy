@@ -42,8 +42,17 @@ from aitm_e2e import check, free_port, ok, repo_root, section, skip  # noqa: E40
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, issues, require_lane, require_verbs,  # noqa: E402
-                           scan_call, start_job, wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    boot_target,
+    brief,
+    issues,
+    require_checks,
+    require_lane,
+    require_verbs,
+    scan_call,
+    start_job,
+    wait_terminal,
+)
 
 NEEDED_CHECKS = ("sqli-boolean", "sqli-time", "cmdi-time")
 ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
@@ -55,22 +64,6 @@ TIMED_PATHS = ("/items", "/orders", "/ping")
 MAX_DELAY_PROBES_PER_POINT = 8
 MIN_TIMING_R = 0.85
 JOB_TIMEOUT = 600.0
-
-
-def require_checks(op, ids) -> None:
-    """SKIP 77 naming every check id the live `scan.checks` catalogue lacks."""
-    live = {c.get("id") for c in (scan_call(op, "operator", "scan.checks", {}) or {}).get("checks", [])
-            if isinstance(c, dict)}
-    missing = [i for i in ids if i not in live]
-    if missing:
-        skip("missing check id " + ", ".join(missing) + " in scan.checks (T3 is not on this build)")
-
-
-def brief(iss, limit: int = 12) -> str:
-    rows = sorted({(i.get("class"), i.get("check_id"), (i.get("location") or {}).get("path"))
-                   for i in iss if isinstance(i, dict)})
-    shown = ", ".join(f"{c}/{cid}@{p}" for c, cid, p in rows[:limit])
-    return f"{len(rows)} kind(s): {shown}{' ...' if len(rows) > limit else ''}"
 
 
 def by_check(iss, check_id: str, path: str) -> list:
@@ -118,7 +111,7 @@ def main() -> None:
     if not scripts:
         skip(f"no bundled active scripts at {ACTIVE_DIR} (the no-sleep rule has nothing to check)")
 
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
+    with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
             ssl_insecure=True,
@@ -129,7 +122,7 @@ def main() -> None:
             op = BusClient.operator(core)
             require_verbs(op, "scan.start", "scan.status", "scan.issues", "scan.issue", "scan.checks")
             require_lane(op, "http")
-            require_checks(op, NEEDED_CHECKS)
+            require_checks(op, *NEEDED_CHECKS)
 
             section("the blind checks find the seeded vulns on V")
             iss_v, seq_v = run_blind(op, v)

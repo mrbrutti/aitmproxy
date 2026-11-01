@@ -18,6 +18,8 @@ loaded), and the core's own stderr on disk.
 SKIPs 77 when the live core lacks `scan.checks`.
 """
 import os
+import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -29,7 +31,11 @@ from aitm_e2e import check, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import ScanTarget, require_verbs, scan_call  # noqa: E402
+from aitm_e2e.scan import (  # noqa: E402
+    boot_target,
+    require_verbs,
+    scan_call,
+)
 
 # The CheckMeta keys every catalogue entry must carry (plan task B5).
 REQUIRED_META_KEYS = (
@@ -88,106 +94,114 @@ def checks_of(client) -> list[dict]:
 
 
 def main() -> None:
-    with ScanTarget("vulnerable") as v:
-        # --- core A: stock catalogue -------------------------------------
-        cfg_a = CoreConfig(
-            proxy_port=free_port(),
-            scope_entries=[v.authority],
-            findings_dir=tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-cat-a-"),
-        )
-        with Aitm.server(cfg_a) as core_a:
-            op = BusClient.operator(core_a)
-            require_verbs(op, "scan.checks")
+    work = tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-cat-")
+    try:
+        with boot_target("vulnerable") as v:
+            # --- core A: stock catalogue -------------------------------------
+            cfg_a = CoreConfig(
+                proxy_port=free_port(),
+                scope_entries=[v.authority],
+                findings_dir=os.path.join(work, "core-a-findings"),
+            )
+            with Aitm.server(cfg_a) as core_a:
+                op = BusClient.operator(core_a)
+                require_verbs(op, "scan.checks")
 
-            section("core A: every scan.checks entry carries full CheckMeta")
-            checks = checks_of(op)
-            check(len(checks) > 0, f"scan.checks listed {len(checks)} entr(y/ies)")
-            missing = {}
-            for c in checks:
-                absent = [k for k in REQUIRED_META_KEYS if k not in c]
-                if absent:
-                    missing[c.get("id", "<no id>")] = absent
-            check(not missing,
-                  f"every entry has {list(REQUIRED_META_KEYS)} (offenders: {missing})")
+                section("core A: every scan.checks entry carries full CheckMeta")
+                checks = checks_of(op)
+                check(len(checks) > 0, f"scan.checks listed {len(checks)} entr(y/ies)")
+                missing = {}
+                for c in checks:
+                    absent = [k for k in REQUIRED_META_KEYS if k not in c]
+                    if absent:
+                        missing[c.get("id", "<no id>")] = absent
+                check(not missing,
+                      f"every entry has {list(REQUIRED_META_KEYS)} (offenders: {missing})")
 
-            ids = {c.get("id") for c in checks}
-            check(NATIVE_IDS.issubset(ids),
-                  f"the interim lane's native checks {sorted(NATIVE_IDS)} are in the "
-                  f"catalogue (missing {sorted(NATIVE_IDS - ids)})")
+                ids = {c.get("id") for c in checks}
+                check(NATIVE_IDS.issubset(ids),
+                      f"the interim lane's native checks {sorted(NATIVE_IDS)} are in the "
+                      f"catalogue (missing {sorted(NATIVE_IDS - ids)})")
 
-            section("core A: bundled active scripts appear with origin.kind bundled")
-            listed, loaded = op.try_call("script.list", {})
-            bundled_active = [s for s in (loaded or [])
-                              if listed == "ok" and isinstance(s, dict)
-                              and "bundled" in str(s.get("path", ""))
-                              and "active" in str(s.get("path", ""))]
-            if bundled_active:
-                origins = [c.get("origin", {}).get("kind") for c in checks]
-                check("bundled" in origins,
-                      f"{len(bundled_active)} bundled active script(s) loaded, so at "
-                      f"least one check has origin.kind == bundled "
-                      f"(origins seen: {sorted(set(origins))})")
-            else:
-                ok(f"note: script.list ({listed}) shows no bundled active scripts on "
-                   "this build; the origin.kind == bundled assertion is not applicable")
-            op.close()
+                section("core A: bundled active scripts appear with origin.kind bundled")
+                status, loaded = op.try_call("script.list", {})
+                bundled_active = []
+                if status == "ok":
+                    bundled_active = [row for row in (loaded or [])
+                                      if isinstance(row, dict)
+                                      and "bundled" in str(row.get("path", ""))
+                                      and "active" in str(row.get("path", ""))]
+                if bundled_active:
+                    origins = [c.get("origin", {}).get("kind") for c in checks]
+                    check("bundled" in origins,
+                          f"{len(bundled_active)} bundled active script(s) loaded, so at "
+                          f"least one check has origin.kind == bundled "
+                          f"(origins seen: {sorted(set(origins))})")
+                else:
+                    ok(f"note: script.list ({status}) shows no bundled active scripts on "
+                       "this build; the origin.kind == bundled assertion is not applicable")
+                op.close()
 
-        # --- core B: an operator script registers a check -----------------
-        scripts_b = tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-cat-b-scripts-")
-        write_script(scripts_b, "e2e-custom", "E2E custom", with_kinds=True)
-        cfg_b = CoreConfig(
-            proxy_port=free_port(),
-            scope_entries=[v.authority],
-            findings_dir=tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-cat-b-"),
-            rhai_scripts_dir=scripts_b,
-        )
-        with Aitm.server(cfg_b) as core_b:
-            op2 = BusClient.operator(core_b)
-            section("core B: e2e-custom.rhai is in scan.checks after boot")
-            entries = {c.get("id"): c for c in checks_of(op2)}
-            check("e2e-custom" in entries,
-                  f"e2e-custom is in the catalogue (ids: {sorted(entries)[:12]}...)")
-            custom = entries.get("e2e-custom") or {}
-            if custom:
-                check(custom.get("class") == "e2e",
-                      f"e2e-custom class is e2e, got {custom.get('class')!r}")
-                check(custom.get("lanes") == ["http"],
-                      f"e2e-custom lanes are ['http'], got {custom.get('lanes')!r}")
-                check(custom.get("kinds") == ["query"],
-                      f"e2e-custom kinds are ['query'], got {custom.get('kinds')!r}")
-                check((custom.get("origin") or {}).get("kind") == "custom",
-                      f"e2e-custom origin.kind is custom, got "
-                      f"{(custom.get('origin') or {}).get('kind')!r}")
-            op2.close()
+            # --- core B: an operator script registers a check -----------------
+            scripts_b = os.path.join(work, "core-b-scripts")
+            os.makedirs(scripts_b, exist_ok=True)
+            write_script(scripts_b, "e2e-custom", "E2E custom", with_kinds=True)
+            cfg_b = CoreConfig(
+                proxy_port=free_port(),
+                scope_entries=[v.authority],
+                findings_dir=os.path.join(work, "core-b-findings"),
+                rhai_scripts_dir=scripts_b,
+            )
+            with Aitm.server(cfg_b) as core_b:
+                op2 = BusClient.operator(core_b)
+                section("core B: e2e-custom.rhai is in scan.checks after boot")
+                entries = {c.get("id"): c for c in checks_of(op2)}
+                check("e2e-custom" in entries,
+                      f"e2e-custom is in the catalogue (ids: {sorted(entries)[:12]}...)")
+                custom = entries.get("e2e-custom") or {}
+                if custom:
+                    check(custom.get("class") == "e2e",
+                          f"e2e-custom class is e2e, got {custom.get('class')!r}")
+                    check(custom.get("lanes") == ["http"],
+                          f"e2e-custom lanes are ['http'], got {custom.get('lanes')!r}")
+                    check(custom.get("kinds") == ["query"],
+                          f"e2e-custom kinds are ['query'], got {custom.get('kinds')!r}")
+                    check((custom.get("origin") or {}).get("kind") == "custom",
+                          f"e2e-custom origin.kind is custom, got "
+                          f"{(custom.get('origin') or {}).get('kind')!r}")
+                op2.close()
 
-        # --- core C: a script missing `kinds` fails to load ---------------
-        scripts_c = tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-cat-c-scripts-")
-        write_script(scripts_c, "e2e-broken", "E2E broken", with_kinds=False)
-        cfg_c = CoreConfig(
-            proxy_port=free_port(),
-            scope_entries=[v.authority],
-            findings_dir=tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-cat-c-"),
-            rhai_scripts_dir=scripts_c,
-        )
-        section("core C: a check missing `kinds` is a load error naming `kinds`")
-        try:
-            core_c = Aitm.server(cfg_c)
-        except RuntimeError as e:
-            # The core refused to boot on the bad script: the error itself must
-            # name the missing key, and no catalogue can hold e2e-broken.
-            check("kinds" in str(e),
-                  f"the core's refusal to boot names `kinds`: {str(e)[-400:]!r}")
-            return
-        with core_c:
-            op3 = BusClient.operator(core_c)
-            ids_c = {c.get("id") for c in checks_of(op3)}
-            check("e2e-broken" not in ids_c,
-                  f"e2e-broken is absent from the catalogue (ids: {sorted(ids_c)[:12]}...)")
-            err = core_c.stderr_text()
-            check("kinds" in err,
-                  f"the core's stderr names the missing key `kinds` "
-                  f"(tail: {err[-400:]!r})")
-            op3.close()
+            # --- core C: a script missing `kinds` fails to load ---------------
+            scripts_c = os.path.join(work, "core-c-scripts")
+            os.makedirs(scripts_c, exist_ok=True)
+            write_script(scripts_c, "e2e-broken", "E2E broken", with_kinds=False)
+            cfg_c = CoreConfig(
+                proxy_port=free_port(),
+                scope_entries=[v.authority],
+                findings_dir=os.path.join(work, "core-c-findings"),
+                rhai_scripts_dir=scripts_c,
+            )
+            section("core C: a check missing `kinds` is a load error naming `kinds`")
+            try:
+                core_c = Aitm.server(cfg_c)
+            except RuntimeError as e:
+                # The core refused to boot on the bad script: the error itself must
+                # name the missing key, and no catalogue can hold e2e-broken.
+                check("kinds" in str(e),
+                      f"the core's refusal to boot names `kinds`: {str(e)[-400:]!r}")
+                return
+            with core_c:
+                op3 = BusClient.operator(core_c)
+                ids_c = {c.get("id") for c in checks_of(op3)}
+                check("e2e-broken" not in ids_c,
+                      f"e2e-broken is absent from the catalogue (ids: {sorted(ids_c)[:12]}...)")
+                err = core_c.stderr_text()
+                check("kinds" in err,
+                      f"the core's stderr names the missing key `kinds` "
+                      f"(tail: {err[-400:]!r})")
+                op3.close()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

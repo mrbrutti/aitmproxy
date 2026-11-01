@@ -59,6 +59,7 @@ from aitm_e2e.scan import (  # noqa: E402
 )
 
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
+# A bounded job that must be REFUSED or stay local; 300 s is generous.
 JOB_TIMEOUT = 300.0
 CASES = 200
 # The RESP commands of parent D8.5 the lane may never generate, as redis

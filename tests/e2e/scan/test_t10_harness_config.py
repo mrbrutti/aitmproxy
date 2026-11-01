@@ -35,6 +35,7 @@ fail / 77 skip. Never prints a token.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -47,6 +48,7 @@ from aitm_e2e.config import CoreConfig, ScannerSection, l4_inject_entry  # noqa:
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     ScanTarget,
+    boot_target,
     require_verbs,
     scan_call,
     start_job,
@@ -120,7 +122,6 @@ def check_core_b_l4_scope() -> None:
         core_b = Aitm.server(cfg_b)
     except RuntimeError as e:
         skip(f"core with l4_enabled did not boot (L4 is feature-compiled + opt-in): {e}")
-        return
     try:
         op = BusClient.operator(core_b)
         if "l4.scope.list" not in set(op.tool_names()):
@@ -138,7 +139,7 @@ def check_core_b_l4_scope() -> None:
         core_b.stop()
 
 
-def check_core_a_scanner(v: ScanTarget) -> None:
+def check_core_a_scanner(v: ScanTarget, work: str) -> None:
     # The probe core has no `scanner:` section, so a pre-T1b core boots and
     # require_verbs can SKIP cleanly; only then is core A (with the section) booted.
     probe_cfg = CoreConfig(
@@ -151,7 +152,7 @@ def check_core_a_scanner(v: ScanTarget) -> None:
         require_verbs(pop, *PROFILE_VERBS)
         pop.close()
 
-    findings_dir = tempfile.mkdtemp(prefix="aitm-e2e-scan-t10-cfg-")
+    findings_dir = os.path.join(work, "findings")
     cfg_a = CoreConfig(
         proxy_port=free_port(),
         browser_proxy_port=free_port(),
@@ -216,8 +217,10 @@ def check_core_a_scanner(v: ScanTarget) -> None:
         sent = (final.get("probes") or {}).get("sent")
         check(isinstance(sent, int) and sent <= CEILING,
               f"probes.sent ({sent!r}) <= the clamped ceiling {CEILING}")
-        crawl_cap = (std_prof.get("crawl") or {}).get("max_pages") or 200
-        bound = CEILING + int(crawl_cap) + CRAWL_MARGIN
+        crawl_cap = (std_prof.get("crawl") or {}).get("max_pages")
+        if not isinstance(crawl_cap, int):
+            fail(f"standard profile has no crawl.max_pages (got {std_prof.get('crawl')!r})")
+        bound = CEILING + crawl_cap + CRAWL_MARGIN
         reqs = v.logs.scanner_requests(seq0)
         check(len(reqs) <= bound,
               f"the target logged {len(reqs)} request(s) for the job "
@@ -233,15 +236,13 @@ def main() -> int:
     check_core_b_l4_scope()
 
     section("3. probe verbs, then core A: the scanner: section and the profile store")
+    work = tempfile.mkdtemp(prefix="aitm-e2e-scan-t10-cfg-")
+    v = boot_target("vulnerable")
     try:
-        v = ScanTarget("vulnerable")
-    except FileNotFoundError as e:
-        skip(str(e))
-        return 77
-    try:
-        check_core_a_scanner(v)
+        check_core_a_scanner(v, work)
     finally:
         v.stop()
+        shutil.rmtree(work, ignore_errors=True)
     ok("T10-2: the scanner: + l4: emitters reach a real core; clamp, listing and profiles all round-trip")
     return 0
 

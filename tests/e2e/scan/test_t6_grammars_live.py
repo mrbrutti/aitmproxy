@@ -46,6 +46,7 @@ Exit 0 pass / 1 fail / 77 skip. Never prints a token.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -56,8 +57,11 @@ from aitm_e2e.bus import BusClient, ToolError  # noqa: E402
 from aitm_e2e.config import CoreConfig, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
+    Expectations,
     ScanTarget,
+    boot_target,
     issues,
+    l4_endpoint,
     require_lane,
     require_verbs,
     scan_call,
@@ -84,37 +88,29 @@ MAX_BYTES_PER_S = 16384
 PACER_LIMIT = MAX_BYTES_PER_S * 1.1
 WINDOW_MS = 1000
 CASES = 200
+# One bounded L4 job per grammar against a local speaker; 300 s each.
 JOB_TIMEOUT = 300.0
 
-_failures: list[str] = []
-
-
-def expect(cond: bool, msg: str) -> bool:
-    """Soft assertion: record and keep going, so one grammar cannot hide the rest."""
-    if cond:
-        ok(msg)
-        return True
-    print(f"  [FAIL] {msg}", flush=True)
-    _failures.append(msg)
-    return False
-
-
-def endpoint(target: ScanTarget, service: str, grammar: str) -> dict:
-    row = target.service(service)
-    host, _, port = str(row["addr"]).rpartition(":")
-    return {"ip": host, "port": int(port), "proto": row["proto"], "grammar": grammar}
+# One soft-assert collector: one grammar's failure must not hide the other eight.
+EXPECT = Expectations("grammar assertion")
+expect = EXPECT.expect
 
 
 def advertises(checks: list[dict], grammar: str) -> bool | None:
     """Does `scan.checks` advertise `grammar`? True / False, or None when the
     build exposes no `l4_field` check at all (so the question cannot be
-    answered from the catalogue and only `scan.start` can refuse)."""
+    answered from the catalogue and only `scan.start` can refuse).
+
+    The match is on the `id` / `class` TOKENS (split on `-` and `_`), never on free
+    text: a description that merely mentions "dns" is not an advertised dns grammar."""
     l4_field = [c for c in checks if "l4_field" in (c.get("kinds") or [])]
     if not l4_field:
         return None
     for c in l4_field:
-        hay = " ".join(str(c.get(k) or "") for k in ("id", "class", "name", "description")).lower()
-        if grammar in hay:
+        tokens = set()
+        for key in ("id", "class"):
+            tokens.update(re.split(r"[-_]", str(c.get(key) or "").lower()))
+        if grammar in tokens:
             return True
     return False
 
@@ -147,7 +143,7 @@ def start_stream_job(op: BusClient, target: ScanTarget, service: str, grammar: s
             op, "operator",
             profile_name="l4-stream-safe",
             overrides={
-                "target": {"l4": [endpoint(target, service, grammar)]},
+                "target": {"l4": [l4_endpoint(target, service, grammar)]},
                 "l4": {"cases": CASES, "max_bytes_per_s": MAX_BYTES_PER_S},
             },
             confirm=True,
@@ -224,8 +220,8 @@ def main() -> int:
     skipped: list[str] = []
     try:
         section("1. the nine seeded speakers in both modes, and a core with the L4 inject scope")
-        vuln = ScanTarget("vulnerable", l4=True)
-        patched = ScanTarget("patched", l4=True)
+        vuln = boot_target("vulnerable", l4=True)
+        patched = boot_target("patched", l4=True)
         names = {s.get("name") for s in vuln.services()}
         ok(f"/services lists {len(names)} services on the vulnerable target")
 
@@ -267,8 +263,7 @@ def main() -> int:
     if not ran:
         fail(f"every one of the {len(GRAMMARS)} grammars skipped as not landed ({skipped}); "
              "a half-landed lane must not pass as green")
-    if _failures:
-        fail(f"{len(_failures)} grammar assertion(s) failed: {_failures}")
+    EXPECT.finish()
     ok(f"T6-4: {len(ran)}/{len(GRAMMARS)} grammars proven live on V and clean on P "
        f"(skipped as not landed: {skipped or '-'})")
     return 0

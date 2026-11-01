@@ -30,13 +30,17 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
     map_job,
     require_lane,
     require_verbs,
-    scan_call,
+    sitemap,
     wait_terminal,
 )
+
+# The browser crawl drives a real obscura engine, so a T2 job runs far longer
+# than the 600 s the engine-only cells need.
+JOB_TIMEOUT = 900.0
 
 
 def fetch_index(base: str) -> str:
@@ -68,32 +72,13 @@ def templated(path: str) -> str:
     return re.sub(r"/\d+(?=/|$)", "/{id}", path)
 
 
-def sitemap_all(op, job: str) -> tuple[list[dict], list[dict]]:
-    nodes: dict[str, dict] = {}
-    points: list[dict] = []
-    cursor = None
-    seen: set[str] = set()
-    while True:
-        args: dict = {"job": job, "limit": 1024}
-        if cursor:
-            args["cursor"] = cursor
-        page = scan_call(op, "operator", "scan.sitemap", args)
-        for n in page.get("nodes") or []:
-            nodes[n.get("id") or f"{n.get('method')} {n.get('path_template')}"] = n
-        points.extend(page.get("points") or [])
-        cursor = page.get("next_cursor")
-        if not cursor or cursor in seen:
-            return list(nodes.values()), points
-        seen.add(cursor)
-
-
 def main() -> None:
     if os.environ.get("AITM_OBSCURA") != "1":
         skip("AITM_OBSCURA != 1: the browser crawl needs the real obscura engine")
 
     work = tempfile.mkdtemp(prefix="aitm-e2e-t2-crawl-")
     try:
-        with ScanTarget("vulnerable") as V:
+        with boot_target("vulnerable") as V:
             cfg = CoreConfig(proxy_port=free_port(), scope_entries=[V.authority],
                              findings_dir=os.path.join(work, "findings"))
             with Aitm.server(cfg) as core:
@@ -118,14 +103,14 @@ def main() -> None:
                 res = map_job(op, "operator", target=V.base)
                 job = res["job"]
                 ok(f"job {job} started (lanes run={res.get('lanes', {}).get('run')})")
-                st = wait_terminal(op, "operator", job, timeout=900)
+                st = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
                 check(st.get("state") == "done", f"scan.map job ended done (state={st.get('state')!r})")
                 crawl = st.get("crawl") or {}
                 ok(f"crawl counters: pages={crawl.get('pages')} forms_submitted={crawl.get('forms_submitted')}")
                 check((crawl.get("forms_submitted") or 0) >= 1, "at least one form was submitted")
 
                 section("site map covers every linked path")
-                nodes, _points = sitemap_all(op, job)
+                nodes, _points = sitemap(op, "operator", job)
                 templates = {n.get("path_template") for n in nodes}
                 missing = sorted(p for p in expected
                                  if p not in templates and templated(p) not in templates)

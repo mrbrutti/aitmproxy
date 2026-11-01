@@ -22,10 +22,12 @@ pack (`crates/aitm-scan-model/fixtures/*.json`) and the T10 spec D1/D2.
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -38,16 +40,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import free_port, repo_root, skip
-from .bus import ToolError
+from . import fail, free_port, ok, repo_root, skip
+from .bus import BusError, ToolError
+from .proxyutil import via_proxy
 from .target import testtarget_bin
+from .ws import WsClient
 
 __all__ = [
+    "ROLES",
     "SCAN_VERBS_D3",
     "REFLECTED_XSS_CLASSES",
     "WS_CSWSH_CLASS",
     "WS_INJECTION_CLASS",
-    "WS_AUTH_BYPASS_CLASS",
     "JOB_NOTIFICATION_METHOD",
     "TERMINAL_STATES",
     "TERMINAL_EVENTS",
@@ -56,6 +60,7 @@ __all__ = [
     "scan_tools",
     "require_verbs",
     "require_lane",
+    "require_checks",
     "scan_call",
     "scan_try",
     "scan_error_code",
@@ -63,21 +68,33 @@ __all__ = [
     "map_job",
     "cancel",
     "wait_terminal",
+    "run_to_terminal",
     "subscribe",
     "collect_push",
     "issues",
     "issue",
+    "brief",
+    "sitemap",
+    "packet_lane_gate",
+    "read_capture_packets",
     "ScanTarget",
     "boot_target",
+    "split_addr",
+    "l4_endpoint",
+    "login",
+    "login_via_proxy",
     "until",
+    "Expectations",
     "TargetLogs",
     "Canary",
+    "WsClientWithHeaders",
     "ledger_flush",
 ]
 
-# The 18 verbs of the parent spec D3, for documentation and cross-checks only. The
-# expectation a cell or run.py uses is `expected_scan_verbs()`, parsed from the
-# maintained Rust contract, never this tuple.
+# The 18 verbs of the parent spec D3. `test_t1_contract` uses this tuple for
+# CONTRACT COMPLETENESS only -- "the maintained EXPECTED_TOOLS list still names every
+# verb the spec promises". The expectation asserted against a LIVE core is always
+# `expected_scan_verbs()`, parsed from the Rust contract, never this tuple.
 SCAN_VERBS_D3: tuple[str, ...] = (
     "scan.start",
     "scan.map",
@@ -118,7 +135,6 @@ REFLECTED_XSS_CLASSES: tuple[str, ...] = ("reflected-xss",)
 # is a check id, not a class.
 WS_CSWSH_CLASS = "ws-cswsh"
 WS_INJECTION_CLASS = "ws-injection"
-WS_AUTH_BYPASS_CLASS = "ws-auth-bypass"
 
 _CONTRACT = Path(repo_root()) / "crates" / "aitm" / "tests" / "frontends.rs"
 _ERROR_CODE_RE = re.compile(r"scan: ([a-z_]+):")
@@ -144,7 +160,7 @@ def _parse_expected_tools(path: Path) -> list[str]:
     else:
         loose = re.search(r"EXPECTED_TOOLS[^=]*=\s*\[(.*?)\];", text, re.S)
         if not loose:
-            return []
+            raise RuntimeError(f"EXPECTED_TOOLS not found in {path}")
         body = loose.group(1)
     body = re.sub(r"//[^\n]*", "", body)  # drop line comments before harvesting literals
     return re.findall(r'"([^"]+)"', body)
@@ -184,12 +200,28 @@ def require_lane(client, lane: str, role: str = "operator") -> None:
     """SKIP 77 unless `scan.checks` lists at least one check for `lane`
     (`http | ws | l4_stream | l4_packet`). Goes through `scan_call`, so the
     ledger records the `scan.checks` call at `role`."""
-    if "scan.checks" not in set(client.tool_names()):
-        skip("missing verb scan.checks")
-    result = scan_call(client, role, "scan.checks", {})
-    checks = result.get("checks", []) if isinstance(result, dict) else []
-    if not any(lane in (c.get("lanes") or []) for c in checks if isinstance(c, dict)):
+    require_verbs(client, "scan.checks")
+    checks = _catalogue(client, role)
+    if not any(lane in (c.get("lanes") or []) for c in checks):
         skip(f"lane {lane} has no scan.checks entry on this build")
+
+
+def require_checks(client, *ids: str, role: str = "operator") -> None:
+    """SKIP 77 naming every check id of `ids` the live `scan.checks` catalogue lacks
+    (a check that has not landed on this build is a loud SKIP, never a silent pass).
+    Goes through `scan_call`, so the ledger records the call at `role`."""
+    require_verbs(client, "scan.checks")
+    live = {c.get("id") for c in _catalogue(client, role)}
+    missing = [i for i in ids if i not in live]
+    if missing:
+        skip("missing check id " + ", ".join(missing) + " in scan.checks (not on this build)")
+
+
+def _catalogue(client, role: str) -> list[dict]:
+    """The `checks` rows of one live `scan.checks` call, ledgered at `role`."""
+    result = scan_call(client, role, "scan.checks", {})
+    rows = result.get("checks", []) if isinstance(result, dict) else []
+    return [c for c in rows if isinstance(c, dict)]
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +255,10 @@ def scan_error_code(msg: str) -> str | None:
     return m.group(1) if m else None
 
 
-def scan_call(client, role: str, verb: str, args: dict | None = None, *, confirm: bool = False) -> Any:
-    """Call a scan verb at `role`; record it in the ledger; raise ToolError on a
-    refusal (the ledger row then carries the parsed code). `confirm=True` runs the
-    operator two-phase `client.confirm` handshake instead of a plain call."""
+def _invoke(client, role: str, verb: str, args: dict | None, confirm: bool) -> Any:
+    """The one call path behind `scan_call` and `scan_try`: check the role, call the
+    verb (`client.confirm` two-phase handshake when `confirm`, else `client.call`),
+    and record the outcome in the ledger. Raises ToolError on a refusal."""
     _check_role(role)
     args = args or {}
     try:
@@ -238,28 +270,41 @@ def scan_call(client, role: str, verb: str, args: dict | None = None, *, confirm
     return result
 
 
-def scan_try(client, role: str, verb: str, args: dict | None = None) -> tuple[str, Any]:
-    """Like scan_call but returns ('ok', result) | ('error', message) -- for
-    asserting that a verb is REFUSED for a role. Recorded in the ledger."""
-    _check_role(role)
-    status, payload = client.try_call(verb, args or {})
-    if status == "ok":
-        _record(verb, role, "ok", None)
-    else:
-        _record(verb, role, "error", scan_error_code(str(payload)))
-    return status, payload
+def scan_call(client, role: str, verb: str, args: dict | None = None, *, confirm: bool = False) -> Any:
+    """Call a scan verb at `role`; record it in the ledger; raise ToolError on a
+    refusal (the ledger row then carries the parsed code). `confirm=True` runs the
+    operator two-phase `client.confirm` handshake instead of a plain call."""
+    return _invoke(client, role, verb, args, confirm)
+
+
+def scan_try(client, role: str, verb: str, args: dict | None = None, *,
+             confirm: bool = False) -> tuple[str, Any]:
+    """Like scan_call but returns ('ok', result) | ('error', message) -- for asserting
+    that a verb is REFUSED for a role. Recorded in the ledger. `confirm=True` answers
+    the operator confirm prompt first, so a refusal has to survive the confirmation
+    instead of hiding behind it. A BusError (a prompt with no `confirm_token`) is a
+    broken core, not a refusal, and propagates."""
+    try:
+        return ("ok", _invoke(client, role, verb, args, confirm))
+    except ToolError as e:
+        return ("error", str(e))
 
 
 def ledger_flush() -> None:
     """Write `$AITM_E2E_LEDGER_DIR/<cell>.json` = {"cell", "calls": [...]}; with the
     dir unset (a cell run by hand) print one note and write nothing. Registered
-    with atexit at import; safe to call again (rewrites the same file)."""
+    with atexit at import; safe to call again (rewrites the same file).
+
+    No calls recorded AND no dir set means there is nothing to report: stay silent,
+    so an importer that is not a cell (run.py, reading the roll-up) prints no note.
+    With the dir set the file is written even when `calls` is empty -- "this cell
+    called no scan verb" is a fact the roll-up should see."""
     global _NOTED_NO_DIR
     with _LEDGER_LOCK:
         calls = list(_LEDGER)
     ledger_dir = os.environ.get("AITM_E2E_LEDGER_DIR")
     if not ledger_dir:
-        if not _NOTED_NO_DIR:
+        if calls and not _NOTED_NO_DIR:
             _NOTED_NO_DIR = True
             print(f"note: AITM_E2E_LEDGER_DIR unset; {len(calls)} scan call(s) not recorded "
                   "(run via tests/e2e/run.py for the verb ledger)", flush=True)
@@ -331,6 +376,17 @@ def wait_terminal(client, role: str, job: str, timeout: float = 600.0, poll: flo
         time.sleep(poll)
 
 
+def run_to_terminal(client, role: str, *, timeout: float = 600.0, **start_kwargs) -> tuple[str, dict]:
+    """`start_job(client, role, **start_kwargs)` then `wait_terminal`: the (job id,
+    terminal JobStatus) pair. RuntimeError when `scan.start` answered without a job
+    id (including an unanswered confirm prompt), so a cell never polls `None`."""
+    started = start_job(client, role, **start_kwargs)
+    job = started.get("job") if isinstance(started, dict) else None
+    if not isinstance(job, str) or not job:
+        raise RuntimeError(f"scan.start did not return a job id: {str(started)[:200]}")
+    return job, wait_terminal(client, role, job, timeout=timeout)
+
+
 def subscribe(client):
     """`flow.subscribe {}` on `client` (job lines fan out to every connection that
     holds a flow subscription; parent D3). Returns the client, now a subscriber for
@@ -355,34 +411,43 @@ def collect_push(subscriber, job: str, *, until_terminal: bool = True, timeout: 
     arrival order, as their `params` dicts ({job, kind, event, seq, ts_ms, status,
     issue?}; fixtures job.*.json). Stops at the first `event` in
     {finished, cancelled, failed} (when `until_terminal`) or at the timeout. Lines
-    for other jobs and other notification kinds are left alone / stashed."""
+    for OTHER jobs are re-stashed on `subscriber.notifications` before this returns,
+    so a later `collect_push` for those jobs still sees them; notifications that are
+    not job lines are never taken off the stash at all."""
     got: list[dict] = []
+    others: list[dict] = []
     deadline = time.monotonic() + timeout
 
     def accept(msg) -> bool:
         params = msg.get("params") if isinstance(msg, dict) else None
         if not isinstance(params, dict) or params.get("job") != job:
+            others.append(msg)  # another job's line: put it back before returning
             return False
         got.append(params)
         return until_terminal and params.get("event") in TERMINAL_EVENTS
 
-    for m in _take_stashed_job_lines(subscriber):
-        if accept(m):
-            return got
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return got
-        m = subscriber.wait_notification(JOB_NOTIFICATION_METHOD, timeout=max(0.05, remaining))
-        if m is None:
-            return got
-        if accept(m):
-            return got
-        # a job line for another job: keep draining; also sweep anything the
-        # client stashed meanwhile (wait_notification stashes non-matching lines)
-        for s in _take_stashed_job_lines(subscriber):
-            if accept(s):
+    try:
+        for m in _take_stashed_job_lines(subscriber):
+            if accept(m):
                 return got
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return got
+            m = subscriber.wait_notification(JOB_NOTIFICATION_METHOD, timeout=max(0.05, remaining))
+            if m is None:
+                return got
+            if accept(m):
+                return got
+            # a job line for another job: keep draining; also sweep anything the
+            # client stashed meanwhile (wait_notification stashes non-matching lines)
+            for s in _take_stashed_job_lines(subscriber):
+                if accept(s):
+                    return got
+    finally:
+        stash = getattr(subscriber, "notifications", None)
+        if stash is not None and others:
+            stash.extend(others)
 
 
 def issues(client, role: str, **filters) -> list[dict]:
@@ -394,7 +459,7 @@ def issues(client, role: str, **filters) -> list[dict]:
     while True:
         page = scan_call(client, role, "scan.issues", args)
         if not isinstance(page, dict):
-            raise ToolError(f"scan.issues: expected an object, got {type(page).__name__}")
+            raise RuntimeError(f"scan.issues: expected an object, got {type(page).__name__}")
         out.extend(page.get("issues") or [])
         cursor = page.get("next_cursor")
         if not cursor or cursor in seen_cursors:
@@ -408,18 +473,149 @@ def issue(client, role: str, id: str) -> dict:  # noqa: A002  (the wire name is 
     return scan_call(client, role, "scan.issue", {"id": id})
 
 
+def brief(issue_rows, limit: int = 12) -> str:
+    """A one-line digest of issue summaries for a diagnostic print:
+    `N kind(s): <class>/<check_id>@<path>, ...` over the DISTINCT triples, `...`
+    when more than `limit` of them. Carries no evidence, so no secret."""
+    rows = sorted({(i.get("class"), i.get("check_id"), (i.get("location") or {}).get("path"))
+                   for i in issue_rows if isinstance(i, dict)},
+                  key=lambda r: tuple("" if x is None else str(x) for x in r))
+    shown = ", ".join(f"{c}/{cid}@{path}" for c, cid, path in rows[:limit])
+    return f"{len(rows)} kind(s): {shown}{' ...' if len(rows) > limit else ''}"
+
+
+def sitemap(client, role: str, job: str, *, limit: int = 1024) -> tuple[list[dict], list[dict]]:
+    """`scan.sitemap {job, limit}` walking `next_cursor` until it is null (like
+    `issues()`): (nodes, points). Nodes are de-duplicated on `id` (falling back to
+    `<method> <path_template>`); points are concatenated in page order."""
+    nodes: dict[str, dict] = {}
+    points: list[dict] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        args: dict = {"job": job, "limit": limit}
+        if cursor:
+            args["cursor"] = cursor
+        page = scan_call(client, role, "scan.sitemap", args)
+        if not isinstance(page, dict):
+            raise RuntimeError(f"scan.sitemap: expected an object, got {type(page).__name__}")
+        for n in page.get("nodes") or []:
+            nodes[n.get("id") or f"{n.get('method')} {n.get('path_template')}"] = n
+        points.extend(page.get("points") or [])
+        cursor = page.get("next_cursor")
+        if not cursor or cursor in seen:
+            return list(nodes.values()), points
+        seen.add(cursor)
+
+
+def packet_lane_gate(client, *verbs: str, role: str = "operator") -> dict:
+    """SKIP 77 unless this core can really run the L4 PACKET lane: every verb of
+    `verbs` live, an `l4_packet` lane in `scan.checks`, the L4 module compiled in and
+    enabled, and raw capture privilege. Returns the `l4.capture.status` reply."""
+    if verbs:
+        require_verbs(client, *verbs)
+    require_lane(client, "l4_packet", role)
+    if "l4.capture.status" not in set(client.tool_names()):
+        skip("the L4 module is not enabled on this core (no l4.capture.status): the packet lane "
+             "needs l4.enabled and the feature-compiled l4 module")
+    status, reply = client.try_call("l4.capture.status")
+    if status != "ok" or not isinstance(reply, dict):
+        skip(f"l4.capture.status did not answer with an availability object: {str(reply)[:200]}")
+    if reply.get("available") is not True:
+        skip(f"the L4 packet lane needs raw pcap privilege, and this core has none: {reply.get('reason')} "
+             "(macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW)")
+    return reply
+
+
+def read_capture_packets(client, flow_id: str, page: int = 500) -> list[dict]:
+    """Every packet of an L4 capture flow, walking `l4.flow.get {offset, limit}`
+    while the reply says `truncated`. Not a scan verb: not in the ledger."""
+    out: list[dict] = []
+    offset = 0
+    while True:
+        doc = client.call("l4.flow.get", {"id": flow_id, "offset": offset, "limit": page})
+        if not isinstance(doc, dict):
+            raise RuntimeError(f"l4.flow.get: expected an object, got {type(doc).__name__}")
+        got = doc.get("packets") or []
+        out.extend(got)
+        nxt = doc.get("next_offset")
+        if not doc.get("truncated") or not isinstance(nxt, int) or nxt <= offset or not got:
+            return out
+        offset = nxt
+
+
 # ---------------------------------------------------------------------------
 # the seeded target + its control-origin logs
 # ---------------------------------------------------------------------------
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow nothing: a 3xx surfaces as an HTTPError the caller has to handle."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Control-origin, /services and canary traffic is loopback-only and must stay that
+# way: an empty ProxyHandler makes urllib ignore `http_proxy` / `HTTPS_PROXY` /
+# `ALL_PROXY` in the environment, so an observer read can never be routed off the
+# machine -- or, worse, through the aitm proxy this suite is testing.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 def _http_json(method: str, url: str, body: bytes | None = None) -> Any:
     req = urllib.request.Request(url, data=body, method=method)
     if body is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310  (loopback only)
+    with _OPENER.open(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310  (loopback only)
         raw = resp.read()
     return json.loads(raw.decode("utf-8")) if raw else None
+
+
+# The seeded login of the test target (T10 spec D3 `/login`): these credentials are
+# fixtures of the target, not a secret. The SESSION ID they return is never printed.
+_LOGIN_FORM = b"user=alice&pass=wonderland"
+_SET_COOKIE_RE = re.compile(r"session=([0-9a-f]{32}); HttpOnly; Path=/$")
+
+
+def _session_from_set_cookie(set_cookie: str) -> str:
+    """The 32-hex session id of `Set-Cookie: session=<32 hex>; HttpOnly; Path=/`.
+    RuntimeError -- naming the SHAPE, never the header value -- when it differs."""
+    m = _SET_COOKIE_RE.match(set_cookie or "")
+    if not m:
+        raise RuntimeError("login did not answer with `Set-Cookie: session=<32 hex>; HttpOnly; Path=/`")
+    return m.group(1)
+
+
+def login(base: str) -> str:
+    """`POST /login` DIRECTLY to the target origin with the seeded credentials; the
+    32-hex session id. Use when the login itself must NOT become a captured flow
+    (`login_via_proxy` is the other half). Never prints the id or the cookie."""
+    req = urllib.request.Request(base.rstrip("/") + "/login", data=_LOGIN_FORM, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with _OPENER.open(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310  (loopback only)
+            status, headers = resp.status, resp.headers
+            resp.read()
+    except urllib.error.HTTPError as e:  # the seeded /login answers 302; we follow none
+        status, headers = e.code, e.headers
+        e.read()
+        e.close()
+    if status != 302:
+        raise RuntimeError(f"POST /login -> 302 expected, got {status}")
+    return _session_from_set_cookie(headers.get("Set-Cookie") or "")
+
+
+def login_via_proxy(proxy_port: int, base: str) -> str:
+    """`POST /login` THROUGH the aitm proxy (so the login is a captured flow the
+    scanner can learn the session from); the 32-hex session id. Never printed."""
+    r = via_proxy(proxy_port, "POST", base.rstrip("/") + "/login",
+                  headers={"Content-Type": "application/x-www-form-urlencoded"},
+                  body=_LOGIN_FORM)
+    if r.status != 302:
+        raise RuntimeError(f"POST /login through the proxy -> 302 expected, got {r.status}")
+    headers = {k.lower(): v for k, v in r.headers.items()}
+    return _session_from_set_cookie(headers.get("set-cookie") or "")
 
 
 def _authority(url: str | None) -> str | None:
@@ -665,13 +861,73 @@ def boot_target(mode: str = "vulnerable", **kw) -> "ScanTarget":
     try:
         return ScanTarget(mode, **kw)
     except FileNotFoundError as e:
-        skip(str(e))
-        raise  # unreachable: skip() exits; keeps the return type honest for readers
+        skip(str(e))  # exits the process (77); nothing after this line runs
+
+
+def split_addr(addr: str) -> tuple[str, int]:
+    """`127.0.0.1:54321` -> ("127.0.0.1", 54321); `[::1]:54321` -> ("::1", 54321).
+    `urlsplit("//" + addr)` does the IPv6 bracket handling, so nothing in the suite
+    splits on the last colon -- which would cut an IPv6 address in half."""
+    parts = urllib.parse.urlsplit("//" + str(addr))
+    host, port = parts.hostname, parts.port
+    if not host or port is None:
+        raise ValueError(f"not a host:port address: {addr!r}")
+    return host, port
+
+
+def l4_endpoint(target: "ScanTarget", service: str, grammar: str | None = None) -> dict:
+    """The `{ip, port, proto[, grammar]}` endpoint of one `/services` L4 row, ready
+    for `scan.start` `overrides.target.l4`. `grammar` overrides the row's own; with
+    neither, the endpoint carries no `grammar` key."""
+    row = target.service(service)
+    host, port = split_addr(row["addr"])
+    endpoint = {"ip": host, "port": port, "proto": row.get("proto")}
+    chosen = grammar if grammar is not None else row.get("grammar")
+    if chosen:
+        endpoint["grammar"] = chosen
+    return endpoint
+
+
+class Expectations:
+    """A soft-assert collector for a long table-driven cell: one failing row must
+    not hide the rest of the table. `expect` prints `[ok]` / `[FAIL]` and records the
+    failures, `note` prints a diagnostic, `finish` ends the cell with ONE `fail()`
+    naming them (and returns silently when every expectation held)."""
+
+    def __init__(self, what: str = "expectation"):
+        self.what = what
+        self.failures: list[str] = []
+
+    def expect(self, cond, msg: str, detail: Any = "") -> bool:
+        """Record and keep going: True when `cond` held."""
+        if cond:
+            ok(msg)
+            return True
+        line = f"  [FAIL] {msg}"
+        if detail != "":
+            line += f"   -- {str(detail)[:300]}"
+        print(line, flush=True)
+        self.failures.append(msg)
+        return False
+
+    def note(self, label: str, value: Any) -> None:
+        """One `note: <label> = <value>` diagnostic line (truncated at 400 chars)."""
+        print(f"note: {label} = {str(value)[:400]}", flush=True)
+
+    def finish(self, limit: int = 8) -> None:
+        """`fail()` (exit 1) naming the first `limit` failures; a no-op when none."""
+        if self.failures:
+            fail(f"{len(self.failures)} {self.what}(s) failed: " + "; ".join(self.failures[:limit]))
 
 
 # ---------------------------------------------------------------------------
 # the out-of-scope canary
 # ---------------------------------------------------------------------------
+
+
+# At most this much request body is read off a canary hit: the body is never
+# asserted on, only the fact of the hit, so there is no reason to buffer more.
+_CANARY_MAX_BODY = 1024 * 1024
 
 
 class Canary:
@@ -690,15 +946,21 @@ class Canary:
             protocol_version = "HTTP/1.1"
 
             def _hit(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                # Record FIRST, read second: the hit is the whole point of this
+                # listener, and it must survive a malformed Content-Length, a body
+                # that never arrives, or a body too large to want in memory.
                 with canary._lock:
                     canary.hits.append({
                         "method": self.command,
                         "path": self.path,
                         "headers": {k.lower(): v for k, v in self.headers.items()},
                     })
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                if length > 0:
+                    self.rfile.read(min(length, _CANARY_MAX_BODY))
                 body = b"canary"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
@@ -738,3 +1000,42 @@ class Canary:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+# ---------------------------------------------------------------------------
+# a WebSocket client that can carry extra upgrade headers
+# ---------------------------------------------------------------------------
+
+
+class WsClientWithHeaders(WsClient):
+    """`aitm_e2e.ws.WsClient` plus two things the scanner cells need: arbitrary
+    `extra_headers` on the proxied upgrade (`Origin`, `Cookie`, ...) and the
+    `Sec-WebSocket-Key` it sent, kept as `.key` -- so a cell can prove a scanner lane
+    re-dialled with a key of its OWN rather than replaying the cell's handshake.
+
+    A header value of None is dropped, so `extra_headers={"Cookie": cookie}` with no
+    cookie yields an anonymous upgrade. Cookie values are never printed here."""
+
+    def __init__(self, proxy_host, proxy_port, origin_host, origin_port, path="/",
+                 *, extra_headers: dict | None = None):
+        self.key = base64.b64encode(os.urandom(16)).decode()
+        self.sock = socket.create_connection((proxy_host, proxy_port), timeout=10)
+        self.rd = self.sock.makefile("rb")
+        target = f"http://{origin_host}:{origin_port}{path}"
+        lines = [
+            f"GET {target} HTTP/1.1",
+            f"Host: {origin_host}:{origin_port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {self.key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        lines += [f"{name}: {value}" for name, value in (extra_headers or {}).items() if value is not None]
+        self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        status = self.rd.readline().decode().strip()
+        if "101" not in status:
+            raise BusError(f"ws upgrade failed: {status!r} {self.rd.read(400)!r}")
+        while True:
+            line = self.rd.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break

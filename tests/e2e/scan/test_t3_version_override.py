@@ -35,8 +35,13 @@ from aitm_e2e import check, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, require_lane, require_verbs,  # noqa: E402
-                           start_job, wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    boot_target,
+    require_lane,
+    require_verbs,
+    start_job,
+    wait_terminal,
+)
 
 JOB_TIMEOUT = 600.0
 
@@ -46,7 +51,7 @@ def since(entries, seq: int) -> list:
 
 
 def main() -> None:
-    with ScanTarget("vulnerable") as v:
+    with boot_target("vulnerable") as v:
         if not v.tls_base or not v.tls_h1_base:
             skip("the test target started no tls / tls_h1 listener (needs --tls-port and "
                  "--tls-h1-port; T10 child spec D1)")

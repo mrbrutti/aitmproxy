@@ -44,46 +44,40 @@ from aitm_e2e.config import CoreConfig, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     ScanTarget,
+    boot_target,
     issues,
+    l4_endpoint,
     require_lane,
     require_verbs,
-    start_job,
-    wait_terminal,
+    run_to_terminal,
 )
 
 SERVICE = "l4-dns-fault"
 GRAMMAR = "dns"
 FAULT_CLASSES = {"l4-parser-fault", "l4-crash"}
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
+# A bounded L4 stream job against one local speaker; 300 s is generous for it.
 JOB_TIMEOUT = 300.0
 
 
-def endpoint(target: ScanTarget) -> dict:
-    """`{ip, port, proto, grammar}` for the `l4-dns-fault` `/services` row."""
-    row = target.service(SERVICE)
-    host, _, port = str(row["addr"]).rpartition(":")
-    return {"ip": host, "port": int(port), "proto": row["proto"], "grammar": GRAMMAR}
-
-
 def run_job(op: BusClient, target: ScanTarget) -> dict:
-    started = start_job(
-        op, "operator",
+    job, final = run_to_terminal(
+        op, "operator", timeout=JOB_TIMEOUT,
         profile_name="l4-stream-safe",
-        overrides={"target": {"l4": [endpoint(target)]}},
+        overrides={"target": {"l4": [l4_endpoint(target, SERVICE, GRAMMAR)]}},
         confirm=True,
     )
-    job = started.get("job")
-    check(isinstance(job, str) and job != "", f"scan.start returned a job id (got {job!r})")
-    return wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
+    ok(f"scan.start returned a job id ({job})")
+    return final
 
 
 def main() -> int:
     vuln = patched = core = op = None
     try:
         section("1. the seeded DNS-like UDP speaker, in both modes, and an L4-inject core")
-        vuln = ScanTarget("vulnerable", l4=True)
-        patched = ScanTarget("patched", l4=True)
-        v_ep = endpoint(vuln)
+        vuln = boot_target("vulnerable", l4=True)
+        patched = boot_target("patched", l4=True)
+        v_ep = l4_endpoint(vuln, SERVICE, GRAMMAR)
         ok(f"vulnerable {SERVICE} on {v_ep['ip']}:{v_ep['port']} ({v_ep['proto']})")
         check(v_ep["proto"] == "udp", f"{SERVICE} is a UDP service (got {v_ep['proto']!r})")
         check(vuln.service(SERVICE).get("grammar") == GRAMMAR,

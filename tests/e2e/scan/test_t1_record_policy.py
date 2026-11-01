@@ -25,17 +25,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aitm_e2e import check, fail, free_port, ok, section, skip  # noqa: E402
+from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     TERMINAL_STATES,
-    ScanTarget,
+    boot_target,
     require_verbs,
     scan_call,
     start_job,
+    until,
     wait_terminal,
 )
 
@@ -44,6 +45,8 @@ JOB_TIMEOUT = 600.0
 # real request (the browser crawl marks store additions around its navigations,
 # spec D8; sending after it keeps the "real flow is unmarked" assertion honest).
 CRAWL_WAIT = 30.0
+# How long the store may take to re-record a probe flow's `issue:<id>` mark.
+SETTLE_TIMEOUT = 10.0
 
 
 def flow_rows(op) -> list[dict]:
@@ -62,10 +65,7 @@ def main() -> int:
     target = core = op = None
     try:
         section("arrange: vulnerable target + own core on free ports")
-        try:
-            target = ScanTarget("vulnerable")
-        except FileNotFoundError as e:
-            skip(str(e))
+        target = boot_target("vulnerable")
         cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
                          scope_entries=[target.authority])
         core = Aitm.server(cfg)
@@ -95,7 +95,18 @@ def main() -> int:
         final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
         check(final.get("state") == "done", f"job {job} finished done (got {final.get('state')!r}, "
               f"stopped_reason={final.get('stopped_reason')!r})")
-        time.sleep(1.0)  # let the last issue re-recordings settle in the store
+        # The store re-records a probe flow's marks as its issue lands: poll until
+        # every non-crawl job flow carries an `issue:<id>` mark instead of sleeping a
+        # fixed second. The assertions below still judge the result on their own.
+        def issue_marks_settled() -> bool:
+            fresh = [r for r in flow_rows(op) if r.get("id") not in before
+                     and r.get("authority") == target.authority
+                     and marker not in str(r.get("path") or "")
+                     and "crawl" not in marks_of(r)]
+            return bool(fresh) and all(
+                any(m.startswith("issue:") for m in marks_of(r)) for r in fresh)
+
+        until(issue_marks_settled, SETTLE_TIMEOUT)
 
         section("assert: store diff vs the target's request log")
         rows = [r for r in flow_rows(op) if r.get("id") not in before]

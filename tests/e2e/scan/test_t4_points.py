@@ -37,38 +37,22 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
     require_lane,
     require_verbs,
-    scan_call,
+    sitemap,
     start_job,
     wait_terminal,
 )
 from aitm_e2e.ws import WsClient  # noqa: E402
 
-RUN = secrets.token_hex(6)  # per-run marker (flows may be shared with parallel cells)
+RUN = secrets.token_hex(6)
+JOB_TIMEOUT = 600.0  # per-run marker (flows may be shared with parallel cells)
 
 
 def _authority_parts(authority: str) -> tuple[str, int]:
     host, port = authority.rsplit(":", 1)
     return host, int(port)
-
-
-def sitemap_points(op, job: str) -> list[dict]:
-    """Every `scan.sitemap` point for `job`, walking `next_cursor` (D3 paging)."""
-    points: list[dict] = []
-    cursor = None
-    seen: set[str] = set()
-    while True:
-        args: dict = {"job": job, "limit": 1024}
-        if cursor:
-            args["cursor"] = cursor
-        page = scan_call(op, "operator", "scan.sitemap", args)
-        points.extend((page or {}).get("points") or [])
-        cursor = (page or {}).get("next_cursor")
-        if not cursor or cursor in seen:
-            return points
-        seen.add(cursor)
 
 
 def _handshake_keys(entries: list[dict]) -> set[str]:
@@ -78,7 +62,7 @@ def _handshake_keys(entries: list[dict]) -> set[str]:
 
 def main() -> int:
     section("AC T4-1: ws_json_value points from a captured /ws conversation")
-    with ScanTarget("vulnerable") as v:
+    with boot_target("vulnerable") as v:
         vhost, vport = _authority_parts(v.authority)
         cfg = CoreConfig(
             proxy_port=free_port(),
@@ -115,8 +99,11 @@ def main() -> int:
                                    "target": {"origins": [v.base]},
                                    "lanes": ["ws"]})
             job = r["job"]
-            wait_terminal(op, "operator", job)
-            pts = sitemap_points(op, job)
+            final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
+            check(final.get("state") == "done",
+                  f"the ws job finished done (state={final.get('state')!r}, "
+                  f"stopped_reason={final.get('stopped_reason')!r})")
+            _nodes, pts = sitemap(op, "operator", job)
             ws_json = [p for p in pts if p.get("kind") == "ws_json_value"]
             names = {p.get("name") for p in ws_json}
             check("type" in names and "msg" in names,

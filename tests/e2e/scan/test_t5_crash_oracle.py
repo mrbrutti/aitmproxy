@@ -56,8 +56,16 @@ from aitm_e2e import fail, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.config import CoreConfig, l4_capture_entry, l4_inject_entry  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, issue, issues, require_lane,  # noqa: E402
-                           require_verbs, start_job, wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    Expectations,
+    boot_target,
+    issue,
+    issues,
+    packet_lane_gate,
+    split_addr,
+    start_job,
+    wait_terminal,
+)
 
 SERVICE = "l4-udp-payload-crash"
 # Child spec D5: the V trigger is a payload starting DE AD BE EF with len >= 8. The seed is
@@ -75,50 +83,14 @@ LIVENESS_EVERY = 25
 EXPECTED_DOWNTIME = 1 + REPRODUCE_COUNT
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.issue", "scan.checks")
 
-_failures: list[str] = []
-
-
-def expect(cond, msg: str, detail="") -> bool:
-    if cond:
-        ok(msg)
-        return True
-    line = f"  [FAIL] {msg}"
-    if detail != "":
-        line += f"   -- {str(detail)[:300]}"
-    print(line, flush=True)
-    _failures.append(msg)
-    return False
-
-
-def note(label: str, value) -> None:
-    print(f"note: {label} = {str(value)[:400]}", flush=True)
+# One soft-assert collector for the whole cell: a failing expectation records itself
+# and the run continues, so one bad row never hides the rest of the evidence.
+EXPECT = Expectations()
+expect, note = EXPECT.expect, EXPECT.note
 
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def split_addr(addr: str) -> tuple[str, int]:
-    """`127.0.0.1:54321` -> ("127.0.0.1", 54321)."""
-    host, _, port = str(addr).rpartition(":")
-    return host, int(port)
-
-
-def gate(op) -> dict:
-    """SKIP 77 unless this core can run the packet lane: the scan verbs, a live
-    `l4_packet` lane in `scan.checks`, the L4 module, and raw capture privilege."""
-    require_verbs(op, *VERBS)
-    require_lane(op, "l4_packet")
-    if "l4.capture.status" not in set(op.tool_names()):
-        skip("the L4 module is not enabled on this core (no l4.capture.status): the packet lane "
-             "needs l4.enabled and the feature-compiled l4 module")
-    status, reply = op.try_call("l4.capture.status")
-    if status != "ok" or not isinstance(reply, dict):
-        skip(f"l4.capture.status did not answer with an availability object: {str(reply)[:200]}")
-    if reply.get("available") is not True:
-        skip(f"the L4 packet lane needs raw pcap privilege, and this core has none: {reply.get('reason')} "
-             "(macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW)")
-    return reply
 
 
 def packet_profile(ip: str, port: int, proto: str, l4_opts: dict) -> dict:
@@ -190,8 +162,8 @@ def main() -> int:
     vuln = patched = core = op = None
     try:
         section("arrange: the vulnerable and patched targets with their L4 speakers, and an L4 core")
-        vuln = ScanTarget("vulnerable", l4=True)
-        patched = ScanTarget("patched", l4=True)
+        vuln = boot_target("vulnerable", l4=True)
+        patched = boot_target("patched", l4=True)
         v_svc = vuln.service(SERVICE)
         p_svc = patched.service(SERVICE)
         v_ip, v_port = split_addr(v_svc["addr"])
@@ -208,7 +180,7 @@ def main() -> int:
         )
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
-        gate(op)
+        packet_lane_gate(op, *VERBS)
 
         section("(a) T5-2a: a real CLOSED UDP port answers ICMP 3/3, a real CLOSED TCP port answers RST")
         closed_udp = free_port()
@@ -308,8 +280,7 @@ def main() -> int:
             if t is not None:
                 t.stop()
 
-    if _failures:
-        fail(f"{len(_failures)} expectation(s) failed: " + "; ".join(_failures[:8]))
+    EXPECT.finish()
     ok("PASS: the kernel reactions are classified, the userland crash is found, confirmed and retired, "
        "and the patched service stays clean")
     return 0
@@ -320,7 +291,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except FileNotFoundError as e:
-        skip(f"a real binary this cell needs is missing: {e}")
     except Exception as e:  # noqa: BLE001
         fail(f"{type(e).__name__}: {e}")

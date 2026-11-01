@@ -31,7 +31,7 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
     require_verbs,
     scan_call,
     scan_error_code,
@@ -41,6 +41,7 @@ from aitm_e2e.scan import (  # noqa: E402
 )
 
 CANDIDATES = ("ws", "l4_stream", "l4_packet")
+# A tiny inline profile (40 probes) on one origin: 300 s is generous for it.
 JOB_TIMEOUT = 300.0
 
 
@@ -59,10 +60,7 @@ def main() -> int:
     target = core = op = None
     try:
         section("arrange: vulnerable target + own core (l4 layer enabled)")
-        try:
-            target = ScanTarget("vulnerable")
-        except FileNotFoundError as e:
-            skip(str(e))
+        target = boot_target("vulnerable")
         cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
                          scope_entries=[target.authority], l4_enabled=True)
         core = Aitm.server(cfg)
@@ -88,7 +86,7 @@ def main() -> int:
         check(isinstance(skipped, list) and len(skipped) == 1, f"scan.start lanes.skipped has one entry (got {skipped!r})")
         entry = skipped[0] if isinstance(skipped, list) and skipped else {}
         reason = entry.get("reason") if isinstance(entry, dict) else None
-        check(entry.get("lane") == dead if isinstance(entry, dict) else False,
+        check(isinstance(entry, dict) and entry.get("lane") == dead,
               f"lanes.skipped[0].lane == {dead!r} (got {entry!r})")
         check(isinstance(reason, str) and reason.strip() != "", f"lanes.skipped[0].reason is non-empty ({reason!r})")
         check(skipped == [{"lane": dead, "reason": reason}], "lanes.skipped == [{lane: dead, reason}] exactly")
@@ -108,11 +106,9 @@ def main() -> int:
         section(f"[{dead}] alone: lane_unavailable, nothing reaches the target")
         seq1 = target.logs.reset()
         args = {"profile": inline_profile("e2e-dead", target.base, [dead])}
-        status, payload = scan_try(op, "operator", "scan.start", args)
-        if status == "ok" and isinstance(payload, dict) and payload.get("status") == "needs_confirmation":
-            token = payload.get("confirm_token")
-            check(bool(token), "confirm prompt carried a confirm_token")
-            status, payload = scan_try(op, "operator", "scan.start", dict(args, _confirm=token))
+        # confirm=True: an L4 dead lane is confirmable, and the refusal has to survive
+        # the confirmation rather than hide behind the prompt.
+        status, payload = scan_try(op, "operator", "scan.start", args, confirm=needs_confirm)
         check(status == "error", f"scan.start with only [{dead}] is refused (got {status!r}: {str(payload)[:120]})")
         code = scan_error_code(str(payload)) if status == "error" else None
         check(code == "lane_unavailable", f"refusal code == lane_unavailable (got {code!r})")

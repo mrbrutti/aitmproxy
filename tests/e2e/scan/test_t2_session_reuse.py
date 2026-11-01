@@ -17,7 +17,6 @@ SKIP 77: serve binary missing, a missing `scan.start`/`scan.status`/`scan.issues
 """
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -32,8 +31,9 @@ from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     REFLECTED_XSS_CLASSES,
-    ScanTarget,
+    boot_target,
     issues,
+    login_via_proxy,
     require_lane,
     require_verbs,
     scan_call,
@@ -41,19 +41,9 @@ from aitm_e2e.scan import (  # noqa: E402
     wait_terminal,
 )
 
-
-def login_via_proxy(proxy: int, base: str) -> str:
-    """`POST /login` through the proxy; returns the 32-hex session id (never printed)."""
-    r = via_proxy(proxy, "POST", base + "/login",
-                  headers={"Content-Type": "application/x-www-form-urlencoded"},
-                  body=b"user=alice&pass=wonderland")
-    check(r.status == 302, f"POST /login through the proxy -> 302 (got {r.status})")
-    headers = {k.lower(): v for k, v in r.headers.items()}
-    m = re.match(r"session=([0-9a-f]{32}); HttpOnly; Path=/$", headers.get("set-cookie") or "")
-    if not m:
-        fail("login did not answer with `Set-Cookie: session=<32 hex>; HttpOnly; Path=/`")
-    ok("login set a 32-hex HttpOnly session cookie")
-    return m.group(1)
+# The browser crawl drives a real obscura engine, so a T2 job runs far longer
+# than the 600 s the engine-only cells need.
+JOB_TIMEOUT = 900.0
 
 
 def account_issues(xs: list[dict]) -> list[dict]:
@@ -68,7 +58,7 @@ def reflected(rows: list[dict]) -> list[dict]:
 def main() -> None:
     work = tempfile.mkdtemp(prefix="aitm-e2e-t2-session-")
     try:
-        with ScanTarget("vulnerable") as V:
+        with boot_target("vulnerable") as V:
             cfg = CoreConfig(proxy_port=free_port(), scope_entries=[V.authority],
                              findings_dir=os.path.join(work, "findings"))
             with Aitm.server(cfg) as core:
@@ -78,7 +68,11 @@ def main() -> None:
                 proxy = cfg.proxy_port
 
                 section("real login + authenticated GET /account through the proxy")
-                sid = login_via_proxy(proxy, V.base)
+                try:
+                    sid = login_via_proxy(proxy, V.base)
+                except RuntimeError as e:
+                    fail(str(e))
+                ok("POST /login through the proxy set a 32-hex HttpOnly session cookie")
                 cookie = {"Cookie": f"session={sid}"}
                 r = via_proxy(proxy, "GET", V.base + "/account?tab=overview", headers=cookie)
                 check(r.status == 200, f"GET /account?tab=overview with the session -> 200 (got {r.status})")
@@ -99,7 +93,7 @@ def main() -> None:
                 seq0 = V.logs.reset()
                 job1 = start_job(op, "operator", target=V.base,
                                  overrides={"session": {"mode": "observed"}})["job"]
-                st1 = wait_terminal(op, "operator", job1, timeout=900)
+                st1 = wait_terminal(op, "operator", job1, timeout=JOB_TIMEOUT)
                 check(st1.get("state") == "done", f"job 1 ended done (state={st1.get('state')!r}, "
                                                   f"stopped_reason={st1.get('stopped_reason')!r})")
                 sess = st1.get("session") or {}
@@ -126,7 +120,7 @@ def main() -> None:
                 seq1 = V.logs.reset()
                 job2 = start_job(op, "operator", target=V.base,
                                  overrides={"session": {"mode": "none"}})["job"]
-                st2 = wait_terminal(op, "operator", job2, timeout=900)
+                st2 = wait_terminal(op, "operator", job2, timeout=JOB_TIMEOUT)
                 check(st2.get("state") == "done", f"job 2 ended done (state={st2.get('state')!r})")
                 sess2 = st2.get("session")
                 check(sess2 is None or sess2.get("reused") is False,

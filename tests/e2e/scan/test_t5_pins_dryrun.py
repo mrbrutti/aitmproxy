@@ -44,58 +44,32 @@ from aitm_e2e import fail, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient, BusError, ToolError  # noqa: E402
 from aitm_e2e.config import CoreConfig, l4_capture_entry, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, require_lane, require_verbs, scan_error_code,  # noqa: E402
-                           scan_try, start_job, wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    Expectations,
+    boot_target,
+    packet_lane_gate,
+    read_capture_packets,
+    scan_error_code,
+    scan_try,
+    split_addr,
+    start_job,
+    wait_terminal,
+)
 
 SERVICE = "l4-udp-payload-crash"
 PINNED_FIELDS = ("ipv4.src", "dst")
 DRY_RUN_CASES = 50
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
+JOB_TIMEOUT = 600.0
 
-_failures: list[str] = []
-
-
-def expect(cond, msg: str, detail="") -> bool:
-    if cond:
-        ok(msg)
-        return True
-    line = f"  [FAIL] {msg}"
-    if detail != "":
-        line += f"   -- {str(detail)[:300]}"
-    print(line, flush=True)
-    _failures.append(msg)
-    return False
-
-
-def note(label: str, value) -> None:
-    print(f"note: {label} = {str(value)[:400]}", flush=True)
+# One soft-assert collector for the whole cell: a failing expectation records itself
+# and the run continues, so one bad row never hides the rest of the evidence.
+EXPECT = Expectations()
+expect, note = EXPECT.expect, EXPECT.note
 
 
 def loopback_interface() -> str:
     return "lo0" if sys.platform == "darwin" else "lo"
-
-
-def split_addr(addr: str) -> tuple[str, int]:
-    """`127.0.0.1:54321` -> ("127.0.0.1", 54321)."""
-    host, _, port = str(addr).rpartition(":")
-    return host, int(port)
-
-
-def gate(op) -> dict:
-    """SKIP 77 unless this core can run the packet lane: the scan verbs, a live
-    `l4_packet` lane in `scan.checks`, the L4 module, and raw capture privilege."""
-    require_verbs(op, *VERBS)
-    require_lane(op, "l4_packet")
-    if "l4.capture.status" not in set(op.tool_names()):
-        skip("the L4 module is not enabled on this core (no l4.capture.status): the packet lane "
-             "needs l4.enabled and the feature-compiled l4 module")
-    status, reply = op.try_call("l4.capture.status")
-    if status != "ok" or not isinstance(reply, dict):
-        skip(f"l4.capture.status did not answer with an availability object: {str(reply)[:200]}")
-    if reply.get("available") is not True:
-        skip(f"the L4 packet lane needs raw pcap privilege, and this core has none: {reply.get('reason')} "
-             "(macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW)")
-    return reply
 
 
 def packet_profile(ip: str, port: int, l4_opts: dict) -> dict:
@@ -106,45 +80,13 @@ def packet_profile(ip: str, port: int, l4_opts: dict) -> dict:
     }
 
 
-def try_start(op, profile: dict) -> tuple[str, object]:
-    """`scan.start` at operator through `scan_try` (so the refusal lands in the verb
-    ledger), following the operator `_confirm` handshake when the core offers one: an L4
-    profile is confirmable, and the refusal must survive the confirmation, not hide behind
-    it. Returns ('ok', result) | ('error', message)."""
-    args = {"profile": profile}
-    status, payload = scan_try(op, "operator", "scan.start", args)
-    if status == "ok" and isinstance(payload, dict) and payload.get("status") == "needs_confirmation":
-        token = payload.get("confirm_token")
-        if not token:
-            fail(f"scan.start asked for confirmation without a confirm_token: {payload!r}")
-        status, payload = scan_try(op, "operator", "scan.start", dict(args, _confirm=token))
-    return status, payload
-
-
-def read_packets(op, flow_id: str, page: int = 500) -> list[dict]:
-    """Every packet of a capture flow, walking `l4.flow.get {offset, limit}` while the
-    reply says `truncated`."""
-    out: list[dict] = []
-    offset = 0
-    while True:
-        doc = op.call("l4.flow.get", {"id": flow_id, "offset": offset, "limit": page})
-        if not isinstance(doc, dict):
-            raise ToolError(f"l4.flow.get: expected an object, got {type(doc).__name__}")
-        got = doc.get("packets") or []
-        out.extend(got)
-        nxt = doc.get("next_offset")
-        if not doc.get("truncated") or not isinstance(nxt, int) or nxt <= offset or not got:
-            return out
-        offset = nxt
-
-
 def main() -> int:
     iface = loopback_interface()
     target = core = op = None
     cap_id = None
     try:
         section("arrange: the vulnerable target with its L4 speakers, and an L4-enabled core")
-        target = ScanTarget("vulnerable", l4=True)
+        target = boot_target("vulnerable", l4=True)
         svc = target.service(SERVICE)
         ip, port = split_addr(svc["addr"])
         note(f"/services[{SERVICE}]", svc)
@@ -157,7 +99,7 @@ def main() -> int:
         )
         core = Aitm.server(cfg)
         op = BusClient.operator(core)
-        gate(op)
+        packet_lane_gate(op, *VERBS)
 
         section("observer 1: a capture that is running before any job is started")
         started_cap = op.confirm("l4.capture.start", {"interface": iface, "direction": "inbound"})
@@ -171,7 +113,8 @@ def main() -> int:
         section("T5-3 pins: a profile naming a non-fuzzable field is refused with invalid_profile")
         for field in PINNED_FIELDS:
             profile = packet_profile(ip, port, {"cases": 10, "fields": [field]})
-            status, payload = try_start(op, profile)
+            status, payload = scan_try(op, "operator", "scan.start",
+                                       {"profile": profile}, confirm=True)
             note(f"scan.start with fields: [{field!r}]", payload)
             expect(status == "error", f"a profile fuzzing `{field}` is refused", payload)
             code = scan_error_code(str(payload)) if status == "error" else None
@@ -192,7 +135,7 @@ def main() -> int:
         if not isinstance(job, str):
             fail(f"scan.start (dry run) returned no job id: {started!r}")
 
-        final = wait_terminal(op, "operator", job, timeout=600)
+        final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
         note("scan.status (dry run, terminal)",
              {k: final.get(k) for k in ("state", "phase", "stopped_reason", "l4", "issues")})
         expect(final.get("state") == "done", "the dry-run job finished `done`", final.get("state"))
@@ -205,7 +148,7 @@ def main() -> int:
         running = (op.call("l4.capture.status") or {}).get("captures") or []
         expect(cap_id not in running, "the capture is no longer running after l4.capture.stop", running)
         cap_id_done, cap_id = cap_id, None
-        packets = read_packets(op, cap_id_done)
+        packets = read_capture_packets(op, cap_id_done)
         to_port = [p for p in packets if p.get("dst_port") == port]
         note("capture", f"{len(packets)} packets total, {len(to_port)} to port {port}")
         expect(len(to_port) == 0,
@@ -231,8 +174,7 @@ def main() -> int:
         if target is not None:
             target.stop()
 
-    if _failures:
-        fail(f"{len(_failures)} expectation(s) failed: " + "; ".join(_failures[:8]))
+    EXPECT.finish()
     ok("PASS: the non-fuzzable pins are refused with invalid_profile and a dry run puts nothing on the wire")
     return 0
 
@@ -242,7 +184,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except FileNotFoundError as e:
-        skip(f"a real binary this cell needs is missing: {e}")
     except Exception as e:  # noqa: BLE001
         fail(f"{type(e).__name__}: {e}")

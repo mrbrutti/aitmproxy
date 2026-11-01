@@ -41,8 +41,16 @@ from aitm_e2e import check, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, issues, require_lane, require_verbs,  # noqa: E402
-                           scan_call, start_job, wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    boot_target,
+    issues,
+    require_checks,
+    require_lane,
+    require_verbs,
+    scan_call,
+    start_job,
+    wait_terminal,
+)
 
 H2_CHECKS = ["h2-settings-observe", "h2-header-crlf-tolerance", "h2-pseudo-header-validation",
              "h2-rapid-reset-mitigation", "h2-cl-te-downgrade-indicator"]
@@ -54,15 +62,6 @@ SILENT_CHECKS = ("h2-pseudo-header-validation", "h2-header-crlf-tolerance",
 RAPID_RESET_PHRASE = "no reset-rate mitigation"
 EXPECTED_REQUESTS = [0, 2, 2, 3, 8]
 JOB_TIMEOUT = 600.0
-
-
-def require_checks(op, ids) -> None:
-    """SKIP 77 naming every check id the live `scan.checks` catalogue lacks."""
-    live = {c.get("id") for c in (scan_call(op, "operator", "scan.checks", {}) or {}).get("checks", [])
-            if isinstance(c, dict)}
-    missing = [i for i in ids if i not in live]
-    if missing:
-        skip("missing check id " + ", ".join(missing) + " in scan.checks (T3 is not on this build)")
 
 
 def h2_profile(name: str, origin: str) -> dict:
@@ -128,13 +127,12 @@ def assert_connections(conns, label: str) -> None:
           f"(observed {len(conns)}: {detail})")
     check(counts == EXPECTED_REQUESTS,
           f"{label}: per-connection request counts are {EXPECTED_REQUESTS} "
-          f"(observed {counts})")
-    check(all(n <= 8 for n in counts),
-          f"{label}: no connection carried more than 8 streams (observed {counts})")
+          f"(observed {counts}) -- the exact list, so the <= 8 streams/connection "
+          f"bound holds by construction")
 
 
 def main() -> None:
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
+    with boot_target("vulnerable") as v, boot_target("patched") as p:
         if not v.tls_base or not p.tls_base:
             skip("the test target started no TLS listener (needs --tls-port; T10 child spec D1)")
         cfg = CoreConfig(
@@ -147,7 +145,7 @@ def main() -> None:
             op = BusClient.operator(core)
             require_verbs(op, "scan.start", "scan.status", "scan.issues", "scan.issue", "scan.checks")
             require_lane(op, "http")
-            require_checks(op, H2_CHECKS)
+            require_checks(op, *H2_CHECKS)
 
             section("the observe-only h2 checks on V")
             iss_v, conns_v = run_on(op, v, "V")

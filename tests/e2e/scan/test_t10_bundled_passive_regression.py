@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# e2e: tier=T1 surface=scan needs=ws
+# e2e: tier=T1 surface=scan needs=http
 """The bundled passive catalogue still fires on real proxied traffic, Vulnerable
 vs Patched (T10 spec S10; parent AC T10-3) — with NO scanner engine and NO
 `scan.*` call at all. The observer is the core's own `script.findings` after real
@@ -25,7 +25,7 @@ to the script, never to the traffic; on a miss it prints the script's
 `script.list` row (`enabled`, `hooks`, `last_error`) and every finding `source`
 seen before failing.
 
-This cell imports `ScanTarget` from `aitm_e2e.scan` only; it calls no `scan.*`
+This cell boots its targets with `boot_target` from `aitm_e2e.scan`; it calls no `scan.*`
 verb, so its ledger file is `calls: []`. `script.findings` / `flow.get` /
 `script.list` are plain bus reads, not scan verbs.
 
@@ -49,11 +49,11 @@ from aitm_e2e import tls  # noqa: E402
 from aitm_e2e.bus import BusClient, ToolError  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import ScanTarget  # noqa: E402
+from aitm_e2e.scan import boot_target, split_addr, until  # noqa: E402
 from aitm_e2e.ws import WsClient  # noqa: E402
 
 SCRIPT_IDS = ("missing-hsts", "missing-csp", "ws-cleartext-transport")
-POLL_V_S = 10.0     # poll window for V's findings (spec S10)
+POLL_V_S = 15.0     # poll window for V's findings (plan B4)
 SETTLE_P_S = 3.0    # let any P finding land before asserting none did
 
 
@@ -155,9 +155,9 @@ def drive_ws(proxy_host: str, proxy_port: int, authority: str, label: str, *, ex
     """One cleartext ws:// echo conversation through the proxy. On V the upgrade
     succeeds (any Origin, no session); on P it is refused (no session), which is
     the point — no cleartext WebSocket flow is established for P."""
-    host, _, port = authority.rpartition(":")
+    host, port = split_addr(authority)
     try:
-        client = WsClient(proxy_host, proxy_port, host, int(port), path="/ws")
+        client = WsClient(proxy_host, proxy_port, host, port, path="/ws")
     except Exception as e:  # noqa: BLE001  (P refuses the upgrade; that is expected)
         if expect_upgrade:
             fail(f"{label}: the cleartext ws:// upgrade through the proxy failed: {e}")
@@ -175,12 +175,8 @@ def drive_ws(proxy_host: str, proxy_port: int, authority: str, label: str, *, ex
 def main() -> int:
     if not tls.have("curl"):
         skip("curl not found: the MITM HTTPS path needs curl --cacert")
-    try:
-        v = ScanTarget("vulnerable", tls=True, control=True)
-        p = ScanTarget("patched", tls=True, control=True)
-    except FileNotFoundError as e:
-        skip(str(e))
-        return 77
+    v = boot_target("vulnerable")
+    p = boot_target("patched")
 
     core = op = None
     try:
@@ -225,16 +221,17 @@ def main() -> int:
                   flush=True)
 
         section("poll script.findings: all three bundled scripts fire on V's host")
-        present: set[str] = set()
-        fs: list[dict] = []
-        deadline = time.monotonic() + POLL_V_S
-        while time.monotonic() < deadline:
+        latest: dict = {"present": set(), "findings": []}
+
+        def all_three_fired() -> bool:
             cache: dict = {}
-            fs = findings_now(op)
-            present = {sid for sid in SCRIPT_IDS if fired_for(op, sid, v_hosts, fs, cache)}
-            if present == set(SCRIPT_IDS):
-                break
-            time.sleep(0.3)
+            latest["findings"] = findings_now(op)
+            latest["present"] = {sid for sid in SCRIPT_IDS
+                                 if fired_for(op, sid, v_hosts, latest["findings"], cache)}
+            return latest["present"] == set(SCRIPT_IDS)
+
+        until(all_three_fired, POLL_V_S, interval=0.3)
+        present, fs = latest["present"], latest["findings"]
         for sid in SCRIPT_IDS:
             if sid in present:
                 ok(f"V: bundled `{sid}` recorded a finding on V's host")
@@ -250,11 +247,9 @@ def main() -> int:
                   f"(details: {[f.get('detail') for f in same_source][:3]!r}); "
                   f"all sources seen: {sorted({str(f.get('source')) for f in fs})}", flush=True)
             if sid == "ws-cleartext-transport" and not same_source:
-                print("diag: ws-cleartext-transport guards on `flow.request.url.starts_with(\"ws://\")` in "
-                      "on_ws_start, but a WebSocket flow has no request in the Rhai flow API "
-                      "(crates/aitm-plugin-rhai/src/flow_api.rs NO_REQUEST: reads return \"\"), so the "
-                      "guard cannot be true on a live WS flow -- a bundled-script/engine gap, not a traffic gap",
-                      flush=True)
+                print("note: known: bundled ws-cleartext-transport never fires on a live WS flow "
+                      "(aitm-plugin-rhai exposes no request to Rhai hooks on WebSocket flows); "
+                      "T1b fix in flight", flush=True)
             check(False, f"V: bundled `{sid}` recorded a finding on V's host")
 
         section("the same two actions against the PATCHED target add none of the three")

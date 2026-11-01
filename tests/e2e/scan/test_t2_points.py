@@ -30,13 +30,17 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
     map_job,
     require_lane,
     require_verbs,
-    scan_call,
+    sitemap,
     wait_terminal,
 )
+
+# The browser crawl drives a real obscura engine, so a T2 job runs far longer
+# than the 600 s the engine-only cells need.
+JOB_TIMEOUT = 900.0
 
 WANTED_KINDS = {"json_value", "xml_value", "multipart_value", "header", "cookie",
                 "path_segment", "path_filename"}
@@ -53,22 +57,6 @@ MULTIPART = (
 ).encode("utf-8")
 
 
-def sitemap_points(op, job: str) -> list[dict]:
-    points: list[dict] = []
-    cursor = None
-    seen: set[str] = set()
-    while True:
-        args: dict = {"job": job, "limit": 1024}
-        if cursor:
-            args["cursor"] = cursor
-        page = scan_call(op, "operator", "scan.sitemap", args)
-        points.extend(page.get("points") or [])
-        cursor = page.get("next_cursor")
-        if not cursor or cursor in seen:
-            return points
-        seen.add(cursor)
-
-
 def url_path(point: dict) -> str | None:
     url = point.get("url")
     return urlsplit(url).path if isinstance(url, str) else None
@@ -77,7 +65,7 @@ def url_path(point: dict) -> str | None:
 def main() -> None:
     work = tempfile.mkdtemp(prefix="aitm-e2e-t2-points-")
     try:
-        with ScanTarget("vulnerable") as V:
+        with boot_target("vulnerable") as V:
             cfg = CoreConfig(proxy_port=free_port(), scope_entries=[V.authority],
                              findings_dir=os.path.join(work, "findings"))
             with Aitm.server(cfg) as core:
@@ -126,9 +114,9 @@ def main() -> None:
                 res = map_job(op, "operator", target=V.base,
                               overrides={"crawl": {"use_browser": "never"}})
                 job = res["job"]
-                st = wait_terminal(op, "operator", job, timeout=900)
+                st = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
                 check(st.get("state") == "done", f"scan.map job ended done (state={st.get('state')!r})")
-                points = sitemap_points(op, job)
+                _nodes, points = sitemap(op, "operator", job)
                 kinds = {p.get("kind") for p in points}
                 ok(f"{len(points)} points; kinds = {sorted(k for k in kinds if isinstance(k, str))}")
                 check(WANTED_KINDS <= kinds, f"kinds cover {sorted(WANTED_KINDS)} (missing: {sorted(WANTED_KINDS - kinds)})")

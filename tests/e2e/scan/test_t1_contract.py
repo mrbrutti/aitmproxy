@@ -31,9 +31,9 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    SCAN_VERBS_D3,
     ContractDrift,
-    ScanTarget,
+    SCAN_VERBS_D3,
+    boot_target,
     expected_scan_verbs,
     scan_call,
     scan_tools,
@@ -46,10 +46,7 @@ def main() -> int:
     target = core = op = None
     try:
         section("arrange: vulnerable target + own core on free ports")
-        try:
-            target = ScanTarget("vulnerable")
-        except FileNotFoundError as e:
-            skip(str(e))
+        target = boot_target("vulnerable")
         cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
                          scope_entries=[target.authority])
         core = Aitm.server(cfg)

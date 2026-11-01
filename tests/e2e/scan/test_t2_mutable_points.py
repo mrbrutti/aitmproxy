@@ -32,13 +32,17 @@ from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     REFLECTED_XSS_CLASSES,
-    ScanTarget,
+    boot_target,
     issues,
     require_lane,
     require_verbs,
     start_job,
     wait_terminal,
 )
+
+# The browser crawl drives a real obscura engine, so a T2 job runs far longer
+# than the 600 s the engine-only cells need.
+JOB_TIMEOUT = 900.0
 
 UA = "aitm-e2e-ua/1.0"
 XFF = "1.2.3.4"
@@ -69,7 +73,7 @@ def reflections(xss: list[dict]) -> tuple[list[dict], list[dict]]:
 def main() -> None:
     work = tempfile.mkdtemp(prefix="aitm-e2e-t2-mutable-")
     try:
-        with ScanTarget("vulnerable") as V, ScanTarget("patched") as P:
+        with boot_target("vulnerable") as V, boot_target("patched") as P:
             cfg = CoreConfig(proxy_port=free_port(), scope_entries=[V.authority, P.authority],
                              findings_dir=os.path.join(work, "findings"))
             with Aitm.server(cfg) as core:
@@ -88,7 +92,7 @@ def main() -> None:
                 section("V: header and cookie reflections are found")
                 seq_v = V.logs.reset()
                 job_v = start_job(op, "operator", target=V.base)["job"]
-                st = wait_terminal(op, "operator", job_v, timeout=900)
+                st = wait_terminal(op, "operator", job_v, timeout=JOB_TIMEOUT)
                 check(st.get("state") == "done", f"V job ended done (state={st.get('state')!r}, "
                                                  f"stopped_reason={st.get('stopped_reason')!r})")
                 xss_v = reflected(issues(op, "operator", job=job_v))
@@ -123,7 +127,7 @@ def main() -> None:
                 section("P: neither reflection is reported")
                 seq_p = P.logs.reset()
                 job_p = start_job(op, "operator", target=P.base)["job"]
-                st = wait_terminal(op, "operator", job_p, timeout=900)
+                st = wait_terminal(op, "operator", job_p, timeout=JOB_TIMEOUT)
                 check(st.get("state") == "done", f"P job ended done (state={st.get('state')!r}, "
                                                  f"stopped_reason={st.get('stopped_reason')!r})")
                 xss_p = reflected(issues(op, "operator", job=job_p))

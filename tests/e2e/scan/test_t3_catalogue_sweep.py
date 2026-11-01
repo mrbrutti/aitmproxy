@@ -43,8 +43,16 @@ from aitm_e2e import check, free_port, ok, repo_root, section, skip  # noqa: E40
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (ScanTarget, issues, require_lane, require_verbs,  # noqa: E402
-                           scan_call, start_job, wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    boot_target,
+    brief,
+    issues,
+    require_lane,
+    require_verbs,
+    scan_call,
+    start_job,
+    wait_terminal,
+)
 
 ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
 ID_RE = re.compile(r'id:\s*"([^"]+)"')
@@ -79,13 +87,6 @@ def script_ids() -> dict:
     return found
 
 
-def brief(iss, limit: int = 16) -> str:
-    rows = sorted({(i.get("class"), i.get("check_id"), (i.get("location") or {}).get("path"))
-                   for i in iss if isinstance(i, dict)})
-    shown = ", ".join(f"{c}/{cid}@{p}" for c, cid, p in rows[:limit])
-    return f"{len(rows)} kind(s): {shown}{' ...' if len(rows) > limit else ''}"
-
-
 def run_standard(op, target) -> tuple[list, int]:
     seq0 = target.logs.reset()
     job = start_job(op, "operator", target=target.base)["job"]
@@ -101,7 +102,7 @@ def main() -> None:
     ok(f"{len(declared)} bundled active script(s) declare "
        f"{sum(len(v) for v in declared.values())} check id(s) on disk")
 
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
+    with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
             ssl_insecure=True,
@@ -146,7 +147,7 @@ def main() -> None:
             for cls, path in sorted(SEEDED.items()):
                 hits = [i for i in by_class.get(cls, [])
                         if (i.get("location") or {}).get("path") == path]
-                check(hits, f"V: class {cls!r} found on {path} [{brief(iss_v)}]")
+                check(hits, f"V: class {cls!r} found on {path} [{brief(iss_v, 16)}]")
                 if cls == "sqli":
                     check(any(i.get("check_id") == "sqli" for i in hits),
                           "V: the /products sqli issue carries check_id 'sqli' "
@@ -162,7 +163,7 @@ def main() -> None:
             iss_p, seq_p = run_standard(op, p)
             leaked = sorted({i.get("class") for i in iss_p if i.get("class") in SEEDED})
             check(not leaked,
-                  f"P: none of the nine seeded classes (observed {leaked}) [{brief(iss_p)}]")
+                  f"P: none of the nine seeded classes (observed {leaked}) [{brief(iss_p, 16)}]")
             check(len(p.logs.scanner_requests(seq_p)) > 0,
                   "P was probed too: the clean result is the patch, not a missed target")
 

@@ -19,7 +19,6 @@ SKIP 77: serve binary missing, a missing `scan.start`/`scan.status`/`scan.issues
 """
 import json
 import os
-import re
 import secrets
 import shutil
 import sys
@@ -35,10 +34,11 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
     collect_push,
     issue,
     issues,
+    login_via_proxy,
     require_lane,
     require_verbs,
     scan_call,
@@ -47,19 +47,9 @@ from aitm_e2e.scan import (  # noqa: E402
     wait_terminal,
 )
 
-
-def login_via_proxy(proxy: int, base: str) -> str:
-    """`POST /login` through the proxy; returns the 32-hex session id (never printed)."""
-    r = via_proxy(proxy, "POST", base + "/login",
-                  headers={"Content-Type": "application/x-www-form-urlencoded"},
-                  body=b"user=alice&pass=wonderland")
-    check(r.status == 302, f"POST /login through the proxy -> 302 (got {r.status})")
-    headers = {k.lower(): v for k, v in r.headers.items()}
-    m = re.match(r"session=([0-9a-f]{32}); HttpOnly; Path=/$", headers.get("set-cookie") or "")
-    if not m:
-        fail("login did not answer with `Set-Cookie: session=<32 hex>; HttpOnly; Path=/`")
-    ok("login set a 32-hex HttpOnly session cookie")
-    return m.group(1)
+# The browser crawl drives a real obscura engine, so a T2 job runs far longer
+# than the 600 s the engine-only cells need.
+JOB_TIMEOUT = 900.0
 
 
 def sitemap_pages(op, job: str) -> list[dict]:
@@ -94,7 +84,7 @@ def main() -> None:
     work = tempfile.mkdtemp(prefix="aitm-e2e-t2-leak-")
     findings_dir = os.path.join(work, "findings")
     try:
-        with ScanTarget("vulnerable") as V:
+        with boot_target("vulnerable") as V:
             cfg = CoreConfig(proxy_port=free_port(), scope_entries=[V.authority], findings_dir=findings_dir)
             with Aitm.server(cfg) as core:
                 op = BusClient.operator(core)
@@ -105,7 +95,11 @@ def main() -> None:
                 sub = subscribe(BusClient.operator(core))
 
                 section("real session material through the proxy (values never printed)")
-                S = login_via_proxy(proxy, V.base)
+                try:
+                    S = login_via_proxy(proxy, V.base)
+                except RuntimeError as e:
+                    fail(str(e))
+                ok("POST /login through the proxy set a 32-hex HttpOnly session cookie")
                 cookie = {"Cookie": f"session={S}"}
                 r = via_proxy(proxy, "GET", V.base + "/account?tab=overview", headers=cookie)
                 check(r.status == 200, f"GET /account?tab=overview with the session -> 200 (got {r.status})")
@@ -123,9 +117,9 @@ def main() -> None:
                                 overrides={"session": {"mode": "observed"}})["job"]
                 lines: list[dict] = []
                 collector = threading.Thread(
-                    target=lambda: lines.extend(collect_push(sub, job, timeout=900)), daemon=True)
+                    target=lambda: lines.extend(collect_push(sub, job, timeout=JOB_TIMEOUT)), daemon=True)
                 collector.start()
-                st = wait_terminal(op, "operator", job, timeout=900)
+                st = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
                 collector.join(timeout=30)
                 ok(f"job {job} ended state={st.get('state')!r} stopped_reason={st.get('stopped_reason')!r}; "
                    f"{len(lines)} push lines collected")

@@ -34,32 +34,24 @@ from aitm_e2e import check, free_port, ok, section, skip  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
-from aitm_e2e.scan import (REFLECTED_XSS_CLASSES, ScanTarget, issues,  # noqa: E402
-                           require_lane, require_verbs, scan_call, start_job,
-                           wait_terminal)
+from aitm_e2e.scan import (  # noqa: E402
+    REFLECTED_XSS_CLASSES,
+    boot_target,
+    brief,
+    issues,
+    require_checks,
+    require_lane,
+    require_verbs,
+    scan_call,
+    start_job,
+    wait_terminal,
+)
 
 # The T3 check ids this cell needs in the live catalogue (parent spec D8.2). These are
 # CHECK ids, a vocabulary of their own; the issue class is `REFLECTED_XSS_CLASSES`.
 NEEDED_CHECKS = ("xss-reflected", "sqli")
 XSS_LABEL = "/".join(REFLECTED_XSS_CLASSES)
 JOB_TIMEOUT = 600.0
-
-
-def require_checks(op, ids) -> None:
-    """SKIP 77 naming every check id the live `scan.checks` catalogue lacks."""
-    live = {c.get("id") for c in (scan_call(op, "operator", "scan.checks", {}) or {}).get("checks", [])
-            if isinstance(c, dict)}
-    missing = [i for i in ids if i not in live]
-    if missing:
-        skip("missing check id " + ", ".join(missing) + " in scan.checks (T3 is not on this build)")
-
-
-def brief(iss, limit: int = 12) -> str:
-    """(class, check_id, path) triples of the issues, for a readable assertion line."""
-    rows = sorted({(i.get("class"), i.get("check_id"), (i.get("location") or {}).get("path"))
-                   for i in iss if isinstance(i, dict)})
-    shown = ", ".join(f"{c}/{cid}@{p}" for c, cid, p in rows[:limit])
-    return f"{len(rows)} kind(s): {shown}{' ...' if len(rows) > limit else ''}"
 
 
 def find(iss, cls, path: str) -> list:
@@ -79,7 +71,7 @@ def run_job(op, target, origin: str) -> tuple[str, dict]:
 
 
 def main() -> None:
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
+    with boot_target("vulnerable") as v, boot_target("patched") as p:
         if not v.tls_base or not p.tls_base:
             skip("the test target did not start a TLS listener (needs --tls-port; T10 D1)")
         cfg = CoreConfig(
@@ -93,7 +85,7 @@ def main() -> None:
             require_verbs(op, "scan.start", "scan.status", "scan.issues", "scan.issue",
                           "scan.checks", "flow.detail")
             require_lane(op, "http")
-            require_checks(op, NEEDED_CHECKS)
+            require_checks(op, *NEEDED_CHECKS)
 
             section("the job runs over the target's h2 TLS listener (V)")
             job_v, ctx = run_job(op, v, v.tls_base)

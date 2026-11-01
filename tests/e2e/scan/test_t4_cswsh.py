@@ -27,33 +27,32 @@ Exit 0 pass / 1 fail / 77 skip. Tokens are never printed.
 
 from __future__ import annotations
 
-import base64
-import http.client
 import json
-import os
 import secrets
-import socket
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aitm_e2e import check, free_port, ok, section  # noqa: E402
-from aitm_e2e.bus import BusClient, BusError  # noqa: E402
+from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    WS_CSWSH_CLASS,
     ScanTarget,
+    WS_CSWSH_CLASS,
+    WsClientWithHeaders,
+    boot_target,
     issues,
+    login,
     require_lane,
     require_verbs,
     start_job,
     wait_terminal,
 )
-from aitm_e2e.ws import WsClient  # noqa: E402
 
 RUN = secrets.token_hex(6)
+JOB_TIMEOUT = 600.0
 FOREIGN_ORIGIN = "http://evil.example"
 
 
@@ -62,62 +61,12 @@ def _authority_parts(authority: str) -> tuple[str, int]:
     return host, int(port)
 
 
-def _login(authority: str) -> str:
-    """`POST /login` with the seeded credentials; return the `session` cookie id."""
-    host, port = _authority_parts(authority)
-    conn = http.client.HTTPConnection(host, port, timeout=5)
-    try:
-        conn.request("POST", "/login", body="user=alice&pass=wonderland",
-                     headers={"Content-Type": "application/x-www-form-urlencoded"})
-        resp = conn.getresponse()
-        setc = resp.getheader("Set-Cookie") or ""
-        resp.read()
-    finally:
-        conn.close()
-    if "session=" not in setc:
-        raise RuntimeError(f"login did not set a session cookie: {setc!r}")
-    return setc.split("session=", 1)[1].split(";", 1)[0]
-
-
-class _WsClientWithHeaders(WsClient):
-    """A `WsClient` that adds `Origin` and `Cookie` to the proxied upgrade, and keeps
-    the `Sec-WebSocket-Key` it sent so the cell can compare it to the lane's dials."""
-
-    def __init__(self, proxy_host, proxy_port, origin_host, origin_port, path="/",
-                 *, cookie: str | None = None, origin: str | None = None):
-        self.sent_key = base64.b64encode(os.urandom(16)).decode()
-        self.sock = socket.create_connection((proxy_host, proxy_port), timeout=10)
-        self.rd = self.sock.makefile("rb")
-        target = f"http://{origin_host}:{origin_port}{path}"
-        lines = [
-            f"GET {target} HTTP/1.1",
-            f"Host: {origin_host}:{origin_port}",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            f"Sec-WebSocket-Key: {self.sent_key}",
-            "Sec-WebSocket-Version: 13",
-        ]
-        if origin is not None:
-            lines.append(f"Origin: {origin}")
-        if cookie is not None:
-            lines.append(f"Cookie: {cookie}")
-        req = "\r\n".join(lines) + "\r\n\r\n"
-        self.sock.sendall(req.encode())
-        status = self.rd.readline().decode().strip()
-        if "101" not in status:
-            raise BusError(f"ws upgrade failed: {status!r} {self.rd.read(400)!r}")
-        while True:
-            line = self.rd.readline()
-            if line in (b"\r\n", b"\n", b""):
-                break
-
-
 def _authed_conversation(proxy_port: int, authority: str, cookie: str) -> str:
     """Hold one authenticated echo conversation through the proxy; return the sent key."""
     host, port = _authority_parts(authority)
     origin = f"http://{authority}"
-    client = _WsClientWithHeaders("127.0.0.1", proxy_port, host, port, "/ws",
-                                  cookie=f"session={cookie}", origin=origin)
+    client = WsClientWithHeaders("127.0.0.1", proxy_port, host, port, "/ws",
+                                 extra_headers={"Origin": origin, "Cookie": f"session={cookie}"})
     try:
         _opcode, hello = client.recv()
         try:
@@ -129,7 +78,7 @@ def _authed_conversation(proxy_port: int, authority: str, cookie: str) -> str:
         client.recv()
     finally:
         client.close()
-    return client.sent_key
+    return client.key
 
 
 def _ws_handshakes_since(target: ScanTarget, seq0: int) -> list[dict]:
@@ -139,7 +88,7 @@ def _ws_handshakes_since(target: ScanTarget, seq0: int) -> list[dict]:
 
 def main() -> int:
     section("AC T4-2: CSWSH found on V (ws-cswsh, certain), not on P; key regenerated, cookie kept")
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
+    with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
             browser_proxy_port=free_port(),
@@ -151,7 +100,7 @@ def main() -> int:
             require_lane(op, "ws")
 
             section("V: authenticated baseline conversation, then the ws-lane job")
-            v_cookie = _login(v.authority)
+            v_cookie = login(f"http://{v.authority}")
             v_key = _authed_conversation(core.cfg.proxy_port, v.authority, v_cookie)
             v_origin = f"http://{v.authority}"
             v_seq0 = v.logs.reset()
@@ -159,7 +108,10 @@ def main() -> int:
                               profile={"name": f"e2e-t4-cswsh-v-{RUN}",
                                        "target": {"origins": [v.base]},
                                        "lanes": ["ws"]})["job"]
-            wait_terminal(op, "operator", v_job)
+            v_final = wait_terminal(op, "operator", v_job, timeout=JOB_TIMEOUT)
+            check(v_final.get("state") == "done",
+                  f"V: the ws job finished done (state={v_final.get('state')!r}, "
+                  f"stopped_reason={v_final.get('stopped_reason')!r})")
             v_cswsh = [i for i in issues(op, "operator", job=v_job) if i.get("class") == WS_CSWSH_CLASS]
             check(len(v_cswsh) >= 1, f"V: a {WS_CSWSH_CLASS} issue was raised ({len(v_cswsh)})")
             check(all(i.get("confidence") == "certain" for i in v_cswsh),
@@ -177,7 +129,7 @@ def main() -> int:
                   f"kept the session cookie, and was accepted ({len(lane_hs)} of {len(v_hs)})")
 
             section("P: the same dial is rejected (403) and no ws-cswsh issue is raised")
-            p_cookie = _login(p.authority)
+            p_cookie = login(f"http://{p.authority}")
             _authed_conversation(core.cfg.proxy_port, p.authority, p_cookie)
             p_origin = f"http://{p.authority}"
             p_seq0 = p.logs.reset()
@@ -185,7 +137,10 @@ def main() -> int:
                               profile={"name": f"e2e-t4-cswsh-p-{RUN}",
                                        "target": {"origins": [p.base]},
                                        "lanes": ["ws"]})["job"]
-            wait_terminal(op, "operator", p_job)
+            p_final = wait_terminal(op, "operator", p_job, timeout=JOB_TIMEOUT)
+            check(p_final.get("state") == "done",
+                  f"P: the ws job finished done (state={p_final.get('state')!r}, "
+                  f"stopped_reason={p_final.get('stopped_reason')!r})")
             p_cswsh = [i for i in issues(op, "operator", job=p_job) if i.get("class") == WS_CSWSH_CLASS]
             check(len(p_cswsh) == 0,
                   f"P: no {WS_CSWSH_CLASS} issue (patched rejects the foreign Origin) ({len(p_cswsh)})")

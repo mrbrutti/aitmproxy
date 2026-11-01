@@ -28,13 +28,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aitm_e2e import check, fail, free_port, ok, section, skip  # noqa: E402
+from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     REFLECTED_XSS_CLASSES,
-    ScanTarget,
+    boot_target,
     issue,
     issues,
     require_verbs,
@@ -92,10 +92,7 @@ def main() -> int:
     target = core = core2 = op = op2 = None
     try:
         section("arrange: vulnerable target + own core on free ports")
-        try:
-            target = ScanTarget("vulnerable")
-        except FileNotFoundError as e:
-            skip(str(e))
+        target = boot_target("vulnerable")
         cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
                          scope_entries=[target.authority], findings_dir=findings_dir)
         core = Aitm.server(cfg)

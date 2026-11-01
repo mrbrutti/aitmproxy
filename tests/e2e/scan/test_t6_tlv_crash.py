@@ -31,8 +31,8 @@ SKIPs 77 (never a FAIL):
   * the core does not advertise the `scan.*` verbs this cell calls;
   * `scan.checks` lists no check for the `l4_stream` lane (the T6 lane has not
     landed on this build);
-  * `aitm-testtarget-serve` / `aitm` are not built (FileNotFoundError -> FAIL
-    with the build command, as in the sibling cells).
+  * `aitm-testtarget-serve` is not built (`boot_target` SKIPs 77 naming the build
+    command, the same way in every cell).
 
 Exit 0 pass / 1 fail / 77 skip. Never prints a token.
 """
@@ -50,12 +50,13 @@ from aitm_e2e.config import CoreConfig, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     ScanTarget,
+    boot_target,
     issue,
     issues,
+    l4_endpoint,
     require_lane,
     require_verbs,
-    start_job,
-    wait_terminal,
+    run_to_terminal,
 )
 
 SERVICE = "l4-tlv-crash"
@@ -63,37 +64,30 @@ GRAMMAR = "tlv"
 # Three well-formed TLV frames (u16 BE length + payload): "a", "ab", "abc".
 SEEDS = [{"hex": "000161"}, {"hex": "00026162"}, {"hex": "0003616263"}]
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.issue", "scan.checks")
+# A bounded L4 stream job against one local speaker; 300 s is generous for it.
 JOB_TIMEOUT = 300.0
-
-
-def endpoint(target: ScanTarget, name: str) -> dict:
-    """`{ip, port, proto, grammar}` for one `/services` l4 row (`addr` is `127.0.0.1:PORT`)."""
-    row = target.service(name)
-    host, _, port = str(row["addr"]).rpartition(":")
-    return {"ip": host, "port": int(port), "proto": row["proto"], "grammar": GRAMMAR}
 
 
 def run_job(op: BusClient, target: ScanTarget) -> dict:
     """Start the TLV stream job against `target` and return its terminal JobStatus."""
-    started = start_job(
-        op, "operator",
+    job, final = run_to_terminal(
+        op, "operator", timeout=JOB_TIMEOUT,
         profile_name="l4-stream-safe",
-        overrides={"target": {"l4": [endpoint(target, SERVICE)]}, "l4": {"seeds": SEEDS}},
+        overrides={"target": {"l4": [l4_endpoint(target, SERVICE, GRAMMAR)]}, "l4": {"seeds": SEEDS}},
         confirm=True,
     )
-    job = started.get("job")
-    check(isinstance(job, str) and job != "", f"scan.start returned a job id (got {job!r})")
-    return wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
+    ok(f"scan.start returned a job id ({job})")
+    return final
 
 
 def main() -> int:
     vuln = patched = core = op = None
     try:
         section("1. the seeded TLV speaker, in both modes, and a core with the L4 inject scope")
-        vuln = ScanTarget("vulnerable", l4=True)
-        patched = ScanTarget("patched", l4=True)
-        v_ep = endpoint(vuln, SERVICE)
-        p_ep = endpoint(patched, SERVICE)
+        vuln = boot_target("vulnerable", l4=True)
+        patched = boot_target("patched", l4=True)
+        v_ep = l4_endpoint(vuln, SERVICE, GRAMMAR)
+        p_ep = l4_endpoint(patched, SERVICE, GRAMMAR)
         ok(f"vulnerable {SERVICE} on {v_ep['ip']}:{v_ep['port']} ({v_ep['proto']}), "
            f"patched on {p_ep['ip']}:{p_ep['port']}")
         check(v_ep["proto"] == "tcp", f"{SERVICE} is a TCP service (got {v_ep['proto']!r})")

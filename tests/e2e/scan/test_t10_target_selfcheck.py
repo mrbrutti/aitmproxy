@@ -62,7 +62,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aitm_e2e import check, fail, ok, section, skip  # noqa: E402
-from aitm_e2e.scan import ScanTarget, boot_target, until  # noqa: E402
+from aitm_e2e.scan import ScanTarget, boot_target, split_addr, until  # noqa: E402
 from aitm_e2e.tls import curl, curl_http_version, have  # noqa: E402
 from aitm_e2e.ws import ws_encode, ws_read_frame  # noqa: E402
 
@@ -192,8 +192,7 @@ def text(body: bytes) -> str:
 
 
 def addr_of(target: ScanTarget, name: str) -> tuple[str, int]:
-    host, _, port = str(target.service(name)["addr"]).rpartition(":")
-    return host, int(port)
+    return split_addr(str(target.service(name)["addr"]))
 
 
 # ---------------------------------------------------------------------------

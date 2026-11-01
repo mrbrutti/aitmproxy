@@ -19,7 +19,6 @@ SKIP 77: serve binary missing, a missing `scan.start`/`scan.status` verb, or no
 `http` lane in `scan.checks`.
 """
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -33,28 +32,19 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
+    login_via_proxy,
     require_lane,
     require_verbs,
     start_job,
     wait_terminal,
 )
 
+# The browser crawl drives a real obscura engine, so a T2 job runs far longer
+# than the 600 s the engine-only cells need.
+JOB_TIMEOUT = 900.0
+
 ARMED = 20
-
-
-def login_via_proxy(proxy: int, base: str) -> str:
-    """`POST /login` through the proxy; returns the 32-hex session id (never printed)."""
-    r = via_proxy(proxy, "POST", base + "/login",
-                  headers={"Content-Type": "application/x-www-form-urlencoded"},
-                  body=b"user=alice&pass=wonderland")
-    check(r.status == 302, f"POST /login through the proxy -> 302 (got {r.status})")
-    headers = {k.lower(): v for k, v in r.headers.items()}
-    m = re.match(r"session=([0-9a-f]{32}); HttpOnly; Path=/$", headers.get("set-cookie") or "")
-    if not m:
-        fail("login did not answer with `Set-Cookie: session=<32 hex>; HttpOnly; Path=/`")
-    ok("login set a 32-hex HttpOnly session cookie")
-    return m.group(1)
 
 
 def with_session(e: dict) -> bool:
@@ -64,7 +54,7 @@ def with_session(e: dict) -> bool:
 def main() -> None:
     work = tempfile.mkdtemp(prefix="aitm-e2e-t2-session-lost-")
     try:
-        with ScanTarget("vulnerable") as V:
+        with boot_target("vulnerable") as V:
             cfg = CoreConfig(proxy_port=free_port(), scope_entries=[V.authority],
                              findings_dir=os.path.join(work, "findings"))
             with Aitm.server(cfg) as core:
@@ -74,7 +64,11 @@ def main() -> None:
                 proxy = cfg.proxy_port
 
                 section("real login, authenticated GET /account, arm /logout-after, GET /account again")
-                sid = login_via_proxy(proxy, V.base)
+                try:
+                    sid = login_via_proxy(proxy, V.base)
+                except RuntimeError as e:
+                    fail(str(e))
+                ok("POST /login through the proxy set a 32-hex HttpOnly session cookie")
                 cookie = {"Cookie": f"session={sid}"}
                 r = via_proxy(proxy, "GET", V.base + "/account?tab=overview", headers=cookie)
                 check(r.status == 200, f"GET /account?tab=overview with the session -> 200 (got {r.status})")
@@ -88,7 +82,7 @@ def main() -> None:
                 seq0 = V.logs.reset()
                 job = start_job(op, "operator", target=V.base,
                                 overrides={"session": {"mode": "observed"}})["job"]
-                st = wait_terminal(op, "operator", job, timeout=900)
+                st = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
                 ok(f"job {job} ended state={st.get('state')!r} phase={st.get('phase')!r} "
                    f"probes.sent={(st.get('probes') or {}).get('sent')}")
                 check(st.get("state") in ("done", "failed", "cancelled"), "job reached a terminal state")

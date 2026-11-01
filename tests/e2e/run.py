@@ -31,7 +31,6 @@ Usage:
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import shutil
@@ -288,14 +287,23 @@ def print_ledger(ledger_dir: str) -> None:
     called it and at which role, `UNCALLED` otherwise, then `called/total`. Cells
     write `$AITM_E2E_LEDGER_DIR/<cell>.json` via aitm_e2e.scan.ledger_flush(). A
     called verb that is NOT in the contract is still listed, flagged, so a call the
-    contract does not know about is never hidden (it does not count toward total)."""
+    contract does not know about is never hidden (it does not count toward total).
+
+    The roll-up is a REPORT, not a gate: anything that goes wrong reading it prints
+    one line and leaves the run's own pass/skip/fail summary standing."""
+    try:
+        _print_ledger(ledger_dir)
+    except Exception as e:  # noqa: BLE001  (never let a report break the run)
+        print(f"ledger: could not print ({e})", flush=True)
+
+
+def _print_ledger(ledger_dir: str) -> None:
     if E2E_DIR not in sys.path:
         sys.path.insert(0, E2E_DIR)
-    from aitm_e2e.scan import ROLES, expected_scan_verbs, ledger_flush  # noqa: E402
+    # The runner is not a cell: it records no scan call, and aitm_e2e.scan's atexit
+    # flush is silent with nothing recorded, so importing it here changes no output.
+    from aitm_e2e.scan import ROLES, expected_scan_verbs  # noqa: E402
 
-    # importing aitm_e2e.scan registers the per-CELL atexit flush; the runner is
-    # not a cell (it only reads the ledger), so drop that hook here.
-    atexit.unregister(ledger_flush)
     expected = expected_scan_verbs()
     calls: dict[str, dict[str, list[str]]] = {}
     for name in sorted(os.listdir(ledger_dir)):

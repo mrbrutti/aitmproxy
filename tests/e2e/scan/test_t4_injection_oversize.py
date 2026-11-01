@@ -28,25 +28,24 @@ Exit 0 pass / 1 fail / 77 skip. Tokens are never printed.
 
 from __future__ import annotations
 
-import base64
-import http.client
 import json
-import os
 import secrets
-import socket
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aitm_e2e import check, free_port, ok, section  # noqa: E402
-from aitm_e2e.bus import BusClient, BusError  # noqa: E402
+from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    WS_INJECTION_CLASS,
     ScanTarget,
+    WS_INJECTION_CLASS,
+    WsClientWithHeaders,
+    boot_target,
     issues,
+    login,
     require_lane,
     require_verbs,
     start_job,
@@ -55,58 +54,13 @@ from aitm_e2e.scan import (  # noqa: E402
 from aitm_e2e.ws import WsClient  # noqa: E402
 
 RUN = secrets.token_hex(6)
+JOB_TIMEOUT = 600.0
 MSG_LEN = 200  # the `msg` field length L the cell injects
 
 
 def _authority_parts(authority: str) -> tuple[str, int]:
     host, port = authority.rsplit(":", 1)
     return host, int(port)
-
-
-def _login(authority: str) -> str:
-    host, port = _authority_parts(authority)
-    conn = http.client.HTTPConnection(host, port, timeout=5)
-    try:
-        conn.request("POST", "/login", body="user=alice&pass=wonderland",
-                     headers={"Content-Type": "application/x-www-form-urlencoded"})
-        resp = conn.getresponse()
-        setc = resp.getheader("Set-Cookie") or ""
-        resp.read()
-    finally:
-        conn.close()
-    if "session=" not in setc:
-        raise RuntimeError(f"login did not set a session cookie: {setc!r}")
-    return setc.split("session=", 1)[1].split(";", 1)[0]
-
-
-class _WsClientWithHeaders(WsClient):
-    """A `WsClient` that adds `Cookie` to the proxied upgrade (P requires a session)."""
-
-    def __init__(self, proxy_host, proxy_port, origin_host, origin_port, path="/",
-                 *, cookie: str | None = None):
-        self.sent_key = base64.b64encode(os.urandom(16)).decode()
-        self.sock = socket.create_connection((proxy_host, proxy_port), timeout=10)
-        self.rd = self.sock.makefile("rb")
-        target = f"http://{origin_host}:{origin_port}{path}"
-        lines = [
-            f"GET {target} HTTP/1.1",
-            f"Host: {origin_host}:{origin_port}",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            f"Sec-WebSocket-Key: {self.sent_key}",
-            "Sec-WebSocket-Version: 13",
-        ]
-        if cookie is not None:
-            lines.append(f"Cookie: {cookie}")
-        req = "\r\n".join(lines) + "\r\n\r\n"
-        self.sock.sendall(req.encode())
-        status = self.rd.readline().decode().strip()
-        if "101" not in status:
-            raise BusError(f"ws upgrade failed: {status!r} {self.rd.read(400)!r}")
-        while True:
-            line = self.rd.readline()
-            if line in (b"\r\n", b"\n", b""):
-                break
 
 
 def _echo(client) -> None:
@@ -128,7 +82,7 @@ def _max_in_frame_len(target: ScanTarget) -> int:
 
 def main() -> int:
     section("AC T4-3: ws-injection on V not P; one ws-oversize-frame at 2x max")
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
+    with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
             browser_proxy_port=free_port(),
@@ -153,7 +107,10 @@ def main() -> int:
                               profile={"name": f"e2e-t4-inj-v-{RUN}",
                                        "target": {"origins": [v.base]},
                                        "lanes": ["ws"]})["job"]
-            wait_terminal(op, "operator", v_job)
+            v_final = wait_terminal(op, "operator", v_job, timeout=JOB_TIMEOUT)
+            check(v_final.get("state") == "done",
+                  f"V: the ws job finished done (state={v_final.get('state')!r}, "
+                  f"stopped_reason={v_final.get('stopped_reason')!r})")
             v_issues = issues(op, "operator", job=v_job)
             v_refl = [i for i in v_issues if i.get("class") == WS_INJECTION_CLASS]
             check(len(v_refl) >= 1, f"V: a {WS_INJECTION_CLASS} issue was raised ({len(v_refl)})")
@@ -171,10 +128,10 @@ def main() -> int:
                   f"ws-oversize-frame contributes at most one issue per job ({len(v_oversize_issues)})")
 
             section("P: HTML-escaped, so no ws-injection")
-            p_cookie = _login(p.authority)
+            p_cookie = login(f"http://{p.authority}")
             phost, pport = _authority_parts(p.authority)
-            pc = _WsClientWithHeaders("127.0.0.1", core.cfg.proxy_port, phost, pport, "/ws",
-                                      cookie=f"session={p_cookie}")
+            pc = WsClientWithHeaders("127.0.0.1", core.cfg.proxy_port, phost, pport, "/ws",
+                                     extra_headers={"Cookie": f"session={p_cookie}"})
             try:
                 _echo(pc)
             finally:
@@ -184,7 +141,10 @@ def main() -> int:
                               profile={"name": f"e2e-t4-inj-p-{RUN}",
                                        "target": {"origins": [p.base]},
                                        "lanes": ["ws"]})["job"]
-            wait_terminal(op, "operator", p_job)
+            p_final = wait_terminal(op, "operator", p_job, timeout=JOB_TIMEOUT)
+            check(p_final.get("state") == "done",
+                  f"P: the ws job finished done (state={p_final.get('state')!r}, "
+                  f"stopped_reason={p_final.get('stopped_reason')!r})")
             p_refl = [i for i in issues(op, "operator", job=p_job) if i.get("class") == WS_INJECTION_CLASS]
             check(len(p_refl) == 0,
                   f"P: no {WS_INJECTION_CLASS} issue (reflection is escaped) ({len(p_refl)})")

@@ -14,6 +14,8 @@ Observers: BOTH targets' control logs (`TargetLogs.scanner_requests`).
 
 SKIPs 77 when the live core lacks `scan.start` / `scan.status`.
 """
+import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -26,7 +28,7 @@ from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
-    ScanTarget,
+    boot_target,
     require_verbs,
     scan_error_code,
     scan_try,
@@ -35,57 +37,60 @@ from aitm_e2e.scan import (  # noqa: E402
 )
 
 PROBE_BUDGET = 50
-TERMINAL_TIMEOUT_S = 600.0
+JOB_TIMEOUT = 600.0
 
 
 def main() -> None:
-    with ScanTarget("vulnerable") as v, ScanTarget("patched") as p:
-        findings_dir = tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-scope-")
-        # Only V is in scope. P is booted and reachable, but out of scope.
-        cfg = CoreConfig(
-            proxy_port=free_port(),
-            scope_entries=[v.authority],
-            findings_dir=findings_dir,
-        )
-        with Aitm.server(cfg) as core:
-            op = BusClient.operator(core)
-            require_verbs(op, "scan.start", "scan.status")
+    work = tempfile.mkdtemp(prefix="aitm-e2e-scan-t1-scope-")
+    try:
+        with boot_target("vulnerable") as v, boot_target("patched") as p:
+            findings_dir = os.path.join(work, "findings")
+            # Only V is in scope. P is booted and reachable, but out of scope.
+            cfg = CoreConfig(
+                proxy_port=free_port(),
+                scope_entries=[v.authority],
+                findings_dir=findings_dir,
+            )
+            with Aitm.server(cfg) as core:
+                op = BusClient.operator(core)
+                require_verbs(op, "scan.start", "scan.status")
 
-            section("an out-of-scope origin is refused before any socket is opened")
-            status, payload = scan_try(op, "operator", "scan.start", {"target": p.base})
-            check(status == "error",
-                  f"scan.start on the out-of-scope origin was refused "
-                  f"(got {status!r}: {payload!r})")
-            code = scan_error_code(str(payload))
-            check(code == "out_of_scope",
-                  f"the refusal carries the D3 code out_of_scope, got {code!r} "
-                  f"from {payload!r}")
-            p_reqs = p.logs.scanner_requests(0)
-            check(p_reqs == [],
-                  f"the out-of-scope target recorded zero requests "
-                  f"(its own log holds {len(p_reqs)})")
+                section("an out-of-scope origin is refused before any socket is opened")
+                status, payload = scan_try(op, "operator", "scan.start", {"target": p.base})
+                check(status == "error",
+                      f"scan.start on the out-of-scope origin was refused "
+                      f"(got {status!r}: {payload!r})")
+                code = scan_error_code(str(payload))
+                check(code == "out_of_scope",
+                      f"the refusal carries the D3 code out_of_scope, got {code!r} "
+                      f"from {payload!r}")
+                p_reqs = p.logs.scanner_requests(0)
+                check(p_reqs == [],
+                      f"the out-of-scope target recorded zero requests "
+                      f"(its own log holds {len(p_reqs)})")
 
-            section(f"an in-scope job with budget.probes = {PROBE_BUDGET} stops on budget")
-            seq0 = v.logs.reset()
-            job = start_job(op, "operator", target=v.base,
-                            overrides={"budget": {"probes": PROBE_BUDGET}})["job"]
-            try:
-                final = wait_terminal(op, "operator", job, timeout=TERMINAL_TIMEOUT_S)
-            except TimeoutError as e:
-                fail(str(e))
-                return
-            check(final.get("stopped_reason") == "budget",
-                  f"stopped_reason is budget, got {final.get('stopped_reason')!r} "
-                  f"(state={final.get('state')!r})")
-            sent = (final.get("probes") or {}).get("sent")
-            check(isinstance(sent, int) and sent <= PROBE_BUDGET,
-                  f"probes.sent ({sent!r}) <= the requested budget {PROBE_BUDGET}")
+                section(f"an in-scope job with budget.probes = {PROBE_BUDGET} stops on budget")
+                seq0 = v.logs.reset()
+                job = start_job(op, "operator", target=v.base,
+                                overrides={"budget": {"probes": PROBE_BUDGET}})["job"]
+                try:
+                    final = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
+                except TimeoutError as e:
+                    fail(str(e))
+                check(final.get("stopped_reason") == "budget",
+                      f"stopped_reason is budget, got {final.get('stopped_reason')!r} "
+                      f"(state={final.get('state')!r})")
+                sent = (final.get("probes") or {}).get("sent")
+                check(isinstance(sent, int) and sent <= PROBE_BUDGET,
+                      f"probes.sent ({sent!r}) <= the requested budget {PROBE_BUDGET}")
 
-            v_reqs = v.logs.scanner_requests(seq0)
-            check(len(v_reqs) <= PROBE_BUDGET,
-                  f"the target's own log counts {len(v_reqs)} request(s) for the job "
-                  f"(<= {PROBE_BUDGET})")
-            op.close()
+                v_reqs = v.logs.scanner_requests(seq0)
+                check(len(v_reqs) <= PROBE_BUDGET,
+                      f"the target's own log counts {len(v_reqs)} request(s) for the job "
+                      f"(<= {PROBE_BUDGET})")
+                op.close()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":
