@@ -1091,6 +1091,28 @@ anyone here: `CaptureAdvice.swift`, `CaptureCapability.swift`, `Package.swift`, 
   CA to be trusted on his Mac, in his own words; until then TR-AC17 is proved in its not-trusted
   form only and Shipped says so.
 
+## Coordinator contract for Task 1c (orchestrator, 2026-11-01, GO on the four Kit files)
+
+- Files held by this session: `AitmproxyKit/FlowSummary.swift`, `Flow.swift`, `FlowDetail.swift`,
+  `FlowDetail+Wire.swift` and their tests (last written by #195 and #212; improve-loop's S-080 only
+  consumes them: `Session.swift` counters region, `StatusBar.swift`, `Panels/OverviewPanel.swift`).
+- Wire contract (spec `2026-10-31-per-host-decryption-design.md` D7/D9): the wire `tunnelled` mark is
+  retired; `tls` derives from `tunnel` (decrypted / passthrough / failed with `tunnel_reason`); failed
+  rows have `status` null, established ones 200, `duration_ms` on close; pushes arrive as `created`
+  then `response`; request counters exclude tunnel rows (improve-loop owns the counters).
+- Add-to-Scope is offered only when `tunnel == passthrough && tunnel_reason == out_of_scope`, or
+  `passive == true`; never on `pinned`. (The per-row offer is improve-loop's inspector; the banner's
+  `Add Host…` button follows the Scope fact, not a row.)
+- `proxy.status.decrypt.advice` is quoted verbatim whenever present; the fallback strings are only
+  for a core that lacks the field.
+- Definition of ready (unchanged): real app over the real bus against a core at or after 448e75e
+  (installed 0.5.9 or a dev bundle with that core): empty Scope + `curl -k` to an https host shows a
+  passthrough row with reason `out_of_scope`; `scope.add` that host and the next connection shows
+  decrypted; a client that rejects the MITM certificate shows failed / `client_rejected_certificate`.
+  No fixture or sample-data evidence anywhere; the PR body states the live proof; the stage-6 panel
+  comment (security / quality / spec + dispositions) is on the PR; then "ready <sha>" to the
+  orchestrator with main merged in.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
