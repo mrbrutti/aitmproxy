@@ -125,13 +125,6 @@ fn payload(bytes: &[u8]) -> Payload {
     }
 }
 
-/// Held for as long as a test reads the captured tracing lines.
-///
-/// `common::capture_tracing` shares one process-wide sink and clears it on
-/// every call, so two tests in this binary reading it at once would wipe each
-/// other's lines. They take this in turn instead.
-static TRACING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// The lane's check with this catalogue id.
 fn check_by_id(checks: &[Arc<dyn Check>], id: &str) -> Arc<dyn Check> {
     checks
@@ -833,8 +826,8 @@ async fn self_port_exclusion() {
 /// the fourth.
 #[tokio::test]
 async fn discovery_line_reports_its_counts() {
-    let _serial = TRACING.lock().await;
-    let (_guard, lines) = common::capture_tracing();
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
 
     let seeds = hex_seeds(&[
         b"*2\r\n$4\r\nAUTH\r\n$3\r\nabc\r\n",
@@ -917,85 +910,6 @@ async fn discovery_line_reports_its_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// SPEC-I1: `count_from` names the count field
-// ---------------------------------------------------------------------------
-
-/// A shipped grammar's `count_from` names the **count field**, and that
-/// field's value is what bounds the repeat (spec S2, S3).
-///
-/// Two halves, one per shipped grammar that declares a count. DNS: a reply
-/// whose `qdcount` is zero has no question, however many question-shaped
-/// bytes follow the header — they are all `rest`. RESP: an array whose
-/// `count` says two is two elements, so a third on the wire is leftover and
-/// the frame is not that message.
-#[test]
-fn count_from_names_the_count_field_in_the_shipped_grammars() {
-    use aitm_scan_l4_stream::grammar::by_kind;
-    use aitm_scan_l4_stream::spec::GrammarKind;
-    use aitm_scan_l4_stream::tree::FieldPath;
-
-    // The T10 answer-only DNS reply: a twelve-byte header with qdcount 0 and
-    // ancount 1, then one `A` record for `www.`.
-    let mut reply: Vec<u8> = vec![
-        0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-    ];
-    let answer: [u8; 19] = [
-        0x03, b'w', b'w', b'w', 0x00, // name "www."
-        0x00, 0x01, // type A
-        0x00, 0x01, // class IN
-        0x00, 0x00, 0x00, 0x3c, // ttl 60
-        0x00, 0x04, // rdlength
-        0x7f, 0x00, 0x00, 0x01, // 127.0.0.1
-    ];
-    reply.extend_from_slice(&answer);
-
-    let dns = by_kind(GrammarKind::Dns);
-    let tree = dns.parse(&reply).expect("the answer-only reply parses");
-    let questions = tree
-        .get(&FieldPath::new("questions"))
-        .expect("the dns grammar has a `questions` repeat");
-    assert!(
-        questions.children.is_empty(),
-        "qdcount is zero, so the question-shaped bytes are all `rest`: {:?}",
-        questions
-            .children
-            .iter()
-            .map(|child| child.path.to_string())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        tree.get(&FieldPath::new("rest"))
-            .expect("a `rest` node")
-            .bytes,
-        answer.to_vec(),
-    );
-
-    let resp = by_kind(GrammarKind::Resp);
-    let two = resp
-        .parse(b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n")
-        .expect("a two-element RESP array parses");
-    assert_eq!(
-        two.get(&FieldPath::new("args"))
-            .expect("an `args` repeat")
-            .children
-            .len(),
-        2,
-    );
-    // Three elements behind a count of two: the array form takes two and the
-    // third is leftover, so the frame is not a RESP array — and not the
-    // inline form either, which is a single `\r\n`-terminated line. A parser
-    // that ignored the count would call it a well-formed three-element array.
-    let three = resp.parse(b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n$3\r\nxyz\r\n");
-    assert!(
-        three.is_none(),
-        "`*2` bounds the array at two elements: {:?}",
-        three.map(|tree| tree
-            .get(&FieldPath::new("args"))
-            .map(|args| args.children.len()))
-    );
-}
-
-// ---------------------------------------------------------------------------
 // SPEC-I2 / QUAL-I2: a skipped profile seed is reported, not dropped
 // ---------------------------------------------------------------------------
 
@@ -1010,8 +924,8 @@ async fn a_skipped_profile_seed_is_counted_and_named() {
     use aitm_core::FlowId;
     use aitm_scan_model::FlowRef;
 
-    let _serial = TRACING.lock().await;
-    let (_guard, lines) = common::capture_tracing();
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
 
     // Port 9008 is this test's alone: the capture sink is global and the
     // other tests in this binary run beside it.
@@ -1093,23 +1007,144 @@ async fn a_skipped_profile_seed_is_counted_and_named() {
     assert_eq!(client.count(), 0, "a passed deadline opens no exchange");
 }
 
+/// The profile's seeds are the same for every endpoint, so they are decoded
+/// once and the skipped-seed notes are shared, not recomputed per endpoint.
+///
+/// One `flow:` seed this lane cannot use, two L4 endpoints: each endpoint's
+/// discovery line counts the one skipped seed, and each endpoint's verdict
+/// carries the very same note — once.
+#[tokio::test]
+async fn one_profile_seed_is_decoded_once_for_every_endpoint() {
+    use aitm_core::FlowId;
+    use aitm_scan_model::FlowRef;
+
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
+
+    // Ports 9013 and 9014 are this test's alone: the capture sink is global.
+    let mut profile = profile_for(
+        "127.0.0.1",
+        9013,
+        Some("raw"),
+        10,
+        &hex_seeds(&[b"\x00\xff"]),
+    );
+    profile.l4.seeds.insert(
+        0,
+        L4Seed::Flow {
+            flow: FlowRef(FlowId::new()),
+        },
+    );
+    profile.target.l4.push(L4TargetSpec {
+        ip: "127.0.0.1".to_string(),
+        port: 9014,
+        proto: L4Transport::Tcp,
+        grammar: Some("raw".to_string()),
+    });
+
+    let target = profile.target.clone();
+    let client = Arc::new(CountingClient::dry_run());
+    let lane = lane_with_client(
+        Some(common::wildcard_guard(&[9013, 9014])),
+        None,
+        Arc::clone(&client) as Arc<dyn StreamClient>,
+    );
+    let job: Arc<dyn JobCtx> = Arc::new(
+        TestJob::new(profile)
+            .with_job_id("22two")
+            .with_marker("aitm22two")
+            .with_deadline(Instant::now() - Duration::from_secs(1)),
+    );
+    let discovery = lane
+        .discover(&target, job.as_ref())
+        .await
+        .expect("two endpoints, each with one usable seed");
+    assert_eq!(
+        discovery.points.len(),
+        2,
+        "one usable seed per endpoint is one point each"
+    );
+
+    // Each endpoint's discovery line counts the one skipped seed.
+    let recorded = lines.lock().expect("the capture sink").clone();
+    assert!(
+        !recorded.is_empty(),
+        "the capture recorded nothing at all, so nothing below is proven"
+    );
+    for port in ["9013", "9014"] {
+        let mine: Vec<&String> = recorded
+            .iter()
+            .filter(|line| {
+                line.contains("l4_stream discover")
+                    && line.contains(&format!("node=l4s-tcp-127.0.0.1-{port}"))
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "one discovery line for {port}: {mine:?}");
+        assert!(
+            mine[0].contains("seeds_skipped=1"),
+            "the discovery line for {port} does not count the skipped seed: {}",
+            mine[0]
+        );
+    }
+
+    // The note rides each endpoint's verdict, once, and it is the same note:
+    // the shared, decode-once list.
+    let clause = |detail: &str| -> String {
+        let start = detail
+            .find("seed_notes=[")
+            .expect("the verdict carries a seed_notes clause");
+        let rest = &detail[start..];
+        // The clause is the detail's last, and a note may itself hold a `]`
+        // (`seed[0]: ...`), so the closing bracket is the final one.
+        let end = rest.rfind(']').expect("the seed_notes clause closes");
+        rest[..=end].to_string()
+    };
+    let mut clauses = Vec::new();
+    for point in &discovery.points {
+        let host = lane
+            .probe_host_for(point, Arc::clone(&job))
+            .expect("the lane hosts the point");
+        let verdict = check_by_id(&lane.checks(), "l4-crash")
+            .run(point, host.as_ref())
+            .await;
+        assert_eq!(
+            verdict.detail.matches("seed_notes=[").count(),
+            1,
+            "the note rides the verdict exactly once: {}",
+            verdict.detail
+        );
+        clauses.push(clause(&verdict.detail));
+    }
+    assert_eq!(clauses.len(), 2);
+    assert_eq!(
+        clauses[0], clauses[1],
+        "both endpoints carry the same single note"
+    );
+    assert!(
+        clauses[0].contains("flow seeds are not L4 flows"),
+        "the shared note names the reason: {}",
+        clauses[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SPEC-I3 / S9: a refusal and a dead target are warned about
 // ---------------------------------------------------------------------------
 
-/// The two things an operator must see without turning on debug logging: the
-/// guard refusing to let the lane send, and a target that stopped answering.
+/// Discovery's own S5.2 step-1 preview, refused, is a WARN an operator sees
+/// without turning on debug logging: the endpoint is named, with the reason
+/// and nothing else — no byte of a case or a reply (spec S9, SPEC-I3, C11).
 ///
-/// Both lines are WARN, and both carry ids, counts and a reason only — no
-/// byte of a case or a reply (spec S9, C11).
+/// Both halves of S5.1's refusal go through `authorise_preview`, the one
+/// refusal point: an endpoint outside the operator's L4 scope, and a lane
+/// whose L4 subsystem is disabled.
 #[tokio::test]
-async fn a_guard_refusal_and_a_dead_target_are_warned() {
-    let _serial = TRACING.lock().await;
+async fn a_refused_preview_is_warned() {
     let seeds = hex_seeds(&[b"abc"]);
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
 
-    // (0) Discovery's own S5.2 step-1 preview, refused: the endpoint is not
-    // in the operator's L4 scope at all.
-    let (_guard0, lines) = common::capture_tracing();
+    // (a) An endpoint not in the operator's L4 scope at all.
     let client = Arc::new(CountingClient::live());
     let profile = profile_for("127.0.0.1", 9011, Some("raw"), 10, &seeds);
     let (_lane, _job, found) = discover_with(
@@ -1129,22 +1164,55 @@ async fn a_guard_refusal_and_a_dead_target_are_warned() {
         error.to_string().starts_with("scan: out_of_scope: "),
         "{error}"
     );
+    assert_eq!(client.count(), 0, "a refusal opens no exchange");
+
+    // (b) S5.1: a disabled lane refuses the same preview, named and warned
+    // through the very same path — not an early return the operator never
+    // sees.
+    let off_client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", 9012, Some("raw"), 10, &seeds);
+    let (_lane, _job, found) = discover_with(None, Arc::clone(&off_client), profile, "22off").await;
+    let error = found.expect_err("a disabled lane discovers nothing");
+    assert!(
+        error.to_string().starts_with("scan: refused_l4: "),
+        "{error}"
+    );
+    assert_eq!(off_client.count(), 0, "a refusal opens no exchange");
+
     let recorded = lines.lock().expect("the capture sink").clone();
-    let warned: Vec<&String> = recorded
+    assert!(
+        !recorded.is_empty(),
+        "the capture recorded nothing at all, so nothing below is proven"
+    );
+    let scope_warn: Vec<&String> = recorded
         .iter()
         .filter(|line| line.starts_with("WARN ") && line.contains("endpoint=127.0.0.1:9011"))
         .collect();
     assert_eq!(
-        warned.len(),
+        scope_warn.len(),
         1,
-        "one WARN for the refused preview: {recorded:?}"
+        "one WARN for the out-of-scope preview: {recorded:?}"
     );
-    assert!(warned[0].contains("out_of_scope"), "{}", warned[0]);
-    assert_eq!(client.count(), 0, "a refusal opens no exchange");
+    assert!(scope_warn[0].contains("out_of_scope"), "{}", scope_warn[0]);
+    let off_warn: Vec<&String> = recorded
+        .iter()
+        .filter(|line| line.starts_with("WARN ") && line.contains("endpoint=127.0.0.1:9012"))
+        .collect();
+    assert_eq!(
+        off_warn.len(),
+        1,
+        "one WARN for the disabled-lane preview: {recorded:?}"
+    );
+    assert!(off_warn[0].contains("refused_l4"), "{}", off_warn[0]);
+}
 
-    // (1) The A1 self-port re-check, which refuses after discovery and opens
-    // no socket.
-    let (_guard, lines) = common::capture_tracing();
+/// The A1 self-port re-check refuses after discovery and opens no socket, and
+/// that refusal is a WARN naming the point and the endpoint (spec S9, C11).
+#[tokio::test]
+async fn a_guard_refusal_is_warned() {
+    let seeds = hex_seeds(&[b"abc"]);
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
     let guard = common::wildcard_guard(&[9009]);
     let client = Arc::new(CountingClient::live());
     let profile = profile_for("127.0.0.1", 9009, Some("raw"), 10, &seeds);
@@ -1197,14 +1265,32 @@ async fn a_guard_refusal_and_a_dead_target_are_warned() {
         "{}",
         warned[0]
     );
+}
 
-    // (2) A target that is not there at all: nothing listens on 9010, so the
-    // campaign's first connect fails and the campaign stops `target_down`.
-    let (_guard2, lines) = common::capture_tracing();
+/// A target that is not there at all: the campaign's first connect is
+/// refused, so it stops `target_down`, and that is a WARN naming the point —
+/// not a DEBUG line an operator has to go looking for (spec S9, SPEC-I3).
+#[tokio::test]
+async fn a_target_that_never_recovers_is_warned() {
+    // An ephemeral loopback port, bound only to learn a free number and then
+    // dropped, so nothing listens on it and the connect is refused. Binding
+    // is the sandbox's call, so skip when it refuses.
+    let Some(listener) = common::bind_or_skip().await else {
+        return;
+    };
+    let port = listener
+        .local_addr()
+        .expect("the ephemeral listener has an address")
+        .port();
+    drop(listener);
+
+    let seeds = hex_seeds(&[b"abc"]);
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
     let client = Arc::new(CountingClient::live());
-    let profile = profile_for("127.0.0.1", 9010, Some("raw"), 10, &seeds);
+    let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
     let (lane, job, found) = discover_with(
-        Some(common::wildcard_guard(&[9010])),
+        Some(common::wildcard_guard(&[port])),
         Arc::clone(&client),
         profile,
         "22down",

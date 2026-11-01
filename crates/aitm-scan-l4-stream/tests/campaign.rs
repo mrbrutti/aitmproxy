@@ -174,13 +174,6 @@ impl Run {
     }
 }
 
-/// Held for as long as a test reads the captured tracing lines.
-///
-/// `common::capture_tracing` shares one process-wide sink and clears it on
-/// every call, so two tests in this binary reading it at once would wipe each
-/// other's lines. They take this in turn instead.
-static TRACING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// `JobState`'s mutex, read without caring about a poisoned lock.
 fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -504,8 +497,8 @@ async fn target_never_recovers() {
     let Some(speaker) = common::dead_after_trigger().await else {
         return;
     };
-    let _serial = TRACING.lock().await;
-    let (_capture, lines) = common::capture_tracing();
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
     let profile = profile_for(speaker.addr.port(), None, 50, &["0003616263", "0001ff"]);
     let run = Run::start(&speaker, profile, "scan-21-dead").await;
     let point = point_at(&run.points, "length");
@@ -532,7 +525,7 @@ async fn target_never_recovers() {
 
     // SPEC-I3: a target that stopped answering is a WARN, not a DEBUG line
     // an operator has to go looking for. Ids and counts only (C11).
-    let recorded = locked(&lines).clone();
+    let recorded = locked(lines).clone();
     assert!(
         !recorded.is_empty(),
         "the capture recorded nothing, so it proves nothing"
@@ -564,8 +557,8 @@ async fn no_bytes_in_logs_or_debug() {
     let Some(speaker) = common::tlv_crash(Duration::from_secs(1)).await else {
         return;
     };
-    let _serial = TRACING.lock().await;
-    let (_capture, lines) = common::capture_tracing();
+    let capture = common::capture_tracing().await;
+    let lines = &capture.lines;
 
     // The seed carries the marker: `000b` declares its eleven bytes.
     let secret_seed = format!("000b{}", encode_hex(SECRET));
@@ -579,7 +572,7 @@ async fn no_bytes_in_logs_or_debug() {
     let marker = String::from_utf8_lossy(SECRET).into_owned();
     let forbidden = [marker, hex.clone(), hex.to_uppercase()];
 
-    let recorded = locked(&lines).clone();
+    let recorded = locked(lines).clone();
     assert!(
         !recorded.is_empty(),
         "the capture recorded nothing, so it proves nothing"

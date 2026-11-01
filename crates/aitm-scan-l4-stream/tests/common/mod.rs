@@ -865,7 +865,7 @@ impl JobCtx for TestJob {
 
 /// Keeps a tracing capture's lines readable for as long as it is held, and
 /// clears them when it drops.
-pub struct Guard {
+struct Guard {
     sink: Arc<Mutex<Vec<String>>>,
 }
 
@@ -873,6 +873,20 @@ impl Drop for Guard {
     fn drop(&mut self) {
         lock(&self.sink).clear();
     }
+}
+
+/// A held tracing capture: the process-wide serial lock and the shared sink,
+/// bundled so a test takes both in one `capture_tracing().await`.
+///
+/// The sink is one process-wide buffer cleared on every call, so two tests
+/// reading it at once would wipe each other's lines. Holding this is holding
+/// the serial lock that keeps them in turn; its [`lines`](Self::lines) stay
+/// readable for as long as it lives and are cleared when it drops.
+pub struct TracingCapture {
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+    _guard: Guard,
+    /// The shared sink of recorded lines.
+    pub lines: Arc<Mutex<Vec<String>>>,
 }
 
 /// Record every `tracing` event of the process, with all its fields.
@@ -884,9 +898,17 @@ impl Drop for Guard {
 /// subscriber would miss most of a run. A process can only install one, so the
 /// sink is shared and cleared on each call; a test that records nothing at all
 /// should say so rather than pass vacuously.
+///
+/// The returned [`TracingCapture`] holds the process-wide serial lock, so a
+/// test awaits it and never races another on the shared sink.
 #[must_use]
-pub fn capture_tracing() -> (Guard, Arc<Mutex<Vec<String>>>) {
+pub async fn capture_tracing() -> TracingCapture {
+    /// Held for as long as a test reads the captured tracing lines, so two
+    /// tests in one binary take the shared sink in turn.
+    static TRACING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static SINK: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+
+    let serial = TRACING.lock().await;
     let sink = SINK.get_or_init(|| {
         let sink = Arc::new(Mutex::new(Vec::new()));
         let subscriber = Capture {
@@ -899,12 +921,13 @@ pub fn capture_tracing() -> (Guard, Arc<Mutex<Vec<String>>>) {
         sink
     });
     lock(sink).clear();
-    (
-        Guard {
+    TracingCapture {
+        _serial: serial,
+        _guard: Guard {
             sink: Arc::clone(sink),
         },
-        Arc::clone(sink),
-    )
+        lines: Arc::clone(sink),
+    }
 }
 
 /// The capturing subscriber: every event, rendered with its fields.
