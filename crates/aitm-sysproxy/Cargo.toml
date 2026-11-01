@@ -1,0 +1,25 @@
+[package]
+name = "aitm-sysproxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "System proxy automation: read, set and restore the OS HTTP/HTTPS proxy (networksetup, gsettings, KDE) behind the proxy.system.* verbs, with a crash-safe state file."
+
+[dependencies]
+# `Value` for the verb payloads; `Command`/`Plugin` for the three verbs.
+aitm-core.workspace = true
+# `exec::{CmdLine, CmdOutput, Executor, RealExecutor}`: every OS read and
+# write is a rendered command line tests assert on; `testing::ScriptedExecutor`
+# for the unit tests.
+aitm-ca.workspace = true
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+# The state file and verb payload shapes.
+serde_json = "1"
+# RFC 3339 `saved_at` on the state file and the watchdog log line.
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

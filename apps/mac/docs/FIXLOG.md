@@ -2,6 +2,27 @@
 
 Bugs found after the fact, with the rule each one taught. Newest first.
 
+## 2026-10-31 — The Flows page stopped redrawing after intercept was armed
+
+Symptom: on the installed v0.5.6, Flows page, a parked row kept reading `Paused`
+after Resume and new rows never appeared, for as long as you watched, while the
+sidebar count, the status bar and the inspector strip all moved; switching to Apps
+and back redrew everything. Reproduced on a dev bundle with a real core in one
+process: the Apps page updated within a poll, the Flows page not at all.
+Cause: `Session.visibleRows` caches the filtered rows and, when `rowsVersion` is
+unchanged, returns the cache without reading `rows`. With `@Observable` a view
+depends only on what it read during its last body evaluation, so a re-evaluation
+for any other reason while the cache was warm (arming intercept shows the bar in
+the same `listAndInspector` view; selection; focus) left the flow table with no
+dependency on `rows` — later polls changed `rows` and nothing re-rendered until a
+page switch changed the query and missed the cache. The Apps page was spared only
+because its "no source app" banner reads `session.rows` on every evaluation.
+Fix: `visibleRows` reads `rows` and `details` unconditionally before consulting the
+cache (the cache still spares the re-filtering).
+Rule: a cached computed property on an `@Observable` model must read every
+observed input it depends on, on every access, or the views that use it lose the
+dependency the first time they re-render for an unrelated reason.
+
 ## 2026-10-31 — Breakpoint rules never reached a live core
 
 Symptom: with any rule in Rules… (S-040), arming intercept on a real `aitm` failed

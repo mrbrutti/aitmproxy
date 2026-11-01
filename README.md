@@ -11,7 +11,7 @@ Rust; runs on macOS and Linux.
 **Website: [mrbrutti.github.io/aitmproxy](https://mrbrutti.github.io/aitmproxy/)**
 — features, documentation, demos and downloads.
 
-![release](https://img.shields.io/badge/release-v0.5.6-555?style=flat-square)
+![release](https://img.shields.io/badge/release-v0.5.7-555?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-555?style=flat-square)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-555?style=flat-square)
 
@@ -145,8 +145,8 @@ then install it. Packages place `aitm` and `aitm-tui` on your `PATH` with obscur
 beside them.
 
 ```bash
-sudo apt install ./aitm-0.5.6-amd64.deb     # Debian / Ubuntu
-sudo dnf install ./aitm-0.5.6-x86_64.rpm    # Fedora / RHEL
+sudo apt install ./aitm-0.5.7-amd64.deb     # Debian / Ubuntu
+sudo dnf install ./aitm-0.5.7-x86_64.rpm    # Fedora / RHEL
 ```
 
 The release also ships `aitm-<version>-<target>.tar.gz` for Linux and macOS, and
@@ -190,6 +190,30 @@ config file (`~/Library/Application Support/aitmproxy/config.yaml` on macOS,
 ```yaml
 scope:
   entries: ["example.test", "*.staging.example.test"]
+```
+
+Instead of pointing every client at the port by hand, the core can set itself as
+the system HTTP/HTTPS proxy. The `system_proxy:` block in the same file controls
+it:
+
+```yaml
+system_proxy:
+  auto: false       # set the system proxy at startup, restore it at exit
+  bypass: []        # extra hosts that skip the proxy, merged with the defaults
+  state_file: ~     # where the previous setting is saved; default: beside the CA audit log
+```
+
+The same thing is available live over the bus and in every UI: `proxy.system.status`
+reads the current system proxy and whether this core set it; `proxy.system.set`
+(optional `bypass` list; operator-only) saves the previous setting and points the
+system at the core; `proxy.system.unset` (operator-only) puts the previous setting
+back. The previous setting is
+restored on quit, after a crash by a watchdog, and at the next start; `aitm proxy system unset` restores by hand.
+On a headless Linux box with no GNOME or KDE session there is no system proxy to
+set; export the variables instead:
+
+```bash
+export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080 no_proxy=localhost,127.0.0.1,::1
 ```
 
 A running core can also have scope changed live from a UI. From there, hold and
