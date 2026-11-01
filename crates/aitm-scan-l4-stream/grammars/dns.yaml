@@ -36,13 +36,13 @@ message:
       - { name: ancount, type: u16 be, value: 0 }
       - { name: nscount, type: u16 be, value: 0 }
       - { name: arcount, type: u16 be, value: 0 }
-  # `count_from` names the repeat whose element count is declared elsewhere --
-  # here by `qdcount` above, which carries `count: { of: questions }`. See the
-  # note in `src/grammars/dns.rs`: the parser keys a declared count by the name
-  # of the repeat it counts.
+  # How many questions follow is `qdcount` in the header above, which carries
+  # `count: { of: questions }`; this repeat names that field in turn. The two
+  # name each other, and the validator refuses a grammar where they disagree
+  # or where the count field is not declared before the repeat it bounds.
   - name: questions
     type: repeat
-    count_from: questions
+    count_from: qdcount
     fields:
       - name: name
         type: group

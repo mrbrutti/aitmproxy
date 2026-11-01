@@ -583,7 +583,13 @@ impl<'a> Parser<'a> {
 
         match relation {
             Relation::Count { of } => match usize::try_from(value) {
-                Ok(count) => self.counts.push((of.clone(), count)),
+                Ok(count) => {
+                    // A declared count is reachable under two names: the
+                    // count field's own (`count_from: qdcount`, the spelling
+                    // spec S2 and S3 use) and the repeat it counts.
+                    self.counts.push((node.path.last().to_string(), count));
+                    self.counts.push((of.clone(), count));
+                }
                 Err(_) => node.relation_broken = true,
             },
             Relation::Len {
@@ -1106,6 +1112,31 @@ message:
         assert_eq!(
             render(&tree),
             b"*3\r\n$4\r\nPING\r\n$3\r\nabc\r\n$3\r\nabc\r\n".to_vec()
+        );
+    }
+
+    /// SPEC-I1: `count_from` names the **count field**, and that field's
+    /// value bounds the repeat.
+    ///
+    /// Three elements are on the wire and the count says two: the repeat
+    /// takes two, the third is left over, and leftover bytes are not this
+    /// message. A parser that ignored the count would take all three and
+    /// call the frame well-formed.
+    #[test]
+    fn count_from_names_the_count_field_which_bounds_the_repeat() {
+        let spec = resp();
+        let short = b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n$3\r\nxyz\r\n";
+
+        assert!(
+            parse(&spec, short).is_none(),
+            "`*2` bounds the array at two elements, so the third is leftover"
+        );
+
+        // And the other direction: a count of three with two elements on the
+        // wire is short, which is not this message either.
+        assert!(
+            parse(&spec, b"*3\r\n$4\r\nPING\r\n$3\r\nabc\r\n").is_none(),
+            "`*3` with two elements on the wire is a short array"
         );
     }
 

@@ -32,14 +32,15 @@ message:
     type: group
     fields:
       - { name: star, type: delim, value: "*" }
-      # How many arguments follow. `count_from` below names the repeat this
-      # counts, not this field: the parser keys a declared count by the name
-      # of the repeat it belongs to (see the note in `src/grammars/resp.rs`).
+      # How many arguments follow. The `args` repeat below takes its element
+      # count from this field by name (`count_from: count`), and this field
+      # declares which repeat it counts (`count: { of: args }`): the two name
+      # each other, and the validator refuses a grammar where they disagree.
       - { name: count, type: decimal, count: { of: args } }
       - { name: crlf, type: delim, value: "\r\n" }
   - name: args
     type: repeat
-    count_from: args
+    count_from: count
     fields:
       - { name: dollar, type: delim, value: "$" }
       # The declared length of this argument. It is read, not trusted: a

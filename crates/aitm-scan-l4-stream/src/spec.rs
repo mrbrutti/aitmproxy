@@ -406,6 +406,14 @@ pub enum SpecError {
     TokenWithoutOneOf(String),
     /// A `repeat` with neither `count_from` nor `until`.
     RepeatWithoutCount(String),
+    /// A `repeat` whose `count_from` names a field that does not carry
+    /// `count: { of: <that repeat> }`.
+    CountFromMismatch {
+        /// The repeat holding the `count_from`.
+        repeat: String,
+        /// The field it names.
+        field: String,
+    },
     /// A relation on a field whose type cannot hold it. The string is
     /// `<field>: <why>`.
     BadRelationKind(String),
@@ -438,6 +446,11 @@ impl fmt::Display for SpecError {
             SpecError::RepeatWithoutCount(name) => write!(
                 f,
                 "field '{name}' is a repeat and needs count_from or until"
+            ),
+            SpecError::CountFromMismatch { repeat, field } => write!(
+                f,
+                "field '{repeat}' takes its count from '{field}', which does not carry \
+                 count: {{ of: {repeat} }}"
             ),
             SpecError::BadRelationKind(what) => write!(f, "field {what}"),
             SpecError::TooDeep(depth) => write!(
@@ -507,7 +520,8 @@ impl MessageSpec {
             return Err(SpecError::TooManyFields(total));
         }
         let mut scopes: Vec<Vec<&str>> = Vec::new();
-        validate_level(&self.message, &mut scopes, 1)
+        let mut seen: Vec<&FieldSpec> = Vec::with_capacity(total);
+        validate_level(&self.message, &mut scopes, &mut seen, 1)
     }
 }
 
@@ -521,6 +535,7 @@ fn count_fields(fields: &[FieldSpec]) -> usize {
 fn validate_level<'a>(
     fields: &'a [FieldSpec],
     scopes: &mut Vec<Vec<&'a str>>,
+    seen: &mut Vec<&'a FieldSpec>,
     depth: usize,
 ) -> Result<(), SpecError> {
     if depth > MAX_DEPTH {
@@ -538,9 +553,12 @@ fn validate_level<'a>(
 
     let result = (|| {
         for field in fields {
-            validate_field(field, scopes)?;
+            // Pre-order, so when a `count_from` is resolved `seen` holds
+            // exactly the fields declared before it in document order.
+            validate_field(field, scopes, seen)?;
+            seen.push(field);
             if !field.fields.is_empty() {
-                validate_level(&field.fields, scopes, depth + 1)?;
+                validate_level(&field.fields, scopes, seen, depth + 1)?;
             }
         }
         Ok(())
@@ -550,7 +568,11 @@ fn validate_level<'a>(
     result
 }
 
-fn validate_field(field: &FieldSpec, scopes: &[Vec<&str>]) -> Result<(), SpecError> {
+fn validate_field(
+    field: &FieldSpec,
+    scopes: &[Vec<&str>],
+    seen: &[&FieldSpec],
+) -> Result<(), SpecError> {
     match field.kind {
         FieldKind::Delim if field.value.is_none() => {
             return Err(SpecError::DelimWithoutValue(field.name.clone()));
@@ -565,7 +587,7 @@ fn validate_field(field: &FieldSpec, scopes: &[Vec<&str>]) -> Result<(), SpecErr
     }
 
     if let Some(count_from) = &field.count_from {
-        resolve(field, count_from, scopes)?;
+        resolve_count_from(field, count_from, seen)?;
     }
 
     let Some(relation) = &field.relation else {
@@ -614,6 +636,42 @@ fn validate_field(field: &FieldSpec, scopes: &[Vec<&str>]) -> Result<(), SpecErr
     }
 
     Ok(())
+}
+
+/// Resolve a `repeat`'s `count_from`, which names the **count field**:
+/// RESP's `count`, DNS's `qdcount` (spec S2, S3).
+///
+/// Two rules. The field must be declared *earlier in document order* — its
+/// own level, an ancestor, or a descendant of an earlier sibling, which is
+/// where DNS's `qdcount` sits — because a parser can only bound a repeat by
+/// a count it has already read. And it must carry
+/// `count: { of: <this repeat> }`, so that the count field and the repeat it
+/// counts name each other and neither spelling can drift from the other.
+fn resolve_count_from(
+    field: &FieldSpec,
+    count_from: &str,
+    seen: &[&FieldSpec],
+) -> Result<(), SpecError> {
+    let mut declared = false;
+    for earlier in seen {
+        if earlier.name != count_from {
+            continue;
+        }
+        declared = true;
+        if matches!(&earlier.relation, Some(Relation::Count { of }) if of == &field.name) {
+            return Ok(());
+        }
+    }
+    if declared {
+        return Err(SpecError::CountFromMismatch {
+            repeat: field.name.clone(),
+            field: count_from.to_string(),
+        });
+    }
+    Err(SpecError::UnknownTarget {
+        field: field.name.clone(),
+        target: count_from.to_string(),
+    })
 }
 
 /// Resolve a relation target against the field's own level, then outwards:
@@ -1090,6 +1148,70 @@ message:
 
         let err = MessageSpec::from_yaml(yaml).expect_err("from_yaml validates");
         assert!(err.to_string().contains("nope"), "display: {err}");
+    }
+
+    /// SPEC-I1: `count_from` names a count field declared earlier, and that
+    /// field must carry the matching `count: { of: <this repeat> }`.
+    #[test]
+    fn count_from_names_an_earlier_count_field() {
+        // (a) The spelling spec S2 and S3 use: the repeat names the field
+        // that counts it, and that field may sit inside an earlier group —
+        // which is where DNS's `qdcount` is.
+        let good = concat!(
+            "grammar: t\n",
+            "transport: udp\n",
+            "message:\n",
+            "  - name: header\n",
+            "    type: group\n",
+            "    fields:\n",
+            "      - { name: qdcount, type: u16 be, count: { of: questions } }\n",
+            "  - name: questions\n",
+            "    type: repeat\n",
+            "    count_from: qdcount\n",
+            "    fields:\n",
+            "      - { name: qtype, type: u16 be }\n",
+        );
+        MessageSpec::from_yaml(good).expect("a count field in an earlier group is in scope");
+
+        // (b) A name no field carries.
+        let unknown = good.replace("count_from: qdcount", "count_from: nope");
+        let err = MessageSpec::from_yaml(&unknown).expect_err("an unknown count_from is refused");
+        assert!(err.to_string().contains("nope"), "display: {err}");
+        assert!(err.to_string().contains("questions"), "display: {err}");
+
+        // (c) A field that exists but carries no `count: { of: questions }`.
+        let mismatch = concat!(
+            "grammar: t\n",
+            "transport: udp\n",
+            "message:\n",
+            "  - { name: qdcount, type: u16 be }\n",
+            "  - name: questions\n",
+            "    type: repeat\n",
+            "    count_from: qdcount\n",
+            "    fields:\n",
+            "      - { name: qtype, type: u16 be }\n",
+        );
+        let err = MessageSpec::from_yaml(mismatch)
+            .expect_err("a count_from whose field does not count this repeat is refused");
+        assert!(err.to_string().contains("qdcount"), "display: {err}");
+        assert!(err.to_string().contains("questions"), "display: {err}");
+
+        // (d) The old inverted spelling — the repeat naming itself — is no
+        // longer a valid grammar.
+        let inverted = concat!(
+            "grammar: t\n",
+            "transport: udp\n",
+            "message:\n",
+            "  - { name: qdcount, type: u16 be, count: { of: questions } }\n",
+            "  - name: questions\n",
+            "    type: repeat\n",
+            "    count_from: questions\n",
+            "    fields:\n",
+            "      - { name: qtype, type: u16 be }\n",
+        );
+        let err = MessageSpec::from_yaml(inverted)
+            .expect_err("a repeat may not name itself as its count field");
+        assert!(err.to_string().contains("questions"), "display: {err}");
     }
 
     #[test]

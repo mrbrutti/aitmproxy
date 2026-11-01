@@ -877,3 +877,82 @@ async fn discovery_line_reports_its_counts() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// SPEC-I1: `count_from` names the count field
+// ---------------------------------------------------------------------------
+
+/// A shipped grammar's `count_from` names the **count field**, and that
+/// field's value is what bounds the repeat (spec S2, S3).
+///
+/// Two halves, one per shipped grammar that declares a count. DNS: a reply
+/// whose `qdcount` is zero has no question, however many question-shaped
+/// bytes follow the header — they are all `rest`. RESP: an array whose
+/// `count` says two is two elements, so a third on the wire is leftover and
+/// the frame is not that message.
+#[test]
+fn count_from_names_the_count_field_in_the_shipped_grammars() {
+    use aitm_scan_l4_stream::grammar::by_kind;
+    use aitm_scan_l4_stream::spec::GrammarKind;
+    use aitm_scan_l4_stream::tree::FieldPath;
+
+    // The T10 answer-only DNS reply: a twelve-byte header with qdcount 0 and
+    // ancount 1, then one `A` record for `www.`.
+    let mut reply: Vec<u8> = vec![
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let answer: [u8; 19] = [
+        0x03, b'w', b'w', b'w', 0x00, // name "www."
+        0x00, 0x01, // type A
+        0x00, 0x01, // class IN
+        0x00, 0x00, 0x00, 0x3c, // ttl 60
+        0x00, 0x04, // rdlength
+        0x7f, 0x00, 0x00, 0x01, // 127.0.0.1
+    ];
+    reply.extend_from_slice(&answer);
+
+    let dns = by_kind(GrammarKind::Dns);
+    let tree = dns.parse(&reply).expect("the answer-only reply parses");
+    let questions = tree
+        .get(&FieldPath::new("questions"))
+        .expect("the dns grammar has a `questions` repeat");
+    assert!(
+        questions.children.is_empty(),
+        "qdcount is zero, so the question-shaped bytes are all `rest`: {:?}",
+        questions
+            .children
+            .iter()
+            .map(|child| child.path.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tree.get(&FieldPath::new("rest"))
+            .expect("a `rest` node")
+            .bytes,
+        answer.to_vec(),
+    );
+
+    let resp = by_kind(GrammarKind::Resp);
+    let two = resp
+        .parse(b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n")
+        .expect("a two-element RESP array parses");
+    assert_eq!(
+        two.get(&FieldPath::new("args"))
+            .expect("an `args` repeat")
+            .children
+            .len(),
+        2,
+    );
+    // Three elements behind a count of two: the array form takes two and the
+    // third is leftover, so the frame is not a RESP array — and not the
+    // inline form either, which is a single `\r\n`-terminated line. A parser
+    // that ignored the count would call it a well-formed three-element array.
+    let three = resp.parse(b"*2\r\n$4\r\nPING\r\n$3\r\nabc\r\n$3\r\nxyz\r\n");
+    assert!(
+        three.is_none(),
+        "`*2` bounds the array at two elements: {:?}",
+        three.map(|tree| tree
+            .get(&FieldPath::new("args"))
+            .map(|args| args.children.len()))
+    );
+}
