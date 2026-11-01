@@ -516,6 +516,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-term"
+version = "0.5.10"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+]
+
+[[package]]
 name = "aitm-testtarget"
 version = "0.5.10"
 dependencies = [
