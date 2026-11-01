@@ -518,7 +518,20 @@ impl HttpSender {
                 .await
             {
                 Ok(s) => s,
-                Err(e) => return Err(handshake_error(e, authority, host, &offer)),
+                Err(e) => {
+                    // An `Auto` offer the peer refused outright was narrowed
+                    // by a cache entry the peer has just proven stale (a
+                    // first `Auto` send offers everything, and an entry it
+                    // never had is nothing to drop). Forget it, so the next
+                    // `Auto` send offers both protocols again instead of
+                    // failing the same way for the rest of the TTL (plan
+                    // amendment A7, review finding SPEC-5). A forced send
+                    // never touches the cache.
+                    if matches!(version, VersionPolicy::Auto) && alpn_refused(&e) {
+                        self.alpn.invalidate(key);
+                    }
+                    return Err(handshake_error(e, authority, host, &offer));
+                }
             };
             let selected = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
             let negotiated = match selected.as_deref() {
@@ -620,15 +633,8 @@ fn handshake_error(
     host: &str,
     offer: &[&[u8]],
 ) -> anyhow::Error {
-    let refused = matches!(
-        err.get_ref()
-            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
-        Some(rustls::Error::AlertReceived(
-            rustls::AlertDescription::NoApplicationProtocol
-        ))
-    );
     let asked_only_for_h2 = offer.len() == 1 && offer[0] == ALPN_H2;
-    if refused && asked_only_for_h2 {
+    if alpn_refused(&err) && asked_only_for_h2 {
         return SendError::H2NotNegotiated {
             authority: authority.to_string(),
             detail: "server refused ALPN h2 (no_application_protocol)".into(),
@@ -636,6 +642,18 @@ fn handshake_error(
         .into();
     }
     anyhow::Error::new(err).context(format!("TLS to {host}"))
+}
+
+/// Whether a TLS handshake failure is the peer's `no_application_protocol`
+/// alert — it refused every protocol the ClientHello offered.
+fn alpn_refused(err: &std::io::Error) -> bool {
+    matches!(
+        err.get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::NoApplicationProtocol
+        ))
+    )
 }
 
 /// Normalise a request for sending, whatever the version: a `Host` header from
@@ -1733,9 +1751,17 @@ mod tests {
             tokio::spawn(
                 async move { tls_origin(second_server, &[b"http/1.1"], RESPONSE_200).await },
             );
+        // The origin is h1-only now and stays so: the third send meets it
+        // again, offering both protocols once the stale entry is gone.
+        let (third_client, third_server) = duplex(64 * 1024);
+        let third =
+            tokio::spawn(
+                async move { tls_origin(third_server, &[b"http/1.1"], RESPONSE_200).await },
+            );
         let dialer = Arc::new(DuplexDialer::new(VecDeque::from([
             first_client,
             second_client,
+            third_client,
         ])));
         let sender = HttpSender::new()
             .with_insecure(true)
@@ -1790,10 +1816,87 @@ mod tests {
             vec!["h2".to_string()],
             "a cached H2 makes Auto offer only h2"
         );
+        // SPEC-5 (plan amendment A7): the refusal of a cache-narrowed offer
+        // proves the entry stale, so it is invalidated rather than left to
+        // age out, and the next `Auto` send offers both protocols again.
+        assert_eq!(
+            sender.negotiated_for("https", "origin.test:443"),
+            None,
+            "a no_application_protocol refusal of the cache-narrowed offer drops the entry"
+        );
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect("with the stale entry gone, Auto falls back to HTTP/1.1");
+        assert_eq!(resp.version, aitm_core::HttpVersion::Http11);
+        assert_eq!(resp.status, 200);
+        assert_eq!(dialer.calls(), 3);
+        let third_log = third.await.expect("third origin task");
+        assert_eq!(
+            third_log.alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()],
+            "the next Auto send re-offers both protocols"
+        );
+        assert_eq!(
+            sender.negotiated_for("https", "origin.test:443"),
+            Some(Negotiated::H1),
+            "and the cache now records what the origin really speaks"
+        );
+    }
+
+    /// SPEC-5, the other half: only an `Auto` send's refusal says anything
+    /// about the cache. A forced `h2` refused by the same alert leaves the
+    /// `Auto` entry exactly as it was.
+    #[tokio::test]
+    async fn a_forced_h2_refusal_does_not_touch_the_alpn_cache() {
+        let (first_client, first_server) = duplex(64 * 1024);
+        let first =
+            tokio::spawn(
+                async move { tls_h2_origin_for(first_server, &[b"h2", b"http/1.1"], 1).await },
+            );
+        let (second_client, second_server) = duplex(64 * 1024);
+        let second =
+            tokio::spawn(
+                async move { tls_origin(second_server, &[b"http/1.1"], RESPONSE_200).await },
+            );
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([
+            first_client,
+            second_client,
+        ])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+        let req = https_get();
+
+        tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect("the first auto exchange speaks h2");
+        assert_eq!(
+            sender.negotiated_for("https", "origin.test:443"),
+            Some(Negotiated::H2)
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("the first origin finished within the guard");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H2),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("an h1-only origin refuses the forced h2 offer");
+        assert!(is_h2_not_negotiated(&err), "error was {err}");
+        assert_eq!(dialer.calls(), 2);
+        let second_log = second.await.expect("second origin task");
+        assert_eq!(second_log.alpn, vec!["h2".to_string()]);
         assert_eq!(
             sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H2),
-            "a failed handshake does not rewrite the cache; the entry ages out with the TTL"
+            "a forced send's refusal never rewrites the Auto cache"
         );
     }
 
