@@ -50,9 +50,12 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
      from the `system_proxy` sub-object of every `proxy.status` poll (existing cadence; the core
      refreshes it ≤ 5 s and immediately after set/unset) and from the direct replies of
      `proxy.system.set`/`unset`. Wire: `proxy.status.system_proxy = { state: off|points_at_us|other|
-     unsupported|needs_privilege|unknown, host, port, managed_by_us, setting, supported, detail }`; PR4
-     adds `SystemProxyState.init?(compact:)` (points_at_us → `.thisCore`, other → `.other(host, port)`,
-     off → `.off`, the rest → nil) and `SystemProxyFacts`, and fills `.setSystemProxy`/`.unsetSystemProxy`.
+     unsupported|needs_privilege|unknown, host, port, managed_by_us, setting, supported, detail }`.
+     **PR #246 (gate 5)** ships `SystemProxyState.init?(compact: JSONValue, listenAddress: String)`
+     (points_at_us → both endpoints at the listen address, other → both at host:port, off → `.off`,
+     unsupported / needs_privilege / unknown / malformed → nil, `other` at our own listen address → nil,
+     bare IPv6 literal without brackets → nil); PR4 adds `SystemProxyFacts` and fills
+     `.setSystemProxy`/`.unsetSystemProxy`.
      The Proxy menu gets only PR4's toggle (⌥⌘P); nothing of ours.
    - **CA source** (PR D's published contract, 2026-11-01; branch `claude/ca-trust-mac`,
      `apps/mac/Sources/Aitmproxy/Session+CATrust.swift`): we read `Session.caTrust: CATrustFacts?` and
@@ -81,11 +84,12 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
    `tunnel` → `tls` mapping is not written, `tunnelledFlowCount` stays 0 on every build, and TR-AC20 / B8
    are recorded as deferred. Nothing else waits on it.
 5. **PR #246 merged, SHA `__________`.** The system-proxy session's PR 4a = **PR #246** (branch
-   `claude/system-proxy-kit-type` off `main c8e4b6e5`, head `698bed37`) ships only
-   `apps/mac/Sources/AitmproxyKit/SystemProxyState.swift` + 27 tests — the type exactly as spec D2
+   `claude/system-proxy-kit-type` off `main c8e4b6e5`, head `c8ed92f4` after its panel) ships only
+   `apps/mac/Sources/AitmproxyKit/SystemProxyState.swift` + 31 tests — the type exactly as spec D2
    defines it (TR-AC1/2) plus `init?(compact:listenAddress:)` (points_at_us → both endpoints at the
    listen address, other → both at host:port, off → `.off`, unsupported / needs_privilege / unknown /
-   malformed → nil), no polling, no other file. New file, so it does not wait for the fixture-removal
+   malformed → nil, `other` at our own listen address → nil, brackets normalised in the match, bare IPv6
+   literal without brackets → nil, `:::8080` rejected since the core prints `[::]:8080`), no polling, no other file. New file, so it does not wait for the fixture-removal
    mac SHA. Task 1 builds against it on `main` and calls `state.route(to: listenAddress)` for the word;
    PR4 proper keeps ownership and adds the `proxy.status.system_proxy` polling later. This plan creates
    nothing of it.
@@ -1085,42 +1089,42 @@ docs PR from this branch.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| docs #242 | spec | Critical | #1 CA fact actions defined two incompatible ways ("reserved, no button" vs `[.trustCA, .openCAPanel]`) | fixed in this PR: post-PR-D state everywhere — the CA entry carries PR D's `actions` (`[.trustCA, .openCAPanel]`), the `caTrusted` step's action is `.trustCA`, the CA-only banner button is `.trustCA`; every "reserved / no button" sentence removed from Non-goals, Constraints, D2, D2a, D4, D10, TR-AC6/16/17, plan Task 1b, plan call 11 |
-| docs #242 | spec | Important | #2 TR-AC3 pins both `[.openScope]` and `[.addScopeHost, .openScope]` | fixed in this PR: one list, `[.addScopeHost, .openScope]`; TR-AC10's button list and plan Task 1b aligned |
-| docs #242 | spec | Important | #3 D10 and Task 1b carry the retired "— remedy" suffix; `advice` list lacks `scope`; Scope closed actions written two ways | fixed in this PR: D10 banner cells are states only; Task 1b `advice` = `[systemProxy, allApps, scope, caTrust]`, one Scope action list, no remedy clause |
-| docs #242 | spec | Important | #4 "Scope closed" derived two ways (D3 vs D5) | fixed in this PR: D5 `scopeClosed ⇔ !routes.scope.open`, D2 doc and Task 1 comment aligned; the stale-list banner case added to TR-AC3 and Task 1's test |
-| docs #242 | spec | Important | #5 numeric-string Port dropped from the plan, no test | fixed in this PR: TR-AC1 gains `"HTTPPort": "9090"` → 9090 and `"abc"` → nil; the test lives in PR #246's suite (gate 5) and Task 1 reports if it is unpinned |
-| docs #242 | spec | Important | #6 Task 4 anchors CommandMap/BRIEF on a "Scan" entry that does not exist there | superseded in this PR: Task 4 removed — `.openNetworkSettings` denied by the orchestrator 2026-11-01; no CommandMap/BRIEF/GLOSSARY insertion remains |
-| docs #242 | spec | Important | #7 footprint exceeds the recorded grant; gate Q1 open | fixed in this PR: gate 2 records the orchestrator's answers of 2026-11-01 (`check-capture-toggle.sh` GO; `BusService.swift` one line; `Session+Connection.swift` GO on PR D's SHA; `.openNetworkSettings` denied; no reader) and gate 5 (PR #246); Q1 marked resolved |
-| docs #242 | spec | Important | #8 icons plan lacks the "traffic-route PR first" gate and the BusService/Session serialisation; both plans say one PR | fixed in this PR: icons plan gate 4 ("traffic-route PR merged, SHA ___; Tasks 5/6 after traffic-route Tasks 2/2b"); both plans state two PRs from this branch, traffic-route first |
-| docs #242 | spec | Minor | #9 AC ordinals diverge from ids (6a/6b/15…) | fixed in this PR: ordinals = ids; TR-AC15/16 moved after TR-AC14; TR-AC14 kept as a dated tombstone |
-| docs #242 | spec | Minor | #10 "existing 16 cases" is 14 | fixed in this PR |
-| docs #242 | spec | Minor | #11 Task 1b tests say `.caTrust` for the step kind | fixed in this PR: `.caTrusted` for the step everywhere; `TrafficRoute.Kind.caTrust` unchanged |
-| docs #242 | spec | Minor | #12 Task 1 both "declares" `.caTrusted` and says PR D provides it | fixed in this PR: Task 1 declares the route kinds only; PR D's enum cases are left as found and never added |
-| docs #242 | spec | Minor | #13 spec D7 lists STORIES.md S-073; plan says not touched | fixed in this PR: STORIES.md removed from D7 and the claim list; "not touched" everywhere |
-| docs #242 | spec | Minor | #14 `proxy.system.*` verbs described as future | fixed in this PR: on `main` as PR #214 (`3d710ab7`); the mac toggle and `.setSystemProxy`/`.unsetSystemProxy` are PR4's |
-| docs #242 | spec | Minor | #15 unreachable banner case (All Apps as highest-priority shown fact) | superseded in this PR: with the system proxy unknown until PR4, All Apps is the first shown fact of the fresh install; D5 restated as `knownOpenRoute` and TR-AC18 pins `.openCaptureSettings` for it |
-| docs #242 | spec | Minor | #16 RouteBanner doc comment pre-widening | fixed in this PR (spec D7, plan Task 3): every list page, the D5/D8 rule |
-| docs #242 | spec | Minor | #17 stale line anchors (Session.swift post-#197; icons plan base `5eac2a5`) | fixed in this PR: icons spec cites Session.swift by symbol with `main 8e19c2e3` lines; both plans' base is `main 8e19c2e3`; ShellView anchors refreshed |
-| docs #242 | spec | Minor | #18 Status lines lack the 2026-11-01 amendment approval date | fixed in this PR: both specs and both plans read "amended 2026-11-01 (self-approved, autonomous mode)" |
-| docs #242 | spec | Minor | #19 `Endpoint.address` stored in the spec, computed in the plan | fixed in this PR: computed in spec D2/D2a and plan call 3 (PR #246's shape) |
-| docs #242 | quality | Important | TR-AC3 two action lists (overlaps spec #2) | fixed in this PR, see spec #2 |
-| docs #242 | quality | Important | CA actions "reserved" vs used (overlaps spec #1) | fixed in this PR, see spec #1 |
-| docs #242 | quality | Important | `.caTrust` vs `.caTrusted` step kind, six places (overlaps spec #11) | fixed in this PR, see spec #11 |
-| docs #242 | quality | Important | D10 remedy suffix (overlaps spec #3) | fixed in this PR, see spec #3 |
-| docs #242 | quality | Important | `scopeClosed` derived two ways (overlaps spec #4) | fixed in this PR, see spec #4 |
-| docs #242 | quality | Important | Task 4 "Scan" anchor (overlaps spec #6) | superseded in this PR, see spec #6 |
-| docs #242 | quality | Important | `Tok.Size.Row.dense` is 28 pt, not 40 (Tokens.swift:296); TR-AC19's "40 / never 80" cannot pass; D8's measurement uncited | fixed in this PR: D5, D8, TR-AC19, plan Task 3 and B4 say 28 pt / 56 for two and cite `Tokens.swift:296`, `ScopePanel.swift:268`, `ShellView.swift:368`; D8 states only that the old banners use that token and that TR-AC19 measures the header offset against it |
-| docs #242 | quality | Important | icons spec cites Session.swift:479-483 / :524-527 / :529-549 (post-#197 they moved) | fixed in this PR: cited by symbol — `Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408 on `main 8e19c2e3` |
-| docs #242 | quality | Minor | research 21/22 H1 titles say 13/14; 22 never cites `16-system-proxy.md`; bare "research 12" points at a branch-only note | fixed in this PR: titles 21/22; research 22 cites 16-system-proxy.md; the observe-lane note cited by file and branch (`12-macos-observe-only-lane.md` on `claude/heuristic-pare-835491`; on `main` 12 is the L4 parity audit) |
-| docs #242 | quality | Minor | unlabelled inferences (sub-millisecond read, primary-service rule, NSNumber, Network-Settings URL, ~8 spawns/s, `exec` icon, "never prompts") | fixed in this PR: the read and the URL are gone with the reader and the denial; the primary-service rule cites research 22 §2.4 as inference; NSNumber marked unverified; the spawn rate marked inference (~4/s); the `exec` icon marked unverified (icons spec D9); "never prompts" rewritten as one observation (research 22 §5b, plan Task 6) |
-| docs #242 | quality | Minor | stale sentences (ScopeBanner "yields", OQ14, four base SHAs, call 13 vs Task 1c, RouteBanner comment, "PR B is not released", icons gate 1 blank) | fixed in this PR: call site removed (not "yields"); OQ14 says PR #228 landed; branch base `main 8e19c2e3` everywhere (PR SHAs kept where they identify a PR); call 13 points at Task 1c; RouteBanner comment widened; "PR B is released (v0.5.9)"; icons gate 1 = `3fe92f66` |
-| docs #242 | quality | Minor | numbering/ordering (AC ordinals; calls 1–11,15,16,14,13,12; Q1,Q2,Q3,Q7,Q6,Q5,Q4; Task 6 B6,B8,B7 and "B8"/"B9"; "Six tasks in five waves"; "16 cases") | fixed in this PR: ordinals = ids; calls 1–16 in order; Q1–Q7 in order; Task 6 steps B1–B9 unique and ordered; "Eight tasks in eight waves"; 14 cases |
-| docs #242 | quality | Minor | STORIES.md both edited (spec D7) and "not touched" (plan) | fixed in this PR: not touched, everywhere |
-| docs #242 | quality | Minor | StatusPanel footprint counted three ways | fixed in this PR: stated once in spec D7 (`.help` line + `.addScopeHost` case + PR D hand-over); TR-AC8, Tasks 3/2b, the file table and call 1 refer to it |
-| docs #242 | quality | Minor | icons plan `subItem(… mark: Monogram(text: "◎"))` vs the declared `@ViewBuilder mark: () -> Mark` | fixed in this PR: `mark: { Monogram(text: "◎") }` in the icons spec D5 and plan Task 5 |
-| docs #242 | quality | Minor | research 22 line citations drifted (proxy.rs:331-336 → :360; build.sh:169-205 → :241) | fixed in this PR |
-| docs #242 | quality | Minor | Swift gate scratch paths differ between spec ACs and plans | fixed in this PR: spec TR-AC9 = plan (`test-build-routes`); icons AI-AC23 = plan (`test-build-icons`) |
+| docs #242 | spec | Critical | #1 CA fact actions defined two incompatible ways ("reserved, no button" vs `[.trustCA, .openCAPanel]`) | fixed in 644b9c90: post-PR-D state everywhere — the CA entry carries PR D's `actions` (`[.trustCA, .openCAPanel]`), the `caTrusted` step's action is `.trustCA`, the CA-only banner button is `.trustCA`; every "reserved / no button" sentence removed from Non-goals, Constraints, D2, D2a, D4, D10, TR-AC6/16/17, plan Task 1b, plan call 11 |
+| docs #242 | spec | Important | #2 TR-AC3 pins both `[.openScope]` and `[.addScopeHost, .openScope]` | fixed in 644b9c90: one list, `[.addScopeHost, .openScope]`; TR-AC10's button list and plan Task 1b aligned |
+| docs #242 | spec | Important | #3 D10 and Task 1b carry the retired "— remedy" suffix; `advice` list lacks `scope`; Scope closed actions written two ways | fixed in 644b9c90: D10 banner cells are states only; Task 1b `advice` = `[systemProxy, allApps, scope, caTrust]`, one Scope action list, no remedy clause |
+| docs #242 | spec | Important | #4 "Scope closed" derived two ways (D3 vs D5) | fixed in 644b9c90: D5 `scopeClosed ⇔ !routes.scope.open`, D2 doc and Task 1 comment aligned; the stale-list banner case added to TR-AC3 and Task 1's test |
+| docs #242 | spec | Important | #5 numeric-string Port dropped from the plan, no test | fixed in 644b9c90: TR-AC1 gains `"HTTPPort": "9090"` → 9090 and `"abc"` → nil; the test lives in PR #246's suite (gate 5) and Task 1 reports if it is unpinned |
+| docs #242 | spec | Important | #6 Task 4 anchors CommandMap/BRIEF on a "Scan" entry that does not exist there | superseded in 644b9c90: Task 4 removed — `.openNetworkSettings` denied by the orchestrator 2026-11-01; no CommandMap/BRIEF/GLOSSARY insertion remains |
+| docs #242 | spec | Important | #7 footprint exceeds the recorded grant; gate Q1 open | fixed in 644b9c90: gate 2 records the orchestrator's answers of 2026-11-01 (`check-capture-toggle.sh` GO; `BusService.swift` one line; `Session+Connection.swift` GO on PR D's SHA; `.openNetworkSettings` denied; no reader) and gate 5 (PR #246); Q1 marked resolved |
+| docs #242 | spec | Important | #8 icons plan lacks the "traffic-route PR first" gate and the BusService/Session serialisation; both plans say one PR | fixed in 644b9c90: icons plan gate 4 ("traffic-route PR merged, SHA ___; Tasks 5/6 after traffic-route Tasks 2/2b"); both plans state two PRs from this branch, traffic-route first |
+| docs #242 | spec | Minor | #9 AC ordinals diverge from ids (6a/6b/15…) | fixed in 644b9c90: ordinals = ids; TR-AC15/16 moved after TR-AC14; TR-AC14 kept as a dated tombstone |
+| docs #242 | spec | Minor | #10 "existing 16 cases" is 14 | fixed in 644b9c90 |
+| docs #242 | spec | Minor | #11 Task 1b tests say `.caTrust` for the step kind | fixed in 644b9c90: `.caTrusted` for the step everywhere; `TrafficRoute.Kind.caTrust` unchanged |
+| docs #242 | spec | Minor | #12 Task 1 both "declares" `.caTrusted` and says PR D provides it | fixed in 644b9c90: Task 1 declares the route kinds only; PR D's enum cases are left as found and never added |
+| docs #242 | spec | Minor | #13 spec D7 lists STORIES.md S-073; plan says not touched | fixed in 644b9c90: STORIES.md removed from D7 and the claim list; "not touched" everywhere |
+| docs #242 | spec | Minor | #14 `proxy.system.*` verbs described as future | fixed in 644b9c90: on `main` as PR #214 (`3d710ab7`); the mac toggle and `.setSystemProxy`/`.unsetSystemProxy` are PR4's |
+| docs #242 | spec | Minor | #15 unreachable banner case (All Apps as highest-priority shown fact) | superseded in 644b9c90: with the system proxy unknown until PR4, All Apps is the first shown fact of the fresh install; D5 restated as `knownOpenRoute` and TR-AC18 pins `.openCaptureSettings` for it |
+| docs #242 | spec | Minor | #16 RouteBanner doc comment pre-widening | fixed in 644b9c90 (spec D7, plan Task 3): every list page, the D5/D8 rule |
+| docs #242 | spec | Minor | #17 stale line anchors (Session.swift post-#197; icons plan base `5eac2a5`) | fixed in 644b9c90: icons spec cites Session.swift by symbol with `main 8e19c2e3` lines; both plans' base is `main 8e19c2e3`; ShellView anchors refreshed |
+| docs #242 | spec | Minor | #18 Status lines lack the 2026-11-01 amendment approval date | fixed in 644b9c90: both specs and both plans read "amended 2026-11-01 (self-approved, autonomous mode)" |
+| docs #242 | spec | Minor | #19 `Endpoint.address` stored in the spec, computed in the plan | fixed in 644b9c90: computed in spec D2/D2a and plan call 3 (PR #246's shape) |
+| docs #242 | quality | Important | TR-AC3 two action lists (overlaps spec #2) | fixed in 644b9c90, see spec #2 |
+| docs #242 | quality | Important | CA actions "reserved" vs used (overlaps spec #1) | fixed in 644b9c90, see spec #1 |
+| docs #242 | quality | Important | `.caTrust` vs `.caTrusted` step kind, six places (overlaps spec #11) | fixed in 644b9c90, see spec #11 |
+| docs #242 | quality | Important | D10 remedy suffix (overlaps spec #3) | fixed in 644b9c90, see spec #3 |
+| docs #242 | quality | Important | `scopeClosed` derived two ways (overlaps spec #4) | fixed in 644b9c90, see spec #4 |
+| docs #242 | quality | Important | Task 4 "Scan" anchor (overlaps spec #6) | superseded in 644b9c90, see spec #6 |
+| docs #242 | quality | Important | `Tok.Size.Row.dense` is 28 pt, not 40 (Tokens.swift:296); TR-AC19's "40 / never 80" cannot pass; D8's measurement uncited | fixed in 644b9c90: D5, D8, TR-AC19, plan Task 3 and B4 say 28 pt / 56 for two and cite `Tokens.swift:296`, `ScopePanel.swift:268`, `ShellView.swift:368`; D8 states only that the old banners use that token and that TR-AC19 measures the header offset against it |
+| docs #242 | quality | Important | icons spec cites Session.swift:479-483 / :524-527 / :529-549 (post-#197 they moved) | fixed in 644b9c90: cited by symbol — `Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408 on `main 8e19c2e3` |
+| docs #242 | quality | Minor | research 21/22 H1 titles say 13/14; 22 never cites `16-system-proxy.md`; bare "research 12" points at a branch-only note | fixed in 644b9c90: titles 21/22; research 22 cites 16-system-proxy.md; the observe-lane note cited by file and branch (`12-macos-observe-only-lane.md` on `claude/heuristic-pare-835491`; on `main` 12 is the L4 parity audit) |
+| docs #242 | quality | Minor | unlabelled inferences (sub-millisecond read, primary-service rule, NSNumber, Network-Settings URL, ~8 spawns/s, `exec` icon, "never prompts") | fixed in 644b9c90: the read and the URL are gone with the reader and the denial; the primary-service rule cites research 22 §2.4 as inference; NSNumber marked unverified; the spawn rate marked inference (~4/s); the `exec` icon marked unverified (icons spec D9); "never prompts" rewritten as one observation (research 22 §5b, plan Task 6) |
+| docs #242 | quality | Minor | stale sentences (ScopeBanner "yields", OQ14, four base SHAs, call 13 vs Task 1c, RouteBanner comment, "PR B is not released", icons gate 1 blank) | fixed in 644b9c90: call site removed (not "yields"); OQ14 says PR #228 landed; branch base `main 8e19c2e3` everywhere (PR SHAs kept where they identify a PR); call 13 points at Task 1c; RouteBanner comment widened; "PR B is released (v0.5.9)"; icons gate 1 = `3fe92f66` |
+| docs #242 | quality | Minor | numbering/ordering (AC ordinals; calls 1–11,15,16,14,13,12; Q1,Q2,Q3,Q7,Q6,Q5,Q4; Task 6 B6,B8,B7 and "B8"/"B9"; "Six tasks in five waves"; "16 cases") | fixed in 644b9c90: ordinals = ids; calls 1–16 in order; Q1–Q7 in order; Task 6 steps B1–B9 unique and ordered; "Eight tasks in eight waves"; 14 cases |
+| docs #242 | quality | Minor | STORIES.md both edited (spec D7) and "not touched" (plan) | fixed in 644b9c90: not touched, everywhere |
+| docs #242 | quality | Minor | StatusPanel footprint counted three ways | fixed in 644b9c90: stated once in spec D7 (`.help` line + `.addScopeHost` case + PR D hand-over); TR-AC8, Tasks 3/2b, the file table and call 1 refer to it |
+| docs #242 | quality | Minor | icons plan `subItem(… mark: Monogram(text: "◎"))` vs the declared `@ViewBuilder mark: () -> Mark` | fixed in 644b9c90: `mark: { Monogram(text: "◎") }` in the icons spec D5 and plan Task 5 |
+| docs #242 | quality | Minor | research 22 line citations drifted (proxy.rs:331-336 → :360; build.sh:169-205 → :241) | fixed in 644b9c90 |
+| docs #242 | quality | Minor | Swift gate scratch paths differ between spec ACs and plans | fixed in 644b9c90: spec TR-AC9 = plan (`test-build-routes`); icons AI-AC23 = plan (`test-build-icons`) |
 
 ## Shipped
 

@@ -180,7 +180,7 @@ client-side flag.
   this spec's step and row, keeping the words) starts only once PR D is on `main`. The system-proxy,
   All Apps and Scope parts are not gated on it and land first (plan Tasks 1/2 vs 1b/2b).
 - **`SystemProxyState` is PR #246's file.** The type is defined here (§D2) as the shared contract and
-  shipped — type plus 27 Kit tests and `init?(compact:listenAddress:)`, no polling, no other file —
+  shipped — type plus 31 Kit tests and `init?(compact:listenAddress:)`, no polling, no other file —
   by the system-proxy session as PR #246 (branch `claude/system-proxy-kit-type`) ahead of this
   spec's PR (plan gate 5). This spec declares nothing of it and compiles against it; PR4 proper
   keeps ownership and adds `SystemProxyFacts` and the `proxy.status.system_proxy` polling that
@@ -262,7 +262,7 @@ Flows empty state needs 0–2 lines with actions and the banner needs a predicat
 
 `AitmproxyKit/SystemProxyState.swift` — **defined here as the shared contract, implemented by the
 system-proxy session (file owned by PR4; shipped as the tiny PR 4a = PR #246, branch
-`claude/system-proxy-kit-type`, with 27 Kit tests, ahead of this spec's PR — plan gate 5)**. PR #246
+`claude/system-proxy-kit-type`, with 31 Kit tests, ahead of this spec's PR — plan gate 5)**. PR #246
 also carries `init?(compact:listenAddress:)`, PR4's decoder of `proxy.status.system_proxy`
 (`points_at_us` → both endpoints at the listen address, `other` → both at `host:port`, `off` → `.off`,
 `unsupported` / `needs_privilege` / `unknown` / malformed → nil). This spec declares nothing of it; its

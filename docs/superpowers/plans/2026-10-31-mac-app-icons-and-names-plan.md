@@ -659,37 +659,37 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| docs #242 | spec | Critical | #1 (traffic-route) CA fact actions defined two incompatible ways | fixed in this PR in the traffic-route spec/plan: post-PR-D state everywhere (see that plan's log) |
-| docs #242 | spec | Important | #2 (traffic-route) TR-AC3 two action lists | fixed in this PR (traffic-route) |
-| docs #242 | spec | Important | #3 (traffic-route) D10 remedy suffix; `advice` list; Scope actions two ways | fixed in this PR (traffic-route) |
-| docs #242 | spec | Important | #4 (traffic-route) "Scope closed" derived two ways | fixed in this PR (traffic-route) |
-| docs #242 | spec | Important | #5 (traffic-route) numeric-string Port, no test | fixed in this PR (traffic-route; the test is PR #246's) |
-| docs #242 | spec | Important | #6 (traffic-route) Task 4 "Scan" anchor | superseded in this PR: traffic-route Task 4 removed (`.openNetworkSettings` denied 2026-11-01) |
-| docs #242 | spec | Important | #7 (traffic-route) footprint exceeds the grant | fixed in this PR (traffic-route gate 2 records the orchestrator's 2026-11-01 answers) |
-| docs #242 | spec | Important | #8 this plan lacks the "traffic-route PR first" gate and the BusService/Session serialisation; both plans say "one PR" | fixed in this PR: gate 4 added (traffic-route PR merged, SHA ___; Tasks 5/6 after traffic-route Tasks 2/2b); PR shape stated in both plans and the spec's Constraints |
-| docs #242 | spec | Minor | #9 (traffic-route) AC ordinals ≠ ids | fixed in this PR (traffic-route) |
-| docs #242 | spec | Minor | #10 (traffic-route) "16 cases" is 14 | fixed in this PR (traffic-route) |
-| docs #242 | spec | Minor | #11 (traffic-route) `.caTrust` step kind | fixed in this PR (traffic-route) |
-| docs #242 | spec | Minor | #12 (traffic-route) Task 1 declares vs PR D provides | fixed in this PR (traffic-route) |
-| docs #242 | spec | Minor | #13 (traffic-route) STORIES.md both ways | fixed in this PR (traffic-route) |
-| docs #242 | spec | Minor | #14 (traffic-route) `proxy.system.*` described as future | fixed in this PR (traffic-route: PR #214) |
-| docs #242 | spec | Minor | #15 (traffic-route) unreachable banner case | superseded in this PR (traffic-route D5 `knownOpenRoute`) |
-| docs #242 | spec | Minor | #16 (traffic-route) RouteBanner doc comment | fixed in this PR (traffic-route) |
-| docs #242 | spec | Minor | #17 stale line anchors (Session.swift post-#197 in this spec; this plan's base `5eac2a5`) | fixed in this PR: spec D1/D4 cite `Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408 on `main 8e19c2e3`; this plan's base is `main 8e19c2e3` |
-| docs #242 | spec | Minor | #18 Status lines lack the 2026-11-01 amendment date | fixed in this PR: spec and plan read "amended 2026-11-01 (self-approved, autonomous mode)" |
-| docs #242 | spec | Minor | #19 (traffic-route) `Endpoint.address` stored vs computed | fixed in this PR (traffic-route; PR #246's shape) |
-| docs #242 | quality | Important | (traffic-route) TR-AC3 two lists; CA reserved vs used; `.caTrust` vs `.caTrusted`; D10 remedy suffix; `scopeClosed` two ways; Task 4 "Scan" anchor | fixed / superseded in this PR (traffic-route; see spec #2/#1/#11/#3/#4/#6) |
-| docs #242 | quality | Important | (traffic-route) `Tok.Size.Row.dense` is 28 pt, not 40 | fixed in this PR (traffic-route: 28 / 56, `Tokens.swift:296`) |
-| docs #242 | quality | Important | this spec cites Session.swift:479-483 / :524-527 / :529-549 | fixed in this PR: cited by symbol with `main 8e19c2e3` lines (see spec #17) |
-| docs #242 | quality | Minor | research 21/22 H1 titles say 13/14; 22 never cites `16-system-proxy.md`; bare "research 12" | fixed in this PR (research 21/22) |
-| docs #242 | quality | Minor | unlabelled inferences, incl. this spec's `exec` icon remark | fixed in this PR: D9 labels it unverified; the traffic-route and research items are labelled or removed (see that plan's log) |
-| docs #242 | quality | Minor | stale sentences, incl. this spec's "PR B is not released" and this plan's gate 1 blank | fixed in this PR: D7 says PR B is released (v0.5.9); gate 1 = `3fe92f66`; the traffic-route items in that plan's log |
-| docs #242 | quality | Minor | (traffic-route) numbering/ordering | fixed in this PR (traffic-route) |
-| docs #242 | quality | Minor | (traffic-route) STORIES.md both ways | fixed in this PR (traffic-route) |
-| docs #242 | quality | Minor | (traffic-route) StatusPanel footprint three ways | fixed in this PR (traffic-route) |
-| docs #242 | quality | Minor | this plan's `subItem(… mark: Monogram(text: "◎"))` vs the declared `@ViewBuilder mark: () -> Mark` | fixed in this PR: `mark: { Monogram(text: "◎") }` in Task 5 and spec D5 |
-| docs #242 | quality | Minor | research 22 line citations drifted | fixed in this PR (research 22: proxy.rs:360, build.sh:241) |
-| docs #242 | quality | Minor | Swift gate scratch paths differ between spec ACs and plans | fixed in this PR: this spec's AI-AC23 = this plan's `test-build-icons`; traffic-route TR-AC9 = `test-build-routes` |
+| docs #242 | spec | Critical | #1 (traffic-route) CA fact actions defined two incompatible ways | fixed in 644b9c90 in the traffic-route spec/plan: post-PR-D state everywhere (see that plan's log) |
+| docs #242 | spec | Important | #2 (traffic-route) TR-AC3 two action lists | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Important | #3 (traffic-route) D10 remedy suffix; `advice` list; Scope actions two ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Important | #4 (traffic-route) "Scope closed" derived two ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Important | #5 (traffic-route) numeric-string Port, no test | fixed in 644b9c90 (traffic-route; the test is PR #246's) |
+| docs #242 | spec | Important | #6 (traffic-route) Task 4 "Scan" anchor | superseded in 644b9c90: traffic-route Task 4 removed (`.openNetworkSettings` denied 2026-11-01) |
+| docs #242 | spec | Important | #7 (traffic-route) footprint exceeds the grant | fixed in 644b9c90 (traffic-route gate 2 records the orchestrator's 2026-11-01 answers) |
+| docs #242 | spec | Important | #8 this plan lacks the "traffic-route PR first" gate and the BusService/Session serialisation; both plans say "one PR" | fixed in 644b9c90: gate 4 added (traffic-route PR merged, SHA ___; Tasks 5/6 after traffic-route Tasks 2/2b); PR shape stated in both plans and the spec's Constraints |
+| docs #242 | spec | Minor | #9 (traffic-route) AC ordinals ≠ ids | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #10 (traffic-route) "16 cases" is 14 | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #11 (traffic-route) `.caTrust` step kind | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #12 (traffic-route) Task 1 declares vs PR D provides | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #13 (traffic-route) STORIES.md both ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #14 (traffic-route) `proxy.system.*` described as future | fixed in 644b9c90 (traffic-route: PR #214) |
+| docs #242 | spec | Minor | #15 (traffic-route) unreachable banner case | superseded in 644b9c90 (traffic-route D5 `knownOpenRoute`) |
+| docs #242 | spec | Minor | #16 (traffic-route) RouteBanner doc comment | fixed in 644b9c90 (traffic-route) |
+| docs #242 | spec | Minor | #17 stale line anchors (Session.swift post-#197 in this spec; this plan's base `5eac2a5`) | fixed in 644b9c90: spec D1/D4 cite `Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408 on `main 8e19c2e3`; this plan's base is `main 8e19c2e3` |
+| docs #242 | spec | Minor | #18 Status lines lack the 2026-11-01 amendment date | fixed in 644b9c90: spec and plan read "amended 2026-11-01 (self-approved, autonomous mode)" |
+| docs #242 | spec | Minor | #19 (traffic-route) `Endpoint.address` stored vs computed | fixed in 644b9c90 (traffic-route; PR #246's shape) |
+| docs #242 | quality | Important | (traffic-route) TR-AC3 two lists; CA reserved vs used; `.caTrust` vs `.caTrusted`; D10 remedy suffix; `scopeClosed` two ways; Task 4 "Scan" anchor | fixed / superseded in 644b9c90 (traffic-route; see spec #2/#1/#11/#3/#4/#6) |
+| docs #242 | quality | Important | (traffic-route) `Tok.Size.Row.dense` is 28 pt, not 40 | fixed in 644b9c90 (traffic-route: 28 / 56, `Tokens.swift:296`) |
+| docs #242 | quality | Important | this spec cites Session.swift:479-483 / :524-527 / :529-549 | fixed in 644b9c90: cited by symbol with `main 8e19c2e3` lines (see spec #17) |
+| docs #242 | quality | Minor | research 21/22 H1 titles say 13/14; 22 never cites `16-system-proxy.md`; bare "research 12" | fixed in 644b9c90 (research 21/22) |
+| docs #242 | quality | Minor | unlabelled inferences, incl. this spec's `exec` icon remark | fixed in 644b9c90: D9 labels it unverified; the traffic-route and research items are labelled or removed (see that plan's log) |
+| docs #242 | quality | Minor | stale sentences, incl. this spec's "PR B is not released" and this plan's gate 1 blank | fixed in 644b9c90: D7 says PR B is released (v0.5.9); gate 1 = `3fe92f66`; the traffic-route items in that plan's log |
+| docs #242 | quality | Minor | (traffic-route) numbering/ordering | fixed in 644b9c90 (traffic-route) |
+| docs #242 | quality | Minor | (traffic-route) STORIES.md both ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | quality | Minor | (traffic-route) StatusPanel footprint three ways | fixed in 644b9c90 (traffic-route) |
+| docs #242 | quality | Minor | this plan's `subItem(… mark: Monogram(text: "◎"))` vs the declared `@ViewBuilder mark: () -> Mark` | fixed in 644b9c90: `mark: { Monogram(text: "◎") }` in Task 5 and spec D5 |
+| docs #242 | quality | Minor | research 22 line citations drifted | fixed in 644b9c90 (research 22: proxy.rs:360, build.sh:241) |
+| docs #242 | quality | Minor | Swift gate scratch paths differ between spec ACs and plans | fixed in 644b9c90: this spec's AI-AC23 = this plan's `test-build-icons`; traffic-route TR-AC9 = `test-build-routes` |
 
 ## Shipped
 
