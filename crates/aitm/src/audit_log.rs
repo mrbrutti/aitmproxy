@@ -27,6 +27,13 @@
 //! holds with the writer's [`SecretRegistry`], attaches the writer to the shared
 //! ring and says one line. The [`AuditLogHandle`] it returns reaches the running
 //! writer: its registry, its health and its shutdown.
+//!
+//! The writer does not trust an entry. Each stream's thread puts every entry
+//! through the field pipeline of the `pipeline` module just before it renders the
+//! line: each text field is bounded, scrubbed, masked with the registry (as it
+//! stands when the line is written, so a secret registered while the entry
+//! waited is masked in it), stripped of control characters and cut to its cap. An
+//! entry the call path produced passes through unchanged.
 
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -44,6 +51,7 @@ use aitm_core::{
 };
 use tracing::{info, warn};
 
+mod pipeline;
 mod registry;
 
 pub use registry::{Registration, SecretRegistry};
@@ -889,11 +897,16 @@ enum Msg {
 }
 
 /// One stream's counters and flags, shared between the producers and the
-/// stream's thread. Atomics, and the one lock of `gap`, which guards a few
-/// integer operations and is never held across I/O: a producer never waits on a
-/// thread that is blocked in file I/O.
+/// stream's thread, and the registry the thread masks with. Atomics, and the one
+/// lock of `gap`, which guards a few integer operations and is never held across
+/// I/O: a producer never waits on a thread that is blocked in file I/O.
 #[derive(Default)]
 struct StreamShared {
+    /// The writer's registry, also held by the writer and its handle. The thread
+    /// masks every field with it when it writes the line, not when the entry was
+    /// queued, so a secret registered while the entry waited is masked in it. A
+    /// default is an empty registry, which masks nothing.
+    registry: Arc<SecretRegistry>,
     /// Entries refused: the queue was full, the stream is closing, or the thread
     /// is gone.
     dropped: AtomicU64,
@@ -1100,11 +1113,13 @@ impl<'a> StreamWriter<'a> {
         }
     }
 
-    /// Writes one entry as its JSONL line, behind the pending `gap` marker if
-    /// there is one. A failure is counted, marks the stream degraded and loses
-    /// this entry; the next write that succeeds clears `degraded`.
+    /// Writes one entry as its JSONL line (the entry after the field pipeline of
+    /// `pipeline`, so no secret and no control character reaches the file),
+    /// behind the pending `gap` marker if there is one. A failure is counted,
+    /// marks the stream degraded and loses this entry; the next write that
+    /// succeeds clears `degraded`.
     fn write_entry(&mut self, entry: &AuditEntry) {
-        let line = aitm_ca::audit::entry_to_jsonl(entry);
+        let line = pipeline::render_line(entry, &self.shared.registry);
         match self.try_write(&line) {
             Ok(()) => self.succeeded(),
             Err(error) => self.failed(entry.at_millis(), &error),
@@ -1356,14 +1371,18 @@ impl<'a> StreamWriter<'a> {
 }
 
 /// Starts one stream's thread, named `aitm-audit-<label>`, with a queue of
-/// `capacity` entries.
+/// `capacity` entries, masking with `registry`.
 fn spawn_stream(
     kind: StreamKind,
     spec: StreamSpec,
     tuning: &Tuning,
+    registry: &Arc<SecretRegistry>,
 ) -> io::Result<(StreamEnds, JoinHandle<()>)> {
     let (tx, rx) = sync_channel(tuning.queue[kind.index()]);
-    let shared = Arc::new(StreamShared::default());
+    let shared = Arc::new(StreamShared {
+        registry: Arc::clone(registry),
+        ..StreamShared::default()
+    });
     shared
         .degraded
         .store(spec.file.is_none(), Ordering::Relaxed);
@@ -1414,8 +1433,10 @@ pub struct AuditLogWriter {
     /// through `&self`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The secrets the writer masks by value (spec Design 14.4). Empty until
-    /// `start` registers the configured ones; the stream threads do not mask with
-    /// it yet.
+    /// `start` registers the configured ones. Every stream thread holds a clone
+    /// and masks each field with it as it writes the line (the field pipeline of
+    /// `pipeline`), so a registration made while the writer runs is seen by the
+    /// next entry any thread writes, one already queued included.
     registry: Arc<SecretRegistry>,
 }
 
@@ -1425,17 +1446,20 @@ impl AuditLogWriter {
     /// before it end by themselves.
     fn from_specs(specs: [StreamSpec; 3], tuning: Tuning) -> io::Result<AuditLogWriter> {
         let [control, agent, reads] = specs;
-        let (control, control_thread) = spawn_stream(StreamKind::Control, control, &tuning)?;
-        let (agent, agent_thread) = spawn_stream(StreamKind::Agent, agent, &tuning)?;
-        let (reads, reads_thread) = spawn_stream(StreamKind::Reads, reads, &tuning)?;
+        let registry = Arc::new(SecretRegistry::new());
+        let (control, control_thread) =
+            spawn_stream(StreamKind::Control, control, &tuning, &registry)?;
+        let (agent, agent_thread) = spawn_stream(StreamKind::Agent, agent, &tuning, &registry)?;
+        let (reads, reads_thread) = spawn_stream(StreamKind::Reads, reads, &tuning, &registry)?;
         Ok(AuditLogWriter {
             streams: [control, agent, reads],
             threads: Mutex::new(vec![control_thread, agent_thread, reads_thread]),
-            registry: Arc::new(SecretRegistry::new()),
+            registry,
         })
     }
 
-    /// The registry the writer masks with, empty at first.
+    /// The registry the stream threads mask with, empty at first. A secret
+    /// registered through it is masked in every line written from then on.
     pub fn registry(&self) -> &Arc<SecretRegistry> {
         &self.registry
     }
@@ -1595,6 +1619,33 @@ fn is_secret_env_name(name: &str) -> bool {
         .any(|fragment| lower.contains(fragment))
 }
 
+/// The values of a variable whose name says "secret" that are a switch, not a
+/// secret: `TOKENIZERS_PARALLELISM=false`, `X_TOKEN=true`. The name rule cannot
+/// tell them apart, and masking `false` as a whole token would turn every
+/// `{"x":false}` the log carries into `{"x":[redacted]}`, which is not JSON.
+const BENIGN_ENV_LITERALS: [&str; 12] = [
+    "true", "false", "null", "none", "yes", "no", "on", "off", "default", "enabled", "disabled",
+    "auto",
+];
+
+/// A run of digits this short is a port, a count or a level, not a secret.
+const ENV_DIGITS_MIN_BYTES: usize = 8;
+
+/// Whether the value of an environment variable that the name rule took for a
+/// secret is empty, one of [`BENIGN_ENV_LITERALS`] (ASCII case-insensitively,
+/// the whole value), or only ASCII digits and shorter than
+/// [`ENV_DIGITS_MIN_BYTES`] bytes. Such a value is never given to the registry
+/// (it is `Registration::Ignored` without being asked), so it is not masked and
+/// is not warned about. Only environment values are asked: a token the operator
+/// configured is masked whatever it looks like.
+fn is_benign_env_value(value: &str) -> bool {
+    value.is_empty()
+        || BENIGN_ENV_LITERALS
+            .iter()
+            .any(|literal| value.eq_ignore_ascii_case(literal))
+        || (value.len() < ENV_DIGITS_MIN_BYTES && value.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// What `start` returns when the audit log is on: the way to reach the running
 /// writer. Clones share the writer and its registry. `Debug` prints the number
 /// of registered secrets and nothing else, and there is no `Display`.
@@ -1730,7 +1781,8 @@ fn boot_target(setting: &AuditLogSetting) -> Option<(PathBuf, bool)> {
 
 /// Every secret the writer must mask from the first line: `(source label,
 /// value)`, an empty value skipped. A label names a place and never carries a
-/// value; an environment variable's is `env:<NAME>`.
+/// value; an environment variable's is `env:<NAME>`. An environment value that
+/// is not a secret (see [`is_benign_env_value`]) is skipped too.
 fn configured_secrets(
     cfg: &Config,
     web_token: Option<&str>,
@@ -1758,7 +1810,7 @@ fn configured_secrets(
         add("web.agent_bridge_token", token);
     }
     for (name, value) in env {
-        if is_secret_env_name(name) {
+        if is_secret_env_name(name) && !is_benign_env_value(value) {
             add(&format!("env:{name}"), value);
         }
     }
@@ -6904,5 +6956,331 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    // ---- the field pipeline on the stream's thread (Task W12) ----------
+
+    /// AC50: a secret registered while the writer runs is masked in the line of
+    /// an entry that was already queued and in one recorded afterwards. The
+    /// control stream's file blocks inside its first write, so `e1` waits in the
+    /// queue while the registration is made: masking happens when the line is
+    /// written, not when the entry is recorded.
+    #[test]
+    fn a_late_registration_reaches_a_running_writer() {
+        const LATE: &str = "LATE50TOKENVALUE";
+        let states = [FakeState::gated(), FakeState::plain(), FakeState::plain()];
+        let _release = ReleaseOnDrop(states[0].clone());
+        let writer = fake_writer(&states, Tuning::production());
+        let carrying = |command: &str, at_ms: u64| AuditEntry {
+            args_summary: format!("note {LATE} end"),
+            ..entry(command, Frontend::Operator, at_ms)
+        };
+
+        writer.record(
+            AuditLane::Evidence,
+            entry("e0", Frontend::Operator, BASE_MS),
+        );
+        assert!(
+            wait_until(FLUSH_BUDGET, || states[0].inside()),
+            "the control stream never reached its first write"
+        );
+        writer.record(AuditLane::Evidence, carrying("e1", BASE_MS + 1));
+        assert_eq!(
+            writer.registry().register("test.late", LATE),
+            Registration::Substring
+        );
+        states[0].release();
+        writer.record(AuditLane::Evidence, carrying("e2", BASE_MS + 2));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(fake_shape(&states[0]), ["e0", "e1", "e2"]);
+        for line in states[0].lines() {
+            assert!(!line.contains(LATE), "the secret reached a line: {line}");
+        }
+        let args: Vec<String> = fake_json(&states[0])
+            .iter()
+            .map(|line| line["args"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert_eq!(args, ["{}", "note [redacted] end", "note [redacted] end"]);
+    }
+
+    /// AC16, the text fields (the next task adds `args`): a hand-built hostile
+    /// entry reaches a real file with no secret in it, registered or shaped, no
+    /// control byte other than the two line ends (the `start` marker's and the
+    /// entry's), no DEL and no C1 character, and every field within its cap.
+    #[test]
+    fn a_hostile_text_entry_is_sanitised_before_it_is_written() {
+        const REG: &str = "REGSECRET16XYZ";
+        let dir = scratch("hostile-text");
+        let (ring, writer, paths) = fs_writer(&dir, Tuning::production());
+        writer.registry().register("test.registered", REG);
+        let shaped = format!("ghp_{}", "Cx".repeat(18));
+        let hostile = AuditEntry {
+            client_label: Some("web-bridge\u{202E}\n token=LABELSECRET9".to_string()),
+            connection_id: Some("c".repeat(10 * 1024)),
+            command: format!("a\nb {shaped} {}", "z".repeat(200)),
+            args_summary: format!(
+                "{{\"k\":\"{REG}\"}} \u{9b}\u{7f}{}",
+                "x".repeat(1024 * 1024)
+            ),
+            result: AuditResult::Error(format!(
+                "Bearer REASONSECRET9 \u{1b}[31m \u{9b}2J\u{7f}\nnext {REG}"
+            )),
+            ..entry("unused", Frontend::Mcp, BASE_MS)
+        };
+        ring.append_in(AuditLane::Evidence, hostile);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let raw = fs::read(&paths[1]).expect("read the agent file");
+        let mut failures: Vec<String> = Vec::new();
+        let ends = raw.iter().filter(|byte| **byte == b'\n').count();
+        if ends != 2 {
+            failures.push(format!("left: {ends} line ends, right: 2"));
+        }
+        if let Some(byte) = raw.iter().find(|b| **b < 0x20 && **b != b'\n') {
+            failures.push(format!("the file holds the control byte {byte:#04x}"));
+        }
+        if raw.contains(&0x7f) {
+            failures.push("the file holds DEL".to_string());
+        }
+        if raw.windows(2).any(|pair| pair == [0xC2, 0x9B]) {
+            failures.push("the file holds U+009B".to_string());
+        }
+        let text = String::from_utf8_lossy(&raw);
+        for secret in ["LABELSECRET9", "REASONSECRET9", REG, shaped.as_str()] {
+            if text.contains(secret) {
+                failures.push(format!("{secret} is in the file"));
+            }
+        }
+        let lines = read_lines(&paths[1]);
+        match lines.last() {
+            Some(line) if line.get("command").is_some() => {
+                let chars = |path: &[&str]| {
+                    let mut here = line;
+                    for key in path {
+                        here = &here[*key];
+                    }
+                    let text = here.as_str().unwrap_or("");
+                    (text.chars().count(), text.len())
+                };
+                for (field, path, max_chars, max_bytes) in [
+                    ("client_label", &["client_label"][..], 64, usize::MAX),
+                    ("args", &["args"][..], usize::MAX, 515),
+                    ("result.error", &["result", "error"][..], usize::MAX, 1027),
+                    ("connection_id", &["connection_id"][..], usize::MAX, 64),
+                    ("command", &["command"][..], 128, usize::MAX),
+                ] {
+                    let (got_chars, got_bytes) = chars(path);
+                    if got_chars > max_chars || got_bytes > max_bytes {
+                        failures.push(format!(
+                            "{field}: {got_chars} chars, {got_bytes} bytes; at most {max_chars} chars, {max_bytes} bytes"
+                        ));
+                    }
+                }
+            }
+            other => failures.push(format!("the last line is not the entry: {other:?}")),
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The environment values the rule skips: literals that say "on" or "off"
+    /// rather than hold a secret, and digit runs too short to be one.
+    const BENIGN_ENV_VALUES: [&str; 31] = [
+        "true", "false", "null", "none", "yes", "no", "on", "off", "default", "enabled",
+        "disabled", "auto", "TRUE", "False", "NULL", "None", "Yes", "nO", "ON", "oFF", "Default",
+        "ENABLED", "Disabled", "AUTO", "0", "1", "42", "12345", "1234567", "007", "9999999",
+    ];
+
+    /// The shapes of a real secret a variable named `..._TOKEN` holds.
+    fn env_secret_values() -> [String; 4] {
+        [
+            format!("ghp_{}", "Cq".repeat(18)),
+            "9f86d081884c7d659a2feaa0c55ad015".to_string(),
+            "12345678".to_string(),
+            "1234567a".to_string(),
+        ]
+    }
+
+    /// A value is skipped from the environment rule only when it is one of the
+    /// literals whole (ASCII case-insensitively) or digits only and shorter than
+    /// 8 bytes; a longer digit run, a literal with anything beside it and every
+    /// secret-looking value are registered. The label names the variable, never
+    /// the value. Configured tokens are not subject to the rule at all.
+    #[test]
+    fn the_environment_rule_skips_values_that_are_not_secrets() {
+        let kept_beside: Vec<String> = [
+            "truest",
+            "nothing",
+            " true",
+            "true ",
+            "falsey",
+            "automatic",
+            "yes!",
+            "0x12345",
+            "12345 67",
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+        let mut env: Vec<(String, String)> = Vec::new();
+        for (i, value) in BENIGN_ENV_VALUES.iter().enumerate() {
+            env.push((format!("SKIP{i}_TOKEN"), value.to_string()));
+        }
+        env.push(("EMPTY_TOKEN".to_string(), String::new()));
+        let mut want: Vec<(String, String)> = Vec::new();
+        for (i, value) in env_secret_values()
+            .into_iter()
+            .chain(kept_beside)
+            .enumerate()
+        {
+            let pair = (format!("KEEP{i}_SECRET"), value);
+            env.push(pair.clone());
+            want.push((format!("env:{}", pair.0), pair.1));
+        }
+
+        let cfg = Config::default();
+        let got: Vec<(String, String)> = configured_secrets(&cfg, None, &env)
+            .into_iter()
+            .filter(|(label, _)| label.starts_with("env:"))
+            .collect();
+        assert_eq!(got, want);
+
+        // A configured token keeps full masking whatever it looks like.
+        let mut cfg = Config::default();
+        cfg.mcp.transport = McpTransport::LoopbackTcp {
+            port: 0,
+            token: "on".to_string(),
+            endpoint_file: None,
+        };
+        cfg.mcp.operator_token = Some("false".to_string());
+        cfg.mcp.agent_token = Some("0".to_string());
+        let configured = configured_secrets(&cfg, Some("true"), &env);
+        let first_four: Vec<(&str, &str)> = configured
+            .iter()
+            .take(4)
+            .map(|(label, value)| (label.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            first_four,
+            [
+                ("mcp.transport.token", "on"),
+                ("mcp.operator_token", "false"),
+                ("mcp.agent_token", "0"),
+                ("web.agent_bridge_token", "true"),
+            ]
+        );
+    }
+
+    /// A variable such as `TOKENIZERS_PARALLELISM=false` must not make `false`
+    /// a secret: with it present, ordinary JSON survives byte for byte, the
+    /// boot logs no warning about it, and a real secret-looking value of
+    /// another variable is registered and masked.
+    #[test]
+    fn a_flag_like_environment_value_never_masks_ordinary_text() {
+        let dir = scratch("env-flags");
+        let base = dir.join("audit.jsonl");
+        let secrets = env_secret_values();
+        let env: Vec<(String, String)> = [
+            ("X_TOKEN", "true"),
+            ("TOKENIZERS_PARALLELISM", "false"),
+            ("NULLISH_SECRET", "null"),
+            ("PROMPT_PASSWORD", "none"),
+            ("CLEAR_CREDENTIAL", "default"),
+            ("BARE_TOKEN", "enabled"),
+            ("PORT_TOKEN", "1234567"),
+            ("GITHUB_TOKEN", secrets[0].as_str()),
+            ("BUILD_SECRET", secrets[1].as_str()),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .to_vec();
+
+        let (log, ()) = logged_until("INFO", || {
+            let cfg = config_for(
+                &dir,
+                AuditLogSetting::Path(dir.join("probe").join("a.jsonl")),
+            );
+            let handle = start_tuned(&cfg, &fresh_ring(), None, &env, Tuning::production())
+                .expect("start")
+                .expect("an audit log is on");
+            flush(&handle);
+        });
+        assert!(!log.contains("WARN"), "no warning about a flag: {log}");
+        assert_eq!(log.lines().count(), 1, "only the start line: {log}");
+        assert!(!log.contains("PARALLELISM"), "{log}");
+
+        let cfg = config_for(&dir, AuditLogSetting::Path(base.clone()));
+        let ring = fresh_ring();
+        let handle = start_tuned(&cfg, &ring, None, &env, Tuning::production())
+            .expect("start")
+            .expect("an audit log is on");
+        assert_eq!(handle.registry().len(), 2, "only the two real secrets");
+        let flags =
+            r#"{"a":false,"b":true,"c":null,"d":"none","e":"default","f":"enabled","g":1234567}"#;
+        let benign = AuditEntry {
+            args_summary: flags.to_string(),
+            ..entry("flag.use", Frontend::Mcp, BASE_MS)
+        };
+        let leaking = AuditEntry {
+            args_summary: format!(
+                "{{\"u\":\"x?next={}\",\"h\":\"{}\"}}",
+                secrets[0], secrets[1]
+            ),
+            ..entry("secret.use", Frontend::Mcp, BASE_MS + 1)
+        };
+        ring.append_in(AuditLane::Evidence, benign.clone());
+        ring.append_in(AuditLane::Evidence, leaking);
+        flush(&handle);
+
+        let agent = stream_path(&base, StreamKind::Agent);
+        let written: Vec<String> = fs::read_to_string(&agent)
+            .expect("read the agent file")
+            .lines()
+            .filter(|line| line.contains("\"command\""))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert_eq!(written[0], aitm_ca::audit::entry_to_jsonl(&benign));
+        let leaked = read_lines(&agent);
+        assert_eq!(
+            leaked[2]["args"],
+            r#"{"u":"x?next=[redacted]","h":"[redacted]"}"#
+        );
+    }
+
+    /// A configured token is masked whatever it looks like: the environment
+    /// rule that skips `true` and `false` does not apply to the five sources
+    /// the operator configured.
+    #[test]
+    fn a_configured_token_keeps_full_masking_whatever_its_value() {
+        let dir = scratch("configured-literals");
+        let mut cfg = config_for(&dir, AuditLogSetting::Path(dir.join("audit.jsonl")));
+        cfg.mcp.operator_token = Some("false".to_string());
+        cfg.mcp.agent_token = Some("12345".to_string());
+        let handle = start_tuned(
+            &cfg,
+            &fresh_ring(),
+            Some("true"),
+            &[("X_TOKEN".to_string(), "null".to_string())],
+            Tuning::production(),
+        )
+        .expect("start")
+        .expect("an audit log is on");
+        flush(&handle);
+        assert_eq!(
+            handle.registry().len(),
+            3,
+            "the environment's `null` is not one"
+        );
+        assert_eq!(handle.registry().mask("a false b"), "a [redacted] b");
+        assert_eq!(handle.registry().mask("a 12345 b"), "a [redacted] b");
+        assert_eq!(handle.registry().mask("a true b"), "a [redacted] b");
+        assert_eq!(handle.registry().mask("a null b"), "a null b");
     }
 }

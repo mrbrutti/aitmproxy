@@ -434,3 +434,83 @@ fn no_registered_command_name_starts_with_audit() {
         .collect();
     assert!(audit.is_empty(), "no command is named audit.*: {audit:?}");
 }
+
+/// AC17 (guard). An entry `record_audit` produced for a real call is written as
+/// exactly `entry_to_jsonl(&entry)`: the writer's field pipeline changes nothing
+/// an honest call carries. The calls cover every stream and both results (an
+/// operator's `agent.set`, an agent's `flow.list`, the agent's refused
+/// `agent.set`, and two refused sensitive calls, `scope.add` and `scope.remove`,
+/// whose `host` argument is one of the shapes where `scrub_text` over JSON text
+/// was not a no-op: an `Authorization` header in a value, and escaped line
+/// breaks around a `Cookie` header). The sorted set of entry lines over the
+/// three files equals the sorted set of `entry_to_jsonl` of what the ring holds,
+/// and the secret is in no file.
+#[test]
+fn an_honest_entry_is_written_unchanged() {
+    let rig = Rig::new("ac17");
+    let srv = rig.shared_server();
+    let operator = streaming(&srv, Frontend::Operator, None);
+    let agent = streaming(&srv, Frontend::Mcp, Some("wiring-agent"));
+
+    let call = |conn: &ConnCtx, name: &str, arguments: Value| {
+        srv.handle_on(conn, &call_line(name, arguments))
+            .unwrap_or_else(|| panic!("a reply to {name}"));
+    };
+    call(&operator, "agent.set", json!({"policy": "auto"}));
+    call(&agent, "flow.list", json!({}));
+    call(&agent, "agent.set", json!({"policy": "auto"}));
+    call(
+        &agent,
+        "scope.add",
+        json!({"host": "Authorization: Bearer SECRET47"}),
+    );
+    call(
+        &agent,
+        "scope.remove",
+        json!({"host": "GET /\r\nCookie: a=b; z=SECRET47\r\nHost: x"}),
+    );
+
+    let files = rig.finish();
+    files.assert_start_markers();
+    let ring = rig.assembled.audit_ring.recent(None, None);
+    assert_eq!(ring.len(), 5, "five calls, five entries: {ring:?}");
+
+    let kinds = [StreamKind::Control, StreamKind::Agent, StreamKind::Reads];
+    let mut written: Vec<String> = kinds
+        .into_iter()
+        .flat_map(|kind| {
+            let path = stream_path(&rig.base, kind);
+            fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+                .lines()
+                .filter(|line| line.contains("\"command\""))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut expected: Vec<String> = ring.iter().map(aitm_ca::audit::entry_to_jsonl).collect();
+    written.sort();
+    expected.sort();
+    assert_eq!(written, expected);
+
+    let hosts: Vec<&str> = entries(&files.agent)
+        .iter()
+        .filter(|line| matches!(line["command"].as_str(), Some("scope.add" | "scope.remove")))
+        .filter_map(|line| line["args"].as_str())
+        .collect();
+    assert_eq!(
+        hosts,
+        [
+            r#"{"host":"Authorization: [redacted]"}"#,
+            r#"{"host":"GET /\r\nCookie: [redacted]\r\nHost: x"}"#,
+        ]
+    );
+    for kind in kinds {
+        let text = fs::read_to_string(stream_path(&rig.base, kind)).unwrap_or_default();
+        assert!(
+            !text.contains("SECRET47"),
+            "{}: a secret reached the file",
+            kind.label()
+        );
+    }
+}

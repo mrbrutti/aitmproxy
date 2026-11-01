@@ -46,6 +46,14 @@ const WHOLE_TOKEN_MIN_BYTES: usize = 4;
 /// The warning says `shorter than 8`: keep the two in step.
 const SUBSTRING_MIN_BYTES: usize = 8;
 
+/// The ending of a text must be at least this many bytes of a secret for
+/// [`SecretRegistry::mask_trailing_fragment`] to take it for one cut in half.
+const FRAGMENT_MIN_BYTES: usize = 6;
+
+/// The marker a producer's cap puts after the text it cut: the ring's own, which
+/// the writer's caps use too (see `pipeline`).
+pub(super) const CUT_MARK: &str = "\u{2026}";
+
 /// How a secret was taken in. It carries no value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Registration {
@@ -130,6 +138,19 @@ impl SecretRegistry {
     /// lock is held while this runs.
     pub fn mask(&self, text: &str) -> String {
         self.current().mask(text)
+    }
+
+    /// `text` with a registered secret that a cut left at its end masked: when
+    /// `text` (ignoring one trailing `…`, the marker a producer's cap puts after
+    /// a cut) ends with a prefix of 6 bytes or more of a secret of 8 bytes or
+    /// more, in any stored form, that fragment becomes `[redacted]` and the
+    /// marker is put back. The longest such ending wins. A whole secret is
+    /// masked by [`mask`](Self::mask); this is for the part of one that a cap
+    /// kept. A fragment shorter than 6 bytes is not masked: it is too common to
+    /// tell from text (Design 14.4, Residual risks). No lock is held while this
+    /// runs.
+    pub(crate) fn mask_trailing_fragment(&self, text: &str) -> String {
+        self.current().mask_trailing_fragment(text)
     }
 
     /// How many distinct secrets are stored (ignored ones are not).
@@ -219,6 +240,42 @@ impl Snapshot {
         }
         out.push_str(text.get(copied..).unwrap_or_default());
         out
+    }
+
+    /// See [`SecretRegistry::mask_trailing_fragment`].
+    fn mask_trailing_fragment(&self, text: &str) -> String {
+        let (body, marker) = match text.strip_suffix(CUT_MARK) {
+            Some(body) => (body, CUT_MARK),
+            None => (text, ""),
+        };
+        let Some(start) = self.fragment_start(body) else {
+            return text.to_string();
+        };
+        let mut out = String::with_capacity(start + MASK.len() + marker.len());
+        // `start` is a character boundary of `body`; a failed `get` would drop
+        // text, never keep it.
+        out.push_str(body.get(..start).unwrap_or_default());
+        out.push_str(MASK);
+        out.push_str(marker);
+        out
+    }
+
+    /// Where the longest ending of `body` that is a prefix of a stored form
+    /// begins, when that ending is [`FRAGMENT_MIN_BYTES`] bytes or more. Only
+    /// the forms of `Substring` secrets are looked at: a `WholeToken` secret is
+    /// shorter than 8 bytes. The scan is bounded by the length of `body` and of
+    /// the longest form, and tries the earliest start first, so the first match
+    /// is the longest ending.
+    fn fragment_start(&self, body: &str) -> Option<usize> {
+        let longest = self.substrings.iter().map(String::len).max()?;
+        let earliest = body.len().saturating_sub(longest);
+        let latest = body.len().checked_sub(FRAGMENT_MIN_BYTES)?;
+        (earliest..=latest)
+            .filter(|at| body.is_char_boundary(*at))
+            .find(|at| {
+                let ending = body.get(*at..).unwrap_or_default();
+                self.substrings.iter().any(|form| form.starts_with(ending))
+            })
     }
 }
 
@@ -745,5 +802,132 @@ mod tests {
         assert_eq!(format!("{:?}", Registration::Substring), "Substring");
         assert_eq!(format!("{:?}", Registration::WholeToken), "WholeToken");
         assert_eq!(format!("{:?}", Registration::Ignored), "Ignored");
+    }
+
+    /// The rows whose trailing-fragment mask is not the wanted text.
+    fn failing_fragment_rows(
+        registry: &SecretRegistry,
+        rows: &[(&str, &str, &str)],
+    ) -> Vec<String> {
+        rows.iter()
+            .filter_map(|(name, text, want)| {
+                let got = registry.mask_trailing_fragment(text);
+                (got != *want).then(|| format!("{name}: {text:?} gave {got:?}, wanted {want:?}"))
+            })
+            .collect()
+    }
+
+    /// Design 14.4, cut secrets: a text that ends with a prefix of 6 bytes or
+    /// more of a registered secret loses that fragment, the producer's `…`
+    /// marker is set aside and put back, and the longest fragment wins.
+    #[test]
+    fn a_trailing_fragment_of_a_registered_secret_is_masked() {
+        let registry = SecretRegistry::new();
+        registry.register("test.cut", "CUT12SECRETVALUE0123456789");
+        registry.register("test.overlap", "ABABABABCD");
+        let failures = failing_fragment_rows(
+            &registry,
+            &[
+                ("ten bytes", "see CUT12SECRE", "see [redacted]"),
+                (
+                    "ten bytes and the marker",
+                    "see CUT12SECRE…",
+                    "see [redacted]…",
+                ),
+                ("exactly six bytes", "x CUT12S", "x [redacted]"),
+                ("five bytes stay", "x CUT12", "x CUT12"),
+                ("the whole text is the fragment", "CUT12SECRE", "[redacted]"),
+                (
+                    "the whole secret at the end",
+                    "x CUT12SECRETVALUE0123456789",
+                    "x [redacted]",
+                ),
+                (
+                    "not at the end",
+                    "CUT12SECRE and more",
+                    "CUT12SECRE and more",
+                ),
+                (
+                    "one marker is set aside, not two",
+                    "x CUT12SECRE……",
+                    "x CUT12SECRE……",
+                ),
+                (
+                    "a two-byte character before the fragment",
+                    "é CUT12SECRE",
+                    "é [redacted]",
+                ),
+                ("shorter than six", "CUT1", "CUT1"),
+                ("empty", "", ""),
+                ("only the marker", "…", "…"),
+                ("no fragment, a marker", "plain text…", "plain text…"),
+                // `ABABAB` and `ABABABAB` both end the text and both start the
+                // secret: the longer one is masked, not the shorter.
+                ("the longest fragment wins", "xABABABABAB", "xAB[redacted]"),
+            ],
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Every stored form of a secret is a form a cut can leave: the raw one, the
+    /// JSON-escaped one and the percent-encoded ones in both cases of hex.
+    #[test]
+    fn a_trailing_fragment_is_found_in_every_stored_form() {
+        let registry = SecretRegistry::new();
+        registry.register("test.base64", "Zm9v+YmFy/Ymf=ZZ99");
+        registry.register("test.json", "ab\"cd\\ef12345");
+        registry.register("test.utf8", "héllo-wörld-12345");
+        let failures = failing_fragment_rows(
+            &registry,
+            &[
+                ("raw", "next=Zm9v+YmFy/Y", "next=[redacted]"),
+                (
+                    "percent, upper-case hex",
+                    "u?next=Zm9v%2BYmFy%2",
+                    "u?next=[redacted]",
+                ),
+                (
+                    "percent, lower-case hex",
+                    "u?next=Zm9v%2bYmFy%2f",
+                    "u?next=[redacted]",
+                ),
+                ("JSON-escaped", r#"x ab\"cd\\ef1"#, "x [redacted]"),
+                ("raw with the quote", "x ab\"cd\\ef1", "x [redacted]"),
+                ("multi-byte, raw", "x héllo-w", "x [redacted]"),
+                (
+                    "multi-byte, percent",
+                    "x h%C3%A9llo-w%C3%B6",
+                    "x [redacted]",
+                ),
+            ],
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Only a secret of 8 bytes or more is cut-masked: a short secret is masked
+    /// as a whole token and a fragment of it is not a secret. An empty registry
+    /// changes nothing.
+    #[test]
+    fn only_a_secret_of_eight_bytes_or_more_is_cut_masked() {
+        let registry = SecretRegistry::new();
+        // A long secret too, so that the scan runs and a short one could be taken.
+        registry.register("test.long", "CUT12SECRETVALUE0123456789");
+        registry.register("test.short", "abcdefg");
+        registry.register("test.tiny", "qzx");
+        let failures = failing_fragment_rows(
+            &registry,
+            &[
+                ("a fragment of a 7-byte secret", "x abcdef", "x abcdef"),
+                ("a fragment of an ignored one", "x qzx", "x qzx"),
+            ],
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+        let empty = SecretRegistry::new();
+        let failures = failing_fragment_rows(
+            &empty,
+            &[("an empty registry", "see CUT12SECRE…", "see CUT12SECRE…")],
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
