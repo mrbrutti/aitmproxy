@@ -847,6 +847,19 @@ impl PointRunner {
         // waits for it.
         let mut alive = false;
         for _ in 0..reproduce_count {
+            // A replay is a case (call C10), so the job's ceiling bounds it
+            // exactly as it bounds the fuzz loop: with no room left there is
+            // no reproduction to be had, and the triage stops before it even
+            // waits for the target (tester finding F2). Per finding F1 an
+            // interrupted triage is not a crash.
+            let job_id = self.job.job_id();
+            if self.shared.state.cases_remaining(job_id) == Some(0) {
+                let cap = self.shared.state.cases_cap(job_id).unwrap_or(0);
+                let reason = StopReason::CaseCap(cap);
+                self.stop(reason.clone());
+                triage.stop = Some(reason);
+                return triage;
+            }
             if !alive {
                 match self.await_recovery().await {
                     // The replay below sets `alive` from its own probes.
@@ -1731,6 +1744,52 @@ mod tests {
             })
         );
         assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+    }
+
+    /// Tester finding F2: spec D8.4 caps a job at `cases_cap` cases and a
+    /// reproduction replay is a case (call C10), so a crash triage that has
+    /// no room left is interrupted rather than allowed to overshoot. The
+    /// interrupted triage is not a crash (finding F1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replays_never_exceed_the_case_cap() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        // Two cases is the whole job: the crashing case is the last one the
+        // cap allows, so not one replay fits.
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 2), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert_eq!(run.stopped, Some(StopReason::CaseCap(2)));
+        assert!(
+            run.crash.is_none(),
+            "a triage with no room to replay proves nothing: {:?}",
+            run.crash
+        );
+        assert_eq!(run.cases.len(), 2);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 2,
+                crashes: 0,
+                liveness_failures: 2,
+                retired_elements: 0,
+            })
+        );
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+        // 1 baseline + 2 cases + the 2 failed probes, and nothing after: no
+        // replay, and no recovery poll spent waiting for one.
+        assert_eq!(mock.inject_count(), 5);
+        assert_eq!(job.charged(), 5);
+        assert_eq!(shared.state.cases_remaining(job.job_id()), Some(0));
+        assert_eq!(
+            shared.state.stopped(job.job_id()),
+            Some(StopReason::CaseCap(2)),
+            "the cap is job-wide: no later point sends another case"
+        );
     }
 
     /// Tester (stage 5): the job deadline passes while the runner is polling

@@ -53,6 +53,10 @@ pub enum StopReason {
     ConsecutiveTimeouts(u32),
     /// The job's stimulus budget is spent.
     Budget,
+    /// The job's case ceiling is spent: `cases_cap` cases have been sent, so
+    /// not even a reproduction replay may go out (spec D8.4, "cases per job
+    /// <= 5000"; tester finding F2).
+    CaseCap(u32),
     /// The job's deadline passed.
     Deadline,
     /// The operator cancelled the job.
@@ -70,6 +74,7 @@ impl fmt::Display for StopReason {
                 write!(f, "consecutive_timeouts: {n} silent cases in a row")
             }
             Self::Budget => write!(f, "budget exhausted"),
+            Self::CaseCap(cap) => write!(f, "case cap reached: {cap} cases sent"),
             Self::Deadline => write!(f, "job deadline passed"),
             Self::Cancelled => write!(f, "job cancelled"),
             Self::GuardRefused(m) => write!(f, "guard refused: {m}"),
@@ -409,6 +414,27 @@ impl LaneState {
             let sent = u32::try_from(job.stats.l4.cases).unwrap_or(u32::MAX);
             share.min(job.stats.cases_cap.saturating_sub(sent))
         })
+    }
+
+    /// How much of the job's case ceiling is left: `cases_cap` minus the
+    /// cases already sent, never below zero. `None` when the job is unknown.
+    ///
+    /// [`Self::allocate_cases`] bounds one point's fuzz loop; this is what a
+    /// send outside that loop — a crash triage's reproduction replay — checks
+    /// before it spends a case (tester finding F2).
+    #[must_use]
+    pub fn cases_remaining(&self, job_id: &str) -> Option<u32> {
+        self.with_job(job_id, |job| {
+            let sent = u32::try_from(job.stats.l4.cases).unwrap_or(u32::MAX);
+            job.stats.cases_cap.saturating_sub(sent)
+        })
+    }
+
+    /// The job's case ceiling, already clamped to [`CASES_CEILING`]. `None`
+    /// when the job is unknown.
+    #[must_use]
+    pub fn cases_cap(&self, job_id: &str) -> Option<u32> {
+        self.with_job(job_id, |job| job.stats.cases_cap)
     }
 
     /// Record one case's outcome.
@@ -1046,6 +1072,45 @@ mod tests {
             StopReason::Unavailable("no bpf".to_string()).to_string(),
             "l4 unavailable: no bpf"
         );
+        assert_eq!(
+            StopReason::CaseCap(5000).to_string(),
+            "case cap reached: 5000 cases sent"
+        );
+    }
+
+    /// Tester finding F2: the job's case ceiling is readable while the job
+    /// runs, so the crash triage can refuse a replay the cap has no room for.
+    #[test]
+    fn cases_remaining_counts_down_from_the_cap() {
+        let state = LaneState::new();
+        state.begin_job("scan-rem", vec![plan_fixture()], points(1), 3, 20, false);
+
+        assert_eq!(state.cases_remaining("scan-rem"), Some(3));
+        assert_eq!(
+            state.record_case("scan-rem", CaseClass::Clean, true),
+            Ok(())
+        );
+        assert_eq!(state.cases_remaining("scan-rem"), Some(2));
+        // An unsendable case is counted apart and spends no room.
+        assert_eq!(
+            state.record_case("scan-rem", CaseClass::Silence, false),
+            Ok(())
+        );
+        assert_eq!(state.cases_remaining("scan-rem"), Some(2));
+        for _ in 0..2 {
+            assert_eq!(
+                state.record_case("scan-rem", CaseClass::Clean, true),
+                Ok(())
+            );
+        }
+        assert_eq!(state.cases_remaining("scan-rem"), Some(0));
+        // The counter never wraps past the cap.
+        assert_eq!(
+            state.record_case("scan-rem", CaseClass::Clean, true),
+            Ok(())
+        );
+        assert_eq!(state.cases_remaining("scan-rem"), Some(0));
+        assert_eq!(state.cases_remaining("scan-nope"), None);
     }
 
     /// Tester (stage 5): `CrashRecord` and `PointRun` print bytes as counts,
