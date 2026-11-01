@@ -4,20 +4,26 @@
 //!
 //! Presence is what `find-certificate -a -Z` prints. Trust is one
 //! `verify-cert -l -L -p basic` evaluation, run only when the certificate is
-//! present (spec D17.3). The policy is `basic`, not `ssl`, because Task 32's
-//! probe showed `-p ssl` rejects every CA certificate with "Invalid Extended
-//! Key Usage for policy", trusted or not; our install sets both policies, so a
-//! `basic` verdict reflects HTTPS trust for every path the app offers. Trust
-//! settings are per user and per certificate hash, not per keychain, so both
-//! scopes report the same evaluation. Every mutation is check-first, which
-//! keeps the design independent of what a duplicate `add-trusted-cert` does.
+//! present (spec D17.3). The policy is `basic`, not `ssl`: `-p ssl` rejects
+//! every CA certificate with "Invalid Extended Key Usage for policy", trusted
+//! or not (the read-only probe recorded under "Task 32 result" in
+//! `docs/superpowers/plans/2026-10-31-ca-trust-first-run-plan.md`); our
+//! install sets both policies, so a `basic` verdict reflects HTTPS trust for
+//! every path the app offers. Trust settings are per user and per certificate
+//! hash, not per keychain, so both scopes report the same evaluation. Every
+//! mutation is check-first, and `install` on a present certificate reads
+//! trust back and replaces an untrusted copy (plan correction 8), which keeps
+//! the design independent of what a duplicate `add-trusted-cert` does.
 
 use crate::cert::CaCert;
 use crate::exec::{CmdLine, CmdOutput, Executor};
-use crate::platform::{cmd, failure_text, run, sudo_if_needed};
+use crate::platform::{
+    cmd, failure_text, failure_text_with_tail, run, stderr_tail, sudo_if_needed, tail_of,
+};
 use crate::store::{
     Change, Platform, Presence, Scope, StoreStatus, Trust, TrustError, TrustErrorKind, TrustStore,
 };
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MacOsStore;
@@ -32,7 +38,8 @@ const DETAIL: &str = "macOS: presence from `security find-certificate`; trust fr
                       verify-cert` (basic policy, local only; our install sets the ssl and \
                       basic policies together)";
 
-/// `verify-cert`'s stdout contains this on exit 0 (Task 32's literal).
+/// `verify-cert`'s stdout contains this on exit 0 (the literal the probe
+/// quoted; see the module docs).
 const VERIFY_SUCCESS: &str = "certificate verification successful";
 
 /// What `add-trusted-cert` says (case-insensitively) when the authentication
@@ -221,23 +228,8 @@ fn is_cancelled(out: &CmdOutput) -> bool {
 /// `verify-cert` prints its verdict (`Cert Verify Result: …`) on stdout, so a
 /// failed evaluation's tail is taken from both streams, stdout first.
 fn verify_failure_text(cmd: &CmdLine, out: &CmdOutput) -> String {
-    let lines: Vec<&str> = out
-        .stdout
-        .lines()
-        .chain(out.stderr.lines())
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let start = lines.len().saturating_sub(5);
-    let tail = lines[start..].join(" | ");
-    let code = out
-        .code
-        .map_or_else(|| "on a signal".to_string(), |c| c.to_string());
-    if tail.is_empty() {
-        format!("`{}` exited {code}", cmd.render())
-    } else {
-        format!("`{}` exited {code}: {tail}", cmd.render())
-    }
+    let tail = tail_of(out.stdout.lines().chain(out.stderr.lines()));
+    failure_text_with_tail(cmd, out, &tail)
 }
 
 impl TrustStore for MacOsStore {
@@ -284,8 +276,40 @@ impl TrustStore for MacOsStore {
     fn install(&self, cert: &CaCert, scope: Scope, exec: &dyn Executor) -> anyhow::Result<Change> {
         let mut op = Op::new(cert, scope, exec)?;
         let keychain = op.keychain.clone();
+        let mut detail = Vec::new();
         if op.presence()? == Presence::Present {
-            return Ok(op.finish(false, vec![format!("already present in {keychain}")]));
+            // Presence is not trust: a copy left by a dismissed dialog whose
+            // rollback failed, or imported by hand, has no trust settings.
+            match op.verify_trust() {
+                Ok((Trust::Yes, _)) => {
+                    return Ok(op.finish(
+                        false,
+                        vec![format!("already present and trusted in {keychain}")],
+                    ));
+                }
+                Err(e) => {
+                    return Ok(op.finish(
+                        false,
+                        vec![format!("already present in {keychain}"), e.to_string()],
+                    ));
+                }
+                Ok(_) => {
+                    let sha256 = cert.sha256_hex();
+                    let (cmd, out) =
+                        op.mutate("delete-certificate", false, &["-Z", &sha256, &keychain])?;
+                    if !out.success() {
+                        return Err(TrustError::new(
+                            TrustErrorKind::ToolFailed,
+                            format!(
+                                "could not remove the untrusted copy from {keychain}: {}",
+                                failure_text(&cmd, &out)
+                            ),
+                        )
+                        .into());
+                    }
+                    detail.push(format!("replaced the untrusted copy in {keychain}"));
+                }
+            }
         }
 
         let path = cert.path.display().to_string();
@@ -305,27 +329,26 @@ impl TrustStore for MacOsStore {
             ],
         )?;
         if out.success() {
-            return Ok(op.finish(
-                true,
-                vec![format!(
-                    "added to {keychain} as a trusted root for ssl and basic"
-                )],
+            detail.push(format!(
+                "added to {keychain} as a trusted root for ssl and basic"
             ));
+            return Ok(op.finish(true, detail));
         }
 
-        let kind = if is_headless(&out) {
-            TrustErrorKind::HeadlessAuth
+        let (kind, mut message) = if is_headless(&out) {
+            (
+                TrustErrorKind::HeadlessAuth,
+                format!("{HEADLESS_HINT} ({})", failure_text(&cmd, &out)),
+            )
         } else if is_cancelled(&out) {
-            TrustErrorKind::Cancelled
+            debug!(
+                target: "aitm_ca",
+                stderr_tail = stderr_tail(&out).as_str(),
+                "add-trusted-cert classified as cancelled"
+            );
+            (TrustErrorKind::Cancelled, CANCELLED_MESSAGE.to_string())
         } else {
-            TrustErrorKind::ToolFailed
-        };
-        let mut message = match kind {
-            TrustErrorKind::HeadlessAuth => {
-                format!("{HEADLESS_HINT} ({})", failure_text(&cmd, &out))
-            }
-            TrustErrorKind::Cancelled => CANCELLED_MESSAGE.to_string(),
-            _ => failure_text(&cmd, &out),
+            (TrustErrorKind::ToolFailed, failure_text(&cmd, &out))
         };
 
         // Rollback, best effort: a failed add-trusted-cert can leave the

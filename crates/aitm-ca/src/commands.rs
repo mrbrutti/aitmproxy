@@ -380,17 +380,11 @@ fn location_for(platform: &Platform, scope: Scope, exec: &dyn Executor) -> Optio
     }
 }
 
-/// The `TrustErrorKind` behind an error, for the failure log line.
-/// `Cancelled` is `"cancelled"` (spec D17.4, the word every frontend keys
-/// on); the other kinds keep their Debug names.
-fn kind_name(err: &anyhow::Error) -> String {
-    err.downcast_ref::<TrustError>().map_or_else(
-        || "Other".to_string(),
-        |e| match e.kind {
-            TrustErrorKind::Cancelled => "cancelled".to_string(),
-            kind => format!("{kind:?}"),
-        },
-    )
+/// The `TrustErrorKind` behind an error, for the failure log line
+/// (`TrustErrorKind::label`); `"Other"` when it is not a `TrustError`.
+fn kind_name(err: &anyhow::Error) -> &'static str {
+    err.downcast_ref::<TrustError>()
+        .map_or("Other", |e| e.kind.label())
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +939,33 @@ impl Command for Change {
         let scope = Self::resolve_scope(&platform, args.scope).map_err(|e| audit.fail(e.into()))?;
         audit.scope = Some(scope.label().to_string());
 
+        // Where a user scope exists, the System keychain is the terminal's
+        // alone (spec D17.1, D17.14): a bus client never makes the core spawn
+        // `sudo`. Linux has only the system scope and is unchanged (D17.13).
+        if scope == Scope::System
+            && frontend != Frontend::Cli
+            && platform.scopes().contains(&Scope::User)
+        {
+            let refusal = TrustError::new(
+                TrustErrorKind::UnsupportedScope,
+                format!(
+                    "system scope needs a terminal: run `aitm ca {} --scope system` yourself; \
+                     the app and the bus clients use the login keychain",
+                    op.verb()
+                ),
+            );
+            warn!(
+                target: "aitm_ca",
+                command = op.name(),
+                frontend = audit.frontend,
+                scope = scope.label(),
+                platform = platform.label(),
+                kind = refusal.kind.label(),
+                "refused: the System keychain is reachable from the CLI only"
+            );
+            return Err(audit.fail(refusal.into()));
+        }
+
         let store = store_for(&platform);
         let apply = |exec: &dyn Executor| match op {
             Op::Install => store.install(&cert, scope, exec),
@@ -964,7 +985,7 @@ impl Command for Change {
                     fingerprint_sha256 = fingerprint.as_str(),
                     scope = scope.label(),
                     platform = platform.label(),
-                    kind = kind_name(&err).as_str(),
+                    kind = kind_name(&err),
                     error = format!("{err:#}").as_str(),
                     "OS trust store change failed"
                 );

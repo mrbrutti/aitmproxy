@@ -246,8 +246,12 @@ fn reader_rejects_an_unknown_frontend() {
         let tampered = json.replace("\"frontend\":\"cli\"", &format!("\"frontend\":\"{bad}\""));
         assert_ne!(tampered, json, "replacement did not apply for {bad:?}");
         let err = serde_json::from_str::<AuditRecord>(&tampered).unwrap_err();
+        // `intern` reports an unknown variant with the vocabulary, so even
+        // the empty string pins something: the exact three words.
         assert!(
-            err.to_string().contains("frontend") || err.to_string().contains(bad),
+            err.to_string().starts_with(&format!(
+                "unknown variant `{bad}`, expected one of `cli`, `mcp`, `operator`"
+            )),
             "{bad:?}: {err}"
         );
     }

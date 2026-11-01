@@ -12,7 +12,10 @@ use aitm_ca::store::{
     store_for, LinuxFamily, Platform, Presence, Scope, Trust, TrustError, TrustErrorKind,
     TrustStore,
 };
-use aitm_ca::testing::{ScriptedExecutor, FIXTURE_FP1, FIXTURE_FP256};
+use aitm_ca::testing::{
+    ScriptedExecutor, CANCEL_STDERR, FIXTURE_FP1, FIXTURE_FP256, MACOS_DETAIL, NOT_TRUSTED,
+    VERIFY_OK, VERIFY_SPAWN_FAILURE, VERIFY_USER,
+};
 
 /// The checked-in fixture CA, exactly as `ca.crt` on disk.
 const FIXTURE: &[u8] = include_bytes!("fixtures/ca.crt");
@@ -24,23 +27,6 @@ const Q_SYS: &str = "security find-certificate -a -Z /Library/Keychains/System.k
 
 /// What `security add-trusted-cert` prints on stderr in an SSH session.
 const HEADLESS_STDERR: &str = "SecTrustSettingsSetTrustSettings: The authorization was denied since no user interaction was possible";
-
-/// What `security add-trusted-cert` prints on stderr when the authentication
-/// dialog is dismissed (spec D17.4's literal, confirmed or corrected by Task 40).
-const CANCEL_STDERR: &str =
-    "SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.";
-
-/// The trust read-back Task 32 chose, as `status` renders it.
-const VERIFY_USER: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
-/// `verify-cert`'s stdout on exit 0 (Task 32).
-const VERIFY_OK: &str = "/ca/ca.crt: certificate verification successful.";
-/// `verify-cert`'s output tail on a non-zero exit for an untrusted CA (Task 32).
-const NOT_TRUSTED: &str = "Cert Verify Result: CSSMERR_TP_NOT_TRUSTED";
-
-/// Every macOS status answer carries this.
-const MACOS_DETAIL: &str = "trust from `security verify-cert`";
-/// The one `detail` line naming what ran (spec D17.3, policy per Task 32).
-const DETAIL: &str = "macOS: presence from `security find-certificate`; trust from `security verify-cert` (basic policy, local only; our install sets the ssl and basic policies together)";
 
 /// Uppercase hex without separators — the form `find-certificate -Z` prints.
 fn fp256_hex() -> String {
@@ -172,37 +158,6 @@ fn status_present_absent_sha1_only() {
 /// Delegates to a `ScriptedExecutor` but cannot spawn `security verify-cert`
 /// (the tool is missing), the way `RealExecutor` fails when a program cannot
 /// start.
-struct VerifyUnspawnable(ScriptedExecutor);
-
-const VERIFY_SPAWN_FAILURE: &str = "could not start `security verify-cert -c /ca/ca.crt -l -L -p basic`: No such file or directory (os error 2)";
-
-impl Executor for VerifyUnspawnable {
-    fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
-        if cmd.args.first().map(String::as_str) == Some("verify-cert") {
-            // Recorded like every other run, then refused like a missing tool.
-            let _ = self.0.run(cmd);
-            anyhow::bail!("{VERIFY_SPAWN_FAILURE}");
-        }
-        self.0.run(cmd)
-    }
-
-    fn read_file(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-        self.0.read_file(path)
-    }
-
-    fn dir_exists(&self, path: &Path) -> bool {
-        self.0.dir_exists(path)
-    }
-
-    fn home_dir(&self) -> Option<PathBuf> {
-        self.0.home_dir()
-    }
-
-    fn is_root(&self) -> bool {
-        self.0.is_root()
-    }
-}
-
 // SP-AC31 (D17.3): trust comes from one `verify-cert` evaluation, run only
 // when the certificate is present.
 #[test]
@@ -218,7 +173,7 @@ fn status_reads_trust_with_verify_cert() {
     assert_eq!(st.installed, Presence::Present);
     assert_eq!(st.trusted, Trust::Yes);
     assert_eq!(exec.runs().last().map(String::as_str), Some(VERIFY_USER));
-    assert_eq!(st.detail, vec![DETAIL.to_string()]);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
 
     // Present + non-zero exit: not trusted, the output tail in detail
     // (whichever stream `security` printed it on).
@@ -264,10 +219,15 @@ fn status_reads_trust_with_verify_cert() {
     assert_eq!(st.installed, Presence::Absent);
     assert_eq!(st.trusted, Trust::No);
     assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
-    assert_eq!(st.detail, vec![DETAIL.to_string()]);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
 
     // Present + verify-cert unspawnable: unknown, with the failure text.
-    let exec = VerifyUnspawnable(ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), ""));
+    let exec = ScriptedExecutor::new().unspawnable("verify-cert").respond(
+        Q_USER,
+        0,
+        &present_output(),
+        "",
+    );
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Present);
     assert_eq!(st.trusted, Trust::Unknown);
@@ -277,7 +237,7 @@ fn status_reads_trust_with_verify_cert() {
         st.detail
     );
     assert_eq!(
-        exec.0.runs(),
+        exec.runs(),
         vec![Q_USER.to_string(), VERIFY_USER.to_string()]
     );
     assert!(st.detail.iter().any(|d| d.contains(MACOS_DETAIL)));
@@ -345,12 +305,21 @@ fn install_user_idempotent() {
     assert_eq!(change.location, K_USER);
     assert_eq!(change.commands, exec.runs());
 
-    // Present: the query alone, nothing added.
-    let exec = ScriptedExecutor::new().respond(Q_USER, 0, &present_output(), "");
+    // Present and trusted: the query and the read-back, nothing added.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 0, VERIFY_OK, "");
     let change = store.install(&cert, Scope::User, &exec).unwrap();
-    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_USER.to_string()]
+    );
     assert!(!change.changed);
     assert_eq!(change.location, K_USER);
+    assert_eq!(
+        change.detail,
+        vec![format!("already present and trusted in {K_USER}")]
+    );
 }
 
 // CA-AC10
@@ -757,7 +726,7 @@ fn status_present_detail_names_the_trust_check() {
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Present);
     assert_eq!(st.trusted, Trust::Yes);
-    assert_eq!(st.detail, vec![DETAIL.to_string()]);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
     assert!(
         !st.detail.iter().any(|d| d.contains("UNCONFIRMED")),
         "the old unconfirmed claim is gone: {:?}",
@@ -769,7 +738,7 @@ fn status_present_detail_names_the_trust_check() {
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Absent);
     assert_eq!(st.trusted, Trust::No);
-    assert_eq!(st.detail, vec![DETAIL.to_string()]);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
     assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
 }
 
@@ -805,7 +774,7 @@ fn status_verify_cert_output_edges() {
     assert_eq!(
         st.detail,
         vec![
-            DETAIL.to_string(),
+            MACOS_DETAIL.to_string(),
             format!("`{VERIFY_USER}` exited 1: {VERIFY_OK}")
         ]
     );
@@ -817,7 +786,7 @@ fn status_verify_cert_output_edges() {
         .respond(VERIFY_USER, 0, &noisy, "");
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.trusted, Trust::Yes);
-    assert_eq!(st.detail, vec![DETAIL.to_string()]);
+    assert_eq!(st.detail, vec![MACOS_DETAIL.to_string()]);
 
     // Exit 0 with the phrase only on stderr: not a success (stdout is the
     // channel the literal was quoted from).
@@ -829,7 +798,7 @@ fn status_verify_cert_output_edges() {
     assert_eq!(
         st.detail,
         vec![
-            DETAIL.to_string(),
+            MACOS_DETAIL.to_string(),
             format!(
                 "`{VERIFY_USER}` exited 0 without \"certificate verification successful\" in its output"
             )
@@ -844,7 +813,10 @@ fn status_verify_cert_output_edges() {
     assert_eq!(st.trusted, Trust::No);
     assert_eq!(
         st.detail,
-        vec![DETAIL.to_string(), format!("`{VERIFY_USER}` exited 1")]
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!("`{VERIFY_USER}` exited 1")
+        ]
     );
 
     // Oversized output: only the last five non-empty lines, stdout before
@@ -859,7 +831,7 @@ fn status_verify_cert_output_edges() {
     assert_eq!(
         st.detail,
         vec![
-            DETAIL.to_string(),
+            MACOS_DETAIL.to_string(),
             format!("`{VERIFY_USER}` exited 2: s3 | s4 | e1 | e2 | e3")
         ]
     );
@@ -880,25 +852,18 @@ fn status_verify_cert_output_edges() {
 
     // Unknown presence (find-certificate itself failed): no verify run, and
     // the trust stays Unknown rather than defaulting to No.
-    let exec = ScriptedExecutor::new()
-        .respond(Q_USER, 0, &present_output(), "")
-        .respond(
-            Q_USER,
-            1,
-            "",
-            "security: SecKeychainSearchCopyNext: The specified keychain could not be found.",
-        );
-    // First call primes the queue (present), second is the failure.
-    let _ = store.status(&cert, Scope::User, &exec);
+    let not_found =
+        "security: SecKeychainSearchCopyNext: The specified keychain could not be found.";
+    let exec = ScriptedExecutor::new().respond(Q_USER, 1, "", not_found);
     let st = store.status(&cert, Scope::User, &exec).unwrap();
     assert_eq!(st.installed, Presence::Unknown);
     assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
     assert_eq!(
-        exec.runs(),
+        st.detail,
         vec![
-            Q_USER.to_string(),
-            VERIFY_USER.to_string(),
-            Q_USER.to_string()
+            MACOS_DETAIL.to_string(),
+            format!("`{Q_USER}` exited 1: {not_found}")
         ]
     );
 }
@@ -1008,5 +973,168 @@ fn install_cancelled_system_scope_rolls_back_through_sudo() {
             Q_SYS.to_string(),
             del_sys(&fp256_hex()),
         ]
+    );
+}
+
+// Stage-6 fix task C1 (plan correction 8, spec D17.3): `install` on a present
+// certificate reads trust back; an untrusted copy is replaced, a trusted one
+// is left alone, and an unreadable one is reported present as before.
+#[test]
+fn install_present_reads_trust_back_and_replaces_an_untrusted_copy() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+    let del = del_user(&fp256_hex());
+
+    // Present, verify-cert says No: delete the copy, then the normal add.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 1, "", NOT_TRUSTED);
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(change.changed);
+    assert_eq!(change.location, K_USER);
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            del.clone(),
+            add_user(),
+        ]
+    );
+    assert_eq!(change.commands, exec.runs());
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("replaced the untrusted copy in {K_USER}"),
+            format!("added to {K_USER} as a trusted root for ssl and basic"),
+        ]
+    );
+
+    // Present, verify-cert says Yes: nothing changes (the idempotent case).
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 0, VERIFY_OK, "");
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(!change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_USER.to_string()]
+    );
+    assert_eq!(
+        change.detail,
+        vec![format!("already present and trusted in {K_USER}")]
+    );
+
+    // Present, verify-cert cannot run: present as before, with the failure.
+    let exec = ScriptedExecutor::new().unspawnable("verify-cert").respond(
+        Q_USER,
+        0,
+        &present_output(),
+        "",
+    );
+    let change = store.install(&cert, Scope::User, &exec).unwrap();
+    assert!(!change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_USER.to_string()]
+    );
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("already present in {K_USER}"),
+            VERIFY_SPAWN_FAILURE.to_string()
+        ]
+    );
+
+    // Untrusted, the dialog is dismissed on the re-add, the copy is back:
+    // the same classification and rollback as a first install.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 1, "", NOT_TRUSTED)
+        .respond(&add_user(), 1, "", CANCEL_STDERR);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not \
+         trusted; removed the untrusted copy it left behind"
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            del.clone(),
+            add_user(),
+            Q_USER.to_string(),
+            del.clone(),
+        ]
+    );
+
+    // Untrusted and the delete fails: stop before adding a second copy.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 1, "", NOT_TRUSTED)
+        .respond(
+            &del,
+            1,
+            "",
+            "security: SecKeychainItemDelete: User interaction is not allowed.",
+        );
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "could not remove the untrusted copy from {K_USER}: `{del}` exited 1: security: \
+             SecKeychainItemDelete: User interaction is not allowed."
+        )
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![Q_USER.to_string(), VERIFY_USER.to_string(), del.clone()]
+    );
+
+    // System scope: the delete and the add both go through sudo.
+    let sys_present = present_output().replace(K_USER, K_SYS);
+    let exec = ScriptedExecutor::new()
+        .root(false)
+        .respond(Q_SYS, 0, &sys_present, "")
+        .respond(VERIFY_USER, 1, "", NOT_TRUSTED);
+    let change = store.install(&cert, Scope::System, &exec).unwrap();
+    assert!(change.changed);
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_SYS.to_string(),
+            VERIFY_USER.to_string(),
+            del_sys(&fp256_hex()),
+            add_sys(),
+        ]
+    );
+    assert_eq!(
+        change.detail,
+        vec![
+            format!("replaced the untrusted copy in {K_SYS}"),
+            format!("added to {K_SYS} as a trusted root for ssl and basic"),
+        ]
+    );
+}
+
+// Stage-6 fix task C1 (finding 6): the kind's audit/WARN word, one home.
+#[test]
+fn trust_error_kind_labels() {
+    assert_eq!(TrustErrorKind::Cancelled.label(), "cancelled");
+    assert_eq!(TrustErrorKind::HeadlessAuth.label(), "HeadlessAuth");
+    assert_eq!(TrustErrorKind::NeedsRoot.label(), "NeedsRoot");
+    assert_eq!(TrustErrorKind::UnsupportedScope.label(), "UnsupportedScope");
+    assert_eq!(TrustErrorKind::ToolFailed.label(), "ToolFailed");
+    assert_eq!(TrustErrorKind::ToolMissing.label(), "ToolMissing");
+    assert_eq!(TrustErrorKind::Timeout.label(), "Timeout");
+    assert_eq!(TrustErrorKind::CopiesRemain.label(), "CopiesRemain");
+    assert_eq!(TrustErrorKind::NoCertificate.label(), "NoCertificate");
+    assert_eq!(
+        TrustErrorKind::UnsupportedPlatform.label(),
+        "UnsupportedPlatform"
     );
 }

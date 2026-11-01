@@ -14,11 +14,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
 
 use aitm_ca::audit::AuditRecord;
-use aitm_ca::exec::{CmdLine, CmdOutput, Executor};
 use aitm_ca::store::{
     LinuxFamily, Platform, TrustError, TrustErrorKind, DEBIAN_ANCHOR_DIR, FEDORA_ANCHOR_DIR,
 };
-use aitm_ca::testing::{MemoryAuditLog, ScriptedExecutor, FIXTURE_FP1, FIXTURE_FP256};
+use aitm_ca::testing::{
+    MemoryAuditLog, ScriptedExecutor, CANCEL_STDERR, FIXTURE_FP1, FIXTURE_FP256, MACOS_DETAIL,
+    NOT_TRUSTED, VERIFY_OK, VERIFY_SPAWN_FAILURE, VERIFY_USER,
+};
 use aitm_ca::CaPlugin;
 use aitm_core::{
     CaConfig, CommandHost, Frontend, HttpFlow, HttpRequest, MemFlowStore, Params, ProxyClient,
@@ -1316,18 +1318,12 @@ fn scope_resolution_per_platform() {
 // `stores.user.trusted == "yes"`.
 #[test]
 fn ca_status_json_reports_user_trust_yes() {
-    const VERIFY_USER: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
     let h = Harness::new(
         cfg("/ca", false),
         ScriptedExecutor::new()
             .file("/ca/ca.crt", FIXTURE)
             .respond(Q_USER, 0, &present_user_output(), "")
-            .respond(
-                VERIFY_USER,
-                0,
-                "/ca/ca.crt: certificate verification successful.",
-                "",
-            ),
+            .respond(VERIFY_USER, 0, VERIFY_OK, ""),
         MemoryAuditLog::new(),
     );
     let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
@@ -1366,7 +1362,7 @@ fn cancelled_install_warns_with_kind_cancelled() {
             &add_user(),
             1,
             "",
-            "SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.",
+            CANCEL_STDERR,
         ),
         MemoryAuditLog::new(),
     );
@@ -1404,16 +1400,9 @@ fn cancelled_install_warns_with_kind_cancelled() {
 // SP-AC32 edges the Coder's tests leave open).
 // ---------------------------------------------------------------------------
 
-/// The trust read-back as `MacOsStore::status` renders it (Task 32's choice).
-const VERIFY_USER: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
-const VERIFY_OK: &str = "/ca/ca.crt: certificate verification successful.";
-const NOT_TRUSTED: &str = "Cert Verify Result: CSSMERR_TP_NOT_TRUSTED";
-const MACOS_DETAIL: &str = "macOS: presence from `security find-certificate`; trust from `security verify-cert` (basic policy, local only; our install sets the ssl and basic policies together)";
 const K_SYS: &str = "/Library/Keychains/System.keychain";
 const DEBIAN_ANCHOR: &str = "/usr/local/share/ca-certificates/aitmproxy-root-ca.crt";
 const SUDO_NO_TTY: &str = "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper";
-const CANCEL_STDERR: &str =
-    "SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.";
 const CANCELLED_FULL: &str = "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted; removed the untrusted copy it left behind";
 
 /// `find-certificate -a -Z` output holding the fixture in the System keychain.
@@ -1423,58 +1412,6 @@ fn present_system_output() -> String {
         FIXTURE_FP256.replace(':', ""),
         FIXTURE_FP1.replace(':', "")
     )
-}
-
-/// Delegates to a `ScriptedExecutor` but cannot spawn `security verify-cert`,
-/// the way `RealExecutor` fails when the program is missing.
-struct VerifyUnspawnable(ScriptedExecutor);
-
-const VERIFY_SPAWN_FAILURE: &str = "could not start `security verify-cert -c /ca/ca.crt -l -L -p basic`: No such file or directory (os error 2)";
-
-impl Executor for VerifyUnspawnable {
-    fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
-        if cmd.args.first().map(String::as_str) == Some("verify-cert") {
-            let _ = self.0.run(cmd);
-            anyhow::bail!("{VERIFY_SPAWN_FAILURE}");
-        }
-        self.0.run(cmd)
-    }
-
-    fn read_file(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-        self.0.read_file(path)
-    }
-
-    fn dir_exists(&self, path: &Path) -> bool {
-        self.0.dir_exists(path)
-    }
-
-    fn home_dir(&self) -> Option<PathBuf> {
-        self.0.home_dir()
-    }
-
-    fn is_root(&self) -> bool {
-        self.0.is_root()
-    }
-}
-
-/// `ca.status` through the plugin on any executor (the `Harness` is pinned
-/// to `ScriptedExecutor`).
-fn status_with(exec: Arc<dyn Executor>, frontend: Frontend) -> Value {
-    let mut reg = Registry::new();
-    reg.add_plugin(Box::new(CaPlugin::with_backend(
-        cfg("/ca", false),
-        exec,
-        Arc::new(MemoryAuditLog::new()),
-        Platform::MacOs,
-    )));
-    let store = MemFlowStore::new();
-    let guard = StdGuard::default();
-    let client = StubClient;
-    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(frontend);
-    reg.command("ca.status")
-        .unwrap()
-        .invoke(params(&[]), &host)
-        .unwrap()
 }
 
 fn store_text<'a>(v: &'a Value, scope: &str, key: &str) -> &'a str {
@@ -1691,20 +1628,21 @@ fn ca_status_json_reports_user_trust_no_and_unknown() {
 
     // Unspawnable: "unknown", with the spawn failure in detail; the System
     // keychain is still absent and "no".
-    let inner = ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE).respond(
-        Q_USER,
-        0,
-        &present_user_output(),
-        "",
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .unspawnable("verify-cert")
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), ""),
+        MemoryAuditLog::new(),
     );
-    let exec = Arc::new(VerifyUnspawnable(inner));
-    let v = status_with(exec.clone(), Frontend::Operator);
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
     assert_eq!(store_text(&v, "user", "installed"), "present");
     assert_eq!(store_text(&v, "user", "trusted"), "unknown");
     assert_eq!(store_text(&v, "system", "installed"), "absent");
     assert_eq!(store_text(&v, "system", "trusted"), "no");
     assert_eq!(
-        exec.0.runs(),
+        h.exec.runs(),
         vec![
             Q_USER.to_string(),
             VERIFY_USER.to_string(),
@@ -1904,4 +1842,208 @@ fn cancelled_install_audit_detail_is_the_full_message() {
     );
     assert_eq!(h.records()[0].frontend, "mcp");
     assert_eq!(h.records()[0].outcome, "error");
+}
+
+// ---------------------------------------------------------------------------
+// Stage-6 fix task C1 (plan correction 7, spec D17.1/D17.14): only the CLI
+// may ask for the System keychain on a platform that has a user scope.
+// ---------------------------------------------------------------------------
+
+const SYSTEM_NEEDS_TERMINAL_INSTALL: &str = "system scope needs a terminal: run `aitm ca install \
+                                             --scope system` yourself; the app and the bus \
+                                             clients use the login keychain";
+const SYSTEM_NEEDS_TERMINAL_UNINSTALL: &str = "system scope needs a terminal: run `aitm ca \
+                                               uninstall --scope system` yourself; the app and \
+                                               the bus clients use the login keychain";
+
+fn add_sys_sudo() -> String {
+    format!(
+        "sudo -- security add-trusted-cert -d -r trustRoot -p ssl -p basic -k {K_SYS} /ca/ca.crt"
+    )
+}
+
+#[test]
+fn non_cli_system_scope_is_refused_before_any_run() {
+    // Operator, macOS, scope system: UnsupportedScope, the terminal remedy,
+    // audited as error, and the executor never ran.
+    let h = Harness::scripted(false);
+    let err = h
+        .call(
+            "ca.install",
+            Frontend::Operator,
+            &[("scope", str_arg("system"))],
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::UnsupportedScope),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), SYSTEM_NEEDS_TERMINAL_INSTALL);
+    assert_eq!(h.exec.runs(), Vec::<String>::new());
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].command, "ca.install");
+    assert_eq!(records[0].frontend, "operator");
+    assert_eq!(records[0].outcome, "error");
+    assert_eq!(records[0].scope.as_deref(), Some("system"));
+    assert_eq!(records[0].platform.as_deref(), Some("macos"));
+    assert_eq!(
+        records[0].fingerprint_sha256.as_deref(),
+        Some(FIXTURE_FP256)
+    );
+    assert_eq!(records[0].detail, SYSTEM_NEEDS_TERMINAL_INSTALL);
+
+    // The sibling verb names itself in the remedy.
+    let h = Harness::scripted(false);
+    let err = h
+        .call(
+            "ca.uninstall",
+            Frontend::Operator,
+            &[("scope", str_arg("system"))],
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::UnsupportedScope),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), SYSTEM_NEEDS_TERMINAL_UNINSTALL);
+    assert_eq!(h.exec.runs(), Vec::<String>::new());
+    assert_eq!(h.records()[0].outcome, "error");
+
+    // An agent with the flag on is a bus client too: same refusal.
+    let h = Harness::scripted(true);
+    let err = h
+        .call("ca.install", Frontend::Mcp, &[("scope", str_arg("system"))])
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::UnsupportedScope),
+        "{err:#}"
+    );
+    assert_eq!(err.to_string(), SYSTEM_NEEDS_TERMINAL_INSTALL);
+    assert_eq!(h.exec.runs(), Vec::<String>::new());
+
+    // Windows has a user scope too, so the same rule holds there.
+    let h = Harness::on(
+        Platform::Windows,
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let err = h
+        .call(
+            "ca.install",
+            Frontend::Operator,
+            &[("scope", str_arg("system"))],
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::UnsupportedScope),
+        "{err:#}"
+    );
+    assert_eq!(h.exec.runs(), Vec::<String>::new());
+
+    // The CLI still gets the System keychain through sudo.
+    let h = Harness::scripted(false);
+    let v = h
+        .call("ca.install", Frontend::Cli, &[("scope", str_arg("system"))])
+        .unwrap();
+    assert_eq!(text(&v, "scope"), "system");
+    assert!(flag(&v, "changed"));
+    assert_eq!(h.exec.runs(), vec![Q_SYS.to_string(), add_sys_sudo()]);
+    assert_eq!(h.records()[0].outcome, "ok");
+
+    // The operator's default scope on macOS is untouched: the login keychain.
+    let h = Harness::scripted(false);
+    let v = h.call("ca.install", Frontend::Operator, &[]).unwrap();
+    assert_eq!(text(&v, "scope"), "user");
+    assert_eq!(h.exec.runs(), vec![Q_USER.to_string(), add_user()]);
+}
+
+#[test]
+fn linux_operator_system_scope_is_unchanged() {
+    let tee = format!("sudo -- tee {DEBIAN_ANCHOR}");
+    // No scope: the platform's only scope, through sudo, as before.
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.install", Frontend::Operator, &[]).unwrap();
+    assert_eq!(text(&v, "scope"), "system");
+    assert_eq!(
+        h.exec.runs(),
+        vec![tee.clone(), "sudo -- update-ca-certificates".to_string()]
+    );
+    assert_eq!(h.records()[0].outcome, "ok");
+    assert_eq!(h.records()[0].frontend, "operator");
+
+    // Explicit `system` on Linux is the only scope there, not a System
+    // keychain: still allowed.
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let v = h
+        .call(
+            "ca.install",
+            Frontend::Operator,
+            &[("scope", str_arg("system"))],
+        )
+        .unwrap();
+    assert_eq!(text(&v, "scope"), "system");
+    assert_eq!(h.exec.runs()[0], tee);
+}
+
+// Stage-6 fix task C1 (finding 2): the calm message hides the tool text, so
+// the stderr tail goes to one DEBUG line at the classification site.
+#[test]
+fn cancelled_install_logs_the_stderr_tail_at_debug() {
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE).respond(
+            &add_user(),
+            1,
+            "",
+            &format!("noise line\n{CANCEL_STDERR}\n"),
+        ),
+        MemoryAuditLog::new(),
+    );
+    let (result, capture) = traced(|| h.call("ca.install", Frontend::Operator, &[]));
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted"
+    );
+
+    let debug = capture.at(Level::DEBUG, "aitm_ca");
+    let classified: Vec<&Captured> = debug
+        .iter()
+        .filter(|e| e.fields.contains_key("stderr_tail"))
+        .collect();
+    assert_eq!(classified.len(), 1, "{debug:?}");
+    let f = &classified[0].fields;
+    assert_eq!(
+        f.get("stderr_tail").map(String::as_str),
+        Some(format!("noise line | {CANCEL_STDERR}").as_str())
+    );
+    assert_eq!(
+        f.get("message").map(String::as_str),
+        Some("add-trusted-cert classified as cancelled")
+    );
+    // The tool text stays out of the error, the audit record and the WARN line.
+    assert!(!err.to_string().contains("canceled"), "{err}");
+    assert!(!h.records()[0].detail.contains("canceled"));
+    let warns = capture.at(Level::WARN, "aitm_ca");
+    assert_eq!(warns.len(), 1, "{capture:?}");
+    assert!(!warns[0]
+        .fields
+        .get("error")
+        .is_some_and(|e| e.contains("canceled")));
 }
