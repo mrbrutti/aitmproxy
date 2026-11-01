@@ -289,6 +289,7 @@ pub fn tools(names: &[&str]) -> Vec<ToolInfo> {
             name: (*n).to_string(),
             description: format!("{n} (test)"),
             input_schema: json!({"type":"object","properties":{}}),
+            confirmable: false,
         })
         .collect()
 }

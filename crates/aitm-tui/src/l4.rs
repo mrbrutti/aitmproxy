@@ -7,12 +7,30 @@
 //!
 //! Honest degradation (foundation §2.10(c)) is the rule. A terminal cannot draw
 //! a graphical tree, so a packet's layer tree renders as a labelled indented
-//! **text** tree ([`layer_tree_lines`]) rather than being dropped. `l4.flow.get`
-//! carries no raw bytes (a `PacketSummary` is `{layers, length}` only), so a
-//! captured packet shows its length and an honest note; a crafted packet's bytes
-//! come from `l4.craft` and render as hex.
+//! **text** tree ([`layer_tree_lines`]) rather than being dropped. A packet's
+//! on-wire `bytes` (L4 parity spec §2) are present only when the core let this
+//! caller see them (§2.2); a packet without them shows its headers and length
+//! and an honest note. Every byte renders through [`hex_dump`] /
+//! [`ascii_column`], so no raw control byte reaches the terminal (§2.3).
+//!
+//! Availability (spec §1) is read from `l4.capture.status` /
+//! `l4.intercept.status` on every slow poll and never cached for the session;
+//! until the first reply it is [`L4Availability::pending`].
 
-use serde_json::Value;
+use serde_json::{json, Value};
+
+use crate::action::ToolInfo;
+use crate::base64;
+
+/// The marker an older core's gated verbs put in their error text; the
+/// availability `reason` is exactly what follows it (spec §1 compatibility).
+pub const UNAVAILABLE_MARKER: &str = "L4 unavailable: ";
+
+/// The one pending literal TUI, web and macOS share (plan decision 9).
+pub const PENDING_REASON: &str = "Reading L4 availability…";
+
+/// The inspector's packet window (spec §2: the core's default `limit`).
+pub const INSPECT_LIMIT: u64 = 256;
 
 /// One packet of an L4 flow, from `l4.flow.get`'s `packets[]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +43,41 @@ pub struct L4Packet {
     pub injected: bool,
     /// Decoded layer names, outermost first (e.g. `["IPv4","UDP","Raw"]`).
     pub layers: Vec<String>,
+    /// Milliseconds since the Unix epoch, UTC (spec §2); `None` on an older core.
+    pub timestamp: Option<i64>,
+    /// `TCP`, `UDP`, `ICMP`, `ICMPv6` (spec §2), when the core decoded one.
+    pub proto: Option<String>,
+    /// Source / destination IP address strings (spec §2).
+    pub src: Option<String>,
+    pub dst: Option<String>,
+    /// TCP/UDP ports (spec §2); `None` otherwise.
+    pub src_port: Option<u16>,
+    pub dst_port: Option<u16>,
+    /// The on-wire bytes, decoded from the base64 `bytes` key. `None` when the
+    /// key is absent: the caller may not see them (spec §2.2) or the core
+    /// predates §2. Never confused with an empty packet.
+    pub bytes: Option<Vec<u8>>,
+}
+
+fn opt_str(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn opt_port(v: &Value, key: &str) -> Option<u16> {
+    v.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| u16::try_from(n).ok())
+}
+
+fn str_list(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl L4Packet {
@@ -37,15 +90,17 @@ impl L4Packet {
                 .to_string(),
             length: v.get("length").and_then(Value::as_u64).unwrap_or(0),
             injected: v.get("injected").and_then(Value::as_bool).unwrap_or(false),
-            layers: v
-                .get("layers")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|l| l.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            layers: str_list(v, "layers"),
+            timestamp: v.get("timestamp").and_then(Value::as_i64),
+            proto: opt_str(v, "proto"),
+            src: opt_str(v, "src"),
+            dst: opt_str(v, "dst"),
+            src_port: opt_port(v, "src_port"),
+            dst_port: opt_port(v, "dst_port"),
+            bytes: v
+                .get("bytes")
+                .and_then(Value::as_str)
+                .and_then(base64::decode),
         }
     }
 
@@ -83,6 +138,16 @@ pub struct L4Flow {
     pub packet_count: u64,
     pub injected_count: u64,
     pub packets: Vec<L4Packet>,
+    /// Flow creation, ms since the Unix epoch (spec §2); `None` on an older core.
+    pub started_at: Option<i64>,
+    /// The flow-level `proto` word from the first decodable packet (spec §2).
+    pub transport: Option<String>,
+    /// Flow-level addresses and ports from the first decodable packet (spec §2),
+    /// so a list row shows its target without reading packets.
+    pub src: Option<String>,
+    pub dst: Option<String>,
+    pub src_port: Option<u16>,
+    pub dst_port: Option<u16>,
 }
 
 impl L4Flow {
@@ -101,11 +166,8 @@ impl L4Flow {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            filter: v.get("filter").and_then(Value::as_str).map(str::to_string),
-            queue: v
-                .get("queue")
-                .and_then(Value::as_u64)
-                .and_then(|n| u16::try_from(n).ok()),
+            filter: opt_str(v, "filter"),
+            queue: opt_port(v, "queue"),
             packet_count: v.get("packet_count").and_then(Value::as_u64).unwrap_or(0),
             injected_count: v.get("injected_count").and_then(Value::as_u64).unwrap_or(0),
             packets: v
@@ -113,12 +175,22 @@ impl L4Flow {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().map(L4Packet::from_json).collect())
                 .unwrap_or_default(),
+            started_at: v.get("started_at").and_then(Value::as_i64),
+            transport: opt_str(v, "proto"),
+            src: opt_str(v, "src"),
+            dst: opt_str(v, "dst"),
+            src_port: opt_port(v, "src_port"),
+            dst_port: opt_port(v, "dst_port"),
         })
     }
 
-    /// The `TCP` / `UDP` / `ICMP` sub-label, from the first packet's layers.
+    /// The `TCP` / `UDP` / `ICMP` sub-label: the flow-level `proto` (spec §2)
+    /// when the core sent one, else the first packet's layers.
     pub fn proto(&self) -> Option<&'static str> {
-        self.packets.first().and_then(|p| proto_of(&p.layers))
+        self.transport
+            .as_deref()
+            .and_then(proto_label)
+            .or_else(|| self.packets.first().and_then(|p| proto_of(&p.layers)))
     }
 
     /// The list row's target cell: the bound interface (+ filter note). The
@@ -151,15 +223,217 @@ pub fn proto_of(layers: &[String]) -> Option<&'static str> {
     // Innermost transport wins — scan inner-to-outer, matching the web
     // (`protoSubLabel`) and macOS (`L4Proto.fromLayers`) rule so the three
     // surfaces print the same sub-label.
-    layers
-        .iter()
-        .rev()
-        .find_map(|l| match l.to_ascii_uppercase().as_str() {
-            "TCP" => Some("TCP"),
-            "UDP" => Some("UDP"),
-            "ICMP" | "ICMPV6" => Some("ICMP"),
-            _ => None,
+    layers.iter().rev().find_map(|l| proto_label(l))
+}
+
+/// The sub-label for one layer / `proto` word (`ICMPv6` folds into `ICMP`).
+fn proto_label(word: &str) -> Option<&'static str> {
+    match word.to_ascii_uppercase().as_str() {
+        "TCP" => Some("TCP"),
+        "UDP" => Some("UDP"),
+        "ICMP" | "ICMPV6" => Some("ICMP"),
+        _ => None,
+    }
+}
+
+// ------------------------------------------------------------ availability
+
+/// What `l4.capture.status` / `l4.intercept.status` say about a capability
+/// class on this core now (L4 parity spec §1). Re-read on every slow poll,
+/// never cached for the session; [`L4Availability::pending`] until the first
+/// reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L4Availability {
+    pub available: bool,
+    /// `available` | `needs_privilege` | `unsupported_platform` |
+    /// `not_configured`; `None` from an older core or an error.
+    pub code: Option<String>,
+    /// The core's reason, verbatim; `None` when available.
+    pub reason: Option<String>,
+}
+
+impl L4Availability {
+    /// Parse a status reply: the §1 object (bool `available`, copying `code` and
+    /// `reason`), or an older core's bare array (available). Anything else is
+    /// honestly unavailable.
+    pub fn from_reply(v: &Value) -> Self {
+        if let Some(available) = v.get("available").and_then(Value::as_bool) {
+            return Self {
+                available,
+                code: opt_str(v, "code"),
+                reason: opt_str(v, "reason"),
+            };
+        }
+        if v.is_array() {
+            return Self {
+                available: true,
+                code: None,
+                reason: None,
+            };
+        }
+        Self {
+            available: false,
+            code: None,
+            reason: Some("unrecognised l4 status reply".to_string()),
+        }
+    }
+
+    /// An older core's tool error: `Some` iff `message` carries
+    /// [`UNAVAILABLE_MARKER`]; the reason is exactly the text after it.
+    pub fn from_error(message: &str) -> Option<Self> {
+        let (_, reason) = message.split_once(UNAVAILABLE_MARKER)?;
+        Some(Self {
+            available: false,
+            code: None,
+            reason: Some(reason.to_string()),
         })
+    }
+
+    /// Before the first status reply: unavailable, reason [`PENDING_REASON`].
+    pub fn pending() -> Self {
+        Self {
+            available: false,
+            code: None,
+            reason: Some(PENDING_REASON.to_string()),
+        }
+    }
+}
+
+impl Default for L4Availability {
+    fn default() -> Self {
+        Self::pending()
+    }
+}
+
+/// The ids a status reply lists under `key` (`captures` / `sessions`): string
+/// entries as they are, object entries by their `id`; an older core's bare
+/// array the same way.
+pub fn status_ids(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    e.as_str()
+                        .or_else(|| e.get("id").and_then(Value::as_str))
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------- parked packets
+
+/// One `l4.intercept.list` entry: a packet parked in-path (spec §4). The core
+/// lists them oldest first; the verdict verbs take this `id`, never the flow's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L4Parked {
+    pub id: String,
+    /// The intercept flow (session) it belongs to.
+    pub flow: String,
+    pub state: String,
+    pub length: u64,
+    pub layers: Vec<String>,
+    /// Epoch ms when it was parked; `None` on an older core.
+    pub parked_at: Option<i64>,
+}
+
+impl L4Parked {
+    /// Parse one entry. `None` without string `id` and `flow`.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            id: opt_str(v, "id")?,
+            flow: opt_str(v, "flow")?,
+            state: opt_str(v, "state").unwrap_or_else(|| "parked".to_string()),
+            length: v.get("length").and_then(Value::as_u64).unwrap_or(0),
+            layers: str_list(v, "layers"),
+            parked_at: v.get("parked_at").and_then(Value::as_i64),
+        })
+    }
+
+    /// Parse an `l4.intercept.list` reply in the core's order; not an array →
+    /// nothing parked.
+    pub fn list_from_json(v: &Value) -> Vec<Self> {
+        v.as_array()
+            .map(|a| a.iter().filter_map(Self::from_json).collect())
+            .unwrap_or_default()
+    }
+}
+
+// ------------------------------------------------------- tool-shaped args
+
+fn tool<'a>(tools: &'a [ToolInfo], name: &str) -> Option<&'a ToolInfo> {
+    tools.iter().find(|t| t.name == name)
+}
+
+/// Whether `l4.flow.get` declares the §2 `limit` window in its inputSchema
+/// (an older core does not; the UI then omits it).
+pub fn supports_window(tools: &[ToolInfo]) -> bool {
+    tool(tools, "l4.flow.get").is_some_and(|t| {
+        t.input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key("limit"))
+    })
+}
+
+/// The list poll's `l4.flow.get` args: `{"id", "limit": 0}` with the window
+/// (flow fields only), `{"id"}` against an older core.
+pub fn flow_get_args(id: &str, window: bool) -> Value {
+    if window {
+        json!({"id": id, "limit": 0})
+    } else {
+        json!({"id": id})
+    }
+}
+
+/// The inspector's `l4.flow.get` args: the first window of packets.
+pub fn inspect_args(id: &str) -> Value {
+    json!({"id": id, "offset": 0, "limit": INSPECT_LIMIT})
+}
+
+/// Spec §3 / AC39: the scope-add control exists only when `tools/list` offers
+/// `l4.scope.add` with `confirmable: true` (a core with unit (a')).
+pub fn supports_operator_scope_add(tools: &[ToolInfo]) -> bool {
+    tool(tools, "l4.scope.add").is_some_and(|t| t.confirmable)
+}
+
+// ------------------------------------------------------------- packet text
+
+/// The ASCII column of a hex view (spec §2.3 / AC40): printable ASCII
+/// 0x20–0x7e as itself, every other byte as `.`, so no control byte reaches the
+/// terminal.
+pub fn ascii_column(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+/// A hex dump, 16 bytes per row: `<offset:08x>  <hex, space-separated>  <ascii>`.
+/// Empty input → no rows.
+pub fn hex_dump(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .chunks(16)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            format!(
+                "{:08x}  {:<47}  {}",
+                i * 16,
+                hex.join(" "),
+                ascii_column(chunk)
+            )
+        })
+        .collect()
 }
 
 /// A packet's layer tree as an honest, **labelled** indented text tree
@@ -476,9 +750,23 @@ pub struct L4State {
     pub pending: Option<(String, Value)>,
     /// The confirm-over-the-wire overlay, once the reply arrives.
     pub confirm: Option<L4Confirm>,
+    /// `l4.capture.status` (capture + inject), re-read every slow poll (§1).
+    pub capture: L4Availability,
+    /// `l4.intercept.status`, re-read every slow poll (§1).
+    pub intercept: L4Availability,
+    /// The running capture flow ids (`l4.capture.status.captures`).
+    pub captures: Vec<String>,
+    /// `l4.intercept.list`, in the core's order (oldest first, §4).
+    pub parked: Vec<L4Parked>,
 }
 
 impl L4State {
+    /// The parked packet the intercept bar acts on for `flow`: the first
+    /// listed, which the core orders oldest first (plan decision 3).
+    pub fn parked_for(&self, flow: &str) -> Option<&L4Parked> {
+        self.parked.iter().find(|p| p.flow == flow)
+    }
+
     /// Whether an L4 flow is in scope: an `l4.scope.list` entry covers its
     /// interface (the courtesy signal; the guard is the enforcement, Part 5).
     /// With no scope at all, nothing is in scope (deny-by-default).

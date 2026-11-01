@@ -3509,6 +3509,24 @@ impl App {
                     .collect();
             }
             BusEvent::L4Agent(v) => self.l4.gates = crate::l4::L4Gates::from_json(&v),
+            // Spec §1: availability is whatever the core said last; a change
+            // never toasts (the panel and the bars show it).
+            BusEvent::L4Availability {
+                capture,
+                intercept,
+                captures,
+            } => {
+                self.l4.capture = capture;
+                self.l4.intercept = intercept;
+                self.l4.captures = captures;
+            }
+            // Spec §4: the parked packets in the core's order (oldest first).
+            BusEvent::L4Parked(values) => {
+                self.l4.parked = values
+                    .iter()
+                    .filter_map(crate::l4::L4Parked::from_json)
+                    .collect();
+            }
             BusEvent::Findings(library) => self.merge_library(library, &mut out),
             BusEvent::Agent(a) => self.agent = a,
             BusEvent::CallOk { name, value } => {
@@ -4234,6 +4252,7 @@ mod tests {
                 name: (*n).to_string(),
                 description: String::new(),
                 input_schema: json!({"type":"object","properties":{}}),
+                confirmable: false,
             })
             .collect()
     }
@@ -4595,6 +4614,7 @@ mod tests {
             name: "agent.set".into(),
             description: String::new(),
             input_schema: json!({}),
+            confirmable: false,
         });
         assert_eq!(
             app.update(Action::AgentSet(AgentPolicy::Paused)),

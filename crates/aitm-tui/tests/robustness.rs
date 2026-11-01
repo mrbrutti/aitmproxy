@@ -954,6 +954,7 @@ fn tool_info_params_reads_the_input_schema() {
         name: "x".into(),
         description: String::new(),
         input_schema: json!({"type":"object","properties":{"id":{"type":"string","description":"The flow."},"n":{"type":"integer"}},"required":["id"]}),
+        confirmable: false,
     };
     assert_eq!(
         t.params(),
@@ -1359,6 +1360,7 @@ fn dry_run_bypasses_the_confirm_only_as_a_declared_boolean_true() {
         name: "ca.uninstall".into(),
         description: "Remove the CA (confirmed).".into(),
         input_schema: json!({"type":"object","properties":{"dry_run":{"type":"boolean","description":"Only report."}}}),
+        confirmable: false,
     });
     assert_eq!(
         app.run_command("ca.uninstall dry_run=true"),

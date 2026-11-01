@@ -233,6 +233,17 @@ pub enum BusEvent {
     L4Scope(Vec<Value>),
     /// `l4.agent.status`: the four per-feature agent gate states.
     L4Agent(Value),
+    /// `l4.capture.status` + `l4.intercept.status` (L4 parity spec §1), read on
+    /// every slow pass: the two availabilities and the running capture ids.
+    L4Availability {
+        capture: crate::l4::L4Availability,
+        intercept: crate::l4::L4Availability,
+        captures: Vec<String>,
+    },
+    /// `l4.intercept.list` (spec §4): the parked packets, oldest first, each an
+    /// `{id, flow, state, dir, length, layers, parked_at}` object. Read only
+    /// while intercept is available.
+    L4Parked(Vec<Value>),
 }
 
 /// One declared parameter of a tool's `inputSchema`, as a form row.
