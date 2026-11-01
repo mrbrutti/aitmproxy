@@ -223,7 +223,7 @@ struct FlowCommands: Commands {
             // The first-run step from the menu (spec D17.10): the same `trustCA()` as the sheet, the
             // Status card and the CA panel. ⌃⌘T is free (⌘T is New Browser Tab). Disabled while the
             // bus is not the operator's, while a change is in flight, and once a store says trusted.
-            Button("Trust the aitmproxy CA") { Task { await session.trustCA() } }
+            Button(ConnectionAction.trustCA.title) { Task { await session.trustCA() } }
                 .keyboardShortcut("t", modifiers: [.command, .control])
                 .disabled(!session.caTrustControlLive || session.caTrust?.trusted == true)
             Button("Certificate Authority…") { session.show(.ca) }

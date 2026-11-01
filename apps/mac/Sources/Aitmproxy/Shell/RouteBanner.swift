@@ -66,6 +66,9 @@ struct RouteBanner: View {
 /// action a route carries is one `perform` takes.
 enum RouteActions {
     static func run(_ action: ConnectionAction, session: Session, openSettings: OpenSettingsAction) {
+        // The trust action is the view's to run (PR D: `perform` returns false for it on purpose); same
+        // confirm-gated path as the Status page's row. The model drops the button once trusted or installing.
+        if action == .trustCA { Task { await session.trustCA() }; return }
         if session.perform(connection: action) { return }
         if action == .openCaptureSettings {
             session.settingsTab = .capture
