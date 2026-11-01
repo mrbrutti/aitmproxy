@@ -31,6 +31,10 @@ H11. T7-19 waits for the Site map marker before pinning the job, so the tab chec
 
 Ratified builder decisions (recorded here, no change): needle prefix widths (`name[:20]` becomes the rendered-row needle of H6; `pay_needle[:20]`, `node_needle[:40]`, point name `[:16]` stay, prefixes of random-free literals are safe against the live read); `on_cursor`'s `{0,8}` glyph allowance; `pick_issue`'s 8-candidate cap; `SAMPLES_MAX = 6` and the timeouts.
 
+## Round H cell result (2026-11-01)
+
+Done, one commit `c34a08b0` (+565/-83); `--selftest` paints 200x50 frames from the renderer's geometry and passes 22 assertions offline; py_compile and discovery clean; the sandbox run dies at the bind denial before any claim. Premise correction: `Mode::Scan` bypasses `main_region`, so the Scan view draws no sidebar; the box border alone offsets `>` to column 1, and the reader anchors on the border column found from the tab-strip row, so it holds at any offset (the self-test covers a 28-column-sidebar variant too).
+
 ## Not in this round
 
 The harness's shared default operator token on a loopback bus and the parent env inherited by the TUI child are pre-existing harness conventions (T10).

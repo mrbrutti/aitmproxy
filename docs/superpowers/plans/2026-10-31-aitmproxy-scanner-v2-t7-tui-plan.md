@@ -661,6 +661,12 @@ Kept by the main session during stage 6. One row per finding.
 | G-C | spec | Minor | `EDITOR_HEAD_RE` matches the no-editor hint | fix round H (H4) |
 | G-C | spec | Minor | T7-19 tab marker waited before `J` pins the job | fix round H (H11) |
 | G-C | spec | note | prefix needle widths, glyph allowance, candidate cap, sample count and timeouts | ratified in round H's text |
+| H (cell) | fix round | done | H1-H11 in `c34a08b0`; 22-assertion offline frame self-test (`--selftest`) green; py_compile and discovery clean | final cell re-review |
+| H (cell) | coder note | Minor | the Scan view draws no sidebar (H9's premise); the reader anchors on the box border column from the strip row | ratified; H9 text corrected |
+| H (cell) | coder note | Minor | self-test frames are painted from the renderer's geometry, not a hand-typed literal | ratified |
+| H (cell) | coder note | Minor | H2 adopts the exact-tuple entry's id for the `finally` removal and continues the step | ratified |
+| H (cell) | coder note | Minor | `TAB_MARKERS["3"]` replaced by `SITEMAP_MARKER = "{n} nodes"`; `cursor_row` right-strips; T7-16's Jobs-tab wait and row wait are one check | ratified |
+| H (cell) | coder note | note | T7-18's post-`y` `row_shown` does not wait on the Jobs marker; `on_cursor`'s `{0,8}` allowance can accept a sibling row containing the needle | accepted residuals; the live run will tell |
 
 ## Shipped
 
