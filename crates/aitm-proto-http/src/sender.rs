@@ -187,10 +187,7 @@ impl HttpSender {
             resolver: Arc::new(SystemResolver),
             dialer: Arc::new(TcpDialer),
             ssrf: None,
-            alpn: Cache::builder()
-                .time_to_live(ALPN_CACHE_TTL)
-                .max_capacity(ALPN_CACHE_CAPACITY)
-                .build(),
+            alpn: alpn_cache(ALPN_CACHE_TTL),
             h2_pool: H2Pool::new(),
         }
     }
@@ -226,6 +223,16 @@ impl HttpSender {
         self
     }
 
+    /// How long a negotiated protocol is remembered before the sender offers
+    /// both again (default [`ALPN_CACHE_TTL`], ten minutes). Rebuilds the
+    /// cache, so it is empty afterwards — call it while configuring the
+    /// sender, not mid-run. A seam for tests, which cannot wait out the
+    /// default.
+    pub fn with_alpn_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.alpn = alpn_cache(ttl);
+        self
+    }
+
     /// The overall deadline for one exchange after the TCP connect (default
     /// 60s).
     pub fn with_response_timeout(mut self, timeout: Duration) -> Self {
@@ -233,20 +240,23 @@ impl HttpSender {
         self
     }
 
-    /// What ALPN settled on for `authority` (`host:port`), while the cache
-    /// entry lives. `None` once it has expired or before the first exchange.
-    pub fn negotiated_for(&self, authority: &str) -> Option<Negotiated> {
-        self.alpn.get(authority)
+    /// What ALPN settled on for `scheme://authority` (`authority` is
+    /// `host:port`), while the cache entry lives. `None` once it has expired or
+    /// before the first exchange. The scheme is part of the identity: a
+    /// cleartext and a TLS origin on the same host and port are two peers.
+    pub fn negotiated_for(&self, scheme: &str, authority: &str) -> Option<Negotiated> {
+        self.alpn.get(&conn_key(scheme, authority))
     }
 
-    /// The ALPN protocol list to offer for `authority` under `version`:
-    /// everything we can speak when nothing is known, the remembered protocol
-    /// on a cache hit, and exactly one entry when the caller forces a version.
-    fn alpn_offer(&self, authority: &str, version: VersionPolicy) -> Vec<&'static [u8]> {
+    /// The ALPN protocol list to offer for the connection `key` under
+    /// `version`: everything we can speak when nothing is known, the remembered
+    /// protocol on a cache hit, and exactly one entry when the caller forces a
+    /// version.
+    fn alpn_offer(&self, key: &str, version: VersionPolicy) -> Vec<&'static [u8]> {
         match version {
             VersionPolicy::H1 => vec![ALPN_HTTP11],
             VersionPolicy::H2 | VersionPolicy::H2c => vec![ALPN_H2],
-            VersionPolicy::Auto => match self.negotiated_for(authority) {
+            VersionPolicy::Auto => match self.alpn.get(key) {
                 Some(Negotiated::H2) => vec![ALPN_H2],
                 Some(Negotiated::H1) => vec![ALPN_HTTP11],
                 None => vec![ALPN_H2, ALPN_HTTP11],
@@ -255,16 +265,16 @@ impl HttpSender {
     }
 
     /// Whether this send already knows it will speak h2 — the case where a
-    /// pooled connection to `authority` can carry it instead of a fresh dial.
+    /// pooled connection under `key` can carry it instead of a fresh dial.
     /// An `Auto` send only knows that once ALPN has settled on h2 here before;
     /// a forced `h2`/`h2c` always does. (A forced `h2` on a plaintext origin
     /// has already failed by this point, so `tls` decides that arm.)
-    fn h2_without_negotiating(&self, authority: &str, version: VersionPolicy, tls: bool) -> bool {
+    fn h2_without_negotiating(&self, key: &str, version: VersionPolicy, tls: bool) -> bool {
         match version {
             VersionPolicy::H1 => false,
             VersionPolicy::H2 => tls,
             VersionPolicy::H2c => true,
-            VersionPolicy::Auto => tls && self.negotiated_for(authority) == Some(Negotiated::H2),
+            VersionPolicy::Auto => tls && self.alpn.get(key) == Some(Negotiated::H2),
         }
     }
 
@@ -296,6 +306,10 @@ impl HttpSender {
         let req = prepare_common(&req);
         let (host, port) = split_authority(&req.authority, &scheme)?;
         let authority = Authority::new(&host, port).to_string();
+        // Everything connection-shaped — the ALPN cache and the h2 pool — is
+        // keyed by scheme *and* authority: `http://h:p` (h2c, cleartext) and
+        // `https://h:p` are two different peers and must never share an entry.
+        let key = conn_key(&scheme, &authority);
 
         // A plaintext origin has no ALPN to force h2 with; say so before we
         // spend a connection on it.
@@ -334,8 +348,8 @@ impl HttpSender {
         // pooled connection to the authority serves it without a second dial.
         // The resolve and the SSRF gate above still run every time, so reuse
         // never skips the check that decides whether this target is allowed.
-        let pooled = if self.h2_without_negotiating(&authority, version, tls) {
-            self.h2_pool.take(&authority)
+        let pooled = if self.h2_without_negotiating(&key, version, tls) {
+            self.h2_pool.take(&key)
         } else {
             None
         };
@@ -345,7 +359,7 @@ impl HttpSender {
                 return crate::h2_sender::exchange_pooled(
                     &self.h2_pool,
                     send_req,
-                    &authority,
+                    &key,
                     &req,
                     self.response_timeout,
                 )
@@ -353,7 +367,7 @@ impl HttpSender {
             }
             let stream = self.dialer.dial(addr).await?;
             if tls {
-                let offer = self.alpn_offer(&authority, version);
+                let offer = self.alpn_offer(&key, version);
                 let name = ServerName::try_from(host.clone())
                     .map_err(|e| anyhow!("invalid server name {host:?}: {e}"))?;
                 let tls_stream = match TlsConnector::from(self.client_config(&offer)?)
@@ -373,14 +387,14 @@ impl HttpSender {
                 // back says nothing about what would have been negotiated and
                 // must not steer a later `Auto` send (plan Task 3, item 5).
                 if matches!(version, VersionPolicy::Auto) {
-                    self.alpn.insert(authority.clone(), negotiated);
+                    self.alpn.insert(key.clone(), negotiated);
                 }
                 match negotiated {
                     Negotiated::H2 => {
                         crate::h2_sender::exchange(
                             &self.h2_pool,
                             Box::new(tls_stream),
-                            &authority,
+                            &key,
                             &req,
                             self.response_timeout,
                         )
@@ -406,14 +420,8 @@ impl HttpSender {
             } else if matches!(version, VersionPolicy::H2c) {
                 // Prior-knowledge cleartext h2: no TLS, no ALPN, straight into
                 // the h2 preface on the raw stream.
-                crate::h2_sender::exchange(
-                    &self.h2_pool,
-                    stream,
-                    &authority,
-                    &req,
-                    self.response_timeout,
-                )
-                .await
+                crate::h2_sender::exchange(&self.h2_pool, stream, &key, &req, self.response_timeout)
+                    .await
             } else {
                 drive(stream, &prepare_h1(&req)).await
             }
@@ -582,6 +590,22 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Split `host[:port]` with the scheme's default port; handles bracketed IPv6.
+/// An empty ALPN cache holding at most [`ALPN_CACHE_CAPACITY`] entries, each
+/// for `ttl`.
+fn alpn_cache(ttl: Duration) -> Cache<String, Negotiated> {
+    Cache::builder()
+        .time_to_live(ttl)
+        .max_capacity(ALPN_CACHE_CAPACITY)
+        .build()
+}
+
+/// The identity of one upstream connection: `scheme://host:port`. The single
+/// key for both the ALPN cache and the h2 connection pool, so an `h2c` peer and
+/// a TLS peer on the same host and port never collide.
+fn conn_key(scheme: &str, authority: &str) -> String {
+    format!("{scheme}://{authority}")
+}
+
 fn split_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
     let default = if scheme == "https" { 443 } else { 80 };
     let auth = aitm_core::Authority::parse_with_default(authority, default)
@@ -1069,7 +1093,7 @@ mod tests {
             tls_sends(&[b"h2", b"http/1.1"], VersionPolicy::Auto, 1).await;
         assert_eq!(logs[0].alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H2)
         );
     }
@@ -1083,7 +1107,7 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.version, aitm_core::HttpVersion::Http11);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H1)
         );
     }
@@ -1130,7 +1154,7 @@ mod tests {
             "error was {err}"
         );
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             None,
             "a forced send must never write the ALPN cache"
         );
@@ -1157,7 +1181,7 @@ mod tests {
             "error was {err}"
         );
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             None,
             "a forced send must never write the ALPN cache"
         );
@@ -1268,7 +1292,7 @@ mod tests {
             other => panic!("body was {other:?}, want Bytes(hi)"),
         }
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H2)
         );
         drop(sender);
@@ -1306,7 +1330,7 @@ mod tests {
         assert_eq!(forced.status, 200);
         assert_eq!(forced.version, aitm_core::HttpVersion::Http11);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             None,
             "a forced-h1 send must not record what the authority negotiated"
         );
@@ -1322,7 +1346,7 @@ mod tests {
         .expect("the following auto exchange succeeds");
         assert_eq!(auto.version, aitm_core::HttpVersion::H2);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H2)
         );
         drop(sender);
@@ -1351,7 +1375,7 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(log.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H1)
         );
     }
@@ -1378,7 +1402,7 @@ mod tests {
         );
         assert!(is_h2_not_negotiated(&err), "error was {err}");
         assert_eq!(dialer.calls(), 1, "h2c over TLS dials and runs ALPN");
-        assert_eq!(sender.negotiated_for("origin.test:443"), None);
+        assert_eq!(sender.negotiated_for("https", "origin.test:443"), None);
     }
 
     /// Session call S2, the positive half: `H2c` on an `https://` h2 origin runs
@@ -1404,7 +1428,7 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.version, aitm_core::HttpVersion::H2);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             None,
             "a forced h2c send must not write the ALPN cache"
         );
@@ -1450,7 +1474,7 @@ mod tests {
             .expect("the first auto exchange speaks h2");
         assert_eq!(resp.version, aitm_core::HttpVersion::H2);
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H2)
         );
 
@@ -1487,7 +1511,7 @@ mod tests {
             "a cached H2 makes Auto offer only h2"
         );
         assert_eq!(
-            sender.negotiated_for("origin.test:443"),
+            sender.negotiated_for("https", "origin.test:443"),
             Some(Negotiated::H2),
             "a failed handshake does not rewrite the cache; the entry ages out with the TTL"
         );
@@ -1522,7 +1546,7 @@ mod tests {
             err.to_string().contains("TLS to origin.test"),
             "error was {err}"
         );
-        assert_eq!(sender.negotiated_for("origin.test:443"), None);
+        assert_eq!(sender.negotiated_for("https", "origin.test:443"), None);
         drop(sender);
         let log = tokio::time::timeout(Duration::from_secs(10), origin)
             .await
@@ -1553,6 +1577,164 @@ mod tests {
         assert!(err.to_string().contains("bad authority"), "error was {err}");
         assert!(!is_h2_not_negotiated(&err), "error was {err}");
         assert_eq!(dialer.calls(), 0);
+    }
+
+    /// The ALPN cache honours the TTL it was built with: once the entry has
+    /// aged out, the next `Auto` send offers both protocols again instead of
+    /// the remembered one (the default-TTL case is
+    /// `the_second_send_offers_only_the_cached_protocol`).
+    #[tokio::test]
+    async fn an_expired_alpn_cache_entry_makes_the_next_send_offer_both_again() {
+        let mut clients = VecDeque::new();
+        let mut origins = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = duplex(64 * 1024);
+            clients.push_back(client);
+            origins.push(tokio::spawn(async move {
+                tls_origin(server, &[b"http/1.1"], RESPONSE_200).await
+            }));
+        }
+        let dialer = Arc::new(DuplexDialer::new(clients));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone())
+            .with_alpn_cache_ttl(Duration::from_millis(1));
+        let req = https_get();
+
+        let first = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the first send finished within the guard")
+            .expect("the h1 origin answers");
+        assert_eq!(first.status, 200);
+
+        // A real wait, past the 1 ms TTL: the entry the first send wrote is
+        // gone, so the second send cannot be steered by it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sender.negotiated_for("https", "origin.test:443"),
+            None,
+            "the cache entry must age out with the configured TTL"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the second send finished within the guard")
+            .expect("the h1 origin answers again");
+        assert_eq!(second.status, 200);
+        assert_eq!(dialer.calls(), 2);
+
+        let mut logs = Vec::new();
+        for origin in origins {
+            logs.push(origin.await.expect("origin task"));
+        }
+        assert_eq!(
+            logs.iter().map(|l| l.alpn.clone()).collect::<Vec<_>>(),
+            vec![
+                vec!["h2".to_string(), "http/1.1".to_string()],
+                vec!["h2".to_string(), "http/1.1".to_string()]
+            ],
+            "an expired entry must not narrow the second ClientHello"
+        );
+    }
+
+    /// The ALPN cache is keyed by scheme as well as `host:port`: what
+    /// `https://origin.test:443` settled on says nothing about
+    /// `http://origin.test:443`, which never negotiates ALPN at all.
+    #[tokio::test]
+    async fn the_alpn_cache_is_keyed_by_scheme_as_well_as_host_port() {
+        let (sender, _results, _logs, _dialer) =
+            tls_sends(&[b"h2", b"http/1.1"], VersionPolicy::Auto, 1).await;
+        assert_eq!(
+            sender.negotiated_for("https", "origin.test:443"),
+            Some(Negotiated::H2)
+        );
+        assert_eq!(
+            sender.negotiated_for("http", "origin.test:443"),
+            None,
+            "a cleartext origin on the same host:port must not inherit the TLS negotiation"
+        );
+    }
+
+    /// A plaintext h2 origin over one duplex half (prior-knowledge h2c): answer
+    /// every stream `200` with `body`, until the client closes the connection.
+    async fn plain_h2_origin(io: DuplexStream, body: &'static [u8]) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        while let Some(Ok((_req, mut respond))) = conn.accept().await {
+            if let Ok(resp) = http::Response::builder().status(200).body(()) {
+                if let Ok(mut send) = respond.send_response(resp, false) {
+                    let _ = send.send_data(bytes::Bytes::from_static(body), true);
+                }
+            }
+        }
+    }
+
+    fn body_bytes(resp: &HttpResponse) -> Vec<u8> {
+        match &resp.body {
+            Body::Bytes(b) => b.clone(),
+            Body::Empty => Vec::new(),
+            other => panic!("body was {other:?}, want Bytes"),
+        }
+    }
+
+    /// The h2 pool is keyed by scheme as well as `host:port`: a cleartext
+    /// (`h2c`) connection to `origin.test:443` must never carry a later
+    /// `https` send to the same host and port. Both origins answer a different
+    /// body, so a reused connection is visible in the response, not only in the
+    /// dial count.
+    #[tokio::test]
+    async fn an_h2c_connection_is_not_reused_for_a_tls_send_to_the_same_host_port() {
+        let (cleartext_client, cleartext_server) = duplex(64 * 1024);
+        let (tls_client, tls_server) = duplex(64 * 1024);
+        let plain = tokio::spawn(plain_h2_origin(cleartext_server, b"plain"));
+        let secure = tokio::spawn(async move { tls_h2_origin(tls_server, &[b"h2"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([
+            cleartext_client,
+            tls_client,
+        ])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+
+        let cleartext_req = HttpRequest {
+            scheme: "http".into(),
+            ..https_get()
+        };
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&cleartext_req, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the h2c send finished within the guard")
+        .expect("the cleartext origin answers");
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"plain".to_vec());
+        assert_eq!(dialer.calls(), 1);
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&https_get(), VersionPolicy::H2),
+        )
+        .await
+        .expect("the https send finished within the guard")
+        .expect("the TLS origin answers on its own connection");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_bytes(&resp),
+            b"hi".to_vec(),
+            "the https send was served by the pooled cleartext connection"
+        );
+        assert_eq!(
+            dialer.calls(),
+            2,
+            "an https send must dial rather than reuse the h2c connection to the same host:port"
+        );
+        drop(sender);
+        plain.abort();
+        secure.abort();
     }
 
     /// Oversized input on the h1 path: a 17 MiB `Content-Length` body is

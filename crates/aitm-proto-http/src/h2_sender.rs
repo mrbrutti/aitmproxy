@@ -38,7 +38,8 @@ const H2_WIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The response-body cap, matching the h1 path in [`crate::sender`].
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// One live h2 connection per authority, reused while idle.
+/// One live h2 connection per connection key (`scheme://host:port`, the
+/// identity the sender's `conn_key` builds), reused while idle.
 ///
 /// The map is capped at [`MAX_POOLED_AUTHORITIES`]: past that, an exchange
 /// still runs on its own fresh connection, it is simply not remembered.
@@ -55,60 +56,61 @@ impl H2Pool {
         Self::default()
     }
 
-    /// A handle for `authority` when the pooled connection is ready to carry
+    /// A handle for `key` when the pooled connection is ready to carry
     /// another stream. A connection that has errored (GOAWAY, a closed socket)
     /// is dropped from the pool and `None` is returned, so the caller redials.
     /// `None` is also returned while the connection is merely busy — the caller
     /// opens a second one rather than queueing behind it.
-    pub(crate) fn take(&self, authority: &str) -> Option<SendRequest<Bytes>> {
+    pub(crate) fn take(&self, key: &str) -> Option<SendRequest<Bytes>> {
         let mut conns = self.conns.lock().ok()?;
-        let entry = conns.get_mut(authority)?;
+        let entry = conns.get_mut(key)?;
         // A no-op waker: this is a readiness *probe*, not a wait. Nothing is
         // ever woken through it, and the next send polls again.
         let mut cx = Context::from_waker(Waker::noop());
         match entry.poll_ready(&mut cx) {
             Poll::Ready(Ok(())) => Some(entry.clone()),
             Poll::Ready(Err(_)) => {
-                conns.remove(authority);
+                conns.remove(key);
                 None
             }
             Poll::Pending => None,
         }
     }
 
-    /// Remember `send_req` for `authority`, replacing any previous handle.
-    fn store(&self, authority: &str, send_req: SendRequest<Bytes>) {
+    /// Remember `send_req` for `key`, replacing any previous handle.
+    fn store(&self, key: &str, send_req: SendRequest<Bytes>) {
         if let Ok(mut conns) = self.conns.lock() {
-            if conns.len() >= MAX_POOLED_AUTHORITIES && !conns.contains_key(authority) {
+            if conns.len() >= MAX_POOLED_AUTHORITIES && !conns.contains_key(key) {
                 return;
             }
-            conns.insert(authority.to_string(), send_req);
+            conns.insert(key.to_string(), send_req);
         }
     }
 
-    /// Forget the connection to `authority` (it failed mid-exchange).
-    fn remove(&self, authority: &str) {
+    /// Forget the connection under `key` (it failed mid-exchange).
+    fn remove(&self, key: &str) {
         if let Ok(mut conns) = self.conns.lock() {
-            conns.remove(authority);
+            conns.remove(key);
         }
     }
 }
 
 /// Run one request/response exchange over a **new** h2 connection on `stream`,
-/// remembering the connection in `pool` for the next send to `authority`.
+/// remembering the connection in `pool` under `key` for the next send to the
+/// same scheme, host and port.
 ///
 /// `stream` is already the right transport: a TLS stream that negotiated ALPN
 /// `h2`, or a plain one for prior-knowledge h2c.
 pub(crate) async fn exchange(
     pool: &H2Pool,
     stream: Box<dyn ProbeStream>,
-    authority: &str,
+    key: &str,
     req: &HttpRequest,
     response_timeout: Duration,
 ) -> Result<HttpResponse> {
-    let send_req = handshake(stream, authority).await?;
-    pool.store(authority, send_req.clone());
-    exchange_pooled(pool, send_req, authority, req, response_timeout).await
+    let send_req = handshake(stream, key).await?;
+    pool.store(key, send_req.clone());
+    exchange_pooled(pool, send_req, key, req, response_timeout).await
 }
 
 /// Run one request/response exchange over an already-open connection taken
@@ -117,26 +119,54 @@ pub(crate) async fn exchange(
 pub(crate) async fn exchange_pooled(
     pool: &H2Pool,
     send_req: SendRequest<Bytes>,
-    authority: &str,
+    key: &str,
     req: &HttpRequest,
     response_timeout: Duration,
 ) -> Result<HttpResponse> {
+    // Armed for the whole exchange: a deadline *above* this layer (the
+    // sender's whole-exchange timeout, which starts before the dial and so
+    // fires first on a real connect) drops this future instead of resuming it,
+    // so an `if result.is_err()` after the await would never run. The guard
+    // runs on that drop too, which is what keeps a stalled connection out of
+    // the pool (D8.2 "closed on error").
+    let mut eviction = PoolEviction {
+        pool,
+        key,
+        armed: true,
+    };
     let result = match tokio::time::timeout(response_timeout, stream_exchange(send_req, req)).await
     {
         Ok(result) => result,
         Err(_) => Err(anyhow!(
-            "h2 exchange with {authority} timed out after {response_timeout:?}"
+            "h2 exchange with {key} timed out after {response_timeout:?}"
         )),
     };
-    if result.is_err() {
-        pool.remove(authority);
+    if result.is_ok() {
+        eviction.armed = false;
     }
     result
 }
 
+/// Drops `key`'s pooled connection unless the exchange it guards
+/// completed successfully — including when that exchange is cancelled rather
+/// than finished, which a plain error branch cannot see.
+struct PoolEviction<'a> {
+    pool: &'a H2Pool,
+    key: &'a str,
+    armed: bool,
+}
+
+impl Drop for PoolEviction<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.remove(self.key);
+        }
+    }
+}
+
 /// Handshake a new h2 client connection, with the same settings the proxy's
 /// own upstream path uses, and drive it on its own task.
-async fn handshake(stream: Box<dyn ProbeStream>, authority: &str) -> Result<SendRequest<Bytes>> {
+async fn handshake(stream: Box<dyn ProbeStream>, key: &str) -> Result<SendRequest<Bytes>> {
     let (send_req, connection) = wire(
         "handshake",
         h2::client::Builder::new()
@@ -146,8 +176,8 @@ async fn handshake(stream: Box<dyn ProbeStream>, authority: &str) -> Result<Send
             .handshake::<_, Bytes>(stream),
     )
     .await?
-    .with_context(|| format!("h2 handshake with {authority}"))?;
-    let label = authority.to_string();
+    .with_context(|| format!("h2 handshake with {key}"))?;
+    let label = key.to_string();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::warn!("h2 connection to {label} ended with error: {e}");
@@ -1026,7 +1056,6 @@ mod tests {
     /// peer that just stalled. Virtual time: the 5 s response timeout elapses
     /// without a real wait.
     #[tokio::test(start_paused = true)]
-    #[ignore = "defect D1 (tester pass over tasks 1+3): the sender's whole-exchange timeout fires before h2_sender::exchange_pooled's and drops it before `pool.remove`, so a stalled connection stays pooled and every later send to the authority times out on it; un-ignore with the fix"]
     async fn a_timed_out_exchange_drops_the_still_open_connection_from_the_pool() {
         let (client1, server1) = duplex(64 * 1024);
         let (client2, server2) = duplex(64 * 1024);
