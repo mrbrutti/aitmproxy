@@ -199,6 +199,17 @@ public enum EmbeddedCoreLaunch {
         /// startup scope. `allow_agent_widen` is never emitted: restoring the
         /// operator's scope must not let agents widen it.
         public var scopeHosts: [String]
+        /// When true, emit a top-level `system_proxy.auto: true` so the embedded core
+        /// sets itself as the system proxy at launch and restores the previous setting
+        /// on quit (Settings ▸ Proxy "Set system proxy at launch", `Store.defaults`
+        /// `systemProxy.auto`). Off by default; like `macos_capture`, the manager
+        /// re-reads it on every spawn, so Restart Core is what applies a change.
+        public var systemProxyAuto: Bool
+        /// Hosts that skip the system proxy (`system_proxy.bypass`, Settings ▸ Proxy
+        /// "Bypass hosts"). Emitted in array order, each double-quoted; the same
+        /// newline guard as `scopeHosts`. Empty — the default for every pre-existing
+        /// call site — emits no `bypass:` key, so the core parses its default list.
+        public var systemProxyBypass: [String]
 
         public init(
             obscuraBinary: URL,
@@ -209,7 +220,9 @@ public enum EmbeddedCoreLaunch {
             endpointFile: URL,
             sslInsecure: Bool = false,
             captureEnabled: Bool = false,
-            scopeHosts: [String] = []
+            scopeHosts: [String] = [],
+            systemProxyAuto: Bool = false,
+            systemProxyBypass: [String] = []
         ) {
             self.obscuraBinary = obscuraBinary
             self.proxyPort = proxyPort
@@ -220,6 +233,8 @@ public enum EmbeddedCoreLaunch {
             self.sslInsecure = sslInsecure
             self.captureEnabled = captureEnabled
             self.scopeHosts = scopeHosts
+            self.systemProxyAuto = systemProxyAuto
+            self.systemProxyBypass = systemProxyBypass
         }
 
         /// The `config.yaml` body. The bus binds `port: 0` (ephemeral, so it
@@ -283,6 +298,25 @@ public enum EmbeddedCoreLaunch {
                     body += "    - \"\(escaped)\"\n"
                 }
             }
+            // `system_proxy` is the LAST tail (after `scope`), so every byte-exact `hasSuffix`
+            // on a config without it still holds. A top-level `system_proxy:` with `auto:` and
+            // an optional `bypass:` list under it is exactly the shape the core's
+            // `config_file.rs` accepts (`deny_unknown_fields`), and the text is byte-for-byte
+            // the input of its `system_proxy_block_the_mac_app_emits_parses` test (SP-AC25).
+            // `auto` is written whenever the block is (so a bypass list with the launch toggle
+            // off says `auto: false`); `bypass:` only when the list is non-empty. Nothing is
+            // written when both are at their defaults, so the core keeps its own.
+            if systemProxyAuto || !systemProxyBypass.isEmpty {
+                body += "\nsystem_proxy:\n  auto: \(systemProxyAuto)\n"
+                if !systemProxyBypass.isEmpty {
+                    body += "  bypass:\n"
+                    for host in systemProxyBypass {
+                        let escaped = try EmbeddedCoreLaunch.yamlDoubleQuoted(
+                            host, onNewline: ConfigError.hostContainsNewline)
+                        body += "    - \"\(escaped)\"\n"
+                    }
+                }
+            }
             return body
         }
     }
@@ -291,8 +325,8 @@ public enum EmbeddedCoreLaunch {
     public enum ConfigError: Error, Equatable {
         /// A path carried a newline, which would break out of its YAML scalar.
         case pathContainsNewline(String)
-        /// A scope host carried a newline, which would break out of its YAML scalar
-        /// and let a crafted host inject YAML into the token-bearing config.
+        /// A scope or system-proxy bypass host carried a newline, which would break out
+        /// of its YAML scalar and let a crafted host inject YAML into the token-bearing config.
         case hostContainsNewline(String)
     }
 
