@@ -1298,6 +1298,9 @@ forwarded to the coordinator for the spec file.
 | Q5 | G3/S1 spec wording (`HttpRequest.version`) | **Confirmed**: the sentence applies to the response. Forwarded to the coordinator as a spec wording correction. |
 | Q6 | B1 replay over h2 by default | **Confirmed.** `VersionPolicy::Auto` is the spec's default (D9.1) and D8.2 says `HttpSender` replaces `Http1Sender`'s behaviour; `flow.replay`/`request.send`/`http.send` reissue over h2 against an h2 origin, visible in `flow.detail` `response.version`. |
 
+
+**Coordinator decisions received (2026-10-31, after the table above):** (1) D8.2 will say `HttpResponse.version`; the T3-1/T3-2 oracle is `flow.detail` `response.version`. (2) T1b adds `Timing.correlated: bool` (default `false`) to the model: Task 8 builds `Timing` with the fields that exist on this branch, and Task 11 (the T1b merge) adds `correlated: timing::correlated(&t)` at the single construction site in `blind_timing.rs`, so the T10 cell reads it from `evidence.timing`. (3) `CheckMeta.scope: point | node | origin` arrives via T1b; the per-authority TTL guard stays until then. (4) Raw-h2 accept-any TLS is allowed only under S6's conditions (same authority, after `host.baseline()` passed the guarded client, no session headers, observe-only); Task 6 states them in the `raw_h2` doc comment and Task 18 repeats them in the PR body for the security reviewer's explicit sign-off. (5) Check ids as chosen.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
