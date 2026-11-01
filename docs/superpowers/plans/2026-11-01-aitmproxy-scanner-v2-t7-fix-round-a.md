@@ -50,6 +50,10 @@ A19. Tab strip hygiene (`crates/aitm-tui/src/ui/scan/mod.rs`): `enumerate()` ins
 
 A20. First `Esc` on the legacy Site map flips Points to Nodes instead of leaving (`crates/aitm-tui/src/scan/mod.rs` `close_pane`, `crates/aitm-tui/src/app.rs` `Back`): under `ScanOffer::Legacy`, `Back` leaves to `Mode::Flows` at once (D12 "nothing changes in behaviour"). Test in `tests/scan_surface.rs`: `open_site_map`, `Back` gives `Mode::Flows`.
 
+A21. Missing-verb wording repeats the verb (`scan.cancel: scan.cancel is not on this bus`): add `ScanError::missing_verb(verb: &str) -> Self` in `crates/aitm-tui/src/scan/mod.rs` (uncoded, detail `is not on this bus`) and make `wording()` for an uncoded error whose detail starts with `is not on this bus` read `<verb> is not on this bus` (no colon); `App::scan_call` in `crates/aitm-tui/src/app.rs` uses the constructor. Test (`tests/scan_v2_parse.rs`): `ScanError::missing_verb("scan.cancel").wording() == "scan.cancel is not on this bus"`.
+
+**Range for this round:** `6a95f777..51d67457` (Tasks 1 to 5).
+
 ## Not in this round (dispositioned elsewhere)
 
 The `IssueFilters.severity_min` type and its doc comment (Task 7); the two `format!("http://{host}/")` sites (Task 9); the Profiles list placeholder arm (Task 11); the legacy Jobs hint line (Task 14).
