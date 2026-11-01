@@ -45,7 +45,8 @@ use crate::oracle::{classify, liveness_passes, CaseClass, LatencyWindow};
 use crate::plan::{is_decodable, send_recv_spec, PlanError, SeedSpec, TargetPlan};
 use crate::rng::{derive_seed, Rng};
 use crate::state::{
-    report_counters, Candidate, CaseRecord, CrashRecord, LaneState, Outcome, PointRun, StopReason,
+    report_counters, Candidate, CaseOutcome, CaseRecord, CrashRecord, LaneState, PointRun,
+    StopReason,
 };
 use crate::sync::lock;
 
@@ -618,7 +619,7 @@ impl PointRunner {
         // (f) The oracle reads the reply, and the ladder gets its say — after
         // the record exists, so the tripping case is never lost.
         let classified = classify(&outcome, elapsed);
-        record.outcome = Outcome::Sent {
+        record.outcome = CaseOutcome::Sent {
             class: classified.class,
             elapsed_ms: classified.elapsed_ms,
             latency_outlier: false,
@@ -765,7 +766,7 @@ impl PointRunner {
             let stop = delivered.stop;
             // An unsent case (undecodable) carries no reaction; it is logged and
             // the loop moves on (review finding M2).
-            let Outcome::Sent {
+            let CaseOutcome::Sent {
                 class, elapsed_ms, ..
             } = record.outcome
             else {
@@ -775,7 +776,7 @@ impl PointRunner {
             sent_cases += 1;
             if class == CaseClass::Clean {
                 latency.record(elapsed_ms);
-                record.outcome = Outcome::Sent {
+                record.outcome = CaseOutcome::Sent {
                     class,
                     elapsed_ms,
                     latency_outlier: latency.is_outlier(elapsed_ms),
@@ -784,84 +785,82 @@ impl PointRunner {
 
             if class.is_candidate() && stop.is_none() {
                 let (first, second, probe_stop) = self.probe_pair(false).await;
-                let probes = (first, second);
                 alive = first || second;
                 if let Some(reason) = probe_stop {
                     record.candidate = Candidate::Interrupted {
-                        probes,
                         stop: reason.clone(),
                     };
                     run.cases.push(record);
                     run.stopped = Some(reason);
                     break;
                 }
-                // `reproduce_count: 0` asks for no replay at all, and spec
-                // call 14 confirms a crash only on a reproduction. So the
-                // triage never runs, the candidate is never confirmed — no
-                // crash, no retirement, no stop — and the loop goes on to the
-                // next case, keeping this one's `(false, false)` liveness for
-                // `checks::CrashCheck` to report as inconclusive (review
-                // finding G1).
-                if !first && !second && reproduce_count == 0 {
-                    record.candidate = Candidate::Unjudged { probes };
-                }
-                if !first && !second && reproduce_count > 0 {
-                    let triage = self
-                        .triage(&spec, &seed.id, &chain, index, reproduce_count)
-                        .await;
-                    // A triage any stop cut short proves nothing: the point
-                    // keeps its `(false, false)` candidate case, the run ends
-                    // on the stop and no crash is recorded or retired (tester
-                    // finding F1). `checks::CrashCheck` surfaces the
-                    // unconfirmed candidate as inconclusive.
-                    if let Some(reason) = triage.stop {
-                        record.candidate = Candidate::Interrupted {
-                            probes,
-                            stop: reason.clone(),
-                        };
-                        run.cases.push(record);
-                        run.stopped = Some(reason);
-                        break;
-                    }
-                    let crashed = !triage.recovered
-                        || (triage.attempts == reproduce_count
-                            && triage.reproduced == triage.attempts);
-                    record.candidate = if crashed {
-                        Candidate::Confirmed {
-                            probes,
-                            reproduced: triage.reproduced,
-                            attempts: triage.attempts,
-                        }
+                // Both probes failed, so this case is a candidate.
+                if !first && !second {
+                    if reproduce_count == 0 {
+                        // `reproduce_count: 0` asks for no replay at all, and
+                        // spec call 14 confirms a crash only on a
+                        // reproduction. So the triage never runs, the
+                        // candidate is never confirmed — no crash, no
+                        // retirement, no stop — and the loop goes on to the
+                        // next case, leaving the unjudged candidate for
+                        // `checks::CrashCheck` to report as inconclusive
+                        // (review finding G1).
+                        record.candidate = Candidate::Unjudged;
                     } else {
-                        // The triage ran and the candidate did not come back:
-                        // that is the lane's answer, and no later stop reopens
-                        // it (review finding Q2).
-                        Candidate::NotReproduced {
-                            probes,
-                            reproduced: triage.reproduced,
-                            attempts: triage.attempts,
+                        let triage = self
+                            .triage(&spec, &seed.id, &chain, index, reproduce_count)
+                            .await;
+                        // A triage any stop cut short proves nothing: the
+                        // point keeps its candidate case, the run ends on the
+                        // stop and no crash is recorded or retired (tester
+                        // finding F1). `checks::CrashCheck` surfaces the
+                        // unconfirmed candidate as inconclusive.
+                        if let Some(reason) = triage.stop {
+                            record.candidate = Candidate::Interrupted {
+                                stop: reason.clone(),
+                            };
+                            run.cases.push(record);
+                            run.stopped = Some(reason);
+                            break;
                         }
-                    };
-                    if crashed {
-                        self.shared.state.record_crash(job_id, &self.point.id);
-                        run.crash = Some(CrashRecord {
-                            case_index: index,
-                            recovered: triage.recovered,
-                            evidence: L4Evidence {
-                                sent_hex: record.sent_hex.clone(),
-                                seed_id: seed.id.clone(),
-                                rng_seed: self.rng_seed,
-                                mutation_chain: chain.clone(),
-                                prior_messages: 0,
-                                oracle: L4Oracle::LivenessFailed,
-                                liveness_before,
-                                liveness_after: false,
-                                reproduced: (triage.reproduced, triage.attempts),
-                                scope_entry: self.plan.target.scope_entry.clone(),
-                            },
-                        });
-                        run.cases.push(record);
-                        break;
+                        let crashed = !triage.recovered
+                            || (triage.attempts == reproduce_count
+                                && triage.reproduced == triage.attempts);
+                        record.candidate = if crashed {
+                            Candidate::Confirmed {
+                                reproduced: triage.reproduced,
+                                attempts: triage.attempts,
+                            }
+                        } else {
+                            // The triage ran and the candidate did not come
+                            // back: that is the lane's answer, and no later
+                            // stop reopens it (review finding Q2).
+                            Candidate::NotReproduced {
+                                reproduced: triage.reproduced,
+                                attempts: triage.attempts,
+                            }
+                        };
+                        if crashed {
+                            self.shared.state.record_crash(job_id, &self.point.id);
+                            run.crash = Some(CrashRecord {
+                                case_index: index,
+                                recovered: triage.recovered,
+                                evidence: L4Evidence {
+                                    sent_hex: record.sent_hex.clone(),
+                                    seed_id: seed.id.clone(),
+                                    rng_seed: self.rng_seed,
+                                    mutation_chain: chain.clone(),
+                                    prior_messages: 0,
+                                    oracle: L4Oracle::LivenessFailed,
+                                    liveness_before,
+                                    liveness_after: false,
+                                    reproduced: (triage.reproduced, triage.attempts),
+                                    scope_entry: self.plan.target.scope_entry.clone(),
+                                },
+                            });
+                            run.cases.push(record);
+                            break;
+                        }
                     }
                 }
             }
@@ -1515,7 +1514,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::NotReproduced {
-                probes: (false, false),
                 reproduced: 0,
                 attempts: 3,
             }
@@ -1585,7 +1583,7 @@ mod tests {
         assert_eq!(
             run.cases
                 .iter()
-                .filter(|case| matches!(case.candidate, Candidate::Unjudged { .. }))
+                .filter(|case| matches!(case.candidate, Candidate::Unjudged))
                 .map(|case| case.chain.join(";"))
                 .collect::<Vec<_>>(),
             [
@@ -1606,12 +1604,7 @@ mod tests {
             .iter()
             .find(|case| case.chain == vec!["grow:8".to_string()])
             .expect("the grow:8 case");
-        assert_eq!(
-            candidate.candidate,
-            Candidate::Unjudged {
-                probes: (false, false)
-            }
-        );
+        assert_eq!(candidate.candidate, Candidate::Unjudged);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2018,7 +2011,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::Budget,
             }
         );
@@ -2066,7 +2058,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::CaseCap(2),
             }
         );
@@ -2130,7 +2121,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::Deadline,
             }
         );
@@ -2201,7 +2191,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::Cancelled,
             }
         );
@@ -2251,7 +2240,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::Budget,
             }
         );
@@ -2300,7 +2288,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::Budget,
             }
         );
@@ -2352,7 +2339,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::CaseCap(4),
             }
         );
@@ -2734,7 +2720,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::NotReproduced {
-                probes: (false, false),
                 reproduced: 0,
                 attempts: 3,
             }

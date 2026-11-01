@@ -97,7 +97,7 @@ pub struct CaseRecord {
     /// Whether the case went out and, if it did, how the oracle read it. A class
     /// and an elapsed time exist only for a sent case, so an unsent case can
     /// never carry a reaction and a sent one always does (review finding M2).
-    pub outcome: Outcome,
+    pub outcome: CaseOutcome,
     /// What the triage ladder made of this case: the lane's own answer,
     /// recorded here rather than inferred later from the run's stop (review
     /// finding Q2).
@@ -107,10 +107,10 @@ pub struct CaseRecord {
 /// Whether a case reached the wire, and what came back when it did.
 ///
 /// Modelling the two states as one enum is what keeps a class and a sent flag
-/// from ever disagreeing (review finding M2): an [`Outcome::Unsent`] case has no
-/// class and no timing, and only a [`Outcome::Sent`] case does.
+/// from ever disagreeing (review finding M2): a [`CaseOutcome::Unsent`] case
+/// has no class and no timing, and only a [`CaseOutcome::Sent`] case does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
+pub enum CaseOutcome {
     /// The case never reached the wire — undecodable, or the builder refused it.
     Unsent,
     /// The case went out and the oracle read its reply.
@@ -135,7 +135,7 @@ impl CaseRecord {
             seed_id,
             chain,
             sent_hex,
-            outcome: Outcome::Unsent,
+            outcome: CaseOutcome::Unsent,
             candidate: Candidate::No,
         }
     }
@@ -144,23 +144,23 @@ impl CaseRecord {
     #[must_use]
     pub fn class(&self) -> Option<CaseClass> {
         match self.outcome {
-            Outcome::Sent { class, .. } => Some(class),
-            Outcome::Unsent => None,
+            CaseOutcome::Sent { class, .. } => Some(class),
+            CaseOutcome::Unsent => None,
         }
     }
 
     /// Whether the case actually reached the wire.
     #[must_use]
     pub fn sent(&self) -> bool {
-        matches!(self.outcome, Outcome::Sent { .. })
+        matches!(self.outcome, CaseOutcome::Sent { .. })
     }
 
     /// The round trip in milliseconds, `0` for an unsent case.
     #[must_use]
     pub fn elapsed_ms(&self) -> u32 {
         match self.outcome {
-            Outcome::Sent { elapsed_ms, .. } => elapsed_ms,
-            Outcome::Unsent => 0,
+            CaseOutcome::Sent { elapsed_ms, .. } => elapsed_ms,
+            CaseOutcome::Unsent => 0,
         }
     }
 
@@ -169,7 +169,7 @@ impl CaseRecord {
     pub fn latency_outlier(&self) -> bool {
         matches!(
             self.outcome,
-            Outcome::Sent {
+            CaseOutcome::Sent {
                 latency_outlier: true,
                 ..
             }
@@ -179,9 +179,11 @@ impl CaseRecord {
 
 /// How far the crash ladder got with one case — the case's own verdict.
 ///
-/// Every variant past [`Candidate::No`] carries `probes`, the two liveness
-/// probes the candidate spent, `(immediate, retry)`; both are `false`, because
-/// a candidate whose target answered is no candidate at all.
+/// Every variant past [`Candidate::No`] means the same two liveness probes
+/// failed: a candidate exists only when neither the immediate probe nor the
+/// retry answered, because a candidate whose target answered is no candidate
+/// at all. The variants therefore carry no probe pair to disagree with that
+/// (review finding N1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Candidate {
     /// No crash candidate: the oracle did not flag the case, or a liveness
@@ -190,15 +192,10 @@ pub enum Candidate {
     /// Both liveness probes failed and no replay ever ran: the profile asked
     /// for none (`reproduce_count: 0`), so spec call 14's reproduction never
     /// happened and the case is an open question (review finding G1).
-    Unjudged {
-        /// The candidate's two liveness probes.
-        probes: (bool, bool),
-    },
+    Unjudged,
     /// A triage that started and a stop cut short: nothing is proven either
     /// way (tester finding F1).
     Interrupted {
-        /// The candidate's two liveness probes.
-        probes: (bool, bool),
         /// The stop that interrupted the triage.
         stop: StopReason,
     },
@@ -206,8 +203,6 @@ pub enum Candidate {
     /// lane's answer is "not a crash", and no later stop changes it (spec
     /// call 14; review finding G1).
     NotReproduced {
-        /// The candidate's two liveness probes.
-        probes: (bool, bool),
         /// How many replays reproduced the silence.
         reproduced: u32,
         /// How many replays went out.
@@ -216,8 +211,6 @@ pub enum Candidate {
     /// The triage confirmed the crash: every replay reproduced it, or the
     /// target never came back at all.
     Confirmed {
-        /// The candidate's two liveness probes.
-        probes: (bool, bool),
         /// How many replays reproduced the silence.
         reproduced: u32,
         /// How many replays went out.
@@ -380,8 +373,6 @@ pub struct JobStats {
     pub stopped: Option<StopReason>,
 }
 
-/// One job's state. Private: everything outside reaches it through
-/// [`LaneState`], which keeps the locking in one place.
 /// The identity a job is begun under: the id the engine knows it by and the
 /// marker its points, seeds and runners are keyed by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,6 +391,8 @@ impl<'a> JobKey<'a> {
     }
 }
 
+/// One job's state. Private: everything outside reaches it through
+/// [`LaneState`], which keeps the locking in one place.
 struct JobState {
     /// The job's marker: what its runners are keyed by, so evicting the job
     /// can evict them too (review findings SEC2/Q4).
@@ -500,6 +493,7 @@ impl LaneState {
     /// evicted ones and, when a known job is re-begun, its previous marker.
     /// The caller forgets their runners, so the registry is bounded by the
     /// same window this state is (review findings SEC2/Q4).
+    #[must_use = "forget the returned markers' runners"]
     pub fn begin_job(
         &self,
         job: JobKey<'_>,
@@ -756,7 +750,7 @@ mod tests {
             seed_id: "127.0.0.1:9/udp#0".to_string(),
             chain: vec!["grow:8".to_string()],
             sent_hex: "deadbeef".to_string(),
-            outcome: Outcome::Sent {
+            outcome: CaseOutcome::Sent {
                 class,
                 elapsed_ms: 1,
                 latency_outlier: false,
@@ -769,7 +763,7 @@ mod tests {
     fn cases_cap_is_min_of_profile_and_ceiling() {
         let state = LaneState::new();
 
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-big", "m-scan-big"),
             vec![plan_fixture()],
             points(1),
@@ -782,7 +776,7 @@ mod tests {
             5000
         );
 
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-small", "m-scan-small"),
             vec![plan_fixture()],
             points(1),
@@ -802,7 +796,7 @@ mod tests {
     #[test]
     fn allocation_is_ceil_and_bounded() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-a", "m-scan-a"),
             vec![plan_fixture()],
             points(14),
@@ -827,7 +821,7 @@ mod tests {
     #[test]
     fn consecutive_timeouts_stop() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-t", "m-scan-t"),
             vec![plan_fixture()],
             points(1),
@@ -855,7 +849,7 @@ mod tests {
         );
 
         // A clean case after two silent ones resets the ladder.
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-r", "m-scan-r"),
             vec![plan_fixture()],
             points(1),
@@ -875,7 +869,7 @@ mod tests {
     #[test]
     fn unsendable_counts_separately() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-u", "m-scan-u"),
             vec![plan_fixture()],
             points(1),
@@ -896,7 +890,7 @@ mod tests {
     #[test]
     fn crash_retires_point() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-c", "m-scan-c"),
             vec![plan_fixture()],
             points(2),
@@ -929,7 +923,7 @@ mod tests {
     #[test]
     fn unknown_job_is_none() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-known", "m-scan-known"),
             vec![plan_fixture()],
             points(1),
@@ -965,7 +959,7 @@ mod tests {
     fn oldest_job_evicted_past_eight() {
         let state = LaneState::new();
         for i in 1..=9 {
-            state.begin_job(
+            let _ = state.begin_job(
                 JobKey::new(&format!("j{i}"), &format!("m-j{i}")),
                 vec![plan_fixture()],
                 points(1),
@@ -1070,7 +1064,7 @@ mod tests {
     #[test]
     fn run_cache_round_trip() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-run", "m-scan-run"),
             vec![plan_fixture()],
             points(1),
@@ -1111,7 +1105,7 @@ mod tests {
     #[test]
     fn allocation_when_points_outnumber_cases() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-p", "m-scan-p"),
             vec![plan_fixture()],
             points(14),
@@ -1128,7 +1122,7 @@ mod tests {
         assert_eq!(state.allocate_cases("scan-p"), Some(0));
         assert_eq!(state.stats("scan-p").expect("known").points, 14);
 
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-z", "m-scan-z"),
             vec![plan_fixture()],
             Vec::new(),
@@ -1140,7 +1134,7 @@ mod tests {
         assert_eq!(state.stats("scan-z").expect("known").points, 0);
 
         // A profile asking for zero cases allocates nothing.
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-0", "m-scan-0"),
             vec![plan_fixture()],
             points(3),
@@ -1156,7 +1150,7 @@ mod tests {
     #[test]
     fn ceiling_allocation_is_exhausted_at_5000() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-max", "m-scan-max"),
             vec![plan_fixture()],
             points(1),
@@ -1183,7 +1177,7 @@ mod tests {
         );
 
         // Exactly the ceiling is not clamped.
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-5000", "m-scan-5000"),
             vec![plan_fixture()],
             points(1),
@@ -1192,7 +1186,7 @@ mod tests {
             false,
         );
         assert_eq!(state.stats("scan-5000").expect("known").cases_cap, 5000);
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-5001", "m-scan-5001"),
             vec![plan_fixture()],
             points(1),
@@ -1208,7 +1202,7 @@ mod tests {
     #[test]
     fn zero_threshold_stops_on_the_first_silence() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-0t", "m-scan-0t"),
             vec![plan_fixture()],
             points(1),
@@ -1220,7 +1214,7 @@ mod tests {
             state.record_case("scan-0t", CaseClass::Silence),
             Err(StopReason::ConsecutiveTimeouts(1))
         );
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-1t", "m-scan-1t"),
             vec![plan_fixture()],
             points(1),
@@ -1240,7 +1234,7 @@ mod tests {
     #[test]
     fn first_stop_reason_wins() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-s", "m-scan-s"),
             vec![plan_fixture()],
             points(1),
@@ -1266,7 +1260,7 @@ mod tests {
     #[test]
     fn re_begin_replaces_state_and_keeps_its_slot() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("j-first", "m-j-first"),
             vec![plan_fixture()],
             points(1),
@@ -1278,7 +1272,7 @@ mod tests {
             assert_eq!(state.record_case("j-first", CaseClass::Clean), Ok(()));
         }
         state.record_crash("j-first", "p0");
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("j-first", "m-j-first"),
             vec![plan_fixture()],
             points(2),
@@ -1293,7 +1287,7 @@ mod tests {
         assert!(state.point_known("j-first", "p1"));
 
         for i in 2..=8 {
-            state.begin_job(
+            let _ = state.begin_job(
                 JobKey::new(&format!("j{i}"), &format!("m-j{i}")),
                 vec![plan_fixture()],
                 points(1),
@@ -1303,7 +1297,7 @@ mod tests {
             );
         }
         assert!(state.counters("j-first").is_some(), "eight jobs fit");
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("j9", "m-j9"),
             vec![plan_fixture()],
             points(1),
@@ -1353,7 +1347,7 @@ mod tests {
     #[test]
     fn cases_remaining_counts_down_from_the_cap() {
         let state = LaneState::new();
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new("scan-rem", "m-scan-rem"),
             vec![plan_fixture()],
             points(1),
@@ -1431,9 +1425,9 @@ mod tests {
     #[test]
     fn sent_and_outlier_counts_read_the_flags() {
         let mut unsent = case(0, CaseClass::Clean);
-        unsent.outcome = Outcome::Unsent;
+        unsent.outcome = CaseOutcome::Unsent;
         let mut slow = case(1, CaseClass::Clean);
-        slow.outcome = Outcome::Sent {
+        slow.outcome = CaseOutcome::Sent {
             class: CaseClass::Clean,
             elapsed_ms: 1,
             latency_outlier: true,

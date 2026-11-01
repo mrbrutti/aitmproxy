@@ -780,7 +780,7 @@ pub mod harness {
         )
         .expect("the loopback profile discovers");
         let state = Arc::new(LaneState::new());
-        state.begin_job(
+        let _ = state.begin_job(
             JobKey::new(job.job_id(), &job.marker()),
             plans.clone(),
             discovery.points.iter().map(|p| p.id.clone()).collect(),

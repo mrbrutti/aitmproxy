@@ -366,7 +366,7 @@ fn candidate_verdict(run: &PointRun) -> Option<Verdict> {
             Candidate::Interrupted { stop, .. } => {
                 Some((case, format!("{stop} before reproduction")))
             }
-            Candidate::Unjudged { .. } => {
+            Candidate::Unjudged => {
                 Some((case, "not reproduced (reproduce_count is 0)".to_string()))
             }
             Candidate::No | Candidate::NotReproduced { .. } | Candidate::Confirmed { .. } => None,
@@ -690,12 +690,7 @@ mod tests {
             .iter()
             .find(|case| case.chain == vec!["grow:8:repeat".to_string()])
             .expect("the grow:8:repeat case");
-        assert_eq!(
-            candidate.candidate,
-            Candidate::Unjudged {
-                probes: (false, false)
-            }
-        );
+        assert_eq!(candidate.candidate, Candidate::Unjudged);
         assert_eq!(verdict.evidence.payload, Some(candidate.sent_hex.clone()));
         assert_eq!(
             verdict.detail,
@@ -739,7 +734,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::NotReproduced {
-                probes: (false, false),
                 reproduced: 0,
                 attempts: 3,
             }
@@ -992,7 +986,7 @@ mod tests {
     #[test]
     fn detail_lines_are_literal() {
         use crate::oracle::CaseClass;
-        use crate::state::{CaseRecord, CrashRecord, Outcome, PointRun};
+        use crate::state::{CaseOutcome, CaseRecord, CrashRecord, PointRun};
         use aitm_scan_model::L4Evidence;
 
         let case = |index: u32, class: CaseClass, hex: &str, outlier: bool| CaseRecord {
@@ -1000,7 +994,7 @@ mod tests {
             seed_id: "127.0.0.1:9/udp#0".to_string(),
             chain: vec![format!("case{index}")],
             sent_hex: hex.to_string(),
-            outcome: Outcome::Sent {
+            outcome: CaseOutcome::Sent {
                 class,
                 elapsed_ms: 1,
                 latency_outlier: outlier,
@@ -1300,7 +1294,6 @@ mod tests {
         assert_eq!(
             run.cases[1].candidate,
             Candidate::Interrupted {
-                probes: (false, false),
                 stop: StopReason::WireWrite("mock wire down".to_string()),
             }
         );
