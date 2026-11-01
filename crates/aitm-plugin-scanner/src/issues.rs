@@ -322,7 +322,7 @@ impl IssueFilter {
     /// Whether `issue` passes every narrowing this filter sets.
     fn matches(&self, issue: &Issue) -> bool {
         if let Some(job) = &self.job {
-            if &issue.job != job {
+            if !issue.found_by(job) {
                 return false;
             }
         }
@@ -511,6 +511,7 @@ impl IssueStore {
 
         let mut issue = Issue {
             id: String::new(),
+            jobs: vec![new.job.clone()],
             job: new.job,
             check_id: new.check_id,
             class: new.class,
@@ -677,7 +678,7 @@ impl IssueStore {
         let mut total = 0u64;
         let mut by_severity = BySeverity::default();
         let mut by_confidence = ByConfidence::default();
-        for issue in inner.issues.values().filter(|i| i.job == job) {
+        for issue in inner.issues.values().filter(|i| i.found_by(job)) {
             total = total.saturating_add(1);
             by_severity.bump(issue.severity);
             by_confidence.bump(issue.confidence);
@@ -839,6 +840,14 @@ fn key_input(new: &NewIssue) -> DedupeInput<'_> {
 fn merge_into(existing: &mut Issue, new: &NewIssue, now_ms: u64) {
     existing.occurrences = existing.occurrences.saturating_add(1);
     existing.last_seen = now_ms;
+    // The re-finding job joins the issue's job list (`job` stays the first
+    // finder), so `scan.issues { job }` on the later job lists it too.
+    if existing.jobs.is_empty() {
+        existing.jobs.push(existing.job.clone());
+    }
+    if !existing.jobs.iter().any(|j| j == &new.job) {
+        existing.jobs.push(new.job.clone());
+    }
 
     // Read the paths before the evidence may be replaced: a passive issue's
     // path list survives a stronger sighting.
@@ -1391,6 +1400,47 @@ mod tests {
             .update_status("issue-deadbeef", IssueStatus::Confirmed, None)
             .expect_err("unknown id is refused");
         assert_eq!(err.to_string(), "scan: not_found: issue issue-deadbeef");
+    }
+
+    /// Spec D6 dedupes across jobs, so a later job that re-finds an issue the
+    /// store already holds merges into it; `jobs` records every finder and the
+    /// per-job view (`for_job`, `tally_for_job`, the `job` filter) includes the
+    /// issue for the re-finding job as well as the first (T7 live run 3:
+    /// 35 `issue` push lines, `scan.issues { job }` empty).
+    #[test]
+    fn a_refound_issue_belongs_to_every_job_that_found_it() {
+        let store = IssueStore::new(None);
+        let first = store
+            .upsert(new_issue("xss-reflected", "q"), 1)
+            .expect("insert");
+        let Upsert::Created(first) = first else {
+            panic!("first sighting inserts");
+        };
+        assert_eq!(first.jobs, vec!["scan-01020304".to_string()]);
+
+        let mut refind = new_issue("xss-reflected", "q");
+        refind.job = "scan-aaaabbbb".into();
+        let again = store.upsert(refind, 2).expect("merge");
+        let Upsert::Merged(merged) = again else {
+            panic!("the same key from another job merges");
+        };
+        assert_eq!(merged.id, first.id);
+        assert_eq!(merged.job, "scan-01020304", "`job` stays the first finder");
+        assert_eq!(
+            merged.jobs,
+            vec!["scan-01020304".to_string(), "scan-aaaabbbb".to_string()]
+        );
+        assert_eq!(merged.occurrences, 2);
+
+        assert_eq!(store.for_job("scan-01020304").len(), 1);
+        assert_eq!(
+            store.for_job("scan-aaaabbbb").len(),
+            1,
+            "the re-finder sees it too"
+        );
+        assert_eq!(store.tally_for_job("scan-aaaabbbb").0, 1);
+        assert_eq!(store.for_job("scan-ffffffff").len(), 0);
+        assert_eq!(merged.summary().jobs.len(), 2);
     }
 
     /// `for_job` is the per-job view the worker reports from, and `set_links`

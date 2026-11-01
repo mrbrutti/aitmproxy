@@ -260,6 +260,7 @@ mod tests {
         IssueSummary {
             id: "issue-9f8e7d6c".to_string(),
             job: "scan-1a2b3c4d".to_string(),
+            jobs: vec!["scan-1a2b3c4d".to_string()],
             check_id: "http.reflected-xss".to_string(),
             class: "reflected-xss".to_string(),
             name: "Reflected cross-site scripting".to_string(),

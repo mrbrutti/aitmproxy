@@ -531,6 +531,7 @@ mod tests {
         Issue {
             id: "issue-abcd1234".to_string(),
             job: "scan-12345678".to_string(),
+            jobs: vec!["scan-12345678".to_string()],
             check_id: "xss-reflected".to_string(),
             class: "reflected-xss".to_string(),
             name: "Reflected XSS in q".to_string(),
