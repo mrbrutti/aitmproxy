@@ -68,3 +68,26 @@ fn pill_shows_the_ca_word() {
     let t = toolbar(&app);
     assert!(!t.contains("· CA"), "every store unknown: no word: {t}");
 }
+
+#[test]
+fn pill_drops_the_trusting_word_when_the_bus_drops() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "ca.status".into(),
+        value: ca_status("no"),
+    });
+    app.ca_installing = true;
+    let t = toolbar(&app);
+    assert!(t.contains("· CA trusting…"), "{t}");
+
+    let _ = app.on_bus(BusEvent::Disconnected("connection reset".into()));
+    let _ = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "ca.status".into(),
+        value: ca_status("no"),
+    });
+    let t = toolbar(&app);
+    assert!(t.contains("listening 127.0.0.1:8080 · CA untrusted"), "{t}");
+    assert!(!t.contains("trusting"), "{t}");
+}
