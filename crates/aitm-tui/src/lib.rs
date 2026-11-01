@@ -28,6 +28,7 @@ pub mod open;
 pub mod scan;
 pub mod snapshot;
 pub mod syntax;
+pub mod text;
 pub mod theme;
 pub mod tokens;
 pub mod ui;

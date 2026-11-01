@@ -14,7 +14,7 @@ use aitm_scan_model::{
 use serde_json::{json, Map, Value};
 
 use super::{is_issue_id, step, Dir, ScanError, ISSUES_PAGE_LIMIT};
-use crate::ui::text::truncate;
+use crate::text::truncate;
 
 /// How many `Tick`s between two `scan.issues` refreshes while the Issues tab
 /// is shown and a job is live (spec D6: five seconds).

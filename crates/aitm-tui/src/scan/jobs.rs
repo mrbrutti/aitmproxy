@@ -10,7 +10,7 @@ use aitm_scan_model::{
 };
 
 use super::{is_job_id, lane_token, severity_counts, severity_token, SEVERITY_ORDER};
-use crate::ui::text::truncate;
+use crate::text::truncate;
 
 /// Which pane of the Jobs tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

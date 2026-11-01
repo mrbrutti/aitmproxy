@@ -14,7 +14,10 @@ pub mod l4;
 pub mod overlays;
 pub mod scan;
 pub mod sidebar;
-pub mod text;
+// The cell-width helpers live at the crate root (`crate::text`): the model
+// bounds strings with them too, so they are not the view's. Re-exported so
+// every `crate::ui::text` path keeps compiling.
+pub use crate::text;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
