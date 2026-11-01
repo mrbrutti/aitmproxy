@@ -71,6 +71,12 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
   header value, cookie value or body. The model's `SessionMaterial`, `Payload`, `RawProbe` and
   `ProbeResponse` already have redacting `Debug` impls; never add a type that prints a value.
 - **Marks.** Job mark = `format!("scan:{}", job.job_id())`; crawl mark = the literal `crawl`.
+- **`session.mode: none` means unauthenticated (orchestrator amendment 2026-11-01).** A captured
+  source request may itself carry the operator's session (`Cookie`, `Authorization`, any
+  `is_secret_name` header). Under `mode: none` the `ProbeHost` strips those from the source request
+  before building the baseline and every probe, and the `session`-trait points of such a request are
+  not produced; under `mode: observed` the material is merged as D7 says. Otherwise AC T2-4's
+  "with `session.mode: none` it is not reached" cannot hold for a seed captured while logged in.
 - **The session-lost token.** `session::SESSION_LOST_PREFIX = "scan: session_lost: "`. After a
   canary loss with `on_lost: stop`, every `probe`/`baseline`/`probe_raw` of every host of that job
   returns `Err` whose message starts with that literal. T1b's engine maps it to
