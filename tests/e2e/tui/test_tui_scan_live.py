@@ -35,13 +35,15 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         launch (`Confirm over the wire: scan launch`, recorded as a check and answered
         with y by `launch`, H77; the prompt is read across the box's line wrap, H79) -> a
         Jobs row with the id scan.list reports, sampled as soon as it is on screen at 0.5 s
-        spacing: three or more screen samples (on until the state/phase cell changes or
-        SAMPLES_MAX, H80) whose on-screen `sent/budget` is non-decreasing and inside a
-        scan.status bracket taken around the sample; x right after the last sample yields
-        `cancelled` on screen and in scan.status (on a fresh `thorough` `intrusive` job
-        cancelled in its first second when the sampled one finished before x, H37), and the
-        state/phase cell changes at least once across the samples and that `cancelled` row;
-        the second client saw a `progress` and a `cancelled` line for the cancelled job.
+        spacing: three or more screen samples (on until the row reads an audit phase with
+        `sent > 0` and the second client has counted a `progress` line for the job, bounded
+        by 60 s and SAMPLES_HARD_MAX, H83) whose on-screen `sent/budget` is non-decreasing
+        and inside a scan.status bracket taken around the sample; x right after the last
+        sample yields `cancelled` on screen and in scan.status (on a fresh `thorough`
+        `intrusive` job, sampled the same way before its x, when the sampled one finished
+        first, H37), and the state/phase cell changes at least once across the samples and
+        that `cancelled` row; the second client saw a `progress` and a `cancelled` line for
+        the cancelled job (the detail says what the wait before x saw).
         Every launch (s, m, the confirm's y) returns only once its start reply has landed
         on the Jobs tab with the new row, since that reply switches the tab and undoes a
         tab key pressed before it (H72).
@@ -166,10 +168,16 @@ ROW_APPEAR_S = 20.0
 # (the fifth: one `done` sample), so the sampled job runs `thorough` AND `intrusive` and
 # is sampled at this spacing, the first sample as soon as its row is on screen (H62, H70).
 SAMPLE_GAP_S = 0.5
-# Never fewer than SAMPLES_MIN samples; the sampling goes on past them until the row's
-# state/phase cell changes or SAMPLES_MAX samples exist (the seventh live run's three all
-# read `running/audit`: the crawl phase had passed before the row appeared, H80).
-SAMPLES_MIN, SAMPLES_MAX = 3, 8
+# Never fewer than SAMPLES_MIN samples; the sampling goes on past them until the row reads
+# an audit phase with `sent > 0` AND the second bus client has counted a `progress` line
+# for the job (H83: the eleventh live run's three samples at 0.5 s all read `running/crawl`,
+# so `x` cancelled the job before any probe ran and the subscriber saw `started`, two
+# `phase` and `cancelled` lines but no `progress`; the seventh's three all read
+# `running/audit`, H80). Bounded by PROGRESS_WAIT_S from the first sample (then `x`
+# regardless and the push check's detail says what was seen) and by SAMPLES_HARD_MAX
+# samples, so `status-pairs.json` stays readable.
+SAMPLES_MIN, SAMPLES_HARD_MAX = 3, 120
+PROGRESS_WAIT_S = 60.0
 CATCHUP_S = 8.0
 CANCEL_S = 25.0
 ISSUE_WAIT_S = 150.0
@@ -1621,17 +1629,63 @@ def phases_of(samples):
     return [s["screen_state_phase"] for s in samples if s["screen_state_phase"]]
 
 
-def more_samples(samples):
-    """True while T7-16 keeps sampling the job's row (H80): fewer than SAMPLES_MIN samples
-    yet, or SAMPLES_MIN or more whose state/phase cells have not changed and fewer than
-    SAMPLES_MAX. The seventh live run's three samples at 0.5 s all read `running/audit`
-    (the crawl phase had passed before the row appeared), so a fixed three could never
-    see a change; a job that leaves `running` ends the sampling from the caller (H37)."""
+def audit_sample(samples):
+    """The ordinal (`n`) of the first sample whose row reads an audit phase
+    (`running/audit`: the probes are being sent) with `sent > 0`, or None (H83)."""
+    for s in samples:
+        if (s["screen_state_phase"] or "").endswith("/audit") and (s["screen_sent"] or 0) > 0:
+            return s["n"]
+    return None
+
+
+def seen_before_x(samples, counts, elapsed_s, ended_by=None):
+    """What the wait before `x` has seen so far (H83; `before-x.json`): the sample count,
+    the first audit sample with `sent > 0`, the `progress` lines the second client has
+    counted for the job, the seconds since the first sample's bracketing read, and why
+    the sampling ended (`ready`, `terminal`, `bound`, `cap`; None while it goes on)."""
+    return {"samples": len(samples), "audit_sample": audit_sample(samples),
+            "progress_pushes": int(counts.get("progress", 0) or 0), "elapsed_s": round(elapsed_s, 2),
+            "ended_by": ended_by}
+
+
+def cancel_ready(seen):
+    return seen["audit_sample"] is not None and seen["progress_pushes"] >= 1
+
+
+def more_samples(samples, seen, wait_s=PROGRESS_WAIT_S):
+    """True while T7-16 keeps sampling the job's row before `x` (H83): never fewer than
+    SAMPLES_MIN samples, then on until a sample's row reads an audit phase with `sent >
+    0` AND the second client has counted a `progress` line for the job (`cancel_ready`),
+    so the cancel lands on a job whose probes are running and whose push stream carries
+    the `progress` the T7-16 push check asserts. The eleventh live run's three samples at
+    0.5 s all read `running/crawl` and `x` cancelled the job before any probe ran; the
+    seventh's three all read `running/audit` (H80). Off at SAMPLES_HARD_MAX samples or
+    `wait_s` (PROGRESS_WAIT_S) seconds, whatever was seen: then `x` regardless. A job that
+    leaves `running` ends the sampling from the caller (H37)."""
+    if len(samples) >= SAMPLES_HARD_MAX or seen["elapsed_s"] >= wait_s:
+        return False
     if len(samples) < SAMPLES_MIN:
         return True
-    if len(samples) >= SAMPLES_MAX:
-        return False
-    return len(set(phases_of(samples))) <= 1
+    return not cancel_ready(seen)
+
+
+def before_x_words(seen, wait_s=PROGRESS_WAIT_S):
+    """The wait before `x` as one failure detail (H83): what `x` followed, or which of the
+    two conditions the bound ran out on."""
+    at = "never on screen" if seen["audit_sample"] is None else f"at sample {seen['audit_sample']}"
+    got = (f"{seen['samples']} samples in {seen['elapsed_s']} s; an audit phase with `sent > 0` {at}; "
+           f"{seen['progress_pushes']} `progress` line(s) counted for the job")
+    if seen["ended_by"] == "ready":
+        return f"`x` once both were seen: {got}"
+    if seen["ended_by"] == "terminal":
+        return f"no `x`, the job left `running` first: {got}"
+    missing = []
+    if seen["audit_sample"] is None:
+        missing.append("no sample read an audit phase with `sent > 0`")
+    if seen["progress_pushes"] < 1:
+        missing.append("no `progress` line was counted for the job")
+    return (f"`x` regardless, the bound ran out ({wait_s} s or {SAMPLES_HARD_MAX} samples, ended by "
+            f"{seen['ended_by']}): {', '.join(missing) or 'both seen on the last sample'}; {got}")
 
 
 def sample_of(n, text, job, before, after, caught_up):
@@ -1698,34 +1752,24 @@ def step_seed(ctx):
             ctx.screen("seed"))
 
 
-def step_t7_16(ctx):
-    """T7-16 (UI-1): launch from the held editor, watch the counters, cancel. It runs
-    after T7-17 (H65), so the editor is re-entered (`ensure_editor`, as T7-17 did
-    before) and never assumed fresh; the sampled job and the fresh cancel job run
-    `thorough` and `intrusive`, since a `standard` job with the client crawl is `done`
-    in about a second (H62) and a `thorough` one in about 2 s (H70). The launch returns
-    once its start reply landed on the Jobs tab with the row (`launch`, H72), and the
-    samples then come every SAMPLE_GAP_S (0.5 s) with `x` right after the third."""
+def sample_then_cancel(ctx, job, tag="T7-16", row_check=True, wait_s=PROGRESS_WAIT_S, gap_s=SAMPLE_GAP_S):
+    """T7-16's samples of `job`'s Jobs row, then `x` (H83). One sample every `gap_s`
+    (SAMPLE_GAP_S), the first as soon as the row's paint has caught up with the
+    bracket's first read (H62, H70), each bracketed by a scan.status read before and
+    after and kept as `screen-<tag>-<n>.txt`. The sampling goes on while `more_samples`
+    says so: never fewer than SAMPLES_MIN, then until the row reads an audit phase with
+    `sent > 0` AND the second client has counted a `progress` line for the job, bounded
+    by `wait_s` (PROGRESS_WAIT_S) and SAMPLES_HARD_MAX; a job that leaves `running` ends
+    it (H37). Then `x`, RIGHT after the bracketing read that follows the last sample
+    (H62); on a terminal state `x` is inert (`already <state>`), so it is not pressed and
+    the caller launches a fresh job (H37). Returns (samples, seen, pre_x): the samples
+    (`status-pairs.json`), the wait's record (`seen_before_x`, worded by
+    `before_x_words`) and the scan.status read taken before `x`."""
     c, term = ctx.c, ctx.term
-    if not open_scan(ctx):
-        c.fatal("T7-16: `:scan` never opened the Scan view", ctx.screen("t7-16"))
-    if not ensure_editor(ctx, "standard", ctx.origin):
-        c.fatal("T7-16: the held `standard` editor with the target origin was not available "
-                "(1, cursor, Enter, `o` <origin>, Enter)", ctx.screen("t7-16"))
-    c.check("T7-16: the held `standard` editor carries the target origin on its `origins` line",
-            ctx.origin in (field_line(term.text(), "origins") or ""), ctx.screen("t7-16"))
-    set_browser_never(ctx, "T7-16")
-    set_speed_thorough(ctx, "T7-16")
-    set_intensity_intrusive(ctx, "T7-16")
-
-    job = launch(ctx, "s", step="T7-16")
-    if not job:
-        c.fatal("T7-16: `s` started no job (scan.list gained no id)", ctx.screen("t7-16"))
-    ctx.jobs["standard"] = job
-    c.check("T7-16: scan.list reports a job id in the engine's form", bool(JOB_ID_RE.fullmatch(job)), job)
-
     samples = []
-    for n in range(SAMPLES_MAX):
+    seen = seen_before_x(samples, {}, 0.0)
+    t0 = time.monotonic()
+    for n in range(SAMPLES_HARD_MAX):
         before = status_of(ctx.bus, job)
         b_sent = sent_of(before)
 
@@ -1745,39 +1789,74 @@ def step_t7_16(ctx):
             caught_up = poll(lambda: landed_on_jobs(term.text(), job) and fresh_enough(), ROW_APPEAR_S, 0.1)
         else:
             caught_up = poll(fresh_enough, CATCHUP_S, 0.2)
-        text = ctx.snap(f"t7-16-{n}")
+        text = ctx.snap(f"{tag.lower()}-{n}")
         after = status_of(ctx.bus, job)
-        if n == 0:
+        if n == 0 and row_check:
             on_jobs = re.search(TAB_MARKERS["2"], text) is not None
-            c.check(f"T7-16: the Jobs tab drew and carries the row for {job}",
-                    on_jobs and row_tail(text, job) is not None, f"jobs tab {on_jobs}; {ctx.screen('t7-16')}")
+            c.check(f"{tag}: the Jobs tab drew and carries the row for {job}",
+                    on_jobs and row_tail(text, job) is not None, f"jobs tab {on_jobs}; {ctx.screen(tag.lower())}")
         samples.append(sample_of(n, text, job, before, after, caught_up))
-        ctx.ev.write(f"screen-T7-16-{n}.txt", text)
-        # The sampling goes on at SAMPLE_GAP_S until the state/phase cell changes or
-        # SAMPLES_MAX samples exist, never fewer than SAMPLES_MIN (`more_samples`, H80: the
-        # seventh live run's three all read `running/audit`); a job already out of
-        # `running` ends it too, since a wait for its phase to change could only watch it
-        # finish (H37).
-        if not more_samples(samples):
-            break
+        ctx.ev.write(f"screen-{tag}-{n}.txt", text)
+        # The sampling goes on at `gap_s` until the row reads an audit phase with `sent > 0`
+        # and the second client has counted a `progress` line for the job, never fewer than
+        # SAMPLES_MIN, bounded by `wait_s` and SAMPLES_HARD_MAX (`more_samples`, H83); a job
+        # already out of `running` ends it too, since a wait for its audit could only watch
+        # it finish (H37).
+        seen = seen_before_x(samples, ctx.pushes.of(job), time.monotonic() - t0)
         if (after.get("state") or "") in TERMINAL_STATES:
+            seen["ended_by"] = "terminal"
             break
-        time.sleep(SAMPLE_GAP_S)
+        if not more_samples(samples, seen, wait_s):
+            seen["ended_by"] = ("ready" if cancel_ready(seen)
+                                else "cap" if len(samples) >= SAMPLES_HARD_MAX else "bound")
+            break
+        time.sleep(gap_s)
 
     # `x` cancels the job under the Jobs cursor, and it goes RIGHT after the last sample
-    # (H62): the bracketing read and the key come before the sample checks below. Against
-    # the small target a `standard` job can finish inside the sampling window (the first
-    # live run: 182 probes in about 6 s; the fourth: in about a second), and `x` on a
+    # (H62): the bracketing read and the key come before the caller's sample checks.
+    # `x` on a terminal job is inert (`already <state>`), so it is not pressed then (H37).
+    pre_x = status_of(ctx.bus, job)
+    if (pre_x.get("state") or "") not in TERMINAL_STATES:
+        term.press("x")
+    return samples, seen, pre_x
+
+
+def step_t7_16(ctx):
+    """T7-16 (UI-1): launch from the held editor, watch the counters, cancel. It runs
+    after T7-17 (H65), so the editor is re-entered (`ensure_editor`, as T7-17 did
+    before) and never assumed fresh; the sampled job and the fresh cancel job run
+    `thorough` and `intrusive`, since a `standard` job with the client crawl is `done`
+    in about a second (H62) and a `thorough` one in about 2 s (H70). The launch returns
+    once its start reply landed on the Jobs tab with the row (`launch`, H72), and the
+    samples then come every SAMPLE_GAP_S (0.5 s), `x` right after the one that completes
+    the audit-and-progress condition (`sample_then_cancel`, H83)."""
+    c, term = ctx.c, ctx.term
+    if not open_scan(ctx):
+        c.fatal("T7-16: `:scan` never opened the Scan view", ctx.screen("t7-16"))
+    if not ensure_editor(ctx, "standard", ctx.origin):
+        c.fatal("T7-16: the held `standard` editor with the target origin was not available "
+                "(1, cursor, Enter, `o` <origin>, Enter)", ctx.screen("t7-16"))
+    c.check("T7-16: the held `standard` editor carries the target origin on its `origins` line",
+            ctx.origin in (field_line(term.text(), "origins") or ""), ctx.screen("t7-16"))
+    set_browser_never(ctx, "T7-16")
+    set_speed_thorough(ctx, "T7-16")
+    set_intensity_intrusive(ctx, "T7-16")
+
+    job = launch(ctx, "s", step="T7-16")
+    if not job:
+        c.fatal("T7-16: `s` started no job (scan.list gained no id)", ctx.screen("t7-16"))
+    ctx.jobs["standard"] = job
+    c.check("T7-16: scan.list reports a job id in the engine's form", bool(JOB_ID_RE.fullmatch(job)), job)
+
+    # Against the small target a `standard` job can finish inside the sampling window (the
+    # first live run: 182 probes in about 6 s; the fourth: in about a second), and `x` on a
     # terminal job is inert (`already <state>`). So when the bracketing read taken before
     # `x` already shows a terminal state, a fresh job is launched from the held editor
-    # (`thorough` too) and `x` goes within its first second, as soon as its row is drawn
-    # (the launch lands on the Jobs tab with the new job under the cursor, `land_started`);
+    # (`thorough` and `intrusive` too), sampled the same way before its own `x` (H83), and
     # the cancel checks and the push counts then name that job (H37).
+    samples, seen_x, pre_x = sample_then_cancel(ctx, job)
     cancel_job = job
-    pre_x = status_of(ctx.bus, job)
     sampled_terminal = (pre_x.get("state") or "") in TERMINAL_STATES
-    if not sampled_terminal:
-        term.press("x")
     ctx.ev.write_json("status-pairs.json", samples)
 
     c.check(f"T7-16: at least {SAMPLES_MIN} screen samples carry the row's probes cell",
@@ -1813,7 +1892,16 @@ def step_t7_16(ctx):
         on_row = ctx.landed.get(fresh, False)
         c.check(f"T7-16: the Jobs tab drew the fresh job {fresh} under the cursor",
                 on_row and on_cursor(term.text(), fresh), f"landed {on_row}; {ctx.screen('t7-16')}")
-        term.press("x")
+        # The fresh job is sampled the same way before its `x` (H83); its samples are
+        # another row's and stay out of the sampled job's assertions (H80), so they go to
+        # `status-pairs-fresh.json` on their own.
+        fresh_samples, seen_x, pre_x = sample_then_cancel(ctx, fresh, tag="T7-16-fresh", row_check=False)
+        ctx.ev.write_json("status-pairs-fresh.json", fresh_samples)
+        if (pre_x.get("state") or "") in TERMINAL_STATES:
+            c.check(f"T7-16: the fresh job {fresh} was still `running` when its `x` was due",
+                    False, f"state {pre_x.get('state')}; {before_x_words(seen_x)}")
+            return
+    ctx.ev.write_json("before-x.json", dict(seen_x, job=cancel_job))
     cancelled = poll(lambda: "cancelled" in (row_state(term.text(), cancel_job) or ""), CANCEL_S, 0.3)
     # The `cancelled` row is bracketed by status reads like every sample and, when it is
     # the sampled job's own row, folds in as the last sample of the phase-change
@@ -1827,7 +1915,8 @@ def step_t7_16(ctx):
         samples.append(sample_of("cancel", text, job, before_cancel, after_cancel, cancelled))
         ctx.ev.write_json("status-pairs.json", samples)
     c.check(f"T7-16: `x` left the row of {cancel_job} reading `cancelled`", cancelled,
-            f"pre-x state {pre_x.get('state')}; banner {banner_of(text)!r}; {ctx.screen('t7-16')}")
+            f"pre-x state {pre_x.get('state')}; {before_x_words(seen_x)}; banner {banner_of(text)!r}; "
+            f"{ctx.screen('t7-16')}")
     phases = phases_of(samples)
     c.check("T7-16: the row's state/phase text changed at least once across the samples and the "
             "post-`x` `cancelled` row (H80)", len(set(phases)) > 1, phases)
@@ -1835,13 +1924,14 @@ def step_t7_16(ctx):
     c.check(f"T7-16: scan.status agrees {cancel_job} is `cancelled`", final.get("state") == "cancelled",
             final.get("state"))
 
-    # The push counts, with the second client's own state in the failure detail: what it
-    # drained by method, why its thread stopped (if it did), what flow.subscribe answered
-    # and the first job lines it saw (H46); its socket must still be alive here.
+    # The push counts, with what the wait before `x` saw (H83) and the second client's own
+    # state in the failure detail: what it drained by method, why its thread stopped (if
+    # it did), what flow.subscribe answered and the first job lines it saw (H46); its
+    # socket must still be alive here.
     counts = ctx.pushes.of(cancel_job)
     c.check(f"T7-16: the second bus client saw a `progress` and a `cancelled` line for {cancel_job}",
             counts.get("progress", 0) >= 1 and counts.get("cancelled", 0) >= 1,
-            f"counts for {cancel_job} {counts}; {ctx.pushes.describe()}")
+            f"counts for {cancel_job} {counts}; before x: {before_x_words(seen_x)}; {ctx.pushes.describe()}")
     c.check("T7-16: the second bus client's subscription socket is still alive (its drain thread "
             "runs; it stops only on `stop()` or a dead socket)", ctx.pushes.alive(), ctx.pushes.describe())
 
@@ -3238,6 +3328,44 @@ class ScriptedListBus:
         return {"jobs": [{"job": self.job}]}
 
 
+class ScriptedJobsRun:
+    """A terminal, bus and `Pushes` stand-in in one for `sample_then_cancel` (H83). The
+    run is a script of rows `(state_phase, sent, progress_pushes)`, one per sample, the
+    last repeated. The sample under way is the one the scan.status reads bracket (two
+    per sample, `before` then `after`), so `text()` paints the Jobs frame with that
+    sample's row and `of(job)` answers that sample's `progress` count; `press` records
+    each key with the sample ordinal it came at (the proof that `x` came after the
+    scripted audit row and progress line, never before)."""
+
+    def __init__(self, rows, budget=400):
+        self.rows = list(rows)
+        self.budget = budget
+        self.status_calls = 0
+        self.keys = []
+
+    def sample(self):
+        return min(max(self.status_calls - 1, 0) // 2, len(self.rows) - 1)
+
+    def text(self):
+        phase, sent, _ = self.rows[self.sample()]
+        return (jobs_frame().replace(f"{'running/crawl':<13}", f"{phase:<13}", 1)
+                .replace(f"{'12/400':<6}", f"{sent}/{self.budget}".ljust(6), 1))
+
+    def press(self, keys):
+        self.keys.append((keys, self.sample()))
+
+    def call(self, name, args=None):
+        assert name == "scan.status", name
+        self.status_calls += 1
+        phase, sent, _ = self.rows[self.sample()]
+        return {"job": (args or {}).get("job"), "state": phase.split("/")[0],
+                "probes": {"sent": sent, "budget": self.budget}}
+
+    def of(self, _job):
+        progress = self.rows[self.sample()][2]
+        return {"progress": progress} if progress else {}
+
+
 class ScriptedSocket:
     """The `_sock` the harness's `BusClient` holds, as far as `Pushes.stop()` touches it:
     `shutdown` wakes the blocked read (on the real socket the readline returns "" and
@@ -3911,30 +4039,107 @@ def selftest():
                 f"{three_ok} browser {three.browser!r} speed {three.speed!r} intensity "
                 f"{three.intensity!r} keys {three.keys!r}; gap {SAMPLE_GAP_S}")
 
-        # Cell item from the seventh live smoke run: H80. Three samples at 0.5 s all read
-        # `running/audit` (`status-pairs.json`: the crawl phase had passed before the row
-        # appeared), so the sampling goes on until the state/phase cell changes or SAMPLES_MAX
-        # (8) samples exist, never fewer than SAMPLES_MIN, and the post-`x` `cancelled` row
-        # is the last sample of the phase-change assertion.
-        audit = {"screen_state_phase": "running/audit", "screen_sent": 1}
-        report = {"screen_state_phase": "running/report", "screen_sent": 2}
+        # Cell items from the seventh and eleventh live smoke runs: H80, H83. Run 7's three
+        # samples at 0.5 s all read `running/audit` (the crawl phase had passed before the
+        # row appeared); run 11's three all read `running/crawl` and `x` cancelled the job
+        # before any probe ran, so the second client counted `started 1, phase 2, cancelled
+        # 1` and no `progress`. So the sampling goes on, never fewer than SAMPLES_MIN, until
+        # the row reads an audit phase with `sent > 0` AND the second client has counted a
+        # `progress` line for the job, bounded by PROGRESS_WAIT_S (60 s) and SAMPLES_HARD_MAX
+        # (120); then `x` regardless, the detail naming what was missing; the post-`x`
+        # `cancelled` row is the last sample of the phase-change assertion.
+        audit = {"screen_state_phase": "running/audit", "screen_sent": 1, "n": 0}
         cancel_row = sample_of("cancel", "│>" + JOB + "  standard  http://127.0.0.1:8080  cancelled"
                                "      220/2000", JOB, {"probes": {"sent": 220}, "state": "cancelled"},
                                {"probes": {"sent": 220}, "state": "cancelled"}, True)
-        c.check("selftest: T7-16 sampling: three identical samples keep sampling (the run 7 case), a "
-                "fourth with a changed phase ends it, eight identical end it, two with a change go on to "
-                "the third; the `cancelled` row folds as a bracketed sample whose phase differs (H80)",
-                SAMPLES_MAX == 8 and more_samples([]) and more_samples([audit, audit])
-                and more_samples([audit, audit, audit]) and not more_samples([audit, audit, audit, report])
-                and more_samples([audit] * 7) and not more_samples([audit] * 8)
-                and more_samples([audit, report]) and not more_samples([audit, report, report])
-                and len(set(phases_of([audit, audit, audit]))) == 1
+        c.check("selftest: T7-16 sampling: the `cancelled` row folds as a bracketed sample whose phase "
+                "differs from the samples' (H80)",
+                len(set(phases_of([audit, audit, audit]))) == 1
                 and phases_of([audit, audit, audit, cancel_row]) == ["running/audit"] * 3 + ["cancelled"]
                 and cancel_row["n"] == "cancel" and cancel_row["job"] == JOB
                 and cancel_row["screen_sent"] == 220 and cancel_row["screen_budget"] == 2000
                 and cancel_row["status_before_sent"] == 220 and cancel_row["status_after_state"] == "cancelled"
                 and cancel_row["caught_up"] is True,
                 f"cancel sample {cancel_row}")
+        none_seen = {"samples": 3, "audit_sample": None, "progress_pushes": 0, "elapsed_s": 1.0, "ended_by": None}
+        both_seen = dict(none_seen, audit_sample=2, progress_pushes=1)
+        c.check("selftest: more_samples (H83): on below SAMPLES_MIN whatever was seen; on past it until "
+                "both the audit sample and a `progress` line exist; off at both, at SAMPLES_HARD_MAX "
+                "samples and at the PROGRESS_WAIT_S bound; the audit sample needs `sent > 0`",
+                SAMPLES_HARD_MAX == 120 and PROGRESS_WAIT_S == 60.0
+                and more_samples([], none_seen) and more_samples([audit], both_seen)
+                and more_samples([audit] * 3, none_seen) and more_samples([audit] * 3, dict(none_seen, audit_sample=1))
+                and more_samples([audit] * 3, dict(none_seen, progress_pushes=1))
+                and not more_samples([audit] * 3, both_seen) and more_samples([audit] * 119, none_seen)
+                and not more_samples([audit] * 120, none_seen)
+                and not more_samples([audit] * 3, dict(none_seen, elapsed_s=60.0))
+                and more_samples([audit] * 3, dict(none_seen, elapsed_s=59.9))
+                and audit_sample([dict(audit, screen_sent=0), dict(audit, n=1, screen_state_phase="running/crawl",
+                                                                    screen_sent=5), dict(audit, n=2)]) == 2
+                and audit_sample([dict(audit, screen_sent=0)]) is None,
+                f"none {none_seen} both {both_seen}")
+        crawl, audit_quiet, audit_pushed = ("running/crawl", 0, 0), ("running/audit", 30, 0), ("running/audit", 31, 1)
+        staged = ScriptedJobsRun([crawl, crawl, crawl, audit_quiet, audit_pushed])
+        staged_checks = Checks(out=io.StringIO())
+        st_samples, st_seen, st_pre = sample_then_cancel(
+            Ctx(staged_checks, staged, staged, staged, s_ev, 0, "", ORIGIN, 8080, set()), JOB, gap_s=0.02)
+        st_words = before_x_words(st_seen)
+        c.check("selftest: sample_then_cancel (H83): a row that reads `running/crawl` for three samples, "
+                "then `running/audit` with `sent > 0` while the second client has no `progress` yet, then "
+                "the same with one `progress` counted, is sampled five times and `x` is pressed once, at "
+                "the fifth sample and not before; the three crawl samples count toward the minimum, every "
+                "sample sits inside its bracket, the Jobs-row check passed and the detail says both were seen",
+                staged.keys == [("x", 4)] and len(st_samples) == 5
+                and phases_of(st_samples) == ["running/crawl"] * 3 + ["running/audit"] * 2
+                and [s["screen_sent"] for s in st_samples] == [0, 0, 0, 30, 31]
+                and all(s["status_before_sent"] <= s["screen_sent"] <= s["status_after_sent"] for s in st_samples)
+                and st_seen["audit_sample"] == 3 and st_seen["progress_pushes"] == 1
+                and st_seen["ended_by"] == "ready" and st_seen["samples"] == 5
+                and st_pre.get("state") == "running" and staged_checks.tally() == (1, 0, 0)
+                and st_words.startswith("`x` once both were seen") and "sample 3" in st_words
+                and "1 `progress`" in st_words,
+                f"keys {staged.keys!r} seen {st_seen} words {st_words!r} samples "
+                f"{[(s['screen_state_phase'], s['screen_sent']) for s in st_samples]}")
+        stalled = ScriptedJobsRun([crawl])
+        t0 = time.monotonic()
+        sl_samples, sl_seen, sl_pre = sample_then_cancel(
+            Ctx(Checks(out=io.StringIO()), stalled, stalled, stalled, s_ev, 0, "", ORIGIN, 8080, set()), JOB,
+            tag="T7-16-selftest", wait_s=0.3, gap_s=0.02)
+        sl_took = time.monotonic() - t0
+        quiet = ScriptedJobsRun([audit_quiet])
+        q_samples, q_seen, _ = sample_then_cancel(
+            Ctx(Checks(out=io.StringIO()), quiet, quiet, quiet, s_ev, 0, "", ORIGIN, 8080, set()), JOB,
+            tag="T7-16-selftest", wait_s=0.3, gap_s=0.02)
+        sl_words, q_words = before_x_words(sl_seen, 0.3), before_x_words(q_seen, 0.3)
+        c.check("selftest: sample_then_cancel (H83): a row that never leaves `running/crawl` is sampled "
+                "until the bound runs out, then `x` is pressed anyway and the detail names both missing "
+                "conditions; one stuck at `running/audit` with `sent > 0` and no `progress` line names "
+                "the push alone",
+                stalled.keys == [("x", 0)] and len(sl_samples) >= SAMPLES_MIN and 0.3 <= sl_took < 3
+                and sl_seen["ended_by"] == "bound" and sl_pre.get("state") == "running"
+                and sl_words.startswith("`x` regardless") and "0.3 s" in sl_words
+                and "no sample read an audit phase with `sent > 0`" in sl_words
+                and "no `progress` line" in sl_words
+                and quiet.keys == [("x", 0)] and q_seen["audit_sample"] == 0 and q_seen["ended_by"] == "bound"
+                and len(q_samples) >= SAMPLES_MIN and "no `progress` line" in q_words
+                and "no sample read an audit phase" not in q_words,
+                f"stalled keys {stalled.keys!r} took {sl_took:.2f} s words {sl_words!r}; quiet keys "
+                f"{quiet.keys!r} words {q_words!r}")
+        capped = ScriptedJobsRun([crawl])
+        cp_samples, cp_seen, _ = sample_then_cancel(
+            Ctx(Checks(out=io.StringIO()), capped, capped, capped, s_ev, 0, "", ORIGIN, 8080, set()), JOB,
+            tag="T7-16-selftest", gap_s=0)
+        ended = ScriptedJobsRun([crawl, ("done", 12, 0)])
+        en_samples, en_seen, en_pre = sample_then_cancel(
+            Ctx(Checks(out=io.StringIO()), ended, ended, ended, s_ev, 0, "", ORIGIN, 8080, set()), JOB,
+            tag="T7-16-selftest", gap_s=0.02)
+        c.check("selftest: sample_then_cancel (H83, H37): a row that never changes stops at SAMPLES_HARD_MAX "
+                "samples inside the 60 s bound (`x` pressed anyway); a job that reads `done` on its second "
+                "bracketing read ends the sampling at two samples and `x` is not pressed",
+                len(cp_samples) == SAMPLES_HARD_MAX and cp_seen["ended_by"] == "cap" and capped.keys == [("x", 0)]
+                and ended.keys == [] and len(en_samples) == 2 and en_seen["ended_by"] == "terminal"
+                and en_pre.get("state") == "done" and before_x_words(en_seen).startswith("no `x`"),
+                f"capped {len(cp_samples)} {cp_seen}; ended keys {ended.keys!r} {en_seen}")
 
         # Cell item from the fifth live smoke run: H72. The start reply switches the Scan tab
         # to Jobs (`fold_start_result`), so a `4` pressed before it lands is undone: `launch`
