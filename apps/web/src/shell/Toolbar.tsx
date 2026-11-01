@@ -19,7 +19,11 @@ import { copyText } from '~/inspector/ui';
 import { menuState, pillWord } from '~/state/systemProxy';
 import css from './Toolbar.module.css';
 
-const POLICY_LABEL: Record<AgentPolicy, string> = { all: 'Allow all tools', readonly: 'Read-only', paused: 'Paused' };
+/** The five core postures, in the Agent menu's order; `auto`/`ask` as the core defines them (autonomous: sensitive refused · human in the loop: sensitive asks). */
+const POLICIES = ['all', 'auto', 'ask', 'readonly', 'paused'] as const satisfies readonly AgentPolicy[];
+const POLICY_LABEL: Record<AgentPolicy, string> = { all: 'Allow all tools', auto: 'Auto-approve', ask: 'Ask first', readonly: 'Read-only', paused: 'Paused' };
+/** The label, or the wire word itself for a posture a newer core added that this build does not name (never throw in render). */
+const policyLabel = (p: AgentPolicy): string => POLICY_LABEL[p] ?? p;
 
 /** Clear with a one-step inline confirm when there is anything to clear (never window.confirm). */
 export const ClearButton: Component<{ variant: 'toolbar' | 'small'; label?: string }> = (props) => {
@@ -162,7 +166,7 @@ export const Toolbar: Component = () => {
         type="button"
         class={css.agent}
         data-policy={app.proxy.agent}
-        title={`Agent policy: ${POLICY_LABEL[app.proxy.agent].toLowerCase()}`}
+        title={`Agent policy: ${policyLabel(app.proxy.agent).toLowerCase()}`}
         aria-haspopup="menu"
         aria-expanded={agentMenu() != null}
         onClick={(e) => setAgentMenu({ anchor: rectAnchor(e.currentTarget.getBoundingClientRect()), kb: e.detail === 0 })}
@@ -180,7 +184,7 @@ export const Toolbar: Component = () => {
             label="Agent policy"
             onClose={() => setAgentMenu(null)}
             items={[
-              ...(['all', 'readonly', 'paused'] as const).map((p) => ({
+              ...POLICIES.map((p) => ({
                 label: POLICY_LABEL[p],
                 checked: app.proxy.agent === p,
                 onSelect: () => void app.setAgentPolicy(p),

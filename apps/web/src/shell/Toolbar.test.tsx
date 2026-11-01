@@ -8,6 +8,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@solidjs/testing-library';
+import { ErrorBoundary } from 'solid-js';
 import type { BusClient } from '~/bus/types';
 import { AppProvider } from '~/state/context';
 import { createAppStore } from '~/state/app';
@@ -44,6 +45,8 @@ interface MountOpts {
   hold?: Promise<unknown>;
   /** Leave `proxy.system.status` out of the catalogue (a core without the read). */
   noStatusTool?: boolean;
+  /** What `agent.status` reports as `policy`; the real core has five (`all`, `auto`, `ask`, `readonly`, `paused`). Default: the memory bus's `all`. */
+  policy?: string;
 }
 
 /**
@@ -68,6 +71,9 @@ function mountWith(opts: MountOpts) {
         return POINTS_AT_US as T;
       }
       const result = await mem.call<T>(tool, args);
+      if (tool === 'agent.status' && opts.policy !== undefined) {
+        return { ...(result as Record<string, unknown>), policy: opts.policy } as T;
+      }
       if (tool === 'proxy.status') {
         ctl.polls += 1;
         const r = result as Record<string, unknown>;
@@ -77,12 +83,21 @@ function mountWith(opts: MountOpts) {
     },
   };
   const app = createAppStore(bus);
+  /** Render errors Solid would otherwise rethrow into the store's swallowed promise chain (a frozen toolbar in the app). */
+  const errors: Error[] = [];
   render(() => (
     <AppProvider store={app}>
-      <Toolbar />
+      <ErrorBoundary
+        fallback={(e: unknown) => {
+          errors.push(e instanceof Error ? e : new Error(String(e)));
+          return <p>toolbar render error</p>;
+        }}
+      >
+        <Toolbar />
+      </ErrorBoundary>
     </AppProvider>
   ));
-  return { bus, app, calls, ctl };
+  return { bus, app, calls, ctl, errors };
 }
 
 const mount = (status: unknown, full?: unknown) => mountWith({ status, full });
@@ -337,5 +352,50 @@ describe('Toolbar system-proxy pill (tester)', () => {
     await waitFor(() => expect(app.toast()).toEqual({ text: 'system proxy: a system-proxy change is already in flight', kind: 'error' }));
     expect(app.proxy.systemProxySetting).toBe(false);
     expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy off');
+  });
+});
+
+// The live core's `agent.status` carries five policies (`all`, `auto`, `ask`, `readonly`, `paused`;
+// crates/aitm-core/src/agent.rs). Live proof of PR 3 found the toolbar throwing on `auto`
+// (`POLICY_LABEL[...]` undefined → `.toLowerCase()`), which took the system-proxy pill down with it.
+describe('Toolbar Agent toggle under the core’s five policies', () => {
+  const agentButton = () => screen.getByRole('button', { name: /^Agent/ });
+
+  it.each([
+    ['auto', 'Auto-approve'],
+    ['ask', 'Ask first'],
+  ])('renders with policy %s: the title names it, the menu lists five and the pill menu still opens', async (policy, label) => {
+    let app, errors: Error[];
+    ({ bus, app, errors } = mountWith({ status: OFF, policy }));
+    await waitFor(() => expect(app.proxy.agent).toBe(policy));
+    expect(errors.map((e) => e.message)).toEqual([]);
+
+    const b = agentButton();
+    expect(b.getAttribute('data-policy')).toBe(policy);
+    expect(b.title).toBe(`Agent policy: ${label.toLowerCase()}`);
+
+    fireEvent.click(b);
+    const items = screen.getAllByRole('menuitemradio');
+    expect(items.map((i) => i.textContent)).toEqual(['Allow all tools', 'Auto-approve', 'Ask first', 'Read-only', 'Paused']);
+    expect(items.map((i) => i.getAttribute('aria-checked'))).toEqual(['all', 'auto', 'ask', 'readonly', 'paused'].map((p) => String(p === policy)));
+    fireEvent.keyDown(screen.getByRole('menu', { name: 'Agent policy' }), { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+
+    // The same component renders the system-proxy pill menu; it must still open and carry its word.
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('off'));
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy off');
+    fireEvent.click(pill());
+    expect(screen.getByRole('menu', { name: 'System proxy' })).toBeTruthy();
+    expect(screen.getByRole('menuitemradio', { name: 'Set as system proxy' })).toBeTruthy();
+  });
+
+  it('a policy this build does not know (a newer core) falls back to the wire word instead of throwing', async () => {
+    let app, errors: Error[];
+    ({ bus, app, errors } = mountWith({ status: OFF, policy: 'quarantine' }));
+    await waitFor(() => expect(app.proxy.agent as string).toBe('quarantine'));
+    expect(errors.map((e) => e.message)).toEqual([]);
+    expect(agentButton().title).toBe('Agent policy: quarantine');
+    fireEvent.click(pill());
+    expect(screen.getByRole('menu', { name: 'System proxy' })).toBeTruthy();
   });
 });

@@ -132,7 +132,8 @@ export interface StateNotification {
   protocol?: string;
   intercept_armed: boolean;
   paused: number;
-  agent: 'all' | 'readonly' | 'paused';
+  /** The core's five postures (crates/aitm-core/src/agent.rs); `all`/`readonly`/`paused` are what the UI sets, `auto`/`ask` arrive from config or the CLI. */
+  agent: 'all' | 'auto' | 'ask' | 'readonly' | 'paused';
   agent_actions_last_minute?: number;
   throughput?: { up: number; down: number };
   memory_bytes?: number;
