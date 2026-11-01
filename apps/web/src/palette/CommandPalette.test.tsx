@@ -20,8 +20,11 @@ const TOOLS: ToolDef[] = [
   tool('flow.list', 'List captured flow ids.', {}, [], false),
   tool('flow.replay', 'Send a captured request again.', { id: { type: 'string', 'x-aitm': 'FlowId' } }, ['id']),
   tool('flow.kill', 'Abort a flow.', { id: { type: 'string' }, mode: { type: 'string', enum: ['reset', '429', '503'] } }, ['id']),
-  tool('ca.install', 'Install the root CA.', { store: { type: 'string' } }, [], true, 'This changes the system trust store.'),
+  tool('ca.install', 'Install the root CA.', { scope: { type: 'string' } }, [], true, 'This changes the system trust store.'),
 ];
+
+/** What `ca.status` parsed to on a Mac whose login keychain does not trust the CA yet. */
+const CA_UNTRUSTED = { trusted: false, scope: null, platform: 'macos', fingerprint: 'AB:CD' } as const;
 
 const flow = (seq: number, p: Partial<FlowSummary> = {}): FlowEntry => {
   const raw: FlowSummary = {
@@ -56,11 +59,11 @@ const flow = (seq: number, p: Partial<FlowSummary> = {}): FlowEntry => {
   return { id: raw.id, flow: store, raw, set };
 };
 
-function stubApp() {
+function stubApp(ca: AppStore['ca'] = null) {
   const entries = [flow(1), flow(2, { authority: 'auth.shop-staging.test', path: '/login', method: 'POST' })];
   const [version] = createSignal(0);
   const [ui, setUi] = createStore({ paletteOpen: true, theme: 'light', density: 'dense', layout: 'horizontal' });
-  const call = vi.fn(async (name: string, args?: Record<string, unknown>) => {
+  const call = vi.fn(async (name: string, args?: Record<string, unknown>): Promise<unknown> => {
     if (name === 'flow.replay') return 'f2';
     if (name === 'flow.list') return ['f1', 'f2'];
     return { ok: true, name, args };
@@ -68,6 +71,10 @@ function stubApp() {
   const app = {
     ui,
     proxy: { tools: TOOLS, armed: false, scope: [] },
+    ca,
+    caInstalling: false,
+    setCAInstalling: vi.fn(),
+    refreshCA: vi.fn(async () => {}),
     version,
     entries,
     byId: new Map(entries.map((e) => [e.id, e])),
@@ -115,7 +122,7 @@ describe('CommandPalette grouping', () => {
     expect(getByText('Setup')).toBeTruthy();
     expect(queryByText('Recent')).toBeNull();
     const options = getAllByRole('option');
-    expect(options.map((o) => o.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('flow.replay'), expect.stringContaining('Install CA')]));
+    expect(options.map((o) => o.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('flow.replay'), expect.stringContaining('Trust the aitmproxy CA')]));
     // read-only hint on non-mutating tools
     expect(getByText('flow.list').closest('[role="option"]')!.textContent).toContain('read-only');
     // flows newest first
@@ -213,6 +220,80 @@ describe('CommandPalette grouping', () => {
     await tick();
     expect(app.call).toHaveBeenCalledWith('ca.install', {});
     expect(queryByText('Confirm')).toBeNull();
+  });
+
+  it('the Setup action prefills scope: user on macOS, holds the in-flight flag around the call, then re-reads ca.status (D17.1, D17.5, D17.12)', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    app.setCAInstalling.mockImplementation((on: boolean) => order.push(`installing:${on}`));
+    app.refreshCA.mockImplementation(async () => {
+      order.push('refreshCA');
+    });
+    app.call.mockImplementation(async (name: string) => {
+      order.push(`call:${name}`);
+      return { changed: true };
+    });
+    const { getByRole, getByText } = await mount(app);
+    const option = getByText('Trust the aitmproxy CA').closest('[role="option"]')!;
+    expect(option.textContent).toContain('Install the root CA into your user trust store; HTTPS is not captured until then');
+    fireEvent.click(option);
+    await tick();
+    expect(getByRole('dialog').querySelector<HTMLInputElement>('input[name="scope"], #palette-ca-install-scope')?.value).toBe('user');
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call).toHaveBeenCalledWith('ca.install', { scope: 'user' });
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
+    expect(getByRole('status').textContent).toContain('ok');
+  });
+
+  it('a cancelled macOS dialog is an info notice, not an error (D17.4)', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const msg = 'ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted';
+    app.call.mockImplementation(async () => {
+      throw new Error(msg);
+    });
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.notice).toHaveBeenCalledWith(msg, 'info');
+    expect(queryByRole('status')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(app.refreshCA).toHaveBeenCalledTimes(1);
+    expect(app.setCAInstalling).toHaveBeenLastCalledWith(false);
+  });
+
+  it('any other ca.install failure stays an error result and still re-reads ca.status', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    app.call.mockImplementation(async () => {
+      throw new Error('ca.install refused: ca.install is refused from an agent frontend');
+    });
+    const { getByRole, getByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.notice).not.toHaveBeenCalled();
+    expect(getByRole('status').textContent).toContain('error');
+    expect(app.refreshCA).toHaveBeenCalledTimes(1);
+  });
+
+  it('the Setup action passes no scope on Linux (D17.1)', async () => {
+    const app = stubApp({ trusted: false, scope: null, platform: 'linux-debian', fingerprint: 'AB:CD' });
+    const { getByRole, getByText } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    expect(getByRole('dialog').querySelector<HTMLInputElement>('input[name="scope"], #palette-ca-install-scope')?.value ?? '').toBe('');
   });
 
   it('Esc closes from the list and returns to the list from a form', async () => {

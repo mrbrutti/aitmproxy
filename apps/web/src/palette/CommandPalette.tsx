@@ -12,7 +12,8 @@ import { Icon } from '~/components/Icon';
 import { Kbd } from '~/components/Kbd';
 import { FlowLine } from '~/lib/schema-form/FlowLine';
 import { SchemaForm } from '~/lib/schema-form/SchemaForm';
-import { createFormState, type FormState } from '~/lib/schema-form/infer';
+import { createFormState, type FormState, type RawValues } from '~/lib/schema-form/infer';
+import { isCACancelled } from '~/state/caTrust';
 import { segments } from '~/lib/fuzzy';
 import { openedByPointer } from '~/lib/pointer';
 import { buildGroups, commandKey, compactJson, flatten, flowIdsIn, parseQuery, pushRecent, readPinned, readRecent, setupKey, togglePinned, type PaletteItem } from './groups';
@@ -67,24 +68,43 @@ export const CommandPalette: Component = () => {
   // ---- running commands ----
   const toolByName = (name: string) => app.proxy.tools.find((t) => t.name === name) ?? null;
 
+  /** The two calls that change the OS trust store (§D17.12): in-flight word, then the `ca.status` re-read (D17.5). */
+  const changesCA = (tool: ToolDef) => tool.name === 'ca.install' || tool.name === 'ca.uninstall';
+
   const run = async (tool: ToolDef, args: Record<string, unknown>) => {
     setStage({ kind: 'running', tool });
     const t0 = performance.now();
+    const ca = changesCA(tool);
+    if (ca) app.setCAInstalling(true);
     try {
       const value = await app.call(tool.name, args);
       setStage({ kind: 'result', tool, ok: true, value, ms: performance.now() - t0, args });
       if (tool.mutates !== false) void app.refreshSide();
     } catch (e) {
-      setStage({ kind: 'result', tool, ok: false, value: (e as Error).message, ms: performance.now() - t0, args });
+      const message = (e as Error).message;
+      if (ca && isCACancelled(message)) {
+        // The operator dismissed the OS dialog: calm (D17.4), nothing to inspect.
+        app.notice(message, 'info');
+        setStage({ kind: 'list' });
+      } else setStage({ kind: 'result', tool, ok: false, value: message, ms: performance.now() - t0, args });
+    } finally {
+      if (ca) {
+        await app.refreshCA();
+        app.setCAInstalling(false);
+      }
     }
     setRecent(pushRecent(commandKey(tool.name)));
   };
 
-  const selectTool = (tool: ToolDef) => {
-    const form = createFormState(tool);
+  /** Initial form values from a setup action's arguments: strings and booleans as they are, the rest as JSON text. */
+  const toRawValues = (args: Record<string, unknown>): RawValues =>
+    Object.fromEntries(Object.entries(args).map(([k, v]) => [k, typeof v === 'string' || typeof v === 'boolean' ? v : JSON.stringify(v)]));
+
+  const selectTool = (tool: ToolDef, initial: Record<string, unknown> = {}) => {
+    const form = createFormState(tool, toRawValues(initial));
     if (form.fields.length === 0) {
       if (typeof tool.confirm === 'string') setStage({ kind: 'form', tool, form, confirming: true });
-      else void run(tool, {});
+      else void run(tool, initial);
       return;
     }
     setStage({ kind: 'form', tool, form, confirming: false });
@@ -116,7 +136,7 @@ export const CommandPalette: Component = () => {
         setRecent(pushRecent(setupKey(item.action.id)));
         if (item.action.tool) {
           const t = toolByName(item.action.tool);
-          if (t) selectTool(t);
+          if (t) selectTool(t, item.action.args ?? {});
           else app.notice(`${item.action.tool} is not available on this bus`, 'error');
         } else void item.action.run?.();
         break;
