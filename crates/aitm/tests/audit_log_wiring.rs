@@ -34,7 +34,7 @@ use aitm_mcp::{ConnCtx, McpServer};
 use serde_json::{json, Value};
 
 /// The most a shutdown is given to flush; every test asserts it finished.
-const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// The loopback transport's token. Made up; nothing is bound or served.
 const LOOPBACK_TOKEN: &str = "audit-wiring-test-loopback-token";
 
@@ -173,7 +173,7 @@ impl Rig {
 
     /// Flushes and stops the writer, then reads the three files back.
     fn finish(&self) -> Files {
-        let report = self.handle.shutdown(SHUTDOWN_BUDGET);
+        let report = self.handle.shutdown(FLUSH_TIMEOUT);
         assert!(
             report.complete,
             "the writer did not flush in time: {report:?}"

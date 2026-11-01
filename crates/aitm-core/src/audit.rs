@@ -393,7 +393,8 @@ pub trait AuditSink: Send + Sync {
 pub struct DurableAuditStatus {
     /// Whether the writer is currently failing to persist entries.
     pub degraded: bool,
-    /// How many entries the writer has dropped (a full queue).
+    /// How many entries the writer has refused rather than written: the queue was
+    /// full, it was closing or gone, or a stuck rotation held the file at its ceiling.
     pub dropped: u64,
     /// How many writes to the file have failed.
     pub write_failures: u64,

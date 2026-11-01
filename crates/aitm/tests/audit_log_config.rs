@@ -1,5 +1,5 @@
-//! Durable audit, task W2 (AC1, AC2): the `mcp.audit_log` config key and the
-//! `AITM_AUDIT_LOG` environment override.
+//! The durable audit log's configuration (AC1, AC2): the `mcp.audit_log` config
+//! key and the `AITM_AUDIT_LOG` environment override.
 //!
 //! The key accepts `true`, `false`, `off` (any case) and an absolute path; every
 //! other value is a config error naming `mcp.audit_log` and "absolute". The
@@ -8,11 +8,13 @@
 //! control the fail-safe direction is "stay on", so a typo must not disable the
 //! trail. Paths are Unix literals; the repo's CI is Unix.
 //!
-//! Task W3 adds AC3 (`stream_paths_follow_the_rule`): the three stream files are
-//! derived from the one configured base path.
+//! `stream_paths_follow_the_rule` (AC3): the three stream files are derived from
+//! the one configured base path.
 //!
-//! Task W11 adds AC4 (`a_stream_path_equal_to_the_ca_log_is_refused`): `start`
-//! refuses a configuration in which a stream file would be the CA audit log.
+//! `a_stream_path_equal_to_the_ca_log_is_refused` (AC4) and
+//! `a_ca_log_that_is_a_stream_file_in_another_spelling_is_refused`: `start`
+//! refuses a configuration in which a stream file, or a file a stream rotates to,
+//! would be the CA audit log, however its path is spelled.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -157,21 +159,22 @@ fn audit_log_env_wins_and_never_silently_disables() {
         AuditLogSetting::Path(PathBuf::from("/a/audit.jsonl")),
     ];
     let mut failures: Vec<String> = Vec::new();
+    // `reason` is what the warning must say is wrong with the value, when it warns.
     let mut check = |start: &AuditLogSetting,
                      value: Option<&str>,
                      want: &AuditLogSetting,
-                     want_warning: bool| {
+                     reason: Option<&str>| {
         let (got, log) = with_env(start, value);
         let row = format!("file {start:?}, env {value:?}");
         if got != *want {
             failures.push(format!("{row}: left: {got:?}, right: {want:?}"));
         }
         let lines = log.lines().count();
-        if want_warning {
-            // One line, on the audit target, naming the variable and the
-            // Debug-escaped value (a newline in the value cannot forge a line).
-            let escaped = format!("AITM_AUDIT_LOG={:?}", value.unwrap_or_default());
-            for needle in [escaped.as_str(), "aitm::audit", "WARN", "unchanged"] {
+        if let Some(reason) = reason {
+            // One line, on the audit target, naming the variable and the reason
+            // and never the value (so a newline in it cannot forge a line and a
+            // secret pasted into it is not logged).
+            for needle in ["AITM_AUDIT_LOG", reason, "aitm::audit", "WARN", "unchanged"] {
                 if !log.contains(needle) {
                     failures.push(format!("{row}: the warning lacks {needle:?}: {log:?}"));
                 }
@@ -187,34 +190,37 @@ fn audit_log_env_wins_and_never_silently_disables() {
     for start in &starts {
         // Off spellings, ASCII case-insensitive.
         for value in ["off", "false", "0", "no", "OFF"] {
-            check(start, Some(value), &AuditLogSetting::Off, false);
+            check(start, Some(value), &AuditLogSetting::Off, None);
         }
         // On spellings, ASCII case-insensitive.
         for value in ["on", "true", "1", "yes", "default", "True"] {
-            check(start, Some(value), &AuditLogSetting::Default, false);
+            check(start, Some(value), &AuditLogSetting::Default, None);
         }
         // An absolute path selects `Path`.
         check(
             start,
             Some("/tmp/x/a.jsonl"),
             &AuditLogSetting::Path(PathBuf::from("/tmp/x/a.jsonl")),
-            false,
+            None,
         );
         // Unset: the file's value survives.
-        check(start, None, start, false);
+        check(start, None, start, None);
         // Anything else leaves the file's setting exactly as it was: a typo, a
         // relative path, an empty string, a value that only looks like "off"
-        // (the parse is not trimmed), a value with a newline in it.
-        for value in [
-            "ofd",
-            "relative.jsonl",
-            "~/audit.jsonl",
-            "",
-            " off",
-            "off ",
-            "a\nb",
+        // (the parse is not trimmed), a value with a newline in it. The warning
+        // says which kind of wrong it is.
+        let other = "not one of off/on/default or an absolute path";
+        for (value, reason) in [
+            ("ofd", other),
+            ("relative.jsonl", other),
+            ("~/audit.jsonl", "a relative path"),
+            ("logs/audit.jsonl", "a relative path"),
+            ("", "empty"),
+            (" off", other),
+            ("off ", other),
+            ("a\nb", other),
         ] {
-            check(start, Some(value), start, true);
+            check(start, Some(value), start, Some(reason));
         }
     }
 
@@ -265,7 +271,6 @@ fn stream_paths_follow_the_rule() {
     }
 
     // `Default` is `audit.jsonl` in the directory the CA audit log lives in.
-    // (These two rows are green on arrival: Task W1 built `resolved_path`.)
     match AuditLogSetting::Default.resolved_path() {
         Some(path) => {
             if path.file_name() != Some("audit.jsonl".as_ref()) {
@@ -404,6 +409,191 @@ fn a_stream_path_equal_to_the_ca_log_is_refused() {
         other => failures.push(format!(
             "a distinct CA log: left: {other:?}, right: Ok(Some(handle))"
         )),
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} row(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// `start` against `ca_log` with the stream base `<dir>/audit.jsonl`: the error
+/// text when it refuses, or why the answer is not a refusal.
+fn start_against(dir: &Scratch, ca_log: PathBuf) -> Result<String, String> {
+    let mut cfg = Config::default();
+    cfg.mcp.audit_log = AuditLogSetting::Path(dir.path().join("audit.jsonl"));
+    cfg.ca.audit_log = ca_log;
+    let ring = Arc::new(AuditRing::new(16));
+    match audit_log::start(&cfg, &ring, None, &[]) {
+        Err(err) => Ok(format!("{err:#}")),
+        Ok(Some(handle)) => {
+            let _ = handle.shutdown(std::time::Duration::from_secs(5));
+            Err("started".to_string())
+        }
+        Ok(None) => Err("returned no handle".to_string()),
+    }
+}
+
+/// The CA audit log is the same file as a stream file however its path is
+/// spelled: through `..` (the directory it goes through present or not), through
+/// a symbolic link to the directory, or as the file a stream rotates its own to
+/// (`audit.jsonl.4`, `audit.agent.jsonl.5`, `audit.reads.jsonl.2`: the rotated
+/// files each stream keeps, 4, 5 and 2). Each is refused by name, nothing is
+/// created, and the names just past what a stream keeps are not a collision.
+#[test]
+fn a_ca_log_that_is_a_stream_file_in_another_spelling_is_refused() {
+    let mut failures: Vec<String> = Vec::new();
+    let mut refused = |row: &str, setup: &dyn Fn(&Scratch) -> PathBuf, want_left: &[&str]| {
+        let dir = Scratch::new("ca-spelling");
+        let ca_log = setup(&dir);
+        match start_against(&dir, ca_log.clone()) {
+            Ok(text) => {
+                if !text.contains("ca.audit_log") {
+                    failures.push(format!(
+                        "{row}: the error does not name ca.audit_log: {text}"
+                    ));
+                }
+                let shown = ca_log.display().to_string();
+                if !text.contains(&shown) {
+                    failures.push(format!("{row}: the error does not name {shown}: {text}"));
+                }
+            }
+            Err(why) => failures.push(format!(
+                "{row}: left: {why}, right: an error naming ca.audit_log"
+            )),
+        }
+        if dir.names() != want_left {
+            failures.push(format!(
+                "{row}: left: {:?}, right: {want_left:?}",
+                dir.names()
+            ));
+        }
+    };
+
+    refused(
+        "through a directory that is there",
+        &|dir| {
+            std::fs::create_dir(dir.path().join("sub")).expect("make sub");
+            dir.path().join("sub").join("..").join("audit.jsonl")
+        },
+        &["sub"],
+    );
+    refused(
+        "through a directory that is not there",
+        &|dir| dir.path().join("nosuch").join("..").join("audit.jsonl"),
+        &[],
+    );
+    refused(
+        "through a link to the directory",
+        &|dir| {
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("link")).expect("make link");
+            dir.path().join("link").join("audit.jsonl")
+        },
+        &["link"],
+    );
+    for (row, name) in [
+        ("the control stream's newest rotated file", "audit.jsonl.1"),
+        ("the control stream's oldest rotated file", "audit.jsonl.4"),
+        (
+            "the agent stream's oldest rotated file",
+            "audit.agent.jsonl.5",
+        ),
+        (
+            "the reads stream's oldest rotated file",
+            "audit.reads.jsonl.2",
+        ),
+    ] {
+        refused(row, &|dir| dir.path().join(name), &[]);
+    }
+
+    // Just past what a stream keeps is not a name it ever writes.
+    for name in [
+        "audit.jsonl.5",
+        "audit.agent.jsonl.6",
+        "audit.reads.jsonl.3",
+    ] {
+        let dir = Scratch::new("ca-past-keep");
+        match start_against(&dir, dir.path().join(name)) {
+            Err(started) if started == "started" => {}
+            other => failures.push(format!("{name}: left: {other:?}, right: a normal start")),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} row(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A value that is not a setting is never printed: not in the warning the
+/// environment variable gives, whatever it holds (a token pasted into the wrong
+/// variable is the case), and not in the error the config file gives, whatever
+/// YAML shape it has (a mapping with a key of its own, a list, a number, a
+/// string). The errors say what kind of value it was.
+#[test]
+fn a_value_that_is_not_a_setting_is_never_echoed() {
+    const CANARY: &str = "CNRY04xdeadbeefcafe";
+    let mut failures: Vec<String> = Vec::new();
+
+    for value in [
+        CANARY.to_string(),
+        format!("{CANARY}/audit.jsonl"),
+        format!("operator_token={CANARY}"),
+    ] {
+        let (setting, log) = with_env(&AuditLogSetting::Default, Some(&value));
+        if setting != AuditLogSetting::Default {
+            failures.push(format!("env {value:?} changed the setting: {setting:?}"));
+        }
+        if log.contains(CANARY) {
+            failures.push(format!(
+                "env {value:?}: the warning carries the value: {log}"
+            ));
+        }
+        if !log.contains("WARN") {
+            failures.push(format!("env {value:?}: no warning: {log:?}"));
+        }
+    }
+
+    for (row, yaml, kind) in [
+        (
+            "a mapping",
+            format!("mcp:\n  audit_log:\n    operator_token: {CANARY}\n"),
+            "a mapping",
+        ),
+        (
+            "a list",
+            format!("mcp:\n  audit_log: [{CANARY}, b]\n"),
+            "a list",
+        ),
+        ("a number", "mcp:\n  audit_log: 5\n".to_string(), "a number"),
+        (
+            "a relative path",
+            format!("mcp:\n  audit_log: {CANARY}/audit.jsonl\n"),
+            "a string",
+        ),
+        (
+            "a bare word",
+            format!("mcp:\n  audit_log: {CANARY}\n"),
+            "a string",
+        ),
+    ] {
+        match parsed(&yaml) {
+            Err(text) => {
+                if text.contains(CANARY) {
+                    failures.push(format!("{row}: the error carries the value: {text}"));
+                }
+                for needle in ["mcp.audit_log", "absolute", kind] {
+                    if !text.contains(needle) {
+                        failures.push(format!("{row}: the error lacks {needle:?}: {text}"));
+                    }
+                }
+            }
+            Ok(setting) => failures.push(format!("{row}: left: Ok({setting:?}), right: an error")),
+        }
     }
 
     assert!(

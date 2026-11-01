@@ -43,7 +43,7 @@
 //! sits outside every literal, and the letter of the scan above would give up
 //! and run the plain-text pass over JSON text, which is the defect this module
 //! exists to avoid. So one trailing `…` is set aside before the scan and put
-//! back after, as the registry's fragment mask sets it aside (plan Ambiguity 15),
+//! back after, as the registry's trailing-fragment search sets it aside,
 //! and a word that is the start of `true`, `false` or `null` and runs to the end
 //! of the text is the word the cut interrupted.
 
@@ -363,7 +363,7 @@ mod tests {
         );
     }
 
-    /// The plan's extra test: over a list of cut and odd texts, a scan that gives a
+    /// Over a list of cut and odd texts, a scan that gives a
     /// result changed only literal contents, and a text with something else
     /// outside a literal is given up (`None`, plain text for the caller).
     #[test]
@@ -518,7 +518,7 @@ mod tests {
         let mut failures = Vec::new();
         for (row, text, want) in [
             (
-                "the plan's row",
+                "a secret-named key, cut after the next member",
                 r#"{"password":"SECRET54c","n":1"#,
                 r#"{"password":"<redacted>","n":1"#,
             ),
@@ -753,8 +753,8 @@ mod tests {
     }
 
     /// Design 14.5, AC47's writer half: what the source wrote for a call is a
-    /// fixed point of the writer's pass. The list is local (the corpus does not
-    /// exist for this task; its own test repeats this over its values). Each value
+    /// fixed point of the writer's pass. The list is local (the redaction corpus
+    /// repeats this over its own values). Each value
     /// is put through the source function, and the writer's pass must give that
     /// text back, whole, and cut at the source's cap after every character.
     #[test]
@@ -855,7 +855,7 @@ mod tests {
         ]
     }
 
-    /// Hostile nesting must not exhaust the stack (plan ambiguity 22): the scan
+    /// Hostile nesting must not exhaust the stack: the scan
     /// holds no stack of its own. It runs here on a thread with 128 KiB of stack,
     /// which a recursive scan of 100 000 levels cannot survive, and must give each
     /// text back as it was (nothing in it is a literal).
@@ -902,7 +902,7 @@ mod tests {
     /// strict text pass per literal are exactly that size, the worst the writer is
     /// ever given, and the cheap ones (no literal to pass) are 512 KiB: a scan that
     /// re-read a run of blanks for every byte of it would need minutes on them. The
-    /// generous bound (20 s, the plan's guard for hostile input) is for a loaded
+    /// generous bound (20 s, for hostile input) is for a loaded
     /// debug build; the work takes milliseconds in release.
     #[test]
     fn hostile_texts_are_scanned_in_linear_time() {

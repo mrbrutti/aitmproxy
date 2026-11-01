@@ -915,9 +915,11 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     }
 
     // Last: every call the servers audited is queued by now. This flushes it, and
-    // is bounded (`SHUTDOWN_BUDGET`), so a stalled disk cannot hold the exit.
+    // is bounded (`SHUTDOWN_BUDGET`), so a stalled disk cannot hold the exit. It
+    // sleeps while the stream threads drain, so it says so to the (multi-thread)
+    // runtime rather than blocking inside the async fn unannounced.
     if let Some(handle) = &audit {
-        let report = handle.shutdown(audit_log::SHUTDOWN_BUDGET);
+        let report = tokio::task::block_in_place(|| handle.shutdown(audit_log::SHUTDOWN_BUDGET));
         if !report.complete {
             warn!(
                 target: "aitm::audit",

@@ -326,7 +326,8 @@ fn agent_status_output_schema_declares_every_durable_audit_key() {
 }
 
 /// AC35 `[guard]`: nothing registered by the agent or control plugin reads the
-/// audit file or reveals where it is. (The whole-registry check is W16's.)
+/// audit file or reveals where it is. (The whole-registry check is
+/// `no_registered_command_name_starts_with_audit` in `audit_log_wiring.rs`.)
 #[test]
 fn no_command_reads_or_reveals_the_audit_file() {
     let ring = Arc::new(AuditRing::default());

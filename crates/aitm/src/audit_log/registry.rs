@@ -47,7 +47,7 @@ const MASK_LITERALS: [&str; 3] = ["redacted", "[redacted]", "<redacted>"];
 const WHOLE_TOKEN_MIN_BYTES: usize = 4;
 
 /// This many bytes or more and a secret is masked as a substring anywhere.
-/// The warning says `shorter than 8`: keep the two in step.
+/// The warning for a shorter secret names this number.
 const SUBSTRING_MIN_BYTES: usize = 8;
 
 /// The ending of a text must be at least this many bytes of a secret for
@@ -64,8 +64,9 @@ const JSON_DEPTHS: usize = 3;
 /// document, twice. The percent form of the raw secret is level 0.
 const PERCENT_OF_JSON_DEPTHS: usize = 2;
 
-/// The marker a producer's cap puts after the text it cut: the ring's own, which
-/// the writer's caps use too (see `pipeline`).
+/// The marker a producer's cap puts after the text it cut: the MCP server's (see
+/// `cap_text` in `aitm-mcp/src/server.rs`), which the writer's caps use too (see
+/// `pipeline`).
 pub(super) const CUT_MARK: &str = "\u{2026}";
 
 /// How a secret was taken in. It carries no value.
@@ -145,7 +146,7 @@ impl SecretRegistry {
             warn!(
                 target: "aitm::audit",
                 source = ?source,
-                "a secret registered from this source is shorter than 8 characters and is only partly covered by value masking"
+                "a secret registered from this source is shorter than {SUBSTRING_MIN_BYTES} bytes and is only partly covered by value masking"
             );
         }
         tier
@@ -987,7 +988,7 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    // ---- the escaping depths a secret can be met at (fix task, finding 1) ----
+    // ---- the escaping depths a secret can be met at ----
 
     /// A configured secret with every character an encoder rewrites: `"` and `\`
     /// (JSON), `/`, `+` and `=` (percent).
@@ -1078,7 +1079,7 @@ mod tests {
         );
     }
 
-    /// Finding 1: the writer meets a secret as it is, JSON-escaped once (in
+    /// The writer meets a secret as it is, JSON-escaped once (in
     /// `args`), twice (in a string that holds a JSON document) and three times
     /// over (a document inside a document), percent-encoded in either case, as a
     /// JSON form that is then percent-encoded (a document in a URL or a form), and
@@ -1151,7 +1152,7 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// Finding 1: the tier is the raw secret's. A 5-byte secret with a quote is a
+    /// The tier is the raw secret's. A 5-byte secret with a quote is a
     /// whole token at every depth (its depth-3 form is 13 bytes and is still not
     /// masked inside a word); it is not taken for a substring because a deeper
     /// form is long.
@@ -1185,7 +1186,7 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// Finding 1: masking a secret at any of the stored depths leaves valid JSON,
+    /// Masking a secret at any of the stored depths leaves valid JSON,
     /// and decoding the document down to the secret gives `[redacted]`: the mask
     /// replaces the whole escaped form, so no `\` is left to escape what follows.
     /// The secrets include one that begins with a quote (each form is then a
@@ -1215,7 +1216,7 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// Finding 1: a registration with every form is still a count and nothing
+    /// A registration with every form is still a count and nothing
     /// else in `Debug`, and a long secret with many forms warns about nothing.
     #[test]
     fn many_forms_change_neither_the_count_nor_the_log() {

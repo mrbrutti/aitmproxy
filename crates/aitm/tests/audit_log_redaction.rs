@@ -47,7 +47,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aitm::audit_log::{start, start_at, start_tuned, AuditLogHandle, Registration, Tuning};
@@ -66,17 +66,14 @@ use aitm_poc::{Assertion, PocInfo, Severity, Variable};
 use serde_json::{json, Map, Value};
 
 /// The most a shutdown is given to flush; every run asserts it finished.
-const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The size at which every stream's file rotates in the corpus run: small enough
 /// that the agent file (which holds every call) rotates, and large enough that
 /// the retention (five rotated files) does not drop the oldest. The completeness
 /// guard fails when this is wrong either way; change this number, never the guard.
-///
-/// 12 KiB held the 105 calls of the first half of the corpus; the second half and
-/// the generated rows bring the run to over 300 calls, about 90 KB of lines, which
-/// six files of 12 KiB cannot hold (the guard counted 261 lines for 313 calls), so
-/// the cap is 24 KiB: three numbered files and the active one.
+/// The run is over 300 calls, about 90 KB of lines: at 24 KiB that is three
+/// numbered files and the active one, and the five rotated files kept hold them all.
 const CAP_BYTES: u64 = 24 * 1024;
 
 /// The label the agent connection declares.
@@ -218,15 +215,44 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// A seed that differs per run and per call of this function.
+/// The seed of this process's run, the same for every call: `AITM_CORPUS_SEED`
+/// (decimal, or hexadecimal with a `0x`) when it is set, otherwise one drawn from
+/// the clock and the process id. The canaries follow from it, so a run that fails
+/// repeats exactly with the seed its failure message prints (see [`seeded`]); a
+/// seed of one value per process, not per call, is what makes that hold whatever
+/// order the tests run in. Rows of different tests share canaries, which is
+/// harmless: each test has its own files.
 fn run_seed() -> u64 {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    mix(nanos ^ (u64::from(std::process::id()) << 32) ^ mix(n))
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        let given = std::env::var("AITM_CORPUS_SEED")
+            .ok()
+            .and_then(|text| seed_from(&text));
+        given.unwrap_or_else(|| {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            mix(nanos ^ (u64::from(std::process::id()) << 32))
+        })
+    })
+}
+
+/// The seed `text` spells: decimal, or hexadecimal with a `0x`; blanks around it
+/// are ignored. Anything else is no seed.
+fn seed_from(text: &str) -> Option<u64> {
+    let text = text.trim();
+    match text.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
+/// `message` and how to repeat this run: every failure message of the corpus ends
+/// with this, because the canaries differ from run to run.
+fn seeded(message: impl std::fmt::Display) -> String {
+    let seed = run_seed();
+    format!("{message}\n(seed {seed:#x}: AITM_CORPUS_SEED={seed:#x} repeats this run)")
 }
 
 /// The canary of row `n`: `CNRY` + the row number as two digits + `x` + eight hex
@@ -460,7 +486,7 @@ impl Rig {
 
     /// What is wrong with the rig itself: a token that is not 64 hex digits or
     /// that the registry does not mask. A rig whose writer did not register its
-    /// tokens would run the next task's rows against nothing.
+    /// tokens would run every row against nothing.
     fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
         let registry = self.handle.registry();
@@ -1612,7 +1638,10 @@ fn generated_shape_rows(seed: u64) -> Vec<Row> {
     }
     assert!(
         n < TOKEN_ROW_BASE,
-        "the generated shape rows overran the token rows' numbers: {n}"
+        "{}",
+        seeded(format!(
+            "the generated shape rows overran the token rows' numbers: {n}"
+        ))
     );
     rows
 }
@@ -2097,7 +2126,8 @@ fn generated_token_rows(seed: u64, tokens: &Tokens) -> Vec<Row> {
     let last = next();
     assert!(
         last < TOKEN_ROW_BASE + 700,
-        "the token matrix overran: {last}"
+        "{}",
+        seeded(format!("the token matrix overran: {last}"))
     );
     rows
 }
@@ -2272,7 +2302,7 @@ impl Run {
             }
         }
 
-        let report = rig.handle.shutdown(SHUTDOWN_BUDGET);
+        let report = rig.handle.shutdown(FLUSH_TIMEOUT);
         if !report.complete {
             problems.push(format!("the writer did not flush in time: {report:?}"));
         }
@@ -2429,13 +2459,65 @@ fn read_audit_files(dir: &Path) -> Vec<Named> {
 fn assert_none(what: &str, failures: &[String]) {
     assert!(
         failures.is_empty(),
-        "{what}: {} failure(s)\n{}",
-        failures.len(),
-        failures.join("\n")
+        "{}",
+        seeded(format!(
+            "{what}: {} failure(s)\n{}",
+            failures.len(),
+            failures.join("\n")
+        ))
     );
 }
 
 // --------------------------------------------------------------------- tests
+
+/// What the test above runs this binary again to see: the seed this process has.
+#[test]
+fn print_the_seed() {
+    println!("the seed is {:#x}.", run_seed());
+}
+
+/// The seed is one value for the whole process, `AITM_CORPUS_SEED` is read in the
+/// two spellings it documents, and a failure message says how to repeat the run.
+#[test]
+fn the_seed_repeats_the_run_and_every_failure_says_how() {
+    assert_eq!(run_seed(), run_seed(), "one seed for the process");
+    assert_eq!(seed_from("1234"), Some(1234));
+    assert_eq!(seed_from(" 0x1f "), Some(31));
+    assert_eq!(seed_from("0XFF"), None, "the prefix is lower-case");
+    assert_eq!(seed_from("0xzz"), None);
+    assert_eq!(seed_from(""), None);
+    assert_eq!(seed_from("seed"), None);
+
+    // The variable reaches `run_seed`: this binary, run again with it set, reports it.
+    let exe = std::env::current_exe().expect("the path of the test binary");
+    let child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "print_the_seed",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AITM_CORPUS_SEED", "0x2a")
+        .output()
+        .expect("run the test binary again");
+    let said = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success() && said.contains("the seed is 0x2a."),
+        "the child did not report the seed it was given: {said}"
+    );
+
+    let message = seeded("the run failed");
+    let repeat = format!("AITM_CORPUS_SEED={:#x}", run_seed());
+    assert!(message.starts_with("the run failed\n"), "{message}");
+    assert!(message.contains(&repeat), "{message}");
+    let panic = std::panic::catch_unwind(|| assert_none("a probe", &["one".to_string()]))
+        .expect_err("a failure panics");
+    let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        text.contains("a probe: 1 failure(s)") && text.contains(&repeat),
+        "assert_none says how to repeat the run: {text}"
+    );
+}
 
 /// The lines of the files, as written, that hold `needle`: the file's name and
 /// the line. Every line is looked at, a line that does not parse included.
@@ -2713,7 +2795,12 @@ fn benign_values_survive_the_real_path_byte_for_byte() {
             ));
         }
     }
-    assert_eq!(checked, benign_rows().len(), "every benign row was checked");
+    assert_eq!(
+        checked,
+        benign_rows().len(),
+        "{}",
+        seeded("every benign row was checked")
+    );
     assert_none("benign values", &failures);
 }
 
@@ -2864,8 +2951,12 @@ fn fixed_point_failures(run: &Run) -> Vec<String> {
             },
         });
     }
-    let report = handle.shutdown(SHUTDOWN_BUDGET);
-    assert!(report.complete, "the second writer flushed: {report:?}");
+    let report = handle.shutdown(FLUSH_TIMEOUT);
+    assert!(
+        report.complete,
+        "{}",
+        seeded(format!("the second writer flushed: {report:?}"))
+    );
     let second_files = read_audit_files(base.parent().expect("the base has a directory"));
     let second: Vec<String> = second_files
         .iter()
@@ -2928,7 +3019,11 @@ fn corpus_args_are_idempotent_under_redact_value() {
             ));
         }
     }
-    assert!(checked > 60, "the table was walked: {checked} rows");
+    assert!(
+        checked > 60,
+        "{}",
+        seeded(format!("the table was walked: {checked} rows"))
+    );
     assert_none("idempotence of redact_value", &failures);
 }
 
@@ -3175,7 +3270,8 @@ fn a_built_poc_passes_through_the_audit_clean() {
     let yaml_args = whole_row.args["poc_text"].as_str().unwrap_or_default();
     assert!(
         json!({"poc_text": yaml_args}).to_string().len() > DEFAULT_ARGS_SUMMARY_CAP,
-        "the YAML is longer than the 512-byte cap (it is the point of the row)"
+        "{}",
+        seeded("the YAML is longer than the 512-byte cap (it is the point of the row)")
     );
     for (row, seen) in run.rows.iter().zip(&run.seen) {
         let line = match run.line_for(row) {
@@ -3374,7 +3470,7 @@ fn registered_sources_failures(streamable: bool) -> Vec<String> {
     append(json!({"note": format!("cwd {} sock {}", unmasked[1], unmasked[0])}).to_string());
     audited += 1;
 
-    let report = handle.shutdown(SHUTDOWN_BUDGET);
+    let report = handle.shutdown(FLUSH_TIMEOUT);
     if !report.complete {
         failures.push(format!("[{kind}] the writer did not flush: {report:?}"));
     }
@@ -3409,14 +3505,11 @@ fn registered_sources_failures(streamable: bool) -> Vec<String> {
     failures
 }
 
-/// FINDING (task W15, fixed by the fix task that followed it). When a
-/// cap leaves a fragment of a registered secret that is 6 to 9 bytes long, the
-/// writer masks it with the 10-byte `[redacted]` *after* it capped `args`, so the
-/// entry's `args` ends up to 4 bytes past the cap (519 bytes for a 6-byte
-/// fragment, against 512 and the 3-byte marker). Nothing leaks, but the size
-/// bound of Design 6 does not hold, and the line is not a fixed point of the
-/// writer: a second pass over it cuts the mask to `[redac…`. The writer now
-/// cuts the text before the fragment until the mask fits.
+/// When a cap leaves a fragment of a registered secret that is 6 to 9 bytes
+/// long, the mask that replaces it (`[redacted]`, 10 bytes) is longer than the
+/// fragment. The writer cuts the text before the fragment to make room, so the
+/// entry's `args` stays within the 512-byte cap and its 3-byte marker (Design 6)
+/// and a second pass over the line changes nothing.
 #[test]
 fn a_masked_short_fragment_keeps_args_within_the_cap() {
     let run = Run::execute("overrun");
@@ -3448,20 +3541,19 @@ fn a_masked_short_fragment_keeps_args_within_the_cap() {
     }
     assert!(
         checked >= 6,
-        "the rows that cut a short fragment ran: {checked}"
+        "{}",
+        seeded(format!("the rows that cut a short fragment ran: {checked}"))
     );
     assert_none("the writer's cap on args", &failures);
 }
 
-/// FINDING (task W15, fixed by the fix task that followed it). A
-/// registered secret that holds a quote or a backslash is masked in its raw form
-/// (a plain text field) and in its JSON form (inside `args`, which is JSON text),
-/// but not when it sits inside a string field that is itself JSON text, say a
-/// `body` holding a document: the writer then sees the form that escaping the JSON
-/// form once more makes (`\\\"` for `"`), which the registry does not store. A
-/// 64-hex token (what `generate_token` makes) has no such character, so the
-/// tokens the process mints are not exposed; a configured one that does have one
-/// was. The registry now stores the JSON form at depths 1 to 3.
+/// A registered secret that holds a quote or a backslash is masked in its raw
+/// form (a plain text field), in its JSON form (inside `args`, which is JSON
+/// text) and inside a string field that is itself JSON text, say a `body` holding
+/// a document: there the writer sees the form that escaping the JSON form once
+/// more makes (`\\\"` for `"`), which the registry stores (JSON depths 1 to 3).
+/// A 64-hex token (what `generate_token` makes) has no such character; a
+/// configured one that has one is covered all the same.
 #[test]
 fn a_registered_secret_with_a_quote_is_masked_inside_json_text_in_a_string() {
     let seed = run_seed();

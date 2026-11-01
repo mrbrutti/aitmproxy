@@ -159,7 +159,7 @@ pub fn stream_path(base: &Path, kind: StreamKind) -> PathBuf {
 /// exactly when the origin is trusted control (the operator and the CLI), and
 /// to `Agent` otherwise, so an origin this code has never heard of lands in
 /// the untrusted stream. Nothing here compares against the agent role.
-pub fn stream_for(lane: AuditLane, origin: Frontend) -> StreamKind {
+fn stream_for(lane: AuditLane, origin: Frontend) -> StreamKind {
     match lane {
         AuditLane::Routine => StreamKind::Reads,
         AuditLane::Evidence if origin.is_trusted_control() => StreamKind::Control,
@@ -189,7 +189,7 @@ struct FileId {
 }
 
 /// One open, append-only log file as the writer thread sees it. The real one is
-/// [`FsFile`]; later tasks' tests substitute a fake that records lines or blocks.
+/// [`FsFile`]; the writer's tests substitute a fake that records lines or blocks.
 trait LogFile: Send {
     /// Appends `line` and one `\n` with a single `write_all`, never buffered, so
     /// a reader sees the line at once and a crash tears at most the last line.
@@ -294,7 +294,7 @@ fn start_marker_line(stream: StreamKind, at_ms: i64, pid: u32) -> String {
 }
 
 /// An error that refuses to use `path`, with the reason in the message.
-fn refused(path: &Path, reason: impl std::fmt::Display) -> io::Error {
+fn io_refusal(path: &Path, reason: impl fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!("audit log {}: {reason}", path.display()),
@@ -302,7 +302,7 @@ fn refused(path: &Path, reason: impl std::fmt::Display) -> io::Error {
 }
 
 /// `source` with the path and what was being attempted put in front of it.
-fn failed(path: &Path, what: impl std::fmt::Display, source: io::Error) -> io::Error {
+fn io_context(path: &Path, what: impl fmt::Display, source: io::Error) -> io::Error {
     io::Error::new(
         source.kind(),
         format!("audit log {}: {what}: {source}", path.display()),
@@ -343,20 +343,20 @@ fn hard_links(_meta: &Metadata) -> u64 {
 fn refuse_hostile_file(path: &Path, meta: &Metadata) -> io::Result<()> {
     let kind = meta.file_type();
     if kind.is_symlink() {
-        return Err(refused(
+        return Err(io_refusal(
             path,
             "the path is a symbolic link; the writer never writes through one",
         ));
     }
     if !kind.is_file() {
-        return Err(refused(
+        return Err(io_refusal(
             path,
             "the path is not a regular file (a directory, FIFO, socket or device); it is not opened",
         ));
     }
     let links = hard_links(meta);
     if links > 1 {
-        return Err(refused(
+        return Err(io_refusal(
             path,
             format_args!(
                 "the file has {links} hard links; the writer refuses a file another path can also write"
@@ -375,7 +375,7 @@ fn refuse_hostile_file(path: &Path, meta: &Metadata) -> io::Result<()> {
 fn prepare_parent(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| refused(path, "the path has no parent directory"))?;
+        .ok_or_else(|| io_refusal(path, "the path has no parent directory"))?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -384,7 +384,7 @@ fn prepare_parent(path: &Path) -> io::Result<()> {
         builder.mode(PRIVATE_DIR_MODE);
     }
     builder.create(parent).map_err(|source| {
-        failed(
+        io_context(
             path,
             format_args!("cannot create the parent directory {}", parent.display()),
             source,
@@ -394,7 +394,7 @@ fn prepare_parent(path: &Path) -> io::Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(parent).map_err(|source| {
-            failed(
+            io_context(
                 path,
                 format_args!("cannot inspect the parent directory {}", parent.display()),
                 source,
@@ -402,7 +402,7 @@ fn prepare_parent(path: &Path) -> io::Result<()> {
         })?;
         let mode = meta.mode();
         if mode & 0o002 != 0 && mode & 0o1000 == 0 {
-            return Err(refused(
+            return Err(io_refusal(
                 path,
                 format_args!(
                     "the parent directory {} is world-writable and not sticky; another user could replace the log",
@@ -435,7 +435,7 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
         } else {
             "cannot open the file for append"
         };
-        failed(path, what, source)
+        io_context(path, what, source)
     })
 }
 
@@ -444,10 +444,11 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
 /// symbolic link since the first look is refused. Where the platform has no
 /// identity both sides read `None` and the check passes.
 fn confirm_same_file(path: &Path, opened: &Metadata) -> io::Result<()> {
-    let now = fs::symlink_metadata(path)
-        .map_err(|source| failed(path, "cannot re-inspect the path after opening it", source))?;
+    let now = fs::symlink_metadata(path).map_err(|source| {
+        io_context(path, "cannot re-inspect the path after opening it", source)
+    })?;
     if file_id(&now) != file_id(opened) {
-        return Err(refused(
+        return Err(io_refusal(
             path,
             "the path changed while it was being opened; refusing to use it",
         ));
@@ -466,7 +467,7 @@ fn restrict_to_owner(path: &Path, file: &File, meta: &Metadata) -> io::Result<()
     }
     file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
         .map_err(|source| {
-            failed(
+            io_context(
                 path,
                 "cannot restrict the file to its owner (mode 0600)",
                 source,
@@ -517,12 +518,12 @@ fn preflight(path: &Path, stream: StreamKind) -> io::Result<FsFile> {
             false
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => true,
-        Err(source) => return Err(failed(path, "cannot inspect the path", source)),
+        Err(source) => return Err(io_context(path, "cannot inspect the path", source)),
     };
     let file = open_private(path, create)?;
     let meta = file
         .metadata()
-        .map_err(|source| failed(path, "cannot inspect the opened file", source))?;
+        .map_err(|source| io_context(path, "cannot inspect the opened file", source))?;
     refuse_hostile_file(path, &meta)?;
     confirm_same_file(path, &meta)?;
     restrict_to_owner(path, &file, &meta)?;
@@ -532,7 +533,7 @@ fn preflight(path: &Path, stream: StreamKind) -> io::Result<FsFile> {
         id: file_id(&meta),
     };
     out.write_start(stream)
-        .map_err(|source| failed(path, "cannot write the start marker", source))?;
+        .map_err(|source| io_context(path, "cannot write the start marker", source))?;
     Ok(out)
 }
 
@@ -608,7 +609,7 @@ fn rotated_path(path: &Path, n: usize) -> PathBuf {
 /// numbering, and the files after the gap still move.
 fn move_aside(from: &Path, to: &Path) -> io::Result<()> {
     match fs::rename(from, to) {
-        Err(source) if source.kind() != io::ErrorKind::NotFound => Err(failed(
+        Err(source) if source.kind() != io::ErrorKind::NotFound => Err(io_context(
             from,
             format_args!("cannot rename it to {}", to.display()),
             source,
@@ -629,17 +630,18 @@ fn shift_rotated_files(path: &Path, keep: usize) -> io::Result<()> {
     let keep = keep.max(1);
     let oldest = rotated_path(path, keep);
     match fs::symlink_metadata(&oldest) {
-        Ok(meta) if meta.file_type().is_file() => fs::remove_file(&oldest)
-            .map_err(|source| failed(&oldest, "cannot delete the oldest rotated file", source))?,
+        Ok(meta) if meta.file_type().is_file() => fs::remove_file(&oldest).map_err(|source| {
+            io_context(&oldest, "cannot delete the oldest rotated file", source)
+        })?,
         Ok(_) => {
-            return Err(refused(
+            return Err(io_refusal(
                 &oldest,
                 "the oldest rotated slot is not a regular file; rotation never deletes one",
             ))
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
-            return Err(failed(
+            return Err(io_context(
                 &oldest,
                 "cannot inspect the oldest rotated slot",
                 source,
@@ -919,6 +921,11 @@ struct StreamShared {
     closed: AtomicBool,
     /// The thread ended any other way: it panicked, or every sender is gone.
     dead: AtomicBool,
+    /// A rotation failed and none has succeeded since: the file grows past its
+    /// cap, and past twice its cap lines are refused (spec Design 8). A flag of
+    /// its own, not `degraded`, because a line that is still written clears
+    /// `degraded` and the wedge outlives that line.
+    rotation_wedged: AtomicBool,
     /// Entries accepted by `record` and not yet written.
     queued: AtomicUsize,
     /// A shutdown has begun: `record` refuses every entry from now on, so none
@@ -983,8 +990,9 @@ impl StreamEnds {
 
     /// [`offer`](Self::offer) that runs `between` once the entry has passed
     /// every check and before it is sent: the one point at which a shutdown can
-    /// begin without the entry knowing. A test holds a call there; `offer`
-    /// passes nothing.
+    /// begin without the entry knowing. The test
+    /// `a_record_caught_by_a_shutdown_mid_call_is_written_not_stranded` holds a call
+    /// there; `offer` passes nothing.
     fn offer_after_check(&self, entry: AuditEntry, between: impl FnOnce()) -> bool {
         let shared = &self.shared;
         if shared.closing.load(Ordering::SeqCst) {
@@ -1047,13 +1055,25 @@ fn copy_error(error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), error.to_string())
 }
 
+/// What `write_through` did with the line it was given.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    /// The line, and the pending `gap` marker before it if there was one, are in
+    /// the file.
+    Written,
+    /// Nothing was written: a rotation is wedged and the file is at its ceiling.
+    HeldBack,
+}
+
 /// What one stream's thread owns while it runs: its file and the policy for
 /// when the file goes wrong (spec Design 9) and when it is full (spec Design 8).
 /// Best effort and one attempt per entry: a failed write loses that entry, closes
 /// the file and marks the hole; the next entry reopens it if the reopen interval
 /// has passed and fails fast otherwise, so a broken disk costs one `open` an
 /// interval, not one per entry. A file at its cap is rotated before the line that
-/// would overflow it is written, and a rotation that fails costs no line.
+/// would overflow it is written, and a rotation that fails costs no line until the
+/// file is at twice its cap: from there lines are refused, and counted, for as long
+/// as the rotation stays wedged.
 struct StreamWriter<'a> {
     kind: StreamKind,
     spec: StreamSpec,
@@ -1122,7 +1142,8 @@ impl<'a> StreamWriter<'a> {
     fn write_entry(&mut self, entry: &AuditEntry) {
         let line = pipeline::render_line(entry, &self.shared.registry);
         match self.try_write(&line) {
-            Ok(()) => self.succeeded(),
+            Ok(Placed::Written) => self.succeeded(),
+            Ok(Placed::HeldBack) => self.held_back(entry.at_millis()),
             Err(error) => self.failed(entry.at_millis(), &error),
         }
     }
@@ -1130,7 +1151,7 @@ impl<'a> StreamWriter<'a> {
     /// Reopens the file when there is none and it is time; with a file, checks
     /// that the path still names it when the re-check interval has passed. Then
     /// writes. A write that fails closes the file and starts the reopen interval.
-    fn try_write(&mut self, line: &str) -> io::Result<()> {
+    fn try_write(&mut self, line: &str) -> io::Result<Placed> {
         if self.spec.file.is_none() {
             self.reopen_file()?;
         } else if self.last_recheck.elapsed() >= self.recheck {
@@ -1159,11 +1180,16 @@ impl<'a> StreamWriter<'a> {
     }
 
     /// Opens the file now, whatever the reopen interval says. A failure starts
-    /// the interval again and is what an entry that fails fast reports.
+    /// the interval again and is what an entry that fails fast reports. A file
+    /// opened afresh ends a wedge: it is not the one a rotation could not move
+    /// (a rotation that stopped half way is repaired by this, and the next one to
+    /// fail wedges the stream again).
     fn open_file(&mut self) -> io::Result<()> {
         match self.spec.backend.open(&self.spec.path, self.kind) {
             Ok(file) => {
                 self.spec.file = Some(file);
+                self.last_rotation_failure = None;
+                self.shared.rotation_wedged.store(false, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
@@ -1206,7 +1232,7 @@ impl<'a> StreamWriter<'a> {
             Recheck::Refused(reason) => {
                 self.spec.file = None;
                 self.last_open_attempt = Instant::now();
-                self.last_error = refused(&self.spec.path, reason);
+                self.last_error = io_refusal(&self.spec.path, reason);
                 false
             }
         }
@@ -1220,7 +1246,10 @@ impl<'a> StreamWriter<'a> {
     /// A marker whose own write fails goes back into the pending gap, so the
     /// hole is still reported by the next write that succeeds, and the error is
     /// returned for the entry to be counted as failed.
-    fn write_through(&mut self, line: Option<&str>) -> io::Result<()> {
+    ///
+    /// While a rotation is wedged nothing is written that would take the file past
+    /// twice its cap ([`Placed::HeldBack`]); the pending marker stays pending.
+    fn write_through(&mut self, line: Option<&str>) -> io::Result<Placed> {
         let shared = self.shared;
         // The guard lives for this statement only: the lock is never held across I/O.
         let pending = shared.lock_gap().take();
@@ -1228,13 +1257,22 @@ impl<'a> StreamWriter<'a> {
         let incoming = marker.as_ref().map_or(0, |marker| marker.len() + 1)
             + line.map_or(0, |line| line.len() + 1);
         if incoming == 0 {
-            return Ok(());
+            return Ok(Placed::Written);
         }
         self.rotate_if_due(incoming as u64);
-        let Some(file) = self.spec.file.as_mut() else {
+        let Some(file) = self.spec.file.as_ref() else {
             if let Some(gap) = pending {
                 shared.lock_gap().merge(gap);
             }
+            return Err(copy_error(&self.last_error));
+        };
+        if self.past_ceiling(file.size(), incoming as u64) {
+            if let Some(gap) = pending {
+                shared.lock_gap().merge(gap);
+            }
+            return Ok(Placed::HeldBack);
+        }
+        let Some(file) = self.spec.file.as_mut() else {
             return Err(copy_error(&self.last_error));
         };
         if let Some(marker) = marker {
@@ -1246,9 +1284,21 @@ impl<'a> StreamWriter<'a> {
             }
         }
         match line {
-            Some(line) => file.append_line(line),
-            None => Ok(()),
+            Some(line) => file.append_line(line).map(|()| Placed::Written),
+            None => Ok(Placed::Written),
         }
+    }
+
+    /// Whether `incoming` more bytes would take a file of `size` bytes past the
+    /// ceiling: twice its cap, enforced only while a rotation is wedged (a file
+    /// that rotates is bounded by its cap and its rotated files, and a rotation
+    /// that has not failed has no reason to be doubted). An empty file takes
+    /// whatever comes, as `rotate_if_due` does: a line bigger than the ceiling is
+    /// the only thing it would hold.
+    fn past_ceiling(&self, size: u64, incoming: u64) -> bool {
+        self.last_rotation_failure.is_some()
+            && size > 0
+            && size.saturating_add(incoming) > self.cap_bytes.saturating_mul(2)
     }
 
     /// Rotates the file when it holds something and `incoming` more bytes would
@@ -1258,8 +1308,9 @@ impl<'a> StreamWriter<'a> {
     ///
     /// A success replaces the file: the line is then written to the new one. A
     /// failure keeps the old file, which the line is written to all the same (the
-    /// cap is soft while rotation fails), starts the retry interval and logs
-    /// through the stream's throttle. It is not a write failure.
+    /// cap is soft while rotation fails, up to the ceiling of twice the cap that
+    /// `write_through` holds), starts the retry interval, marks the stream wedged
+    /// and logs through the stream's throttle. It is not a write failure.
     ///
     /// The path is checked before every rotation (spec Design 8): renaming
     /// whatever is at the path, when it is not the file the stream has been
@@ -1298,9 +1349,11 @@ impl<'a> StreamWriter<'a> {
             Ok(fresh) => {
                 self.spec.file = Some(fresh);
                 self.last_rotation_failure = None;
+                self.shared.rotation_wedged.store(false, Ordering::Release);
             }
             Err(error) => {
                 self.last_rotation_failure = Some(now);
+                self.shared.rotation_wedged.store(true, Ordering::Release);
                 if let Some(suppressed) = self.throttle.admit(now) {
                     // The path and the error, never a field of the entry.
                     warn!(
@@ -1310,7 +1363,7 @@ impl<'a> StreamWriter<'a> {
                         error_kind = ?error.kind(),
                         error = %error,
                         suppressed,
-                        "an audit log rotation failed; lines go to the current file, over its size cap, and the rotation is retried later"
+                        "an audit log rotation failed; lines go to the current file, over its size cap and up to twice it (then they are refused), and the rotation is retried later"
                     );
                 }
             }
@@ -1325,6 +1378,7 @@ impl<'a> StreamWriter<'a> {
     /// nothing is counted again.
     fn finish(&mut self) {
         if self.spec.file.is_some() {
+            // A marker held back by the ceiling stays with the counters.
             let _ = self.write_through(None);
         }
         if let Some(file) = self.spec.file.as_mut() {
@@ -1353,6 +1407,14 @@ impl<'a> StreamWriter<'a> {
                 "an audit log entry was lost to a write error; the stream retries"
             );
         }
+    }
+
+    /// The entry written at `at_ms` was refused: the rotation is wedged and the
+    /// file is at its ceiling. It counts as dropped and goes into the pending
+    /// `gap`, so the marker says so when a rotation succeeds; it is never written.
+    fn held_back(&mut self, at_ms: i64) {
+        self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+        self.shared.lock_gap().note_drop(at_ms);
     }
 
     /// An entry was written: the first one after a failure ends the degraded
@@ -1428,7 +1490,7 @@ impl Deadline {
 /// one thread that owns its file, so a stream that stalls or floods cannot slow
 /// the call path or another stream: [`record`](DurableAudit::record) is a
 /// `try_send` and nothing else.
-pub struct AuditLogWriter {
+struct AuditLogWriter {
     streams: [StreamEnds; 3],
     /// The streams' threads until a shutdown takes them, so `shutdown` works
     /// through `&self`.
@@ -1461,7 +1523,7 @@ impl AuditLogWriter {
 
     /// The registry the stream threads mask with, empty at first. A secret
     /// registered through it is masked in every line written from then on.
-    pub fn registry(&self) -> &Arc<SecretRegistry> {
+    fn registry(&self) -> &Arc<SecretRegistry> {
         &self.registry
     }
 
@@ -1472,7 +1534,7 @@ impl AuditLogWriter {
     /// budget ends (a write that is stuck) is left running and the report says
     /// so; the caller exits regardless. A later call waits for the threads
     /// still left and reports on them; once none is left it reports complete.
-    pub fn shutdown(&self, budget: Duration) -> ShutdownReport {
+    fn shutdown(&self, budget: Duration) -> ShutdownReport {
         let handles = std::mem::take(&mut *self.lock_threads());
         if handles.is_empty() {
             return ShutdownReport {
@@ -1572,8 +1634,8 @@ impl DurableAudit for AuditLogWriter {
     }
 
     /// The counters summed over the streams. `degraded` is true when any stream
-    /// is dead or its latest write failed; a stream that ended through a `Close`
-    /// is closed, not degraded.
+    /// is dead, its latest write failed or its rotation is wedged; a stream that
+    /// ended through a `Close` is closed, not degraded.
     fn status(&self) -> DurableAuditStatus {
         let mut status = DurableAuditStatus::default();
         for stream in &self.streams {
@@ -1584,8 +1646,9 @@ impl DurableAudit for AuditLogWriter {
             status.write_failures = status
                 .write_failures
                 .saturating_add(shared.write_failures.load(Ordering::Relaxed));
-            status.degraded |=
-                shared.degraded.load(Ordering::Acquire) || shared.dead.load(Ordering::Acquire);
+            status.degraded |= shared.degraded.load(Ordering::Acquire)
+                || shared.dead.load(Ordering::Acquire)
+                || shared.rotation_wedged.load(Ordering::Acquire);
         }
         status
     }
@@ -1653,13 +1716,12 @@ fn is_benign_env_value(value: &str) -> bool {
 #[derive(Clone)]
 pub struct AuditLogHandle {
     writer: Arc<AuditLogWriter>,
-    registry: Arc<SecretRegistry>,
 }
 
 impl fmt::Debug for AuditLogHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuditLogHandle")
-            .field("secrets", &self.registry.len())
+            .field("secrets", &self.writer.registry().len())
             .finish()
     }
 }
@@ -1667,13 +1729,13 @@ impl fmt::Debug for AuditLogHandle {
 impl AuditLogHandle {
     /// The registry the writer masks with.
     pub fn registry(&self) -> &Arc<SecretRegistry> {
-        &self.registry
+        self.writer.registry()
     }
 
     /// Registers `secret` (from the place `source` names) with the writer, which
     /// masks it in every field it writes from now on.
     pub fn register_secret(&self, source: &str, secret: &str) -> Registration {
-        self.registry.register(source, secret)
+        self.writer.registry().register(source, secret)
     }
 
     /// Mints the per-run operator bridge token (`web::generate_token`) and
@@ -1682,12 +1744,13 @@ impl AuditLogHandle {
     /// [`bridge_token`]) in place of `web::generate_token`.
     pub fn generate_bridge_token(&self) -> String {
         let token = crate::web::generate_token();
-        self.registry.register(BRIDGE_TOKEN_SOURCE, &token);
+        self.writer.registry().register(BRIDGE_TOKEN_SOURCE, &token);
         token
     }
 
-    /// Flushes and stops the writer within `budget`; see
-    /// [`AuditLogWriter::shutdown`].
+    /// Flushes and stops the writer within `budget`: stops it taking entries,
+    /// writes what is queued and syncs each file, and says what was left if the
+    /// budget ran out first.
     pub fn shutdown(&self, budget: Duration) -> ShutdownReport {
         self.writer.shutdown(budget)
     }
@@ -1739,6 +1802,9 @@ pub fn start(
 /// equal to `ca_log` is an error in both modes, and nothing is created.
 ///
 /// A ring takes one sink: a second writer for the same ring is an error.
+///
+/// Used by tests, which name the base path directly.
+#[doc(hidden)]
 pub fn start_at(
     ring: &Arc<AuditRing>,
     base: &Path,
@@ -1848,6 +1914,70 @@ fn open_stream(kind: StreamKind, base: &Path, explicit: bool) -> anyhow::Result<
     })
 }
 
+/// The first file a stream writes (its active file, or a rotated file it keeps:
+/// `F.1` to `F.keep`) that is the CA audit log, as the stream, the path it writes
+/// and whether it is a rotated one. The comparison is of the files: see
+/// [`resolved`].
+fn ca_log_collision(
+    base: &Path,
+    ca_log: &Path,
+    tuning: &Tuning,
+) -> Option<(StreamKind, PathBuf, bool)> {
+    let ca_log = resolved(ca_log);
+    StreamKind::ALL.into_iter().find_map(|kind| {
+        let active = stream_path(base, kind);
+        if resolved(&active) == ca_log {
+            return Some((kind, active, false));
+        }
+        (1..=tuning.keep[kind.index()]).find_map(|n| {
+            let rotated = rotated_path(&active, n);
+            (resolved(&rotated) == ca_log).then_some((kind, rotated, true))
+        })
+    })
+}
+
+/// `path` made absolute and with every link and `..` in it resolved as far as
+/// the file system can say: the longest ancestor that exists is canonicalised and
+/// the rest, which does not exist and so is no link, is appended with its `.` and
+/// `..` removed. Two spellings of one file give one path (`<d>/sub/../a`,
+/// `<d>/link-to-d/a`, `<d>/a`), whether or not the file or the directories in
+/// front of it are there yet.
+fn resolved(path: &Path) -> PathBuf {
+    let absolute = if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(here) => here.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let mut head = absolute.clone();
+    // The components cut off the end, last first.
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = fs::canonicalize(&head) {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                if part == ".." {
+                    out.pop();
+                } else if part != "." {
+                    out.push(part);
+                }
+            }
+            return out;
+        }
+        match head.components().next_back() {
+            Some(std::path::Component::Normal(name)) => rest.push(name.to_os_string()),
+            Some(std::path::Component::ParentDir) => rest.push("..".into()),
+            Some(std::path::Component::CurDir) => rest.push(".".into()),
+            _ => return absolute,
+        }
+        if !head.pop() {
+            return absolute;
+        }
+    }
+}
+
 /// The boot, in order: refuse a stream path that is the CA audit log; open each
 /// stream (control, agent, reads) under the boot policy; start the writer;
 /// register every secret; attach the sink; say one line when every stream is open.
@@ -1859,15 +1989,18 @@ fn start_core(
     tuning: Tuning,
     secrets: Vec<(String, String)>,
 ) -> anyhow::Result<Option<AuditLogHandle>> {
-    for kind in StreamKind::ALL {
-        let path = stream_path(base, kind);
-        if path == ca_log {
-            anyhow::bail!(
-                "the {} stream of the audit log would be {}, which is ca.audit_log: the CA audit log and the general audit log are different logs and must not share a file; move mcp.audit_log or ca.audit_log",
-                kind.label(),
-                path.display()
-            );
-        }
+    if let Some((kind, path, rotated)) = ca_log_collision(base, ca_log, &tuning) {
+        let what = if rotated {
+            "would rotate its file to"
+        } else {
+            "would be"
+        };
+        anyhow::bail!(
+            "the {} stream of the audit log {what} {}, which is ca.audit_log ({}): the CA audit log and the general audit log are different logs and must not share a file; move mcp.audit_log or ca.audit_log",
+            kind.label(),
+            path.display(),
+            ca_log.display()
+        );
     }
     let control = open_stream(StreamKind::Control, base, explicit)?;
     let agent = open_stream(StreamKind::Agent, base, explicit)?;
@@ -1908,10 +2041,7 @@ fn start_core(
             "durable audit log on"
         );
     }
-    Ok(Some(AuditLogHandle {
-        registry: Arc::clone(writer.registry()),
-        writer,
-    }))
+    Ok(Some(AuditLogHandle { writer }))
 }
 
 #[cfg(test)]
@@ -2029,6 +2159,11 @@ mod tests {
             .map(str::to_string)
             .collect()
     }
+
+    /// How long a test waits for something another thread does. Far above what it
+    /// takes: a wait that ends early costs nothing, and one that is too short fails
+    /// on a loaded machine.
+    const WAIT: Duration = Duration::from_secs(10);
 
     /// Polls `cond` every 5 ms until it holds or `timeout` passes. Never a fixed
     /// sleep: a fast machine finishes at once.
@@ -2176,7 +2311,7 @@ mod tests {
         );
     }
 
-    /// `index` is the position in `ALL` (later tasks index arrays with it) and
+    /// `index` is the position in `ALL` (the per-stream arrays are indexed with it) and
     /// `label` names the stream in thread names and log lines.
     #[test]
     fn stream_index_and_label_name_each_stream() {
@@ -2612,7 +2747,7 @@ mod tests {
         );
     }
 
-    // ---- the writer core (Task W5) -------------------------------------
+    // ---- the writer core ------------------------------------------------
 
     /// How long a test gives a shutdown that has real work to do.
     const FLUSH_BUDGET: Duration = Duration::from_secs(5);
@@ -2691,8 +2826,8 @@ mod tests {
     }
 
     /// What a fake log file remembers and how it misbehaves, shared with the
-    /// test through an `Arc`. Used from here on by the tasks that script a
-    /// failing or a stalled disk.
+    /// test through an `Arc`. The tests that script a failing or a stalled disk
+    /// use it.
     #[derive(Default)]
     struct FakeState {
         /// Every line written, without its newline.
@@ -3045,34 +3180,31 @@ mod tests {
     }
 
     /// AC30: a writer stuck inside a write cannot hold a shutdown past its
-    /// budget, and the report says entries are left.
+    /// budget: the call returns while the write is still stuck, and the report says
+    /// entries are left. (That it returned with the thread unfinished is the
+    /// property; no clock is read, so a loaded machine cannot fail it.)
     #[test]
     fn shutdown_of_a_blocked_writer_returns_within_its_budget() {
         let states = [FakeState::plain(), FakeState::gated(), FakeState::plain()];
         let writer = fake_writer(&states, Tuning::production());
         writer.record(AuditLane::Evidence, entry("blocked", Frontend::Mcp, 1));
         assert!(
-            wait_until(Duration::from_secs(2), || states[1].inside()),
+            wait_until(WAIT, || states[1].inside()),
             "the agent writer never reached its write"
         );
 
-        let started = Instant::now();
         let report = writer.shutdown(Duration::from_millis(300));
-        let took = started.elapsed();
         // Let the stuck thread go before any assertion can fail, so it can exit.
         states[1].release();
 
-        assert!(took < Duration::from_millis(1500), "shutdown took {took:?}");
-        assert!(!report.complete);
+        assert!(!report.complete, "the stuck write was waited for");
         assert!(
             report.estimated_left >= 1,
             "estimated_left is {}",
             report.estimated_left
         );
         assert!(
-            wait_until(Duration::from_secs(2), || {
-                states[1].syncs.load(Ordering::SeqCst) == 1
-            }),
+            wait_until(WAIT, || { states[1].syncs.load(Ordering::SeqCst) == 1 }),
             "after the release the writer did not process its Close"
         );
     }
@@ -3091,9 +3223,7 @@ mod tests {
         writer.record(AuditLane::Evidence, entry("failed1", Frontend::Mcp, 1));
         writer.record(AuditLane::Evidence, entry("failed2", Frontend::Mcp, 2));
         assert!(
-            wait_until(Duration::from_secs(2), || {
-                writer.status().write_failures == 2
-            }),
+            wait_until(WAIT, || { writer.status().write_failures == 2 }),
             "the two failing writes were not processed: {:?}",
             writer.status()
         );
@@ -3102,7 +3232,7 @@ mod tests {
         writer.record(AuditLane::Evidence, entry("stuck", Frontend::Mcp, 3));
         writer.record(AuditLane::Evidence, entry("waiting", Frontend::Mcp, 4));
         assert!(
-            wait_until(Duration::from_secs(2), || states[1].inside()),
+            wait_until(WAIT, || states[1].inside()),
             "the agent writer never reached its write"
         );
         let report = writer.shutdown(Duration::from_millis(200));
@@ -3236,7 +3366,7 @@ mod tests {
         writer.record(AuditLane::Evidence, entry("lost1", Frontend::Mcp, 1));
         writer.record(AuditLane::Evidence, entry("lost2", Frontend::Mcp, 2));
         assert!(
-            wait_until(Duration::from_secs(2), || {
+            wait_until(WAIT, || {
                 let status = writer.status();
                 status.write_failures == 2 && status.degraded
             }),
@@ -3246,7 +3376,7 @@ mod tests {
 
         writer.record(AuditLane::Evidence, entry("kept", Frontend::Mcp, 3));
         assert!(
-            wait_until(Duration::from_secs(2), || {
+            wait_until(WAIT, || {
                 !writer.status().degraded && states[1].lines().len() == 2
             }),
             "a successful write did not clear degraded: {:?}",
@@ -3323,7 +3453,7 @@ mod tests {
 
         writer.record(AuditLane::Evidence, entry("boom", Frontend::Mcp, 1));
         assert!(
-            wait_until(Duration::from_secs(2), || writer.status().degraded),
+            wait_until(WAIT, || writer.status().degraded),
             "a dead writer thread did not degrade the writer"
         );
         assert_eq!(writer.status().dropped, 0, "nothing dropped yet");
@@ -3341,7 +3471,7 @@ mod tests {
         assert_eq!(states[0].lines().len(), 1, "the control stream still wrote");
     }
 
-    // ---- drop-newest and gap markers (Task W6) -------------------------
+    // ---- drop-newest and gap markers ------------------------------------
 
     /// The clock the gap tests build their entries' `at` from, so a marker's
     /// `from` and `to` can be asserted exactly.
@@ -3381,7 +3511,7 @@ mod tests {
         let writer = fake_writer(&states, tuning);
         writer.record(AuditLane::Evidence, agent_entry(0));
         assert!(
-            wait_until(Duration::from_secs(2), || states[1].inside()),
+            wait_until(WAIT, || states[1].inside()),
             "the agent writer never reached its write"
         );
         (states, writer, release)
@@ -3527,7 +3657,7 @@ mod tests {
 
         ring.append_in(AuditLane::Evidence, agent_entry(0));
         assert!(
-            wait_until(Duration::from_secs(2), || agent_state.inside()),
+            wait_until(WAIT, || agent_state.inside()),
             "the agent writer never reached its write"
         );
         let flood = ring.clone();
@@ -3558,7 +3688,7 @@ mod tests {
                 .unwrap_or(0)
         };
         assert!(
-            wait_until(Duration::from_secs(2), || {
+            wait_until(WAIT, || {
                 entries_in(&paths[0]) == 10 && entries_in(&paths[2]) == 10
             }),
             "control holds {} entries and reads {}, expected 10 each",
@@ -3783,9 +3913,7 @@ mod tests {
             writer.record(lane, entry(&format!("{name}0"), origin, BASE_MS));
         }
         assert!(
-            wait_until(Duration::from_secs(2), || states
-                .iter()
-                .all(|state| state.inside())),
+            wait_until(WAIT, || states.iter().all(|state| state.inside())),
             "a writer never reached its write"
         );
         for (lane, origin, name) in rows {
@@ -3827,9 +3955,7 @@ mod tests {
         states[1].fail_next.store(1, Ordering::SeqCst);
         states[1].release();
         assert!(
-            wait_until(Duration::from_secs(2), || {
-                writer.status().write_failures == 1
-            }),
+            wait_until(WAIT, || { writer.status().write_failures == 1 }),
             "the failed gap write was not counted: {:?}",
             writer.status()
         );
@@ -3871,7 +3997,7 @@ mod tests {
             }
         );
         // The refused entry is not on disk, but the hole it left is: nothing was
-        // written after it, so the shutdown itself writes the marker (Task W8).
+        // written after it, so the shutdown itself writes the marker.
         assert_eq!(
             fake_shape(&states[1]),
             ["a0", "gap"],
@@ -3902,9 +4028,7 @@ mod tests {
             let writer = writer.clone();
             closer = Some(std::thread::spawn(move || writer.shutdown(FLUSH_BUDGET)));
             assert!(
-                wait_until(Duration::from_secs(2), || {
-                    agent.shared.closing.load(Ordering::SeqCst)
-                }),
+                wait_until(WAIT, || { agent.shared.closing.load(Ordering::SeqCst) }),
                 "the shutdown never began"
             );
         });
@@ -3951,9 +4075,7 @@ mod tests {
                 })
             })
             .collect();
-        let started = wait_until(Duration::from_secs(5), || {
-            fake_entry_count(&states[1]) >= 200
-        });
+        let started = wait_until(WAIT, || fake_entry_count(&states[1]) >= 200);
 
         let report = writer.shutdown(FLUSH_BUDGET);
         stop.store(true, Ordering::Relaxed);
@@ -4008,7 +4130,7 @@ mod tests {
         assert_eq!(fake_shape(&states[1]), ["a0"]);
     }
 
-    // ---- the runtime error policy (Task W7) ----------------------------
+    // ---- the runtime error policy ---------------------------------------
 
     /// AC20: a write error loses that entry, closes the file and marks the hole;
     /// the next entry reopens the stream, and its line is preceded by one `gap`
@@ -4025,9 +4147,7 @@ mod tests {
             writer.record(AuditLane::Evidence, control_entry(i));
         }
         assert!(
-            wait_until(Duration::from_secs(2), || {
-                writer.status().write_failures == 5
-            }),
+            wait_until(WAIT, || { writer.status().write_failures == 5 }),
             "five failures were not reported: {:?}",
             writer.status()
         );
@@ -4091,9 +4211,7 @@ mod tests {
             for i in 1..=3 {
                 writer.record(AuditLane::Evidence, agent_entry(i));
             }
-            let counted = wait_until(Duration::from_secs(2), || {
-                writer.status().write_failures == 3
-            });
+            let counted = wait_until(WAIT, || writer.status().write_failures == 3);
             let status = writer.status();
             let opens = states[1].open_calls.load(Ordering::SeqCst);
             let report = writer.shutdown(FLUSH_BUDGET);
@@ -4138,7 +4256,7 @@ mod tests {
         let writer = fake_writer(&states, Tuning::production());
         writer.record(AuditLane::Evidence, agent_entry(1));
         assert!(
-            wait_until(Duration::from_secs(2), || writer.status().degraded),
+            wait_until(WAIT, || writer.status().degraded),
             "a dead writer thread did not degrade the writer"
         );
 
@@ -4159,9 +4277,10 @@ mod tests {
     /// A moment far enough back that a reopen interval of a few seconds has
     /// passed since it, for the tests that drive a [`StreamWriter`] by hand.
     fn long_ago() -> Instant {
-        Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .expect("the machine has been up for ten seconds")
+        let now = Instant::now();
+        // A machine that started less than ten seconds ago has no such moment; the
+        // tests then get no head start and fail on their own assertions.
+        now.checked_sub(Duration::from_secs(10)).unwrap_or(now)
     }
 
     /// A [`StreamWriter`] over `state`, with its file open or not, whose reopen
@@ -4203,13 +4322,14 @@ mod tests {
         let shared = StreamShared::default();
         let mut writer = hand_driven(&state, true, &shared);
 
+        let before = Instant::now();
         writer.write_entry(&agent_entry(1));
         assert!(
             writer.spec.file.is_none(),
             "the failed write closed the file"
         );
         assert!(
-            writer.last_open_attempt.elapsed() < Duration::from_secs(1),
+            writer.last_open_attempt >= before,
             "the failure started the reopen interval"
         );
 
@@ -4370,7 +4490,7 @@ mod tests {
             "aitm::audit",
             "/fake/log-test/the-file.jsonl",
             "StorageFull",
-            // The error's own text, not only its kind (Task W8).
+            // The error's own text, not only its kind.
             "the fake disk is full",
             "suppressed=0",
         ] {
@@ -4397,7 +4517,7 @@ mod tests {
         );
     }
 
-    // ---- rotation and retention (Task W8) ------------------------------
+    // ---- rotation and retention -----------------------------------------
 
     /// Real files, a cap of 2048 bytes and `keep` rotated files per stream.
     fn rotating(keep: usize) -> Tuning {
@@ -4647,8 +4767,11 @@ mod tests {
     }
 
     /// AC25: a rotation that cannot rename or create never costs a line: every
-    /// line goes to the file that is still open, which grows past the cap, and a
-    /// failed rotation is not a write failure.
+    /// line goes to the file that is still open, which grows past the cap (12
+    /// lines of 250 bytes against a cap of 2048: past the cap, under the ceiling
+    /// of twice the cap that `a_wedged_rotation_holds_the_file_to_twice_its_cap`
+    /// covers), and a failed rotation is not a write failure; it does leave the
+    /// writer `degraded` while it lasts.
     #[cfg(unix)]
     #[test]
     fn a_failed_rotation_never_drops_the_line() {
@@ -4659,7 +4782,7 @@ mod tests {
             writer.shutdown(FLUSH_BUDGET);
             return;
         }
-        record_fat(&ring, 100);
+        record_fat(&ring, 12);
         let report = writer.shutdown(FLUSH_BUDGET);
         unlock_directory(&dir.0);
         assert!(report.complete, "the flush did not finish: {report:?}");
@@ -4667,8 +4790,8 @@ mod tests {
         let agent = &paths[1];
         assert_eq!(
             entry_commands(agent),
-            names("c", 100),
-            "all 100 lines are in the active file"
+            names("c", 12),
+            "all 12 lines are in the active file"
         );
         let len = fs::metadata(agent).expect("the active file").len();
         assert!(
@@ -4679,11 +4802,11 @@ mod tests {
         assert_eq!(
             writer.status(),
             DurableAuditStatus {
-                degraded: false,
+                degraded: true,
                 dropped: 0,
                 write_failures: 0
             },
-            "a failed rotation is not a write failure"
+            "a failed rotation is not a write failure, and costs no line under the ceiling"
         );
     }
 
@@ -4739,7 +4862,7 @@ mod tests {
         fs::write(slot.join("keep-me"), "precious").expect("fill the directory");
 
         let (ring, writer, _paths) = fs_writer(&dir, rotating(2));
-        record_fat(&ring, 100);
+        record_fat(&ring, 12);
         let report = writer.shutdown(FLUSH_BUDGET);
         assert!(report.complete, "the flush did not finish: {report:?}");
 
@@ -4757,7 +4880,7 @@ mod tests {
         );
         assert_eq!(
             entry_commands(&agent),
-            names("c", 100),
+            names("c", 12),
             "no line was lost to the failed rotation"
         );
         assert_eq!(writer.status().write_failures, 0);
@@ -4794,9 +4917,19 @@ mod tests {
             skipped("a_failed_rotation_is_retried_once_per_interval (running as root)");
             return;
         };
-        assert_eq!((once, kept), (1, 100), "an hour between tries: one try");
-        let (every_line, kept) = run(Duration::ZERO).expect("the first run was not skipped");
-        assert_eq!(kept, 100, "no line lost");
+        // What fits under the ceiling of twice the cap (4096 bytes) is written, the
+        // rest refused: the same either way, so the retry interval is all that
+        // differs between the two runs.
+        assert_eq!(once, 1, "an hour between tries: one try");
+        assert!(
+            (9..100).contains(&kept),
+            "past the cap, under the ceiling: {kept} lines"
+        );
+        let (every_line, kept_again) = run(Duration::ZERO).expect("the first run was not skipped");
+        assert_eq!(
+            kept_again, kept,
+            "the interval does not change what is written"
+        );
         assert!(
             every_line > 10,
             "no wait between tries: expected a try per line past the cap, got {every_line}"
@@ -4820,26 +4953,30 @@ mod tests {
             writer.shutdown(FLUSH_BUDGET);
             return;
         }
-        for i in 0..20 {
+        // Twelve lines: past the cap of 2048, under the ceiling of twice it.
+        for i in 0..12 {
             ring.append_in(AuditLane::Evidence, fat_entry(i));
         }
         let agent = paths[1].clone();
-        let written = wait_until(Duration::from_secs(2), || {
+        let written = wait_until(WAIT, || {
             fs::read_to_string(&agent)
-                .map(|text| text.lines().filter(|l| l.contains("\"command\"")).count() == 20)
+                .map(|text| text.lines().filter(|l| l.contains("\"command\"")).count() == 12)
                 .unwrap_or(false)
         });
+        let degraded_while_locked = writer.status().degraded;
         unlock_directory(&dir.0);
-        assert!(written, "the first twenty lines were not written");
-        for i in 20..40 {
+        assert!(written, "the first twelve lines were not written");
+        assert!(degraded_while_locked, "a rotation that fails is degraded");
+        for i in 12..24 {
             ring.append_in(AuditLane::Evidence, fat_entry(i));
         }
         let report = writer.shutdown(FLUSH_BUDGET);
         assert!(report.complete, "the flush did not finish: {report:?}");
+        assert!(!writer.status().degraded, "a rotation that succeeds is not");
 
         let files = stream_files(&agent);
         let commands: Vec<String> = files.iter().flat_map(|file| entry_commands(file)).collect();
-        assert_eq!(commands, names("c", 40), "every line once, in order");
+        assert_eq!(commands, names("c", 24), "every line once, in order");
         assert!(
             files.len() >= 2,
             "the file rotated once the directory allowed it"
@@ -4852,12 +4989,144 @@ mod tests {
         assert_eq!(writer.status().write_failures, 0);
     }
 
+    /// Plants a symbolic link at `path`, where a rotation looks for the oldest
+    /// rotated file: a rotation stops there before it renames anything, on every
+    /// try, and so is wedged for as long as the link is.
+    #[cfg(unix)]
+    fn plant_wedge(path: &Path, dir: &Scratch) {
+        std::os::unix::fs::symlink(dir.join("elsewhere"), path).expect("plant the link");
+    }
+
+    /// Spec Design 8 and 9: while a rotation keeps failing the file is held to
+    /// twice its cap, not left to grow without bound. A symbolic link at the
+    /// oldest slot makes every rotation fail; 600 lines of 250 bytes against a
+    /// cap of 2048 leave the file at no more than 4096 bytes, the lines that
+    /// would take it past that are refused (counted as `dropped`, never written),
+    /// what is in the file is the first lines in order, and the status says
+    /// `degraded` although no write failed. The link is not touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_rotation_holds_the_file_to_twice_its_cap() {
+        let dir = scratch("rotate-wedged");
+        let agent = stream_path(&dir.join("audit.jsonl"), StreamKind::Agent);
+        let slot = numbered(&agent, 2);
+        plant_wedge(&slot, &dir);
+        let tuning = Tuning {
+            rotate_retry: Duration::ZERO,
+            ..rotating(2)
+        };
+        let (ring, writer, paths) = fs_writer(&dir, tuning);
+        record_fat(&ring, 600);
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let len = fs::metadata(&paths[1]).expect("the active file").len();
+        assert!(
+            len > 2048 && len <= 2 * 2048,
+            "over the cap, held to twice it: {len} bytes"
+        );
+        let written = entry_commands(&paths[1]);
+        assert!(
+            written.len() > 8 && written.len() < 600,
+            "{} lines written",
+            written.len()
+        );
+        assert_eq!(
+            written,
+            names("c", written.len()),
+            "the first lines, in order, none after a hole"
+        );
+        assert_eq!(
+            writer.status(),
+            DurableAuditStatus {
+                degraded: true,
+                dropped: 600 - written.len() as u64,
+                write_failures: 0
+            },
+            "refused lines are dropped; the wedge is degraded; nothing failed to write"
+        );
+        assert!(
+            fs::symlink_metadata(&slot).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the link at the oldest slot was touched"
+        );
+        assert!(!numbered(&agent, 1).exists(), "nothing was renamed");
+    }
+
+    /// The ceiling ends with the wedge: once the slot is free the next write
+    /// rotates (the file that was held at its ceiling is kept whole as `F.1`),
+    /// `degraded` clears, and the fresh file opens with a `start` marker and then
+    /// one `gap` marker that holds every refused line (counted once). Driven by
+    /// hand over real files so that the counts are exact.
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_rotation_recovers_when_the_slot_is_free() {
+        let dir = scratch("rotate-unwedge");
+        let path = dir.join("audit.agent.jsonl");
+        let slot = numbered(&path, 2);
+        plant_wedge(&slot, &dir);
+        let file = preflight(&path, StreamKind::Agent).expect("preflight");
+        let spec = StreamSpec {
+            path: path.clone(),
+            backend: Box::new(FsBackend),
+            file: Some(Box::new(file)),
+        };
+        let tuning = Tuning {
+            rotate_retry: Duration::ZERO,
+            ..rotating(2)
+        };
+        let shared = StreamShared::default();
+        let mut writer = StreamWriter::new(StreamKind::Agent, spec, &shared, &tuning);
+        for i in 0..30 {
+            writer.write_entry(&fat_entry(i));
+        }
+        let refused = shared.dropped.load(Ordering::Relaxed);
+        let written = entry_commands(&path).len();
+        assert!(refused > 0, "the ceiling refused lines");
+        assert_eq!(written as u64 + refused, 30, "every line is accounted for");
+        assert!(shared.rotation_wedged.load(Ordering::Relaxed), "wedged");
+        assert!(
+            fs::metadata(&path).expect("the active file").len() <= 2 * 2048,
+            "held to twice the cap"
+        );
+
+        fs::remove_file(&slot).expect("free the slot");
+        writer.write_entry(&fat_entry(30));
+        assert!(
+            !shared.rotation_wedged.load(Ordering::Relaxed),
+            "a rotation that succeeds ends the wedge"
+        );
+        assert_eq!(
+            shared.dropped.load(Ordering::Relaxed),
+            refused,
+            "the refused lines are not counted again"
+        );
+        assert_eq!(
+            entry_commands(&numbered(&path, 1)),
+            names("c", written),
+            "the file held at its ceiling is kept whole"
+        );
+        assert_eq!(line_shape(&path), ["start", "gap", "c30"]);
+        let gap = &read_lines(&path)[1];
+        assert_eq!(gap["dropped"], refused, "{gap}");
+        assert_eq!(gap["failed"], 0, "{gap}");
+        assert_eq!(gap["from"], BASE_MS + written as u64, "{gap}");
+        assert_eq!(gap["to"], BASE_MS + 29, "{gap}");
+    }
+
     /// The fake backend refuses to rotate (the trait default), so a stream over
     /// a small cap fails to rotate on every entry past it. One warn reaches the
     /// log for those failures (the throttle holds the rest back), it names the
-    /// path and the error, never an entry field, and every entry is written.
+    /// path and the error, never an entry field, and no line is lost to the
+    /// failures while the file is under its ceiling: with a cap of two lines, the
+    /// fifth of five (the third to fail) would take the file past twice the cap,
+    /// and is refused instead.
     #[test]
     fn a_failed_rotation_is_logged_once_through_the_throttle() {
+        let queued = |i: u64| AuditEntry {
+            args_summary: format!("{{\"token\":\"{LOG_CANARY}\"}}"),
+            ..entry(&format!("{LOG_CANARY}-{i}"), Frontend::Mcp, BASE_MS + i)
+        };
+        let line = aitm_ca::audit::entry_to_jsonl(&queued(1)).len() as u64 + 1;
         let run = || {
             let state = FakeState::plain();
             let spec = StreamSpec {
@@ -4866,20 +5135,16 @@ mod tests {
                 file: Some(Box::new(FakeFile(state.clone()))),
             };
             let tuning = Tuning {
-                cap_bytes: [100; 3],
+                cap_bytes: [2 * line; 3],
                 rotate_retry: Duration::ZERO,
                 warn_every: Duration::from_secs(3600),
                 ..Tuning::production()
             };
             let shared = StreamShared::default();
             let (tx, rx) = sync_channel(8);
-            for i in 1..=4 {
-                let queued = AuditEntry {
-                    args_summary: format!("{{\"token\":\"{LOG_CANARY}\"}}"),
-                    ..entry(&format!("{LOG_CANARY}-{i}"), Frontend::Mcp, BASE_MS + i)
-                };
+            for i in 1..=5 {
                 shared.queued.fetch_add(1, Ordering::Relaxed);
-                tx.send(Msg::Entry(queued)).expect("queue an entry");
+                tx.send(Msg::Entry(queued(i))).expect("queue an entry");
             }
             tx.send(Msg::Close).expect("queue the close");
             run_stream(rx, spec, &shared, StreamKind::Agent, &tuning);
@@ -4906,14 +5171,17 @@ mod tests {
         assert_eq!(
             fake_entry_count(&state),
             4,
-            "a failed rotation never costs a line"
+            "a failed rotation costs no line under the ceiling; the fifth is past it"
         );
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 1);
         assert_eq!(shared.write_failures.load(Ordering::Relaxed), 0);
         assert!(!shared.degraded.load(Ordering::Relaxed));
+        assert!(shared.rotation_wedged.load(Ordering::Relaxed));
         assert_eq!(
             state.syncs.load(Ordering::SeqCst),
-            3 + 1,
-            "the file is synced before each try at moving it, and once at close"
+            3 + 1 + 1,
+            "the file is synced before each try at moving it (three lines, and the \
+             marker at close that reports the refused one) and once at close"
         );
     }
 
@@ -5067,7 +5335,7 @@ mod tests {
         assert!(off.is_empty(), "{}", off.join("\n"));
     }
 
-    // ---- the reason in the log, and the gap at shutdown (Task W8) ------
+    // ---- the reason in the log, and the gap at shutdown ------------------
 
     /// Runs `run` under a subscriber scoped to this thread and returns what it
     /// logged beside what it returned.
@@ -5272,7 +5540,7 @@ mod tests {
         );
     }
 
-    // ---- the path re-check (Task W9) -----------------------------------
+    // ---- the path re-check -----------------------------------------------
 
     /// A re-check before every entry: for the tests whose subject is what the
     /// writer does about the answer, not when it asks.
@@ -5904,10 +6172,11 @@ mod tests {
     fn the_interval_check_first_runs_one_interval_after_boot_and_then_once_per_interval() {
         let state = FakeState::plain();
         let shared = StreamShared::default();
+        let before = Instant::now();
         let mut writer = hand_driven(&state, true, &shared);
         let calls = || state.recheck_calls.load(Ordering::SeqCst);
         assert!(
-            writer.last_recheck.elapsed() < Duration::from_secs(1),
+            writer.last_recheck >= before,
             "the interval starts when the writer does"
         );
 
@@ -5970,11 +6239,12 @@ mod tests {
         let mut writer = hand_driven(&state, true, &shared);
 
         writer.last_recheck = long_ago();
+        let before = Instant::now();
         writer.write_entry(&agent_entry(1));
         assert_eq!(state.open_calls.load(Ordering::SeqCst), 1, "one try");
         assert!(writer.spec.file.is_none(), "the handle is closed");
         assert!(
-            writer.last_open_attempt.elapsed() < Duration::from_secs(1),
+            writer.last_open_attempt >= before,
             "the failed reopen started the interval"
         );
         assert_eq!(shared.write_failures.load(Ordering::Relaxed), 1);
@@ -6053,8 +6323,11 @@ mod tests {
             backend: Box::new(FakeBackend(state.clone())),
             file: Some(Box::new(FakeFile(state.clone()))),
         };
+        // A line is about 120 bytes: the second entry, with the marker, is past a
+        // cap of 200 (so the check that refuses the path is asked), and the third
+        // is past it too but under the ceiling of twice the cap, so it is written.
         let tuning = Tuning {
-            cap_bytes: [100; 3],
+            cap_bytes: [200; 3],
             recheck: Duration::from_secs(3600),
             reopen: Duration::from_secs(5),
             ..Tuning::production()
@@ -6091,7 +6364,7 @@ mod tests {
         assert!(!shared.degraded.load(Ordering::Relaxed), "recovered");
     }
 
-    // ---- start, the handle and the boot policy (Task W11) --------------
+    // ---- start, the handle and the boot policy ---------------------------
     //
     // No test here resolves `AuditLogSetting::Default`: that would write to the
     // operator's real config directory. Every start names a path under a
@@ -6302,7 +6575,7 @@ mod tests {
         assert!(status.degraded, "degraded at once: {status:?}");
         ring.append_in(AuditLane::Evidence, entry("lost", Frontend::Operator, 1));
         assert!(
-            wait_until(Duration::from_secs(5), || {
+            wait_until(WAIT, || {
                 ring.durable_status()
                     .is_some_and(|status| status.write_failures == 1)
             }),
@@ -6317,7 +6590,7 @@ mod tests {
 
         // A relative path is unusable in both modes, and nothing is created
         // relative to the working directory.
-        let relative_dir = format!("aitm-w11-relative-{}", std::process::id());
+        let relative_dir = format!("aitm-audit-relative-{}", std::process::id());
         let relative = Path::new(&relative_dir).join("audit.jsonl");
         let ring = fresh_ring();
         let explicit = start_at(&ring, &relative, &ca_log, true);
@@ -6350,8 +6623,8 @@ mod tests {
         let dir = scratch("off");
         let cfg = config_for(&dir, AuditLogSetting::Off);
         let ring = fresh_ring();
-        let env = [("SERVICE_TOKEN".to_string(), "CNRYW11x0ff0ff01".to_string())];
-        let started = start(&cfg, &ring, Some("CNRYW11x0ff0ff02"), &env)
+        let env = [("SERVICE_TOKEN".to_string(), "CNRYSRCx0ff0ff01".to_string())];
+        let started = start(&cfg, &ring, Some("CNRYSRCx0ff0ff02"), &env)
             .expect("an audit log that is off is not an error");
         assert!(started.is_none(), "expected no handle, got {started:?}");
         assert_eq!(
@@ -6442,7 +6715,7 @@ mod tests {
             let state = FakeState::plain();
             state.fail_next.store(1, Ordering::SeqCst);
             let spec = StreamSpec {
-                path: PathBuf::from("/fake/w11-secrets/the-file.jsonl"),
+                path: PathBuf::from("/fake/secrets-log/the-file.jsonl"),
                 backend: Box::new(FakeBackend(state.clone())),
                 file: Some(Box::new(FakeFile(state.clone()))),
             };
@@ -6544,7 +6817,7 @@ mod tests {
             failures.push(format!("the short-secret warning is missing: {log}"));
         }
         let failing = log_of_a_failing_write_carrying(&SECRETS_51);
-        if !failing.contains("WARN") || !failing.contains("/fake/w11-secrets/the-file.jsonl") {
+        if !failing.contains("WARN") || !failing.contains("/fake/secrets-log/the-file.jsonl") {
             failures.push(format!("the failing write logged no warning: {failing}"));
         }
         assert!(
@@ -6557,11 +6830,11 @@ mod tests {
 
     /// Made up, like every canary in these tests; 8 bytes or more so that each
     /// is masked as a substring.
-    const SRC_TRANSPORT: &str = "CNRYW11x1a2b3c01";
-    const SRC_OPERATOR: &str = "CNRYW11x1a2b3c02";
-    const SRC_AGENT: &str = "CNRYW11x1a2b3c03";
-    const SRC_WEB: &str = "CNRYW11x1a2b3c04";
-    const SRC_ENV: &str = "CNRYW11x1a2b3c05";
+    const SRC_TRANSPORT: &str = "CNRYSRCx1a2b3c01";
+    const SRC_OPERATOR: &str = "CNRYSRCx1a2b3c02";
+    const SRC_AGENT: &str = "CNRYSRCx1a2b3c03";
+    const SRC_WEB: &str = "CNRYSRCx1a2b3c04";
+    const SRC_ENV: &str = "CNRYSRCx1a2b3c05";
     /// Values of variables whose names do not look like secrets.
     const SRC_SOCK: &str = "/tmp/sock11xxxxxxxx";
     const SRC_HOME: &str = "/home/u11xxxxxx";
@@ -6959,7 +7232,7 @@ mod tests {
         );
     }
 
-    // ---- the field pipeline on the stream's thread (Task W12) ----------
+    // ---- the field pipeline on the stream's thread ------------------------
 
     /// AC50: a secret registered while the writer runs is masked in the line of
     /// an entry that was already queued and in one recorded afterwards. The
@@ -6982,7 +7255,7 @@ mod tests {
             entry("e0", Frontend::Operator, BASE_MS),
         );
         assert!(
-            wait_until(FLUSH_BUDGET, || states[0].inside()),
+            wait_until(WAIT, || states[0].inside()),
             "the control stream never reached its first write"
         );
         writer.record(AuditLane::Evidence, carrying("e1", BASE_MS + 1));
@@ -7091,7 +7364,7 @@ mod tests {
         );
     }
 
-    // ---- the args pipeline: parse first, then the tolerant scan (Task W13) ----
+    // ---- the args pipeline: parse first, then the tolerant scan ----
 
     /// `text` with the content of every string literal deleted (the quotes
     /// stay): what two texts must agree on when only literal contents may differ.

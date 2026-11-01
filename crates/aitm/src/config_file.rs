@@ -606,13 +606,29 @@ impl AuditLogFile {
             Self::Text(s) if Path::new(&s).is_absolute() => {
                 Ok(AuditLogSetting::Path(PathBuf::from(s)))
             }
-            Self::Text(s) => {
-                bail!("mcp.audit_log must be true, false, off, or an absolute path; got {s:?}")
-            }
-            Self::Other(v) => {
-                bail!("mcp.audit_log must be true, false, off, or an absolute path; got {v:?}")
-            }
+            // The value is not printed, only its kind: a file with a token under
+            // the wrong key must not have the token echoed into a log.
+            Self::Text(_) => bail!(
+                "mcp.audit_log must be true, false, off, or an absolute path; got a string that is neither off nor an absolute path"
+            ),
+            Self::Other(v) => bail!(
+                "mcp.audit_log must be true, false, off, or an absolute path; got {}",
+                yaml_kind(&v)
+            ),
         }
+    }
+}
+
+/// What kind of YAML value `value` is, for an error that must not print it.
+fn yaml_kind(value: &serde_yaml::Value) -> &'static str {
+    match value {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a mapping",
+        serde_yaml::Value::Tagged(_) => "a tagged value",
     }
 }
 

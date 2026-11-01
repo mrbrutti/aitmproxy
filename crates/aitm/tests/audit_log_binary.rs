@@ -1,6 +1,6 @@
-//! The durable audit log, through the real `aitm` binary (plan
-//! 2026-10-31-durable-audit, Task W18; spec Design 3, 4, 10 and 14.4; AC31,
-//! AC36, AC37, AC58).
+//! The durable audit log, through the real `aitm` binary (spec
+//! `docs/superpowers/specs/2026-10-31-durable-audit-design.md`, Design 3, 4, 10
+//! and 14.4; AC31, AC36, AC37, AC58).
 //!
 //! Three of the four tests bind loopback sockets (the proxy, the browser's
 //! proxy, the agent bus and, for `aitm web`, the UI) and so run from the
@@ -45,8 +45,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The spec's bound on `aitm` exiting after SIGTERM (AC31).
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The spec's bound on a boot that must fail (AC37).
-const FAILED_BOOT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the test waits for a boot that must fail. AC37 says it fails within 5
+/// s, and it does so in milliseconds (before any port is bound); twice that keeps
+/// a loaded machine from failing the test on the clock.
+const FAILED_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 

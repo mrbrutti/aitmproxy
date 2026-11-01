@@ -65,12 +65,27 @@ pub fn apply(cfg: &mut Config, lookup: impl Fn(&str) -> Option<String>) {
     if let Some(raw) = lookup(AUDIT_LOG) {
         match audit_log_from_env(&raw) {
             Some(setting) => cfg.mcp.audit_log = setting,
+            // The reason, never the value: a token pasted into the wrong variable
+            // must not reach the log.
             None => tracing::warn!(
                 target: "aitm::audit",
-                "{AUDIT_LOG}={raw:?} is not off, on, default or an absolute path; \
-                 the audit log setting is unchanged"
+                "{AUDIT_LOG} is {}; the audit log setting is unchanged",
+                why_not_a_setting(&raw)
             ),
         }
+    }
+}
+
+/// What is wrong with an `AITM_AUDIT_LOG` value that means nothing, in words that
+/// do not repeat it: empty, a relative path (it has a directory part, so it was
+/// meant for one), or not one of the spellings.
+fn why_not_a_setting(raw: &str) -> &'static str {
+    if raw.is_empty() {
+        "empty"
+    } else if raw.contains(['/', '\\']) {
+        "a relative path"
+    } else {
+        "not one of off/on/default or an absolute path"
     }
 }
 

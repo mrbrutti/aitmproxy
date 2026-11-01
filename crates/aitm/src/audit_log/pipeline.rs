@@ -46,19 +46,20 @@ use super::registry::{SecretRegistry, CUT_MARK, MASK};
 /// Every string field is cut to this many bytes before any pass reads it: the
 /// work bound of Design 14.5 step 1. Far above every cap below, so nothing a
 /// field keeps is ever lost to it.
-pub(crate) const FIELD_BOUND_BYTES: usize = 64 * 1024;
+const FIELD_BOUND_BYTES: usize = 64 * 1024;
 
 /// The longest `command` the file keeps, in characters (no marker).
-pub(crate) const MAX_COMMAND_CHARS: usize = 128;
+const MAX_COMMAND_CHARS: usize = 128;
 
 /// The longest `connection_id` the file keeps, in bytes (no marker).
-pub(crate) const MAX_CONNECTION_ID_BYTES: usize = 64;
+const MAX_CONNECTION_ID_BYTES: usize = 64;
 
 /// How the cap of step 5 cuts one field.
 #[derive(Clone, Copy)]
 enum Cap {
     /// At most this many bytes on a character boundary, plus the `…` marker when
-    /// something was cut (the ring's own rule, so cutting its output is a no-op).
+    /// something was cut (the MCP server's `cap_text` rule, in
+    /// `aitm-mcp/src/server.rs`, so cutting its output is a no-op).
     Marked(usize),
     /// At most this many characters, no marker.
     Chars(usize),
@@ -291,8 +292,9 @@ fn replace_controls(text: &str) -> String {
 }
 
 /// `text` cut to at most `cap` bytes on a character boundary, plus the `…`
-/// marker only when something was cut: the ring's own `cap_text`, so applying it to
-/// what the ring produced changes nothing.
+/// marker only when something was cut: the MCP server's `cap_text`
+/// (`aitm-mcp/src/server.rs`), so applying it to what the server produced changes
+/// nothing.
 fn cap_marked(mut text: String, cap: usize) -> String {
     if text.len() > cap {
         text.truncate(floor_boundary(&text, cap));
@@ -952,7 +954,7 @@ mod tests {
         );
     }
 
-    // ---- a fragment mask never pushes a field past its cap (fix task, finding 2) ----
+    // ---- a fragment mask never pushes a field past its cap ----
 
     /// The registered secret whose first bytes a cap leaves at the end of a field.
     const CUT_SECRET: &str = "CUT12SECRETVALUE0123456789";
@@ -1002,7 +1004,7 @@ mod tests {
         (first, failure)
     }
 
-    /// Finding 2, `args`: the producer's cap left `fragment` bytes of a registered
+    /// `args`: the producer's cap left `fragment` bytes of a registered
     /// secret (6 to 12) at the end of a 512-byte `args`. The 10-byte mask is longer
     /// than a fragment of 6 to 9 bytes, so it takes room: the text before the
     /// fragment is cut (on a character boundary, never inside the mask) until the
@@ -1055,7 +1057,7 @@ mod tests {
         );
     }
 
-    /// Finding 2, the other capped fields, where the helper is shared: the reason
+    /// The other capped fields, where the helper is shared: the reason
     /// (1024 bytes and the marker), the command (128 characters), the connection
     /// id (64 bytes) and the label (64 characters), each with a 6, 9 and 10 byte
     /// fragment at the very end of a field that is exactly at its cap. 6 and 9
@@ -1140,7 +1142,7 @@ mod tests {
         );
     }
 
-    /// Finding 2: the cut before the fragment lands on a character boundary. The
+    /// The cut before the fragment lands on a character boundary. The
     /// 512 bytes are `{"note":"`, 248 two-byte characters and 7 bytes of the
     /// secret; the mask needs the text to end by byte 502, which is inside a
     /// character, so the 246 characters before it (501 bytes) are kept.
@@ -1160,7 +1162,7 @@ mod tests {
         assert_eq!(string_at(&value, &["args"]), want);
     }
 
-    /// Finding 2: the cut before the fragment may land between the backslash of a
+    /// The cut before the fragment may land between the backslash of a
     /// JSON escape and the character it escapes (`\n` is two bytes), which would
     /// leave a lone backslash in front of the mask. Over every alignment of
     /// escapes against the cut, for two kinds of escape (`\n`, and `\\`, a
@@ -1220,7 +1222,7 @@ mod tests {
         );
     }
 
-    /// Finding 2: a backslash that is itself escaped (`\\`) before the cut is kept.
+    /// A backslash that is itself escaped (`\\`) before the cut is kept.
     /// The text before the 9-byte fragment is 503 bytes and ends `\\x`: dropping
     /// the `x` is all the room the mask needs, and what is left ends in an even
     /// run, which reads back as one backslash. Trimming it would leave a lone one.
@@ -1240,7 +1242,7 @@ mod tests {
         assert_eq!(string_at(&value, &["args"]), want);
     }
 
-    /// Finding 1, end to end: a registered secret with a quote and a backslash
+    /// End to end: a registered secret with a quote and a backslash
     /// held in a JSON document, in a document in a document, and in a document in
     /// a document in a document (the `args` the writer sees holds it escaped once,
     /// twice, three times over) is masked in the line, and the line's `args` is
