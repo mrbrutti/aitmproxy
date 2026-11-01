@@ -414,21 +414,21 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-checks-http"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-scan-model",
 ]
 
 [[package]]
 name = "aitm-scan-http"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-scan-model",
 ]
 
 [[package]]
 name = "aitm-scan-l4-packet"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-proto-l4",
  "aitm-scan-model",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-l4-stream"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-proto-l4",
  "aitm-scan-model",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-model"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-ws"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
