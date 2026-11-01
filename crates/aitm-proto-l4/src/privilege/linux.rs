@@ -7,13 +7,22 @@
 //! metadata along the helper's path, the policy file, `pkexec`'s presence, the
 //! environment, and `/dev/tty`. The one thing it runs is the helper's own
 //! `probe`, as this user, with a bounded wait. Discovery finds a helper to
-//! probe; only the policy's exec path is ever run through polkit, and that is
-//! P1b.14's job, not this file's.
+//! probe; only the policy's exec path is ever run through polkit, by
+//! [`request_linux`] below (plan P1b.14), whose argv is [`pkexec_argv`].
 
+use std::any::Any;
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::privilege::contract::LINUX_HELPER_PATH;
-use crate::privilege::derive::LinuxInputs;
+use crate::privilege::derive::{text, LinuxInputs};
+use crate::privilege::report::RequestState;
+use crate::privilege::state::{Outcome, PrivilegeConfig, ProcessLifetime};
 
 /// File name of the helper binary wherever it is installed.
 pub const HELPER_FILE_NAME: &str = "aitm-l4-helper";
@@ -192,9 +201,7 @@ fn path_chain(path: &Path) -> Option<Vec<PathMeta>> {
 /// can rely on.
 #[cfg(target_os = "linux")]
 fn probe_reports_net_raw(helper: &Path) -> bool {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     const PROBE_WAIT: Duration = Duration::from_secs(2);
 
@@ -238,6 +245,639 @@ fn probe_reports_net_raw(helper: &Path) -> bool {
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// The request (plan P1b.14): spawning the launcher, reading the child's end
+// ---------------------------------------------------------------------------
+//
+// Everything that decides is pure and tested on every OS: the argv builders,
+// the pre-spawn refusals in [`request_linux`], the §5.5 exit table in
+// [`classify_exit`] and the watcher's step in [`watch_step`]. The one piece of
+// I/O is [`StdSpawner`], which runs the argv it is given (never a shell) with
+// stderr on a pipe drained into a bounded [`StderrTail`].
+
+/// How a spawned child ended: an exit code, or death by a signal. The watcher
+/// must tell `exit 127` from `killed by SIGINT` (spike S7), so the two are
+/// distinct here; the real spawner reads `ExitStatus::code()` and
+/// `ExitStatusExt::signal()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExit {
+    /// `exit(n)`.
+    Exited(i32),
+    /// Killed by signal `n`.
+    Signaled(i32),
+}
+
+/// `SIGINT`'s number on every Unix; Ctrl-C at the prompt (spec §5.5).
+pub const SIGINT: i32 = 2;
+
+/// One spawned process, as the watcher sees it. Nothing here blocks on the
+/// child: `try_wait` polls, `kill` is best effort (a launcher running as
+/// another user may refuse it), `stderr_tail` is a snapshot.
+pub trait Child: Send {
+    /// The pid the core spawned. pkexec execs the helper in place, so it is
+    /// also the pid the socket's `SO_PEERCRED` must carry.
+    fn id(&self) -> u32;
+    /// `Some` once the child ended; `None` while it lives.
+    fn try_wait(&mut self) -> io::Result<Option<ChildExit>>;
+    /// Ask the child to die. Best effort, never waits.
+    fn kill(&mut self);
+    /// The last [`STDERR_TAIL_BYTES`] of the child's stderr so far.
+    fn stderr_tail(&mut self) -> String;
+}
+
+/// Runs an argv. `argv[0]` is the program, absolute; no shell is involved.
+pub trait Spawner: Send + Sync {
+    /// Spawn `argv` and hand back the child.
+    ///
+    /// # Errors
+    /// Whatever the OS says about the spawn.
+    fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>>;
+}
+
+/// The SIGINT seam of spec §5.5 (S7): while a launcher child is alive the core
+/// is meant to hold a SIGINT **handler** (never `SIG_IGN`) so Ctrl-C cancels
+/// the prompt without ending the core, restoring the previous disposition
+/// when the token drops.
+///
+/// The real install is `sigaction`, which is an `unsafe fn` in `nix`, and this
+/// crate forbids `unsafe` (plan Rule 8). So this crate carries only the seam:
+/// the trait has a single operation, `hold`, there is nothing through which an
+/// ignore could be installed, and the production default is
+/// [`NoopSignalGuard`]. A real guard belongs in a leaf crate with a
+/// `// SAFETY:` comment and the Security reviewer's sign-off (spec
+/// Constraints); when it lands, note that the `aitm` binary's tokio `ctrl_c`
+/// shutdown future (`shutdown_signal` in `crates/aitm/src/lib.rs`) is displaced
+/// for the prompt window and returns when the token restores the previous
+/// `sigaction`.
+pub trait SignalGuard: Send + Sync {
+    /// Take a hold for one child's lifetime; dropping the token releases it.
+    fn hold(&self) -> Box<dyn Any + Send>;
+}
+
+/// The default seam: a token that does nothing (see [`SignalGuard`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopSignalGuard;
+
+impl SignalGuard for NoopSignalGuard {
+    fn hold(&self) -> Box<dyn Any + Send> {
+        Box::new(())
+    }
+}
+
+/// How much of the child's stderr is kept: the last 4 KiB (**Architect's
+/// call**). The launcher's whole failure text fits many times over.
+pub const STDERR_TAIL_BYTES: usize = 4096;
+
+/// A bounded tail of bytes: `push` keeps the last [`STDERR_TAIL_BYTES`].
+#[derive(Debug, Default, Clone)]
+pub struct StderrTail {
+    bytes: VecDeque<u8>,
+}
+
+impl StderrTail {
+    /// An empty tail.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `chunk`, dropping the oldest bytes past the bound.
+    pub fn push(&mut self, chunk: &[u8]) {
+        let keep = chunk.len().min(STDERR_TAIL_BYTES);
+        let tail = &chunk[chunk.len() - keep..];
+        if keep == STDERR_TAIL_BYTES {
+            self.bytes.clear();
+        } else {
+            let overflow = (self.bytes.len() + keep).saturating_sub(STDERR_TAIL_BYTES);
+            self.bytes.drain(..overflow);
+        }
+        self.bytes.extend(tail);
+    }
+
+    /// Bytes held, at most [`STDERR_TAIL_BYTES`].
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Nothing held yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// The held bytes, oldest first.
+    #[must_use]
+    pub fn bytes(&self) -> Vec<u8> {
+        self.bytes.iter().copied().collect()
+    }
+
+    /// The held bytes as text (lossy).
+    #[must_use]
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes()).into_owned()
+    }
+}
+
+/// Copy `pipe` into `tail` until EOF or a read error. Runs on the drain
+/// thread for as long as anything holds the pipe's write end: the helper
+/// inherits the launcher's stderr and must never block on a full pipe.
+pub fn drain_into(mut pipe: impl Read, tail: &Mutex<StderrTail>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => tail
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// The only environment the child gets. pkexec itself needs nothing from the
+/// core's environment: it talks to polkitd over the system bus and finds the
+/// session's agent through logind, and the textual agent opens `/dev/tty`.
+/// `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY` are passed so a graphical
+/// agent lookup sees the same session the core runs in. Deliberately absent:
+/// `SHELL` (pkexec refuses a value not in `/etc/shells`), `LANG`/`LC_*` (the
+/// C locale keeps the stderr texts [`classify_exit`] matches as spike S7
+/// measured them), `PATH` (the program is absolute), and everything else.
+pub const PASSED_ENV: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
+
+/// The real spawner: `std::process::Command` over `argv[0]`, environment
+/// cleared down to [`PASSED_ENV`], stdin and stdout inherited (the textual
+/// agent prompts on the controlling terminal, not on stdio), stderr on a pipe
+/// a drain thread copies into a bounded [`StderrTail`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdSpawner;
+
+impl Spawner for StdSpawner {
+    fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>> {
+        let (program, args) = argv.split_first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an empty argv cannot be spawned",
+            )
+        })?;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped());
+        for key in PASSED_ENV {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let mut child = command.spawn()?;
+        let tail = Arc::new(Mutex::new(StderrTail::new()));
+        let done = Arc::new(DrainDone::default());
+        if let Some(pipe) = child.stderr.take() {
+            let tail = Arc::clone(&tail);
+            let done = Arc::clone(&done);
+            std::thread::Builder::new()
+                .name("l4-helper-stderr".to_string())
+                .spawn(move || {
+                    drain_into(pipe, &tail);
+                    done.finish();
+                })?;
+        } else {
+            done.finish();
+        }
+        Ok(Box::new(StdChild {
+            child,
+            tail,
+            done,
+            exited: false,
+        }))
+    }
+}
+
+/// "The drain thread reached EOF": lets `stderr_tail` wait, bounded, for the
+/// last bytes once the child has exited.
+#[derive(Default)]
+struct DrainDone {
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl DrainDone {
+    fn finish(&self) {
+        *self.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) {
+        let guard = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self
+            .changed
+            .wait_timeout_while(guard, timeout, |done| !*done)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// How long `stderr_tail` waits for the drain to reach EOF after the exit.
+const DRAIN_SETTLE: Duration = Duration::from_millis(500);
+
+struct StdChild {
+    child: std::process::Child,
+    tail: Arc<Mutex<StderrTail>>,
+    done: Arc<DrainDone>,
+    exited: bool,
+}
+
+impl Child for StdChild {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ChildExit>> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        self.exited = true;
+        Ok(Some(exit_of(status)))
+    }
+
+    fn kill(&mut self) {
+        // A launcher running as another user refuses the signal (EPERM);
+        // the watcher has already recorded the outcome, so nothing to report.
+        let _ = self.child.kill();
+    }
+
+    fn stderr_tail(&mut self) -> String {
+        if self.exited {
+            self.done.wait(DRAIN_SETTLE);
+        }
+        self.tail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .text()
+    }
+}
+
+/// An `ExitStatus` as a [`ChildExit`]: the code when there is one, else the
+/// signal (Unix).
+fn exit_of(status: std::process::ExitStatus) -> ChildExit {
+    if let Some(code) = status.code() {
+        return ChildExit::Exited(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return ChildExit::Signaled(signal);
+        }
+    }
+    ChildExit::Exited(-1)
+}
+
+/// The launcher's argv: `/usr/bin/pkexec <policy exec path> serve --connect
+/// <socket>`. The program is the launcher's absolute path (no `PATH` lookup,
+/// and [`PASSED_ENV`] carries none), and the helper path is the policy's
+/// [`LINUX_HELPER_PATH`] literal: pkexec is never given a configured or
+/// discovered path (AC17).
+#[must_use]
+pub fn pkexec_argv(socket: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from(PKEXEC_PATH),
+        OsString::from(LINUX_HELPER_PATH),
+        OsString::from("serve"),
+        OsString::from("--connect"),
+        socket.as_os_str().to_os_string(),
+    ]
+}
+
+/// The direct argv for a helper with file capabilities (the headless
+/// fallback, spec §5.6): `<helper> serve --connect <socket>`, no launcher.
+#[must_use]
+pub fn direct_helper_argv(helper: &Path, socket: &Path) -> Vec<OsString> {
+    vec![
+        helper.as_os_str().to_os_string(),
+        OsString::from("serve"),
+        OsString::from("--connect"),
+        socket.as_os_str().to_os_string(),
+    ]
+}
+
+/// Progress and reply texts of the Linux request (spec §2.3, §2.4, §5.5).
+pub mod msg {
+    /// `cannot_prompt` from a one-shot process (spec §2.4).
+    pub const ONE_SHOT: &str = "a one-shot command exits before the helper could serve it; set \
+                                l4.privilege.request: at_start or use Allow in the TUI or web UI";
+    /// `pending` with a display set.
+    pub const PENDING_DIALOG: &str = "Waiting for administrator approval in the polkit dialog";
+    /// `pending` without a display: the textual agent on the controlling tty.
+    pub const PENDING_TERMINAL: &str =
+        "Enter an administrator password in the terminal running aitm";
+    /// `approved`: the helper connected and passed its checks.
+    pub const APPROVED: &str = "Packet capture is available through the helper";
+    /// `dismissed`: Cancel, Ctrl-D or Ctrl-C at the prompt.
+    pub const CANCELLED: &str = "Approval was cancelled";
+    /// `failed`: wrong password, or the caller is not an administrator.
+    pub const AUTH_FAILED: &str =
+        "Administrator authentication failed (wrong password or not authorized)";
+    /// `failed`: the launcher found no agent after the predicate said it would.
+    pub const NO_PROMPT_SHOWN: &str =
+        "No password prompt could be shown here (no desktop session or terminal)";
+    /// `failed`: nothing happened within [`super::APPROVAL_TIMEOUT_MS`].
+    pub const TIMED_OUT: &str = "No approval within 5 minutes";
+    /// `failed`: the helper connected but the state has no guard to build the
+    /// backend over (the wiring seam; see `PrivilegeState::set_guard`).
+    pub const NO_GUARD: &str = "no L4 guard attached to the privilege state";
+    /// `cannot_prompt`: the spawn itself failed; the OS text follows.
+    pub const SPAWN_FAILED: &str = "The packet-capture helper could not be started";
+}
+
+/// Launcher stderr texts the §5.5 table keys on (spike S7, verbatim).
+pub mod stderr_text {
+    /// Exit 127: no controlling terminal for the textual agent.
+    pub const NO_AGENT: &str = "Error creating textual authentication agent";
+    /// Exit 127: Ctrl-D at the textual prompt.
+    pub const EOF: &str = "Got unexpected EOF while reading from controlling terminal";
+    /// Exit 127: wrong password, or not an administrator.
+    pub const NOT_AUTHORIZED: &str = "Not authorized";
+}
+
+/// How long the watcher waits for approval before killing the child.
+pub const APPROVAL_TIMEOUT_MS: u64 = 300_000;
+
+/// A child the request spawned, with the SIGINT hold taken for its lifetime.
+pub struct Spawned {
+    /// The launcher (or the direct helper).
+    pub child: Box<dyn Child>,
+    /// Released when the child ends or connects.
+    pub hold: Box<dyn Any + Send>,
+}
+
+impl std::fmt::Debug for Spawned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spawned")
+            .field("pid", &self.child.id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`request_linux`] decided: the wire outcome and message, and the
+/// child when one was spawned (`Pending` only).
+#[derive(Debug)]
+pub struct LinuxRequest {
+    /// The wire `outcome`.
+    pub outcome: Outcome,
+    /// The operator's message; also the progress message for `Pending`.
+    pub message: String,
+    /// `Some` exactly when `outcome` is `Pending`.
+    pub spawned: Option<Spawned>,
+}
+
+impl LinuxRequest {
+    fn refuse(message: &str) -> Self {
+        LinuxRequest {
+            outcome: Outcome::CannotPrompt,
+            message: message.to_string(),
+            spawned: None,
+        }
+    }
+}
+
+/// The Linux half of `l4.privilege.request` (spec §2.3), up to the spawn.
+/// In order: a one-shot process refuses (spec §2.4) and spawns nothing; no
+/// prompt possible is `cannot_prompt` with the no-prompt text; a helper that
+/// is not the root-owned policy exec path, a missing policy file or launcher
+/// is `cannot_prompt` with the package label; otherwise a SIGINT hold is
+/// taken and exactly [`pkexec_argv`]`(socket)` is spawned, answering
+/// `Pending` with the dialog text when `display_set` (`DISPLAY` or
+/// `WAYLAND_DISPLAY` non-empty) else the terminal text. `socket` is the
+/// listener's absolute path, bound by the caller before this spawns.
+pub fn request_linux(
+    cfg: &PrivilegeConfig,
+    inputs: &LinuxInputs,
+    spawner: &dyn Spawner,
+    signal: &dyn SignalGuard,
+    socket: &Path,
+    display_set: bool,
+) -> LinuxRequest {
+    if cfg.lifetime == ProcessLifetime::OneShot {
+        return LinuxRequest::refuse(msg::ONE_SHOT);
+    }
+    let packaged = inputs
+        .helper
+        .as_ref()
+        .is_some_and(|helper| helper.at_policy_path && helper.root_owned_chain)
+        && inputs.policy_file_present
+        && inputs.pkexec_present;
+    if !packaged {
+        return LinuxRequest::refuse(text::LINUX_INSTALL_LABEL);
+    }
+    if !inputs.prompt_possible {
+        return LinuxRequest::refuse(text::LINUX_NO_PROMPT);
+    }
+
+    let hold = signal.hold();
+    match spawner.spawn(&pkexec_argv(socket)) {
+        Ok(child) => LinuxRequest {
+            outcome: Outcome::Pending,
+            message: if display_set {
+                msg::PENDING_DIALOG.to_string()
+            } else {
+                msg::PENDING_TERMINAL.to_string()
+            },
+            spawned: Some(Spawned { child, hold }),
+        },
+        Err(err) => {
+            drop(hold);
+            LinuxRequest::refuse(&format!("{} ({err})", msg::SPAWN_FAILED))
+        }
+    }
+}
+
+/// The §5.5 exit table (S7), pure: how the launcher ended and its stderr
+/// tail, to the request's progress and message. Exit 126 is a graphical
+/// agent's Cancel; the textual agent never exits 126 and tells its three
+/// endings apart only by text, checked in the order no-agent, EOF, not
+/// authorized (the EOF text is followed by the same "Not authorized" line).
+#[must_use]
+pub fn classify_exit(exit: ChildExit, stderr_tail: &str) -> (RequestState, String) {
+    match exit {
+        ChildExit::Exited(126) => (RequestState::Dismissed, msg::CANCELLED.to_string()),
+        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::NO_AGENT) => {
+            (RequestState::Failed, msg::NO_PROMPT_SHOWN.to_string())
+        }
+        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::EOF) => {
+            (RequestState::Dismissed, msg::CANCELLED.to_string())
+        }
+        ChildExit::Exited(127) if stderr_tail.contains(stderr_text::NOT_AUTHORIZED) => {
+            (RequestState::Failed, msg::AUTH_FAILED.to_string())
+        }
+        ChildExit::Signaled(SIGINT) => (RequestState::Dismissed, msg::CANCELLED.to_string()),
+        ChildExit::Exited(code) => (
+            RequestState::Failed,
+            format!("The packet-capture helper did not start (pkexec exit {code})"),
+        ),
+        ChildExit::Signaled(signal) => (
+            RequestState::Failed,
+            format!("The packet-capture helper did not start (killed by signal {signal})"),
+        ),
+    }
+}
+
+/// What one watcher step decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOutcome {
+    /// Nothing yet; step again.
+    Waiting,
+    /// The helper session is up: the request is approved.
+    Connected,
+    /// The child ended (or was killed at the deadline); record this progress.
+    Ended {
+        /// `Dismissed` or `Failed`.
+        state: RequestState,
+        /// The operator's message.
+        message: String,
+    },
+}
+
+/// One step of the watcher, pure over its inputs: a connected session wins;
+/// else a child that ended is [`classify_exit`]ed over its stderr tail; else
+/// [`APPROVAL_TIMEOUT_MS`] after `started_ms` on the injected clock the child
+/// is killed and the request `failed` with the timeout text; else wait.
+pub fn watch_step(
+    child: &mut dyn Child,
+    connected: bool,
+    started_ms: u64,
+    now_ms: u64,
+) -> WatchOutcome {
+    if connected {
+        return WatchOutcome::Connected;
+    }
+    match child.try_wait() {
+        Ok(Some(exit)) => {
+            let tail = child.stderr_tail();
+            let (state, message) = classify_exit(exit, &tail);
+            WatchOutcome::Ended { state, message }
+        }
+        Err(err) => WatchOutcome::Ended {
+            state: RequestState::Failed,
+            message: format!("The packet-capture helper did not start ({err})"),
+        },
+        Ok(None) if now_ms.saturating_sub(started_ms) >= APPROVAL_TIMEOUT_MS => {
+            child.kill();
+            WatchOutcome::Ended {
+                state: RequestState::Failed,
+                message: msg::TIMED_OUT.to_string(),
+            }
+        }
+        Ok(None) => WatchOutcome::Waiting,
+    }
+}
+
+/// Scripted stand-ins for the request's seams, shared with `state`'s tests.
+#[cfg(test)]
+pub(crate) mod fakes {
+    use std::any::Any;
+    use std::ffi::OsString;
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{Child, ChildExit, SignalGuard, Spawner};
+
+    /// A child that answers `try_wait` with `None` `ticks` times, then `exit`.
+    pub(crate) struct FakeChild {
+        pub(crate) pid: u32,
+        pub(crate) ticks_left: u32,
+        pub(crate) exit: Option<ChildExit>,
+        pub(crate) stderr: String,
+        pub(crate) killed: Arc<AtomicUsize>,
+    }
+
+    impl FakeChild {
+        pub(crate) fn alive(pid: u32) -> Self {
+            FakeChild {
+                pid,
+                ticks_left: 0,
+                exit: None,
+                stderr: String::new(),
+                killed: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Child for FakeChild {
+        fn id(&self) -> u32 {
+            self.pid
+        }
+        fn try_wait(&mut self) -> io::Result<Option<ChildExit>> {
+            if self.ticks_left > 0 {
+                self.ticks_left -= 1;
+                return Ok(None);
+            }
+            Ok(self.exit)
+        }
+        fn kill(&mut self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn stderr_tail(&mut self) -> String {
+            self.stderr.clone()
+        }
+    }
+
+    /// Records every argv it spawns and how many SIGINT holds were out at
+    /// that moment.
+    pub(crate) struct FakeSpawner {
+        pub(crate) argvs: Mutex<Vec<Vec<OsString>>>,
+        pub(crate) holds: Arc<AtomicUsize>,
+        pub(crate) holds_at_spawn: Mutex<Vec<usize>>,
+    }
+
+    impl FakeSpawner {
+        pub(crate) fn new(holds: &Arc<AtomicUsize>) -> Self {
+            FakeSpawner {
+                argvs: Mutex::new(Vec::new()),
+                holds: Arc::clone(holds),
+                holds_at_spawn: Mutex::new(Vec::new()),
+            }
+        }
+        pub(crate) fn argvs(&self) -> Vec<Vec<OsString>> {
+            self.argvs.lock().unwrap().clone()
+        }
+    }
+
+    impl Spawner for FakeSpawner {
+        fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>> {
+            self.argvs.lock().unwrap().push(argv.to_vec());
+            self.holds_at_spawn
+                .lock()
+                .unwrap()
+                .push(self.holds.load(Ordering::SeqCst));
+            Ok(Box::new(FakeChild::alive(4242)))
+        }
+    }
+
+    /// A SIGINT guard whose tokens count: +1 on `hold`, -1 when the token drops.
+    /// Its only operation is `hold`; there is no "ignore" to call.
+    pub(crate) struct CountingGuard(pub(crate) Arc<AtomicUsize>);
+    pub(crate) struct Held(Arc<AtomicUsize>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl SignalGuard for CountingGuard {
+        fn hold(&self) -> Box<dyn Any + Send> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::new(Held(Arc::clone(&self.0)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -362,5 +1002,487 @@ mod tests {
         // Wayland alone is enough; an empty DISPLAY is unset.
         assert!(prompt_possible(None, Some("wayland-0"), false));
         assert!(!prompt_possible(Some(""), Some(""), false));
+    }
+
+    // ---- Task P1b.14: the request, pkexec's end, the watcher step ----
+
+    use std::ffi::OsString;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::fakes::{CountingGuard, FakeChild, FakeSpawner};
+    use crate::config::L4PrivilegeConfig;
+    use crate::privilege::derive::{HelperCandidate, LinuxInputs};
+    use crate::privilege::report::RequestState;
+    use crate::privilege::state::{Outcome, PrivilegeConfig, ProcessLifetime};
+
+    const SOCKET: &str = "/run/user/1000/aitm/l4-helper-777.sock";
+
+    /// The packaged install, complete, with a prompt possible (the pkexec row).
+    fn packaged() -> LinuxInputs {
+        LinuxInputs {
+            cap_net_raw: false,
+            cap_net_admin: false,
+            session_connected: false,
+            helper: Some(HelperCandidate {
+                path: PathBuf::from(LINUX_HELPER_PATH),
+                at_policy_path: true,
+                root_owned_chain: true,
+                file_caps_net_raw: false,
+            }),
+            policy_file_present: true,
+            pkexec_present: true,
+            prompt_possible: true,
+        }
+    }
+
+    fn cfg(lifetime: ProcessLifetime, helper_path: Option<&str>) -> PrivilegeConfig {
+        PrivilegeConfig {
+            enabled: true,
+            l4: L4PrivilegeConfig {
+                helper_path: helper_path.map(PathBuf::from),
+                ..L4PrivilegeConfig::default()
+            },
+            lifetime,
+        }
+    }
+
+    fn os(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn one_shot_refuses_and_spawns_nothing() {
+        let holds = Arc::new(AtomicUsize::new(0));
+        let spawner = FakeSpawner::new(&holds);
+        let req = request_linux(
+            &cfg(ProcessLifetime::OneShot, None),
+            &packaged(),
+            &spawner,
+            &CountingGuard(Arc::clone(&holds)),
+            Path::new(SOCKET),
+            true,
+        );
+        assert_eq!(req.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            req.message,
+            "a one-shot command exits before the helper could serve it; set \
+             l4.privilege.request: at_start or use Allow in the TUI or web UI"
+        );
+        assert!(req.spawned.is_none());
+        assert!(spawner.argvs().is_empty(), "nothing is spawned");
+        assert_eq!(
+            holds.load(Ordering::SeqCst),
+            0,
+            "no SIGINT hold without a child"
+        );
+    }
+
+    #[test]
+    fn no_prompt_is_cannot_prompt_and_spawns_nothing() {
+        let holds = Arc::new(AtomicUsize::new(0));
+        let spawner = FakeSpawner::new(&holds);
+        let guard = CountingGuard(Arc::clone(&holds));
+        let serving = cfg(ProcessLifetime::Serving, None);
+
+        let no_prompt = LinuxInputs {
+            prompt_possible: false,
+            ..packaged()
+        };
+        let req = request_linux(
+            &serving,
+            &no_prompt,
+            &spawner,
+            &guard,
+            Path::new(SOCKET),
+            false,
+        );
+        assert_eq!(req.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            req.message,
+            "No password prompt can be shown here (no desktop session or terminal)"
+        );
+        assert!(req.spawned.is_none());
+
+        // The package row: a helper found, but not root-owned (under $HOME).
+        let home = LinuxInputs {
+            helper: Some(HelperCandidate {
+                path: PathBuf::from("/home/u/aitm-l4-helper"),
+                at_policy_path: false,
+                root_owned_chain: false,
+                file_caps_net_raw: false,
+            }),
+            ..packaged()
+        };
+        let req = request_linux(&serving, &home, &spawner, &guard, Path::new(SOCKET), true);
+        assert_eq!(req.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            req.message,
+            "Install the aitm .deb or .rpm to get the packet-capture helper"
+        );
+        assert!(req.spawned.is_none());
+
+        // No launcher, or no policy file: the same package row.
+        let no_pkexec = LinuxInputs {
+            pkexec_present: false,
+            ..packaged()
+        };
+        let req = request_linux(
+            &serving,
+            &no_pkexec,
+            &spawner,
+            &guard,
+            Path::new(SOCKET),
+            true,
+        );
+        assert_eq!(req.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            req.message,
+            "Install the aitm .deb or .rpm to get the packet-capture helper"
+        );
+
+        assert!(
+            spawner.argvs().is_empty(),
+            "nothing is spawned on any refusal"
+        );
+        assert_eq!(holds.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pkexec_argv_is_policy_path_only() {
+        let holds = Arc::new(AtomicUsize::new(0));
+        let spawner = FakeSpawner::new(&holds);
+        let guard = CountingGuard(Arc::clone(&holds));
+        // `l4.privilege.helper_path` points under $HOME; the request still runs
+        // only the policy's exec path.
+        let configured = cfg(ProcessLifetime::Serving, Some("/home/u/aitm-l4-helper"));
+
+        let req = request_linux(
+            &configured,
+            &packaged(),
+            &spawner,
+            &guard,
+            Path::new(SOCKET),
+            true,
+        );
+        assert_eq!(req.outcome, Outcome::Pending);
+        assert_eq!(
+            req.message,
+            "Waiting for administrator approval in the polkit dialog"
+        );
+        let spawned = req.spawned.expect("a child was spawned");
+        assert_eq!(spawned.child.id(), 4242);
+
+        let argvs = spawner.argvs();
+        assert_eq!(
+            argvs,
+            vec![os(&[
+                "/usr/bin/pkexec",
+                "/usr/lib/aitmproxy/aitm-l4-helper",
+                "serve",
+                "--connect",
+                SOCKET,
+            ])]
+        );
+        for arg in argvs.iter().flatten() {
+            assert!(
+                !arg.to_string_lossy().contains("/home/u"),
+                "the configured path never reaches pkexec: {arg:?}"
+            );
+        }
+        assert_eq!(pkexec_argv(Path::new(SOCKET)), argvs[0]);
+
+        // Without a display the message points at the terminal.
+        let req = request_linux(
+            &configured,
+            &packaged(),
+            &spawner,
+            &guard,
+            Path::new(SOCKET),
+            false,
+        );
+        assert_eq!(req.outcome, Outcome::Pending);
+        assert_eq!(
+            req.message,
+            "Enter an administrator password in the terminal running aitm"
+        );
+    }
+
+    #[test]
+    fn exit_126_is_dismissed() {
+        assert_eq!(
+            classify_exit(
+                ChildExit::Exited(126),
+                "Error executing command as another user: Request dismissed\n"
+            ),
+            (
+                RequestState::Dismissed,
+                "Approval was cancelled".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn exit_127_not_authorized_is_failed() {
+        let stderr = "polkit-agent-helper-1: pam_authenticate failed: Authentication failure\n\
+                      ==== AUTHENTICATION FAILED ====\n\
+                      Error executing command as another user: Not authorized\n";
+        let (state, message) = classify_exit(ChildExit::Exited(127), stderr);
+        assert_eq!(state, RequestState::Failed);
+        assert_eq!(
+            message,
+            "Administrator authentication failed (wrong password or not authorized)"
+        );
+        assert!(message.contains("wrong password"));
+    }
+
+    #[test]
+    fn exit_127_eof_is_dismissed() {
+        let stderr = "==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====\n\
+                      Authenticating as: root\n\
+                      Password: \n\
+                      polkit-agent-helper-1: Got unexpected EOF while reading from controlling terminal\n\
+                      ==== AUTHENTICATION FAILED ====\n\
+                      Error executing command as another user: Not authorized\n";
+        assert_eq!(
+            classify_exit(ChildExit::Exited(127), stderr),
+            (
+                RequestState::Dismissed,
+                "Approval was cancelled".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn no_agent_text_is_failed() {
+        let stderr = "Error creating textual authentication agent: Error opening current \
+                      controlling terminal for the process (`/dev/tty'): No such device or address\n";
+        let (state, message) = classify_exit(ChildExit::Exited(127), stderr);
+        assert_eq!(state, RequestState::Failed);
+        assert_eq!(
+            message,
+            "No password prompt could be shown here (no desktop session or terminal)"
+        );
+        assert!(message.contains("No password prompt"));
+    }
+
+    #[test]
+    fn sigint_is_dismissed() {
+        assert_eq!(
+            classify_exit(ChildExit::Signaled(SIGINT), ""),
+            (
+                RequestState::Dismissed,
+                "Approval was cancelled".to_string()
+            )
+        );
+        assert_eq!(SIGINT, 2);
+    }
+
+    #[test]
+    fn other_exit_is_failed() {
+        assert_eq!(
+            classify_exit(ChildExit::Exited(2), "pkexec --version\n"),
+            (
+                RequestState::Failed,
+                "The packet-capture helper did not start (pkexec exit 2)".to_string()
+            )
+        );
+        // 127 with none of the known texts is the generic row too.
+        assert_eq!(
+            classify_exit(ChildExit::Exited(127), "something else entirely"),
+            (
+                RequestState::Failed,
+                "The packet-capture helper did not start (pkexec exit 127)".to_string()
+            )
+        );
+        assert_eq!(
+            classify_exit(ChildExit::Signaled(9), ""),
+            (
+                RequestState::Failed,
+                "The packet-capture helper did not start (killed by signal 9)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_is_failed_after_300s() {
+        let mut child = FakeChild::alive(77);
+        let killed = Arc::clone(&child.killed);
+        let started = 10_000;
+
+        // Still waiting one tick short of the deadline, nothing killed.
+        assert_eq!(
+            watch_step(&mut child, false, started, started + 299_999),
+            WatchOutcome::Waiting
+        );
+        assert_eq!(killed.load(Ordering::SeqCst), 0);
+
+        // At 300 s on the injected clock: kill and `failed`.
+        assert_eq!(
+            watch_step(&mut child, false, started, started + 300_000),
+            WatchOutcome::Ended {
+                state: RequestState::Failed,
+                message: "No approval within 5 minutes".to_string(),
+            }
+        );
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert_eq!(APPROVAL_TIMEOUT_MS, 300_000);
+
+        // A connected session wins over everything, even past the deadline.
+        let mut child = FakeChild::alive(78);
+        assert_eq!(
+            watch_step(&mut child, true, started, started + 400_000),
+            WatchOutcome::Connected
+        );
+        assert_eq!(child.killed.load(Ordering::SeqCst), 0);
+
+        // A child that ended is classified, whatever the clock says.
+        let mut child = FakeChild {
+            exit: Some(ChildExit::Exited(126)),
+            stderr: "Request dismissed".to_string(),
+            ..FakeChild::alive(79)
+        };
+        assert_eq!(
+            watch_step(&mut child, false, started, started + 1),
+            WatchOutcome::Ended {
+                state: RequestState::Dismissed,
+                message: "Approval was cancelled".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn file_caps_helper_spawns_directly() {
+        let argv = direct_helper_argv(Path::new("/opt/aitm/aitm-l4-helper"), Path::new(SOCKET));
+        assert_eq!(
+            argv,
+            os(&["/opt/aitm/aitm-l4-helper", "serve", "--connect", SOCKET])
+        );
+        assert_ne!(argv[0], OsString::from(PKEXEC_PATH));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("pkexec")));
+    }
+
+    /// Rule 8 keeps the real `sigaction` out of this crate (it is `unsafe` in
+    /// `nix`), so the guard is a seam: the only operation a `SignalGuard` has
+    /// is `hold`, nothing can install `SIG_IGN` through it, and this pins that
+    /// the spawn happens under exactly one hold that the token releases.
+    #[test]
+    fn sigint_handler_installed_not_ignored() {
+        let holds = Arc::new(AtomicUsize::new(0));
+        let spawner = FakeSpawner::new(&holds);
+        let guard = CountingGuard(Arc::clone(&holds));
+
+        let req = request_linux(
+            &cfg(ProcessLifetime::Serving, None),
+            &packaged(),
+            &spawner,
+            &guard,
+            Path::new(SOCKET),
+            true,
+        );
+        let spawned = req.spawned.expect("spawned");
+        assert_eq!(
+            holds.load(Ordering::SeqCst),
+            1,
+            "one hold while the child lives"
+        );
+        assert_eq!(
+            *spawner.holds_at_spawn.lock().unwrap(),
+            vec![1],
+            "nothing is spawned without a hold"
+        );
+
+        // The watcher drops the token when the child ends or connects; the
+        // previous disposition is back.
+        drop(spawned.hold);
+        assert_eq!(holds.load(Ordering::SeqCst), 0);
+
+        // The production default is the no-op seam: it hands out a token too.
+        let token = NoopSignalGuard.hold();
+        drop(token);
+    }
+
+    #[test]
+    fn stderr_pipe_is_drained_after_approval() {
+        // The bounded buffer keeps exactly the last 4 KiB.
+        let mut tail = StderrTail::new();
+        tail.push(&[b'a'; 3000]);
+        tail.push(&[b'b'; 3000]);
+        assert_eq!(tail.len(), 4096);
+        let text = tail.text();
+        assert_eq!(text.len(), 4096);
+        assert!(text.starts_with("aaaa"));
+        assert!(text.ends_with("bbbb"));
+        assert_eq!(text.matches('b').count(), 3000);
+        assert_eq!(STDERR_TAIL_BYTES, 4096);
+
+        // A child that keeps writing after approval: 64 KiB into the pipe never
+        // blocks the writer, and the tail stays at 4 KiB.
+        let (reader, mut writer) = UnixStream::pair().expect("pair");
+        let shared = Arc::new(Mutex::new(StderrTail::new()));
+        let drain = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || drain_into(reader, &shared))
+        };
+        let mut expected_last = Vec::new();
+        for round in 0..64u8 {
+            let chunk = vec![round; 1024];
+            writer.write_all(&chunk).expect("write");
+            expected_last.extend_from_slice(&chunk);
+        }
+        drop(writer);
+        drain.join().expect("drain thread");
+        let tail = shared.lock().unwrap();
+        assert_eq!(tail.len(), 4096);
+        let last = &expected_last[expected_last.len() - 4096..];
+        assert_eq!(tail.bytes(), last);
+    }
+
+    /// The real spawner on a real child: stderr lands in the tail, the exit
+    /// code and the signal come back distinct (S7 needs both).
+    #[test]
+    fn std_spawner_reads_exit_code_signal_and_stderr() {
+        let spawner = StdSpawner;
+        let mut child = spawner
+            .spawn(&os(&["/bin/sh", "-c", "echo not-a-prompt >&2; exit 126"]))
+            .expect("spawn sh");
+        assert!(child.id() > 0);
+        let exit = wait_fake_free(child.as_mut());
+        assert_eq!(exit, ChildExit::Exited(126));
+        assert_eq!(child.stderr_tail(), "not-a-prompt\n");
+
+        let mut child = spawner
+            .spawn(&os(&["/bin/sh", "-c", "kill -INT $$"]))
+            .expect("spawn sh");
+        assert_eq!(wait_fake_free(child.as_mut()), ChildExit::Signaled(SIGINT));
+
+        // The environment is cleared down to the display variables: SHELL and
+        // PATH never reach the child.
+        let mut child = spawner
+            .spawn(&os(&[
+                "/bin/sh",
+                "-c",
+                "env | grep -c '^SHELL=\\|^PATH=\\|^HOME=' >&2; exit 0",
+            ]))
+            .expect("spawn sh");
+        assert_eq!(wait_fake_free(child.as_mut()), ChildExit::Exited(0));
+        assert_eq!(child.stderr_tail().trim(), "0");
+    }
+
+    fn wait_fake_free(child: &mut dyn Child) -> ChildExit {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(exit) = child.try_wait().expect("try_wait") {
+                // `stderr_tail` after an exit waits (bounded) for the drain
+                // thread to land the last bytes; no sleep here.
+                return exit;
+            }
+            assert!(std::time::Instant::now() < deadline, "child never ended");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
