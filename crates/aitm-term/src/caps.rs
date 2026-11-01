@@ -398,4 +398,64 @@ mod tests {
             }
         );
     }
+
+    // ---- tester additions ----
+
+    #[test]
+    fn caps_aitm_term_is_case_insensitive_and_ignores_other_values() {
+        assert_eq!(TermMode::from_env_value("PLAIN"), Some(TermMode::Plain));
+        assert_eq!(TermMode::from_env_value("Ascii"), Some(TermMode::Ascii));
+        assert_eq!(TermMode::from_env_value("rich"), Some(TermMode::Rich));
+        assert_eq!(TermMode::from_env_value(""), None);
+        assert_eq!(TermMode::from_env_value("fancy"), None);
+        assert_eq!(TermMode::from_env_value(" plain"), None);
+
+        // An unknown word changes nothing: the TTY stays rich.
+        assert_eq!(on_tty(&tty_env_with(&[("AITM_TERM", "fancy")])), rich());
+        // `PLAIN` in capitals is the plain mode.
+        assert_eq!(
+            on_tty(&tty_env_with(&[("AITM_TERM", "PLAIN")])),
+            Caps {
+                tty: true,
+                color: false,
+                unicode: false,
+                animate: false,
+                width: 120,
+                ci: false,
+            }
+        );
+        // D2 rule 1 beats rule 2: `--color=always` keeps colour even under
+        // `AITM_TERM=plain`, which still kills glyphs and animation.
+        assert_eq!(
+            Caps::from_parts(
+                true,
+                Some(120),
+                ColorChoice::Always,
+                &tty_env_with(&[("AITM_TERM", "plain")])
+            ),
+            Caps {
+                tty: true,
+                color: true,
+                unicode: false,
+                animate: false,
+                width: 120,
+                ci: false,
+            }
+        );
+    }
+
+    #[test]
+    fn caps_width_is_80_when_unmeasured_and_the_measurement_otherwise() {
+        let unmeasured = Caps::from_parts(true, None, ColorChoice::Auto, &env_of(TTY_ENV));
+        assert_eq!(unmeasured.width, 80);
+        let narrow = Caps::from_parts(true, Some(10), ColorChoice::Auto, &env_of(TTY_ENV));
+        assert_eq!(narrow.width, 10);
+        assert_eq!(
+            narrow,
+            Caps {
+                width: 10,
+                ..rich()
+            }
+        );
+    }
 }

@@ -135,4 +135,24 @@ mod tests {
         );
         assert_eq!(got[0], ev);
     }
+
+    // ---- tester additions ----
+
+    #[test]
+    fn redact_fields_matches_suffixes_case_insensitively_and_leaves_lookalikes() {
+        let mut got = fields(&[
+            ("TOKEN", "a"),
+            ("api-secret", "b"),
+            ("PassWord", "c"),
+            ("tokenizer", "d"),
+            ("", "e"),
+        ]);
+        redact_fields(&mut got);
+        let values: Vec<&str> = got.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(values, ["<redacted>", "<redacted>", "<redacted>", "d", "e"]);
+
+        let mut none: Vec<(String, String)> = Vec::new();
+        redact_fields(&mut none);
+        assert!(none.is_empty());
+    }
 }

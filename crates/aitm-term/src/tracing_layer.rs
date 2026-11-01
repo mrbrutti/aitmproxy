@@ -189,4 +189,55 @@ mod tests {
         );
         assert!(dumped.contains("<redacted>"));
     }
+
+    // ---- tester additions ----
+
+    #[test]
+    fn ui_layer_through_the_reporter_renders_token_as_redacted() {
+        use crate::caps::Caps;
+        use crate::reporter::{Reporter, Verbosity};
+        use crate::testing::SharedSink;
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        let subscriber =
+            tracing_subscriber::registry().with(UiLayer::new(reporter.events(), Level::WARN));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                token = "deadbeefcafebabe",
+                url = "http://127.0.0.1:8082/",
+                "bridge token minted"
+            );
+            tracing::info!(token = "deadbeefcafebabe", "below the view");
+        });
+        reporter.finish();
+
+        assert_eq!(
+            sink.text(),
+            "warning: bridge token minted token=<redacted> url=http://127.0.0.1:8082/\n"
+        );
+        assert!(
+            !sink.text().contains("deadbeef"),
+            "the secret must not reach the sink: {:?}",
+            sink.text()
+        );
+        assert!(!sink.bytes().contains(&0x1b));
+    }
+
+    #[test]
+    fn ui_layer_handles_an_event_with_no_message_and_no_fields() {
+        let (sender, events) = collector();
+        let subscriber = tracing_subscriber::registry().with(UiLayer::new(sender, Level::WARN));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("");
+        });
+
+        let got = events.lock().expect("test mutex");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].message, "");
+        assert_eq!(got[0].fields, Vec::<(String, String)>::new());
+        assert_eq!(got[0].target, "aitm_term::tracing_layer::tests");
+    }
 }

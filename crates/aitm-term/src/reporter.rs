@@ -1669,4 +1669,814 @@ mod tests {
         );
         assert_eq!(unset.display_home(), None);
     }
+
+    // ---- tester additions: thread lifecycle, failing sinks, narrow and
+    // empty inputs, and the design rules checked in the bytes ----
+
+    /// A sink that records which thread wrote each chunk, so a test can
+    /// tell the render thread's output from the caller's.
+    #[derive(Clone, Default)]
+    struct ThreadTaggingSink(Arc<Mutex<Chunks>>);
+
+    /// What a [`ThreadTaggingSink`] holds: the writing thread's name and
+    /// the bytes, per write.
+    type Chunks = Vec<(Option<String>, Vec<u8>)>;
+
+    impl ThreadTaggingSink {
+        fn writers(&self) -> Vec<Option<String>> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect()
+        }
+
+        fn text(&self) -> String {
+            let bytes: Vec<u8> = self
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .flat_map(|(_, chunk)| chunk.iter().copied())
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl Write for ThreadTaggingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let name = std::thread::current().name().map(str::to_string);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((name, buf.to_vec()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A sink whose every write and flush fails, like a closed stderr; it
+    /// counts the attempts so a test can prove it was really used.
+    #[derive(Clone, Default)]
+    struct FailingSink(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Write for FailingSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::other("stderr closed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("stderr closed"))
+        }
+    }
+
+    /// Every `ESC [ … <final>` sequence in `bytes`, in order; panics on an
+    /// ESC that starts no CSI or on an unterminated one.
+    fn csi_sequences(bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            assert_eq!(bytes.get(i + 1), Some(&b'['), "bare ESC at byte {i}");
+            let start = i;
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            assert!(i < bytes.len(), "unterminated CSI at byte {start}");
+            out.push(String::from_utf8_lossy(&bytes[start..=i]).into_owned());
+            i += 1;
+        }
+        out
+    }
+
+    /// Spec T2 and plan C2/C3: the classic 16-colour SGR codes, dim, bold,
+    /// reset, column 1, clear line, cursor up and the synchronized-update
+    /// brackets. Nothing else may leave the renderer.
+    fn is_allowed_csi(seq: &str) -> bool {
+        const FIXED: [&str; 11] = [
+            "\x1b[34m",
+            "\x1b[32m",
+            "\x1b[33m",
+            "\x1b[31m",
+            "\x1b[2m",
+            "\x1b[1m",
+            "\x1b[0m",
+            "\x1b[1G",
+            "\x1b[2K",
+            "\x1b[?2026h",
+            "\x1b[?2026l",
+        ];
+        if FIXED.contains(&seq) {
+            return true;
+        }
+        seq.strip_prefix("\x1b[")
+            .and_then(|s| s.strip_suffix('A'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    fn ca_card() -> Card {
+        Card {
+            headline: "aitmproxy · listening 127.0.0.1:8080 · CA untrusted".to_string(),
+            headline_role: Role::Success,
+            rows: vec![
+                Row {
+                    label: "CA",
+                    value: "untrusted".to_string(),
+                    value_role: Role::Warning,
+                    next: Some("aitm ca install".to_string()),
+                },
+                Row {
+                    label: "Log",
+                    value: "/Users/matt/x.log".to_string(),
+                    value_role: Role::Dim,
+                    next: None,
+                },
+            ],
+        }
+    }
+
+    fn boom_event() -> UiEvent {
+        UiEvent {
+            level: tracing::Level::ERROR,
+            target: "aitm::wire".to_string(),
+            message: "boom".to_string(),
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_thousand_plain_phases_print_one_line_each_and_no_control_bytes() {
+        let sink = SharedSink::new();
+        let reporter =
+            Reporter::new(utf8_pipe(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        for i in 0..1000 {
+            reporter
+                .phase(&format!("phase {i}"))
+                .done(&format!("step {i} ready"));
+        }
+        reporter.finish();
+
+        let text = sink.text();
+        let lines: Vec<&str> = text.split_terminator('\n').collect();
+        assert_eq!(lines.len(), 1000);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(*line, format!("step {i} ready"));
+        }
+        assert_eq!(text.matches('\n').count(), 1000);
+        no_escape_bytes(&sink);
+        assert!(matches!(&*reporter.lock(), State::Finished(Some(_))));
+    }
+
+    #[test]
+    fn reporter_starts_no_thread_until_the_first_message_and_joins_it_on_finish() {
+        // Nothing sent: no thread is ever started, and finish leaves the
+        // renderer on the caller's side.
+        let idle = Reporter::new(
+            Caps::plain(),
+            Box::new(SharedSink::new()),
+            Verbosity::Normal,
+        );
+        assert!(matches!(&*idle.lock(), State::Idle(_)));
+        idle.finish();
+        assert!(matches!(&*idle.lock(), State::Finished(Some(_))));
+
+        let sink = ThreadTaggingSink::default();
+        let reporter =
+            Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        reporter.phase("reading config").done("config defaults");
+        assert!(matches!(&*reporter.lock(), State::Running { .. }));
+        reporter.finish();
+        // `Finished(Some)` is reached only through `JoinHandle::join`: the
+        // `aitm-term` thread has exited (AC-W1-30, unit half).
+        assert!(matches!(&*reporter.lock(), State::Finished(Some(_))));
+
+        reporter.warn("late");
+        assert_eq!(sink.text(), "config defaults\nwarning: late\n");
+        let me = std::thread::current().name().map(str::to_string);
+        assert_ne!(me.as_deref(), Some(THREAD_NAME));
+        assert_eq!(
+            sink.writers(),
+            vec![Some(THREAD_NAME.to_string()), me],
+            "the phase line came from the render thread; after finish the caller writes"
+        );
+    }
+
+    #[test]
+    fn finish_from_another_thread_leaves_a_live_phase_working() {
+        let sink = SharedSink::new();
+        let reporter =
+            Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        let phase = reporter.phase("starting obscura");
+
+        let other = reporter.clone();
+        std::thread::spawn(move || other.finish())
+            .join()
+            .expect("finish on another thread must not panic");
+        assert!(matches!(&*reporter.lock(), State::Finished(Some(_))));
+
+        // The phase that outlived the thread ends synchronously, in plain form.
+        phase.done("obscura probed 0.3.1");
+        assert_eq!(sink.text(), "obscura probed 0.3.1\n");
+
+        // A phase dropped after finish still prints its label.
+        drop(reporter.phase("checking CA trust"));
+        assert_eq!(sink.text(), "obscura probed 0.3.1\nchecking CA trust\n");
+        no_escape_bytes(&sink);
+    }
+
+    #[test]
+    fn a_failing_sink_never_panics_and_every_blocking_call_returns() {
+        for caps in [Caps::plain(), rich_caps(true, true)] {
+            let sink = FailingSink::default();
+            let attempts = Arc::clone(&sink.0);
+            let reporter = Reporter::new(caps, Box::new(sink), Verbosity::Normal).checklist(true);
+            let started = Instant::now();
+
+            reporter.header("aitmproxy", "0.5.11");
+            let phase = reporter.phase("loading detections");
+            phase.progress(12, Some(49));
+            phase.done("49 detections ready");
+            reporter.phase("binding ports").fail("binding ports");
+            reporter.warn("log file unavailable");
+            reporter.event(browser_event());
+            reporter.card(&bus_card());
+            reporter.error(&port_report());
+            reporter.finish();
+            reporter.warn("late");
+            reporter.finish_and_clear();
+
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "no blocking call may wait on a sink that fails at once ({caps:?})"
+            );
+            let n = attempts.load(Ordering::Relaxed);
+            assert!(
+                n >= 6,
+                "the sink must have been written to ({caps:?}): {n} attempts"
+            );
+            assert!(matches!(&*reporter.lock(), State::Finished(Some(_))));
+        }
+    }
+
+    #[test]
+    fn checklist_can_be_turned_on_while_the_thread_runs() {
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let reporter = Reporter::with_clock(
+            Caps::plain(),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+            clock.clone(),
+        );
+        let first = reporter.phase("reading config");
+        clock.advance(Duration::from_millis(20));
+        first.done("first");
+        assert!(matches!(&*reporter.lock(), State::Running { .. }));
+
+        let reporter = reporter.checklist(true);
+        let second = reporter.phase("loading detections");
+        clock.advance(Duration::from_millis(20));
+        second.done("second");
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            "second\n",
+            "the fast first phase stays silent; the toggle reached the thread"
+        );
+    }
+
+    #[test]
+    fn finish_and_clear_in_plain_mode_erases_nothing() {
+        let sink = SharedSink::new();
+        let reporter =
+            Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        reporter.header("aitmproxy", "0.5.11");
+        reporter.phase("reading config").done("config defaults");
+        reporter.finish_and_clear();
+        assert_eq!(sink.text(), "aitmproxy 0.5.11\nconfig defaults\n");
+        no_escape_bytes(&sink);
+        assert!(matches!(&*reporter.lock(), State::Finished(Some(_))));
+    }
+
+    #[test]
+    fn plain_output_carries_no_control_byte_on_any_path_even_with_colour_allowed() {
+        // `CLICOLOR_FORCE=1 aitm 2>file`: colour allowed, no animation. Spec
+        // D4: the plain form never emits an escape byte or a carriage return.
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let caps = Caps {
+            color: true,
+            ..utf8_pipe()
+        };
+        let mut r = renderer(caps, Verbosity::Verbose, true, clock.clone(), &sink);
+        header(&mut r);
+        start(&mut r, &clock, 1, "binding ports");
+        r.handle(Msg::Progress {
+            id: 1,
+            done: 1,
+            total: Some(2),
+        });
+        clock.advance(Duration::from_millis(150));
+        r.tick();
+        done(
+            &mut r,
+            &clock,
+            1,
+            "proxy listening 127.0.0.1:8080 · browser proxy 127.0.0.1:8081",
+        );
+        start(&mut r, &clock, 2, "binding ports");
+        r.handle(Msg::PhaseFail {
+            id: 2,
+            what: "binding ports".to_string(),
+            at: clock.now(),
+        });
+        r.handle(Msg::Warn("log file unavailable".to_string()));
+        r.handle(Msg::Event(browser_event()));
+        r.handle(Msg::Event(boom_event()));
+        r.handle(Msg::Card(ca_card()));
+        r.handle(Msg::Error {
+            report: port_report().with_log(Some(PathBuf::from("/Users/matt/x.log"))),
+            home: Some(PathBuf::from("/Users/matt")),
+        });
+        let (ack, acked) = mpsc::sync_channel(1);
+        r.handle(Msg::Clear(ack));
+        assert_eq!(acked.try_recv(), Ok(()));
+        let (ack, acked) = mpsc::sync_channel(1);
+        r.handle(Msg::Flush(ack));
+        assert_eq!(acked.try_recv(), Ok(()));
+
+        assert_eq!(
+            sink.text(),
+            "aitmproxy 0.5.11\n\
+             proxy listening 127.0.0.1:8080 · browser proxy 127.0.0.1:8081 · in 150 ms\n\
+             error: binding ports\n\
+             warning: log file unavailable\n\
+             warning: embedded browser unavailable; browser.* commands will error engine=obscura error=nope\n\
+             error: boom\n\
+             CA: untrusted · aitm ca install\n\
+             Log: /Users/matt/x.log\n\
+             error: cannot start: the proxy port 127.0.0.1:8080 is already in use\n\
+             \x20 fix: lsof -nP -iTCP:8080 -sTCP:LISTEN\n\
+             \x20 log: /Users/matt/x.log\n"
+        );
+        no_escape_bytes(&sink);
+    }
+
+    #[test]
+    fn rich_output_uses_only_the_sixteen_colour_sgr_and_the_cursor_codes() {
+        for unicode in [true, false] {
+            let clock = FakeClock::new();
+            let sink = SharedSink::new();
+            let mut r = renderer_with_width(
+                rich_caps(true, unicode),
+                Verbosity::Verbose,
+                true,
+                clock.clone(),
+                &sink,
+                120,
+            );
+            header(&mut r);
+            start(&mut r, &clock, 1, "loading detections");
+            start(&mut r, &clock, 2, "starting obscura");
+            r.handle(Msg::Progress {
+                id: 1,
+                done: 12,
+                total: Some(49),
+            });
+            clock.advance(Duration::from_millis(150));
+            r.tick();
+            clock.advance(Duration::from_millis(100));
+            r.tick();
+            r.handle(Msg::Warn("log file unavailable".to_string()));
+            r.handle(Msg::Event(browser_event()));
+            r.handle(Msg::Event(boom_event()));
+            done(&mut r, &clock, 1, "49 detections ready");
+            r.handle(Msg::PhaseFail {
+                id: 2,
+                what: "starting obscura".to_string(),
+                at: clock.now(),
+            });
+            r.handle(Msg::Card(ca_card()));
+            r.handle(Msg::Error {
+                report: port_report().with_log(Some(PathBuf::from("/Users/matt/x.log"))),
+                home: Some(PathBuf::from("/Users/matt")),
+            });
+            let (ack, _acked) = mpsc::sync_channel(1);
+            r.handle(Msg::Clear(ack));
+
+            let bytes = sink.bytes();
+            let text = sink.text();
+            let seqs = csi_sequences(&bytes);
+            for seq in &seqs {
+                assert!(
+                    is_allowed_csi(seq),
+                    "forbidden sequence {seq:?} (unicode={unicode}) in {text:?}"
+                );
+            }
+            // The run really exercised every allowed family, so the
+            // allow-list check above is not vacuous.
+            for must in [
+                "\x1b[34m",
+                "\x1b[32m",
+                "\x1b[33m",
+                "\x1b[31m",
+                "\x1b[2m",
+                "\x1b[0m",
+                "\x1b[1G",
+                "\x1b[2K",
+                "\x1b[1A",
+                "\x1b[2A",
+                "\x1b[?2026h",
+                "\x1b[?2026l",
+            ] {
+                assert!(
+                    seqs.iter().any(|s| s == must),
+                    "{must:?} missing (unicode={unicode}) in {text:?}"
+                );
+            }
+            assert!(
+                !bytes.contains(&b'\r'),
+                "no CR (unicode={unicode}): {text:?}"
+            );
+            assert!(!text.contains("\x1b[9"), "bright SGR forbidden: {text:?}");
+            assert!(
+                !text.contains("38;5") && !text.contains("48;5") && !text.contains("38;2"),
+                "256/true colour forbidden: {text:?}"
+            );
+            if !unicode {
+                assert!(
+                    bytes.iter().all(|b| *b < 0x80),
+                    "ASCII glyphs must leave no byte >= 0x80: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ten_column_terminal_truncates_live_lines_and_prints_the_fix_command_whole() {
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let caps = Caps {
+            width: 10,
+            ..rich_caps(false, true)
+        };
+        let mut r = renderer_with_width(caps, Verbosity::Normal, false, clock.clone(), &sink, 10);
+        start(&mut r, &clock, 1, "loading detections");
+        clock.advance(Duration::from_millis(150));
+        r.tick();
+        assert_eq!(sink.text(), format!("{BEGIN}{CLR}  ⠋ loadi…\n{END}"));
+        assert_eq!(text::width("  ⠋ loadi…"), 10);
+
+        r.handle(Msg::Progress {
+            id: 1,
+            done: 12,
+            total: Some(49),
+        });
+        clock.advance(Duration::from_millis(100));
+        r.tick();
+        let text = sink.text();
+        assert!(
+            text.ends_with(&format!("{BEGIN}{UP1}{CLR}  ⠙ loadi…\n{END}")),
+            "{text:?}"
+        );
+
+        r.handle(Msg::Error {
+            report: port_report(),
+            home: None,
+        });
+        let text = sink.text();
+        assert!(
+            text.ends_with(&format!(
+                "{BEGIN}{UP1}{CLR}  ✕ loadi…\n{END}\n\
+                 ✕ cannot start: the proxy port 127.0.0.1:8080 is already in use\n\
+                 \n\
+                 \x20 ▸ lsof -nP -iTCP:8080 -sTCP:LISTEN\n"
+            )),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn width_probe_without_a_measurement_falls_back_to_the_caps_width() {
+        let sink = SharedSink::new();
+        let caps = Caps {
+            width: 40,
+            ..rich_caps(false, true)
+        };
+        let mut r = Renderer::new(
+            caps,
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            Box::new(sink.clone()),
+            Box::new(|| None),
+        );
+        r.handle(Msg::Event(browser_event()));
+        assert_eq!(
+            sink.text(),
+            format!("{BEGIN}{CLR}  ! embedded browser unavailable; brows…\n{END}")
+        );
+        assert_eq!(text::width("  ! embedded browser unavailable; brows…"), 40);
+    }
+
+    #[test]
+    fn a_label_wider_than_the_terminal_is_truncated_in_rich_and_whole_in_plain() {
+        let long = "x".repeat(200);
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            true,
+            clock.clone(),
+            &sink,
+        );
+        start(&mut r, &clock, 1, &long);
+        clock.advance(Duration::from_millis(150));
+        r.tick();
+        let live = format!("  ⠋ {}…", "x".repeat(75));
+        assert_eq!(sink.text(), format!("{BEGIN}{CLR}{live}\n{END}"));
+        assert_eq!(text::width(&live), 80);
+
+        done(&mut r, &clock, 1, &long);
+        let collapsed = format!("  ✓ {}…", "x".repeat(75));
+        let text = sink.text();
+        assert!(
+            text.ends_with(&format!("{BEGIN}{UP1}{CLR}{collapsed}\n{END}")),
+            "{text:?}"
+        );
+
+        // Plain mode never truncates: the summary is printed whole.
+        let plain = SharedSink::new();
+        let mut r = renderer(utf8_pipe(), Verbosity::Normal, true, clock.clone(), &plain);
+        start(&mut r, &clock, 2, &long);
+        done(&mut r, &clock, 2, &long);
+        assert_eq!(plain.text(), format!("{long}\n"));
+    }
+
+    #[test]
+    fn progress_follows_the_label_on_the_live_line() {
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            false,
+            clock.clone(),
+            &sink,
+        );
+        start(&mut r, &clock, 1, "loading detections");
+        r.handle(Msg::Progress {
+            id: 1,
+            done: 12,
+            total: Some(49),
+        });
+        clock.advance(Duration::from_millis(150));
+        r.tick();
+        assert_eq!(
+            sink.text(),
+            format!("{BEGIN}{CLR}  ⠋ loading detections 12/49\n{END}")
+        );
+
+        r.handle(Msg::Progress {
+            id: 1,
+            done: 20,
+            total: None,
+        });
+        // Progress for a phase that does not exist is ignored.
+        r.handle(Msg::Progress {
+            id: 99,
+            done: 1,
+            total: Some(1),
+        });
+        clock.advance(Duration::from_millis(100));
+        r.tick();
+        let text = sink.text();
+        assert!(
+            text.ends_with(&format!(
+                "{BEGIN}{UP1}{CLR}  ⠙ loading detections 20\n{END}"
+            )),
+            "{text:?}"
+        );
+
+        // Plain mode shows no progress: the phase prints nothing until it ends.
+        let plain = SharedSink::new();
+        let mut r = renderer(
+            Caps::plain(),
+            Verbosity::Normal,
+            true,
+            clock.clone(),
+            &plain,
+        );
+        start(&mut r, &clock, 2, "loading detections");
+        r.handle(Msg::Progress {
+            id: 2,
+            done: 12,
+            total: Some(49),
+        });
+        r.tick();
+        assert_eq!(plain.text(), "");
+        done(&mut r, &clock, 2, "49 detections ready");
+        assert_eq!(plain.text(), "49 detections ready\n");
+    }
+
+    #[test]
+    fn empty_warning_and_empty_event_lines() {
+        let empty_event = UiEvent {
+            level: tracing::Level::WARN,
+            target: "aitm::wire".to_string(),
+            message: String::new(),
+            fields: Vec::new(),
+        };
+
+        let plain = SharedSink::new();
+        let mut r = renderer(
+            Caps::plain(),
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            &plain,
+        );
+        r.handle(Msg::Warn(String::new()));
+        r.handle(Msg::Event(empty_event.clone()));
+        assert_eq!(plain.text(), "warning: \nwarning: aitm::wire\n");
+
+        let rich = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            &rich,
+        );
+        r.handle(Msg::Warn(String::new()));
+        r.handle(Msg::Event(empty_event));
+        assert_eq!(
+            rich.text(),
+            format!("{BEGIN}{CLR}  ! \n{END}{BEGIN}{CLR}  ! aitm::wire\n{END}")
+        );
+    }
+
+    #[test]
+    fn a_redacted_event_renders_token_equals_redacted_in_both_modes() {
+        let ev = UiEvent {
+            level: tracing::Level::WARN,
+            target: "aitm::web".to_string(),
+            message: "bridge token minted".to_string(),
+            fields: vec![("token".to_string(), crate::event::REDACTED.to_string())],
+        };
+
+        let plain = SharedSink::new();
+        let mut r = renderer(
+            Caps::plain(),
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            &plain,
+        );
+        r.handle(Msg::Event(ev.clone()));
+        assert_eq!(
+            plain.text(),
+            "warning: bridge token minted token=<redacted>\n"
+        );
+
+        let rich = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(true, true),
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            &rich,
+        );
+        r.handle(Msg::Event(ev));
+        assert_eq!(
+            rich.text(),
+            format!(
+                "{BEGIN}{CLR}  \x1b[33m!\x1b[0m bridge token minted\x1b[2m · token=<redacted>\x1b[0m\n{END}"
+            )
+        );
+    }
+
+    #[test]
+    fn quiet_rich_draws_no_live_region_but_still_shows_events_and_the_panel() {
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer_with_width(
+            rich_caps(false, true),
+            Verbosity::Quiet,
+            true,
+            clock.clone(),
+            &sink,
+            120,
+        );
+        header(&mut r);
+        start(&mut r, &clock, 1, "loading detections");
+        clock.advance(Duration::from_millis(150));
+        r.tick();
+        done(&mut r, &clock, 1, "49 detections ready");
+        r.handle(Msg::Card(bus_card()));
+        assert_eq!(
+            sink.text(),
+            "",
+            "header, phases and card are dropped under -q"
+        );
+
+        r.handle(Msg::Event(browser_event()));
+        r.handle(Msg::Error {
+            report: port_report(),
+            home: None,
+        });
+        assert_eq!(
+            sink.text(),
+            format!(
+                "{BEGIN}{CLR}  ! embedded browser unavailable; browser.* commands will error · engine=obscura · error=nope\n{END}\n\
+                 ✕ cannot start: the proxy port 127.0.0.1:8080 is already in use\n\
+                 \n\
+                 \x20 ▸ lsof -nP -iTCP:8080 -sTCP:LISTEN\n"
+            )
+        );
+    }
+
+    #[test]
+    fn finish_and_clear_counts_the_card_and_its_blank_line() {
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            true,
+            clock.clone(),
+            &sink,
+        );
+        header(&mut r); // header + its blank line: 1 to erase
+        start(&mut r, &clock, 1, "reading config");
+        done(&mut r, &clock, 1, "config defaults"); // 1 collapsed line
+        r.handle(Msg::Card(bus_card())); // blank line + 2 card lines
+        let (ack, acked) = mpsc::sync_channel(1);
+        r.handle(Msg::Clear(ack));
+        assert_eq!(acked.try_recv(), Ok(()));
+
+        let erase = "\x1b[1A\x1b[2K";
+        let text = sink.text();
+        assert!(text.ends_with(&erase.repeat(5)), "{text:?}");
+        assert!(!text.ends_with(&erase.repeat(6)), "{text:?}");
+
+        // A second clear has nothing left to erase.
+        let (ack, _acked) = mpsc::sync_channel(1);
+        r.handle(Msg::Clear(ack));
+        assert_eq!(sink.text(), text);
+    }
+
+    #[test]
+    fn live_lines_that_end_silently_are_blanked_on_the_next_frame() {
+        // Two drawn phases end with an `at` before the first-draw delay
+        // (one-shot mode prints nothing for them): the next frame has one
+        // line to show over two on screen, so the second is blanked and the
+        // cursor steps back over it.
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            false,
+            clock.clone(),
+            &sink,
+        );
+        let t0 = clock.now();
+        start(&mut r, &clock, 1, "a");
+        start(&mut r, &clock, 2, "b");
+        clock.advance(Duration::from_millis(150));
+        r.tick();
+        let drawn = sink.text();
+        assert_eq!(drawn, format!("{BEGIN}{CLR}  ⠋ a\n{CLR}  ⠋ b\n{END}"));
+
+        let early = t0 + Duration::from_millis(50);
+        r.handle(Msg::PhaseDone {
+            id: 1,
+            summary: "a".to_string(),
+            at: early,
+        });
+        r.handle(Msg::PhaseDone {
+            id: 2,
+            summary: "b".to_string(),
+            at: early,
+        });
+        assert_eq!(sink.text(), drawn, "a silent end draws nothing by itself");
+
+        r.handle(Msg::Warn("w".to_string()));
+        let text = sink.text();
+        assert_eq!(
+            &text[drawn.len()..],
+            format!("{BEGIN}\x1b[2A{CLR}  ! w\n{CLR}\n{UP1}{END}")
+        );
+    }
 }

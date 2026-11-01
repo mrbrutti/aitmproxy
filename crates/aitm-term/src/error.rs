@@ -317,4 +317,108 @@ mod tests {
             "error: usage: aitm [--config <path>] tui (takes no further arguments)\n  fix: aitm --help\n"
         );
     }
+
+    // ---- tester additions ----
+
+    #[test]
+    fn rich_panel_at_ten_columns_wraps_prose_but_prints_the_command_whole() {
+        let caps = Caps {
+            width: 10,
+            ..tty_no_color()
+        };
+        let report = ErrorReport::failure("cannot start")
+            .with_why(vec!["held by another aitm".to_string()])
+            .with_fix("free it or move")
+            .with_command("lsof -nP -iTCP:8080 -sTCP:LISTEN")
+            .with_log(Some(PathBuf::from(
+                "/Users/matt/Library/Application Support/aitmproxy/logs/aitm.log",
+            )));
+        let out = report.render_rich(&caps, &RICH, Some(Path::new("/Users/matt")));
+        assert_eq!(
+            out,
+            "✕ cannot start\n\
+             \x20 held by\n\
+             \x20 another\n\
+             \x20 aitm\n\
+             \x20 free it\n\
+             \x20 or move\n\
+             \n\
+             \x20 ▸ lsof -nP -iTCP:8080 -sTCP:LISTEN\n\
+             \n\
+             \x20 Log           ~/Library/Application Support/aitmproxy/logs/aitm.log\n"
+        );
+    }
+
+    #[test]
+    fn rich_panel_at_zero_width_puts_every_word_on_its_own_line_and_never_panics() {
+        let caps = Caps {
+            width: 0,
+            ..tty_no_color()
+        };
+        let report = ErrorReport::failure("x").with_why(vec!["a b".to_string()]);
+        assert_eq!(report.render_rich(&caps, &RICH, None), "✕ x\n  a\n  b\n");
+    }
+
+    #[test]
+    fn a_report_with_no_blocks_is_its_headline_alone() {
+        let empty = ErrorReport::failure("");
+        assert_eq!(empty.render_rich(&tty_no_color(), &RICH, None), "✕ \n");
+        assert_eq!(empty.render_plain(&RICH), "error: \n");
+
+        // No block, no blank line: the headline is the whole panel.
+        let bare = ErrorReport::failure("cannot start");
+        assert_eq!(
+            bare.render_rich(&tty_no_color(), &RICH, None),
+            "✕ cannot start\n"
+        );
+        assert_eq!(bare.render_plain(&RICH), "error: cannot start\n");
+
+        // An empty `why` vector and an empty `fix` string add nothing and
+        // one empty indented line respectively.
+        let with_empty = ErrorReport::failure("cannot start")
+            .with_why(Vec::new())
+            .with_fix("");
+        assert_eq!(
+            with_empty.render_rich(&tty_no_color(), &RICH, None),
+            "✕ cannot start\n"
+        );
+        assert_eq!(with_empty.render_plain(&RICH), "error: cannot start\n  \n");
+    }
+
+    #[test]
+    fn plain_render_prints_the_log_path_in_full_even_with_a_home() {
+        let report = ErrorReport::failure("x").with_log(Some(PathBuf::from("/Users/matt/x.log")));
+        // `render` in plain mode ignores `home` (plan C7).
+        assert_eq!(
+            report.render(&Caps::plain(), Some(Path::new("/Users/matt"))),
+            "error: x\n  log: /Users/matt/x.log\n"
+        );
+        assert_eq!(
+            report.render_rich(&tty_no_color(), &RICH, Some(Path::new("/Users/matt"))),
+            "✕ x\n\n  Log           ~/x.log\n"
+        );
+        assert_eq!(
+            report.render_rich(&tty_no_color(), &RICH, None),
+            "✕ x\n\n  Log           /Users/matt/x.log\n"
+        );
+    }
+
+    #[test]
+    fn rich_panel_paints_exactly_one_span_and_no_bright_or_256_colour_sgr() {
+        let caps = Caps {
+            color: true,
+            ..tty_no_color()
+        };
+        let out = m2_report().render_rich(&caps, &RICH, Some(Path::new("/Users/matt")));
+        assert!(!out.contains("\x1b[9"), "bright SGR forbidden: {out:?}");
+        assert!(!out.contains("38;5"), "256-colour forbidden: {out:?}");
+        assert!(!out.contains("38;2"), "truecolor forbidden: {out:?}");
+        assert_eq!(
+            out.matches("\x1b[").count(),
+            2,
+            "only the headline glyph and its reset: {out:?}"
+        );
+        assert!(out.starts_with("\x1b[31m✕\x1b[0m "));
+        assert!(!out.contains('\r'));
+    }
 }

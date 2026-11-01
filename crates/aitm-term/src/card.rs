@@ -277,4 +277,89 @@ mod tests {
         let ascii_pipe = Caps::plain();
         assert_eq!(card.render(&ascii_pipe), card.render_plain(&ASCII));
     }
+
+    // ---- tester additions ----
+
+    #[test]
+    fn empty_card_renders_its_headline_line_rich_and_nothing_plain() {
+        let empty = Card {
+            headline: String::new(),
+            headline_role: Role::Success,
+            rows: Vec::new(),
+        };
+        assert_eq!(empty.render_rich(&tty(false), &RICH), "● \n");
+        assert_eq!(empty.render_rich(&tty(true), &RICH), "\x1b[32m●\x1b[0m \n");
+        assert_eq!(empty.render_rich(&tty(false), &ASCII), "* \n");
+        assert_eq!(empty.render_plain(&RICH), "");
+        assert_eq!(empty.render(&Caps::plain()), "");
+    }
+
+    #[test]
+    fn card_rows_are_never_truncated_however_narrow_the_terminal() {
+        // Width is not consulted at all: ten columns, zero columns and
+        // eighty give the same bytes (plan C5: URLs, paths and commands stay
+        // copyable).
+        let card = m1_card(TILDE_LOG);
+        let narrow = Caps {
+            width: 10,
+            ..tty(false)
+        };
+        assert_eq!(card.render_rich(&narrow, &RICH), M1);
+        let zero = Caps {
+            width: 0,
+            ..tty(false)
+        };
+        assert_eq!(card.render_rich(&zero, &RICH), M1);
+        let narrow_pipe = Caps {
+            width: 10,
+            ..Caps::plain()
+        };
+        assert_eq!(
+            m1_card(FULL_LOG).render(&narrow_pipe),
+            m1_card(FULL_LOG).render_plain(&ASCII)
+        );
+    }
+
+    #[test]
+    fn a_label_wider_than_the_column_is_not_padded_and_does_not_panic() {
+        // T3 fixes the label set at twelve characters or fewer, so a wider
+        // label is a call-site bug; the renderer only has to stay whole.
+        let card = Card {
+            headline: "x".to_string(),
+            headline_role: Role::Success,
+            rows: vec![Row {
+                label: "System proxy watchdog",
+                value: "v".to_string(),
+                value_role: Role::Plain,
+                next: Some("aitm x".to_string()),
+            }],
+        };
+        assert_eq!(
+            card.render_rich(&tty(false), &RICH),
+            "● x\n  System proxy watchdogv\n                ▸ aitm x\n"
+        );
+        assert_eq!(
+            card.render_plain(&RICH),
+            "System proxy watchdog: v · aitm x\n"
+        );
+    }
+
+    #[test]
+    fn rich_card_carries_no_bright_or_256_colour_sgr() {
+        let out = m1_card(TILDE_LOG).render_rich(&tty(true), &RICH);
+        assert!(!out.contains("\x1b[9"), "bright SGR forbidden: {out:?}");
+        assert!(!out.contains("38;5"), "256-colour forbidden: {out:?}");
+        assert!(!out.contains("38;2"), "truecolor forbidden: {out:?}");
+        assert!(
+            !out.contains("\x1b[4"),
+            "background colour forbidden: {out:?}"
+        );
+        // Exactly the spans T2 allows: the glyph, two warning values and
+        // the dim log path, each with its reset.
+        assert_eq!(out.matches("\x1b[32m").count(), 1, "{out:?}");
+        assert_eq!(out.matches("\x1b[33m").count(), 2, "{out:?}");
+        assert_eq!(out.matches("\x1b[2m").count(), 1, "{out:?}");
+        assert_eq!(out.matches("\x1b[0m").count(), 4, "{out:?}");
+        assert_eq!(out.matches("\x1b[").count(), 8, "{out:?}");
+    }
 }

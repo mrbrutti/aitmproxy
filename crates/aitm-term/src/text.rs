@@ -290,4 +290,71 @@ mod tests {
         );
         assert_eq!(tilde(Path::new("/tmp/x"), Some(Path::new(""))), "/tmp/x");
     }
+
+    // ---- tester additions: edge cases a reporting layer must survive ----
+
+    #[test]
+    fn strip_sgr_survives_an_unterminated_introducer() {
+        // A bare `ESC[` at the very end hides nothing but itself.
+        assert_eq!(strip_sgr("a\x1b["), "a");
+        assert_eq!(strip_sgr("\x1b["), "");
+        // An unterminated sequence whose body is multibyte text ends at the
+        // string's end without slicing inside a character.
+        assert_eq!(strip_sgr("a\x1b[日本"), "a");
+        assert_eq!(width("a\x1b["), 1);
+        // Two sequences back to back, then text.
+        assert_eq!(strip_sgr("\x1b[1A\x1b[2Kx"), "x");
+    }
+
+    #[test]
+    fn truncate_with_room_smaller_than_the_ellipsis_returns_only_the_ellipsis() {
+        assert_eq!(truncate("abcdef", 2, "..."), "...");
+        assert_eq!(truncate("abcdef", 3, "..."), "...");
+        assert_eq!(truncate("abcdef", 0, "..."), "...");
+        assert_eq!(truncate("abcdef", 1, "…"), "…");
+        // An empty text always fits, whatever the budget.
+        assert_eq!(truncate("", 0, "…"), "");
+    }
+
+    #[test]
+    fn truncate_a_ten_thousand_character_word_to_ten_columns() {
+        let word = "x".repeat(10_000);
+        let out = truncate(&word, 10, "…");
+        assert_eq!(out, format!("{}…", "x".repeat(9)));
+        assert_eq!(width(&out), 10);
+        // Wide characters are never split: four columns hold one `日` and
+        // the ellipsis, not one and a half.
+        let wide = "日".repeat(10_000);
+        assert_eq!(truncate(&wide, 4, "…"), "日…");
+    }
+
+    #[test]
+    fn wrap_keeps_a_ten_thousand_character_word_whole_on_one_line() {
+        let word = "y".repeat(10_000);
+        let lines = wrap(&word, 80, "  ");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], format!("  {word}"));
+        assert_eq!(lines[0].len(), 10_002);
+        // Surrounded by short words it still stands alone, unbroken.
+        let lines = wrap(&format!("a {word} b"), 80, "  ");
+        assert_eq!(
+            lines,
+            vec!["  a".to_string(), format!("  {word}"), "  b".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_at_zero_width_or_under_the_indent_puts_every_word_on_its_own_line() {
+        assert_eq!(wrap("a b c", 0, ""), vec!["a", "b", "c"]);
+        assert_eq!(wrap("a b c", 1, "  "), vec!["  a", "  b", "  c"]);
+    }
+
+    #[test]
+    fn tilde_with_root_as_home() {
+        let root = Path::new("/");
+        assert_eq!(tilde(Path::new("/"), Some(root)), "~");
+        assert_eq!(tilde(Path::new("/tmp/x"), Some(root)), "~/tmp/x");
+        assert_eq!(tilde(Path::new("relative/x"), Some(root)), "relative/x");
+        assert_eq!(tilde(Path::new(""), Some(Path::new("/Users/matt"))), "");
+    }
 }
