@@ -605,19 +605,24 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   (operator-only, like capture).
 - **Settings ▸ Proxy** gains, below the embedded-proxy section: a live toggle
   "Set as system proxy" (position = the fact, never a preference; disabled with
-  the reason while `setting`, unsupported, or the bus is not connected as
-  operator); a persisted toggle "Set system proxy at launch"
+  the reason while `setting`, unsupported, the bus is not connected as operator, or the core has
+  not reported the system proxy yet; the route's line and an "N hosts" count under the field —
+  as built 2026-11-01); a persisted toggle "Set system proxy at launch"
   (`Store.defaults` key `systemProxy.auto`, read by `EmbeddedCore` at spawn
   and emitted as a top-level `system_proxy:\n  auto: true\n` block in the
   per-launch config, like `macos_capture`); an editable "Bypass hosts" field
   (`systemProxy.bypass`, comma/space separated, emitted as `system_proxy.bypass`
-  and passed as the `bypass` param on a live set); the §D12 lane sentence and
+  and passed as the `bypass` param on a live set; the mac field drops a piece carrying a control
+  or illegal scalar — the per-launch config would not parse — or a leading `-`, an argv flag to
+  `networksetup`; everything else is the core's to judge, §D5); the §D12 lane sentence and
   the §D5 copy as footnotes; the `guidance` line as selectable text when
   unsupported. The launch toggle and the bypass field apply on Restart Core
   (the existing Apply & Restart rule).
 - **First-run sheet** (once per install, `Store.defaults` key
   `systemProxy.sheetShown`): shown when the embedded core reaches `.ready`, the
-  bus is connected as operator, the fact is not `points_at_us`, `systemProxy.auto`
+  bus is connected as operator, the system-proxy route is known, closed and `supported` with no
+  change in flight (a word that names no endpoint — `unknown`, `unsupported`, `needs_privilege`,
+  `other` at our own address — shows no row to act on; as built 2026-11-01), `systemProxy.auto`
   is off, and `systemProxy.promptSuppressed` is false. (The toolbar Proxy switch is
   pause/resume, not the system proxy; the "flip to on" trigger was dropped 2026-11-01. The sheet
   is `Shell/SetupSheet.swift`, shared with D17.8.) Title "Set
@@ -654,9 +659,9 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   the `.caTrusted` step ("Trust the aitmproxy CA") between `.busConnected` and
   `.extensionOn`.**
 - **Menu**: Proxy ▸ "Set as System Proxy" / "Restore System Proxy" (one item,
-  title follows the fact; ⌥⌘P), gated like the Settings toggle. Palette: the `CommandMap` row (the
-  brief's contract); the raw verbs are excluded from the palette's Commands list and the Agent
-  log's Approve, so the only entries are the gated menu item and the Settings toggle.
+  title follows the fact; ⌥⌘P), gated like the Settings toggle. Palette: the `CommandMap` row only
+  (the brief's contract); the raw verbs are excluded from the palette's Commands list and refused
+  by the Agent log's Approve (`Session.isSystemProxyVerb`, pinned by the tripwire's rule 3).
 - **Quit**: nothing new. The embedded core's orderly SIGTERM path (§D9 a)
   restores; the watchdog (§D9 b) covers a force-kill.
 - **Tripwire**: a new `apps/mac/tools/check-sysproxy-operator-only.sh`, the

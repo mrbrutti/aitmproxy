@@ -1256,7 +1256,8 @@ under Matt's standing mandate; the deviations marked **(Matt)** are flagged in t
   `AitmproxyKit/CoreConnection.swift`, `Bus/EmbeddedCoreController.swift`; Task 28 →
   `AitmproxyKit/SetupWords.swift` (+Tests: row title, checklist, caption), `Session+Palette.swift`
   (the two verbs excluded from the Commands list), `Panels/AgentPanel.swift` (Approve refuses them);
-  Task 24 → `SystemProxyFacts.keepingFullFields(from:)`. Task 28's Kit half: `CommandMap` row `E("Proxy", "Set as / Restore System
+  Task 24 → `SystemProxyFacts.keepingFullFields(from:)`; Task 28 → `Shell/ShellView.swift`
+  (`EmptyFlows` carries `systemProxyControlLive`). Task 28's Kit half: `CommandMap` row `E("Proxy", "Set as / Restore System
   Proxy", "⌥⌘P", items: toggle([...]))` directly after the CA row, and the same words appended to
   `docs/BRIEF.md`'s Proxy row (`mapMatchesTheBrief` pins the two together). There is no
   "Network Settings…" item on main (superseded 2026-11-01 in the traffic-route plan).
@@ -1277,8 +1278,9 @@ under Matt's standing mandate; the deviations marked **(Matt)** are flagged in t
   `capture.enabled` without moving the lines `check-capture-toggle.sh` pins.
 - **Task 28 → sheet row, Status, banner, menu.** `SetupSheet` gains row 1 "Set aitmproxy as the
   system proxy" above the CA row (CA → 2, Scope → 3; the `SetupRow` numbers follow), with the
-  route's line, `PrimaryButton("Set as System Proxy")` (sets `systemProxy.auto = true` then
-  calls `setSystemProxy()`; caption exactly "Also turns on “Set system proxy at launch” in
+  route's line, `PrimaryButton("Set as System Proxy")` (calls `setSystemProxy()`, then sets
+  `systemProxy.auto = true` once the facts report `points_at_us` — a refused set leaves the
+  preference off; caption exactly "Also turns on “Set system proxy at launch” in
   Settings ▸ Proxy"), hidden once open, disabled unless `systemProxyControlLive`; a
   `Toggle("Don't ask again")` writing `systemProxy.promptSuppressed` (the key existed unwritten).
   `StatusPanel.run`, `RouteActions.run` (RouteBanner.swift) and the Flows empty state route
