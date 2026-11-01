@@ -1492,7 +1492,7 @@ extension ScanSurfaceTests {
         #expect(scanNoJobsText == "No jobs yet — pick a profile and Start Scan.")
         #expect(scanNoIssuesText == "No issues — start a scan, or widen the filters.")
         #expect(scanNoSitemapText == "No site map yet — a running job fills this as it crawls.")
-        #expect(scanProfileNameRuleText == "Use letters, digits, - _ . (not leading)")
+        #expect(scanProfileNameRuleText == "Use lowercase letters, digits, - _ . (start with a letter or digit)")
         #expect(ScanFormat.findingText("f-3b1c") == "Finding f-3b1c")
         #expect(scanNoProfilesText == "No profiles — the core lists none.")
         #expect(scanNothingToDeleteText(name: "my-api") == "Nothing to delete: my-api is not on the core")
@@ -1538,7 +1538,8 @@ extension ScanSurfaceTests {
     /// S5: a profile name is a store key on the core; only a plain token may go there.
     @Test func profileNamesAreValidatedBeforeTheyReachTheCore() {
         #expect(ScanSurface.isValidProfileName("my-api"))
-        #expect(ScanSurface.isValidProfileName("My.API_2"))
+        #expect(ScanSurface.isValidProfileName("my.api_2"))
+        #expect(!ScanSurface.isValidProfileName("My.API_2"), "the engine takes lowercase only")
         #expect(ScanSurface.isValidProfileName("standard"))
         #expect(ScanSurface.isValidProfileName("a"))
         #expect(ScanSurface.isValidProfileName(String(repeating: "a", count: 64)))
@@ -1681,7 +1682,8 @@ extension ScanSurfaceTests {
     /// or NUL scalars) passes however many scalars it has.
     @Test func profileNameRuleAtItsBoundaries() {
         let sixtyThree = String(repeating: "a", count: 63)
-        #expect(ScanSurface.isValidProfileName(sixtyThree + "Z"))
+        #expect(ScanSurface.isValidProfileName(sixtyThree + "z"))
+        #expect(!ScanSurface.isValidProfileName(sixtyThree + "Z"), "uppercase is refused")
         #expect(ScanSurface.isValidProfileName(sixtyThree + "."))
         #expect(ScanSurface.isValidProfileName(sixtyThree + "-"))
         #expect(ScanSurface.isValidProfileName(sixtyThree + "_"))
@@ -1693,7 +1695,7 @@ extension ScanSurfaceTests {
         #expect(ScanSurface.isValidProfileName("api."))
         #expect(ScanSurface.isValidProfileName("api.."))
         #expect(ScanSurface.isValidProfileName("api-"))
-        #expect(ScanSurface.isValidProfileName("_api"))
+        #expect(!ScanSurface.isValidProfileName("_api"), "a name starts with a letter or digit")
         #expect(ScanSurface.isValidProfileName("0"))
         #expect(ScanSurface.isValidProfileName("9-lives"))
         #expect(ScanSurface.isValidProfileName("a..b"), "two dots inside a name are not a path segment")

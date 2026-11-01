@@ -65,7 +65,7 @@ public func scanNothingToDeleteText(name: String) -> String { "Nothing to delete
 public func scanUnableText(_ what: String, _ reason: String) -> String { "Unable to \(what): \(reason)" }
 
 /// The Duplicate… popover's hint under a name `ScanSurface.isValidProfileName` refuses.
-public let scanProfileNameRuleText = "Use letters, digits, - _ . (not leading)"
+public let scanProfileNameRuleText = "Use lowercase letters, digits, - _ . (start with a letter or digit)"
 
 // MARK: - Offering
 
@@ -94,13 +94,22 @@ public enum ScanSurface {
     /// `-`, `_` or `.`, not starting with `.` or `-`. So no path separator, no
     /// whitespace, no NUL, no `..` segment can reach the core's store.
     public static func isValidProfileName(_ name: String) -> Bool {
-        let scalars = name.unicodeScalars
+        // The engine's rule for a saved profile (`^[a-z0-9][a-z0-9._-]{0,63}$`): lowercase
+        // only, so collisions are case-insensitive by construction; validated here before
+        // the name ever reaches `scan.profile.save`, and again by the core before any path.
+        let scalars = Array(name.unicodeScalars)
         guard (1...64).contains(scalars.count) else { return false }
-        guard let first = scalars.first, first != ".", first != "-" else { return false }
-        return scalars.allSatisfy { scalar in
+        func lowerOrDigit(_ scalar: Unicode.Scalar) -> Bool {
             switch scalar {
-            case "a"..."z", "A"..."Z", "0"..."9", "-", "_", ".": true
+            case "a"..."z", "0"..."9": true
             default: false
+            }
+        }
+        guard lowerOrDigit(scalars[0]) else { return false }
+        return scalars.dropFirst().allSatisfy { scalar in
+            switch scalar {
+            case "-", "_", ".": true
+            default: lowerOrDigit(scalar)
             }
         }
     }
