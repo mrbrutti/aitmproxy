@@ -33,17 +33,27 @@ public enum AppIdentifier {
     /// Most dotted components LaunchServices is asked about (the walk is one IPC per component).
     public static let maxIdentifierComponents = 8
 
+    /// Most characters a tooltip shows of an identifier — the same figure as `maxIdentifierBytes`
+    /// by choice, counted in characters because a tooltip is text, not wire bytes.
+    public static let maxTooltipCharacters = 256
+
     /// The identifier as a tooltip (D10): control and format scalars (Cc, Cf — bidi overrides
-    /// included) removed, capped at `maxIdentifierBytes` characters, nothing else changed — no
-    /// trimming, no `.app` rule (stage-6 security S-M3: the raw `bundleID` is wire text).
+    /// included) removed, capped at `maxTooltipCharacters`, nothing else changed — no trimming,
+    /// no `.app` rule (stage-6 security S-M3: the raw `bundleID` is wire text).
     public static func tooltipText(_ identifier: String) -> String {
-        let scalars = identifier.unicodeScalars.filter { scalar in
+        String(withoutControlAndFormat(identifier).prefix(maxTooltipCharacters))
+    }
+
+    /// Control (Cc) and format (Cf) scalars removed — the same two categories PR B's
+    /// `ClientInfo.displayName(forSourceApp:)` filters, repeated here because `Flow.swift` is not
+    /// edited. One copy for `sanitized` and `tooltipText`.
+    private static func withoutControlAndFormat(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter { scalar in
             switch scalar.properties.generalCategory {
             case .control, .format: false
             default: true
             }
-        }
-        return String(String.UnicodeScalarView(scalars).prefix(maxIdentifierBytes))
+        }))
     }
 
     /// `node-5555…` → `node`: an identifier with no `.` whose tail is `-` + 16 or more lowercase
@@ -64,17 +74,11 @@ public enum AppIdentifier {
         knownUnbundled[identifier] ?? ClientInfo.displayName(forSourceApp: trimmedAdHoc(identifier))
     }
 
-    /// A bundle-supplied name made safe to show: control (Cc) and format (Cf) scalars removed —
-    /// the same two categories PR B's `ClientInfo.displayName(forSourceApp:)` filters, repeated
-    /// here because `Flow.swift` is not edited — whitespace and newlines trimmed, one trailing
-    /// `.app` dropped, at most 64 characters; nil when nothing printable is left.
+    /// A bundle-supplied name made safe to show: control (Cc) and format (Cf) scalars removed
+    /// (`withoutControlAndFormat`), whitespace and newlines trimmed, one trailing `.app` dropped,
+    /// at most 64 characters; nil when nothing printable is left.
     public static func sanitized(_ name: String) -> String? {
-        var text = String(String.UnicodeScalarView(name.unicodeScalars.filter { scalar in
-            switch scalar.properties.generalCategory {
-            case .control, .format: return false
-            default: return true
-            }
-        }))
+        var text = withoutControlAndFormat(name)
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasSuffix(".app") { text.removeLast(4) }
         text = String(text.prefix(64))

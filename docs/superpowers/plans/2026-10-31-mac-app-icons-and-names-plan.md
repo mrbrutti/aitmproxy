@@ -123,6 +123,13 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       public static func serviceLabel(_ name: String) -> String
       public static let knownUnbundled: [String: String]
       public static let ownerMap: [String: String]
+      /// Caps on what LaunchServices is asked about (stage-6 S-I1): over either, `candidates` is `[]`.
+      public static let maxIdentifierBytes: Int        // 256 UTF-8 bytes
+      public static let maxIdentifierComponents: Int   // 8 dotted parts
+      /// Most characters an identifier tooltip shows (stage-6 S-M3); the same figure by choice.
+      public static let maxTooltipCharacters: Int      // 256
+      /// The identifier for a tooltip: Cc/Cf removed, capped, no trimming (D10).
+      public static func tooltipText(_ identifier: String) -> String
   }
 
   public extension ClientInfo {
@@ -134,6 +141,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
   Rules, verbatim from D1:
   - `candidates`: split on `.`; fewer than three components → `[identifier]`; else the identifier
     then every prefix with ≥ 3 components, longest first.
+  - `candidates` cap (stage-6 S-I1): over `maxIdentifierBytes` (256) or `maxIdentifierComponents` (8) → `[]`, never asked of LaunchServices.
+  - `tooltipText` (stage-6 S-M3, D10): Cc/Cf removed via the one shared filter, capped at `maxTooltipCharacters` (256) characters, no trimming, no `.app` rule.
   - `trimmedAdHoc`: only when the identifier contains no `.`; regex `^(.+)-([0-9a-f]{16,})$`
     (lowercase hex only) → group 1; else unchanged.
   - `fallbackName`: `knownUnbundled[id] ?? ClientInfo.displayName(forSourceApp: trimmedAdHoc(id))`.
@@ -283,7 +292,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 ### Task 3: Overview counts by group key
 
 - **Satisfies:** AI-AC11
-- **Depends on:** Task 1 for compilation (`groupKey`); coded in parallel.
+- **Depends on:** Tasks 1 and 2 for compilation (`groupKey`; `ClientTree.clients`, since the stage-6 Q-I1 fix); coded in parallel.
 - **Files:**
   - `apps/mac/Sources/AitmproxyKit/Panels/Overview.swift` (modify)
   - `apps/mac/Sources/AitmproxyKit/Panels/OverviewBreakdowns.swift` (modify)
@@ -298,7 +307,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     `clients` is grouped by `groupKey` with the name taken from the first row of that key, ordered
     count desc, then name asc, then key asc (the same order as `ClientTree.clients`).
   - App view `Panels/OverviewBreakdowns.swift` "Clients" section: `ForEach(breakdowns.clients, id: \.key)`,
-    label `entry.name`, `.help(entry.key)`, action `session.show(.apps, group: .client(entry.key))`,
+    label `entry.name`, `.help(AppIdentifier.tooltipText(entry.key))` (D10, stage-6 S-M3), action `session.show(.apps, group: .client(entry.key))`,
     accessibility label unchanged in shape.
 - **Test:** with the AI-AC7 rows built locally in each test file (same private helper as Task 2;
   do not share a file):
@@ -403,7 +412,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 
 ### Task 5: Session tree state and the sidebar Apps tree
 
-> Checklist additions (stage-6 on PR #268): (1) the context-menu noun at `SidebarView.swift:158` must say "Host" for `.clientHost` too (today every non-`.host` group reads "App"); (2) delete `AppMark` (NSRunningApplication path) — `ClientMark` replaces it; (3) `Session.clients` becomes `ClientTree.clients(in: rows)` unless the one-line interim widening already landed it (Review log Q-M1); (4) every identifier tooltip is `AppIdentifier.tooltipText(id)` (security S-M3).
+> Checklist additions (stage-6 on PR #268): (1) the context-menu noun at `SidebarView.swift:158` must say "Host" for `.clientHost` too (today every non-`.host` group reads "App"); (2) delete `AppMark` (NSRunningApplication path) — `ClientMark` replaces it; (3) `Session.clients` already delegates to `ClientTree.clients(in: rows)` (interim widening, Review log Q-M1) — Task 5 only confirms it; (4) every identifier tooltip is `AppIdentifier.tooltipText(id)` (security S-M3).
 
 - **Satisfies:** D4 (Session), D5, D7, D10 (sidebar rows); AI-AC13 (tripwires); proven live by
   AI-AC14, AI-AC15, AI-AC19, AI-AC20 (Task 8).
@@ -433,7 +442,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       leading inset `12`, then the row `Button` (`ClientMark(client:)` at inset `28`, `Space.sm`,
       title `client.name`, spacer, count) whose action is `session.show(.apps, group: .client(key))`;
       height `Tok.Size.control`; fill `Tok.Ground.active` when `session.page == .apps && session.group == .client(key)`;
-      `.help(client.bundleID ?? client.name)`; `.contextMenu` Pin/Unpin App via
+      `.help(AppIdentifier.tooltipText(client.bundleID ?? client.name))` (D10); `.contextMenu` Pin/Unpin App via
       `session.pin/unpin(.client(key))`; accessibility label
       `"<name>, <count> flows[, pinned], expanded|collapsed"` plus `.accessibilityAction(named:)`
       "Expand"/"Collapse".
@@ -445,7 +454,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     - Pinned apps: `ForEach(session.pins.apps …)` keyed by the stored key; `current = session.clients.first { $0.0.groupKey == key }`;
       title `current?.0.name ?? key`, mark `ClientMark(client: current?.0 ?? ClientInfo(name: key, bundleID: key))`
       (plan call: a stale key still resolves through the one cache), count `current?.1`,
-      `.help(key)`; visible when the query matches the key or the current name; not expandable.
+      `.help(AppIdentifier.tooltipText(key))` (D10); visible when the query matches the key or the current name; not expandable.
     - `subItem` signature becomes
       `private func subItem<Mark: View>(_ group: FlowGroup, title: String, count: Int?, page: SidebarPage, leadingInset: CGFloat = 28, help: String? = nil, @ViewBuilder mark: () -> Mark) -> some View`;
       Domains rows and pinned hosts call it with `mark: { Monogram(text: "◎") }` and the default inset —
@@ -463,6 +472,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 ---
 
 ### Task 6: Poll-loop enrichment and the Client cell
+
+> Checklist addition (stage-6 on PR #268): the Client cell tooltip is `AppIdentifier.tooltipText(identifier)`, never the raw `bundleID` (D10, security S-M3).
 
 - **Satisfies:** D3, D6; AI-AC22 (diff shape); proven live by AI-AC17, AI-AC18, AI-AC21 (Task 8).
 - **Depends on:** Task 4 (`AppIdentityResolver`, `Tok.Glyph.process`); **gate 4** (the traffic-route PR
@@ -490,7 +501,7 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
       `clientIcon.contentTintColor = meta.nsColor`; pending → `clientIcon.image = nil` and
       `AppIdentityResolver.shared.onResolve(identifier) { [weak self] verdict in guard let self, self.shownIdentifier == identifier else { return }; <apply as above> }`.
       `client == nil` → `label.stringValue = Format.dash`, `clientIcon` hidden.
-    - `toolTip`: `.client` → `row.client.map { $0.bundleID ?? $0.name }`.
+    - `toolTip`: `.client` → `row.client.map { AppIdentifier.tooltipText($0.bundleID ?? $0.name) }` (D10, stage-6 S-M3: never the raw `bundleID`).
     - `describeDrawnViews`: `clientIcon.setAccessibilityElement(!clientIcon.isHidden && clientIcon.image != nil)`,
       role `.image`, label `row.client?.name`.
     - `backgroundStyle` override and `FlowRowView.isEmphasized` stay as they are (selection must
@@ -733,9 +744,9 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | PR #268 | spec | Minor | SP-M2 — I-1/I-2 Review-log rows carried no fix SHA | fixed in docs (this commit): `b45c3045` |
 | PR #268 | spec | Minor | SP-M3 — D2 step 6 had no rule for the all-nil name case the code handles (Task 4 deviation (d)) | fixed in docs (this commit): "if none sanitises, `AppIdentifier.fallbackName(for: id)`" |
 | PR #268 | spec | Minor | SP-M4 — AI-AC5 says "four true paths" but D1 listed three; the test's fourth (`.xpc/`) literal was the coder's | fixed in docs (this commit): fourth path added to D1 |
-| PR #268 | spec | Minor | SP-M5 — `Session.clients` (`Session.swift:360-364`) still groups by `ClientInfo` value until Task 5, so the Apps header can exceed the Overview tile in the I-2 scenario while the Kit half is on main alone | accepted (plan defers it to Task 5; recorded so the half-landed ruling is known) |
+| PR #268 | spec | Minor | SP-M5 — `Session.clients` (`Session.swift:360-364`) still groups by `ClientInfo` value until Task 5, so the Apps header can exceed the Overview tile in the I-2 scenario while the Kit half is on main alone | superseded: the one-line Session.swift widening (Q-M1 grant) lands `ClientTree.clients(in: rows)` in this PR, so the Apps header equals the Overview tile on main alone |
 | PR #268 | quality | Important | Q-I1 — `OverviewBreakdowns.clients` re-implemented `ClientTree.clients` (group by key, first-row name, count→name→key sort); the two copies drifted once already in this range (Tester I-2) | fixed (this commit): `clients = ClientTree.clients(in: http).map { ClientCount(key:name:count:) }`; `OverviewStats.clients` stays a one-liner |
-| PR #268 | quality | Minor | Q-M1 — `ClientTree.swift` doc comment says `Session.clients` calls it while `Session.swift:360-364` still carries the old `ClientInfo`-value loop (a third copy, the one running) | orchestrator asked 2026-11-01 to widen the Session.swift interim claim by one line (`var clients { ClientTree.clients(in: rows) }`); disposition recorded when answered |
+| PR #268 | quality | Minor | Q-M1 — `ClientTree.swift` doc comment says `Session.clients` calls it while `Session.swift:360-364` still carries the old `ClientInfo`-value loop (a third copy, the one running) | orchestrator GRANTED 2026-11-01 the one-line widening of the Session.swift interim claim: `var clients: [(ClientInfo, Int)] { ClientTree.clients(in: rows) }` (same return shape, no callers changed; nothing near `systemProxy`/`decrypt`/`caTrust`/the poll loop; PR 4 re-merges over it); fixed in the commit after a5e5ea86 |
 | PR #268 | quality | Minor | Q-M2 — stale "overwrite keeps age" test comment | = spec SP-M1, fixed (this commit) |
 | PR #268 | quality | Minor | Q-M3 — `AppIdentityResolver` had an internal `init()` beside `shared` (a second resolver with cold caches was constructible), `owner(of:)` internal among private siblings, step-7 comment described `store`'s job | fixed (this commit): `private init()`, `private static owner(of:)`, step-7 comment reworded |
 | PR #268 | quality | Minor | Q-M4 — tester suite: a runtime `#expect(shared is BoundedCache…)` that cannot fail stood in for a compile-time check; `boundedCacheOverwriteRefreshesTheOldest` re-proves a Coder property | fixed (this commit): `let _: any Sendable = …` with a comment; the overlapping test kept, overlap accepted in writing (it pins the refresh from the other key and the count) |
@@ -745,6 +756,17 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | PR #268 | security | Minor | S-M2 — the prefix walk lets an ad-hoc-signed local binary (`codesign -i com.apple.Safari.sync`) wear Safari's icon and "Safari (Service)"; the tooltip's raw id is the only tell | accepted as a design gap (the NE does not verify the signer); spec Open question 4; follow-up in Shipped: team-id beside `source_app` from the extension's audit token, resolver inherits only on a team match |
 | PR #268 | security | Minor | S-M3 — the Overview bar tooltip showed the raw `bundleID` (no Cc/Cf filter, no cap): a U+202E override makes the tail read as another vendor | fixed (this commit): `AppIdentifier.tooltipText(_:)` (Cc/Cf stripped, 256-char cap, no trimming) used by the bar `.help`; D10 rule; Task 5 uses it for the sidebar rows; tester `tooltipTextStripsFormatAndControlScalarsAndCaps` |
 | PR #268 | security | — | `unsafe` sign-off: none in range; no `@unchecked`/`nonisolated(unsafe)`; the `Handoff` wrapper was not needed | n/a |
+| PR #268 | security (delta re-verification of a5e5ea86) | — | S-I1/S-M1/S-M3 verified fixed, S-M2 accepted; residual recorded: past 4096 distinct LIVE identifiers the `seen` set rotates and the poll re-resolves (live − 4096) per tick, each now ≤ 6 IPCs of ≤ 256 bytes — bounded CPU, attacker-only shape; no `unsafe` in range | PASS, 0 open; residual accepted (hardening option: size `seen` from `max_flows`) |
+| PR #268 | quality (delta re-verification of a5e5ea86) | Minor | QD1 — the Cc/Cf scalar filter appeared twice in `AppIdentifier` (`sanitized`, `tooltipText`); the tooltip cap was documented as "`maxIdentifierBytes` characters" | fixed (this commit): one private `withoutControlAndFormat`; `maxTooltipCharacters = 256` named as the same figure by choice |
+| PR #268 | quality (delta re-verification of a5e5ea86) | Minor | QD2 — the two S-I1/S-M3 contract tests lived in the tester's edge-shape suite | fixed (this commit): moved into `AppIdentifierTests` |
+| PR #268 | quality (delta re-verification of a5e5ea86) | Minor | QD3 — `seen` comment gave the mechanism, not the visible cost (an evicted identifier's rows show the Kit name until a visible mark re-reads it) | fixed (this commit): one sentence added |
+| PR #268 | spec (delta re-verification of a5e5ea86) | Important | SPD-I1 — the identifier-tooltip rule was written two ways: D10 said `tooltipText`, while spec D4/D5 and plan Tasks 3/5/6 still wrote the raw `.help(key)` form and Task 6 had no instruction | fixed in docs (this commit): all six sites read `AppIdentifier.tooltipText(…)`; Task 6 checklist line |
+| PR #268 | spec (delta) | Minor | SPD-M1 — `maxIdentifierBytes`, `maxIdentifierComponents`, `tooltipText` (and `maxTooltipCharacters`) missing from D1's API block and plan Task 1's signature block / rules | fixed in docs (this commit) |
+| PR #268 | spec (delta) | Minor | SPD-M2 — tooltip cap stated in three units (bytes / scalars / characters) | fixed: code caps on `Character`s (`String.prefix`), constant `maxTooltipCharacters`, spec says characters; test adds a 300-flag literal → 256 characters / 512 scalars |
+| PR #268 | spec (delta) | Minor | SPD-M3 — AI-AC1 pointed at "the S-M3 literals above" with one literal in D1 | fixed in docs (this commit): four `tooltipText` literals listed |
+| PR #268 | spec (delta) | Minor | SPD-M4 — the resolver's `seen` set was only in the Amendments line; Constraints, D1 `enriched` doc, D1 storage comment and D3 still described two caches and "one poll" | fixed in docs (this commit) |
+| PR #268 | spec (delta) | Minor | SPD-M5 — plan Task 3 "Depends on: Task 1" while the Q-I1 fix made it call `ClientTree.clients` | fixed in docs (this commit): Tasks 1 and 2 |
+| PR #268 | spec (delta) | Minor | SPD-M6 — Open question 4 was inserted before item 3 | fixed in docs (this commit): reordered |
 
 ## Shipped
 

@@ -38,7 +38,8 @@ final class AppIdentityResolver {
     /// Identifiers resolved at least once. The poll loop's `enriched` never re-schedules one of
     /// these after `verdicts` evicted it (stage-6 security S-M1: past 512 distinct identifiers the
     /// poll would otherwise re-resolve the evicted ones every tick, forever); only a visible
-    /// `identity(for:)` read does, so re-resolution is bounded by what is on screen.
+    /// `identity(for:)` read does, so re-resolution is bounded by what is on screen. Cost: an
+    /// evicted identifier's rows show the Kit name again until a visible mark re-reads it.
     @ObservationIgnored private var seen = BoundedCache<String, Bool>(capacity: 4096)
     /// `onResolve` callbacks waiting for a verdict, by identifier.
     @ObservationIgnored private var pending: [String: [@MainActor (AppIdentity) -> Void]] = [:]

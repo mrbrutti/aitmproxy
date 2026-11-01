@@ -94,4 +94,45 @@ import Testing
         // Already that name: an equal value, so a settled row never changes.
         #expect(c.withResolvedName("Google Chrome (Service)") == c)
     }
+
+    // MARK: stage-6 security S-I1 / S-M3 (spec D1 caps and `tooltipText`, AI-AC1 literals)
+
+    @Test func candidatesRefuseOversizeIdentifiers() {
+        // 256 bytes with three components is still walked; one byte more is not asked of LaunchServices.
+        let tail = String(repeating: "a", count: 256 - "com.x.".count)
+        let atCap = "com.x." + tail
+        #expect(atCap.utf8.count == 256)
+        #expect(AppIdentifier.candidates(for: atCap) == [atCap])
+        let overCap = atCap + "b"
+        #expect(overCap.utf8.count == 257)
+        #expect(AppIdentifier.candidates(for: overCap) == [])
+        // Eight dotted components walk down to three; nine are refused outright.
+        let eight = "a.b.c.d.e.f.g.h"
+        #expect(AppIdentifier.candidates(for: eight).count == 6)
+        #expect(AppIdentifier.candidates(for: eight).last == "a.b.c")
+        #expect(AppIdentifier.candidates(for: eight + ".i") == [])
+        // A 64 KiB all-dot identifier (the imported-session shape) yields no candidate at all.
+        #expect(AppIdentifier.candidates(for: String(repeating: ".", count: 65536)) == [])
+        // Multi-byte scalars count as bytes, not characters.
+        let emoji = String(repeating: "\u{1F600}", count: 65)  // 65 × 4 = 260 bytes
+        #expect(AppIdentifier.candidates(for: "a.b." + emoji) == [])
+        #expect(AppIdentifier.maxIdentifierBytes == 256)
+        #expect(AppIdentifier.maxIdentifierComponents == 8)
+    }
+
+    @Test func tooltipTextStripsFormatAndControlScalarsAndCaps() {
+        #expect(AppIdentifier.tooltipText("com.apple.Safari") == "com.apple.Safari")
+        // A right-to-left override cannot make the tail read as another vendor.
+        #expect(AppIdentifier.tooltipText("com.evil.x\u{202E}irafaS.elppa.moc") == "com.evil.xirafaS.elppa.moc")
+        #expect(AppIdentifier.tooltipText("a\u{0}b\u{7}c\u{200B}d") == "abcd")
+        // No trimming and no `.app` rule: the tooltip is the identifier, not a display name.
+        #expect(AppIdentifier.tooltipText(" com.x.app ") == " com.x.app ")
+        #expect(AppIdentifier.tooltipText("").isEmpty)
+        let long = String(repeating: "k", count: 300)
+        #expect(AppIdentifier.tooltipText(long).count == 256)
+        // The cap counts characters: a flag is one character of two scalars and is never split.
+        let flags = String(repeating: "\u{1F1FA}\u{1F1F8}", count: 300)
+        #expect(AppIdentifier.tooltipText(flags).count == 256)
+        #expect(AppIdentifier.tooltipText(flags).unicodeScalars.count == 512)
+    }
 }
