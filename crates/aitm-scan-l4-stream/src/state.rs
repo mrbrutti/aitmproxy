@@ -87,21 +87,42 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // The pacer
 // ---------------------------------------------------------------------------
 
-/// A token-bucket pacer over bytes per second (spec S5.7).
+/// A sliding one-second window over bytes sent (spec S5.7).
 ///
-/// The bucket holds one second of tokens and starts full. Every write the lane
-/// makes — prelude, case, liveness probe, reproduction — asks
-/// [`BytePacer::wait_for`] how long to sleep first. The pacer only computes the
-/// wait; the caller sleeps, so no lock is ever held across an await.
-#[derive(Debug)]
+/// The bound the umbrella measures (T6-4) is stated over the target's log:
+/// *for every one-second window, the bytes the lane wrote in it are at most
+/// `max_bytes_per_s`*. So that is what the pacer keeps. It remembers each
+/// write of the last second and, asked for `len` more, either records the
+/// write and returns zero or returns exactly how long the caller must sleep
+/// for enough of those writes to age out of the window.
+///
+/// A token bucket does not hold that bound: one that starts full lets a
+/// wall-clock second carry its initial second of tokens *and* the second of
+/// refill behind them, which is how a 8192 bytes/s profile was observed
+/// writing 9937 bytes in a second against T10's SMTP speaker.
+///
+/// Every write the lane makes — prelude, case, liveness probe, reproduction —
+/// passes through [`BytePacer::wait_for`]. The pacer only computes the wait
+/// and records the write; the caller sleeps, so no lock is ever held across
+/// an await, and the caller may sleep once and write (it need not ask again).
 pub struct BytePacer {
-    /// Tokens added per second, which is also the bucket's capacity.
+    /// The bytes one window may carry.
     rate: u32,
-    /// Tokens available now; negative while the bucket is in debt.
-    tokens: f64,
-    /// When the bucket was last refilled.
-    last: Instant,
+    /// Each write of the last second: when it goes out, and how many bytes.
+    /// Ascending in time, oldest at the front.
+    window: VecDeque<(Instant, usize)>,
+    /// The bytes [`BytePacer::window`] holds, kept in step with it.
+    in_window: usize,
 }
+
+/// The width of the window the pacer bounds.
+const PACER_WINDOW: Duration = Duration::from_secs(1);
+
+/// Writes remembered at once. Beyond this the two oldest are merged, which
+/// holds their bytes in the window until the later of the two ages out: the
+/// pacer stays conservative and its memory stays bounded however small the
+/// lane's messages are.
+const MAX_PACER_WRITES: usize = 4096;
 
 impl BytePacer {
     /// A pacer at `bytes_per_s`, clamped to `1..=`[`MAX_BYTES_PER_S`].
@@ -110,11 +131,10 @@ impl BytePacer {
     /// asking for zero bytes per second would otherwise mean "never send".
     #[must_use]
     pub fn new(bytes_per_s: u32) -> Self {
-        let rate = bytes_per_s.clamp(1, MAX_BYTES_PER_S);
         Self {
-            rate,
-            tokens: f64::from(rate),
-            last: Instant::now(),
+            rate: bytes_per_s.clamp(1, MAX_BYTES_PER_S),
+            window: VecDeque::new(),
+            in_window: 0,
         }
     }
 
@@ -125,6 +145,9 @@ impl BytePacer {
     }
 
     /// How long the caller must sleep before writing `len` bytes.
+    ///
+    /// The write is recorded as happening after that sleep, so the caller
+    /// sleeps once and writes.
     pub fn wait_for(&mut self, len: usize) -> Duration {
         self.wait_for_at(len, Instant::now())
     }
@@ -132,21 +155,84 @@ impl BytePacer {
     /// [`BytePacer::wait_for`] with the clock injected, so the rule is testable
     /// without sleeping.
     ///
-    /// `now` going backwards is treated as no time passing.
+    /// `now` going backwards — which [`Instant`] does not do in the lane, but
+    /// a caller may inject — only makes the pacer slower: the write is still
+    /// recorded after every write already held, so the window never loses one.
     pub fn wait_for_at(&mut self, len: usize, now: Instant) -> Duration {
-        let rate = f64::from(self.rate);
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = now;
-        // Refill, never past one second of capacity, then spend. The spend may
-        // leave the bucket in debt, which is exactly the wait the caller owes.
-        self.tokens = (self.tokens + elapsed * rate).min(rate);
-        self.tokens -= len as f64;
-        if self.tokens >= 0.0 {
-            return Duration::ZERO;
+        self.expire(now);
+        let rate = self.rate as usize;
+
+        let wait = if self.in_window + len <= rate {
+            // It fits in the window as it stands.
+            Duration::ZERO
+        } else {
+            // Wait for the oldest writes to age out, until what is left makes
+            // room for `len`. A write at `t` leaves the window at `t` + one
+            // second. A `len` over the whole rate frees nothing it needs, so
+            // the loop runs to the end and it waits for the window to drain
+            // entirely: alone in an empty window it is allowed, since no
+            // sleep could ever make it fit.
+            let needed = (self.in_window + len).saturating_sub(rate);
+            let mut freed = 0usize;
+            let mut until = None;
+            for (at, bytes) in &self.window {
+                freed += bytes;
+                until = Some(*at + PACER_WINDOW);
+                if freed >= needed && len <= rate {
+                    break;
+                }
+            }
+            until.map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
+        };
+
+        self.record(now + wait, len);
+        wait
+    }
+
+    /// Drop the writes that are no longer inside the window ending at `now`.
+    ///
+    /// The window is half-open — a write at `t` counts until `t` + one second
+    /// exactly — which is what makes the per-write check imply the bound over
+    /// every window: the last write of any window sees every other write in
+    /// it.
+    fn expire(&mut self, now: Instant) {
+        while let Some(&(at, bytes)) = self.window.front() {
+            if now.saturating_duration_since(at) < PACER_WINDOW {
+                break;
+            }
+            self.window.pop_front();
+            self.in_window -= bytes;
         }
-        // `try_from_secs_f64` refuses a non-finite or absurd value; the lane
-        // never waits longer than one await in any case.
-        Duration::try_from_secs_f64(-self.tokens / rate).unwrap_or(MAX_AWAIT)
+    }
+
+    /// Remember a write of `len` bytes going out at `at`.
+    fn record(&mut self, at: Instant, len: usize) {
+        // Never before the write already held, so the window stays ordered.
+        let at = match self.window.back() {
+            Some(&(last, _)) if last > at => last,
+            _ => at,
+        };
+        self.window.push_back((at, len));
+        self.in_window += len;
+        while self.window.len() > MAX_PACER_WRITES {
+            let (_, older) = self.window.pop_front().unwrap_or((at, 0));
+            if let Some(front) = self.window.front_mut() {
+                front.1 += older;
+            } else {
+                self.in_window -= older;
+            }
+        }
+    }
+}
+
+impl fmt::Debug for BytePacer {
+    /// Sizes and counts only, like every other `Debug` in the lane (S9, C11).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BytePacer")
+            .field("rate", &self.rate)
+            .field("writes", &self.window.len())
+            .field("in_window", &self.in_window)
+            .finish()
     }
 }
 
@@ -658,17 +744,78 @@ mod tests {
     }
 
     #[test]
-    fn pacer_waits_when_bucket_empty() {
+    fn pacer_bounds_every_one_second_window() {
         let mut pacer = BytePacer::new(1000);
         let t0 = Instant::now();
-        // The bucket holds one second of tokens and starts full.
+        // An empty window takes a whole second's worth at once.
         assert_eq!(pacer.wait_for_at(1000, t0), Duration::ZERO);
-        // Empty at the same instant: 500 bytes at 1000 bytes/s is half a second.
-        assert_eq!(pacer.wait_for_at(500, t0), Duration::from_millis(500));
-        // Two seconds later the bucket has refilled to its one-second capacity.
+        // The window is full until those 1000 bytes age out of it, so the next
+        // 500 bytes wait the whole second — not the half second a bucket that
+        // starts full allowed, which let a wall-clock second carry 1500.
+        assert_eq!(pacer.wait_for_at(500, t0), Duration::from_secs(1));
+        // Two seconds on, both recorded sends have left the window.
         assert_eq!(
             pacer.wait_for_at(1, t0 + Duration::from_secs(2)),
             Duration::ZERO
+        );
+    }
+
+    /// T6-4, the umbrella's bound, as the independent observer measures it:
+    /// over a long paced run, no one-second window of the write log may carry
+    /// more than the rate (spec S5.7).
+    #[test]
+    fn pacer_sliding_window_property() {
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xB17E_9ACE);
+        let mut pacer = BytePacer::new(1000);
+        let t0 = Instant::now();
+        let mut now = t0;
+        // Every write the caller actually makes: the instant it goes out and
+        // how many bytes it is. Ascending in time, because the next call is
+        // never earlier than the write before it.
+        let mut written: Vec<(Instant, usize)> = Vec::with_capacity(10_000);
+        let mut paced = 0u32;
+
+        for _ in 0..10_000 {
+            let len = rng.random_range(1..=200usize);
+            let wait = pacer.wait_for_at(len, now);
+            if !wait.is_zero() {
+                paced += 1;
+            }
+            // The caller sleeps the wait the pacer returned, then writes.
+            let at = now + wait;
+            written.push((at, len));
+
+            // The window that closes on this write holds at most the rate.
+            let opened = at - Duration::from_secs(1);
+            let in_window: usize = written
+                .iter()
+                .rev()
+                .take_while(|(t, _)| *t > opened)
+                .map(|(_, n)| *n)
+                .sum();
+            assert!(
+                in_window <= 1000,
+                "the second ending {:?} after the start carried {in_window} bytes, over 1000",
+                at.duration_since(t0)
+            );
+
+            now = at + Duration::from_millis(rng.random_range(0..=50));
+        }
+
+        // The run was paced, not merely spread thin: the writes wanted about
+        // 4000 bytes/s and the pacer held them near 1000 without starving them.
+        assert!(paced > 4_000, "only {paced} of 10000 writes were paced");
+        let total: usize = written.iter().map(|(_, n)| *n).sum();
+        let elapsed = written
+            .last()
+            .map(|(t, _)| t.duration_since(t0))
+            .unwrap_or_default();
+        let achieved = (total as f64 / elapsed.as_secs_f64()) as u64;
+        assert!(
+            (800..=1000).contains(&achieved),
+            "{total} bytes over {elapsed:?} is {achieved} bytes/s, not a rate of 1000"
         );
     }
 
