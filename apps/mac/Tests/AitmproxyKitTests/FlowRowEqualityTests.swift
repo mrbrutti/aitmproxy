@@ -38,6 +38,14 @@ struct FlowRowEqualityTests {
             ("WebSocket frame counts", { $0.wsFrames = (sent: 3, received: 1) }),
             ("L4 packet count", { $0.l4 = L4RowInfo(proto: .tcp, sessionState: .capture, target: "10.0.0.1:443", packetCount: 7, injectedCount: 0, inScope: true) }),
             ("seq after a Clear", { $0.seq = 1 }),
+            // The #228 tunnel fields (Task 1c): a CONNECT row's outcome, reason and byte
+            // counts land after the row first appears, and `passive` flips when the core
+            // marks a flow observed-only.
+            ("tunnel mode", { $0.tunnel = .passthrough }),
+            ("tunnel reason", { $0.tunnelReason = .outOfScope }),
+            ("tunnel bytes up", { $0.tunnelBytesUp = 1 }),
+            ("tunnel bytes down", { $0.tunnelBytesDown = 2 }),
+            ("passive", { $0.passive = true }),
         ]
         for (name, mutate) in mutations {
             var changed = parked

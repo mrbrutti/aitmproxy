@@ -23,9 +23,21 @@ extension Session {
             captureSupported: coreHealth.captureSupported,
             scopeHostCount: scopeHosts.count,
             flowCount: rows.count,
-            listenAddress: coreHealth.connection?.proxyAddress ?? listenAddress
+            listenAddress: coreHealth.connection?.proxyAddress ?? listenAddress,
+            systemProxy: systemProxy,
+            caTrust: caTrust,
+            tunnelledFlowCount: tunnelledFlowCount,
+            decrypt: decrypt
         )
     }
+
+    /// Flows the core passed through as TLS tunnels rather than decrypting (`FlowRow.tls == .tunnelled`,
+    /// mapped from the wire's `tunnel` field): the Scope fact's banner clause reads it (spec D5).
+    var tunnelledFlowCount: Int { rows.count { $0.tls == .tunnelled } }
+
+    /// The two automatic routes into the proxy (spec D7): what the Flows surfaces read, so no lane
+    /// word reaches ShellView and the connectionSummary reader allow-list does not grow.
+    var trafficRoutes: TrafficRoutes { connectionSummary.routes }
 
     /// Runs a navigation or copy action from a lane card or a Getting-started row. The
     /// operator-only actions — the core restart, the capture switch, the extension uninstall and
@@ -43,6 +55,9 @@ extension Session {
             reconnectBus()
         case .openScope:
             show(.scope)
+        case .addScopeHost:
+            show(.scope)
+            scopeSheetVisible = true
         case .openCAPanel:
             show(.ca)
         case .trustCA:
