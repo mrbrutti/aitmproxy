@@ -209,7 +209,7 @@ adds one line to `run()`; the provider (Task 4) after both; then the Terminal bu
       func stop()                                           // stopped = true; installed = nil; an in-flight completion is then ignored
   }
   ```
-  `applyIfNeeded`: return unless `!stopped && !inFlight && pending != installed`; set
+  `applyIfNeeded` (erratum, see Review log: after a FAILED apply the same set is not re-applied by itself — spec Design B "Failure semantics" governs): return unless `!stopped && !inFlight && pending != installed`; set
   `inFlight`; call `apply(pending, reasserting)`; in the completion: `inFlight = false`; if
   `stopped` return; on `nil` error `installed = wanted` and `onEvent(.applied)`, else
   `onEvent(.applyFailed(kept: installed))`; then `applyIfNeeded(reasserting: true)` again
@@ -368,6 +368,24 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 4 | Coder (Task 4) | — (plan erratum) | Plan Task 4 `applyIfNeeded` sentence "then `applyIfNeeded(reasserting: true)` again", read literally, re-applies a FAILED set immediately and forever on a persistent error; spec Design B says "never retries on a timer; the next scope change triggers the next attempt". | Spec authoritative; built as: after success re-check `pending`, after failure re-check only if a newer set arrived (pinned by `ruleReconciler` steps 8, 9, 13). Orchestrator ruling 2026-11-01. |
+| 2 | Tester | Minor (pre-existing) | F1: the old `coreLinkAndClaim` check asserts `isAttached` right after reading Hello while `serve` publishes `control` after the Hello write; red once at load 61, green 4/4 after. Not touched by this range (TR-AC3). | Accepted 2026-11-01 (orchestrator, autonomous mandate): load flake outside the range; follow-up: poll `isAttached` ≤ 2 s like `scopeChangeHook` does. |
+| 4 | Tester | Minor | F2: a `reconcile(for:)` reaching the queue before `begin` is dropped (`stopped` starts true); spec C's coalescing covers the in-flight window (pinned, vector B) but not the pre-`begin` window; practically unreachable given `startProxy`'s ordering. | Fixed in `ffc8da00` (panel round 1, F1): `begin` no longer resets `pending`; a pre-`begin` set is applied right after the startup apply (pin A asserts the fixed behaviour). |
+| 4 | Tester | Minor | F3: a second `begin` without `stop()` (Tahoe FB21464147) re-applies `.tcpOnly` and drops installed UDP rules until the next scope change. | Fixed in `ffc8da00` (panel round 1, F1): a second `begin` with a set installed answers its completion at once and keeps the installed set (pin C); spec Design C amended. |
+| 4 | Quality + Security | Minor | `begin` overwrote the hook-derived `pending` (root of Tester F2/F3; a reconcile's error could answer a second `startProxy`). | Fixed in `ffc8da00`: explicit `startApply(set:…)`, startup completions tagged to the startup apply, double-`begin` answers at once; vectors A, C, F. Spec C amended. |
+| 4 | Security + Quality + Spec | Minor | A `startProxy` completion parked when `stopProxy` arrived was never called (NE contract). | Fixed in `56720ca6`: `stop()` answers it once with `NSPOSIXErrorDomain`/`ECANCELED`; pins step 12, D2. Spec C amended. |
+| 4 | Quality | Minor | A failed startup apply left the reconciler live (a detach-driven re-apply with `reasserting`) and logged the error twice. | Fixed in `7aa18ee3`: `reconciler.stop()` before `handoff.stop()` in the error branch; duplicate `os_log` dropped; vector G. |
+| 3 | Security | Minor | No upper bound on the UDP rule count (a 1 MiB Scope frame could carry ~10^5 tokens). | Fixed in `10862135`: `maxUDPTargets = 256` after canonicalisation, `dropped` in equality and in `summary` (`(+K dropped)`); pinned with a 300-token vector. Spec A amended. |
+| 3 | Security | Minor | Loopback, multicast and broadcast IP tokens produced rules (dead weight; one kernel-rejected rule blocks the whole set). | Fixed in `d0d4a810`: skip loopback (`127/8` by first octet — the SDK's `isLoopback` is `127.0.0.1` only — and `::1`), multicast, `255.255.255.255`; pins incl. `127.200.1.2:443`. Spec A/H amended. |
+| 4 | Security | Minor | No watchdog on a `setTunnelNetworkSettings` completion that never arrives (`inFlight` stuck). | Accepted 2026-11-01 (orchestrator, autonomous mandate): theoretical (an Apple API not calling its handler); a timer contradicts spec B's no-timer design; the absence of a "rules applied" line after a scope change is the observable. |
+| 3, T | Quality | Minor | Duplicated test scaffolding across the `#if DEBUG` extensions (`remote(_:)` twice; the fake apply quartet twice). | Fixed in `2a5682ca`: one `remoteText(_:)`, one `FakeApply` helper shared by both reconciler groups. |
+| T | Quality | Minor | `providerRulesEdges` computed its expected ordering with the comparator under test. | Fixed in `1e21a73b`: literal pins that a numeric sort would fail (`10.1.0.9`, `10.1.1.9`, `10.1.10.9`, `10.1.11.9`, …). |
+| 3, 4 | Quality | Minor | Doc drift: `ne-selfcheck.sh` header and the `HandoffSelfCheck` doc said every check lives at the bottom of `FlowHandoff.swift`. | Fixed in `c0d1a1a3`. |
+| 3 | Quality | Minor | Rule-shape prose repeated in five places (37-line `ProviderRules.swift` header). | Fixed in `419e5960`: header trimmed to the why + a spec pointer. |
+| 4 | Spec | Minor | Plan Task 4 `applyIfNeeded` sentence and spec B's "re-runs the same check" clause would, read literally, retry a failed set forever; code follows spec B "Failure semantics". | Accepted as an erratum 2026-11-01: spec B sentence corrected in the same commit as these rows; plan sentence left with this row as the record. |
+| 4 | Spec | Minor | `generation` counter beyond the plan's `inFlight`/`stopped` sketch. | Accepted 2026-11-01: the minimum mechanism that makes the plan's stop contract hold in its own step-11 scenario; pinned (step 12, D1/D2). |
+| 4 | Spec | Minor | `.error` log line appends `(wanted <summary>)` beyond spec D's named elements. | Accepted 2026-11-01: scoped targets are operator configuration (spec D); the TR-AC8 ladder's construction-bug rung needs the wanted set. |
+| T | Spec | Minor | Tester added three `run()` lines and a second group in `FlowHandoff.swift`, beyond the coordination allowance (one group, one line). | Accepted 2026-11-01: tests only, zero removed lines; the observe-lane session is told the `run()` region widened; whoever merges second rebases. |
 
 ## Shipped
 

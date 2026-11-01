@@ -123,6 +123,11 @@ The wanted rule set is a pure function of `ScopeMatcher?`:
   output, kept as a guard); ports 53/5353/853 as above.
 - Canonical form: UDP targets de-duplicated and sorted by address text then port (nil first), so
   two scopes with the same claimable IP set compare equal whatever the token order.
+- **Amended after the stage-6 panel (2026-11-01, security Minors):** the skip set also covers
+  loopback (`127/8`, `::1`), multicast and the IPv4 limited broadcast `255.255.255.255` — the
+  kernel never diverts loopback and one kernel-rejected rule would block the whole set; and the
+  UDP target list is capped at **256** after canonicalisation (first 256 in canonical order), the
+  dropped count shown in the log `summary`. Both are under-inclusive, never over-inclusive.
 
 Why R2 over R1 (one catch-all `.UDP` rule): it is exactly the matcher's UDP claim set (what the
 kernel diverts ≡ what the provider can claim); if the kernel effect is per-match, the
@@ -150,8 +155,10 @@ without error), `pendingWanted: ProviderRuleSet`, `inFlight: Bool`, `stopped: Bo
 `includedNetworkRules = wanted.networkRules()`, sets `reasserting = true`, calls
 `setTunnelNetworkSettings`; its completion hops back onto the queue, clears `reasserting`, and
 on success sets `installed = wanted` and logs the change (D); on error logs it and leaves
-`installed` as it was; then clears `inFlight` and re-runs the same check against
-`pendingWanted` (coalescing: at most one in flight plus one pending, so a burst of pushes
+`installed` as it was; then clears `inFlight` and re-runs the check against `pendingWanted` —
+after a **failure** only if a newer set arrived during the flight (the failed set is not
+re-applied by itself; see "Failure semantics" below, which governs; wording corrected after the
+stage-6 spec review) — (coalescing: at most one in flight plus one pending, so a burst of pushes
 applies at most the last distinct set). **Debounce by construction:** a core restart is
 detach → attach within seconds; with no UDP target scoped wanted == installed throughout and
 nothing is applied; with one scoped, exactly two applications (TCP-only, then TCP+UDP).
@@ -198,7 +205,12 @@ the completion handler is called with the apply's result; on error `handoff.stop
 is coalesced as `pendingWanted` and applied right after. UDP rules therefore appear only after a
 Scope push holding UDP-claimable IP tokens. `stopProxy` sets `stopped`, resets `installed`,
 `pendingWanted` and `inFlight` on the queue, then `handoff.stop()`; a hook firing from the
-resulting detach is dropped. The class doc comment and the `startProxy` comment ("Provider
+resulting detach is dropped. **Amended after the stage-6 panel (2026-11-01):** a `startProxy`
+completion still parked when `stopProxy` arrives is answered with a cancellation error
+(`ECANCELED`), never dropped; a second `startProxy` without `stopProxy` (FB21464147) with a rule
+set already installed answers its completion at once and keeps the installed set (no TCP-only
+re-apply); a `Scope` reaching the queue before the startup apply is kept as `pendingWanted` and
+applied right after it; a failed startup apply stops the reconciler before `handoff.stop()`. The class doc comment and the `startProxy` comment ("Provider
 *rules* cannot be hot-edited without a restart") are rewritten to describe this design.
 
 ### D. Logging **(Architect's call on addresses)**
