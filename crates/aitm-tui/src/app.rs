@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use aitm_scan_model::{
-    Issue, IssuesResult, JobEvent, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN,
+    Issue, IssuesResult, JobEvent, JobId, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN,
     JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
@@ -3988,11 +3988,23 @@ impl App {
     /// the terminal and `issue` events also refresh the issue list when the
     /// operator has looked at Issues (the sidebar count reads `summaries`,
     /// which `scan.status` refreshes, so it never needs `scan.issues`).
+    ///
+    /// A job the TUI does not know (not in `order`, not started here) is
+    /// polled only while the Scan view is shown: there a `scan.list` every
+    /// ten seconds prunes what the core forgot, elsewhere nothing would, so
+    /// a core pushing fresh ids could grow the state one row per line (D6
+    /// hostile-core bounds). Outside the view the line is left to the list
+    /// the next open requests. A known job is polled from every mode.
     fn on_job_line(&mut self, line: &JobNotification, out: &mut Vec<BusRequest>) {
         let job = line.job.as_str();
         // D6 hostile-core bound: a malformed id never becomes a tag key, an
         // argument or an `inflight` entry.
         if !is_job_id(job) {
+            return;
+        }
+        let known = self.scan.jobs.order.iter().any(|id| id == job)
+            || self.scan.jobs.started_here.contains(job);
+        if !known && self.mode != Mode::Scan {
             return;
         }
         self.request_scan_status(job, out);
@@ -4132,16 +4144,18 @@ impl App {
     }
 
     /// The D6 timers, run from every `Tick`: every [`STATUS_POLL_TICKS`] one
-    /// `scan.status` per live job (the cursor's job first, then `order`, at
-    /// most [`MAX_STATUS_FOLLOWUPS`] leaving per firing; the rest wait for the
-    /// next one), every [`LIST_POLL_TICKS`] a `scan.list` while the Scan view
-    /// is shown, every [`ISSUES_POLL_TICKS`] a `scan.issues` while the Issues
-    /// tab is shown and the filtered job (any job, without the filter) is
-    /// live. Task 9 adds the Site map timer here.
+    /// `scan.status` per live job (the cursor's job first, then `order` from
+    /// the rotating `poll_offset`, at most [`MAX_STATUS_FOLLOWUPS`] leaving
+    /// per firing; the rest are reached by the next firings, which start
+    /// where this one stopped), every [`LIST_POLL_TICKS`] a `scan.list`
+    /// while the Scan view is shown, every [`ISSUES_POLL_TICKS`] a
+    /// `scan.issues` while the Issues tab is shown and the filtered job (any
+    /// job, without the filter) is live. Task 9 adds the Site map timer here.
     fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
         if t.is_multiple_of(STATUS_POLL_TICKS) {
             let live = self.scan.jobs.live();
-            self.request_scan_statuses(live.iter().map(String::as_str), out);
+            let attempted = self.request_scan_statuses(&live, out);
+            self.scan.jobs.advance_poll(&live[..attempted]);
         }
         if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
             self.request_scan_list(out);
@@ -4176,21 +4190,22 @@ impl App {
 
     /// `scan.status` for each of `jobs` in turn until [`MAX_STATUS_FOLLOWUPS`]
     /// have left (spec D6, hostile-core bounds): a job already in flight
-    /// costs nothing and the rest wait for the next firing.
-    fn request_scan_statuses<'a>(
-        &mut self,
-        jobs: impl IntoIterator<Item = &'a str>,
-        out: &mut Vec<BusRequest>,
-    ) {
+    /// costs nothing and the rest wait for the next firing. Returns how many
+    /// of `jobs` were attempted (the prefix the cap let through), which the
+    /// status timer moves its walk past.
+    fn request_scan_statuses(&mut self, jobs: &[JobId], out: &mut Vec<BusRequest>) -> usize {
         let mut sent = 0;
+        let mut attempted = 0;
         for job in jobs {
             if sent >= MAX_STATUS_FOLLOWUPS {
                 break;
             }
+            attempted += 1;
             if self.request_scan_status(job, out) {
                 sent += 1;
             }
         }
+        attempted
     }
 
     /// A timer- or push-driven `scan.*` read: silent when the bus lacks the
@@ -4263,7 +4278,7 @@ impl App {
             "scan.list" => {
                 if let Some(list) = self.scan_reply::<ListResult>(tag, name, &value) {
                     let followups = self.scan.jobs.fold_list(list);
-                    self.request_scan_statuses(followups.iter().map(String::as_str), out);
+                    self.request_scan_statuses(&followups, out);
                 }
             }
             "scan.issues" => {

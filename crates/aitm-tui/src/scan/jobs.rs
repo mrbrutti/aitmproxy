@@ -25,13 +25,24 @@ pub struct JobsState {
     /// for a job not yet here puts it at the front until the next list, which
     /// drops it unless it is marked.
     pub order: Vec<JobId>,
-    /// The summary of every listed job.
+    /// The summary of every job in `order`. Invariant, kept by
+    /// [`JobsState::fold_status`] and [`JobsState::fold_list`]:
+    /// `full.keys() ⊆ summaries.keys() ⊆ order` (a status fold writes both
+    /// maps and `order`; a list fold retains both maps to `order`), so the
+    /// walks read `order` alone and a key of either map is always a row.
     pub summaries: BTreeMap<JobId, JobSummary>,
-    /// Full status for the jobs `scan.status` has answered for.
+    /// Full status for the jobs `scan.status` has answered for; every key
+    /// is in `summaries` and in `order` (see `summaries`).
     pub full: BTreeMap<JobId, JobStatus>,
     /// The list cursor.
     pub cursor: usize,
     pub pane: JobPane,
+    /// Where in `order` the next status firing's walk starts (spec D6, the
+    /// [`super::MAX_STATUS_FOLLOWUPS`] cap): [`JobsState::live`] rotates
+    /// `order` here and [`JobsState::advance_poll`] moves it past the jobs
+    /// a firing attempted, so with `n` live jobs every one is reached within
+    /// `ceil(n / 16)` firings instead of the first 16 starving the rest.
+    pub poll_offset: usize,
     /// Scroll offset of the Detail pane.
     pub detail_scroll: u16,
     /// The tick of the last `scan.list` request.
@@ -94,6 +105,11 @@ impl JobsState {
             .filter(|id| listed.contains(*id) && !self.full.contains_key(*id))
             .cloned()
             .collect();
+        debug_assert!(
+            self.summaries.keys().all(|id| kept.contains(id))
+                && self.full.keys().all(|id| self.summaries.contains_key(id)),
+            "full.keys() ⊆ summaries.keys() ⊆ order"
+        );
         self.order = order;
         self.cursor = self.cursor.min(self.order.len().saturating_sub(1));
         followups
@@ -118,26 +134,44 @@ impl JobsState {
             .or_else(|| self.full.get(id).map(|s| s.state))
     }
 
-    /// Every job in `summaries` or `full` whose state is not terminal: the
-    /// cursor's job first, then `order`, then any known only to the maps
-    /// (D6: the jobs the status timer polls, the first
-    /// [`super::MAX_STATUS_FOLLOWUPS`] not already in flight per firing).
+    /// Every job in `order` whose state is not terminal, in the order the
+    /// status timer polls them (D6): the cursor's job first, then `order`
+    /// read from `poll_offset` round to it. The maps are retained to
+    /// `order` (see `summaries`), so nothing else can be live.
     pub fn live(&self) -> Vec<JobId> {
-        let mut seen: BTreeSet<&JobId> = BTreeSet::new();
-        let mut ids: Vec<JobId> = Vec::with_capacity(self.order.len());
+        let n = self.order.len();
+        let start = if n == 0 { 0 } else { self.poll_offset % n };
+        let mut ids: Vec<JobId> = Vec::with_capacity(n);
         let under_cursor = self.order.get(self.cursor);
         for id in under_cursor
             .into_iter()
-            .chain(self.order.iter())
-            .chain(self.summaries.keys())
-            .chain(self.full.keys())
+            .chain(&self.order[start..])
+            .chain(&self.order[..start])
         {
-            if seen.insert(id) {
+            if Some(id) != under_cursor || ids.is_empty() {
                 ids.push(id.clone());
             }
         }
         ids.retain(|id| self.state_of(id).is_some_and(|s| !s.is_terminal()));
         ids
+    }
+
+    /// Move the status walk past the jobs one firing attempted (`polled`,
+    /// the prefix of [`JobsState::live`] the cap let through, in flight or
+    /// sent): the next firing starts at the `order` entry after the last one
+    /// walked. The cursor's job rides at the front out of turn, so it is
+    /// skipped unless it is all the firing reached. A job no longer in
+    /// `order` leaves the offset where it was.
+    pub fn advance_poll(&mut self, polled: &[JobId]) {
+        let cursor = self.cursor_job();
+        let last = polled
+            .iter()
+            .rev()
+            .find(|id| Some(*id) != cursor)
+            .or(polled.last());
+        if let Some(i) = last.and_then(|id| self.order.iter().position(|o| o == id)) {
+            self.poll_offset = (i + 1) % self.order.len();
+        }
     }
 
     /// The job under the list cursor, if the list has one.
@@ -146,17 +180,15 @@ impl JobsState {
     }
 
     /// The row for a job in `order`, built through [`row`] from whatever is
-    /// known: the summary (and the full view when `scan.status` answered), the
-    /// full view alone when the list has not carried the job yet, or the bare
-    /// id with every cell `...` when nothing has answered (a job started here
-    /// before its first reply). `summaries` is never indexed: an `order` id
-    /// may lack an entry (hand-off from the Task 5 panel).
+    /// known: the summary (and the full view when `scan.status` answered),
+    /// or the bare id with every cell `...` when nothing has answered (a job
+    /// started here before its first reply). `summaries` is never indexed:
+    /// an `order` id may lack an entry; a `full` entry without a summary
+    /// cannot happen (`full.keys() ⊆ summaries.keys()`, see `summaries`).
     pub fn row_of(&self, id: &str) -> JobRow {
-        let full = self.full.get(id);
-        match (self.summaries.get(id), full) {
-            (Some(summary), _) => row(summary, full),
-            (None, Some(status)) => row(&status.summary(), Some(status)),
-            (None, None) => JobRow::unknown(id),
+        match self.summaries.get(id) {
+            Some(summary) => row(summary, self.full.get(id)),
+            None => JobRow::unknown(id),
         }
     }
 

@@ -18,7 +18,7 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{
-    is_job_id, parse_result, tag_keyed, JobsState, PendingLaunch, ScanTab, MAX_STATUS_FOLLOWUPS,
+    is_job_id, parse_result, JobsState, PendingLaunch, ScanTab, MAX_STATUS_FOLLOWUPS,
 };
 use common::*;
 use serde_json::{json, Value};
@@ -41,21 +41,71 @@ fn app() -> App {
     app
 }
 
-/// The `job.progress.json` push line, as the bus task hands it over.
-fn progress_line() -> BusEvent {
+/// A connected v2 app in the Scan view with its opening `scan.list` settled
+/// empty, so nothing is in flight.
+fn scan_app() -> App {
+    let mut app = app();
+    let _ = app.update(Action::OpenScan);
+    let _ = app.on_bus(empty_list_reply());
+    assert_eq!(app.mode, Mode::Scan);
+    assert!(
+        app.scan.inflight.is_empty(),
+        "nothing in flight at the start"
+    );
+    app
+}
+
+/// A `notifications/aitm/job` push line carrying `params`, as the bus task
+/// hands it over.
+fn job_line(params: Value) -> BusEvent {
     BusEvent::Notification(json!({
         "jsonrpc": "2.0",
         "method": "notifications/aitm/job",
-        "params": fixture("job.progress.json"),
+        "params": params,
     }))
 }
 
-/// The `scan.status.json` reply under its keyed tag.
-fn status_reply(body: Value) -> BusEvent {
+/// A `scan.list` reply under its single-slot tag.
+fn list_reply(value: Value) -> BusEvent {
     BusEvent::CallTaggedOk {
-        tag: format!("scan.status:{JOB}"),
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value,
+    }
+}
+
+/// A `scan.status` reply for `job` under its keyed tag.
+fn status_reply_for(job: &str, body: Value) -> BusEvent {
+    BusEvent::CallTaggedOk {
+        tag: format!("scan.status:{job}"),
         name: "scan.status".into(),
         value: body,
+    }
+}
+
+/// The `job.progress.json` push line.
+fn progress_line() -> BusEvent {
+    job_line(fixture("job.progress.json"))
+}
+
+/// The `scan.status.json` reply for `JOB` under its keyed tag.
+fn status_reply(body: Value) -> BusEvent {
+    status_reply_for(JOB, body)
+}
+
+/// `scan.status.json` with its job replaced by `id`, unparsed.
+fn running_body(id: &str) -> Value {
+    let mut body = fixture("scan.status.json");
+    body["job"] = json!(id);
+    body
+}
+
+/// The `scan.status {job}` request under its keyed tag.
+fn status_request(job: &str) -> BusRequest {
+    BusRequest::CallTagged {
+        tag: format!("scan.status:{job}"),
+        name: "scan.status".into(),
+        args: json!({ "job": job }),
     }
 }
 
@@ -73,6 +123,24 @@ fn tagged_requests(reqs: &[BusRequest]) -> usize {
         .count()
 }
 
+/// The tags of every `scan.status` request in `reqs`, in order.
+fn status_tags(reqs: &[BusRequest]) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::CallTagged { tag, name, .. } if name == "scan.status" => Some(tag.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The job ids every `scan.status` request in `reqs` asks about, in order.
+fn status_jobs(reqs: &[BusRequest]) -> Vec<String> {
+    status_tags(reqs)
+        .iter()
+        .map(|tag| tag.trim_start_matches("scan.status:").to_string())
+        .collect()
+}
+
 /// The `scan.list {}` request under its single-slot tag.
 fn list_request() -> BusRequest {
     BusRequest::CallTagged {
@@ -84,11 +152,7 @@ fn list_request() -> BusRequest {
 
 /// An empty `scan.list` reply, settling the tag without adding a job.
 fn empty_list_reply() -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    }
+    list_reply(json!({ "jobs": [] }))
 }
 
 fn tick(app: &mut App) -> Vec<BusRequest> {
@@ -96,18 +160,50 @@ fn tick(app: &mut App) -> Vec<BusRequest> {
 }
 
 /// T7-2: a job line yields exactly one tagged `scan.status {job}` and no
-/// `Refresh` (push is a trigger, poll is truth).
+/// `Refresh` (push is a trigger, poll is truth). The view is open: outside
+/// it an unknown job's line is left to the next `scan.list` (fix round C,
+/// C1).
 #[test]
 fn a_job_line_triggers_one_tagged_status_and_no_refresh() {
-    let mut app = app();
+    let mut app = scan_app();
     let reqs = app.on_bus(progress_line());
+    assert_eq!(reqs, vec![status_request(JOB)]);
+}
+
+/// Fix round C, C1: outside the Scan view a push line for a job the TUI
+/// does not know (not in `order`, not started here) yields nothing, so a
+/// core cannot grow the state one entry per pushed id where no `scan.list`
+/// ever prunes it; the next list on opening the view brings the job. Once
+/// the job is known, or marked as started here, the same line polls it
+/// from any mode.
+#[test]
+fn an_unknown_job_line_outside_the_scan_view_requests_nothing() {
+    let mut app = app();
+    assert_eq!(app.mode, Mode::Flows);
+    let reqs = app.on_bus(progress_line());
+    assert!(
+        reqs.is_empty(),
+        "an unknown job is not polled here: {reqs:?}"
+    );
+    assert!(app.scan.inflight.is_empty());
+    assert!(
+        app.scan.jobs.order.is_empty(),
+        "nothing is folded from a line"
+    );
+
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    assert_eq!(app.scan.jobs.order, vec![JOB.to_string()]);
+    let reqs = app.on_bus(progress_line());
+    assert_eq!(reqs, vec![status_request(JOB)], "a known job is polled");
+
+    let mut started = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = connect(&mut started, TOOLS, None);
+    started.scan.jobs.started_here.insert(JOB.to_string());
+    let reqs = started.on_bus(progress_line());
     assert_eq!(
         reqs,
-        vec![BusRequest::CallTagged {
-            tag: format!("scan.status:{JOB}"),
-            name: "scan.status".into(),
-            args: json!({ "job": JOB }),
-        }]
+        vec![status_request(JOB)],
+        "a job started here is polled before its first list"
     );
 }
 
@@ -136,7 +232,7 @@ fn a_flow_line_is_coalesced_to_one_refresh_on_the_next_tick() {
 /// `scan.status` (tag dedupe).
 #[test]
 fn four_progress_lines_yield_one_inflight_status() {
-    let mut app = app();
+    let mut app = scan_app();
     let mut total = 0;
     for _ in 0..4 {
         total += tagged_requests(&app.on_bus(progress_line()));
@@ -188,11 +284,7 @@ fn status_polls_every_four_ticks_only_while_live() {
 #[test]
 fn scan_list_folds_order_and_asks_status_for_unknown_jobs() {
     let mut app = app();
-    let reqs = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: fixture("scan.list.json"),
-    });
+    let reqs = app.on_bus(list_reply(fixture("scan.list.json")));
     assert_eq!(
         app.scan.jobs.order,
         vec![JOB.to_string(), "scan-55667788".to_string()]
@@ -227,7 +319,7 @@ fn scan_list_folds_order_and_asks_status_for_unknown_jobs() {
 /// be answered).
 #[test]
 fn disconnect_clears_inflight() {
-    let mut app = app();
+    let mut app = scan_app();
     let _ = app.on_bus(progress_line());
     assert!(!app.scan.inflight.is_empty());
     let _ = app.on_bus(BusEvent::Disconnected("x".into()));
@@ -289,11 +381,7 @@ fn a_push_line_with_a_forged_job_id_is_dropped() {
     let mut app = app();
     let mut params = fixture("job.progress.json");
     params["job"] = json!("scan-../../x");
-    let reqs = app.on_bus(BusEvent::Notification(json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/aitm/job",
-        "params": params,
-    })));
+    let reqs = app.on_bus(job_line(params));
     assert!(reqs.is_empty(), "a forged id yields no request: {reqs:?}");
     assert!(app.scan.inflight.is_empty());
     assert!(
@@ -319,28 +407,16 @@ fn a_list_row_with_a_forged_job_id_is_skipped() {
     let mut app = app();
     let mut list = fixture("scan.list.json");
     list["jobs"][1]["job"] = json!("scan-ZZZZZZZZ");
-    let reqs = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: list,
-    });
+    let reqs = app.on_bus(list_reply(list));
     assert_eq!(app.scan.jobs.order, vec![JOB.to_string()]);
     assert_eq!(app.scan.jobs.summaries.len(), 1);
-    assert_eq!(
-        reqs,
-        vec![BusRequest::CallTagged {
-            tag: format!("scan.status:{JOB}"),
-            name: "scan.status".into(),
-            args: json!({ "job": JOB }),
-        }]
-    );
+    assert_eq!(reqs, vec![status_request(JOB)]);
 }
 
 /// A running `scan.status.json` body under `id`, parsed.
 fn running_status(id: &str) -> JobStatus {
-    let mut body = fixture("scan.status.json");
-    body["job"] = json!(id);
-    parse_result::<JobStatus>("scan.status", &body).expect("a running status")
+    parse_result::<JobStatus>("scan.status", &running_body(id))
+        .expect("scan.status.json with its job replaced parses as a JobStatus")
 }
 
 /// `scan.list.json`, parsed.
@@ -411,16 +487,6 @@ fn fold_list_unmarks_a_started_here_job_the_list_carries() {
     );
 }
 
-/// The tags of every `scan.status` request in `reqs`, in order.
-fn status_tags(reqs: &[BusRequest]) -> Vec<String> {
-    reqs.iter()
-        .filter_map(|r| match r {
-            BusRequest::CallTagged { tag, name, .. } if name == "scan.status" => Some(tag.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// D6 hostile-core bounds (fix round B, B2): a `scan.list` of 40 running
 /// jobs yields exactly `MAX_STATUS_FOLLOWUPS` (16) `scan.status` requests on
 /// the fold and exactly 16 more, none repeated, on the next status firing,
@@ -429,21 +495,8 @@ fn status_tags(reqs: &[BusRequest]) -> Vec<String> {
 fn status_followups_are_capped_per_fold_and_per_firing() {
     assert_eq!(MAX_STATUS_FOLLOWUPS, 16);
     let mut app = app();
-    let template = fixture("scan.list.json")["jobs"][0].clone();
-    let ids: Vec<String> = (0..40).map(|n| format!("scan-000000{n:02}")).collect();
-    let jobs: Vec<Value> = ids
-        .iter()
-        .map(|id| {
-            let mut row = template.clone();
-            row["job"] = json!(id);
-            row
-        })
-        .collect();
-    let reqs = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": jobs }),
-    });
+    let (ids, list) = forty_running_jobs();
+    let reqs = app.on_bus(list_reply(list));
     assert_eq!(app.scan.jobs.order, ids);
     let first = status_tags(&reqs);
     assert_eq!(
@@ -453,7 +506,7 @@ fn status_followups_are_capped_per_fold_and_per_firing() {
     );
     let expected: Vec<String> = ids[..16]
         .iter()
-        .map(|id| tag_keyed("scan.status", id))
+        .map(|id| format!("scan.status:{id}"))
         .collect();
     assert_eq!(first, expected, "the first 16 listed jobs, in list order");
 
@@ -466,8 +519,8 @@ fn status_followups_are_capped_per_fold_and_per_firing() {
     }
     app.scan.jobs.cursor = 39;
     let second = status_tags(&tick(&mut app));
-    let mut expected: Vec<String> = vec![tag_keyed("scan.status", &ids[39])];
-    expected.extend(ids[16..31].iter().map(|id| tag_keyed("scan.status", id)));
+    let mut expected: Vec<String> = vec![format!("scan.status:{}", ids[39])];
+    expected.extend(ids[16..31].iter().map(|id| format!("scan.status:{id}")));
     assert_eq!(
         second, expected,
         "the cursor's job first, then order, 16 in all"
@@ -475,6 +528,98 @@ fn status_followups_are_capped_per_fold_and_per_firing() {
     let distinct: BTreeSet<&String> = first.iter().chain(second.iter()).collect();
     assert_eq!(distinct.len(), 32, "none duplicated");
     assert_eq!(app.scan.inflight.len(), 32);
+}
+
+/// Forty running jobs as a `scan.list` body: their ids, in list order, and
+/// the reply value.
+fn forty_running_jobs() -> (Vec<String>, Value) {
+    let template = fixture("scan.list.json")["jobs"][0].clone();
+    let ids: Vec<String> = (0..40).map(|n| format!("scan-000000{n:02}")).collect();
+    let jobs: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let mut row = template.clone();
+            row["job"] = json!(id);
+            row
+        })
+        .collect();
+    (ids, json!({ "jobs": jobs }))
+}
+
+/// Fix round C, C2: under the 16-cap the status walk starts at a rotating
+/// offset, so with 40 running jobs three firings (every reply answered in
+/// between) reach every job at least once; the cursor's job still goes
+/// first each time. Without the rotation the same 16 would be polled every
+/// firing and the rest starved.
+#[test]
+fn status_polls_rotate_so_every_live_job_is_reached_within_three_firings() {
+    let mut app = app();
+    let (ids, list) = forty_running_jobs();
+    let reqs = app.on_bus(list_reply(list));
+    for id in status_jobs(&reqs) {
+        let _ = app.on_bus(status_reply_for(&id, running_body(&id)));
+    }
+    assert!(
+        app.scan.inflight.is_empty(),
+        "the fold's follow-ups are answered"
+    );
+    app.scan.jobs.cursor = 39;
+
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    for firing in 1..=3 {
+        for _ in 0..3 {
+            let quiet = tick(&mut app);
+            assert!(
+                quiet.is_empty(),
+                "firing {firing}: quiet tick sent {quiet:?}"
+            );
+        }
+        let polled = status_jobs(&tick(&mut app));
+        assert_eq!(
+            polled.len(),
+            16,
+            "firing {firing} sends the cap: {polled:?}"
+        );
+        assert_eq!(
+            polled[0], ids[39],
+            "firing {firing}: the cursor's job first"
+        );
+        for id in polled {
+            reached.insert(id.clone());
+            let _ = app.on_bus(status_reply_for(&id, running_body(&id)));
+        }
+    }
+    let all: BTreeSet<String> = ids.iter().cloned().collect();
+    let missed: Vec<&String> = all.difference(&reached).collect();
+    assert!(
+        missed.is_empty(),
+        "never polled in three firings: {missed:?}"
+    );
+}
+
+/// Fix round C, C6: `live()` reads the cursor's job then `order` alone;
+/// `summaries` and `full` are retained to `order` by every list fold, so a
+/// job a list dropped is in neither, and an entry smuggled into the maps
+/// outside `order` is never polled.
+#[test]
+fn live_reads_order_alone() {
+    let mut jobs = JobsState::default();
+    jobs.fold_status(running_status("scan-bbbbbbbb"));
+    let _ = jobs.fold_list(list_fixture());
+    assert_eq!(
+        jobs.order,
+        vec![JOB.to_string(), "scan-55667788".to_string()]
+    );
+    assert_eq!(jobs.live(), vec![JOB.to_string()], "the listed running job");
+    jobs.summaries.insert(
+        "scan-cccccccc".to_string(),
+        running_status("scan-cccccccc").summary(),
+    );
+    assert_eq!(
+        jobs.live(),
+        vec![JOB.to_string()],
+        "a summary outside order is not polled"
+    );
 }
 
 /// D13 error granularity (fix round B, B7): a keyed verb's error is cleared
@@ -499,11 +644,7 @@ fn a_keyed_error_is_cleared_only_by_the_same_key() {
 
     let mut sibling = fixture("scan.status.json");
     sibling["job"] = json!("scan-bbbbbbbb");
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.status:scan-bbbbbbbb".into(),
-        name: "scan.status".into(),
-        value: sibling,
-    });
+    let _ = app.on_bus(status_reply_for("scan-bbbbbbbb", sibling));
     assert_eq!(
         app.scan.last_error.as_ref().map(|e| e.tag.as_str()),
         Some("scan.status:scan-aaaaaaaa"),
@@ -512,11 +653,7 @@ fn a_keyed_error_is_cleared_only_by_the_same_key() {
 
     let mut same = fixture("scan.status.json");
     same["job"] = json!("scan-aaaaaaaa");
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.status:scan-aaaaaaaa".into(),
-        name: "scan.status".into(),
-        value: same,
-    });
+    let _ = app.on_bus(status_reply_for("scan-aaaaaaaa", same));
     assert_eq!(app.scan.last_error, None, "job A's own success clears it");
 
     let _ = app.on_bus(BusEvent::CallTaggedFailed {
@@ -528,11 +665,7 @@ fn a_keyed_error_is_cleared_only_by_the_same_key() {
         app.scan.last_error.as_ref().map(|e| e.tag.as_str()),
         Some("scan.list")
     );
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    });
+    let _ = app.on_bus(empty_list_reply());
     assert_eq!(
         app.scan.last_error, None,
         "a single-slot verb clears as before"
@@ -600,19 +733,11 @@ fn a_terminal_line_on_the_issues_tab_requests_issues() {
         value: json!({ "issues": [] }),
     });
     assert!(app.scan.inflight.is_empty(), "the entry fetch is settled");
-    let reqs = app.on_bus(BusEvent::Notification(json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/aitm/job",
-        "params": fixture("job.finished.json"),
-    })));
+    let reqs = app.on_bus(job_line(fixture("job.finished.json")));
     assert_eq!(
         reqs,
         vec![
-            BusRequest::CallTagged {
-                tag: format!("scan.status:{JOB}"),
-                name: "scan.status".into(),
-                args: json!({ "job": JOB }),
-            },
+            status_request(JOB),
             BusRequest::CallTagged {
                 tag: "scan.issues".into(),
                 name: "scan.issues".into(),
