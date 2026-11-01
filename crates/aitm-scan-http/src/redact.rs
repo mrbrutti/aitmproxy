@@ -68,9 +68,10 @@ pub(crate) fn example(kind: InsertionKind, name: &str, value: &str) -> String {
 /// `url` with every credential removed, safe for a log line or an error message.
 ///
 /// When it parses as a URL: the userinfo is dropped, the fragment is dropped,
-/// and the query is rebuilt pair by pair, each pair kept exactly as it appeared
-/// unless its key [`is_secret_name`], in which case the value becomes
-/// [`REDACTED`]. When it does not parse (a relative reference, a malformed
+/// and the query is rebuilt pair by pair: a pair whose key [`is_secret_name`]
+/// has its value replaced by [`REDACTED`], every other pair keeps its key and
+/// has its value passed through [`scrub`], with no re-encoding. When it does
+/// not parse (a relative reference, a malformed
 /// authority), everything up to and including the last `@` of the
 /// authority-looking head is dropped — that is where a `user:password@` sits —
 /// and the rest is scrubbed. Either way the result is cut to
@@ -114,8 +115,10 @@ fn rebuild(parsed: &url::Url) -> String {
 }
 
 /// A raw query string with the value of every pair whose key [`is_secret_name`]
-/// replaced by [`REDACTED`]. Pairs are split on `&` and the first `=` only;
-/// a fragment with no `=` is kept as it is.
+/// replaced by [`REDACTED`], and the value of every other pair passed through
+/// [`scrub`], so a credential nested inside a non-secret parameter (an
+/// unencoded `next=/cb?sid=abc`) is masked too. Pairs are split on `&` and the
+/// first `=` only; a fragment with no `=` is scrubbed whole.
 fn safe_query(query: &str) -> String {
     let mut out = String::new();
     for (index, pair) in query.split('&').enumerate() {
@@ -128,7 +131,12 @@ fn safe_query(query: &str) -> String {
                 out.push('=');
                 out.push_str(REDACTED);
             }
-            _ => out.push_str(pair),
+            Some((key, value)) => {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(&scrub(value));
+            }
+            None => out.push_str(&scrub(pair)),
         }
     }
     out
@@ -215,6 +223,14 @@ mod tests {
                 .chars()
                 .count(),
             MAX_SAFE_URL_CHARS
+        );
+    }
+
+    #[test]
+    fn safe_url_scrubs_kept_query_values() {
+        assert_eq!(
+            safe_url("http://t/x?next=/cb?sid=abc&q=1"),
+            "http://t/x?next=/cb?sid=[redacted]&q=1"
         );
     }
 
