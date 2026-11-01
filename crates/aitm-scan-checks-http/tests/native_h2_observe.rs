@@ -1,0 +1,958 @@
+//! The five observe-only HTTP/2 checks (spec D8.2, AC T3-3; T3 plan task 9,
+//! amendment A3).
+//!
+//! No socket is opened. The driver seam is [`RawH2Runner`]; a [`FakeRunner`]
+//! records every plan it is handed and answers from a script, so each test can
+//! say both what the check *sent* (the plan) and what it *concluded* from a
+//! given observation (the verdict).
+
+mod support;
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use aitm_proto_http::raw_h2::{
+    RawH2Mode, RawH2Observation, RawH2Plan, RawH2Target, RawHeader, StreamOutcome,
+};
+use aitm_scan_checks_http::h2_observe::{h2_checks, RawH2Runner, RealRawH2Runner};
+use aitm_scan_model::{
+    Check, CheckCost, CheckOrigin, Confidence, InsertionKind, InsertionPoint, Intensity, LaneKind,
+    Outcome, Technique, Verdict,
+};
+use futures::future::BoxFuture;
+
+use support::{point, ScriptedHost};
+
+const ORIGIN_URL: &str = "https://origin.test/x";
+
+type Script = dyn Fn(&RawH2Plan) -> anyhow::Result<RawH2Observation> + Send + Sync;
+
+/// Records every plan and answers from a closure.
+struct FakeRunner {
+    plans: Mutex<Vec<RawH2Plan>>,
+    script: Box<Script>,
+}
+
+impl FakeRunner {
+    fn scripted(
+        script: impl Fn(&RawH2Plan) -> anyhow::Result<RawH2Observation> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            plans: Mutex::new(Vec::new()),
+            script: Box::new(script),
+        })
+    }
+
+    fn answering(obs: RawH2Observation) -> Arc<Self> {
+        Self::scripted(move |_| Ok(obs.clone()))
+    }
+
+    fn failing() -> Arc<Self> {
+        Self::scripted(|_| anyhow::bail!("tls handshake failed: no ALPN h2"))
+    }
+
+    fn calls(&self) -> usize {
+        self.plans.lock().unwrap().len()
+    }
+
+    fn plans(&self) -> Vec<RawH2Plan> {
+        self.plans.lock().unwrap().clone()
+    }
+
+    fn only_plan(&self) -> RawH2Plan {
+        let plans = self.plans();
+        assert_eq!(plans.len(), 1, "expected exactly one raw connection");
+        plans.into_iter().next().unwrap()
+    }
+}
+
+impl RawH2Runner for FakeRunner {
+    fn run<'a>(&'a self, plan: RawH2Plan) -> BoxFuture<'a, anyhow::Result<RawH2Observation>> {
+        Box::pin(async move {
+            let out = (self.script)(&plan);
+            self.plans.lock().unwrap().push(plan);
+            out
+        })
+    }
+}
+
+fn obs(streams: Vec<StreamOutcome>) -> RawH2Observation {
+    RawH2Observation {
+        settings: vec![(3, 128), (4, 65535)],
+        streams,
+        goaway: None,
+        connection_closed: false,
+        elapsed_ms: 5,
+    }
+}
+
+fn reset() -> StreamOutcome {
+    StreamOutcome::Reset { error_code: 1 }
+}
+
+fn resets(n: usize) -> RawH2Observation {
+    obs(vec![reset(); n])
+}
+
+fn check_named(runner: &Arc<FakeRunner>, id: &str) -> Arc<dyn Check> {
+    let dynamic: Arc<dyn RawH2Runner> = runner.clone();
+    h2_checks(dynamic)
+        .into_iter()
+        .find(|c| c.meta().id == id)
+        .unwrap_or_else(|| panic!("no check named {id}"))
+}
+
+fn origin_point() -> InsertionPoint {
+    point(InsertionKind::Query, "q", ORIGIN_URL)
+}
+
+async fn run(check: &Arc<dyn Check>, host: &ScriptedHost) -> Verdict {
+    check.run(&origin_point(), host).await
+}
+
+fn blocks(plan: &RawH2Plan) -> &Vec<Vec<RawHeader>> {
+    match &plan.mode {
+        RawH2Mode::Blocks(b) => b,
+        other => panic!("expected Blocks, got {other:?}"),
+    }
+}
+
+fn h(name: &str, value: &str) -> RawHeader {
+    RawHeader::new(name, value)
+}
+
+fn base() -> Vec<RawHeader> {
+    vec![
+        h(":method", "GET"),
+        h(":scheme", "https"),
+        h(":authority", "origin.test"),
+        h(":path", "/x"),
+    ]
+}
+
+const ALL_IDS: [&str; 5] = [
+    "h2-settings-observe",
+    "h2-pseudo-header-validation",
+    "h2-header-crlf-tolerance",
+    "h2-cl-te-downgrade-indicator",
+    "h2-rapid-reset-mitigation",
+];
+
+// ---------------------------------------------------------------------------
+// meta
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_five_checks_carry_the_decided_ids_classes_and_shape() {
+    let runner = FakeRunner::failing();
+    let dynamic: Arc<dyn RawH2Runner> = runner;
+    let metas: Vec<_> = h2_checks(dynamic)
+        .iter()
+        .map(|c| c.meta().clone())
+        .collect();
+
+    let got: Vec<(String, String, Option<u32>, aitm_poc::Severity, Technique)> = metas
+        .iter()
+        .map(|m| {
+            (
+                m.id.clone(),
+                m.class.clone(),
+                m.cwe,
+                m.severity,
+                m.technique,
+            )
+        })
+        .collect();
+    use aitm_poc::Severity::Info;
+    assert_eq!(
+        got,
+        vec![
+            (
+                "h2-settings-observe".to_string(),
+                "h2-settings".to_string(),
+                None,
+                Info,
+                Technique::Observe
+            ),
+            (
+                "h2-pseudo-header-validation".to_string(),
+                "h2-pseudo-header".to_string(),
+                Some(444),
+                Info,
+                Technique::Malformed
+            ),
+            (
+                "h2-header-crlf-tolerance".to_string(),
+                "h2-header-crlf".to_string(),
+                Some(113),
+                Info,
+                Technique::Malformed
+            ),
+            (
+                "h2-cl-te-downgrade-indicator".to_string(),
+                "h2-smuggling-indicator".to_string(),
+                Some(444),
+                Info,
+                Technique::Observe
+            ),
+            (
+                "h2-rapid-reset-mitigation".to_string(),
+                "h2-rapid-reset".to_string(),
+                Some(400),
+                Info,
+                Technique::Observe
+            ),
+        ]
+    );
+    for m in &metas {
+        assert_eq!(m.lanes, vec![LaneKind::Http], "{}", m.id);
+        assert_eq!(
+            m.kinds,
+            vec![
+                InsertionKind::Query,
+                InsertionKind::BodyParam,
+                InsertionKind::Header,
+                InsertionKind::Cookie,
+                InsertionKind::PathSegment,
+            ],
+            "{}",
+            m.id
+        );
+        assert_eq!(m.cost, CheckCost::Light, "{}", m.id);
+        assert!(m.needs_baseline, "{}", m.id);
+        assert!(!m.targets_session, "{}", m.id);
+        assert_eq!(m.origin, CheckOrigin::Native, "{}", m.id);
+    }
+}
+
+#[test]
+fn no_h2_check_is_intrusive() {
+    let runner = FakeRunner::failing();
+    let dynamic: Arc<dyn RawH2Runner> = runner;
+    for check in h2_checks(dynamic) {
+        assert_eq!(
+            check.meta().intensity,
+            Intensity::Medium,
+            "{}",
+            check.meta().id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// h2-settings-observe
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn settings_observe_reports_the_advertised_values() {
+    let runner = FakeRunner::answering(obs(vec![]));
+    let check = check_named(&runner, "h2-settings-observe");
+    let host = ScriptedHost::new();
+
+    let v = run(&check, &host).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(v.confidence, Confidence::Certain);
+    assert_eq!(check.meta().severity, aitm_poc::Severity::Info);
+    assert!(
+        v.detail.contains("max_concurrent_streams=128"),
+        "{}",
+        v.detail
+    );
+    assert!(
+        v.detail.contains("initial_window_size=65535"),
+        "{}",
+        v.detail
+    );
+    assert_eq!(
+        v.evidence.matched.as_deref(),
+        Some("max_concurrent_streams=128, initial_window_size=65535")
+    );
+    let plan = runner.only_plan();
+    assert_eq!(plan.mode, RawH2Mode::SettingsOnly);
+    assert_eq!(plan.streams, 0);
+    assert_eq!(
+        plan.target,
+        RawH2Target {
+            scheme: "https".to_string(),
+            authority: "origin.test".to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn settings_observe_names_unknown_ids_and_bounds_the_evidence() {
+    let mut o = obs(vec![]);
+    o.settings = (100u16..160)
+        .map(|id| (id, 1_000_000 + u32::from(id)))
+        .collect();
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-settings-observe");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    let matched = v.evidence.matched.expect("settings listed");
+    assert!(
+        matched.starts_with("setting_100=1000100, setting_101=1000101"),
+        "{matched}"
+    );
+    assert!(matched.len() <= 256, "{}", matched.len());
+}
+
+#[tokio::test]
+async fn settings_observe_is_clean_only_when_no_settings_were_read() {
+    let mut o = obs(vec![]);
+    o.settings = vec![];
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-settings-observe");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(v.detail, "the peer sent no SETTINGS frame");
+}
+
+// ---------------------------------------------------------------------------
+// h2-pseudo-header-validation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pseudo_header_validation_sends_three_variants_on_one_connection() {
+    let runner = FakeRunner::answering(resets(3));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    let plan = runner.only_plan();
+    assert_eq!(plan.streams, 3);
+    assert!(plan.headers.is_empty());
+    assert_eq!(
+        blocks(&plan),
+        &vec![
+            // 0: no :path
+            vec![
+                h(":method", "GET"),
+                h(":scheme", "https"),
+                h(":authority", "origin.test"),
+            ],
+            // 1: :method twice
+            vec![
+                h(":method", "GET"),
+                h(":method", "GET"),
+                h(":scheme", "https"),
+                h(":authority", "origin.test"),
+                h(":path", "/x"),
+            ],
+            // 2: a pseudo-header after a regular header
+            vec![
+                h(":method", "GET"),
+                h(":scheme", "https"),
+                h(":authority", "origin.test"),
+                h("x-aitm-probe", "1"),
+                h(":path", "/x"),
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pseudo_header_validation_is_clean_when_every_stream_is_rejected() {
+    let runner = FakeRunner::answering(obs(vec![
+        reset(),
+        StreamOutcome::Refused,
+        StreamOutcome::Headers { status: Some(400) },
+    ]));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    assert_eq!(v.evidence.matched, None);
+}
+
+#[tokio::test]
+async fn pseudo_header_validation_names_the_tolerated_variant() {
+    let runner = FakeRunner::answering(obs(vec![
+        reset(),
+        StreamOutcome::Headers { status: Some(200) },
+        reset(),
+    ]));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(
+        v.detail,
+        "variant 1 (duplicate :method) was answered with status 200 instead of being rejected"
+    );
+    assert_eq!(
+        v.evidence.matched.as_deref(),
+        Some("variant 1: duplicate :method")
+    );
+    assert!(v.poc_hint.is_none());
+}
+
+#[tokio::test]
+async fn an_answer_with_an_unreadable_status_counts_as_tolerated_and_a_redirect_too() {
+    for (answer, expect) in [
+        (
+            StreamOutcome::Headers { status: None },
+            "an unreadable status",
+        ),
+        (StreamOutcome::Headers { status: Some(302) }, "status 302"),
+    ] {
+        let runner = FakeRunner::answering(obs(vec![reset(), reset(), answer]));
+        let check = check_named(&runner, "h2-pseudo-header-validation");
+
+        let v = run(&check, &ScriptedHost::new()).await;
+
+        assert_eq!(v.outcome, Outcome::Vulnerable, "{answer:?}");
+        assert!(
+            v.detail
+                .starts_with("variant 2 (pseudo-header after a regular header)"),
+            "{}",
+            v.detail
+        );
+        assert!(v.detail.contains(expect), "{}", v.detail);
+    }
+}
+
+#[tokio::test]
+async fn a_timed_out_or_missing_stream_is_inconclusive_not_clean() {
+    for o in [
+        obs(vec![reset(), StreamOutcome::Timeout, reset()]),
+        obs(vec![reset(), reset()]),
+    ] {
+        let runner = FakeRunner::answering(o);
+        let check = check_named(&runner, "h2-pseudo-header-validation");
+
+        let v = run(&check, &ScriptedHost::new()).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// h2-header-crlf-tolerance
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn crlf_tolerance_sends_one_name_and_one_value_probe() {
+    let runner = FakeRunner::answering(resets(2));
+    let check = check_named(&runner, "h2-header-crlf-tolerance");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    let plan = runner.only_plan();
+    assert_eq!(plan.streams, 2);
+    let mut value_variant = base();
+    value_variant.push(RawHeader::raw(b"x-aitm-probe", b"a\r\nx-aitm-injected: 1"));
+    let mut name_variant = base();
+    name_variant.push(RawHeader::raw(b"x-aitm-probe\r\nx-aitm-injected", b"1"));
+    assert_eq!(blocks(&plan), &vec![value_variant, name_variant]);
+}
+
+#[tokio::test]
+async fn crlf_tolerance_names_the_tolerated_variant() {
+    let runner = FakeRunner::answering(obs(vec![
+        reset(),
+        StreamOutcome::Headers { status: Some(200) },
+    ]));
+    let check = check_named(&runner, "h2-header-crlf-tolerance");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(
+        v.detail,
+        "variant 1 (CRLF in a header name) was answered with status 200 instead of being rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// h2-cl-te-downgrade-indicator
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cl_te_indicator_sends_two_variants_and_never_a_body() {
+    let runner = FakeRunner::answering(resets(2));
+    let check = check_named(&runner, "h2-cl-te-downgrade-indicator");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    let plan = runner.only_plan();
+    assert_eq!(plan.streams, 2);
+    let mut cl = base();
+    cl.push(h("content-length", "1"));
+    let mut te = base();
+    te.push(h("transfer-encoding", "chunked"));
+    assert_eq!(blocks(&plan), &vec![cl, te]);
+}
+
+#[tokio::test]
+async fn cl_te_indicator_is_tentative_when_a_stream_is_answered() {
+    let runner = FakeRunner::answering(obs(vec![
+        StreamOutcome::Headers { status: Some(200) },
+        reset(),
+    ]));
+    let check = check_named(&runner, "h2-cl-te-downgrade-indicator");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(
+        v.detail,
+        "variant 0 (content-length one byte longer than the body) was answered with status 200 instead of being rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// h2-rapid-reset-mitigation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rapid_reset_never_opens_more_than_eight_pairs() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    run(&check, &ScriptedHost::new()).await;
+
+    let plan = runner.only_plan();
+    assert_eq!(plan.mode, RawH2Mode::RapidReset { pairs: 8 });
+    assert_eq!(plan.streams, 8);
+    assert_eq!(plan.headers, base());
+}
+
+#[tokio::test]
+async fn rapid_reset_is_clean_when_the_peer_sends_goaway() {
+    let mut o = resets(8);
+    o.goaway = Some((15, 11));
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    assert_eq!(
+        v.detail,
+        "the peer sent GOAWAY(last_stream_id=15, error_code=11) during 8 reset pairs"
+    );
+}
+
+#[tokio::test]
+async fn rapid_reset_is_clean_when_the_peer_refuses_a_stream() {
+    let mut streams = vec![reset(); 8];
+    streams[5] = StreamOutcome::Refused;
+    let runner = FakeRunner::answering(obs(streams));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Clean);
+    assert_eq!(v.detail, "the peer refused a stream during 8 reset pairs");
+}
+
+#[tokio::test]
+async fn rapid_reset_without_goaway_reports_no_mitigation_observed() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    let v = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(
+        v.detail,
+        "no reset-rate mitigation observed in 8 reset pairs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the scope gate, the once-per-authority guard, the stop contract
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_h2_check_calls_baseline_before_it_dials() {
+    for id in ALL_IDS {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, id);
+        let host = ScriptedHost::new().with_baseline_fails(true);
+
+        let v = run(&check, &host).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
+        assert_eq!(v.detail, "baseline refused; not probing", "{id}");
+        assert_eq!(host.baseline_calls(), 1, "{id}");
+        assert_eq!(
+            runner.calls(),
+            0,
+            "{id}: no raw connection after a refused baseline"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_baseline_does_not_use_up_the_authority() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    let refused = run(&check, &ScriptedHost::new().with_baseline_fails(true)).await;
+    let allowed = run(&check, &ScriptedHost::new()).await;
+
+    assert_eq!(refused.outcome, Outcome::Inconclusive);
+    assert_eq!(allowed.outcome, Outcome::Vulnerable);
+    assert_eq!(runner.calls(), 1);
+}
+
+#[tokio::test]
+async fn an_h2_check_runs_once_per_authority() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let host = ScriptedHost::new();
+    let second_host = ScriptedHost::new();
+
+    let first = run(&check, &host).await;
+    let second = check
+        .run(
+            &point(
+                InsertionKind::Header,
+                "x-forwarded-for",
+                "https://origin.test/other",
+            ),
+            &second_host,
+        )
+        .await;
+
+    assert_eq!(first.outcome, Outcome::Vulnerable);
+    assert_eq!(second.outcome, Outcome::Inconclusive);
+    assert_eq!(second.detail, "already observed for this authority");
+    assert_eq!(runner.calls(), 1);
+    assert_eq!(
+        second_host.baseline_calls(),
+        0,
+        "a repeat sends nothing at all"
+    );
+}
+
+#[tokio::test]
+async fn the_guard_is_per_authority_and_per_scheme() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    for url in [
+        "https://origin.test/x",
+        "https://origin.test:8443/x",
+        "https://other.test/x",
+        "http://origin.test/x",
+    ] {
+        let v = check
+            .run(&point(InsertionKind::Query, "q", url), &ScriptedHost::new())
+            .await;
+        assert_eq!(v.outcome, Outcome::Vulnerable, "{url}");
+    }
+
+    assert_eq!(runner.calls(), 4);
+}
+
+#[tokio::test]
+async fn the_guard_is_per_check_instance() {
+    let runner = FakeRunner::answering(resets(8));
+    let one = check_named(&runner, "h2-rapid-reset-mitigation");
+    let two = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    run(&one, &ScriptedHost::new()).await;
+    let v = run(&two, &ScriptedHost::new()).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(runner.calls(), 2);
+}
+
+#[tokio::test]
+async fn each_check_has_its_own_guard() {
+    let runner = FakeRunner::scripted(|plan| match &plan.mode {
+        RawH2Mode::SettingsOnly => Ok(obs(vec![])),
+        _ => Ok(resets(plan.streams as usize)),
+    });
+    let dynamic: Arc<dyn RawH2Runner> = runner.clone();
+    let checks = h2_checks(dynamic);
+
+    for check in &checks {
+        let v = run(check, &ScriptedHost::new()).await;
+        assert_ne!(v.outcome, Outcome::Inconclusive, "{}", check.meta().id);
+    }
+
+    assert_eq!(runner.calls(), 5);
+}
+
+#[tokio::test]
+async fn a_runner_error_is_inconclusive_for_every_check() {
+    for id in ALL_IDS {
+        let runner = FakeRunner::failing();
+        let check = check_named(&runner, id);
+
+        let v = run(&check, &ScriptedHost::new()).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
+        assert_eq!(
+            v.detail, "origin does not negotiate h2 (or the raw probe failed)",
+            "{id}"
+        );
+        assert!(v.poc_hint.is_none(), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn a_stopped_job_sends_nothing() {
+    for host in [
+        ScriptedHost::new().with_cancelled(true),
+        ScriptedHost::new().with_budget(0),
+        ScriptedHost::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+    ] {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+        let v = run(&check, &host).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+        assert_eq!(host.baseline_calls(), 0);
+        assert_eq!(runner.calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn the_raw_probe_does_not_spend_the_hosts_budget() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let host = ScriptedHost::new().with_budget(1);
+
+    let v = run(&check, &host).await;
+
+    // Budget one pays for the baseline; the raw probe does not spend the host's
+    // budget, so it still runs.
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(runner.calls(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// the raw target
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_target_is_derived_from_the_point_url() {
+    let cases = [
+        ("https://origin.test/x", "https", "origin.test", "/x"),
+        (
+            "https://origin.test:8443/a/b?q=1#f",
+            "https",
+            "origin.test:8443",
+            "/a/b",
+        ),
+        ("HTTPS://Origin.TEST", "https", "origin.test", "/"),
+        (
+            "http://user:secret@origin.test/p",
+            "http",
+            "origin.test",
+            "/p",
+        ),
+        ("https://[::1]:9443/x", "https", "[::1]:9443", "/x"),
+    ];
+    for (url, scheme, authority, path) in cases {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+        check
+            .run(&point(InsertionKind::Query, "q", url), &ScriptedHost::new())
+            .await;
+
+        let plan = runner.only_plan();
+        assert_eq!(plan.target.scheme, scheme, "{url}");
+        assert_eq!(plan.target.authority, authority, "{url}");
+        assert_eq!(plan.headers[1], h(":scheme", scheme), "{url}");
+        assert_eq!(plan.headers[2], h(":authority", authority), "{url}");
+        assert_eq!(plan.headers[3], h(":path", path), "{url}");
+        assert!(
+            !format!("{plan:?}").contains("secret"),
+            "userinfo must never reach the wire: {url}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unusable_url_is_inconclusive_and_dials_nothing() {
+    let mut no_url = origin_point();
+    no_url.url = None;
+    let mut points = vec![no_url];
+    for url in [
+        "ftp://origin.test/x",
+        "https:///x",
+        "origin.test/x",
+        "https://exa mple.test/",
+    ] {
+        points.push(point(InsertionKind::Query, "q", url));
+    }
+    for p in points {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+        let v = check.run(&p, &ScriptedHost::new()).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{:?}", p.url);
+        assert_eq!(
+            v.detail, "the point has no usable http(s) url",
+            "{:?}",
+            p.url
+        );
+        assert_eq!(runner.calls(), 0, "{:?}", p.url);
+    }
+}
+
+#[tokio::test]
+async fn a_path_with_control_bytes_falls_back_to_the_root() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+
+    check
+        .run(
+            &point(InsertionKind::Query, "q", "https://origin.test/a b"),
+            &ScriptedHost::new(),
+        )
+        .await;
+
+    assert_eq!(runner.only_plan().headers[3], h(":path", "/"));
+}
+
+// ---------------------------------------------------------------------------
+// the AC T3-3 expected set, and the standing guarantees
+// ---------------------------------------------------------------------------
+
+/// A conforming (hyper-like) server: advertises SETTINGS, resets every
+/// malformed stream with PROTOCOL_ERROR and every cancelled stream, and never
+/// sends GOAWAY.
+fn conforming_runner() -> Arc<FakeRunner> {
+    FakeRunner::scripted(|plan| {
+        let mut o = match &plan.mode {
+            RawH2Mode::SettingsOnly => obs(vec![]),
+            _ => resets(plan.streams as usize),
+        };
+        o.settings = vec![(3, 100), (4, 65535)];
+        Ok(o)
+    })
+}
+
+#[tokio::test]
+async fn the_t3_3_expected_set_on_a_conforming_server() {
+    let runner = conforming_runner();
+    let dynamic: Arc<dyn RawH2Runner> = runner.clone();
+    let mut got = Vec::new();
+    for check in h2_checks(dynamic) {
+        let v = run(&check, &ScriptedHost::new()).await;
+        got.push((check.meta().id.clone(), v.outcome, check.meta().severity));
+    }
+
+    use aitm_poc::Severity::Info;
+    assert_eq!(
+        got,
+        vec![
+            ("h2-settings-observe".to_string(), Outcome::Vulnerable, Info),
+            (
+                "h2-pseudo-header-validation".to_string(),
+                Outcome::Clean,
+                Info
+            ),
+            ("h2-header-crlf-tolerance".to_string(), Outcome::Clean, Info),
+            (
+                "h2-cl-te-downgrade-indicator".to_string(),
+                Outcome::Clean,
+                Info
+            ),
+            (
+                "h2-rapid-reset-mitigation".to_string(),
+                Outcome::Vulnerable,
+                Info
+            ),
+        ]
+    );
+    // One connection per check, never more.
+    assert_eq!(runner.calls(), 5);
+}
+
+#[tokio::test]
+async fn no_plan_ever_exceeds_eight_streams_or_carries_session_material() {
+    let runner = conforming_runner();
+    let dynamic: Arc<dyn RawH2Runner> = runner.clone();
+    for check in h2_checks(dynamic) {
+        run(&check, &ScriptedHost::new()).await;
+    }
+
+    for plan in runner.plans() {
+        assert!(plan.streams <= 8, "{plan:?}");
+        let opened = match &plan.mode {
+            RawH2Mode::SettingsOnly => 0,
+            RawH2Mode::SingleRequest => 1,
+            RawH2Mode::RapidReset { pairs } => usize::from(*pairs),
+            RawH2Mode::Blocks(b) => b.len(),
+        };
+        assert_eq!(usize::from(plan.streams), opened, "{plan:?}");
+        let all: Vec<&RawHeader> = match &plan.mode {
+            RawH2Mode::Blocks(b) => b.iter().flatten().collect(),
+            _ => plan.headers.iter().collect(),
+        };
+        for header in all {
+            let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
+            for forbidden in [
+                "cookie",
+                "authorization",
+                "proxy-authorization",
+                "set-cookie",
+            ] {
+                assert_ne!(name, forbidden, "{plan:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_h2_check_supplies_a_poc_hint() {
+    let vulnerable = FakeRunner::answering(obs(vec![
+        StreamOutcome::Headers { status: Some(200) },
+        StreamOutcome::Headers { status: Some(200) },
+        StreamOutcome::Headers { status: Some(200) },
+    ]));
+    for id in ALL_IDS {
+        let check = check_named(&vulnerable, id);
+        let v = run(&check, &ScriptedHost::new()).await;
+        assert!(v.poc_hint.is_none(), "{id}");
+    }
+    assert!(vulnerable.calls() > 0);
+}
+
+#[tokio::test]
+async fn the_real_runner_refuses_session_material_before_dialling() {
+    let runner = RealRawH2Runner::new();
+    let plan = RawH2Plan {
+        target: RawH2Target {
+            scheme: "https".to_string(),
+            authority: "origin.test".to_string(),
+        },
+        headers: vec![h(":method", "GET"), h("cookie", "sid=1")],
+        mode: RawH2Mode::SingleRequest,
+        streams: 1,
+    };
+
+    let err = runner
+        .run(plan)
+        .await
+        .expect_err("a cookie header is refused");
+
+    assert_eq!(
+        err.to_string(),
+        "a raw h2 probe never sends a `cookie` header"
+    );
+}
