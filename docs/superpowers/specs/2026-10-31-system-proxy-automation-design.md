@@ -166,7 +166,7 @@ pub(crate) trait PlatformOps: Send + Sync {
 }
 ```
 
-`WriteError::NeedsPrivilege(remedy)` is produced when a `networksetup` mutation
+`WriteError::NeedsPrivilege { line }` (the failing rendered command line; the engine supplies the §D3 remedy sentence from `remedy(ours)`) is produced when a `networksetup` mutation
 exits non-zero or prints `** Error: Command requires admin privileges.` on
 stdout or stderr; `ReadError::Unavailable` when a read prints
 `AuthorizationCreate() failed` or `scutil --proxy` yields an empty dictionary
