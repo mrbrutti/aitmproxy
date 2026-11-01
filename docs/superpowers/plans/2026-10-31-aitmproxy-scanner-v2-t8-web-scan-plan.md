@@ -266,6 +266,38 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2 | impeccable design hook | Minor | `.notice` carried a 2 px left accent border (side-tab tell) | fixed in `2b8714dd` (border removed) |
+| 1, 2 | coders (plan gap) | Important | `node:fs` imports in tests fail `tsc` (no `@types/node`); the plan's fixture loader could not typecheck | fixed in `2b8714dd`: test-only `apps/web/src/types-node-test.d.ts`; `@types/node` rejected because it would retype the app's DOM timer APIs; a vitest guard (`43c8cd1e`) asserts no non-test file imports `node:` |
+| 10-13 | orchestrator visual review (dev server, not evidence) | Important | Jobs rows truncated the state words; class chips title-cased; unstyled `<select>`; site-map host rows unstyled; editor not disabled on a closed bus | fixed in `2ae8b8e6` |
+| 11, 10, 12 | engine contract (T1b) | Important | profile-name rule, `crawl.errors`, site map must name its job | fixed in `c9d5a39e`; spec A1/A5/A6 |
+| 11, 15 | live run 1 | Important | headless Chrome cannot drive a native `<select>` with real input; `Origin scheme` picker unreachable | fixed in `9df1cf5a` (segmented radiogroup; script clicks it); spec A2 |
+| 4 | live run 2 | Important | `live-env.mjs` parsed an obsolete stdout line, so the proof ran as an agent session and `scan.start` was refused | fixed in `e138d7f2` (`parseOperatorUrl`, both formats); `943f56d1` makes the operator URL mandatory; spec A11 |
+| 4, 15 | live run 3 | Important | `interface: *` is invalid YAML (alias marker); cancel step had nothing to cancel; phase assertion vacuous; PoC ref cannot be in `poc.list` (non-recursive); note typed into `body` (toast overlap); 8a reason order | fixed in `943f56d1`; PoC half recorded as NOTE by design, spec A7 (core question for Matt in spec Open question 2) |
+| all | security | Minor | wire-keyed Solid stores fall through to `Object.prototype` (`constructor` profile crashes the editor) | fixed in `08ec7391` (`own()`/`emptyRecord()`), test with a `constructor` profile |
+| 11 | security | Minor | wire profile name interpolated into a CSS selector | fixed in `43c8cd1e` (`getElementById` via `listboxKeys({domId})`), test with `we"ird]` |
+| 8, 9 | quality | Important | `cancel` swallowed the core's refusal | fixed in `08ec7391` (`CancelResult`, `report('cancel', …)`), rendered in `43c8cd1e` |
+| 9, 11 | quality | Important | one untyped `lastError` for seven sources; code sniffed from English text | fixed in `08ec7391` (`ScanError { source, code, text }`, `errorFor`) + `43c8cd1e` (views render only their sources) |
+| 9, 14, 11 | quality | Important | bootstrap reads issued three times with no in-flight guard | fixed in `08ec7391` (`ensure*` memoised) + `43c8cd1e` (shell/views call `ensure*`; test `no_duplicate_bootstrap_reads`) |
+| 10-13 | quality | Important | four copies of the listbox keyboard handler; duplicated `Dash`/`Fact`/`Section`/loading/reconnect/last-good | fixed in `43c8cd1e` (`primitives.tsx`, `listboxKeys`) |
+| 8, 10 | quality | Important | `refreshStatus` dropped errors silently; a finished job's detail could stay stale with no error state | fixed in `08ec7391` (`statusError(job)`) + `43c8cd1e` (Jobs detail `ErrorBlock` + Retry) |
+| 11 | quality | Important | `EditorForm` monolith; seven local-state groups survived a profile switch | fixed in `43c8cd1e` (section components with their own drafts; editor keyed on the name; test `per_profile_reset`) |
+| 9, 1 | quality | Minor | save/delete replies parsed inline in the store; wrong comment on `parseL4Entries` | fixed in `08ec7391` (`parseProfileSaveResult`/`parseProfileDeleteResult`) |
+| 2 | quality | Minor | `types-node-test.d.ts` is global to the app build | fixed in `43c8cd1e` (vitest guard: no non-test `src/**` file imports `node:`) |
+| tests | quality | Minor | fixture loader copied eleven times | partly fixed in `08ec7391` (`fixture()` exported from `testkit.ts`, four suites import it); the view suites keep a local copy — accepted (orchestrator, 2026-11-01): cosmetic, no behaviour |
+| 15 | quality | Minor | `scan-live.mjs` repeats the `cua-live.mjs` harness; dead `L4_LABELS`; false NOTE | dead code and NOTE fixed in `943f56d1`; harness extraction accepted as not done (orchestrator, 2026-11-01): a shared `live-harness.mjs` is a follow-up across three scripts, outside T8's scope |
+| 7 | quality | Minor | mock drift (`crawl.errors`), mock placement | moot: main `d5a698ff` (#241) removed the web mock bus; Task 7 withdrawn in the merge `5d00069e` (plan PA7) |
+| views | quality | Minor | `!` assertions, `as T` casts, per-row `find`, double `liveCount()` read | fixed in `43c8cd1e` except the `Sidebar.tsx` double read — accepted (orchestrator, 2026-11-01): one extra signal read |
+| 11 | spec | Important | client-side profile-name rule not in the contract | accepted as the engine's rule (orchestrator, 2026-11-01): `crates/aitm-plugin-scanner/src/profiles.rs:37` on PR #232; spec D-T8.5 amended (A1) |
+| 2 | spec | Important | undeclared `types-node-test.d.ts` | accepted (orchestrator, 2026-11-01); added to D-T8.12 and the file matrix (A9/PA1); guard test in `43c8cd1e` |
+| 11 | spec | Important | W-16 untested for Profiles (loading, error-with-Retry) | fixed in `23f88b3f` (tester) and `43c8cd1e` (last good) |
+| 10 | spec | Minor | row Cancel removed (spec said row and strip) | accepted (orchestrator, 2026-11-01): detail header + strip; D-T8.7 amended (A3) |
+| 9 | spec | Minor | `confirm_required` text not rendered before the re-run; untested | fixed in `08ec7391` |
+| 1, 10, 12 | spec | Minor | `crawl.errors` and Site map job label beyond the spec | accepted as engine-contract additions; spec amended (A5, A6) |
+| 1 | spec | Minor | `parseScanProfile` defaults `lanes: ['http']` | accepted: matches `profile.rs` `Default`; plan Task 1 amended (PA2) |
+| 11 | spec | Minor | `Origin scheme` radiogroup, not `<select>` | accepted; spec amended (A2) |
+| 15 | spec | Minor | no `scanner:` block in the live script | accepted: D11 defaults already apply; plan PA13 |
+| 11 | spec | Minor | Profiles error block lacked "last good" | fixed in `43c8cd1e` |
+| 1 | tester | Minor | negative counters pass through `num()` | fixed in `08ec7391` (clamp to 0) |
 
 ## Shipped
 
