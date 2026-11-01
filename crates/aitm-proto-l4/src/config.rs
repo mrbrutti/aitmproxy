@@ -20,7 +20,10 @@ pub struct L4Config {
     pub enabled: bool,
     /// Capture/inject backend. `Pcap` by default.
     pub capture_backend: L4Backend,
-    /// Deny-by-default scope: an empty list means nothing is active.
+    /// Deny-by-default scope: an empty list means nothing is active. An entry's
+    /// `interface` may be `"*"` to cover any interface (socket-based clients that
+    /// cannot know their egress NIC); direction, CIDR, ports and capability still
+    /// narrow it.
     pub scope: Vec<L4ScopeEntry>,
     /// Tool-wide injection ceiling in packets/sec. `0` ⇒ refuse.
     pub global_inject_pps: u32,

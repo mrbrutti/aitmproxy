@@ -80,15 +80,19 @@ impl ProtocolModule for WsModule {
 }
 
 /// The metadata a WebSocket flow starts with, given its handshake `HttpFlow`'s:
-/// exactly the capture attribution (`source_app`, `capture_interface`) is
-/// inherited, so the conversation is attributed to the same client process and
-/// backend as the 101 that opened it. Marks, comment, replay flag and timing are
-/// the WebSocket flow's own and start fresh.
-fn inherit_attribution(handshake: &FlowMeta) -> FlowMeta {
-    FlowMeta::with_attribution(
-        handshake.source_app.clone(),
-        handshake.capture_interface.clone(),
-    )
+/// exactly the capture attribution (`source_app`, `capture_interface`) and the
+/// passive stamp are inherited, so the conversation is attributed to the same
+/// client process and backend as the 101 that opened it and, like that 101, is
+/// observed only when its host was outside Scope (spec D4). Marks, comment,
+/// replay flag and timing are the WebSocket flow's own and start fresh.
+fn inherit_meta(handshake: &FlowMeta) -> FlowMeta {
+    FlowMeta {
+        passive: handshake.passive,
+        ..FlowMeta::with_attribution(
+            handshake.source_app.clone(),
+            handshake.capture_interface.clone(),
+        )
+    }
 }
 
 /// Relay frames between the client and the already-upgraded upstream,
@@ -128,7 +132,7 @@ async fn drive(
         messages: Vec::new(),
         client_conn,
         server_conn,
-        metadata: inherit_attribution(&meta),
+        metadata: inherit_meta(&meta),
         intercept: InterceptState::Observed,
     }));
 
@@ -331,26 +335,37 @@ mod tests {
 
     use super::*;
 
-    /// SA-AC0: a WebSocket flow inherits exactly the handshake's capture attribution.
-    /// Marks, comment, replay flag and timing are the WebSocket flow's own.
+    /// SA-AC0 + spec D4: a WebSocket flow inherits exactly the handshake's capture
+    /// attribution and its passive stamp. Marks, comment, replay flag and timing
+    /// are the WebSocket flow's own.
     #[test]
-    fn inherit_attribution_copies_only_the_two_fields() {
+    fn inherit_meta_copies_attribution_and_passive_only() {
         let handshake = FlowMeta {
             source_app: Some("com.apple.Safari".into()),
             capture_interface: Some("macos-ne".into()),
             marks: vec!["x".into()],
             comment: Some("c".into()),
             is_replay: true,
+            passive: true,
             ..FlowMeta::default()
         };
 
-        let meta = inherit_attribution(&handshake);
+        let meta = inherit_meta(&handshake);
 
         assert_eq!(meta.source_app, Some("com.apple.Safari".into()));
         assert_eq!(meta.capture_interface, Some("macos-ne".into()));
+        assert!(
+            meta.passive,
+            "a WebSocket opened by a passive handshake is passive"
+        );
         assert!(meta.marks.is_empty());
         assert_eq!(meta.comment, None);
         assert!(!meta.is_replay);
+        assert_eq!(meta.tunnel, None);
+        assert!(
+            !inherit_meta(&FlowMeta::default()).passive,
+            "an acted-on handshake opens an acted-on WebSocket"
+        );
     }
 
     // ---- Tester additions (whole-branch stage 5) -----------------------------
@@ -482,5 +497,25 @@ mod tests {
         let ws = ws_flow_after_drive(FlowMeta::default()).await;
         assert_eq!(ws.metadata.source_app, None);
         assert_eq!(ws.metadata.capture_interface, None);
+    }
+
+    /// Spec D4, the live wiring: `drive` stamps the `WsFlow` with its handshake's
+    /// `passive` (true → true, false → false), so a WebSocket opened by plain HTTP
+    /// to a host outside Scope is observed only, exactly like its handshake.
+    #[tokio::test]
+    async fn websocket_flow_inherits_passive_from_its_handshake() {
+        let passive = ws_flow_after_drive(FlowMeta {
+            passive: true,
+            ..FlowMeta::default()
+        })
+        .await;
+        assert!(passive.metadata.passive, "true → true");
+
+        let acted_on = ws_flow_after_drive(FlowMeta {
+            passive: false,
+            ..FlowMeta::default()
+        })
+        .await;
+        assert!(!acted_on.metadata.passive, "false → false");
     }
 }

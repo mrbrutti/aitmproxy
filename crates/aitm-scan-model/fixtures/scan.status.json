@@ -1,0 +1,95 @@
+{
+  "job": "scan-1a2b3c4d",
+  "state": "running",
+  "phase": "auditing",
+  "profile_name": "standard",
+  "targets": [
+    "http://127.0.0.1:8080"
+  ],
+  "started_by": {
+    "frontend": "operator",
+    "client_label": "web-ui"
+  },
+  "started_at": 1761900000000,
+  "finished_at": null,
+  "elapsed_ms": 42000,
+  "stopped_reason": null,
+  "probes": {
+    "sent": 418,
+    "budget": 2000,
+    "errors": 2,
+    "timeouts": 1,
+    "rate_waits": 0,
+    "by_lane": {
+      "http": 418
+    }
+  },
+  "crawl": {
+    "pages": 37,
+    "queued": 0,
+    "depth": 3,
+    "forms_submitted": 4
+  },
+  "points": {
+    "found": 120,
+    "queued": 40,
+    "audited": 80,
+    "skipped": {
+      "ignored": 5,
+      "frequent": 3,
+      "limit": 0
+    }
+  },
+  "checks": {
+    "scheduled": 240,
+    "done": 180,
+    "running": [
+      "http.reflected-xss",
+      "http.sqli-error"
+    ]
+  },
+  "issues": {
+    "total": 3,
+    "by_severity": {
+      "critical": 0,
+      "high": 1,
+      "medium": 1,
+      "low": 1,
+      "info": 0
+    },
+    "by_confidence": {
+      "certain": 1,
+      "firm": 1,
+      "tentative": 1
+    }
+  },
+  "l4": null,
+  "session": {
+    "reused": true,
+    "lost": false,
+    "canary": {
+      "kind": "flow",
+      "method": "GET",
+      "path": "/account",
+      "expected_status": 200
+    },
+    "browser_partial": false
+  },
+  "lanes": {
+    "requested": [
+      "http",
+      "ws"
+    ],
+    "run": [
+      "http"
+    ],
+    "skipped": [
+      {
+        "lane": "ws",
+        "reason": "lane not available on this build"
+      }
+    ]
+  },
+  "clamped": [],
+  "error": null
+}
