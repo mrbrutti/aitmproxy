@@ -19,7 +19,7 @@ use crate::caps::TermCaps;
 use crate::filter::{self, Expr};
 use crate::model::{
     counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, Finding, FlowDetail,
-    FlowKind, FlowRow, Message, Severity,
+    FlowKind, FlowRow, Message, Severity, SystemProxyWord,
 };
 use crate::open::{self, OpenTarget};
 use crate::theme::Theme;
@@ -894,6 +894,12 @@ pub struct App {
     pub auto_select: bool,
     pub intercept_armed: bool,
     pub capture_paused: bool,
+    /// `proxy.status.system_proxy` from the last poll (spec §D14); `None`
+    /// until the first reply, or when the core does not report it.
+    pub system_proxy: Option<SystemProxyWord>,
+    /// This TUI's own `proxy.system.set`/`unset` is in flight: the pill reads
+    /// `· sys-proxy setting…` until the reply or the error.
+    pub sysproxy_setting: bool,
     pub scope: Vec<String>,
     pub findings: Vec<Finding>,
     pub finding_cursor: usize,
@@ -986,6 +992,8 @@ impl App {
             auto_select: false,
             intercept_armed: false,
             capture_paused: false,
+            system_proxy: None,
+            sysproxy_setting: false,
             scope: Vec::new(),
             findings: Vec::new(),
             finding_cursor: 0,
@@ -1545,6 +1553,16 @@ impl App {
                 let armed = !self.intercept_armed;
                 self.intercept_armed = armed;
                 out.push(BusRequest::Intercept(armed));
+            }
+            // D14: `off` only when the word says the system proxy is already
+            // ours; `on` otherwise, including before the first status poll.
+            Action::ToggleSysProxy => {
+                let ours = self
+                    .system_proxy
+                    .as_ref()
+                    .is_some_and(|w| w.state == "points_at_us");
+                let line = if ours { "sysproxy off" } else { "sysproxy on" };
+                out.extend(self.run_command(line));
             }
             Action::Resume => {
                 if let Some(f) = self.selected_l4().cloned() {
@@ -3299,6 +3317,34 @@ impl App {
                     );
                 }
             }
+            // D14: the OS system proxy. One gate for the three verbs: a core
+            // with `proxy.system.set` has them all. `on` sends `{}` so the
+            // config's bypass list applies; `status` only reads.
+            "sysproxy" => {
+                let tool = match rest {
+                    "on" => "proxy.system.set",
+                    "off" => "proxy.system.unset",
+                    "status" => "proxy.system.status",
+                    _ => {
+                        self.toast(Level::Error, "usage: :sysproxy on|off|status");
+                        return out;
+                    }
+                };
+                if !self.has_tool("proxy.system.set") {
+                    self.toast(
+                        Level::Warn,
+                        "System proxy needs the core's proxy.system.* verbs",
+                    );
+                    return out;
+                }
+                if tool != "proxy.system.status" {
+                    self.sysproxy_setting = true;
+                }
+                out.push(BusRequest::Call {
+                    name: tool.into(),
+                    args: json!({}),
+                });
+            }
             "findings" | "poc" => {
                 if let Some(spec) = rest.strip_prefix("run ") {
                     let mut p = spec.splitn(2, ' ');
@@ -3382,6 +3428,7 @@ impl App {
                 self.intercept_armed = s.intercept_armed;
                 self.capture_paused = !s.capturing;
                 self.store_paused = Some(s.paused);
+                self.system_proxy = s.system_proxy;
             }
             BusEvent::ScriptFindings(list) => {
                 self.findings.retain(|f| f.script.is_none());
@@ -3697,6 +3744,18 @@ impl App {
                         };
                         self.toast(Level::Info, msg);
                     }
+                    // D14: the reply is the full status object; its word
+                    // replaces the last poll's and its `detail` is the toast.
+                    "proxy.system.set" | "proxy.system.unset" => {
+                        self.sysproxy_setting = false;
+                        if let Some(word) = SystemProxyWord::from_json(&value) {
+                            self.system_proxy = Some(word);
+                        }
+                        self.toast(Level::Info, sysproxy_detail(&name, &value));
+                    }
+                    "proxy.system.status" => {
+                        self.toast(Level::Info, sysproxy_detail(&name, &value));
+                    }
                     "flow.clear" => {
                         let n = |k: &str| value.get(k).and_then(Value::as_u64).unwrap_or(0);
                         self.toast(
@@ -3885,6 +3944,11 @@ impl App {
                         self.scan.running = false;
                         self.scan.error = Some(message.clone());
                     }
+                    // D14: a refusal (agent-token bus) or a failed write
+                    // settles the in-flight pill; the text below is verbatim.
+                    "proxy.system.set" | "proxy.system.unset" => {
+                        self.sysproxy_setting = false;
+                    }
                     _ => {}
                 }
                 self.toast(Level::Error, message);
@@ -4008,6 +4072,15 @@ fn read_poc_yaml(path: &str) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|e| e.to_string())?;
     Ok(text)
+}
+
+/// The toast for a `proxy.system.*` reply: the core's `detail` line, or the
+/// verb's name when the reply carries none (spec §D14).
+fn sysproxy_detail(name: &str, value: &Value) -> String {
+    match value.get("detail").and_then(Value::as_str) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => format!("{name}: ok"),
+    }
 }
 
 /// `pause` → `Pause`, for a toast that starts a sentence.
@@ -5971,5 +6044,255 @@ mod tests {
         assert!(app.current_toast().is_some());
         let _ = app.update(Action::Tick);
         assert!(app.current_toast().is_none());
+    }
+
+    // ------------------------------------------------- system proxy (D14)
+
+    fn sysproxy_call(name: &str) -> BusRequest {
+        BusRequest::Call {
+            name: name.into(),
+            args: json!({}),
+        }
+    }
+
+    fn sysproxy_word(state: &str) -> SystemProxyWord {
+        SystemProxyWord {
+            state: state.into(),
+            supported: true,
+            ..SystemProxyWord::default()
+        }
+    }
+
+    /// SP-AC26 / D14: with the verbs on the bus, `:sysproxy on|off|status`
+    /// is one bare call each; `on` and `off` raise the in-flight flag (the pill
+    /// reads `setting…`), `status` does not; anything else is a usage error.
+    #[test]
+    fn sysproxy_on_calls_set_when_the_tool_exists() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        assert_eq!(
+            app.run_command(":sysproxy on"),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting, "on → in flight until the reply");
+
+        app.sysproxy_setting = false;
+        assert_eq!(
+            app.run_command(":sysproxy off"),
+            vec![sysproxy_call("proxy.system.unset")]
+        );
+        assert!(app.sysproxy_setting, "off → in flight until the reply");
+
+        app.sysproxy_setting = false;
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+        assert!(!app.sysproxy_setting, "status reads; nothing is in flight");
+
+        assert!(app.run_command(":sysproxy sideways").is_empty());
+        assert!(app.run_command(":sysproxy").is_empty());
+        let t = app.current_toast().expect("a usage toast");
+        assert_eq!(t.level, Level::Error);
+        assert_eq!(t.text, "usage: :sysproxy on|off|status");
+    }
+
+    /// SP-AC26 / D14: a bus without `proxy.system.set` (an older core, or a
+    /// tools/list that hid it) gets the one warning toast and no call.
+    #[test]
+    fn sysproxy_without_the_tool_toasts() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        assert!(app.run_command(":sysproxy on").is_empty());
+        assert!(!app.sysproxy_setting);
+        let t = app.current_toast().expect("a toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "System proxy needs the core's proxy.system.* verbs");
+        // `off` and `status` are gated by the same tool.
+        assert!(app.run_command(":sysproxy off").is_empty());
+        assert!(app.run_command(":sysproxy status").is_empty());
+        assert_eq!(app.toasts.len(), 3);
+        assert!(app
+            .toasts
+            .iter()
+            .all(|t| t.text == "System proxy needs the core's proxy.system.* verbs"));
+    }
+
+    /// D14: `s` in the flow list is `ToggleSysProxy`; the toggle sends `unset`
+    /// only when the word says the system proxy already points at us, else `set`
+    /// (including before the first `proxy.status` carried a word at all).
+    #[test]
+    fn s_key_toggles_by_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert_eq!(
+            crate::keys::map(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                Mode::Flows
+            ),
+            Some(Action::ToggleSysProxy)
+        );
+
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools
+            .extend(tools(&["proxy.system.set", "proxy.system.unset"]));
+
+        app.system_proxy = Some(sysproxy_word("points_at_us"));
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.unset")]
+        );
+        assert!(app.sysproxy_setting);
+
+        app.sysproxy_setting = false;
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+
+        app.sysproxy_setting = false;
+        app.system_proxy = Some(SystemProxyWord {
+            host: Some("127.0.0.1".into()),
+            port: Some(9090),
+            ..sysproxy_word("other")
+        });
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+
+        app.sysproxy_setting = false;
+        app.system_proxy = None;
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+
+        // The key is gated like the command: no tool, no call, the warning.
+        let mut bare = App::new(TermCaps::full(), "127.0.0.1:9090");
+        bare.system_proxy = Some(sysproxy_word("off"));
+        assert!(bare.update(Action::ToggleSysProxy).is_empty());
+        assert_eq!(
+            bare.current_toast().map(|t| t.text.as_str()),
+            Some("System proxy needs the core's proxy.system.* verbs")
+        );
+    }
+
+    /// D14: the `proxy.system.set` / `unset` reply clears the in-flight flag,
+    /// replaces the word with the reply's state and toasts its `detail`; a bus
+    /// error clears the flag and is shown verbatim; `proxy.system.status`
+    /// toasts `detail`; every `proxy.status` poll refreshes the word.
+    #[test]
+    fn set_reply_clears_in_flight_and_updates_the_word() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+
+        let _ = app.run_command(":sysproxy on");
+        assert!(app.sysproxy_setting);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.set".into(),
+            value: json!({
+                "state": "points_at_us", "host": null, "port": null,
+                "managed_by_us": true, "setting": false, "supported": true,
+                "mechanism": "networksetup", "services": ["Wi-Fi"],
+                "detail": "HTTP and HTTPS → 127.0.0.1:8080 (this core)",
+                "changed": true, "commands": ["networksetup -setwebproxy Wi-Fi 127.0.0.1 8080"]
+            }),
+        });
+        assert!(
+            !app.sysproxy_setting,
+            "the reply settles the in-flight flag"
+        );
+        let word = app.system_proxy.as_ref().expect("the reply's word");
+        assert_eq!(word.state, "points_at_us");
+        assert!(word.managed_by_us);
+        assert_eq!(
+            word.pill(app.sysproxy_setting).as_deref(),
+            Some("· sys-proxy → us")
+        );
+        let t = app.current_toast().expect("the detail toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "HTTP and HTTPS → 127.0.0.1:8080 (this core)");
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+
+        // unset: the reply's `off` state replaces the word.
+        let _ = app.run_command(":sysproxy off");
+        assert!(app.sysproxy_setting);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.unset".into(),
+            value: json!({
+                "state": "off", "host": null, "port": null, "managed_by_us": false,
+                "setting": false, "supported": true, "detail": "HTTP and HTTPS off",
+                "changed": true, "commands": [], "restored": ["Wi-Fi"], "left_alone": []
+            }),
+        });
+        assert!(!app.sysproxy_setting);
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("off")
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("HTTP and HTTPS off")
+        );
+
+        // A refusal from an agent-token bus: flag cleared, text verbatim, word kept.
+        let _ = app.run_command(":sysproxy on");
+        assert!(app.sysproxy_setting);
+        let _ = app.on_bus(BusEvent::CallFailed {
+            name: "proxy.system.set".into(),
+            message: "proxy.system.set is operator-only".into(),
+        });
+        assert!(
+            !app.sysproxy_setting,
+            "an error settles the in-flight flag too"
+        );
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("off")
+        );
+        let t = app.current_toast().expect("the error toast");
+        assert_eq!(t.level, Level::Error);
+        assert_eq!(t.text, "proxy.system.set is operator-only");
+
+        // `status` toasts the detail and leaves the flag alone.
+        let _ = app.run_command(":sysproxy status");
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: json!({"state": "other", "host": "127.0.0.1", "port": 9090,
+                "supported": true, "detail": "HTTP and HTTPS → 127.0.0.1:9090 (not this core)"}),
+        });
+        assert!(!app.sysproxy_setting);
+        let t = app.current_toast().expect("the status toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "HTTP and HTTPS → 127.0.0.1:9090 (not this core)");
+
+        // Every proxy.status poll carries the word, next to the capture flags.
+        let _ = app.on_bus(BusEvent::ProxyStatus(ProxyStatus::from_json(&json!({
+            "listening": true, "address": "127.0.0.1:8080", "capturing": true,
+            "system_proxy": {"state": "other", "host": "127.0.0.1", "port": 9090,
+                "managed_by_us": false, "setting": false, "supported": true,
+                "detail": "HTTP and HTTPS → 127.0.0.1:9090 (not this core)"}
+        }))));
+        assert_eq!(
+            app.system_proxy
+                .as_ref()
+                .and_then(|w| w.pill(false))
+                .as_deref(),
+            Some("· sys-proxy → 127.0.0.1:9090")
+        );
+        let _ = app.on_bus(BusEvent::ProxyStatus(status(true, true, 0)));
+        assert_eq!(
+            app.system_proxy, None,
+            "a poll without the key clears the word"
+        );
     }
 }
