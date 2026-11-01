@@ -47,6 +47,53 @@ extension SelfTest {
             check("the self-test's own scope.add is recorded as an operator command",
                   session.activity.visible.contains { $0.origin == .operator && $0.command == "scope.add" })
 
+            // #192 / spec 2026-11-01 bus-reconnect-ownership D5: Proxy ▸ Reconnect Bus while
+            // connected is the same `BusService.start()` a core restart calls. Before the fix the
+            // superseded run's late cleanup cleared the new run's client: the status bar said
+            // connected while every action failed "the bus connection closed" and the Scope list
+            // froze. The block leaves the session connected with scope [upstream], so every check
+            // after it runs on the reconnected connection.
+            let recorder = BusStateRecorder(session: session)
+            recorder.arm()
+            session.reconnectBus()
+            await settle(timeout: .seconds(10)) { recorder.sawNonConnected && isConnected(session.bus) }
+            check("Reconnect Bus while connected: the bus leaves connected and comes back, never failed",
+                  recorder.sawNonConnected && !recorder.sawFailed && session.bus == .connected(address), recorder.sequence)
+            // Two 500 ms polls: a superseded run's late cleanup would land in this window.
+            try? await Task.sleep(for: .seconds(1))
+            check("the bus is still connected two polls after Reconnect Bus", isConnected(session.bus) && session.lastError == nil,
+                  "bus \(session.bus) err \(session.lastError ?? "-")")
+            // The first action after the reconnect, issued once: a retry would pass on the broken build too.
+            let host = "reconnect-\(String(UUID().uuidString.prefix(8)).lowercased()).test"
+            session.addScope(host)
+            await settle { session.scopeHosts.contains(host) }
+            check("the first Scope action after Reconnect Bus succeeds and lands in scope.list",
+                  session.scopeHosts.contains(host) && session.lastError == nil, "scope \(session.scopeHosts) err \(session.lastError ?? "-")")
+            check("the earlier scope entry survives the reconnect (the core's list wins)", session.scopeHosts.contains(upstream), "scope \(session.scopeHosts)")
+            // The palette seam (`commandRunner`) issues no refreshScope: only the poll can drop the host.
+            _ = try? await session.runCommand("scope.remove", ["host": .string(host)])
+            await settle(timeout: .seconds(3)) { !session.scopeHosts.contains(host) }
+            check("scopeHosts keeps following the core after Reconnect Bus (a palette scope.remove is dropped by the poll)",
+                  !session.scopeHosts.contains(host), "scope \(session.scopeHosts)")
+            // The mid-connect() probe: a second start() 1 ms after the first lands inside the first
+            // run's connect() when timing allows; the second run must end up the owner either way.
+            if let service = session.actions as? BusService {
+                service.start()
+                try? await Task.sleep(for: .milliseconds(1))
+                service.start()
+                await settle(timeout: .seconds(10)) { isConnected(session.bus) }
+                session.addScope(host)
+                await settle { session.scopeHosts.contains(host) }
+                check("a second start() during the first run's connect leaves the second run the owner (Scope action succeeds)",
+                      session.scopeHosts.contains(host) && session.lastError == nil, "scope \(session.scopeHosts) err \(session.lastError ?? "-")")
+                // Leave the core's scope as [upstream] for the checks that follow.
+                _ = try? await session.runCommand("scope.remove", ["host": .string(host)])
+                await settle(timeout: .seconds(3)) { !session.scopeHosts.contains(host) }
+            } else {
+                check("a second start() during the first run's connect leaves the second run the owner (Scope action succeeds)", false,
+                      "session.actions is not a BusService")
+            }
+
             // flow.intercept both ways: the call that recursed in b7d3163.
             session.arm(true)
             await settle { session.interceptArmed }
@@ -393,6 +440,12 @@ extension SelfTest {
         await settle { !session.interceptArmed }
     }
 
+    /// True iff `state` is `.connected(_)`, whatever the address.
+    private static func isConnected(_ state: BusState) -> Bool {
+        if case .connected = state { return true }
+        return false
+    }
+
     /// `exit N` once the process ended, `running` while it has not: `Process.terminationStatus`
     /// raises on a live process, which would turn a failed check into a crash.
     private static func exitText(_ process: Process) -> String {
@@ -439,4 +492,46 @@ nonisolated final class ObservationFlag: @unchecked Sendable {
     private var value = false
     var fired: Bool { lock.withLock { value } }
     func fire() { lock.withLock { value = true } }
+}
+
+/// Every `BusState` the session publishes after `arm()`, in order, so a check can assert a
+/// whole reconnect sequence (#192, spec 2026-11-01 bus-reconnect-ownership D5, BR-AC5). The
+/// first value is the state current when the recorder was made, so `sequence` reads from the
+/// old state to the new one. `withObservationTracking`'s `onChange` fires on willSet, before
+/// the new value is stored, and on whatever thread wrote it, so it never reads `session.bus`
+/// itself: it hops to the main actor, appends the post-mutation value and re-arms. Each
+/// `session.bus` write happens in its own main-actor job and the hop reads the value that
+/// write stored, so FIFO ordering gives one sample per write; a write that lands before the
+/// re-arm is still sampled by the pending hop (it reads the latest value).
+@MainActor final class BusStateRecorder {
+    private let session: Session
+    private(set) var values: [BusState]
+
+    init(session: Session) {
+        self.session = session
+        values = [session.bus]
+    }
+
+    func arm() {
+        withObservationTracking { _ = session.bus } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.values.append(self.session.bus)
+                self.arm()
+            }
+        }
+    }
+
+    /// Some recorded value is not `.connected(_)`: the reconnect really left the old connection.
+    var sawNonConnected: Bool {
+        values.contains { if case .connected = $0 { return false } else { return true } }
+    }
+
+    /// Some recorded value is `.failed(_)`: a superseded run reported a loss, or a real one happened.
+    var sawFailed: Bool {
+        values.contains { if case .failed = $0 { return true } else { return false } }
+    }
+
+    /// e.g. `connected("127.0.0.1:18193") → disconnected → connecting("127.0.0.1:18193") → connected("127.0.0.1:18193")`.
+    var sequence: String { values.map { "\($0)" }.joined(separator: " → ") }
 }
