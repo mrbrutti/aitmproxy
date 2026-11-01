@@ -741,6 +741,8 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | security review (H50-H56) | PASS | H50 frame rows, `cut_to` contract, H56 symmetry and no cross-tab leak verified | one pre-existing Minor to H66 |
 | H (Rust) | security | Minor | keyed status/cancel error with a non-`not_found` code never clears once the job leaves | fix round H Rust (H66) |
 | H (Rust) | security | note | `browser.*` and `poc.get` `CallFailed` arms store the raw core message | follow-up outside the scan items (TUI-wide bound sweep) |
+| H (Rust) | quality review (H50-H56) | PASS | every H52 sub-item and H56's shape verified | three Minors to H67-H69 |
+| H (Rust) | quality | Minor | `last_error` doc claims a toast reader; slot dispatch written thrice; H50 test proves two things | fix round H Rust (H67, H68, H69) |
 
 ## Shipped
 

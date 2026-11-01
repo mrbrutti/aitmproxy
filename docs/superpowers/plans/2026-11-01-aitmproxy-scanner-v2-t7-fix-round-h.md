@@ -143,6 +143,12 @@ H65 (cell). T1b's rule (2026-11-01): issues dedupe across jobs by class and loca
 
 H66 (Rust). A keyed `scan.status:<job>`/`scan.cancel:<job>` error with a code other than `not_found` has no clearing path once the job turns terminal or leaves the list (no same-tag success can come): in `JobsState::fold_list` (job dropped from `order`) and `fold_status` (job turned terminal) clear `jobs.error` and `last_error` when their tag names that job, mirroring G74. Test (`tests/scan_v2_errors.rs`): a `busy` on `scan.status:<job>`, then a `scan.list` without the job, leaves the Jobs banner `idle`. Pre-existing lifecycle; the out-of-range `browser.*`/`poc.get` raw `CallFailed` messages are a follow-up outside T7's scan items (recorded for the Review log).
 
+H67 (Rust). `last_error` docs claim a toast reader that no longer exists (`scan/mod.rs` field and `set_error` docs, `ui/scan/mod.rs` `tab_error` doc, the test message in `scan_v2_errors.rs`): reword to "the view-wide record of the last `scan.*` failure, read by the tests only; the toast is built from the `ScanError` in `on_scan_failed`".
+
+H68 (Rust). The tab-to-error-slot dispatch is written three times (`set_error`, `clear_error`, `tab_error`): `ScanState::error_slot(tab) -> &Option<ScanError>` and `error_slot_mut(tab)` with one exhaustive match (no `_` arm); `set_error`, `clear_error` and `tab_error` use them (Jobs keeps `legacy.or(..)`).
+
+H69 (Rust). The H50 test proves two scenarios under one name with a shadowed `confirm`: split into `a_huge_prompt_is_bounded_once_at_fold` (the tabbed prompt, no render) and `a_prompt_wider_than_the_box_wraps_and_keeps_the_key_line_last` (the spaced prompt, the render assertions).
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
