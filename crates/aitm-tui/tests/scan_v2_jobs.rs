@@ -15,7 +15,11 @@ use aitm_scan_model::{BySeverity, JobStatus, JobSummary};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::scan::{probe_bar, row, severity_bar, ScanTab};
+use aitm_tui::scan::{
+    detail_lines, probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ScanTab,
+    PROFILE_MAX, TARGETS_MAX,
+};
+use aitm_tui::ui::text::width;
 use common::*;
 use serde_json::{json, Value};
 
@@ -107,11 +111,12 @@ fn status_renders_the_row_literals() {
     let text = screen(&app);
     let line = line_with(&text, JOB).unwrap_or_else(|| panic!("no row for {JOB}: {text}"));
     for literal in [
-        "418/2000",
+        "418/2000 ━━────",
         "80/120",
         "running/audit",
         "standard",
         "http://127.0.0.1:8080",
+        "▆▆▄▄▂▂",
         "42s",
     ] {
         assert!(
@@ -182,15 +187,10 @@ fn cancel_is_sent_once_until_the_reply() {
     assert!(second.is_empty(), "the tag dedupe holds it: {second:?}");
     assert!(app.scan.inflight.contains(&format!("scan.cancel:{JOB}")));
 
-    let cancel = fixture("scan.cancel.json");
-    let state = cancel["state"]
-        .as_str()
-        .expect("the fixture names a state")
-        .to_string();
     let reqs = app.on_bus(BusEvent::CallTaggedOk {
         tag: format!("scan.cancel:{JOB}"),
         name: "scan.cancel".into(),
-        value: cancel,
+        value: fixture("scan.cancel.json"),
     });
     assert!(reqs.is_empty(), "a cancel reply pushes nothing: {reqs:?}");
     assert!(
@@ -200,8 +200,8 @@ fn cancel_is_sent_once_until_the_reply() {
     let text = screen(&app);
     let line = line_with(&text, JOB).unwrap_or_default();
     assert!(
-        line.contains(&state),
-        "the row shows the reply's state {state:?}: {line:?}"
+        line.contains("cancelling"),
+        "the row shows the reply's state: {line:?}"
     );
     // The third `x` goes out again: the job is still not terminal.
     let third = app.update(Action::ScanCancel);
@@ -296,6 +296,109 @@ fn detail_lists_lanes_and_session() {
     }
 }
 
+/// Fix round C, C20 (D6 hostile-core bounds): the row is bounded when it is
+/// built, not per frame. A 1 MiB `targets[0]` and a long profile name give
+/// a row whose text is at most four target cells wide and whose profile is
+/// cut to the column cap, more than four targets are counted rather than
+/// joined, the table still draws the targets cell at most `TARGETS_MAX`
+/// wide with an ellipsis, and the Detail pane's length is counted without
+/// building its lines.
+#[test]
+fn rows_are_bounded_at_construction_not_at_render() {
+    let mut app = app();
+    let mut body = fixture("scan.status.json");
+    body["targets"] = json!(["h".repeat(1 << 20)]);
+    body["profile_name"] = json!("p".repeat(300));
+    let _ = app.on_bus(status_reply(body));
+
+    let built = app.scan.jobs.row_of(JOB);
+    assert!(
+        width(&built.targets) <= 4 * TARGETS_MAX,
+        "targets text is {} cells",
+        width(&built.targets)
+    );
+    assert_eq!(width(&built.profile), PROFILE_MAX);
+    assert!(built.profile.ends_with('…'));
+
+    let text = screen(&app);
+    let header = line_with(&text, "state/phase").unwrap_or_default();
+    let from = col_of(header, "targets").expect("a targets column");
+    let to = col_of(header, "state/phase").expect("a state column");
+    assert!(
+        to - from <= TARGETS_MAX + 2,
+        "the targets column spans {} cells",
+        to - from
+    );
+    let line = line_with(&text, JOB).unwrap_or_default();
+    assert!(line.contains('…'), "the cut is shown: {line:?}");
+
+    let status: JobStatus =
+        serde_json::from_value(fixture("scan.status.json")).expect("the fixture parses");
+    let many = JobStatus {
+        targets: (1..=6).map(|n| format!("http://h{n}.test")).collect(),
+        ..status.clone()
+    };
+    let crowded = row(&many.summary(), Some(&many));
+    assert_eq!(
+        crowded.targets,
+        "http://h1.test http://h2.test http://h3.test http://h4.test +2"
+    );
+
+    let mut jobs = JobsState::default();
+    jobs.fold_status(status.clone());
+    assert_eq!(jobs.detail_len(), 1 + detail_lines(&status).len());
+    assert_eq!(
+        jobs.detail_text(),
+        detail_lines(&status),
+        "the view and the count read the same lines"
+    );
+    let mut bare = JobsState::default();
+    bare.order.push(JOB.to_string());
+    assert_eq!(
+        bare.detail_text(),
+        vec![("", "waiting for scan.status...".to_string())],
+        "no status: the placeholder line"
+    );
+    assert_eq!(bare.detail_len(), 2, "the id line and the placeholder");
+}
+
+/// Fix round C, C28: the detail's first line repeats the profile and the
+/// targets only when the table was too narrow to draw them (the narrow
+/// mockup); in the wide layout the row already shows them.
+#[test]
+fn detail_first_line_carries_profile_and_targets_only_when_the_table_dropped_them() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+
+    let wide = text_of(&app, 200, 50);
+    let lines: Vec<&str> = wide.lines().filter(|l| l.contains(JOB)).collect();
+    assert_eq!(lines.len(), 2, "the row and the detail id line: {wide}");
+    assert!(
+        lines[0].contains("standard"),
+        "the wide row: {:?}",
+        lines[0]
+    );
+    assert!(
+        !lines[1].contains("standard"),
+        "the wide detail does not repeat it: {:?}",
+        lines[1]
+    );
+
+    let narrow = text_of(&app, 90, 40);
+    let lines: Vec<&str> = narrow.lines().filter(|l| l.contains(JOB)).collect();
+    assert_eq!(lines.len(), 2, "the row and the detail id line: {narrow}");
+    assert!(
+        !lines[0].contains("standard"),
+        "the narrow row drops it: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("standard") && lines[1].contains("http://127.0.0.1:8080"),
+        "the narrow detail carries both: {:?}",
+        lines[1]
+    );
+}
+
 /// The row builder: `...` until a full status is known; the counters in the
 /// plan's `<sent>/<budget>` and `<audited>/<found>` shapes.
 #[test]
@@ -319,8 +422,14 @@ fn row_reads_dots_until_the_status_is_known() {
 
 /// The bars: progress rounds up so any probe shows, a zero budget is empty;
 /// the severity stack gives every non-zero severity a cell, graver first.
+/// The text bars are composed from the typed `probe_fill` and
+/// `severity_runs` the view styles (fix round C, C21, C23).
 #[test]
 fn bars_are_box_drawing_cells() {
+    assert_eq!(probe_fill(418, 2000, 6), 2);
+    assert_eq!(probe_fill(0, 2000, 6), 0);
+    assert_eq!(probe_fill(5, 0, 4), 0);
+    assert_eq!(probe_fill(3000, 2000, 4), 4);
     assert_eq!(probe_bar(418, 2000, 6), "━━────");
     assert_eq!(probe_bar(0, 2000, 6), "──────");
     assert_eq!(probe_bar(2000, 2000, 6), "━━━━━━");
@@ -334,7 +443,19 @@ fn bars_are_box_drawing_cells() {
         ..Default::default()
     };
     assert_eq!(severity_bar(&three, 6), "▆▆▄▄▂▂");
+    assert_eq!(
+        severity_runs(&three, 6),
+        vec![
+            ("high", "▆▆".to_string()),
+            ("medium", "▄▄".to_string()),
+            ("low", "▂▂".to_string()),
+        ]
+    );
     assert_eq!(severity_bar(&BySeverity::default(), 6), "······");
+    assert_eq!(
+        severity_runs(&BySeverity::default(), 6),
+        vec![("", "······".to_string())]
+    );
     let lopsided = BySeverity {
         critical: 1,
         low: 99,

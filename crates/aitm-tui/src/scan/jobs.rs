@@ -1,4 +1,6 @@
-//! The Jobs tab's state (spec D3, D11) and the two text helpers its rows use.
+//! The Jobs tab's state (spec D3, D11) and the text helpers its rows use.
+//! A row is bounded when it is built (D6 hostile-core bounds): the view
+//! measures and draws what [`row`] already cut, never the core's strings.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,6 +10,7 @@ use aitm_scan_model::{
 };
 
 use super::is_job_id;
+use crate::ui::text::truncate;
 
 /// Which pane of the Jobs tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,34 +195,70 @@ impl JobsState {
         }
     }
 
+    /// The Detail pane's `label value` lines for the cursor's job: the
+    /// [`detail_lines`] of its full status, or the one placeholder line
+    /// (an empty label) while no `scan.status` has answered. The view draws
+    /// exactly these under the id line.
+    pub fn detail_text(&self) -> Vec<(&'static str, String)> {
+        match self.cursor_job().and_then(|id| self.full.get(id)) {
+            Some(status) => detail_lines(status),
+            None => vec![("", WAITING_FOR_STATUS.to_string())],
+        }
+    }
+
     /// How many lines the Detail pane has for the cursor's job: the id line
-    /// plus one per [`detail_lines`] entry; one line (the id alone) while no
-    /// `scan.status` has answered. The reducer clamps `detail_scroll` to it.
+    /// plus [`JobsState::detail_text`]'s count, counted without building the
+    /// lines ([`detail_line_count`]). The reducer clamps `detail_scroll` to
+    /// it on every key.
     pub fn detail_len(&self) -> usize {
         1 + self
             .cursor_job()
             .and_then(|id| self.full.get(id))
-            .map_or(0, |status| detail_lines(status).len())
+            .map_or(1, detail_line_count)
     }
 }
+
+/// The Detail pane's one line while no `scan.status` has answered.
+pub const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
+
+/// The widest a `profile` cell grows before it is cut (the column cap, and
+/// the bound [`row`] applies when it is built).
+pub const PROFILE_MAX: usize = 16;
+/// The widest a `targets` column grows before its middle is elided; [`row`]
+/// keeps at most four times this of the joined targets.
+pub const TARGETS_MAX: usize = 48;
+/// How many targets [`row`] joins; the rest are counted (`+n`).
+const TARGETS_JOINED: usize = 4;
+/// The probe bar's cells, the width of its `probes` header.
+pub const PROBE_BAR_CELLS: usize = 6;
+/// The severity bar's cells, the width of its `issues` header.
+pub const SEVERITY_BAR_CELLS: usize = 6;
 
 /// What a row cell reads until the value is known (spec D11: `profile` and
 /// `targets` read `...` until the first `scan.status`).
 pub const UNKNOWN: &str = "...";
 
-/// One Jobs row, every cell already text except the severity tally, which
-/// the view draws as a stacked bar coloured per severity (spec D11, D13).
+/// One Jobs row, every cell already text and bounded except the severity
+/// tally, which the view draws as a stacked bar coloured per severity (spec
+/// D11, D13), and the probe bar's fill, typed so the view never parses the
+/// row's text back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
     pub id: String,
-    /// The profile name, `...` until a full status is known.
+    /// The profile name cut to [`PROFILE_MAX`], `...` until a full status
+    /// is known.
     pub profile: String,
-    /// The targets joined by a space, `...` until a full status is known.
+    /// The first [`TARGETS_JOINED`] targets joined by a space (`+n` for the
+    /// rest), cut to four times [`TARGETS_MAX`]; `...` until a full status
+    /// is known.
     pub targets: String,
     /// [`state_phase_text`].
     pub state_phase: String,
     /// `<sent>/<budget>`.
     pub probes: String,
+    /// [`probe_fill`] of the counters over [`PROBE_BAR_CELLS`]; 0 while the
+    /// counters are not known.
+    pub probe_fill: usize,
     /// `<audited>/<found>`.
     pub points: String,
     pub issues: BySeverity,
@@ -236,6 +275,7 @@ impl JobRow {
             targets: UNKNOWN.to_string(),
             state_phase: UNKNOWN.to_string(),
             probes: UNKNOWN.to_string(),
+            probe_fill: 0,
             points: UNKNOWN.to_string(),
             issues: BySeverity::default(),
             elapsed: UNKNOWN.to_string(),
@@ -245,18 +285,39 @@ impl JobRow {
 
 /// The row for a job (spec D11): the counters from `summary`, which both
 /// `scan.list` and `scan.status` refresh; the profile and targets from `full`,
-/// which only `scan.status` carries, `...` until then.
+/// which only `scan.status` carries, `...` until then. The core's strings
+/// are bounded here (D6 hostile-core bounds), so a frame's measuring and
+/// eliding runs over at most a few hundred cells per row.
 pub fn row(summary: &JobSummary, full: Option<&JobStatus>) -> JobRow {
     JobRow {
         id: summary.job.clone(),
-        profile: full.map_or_else(|| UNKNOWN.to_string(), |f| f.profile_name.clone()),
-        targets: full.map_or_else(|| UNKNOWN.to_string(), |f| f.targets.join(" ")),
+        profile: full.map_or_else(
+            || UNKNOWN.to_string(),
+            |f| truncate(&f.profile_name, PROFILE_MAX),
+        ),
+        targets: full.map_or_else(|| UNKNOWN.to_string(), |f| targets_text(&f.targets)),
         state_phase: state_phase_text(summary.state, summary.phase),
         probes: format!("{}/{}", summary.probes.sent, summary.probes.budget),
+        probe_fill: probe_fill(summary.probes.sent, summary.probes.budget, PROBE_BAR_CELLS),
         points: format!("{}/{}", summary.points.audited, summary.points.found),
         issues: summary.issues.by_severity,
         elapsed: elapsed_text(summary.elapsed_ms),
     }
+}
+
+/// The row's `targets` cell: the first [`TARGETS_JOINED`] targets joined by
+/// a space, `+n` for any more, the whole cut to four times [`TARGETS_MAX`].
+fn targets_text(targets: &[String]) -> String {
+    let mut text = targets
+        .iter()
+        .take(TARGETS_JOINED)
+        .map(|t| truncate(t, 4 * TARGETS_MAX))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if targets.len() > TARGETS_JOINED {
+        text.push_str(&format!(" +{}", targets.len() - TARGETS_JOINED));
+    }
+    truncate(&text, 4 * TARGETS_MAX)
 }
 
 /// The probe bar's filled cell: heavy box-drawing (spec D13: bars are
@@ -267,17 +328,22 @@ pub const BAR_EMPTY: &str = "─";
 /// The severity bar's cell when the tally is zero.
 pub const BAR_NONE: &str = "·";
 
-/// `sent/budget` as `cells` box-drawing cells, filled from the left. The
-/// filled count rounds up, so the first probe already shows and the bar
-/// fills only at the budget; a zero budget (unlimited or unknown) draws
-/// empty; more sent than budgeted fills the bar.
+/// How many of `cells` the probe bar fills for `sent/budget`. The count
+/// rounds up, so the first probe already shows and the bar fills only at
+/// the budget; a zero budget (unlimited or unknown) fills nothing; more
+/// sent than budgeted fills every cell.
+pub fn probe_fill(sent: u64, budget: u64, cells: usize) -> usize {
+    if budget == 0 || sent == 0 {
+        return 0;
+    }
+    let n = (u128::from(sent) * cells as u128).div_ceil(u128::from(budget));
+    usize::try_from(n).unwrap_or(cells).min(cells)
+}
+
+/// `sent/budget` as `cells` box-drawing cells, [`probe_fill`] of them
+/// filled from the left.
 pub fn probe_bar(sent: u64, budget: u64, cells: usize) -> String {
-    let filled = if budget == 0 || sent == 0 {
-        0
-    } else {
-        let n = (u128::from(sent) * cells as u128).div_ceil(u128::from(budget));
-        usize::try_from(n).unwrap_or(cells).min(cells)
-    };
+    let filled = probe_fill(sent, budget, cells);
     let mut bar = BAR_FILLED.repeat(filled);
     bar.push_str(&BAR_EMPTY.repeat(cells - filled));
     bar
@@ -337,28 +403,53 @@ pub fn severity_segments(b: &BySeverity, cells: usize) -> [usize; 5] {
     seg
 }
 
-/// The stacked severity bar as text: [`severity_segments`] drawn with the
-/// [`SEVERITY_LEVELS`] glyphs, `·` per cell when the tally is zero. The view
-/// colours each segment with `Theme::severity`; the glyph heights carry the
-/// same reading without colour.
-pub fn severity_bar(b: &BySeverity, cells: usize) -> String {
+/// The stacked severity bar as runs: one `(severity label, glyph run)` per
+/// non-zero severity, gravest first ([`severity_segments`] drawn with the
+/// [`SEVERITY_LEVELS`] glyphs); a zero tally is one run with an empty label
+/// and `·` per cell. The view colours each run with `Theme::severity`; the
+/// glyph heights carry the same reading without colour.
+pub fn severity_runs(b: &BySeverity, cells: usize) -> Vec<(&'static str, String)> {
     let seg = severity_segments(b, cells);
     if seg.iter().all(|n| *n == 0) {
-        return BAR_NONE.repeat(cells);
+        return vec![("", BAR_NONE.repeat(cells))];
     }
     SEVERITY_LEVELS
         .iter()
         .zip(seg)
-        .map(|((_, glyph), n)| glyph.repeat(n))
+        .filter(|(_, n)| *n > 0)
+        .map(|((label, glyph), n)| (*label, glyph.repeat(n)))
         .collect()
 }
+
+/// The stacked severity bar as text: [`severity_runs`] concatenated.
+pub fn severity_bar(b: &BySeverity, cells: usize) -> String {
+    severity_runs(b, cells)
+        .into_iter()
+        .map(|(_, run)| run)
+        .collect()
+}
+
+/// How many lines [`detail_lines`] gives `status`, without building them:
+/// the seven fixed lines plus one each for `clamped`, `stopped`, `error`
+/// and `l4` when present. Kept in step with `detail_lines` by its unit test.
+pub fn detail_line_count(status: &JobStatus) -> usize {
+    DETAIL_FIXED_LINES
+        + usize::from(!status.clamped.is_empty())
+        + usize::from(status.stopped_reason.is_some())
+        + usize::from(status.error.is_some())
+        + usize::from(status.l4.is_some())
+}
+
+/// The lines every [`detail_lines`] has: lanes, started by, probes, crawl,
+/// points, checks, session.
+const DETAIL_FIXED_LINES: usize = 7;
 
 /// The Detail pane's `label value` lines for a job (spec D11): lanes
 /// requested/run/skipped with reasons, who started it, the probe, crawl,
 /// point and check counters, the session, then `clamped`, `stopped`,
 /// `error` and `l4` only when present. Plain text; the view styles the label.
-pub fn detail_lines(status: &JobStatus) -> Vec<(String, String)> {
-    let mut lines = Vec::with_capacity(10);
+pub fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::with_capacity(DETAIL_FIXED_LINES + 4);
     let lanes = &status.lanes;
     let mut lane_text = format!(
         "requested {} · run {}",
@@ -374,14 +465,14 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(String, String)> {
         lane_text.push_str(" · skipped ");
         lane_text.push_str(&skipped.join(", "));
     }
-    lines.push(("lanes".to_string(), lane_text));
+    lines.push(("lanes", lane_text));
 
     let by = &status.started_by;
     let who = match &by.client_label {
         Some(label) if !label.is_empty() => format!("{} ({label})", by.frontend),
         _ => by.frontend.clone(),
     };
-    lines.push(("started by".to_string(), who));
+    lines.push(("started by", who));
 
     let p = &status.probes;
     let mut probes = format!(
@@ -397,11 +488,11 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(String, String)> {
         probes.push_str(" · by lane ");
         probes.push_str(&by_lane.join(", "));
     }
-    lines.push(("probes".to_string(), probes));
+    lines.push(("probes", probes));
 
     let c = &status.crawl;
     lines.push((
-        "crawl".to_string(),
+        "crawl",
         format!(
             "pages {} · queued {} · depth {} · forms {}",
             c.pages, c.queued, c.depth, c.forms_submitted
@@ -410,7 +501,7 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(String, String)> {
 
     let pt = &status.points;
     lines.push((
-        "points".to_string(),
+        "points",
         format!(
             "found {} · queued {} · audited {} · skipped ignored {}, frequent {}, limit {}",
             pt.found,
@@ -428,9 +519,9 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(String, String)> {
         checks.push_str(" · running ");
         checks.push_str(&ch.running.join(", "));
     }
-    lines.push(("checks".to_string(), checks));
+    lines.push(("checks", checks));
 
-    lines.push(("session".to_string(), session_text(status)));
+    lines.push(("session", session_text(status)));
 
     if !status.clamped.is_empty() {
         let clamped: Vec<String> = status
@@ -438,17 +529,17 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(String, String)> {
             .iter()
             .map(|c| format!("{} {} -> {}", c.field, c.requested, c.applied))
             .collect();
-        lines.push(("clamped".to_string(), clamped.join(", ")));
+        lines.push(("clamped", clamped.join(", ")));
     }
     if let Some(reason) = status.stopped_reason {
-        lines.push(("stopped".to_string(), stopped_text(reason).to_string()));
+        lines.push(("stopped", stopped_text(reason).to_string()));
     }
     if let Some(error) = &status.error {
-        lines.push(("error".to_string(), error.clone()));
+        lines.push(("error", error.clone()));
     }
     if let Some(l4) = &status.l4 {
         lines.push((
-            "l4".to_string(),
+            "l4",
             format!(
                 "cases {} · crashes {} · liveness failures {} · retired {}",
                 l4.cases, l4.crashes, l4.liveness_failures, l4.retired_elements
@@ -485,7 +576,7 @@ fn session_text(status: &JobStatus) -> String {
 }
 
 /// A lane's wire name.
-pub fn lane_name(lane: LaneKind) -> &'static str {
+fn lane_name(lane: LaneKind) -> &'static str {
     match lane {
         LaneKind::Http => "http",
         LaneKind::Ws => "ws",
@@ -547,9 +638,9 @@ pub fn state_text(state: JobState) -> &'static str {
 /// The row's `state/phase` cell: a non-terminal job reads
 /// `<state>/<short phase>`, a terminal one its state alone.
 pub fn state_phase_text(state: JobState, phase: Phase) -> String {
-    let state_text = state_text(state);
+    let word = state_text(state);
     if state.is_terminal() {
-        return state_text.to_string();
+        return word.to_string();
     }
     let short = match phase {
         Phase::Queued => "queued",
@@ -559,7 +650,7 @@ pub fn state_phase_text(state: JobState, phase: Phase) -> String {
         Phase::Reporting => "report",
         Phase::Done => "done",
     };
-    format!("{state_text}/{short}")
+    format!("{word}/{short}")
 }
 
 #[cfg(test)]
@@ -596,6 +687,29 @@ mod tests {
 
         jobs.order.retain(|j| j == "scan-done");
         assert!(jobs.newest_active().is_none(), "no live job, no count");
+    }
+
+    /// Fix round C, C20/C24: the count the reducer clamps the scroll to
+    /// mirrors the lines the view draws, with and without every optional
+    /// line.
+    #[test]
+    fn detail_line_count_mirrors_detail_lines() {
+        let bare = JobStatus::default();
+        assert_eq!(detail_line_count(&bare), detail_lines(&bare).len());
+        assert_eq!(detail_line_count(&bare), 7);
+        let full = JobStatus {
+            clamped: vec![aitm_scan_model::Clamped {
+                field: "budget.probes".into(),
+                requested: 9000,
+                applied: 2000,
+            }],
+            stopped_reason: Some(StoppedReason::Budget),
+            error: Some("boom".into()),
+            l4: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(detail_line_count(&full), detail_lines(&full).len());
+        assert_eq!(detail_line_count(&full), 11);
     }
 
     #[test]

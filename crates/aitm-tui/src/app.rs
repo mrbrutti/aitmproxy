@@ -172,6 +172,25 @@ pub struct BrowserState {
 /// one spare footer row (spec D11, plan task 4).
 const SCAN_CHROME_ROWS: u16 = 10;
 
+/// One step of a Scan cursor or scroll over `len` entries (D11): `Up`/`Down`
+/// by one, `PageUp`/`PageDown` by `page`, `Home`/`End` to the ends, any
+/// other action stays; the result is clamped to the last entry (0 when
+/// there is none). The one walk the Jobs list, the Jobs detail scroll, the
+/// Site map, Profiles and Issues cursors share.
+fn walk(action: &Action, cursor: usize, len: usize, page: usize) -> usize {
+    let last = len.saturating_sub(1);
+    match action {
+        Action::Up => cursor.saturating_sub(1),
+        Action::Down => cursor + 1,
+        Action::PageUp => cursor.saturating_sub(page),
+        Action::PageDown => cursor + page,
+        Action::Home => 0,
+        Action::End => last,
+        _ => cursor,
+    }
+    .min(last)
+}
+
 /// Whether the browser view counts a call as in flight: exactly the calls
 /// [`browser_busy_label`] has a word for. The same predicate gates the
 /// increment in `call_tool` and the decrements on `CallOk`/`CallFailed`, so
@@ -2746,29 +2765,12 @@ impl App {
                     // moving a cursor (D11); the last line is the floor.
                     let n = self.scan.jobs.detail_len();
                     let c = usize::from(self.scan.jobs.detail_scroll);
-                    let next = match action {
-                        Action::Up => c.saturating_sub(1),
-                        Action::Down => c + 1,
-                        Action::PageUp => c.saturating_sub(page),
-                        Action::PageDown => c + page,
-                        Action::Home => 0,
-                        Action::End => n,
-                        _ => c,
-                    }
-                    .min(n.saturating_sub(1));
+                    let next = walk(action, c, n, page);
                     self.scan.jobs.detail_scroll = u16::try_from(next).unwrap_or(u16::MAX);
                 } else if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
                     if n > 0 {
                         let c = *cursor;
-                        *cursor = match action {
-                            Action::Up => c.saturating_sub(1),
-                            Action::Down => (c + 1).min(n - 1),
-                            Action::PageUp => c.saturating_sub(page),
-                            Action::PageDown => (c + page).min(n - 1),
-                            Action::Home => 0,
-                            Action::End => n - 1,
-                            _ => c,
-                        };
+                        *cursor = walk(action, c, n, page);
                         let moved = *cursor != c;
                         // A new job under the Jobs cursor shows its detail
                         // from the top.

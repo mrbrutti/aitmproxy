@@ -5,11 +5,13 @@
 //! Layout (builder's call, from the D11 wide mockup, which draws Jobs stacked
 //! even at 120 columns because a full row needs the width): the table takes
 //! the top of the body, sized to its rows up to two fifths of the height, a
-//! rule, then the detail. Columns are measured from the rows; when the
-//! `profile` and `targets` columns do not fit, the table drops them and the
-//! detail's first line carries both (the narrow mockup). Hue only on data
-//! (D13): the state cell by the status tokens, the severity cells by
-//! `Theme::severity`; everything else is text and rule tokens.
+//! rule, then the detail. Columns are measured from the rows, which the
+//! model already bounded (D6 hostile-core bounds); when the `profile` and
+//! `targets` columns do not fit, the table drops them and the detail's first
+//! line carries both (the narrow mockup); in the full layout the detail's
+//! first line is the id alone. Hue only on data (D13): the state cell by the
+//! status tokens, the severity cells by `Theme::severity`; everything else
+//! is text and rule tokens.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -20,8 +22,8 @@ use aitm_scan_model::JobState;
 
 use crate::app::App;
 use crate::scan::{
-    detail_lines, probe_bar, severity_segments, JobPane, JobRow, LegacyRun, ScanOffer, BAR_NONE,
-    SEVERITY_LEVELS,
+    severity_runs, JobPane, JobRow, LegacyRun, ScanOffer, BAR_EMPTY, BAR_FILLED, PROBE_BAR_CELLS,
+    PROFILE_MAX, SEVERITY_BAR_CELLS, TARGETS_MAX,
 };
 use crate::theme::Theme;
 use crate::tokens::color::status;
@@ -30,16 +32,8 @@ use crate::ui::scan::{note, pane_rule, stacked, stacked_share, Panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, elide_middle, fit, right, truncate, width};
 
-/// The probe bar's cells, the width of its `probes` header.
-const PROBE_BAR_CELLS: usize = 6;
-/// The severity bar's cells, the width of its `issues` header.
-const SEVERITY_BAR_CELLS: usize = 6;
 /// Blank cells between columns.
 const GAP: usize = 2;
-/// The widest a `profile` cell grows before it is cut.
-const PROFILE_MAX: usize = 16;
-/// The widest a `targets` cell grows before its middle is elided.
-const TARGETS_MAX: usize = 48;
 /// The Detail pane's footer (D11).
 const FOOTER: &str = "x cancel · ⏎ issues of this job · s start · m map";
 
@@ -62,9 +56,14 @@ fn table(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let jobs = &app.scan.jobs;
     let rows: Vec<JobRow> = jobs.order.iter().map(|id| jobs.row_of(id)).collect();
     let split = split(area, rows.len());
+    let cols = Columns::measure(&rows, usize::from(split.list.width));
+    // The clamped cursor, once: the list highlights it, the detail reads it.
+    let cursor = jobs.cursor.min(rows.len().saturating_sub(1));
     pane_rule(theme, &split, buf);
-    list(app, theme, &rows, split.list, buf);
-    detail(app, theme, &rows, split.detail, buf);
+    list(app, theme, &rows, &cols, cursor, split.list, buf);
+    if let Some(row) = rows.get(cursor) {
+        detail(app, theme, row, cols.full, split.detail, buf);
+    }
 }
 
 /// The table on top, sized to its header and rows up to the shared
@@ -105,17 +104,18 @@ impl Columns {
             probes: widest(|r| &r.probes, 6),
             points: widest(|r| &r.points, 6),
             elapsed: widest(|r| &r.elapsed, 3),
-            full: true,
+            full: false,
         };
-        c.full = c.total() <= avail;
+        c.full = c.total(true) <= avail;
         c
     }
 
-    /// The cells a row takes: the cursor mark, the columns, the gaps, the
-    /// probe bar beside its number and the severity bar.
-    fn total(&self) -> usize {
+    /// The cells a row takes with (`full`) or without the `profile` and
+    /// `targets` columns: the cursor mark, the columns, the gaps, the probe
+    /// bar beside its number and the severity bar.
+    fn total(&self, full: bool) -> usize {
         let mut n = 1 + self.job;
-        if self.full {
+        if full {
             n += GAP + self.profile + GAP + self.targets;
         }
         n + GAP
@@ -133,24 +133,31 @@ impl Columns {
     }
 }
 
-/// The header and the rows, the cursor row highlighted while the List pane
-/// is focused, scrolled so the cursor is always on screen.
-fn list(app: &App, theme: &Theme, rows: &[JobRow], area: Rect, buf: &mut Buffer) {
+/// The header and the rows, the row at `cursor` (already clamped)
+/// highlighted while the List pane is focused, scrolled so the cursor is
+/// always on screen.
+fn list(
+    app: &App,
+    theme: &Theme,
+    rows: &[JobRow],
+    cols: &Columns,
+    cursor: usize,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     if area.height == 0 {
         return;
     }
-    let cols = Columns::measure(rows, usize::from(area.width));
     put(
         buf,
         Rect::new(area.x, area.y, area.width, 1),
-        header(theme, &cols),
+        header(theme, cols),
     );
     let body_h = usize::from(area.height.saturating_sub(1));
     if body_h == 0 || rows.is_empty() {
         return;
     }
     let jobs = &app.scan.jobs;
-    let cursor = jobs.cursor.min(rows.len() - 1);
     let top = cursor.saturating_sub(body_h - 1);
     let focused = jobs.pane == JobPane::List;
     for (k, row) in rows.iter().enumerate().skip(top).take(body_h) {
@@ -163,7 +170,7 @@ fn list(app: &App, theme: &Theme, rows: &[JobRow], area: Rect, buf: &mut Buffer)
         put(
             buf,
             line_area,
-            row_line(theme, &cols, row, state, k == cursor),
+            row_line(theme, cols, row, state, k == cursor),
         );
     }
 }
@@ -224,7 +231,7 @@ fn row_line(
             theme.text_secondary(),
         ));
     }
-    spans.push(Span::raw(gap.clone()));
+    spans.push(Span::raw(" ".repeat(GAP)));
     spans.push(Span::styled(
         fit(&row.state_phase, cols.state),
         state_style(theme, state),
@@ -246,38 +253,33 @@ fn row_line(
     Line::from(spans)
 }
 
-/// The probe bar split into its filled and empty runs. A row whose counters
-/// are not known yet (`...`) draws the bar empty.
+/// The probe bar: the row's typed `probe_fill` cells filled in primary
+/// text, the rest empty in tertiary (an unknown row has a fill of 0).
 fn probe_spans(theme: &Theme, row: &JobRow) -> Vec<Span<'static>> {
-    let (sent, budget) = row
-        .probes
-        .split_once('/')
-        .and_then(|(s, b)| Some((s.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
-        .unwrap_or((0, 0));
-    let bar = probe_bar(sent, budget, PROBE_BAR_CELLS);
-    let filled: String = bar.chars().take_while(|c| *c == '━').collect();
-    let empty: String = bar.chars().skip_while(|c| *c == '━').collect();
+    let fill = row.probe_fill.min(PROBE_BAR_CELLS);
     vec![
-        Span::styled(filled, theme.text_primary()),
-        Span::styled(empty, theme.text_tertiary()),
+        Span::styled(BAR_FILLED.repeat(fill), theme.text_primary()),
+        Span::styled(
+            BAR_EMPTY.repeat(PROBE_BAR_CELLS - fill),
+            theme.text_tertiary(),
+        ),
     ]
 }
 
-/// The stacked severity bar: one span per non-zero severity in its hue,
-/// `·` cells in tertiary when the tally is zero (D13: hue only on data).
+/// The stacked severity bar: one span per run of [`severity_runs`] in its
+/// severity's hue; the zero tally's single unlabelled run in tertiary (D13:
+/// hue only on data).
 fn severity_spans(theme: &Theme, row: &JobRow) -> Vec<Span<'static>> {
-    let seg = severity_segments(&row.issues, SEVERITY_BAR_CELLS);
-    if seg.iter().all(|n| *n == 0) {
-        return vec![Span::styled(
-            BAR_NONE.repeat(SEVERITY_BAR_CELLS),
-            theme.text_tertiary(),
-        )];
-    }
-    SEVERITY_LEVELS
-        .iter()
-        .zip(seg)
-        .filter(|(_, n)| *n > 0)
-        .map(|((label, glyph), n)| Span::styled(glyph.repeat(n), theme.severity(label)))
+    severity_runs(&row.issues, SEVERITY_BAR_CELLS)
+        .into_iter()
+        .map(|(label, run)| {
+            let style = if label.is_empty() {
+                theme.text_tertiary()
+            } else {
+                theme.severity(label)
+            };
+            Span::styled(run, style)
+        })
         .collect()
 }
 
@@ -295,50 +297,44 @@ fn state_style(theme: &Theme, state: Option<JobState>) -> Style {
     }
 }
 
-/// The Detail pane of the cursor's job: its id, profile and targets on the
-/// first line, then the `label value` lines of [`detail_lines`] from the
-/// full status, scrolled by `detail_scroll`; a job no `scan.status` has
-/// answered for says so. The footer takes the last row when there are two
-/// or more.
-fn detail(app: &App, theme: &Theme, rows: &[JobRow], area: Rect, buf: &mut Buffer) {
+/// The Detail pane of the cursor's job (`row`): its id on the first line,
+/// with the profile and targets after it only when the table was too
+/// narrow to draw them (`table_full` is false), then the `label value`
+/// lines of `JobsState::detail_text` (the full status's lines, or the
+/// waiting placeholder), scrolled by `detail_scroll`. The footer takes the
+/// last row when there are two or more.
+fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
     }
     let jobs = &app.scan.jobs;
-    let Some(row) = rows.get(jobs.cursor.min(rows.len().saturating_sub(1))) else {
-        return;
-    };
-    let full = jobs.full.get(&row.id);
     let w = usize::from(area.width).saturating_sub(1);
-    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
-        Span::styled(
-            format!(" {}", row.id),
-            theme.text_primary().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
+    let mut first = vec![Span::styled(
+        format!(" {}", row.id),
+        theme.text_primary().add_modifier(Modifier::BOLD),
+    )];
+    if !table_full {
+        first.push(Span::styled(
             format!("  {}  {}", row.profile, row.targets),
             theme.text_secondary(),
-        ),
-    ])];
-    match full {
-        Some(status) => {
-            // `label value`, one space between (the D11 mockup's shape):
-            // no label column, so the line reads as the sentence it is.
-            for (label, value) in detail_lines(status) {
-                let value_w = w.saturating_sub(1 + width(&label) + 1);
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {label}"), theme.text_secondary()),
-                    Span::styled(
-                        format!(" {}", truncate(&value, value_w)),
-                        theme.text_primary(),
-                    ),
-                ]));
-            }
+        ));
+    }
+    let mut lines: Vec<Line<'static>> = vec![Line::from(first)];
+    for (label, value) in jobs.detail_text() {
+        if label.is_empty() {
+            lines.push(Line::styled(format!(" {value}"), theme.text_tertiary()));
+            continue;
         }
-        None => lines.push(Line::styled(
-            " waiting for scan.status...",
-            theme.text_tertiary(),
-        )),
+        // `label value`, one space between (the D11 mockup's shape): no
+        // label column, so the line reads as the sentence it is.
+        let value_w = w.saturating_sub(1 + width(label) + 1);
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {label}"), theme.text_secondary()),
+            Span::styled(
+                format!(" {}", truncate(&value, value_w)),
+                theme.text_primary(),
+            ),
+        ]));
     }
     let has_footer = area.height >= 2;
     let body_h = usize::from(area.height) - usize::from(has_footer);
@@ -431,8 +427,9 @@ mod tests {
         assert_eq!(tiny.detail.height, 0);
     }
 
-    /// Below the full row's width the profile and targets columns are
-    /// dropped; the rest of the columns keep their header widths.
+    /// The fixture's row is 100 cells wide with its profile and targets
+    /// columns (the two take 33 of them); below that width the two are
+    /// dropped and the rest of the columns keep their header widths.
     #[test]
     fn columns_drop_profile_and_targets_when_the_row_does_not_fit() {
         let row = JobRow {
@@ -441,15 +438,17 @@ mod tests {
             targets: "http://127.0.0.1:8080".into(),
             state_phase: "running/audit".into(),
             probes: "418/2000".into(),
+            probe_fill: 2,
             points: "80/120".into(),
             issues: Default::default(),
             elapsed: "42s".into(),
         };
-        let wide = Columns::measure(std::slice::from_ref(&row), 198);
-        assert!(wide.full);
-        assert_eq!((wide.profile, wide.targets), (8, 21));
-        let narrow = Columns::measure(std::slice::from_ref(&row), 88);
-        assert!(!narrow.full);
-        assert!(narrow.total() <= 88, "{}", narrow.total());
+        let cols = Columns::measure(std::slice::from_ref(&row), 100);
+        assert_eq!(cols.total(true), 100, "the full row's width");
+        assert_eq!(cols.total(false), 67, "without profile and targets");
+        assert!(cols.full, "a 100-cell row fits 100 cells");
+        assert_eq!((cols.profile, cols.targets), (8, 21));
+        let narrow = Columns::measure(std::slice::from_ref(&row), 99);
+        assert!(!narrow.full, "one cell short drops the two columns");
     }
 }
