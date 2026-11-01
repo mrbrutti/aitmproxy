@@ -39,7 +39,9 @@ use tokio::net::TcpListener;
 
 pub use grader::{grade, GradeReport};
 pub use l4::{L4Config, L4Service};
-pub use manifest::{l4_manifest, manifest, manifest_yaml, L4Asset, PlantedVuln};
+pub use manifest::{
+    l4_manifest, manifest, manifest_yaml, seed_index, Discovery, L4Asset, PlantedVuln, SeedRoute,
+};
 pub use seed::SeedMode;
 
 /// A running test target: the bound loopback address plus the per-instance state
