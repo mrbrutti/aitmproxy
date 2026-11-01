@@ -449,8 +449,14 @@ dependencies = [
 name = "aitm-scan-l4-packet"
 version = "0.5.9"
 dependencies = [
+ "aitm-core",
+ "aitm-poc",
  "aitm-proto-l4",
  "aitm-scan-model",
+ "anyhow",
+ "futures",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
