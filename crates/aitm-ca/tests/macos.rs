@@ -772,3 +772,241 @@ fn status_present_detail_names_the_trust_check() {
     assert_eq!(st.detail, vec![DETAIL.to_string()]);
     assert_eq!(exec.runs(), vec![Q_USER.to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// Stage-5 tester additions (Task 34, spec D17.3 / D17.4): the parser's edges.
+// ---------------------------------------------------------------------------
+
+/// System-scope add as a non-root operator renders it.
+fn add_sys() -> String {
+    format!(
+        "sudo -- security add-trusted-cert -d -r trustRoot -p ssl -p basic -k {K_SYS} /ca/ca.crt"
+    )
+}
+
+fn del_sys(hash: &str) -> String {
+    format!("sudo -- security delete-certificate -Z {hash} {K_SYS}")
+}
+
+// SP-AC31 (tester): `verify-cert` output that is malformed, empty, noisy or
+// contradictory never yields `Yes` by accident, and the detail tail is the
+// exact last-five-lines rendering.
+#[test]
+fn status_verify_cert_output_edges() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+
+    // Exit 1 with the success phrase on stdout: the exit code wins.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 1, VERIFY_OK, "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![
+            DETAIL.to_string(),
+            format!("`{VERIFY_USER}` exited 1: {VERIFY_OK}")
+        ]
+    );
+
+    // Exit 0 with the phrase buried in noise: still Yes (substring match).
+    let noisy = format!("warning: legacy keychain\n\n{VERIFY_OK}\n  trailing  \n");
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 0, &noisy, "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::Yes);
+    assert_eq!(st.detail, vec![DETAIL.to_string()]);
+
+    // Exit 0 with the phrase only on stderr: not a success (stdout is the
+    // channel the literal was quoted from).
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 0, "", VERIFY_OK);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![
+            DETAIL.to_string(),
+            format!(
+                "`{VERIFY_USER}` exited 0 without \"certificate verification successful\" in its output"
+            )
+        ]
+    );
+
+    // Exit 1 with nothing on either stream: the bare exit line.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 1, "", "");
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![DETAIL.to_string(), format!("`{VERIFY_USER}` exited 1")]
+    );
+
+    // Oversized output: only the last five non-empty lines, stdout before
+    // stderr, trimmed and joined with " | ".
+    let stdout = "s1\n\n  s2  \ns3\ns4\n";
+    let stderr = "\ne1\ne2\n   \ne3\n";
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 2, stdout, stderr);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail,
+        vec![
+            DETAIL.to_string(),
+            format!("`{VERIFY_USER}` exited 2: s3 | s4 | e1 | e2 | e3")
+        ]
+    );
+
+    // A very large stderr (a tool dump) never lands whole in detail.
+    let dump: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(VERIFY_USER, 1, "", &dump);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.trusted, Trust::No);
+    assert_eq!(
+        st.detail[1],
+        format!(
+            "`{VERIFY_USER}` exited 1: line 9995 | line 9996 | line 9997 | line 9998 | line 9999"
+        )
+    );
+
+    // Unknown presence (find-certificate itself failed): no verify run, and
+    // the trust stays Unknown rather than defaulting to No.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(
+            Q_USER,
+            1,
+            "",
+            "security: SecKeychainSearchCopyNext: The specified keychain could not be found.",
+        );
+    // First call primes the queue (present), second is the failure.
+    let _ = store.status(&cert, Scope::User, &exec);
+    let st = store.status(&cert, Scope::User, &exec).unwrap();
+    assert_eq!(st.installed, Presence::Unknown);
+    assert_eq!(st.trusted, Trust::Unknown);
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            Q_USER.to_string()
+        ]
+    );
+}
+
+// SP-AC32 (tester): the cancel marker is case-insensitive and spelled either
+// way, headless text takes precedence over it, an unrelated failure is
+// `ToolFailed`, and a failed rollback appends the "may remain" suffix.
+#[test]
+fn install_cancelled_marker_edges() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+    let bare = "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted";
+
+    for stderr in [
+        "User CANCELED the operation.",
+        "SecTrustSettingsSetTrustSettings: The authorization was cancelled by the user.",
+        "error: Cancel\n",
+    ] {
+        let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", stderr);
+        let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+        assert_eq!(
+            kind_of(&err),
+            TrustErrorKind::Cancelled,
+            "stderr: {stderr:?}"
+        );
+        assert_eq!(err.to_string(), bare, "stderr: {stderr:?}");
+        // The raw tool text never leaks into the calm message.
+        assert!(!err.to_string().contains("CANCELED"), "{err}");
+    }
+
+    // Both markers present: headless wins (the SSH case must keep its hint).
+    let both = format!("{HEADLESS_STDERR}; the request was canceled");
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", &both);
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::HeadlessAuth);
+    assert!(err.to_string().contains("GUI session"), "{err}");
+
+    // "cancel" on stdout only is not the dialog: stderr is the channel.
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "canceled", "");
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+
+    // An unrelated failure, and an empty one, stay ToolFailed with the tool
+    // text.
+    let exec = ScriptedExecutor::new().respond(
+        &add_user(),
+        1,
+        "",
+        "security: SecTrustSettingsSetTrustSettings: One or more parameters passed to a function were not valid.",
+    );
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+    assert!(err.to_string().contains("were not valid"), "got: {err}");
+    let exec = ScriptedExecutor::new().respond(&add_user(), 1, "", "");
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::ToolFailed);
+    assert_eq!(err.to_string(), format!("`{}` exited 1", add_user()));
+
+    // Cancelled, copy left behind, rollback itself fails: the other suffix.
+    let exec = ScriptedExecutor::new()
+        .respond(Q_USER, 0, "", "")
+        .respond(Q_USER, 0, &present_output(), "")
+        .respond(&add_user(), 1, "", CANCEL_STDERR)
+        .respond(&del_user(&fp256_hex()), 1, "", "security: SecKeychainItemDelete: The specified item could not be found in the keychain.");
+    let err = store.install(&cert, Scope::User, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        format!("{bare}; an untrusted copy may remain in the keychain")
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            add_user(),
+            Q_USER.to_string(),
+            del_user(&fp256_hex()),
+        ]
+    );
+}
+
+// SP-AC32 (tester, System scope): the same classification applies to the
+// `sudo` path, and the rollback uses the System keychain through `sudo`.
+#[test]
+fn install_cancelled_system_scope_rolls_back_through_sudo() {
+    let cert = fixture_cert();
+    let store = MacOsStore;
+    let sys_present = present_output().replace(K_USER, K_SYS);
+
+    let exec = ScriptedExecutor::new()
+        .root(false)
+        .respond(Q_SYS, 0, "", "")
+        .respond(Q_SYS, 0, &sys_present, "")
+        .respond(&add_sys(), 1, "", CANCEL_STDERR);
+    let err = store.install(&cert, Scope::System, &exec).unwrap_err();
+    assert_eq!(kind_of(&err), TrustErrorKind::Cancelled);
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not \
+         trusted; removed the untrusted copy it left behind"
+    );
+    assert_eq!(
+        exec.runs(),
+        vec![
+            Q_SYS.to_string(),
+            add_sys(),
+            Q_SYS.to_string(),
+            del_sys(&fp256_hex()),
+        ]
+    );
+}

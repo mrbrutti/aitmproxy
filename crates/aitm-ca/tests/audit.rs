@@ -235,3 +235,25 @@ fn operator_frontend_round_trips() {
     let back: AuditRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(back, rec);
 }
+
+// D17.2 (tester): the reader's allow-list grew by exactly "operator"; any
+// other frontend word is still a deserialization error, never a leak.
+#[test]
+fn reader_rejects_an_unknown_frontend() {
+    let rec = record("changed=true");
+    let json = serde_json::to_string(&rec).unwrap();
+    for bad in ["gui", "Operator", "OPERATOR", "operator ", ""] {
+        let tampered = json.replace("\"frontend\":\"cli\"", &format!("\"frontend\":\"{bad}\""));
+        assert_ne!(tampered, json, "replacement did not apply for {bad:?}");
+        let err = serde_json::from_str::<AuditRecord>(&tampered).unwrap_err();
+        assert!(
+            err.to_string().contains("frontend") || err.to_string().contains(bad),
+            "{bad:?}: {err}"
+        );
+    }
+    for good in ["cli", "mcp", "operator"] {
+        let ok = json.replace("\"frontend\":\"cli\"", &format!("\"frontend\":\"{good}\""));
+        let back: AuditRecord = serde_json::from_str(&ok).unwrap();
+        assert_eq!(back.frontend, good);
+    }
+}

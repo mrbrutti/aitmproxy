@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
 
 use aitm_ca::audit::AuditRecord;
+use aitm_ca::exec::{CmdLine, CmdOutput, Executor};
 use aitm_ca::store::{
     LinuxFamily, Platform, TrustError, TrustErrorKind, DEBIAN_ANCHOR_DIR, FEDORA_ANCHOR_DIR,
 };
@@ -1396,4 +1397,511 @@ fn cancelled_install_warns_with_kind_cancelled() {
     let f = &warns[0].fields;
     assert_eq!(f.get("kind").map(String::as_str), Some("cancelled"));
     assert_eq!(f.get("command").map(String::as_str), Some("ca.install"));
+}
+
+// ---------------------------------------------------------------------------
+// Stage-5 tester additions (Tasks 33 and 34, spec §D17; SP-AC29, SP-AC31,
+// SP-AC32 edges the Coder's tests leave open).
+// ---------------------------------------------------------------------------
+
+/// The trust read-back as `MacOsStore::status` renders it (Task 32's choice).
+const VERIFY_USER: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
+const VERIFY_OK: &str = "/ca/ca.crt: certificate verification successful.";
+const NOT_TRUSTED: &str = "Cert Verify Result: CSSMERR_TP_NOT_TRUSTED";
+const MACOS_DETAIL: &str = "macOS: presence from `security find-certificate`; trust from `security verify-cert` (basic policy, local only; our install sets the ssl and basic policies together)";
+const K_SYS: &str = "/Library/Keychains/System.keychain";
+const DEBIAN_ANCHOR: &str = "/usr/local/share/ca-certificates/aitmproxy-root-ca.crt";
+const SUDO_NO_TTY: &str = "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper";
+const CANCEL_STDERR: &str =
+    "SecTrustSettingsSetTrustSettings: The authorization was canceled by the user.";
+const CANCELLED_FULL: &str = "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted; removed the untrusted copy it left behind";
+
+/// `find-certificate -a -Z` output holding the fixture in the System keychain.
+fn present_system_output() -> String {
+    format!(
+        "SHA-256 hash: {}\nSHA-1 hash: {}\nkeychain: \"{K_SYS}\"\n",
+        FIXTURE_FP256.replace(':', ""),
+        FIXTURE_FP1.replace(':', "")
+    )
+}
+
+/// Delegates to a `ScriptedExecutor` but cannot spawn `security verify-cert`,
+/// the way `RealExecutor` fails when the program is missing.
+struct VerifyUnspawnable(ScriptedExecutor);
+
+const VERIFY_SPAWN_FAILURE: &str = "could not start `security verify-cert -c /ca/ca.crt -l -L -p basic`: No such file or directory (os error 2)";
+
+impl Executor for VerifyUnspawnable {
+    fn run(&self, cmd: &CmdLine) -> anyhow::Result<CmdOutput> {
+        if cmd.args.first().map(String::as_str) == Some("verify-cert") {
+            let _ = self.0.run(cmd);
+            anyhow::bail!("{VERIFY_SPAWN_FAILURE}");
+        }
+        self.0.run(cmd)
+    }
+
+    fn read_file(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+        self.0.read_file(path)
+    }
+
+    fn dir_exists(&self, path: &Path) -> bool {
+        self.0.dir_exists(path)
+    }
+
+    fn home_dir(&self) -> Option<PathBuf> {
+        self.0.home_dir()
+    }
+
+    fn is_root(&self) -> bool {
+        self.0.is_root()
+    }
+}
+
+/// `ca.status` through the plugin on any executor (the `Harness` is pinned
+/// to `ScriptedExecutor`).
+fn status_with(exec: Arc<dyn Executor>, frontend: Frontend) -> Value {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CaPlugin::with_backend(
+        cfg("/ca", false),
+        exec,
+        Arc::new(MemoryAuditLog::new()),
+        Platform::MacOs,
+    )));
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None).with_frontend(frontend);
+    reg.command("ca.status")
+        .unwrap()
+        .invoke(params(&[]), &host)
+        .unwrap()
+}
+
+fn store_text<'a>(v: &'a Value, scope: &str, key: &str) -> &'a str {
+    text(field(field(v, "stores"), scope), key)
+}
+
+// SP-AC29 (tester): the operator frontend is labelled "operator" on every
+// outcome the gate can reach: dry_run, flag on, and the INFO line.
+#[test]
+fn operator_dry_run_and_flag_on_are_audited_as_operator() {
+    // Operator + dry_run, flag off: passes (dry_run always does) and the
+    // record says who asked.
+    let h = Harness::scripted(false);
+    let v = h
+        .call(
+            "ca.install",
+            Frontend::Operator,
+            &[("dry_run", Value::Bool(true))],
+        )
+        .unwrap();
+    assert!(flag(&v, "dry_run"));
+    assert!(flag(&v, "changed"));
+    assert_eq!(text(&v, "scope"), "user");
+    assert_eq!(
+        strings(&v, "commands"),
+        vec![Q_USER.to_string(), add_user()]
+    );
+    // The mutation was rendered, not run.
+    assert_eq!(h.exec.runs(), vec![Q_USER.to_string()]);
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].frontend, "operator");
+    assert_eq!(records[0].outcome, "dry_run");
+    assert_eq!(records[0].scope.as_deref(), Some("user"));
+
+    // Operator with the flag on: still "operator", never "mcp".
+    let (h, capture) = traced(|| {
+        let h = Harness::scripted(true);
+        let v = h.call("ca.install", Frontend::Operator, &[]).unwrap();
+        assert!(flag(&v, "changed"));
+        h
+    });
+    assert_eq!(h.exec.runs(), vec![Q_USER.to_string(), add_user()]);
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].frontend, "operator");
+    assert_eq!(records[0].outcome, "ok");
+    let info = capture.at(Level::INFO, "aitm_ca");
+    assert_eq!(info.len(), 1, "{capture:?}");
+    assert_eq!(
+        info[0].fields.get("frontend").map(String::as_str),
+        Some("operator")
+    );
+    assert_eq!(
+        info[0].fields.get("message").map(String::as_str),
+        Some("OS trust store updated")
+    );
+    assert!(capture.at(Level::WARN, "aitm_ca").is_empty(), "{capture:?}");
+
+    // Operator uninstall, flag off, certificate present: proceeds and is
+    // labelled the same.
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(Q_USER, 0, "", ""),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.uninstall", Frontend::Operator, &[]).unwrap();
+    assert!(flag(&v, "changed"));
+    assert_eq!(h.exec.runs()[0], Q_USER);
+    assert_eq!(
+        h.exec.runs()[1],
+        "security remove-trusted-cert /ca/ca.crt".to_string()
+    );
+    assert_eq!(h.records()[0].frontend, "operator");
+    assert_eq!(h.records()[0].outcome, "ok");
+}
+
+// D17.13 (tester): Linux is unchanged by the gate widening. An operator
+// install that cannot get root is still a `NeedsRoot` error with the CLI
+// remedy, audited as "operator"/"error", with the kind in the WARN line.
+#[test]
+fn linux_operator_install_still_needs_root() {
+    let tee = format!("sudo -- tee {DEBIAN_ANCHOR}");
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .root(false)
+            .respond(&tee, 1, "", SUDO_NO_TTY),
+        MemoryAuditLog::new(),
+    );
+    let (result, capture) = traced(|| h.call("ca.install", Frontend::Operator, &[]));
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::NeedsRoot),
+        "{err:#}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with(
+            "needs root: run aitm ca install from a shell where sudo can prompt, or start the \
+             proxy as root ("
+        ),
+        "got: {msg}"
+    );
+    assert!(msg.contains(SUDO_NO_TTY), "got: {msg}");
+    // The gate let the operator through (the tee ran); the refresh never did.
+    assert_eq!(h.exec.runs(), vec![tee.clone()]);
+
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].frontend, "operator");
+    assert_eq!(records[0].outcome, "error");
+    assert_eq!(records[0].scope.as_deref(), Some("system"));
+    assert_eq!(records[0].platform.as_deref(), Some("linux-debian"));
+    assert_eq!(records[0].detail, msg);
+
+    let warns = capture.at(Level::WARN, "aitm_ca");
+    assert_eq!(warns.len(), 1, "{capture:?}");
+    assert_eq!(
+        warns[0].fields.get("kind").map(String::as_str),
+        Some("NeedsRoot")
+    );
+    assert_eq!(
+        warns[0].fields.get("platform").map(String::as_str),
+        Some("linux-debian")
+    );
+
+    // The Linux status shape is untouched too: one `system` store, no `user`.
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert_eq!(text(&v, "platform"), "linux-debian");
+    match field(&v, "stores") {
+        Value::Object(stores) => {
+            assert_eq!(stores.keys().collect::<Vec<_>>(), vec!["system"]);
+        }
+        other => panic!("stores is not an object: {other:?}"),
+    }
+    assert_eq!(store_text(&v, "system", "installed"), "absent");
+    // Linux's trust comes from the extracted bundle, which the scripted fs
+    // does not hold: unknown (pre-existing Linux behaviour, linux.rs is not
+    // in this range). With a bundle that lacks us it reads "no".
+    assert_eq!(store_text(&v, "system", "trusted"), "unknown");
+    let h = Harness::on(
+        Platform::Linux(LinuxFamily::Debian),
+        cfg("/ca", false),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE).file(
+            "/etc/ssl/certs/ca-certificates.crt",
+            b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        ),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert_eq!(store_text(&v, "system", "installed"), "absent");
+    assert_eq!(store_text(&v, "system", "trusted"), "no");
+    assert!(
+        h.exec.runs().is_empty(),
+        "Linux status is read-only: {:?}",
+        h.exec.runs()
+    );
+}
+
+// SP-AC31 (tester, command level): the other two verify-cert outcomes reach
+// the JSON as "no" and "unknown", each with its own detail line, and the
+// macOS detail line is deduplicated across the two stores.
+#[test]
+fn ca_status_json_reports_user_trust_no_and_unknown() {
+    // Non-zero exit: "no", with the verify-cert tail in detail.
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(VERIFY_USER, 1, NOT_TRUSTED, ""),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert!(flag(&v, "exists"));
+    assert_eq!(text(&v, "platform"), "macos");
+    assert_eq!(store_text(&v, "user", "installed"), "present");
+    assert_eq!(store_text(&v, "user", "trusted"), "no");
+    assert_eq!(store_text(&v, "user", "location"), K_USER);
+    assert_eq!(store_text(&v, "system", "installed"), "absent");
+    assert_eq!(store_text(&v, "system", "trusted"), "no");
+    assert_eq!(
+        h.exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            Q_SYS.to_string()
+        ]
+    );
+    let detail = strings(&v, "detail");
+    assert_eq!(
+        detail,
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!("`{VERIFY_USER}` exited 1: {NOT_TRUSTED}"),
+            OBSCURA_DETAIL_LINE.to_string(),
+        ],
+        "{detail:?}"
+    );
+    assert!(h.records().is_empty(), "ca.status is never audited");
+
+    // Unspawnable: "unknown", with the spawn failure in detail; the System
+    // keychain is still absent and "no".
+    let inner = ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE).respond(
+        Q_USER,
+        0,
+        &present_user_output(),
+        "",
+    );
+    let exec = Arc::new(VerifyUnspawnable(inner));
+    let v = status_with(exec.clone(), Frontend::Operator);
+    assert_eq!(store_text(&v, "user", "installed"), "present");
+    assert_eq!(store_text(&v, "user", "trusted"), "unknown");
+    assert_eq!(store_text(&v, "system", "installed"), "absent");
+    assert_eq!(store_text(&v, "system", "trusted"), "no");
+    assert_eq!(
+        exec.0.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            Q_SYS.to_string()
+        ]
+    );
+    let detail = strings(&v, "detail");
+    assert_eq!(
+        detail,
+        vec![
+            MACOS_DETAIL.to_string(),
+            VERIFY_SPAWN_FAILURE.to_string(),
+            OBSCURA_DETAIL_LINE.to_string(),
+        ],
+        "{detail:?}"
+    );
+
+    // Both keychains empty: "no" twice, no verify-cert at all.
+    let h = Harness::scripted(false);
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert_eq!(store_text(&v, "user", "installed"), "absent");
+    assert_eq!(store_text(&v, "user", "trusted"), "no");
+    assert_eq!(store_text(&v, "system", "installed"), "absent");
+    assert_eq!(store_text(&v, "system", "trusted"), "no");
+    assert_eq!(h.exec.runs(), vec![Q_USER.to_string(), Q_SYS.to_string()]);
+    assert_eq!(
+        strings(&v, "detail"),
+        vec![MACOS_DETAIL.to_string(), OBSCURA_DETAIL_LINE.to_string()]
+    );
+}
+
+/// The obscura independence line `ca.status` always ends its detail with.
+const OBSCURA_DETAIL_LINE: &str = "the embedded browser (obscura) does not use the OS trust store; it trusts this CA through --ca-cert at launch";
+
+// SP-AC31 (tester, System scope path): a certificate held only by the System
+// keychain is read back the same way and reported under `stores.system`; a
+// certificate in both keychains yields one evaluation per store and one
+// deduplicated detail line.
+#[test]
+fn ca_status_json_system_scope_trust() {
+    // Only the System keychain holds it.
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_SYS, 0, &present_system_output(), "")
+            .respond(VERIFY_USER, 0, VERIFY_OK, ""),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert_eq!(store_text(&v, "user", "installed"), "absent");
+    assert_eq!(store_text(&v, "user", "trusted"), "no");
+    assert_eq!(store_text(&v, "system", "installed"), "present");
+    assert_eq!(store_text(&v, "system", "trusted"), "yes");
+    assert_eq!(store_text(&v, "system", "location"), K_SYS);
+    assert_eq!(
+        h.exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            Q_SYS.to_string(),
+            VERIFY_USER.to_string()
+        ]
+    );
+    assert!(
+        h.exec.runs().iter().all(|l| !l.starts_with("sudo")),
+        "status never escalates: {:?}",
+        h.exec.runs()
+    );
+
+    // Both keychains hold it: both say yes, verify-cert ran once per store,
+    // the macOS detail line appears once.
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(Q_SYS, 0, &present_system_output(), "")
+            .respond(VERIFY_USER, 0, VERIFY_OK, ""),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert_eq!(store_text(&v, "user", "trusted"), "yes");
+    assert_eq!(store_text(&v, "system", "trusted"), "yes");
+    assert_eq!(
+        h.exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            VERIFY_USER.to_string(),
+            Q_SYS.to_string(),
+            VERIFY_USER.to_string()
+        ]
+    );
+    assert_eq!(
+        strings(&v, "detail"),
+        vec![MACOS_DETAIL.to_string(), OBSCURA_DETAIL_LINE.to_string()]
+    );
+
+    // Trusted in neither, present in both: two "no" and one verify tail
+    // (identical lines are deduplicated too).
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(Q_SYS, 0, &present_system_output(), "")
+            .respond(VERIFY_USER, 1, "", NOT_TRUSTED),
+        MemoryAuditLog::new(),
+    );
+    let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
+    assert_eq!(store_text(&v, "user", "trusted"), "no");
+    assert_eq!(store_text(&v, "system", "trusted"), "no");
+    assert_eq!(
+        strings(&v, "detail"),
+        vec![
+            MACOS_DETAIL.to_string(),
+            format!("`{VERIFY_USER}` exited 1: {NOT_TRUSTED}"),
+            OBSCURA_DETAIL_LINE.to_string(),
+        ]
+    );
+}
+
+// SP-AC32 (tester, command level): with the rollback path taken, the audit
+// record's detail and the WARN `error` field carry the full literal, byte for
+// byte, and nothing but `error` is recorded.
+#[test]
+fn cancelled_install_audit_detail_is_the_full_message() {
+    let h = Harness::new(
+        cfg("/ca", false),
+        ScriptedExecutor::new()
+            .file("/ca/ca.crt", FIXTURE)
+            .respond(Q_USER, 0, "", "")
+            .respond(Q_USER, 0, &present_user_output(), "")
+            .respond(&add_user(), 1, "", CANCEL_STDERR),
+        MemoryAuditLog::new(),
+    );
+    let (result, capture) = traced(|| h.call("ca.install", Frontend::Operator, &[]));
+    let err = result.unwrap_err();
+    assert_eq!(err.to_string(), CANCELLED_FULL);
+    assert_eq!(
+        err.downcast_ref::<TrustError>().map(|e| e.kind),
+        Some(TrustErrorKind::Cancelled)
+    );
+    assert_eq!(
+        h.exec.runs(),
+        vec![
+            Q_USER.to_string(),
+            add_user(),
+            Q_USER.to_string(),
+            format!(
+                "security delete-certificate -Z {} {K_USER}",
+                FIXTURE_FP256.replace(':', "")
+            ),
+        ]
+    );
+
+    let records = h.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = &records[0];
+    assert_eq!(
+        rec,
+        &AuditRecord {
+            ts: rec.ts.clone(),
+            command: "ca.install",
+            frontend: "operator",
+            outcome: "error",
+            scope: Some("user".to_string()),
+            platform: Some("macos".to_string()),
+            fingerprint_sha256: Some(FIXTURE_FP256.to_string()),
+            detail: CANCELLED_FULL.to_string(),
+        }
+    );
+
+    let warns = capture.at(Level::WARN, "aitm_ca");
+    assert_eq!(warns.len(), 1, "{capture:?}");
+    let f = &warns[0].fields;
+    assert_eq!(f.get("kind").map(String::as_str), Some("cancelled"));
+    assert_eq!(f.get("error").map(String::as_str), Some(CANCELLED_FULL));
+    assert_eq!(f.get("scope").map(String::as_str), Some("user"));
+    assert!(capture.at(Level::INFO, "aitm_ca").is_empty(), "{capture:?}");
+
+    // The MCP frontend with the flag on meets the same calm message: the
+    // kind does not depend on who asked.
+    let h = Harness::new(
+        cfg("/ca", true),
+        ScriptedExecutor::new().file("/ca/ca.crt", FIXTURE).respond(
+            &add_user(),
+            1,
+            "",
+            CANCEL_STDERR,
+        ),
+        MemoryAuditLog::new(),
+    );
+    let err = h.call("ca.install", Frontend::Mcp, &[]).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted"
+    );
+    assert_eq!(h.records()[0].frontend, "mcp");
+    assert_eq!(h.records()[0].outcome, "error");
 }
