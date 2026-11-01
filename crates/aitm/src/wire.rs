@@ -1247,7 +1247,7 @@ mod tests {
             "scan.discover",
             "scan.passive",
             "scan.report",
-            "check.reflected-xss",
+            "check.xss-reflected",
             "check.open-redirect",
             "check.reflection",
             "check.security-header",

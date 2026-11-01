@@ -1475,9 +1475,9 @@ mod tests {
             vec![
                 "check.cookie-flag",
                 "check.open-redirect",
-                "check.reflected-xss",
                 "check.reflection",
                 "check.security-header",
+                "check.xss-reflected",
             ]
         );
     }
@@ -1757,9 +1757,9 @@ mod tests {
                 "cookie-flag",
                 "fake.vuln",
                 "open-redirect",
-                "reflected-xss",
                 "reflection",
                 "security-header",
+                "xss-reflected",
             ]
         );
 

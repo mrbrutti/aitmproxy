@@ -437,7 +437,7 @@ mod tests {
     use crate::plugin::ScannerPlugin;
 
     /// A client that answers every request with an HTML page echoing the
-    /// decoded query values, so the interim `reflected-xss` check sees its
+    /// decoded query values, so the interim `xss-reflected` check sees its
     /// marker come back unencoded.
     struct EchoClient {
         seen: std::sync::Mutex<Vec<String>>,
@@ -591,7 +591,7 @@ mod tests {
 
         let result = h
             .call(
-                "check.reflected-xss",
+                "check.xss-reflected",
                 &[("url", s("http://ex.test/search")), ("param", s("q"))],
             )
             .expect("the manual check runs");
@@ -616,7 +616,7 @@ mod tests {
         let h = Harness::new();
         let err = h
             .call(
-                "check.reflected-xss",
+                "check.xss-reflected",
                 &[("url", s("http://other.test/search")), ("param", s("q"))],
             )
             .expect_err("an unscoped url is refused");
@@ -661,7 +661,7 @@ mod tests {
 
         impl Command for Squatter {
             fn name(&self) -> &str {
-                "check.reflected-xss"
+                "check.xss-reflected"
             }
 
             fn schema(&self) -> aitm_core::ParamSchema {
@@ -682,7 +682,7 @@ mod tests {
         reg.add_plugin(Box::new(ScannerPlugin::new(ScannerConfig::default())));
 
         assert_eq!(
-            reg.command("check.reflected-xss")
+            reg.command("check.xss-reflected")
                 .expect("still registered")
                 .schema()
                 .description,
@@ -708,7 +708,7 @@ mod tests {
 
         let err = h
             .call(
-                "check.reflected-xss",
+                "check.xss-reflected",
                 &[
                     ("url", s("http://127.0.0.1:8081/search")),
                     ("param", s("q")),
@@ -719,7 +719,7 @@ mod tests {
         assert!(h.client.payloads().is_empty());
 
         h.call(
-            "check.reflected-xss",
+            "check.xss-reflected",
             &[
                 ("url", s("http://127.0.0.1:8080/search")),
                 ("param", s("q")),
@@ -727,7 +727,7 @@ mod tests {
         )
         .expect("the ported entry admits the url on that port");
         h.call(
-            "check.reflected-xss",
+            "check.xss-reflected",
             &[("url", s("https://secure.test/search")), ("param", s("q"))],
         )
         .expect("the 443 entry admits the default-port https url");

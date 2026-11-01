@@ -54,6 +54,11 @@ const CRAWL_MARK: &str = "crawl";
 /// How many probe flows one [`InterimProbeHost`] keeps in memory (spec D5).
 pub const MAX_HELD_FLOWS: usize = 16;
 
+/// The reflected-XSS check's **id**, spec D8.2's literal name — distinct from
+/// the issue **class** it emits (`crate::checks::CLASS_REFLECTED_XSS`), and so
+/// the manual verb is `check.xss-reflected`.
+const CHECK_XSS_REFLECTED: &str = "xss-reflected";
+
 /// The interim HTTP [`Lane`]: the v1 scanner behind the v2 traits.
 pub struct InterimHttpLane {
     cfg: ScannerConfig,
@@ -875,9 +880,13 @@ fn http_kinds() -> Vec<InsertionKind> {
 }
 
 /// The catalogue entry for the shipped reflected-XSS class.
+///
+/// The **id** is spec D8.2's literal check name (`xss-reflected`, so the
+/// manual verb is `check.xss-reflected`); the **class** stays the issue class
+/// the check emits (`reflected-xss`).
 fn reflected_xss_meta() -> CheckMeta {
     CheckMeta {
-        id: crate::checks::CLASS_REFLECTED_XSS.to_string(),
+        id: CHECK_XSS_REFLECTED.to_string(),
         name: "Reflected cross-site scripting".to_string(),
         class: crate::checks::CLASS_REFLECTED_XSS.to_string(),
         lanes: vec![LaneKind::Http],
@@ -1553,7 +1562,7 @@ mod tests {
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
 
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
 
         assert_eq!(verdict.outcome, Outcome::Vulnerable);
         assert_eq!(verdict.confidence, aitm_scan_model::Confidence::Certain);
@@ -1615,7 +1624,7 @@ mod tests {
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
 
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
 
         assert_eq!(verdict.outcome, Outcome::Inconclusive);
         assert_eq!(verdict.confidence, aitm_scan_model::Confidence::Tentative);
@@ -1647,7 +1656,7 @@ mod tests {
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
 
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
 
         assert_eq!(verdict.outcome, Outcome::Clean);
         assert!(verdict.poc_hint.is_none());
@@ -1937,7 +1946,7 @@ mod tests {
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
 
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
 
         assert!(
             client.calls() >= 2,
@@ -1956,7 +1965,7 @@ mod tests {
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
 
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
 
         assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
         assert!(verdict.detail.contains("deadline"), "{}", verdict.detail);
@@ -2168,7 +2177,7 @@ mod tests {
         let host = lane()
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
         assert_eq!(verdict.outcome, Outcome::Inconclusive);
         assert!(verdict.detail.contains("cancelled"), "{}", verdict.detail);
         assert_eq!(client.calls(), 0, "a cancelled check sends nothing");
@@ -2180,7 +2189,7 @@ mod tests {
         let host = lane()
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
-        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        let verdict = check_named("xss-reflected").run(&point, &*host).await;
         assert_eq!(verdict.outcome, Outcome::Inconclusive);
         assert!(verdict.detail.contains("budget"), "{}", verdict.detail);
         assert_eq!(client.calls(), 0, "a spent budget sends nothing");
@@ -2262,14 +2271,30 @@ mod tests {
     }
 
     /// The lane's five checks carry the metadata the plan pins (call B19), in
-    /// the plan's order, with `id == class` and a native origin; the passive
-    /// three cover every HTTP kind and no WebSocket or L4 one.
+    /// the plan's order, with a native origin; the passive three cover every
+    /// HTTP kind and no WebSocket or L4 one.
+    ///
+    /// Coordinator ruling 2026-11-01: an **id** is spec D8.2's literal name
+    /// (`xss-reflected`), a **class** is the issue class the check emits
+    /// (`reflected-xss`), so the two differ for the reflected-XSS check and
+    /// coincide for the other four.
     #[test]
     fn the_five_interim_checks_carry_the_pinned_metadata() {
         let checks = lane().checks();
         let ids: Vec<&str> = checks.iter().map(|c| c.meta().id.as_str()).collect();
         assert_eq!(
             ids,
+            [
+                "xss-reflected",
+                "open-redirect",
+                "reflection",
+                "security-header",
+                "cookie-flag"
+            ]
+        );
+        let classes: Vec<&str> = checks.iter().map(|c| c.meta().class.as_str()).collect();
+        assert_eq!(
+            classes,
             [
                 "reflected-xss",
                 "open-redirect",
@@ -2280,7 +2305,6 @@ mod tests {
         );
         for check in &checks {
             let meta = check.meta();
-            assert_eq!(meta.id, meta.class, "{}: id == class", meta.id);
             assert_eq!(meta.origin, CheckOrigin::Native, "{}", meta.id);
             assert_eq!(meta.lanes, vec![LaneKind::Http], "{}", meta.id);
             assert!(!meta.description.is_empty(), "{}", meta.id);

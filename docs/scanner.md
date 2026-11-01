@@ -58,9 +58,10 @@ falls back to the **interim HTTP lane** built into the scanner plugin, and a
 profile that asks for `ws`, `l4_packet` or `l4_stream` is not refused: those
 lanes are reported in `lanes.skipped` with the reason "lane not available on
 this build", and the job runs the lanes it has. The interim lane carries five
-checks — two active (`reflected-xss`, `open-redirect`) and three passive
+checks — two active (`xss-reflected`, `open-redirect`) and three passive
 (`reflection`, `security-header`, `cookie-flag`) — and derives query and body
-points from captured requests.
+points from captured requests. Those are check **ids**; the issue **classes**
+they emit are `reflected-xss` and `open-redirect`.
 
 Its crawl drives the **embedded browser**, so a real crawl needs a running core
 that has one. With no browser, with `crawl.use_browser: never`, or with
@@ -530,12 +531,12 @@ unauthenticated.
 ## Running one check by hand
 
 Every catalogue entry gets a uniform `check.<id>` command —
-`check.reflected-xss`, `check.open-redirect`, `check.demo.sleep-sqli` — so a
+`check.xss-reflected`, `check.open-redirect`, `check.demo.sleep-sqli` — so a
 check can be run against one **query parameter** by hand, without starting a
 job:
 
 ```text
-check.reflected-xss { url: "https://app.example/search?q=1", param: "q" }
+check.xss-reflected { url: "https://app.example/search?q=1", param: "q" }
 ```
 
 It is **not** a way around the job model. The command builds a one-shot job over
