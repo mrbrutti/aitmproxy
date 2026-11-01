@@ -805,7 +805,8 @@ impl Command for ScanSitemap {
         ParamSchema {
             description: "The site map one job discovered: its nodes (method and path \
                           template per origin) and the insertion points on them. Name the \
-                          job, or name a `target` origin and get its newest job. `nodes` is \
+                          job, name a `target` origin and get its newest job, or give \
+                          neither and get the newest job of all. `nodes` is \
                           always complete; `points` is paged — at most `limit` (default \
                           1024, capped 4096), then pass `next_cursor` back as `cursor`."
                 .into(),
@@ -842,13 +843,15 @@ impl Command for ScanSitemap {
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let job = match opt_str(&args, "job")? {
             Some(job) => job,
+            None if opt_str(&args, "target")?.is_none() => {
+                // Neither given (both are optional in spec D3): the newest job.
+                self.engine
+                    .registry
+                    .newest()
+                    .ok_or_else(|| scan_error(ScanErrorCode::NotFound, "no scan job has run yet"))?
+            }
             None => {
-                let target = opt_str(&args, "target")?.ok_or_else(|| {
-                    scan_error(
-                        ScanErrorCode::InvalidProfile,
-                        "give either `job` or `target`",
-                    )
-                })?;
+                let target = opt_str(&args, "target")?.expect("checked above");
                 let origin = profiles::normalize_origin(&target)
                     .map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
                 self.engine

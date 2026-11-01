@@ -256,6 +256,9 @@ pub struct JobRuntime {
     /// Charges the HTTP lane made during the crawling phase: one per browser
     /// navigation, which is the page count of a browser crawl (spec D5).
     crawl_charges: AtomicU64,
+    /// Crawls of one origin that failed outright (`JobCtx::report_crawl_error`),
+    /// folded into `crawl.errors` by `sync_counters`.
+    crawl_errors: AtomicU64,
 }
 
 impl JobRuntime {
@@ -410,6 +413,16 @@ impl JobCtx for JobRuntime {
 
     fn report_session_lost(&self) {
         self.mark_session_lost();
+    }
+
+    fn report_crawl_error(&self, origin: &str, reason: &str) {
+        self.crawl_errors.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            target: "aitm::scanner",
+            origin,
+            reason,
+            "crawl failed; discovery continues over what the lane still has"
+        );
     }
 
     fn report_session_canary(&self, canary: Canary) {
@@ -572,6 +585,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         current_lane: Mutex::new(None),
         in_crawl: AtomicBool::new(false),
         crawl_charges: AtomicU64::new(0),
+        crawl_errors: AtomicU64::new(0),
     });
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
@@ -585,7 +599,9 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
     let mut nodes: Vec<SiteNode> = Vec::new();
     for lane in &lanes {
         runtime.set_lane(lane.lane());
-        match bounded_await(
+        // The whole crawl is one await: bound it by the job's deadline only
+        // (`bounded_await`'s 30 s cap is for a single probe).
+        match crate::client::await_until_deadline(
             deadline,
             &cancel,
             lane.discover(&profile.target, job_ctx.as_ref()),
@@ -1327,6 +1343,10 @@ fn sync_counters(
     raise(
         &mut guarded.probes.timeouts,
         meter.timeouts.load(Ordering::SeqCst),
+    );
+    raise(
+        &mut guarded.crawl.errors,
+        runtime.crawl_errors.load(Ordering::Relaxed),
     );
     raise(
         &mut guarded.probes.rate_waits,

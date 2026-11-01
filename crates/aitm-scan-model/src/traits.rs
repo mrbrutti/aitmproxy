@@ -266,6 +266,16 @@ pub trait JobCtx: Send + Sync {
     fn report_session_browser_partial(&self, cookie_names: Vec<String>) {
         let _ = cookie_names;
     }
+
+    /// A crawl of one origin failed outright (the browser crawl timed out or
+    /// was refused). The engine counts it in `crawl.errors` so the status says
+    /// the job ran on fewer points than it could have; the lane then falls back
+    /// to whatever discovery it still has.
+    ///
+    /// A no-op by default.
+    fn report_crawl_error(&self, origin: &str, reason: &str) {
+        let _ = (origin, reason);
+    }
 }
 
 /// What one lane's discovery pass found (spec D2).

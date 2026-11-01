@@ -372,6 +372,19 @@ def _job_args(profile, profile_name, target, overrides) -> dict:
         args["profile_name"] = profile_name
     if target is not None:
         args["target"] = target
+    # Sanctioned default (coordinator, 2026-11-01): a cell that does not ask for
+    # the browser runs the client crawl. On a rig with obscura present the
+    # engine's `use_browser: auto` would pick the browser, and a browser proxy
+    # port shared with another session's core makes every navigation time out.
+    # A cell that sets `crawl.use_browser` itself (profile or overrides) is
+    # left alone (test_t2_crawl needs the real browser).
+    def _sets_use_browser(d) -> bool:
+        return isinstance(d, dict) and isinstance(d.get("crawl"), dict) and "use_browser" in d["crawl"]
+    if not _sets_use_browser(profile) and not _sets_use_browser(overrides):
+        overrides = dict(overrides or {})
+        crawl = dict(overrides.get("crawl") or {})
+        crawl["use_browser"] = "never"
+        overrides["crawl"] = crawl
     if overrides is not None:
         args["overrides"] = overrides
     return args

@@ -87,8 +87,7 @@ Its crawl has three modes, and the lane picks one per origin:
   crawl off; the lane maps and audits only what the proxy has already
   captured for the origin.
 
-(`scan.map` uses the same crawl with `submit_forms` forced off: it never
-submits a form, because a form POST is a write the target did not see coming.)
+(`scan.map` uses the same crawl, `submit_forms` included: spec D8.1 makes form filling with inert generated values a crawl step, so a map job reaches the same routes a scan does and sends no probe)
 
 ## The verbs
 
@@ -102,7 +101,7 @@ submits a form, because a form POST is a write the target did not see coming.)
 | `scan.issues` | Read | `job?`, `target?`, `severity_min?`, `confidence_min?`, `class?`, `lane?`, `status?`, `since?`, `limit?` (100, max 1024), `cursor?` | `{ issues, next_cursor, by_severity }` | `invalid_profile`, `not_found` |
 | `scan.issue` | Read | `id` | `Issue` | `not_found` |
 | `scan.issue.update` | Write | `id`, `status`, `note?` | `Issue` | `not_found`, `invalid_profile` |
-| `scan.sitemap` | Read | `job?` or `target?`, `cursor?`, `limit?` (1024, max 4096) | `{ nodes, points, next_cursor }` | `invalid_profile`, `not_found` |
+| `scan.sitemap` | Read | `job?`, `target?` (neither ⇒ the newest job of all), `cursor?`, `limit?` (1024, max 4096) | `{ nodes, points, next_cursor }` | `invalid_profile`, `not_found` |
 | `scan.checks` | Read | `lane?`, `class?`, `origin?` | `{ checks: [CheckMeta], lanes: [{ lane, source: crate \| interim }] }` | `invalid_profile` |
 | `scan.profile.list` | Read | — | `{ profiles: [{ name, builtin, summary }] }` | — |
 | `scan.profile.get` | Read | `name` | `ScanProfile` | `not_found`, `invalid_profile` |
@@ -122,8 +121,9 @@ a partial profile merged over it key by key, and a mistyped override key is an
 
 `scan.map` is `scan.start` with `lanes: [http]` and `intensity: passive` forced:
 it crawls, runs the passive checks and enumerates insertion points, and sends no
-probe. Its crawl follows GET links only (`crawl.submit_forms` is forced off), so
-a map job never submits a form. Read its result with `scan.sitemap` and
+probe. Its crawl honours the profile's `crawl.submit_forms` (default on): form
+filling with inert generated values is part of the crawl, not a probe
+(coordinator decision, 2026-11-01). Read its result with `scan.sitemap` and
 `scan.issues`.
 
 `scan.discover` is **deprecated**. It is now a `scan.map` job plus a bounded
@@ -381,6 +381,14 @@ runs against a given origin at a time (a second is `busy`).
 Recorded scan flows carry marks, so they can be filtered back out of the capture
 list: `scan:<job>` on every flow the job produced, `crawl` on a lane's crawl
 captures, and `issue:<id>` on the flows re-recorded as an issue's evidence.
+
+Three reading notes from the 2026-11-01 live runs: `elapsed_ms` is live while
+the job runs (wall time since `started_at`, fixed at the terminal transition);
+`crawl.errors` counts crawls of an origin that failed outright (a browser crawl
+that timed out or was refused, after which the client crawl stands in), so a job
+that ran on fewer points than it could have says so; `poc_ref` on an issue is
+present only when `findings.dir` is set, because the reproduction's
+`FindingRecord` is what it points at (no findings dir, no record, no `poc_ref`).
 
 ## Issues
 

@@ -123,6 +123,11 @@ pub struct CrawlCounters {
     pub depth: u32,
     /// Forms submitted.
     pub forms_submitted: u64,
+    /// Crawls that failed outright (a browser crawl that timed out or was
+    /// refused), counted so a job that fell back to captured flows or the client
+    /// crawl says so instead of silently running on fewer points (additive,
+    /// 2026-11-01; absent on the wire means 0).
+    pub errors: u64,
 }
 
 /// Insertion-point counters (spec D5).
@@ -387,6 +392,7 @@ mod tests {
                 ..IssueCounters::default()
             },
             crawl: CrawlCounters {
+                errors: 0,
                 pages: 9,
                 ..CrawlCounters::default()
             },

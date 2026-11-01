@@ -92,16 +92,18 @@ impl InterimHttpLane {
     /// navigate are charged afterwards. Should that charge be refused (another
     /// lane spent the budget meanwhile), whatever is left is drained: the
     /// navigations happened and the budget must say so.
-    async fn crawl_origin(&self, origin: &str, job: &dyn JobCtx) -> Option<String> {
+    async fn crawl_origin(&self, origin: &str, job: &dyn JobCtx) -> BrowserCrawl {
         let profile = job.profile();
         if profile.crawl.max_pages == 0 || profile.crawl.use_browser == UseBrowser::Never {
-            return None;
+            return BrowserCrawl::NotApplicable;
         }
         // No browser: nothing to crawl and nothing to report.
-        let browser = job.browser()?;
+        let Some(browser) = job.browser() else {
+            return BrowserCrawl::NotApplicable;
+        };
         let max_pages = profile.crawl.max_pages.min(job.budget_left());
         if max_pages == 0 {
-            return None;
+            return BrowserCrawl::NotApplicable;
         }
 
         let store = job.store();
@@ -143,9 +145,9 @@ impl InterimHttpLane {
                 if pages > 0 && !job.charge(pages) {
                     job.charge(job.budget_left());
                 }
-                None
+                BrowserCrawl::Ran
             }
-            Err(err) => Some(scrub(&format!("{err:#}"))),
+            Err(err) => BrowserCrawl::Failed(scrub(&format!("{err:#}"))),
         }
     }
 
@@ -165,11 +167,10 @@ impl InterimHttpLane {
         &self,
         origin: &str,
         job: &dyn JobCtx,
+        browser_crawled: bool,
     ) -> Option<crate::interim_crawl::CrawlStop> {
         let profile = job.profile();
-        let browser_crawls =
-            job.browser().is_some() && profile.crawl.use_browser != UseBrowser::Never;
-        if profile.crawl.max_pages == 0 || browser_crawls {
+        if profile.crawl.max_pages == 0 || browser_crawled {
             return None;
         }
         crate::interim_crawl::crawl_with_client(origin, job)
@@ -267,6 +268,19 @@ impl InterimHttpLane {
     }
 }
 
+/// What the browser crawl of one origin did, so the lane knows whether the
+/// client crawl has to stand in for it.
+#[derive(Debug, PartialEq, Eq)]
+enum BrowserCrawl {
+    /// No browser, `use_browser: never` or `max_pages: 0`: nothing to do.
+    NotApplicable,
+    /// The browser crawled; its navigations are in the store.
+    Ran,
+    /// The browser crawl failed (reason already scrubbed): counted as a crawl
+    /// error, and the client crawl runs instead.
+    Failed(String),
+}
+
 impl Lane for InterimHttpLane {
     fn lane(&self) -> LaneKind {
         LaneKind::Http
@@ -285,18 +299,20 @@ impl Lane for InterimHttpLane {
                 // `Discovery` has no notes field (the model is frozen for this
                 // task), so a refused crawl is logged with the job's context:
                 // discovery still runs over what the proxy captured.
-                if let Some(reason) = self.crawl_origin(origin, job).await {
-                    tracing::warn!(
-                        job = job.job_id(),
-                        origin,
-                        reason = %reason,
-                        "interim lane: the browser crawl was refused; \
-                         discovery continues over captured flows"
-                    );
-                }
-                // The client crawl, for a job with no browser to crawl with.
-                // It is a no-op whenever the browser crawl above could run.
-                if let Some(stopped) = self.client_crawl(origin, job).await {
+                // A browser crawl that fails (timed out, refused, wrong proxy
+                // port) is counted in `crawl.errors` and the client crawl runs
+                // in its place, so the job does not silently proceed on
+                // captured flows alone (T7/T2 live runs, 2026-11-01).
+                let browser_crawled = match self.crawl_origin(origin, job).await {
+                    BrowserCrawl::Ran => true,
+                    BrowserCrawl::NotApplicable => false,
+                    BrowserCrawl::Failed(reason) => {
+                        job.report_crawl_error(origin, &reason);
+                        false
+                    }
+                };
+                // The client crawl, for a job whose browser did not crawl.
+                if let Some(stopped) = self.client_crawl(origin, job, browser_crawled).await {
                     tracing::debug!(
                         job = job.job_id(),
                         origin,
@@ -2230,10 +2246,10 @@ mod tests {
             cfg: ScannerConfig::default(),
         };
 
-        let reason = lane
-            .crawl_origin("http://nobody.test", &job)
-            .await
-            .expect("an out-of-scope seed is a refused crawl");
+        let BrowserCrawl::Failed(reason) = lane.crawl_origin("http://nobody.test", &job).await
+        else {
+            panic!("an out-of-scope seed is a failed crawl");
+        };
         assert!(
             reason.contains("nobody.test") || reason.contains("scope"),
             "the reason names the refusal: {reason}"
@@ -2242,16 +2258,16 @@ mod tests {
 
         assert_eq!(
             lane.crawl_origin(ORIGIN, &job).await,
-            None,
-            "a crawl that ran reports no reason"
+            BrowserCrawl::Ran,
+            "a crawl that ran says so"
         );
         assert!(job.charged() >= 1);
 
         job.profile.crawl.use_browser = UseBrowser::Never;
         assert_eq!(
             lane.crawl_origin("http://nobody.test", &job).await,
-            None,
-            "a crawl skipped by design is not a refusal"
+            BrowserCrawl::NotApplicable,
+            "a crawl skipped by design is not a failure"
         );
     }
 
