@@ -2696,6 +2696,96 @@ mod tests {
         );
     }
 
+    /// The registry's terminal signal is what every "wait for the end" reads:
+    /// `false` while a job runs, flipped exactly once by `finish` after the
+    /// terminal status is written, `true` at once for a job that is already
+    /// over (a reloaded record included), and a waiter parked on `changed()`
+    /// wakes on the flip. No clock anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_signal_flips_once_on_finish_and_reads_true_for_finished_jobs() {
+        let registry = crate::jobs::JobRegistry::new(10);
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let status = Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
+            job: "scan-0000beef".to_string(),
+            state: aitm_scan_model::JobState::Running,
+            ..aitm_scan_model::JobStatus::default()
+        }));
+        assert!(registry.try_insert(crate::jobs::JobEntry {
+            status: Arc::clone(&status),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: None,
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: Vec::new(),
+            is_agent: false,
+            terminal: tx,
+        }));
+        assert!(
+            registry.terminal_signal("scan-nope").is_none(),
+            "unknown job: no signal"
+        );
+        let mut rx = registry
+            .terminal_signal("scan-0000beef")
+            .expect("a known job has a signal");
+        assert!(!*rx.borrow(), "a running job reads false");
+
+        // A waiter parked on the signal wakes when `finish` flips it, and
+        // reads a terminal status when it does.
+        let waiter = {
+            let registry_status = Arc::clone(&status);
+            let mut rx = rx.clone();
+            tokio::spawn(async move {
+                while !*rx.borrow_and_update() {
+                    rx.changed().await.expect("sender alive");
+                }
+                registry_status.read().unwrap().state
+            })
+        };
+        tokio::task::yield_now().await;
+        {
+            let mut guarded = status.write().unwrap();
+            guarded.state = aitm_scan_model::JobState::Done;
+            guarded.finished_at = Some(1);
+        }
+        registry.finish("scan-0000beef");
+        assert_eq!(
+            waiter.await.expect("waiter"),
+            aitm_scan_model::JobState::Done
+        );
+        assert!(
+            *rx.borrow_and_update(),
+            "after finish the signal reads true"
+        );
+
+        // Flipping again is a no-op for readers: the value is already true.
+        registry.finish("scan-0000beef");
+        assert!(*rx.borrow(), "idempotent");
+
+        // A job inserted already terminal starts true (what load_history does).
+        let (tx2, _) = tokio::sync::watch::channel(true);
+        assert!(registry.try_insert(crate::jobs::JobEntry {
+            status: Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
+                job: "scan-0000dead".to_string(),
+                state: aitm_scan_model::JobState::Failed,
+                finished_at: Some(2),
+                ..aitm_scan_model::JobStatus::default()
+            })),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: None,
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: Vec::new(),
+            is_agent: false,
+            terminal: tx2,
+        }));
+        let done = crate::jobs::test_support::wait_terminal(&registry, "scan-0000dead").await;
+        assert_eq!(
+            done.state,
+            aitm_scan_model::JobState::Failed,
+            "resolves at once for a finished job"
+        );
+    }
+
     /// The registry surface `scan.sitemap`, `scan.cancel` and the worker read:
     /// the handles of one job, the newest job for an origin, and a history
     /// that never evicts a live job however small `history` is.
