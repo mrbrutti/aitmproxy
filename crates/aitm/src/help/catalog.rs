@@ -1169,6 +1169,42 @@ mod tests {
         );
     }
 
+    // ---- tester, wave-2 pass 2 (plan C45: the curated group keys) ----
+
+    /// The group-level keys of `EXAMPLES` are exactly the three curated
+    /// groups; each is a registered group, never also a command, and each of
+    /// its lines runs a verb of that group through the real `locate`. A new
+    /// group entry is then a deliberate addition and a stale one cannot stay.
+    #[test]
+    fn curated_group_keys_are_check_scan_and_scope() {
+        let described = catalogue_registry_with_l4();
+        let registry = &described.registry;
+        let group_keys: Vec<&str> = EXAMPLES
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| !key.contains('.'))
+            .collect();
+        assert_eq!(group_keys, ["check", "scan", "scope"]);
+        for key in group_keys {
+            assert!(describe::is_group(registry, key), "{key} is a group");
+            assert!(registry.command(key).is_none(), "{key} is not a command");
+            let lines = examples_for(key);
+            assert!(
+                lines.len() >= 2,
+                "{key}: a curated group shows more than one line"
+            );
+            for line in lines {
+                let argv = shell_words(line);
+                match locate(registry, &argv[1..]) {
+                    Ok(Located::Command { cmd, .. }) => {
+                        assert_eq!(group_of(cmd.name()), key, "{key}: {line:?}");
+                    }
+                    other => panic!("{key}: {line:?} does not name a verb: {other:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn top_rows_match_the_mockup() {
         assert_eq!(

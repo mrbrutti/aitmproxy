@@ -1079,4 +1079,56 @@ mod tests {
             "k: invalid value: character '…', expected a digit"
         );
     }
+
+    // ---- tester, wave-2 pass 2 (plan Task 15 item 9b, C31; AC-W2-2) ----
+
+    /// Item 9b end to end on the real serde path, through `answer` rather
+    /// than the settings helper alone: a block scalar on an enum field puts a
+    /// newline inside serde's raw `unknown variant` payload, and a token
+    /// mis-indented under a numeric key is quoted as a string. Neither value
+    /// reaches the one warning line, which keeps the field path and the
+    /// `expected …` clause (first-line-then-redact lost the clause), and the
+    /// page still prints.
+    #[test]
+    fn answer_warning_redacts_a_multi_line_variant_and_a_mistyped_scalar() {
+        let variant = TempConfig::new(
+            "answer-variant",
+            "mcp:\n  stdio_role: |\n    optoken-1\n    optoken-2\n",
+        );
+        let (answer, warned) = ask_with(Some(&variant.path), &implicit("scope"), NO_CATALOGUE_ENV);
+        assert!(
+            page(&answer).starts_with("aitm scope — which hosts are decrypted\n"),
+            "{answer:?}"
+        );
+        assert_eq!(warned.lines().count(), 1, "{warned:?}");
+        assert!(
+            !warned.contains("optoken"),
+            "the value is echoed: {warned:?}"
+        );
+        assert!(
+            warned
+                .contains(": mcp.stdio_role: unknown variant `…`, expected `agent` or `operator`"),
+            "{warned:?}"
+        );
+        assert!(
+            warned.ends_with(" · help lists the default command set\n"),
+            "{warned:?}"
+        );
+
+        let scalar = TempConfig::new(
+            "answer-scalar",
+            "limits:\n  max_body_bytes: optoken-test-abc\n",
+        );
+        let (answer, warned) = ask_with(Some(&scalar.path), &explicit(&[]), NO_CATALOGUE_ENV);
+        assert!(page(&answer).starts_with("aitm 0.5.11 — "), "{answer:?}");
+        assert_eq!(warned.lines().count(), 1, "{warned:?}");
+        assert!(
+            !warned.contains("optoken"),
+            "the value is echoed: {warned:?}"
+        );
+        assert!(
+            warned.contains(": limits.max_body_bytes: invalid type: string \"…\", expected "),
+            "{warned:?}"
+        );
+    }
 }

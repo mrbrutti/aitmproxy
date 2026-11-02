@@ -1222,4 +1222,42 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
         }
         assert_eq!(verbs_seen, reg.commands().count());
     }
+
+    // ---- tester, wave-2 pass 2 (plan C45: curated group examples) ----
+
+    /// A group with its own catalogue entry (`check`, `scan`, `scope`) shows
+    /// exactly those lines — not the first example of each verb, so the
+    /// 41-verb `check` group is not reduced to four arbitrary probes — while
+    /// a group without one (`flow`) falls back to its verbs' first examples,
+    /// at most four, in registration order.
+    #[test]
+    fn curated_group_examples_win_over_the_verb_fallback() {
+        let described = registry_with("curated", CATALOGUE_ENV);
+        let reg = &described.registry;
+        for name in ["check", "scan", "scope"] {
+            let curated = examples_for(name);
+            assert!(!curated.is_empty(), "{name} has a curated entry");
+            let out = render(
+                &piped_utf8(),
+                &group(reg, name).unwrap_or_else(|| panic!("{name} is a group")),
+            );
+            let expected: Vec<String> = curated.iter().map(|line| format!("  $ {line}")).collect();
+            assert_eq!(block_lines(&out, "Examples:"), expected, "{name}");
+        }
+        assert!(examples_for("flow").is_empty(), "flow has no group entry");
+        let (_, cmds) = describe::groups(reg)
+            .into_iter()
+            .find(|(g, _)| g == "flow")
+            .expect("flow is a group");
+        assert!(cmds.len() > GROUP_EXAMPLES_MAX, "{}", cmds.len());
+        let out = render(&piped_utf8(), &group(reg, "flow").expect("flow is a group"));
+        let expected: Vec<String> = cmds
+            .iter()
+            .filter_map(|cmd| examples_for(cmd.name()).first())
+            .take(GROUP_EXAMPLES_MAX)
+            .map(|line| format!("  $ {line}"))
+            .collect();
+        assert_eq!(expected.len(), GROUP_EXAMPLES_MAX);
+        assert_eq!(block_lines(&out, "Examples:"), expected);
+    }
 }

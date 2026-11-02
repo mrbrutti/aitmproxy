@@ -2327,6 +2327,68 @@ mod tests {
         );
     }
 
+    /// Tester, wave-2 pass 2 (plan C32/C33, Task 15 item 5): the remaining
+    /// help forms classify as `Mode::Help` too — `-h`, `help <group> <verb>`,
+    /// `operator-token --help` — the request rides beside the split-off
+    /// `--script`/`--bus-endpoint-file`/terminal flags, which are not its
+    /// topic, and a help flag behind `web` skips `web::parse_args` (so a
+    /// valueless `--listen` is no error and `web_args` stays empty). The
+    /// argv an implicit request carries is what the splits left, which is
+    /// what the `NotHelp` fall-through continues with as `Mode::Cli`.
+    #[test]
+    fn help_mode_rides_with_the_split_flags_and_skips_the_web_parser() {
+        let parse = |argv: &[&str]| {
+            parse_invocation(args(argv))
+                .expect("parses")
+                .expect("something to run")
+        };
+        let topic_of = |mode: &Mode| -> Option<(Vec<String>, bool)> {
+            match mode {
+                Mode::Help(req) => Some((req.topic.clone(), req.explicit)),
+                _ => None,
+            }
+        };
+        assert_eq!(topic_of(&parse(&["-h"]).mode), Some((args(&[]), true)));
+        assert_eq!(
+            topic_of(&parse(&["help", "scope", "add"]).mode),
+            Some((args(&["scope", "add"]), true))
+        );
+        assert_eq!(
+            topic_of(&parse(&["operator-token", "--help"]).mode),
+            Some((args(&["operator-token"]), true))
+        );
+        // Behind `web`, the help flag wins before the web parser runs.
+        let web = parse(&["web", "--listen", "--help"]);
+        assert_eq!(topic_of(&web.mode), Some((args(&["web"]), true)));
+        assert!(web.web_args.is_none(), "{:?}", web.web_args);
+        // The split-off flags ride beside the request and are not its topic.
+        let split = parse(&[
+            "-q",
+            "--color=never",
+            "--script",
+            "/s.rhai",
+            "--bus-endpoint-file",
+            "/b.json",
+            "help",
+            "scpe",
+        ]);
+        assert_eq!(topic_of(&split.mode), Some((args(&["scpe"]), true)));
+        assert_eq!(split.script_args, vec![PathBuf::from("/s.rhai")]);
+        assert_eq!(split.bus_endpoint_file, Some(PathBuf::from("/b.json")));
+        assert_eq!(
+            split.term,
+            TermOpts {
+                verbosity: Verbosity::Quiet,
+                color: ColorChoice::Never,
+            }
+        );
+        let Mode::Help(req) = parse(&["--script", "/s.rhai", "scpe"]).mode else {
+            panic!("a single bare token is an implicit request");
+        };
+        assert!(!req.explicit);
+        assert_eq!(req.argv, args(&["scpe"]));
+    }
+
     /// Spec D9: the global terminal flags are split off first and ride in the
     /// invocation; the mode is classified from what is left.
     #[test]
