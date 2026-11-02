@@ -496,6 +496,10 @@ Kept by the main session during stage 6. One row per finding.
 | merge | Orchestrator | Note | main a2ab31c3 (#285) merged as c7575cdc; the branch's five new bounded `wait_terminal` calls dropped their `Duration` (11eb38ec); Task 5 rescoped per the paragraph above | done |
 | all | Orchestrator | Note | Wave A coders ran into each other's mid-TDD states (expected in one tree); whole-package reds during Wave A were the Task 3 casualty above, not regressions | noted |
 
+## Follow-up PR 3 (not in this PR; amendment 59, T3's 2b live run)
+
+`aitm-core/src/client.rs` builds every client-sent flow with `server_conn: None` because `RequestSender::send_with` returns only an `HttpResponse` and cannot report the peer it connected to, so no lane host can fill `baseline_peer_addr()` and the raw-h2 checks' DNS-rebinding guard (A5) never engages (T3 ships 2b with a gated name-resolution fallback + warn when the hook is `None`). PR 3: `HttpResponse` (or the sender result) gains `peer: Option<SocketAddr>`; `ProxyClient`/`send_opts` fills `server_conn.peer` from it; `HttpSender` (T3's crate) reports the connected peer; the interim lane and T2's lane fill `baseline_peer_addr()` from `server_conn.peer`. T1b owns the aitm-core half (D12), T3 the `HttpSender` hunk — the signature is agreed with T3 before coding. Tests: a client-sent flow carries the peer the sender connected to; `baseline_peer_addr()` on the interim host is `Some` after the baseline. Small, separate, right after PR 2.
+
 ## Shipped
 
 Filled at integration (stage 7): PR number and squash SHA, the four live-proof lines from
