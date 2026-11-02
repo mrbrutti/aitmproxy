@@ -441,7 +441,7 @@ Three reviewers on `<Part 2 tip>..<Part 3 tip>`.
 
 - **Satisfies:** AC37 (live)
 - **Files:** `docs/design/evidence/jobs-view-<date>/web/` (create)
-- **Change:** real core from the branch with `aitm web`, `aitm-testtarget-serve --latency-ms 400` and the dead port in scope; `node scripts/shot.mjs --url <operator URL>#scan/jobs --out <png> --wait 2500` (plus `--keys`/`--evalFile` to select rows) for running (auditing with the Now line), cancelled, and the dead-target done state; the concurrent `scan.status` JSON beside each; the frames show the same sentences as AC16. `apps/web/scripts/scan-live.mjs` is the witness-style driver to reuse where it fits.
+- **Change:** real core from the branch with `aitm web`, `aitm-testtarget-serve --latency-ms 400` and the dead port in scope; `apps/web/scripts/scan-live.mjs` is the driver (merged in #293, wrapped by the e2e cell `test_t8_web_live`): add Jobs-view steps to it for running (auditing with the Now line), cancelled, and the dead-target done state, each polling the terminal *state* from `scan.status` (never the rendered word; its step 03c races at phase boundaries) before the capture; `node scripts/shot.mjs --url <operator URL>#scan/jobs --out <png> --wait 2500` (plus `--keys`/`--evalFile`) only for stills; the concurrent `scan.status` JSON beside each; the frames show the same sentences as AC16.
 - **Done when:** folder committed, PR comment lists AC37's three states with frames.
 
 ---

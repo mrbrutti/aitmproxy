@@ -1050,9 +1050,11 @@ age clause `showing values from 42s ago`), Scan Again (no key is added; the
   one-shot verb table has no `scan.start`) appearing selected with nothing
   else selected;
   VoiceOver reading one row (a screen recording or the AX dump's label).
-  Web: the same states through `apps/web/scripts/shot.mjs --url <operator
-  URL> --out <png>` (headless Chrome against the real core; the T8 proof's
-  `scan-live.mjs` lived in a scratch worktree and is not in the repo). TUI:
+  Web: the same states through `apps/web/scripts/scan-live.mjs` (real web
+  app + real core + headless Chrome; merged in #293 and wrapped by the e2e
+  cell `test_t8_web_live`), extended with steps for the Jobs view states;
+  `scripts/shot.mjs` only for stills. Its step 03c races at phase
+  boundaries, so a new step polls the terminal *state*, never the word. TUI:
   a pty recording of the Jobs tab through the same job. The frames go to
   `docs/design/evidence/jobs-view-<date>/` in the PR.
 
@@ -1309,9 +1311,9 @@ row it closes.
     rule whose inline width is `50%` for `3236 / 6468`; Scan Again sends
     `scan.start` with `{ profile_name, overrides: { target: { origins } } }`
     (store test); `styles.test.ts` finds no literal colour, radius or `ms`
-    duration in `scanner.module.css`. Live: `scripts/shot.mjs` captures of
-    running, cancelled and the dead-target done states show the same
-    sentences as AC16.
+    duration in `scanner.module.css`. Live: `scripts/scan-live.mjs` (with
+    Jobs-view steps added) captures running, cancelled and the dead-target
+    done states showing the same sentences as AC16.
 38. **AC38 (W2, D18; unit).** The `ReconnectNote` text with `jobsLoadedAt`
     42 s old reads `Bus disconnected · showing values from 0:42 ago ·
     reconnecting…`; every control in the Jobs view is disabled while the bus
