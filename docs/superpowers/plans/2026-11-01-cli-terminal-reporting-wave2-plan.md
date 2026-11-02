@@ -602,8 +602,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix A | spec pass 2 | Minor | Sp7 the Sp3 example checker is more lenient than `parse_flags` (a Bool flag swallows any following token; values not type-checked) | fixed in 44083726: `aitm_cli::dispatch::check_flags(rest, cmd)` (shares `split_yes` + `parse_flags` with `Cli::dispatch`) replaces the hand-written flag loop; 12 negative cases; all 114 entries pass under the real parser — same item as Q13 |
 | fix A | spec pass 2 | Minor | Sp8 Review-log rows named "fix round A" instead of the SHA; Q5/Q12/Sp4 named no accepter | fixed in dfc1bb3b |
 | fix C | quality pass 4 | Minor | Q20 the `line` test closure is declared in three redaction tests | accepted by the session lead 2026-11-01 (autonomous mode): a three-line test helper; the reviewer rated it not worth a round |
-| fix C | spec pass 4 | Minor | Sp13 two pass-1 rows named no SHA (the C33 fix; the tester's tests) | fixed in 7ed4657c: ba82881b and c8c8035a named |
-| fix C | spec pass 4 | Minor | Sp14 the Q17 acceptance pinned a tag count that round C moved | fixed in 7ed4657c: the acceptance is the class, no count |
+| fix C | spec pass 4 | Minor | Sp13 two pass-1 rows named no SHA (the C33 fix; the tester's tests) | fixed in 2698a655: ba82881b and c8c8035a named |
+| fix C | spec pass 4 | Minor | Sp14 the Q17 acceptance pinned a tag count that round C moved | fixed in 2698a655: the acceptance is the class, no count |
 | fix B | spec pass 3 | Minor | Sp9 `check_flags` (and `group_of`) were public API recorded only in Review-log rows | fixed in 63ed1b50: Task 5's `pub` list, Task 10's test bullet and C31 amended |
 | fix B | spec pass 3 | Minor | Sp10 Review-log rows said "fixed in this commit" | fixed in 63ed1b50: SHAs 4f18fc41 / dfc1bb3b / add28b42 |
 | fix B | spec pass 3 | Minor | Sp11 = Q18 | fixed in add28b42 |
