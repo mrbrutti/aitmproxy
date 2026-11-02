@@ -1123,8 +1123,10 @@ crates/aitm-scan-http/
      then landed too, so the merged test is main's `lane_slots_count_the_landed_lanes` with the literal `3`
      (http, ws, l4_packet) in the merge of main (the integration-shared-file rule:
      each merging track bumps it, in merge order).
-  5. Contract check, no re-pin expected: `cargo test -p aitm --test frontends` passes with
-     `EXPECTED_TOOLS` untouched (T2 adds no verb); `cargo test -p aitm --test bundled_startup` and
+  5. Contract check (amended 2026-11-01): `cargo test -p aitm --test frontends` passes after
+     re-pinning `EXPECTED_TOOLS` and the TUI `CORE_TOOLS` for the interim lane's `check.<id>` verbs
+     that leave `tools/list` when the http slot becomes `Some` (T2 adds no verb of its own, so the
+     only movement is that removal; see the Review log); `cargo test -p aitm --test bundled_startup` and
      `cargo test -p aitm-plugin-rhai --test bundled_scripts` pass (T2 adds no check). Quote them.
   6. Full gate; quote the final `test result:` lines and `echo $?`.
   7. Real boot proof (Terminal): `cargo build -p aitm -p aitm-testtarget` then
