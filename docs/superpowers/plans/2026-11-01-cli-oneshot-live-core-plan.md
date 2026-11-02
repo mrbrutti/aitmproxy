@@ -216,6 +216,8 @@ Never touched: `crates/aitm/src/wire.rs`, `crates/aitm/src/tui.rs`, `crates/aitm
   - `unknown_liveness_counts_as_alive`: liveness closure returns `Unknown` → the pointer is chosen (dialing is T10's; here the `Target` is returned).
 - **Done when:** the tests pass under `cargo test -p aitm --offline --lib oneshot::resolve` and the `aitm` package gate passes.
 
+Note for Task 10 (from Task 8): `refuse::two_cores` compares config paths by raw equality while `resolve` prefers by canonical equality — pass canonicalized paths into `two_cores`, or canonicalize inside it, so a tie among symlinked-config pointers reads "Both", not "Neither". Unreadable/unparsable token configs and token files are R13/R14 (W1 `report_for` shape), added to spec D9.
+
 ### Task 10: `oneshot/remote.rs` and `oneshot/run.rs` — prepare, connect, call, confirm, render, the entry point
 
 - **Satisfies:** AC-R14-13/14/21/24/25 (the client half), spec D8.
