@@ -8,9 +8,9 @@
 //! `aitm::oneshot::run` — a local verb runs in-process, a live one on the
 //! running core (R14 spec D6/D8) — writes the rendered bytes to stdout, and
 //! exits. Invoked bare it starts the proxy accept loop and the MCP server
-//! (stdio or loopback-TCP per config),
-//! with the configured browser engine attached when it launches, and closes
-//! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
+//! (stdio or loopback-TCP per config), with the configured browser engine
+//! attached when it launches, and closes the browser on every orderly exit
+//! path including SIGINT/SIGTERM (spec §D6).
 //! Invoked as `aitm tui` it does the same but with the terminal operator UI in
 //! the process too, over an in-process bus channel (`aitm::tui`).
 //! `aitm web [--listen ADDR] [--token TOKEN] [--no-open]` is the server path
