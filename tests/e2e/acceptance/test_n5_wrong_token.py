@@ -9,8 +9,9 @@ supplied)` and stop retrying. N4-TUI / N4-WEB: `aitm tui` / `aitm web` started f
 while 8080 is held must print `cannot start: the proxy port 127.0.0.1:8080 is already in use.`
 before any screen and exit by themselves (read-only: a refused start changes nothing; the only
 process touched is the child this cell started). N5-WEB is judged by the web cell when `aitm web`
-runs (it owns the agent URL); here it is SKIP unless an `aitm` holds 8082. N5-CLI is CLI-6's
-one-shot refusal. SKIP when the app's core is not running. Steps → negatives-steps.tsv.
+runs (it owns the agent URL; spec D7 places it there), so this cell writes no N5-WEB row. N5-CLI
+is CLI-6's one-shot refusal: `N/A` here (spec D1). SKIP when the app's core is not running.
+Steps → negatives-steps.tsv.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import time
 
 E2E = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, E2E)
-from aitm_e2e.installed import INSTALLED_CLI, StepWriter, find_embedded_core, port_holder  # noqa: E402
+from aitm_e2e.installed import INSTALLED_CLI, StepWriter, exit_on_term, find_embedded_core, port_holder  # noqa: E402
 from aitm_e2e.tui_pty import Terminal  # noqa: E402
 
 OUT = os.environ.get("ACCEPT_OUT", "/tmp/claude/acceptance/n5")
@@ -34,7 +35,7 @@ REFUSAL = "bus refused the token: it matched neither the agent nor the operator 
 N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use."
 N4_HOLDER_LINE = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program."
 N4_LSOF = "Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN"
-EXPECTED_STEPS = ("N5-TUI", "N5-WEB", "N5-CLI", "N4-TUI", "N4-WEB")
+EXPECTED_STEPS = ("N5-TUI", "N5-CLI", "N4-TUI", "N4-WEB")
 
 w = StepWriter(os.path.join(OUT, "negatives-steps.tsv"), EXPECTED_STEPS)
 step = w.step
@@ -118,12 +119,8 @@ def n4_web() -> None:
 
 
 def main() -> int:
-    step("N5-CLI", "SKIP", "one-shot refusal is CLI-6's")
-    h8082 = port_holder(8082)
-    if h8082 and h8082.lower().startswith("aitm"):
-        step("N5-WEB", "SKIP", f"aitm web is on 8082 ({h8082}) but its agent URL is only known to the web cell; judged there")
-    else:
-        step("N5-WEB", "SKIP", "aitm web not running (judged in the web cell when it runs)")
+    exit_on_term()
+    step("N5-CLI", "N/A", "the one-shot refusal is CLI-6's row (no separate step on this surface)")
     try:
         core = find_embedded_core()
     except RuntimeError as e:

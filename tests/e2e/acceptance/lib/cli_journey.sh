@@ -7,10 +7,18 @@
 # Usage: cli_journey.sh <livecore|nocore|all> [outdir]      AITM=/opt/homebrew/bin/aitm by default
 #   livecore: CLI-4, CLI-5 (+ bus-side check and removal), CLI-7, CLI-9, CLI-10, N4-CLI, CLI-0
 #             — precondition: the app's core holds 8080
-#   nocore:   CLI-1, CLI-2, CLI-3, CLI-6, CLI-8                — precondition: 8080/8081/8082 free
+#   nocore:   CLI-1, CLI-2, CLI-3, CLI-6, CLI-8                — precondition: 8080/8081/8082 all free
+#             (checked before CLI-3; a serving `aitm` binds all three)
 # Every step writes $OUT/<id>.{out,err,exit}; a step line is `<id> <PASS|FAIL|SKIP|BLOCKED> <detail>`;
 # $OUT/../cli-steps.tsv gets the report rows (any id of the half not reached: `SKIP not reached`).
 # Exit 0 = all performed PASS, 77 = a SKIP/BLOCKED, 1 = a FAIL.
+#
+# CLI-9 `set` (spec Constraints "Bypass is a precondition, not a promise", D9): the one-shot passes
+# the operator's config.yaml `system_proxy.bypass`, so `set` runs only when that list names his
+# tooling (installed.tooling_mentioned on installed.config_bypass), else SKIP `bypass list absent in
+# config.yaml system_proxy.bypass`; after the flip `scutil --proxy`'s ExceptionsList must carry them
+# (installed.bypass_applied, whole entries) or the cell restores at once (`unset`, then the trap)
+# and records FAIL `bypass not applied`.
 #
 # The hosts CLI-5/CLI-6 add are `acceptance-cli5.invalid` / `acceptance-cli6.invalid`: `.invalid`
 # is reserved (RFC 2606), so a one-shot that DOES reach the running core can never touch a host
@@ -59,15 +67,19 @@ if core is None:
 print(json.dumps(connect(core).call(sys.argv[2], {}), separators=(",", ":")))
 PY
 }
+# installed.<fn>(...) through the shared module; prints the function's return (never a token).
+py_installed() { python3 -c "import sys; sys.path.insert(0, sys.argv[1]); from aitm_e2e import installed; sys.argv = sys.argv[1:]; $1" "$e2e" "${@:2}" 2>/dev/null; }
 h8080=$(holder 8080)
+held=""   # "port N held by X" for the first busy default port (the no-core half needs all three free)
+for p in 8080 8081 8082; do hp=$(holder "$p"); if [ -n "$hp" ]; then held="port $p held by $hp"; break; fi; done
 
 echo "mode: $MODE   aitm: $AITM -> $(readlink "$AITM" 2>/dev/null || echo "$AITM")   HOME: $HOME"
-echo "8080 holder: ${h8080:-none}"; echo
+echo "8080 holder: ${h8080:-none}   default ports: ${held:-all free}"; echo
 
 # ---------------------------------------------------------------- nocore half
 if want nocore; then
-  if [ -n "$h8080" ]; then
-    for id in CLI-1 CLI-2 CLI-3 CLI-6 CLI-8; do res "$id" SKIP "port 8080 held by $h8080; the no-core half needs the ports free"; done
+  if [ -n "$held" ]; then
+    for id in CLI-1 CLI-2 CLI-3 CLI-6 CLI-8; do res "$id" SKIP "$held; the no-core half needs 8080, 8081 and 8082 free"; done
   else
     # CLI-1 --version: one line `aitm <version>`, exit 0, nothing else on either stream (required: #271).
     run CLI-1 10 "$AITM" --version; rc=$?
@@ -156,8 +168,12 @@ if want livecore; then
     run CLI-9-status 10 "$AITM" proxy system status; rc9=$?
     st_bus=$(bus_json proxy.system.status | head -c 200)
     st_cli=$(clean "$OUT/CLI-9-status.out" | grep -oE '"(state|managed_by_us)": *[^,}]+' | tr '\n' ' ' | head -c 120)
+    byp=$(py_installed 'print(", ".join(installed.config_bypass()))')
     if ! yes_has CLI-9; then
       res CLI-9 SKIP "status read (exit $rc9: ${st_cli:-no state/managed_by_us in the output}); set/unset need Matt's yes (ACCEPT_YES=CLI-9)" "proxy.system.status over the bus: ${st_bus:-unreadable}"
+    elif [ "$(py_installed 'print("yes" if installed.tooling_mentioned(installed.config_bypass()) else "no")')" != yes ]; then
+      # The precondition (spec Constraints): the one-shot passes config.yaml's system_proxy.bypass; without the tooling in it, no flip.
+      res CLI-9 SKIP "bypass list absent in config.yaml system_proxy.bypass (${byp:-none}); add the operator's tooling there first — status read (exit $rc9: ${st_cli:-no state/managed_by_us}); set/unset not run" "proxy.system.status over the bus: ${st_bus:-unreadable}"
     else
       rec="$OUT/CLI-9-before.json"
       python3 -c "import sys; sys.path.insert(0, sys.argv[1]); from aitm_e2e.installed import record_state_file; record_state_file(sys.argv[2])" "$e2e" "$rec"
@@ -169,13 +185,18 @@ if want livecore; then
       sc_set=$(scutil --proxy)
       refusal=$(clean "$OUT/CLI-9-set.err" "$OUT/CLI-9-set.out" 2>/dev/null | grep -m1 -E 'needs a running core|no running core' | head -c 160)
       if [ "$sc_set" != "$sc_before" ]; then
-        if echo "$sc_set" | grep -q 'HTTPPort : 8080' && echo "$sc_set" | grep -qE '\*\.anthropic\.com|claude\.ai|github\.com'; then set_ok=1; else set_ok=0; fi
-        run CLI-9-unset 15 "$AITM" proxy system unset; rcu=$?
+        # Judge the flip: points at 8080 AND the ExceptionsList carries the tooling as whole entries (installed.bypass_applied).
+        applied=$(printf '%s' "$sc_set" | py_installed 'print("yes" if installed.bypass_applied(sys.stdin.read()) else "no")')
+        if echo "$sc_set" | grep -q 'HTTPPort : 8080'; then at_us=1; else at_us=0; fi
+        run CLI-9-unset 15 "$AITM" proxy system unset; rcu=$?   # restore at once, whatever the judgement; the trap replays if this left a difference
         sc_after=$(scutil --proxy)
-        if [ "$set_ok" = 1 ] && [ "$sc_after" = "$sc_before" ]; then
-          res CLI-9 PASS "status exit $rc9 (${st_cli}); set acted on the Mac (8080 + bypass), unset restored it byte for byte" "proxy.system.status before ${st_bus}; after $(bus_json proxy.system.status | head -c 120)"
+        same_after=$([ "$sc_after" = "$sc_before" ] && echo yes || echo NO)
+        if [ "$applied" != yes ]; then
+          res CLI-9 FAIL "bypass not applied: set changed scutil (points at 8080: $at_us) but the ExceptionsList lacks the tooling hosts; restored at once (unset exit $rcu, scutil identical to before: $same_after$([ "$same_after" = NO ] && echo ' — the trap replays'))" "$(echo "$sc_set" | tr '\n' ' ' | head -c 200)"
+        elif [ "$at_us" = 1 ] && [ "$same_after" = yes ]; then
+          res CLI-9 PASS "status exit $rc9 (${st_cli}); set acted on the Mac (8080, ExceptionsList carries the tooling), unset restored it byte for byte" "proxy.system.status before ${st_bus}; after $(bus_json proxy.system.status | head -c 120)"
         else
-          res CLI-9 FAIL "set changed scutil (points at 8080 with bypass: $set_ok); unset exit $rcu, scutil identical to before: $([ "$sc_after" = "$sc_before" ] && echo yes || echo NO — the trap replays)" "$(echo "$sc_set" | tr '\n' ' ' | head -c 200)"
+          res CLI-9 FAIL "set changed scutil (points at 8080: $at_us, bypass applied: yes); unset exit $rcu, scutil identical to before: $same_after$([ "$same_after" = NO ] && echo ' — the trap replays')" "$(echo "$sc_set" | tr '\n' ' ' | head -c 200)"
         fi
       elif [ -n "$refusal" ] && [ "$rcs" != 0 ]; then
         res CLI-9 PASS "status exit $rc9 (${st_cli}); set refused honestly: $refusal; scutil unchanged (unset not run: nothing was set)" "proxy.system.status over the bus ${st_bus}" "claude/cli-oneshot-live-core (the live-core requirement)"
