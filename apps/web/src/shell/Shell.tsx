@@ -108,7 +108,11 @@ export const Shell: Component = () => {
       <Sidebar class={css.sidebar!} />
       <section class={css.main}>
         <Toolbar />
-        <RoleBanner />
+        {/* RoleBanner is a fragment of 0–2 banners; the always-present wrapper pins them to one
+            `auto` row of .main so the chip bar, filter row and body never shift down a row. */}
+        <div class={css.banners}>
+          <RoleBanner />
+        </div>
         <ChipBar />
         <Show when={app.ui.filtersOpen} fallback={<div />}>
           <FilterBar />

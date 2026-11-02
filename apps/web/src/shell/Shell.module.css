@@ -1,4 +1,4 @@
-/* The shell (§2.6): sidebar 240 | main; main = toolbar 44 / chip bar 36 / [filter bar] / body;
+/* The shell (§2.6): sidebar 240 | main; main = toolbar 44 / [role banners] / chip bar 36 / [filter bar] / body;
    status bar 28 spans the full width. The body is list (+ intercept bar) | splitter | lower. */
 .app {
   height: 100%;
@@ -32,9 +32,13 @@
 .main {
   grid-row: 1 / 2;
   display: grid;
-  grid-template-rows: var(--size-toolbar) var(--size-filter-bar) auto minmax(0, 1fr);
+  /* toolbar / banners (0 high when none) / chip bar / filter bar or its empty placeholder / body */
+  grid-template-rows: var(--size-toolbar) auto var(--size-filter-bar) auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+}
+.banners {
+  min-width: 0;
 }
 
 .body {
