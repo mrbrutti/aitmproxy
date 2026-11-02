@@ -86,6 +86,9 @@ impl XssReflected {
                     InsertionKind::XmlValue,
                     InsertionKind::MultipartValue,
                     InsertionKind::Header,
+                    // A cookie value printed into the page (the seeded `/prefs`
+                    // theme, AC T2-3; T2's live run, 2026-11-01).
+                    InsertionKind::Cookie,
                     InsertionKind::PathSegment,
                     InsertionKind::ParamNameQuery,
                 ],
@@ -97,6 +100,7 @@ impl XssReflected {
                 needs_baseline: false,
                 wants_traits: None,
                 targets_session: false,
+                scope: aitm_scan_model::CheckScope::Point,
                 cwe: Some(79),
                 description: "Places a job-unique canary at the point in three HTML contexts \
                               and reports when it is reflected verbatim into an HTML \
@@ -404,6 +408,8 @@ fn reflected(
                 }))],
             }),
         }),
+        location: None,
+        more: Vec::new(),
     }
 }
 

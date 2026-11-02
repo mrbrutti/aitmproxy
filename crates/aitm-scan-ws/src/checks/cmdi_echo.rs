@@ -20,9 +20,9 @@
 use std::sync::{Arc, OnceLock};
 
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, FlowRef, InsertionKind,
-    InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, Technique,
-    Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, FlowRef,
+    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost,
+    Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -67,6 +67,7 @@ fn meta() -> &'static CheckMeta {
         needs_baseline: false,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: Some(78),
         description: "Replaces a WebSocket field with shell command separators wrapping \
                       `echo <marker>` and reports the field as command-injectable when a reply \
@@ -133,6 +134,8 @@ impl Check for CmdiEcho {
                         // describe a reproduction the runner cannot run
                         // (plan call 19).
                         poc_hint: None,
+                        location: None,
+                        more: Vec::new(),
                     };
                 }
             }
@@ -147,6 +150,8 @@ impl Check for CmdiEcho {
                 detail: "no reply carried the marker without the payload that asked for it"
                     .to_string(),
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             }
         })
     }

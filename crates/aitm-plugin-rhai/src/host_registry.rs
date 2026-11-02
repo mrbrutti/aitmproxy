@@ -38,11 +38,12 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use aitm_core::{CallerTrust, Value};
 use aitm_plugin::language::{
-    GuardHandle, Guarded, HostCallContextSource, HostCallCtx, HostError, HostFn, ProtocolLanguage,
-    RegisterError, ScriptHostRegistry,
+    GuardHandle, Guarded, HostCallContextSource, HostCallCtx, HostError, HostFn, HostRunKind,
+    ProtocolLanguage, RegisterError, ScriptHostRegistry,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Module, NativeCallContext, Position};
 
+use crate::engine::{current_run, RunKind};
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
 
 /// The most positional arguments a `<ns>.fn(...)` call may take. Each method
@@ -463,6 +464,21 @@ impl HostCallContextSource for RhaiCallSource {
 
     fn call_source(&self) -> &str {
         &self.call_source
+    }
+
+    /// The run kind of the eval making this call, read from the thread-local run
+    /// the dispatcher opened ([`current_run`]) and mapped variant-for-variant, so
+    /// a seam guard can gate on it (D8.3: `ws.*` refuses `Some(HostRunKind::Hook)`).
+    /// `None` outside any run — exactly the conservative "cannot tell" the trait
+    /// default gives.
+    fn run_kind(&self) -> Option<HostRunKind> {
+        current_run().map(|kind| match kind {
+            RunKind::Hook => HostRunKind::Hook,
+            RunKind::Load => HostRunKind::Load,
+            RunKind::Command => HostRunKind::Command,
+            RunKind::Check => HostRunKind::Check,
+            RunKind::PocStep => HostRunKind::PocStep,
+        })
     }
 }
 

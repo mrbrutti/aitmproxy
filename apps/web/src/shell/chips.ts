@@ -1,5 +1,5 @@
-// The chip bar's order (§2.7): `All | HTTP HTTPS WebSocket | h1 h2 | JSON Form XML JS CSS GraphQL
-// Document Media Other`. ⌘1…⌘9 select the first nine.
+// The chip bar's order (§2.7; L4 parity §7(c)): `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 |
+// JSON Form XML JS CSS GraphQL Document Media Other`. ⌘1…⌘9 select the first nine (⌘5 is TCP).
 import type { Chip } from '~/state/app';
 
 export interface ChipDef {
@@ -14,6 +14,9 @@ export const CHIPS: readonly ChipDef[] = [
   { id: 'http', label: 'HTTP', group: true },
   { id: 'https', label: 'HTTPS' },
   { id: 'ws', label: 'WebSocket' },
+  { id: 'tcp', label: 'TCP', group: true },
+  { id: 'udp', label: 'UDP' },
+  { id: 'l4', label: 'L4' },
   { id: 'h1', label: 'h1', group: true },
   { id: 'h2', label: 'h2' },
   { id: 'json', label: 'JSON', group: true },

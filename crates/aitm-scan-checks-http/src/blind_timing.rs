@@ -135,6 +135,7 @@ pub fn sqli_time() -> Arc<dyn Check> {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
+            scope: aitm_scan_model::CheckScope::Point,
             cwe: Some(89),
             description: "Asks the database for a bounded pause through the point, in an \
                           alternating long/short schedule, and reports when the observed \
@@ -190,6 +191,7 @@ pub fn cmdi_time() -> Arc<dyn Check> {
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
+            scope: aitm_scan_model::CheckScope::Point,
             cwe: Some(78),
             description: "Asks the operating system for a bounded pause through the point, \
                           in an alternating long/short schedule, and reports when the \
@@ -289,7 +291,13 @@ fn tracked(
         confidence: Confidence::Firm,
         evidence: Evidence {
             payload: Some(payload),
-            timing: Some(timing),
+            // The fitter makes no claim; this check did (`correlated(&timing)`
+            // held), so the evidence says so for the reader (spec D8.2,
+            // coordinator decision 2).
+            timing: Some(Timing {
+                correlated: true,
+                ..timing
+            }),
             probe_flows,
             baseline_flow,
             ..Evidence::default()
@@ -298,6 +306,8 @@ fn tracked(
         // A blind differential has no stable response assertion to reproduce, so
         // no PoC hint and no `FindingRecord` (spec D6).
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
@@ -340,12 +350,21 @@ impl Check for TimingCheck {
             // than by the job stopping. They cost their probes and taught
             // nothing, so they may not be counted as a quiet target.
             let mut abandoned = 0usize;
+            // Families whose first probe the server answered with a 5xx. The
+            // payload breaks the query rather than delaying it — the
+            // error-based check's finding — and every further delay probe
+            // would be one more server error for a host whose error ladder
+            // the job shares with every other check (live run 2026-11-01).
+            let mut errored = 0usize;
+            // Which probe of its schedule the last such family broke on.
+            let mut errored_at: Option<usize> = None;
 
             for family in families {
                 let mut requested: Vec<f32> = Vec::with_capacity(delays.len());
                 let mut observed: Vec<u32> = Vec::with_capacity(delays.len());
                 let mut probe_flows: Vec<FlowRef> = Vec::new();
                 let mut refused_here = 0usize;
+                let mut attempted_here = 0usize;
 
                 for delay in delays {
                     if !may_send(host, 1) {
@@ -359,6 +378,7 @@ impl Check for TimingCheck {
                         bytes: None,
                     };
                     tally.attempted();
+                    attempted_here += 1;
                     let Ok(resp) = host.probe(&payload).await else {
                         // One refused probe is not a verdict, but it does cost
                         // this family its complete series.
@@ -366,6 +386,13 @@ impl Check for TimingCheck {
                         refused_here += 1;
                         continue;
                     };
+                    if crate::gate::is_server_error(&resp) {
+                        errored += 1;
+                        errored_at = Some(attempted_here);
+                        // The rest of this family leaves the plan on purpose.
+                        tally.skipped(delays.len().saturating_sub(attempted_here));
+                        break;
+                    }
                     requested.push(delay);
                     observed.push(resp.elapsed_ms);
                     probe_flows.extend(resp.flow);
@@ -389,6 +416,25 @@ impl Check for TimingCheck {
 
             if let Some(unfinished) = tally.unfinished() {
                 return unfinished;
+            }
+            if errored > 0 {
+                let was = if errored == 1 { "was" } else { "were" };
+                let on = match errored_at {
+                    Some(probe) if errored == 1 => {
+                        format!(" (on probe {probe} of {})", delays.len())
+                    }
+                    Some(probe) => format!(" (the last on probe {probe} of {})", delays.len()),
+                    None => String::new(),
+                };
+                return no_finding(
+                    Outcome::Inconclusive,
+                    format!(
+                        "{errored} of {total} payload families {was} abandoned after a 5xx answer{on}: \
+                         the payload breaks the query rather than delaying it, which is the \
+                         error-based check's territory, so no delay was measured for them",
+                        total = families.len()
+                    ),
+                );
             }
             // Every probe the plan asked for was sent, but a family that lost
             // one of them was never fitted. `Clean` would claim the response

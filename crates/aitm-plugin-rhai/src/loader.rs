@@ -26,6 +26,8 @@ use std::sync::Arc;
 
 use aitm_core::CallerTrust;
 use aitm_plugin::language::ProtocolLanguage;
+use aitm_scan_model::registry::CheckRegistry;
+use aitm_scan_model::vocab::CheckOrigin;
 use rhai::{Dynamic, Engine, ParseError, ParseErrorType, AST};
 
 use crate::command::register_reg_api;
@@ -38,6 +40,7 @@ use crate::host_core::{
     FindingCapability, LogCapability, Options, ScriptCapability, ScriptServices,
 };
 use crate::host_net::{BrowserCapability, HttpCapability, ScopeCapability, StoreCapability};
+use crate::host_probe::ProbeCapability;
 use crate::plugin::{ErrorSink, LoadedScript};
 use crate::poc_step::VarsCapability;
 use crate::prelude::register_prelude;
@@ -107,6 +110,11 @@ pub struct RhaiLoader {
     /// Shared by every plugin this loader yields; the wiring binds the chain
     /// into it once the chain exists (see [`ErrorSink`]).
     errors: Arc<ErrorSink>,
+    /// The catalogue every script's `reg.add_check` lands in, read by the
+    /// scanner engine when it builds a job's check list (spec D9.3). One per
+    /// loader, shared with each script it loads, so a `script.reload` swaps
+    /// exactly that script's checks (plan call B9).
+    checks: Arc<CheckRegistry>,
 }
 
 impl RhaiLoader {
@@ -197,6 +205,7 @@ impl RhaiLoader {
             cfg,
             capabilities: cap_requirements,
             errors: Arc::default(),
+            checks: Arc::new(CheckRegistry::new()),
         })
     }
 
@@ -209,6 +218,12 @@ impl RhaiLoader {
     /// binds the chain into it once built.
     pub fn error_sink(&self) -> Arc<ErrorSink> {
         Arc::clone(&self.errors)
+    }
+
+    /// The check catalogue this loader's scripts register into. The host hands
+    /// the same handle to the scanner, which reads a snapshot per job.
+    pub fn checks(&self) -> Arc<CheckRegistry> {
+        Arc::clone(&self.checks)
     }
 
     /// The services the host surface was registered against, so the PoC step
@@ -299,6 +314,7 @@ impl RhaiLoader {
         // (commands.rs). Persisting TRUE operator authorship across restart is a
         // separate follow-up (spec Open-Q 1).
         .with_authoring_trust(CallerTrust::Agent)
+        .with_checks(Arc::clone(&self.checks), check_origin(&entry.path))
         .with_error_sink(Arc::clone(&self.errors)))
     }
 
@@ -582,6 +598,23 @@ fn decode_string(b: &[u8], start: usize) -> Option<(String, usize)> {
     }
 }
 
+/// Where a script's checks came from (plan call B17): `bundled` when the path
+/// runs through a `bundled` directory — the catalogue shipped with aitmproxy —
+/// and `custom` otherwise, which is every script an operator placed. A script
+/// never declares this itself; `scan.checks` shows it so an operator can tell
+/// a shipped detection from one of their own.
+fn check_origin(path: &Path) -> CheckOrigin {
+    let bundled = path
+        .components()
+        .any(|part| part.as_os_str() == std::ffi::OsStr::new("bundled"));
+    let path = path.display().to_string();
+    if bundled {
+        CheckOrigin::Bundled { path }
+    } else {
+        CheckOrigin::Custom { path }
+    }
+}
+
 /// The providers M3 ships (spec §6a). A namespace missing from this list does
 /// not exist for scripts. `browser` decides SSRF under the host's policy and
 /// `scope.add` is offered only when the config allows it.
@@ -597,6 +630,9 @@ fn m3_capabilities(cfg: &RhaiConfig) -> Vec<Arc<dyn ScriptCapability>> {
         Arc::new(BrowserCapability::new(cfg.ssrf.clone())),
         Arc::new(StoreCapability),
         Arc::new(ScopeCapability::new(cfg.allow_scope_add)),
+        // `probe.*`: refused outside a check closure, so adding it here widens
+        // nothing for a hook, a command or a PoC step (spec D4).
+        Arc::new(ProbeCapability),
         Arc::new(VarsCapability),
         // Pure prelude helpers (encode / hash / match / random); always offered,
         // no services, no guard (see `crate::dsl`).

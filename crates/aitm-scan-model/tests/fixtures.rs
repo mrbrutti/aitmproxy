@@ -14,9 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aitm_scan_model::{
-    builtin, Canary, CanaryMethod, CheckOrigin, ChecksResult, InsertionKind, Issue, IssueStatus,
-    JobEvent, JobNotification, JobState, ListResult, ProfileDeleteResult, ProfileListResult,
-    ProfileSaveResult, ScanProfile, SessionProfile, SitemapResult, StartResult,
+    builtin, Canary, CanaryMethod, CheckOrigin, CheckScope, ChecksResult, InsertionKind, Issue,
+    IssueStatus, JobEvent, JobNotification, JobState, ListResult, ProfileDeleteResult,
+    ProfileListResult, ProfileSaveResult, ScanProfile, SessionProfile, SitemapResult, StartResult,
     BUILTIN_PROFILE_NAMES, JOB_KIND_SCAN,
 };
 
@@ -176,6 +176,14 @@ fn every_fixture_parses_into_its_model_type() {
                     .iter()
                     .any(|c| matches!(c.origin, CheckOrigin::Custom { .. })),
                 "a custom check is present"
+            );
+            // Tester (T1b Task 1): the one entry carrying `"scope": "origin"`
+            // reads as `Origin`; the two without the key read as the `Point`
+            // default, so a pre-T1b catalogue entry schedules as it always did.
+            let scopes: Vec<CheckScope> = r.checks.iter().map(|c| c.scope).collect();
+            assert_eq!(
+                scopes,
+                vec![CheckScope::Point, CheckScope::Point, CheckScope::Origin]
             );
         }),
         ("scan.profile.list.json", |s| {

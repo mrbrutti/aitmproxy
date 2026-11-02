@@ -1,0 +1,18 @@
+listen: "127.0.0.1:8290"
+mcp:
+  transport:
+    loopback_tcp:
+      port: 18290
+      token: <redacted>
+  operator_token: <redacted>
+browser:
+  proxy_addr: "127.0.0.1:8291"
+  obscura:
+    binary: "/Applications/Aitmproxy.app/Contents/Resources/core/obscura"
+scope:
+  entries:
+    - "127.0.0.1:8097"
+l4:
+  enabled: true
+findings:
+  dir: "/tmp/claude/t9-ext/findings"

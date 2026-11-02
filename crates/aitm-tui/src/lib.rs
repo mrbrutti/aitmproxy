@@ -286,6 +286,52 @@ pub const CORE_TOOLS: &[&str] = &[
     "scan.passive",
     // Scanner plugin (Stage 2): findings report + index over recorded findings (Read).
     "scan.report",
+    // Scanner v2 (spec 2026-10-31-aitmproxy-scanner-v2-design, D3): the job verb
+    // family. `scan.start` is Sensitive; `scan.map`, `scan.cancel` and the profile
+    // mutators are Write; the rest are Read.
+    "scan.start",
+    "scan.map",
+    "scan.status",
+    "scan.list",
+    "scan.cancel",
+    "scan.issues",
+    "scan.issue",
+    "scan.issue.update",
+    "scan.sitemap",
+    "scan.checks",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.profile.save",
+    "scan.profile.delete",
+    "scan.session.preview",
+    // One manual verb per registered check (D3 `check.<id>`): the ten T3 natives
+    // (PR 2a) and the interim HTTP lane's three passive checks. The three interim
+    // passive ids go away with T2's integration.
+    "check.xss-reflected",
+    "check.open-redirect",
+    "check.sqli-boolean",
+    "check.sqli-time",
+    "check.cmdi-time",
+    "check.h2-settings-observe",
+    "check.h2-pseudo-header-validation",
+    "check.h2-header-crlf-tolerance",
+    "check.h2-cl-te-downgrade-indicator",
+    "check.h2-rapid-reset-mitigation",
+    "check.reflection",
+    "check.security-header",
+    "check.cookie-flag",
+    // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
+    // manual verb.
+    "check.cswsh",
+    "check.ws-auth-bypass-handshake",
+    "check.ws-cmdi-echo",
+    "check.ws-input-reflection",
+    "check.ws-oversize-frame",
+    "check.ws-sql-error",
+    "check.ws-ssti",
+    "check.ws-subprotocol-observe",
+    "check.l4-packet-crash",
+    "check.l4-packet-reaction",
 ];
 
 /// An [`App`] for in-crate tests: `cols`×`rows`, connected to a bus that

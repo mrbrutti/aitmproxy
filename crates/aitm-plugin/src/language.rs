@@ -112,6 +112,35 @@ pub trait HostCallContextSource {
     /// A short label for where the call originated (for `finding` provenance and
     /// diagnostics).
     fn call_source(&self) -> &str;
+
+    /// Which kind of script run is calling, if the source can tell. A guard that
+    /// must refuse a particular run kind (D8.3: `ws.*` refusing a flow hook)
+    /// checks for `Some(HostRunKind::Hook)`; `None` means the source cannot tell
+    /// and the guard decides conservatively. The default returns `None`, so a
+    /// source that does not track the run kind (a PoC step, a test stub) compiles
+    /// unchanged.
+    fn run_kind(&self) -> Option<HostRunKind> {
+        None
+    }
+}
+
+/// Which kind of script run is driving a seam host call. The rhai engine maps
+/// its own run kind onto this (`aitm-plugin-rhai`'s `RhaiCallSource::run_kind`)
+/// so a protocol guard can gate on the run kind without a rhai dependency — a
+/// `ws.*` guard refuses `Some(HostRunKind::Hook)`, a scanner probe recognises
+/// `Some(HostRunKind::Check)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRunKind {
+    /// A flow hook (`on_request`, …).
+    Hook,
+    /// A script's `load(reg)` at startup.
+    Load,
+    /// A script-registered command invoked from a frontend.
+    Command,
+    /// A scanner check's `run`.
+    Check,
+    /// A PoC `script` step.
+    PocStep,
 }
 
 /// The per-invocation context threaded through every seam [`HostFn`] and
@@ -146,6 +175,12 @@ impl<'a> HostCallCtx<'a> {
     /// The call's origin label, delegated to the [`HostCallContextSource`].
     pub fn call_source(&self) -> &str {
         self.ctx.call_source()
+    }
+
+    /// Which kind of script run is calling, delegated to the
+    /// [`HostCallContextSource`] (`None` when the source cannot tell).
+    pub fn run_kind(&self) -> Option<HostRunKind> {
+        self.ctx.run_kind()
     }
 }
 
