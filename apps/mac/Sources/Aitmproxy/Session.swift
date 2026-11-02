@@ -198,6 +198,16 @@ final class Session {
     /// Scope adds the operator typed that the core has not listed yet: sending, queued for
     /// replay after a core restart, or failed with the core's reason (S-081).
     var scopeAdds = ScopeAddQueue()
+    /// The macOS system proxy's endpoint half as the core reports it: the facts' `state`, one source
+    /// (`BusService.refreshProxyStatus()` and the set/unset replies write the facts; Session+SystemProxy.swift).
+    /// nil = unknown (never rendered as off): no facts, or a verb word that names no endpoint
+    /// (traffic-route spec D6, plan call 4). `ConnectionSummary.make` keeps a separate `systemProxy:`
+    /// parameter for a CFNetwork read this app does not make.
+    var systemProxy: SystemProxyState? { systemProxyFacts?.state }
+    /// `proxy.status.decrypt` as last polled (traffic-route spec D6): how many hosts Scope decrypts and the
+    /// core's own empty-Scope sentence. nil until the first live read or on an older core; `make` ignores
+    /// it while the bus lane is not `.ok`, so no reset on disconnect is needed.
+    var decrypt: DecryptStatus?
     var findingsCount = 0
     var browserTabs = 0
     var activeScripts = 0
@@ -228,6 +238,33 @@ final class Session {
     @ObservationIgnored var actions: any FlowActions = OfflineActions()
     /// The last failed action, shown in the status bar until the next one succeeds.
     var lastError: String?
+
+    // MARK: CA trust (spec D17; the actions live in Session+CATrust.swift)
+
+    /// The last `ca.status` read-back: the poll's first tick and every 10th, and forced after
+    /// every trust change. `nil` until read, and again while the bus is down.
+    var caStatus: CAStatus?
+    /// A `ca.install` / `ca.uninstall` call is in flight; `CATrustFacts.installing` reads it.
+    var caTrustInstalling = false
+    /// The last change came back `HeadlessAuth` (macOS) or `NeedsRoot` (Linux).
+    var caTrustNeedsAdmin = false
+    /// The last change's failure other than a cancelled dialog, with the verb it came from. The CA
+    /// panel shows it until a `ca.status` read-back says that verb's end state holds
+    /// (`CATrustFailure.resolved(by:)`, applied in `refreshCAStatus`), a later change succeeds or
+    /// is cancelled, or the bus goes (`forgetCATrust`).
+    var caTrustLastError: CATrustFailure?
+    /// The first-run sheet (Shell/SetupSheet.swift) is up.
+    var setupSheetVisible = false
+
+    // MARK: System proxy (spec 2026-10-31-system-proxy-automation §D13; the actions live in Session+SystemProxy.swift)
+
+    /// The verb's compact object from the last `proxy.status`, or the last full `proxy.system.status` /
+    /// set / unset reply (the same keys plus `guidance` and `remedy`). nil until read and while the bus
+    /// is down (`forgetSystemProxy`); `systemProxy` is its endpoint half.
+    var systemProxyFacts: SystemProxyFacts?
+    /// A `proxy.system.set` / `unset` call is in flight from THIS app. The facts' `setting` is another
+    /// client's change; `systemProxyControlLive` closes the controls for either.
+    var systemProxySetting = false
 
     init() {
         pins = Pins.load(from: pinsURL)
@@ -337,12 +374,10 @@ final class Session {
     /// Bumped whenever `rows` or `details` change, so the cache knows.
     @ObservationIgnored private var rowsVersion = 0
 
-    /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first.
-    var clients: [(ClientInfo, Int)] {
-        var counts: [ClientInfo: Int] = [:]
-        for row in rows { if let c = row.client { counts[c, default: 0] += 1 } }
-        return counts.sorted { $0.value == $1.value ? $0.key.name < $1.key.name : $0.value > $1.value }
-    }
+    /// Clients and hosts for the sidebar's Apps / Domains groups, most flows first. Clients are the
+    /// Kit's one grouping rule (by `groupKey`, icons plan Task 2) so the Apps header equals the
+    /// Overview tile.
+    var clients: [(ClientInfo, Int)] { ClientTree.clients(in: rows) }
 
     var hosts: [(String, Int)] {
         var counts: [String: Int] = [:]
@@ -388,27 +423,16 @@ final class Session {
         self.group = group
     }
 
-    func pin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.pinHost(h)
-        case .client(let c): pins.pinApp(c)
-        }
-    }
+    // Group → pin mapping lives in the Kit (`Pins.pin/unpin/contains(_ group:)`, icons plan Task 2):
+    // `.host`/`.clientHost` pin the host, `.client` pins the app by its group key.
+    func pin(_ group: FlowGroup) { pins.pin(group) }
 
     func unpin(_ group: FlowGroup) {
-        switch group {
-        case .host(let h): pins.unpinHost(h)
-        case .client(let c): pins.unpinApp(c)
-        }
+        pins.unpin(group)
         if self.group == group { self.group = nil }
     }
 
-    func isPinned(_ group: FlowGroup) -> Bool {
-        switch group {
-        case .host(let h): pins.hosts.contains(h)
-        case .client(let c): pins.apps.contains(c)
-        }
-    }
+    func isPinned(_ group: FlowGroup) -> Bool { pins.contains(group) }
 
     // MARK: Intents — state (the actions live in Session+Verbs.swift)
 

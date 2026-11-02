@@ -346,7 +346,9 @@ def main() -> int:
         hdrs = a.get("headers") if isinstance(a.get("headers"), dict) else {}
         expect(a.get("authority") == target, "authority survives verbatim", a.get("authority"))
         expect(a.get("method") == "POST", "method survives verbatim", a.get("method"))
-        expect(hdrs.get("X-Audit-Marker") == marker, "non-secret header X-Audit-Marker survives verbatim", hdrs)
+        expect(hdrs.get("X-Audit-Marker") == KEY_REDACTED,
+               f"non-benign header X-Audit-Marker has its value hidden as {KEY_REDACTED} (rule D)", hdrs)
+        expect("X-Audit-Marker" in hdrs, "the name X-Audit-Marker is still present", hdrs)
         expect(hdrs.get("Content-Type") == "application/x-www-form-urlencoded", "Content-Type survives verbatim", hdrs)
         for key in ("Authorization", "X-Api-Key", "Cookie"):
             expect(hdrs.get(key) == KEY_REDACTED, f"secret-named header {key} is {KEY_REDACTED}", hdrs.get(key))

@@ -36,8 +36,11 @@ client. Polling kept working (it holds its own reference), so the window looked
 connected, while every verb went through `live()`, found no client and failed with
 "the bus connection closed" until the next reconnect. On the installed app that is
 "I pressed Apply and Restart Core / the core restarted, and now nothing I do lands".
-Fix: a run checks cancellation right after its connect, sets the failed state only
-when it is still the current run, and clears `client` only if it is still its own.
+Fix: the same defect was fixed on main while this story was in flight — #262 ("a
+superseded run() owns nothing but its own socket", #192, with
+`tools/selftest-live-reconnect.sh` as its gate). This story's live proof reproduced it
+independently on a pre-#262 build; the merged result keeps #262's `owns()` guards and
+replays the queued adds only on the run that owns the bus.
 
 ## 2026-10-31 — The Flows page stopped redrawing after intercept was armed
 
