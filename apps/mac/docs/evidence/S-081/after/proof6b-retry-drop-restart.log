@@ -1,0 +1,10 @@
+app pid=21099
+window 33643 origin 461 -1264 size 1848 1126
+retry click at 2160 -1026
+17:37:01.413 shot 42-after-retry
+17:37:03.667 shot 43-dropped
+core 21147 "structuredContent":["ok.test"],"isError":false}
+17:37:06.654 return pressed
+17:37:12.584 shot 49-landed
+core 26585 "structuredContent":["ok.test","during.restart"],"isError":false}
+proof6 exit 0

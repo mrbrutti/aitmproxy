@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
+from aitm_e2e import check, skip, fail, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import BusClient  # noqa: E402
 from aitm_e2e.config import CoreConfig, ScannerSection, l4_inject_entry  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
@@ -113,6 +113,11 @@ def main() -> int:
         op = BusClient.operator(core)
         require_verbs(op, *VERBS)
         code, payload = refusal_code(op, "operator", stream_args(vuln))
+        if code == "lane_unavailable":
+            # D3's first rung: the engine has no l4_stream lane at all, so the
+            # L4 gate below it is never reached. The T6 lane is not on this build.
+            skip("lane l4_stream is not on this build (lane_unavailable); "
+                 "needs T6 (aitm-scan-l4-stream)")
         check(code == "refused_l4",
               f"(a) a stream job on a core with l4.enabled false is `refused_l4` "
               f"(got {code!r}: {payload!r})")

@@ -60,6 +60,8 @@ pub(crate) fn no_finding(outcome: Outcome, detail: impl Into<String>) -> Verdict
         evidence: Evidence::default(),
         detail: detail.into(),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

@@ -73,6 +73,7 @@
       "needs_baseline": false,
       "wants_traits": null,
       "targets_session": false,
+      "scope": "origin",
       "cwe": 200,
       "description": "An operator-authored passive check: flags responses carrying the in-house X-Debug-Marker header, which this engagement's target leaves on when a staging build is deployed.",
       "remediation": "Strip the debug header at the edge for production builds, or gate it behind an authenticated internal flag.",
