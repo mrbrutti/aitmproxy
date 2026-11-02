@@ -404,15 +404,18 @@ pub struct FlowMeta {
     /// inspector's "Edited" flag; the original is recoverable while the flow is
     /// still intercepted (`InterceptState::Intercepted { backup }`).
     pub edited: bool,
-    /// Arrives as `NextLayerHint::peer_identity` from a capture ingress; `None` for a
-    /// proxied, replayed or imported flow.
-    /// The signing identifier of the process that opened the client connection, as a
-    /// capture backend observed it (macOS NE: `com.apple.Safari`). `None` for a
-    /// proxied flow. Backend-supplied text about a client: data to store and show,
-    /// never a scope or guard input.
+    /// Identifier of the app that opened the client connection, arriving as
+    /// `NextLayerHint::peer_identity`: the signing identifier a capture backend
+    /// observed (macOS NE: `com.apple.Safari`), or the core's own resolution of a
+    /// proxied loopback client (a bundle identifier such as `com.apple.python3`, or
+    /// an executable basename such as `curl`). `None` unless the core could name
+    /// the client, and always `None` for a replayed or imported flow. Text about a
+    /// client: data to store and show, never a scope or guard input.
     pub source_app: Option<String>,
     /// The capture backend that delivered the client connection (`"macos-ne"`). `None`
-    /// for a proxied flow.
+    /// for a proxied flow, including one whose client the core named: together,
+    /// `source_app` set with `capture_interface` null means "explicit proxy, client
+    /// named by the core".
     pub capture_interface: Option<String>,
     /// Observed only, nothing acted on it (spec D4): plain HTTP to a host outside
     /// Scope is stored and shown, but no intercept rule parks it, no script sees it

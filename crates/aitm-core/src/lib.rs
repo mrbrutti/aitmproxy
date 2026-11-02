@@ -19,6 +19,7 @@ pub mod event;
 pub mod flow;
 pub mod guard;
 pub mod header;
+pub mod peer;
 pub mod plugin;
 pub mod protocol;
 pub mod proxy;
@@ -64,6 +65,7 @@ pub use guard::{
     StdGuard,
 };
 pub use header::{HeaderError, HeaderMap};
+pub use peer::PeerResolver;
 pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use proxy::{Proxy, ProxyBuilder};
