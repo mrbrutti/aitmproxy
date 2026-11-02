@@ -10,8 +10,17 @@
 //! flow mapping (`mcp: {…}`) is refused rather than corrupted. The command is
 //! CLI-only and never registered as an MCP/registry tool, so no agent can write
 //! the operator secret (the no-self-promotion anti-goal).
+//!
+//! Since the one-shot spec (§D3) a serving first run also mints the token
+//! automatically through [`mint_if_absent`]: the same surgical editor, the same
+//! atomic write, the result always `0600`, and never fatal (a failure is a
+//! [`Minted::Skipped`] that turns the operator bus off for the run). The minted
+//! value travels as an [`OperatorToken`], whose `Debug` redacts and which has no
+//! `Display`, so it cannot reach a log, phase line or error string by accident.
 
 use std::fmt;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -166,13 +175,141 @@ pub fn generate_and_store(config_path: &Path, force: bool) -> anyhow::Result<Pat
     Ok(config_path.to_path_buf())
 }
 
+/// The operator token a serving first run minted (spec §D3). `Debug` prints
+/// `OperatorToken(<redacted>)` and there is deliberately no `Display`, so the
+/// value cannot reach a log record, a phase line or an error string by accident
+/// (AC-R14-28/29); the one way to read it is [`OperatorToken::expose`].
+pub struct OperatorToken(String);
+
+impl OperatorToken {
+    /// The token value, for the single consumer that stores it in
+    /// `cfg.mcp.operator_token`. Never format, log or print the result.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for OperatorToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperatorToken(<redacted>)")
+    }
+}
+
+/// What [`mint_if_absent`] did. Never an error: minting is best-effort and a
+/// failure only turns the operator bus off for this run (plan C4).
+#[derive(Debug)]
+pub enum Minted {
+    /// The file already carries a non-empty `mcp.operator_token`; nothing was
+    /// written.
+    Present,
+    /// A fresh token was inserted and the file written `0600`.
+    Written {
+        /// The config file that now holds the token.
+        path: PathBuf,
+        /// The minted token, for `cfg.mcp.operator_token`.
+        token: OperatorToken,
+    },
+    /// The token could not be minted. `reason` is the operator-facing tail of
+    /// the warning (`… could not write mcp.operator_token to <path> · <reason>`)
+    /// and never contains a token.
+    Skipped {
+        /// Why, in the spec's words (e.g. `<path> does not exist`,
+        /// `<path> is not a regular file`, `the mcp: section is written inline`,
+        /// `cannot write <path>: <io error>`).
+        reason: String,
+    },
+}
+
+/// Mint `mcp.operator_token` into the config at `path` when it has none.
+///
+/// Returns [`Minted::Present`] when the file already has a non-empty token,
+/// [`Minted::Written`] after inserting a fresh CSPRNG token with
+/// [`insert_operator_token`] (every other byte kept) and writing the file
+/// through [`write_atomically`] (so it is `0600` afterwards whatever it was
+/// before), and [`Minted::Skipped`] otherwise: a missing file when
+/// `create_if_missing` is false (an explicit `--config` is never created), a
+/// symlink at the path (a dotfile-managed config is never written through or
+/// replaced by an automatic first-run write; reading a token elsewhere still
+/// follows symlinks), a non-regular file at the path, an inline `mcp: {…}`
+/// section, or an unreadable/unwritable file or directory. With
+/// `create_if_missing` an absent file starts from empty text and its parent
+/// directory is created `0700` if absent. Never fatal; never returns the token
+/// in a `reason`.
+pub fn mint_if_absent(path: &Path, create_if_missing: bool) -> Minted {
+    let skipped = |reason: String| Minted::Skipped { reason };
+    if std::fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink()) {
+        return skipped(format!(
+            "{} is a symlink: aitm does not write a token through it; add \
+             mcp.operator_token yourself or set mcp.operator_bus.enabled: false",
+            path.display()
+        ));
+    }
+    let yaml = match std::fs::metadata(path) {
+        Ok(md) if !md.is_file() => {
+            return skipped(format!("{} is not a regular file", path.display()));
+        }
+        Ok(_) => match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => return skipped(format!("cannot read {}: {e}", path.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !create_if_missing {
+                return skipped(format!("{} does not exist", path.display()));
+            }
+            if let Err(e) = create_private_parent(path) {
+                return skipped(format!("cannot write {}: {e}", path.display()));
+            }
+            String::new()
+        }
+        Err(e) => return skipped(format!("cannot read {}: {e}", path.display())),
+    };
+
+    let token = generate_operator_token();
+    let updated = match insert_operator_token(&yaml, &token, false) {
+        Ok(text) => text,
+        Err(OperatorTokenError::AlreadySet) => return Minted::Present,
+        Err(OperatorTokenError::InlineMcpSection) => {
+            return skipped("the mcp: section is written inline".to_string());
+        }
+        Err(e @ OperatorTokenError::NoConfigFile(_)) => return skipped(e.to_string()),
+    };
+
+    match write_atomically(path, &updated) {
+        Ok(()) => Minted::Written {
+            path: path.to_path_buf(),
+            token: OperatorToken(token),
+        },
+        Err(e) => skipped(format!("cannot write {}: {e}", path.display())),
+    }
+}
+
+/// Create `path`'s parent directory with mode `0700` when it does not exist
+/// yet. An existing parent is left exactly as the operator has it.
+fn create_private_parent(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if parent.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Replace `path`'s contents with `data` via a sibling temp file and an atomic
 /// `rename`, so a crash or full disk can never truncate the operator's config to
 /// an empty or half-written file. The rename also replaces the target in place
 /// without following a symlink into another inode. Both files share `path`'s
 /// parent directory, so the rename stays within one filesystem (where it is
-/// atomic). The temp file is removed if the rename fails.
+/// atomic). The temp file is removed if the write or the rename fails.
+///
+/// The temp file is created `0600` (`create_new` so no existing inode is
+/// reused, then an explicit `set_permissions` so the umask cannot widen or
+/// narrow it), so the renamed result is `0600` whatever the umask and whatever
+/// mode the old file had (spec §D3, research F7).
 fn write_atomically(path: &Path, data: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
     let stem = path
@@ -180,7 +317,19 @@ fn write_atomically(path: &Path, data: &str) -> std::io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tmp = dir.join(format!(".{stem}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, data)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let written = file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(data.as_bytes()));
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -270,6 +419,7 @@ fn value_is_empty(after: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config_file;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn inserts_into_existing_mcp_block() {
@@ -398,9 +548,18 @@ mod tests {
             "listen: 127.0.0.1:8080\nmcp:\n  transport:\n    loopback_tcp:\n      port: 9090\n      token: abc\n",
         )
         .unwrap();
+        // The file starts world-readable so the assertion below proves the atomic
+        // write tightens it to 0600 rather than inheriting the old mode or the
+        // umask (spec D3, research F7).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         generate_and_store(&path, false).unwrap();
 
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "config must be 0600 after the write, got {mode:o}"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         let cfg = config_file::parse(&text).unwrap();
         let tok = cfg
@@ -437,5 +596,240 @@ mod tests {
         let token = generate_operator_token();
         assert!(!token.is_empty());
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A fresh, unique temp directory for one minting test.
+    fn mint_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aitm-mint-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Assert `text` is exactly `prefix` + 64 hex chars + `"\n"` and return the
+    /// 64-char token it carries.
+    fn token_line_after(text: &str, prefix: &str) -> String {
+        let rest = text
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("text does not start with {prefix:?}:\n{text}"));
+        let tok = rest
+            .strip_suffix('\n')
+            .unwrap_or_else(|| panic!("text does not end with a newline:\n{text}"));
+        assert_eq!(
+            tok.len(),
+            64,
+            "token is 64 hex chars, got {}:\n{text}",
+            tok.len()
+        );
+        assert!(
+            tok.chars().all(|c| c.is_ascii_hexdigit()),
+            "token is not hex:\n{text}"
+        );
+        tok.to_string()
+    }
+
+    #[test]
+    fn mint_creates_the_default_file_0600_with_one_token_line() {
+        // AC-R14-3: the default config does not exist (nor its parent); the
+        // first serving run creates both, the file 0600 and the parent 0700,
+        // with exactly one token line; a second run changes nothing.
+        let dir = mint_dir();
+        let parent = dir.join("aitmproxy");
+        let p = parent.join("config.yaml");
+        assert!(!parent.exists());
+
+        let first = mint_if_absent(&p, true);
+        let token = match first {
+            Minted::Written { path, token } => {
+                assert_eq!(path, p);
+                token
+            }
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(mode_of(&p), 0o600, "file mode {:o}", mode_of(&p));
+        assert_eq!(
+            mode_of(&parent),
+            0o700,
+            "parent mode {:o}",
+            mode_of(&parent)
+        );
+        let text = std::fs::read_to_string(&p).unwrap();
+        let in_file = token_line_after(&text, "mcp:\n  operator_token: ");
+        assert_eq!(
+            token.expose(),
+            in_file,
+            "returned token differs from the file's"
+        );
+        // Exactly one operator_token line.
+        assert_eq!(text.matches("operator_token:").count(), 1);
+
+        let second = mint_if_absent(&p, true);
+        assert!(matches!(second, Minted::Present), "second call: {second:?}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            text,
+            "bytes changed on a Present run"
+        );
+        assert_eq!(mode_of(&p), 0o600);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mint_inserts_into_an_existing_0644_file_and_tightens_it() {
+        // AC-R14-4: a pre-existing config gains exactly the one line, every
+        // other byte unchanged, and ends up 0600 even though it was 0644.
+        let dir = mint_dir();
+        let p = dir.join("config.yaml");
+        let before = "# c\nlisten: 127.0.0.1:8080\n";
+        std::fs::write(&p, before).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&p), 0o644);
+
+        let minted = mint_if_absent(&p, false);
+        let token = match minted {
+            Minted::Written { path, token } => {
+                assert_eq!(path, p);
+                token
+            }
+            other => panic!("expected Written, got {other:?}"),
+        };
+        assert_eq!(mode_of(&p), 0o600, "file mode {:o}", mode_of(&p));
+        let text = std::fs::read_to_string(&p).unwrap();
+        let in_file = token_line_after(
+            &text,
+            "# c\nlisten: 127.0.0.1:8080\nmcp:\n  operator_token: ",
+        );
+        assert_eq!(token.expose(), in_file);
+        assert_eq!(
+            text,
+            format!("# c\nlisten: 127.0.0.1:8080\nmcp:\n  operator_token: {in_file}\n")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mint_skips_without_creating_when_told_not_to() {
+        // An explicit --config that names a missing file is never created by
+        // minting (spec D3: a mistyped path stays the config error).
+        let dir = mint_dir();
+        let p = dir.join("missing.yaml");
+
+        let minted = mint_if_absent(&p, false);
+        match minted {
+            Minted::Skipped { reason } => {
+                assert_eq!(reason, format!("{} does not exist", p.display()));
+                assert!(reason.ends_with("does not exist"));
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(
+            !p.exists(),
+            "file was created despite create_if_missing = false"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mint_skips_an_inline_mcp_section() {
+        // Plan C4: the surgical editor's InlineMcpSection becomes a Skipped
+        // with the spec's words; the file is left byte-for-byte alone.
+        let dir = mint_dir();
+        let p = dir.join("config.yaml");
+        let before = "mcp: {operator_token: \"\"}\n";
+        std::fs::write(&p, before).unwrap();
+
+        let minted = mint_if_absent(&p, false);
+        match minted {
+            Minted::Skipped { reason } => {
+                assert_eq!(reason, "the mcp: section is written inline");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mint_skips_a_directory_at_the_path() {
+        // A non-regular file at the config path is refused with the spec's
+        // words and nothing is written into or over it.
+        let dir = mint_dir();
+        let p = dir.join("config.yaml");
+        std::fs::create_dir(&p).unwrap();
+
+        let minted = mint_if_absent(&p, true);
+        match minted {
+            Minted::Skipped { reason } => {
+                assert_eq!(reason, format!("{} is not a regular file", p.display()));
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(p.is_dir(), "the directory was replaced");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mint_skips_a_symlinked_config() {
+        // A dotfile-managed config (a symlink) is never minted into: replacing
+        // the link would break it and writing through it could put a secret
+        // into a git-tracked repo. The link and its target are left untouched.
+        let dir = mint_dir();
+        let target = dir.join("target.yaml");
+        let before = "listen: 127.0.0.1:8080\n";
+        std::fs::write(&target, before).unwrap();
+        let link = dir.join("config.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let minted = mint_if_absent(&link, true);
+        match minted {
+            Minted::Skipped { reason } => {
+                assert_eq!(
+                    reason,
+                    format!(
+                        "{} is a symlink: aitm does not write a token through it; add \
+                         mcp.operator_token yourself or set mcp.operator_bus.enabled: false",
+                        link.display()
+                    )
+                );
+                assert!(reason.contains("is a symlink"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink was replaced"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn minted_debug_never_prints_the_token() {
+        // AC-R14-29: the token wrapper redacts in Debug; the enum inherits it.
+        let token = OperatorToken("optoken-test-abc".into());
+        assert_eq!(format!("{token:?}"), "OperatorToken(<redacted>)");
+        assert_eq!(token.expose(), "optoken-test-abc");
+
+        let minted = Minted::Written {
+            path: PathBuf::from("/tmp/x/config.yaml"),
+            token,
+        };
+        let dbg = format!("{minted:?}");
+        assert!(dbg.contains("<redacted>"), "no redaction marker: {dbg}");
+        assert!(!dbg.contains("optoken-test-abc"), "token leaked: {dbg}");
+        assert!(dbg.contains("/tmp/x/config.yaml"), "path missing: {dbg}");
     }
 }
