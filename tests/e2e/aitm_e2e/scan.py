@@ -637,8 +637,12 @@ def packet_lane_gate(client, *verbs: str, role: str = "operator") -> dict:
 
 
 def read_capture_packets(client, flow_id: str, page: int = 500) -> list[dict]:
-    """Every packet of an L4 capture flow, walking `l4.flow.get {offset, limit}`
-    while the reply says `truncated`. Not a scan verb: not in the ledger."""
+    """Every packet of an L4 capture flow, walking `l4.flow.get {offset, limit}` until
+    `packet_count` packets have been read. The reply's `truncated` / `next_offset` say
+    only that the reply's *byte* budget cut a page short (`FLOW_GET_MAX_REPLY_BYTES`),
+    never that the `limit` window ended, so a walk keyed on `truncated` alone stopped
+    after one page and undercounted a 600-packet flow as 500 (T5 rig run 6/7, 2026-11-02).
+    Not a scan verb: not in the ledger."""
     out: list[dict] = []
     offset = 0
     while True:
@@ -647,10 +651,17 @@ def read_capture_packets(client, flow_id: str, page: int = 500) -> list[dict]:
             raise RuntimeError(f"l4.flow.get: expected an object, got {type(doc).__name__}")
         got = doc.get("packets") or []
         out.extend(got)
+        total = doc.get("packet_count")
+        if not got:
+            break
         nxt = doc.get("next_offset")
-        if not doc.get("truncated") or not isinstance(nxt, int) or nxt <= offset or not got:
-            return out
-        offset = nxt
+        if doc.get("truncated") and isinstance(nxt, int) and nxt > offset:
+            offset = nxt
+        else:
+            offset += len(got)
+        if isinstance(total, int) and offset >= total:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
