@@ -999,4 +999,85 @@ extension ScanModelTests {
         #expect(status.crawl.formsSkipped == 0)
         #expect(status.crawl.lastError == nil)
     }
+
+    /// Tester (Jobs view plan 1.6): the D1 decoders at the edges AC1 and AC2 do not
+    /// name: a wrong type, a negative count or a non-object sample is refused; an
+    /// empty object reads every default; a sample list longer than the engine's cap
+    /// of 8 decodes whole (the cap is the engine's, not the Kit's); an empty
+    /// `last_error` token is an unknown kind whose raw value is the empty string.
+    @Test func checkAndCrawlErrorFieldsAtTheEdges() throws {
+        // Wrong types and negative counts are malformed wire, not defaults.
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["errors": "seven"]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["errors": -1]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["skipped": 1.5]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["skipped_samples": ["check": "x"]]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["error_samples": [7]]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["error_samples": [["detail": 3]]]) }
+        #expect(throws: BusError.self) { try ScanCrawlCounters(json: ["errors": "one"]) }
+        #expect(throws: BusError.self) { try ScanCrawlCounters(json: ["forms_skipped": -2]) }
+        #expect(throws: BusError.self) { try ScanCrawlCounters(json: ["last_error": 7]) }
+        #expect(throws: BusError.self) { try ScanCheckErrorSample(json: "not an object") }
+        #expect(throws: BusError.self) { try ScanCheckErrorSample(json: .null) }
+
+        // Empty objects read every default.
+        let emptyChecks = try ScanCheckCounters(json: [:])
+        #expect(emptyChecks.scheduled == 0)
+        #expect(emptyChecks.done == 0)
+        #expect(emptyChecks.running == [])
+        #expect(emptyChecks.errors == 0)
+        #expect(emptyChecks.errorSamples == [])
+        #expect(emptyChecks.skipped == 0)
+        #expect(emptyChecks.skippedSamples == [])
+        let emptyCrawl = try ScanCrawlCounters(json: [:])
+        #expect(emptyCrawl.pages == 0)
+        #expect(emptyCrawl.errors == 0)
+        #expect(emptyCrawl.formsSkipped == 0)
+        #expect(emptyCrawl.lastError == nil)
+        #expect(try ScanCheckErrorSample(json: [:]) == ScanCheckErrorSample(check: "", point: "", detail: ""))
+        #expect(try ScanCheckCounters(json: ["error_samples": [], "skipped_samples": []]).errorSamples == [])
+
+        // An explicit null reads as absent (the engine's `Option` fields), so the default.
+        #expect(try ScanCheckCounters(json: ["errors": .null]).errors == 0)
+        #expect(try ScanCheckCounters(json: ["error_samples": .null]).errorSamples == [])
+
+        // A sample list past the engine's cap of 8 decodes whole, in order.
+        let many = JSONValue.array((0..<64).map { i in
+            .object(["check": .string("c\(i)"), "point": .string("p\(i)"), "detail": .string("d\(i)")])
+        })
+        let capped = try ScanCheckCounters(json: ["errors": 64, "error_samples": many, "skipped_samples": many])
+        #expect(capped.errorSamples.count == 64)
+        #expect(capped.skippedSamples.count == 64)
+        #expect(capped.errorSamples[63] == ScanCheckErrorSample(check: "c63", point: "p63", detail: "d63"))
+
+        // A detail with the engine's scrubbed text and non-ASCII survives verbatim.
+        let detail = "Connection refused (os error 61) — «scrubbed» \u{1F512}"
+        #expect(try ScanCheckErrorSample(json: ["detail": .string(detail)]).detail == detail)
+
+        // The empty token is an unknown kind, round-trips, and reads as a failed connection.
+        let blank = try ScanCrawlCounters(json: ["last_error": ""])
+        #expect(blank.lastError == .unknown(""))
+        #expect(blank.lastError?.rawValue == "")
+        #expect(ScanCrawlErrorKind(rawValue: "") == .unknown(""))
+        #expect(ScanCrawlErrorKind(rawValue: "CONNECT_REFUSED") == .unknown("CONNECT_REFUSED"), "tokens are case-sensitive")
+        // The wire token `other` always lands in the engine's own case, never the escape
+        // hatch (equality on a `ScanVocabulary` is by raw value, so only the case match tells).
+        var landsInOther = false
+        if case .other = try #require(ScanCrawlErrorKind(rawValue: "other")) { landsInOther = true }
+        #expect(landsInOther)
+        var landsInUnknown = false
+        if case .unknown("weird") = try #require(ScanCrawlErrorKind(rawValue: "weird")) { landsInUnknown = true }
+        #expect(landsInUnknown)
+
+        // The status's row summary carries none of the new fields: a status with errors
+        // and a crawl error still summarises to the same seven counters as the list row.
+        var json = try ScanPack.load("scan.status.json")
+        json = ScanPack.edited(json, path: ["checks", "errors"], to: 7)
+        json = ScanPack.edited(json, path: ["crawl", "errors"], to: 1)
+        json = ScanPack.edited(json, path: ["crawl", "last_error"], to: "connect_refused")
+        let status = try ScanJobStatus(json: json)
+        #expect(status.checks.errors == 7)
+        #expect(status.crawl.lastError == .connectRefused)
+        let row = try ScanListResult(json: ScanPack.load("scan.list.json")).jobs[0]
+        #expect(status.summary == row)
+    }
 }

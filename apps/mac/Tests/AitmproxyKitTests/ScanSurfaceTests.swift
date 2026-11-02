@@ -2521,4 +2521,183 @@ extension ScanSurfaceTests {
         model.jobsError = "Unable to cancel job scan-1a2b3c4d: nope"
         #expect(model.inlineJobsError(ageMs: 42_000) == "Unable to cancel job scan-1a2b3c4d: nope")
     }
+
+    /// Tester (Jobs view plan 1.6): the edges of D2's precedence, the re-read rule,
+    /// the cancel gate and D6's link that AC3, AC4, AC7 and AC12 do not name, each
+    /// with the literal the Kit must produce.
+    @Test func factsReReadCancelGateAndLinkAtTheEdges() throws {
+        // D2 precedence: a terminal status wins even over a terminal list row that is later.
+        let bothTerminal = ScanJobFacts.make(
+            summary: try Self.summary(state: .done, elapsedMs: 70_000),
+            status: try Self.status(state: .done, elapsedMs: 69_000))
+        #expect(bothTerminal.summary.elapsedMs == 69_000, "a terminal status is final; the list row never overrides it")
+        // A failed status beats a running list row that is far ahead in elapsed.
+        let failedBehind = ScanJobFacts.make(
+            summary: try Self.summary(state: .running, elapsedMs: 500_000),
+            status: try Self.status(state: .failed, elapsedMs: 12_000))
+        #expect(failedBehind.summary.state == .failed)
+        #expect(failedBehind.summary.elapsedMs == 12_000)
+        // Neither terminal, equal elapsed: the status (the tie goes to the status).
+        let evenLive = ScanJobFacts.make(
+            summary: try Self.summary(state: .running, elapsedMs: 42_000),
+            status: try Self.status(state: .cancelling, elapsedMs: 42_000))
+        #expect(evenLive.summary.state == .cancelling)
+        // An unknown state is not terminal: the higher elapsed decides, the status is kept.
+        let unknown = ScanJobFacts.make(
+            summary: try Self.summary(state: .other("paused"), elapsedMs: 50_000),
+            status: try Self.status(state: .running, elapsedMs: 49_000))
+        #expect(unknown.summary.state == .other("paused"))
+        #expect(unknown.status?.state == .running)
+        // `job` is the list row's; the status is kept whole even when it names another job.
+        let crossed = ScanJobFacts.make(
+            summary: try Self.summary("scan-aaaa", state: .running, elapsedMs: 1_000),
+            status: try Self.status("scan-bbbb", state: .running, elapsedMs: 2_000))
+        #expect(crossed.job == "scan-aaaa")
+        #expect(crossed.status?.job == "scan-bbbb")
+
+        // The re-read rule with unknown states: an unknown stored state is not terminal,
+        // so a terminal list row forces one more read; an unknown list row never does.
+        let paused = try Self.summary(state: .other("paused"), elapsedMs: 50_000)
+        let done = try Self.summary(state: .done, elapsedMs: 69_000)
+        let storedPaused = try Self.status(state: .other("paused"), elapsedMs: 50_000)
+        let storedRunning = try Self.status(state: .running, elapsedMs: 42_000)
+        let storedFailed = try Self.status(state: .failed, elapsedMs: 12_000)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: paused, stored: nil) == true)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: done, stored: storedPaused) == true)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: paused, stored: storedRunning) == false)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: paused, stored: storedPaused) == false)
+        // A terminal stored status is final whatever the list row says.
+        #expect(ScanSurfaceModel.needsStatusRead(summary: done, stored: storedFailed) == false)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: paused, stored: storedFailed) == false)
+        let running = try Self.summary(state: .running, elapsedMs: 42_000)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: running, stored: storedFailed) == false)
+
+        // The cancel gate: an unknown merged state is never a target; a locally started job
+        // the list has not carried yet is (its `scan.start` status is queued).
+        var model = ScanSurfaceModel()
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.applyStatus(storedPaused)
+        #expect(model.facts(for: "scan-1a2b3c4d")?.summary.state == .other("paused"))
+        #expect(model.mayCancel(job: "scan-1a2b3c4d") == false)
+        #expect(model.cancelTarget == nil)
+        var started = ScanSurfaceModel()
+        var start = try Self.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["job"], to: "scan-local")
+        start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
+        started.applyStart(try ScanStartResult(json: start))
+        let local = try #require(started.facts(for: "scan-local"))
+        #expect(local.summary.state == .queued)
+        #expect(local.status?.job == "scan-local")
+        #expect(started.mayCancel(job: "scan-local") == true)
+        #expect(started.cancelTarget == "scan-local")
+        // D2 as written: with the selection on a cancelling job, Cancel Scan's target
+        // falls to the only queued or running job elsewhere in the list.
+        var twoJobs = try Self.load("scan.list.json")
+        var rows = try #require(twoJobs["jobs"]?.arrayValue)
+        rows[1] = ScanPack.edited(rows[1], path: ["state"], to: "running")
+        twoJobs = ScanPack.edited(twoJobs, path: ["jobs"], to: .array(rows))
+        model.applyList(try ScanListResult(json: twoJobs), now: 0)
+        model.applyStatus(try Self.status(state: .cancelling, elapsedMs: 43_000))
+        model.selectedJob = "scan-1a2b3c4d"
+        #expect(model.cancelTarget == "scan-55667788")
+
+        // D3: an empty list never invents a selection, and a selection the list dropped
+        // falls to nothing when the list is empty too.
+        var dropped = ScanSurfaceModel()
+        dropped.selectedJob = "scan-gone"
+        dropped.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        #expect(dropped.selectedJob == nil)
+
+        // D6: a connecting bus outranks a failed list; a second failure moves the stamp and
+        // keeps the age of the last good list; the age clause clamps at 0:00 when the
+        // caller's clock is behind the stamp.
+        let connectingFailed = ScanJobsLink.make(bus: .connecting("…"), listFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
+        #expect(connectingFailed.kind == .reconnecting)
+        #expect(connectingFailed.verbsEnabled == false)
+        var failing = ScanSurfaceModel()
+        failing.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 1_000)
+        failing.noteListFailure(core: "the bus did not reply in time", now: 31_000)
+        failing.noteListFailure(core: "the core closed the bus", now: 33_000)
+        #expect(failing.listFailedAt == 33_000)
+        #expect(failing.jobsLoadedAt == 1_000)
+        #expect(failing.jobs.count == 2, "the rows and their counters stay through a failure")
+        #expect(failing.inlineJobsError(ageMs: 32_000)
+                == "Unable to list jobs: the core closed the bus. Showing values from 0:32 ago; retrying every 2 s.")
+        let behind = ScanJobsLink.make(bus: .connected("…"), listFailedAt: 2_000, jobsLoadedAt: 1_000, now: 700)
+        #expect(behind.valuesAgeMs == -300)
+        #expect(behind.bannerText == "The core is not answering · showing values from 0:00 ago · retrying every 2 s")
+        let hourOld = ScanJobsLink.make(bus: .disconnected, listFailedAt: nil, jobsLoadedAt: 0, now: 3_600_000)
+        #expect(hourOld.bannerText == "Bus disconnected · showing values from 1:00:00 ago · Proxy ▸ Reconnect Bus (⌃⌘R) to retry")
+        // (D6 amendment of 2026-11-02: a failed status or cancel read is to mark the link
+        // too, through `noteReadFailure(text:core:now:)`; that is the fix task's test.)
+        failing.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 35_000)
+        #expect(failing.inlineJobsError(ageMs: 0) == nil)
+        #expect(failing.jobsLoadedAt == 35_000)
+    }
+
+    /// Tester (Jobs view plan 1.6): the end-text edges D4 and the plan's gap 8 imply but
+    /// AC9 does not spell out, each with its literal.
+    @Test func endTextAtTheEdges() throws {
+        // Gap 8: a `failed` job with an empty-string error has no error text, so the reason is said.
+        #expect(ScanEndText.stoppedReason(.failed, state: .failed, probesBudget: 2000, error: "")
+                == "Stopped early: an error ended the job.")
+        #expect(ScanEndText.stoppedReason(.failed, state: .done, probesBudget: 2000, error: "boom") == nil,
+                "the error text is shown whatever the state")
+        // `cancelled` is only swallowed by the cancelled state itself, not by cancelling.
+        #expect(ScanEndText.stoppedReason(.cancelled, state: .cancelling, probesBudget: 2000, error: nil)
+                == "Stopped early: the job was cancelled.")
+        #expect(ScanEndText.stoppedReason(.cancelled, state: .failed, probesBudget: 2000, error: nil)
+                == "Stopped early: the job was cancelled.")
+        // The budget sentence groups every size of budget.
+        #expect(ScanEndText.stoppedReason(.budget, state: .done, probesBudget: 0, error: nil)
+                == "Stopped early: the probe budget of 0 was spent. Raise it in the profile to go further.")
+        #expect(ScanEndText.stoppedReason(.budget, state: .done, probesBudget: 1_000_000, error: nil)
+                == "Stopped early: the probe budget of 1,000,000 was spent. Raise it in the profile to go further.")
+        // The unknown reason's raw line carries the token as it came, including an empty one.
+        #expect(ScanEndText.stoppedReason(.other(""), state: .done, probesBudget: 2000, error: nil)
+                == "Stopped early for a reason this app does not know.")
+        #expect(ScanEndText.rawReasonLine(.other("")) == "stopped_reason: ")
+        #expect(ScanEndText.rawReasonLine(.budget) == "stopped_reason: budget")
+        #expect(ScanEndText.rawReasonLine(.sessionLost) == "stopped_reason: session_lost")
+        #expect(ScanEndText.rawReasonLine(.guardRefused) == "stopped_reason: guard_refused")
+        #expect(ScanEndText.rawCrawlErrorLine(.h2NotNegotiated) == "crawl.last_error: h2_not_negotiated")
+        #expect(ScanEndText.crawlErrorWords(.unknown("")) == "the connection failed")
+
+        // Crawl trouble with large counts groups both numbers.
+        let big = try ScanCrawlCounters(json: ["pages": 12_345, "errors": 1_000])
+        #expect(ScanEndText.crawlTrouble(big) == "The crawl fetched 12,345 pages and hit 1,000 errors")
+        let onePageManyErrors = try ScanCrawlCounters(json: ["pages": 1, "errors": 2])
+        #expect(ScanEndText.crawlTrouble(onePageManyErrors) == "The crawl fetched 1 page and hit 2 errors")
+
+        // `sentence`: an unknown state is not terminal, so no sentence; a done row whose
+        // stored status is still live (the one-beat gap D2 hides) reads the merged counters
+        // and the status's scheduled count.
+        let exploded = ScanJobFacts.make(
+            summary: try Self.summary(state: .other("exploded"), elapsedMs: 9_000),
+            status: try Self.status(state: .other("exploded"), elapsedMs: 9_000, edits: []))
+        #expect(ScanEndText.sentence(exploded) == nil)
+        let gap = ScanJobFacts.make(
+            summary: try Self.summary(state: .done, elapsedMs: 69_000),
+            status: try Self.status(state: .running, elapsedMs: 65_000, edits: []))
+        #expect(gap.summary.state == .done)
+        #expect(ScanEndText.sentence(gap) == "Done in 1:09 · 120 points · 240 checks.")
+        // Cancelled with nothing run yet, and an hour-long failure.
+        let cancelledEarly = ScanJobFacts.make(
+            summary: try Self.summary(state: .cancelled, elapsedMs: 500),
+            status: try Self.status(state: .cancelled, elapsedMs: 500, edits: [
+                (["checks", "scheduled"], 0), (["checks", "done"], 0),
+            ]))
+        #expect(ScanEndText.sentence(cancelledEarly) == "Cancelled after 0:00; 0 of 0 checks had run. What it found stays.")
+        let failedLate = ScanJobFacts.make(
+            summary: try Self.summary(state: .failed, elapsedMs: 3_600_000),
+            status: try Self.status(state: .failed, elapsedMs: 3_600_000, edits: [(["error"], "boom")]))
+        #expect(ScanEndText.sentence(failedLate) == "Failed after 1:00:00.")
+
+        // `grouped` at the integer edges: no trap, a leading minus, every group of three.
+        #expect(ScanFormat.grouped(-1_234) == "-1,234")
+        #expect(ScanFormat.grouped(-1) == "-1")
+        #expect(ScanFormat.grouped(100_000) == "100,000")
+        #expect(ScanFormat.grouped(Int.max) == "9,223,372,036,854,775,807")
+        #expect(ScanFormat.grouped(Int.min) == "-9,223,372,036,854,775,808")
+    }
 }
