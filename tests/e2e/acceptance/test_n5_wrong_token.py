@@ -32,9 +32,14 @@ os.makedirs(OUT, exist_ok=True)
 TUI = os.environ.get("AITM_TUI", "/opt/homebrew/bin/aitm-tui")
 AITM = os.environ.get("AITM", INSTALLED_CLI)
 REFUSAL = "bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)"
-N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use."
+# Wave 1's M2 panel (spec 2026-11-01-cli-terminal-reporting-design, M2 "after"): the headline has no
+# trailing period, the two why sentences follow, and the holder command is the panel's `fix:` line
+# on a pipe / `▸` on a TTY (0.5.10 said "Find the holder with:"). On a TTY the why lines wrap at 80
+# columns, so the words are matched across any whitespace (`n4_words`).
+N4_PANEL = "cannot start: the proxy port 127.0.0.1:8080 is already in use"
 N4_HOLDER_LINE = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program."
-N4_LSOF = "Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN"
+N4_FREE_LINE = "Free it, or set `listen:` to another address in"
+N4_LSOF = "lsof -nP -iTCP:8080 -sTCP:LISTEN"
 EXPECTED_STEPS = ("N5-TUI", "N5-CLI", "N4-TUI", "N4-WEB")
 
 w = StepWriter(os.path.join(OUT, "negatives-steps.tsv"), EXPECTED_STEPS)
@@ -45,9 +50,16 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", s)
 
 
+def _has_words(text: str, phrase: str) -> bool:
+    """`phrase` present with any run of whitespace between its words (the TTY form wraps)."""
+    return re.search(r"\s+".join(re.escape(w) for w in phrase.split()), text) is not None
+
+
 def n4_words(text: str) -> tuple[bool, list[str]]:
-    miss = [x for x in (N4_PANEL, N4_HOLDER_LINE, N4_LSOF) if x not in text]
-    return N4_PANEL in text, miss
+    """Wave 1's port-in-use panel: the headline decides; the why sentences and the `lsof` fix
+    line are reported when missing."""
+    miss = [x for x in (N4_PANEL, N4_HOLDER_LINE, N4_FREE_LINE, N4_LSOF) if not _has_words(text, x)]
+    return _has_words(text, N4_PANEL), miss
 
 
 def n5_tui(core) -> None:
