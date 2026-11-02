@@ -1028,7 +1028,17 @@ impl RunCtx<'_> {
         };
         let meta = item.check.meta().clone();
         let Some(lane) = self.lanes.iter().find(|l| l.lane() == point.lane) else {
-            self.item_done(item.point, owed);
+            // Amendment 69, one branch earlier: a point whose lane is not on
+            // this build cannot be hosted either; it is skipped with a sample,
+            // never a silent `done`.
+            let reason = format!(
+                "lane {} is not on this build",
+                serde_json::to_value(point.lane)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| format!("{:?}", point.lane))
+            );
+            self.item_skipped(item, &meta.id, &point.id, &reason, owed);
             return;
         };
         // Whatever this item charges belongs to this lane (spec D5,
@@ -1990,6 +2000,43 @@ mod tests {
         assert_eq!(
             origin.points_seen(),
             vec!["origin:http://scan.test:80".to_string()]
+        );
+    }
+
+    /// Amendment 69, one branch earlier: a point whose lane is not on this
+    /// build (a WS point discovered on an http-only build) is skipped with a
+    /// sample naming the lane, never a silent `done`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_whose_lane_is_not_on_this_build_is_skipped_with_a_sample() {
+        let mut ws_point = fake_point("w1", "chan", "ws://scan.test/socket");
+        ws_point.lane = LaneKind::Ws;
+        let h = Harness::new().with_lane(FakeLane::http().with_points(vec![ws_point]).with_check(
+            FakeCheck::on_lane("fake.ws", "demo", LaneKind::Ws, FakeRun::clean()),
+        ));
+        h.bind();
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::Http, LaneKind::Ws];
+        let started = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect("the http lane is available");
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        let ws_samples: Vec<_> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .filter(|s| s.check == "fake.ws")
+            .collect();
+        assert!(
+            status.checks.skipped >= 1 && !ws_samples.is_empty(),
+            "the ws item on an http-only build is skipped with a sample: {:?}",
+            status.checks
+        );
+        assert!(
+            ws_samples[0]
+                .detail
+                .contains("lane ws is not on this build"),
+            "{:?}",
+            ws_samples[0].detail
         );
     }
 
