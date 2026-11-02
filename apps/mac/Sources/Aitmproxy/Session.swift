@@ -40,6 +40,9 @@ final class Session {
     }()
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
+    /// Group keys of the Apps rows currently showing their domains (icons spec D4). Session-only,
+    /// never persisted: selecting an app opens it (`show`), the chevron toggles it (`toggleExpanded`).
+    var expandedApps: Set<String> = []
     var details: [FlowID: FlowDetail] = [:] {
         didSet { rowsVersion &+= 1 }
     }
@@ -194,7 +197,13 @@ final class Session {
     /// tests) use the well-known `CoreID.fixture`. The seam for multi-core: a second
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
-    var scopeHosts: [String] = []
+    var scopeHosts: [String] = [] {
+        // The core's list is the fact: a host it now lists is no longer an add in flight (S-081).
+        didSet { scopeAdds.confirm(listed: scopeHosts) }
+    }
+    /// Scope adds the operator typed that the core has not listed yet: sending, queued for
+    /// replay after a core restart, or failed with the core's reason (S-081).
+    var scopeAdds = ScopeAddQueue()
     /// The macOS system proxy's endpoint half as the core reports it: the facts' `state`, one source
     /// (`BusService.refreshProxyStatus()` and the set/unset replies write the facts; Session+SystemProxy.swift).
     /// nil = unknown (never rendered as off): no facts, or a verb word that names no endpoint
@@ -376,6 +385,10 @@ final class Session {
     /// Overview tile.
     var clients: [(ClientInfo, Int)] { ClientTree.clients(in: rows) }
 
+    /// The domains under one Apps row (icons spec D4): the hosts the app with group key `key`
+    /// talked to, most flows first; their counts sum to that app's `clients` count.
+    func hosts(forClient key: String) -> [(String, Int)] { ClientTree.hosts(forClient: key, in: rows) }
+
     var hosts: [(String, Int)] {
         var counts: [String: Int] = [:]
         for row in rows { counts[row.authority, default: 0] += 1 }
@@ -415,9 +428,18 @@ final class Session {
     }
 
     /// Choose a sidebar page; a sub-item narrows to its group, the group header clears it.
+    /// Selecting an app, or a domain under one, also opens that app's domains (icons spec D4:
+    /// collapsing is explicit via the chevron and keeps the selection and the narrowing).
     func show(_ page: SidebarPage, group: FlowGroup? = nil) {
         self.page = page
         self.group = group
+        if case .client(let key) = group { expandedApps.insert(key) }
+        if case .clientHost(let key, _) = group { expandedApps.insert(key) }
+    }
+
+    /// The Apps row's chevron: open or close one app's domains without touching the selection.
+    func toggleExpanded(_ key: String) {
+        if expandedApps.contains(key) { expandedApps.remove(key) } else { expandedApps.insert(key) }
     }
 
     // Group → pin mapping lives in the Kit (`Pins.pin/unpin/contains(_ group:)`, icons plan Task 2):
