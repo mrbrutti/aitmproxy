@@ -14,8 +14,10 @@ Act + assert, two jobs:
      the override beat the listener's h2 offer.
   2. `scan.start { target: <tls_h1 base>, overrides: { http: { version: "h2" },
      crawl: { use_browser: "never" } } }` -> `wait_terminal` ends `state: "done"`
-     (never `failed`), `stopped_reason == "errors"`, `"h2_not_negotiated"` in
-     `status["error"]`, `probes.errors > 0`, and the target logged only
+     (never `failed`), `stopped_reason` and `error` null (amendment 39b: an
+     all-failed crawl degrades, it does not stop early), `crawl.errors > 0`,
+     `crawl.pages == 0`, `crawl.last_error == "h2_not_negotiated"`,
+     `probes.errors > 0`, and the target logged only
      `tls_handshake` entries (all `alpn == "http/1.1"`) and zero HTTP requests.
 
 Observer, independent of the scanner: the target's control origin `GET /log/http`
@@ -98,17 +100,20 @@ def main() -> None:
             probes2 = st2.get("probes") or {}
             check(st2.get("state") == "done",
                   f"the job ended state 'done', not a job failure (state={st2.get('state')!r})")
-            if st2.get("stopped_reason") is None and not error_text:
-                # The crawl's one request failed on `h2_not_negotiated`, nothing was
-                # scheduled, and the engine does not yet account an all-failed
-                # crawl as a stop reason (spec amendment 39, T1b follow-up PR 2).
-                # The first half above proved the T3 side; this half waits for 39.
-                skip(f"engine accounting of an all-failed crawl pending amendment 39 "
-                     f"(probes={probes2}); the T3 half of AC T3-2 passed above")
-            check(st2.get("stopped_reason") == "errors",
-                  f"stopped_reason is 'errors' (observed {st2.get('stopped_reason')!r})")
-            check("h2_not_negotiated" in error_text,
-                  f"status.error names h2_not_negotiated (observed {error_text[:120]!r})")
+            # Spec amendment 39b (supersedes 39; T1b follow-up PR 2): a job whose
+            # crawl failed on every request ends `done` with `stopped_reason` and
+            # `error` null ("degrade, do not fail"; `stopped_reason` is reserved
+            # for early stops), and names the cause on `crawl.errors` /
+            # `crawl.last_error` with a closed token.
+            crawl2 = st2.get("crawl") or {}
+            check(st2.get("stopped_reason") is None and not error_text,
+                  f"an all-failed crawl is not an early stop: stopped_reason and error are null "
+                  f"(observed {st2.get('stopped_reason')!r}, {error_text[:80]!r})")
+            check(int(crawl2.get("errors") or 0) > 0 and int(crawl2.get("pages") or 0) == 0,
+                  f"crawl.errors counted every failed request and no page was fetched "
+                  f"(observed errors={crawl2.get('errors')!r}, pages={crawl2.get('pages')!r})")
+            check(crawl2.get("last_error") == "h2_not_negotiated",
+                  f"crawl.last_error names h2_not_negotiated (observed {crawl2.get('last_error')!r})")
             check(probes2.get("errors", 0) > 0,
                   f"probes.errors counted the sender errors (observed {probes2.get('errors')!r})")
 
