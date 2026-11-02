@@ -628,6 +628,10 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// When the last `scan.list` failed (epoch ms); cleared by the next list that lands. A failed
     /// cancel or status read sets `jobsError` but not this (Jobs view D6).
     public var listFailedAt: Int?
+    /// The core's own text of the last failed `scan.list`, so the inline error can
+    /// carry the last-good clause (`inlineJobsError(ageMs:)`); nil when the list is
+    /// fine or when `jobsError` came from a cancel or status read (Jobs view D6).
+    public var listFailureCore: String?
 
     // Site map
     public var sitemapJob: String?
@@ -850,6 +854,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         refreshNeeded = refreshNeeded.intersection(kept)
         jobsLoadedAt = now
         listFailedAt = nil
+        listFailureCore = nil
         if let selected = selectedJob {
             if !jobs.contains(where: { $0.job == selected }), !locallyStarted.contains(selected) {
                 selectedJob = jobs.first?.job
@@ -859,11 +864,23 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         }
     }
 
-    /// A `scan.list` that failed: the inline error and the failure stamp (Jobs view
-    /// D6); the rows and their counters stay. The caller passes the same clock as `applyList`.
-    public mutating func noteListFailure(_ text: String, now: Int) {
-        jobsError = text
+    /// A `scan.list` that failed: `core` is the core's own text (`BusService.describe`).
+    /// Sets the inline error `Unable to list jobs: <core>`, keeps the core text for
+    /// `inlineJobsError(ageMs:)` and stamps the failure (Jobs view D6); the rows and
+    /// their counters stay. The caller passes the same clock as `applyList`.
+    public mutating func noteListFailure(core: String, now: Int) {
+        jobsError = scanUnableText("list jobs", core)
+        listFailureCore = core
         listFailedAt = now
+    }
+
+    /// The text of the inline error above the rows: a failed list says
+    /// `Unable to list jobs: <core>. Showing values from 0:42 ago; retrying every 2 s.`
+    /// (`ScanFormat.listErrorText`, with `ScanJobsLink.valuesAgeMs` as the age, Jobs
+    /// view D6); a failed cancel or status read shows its `jobsError` verbatim.
+    public func inlineJobsError(ageMs: Int?) -> String? {
+        if let core = listFailureCore { return ScanFormat.listErrorText(core: core, ageMs: ageMs) }
+        return jobsError
     }
 
     /// `scan.status`: stored, and the matching list row takes its summary.
@@ -1051,6 +1068,9 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 /// Every string the Scan views render, so a view carries no logic.
 public enum ScanFormat {
     public static let noSessionText = "No session seen yet for this origin."
+    /// The header button's title while the merged state is cancelling: disabled, and
+    /// the only button whose title is not a verb (Jobs view D2).
+    public static let cancellingTitle = "Cancelling…"
 
     /// `m:ss`, or `h:mm:ss` from an hour on.
     public static func elapsed(ms: Int) -> String {

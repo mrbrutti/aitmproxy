@@ -2278,7 +2278,7 @@ extension ScanSurfaceTests {
 
         // D6: a list failure stamps `listFailedAt` beside the error; the next list clears it.
         var failed = ScanSurfaceModel()
-        failed.noteListFailure("Unable to list jobs: the bus did not reply in time", now: 5_000)
+        failed.noteListFailure(core: "the bus did not reply in time", now: 5_000)
         #expect(failed.jobsError == "Unable to list jobs: the bus did not reply in time")
         #expect(failed.listFailedAt == 5_000)
         failed.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 7_000)
@@ -2490,5 +2490,35 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.grouped(1000) == "1,000")
         #expect(ScanFormat.grouped(6468) == "6,468")
         #expect(ScanFormat.grouped(1_234_567) == "1,234,567")
+    }
+
+    /// Fix 1.5b: the `Cancelling…` title (D2, AC5) and the inline list error's
+    /// age clause (D6, AC12) both come from the Kit. `noteListFailure(core:now:)`
+    /// keeps the raw core text so `inlineJobsError(ageMs:)` can add the last-good
+    /// clause, while `jobsError` itself keeps its plain wording; a failed cancel or
+    /// status read, which sets `jobsError` alone, keeps its own text verbatim.
+    @Test func cancellingTitleAndInlineListError() throws {
+        #expect(ScanFormat.cancellingTitle == "Cancelling…")
+
+        var model = ScanSurfaceModel()
+        model.noteListFailure(core: "the bus did not reply in time", now: 43_000)
+        #expect(model.listFailureCore == "the bus did not reply in time")
+        #expect(model.listFailedAt == 43_000)
+        #expect(model.jobsError == "Unable to list jobs: the bus did not reply in time")
+        #expect(model.inlineJobsError(ageMs: 42_000)
+                == "Unable to list jobs: the bus did not reply in time. Showing values from 0:42 ago; retrying every 2 s.")
+        #expect(model.inlineJobsError(ageMs: nil)
+                == "Unable to list jobs: the bus did not reply in time. Retrying every 2 s.")
+
+        // The next list that lands clears the core text with the stamp and the error.
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 45_000)
+        #expect(model.listFailureCore == nil)
+        #expect(model.listFailedAt == nil)
+        #expect(model.jobsError == nil)
+        #expect(model.inlineJobsError(ageMs: 1_000) == nil)
+
+        // A cancel failure is not a list failure: its text shows verbatim, no age clause.
+        model.jobsError = "Unable to cancel job scan-1a2b3c4d: nope"
+        #expect(model.inlineJobsError(ageMs: 42_000) == "Unable to cancel job scan-1a2b3c4d: nope")
     }
 }

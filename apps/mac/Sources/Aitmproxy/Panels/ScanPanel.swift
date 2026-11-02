@@ -274,7 +274,7 @@ final class ScanPanelState {
             let listed = Set(surface.jobs.map(\.job))
             statusRequested = statusRequested.filter { listed.contains($0.job) }
         } catch {
-            surface.noteListFailure(scanUnableText("list jobs", BusService.describe(error)), now: Self.clockMs)
+            surface.noteListFailure(core: BusService.describe(error), now: Self.clockMs)
         }
     }
 

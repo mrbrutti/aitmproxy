@@ -28,8 +28,9 @@ struct ScanJobsTab: View {
 
     @ViewBuilder private var list: some View {
         VStack(spacing: 0) {
-            if let error = state.surface.jobsError {
-                // `jobsError` inline above the rows (D11): the list it could not refresh stays.
+            if let error = state.surface.inlineJobsError(ageMs: state.link.valuesAgeMs) {
+                // The inline error above the rows (D11): the list it could not refresh stays,
+                // and a failed list says how old its values are (Jobs view D6).
                 ScanInlineError(text: error)
                 Rule(color: Tok.Line.rule)
             }
@@ -312,7 +313,7 @@ private struct ScanJobDetail: View {
                     .help("Stop this job; its issues stay (⌥⌘.)")
                     .disabled(!state.link.verbsEnabled)
             case .cancelling:
-                PrimaryButton(ScanJobState.cancelling.word) {}
+                PrimaryButton(ScanFormat.cancellingTitle) {}
                     .disabled(true)
             default:
                 EmptyView()
