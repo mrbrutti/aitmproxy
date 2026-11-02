@@ -373,12 +373,12 @@ pub struct StdGuard {
     max_concurrency: u32,
     in_flight: Arc<AtomicU32>,
     host_error_budget: u32,
-    host_errors: Mutex<HashMap<String, u32>>,
+    host_errors: Mutex<HashMap<Authority, u32>>,
     backoff: crate::config::BackoffConfig,
     /// Per-host: how many times it has been disabled (drives exponential backoff).
-    disable_count: Mutex<HashMap<String, u32>>,
+    disable_count: Mutex<HashMap<Authority, u32>>,
     /// Per-host: the instant a disabled host becomes eligible again.
-    disabled_until: Mutex<HashMap<String, Instant>>,
+    disabled_until: Mutex<HashMap<Authority, Instant>>,
 }
 
 impl StdGuard {
@@ -428,31 +428,31 @@ impl StdGuard {
             .clear();
     }
 
-    /// Whether `authority` is inside a disable window. An explicit port is one
-    /// service: disabled when its own window or the host-wide window (an
-    /// unported `record_error`) is live. An unported spelling is the host-wide
-    /// view: disabled while any service on that host is, so a disabled target
-    /// is not reachable under a spelling that drops the port.
+    /// Whether `authority` is inside a disable window. Windows are keyed on
+    /// the [`Authority`] itself (host + port; port `0` is the host-wide window an
+    /// unported `record_error` writes). An explicit port is one service:
+    /// disabled when its own window or the host-wide one is live. An unported
+    /// spelling is the host-wide view: disabled while any service on that host
+    /// is, so a disabled target is not reachable under a spelling that drops
+    /// the port. Expired windows are dropped on the way.
     fn is_disabled(&self, authority: &Authority) -> bool {
         if self.host_error_budget == 0 {
             return false;
         }
         let now = Instant::now();
-        let windows = self
+        let mut windows = self
             .disabled_until
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let live = |until: &Instant| now < *until;
+        windows.retain(|_, until| now < *until);
         if authority.port == 0 {
-            let prefix = format!("{}:", authority.host);
-            windows
-                .iter()
-                .any(|(key, until)| key.starts_with(&prefix) && live(until))
+            windows.keys().any(|key| key.host == authority.host)
         } else {
-            windows.get(&budget_key(authority)).is_some_and(live)
-                || windows
-                    .get(&format!("{}:0", authority.host))
-                    .is_some_and(live)
+            windows.contains_key(authority)
+                || windows.contains_key(&Authority {
+                    host: authority.host.clone(),
+                    port: 0,
+                })
         }
     }
 }
@@ -480,14 +480,6 @@ fn host_in_scope(host: &str, entry: &str) -> bool {
     }
 }
 
-/// The error-budget / disable-window key of an authority: `host:port`, with the
-/// port as the caller spelled it (the proxy's own client fills the scheme's
-/// default first, see `client.rs`), so each service on a host has its own
-/// budget and a different port is a different target.
-fn budget_key(authority: &Authority) -> String {
-    format!("{}:{}", authority.host, authority.port)
-}
-
 impl ScopeRateGuard for StdGuard {
     fn check_active(&self, host: &str) -> Result<ActionPermit, GuardError> {
         if !self.in_scope(host) {
@@ -495,12 +487,13 @@ impl ScopeRateGuard for StdGuard {
         }
         // The rate throttle is keyed on the *normalized* host (one bucket per
         // server, whatever the spelling); the error budget and the disable
-        // window are keyed on the normalized `host:port` authority, because two
-        // services on one address are two targets: a budget shared across ports
-        // let one job's erroring target disable another job's target on the same
-        // host (scanner v2 live run, 2026-11-02). Callers pass the authority with
-        // its scheme's default port filled ([`budget_key`]), so `target.example`,
-        // `TARGET.example:443` and `Target.Example` share one counter.
+        // window are keyed on the normalized `Authority` (host + port), because
+        // two services on one address are two targets: a budget shared across
+        // ports let one job's erroring target disable another job's target on
+        // the same host (scanner v2 live run, 2026-11-02). `record_error` callers
+        // pass the authority with its scheme's default port filled, so
+        // `target.example`, `TARGET.example:443` and `Target.Example` share one
+        // counter; an unported `check_active` is the host-wide view.
         let authority = match Authority::parse_with_default(host, 0) {
             Ok(a) => a,
             Err(_) => return Err(GuardError::OutOfScope(host.to_string())),
@@ -612,8 +605,9 @@ impl ScopeRateGuard for StdGuard {
         // Same normalized authority key as `check_active`'s disable check, so
         // the budget and disable window can't be evaded (or double-counted) by
         // spelling the host differently.
+        // Port 0 (no port in the spelling) is the host-wide window.
         let key = match Authority::parse_with_default(host, 0) {
-            Ok(a) => budget_key(&a),
+            Ok(a) => a,
             Err(_) => return,
         };
         let mut errors = self
@@ -644,7 +638,7 @@ impl ScopeRateGuard for StdGuard {
 }
 
 #[cfg(test)]
-mod budget_key_tests {
+mod authority_key_tests {
     use super::*;
 
     /// Two services on one host are two targets: exhausting one's error budget
@@ -679,6 +673,68 @@ mod budget_key_tests {
         assert!(
             matches!(g.check_active("127.0.0.1"), Err(GuardError::HostDisabled)),
             "the unported spelling is the host-wide view: a disabled service makes it refused"
+        );
+    }
+
+    /// An error charged under an unported spelling is host-wide: every port of
+    /// that host is disabled (the pre-existing "disabled under every spelling"
+    /// contract, in the direction `tests/guard.rs` does not cover).
+    #[test]
+    fn an_unported_disable_covers_every_port_of_the_host() {
+        let g = StdGuard::new(LimitConfig {
+            per_host_rps: 1000,
+            host_error_budget: 1,
+            ..LimitConfig::default()
+        });
+        g.add_scope(ScopeEntry {
+            host: "target.example".into(),
+        });
+        g.record_error("target.example");
+        for spelling in [
+            "target.example:443",
+            "target.example:8080",
+            "target.example",
+        ] {
+            assert!(
+                matches!(g.check_active(spelling), Err(GuardError::HostDisabled)),
+                "{spelling} is disabled by the host-wide window"
+            );
+        }
+    }
+
+    /// IPv6 authorities key by host and port, never by a string prefix: `::1`
+    /// and `::1:2` are different hosts, and a bracketed spelling folds to the
+    /// same key as the unbracketed one.
+    #[test]
+    fn ipv6_authorities_are_keyed_by_host_and_port_not_by_prefix() {
+        let g = StdGuard::new(LimitConfig {
+            per_host_rps: 1000,
+            host_error_budget: 1,
+            ..LimitConfig::default()
+        });
+        g.add_scope(ScopeEntry {
+            host: "[::1]".into(),
+        });
+        g.add_scope(ScopeEntry {
+            host: "[::1:2]".into(),
+        });
+        g.record_error("[::1:2]:443");
+        assert!(
+            matches!(g.check_active("[::1:2]:443"), Err(GuardError::HostDisabled)),
+            "the erroring IPv6 authority is disabled"
+        );
+        assert!(
+            g.check_active("[::1]:443").is_ok() && g.check_active("[::1]").is_ok(),
+            "a different IPv6 host that merely shares a prefix is still served"
+        );
+        g.record_error("[::1]:8443");
+        assert!(
+            matches!(g.check_active("[::1]:8443"), Err(GuardError::HostDisabled)),
+            "a bracketed spelling folds to the same key"
+        );
+        assert!(
+            g.check_active("[::1]:443").is_ok(),
+            "another port of the same IPv6 host is a different service"
         );
     }
 }

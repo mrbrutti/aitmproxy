@@ -750,13 +750,6 @@ mod tests {
         }
     }
 
-    /// Spec D5 "Budget and pacing": one `probes` budget per job, one unit per
-    /// stimulus, and the probe that would overdraw it is refused before it
-    /// reaches the sender.
-    /// Spec amendment 80: the job client sends every probe through
-    /// `ProxyClient::send_probe`, so the proxy's breaker does not count a 5xx
-    /// answer against the target's error budget (a probe is meant to provoke
-    /// one); it still charges transport failures and timeouts on that path.
     #[tokio::test]
     async fn probes_go_out_through_send_probe_not_send_opts() {
         let stub = StubClient::new(vec![Outcome::Ok(500), Outcome::Ok(200)]);
@@ -783,6 +776,13 @@ mod tests {
         );
     }
 
+    /// Spec D5 "Budget and pacing": one `probes` budget per job, one unit per
+    /// stimulus, and the probe that would overdraw it is refused before it
+    /// reaches the sender.
+    /// Spec amendment 80: the job client sends every probe through
+    /// `ProxyClient::send_probe`, so the proxy's breaker does not count a 5xx
+    /// answer against the target's error budget (a probe is meant to provoke
+    /// one); it still charges transport failures and timeouts on that path.
     #[tokio::test]
     async fn charges_one_unit_per_send_and_stops_at_budget() {
         let stub = StubClient::new(vec![Outcome::Ok(200), Outcome::Ok(200), Outcome::Ok(200)]);
