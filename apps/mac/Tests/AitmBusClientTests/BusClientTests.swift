@@ -164,4 +164,121 @@ private func makeClient(_ endpoint: BusEndpoint, timeout: Duration = .seconds(5)
             return
         }
     }
+
+    // MARK: Confirm-over-the-wire (spec 2026-10-31-l4-parity-fixes §3)
+    //
+    // The core strips `_confirm` before schema enforcement, so no tool's
+    // `inputSchema` declares it. A client that prunes arguments to the schema
+    // sends the confirmed re-issue bare and gets a second `needs_confirmation`
+    // (the TUI did exactly that, found live). These pins run the real
+    // `BusClient` over a loopback `NWConnection` and read what the server got.
+
+    /// The arguments the inspector sends for a guarded inject, built here.
+    private static let bareInjectArgs: [String: JSONValue] = [
+        "spec": ["layers": [["udp": ["dst_port": 9]], ["payload": ["hex": "00"]]]],
+        "dst": .string("127.0.0.1"),
+        "interface": .string("lo0"),
+    ]
+
+    /// What `aitm-mcp::server::needs_confirmation` answers the bare call with.
+    private static let needsConfirmationResult: JSONValue = [
+        "content": [["type": "text", "text": "Inject 1× UDP 127.0.0.1:9 on lo0"]],
+        "structuredContent": [
+            "status": "needs_confirmation",
+            "prompt": "Inject 1× UDP 127.0.0.1:9 on lo0",
+            "confirm_token": "tok-7f1c",
+        ],
+        "isError": false,
+    ]
+
+    private static let injectedResult: JSONValue = [
+        "content": [["type": "text", "text": "{\"injected\":1}"]],
+        "structuredContent": ["injected": 1],
+        "isError": false,
+    ]
+
+    @Test func confirmKeyReachesTheWireVerbatim() async throws {
+        let server = FakeBusServer()
+        let endpoint = try await server.start()
+        defer { Task { await server.stop() } }
+        await server.script("l4.inject", [Self.injectedResult])
+        let client = makeClient(endpoint)
+        _ = try await withTimeout { try await client.connect() }
+
+        let confirmed = Self.bareInjectArgs.merging(["_confirm": .string("tok-7f1c")]) { _, new in new }
+        _ = try await withTimeout { try await client.call("l4.inject", confirmed) }
+
+        // The whole arguments object, so a pruner that drops any key fails here.
+        let calls = await server.receivedCalls
+        #expect(
+            calls == [
+                RecordedCall(
+                    name: "l4.inject",
+                    arguments: [
+                        "spec": ["layers": [["udp": ["dst_port": 9]], ["payload": ["hex": "00"]]]],
+                        "dst": "127.0.0.1",
+                        "interface": "lo0",
+                        "_confirm": "tok-7f1c",
+                    ])
+            ])
+        #expect(calls.first?.arguments["_confirm"] == "tok-7f1c")
+    }
+
+    @Test func needsConfirmationResultIsReturnedNotThrown() async throws {
+        let server = FakeBusServer()
+        let endpoint = try await server.start()
+        defer { Task { await server.stop() } }
+        await server.script("l4.inject", [Self.needsConfirmationResult])
+        let client = makeClient(endpoint)
+        _ = try await withTimeout { try await client.connect() }
+
+        // Not a thrown `.tool` error: `isError` is false, so the UI parses
+        // `L4ConfirmRequest` (status, prompt, confirm_token) from the result.
+        let result = try await withTimeout { try await client.call("l4.inject", Self.bareInjectArgs) }
+        #expect(
+            result == [
+                "status": "needs_confirmation",
+                "prompt": "Inject 1× UDP 127.0.0.1:9 on lo0",
+                "confirm_token": "tok-7f1c",
+            ])
+        #expect(result["status"]?.stringValue == "needs_confirmation")
+        #expect(result["prompt"]?.stringValue == "Inject 1× UDP 127.0.0.1:9 on lo0")
+        #expect(result["confirm_token"]?.stringValue == "tok-7f1c")
+        // The connection survives the handshake reply.
+        try await withTimeout { try await client.ping() }
+    }
+
+    @Test func confirmedReissueIsASecondCallWithTheSameNameAndArgsPlusToken() async throws {
+        let server = FakeBusServer()
+        let endpoint = try await server.start()
+        defer { Task { await server.stop() } }
+        await server.script("l4.inject", [Self.needsConfirmationResult, Self.injectedResult])
+        let client = makeClient(endpoint)
+        _ = try await withTimeout { try await client.connect() }
+
+        // 1. Bare call: the core asks for confirmation and hands out a token.
+        let first = try await withTimeout { try await client.call("l4.inject", Self.bareInjectArgs) }
+        let token = try #require(first["confirm_token"]?.stringValue)
+        #expect(token == "tok-7f1c")
+
+        // 2. The identical call plus `_confirm` runs it.
+        let confirmed = Self.bareInjectArgs.merging(["_confirm": .string(token)]) { _, new in new }
+        let second = try await withTimeout { try await client.call("l4.inject", confirmed) }
+        #expect(second == ["injected": 1])
+
+        var expectedConfirmed = Self.bareInjectArgs
+        expectedConfirmed["_confirm"] = "tok-7f1c"
+        let calls = await server.receivedCalls
+        #expect(
+            calls == [
+                RecordedCall(name: "l4.inject", arguments: .object(Self.bareInjectArgs)),
+                RecordedCall(name: "l4.inject", arguments: .object(expectedConfirmed)),
+            ])
+
+        // The second call's arguments minus `_confirm` are exactly the first's.
+        var secondMinusToken = try #require(calls.last?.arguments.objectValue)
+        #expect(secondMinusToken.removeValue(forKey: "_confirm") == "tok-7f1c")
+        #expect(secondMinusToken == calls.first?.arguments.objectValue)
+        #expect(secondMinusToken == Self.bareInjectArgs)
+    }
 }

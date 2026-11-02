@@ -3,13 +3,25 @@ import Network
 
 @testable import AitmBusClient
 
+/// One `tools/call` as the server received it: the tool name and the
+/// `arguments` object exactly as it came off the wire.
+struct RecordedCall: Hashable, Sendable {
+    let name: String
+    let arguments: JSONValue
+}
+
 /// A stand-in for `aitm`'s loopback MCP transport: token line, `initialize`,
 /// `ping`, `tools/list`, `tools/call`, plus knobs the tests need (push a
-/// notification, a tool that hangs, a tool that drops the connection).
+/// notification, a tool that hangs, a tool that drops the connection, a
+/// scripted reply queue per tool).
 actor FakeBusServer {
     let token: String
     private(set) var port: UInt16 = 0
     private(set) var receivedMethods: [String] = []
+    /// Every `tools/call`, in arrival order, with its full `arguments`.
+    private(set) var receivedCalls: [RecordedCall] = []
+    /// Scripted `tools/call` results by tool name, consumed front to back.
+    private var scripted: [String: [JSONValue]] = [:]
 
     private struct Peer {
         let connection: NWConnection
@@ -56,6 +68,13 @@ actor FakeBusServer {
     func dropAllConnections() {
         for peer in peers.values { peer.connection.cancel() }
         peers.removeAll()
+    }
+
+    /// Queues tool results for `tool`: each `tools/call` of that name takes the
+    /// next one (the whole result object: `content`, `structuredContent`,
+    /// `isError`). Once the queue is empty the built-in tools answer again.
+    func script(_ tool: String, _ results: [JSONValue]) {
+        scripted[tool, default: []].append(contentsOf: results)
     }
 
     /// Writes one notification line to every authenticated peer.
@@ -182,6 +201,12 @@ actor FakeBusServer {
     private func callTool(_ params: JSONValue, peer id: UUID) -> Result<JSONValue, JSONRPCErrorBody>? {
         let name = params["name"]?.stringValue ?? ""
         let arguments = params["arguments"] ?? [:]
+        receivedCalls.append(RecordedCall(name: name, arguments: arguments))
+        if var queue = scripted[name], !queue.isEmpty {
+            let result = queue.removeFirst()
+            scripted[name] = queue
+            return .success(result)
+        }
         switch name {
         case "fake.echo":
             return .success([
