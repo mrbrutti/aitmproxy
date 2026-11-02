@@ -791,6 +791,91 @@ import Testing
         // With no other tail the block follows the `browser` section directly (byte-exact, as the core parses it).
         #expect(yaml.hasSuffix("    stop_timeout: 2\nsystem_proxy:\n  auto: true\n  bypass:\n    - \"corp.test\"\n"))
     }
+
+    // MARK: Harness audit log
+
+    /// A config whose only non-default is the harness audit-log file: every other field matches
+    /// the system-proxy helper's fixture, so `operatorToken` is `"11"` (the core's pin literal).
+    private func config(auditLogFile: URL?, systemProxyAuto: Bool = false) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            systemProxyAuto: systemProxyAuto,
+            auditLogFile: auditLogFile
+        )
+    }
+
+    @Test func audit_log_is_absent_by_default() throws {
+        // AC1: a Config built without the new parameter — every pre-existing call site, and the
+        // installed app's normal launch — carries no audit-log file and writes no `audit_log` key,
+        // so the core keeps its default and the generated config is byte-identical to before.
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        #expect(config.auditLogFile == nil)
+        #expect(!(try config.yaml()).contains("audit_log"))
+    }
+
+    @Test func audit_log_line_sits_inside_the_mcp_block_and_is_what_the_core_parses() throws {
+        // AC2/AC5: the key belongs to `mcp` (`deny_unknown_fields`), so it is the line directly
+        // after `operator_token` at two-space indent and before the top-level `browser:`.
+        let yaml = try config(auditLogFile: URL(fileURLWithPath: "/tmp/store/audit.jsonl")).yaml()
+        #expect(yaml.contains("  operator_token: \"11\"\n  audit_log: \"/tmp/store/audit.jsonl\"\nbrowser:\n"))
+
+        // Pin the fragment to the core's round-trip test: the Rust test must still spell the same
+        // two lines (under the minimal `mcp:` header that makes them a complete parse input) and
+        // must still exist. This file lives at apps/mac/Tests/AitmproxyKitTests/, so the repo
+        // root is five levels up.
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let source = root.appending(path: "crates/aitm/src/config_file.rs")
+        try #require(
+            FileManager.default.fileExists(atPath: source.path),
+            "cannot find the core's src/config_file.rs at \(source.path)")
+        let rust = try String(contentsOf: source, encoding: .utf8)
+        let rustLiteral = #""mcp:\n  operator_token: \"11\"\n  audit_log: \"/tmp/store/audit.jsonl\"\n""#
+        #expect(rust.contains(rustLiteral), "src/config_file.rs no longer contains the literal \(rustLiteral)")
+        #expect(rust.contains("fn mcp_audit_log_path_the_mac_app_emits_parses()"))
+    }
+
+    @Test func audit_log_path_is_escaped_and_a_newline_is_refused() throws {
+        // AC4: the path goes through the same double-quoted-scalar escape as the obscura and
+        // endpoint paths — a quote or backslash cannot break out of the scalar — and a newline
+        // (which would let a crafted `APP_STORE` inject YAML into the token-bearing file) throws.
+        let escaped = try config(auditLogFile: URL(fileURLWithPath: #"/a/"b"\c/audit.jsonl"#)).yaml()
+        #expect(escaped.contains(#"audit_log: "/a/\"b\"\\c/audit.jsonl""#))
+
+        let bad = config(auditLogFile: URL(fileURLWithPath: "/tmp/x\nlisten: evil"))
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\nlisten: evil")) {
+            try bad.yaml()
+        }
+    }
+
+    @Test func harness_audit_log_file_follows_the_harness_variables() {
+        // AC1–AC3: no harness variable means nil (the installed app); a non-empty `APP_STORE`
+        // points into the store; `APP_LIVE=1` alone points into the per-run work dir; when both
+        // are set the store wins, as it does for `Store.url`.
+        let workDir = URL(fileURLWithPath: "/tmp/wd", isDirectory: true)
+        func file(_ env: [String: String]) -> URL? {
+            EmbeddedCoreLaunch.harnessAuditLogFile(environment: env, workDir: workDir)
+        }
+        #expect(file([:]) == nil)
+        #expect(file(["APP_STORE": ""]) == nil)
+        #expect(file(["APP_LIVE": "0"]) == nil)
+        #expect(file(["APP_STORE": "/tmp/Aitmproxy-dev-state-x"])?.path == "/tmp/Aitmproxy-dev-state-x/audit.jsonl")
+        #expect(file(["APP_LIVE": "1"])?.path == "/tmp/wd/audit.jsonl")
+        #expect(file(["APP_STORE": "/tmp/Aitmproxy-dev-state-x", "APP_LIVE": "1"])?.path == "/tmp/Aitmproxy-dev-state-x/audit.jsonl")
+    }
+
+    @Test func audit_log_does_not_disturb_the_tails() throws {
+        // AC7: the line lives in the `mcp:` block, not as a tail, so the byte-exact `hasSuffix`
+        // the system-proxy tests rely on still holds, and `audit_log` precedes `browser:`.
+        let yaml = try config(auditLogFile: URL(fileURLWithPath: "/tmp/store/audit.jsonl"), systemProxyAuto: true).yaml()
+        #expect(yaml.hasSuffix("\nsystem_proxy:\n  auto: true\n"))
+        let audit = try #require(yaml.range(of: "  audit_log: \"/tmp/store/audit.jsonl\"\n"))
+        let browser = try #require(yaml.range(of: "browser:\n"))
+        #expect(audit.upperBound <= browser.lowerBound)
+    }
 }
 
 /// A minimal real listener that holds a TCP port for the duration of a test, so
