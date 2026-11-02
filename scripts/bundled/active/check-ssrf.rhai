@@ -36,17 +36,30 @@ const META = #{
 
 fn load(reg) {
     reg.add_check(META, |point| {
-        // Each target with a signature its own response carries.
+        // Each target with a signature its own response carries. No signature
+        // token appears in its own URL, and none is something an ordinary page
+        // says anyway: a page that merely echoes the URL we sent (the first
+        // live run read `computeMetadata` and every page's `<title>` as a hit)
+        // is not a fetch.
         let targets = [
-            ["http://169.254.169.254/latest/meta-data/", "(?i)(ami-id|instance-id|iam/|hostname|public-keys)"],
-            ["http://metadata.google.internal/computeMetadata/v1/", "(?i)(computeMetadata|project-id|instance/)"],
-            ["http://169.254.169.254/metadata/instance?api-version=2021-02-01", "(?i)(compute|azEnvironment|subscriptionId)"],
-            ["http://127.0.0.1/", "(?i)(<title>|server:|apache|nginx|it works)"],
+            ["http://169.254.169.254/latest/meta-data/", "(?i)(ami-id|instance-id|iam/security-credentials|public-keys/)"],
+            ["http://metadata.google.internal/computeMetadata/v1/", "(?i)(project-id|numeric-project-id|service-accounts/)"],
+            ["http://169.254.169.254/metadata/instance?api-version=2021-02-01", "(?i)(azEnvironment|subscriptionId|vmId|resourceGroupName)"],
+            ["http://127.0.0.1/", "(?i)(it works!|welcome to nginx|apache2 (debian|ubuntu) default|iis windows server)"],
         ];
+
+        // A signature the page carries before any payload is the page's own
+        // text, not a fetched response.
+        let baseline = probe.baseline();
 
         for target in targets {
             let reply = probe.send(target[0]);
-            if regex_match(target[1], reply.body) {
+            // The echo of the URL itself is cut out before matching, so a
+            // reflected parameter can never be read as a fetched page.
+            // (`replace` edits the string in place and returns nothing.)
+            let body = reply.body;
+            body.replace(target[0], "");
+            if regex_match(target[1], body) && !regex_match(target[1], baseline.body) {
                 return #{
                     outcome: "vulnerable",
                     confidence: "firm",

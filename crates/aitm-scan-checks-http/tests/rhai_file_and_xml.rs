@@ -565,6 +565,52 @@ async fn ssrf_is_vulnerable_against_its_vulnerable_shape() {
     );
 }
 
+/// Live run 2026-11-01 (T3 PR 2b): a page that echoes the URL it was handed, and
+/// every HTML page's `<title>`, were read as fetched metadata. The echo of the
+/// payload is cut out before matching and no signature token is one an
+/// ordinary page carries, so an echoing page is Clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssrf_is_clean_when_the_page_only_echoes_the_url() {
+    let check = Loaded::load("check-ssrf.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+
+    let host = Replies::plain(200, "<title>Search</title><p>you searched for</p>")
+        .when("169.254.169.254/latest/meta-data", 200,
+              "<title>Search</title><p>you searched for http://169.254.169.254/latest/meta-data/</p>")
+        .when("metadata.google.internal", 200,
+              "<title>Search</title><p>you searched for http://metadata.google.internal/computeMetadata/v1/</p>")
+        .when("metadata/instance", 200,
+              "<title>Search</title><p>you searched for http://169.254.169.254/metadata/instance?api-version=2021-02-01</p>")
+        .when("127.0.0.1", 200, "<title>Search</title><p>you searched for http://127.0.0.1/</p>")
+        .build();
+    let verdict = run(&check, &ssrf_point(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean);
+    assert_eq!(
+        host.payloads(),
+        ssrf_targets(),
+        "every address was tried before the point was cleared"
+    );
+}
+
+/// A signature the page already carries before any payload is the page's own
+/// text: the baseline is consulted and the point is Clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssrf_is_clean_when_the_baseline_already_carries_the_signature() {
+    let check = Loaded::load("check-ssrf.rhai")
+        .expect("loads")
+        .single()
+        .expect("exactly one check");
+
+    let host = Replies::plain(200, "<h1>It works!</h1>").build();
+    let verdict = run(&check, &ssrf_point(), &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean);
+    assert_eq!(host.payloads(), ssrf_targets());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssrf_is_clean_against_its_patched_shape() {
     let check = Loaded::load("check-ssrf.rhai")
