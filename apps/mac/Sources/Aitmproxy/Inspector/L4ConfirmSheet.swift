@@ -18,9 +18,7 @@ struct L4ConfirmSheet: View {
     /// one-line inject summary without wrapping.
     private static let width: CGFloat = 480
 
-    private var words: (title: String, action: String, identifier: String) {
-        L4ConfirmWords.for(command: request.call?.command)
-    }
+    private var words: L4ConfirmWords { L4ConfirmWords(command: request.call?.command) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.md) {

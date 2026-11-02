@@ -434,14 +434,18 @@ public struct L4ConfirmRequest: Hashable, Sendable, Identifiable {
 /// the action button's label and the button's accessibility identifier the live check
 /// presses. Derived from the call's command so the dialog can never say "Inject" over a
 /// drop; an unknown or absent command gets the neutral words.
-public enum L4ConfirmWords {
-    public static func `for`(command: String?) -> (title: String, action: String, identifier: String) {
+public struct L4ConfirmWords: Hashable, Sendable {
+    public let title: String
+    public let action: String
+    public let identifier: String
+
+    public init(command: String?) {
         switch command {
-        case "l4.inject": ("Confirm injection", "Inject", "l4-confirm-inject")
-        case "l4.intercept.forward": ("Confirm forward", "Forward", "l4-confirm-forward")
-        case "l4.intercept.drop": ("Confirm drop", "Drop", "l4-confirm-drop")
-        case "l4.scope.add": ("Confirm L4 scope entry", "Add", "l4-scope-confirm")
-        default: ("Confirm", "Confirm", "l4-confirm")
+        case "l4.inject": (title, action, identifier) = ("Confirm injection", "Inject", "l4-confirm-inject")
+        case "l4.intercept.forward": (title, action, identifier) = ("Confirm forward", "Forward", "l4-confirm-forward")
+        case "l4.intercept.drop": (title, action, identifier) = ("Confirm drop", "Drop", "l4-confirm-drop")
+        case "l4.scope.add": (title, action, identifier) = ("Confirm L4 scope entry", "Add", "l4-scope-confirm")
+        default: (title, action, identifier) = ("Confirm", "Confirm", "l4-confirm")
         }
     }
 }

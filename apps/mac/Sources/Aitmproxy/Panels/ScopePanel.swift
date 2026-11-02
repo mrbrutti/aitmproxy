@@ -382,8 +382,9 @@ struct ScopePanel: View {
 
     // MARK: L4 add (spec §3; rendered only while `l4CanAddScope` and the session is the operator)
 
-    /// The role the server echoed at `initialize`; nil (unconfirmed) is not the operator.
-    private var l4IsOperator: Bool { session.resolvedRole == "operator" }
+    /// The connection is the operator's: `Session.isOperator`, read from the `resolvedRole` the
+    /// server echoed at `initialize`; nil (unconfirmed) is not the operator.
+    private var l4IsOperator: Bool { session.isOperator }
 
     private var l4CidrTrimmed: String { l4Cidr.trimmingCharacters(in: .whitespaces) }
     private var l4InterfaceTrimmed: String { l4Interface.trimmingCharacters(in: .whitespaces) }
@@ -435,6 +436,10 @@ struct ScopePanel: View {
     /// prompt bound to this exact call; a plain result refreshes the list; a guard
     /// refusal or error lands inline, never in a dialog.
     private func addL4Scope() {
+        // The role gate at the send site, not only on the form (AC33; plan amendment 7): a
+        // future menu item or shortcut that reaches here without the operator role is refused
+        // inline with the same reason the inspector's verbs use, and nothing is sent.
+        guard l4IsOperator else { l4AddError = Session.operatorOnlyReason; return }
         guard canAddL4 else { return }
         let draft = L4ScopeDraft(cidr: l4CidrTrimmed, ports: l4Ports, interface: l4InterfaceTrimmed,
                                  direction: l4Direction, capability: l4Capability)
@@ -484,13 +489,13 @@ struct ScopePanel: View {
     /// while the bus still reports connected after the await, which is as close as a view can
     /// get to `BusService`'s owner check. A reconnect that lands inside the round trip loses
     /// nothing — `BusService.pollLoop` clears the L4 facts on disconnect and its slow tick
-    /// re-reads `l4.scope.list` (about every 5 s), so the list converges on the core's either way.
+    /// re-reads `l4.scope.list` (about every 5 s), so the list converges on the core's either
+    /// way. The form is the view's own and is cleared on every successful read.
     private func refreshL4ScopeAfterAdd() async {
         do {
             let list = try await session.runCommand("l4.scope.list", [:])
-            guard case .connected = session.bus else { return }
             let items = L4ScopeItem.list(list)
-            if session.l4Scope != items { session.l4Scope = items }
+            if case .connected = session.bus, session.l4Scope != items { session.l4Scope = items }
             l4Cidr = ""
             l4Ports = ""
             l4Interface = "lo0"

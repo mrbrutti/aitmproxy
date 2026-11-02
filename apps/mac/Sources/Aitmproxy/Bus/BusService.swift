@@ -239,7 +239,9 @@ final class BusService: FlowActions {
             // slow tick, so counts and session state follow the core at the ~5 s cadence of the other
             // L4 facts instead of one `l4.flow.get` per flow per 500 ms. Nothing is cached between
             // ticks beyond `session.l4Details`, so a flow the core dropped leaves the list on the next
-            // tick. One flow's failed read skips that flow, like the HTTP loop. A failed `l4.flow.list`
+            // tick. A new flow whose first read fails is skipped until the next tick, like the HTTP
+            // loop; a known flow whose slow-tick re-read fails keeps its cached fields, so a transient
+            // failure never drops a row or blanks the inspector. A failed `l4.flow.list`
             // is an empty tick, deliberately not a thrown error: `pollLoop` throwing is how a lost
             // connection is reported, and an L4 verb error (a gated verb on an older core, a guard
             // refusal) must not reconnect the whole bus and drop the HTTP rows with it.
@@ -256,7 +258,11 @@ final class BusService: FlowActions {
                     }
                     let json = try? await client.call("l4.flow.get", L4Wire.flowGetArgs(id: id, inspect: false, window: window))
                     guard owns() else { return }
-                    if let json, let flow = L4Flow(json: json) { l4Flows.append(flow) }
+                    if let json, let flow = L4Flow(json: json) {
+                        l4Flows.append(flow)
+                    } else if let cached = known[id] {
+                        l4Flows.append(cached)
+                    }
                 }
             }
             // Likewise the rows and rates this iteration publishes: no await from here to the sleep.

@@ -33,12 +33,9 @@ struct L4Inspector: View {
 
     private var gate: L4ActionGate { L4ActionGate(inScope: row.inScope) }
     /// Inject, Forward and Drop are the operator's (spec §3): an agent-role session would only
-    /// get a policy refusal, so the buttons are disabled with the reason instead of offered to
-    /// fail — the same gate as the Scope page's add form (`l4IsOperator`). Read from the role the
-    /// server echoed at `initialize`; nil (unconfirmed) is not the operator.
-    private var isOperator: Bool { session.resolvedRole == "operator" }
-    /// The help text on a verb the role gate disabled.
-    static let operatorOnlyReason = "Needs the operator token (Settings ▸ Bus)"
+    /// get a policy refusal, so the buttons are disabled with `Session.operatorOnlyReason` and
+    /// `issue` refuses at the send site — the same gate as the Scope page's add form.
+    private var isOperator: Bool { session.isOperator }
     /// The oldest parked packet of this flow, the one the intercept bar acts on (spec §4).
     private var parkedPacket: L4ParkedPacket? { L4ParkedPacket.first(for: row.id, in: session.l4Parked) }
 
@@ -49,7 +46,7 @@ struct L4Inspector: View {
                 Rule()
             }
             L4InterceptBar(availability: session.l4InterceptAvailability, parked: parkedPacket, gate: gate,
-                           isOperator: isOperator,
+                           isOperator: isOperator, operatorOnlyReason: Session.operatorOnlyReason,
                            onForward: { verdict("l4.intercept.forward") },
                            onDrop: { verdict("l4.intercept.drop") })
             if let detail {
@@ -182,7 +179,7 @@ struct L4Inspector: View {
     /// availability text (its reason when degraded, the pending literal before the first
     /// status reply), else what is left to do.
     private var injectHelp: String {
-        if !isOperator { return Self.operatorOnlyReason }
+        if !isOperator { return Session.operatorOnlyReason }
         if !gate.injectEnabled { return gate.disabledReason ?? "" }
         if let text = session.l4CaptureAvailability.displayText { return text }
         if preview == nil { return "Build the packet first" }
@@ -229,8 +226,12 @@ struct L4Inspector: View {
 
     /// Issue one confirmable call. A `needs_confirmation` reply becomes a prompt
     /// bound to exactly this call; a plain result reports `plainResult`; a guard
-    /// refusal is surfaced verbatim, never as a confirm dialog.
+    /// refusal is surfaced verbatim, never as a confirm dialog. The role gate is
+    /// enforced here, at the send site, not only on the buttons: a future menu item
+    /// or shortcut that reaches `issue` without the operator role is refused the
+    /// same way (AC33), nothing is sent.
     private func issue(_ call: L4PendingCall, plainResult: String) {
+        guard isOperator else { injectResult = Session.operatorOnlyReason; return }
         injectResult = nil
         Task {
             do {
@@ -409,8 +410,8 @@ private struct L4PacketDetail: View {
                 if let bytes = packet.bytes {
                     // Every row is one `Text`; `L4Hex` has already replaced every byte
                     // outside 0x20–0x7e with `.`, so nothing a packet carried can act on
-                    // the screen (spec §2.3). The rows are built once per packet, here,
-                    // and laid out lazily: a 256-packet window of full frames is 25,000 rows.
+                    // the screen (spec §2.3). These are one packet's rows — a jumbo frame is
+                    // a few thousand — so they are built once, here, and laid out lazily.
                     let rows = L4Hex.rows(bytes)
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(rows.enumerated()), id: \.offset) { _, line in
@@ -457,12 +458,14 @@ struct L4InterceptBar: View {
     var parked: L4ParkedPacket?
     var gate: L4ActionGate
     var isOperator: Bool
+    /// What a verdict says when `isOperator` is false (`Session.operatorOnlyReason`).
+    var operatorOnlyReason: String
     var onForward: () -> Void
     var onDrop: () -> Void
 
     /// The reason a verdict is disabled, or nil when it is offered.
     private func disabledReason(_ action: L4MutatingAction) -> String? {
-        if !isOperator { return L4Inspector.operatorOnlyReason }
+        if !isOperator { return operatorOnlyReason }
         return gate.isEnabled(action) ? nil : gate.disabledReason
     }
 

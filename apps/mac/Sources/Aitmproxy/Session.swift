@@ -178,6 +178,11 @@ final class Session {
     /// Set when the operator's Expected role (Settings ▸ Bus) disagrees with the
     /// resolved role, or the server echoed no role to confirm it (spec AC8).
     var roleWarning = false
+    /// The connection is the operator's (the role the server echoed at `initialize`); nil
+    /// (unconfirmed) or `"agent"` is not. The operator-only L4 verbs and the L4 scope add gate on it.
+    var isOperator: Bool { resolvedRole == "operator" }
+    /// Why an operator-only control is disabled or a call refused at its send site.
+    static let operatorOnlyReason = "Needs the operator token (Settings ▸ Bus)"
     /// Bumped by Proxy ▸ Reconnect Bus (⌃⌘R) so the shell re-resolves the
     /// endpoint and reconnects — picking up a newly pasted operator token.
     var reconnectTick = 0

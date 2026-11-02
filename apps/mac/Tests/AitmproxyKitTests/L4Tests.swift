@@ -1020,9 +1020,24 @@ import Testing
 }
 
 @Suite struct L4TesterScopeCoverTests {
-    private func item(_ cidr: String, ports: String, interface: String = "lo0") -> L4ScopeItem {
-        L4ScopeItem(id: "T", cidr: cidr, ports: ports, interface: interface, direction: "inbound",
+    private func item(_ cidr: String, ports: String, interface: String = "lo0", direction: String = "inbound") -> L4ScopeItem {
+        L4ScopeItem(id: "T", cidr: cidr, ports: ports, interface: interface, direction: direction,
                     capability: "capture", source: "config")
+    }
+
+    /// S1: a flow that carries a direction is covered only by an entry of the same direction,
+    /// compared exactly; a flow without one (today's `L4Flow`) is not checked against the entry's.
+    @Test func testDirectionMustMatchWhenTheFlowCarriesOne() {
+        let inbound = item("127.0.0.1/32", ports: "all", direction: "inbound")
+        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "inbound"))
+        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "outbound"))
+        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: nil, direction: "outbound"))
+        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "Inbound"))
+        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: nil))
+        let outbound = item("10.0.0.0/8", ports: "all", direction: "outbound")
+        #expect(outbound.covers(interface: "lo0", dst: "10.1.2.3", port: 443, direction: "outbound"))
+        #expect(!outbound.covers(interface: "lo0", dst: "10.1.2.3", port: 443, direction: "inbound"))
     }
 
     /// The IPv4 prefix arithmetic at its edges: `/0` covers every IPv4 address, `/32` only the
@@ -1105,74 +1120,43 @@ import Testing
 
 // MARK: - Review-log fixes (stage 6, plan 2026-10-31-l4-parity-fixes unit (d))
 
-@Suite struct L4ReviewFixCoverTests {
-    private func item(_ cidr: String, ports: String, direction: String = "inbound") -> L4ScopeItem {
-        L4ScopeItem(id: "R", cidr: cidr, ports: ports, interface: "lo0", direction: direction,
-                    capability: "capture", source: "config")
-    }
-
-    /// S1: an ICMP-like flow (`lo0`, `127.0.0.1`, no port) is NOT covered by a `9000-9999` entry
-    /// but IS by an `all` entry; a flow that carries a direction is covered only by an entry of
-    /// the same direction, and a flow without one (today's `L4Flow`) ignores the entry's.
-    @Test func testUnknownPortNeedsAllAndDirectionMustMatch() {
-        #expect(!item("127.0.0.1/32", ports: "9000-9999").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
-        #expect(item("127.0.0.1/32", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
-        #expect(!item("127.0.0.1/32", ports: "9053").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
-        // A known port still goes through the range.
-        #expect(item("127.0.0.1/32", ports: "9000-9999").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
-
-        let inbound = item("127.0.0.1/32", ports: "all", direction: "inbound")
-        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "inbound"))
-        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "outbound"))
-        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: nil, direction: "outbound"))
-        // No direction on the flow: the entry's direction is not consulted (the default argument).
-        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
-        #expect(inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: nil))
-        // The entry's direction is compared exactly.
-        #expect(!inbound.covers(interface: "lo0", dst: "127.0.0.1", port: 9053, direction: "Inbound"))
-        let outbound = item("10.0.0.0/8", ports: "all", direction: "outbound")
-        #expect(outbound.covers(interface: "lo0", dst: "10.1.2.3", port: 443, direction: "outbound"))
-        #expect(!outbound.covers(interface: "lo0", dst: "10.1.2.3", port: 443, direction: "inbound"))
-    }
-}
-
-@Suite struct L4ReviewFixConfirmWordsTests {
+@Suite struct L4ConfirmWordsTests {
     /// Q3: the one shared confirm sheet derives its title, action word and accessibility
     /// identifier from the bound call's command; an unknown or absent command gets the
     /// neutral words.
     @Test func testConfirmWordsFollowTheBoundCommand() {
-        let inject = L4ConfirmWords.for(command: "l4.inject")
+        let inject = L4ConfirmWords(command: "l4.inject")
         #expect(inject.title == "Confirm injection")
         #expect(inject.action == "Inject")
         #expect(inject.identifier == "l4-confirm-inject")
 
-        let forward = L4ConfirmWords.for(command: "l4.intercept.forward")
+        let forward = L4ConfirmWords(command: "l4.intercept.forward")
         #expect(forward.title == "Confirm forward")
         #expect(forward.action == "Forward")
         #expect(forward.identifier == "l4-confirm-forward")
 
-        let drop = L4ConfirmWords.for(command: "l4.intercept.drop")
+        let drop = L4ConfirmWords(command: "l4.intercept.drop")
         #expect(drop.title == "Confirm drop")
         #expect(drop.action == "Drop")
         #expect(drop.identifier == "l4-confirm-drop")
 
-        let scope = L4ConfirmWords.for(command: "l4.scope.add")
+        let scope = L4ConfirmWords(command: "l4.scope.add")
         #expect(scope.title == "Confirm L4 scope entry")
         #expect(scope.action == "Add")
         #expect(scope.identifier == "l4-scope-confirm")
 
-        let unknown = L4ConfirmWords.for(command: "l4.intercept.mutate")
+        let unknown = L4ConfirmWords(command: "l4.intercept.mutate")
         #expect(unknown.title == "Confirm")
         #expect(unknown.action == "Confirm")
         #expect(unknown.identifier == "l4-confirm")
-        let unbound = L4ConfirmWords.for(command: nil)
+        let unbound = L4ConfirmWords(command: nil)
         #expect(unbound.title == "Confirm")
         #expect(unbound.action == "Confirm")
         #expect(unbound.identifier == "l4-confirm")
     }
 }
 
-@Suite struct L4ReviewFixEndpointsTests {
+@Suite struct L4PacketEndpointsTests {
     /// Q7: `L4Packet.endpoints` is `src:srcPort → dst:dstPort` from whatever §2 fields the core
     /// sent — a side without a port is the bare host, a missing side is `?`, and a packet with
     /// neither address has no endpoints line at all.
