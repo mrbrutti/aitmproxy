@@ -15,7 +15,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     confidence_token, is_issue_id, lane_token, scroll, severity_token, status_token, step, walk,
-    wire_token, Dir, ScanError, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT, SEVERITY_ORDER,
+    wire_token, Dir, ScanError, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT,
+    SEVERITY_ORDER,
 };
 use crate::action::Action;
 use crate::text::{clean, cut_to, truncate};
@@ -296,6 +297,8 @@ pub struct ReadIssue {
 pub struct Dropped {
     /// Probe flows past [`FLOWS_MAX`].
     pub flows: usize,
+    /// Finders (`Issue.jobs`) past [`DETAIL_LIST_MAX`] (fix round H, H84).
+    pub jobs: usize,
     /// Mutators of the L4 mutation chain past `MUTATIONS_MAX + 1`.
     pub mutations: usize,
     /// Timing rows past `TIMING_ROWS_MAX + 1`.
@@ -585,11 +588,16 @@ impl IssuesState {
         self.detail().map_or(0, |read| DetailLayout::of(read).total)
     }
 
-    /// Drop every read issue that belongs to `job` (spec D6: a terminal
+    /// Drop every read issue whose sole finder is `job` (spec D6: a terminal
     /// line for the job lets the next landing read the issue again), by the
-    /// job the issue itself names, so a filtered-out job's issues leave too.
+    /// jobs the issue itself names (`jobs_or_job()`; fix round H, H84), so a
+    /// filtered-out job's issues leave too while an issue another listed
+    /// job still owns stays read.
     pub fn forget_job(&mut self, job: &str) {
-        self.read.retain(|_, i| i.job != job);
+        self.read.retain(|_, i| {
+            let jobs = i.jobs_or_job();
+            !(jobs.len() == 1 && jobs[0] == job)
+        });
     }
 }
 
@@ -680,10 +688,15 @@ impl DetailLayout {
 /// probe flows and timing rows dropped are returned, so the pane can count
 /// them, and every truncated vector gives its capacity back. Ids the fold
 /// matched (`id`), enums and numbers the contract already bounds are left
-/// alone; `job`, a free string on the wire, is cut like the rest (G1). The
-/// per-frame line building then runs over bounded text only.
+/// alone; `job`, a free string on the wire, is cut like the rest (G1), and
+/// so is every id of `jobs`, kept to [`DETAIL_LIST_MAX`] with the rest
+/// counted (H84). The per-frame line building then runs over bounded text
+/// only.
 fn bound_issue(issue: &mut Issue) -> Dropped {
     let cut = |s: &mut String| cut_to(s, DETAIL_VALUE_MAX);
+    let dropped_jobs = issue.jobs.len().saturating_sub(DETAIL_LIST_MAX);
+    issue.jobs.truncate(DETAIL_LIST_MAX);
+    issue.jobs.shrink_to_fit();
     let loc = &mut issue.location;
     let mut fields: Vec<&mut String> = vec![
         &mut issue.description,
@@ -697,6 +710,7 @@ fn bound_issue(issue: &mut Issue) -> Dropped {
         &mut loc.path_template,
         &mut loc.name,
     ];
+    fields.extend(issue.jobs.iter_mut());
     fields.extend(
         [
             issue.evidence.payload.as_mut(),
@@ -756,6 +770,7 @@ fn bound_issue(issue: &mut Issue) -> Dropped {
     }
     Dropped {
         flows: dropped_flows,
+        jobs: dropped_jobs,
         mutations: dropped_mutations,
         timing: dropped_timing,
     }
@@ -793,8 +808,8 @@ pub type DetailLine = (&'static str, String);
 /// under it when the issue has one, H60); the description;
 /// the evidence (`payload`, `matched`, the timing table, the diff lengths,
 /// the L4 fields) when present; `after_flows` is the PoC and finding refs,
-/// remediation and note when present, then occurrences with first and last
-/// seen. The head is [`issue_head`]; the flows are [`flow_at`]. Built from
+/// remediation and note when present, the jobs that found the issue
+/// (H84), then occurrences with first and last seen. The head is [`issue_head`]; the flows are [`flow_at`]. Built from
 /// the strings [`bound_issue`] cut once at fold time; the view cuts each
 /// line to the pane. Nothing but the named fields of the `Issue` is ever
 /// rendered, so no cookie or header value can reach the screen from here.
@@ -869,6 +884,7 @@ pub fn issue_detail_lines(read: &ReadIssue) -> DetailLines {
     if let Some(n) = &issue.note {
         after.push(("note", n.clone()));
     }
+    after.push(("job", jobs_text(issue, read.dropped.jobs)));
     after.push((
         "seen",
         format!(
@@ -888,8 +904,8 @@ pub fn issue_detail_lines(read: &ReadIssue) -> DetailLines {
 /// The lines every `before_flows` has: class, target, location,
 /// description.
 const BEFORE_FIXED_LINES: usize = 4;
-/// The lines every `after_flows` has: poc, finding, seen.
-const AFTER_FIXED_LINES: usize = 3;
+/// The lines every `after_flows` has: poc, finding, job, seen.
+const AFTER_FIXED_LINES: usize = 4;
 
 /// How many lines [`issue_detail_lines`] builds for the read issue, as
 /// `(before_flows, after_flows)`, counted without building them (the
@@ -937,6 +953,18 @@ fn location_text(issue: &Issue) -> String {
     }
     if let Some(w) = &loc.ws_path {
         text.push_str(&format!(" · ws {w}"));
+    }
+    text
+}
+
+/// The `job` detail line (fix round H, H84): every job that found or
+/// re-found the issue (`jobs_or_job()`, the first finder first, each id cut
+/// by [`bound_issue`]) joined by `, `, then ` +n` for the finders the fold
+/// cut past [`DETAIL_LIST_MAX`].
+fn jobs_text(issue: &Issue, dropped: usize) -> String {
+    let mut text = issue.jobs_or_job().join(", ");
+    if dropped > 0 {
+        text.push_str(&format!(" +{dropped}"));
     }
     text
 }
@@ -1248,6 +1276,7 @@ mod tests {
                     "remediation",
                     "Contextually encode output and set a strict CSP."
                 ),
+                ("job", "scan-1a2b3c4d"),
                 (
                     "seen",
                     "1 occurrence · first 2025-10-31 08:40:00 · last 2025-10-31 08:40:00"
@@ -1282,9 +1311,11 @@ mod tests {
         state.list = vec![issue.summary()];
         state.rows = vec![issue_row(&state.list[0])];
         state.fold_issue(issue);
+        // The head, eleven pairs (the `job` line among them, H84), the
+        // flows label and three flows.
         assert_eq!(
             state.detail_len(),
-            1 + 10 + 1 + 3,
+            1 + 11 + 1 + 3,
             "head, pairs, label, flows"
         );
         assert_eq!(state.flow_count(), 3);
@@ -1543,7 +1574,7 @@ mod tests {
             state.flow_under_cursor().map(|(_, tag)| tag),
             Some(FlowTag::Baseline)
         );
-        assert_eq!(state.detail_len(), 1 + 10 + 1 + 65 + 1);
+        assert_eq!(state.detail_len(), 1 + 11 + 1 + 65 + 1);
         // Fix round G, G2: the layout is the one arithmetic; its total is
         // `detail_len`, its runs are the lines built, and `first_after`
         // sits past the flows and the `... n more` row.

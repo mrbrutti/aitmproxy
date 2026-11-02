@@ -976,3 +976,95 @@ fn an_l4_location_renders_its_own_detail_line() {
         "the inline form on the location line is gone: {text}"
     );
 }
+
+/// Fix round H, H84 (`Issue.jobs`, #232 `7252d0df`): an issue belongs to
+/// every job that found or re-found it. The detail's `job` line lists
+/// `jobs_or_job()` joined by `, `: both ids of a two-job issue, the one
+/// `job` of a record written before the field existed.
+#[test]
+fn the_job_line_names_every_job_that_found_the_issue() {
+    let mut app = app_with_xss_read();
+    let text = screen(&app);
+    assert_eq!(
+        detail_line(&text, "job         scan-"),
+        "job         scan-1a2b3c4d",
+        "an older record reads its one job: {text}"
+    );
+
+    let mut issue = fixture("scan.issue.json");
+    issue["jobs"] = json!(["scan-1a2b3c4d", "scan-2b3c4d5e"]);
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    let text = screen(&app);
+    assert_eq!(
+        detail_line(&text, "job         scan-"),
+        "job         scan-1a2b3c4d, scan-2b3c4d5e",
+        "both finders, first finder first: {text}"
+    );
+}
+
+/// Fix round H, H84: `forget_job` drops a read issue only when the job is
+/// its sole finder, so an issue another listed job still owns stays read
+/// (its detail is not re-fetched for a job that did not stop owning it).
+#[test]
+fn forget_job_keeps_an_issue_another_job_still_owns() {
+    let mut app = app_with_xss_read();
+    let mut issue = fixture("scan.issue.json");
+    issue["jobs"] = json!(["scan-1a2b3c4d", "scan-2b3c4d5e"]);
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    assert!(app.scan.issues.detail().is_some());
+    app.scan.issues.forget_job("scan-1a2b3c4d");
+    assert!(
+        app.scan.issues.detail().is_some(),
+        "the first finder's terminal line keeps a two-job issue read"
+    );
+    app.scan.issues.forget_job("scan-2b3c4d5e");
+    assert!(
+        app.scan.issues.detail().is_some(),
+        "neither listed job is the sole finder"
+    );
+
+    let mut app = app_with_xss_read();
+    assert!(app.scan.issues.detail().is_some());
+    app.scan.issues.forget_job("scan-1a2b3c4d");
+    assert!(
+        app.scan.issues.detail().is_none(),
+        "a one-job issue is dropped by its only finder"
+    );
+    assert!(app.scan.issues.read.is_empty());
+}
+
+/// Fix round H, H84 (D6 hostile-core bounds): the `jobs` list is cut at
+/// fold to `DETAIL_LIST_MAX` ids, each cut like `job`, and the line says
+/// `+n` for the rest; twenty finders read as the first eight and `+12`.
+#[test]
+fn the_job_line_is_bounded_at_fold_with_a_plus_n() {
+    use aitm_tui::scan::DETAIL_LIST_MAX;
+
+    let mut app = app_with_xss_read();
+    let mut issue = fixture("scan.issue.json");
+    let jobs: Vec<String> = (0..20).map(|k| format!("scan-{k:08x}")).collect();
+    issue["jobs"] = json!(jobs);
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    let read = app.scan.issues.detail().expect("read");
+    assert_eq!(read.jobs.len(), DETAIL_LIST_MAX);
+    assert!(read.jobs.capacity() < 20, "capacity given back");
+    let want = format!(
+        "{} +{}",
+        jobs[..DETAIL_LIST_MAX].join(", "),
+        20 - DETAIL_LIST_MAX
+    );
+    let lines = aitm_tui::scan::issue_detail_lines(read);
+    assert!(
+        lines.after_flows.contains(&("job", want.clone())),
+        "the job line: {:?}",
+        lines.after_flows
+    );
+    // The pane cuts the long line once to its width, ellipsis on the cut.
+    let text = screen(&app);
+    let row = detail_line(&text, "job         scan-");
+    assert!(
+        row.starts_with("job         scan-00000000, scan-00000001, scan-00000002"),
+        "{row}"
+    );
+    assert!(row.ends_with('…'), "cut by the pane: {row}");
+}
