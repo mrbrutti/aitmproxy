@@ -205,7 +205,12 @@ actor EmbeddedCore {
                 captureEnabled: captureEnabled,
                 scopeHosts: scopeHosts,
                 systemProxyAuto: systemProxyAuto,
-                systemProxyBypass: systemProxyBypass
+                systemProxyBypass: systemProxyBypass,
+                // A harness run (dev bundle `APP_STORE`, live self-test `APP_LIVE=1`) keeps
+                // its durable audit under its own directory, never the operator's real
+                // `audit.jsonl`; a normal launch passes nil and the config is unchanged.
+                auditLogFile: EmbeddedCoreLaunch.harnessAuditLogFile(
+                    environment: ProcessInfo.processInfo.environment, workDir: workDir)
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {

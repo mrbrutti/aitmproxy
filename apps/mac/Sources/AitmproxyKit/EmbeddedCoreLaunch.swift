@@ -158,6 +158,30 @@ public enum EmbeddedCoreLaunch {
         return bare == "127.0.0.1" || bare == "::1" || bare == "localhost"
     }
 
+    // MARK: Harness audit log
+
+    /// Where a harness run's embedded core should write its durable audit, or `nil`
+    /// for a normal launch. Pure and environment-injected so it is unit-testable
+    /// without the process environment. The same two variables that make
+    /// `SettingsDomain` pick the isolated defaults suite drive this:
+    /// - `APP_STORE` non-empty (a dev bundle, `tools/snap-dev.sh`): `<APP_STORE>/audit.jsonl`
+    ///   — the store wins when both are set, as it does for `Store.url` (AC2);
+    /// - else `APP_LIVE == "1"` (the live self-test, which `SelfTest.live` matches
+    ///   exactly so): `<workDir>/audit.jsonl`, the per-run `0700` dir the manager
+    ///   deletes at teardown, so the record dies with the run (AC3);
+    /// - else `nil`: the installed app keeps the core's default (AC1).
+    /// Both destinations are absolute, as `mcp.audit_log` requires; the core's writer
+    /// preflight creates the file `0600` and any missing parent `0700`.
+    public static func harnessAuditLogFile(environment: [String: String], workDir: URL) -> URL? {
+        if let store = environment["APP_STORE"], !store.isEmpty {
+            return URL(fileURLWithPath: store, isDirectory: true).appending(path: "audit.jsonl")
+        }
+        if environment["APP_LIVE"] == "1" {
+            return workDir.appending(path: "audit.jsonl")
+        }
+        return nil
+    }
+
     // MARK: Per-launch config
 
     /// Everything the child `aitm` needs to come up as a self-contained embedded
@@ -210,6 +234,15 @@ public enum EmbeddedCoreLaunch {
         /// newline guard as `scopeHosts`. Empty — the default for every pre-existing
         /// call site — emits no `bypass:` key, so the core parses its default list.
         public var systemProxyBypass: [String]
+        /// Where the embedded core writes its durable audit (`mcp.audit_log`). Set only
+        /// for a harness run (`harnessAuditLogFile`: a dev bundle's `APP_STORE`, or the
+        /// live self-test's per-run work dir) so a throwaway core never appends to the
+        /// operator's real `~/Library/Application Support/aitmproxy/audit.jsonl`. `nil` —
+        /// the default for every pre-existing call site and for the installed app —
+        /// emits no key, so the core keeps its default and the config is byte-identical
+        /// to before (AC1). The sibling `audit.agent.jsonl` / `audit.reads.jsonl` streams
+        /// follow the base path in the core.
+        public var auditLogFile: URL?
 
         public init(
             obscuraBinary: URL,
@@ -222,7 +255,8 @@ public enum EmbeddedCoreLaunch {
             captureEnabled: Bool = false,
             scopeHosts: [String] = [],
             systemProxyAuto: Bool = false,
-            systemProxyBypass: [String] = []
+            systemProxyBypass: [String] = [],
+            auditLogFile: URL? = nil
         ) {
             self.obscuraBinary = obscuraBinary
             self.proxyPort = proxyPort
@@ -235,6 +269,7 @@ public enum EmbeddedCoreLaunch {
             self.scopeHosts = scopeHosts
             self.systemProxyAuto = systemProxyAuto
             self.systemProxyBypass = systemProxyBypass
+            self.auditLogFile = auditLogFile
         }
 
         /// The `config.yaml` body. The bus binds `port: 0` (ephemeral, so it
@@ -256,6 +291,16 @@ public enum EmbeddedCoreLaunch {
         public func yaml() throws -> String {
             let obscuraPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(obscuraBinary.path)
             let endpointPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(endpointFile.path)
+            // `audit_log` belongs under `mcp:` (`deny_unknown_fields`), so it is one line
+            // directly after `operator_token`, two-space indent, and NOT a tail: the
+            // `ssl_insecure` / `macos_capture` / `scope` / `system_proxy` tails are
+            // byte-exact `hasSuffix` targets and must keep their position (AC7). The path
+            // goes through the same escape as the other two paths, so a quote or backslash
+            // in `APP_STORE` cannot break the scalar and a newline is refused (AC4). The
+            // two-line fragment is byte-for-byte the input of the core's `config_file.rs`
+            // `mcp_audit_log_path_the_mac_app_emits_parses` test (AC5). Nil emits nothing.
+            let auditPath = try auditLogFile.map { try EmbeddedCoreLaunch.yamlDoubleQuoted($0.path) }
+            let auditLine = auditPath.map { "\n  audit_log: \"\($0)\"" } ?? ""
             let base = """
             listen: "127.0.0.1:\(proxyPort)"
             mcp:
@@ -264,7 +309,7 @@ public enum EmbeddedCoreLaunch {
                   port: 0
                   token: "\(token)"
                   endpoint_file: "\(endpointPath)"
-              operator_token: "\(operatorToken)"
+              operator_token: "\(operatorToken)"\(auditLine)
             browser:
               proxy_addr: "127.0.0.1:\(browserProxyPort)"
               obscura:
