@@ -530,6 +530,24 @@ function is unit-testable.
 Reason: C12 showed Cancel enabled against a frozen core for 30 s with no
 word about the values' age.
 
+**Amendment (2026-11-02, from the PR 1 live proof).** The Jobs poll is
+sequential and reads the selected job's `scan.status` before `scan.list`, so
+against a frozen core the *status* read times out first (at ~30 s the inline
+error read `Unable to read job scan-…: the bus did not reply in time`) and
+the list read has not even been attempted; with `.unanswered` tied to the
+list alone, Cancel stayed enabled. So: **any failed Jobs read** (list,
+status, cancel) marks the link. `listFailedAt` is renamed `readFailedAt`,
+`listFailureCore` becomes `readFailure: (text: String, core: String)?`
+recording the failed read's own wording (`Unable to list jobs: …` /
+`Unable to read job <id>: …` / `Unable to cancel job <id>: …`) and the core
+text; `noteReadFailure(text:core:now:)` replaces `noteListFailure`;
+`applyList` clears both (a list that lands is the proof the core answers).
+`inlineJobsError(ageMs:)` returns `<text>. Showing values from 0:42 ago;
+retrying every 2 s.` for whichever read failed (the list beat is what brings
+the values back), else `jobsError`. `ScanJobsLink.make(bus:readFailedAt:…)`
+keeps its kind rules with the renamed input. AC12's live literal therefore
+starts with whichever read failed first.
+
 #### D7. What PR 1 does not touch
 
 PR 1 keeps `ScanJobRow`'s two lines and severity bar, the detail's sections,
@@ -1137,11 +1155,14 @@ row it closes.
     false`; `(.connected("…"), listFailedAt: 5_000, …)` gives `.unanswered`;
     `(.connected, nil, …)` gives `.live`, `verbsEnabled == true`;
     `(.disconnected, …, jobsLoadedAt: nil)` gives `valuesAgeMs == nil`.
-    Live: `kill -STOP` the core; at 35 s the inline error reads `Unable to
-    list jobs: <core text>. Showing values from 0:3x ago; retrying every 2
-    s.`, Cancel Scan and the hover Cancel are disabled, the rows keep their
-    values; after `kill -CONT` the error clears within 5 s and Cancel Scan
-    is enabled.
+    Live: `kill -STOP` the core with a running job selected; at 35 s the
+    inline error reads `Unable to read job <id>: <core text>. Showing values
+    from 0:3x ago; retrying every 2 s.` (the status read times out first;
+    with a terminal job selected it is `Unable to list jobs: …`, D6
+    amendment), Cancel Scan is disabled and the hover Cancel hidden, the
+    rows keep their values; after `kill -CONT` the error clears within 5 s
+    of the next list and Cancel Scan is enabled. The `ScanJobsLink.make`
+    unit cases use the renamed `readFailedAt:` input.
 
 ### PR 2 (mac, redesign)
 

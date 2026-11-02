@@ -510,6 +510,9 @@ Three reviewers on `<Part 2 tip>..<Part 4 tip>`.
 4. **AC7 / AC29 "command recorder".** The app has no such recorder. The plan proves AC7 by the core's audit log and AC29 by a unified-log line the app writes beside the `NSAccessibility` post. Architect's call.
 5. **Web banner kinds.** The web bus exposes open / not open, so `.disconnected` and `.unanswered` wordings are not derivable; the web renders the `reconnecting…` text (AC38 asks for exactly that one). Architect's call.
 6. **`ScanEndText` placement.** Kept in `ScanSurface.swift` as the spec says (AC32 greps that file), which is why the Kit tasks of each mac part are sequential.
+7. **`ScanFormat.grouped` mechanism (found in Task 1.3).** `en_US_POSIX` has no grouping in ICU (`6468` prints as `6468`), so `grouped` inserts the comma deterministically by hand; the outcome `6,468` is what the spec pins. The web and TUI pins use fixed en-US grouping the same way.
+8. **Terminal row before its status lands (found in Task 1.3).** D4's Done/Cancelled sentences quote `checks.*`, which D2 calls detail-only, so `ScanEndText.sentence` returns nil for a terminal row whose `scan.status` has not landed (one beat under D2 rule 2); the view shows the row's state word meanwhile. Pinned as `unread` in `endTextIsTheSpecsSentences`. A `failed` job with an empty-string `error` counts as having no error text.
+9. **D3 changed one pre-existing test (Task 1.2).** `moveSelectionWalksTheVisibleList` assumed `applyList` leaves nothing selected; under D3 it selects the first job, so the test's expectations moved one row. Not a behaviour regression: it is the spec's rule.
 
 ## Review log
 
