@@ -82,10 +82,14 @@ def na_rows() -> None:
 
 def note_secret(value: str) -> None:
     """A web bearer value: redacted by the writer from now on and appended to $ACCEPT_OUT/.secrets
-    (created 0600, one per line) so run.sh's leak grep knows it; run.sh shreds the file."""
+    (created 0600, one per line) so run.sh's leak grep knows it; run.sh deletes the file as soon as
+    this cell returns. Written only under run.sh (ACCEPT_OUT set): a standalone run keeps the values
+    in memory and never puts a bearer on disk."""
     if not value:
         return
     w.add_secret(value)
+    if not os.environ.get("ACCEPT_OUT"):
+        return
     fd = os.open(os.path.join(OUT, ".secrets"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(value + "\n")

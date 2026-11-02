@@ -418,9 +418,10 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             if n1:
                 # Re-probe the focus AFTER the restart press (one digit + AX read): the restart may have moved
                 # it. Seen → paste + Return (the add lands while the core is still coming back); not seen →
-                # paste WITHOUT Return, nothing is submitted into an unknown target.
+                # send NOTHING more (a blind paste could land in a persisting field such as Settings' bypass).
                 n1_focus = field_focused()
-                type_text(N1_HOST, enter=n1_focus)
+                if n1_focus:
+                    type_text(N1_HOST, enter=True)
             time.sleep(6)
             stop.set()
             core2 = None
@@ -440,7 +441,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             elif not n1:
                 step("N1-MAC", "SKIP", "the Edit Scope sheet did not open / take focus before the restart; no add attempted")
             elif not n1_focus:
-                step("N1-MAC", "SKIP", f"the focus probe after Restart Core was not seen in the sheet's field; {N1_HOST} and a probe digit `1` were pasted WITHOUT Return (nothing submitted) — clear the field by hand if it is still there; frames in N1-frames/", f"scope.list after restart {sc_after}")
+                step("N1-MAC", "SKIP", f"the focus probe after Restart Core was not seen in the sheet's field; nothing was pasted — only the probe digit `1` went to the then-focused field: clear it by hand if it is visible; frames in N1-frames/", f"scope.list after restart {sc_after}")
             else:
                 landed = bool(sc_after) and N1_HOST in sc_after
                 if landed:

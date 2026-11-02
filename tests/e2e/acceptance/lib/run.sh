@@ -65,13 +65,23 @@ py_installed() { # <python one-liner body using `installed`>  args...   (the sha
 state_json="$OUT/state-before.json"
 py_installed 'installed.record_state_file(sys.argv[1])' "$state_json" && echo "state-before.json recorded (scutil + per-service)"
 scutil_start="$(scutil --proxy)"
+scutil_cell="$scutil_start"   # re-snapshotted right before each cell (the ERROR path compares to the cell's own start)
 
-restore_after_error() { # after an ERROR cell: replay the recorded state iff scutil differs from the run start; say what was done
-  if [ "$(scutil --proxy)" = "$scutil_start" ]; then
-    echo "   system proxy: identical to the run-start reading; nothing to restore"
+# The web cell's bearer values live in $OUT/.secrets (0600) only until the leak grep has read them;
+# an interrupted run must not leave them behind: destroyed on EXIT, INT and TERM.
+secrets_file="$OUT/.secrets"
+destroy_secrets() { [ -f "$secrets_file" ] && { : >"$secrets_file"; rm -f "$secrets_file"; echo "   .secrets emptied and deleted (0600 while it existed; APFS does not overwrite blocks in place)"; }; return 0; }
+trap 'destroy_secrets' EXIT
+trap 'destroy_secrets; trap - INT; kill -INT $$' INT
+trap 'destroy_secrets; trap - TERM; kill -TERM $$' TERM
+
+restore_after_error() { # after an ERROR cell: replay the recorded state iff scutil differs from THIS cell's start; say what was done
+  if [ "$(scutil --proxy)" = "$scutil_cell" ]; then
+    echo "   system proxy: identical to the cell-start reading; nothing to restore"
     return
   fi
-  echo "   system proxy: DIFFERS from the run-start reading; replaying the recorded per-service state from state-before.json"
+  echo "   system proxy: DIFFERS from the cell-start reading (diff follows); replaying the recorded per-service state from state-before.json"
+  diff <(printf '%s\n' "$scutil_cell") <(scutil --proxy) | sed 's/^/     /' || true
   if py_installed 'sys.exit(installed.replay_file(sys.argv[1]))' "$state_json"; then
     echo "   restored: scutil --proxy identical to the run-start reading again"
   else
@@ -93,6 +103,7 @@ run_cell() { # name cmd...   (watchdog: INT at the cap, 30 s, TERM, 10 s, KILL; 
   # installs KeyboardInterrupt, a bash cell cannot trap it): the launcher resets SIGINT to default
   # and execs the cell, so the watchdog's INT reaches its `finally`. `<&0`: the cell keeps this
   # shell's stdin for `pause()` (a plain `&` would hand it /dev/null).
+  scutil_cell="$(scutil --proxy)"
   python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@" <&0 >"$OUT/$name.out" 2>&1 & local pid=$!
   ( exec sleep "$cell_timeout" ) & local w=$!   # exec: killing $w kills the sleep itself, nothing is left behind
   while alive "$pid" && alive "$w"; do sleep 1; done
@@ -150,6 +161,8 @@ case ",$journeys," in *,mac,*) run_cell mac python3 "$cells/test_mac_journey.py"
 case ",$journeys," in *,mac,*|*,negatives,*) run_cell n5 python3 "$cells/test_n5_wrong_token.py";; esac
 case ",$journeys," in *,tui,*) run_cell tui python3 "$cells/test_tui_journey.py";; esac
 case ",$journeys," in *,web,*) run_cell web python3 "$cells/test_web_journey.py";; esac
+# The web bearer values are read the moment the web cell returns and the file is destroyed: its lifetime is the cell's.
+if [ -f "$secrets_file" ]; then while IFS= read -r v; do add_secret "$v"; done <"$secrets_file"; destroy_secrets; fi
 case ",$journeys," in *,cli,*) run_cell cli-nocore bash "$here/cli_journey.sh" nocore "$OUT/cli";; esac
 
 bash "$here/preflight.sh" "$OUT/state-after.txt" >/dev/null
@@ -165,8 +178,7 @@ echo; echo "---- secret leak check (operator token value, agent token value, web
 leak=0
 collect_core_secrets   # again: a restarted core (MAC-13) minted new values
 [ -n "${AITM_WEB_TOKEN:-}" ] && add_secret "$AITM_WEB_TOKEN"
-secrets_file="$OUT/.secrets"
-if [ -f "$secrets_file" ]; then
+if [ -f "$secrets_file" ]; then   # only if a cell wrote it after the web cell (none does today)
   while IFS= read -r v; do add_secret "$v"; done <"$secrets_file"
 fi
 echo "   known secret values: ${#secrets[@]}"
@@ -175,10 +187,7 @@ if [ "${#secrets[@]}" -gt 0 ]; then
   hits=$(grep -rlF --exclude=.secrets -f <(printf '%s\n' "${secrets[@]}") "$OUT" 2>/dev/null || true)
   [ -n "$hits" ] && { echo "SECRET VALUE present in: $hits"; leak=1; }
 fi
-if [ -f "$secrets_file" ]; then
-  rm -P "$secrets_file" 2>/dev/null || { : >"$secrets_file"; rm -f "$secrets_file"; }
-  echo "   .secrets overwritten and deleted"
-fi
+destroy_secrets
 tok_hits=$(grep -rElI '#t=[A-Za-z0-9_-]{12,}|operator_token: *"?[A-Za-z0-9_-]{16,}' "$OUT" 2>/dev/null || true)
 [ -n "$tok_hits" ] && { echo "TOKEN-SHAPED STRING in: $tok_hits"; leak=1; }
 [ "$leak" = 1 ] && fail=1 || echo "none"
