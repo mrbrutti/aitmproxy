@@ -566,6 +566,8 @@ Shape approved by the coordinator (2026-11-02): `HttpResponse.peer: Option<Socke
 
 Also in PR 3 (amendment 67): the Rhai bridge scrubs `Verdict.detail` (root and siblings) with the same scrub function the manual path uses.
 
+Also in PR 3 (amendment 72): a contract test that every engine-reachable `ProbeHost` (interim, http, ws, l4 packet, l4 stream, `ArcHost`) answers `client()`, `shared()`, `captured()` and debits `charge()`; T2's host shipped defaulting all three (hotfix pending), so the Rhai-based t3 cells on the merged head show that hole, not PR 2's.
+
 ## Shipped
 
 PR #292 (`claude/scanner-v2-t1b-followup-2`, base `main` 32c4b5a4; head at the "ready" c3d79e76 + this note), opened 2026-11-02; merge is the coordinator's.
