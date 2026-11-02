@@ -305,13 +305,18 @@ fn levenshtein_ratio_kitten_sitting() {
 async fn old_style_add_command_scripts_still_register() {
     let loader = loader();
     let checks = Arc::new(CheckRegistry::new());
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/bundled/active/check-sqli.rhai"
-    );
-    let src = std::fs::read_to_string(path).expect("the shipped script is readable");
+    // An old-style script of its own: every bundled `active/` script registers
+    // a check since T3 PR 2b, so the fixture is inline, shaped like the shipped
+    // `check.sqli` command was before its conversion.
+    let src = r#"const NAME = "old-style-check";
+const API = "1";
+fn load(reg) {
+    reg.add_command("check.sqli", "Probe a parameter for SQL injection", |args| { "ok" });
+}
+"#;
 
-    let registry = run_load(&loader, &checks, path, &src).expect("the shipped script loads");
+    let registry =
+        run_load(&loader, &checks, "<old-style>", src).expect("the old-style script loads");
 
     assert!(
         registry.command("check.sqli").is_some(),
