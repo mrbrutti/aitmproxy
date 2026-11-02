@@ -3,7 +3,8 @@
 **Plan:** `docs/superpowers/plans/2026-10-31-l4-parity-fixes-plan.md`, unit (c) web, Task C10.
 **Spec:** `docs/superpowers/specs/2026-10-31-l4-parity-fixes-design.md` — L4PAR-AC18 (live), AC19, AC20, AC21, AC22, AC23, AC24, AC33 (web half).
 **Harness:** `apps/web/scripts/cua-l4.mjs` (`npm run cua:l4`), on `live-env.mjs` + `cua-driver.mjs` (unchanged).
-**Date of the run:** 2026-11-01, 18:09–18:11 PDT.
+**Date of the run (run 1):** 2026-11-01, 18:09–18:11 PST (DST ended 2026-11-01 02:00; the machine is on PST). Its idle-window
+`t0=1793585392521` is 2026-11-02 02:09:52 UTC = 18:09:52 PST (log 08 line 74).
 **Worktree branch:** `claude/competent-ellis-5a0f21`.
 **HEAD at the run:** `f99a4a01` (code head `a93e7398` = C1–C9b, plus the two pre-run shell fixes `7bf7f0f2`, `8b707e63`, plus the C10 script commit).
 **Binary:** `target/release/aitm` built from this worktree; workspace version **0.5.10**.
@@ -13,14 +14,22 @@
 `l4.scope.add` advertised with `confirmable: true`.
 **Full redacted log (run 1):** `/tmp/claude/l4-rig/c-evidence/08-cua-l4-full-run.log` (407 lines; every step line, the histogram, the scope prompt, the 19 screenshot paths).
 **Full redacted log (run 2, after the wrapper fix):** `/tmp/claude/l4-rig/c-evidence/10-cua-l4-run2-after-wrapper-fix.log` (402 lines; same
-rig and binary; its idle-window `t0` is 2026-11-01 18:15:02 local time, file written 18:16).
+rig and binary; its idle-window `t0=1793585702085` is 2026-11-02 02:15:02 UTC = 18:15:02 PST, file written 18:16 PST).
+**Full redacted log (run 3, the fix-3 script):** `/tmp/claude/l4-rig/c-evidence/11-cua-l4-run3-after-fix3.log` (410 lines; built from
+`62af37a8` = unit (c) fix 3, the commit that added every-token redaction, the no-auto-PASS step wrapper, the 05f privileged
+branch and step 07d; same rig; core on proxy 60010, web 60012, target 60009; its idle-window `t0=1793587936570` is
+2026-11-02 02:52:16 UTC = 18:52:16 PST, file written 18:53 PST).
 
 **Summary line printed by the script, run 1:** `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`.
 One of the 38 PASS lines was the step-09 wrapper line (`PASS 09 privileged real-packet click-drive …`) printed after the
 body had recorded only `BLOCKED 09 …`; the wrapper was fixed in the commit that filled this record (a body that records a
 BLOCKED line is no longer auto-passed). **Run 2 (log 10) confirmed it:** its summary line is
-`37 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`, with no `PASS 09` line. The 37 real PASS lines below are the same
-assertions in both runs (the ids and scope ids quoted are run 1's).
+`37 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`, with no `PASS 09` line — the wrapper fix, 37 = run 1's 38 minus the
+spurious `PASS 09`. **Run 3 (log 11), the fix-3 script, prints `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`:**
+38 = 37 + the new step 07d (the UI activity log read live, row below), still with no `PASS 09` line; its 05f line is
+`BLOCKED 05f … blocked: needs D0` with the core's reason quoted, and its 4 notes are the same four explanatory notes as
+runs 1 and 2 (no "no assertion ran" note). The PASS lines below are the same assertions in all three runs (the ids and
+scope ids quoted are run 1's; run 3's are `conn_86a16b9578df7017-2` and scope id `22f1505c-7a9b-4bb0-b7e5-b57b26be1226`).
 
 ## Rule for every task (plan, Matt 2026-10-31)
 
@@ -106,6 +115,7 @@ in proxy scope so real HTTP rows exist.
 | 07a | AC23 | Operator, L4 view, no L4 rows; **60 s** with no script bus call; `agent.activity {since: t0}` → `l4.*` entries ≤ **30** | PASS — `count=17`; histogram `l4.flow.list 5, l4.capture.status 5, l4.intercept.status 5, l4.scope.list 1, l4.agent.status 1` |
 | 07b | AC23 | No counted `l4.*` entry has a `result` other than `"ok"` | PASS — `all ok` |
 | 07c | AC23 | All counted entries share one `connection_id`; distinct `client_label`s printed | PASS — `connection_ids=["conn_b65bed132a6bec00-2"]`; `client_label` values `["web-bridge"]` |
+| 07d | AC23 (UI activity log) | After the window: sidebar → Agent, read every `section[aria-label="Activity log"] [role=row][data-seq]`, keep the `l4.*` commands (cell 2), assert none has `data-result="error"`; back to L4 | PASS (run 3, log 11 line 86) — `PASS 07d the UI activity log (Agent panel) has no l4.* entry marked error — rows=183; l4 rows=31; error rows=[]` |
 | 07 note | AC23 | Browser console during the window | NOTE — `0 new browser console error(s) during the window` |
 | 08a | AC24 | Page re-opened at the **agent** URL → `l4-operator-only-banner` text | PASS — `banner "L4 actions (capture, inject, scope, intercept) need the Operator URL."` |
 | 08b | AC24 | Sidebar → L4: `l4-capture-start` disabled, `title` and `l4-capture-reason` are the operator-only literal, `data-operator-only="true"` | PASS — `disabled=true; title "Operator only: reconnect with the Operator URL the core printed"; data-operator-only=true; reason "Operator only: reconnect with the Operator URL the core printed"` |
