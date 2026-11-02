@@ -12,30 +12,34 @@ import css from './l4.module.css';
 
 export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
   const store = props.store;
+  // One wrapper element so the bar is a single, content-sized item in the Shell's list column; on a
+  // short window it scrolls inside itself (max-height) rather than clipping the scope rows or the form.
   return (
-    <Show
-      when={store.present()}
-      fallback={
-        <p class={css.l4Empty}>
-          L4 is not enabled on this core — no `l4.*` commands are advertised. Start the core with `l4.enabled: true` (and the
-          privilege / scope to use it) to drive raw-packet capture, craft and inject from here.
-        </p>
-      }
-    >
-      <CaptureControls
-        capture={store.captureAvailability()}
-        running={store.captureIds()}
-        canScope={store.caps().scope}
-        scope={store.scope()}
-        tools={store.tools()}
-        onStart={(iface, direction) => void store.startCapture(iface, direction)}
-        onStop={(id) => void store.stopCapture(id)}
-        onAddScope={store.addScope}
-        onConfirmAddScope={store.confirmAddScope}
-      />
-      <Show when={!store.interceptAvailability().available}>
-        <InterceptLimitedLine reason={store.interceptAvailability().reason ?? ''} />
+    <div class={css.captureBar} data-testid="l4-capture-bar">
+      <Show
+        when={store.present()}
+        fallback={
+          <p class={css.l4Empty}>
+            L4 is not enabled on this core — no `l4.*` commands are advertised. Start the core with `l4.enabled: true` (and the
+            privilege / scope to use it) to drive raw-packet capture, craft and inject from here.
+          </p>
+        }
+      >
+        <CaptureControls
+          capture={store.captureAvailability()}
+          running={store.captureIds()}
+          canScope={store.caps().scope}
+          scope={store.scope()}
+          tools={store.tools()}
+          onStart={(iface, direction) => void store.startCapture(iface, direction)}
+          onStop={(id) => void store.stopCapture(id)}
+          onAddScope={store.addScope}
+          onConfirmAddScope={store.confirmAddScope}
+        />
+        <Show when={!store.interceptAvailability().available}>
+          <InterceptLimitedLine reason={store.interceptAvailability().reason ?? ''} />
+        </Show>
       </Show>
-    </Show>
+    </div>
   );
 };

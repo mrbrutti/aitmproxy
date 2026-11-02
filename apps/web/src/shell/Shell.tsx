@@ -118,7 +118,12 @@ export const Shell: Component = () => {
             <Show when={l4 && app.ui.sidebar.kind === 'l4'}>
               <L4CaptureBar store={l4!} />
             </Show>
-            <FlowList />
+            {/* The list fills whatever the capture bar (L4 view) and the intercept bar (armed) leave;
+                the wrapper is the one flex item that grows, so the bar is never height-constrained
+                and the virtualised body keeps scrolling (min-height: 0). */}
+            <div class={css.listFill}>
+              <FlowList />
+            </div>
             <Show when={app.proxy.armed}>
               <InterceptBar />
             </Show>

@@ -51,11 +51,25 @@
   grid-template-columns: minmax(240px, 1fr) 1px minmax(240px, var(--split, 50%));
 }
 
+/* The list pane is a column: [L4 capture bar, sized to its content] / list (fills) / [intercept
+   bar, sized to its content]. A grid with fixed row tracks put the L4 bar in the 1fr row and the
+   list in an implicit auto row, which clipped the bar's scope rows and add form; flex lets the one
+   growing item be the list whether or not the bars are present. */
 .listPane {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
+}
+.listPane > :not(.listFill) {
+  flex: none;
+}
+.listFill {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .splitter {

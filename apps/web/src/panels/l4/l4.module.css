@@ -226,6 +226,14 @@
 }
 
 /* capture controls / intercept bar */
+/* The L4 capture bar above the flow list (L4CaptureBar): never shrinks below its content; on a
+   short window it scrolls inside itself instead of clipping the scope rows or the add form. */
+.captureBar {
+  flex: none;
+  min-width: 0;
+  max-height: 45vh;
+  overflow-y: auto;
+}
 .controls {
   display: flex;
   gap: var(--space-2);
