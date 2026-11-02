@@ -2,6 +2,7 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, type Component, type JSX } from 'solid-js';
 import { useApp } from '~/state/context';
 import { scriptsStore } from '~/panels/scripts/store';
+import { scanStore } from '~/panels/scanner/store';
 import type { SidebarItem } from '~/state/app';
 import { Icon, type IconName } from '~/components/Icon';
 import { Kbd } from '~/components/Kbd';
@@ -66,6 +67,10 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
       if (offered && !scripts.loaded()) void scripts.refreshList({ quiet: true });
     }),
   );
+  // The scan store is created here, not in the panel, so its live job count (and its bootstrap read
+  // and notification handler) exist before the Scan panel is ever opened — the nav shows a running
+  // scan on first paint.
+  const scan = scanStore(app);
   const [open, setOpen] = createSignal({ pinned: true, apps: true, domains: true });
   const [allDomains, setAllDomains] = createSignal(false);
   let input: HTMLInputElement | undefined;
@@ -174,8 +179,14 @@ export const Sidebar: Component<{ class?: string }> = (props) => {
 
         <div class={css.group}>aitmproxy</div>
         <Item icon="crosshair" label="Scope" count={app.proxy.scope.length} countKind="queue" current={is({ kind: 'scope' })} onClick={pick({ kind: 'scope' })} />
-        <Show when={app.proxy.tools.some((t) => t.name === 'scan.discover')}>
-          <Item icon="search" label="Scan" current={is({ kind: 'scan' })} onClick={pick({ kind: 'scan' })} />
+        <Show when={scan.offered() !== 'none'}>
+          <Item
+            icon="search"
+            label="Scan"
+            count={scan.liveCount() ? `${scan.liveCount()} live` : null}
+            current={is({ kind: 'scan' })}
+            onClick={pick({ kind: 'scan' })}
+          />
         </Show>
         <Item icon="flag" label="Findings" count={app.proxy.findings.length} countKind="queue" current={is({ kind: 'findings' })} onClick={pick({ kind: 'findings' })} />
         <Item icon="globe" label="Browser" count="1 tab" current={is({ kind: 'browser' })} onClick={pick({ kind: 'browser' })} />
