@@ -8,7 +8,7 @@ import type { FlowEntry } from '~/state/app';
 import { Menu, type MenuEntry } from '~/components/Menu';
 import { pointAnchor, type AnchorRect } from '~/components/floating';
 import { EVENTS } from '~/shell/shortcuts';
-import { isL4Chip, l4ChipMatches, type UnionRow } from '~/panels/l4/model';
+import { httpVerbAllowed, isL4Chip, l4ChipMatches, L4_NO_HTTP_VERBS, type UnionRow } from '~/panels/l4/model';
 import { compareFlows, createColumnState, type ColumnId, type ColumnStore } from './columns';
 import { FlowRow } from './FlowRow';
 import { L4FlowRow } from './L4FlowRow';
@@ -144,18 +144,33 @@ export const FlowList: Component<FlowListProps> = (props) => {
     return r ? pointAnchor(r.left + r.width / 2, r.top + r.height / 2) : pointAnchor(0, 0);
   };
   const entryOf = (id: string) => app.byId.get(id) ?? null;
+  // D9 UI (parity spec §7(c), AC33): mark, comment and the row menu are HTTP verbs. An L4 id is
+  // not in the HTTP map, so `entryOf` would already be null — but the refusal is deliberate, with
+  // the notice, not incidental: no overlay opens and nothing reaches the bus.
+  const l4Refused = (id: string): boolean => {
+    if (httpVerbAllowed(id, app.l4Ids())) return false;
+    app.notice(L4_NO_HTTP_VERBS);
+    return true;
+  };
+  const idOf = (e: Event) => (e as CustomEvent<{ id: string }>).detail.id;
 
   onMount(() => {
     const onMark = (e: Event) => {
-      const entry = entryOf((e as CustomEvent<{ id: string }>).detail.id);
+      const id = idOf(e);
+      if (l4Refused(id)) return;
+      const entry = entryOf(id);
       if (entry) setOverlay({ kind: 'mark', entry, anchor: anchorFor(entry.id), kb: true });
     };
     const onComment = (e: Event) => {
-      const entry = entryOf((e as CustomEvent<{ id: string }>).detail.id);
+      const id = idOf(e);
+      if (l4Refused(id)) return;
+      const entry = entryOf(id);
       if (entry) setOverlay({ kind: 'comment', entry, anchor: anchorFor(entry.id) });
     };
     const onCtx = (e: Event) => {
-      const entry = entryOf((e as CustomEvent<{ id: string }>).detail.id);
+      const id = idOf(e);
+      if (l4Refused(id)) return;
+      const entry = entryOf(id);
       if (entry) setOverlay({ kind: 'menu', entry, anchor: anchorFor(entry.id), kb: true });
     };
     window.addEventListener(EVENTS.mark, onMark);
@@ -183,9 +198,12 @@ export const FlowList: Component<FlowListProps> = (props) => {
     const id = rowIdFrom(e);
     if (!id) return;
     e.preventDefault();
+    // An `L4FlowRow` carries `data-id` too: right-click on it selects the row (the L4 inspector
+    // opens) and refuses the HTTP menu with the notice (D9 UI).
+    if (!app.selectedIds().has(id)) app.select(id);
+    if (l4Refused(id)) return;
     const entry = entryOf(id);
     if (!entry) return;
-    if (!app.selectedIds().has(id)) app.select(id);
     setOverlay({ kind: 'menu', entry, anchor: pointAnchor(e.clientX, e.clientY), kb: false });
   };
 

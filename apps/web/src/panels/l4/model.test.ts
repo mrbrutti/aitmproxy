@@ -7,6 +7,7 @@ import {
   flowSubLabel,
   formatPacketTime,
   hexRows,
+  httpVerbAllowed,
   interceptBarModel,
   isKnownKind,
   isL4Chip,
@@ -424,5 +425,19 @@ describe('operatorOnlyReason (spec §7(c) D12, AC24)', () => {
   it('the exported literal is the reason the components render as title and text', () => {
     expect(OPERATOR_ONLY_REASON).toBe('Operator only: reconnect with the Operator URL the core printed');
     expect(operatorOnlyReason('agent')).toBe(OPERATOR_ONLY_REASON);
+  });
+});
+
+describe('httpVerbAllowed (spec §7(c) D9 UI, AC33)', () => {
+  it('an L4 id gets no HTTP verb: replay, mark, comment, PoC return before any bus call', () => {
+    expect(httpVerbAllowed('l4-1', new Set(['l4-1']))).toBe(false);
+  });
+
+  it('an HTTP id keeps its verbs even when L4 ids are present', () => {
+    expect(httpVerbAllowed('h-1', new Set(['l4-1']))).toBe(true);
+  });
+
+  it('with no L4 ids every id is an HTTP id', () => {
+    expect(httpVerbAllowed('h-1', new Set())).toBe(true);
   });
 });

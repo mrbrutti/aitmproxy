@@ -677,6 +677,21 @@ export function operatorOnlyReason(role: 'operator' | 'agent' | null): string | 
   return role === 'operator' ? null : OPERATOR_ONLY_REASON;
 }
 
+// ---- no HTTP verbs on L4 ids (parity spec §7(c) D9 UI, AC33) -----------------------------------
+//
+// L4 sessions are rows in the one flow list, but `flow.replay`, `flow.mark`, `flow.comment`,
+// `poc.build`, `flow.resume`/`flow.kill`/`flow.mutate` are HTTP verbs: the core resolves their id
+// in the HTTP `FlowStore` and an L4 id can only fail. The flow list, the context menu and the
+// keyboard ask this before acting, and return with `L4_NO_HTTP_VERBS` instead of a bus call.
+
+/** The notice the UI shows when an HTTP verb is asked of an L4 row. */
+export const L4_NO_HTTP_VERBS = 'Not available for L4 flows';
+
+/** False iff `id` is an L4 session id (registered by the L4 store in `app.l4Ids()`). */
+export function httpVerbAllowed(id: string, l4Ids: ReadonlySet<string>): boolean {
+  return !l4Ids.has(id);
+}
+
 // ---- poll plan (parity spec §7(c) "Polling", AC23) ------------------------------------------------
 //
 // The app's 1.5 s timer calls `store.refresh()`; the store asks this plan what is due and returns
