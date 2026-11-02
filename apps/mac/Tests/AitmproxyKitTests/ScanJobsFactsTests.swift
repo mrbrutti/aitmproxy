@@ -122,6 +122,18 @@ import Testing
         #expect(model.facts(for: "scan-elsewhere") == nil)
     }
 
+    /// D2 (plan fix 1.5g): a facts value has one job id, its summary's. `job` is
+    /// read off the summary, so the memberwise init takes only the two shapes.
+    @Test func jobFactsReadTheJobOffTheSummary() throws {
+        let summary = try Self.summary("scan-55667788", state: .done, elapsedMs: 69_000)
+        let bare = ScanJobFacts(summary: summary, status: nil)
+        #expect(bare.job == "scan-55667788")
+        let status = try Self.status("scan-55667788", state: .done, elapsedMs: 69_000)
+        let made = ScanJobFacts.make(summary: summary, status: status)
+        #expect(made.job == "scan-55667788")
+        #expect(made == ScanJobFacts(summary: status.summary, status: status))
+    }
+
     /// AC8 (unit half) and D6's list facts: the list selects its newest job when
     /// nothing is selected, keeps a selection it still carries, and moves a
     /// selection the core dropped (unless this app started it) to the first row.
@@ -469,11 +481,11 @@ import Testing
             status: try Self.status(state: .running, elapsedMs: 49_000))
         #expect(unknown.summary.state == .other("paused"))
         #expect(unknown.status?.state == .running)
-        // `job` is the list row's; the status is kept whole even when it names another job.
+        // `job` is the merged summary's; the status is kept whole even when it names another job.
         let crossed = ScanJobFacts.make(
             summary: try Self.summary("scan-aaaa", state: .running, elapsedMs: 1_000),
             status: try Self.status("scan-bbbb", state: .running, elapsedMs: 2_000))
-        #expect(crossed.job == "scan-aaaa")
+        #expect(crossed.job == "scan-bbbb")
         #expect(crossed.status?.job == "scan-bbbb")
 
         // The re-read rule with unknown states: an unknown stored state is not terminal,

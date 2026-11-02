@@ -1092,6 +1092,30 @@ extension ScanModelTests {
     /// to its field's cap (profile name 64; error, sample fields, clamped field,
     /// skipped reason and running ids 400; targets 200; an unknown vocabulary token
     /// 64); the sample, running and target lists are cut to the engine's own 8.
+    /// `ScanWire.boundedArray`'s contract (D1 amendment; plan fix 1.5g): items past
+    /// `listMax` are neither type-checked nor kept, so a malformed ninth item is not
+    /// refused, while a malformed item inside the cap is. The two string helpers are
+    /// named by what they return: `optionalBoundedString` (nil when absent) and
+    /// `boundedString` (required; absent is malformed).
+    @Test func boundedArrayContractAndTheTwoBoundedStringHelpers() throws {
+        let status = try ScanPack.load("scan.status.json")
+        let eight: [JSONValue] = ["a", "b", "c", "d", "e", "f", "g", "h"]
+        let decoded = try ScanJobStatus(json: ScanPack.edited(status, path: ["checks", "running"], to: .array(eight + [42])))
+        #expect(decoded.checks.running == ["a", "b", "c", "d", "e", "f", "g", "h"])
+        #expect(throws: BusError.self) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["checks", "running"], to: .array([42])))
+        }
+
+        let wire = try ScanWire(["present": .string("ab\u{0007}cdef")], as: "T")
+        #expect(try wire.optionalBoundedString("present", max: 4) == "abcd")
+        #expect(try wire.optionalBoundedString("absent", max: 4) == nil)
+        let required: String = try wire.boundedString("present", max: 4)
+        #expect(required == "abcd")
+        #expect(throws: BusError.malformed("T needs `absent`")) {
+            let _: String = try wire.boundedString("absent", max: 4)
+        }
+    }
+
     @Test func coreStringsAreBoundedAndCleaned() throws {
         // A 1,000-character detail with a bidi override and a newline in it: 400 clean characters.
         let hostile = String(repeating: "a", count: 300) + "\u{202E}" + String(repeating: "b", count: 300)

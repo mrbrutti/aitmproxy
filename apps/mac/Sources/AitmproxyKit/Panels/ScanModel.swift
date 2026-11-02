@@ -666,8 +666,8 @@ struct ScanWire {
         return String(String.UnicodeScalarView(kept.prefix(max)))
     }
 
-    /// `optionalString`, cleaned and cut to `max`.
-    func boundedString(_ key: String, max: Int) throws -> String? {
+    /// `optionalString`, cleaned and cut to `max`; nil when absent or `null`.
+    func optionalBoundedString(_ key: String, max: Int) throws -> String? {
         try optionalString(key).map { Self.cleaned($0, max: max) }
     }
 
@@ -676,7 +676,8 @@ struct ScanWire {
         try Self.cleaned(string(key), max: max)
     }
 
-    /// `array`, cut to the engine's `listMax` items.
+    /// `array`, cut to the engine's `listMax` items. Items of a list past `listMax`
+    /// are neither type-checked nor kept, so a malformed item there is not refused.
     func boundedArray(_ key: String) throws -> ArraySlice<JSONValue> {
         try array(key).prefix(Self.listMax)
     }
@@ -922,9 +923,9 @@ public struct ScanCheckErrorSample: Hashable, Sendable {
 extension ScanCheckErrorSample {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanCheckErrorSample")
-        check = try wire.boundedString("check", max: ScanWire.detailMax) ?? ""
-        point = try wire.boundedString("point", max: ScanWire.detailMax) ?? ""
-        detail = try wire.boundedString("detail", max: ScanWire.detailMax) ?? ""
+        check = try wire.optionalBoundedString("check", max: ScanWire.detailMax) ?? ""
+        point = try wire.optionalBoundedString("point", max: ScanWire.detailMax) ?? ""
+        detail = try wire.optionalBoundedString("detail", max: ScanWire.detailMax) ?? ""
     }
 }
 
@@ -1202,7 +1203,7 @@ extension ScanJobStatus {
         job = try wire.boundedString("job", max: ScanWire.tokenMax)
         state = try wire.vocab("state")
         phase = try wire.vocab("phase")
-        profileName = try wire.boundedString("profile_name", max: ScanWire.tokenMax) ?? ""
+        profileName = try wire.optionalBoundedString("profile_name", max: ScanWire.tokenMax) ?? ""
         targets = try wire.boundedStrings("targets", max: ScanWire.targetMax)
         startedBy = try ScanStartedBy(json: wire.object("started_by"))
         startedAt = try wire.int("started_at", default: 0)
@@ -1218,7 +1219,7 @@ extension ScanJobStatus {
         session = try wire.optionalObject("session").map { try ScanSessionStatus(json: $0) }
         lanes = try ScanLaneReport(json: wire.object("lanes"))
         clamped = try wire.array("clamped").map { try ScanClamped(json: $0) }
-        error = try wire.boundedString("error", max: ScanWire.detailMax)
+        error = try wire.optionalBoundedString("error", max: ScanWire.detailMax)
     }
 }
 

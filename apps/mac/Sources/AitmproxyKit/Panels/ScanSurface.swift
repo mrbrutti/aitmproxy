@@ -425,9 +425,12 @@ public struct ScanCheckTree: Hashable, Sendable {
 /// One truth per job: the counters both wire shapes carry, merged from the
 /// `scan.list` row and the stored `scan.status`, plus the detail-only fields
 /// the status alone carries. The row and the detail both read this value, so
-/// they can never disagree (Jobs view spec D2).
+/// they can never disagree (Jobs view spec D2). `job` is the merged summary's id:
+/// inside `ScanSurfaceModel` the listed row and its stored status always name the
+/// same job (`facts(for:)` reads `statuses[job]`, stored under `status.job`).
 public struct ScanJobFacts: Equatable, Sendable {
-    public var job: String
+    /// The job id, the merged summary's.
+    public var job: String { summary.job }
     /// The shared counters (state, phase, elapsed, probes, points, issues), from
     /// whichever of the two shapes is the newer truth.
     public var summary: ScanJobSummary
@@ -435,8 +438,7 @@ public struct ScanJobFacts: Equatable, Sendable {
     /// stopped reason, error); nil until the first `scan.status` lands.
     public var status: ScanJobStatus?
 
-    public init(job: String, summary: ScanJobSummary, status: ScanJobStatus?) {
-        self.job = job
+    public init(summary: ScanJobSummary, status: ScanJobStatus?) {
         self.summary = summary
         self.status = status
     }
@@ -447,7 +449,7 @@ public struct ScanJobFacts: Equatable, Sendable {
     /// two has the higher `elapsedMs` (the status on a tie). `status` is kept as
     /// given either way.
     public static func make(summary: ScanJobSummary, status: ScanJobStatus?) -> ScanJobFacts {
-        guard let status else { return ScanJobFacts(job: summary.job, summary: summary, status: nil) }
+        guard let status else { return ScanJobFacts(summary: summary, status: nil) }
         let merged: ScanJobSummary = if status.state.isTerminal {
             status.summary
         } else if summary.state.isTerminal {
@@ -457,7 +459,7 @@ public struct ScanJobFacts: Equatable, Sendable {
         } else {
             summary
         }
-        return ScanJobFacts(job: summary.job, summary: merged, status: status)
+        return ScanJobFacts(summary: merged, status: status)
     }
 }
 
@@ -478,18 +480,13 @@ public struct ScanStatusReadLedger: Equatable, Sendable {
     public struct Key: Hashable, Sendable {
         public var job: String
         public var summaryIsTerminal: Bool
-
-        public init(job: String, summaryIsTerminal: Bool) {
-            self.job = job
-            self.summaryIsTerminal = summaryIsTerminal
-        }
     }
 
-    public private(set) var keys: Set<Key> = []
+    private(set) var keys: Set<Key> = []
 
     public init() {}
 
-    public var count: Int { keys.count }
+    var count: Int { keys.count }
 
     /// Claims the read for `job` under its row's terminality: true when the key was
     /// absent (the caller makes the read), false when it was already claimed.
