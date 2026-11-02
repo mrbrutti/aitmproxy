@@ -339,6 +339,15 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 - **Done when:** the four tests pass; `cargo test -p aitm-plugin-scanner --offline` passes
   three times in a row in the sandbox (no flake); per-task gate green.
 
+### Task 7: `JobCtx::report_forms_submitted` feeds `crawl.forms_submitted` (amendment 53)
+
+**Added 2026-11-01 (coordinator, amendment 53, additive; ordered right after Task 1b so T2 can un-draft #223 against a real counter).** `JobStatus.crawl.forms_submitted` exists in the model but nothing writes it: there is no `JobCtx` hook (only `report_forms_skipped` / `report_crawl_error`), and T2's lane really submits forms on real obscura (five per map on the test target), so AC T2-1's `forms_submitted >= 1` asserts a counter that cannot move.
+
+- **Files:** `crates/aitm-scan-model/src/traits.rs` (`fn report_forms_submitted(&self, count: u32) {}` default no-op beside `report_forms_skipped`), `crates/aitm-plugin-scanner/src/worker.rs` (`JobRuntime.forms_submitted: AtomicU64`, the hook adds to it, `sync_counters` raises `crawl.forms_submitted` monotonically like `forms_skipped`), `crates/aitm-plugin-scanner/src/interim_crawl.rs` + `interim_lane.rs` (`client_crawl` region: the interim client crawl counts the forms it submits and reports them, so the interim lane feeds the counter too), `crates/aitm-plugin-scanner/src/jobs.rs` test support (`FakeLane::with_forms_submitted(n)` calling the hook from `discover`).
+- **Tests (red first):** `worker::tests::reported_form_submissions_reach_the_status` — a lane reporting 3 submits yields `crawl.forms_submitted == 3` in the terminal status and in `scan.status`; `interim_crawl::tests::submitted_forms_are_counted` — the client crawl's `ClientCrawl.forms_submitted` equals the POSTs it sent (the destructive/logout skips do not count); a reload of a pre-amendment record reads 0 (serde default; already covered by `crawl_counters_additive_fields_default_to_zero`, extend if needed).
+- **Done when:** the three tests are green, `cargo test -p aitm-scan-model -p aitm-plugin-scanner` green, docs/scanner.md's status field list names `crawl.forms_submitted` as written by any lane through the hook (Task 6 docs coder or this task, one writer).
+- **Ownership:** runs after Task 1b (same `worker.rs`/`interim_lane.rs`), before Task 5.
+
 ### Task 6: bookkeeping and docs wording
 
 - **Satisfies:** workflow stage-7 record keeping; amendment 39/40 operator docs.
@@ -376,6 +385,7 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 | `aitm-scan-model/src/job.rs`, `traits.rs` (doc) | | W | | | | | |
 | `docs/scanner.md` | | | | W | | | W |
 | the two plan files | | | | | | | W |
+| Task 7 (`traits.rs` hook, `worker.rs` runtime counter, `interim_crawl.rs`/`interim_lane.rs` client_crawl, `jobs.rs` test support) | | | | | after 1b | before 5 | |
 
 Wave A's four tasks share no file. `worker.rs` and `interim_lane.rs` are written by Task 2,
 then Task 1b, then (tests only) Task 5, strictly in that order; the orchestrator dispatches
