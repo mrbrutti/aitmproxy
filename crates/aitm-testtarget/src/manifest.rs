@@ -646,6 +646,13 @@ mod tests {
             by_id("sqli-boolean-items-id").trigger_hint
         );
         assert!(
+            by_id("cmdi-ping-host")
+                .trigger_hint
+                .contains("echo w appends w"),
+            "{}",
+            by_id("cmdi-ping-host").trigger_hint
+        );
+        assert!(
             manifest().iter().all(|v| v.id != "sqli-time-items"),
             "the time seed left /items"
         );

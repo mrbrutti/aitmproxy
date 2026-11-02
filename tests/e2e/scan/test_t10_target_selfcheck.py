@@ -12,7 +12,7 @@ What it proves, Vulnerable (V) next to Patched (P), both booted with `--l4`:
     negotiates `1.1`, the h1-only listener negotiates `1.1` under `--http2`; the
     control log then holds `tls_handshake` entries with those ALPNs and `request`
     entries with `version` h2/h1 and `conn_req_index == 1`
-  - one seed per D3 class, then EVERY remaining D3 row (the `SEEDS` table, 20 rows
+  - one seed per D3 class, then EVERY remaining D3 row (the `SEEDS` table, 21 rows
     plus the stored-XSS round trip), answers on V with the row's literal signal
     and on P with the row's patched answer; the timing rows (`SLEEP(2)`,
     `;sleep 2`) take >= 2 s on V and < 1 s on P
