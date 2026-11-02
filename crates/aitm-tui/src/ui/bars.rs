@@ -19,6 +19,13 @@ use crate::ui::FrameView;
 /// width up; narrower, the agent toggle alone is the right cluster.
 pub const TOOLBAR_HINTS_COLS: u16 = 150;
 
+/// Blank cells the centred listening pill needs free around it so it never
+/// abuts the left cluster or the agent toggle: the hints decision reserves
+/// one gutter per side (`2 * PILL_GUTTER`); the placement branch takes a
+/// single gutter as the minimum total gap, which is what the 160/220-column
+/// tests pin.
+const PILL_GUTTER: usize = 2;
+
 /// The intercept bar's Kill hint: the abort mode is fixed at connection
 /// reset until core follow-up F3 adds 429/503.
 pub const KILL_HINT: &str = "[d Kill · abort mode: reset (429/503 need F3)]";
@@ -89,8 +96,15 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         (_, _, None) if app.has_tool("proxy.status") => "listen address unknown".to_string(),
         (_, _, None) => "listen address unknown (core follow-up F7)".to_string(),
     };
-    // The CA-trust word (§D17.6) follows the listening text; the sys-proxy
-    // word (§D12) goes between them when it lands.
+    // The §D12 system-proxy word sits after the address; this TUI's own
+    // in-flight set/unset reads `setting…` (D14). The CA-trust word
+    // (§D17.6) follows it; the state closes the pill.
+    let sysproxy = app
+        .system_proxy
+        .as_ref()
+        .and_then(|w| w.pill(app.sysproxy_setting))
+        .map(|p| format!(" {p}"))
+        .unwrap_or_default();
     let ca = app
         .ca_trust_word()
         .map(|w| format!(" {w}"))
@@ -98,7 +112,10 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let pill = Line::from(vec![
         Span::styled("● ", dot_style),
         Span::styled("aitmproxy", bold),
-        Span::styled(format!(" · {listen}{ca}{state}"), theme.text_secondary()),
+        Span::styled(
+            format!(" · {listen}{sysproxy}{ca}{state}"),
+            theme.text_secondary(),
+        ),
     ]);
 
     let agent_style = match app.agent.policy {
@@ -120,32 +137,39 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         crate::app::Layout::Horizontal => "▄▄ below",
         crate::app::Layout::Vertical => "▌▐ right",
     };
+    // Widths are summed in `usize`: `cells()` saturates at `u16::MAX`, and an
+    // unbounded `other` host could otherwise overflow a `u16` sum.
+    let lw = Line::from(left.clone()).width();
+    let pw = pill.width();
+    let cols = usize::from(area.width);
     let mut right = vec![Span::styled(format!("[{agent_label}]"), agent_style)];
-    // The key hints are a courtesy; below this width they would squeeze the
-    // listening pill into the agent toggle.
-    if area.width >= TOOLBAR_HINTS_COLS {
-        right.push(Span::styled(
-            format!("  {} palette  {}  b sidebar", glyph::PALETTE, layout),
-            theme.text_tertiary(),
-        ));
+    // The key hints are a courtesy; below this width — or when the pill,
+    // which now carries the system-proxy word, would otherwise be clipped
+    // against the agent toggle — they are dropped.
+    let hints = Span::styled(
+        format!("  {} palette  {}  b sidebar", glyph::PALETTE, layout),
+        theme.text_tertiary(),
+    );
+    let with_hints = lw + pw + Line::from(right.clone()).width() + hints.width() + 2 * PILL_GUTTER;
+    if area.width >= TOOLBAR_HINTS_COLS && with_hints <= cols {
+        right.push(hints);
     }
     right.push(Span::raw(" "));
     let right = Line::from(right);
-
-    let lw = cells(Line::from(left.clone()).width());
-    let rw = cells(right.width());
+    let rw = right.width();
     buf.set_line(area.x, area.y, &Line::from(left), area.width);
-    if lw + rw + 2 < area.width {
-        let pw = cells(pill.width());
-        let free_start = lw;
-        let free_end = area.width.saturating_sub(rw);
-        let x = if pw + 2 <= free_end.saturating_sub(free_start) {
-            area.x + free_start + (free_end - free_start - pw) / 2
+    if lw + rw + PILL_GUTTER < cols {
+        // Inside this branch `lw`, `rw` and the free span all fit in `u16`.
+        let free_start = cells(lw);
+        let free_end = area.width.saturating_sub(cells(rw));
+        let free = free_end.saturating_sub(free_start);
+        let x = if pw + PILL_GUTTER <= usize::from(free) {
+            area.x + free_start + (free - cells(pw)) / 2
         } else {
             area.x + free_start + 1
         };
         buf.set_line(x, area.y, &pill, free_end.saturating_sub(x - area.x));
-        buf.set_line(area.x + area.width - rw, area.y, &right, rw);
+        buf.set_line(area.x + area.width - cells(rw), area.y, &right, cells(rw));
     }
 }
 

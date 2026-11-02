@@ -3,6 +3,7 @@ import Foundation
 /// Hosts and apps pinned to the sidebar's Working group (`pins.json`).
 public struct Pins: Codable, Hashable, Sendable {
     public var hosts: [String]
+    /// Group keys (`ClientInfo.groupKey`: the signing identifier when the row has one, else the name).
     public var apps: [String]
 
     public init(hosts: [String] = [], apps: [String] = []) {

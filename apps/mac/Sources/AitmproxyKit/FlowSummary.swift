@@ -43,6 +43,19 @@ public struct FlowSummary: Hashable, Sendable {
     /// (`duration_ms`, whole milliseconds). Nil while in flight, from an older core,
     /// and for a WebSocket flow, which has no end marker yet.
     public var duration: Duration?
+    /// The outcome of a `CONNECT` row (wire `tunnel`, #228: `decrypted` / `passthrough` /
+    /// `failed`); nil when the row is not a tunnel, from a core older than #228, and for a
+    /// code this build does not know.
+    public var tunnel: TunnelMode?
+    /// Why the tunnel was passed through or failed (wire `tunnel_reason`); nil when absent,
+    /// null, or a label this build does not know.
+    public var tunnelReason: TunnelReason?
+    /// Bytes relayed through a passthrough tunnel (wire `bytes_up` / `bytes_down`), with the
+    /// same guards as the body sizes; nil until the tunnel closes.
+    public var tunnelBytesUp: Int64?
+    public var tunnelBytesDown: Int64?
+    /// The core observed this flow without decrypting it (wire `passive`; absent → false).
+    public var passive: Bool
 
     /// No body a real core buffers approaches this (the default cap is 10 MiB); a size
     /// past it is a lie from the peer, read as unknown so it is neither shown nor summed.
@@ -61,7 +74,9 @@ public struct FlowSummary: Hashable, Sendable {
         scheme: String? = nil, authority: String? = nil, path: String? = nil, status: Int? = nil,
         handshake: FlowID? = nil, messages: Int? = nil, requestBytes: Int64? = nil, responseBytes: Int64? = nil,
         startedAt: Date? = nil, duration: Duration? = nil, reportsBodySizes: Bool = false,
-        sourceApp: String? = nil, captureInterface: String? = nil
+        sourceApp: String? = nil, captureInterface: String? = nil,
+        tunnel: TunnelMode? = nil, tunnelReason: TunnelReason? = nil,
+        tunnelBytesUp: Int64? = nil, tunnelBytesDown: Int64? = nil, passive: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -81,6 +96,11 @@ public struct FlowSummary: Hashable, Sendable {
         self.reportsBodySizes = reportsBodySizes || requestBytes != nil || responseBytes != nil
         self.sourceApp = sourceApp
         self.captureInterface = captureInterface
+        self.tunnel = tunnel
+        self.tunnelReason = tunnelReason
+        self.tunnelBytesUp = tunnelBytesUp
+        self.tunnelBytesDown = tunnelBytesDown
+        self.passive = passive
     }
 
     /// Decodes the `structuredContent` of a `flow.get` result. Unknown
@@ -113,9 +133,18 @@ public struct FlowSummary: Hashable, Sendable {
         // wire is not one and reads as unknown (nil), never as a date before 1970.
         self.startedAt = Self.wholeMillis(json["started_at"]).map { Date(timeIntervalSince1970: Double($0) / 1000) }
         self.duration = Self.wholeMillis(json["duration_ms"]).map { .milliseconds($0) }
+        // Per-host decryption (#228, `capture.rs` `tunnel_fields`). An unknown mode or
+        // reason label from a newer core reads as nil; the byte counts are counts.
+        self.tunnel = json["tunnel"]?.stringValue.flatMap(TunnelMode.init(rawValue:))
+        self.tunnelReason = json["tunnel_reason"]?.stringValue.flatMap(TunnelReason.init(rawValue:))
+        self.tunnelBytesUp = Self.size(json["bytes_up"])
+        self.tunnelBytesDown = Self.size(json["bytes_down"])
+        self.passive = json["passive"]?.boolValue ?? false
     }
 
-    private static func size(_ value: JSONValue?) -> Int64? {
+    /// A non-negative count no real body (or tunnel) exceeds, else nil: absent, `null`,
+    /// negative, fractional or past `maxBodyBytes`. Shared with `FlowDetail+Wire`.
+    static func size(_ value: JSONValue?) -> Int64? {
         guard let size = value?.intValue, size >= 0, Int64(size) <= Self.maxBodyBytes else { return nil }
         return Int64(size)
     }
@@ -144,6 +173,14 @@ public struct FlowSummary: Hashable, Sendable {
         case .observed, .resumed: state = status == nil ? .pending : .complete
         }
         let scheme = scheme ?? (kind == .websocket ? "wss" : "https")
+        // The wire's `tunnel` decides the SSL column when the core sent one (#228); a row
+        // that is not a tunnel, or an older core, falls back to the scheme rule.
+        let tls: TLSState = switch tunnel {
+        case .passthrough: .tunnelled
+        case .failed: .pinnedOrFailed
+        case .decrypted: .decrypted
+        case nil: scheme == "https" || scheme == "wss" ? .decrypted : .none
+        }
         return FlowRow(
             id: id, seq: seq, kind: kind,
             method: kind == .websocket ? .ws : HTTPMethod(method ?? "GET"),
@@ -153,7 +190,9 @@ public struct FlowSummary: Hashable, Sendable {
             client: sourceApp.map { ClientInfo(sourceApp: $0) },
             startedAt: startedAt, duration: duration,
             requestBytes: requestBytes, responseBytes: responseBytes,
-            tls: scheme == "https" || scheme == "wss" ? .decrypted : .none,
+            tls: tls,
+            tunnel: tunnel, tunnelReason: tunnelReason,
+            tunnelBytesUp: tunnelBytesUp, tunnelBytesDown: tunnelBytesDown, passive: passive,
             edited: intercept == .resumed,
             wsFrames: messages.map { (sent: $0, received: 0) },
             coreID: coreID

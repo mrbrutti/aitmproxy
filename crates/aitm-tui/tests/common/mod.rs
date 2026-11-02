@@ -59,6 +59,14 @@ pub fn text_of(app: &App, cols: u16, rows: u16) -> String {
     to_text(&draw(app, cols, rows))
 }
 
+/// The toolbar row at `cols` columns, styles dropped, trailing spaces trimmed.
+pub fn toolbar_at(app: &App, cols: u16) -> String {
+    let area = Rect::new(0, 0, cols, 1);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::bars::toolbar(app, &theme(), area, &mut buf);
+    to_text(&buf).trim_end().to_string()
+}
+
 /// An [`App`] at `cols`×`rows`, connected to a bus that offers every
 /// [`CORE_TOOLS`] name (bus address `test`, so it is not a loopback bus).
 /// Flows, details, scope and findings are not part of it; each test feeds
@@ -360,6 +368,7 @@ pub fn connect(app: &mut App, tool_names: &[&str], listening: Option<&str>) -> V
             capturing: true,
             paused: 0,
             flows: 0,
+            system_proxy: None,
         })));
     }
     out

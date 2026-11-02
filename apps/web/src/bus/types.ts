@@ -132,10 +132,37 @@ export interface StateNotification {
   protocol?: string;
   intercept_armed: boolean;
   paused: number;
-  agent: 'all' | 'readonly' | 'paused';
+  /** The core's five postures (crates/aitm-core/src/agent.rs); `all`/`readonly`/`paused` are what the UI sets, `auto`/`ask` arrive from config or the CLI. */
+  agent: 'all' | 'auto' | 'ask' | 'readonly' | 'paused';
   agent_actions_last_minute?: number;
   throughput?: { up: number; down: number };
   memory_bytes?: number;
+}
+
+/**
+ * `proxy.status.system_proxy` (spec D6): the OS-level system proxy as the core reads it. The
+ * compact sub-object carries the first seven fields; the full `proxy.system.*` results add
+ * `guidance` (the env line when `unsupported`) and `remedy` (the privilege sentence when
+ * `needs_privilege`). A state string the client does not know parses to `unknown`.
+ */
+export type SystemProxyState = 'off' | 'points_at_us' | 'other' | 'unsupported' | 'needs_privilege' | 'unknown';
+
+export interface SystemProxyStatus {
+  state: SystemProxyState;
+  /** The effective endpoint; present only for `other` (D6). */
+  host: string | null;
+  port: number | null;
+  /** The state file exists and every service it lists still reads back as what we wrote. */
+  managed_by_us: boolean;
+  /** A set/unset is in flight in the core (another client's call). */
+  setting: boolean;
+  /** `mechanism != none`. */
+  supported: boolean;
+  detail: string;
+  /** The env-var line when `unsupported`; the parser sets null when the object carries none (the compact one never does). */
+  guidance: string | null;
+  /** The privilege sentence when `needs_privilege`; null otherwise or when absent. */
+  remedy: string | null;
 }
 
 /** One trust store of `ca.status.stores` (`crates/aitm-ca/src/commands.rs`): `user` or `system`. */

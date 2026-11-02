@@ -448,7 +448,8 @@ for view in banner empty; do
 done
 has "NS-AC3 the banner never promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'carry no source app'
 hasnt "NS-AC3 no advice copy promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'attribute flows to apps|flows are attributed|needs the (macOS )?capture extension'
-has "NS-AC8 with flows present the Apps page keeps the table and shows the banner" "$shell_code" 'session.clients.isEmpty, !session.rows.isEmpty'
+has "NS-AC8 with flows present the list pages keep the table and the route banner is guarded by trafficRoutes.banner (spec 2026-10-31-mac-traffic-route-advice D8)" "$shell_code" 'if routes.banner != nil {'
+has "NS-AC8 the guard's routes are session.trafficRoutes, read once" "$shell_code" 'let routes = session.trafficRoutes'
 has "NS-AC8 the full empty state shows only when there are no flows at all" "$shell_code" 'session.clients.isEmpty, session.rows.isEmpty'
 hasnt "NS-AC4 ShellView reads no capture.enabled key" "$shell_code" 'capture\.enabled'
 hasnt "NS-AC4 ShellView never calls the toggle glue" "$shell_code" 'CaptureSwitch'
@@ -522,17 +523,27 @@ has "NS-AC3 the Apps empty state shows the advice detail" "$empty_body" 'Text(ad
 
 # NS-AC8: MainView renders the banner above the table when flows exist, the empty state only when
 # there are none, and the flow table is the fallback. A view that exists but is never rendered fails here.
+# Since spec 2026-10-31-mac-traffic-route-advice-design D8 the one banner line on every list page is
+# RouteBanner(routes:) (the closed routes' state words, one remedy button), handed the one
+# `let routes = session.trafficRoutes` MainView reads per body and guarded by `routes.banner != nil`;
+# AppsAttributionBanner's call site is gone (its struct stays, so the NS-AC3 body pins above still hold)
+# and a second RouteBanner(routes:) call, a second trafficRoutes read or a returning AppsAttributionBanner()
+# call in MainView fails here.
 main_body=$(body_of "$shell" '^struct MainView: View')
 found "NS-AC8 MainView" "$main_body"
-equals "NS-AC8 the banner is rendered exactly once" "$(grep -c -F 'AppsAttributionBanner()' <<<"$main_body")" "1"
+equals "NS-AC8 the banner is rendered exactly once" "$(grep -c -F 'RouteBanner(routes: routes)' <<<"$main_body")" "1"
+equals "NS-AC8 MainView reads session.trafficRoutes exactly once" "$(grep -c -F 'session.trafficRoutes' <<<"$main_body")" "1"
+equals "NS-AC8 the old Apps banner is no longer rendered" "$(grep -c -F 'AppsAttributionBanner()' <<<"$main_body")" "0"
 equals "NS-AC8 the empty state is rendered exactly once" "$(grep -c -F 'AppsEmptyState()' <<<"$main_body")" "1"
-main_bcond=$(line_of "$main_body" 'session[.]page == [.]apps, session[.]clients[.]isEmpty, !session[.]rows[.]isEmpty [{]')
-main_bcall=$(line_of "$main_body" 'AppsAttributionBanner[(][)]')
+main_routes=$(line_of "$main_body" 'let routes = session[.]trafficRoutes$')
+main_bcond=$(line_of "$main_body" 'if routes[.]banner != nil [{]')
+main_bcall=$(line_of "$main_body" 'RouteBanner[(]routes: routes[)]')
 main_split=$(line_of "$main_body" 'if session[.]splitView [{]')
 main_econd=$(line_of "$main_body" 'else if session[.]page == [.]apps, session[.]clients[.]isEmpty, session[.]rows[.]isEmpty [{]')
 main_ecall=$(line_of "$main_body" 'AppsEmptyState[(][)]')
-main_table=$(line_of "$main_body" '^[0-9]+:[[:space:]]*flowTable[[:space:]]*$')
-ordered "NS-AC8 the banner condition (flows present) guards the banner" "$main_bcond" "$main_bcall"
+main_table=$(line_of "$main_body" '^[0-9]+:[[:space:]]*flowTable[(]routes: routes[)][[:space:]]*$')
+ordered "NS-AC8 the routes are read before the banner's guard" "$main_routes" "$main_bcond"
+ordered "NS-AC8 the banner condition (a route is closed) guards the banner" "$main_bcond" "$main_bcall"
 ordered "NS-AC8 the banner sits above the flow table" "$main_bcall" "$main_split"
 ordered "NS-AC8 the empty-state condition (no flows) guards the empty state" "$main_econd" "$main_ecall"
 ordered "NS-AC8 the flow table is the fallback after the empty state" "$main_ecall" "$main_table"

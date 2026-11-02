@@ -287,7 +287,7 @@ export async function startAitm({
   for (const d of [pocDir, pocOut]) if (!existsSync(d)) spawn('mkdir', ['-p', d]);
   const child = spawn(aitmBin, ['--config', cfg, 'web', '--listen', `127.0.0.1:${webPort}`, '--token', token], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info' },
+    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'info', AITM_AUDIT_LOG: process.env.AITM_AUDIT_LOG ?? 'off' },
   });
   let stderr = '';
   let out = '';

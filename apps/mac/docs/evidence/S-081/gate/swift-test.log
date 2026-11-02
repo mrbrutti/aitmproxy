@@ -1,0 +1,5 @@
+◇ Suite ScopeAddQueueTests started.
+✔ Suite ScopeAddQueueTests passed after 0.060 seconds.
+✔ Test run with 727 tests in 83 suites passed after 0.839 seconds.
+✔ Test run with 31 tests in 6 suites passed after 0.514 seconds.
+swift test exit 0
