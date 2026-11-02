@@ -194,7 +194,11 @@ def main() -> int:
         closed_udp = free_port()
         closed_tcp = free_port()
         note("closed ports (nothing is bound here)", {"udp": closed_udp, "tcp": closed_tcp})
-        check_kernel_reaction(op, "127.0.0.1", closed_udp, "udp", "udp.length",
+        # `raw`, not a header field: a datagram whose `udp.length` is mutated is dropped
+        # by the receiving stack before the port lookup, so it draws no ICMP at all
+        # (rig run 6: 2 of 10 header cases sendable, all silent); only a well-formed
+        # datagram to a closed port is answered with ICMP 3/3 (write-up section iii).
+        check_kernel_reaction(op, "127.0.0.1", closed_udp, "udp", "raw",
                               {"kind": "icmp", "type": 3, "code": 3}, "closed-udp")
         check_kernel_reaction(op, "127.0.0.1", closed_tcp, "tcp", "tcp.flags",
                               {"kind": "reset"}, "closed-tcp")
