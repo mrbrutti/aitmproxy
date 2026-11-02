@@ -442,6 +442,7 @@ name = "aitm-scan-checks-http"
 version = "0.5.11"
 dependencies = [
  "aitm-core",
+ "aitm-plugin-rhai",
  "aitm-poc",
  "aitm-proto-http",
  "aitm-scan-model",
