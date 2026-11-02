@@ -14,10 +14,10 @@ use aitm_tui::keys;
 use aitm_tui::l4::{
     ascii_column, clock_ms, flow_get_args, fold_status, hex_dump, inert, inspect_args,
     packet_fields, slow_l4_reads, status_ids, supports_operator_scope_add, supports_window,
-    ConfirmReply, L4Availability, L4Confirm, L4Flow, L4Pane, L4Parked, L4Read, L4State,
-    SCOPE_ADD_L4_USAGE,
+    L4Availability, L4Flow, L4Pane, L4Parked, L4Read, L4State, SCOPE_ADD_L4_USAGE,
 };
 use aitm_tui::model::{AgentPolicy, AgentState, FlowRow};
+use aitm_tui::scan::launch::{ConfirmReply, WireConfirm};
 use aitm_tui::theme::Theme;
 use aitm_tui::ui::complete::{l4_command_candidates, Candidate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -377,7 +377,7 @@ fn models_supports_operator_scope_add_needs_confirmable() {
     assert!(supports_operator_scope_add(&[present]));
 }
 
-/// AC40: packet text is inert — bytes outside 0x20–0x7e render as `.`.
+/// AC40: packet text is inert: bytes outside 0x20–0x7e render as `.`.
 #[test]
 fn models_ascii_column_is_inert() {
     assert_eq!(
@@ -460,7 +460,7 @@ fn models_bus_events_fold_into_l4_state() {
 /// statuses come first so one pass's status read governs its list read.
 #[test]
 fn polling_slow_reads_status_always_and_parked_only_when_available() {
-    // Tester: the unavailable pass is exactly these four, in this order —
+    // Tester: the unavailable pass is exactly these four, in this order:
     // both status verbs every time, never `l4.intercept.list`.
     let unavailable = read_tools(slow_l4_reads(|_| true, false));
     assert_eq!(
@@ -1235,7 +1235,7 @@ fn parked_id_unavailable_intercept_refuses_locally_with_the_reason() {
     assert_eq!(app.update(Action::Kill), Vec::<BusRequest>::new());
     assert_eq!(toast_text(&app), "in-path intercept unavailable: Y");
     assert!(app.l4.pending.is_none(), "{:?}", app.l4.pending);
-    assert_ne!(app.mode, Mode::L4Confirm);
+    assert_ne!(app.mode, Mode::WireConfirm);
     // Mutate (`e`) opens the craft pane; it never calls `l4.intercept.*`.
     let out = app.update(Action::Edit);
     assert!(
@@ -1500,7 +1500,7 @@ fn craft_ready(parked: Vec<Value>) -> App {
 }
 
 /// AC12: "apply to parked packet" emits exactly `l4.intercept.mutate {id: <parked
-/// id>, spec: <the editor's spec>}` — the parked id from `l4.intercept.list`,
+/// id>, spec: <the editor's spec>}`, the parked id from `l4.intercept.list`,
 /// never the flow id, and the spec parsed from the editor's text.
 #[test]
 fn mutate_apply_sends_the_parked_id_and_the_editor_spec() {
@@ -1694,8 +1694,8 @@ fn inject_gate_refuses_locally_while_capture_is_unavailable() {
     assert_eq!(out, Vec::<BusRequest>::new());
     assert_eq!(toast_text(&app), "inject unavailable: R");
     assert!(app.l4.pending.is_none(), "{:?}", app.l4.pending);
-    assert!(app.l4.confirm.is_none());
-    assert_ne!(app.mode, Mode::L4Confirm);
+    assert!(app.wire_confirm.is_none());
+    assert_ne!(app.mode, Mode::WireConfirm);
 
     let mut fresh = inject_ready(L4Availability::pending());
     let out = fresh.update(Action::L4Inject);
@@ -1798,8 +1798,8 @@ fn scope_add_l4_confirm_handshake_reissues_with_the_token() {
         name: "l4.scope.add".into(),
         value: json!({"status": "needs_confirmation", "prompt": "P", "confirm_token": "tok-1"}),
     });
-    assert_eq!(on.mode, Mode::L4Confirm);
-    let confirm = on.l4.confirm.as_ref().expect("confirm overlay state");
+    assert_eq!(on.mode, Mode::WireConfirm);
+    let confirm = on.wire_confirm.as_ref().expect("confirm overlay state");
     assert_eq!(confirm.prompt, "P");
     assert_eq!(confirm.call, "l4.scope.add");
     assert!(
@@ -1808,10 +1808,10 @@ fn scope_add_l4_confirm_handshake_reissues_with_the_token() {
     );
 
     assert_eq!(
-        keys::map(press('y'), Mode::L4Confirm),
-        Some(Action::L4Confirm(true))
+        keys::map(press('y'), Mode::WireConfirm),
+        Some(Action::WireConfirm(true))
     );
-    let reqs = on.update(Action::L4Confirm(true));
+    let reqs = on.update(Action::WireConfirm(true));
     assert_eq!(
         reqs,
         vec![BusRequest::Call {
@@ -2221,7 +2221,7 @@ fn chips_filters_help_bar_and_filter_hint_list_the_atoms() {
         "{text}"
     );
     assert!(
-        text.contains("Any key closes this help."),
+        text.contains("↑↓ PgUp PgDn Home End scroll · any other key closes this help."),
         "the last help line is not clipped: {text}"
     );
     // The filter prompt's hint.
@@ -2237,17 +2237,17 @@ fn chips_filters_help_bar_and_filter_hint_list_the_atoms() {
 fn render_confirm(call: &str, args: Value, prompt: &str) -> String {
     let mut app = app();
     let _ = connected(&mut app, l4_tools(true));
-    app.l4.confirm = Some(L4Confirm {
+    app.wire_confirm = Some(WireConfirm {
         call: call.to_string(),
         args,
         prompt: prompt.to_string(),
         token: "tok-1".to_string(),
     });
-    app.mode = Mode::L4Confirm;
+    app.mode = Mode::WireConfirm;
     let theme = Theme::new(true);
     let area = Rect::new(0, 0, 120, 30);
     let mut buf = Buffer::empty(area);
-    aitm_tui::ui::l4::confirm(&app, &theme, area, &mut buf);
+    aitm_tui::ui::scan::confirm::render(&app, &theme, area, &mut buf);
     buffer_text(&buf).join("\n")
 }
 
@@ -2626,7 +2626,7 @@ fn no_stale_f1_in_tui_src() {
     assert!(hits.is_empty(), "stale F1 text:\n{}", hits.join("\n"));
 
     // Stage-6 fix (quality Minor): the bare follow-up tag `F1` must not be
-    // rendered anywhere either — no `src/ui/` string literal may carry it as
+    // rendered anywhere either: no `src/ui/` string literal may carry it as
     // a word (`F10`–`F15` and identifiers outside literals are untouched).
     let bare = regex::Regex::new(r"\bF1\b").expect("regex");
     let mut ui_hits = Vec::new();
@@ -2658,8 +2658,8 @@ fn no_stale_f1_in_tui_src() {
 //
 // Stage-5 additions (tester). Every input below is built in the test in the
 // core's wire shape; nothing is read from a fixture, a snapshot or a seeded
-// store. The theme of this block is the unit's core promise — **nothing on
-// the wire when unavailable, and never the flow id on a verdict** — plus the
+// store. The theme of this block is the unit's core promise (**nothing on
+// the wire when unavailable, and never the flow id on a verdict**) plus the
 // edge cases a bus client must survive: malformed, empty, oversized and
 // control-character-laden replies.
 
@@ -2756,8 +2756,8 @@ fn tester_parked_id_rule_every_verdict_verb_carries_only_the_parked_id() {
         ]
     );
 
-    // The confirm handshake on Forward re-issues `{id: <parked>, _confirm}` —
-    // still never the flow id — and `n` on a fresh one sends nothing.
+    // The confirm handshake on Forward re-issues `{id: <parked>, _confirm}`,
+    // still never the flow id, and `n` on a fresh one sends nothing.
     let _ = app.update(Action::Resume);
     let reqs = app.on_bus(BusEvent::CallOk {
         name: "l4.intercept.forward".into(),
@@ -2767,8 +2767,8 @@ fn tester_parked_id_rule_every_verdict_verb_carries_only_the_parked_id() {
         l4_calls(&reqs).is_empty(),
         "the handshake reply sends nothing"
     );
-    assert_eq!(app.mode, Mode::L4Confirm);
-    let reqs = app.update(Action::L4Confirm(true));
+    assert_eq!(app.mode, Mode::WireConfirm);
+    let reqs = app.update(Action::WireConfirm(true));
     assert_eq!(
         reqs,
         vec![BusRequest::Call {
@@ -2784,14 +2784,14 @@ fn tester_parked_id_rule_every_verdict_verb_carries_only_the_parked_id() {
         name: "l4.intercept.drop".into(),
         value: json!({"status": "needs_confirmation", "prompt": "Drop?", "confirm_token": "cfm-78"}),
     });
-    assert_eq!(app.mode, Mode::L4Confirm);
+    assert_eq!(app.mode, Mode::WireConfirm);
     assert_eq!(
-        keys::map(press('n'), Mode::L4Confirm),
-        Some(Action::L4Confirm(false))
+        keys::map(press('n'), Mode::WireConfirm),
+        Some(Action::WireConfirm(false))
     );
-    assert_eq!(app.update(Action::L4Confirm(false)), vec![]);
+    assert_eq!(app.update(Action::WireConfirm(false)), vec![]);
     assert_eq!(toast_text(&app), "l4.intercept.drop cancelled");
-    assert!(app.l4.confirm.is_none());
+    assert!(app.wire_confirm.is_none());
 }
 
 /// `Debug` text of a request, for "does not contain" checks.
@@ -2823,14 +2823,14 @@ fn tester_malformed_handshake_without_a_token_opens_nothing_and_sends_nothing() 
             .any(|r| matches!(r, BusRequest::Call { name, .. } if name == "l4.scope.add")),
         "no bare re-issue: {reqs:?}"
     );
-    assert_ne!(on.mode, Mode::L4Confirm, "no overlay without a token");
-    assert!(on.l4.confirm.is_none());
+    assert_ne!(on.mode, Mode::WireConfirm, "no overlay without a token");
+    assert!(on.wire_confirm.is_none());
     assert!(
         on.l4.pending.is_none(),
         "the pending call is consumed, not replayed"
     );
     // `y` now (no overlay) must not resurrect anything.
-    assert_eq!(on.update(Action::L4Confirm(true)), vec![]);
+    assert_eq!(on.update(Action::WireConfirm(true)), vec![]);
 
     let mut inj = inject_ready(available());
     let _ = inj.update(Action::L4Inject);
@@ -2839,14 +2839,14 @@ fn tester_malformed_handshake_without_a_token_opens_nothing_and_sends_nothing() 
         value: json!({"status": "needs_confirmation", "prompt": "Inject?"}),
     });
     assert!(l4_calls(&reqs).is_empty(), "{reqs:?}");
-    assert_ne!(inj.mode, Mode::L4Confirm);
-    assert!(inj.l4.confirm.is_none());
-    assert_eq!(inj.update(Action::L4Confirm(true)), vec![]);
+    assert_ne!(inj.mode, Mode::WireConfirm);
+    assert!(inj.wire_confirm.is_none());
+    assert_eq!(inj.update(Action::WireConfirm(true)), vec![]);
 }
 
 /// HTTP `:scope add <host>` is unchanged by the L4 form even for hosts that
-/// begin with the letters `l4` — only the exact word `l4` (alone or followed
-/// by a space) is the L4 form — and the same holds through the palette's
+/// begin with the letters `l4` (only the exact word `l4`, alone or followed
+/// by a space, is the L4 form) and the same holds through the palette's
 /// Submit path with the `l4` completion present.
 #[test]
 fn tester_scope_add_host_beginning_with_l4_is_still_http_scope() {
@@ -2889,11 +2889,11 @@ fn tester_scope_add_host_beginning_with_l4_is_still_http_scope() {
 }
 
 /// Spec §2.3 / AC40 discipline for **strings**, not just packet bytes: every
-/// core-supplied L4 string that reaches the screen — the two status reasons,
+/// core-supplied L4 string that reaches the screen (the two status reasons,
 /// a parked id, a parked state, layer names, packet `proto`/`src`, capture
 /// ids, interface names (scope entries and flows, as list rows and as palette
 /// completions), scope-entry fields, the confirm prompt and the refusal
-/// toasts — is rendered with no control character anywhere on the screen,
+/// toasts) is rendered with no control character anywhere on the screen,
 /// with ESC sequences and newlines included in the input. Where the renderer
 /// goes through `inert()` the control byte shows as `.` (the AC40 rule), which
 /// pins that the helper is actually on that path.
@@ -3028,10 +3028,9 @@ fn tester_core_strings_with_control_characters_render_inert_on_every_surface() {
     assert_inert(&buffer_text(&buf).join("\n"), "flow list with an L4 row");
 
     assert_eq!(app.run_command("l4 capture lo0"), vec![]);
-    assert_eq!(
-        toast_text(&app),
-        format!("capture unavailable: {CAP_REASON}")
-    );
+    // The toast is stored with the control characters stripped (the app's
+    // fold-time `clean`, T7 fix round H) and rendered inert on top.
+    assert_eq!(toast_text(&app), "capture unavailable: no[31m bpfaccess");
     let mut buf = Buffer::empty(area);
     aitm_tui::ui::render(&app, &theme, area, &mut buf);
     assert_inert(
@@ -3050,7 +3049,7 @@ fn tester_core_strings_with_control_characters_render_inert_on_every_surface() {
     assert_eq!(app.update(Action::Resume), vec![]);
     assert_eq!(
         toast_text(&app),
-        format!("in-path intercept unavailable: {INT_REASON}")
+        "in-path intercept unavailable: Linux[0m only"
     );
     let mut buf = Buffer::empty(area);
     aitm_tui::ui::render(&app, &theme, area, &mut buf);
@@ -3263,9 +3262,11 @@ fn tester_oversized_inputs_render_without_panic() {
     let ids: Vec<&str> = vec!["C"; 500];
     set_capture(&mut app, unavailable(&long_reason), &ids);
     assert_eq!(app.run_command("l4 capture lo0"), vec![]);
+    // Stored stripped of the escapes and cut to the toast bound (400 cells,
+    // `App::toast`): the 21-cell prefix, 378 `x` and the ellipsis.
     assert_eq!(
         toast_text(&app),
-        format!("capture unavailable: {long_reason}")
+        format!("capture unavailable: {}…", "x".repeat(378))
     );
     let area = Rect::new(0, 0, 100, 14);
     let mut buf = Buffer::empty(area);
@@ -3344,7 +3345,7 @@ fn tester_nothing_on_the_wire_under_every_unavailable_code() {
                 "{action:?}"
             );
             assert!(app.l4.pending.is_none(), "{reason}: {action:?}");
-            assert_ne!(app.mode, Mode::L4Confirm);
+            assert_ne!(app.mode, Mode::WireConfirm);
         }
         // And the reducer itself never asks for the parked list: that read is
         // the bus task's, gated on the status (the bus-level test is in
@@ -3387,7 +3388,7 @@ const HELP_BODY_MARKERS: [&str; 36] = [
     "set / restore the system proxy (:sysproxy on|off|status)",
     "copy URL (OSC 52) · open externally",
     "filter expression: ~u ~d",
-    "command palette — every bus tool plus:",
+    "command palette, every bus tool plus:",
     "Arm/disarm interception (i)",
     "Resume the targeted paused flow (⏎ in the bar)",
     "Resume every paused flow",
@@ -3405,14 +3406,17 @@ const HELP_BODY_MARKERS: [&str; 36] = [
 ];
 const HELP_SCOPE_ADD_MARKER: &str = "Add an L4 scope entry";
 
-/// Quality Important: the help footer's hidden-line count is exactly the number
-/// of key / palette lines that did not make it onto the screen, a footer appears
-/// only when at least one is hidden, and the closing hint is present every time.
-/// Literal per cell: at 100×37 the box's inner height is 35, so 36 body lines
-/// hide 2 and 37 hide 3; at 120×40 (inner 38) nothing is hidden for either body
-/// (37 + the hint fit by dropping the blank spacer); 160×44 and 160×50 fit all.
+/// Quality Important: the key / palette lines off the screen are exactly the
+/// ones the help overlay's `more ↓` marker stands in for, the marker appears
+/// only when something is hidden, and the closing hint is reachable every time
+/// (End scrolls to it; the overlay scrolls, T7 spec D11 / fix round G, G85).
+/// Literal per cell: at 100×37 the box's inner height is 35 and the marker
+/// takes the last row, so 34 body rows show: 36 body lines hide 2 and 37 hide
+/// 3; at 120×40 (inner 38, 37 body rows) nothing is hidden for either body;
+/// 160×44 and 160×50 show every key / palette line (the Scan section below
+/// them is what scrolls at 44 rows, and nothing at 50).
 #[test]
-fn help_footer_counts_exactly_the_hidden_lines_and_only_when_some_are() {
+fn help_more_marker_shows_exactly_when_lines_are_hidden_and_end_reaches_the_closing_hint() {
     let cells: [(u16, u16, bool, Option<usize>); 8] = [
         (100, 37, false, Some(2)),
         (100, 37, true, Some(3)),
@@ -3427,6 +3431,8 @@ fn help_footer_counts_exactly_the_hidden_lines_and_only_when_some_are() {
     for (cols, rows, confirmable, expected_hidden) in cells {
         let mut app = app();
         let _ = connected(&mut app, l4_tools(confirmable));
+        // The reducer clamps the scroll with the size it was told.
+        let _ = app.update(Action::Resize(cols, rows));
         app.mode = Mode::Help;
         let area = Rect::new(0, 0, cols, rows);
         let mut buf = Buffer::empty(area);
@@ -3434,10 +3440,6 @@ fn help_footer_counts_exactly_the_hidden_lines_and_only_when_some_are() {
         let text = buffer_text(&buf).join("\n");
         let cell = format!("{cols}×{rows} confirmable={confirmable}");
 
-        assert!(
-            text.contains("Any key closes this help."),
-            "{cell}: closing hint missing:\n{text}"
-        );
         // The full list, as the rendered screen shows or hides it.
         let mut missing = HELP_BODY_MARKERS
             .iter()
@@ -3457,21 +3459,37 @@ fn help_footer_counts_exactly_the_hidden_lines_and_only_when_some_are() {
         match expected_hidden {
             Some(n) => {
                 assert_eq!(missing, n, "{cell}: lines off the screen:\n{text}");
-                let footer =
-                    format!("… {n} more lines need a taller window · Any key closes this help.");
                 assert!(
-                    text.contains(&footer),
-                    "{cell}: footer {footer:?} not in:\n{text}"
+                    text.contains("more ↓"),
+                    "{cell}: no scroll marker while lines are hidden:\n{text}"
                 );
             }
             None => {
                 assert_eq!(missing, 0, "{cell}: every line is on the screen:\n{text}");
-                assert!(
-                    !text.contains("more lines"),
-                    "{cell}: a footer with nothing hidden:\n{text}"
-                );
             }
         }
+        // The closing hint is reachable every time: End scrolls to it, and the
+        // top marker says what scrolled away (nothing at 160×50, where it all
+        // fits and the hint is on screen without scrolling).
+        let scrolled = text.contains("more ↓");
+        assert_eq!(
+            scrolled,
+            !text.contains("↑↓ PgUp PgDn Home End scroll · any other key closes this help."),
+            "{cell}: the closing hint shows exactly when nothing is below:\n{text}"
+        );
+        let _ = app.update(Action::End);
+        let mut buf = Buffer::empty(area);
+        aitm_tui::ui::render(&app, &theme, area, &mut buf);
+        let text = buffer_text(&buf).join("\n");
+        assert!(
+            text.contains("↑↓ PgUp PgDn Home End scroll · any other key closes this help."),
+            "{cell}: closing hint missing after End:\n{text}"
+        );
+        assert_eq!(
+            text.contains("↑ more"),
+            scrolled,
+            "{cell}: the top marker after End:\n{text}"
+        );
     }
 }
 
@@ -3508,8 +3526,8 @@ fn confirm_reply_for_another_verb_leaves_the_pending_inject_in_place() {
         Some(("l4.inject".to_string(), inject_args())),
         "the inject stays pending"
     );
-    assert!(app.l4.confirm.is_none(), "{:?}", app.l4.confirm);
-    assert_ne!(app.mode, Mode::L4Confirm);
+    assert!(app.wire_confirm.is_none(), "{:?}", app.wire_confirm);
+    assert_ne!(app.mode, Mode::WireConfirm);
     assert_eq!(
         toast_text(&app),
         "l4.scope.add needs confirmation: re-run it from the L4 controls"
@@ -3521,8 +3539,8 @@ fn confirm_reply_for_another_verb_leaves_the_pending_inject_in_place() {
         value: handshake("Inject 1 UDP to 127.0.0.1:7?", "tok-inject"),
     });
     assert_eq!(reqs, Vec::<BusRequest>::new());
-    assert_eq!(app.mode, Mode::L4Confirm);
-    let c = app.l4.confirm.clone().expect("overlay");
+    assert_eq!(app.mode, Mode::WireConfirm);
+    let c = app.wire_confirm.clone().expect("overlay");
     assert_eq!(c.call, "l4.inject");
     assert_eq!(c.args, inject_args());
     assert_eq!(c.prompt, "Inject 1 UDP to 127.0.0.1:7?");
@@ -3531,7 +3549,7 @@ fn confirm_reply_for_another_verb_leaves_the_pending_inject_in_place() {
     let mut expected = inject_args();
     expected["_confirm"] = json!("tok-inject");
     assert_eq!(
-        app.update(Action::L4Confirm(true)),
+        app.update(Action::WireConfirm(true)),
         vec![BusRequest::Call {
             name: "l4.inject".into(),
             args: expected,
@@ -3541,7 +3559,7 @@ fn confirm_reply_for_another_verb_leaves_the_pending_inject_in_place() {
 
 /// Security Minor 1: a handshake with nothing pending for its name (the generic
 /// palette tool form never sets `pending`) builds no overlay and re-issues
-/// nothing — the toast says to re-run it from the L4 controls.
+/// nothing: the toast says to re-run it from the L4 controls.
 #[test]
 fn confirm_reply_with_nothing_pending_toasts_and_sends_nothing() {
     for name in [
@@ -3559,22 +3577,22 @@ fn confirm_reply_with_nothing_pending_toasts_and_sends_nothing() {
             value: handshake("P", "tok-1"),
         });
         assert_eq!(reqs, Vec::<BusRequest>::new(), "{name}");
-        assert!(app.l4.confirm.is_none(), "{name}: {:?}", app.l4.confirm);
-        assert_ne!(app.mode, Mode::L4Confirm, "{name}");
+        assert!(app.wire_confirm.is_none(), "{name}: {:?}", app.wire_confirm);
+        assert_ne!(app.mode, Mode::WireConfirm, "{name}");
         assert_eq!(
             toast_text(&app),
             format!("{name} needs confirmation: re-run it from the L4 controls")
         );
         assert_eq!(toast_level(&app), Some(Level::Warn), "{name}");
         assert_eq!(
-            app.update(Action::L4Confirm(true)),
+            app.update(Action::WireConfirm(true)),
             Vec::<BusRequest>::new()
         );
     }
 }
 
 /// Quality Minor 3: a `needs_confirmation` reply without `confirm_token` is a
-/// malformed handshake, reported as a warning — not as the call's success —
+/// malformed handshake, reported as a warning, not as the call's success,
 /// with nothing sent, no overlay and no `l4.scope.list` re-read.
 #[test]
 fn confirm_reply_without_a_token_is_a_malformed_warning() {
@@ -3595,8 +3613,8 @@ fn confirm_reply_without_a_token_is_a_malformed_warning() {
         "l4.scope.add: malformed confirmation reply (no token)"
     );
     assert_eq!(toast_level(&on), Some(Level::Warn));
-    assert!(on.l4.confirm.is_none());
-    assert_ne!(on.mode, Mode::L4Confirm);
+    assert!(on.wire_confirm.is_none());
+    assert_ne!(on.mode, Mode::WireConfirm);
     assert!(on.l4.pending.is_none());
 
     let mut inj = inject_ready(available());
@@ -3611,8 +3629,8 @@ fn confirm_reply_without_a_token_is_a_malformed_warning() {
         "l4.inject: malformed confirmation reply (no token)"
     );
     assert_eq!(toast_level(&inj), Some(Level::Warn));
-    assert!(inj.l4.confirm.is_none());
-    assert_ne!(inj.mode, Mode::L4Confirm);
+    assert!(inj.wire_confirm.is_none());
+    assert_ne!(inj.mode, Mode::WireConfirm);
 }
 
 /// Security Minor 2 / AC33: `:l4 stop <id>` is refused locally while capture
@@ -3644,7 +3662,7 @@ fn capture_commands_stop_is_refused_locally_while_capture_is_unavailable() {
 }
 
 /// Quality Minor: the refusal fallback is one word for every class when the
-/// core sends no `reason` — `unknown` for inject, capture start, capture stop
+/// core sends no `reason`: `unknown` for inject, capture start, capture stop
 /// and the in-path verdicts alike.
 #[test]
 fn quality_refusal_fallback_reason_is_unknown_for_every_class() {
@@ -3685,10 +3703,11 @@ fn quality_refusal_fallback_reason_is_unknown_for_every_class() {
 }
 
 /// Quality Minor: the status-bar toast goes through the app's own `inert()`
-/// rule like every other core-sourced string — a control character in a toast
-/// renders as `.`, by design rather than by a ratatui rendering detail.
+/// rule like every other core-sourced string, after `App::toast` has already
+/// stripped the control characters at store time (T7 fix round H), so none
+/// reaches the terminal by design rather than by a ratatui rendering detail.
 #[test]
-fn quality_toast_text_renders_inert() {
+fn quality_toast_text_is_cleaned_at_store_time_and_inert_on_render() {
     let theme = Theme::new(true);
     let mut app = app();
     let _ = connected(&mut app, l4_tools(false));
@@ -3701,7 +3720,7 @@ fn quality_toast_text_renders_inert() {
     let mut buf = Buffer::empty(area);
     aitm_tui::ui::render(&app, &theme, area, &mut buf);
     let text = buffer_text(&buf).join("\n");
-    assert!(text.contains("core said a.[31mb.c.d"), "{text}");
+    assert!(text.contains("core said a[31mbcd"), "{text}");
     assert_inert(&text, "status bar with a control-laden toast");
 }
 
@@ -3812,7 +3831,7 @@ fn quality_candidate_becomes_a_command_palette_item() {
 #[test]
 fn quality_confirm_reply_classifies_handshake_malformed_and_plain() {
     let args = json!({"id": "P1"});
-    match L4Confirm::classify(
+    match WireConfirm::classify(
         "l4.intercept.forward",
         &args,
         &handshake("Forward?", "tok-f"),
@@ -3826,7 +3845,7 @@ fn quality_confirm_reply_classifies_handshake_malformed_and_plain() {
         other => panic!("{other:?}"),
     }
     assert_eq!(
-        L4Confirm::classify(
+        WireConfirm::classify(
             "l4.inject",
             &args,
             &json!({"status": "needs_confirmation", "prompt": "P"})
@@ -3834,7 +3853,7 @@ fn quality_confirm_reply_classifies_handshake_malformed_and_plain() {
         ConfirmReply::Malformed
     );
     assert_eq!(
-        L4Confirm::classify(
+        WireConfirm::classify(
             "l4.inject",
             &args,
             &json!({"status": "needs_confirmation", "confirm_token": 7})
@@ -3842,17 +3861,17 @@ fn quality_confirm_reply_classifies_handshake_malformed_and_plain() {
         ConfirmReply::Malformed
     );
     assert_eq!(
-        L4Confirm::classify("l4.inject", &args, &json!({"injected": 1})),
+        WireConfirm::classify("l4.inject", &args, &json!({"injected": 1})),
         ConfirmReply::Plain
     );
     assert_eq!(
-        L4Confirm::classify("l4.inject", &args, &json!("S4")),
+        WireConfirm::classify("l4.inject", &args, &json!("S4")),
         ConfirmReply::Plain
     );
 }
 
 /// Quality Minor: `inert` lives beside `ascii_column` and applies its rule to
-/// a string — every control character (C0, DEL, C1) becomes `.`.
+/// a string: every control character (C0, DEL, C1) becomes `.`.
 #[test]
 fn quality_inert_maps_every_control_character_to_a_dot() {
     assert_eq!(inert("a\u{1b}[31mb\u{7f}c\u{9b}d\n"), "a.[31mb.c.d.");
@@ -3968,9 +3987,9 @@ fn same_verb_in_flight_sends_once_and_toasts_until_the_reply() {
         name: "l4.scope.add".into(),
         value: handshake("Add 127.0.0.1/32?", "tok-s"),
     });
-    assert_eq!(on.mode, Mode::L4Confirm);
+    assert_eq!(on.mode, Mode::WireConfirm);
     assert!(on.l4.pending.is_none());
-    let confirmed = on.update(Action::L4Confirm(true));
+    let confirmed = on.update(Action::WireConfirm(true));
     assert_eq!(confirmed.len(), 1, "{confirmed:?}");
     assert_eq!(on.run_command(cmd), first);
 
@@ -4011,7 +4030,7 @@ fn same_verb_in_flight_sends_once_and_toasts_until_the_reply() {
 }
 
 /// Quality pass-2 Minor 2: the refusal rule is a pure method on the
-/// availability — `None` while available, otherwise the exact toast text with
+/// availability: `None` while available, otherwise the exact toast text with
 /// the core's reason or the one fallback `unknown`.
 #[test]
 fn quality_refusal_is_pure_and_keeps_every_literal() {

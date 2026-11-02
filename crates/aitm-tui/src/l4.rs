@@ -211,7 +211,7 @@ impl L4Flow {
 
 /// The `TCP` / `UDP` / `ICMP` transport sub-label for a layer list, if any.
 pub fn proto_of(layers: &[String]) -> Option<&'static str> {
-    // Innermost transport wins — scan inner-to-outer, matching the web
+    // Innermost transport wins: scan inner-to-outer, matching the web
     // (`protoSubLabel`) and macOS (`L4Proto.fromLayers`) rule so the three
     // surfaces print the same sub-label.
     layers.iter().rev().find_map(|l| proto_label(l))
@@ -410,7 +410,7 @@ impl L4Read {
 /// The slow pass's `l4.*` reads, in order (spec §1, §4): the L4 scope and
 /// agent panels, then both status verbs every time (availability is never
 /// cached for the session), then `l4.intercept.list` only while intercept is
-/// available — a core whose intercept is unavailable is never asked for its
+/// available: a core whose intercept is unavailable is never asked for its
 /// parked list. Only verbs the bus offers (`has`) are listed. The statuses
 /// precede the list so a status read in one pass governs that pass's list.
 pub fn slow_l4_reads(has: impl Fn(&str) -> bool, intercept_available: bool) -> Vec<L4Read> {
@@ -518,7 +518,7 @@ pub fn scope_add_args(words: &str) -> Result<Value, &'static str> {
 // ------------------------------------------------------------- packet text
 
 /// Text from the core, made inert for the terminal: every control character
-/// becomes `.` — [`ascii_column`]'s rule applied to a string (spec §2.3 /
+/// becomes `.`, [`ascii_column`]'s rule applied to a string (spec §2.3 /
 /// AC40). Used by every surface that renders a core-supplied string, the
 /// status-bar toast included.
 pub fn inert(s: &str) -> String {
@@ -620,7 +620,7 @@ pub fn packet_fields(p: &L4Packet) -> Vec<(&'static str, String)> {
 }
 
 /// A packet's layer tree as an honest, **labelled** indented text tree
-/// (ui-ext §3.2: a terminal cannot draw a graphical tree, so render it as text —
+/// (ui-ext §3.2: a terminal cannot draw a graphical tree, so render it as text,
 /// never drop it). Outermost layer first, each nested one a step deeper.
 pub fn layer_tree_lines(layers: &[String]) -> Vec<String> {
     let mut lines = vec!["layer tree (text):".to_string()];
@@ -665,7 +665,7 @@ impl L4ScopeEntry {
                 .to_string()
         };
         // `l4.scope.list` serializes `cidr` and `ports` as STRINGS ("127.0.0.1/32",
-        // "0-65535") — see `commands::scope_entry_to_value`. Read them as such (the
+        // "0-65535"), see `commands::scope_entry_to_value`. Read them as such (the
         // web + macOS surfaces do the same); collapse the port range to its display
         // form.
         let cidr = v
@@ -798,68 +798,6 @@ impl L4Gates {
     }
 }
 
-/// A pending inject confirm-over-the-wire handshake (M4 D4, L4OPS-AC10). The
-/// first `l4.inject` (without `_confirm`) returns a `needs_confirmation` reply
-/// whose `prompt` is the wire summary — destination, packet summary, count,
-/// matched scope entry, minted permit budget. The overlay shows it; on confirm
-/// the UI re-issues the identical call plus the reserved `_confirm` token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct L4Confirm {
-    /// The tool to re-issue (`l4.inject`, `l4.intercept.forward`, …).
-    pub call: String,
-    /// The original args, re-sent verbatim plus `_confirm`.
-    pub args: Value,
-    /// The wire summary the server built, shown to the operator.
-    pub prompt: String,
-    /// The single-use confirm token bound to the pending call.
-    pub token: String,
-}
-
-/// What a guarded verb's reply is (L4 parity, stage-6 fix): the confirm
-/// handshake bound to the pending call, a handshake the TUI cannot complete,
-/// or a plain result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfirmReply {
-    /// `needs_confirmation` with a token: the overlay to open.
-    Handshake(L4Confirm),
-    /// `needs_confirmation` without a string `confirm_token`: nothing can be
-    /// re-issued, and it is not a success either.
-    Malformed,
-    /// Not a handshake: the verb's own result.
-    Plain,
-}
-
-impl L4Confirm {
-    /// Classify a reply against the pending `(call, args)` it answers.
-    pub fn classify(call: &str, args: &Value, reply: &Value) -> ConfirmReply {
-        if reply.get("status").and_then(Value::as_str) != Some("needs_confirmation") {
-            return ConfirmReply::Plain;
-        }
-        let Some(token) = reply.get("confirm_token").and_then(Value::as_str) else {
-            return ConfirmReply::Malformed;
-        };
-        ConfirmReply::Handshake(Self {
-            call: call.to_string(),
-            args: args.clone(),
-            prompt: reply
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or("Confirm this action?")
-                .to_string(),
-            token: token.to_string(),
-        })
-    }
-
-    /// The args to re-send on confirm: the originals plus the `_confirm` token.
-    pub fn confirmed_args(&self) -> Value {
-        let mut args = self.args.clone();
-        if let Value::Object(map) = &mut args {
-            map.insert("_confirm".to_string(), Value::String(self.token.clone()));
-        }
-        args
-    }
-}
-
 /// The default `PacketSpec` the craft editor opens with: a loopback UDP probe,
 /// valid for `l4.craft` (outermost layer first; `raw` is a byte list).
 pub const DEFAULT_CRAFT_YAML: &str = "\
@@ -956,10 +894,9 @@ pub struct L4State {
     pub pane: L4Pane,
     /// The YAML craft editor + hex preview.
     pub craft: CraftBuffer,
-    /// A pending inject (call, args) awaiting the `needs_confirmation` reply.
+    /// A pending guarded call (`l4.inject`, `l4.scope.add`, an intercept
+    /// verdict) awaiting its `needs_confirmation` reply, as (call, args).
     pub pending: Option<(String, Value)>,
-    /// The confirm-over-the-wire overlay, once the reply arrives.
-    pub confirm: Option<L4Confirm>,
     /// `l4.capture.status` (capture + inject), re-read every slow poll (§1).
     pub capture: L4Availability,
     /// `l4.intercept.status`, re-read every slow poll (§1).
@@ -1052,25 +989,6 @@ mod tests {
         assert!(g.present);
         assert!(g.get(L4Gate::Capture));
         assert!(!g.get(L4Gate::Inject));
-    }
-
-    #[test]
-    fn confirm_round_trip_adds_the_token() {
-        let args = json!({"spec": {"layers": []}, "dst": "127.0.0.1", "port": 7});
-        let reply = json!({"status": "needs_confirmation", "prompt": "Inject 1 UDP to 127.0.0.1:7?", "confirm_token": "tok-9"});
-        let ConfirmReply::Handshake(c) = L4Confirm::classify("l4.inject", &args, &reply) else {
-            panic!("a complete handshake classifies as Handshake");
-        };
-        assert_eq!(c.call, "l4.inject");
-        assert_eq!(c.prompt, "Inject 1 UDP to 127.0.0.1:7?");
-        assert_eq!(c.token, "tok-9");
-        assert_eq!(c.confirmed_args()["_confirm"], "tok-9");
-        assert_eq!(c.confirmed_args()["dst"], "127.0.0.1");
-        // A plain success is not a confirmation handshake.
-        assert_eq!(
-            L4Confirm::classify("l4.inject", &args, &json!({"injected": 1})),
-            ConfirmReply::Plain
-        );
     }
 
     #[test]

@@ -1175,15 +1175,15 @@ mod tests {
     }
 
     /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// a skeleton slot returning `None` is skipped rather than collected. Three lanes
-    /// have landed: T2 (`aitm-scan-http`), T4 (`aitm-scan-ws`) and T5
+    /// a skeleton slot returning `None` is skipped rather than collected. Four
+    /// lanes have landed: T2 (`aitm-scan-http`), T4 (`aitm-scan-ws`), T5
     /// (`aitm-scan-l4-packet`, which returns `Some` even without the L4 handles,
-    /// call A18); the remaining slots are still skeletons, and with the L4 handles
-    /// present the stream slot is still called and still contributes nothing. Each
-    /// lane track's landing bumps these literals; that track re-pins this test.
+    /// call A18) and T6 (`aitm-scan-l4-stream`, `Some` with or without the L4
+    /// handles; it refuses at discovery when they are absent). Each lane track's
+    /// landing bumps these literals; that track re-pins this test.
     #[test]
     fn lane_slots_count_the_landed_lanes() {
-        assert_eq!(collect_lanes(None).len(), 3);
+        assert_eq!(collect_lanes(None).len(), 4);
         // T3 (`aitm-scan-checks-http`): the ten D8.2 natives, built through the
         // gated constructor with an unbound guard (deny-by-default until the
         // proxy binds it).
@@ -1214,7 +1214,7 @@ mod tests {
             })),
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 3);
+        assert_eq!(collect_lanes(Some(&shared)).len(), 4);
     }
 
     /// Task 19 (T4 hand-off): the operator's `ssl_insecure` reaches the WS
