@@ -18,6 +18,9 @@ import Foundation
 /// never returns nil, and `rawValue` gives back the wire spelling either way.
 /// Equality and hashing go through `rawValue` (the standard library's
 /// `RawRepresentable` witnesses), so each enum spells both as plain switches.
+/// A vocabulary whose unknown token a view prints (the job state, the phase, the
+/// stopped reason, the crawl error) cleans and cuts it to `ScanWire.tokenMax` first,
+/// so no raw-token line carries an unbounded core string.
 public protocol ScanVocabulary: RawRepresentable, Hashable, Sendable where RawValue == String {
     /// The case an unknown string lands in.
     static func other(_ raw: String) -> Self
@@ -36,7 +39,7 @@ public enum ScanJobState: ScanVocabulary {
         case "done": self = .done
         case "cancelled": self = .cancelled
         case "failed": self = .failed
-        default: self = .other(rawValue)
+        default: self = .other(ScanWire.cleaned(rawValue, max: ScanWire.tokenMax))
         }
     }
 
@@ -87,7 +90,7 @@ public enum ScanPhase: ScanVocabulary {
         case "auditing": self = .auditing
         case "reporting": self = .reporting
         case "done": self = .done
-        default: self = .other(rawValue)
+        default: self = .other(ScanWire.cleaned(rawValue, max: ScanWire.tokenMax))
         }
     }
 
@@ -131,7 +134,7 @@ public enum ScanStoppedReason: ScanVocabulary {
         case "policy": self = .policy
         case "guard_refused": self = .guardRefused
         case "failed": self = .failed
-        default: self = .other(rawValue)
+        default: self = .other(ScanWire.cleaned(rawValue, max: ScanWire.tokenMax))
         }
     }
 
@@ -165,7 +168,7 @@ public enum ScanCrawlErrorKind: ScanVocabulary {
         case "timeout": self = .timeout
         case "transport": self = .transport
         case "other": self = .other
-        default: self = .unknown(rawValue)
+        default: self = .unknown(ScanWire.cleaned(rawValue, max: ScanWire.tokenMax))
         }
     }
 
@@ -631,6 +634,45 @@ struct ScanWire {
         return text
     }
 
+    // Bounds on core-controlled text (security review of the Jobs view, fix 1.5e). The
+    // core is loopback and token-authenticated and the engine scrubs upstream text, but a
+    // string the detail prints verbatim (an error, a sample, a profile name, an unknown
+    // token) still gets one choke point here, mirroring the TUI's `bound_status`:
+    // control, format and line/paragraph separator scalars are dropped (a bidi override
+    // or a newline never reaches a row), then the text is cut to its field's cap, and a
+    // sampled list is cut to the engine's own cap.
+
+    /// The engine's cap on `error_samples`, `skipped_samples`, `checks.running` and `targets`.
+    static let listMax = 8
+    /// The cap on an unknown vocabulary token and a profile name.
+    static let tokenMax = 64
+    /// The cap on an error text, a sample field, a clamped field, a skipped reason, a running id.
+    static let detailMax = 400
+    /// The cap on one target.
+    static let targetMax = 200
+
+    /// `text` without control, format and line/paragraph separator scalars, cut to `max` characters.
+    static func cleaned(_ text: String, max: Int) -> String {
+        var kept = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator: continue
+            default: kept.append(scalar)
+            }
+        }
+        return String(String(kept).prefix(max))
+    }
+
+    /// `optionalString`, cleaned and cut to `max`.
+    func boundedString(_ key: String, max: Int) throws -> String? {
+        try optionalString(key).map { Self.cleaned($0, max: max) }
+    }
+
+    /// `strings`, cut to `listMax` items, each cleaned and cut to `max`.
+    func boundedStrings(_ key: String, max: Int) throws -> [String] {
+        try strings(key).prefix(Self.listMax).map { Self.cleaned($0, max: max) }
+    }
+
     /// The largest whole number a wire field may carry: 2^53, the last integer a
     /// JSON double represents exactly. Every count, port and epoch-millisecond
     /// stamp the scanner sends is non-negative and far below it, so a value
@@ -864,9 +906,9 @@ public struct ScanCheckErrorSample: Hashable, Sendable {
 extension ScanCheckErrorSample {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanCheckErrorSample")
-        check = try wire.optionalString("check") ?? ""
-        point = try wire.optionalString("point") ?? ""
-        detail = try wire.optionalString("detail") ?? ""
+        check = try wire.boundedString("check", max: ScanWire.detailMax) ?? ""
+        point = try wire.boundedString("point", max: ScanWire.detailMax) ?? ""
+        detail = try wire.boundedString("detail", max: ScanWire.detailMax) ?? ""
     }
 }
 
@@ -875,15 +917,15 @@ extension ScanCheckErrorSample {
 public struct ScanCheckCounters: Hashable, Sendable {
     public var scheduled: Int
     public var done: Int
-    /// The ids of the checks in flight (the engine caps this at 8).
+    /// The ids of the checks in flight (the engine caps this at 8; so does the decoder).
     public var running: [String]
     /// Check runs that ended in an `error` verdict; 0 on an older core.
     public var errors: Int
-    /// The first distinct error samples (the engine caps this at 8).
+    /// The first distinct error samples (the engine caps this at 8; so does the decoder).
     public var errorSamples: [ScanCheckErrorSample]
     /// Items no lane could host; 0 on an older core.
     public var skipped: Int
-    /// The first distinct skip samples (the engine caps this at 8).
+    /// The first distinct skip samples (the engine caps this at 8; so does the decoder).
     public var skippedSamples: [ScanCheckErrorSample]
 }
 
@@ -892,11 +934,11 @@ extension ScanCheckCounters {
         let wire = try ScanWire(json, as: "ScanCheckCounters")
         scheduled = try wire.int("scheduled", default: 0)
         done = try wire.int("done", default: 0)
-        running = try wire.strings("running")
+        running = try wire.boundedStrings("running", max: ScanWire.detailMax)
         errors = try wire.int("errors", default: 0)
-        errorSamples = try wire.array("error_samples").map { try ScanCheckErrorSample(json: $0) }
+        errorSamples = try wire.array("error_samples").prefix(ScanWire.listMax).map { try ScanCheckErrorSample(json: $0) }
         skipped = try wire.int("skipped", default: 0)
-        skippedSamples = try wire.array("skipped_samples").map { try ScanCheckErrorSample(json: $0) }
+        skippedSamples = try wire.array("skipped_samples").prefix(ScanWire.listMax).map { try ScanCheckErrorSample(json: $0) }
     }
 }
 
@@ -1017,7 +1059,7 @@ extension ScanSkippedLane {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanSkippedLane")
         lane = try wire.vocab("lane")
-        reason = try wire.string("reason")
+        reason = try ScanWire.cleaned(wire.string("reason"), max: ScanWire.detailMax)
     }
 }
 
@@ -1055,8 +1097,9 @@ public struct ScanClamped: Hashable, Sendable {
 extension ScanClamped {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanClamped")
-        self.init(
-            field: try wire.string("field"), requested: try wire.int("requested"), applied: try wire.int("applied"))
+        try self.init(
+            field: ScanWire.cleaned(wire.string("field"), max: ScanWire.detailMax),
+            requested: wire.int("requested"), applied: wire.int("applied"))
     }
 }
 
@@ -1143,8 +1186,8 @@ extension ScanJobStatus {
         job = try wire.string("job")
         state = try wire.vocab("state")
         phase = try wire.vocab("phase")
-        profileName = try wire.optionalString("profile_name") ?? ""
-        targets = try wire.strings("targets")
+        profileName = try wire.boundedString("profile_name", max: ScanWire.tokenMax) ?? ""
+        targets = try wire.boundedStrings("targets", max: ScanWire.targetMax)
         startedBy = try ScanStartedBy(json: wire.object("started_by"))
         startedAt = try wire.int("started_at", default: 0)
         finishedAt = try wire.optionalInt("finished_at")
@@ -1159,7 +1202,7 @@ extension ScanJobStatus {
         session = try wire.optionalObject("session").map { try ScanSessionStatus(json: $0) }
         lanes = try ScanLaneReport(json: wire.object("lanes"))
         clamped = try wire.array("clamped").map { try ScanClamped(json: $0) }
-        error = try wire.optionalString("error")
+        error = try wire.boundedString("error", max: ScanWire.detailMax)
     }
 }
 

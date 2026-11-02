@@ -165,7 +165,7 @@ private struct ScanJobRow: View {
                 Spacer(minLength: Space.xs)
                 if hovered, cancelable {
                     FlatButton("Cancel", action: cancel)
-                        .help("Stop this job; its issues stay (⌥⌘.)")
+                        .help(ScanFormat.cancelHelpText)
                 }
             }
             // The line keeps the button's height whether or not it shows, so a
@@ -255,17 +255,12 @@ private struct ScanJobDetail: View {
 
     private var summary: ScanJobSummary { facts.summary }
     private var status: ScanJobStatus? { facts.status }
-    private var jobState: ScanJobState { summary.state }
-    private var phase: ScanPhase { summary.phase }
-    private var elapsedMs: Int { summary.elapsedMs }
-    private var probes: ScanProbeCounters { summary.probes }
-    private var points: ScanPointCounters { summary.points }
-    private var issues: ScanIssueCounters { summary.issues }
 
-    /// The Stopped section shows for a stopped reason, an error, or a crawl that
-    /// hit errors (Jobs view D4).
-    private var hasStoppedFacts: Bool {
-        guard let status else { return false }
+    /// The Stopped section shows only once the merged state is terminal, and then for
+    /// a stopped reason, an error, or a crawl that hit errors (Jobs view D4); a live
+    /// job's crawl error is not a stop.
+    private static func hasStoppedFacts(_ summary: ScanJobSummary, _ status: ScanJobStatus) -> Bool {
+        guard summary.state.isTerminal else { return false }
         return status.stoppedReason != nil || status.error != nil || status.crawl.errors > 0
     }
 
@@ -284,7 +279,7 @@ private struct ScanJobDetail: View {
                     if !clampedLines.isEmpty { clampedSection }
                     if let session = status?.session { sessionSection(session) }
                     if let l4 = status?.l4 { l4Section(l4) }
-                    if hasStoppedFacts { stoppedSection }
+                    if let status, Self.hasStoppedFacts(summary, status) { stoppedSection(status) }
                 }
                 .padding(Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -298,23 +293,27 @@ private struct ScanJobDetail: View {
 
     private var header: some View {
         HStack(spacing: Space.md) {
-            Text([jobState.word, phase.word, ScanFormat.elapsed(ms: elapsedMs)].joined(separator: " · "))
+            Text([summary.state.word, summary.phase.word, ScanFormat.elapsed(ms: summary.elapsedMs)].joined(separator: " · "))
                 .font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color)
                 .lineLimit(1)
             Spacer(minLength: Space.sm)
             // Cancel Scan while the merged state is queued or running; disabled and
-            // titled by the cancelling word while the cancel is in flight (Jobs view
-            // D2); the whole verb is off while the link is not live (Jobs view D6).
-            switch jobState {
+            // titled by the cancelling word while the cancel is on the wire or the core
+            // calls the job cancelling (Jobs view D2); the whole verb is off while the
+            // link is not live (Jobs view D6).
+            switch summary.state {
             case .queued, .running:
-                PrimaryButton("Cancel Scan") { Task { await state.cancel(job: facts.job) } }
-                    .keyboardShortcut(".", modifiers: [.command, .option])
-                    .help("Stop this job; its issues stay (⌥⌘.)")
-                    .disabled(!state.link.verbsEnabled)
+                if state.cancelInFlight(facts.job) {
+                    cancellingButton
+                } else {
+                    PrimaryButton("Cancel Scan") { Task { await state.cancel(job: facts.job) } }
+                        .keyboardShortcut(".", modifiers: [.command, .option])
+                        .help(ScanFormat.cancelHelpText)
+                        .disabled(!state.link.verbsEnabled)
+                }
             case .cancelling:
-                PrimaryButton(ScanFormat.cancellingTitle) {}
-                    .disabled(true)
+                cancellingButton
             default:
                 EmptyView()
             }
@@ -325,22 +324,29 @@ private struct ScanJobDetail: View {
         .frame(height: Tok.Size.inspectorHeader)
     }
 
+    /// The header's verb while a cancel is on the wire or the core calls the job
+    /// cancelling: the cancelling word, disabled (Jobs view D2).
+    private var cancellingButton: some View {
+        PrimaryButton(ScanFormat.cancellingTitle) {}
+            .disabled(true)
+    }
+
     // MARK: Sections
 
     private var probesSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Probes")
-            Text("\(probes.sent) / \(probes.budget)")
+            Text("\(summary.probes.sent) / \(summary.probes.budget)")
                 .font(Tok.Face.data(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color)
-            ScanJobProgressRule(done: probes.sent, total: probes.budget)
+            ScanJobProgressRule(done: summary.probes.sent, total: summary.probes.budget)
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Errors", "\(probes.errors)")
-                ScanStat("Timeouts", "\(probes.timeouts)")
-                ScanStat("Rate waits", "\(probes.rateWaits)")
+                ScanStat("Errors", "\(summary.probes.errors)")
+                ScanStat("Timeouts", "\(summary.probes.timeouts)")
+                ScanStat("Rate waits", "\(summary.probes.rateWaits)")
             }
-            if !probes.byLane.isEmpty {
-                ScanStat("By lane", probes.byLane.keys.sorted().map { "\($0) \(probes.byLane[$0] ?? 0)" }
+            if !summary.probes.byLane.isEmpty {
+                ScanStat("By lane", summary.probes.byLane.keys.sorted().map { "\($0) \(summary.probes.byLane[$0] ?? 0)" }
                     .joined(separator: " · "))
             }
         }
@@ -362,14 +368,14 @@ private struct ScanJobDetail: View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Points")
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Found", "\(points.found)")
-                ScanStat("Queued", "\(points.queued)")
-                ScanStat("Audited", "\(points.audited)")
+                ScanStat("Found", "\(summary.points.found)")
+                ScanStat("Queued", "\(summary.points.queued)")
+                ScanStat("Audited", "\(summary.points.audited)")
             }
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Skipped ignored", "\(points.skipped.ignored)")
-                ScanStat("Skipped frequent", "\(points.skipped.frequent)")
-                ScanStat("Skipped limit", "\(points.skipped.limit)")
+                ScanStat("Skipped ignored", "\(summary.points.skipped.ignored)")
+                ScanStat("Skipped frequent", "\(summary.points.skipped.frequent)")
+                ScanStat("Skipped limit", "\(summary.points.skipped.limit)")
             }
         }
     }
@@ -399,19 +405,19 @@ private struct ScanJobDetail: View {
     private var issuesSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
             ScanSectionTitle("Issues")
-            ScanSeverityBar(by: issues.bySeverity, height: 12)
+            ScanSeverityBar(by: summary.issues.bySeverity, height: 12)
             // The counts in words beside the bar, so severity is never colour alone.
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat(ScanSeverity.critical.word, "\(issues.bySeverity.critical)")
-                ScanStat(ScanSeverity.high.word, "\(issues.bySeverity.high)")
-                ScanStat(ScanSeverity.medium.word, "\(issues.bySeverity.medium)")
-                ScanStat(ScanSeverity.low.word, "\(issues.bySeverity.low)")
-                ScanStat(ScanSeverity.info.word, "\(issues.bySeverity.info)")
+                ScanStat(ScanSeverity.critical.word, "\(summary.issues.bySeverity.critical)")
+                ScanStat(ScanSeverity.high.word, "\(summary.issues.bySeverity.high)")
+                ScanStat(ScanSeverity.medium.word, "\(summary.issues.bySeverity.medium)")
+                ScanStat(ScanSeverity.low.word, "\(summary.issues.bySeverity.low)")
+                ScanStat(ScanSeverity.info.word, "\(summary.issues.bySeverity.info)")
             }
             HStack(alignment: .top, spacing: Space.xl) {
-                ScanStat("Certain", "\(issues.byConfidence.certain)")
-                ScanStat("Firm", "\(issues.byConfidence.firm)")
-                ScanStat("Tentative", "\(issues.byConfidence.tentative)")
+                ScanStat("Certain", "\(summary.issues.byConfidence.certain)")
+                ScanStat("Firm", "\(summary.issues.byConfidence.firm)")
+                ScanStat("Tentative", "\(summary.issues.byConfidence.tentative)")
             }
         }
     }
@@ -486,39 +492,33 @@ private struct ScanJobDetail: View {
     }
 
     /// Why the job stopped, in words (Jobs view D4): the stopped-reason sentence,
-    /// the crawl-trouble sentence with the last error's words, the engine's error
-    /// text verbatim, and last the raw tokens in the data face, the one place
-    /// they appear.
-    @ViewBuilder private var stoppedSection: some View {
-        if let status {
-            VStack(alignment: .leading, spacing: Space.sm) {
-                ScanSectionTitle("Stopped")
-                if let reason = status.stoppedReason,
-                   let sentence = ScanEndText.stoppedReason(
-                       reason, state: jobState, probesBudget: probes.budget, error: status.error)
-                {
-                    stoppedSentence(sentence)
-                }
-                if let trouble = ScanEndText.crawlTrouble(status.crawl) {
-                    if let kind = status.crawl.lastError {
-                        stoppedSentence(trouble + " — " + ScanEndText.crawlErrorWords(kind))
-                    } else {
-                        stoppedSentence(trouble)
-                    }
-                }
-                if let error = status.error {
-                    Text(error)
-                        .font(Tok.Face.data(Tok.Typography.Size.md))
-                        .foregroundStyle(Tok.Status.serverError.color)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let reason = status.stoppedReason {
-                    rawLine(ScanEndText.rawReasonLine(reason))
-                }
-                if let kind = status.crawl.lastError {
-                    rawLine(ScanEndText.rawCrawlErrorLine(kind))
-                }
+    /// the crawl-trouble line (with the last error's words when the engine set one),
+    /// the engine's error text verbatim, and last the raw tokens in the data face,
+    /// the one place they appear. Every line is the Kit's; the view only stacks them.
+    private func stoppedSection(_ status: ScanJobStatus) -> some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            ScanSectionTitle("Stopped")
+            if let reason = status.stoppedReason,
+               let sentence = ScanEndText.stoppedReason(
+                   reason, state: summary.state, probesBudget: summary.probes.budget, error: status.error)
+            {
+                stoppedSentence(sentence)
+            }
+            if let trouble = ScanEndText.crawlTroubleLine(status.crawl) {
+                stoppedSentence(trouble)
+            }
+            if let error = status.error {
+                Text(error)
+                    .font(Tok.Face.data(Tok.Typography.Size.md))
+                    .foregroundStyle(Tok.Status.serverError.color)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let reason = status.stoppedReason {
+                rawLine(ScanEndText.rawReasonLine(reason))
+            }
+            if let kind = status.crawl.lastError {
+                rawLine(ScanEndText.rawCrawlErrorLine(kind))
             }
         }
     }

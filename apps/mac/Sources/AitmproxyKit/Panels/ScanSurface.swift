@@ -463,15 +463,17 @@ public struct ScanJobFacts: Equatable, Sendable {
 
 /// A failed Jobs read (`scan.list`, `scan.status` or `scan.cancel`): the read's
 /// own wording (`Unable to list jobs: <core>` / `Unable to read job <id>: <core>` /
-/// `Unable to cancel job <id>: <core>`) and the core's own text (Jobs view D6
-/// amendment). `ScanSurfaceModel.inlineJobsError(ageMs:)` adds the last-good clause.
+/// `Unable to cancel job <id>: <core>`) and when it failed (epoch ms, the caller's
+/// clock; Jobs view D6 amendment). The one record of a failed read: `jobsError` and
+/// `readFailedAt` read it, `ScanSurfaceModel.inlineJobsError(ageMs:)` adds the
+/// last-good clause, and the next list that lands clears it.
 public struct ScanReadFailure: Equatable, Sendable {
     public var text: String
-    public var core: String
+    public var at: Int
 
-    public init(text: String, core: String) {
+    public init(text: String, at: Int) {
         self.text = text
-        self.core = core
+        self.at = at
     }
 }
 
@@ -483,7 +485,8 @@ public struct ScanJobsLink: Equatable, Sendable {
     public enum Kind: Equatable, Sendable { case live, reconnecting, disconnected, unanswered }
 
     public var kind: Kind
-    /// `now - jobsLoadedAt`; nil before the first list arrived.
+    /// `now - jobsLoadedAt`, never below 0 (the stamp and `now` may come from two
+    /// clocks a beat apart); nil before the first list arrived.
     public var valuesAgeMs: Int?
     public var bannerText: String?
     public var verbsEnabled: Bool
@@ -504,20 +507,20 @@ public struct ScanJobsLink: Equatable, Sendable {
         case .disconnected, .failed: .disconnected
         case .connected: readFailedAt != nil ? .unanswered : .live
         }
-        let age = jobsLoadedAt.map { now - $0 }
+        let age = jobsLoadedAt.map { max(0, now - $0) }
         return ScanJobsLink(
             kind: kind, valuesAgeMs: age, bannerText: bannerText(kind: kind, ageMs: age), verbsEnabled: kind == .live)
     }
 
     /// D15's table; the age clause is omitted while no list has arrived.
     static func bannerText(kind: Kind, ageMs: Int?) -> String? {
-        guard kind != .live else { return nil }
         let age = ageMs.map { "showing values from \(ScanFormat.elapsed(ms: $0)) ago" }
-        let parts: [String?] = switch kind {
-        case .live: []
-        case .reconnecting: ["Bus disconnected", age, "reconnecting…"]
-        case .disconnected: ["Bus disconnected", age, "Proxy ▸ Reconnect Bus (⌃⌘R) to retry"]
-        case .unanswered: ["The core is not answering", age, "retrying every 2 s"]
+        let parts: [String?]
+        switch kind {
+        case .live: return nil
+        case .reconnecting: parts = ["Bus disconnected", age, "reconnecting…"]
+        case .disconnected: parts = ["Bus disconnected", age, "Proxy ▸ Reconnect Bus (⌃⌘R) to retry"]
+        case .unanswered: parts = ["The core is not answering", age, "retrying every 2 s"]
         }
         return parts.compactMap { $0 }.joined(separator: " · ")
     }
@@ -530,20 +533,21 @@ public struct ScanJobsLink: Equatable, Sendable {
 /// the data-face lines. Identical on the web and TUI surfaces (the parity pin);
 /// numbers are grouped (`6,468`), singulars go through `ScanFormat.plural`.
 public enum ScanEndText {
-    /// The one sentence for a terminal job; nil while the job is live, and
-    /// until its `scan.status` has landed (the checks it quotes are detail-only
-    /// fields, nil until then, spec D2).
+    /// The one sentence for a terminal job; nil while the job is live, and until a
+    /// terminal `scan.status` has landed: the checks it quotes are detail-only fields,
+    /// and a stored status still live during the one-beat gap (spec D2) would quote the
+    /// live read's numbers, so the sentence waits for the final ones.
     public static func sentence(_ facts: ScanJobFacts) -> String? {
+        guard let status = facts.status, status.state.isTerminal else { return nil }
         let summary = facts.summary
-        guard summary.state.isTerminal, let status = facts.status else { return nil }
         let elapsed = ScanFormat.elapsed(ms: summary.elapsedMs)
         switch summary.state {
         case .done:
-            return "Done in \(elapsed) · \(count(summary.points.found, "point")) · "
-                + "\(count(status.checks.scheduled, "check"))."
+            return "Done in \(elapsed) · \(ScanFormat.plural(summary.points.found, "point", grouped: true)) · "
+                + "\(ScanFormat.plural(status.checks.scheduled, "check", grouped: true))."
         case .cancelled:
             return "Cancelled after \(elapsed); \(ScanFormat.grouped(status.checks.done)) of "
-                + "\(count(status.checks.scheduled, "check")) had run. What it found stays."
+                + "\(ScanFormat.plural(status.checks.scheduled, "check", grouped: true)) had run. What it found stays."
         case .failed:
             return "Failed after \(elapsed)."
         default:
@@ -575,7 +579,18 @@ public enum ScanEndText {
     /// `The crawl fetched 1 page and hit 1 error`; nil when the crawl hit none.
     public static func crawlTrouble(_ crawl: ScanCrawlCounters) -> String? {
         guard crawl.errors > 0 else { return nil }
-        return "The crawl fetched \(count(crawl.pages, "page")) and hit \(count(crawl.errors, "error"))"
+        return "The crawl fetched \(ScanFormat.plural(crawl.pages, "page", grouped: true)) and hit "
+            + ScanFormat.plural(crawl.errors, "error", grouped: true)
+    }
+
+    /// The Stopped section's crawl line: `crawlTrouble`, joined by an em dash with the
+    /// last error's words when the engine set `crawl.last_error` (it does only when no
+    /// page was fetched): `The crawl fetched 0 pages and hit 1 error — the target refused
+    /// the connection`. Nil when the crawl hit no errors.
+    public static func crawlTroubleLine(_ crawl: ScanCrawlCounters) -> String? {
+        guard let trouble = crawlTrouble(crawl) else { return nil }
+        guard let kind = crawl.lastError else { return trouble }
+        return trouble + " — " + crawlErrorWords(kind)
     }
 
     /// The words for a `crawl.last_error` token; `transport`, `other` and an
@@ -598,11 +613,6 @@ public enum ScanEndText {
     /// `crawl.last_error: connect_refused`: the raw token, for the data-face line only.
     public static func rawCrawlErrorLine(_ kind: ScanCrawlErrorKind) -> String {
         "crawl.last_error: \(kind.rawValue)"
-    }
-
-    /// `1 check` / `6,468 checks`: `ScanFormat.plural`'s singular rule over a grouped number.
-    private static func count(_ n: Int, _ noun: String) -> String {
-        "\(ScanFormat.grouped(n)) \(noun)\(n == 1 ? "" : "s")"
     }
 }
 
@@ -636,17 +646,20 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     public var selectedJob: String?
     /// Per job: the `clamped` and `lanes.skipped` notices of its `scan.start` result.
     public var launchNotices: [String: [String]] = [:]
-    public var jobsError: String?
     /// When the last `scan.list` landed (epoch ms, the caller's clock); nil before the first (Jobs view D6).
     public var jobsLoadedAt: Int?
-    /// When the last Jobs read (`scan.list`, `scan.status` or `scan.cancel`) failed (epoch
-    /// ms); cleared by the next list that lands, the proof the core answers (Jobs view D6
+    /// The last failed Jobs read (`scan.list`, `scan.status` or `scan.cancel`): its own
+    /// wording and when it failed; the one stored failure fact. Set by `noteReadFailure`,
+    /// cleared by the next list that lands, the proof the core answers (Jobs view D6
     /// amendment). Any failed Jobs read marks the link: the poll reads the selected job's
     /// status before the list, so against a frozen core the status read times out first.
-    public var readFailedAt: Int?
-    /// The last failed Jobs read's own wording and the core's text, so the inline error can
-    /// carry the last-good clause (`inlineJobsError(ageMs:)`); nil once a list lands.
     public var readFailure: ScanReadFailure?
+    /// The inline error's plain wording (`Unable to list jobs: <core>`); nil while no Jobs
+    /// read has failed since the last list landed. Reads `readFailure`.
+    public var jobsError: String? { readFailure?.text }
+    /// When the last Jobs read failed (epoch ms), for `ScanJobsLink.make`; nil while none has
+    /// since the last list landed. Reads `readFailure`.
+    public var readFailedAt: Int? { readFailure?.at }
 
     // Site map
     public var sitemapJob: String?
@@ -708,6 +721,14 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     public static func needsStatusRead(summary: ScanJobSummary, stored: ScanJobStatus?) -> Bool {
         guard let stored else { return true }
         return summary.state.isTerminal && !stored.state.isTerminal
+    }
+
+    /// Rule 1 of the re-read rule (Jobs view D2): the selected job is read every beat
+    /// while its STORED status is missing or still live, whatever the list row says
+    /// (the list turns terminal first; the stored status must follow it there or the
+    /// detail freezes at its last live read). A terminal stored status is final.
+    public static func selectedNeedsStatusRead(stored: ScanJobStatus?) -> Bool {
+        stored.map { !$0.state.isTerminal } ?? true
     }
 
     /// Whether Cancel may be offered for `job`: its merged state is queued or
@@ -850,7 +871,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     /// `scan.list`, newest first as delivered. A job this app started that the
     /// list does not carry yet stays in front of it. `now` (epoch ms, the caller's
-    /// clock) stamps `jobsLoadedAt` and clears `readFailedAt` (Jobs view D6). The
+    /// clock) stamps `jobsLoadedAt` and clears `readFailure` (Jobs view D6). The
     /// selection follows the list (Jobs view D3): nothing selected → the newest
     /// job; a selection the core dropped and this app is not waiting on → the
     /// first row; an existing selection is never replaced by a newer job.
@@ -861,7 +882,6 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         let pending = jobs.filter { !listed.contains($0.job) && locallyStarted.contains($0.job) }
         locallyStarted.subtract(listed)
         jobs = pending + result.jobs
-        jobsError = nil
         // The per-job side tables follow the list: a job the core no longer lists
         // (and this app is not waiting on) takes its seq, status, notices and flag with it.
         let kept = listed.union(locallyStarted)
@@ -870,7 +890,6 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         launchNotices = launchNotices.filter { kept.contains($0.key) }
         refreshNeeded = refreshNeeded.intersection(kept)
         jobsLoadedAt = now
-        readFailedAt = nil
         readFailure = nil
         if let selected = selectedJob {
             if !jobs.contains(where: { $0.job == selected }), !locallyStarted.contains(selected) {
@@ -882,24 +901,21 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     }
 
     /// A Jobs read (`scan.list`, `scan.status`, `scan.cancel`) that failed: `text` is the
-    /// read's own wording (`Unable to list jobs: <core>` and the like), `core` the core's
-    /// own text (`BusService.describe`). Sets the inline error to `text`, keeps both for
-    /// `inlineJobsError(ageMs:)` and stamps the failure (Jobs view D6 amendment); the rows
-    /// and their counters stay. The caller passes the same clock as `applyList`.
-    public mutating func noteReadFailure(text: String, core: String, now: Int) {
-        jobsError = text
-        readFailure = ScanReadFailure(text: text, core: core)
-        readFailedAt = now
+    /// read's own wording (`Unable to list jobs: <core>` and the like), `now` the caller's
+    /// clock, the same one `applyList` stamps with. Records the one failure fact (Jobs view
+    /// D6 amendment): `jobsError`, `readFailedAt` and `inlineJobsError(ageMs:)` all read it,
+    /// and only the next list that lands clears it. The rows and their counters stay.
+    public mutating func noteReadFailure(text: String, now: Int) {
+        readFailure = ScanReadFailure(text: text, at: now)
     }
 
     /// The text of the inline error above the rows: while a Jobs read has failed and no
     /// list has landed since, that read's own wording with the last-good clause, e.g.
     /// `Unable to read job scan-…: <core>. Showing values from 0:42 ago; retrying every 2 s.`
     /// (`ScanFormat.ageClause`, with `ScanJobsLink.valuesAgeMs` as the age; the list beat
-    /// is what brings the values back, Jobs view D6); else `jobsError`.
+    /// is what brings the values back, Jobs view D6); nil otherwise.
     public func inlineJobsError(ageMs: Int?) -> String? {
-        if let failure = readFailure { return failure.text + ScanFormat.ageClause(ageMs) }
-        return jobsError
+        readFailure.map { $0.text + ScanFormat.ageClause(ageMs) }
     }
 
     /// `scan.status`: stored, and the matching list row takes its summary.
@@ -1090,6 +1106,8 @@ public enum ScanFormat {
     /// The header button's title while the merged state is cancelling: disabled, and
     /// the only button whose title is not a verb (Jobs view D2).
     public static let cancellingTitle = "Cancelling…"
+    /// The help on Cancel Scan and the row's hover Cancel (Jobs view D7 keeps PR 1's words).
+    public static let cancelHelpText = "Stop this job; its issues stay (⌥⌘.)"
 
     /// `m:ss`, or `h:mm:ss` from an hour on.
     public static func elapsed(ms: Int) -> String {
@@ -1132,15 +1150,9 @@ public enum ScanFormat {
     /// The last-good clause a failed Jobs read's inline error ends with (Jobs view D6):
     /// `. Showing values from 0:42 ago; retrying every 2 s.` with an age; without one (no
     /// list has landed yet) `. Retrying every 2 s.`
-    public static func ageClause(_ ageMs: Int?) -> String {
+    static func ageClause(_ ageMs: Int?) -> String {
         guard let ageMs else { return ". Retrying every 2 s." }
         return ". Showing values from \(elapsed(ms: ageMs)) ago; retrying every 2 s."
-    }
-
-    /// `Unable to list jobs: <core text>. Showing values from 0:42 ago; retrying every 2 s.`
-    /// (Jobs view D6): the inline list error with the last-good clause (`ageClause`).
-    public static func listErrorText(core: String, ageMs: Int?) -> String {
-        "Unable to list jobs: \(core)" + ageClause(ageMs)
     }
 
     /// `Clamped budget.probes 50000 → 20000`: a `scan.start` / `scan.status` clamp notice.
@@ -1326,6 +1338,9 @@ public enum ScanFormat {
         }
     }
 
-    /// `1 endpoint` / `3 endpoints`.
-    public static func plural(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
+    /// `1 endpoint` / `3 endpoints`; with `grouped`, `6,468 checks` (the end-state
+    /// sentences, Jobs view D4). The one singular rule.
+    public static func plural(_ n: Int, _ noun: String, grouped: Bool = false) -> String {
+        "\(grouped ? Self.grouped(n) : String(n)) \(noun)\(n == 1 ? "" : "s")"
+    }
 }

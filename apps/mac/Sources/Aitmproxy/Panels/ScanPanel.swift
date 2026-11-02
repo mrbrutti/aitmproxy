@@ -276,23 +276,21 @@ final class ScanPanelState {
             let listed = Set(surface.jobs.map(\.job))
             statusRequested = statusRequested.filter { listed.contains($0.job) }
         } catch {
-            let core = BusService.describe(error)
-            surface.noteReadFailure(text: scanUnableText("list jobs", core), core: core, now: Self.clockMs)
+            surface.noteReadFailure(text: scanUnableText("list jobs", BusService.describe(error)), now: Self.clockMs)
         }
     }
 
     /// `scan.status {job}`: the counters of one job, and its list row. A failure
     /// marks the link like a failed list (Jobs view D6 amendment: the poll reads the
-    /// selected job's status first, so against a frozen core this times out first);
-    /// the next list that lands clears it.
+    /// selected job's status first, so against a frozen core this times out first).
+    /// A success clears nothing: one job answering is not proof the list does, so only
+    /// the next list that lands clears the failure (D6; `applyList` is the one clearing point).
     func refreshStatus(_ job: String) async {
         do {
             let value = try await session.runCommand("scan.status", ["job": .string(job)])
             surface.applyStatus(try ScanJobStatus(json: value))
-            surface.jobsError = nil
         } catch {
-            let core = BusService.describe(error)
-            surface.noteReadFailure(text: scanUnableText("read job \(job)", core), core: core, now: Self.clockMs)
+            surface.noteReadFailure(text: scanUnableText("read job \(job)", BusService.describe(error)), now: Self.clockMs)
         }
     }
 
@@ -346,8 +344,12 @@ final class ScanPanelState {
         let summaryIsTerminal: Bool
     }
 
-    /// The reads already made (or in flight) under the rule above; pruned by the list.
+    /// The reads already made (or in flight) under the rule above; pruned and re-armed
+    /// only when a list lands (`refreshList`), never by the read's own outcome.
     @ObservationIgnored private var statusRequested: Set<StatusReadKey> = []
+    /// The jobs whose `scan.cancel` is on the wire, so a second press within one round
+    /// trip sends nothing and the header reads the cancelling word meanwhile.
+    @ObservationIgnored private var cancelsInFlight: Set<String> = []
     /// The filters the loaded issues page was read under; a change re-reads it.
     @ObservationIgnored private var loadedIssueFilters: ScanIssueFilters?
     /// The job the loaded site-map page was read for, wrapped so "all jobs" (nil)
@@ -448,17 +450,20 @@ final class ScanPanelState {
     }
 
     /// The re-read rule (Jobs view D2). Rule 1: the selected job is read every beat
-    /// while its STORED status is missing or non-terminal, not while the list row is
-    /// (the list turns terminal first; the stored status must follow it there or the
-    /// detail freezes at its last live read, C1). A terminal stored status is final.
-    /// Rule 2: every other listed job is read when `needsStatusRead` says so and no
-    /// read under the same key has been made; a read that leaves the rule true (it
-    /// failed, or the core has not caught up) gives the key back for the next beat.
+    /// while its STORED status is missing or non-terminal (`selectedNeedsStatusRead`),
+    /// not while the list row is (the list turns terminal first; the stored status
+    /// must follow it there or the detail freezes at its last live read, C1). A
+    /// terminal stored status is final. Rule 2: every other listed job is read when
+    /// `needsStatusRead` says so and no read under the same key has been made. A key
+    /// is never re-armed by the read's own outcome: a failed read against a core that
+    /// is not answering would otherwise retry at 1 Hz and flip the link every second.
+    /// It is pruned and re-armed only when the next list lands (`refreshList`), the
+    /// proof the core answers, so a failed status read is retried after that list.
     /// A job the push flags already read this tick is left alone.
     private func pollStatuses(flagged: Set<String>) async {
         var readThisBeat = flagged
         if let job = surface.selectedJob, !flagged.contains(job),
-           surface.statuses[job].map({ !$0.state.isTerminal }) ?? true {
+           ScanSurfaceModel.selectedNeedsStatusRead(stored: surface.statuses[job]) {
             readThisBeat.insert(job)
             await refreshStatus(job)
         }
@@ -471,10 +476,6 @@ final class ScanPanelState {
             guard !statusRequested.contains(key) else { continue }
             statusRequested.insert(key)
             await refreshStatus(job)
-            if let after = surface.jobs.first(where: { $0.job == job }),
-               ScanSurfaceModel.needsStatusRead(summary: after, stored: surface.statuses[job]) {
-                statusRequested.remove(key)
-            }
         }
     }
 
@@ -580,10 +581,13 @@ final class ScanPanelState {
     // MARK: Surface intents: jobs
 
     /// `scan.cancel {job}`. The issues the job already found stay. Sends nothing for
-    /// a job whose merged state is already cancelling or terminal, or while the link
-    /// has the verbs gated off (Jobs view D2, D6): pressing Cancel twice is one cancel.
+    /// a job whose merged state is already cancelling or terminal, while the link has
+    /// the verbs gated off, or while its own cancel is still on the wire (Jobs view D2,
+    /// D6): pressing Cancel twice, even within one round trip, is one cancel.
     func cancel(job: String) async {
-        guard surface.mayCancel(job: job), link.verbsEnabled else { return }
+        guard surface.mayCancel(job: job), link.verbsEnabled, !cancelsInFlight.contains(job) else { return }
+        cancelsInFlight.insert(job)
+        defer { cancelsInFlight.remove(job) }
         do {
             let value = try await session.runCommand("scan.cancel", ["job": .string(job)])
             if let status = try? ScanJobStatus(json: value) {
@@ -592,10 +596,13 @@ final class ScanPanelState {
                 await refreshStatus(job)
             }
         } catch {
-            let core = BusService.describe(error)
-            surface.noteReadFailure(text: scanUnableText("cancel job \(job)", core), core: core, now: Self.clockMs)
+            surface.noteReadFailure(text: scanUnableText("cancel job \(job)", BusService.describe(error)), now: Self.clockMs)
         }
     }
+
+    /// Whether `job`'s `scan.cancel` is on the wire: the header reads the cancelling
+    /// word (disabled) meanwhile, before the core has called the job cancelling.
+    func cancelInFlight(_ job: String) -> Bool { cancelsInFlight.contains(job) }
 
     /// Cancel Scan (⌥⌘.): the selected job while queued or running; with nothing
     /// selected, the only running one (Jobs view D2 amendment).
