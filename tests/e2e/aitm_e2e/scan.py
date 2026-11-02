@@ -77,6 +77,8 @@ __all__ = [
     "issue",
     "brief",
     "sitemap",
+    "PACKET_LANE_VIA",
+    "PACKET_PERMISSION_PENDING",
     "packet_lane_gate",
     "read_capture_packets",
     "ScanTarget",
@@ -559,23 +561,79 @@ def sitemap(client, role: str, job: str, *, limit: int = 1024) -> tuple[list[dic
         seen.add(cursor)
 
 
+# The privilege route the packet-lane proof accepts today (l4-capture-privilege spec
+# §2.2 `l4.privilege`: a capability's `via` is `process` or `helper`). A tuple so the
+# helper route is a one-line widening once that route is proven (T5 live proof, 2026-11-01).
+PACKET_LANE_VIA: tuple[str, ...] = ("process",)
+
+# The per-platform SKIP reason when packet capture is not granted to the core process.
+# It names the PRODUCT's own privilege path (macOS: the Aitmproxy app's packet-capture
+# helper, `aitm-l4-helper`; Linux: the packet-capture helper, or CAP_NET_RAW held by the
+# core process on a test rig) -- never a third-party daemon and never a line to type.
+PACKET_PERMISSION_PENDING: dict[str, str] = {
+    "darwin": "packet-capture permission not granted (aitm-l4-helper phase 1 pending)",
+    "linux": "packet-capture permission not granted (the core process has no CAP_NET_RAW; "
+             "the packet-capture helper of spec 2026-10-31-l4-capture-privilege-design.md is pending)",
+}
+_PACKET_PERMISSION_PENDING_OTHER = (
+    "packet-capture permission not granted (no packet-capture privilege path is defined for "
+    "this platform by spec 2026-10-31-l4-capture-privilege-design.md)")
+
+
+def _packet_permission_pending() -> str:
+    return PACKET_PERMISSION_PENDING.get(sys.platform, _PACKET_PERMISSION_PENDING_OTHER)
+
+
+def _privilege_gate(privilege: dict) -> None:
+    """SKIP 77 unless the `l4.privilege` report says `capture` AND `inject` are
+    `available` via a route in `PACKET_LANE_VIA`. Anything else is a SKIP with the
+    report's own reason, never a FAIL: a core serving through the helper, or one still
+    waiting for approval, is not broken."""
+    caps = privilege.get("capabilities") if isinstance(privilege.get("capabilities"), dict) else {}
+    for name in ("capture", "inject"):
+        cap = caps.get(name) if isinstance(caps.get(name), dict) else {}
+        if cap.get("state") != "available":
+            reason = cap.get("reason") or f"l4.privilege reports {name} {cap.get('state')!r}"
+            skip(f"{_packet_permission_pending()}; core says: {reason}")
+    for name in ("capture", "inject"):
+        via = caps[name].get("via")
+        if via not in PACKET_LANE_VIA:
+            skip(f"the packet-lane proof expects capture via process on this PR; the core reports "
+                 f"via {via} (widen PACKET_LANE_VIA when that route is proven)")
+
+
 def packet_lane_gate(client, *verbs: str, role: str = "operator") -> dict:
     """SKIP 77 unless this core can really run the L4 PACKET lane: every verb of
     `verbs` live, an `l4_packet` lane in `scan.checks`, the L4 module compiled in and
-    enabled, and raw capture privilege. Returns the `l4.capture.status` reply."""
+    enabled, and packet-capture privilege held by the core process.
+
+    Privilege is read from `l4.privilege` (l4-capture-privilege spec §2.2) when the core
+    advertises it: `capabilities.capture` and `capabilities.inject` must both be
+    `{"state": "available", "via": <one of PACKET_LANE_VIA>}`. On a pre-p1b core without
+    the verb it falls back to `l4.capture.status.available`. Either way a missing grant
+    SKIPs with `PACKET_PERMISSION_PENDING[platform]; core says: <reason>`.
+
+    Returns the `l4.capture.status` reply plus `"privilege"`: the `l4.privilege` reply,
+    or None on a core without the verb. Neither holds a token."""
     if verbs:
         require_verbs(client, *verbs)
     require_lane(client, "l4_packet", role)
-    if "l4.capture.status" not in set(client.tool_names()):
+    tools = set(client.tool_names())
+    if "l4.capture.status" not in tools:
         skip("the L4 module is not enabled on this core (no l4.capture.status): the packet lane "
              "needs l4.enabled and the feature-compiled l4 module")
     status, reply = client.try_call("l4.capture.status")
     if status != "ok" or not isinstance(reply, dict):
         skip(f"l4.capture.status did not answer with an availability object: {str(reply)[:200]}")
-    if reply.get("available") is not True:
-        skip(f"the L4 packet lane needs raw pcap privilege, and this core has none: {reply.get('reason')} "
-             "(macOS: read+write on /dev/bpf*, e.g. ChmodBPF; Linux: CAP_NET_RAW)")
-    return reply
+    privilege: dict | None = None
+    if "l4.privilege" in tools:
+        p_status, privilege = client.try_call("l4.privilege")
+        if p_status != "ok" or not isinstance(privilege, dict):
+            skip(f"l4.privilege did not answer with a privilege report: {str(privilege)[:200]}")
+        _privilege_gate(privilege)
+    elif reply.get("available") is not True:
+        skip(f"{_packet_permission_pending()}; core says: {reply.get('reason')}")
+    return {**reply, "privilege": privilege}
 
 
 def read_capture_packets(client, flow_id: str, page: int = 500) -> list[dict]:
