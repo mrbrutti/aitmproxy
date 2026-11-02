@@ -443,7 +443,7 @@ Kept by the T6 session during stage 6. One row per finding. Range reviewed: `395
 
 ## Shipped
 
-**Status at PR ready (2026-11-01, branch `claude/scanner-v2-t6-e91bd9`, PR #229 un-drafted at head `3780d1ca`: gate and cells of record at `a07ae5f4` (main `0e64d7cf`), then main `dd03860a` (v0.5.12 bump, no Rust source change) merged and compile-checked):**
+**Status at PR ready (2026-11-01, branch `claude/scanner-v2-t6-e91bd9`, PR #229 un-drafted at the head formed by `3780d1ca` plus this plan's own docs commits: gate and cells of record at `a07ae5f4` (main `0e64d7cf`), then main `dd03860a` (v0.5.12 bump, no Rust source change) merged and compile-checked):**
 
 - Landed: Tasks 1-24 (23 = the bus-level acceptance run, see Review log "run 6"); fixes F1-F11; panel rounds A, B, R2, R3. Everything under `crates/aitm-scan-l4-stream/**` plus `Cargo.lock`, the two T6 docs, the T1b-contract adaptation (`Verdict.location`/`more`, `CheckScope::Point`, `L4Options` struct-update), `StreamHost::report_l4_hook` -> `JobCtx::report_l4` (A5), the `wire.rs` lane-slot literal (3: ws, l4_packet, l4_stream), the three `check.l4-*` pins in `crates/aitm/tests/frontends.rs` (`EXPECTED_TOOLS` 103) and `aitm-tui::CORE_TOOLS`, and a one-line fix to T10's `test_t6_tlv_crash.py` chain assertion.
 - Panel: round 1 Security PASS / Quality FAIL / Spec FAIL -> fixed; re-review of the fix round PASS/PASS/PASS; re-review of round 2 PASS/PASS/PASS with three Minors fixed in R3 and three accepted in writing; F6-F11 are behaviour fixes found by the bus-level runs, each with a spec erratum and a Review log row (no logic change at integration beyond them: the adaptation fills new contract fields with `None`/`Vec::new()`/`CheckScope::Point`).
