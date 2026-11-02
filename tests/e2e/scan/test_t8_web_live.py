@@ -9,9 +9,9 @@ bridge, keeps a second "witness" bus connection, and prints per-step results.
 What this cell asserts, from the script's own result JSON (the LAST stdout line):
   - the process exited 0 and `fail == 0`;
   - every step is PASS, except that a GAP (the script's "engine cannot do this yet"
-    category) is tolerated only for two exact step labels: `08b lane_unavailable` (a core
-    built without an L4 lane cannot run the L4 confirm flow, T8's note) and `04d PoC ref`
-    (no engine check emits `poc_ref` yet); any other GAP is red;
+    category) is tolerated only for the exact step label `08b lane_unavailable` (a core
+    built without an L4 lane cannot run the L4 confirm flow, T8's note); any other GAP is
+    red, including `04d PoC ref`, which the script judges on an issue of a hinted class;
   - the run covered the surface: at least 20 recorded results and the step groups
     01..08 all appear.
 
@@ -63,9 +63,10 @@ STEP_GROUPS = ("01", "02", "03", "04", "05", "06", "07", "08")
 # A GAP is the script's own category for "the engine cannot do this yet" (a FAIL is the UI
 # being wrong). Tolerated only where the gap is known and named; any other GAP is red.
 GAP_ALLOWED = {  # exact step labels, as the script records them
-    "04d PoC ref": "no engine check emits poc_ref yet (the PoC ref row renders nothing to click)",
     "08b lane_unavailable": "a core built without an L4 lane cannot run the L4 confirm flow (T8's note)",
 }
+# `04d PoC ref` is NOT tolerated: the script inspects an issue of a hinted class (D6: xss-reflected,
+# open-redirect), so a missing `poc_ref` there is an engine / PoC-runner finding, not a known gap.
 TOKEN_RE = re.compile(r"(#t=|token=)[A-Za-z0-9._~-]+")
 
 
