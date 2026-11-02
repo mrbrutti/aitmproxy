@@ -980,7 +980,10 @@ mod tests {
             "the second check finds the flag already set"
         );
 
-        // `force_lost` flips it just the same: a check after it is not first.
+        // `force_lost` (a rebuilt monitor for an evicted-lost job, S-M5) flips
+        // the same flag a check reads: the first check after it finds the
+        // flag already set, so it is not `first` and does not re-report the
+        // loss to the job.
         let forced = SessionMonitor::new(
             Some(CanaryRequest {
                 request: request("GET", "http://t:8080/me", &[("cookie", "sid=S3")], None),
@@ -991,8 +994,17 @@ mod tests {
             OnLost::Continue,
             1,
         );
-        assert!(forced.mark_lost(), "the first mark flips the flag");
-        assert!(!forced.mark_lost(), "a second mark does not");
+        forced.force_lost();
+        assert!(forced.is_lost(), "force_lost sets the lost flag");
+        assert_eq!(
+            forced.check(&gone, SendOptions::default(), timeout).await,
+            CanaryOutcome::Lost {
+                before: 200,
+                after: 302,
+                first: false
+            },
+            "a check after force_lost is not the first loss"
+        );
     }
 
     #[tokio::test]
