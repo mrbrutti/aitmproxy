@@ -119,9 +119,10 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ]);
 
     let agent_style = match app.agent.policy {
-        Some(AgentPolicy::All) | Some(AgentPolicy::ReadOnly) => {
-            theme.agent().add_modifier(Modifier::BOLD)
-        }
+        Some(AgentPolicy::All)
+        | Some(AgentPolicy::Auto)
+        | Some(AgentPolicy::Ask)
+        | Some(AgentPolicy::ReadOnly) => theme.agent().add_modifier(Modifier::BOLD),
         Some(AgentPolicy::Paused) | None => theme.text_tertiary().add_modifier(Modifier::BOLD),
     };
     let agent_label = match app.agent.policy {
@@ -131,7 +132,7 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             p.label(),
             app.agent.actions_last_minute
         ),
-        None => format!("{} Agent · n/a (F1)", glyph::AGENT),
+        None => format!("{} Agent · n/a", glyph::AGENT),
     };
     let layout = match app.layout {
         crate::app::Layout::Horizontal => "▄▄ below",
@@ -177,7 +178,7 @@ pub fn chips(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());
     let mut spans = vec![Span::raw(" ")];
     for (i, c) in Chip::ALL.iter().enumerate() {
-        if matches!(c, Chip::Http | Chip::H1 | Chip::Json) {
+        if matches!(c, Chip::Http | Chip::Tcp | Chip::H1 | Chip::Json) {
             spans.push(Span::styled("│ ", theme.rule()));
         }
         let label = c.label();
@@ -388,7 +389,12 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             Level::Warn => theme.intercept_armed_quiet(),
             Level::Error => theme.fg(&crate::tokens::color::status::SERVER_ERROR),
         };
-        Line::styled(t.text.clone(), style.add_modifier(Modifier::BOLD))
+        // The toast may quote the core (an availability reason, an error):
+        // through the app's own inert rule like every other core string.
+        Line::styled(
+            crate::l4::inert(&t.text),
+            style.add_modifier(Modifier::BOLD),
+        )
     } else {
         let vis = view.visible.len();
         let pos = view
@@ -500,7 +506,7 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         PromptKind::Palette => (":", "command or tool · ↑↓ choose · ⏎ run · Esc"),
         PromptKind::Filter => (
             "/",
-            "~u url ~d host ~m method ~s status ~a agent ~paused · & | ! ( )",
+            "~u url ~d host ~m method ~s status ~a agent ~paused ~l4 ~tcp ~udp ~icmp · & | ! ( )",
         ),
         PromptKind::Comment => ("comment:", "⏎ save · Esc"),
         PromptKind::Mark => ("mark:", "colours separated by spaces · ⏎ save"),

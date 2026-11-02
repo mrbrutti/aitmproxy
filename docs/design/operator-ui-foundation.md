@@ -392,7 +392,7 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | Command | Params → result | Drives |
 |---|---|---|
 | `flow.list` | `{}` → `[FlowId]` oldest first | flow list ids (today the whole list every poll) |
-| `flow.get` | `{id}` → summary `{id, kind: http\|websocket, intercept, is_replay, method, scheme, authority, path, status?, request_bytes?, response_bytes?, started_at?, duration_ms?, handshake?, messages?, source_app?, capture_interface?}`; `source_app`/`capture_interface` are set on NE-captured flows, null on proxied ones | a row's cells. **No headers, body, conn or metadata** → F5 |
+| `flow.get` | `{id}` → summary `{id, kind: http\|websocket, intercept, is_replay, method, scheme, authority, path, status?, request_bytes?, response_bytes?, started_at?, duration_ms?, handshake?, messages?, source_app?, capture_interface?}`; `source_app` is set when a capture backend observed the app or the core named the loopback client of a proxied connection, null unless the core could name the client; `capture_interface` is set only on NE-captured flows | a row's cells. **No headers, body, conn or metadata** → F5 |
 | `flow.intercept` | `{enabled?: bool}` → `bool` | arm/disarm; parks **every request** while armed |
 | `flow.resume` | `{id}` → ok | the bar's Resume |
 | `flow.kill` | `{id}` → ok | Kill (connection reset) |
@@ -408,6 +408,8 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | `proxy.system.status` | `{}` → `{state: off\|points_at_us\|other\|unsupported\|needs_privilege\|unknown, host?, port?, detail, ours: {host, port}, mechanism: networksetup\|gsettings\|kde\|none, supported, managed_by_us, setting, effective, services, bypass_default, guidance?, remedy?, last_change_ms?, watchdog_pid?, state_file}`; `proxy.status` carries a compact `system_proxy` sub-object with the first seven of these | System-proxy status in Settings and the status bar; `guidance` is the headless-Linux line to show as copyable text, never run: `export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080 no_proxy=localhost,127.0.0.1,::1` |
 | `proxy.system.set` | `{bypass?: [String]}` → the status object plus `{changed, commands}`; operator-only, serving processes only (one-shot `aitm proxy system set` is refused) | the "Set system proxy" control; the launch-time on-switch is `system_proxy.auto` in the config file (`system_proxy: {auto, bypass, state_file}`; `state_file` defaults to beside the CA audit log) |
 | `proxy.system.unset` | `{}` → the status object plus `{changed, commands, restored: [service], left_alone: [service]}`; operator-only; works one-shot | the "Restore" control; the previous setting is restored on quit, after a crash by a watchdog, and at the next start; `aitm proxy system unset` restores by hand |
+
+The two attribution keys read together: `source_app` and `capture_interface` both set (`macos-ne`) means a capture backend delivered the connection and observed the signing identifier; `source_app` set with `capture_interface` null means an explicit-proxy connection whose loopback client the core named itself; both null means the core could not name the client (non-loopback peer, other user, exited before the scan, budget missed, rate-limited, unsupported OS) or a replayed/imported flow.
 
 ### 4.4 Live flow list — polling today, subscription after F4
 
