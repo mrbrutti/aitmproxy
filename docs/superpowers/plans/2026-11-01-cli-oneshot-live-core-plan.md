@@ -360,6 +360,7 @@ Kept by the main session during stage 6. One row per finding.
 | T3 | spec pass 3 | Minor | Sp19 S4 (`sync_all` before the rename, directory fsync best-effort) was in the log but in no task text and not in D3 | fixed in 8e8db416 (plan T3, spec D3) |
 | T13 | spec pass 3 | Minor | Sp20 T13 items 1/4/6 and Done-when not reconciled with Q7 and item 7: no `Confirmer` import, no `confirmer` in the `Inputs` literal, `let operator_bus` not `mut`, "under 90 lines" | fixed in 8e8db416 (items 1/4/6, Done-when "under ~96") |
 | T13 | spec pass 3 | Minor | Sp21 spec Claims and D12 and the plan overview still counted five `main.rs` hooks while D2 and item 7 add the S1 `finished()` arm | fixed in 8e8db416: six hooks, (6) one `finished()` arm in each `select!` |
+| merge | lead 2026-11-01 | — | #271's tip ff62fea3 (main a2ab31c3: #232 scanner v2, #282, #283, #263, #285, #277) merged into this branch ahead of the rebase onto main; four conflicts resolved (README scan paragraph, `config_file.rs` test imports, research README rows, `docs/scanner.md` taken from main — the three D13 spans no longer exist, merge note in D13); `ScriptWiring.script_checks` added to the verb test's literal; the 38 natives #232 registers pinned Live (15 `scan.*` job verbs, 23 `check.*`); per-package offline checks green (clippy aitm-mcp/aitm-core/aitm lib, aitm lib 539 tests) | 18e5dae4 (merge), 264b0ca2 (pin); for panel pass 4 to confirm |
 
 ## Shipped
 
