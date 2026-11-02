@@ -1602,8 +1602,12 @@ mod tests {
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.points.found, 2);
         assert_eq!(status.points.audited, 2);
-        assert_eq!(status.checks.scheduled, 2);
-        assert_eq!(status.checks.done, 2);
+        // Two points x (the lane's one check + the engine's three shipped
+        // passive checks, which run on every http point whatever lane holds
+        // the slot; spec amendment 24). The passives read the captured flow
+        // and send nothing, so the probe count is the fake check's alone.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(status.checks.done, 8);
         assert!(status.checks.running.is_empty());
         assert_eq!(status.probes.sent, 2, "one probe per point");
         assert!(status.finished_at.is_some());
@@ -1613,17 +1617,19 @@ mod tests {
     /// moves to `cancelled` with its issues intact and sends nothing more.
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_moves_to_cancelled_and_keeps_issues() {
-        let h = Harness::new().with_lane(
-            FakeLane::http()
-                // The catalogue is id-sorted, so `fake.hit` is scheduled
-                // before `fake.wait` and the issue exists before the block.
-                .with_check(FakeCheck::scripted(
-                    "fake.hit",
-                    "demo",
-                    vec![FakeRun::vulnerable()],
-                ))
-                .with_check(FakeCheck::blocking("fake.wait")),
-        );
+        let h = Harness::new()
+            .with_lane(
+                FakeLane::http()
+                    // The catalogue is id-sorted, so `fake.hit` is scheduled
+                    // before `fake.wait` and the issue exists before the block.
+                    .with_check(FakeCheck::scripted(
+                        "fake.hit",
+                        "demo",
+                        vec![FakeRun::vulnerable()],
+                    ))
+                    .with_check(FakeCheck::blocking("fake.wait")),
+            )
+            .with_egress();
         h.bind();
 
         let started = crate::jobs::start(
@@ -1644,12 +1650,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        // A running job holds the egress posture: race-free here because the
+        // blocking check keeps the job open until the cancel below (the
+        // panicking-lane test used to read this and raced its own finaliser).
+        assert!(h.egress_confined(), "a running job holds the posture");
+
         let cancelling = h
             .engine
             .registry
             .cancel(&started.job)
             .expect("the job is in the registry");
-        assert_eq!(cancelling.state, JobState::Cancelling);
+        // `cancel` answers with the status as it stands: `Cancelling` while the
+        // worker is still unwinding, or already `Cancelled` when the finaliser
+        // beat this read on the multi-thread runtime (CI Rust gate on #229,
+        // #287, #290, #292, 2026-11-02: "left: Cancelled, right: Cancelling";
+        // coordinator's amendment 71b, test determinism). Either says the cancel
+        // took; the terminal facts are asserted after the signal below.
+        assert!(
+            matches!(cancelling.state, JobState::Cancelling | JobState::Cancelled),
+            "cancel answered {:?}",
+            cancelling.state
+        );
 
         let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Cancelled);
@@ -2670,7 +2691,11 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        assert!(h.egress_confined(), "a running job holds the posture");
+        // No pre-terminal read of the hold here: on the multi-thread runtime
+        // the lane's panic can end the job before this line runs, so "a
+        // running job holds the posture" raced the supervisor (CI Rust gate on
+        // #289, 2026-11-02; coordinator's amendment 71b). The cancel test above
+        // pins that property race-free behind its blocking check.
 
         // The terminal signal decides when the job is over; `TERMINAL_NET` is
         // the only net (the old 2 s bound tripped on a loaded gate machine).
@@ -2764,10 +2789,11 @@ mod tests {
         assert_eq!(status.state, JobState::Done, "{:?}", status.error);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.error, None);
-        // Two points x two checks: every item, the panicking ones included,
-        // counts as done, and the point count follows.
-        assert_eq!(status.checks.scheduled, 4);
-        assert_eq!(status.checks.done, 4);
+        // Two points x (two lane checks + the engine's three shipped passive
+        // checks): every item, the panicking ones included, counts as done,
+        // and the point count follows.
+        assert_eq!(status.checks.scheduled, 10);
+        assert_eq!(status.checks.done, 10);
         assert_eq!(status.points.audited, 2);
         assert!(status.checks.running.is_empty());
         // `fake.hit` still ran after `fake.boom` panicked on the same point.

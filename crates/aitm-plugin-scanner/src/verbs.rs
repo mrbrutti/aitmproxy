@@ -1191,7 +1191,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, SystemTime};
 
     use aitm_core::{
         AgentPolicy, Body, Command, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore,
@@ -1225,9 +1225,10 @@ mod tests {
 
     /// A registry loaded with a real [`ScannerPlugin`], its [`crate::jobs::ScanLate`]
     /// bound to in-memory services. The plugin carries **no** lane crate, so the
-    /// interim HTTP lane is what `lanes_for_run` picks (call B2) and the five
-    /// interim checks are in the catalogue; a `FakeCheck` rides in beside them
-    /// through the native-check slot the binary fills.
+    /// interim HTTP lane is what `lanes_for_run` picks (call B2); the catalogue
+    /// holds the engine's three shipped passive checks (spec amendment 24) and
+    /// the two legacy actives in the native slot; a `FakeCheck` rides in beside
+    /// them through the native-check slot the binary fills.
     struct Harness {
         reg: Registry,
         engine: Arc<Engine>,
@@ -1447,7 +1448,7 @@ mod tests {
 
     /// Spec D3: the verb table is the contract. The registry holds exactly the
     /// eighteen `scan.*` names (fifteen new, three shipped) and one uniform
-    /// `check.<id>` per catalogue entry — here the interim lane's three passive
+    /// `check.<id>` per catalogue entry — here the engine's three shipped passive
     /// checks plus the two legacy actives in the harness's native slot (call B8).
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_exposes_every_d3_verb_and_the_manual_checks() {
@@ -1563,16 +1564,30 @@ mod tests {
     }
 
     /// AC T1-1: `scan.start` returns the accepted job at once; the work happens
-    /// in the background.
+    /// in the background. Proven without a clock: the job runs a check that
+    /// does not end until the job is cancelled (or the engine's
+    /// `check_timeout_s`, 60 s by default, cuts it), so the verb answering with
+    /// the job's terminal signal still unset shows it did not wait for the
+    /// work; a `scan.start` that did wait would come back late with the signal
+    /// already `true` — a failure, not a hang. The old `elapsed() < 2 s` bound
+    /// tripped on a loaded CI runner (#290, 2026-11-02; coordinator's
+    /// amendment 71b).
     #[tokio::test(flavor = "multi_thread")]
     async fn start_returns_a_start_result_immediately() {
-        let h = Harness::new();
+        let h = Harness::with_check(FakeCheck::blocking("fake.blocker"));
+        h.capture("/search?q=1", HeaderMap::new(), "ok");
 
-        let began = Instant::now();
         let result = h.ok("scan.start", &[("target", s("http://scan.test"))]);
-        assert!(began.elapsed() < Duration::from_secs(2));
 
         let job = as_str(obj(&result, "job")).to_string();
+        assert_eq!(
+            h.engine
+                .registry
+                .terminal_signal(&job)
+                .map(|signal| *signal.borrow()),
+            Some(false),
+            "the verb answered while its job was still running"
+        );
         assert_eq!(job.len(), 13, "`{job}` is `scan-<8 hex>`");
         assert!(job.starts_with("scan-"));
         assert!(job[5..].chars().all(|c| c.is_ascii_hexdigit()));
@@ -1584,6 +1599,7 @@ mod tests {
         assert_eq!(as_str(obj(&skipped[0], "lane")), "ws");
         assert_eq!(as_array(obj(obj(&result, "lanes"), "run")).len(), 1);
 
+        h.ok("scan.cancel", &[("job", s(&job))]);
         h.wait_terminal(&job).await;
     }
 

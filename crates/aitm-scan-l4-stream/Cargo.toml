@@ -12,6 +12,39 @@ description = "Scanner v2 L4 stream lane (track T6): stream-level discovery and 
 aitm-proto-l4.workspace = true
 # The `Lane` trait this crate's `lane()` slot returns.
 aitm-scan-model.workspace = true
+# `redact::{scrub_text, is_secret_key}` for every excerpt the lane reports
+# (spec Constraints).
+aitm-core.workspace = true
+# `CheckMeta.severity` is an `aitm_poc::Severity` (spec S6.3) and
+# `aitm-scan-model` imports the type privately, so the three checks cannot
+# name their severity without this crate. Already in the build graph through
+# `aitm-scan-model`; see the Task 19 report's note on the spec's dependency
+# list.
+aitm-poc.workspace = true
+
+anyhow.workspace = true
+futures.workspace = true
+tracing.workspace = true
+# The `MessageSpec` grammar format (spec S2) is serde over YAML.
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
+# The DNS grammar (spec S3 row 4) parses and builds messages with hickory.
+hickory-proto.workspace = true
+# Seedable, reproducible mutation (spec S6.4): `rand` traits over ChaCha8.
+rand.workspace = true
+rand_chacha.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+] }
 
 [lints]
 workspace = true

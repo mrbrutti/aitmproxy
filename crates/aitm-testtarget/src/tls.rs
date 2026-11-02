@@ -3,8 +3,10 @@
 //! and lends it to both listeners), one rustls `ServerConfig` per ALPN list
 //! built with the `ring` provider via `builder_with_provider` (no global
 //! provider install), and the accept loop that negotiates ALPN, writes a
-//! `tls_handshake` entry (D2) and hands the stream to `serve_h2` (`h2`) or
-//! `serve_h1` (`http/1.1` or none). The `tls` listener offers `[h2, http/1.1]`,
+//! `tls_handshake` entry (D2) and hands the stream to `serve_h2` (`h2`, wrapped
+//! in the read-side [`H2StreamCounter`] so the row's `streams` counts every
+//! client stream opened on the wire, amendment 51) or `serve_h1` (`http/1.1`
+//! or none). The `tls` listener offers `[h2, http/1.1]`,
 //! the `tls_h1` listener `[http/1.1]` only, so the HTTP/2 sender and its version
 //! override can be proven against a target that behaves either way.
 
@@ -18,6 +20,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::app::{self, AppState};
+use crate::h2count::H2StreamCounter;
 use crate::listeners::accept_loop;
 use crate::log::{Listener, ServiceInfo};
 
@@ -163,7 +166,10 @@ async fn serve_tls(
     let conn = state.log.open_conn(kind, alpn_str.as_deref(), peer);
     state.log.log_tls_handshake(&conn);
     if negotiated.as_deref() == Some(&b"h2"[..]) {
-        app::serve_h2(tls, state.clone(), conn.clone()).await;
+        // The counter observes the inbound frames before hyper parses them;
+        // the bytes hyper sees and every write are untouched.
+        let counted = H2StreamCounter::new(tls, conn.clone());
+        app::serve_h2(counted, state.clone(), conn.clone()).await;
     } else {
         app::serve_h1(tls, state.clone(), conn.clone()).await;
     }

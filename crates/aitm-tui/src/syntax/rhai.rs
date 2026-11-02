@@ -2,7 +2,7 @@
 //! shared `rhai.grammar.json`: the keyword and literal sets come from
 //! [`crate::languages`], and the lexical rules (line/block comments, the four
 //! string forms, numbers) re-express the grammar's described rules in a byte
-//! scanner. It never panics — an unterminated string or block comment colours
+//! scanner. It never panics: an unterminated string or block comment colours
 //! to the end of its span and the scan resumes on the next line.
 
 use super::SyntaxToken;

@@ -1,0 +1,436 @@
+//! Scanner v2 TUI, plan task 4: the feature-detection matrix (spec D2) and the
+//! common tab chrome (D11). Three buses, three surfaces: a legacy bus (only
+//! `scan.discover`) keeps today's one-shot behaviour and reaches the wire only
+//! on an explicit launch; a bus with neither scanner verb hides the sidebar row
+//! and says so in every tab; a v2 bus lands on Profiles and remembers the tab.
+//!
+//! Fixture-driven: this proves the reducer and the rendering only. Acceptance
+//! is the pty cell against a real core (spec Acceptance criteria, "Live").
+
+mod common;
+
+use aitm_tui::action::{Action, BusEvent, BusRequest};
+use aitm_tui::app::{App, Mode, SidebarItem};
+use aitm_tui::caps::TermCaps;
+use aitm_tui::scan::{MapPane, ScanTab};
+use common::*;
+
+/// The text of every tab of the Scan view, in strip order.
+fn tab_texts(app: &mut App) -> Vec<(ScanTab, String)> {
+    ScanTab::ALL
+        .iter()
+        .map(|tab| {
+            let _ = app.update(Action::ScanTab(*tab));
+            (*tab, text_of(app, app.width, app.height))
+        })
+        .collect()
+}
+
+/// The strip-and-banner row of the Scan view, without its trailing box edge
+/// and padding, so `ends_with` reads the banner's last word.
+fn banner_row(text: &str) -> &str {
+    line_with(text, "1 Profiles")
+        .unwrap_or_default()
+        .trim_end_matches(['│', ' '])
+}
+
+/// The tool names of every call (tagged or not) in `reqs`.
+fn called(reqs: &[BusRequest]) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::Call { name, .. } | BusRequest::CallTagged { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// D2, legacy row: with only `scan.discover` the first open lands on Jobs, the
+/// one synthetic one-shot row is the Jobs tab, Profiles says what it would
+/// need, and opening the view reaches the wire with nothing at all (a crawl is
+/// hundreds of real navigations: only `r` / `:scan <host>` launch one).
+#[test]
+fn legacy_bus_opens_on_jobs_with_the_one_shot_row_and_no_scan_calls() {
+    let mut app = legacy_app(200, 50);
+    assert!(app.has_tool("scan.discover"));
+    assert!(
+        !app.has_tool("scan.start"),
+        "a legacy bus has no scan.start"
+    );
+
+    let reqs = app.update(Action::OpenScan);
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(
+        app.scan.tab,
+        ScanTab::Jobs,
+        "a legacy bus has no profiles, so the first open lands on Jobs"
+    );
+    let scan_calls: Vec<String> = called(&reqs)
+        .into_iter()
+        .filter(|n| n.starts_with("scan."))
+        .collect();
+    assert!(
+        scan_calls.is_empty(),
+        "opening the view calls no scanner verb: {scan_calls:?}"
+    );
+
+    let jobs = text_of(&app, 200, 50);
+    assert!(
+        jobs.contains("one-shot"),
+        "the Jobs tab is the legacy one-shot row: {jobs}"
+    );
+    // D11's common chrome: the four-tab strip, in strip order, with the
+    // state banner beside it.
+    let strip = line_with(&jobs, "1 Profiles").unwrap_or_default();
+    assert!(
+        col_of(strip, "1 Profiles") < col_of(strip, "2 Jobs")
+            && col_of(strip, "2 Jobs") < col_of(strip, "3 Site map")
+            && col_of(strip, "3 Site map") < col_of(strip, "4 Issues")
+            && col_of(strip, "4 Issues") < col_of(strip, "idle"),
+        "the tab strip reads 1 Profiles 2 Jobs 3 Site map 4 Issues, then the banner: {strip:?}"
+    );
+
+    let _ = app.update(Action::ScanTab(ScanTab::Profiles));
+    let profiles = text_of(&app, 200, 50);
+    assert!(
+        profiles.contains("profiles need scan.profile.list (scanner v2)"),
+        "Profiles is degraded on a legacy bus: {profiles}"
+    );
+    // A3: the degraded text is the banner (D11), not `idle`, and it is the
+    // one state on screen (D13): the pane body does not repeat it.
+    let strip = banner_row(&profiles);
+    assert!(
+        strip.ends_with("profiles need scan.profile.list (scanner v2)"),
+        "the Profiles strip row ends with the degraded literal: {strip:?}"
+    );
+    assert!(
+        !strip.contains("idle"),
+        "a degraded tab is not idle: {strip:?}"
+    );
+    assert_eq!(
+        profiles
+            .matches("profiles need scan.profile.list (scanner v2)")
+            .count(),
+        1,
+        "exactly one state on screen (D13): {profiles}"
+    );
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let issues = text_of(&app, 200, 50);
+    let strip = banner_row(&issues);
+    assert!(
+        strip.ends_with("issues need scan.issues (scanner v2)"),
+        "the Issues strip row ends with the degraded literal: {strip:?}"
+    );
+    assert_eq!(
+        issues
+            .matches("issues need scan.issues (scanner v2)")
+            .count(),
+        1,
+        "exactly one state on screen (D13): {issues}"
+    );
+}
+
+/// Fix round A, A3 (D2, D13): on a v2 bus missing one tab's verb, the banner
+/// reads `<verb> is not on this bus` and nothing else on the tab repeats it.
+#[test]
+fn v2_bus_missing_a_tabs_verb_says_so_once_in_the_banner() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["scan.start", "scan.list", "scan.status"], None);
+    let _ = app.update(Action::OpenScan);
+    for (tab, verb) in [
+        (ScanTab::Profiles, "scan.profile.list"),
+        (ScanTab::SiteMap, "scan.sitemap"),
+        (ScanTab::Issues, "scan.issues"),
+    ] {
+        let _ = app.update(Action::ScanTab(tab));
+        let text = text_of(&app, 200, 50);
+        let strip = banner_row(&text);
+        let want = format!("{verb} is not on this bus");
+        assert!(
+            strip.ends_with(&want),
+            "{tab:?}: the strip row ends with {want:?}: {strip:?}"
+        );
+        assert_eq!(
+            text.matches(&want).count(),
+            1,
+            "{tab:?}: exactly one state on screen (D13): {text}"
+        );
+    }
+}
+
+/// D2, bottom row: no scanner at all. The sidebar has no Scan row (never land
+/// on a row that is not drawn) and `:scan` still opens the view, which names
+/// both verbs it could have been served by, in every tab.
+#[test]
+fn no_scanner_hides_the_row_and_scan_names_both_verbs() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["flow.list", "flow.get"], None);
+    assert!(!app.has_tool("scan.discover"));
+
+    let flows = text_of(&app, 200, 50);
+    assert!(
+        !flows.lines().any(|l| l.contains(" Scan ")),
+        "no Scan row without a scanner: {flows}"
+    );
+
+    let reqs = app.run_command("scan");
+    assert_eq!(app.mode, Mode::Scan, "the view still opens");
+    assert!(called(&reqs).is_empty(), "and calls nothing: {reqs:?}");
+    for (tab, text) in tab_texts(&mut app) {
+        assert!(
+            text.contains("the scanner is not on this bus (scan.start / scan.discover)"),
+            "{tab:?} names both verbs: {text}"
+        );
+    }
+}
+
+/// D2, v2 row and Architect's call 1: `scan.start` means profiles, so the
+/// first open lands on Profiles; a later open restores the tab the operator
+/// left on.
+#[test]
+fn v2_first_open_lands_on_profiles_and_remembers_the_tab() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["scan.start", "scan.list", "scan.status"], None);
+
+    let _ = app.update(Action::OpenScan);
+    assert_eq!(
+        app.scan.tab,
+        ScanTab::Profiles,
+        "a v2 bus opens on Profiles"
+    );
+    assert_eq!(app.sidebar, SidebarItem::Scan);
+
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.update(Action::Back);
+    assert_eq!(app.mode, Mode::Flows, "Esc leaves the view");
+
+    let _ = app.update(Action::OpenScan);
+    assert_eq!(
+        app.scan.tab,
+        ScanTab::Jobs,
+        "the second open restores the tab the operator left on"
+    );
+}
+
+/// Fix round A, A2 (fixture widened in fix round C, C14): the Site map's
+/// pane-to-list choice is made once, keyed on the bus. On a v2 bus with two
+/// `scan.sitemap` nodes on screen and a legacy endpoint also present, `Down`
+/// walks the v2 nodes (the cursor lands on the second) and leaves the legacy
+/// cursor alone; `Enter` opens the selected node's first flow; no legacy
+/// row is ever read.
+#[test]
+fn v2_site_map_enter_opens_the_v2_nodes_first_flow() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["scan.start", "scan.sitemap", "flow.list"], None);
+    let sitemap = fixture("scan.sitemap.json");
+    let result: aitm_scan_model::SitemapResult =
+        serde_json::from_value(sitemap.clone()).expect("fixture parses");
+    let first_flow = result.nodes[0].flows[0].to_string();
+    const SECOND_FLOW: &str = "550e8400-e29b-41d4-a716-446655440099";
+    let mut second_json = sitemap["nodes"][0].clone();
+    second_json["id"] = serde_json::json!("node-2");
+    second_json["path_template"] = serde_json::json!("/second");
+    second_json["flows"] = serde_json::json!([SECOND_FLOW]);
+    let second: aitm_scan_model::SiteNode =
+        serde_json::from_value(second_json).expect("the second node parses");
+    for (id, path) in [
+        (first_flow.as_str(), "/account/1"),
+        (SECOND_FLOW, "/second"),
+    ] {
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            id,
+            "GET",
+            "127.0.0.1:8080",
+            path,
+            Some(200),
+            "none",
+        )]));
+    }
+    app.selected = None;
+
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    // The two-node page arrives through the fold (fix round G, G13), so
+    // the lines and the point order are built as they are live.
+    let mut page = sitemap;
+    page["nodes"] = serde_json::json!([
+        serde_json::to_value(&result.nodes[0]).expect("the node serialises"),
+        serde_json::to_value(&second).expect("the node serialises"),
+    ]);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.sitemap".into(),
+        name: "scan.sitemap".into(),
+        value: page,
+    });
+    app.scan.sitemap.pane = MapPane::Nodes;
+    app.scan.legacy.endpoints = vec!["http://127.0.0.1:8080/legacy".into()];
+    assert_eq!(app.scan.sitemap.nodes.len(), 2);
+    assert_eq!(app.scan.sitemap.lines.len(), 2, "the fold built the lines");
+    assert_eq!(app.scan.sitemap.points.len(), 2);
+
+    let _ = app.update(Action::Down);
+    assert_eq!(
+        app.scan.sitemap.node_cursor, 1,
+        "Down walks the v2 nodes to the second"
+    );
+    assert_eq!(
+        app.scan.legacy.endpoint_cursor, 0,
+        "the legacy cursor is not touched"
+    );
+    let _ = app.update(Action::Enter);
+    assert_eq!(
+        app.selected.as_deref(),
+        Some(SECOND_FLOW),
+        "Enter selects the second v2 node's first flow"
+    );
+    assert_eq!(app.mode, Mode::Inspector, "and opens it in the inspector");
+}
+
+/// Every verb of the v2 surface (spec D2, D3).
+const V2_TOOLS: &[&str] = &[
+    "scan.start",
+    "scan.map",
+    "scan.list",
+    "scan.status",
+    "scan.cancel",
+    "scan.issues",
+    "scan.issue",
+    "scan.issue.update",
+    "scan.sitemap",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.profile.save",
+    "scan.profile.delete",
+    "scan.checks",
+    "scan.session.preview",
+];
+
+/// D13's in-flight and empty states (plan Task 16): while a tab's read is
+/// in flight over an empty pane the banner reads `refreshing <verb>...`;
+/// an empty reply draws the tab's empty text with the banner back to
+/// `idle`; once a pane is populated a read in flight leaves the banner
+/// `idle` and the content on screen.
+#[test]
+fn every_tab_reads_refreshing_over_an_empty_pane_then_its_empty_text() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, V2_TOOLS, None);
+    let reqs = app.update(Action::OpenScan);
+    assert_eq!(
+        called(&reqs).len(),
+        3,
+        "list, profile list, checks: {reqs:?}"
+    );
+    for (tab, verb) in [
+        (ScanTab::Profiles, "scan.profile.list"),
+        (ScanTab::Jobs, "scan.list"),
+        (ScanTab::SiteMap, "scan.sitemap"),
+        (ScanTab::Issues, "scan.issues"),
+    ] {
+        let _ = app.update(Action::ScanTab(tab));
+        assert!(
+            app.scan.inflight.contains(verb),
+            "{tab:?}: {verb} is in flight: {:?}",
+            app.scan.inflight
+        );
+        let text = text_of(&app, 200, 50);
+        let strip = banner_row(&text);
+        assert!(
+            strip.ends_with(&format!("refreshing {verb}...")),
+            "{tab:?}: the banner names the read in flight: {strip:?}"
+        );
+    }
+
+    for (tab, verb, value, empty) in [
+        (
+            ScanTab::Issues,
+            "scan.issues",
+            serde_json::json!({ "issues": [] }),
+            "no issues yet",
+        ),
+        (
+            ScanTab::SiteMap,
+            "scan.sitemap",
+            serde_json::json!({ "nodes": [], "points": [] }),
+            "no site map yet",
+        ),
+        (
+            ScanTab::Jobs,
+            "scan.list",
+            serde_json::json!({ "jobs": [] }),
+            "no jobs yet: start one from Profiles (s)",
+        ),
+        (
+            ScanTab::Profiles,
+            "scan.profile.list",
+            serde_json::json!({ "profiles": [] }),
+            "no profiles yet",
+        ),
+    ] {
+        // Enter the tab first: entering Site map or Issues re-reads (D6),
+        // which the dedupe folds into the read already in flight; the
+        // reply then settles the one tag.
+        let _ = app.update(Action::ScanTab(tab));
+        let _ = app.on_bus(BusEvent::CallTaggedOk {
+            tag: verb.into(),
+            name: verb.into(),
+            value,
+        });
+        assert!(
+            !app.scan.inflight.contains(verb),
+            "{tab:?}: {verb} settled: {:?}",
+            app.scan.inflight
+        );
+        let text = text_of(&app, 200, 50);
+        let strip = banner_row(&text);
+        assert!(
+            strip.ends_with("idle"),
+            "{tab:?}: the reply settled the banner: {strip:?}"
+        );
+        assert_eq!(
+            text.matches(empty).count(),
+            1,
+            "{tab:?}: the empty text once (D13):\n{text}"
+        );
+    }
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.checks".into(),
+        name: "scan.checks".into(),
+        value: serde_json::json!({ "checks": [] }),
+    });
+    assert!(app.scan.inflight.is_empty(), "{:?}", app.scan.inflight);
+
+    // A populated Jobs pane keeps its rows while the timer's list is in
+    // flight, and the banner reads idle, not refreshing.
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: fixture("scan.list.json"),
+    });
+    assert_eq!(app.scan.jobs.order.len(), 2);
+    let mut listed = false;
+    for _ in 0..40 {
+        listed |= called(&app.update(Action::Tick))
+            .iter()
+            .any(|n| n == "scan.list");
+    }
+    assert!(listed, "the forty-tick list left");
+    assert!(app.scan.inflight.contains("scan.list"));
+    let text = text_of(&app, 200, 50);
+    assert!(
+        banner_row(&text).ends_with("idle"),
+        "a populated pane is not refreshing: {:?}",
+        banner_row(&text)
+    );
+    assert!(
+        text.contains("scan-1a2b3c4d") && text.contains("scan-55667788"),
+        "the rows stay on screen:\n{text}"
+    );
+    assert!(!text.contains("no jobs yet"), "{text}");
+}
