@@ -334,7 +334,11 @@ Where each negative is observed (its cell):
   (TUI-1, WEB-1, CLI-3) refuse when any of 8080/8081/8082 is busy; MAC `yes` steps require that the holder of 8080 is the
   app's embedded core (bundle-path `pgrep`). Windows are announced on stdout with timestamps.
 - mac driving: `lib/menu.sh "<Menu>" "<Item>"` (System Events, `set frontmost to true` first),
-  `lib/keypress.swift` (CGEvent, refuses unless the app is frontmost), `screencapture -l <win>` loop
+  `lib/type.sh` (pbcopy + ⌘V, probe first), `lib/click.sh <x> <y>` (a System Events click at the
+  screen point, two clicks 0.9 s apart, frontmost first) used on the Edit Scope field's centre
+  before the focus probe — the sheet does not focus its field when Scope already has hosts (run 5,
+  MAC-5); the field is located by accessibility identifier when the app exposes one (`scope-add-host`
+  once the mac fix lands), else by its description "Host to add to scope"; `screencapture -R` loop
   for N1. tui: `aitm_e2e/tui_pty.py` (extracted from `tests/e2e/tui/test_tui_flows_render.py`:
   `TIOCSWINSZ` and the grid replayer; a plan task, not an existing module). web: Playwright
   Chromium (`apps/web/scripts/` has the CDP driver; Safari stays a hand step).
@@ -500,3 +504,9 @@ standalone run — fixed: destroyed on EXIT/INT/TERM, read and destroyed the mom
 written outside `run.sh` (APFS does not overwrite blocks, so the honest claim is "0600, deleted"); Minors fixed:
 the ERROR-path restore compares to the cell's own start reading and prints the diff before replaying; N1 sends
 nothing when the focus probe is not seen (a blind paste could reach Settings' persisting bypass field).
+
+Run 5 follow-up (2026-11-02): MAC-5 failed because the Edit Scope sheet does not focus its field when
+Scope is non-empty and System Events cannot set focus on a SwiftUI text field; the harness now clicks the
+field's accessibility bounds before the probe (`lib/click.sh`, `installed.field_center`), identifier first,
+description fallback; the product fix (focus the Add field whenever the sheet opens, plus an accessibility
+identifier) is carded for the mac session.
