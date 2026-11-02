@@ -25,6 +25,11 @@ branch and step 07d; same rig; core on proxy 60010, web 60012, target 60009; its
 only in a comment; same rig; its idle-window `t0=1793589127177` is 2026-11-02 03:12:07 UTC = 19:12:07 PST). Summary line
 `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`; 07d read `rows=184; l4 rows=31; error rows=[]`; the five BLOCKED lines
 quote the same two core reasons as runs 1–3.
+**Full redacted log (run 5, the fix-5 build = the shipping head of unit (c)):** `/tmp/claude/l4-rig/c-evidence/13-cua-l4-run5-after-fix5.log`
+(410 lines; built from `809385d8` = unit (c) fix 5 — once-log forgets a message only when no read still produces it, inspect
+reads keyed per flow; script unchanged since fix 4; same rig; its idle-window `t0=1793590043359` is 2026-11-02 03:27:23 UTC =
+19:27:23 PST). Summary line `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`; 07d read
+`rows=180; l4 rows=31; error rows=[]`; the five BLOCKED lines quote the same two core reasons as runs 1–4.
 
 **Summary line printed by the script, run 1:** `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`.
 One of the 38 PASS lines was the step-09 wrapper line (`PASS 09 privileged real-packet click-drive …`) printed after the
