@@ -412,6 +412,87 @@ describe('no_innerhtml_under_panels_l4 (C6 tripwire, AC40)', () => {
   });
 });
 
+// ---- scope-add gating tripwire (task C7, spec §3 last bullet, AC22, AC39) -------------------------
+//
+// The add form exists only where the core offers `l4.scope.add` with `confirmable: true`: in
+// `CaptureControls.tsx` the form's testid must sit inside a `<Show when={supportsOperatorScopeAdd(`
+// … `</Show>` span, so against a core without (a') there is no form, not a form that can only fail.
+// In `store.ts` the verb is sent only from `addScope` / `confirmAddScope`, each through the shared
+// confirm-over-the-wire path (`beginGuarded` / `confirmGuarded`) with the C1 builder's arguments.
+
+/** The index just past the `</Show>` that closes the `<Show` opening at `openAt`, or -1. */
+function matchingShowClose(src: string, openAt: number): number {
+  const token = /<Show\b|<\/Show>/g;
+  token.lastIndex = openAt;
+  let depth = 0;
+  for (let m = token.exec(src); m; m = token.exec(src)) {
+    if (m[0] === '</Show>') {
+      depth -= 1;
+      if (depth === 0) return m.index + m[0].length;
+    } else depth += 1;
+  }
+  return -1;
+}
+
+describe('scope_add_form_is_gated (C7 tripwire, AC22, AC39)', () => {
+  it('CaptureControls.tsx renders the add form only inside <Show when={supportsOperatorScopeAdd(…)}>', async () => {
+    const src = await readL4Source('CaptureControls.tsx');
+    const gateAt = src.indexOf('<Show when={supportsOperatorScopeAdd(');
+    expect(gateAt, 'no <Show when={supportsOperatorScopeAdd( gate in CaptureControls.tsx').toBeGreaterThanOrEqual(0);
+    const gateEnd = matchingShowClose(src, gateAt);
+    expect(gateEnd, 'the supportsOperatorScopeAdd gate has no matching </Show>').toBeGreaterThan(gateAt);
+    const formAt = src.indexOf('data-testid="l4-scope-add-form"');
+    expect(formAt, 'no data-testid="l4-scope-add-form" in CaptureControls.tsx').toBeGreaterThanOrEqual(0);
+    expect(formAt, 'the add form must come after the supportsOperatorScopeAdd( gate').toBeGreaterThan(gateAt);
+    expect(formAt, 'the add form must sit inside the supportsOperatorScopeAdd gate span').toBeLessThan(gateEnd);
+    // Exactly one form, and only one occurrence of its testid (no second, ungated copy).
+    expect(src.indexOf('data-testid="l4-scope-add-form"', formAt + 1)).toBe(-1);
+    // What the live browser script (cua-l4.mjs) locates, and the confirm dialog it drives.
+    expect(src).toContain('aria-label="Add L4 scope"');
+    expect(src).toContain('data-testid="l4-scope-add"');
+    expect(src).toContain('aria-label="Scope CIDR"');
+    expect(src).toContain('aria-label="Scope ports"');
+    expect(src).toContain('aria-label="Scope interface"');
+    expect(src).toContain('aria-label="Scope direction"');
+    expect(src).toContain('aria-label="Scope capability"');
+    expect(src).toContain('title="Confirm L4 scope add"');
+    expect(src).toContain('props.onAddScope(');
+    expect(src).toContain('props.onConfirmAddScope(');
+    // Provenance from the core's `source` (config / runtime).
+    expect(src).toContain('e.source');
+  });
+
+  it('store.ts sends l4.scope.add only from addScope / confirmAddScope through beginGuarded / confirmGuarded with scopeAddArgs', async () => {
+    const src = await readL4Source('store.ts');
+    const lines = src.split('\n');
+    const hits = lines.map((text, i) => ({ n: i + 1, text })).filter((l) => l.text.includes("'l4.scope.add'"));
+    expect(hits.map((l) => l.n), 'store.ts must name l4.scope.add on exactly two lines (addScope, confirmAddScope)').toHaveLength(2);
+    const problems: string[] = [];
+    for (const l of hits) {
+      const guarded = l.text.includes('beginGuarded(') || l.text.includes('confirmGuarded(');
+      if (!guarded) problems.push(`line ${l.n}: l4.scope.add not sent through beginGuarded( / confirmGuarded(`);
+      if (!l.text.includes('scopeAddArgs(')) problems.push(`line ${l.n}: l4.scope.add argument is not scopeAddArgs(`);
+    }
+    expect(problems).toEqual([]);
+    // The two lines sit inside the two named functions (arrow or function form), in that order.
+    const addAt = src.search(/(?:async function addScope\(|function addScope\(|const addScope = (?:async )?\()/);
+    const confirmAt = src.search(/(?:async function confirmAddScope\(|function confirmAddScope\(|const confirmAddScope = (?:async )?\()/);
+    expect(addAt, 'store.ts has no addScope definition').toBeGreaterThanOrEqual(0);
+    expect(confirmAt, 'store.ts has no confirmAddScope definition').toBeGreaterThanOrEqual(0);
+    const offsetOfLine = (n: number) => lines.slice(0, n - 1).join('\n').length + (n > 1 ? 1 : 0);
+    const [first, second] = hits.map((l) => offsetOfLine(l.n)) as [number, number];
+    const [lo, hi] = addAt < confirmAt ? [addAt, confirmAt] : [confirmAt, addAt];
+    expect(first).toBeGreaterThan(lo);
+    expect(first).toBeLessThan(hi);
+    expect(second).toBeGreaterThan(hi);
+    // Both are exported on the store object (the capture bar wires them through).
+    expect(src).toMatch(/\n\s+addScope,\n/);
+    expect(src).toMatch(/\n\s+confirmAddScope,\n/);
+    // No direct call site for the verb anywhere in the store.
+    expect(src).not.toMatch(/\bcall(?:<[^>]*>)?\(\s*'l4\.scope\.add'/);
+  });
+});
+
 // ---- live schema block (AC18 live; run in C10 against the rig, skipped in the gate) ---------------
 //
 // Reads the real core's `tools/list` over the loopback-TCP bus (the wire of

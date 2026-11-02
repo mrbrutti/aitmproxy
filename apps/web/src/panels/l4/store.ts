@@ -12,7 +12,7 @@
 import { batch, createEffect, createMemo, createSignal, on, untrack } from 'solid-js';
 import { createStore } from 'solid-js/store';
 import type { AppStore } from '~/state/app';
-import { beginGuarded, type GuardedOutcome } from './inject';
+import { beginGuarded, confirmGuarded, type GuardedOutcome } from './inject';
 import {
   availabilityFromError,
   availabilityFromReply,
@@ -26,6 +26,7 @@ import {
   PENDING_AVAILABILITY,
   placeholderRow,
   revertArgs,
+  scopeAddArgs,
   statusIds,
   supportsFlowWindow,
   verdictArgs,
@@ -36,6 +37,7 @@ import {
   type L4FlowWire,
   type L4ParkedWire,
   type L4PollClock,
+  type L4ScopeDraft,
   type L4ScopeEntryWire,
   type PacketSpec,
   type UnionRow,
@@ -319,6 +321,23 @@ export function createL4Store(app: AppStore) {
     beginGuarded(app.call, 'l4.intercept.mutate', mutateArgs(parkedId, spec));
   const revert = (parkedId: string): Promise<GuardedOutcome> => beginGuarded(app.call, 'l4.intercept.revert', revertArgs(parkedId));
 
+  // Operator L4 scope add (spec §3, AC22): the ONLY path to `l4.scope.add` in this store, and it is
+  // the same confirm-over-the-wire handshake as inject. `addScope` is the first phase; a `confirm`
+  // outcome is completed by `confirmAddScope` with the same draft and the core's token. The core
+  // validates the entry and writes the prompt; nothing here fabricates either. After a `done` the
+  // slow group re-reads `l4.scope.list`, so the new entry shows with its `runtime` provenance.
+  async function addScope(draft: L4ScopeDraft): Promise<GuardedOutcome> {
+    const outcome = await beginGuarded(app.call, 'l4.scope.add', { ...scopeAddArgs(draft) });
+    if (outcome.kind === 'done') await slow();
+    return outcome;
+  }
+
+  async function confirmAddScope(draft: L4ScopeDraft, token: string): Promise<GuardedOutcome> {
+    const outcome = await confirmGuarded(app.call, 'l4.scope.add', { ...scopeAddArgs(draft) }, token);
+    if (outcome.kind === 'done') await slow();
+    return outcome;
+  }
+
   async function setGate(capability: string, allowed: boolean): Promise<void> {
     try {
       const next = await app.call<AgentGates>('l4.agent.set', { capability, allowed });
@@ -354,6 +373,8 @@ export function createL4Store(app: AppStore) {
     drop,
     mutate,
     revert,
+    addScope,
+    confirmAddScope,
     setGate,
     error,
     call: app.call,

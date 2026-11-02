@@ -27,8 +27,11 @@ export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
         running={store.captureIds()}
         canScope={store.caps().scope}
         scope={store.scope()}
+        tools={store.tools()}
         onStart={(iface, direction) => void store.startCapture(iface, direction)}
         onStop={(id) => void store.stopCapture(id)}
+        onAddScope={store.addScope}
+        onConfirmAddScope={store.confirmAddScope}
       />
       <Show when={!store.interceptAvailability().available}>
         <InterceptLimitedLine reason={store.interceptAvailability().reason ?? ''} />
