@@ -906,6 +906,7 @@ fn compose_kv_and_edit_buffer_edge_cases() {
         name: "t".into(),
         description: String::new(),
         input_schema: json!({"properties":{"id":{"type":"string"},"n":{"type":"integer"},"on":{"type":"boolean"},"o":{"type":"object"}},"required":["id"]}),
+        confirmable: false,
     };
     // Object arguments are quoted shell-style; bare braces lose their quotes.
     assert_eq!(

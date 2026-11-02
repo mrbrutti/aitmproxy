@@ -75,6 +75,10 @@ pub enum Action {
     /// The Scan view (scanner-integration Stage 1). Opens the view only and
     /// shows the scope-bound target; viewing never crawls.
     OpenScan,
+    /// The L4 panel (`L`, `:l4`): capture / intercept availability from the
+    /// status verbs, the running captures and the capture commands (L4 parity
+    /// spec §1, AC15). Opening it sends nothing.
+    OpenL4,
     /// Scan view `r`: launch a scope-bound `scan.discover` (deny-by-default:
     /// an out-of-scope target is refused; a running crawl blocks re-launch).
     ScanLaunch,
@@ -195,6 +199,13 @@ pub enum Action {
     L4Inject,
     /// Answer the wire-confirm overlay: `true` re-issues with `_confirm`.
     WireConfirm(bool),
+    /// Craft pane `m`: apply the editor's spec to the selected intercept
+    /// flow's parked packet (`l4.intercept.mutate {id, spec}`, L4 parity spec
+    /// §4 / AC12). The id is the parked packet's from `l4.intercept.list`.
+    L4MutateParked,
+    /// Craft pane `u`: discard the staged edit of that parked packet
+    /// (`l4.intercept.revert {id}`).
+    L4RevertParked,
     /// Toggle one per-feature agent gate in the Agent view (`l4.agent.set`).
     L4ToggleGate(crate::l4::L4Gate),
 }
@@ -333,6 +344,17 @@ pub enum BusEvent {
     L4Scope(Vec<Value>),
     /// `l4.agent.status`: the four per-feature agent gate states.
     L4Agent(Value),
+    /// `l4.capture.status` + `l4.intercept.status` (L4 parity spec §1), read on
+    /// every slow pass: the two availabilities and the running capture ids.
+    L4Availability {
+        capture: crate::l4::L4Availability,
+        intercept: crate::l4::L4Availability,
+        captures: Vec<String>,
+    },
+    /// `l4.intercept.list` (spec §4): the parked packets, oldest first, each an
+    /// `{id, flow, state, dir, length, layers, parked_at}` object. Read only
+    /// while intercept is available.
+    L4Parked(Vec<Value>),
 }
 
 /// One declared parameter of a tool's `inputSchema`, as a form row.

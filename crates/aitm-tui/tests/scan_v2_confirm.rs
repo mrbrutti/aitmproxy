@@ -446,6 +446,15 @@ fn an_l4_inject_shows_the_wire_confirm_and_reissues_with_the_token() {
     app.selected = Some("l4-2".into());
     app.mode = Mode::Inspector;
     app.l4.pane = aitm_tui::l4::L4Pane::Craft;
+    // Capture/inject available (L4 parity B10 refuses `s` locally before the
+    // scope check while `l4.capture.status` says otherwise).
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: aitm_tui::l4::L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "captures": []}),
+        ),
+        intercept: app.l4.intercept.clone(),
+        captures: vec![],
+    });
 
     let reqs = app.update(Action::L4Inject);
     let [BusRequest::Call { name, args }] = reqs.as_slice() else {

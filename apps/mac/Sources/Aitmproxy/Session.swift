@@ -56,24 +56,22 @@ final class Session {
     var l4Details: [FlowID: L4Flow] = [:] {
         didSet { rowsVersion &+= 1 }
     }
-    /// Whether this app is driving its own embedded user-level core, which cannot do
-    /// raw L4 (AC18) — set by the connection model. The self-contained embedded core
-    /// degrades every wire verb to `L4Unavailable`; a privileged / remote core over
-    /// the bus drives L4 fully.
-    var l4EmbeddedCore = false
-    /// The last `L4Unavailable` reason a wire verb returned, surfaced in the banner.
-    var l4LastWireError: String?
+    /// Capture/inject availability as the core's own `l4.capture.status` reply says (spec §1); `.pending` until the first read.
+    var l4CaptureAvailability: L4Availability = .pending
+    /// In-path intercept availability from `l4.intercept.status`; `.pending` until the first read.
+    var l4InterceptAvailability: L4Availability = .pending
+    /// The core's L4 scope entries from `l4.scope.list`.
+    var l4Scope: [L4ScopeItem] = []
+    /// Parked packets from `l4.intercept.list`, read only while intercept is available (spec §4).
+    var l4Parked: [L4ParkedPacket] = []
+    /// `tools/list` says `l4.scope.add` is `confirmable`: the operator scope-add control may render (spec §3).
+    var l4CanAddScope = false
     /// The four per-capability agent gates read from `l4.agent.status` (AC11).
     var l4AgentGates: L4AgentGates?
 
-    /// Whether the macOS L4 surface can drive the wire against the current core.
-    var l4Availability: L4Availability {
-        L4Availability.resolve(embeddedCore: l4EmbeddedCore, wireError: l4LastWireError)
-    }
     /// The L4 commands are advertised by the current core (feature-detected).
     var l4Enabled: Bool { tools.contains { $0.name == "l4.flow.list" } }
     var l4HasSetter: Bool { tools.contains { $0.name == "l4.agent.set" } }
-    var l4HasIntercept: Bool { tools.contains { $0.name == "l4.intercept.start" } }
     /// `scan.discover` is advertised by the current core (feature-detected): the Scan page is offered, else hidden.
     var scanEnabled: Bool { ScanForm.isOffered(in: tools) }
     var selection: Set<FlowID> = []
@@ -183,6 +181,11 @@ final class Session {
     /// Set when the operator's Expected role (Settings ▸ Bus) disagrees with the
     /// resolved role, or the server echoed no role to confirm it (spec AC8).
     var roleWarning = false
+    /// The connection is the operator's (the role the server echoed at `initialize`); nil
+    /// (unconfirmed) or `"agent"` is not. The operator-only L4 verbs and the L4 scope add gate on it.
+    var isOperator: Bool { resolvedRole == "operator" }
+    /// Why an operator-only control is disabled or a call refused at its send site.
+    static let operatorOnlyReason = "Needs the operator token (Settings ▸ Bus)"
     /// Bumped by Proxy ▸ Reconnect Bus (⌃⌘R) so the shell re-resolves the
     /// endpoint and reconnects — picking up a newly pasted operator token.
     var reconnectTick = 0

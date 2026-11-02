@@ -168,7 +168,8 @@ fn wants_l4(lanes: &[LaneKind]) -> bool {
 /// L4 inject confirm. The first guarded call (without `_confirm`) returns a
 /// `needs_confirmation` reply whose `prompt` is the wire summary; the overlay
 /// shows it and, on confirm, the UI re-issues the identical call plus the
-/// reserved `_confirm` token. The L4 surface keeps a type alias to this.
+/// reserved `_confirm` token. The `l4.*` guarded verbs and the `scan.*`
+/// launches share this one type (no alias remains, spec D3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireConfirm {
     /// The tool to re-issue (`l4.inject`, `scan.start`, ...).
@@ -181,28 +182,52 @@ pub struct WireConfirm {
     pub token: String,
 }
 
+/// What a guarded verb's reply is (L4 parity, stage-6 fix): the confirm
+/// handshake bound to the pending call, a handshake the TUI cannot complete,
+/// or a plain result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmReply {
+    /// `needs_confirmation` with a token: the overlay to open.
+    Handshake(WireConfirm),
+    /// `needs_confirmation` without a string `confirm_token`: nothing can be
+    /// re-issued, and it is not a success either.
+    Malformed,
+    /// Not a handshake: the verb's own result.
+    Plain,
+}
+
 impl WireConfirm {
-    /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
-    /// `None` when the reply is not a confirmation handshake. The prompt is
-    /// bounded here, once (fix round H, H34): control characters stripped
-    /// and the text cut to [`PROMPT_MAX`] cells.
-    pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
+    /// Classify a reply against the pending `(call, args)` it answers. The
+    /// prompt is bounded here, once (fix round H, H34): control characters
+    /// stripped and the text cut to [`PROMPT_MAX`] cells.
+    pub fn classify(call: &str, args: &Value, reply: &Value) -> ConfirmReply {
         if reply.get("status").and_then(Value::as_str) != Some("needs_confirmation") {
-            return None;
+            return ConfirmReply::Plain;
         }
+        let Some(token) = reply.get("confirm_token").and_then(Value::as_str) else {
+            return ConfirmReply::Malformed;
+        };
         let prompt = reply
             .get("prompt")
             .and_then(Value::as_str)
             .unwrap_or("Confirm this action?");
-        Some(Self {
+        ConfirmReply::Handshake(Self {
             call: call.to_string(),
             args: args.clone(),
             prompt: truncate(&clean(prompt), PROMPT_MAX),
-            token: reply
-                .get("confirm_token")
-                .and_then(Value::as_str)?
-                .to_string(),
+            token: token.to_string(),
         })
+    }
+
+    /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
+    /// `None` when the reply is not a handshake the TUI can complete (a plain
+    /// result, or a handshake without a token; [`Self::classify`] tells
+    /// those apart).
+    pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
+        match Self::classify(call, args, reply) {
+            ConfirmReply::Handshake(confirm) => Some(confirm),
+            ConfirmReply::Malformed | ConfirmReply::Plain => None,
+        }
     }
 
     /// Whether the call under confirmation is a `scan.*` launch (the
@@ -245,6 +270,34 @@ pub struct LaunchState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn classify_tells_a_handshake_from_a_malformed_one_and_a_plain_reply() {
+        let args = json!({"spec": {"layers": []}, "dst": "127.0.0.1", "port": 7});
+        let reply = json!({"status": "needs_confirmation", "prompt": "Inject 1 UDP to 127.0.0.1:7?", "confirm_token": "tok-9"});
+        let ConfirmReply::Handshake(c) = WireConfirm::classify("l4.inject", &args, &reply) else {
+            panic!("a complete handshake classifies as Handshake");
+        };
+        assert_eq!(c.call, "l4.inject");
+        assert_eq!(c.prompt, "Inject 1 UDP to 127.0.0.1:7?");
+        assert_eq!(c.token, "tok-9");
+        assert_eq!(c.confirmed_args()["_confirm"], "tok-9");
+        assert_eq!(c.confirmed_args()["dst"], "127.0.0.1");
+        // A handshake without a string token cannot be completed.
+        assert_eq!(
+            WireConfirm::classify(
+                "l4.inject",
+                &args,
+                &json!({"status": "needs_confirmation", "prompt": "P"})
+            ),
+            ConfirmReply::Malformed
+        );
+        // A plain success is not a confirmation handshake.
+        assert_eq!(
+            WireConfirm::classify("l4.inject", &args, &json!({"injected": 1})),
+            ConfirmReply::Plain
+        );
+    }
 
     #[test]
     fn confirm_round_trip_adds_the_token() {

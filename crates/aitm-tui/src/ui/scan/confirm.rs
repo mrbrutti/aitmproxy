@@ -43,11 +43,19 @@ impl Family {
         }
     }
 
-    /// The tertiary line under the prompt.
-    fn footnote(self) -> &'static str {
+    /// The tertiary line under the prompt. The L4 line is a fact about
+    /// `l4.inject` (L4OPS-AC10); the same overlay also confirms an operator
+    /// `l4.scope.add` and the intercept verdicts (L4 parity spec §3, §4),
+    /// where that sentence would be false, so it is shown for the inject only.
+    fn footnote(self, call: &str) -> Option<&'static str> {
         match self {
-            Family::Scan => "Confirming starts the job now; x in Jobs cancels it at any time.",
-            Family::L4 => "This reaches the wire only through l4.inject; the guard enforces scope.",
+            Family::Scan => {
+                Some("Confirming starts the job now; x in Jobs cancels it at any time.")
+            }
+            Family::L4 if call == "l4.inject" => {
+                Some("This reaches the wire only through l4.inject; the guard enforces scope.")
+            }
+            Family::L4 => None,
         }
     }
 
@@ -103,10 +111,9 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!(" {}", family.footnote()),
-        theme.text_tertiary(),
-    ));
+    if let Some(footnote) = family.footnote(&c.call) {
+        lines.push(Line::styled(format!(" {footnote}"), theme.text_tertiary()));
+    }
     lines.push(Line::styled(
         " y confirm (re-issues with _confirm) · n / Esc cancel",
         theme.accent().add_modifier(Modifier::BOLD),

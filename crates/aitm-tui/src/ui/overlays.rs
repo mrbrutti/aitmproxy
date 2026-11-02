@@ -2,8 +2,6 @@
 //! the TUI"): the command palette, compose, the scope panel, the PoC findings
 //! panel, the agent panel with its activity log, quick-look and help.
 
-use std::sync::OnceLock;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -131,6 +129,15 @@ const FLOW_KEYS: &[(&str, &str)] = &[
         "F / S / @",
         "findings · scope · agent panels · :scan the Scan view (keys below)",
     ),
+    (
+        "L / :l4",
+        "L4 panel: capture / intercept availability and running captures",
+    ),
+    ("", ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]"),
+    (
+        "b / s / m / u",
+        "L4 craft pane: build · inject (guarded) · apply to parked packet · revert",
+    ),
     ("1-9 0 Tab", "content-type chips"),
     ("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
     (
@@ -144,13 +151,21 @@ const FLOW_KEYS: &[(&str, &str)] = &[
     ("y / o", "copy URL (OSC 52) · open externally"),
     (
         "/",
-        "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed · & | ! ( )",
+        "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed ~l4 ~tcp ~udp ~icmp · & | ! ( )",
     ),
     (":", "command palette, every bus tool plus:"),
 ];
 
 /// How many palette commands the help lists.
 const HELP_COMMANDS: usize = 14;
+
+/// The `:scope add l4` row (L4 parity spec §3 / AC39), listed after the
+/// palette commands only where the core can confirm an operator L4 scope
+/// add; against any other core help does not offer it.
+const SCOPE_ADD_L4_ROW: HelpRow = HelpRow::Command(
+    "scope add l4 …",
+    "Add an L4 scope entry: <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>",
+);
 
 /// The help overlay's closing line.
 const HELP_CLOSE: &str = " ↑↓ PgUp PgDn Home End scroll · any other key closes this help.";
@@ -174,39 +189,47 @@ enum HelpRow {
     Close,
 }
 
-/// Every row of the help overlay, in order, built once: the flow list's
-/// keys and palette commands, the Scan section (its key groups joined by
-/// [`key_text`] from the tabs' own tables, [`HELP`]), a blank and the
-/// closing line.
-fn help_rows() -> &'static [HelpRow] {
-    static ROWS: OnceLock<Vec<HelpRow>> = OnceLock::new();
-    ROWS.get_or_init(|| {
-        let mut rows = vec![HelpRow::Heading("Flow list")];
-        rows.extend(
-            FLOW_KEYS
-                .iter()
-                .map(|(key, what)| HelpRow::Key(key, (*what).to_string())),
-        );
-        rows.extend(
-            BUILTIN_COMMANDS
-                .iter()
-                .take(HELP_COMMANDS)
-                .map(|(cmd, detail)| HelpRow::Command(cmd, detail)),
-        );
-        rows.push(HelpRow::Heading("Scan"));
-        rows.extend(
-            HELP.iter()
-                .map(|(key, groups)| HelpRow::Key(key, key_text(groups))),
-        );
-        rows.push(HelpRow::Blank);
-        rows.push(HelpRow::Close);
-        rows
-    })
+/// Every row of the help overlay, in order: the flow list's keys and
+/// palette commands (plus [`SCOPE_ADD_L4_ROW`] when `scope_add_l4`, the
+/// one row that depends on the bus), the Scan section (its key groups
+/// joined by [`key_text`] from the tabs' own tables, [`HELP`]), a blank and
+/// the closing line. The reducer's scroll clamps and the view build the
+/// same table, so the count can never drift from what is drawn.
+fn help_rows(scope_add_l4: bool) -> Vec<HelpRow> {
+    let mut rows = vec![HelpRow::Heading("Flow list")];
+    rows.extend(
+        FLOW_KEYS
+            .iter()
+            .map(|(key, what)| HelpRow::Key(key, (*what).to_string())),
+    );
+    rows.extend(
+        BUILTIN_COMMANDS
+            .iter()
+            .take(HELP_COMMANDS)
+            .map(|(cmd, detail)| HelpRow::Command(cmd, detail)),
+    );
+    if scope_add_l4 {
+        rows.push(SCOPE_ADD_L4_ROW);
+    }
+    rows.push(HelpRow::Heading("Scan"));
+    rows.extend(
+        HELP.iter()
+            .map(|(key, groups)| HelpRow::Key(key, key_text(groups))),
+    );
+    rows.push(HelpRow::Blank);
+    rows.push(HelpRow::Close);
+    rows
+}
+
+/// Whether `app`'s bus can confirm an operator L4 scope add, the one fact
+/// the help table depends on.
+fn help_scope_add_l4(app: &App) -> bool {
+    crate::l4::supports_operator_scope_add(&app.tools)
 }
 
 /// [`help_rows`] styled for `theme`, one line per row.
-fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
-    help_rows()
+fn help_lines(theme: &Theme, scope_add_l4: bool) -> Vec<Line<'static>> {
+    help_rows(scope_add_l4)
         .iter()
         .map(|row| match row {
             HelpRow::Heading(title) => heading(theme, title),
@@ -233,9 +256,10 @@ fn help_box(screen: Rect, lines: usize) -> Rect {
 
 /// The furthest the help overlay scrolls on a `cols`x`rows` screen: the
 /// lines that do not fit inside its box (fix round G, G85). Zero when the
-/// screen is tall enough for all of them.
-pub fn help_scroll_max(cols: u16, rows: u16) -> usize {
-    let lines = help_rows().len();
+/// screen is tall enough for all of them. `scope_add_l4` is
+/// [`help_scope_add_l4`] for the app.
+pub fn help_scroll_max(cols: u16, rows: u16, scope_add_l4: bool) -> usize {
+    let lines = help_rows(scope_add_l4).len();
     let inner = help_box(Rect::new(0, 0, cols, rows), lines)
         .height
         .saturating_sub(2);
@@ -244,9 +268,9 @@ pub fn help_scroll_max(cols: u16, rows: u16) -> usize {
 
 /// The rows the help overlay shows at once on a `cols`x`rows` screen: its
 /// page for PgUp/PgDn.
-pub fn help_page(cols: u16, rows: u16) -> usize {
+pub fn help_page(cols: u16, rows: u16, scope_add_l4: bool) -> usize {
     usize::from(
-        help_box(Rect::new(0, 0, cols, rows), help_rows().len())
+        help_box(Rect::new(0, 0, cols, rows), help_rows(scope_add_l4).len())
             .height
             .saturating_sub(2),
     )
@@ -257,7 +281,7 @@ pub fn help_page(cols: u16, rows: u16) -> usize {
 /// `app.help_scroll` when the screen is too short for all of its lines,
 /// with a `more` marker on the cut edge (fix round G, G85).
 pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let lines = help_lines(theme);
+    let lines = help_lines(theme, help_scope_add_l4(app));
     let area = help_box(screen, lines.len());
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     if inner.height == 0 {
@@ -474,6 +498,42 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         for h in oos {
             lines.push(Line::styled(format!("   {h}"), theme.text_tertiary()));
         }
+    }
+    // The L4 scope (L4 parity spec §3, AC13): every `l4.scope.list` entry
+    // with its provenance; the add form only where the core can confirm it.
+    lines.push(Line::raw(""));
+    lines.push(heading(theme, "L4 scope"));
+    if app.l4.scope.is_empty() {
+        lines.push(Line::styled(
+            " no L4 scope: nothing is captured, injected or intercepted at L4.",
+            theme.text_tertiary(),
+        ));
+    }
+    for e in &app.l4.scope {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} {:<8} {:<20} {:<12} {:<9} {:<10}",
+                    glyph::SCOPE,
+                    fit(&e.interface, 8),
+                    fit(&e.cidr, 20),
+                    fit(&e.ports, 12),
+                    e.direction,
+                    e.capability
+                ),
+                theme.text_primary(),
+            ),
+            Span::styled(e.source.clone(), theme.text_tertiary()),
+        ]));
+    }
+    if crate::l4::supports_operator_scope_add(&app.tools) {
+        lines.push(Line::styled(
+            format!(
+                " {} (the core asks you to confirm)",
+                crate::l4::SCOPE_ADD_L4_USAGE.trim_start_matches("usage: ")
+            ),
+            theme.text_tertiary(),
+        ));
     }
     lines.push(Line::raw(""));
     let remove_note = if app.has_tool("scope.remove") {
@@ -806,7 +866,7 @@ pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         theme.text_tertiary(),
     ));
     lines.push(Line::styled(
-        " install/uninstall ask for a local y/N first: the bus has no confirm step until core follow-up F1.",
+        " install/uninstall ask for a local y/N before the call.",
         theme.text_tertiary(),
     ));
     lines_into(buf, inner, &lines, 0);
@@ -871,16 +931,29 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             Span::styled(format!(" {} ", glyph::AGENT), theme.agent()),
             Span::styled(
                 match app.agent.policy {
-                    Some(p) => format!("policy: {} · {} actions in the last minute · {} client(s)", p.label(), app.agent.actions_last_minute, app.agent.connected_clients),
-                    None => "agent.status is not on this bus (core follow-up F1): the toggle is read-only here".to_string(),
+                    Some(p) => format!(
+                        "policy: {} · {} actions in the last minute · {} client(s)",
+                        p.label(),
+                        app.agent.actions_last_minute,
+                        app.agent.connected_clients
+                    ),
+                    None => "agent policy not reported by agent.status".to_string(),
                 },
                 theme.text_primary(),
             ),
         ]),
         Line::raw(""),
         policy_line(AgentPolicy::All, "1", "the agent may call every tool"),
-        policy_line(AgentPolicy::ReadOnly, "2", "list/get/status only; mutations are refused"),
-        policy_line(AgentPolicy::Paused, "3", "every tools/call from MCP returns \"paused by operator\""),
+        policy_line(
+            AgentPolicy::ReadOnly,
+            "2",
+            "list/get/status only; mutations are refused",
+        ),
+        policy_line(
+            AgentPolicy::Paused,
+            "3",
+            "every tools/call from MCP returns \"paused by operator\"",
+        ),
         Line::raw(""),
     ];
     l4_capabilities(app, theme, &mut lines);
@@ -927,20 +1000,33 @@ mod tests {
     #[test]
     fn help_rows_are_the_lines_drawn() {
         let theme = Theme::new(true);
-        let lines = help_lines(&theme);
-        assert_eq!(help_rows().len(), lines.len());
-        assert_eq!(help_rows().first(), Some(&HelpRow::Heading("Flow list")));
-        assert_eq!(help_rows().last(), Some(&HelpRow::Close));
+        let lines = help_lines(&theme, false);
+        assert_eq!(help_rows(false).len(), lines.len());
+        assert_eq!(
+            help_rows(false).first(),
+            Some(&HelpRow::Heading("Flow list"))
+        );
+        assert_eq!(help_rows(false).last(), Some(&HelpRow::Close));
         assert!(
-            help_rows()
+            help_rows(false)
                 .iter()
                 .any(|r| matches!(r, HelpRow::Key("Jobs", w) if w == &key_text(&[crate::ui::scan::JOBS_KEYS]))),
             "the Scan section joins the Jobs table"
         );
+        // The operator L4 scope add row is the one bus-dependent row (L4
+        // parity spec §3 / AC39): one more line, right after the commands.
+        let with = help_rows(true);
+        assert_eq!(with.len(), lines.len() + 1);
+        assert!(!help_rows(false).contains(&SCOPE_ADD_L4_ROW));
+        assert_eq!(
+            with.iter().position(|r| *r == SCOPE_ADD_L4_ROW),
+            Some(1 + FLOW_KEYS.len() + HELP_COMMANDS)
+        );
         let tall = help_box(Rect::new(0, 0, 200, 50), lines.len());
         assert_eq!(usize::from(tall.height), lines.len() + 2);
-        assert_eq!(help_scroll_max(200, 50), 0);
-        assert_eq!(help_scroll_max(100, 30), lines.len() - 28);
-        assert_eq!(help_page(100, 30), 28);
+        assert_eq!(help_scroll_max(200, 50, false), 0);
+        assert_eq!(help_scroll_max(100, 30, false), lines.len() - 28);
+        assert_eq!(help_scroll_max(100, 30, true), lines.len() + 1 - 28);
+        assert_eq!(help_page(100, 30, false), 28);
     }
 }

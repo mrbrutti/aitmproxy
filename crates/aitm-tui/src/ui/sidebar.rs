@@ -183,7 +183,8 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let agent_count = match app.agent.policy {
         Some(AgentPolicy::Paused) => "paused".to_string(),
         Some(_) => format!("{}/min", app.agent.actions_last_minute),
-        None => "F1".to_string(),
+        // No policy reported by `agent.status`: missing is a dash (§2.8).
+        None => "—".to_string(),
     };
     line(buf, item(app, SidebarItem::Agent, Some(agent_count), true));
     // The Scan surface appears only when the bus offers a scanner (spec D2).
@@ -203,6 +204,17 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         }
         .unwrap_or_else(|| "-".to_string());
         line(buf, item(app, SidebarItem::Scan, Some(scan_count), false));
+    }
+    // The L4 panel row appears only when the bus offers `l4.capture.status`
+    // (L4 parity AC15); its count is the running captures, a dash when none.
+    if app.has_tool("l4.capture.status") {
+        let n = app.l4.captures.len();
+        let l4_count = if n > 0 {
+            n.to_string()
+        } else {
+            "—".to_string()
+        };
+        line(buf, item(app, SidebarItem::L4, Some(l4_count), false));
     }
 
     // Footer: the sidebar filter hint, pinned to the bottom.

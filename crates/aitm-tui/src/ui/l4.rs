@@ -10,7 +10,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::l4::{L4Flow, L4Pane};
+use crate::l4::{inert, L4Flow, L4Pane};
 use crate::text::{cells, truncate};
 use crate::theme::Theme;
 use crate::tokens::glyph;
@@ -18,6 +18,86 @@ use crate::ui::bars::{put, put_sides};
 use crate::ui::overlays::lines_into;
 use crate::ui::selection_bg;
 use crate::viewers;
+
+/// The L4 panel (`Mode::L4`, opened by `:l4` / `L`): the capture and
+/// intercept availability the status verbs report (L4 parity spec §1), the
+/// running captures and the capture commands (AC15). It renders **live state
+/// only**; the intercept line is the same documented-limited line the
+/// inspector's Intercept pane shows (AC11).
+pub fn panel(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    buf.set_style(area, theme.surface());
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut lines: Vec<Line> = vec![
+        Line::styled(" L4", theme.l4().add_modifier(Modifier::BOLD)),
+        Line::raw(""),
+    ];
+    // Spec §1: until the first reply the UI shows exactly the shared literal.
+    if app.l4.capture.is_pending() || app.l4.intercept.is_pending() {
+        lines.push(Line::styled(
+            format!(" {}", crate::l4::PENDING_REASON),
+            theme.text_tertiary(),
+        ));
+    }
+    for (label, a) in [
+        ("capture", &app.l4.capture),
+        ("intercept", &app.l4.intercept),
+    ] {
+        if a.is_pending() {
+            continue;
+        }
+        if a.available {
+            lines.push(Line::styled(format!(" {label}: available"), theme.l4()));
+        } else {
+            // The reason is the core's text: rendered inert (AC40 discipline).
+            let reason = inert(a.reason.as_deref().unwrap_or("unavailable"));
+            lines.push(Line::styled(
+                format!(" {label} unavailable — {reason}"),
+                theme.intercept_armed_quiet(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " running captures",
+        theme.accent().add_modifier(Modifier::BOLD),
+    ));
+    if app.l4.captures.is_empty() {
+        lines.push(Line::styled("   no running capture", theme.text_tertiary()));
+    } else {
+        for id in &app.l4.captures {
+            lines.push(Line::styled(
+                format!("   {}", inert(id)),
+                theme.text_primary(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    let hint = |cmd: &str, what: &str| {
+        Line::from(vec![
+            Span::styled(format!(" {cmd:<40}"), theme.accent()),
+            Span::styled(what.to_string(), theme.text_tertiary()),
+        ])
+    };
+    lines.push(hint(
+        ":l4 capture <iface> [inbound|outbound]",
+        "start a capture (refused while capture is unavailable)",
+    ));
+    // A typed `:l4 stop <id>` is refused locally while capture is unavailable
+    // (AC33), so the hint is offered only where it can act.
+    if app.l4.capture.available {
+        lines.push(hint(
+            ":l4 stop [<id>]",
+            "stop one running capture, or every one",
+        ));
+    }
+    lines.push(Line::styled(
+        " Esc back · : palette · ? help",
+        theme.text_tertiary(),
+    ));
+    lines_into(buf, area, &lines, 0);
+}
 
 /// Draw the L4 inspector for the selected flow into `area`.
 pub fn inspector(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
@@ -111,8 +191,15 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
     if area.height < 2 {
         return;
     }
+    // The packet list takes only the rows it has (at least one, at most 45 % of
+    // the pane), so the detail below (and its hex rows) gets the rest. A
+    // fixed split left the hex view one row at 200×60 and none at 160×44.
+    let cap = (area.height.saturating_mul(45) / 100).max(1);
+    let list_h = cells(flow.packets.len().max(1))
+        .min(cap)
+        .min(area.height.saturating_sub(2));
     let [list_area, detail_area] =
-        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
+        Layout::vertical([Constraint::Length(list_h), Constraint::Min(1)]).areas(area);
     // The packet list: dir arrow, length, decoded summary, injected tick.
     if flow.packets.is_empty() {
         buf.set_string(
@@ -179,16 +266,44 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
                 lines.push(Line::styled(l, style));
             }
             lines.push(Line::raw(""));
-            // `l4.flow.get` carries no raw bytes, so a captured packet has none;
-            // the hex view is honest about it (the craft pane shows crafted hex).
-            lines.push(Line::styled(
-                format!("hex: {} bytes", p.length),
-                theme.accent().add_modifier(Modifier::BOLD),
-            ));
-            lines.push(Line::styled(
-                "raw bytes are not carried by l4.flow.get: craft a packet (Craft pane) to preview its hex",
-                theme.text_tertiary(),
-            ));
+            // The §2 fields (time, proto, src→dst with ports, length, injected)
+            // on one line, the core's text made inert before it reaches the
+            // terminal, so the hex below keeps its rows on a normal terminal.
+            let mut fields: Vec<Span> = Vec::new();
+            for (i, (label, value)) in crate::l4::packet_fields(p).into_iter().enumerate() {
+                if i > 0 {
+                    fields.push(Span::styled(" · ", theme.text_tertiary()));
+                }
+                fields.push(Span::styled(format!("{label} "), theme.text_secondary()));
+                fields.push(Span::styled(inert(&value), theme.text_primary()));
+            }
+            lines.push(Line::from(fields));
+            lines.push(Line::raw(""));
+            // The on-wire bytes (spec §2.3 / AC40): every row through
+            // `hex_dump`, so no raw byte is ever written; absent `bytes` is
+            // said honestly (withheld for this caller under §2.2, or an older
+            // core), never shown as an empty packet.
+            match &p.bytes {
+                Some(bytes) => {
+                    lines.push(Line::styled(
+                        format!("hex: {} bytes", bytes.len()),
+                        theme.accent().add_modifier(Modifier::BOLD),
+                    ));
+                    for row in crate::l4::hex_dump(bytes) {
+                        lines.push(Line::styled(row, theme.text_primary()));
+                    }
+                }
+                None => {
+                    lines.push(Line::styled(
+                        format!("hex: {} bytes on the wire", p.length),
+                        theme.accent().add_modifier(Modifier::BOLD),
+                    ));
+                    lines.push(Line::styled(
+                        "no bytes from this core: withheld for this caller (spec §2.2) or an older l4.flow.get",
+                        theme.text_tertiary(),
+                    ));
+                }
+            }
         }
         None => lines.push(Line::styled("no packet selected", theme.text_tertiary())),
     }
@@ -205,10 +320,33 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     // The YAML editor (read + highlighted; editing lands via the command bus
     // and the palette today: the hook for in-pane Rhai craft is the
     // protocol-extensible seam, ui-ext §3.2).
+    // The parked-packet keys (spec §4 / AC12) are offered only when they can
+    // act: intercept available and a packet listed for this flow. Otherwise the
+    // header offers nothing that can only fail (AC33); the Intercept pane
+    // carries the documented-limited line.
+    let parked = if app.l4.intercept.available {
+        app.l4.parked_for(&flow.id)
+    } else {
+        None
+    };
+    // `s` is refused locally while `l4.capture.status` (capture + inject) says
+    // unavailable (L4 parity B10 / AC33); the hint says which it is.
+    let inject = if app.l4.capture.available {
+        "s inject (guarded)"
+    } else {
+        "s inject (unavailable)"
+    };
+    let header = match parked {
+        Some(p) => format!(
+            "PacketSpec (YAML): b build · {inject} · m apply to parked {} · u revert",
+            inert(&p.id)
+        ),
+        None => format!("PacketSpec (YAML): b build · {inject}"),
+    };
     buf.set_string(
         editor.x + 1,
         editor.y,
-        "PacketSpec (YAML): b build · s inject (guarded)",
+        header,
         theme.accent().add_modifier(Modifier::BOLD),
     );
     let body = Rect::new(
@@ -285,42 +423,56 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     lines_into(buf, pv, &lines, 0);
 }
 
-/// The Intercept pane: the in-path Forward/Mutate/Drop bar, feature-detected
-/// from `l4.intercept.*` (L4OPS-AC12); documented-limited when absent.
+/// The Intercept pane: the in-path Forward/Mutate/Drop bar (L4OPS-AC12; L4
+/// parity spec §4). While `l4.intercept.status` says unavailable it is **one
+/// documented-limited line with the core's `reason`** and no key hints
+/// (AC11). Otherwise it acts on the flow's first listed parked packet from
+/// `l4.intercept.list` (oldest first), whose id the verdict verbs send.
 fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buffer) {
     if area.height == 0 {
         return;
     }
-    let present = app.has_tool("l4.intercept.forward");
     let mut lines: Vec<Line> = Vec::new();
-    if !present {
+    let intercept = &app.l4.intercept;
+    if intercept.is_pending() {
         lines.push(Line::styled(
-            "In-path intercept is documented-limited here: this bus offers no l4.intercept.*",
-            theme.intercept_armed_quiet(),
-        ));
-        lines.push(Line::styled(
-            "(Linux NFQUEUE + CAP_NET_ADMIN; macOS is Phase 2 via the Network Extension.)",
+            crate::l4::PENDING_REASON,
             theme.text_tertiary(),
         ));
         lines_into(buf, area, &lines, 0);
         return;
     }
-    match flow.parked() {
+    if !intercept.available {
+        let reason = inert(intercept.reason.as_deref().unwrap_or("unavailable"));
+        lines.push(Line::styled(
+            format!("in-path intercept unavailable — {reason}"),
+            theme.intercept_armed_quiet(),
+        ));
+        lines_into(buf, area, &lines, 0);
+        return;
+    }
+    match app.l4.parked_for(&flow.id) {
         Some(p) => {
             // The amber intercept bar, mirroring the HTTP one, labelled a packet.
             let bar = Rect::new(area.x, area.y, area.width, 1);
             buf.set_style(bar, theme.intercept_bar());
+            let summary = if p.layers.is_empty() {
+                "raw".to_string()
+            } else {
+                p.layers.join(" / ")
+            };
             let left = Line::styled(
                 format!(
-                    " {} packet parked · {} {}B",
+                    " {} packet parked · {} {}B · id {}",
                     glyph::INTERCEPT,
-                    p.summary(),
-                    p.length
+                    inert(&summary),
+                    p.length,
+                    inert(&p.id)
                 ),
                 theme.intercept_bar(),
             );
             let right = Line::styled(
-                "[a Forward] [e Mutate] [d Drop] (confirm) ".to_string(),
+                "[a Forward] [e Mutate] [u Revert] [d Drop] (confirm) ".to_string(),
                 theme.intercept_bar(),
             );
             put_sides(buf, bar, left, right);
@@ -330,8 +482,18 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
                 area.width,
                 area.height.saturating_sub(1),
             );
+            if let Some(at) = p.parked_at {
+                lines.push(Line::styled(
+                    format!(
+                        "parked at {} · state {}",
+                        crate::l4::clock_ms(at),
+                        inert(&p.state)
+                    ),
+                    theme.text_secondary(),
+                ));
+            }
             for l in crate::l4::layer_tree_lines(&p.layers) {
-                lines.push(Line::styled(l, theme.text_primary()));
+                lines.push(Line::styled(inert(&l), theme.text_primary()));
             }
             if !app.l4.in_scope(flow) {
                 lines.push(Line::styled(
@@ -343,7 +505,7 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
         }
         None => {
             lines.push(Line::styled(
-                "No parked packet. Start an in-path session (l4.intercept.start) to park one.",
+                "no parked packet on this flow: l4.intercept.list shows none for it",
                 theme.text_tertiary(),
             ));
             lines_into(buf, area, &lines, 0);

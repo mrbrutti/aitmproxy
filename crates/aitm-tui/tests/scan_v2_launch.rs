@@ -795,6 +795,9 @@ fn a_replaced_scan_confirm_drops_its_pending_launch() {
     assert_eq!(app.mode, Mode::WireConfirm);
     assert!(app.scan.launch.pending.is_some());
 
+    // An L4 inject in flight (the handshake opens the overlay only for the
+    // pending call of its name, L4 parity spec §3).
+    app.l4.pending = Some(("l4.inject".to_string(), json!({ "flow": "l4-1" })));
     let _ = app.on_bus(BusEvent::CallOk {
         name: "l4.inject".into(),
         value: json!({ "status": "needs_confirmation", "prompt": "P2", "confirm_token": "tok-2" }),

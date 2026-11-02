@@ -34,8 +34,9 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         Mode::Ca => ca(key),
         Mode::Browser => browser(key),
         Mode::Scan => scan(key),
-        // Read-only: back, palette, help.
-        Mode::Config => panel(key),
+        // Read-only: back, palette, help. The L4 panel's verbs are the `:l4`
+        // commands (L4 parity AC15), so it is a read-only panel too.
+        Mode::Config | Mode::L4 => panel(key),
         Mode::WireConfirm => wire_confirm(key),
         // The arrow, page and Home/End keys scroll the help (fix round G,
         // G85), `:` goes straight to the palette, any other key closes it
@@ -207,6 +208,7 @@ fn flows(key: KeyEvent, ctrl: bool) -> Option<Action> {
         KeyCode::Char('S') => Action::OpenScope,
         KeyCode::Char('s') => Action::ToggleSysProxy,
         KeyCode::Char('@') => Action::OpenAgent,
+        KeyCode::Char('L') => Action::OpenL4,
         KeyCode::Char('l') => Action::ToggleLayout,
         KeyCode::Char('t') => Action::ToggleAutoSelect,
         KeyCode::Char('y') => Action::CopyUrl,
@@ -242,9 +244,12 @@ fn inspector(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Action::CopyUrl,
         KeyCode::Char('o') => Action::OpenExternally,
         KeyCode::Char('i') => Action::ToggleIntercept,
-        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject.
+        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject,
+        // m apply the craft spec to the parked packet, u revert that edit.
         KeyCode::Char('b') => Action::L4Build,
         KeyCode::Char('s') => Action::L4Inject,
+        KeyCode::Char('m') => Action::L4MutateParked,
+        KeyCode::Char('u') => Action::L4RevertParked,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('/') => Action::FilterOpen,
         KeyCode::Char('?') => Action::Help,
