@@ -35,6 +35,7 @@ sys.path.insert(0, E2E)
 from aitm_e2e import is_manual, pause  # noqa: E402
 from aitm_e2e.installed import (  # noqa: E402
     StepWriter,
+    field_center,
     app_version,
     append_leftover,
     audit_tail,
@@ -145,6 +146,22 @@ def open_scope_sheet() -> bool:
         if "Host to add to scope" in ax():
             return True
     return False
+
+
+SCOPE_FIELD_DESC = "Host to add to scope"
+SCOPE_FIELD_ID = "scope-add-host"   # the identifier the mac fix adds; the description is the fallback
+
+
+def click_scope_field() -> bool:
+    """Give the Edit Scope sheet's field the focus by clicking its centre (a real click through
+    System Events), located by accessibility identifier when present, else by description. The
+    sheet does not focus the field itself when Scope already has hosts (run 5, MAC-5)."""
+    centre = field_center(ax(), SCOPE_FIELD_DESC, SCOPE_FIELD_ID)
+    if centre is None:
+        return False
+    out = sh("bash", os.path.join(LIB, "click.sh"), str(centre[0]), str(centre[1]))
+    time.sleep(0.4)
+    return "clicked" in out
 
 
 def field_focused() -> bool:
@@ -264,7 +281,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         step("MAC-5", "PASS", f"both hosts were already in Scope before the run ({pre}); nothing typed, nothing to remove later", f"scope.list {sc}")
     elif not open_scope_sheet():
         step("MAC-5", "FAIL", "Proxy ▸ Scope… (twice) did not show the Edit Scope sheet's field 'Host to add to scope'; nothing typed")
-    elif not field_focused():
+    elif not (click_scope_field() and field_focused()):
         step("MAC-5", "FAIL", "the sheet's field did not take the focus probe (typed '1' not read back); refusing to type into an unknown target")
     else:
         for h in targets:
@@ -407,7 +424,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("N1-MAC", "SKIP", "needs the window and --manual (Restart Core, then an add within ~1 s after a focus re-probe)")
         else:
             sc_before = bus.call("scope.list", {})
-            n1 = is_manual() and open_scope_sheet() and field_focused()
+            n1 = is_manual() and open_scope_sheet() and click_scope_field() and field_focused()
             stop = threading.Event()
             if n1:
                 bounds = sh("bash", os.path.join(LIB, "ax_texts.sh"), "bounds").strip()
@@ -419,7 +436,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 # Re-probe the focus AFTER the restart press (one digit + AX read): the restart may have moved
                 # it. Seen → paste + Return (the add lands while the core is still coming back); not seen →
                 # send NOTHING more (a blind paste could land in a persisting field such as Settings' bypass).
-                n1_focus = field_focused()
+                n1_focus = click_scope_field() and field_focused()
                 if n1_focus:
                     type_text(N1_HOST, enter=True)
             time.sleep(6)
