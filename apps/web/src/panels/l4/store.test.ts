@@ -260,6 +260,47 @@ describe('L4 store: once-per-message failure log (spec §7(c))', () => {
     expect(h.notices.map(([t]) => t)).toEqual(['l4.flow.list: boom', 'l4.scope.list: scope closed', 'l4.scope.list: scope closed']);
   });
 
+  it('recovery is per call, not per verb: flow A\'s l4.flow.get failing on every tick while B\'s succeeds is noticed exactly once (fix 4)', async () => {
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => (a.id === 'A' ? new BusError('A broke') : flowWire('B')),
+      },
+    });
+    for (let i = 0; i < 3; i++) await h.store.refresh(true);
+    expect(h.argsOf('l4.flow.get').filter((a) => a.id === 'A')).toHaveLength(3);
+    expect(h.argsOf('l4.flow.get').filter((a) => a.id === 'B')).toHaveLength(3);
+    // B's success must not forget A's still-failing message.
+    expect(h.notices).toEqual([['l4.flow.get: A broke', 'error']]);
+    expect(h.store.rows().map((r) => r.id)).toEqual(['A', 'B']);
+  });
+
+  it('two flows failing with distinct messages, both recovering, then A failing again: A\'s message is logged again (fix 4)', async () => {
+    let broken = new Set(['A', 'B']);
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => (broken.has(String(a.id)) ? new BusError(`${a.id} broke`) : flowWire(String(a.id))),
+      },
+    });
+    await h.store.refresh(true);
+    expect(h.notices).toEqual([
+      ['l4.flow.get: A broke', 'error'],
+      ['l4.flow.get: B broke', 'error'],
+    ]);
+    broken = new Set();
+    await h.store.refresh(true);
+    expect(h.store.error()).toBeNull();
+    broken = new Set(['A']);
+    // A's recurrence is logged on the very pass it recurs (its own recovery re-armed it), …
+    await h.store.refresh(true);
+    expect(h.notices.map(([t]) => t)).toEqual(['l4.flow.get: A broke', 'l4.flow.get: B broke', 'l4.flow.get: A broke']);
+    // … and B's continuing success does not re-arm it again: still exactly once per recurrence.
+    await h.store.refresh(true);
+    await h.store.refresh(true);
+    expect(h.notices.map(([t]) => t)).toEqual(['l4.flow.get: A broke', 'l4.flow.get: B broke', 'l4.flow.get: A broke']);
+  });
+
   it('two distinct failure messages are each noticed once', async () => {
     h = harness({ replies: { 'l4.flow.list': new BusError('boom'), 'l4.scope.list': new BusError('scope closed') } });
     for (let i = 0; i < 3; i++) await h.store.refresh(true);
@@ -349,6 +390,45 @@ describe('L4 store: windowed reads (spec §2)', () => {
     expect(h.argsOf('l4.flow.get').filter((a) => a.offset === 2)).toHaveLength(1);
     expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
     expect(h.store.inspected()?.truncated).toBe(false);
+  });
+
+  it('the in-flight guard is per flow: a load-more on flow B is not dropped while flow A\'s read for the same next_offset is in flight (fix 4)', async () => {
+    const pkt = (n: number) => ({ dir: 'inbound' as const, length: n, injected: false, layers: ['IPv4', 'UDP'] });
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => {
+          const id = String(a.id);
+          if (a.limit === 0) return flowWire(id, { packet_count: 3 });
+          if (a.offset === 0) return flowWire(id, { packet_count: 3, packets: [pkt(1), pkt(2)], offset: 0, truncated: true, next_offset: 2 });
+          const tail = flowWire(id, { packet_count: 3, packets: [pkt(3)], offset: 2, truncated: false, next_offset: null });
+          return id === 'A' ? gate.then(() => tail) : tail;
+        },
+      },
+    });
+    await h.store.refresh();
+    await h.store.inspect('A');
+    const aMore = h.store.loadMore();
+    // The operator selects B (also truncated at the same next_offset) and clicks load more while A's read is still out.
+    await h.store.inspect('B');
+    await h.store.loadMore();
+    expect(h.argsOf('l4.flow.get').filter((a) => a.offset === 2)).toEqual([
+      { id: 'A', offset: 2, limit: 256 },
+      { id: 'B', offset: 2, limit: 256 },
+    ]);
+    expect(h.store.inspected()?.id).toBe('B');
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
+    // A's late reply belongs to a flow no longer shown: B's window is untouched.
+    release();
+    await aMore;
+    expect(h.store.inspected()?.id).toBe('B');
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
+    // And a second click for B's same window while nothing is in flight for it is still a no-op (complete).
+    const before = h.count('l4.flow.get');
+    await h.store.loadMore();
+    expect(h.count('l4.flow.get')).toBe(before);
   });
 
   it('loadMore releases its guard after a failed read, so the next click reads the same window again (tester pass 2)', async () => {
