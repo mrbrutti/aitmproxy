@@ -76,6 +76,7 @@ use url::Url;
 
 use crate::limits::{
     job_mark, CANARY_EVERY, MAX_AWAIT, MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS,
+    USER_AGENT,
 };
 use crate::session::{CanaryOutcome, SessionMonitor};
 use crate::{mutate, redact, session, url_norm};
@@ -403,15 +404,19 @@ impl HttpProbeHost {
 /// The source request of an origin-scoped point (amendment 38): `method`
 /// (`GET` when the point names none) to `url`, no body.
 ///
-/// The one header it carries is `host`, the authority the request addresses;
-/// everything else a probe needs is put on by [`mutate::build_request`], the
-/// session by [`session::apply_session`], and the HTTP version by the send
-/// options, which read the profile's `http.version` as every other send of
-/// this lane does. `None` when the URL names no host.
+/// It carries two headers: `host`, the authority the request addresses, and
+/// the lane's own `user-agent` ([`USER_AGENT`]), like every request the lane
+/// makes itself (`crawl::client::base_headers`). Nothing else is added later:
+/// [`mutate::build_request`] only rewrites the point and resyncs the body
+/// headers, [`session::apply_session`] puts on the session, and the HTTP
+/// version comes from the send options, which read the profile's
+/// `http.version` as every other send of this lane does. `None` when the URL
+/// names no host.
 fn origin_request(url: &Url, method: Option<&str>) -> Option<HttpRequest> {
     let (authority, path) = url_norm::parts(url)?;
     let mut headers = HeaderMap::new();
     headers.set("host", &authority);
+    headers.set("user-agent", USER_AGENT);
     Some(HttpRequest {
         method: method.unwrap_or("GET").to_string(),
         scheme: url.scheme().to_string(),
@@ -729,7 +734,9 @@ mod tests {
     };
 
     use crate::host::{HttpProbeHost, SessionMonitors};
-    use crate::limits::{job_mark, MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS};
+    use crate::limits::{
+        job_mark, MAX_HELD_FLOWS, MAX_LOST_MONITOR_IDS, MAX_SESSION_MONITORS, USER_AGENT,
+    };
     use crate::session::{CanaryRequest, SessionMonitor, SESSION_LOST_PREFIX};
     use crate::testutil::{captured_flow, request, response, FakeJob, ScriptedClient, JOB_ID};
 
@@ -1274,6 +1281,8 @@ mod tests {
         assert_eq!(req.authority, "t:8080");
         assert_eq!(req.path, "/");
         assert_eq!(req.headers.get("host"), Some("t:8080"));
+        // The lane's own user agent, like every request the lane makes itself.
+        assert_eq!(req.headers.get("user-agent"), Some(USER_AGENT));
         assert_eq!(req.version, aitm_core::HttpVersion::Http11);
         assert!(matches!(req.body, Body::Empty));
         assert_eq!(opts.marks, vec![job_mark(JOB_ID)]);
