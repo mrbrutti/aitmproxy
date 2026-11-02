@@ -22,6 +22,10 @@
 - `aitm-plugin-scanner/src/client.rs`: `JobClient` sends every probe through `send_probe`.
 - Tests: core `a_probe_s_5xx_answers_leave_the_host_enabled_but_its_transport_failures_disable_it` (N 503 answers via `send_probe` → still served; N transport failures → `HostDisabled`; N 503 via `send_opts` → `HostDisabled`); scanner `probes_go_out_through_send_probe_not_send_opts` (a counting stub).
 
+### Task 3: the sweep cell's probe budget covers the catalogue (e2e-only; T3's cell, coordinator informed)
+
+Live run on the fixed head 404cb613 (full parallel cells): 31 pass / 8 skip / 1 fail; `test_t3_h2_sender.py` and `test_t2_mutable_points.py` PASS under load (amendment 74 + 80 proof); `test_t3_catalogue_sweep.py` no longer stops on errors — it ends `stopped_reason: budget` at probes 2000 with 975/1052 checks done and `open-redirect` unreached, because the default 2000-probe budget is smaller than the fifteen-script catalogue. The cell now asks for `budget.probes: 8000` (ceiling 20 000) so the sweep runs its whole catalogue.
+
 ## Acceptance (orchestrator, Terminal)
 - Full workspace gate exit 0 (core change).
 - Live proof under the **parallel** full run (`python3 tests/e2e/run.py scan`, the load-dependent case): `test_t3_catalogue_sweep.py` reaches 1052/1052 checks without `stopped_reason: errors`; `test_t3_h2_sender.py` and `test_t2_mutable_points.py` see P probed; counts no worse than #292's final (28 / 8 / 4 → the three core reds green).
