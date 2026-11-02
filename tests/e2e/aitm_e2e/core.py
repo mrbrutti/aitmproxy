@@ -129,6 +129,14 @@ class Aitm:
         self._stdout_file = open(self._stdout_path, "wb")
         env = dict(os.environ)
         env.setdefault("RUST_LOG", "info")
+        # The core finds its bundled Rhai catalogue through `AITM_BUNDLED_SCRIPTS`,
+        # a `share/aitm/scripts` beside the executable, or a dev-checkout fallback
+        # relative to the executable. A binary built into /tmp (the private-target
+        # pattern) has none of those, so every e2e core would silently run with NO
+        # bundled scripts (umbrella amendment 60). Point it at the checkout unless
+        # the caller set the variable or turned the catalogue off.
+        if "AITM_NO_BUNDLED_SCRIPTS" not in env:
+            env.setdefault("AITM_BUNDLED_SCRIPTS", os.path.join(repo_root(), "scripts", "bundled"))
         # Audit is on by default: this sends the default file into the workdir so a run never touches the operator's own (a path, not `off`, so the cells still exercise the real writer).
         env["AITM_AUDIT_LOG"] = os.environ.get("AITM_E2E_AUDIT_LOG") or os.path.join(self.workdir, "audit.jsonl")
         self.proc = subprocess.Popen(
