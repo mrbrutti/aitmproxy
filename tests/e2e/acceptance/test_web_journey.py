@@ -11,8 +11,13 @@ replays the recorded per-service state in its trap if the surface did not restor
 
 Preconditions: 8080/8081/8082 free (the app quit) — else SKIP naming the holder; Google Chrome
 installed — else WEB-2…7 SKIP. The host WEB-3 adds is removed by the mjs through its row's own
-button (unless ACCEPT_KEEP_SCOPE=1) and listed in leftovers.txt.
-Exit 0 = all performed PASS, 77 = any SKIP/BLOCKED, 1 = any FAIL. Steps → $ACCEPT_OUT/web-steps.tsv.
+button (unless ACCEPT_KEEP_SCOPE=1) and listed in leftovers.txt; a host the operator's config.yaml
+`scope:` block lists (ACCEPT_PRE_SCOPE to the mjs) or the page already shows is pre-existing and
+never removed. Secrets: the card's `#t=` bearer values are added to the writer, appended to
+$ACCEPT_OUT/.secrets (0600, one per line) for run.sh's leak grep, and `aitm web`'s stderr reaches
+aitm-web.log through a redacting pump (post-processed once more at exit). WEB-9/10 and N1-WEB do
+not exist on this surface: `N/A` (spec D1). Exit 0 = all performed PASS (N/A counts as such),
+77 = any SKIP/BLOCKED, 1 = any FAIL. Steps → $ACCEPT_OUT/web-steps.tsv.
 """
 from __future__ import annotations
 
@@ -37,10 +42,13 @@ from aitm_e2e.installed import (  # noqa: E402
     audit_tail,
     bypass_applied,
     config_bypass,
+    config_scope_entries,
+    exit_on_term,
     port_holder,
     replay,
     scutil,
     service_state,
+    tooling_mentioned,
     yes_set,
 )
 
@@ -66,31 +74,31 @@ step = w.step
 
 
 def na_rows() -> None:
-    step("WEB-9", "SKIP", "no All Apps control on this surface", "", "UIs pending (per-host decryption decision)")
-    step("WEB-10", "SKIP", "no Apps view on this surface on 0.5.10")
-    step("N1-WEB", "SKIP", "aitm web owns its core: a core restart under an open tab is not performable here (words pinned in D7)")
+    step("WEB-9", "N/A", "no All Apps control on this surface", "", "UIs pending (per-host decryption decision)")
+    step("WEB-10", "N/A", "no Apps view on this surface on 0.5.10")
+    step("N1-WEB", "N/A", "aitm web owns its core: a core restart under an open tab is not performable here (words pinned in D7)")
     step("N3-WEB", "SKIP", "CA stays trusted (un-trusting is Matt's yes; words read from source)")
 
 
-def config_scope_empty() -> bool | None:
-    """True/False from the `scope:` block of the operator's config.yaml (only that block is read);
-    None when there is no config."""
-    p = os.path.join(DATA_DIR, "config.yaml")
-    if not os.path.exists(p):
-        return None
-    inside, entries = False, 0
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("scope:"):
-                inside = True
-                if "[" in line and line.split(":", 1)[1].strip() not in ("[]", ""):
-                    entries += 1
-                continue
-            if inside and line.strip() and not line.startswith(" "):
-                break
-            if inside and line.strip().startswith("- "):
-                entries += 1
-    return entries == 0
+def note_secret(value: str) -> None:
+    """A web bearer value: redacted by the writer from now on and appended to $ACCEPT_OUT/.secrets
+    (created 0600, one per line) so run.sh's leak grep knows it; run.sh shreds the file."""
+    if not value:
+        return
+    w.add_secret(value)
+    fd = os.open(os.path.join(OUT, ".secrets"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(value + "\n")
+
+
+def pump_redacted(src, dst) -> None:
+    """Copy `aitm web`'s stderr to the log file line by line through the writer's redaction."""
+    for line in src:
+        try:
+            dst.write(w.redact(line))
+            dst.flush()
+        except ValueError:  # the log was closed at the end of the cell while a last line arrived
+            return
 
 
 def read_card(proc: subprocess.Popen, deadline_s: float) -> tuple[list[str], str | None, str | None]:
@@ -130,6 +138,7 @@ def read_card(proc: subprocess.Popen, deadline_s: float) -> tuple[list[str], str
 
 
 def main() -> int:  # noqa: C901 — one journey, in the operator's order
+    exit_on_term()
     if not os.path.isfile(AITM):
         step("WEB-1", "SKIP", f"installed aitm not found at {AITM}")
         na_rows()
@@ -151,14 +160,18 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
     env.pop("AITM_AUDIT_LOG", None)
     env.setdefault("LANG", "en_US.UTF-8")
     set_by_us = False
-    with open(os.path.join(OUT, "aitm-web.log"), "w", encoding="utf-8") as log:
-        proc = subprocess.Popen([AITM, "web"], stdout=subprocess.PIPE, stderr=log, text=True, env=env, start_new_session=True)
+    pre_scope = config_scope_entries()  # his persisted hosts: pre-existing whatever the page shows
+    p: subprocess.Popen | None = None  # the node child, killed in the OUTER finally if it is still there
+    log_path = os.path.join(OUT, "aitm-web.log")
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.Popen([AITM, "web"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+        threading.Thread(target=pump_redacted, args=(proc.stderr, log), daemon=True).start()
         try:
             # WEB-1 — the ready card.
             card, op_url, agent_url = read_card(proc, 20)
             for u in (op_url, agent_url):
                 if u and "#t=" in u:
-                    w.add_secret(u.split("#t=", 1)[1].split("&", 1)[0])
+                    note_secret(u.split("#t=", 1)[1].split("&", 1)[0])
             shown = "\n".join(card)
             with open(os.path.join(OUT, "WEB-1.txt"), "w", encoding="utf-8") as f:
                 f.write(w.redact(shown))
@@ -166,7 +179,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             have = {label: bool(re.search(rx, shown, re.M)) for label, rx in CARD_WANT.items()}
             rules = sum(1 for ln in card if "────" in ln)
             have["two rules"] = rules == 2
-            scope_empty = config_scope_empty()
+            scope_empty = not pre_scope
             if scope_empty:
                 have["Scope line (Scope empty)"] = SCOPE_LINE in shown
             healthz = ""
@@ -188,10 +201,10 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             else:
                 yes = sorted(YES & {"WEB-4", "WEB-7"})
                 byp = config_bypass()
-                if "WEB-4" in yes and not any(t.lstrip("*.") in " ".join(byp) for t in ("*.anthropic.com", "claude.ai", "github.com")):
+                if "WEB-4" in yes and not tooling_mentioned(byp):
                     step("WEB-4", "SKIP", f"bypass list absent in config.yaml system_proxy.bypass ({byp or 'none'}); add it through Settings first")
                     yes = [x for x in yes if x not in ("WEB-4", "WEB-7")]
-                env2 = dict(env, ACCEPT_ROUTE_OPEN="1" if "WEB-4" in yes else "0", ACCEPT_OP_URL=op_url, ACCEPT_AGENT_URL=agent_url or "")
+                env2 = dict(env, ACCEPT_ROUTE_OPEN="1" if "WEB-4" in yes else "0", ACCEPT_OP_URL=op_url, ACCEPT_AGENT_URL=agent_url or "", ACCEPT_PRE_SCOPE=",".join(pre_scope))
                 with open(os.path.join(OUT, "web_journey.mjs.log"), "w", encoding="utf-8") as mlog:
                     p = subprocess.Popen(["node", os.path.join(HERE, "lib", "web_journey.mjs"), OUT, ",".join(yes), "manual" if is_manual() else ""],
                                          stdout=subprocess.PIPE, stderr=mlog, stdin=subprocess.PIPE, text=True, env=env2, start_new_session=True)
@@ -202,8 +215,9 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                             pause(rest)
                             p.stdin.write("\n")
                             p.stdin.flush()
+                        elif kind == "SET":
+                            set_by_us = True  # armed BEFORE the mjs clicks: a crash mid-click still restores
                         elif kind == "CHECK":
-                            set_by_us = True
                             ok = bypass_applied(scutil())
                             p.stdin.write("ok\n" if ok else "bad\n")
                             p.stdin.flush()
@@ -245,6 +259,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("WEB-8", "PASS" if free and same else "FAIL", f"exit {rc}; ports free {free}; scutil identical {same}; run/cores pointers left {left}", "audit: no proxy.system.set left unmatched" if same else "")
             na_rows()
         finally:
+            if p is not None and p.poll() is None:
+                os.killpg(p.pid, signal.SIGTERM)  # the node child (and its Chrome) on ANY exit path, not only the 60 s timeout
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
             if set_by_us:
@@ -255,6 +271,14 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             elif scutil() != before:
                 step("DRIFT", "FAIL", "the system proxy changed during the run by another actor; the harness set nothing and touched nothing — left as is", scutil()[:200])
             w.finish()
+    # The pump redacted with the secrets known at the time of each line; one more pass with every value learned since.
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(w.redact(text))
+    except OSError as e:
+        print(f"aitm-web.log post-redaction failed: {e}", flush=True)
     return w.exit_code()
 
 

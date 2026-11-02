@@ -13,7 +13,11 @@ app's core. MAC-8/10-12 and N1-MAC additionally need AITM_E2E_MANUAL=1 (a hand d
 Without them every such step is SKIP with the reason. The `yes` steps record `scutil`/per-service
 state first and replay it in a trap. Scope hosts the run adds are removed at the end through the
 Scope page's own "Remove <host> from Scope" button (unless ACCEPT_KEEP_SCOPE=1) and listed in
-leftovers.txt; hosts that were in Scope before are never touched.
+leftovers.txt; hosts that were in Scope before (bus `scope.list` read before typing) are never
+touched. When that button is not found the row's context menu is NOT attempted: the host is listed
+`failed (…)` for Matt's hand. Every accessibility dump written beside the steps goes through the
+writer's redaction (the embedded core's token values are added to it first). `set_by_us` is armed
+BEFORE the Set as System Proxy press, so a crash mid-press still restores.
 
 Exit 0 = all performed PASS, 77 = any SKIP/BLOCKED, 1 = any FAIL. Steps → $ACCEPT_OUT/mac-steps.tsv.
 """
@@ -37,6 +41,8 @@ from aitm_e2e.installed import (  # noqa: E402
     bus_truth,
     bypass_applied,
     connect,
+    embedded_secret_lines,
+    exit_on_term,
     find_embedded_core,
     keep_scope,
     port_holder,
@@ -45,6 +51,7 @@ from aitm_e2e.installed import (  # noqa: E402
     scutil,
     service_state,
     sh,
+    tooling_mentioned,
     window_open,
     yes_set,
 )
@@ -84,22 +91,42 @@ def menu(m: str, item: str) -> str:
     return sh("bash", os.path.join(LIB, "menu.sh"), m, item)
 
 
-def press(label: str) -> str:
-    return sh("bash", os.path.join(LIB, "ax_press.sh"), label)
+def press(label: str, prefix: bool = False) -> tuple[int, str]:
+    """(exit code, output) of ax_press.sh; 4 = no such button (nothing pressed)."""
+    argv = ["bash", os.path.join(LIB, "ax_press.sh")] + (["--prefix"] if prefix else []) + [label]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stdout + (("\n[stderr] " + r.stderr.strip()) if r.returncode else "")
 
 
-def type_text(text: str) -> str:
-    return sh("bash", os.path.join(LIB, "type.sh"), text)
+def type_text(text: str, enter: bool = True) -> str:
+    argv = ["bash", os.path.join(LIB, "type.sh")] + ([] if enter else ["--no-return"]) + [text]
+    return sh(*argv)
+
+
+def save_dump(name: str, text: str) -> None:
+    """An accessibility dump beside the steps, through the writer's redaction."""
+    with open(os.path.join(OUT, name), "w", encoding="utf-8") as f:
+        f.write(w.redact(text))
 
 
 def missing(text: str, *needles: str) -> list[str]:
     return [n for n in needles if n not in text]
 
 
+BYPASS_KEY = "systemProxy.bypass"  # SystemProxyPreferences.bypassKey (apps/mac/Sources/AitmproxyKit/SystemProxyPreferences.swift)
+
+
+def mac_bypass_field() -> str:
+    """The Settings ▸ Proxy "Bypass hosts" field as stored (the ONE key, not the whole defaults
+    domain); empty when the key has never been written (the app then shows its recommended
+    default, but the D2 reading is the stored key)."""
+    r = subprocess.run(["defaults", "read", "com.mrbrutti.aitmproxy", BYPASS_KEY], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def mac_bypass_ok() -> bool:
     """The app passes its Settings ▸ Proxy "Bypass hosts" field: a tooling host must be in it."""
-    d = sh("defaults", "read", "com.mrbrutti.aitmproxy")
-    return any(t.lstrip("*.") in d for t in ("*.anthropic.com", "claude.ai", "github.com"))
+    return tooling_mentioned(mac_bypass_field())
 
 
 def core_holds_8080(core) -> str | None:
@@ -121,12 +148,14 @@ def open_scope_sheet() -> bool:
 
 
 def field_focused() -> bool:
-    """Type one harmless digit, read it back from the text field, clear it."""
+    """Type one harmless digit, read it back from the text field, clear it. When the digit is NOT
+    read back the focus is somewhere unknown: nothing more is sent there (no ⌘A/Delete either)."""
     sh("bash", os.path.join(LIB, "type.sh"), "--probe")
     time.sleep(0.3)
     dump = ax()
     ok = any(r.startswith("AXTextField") and "\t1\t" in r for r in dump.splitlines())
-    sh("bash", os.path.join(LIB, "type.sh"), "--clear")
+    if ok:
+        sh("bash", os.path.join(LIB, "type.sh"), "--clear")
     return ok
 
 
@@ -141,6 +170,7 @@ def capture_loop(stop: threading.Event, folder: str, bounds: str) -> None:
 
 
 def main() -> int:  # noqa: C901 — one journey, in the operator's order
+    exit_on_term()
     step("MAC-0", "SKIP", "release run only; brew upgrade is Matt's")
     step("N3-MAC", "SKIP", "CA stays trusted (un-trusting is Matt's yes; words read from source)")
     step("N4-MAC", "SKIP", "needs a plain 8080 listener before launch — yes (it blocks his app's core)")
@@ -157,6 +187,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         w.finish()
         return w.exit_code()
     w.add_secret(core.operator_token)
+    for sec in embedded_secret_lines(core):
+        w.add_secret(sec)
     bus = connect(core)
     truth0 = bus_truth(bus)
     ps = truth0.get("proxy.status", {})
@@ -166,8 +198,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
 
     # Read-only AX dump of whatever the window shows, for the report (no press).
     dump = ax()
-    with open(os.path.join(OUT, "MAC-ax-initial.txt"), "w", encoding="utf-8") as f:
-        f.write(dump)
+    save_dump("MAC-ax-initial.txt", dump)
     sc = truth0.get("scope.list", [])
     cap = truth0.get("capture.status", {})
     sp = truth0.get("proxy.system.status", {})
@@ -188,8 +219,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         menu("Proxy", "Status")
         time.sleep(1.2)
         dump = ax()
-        with open(os.path.join(OUT, "MAC-3-ax.txt"), "w", encoding="utf-8") as f:
-            f.write(dump)
+        save_dump("MAC-3-ax.txt", dump)
         lanes = "; lane words: " + ", ".join(f"'{wd}' {wd in dump}" for wd in ("running", "connected", "operator ·"))
         if "Paste the operator token in Settings ▸ Bus" in dump:
             lanes += "; ROLE-WARNING lane present (connected as <role>)"
@@ -243,8 +273,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             time.sleep(2.0)
         sc2 = bus.call("scope.list", {})
         dump = ax()
-        with open(os.path.join(OUT, "MAC-5-ax.txt"), "w", encoding="utf-8") as f:
-            f.write(dump)
+        save_dump("MAC-5-ax.txt", dump)
         listed = [h for h in targets if h in sc2]
         shown = [h for h in targets if h in dump]
         pend = [x for x in PENDING_WORDS if x in dump]
@@ -262,13 +291,14 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         if "MAC-6" not in YES or not WINDOW:
             step("MAC-6", "SKIP", "needs Matt's yes (ACCEPT_YES=MAC-6) and the window")
         elif not mac_bypass_ok():
-            step("MAC-6", "SKIP", "bypass list absent in the app's Settings ▸ Proxy Bypass hosts; add the operator's tooling there first")
+            fld = mac_bypass_field()
+            step("MAC-6", "SKIP", "bypass list absent in the app's Settings ▸ Proxy Bypass hosts" + (f" (defaults key {BYPASS_KEY} = {fld[:80]!r})" if fld else f" (defaults key {BYPASS_KEY} never written: the field shows the app's recommended default, but the D2 reading is the stored key — save the field once in Settings)") + "; add the operator's tooling there first")
         elif hold:
             step("MAC-6", "SKIP", hold)
         else:
             print(f"== window MAC-6 start {time.strftime('%H:%M:%S')}", flush=True)
+            set_by_us = True  # armed BEFORE the press: a crash mid-press still reaches the restore trap
             pressed = menu("Proxy", "Set as System Proxy")
-            set_by_us = True
             time.sleep(3)
             sp2 = bus.call("proxy.system.status", {})
             sc_now = scutil()
@@ -336,14 +366,13 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         elif not WINDOW:
             step("MAC-9a", "SKIP", f"needs the window to read the Apps sidebar; expected group names {[CLIENT_NAMES.get(a, a.rsplit('.', 1)[-1]) for a in apps]}", tr9)
         else:
-            press("Apps")
+            prc, pout = press("Apps", prefix=True)  # the sidebar title may carry a count ("Apps 3")
             time.sleep(1.2)
             dump = ax()
-            with open(os.path.join(OUT, "MAC-9a-ax.txt"), "w", encoding="utf-8") as f:
-                f.write(dump)
+            save_dump("MAC-9a-ax.txt", dump)
             names = [CLIENT_NAMES.get(a, a.rsplit(".", 1)[-1]) for a in apps]
             rows_seen = {n: any(n in ln and any(ch.isdigit() for ch in ln) for ln in dump.splitlines()) for n in names}
-            step("MAC-9a", "PASS" if names and all(rows_seen.values()) and all(r.get("source_app") for r in ne) else "FAIL", f"Apps rows with a count: {rows_seen}; chevrons present {('Expand ' in dump) or ('Collapse ' in dump)}", tr9, "" if all(rows_seen.values()) else "#272 Apps tree (in 0.5.11) / mac-app-icons-and-names spec decides WebKit Networking vs Safari")
+            step("MAC-9a", "PASS" if prc == 0 and names and all(rows_seen.values()) and all(r.get("source_app") for r in ne) else "FAIL", f"sidebar press: {pout.strip()[:80] if prc == 0 else f'no Apps button (exit {prc})'}; Apps rows with a count: {rows_seen}; chevrons present {('Expand ' in dump) or ('Collapse ' in dump)}", tr9, "" if all(rows_seen.values()) else "#272 Apps tree (in 0.5.11) / mac-app-icons-and-names spec decides WebKit Networking vs Safari")
         if proxied:
             attributed = sum(1 for r in proxied if r.get("source_app"))
             step("MAC-9b", "PASS" if attributed == len(proxied) else "FAIL", f"{len(proxied)} proxied rows, {attributed} carry a source_app → Apps sidebar shows {'them' if attributed else 'NOTHING for them'}", f"flow.table source_app null ×{len(proxied) - attributed}", "" if attributed else "missing feature: attribution for proxied flows (session core-name-the-client-app)")
@@ -385,8 +414,13 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 threading.Thread(target=capture_loop, args=(stop, os.path.join(OUT, "N1-frames"), bounds), daemon=True).start()
                 time.sleep(0.5)
             menu("Proxy", "Restart Core")
+            n1_focus = None
             if n1:
-                type_text(N1_HOST)  # lands within the 300 ms window: menu.sh returns as soon as the click is dispatched
+                # Re-probe the focus AFTER the restart press (one digit + AX read): the restart may have moved
+                # it. Seen → paste + Return (the add lands while the core is still coming back); not seen →
+                # paste WITHOUT Return, nothing is submitted into an unknown target.
+                n1_focus = field_focused()
+                type_text(N1_HOST, enter=n1_focus)
             time.sleep(6)
             stop.set()
             core2 = None
@@ -397,8 +431,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             bus2 = connect(core2) if core2 else None
             sc_after = bus2.call("scope.list", {}) if bus2 else None
             dump = ax()
-            with open(os.path.join(OUT, "MAC-13-ax.txt"), "w", encoding="utf-8") as f:
-                f.write(dump)
+            save_dump("MAC-13-ax.txt", dump)
             kept = sc_after is not None and all(h in sc_after for h in sc_before)
             ok = bus2 is not None and bus2.call("proxy.status", {}).get("listening") is True and kept
             step("MAC-13", "PASS" if ok and "Embedded core failed" not in dump else "FAIL", f"new core pid {core2.pid if core2 else None}; Scope rows kept {kept}; stale failed banner present {'Embedded core failed' in dump}", f"scope.list before {sc_before} after {sc_after}")
@@ -406,6 +439,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 step("N1-MAC", "SKIP", "needs --manual (a hand watches the restart) — the restart itself ran as MAC-13")
             elif not n1:
                 step("N1-MAC", "SKIP", "the Edit Scope sheet did not open / take focus before the restart; no add attempted")
+            elif not n1_focus:
+                step("N1-MAC", "SKIP", f"the focus probe after Restart Core was not seen in the sheet's field; {N1_HOST} was pasted WITHOUT Return (nothing submitted) — clear the field by hand if it is still there; frames in N1-frames/", f"scope.list after restart {sc_after}")
             else:
                 landed = bool(sc_after) and N1_HOST in sc_after
                 if landed:
@@ -422,6 +457,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 bus = bus2
                 core = core2
                 w.add_secret(core2.operator_token)
+                for sec in embedded_secret_lines(core2):
+                    w.add_secret(sec)
 
         # MAC-14 — Stop Capturing (yes; only if we turned it on).
         hold = core_holds_8080(core)
@@ -462,19 +499,27 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 for h in added:
                     append_leftover(OUT, h, "kept", "mac")
             else:
+                done: set[str] = set()
                 try:
-                    menu("Proxy", "Scope…")
+                    menu("Proxy", "Scope…")  # the page; the row's context menu is never attempted (a hand's job)
                     time.sleep(1.0)
                     for h in added:
                         if h in scope_before:
+                            done.add(h)
                             continue
-                        press(f"Remove {h} from Scope")
+                        prc, pout = press(f"Remove {h} from Scope")
+                        if prc != 0:
+                            append_leftover(OUT, h, f"failed (no 'Remove {h} from Scope' button on the Scope page: {pout.strip().splitlines()[-1][:80] if pout.strip() else f'exit {prc}'}; remove by hand)", "mac")
+                            done.add(h)
+                            continue
                         time.sleep(1.5)
                         now = bus.call("scope.list", {})
-                        append_leftover(OUT, h, "removed" if h not in now else "failed", "mac")
+                        append_leftover(OUT, h, "removed" if h not in now else "failed (pressed, still in scope.list)", "mac")
+                        done.add(h)
                 except Exception as e:  # noqa: BLE001 — the report lists what is left
                     for h in added:
-                        append_leftover(OUT, h, f"failed ({type(e).__name__})", "mac")
+                        if h not in done:
+                            append_leftover(OUT, h, f"failed ({type(e).__name__}: {str(e)[:60]})", "mac")
         if set_by_us:
             print("== restore trap: MAC-6 set the system proxy and MAC-15 did not restore it; Restore via the app, then replay the recorded state", flush=True)
             try:

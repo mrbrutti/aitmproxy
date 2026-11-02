@@ -6,9 +6,12 @@
 //   ACCEPT_OP_URL=<operatorUrl> [ACCEPT_AGENT_URL=<webUiUrl>] node web_journey.mjs <outdir> <yesList> [manual]
 // The URLs carry web bearers (#t=…): they travel in the environment, never argv, never stdout.
 //
-// Driven here: WEB-2, WEB-3 (+ N2-WEB read right after), WEB-4/7 (`yes`, only when the yes list
-// names them; after WEB-4 the wrapper is asked to verify the bypass — `CHECK\tWEB-4` → `ok`/`bad`
-// on stdin — and on `bad` the same menu item restores at once), WEB-5 and WEB-6b/c (hand steps:
+// Driven here: WEB-2, WEB-3 (+ N2-WEB read right after; a candidate host named in ACCEPT_PRE_SCOPE —
+// the operator's config.yaml `scope:` block — or already shown on the page is pre-existing and is
+// neither added nor removed), WEB-4/7 (`yes`, only when the yes list names them; `SET\tWEB-4` is
+// printed right BEFORE the click so the wrapper arms its restore trap first; after WEB-4 the
+// wrapper is asked to verify the bypass — `CHECK\tWEB-4` → `ok`/`bad` on stdin — and on `bad`
+// the same menu item restores at once), WEB-5 and WEB-6b/c (hand steps:
 // `PAUSE\t<text>` → the wrapper pauses and answers with a newline; the rows are then judged from
 // the page, the web cell has no bus client), WEB-6a/6d, N5-WEB (the Web UI's agent URL with
 // `&expect=operator`), and the Scope cleanup: exactly the host WEB-3 added is removed through its
@@ -28,6 +31,7 @@ const YES = new Set(yesList.split(',').filter(Boolean));
 const isManual = manual === 'manual';
 const routeOpen = process.env.ACCEPT_ROUTE_OPEN === '1';
 const keepScope = process.env.ACCEPT_KEEP_SCOPE === '1';
+const preScope = new Set((process.env.ACCEPT_PRE_SCOPE || '').split(',').filter(Boolean));
 const redact = (s) => String(s).replace(/#t=[^&\s"]+/g, '#t=<redacted>');
 const log = (m) => console.error(`[web] ${redact(m)}`);
 const step = (id, result, observed = '') => console.log(['STEP', id, result, redact(observed).replace(/\s+/g, ' ').slice(0, 300)].join('\t'));
@@ -72,9 +76,9 @@ try {
   const candidates = [process.env.ACCEPT_HOST || 'example.com', 'httpbin.org', 'acceptance-web.invalid'];
   let host = '';
   const preListed = [];
-  for (const c of candidates) { if (await hostListed(c)) preListed.push(c); else { host = c; break; } }
+  for (const c of candidates) { if (preScope.has(c) || await hostListed(c)) preListed.push(c); else { host = c; break; } }
   if (!host) {
-    step('WEB-3', 'SKIP', `every candidate host is already in Scope (${preListed.join(', ')}); nothing added`);
+    step('WEB-3', 'SKIP', `every candidate host is already in Scope (${preListed.join(', ')}; config.yaml or page); nothing added`);
   } else {
     await d.click({ sel: 'input[aria-label="Add host to scope"]' });
     await d.type(host);
@@ -101,11 +105,12 @@ try {
   } else {
     log(`window WEB-4 start ${new Date().toISOString()}`);
     await openPillMenu();
+    console.log('SET\tWEB-4');   // the wrapper arms set_by_us BEFORE the click lands
+    setByUs = true;
     await d.click({ role: 'menuitem', text: 'Set as system proxy' });
     let word = '';
     for (let i = 0; i < 30 && !/sys-proxy → us/.test(word); i++) { await sleep(500); word = await pillWord(); }
     await d.shot('WEB-4');
-    setByUs = true;
     const verdict = (await ask('CHECK', 'WEB-4')).trim();
     if (/sys-proxy → us/.test(word) && verdict === 'ok') {
       step('WEB-4', 'PASS', `pill word "${word.trim()}"; ExceptionsList carries the tooling (wrapper check ok)`);
@@ -196,7 +201,7 @@ try {
       console.log(`LEFTOVER\t${addedHost}\t${removed ? 'removed' : 'failed'}`);
     }
   }
-  writeFileSync(join(outdir, 'WEB-dom.txt'), await d.ev('document.body.innerText'));
+  writeFileSync(join(outdir, 'WEB-dom.txt'), redact(await d.ev('document.body.innerText')));
 
   // N5-WEB — the agent URL with &expect=operator must show the role-mismatch banner.
   if (!agentUrl) {

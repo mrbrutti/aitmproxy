@@ -12,8 +12,12 @@ after the flip the cell asserts `scutil --proxy` ExceptionsList carries them or 
 A restore trap replays the recorded per-service state. `hand` steps (TUI-4 Safari) pause only with
 AITM_E2E_MANUAL=1. The host TUI-2 adds is removed before quitting through the TUI's own
 `:scope rm <host>` (the same path the Scope panel's `d` takes, but it names the host, so it can
-never remove the operator's own entry) unless ACCEPT_KEEP_SCOPE=1; leftovers.txt lists it.
-Exit 0 = all performed PASS, 77 = any SKIP/BLOCKED, 1 = any FAIL. Steps → $ACCEPT_OUT/tui-steps.tsv.
+never remove the operator's own entry) unless ACCEPT_KEEP_SCOPE=1; leftovers.txt lists it. A host
+is PRE-EXISTING (never removed) when the operator's config.yaml `scope:` block lists it OR the
+Scope panel shows it before the add (a late render alone must not decide). Steps that do not
+exist on this surface (TUI-9/10, N1-TUI) are `N/A` (spec D1). Every screen saved beside the steps
+goes through the writer's redaction. Exit 0 = all performed PASS (N/A counts as such), 77 = any
+SKIP/BLOCKED, 1 = any FAIL. Steps → $ACCEPT_OUT/tui-steps.tsv.
 """
 from __future__ import annotations
 
@@ -33,12 +37,15 @@ from aitm_e2e.installed import (  # noqa: E402
     audit_tail,
     bypass_applied,
     config_bypass,
+    config_scope_entries,
+    exit_on_term,
     keep_scope,
     port_holder,
     replay,
     scutil,
     service_state,
     sh,
+    tooling_mentioned,
     yes_set,
 )
 from aitm_e2e.tui_pty import Terminal  # noqa: E402
@@ -63,18 +70,20 @@ def audit_since(t0_ms: int) -> list[dict]:
 
 
 def save(name: str, text: str) -> None:
+    """A screen beside the steps, through the writer's redaction (no secret value, no `#t=`)."""
     with open(os.path.join(OUT, name), "w", encoding="utf-8") as f:
-        f.write(text)
+        f.write(w.redact(text))
 
 
 def na_rows() -> None:
-    step("TUI-9", "SKIP", "no All Apps control on this surface", "", "UIs pending (per-host decryption decision)")
-    step("TUI-10", "SKIP", "no Apps view on this surface on 0.5.10")
-    step("N1-TUI", "SKIP", "aitm tui owns its core on 0.5.10; the app's restart is seen only from aitm-tui --bus")
+    step("TUI-9", "N/A", "no All Apps control on this surface", "", "UIs pending (per-host decryption decision)")
+    step("TUI-10", "N/A", "no Apps view on this surface on 0.5.10")
+    step("N1-TUI", "N/A", "aitm tui owns its core on 0.5.10; the app's restart is seen only from aitm-tui --bus")
     step("N3-TUI", "SKIP", "CA stays trusted (un-trusting is Matt's yes; words read from source)")
 
 
 def main() -> int:  # noqa: C901 — one journey, in the operator's order
+    exit_on_term()
     if not os.path.isfile(AITM):
         step("TUI-1", "SKIP", f"installed aitm not found at {AITM}")
         na_rows()
@@ -90,6 +99,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             return w.exit_code()
 
     before_scutil, before_svc = scutil(), service_state()
+    config_scope = config_scope_entries()  # his persisted hosts: pre-existing whatever the panel has rendered so far
     t0 = int(time.time() * 1000)
     env = dict(os.environ)
     env.pop("AITM_AUDIT_LOG", None)
@@ -135,7 +145,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         term.press("S", 0.5)
         panel = term.text()
         scope_empty = "Scope is empty — every flow is dimmed and read-only. Press a to add a host." in panel
-        pre_existing = re.search(r"(^|\s)" + re.escape(HOST) + r"(\s|$)", panel, re.M) is not None
+        on_panel = re.search(r"(^|\s)" + re.escape(HOST) + r"(\s|$)", panel, re.M) is not None
+        pre_existing = HOST in config_scope or on_panel   # config OR surface: never remove his own host
         term.press("a", 0.3)
         prompt = term.wait_for(r"scope add:", 3)
         hint = "host · host:port · *.wildcard — a human action" in term.text()
@@ -148,7 +159,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         listed = re.search(r"(^|\s)" + re.escape(HOST) + r"(\s|$)", term.text(), re.M) is not None
         save("TUI-2.txt", term.text())
         if prompt and hint and toast and ok_rows and listed and count:
-            step("TUI-2", "PASS", f"prompt + hint shown, toast `Scope + {HOST}`, panel lists it, status bar ` · {count.group(1)} in scope`; Scope-empty words before: {scope_empty}" + ("; the host was ALREADY in Scope before the run (not removed at the end)" if pre_existing else ""), f"audit scope.add ok at {ok_rows[-1]['at']} (origin {ok_rows[-1].get('origin')}); bus truth: audit only")
+            step("TUI-2", "PASS", f"prompt + hint shown, toast `Scope + {HOST}`, panel lists it, status bar ` · {count.group(1)} in scope`; Scope-empty words before: {scope_empty}" + (f"; the host was ALREADY in Scope before the run (config.yaml {HOST in config_scope}, panel {on_panel}; not removed at the end)" if pre_existing else ""), f"audit scope.add ok at {ok_rows[-1]['at']} (origin {ok_rows[-1].get('origin')}); bus truth: audit only")
         else:
             step("TUI-2", "FAIL", f"prompt {prompt}, hint {hint}, toast {toast}, listed {listed}, in-scope count {count.group(0) if count else None}, audit scope.add ok {len(ok_rows)}", json.dumps(rows[-3:])[:200])
         term.press("\x1b", 0.4)
@@ -169,7 +180,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("TUI-3", "SKIP", "needs Matt's yes (ACCEPT_YES=TUI-3)")
         else:
             byp = config_bypass()
-            if not any(t.lstrip("*.") in " ".join(byp) for t in ("*.anthropic.com", "claude.ai", "github.com")):
+            if not tooling_mentioned(byp):
                 step("TUI-3", "SKIP", f"bypass list absent in config.yaml system_proxy.bypass ({byp or 'none'}); add it through the surface's Settings first")
             else:
                 print(f"== window TUI-3 start {time.strftime('%H:%M:%S')}", flush=True)
@@ -279,8 +290,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("RESTORE", "PASS" if same and not errs else "FAIL", f"replayed recorded state; identical {same}; errors {errs}")
         elif scutil() != before_scutil:
             step("DRIFT", "FAIL", "the system proxy changed during the run by another actor; the harness set nothing and touched nothing — left as is", scutil()[:200])
-        with open(os.path.join(OUT, "tui-raw.txt"), "wb") as f:
-            f.write(bytes(term.raw))
+        save("tui-raw.txt", bytes(term.raw).decode("utf-8", "replace"))
         w.finish()
     return w.exit_code()
 
