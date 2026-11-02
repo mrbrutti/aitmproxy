@@ -159,13 +159,17 @@ for (const f of readdirSync(SHOTS)) if (f.endsWith('.png')) rmSync(join(SHOTS, f
 let target, env, bus, cdp, d;
 let toolDefs = [];
 
-/** Runs one step; a step with no PASS/FAIL line of its own passes unless its body threw. Ends with a screenshot. */
+/**
+ * Runs one step. A body that recorded nothing but notes passes as a whole; a body that recorded any
+ * PASS / FAIL / BLOCKED line is its own recorder (a step whose only line is `blocked: needs D0` is
+ * blocked, not passed). A thrown error fails the step. Ends with a screenshot.
+ */
 async function step(name, body) {
   log(`\n== ${name}`);
   const before = results.length;
   try {
     await body();
-    if (!results.slice(before).some((r) => r.status === 'PASS' || r.status === 'FAIL')) pass(name);
+    if (!results.slice(before).some((r) => r.status === 'PASS' || r.status === 'FAIL' || r.status === 'BLOCKED')) pass(name);
   } catch (e) {
     fail(name, redact(e.message.split('\n')[0]));
   } finally {
