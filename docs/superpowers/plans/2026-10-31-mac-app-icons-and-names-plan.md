@@ -5,7 +5,9 @@
 (approved 2026-10-31, revision 2, amended 2026-11-01; acceptance criteria AI-AC1 … AI-AC24)
 **Branch / worktree:** `feat/mac-app-icons-and-names` in this worktree
 (`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), cut 2026-11-01 off `main 681dff57`
-(the traffic-route PR #265 merge; the original base was `main 8e19c2e3`)
+(the traffic-route PR #265 merge; the original base was `main 8e19c2e3`). **Kit half merged as PR #268 → `ce854397`.**
+**Wave C branch:** `feat/mac-app-icons-ui`, cut 2026-11-01 off `main c65ed0f2` (system-proxy PR 4 #269 merge, the gate for
+Tasks 5/6 per the orchestrator's ruling); Tasks 5, 6 and 8 ship from it as the second PR.
 (PR #196 `5eac2a50` is the last owner of `Shell/SidebarView.swift` and `Bus/BusService.swift`; PR #197
 `9776a0e6` moved `Session.swift`'s navigation enums out).
 **PR shape:** two PRs from this branch — the traffic-route plan
@@ -29,7 +31,10 @@ traffic-route plan's Tasks 2/2b and run only after them, never concurrently.
    the fixture-removal PR touched last).
 4. **The traffic-route PR is merged** (record its merge SHA here: **`681dff57`**, PR #265, 2026-11-01) and this branch's
    second PR is cut on top of it (`feat/mac-app-icons-and-names` off `681dff57`). Orchestrator ruling 2026-11-01: Tasks 5/6 also
-   wait for system-proxy PR 4 (it owns the `BusService` poll loop Task 6 enriches); the orchestrator says when it is in. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
+   wait for system-proxy PR 4 (it owns the `BusService` poll loop Task 6 enriches) — **merged as #269 `c65ed0f2`**; Wave C runs
+   in readiness order with the L4 parity mac unit (d) phase 2 (`Session.swift`, `Session+Verbs.swift`, `BusService.swift`) and
+   improve-loop S-081 (one `Session.swift` property, `Session+Verbs`, two `BusService` lines, `ScopePanel`), all additive; whoever
+   lands later re-merges. **Tasks 5 and 6 run only after the traffic-route plan's Tasks 2/2b
    have landed** — they share `Session.swift` (traffic-route: `systemProxy`, `decrypt`) and
    `Bus/BusService.swift` (traffic-route: one `decrypt` line; PR D's `refreshCAStatus()` is also in
    that file by then) — and never concurrently with them; whichever lands second rebases onto the
@@ -543,6 +548,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 
 ### Task 8: Live proof on the installed notarized app (Terminal, orchestrator or Matt)
 
+> Ordering (orchestrator ruling 2026-11-01, accepted on PR #272): Task 8 is the **post-merge acceptance** of the UI half, the same shape as #200's — only the installed app with the Network Extension produces `source_app`, and that build must already carry Tasks 5/6, so no pre-merge proof exists and no dev-bundle stand-in counts. It runs on Matt's installed build of the first notarized DMG after #272 (v0.5.11) **before the Homebrew tap bump**; the orchestrator holds the tap until the evidence is posted on #272 (and #265's Half B on #265). If it fails, a fix PR goes in before the release is published and the orchestrator tells Matt.
+
 - **Satisfies:** AI-AC14, AI-AC15, AI-AC16, AI-AC17, AI-AC18, AI-AC19, AI-AC20, AI-AC21; the
   whole-branch gates AI-AC13, AI-AC23.
 - **Depends on:** Tasks 1–7 merged into the branch and the Swift gate green on the whole branch.
@@ -770,6 +777,36 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | PR #268 | security (final, 99e5b3be) | — | note: `tooltipText` caps 256 `Character`s, so an identifier of combining marks (Mn, not stripped) can exceed 256 scalars in the tooltip; cosmetic, no regression over PR B's uncapped last component | accepted; tighten to `unicodeScalars.prefix` if ever wanted; PASS stands for `681dff57..99e5b3be` |
 | PR #268 | spec (final, 99e5b3be) | Minor | SPD2-M1 — two stale words after the reorder and the widening: OQ preamble "both" with three forks; D1 "(Task 5)" on the already-landed `Session.clients` one-liner | fixed in docs (this commit); PASS for `681dff57..99e5b3be` |
 | PR #268 | quality (final, 99e5b3be) | — | Q-M1, QD1–QD3 verified closed; nothing new | PASS, 0 open |
+| 6 | Coder (deviation flagged) | Minor | spec D6 / plan say "label leading 6 after" the icon, but no spacing token is 6 (`Space` is 4/8/12/16…); the coder kept the pre-existing literal `6` as the spec states | accepted 2026-11-01 (orchestrating session): the spec measurement wins over the token rule for this pre-existing value; the panel may pick a token (`Space.sm` = 8 changes the spec) — recorded for the quality reviewer |
+| 6 | Coder (noticed) | Minor | the `BusService.swift` diff is one line + one comment ("at most a comment" per the plan); `ClientInfo.monogram` (Kit, `Flow.swift` do-not-touch) is unused by the flow table once Task 6 lands | accepted; `monogram` stays until a Kit cleanup PR |
+| 5 | Coder (deviations flagged) | Minor | (a) `help: String? = nil` applied as `.help(help ?? "")`; (b) while querying, an app's domain sub-rows show (D4) even when its chevron reads collapsed (D5 keys the chevron strictly on `expandedApps`); (c) Apps rows keyed by `\.0.groupKey` so a row survives the D3 rename; (d) the selection fill covers chevron + row; (e) pinned-app `session.clients.first` inline twice | accepted 2026-11-01 (orchestrating session): (c) follows the key rule everywhere else; (b) is both spec sentences read literally — the panel may ask for `||` so the chevron reads open while querying; (a)(d)(e) cosmetic, recorded for the quality reviewer |
+| 5 | Coder (noticed) | Minor | `hint(_:)` at `SidebarView.swift:136` keeps a pre-existing `.padding(.leading, 28)` literal, same value as `Inset.mark` | follow-up with the glyph-literal sweep (Shipped 4) |
+| UI half | Tester | — | PASS on `c65ed0f2..8cd68888`: AC13/22/23 structural + gate-quoted; AC14–21 mapped to Task 8 with the code precondition each needs; all seven coder deviations match their dispositions; app target typechecked clean in the sandbox; 3 Kit invariant tests added (`AppIconsUITesterTests.swift`: `FlowRow ==` covers `client`; tree/narrowing/pins/Overview key on `groupKey` across a rename; stale-pin `ClientInfo(name: key, bundleID: key)` round trip) | 0 Critical, 0 Important, 3 Minor below |
+| UI half | Tester | Minor | M1 — `hosts(forClient:)` is an O(rows) scan per visible app per render while a query is typed (idle path short-circuits) | accepted: fine at today's row counts; memoise if a full capture feels sluggish (follow-up) |
+| UI half | Tester | Minor | M2 — `.help(help ?? "")` put an empty tooltip on Domains / pinned-host rows (Task 5 deviation (a)) | fixed (this commit): `.help(help ?? title)` — the row's own title is the tooltip when no identifier applies |
+| UI half | Tester | Minor | M3 — while querying, a collapsed chevron sat above visible domain rows (Task 5 deviation (b)) | fixed (this commit): the chevron reads open whenever domain rows show (`expandedApps.contains(key) \|\| (querying && !domains(under:).isEmpty)`) |
+| PR #272 | security | Minor | S-M1 — `domains(under:)` ran the O(rows) `hosts(forClient:)` scan before checking whether the row shows domains: idle Apps page, every app collapsed, 50k rows × 30 apps per 500 ms tick on the main actor | fixed (this commit): guard `querying || expandedApps.contains(key)` first; the query-path memo stays a follow-up with Tester M1 |
+| PR #272 | security | Minor | S-M2 — a pending Client cell appended a new `onResolve` closure on every `configure` (every tick under traffic) while one identifier's lookup was in flight; no per-cell dedupe, no cap | fixed (this commit): `awaitingIdentifier` registers once per cell per identifier; the callback reads the latest name/tint from the cell, so a later same-identifier configure still wins |
+| PR #272 | security | — | checked clean: `BusService` one synchronous main-actor cache read, no `await`, #262 ownership untouched; `shownIdentifier` reuse guard correct; wire strings reach only `Text`/`.help`/interpolated a11y labels; `expandedApps` never persisted; no `unsafe`/`unchecked`/logging; six tripwires exit 0 | PASS, 0 Critical, 0 Important |
+| PR #272 | spec | Minor | SP-M1 — the Tester M2 fix gave Domains / pinned-host rows a host tooltip while D5 said "unchanged" and D10's Domains row listed none | fixed in docs (this commit): D5 and D10 say every flat host row's tooltip is its host |
+| PR #272 | spec | Minor | SP-M2 — the Tester M3 fix contradicted D5's literal chevron sentence, and during a query a chevron click flipped `expandedApps` with no visible change ("Collapse" could leave the app expanded after the query cleared) | fixed (this commit): D5 amended to the shipped rule; the chevron `Button` is `.disabled(querying)` so a click during a query is impossible — pointer path; the VoiceOver action followed in the next commit (SPD-M1 / QD1) |
+| PR #272 | spec | — | completeness D3–D7/D10 verified line by line; nothing extra; footprint = the four declared files + tester + plan; AI-AC13/22/23 PASS, AI-AC14–21 pending Task 8; KIT.md still matches | PASS, 0 Critical, 0 Important |
+| PR #272 | quality | Minor | Q1 — `expanded` hid a constant (`querying && !domains(under:).isEmpty` is always true for a visible app) behind an O(rows) scan; `domains(under:)`/`hosts(forClient:)` ran up to three times per app per render while querying | fixed (this commit): `expanded = expandedApps.contains(key) \|\| querying`; with the S-M1 guard the idle path scans nothing and the query path scans once per app (the accepted Tester M1 disposition) |
+| PR #272 | quality | Minor | Q2 — `Inset` summed unrelated `Space` steps (`md + lg`, `+ xxl`) to reach 28/52 | fixed (this commit): `mark = chevron + Tok.Size.icon`, `domain = mark + Tok.Size.icon + Space.sm`, comment states the alignment; values unchanged |
+| PR #272 | quality | Minor | Q3 — `hint(_:)` kept the literal `28` one screen below `Inset.mark` | fixed (this commit): `Inset.mark` |
+| PR #272 | quality | Minor | Q4 — the Client label gap `6` has a token: `Tok.Metric.gapTight` (already used by `countChip`) | fixed (this commit); closes the Task 6 deviation without changing the spec's measurement |
+| PR #272 | quality | Minor | Q5 — `BusService` comment said "never a lookup here" while `enriched` schedules one off-main on a first miss | fixed (this commit): "a non-blocking cache read — a miss only schedules the lookup off the main actor" |
+| PR #272 | quality | Minor | Q6 — `session.clients` (a full grouping per access) read four times per body, twice per pinned app | fixed (this commit): `let clients = session.clients` once per body; supersedes Task 5 deviation (e) |
+| PR #272 | quality | Minor | Q7 — `appRow`'s label `HStack` duplicates `subItem`'s (mark · title · spacer · count) | declined 2026-11-01 (orchestrating session): the app row is expected to diverge (service badge, D5 anatomy with the chevron strip), and a shared `rowLabel` would carry two switches for one `if let count`; revisit when the next KIT label change lands |
+| PR #272 | quality | Minor | Q8 — tester file: two assertions tested the test's own `??` expression, one computed expected value under a literal, one block restated `ClientTreeTests`, a fourth private `row(...)` builder | fixed in part (this commit): the three self-evaluating/computed assertions deleted; the restated block kept (its later Overview/FlowQuery assertions need the grouping it establishes); the shared `TestRows.swift` move is a follow-up (Shipped) |
+| PR #272 | quality | — | checked clean: chevron + row buttons' hit areas and a11y, spec literals (0 / 90° / lineLimit 1), generic `subItem`, `matches` overloads, `clientIcon` constraints and reuse guard, `Session` additions, no dead code or residue | PASS, 0 Critical, 0 Important |
+| PR #272 | security (delta re-verification of d9a5f563) | — | S-M1/S-M2 verified fixed; `awaitingIdentifier` walked through A→B→A reuse: at most one extra closure per distinct-identifier alternation, no lost or misdirected verdict; observation: the row's VoiceOver Expand/Collapse action still called `toggleExpanded` while querying | PASS, 0 open; the observation fixed in the next commit: the action is a no-op while `querying`, same rule as the chevron |
+| PR #272 | quality (delta re-verification of d9a5f563) | Minor | QD1 — the row's VoiceOver Expand/Collapse action still toggled while the chevron was disabled during a query | fixed (this commit): one `canToggle = !querying` drives both `.disabled` and the action body |
+| PR #272 | quality (delta) | Minor | QD2 — `awaitingIdentifier` / `pendingTint` were never cleared on the resolved and no-client paths, so a cell that later saw the same identifier pending again could skip registering and show a blank mark for one tick | fixed (this commit): both cleared in the resolved branch and the no-client branch; the pending branch keeps them |
+| PR #272 | quality (delta) | — | Q1–Q6, Q8 verified closed; Q7 declined accepted | PASS, 0 Critical, 0 Important |
+| PR #272 | spec (delta re-verification of d9a5f563) | Minor | SPD-M1 — SP-M2 residual: the row's VoiceOver Expand/Collapse action still flipped `expandedApps` during a query | fixed (this commit, = quality QD1): one `canToggle`; D5 says both entry points are inert |
+| PR #272 | spec (delta) | Minor | SPD-M2 — the amended D5 sentence left "inside its own `Button` …" dangling off the disabled clause | fixed in docs (this commit): clause moved back after `Tok.Ink.tertiary`; D6 names `Tok.Metric.gapTight` |
+| PR #272 | spec (delta) | — | SP-M1/SP-M2 closed; `Inset` derivation, `gapTight`, `domains` guard, `awaitingIdentifier`, BusService comment, one `clients` read, tester trims all checked against D4–D7/D10 — no new sentence needed; footprint unchanged | PASS, 0 Critical, 0 Important |
 
 ## Shipped
 
@@ -782,4 +819,5 @@ Pre-filled 2026-11-01 — follow-ups accepted during implementation, each a smal
 3. `Flow.swift` `knownSourceApps`: drop the `com.apple.WebKit.Networking → "Safari"` row so PR B's one-poll name matches `knownUnbundled` (Tester M-2; `Flow.swift` is do-not-touch here).
 4. Glyph-literal sweep: `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` → `Tok.Glyph.*` via gen-tokens (Tester M-3).
 5. Signer verification (security S-M2, spec Open question 4): the extension derives the team identifier from the flow's audit token and sends it beside `source_app`; the resolver inherits an owner's icon/name only on a team match — extension + core + Kit, its own spec.
-6. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.
+6. Tests: one shared `Tests/AitmproxyKitTests/TestRows.swift` row builder replacing the four private `row(...)` copies (quality Q8 on #272), when any of the four files is next touched.
+7. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.

@@ -237,6 +237,9 @@ final class BusService: FlowActions {
             func scoped(_ row: FlowRow) -> FlowRow {
                 var row = row
                 row.inScope = session.scopeHosts.isEmpty || Scope.contains(row.authority, in: session.scopeHosts)
+                // The display name from the identity cache (icons spec D3): a non-blocking cache read — a miss
+                // only schedules the lookup off the main actor.
+                row.client = row.client.map(AppIdentityResolver.shared.enriched)
                 return row
             }
             let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
