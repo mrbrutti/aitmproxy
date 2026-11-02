@@ -41,7 +41,7 @@ fn traversal_payloads() -> Vec<String> {
         "..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
         "....//....//....//....//etc/passwd",
         "/etc/passwd",
-        "..%5c..%5c..%5c..%5c..%5cwindows%5cwin.ini",
+        "..\\..\\..\\..\\..\\windows\\win.ini",
         "../../../../../../windows/win.ini",
     ]
     .iter()

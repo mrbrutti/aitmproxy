@@ -128,7 +128,7 @@ async fn crlf_is_vulnerable_against_its_vulnerable_shape() {
     // value carried into the reply's own header block.
     let split = Replies::plain(200, "Redirecting")
         .when_headers(
-            "%0d%0aX-Aitm-Crlf:%20aitm7f3a",
+            "\r\nX-Aitm-Crlf: aitm7f3a",
             200,
             &[(CANARY_HEADER, MARKER)],
             "Redirecting",
@@ -140,7 +140,7 @@ async fn crlf_is_vulnerable_against_its_vulnerable_shape() {
     assert_eq!(verdict.confidence, Confidence::Firm);
     assert_eq!(
         verdict.evidence.payload.as_deref(),
-        Some("/home%0d%0aX-Aitm-Crlf:%20aitm7f3a")
+        Some("/home\r\nX-Aitm-Crlf: aitm7f3a")
     );
     assert_eq!(
         verdict.evidence.matched.as_deref(),
@@ -148,7 +148,7 @@ async fn crlf_is_vulnerable_against_its_vulnerable_shape() {
     );
     assert_eq!(
         split.payloads(),
-        vec!["/home%0d%0aX-Aitm-Crlf:%20aitm7f3a".to_string()],
+        vec!["/home\r\nX-Aitm-Crlf: aitm7f3a".to_string()],
         "the first encoding concluded it; the other two are never sent"
     );
 }
@@ -174,9 +174,9 @@ async fn crlf_is_clean_against_its_patched_shape() {
     assert_eq!(
         patched.payloads(),
         vec![
-            "/home%0d%0aX-Aitm-Crlf:%20aitm7f3a".to_string(),
-            "/home%0d%0aX-Aitm-Crlf:aitm7f3a".to_string(),
-            "/home%E5%98%8D%E5%98%8AX-Aitm-Crlf:aitm7f3a".to_string(),
+            "/home\r\nX-Aitm-Crlf: aitm7f3a".to_string(),
+            "/home\r\nX-Aitm-Crlf:aitm7f3a".to_string(),
+            "/home\u{560d}\u{560a}X-Aitm-Crlf:aitm7f3a".to_string(),
         ],
         "all three encodings are tried before the point is cleared"
     );
@@ -190,7 +190,7 @@ async fn crlf_supplies_a_parsable_poc_hint() {
         .expect("exactly one check");
     let split = Replies::plain(200, "Redirecting")
         .when_headers(
-            "%0d%0aX-Aitm-Crlf:%20aitm7f3a",
+            "\r\nX-Aitm-Crlf: aitm7f3a",
             200,
             &[(CANARY_HEADER, MARKER)],
             "Redirecting",

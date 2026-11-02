@@ -14,7 +14,7 @@ const NAME = "check-sqli";
 const API  = "1";
 
 // Database error signatures, carried over verbatim from the shipped script.
-const SQL_ERR = "(?i)(SQL syntax.*MySQL|ORA-[0-9]{5}|PostgreSQL.*ERROR|SQLSTATE\\[|SQLiteException|Unclosed quotation mark|SqlException|psycopg2\\.|sqlalchemy\\.exc\\.|Warning.*mysqli?_|quoted string not properly terminated)";
+const SQL_ERR = "(?i)(SQL syntax.*MySQL|SQL syntax error|syntax error at or near|ORA-[0-9]{5}|PostgreSQL.*ERROR|SQLSTATE\\[|SQLiteException|Unclosed quotation mark|SqlException|psycopg2\\.|sqlalchemy\\.exc\\.|Warning.*mysqli?_|quoted string not properly terminated)";
 
 const META = #{
     id: "sqli",

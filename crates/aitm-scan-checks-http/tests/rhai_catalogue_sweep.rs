@@ -227,7 +227,7 @@ async fn the_six_poc_classes_supply_a_hint() {
         ),
         Replies::plain(200, "Redirecting")
             .when_headers(
-                "%0d%0aX-Aitm-Crlf:%20aitm7f3a",
+                "\r\nX-Aitm-Crlf: aitm7f3a",
                 200,
                 &[("x-aitm-crlf", MARKER)],
                 "Redirecting",

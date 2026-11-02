@@ -31,7 +31,7 @@ const MARKER: &str = "aitm7f3a";
 
 /// The database-error signature `check-sqli.rhai` carries, as the PoC engine
 /// will receive it. The Rhai source writes `\\[` for this string's `\[`.
-const SQL_ERR: &str = r"(?i)(SQL syntax.*MySQL|ORA-[0-9]{5}|PostgreSQL.*ERROR|SQLSTATE\[|SQLiteException|Unclosed quotation mark|SqlException|psycopg2\.|sqlalchemy\.exc\.|Warning.*mysqli?_|quoted string not properly terminated)";
+const SQL_ERR: &str = r"(?i)(SQL syntax.*MySQL|SQL syntax error|syntax error at or near|ORA-[0-9]{5}|PostgreSQL.*ERROR|SQLSTATE\[|SQLiteException|Unclosed quotation mark|SqlException|psycopg2\.|sqlalchemy\.exc\.|Warning.*mysqli?_|quoted string not properly terminated)";
 
 /// What a MySQL server says when a quote lands in an unparameterised query.
 const MYSQL_ERROR: &str = "You have an error in your SQL syntax; check the manual that \

@@ -42,12 +42,16 @@ fn load(reg) {
         // replayed later, looks for a value that is written down rather than
         // one that was thrown away when the check returned.
         let canary = probe.marker();
-        // Percent-encoded CRLF, the same with no space after the colon, and the
-        // overlong unicode form some front ends fold down to CR LF.
+        // The control characters themselves, not their percent-encoding: the
+        // lane owns the encoding of whatever a check hands `probe.send` (spec
+        // D4), so a pre-encoded `%0d%0a` would reach the wire as `%250d%250a`
+        // and never fold into a line break. Three forms: CR LF with a space
+        // after the colon, the same without, and the overlong unicode pair
+        // (U+560D U+560A) some front ends fold down to CR LF.
         let payloads = [
-            base + "%0d%0aX-Aitm-Crlf:%20" + canary,
-            base + "%0d%0aX-Aitm-Crlf:" + canary,
-            base + "%E5%98%8D%E5%98%8AX-Aitm-Crlf:" + canary,
+            base + "\r\nX-Aitm-Crlf: " + canary,
+            base + "\r\nX-Aitm-Crlf:" + canary,
+            base + "嘍嘊X-Aitm-Crlf:" + canary,
         ];
 
         for payload in payloads {
