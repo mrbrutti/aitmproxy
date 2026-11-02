@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 97] = [
+const EXPECTED_TOOLS: [&str; 100] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -111,9 +111,10 @@ const EXPECTED_TOOLS: [&str; 97] = [
     "scan.profile.delete",
     "scan.session.preview",
     // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
-    // natives of `aitm-scan-checks-http` (PR 2a). The interim HTTP lane and its
-    // three passive ids (`reflection`, `security-header`, `cookie-flag`) left
-    // with T2's `aitm-scan-http` lane, which replaces it.
+    // natives of `aitm-scan-checks-http` (PR 2a) and the three passive checks
+    // the scanner engine itself ships (`reflection`, `security-header`,
+    // `cookie-flag`), which stay on the surface whatever lane holds the http
+    // slot (spec amendment 24: "the passives stay").
     "check.xss-reflected",
     "check.open-redirect",
     "check.sqli-boolean",
@@ -124,6 +125,9 @@ const EXPECTED_TOOLS: [&str; 97] = [
     "check.h2-header-crlf-tolerance",
     "check.h2-cl-te-downgrade-indicator",
     "check.h2-rapid-reset-mitigation",
+    "check.reflection",
+    "check.security-header",
+    "check.cookie-flag",
     // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
     // manual verb once the lane registers with the engine.
     "check.cswsh",
