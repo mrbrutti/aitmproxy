@@ -4,7 +4,8 @@
 # Usage: ax_texts.sh            (window 1 of the Aitmproxy process)
 #        ax_texts.sh menu Proxy (the titles of one menu, with enabled state)
 set -euo pipefail
-pgrep -f 'Aitmproxy.app/Contents/MacOS/Aitmproxy' >/dev/null || { echo "refused: Aitmproxy is not running" >&2; exit 3; }
+pgrep -f '^/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy' >/dev/null || { echo "refused: the installed Aitmproxy is not running" >&2; exit 3; }
+[ "$(pgrep -f 'Aitmproxy.app/Contents/MacOS/Aitmproxy' | wc -l | tr -d ' ')" = 1 ] || { echo "refused: more than one Aitmproxy process (a dev bundle is running)" >&2; exit 3; }
 if [ "${1:-}" = menu ]; then
   osascript - "$2" <<'APPLESCRIPT'
 on run argv

@@ -35,7 +35,9 @@ YES = set(filter(None, os.environ.get("ACCEPT_YES", "").split(",")))
 AITM = os.environ.get("AITM", INSTALLED_CLI)
 CHROME = os.environ.get("CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 TOOLING = ("*.anthropic.com", "claude.ai", "github.com")
+SERVICES = ("Wi-Fi", "Display Ethernet")
 results: dict[str, str] = {}
+set_by_us = False
 
 
 def step(sid, result, observed="", truth="", explains=""):
@@ -47,6 +49,31 @@ def step(sid, result, observed="", truth="", explains=""):
 
 def scutil() -> str:
     return subprocess.run(["scutil", "--proxy"], capture_output=True, text=True).stdout
+
+
+def service_state() -> dict:
+    return {svc: {"http": subprocess.run(["networksetup", "-getwebproxy", svc], capture_output=True, text=True).stdout,
+                  "https": subprocess.run(["networksetup", "-getsecurewebproxy", svc], capture_output=True, text=True).stdout} for svc in SERVICES}
+
+
+def replay(before: dict) -> list[str]:
+    """Put each service back exactly as recorded; returns the networksetup failures."""
+    errs = []
+    for svc, d in before.items():
+        for kind, text in d.items():
+            en = re.search(r"Enabled: (\w+)", text)
+            host = re.search(r"Server: (\S*)", text)
+            port = re.search(r"Port: (\d+)", text)
+            setp = "-setwebproxy" if kind == "http" else "-setsecurewebproxy"
+            setstate = "-setwebproxystate" if kind == "http" else "-setsecurewebproxystate"
+            if host and port and host.group(1):
+                r = subprocess.run(["networksetup", setp, svc, host.group(1), port.group(1)], capture_output=True, text=True)
+                if r.returncode:
+                    errs.append(f"{svc} {setp}: {r.stderr.strip()}")
+            r = subprocess.run(["networksetup", setstate, svc, "on" if en and en.group(1) == "Yes" else "off"], capture_output=True, text=True)
+            if r.returncode:
+                errs.append(f"{svc} {setstate}: {r.stderr.strip()}")
+    return errs
 
 
 def redact(s: str) -> str:
@@ -77,7 +104,8 @@ def main() -> int:
     if not os.path.isfile(CHROME):
         step("WEB-2", "SKIP", f"Google Chrome not found at {CHROME}")
 
-    before = scutil()
+    global set_by_us
+    before, before_svc = scutil(), service_state()
     t0 = int(time.time() * 1000)
     env = dict(os.environ)
     env.pop("AITM_AUDIT_LOG", None)
@@ -122,9 +150,9 @@ def main() -> int:
                 step("WEB-4", "SKIP", "bypass list absent in config.yaml system_proxy.bypass; add it through Settings first")
                 yes = ",".join(x for x in yes.split(",") if x not in ("WEB-4", "WEB-7"))
             manual = "manual" if is_manual() else ""
-            env2 = dict(env, ACCEPT_ROUTE_OPEN="1" if "WEB-4" in yes else "0")
+            env2 = dict(env, ACCEPT_ROUTE_OPEN="1" if "WEB-4" in yes else "0", ACCEPT_OP_URL=op_url)
             with open(os.path.join(OUT, "web_journey.mjs.log"), "w", encoding="utf-8") as mlog:
-                p = subprocess.Popen(["node", os.path.join(HERE, "lib", "web_journey.mjs"), op_url, OUT, yes, manual], stdout=subprocess.PIPE, stderr=mlog, stdin=subprocess.PIPE, text=True, env=env2)
+                p = subprocess.Popen(["node", os.path.join(HERE, "lib", "web_journey.mjs"), OUT, yes, manual], stdout=subprocess.PIPE, stderr=mlog, stdin=subprocess.PIPE, text=True, env=env2, start_new_session=True)
                 for line in p.stdout:
                     line = line.rstrip("\n")
                     if line.startswith("PAUSE\t"):
@@ -138,9 +166,16 @@ def main() -> int:
                             rows = [r for r in audit_tail(200) if r.get("at", 0) >= t0 and r.get("command") == "scope.add"]
                             truth = f"audit scope.add entries since start: {len(rows)}"
                         if sid in ("WEB-4", "WEB-7"):
+                            if sid == "WEB-4":
+                                set_by_us = True
+                            if sid == "WEB-7" and res == "PASS" and scutil() == before:
+                                set_by_us = False
                             truth = "scutil: " + ("points at 8080" if "HTTPPort : 8080" in scutil() else "not 8080") + f"; identical to before: {scutil() == before}"
                         step(sid, res, redact(obs2), truth)
-                p.wait(timeout=60)
+                try:
+                    p.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, signal.SIGTERM)
             if "WEB-4" not in YES or results.get("WEB-4") != "PASS":
                 step("WEB-5", "BLOCKED", "WEB-4 did not set the route")
             elif not is_manual():
@@ -162,12 +197,13 @@ def main() -> int:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGTERM)
         log.close()
-        if scutil() != before:
-            print("== restore trap: scutil differs from before; `aitm proxy system unset` is NOT run by the harness (one-shot restores nothing on 0.5.10) — restoring per service", flush=True)
-            for svc in ("Wi-Fi", "Display Ethernet"):
-                subprocess.run(["networksetup", "-setwebproxystate", svc, "off"], capture_output=True)
-                subprocess.run(["networksetup", "-setsecurewebproxystate", svc, "off"], capture_output=True)
-            print("== scutil identical after restore:", scutil() == before, flush=True)
+        if set_by_us:
+            print("== restore trap: WEB-4 set the system proxy and WEB-7 did not restore it; replaying the recorded per-service state", flush=True)
+            errs = replay(before_svc)
+            same = scutil() == before
+            step("RESTORE", "PASS" if same and not errs else "FAIL", f"replayed recorded state; identical {same}; errors {errs}")
+        elif scutil() != before:
+            step("DRIFT", "FAIL", "the system proxy changed during the run by another actor; the harness set nothing and touched nothing — left as is", scutil()[:200])
     if any(v == "FAIL" for v in results.values()):
         return 1
     if any(v in ("SKIP", "BLOCKED") for v in results.values()):

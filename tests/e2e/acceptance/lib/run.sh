@@ -61,18 +61,20 @@ case ",$journeys," in *,cli,*) run_cell cli-nocore bash "$here/cli_journey.sh" n
 bash "$here/preflight.sh" "$OUT/state-after.txt" >/dev/null
 python3 "$here/bus_truth.py" --embedded >"$OUT/bus-truth-after.txt" 2>&1 || true
 echo; echo "---- restore diff (state-before vs state-after; timestamps and pids differ by design)"
-diff <(grep -vE '^[0-9]{4}-|^== when|pid|Nov|total|^written to' "$OUT/state-before.txt") \
-     <(grep -vE '^[0-9]{4}-|^== when|pid|Nov|total|^written to' "$OUT/state-after.txt") >"$OUT/state-diff.txt" \
+volatile() { # strip timestamps, pids, sizes and dates, keep every line (so a new file or process still shows)
+  sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+//; s/^([0-9]+) /<pid> /; s/pid [0-9]+/pid <n>/g; s/^(.rw|drw)[^ ]+ +[0-9]+ +[a-z]+ +[a-z]+ +[0-9]+ +[A-Z][a-z]{2} +[0-9]+ +[0-9:]+ /<ls> /; s/^total [0-9]+/total <n>/; s/^written to .*//; s/aitm-embedded-core\/[0-9A-F-]{36}/aitm-embedded-core\/<uuid>/g; s/127\.0\.0\.1:[0-9]{4,5}/127.0.0.1:<port>/g; s/"at":[0-9]+/"at":<ms>/g' "$1"
+}
+diff <(volatile "$OUT/state-before.txt") <(volatile "$OUT/state-after.txt") >"$OUT/state-diff.txt" \
   && echo "identical" || { echo "DIFFERS:"; cat "$OUT/state-diff.txt"; }
 
 echo; echo "---- secret leak check (operator token value, agent token value, web #t= values, AITM_WEB_TOKEN)"
 leak=0
-cfg=$(pgrep -fl 'Aitmproxy.app/Contents/Resources/core/aitm' | sed -nE 's/.*--config (\S+).*/\1/p' | head -1)
+cfg=$(pgrep -fl '^/Applications/Aitmproxy.app/Contents/Resources/core/aitm' 2>/dev/null | sed -nE 's/^[0-9]+ \/Applications\/Aitmproxy.app\/Contents\/Resources\/core\/aitm --config (.+\/config\.yaml)$/\1/p' | head -1)
 secrets=()
 [ -n "$cfg" ] && while IFS= read -r v; do [ -n "$v" ] && secrets+=("$v"); done < <(grep -E '^\s*(operator_token|token):' "$cfg" | sed -E 's/^[^:]+:\s*"?([^"]+)"?$/\1/')
 [ -n "${AITM_WEB_TOKEN:-}" ] && secrets+=("$AITM_WEB_TOKEN")
 for v in "${secrets[@]}"; do
-  hits=$(grep -rlF -- "$v" "$OUT" 2>/dev/null | grep -v '/cli/' || true)
+  hits=$(grep -rlF -- "$v" "$OUT" 2>/dev/null || true)
   [ -n "$hits" ] && { echo "SECRET VALUE present in: $hits"; leak=1; }
 done
 tok_hits=$(grep -rElI '#t=[A-Za-z0-9_-]{12,}|operator_token: *"?[A-Za-z0-9_-]{16,}' "$OUT" 2>/dev/null || true)

@@ -2,7 +2,8 @@
 // Release acceptance, journey WEB (spec §D5), the browser half: a REAL Google Chrome over CDP
 // (apps/web/scripts/cua-driver.mjs) opens the Operator URL `aitm web` printed and reads the words.
 //
-//   node web_journey.mjs <operatorUrl> <outdir> <yesList> [manual]
+//   ACCEPT_OP_URL=<operatorUrl> node web_journey.mjs <outdir> <yesList> [manual]
+// The Operator URL carries the web bearer (#t=…): it travels in the environment, never argv.
 //
 // Steps WEB-2, WEB-3, WEB-6a (arm) / WEB-6d (disarm) are driven here; WEB-4/7 (system proxy,
 // `yes`) are clicked only when the yes list names them; WEB-5 / WEB-6b-c (a second browser's
@@ -14,13 +15,15 @@ import { fileURLToPath } from 'node:url';
 import { launchChrome, makeDriver } from '../../../../apps/web/scripts/cua-driver.mjs';
 import { sleep } from '../../../../apps/web/scripts/live-env.mjs';
 
-const [url, outdir, yesList = '', manual = ''] = process.argv.slice(2);
-if (!url || !outdir) { console.error('usage: web_journey.mjs <operatorUrl> <outdir> <yesList> [manual]'); process.exit(2); }
+const [outdir, yesList = '', manual = ''] = process.argv.slice(2);
+const url = process.env.ACCEPT_OP_URL;
+if (!url || !outdir) { console.error('usage: ACCEPT_OP_URL=<operatorUrl> web_journey.mjs <outdir> <yesList> [manual]'); process.exit(2); }
 const YES = new Set(yesList.split(',').filter(Boolean));
 const log = (m) => console.error(`[web] ${m.replace(/#t=[^&\s"]+/g, '#t=<redacted>')}`);
 const step = (id, result, observed = '') => console.log(['STEP', id, result, observed.replace(/\s+/g, ' ').replace(/#t=[^&\s"]+/g, '#t=<redacted>').slice(0, 300)].join('\t'));
 
 const chrome = await launchChrome({ width: 1500, height: 950 });
+if (typeof chrome.close !== 'function') { console.error('cua-driver changed: launchChrome() has no close(); refusing to run without a scoped cleanup'); process.exit(2); }
 const d = makeDriver(chrome, { log, shotsDir: outdir });
 let rc = 0;
 try {
@@ -108,7 +111,9 @@ try {
   step('WEB-ERR', 'FAIL', e.message);
   rc = 1;
 } finally {
-  chrome.kill?.();
-  try { process.kill(chrome.pid ?? 0); } catch {}
+  // close() SIGTERMs only the Chrome it spawned and removes its temp profile (which holds the
+  // operator URL in History). Never signal our own process group.
+  try { await d.open('about:blank'); } catch {}
+  chrome.close();
 }
 process.exit(rc);

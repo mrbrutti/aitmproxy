@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from .bus import BusClient, ToolError
 
 APP_BUNDLE = "/Applications/Aitmproxy.app"
-APP_CORE_CMDLINE = "Aitmproxy.app/Contents/Resources/core/aitm"
+APP_CORE_CMDLINE = "/Applications/Aitmproxy.app/Contents/Resources/core/aitm"
 INSTALLED_CLI = "/opt/homebrew/bin/aitm"
 DATA_DIR = os.path.expanduser("~/Library/Application Support/aitmproxy")
 
@@ -39,10 +39,15 @@ class EmbeddedCore:
 def find_embedded_core() -> EmbeddedCore | None:
     """The installed app's embedded core, or None when the app is not running."""
     out = subprocess.run(["pgrep", "-fl", APP_CORE_CMDLINE], capture_output=True, text=True).stdout
-    m = re.search(r"^(\d+) .*--config (\S+)", out, re.M)
-    if not m:
+    # Anchored to the INSTALLED bundle: sibling sessions run dev bundles under /tmp with the same
+    # relative layout. The config path is the last argument (per-launch dir under the user temp root).
+    hits = [m for m in re.finditer(r"^(\d+) /Applications/Aitmproxy\.app/Contents/Resources/core/aitm --config (.+?)/config\.yaml\s*$", out, re.M)]
+    if not hits:
         return None
-    pid, cfg = int(m.group(1)), m.group(2)
+    if len(hits) > 1:
+        raise RuntimeError(f"{len(hits)} installed-bundle cores are running; refusing to pick one")
+    m = hits[0]
+    pid, cfg = int(m.group(1)), m.group(2) + "/config.yaml"
     token = ""
     with open(cfg, encoding="utf-8") as f:
         for line in f:

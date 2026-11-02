@@ -72,13 +72,18 @@ if want nocore; then
     fi
     # CLI-8 web port held by a PLAIN listener on 8082 (not a core: 8080 must stay free so the web-port panel is reached).
     python3 -m http.server 8082 --bind 127.0.0.1 >/dev/null 2>&1 & hp=$!
-    sleep 0.5
-    run CLI-8 10 "$AITM" web; rc=$?
-    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
-    if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/CLI-8.err" && grep -q '8082' "$OUT/CLI-8.err" && ! grep -qE 'Web UI +http' "$OUT/CLI-8.out"; then
-      res CLI-8 PASS "$(clean "$OUT/CLI-8.err" | grep -m1 'cannot start' | head -c 120)"
+    sleep 0.7
+    if [ "$(holder 8082)" != "Python pid $hp" ] && [ "$(holder 8082)" != "python3 pid $hp" ]; then
+      kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+      res CLI-8 SKIP "could not hold 8082 with a plain listener (holder: $(holder 8082)); not starting aitm web against a live port"
     else
-      res CLI-8 FAIL "exit $rc; stderr: $(clean "$OUT/CLI-8.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI +http' "$OUT/CLI-8.out")"
+      run CLI-8 10 "$AITM" web; rc=$?
+      kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+      if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/CLI-8.err" && grep -q '8082' "$OUT/CLI-8.err" && ! grep -qE 'Web UI +http' "$OUT/CLI-8.out"; then
+        res CLI-8 PASS "$(clean "$OUT/CLI-8.err" | grep -m1 'cannot start' | head -c 120)"
+      else
+        res CLI-8 FAIL "exit $rc; stderr: $(clean "$OUT/CLI-8.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI +http' "$OUT/CLI-8.out")"
+      fi
     fi
   fi
 fi

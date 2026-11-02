@@ -60,8 +60,9 @@ def service_state() -> dict:
     return st
 
 
-def replay(before: dict) -> None:
-    """Put each service back exactly as recorded (never a blanket off)."""
+def replay(before: dict) -> list[str]:
+    """Put each service back exactly as recorded (never a blanket off); returns the failures."""
+    errs = []
     for svc, d in before.items():
         for kind, text in d.items():
             en = re.search(r"Enabled: (\w+)", text)
@@ -70,8 +71,13 @@ def replay(before: dict) -> None:
             setp = "-setwebproxy" if kind == "http" else "-setsecurewebproxy"
             setstate = "-setwebproxystate" if kind == "http" else "-setsecurewebproxystate"
             if host and port and host.group(1):
-                subprocess.run(["networksetup", setp, svc, host.group(1), port.group(1)], capture_output=True)
-            subprocess.run(["networksetup", setstate, svc, "on" if en and en.group(1) == "Yes" else "off"], capture_output=True)
+                r = subprocess.run(["networksetup", setp, svc, host.group(1), port.group(1)], capture_output=True, text=True)
+                if r.returncode:
+                    errs.append(f"{svc} {setp}: {r.stderr.strip()}")
+            r = subprocess.run(["networksetup", setstate, svc, "on" if en and en.group(1) == "Yes" else "off"], capture_output=True, text=True)
+            if r.returncode:
+                errs.append(f"{svc} {setstate}: {r.stderr.strip()}")
+    return errs
 
 
 def config_bypass() -> list[str]:
@@ -248,10 +254,13 @@ def main() -> int:
         step("TUI-10", "SKIP", "no Apps view on this surface on 0.5.10")
     finally:
         term.stop()
-        if armed_set or scutil() != before_scutil:
-            print("== restore trap: replaying the recorded per-service state", flush=True)
-            replay(before_svc)
-            print("== scutil identical after replay:", scutil() == before_scutil, flush=True)
+        if armed_set:
+            print("== restore trap: TUI-3 set the system proxy and TUI-7 did not restore it; replaying the recorded per-service state", flush=True)
+            errs = replay(before_svc)
+            same = scutil() == before_scutil
+            step("RESTORE", "PASS" if same and not errs else "FAIL", f"replayed recorded state; identical {same}; errors {errs}")
+        elif scutil() != before_scutil:
+            step("DRIFT", "FAIL", "the system proxy changed during the run by another actor; the harness set nothing and touched nothing — left as is", scutil()[:200])
         with open(os.path.join(OUT, "tui-raw.txt"), "wb") as f:
             f.write(bytes(term.raw))
 

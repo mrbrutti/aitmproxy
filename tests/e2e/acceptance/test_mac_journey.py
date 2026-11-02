@@ -61,7 +61,9 @@ def service_state() -> dict:
     return {svc: {"http": sh("networksetup", "-getwebproxy", svc), "https": sh("networksetup", "-getsecurewebproxy", svc)} for svc in SERVICES}
 
 
-def replay(before: dict) -> None:
+def replay(before: dict) -> list[str]:
+    """Put each service back exactly as recorded; returns the networksetup failures."""
+    errs = []
     for svc, d in before.items():
         for kind, text in d.items():
             en = re.search(r"Enabled: (\w+)", text)
@@ -70,8 +72,13 @@ def replay(before: dict) -> None:
             setp = "-setwebproxy" if kind == "http" else "-setsecurewebproxy"
             setstate = "-setwebproxystate" if kind == "http" else "-setsecurewebproxystate"
             if host and port and host.group(1):
-                subprocess.run(["networksetup", setp, svc, host.group(1), port.group(1)], capture_output=True)
-            subprocess.run(["networksetup", setstate, svc, "on" if en and en.group(1) == "Yes" else "off"], capture_output=True)
+                r = subprocess.run(["networksetup", setp, svc, host.group(1), port.group(1)], capture_output=True, text=True)
+                if r.returncode:
+                    errs.append(f"{svc} {setp}: {r.stderr.strip()}")
+            r = subprocess.run(["networksetup", setstate, svc, "on" if en and en.group(1) == "Yes" else "off"], capture_output=True, text=True)
+            if r.returncode:
+                errs.append(f"{svc} {setstate}: {r.stderr.strip()}")
+    return errs
 
 
 def ax() -> str:
@@ -289,16 +296,18 @@ def main() -> int:
                 set_by_us = False
         step("MAC-16", "SKIP", "the app was already running at start; not quit by the run (Matt's app)")
     finally:
-        if set_by_us or scutil() != before_sc:
-            print("== restore trap: replaying the recorded per-service system proxy state", flush=True)
+        if set_by_us:
+            print("== restore trap: MAC-6 set the system proxy and MAC-15 did not restore it; Restore via the app, then replay the recorded state", flush=True)
             try:
                 menu("Proxy", "Restore System Proxy")
                 time.sleep(3)
             except Exception:  # noqa: BLE001
                 pass
-            if scutil() != before_sc:
-                replay(before_svc)
-            print("== scutil identical after restore:", scutil() == before_sc, flush=True)
+            errs = replay(before_svc) if scutil() != before_sc else []
+            same = scutil() == before_sc
+            step("RESTORE", "PASS" if same and not errs else "FAIL", f"restored; scutil identical {same}; errors {errs}")
+        elif scutil() != before_sc:
+            step("DRIFT", "FAIL", "the system proxy changed during the run by another actor; the harness set nothing and touched nothing — left as is", scutil()[:200])
         if cap_by_us:
             print("== restore trap: All Apps was turned on by the run and not turned off — leftover for the report", flush=True)
     if any(v == "FAIL" for v in results.values()):
