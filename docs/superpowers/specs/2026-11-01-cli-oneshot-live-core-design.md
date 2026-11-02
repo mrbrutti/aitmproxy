@@ -116,6 +116,8 @@ mcp:
 - `Dedicated(port)` → `LoopbackTcp::bind_operator_only(port, token).await` **now** (so a fixed-port conflict is the M2 panel: `StartupError::PortInUse { role: "the operator bus", addr, remedy }` with the remedy `Free it, or set mcp.operator_bus.port to another port in <config>.`), calls `on_bound(addr)` (the L4 self-port hook, L4PAR-AC34), builds the server as `tui::with_shared_governance(tui::server(cfg, McpTransport::Stdio /* a label only, as the TUI's in-process server does */, &services), &agent_state, &audit_ring).with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role).with_push(push_tx)` and spawns `server.serve_on(listener)` as a tokio task held in `OperatorBus { word: Dedicated(addr), task: Some(JoinHandle) }`. Dropping `OperatorBus` aborts the task, which drops the listener, which removes the pointer: Ctrl-C, SIGTERM, the stdin-EOF exit and the TUI's `q` all end `run()` and so the bus.
 - `Off(reason)` → `OperatorBus { word: Off(reason), task: None }`; the mint-failure reason was already warned by §D3.
 
+Table footnote (2026-11-01, Task 6): a stdio/HTTP transport with `operator_bus.enabled` and no token but no mint-failure reason to quote (the mint never ran, e.g. a caller that skipped it) is `Off("no mcp.operator_token")`, the loopback row's word.
+
 **Why not a new `McpTransport` variant:** every `match` on the enum across six crates would change, `wire.rs` is frozen, and the operator bus is not a transport the operator configures but a property every core has.
 
 ### D3. The operator token is minted on a serving first run
