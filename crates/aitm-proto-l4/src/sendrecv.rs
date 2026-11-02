@@ -38,6 +38,21 @@
 //! in the stimulus's own direction — same source address and port, same
 //! destination address and port, same protocol, whatever link framing the
 //! capture delivers it under — and keeps waiting for the reply behind it.
+//!
+//! **Correlation is strict: "the same host" is never enough.** A capture is a
+//! tap on an interface, so inside its scope filter it carries everyone's
+//! traffic, and on loopback every frame's source address is 127.0.0.1 — the
+//! core's own bus, the test target's control channel, another job's datagrams.
+//! Under [`ReplyMatch::FiveTuple`] a frame is the [`SendRecvOutcome::Response`]
+//! only on the **reversed tuple** (from the address and port we probed, back to
+//! the address and port we sent from, over the stimulus's protocol), and
+//! [`SendRecvOutcome::Other`] only in two shapes — an ICMP error whose *quoted*
+//! datagram is our stimulus, or a TCP reset between the same two ports.
+//! Everything else is ignored and the await keeps waiting, so real silence
+//! stays observable on a busy loopback. Reading "from the target host" as a
+//! reaction is what made the packet lane's crash oracle blind: its V-crash job
+//! scored 65 `clean` / 35 `protocol_error` and never once `silence`, against a
+//! target tcpdump showed answering only 73 of 105 datagrams (task 4b, run 9).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -81,13 +96,24 @@ pub struct SendRecvSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplyMatch {
     /// The reply must come from the stimulus destination with the five-tuple
-    /// reversed (source host == `dst`, and for Tcp/Udp source port == `dst_port`
-    /// and the same protocol). The default.
+    /// reversed (source host == `dst`, and for Tcp/Udp source port ==
+    /// `dst_port`, destination port == the port we sent from, and the same
+    /// protocol). Any other frame is ignored, however near it looks: sharing
+    /// the source host proves nothing on a loopback or any shared segment. The
+    /// default, and the only mode a crash oracle should use.
     #[default]
     FiveTuple,
-    /// The reply must come from a specific host, regardless of port/protocol.
+    /// The reply must come from a specific host and be addressed back to the
+    /// port we sent from, but may be sourced from **any** port — the mode for a
+    /// target that answers off another socket than the one probed. Still not
+    /// "any frame from that host": an unrelated conversation between two other
+    /// ports of the same host is ignored.
     FromHost(IpAddr),
-    /// Any decodable reply that is not the stimulus echoed back.
+    /// Any decodable reply that is not the stimulus echoed back — the
+    /// operator's explicit "show me whatever answers" choice, with no
+    /// correlation at all. On a loopback or any shared segment that means the
+    /// first unrelated frame inside the capture's filter wins, so this mode
+    /// cannot tell a reply from noise and must not drive a crash oracle.
     Any,
 }
 
@@ -428,45 +454,183 @@ impl Correlation {
         if self.is_own_stimulus(&info) {
             return Classified::Ignore;
         }
-        let ends = &info.ends;
         match self.expect {
-            // Any decodable frame that is not our own stimulus echoed back.
+            // Any decodable frame that is not our own stimulus echoed back. The
+            // operator's explicit "show me whatever answers" choice.
             ReplyMatch::Any => Classified::Response,
-            // Correlate purely by source host.
+            // The reaction shapes are tested first: a reset carries the reversed
+            // tuple too, and an ICMP error quoting our ICMP stimulus carries our
+            // protocol — both are reactions, never the reply.
             ReplyMatch::FromHost(host) => {
-                if ends.src == Some(host) {
+                if self.is_reaction_from_host(&info, host) {
+                    Classified::Other
+                } else if self.is_reply_from_host(&info, host) {
                     Classified::Response
                 } else {
                     Classified::Ignore
                 }
             }
-            // The reversed five-tuple: from the target host, matching port +
-            // protocol, and not a reset. Anything else from the host is Other;
-            // anything from another host is unrelated.
             ReplyMatch::FiveTuple => {
-                if ends.src != Some(self.dst) {
-                    return Classified::Ignore;
-                }
-                if info.tcp_rst {
-                    return Classified::Other;
-                }
-                // `self.proto` is the stimulus's `packet_target` protocol, where a
-                // frame with no (or an unknown) transport is `Raw`; name the
-                // reply's the same way so a raw-protocol stimulus matches its reply.
-                let proto_match = ends.proto.unwrap_or(L4Proto::Raw) == self.proto;
-                let port_match = match self.dst_port {
-                    Some(p) if matches!(self.proto, L4Proto::Tcp | L4Proto::Udp) => {
-                        ends.src_port == Some(p)
-                    }
-                    _ => true,
-                };
-                if proto_match && port_match {
+                if self.is_reaction_to_our_stimulus(&info) {
+                    Classified::Other
+                } else if self.is_reversed_tuple(&info) {
                     Classified::Response
                 } else {
-                    Classified::Other
+                    Classified::Ignore
                 }
             }
         }
+    }
+
+    /// The stimulus's own source address, when it states one. A crafted frame
+    /// may leave the source unspecified (`0.0.0.0` / `::`) for the kernel to
+    /// fill, and then it cannot say what address a reply will be addressed to.
+    fn our_addr(&self) -> Option<IpAddr> {
+        self.stimulus_ends.src.filter(|a| !a.is_unspecified())
+    }
+
+    /// The stimulus's own source port, when it states one. Port 0 is the craft
+    /// layer's "unset", so it constrains nothing.
+    fn our_port(&self) -> Option<u16> {
+        self.stimulus_ends.src_port.filter(|p| *p != 0)
+    }
+
+    /// Whether the frame comes **from** the address and port we probed: the
+    /// target half of the reversed tuple.
+    fn is_from_the_target(&self, info: &ReplyInfo<'_>) -> bool {
+        if info.ends.src != Some(self.dst) {
+            return false;
+        }
+        match self.dst_port {
+            Some(p) if matches!(self.proto, L4Proto::Tcp | L4Proto::Udp) => {
+                info.ends.src_port == Some(p)
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the frame is addressed **back to us**: to the stimulus's own
+    /// source address and port, as far as the stimulus states them.
+    fn is_addressed_to_us(&self, info: &ReplyInfo<'_>) -> bool {
+        if let Some(our_addr) = self.our_addr() {
+            if info.ends.dst != Some(our_addr) {
+                return false;
+            }
+        }
+        if let Some(our_port) = self.our_port() {
+            if info.ends.dst_port != Some(our_port) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the frame carries the stimulus's protocol. `self.proto` is the
+    /// stimulus's `packet_target` protocol, where a frame with no (or an
+    /// unknown) transport is `Raw`; the frame's is named the same way so a
+    /// raw-protocol stimulus matches its raw-protocol reply.
+    fn is_our_proto(&self, info: &ReplyInfo<'_>) -> bool {
+        info.ends.proto.unwrap_or(L4Proto::Raw) == self.proto
+    }
+
+    /// The reversed five-tuple — the **only** shape a reply to our stimulus can
+    /// have: from the address and port we probed, back to the address and port
+    /// we sent from, over the stimulus's protocol. For a portless stimulus
+    /// (ICMP, an unknown IP protocol) that is addresses and protocol alone.
+    ///
+    /// "Same host" is deliberately not enough. On loopback every frame's source
+    /// address is 127.0.0.1, so accepting a frame on its source address alone
+    /// reads the core's own bus traffic, another cell's datagrams and the test
+    /// target's HTTP control channel as the target's answer — which is how the
+    /// packet lane scored every case `clean`/`protocol_error` and never once
+    /// observed the silence a crash shows up as (task 4b, rig run 9).
+    fn is_reversed_tuple(&self, info: &ReplyInfo<'_>) -> bool {
+        self.is_from_the_target(info) && self.is_addressed_to_us(info) && self.is_our_proto(info)
+    }
+
+    /// The two frames that are a reaction to our stimulus without being a reply
+    /// to it ([`SendRecvOutcome::Other`]), and nothing else:
+    ///
+    /// (a) an ICMP error whose **quoted** datagram is our stimulus. The quote is
+    /// what makes the test sound, and the concrete reason it exists is the
+    /// loopback hazard that produced the wrong reading: our stimulus carries a
+    /// crafted source port no socket is bound to, so every time the target
+    /// answers it the **kernel** sends an ICMP port-unreachable *to the target*,
+    /// and the capture sees that error on the same loopback. Its quoted packet
+    /// is the target's datagram — our tuple reversed — so without reading the
+    /// quote the error would be taken for the target reacting to us, and a
+    /// healthy echo service would score a protocol_error on every case. The
+    /// error's own source address is not checked: a TTL-exceeded legitimately
+    /// comes from a router that is not the target.
+    ///
+    /// (b) a TCP reset from the port we probed back to the port we sent from —
+    /// a closed TCP port's answer. Sequence and ack numbers are not checked
+    /// (a kernel RST to a crafted SYN need not be in any window we track), but
+    /// the endpoints are: a reset belonging to another loopback conversation is
+    /// not ours.
+    fn is_reaction_to_our_stimulus(&self, info: &ReplyInfo<'_>) -> bool {
+        if let Some(quote) = info.icmp_quote {
+            if self.quote_is_our_stimulus(&quote) {
+                return true;
+            }
+        }
+        info.tcp_rst && self.is_from_the_target(info) && self.is_addressed_to_us(info)
+    }
+
+    /// Whether an ICMP error's quoted inner packet is the stimulus we sent:
+    /// same source, same destination, same protocol, and — when the quote
+    /// carries ports (the first 8 quoted transport bytes always do for TCP and
+    /// UDP) — the same ports. The port test is what separates our error from
+    /// the kernel's port-unreachable for the target's reply on loopback, where
+    /// both addresses are 127.0.0.1 and only the ports differ.
+    fn quote_is_our_stimulus(&self, quote: &PacketEndpoints) -> bool {
+        if quote.dst != Some(self.dst) || quote.proto.unwrap_or(L4Proto::Raw) != self.proto {
+            return false;
+        }
+        if let Some(our_addr) = self.our_addr() {
+            if quote.src != Some(our_addr) {
+                return false;
+            }
+        }
+        if let Some(p) = self.dst_port {
+            if quote.dst_port.is_some() && quote.dst_port != Some(p) {
+                return false;
+            }
+        }
+        if let Some(our_port) = self.our_port() {
+            if quote.src_port.is_some() && quote.src_port != Some(our_port) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`ReplyMatch::FromHost`] is the mode for a target that answers **from
+    /// another port** than the one probed (a service that replies off an
+    /// ephemeral socket): the frame must come from `host`, carry the stimulus's
+    /// protocol and be addressed back to the port we sent from, but its source
+    /// port is free. It is still not "any frame from that host" — on loopback
+    /// that would admit every unrelated conversation.
+    fn is_reply_from_host(&self, info: &ReplyInfo<'_>, host: IpAddr) -> bool {
+        info.ends.src == Some(host) && self.is_addressed_to_us(info) && self.is_our_proto(info)
+    }
+
+    /// The two `Other` shapes under [`ReplyMatch::FromHost`], with the target
+    /// port relaxed to the host: an ICMP error quoting a datagram we sent to
+    /// `host`, and a reset from `host` addressed back to the port we sent from.
+    fn is_reaction_from_host(&self, info: &ReplyInfo<'_>, host: IpAddr) -> bool {
+        if let Some(quote) = info.icmp_quote {
+            let ours = quote.dst == Some(host)
+                && quote.proto.unwrap_or(L4Proto::Raw) == self.proto
+                && self.our_addr().is_none_or(|a| quote.src == Some(a))
+                && self
+                    .our_port()
+                    .is_none_or(|p| quote.src_port.is_none() || quote.src_port == Some(p));
+            if ours {
+                return true;
+            }
+        }
+        info.tcp_rst && info.ends.src == Some(host) && self.is_addressed_to_us(info)
     }
 
     /// Whether a decoded frame travels in the stimulus's **own direction** —
@@ -535,12 +699,20 @@ impl Correlation {
 
 /// What a reply frame carries for correlation: its endpoints (addresses, ports,
 /// transport protocol — the crate's one decode, [`crate::craft::endpoints_of`]),
-/// whether it is a TCP reset, and its transport bytes (everything after the IP
-/// header, as the parser delimits them).
+/// whether it is a TCP reset, its transport bytes (everything after the IP
+/// header, as the parser delimits them) and, for an ICMP error, the endpoints
+/// of the datagram it quotes.
 struct ReplyInfo<'a> {
     ends: PacketEndpoints,
     tcp_rst: bool,
     transport: &'a [u8],
+    /// The endpoints of the packet an ICMP error quotes — the offending
+    /// datagram the error is *about*. `None` for every non-error ICMP type and
+    /// for a quote too short or too malformed to read. The correlator accepts
+    /// an ICMP error as a reaction to our stimulus only when this is our
+    /// stimulus, which is what keeps the kernel's port-unreachable for the
+    /// *target's* reply (same addresses, reversed ports) out of the result.
+    icmp_quote: Option<PacketEndpoints>,
 }
 
 /// Decode a captured frame to its correlation fields. `None` for a frame with no
@@ -563,6 +735,82 @@ fn decode_reply(frame: &[u8]) -> Option<ReplyInfo<'_>> {
         ends,
         tcp_rst,
         transport,
+        icmp_quote: icmp_quote(&parsed.transport),
+    })
+}
+
+/// The endpoints of the datagram an ICMP **error** quotes, or `None`.
+///
+/// Only the ICMP types that carry a quote are read — IPv4 destination
+/// unreachable (3), source quench (4), redirect (5), time exceeded (11) and
+/// parameter problem (12); ICMPv6 destination unreachable (1), packet too big
+/// (2), time exceeded (3) and parameter problem (4). An echo or any other
+/// informational message carries a payload that is not a packet, and reading
+/// one as a quote would invent a correlation.
+fn icmp_quote(transport: &Option<TransportSlice<'_>>) -> Option<PacketEndpoints> {
+    match transport {
+        Some(TransportSlice::Icmpv4(icmp)) if matches!(icmp.type_u8(), 3 | 4 | 5 | 11 | 12) => {
+            quoted_endpoints(icmp.payload())
+        }
+        Some(TransportSlice::Icmpv6(icmp)) if matches!(icmp.type_u8(), 1..=4) => {
+            quoted_endpoints(icmp.payload())
+        }
+        _ => None,
+    }
+}
+
+/// Decode the head of a quoted packet — an IP header plus the first bytes of
+/// its transport — into endpoints.
+///
+/// An ICMP error quotes only the offending datagram's header and (classically)
+/// its first 8 transport bytes, which is a whole UDP header but a fragment of a
+/// TCP one, so the full-packet parser cannot be used here: the IP header is
+/// read with `etherparse`'s header slice (which validates version, IHL and
+/// length and tolerates the truncated payload behind it) and the port pair is
+/// read from the first four transport bytes, the only field TCP and UDP share
+/// at the same offset. Every read is bounds-checked; wire-derived bytes are
+/// hostile and nothing here may panic.
+fn quoted_endpoints(quote: &[u8]) -> Option<PacketEndpoints> {
+    use etherparse::{Ipv4HeaderSlice, Ipv6HeaderSlice};
+
+    let (src, dst, protocol, rest) = if let Ok(v4) = Ipv4HeaderSlice::from_slice(quote) {
+        (
+            IpAddr::from(v4.source_addr()),
+            IpAddr::from(v4.destination_addr()),
+            v4.protocol().0,
+            quote.get(v4.slice().len()..)?,
+        )
+    } else if let Ok(v6) = Ipv6HeaderSlice::from_slice(quote) {
+        (
+            IpAddr::from(v6.source_addr()),
+            IpAddr::from(v6.destination_addr()),
+            v6.next_header().0,
+            quote.get(v6.slice().len()..)?,
+        )
+    } else {
+        return None;
+    };
+
+    let proto = match protocol {
+        1 => Some(L4Proto::Icmp),
+        6 => Some(L4Proto::Tcp),
+        17 => Some(L4Proto::Udp),
+        58 => Some(L4Proto::IcmpV6),
+        _ => None,
+    };
+    let (src_port, dst_port) = match (proto, rest.get(..4)) {
+        (Some(L4Proto::Tcp | L4Proto::Udp), Some(ports)) => (
+            Some(u16::from_be_bytes([ports[0], ports[1]])),
+            Some(u16::from_be_bytes([ports[2], ports[3]])),
+        ),
+        _ => (None, None),
+    };
+    Some(PacketEndpoints {
+        proto,
+        src: Some(src),
+        dst: Some(dst),
+        src_port,
+        dst_port,
     })
 }
 
@@ -853,26 +1101,39 @@ mod tests {
         assert_eq!(g.in_flight(), 0);
     }
 
-    /// A reply from the target host but with the wrong port (not the reversed
-    /// five-tuple) is `Other`, not `Response`.
+    /// Task 4b (was `send_recv_non_matching_reply_is_other`): a frame from the
+    /// target **host** whose source port is not the port we probed is not the
+    /// reversed five-tuple, is neither of the two reaction shapes, and is
+    /// therefore `Ignore`d — the await keeps waiting and reports silence. Under
+    /// the old rule it was `Other`, which on a busy loopback made every
+    /// unrelated frame a "protocol error" from the target.
     #[test]
-    fn send_recv_non_matching_reply_is_other() {
+    fn send_recv_non_matching_reply_is_ignored() {
         let g = send_recv_guard();
         let backend = MockBackend::with_replies(vec![udp_reply("127.0.0.1", 99, b"nope")]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
 
-        let (_flow_id, outcome) = send_recv(
+        let timeout = Duration::from_millis(80);
+        let (flow_id, outcome) = send_recv(
             &g,
             backend,
-            store,
-            spec(ReplyMatch::FiveTuple, Duration::from_secs(1)),
+            store.clone(),
+            spec(ReplyMatch::FiveTuple, timeout),
         )
         .expect("runs");
 
-        assert!(
-            matches!(outcome, SendRecvOutcome::Other(_)),
-            "wrong-port reply from the host is Other, got {outcome:?}"
+        match outcome {
+            SendRecvOutcome::NoResponse { waited } => {
+                assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
+            }
+            other => panic!("a wrong-port frame from the host is not a reply, got {other:?}"),
+        }
+        assert_eq!(
+            store.get(flow_id).expect("flow present").packets.len(),
+            1,
+            "only the stimulus is recorded"
         );
+        assert_eq!(g.in_flight(), 0);
     }
 
     /// A TCP RST reply frame from `src:src_port` to the stimulus source port, the
@@ -2148,6 +2409,341 @@ mod tests {
             assert_eq!(store.get(flow_id).expect("flow present").packets.len(), 1);
             assert_eq!(g.in_flight(), 0);
         }
+    }
+
+    /// An L3 TCP frame from `src:src_port` to `dst:dst_port` with `flags` —
+    /// both ends explicit, so a test can state an unrelated conversation.
+    fn tcp_from_to(src: &str, src_port: u16, dst: &str, dst_port: u16, flags: u8) -> Vec<u8> {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(src_port),
+                    dst_port: Some(dst_port),
+                    flags: Some(flags),
+                    ..TcpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("tcp frame builds")
+    }
+
+    /// The lane's UDP stimulus on loopback: 127.0.0.1:40000 -> 127.0.0.1:9.
+    fn lane_stimulus() -> Vec<u8> {
+        udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe")
+    }
+
+    /// A correlation for [`lane_stimulus`], as `send_recv` builds it.
+    fn lane_correlation(expect: ReplyMatch) -> Correlation {
+        Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            Some(9),
+            L4Proto::Udp,
+            expect,
+            lane_stimulus(),
+        )
+    }
+
+    /// Run `frames` through a `FiveTuple` `send_recv` for [`lane_stimulus`] and
+    /// return the outcome together with the recorded flow's packet count.
+    fn lane_run(frames: Vec<Vec<u8>>, timeout: Duration) -> (SendRecvOutcome, usize) {
+        lane_run_as(frames, ReplyMatch::FiveTuple, timeout)
+    }
+
+    /// [`lane_run`] under an arbitrary match mode.
+    fn lane_run_as(
+        frames: Vec<Vec<u8>>,
+        expect: ReplyMatch,
+        timeout: Duration,
+    ) -> (SendRecvOutcome, usize) {
+        let stimulus = lane_stimulus();
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(frames);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            raw_spec(&stimulus, 9, expect, timeout),
+        )
+        .expect("authorized send_recv runs");
+        let packets = store.get(flow_id).expect("flow present").packets.len();
+        assert_eq!(g.in_flight(), 0);
+        (outcome, packets)
+    }
+
+    /// Task 4b (Critical, rig run 9): on a busy loopback every frame's source
+    /// address is 127.0.0.1, so "the frame came from the target host" is no
+    /// evidence at all. A bus-like TCP segment between two ports that are
+    /// neither end of our stimulus must be `Ignore`d — under the old rule it was
+    /// `Other`, which the lane's oracle read as `protocol_error` and which made
+    /// real silence unobservable (the V-crash job scored 65 clean / 35
+    /// protocol_error and never one `silence`).
+    #[test]
+    fn an_unrelated_tcp_frame_on_loopback_is_ignored_under_five_tuple() {
+        // A client connecting to the core's bus: SYN/ACK 127.0.0.1:8080 -> :51000.
+        let bus = tcp_from_to("127.0.0.1", 8080, "127.0.0.1", 51000, 0x12);
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&bus),
+                Classified::Ignore
+            ),
+            "an unrelated loopback TCP segment is not our target's reaction"
+        );
+
+        let timeout = Duration::from_millis(80);
+        let (outcome, packets) = lane_run(vec![bus], timeout);
+        match outcome {
+            SendRecvOutcome::NoResponse { waited } => {
+                assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
+            }
+            other => panic!("expected silence past the unrelated frame, got {other:?}"),
+        }
+        assert_eq!(packets, 1, "the flow holds the stimulus alone");
+    }
+
+    /// The same for UDP: another cell's datagram between 127.0.0.1:53 and
+    /// 127.0.0.1:34567 shares only the host with our stimulus and is ignored.
+    #[test]
+    fn an_unrelated_udp_frame_from_another_port_is_ignored() {
+        let other_cell = udp_from_to("127.0.0.1", 53, "127.0.0.1", 34567, b"not-ours");
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&other_cell),
+                Classified::Ignore
+            ),
+            "a datagram between two foreign ports is not our reply"
+        );
+
+        let timeout = Duration::from_millis(80);
+        let (outcome, packets) = lane_run(vec![other_cell], timeout);
+        assert!(
+            matches!(outcome, SendRecvOutcome::NoResponse { .. }),
+            "expected silence, got {outcome:?}"
+        );
+        assert_eq!(packets, 1);
+    }
+
+    /// The loopback hazard the quoted-packet test closes: our stimulus carries a
+    /// crafted source port no socket is bound to, so when the target answers it
+    /// the kernel replies to **the target** with an ICMP port-unreachable. That
+    /// error quotes the target's datagram (127.0.0.1:9 -> 127.0.0.1:40000, the
+    /// reverse of ours), so it is the kernel reacting to the target, never the
+    /// target reacting to us, and must be ignored — otherwise a perfectly
+    /// healthy echo service scores a protocol_error on every case.
+    #[test]
+    fn the_kernels_port_unreachable_for_the_targets_echo_reply_is_not_our_reaction() {
+        let targets_reply = udp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, b"probe");
+        let kernel_unreachable = icmp_from("127.0.0.1", 3, 3, &targets_reply);
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&kernel_unreachable),
+                Classified::Ignore
+            ),
+            "an ICMP error quoting the reversed packet is not our stimulus's error"
+        );
+
+        let timeout = Duration::from_millis(80);
+        let (outcome, packets) = lane_run(vec![kernel_unreachable], timeout);
+        assert!(
+            matches!(outcome, SendRecvOutcome::NoResponse { .. }),
+            "expected silence, got {outcome:?}"
+        );
+        assert_eq!(packets, 1);
+    }
+
+    /// The shape that **is** ours: an ICMP 3/3 whose quoted datagram is our own
+    /// stimulus (127.0.0.1:40000 -> 127.0.0.1:9 udp). It is `Other`, and the
+    /// lane's oracle reads `icmp(3,3)` off the recorded packet.
+    #[test]
+    fn an_icmp_error_quoting_our_stimulus_is_the_reaction() {
+        let unreachable = icmp_from("127.0.0.1", 3, 3, &lane_stimulus());
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&unreachable),
+                Classified::Other
+            ),
+            "an ICMP error quoting our stimulus is the target's reaction"
+        );
+
+        let (outcome, packets) = lane_run(vec![unreachable.clone()], Duration::from_secs(10));
+        match outcome {
+            SendRecvOutcome::Other(p) => {
+                assert_eq!(p.bytes, unreachable);
+                assert_eq!(
+                    crate::icmp::icmp_error(&p),
+                    Some((3, 3)),
+                    "the oracle reads the port-unreachable pair"
+                );
+            }
+            other => panic!("expected the ICMP 3/3 as Other, got {other:?}"),
+        }
+        assert_eq!(packets, 2, "stimulus + the reaction");
+    }
+
+    /// A closed TCP port's reset is `Other` only when it comes **from the port
+    /// we probed back to the port we sent from**; a reset belonging to another
+    /// loopback conversation is ignored.
+    #[test]
+    fn a_reset_from_the_target_port_is_the_reaction() {
+        let syn = tcp_syn_to(9);
+        let c = Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            Some(9),
+            L4Proto::Tcp,
+            ReplyMatch::FiveTuple,
+            syn.clone(),
+        );
+        let ours = tcp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, 0x14);
+        assert!(
+            matches!(c.classify(&ours), Classified::Other),
+            "the probed port's RST is the reaction"
+        );
+        let foreign = tcp_from_to("127.0.0.1", 1234, "127.0.0.1", 51000, 0x14);
+        assert!(
+            matches!(c.classify(&foreign), Classified::Ignore),
+            "another conversation's RST is not our reaction"
+        );
+
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![foreign.clone(), ours.clone()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (_, outcome) = send_recv(
+            &g,
+            backend,
+            store,
+            raw_spec(&syn, 9, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Other(p) => assert_eq!(p.bytes, ours, "our RST, not the foreign one"),
+            other => panic!("expected the RST as Other, got {other:?}"),
+        }
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// The positive the strict rule must not lose: with unrelated loopback
+    /// traffic ahead of it, the target's echo reply is still the `Response` and
+    /// the flow holds the stimulus and that reply only.
+    #[test]
+    fn a_real_echo_reply_still_correlates_on_a_busy_loopback() {
+        let bus = tcp_from_to("127.0.0.1", 8080, "127.0.0.1", 51000, 0x12);
+        let other_cell = udp_from_to("127.0.0.1", 53, "127.0.0.1", 34567, b"not-ours");
+        let echo = udp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, b"probe");
+
+        let (outcome, packets) =
+            lane_run(vec![bus, other_cell, echo.clone()], Duration::from_secs(10));
+        match outcome {
+            SendRecvOutcome::Response(p) => assert_eq!(p.bytes, echo, "the echo, not the noise"),
+            other => panic!("expected the echo as Response, got {other:?}"),
+        }
+        assert_eq!(packets, 2, "stimulus + reply");
+    }
+
+    /// Amendment 66, positive (UDP): the reversed five-tuple echo from the port
+    /// we probed is the `Response` — the strict rule drops no real reply.
+    #[test]
+    fn a_udp_echo_reply_from_the_target_port_is_the_response() {
+        let echo = udp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, b"probe");
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&echo),
+                Classified::Response
+            ),
+            "the reversed five-tuple is the reply"
+        );
+        let (outcome, packets) = lane_run(vec![echo.clone()], Duration::from_secs(10));
+        match outcome {
+            SendRecvOutcome::Response(p) => assert_eq!(p.bytes, echo),
+            other => panic!("expected the UDP echo as Response, got {other:?}"),
+        }
+        assert_eq!(packets, 2);
+    }
+
+    /// Amendment 66, positive (TCP): a listening port's SYN-ACK from the port we
+    /// probed back to the port we sent from is the `Response` — not `Other`
+    /// (which would read as a protocol_error) and not `Ignore`.
+    #[test]
+    fn a_tcp_syn_ack_from_the_target_port_is_the_response() {
+        let syn = tcp_syn_to(9);
+        let c = Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            Some(9),
+            L4Proto::Tcp,
+            ReplyMatch::FiveTuple,
+            syn.clone(),
+        );
+        let syn_ack = tcp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, 0x12);
+        assert!(
+            matches!(c.classify(&syn_ack), Classified::Response),
+            "a listening port's SYN-ACK is the reply"
+        );
+
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![syn_ack.clone()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            raw_spec(&syn, 9, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Response(p) => assert_eq!(p.bytes, syn_ack),
+            other => panic!("expected the SYN-ACK as Response, got {other:?}"),
+        }
+        assert_eq!(store.get(flow_id).expect("flow present").packets.len(), 2);
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// `FromHost` is the mode for a target that answers from **another port**:
+    /// the frame must come from the host and be addressed back to the port we
+    /// sent from, but its source port is free. `FiveTuple` ignores the same
+    /// frame, and a frame addressed to a foreign port is ignored in both.
+    #[test]
+    fn from_host_accepts_a_reply_from_another_port_that_five_tuple_ignores() {
+        let from_another_port = udp_from_to("127.0.0.1", 1234, "127.0.0.1", 40000, b"probe");
+        let host = ReplyMatch::FromHost("127.0.0.1".parse().unwrap());
+        assert!(
+            matches!(
+                lane_correlation(host).classify(&from_another_port),
+                Classified::Response
+            ),
+            "FromHost correlates a reply sourced from another port"
+        );
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&from_another_port),
+                Classified::Ignore
+            ),
+            "FiveTuple requires the reversed tuple"
+        );
+
+        let to_a_foreign_port = udp_from_to("127.0.0.1", 53, "127.0.0.1", 34567, b"not-ours");
+        assert!(
+            matches!(
+                lane_correlation(host).classify(&to_a_foreign_port),
+                Classified::Ignore
+            ),
+            "FromHost still requires the frame to be addressed back to us"
+        );
+
+        let (outcome, packets) = lane_run_as(
+            vec![to_a_foreign_port, from_another_port.clone()],
+            host,
+            Duration::from_secs(10),
+        );
+        match outcome {
+            SendRecvOutcome::Response(p) => assert_eq!(p.bytes, from_another_port),
+            other => panic!("expected the other-port reply as Response, got {other:?}"),
+        }
+        assert_eq!(packets, 2);
     }
 
     /// C3 (security): a stimulus whose crafted IP destination is a denylisted host,
