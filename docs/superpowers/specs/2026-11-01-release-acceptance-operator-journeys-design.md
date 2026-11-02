@@ -334,8 +334,9 @@ Where each negative is observed (its cell):
   (TUI-1, WEB-1, CLI-3) refuse when any of 8080/8081/8082 is busy; MAC `yes` steps require that the holder of 8080 is the
   app's embedded core (bundle-path `pgrep`). Windows are announced on stdout with timestamps.
 - mac driving: `lib/menu.sh "<Menu>" "<Item>"` (System Events, `set frontmost to true` first),
-  `lib/type.sh` (pbcopy + ⌘V, probe first), `lib/click.sh <x> <y>` (a System Events click at the
-  screen point, two clicks 0.9 s apart, frontmost first) used on the Edit Scope field's centre
+  `lib/type.sh` (pbcopy + ⌘V, probe first), `lib/click.sh "<description>" ["<identifier>"]` (locates
+  the text field through accessibility right before EACH of two clicks 0.9 s apart, frontmost first,
+  and refuses if the field is gone or moved — no stale coordinates) used on the Edit Scope field
   before the focus probe — the sheet does not focus its field when Scope already has hosts (run 5,
   MAC-5); the field is located by accessibility identifier when the app exposes one (`scope-add-host`
   once the mac fix lands), else by its description "Host to add to scope"; `screencapture -R` loop
@@ -510,3 +511,13 @@ Scope is non-empty and System Events cannot set focus on a SwiftUI text field; t
 field's accessibility bounds before the probe (`lib/click.sh`, `installed.field_center`), identifier first,
 description fallback; the product fix (focus the Add field whenever the sheet opens, plus an accessibility
 identifier) is carded for the mac session.
+
+Stage-6 panel on PR #281 (`82e495f3..d7e6b63c`, 2026-11-02): security FAIL on one Important (a raw-coordinate
+click with no re-check of the target before the second click) → fixed: `click.sh` takes the field's
+description/identifier and re-locates it through accessibility before each click, refusing on gone/moved;
+quality FAIL on one Important (MAC-5/N1 failure texts claimed a probe that never ran) → fixed: one message per
+gate (click refused vs probe not seen); spec FAIL on one Important (the N1 re-probe gained the click and broke
+the ~1 s timing) → fixed: the click is pre-restart only. Minors fixed: empty/negative-coordinate guard (moot:
+no coordinates on argv), identifier cross-checked against the description, float/zero/garbage tests, module-level
+import, Constraints wording. Accepted: the five-script refusal preamble stays duplicated (a `guard.sh` is a
+follow-up, not this PR).

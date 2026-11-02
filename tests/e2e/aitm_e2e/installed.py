@@ -394,8 +394,8 @@ class StepWriter:
 
 def field_center(dump: str, description: str, identifier: str | None = None) -> tuple[int, int] | None:
     """Screen centre of a text field in an `ax_texts.sh` dump: the row whose accessibility
-    identifier equals `identifier` wins (the mac fix adds one); else the first row whose description
-    equals `description`. Text-field rows carry identifier, "x,y" position and "w,h" size as their
+    identifier equals `identifier` AND whose description matches wins (the mac fix adds the
+    identifier); else the first row whose description equals `description`. Text-field rows carry identifier, "x,y" position and "w,h" size as their
     5th–7th tab columns; rows without them (older dumps, zero size) yield None."""
     fallback = None
     for row in dump.splitlines():
@@ -410,8 +410,8 @@ def field_center(dump: str, description: str, identifier: str | None = None) -> 
         if w <= 0 or h <= 0:
             continue
         centre = (x + w // 2, y + h // 2)
-        if identifier and cols[4] == identifier:
-            return centre
+        if identifier and cols[4] == identifier and cols[3] == description:
+            return centre   # identifier wins, but only on the field whose description also matches
         if fallback is None and cols[3] == description:
             fallback = centre
     return fallback
