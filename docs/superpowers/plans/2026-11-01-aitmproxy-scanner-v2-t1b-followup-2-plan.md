@@ -1,7 +1,7 @@
 # Scanner v2 T1b follow-up 2 (amendments 38, 39, 40, 46; deterministic job tests) implementation plan
 
 **Status:** approved 2026-11-01 by the T1b orchestrator under Matt's autonomous mandate (self-approve specs/plans). Decisions on the architect's open calls: C4 keeps "reason only when every crawl request failed" (the coordinator's wording of amendment 39; a partial failure is visible in `crawl.errors` alone); the `other` token for free-text browser-crawl failures is accepted. Amendments 38-40 are cited as "" until that docs PR is on main.
-**Spec:** `docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md` (Approved), D4 "Scheduling", D5 (job model, budget and pacing, "degrade, do not fail"), D11 (`l4_icmp_pace_ms_min`), amendment log rows 46 (on `main`) and 38/39/40 (folded by the coordinator's docs PR #273, head `0f1f8509`, wording quoted below).
+**Spec:** `docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md` (Approved), D4 "Scheduling", D5 (job model, budget and pacing, "degrade, do not fail"), D11 (`l4_icmp_pace_ms_min`), amendment log rows 38/39/40 and 46, all on `main` (docs PR #273 merged as 449d6d17; wording quoted below).
 **Prior plan (conventions, Review log, Shipped):** `docs/superpowers/plans/2026-10-31-aitmproxy-scanner-v2-t1b-plan.md` (T1b, merged as #232 = `3aa8cc67`).
 **Branch / worktree:** `claude/scanner-v2-t1b-followup-2` in `/Users/matt/Security/aitmproxy/.claude/worktrees/wizardly-nightingale-441e25`, cut from `main` `7f942f9f` (contains T1b `3aa8cc67`, T3 PR 2a `2044ac52`, T5 `7f942f9f`). PR target `main`.
 **Size:** one PR; seven tasks in four waves.
