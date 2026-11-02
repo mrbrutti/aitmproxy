@@ -112,8 +112,11 @@ pub struct Verdict {
 
 impl Verdict {
     /// Scrub every free-text field a check may have copied from a response, in
-    /// place: `detail`, the [`Evidence`] (through [`Evidence::scrub`]), and the
-    /// same for every `more` sibling (amendment 67, call C5).
+    /// place: `detail`, the [`Evidence`] (through [`Evidence::scrub`]), the
+    /// [`VerdictLocation`]'s `path` and `name` (scrubbed then bounded like an
+    /// excerpt: a check that copies a response `Location` header into `path`
+    /// must not hand its `?token=` to the bus caller or the issue store), and
+    /// the same for every `more` sibling (amendment 67, call C5).
     ///
     /// One rule for both consumers: the Rhai bridge applies it where a script's
     /// verdict is built, the manual `check.<id>` path applies it before the
@@ -124,6 +127,16 @@ impl Verdict {
     pub fn scrub(&mut self) {
         self.detail = scrub_text_wide(&self.detail);
         self.evidence.scrub();
+        if let Some(location) = &mut self.location {
+            location.path = location
+                .path
+                .as_deref()
+                .map(|text| Evidence::excerpt(&scrub_text_wide(text)));
+            location.name = location
+                .name
+                .as_deref()
+                .map(|text| Evidence::excerpt(&scrub_text_wide(text)));
+        }
         for sibling in &mut self.more {
             sibling.scrub();
         }
@@ -587,7 +600,10 @@ mod tests {
     /// is scrubbed **then** bounded (amendment 16: the exact 256-byte literal
     /// the bridge test pins — cut first, the scrub would leave 249 bytes), and
     /// the scrub is idempotent so a verdict the bridge scrubbed comes through
-    /// the manual path unchanged.
+    /// the manual path unchanged. The `location` override is free text a check
+    /// may have copied from a response `Location` header, so its `path` and
+    /// `name` are scrubbed then bounded like an excerpt, root and sibling
+    /// (PR 3a panel, security Minor 1).
     #[test]
     fn verdict_scrub_covers_detail_evidence_and_siblings() {
         let verdict = Verdict {
@@ -603,7 +619,10 @@ mod tests {
             },
             detail: "echo: Authorization: Bearer abc.def.ghi".into(),
             poc_hint: None,
-            location: None,
+            location: Some(VerdictLocation {
+                path: Some("/reset?token=eyJhbGciOi.eyJzdWIi.c2ln".into()),
+                name: Some("n".repeat(1024 * 1024)),
+            }),
             more: vec![Verdict {
                 outcome: Outcome::Vulnerable,
                 confidence: Confidence::Firm,
@@ -614,7 +633,10 @@ mod tests {
                 },
                 detail: "sibling Cookie: sid=s3cr3t".into(),
                 poc_hint: None,
-                location: None,
+                location: Some(VerdictLocation {
+                    path: Some("/cb?sid=abc123".into()),
+                    name: None,
+                }),
                 more: Vec::new(),
             }],
         };
@@ -641,6 +663,21 @@ mod tests {
         assert_eq!(
             once.more[0].evidence.payload.as_deref(),
             Some("sid=[redacted]")
+        );
+        // A `location` copied from a response is scrubbed then bounded, root
+        // and sibling; an absent field stays absent.
+        let location = once.location.as_ref().expect("location is kept");
+        assert_eq!(location.path.as_deref(), Some("/reset?token=[redacted]"));
+        assert_eq!(
+            location.name.as_deref(),
+            Some("n".repeat(MAX_EXCERPT_BYTES).as_str())
+        );
+        assert_eq!(
+            once.more[0].location,
+            Some(VerdictLocation {
+                path: Some("/cb?sid=[redacted]".into()),
+                name: None,
+            })
         );
         // Untouched: the scrub is about free text only.
         assert_eq!(once.outcome, Outcome::Vulnerable);

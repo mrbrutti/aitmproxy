@@ -428,6 +428,43 @@ async fn a_throwing_closure_is_an_error_verdict() {
     assert!(verdict.detail.contains("boom"), "{:?}", verdict.detail);
 }
 
+/// PR 3a panel (security Minor 2, quality Minor 5): the bridge scrubs at its
+/// one structural exit, so the eval-error arm is covered too. A closure that
+/// `throw`s a string carrying a bearer token (a script doing `throw resp.body`
+/// on an unexpected answer) yields an `Error` verdict whose `detail` reads
+/// `[redacted]` where the token was; the token itself never leaves the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thrown_value_carrying_a_secret_is_scrubbed_in_the_error_verdict() {
+    let (verdict, _host) = verdict_of(
+        r#"throw "unexpected reply: Authorization: Bearer abc.def.ghi""#,
+        200,
+        "body",
+    )
+    .await;
+
+    assert_eq!(verdict.outcome, Outcome::Error);
+    assert!(
+        verdict
+            .detail
+            .starts_with("error: <source>:5 — hook 'anon$"),
+        "{:?}",
+        verdict.detail
+    );
+    assert!(
+        verdict.detail.ends_with(
+            "' failed: unexpected reply: Authorization: [redacted]\n  help: the flow was \
+             forwarded unchanged. Fix the hook and reload the script."
+        ),
+        "{:?}",
+        verdict.detail
+    );
+    assert!(
+        !verdict.detail.contains("abc.def.ghi"),
+        "{:?}",
+        verdict.detail
+    );
+}
+
 /// A verdict map whose `outcome` is not an `Outcome` token is an `Error` naming
 /// it, never a silent `clean` (spec D4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

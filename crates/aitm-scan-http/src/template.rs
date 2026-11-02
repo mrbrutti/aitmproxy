@@ -258,8 +258,9 @@ const REDIRECT_NAMES: [&str; 17] = [
 /// `REDIRECT_URI` match, `nextpage` does not. The caller decides which kinds
 /// have a parameter name at all (C2: not a path segment, not the whole body).
 pub(crate) fn is_redirect_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    REDIRECT_NAMES.contains(&lower.as_str())
+    REDIRECT_NAMES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
 }
 
 /// Whether `value` parses as a whole number or a finite decimal.
@@ -321,9 +322,33 @@ fn last_path_segment(value: &str) -> &str {
 mod tests {
     use super::{
         is_id_like, is_redirect_name, looks_like_filename, path_segment_token, path_template,
-        traits_for, REDIRECT_NAMES,
+        traits_for,
     };
     use aitm_scan_model::PointTrait::{Base64, Email, Filename, Id, Json, Number, Url};
+
+    /// Amendment 83's seventeen redirect-like parameter names, as the ruling
+    /// spells them (plan line 13), written here and not read from the
+    /// implementation so that dropping `rurl` or adding `nextpage` to the
+    /// const goes red.
+    const RULING_REDIRECT_NAMES: [&str; 17] = [
+        "next",
+        "url",
+        "redirect",
+        "redirect_uri",
+        "return",
+        "returnTo",
+        "return_url",
+        "goto",
+        "continue",
+        "dest",
+        "destination",
+        "target",
+        "rurl",
+        "back",
+        "callback",
+        "forward",
+        "location",
+    ];
 
     #[test]
     fn path_template_pins() {
@@ -407,7 +432,7 @@ mod tests {
 
     /// Amendment 83's value branch (path-like, including the `//host`, `\/host`
     /// and `\\host` forms a redirect filter is bypassed with) and its name
-    /// branch (the eighteen redirect-like parameter names, ASCII
+    /// branch (the seventeen redirect-like parameter names, ASCII
     /// case-insensitive and exact).
     #[test]
     fn url_like_and_redirect_name_pins() {
@@ -427,14 +452,31 @@ mod tests {
         assert!(!is_redirect_name(""));
     }
 
-    /// Tester (amendment 83, C1/C2): the name branch is exact and
-    /// ASCII-case-folded over every one of the ruling's names — each matches
-    /// upper-cased, none matches with a character appended, a prefix, or
-    /// surrounding whitespace — and the value branch tags no value that
-    /// carries whitespace or is a bare `/`, however the rest reads.
+    /// Tester (amendment 83, C1/C2): the implementation's set is exactly the
+    /// ruling's seventeen names (as a sorted, lower-cased set), and the name
+    /// branch is exact and ASCII-case-folded over every one of them — each
+    /// matches as spelled and upper-cased, none matches with a character
+    /// appended, a prefix, or surrounding whitespace — and the value branch
+    /// tags no value that carries whitespace or is a bare `/`, however the
+    /// rest reads.
     #[test]
     fn redirect_names_match_exactly_and_url_like_values_are_clean_paths() {
-        for name in REDIRECT_NAMES {
+        let mut ruling: Vec<String> = RULING_REDIRECT_NAMES
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        ruling.sort();
+        let mut known: Vec<String> = super::REDIRECT_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        known.sort();
+        assert_eq!(
+            known, ruling,
+            "the const is the ruling's list, no more, no less"
+        );
+
+        for name in RULING_REDIRECT_NAMES {
             assert!(is_redirect_name(name), "{name}");
             assert!(
                 is_redirect_name(&name.to_ascii_uppercase()),

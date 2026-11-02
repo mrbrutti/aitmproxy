@@ -202,6 +202,10 @@ impl Check for ScriptCheck {
                 // apply to a script's sends too (spec D9.3).
                 let result = with_client(client, call);
 
+                // One structural exit: a thrown value is a script's own text
+                // (`throw resp.body`), so the eval-error arm is scrubbed like
+                // every well-formed shape. The scrub is idempotent, so the
+                // `Ok` arm's own scrub costs nothing here.
                 match result {
                     Ok(value) => verdict_from_dynamic(&value),
                     Err(err) => error_verdict(
@@ -209,6 +213,7 @@ impl Check for ScriptCheck {
                             .to_string(),
                     ),
                 }
+                .scrubbed()
             })
         })
     }
@@ -382,14 +387,23 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 /// siblings ([`verdict_from_array`]); anything else is an `error` naming what
 /// came back.
 ///
-/// Every form comes back through [`Verdict::scrubbed`]: `detail` (root and
-/// siblings) and `evidence.payload`/`matched` are scrubbed here, where the
-/// verdict is built, so a closure that echoes a session cookie or a bearer
-/// token from a response hands it neither to the job path nor to the manual
-/// `check.<id>` path (spec D8.1, amendments 56 and 67). The scrub precedes the
-/// `matched` bound (amendment 16) inside the model's one shared function, the
-/// same one the manual path applies.
+/// Every form comes back through [`Verdict::scrubbed`], applied once at this
+/// function's single exit (the shapes themselves are read by
+/// [`verdict_from_dynamic_raw`]): `detail` (root and siblings),
+/// `evidence.payload`/`matched` and `location.path`/`name` are scrubbed here,
+/// where the verdict is built, so a closure that echoes a session cookie or a
+/// bearer token from a response hands it neither to the job path nor to the
+/// manual `check.<id>` path (spec D8.1, amendments 56 and 67). The scrub
+/// precedes the `matched` bound (amendment 16) inside the model's one shared
+/// function, the same one the manual path applies. A new return shape added
+/// to the raw reader is scrubbed by structure, not by its author remembering.
 pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
+    verdict_from_dynamic_raw(value).scrubbed()
+}
+
+/// The four shapes of [`verdict_from_dynamic`], read without scrubbing; only
+/// its wrapper calls this.
+fn verdict_from_dynamic_raw(value: &Dynamic) -> Verdict {
     if let Some(text) = value.read_lock::<rhai::ImmutableString>() {
         return Verdict {
             outcome: Outcome::Inconclusive,
@@ -399,11 +413,10 @@ pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
             poc_hint: None,
             location: None,
             more: Vec::new(),
-        }
-        .scrubbed();
+        };
     }
     if let Some(items) = value.read_lock::<rhai::Array>() {
-        return verdict_from_array(&items).scrubbed();
+        return verdict_from_array(&items);
     }
     let Some(map) = value.read_lock::<Map>() else {
         return error_verdict(format!(
@@ -412,7 +425,7 @@ pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
             value.type_name()
         ));
     };
-    verdict_from_map(&map).scrubbed()
+    verdict_from_map(&map)
 }
 
 /// An array return: element `[0]` is the root verdict, the rest go into its
