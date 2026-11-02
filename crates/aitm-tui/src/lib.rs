@@ -304,9 +304,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "scan.profile.save",
     "scan.profile.delete",
     "scan.session.preview",
-    // One manual verb per registered check (D3 `check.<id>`): the ten T3 natives
-    // (PR 2a) and the interim HTTP lane's three passive checks. The three interim
-    // passive ids go away with T2's integration.
+    // One manual verb per registered check (spec D3 `check.<id>`): the ten T3
+    // natives of `aitm-scan-checks-http` (PR 2a) and the three passive checks
+    // the scanner engine itself ships (`reflection`, `security-header`,
+    // `cookie-flag`), which stay on the surface whatever lane holds the http
+    // slot (spec amendment 24: "the passives stay").
     "check.xss-reflected",
     "check.open-redirect",
     "check.sqli-boolean",
