@@ -9,15 +9,28 @@ import { flowKinds } from '~/viewers/lang/defs.gen';
 
 // ---- wire shapes (authoritative; see the hand-over note) ----------------------------------------
 
-/** One packet in `l4.flow.get` — note: **no raw bytes** on the wire, only length + layer names. */
+/**
+ * One packet in `l4.flow.get`. The four original fields are always present; the parity spec (§2)
+ * adds the rest, all optional because an older core omits them and `bytes` is also per-caller
+ * (§2.2: absent when the caller may not see the payload).
+ */
 export interface L4PacketWire {
   dir: 'inbound' | 'outbound';
   length: number;
   injected: boolean;
   layers: string[];
+  /** On-wire bytes, standard padded base64 (decode with `lib/bytes.base64ToBytes`). */
+  bytes?: string;
+  /** Epoch milliseconds, UTC. */
+  timestamp?: number;
+  proto?: 'TCP' | 'UDP' | 'ICMP' | 'ICMPv6' | string | null;
+  src?: string | null;
+  dst?: string | null;
+  src_port?: number | null;
+  dst_port?: number | null;
 }
 
-/** `l4.flow.get {id}` result. */
+/** `l4.flow.get {id, offset?, limit?}` result (spec §2: the window fields are optional, older cores omit them). */
 export interface L4FlowWire {
   id: string;
   kind: 'capture' | 'craft' | 'send_recv' | 'intercept';
@@ -27,9 +40,22 @@ export interface L4FlowWire {
   packet_count: number;
   injected_count: number;
   packets: L4PacketWire[];
+  /** Flow creation, epoch ms. */
+  started_at?: number;
+  /** Flow-level addresses from the first decodable packet, so a list row needs no packets. */
+  proto?: string | null;
+  src?: string | null;
+  dst?: string | null;
+  src_port?: number | null;
+  dst_port?: number | null;
+  /** The window this reply starts at (`packet_count` stays the total). */
+  offset?: number;
+  /** True when the byte budget cut the window short; `next_offset` is then the next index. */
+  truncated?: boolean;
+  next_offset?: number | null;
 }
 
-/** One `l4.scope.list` entry. */
+/** One `l4.scope.list` entry; `source` arrives with the parity core (spec §3). */
 export interface L4ScopeEntryWire {
   id: string;
   cidr: string;
@@ -38,6 +64,19 @@ export interface L4ScopeEntryWire {
   direction: 'inbound' | 'outbound';
   capability: 'capture' | 'inject' | 'intercept';
   inject_rate: { pps: number; burst: number };
+  source?: 'config' | 'runtime';
+}
+
+/** One `l4.intercept.list` entry: a packet parked in-path awaiting a verdict (spec §4). */
+export interface L4ParkedWire {
+  id: string;
+  flow: string;
+  state: 'parked' | 'mutated';
+  dir: 'inbound' | 'outbound';
+  length: number;
+  layers: string[];
+  /** Epoch ms; the list is in arrival order, oldest first. */
+  parked_at?: number;
 }
 
 /** `l4.craft {spec}` result — `bytes` is base64 (decode with `lib/bytes.base64ToBytes`). */
@@ -337,3 +376,171 @@ layers:
       dst_port: 9
   - raw: "probe"
 `;
+
+// ---- availability seam (parity spec §1) ---------------------------------------------------------
+//
+// `l4.capture.status` / `l4.intercept.status` always answer with `{available, code, reason,
+// captures|sessions}` on a parity core. An older core answers a bare array (⇒ available) or refuses
+// the gated verbs with an error whose text carries `L4 unavailable: <reason>`. Both shapes map here,
+// so the UI never caches availability and never crashes on either core.
+
+export interface L4Availability {
+  available: boolean;
+  code: string | null;
+  reason: string | null;
+}
+
+/** Until the first status reply lands: not available, with the literal every UI shows. */
+export const PENDING_AVAILABILITY: L4Availability = Object.freeze({
+  available: false,
+  code: null,
+  reason: 'Reading L4 availability…',
+});
+
+const L4_UNAVAILABLE_MARKER = 'L4 unavailable: ';
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Map a status reply (new object or older bare array) to availability. */
+export function availabilityFromReply(reply: unknown): L4Availability {
+  if (Array.isArray(reply)) return { available: true, code: null, reason: null };
+  if (isRecord(reply) && typeof reply.available === 'boolean') {
+    return {
+      available: reply.available,
+      code: typeof reply.code === 'string' ? reply.code : null,
+      reason: typeof reply.reason === 'string' ? reply.reason : null,
+    };
+  }
+  // Neither shape: say so rather than guess; the control stays off with a visible reason.
+  return { available: false, code: null, reason: 'unrecognised L4 status reply' };
+}
+
+/**
+ * An older core's refusal, `…L4 unavailable: <reason>`, as availability; `null` when the message
+ * is some other error (a transport failure is not "L4 unavailable").
+ */
+export function availabilityFromError(message: string): L4Availability | null {
+  const at = message.indexOf(L4_UNAVAILABLE_MARKER);
+  if (at < 0) return null;
+  return { available: false, code: null, reason: message.slice(at + L4_UNAVAILABLE_MARKER.length) };
+}
+
+/**
+ * The ids carried by a status reply: `captures` are flow-id strings, `sessions` are objects keyed
+ * by `flow`. A bare array (older core) is read the same way.
+ */
+export function statusIds(reply: unknown, key: 'captures' | 'sessions'): string[] {
+  const items: unknown = Array.isArray(reply) ? reply : isRecord(reply) ? reply[key] : undefined;
+  if (!Array.isArray(items)) return [];
+  const out: string[] = [];
+  for (const item of items) {
+    if (typeof item === 'string') out.push(item);
+    else if (isRecord(item)) {
+      const id = typeof item.id === 'string' ? item.id : typeof item.flow === 'string' ? item.flow : null;
+      if (id) out.push(id);
+    }
+  }
+  return out;
+}
+
+// ---- argument builders (AC18–AC20, AC22) --------------------------------------------------------
+//
+// Every L4 action builds its arguments here, and `L4_ARG_BUILDERS` lists each key per verb so the
+// live schema check (args.test.ts) can prove each one is in the core's inputSchema.
+
+export type L4Direction = 'inbound' | 'outbound';
+
+/** `l4.capture.start`: interface + direction only; the core derives the BPF filter from scope. */
+export function captureStartArgs(iface: string, direction: L4Direction): { interface: string; direction: L4Direction } {
+  return { interface: iface, direction };
+}
+
+/** `l4.capture.stop {id}` for one running capture. */
+export function captureStopArgs(id: string): { id: string } {
+  return { id };
+}
+
+/** One `l4.capture.stop` argument object per running capture id. */
+export function stopAllArgs(ids: readonly string[]): { id: string }[] {
+  return ids.map((id) => captureStopArgs(id));
+}
+
+/** `l4.intercept.forward` / `l4.intercept.drop`: the parked packet id (spec §4), never the flow id. */
+export function verdictArgs(parkedId: string): { id: string } {
+  return { id: parkedId };
+}
+
+/** `l4.intercept.mutate {id, spec}`. */
+export function mutateArgs(parkedId: string, spec: PacketSpec): { id: string; spec: PacketSpec } {
+  return { id: parkedId, spec };
+}
+
+/** `l4.intercept.revert {id}`. */
+export function revertArgs(parkedId: string): { id: string } {
+  return { id: parkedId };
+}
+
+/** The scope add form's draft, one field per `l4.scope.add` argument. */
+export interface L4ScopeDraft {
+  cidr: string;
+  ports: string;
+  interface: string;
+  direction: L4Direction;
+  capability: 'capture' | 'inject' | 'intercept';
+}
+
+/** `l4.scope.add` arguments, in the form's field order. */
+export function scopeAddArgs(d: L4ScopeDraft): L4ScopeDraft {
+  return { cidr: d.cidr, ports: d.ports, interface: d.interface, direction: d.direction, capability: d.capability };
+}
+
+/** The inspector's packet window size (spec §2 default). */
+export const L4_INSPECT_LIMIT = 256;
+
+/**
+ * `l4.flow.get` arguments. With the window (parity core): list rows ask `limit: 0` (flow fields
+ * only), the inspector asks the first window. Without it (older core) only `{id}`, which the older
+ * schema accepts.
+ */
+export function flowGetArgs(
+  id: string,
+  mode: 'list' | 'inspect',
+  window: boolean,
+): { id: string; offset?: number; limit?: number } {
+  if (!window) return { id };
+  return mode === 'list' ? { id, limit: 0 } : { id, offset: 0, limit: L4_INSPECT_LIMIT };
+}
+
+/** The flow's first-listed (oldest) parked packet, or `null` when none is parked for it. */
+export function parkedFor(parked: readonly L4ParkedWire[], flowId: string): L4ParkedWire | null {
+  return parked.find((p) => p.flow === flowId) ?? null;
+}
+
+// ---- tools/list feature detects -------------------------------------------------------------------
+
+/** True iff `l4.flow.get` declares `limit` (the parity core's bounded window, spec §2). */
+export function supportsFlowWindow(
+  tools: readonly { name: string; inputSchema?: { properties?: Record<string, unknown> } }[],
+): boolean {
+  const t = tools.find((x) => x.name === 'l4.flow.get');
+  return !!t && !!t.inputSchema?.properties && 'limit' in t.inputSchema.properties;
+}
+
+/** True iff `l4.scope.add` is offered with `confirmable: true` (spec §3; AC39): the add form only then. */
+export function supportsOperatorScopeAdd(tools: readonly { name: string; confirmable?: unknown }[]): boolean {
+  return tools.some((t) => t.name === 'l4.scope.add' && t.confirmable === true);
+}
+
+/** Every verb the builders above emit, with its argument keys, for the live schema check (AC18). */
+export const L4_ARG_BUILDERS: readonly { tool: string; keys: readonly string[] }[] = [
+  { tool: 'l4.capture.start', keys: ['interface', 'direction'] },
+  { tool: 'l4.capture.stop', keys: ['id'] },
+  { tool: 'l4.intercept.forward', keys: ['id'] },
+  { tool: 'l4.intercept.drop', keys: ['id'] },
+  { tool: 'l4.intercept.mutate', keys: ['id', 'spec'] },
+  { tool: 'l4.intercept.revert', keys: ['id'] },
+  { tool: 'l4.scope.add', keys: ['cidr', 'ports', 'interface', 'direction', 'capability'] },
+  { tool: 'l4.flow.get', keys: ['id', 'offset', 'limit'] },
+];
