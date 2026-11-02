@@ -525,6 +525,29 @@ fn a_page_of_oversized_ids_is_dropped_without_a_read() {
     assert_eq!(app.scan.issues.pending_read, None);
 }
 
+/// Fix round I, I3 (D6 hostile-core bounds, the Site map's G16 bound on
+/// the Issues page): a `next_cursor` over `CURSOR_MAX` is dropped to
+/// `None` at fold and never stored; one within the bound is kept.
+#[test]
+fn an_oversized_next_cursor_is_dropped_at_fold() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let mut page = page_of(1, |_| XSS.to_string());
+    page["next_cursor"] = json!("c".repeat(5000));
+    let _ = app.on_bus(issues_reply(page));
+    assert_eq!(app.scan.issues.list.len(), 1, "the page itself is folded");
+    assert_eq!(app.scan.issues.next_cursor, None);
+
+    let mut page = page_of(1, |_| XSS.to_string());
+    page["next_cursor"] = json!("cursor-abc");
+    let _ = app.on_bus(issues_reply(page));
+    assert_eq!(
+        app.scan.issues.next_cursor.as_deref(),
+        Some("cursor-abc"),
+        "a ten-char cursor is kept"
+    );
+}
+
 /// Fix round H, H86 (D6 hostile-core bounds): a page row's `jobs` is cut
 /// at fold like a read issue's (H84): a summary carrying 200 finder ids of
 /// 2000 chars each is stored with `DETAIL_LIST_MAX` ids of at most

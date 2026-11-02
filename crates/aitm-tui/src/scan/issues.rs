@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     confidence_token, is_issue_id, lane_token, scroll, severity_token, status_token, step, walk,
-    wire_token, Dir, ScanError, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT,
+    wire_token, Dir, ScanError, CURSOR_MAX, DETAIL_LIST_MAX, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT,
     SEVERITY_ORDER,
 };
 use crate::action::Action;
@@ -465,7 +465,12 @@ pub struct IssuesState {
     pub rows: Vec<IssueRow>,
     /// The severity tally the headers show.
     pub by_severity: BySeverity,
-    /// `Some` while another page can be fetched.
+    /// `Some` while another page can be fetched; dropped to `None` at fold
+    /// when the core's cursor is over [`CURSOR_MAX`] bytes (fix round I,
+    /// I3; D6 hostile-core bounds). Unlike the Site map's G16 path this
+    /// raises no error: the Issues tab never echoes the cursor back yet
+    /// (the filters re-read the first page), so there is nothing to refuse,
+    /// only an unbounded string not to hold.
     pub next_cursor: Option<String>,
     pub filters: IssueFilters,
     /// The list cursor.
@@ -505,8 +510,9 @@ impl IssuesState {
     /// whose id is not in the wire form is dropped, the page is cut to
     /// [`ISSUES_PAGE_LIMIT`], every summary the page keeps is bounded
     /// ([`bound_summary`]: its free strings and its `jobs`; fix round H,
-    /// H86) before its display row is built from it, and `read` keeps only
-    /// the ids the page lists.
+    /// H86) before its display row is built from it, a `next_cursor` over
+    /// [`CURSOR_MAX`] bytes is dropped (fix round I, I3), and `read` keeps
+    /// only the ids the page lists.
     pub fn fold_result(&mut self, mut result: IssuesResult) {
         result.issues.retain(|i| is_issue_id(&i.id));
         result.issues.truncate(ISSUES_PAGE_LIMIT);
@@ -515,7 +521,7 @@ impl IssuesState {
         self.rows = result.issues.iter().map(issue_row).collect();
         self.list = result.issues;
         self.by_severity = result.by_severity;
-        self.next_cursor = result.next_cursor;
+        self.next_cursor = result.next_cursor.filter(|c| c.len() <= CURSOR_MAX);
         let found = selected.and_then(|id| self.list.iter().position(|i| i.id == id));
         self.cursor = found.unwrap_or(self.cursor.min(self.list.len().saturating_sub(1)));
         let listed: BTreeSet<&str> = self.list.iter().map(|i| i.id.as_str()).collect();
@@ -594,15 +600,22 @@ impl IssuesState {
         self.detail().map_or(0, |read| DetailLayout::of(read).total)
     }
 
-    /// Drop every read issue whose sole finder is `job` (spec D6: a terminal
-    /// line for the job lets the next landing read the issue again), by the
-    /// jobs the issue itself names (`jobs_or_job()`; fix round H, H84), so a
-    /// filtered-out job's issues leave too while an issue another listed
-    /// job still owns stays read.
+    /// Drop every read issue whose every finder is `job` (spec D6: a
+    /// terminal line for the job lets the next landing read the issue
+    /// again), by the jobs the issue itself names (fix round H, H84; fix
+    /// round I, I2): `jobs` when it lists any, else `job`, read in place
+    /// without a clone. A filtered-out job's issues leave too, an issue
+    /// another listed job still owns stays read, and a `jobs` that repeats
+    /// the one finder (collapsed at fold anyway, I1) or disagrees with
+    /// `job` is read by what it lists.
     pub fn forget_job(&mut self, job: &str) {
         self.read.retain(|_, i| {
-            let jobs = i.jobs_or_job();
-            !(jobs.len() == 1 && jobs[0] == job)
+            let only_this_job = if i.jobs.is_empty() {
+                i.job == job
+            } else {
+                i.jobs.iter().all(|j| j == job)
+            };
+            !only_this_job
         });
     }
 }

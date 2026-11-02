@@ -1033,6 +1033,48 @@ fn forget_job_keeps_an_issue_another_job_still_owns() {
     assert!(app.scan.issues.read.is_empty());
 }
 
+/// Fix round I, I2: an issue is forgotten for `job` when every finder it
+/// lists is `job`; a `jobs` that repeats the sole finder is still one
+/// finder, and `jobs` outranks `job` when the two disagree.
+#[test]
+fn forget_job_reads_every_listed_finder() {
+    // `jobs: [A, A]` is one finder: A's terminal line drops it.
+    let mut app = app_with_xss_read();
+    let mut issue = fixture("scan.issue.json");
+    issue["jobs"] = json!(["scan-1a2b3c4d", "scan-1a2b3c4d"]);
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    assert!(app.scan.issues.detail().is_some());
+    app.scan.issues.forget_job("scan-1a2b3c4d");
+    assert!(
+        app.scan.issues.detail().is_none(),
+        "a repeated sole finder is still the sole finder"
+    );
+    assert!(app.scan.issues.read.is_empty());
+
+    // `job: A, jobs: [B]`: the listed finder is B, so A's line keeps it
+    // and B's drops it.
+    let mut app = app_with_xss_read();
+    let mut issue = fixture("scan.issue.json");
+    assert_eq!(
+        issue["job"],
+        json!("scan-1a2b3c4d"),
+        "the fixture's job is A"
+    );
+    issue["jobs"] = json!(["scan-2b3c4d5e"]);
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
+    app.scan.issues.forget_job("scan-1a2b3c4d");
+    assert!(
+        app.scan.issues.detail().is_some(),
+        "the `job` field alone does not make A a finder when `jobs` names B"
+    );
+    app.scan.issues.forget_job("scan-2b3c4d5e");
+    assert!(
+        app.scan.issues.detail().is_none(),
+        "the listed finder's line drops it"
+    );
+    assert!(app.scan.issues.read.is_empty());
+}
+
 /// Fix round H, H84 (D6 hostile-core bounds): the `jobs` list is cut at
 /// fold to `DETAIL_LIST_MAX` ids, each cut like `job`, and the line says
 /// `+n` for the rest; twenty finders read as the first eight and `+12`.
