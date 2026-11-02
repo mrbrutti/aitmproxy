@@ -3,22 +3,20 @@
 //! Owned by track **T3** of the scanner v2 design
 //! (`docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md`, section
 //! **D8.2**). This crate contributes native checks to the HTTP lane's catalogue,
-//! not a second `http` lane, so its registration slot is [`checks`] rather than
-//! `lane()` (spec amendment of 2026-10-31, recorded as A16).
+//! not a second `http` lane, so its registration slot is [`checks_with`] rather
+//! than `lane()` (spec amendment of 2026-10-31, recorded as A16).
 //!
 //! Track T1a handed over the skeleton: the crate exists, is a workspace member,
 //! and exposes the registration slot the binary calls, so T3 flips the body
 //! and edits no shared file (spec D1).
 //!
-//! There are two slots. [`checks_with`] takes the job's `SsrfPolicy` and the
-//! engine's `ScopeRateGuard` and returns the ten native checks of D8.2;
-//! [`checks`], the slot `crates/aitm/src/wire.rs` calls today, returns
-//! **nothing** in this PR, so an ungated raw HTTP/2 probe cannot be built
-//! through a slot at all and no native check is reachable from the binary
-//! yet (coordinator decision of 2026-11-01, option A; split-PR call of the
-//! final F6 pass). The binary collects the catalogue through
-//! **`checks_with`**, with the live policy and guard, in a follow-up PR once
-//! the engine lands. The ten, in id order:
+//! The one slot, [`checks_with`], takes the operator's `SsrfPolicy` and the
+//! proxy's `ScopeRateGuard` and returns the ten native checks of D8.2;
+//! `crates/aitm/src/wire.rs` calls it at startup with the live policy and a
+//! guard bound to the proxy's, so all ten are reachable from the binary and
+//! every raw HTTP/2 probe is gated (coordinator decision of 2026-11-01,
+//! option A; wired in T3 PR 2a). There is no gate-free slot: an ungated raw
+//! probe cannot be built through a slot at all. The ten, in id order:
 //!
 //! | Technique | Checks | Module |
 //! |---|---|---|
@@ -65,7 +63,7 @@ pub mod redirect;
 pub mod sqli_boolean;
 pub mod xss;
 
-pub use catalogue::{checks, checks_with};
+pub use catalogue::checks_with;
 
 // The catalogue slots' agreement with the design — the ten ids, the five
 // gate-free ones, the metadata shape and the `class` tokens — is pinned in

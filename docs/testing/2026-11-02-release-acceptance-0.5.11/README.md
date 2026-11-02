@@ -153,9 +153,59 @@ and the tail has rolled past the attribution session's `scope.remove` entries. N
 capture or extension reading changed. `.secrets` did not exist after the run (never written: the web
 cell did not run). Secret grep: 2 values known at start and end, none found.
 
-## Run 5 — window half
+## Run 5 — the window half, 2026-11-02 03:58–04:12Z (`run-5-window-c3e55bee/`)
 
-Pending: display lock after the attribution session's Task 8; yes-list requested from Matt
-(MAC-1/16 quit + relaunch, MAC-6/15, MAC-7/14 not needed while All Apps is on, Safari visits,
-TUI-3/7 and WEB-4/7 system-proxy flips). Scope hosts added by run 4 are removed at its end
-unless Matt says keep, and listed either way.
+Display lock granted by the orchestrator; Matt's yes, verbatim relayed: "Yes, all MAC steps"
+(`ACCEPT_YES=MAC-2…MAC-16`, `ACCEPT_WINDOW=1`, `--manual`). Quit/relaunch of his app was **not**
+approved, so TUI-3/7 and WEB-4/7 stayed SKIP. Runner at `c3e55bee` (main after #278), run from the
+main checkout. The CLI had become 0.5.11 (formula bumped) by this run.
+
+Starting state: app pid 98179, core pid 46605 (0.5.11) on 8080, All Apps on and attached, system
+proxy off (Proxyman's 9090 disabled on both services), CA trusted, Scope `["wikipedia.org"]`
+(someone else's), Safari running, Settings ▸ Proxy "Bypass hosts" key **never saved**.
+
+| # | Result | Observed on the real window | Bus truth | Explains |
+|---|---|---|---|---|
+| MAC-1 | PASS | lane words "running", "connected", "operator ·" present | `listening true`, version 0.5.11 | — |
+| MAC-2 | PASS | first-run sheet not shown (already dismissed or every row done) — recorded | `ca.status user trusted yes` | — |
+| MAC-3 | **PASS** | Status page shows exactly "system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core." and "All Apps is on" (`MAC-3-ax.txt`) | scope 1 host, capture on/attached, system proxy off | — |
+| MAC-4 | PASS | rows exist → banner case; no banner is correct (All Apps on, Scope filled, CA trusted) | `flow.table` 6 rows | — |
+| N2-MAC | SKIP | not the N2 state (a route is open: All Apps on) | — | — |
+| MAC-5 | **FAIL** | Proxy ▸ Scope… opened the Edit Scope sheet on the first press and the field "Host to add to scope" exists, but the **focused element is the sheet itself**, not the field; the probe digit was not read back and the cell refused to type into an unknown target. Diagnosis (`MAC-5-diagnosis.txt`): three probes, two attempts to set focus through accessibility (System Events cannot filter `entire contents`, and SwiftUI exposes no settable focus on the field). The field auto-focuses only when Scope is empty. | `scope.list` unchanged `["wikipedia.org"]` | product UX: the Add field should take focus whenever the sheet opens (card for the mac session); harness: click the field's AX bounds with a CGEvent before typing |
+| MAC-6 | SKIP | `bypass list absent in the app's Settings ▸ Proxy Bypass hosts`: the `systemProxy.bypass` key was never saved, so the run could not read back the bypass the app would pass and refused to flip (spec MAC-6 precondition) | `proxy.system.status state off` | Matt saves the field once (it shows the recommended default) to unblock MAC-6/15 |
+| MAC-7 | **PASS** | "All Apps is on" read on the Status page | `capture.status enabled true, attached` | — |
+| MAC-8 | BLOCKED | MAC-5 (no host added; the Safari leg did not run) | — | — |
+| MAC-9a | BLOCKED | no extension-captured rows (Scope has only `wikipedia.org`, no traffic to it) | `flows_handed_off.tcp 0` | — |
+| MAC-9b | **FAIL** | 6 proxied rows, 0 with `source_app` → Apps sidebar shows nothing for them | `flow.table source_app null ×6` | missing feature (core-name-the-client-app) |
+| MAC-10/11/12 | BLOCKED | MAC-8 | — | — |
+| MAC-13 | **PASS** | Proxy ▸ Restart Core: new core pid 70510, Scope rows kept, no stale "Embedded core failed — not capturing" banner (`MAC-13-ax.txt`) | `scope.list` before == after `["wikipedia.org"]`, `listening true` | — |
+| N1-MAC | SKIP | the Edit Scope sheet did not take focus before the restart; no add attempted (same root cause as MAC-5) | — | #274 is in this build |
+| MAC-14 | SKIP | All Apps was on at start (operator's state); the run never turns his capture off | — | — |
+| MAC-15 | SKIP | nothing to restore (MAC-6 did not set it) | — | — |
+| MAC-16 | SKIP | the app was running at start; not quit by the run | — | — |
+| MAC-0, N3/N4/N5-MAC | SKIP | release-run only; CA stays trusted; plain 8080 listener needs a yes; Settings ▸ Bus is a hand | — | — |
+| CLI-4/5/10 | **FAIL** | as runs 1–4, now on the 0.5.11 CLI | running core `listening true`, `scope.list` unchanged, 6 flows vs `[]` | `claude/cli-oneshot-live-core` |
+| CLI-7, N4-CLI, N4-TUI, N4-WEB, N5-TUI | PASS | as before | — | — |
+| TUI-*, WEB-* | SKIP / N/A | ports held (quit not approved); n/a rows | — | — |
+
+Restore proof: `state-before` vs `state-after` (volatile columns stripped) differs only by MAC-13's core
+restart (pid 46605 → 70510, its obscura child, the new per-launch dir), the harness's own CLI start
+markers in the shared audit tail, and a sibling session's `rustfmt` process line. System proxy, CA,
+extension, Scope, defaults: unchanged. Leftovers: none (no host added; three probe digits typed into a
+sheet with no focused field, nothing submitted; the sheet was dismissed with Esc at the end).
+Secret grep: 4 values known (both cores' tokens, before and after the restart), none found.
+
+| Journey | PASS | FAIL | SKIP | BLOCKED | ERROR | N/A |
+|---|---|---|---|---|---|---|
+| CLI | 2 | 3 | 7 | 0 | 0 | 0 |
+| MAC | 6 | 2 | 10 | 5 | 0 | 0 |
+| NEGATIVES | 3 | 0 | 0 | 0 | 0 | 1 |
+| TUI | 0 | 0 | 11 | 0 | 0 | 3 |
+| WEB | 0 | 0 | 14 | 0 | 0 | 3 |
+
+**Verdict after run 5: `fail`** — CLI-4/5/10 (`claude/cli-oneshot-live-core`), MAC-9b (proxied-flow
+attribution), MAC-5 (Edit Scope field not focused when Scope is non-empty; also blocks the Safari /
+intercept legs). First window-half PASSes on the installed build: MAC-3 (the Status words), MAC-7,
+MAC-13 (Restart Core keeps Scope, no stale banner). Unblocking the rest: Matt saves the Bypass hosts
+field once (MAC-6/15), the mac session fixes the sheet focus or the harness clicks the field, and the
+quit/relaunch yes for the TUI and web halves.

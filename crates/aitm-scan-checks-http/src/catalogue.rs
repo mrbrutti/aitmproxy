@@ -1,21 +1,14 @@
-//! The native check lists this crate contributes to the HTTP lane's catalogue.
+//! The native check list this crate contributes to the HTTP lane's catalogue.
 //!
-//! There are two slots, because five of the ten checks open a raw HTTP/2
-//! connection of their own instead of probing through the lane's guarded
-//! client (coordinator decision of 2026-11-01, option A):
-//!
-//! - [`checks_with`] takes the job's SSRF policy and the engine's scope guard
-//!   and returns **all ten**, with the five h2 checks built over a runner that
-//!   checks every address it resolves against both before it dials;
-//! - [`checks`] — the slot the binary calls today — returns **nothing** in
-//!   this PR. The binary collects the catalogue through
-//!   `checks_with(policy, guard)` in a follow-up PR once the engine lands;
-//!   until then the slot stays empty, so no native check is reachable from
-//!   the binary and `crates/aitm/src/wire.rs`'s skeleton test keeps
-//!   asserting zero (split-PR decision of the final F6 pass).
-//!
-//! An ungated raw h2 probe therefore cannot be built through a slot at all:
-//! there is no constructor that omits the gate.
+//! One slot, [`checks_with`]: it takes the operator's SSRF policy and the
+//! proxy's scope guard and returns **all ten** checks of spec D8.2, with the
+//! five h2 checks built over a runner that checks every address it resolves
+//! against both before it dials (coordinator decision of 2026-11-01, option
+//! A). `crates/aitm/src/wire.rs::collect_native_checks` calls it once at
+//! startup with `cfg.browser.ssrf` and a guard bound to the proxy's (T3 PR
+//! 2a), so every native check is live in the binary and every raw HTTP/2
+//! probe is gated. There is no gate-free slot: a constructor that omitted the
+//! gate would be the one place the binary could reach a raw probe without it.
 
 use std::sync::Arc;
 
@@ -25,27 +18,11 @@ use aitm_scan_model::Check;
 use crate::h2_observe::{h2_checks, RealRawH2Runner};
 use crate::{blind_timing, redirect, sqli_boolean, xss};
 
-/// The ungated slot, which `crates/aitm/src/wire.rs::collect_native_checks`
-/// calls today: **empty** in this PR.
-///
-/// The binary collects the catalogue through [`checks_with`] — with the
-/// job's live `SsrfPolicy` and the engine's `ScopeRateGuard` — in a follow-up
-/// PR once the engine lands. Until then this slot stays empty, so no native
-/// check is reachable from the binary, and `wire.rs`'s
-/// `skeleton_lane_slots_are_empty_today` keeps asserting zero (split-PR
-/// decision of the final F6 pass, 2026-11-01). The five gate-free checks are
-/// not offered here either: a slot the binary can reach without the gate
-/// would be the one place the two halves of the catalogue could diverge.
-#[must_use]
-pub fn checks() -> Vec<Arc<dyn Check>> {
-    Vec::new()
-}
-
 /// This crate's native HTTP checks: the ten of spec D8.2, in id order.
 ///
-/// `crates/aitm/src/wire.rs` calls this once at startup, with the job's live
-/// `SsrfPolicy` and the engine's `ScopeRateGuard`, and adds what it gets back
-/// to the HTTP lane's catalogue. Each call builds fresh checks, so the
+/// `crates/aitm/src/wire.rs` calls this once at startup, with the operator's
+/// `SsrfPolicy` (`browser.ssrf`) and a `ScopeRateGuard` bound to the proxy's
+/// own guard, and hands what it gets back to the scanner's native slot. Each call builds fresh checks, so the
 /// per-instance state a check keeps — the h2 checks' once-per-authority guard
 /// — is never shared between two catalogues.
 ///

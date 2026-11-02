@@ -437,9 +437,10 @@ mod tests {
         // binary binds the services after the proxy exists (call B3).
         assert!(!engine.late.is_bound());
         assert!(late.is_bound() == engine.late.is_bound());
-        // No lane crate: the interim HTTP lane runs, so its five checks are in
-        // the catalogue beside the native one.
-        assert_eq!(engine.catalogue().all().len(), 6);
+        // No lane crate: the interim HTTP lane runs, so its three passive checks
+        // are in the catalogue beside the native one (its two legacy actives
+        // left `checks()` when the T3 natives took their ids, PR 2a).
+        assert_eq!(engine.catalogue().all().len(), 4);
         assert!(engine.catalogue().conflicts().is_empty());
     }
 

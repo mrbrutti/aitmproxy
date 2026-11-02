@@ -1,0 +1,17 @@
+07:38:32 shot 21-run-t1; scan.status scan-3bb76a3b
+{"state": "running", "phase": "auditing", "elapsed_ms": 0, "sent": 268, "budget": 2000, "audited": 983, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:38:37 shot 21-run-t2; scan.status scan-3bb76a3b
+{"state": "running", "phase": "auditing", "elapsed_ms": 0, "sent": 482, "budget": 2000, "audited": 1003, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:38:41 shot 21-run-t3; scan.status scan-3bb76a3b
+{"state": "done", "phase": "done", "elapsed_ms": 12247, "sent": 661, "budget": 2000, "audited": 1027, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:38:46 shot 21-run-t4; scan.status scan-3bb76a3b
+{"state": "done", "phase": "done", "elapsed_ms": 12247, "sent": 661, "budget": 2000, "audited": 1027, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:38:50 shot 21-run-t5; scan.status scan-3bb76a3b
+{"state": "done", "phase": "done", "elapsed_ms": 12247, "sent": 661, "budget": 2000, "audited": 1027, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:38:53 click Cancel Scan
+07:38:57 shot 22-cancel-t1; scan.status scan-3bb76a3b
+{"state": "done", "phase": "done", "elapsed_ms": 12247, "sent": 661, "budget": 2000, "audited": 1027, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:38:59 shot 22-cancel-t2; scan.status scan-3bb76a3b
+{"state": "done", "phase": "done", "elapsed_ms": 12247, "sent": 661, "budget": 2000, "audited": 1027, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}
+07:39:01 shot 22-cancel-t3; scan.status scan-3bb76a3b
+{"state": "done", "phase": "done", "elapsed_ms": 12247, "sent": 661, "budget": 2000, "audited": 1027, "found": 1033, "issues": {"critical": 0, "high": 0, "info": 0, "low": 1, "medium": 0}}

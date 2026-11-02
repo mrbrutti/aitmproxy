@@ -534,10 +534,18 @@ pub struct RawH2Observation {
     pub goaway: Option<(u32, u32)>,
     /// True when the conversation ended with the connection torn down rather
     /// than finished: the peer sent EOF or `GOAWAY`, or the driver hung up
-    /// because the read budget, the read timeout or the whole-probe timeout was
-    /// spent. False when every stream reached an outcome on a healthy
-    /// connection the driver then closed itself.
+    /// because the read budget or the whole-probe timeout was spent. False
+    /// when every stream reached an outcome on a healthy connection the
+    /// driver then closed itself, and false when the peer merely went silent
+    /// (`peer_silent`).
     pub connection_closed: bool,
+    /// True when the probe ended because the peer sent nothing for
+    /// `RAW_READ_TIMEOUT` while the connection stayed open: a silent peer,
+    /// not a closed one. A server that discards cancelled streams without a
+    /// word looks exactly like this, so the checks must not read it as a
+    /// hang-up (live run against hyper, 2026-11-01). Never set together
+    /// with `connection_closed`.
+    pub peer_silent: bool,
     /// Wall-clock time from the dial to the close, in milliseconds.
     pub elapsed_ms: u32,
 }
@@ -666,6 +674,7 @@ impl RawH2Client {
             streams: vec![StreamOutcome::Timeout; streams],
             goaway: None,
             connection_closed: false,
+            peer_silent: false,
             elapsed_ms: 0,
         };
 
@@ -680,9 +689,13 @@ impl RawH2Client {
             // Then the gate, on every address this name answered, immediately
             // before the dial — so the address the driver connects to is one
             // the operator's policy and scope actually allow.
-            if let Some(gate) = &self.ssrf {
-                gate.check("raw h2 probe", &authority, &host, &ips)?;
-            }
+            // The live scope permit is held until the conversation ends, so
+            // the connection is paced and counted as one active egress and a
+            // scope change during the probe is seen on the next one.
+            let _permit = match &self.ssrf {
+                Some(gate) => Some(gate.check_live("raw h2 probe", &authority, &host, &ips)?),
+                None => None,
+            };
             let addr = ips
                 .into_iter()
                 .next()
@@ -939,7 +952,11 @@ async fn converse(
                     break;
                 }
             }
-            Next::Eof | Next::Idle | Next::Budget => {
+            Next::Idle => {
+                obs.peer_silent = true;
+                return Ok(());
+            }
+            Next::Eof | Next::Budget => {
                 obs.connection_closed = true;
                 return Ok(());
             }
@@ -1050,7 +1067,13 @@ async fn read_outcomes(
                 // the oracle is reset-vs-answer.
                 _ => {}
             },
-            Next::Eof | Next::Idle | Next::Budget => {
+            // A silent peer ends the probe too, but the connection is still
+            // open: the observation says so, and says it apart from a close.
+            Next::Idle => {
+                obs.peer_silent = true;
+                return Ok(false);
+            }
+            Next::Eof | Next::Budget => {
                 obs.connection_closed = true;
                 return Ok(false);
             }
@@ -2250,7 +2273,8 @@ mod driver_tests {
             vec![StreamOutcome::Timeout; 3],
             "a reset for an unopened stream is not an outcome for any slot"
         );
-        assert!(obs.connection_closed, "the first stream was never answered");
+        assert!(obs.peer_silent, "the first stream was never answered");
+        assert!(!obs.connection_closed, "silence is not a close");
         assert_eq!(dialer.calls(), 1);
         settled(&log, |l| l.headers_streams.len() == 1).await;
         assert_eq!(
@@ -2315,6 +2339,33 @@ mod driver_tests {
         assert_eq!(dialer.calls(), 0);
     }
 
+    /// A server that discards cancelled streams without a word — what a
+    /// conforming server does, and what hyper did in the live run of
+    /// 2026-11-01 — leaves every rapid-reset slot `Timeout` with the
+    /// connection still open: `peer_silent`, not `connection_closed`, so the
+    /// check can tell "no reaction" from "hung up".
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_on_a_rapid_reset_probe_is_recorded_as_silent_not_closed() {
+        let (client, dialer, log) = peer(Script::new(vec![(3, 100)], Answer::Nothing));
+
+        let obs = client
+            .probe(&plan(RawH2Mode::RapidReset { pairs: 8 }, 8))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(obs.streams, vec![StreamOutcome::Timeout; 8]);
+        assert!(obs.peer_silent);
+        assert!(!obs.connection_closed);
+        assert_eq!(obs.goaway, None);
+        assert_eq!(dialer.calls(), 1);
+        settled(&log, |l| l.headers_streams.len() == 8).await;
+        assert_eq!(
+            log.lock().expect("server log").headers_streams,
+            vec![1, 3, 5, 7, 9, 11, 13, 15],
+            "all eight pairs were written before the peer's silence ended the probe"
+        );
+    }
+
     /// Each block is awaited before the next opens: a peer that never answers
     /// the first stream sees exactly one HEADERS frame, the remaining variants
     /// stay `Timeout`, and the probe ends within one read timeout of the cap.
@@ -2330,7 +2381,11 @@ mod driver_tests {
         let waited = started.elapsed();
 
         assert_eq!(obs.streams, vec![StreamOutcome::Timeout; 3]);
-        assert!(obs.connection_closed);
+        assert!(
+            obs.peer_silent,
+            "the peer said nothing within the read timeout"
+        );
+        assert!(!obs.connection_closed, "silence is not a close");
         assert_eq!(
             waited, RAW_READ_TIMEOUT,
             "the probe took {waited:?}; one silent stream should cost exactly one read timeout"
@@ -2438,6 +2493,10 @@ mod driver_tests {
         guard.add_scope(ScopeEntry {
             host: "127.0.0.1".into(),
         });
+        // The live scope permit is taken for the name the probe dials.
+        guard.add_scope(ScopeEntry {
+            host: "origin.test".into(),
+        });
         let client = client.with_ssrf(SsrfPolicy::default(), guard);
 
         let obs = client
@@ -2451,6 +2510,34 @@ mod driver_tests {
         );
         assert_eq!(dialer.calls(), 1, "the gate let the dial through");
         settled(&log, |l| l.headers_streams == vec![1]).await;
+    }
+
+    /// The gate takes the scope guard's live permit for the name it dials
+    /// (panel review of PR 2a): a scope that lifts the private-address block
+    /// for the IP literal but does not hold the host itself refuses the probe
+    /// before the dial, and says it was the scope, not SSRF.
+    #[tokio::test]
+    async fn the_gate_refuses_a_host_the_live_scope_does_not_hold() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let (client, dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let client = client.with_ssrf(SsrfPolicy::default(), guard);
+
+        let err = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("a host outside the live scope is refused");
+
+        assert!(
+            err.to_string()
+                .starts_with("scope: refusing raw h2 probe to origin.test:80"),
+            "{err}"
+        );
+        assert_eq!(dialer.calls(), 0, "a refused probe never dials");
     }
 
     /// SEC-1: without `with_ssrf` the driver behaves exactly as before — the
@@ -2641,6 +2728,9 @@ mod driver_tests {
         let scope = Arc::new(StdGuard::default());
         scope.add_scope(ScopeEntry {
             host: "127.0.0.1".into(),
+        });
+        scope.add_scope(ScopeEntry {
+            host: "origin.test".into(),
         });
         let client = client.with_ssrf(SsrfPolicy::default(), scope);
         client
