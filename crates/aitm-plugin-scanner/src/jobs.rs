@@ -139,6 +139,10 @@ pub struct JobEntry {
     pub origins: Vec<String>,
     /// Whether an agent started it, so the worker knows to re-check policy.
     pub is_agent: bool,
+    /// Flipped to `true` once, by [`JobRegistry::finish`], when the job is
+    /// terminal. Readers that need "tell me when it is over" subscribe to it
+    /// instead of polling `status` on a clock (a reloaded record starts `true`).
+    pub terminal: tokio::sync::watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for JobEntry {
@@ -334,8 +338,19 @@ impl JobRegistry {
         let mut inner = self.lock();
         if let Some(entry) = inner.get_mut(id) {
             entry.confine = None;
+            // The status is already terminal when the worker calls this; the
+            // signal is the last step, so a subscriber that wakes reads a
+            // terminal status.
+            entry.terminal.send_replace(true);
         }
         prune(&mut inner, self.history);
+    }
+
+    /// A receiver that reads `true` once the job is terminal (immediately for
+    /// a job that already is), or `None` for an unknown job. This is how the
+    /// test harnesses wait for the end without a wall-clock bound.
+    pub fn terminal_signal(&self, id: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.lock().get(id).map(|e| e.terminal.subscribe())
     }
 
     /// Read `<findings_dir>/scan/jobs/*.json` back into finished entries.
@@ -406,6 +421,7 @@ impl JobRegistry {
                 discovery: Arc::new(RwLock::new(Discovery::default())),
                 origins,
                 is_agent,
+                terminal: tokio::sync::watch::channel(true).0,
             }) {
                 added += 1;
             }
@@ -949,6 +965,7 @@ pub fn start(
                 discovery: Arc::clone(&discovery),
                 origins: origins.clone(),
                 is_agent: caller.is_agent(),
+                terminal: tokio::sync::watch::channel(false).0,
             }
         })
         .map_err(|refused| match refused {
@@ -2165,71 +2182,80 @@ pub(crate) mod test_support {
             }
         }
 
-        /// Poll `registry.status(job)` until it is terminal, or give up.
-        pub(crate) async fn wait_terminal(
-            &self,
-            job: &str,
-            within: std::time::Duration,
-        ) -> aitm_scan_model::JobStatus {
-            wait_terminal(&self.engine.registry, job, within).await
+        /// Wait for `job` to be terminal via the registry's terminal signal
+        /// (see [`wait_terminal`]); no clock, only the `TERMINAL_NET` safety net.
+        pub(crate) async fn wait_terminal(&self, job: &str) -> aitm_scan_model::JobStatus {
+            wait_terminal(&self.engine.registry, job).await
         }
     }
 
-    /// One poll of a job, for the three test harnesses' `wait_terminal`.
-    ///
-    /// `Some(status)` once the job is terminal, `None` while it is still
-    /// going. Past `deadline` it panics naming the state and phase the job is
-    /// stuck in — a test that waits forever tells you nothing.
-    fn poll_terminal(
+    /// The safety net around every terminal wait in the tests: never a measured
+    /// bound (the job's own deadline and the terminal signal decide), only the
+    /// point past which a hung job is reported instead of hanging the suite.
+    pub(crate) const TERMINAL_NET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The status once `job` is terminal, read after the registry's terminal
+    /// signal fired (so it is terminal, not racing the worker's last write).
+    fn terminal_status(
         registry: &crate::jobs::JobRegistry,
         job: &str,
-        deadline: Instant,
-        within: std::time::Duration,
-    ) -> Option<aitm_scan_model::JobStatus> {
+    ) -> aitm_scan_model::JobStatus {
         let status = registry
             .status(job)
             .unwrap_or_else(|| panic!("job {job} is in the registry"));
-        if status.state.is_terminal() {
-            return Some(status);
-        }
         assert!(
-            Instant::now() < deadline,
-            "job {job} is still {:?}/{:?} after {within:?}",
+            status.state.is_terminal(),
+            "the terminal signal fired for job {job} but its state is {:?}/{:?}",
             status.state,
             status.phase
         );
-        None
+        status
     }
 
-    /// Poll `registry.status(job)` until it is terminal, or give up. The one
-    /// copy; the `jobs`, `verbs` and `commands` harnesses all call it.
+    /// Wait for `job` to reach a terminal state by subscribing to the
+    /// registry's terminal signal (no polling, no wall-clock bound): resolves
+    /// at once for a job that is already over, otherwise when
+    /// [`crate::jobs::JobRegistry::finish`] flips it. [`TERMINAL_NET`] only
+    /// turns a hung job into a named panic.
     pub(crate) async fn wait_terminal(
         registry: &crate::jobs::JobRegistry,
         job: &str,
-        within: std::time::Duration,
     ) -> aitm_scan_model::JobStatus {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(status) = poll_terminal(registry, job, deadline, within) {
-                return status;
+        let mut rx = registry
+            .terminal_signal(job)
+            .unwrap_or_else(|| panic!("job {job} is in the registry"));
+        let waited = tokio::time::timeout(TERMINAL_NET, async {
+            while !*rx.borrow_and_update() {
+                rx.changed()
+                    .await
+                    .expect("the registry entry outlives the wait");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        })
+        .await;
+        if waited.is_err() {
+            let status = registry.status(job);
+            panic!(
+                "job {job} is still {:?} after the {TERMINAL_NET:?} safety net",
+                status.map(|s| (s.state, s.phase))
+            );
         }
+        terminal_status(registry, job)
     }
 
-    /// [`wait_terminal`] for a harness polling from **outside** a runtime.
+    /// [`wait_terminal`] for a harness waiting from **outside** a runtime: it
+    /// blocks on the same signal through a short-lived current-thread runtime.
+    /// Call it only from a thread that is not inside a tokio runtime
+    /// (`Runtime::block_on` panics when nested); the `commands.rs` harness
+    /// qualifies because its `#[test]` threads never enter its own runtime.
     pub(crate) fn wait_terminal_blocking(
         registry: &crate::jobs::JobRegistry,
         job: &str,
-        within: std::time::Duration,
     ) -> aitm_scan_model::JobStatus {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(status) = poll_terminal(registry, job, deadline, within) {
-                return status;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime for the blocking wait");
+        rt.block_on(wait_terminal(registry, job))
     }
 
     /// An operator caller (CLI).
@@ -2695,9 +2721,7 @@ mod tests {
         let started =
             crate::jobs::start(&h.engine, h.profile(&["http://scan.test"]), agent(), true)
                 .expect("an agent's map job is admitted under `auto`");
-        let status = h
-            .wait_terminal(&started.job, std::time::Duration::from_secs(5))
-            .await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, aitm_scan_model::JobState::Cancelled);
         assert_eq!(
             status.stopped_reason,
@@ -2719,6 +2743,103 @@ mod tests {
         assert!(
             std::time::Instant::now().checked_add(capped).is_some(),
             "the bounded duration still lands on a representable Instant"
+        );
+    }
+
+    /// The registry's terminal signal is what every "wait for the end" reads:
+    /// `false` while a job runs, flipped exactly once by `finish` after the
+    /// terminal status is written, `true` at once for a job that is already
+    /// over (a reloaded record included), and a waiter parked on `changed()`
+    /// wakes on the flip. No clock anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_signal_flips_once_on_finish_and_reads_true_for_finished_jobs() {
+        let registry = crate::jobs::JobRegistry::new(10);
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let status = Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
+            job: "scan-0000beef".to_string(),
+            state: aitm_scan_model::JobState::Running,
+            ..aitm_scan_model::JobStatus::default()
+        }));
+        assert!(registry.try_insert(crate::jobs::JobEntry {
+            status: Arc::clone(&status),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: None,
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: Vec::new(),
+            is_agent: false,
+            terminal: tx,
+        }));
+        assert!(
+            registry.terminal_signal("scan-nope").is_none(),
+            "unknown job: no signal"
+        );
+        let mut rx = registry
+            .terminal_signal("scan-0000beef")
+            .expect("a known job has a signal");
+        assert!(!*rx.borrow(), "a running job reads false");
+
+        // A waiter parked on the signal wakes when `finish` flips it, and
+        // reads a terminal status when it does.
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let waiter = {
+            let registry_status = Arc::clone(&status);
+            let mut rx = rx.clone();
+            tokio::spawn(async move {
+                let mut parked = Some(parked_tx);
+                while !*rx.borrow_and_update() {
+                    // Tell the test we are about to park, so `finish` below is
+                    // guaranteed to be the wake-up and not a value read first.
+                    if let Some(tx) = parked.take() {
+                        let _ = tx.send(());
+                    }
+                    rx.changed().await.expect("sender alive");
+                }
+                registry_status.read().unwrap().state
+            })
+        };
+        parked_rx.await.expect("the waiter reports before parking");
+        {
+            let mut guarded = status.write().unwrap();
+            guarded.state = aitm_scan_model::JobState::Done;
+            guarded.finished_at = Some(1);
+        }
+        registry.finish("scan-0000beef");
+        assert_eq!(
+            waiter.await.expect("waiter"),
+            aitm_scan_model::JobState::Done
+        );
+        assert!(
+            *rx.borrow_and_update(),
+            "after finish the signal reads true"
+        );
+
+        // Flipping again is a no-op for readers: the value is already true.
+        registry.finish("scan-0000beef");
+        assert!(*rx.borrow(), "idempotent");
+
+        // A job inserted already terminal starts true (what load_history does).
+        let (tx2, _) = tokio::sync::watch::channel(true);
+        assert!(registry.try_insert(crate::jobs::JobEntry {
+            status: Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
+                job: "scan-0000dead".to_string(),
+                state: aitm_scan_model::JobState::Failed,
+                finished_at: Some(2),
+                ..aitm_scan_model::JobStatus::default()
+            })),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: None,
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: Vec::new(),
+            is_agent: false,
+            terminal: tx2,
+        }));
+        let done = crate::jobs::test_support::wait_terminal(&registry, "scan-0000dead").await;
+        assert_eq!(
+            done.state,
+            aitm_scan_model::JobState::Failed,
+            "resolves at once for a finished job"
         );
     }
 
@@ -2753,6 +2874,7 @@ mod tests {
                 discovery: Arc::new(std::sync::RwLock::new(Default::default())),
                 origins: vec![origin.to_string()],
                 is_agent: false,
+                terminal: tokio::sync::watch::channel(state.is_terminal()).0,
             }));
             if !state.is_terminal() {
                 live = Some(job);
@@ -2816,6 +2938,7 @@ mod tests {
                 discovery: Arc::new(std::sync::RwLock::new(Default::default())),
                 origins: Vec::new(),
                 is_agent: false,
+                terminal: tokio::sync::watch::channel(false).0,
             }),
             "a colliding id is refused, not silently dropped"
         );
@@ -2942,6 +3065,7 @@ mod tests {
                 discovery: Arc::new(std::sync::RwLock::new(Default::default())),
                 origins: vec!["http://a.test".to_string()],
                 is_agent: false,
+                terminal: tokio::sync::watch::channel(state.is_terminal()).0,
             };
         assert!(registry.try_insert(entry(
             "scan-11111111",
@@ -3018,9 +3142,7 @@ mod tests {
         profile.crawl.max_depth = 1;
         let started =
             crate::jobs::start(&h.engine, profile, operator(), true).expect("a map job starts");
-        let status = h
-            .wait_terminal(&started.job, std::time::Duration::from_secs(5))
-            .await;
+        let status = h.wait_terminal(&started.job).await;
 
         assert_eq!(
             h.client.trail(),
@@ -3051,8 +3173,7 @@ mod tests {
             true,
         )
         .expect("a map job starts");
-        h.wait_terminal(&started.job, std::time::Duration::from_secs(5))
-            .await;
+        h.wait_terminal(&started.job).await;
         assert_eq!(
             h.client.trail(),
             vec!["GET /", "GET /about", "POST /comments"],
@@ -3149,6 +3270,15 @@ mod tests {
             Some("reloaded a non-terminal job record")
         );
         assert!(status.finished_at.is_some(), "a terminal record has an end");
+        // A reloaded record is already over: its terminal signal reads `true`
+        // at once, so a waiter never parks on it.
+        assert!(
+            *registry
+                .terminal_signal("scan-00000002")
+                .expect("the reloaded job has a signal")
+                .borrow(),
+            "a reloaded record starts terminal"
+        );
         assert_eq!(registry.active_count(), 0, "it holds no max_jobs slot");
         assert!(
             registry.active_origins().is_empty(),
@@ -3220,8 +3350,7 @@ mod tests {
 
             h.cancel_all();
             for job in &admitted {
-                h.wait_terminal(job, std::time::Duration::from_secs(5))
-                    .await;
+                h.wait_terminal(job).await;
             }
         }
     }

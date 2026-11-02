@@ -8,8 +8,11 @@
 //! vulnerable), `--port N` (plain HTTP/1; default 0 = ephemeral), `--tls-port N`
 //! (TLS, ALPN `h2`+`http/1.1`), `--tls-h1-port N` (TLS, ALPN `http/1.1` only),
 //! `--control-port N` (the control origin), `--l4` (every L4 speaker on an
-//! ephemeral port; needs `--control-port`). A listener whose flag is absent is
-//! not started, so the legacy invocation starts nothing new.
+//! ephemeral port; needs `--control-port`), `--latency-ms N` (a sleep applied
+//! to every HTTP response and WebSocket frame, not to the L4 speakers; default
+//! 0, at most 60000, so a UI can be observed while an intrusive scan is still
+//! running). A listener whose flag is absent is not started, so the legacy
+//! invocation starts nothing new.
 //!
 //! Stdout, in order, one line per started listener, then `ready`:
 //! `listening http://127.0.0.1:P`, `tls https://127.0.0.1:P`,
@@ -26,7 +29,10 @@ use std::process::ExitCode;
 use aitm_testtarget::{SeedMode, TestTarget};
 
 const USAGE: &str = "usage: aitm-testtarget-serve [--mode vulnerable|patched] [--port <0-65535>] \
-[--tls-port <0-65535>] [--tls-h1-port <0-65535>] [--control-port <0-65535>] [--l4]";
+[--tls-port <0-65535>] [--tls-h1-port <0-65535>] [--control-port <0-65535>] [--l4] [--latency-ms <n>]";
+
+/// `--latency-ms` ceiling: a typo must not make every listener answer hours late.
+const MAX_LATENCY_MS: u64 = 60_000;
 
 /// The parsed command line (spec D1 "Flags" row). `None` = listener not started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +43,8 @@ struct Args {
     tls_h1: Option<u16>,
     control: Option<u16>,
     l4: bool,
+    /// `--latency-ms N`: per-response sleep for HTTP/WS; 0 = none.
+    latency_ms: u64,
 }
 
 #[tokio::main]
@@ -50,7 +58,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut builder = TestTarget::builder(args.mode).port(args.port).l4(args.l4);
+    let mut builder = TestTarget::builder(args.mode)
+        .port(args.port)
+        .l4(args.l4)
+        .latency_ms(args.latency_ms);
     if let Some(p) = args.tls {
         builder = builder.tls(p);
     }
@@ -116,6 +127,7 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
         tls_h1: None,
         control: None,
         l4: false,
+        latency_ms: 0,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -133,6 +145,16 @@ fn parse_from<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
             "--tls-h1-port" => parsed.tls_h1 = Some(port_value(&arg, args.next())?),
             "--control-port" => parsed.control = Some(port_value(&arg, args.next())?),
             "--l4" => parsed.l4 = true,
+            "--latency-ms" => {
+                let value = args.next().ok_or("--latency-ms needs a value")?;
+                parsed.latency_ms = value
+                    .parse()
+                    .ok()
+                    .filter(|ms| *ms <= MAX_LATENCY_MS)
+                    .ok_or_else(|| {
+                        format!("invalid --latency-ms {value:?} (0-{MAX_LATENCY_MS})")
+                    })?;
+            }
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
@@ -198,6 +220,8 @@ mod tests {
             "--control-port",
             "0",
             "--l4",
+            "--latency-ms",
+            "40",
         ]))
         .expect("full flag set parses");
         assert_eq!(
@@ -209,7 +233,18 @@ mod tests {
                 tls_h1: Some(0),
                 control: Some(0),
                 l4: true,
+                latency_ms: 40,
             }
+        );
+        assert_eq!(parse_from(argv(&[])).expect("defaults").latency_ms, 0);
+        assert!(parse_from(argv(&["--latency-ms", "x"])).is_err());
+        assert!(parse_from(argv(&["--latency-ms"])).is_err());
+        assert!(parse_from(argv(&["--latency-ms", "60001"])).is_err());
+        assert_eq!(
+            parse_from(argv(&["--latency-ms", "60000"]))
+                .expect("cap")
+                .latency_ms,
+            60_000
         );
     }
 
@@ -270,6 +305,7 @@ mod tests {
                 tls_h1: None,
                 control: None,
                 l4: false,
+                latency_ms: 0,
             }
         );
         // The last repeated flag wins.

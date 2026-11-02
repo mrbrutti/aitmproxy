@@ -195,6 +195,7 @@ pub(crate) fn encode_frame(opcode: Opcode, payload: &[u8]) -> Vec<u8> {
 }
 
 /// A close frame carrying only the two-byte status code.
+#[cfg(test)]
 pub(crate) fn close_frame(code: u16) -> Vec<u8> {
     encode_frame(Opcode::Close, &code.to_be_bytes())
 }
@@ -538,9 +539,9 @@ async fn close_with<IO>(io: &mut IO, state: &AppState, conn: &ConnInfo, code: u1
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    if write_wire(io, &close_frame(code)).await {
-        log_frame(state, conn, Dir::Out, Opcode::Close, &code.to_be_bytes());
-    }
+    // A server-initiated close is a server frame like any other: delayed by
+    // `--latency-ms`, written and logged by `send`.
+    send(io, state, conn, Opcode::Close, &code.to_be_bytes()).await;
     Some(code)
 }
 
@@ -555,6 +556,7 @@ async fn send<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    state.delay().await; // `--latency-ms`, once per server frame
     let ok = write_wire(io, &encode_frame(opcode, payload)).await;
     if ok {
         log_frame(state, conn, Dir::Out, opcode, payload);
@@ -1029,6 +1031,58 @@ mod tests {
         let mut payload = vec![0u8; len];
         io.read_exact(&mut payload).await.expect("payload");
         (opcode, payload)
+    }
+
+    /// `--latency-ms` (T7 ruling): every server frame waits the configured time,
+    /// in V and P alike; the frame itself is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn latency_delays_every_server_frame() {
+        let latency = std::time::Duration::from_millis(150);
+        for mode in [Vulnerable, Patched] {
+            let st = Arc::new(AppState::with_latency(mode, ControlLog::new(mode), latency));
+            let conn =
+                st.log
+                    .open_conn(Listener::Plain, None, "127.0.0.1:9".parse().expect("peer"));
+            let (server, mut client) = tokio::io::duplex(1 << 20);
+            let task = tokio::spawn(run_frames(server, st.clone(), conn.clone(), false));
+            let t0 = tokio::time::Instant::now();
+            let (op, hello) = read_frame(&mut client).await;
+            assert!(
+                t0.elapsed() >= latency,
+                "{mode:?} hello frame came in {:?}",
+                t0.elapsed()
+            );
+            assert_eq!(op, Opcode::Text);
+            assert_eq!(hello, br#"{"type":"hello","user":"anonymous"}"#);
+            let t1 = tokio::time::Instant::now();
+            client
+                .write_all(&masked(Opcode::Text, br#"{"type":"echo","msg":"hi"}"#))
+                .await
+                .expect("write text");
+            let (op, echo) = read_frame(&mut client).await;
+            assert!(
+                t1.elapsed() >= latency,
+                "{mode:?} echo frame came in {:?}",
+                t1.elapsed()
+            );
+            assert_eq!(op, Opcode::Text);
+            assert_eq!(echo, br#"{"type":"echo","msg":"hi","html":"<b>hi</b>"}"#);
+            // A server-initiated close (an unmasked client frame is a 1002) waits too.
+            let t2 = tokio::time::Instant::now();
+            client
+                .write_all(&encode_frame(Opcode::Text, b"unmasked"))
+                .await
+                .expect("write unmasked");
+            let (op, close) = read_frame(&mut client).await;
+            assert!(
+                t2.elapsed() >= latency,
+                "{mode:?} close frame came in {:?}",
+                t2.elapsed()
+            );
+            assert_eq!(op, Opcode::Close);
+            assert_eq!(&close[..2], &1002u16.to_be_bytes());
+            assert_eq!(task.await.expect("loop task"), Some(1002));
+        }
     }
 
     #[tokio::test]
