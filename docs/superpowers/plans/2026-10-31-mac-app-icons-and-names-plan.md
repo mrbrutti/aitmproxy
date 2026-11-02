@@ -548,6 +548,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 
 ### Task 8: Live proof on the installed notarized app (Terminal, orchestrator or Matt)
 
+> Ordering (orchestrator ruling 2026-11-01, accepted on PR #272): Task 8 is the **post-merge acceptance** of the UI half, the same shape as #200's — only the installed app with the Network Extension produces `source_app`, and that build must already carry Tasks 5/6, so no pre-merge proof exists and no dev-bundle stand-in counts. It runs on Matt's installed build of the first notarized DMG after #272 (v0.5.11) **before the Homebrew tap bump**; the orchestrator holds the tap until the evidence is posted on #272 (and #265's Half B on #265). If it fails, a fix PR goes in before the release is published and the orchestrator tells Matt.
+
 - **Satisfies:** AI-AC14, AI-AC15, AI-AC16, AI-AC17, AI-AC18, AI-AC19, AI-AC20, AI-AC21; the
   whole-branch gates AI-AC13, AI-AC23.
 - **Depends on:** Tasks 1–7 merged into the branch and the Swift gate green on the whole branch.
