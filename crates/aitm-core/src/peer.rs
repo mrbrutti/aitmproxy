@@ -17,9 +17,11 @@
 //! scope, guard or routing input, and never logged above `debug`.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 /// Names the process owning the client end of an accepted connection.
@@ -55,13 +57,50 @@ pub(crate) fn start_attribution(
     peer: SocketAddr,
     local: Option<SocketAddr>,
 ) -> Option<JoinHandle<Option<String>>> {
+    start_attribution_with(in_flight_slots(), resolver, peer, local)
+}
+
+/// How many attribution tasks may occupy the blocking pool at once (security
+/// finding S1, 2026-11-01). Each one may sit for the resolver's full scan
+/// deadline (250 ms) after the acceptor's 25 ms budget has dropped its handle,
+/// so an unbounded flood of loopback connections could fill tokio's 512
+/// blocking threads and stall the bus and MCP. The 65th concurrent connection
+/// is simply not attributed (`None`); nothing else about it changes.
+pub(crate) const MAX_IN_FLIGHT: usize = 64;
+
+/// The process-wide slot pool behind [`start_attribution`].
+fn in_flight_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT)))
+}
+
+/// [`start_attribution`] over an explicit slot pool (tests use their own so
+/// parallel tests do not share the process-wide one). The permit travels into
+/// the blocking task and is released when the task returns, however it ends.
+fn start_attribution_with(
+    slots: &Arc<Semaphore>,
+    resolver: Option<&Arc<dyn PeerResolver>>,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+) -> Option<JoinHandle<Option<String>>> {
     let resolver = resolver?.clone();
     let local = local?;
     if !is_loopback_peer(peer.ip()) {
         return None;
     }
+    let permit = Arc::clone(slots).try_acquire_owned().ok()?;
     Some(tokio::task::spawn_blocking(move || {
-        resolver.resolve(peer, local)
+        let _permit = permit;
+        // A resolver panic costs this connection its identity, nothing more;
+        // say so once per occurrence (the identity itself is never logged
+        // above `debug`; the loopback peer address names no process).
+        match catch_unwind(AssertUnwindSafe(|| resolver.resolve(peer, local))) {
+            Ok(identity) => identity,
+            Err(_panic) => {
+                tracing::warn!(%peer, "attribution task panicked; client identity dropped");
+                None
+            }
+        }
     }))
 }
 
@@ -79,7 +118,12 @@ pub(crate) async fn finish_attribution(
     let task = task?;
     match tokio::time::timeout(budget, task).await {
         Ok(Ok(identity)) => identity,
-        Ok(Err(_join_error)) => None,
+        Ok(Err(join_error)) => {
+            // Panics are caught inside the task; what is left is cancellation
+            // (runtime shutdown), which is not worth more than a debug line.
+            tracing::debug!(%join_error, "attribution task did not complete");
+            None
+        }
         Err(_elapsed) => None,
     }
 }
@@ -271,5 +315,114 @@ mod tests {
     #[test]
     fn attribution_budget_is_the_spec_value() {
         assert_eq!(super::ATTRIBUTION_BUDGET, Duration::from_millis(25));
+    }
+
+    /// Parks every call until `release` is set, then answers.
+    struct ParkingResolver {
+        gate: std::sync::Mutex<bool>,
+        cv: std::sync::Condvar,
+        calls: AtomicUsize,
+    }
+
+    impl ParkingResolver {
+        fn new() -> Self {
+            Self {
+                gate: std::sync::Mutex::new(false),
+                cv: std::sync::Condvar::new(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn release(&self) {
+            *self.gate.lock().expect("gate") = true;
+            self.cv.notify_all();
+        }
+    }
+
+    impl PeerResolver for ParkingResolver {
+        fn resolve(&self, _peer: SocketAddr, _local: SocketAddr) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut open = self.gate.lock().expect("gate");
+            while !*open {
+                open = self.cv.wait(open).expect("gate");
+            }
+            Some("parked".to_string())
+        }
+    }
+
+    /// Security finding S1 (2026-11-01): at most `MAX_IN_FLIGHT` attribution
+    /// tasks occupy the blocking pool at once. With 64 parked, the 65th
+    /// `start_attribution` is `None` at once and never reaches the resolver;
+    /// once the parked tasks return, their permits are back and a new
+    /// connection is attributed again.
+    #[tokio::test]
+    async fn the_sixty_fifth_concurrent_attribution_is_refused_without_a_spawn() {
+        let resolver = Arc::new(ParkingResolver::new());
+        let dyn_resolver: Arc<dyn PeerResolver> = resolver.clone();
+        let slots = Arc::new(tokio::sync::Semaphore::new(super::MAX_IN_FLIGHT));
+        let local = Some(addr("127.0.0.1:8080"));
+
+        let mut tasks = Vec::new();
+        for port in 0..64u16 {
+            let peer = SocketAddr::new(ip("127.0.0.1"), 40_000 + port);
+            let task = super::start_attribution_with(&slots, Some(&dyn_resolver), peer, local);
+            assert!(task.is_some(), "connection {port} gets a slot");
+            tasks.push(task);
+        }
+        let started = Instant::now();
+        let refused = super::start_attribution_with(
+            &slots,
+            Some(&dyn_resolver),
+            addr("127.0.0.1:50000"),
+            local,
+        );
+        let elapsed = started.elapsed();
+        let permits_while_full = slots.available_permits();
+        // Release first: a failed assertion must not leave 64 parked blocking
+        // threads for the runtime's teardown to wait on.
+        resolver.release();
+        assert!(
+            refused.is_none(),
+            "the 65th in-flight attribution is refused"
+        );
+        assert!(elapsed < Duration::from_millis(50));
+        assert_eq!(permits_while_full, 0);
+        for task in tasks {
+            assert_eq!(
+                finish_attribution(task, Duration::from_secs(5))
+                    .await
+                    .as_deref(),
+                Some("parked")
+            );
+        }
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            64,
+            "the refused call never ran"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            64,
+            "every permit came back with its task"
+        );
+
+        let again = super::start_attribution_with(
+            &slots,
+            Some(&dyn_resolver),
+            addr("127.0.0.1:50001"),
+            local,
+        );
+        assert_eq!(
+            finish_attribution(again, Duration::from_secs(5))
+                .await
+                .as_deref(),
+            Some("parked")
+        );
+    }
+
+    /// S1: the production cap is 64, well under tokio's 512 blocking threads.
+    #[test]
+    fn in_flight_cap_is_sixty_four() {
+        assert_eq!(super::MAX_IN_FLIGHT, 64);
     }
 }

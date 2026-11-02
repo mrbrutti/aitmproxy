@@ -174,17 +174,30 @@ impl<S: SocketScanner> Coalescer<S> {
     /// scanner works: a free probe of the warm pids first, then, for the tuples
     /// it missed, one full scan if the bucket has a token. Write a result for
     /// every tuple scanned (unfound = `None`) and wake waiters.
+    ///
+    /// The scanner runs with the lock released, so a panic inside it unwinds
+    /// through this frame with `scanning` still set. [`ScanGuard`] covers that
+    /// path: on unwind it writes `None` for the batch, clears `scanning` and
+    /// wakes the waiters, so the next caller leads a fresh scan instead of
+    /// every later caller waiting out its deadline behind a scan that is not
+    /// running (tester finding T-F1, 2026-11-01).
     fn lead_scan<'a>(&'a self, mut state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
         state.scanning = true;
         let deadline = Instant::now() + self.limits.scan_deadline;
         let batch: Vec<Tuple> = state.pending.drain().collect();
         let warm = state.warm_sorted();
         drop(state);
+        let mut guard = ScanGuard {
+            coalescer: self,
+            batch,
+            armed: true,
+        };
+        let batch = &guard.batch;
 
         let mut found: HashMap<Tuple, ProcessKey> = HashMap::with_capacity(batch.len());
         let mut gone: Vec<u32> = Vec::new();
         if !warm.is_empty() {
-            let probe = self.scanner.find_owners_among(&batch, deadline, &warm);
+            let probe = self.scanner.find_owners_among(batch, deadline, &warm);
             found = probe.owners;
             gone = probe.gone;
         }
@@ -205,7 +218,10 @@ impl<S: SocketScanner> Coalescer<S> {
             found.extend(full);
         }
 
-        // Most recent last so the newest match ends up at the front.
+        // `warm_hit` puts each pid at the front, so after this loop the batch's
+        // matches sit ahead of every pid from earlier batches, ordered among
+        // themselves by descending pid (an arbitrary but deterministic order;
+        // recency within one batch is not observable).
         let mut matched: Vec<u32> = found.values().map(|k| k.pid).collect();
         matched.sort_unstable();
         matched.dedup();
@@ -213,12 +229,13 @@ impl<S: SocketScanner> Coalescer<S> {
             state.warm_hit(pid);
         }
         for t in batch {
-            if state.wanted.contains_key(&t) {
-                state.results.insert(t, found.get(&t).copied());
+            if state.wanted.contains_key(t) {
+                state.results.insert(*t, found.get(t).copied());
             }
         }
         state.scanning = false;
         self.wake.notify_all();
+        guard.armed = false;
         state
     }
 
@@ -234,13 +251,43 @@ impl<S: SocketScanner> Coalescer<S> {
         identity
     }
 
-    /// A poisoned lock means a scanner panicked mid-scan; the state is still
-    /// consistent (results are written under the lock), so keep serving.
+    /// A poisoned lock means some thread panicked **while holding** it (the
+    /// scanner itself runs with the lock released, so a scanner panic does not
+    /// poison it). Every mutation of `State` under the lock is a single map or
+    /// flag write that leaves it consistent at each statement, and
+    /// [`ScanGuard`] clears `scanning` on unwind, so the inner value is safe to
+    /// keep serving; refusing it would wedge every later caller instead.
     fn lock(&self) -> MutexGuard<'_, State> {
         match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+/// Armed for the span of one `lead_scan`; disarmed on the normal path. If the
+/// scanner panics, `Drop` runs on unwind (with the lock **not** held: the
+/// `MutexGuard` locals of `lead_scan` are declared after it and so dropped
+/// first) and finishes the scan as a miss for every tuple in the batch.
+struct ScanGuard<'a, S: SocketScanner> {
+    coalescer: &'a Coalescer<S>,
+    batch: Vec<Tuple>,
+    armed: bool,
+}
+
+impl<S: SocketScanner> Drop for ScanGuard<'_, S> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.coalescer.lock();
+        for t in &self.batch {
+            if state.wanted.contains_key(t) {
+                state.results.insert(*t, None);
+            }
+        }
+        state.scanning = false;
+        self.coalescer.wake.notify_all();
     }
 }
 
@@ -776,15 +823,26 @@ mod tests {
         assert_eq!(seen, vec![tuple(50_950), tuple(50_951)]);
     }
 
-    /// Panics on every full scan.
+    /// Panics on the first `panics` full scans (after sleeping `delay` so a
+    /// waiter can register mid-scan); every later full scan finds nothing.
     struct PanickingScanner {
         calls: Mutex<usize>,
+        panics: usize,
+        delay: Duration,
     }
 
     impl SocketScanner for PanickingScanner {
         fn find_owners(&self, _wanted: &[Tuple], _deadline: Instant) -> HashMap<Tuple, ProcessKey> {
-            *self.calls.lock().unwrap() += 1;
-            panic!("scanner blew up");
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if call <= self.panics {
+                thread::sleep(self.delay);
+                panic!("scanner blew up");
+            }
+            HashMap::new()
         }
 
         fn find_owners_among(&self, _wanted: &[Tuple], _deadline: Instant, _pids: &[u32]) -> Probe {
@@ -811,18 +869,18 @@ mod tests {
     }
 
     /// Tester finding T-F1 (stage 5, 2026-11-01): `lead_scan` sets `scanning`
-    /// and releases the lock before calling the scanner; if the scanner
-    /// panics, nothing resets the flag, so every later caller waits out its
-    /// full deadline behind a scan that is not running and resolves `None`.
-    /// In production (`spawn_blocking`) that is one wedged resolver for the
-    /// life of the process plus the full 25 ms budget on every connection.
-    /// Fails today (`calls == 1`, elapsed == deadline); un-ignore with the fix
-    /// (a drop guard that clears `scanning` and notifies).
+    /// and releases the lock before calling the scanner; without the
+    /// `ScanGuard`, a scanner panic left the flag set, so every later caller
+    /// waited out its full deadline behind a scan that was not running and
+    /// resolved `None`. In production (`spawn_blocking`) that was one wedged
+    /// resolver for the life of the process plus the full 25 ms budget on
+    /// every connection. Before the fix: `calls == 1`, elapsed == deadline.
     #[test]
-    #[ignore = "T-F1: a scanner panic wedges the coalescer; needs a production fix"]
     fn a_scanner_panic_does_not_wedge_later_callers() {
         let scanner = Arc::new(PanickingScanner {
             calls: Mutex::new(0),
+            panics: 1,
+            delay: Duration::ZERO,
         });
         let limits = Limits {
             scan_deadline: Duration::from_millis(30),
@@ -848,6 +906,55 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(20),
             "took {elapsed:?}: waited out the deadline behind a scan that is not running"
+        );
+        assert!(
+            !coalescer.lock().scanning,
+            "the guard cleared `scanning` after the panic"
+        );
+    }
+
+    /// T-F1, the waiter's side: a caller that arrived while the leader's scan
+    /// was running is woken the moment the leader panics (the guard clears
+    /// `scanning` and notifies), finds no scan running and leads the next one
+    /// itself, instead of sitting out its own 2 s deadline.
+    #[test]
+    fn a_waiter_is_released_when_the_leader_panics() {
+        let scanner = Arc::new(PanickingScanner {
+            calls: Mutex::new(0),
+            panics: 1,
+            delay: Duration::from_millis(100),
+        });
+        let limits = Limits {
+            scan_deadline: Duration::from_secs(2),
+            ..Limits::default()
+        };
+        let coalescer = Arc::new(Coalescer::new(Arc::clone(&scanner), limits));
+        let c = Arc::clone(&coalescer);
+        let leader = thread::spawn(move || c.resolve(tuple(50_910)));
+        // Wait until the leader is inside the scanner (sleeping before its panic).
+        let started = Instant::now();
+        while *scanner.calls.lock().unwrap() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "leader never scanned"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(coalescer.lock().scanning, "a scan is in flight");
+
+        let waited = Instant::now();
+        let got = coalescer.resolve(tuple(50_911));
+        let elapsed = waited.elapsed();
+        assert!(leader.join().is_err(), "the leader's thread panicked");
+        assert_eq!(got, None);
+        assert_eq!(
+            *scanner.calls.lock().unwrap(),
+            2,
+            "woken by the guard, the waiter led the next scan itself"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "took {elapsed:?}: the waiter sat out the deadline instead of being woken"
         );
     }
 }
