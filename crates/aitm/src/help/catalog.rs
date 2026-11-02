@@ -96,7 +96,7 @@ pub const GROUPS: &[GroupInfo] = &[
     },
     GroupInfo {
         name: "scan",
-        purpose: "discovery, passive checks and the findings report",
+        purpose: "scan jobs: crawl, probe, triage the issues found",
         footer: None,
     },
     GroupInfo {
@@ -186,50 +186,138 @@ pub const EXAMPLES: &[(&str, &[&str])] = &[
     ("capture.status", &[
         "aitm capture status",
     ]),
+    // Every `check.<id>` is the scanner's one manual-check shape (main #232):
+    // `--url` (http or https, its origin in Scope) and `--param`, the query
+    // parameter the payloads go in — the ws- and l4-lane checks included,
+    // since a manual run always probes an HTTP insertion point. Five ids are
+    // long enough that `app.example.test` would pass 76 columns, so those
+    // lines use the shorter reserved host of the core's own `url` example.
+    ("check", &[
+        "aitm check xss-reflected --url https://app.example.test/search --param q",
+        "aitm check sqli --url https://app.example.test/ --param id",
+    ]),
     ("check.cmdi", &[
-        "aitm check cmdi --args '{\"url\":\"https://app.example.test/\",\"param\":\"host\"}'",
+        "aitm check cmdi --url https://app.example.test/ --param host",
+    ]),
+    ("check.cmdi-time", &[
+        "aitm check cmdi-time --url https://app.example.test/ --param host",
+    ]),
+    ("check.cookie-flag", &[
+        "aitm check cookie-flag --url https://app.example.test/login --param q",
     ]),
     ("check.cors", &[
-        "aitm check cors --args '{\"url\":\"https://app.example.test/api/me\"}'",
+        "aitm check cors --url https://app.example.test/api/me --param q",
     ]),
     ("check.crlf", &[
-        "aitm check crlf --args '{\"url\":\"https://app.example.test/\",\"param\":\"lang\"}'",
+        "aitm check crlf --url https://app.example.test/ --param lang",
+    ]),
+    ("check.cswsh", &[
+        "aitm check cswsh --url https://app.example.test/ws --param q",
+    ]),
+    ("check.h2-cl-te-downgrade-indicator", &[
+        "aitm check h2-cl-te-downgrade-indicator --url https://app.example --param q",
+    ]),
+    ("check.h2-header-crlf-tolerance", &[
+        "aitm check h2-header-crlf-tolerance --url https://app.example.test --param q",
+    ]),
+    ("check.h2-pseudo-header-validation", &[
+        "aitm check h2-pseudo-header-validation --url https://app.example --param q",
+    ]),
+    ("check.h2-rapid-reset-mitigation", &[
+        "aitm check h2-rapid-reset-mitigation --url https://app.example --param q",
+    ]),
+    ("check.h2-settings-observe", &[
+        "aitm check h2-settings-observe --url https://app.example.test --param q",
+    ]),
+    ("check.header-reflection", &[
+        "aitm check header-reflection --url https://app.example.test/ --param q",
     ]),
     ("check.headers", &[
-        "aitm check headers --args '{\"url\":\"https://app.example.test/\"}'",
+        "aitm check headers --url https://app.example.test/ --param q",
+    ]),
+    ("check.l4-crash", &[
+        "aitm check l4-crash --url https://app.example.test/ --param q",
+    ]),
+    ("check.l4-latency-outlier", &[
+        "aitm check l4-latency-outlier --url https://app.example.test/ --param q",
+    ]),
+    ("check.l4-packet-crash", &[
+        "aitm check l4-packet-crash --url https://app.example.test/ --param q",
+    ]),
+    ("check.l4-packet-reaction", &[
+        "aitm check l4-packet-reaction --url https://app.example.test/ --param q",
+    ]),
+    ("check.l4-parser-fault", &[
+        "aitm check l4-parser-fault --url https://app.example.test/ --param q",
     ]),
     ("check.ldapi", &[
-        "aitm check ldapi --args '{\"url\":\"https://app.example.test/\",\"param\":\"user\"}'",
+        "aitm check ldapi --url https://app.example.test/ --param user",
     ]),
     ("check.methods", &[
-        "aitm check methods --args '{\"url\":\"https://app.example.test/api/me\"}'",
+        "aitm check methods --url https://app.example.test/api/me --param q",
     ]),
     ("check.nosqli", &[
-        "aitm check nosqli --args '{\"url\":\"https://app.example.test/\",\"param\":\"user\"}'",
+        "aitm check nosqli --url https://app.example.test/ --param user",
     ]),
-    ("check.open_redirect", &[
-        "aitm check open_redirect --args '{\"url\":\"https://app.example.test/\",\"param\":\"next\"}'",
+    ("check.nosqli-json", &[
+        "aitm check nosqli-json --url https://app.example.test/api --param user",
+    ]),
+    ("check.open-redirect", &[
+        "aitm check open-redirect --url https://app.example.test/ --param next",
     ]),
     ("check.path_traversal", &[
-        "aitm check path_traversal --args '{\"url\":\"https://app.example.test/\",\"param\":\"file\"}'",
+        "aitm check path_traversal --url https://app.example.test/ --param file",
     ]),
     ("check.paths", &[
-        "aitm check paths --args '{\"base\":\"https://app.example.test/\"}'",
+        "aitm check paths --url https://app.example.test/ --param q",
+    ]),
+    ("check.reflection", &[
+        "aitm check reflection --url https://app.example.test/search --param q",
+    ]),
+    ("check.security-header", &[
+        "aitm check security-header --url https://app.example.test/ --param q",
     ]),
     ("check.sqli", &[
-        "aitm check sqli --args '{\"url\":\"https://app.example.test/\",\"param\":\"id\"}'",
+        "aitm check sqli --url https://app.example.test/ --param id",
+    ]),
+    ("check.sqli-boolean", &[
+        "aitm check sqli-boolean --url https://app.example.test/ --param id",
+    ]),
+    ("check.sqli-time", &[
+        "aitm check sqli-time --url https://app.example.test/ --param id",
     ]),
     ("check.ssrf", &[
-        "aitm check ssrf --args '{\"url\":\"https://app.example.test/\",\"param\":\"target\"}'",
+        "aitm check ssrf --url https://app.example.test/ --param target",
     ]),
     ("check.ssti", &[
-        "aitm check ssti --args '{\"url\":\"https://app.example.test/\",\"param\":\"name\"}'",
+        "aitm check ssti --url https://app.example.test/ --param name",
     ]),
-    ("check.xss", &[
-        "aitm check xss --args '{\"url\":\"https://app.example.test/search\",\"param\":\"q\"}'",
+    ("check.ws-auth-bypass-handshake", &[
+        "aitm check ws-auth-bypass-handshake --url https://app.example/ws --param q",
+    ]),
+    ("check.ws-cmdi-echo", &[
+        "aitm check ws-cmdi-echo --url https://app.example.test/ws --param msg",
+    ]),
+    ("check.ws-input-reflection", &[
+        "aitm check ws-input-reflection --url https://app.example.test/ws --param msg",
+    ]),
+    ("check.ws-oversize-frame", &[
+        "aitm check ws-oversize-frame --url https://app.example.test/ws --param msg",
+    ]),
+    ("check.ws-sql-error", &[
+        "aitm check ws-sql-error --url https://app.example.test/ws --param msg",
+    ]),
+    ("check.ws-ssti", &[
+        "aitm check ws-ssti --url https://app.example.test/ws --param msg",
+    ]),
+    ("check.ws-subprotocol-observe", &[
+        "aitm check ws-subprotocol-observe --url https://app.example/ws --param msg",
+    ]),
+    ("check.xss-reflected", &[
+        "aitm check xss-reflected --url https://app.example.test/search --param q",
     ]),
     ("check.xxe", &[
-        "aitm check xxe --args '{\"url\":\"https://app.example.test/api/xml\"}'",
+        "aitm check xxe --url https://app.example.test/api/xml --param q",
     ]),
     ("config.get", &[
         "aitm config get",
@@ -416,14 +504,68 @@ pub const EXAMPLES: &[(&str, &[&str])] = &[
     ("request.send", &[
         "aitm request send --authority app.example.test --path /login",
     ]),
+    ("scan", &[
+        "aitm scan start --target https://app.example.test",
+        "aitm scan status --job scan-1a2b3c4d",
+        "aitm scan issues --severity_min high",
+    ]),
+    ("scan.cancel", &[
+        "aitm scan cancel --job scan-1a2b3c4d",
+    ]),
+    ("scan.checks", &[
+        "aitm scan checks --lane http",
+        "aitm scan checks --origin bundled",
+    ]),
     ("scan.discover", &[
         "aitm scan discover --target https://app.example.test/ --max_pages 50",
+    ]),
+    ("scan.issue", &[
+        "aitm scan issue --id issue-9f0e1d2c",
+    ]),
+    ("scan.issue.update", &[
+        "aitm scan issue update --id issue-9f0e1d2c --status confirmed",
+    ]),
+    ("scan.issues", &[
+        "aitm scan issues --severity_min high",
+        "aitm scan issues --job scan-1a2b3c4d --status open",
+    ]),
+    ("scan.list", &[
+        "aitm scan list",
+        "aitm scan list --active_only true",
+    ]),
+    ("scan.map", &[
+        "aitm scan map --target https://app.example.test",
     ]),
     ("scan.passive", &[
         "aitm scan passive --target https://app.example.test",
     ]),
+    ("scan.profile.delete", &[
+        "aitm scan profile delete --name nightly",
+    ]),
+    ("scan.profile.get", &[
+        "aitm scan profile get --name standard",
+    ]),
+    ("scan.profile.list", &[
+        "aitm scan profile list",
+    ]),
+    ("scan.profile.save", &[
+        "aitm scan profile save --profile '{\"name\":\"nightly\",\"lanes\":[\"http\"]}'",
+    ]),
     ("scan.report", &[
         "aitm scan report --target https://app.example.test",
+    ]),
+    ("scan.session.preview", &[
+        "aitm scan session preview --target https://app.example.test",
+    ]),
+    ("scan.sitemap", &[
+        "aitm scan sitemap --target https://app.example.test",
+    ]),
+    ("scan.start", &[
+        "aitm scan start --target https://app.example.test",
+        "aitm scan start --target https://app.example.test --overrides '{\"intensity\":\"light\"}'",
+    ]),
+    ("scan.status", &[
+        "aitm scan status --job scan-1a2b3c4d",
     ]),
     ("scope", &[
         "aitm scope add --host app.example.test",

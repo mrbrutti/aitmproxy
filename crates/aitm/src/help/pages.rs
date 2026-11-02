@@ -391,7 +391,7 @@ Groups:
   poc                       reproducible proofs of concept
   proxy                     proxy state, pause/resume and the system proxy
   request                   craft and send a request through the proxy
-  scan                      discovery, passive checks and the findings report
+  scan                      scan jobs: crawl, probe, triage the issues found
   scope                     which hosts are decrypted
   script                    the Rhai detection scripts
   session                   save and load the flow store
@@ -617,8 +617,10 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
         assert_eq!(names, BUILT_IN_GROUPS);
         let rendered = block_lines(&out, "Groups:");
         assert_eq!(rendered.len(), 18, "{out}");
+        // `check` is native since the scanner v2 engine (main #232): the
+        // catalogue being off no longer takes the group off the page.
         assert!(
-            !rendered.iter().any(|line| line.starts_with("  check ")),
+            rendered.iter().any(|line| line.starts_with("  check ")),
             "{out}"
         );
         assert!(

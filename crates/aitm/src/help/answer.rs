@@ -581,7 +581,8 @@ mod tests {
         // usual.
         assert!(text.starts_with("aitm 0.5.11 — "), "{text}");
         assert!(text.contains("\n  scope "), "{text}");
-        assert!(!text.contains("\n  check "), "{text}");
+        // `check` is native since the scanner v2 engine (main #232).
+        assert!(text.contains("\n  check "), "{text}");
         // Exactly one warning line, plain (`warning:`), the path and the
         // error's first line between the two `·` (plan C31).
         assert_eq!(warned.lines().count(), 1, "{warned:?}");
