@@ -528,7 +528,7 @@ Spec §7(d) file list. Not touched: `apps/mac/Extension`, anything `R` removes, 
 - **Satisfies:** AC29 (Kit)
 - **Depends on:** M3a
 - **Files:** `apps/mac/Sources/AitmproxyKit/L4.swift`, `apps/mac/Tests/AitmproxyKitTests/L4Tests.swift`
-- **Change:** `public enum L4RowVerbs { public static func gate(_ item: VerbItem, row: FlowRow) -> VerbItem }`: on a `kind == .l4` row, items whose `tableKey` is `.resume, .edit, .kill, .delete, .replay, .editAndReplay, .buildPoC, .resumeSelected, .killSelected, .comment`, or any mark (matched with `if case .mark = item.tableKey`), come back `enabled: false`, `disabledReason: "Not available for L4 flows"`; other rows and verbs are unchanged.
+- **Change:** `public enum L4RowVerbs { public static func gate(_ item: VerbItem, row: FlowRow) -> VerbItem }`: on a `kind == .l4` row, items whose `tableKey` is `.resume, .edit, .kill, .delete, .replay, .editAndReplay, .buildPoC, .resumeSelected, .killSelected, .comment`, or any mark (matched with `if case .mark = item.verb.tableKey`), come back `enabled: false`, `disabledReason: "Not available for L4 flows"`; other rows and verbs are unchanged.
 - **Test first:** `testL4RowOffersNoHTTPVerbs`: for `L4Flow(…).row(seq: 1, inScope: true)`, `VerbTable.items(for: VerbContext(row: row)).map { L4RowVerbs.gate($0, row: row) }` has no enabled mark, comment, replay or buildPoC, and a `.mark(.red)` item built in the test comes back disabled; for an HTTP row every item is unchanged.
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
