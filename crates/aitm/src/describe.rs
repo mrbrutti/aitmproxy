@@ -40,7 +40,7 @@ use aitm_plugin_maprules::MapRulesPlugin;
 use aitm_plugin_passthrough::PassthroughPlugin;
 use aitm_plugin_rhai::wire::build_with_languages;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
-use aitm_plugin_scanner::{ScannerConfig, ScannerPlugin};
+use aitm_plugin_scanner::ScannerPlugin;
 use aitm_plugin_sessionio::SessionIoPlugin;
 use aitm_plugin_wsctl::WsCtlPlugin;
 use aitm_plugins::{
