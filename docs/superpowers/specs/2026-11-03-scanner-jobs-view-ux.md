@@ -400,8 +400,9 @@ UX:
   the selection; an existing selection is never stolen.
 - F4 (C10): rows are real accessibility elements (verify with the AX dump
   and VoiceOver on the real app).
-- F5 (C12): the surface records `jobsLoadedAt` and reads the bus state from
-  the session so the banner and the disabled verbs are driven by facts.
+- F5 (C12): the state records `jobsLoadedAt` (outside the published model, see D6)
+  and reads the bus state from the session so the banner and the disabled verbs
+  are driven by facts.
 
 ### Parity (web, TUI)
 
@@ -670,9 +671,14 @@ dump, not the modifier **(Architect's call on the first mechanism)**.
 
 `ScanSurfaceModel` gains two facts and one derived value:
 
-- `jobsLoadedAt: Int?` (epoch ms), set by `applyList(_:now:)` from its new
-  `now` parameter; `ScanPanelState.refreshList` passes the wall clock in
-  epoch milliseconds, tests pass a literal.
+- `jobsLoadedAt: Int?` (epoch ms): the freshness stamp. **Amended at the merge
+  with #308 (2026-11-02):** it lives on `ScanPanelState` as an
+  `@ObservationIgnored private(set) var`, set by `refreshList` after
+  `applyList(_:)` lands, not on the model. The surface publishes only on a real
+  change (MS-R1: `updateSurface` compares before assigning, and the 2 s list
+  beat re-applies an equal list), and a stamp inside the model would have
+  republished the whole page every beat. `applyList(_:)` takes no clock;
+  `noteReadFailure(text:now:)` keeps its `now` for `readFailedAt`.
 - `readFailure: ScanReadFailure?`, the one stored failure fact
   (`public struct ScanReadFailure: Equatable, Sendable { public var text: String; public var at: Int }`,
   a struct so `Equatable`/`Sendable` are synthesised), set by
