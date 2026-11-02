@@ -487,6 +487,25 @@ mod tests {
         );
     }
 
+    /// The guard's typed refusal survives `anyhow` boxing: `JobClient` (T1b)
+    /// downcasts every `send_opts` error to tell `RateLimited { retry_after }`
+    /// (pace and retry) from `OutOfScope` (give up on the host) apart.
+    #[tokio::test]
+    async fn send_opts_guard_error_is_downcastable() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client = PipelineClient::new(store, guard, Arc::new(RecordingSender::new()));
+
+        let err = client
+            .send_opts(req("other.test"), SendOptions::default())
+            .await
+            .expect_err("other.test is not in scope");
+        assert_eq!(
+            err.downcast_ref::<crate::error::GuardError>(),
+            Some(&crate::error::GuardError::OutOfScope("other.test".into()))
+        );
+    }
+
     /// Tester: marks are carried verbatim, including an empty list and a long or
     /// odd mark, and a `Never` send leaves nothing behind that could carry them
     /// into the store.
@@ -514,5 +533,41 @@ mod tests {
             .unwrap();
         assert_eq!(flow.metadata.marks, odd);
         assert_eq!(stored_marks(&store, flow.id), odd);
+    }
+
+    /// Tester: the pacing half of the ladder the engine's `JobClient` relies on.
+    /// A per-host rate refusal surfaces as the typed `RateLimited { retry_after }`
+    /// (so the client can sleep exactly that long and retry), the guard refuses
+    /// before the sender is reached, and nothing is stored.
+    #[tokio::test]
+    async fn send_opts_rate_limit_error_is_downcastable_with_retry_after() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            per_host_rps: 0,
+            ..Default::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let sender = Arc::new(RecordingSender::new());
+        let client = PipelineClient::new(store.clone(), guard, sender.clone());
+
+        let err = client
+            .send_opts(req("ex.test"), SendOptions::default())
+            .await
+            .expect_err("a zero per-host rate refuses every send");
+
+        assert_eq!(
+            err.downcast_ref::<crate::error::GuardError>(),
+            Some(&crate::error::GuardError::RateLimited {
+                retry_after: std::time::Duration::from_secs(1)
+            })
+        );
+        assert_eq!(
+            sender.calls.load(Ordering::SeqCst),
+            0,
+            "the guard refuses before the sender is reached"
+        );
+        assert_eq!(store.count(), 0, "a refused send stores nothing");
     }
 }

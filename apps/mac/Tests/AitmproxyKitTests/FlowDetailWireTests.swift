@@ -48,6 +48,67 @@ import Testing
         #expect(d.connection.serverAddress == "93.184.216.34:443")
     }
 
+    /// Per-host decryption (#228, TR-AC22): `meta.tunnel {mode, reason, bytes_up, bytes_down}`
+    /// and `meta.passive`, shapes from `crates/aitm-plugins/src/detail.rs` `meta` / `tunnel`.
+    static func withMeta(_ extra: [String: JSONValue]) -> JSONValue {
+        var obj = httpDetail.objectValue!
+        var meta = obj["meta"]!.objectValue!
+        for (key, value) in extra { meta[key] = value }
+        obj["meta"] = .object(meta)
+        return .object(obj)
+    }
+
+    @Test func decodesMetaTunnelAndPassive() throws {
+        let d = try #require(FlowDetail(detailJSON: Self.withMeta([
+            "tunnel": ["mode": "passthrough", "reason": "out_of_scope", "bytes_up": 1, "bytes_down": 2],
+            "passive": false,
+        ])))
+        #expect(d.tunnel == TunnelInfo(mode: .passthrough, reason: .outOfScope, bytesUp: 1, bytesDown: 2))
+        #expect(d.passive == false)
+    }
+
+    @Test func decryptedTunnelHasNoReasonOrCounts() throws {
+        let d = try #require(FlowDetail(detailJSON: Self.withMeta([
+            "tunnel": ["mode": "decrypted", "reason": .null, "bytes_up": .null, "bytes_down": .null],
+            "passive": false,
+        ])))
+        #expect(d.tunnel == TunnelInfo(mode: .decrypted, reason: nil, bytesUp: nil, bytesDown: nil))
+    }
+
+    @Test func failedTunnelCarriesItsReason() throws {
+        let d = try #require(FlowDetail(detailJSON: Self.withMeta([
+            "tunnel": ["mode": "failed", "reason": "client_rejected_certificate", "bytes_up": .null, "bytes_down": .null],
+        ])))
+        #expect(d.tunnel == TunnelInfo(mode: .failed, reason: .clientRejectedCertificate, bytesUp: nil, bytesDown: nil))
+    }
+
+    @Test func nullTunnelAndAbsentPassiveAreTheDefaults() throws {
+        let null = try #require(FlowDetail(detailJSON: Self.withMeta(["tunnel": .null])))
+        #expect(null.tunnel == nil)
+        #expect(null.passive == false)
+        // A core older than #228 sends neither key.
+        let older = try #require(FlowDetail(detailJSON: Self.httpDetail))
+        #expect(older.tunnel == nil)
+        #expect(older.passive == false)
+    }
+
+    @Test func passiveTrueDecodes() throws {
+        let d = try #require(FlowDetail(detailJSON: Self.withMeta(["passive": true])))
+        #expect(d.passive == true)
+    }
+
+    @Test func unknownTunnelModeIsNoTunnel() throws {
+        let d = try #require(FlowDetail(detailJSON: Self.withMeta([
+            "tunnel": ["mode": "weird", "reason": "out_of_scope", "bytes_up": 1, "bytes_down": 2],
+        ])))
+        #expect(d.tunnel == nil)
+        // An unknown reason on a known mode keeps the mode and drops the reason.
+        let newReason = try #require(FlowDetail(detailJSON: Self.withMeta([
+            "tunnel": ["mode": "failed", "reason": "something_new", "bytes_up": .null, "bytes_down": .null],
+        ])))
+        #expect(newReason.tunnel == TunnelInfo(mode: .failed, reason: nil, bytesUp: nil, bytesDown: nil))
+    }
+
     @Test func handlesNullResponseAndBody() throws {
         var obj = Self.httpDetail.objectValue!
         obj["response"] = .null
