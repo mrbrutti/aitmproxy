@@ -80,6 +80,9 @@ AITM_BIN="$(cd "$(dirname "$AITM_BIN")" && pwd)/$(basename "$AITM_BIN")"
 TUI_BIN="$(dirname "$AITM_BIN")/aitm-tui"
 EXPECT_VERSION="${AITM_EXPECT_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)}"
 SECTIONS="${AITM_HELP_SECTIONS:-all}"
+# Decided once, at top level: `tty_reason` is read through `$(...)`, whose
+# stdout is a pipe, so `[ -t 1 ]` inside it would always say "not a TTY".
+if [ -t 1 ]; then STDOUT_IS_TTY=1; else STDOUT_IS_TTY=0; fi
 
 # The runner's own settings must not leak into the binary under test: every
 # section states the variables it needs on the command line. The three
@@ -440,7 +443,7 @@ pty_probe() {
 
 # tty_reason: empty when the recordings can run here; else why not.
 tty_reason() {
-  if [ ! -t 1 ]; then
+  if [ "$STDOUT_IS_TTY" != 1 ]; then
     printf '%s' "stdout is not a TTY: run the script directly in a terminal, not through a pipe"
   elif ! pty_probe; then
     printf '%s' "script cannot allocate a pty here"
