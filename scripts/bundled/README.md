@@ -126,7 +126,7 @@ One row per script; the manual verb is `check.<id>`.
 | `cmdi` | cmdi | query, body_param, json_value | medium | reflected | critical | yes | Split `echo` marker reassembled only by a shell |
 | `cors` | cors | query (origin-scoped) | light | reflected | medium | no | Canary `Origin` echoed, with or without credentials |
 | `crlf` | crlf | query, body_param, header | medium | reflected | high | yes | Injected canary appears as a response header |
-| `header-reflection` | reflected-xss | header, cookie | light | reflected | medium | yes | Header/cookie marker verbatim in an HTML body |
+| `header-reflection` | reflected-xss | header, cookie | light | reflected | medium | yes | A markup-significant header/cookie marker echoed verbatim into HTML, or into a response header |
 | `headers` | missing-security-headers | query (origin-scoped) | passive | passive | low | no | Which of HSTS, CSP, nosniff, frame, referrer are absent |
 | `ldapi` | ldapi | query, body_param | medium | boolean | high | no | Always-true filter differential (directory error refines it) |
 | `methods` | risky-http-methods | query (origin-scoped) | light | observe | info | no | `Allow` advertises a write or debug method |
@@ -145,27 +145,37 @@ cannot plausibly be effective. The four origin-level audits (`cors`, `headers`,
 `methods`, `paths`) declare `kinds: ["query"]` and `scope: "origin"`: the point
 is only a carrier and the audit is of the origin. Three of them run once per
 origin and return one verdict; `paths` returns one verdict per exposed path.
+All four return `inconclusive` when the point carries no URL at all: there is
+then no origin to audit, and concluding nothing is the honest answer.
 
-Two behaviours are deliberately narrower than their class suggests, and both are
-noted here rather than hidden:
+Three behaviours are deliberately narrower than their class suggests, and all
+are noted here rather than hidden:
 
 - `paths` returns **one verdict per exposed path**: an array of verdict maps,
   which the bridge reads as a root verdict plus `Verdict.more` siblings, each
   carrying `location: #{ path }` so `/.git/HEAD` and `/.env` dedupe as two
   issues. A clean origin is a single `clean` verdict with no location.
-- `header-reflection` matches a marker in an **HTML body** only; a non-HTML echo
-  (a header value, a JSON field) is `clean`. The response-header arm is
-  **planned**.
+- `header-reflection` sends a **markup-significant** payload — a quote and an
+  angle bracket in front of the marker — and counts only a verbatim echo. The
+  payload back in an **HTML body** is `vulnerable` at `certain`; the payload
+  back in a **response header** is `vulnerable` at `firm`. A JSON or plain-text
+  body that echoes it, and a page that returns the marker's letters with the
+  punctuation encoded, are both `clean`: the output was escaped, or it never
+  reaches a browser as markup.
 - `methods` returns `inconclusive` when the `OPTIONS` reply carries no `Allow`
   header: the origin advertised nothing, which is not the same as advertising
   nothing risky.
 
 ### HTTP — native checks (`crates/aitm-scan-checks-http`)
 
-Compiled Rust checks, contributed by `aitm_scan_checks_http::checks()`. They sit
-in the same catalogue as the scripts above, are scheduled by the same rules, and
-get the same manual verb: `check.sqli-boolean`, `check.sqli-time`,
-`check.cmdi-time`, `check.xss-reflected`, `check.open-redirect`,
+Compiled Rust checks, contributed by
+`aitm_scan_checks_http::checks_with(ssrf_policy, scope_guard)` — the slot
+`crates/aitm/src/wire.rs` calls once at startup with the operator's SSRF policy
+and the proxy's scope guard, because five of the ten dial raw HTTP/2 and every
+such dial is gated. They sit in the same catalogue as the scripts above, are
+scheduled by the same rules, and get the same manual verb:
+`check.sqli-boolean`, `check.sqli-time`, `check.cmdi-time`,
+`check.xss-reflected`, `check.open-redirect`,
 `check.h2-settings-observe`, `check.h2-pseudo-header-validation`,
 `check.h2-header-crlf-tolerance`, `check.h2-cl-te-downgrade-indicator`,
 `check.h2-rapid-reset-mitigation`.
@@ -177,19 +187,21 @@ xml_value, multipart_value, header, cookie, path_segment`.
 |---|---|---|---|---|---|---|---|
 | `cmdi-time` | cmdi | the eight injectable kinds | medium | timing | critical | no | Response time tracks a requested shell delay |
 | `h2-cl-te-downgrade-indicator` | h2-smuggling-indicator | query, body_param, header, cookie, path_segment | medium | observe | info | no | An h2 request with a disagreeing `content-length`, or a `transfer-encoding`, is answered rather than rejected |
-| `h2-header-crlf-tolerance` | h2-header-crlf | query, body_param, header, cookie, path_segment | medium | malformed | info | no | CR LF inside an h2 header name or value is tolerated |
+| `h2-header-crlf-tolerance` | h2-header-crlf | query, body_param, header, cookie, path_segment | medium | malformed | medium | no | CR LF inside an h2 header name or value is tolerated |
 | `h2-pseudo-header-validation` | h2-pseudo-header | query, body_param, header, cookie, path_segment | medium | malformed | info | no | A malformed pseudo-header set is answered rather than reset |
 | `h2-rapid-reset-mitigation` | h2-rapid-reset | query, body_param, header, cookie, path_segment | medium | observe | info | no | Whether eight open/reset pairs provoke any reset-rate mitigation |
 | `h2-settings-observe` | h2-settings | query, body_param, header, cookie, path_segment | medium | observe | info | no | The SETTINGS the server advertises |
 | `open-redirect` | open-redirect | query, body_param, json_value, header | light | reflected | medium | yes | A 3xx whose `Location` authority is the canary host |
 | `sqli-boolean` | sqli | the eight injectable kinds | medium | boolean | critical | no | True arm reproduces the baseline, false arm diverges |
 | `sqli-time` | sqli | the eight injectable kinds | medium | timing | critical | no | Response time tracks a requested database delay |
-| `xss-reflected` | reflected-xss | query, body_param, json_value, xml_value, multipart_value, header, path_segment, param_name_query | light | reflected | high | yes | A markup canary reflected with brackets and quotes intact into HTML |
+| `xss-reflected` | reflected-xss | query, body_param, json_value, xml_value, multipart_value, header, cookie, path_segment, param_name_query | light | reflected | high | yes | A markup canary reflected with brackets and quotes intact into HTML |
 
 `open-redirect` declares `wants_traits: ["url"]`. The five `h2-*` checks observe
 one HTTP/2 connection each, open at most eight streams, and send no `Cookie`,
 `Authorization` or any session header; they are `medium` intensity and never
-`intrusive`.
+`intrusive`. They also declare `scope: "origin"` — like the four Rhai origin
+audits, the point only carries the origin and the verdict is about the server,
+so each runs once per origin rather than once per parameter.
 
 Two scripts were **retired** when these landed: `check-xss.rhai` and
 `check-open-redirect.rhai` are gone, because `xss-reflected` and `open-redirect`
@@ -279,9 +291,12 @@ const META = #{
 
 fn load(reg) {
     reg.add_check(META, |point| {
-        // Two primes, so the product is unlikely to appear by chance, and a
-        // per-run tag so the match is this probe's and nobody else's.
-        let tag = rand_text_alpha(4);
+        // Two primes, so the product is unlikely to appear by chance, and the
+        // job's own marker as the tag, so the match is this probe's and nobody
+        // else's. The marker rather than random letters: the oracle has to
+        // recognise the tag coming back, and the marker is the one token the
+        // engine, the evidence and a later PoC all agree on.
+        let tag = probe.marker();
         let want = tag + `${73 * 79}`;
         // The second payload is assembled rather than interpolated: a literal
         // dollar-brace would be read by Rhai's own string interpolation.
@@ -380,7 +395,7 @@ is an error.
 | `probe.send(payload)` | the response map, having placed `payload` at the point. `payload` is a string (replace), or `#{ value, mode }` with `mode` one of `"replace"`, `"prefix"`, `"suffix"` |
 | `probe.baseline()` | the response map for the point's unmodified request; cached per point, so asking twice costs one probe |
 | `probe.raw(#{ method, url, headers, body })` | the response map for a request you compose yourself. **Same origin only** — for handshake-, header- and path-level work such as `OPTIONS` or a fixed path list |
-| `probe.marker()` | a fresh string, unique per call, for canaries |
+| `probe.marker()` | the job's collision-resistant canary token: a fresh string on every call, so take it **once** into a variable and reuse it — a check whose oracle has to recognise its own canary (`ssti`, `cmdi`, `crlf`, `xxe`, `cors`, `header-reflection`) builds it from here rather than from `rand_text_alpha`, so evidence, hint and a later PoC all name the same token |
 | `probe.budget_left()` | how many probes the job will still pay for |
 | `probe.timing_fit(#{ requested_s: [..], observed_ms: [..] })` | `#{ correlated, slope, r }` |
 | `probe.levenshtein_ratio(a, b)` | similarity of two strings, 0.0 to 1.0 |
@@ -407,6 +422,12 @@ Return a map:
 | `evidence` | `#{ payload, matched }` — what you sent and what matched. `matched: ()` when nothing did |
 | `detail` | one or two plain sentences an operator can act on |
 | `poc_hint` | optional, below |
+| `location` | optional `#{ path, name }` — what inside the target this verdict is about, so an origin-scoped audit that finds several things dedupes them apart (`paths` uses it) |
+
+Those six are the whole vocabulary: any other key turns the run into an `error`
+verdict naming it. `more` is **not** one of them — a check with several
+findings returns an **array** of verdict maps, and the bridge reads the first
+as the verdict and the rest as its `more` siblings.
 
 Returning a **plain string** instead of a map is read as `inconclusive` with the
 string as `detail`. That keeps an old or half-finished script from breaking a
@@ -436,11 +457,15 @@ poc_hint: #{
 
 The matcher vocabulary is the PoC loader's own, so a hint is a PoC assertion
 already: `type` is `status`, `word`, `regex`, `dsl` or `browser-eval`, with the
-matching field (`word`, `regex`, `dsl`, `status`) and `part` one of `body`,
-`header`, `all`. Combine with `all`, `any`, and negate with **`not:`** wrapping
-a matcher — there is no `negative` flag. The optional `control` re-runs with a
-harmless payload and must *not* match, which is what separates a real finding
-from a page that always contains your word.
+matching field beside it (`status`, `word`, `regex`, `dsl`, or `expr` plus
+`equals`), and `part` one of `body`, `header`, `all` for the `word` and `regex`
+forms. `matchers` is required and is a **list**, which the loader reads as an
+implicit `all`. Combine explicitly with `all` and `any`; negate either with
+**`not:`** wrapping a matcher or with `negative: true` beside it — the scripts
+here use `not:`, because it reads as what it is when the matcher is nested.
+The optional `control` re-runs with a harmless payload and must *not* match,
+which is what separates a real finding from a page that always contains your
+word.
 
 The classes that **must** supply a hint are `sqli`, `ssti`, `cmdi`,
 `path-traversal`, `crlf` and `xxe` — the ones whose issues are worth nothing
