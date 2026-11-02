@@ -551,6 +551,17 @@ impl PointRunner {
     /// counters, as call C1b requires of every stop this runner raises.
     fn stop(&self, reason: StopReason) {
         let job_id = self.job.job_id();
+        // The lane's one log line: a stop reason names a cap, a deadline, a
+        // budget, a wire or craft failure or an unavailable backend, never a
+        // payload byte, and it is the only trace a core operator has of why a
+        // packet job sent fewer cases than its profile asked for (the engine
+        // records a check's error verdict nowhere else; T5 live proof, 4b).
+        tracing::info!(
+            target: "aitm::scanner::l4_packet",
+            job = %job_id,
+            point = %self.point.id,
+            "packet lane stopped this point's run: {reason:?}"
+        );
         self.shared.state.mark_stopped(job_id, reason);
         self.report(job_id);
     }
