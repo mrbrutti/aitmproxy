@@ -100,7 +100,10 @@ when a real `curl -x` through a real core shows Client `curl` in `flow.table`.
   `aitmproxy-sandbox-no-socket-binds`). Parsers, the match rule, the sanitiser, the coalescer and
   the layout pins run anywhere.
 - Linux is implemented but live-proven on a Linux host as a follow-up (D-h). The Linux glue is
-  `cfg(target_os = "linux")`; its parsers are portable and fixture-tested on the Mac.
+  `cfg(any(target_os = "linux", test))` (amended 2026-11-01, panel P3): its parsers are portable,
+  and the `/proc` walk takes its root as a path (`LinuxScanner { skip_pid, uid, root: PathBuf }`,
+  `with_root`), so it is fixture-tested on the Mac (Summary item 8); only `LinuxScanner::new`,
+  which reads the real `/proc`, is Linux-only.
 - `rust-version = "1.97"`: `std::mem::offset_of!` is available for the layout pins.
 - Load: the e2e timing bound must survive a loaded Mac (memory `aitmproxy-load-flaky-tests`); it is
   a generous absolute bound, printed, not a differential measurement.
@@ -199,10 +202,11 @@ snapshots every pending tuple, runs one scan that matches all of them, writes ea
 a `Condvar`, and if new tuples arrived meanwhile loops as leader again (subject to the rate limit).
 A non-leader waits on the `Condvar` until its tuple has a result or `scan_deadline` passes.
 
-**Rate limit (Architect's call): a token bucket of capacity 10, refilled at 10 tokens/s.** A scan
-consumes a token. A caller that finds no scan running and no token returns `None` at once. Worst
-case under a flood: 10 scans/s × 7 ms = 7 % of one core; idle cost zero. A browser page load
-(bursts of a few connections within milliseconds) is one or two scans.
+**Rate limit (Architect's call): a token bucket of capacity 20, refilled at 20 tokens/s** (amended
+2026-11-01, F2; was 10 / 10, see the amendment below). A full scan consumes a token. A caller
+that finds no scan running and no token returns `None` at once. Worst case under a flood:
+20 scans/s × 7 ms = 14 % of one core; idle cost zero. A browser page load (bursts of a few
+connections within milliseconds) is one or two scans.
 
 > **Amendment 2026-11-01 (live-proof finding F2, decided by the orchestrator).** The paragraph
 > above under-counted: sequential connections do not coalesce, so every connection paid a full
@@ -235,8 +239,8 @@ serves a stale name. Both `Some` and `None` identities are cached. The result fo
 is computed once at accept and never re-resolved (it lives on the flow).
 
 Tunables live in `pub struct Limits { scan_deadline: Duration, scan_tokens: u32, scan_refill_per_s: u32, cache_entries: usize }`
-with `Default` = (250 ms, 10, 10, 256), reachable through `ProcessResolver::with_limits` for tests
-only; nothing reads them from config (D6).
+with `Default` = (250 ms, 20, 20, 256) (amended 2026-11-01, F2; was 10, 10), reachable through
+`ProcessResolver::with_limits` for tests only; nothing reads them from config (D6).
 
 ### D4. Match rule (decided, D-d)
 
@@ -336,9 +340,9 @@ docstring rewritten to say what it now proves. The new positive proof lives in
 
 ### D9. Logging and privacy posture
 
-- The resolver logs at `debug` only: scan count, duration, matched/unmatched, rate-limited, deadline
-  hit. Never the identity string above `debug`, never a path or pid at any level in `aitm-core`
-  (the leaf crate has no tracing dependency; it returns values).
+- The core logs presence only (`resolved` bool at `debug`); the leaf crate has no tracing
+  dependency and returns values (amended 2026-11-01, panel P7). Never the identity string above
+  `debug`, never a path or pid at any level in `aitm-core`.
 - Same-user only by construction: the kernel refuses other users' fd tables; we never escalate,
   never ask for a helper, never read `/proc/<pid>/cmdline`.
 - The identity is text chosen by whoever built the client binary: bounded (≤ 256 bytes), scrubbed
@@ -438,7 +442,9 @@ docstring rewritten to say what it now proves. The new positive proof lives in
 15. **AC15 (cache).** Two resolutions mapping to the same `ProcessKey` call `identity` once; a key
     with the same pid and a different `start` calls it again; inserting 257 keys evicts the first.
 16. **AC16 (wording).** `grep -rn "null for a proxied" crates docs` finds nothing outside
-    `apps/mac/**` and `docs/research/**`; `schemas_declare_source_app_and_capture_interface` and
+    `apps/mac/**` and `docs/research/**`; the scope is `crates` and `docs/design`; the archival
+    2026-10-31 specs/plans and this spec quoting the phrase are exempt (amended 2026-11-01, panel
+    P1); `schemas_declare_source_app_and_capture_interface` and
     `flow_get_and_table_report_source_app` pass unchanged; the e2e flow cell (D8) passes against
     the new core.
 17. **AC17 (gates and proof).** Rust gate green; `cargo test -p aitm-peer-process` and the
@@ -481,7 +487,8 @@ the name to every UI with no new wire field, verb, or mac change.
 1. Identity vocabulary option B (bundle identifier if bundled, innermost bundle, else basename),
    because the signing-identifier lookup measured 45-82 ms (every call for ad-hoc binaries) against
    a 25 ms budget, and B is unsafe-free with the locked `core-foundation` crate.
-2. Budget 25 ms after the peek; scan deadline 250 ms; token bucket 10 / 10 per s; cache 256 FIFO
+2. Budget 25 ms after the peek; scan deadline 250 ms; token bucket 20 / 20 per s (amended
+   2026-11-01, F2; was 10 / 10); cache 256 FIFO
    keyed `(pid, start_time)`; both `Some` and `None` identities cached.
 3. The leaf crate depends on `aitm-core` and implements the trait itself (no adapter in `aitm`).
 4. `.app`, `.xpc`, `.appex` are the bundle suffixes recognised; `.framework` is not.

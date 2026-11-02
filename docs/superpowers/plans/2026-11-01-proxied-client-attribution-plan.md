@@ -59,7 +59,7 @@ gates while a wave is in flight, full gate before the panel.
     pub struct ProcessKey { pub pid: u32, pub start: u64 }
     #[derive(Clone, Debug)]
     pub struct Limits { pub scan_deadline: Duration, pub scan_tokens: u32, pub scan_refill_per_s: u32, pub cache_entries: usize }
-    impl Default for Limits  // 250 ms, 10, 10, 256
+    impl Default for Limits  // 250 ms, 20, 20, 256 (amended 2026-11-01, F2; was 10, 10)
     pub(crate) trait SocketScanner: Send + Sync {
         fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey>;
         fn identity(&self, key: ProcessKey) -> Option<String>;   // raw, unsanitised
@@ -192,27 +192,41 @@ gates while a wave is in flight, full gate before the panel.
 - **Done when:** the layout test passes in the sandbox; the Terminal run of
   `cargo test -p aitm-peer-process macos::ffi` is quoted green; clippy/fmt clean.
 
-### Task 4: Linux scanner glue (cfg-gated)
+### Task 4: Linux scanner glue (cfg-gated, fixture-tested on the Mac)
 
 - **Satisfies:** the Linux half of D2/D4/D5 (live proof is the follow-up named in the spec)
 - **Depends on:** Task 1
 - **Files:** `crates/aitm-peer-process/src/linux/scan.rs` (create), `src/linux/mod.rs` (modify:
-  `#[cfg(target_os = "linux")] pub(crate) mod scan;`)
+  `#[cfg(any(target_os = "linux", test))] pub(crate) mod scan;` — amended 2026-11-01 in the
+  whole-branch panel (P3, accepted (a)): the walk builds under `cfg(test)` on every host so it is
+  fixture-tested here, matching spec Summary item 8; only `LinuxScanner::new` stays
+  `cfg(target_os = "linux")`)
 - **Change:**
   ```rust
-  pub(crate) struct LinuxScanner { pub(crate) skip_pid: Option<u32>, uid: u32 }
-  impl LinuxScanner { pub(crate) fn new() -> Self; }  // uid via std::os::unix::fs::MetadataExt on /proc/self (no libc dep)
+  pub(crate) struct LinuxScanner { pub(crate) skip_pid: Option<u32>, uid: u32, root: PathBuf }
+  #[cfg(target_os = "linux")]
+  impl LinuxScanner { pub(crate) fn new() -> Self; }  // root = /proc; uid via std::os::unix::fs::MetadataExt on /proc/self (no libc dep); own pid skipped
+  impl LinuxScanner { pub(crate) fn with_root(root: PathBuf, uid: u32, skip_pid: Option<u32>) -> Self; }  // any procfs root: a fixture tree in tests
   impl SocketScanner for LinuxScanner {
-      fn find_owners(..)  // read /proc/net/tcp and tcp6, parse_tcp_row, match wanted by (local==client, remote==proxy) after canonical(); row.uid must equal self.uid; inode → walk /proc/[0-9]+/fd ascending, readlink, fd_socket_inode == inode; skip skip_pid; deadline per pid; ProcessKey.start from parse_stat_starttime(/proc/<pid>/stat)
-      fn identity(..)     // exe_basename(readlink /proc/<pid>/exe) else /proc/<pid>/comm trimmed
+      fn find_owners(..)  // read <root>/net/tcp and tcp6, parse_tcp_row, match wanted by (local==client, remote==proxy) after canonical(); row.uid must equal self.uid; inode → walk <root>/[0-9]+/fd ascending, readlink, fd_socket_inode == inode; skip skip_pid; deadline per pid; ProcessKey.start from parse_stat_starttime(<root>/<pid>/stat)
+      fn identity(..)     // exe_basename(readlink <root>/<pid>/exe) else <root>/<pid>/comm trimmed
   }
   ```
-- **Test:** the parsers are Task 1's. Here: `cargo check --offline -p aitm-peer-process --target x86_64-unknown-linux-gnu`
-  if that target's std is installed (`rustup target list --installed`); otherwise the Coder
-  reports "Linux glue unverified on this Mac" and the Tester notes it. No fixture-only test for the
-  glue (memory `aitmproxy-no-fixture-ui-evidence` spirit: the proof is the follow-up on a Linux host).
+- **Test:** the parsers are Task 1's. Here: fixture tests over a fake `/proc` under `$TMPDIR`
+  (`linux::scan::tests`, 13 at the panel: a same-uid row is matched, another uid's row is never
+  matched, the lowest pid wins and `skip_pid` is honoured, a missing `stat` still matches with
+  `start == 0`, an expired deadline finds nothing, an empty `/proc` does not panic, an unreadable
+  fd dir is skipped, identity via `exe` then `comm`, a vanished pid is `None`, a malformed row does
+  not abort the table, a targeted probe walks only the given pids). Plus the cross-check
+  `cargo check --offline -p aitm-peer-process --target x86_64-unknown-linux-gnu` if that target's
+  std is installed; otherwise the Coder reports "Linux glue unverified on this Mac" and the Tester
+  notes it.
 - **Done when:** the Mac build is unaffected (`cargo test --offline -p aitm-peer-process` still
-  green) and the cross-check result is quoted either way.
+  green), the fixture tests are green, and the cross-check result is quoted either way. Result at
+  the panel: Homebrew rustc 1.97.1, no rustup, only aarch64-apple-darwin std;
+  `cargo check --offline -p aitm-peer-process --target x86_64-unknown-linux-gnu` →
+  error[E0463]: can't find crate for `core` — unverified on this Mac; live Linux proof is the
+  spec's named follow-up.
 
 ### Task 5: macOS scanner + identity, `ProcessResolver`, trait impl, full self-resolution
 
@@ -268,7 +282,9 @@ gates while a wave is in flight, full gate before the panel.
   `gone`), `ffi::tests::warm_probe_names_this_process_without_a_full_scan` (Terminal),
   `linux::scan::tests::a_targeted_probe_walks_only_the_given_pids_and_reports_the_idle_ones`
   (fixture). `NoScanner::find_owners_among` → `Probe::default()`. The e2e cell's step 4 becomes a
-  hard check that all 20 latency rows carry a python `source_app`. `aitm-core` — `PeerResolver`, builder step, `handle_conn` concurrency and budget
+  hard check that all 20 latency rows carry a python `source_app`.
+
+### Task 6: `aitm-core` — `PeerResolver`, builder step, `handle_conn` concurrency and budget
 
 - **Satisfies:** AC1, AC2, AC3, AC4, AC5
 - **Depends on:** none (parallel with Task 1)
