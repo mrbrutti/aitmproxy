@@ -108,6 +108,9 @@ echo "sections:         $SECTIONS"
 echo
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aitm-oneshot-XXXXXX")"
+# Normalised: macOS sets TMPDIR with a trailing slash, and the pins compare the
+# paths the binary prints (single slashes) against $ROOT-derived literals.
+ROOT="$(cd "$ROOT" && pwd -P)"
 if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
   echo "FATAL: could not create a scratch directory under ${TMPDIR:-/tmp}" >&2
   exit 2
@@ -590,7 +593,7 @@ PY
   check "pointer carries no substring of the operator token" [ "$(count_fx "$TOKEN" "$PTR")" = 0 ]
   check "pointer lock is held while the core runs (flock LOCK_SH|LOCK_NB → BlockingIOError)" [ "$(flock_state "$PTR")" = held ]
   if [ "$HAVE_LSOF" = 1 ]; then
-    lsof -nP -p "$SERVER_PID" -iTCP -sTCP:LISTEN > "$ROOT/plain.lsof" 2>/dev/null
+    lsof -nP -a -p "$SERVER_PID" -iTCP -sTCP:LISTEN > "$ROOT/plain.lsof" 2>/dev/null
     check "lsof: the operator bus port $BUSPORT is bound ($(count_fx ":$BUSPORT (LISTEN)" "$ROOT/plain.lsof") LISTEN line)" \
       [ "$(count_fx ":$BUSPORT (LISTEN)" "$ROOT/plain.lsof")" -ge 1 ]
     local off_lo; off_lo="$(grep -a -F ":$BUSPORT (LISTEN)" "$ROOT/plain.lsof" | grep -v -c -F "127.0.0.1:$BUSPORT (LISTEN)")"
@@ -1066,7 +1069,7 @@ section_shared() {
   check "one pointer, and it names the shared bus 127.0.0.1:$sp with operator true" \
     sh -c '[ -n "$1" ] && grep -q -F "\"bus\":\"127.0.0.1:$2\",\"operator\":true" "$1"' _ "$ptr" "$sp"
   if [ "$HAVE_LSOF" = 1 ]; then
-    lsof -nP -p "$SERVER_PID" -iTCP -sTCP:LISTEN > "$ROOT/shared.lsof" 2>/dev/null
+    lsof -nP -a -p "$SERVER_PID" -iTCP -sTCP:LISTEN > "$ROOT/shared.lsof" 2>/dev/null
     local others; others="$(grep -a -F '(LISTEN)' "$ROOT/shared.lsof" | grep -v -F ":$lp (LISTEN)" | grep -v -F ":$bp (LISTEN)" | grep -c -F '(LISTEN)')"
     check "lsof: exactly one bus listener besides the proxy ($lp) and browser ($bp) ports ($others)" [ "${others:-0}" = 1 ]
     check "lsof: that listener is 127.0.0.1:$sp" grep -q -F "127.0.0.1:$sp (LISTEN)" "$ROOT/shared.lsof"
