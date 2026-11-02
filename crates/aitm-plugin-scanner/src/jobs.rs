@@ -353,6 +353,24 @@ impl JobRegistry {
         self.lock().get(id).map(|e| e.terminal.subscribe())
     }
 
+    /// Resolve once `id` is finished — its [`terminal_signal`] reads `true`,
+    /// which [`finish`] flips after the worker's handles are released — and
+    /// answer its status then. Resolves at once for a job that is already over
+    /// or that is not in the registry (`None`: pruned, or never there), and
+    /// when the entry is pruned mid-wait (the sender dropped with it): in each
+    /// case there is nothing left to wait for. No polling and no clock; a
+    /// caller that wants a deadline wraps this in `tokio::time::timeout`.
+    ///
+    /// [`terminal_signal`]: Self::terminal_signal
+    /// [`finish`]: Self::finish
+    pub async fn wait_terminal(&self, id: &str) -> Option<JobStatus> {
+        if let Some(mut signal) = self.terminal_signal(id) {
+            // `Err`: the sender is gone, so the entry is gone.
+            let _ = signal.wait_for(|terminal| *terminal).await;
+        }
+        self.status(id)
+    }
+
     /// Read `<findings_dir>/scan/jobs/*.json` back into finished entries.
     ///
     /// Returns how many jobs were added. A job the registry already holds is
@@ -1154,8 +1172,13 @@ pub(crate) mod test_support {
         /// otherwise the canned `200 ok`.
         page: Option<String>,
         /// The status every send is answered with (`200` unless a test asks
-        /// for another). A `5xx` is what the per-host error ladder counts.
+        /// for another). A `5xx` is an answer like any other since amendment
+        /// 40: the per-host error ladder counts transport errors and timeouts
+        /// only, which [`StubClient::failing`] models.
         status: u16,
+        /// When set, every send fails at the transport with this text instead
+        /// of answering — what the per-host error ladder counts.
+        failing: Option<&'static str>,
     }
 
     impl StubClient {
@@ -1167,6 +1190,7 @@ pub(crate) mod test_support {
                 requests: Mutex::new(Vec::new()),
                 page: None,
                 status: 200,
+                failing: None,
             })
         }
 
@@ -1180,20 +1204,22 @@ pub(crate) mod test_support {
                 requests: Mutex::new(Vec::new()),
                 page: Some(html.to_string()),
                 status: 200,
+                failing: None,
             })
         }
 
-        /// A client that answers every send with `status` — a `5xx` is the
-        /// unusable answer the per-host error ladder counts (`client.rs`
-        /// `ProbeMeter::record`).
-        pub(crate) fn answering(status: u16) -> Arc<Self> {
+        /// A client whose every send fails at the transport with `text` — the
+        /// outcome the per-host error ladder counts (`client.rs`
+        /// `ProbeMeter::record`). The call is still recorded.
+        pub(crate) fn failing(text: &'static str) -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicU64::new(0),
                 last_call_ms: AtomicU64::new(0),
                 seen: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 page: None,
-                status,
+                status: 200,
+                failing: Some(text),
             })
         }
 
@@ -1252,6 +1278,9 @@ pub(crate) mod test_support {
                     .push(req.clone());
                 self.last_call_ms
                     .store(crate::util::now_ms(), Ordering::SeqCst);
+                if let Some(text) = self.failing {
+                    anyhow::bail!("{text}");
+                }
                 let mut flow = stub_flow(req);
                 if let Some(response) = flow.response.as_mut() {
                     response.status = self.status;
@@ -1306,6 +1335,8 @@ pub(crate) mod test_support {
         /// it probes, as a non-HTTP stimulus does (a WebSocket frame, an L4
         /// case, a browser navigation).
         pub(crate) charge: u32,
+        /// The verdict's `detail` text.
+        pub(crate) detail: String,
     }
 
     impl FakeRun {
@@ -1315,12 +1346,24 @@ pub(crate) mod test_support {
                 probes: 1,
                 payload: PROBE_PAYLOAD,
                 charge: 0,
+                detail: "fake check".to_string(),
             }
         }
 
         pub(crate) fn vulnerable() -> Self {
             Self {
                 outcome: Outcome::Vulnerable,
+                ..Self::clean()
+            }
+        }
+
+        /// A run that sends nothing and answers `Outcome::Error` carrying
+        /// `detail`, as a check whose runner is missing does (amendment 58).
+        pub(crate) fn error(detail: impl Into<String>) -> Self {
+            Self {
+                outcome: Outcome::Error,
+                probes: 0,
+                detail: detail.into(),
                 ..Self::clean()
             }
         }
@@ -1349,6 +1392,8 @@ pub(crate) mod test_support {
         script: Mutex<VecDeque<FakeRun>>,
         fallback: FakeRun,
         runs: AtomicU64,
+        /// The id of every point it was run against, in order.
+        seen: Mutex<Vec<String>>,
         block_until_cancelled: bool,
         /// Panic inside `run` instead of returning a verdict.
         panics: bool,
@@ -1366,6 +1411,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback,
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: false,
                 hint: None,
@@ -1388,6 +1434,32 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback,
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
+                block_until_cancelled: false,
+                panics: false,
+                hint: None,
+                locations: Vec::new(),
+            })
+        }
+
+        /// A check of class `class` with `scope` instead of `fake_meta`'s
+        /// `point` (amendment 38: an `origin`-scoped HTTP check runs once per
+        /// target origin, against the origin item), reporting `fallback` on
+        /// every run; [`points_seen`](Self::points_seen) says what it ran on.
+        pub(crate) fn with_scope(
+            id: &str,
+            class: &str,
+            scope: CheckScope,
+            fallback: FakeRun,
+        ) -> Arc<Self> {
+            let mut meta = fake_meta(id, class);
+            meta.scope = scope;
+            Arc::new(Self {
+                meta,
+                script: Mutex::new(VecDeque::new()),
+                fallback,
+                runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: false,
                 hint: None,
@@ -1403,6 +1475,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback: FakeRun::vulnerable(),
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: false,
                 hint: Some(aitm_scan_model::PocHint {
@@ -1421,6 +1494,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback: FakeRun::vulnerable(),
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: false,
                 hint: None,
@@ -1435,6 +1509,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(script.into_iter().collect()),
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: false,
                 hint: None,
@@ -1454,6 +1529,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: false,
                 hint: None,
@@ -1468,6 +1544,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: true,
                 panics: false,
                 hint: None,
@@ -1477,6 +1554,11 @@ pub(crate) mod test_support {
     }
 
     impl FakeCheck {
+        /// The ids of the points this check was run against, in order.
+        pub(crate) fn points_seen(&self) -> Vec<String> {
+            self.seen.lock().expect("seen lock").clone()
+        }
+
         /// A check whose `run` panics, as a buggy lane crate's check would.
         pub(crate) fn panicking(id: &str, class: &str) -> Arc<Self> {
             Arc::new(Self {
@@ -1484,6 +1566,7 @@ pub(crate) mod test_support {
                 script: Mutex::new(VecDeque::new()),
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
                 block_until_cancelled: false,
                 panics: true,
                 hint: None,
@@ -1499,11 +1582,12 @@ pub(crate) mod test_support {
 
         fn run<'a>(
             &'a self,
-            _point: &'a InsertionPoint,
+            point: &'a InsertionPoint,
             host: &'a dyn ProbeHost,
         ) -> BoxFuture<'a, Verdict> {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
+                self.seen.lock().expect("seen lock").push(point.id.clone());
                 if self.panics {
                     panic!("{PANIC_TEXT}");
                 }
@@ -1535,7 +1619,7 @@ pub(crate) mod test_support {
                         return verdict(Outcome::Error, &e.to_string());
                     }
                 }
-                let mut out = verdict(run.outcome, "fake check");
+                let mut out = verdict(run.outcome, &run.detail);
                 out.poc_hint = self.hint.clone();
                 let mut rest = self.locations.iter();
                 if let Some(first) = rest.next() {
@@ -1545,7 +1629,7 @@ pub(crate) mod test_support {
                     });
                     out.more = rest
                         .map(|path| {
-                            let mut sibling = verdict(run.outcome, "fake check");
+                            let mut sibling = verdict(run.outcome, &run.detail);
                             sibling.location = Some(aitm_scan_model::VerdictLocation {
                                 path: Some(path.clone()),
                                 name: None,
@@ -1712,6 +1796,10 @@ pub(crate) mod test_support {
         discover_error: Option<String>,
         /// Panic inside `discover` instead of returning.
         discover_panic: bool,
+        /// Refuse to host a point without a source flow, as a lane crate whose
+        /// host is built from the captured flow does (`aitm-scan-http`:
+        /// "point ... has no source flow"); an origin item has none.
+        refuse_flowless: bool,
         validate_error: Option<String>,
         l4_reports: Vec<L4Counters>,
         discoveries: AtomicU64,
@@ -1722,6 +1810,14 @@ pub(crate) mod test_support {
         /// job's `scan:<job>` mark and the `crawl` mark, as both crawl paths
         /// leave behind.
         crawl_flows: u32,
+        /// `(origin, reason)` pairs `discover` reports through
+        /// [`JobCtx::report_crawl_error`], one per failed crawl request, as the
+        /// interim lane does (amendment 39).
+        crawl_errors: Vec<(String, String)>,
+        /// Forms `discover` reports as submitted through
+        /// [`JobCtx::report_forms_submitted`], as a crawl that posted them
+        /// does (amendment 53).
+        forms_submitted: u64,
     }
 
     impl FakeLane {
@@ -1737,11 +1833,14 @@ pub(crate) mod test_support {
                 checks: Vec::new(),
                 discover_error: None,
                 discover_panic: false,
+                refuse_flowless: false,
                 validate_error: None,
                 l4_reports: Vec::new(),
                 discoveries: AtomicU64::new(0),
                 discover_charge: 0,
                 crawl_flows: 0,
+                crawl_errors: Vec::new(),
+                forms_submitted: 0,
             }
         }
 
@@ -1777,6 +1876,25 @@ pub(crate) mod test_support {
             self
         }
 
+        /// `discover` reports each `(origin, reason)` through
+        /// `JobCtx::report_crawl_error`, like a client crawl whose requests
+        /// failed; pair it with no crawl captures for an all-failing crawl.
+        pub(crate) fn with_crawl_errors(mut self, errors: Vec<(&str, &str)>) -> Self {
+            self.crawl_errors = errors
+                .into_iter()
+                .map(|(o, r)| (o.to_string(), r.to_string()))
+                .collect();
+            self
+        }
+
+        /// `discover` reports `count` submitted forms through
+        /// `JobCtx::report_forms_submitted`, like a client crawl that posted
+        /// `count` forms (amendment 53).
+        pub(crate) fn with_forms_submitted(mut self, count: u64) -> Self {
+            self.forms_submitted = count;
+            self
+        }
+
         pub(crate) fn with_discover_error(mut self, text: &str) -> Self {
             self.discover_error = Some(text.to_string());
             self
@@ -1785,6 +1903,13 @@ pub(crate) mod test_support {
         /// A lane whose `discover` panics with [`PANIC_TEXT`].
         pub(crate) fn with_discover_panic(mut self) -> Self {
             self.discover_panic = true;
+            self
+        }
+
+        /// The lane refuses every flowless point (an origin item included), as
+        /// `aitm-scan-http`'s host does.
+        pub(crate) fn refusing_flowless_points(mut self) -> Self {
+            self.refuse_flowless = true;
             self
         }
 
@@ -1834,6 +1959,12 @@ pub(crate) mod test_support {
                 for page in 0..self.crawl_flows {
                     job.store().insert(crawl_capture(job.job_id(), page));
                 }
+                for (origin, reason) in &self.crawl_errors {
+                    job.report_crawl_error(origin, reason);
+                }
+                if self.forms_submitted > 0 {
+                    job.report_forms_submitted(self.forms_submitted);
+                }
                 if self.discover_panic {
                     panic!("{PANIC_TEXT}");
                 }
@@ -1852,6 +1983,9 @@ pub(crate) mod test_support {
             point: &InsertionPoint,
             job: Arc<dyn JobCtx>,
         ) -> anyhow::Result<Box<dyn ProbeHost>> {
+            if self.refuse_flowless && point.flow.is_none() {
+                anyhow::bail!("scan: point {} has no source flow", point.id);
+            }
             let profile = job.profile().clone();
             Ok(Box::new(FakeHost {
                 point: point.clone(),
@@ -2040,10 +2174,10 @@ pub(crate) mod test_support {
             self
         }
 
-        /// Answer every send with `status`, so a test can make a host fail.
-        /// Call before [`Harness::bind`].
-        pub(crate) fn answering(mut self, status: u16) -> Self {
-            self.client = StubClient::answering(status);
+        /// Fail every send at the transport with `text`, so a test can make a
+        /// host trip the per-host error ladder. Call before [`Harness::bind`].
+        pub(crate) fn failing(mut self, text: &'static str) -> Self {
+            self.client = StubClient::failing(text);
             self
         }
 
@@ -2181,34 +2315,30 @@ pub(crate) mod test_support {
         status
     }
 
-    /// Wait for `job` to reach a terminal state by subscribing to the
-    /// registry's terminal signal (no polling, no wall-clock bound): resolves
-    /// at once for a job that is already over, otherwise when
-    /// [`crate::jobs::JobRegistry::finish`] flips it. [`TERMINAL_NET`] only
-    /// turns a hung job into a named panic.
+    /// Wait for `job` to reach a terminal state through
+    /// [`crate::jobs::JobRegistry::wait_terminal`] (no polling, no wall-clock
+    /// bound): resolves at once for a job that is already over, otherwise
+    /// when [`crate::jobs::JobRegistry::finish`] flips its signal.
+    /// [`TERMINAL_NET`] only turns a hung job into a named panic.
     pub(crate) async fn wait_terminal(
         registry: &crate::jobs::JobRegistry,
         job: &str,
     ) -> aitm_scan_model::JobStatus {
-        let mut rx = registry
-            .terminal_signal(job)
-            .unwrap_or_else(|| panic!("job {job} is in the registry"));
-        let waited = tokio::time::timeout(TERMINAL_NET, async {
-            while !*rx.borrow_and_update() {
-                rx.changed()
-                    .await
-                    .expect("the registry entry outlives the wait");
+        assert!(
+            registry.terminal_signal(job).is_some(),
+            "job {job} is in the registry"
+        );
+        match tokio::time::timeout(TERMINAL_NET, registry.wait_terminal(job)).await {
+            Ok(Some(_)) => terminal_status(registry, job),
+            Ok(None) => panic!("job {job} left the registry during the wait"),
+            Err(_) => {
+                let status = registry.status(job);
+                panic!(
+                    "job {job} is still {:?} after the {TERMINAL_NET:?} safety net",
+                    status.map(|s| (s.state, s.phase))
+                );
             }
-        })
-        .await;
-        if waited.is_err() {
-            let status = registry.status(job);
-            panic!(
-                "job {job} is still {:?} after the {TERMINAL_NET:?} safety net",
-                status.map(|s| (s.state, s.phase))
-            );
         }
-        terminal_status(registry, job)
     }
 
     /// [`wait_terminal`] for a harness waiting from **outside** a runtime: it
@@ -2754,7 +2884,7 @@ mod tests {
     /// wakes on the flip. No clock anywhere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_signal_flips_once_on_finish_and_reads_true_for_finished_jobs() {
-        let registry = crate::jobs::JobRegistry::new(10);
+        let registry = Arc::new(crate::jobs::JobRegistry::new(10));
         let (tx, _) = tokio::sync::watch::channel(false);
         let status = Arc::new(std::sync::RwLock::new(aitm_scan_model::JobStatus {
             job: "scan-0000beef".to_string(),
@@ -2780,26 +2910,22 @@ mod tests {
             .expect("a known job has a signal");
         assert!(!*rx.borrow(), "a running job reads false");
 
-        // A waiter parked on the signal wakes when `finish` flips it, and
-        // reads a terminal status when it does.
-        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        // A waiter on `wait_terminal` wakes when `finish` flips the signal,
+        // and the status it answers is the terminal one.
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<()>();
         let waiter = {
-            let registry_status = Arc::clone(&status);
-            let mut rx = rx.clone();
+            let registry = Arc::clone(&registry);
             tokio::spawn(async move {
-                let mut parked = Some(parked_tx);
-                while !*rx.borrow_and_update() {
-                    // Tell the test we are about to park, so `finish` below is
-                    // guaranteed to be the wake-up and not a value read first.
-                    if let Some(tx) = parked.take() {
-                        let _ = tx.send(());
-                    }
-                    rx.changed().await.expect("sender alive");
-                }
-                registry_status.read().unwrap().state
+                // Tell the test the wait is about to begin (the signal still
+                // reads false here), so `finish` below is what it wakes on.
+                let _ = waiting_tx.send(());
+                registry
+                    .wait_terminal("scan-0000beef")
+                    .await
+                    .map(|s| (s.state, s.finished_at))
             })
         };
-        parked_rx.await.expect("the waiter reports before parking");
+        waiting_rx.await.expect("the waiter reports before waiting");
         {
             let mut guarded = status.write().unwrap();
             guarded.state = aitm_scan_model::JobState::Done;
@@ -2808,7 +2934,8 @@ mod tests {
         registry.finish("scan-0000beef");
         assert_eq!(
             waiter.await.expect("waiter"),
-            aitm_scan_model::JobState::Done
+            Some((aitm_scan_model::JobState::Done, Some(1))),
+            "wait_terminal resolves on finish with the terminal status"
         );
         assert!(
             *rx.borrow_and_update(),

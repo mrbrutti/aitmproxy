@@ -77,7 +77,7 @@ RAPID_RESET_PHRASE = "no reset-rate mitigation"
 # it counts as a request (0), and the rapid-reset probe's eight cancelled
 # request heads are counted (8). The job client's own pooled h2 connection (the
 # crawl and the checks' baselines) is not a raw-probe connection and is told
-# apart by the `GET /` the crawl fetched on it.
+# apart by the `host` header the job client puts on every request it sends.
 EXPECTED_REQUESTS = [0, 0, 0, 0, 8]
 # T10's per-connection stream counter (PR #284): distinct client-initiated stream ids
 # seen in HEADERS frames on the inbound bytes before hyper parses them, so a rejected

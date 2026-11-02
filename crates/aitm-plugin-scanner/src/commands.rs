@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aitm_core::redact::scrub_text;
 use aitm_core::{
@@ -67,14 +67,11 @@ const MAX_RESULT_ITEMS: usize = 1024;
 /// no probe (spec D3's `scan.map`).
 const MAP_PROFILE: &str = "map-only";
 
-/// How often the wait looks at the job it started.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// How long a job cancelled by the wait is given to wind down before the
 /// verb answers with the last status it saw.
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
-/// An `Instant` arithmetic bound: a configured budget longer than this would
+/// A bound on the configured budget: a deadline further out than this would
 /// overflow the clock on some platforms, and no scan waits a week.
 const MAX_WAIT: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
@@ -222,42 +219,68 @@ impl ScanDiscover {
         let budget = self.engine.cfg.time_budget.min(MAX_WAIT);
         blocking(|| {
             let mut last = start.clone();
-            if let Some(status) = self.poll_until(job, budget, &mut last) {
+            if let Some(status) = self.wait_until(job, budget, &mut last) {
                 return (status, false);
             }
             if let Some(status) = self.engine.registry.cancel(job) {
                 last = status;
             }
             let status = self
-                .poll_until(job, CANCEL_GRACE, &mut last)
+                .wait_until(job, CANCEL_GRACE, &mut last)
                 .unwrap_or_else(|| last.clone());
             (status, true)
         })
     }
 
-    /// Poll the registry until `job` is terminal or `within` has passed.
-    /// `last` always holds the newest status seen, whether or not the job
-    /// settled in time.
-    fn poll_until(&self, job: &str, within: Duration, last: &mut JobStatus) -> Option<JobStatus> {
-        let deadline = Instant::now() + within;
-        loop {
-            match self.engine.registry.status(job) {
-                Some(status) => {
-                    let terminal = status.state.is_terminal();
-                    *last = status;
-                    if terminal {
-                        return Some(last.clone());
-                    }
+    /// Wait until `job` is over or `within` has passed, on the registry's
+    /// terminal wait ([`jobs::JobRegistry::wait_terminal`]): the wait ends
+    /// when the worker's `finish` has run, not on the first read of a terminal
+    /// `state`, so the job's handles (its egress hold) are released by the
+    /// time the verb answers. No polling: the deadline is a `tokio::time::timeout`
+    /// on the engine's runtime, bridged to this synchronous verb over a channel.
+    ///
+    /// `Some(status)` when the job settled or is gone from the registry (a
+    /// history of zero, or pruned under load: nothing left to wait for),
+    /// `None` when the deadline passed first. `last` always holds the newest
+    /// status seen, whether or not the job settled in time.
+    fn wait_until(&self, job: &str, within: Duration, last: &mut JobStatus) -> Option<JobStatus> {
+        let settled = match self.engine.late.get() {
+            Ok(services) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let engine = Arc::clone(&self.engine);
+                let job = job.to_string();
+                services.rt.spawn(async move {
+                    let settled = tokio::time::timeout(within, engine.registry.wait_terminal(&job))
+                        .await
+                        .is_ok();
+                    // The verb may have stopped listening (its connection
+                    // closed); nobody else cares about the answer.
+                    let _ = tx.send(settled);
+                });
+                // The receive is bounded a second past the task's own
+                // deadline: this thread blocks here, and if the caller's
+                // runtime *is* `services.rt` on a single thread (never the
+                // shipped core, which is multi-threaded; `blocking` only
+                // yields the worker there), nothing could drive the task and
+                // an unbounded `recv` would hang the verb for ever. Bounded,
+                // a starved task degrades to "not settled": the deadline,
+                // cancel and grace run as before and the last status answers.
+                match rx.recv_timeout(within.saturating_add(Duration::from_secs(1))) {
+                    Ok(settled) => settled,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                    // The runtime dropped the task on shutdown; there is
+                    // nothing left to wait for.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
                 }
-                // The entry is gone (a history of zero, or pruned under load):
-                // there is nothing left to wait for.
-                None => return Some(last.clone()),
             }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(POLL_INTERVAL);
+            // Unreachable once `jobs::start` has succeeded: the services are
+            // not bound, so nothing can be running.
+            Err(_) => true,
+        };
+        if let Some(status) = self.engine.registry.status(job) {
+            *last = status;
         }
+        settled.then(|| last.clone())
     }
 }
 
@@ -1517,9 +1540,9 @@ mod tests {
     /// while the `SsrfConnector` refuses out-of-scope public hosts — and the
     /// hold is released when the job ends, leaving the standing (off) base
     /// untouched. The hold is the job's now (the engine takes it in
-    /// `jobs::start` and drops it with the job's registry entry), so it is
-    /// released a moment *after* the status goes terminal rather than exactly
-    /// when `invoke` returns.
+    /// `jobs::start` and drops it in `JobRegistry::finish`), and the verb's
+    /// wait answers on the terminal signal `finish` flips last, so the hold is
+    /// gone by the time `invoke` returns: no wait, no clock.
     #[test]
     fn scan_discover_crawls_under_egress_confinement() {
         let posture = Arc::new(EgressConfinement::new(false));
@@ -1547,10 +1570,6 @@ mod tests {
         );
         // (b) the hold is released with the finished job: the base was off and
         // stays off, so a finished scan never leaves the browser confined.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while posture.confined() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert!(
             !posture.confined(),
             "the campaign hold must be released when the job ends"
@@ -1648,8 +1667,11 @@ mod tests {
         let (entered, missing, negative_depth, negative_pages, second, first) =
             std::thread::scope(|s| {
                 let first = s.spawn(|| h.discover(seed()));
-                // Scan #1 is now parked inside the browser, mid-crawl.
-                let entered = gate.entered.recv_timeout(Duration::from_secs(10));
+                // Scan #1 is now parked inside the browser, mid-crawl. The
+                // gate itself is the notification; `TERMINAL_NET` is only the
+                // safety net that names a scan that never got there instead
+                // of hanging the suite (never a measured bound).
+                let entered = gate.entered.recv_timeout(TERMINAL_NET);
 
                 // A malformed call is still told what is wrong with it, not that
                 // another scan is running: every argument is validated before the
@@ -2657,7 +2679,9 @@ mod tests {
 
     use crate::interim_lane::InterimHttpLane;
     use crate::issues::IssueStore;
-    use crate::jobs::test_support::{fake_point, FakeCheck, FakeLane, FakeRun, StubClient};
+    use crate::jobs::test_support::{
+        fake_point, FakeCheck, FakeLane, FakeRun, StubClient, TERMINAL_NET,
+    };
     use crate::jobs::{self, Caller, Engine, JobRegistry, ScanLate, ScanServices};
     use crate::profiles::Profiles;
     use aitm_core::{AgentPolicy, JobBus, Registry};
@@ -2966,6 +2990,12 @@ mod tests {
     /// Call B11: the wait is bounded by the shipped `ScannerConfig.time_budget`.
     /// When it runs out the job is cancelled and the caller is told so, rather
     /// than the connection blocking forever on a lane that never finishes.
+    ///
+    /// The lane cannot end on its own, so the verb answering at all with
+    /// `stopped_reason: time_budget` and a cancelled job *is* the proof that
+    /// the budget ended the wait; nothing is measured. `TERMINAL_NET` is the
+    /// safety net around the call: on expiry the job is cancelled so the
+    /// scope can join, and the test fails naming the hang.
     #[test]
     fn discover_time_budget_cancels_and_reports() {
         let h = Harness::builder()
@@ -2976,18 +3006,26 @@ mod tests {
             .lane(Arc::new(BlockingLane))
             .build();
 
-        let started = std::time::Instant::now();
-        let result = h
-            .discover(params(&[(
-                "target",
-                Value::Str("http://target.test/".into()),
-            )]))
-            .expect("a cancelled map job still answers");
-        assert!(
-            started.elapsed() < Duration::from_secs(6),
-            "the wait is bounded: {:?}",
-            started.elapsed()
-        );
+        let h = &h;
+        let result = std::thread::scope(|s| {
+            let (tx, rx) = mpsc::channel();
+            s.spawn(move || {
+                let _ = tx.send(h.discover(params(&[(
+                    "target",
+                    Value::Str("http://target.test/".into()),
+                )])));
+            });
+            match rx.recv_timeout(TERMINAL_NET) {
+                Ok(result) => result,
+                Err(_) => {
+                    for job in h.engine.registry.list(true, 16) {
+                        h.engine.registry.cancel(&job.job);
+                    }
+                    panic!("scan.discover did not answer within the {TERMINAL_NET:?} safety net");
+                }
+            }
+        })
+        .expect("a cancelled map job still answers");
 
         let Value::Object(map) = &result else {
             panic!("the result is an object: {result:?}");
@@ -3002,6 +3040,72 @@ mod tests {
             JobState::Cancelled,
             "the verb cancelled the job it could not wait for"
         );
+    }
+
+    /// The wait behind `scan.discover` answers when the job's `finish` has run
+    /// (the registry's terminal signal), not on the first read of a terminal
+    /// `state`. Between the two the worker persists the record and the job
+    /// still holds its egress hold, so a verb answering on the status alone
+    /// could hand back a "finished" map while the browser was still confined.
+    /// A zero deadline makes the distinction without a clock: the wait either
+    /// answers on its first look or it does not.
+    #[test]
+    fn discover_wait_answers_on_finish_not_on_a_terminal_status() {
+        let posture = Arc::new(EgressConfinement::new(false));
+        let h = Harness::builder().build();
+        let verb = ScanDiscover {
+            engine: Arc::clone(&h.engine),
+        };
+
+        // A job as the worker leaves it for a moment on its terminal path:
+        // the status says `done`, `finish` has not run, the hold is held.
+        let job = "scan-0000d15c".to_string();
+        let start = aitm_scan_model::JobStatus {
+            job: job.clone(),
+            state: JobState::Done,
+            started_at: 1,
+            finished_at: Some(2),
+            targets: vec!["http://target.test".to_string()],
+            ..Default::default()
+        };
+        assert!(h.engine.registry.try_insert(jobs::JobEntry {
+            status: Arc::new(std::sync::RwLock::new(start.clone())),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            confine: Some(posture.confine()),
+            started_by: Default::default(),
+            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+            origins: vec!["http://target.test".to_string()],
+            is_agent: false,
+            terminal: tokio::sync::watch::channel(false).0,
+        }));
+        assert!(posture.confined(), "the job still holds its egress hold");
+
+        let mut last = start.clone();
+        assert!(
+            verb.wait_until(&job, Duration::ZERO, &mut last).is_none(),
+            "a terminal state alone is not the end of the job: the wait runs out its deadline"
+        );
+        assert_eq!(
+            last, start,
+            "the deadline leaves the newest status in `last`"
+        );
+
+        h.engine.registry.finish(&job);
+        let settled = verb
+            .wait_until(&job, Duration::ZERO, &mut last)
+            .expect("a finished job answers on the first look");
+        assert_eq!(settled.state, JobState::Done);
+        assert!(
+            !posture.confined(),
+            "by the time the wait answers, `finish` has released the hold"
+        );
+
+        // A job the registry no longer holds (pruned under load, or a history
+        // of zero) leaves nothing to wait for: the last status seen answers.
+        let gone = verb
+            .wait_until("scan-00000000", Duration::ZERO, &mut last)
+            .expect("an unknown job answers at once");
+        assert_eq!(gone.job, job);
     }
 
     /// Spec D3: the verb stays, marked deprecated, so a UI reading `tools/list`

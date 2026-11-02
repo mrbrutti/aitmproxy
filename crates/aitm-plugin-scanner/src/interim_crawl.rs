@@ -34,7 +34,7 @@ use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
 
 use aitm_core::{Body, HeaderMap, HttpRequest, HttpVersion, RecordPolicy, SendOptions};
-use aitm_scan_model::JobCtx;
+use aitm_scan_model::{CrawlErrorKind, JobCtx};
 use url::Url;
 
 use crate::client::ProbeRefused;
@@ -142,11 +142,53 @@ impl std::fmt::Display for CrawlStop {
 pub struct ClientCrawl {
     /// Pages fetched successfully.
     pub pages: u32,
+    /// Requests that failed outright: a page the crawl asked for and could not
+    /// fetch (a connect/transport failure or a per-probe timeout), not a
+    /// refusal that ends the crawl (amendment 39).
+    pub failed: u32,
+    /// The kind of the most recent failed request, or `None` when none failed.
+    pub last_error: Option<CrawlErrorKind>,
     /// Forms the crawl found and deliberately did not submit — logout-looking
     /// or destructive-looking ones (`CrawlCounters::forms_skipped`).
     pub forms_skipped: u32,
+    /// Forms the crawl submitted and got an answer for
+    /// (`CrawlCounters::forms_submitted`, amendment 53): the `POST`
+    /// navigations a form became and the client sent. A form the crawl
+    /// skipped is in `forms_skipped`, not here; a `POST` whose send failed is
+    /// in `failed`. A `GET` form is a navigation like any link and is counted
+    /// in `pages` only.
+    pub forms_submitted: u32,
     /// Why it stopped, or `None` when the reachable graph was exhausted.
     pub stopped: Option<CrawlStop>,
+}
+
+/// Classify a failed client-crawl request into a closed [`CrawlErrorKind`]
+/// token (amendment 39; `h2_not_negotiated` is amendment 21's counted probe
+/// error). An exact-token check for `h2_not_negotiated` first, then the typed
+/// probe timeout, then substring tests over the error chain.
+pub(crate) fn classify(err: &anyhow::Error) -> CrawlErrorKind {
+    let text = err
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+        .to_ascii_lowercase();
+    if text.contains("h2_not_negotiated") {
+        return CrawlErrorKind::H2NotNegotiated;
+    }
+    if matches!(
+        err.downcast_ref::<ProbeRefused>(),
+        Some(ProbeRefused::Timeout { .. })
+    ) {
+        return CrawlErrorKind::Timeout;
+    }
+    if text.contains("connection refused") || text.contains("connect") {
+        return CrawlErrorKind::ConnectRefused;
+    }
+    if text.contains("tls") || text.contains("certificate") || text.contains("handshake") {
+        return CrawlErrorKind::Tls;
+    }
+    CrawlErrorKind::Transport
 }
 
 /// Crawl `origin` breadth-first through the job's client.
@@ -165,7 +207,10 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     let Some(seed) = Url::parse(origin).ok().filter(|u| u.has_host()) else {
         return ClientCrawl {
             pages: 0,
+            failed: 0,
+            last_error: None,
             forms_skipped: 0,
+            forms_submitted: 0,
             stopped: Some(CrawlStop::BadOrigin),
         };
     };
@@ -183,7 +228,10 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     queue.push_back((seed, 0));
 
     let mut pages = 0u32;
+    let mut failed = 0u32;
+    let mut last_error: Option<CrawlErrorKind> = None;
     let mut forms_skipped = 0u32;
+    let mut forms_submitted = 0u32;
     let mut attempts = 0u32;
     let mut depth_hit = false;
     let mut stopped: Option<CrawlStop> = None;
@@ -215,16 +263,31 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
             Ok(flow) => flow,
             Err(err) => {
                 // A refusal is the job's own budget, deadline, cancellation or
-                // error ladder speaking: the crawl is over. Any other failure
-                // is one unreachable page.
-                if err.downcast_ref::<ProbeRefused>().is_some() {
-                    stopped = Some(CrawlStop::Refused);
-                    break;
+                // error ladder speaking: the crawl is over. A per-probe timeout
+                // (`ProbeRefused::Timeout`) is one unreachable page, not the end
+                // of the crawl, as is any non-refusal error (amendment 39).
+                if let Some(refused) = err.downcast_ref::<ProbeRefused>() {
+                    if !matches!(refused, ProbeRefused::Timeout { .. }) {
+                        stopped = Some(CrawlStop::Refused);
+                        break;
+                    }
                 }
+                // Reported here, where the failure happened, so each request
+                // carries its own classified token; `failed`/`last_error` stay
+                // the crawl's aggregate view for the status.
+                let kind = classify(&err);
+                job.report_crawl_error(origin, kind.as_str());
+                failed += 1;
+                last_error = Some(kind);
                 continue;
             }
         };
         pages += 1;
+        // Only a form becomes a `POST` navigation, so an answered `POST` is a
+        // form the crawl submitted (amendment 53).
+        if nav.method == "POST" {
+            forms_submitted = forms_submitted.saturating_add(1);
+        }
 
         let Some(response) = flow.response.as_ref() else {
             continue;
@@ -279,7 +342,10 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
 
     ClientCrawl {
         pages,
+        failed,
+        last_error,
         forms_skipped,
+        forms_submitted,
         stopped: stopped.or(depth_hit.then_some(CrawlStop::MaxDepth)),
     }
 }
@@ -1140,5 +1206,333 @@ mod tests {
             shape(&navigations(&base(), &html, true)),
             vec![("GET", "http://target.test/first", None)]
         );
+    }
+
+    // ---------------------------------------------- client-crawl failure tests
+
+    mod failures {
+        use super::super::*;
+
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use aitm_core::{
+            Body, BrowserDriver, FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
+            HttpVersion, InterceptState, MemFlowStore, ProxyClient, ScopeRateGuard, SendOptions,
+            StdGuard,
+        };
+        use aitm_scan_model::{CrawlErrorKind, JobCtx, ScanProfile, SessionMaterial};
+        use futures::future::BoxFuture;
+
+        /// What the stub answers for one request path (before `?`).
+        enum Answer {
+            /// A 200 `text/html` page with this body.
+            Html(&'static str),
+            /// A 200 `text/plain` page.
+            Ok,
+            /// The send fails with this message.
+            Err(&'static str),
+        }
+
+        /// A `ProxyClient` keyed on request path: an `Err` answer is a failed
+        /// request, anything else a page.
+        struct PathClient {
+            answers: std::collections::HashMap<&'static str, Answer>,
+            default: Answer,
+            /// `METHOD path` for every request, in order.
+            trail: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl PathClient {
+            fn new(default: Answer, answers: Vec<(&'static str, Answer)>) -> Arc<Self> {
+                Arc::new(Self {
+                    answers: answers.into_iter().collect(),
+                    default,
+                    trail: std::sync::Mutex::new(Vec::new()),
+                })
+            }
+
+            fn trail(&self) -> Vec<String> {
+                self.trail.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            }
+        }
+
+        fn conn() -> aitm_core::ConnInfo {
+            aitm_core::ConnInfo {
+                peer: "127.0.0.1:0".parse().expect("loopback"),
+                sni: None,
+                alpn: None,
+                tls: false,
+                established: std::time::SystemTime::now(),
+            }
+        }
+
+        impl ProxyClient for PathClient {
+            fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+                self.send_opts(req, SendOptions::default())
+            }
+
+            fn send_opts(
+                &self,
+                req: HttpRequest,
+                _opts: SendOptions,
+            ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+                Box::pin(async move {
+                    let path = req.path.split('?').next().unwrap_or("/");
+                    self.trail
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("{} {path}", req.method));
+                    let answer = self.answers.get(path).unwrap_or(&self.default);
+                    let (status, ctype, body) = match answer {
+                        Answer::Err(message) => return Err(anyhow::anyhow!(*message)),
+                        Answer::Html(body) => (200u16, "text/html; charset=utf-8", *body),
+                        Answer::Ok => (200u16, "text/plain", "ok"),
+                    };
+                    let mut headers = HeaderMap::new();
+                    headers.set("content-type", ctype);
+                    let response = HttpResponse {
+                        status,
+                        version: HttpVersion::Http11,
+                        headers,
+                        trailers: HeaderMap::new(),
+                        body: Body::Bytes(body.as_bytes().to_vec()),
+                        timestamp: std::time::SystemTime::now(),
+                    };
+                    Ok(HttpFlow {
+                        id: aitm_core::FlowId::new(),
+                        request: req,
+                        response: Some(response),
+                        client_conn: conn(),
+                        server_conn: None,
+                        metadata: aitm_core::FlowMeta::default(),
+                        intercept: InterceptState::Observed,
+                    })
+                })
+            }
+        }
+
+        /// A minimal `JobCtx` over the stub client: a generous budget, no
+        /// session, no browser.
+        struct Job {
+            profile: ScanProfile,
+            client: Arc<dyn ProxyClient>,
+            store: Arc<dyn FlowStore>,
+            guard: Arc<dyn ScopeRateGuard>,
+        }
+
+        impl Job {
+            fn new(client: Arc<dyn ProxyClient>) -> Self {
+                Self {
+                    profile: ScanProfile::default(),
+                    client,
+                    store: Arc::new(MemFlowStore::new()),
+                    guard: Arc::new(StdGuard::default()),
+                }
+            }
+        }
+
+        impl JobCtx for Job {
+            fn job_id(&self) -> &str {
+                "scan-1a2b3c4d"
+            }
+            fn profile(&self) -> &ScanProfile {
+                &self.profile
+            }
+            fn client(&self) -> Arc<dyn ProxyClient> {
+                Arc::clone(&self.client)
+            }
+            fn store(&self) -> Arc<dyn FlowStore> {
+                Arc::clone(&self.store)
+            }
+            fn guard(&self) -> Arc<dyn ScopeRateGuard> {
+                Arc::clone(&self.guard)
+            }
+            fn browser(&self) -> Option<Arc<dyn BrowserDriver>> {
+                None
+            }
+            fn session(&self) -> Option<Arc<SessionMaterial>> {
+                None
+            }
+            fn charge(&self, _units: u32) -> bool {
+                true
+            }
+            fn budget_left(&self) -> u32 {
+                1000
+            }
+            fn deadline(&self) -> Instant {
+                Instant::now() + Duration::from_secs(60)
+            }
+            fn cancelled(&self) -> bool {
+                false
+            }
+            fn marker(&self) -> String {
+                "aitm7f3a0000".to_string()
+            }
+        }
+
+        /// Amendment 39, call C4: the classifier maps a failure onto exactly
+        /// one closed token, in the documented order — the forced-h2 marker
+        /// first (it is amendment 21's counted probe error), then a typed
+        /// per-probe timeout, then connect, then TLS, with `transport` as the
+        /// catch-all. Nothing here is a heuristic over a free-text reason: the
+        /// token is what reaches `crawl.last_error`, so a wrong mapping is a
+        /// wrong reason on the operator's status.
+        #[test]
+        fn classify_maps_each_failure_to_its_kind() {
+            assert_eq!(
+                classify(&anyhow::anyhow!("h2_not_negotiated: scan.test:80: alpn")),
+                CrawlErrorKind::H2NotNegotiated
+            );
+            assert_eq!(
+                classify(&anyhow::Error::new(ProbeRefused::Timeout {
+                    host: "scan.test:80".to_string(),
+                    after: Duration::from_secs(30),
+                })),
+                CrawlErrorKind::Timeout,
+                "a typed per-probe timeout is `timeout`, not the text it prints"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!(
+                    "tcp connect to scan.test:80: connection refused"
+                )),
+                CrawlErrorKind::ConnectRefused
+            );
+            for tls in [
+                "TLS handshake failure",
+                "the certificate is not trusted",
+                "handshake eof",
+            ] {
+                assert_eq!(
+                    classify(&anyhow::anyhow!(tls)),
+                    CrawlErrorKind::Tls,
+                    "{tls:?} is a TLS failure"
+                );
+            }
+            assert_eq!(
+                classify(&anyhow::anyhow!("stream reset by peer")),
+                CrawlErrorKind::Transport,
+                "an unrecognised failure is `transport`, never `other`"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!("")),
+                CrawlErrorKind::Transport,
+                "an error with no message still classifies"
+            );
+
+            // The whole cause chain is read, not only the outermost error, and
+            // the match is case-insensitive: a wrapped reason still classifies.
+            let wrapped = anyhow::anyhow!("connection refused").context("fetching /a");
+            assert_eq!(classify(&wrapped), CrawlErrorKind::ConnectRefused);
+            assert_eq!(
+                classify(&anyhow::anyhow!("H2_NOT_NEGOTIATED")),
+                CrawlErrorKind::H2NotNegotiated
+            );
+
+            // Every token the classifier can produce is one the model parses
+            // back, so the lane -> `report_crawl_error` -> worker round trip
+            // never degrades a classified failure to `other`.
+            for kind in [
+                CrawlErrorKind::H2NotNegotiated,
+                CrawlErrorKind::Timeout,
+                CrawlErrorKind::ConnectRefused,
+                CrawlErrorKind::Tls,
+                CrawlErrorKind::Transport,
+            ] {
+                assert_eq!(CrawlErrorKind::parse(kind.as_str()), Some(kind));
+            }
+        }
+
+        /// Amendment 39: every failed client-crawl request is counted in
+        /// `failed` and classified, and `last_error` names the most recent
+        /// cause. An all-failing crawl fetches no page; a crawl that lost one
+        /// of three links keeps the two pages it reached.
+        #[tokio::test]
+        async fn every_failed_request_is_counted_and_classified() {
+            // Every send fails: only the seed is attempted, nothing is found.
+            let client = PathClient::new(
+                Answer::Err("h2_not_negotiated: scan.test:80: alpn"),
+                Vec::new(),
+            );
+            let job = Job::new(client);
+            let crawled = crawl_with_client("http://scan.test", &job).await;
+            assert_eq!(crawled.pages, 0);
+            assert_eq!(crawled.failed, 1, "the seed is the one failed request");
+            assert_eq!(crawled.last_error, Some(CrawlErrorKind::H2NotNegotiated));
+
+            // The seed is a page with two links; one link's send fails.
+            let seed = concat!(
+                "<html><body>",
+                "<a href=\"/a\">a</a>",
+                "<a href=\"/b\">b</a>",
+                "</body></html>",
+            );
+            let client = PathClient::new(
+                Answer::Ok,
+                vec![
+                    ("/", Answer::Html(seed)),
+                    ("/a", Answer::Err("connection refused")),
+                    ("/b", Answer::Ok),
+                ],
+            );
+            let job = Job::new(client);
+            let crawled = crawl_with_client("http://scan.test", &job).await;
+            assert_eq!(crawled.pages, 2, "the seed and the reachable link");
+            assert_eq!(crawled.failed, 1, "exactly the refused link");
+            assert_eq!(crawled.last_error, Some(CrawlErrorKind::ConnectRefused));
+        }
+
+        /// Amendment 53: `forms_submitted` is the number of forms the crawl
+        /// actually sent — the POSTs on the wire — and nothing else: the
+        /// logout-looking and destructive-looking forms it refused are
+        /// `forms_skipped`, a link is a page, and a form whose send failed
+        /// was not submitted.
+        #[tokio::test]
+        async fn submitted_forms_are_counted() {
+            let seed = concat!(
+                "<html><body>",
+                "<a href=\"/about\">about</a>",
+                "<form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>",
+                "<form action=\"/notes\" method=\"post\"><input name=\"note\"></form>",
+                "<form action=\"/account/delete\" method=\"post\"><input name=\"id\"></form>",
+                "<form action=\"/logout\" method=\"post\"></form>",
+                "<form action=\"/broken\" method=\"post\"><input name=\"x\"></form>",
+                "</body></html>",
+            );
+            let client = PathClient::new(
+                Answer::Ok,
+                vec![
+                    ("/", Answer::Html(seed)),
+                    ("/broken", Answer::Err("connection refused")),
+                ],
+            );
+            let job = Job::new(Arc::clone(&client) as Arc<dyn ProxyClient>);
+            let crawled = crawl_with_client("http://scan.test", &job).await;
+
+            let posts_sent = client
+                .trail()
+                .iter()
+                .filter(|line| line.starts_with("POST "))
+                .count();
+            assert_eq!(
+                client.trail(),
+                vec![
+                    "GET /",
+                    "GET /about",
+                    "POST /comments",
+                    "POST /notes",
+                    "POST /broken",
+                ],
+                "the two skipped forms never reach the wire"
+            );
+            assert_eq!(posts_sent, 3, "three POSTs went out, one of them failed");
+            assert_eq!(
+                crawled.forms_submitted, 2,
+                "the POSTs that were answered: {crawled:?}"
+            );
+            assert_eq!(crawled.forms_skipped, 2, "delete + logout");
+            assert_eq!(crawled.failed, 1, "the broken form's send");
+            assert_eq!(crawled.pages, 4, "seed, about, comments, notes");
+        }
     }
 }
