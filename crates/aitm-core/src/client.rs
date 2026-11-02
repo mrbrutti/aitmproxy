@@ -175,12 +175,16 @@ impl PipelineClient {
             if kind == SendKind::Proxied && response.status >= 500 {
                 self.guard.record_error(&authority);
             }
+            // The socket the sender read the answer from, when it knows: that
+            // is the flow's upstream connection (amendment 59; the wire shape
+            // is `flow.detail`'s `server_conn`).
+            let server_conn = response.peer.map(|peer| upstream_conn(peer, &req.scheme));
             let flow = HttpFlow {
                 id: FlowId::new(),
                 request: req,
                 response: Some(response),
                 client_conn: loopback_conn(),
-                server_conn: None,
+                server_conn,
                 metadata: FlowMeta {
                     is_replay: true,
                     marks: opts.marks,
@@ -203,6 +207,20 @@ fn loopback_conn() -> ConnInfo {
         sni: None,
         alpn: None,
         tls: false,
+        established: SystemTime::now(),
+    }
+}
+
+/// The upstream connection of a locally-reissued request, from the socket the
+/// sender reports it read the response from. `tls` follows the request's
+/// scheme; SNI and ALPN are not threaded through `HttpResponse` (the h1/h2
+/// fact is `HttpResponse::version`), so both stay `None`.
+fn upstream_conn(peer: SocketAddr, scheme: &str) -> ConnInfo {
+    ConnInfo {
+        peer,
+        sni: None,
+        alpn: None,
+        tls: scheme.eq_ignore_ascii_case("https"),
         established: SystemTime::now(),
     }
 }
@@ -265,6 +283,12 @@ mod tests {
     }
 
     fn ok_response() -> HttpResponse {
+        ok_response_from(None)
+    }
+
+    /// A 200 answer that names (or does not name) the upstream socket the
+    /// sender read it from, the way `HttpSender` reports its dialled peer.
+    fn ok_response_from(peer: Option<SocketAddr>) -> HttpResponse {
         HttpResponse {
             status: 200,
             version: HttpVersion::Http11,
@@ -272,6 +296,25 @@ mod tests {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer,
+        }
+    }
+
+    /// Answers 200 from a fixed upstream socket (or from none), the way a
+    /// real sender reports the peer it connected to.
+    struct PeerSender(Option<SocketAddr>);
+
+    impl RequestSender for PeerSender {
+        fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+            let peer = self.0;
+            Box::pin(async move { Ok(ok_response_from(peer)) })
+        }
+    }
+
+    fn stored_server_conn(store: &MemFlowStore, id: FlowId) -> Option<ConnInfo> {
+        match store.get(id).expect("flow stored") {
+            Flow::Http(f) => f.server_conn,
+            _ => panic!("expected an HTTP flow"),
         }
     }
 
@@ -735,5 +778,130 @@ mod tests {
             "the guard refuses before the sender is reached"
         );
         assert_eq!(store.count(), 0, "a refused send stores nothing");
+    }
+
+    /// Amendment 59 (core half): the peer the sender connected to becomes the
+    /// client-sent flow's `server_conn` — the wire carrier `flow.detail`
+    /// already emits — with `tls` from the scheme and no SNI/ALPN (call C4).
+    #[tokio::test]
+    async fn a_client_sent_flow_carries_the_peer_the_sender_connected_to() {
+        let upstream: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client =
+            PipelineClient::new(store.clone(), guard, Arc::new(PeerSender(Some(upstream))));
+
+        let flow = client
+            .send_opts(req("ex.test"), SendOptions::default())
+            .await
+            .unwrap();
+
+        let conn = flow
+            .server_conn
+            .as_ref()
+            .expect("the sender named its peer");
+        assert_eq!((conn.peer, conn.tls), (upstream, true));
+        assert_eq!(conn.sni, None);
+        assert_eq!(conn.alpn, None);
+        assert_eq!(
+            flow.response.as_ref().and_then(|r| r.peer),
+            Some(upstream),
+            "the response keeps the peer it was read from"
+        );
+
+        let stored = stored_server_conn(&store, flow.id).expect("the stored flow carries the peer");
+        assert_eq!((stored.peer, stored.tls), (upstream, true));
+        assert_eq!(stored.sni, None);
+        assert_eq!(stored.alpn, None);
+        assert_eq!(stored.established, conn.established);
+    }
+
+    /// A sender that cannot tell where its answer came from leaves
+    /// `server_conn` empty, so T3's "peer unknown" fallback stays reachable.
+    #[tokio::test]
+    async fn a_sender_that_knows_no_peer_leaves_server_conn_none() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client = PipelineClient::new(store.clone(), guard, Arc::new(PeerSender(None)));
+
+        let flow = client
+            .send_opts(req("ex.test"), SendOptions::default())
+            .await
+            .unwrap();
+
+        assert!(flow.server_conn.is_none());
+        assert_eq!(flow.response.as_ref().and_then(|r| r.peer), None);
+        assert!(stored_server_conn(&store, flow.id).is_none());
+    }
+
+    /// Tester (amendment 59): `record: Never` keeps the flow off the store,
+    /// not the peer off the flow — a bulk sender's probe host still reads
+    /// `server_conn.peer` off the returned flow (the lane hosts'
+    /// `baseline_peer_addr()`), while the store stays empty.
+    #[tokio::test]
+    async fn a_record_never_send_stores_nothing_yet_reports_the_peer() {
+        let upstream: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let client = PipelineClient::new(
+            store.clone(),
+            scoped_guard(),
+            Arc::new(PeerSender(Some(upstream))),
+        );
+        let opts = SendOptions {
+            record: RecordPolicy::Never,
+            ..SendOptions::default()
+        };
+
+        let flow = client.send_opts(req("ex.test"), opts).await.unwrap();
+
+        assert_eq!(
+            flow.server_conn.as_ref().map(|c| (c.peer, c.tls)),
+            Some((upstream, true)),
+            "the returned flow names the peer whether or not it is stored"
+        );
+        assert_eq!(store.count(), 0, "record: Never stores nothing");
+    }
+
+    /// Tester (amendment 59, call C4): `tls` follows the request's scheme —
+    /// `http` is a cleartext upstream connection, and the comparison is
+    /// ASCII case-insensitive, so `HTTPS` reads as TLS too.
+    #[tokio::test]
+    async fn upstream_conn_tls_follows_the_requests_scheme() {
+        let upstream: SocketAddr = "10.0.0.5:8080".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let client = PipelineClient::new(
+            store.clone(),
+            scoped_guard(),
+            Arc::new(PeerSender(Some(upstream))),
+        );
+
+        let mut plain = req("ex.test");
+        plain.scheme = "http".into();
+        let flow = client
+            .send_opts(plain, SendOptions::default())
+            .await
+            .unwrap();
+        let conn = flow
+            .server_conn
+            .as_ref()
+            .expect("the sender named its peer");
+        assert_eq!((conn.peer, conn.tls), (upstream, false));
+        assert_eq!(
+            stored_server_conn(&store, flow.id).map(|c| c.tls),
+            Some(false),
+            "the stored copy agrees"
+        );
+
+        let mut shouted = req("ex.test");
+        shouted.scheme = "HTTPS".into();
+        let flow = client
+            .send_opts(shouted, SendOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            flow.server_conn.as_ref().map(|c| c.tls),
+            Some(true),
+            "the scheme comparison folds ASCII case"
+        );
     }
 }

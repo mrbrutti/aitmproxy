@@ -33,6 +33,7 @@ fn http_flow(method: &str, path: &str, status: Option<u16>) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: addr,

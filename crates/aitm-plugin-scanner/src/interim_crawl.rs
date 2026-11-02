@@ -165,7 +165,16 @@ pub struct ClientCrawl {
 /// Classify a failed client-crawl request into a closed [`CrawlErrorKind`]
 /// token (amendment 39; `h2_not_negotiated` is amendment 21's counted probe
 /// error). An exact-token check for `h2_not_negotiated` first, then the typed
-/// probe timeout, then substring tests over the error chain.
+/// probe timeout, then substring tests over the error chain: the TLS words,
+/// then the connect refusal, with `transport` as the catch-all.
+///
+/// Amendment 68: TLS is tested **before** connect. A TLS failure names the
+/// connection it was failing on ("error connecting to h:443: tls handshake
+/// failed"), so reading the connect words first read every such chain as
+/// `connect_refused`. For the same reason the connect arm names the refused
+/// shapes only — "connection refused", "connect refused", "econnrefused" —
+/// and not the bare word `connect`, which "connection reset by peer" and
+/// "disconnected" also carry: those are `transport`.
 pub(crate) fn classify(err: &anyhow::Error) -> CrawlErrorKind {
     let text = err
         .chain()
@@ -182,11 +191,14 @@ pub(crate) fn classify(err: &anyhow::Error) -> CrawlErrorKind {
     ) {
         return CrawlErrorKind::Timeout;
     }
-    if text.contains("connection refused") || text.contains("connect") {
-        return CrawlErrorKind::ConnectRefused;
-    }
     if text.contains("tls") || text.contains("certificate") || text.contains("handshake") {
         return CrawlErrorKind::Tls;
+    }
+    if text.contains("connection refused")
+        || text.contains("connect refused")
+        || text.contains("econnrefused")
+    {
+        return CrawlErrorKind::ConnectRefused;
     }
     CrawlErrorKind::Transport
 }
@@ -1298,6 +1310,7 @@ mod tests {
                         trailers: HeaderMap::new(),
                         body: Body::Bytes(body.as_bytes().to_vec()),
                         timestamp: std::time::SystemTime::now(),
+                        peer: None,
                     };
                     Ok(HttpFlow {
                         id: aitm_core::FlowId::new(),
@@ -1371,13 +1384,17 @@ mod tests {
             }
         }
 
-        /// Amendment 39, call C4: the classifier maps a failure onto exactly
-        /// one closed token, in the documented order — the forced-h2 marker
-        /// first (it is amendment 21's counted probe error), then a typed
-        /// per-probe timeout, then connect, then TLS, with `transport` as the
-        /// catch-all. Nothing here is a heuristic over a free-text reason: the
-        /// token is what reaches `crawl.last_error`, so a wrong mapping is a
-        /// wrong reason on the operator's status.
+        /// Amendment 39, call C4, amendment 68: the classifier maps a failure
+        /// onto exactly one closed token, in the documented order — the
+        /// forced-h2 marker first (it is amendment 21's counted probe error),
+        /// then a typed per-probe timeout, then TLS, then connect, with
+        /// `transport` as the catch-all. TLS is tested before connect because
+        /// a TLS chain names the connection it was failing on ("error
+        /// connecting: tls handshake failed"), and the connect arm names the
+        /// refused shapes only, so "connection reset" is `transport`.
+        /// Nothing here is a heuristic over a free-text reason: the token is
+        /// what reaches `crawl.last_error`, so a wrong mapping is a wrong
+        /// reason on the operator's status.
         #[test]
         fn classify_maps_each_failure_to_its_kind() {
             assert_eq!(
@@ -1392,12 +1409,6 @@ mod tests {
                 CrawlErrorKind::Timeout,
                 "a typed per-probe timeout is `timeout`, not the text it prints"
             );
-            assert_eq!(
-                classify(&anyhow::anyhow!(
-                    "tcp connect to scan.test:80: connection refused"
-                )),
-                CrawlErrorKind::ConnectRefused
-            );
             for tls in [
                 "TLS handshake failure",
                 "the certificate is not trusted",
@@ -1409,6 +1420,26 @@ mod tests {
                     "{tls:?} is a TLS failure"
                 );
             }
+            assert_eq!(
+                classify(&anyhow::anyhow!(
+                    "error connecting to scan.test:443: tls handshake failed"
+                )),
+                CrawlErrorKind::Tls,
+                "a TLS chain that names the connection it failed on is `tls`, \
+                 not `connect_refused`"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!(
+                    "tcp connect to scan.test:80: connection refused"
+                )),
+                CrawlErrorKind::ConnectRefused
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!("connection reset by peer")),
+                CrawlErrorKind::Transport,
+                "a reset connection is `transport`: the connect arm is the \
+                 refused shapes, not every word starting `connect`"
+            );
             assert_eq!(
                 classify(&anyhow::anyhow!("stream reset by peer")),
                 CrawlErrorKind::Transport,
@@ -1441,6 +1472,46 @@ mod tests {
             ] {
                 assert_eq!(CrawlErrorKind::parse(kind.as_str()), Some(kind));
             }
+        }
+
+        /// Tester (amendment 68): the connect arm is the refused shapes the
+        /// OS and the sender print — `Connection refused (os error 61)`,
+        /// `ECONNREFUSED`, `connect refused` — and the TLS arm is read ahead
+        /// of all of them, so a handshake the peer refused is `tls`. A word
+        /// that merely starts with `connect` (`disconnected`) is `transport`.
+        #[test]
+        fn classify_reads_the_refused_shapes_after_tls_and_not_every_connect_word() {
+            for refused in [
+                "Connection refused (os error 61)",
+                "tcp connect to scan.test:80: ECONNREFUSED",
+                "connect refused by scan.test:80",
+            ] {
+                assert_eq!(
+                    classify(&anyhow::anyhow!(refused)),
+                    CrawlErrorKind::ConnectRefused,
+                    "{refused:?} is a refused connection"
+                );
+            }
+            assert_eq!(
+                classify(&anyhow::anyhow!(
+                    "the peer refused the TLS handshake: connection refused"
+                )),
+                CrawlErrorKind::Tls,
+                "TLS is tested before the refused shapes"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!("the peer disconnected")),
+                CrawlErrorKind::Transport,
+                "`disconnected` carries `connect` and is not a refusal"
+            );
+            assert_eq!(
+                classify(
+                    &anyhow::anyhow!("connection refused")
+                        .context("error connecting to scan.test:443: tls handshake failed")
+                ),
+                CrawlErrorKind::Tls,
+                "the whole chain is read and TLS still leads"
+            );
         }
 
         /// Amendment 39: every failed client-crawl request is counted in

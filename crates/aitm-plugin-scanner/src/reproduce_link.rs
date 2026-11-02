@@ -508,6 +508,7 @@ mod tests {
                         trailers: HeaderMap::new(),
                         body: Body::Bytes(body.into_bytes()),
                         timestamp: SystemTime::now(),
+                        peer: None,
                     }),
                     client_conn: conn(),
                     server_conn: None,

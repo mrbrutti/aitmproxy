@@ -29,7 +29,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aitm_core::redact::scrub_text_wide;
 use aitm_core::{CallerTrust, Value};
 use aitm_scan_model::check::{CheckMeta, ControlHint, Evidence, PocHint, Verdict, VerdictLocation};
 use aitm_scan_model::point::InsertionPoint;
@@ -203,6 +202,10 @@ impl Check for ScriptCheck {
                 // apply to a script's sends too (spec D9.3).
                 let result = with_client(client, call);
 
+                // One structural exit: a thrown value is a script's own text
+                // (`throw resp.body`), so the eval-error arm is scrubbed like
+                // every well-formed shape. The scrub is idempotent, so the
+                // `Ok` arm's own scrub costs nothing here.
                 match result {
                     Ok(value) => verdict_from_dynamic(&value),
                     Err(err) => error_verdict(
@@ -210,6 +213,7 @@ impl Check for ScriptCheck {
                             .to_string(),
                     ),
                 }
+                .scrubbed()
             })
         })
     }
@@ -382,7 +386,24 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 /// verdict; an array of maps is the root verdict followed by its `more`
 /// siblings ([`verdict_from_array`]); anything else is an `error` naming what
 /// came back.
+///
+/// Every form comes back through [`Verdict::scrubbed`], applied once at this
+/// function's single exit (the shapes themselves are read by
+/// [`verdict_from_dynamic_raw`]): `detail` (root and siblings),
+/// `evidence.payload`/`matched` and `location.path`/`name` are scrubbed here,
+/// where the verdict is built, so a closure that echoes a session cookie or a
+/// bearer token from a response hands it neither to the job path nor to the
+/// manual `check.<id>` path (spec D8.1, amendments 56 and 67). The scrub
+/// precedes the `matched` bound (amendment 16) inside the model's one shared
+/// function, the same one the manual path applies. A new return shape added
+/// to the raw reader is scrubbed by structure, not by its author remembering.
 pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
+    verdict_from_dynamic_raw(value).scrubbed()
+}
+
+/// The four shapes of [`verdict_from_dynamic`], read without scrubbing; only
+/// its wrapper calls this.
+fn verdict_from_dynamic_raw(value: &Dynamic) -> Verdict {
     if let Some(text) = value.read_lock::<rhai::ImmutableString>() {
         return Verdict {
             outcome: Outcome::Inconclusive,
@@ -478,22 +499,12 @@ fn verdict_from_map(map: &Map) -> Verdict {
         let Some(fields) = value.read_lock::<Map>() else {
             return error_verdict("a verdict's `evidence` must be a map of payload and matched");
         };
-        // Scrubbed here, where the verdict is built, so a closure that echoes a
-        // session cookie or a bearer token from a response hands it neither to
-        // the job path nor to the manual `check.<id>` path (spec D8.1,
-        // amendment 56). Scrubbed *before* the bound (amendment 16): cutting
-        // first could leave a fragment of a credential the scrubber no longer
-        // recognises.
-        evidence.payload = fields
-            .get("payload")
-            .and_then(token)
-            .map(|text| scrub_text_wide(&text));
-        // Bounded by the model: the script chooses what matched, never how much
-        // of it an issue carries.
-        evidence.matched = fields
-            .get("matched")
-            .and_then(token)
-            .map(|text| Evidence::excerpt(&scrub_text_wide(&text)));
+        // Plain reads: the scrub and the `matched` bound both live in
+        // `Verdict::scrub`, applied once by `verdict_from_dynamic` to whatever
+        // form the closure returned, so a map read on its own is never half
+        // scrubbed.
+        evidence.payload = fields.get("payload").and_then(token);
+        evidence.matched = fields.get("matched").and_then(token);
     }
 
     let poc_hint = match map.get("poc_hint").filter(|v| !v.is_unit()) {

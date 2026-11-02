@@ -362,11 +362,7 @@ impl JobRuntime {
             .check_error_samples
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if samples.len() >= MAX_CHECK_ERROR_SAMPLES
-            || samples
-                .iter()
-                .any(|s| s.check == check && s.detail == detail)
-        {
+        if !keep_sample(&mut samples, check, point, detail.clone()) {
             return;
         }
         tracing::warn!(
@@ -376,11 +372,6 @@ impl JobRuntime {
             point = %point,
             "the check reported an error: {detail}",
         );
-        samples.push(CheckErrorSample {
-            check: check.to_string(),
-            point: point.to_string(),
-            detail,
-        });
         if samples.len() == MAX_CHECK_ERROR_SAMPLES {
             // Said once, when the store fills: later distinct errors are
             // counted in `checks.errors` but neither sampled nor logged, so
@@ -1028,7 +1019,14 @@ impl RunCtx<'_> {
         };
         let meta = item.check.meta().clone();
         let Some(lane) = self.lanes.iter().find(|l| l.lane() == point.lane) else {
-            self.item_done(item.point, owed);
+            // Amendment 69, one branch earlier: a point whose lane is not on
+            // this build cannot be hosted either; it is skipped with a sample,
+            // never a silent `done`.
+            let reason = format!(
+                "lane {} is not on this build",
+                util::wire_token(&point.lane)
+            );
+            self.item_skipped(item, &reason, owed);
             return;
         };
         // Whatever this item charges belongs to this lane (spec D5,
@@ -1057,9 +1055,14 @@ impl RunCtx<'_> {
         };
         let host = match hosted {
             Ok(host) => ArcHost(Arc::from(host)),
+            // Amendment 69: the lane could not host this item — a flowless
+            // origin item the engine's interim host did not rescue above, a
+            // point whose flow left the store, a lost session. It is a skip
+            // with a sample, never a silent `checks.done`.
             Err(e) => {
-                self.note_lane_text(&e.to_string());
-                self.item_done(item.point, owed);
+                let reason = e.to_string();
+                self.note_lane_text(&reason);
+                self.item_skipped(item, &reason, owed);
                 return;
             }
         };
@@ -1324,14 +1327,25 @@ impl RunCtx<'_> {
         }
     }
 
-    /// One item finished: the check counter rises, and the point's counter
-    /// rises with the last item that named it.
+    /// One item is accounted for — it ran, or the engine could not run it:
+    /// the point's owed counter falls, and the point is audited with the last
+    /// item that named it.
     ///
     /// An origin item is an item like any other — it is in `points.queued` and
-    /// `checks.scheduled`, and it bumps `checks.done` here — but it is not a
-    /// discovered insertion point, so it never bumps `points.audited`
-    /// (amendment 38).
-    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
+    /// `checks.scheduled` — but it is not a discovered insertion point, so it
+    /// never bumps `points.audited` (amendment 38). A skipped item settles the
+    /// owed count exactly as a finished one does (amendment 69, call C7), so
+    /// `points.audited` reads the same whether a lane could host the point or
+    /// not; only `checks.done` tells the two apart.
+    ///
+    /// Returns whether this item settled a discovered point — the caller bumps
+    /// `points.audited` under the same lock as its check counter, so a
+    /// `scan.status` read never sees one move without the other.
+    fn settle_point(
+        &self,
+        point: usize,
+        owed: &mut std::collections::HashMap<usize, usize>,
+    ) -> bool {
         let last = match owed.get_mut(&point) {
             Some(left) => {
                 *left = left.saturating_sub(1);
@@ -1339,12 +1353,97 @@ impl RunCtx<'_> {
             }
             None => false,
         };
+        last && point < self.points.len()
+    }
+
+    /// One item finished: the check counter rises, and the point settles —
+    /// both under one acquisition of the status lock.
+    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
+        let audited = self.settle_point(point, owed);
         let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
         bump(&mut status.checks.done, 1);
-        if last && point < self.points.len() {
+        if audited {
             bump(&mut status.points.audited, 1);
         }
     }
+
+    /// One item the engine could not run because no lane could host its point
+    /// (amendment 69): it is counted on `checks.skipped`, never on
+    /// `checks.done`, and the first distinct `(check, detail)` reason is kept
+    /// on `checks.skipped_samples` (up to [`MAX_CHECK_ERROR_SAMPLES`], the
+    /// same [`keep_sample`] rule as `error_samples`) and logged **once** — so
+    /// a lane that hosts nothing says so instead of reporting a job of silent
+    /// successes. When the samples fill, one debug line says that further
+    /// distinct skips are counted only, as the error side does. The reason is
+    /// scrubbed first and cut like an evidence excerpt (spec amendment 16:
+    /// scrub, then bound). Kept apart from `checks.errors`/`error_samples`
+    /// (call C6): a skip is not an `error` verdict. The point still settles
+    /// (call C7), under the same lock acquisition as the skip counter.
+    fn item_skipped(
+        &self,
+        item: &ScheduleItem,
+        reason: &str,
+        owed: &mut std::collections::HashMap<usize, usize>,
+    ) {
+        let check = item.check.meta().id.clone();
+        let point_id = self
+            .point_of(item)
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        let audited = self.settle_point(item.point, owed);
+        let detail = Evidence::excerpt(&util::scrub(reason));
+        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+        bump(&mut status.checks.skipped, 1);
+        if audited {
+            bump(&mut status.points.audited, 1);
+        }
+        let samples = &mut status.checks.skipped_samples;
+        if !keep_sample(samples, &check, &point_id, detail.clone()) {
+            return;
+        }
+        tracing::debug!(
+            target: "aitm::scanner",
+            job = %self.job,
+            check = %check,
+            point = %point_id,
+            "no lane could host the point; the item is skipped: {detail}",
+        );
+        if samples.len() == MAX_CHECK_ERROR_SAMPLES {
+            tracing::debug!(
+                target: "aitm::scanner",
+                job = %self.job,
+                "skipped-item samples are full ({MAX_CHECK_ERROR_SAMPLES}); further distinct skips are counted only",
+            );
+        }
+    }
+}
+
+/// The one dedupe-and-cap rule behind `checks.error_samples` and
+/// `checks.skipped_samples`: a `(check, detail)` pair already in `samples` is
+/// not kept again (the first point it was seen on stays), nothing is kept once
+/// the list holds [`MAX_CHECK_ERROR_SAMPLES`], and otherwise the sample is
+/// pushed. Returns whether it pushed, so the caller logs at its own level
+/// exactly once per kept pair. `detail` is already scrubbed and bounded by
+/// the caller — what is deduped is what is shown.
+fn keep_sample(
+    samples: &mut Vec<CheckErrorSample>,
+    check: &str,
+    point: &str,
+    detail: String,
+) -> bool {
+    if samples.len() >= MAX_CHECK_ERROR_SAMPLES
+        || samples
+            .iter()
+            .any(|s| s.check == check && s.detail == detail)
+    {
+        return false;
+    }
+    samples.push(CheckErrorSample {
+        check: check.to_string(),
+        point: point.to_string(),
+        detail,
+    });
+    true
 }
 
 /// Turn one check run into the issues it reports: the root verdict plus its
@@ -1434,12 +1533,10 @@ fn new_issue(
         .as_ref()
         .and_then(|l| l.name.clone())
         .unwrap_or_else(|| point.name.clone());
+    // The model's one scrub rule (amendment 67): `payload` scrubbed, `matched`
+    // scrubbed then bounded. The manual path applies the same `Verdict::scrub`.
     let mut evidence = verdict.evidence.clone();
-    evidence.matched = evidence
-        .matched
-        .as_deref()
-        .map(|text| Evidence::excerpt(&util::scrub(text)));
-    evidence.payload = evidence.payload.as_deref().map(util::scrub);
+    evidence.scrub();
 
     NewIssue {
         job: job.to_string(),
@@ -1933,6 +2030,297 @@ mod tests {
         assert_eq!(
             origin.points_seen(),
             vec!["origin:http://scan.test:80".to_string()]
+        );
+    }
+
+    /// Amendment 69, one branch earlier: a point whose lane is not on this
+    /// build (a WS point discovered on an http-only build) is skipped with a
+    /// sample naming the lane, never a silent `done`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_whose_lane_is_not_on_this_build_is_skipped_with_a_sample() {
+        let mut ws_point = fake_point("w1", "chan", "ws://scan.test/socket");
+        ws_point.lane = LaneKind::Ws;
+        let h = Harness::new().with_lane(FakeLane::http().with_points(vec![ws_point]).with_check(
+            FakeCheck::on_lane("fake.ws", "demo", LaneKind::Ws, FakeRun::clean()),
+        ));
+        h.bind();
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.lanes = vec![LaneKind::Http, LaneKind::Ws];
+        let started = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect("the http lane is available");
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        let ws_samples: Vec<_> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .filter(|s| s.check == "fake.ws")
+            .collect();
+        assert!(
+            status.checks.skipped >= 1 && !ws_samples.is_empty(),
+            "the ws item on an http-only build is skipped with a sample: {:?}",
+            status.checks
+        );
+        assert_eq!(ws_samples[0].detail, "lane ws is not on this build");
+        // Tester: the lane-absent branch keeps every amendment-69 promise the
+        // cannot-host branch makes — nothing is a silent `done`, the skips
+        // account for the schedule, a skip is not an error, and the one
+        // sample names the point it was seen on.
+        assert_eq!(
+            status.checks.done, 0,
+            "an item nobody could host never finished: {:?}",
+            status.checks
+        );
+        assert_eq!(
+            status.checks.done + status.checks.skipped,
+            status.checks.scheduled,
+            "every scheduled item is accounted for: {:?}",
+            status.checks
+        );
+        assert_eq!(status.checks.errors, 0, "a skip is not a check error");
+        assert!(status.checks.error_samples.is_empty());
+        assert_eq!(ws_samples.len(), 1, "one sample per (check, detail)");
+        assert_eq!(ws_samples[0].point, "w1");
+        assert_eq!(status.stopped_reason, None);
+    }
+
+    /// Amendment 69: an item whose lane cannot host it — a point the lane
+    /// refuses to build a host for (no captured flow, a lost session) — is
+    /// `checks.skipped` with a sample naming the check, the first point and
+    /// the scrubbed reason, never a silent `checks.done`. Call C7: the item
+    /// still settles its point's owed count, so `points.audited` reads the
+    /// same as it would have, and `done + skipped == scheduled`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_the_lane_cannot_host_is_skipped_with_a_sample_not_done() {
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_host_error("the fake lane hosts nothing"),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, None);
+        // Two points x (the lane's point check + the engine's three shipped
+        // passive checks, spec amendment 24); the lane hosts none of them.
+        assert_eq!(status.checks.scheduled, 8);
+        assert_eq!(
+            status.checks.done, 0,
+            "an item that never ran is not a finished run"
+        );
+        assert_eq!(status.checks.skipped, 8);
+        assert_eq!(
+            status.checks.done + status.checks.skipped,
+            status.checks.scheduled,
+            "every scheduled item is accounted for"
+        );
+        assert_eq!(
+            status.checks.errors, 0,
+            "a skip is not a check error (call C6)"
+        );
+        assert!(
+            status.checks.error_samples.is_empty(),
+            "a skip is not sampled as an error: {:?}",
+            status.checks.error_samples
+        );
+        assert_eq!(
+            status.checks.skipped_samples.len(),
+            4,
+            "one sample per distinct (check, detail): the two points share \
+             each of the four checks, and every skip has the same reason: {:?}",
+            status.checks.skipped_samples
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.detail == "the fake lane hosts nothing"),
+            "{:?}",
+            status.checks.skipped_samples
+        );
+        let sampled: std::collections::BTreeSet<&str> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .map(|s| s.check.as_str())
+            .collect();
+        assert_eq!(
+            sampled,
+            std::collections::BTreeSet::from([
+                "cookie-flag",
+                "fake.point",
+                "reflection",
+                "security-header",
+            ]),
+            "every scheduled check is named once"
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.point == "p1" || s.point == "p2"),
+            "a sample names the first point the pair was seen on: {:?}",
+            status.checks.skipped_samples
+        );
+        assert_eq!(
+            status.points.audited, 2,
+            "a skipped item still settles its point (call C7)"
+        );
+        assert_eq!(status.issues.total, 0, "a skip is not an issue");
+    }
+
+    /// Amendment 69 (call C6): a skip sample's detail goes through
+    /// `util::scrub` before it is stored, and the list stops at
+    /// [`MAX_CHECK_ERROR_SAMPLES`] distinct `(check, detail)` pairs while
+    /// `checks.skipped` keeps counting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipped_samples_are_scrubbed_and_capped() {
+        let mut lane =
+            FakeLane::http().with_points(vec![fake_point("p1", "q", "http://scan.test/search")]);
+        for i in 0..9 {
+            lane = lane.with_check(FakeCheck::new(
+                &format!("fake.point{i}"),
+                "demo",
+                FakeRun::clean(),
+            ));
+        }
+        let h =
+            Harness::new().with_lane(lane.with_host_error("no host: Authorization: Bearer abc"));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        // One point x (nine lane checks + the engine's three shipped passive
+        // checks, spec amendment 24): twelve items, none of them hosted.
+        assert_eq!(status.checks.scheduled, 12);
+        assert_eq!(status.checks.skipped, 12);
+        assert_eq!(status.checks.done, 0);
+        assert_eq!(
+            status.checks.skipped_samples.len(),
+            aitm_scan_model::MAX_CHECK_ERROR_SAMPLES,
+            "twelve distinct checks, eight kept: {:?}",
+            status.checks.skipped_samples
+        );
+        assert!(
+            status
+                .checks
+                .skipped_samples
+                .iter()
+                .all(|s| s.detail == "no host: Authorization: [redacted]"),
+            "the bearer token never reaches scan.status: {:?}",
+            status.checks.skipped_samples
+        );
+        let named: std::collections::BTreeSet<&str> = status
+            .checks
+            .skipped_samples
+            .iter()
+            .map(|s| s.check.as_str())
+            .collect();
+        assert_eq!(named.len(), 8, "every kept sample names a distinct check");
+    }
+
+    /// Tester (amendment 69, spec amendment 16): a skip reason is cut like an
+    /// evidence excerpt after the scrub — a lane that refuses with a
+    /// response-sized message leaves a bounded sample, never the whole text —
+    /// and the cut never splits a character.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skip_reason_is_bounded_like_an_evidence_excerpt() {
+        let long_reason = format!("no host: {}", "é".repeat(300));
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_host_error(&long_reason),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.done, 0);
+        assert_eq!(status.checks.skipped, status.checks.scheduled);
+        assert!(
+            !status.checks.skipped_samples.is_empty(),
+            "{:?}",
+            status.checks
+        );
+        // The 9-byte prefix plus 123 two-byte `é` is 255 bytes: the last
+        // whole character under the 256-byte bound (a 124th would make 257).
+        let expected = format!("no host: {}", "é".repeat(123));
+        assert_eq!(expected.len(), 255);
+        for sample in &status.checks.skipped_samples {
+            assert_eq!(sample.detail, expected);
+            assert!(sample.detail.len() <= aitm_scan_model::MAX_EXCERPT_BYTES);
+        }
+    }
+
+    /// `keep_sample` is the one dedupe-and-cap rule behind both
+    /// `checks.error_samples` and `checks.skipped_samples`: a `(check, detail)`
+    /// pair is kept once, the same detail on another check is a new pair, and
+    /// past [`MAX_CHECK_ERROR_SAMPLES`] nothing more is kept — the caller
+    /// learns which from the return value.
+    #[test]
+    fn keep_sample_dedupes_on_check_and_detail_and_stops_at_the_cap() {
+        let mut samples = Vec::new();
+        assert!(super::keep_sample(
+            &mut samples,
+            "c1",
+            "p1",
+            "no host".into()
+        ));
+        assert!(
+            !super::keep_sample(&mut samples, "c1", "p2", "no host".into()),
+            "the same (check, detail) on another point is not kept again"
+        );
+        assert!(
+            super::keep_sample(&mut samples, "c2", "p1", "no host".into()),
+            "the same detail on another check is a new pair"
+        );
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].point, "p1", "the first point seen stays");
+        for i in 0..(aitm_scan_model::MAX_CHECK_ERROR_SAMPLES - 2) {
+            assert!(super::keep_sample(
+                &mut samples,
+                "c3",
+                "p1",
+                format!("reason {i}")
+            ));
+        }
+        assert_eq!(samples.len(), aitm_scan_model::MAX_CHECK_ERROR_SAMPLES);
+        assert!(
+            !super::keep_sample(&mut samples, "c4", "p1", "brand new".into()),
+            "past the cap a distinct pair is counted by the caller, not kept"
+        );
+        assert_eq!(samples.len(), aitm_scan_model::MAX_CHECK_ERROR_SAMPLES);
+        assert_eq!(
+            samples.last().map(|s| s.detail.as_str()),
+            Some("reason 5"),
+            "the cap keeps the first eight, in order"
         );
     }
 

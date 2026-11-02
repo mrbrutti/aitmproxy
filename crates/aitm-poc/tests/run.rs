@@ -63,6 +63,7 @@ impl RequestSender for TargetSender {
                 trailers: HeaderMap::new(),
                 body: Body::Bytes(body.as_bytes().to_vec()),
                 timestamp: SystemTime::now(),
+                peer: None,
             })
         })
     }

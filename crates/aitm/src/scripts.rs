@@ -302,6 +302,7 @@ mod tests {
                     trailers: aitm_core::HeaderMap::new(),
                     body: aitm_core::Body::Empty,
                     timestamp: std::time::SystemTime::now(),
+                    peer: None,
                 })
             })
         }

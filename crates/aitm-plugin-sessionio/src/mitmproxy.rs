@@ -234,6 +234,7 @@ fn mitm_response(r: &Tns) -> anyhow::Result<HttpResponse> {
         trailers: HeaderMap::new(),
         body: mitm_body(r),
         timestamp: UNIX_EPOCH,
+        peer: None,
     })
 }
 

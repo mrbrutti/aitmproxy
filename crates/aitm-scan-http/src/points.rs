@@ -44,7 +44,7 @@ use aitm_scan_model::{
 
 use crate::limits::MAX_BODY_PARSE_BYTES;
 use crate::params::{self, BodyFormat, JsonStep};
-use crate::template::{looks_like_filename, path_segment_token, traits_for};
+use crate::template::{is_redirect_name, looks_like_filename, path_segment_token, traits_for};
 use crate::{multipart, redact, xml};
 
 /// Headers that are never insertion points, ASCII-lowercased.
@@ -333,6 +333,21 @@ impl<'a> Collector<'a> {
         }
 
         let mut found = traits_for(value);
+        // Amendment 83's name branch: a redirect-like parameter name carries
+        // a destination however ordinary its value reads (`next=/`,
+        // `goto=home`), and `open-redirect` is gated on `Url`. C2: a path
+        // segment's "name" is the segment text and the whole body's is the
+        // lane's own `body` label, so neither is a parameter name.
+        if is_redirect_name(name)
+            && !matches!(
+                kind,
+                InsertionKind::PathSegment
+                    | InsertionKind::PathFilename
+                    | InsertionKind::EntireBody
+            )
+        {
+            found.push(PointTrait::Url);
+        }
         if flags.json {
             found.push(PointTrait::Json);
         }
@@ -1000,6 +1015,121 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), count, "point ids are not pairwise distinct");
+    }
+
+    /// Amendment 83: a redirect-like parameter name tags its point `Url`
+    /// whatever the value looks like, so `open-redirect`
+    /// (`wants_traits: [Url]`) reaches `/redirect?next=/` — the value branch
+    /// alone left that point untagged. C2: the name branch skips the path
+    /// kinds and `entire_body`, whose "name" is a segment text or the lane's
+    /// own `body` label rather than a parameter name.
+    #[test]
+    fn redirect_like_names_carry_url_whatever_the_value() {
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let opts = EnumerateOptions::from_profile(&profile, &ignore, None);
+
+        let flow = captured_flow(
+            request(
+                "GET",
+                "http://t:8080/redirect?next=/&q=hello&goto=home",
+                &[],
+                Some((
+                    "application/x-www-form-urlencoded",
+                    b"return_url=/account&user=alice",
+                )),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&flow, &opts);
+
+        assert_eq!(
+            point(&out, Query, "next").traits,
+            vec![PointTrait::Url],
+            "{:?}",
+            triples(&out)
+        );
+        assert_eq!(point(&out, Query, "goto").traits, vec![PointTrait::Url]);
+        assert_eq!(point(&out, Query, "q").traits, Vec::new());
+        assert_eq!(
+            point(&out, InsertionKind::BodyParam, "return_url").traits,
+            vec![PointTrait::Url]
+        );
+        assert_eq!(
+            point(&out, InsertionKind::BodyParam, "user").traits,
+            Vec::new()
+        );
+
+        // C2: a path segment named like a redirect parameter is not one.
+        let path = captured_flow(
+            request("GET", "http://t:8080/callback/7", &[], None),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&path, &opts);
+        assert_eq!(
+            point(&out, PathSegment, "callback").traits,
+            Vec::new(),
+            "{:?}",
+            triples(&out)
+        );
+    }
+
+    /// Tester (amendment 83, C2): the name branch folds case on the wire
+    /// (`ReturnTo`, `REDIRECT_URI`), reaches a JSON field named like a
+    /// redirect parameter (alongside its `Json` trait), and leaves the
+    /// `entire_body` point alone — its name is the lane's own `body` label.
+    #[test]
+    fn redirect_like_names_fold_case_reach_json_fields_and_skip_the_body_point() {
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let opts = EnumerateOptions::from_profile(&profile, &ignore, None);
+
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/go?ReturnTo=home&REDIRECT_URI=x",
+                &[],
+                Some(("application/json", br#"{"redirect_uri":"home","note":"x"}"#)),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&flow, &opts);
+
+        assert_eq!(
+            point(&out, Query, "ReturnTo").traits,
+            vec![PointTrait::Url],
+            "{:?}",
+            triples(&out)
+        );
+        assert_eq!(
+            point(&out, Query, "REDIRECT_URI").traits,
+            vec![PointTrait::Url]
+        );
+        let field = point(&out, JsonValue, "redirect_uri");
+        assert!(
+            field.traits.contains(&PointTrait::Url) && field.traits.contains(&PointTrait::Json),
+            "a JSON field named like a redirect parameter is Url and Json: {:?}",
+            field.traits
+        );
+        assert!(
+            !point(&out, JsonValue, "note")
+                .traits
+                .contains(&PointTrait::Url),
+            "an ordinary JSON field is not Url"
+        );
+        assert!(
+            !point(&out, EntireBody, "body")
+                .traits
+                .contains(&PointTrait::Url),
+            "the whole-body point is never Url by name (C2): {:?}",
+            point(&out, EntireBody, "body").traits
+        );
     }
 
     /// A structured-body point whose *path* reads as a secret (`session.id`,

@@ -59,6 +59,7 @@ impl aitm_core::RequestSender for EchoSender {
                 trailers: HeaderMap::new(),
                 body: Body::Bytes(b"echo".to_vec()),
                 timestamp: SystemTime::now(),
+                peer: None,
             })
         })
     }

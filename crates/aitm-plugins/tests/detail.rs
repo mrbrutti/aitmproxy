@@ -52,6 +52,7 @@ fn flow_with_bodies() -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(b"{\"token\":\"xyz\"}".to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: caddr,
@@ -579,6 +580,7 @@ fn connect_row(tunnel: TunnelInfo, status: Option<u16>) -> Flow {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: std::time::SystemTime::now(),
+        peer: None,
     });
     f.metadata.tunnel = Some(tunnel);
     flow

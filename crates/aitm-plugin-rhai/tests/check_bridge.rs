@@ -428,6 +428,43 @@ async fn a_throwing_closure_is_an_error_verdict() {
     assert!(verdict.detail.contains("boom"), "{:?}", verdict.detail);
 }
 
+/// PR 3a panel (security Minor 2, quality Minor 5): the bridge scrubs at its
+/// one structural exit, so the eval-error arm is covered too. A closure that
+/// `throw`s a string carrying a bearer token (a script doing `throw resp.body`
+/// on an unexpected answer) yields an `Error` verdict whose `detail` reads
+/// `[redacted]` where the token was; the token itself never leaves the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thrown_value_carrying_a_secret_is_scrubbed_in_the_error_verdict() {
+    let (verdict, _host) = verdict_of(
+        r#"throw "unexpected reply: Authorization: Bearer abc.def.ghi""#,
+        200,
+        "body",
+    )
+    .await;
+
+    assert_eq!(verdict.outcome, Outcome::Error);
+    assert!(
+        verdict
+            .detail
+            .starts_with("error: <source>:5 — hook 'anon$"),
+        "{:?}",
+        verdict.detail
+    );
+    assert!(
+        verdict.detail.ends_with(
+            "' failed: unexpected reply: Authorization: [redacted]\n  help: the flow was \
+             forwarded unchanged. Fix the hook and reload the script."
+        ),
+        "{:?}",
+        verdict.detail
+    );
+    assert!(
+        !verdict.detail.contains("abc.def.ghi"),
+        "{:?}",
+        verdict.detail
+    );
+}
+
 /// A verdict map whose `outcome` is not an `Outcome` token is an `Error` naming
 /// it, never a silent `clean` (spec D4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -538,6 +575,77 @@ async fn scrubbed_evidence_matched_is_still_bounded() {
     assert_eq!(
         matched,
         format!("{} Cookie: [redacted]; Autho", "a".repeat(230))
+    );
+}
+
+/// Amendment 67 (call C5): `detail` is scrubbed with the same `scrub_text_wide`
+/// as the evidence, at the root, in every sibling of the array form, and in the
+/// plain-string form (which puts the whole string in `detail`). The bridge and
+/// the manual `check.<id>` path share one `Verdict::scrub`, so a bearer token a
+/// closure echoes into its prose reaches neither the job path nor the bus caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detail_is_scrubbed_at_the_root_in_siblings_and_in_the_string_form() {
+    let (verdict, _host) = verdict_of(
+        r#"[ #{ outcome: "clean", detail: "echo: Authorization: Bearer abc.def.ghi" },
+            #{ outcome: "clean", detail: "sibling Cookie: sid=s3cr3t" } ]"#,
+        200,
+        "body",
+    )
+    .await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.detail, "echo: Authorization: [redacted]");
+    assert_eq!(verdict.more.len(), 1);
+    assert_eq!(verdict.more[0].detail, "sibling Cookie: [redacted]");
+
+    let (verdict, _host) = verdict_of(r#""saw Authorization: Bearer x""#, 200, "body").await;
+    assert_eq!(verdict.outcome, Outcome::Inconclusive);
+    assert_eq!(verdict.detail, "saw Authorization: [redacted]");
+}
+
+/// Tester (amendment 67): the map form scrubs `detail` on its own — not only
+/// when it arrives as an element of the array form — and a sibling's evidence
+/// is scrubbed and bounded like the root's. Together with
+/// `detail_is_scrubbed_at_the_root_in_siblings_and_in_the_string_form` this
+/// covers every field of every return shape the bridge accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn map_form_detail_and_sibling_evidence_are_scrubbed() {
+    let (verdict, _host) = verdict_of(
+        r#"#{ outcome: "clean", detail: "saw Cookie: sid=s3cr3t in the reply" }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.detail, "saw Cookie: [redacted] in the reply");
+
+    let (verdict, _host) = verdict_of(
+        r#"{ let pad = ""; pad.pad(230, 'a');
+            [ #{ outcome: "vulnerable", detail: "root" },
+              #{ outcome: "vulnerable",
+                 evidence: #{ payload: "q=1&access_token=tok-123",
+                              matched: pad + " Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi" } } ] }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.more.len(), 1);
+    let sibling = &verdict.more[0];
+    assert_eq!(
+        sibling.evidence.payload.as_deref(),
+        Some("q=1&access_token=[redacted]")
+    );
+    let matched = sibling
+        .evidence
+        .matched
+        .as_deref()
+        .expect("the sibling's matched is kept");
+    assert_eq!(matched.len(), MAX_EXCERPT_BYTES);
+    assert_eq!(
+        matched,
+        format!("{} Cookie: [redacted]; Autho", "a".repeat(230)),
+        "scrubbed then bounded, in the sibling too"
     );
 }
 

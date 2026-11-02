@@ -364,6 +364,7 @@ pub fn captured_conversation_with_cookie(cookie: &str) -> (HttpFlow, WsFlow) {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: at,
+            peer: None,
         }),
         client_conn: conn.clone(),
         server_conn: Some(conn.clone()),

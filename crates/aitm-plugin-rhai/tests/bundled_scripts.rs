@@ -135,6 +135,7 @@ fn vuln_http_flow(scheme: &str) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(body.as_bytes().to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: conn(scheme == "https"),
         server_conn: None,

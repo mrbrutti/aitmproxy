@@ -27,6 +27,7 @@ impl RequestSender for EchoSender {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: SystemTime::now(),
+                peer: None,
             })
         })
     }
