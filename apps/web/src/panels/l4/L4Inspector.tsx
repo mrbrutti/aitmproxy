@@ -1,5 +1,5 @@
 // The L4 inspector (ui-ext §3.2): for a selected L4 flow — the packet list, a selected packet's
-// layer tree + hex-availability note, the craft editor (YAML build → hex preview → guarded inject),
+// layer tree + inert hex dump, the craft editor (YAML build → hex preview → guarded inject),
 // and the in-path intercept bar driven by `interceptBarModel` (parity spec §4). Presentational: the
 // panel wires the bus. Mutate sends the craft editor's spec: the editor hands each spec it builds
 // through `onBuild`, the inspector keeps the last one, and Mutate is off with a reason until a
@@ -30,6 +30,8 @@ export interface L4InspectorProps {
   onMutate: (parkedId: string, spec: PacketSpec) => void;
   onDrop: (parkedId: string) => void;
   onRevert: (parkedId: string) => void;
+  /** Read the next packet window from the flow's `next_offset` after a `truncated` reply (spec §2). */
+  onLoadMore: () => void;
 }
 
 export const L4Inspector: Component<L4InspectorProps> = (props) => {
@@ -65,10 +67,17 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
 
       <div class={css.section}>
         <div class={css.sectionHead}>Packets</div>
-        <PacketList packets={props.flow.packets} selected={sel()} inScope={props.row.inScope} onSelect={setSel} />
+        <PacketList
+          packets={props.flow.packets}
+          selected={sel()}
+          inScope={props.row.inScope}
+          truncated={props.flow.truncated === true}
+          onSelect={setSel}
+          onLoadMore={props.onLoadMore}
+        />
       </div>
 
-      <Show when={packet()}>{(p) => <LayerTree layers={p().layers} length={p().length} />}</Show>
+      <Show when={packet()}>{(p) => <LayerTree packet={p()} />}</Show>
 
       <CraftEditor
         interface={props.flow.interface}

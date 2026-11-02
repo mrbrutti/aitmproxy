@@ -225,7 +225,36 @@ export function createL4Store(app: AppStore) {
   /** Fetch the selected flow's first packet window (spec §2) for the inspector. */
   async function inspect(id: string): Promise<void> {
     const flow = await read<L4FlowWire>('l4.flow.get', app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', window())));
-    if (flow && flow.id === id) setInspected(flow);
+    if (!flow || flow.id !== id) return;
+    // A flow's packet log is append-only, so a window already extended by `loadMore()` is a longer
+    // prefix of the same log: keep it (and its continuation point) rather than shrink back to the
+    // first window when the tick re-reads a grown flow.
+    const shown = inspected();
+    if (shown && shown.id === id && (flow.offset ?? 0) === 0 && shown.packets.length > flow.packets.length) {
+      setInspected({ ...flow, packets: shown.packets, truncated: shown.truncated ?? false, next_offset: shown.next_offset ?? null });
+      return;
+    }
+    setInspected(flow);
+  }
+
+  /**
+   * After a `truncated` window (spec §2 byte budget): read the next window from the reply's
+   * `next_offset` and append its packets to the inspected flow; `truncated` / `next_offset` then
+   * come from the new reply. A no-op when nothing is inspected or the window is complete.
+   */
+  async function loadMore(): Promise<void> {
+    const shown = inspected();
+    if (!shown || shown.truncated !== true || typeof shown.next_offset !== 'number') return;
+    const id = shown.id;
+    const more = await read<L4FlowWire>(
+      'l4.flow.get',
+      app.call<L4FlowWire>('l4.flow.get', flowGetArgs(id, 'inspect', window(), shown.next_offset)),
+    );
+    if (!more || more.id !== id) return;
+    const current = inspected();
+    // The selection moved while the read was in flight: the reply belongs to a flow no longer shown.
+    if (!current || current.id !== id) return;
+    setInspected({ ...more, offset: current.offset ?? 0, packets: [...current.packets, ...more.packets] });
   }
 
   // Selection is the app's single `selectedId`; an L4 id gets its window, anything else clears it.
@@ -317,6 +346,7 @@ export function createL4Store(app: AppStore) {
     selectedRow,
     refresh,
     inspect,
+    loadMore,
     craft,
     startCapture,
     stopCapture,

@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  asciiColumn,
   createOnceLog,
+  flowGetArgs,
   flowScope,
   flowSubLabel,
+  formatPacketTime,
+  hexRows,
   interceptBarModel,
   isKnownKind,
   KNOWN_KINDS,
@@ -14,12 +18,14 @@ import {
   l4SessionState,
   l4Target,
   listCmd,
+  packetHeadline,
   parsePacketSpec,
   PENDING_AVAILABILITY,
   placeholderRow,
   protoSubLabel,
   type L4Availability,
   type L4FlowWire,
+  type L4PacketWire,
   type L4ParkedWire,
   type L4PollClock,
   type L4ScopeEntryWire,
@@ -260,5 +266,93 @@ describe('interceptBarModel', () => {
 
   it('a null reason while unavailable renders as an empty reason string, not "null"', () => {
     expect(interceptBarModel({ available: false, code: null, reason: null }, [], 'F')).toEqual({ kind: 'limited', reason: '' });
+  });
+});
+
+// ---- packet display (task C6; spec §2, §2.3; AC40) ---------------------------------------------------
+
+describe('packetHeadline (spec §2 addresses)', () => {
+  const pkt: L4PacketWire = {
+    dir: 'outbound',
+    length: 36,
+    injected: false,
+    layers: ['IPv4', 'UDP'],
+    proto: 'UDP',
+    src: '127.0.0.1',
+    dst: '127.0.0.1',
+    src_port: 40000,
+    dst_port: 9053,
+  };
+
+  it('renders src:port → dst:port · proto · length when the addresses are present', () => {
+    expect(packetHeadline(pkt)).toBe('127.0.0.1:40000 → 127.0.0.1:9053 · UDP · 36 B');
+  });
+
+  it('falls back to the layer summary when the addresses are null (undecodable or older core)', () => {
+    expect(packetHeadline({ ...pkt, src: null, dst: null, src_port: null, dst_port: null })).toBe('IPv4 · UDP · 36 B');
+    expect(packetHeadline({ dir: 'inbound', length: 2, injected: false, layers: [] })).toBe('raw · 2 B');
+  });
+
+  it('appends ports only when they are non-null (ICMP has addresses but no ports)', () => {
+    expect(packetHeadline({ ...pkt, layers: ['IPv4', 'ICMP'], proto: 'ICMP', src_port: null, dst_port: null, length: 84 })).toBe(
+      '127.0.0.1 → 127.0.0.1 · ICMP · 84 B',
+    );
+  });
+
+  it('adds proto to the layer summary only when it is not already the innermost layer', () => {
+    expect(packetHeadline({ ...pkt, src: null, dst: null, layers: ['Ether', 'IPv4'], proto: 'TCP' })).toBe('Ether · IPv4 · TCP · 36 B');
+  });
+});
+
+describe('formatPacketTime (spec §2 timestamp)', () => {
+  it('renders local HH:MM:SS.mmm with padded fields', () => {
+    const shaped = formatPacketTime(1_761_900_000_007);
+    expect(shaped).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3}$/);
+    expect(shaped.endsWith('.007')).toBe(true);
+    // The hour/minute/second match what the local clock says for that instant.
+    const d = new Date(1_761_900_000_007);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    expect(shaped).toBe(`${hh}:${mm}:${ss}.007`);
+  });
+});
+
+describe('inert hex/ASCII renderer (spec §2.3, AC40)', () => {
+  const ac40 = Uint8Array.of(0x1b, 0x5b, 0x41, 0x0a, 0x7f, 0x7e, 0x41);
+
+  it('asciiColumn maps every byte outside 0x20–0x7e to "."', () => {
+    expect(asciiColumn(ac40)).toBe('.[A..~A');
+    expect(asciiColumn(Uint8Array.of(0x20, 0x7e, 0x7f, 0x1f, 0x00, 0xff))).toBe(' ~....');
+    expect(asciiColumn(new Uint8Array(0))).toBe('');
+  });
+
+  it('hexRows renders one 16-byte row with offset, hex and the ASCII column, with no control character', () => {
+    const rows = hexRows(ac40);
+    expect(rows).toEqual(['00000000  1b 5b 41 0a 7f 7e 41                              |.[A..~A|']);
+    for (const row of rows) for (const ch of row) expect(ch.charCodeAt(0)).toBeGreaterThanOrEqual(0x20);
+  });
+
+  it('hexRows splits at 16 bytes with the extra gap after the 8th byte and 8-digit offsets', () => {
+    const bytes = new Uint8Array(20);
+    for (let i = 0; i < 20; i++) bytes[i] = 0x40 + i;
+    const rows = hexRows(bytes);
+    expect(rows).toEqual([
+      '00000000  40 41 42 43 44 45 46 47  48 49 4a 4b 4c 4d 4e 4f  |@ABCDEFGHIJKLMNO|',
+      '00000010  50 51 52 53                                       |PQRS|',
+    ]);
+    expect(hexRows(new Uint8Array(0))).toEqual([]);
+    const all = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) all[i] = i;
+    for (const row of hexRows(all)) for (const ch of row) expect(ch.charCodeAt(0)).toBeGreaterThanOrEqual(0x20);
+  });
+});
+
+describe('flowGetArgs offset (load more from next_offset)', () => {
+  it('an inspect read may start at next_offset; the C1 defaults are unchanged', () => {
+    expect(flowGetArgs('F', 'inspect', true, 69)).toEqual({ id: 'F', offset: 69, limit: 256 });
+    expect(flowGetArgs('F', 'inspect', true)).toEqual({ id: 'F', offset: 0, limit: 256 });
+    expect(flowGetArgs('F', 'list', true, 69)).toEqual({ id: 'F', limit: 0 });
+    expect(flowGetArgs('F', 'inspect', false, 69)).toEqual({ id: 'F' });
   });
 });

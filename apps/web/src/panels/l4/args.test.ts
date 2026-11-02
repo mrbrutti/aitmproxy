@@ -357,6 +357,61 @@ describe('no_filter_on_capture_start (C4 tripwire, AC18)', () => {
   });
 });
 
+// ---- inert packet text tripwire (task C6, spec §2.3, AC40) -----------------------------------------
+//
+// The web never inserts packet-derived text by raw HTML insertion: every byte of a packet reaches
+// the DOM as a text node (`hexRows` → `<pre>` text). Every file under `panels/l4/` — components,
+// model, styles and the tests themselves — is read with node `fs` and must not contain either DOM
+// property name. The two names are assembled from fragments here so this file passes its own check.
+
+const RAW_HTML_SINKS = [['inner', 'HTML'].join(''), ['dangerouslySet', 'Inner', 'HTML'].join('')];
+
+async function readPanelsL4Files(): Promise<WalkedFile[]> {
+  const fsModule = 'node:fs';
+  const pathModule = 'node:path';
+  const urlModule = 'node:url';
+  const fs = (await import(/* @vite-ignore */ fsModule)) as {
+    readFileSync(path: string, encoding: 'utf8'): string;
+    readdirSync(path: string, opts: { withFileTypes: true }): { name: string; isDirectory(): boolean; isFile(): boolean }[];
+  };
+  const path = (await import(/* @vite-ignore */ pathModule)) as {
+    dirname(p: string): string;
+    join(...parts: string[]): string;
+    relative(from: string, to: string): string;
+  };
+  const url = (await import(/* @vite-ignore */ urlModule)) as { fileURLToPath(u: string): string };
+  const dir = path.dirname(url.fileURLToPath(import.meta.url));
+  const out: WalkedFile[] = [];
+  const walk = (d: string) => {
+    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) out.push({ rel: path.relative(dir, full), text: fs.readFileSync(full, 'utf8') });
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+describe('no_innerhtml_under_panels_l4 (C6 tripwire, AC40)', () => {
+  it('no file under panels/l4/ names a raw HTML insertion sink', async () => {
+    const files = await readPanelsL4Files();
+    expect(files.map((f) => f.rel)).toContain('LayerTree.tsx');
+    expect(files.map((f) => f.rel)).toContain('args.test.ts');
+    const problems: string[] = [];
+    for (const f of files) for (const sink of RAW_HTML_SINKS) if (f.text.includes(sink)) problems.push(`${f.rel}: contains ${sink}`);
+    expect(problems).toEqual([]);
+  });
+
+  it('LayerTree renders hexRows as text and says "no bytes from this core" without bytes', async () => {
+    const src = await readL4Source('LayerTree.tsx');
+    expect(src).toContain('hexRows(');
+    expect(src).toContain('base64ToBytes(');
+    expect(src).toContain('no bytes from this core');
+    expect(src).not.toContain('Raw bytes are not carried');
+  });
+});
+
 // ---- live schema block (AC18 live; run in C10 against the rig, skipped in the gate) ---------------
 //
 // Reads the real core's `tools/list` over the loopback-TCP bus (the wire of

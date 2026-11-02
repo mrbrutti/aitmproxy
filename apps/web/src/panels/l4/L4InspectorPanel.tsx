@@ -95,6 +95,7 @@ export const L4InspectorPanel: Component<{ store: L4Store }> = (props) => {
           onMutate={onMutate}
           onDrop={onDrop}
           onRevert={onRevert}
+          onLoadMore={() => void store.loadMore()}
         />
       </Show>
 

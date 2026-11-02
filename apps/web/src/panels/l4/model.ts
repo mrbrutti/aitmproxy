@@ -501,16 +501,86 @@ export const L4_INSPECT_LIMIT = 256;
 
 /**
  * `l4.flow.get` arguments. With the window (parity core): list rows ask `limit: 0` (flow fields
- * only), the inspector asks the first window. Without it (older core) only `{id}`, which the older
- * schema accepts.
+ * only), the inspector asks a window starting at `offset` (0 for the first read; the reply's
+ * `next_offset` for "load more" after a `truncated` reply, spec §2 byte budget). Without the window
+ * (older core) only `{id}`, which the older schema accepts.
  */
 export function flowGetArgs(
   id: string,
   mode: 'list' | 'inspect',
   window: boolean,
+  offset = 0,
 ): { id: string; offset?: number; limit?: number } {
   if (!window) return { id };
-  return mode === 'list' ? { id, limit: 0 } : { id, offset: 0, limit: L4_INSPECT_LIMIT };
+  return mode === 'list' ? { id, limit: 0 } : { id, offset, limit: L4_INSPECT_LIMIT };
+}
+
+// ---- packet display (spec §2 fields, §2.3 inert text; AC40) --------------------------------------------
+//
+// Pure renderers for the inspector. Every string here is built from the packet's decoded fields or
+// from its bytes mapped through `asciiColumn`, so the components can drop them into text nodes with
+// nothing else to sanitise: no byte outside 0x20–0x7e ever reaches the DOM as itself.
+
+/**
+ * One line for a packet row: `127.0.0.1:40000 → 127.0.0.1:9053 · UDP · 36 B` when the core decoded
+ * the addresses (ports only when it has them); otherwise the layer stack (`IPv4 · UDP · 36 B`, with
+ * `proto` appended only when it is not already the innermost layer), `raw` for an undecoded packet.
+ */
+export function packetHeadline(p: L4PacketWire): string {
+  const size = `${p.length} B`;
+  const parts: string[] = [];
+  if (p.src != null && p.dst != null) {
+    parts.push(`${endpoint(p.src, p.src_port)} → ${endpoint(p.dst, p.dst_port)}`);
+    if (p.proto) parts.push(p.proto);
+  } else {
+    parts.push(...(p.layers.length ? p.layers : ['raw']));
+    if (p.proto && p.layers[p.layers.length - 1] !== p.proto) parts.push(p.proto);
+  }
+  parts.push(size);
+  return parts.join(' · ');
+}
+
+function endpoint(addr: string, port: number | null | undefined): string {
+  return port != null ? `${addr}:${port}` : addr;
+}
+
+/** A packet `timestamp` (epoch ms) as the local wall clock, `HH:MM:SS.mmm`. */
+export function formatPacketTime(ms: number): string {
+  const d = new Date(ms);
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+
+/** The printable-ASCII column of a hex dump: 0x20–0x7e as themselves, every other byte as `.` (spec §2.3). */
+export function asciiColumn(bytes: Uint8Array): string {
+  let out = '';
+  for (const b of bytes) out += b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.';
+  return out;
+}
+
+/** Bytes per `hexRows` line. */
+const HEX_ROW_BYTES = 16;
+/** Width of a full row's hex region: 16 × 2 digits + 15 separators + the extra gap after the 8th byte. */
+const HEX_REGION_WIDTH = HEX_ROW_BYTES * 2 + (HEX_ROW_BYTES - 1) + 1;
+
+/**
+ * A classic hex dump, one string per 16 bytes: an 8-digit hex offset, two spaces, the bytes as
+ * two-digit lowercase hex separated by spaces (an extra space after the 8th, padded so the ASCII
+ * column lines up), two spaces, then `|` + `asciiColumn` + `|`. No character of any row is below
+ * 0x20 (AC40); the caller adds its own line breaks.
+ */
+export function hexRows(bytes: Uint8Array): string[] {
+  const rows: string[] = [];
+  for (let start = 0; start < bytes.length; start += HEX_ROW_BYTES) {
+    const chunk = bytes.subarray(start, start + HEX_ROW_BYTES);
+    let hex = '';
+    for (let i = 0; i < chunk.length; i++) {
+      if (i > 0) hex += i === HEX_ROW_BYTES / 2 ? '  ' : ' ';
+      hex += chunk[i]!.toString(16).padStart(2, '0');
+    }
+    rows.push(`${start.toString(16).padStart(8, '0')}  ${hex.padEnd(HEX_REGION_WIDTH)}  |${asciiColumn(chunk)}|`);
+  }
+  return rows;
 }
 
 /** The flow's first-listed (oldest) parked packet, or `null` when none is parked for it. */
