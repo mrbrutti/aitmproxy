@@ -340,8 +340,9 @@ pub struct McpConfig {
     /// so wiring and audit can speak of "the agent token" directly.
     pub agent_token: Option<String>,
     /// The token that marks a loopback-TCP connection as a human operator
-    /// ([`Frontend::Operator`]). **Off by default**: without it, every
-    /// loopback connection is an agent, matching the M1/M2 posture.
+    /// ([`Frontend::Operator`]). Minted into the config on a serving first run
+    /// (§D3); `None` only before that run, or when `operator_bus.enabled` is
+    /// false and `operator-token generate` was never run.
     pub operator_token: Option<String>,
     /// The agent policy the server starts under (enforced from Task 4). Default
     /// [`AgentPolicy::Auto`] per the milestone's adopted default.
@@ -353,6 +354,10 @@ pub struct McpConfig {
     /// Where the durable audit log is written; see [`AuditLogSetting`]. The
     /// default is the per-user `audit.jsonl`.
     pub audit_log: AuditLogSetting,
+    /// The loopback operator bus every serving core offers by default, so a
+    /// one-shot `aitm <group> <verb>` from a second shell reaches the running
+    /// core (R14 §D2). See [`OperatorBusConfig`].
+    pub operator_bus: OperatorBusConfig,
 }
 
 impl Default for McpConfig {
@@ -364,6 +369,30 @@ impl Default for McpConfig {
             policy: AgentPolicy::Auto,
             stdio_role: Frontend::Mcp,
             audit_log: AuditLogSetting::Default,
+            operator_bus: OperatorBusConfig::default(),
+        }
+    }
+}
+
+/// The loopback operator bus (`mcp.operator_bus`, R14 §D2): the listener that
+/// accepts the operator token and classifies the connection
+/// [`Frontend::Operator`]. When `mcp.transport` is loopback TCP that transport
+/// carries operator access itself; otherwise a dedicated operator-only
+/// loopback listener is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorBusConfig {
+    /// Serve a loopback operator bus and mint the operator token on first run. Default `true`.
+    pub enabled: bool,
+    /// The port of the dedicated operator listener; `0` (the default) is ephemeral.
+    /// Ignored when `mcp.transport` is loopback TCP (that bus carries operator access).
+    pub port: u16,
+}
+
+impl Default for OperatorBusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 0,
         }
     }
 }

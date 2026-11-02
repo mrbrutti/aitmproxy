@@ -302,8 +302,9 @@ Each line is one JSON object. An entry has seven keys:
 
 `at` is epoch milliseconds. `origin` is `operator` for the operator's calls, `mcp`
 for an agent's and `cli` for a CLI call, which lands in `audit.jsonl` with the
-operator's. No `cli` line is written today, because one-shot CLI commands run in
-their own process and build no writer. `args` is the JSON text of the arguments,
+operator's. A one-shot that reaches a running core is recorded by that core as
+`operator` with the client label `aitm-cli`; a verb that runs locally
+(`aitm ca status`) still writes no line. `args` is the JSON text of the arguments,
 redacted and cut at 512 bytes. `result` is `"ok"` or `{"error":"<reason>"}`.
 `client_label` and `connection_id` are `null` when the call has none.
 
@@ -354,8 +355,9 @@ too.
   exact, two concurrent calls can be written in either order, and `at` is
   wall-clock milliseconds, so a clock change reorders it.
 - **Not recorded:** the built-in UI of `aitm tui` (the operator and agent clients
-  of that same process are recorded) and one-shot CLI commands such as
-  `aitm ca status`, which run in their own process with no writer. Calls over
+  of that same process are recorded) and the local one-shot verbs such as
+  `aitm ca status`, which run in their own process with no writer (a one-shot
+  that reaches a running core is recorded by that core). Calls over
   streamable HTTP are recorded with `connection_id: null`.
 - **One path per process.** Two `aitm` processes sharing one `mcp.audit_log` are
   not locked against each other; give each its own path.
@@ -527,9 +529,10 @@ stopped; read what it found with `scan.issues` and `scan.issue`, the crawled
 tree with `scan.sitemap`, and stop it with `scan.cancel`. `scan.map` crawls and
 runs the passive checks without sending a probe. `scan.checks` lists the
 catalogue, and `check.<id>` runs one check by hand against one parameter. Run
-these from the **Scan** view in any UI or over MCP; a crawl needs a running core
-with the embedded browser, so the one-shot CLI cannot crawl. Issues link back to
-the flows they came from. Details in [docs/scanner.md](docs/scanner.md).
+these from the **Scan** view in any UI, over MCP, or from the one-shot CLI,
+which acts on the running core: a crawl needs that core's embedded browser, and
+with no core running the CLI refuses rather than crawling nothing. Issues link
+back to the flows they came from. Details in [docs/scanner.md](docs/scanner.md).
 
 ### Scripting and PoCs
 
@@ -668,10 +671,13 @@ client.**
   findings, the PoC engine and the scanner each register commands.
 - **Frontends are clients.** The MCP server, the web UI, the TUI and the macOS
   app all drive the core by invoking registered commands. The one-shot CLI
-  (`aitm <family> <verb> --flag value`) runs a single command in its own process,
-  which makes it the right tool for self-contained commands such as
-  `aitm ca status` or `aitm ca export`; it does not steer a proxy that is already
-  running.
+  (`aitm <family> <verb> --flag value`) acts on the running core: it finds the
+  core's operator bus (every `aitm`, `aitm web`, `aitm tui` and the macOS app's
+  core serve one on loopback by default), runs the command there and prints the
+  answer; with no core running it refuses and says so. A few verbs run on this
+  machine instead of a core: `ca`, `findings list|get|remove`,
+  `poc list|get|artifact`, `scan report`, `script validate`,
+  `proxy system unset`.
 
 Adding a command to the core exposes it over MCP and in every UI at once, under
 the same scope, sensitivity and confirmation rules.

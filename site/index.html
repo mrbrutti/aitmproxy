@@ -153,7 +153,7 @@
 <section class="section" id="operators">
   <div class="wrap">
     <h2 class="h2" data-reveal>Two operators. One control surface.</h2>
-    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a registered command. A person drives a running core from the web UI, the terminal UI or the macOS app; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what. The one-shot CLI (<code>aitm &lt;family&gt; &lt;verb&gt;</code>) runs a single command in its own process, which suits self-contained jobs such as <code>aitm ca status</code>; it does not steer a proxy that is already running.</p>
+    <p class="lead deck" data-reveal data-d="1">Every action in aitmproxy is a registered command. A person drives a running core from the web UI, the terminal UI or the macOS app; an AI assistant calls the very same command over MCP. There is no second API for agents and no hidden menu for humans — one core, and one record of who did what. The one-shot CLI (<code>aitm &lt;family&gt; &lt;verb&gt;</code>) is a client of that running core too: it finds the core&rsquo;s operator bus, runs the command there and prints the answer; with no core running it refuses and says so. A few verbs, such as <code>aitm ca status</code>, run on this machine instead.</p>
 
     <div class="split">
       <div class="split-col" data-reveal>
@@ -387,7 +387,7 @@ content-type: application/json
 
       <article class="feature" data-reveal>
         <h3 class="h3">Scriptable, all of it</h3>
-        <p>Every command above is registered once: the UIs and MCP call it by the same name, the self-contained ones also run one-shot from the CLI, and Rhai plugins can register commands of their own.</p>
+        <p>Every command above is registered once: the UIs and MCP call it by the same name, every one of them runs one-shot from the CLI on the running core (the self-contained ones run on this machine), and Rhai plugins can register commands of their own.</p>
         <div class="pair">
           <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm script validate --path guard-admin-writes.rhai</code></div>
           <div class="pair-row is-agent"><span class="pair-who">agent</span><code>script.validate({ path: <span class="s">"guard-admin-writes.rhai"</span> })</code></div>

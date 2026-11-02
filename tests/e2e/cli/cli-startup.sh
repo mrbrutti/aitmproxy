@@ -285,10 +285,10 @@ kill "$holder" 2>/dev/null
 echo "### one-shot verbs and operator-token ###"
 
 new_env oneshot
-if HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" flow list >"$ROOT/flow.log" 2>&1; then
-  pass "one-shot 'aitm flow list' exits 0"
+if HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" ca status >"$ROOT/flow.log" 2>&1; then
+  pass "one-shot 'aitm ca status' exits 0"
 else
-  fail "'aitm flow list' failed"; cat "$ROOT/flow.log"
+  fail "'aitm ca status' failed"; cat "$ROOT/flow.log"
 fi
 
 new_env optoken
@@ -311,7 +311,7 @@ fi
 # ===========================================================================
 echo "### bad config is a clear error, not a panic ###"
 badcfg="$ROOT/bad.yaml"; printf 'listen: 127.0.0.1:9\nnot_a_real_key: 1\n' > "$badcfg"
-HOME="$ROOT/badhome" "$AITM_BIN" --config "$badcfg" flow list >"$ROOT/bad.log" 2>&1; rc=$?
+HOME="$ROOT/badhome" "$AITM_BIN" --config "$badcfg" ca status >"$ROOT/bad.log" 2>&1; rc=$?
 if [ "$rc" -ne 0 ] && in_log "$ROOT/bad.log" "config file" && ! in_log "$ROOT/bad.log" "panicked"; then
   pass "malformed config: clear error naming the file, no panic"
 else

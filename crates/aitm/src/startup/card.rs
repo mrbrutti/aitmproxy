@@ -2,6 +2,13 @@
 //! C25, C27): [`ReadyInputs`], [`ready_card`], the T7 vocabulary helpers and
 //! the aitm-ca trust read.
 //!
+//! R14 (`2026-11-01-cli-oneshot-live-core-design.md` D5, D14; its plan Task
+//! 9, call C16) adds [`OperatorBusWord`], the `Operator bus` row directly
+//! after `Bus`, the ` · operator` suffix on a shared `Bus` row, and makes the
+//! Scope next step conditional on the card's own core being reachable by a
+//! one-shot. The renderer in `aitm-term` is untouched: the label is 12
+//! characters, within T3's 14-column field.
+//!
 //! Everything here is a pure function of values `run()` already holds (the
 //! bound listeners, the config, the system-proxy summary, the log path), so
 //! the card is unit-tested by literal rows. The one exception is
@@ -33,6 +40,9 @@ pub(crate) const CA_INSTALL_COMMAND: &str = "aitm ca install";
 /// The next step under an `off` or `points at <host>:<port>` `System proxy`
 /// row (spec T7).
 pub(crate) const PROXY_SYSTEM_SET_COMMAND: &str = "aitm proxy system set";
+/// The `Operator bus` row's label (R14 spec D5): 12 characters, within T3's
+/// 14-column label field.
+pub const OPERATOR_BUS_LABEL: &str = "Operator bus";
 /// The `Browser` row's trailing note (spec M6; one plain string in wave 1,
 /// plan C24).
 const SSRF_NOTE: &str = "(SSRF-filtered)";
@@ -81,6 +91,32 @@ pub fn bus_word(t: &McpTransport) -> BusWord {
     }
 }
 
+/// The operator bus as the card says it (R14 spec D5; `operator_bus::start`
+/// returns it). It decides the `Operator bus` row ([`operator_bus_row`]),
+/// the ` · operator` suffix on the `Bus` row ([`bus_row_value`]) and whether
+/// the Scope next step is promised ([`scope_row`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorBusWord {
+    /// The configured loopback MCP transport already serves the operator
+    /// (one listener): the `Bus` row gains ` · operator`; no row of its own.
+    Shared,
+    /// A dedicated loopback listener at this address: the `Operator bus`
+    /// row, plain.
+    Dedicated(SocketAddr),
+    /// Not served; the reason (`mcp.operator_bus.enabled: false`,
+    /// `no mcp.operator_token`, `could not write mcp.operator_token to
+    /// <path>`) follows `off · ` on a warning row.
+    Off(String),
+}
+
+impl OperatorBusWord {
+    /// Whether a one-shot can reach this core as the operator (R14 D5,
+    /// D14): `Shared` or `Dedicated`.
+    fn reachable(&self) -> bool {
+        !matches!(self, OperatorBusWord::Off(_))
+    }
+}
+
 /// The CA trust verdict once read (spec T7). An unread state is `None` on
 /// the caller's side and never becomes `Untrusted` (TUI D17.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +133,9 @@ pub struct ReadyInputs<'a> {
     pub proxy: SocketAddr,
     pub browser: SocketAddr,
     pub bus: BusWord,
+    /// The operator bus (R14 D5): the `Operator bus` row, the ` · operator`
+    /// suffix on `Bus`, and whether the Scope next step is promised.
+    pub operator_bus: OperatorBusWord,
     /// `web::ui_url`; shown as the `Web UI` row in web mode.
     pub web_url: Option<&'a str>,
     /// `web::operator_ui_url`; shown as the `Operator` row only when an
@@ -185,17 +224,52 @@ fn system_proxy_role(state: &State) -> Role {
     }
 }
 
-/// The `Scope` row's value and next step (spec T7): the core's
-/// [`NOTHING_DECRYPTED_ADVICE`] verbatim plus `aitm scope add --host <host>`
-/// when Scope is empty; `1 host in Scope` / `<n> hosts in Scope` otherwise.
-pub fn scope_row(n: usize) -> (String, Option<FixCommand>) {
+/// The `Scope` row's value and next step (spec T7; R14 D5/D14, which re-pin
+/// AC-W1-6): the core's [`NOTHING_DECRYPTED_ADVICE`] verbatim when Scope is
+/// empty, plus `aitm scope add --host <host>` only when `reachable` (a
+/// one-shot can reach this core as the operator: the operator bus is
+/// `Shared` or `Dedicated`, never `Off`); `1 host in Scope` /
+/// `<n> hosts in Scope` otherwise, never with a next step.
+pub fn scope_row(n: usize, reachable: bool) -> (String, Option<FixCommand>) {
     match n {
         0 => (
             NOTHING_DECRYPTED_ADVICE.to_string(),
-            Some(FixCommand(SCOPE_ADD_COMMAND.to_string())),
+            reachable.then(|| FixCommand(SCOPE_ADD_COMMAND.to_string())),
         ),
         1 => ("1 host in Scope".to_string(), None),
         n => (format!("{n} hosts in Scope"), None),
+    }
+}
+
+/// The `Bus` row's value (spec T7; R14 D5, plan C16): `ready` on the Web
+/// card, the [`BusWord`] otherwise, with ` · operator` appended when the
+/// operator bus is `Shared` (that one listener serves the operator too, so
+/// there is no `Operator bus` row to say it).
+pub fn bus_row_value(bus: &BusWord, mode: ModeWord, ob: &OperatorBusWord) -> String {
+    let base = match mode {
+        ModeWord::Web => "ready".to_string(),
+        ModeWord::Server | ModeWord::Tui => bus.to_string(),
+    };
+    match ob {
+        OperatorBusWord::Shared => format!("{base} · operator"),
+        OperatorBusWord::Dedicated(_) | OperatorBusWord::Off(_) => base,
+    }
+}
+
+/// The `Operator bus` row (R14 D5, plan C16): the address, plain, for a
+/// `Dedicated` bus; `off · <reason>` as a warning for `Off`; `None` for
+/// `Shared`, whose word rides on the `Bus` row. Never a next step: the
+/// reason names the config key or the path itself.
+pub fn operator_bus_row(ob: &OperatorBusWord) -> Option<Row> {
+    match ob {
+        OperatorBusWord::Shared => None,
+        OperatorBusWord::Dedicated(addr) => Some(plain_row(OPERATOR_BUS_LABEL, addr.to_string())),
+        OperatorBusWord::Off(reason) => Some(Row {
+            label: OPERATOR_BUS_LABEL,
+            value: format!("off · {reason}"),
+            value_role: Role::Warning,
+            next: None,
+        }),
     }
 }
 
@@ -261,29 +335,34 @@ fn plain_row(label: &'static str, value: impl Into<String>) -> Row {
     }
 }
 
-/// The ready card (spec D10; M1 for `Server`, M6 for `Web`). Rows in order:
-/// the mode's own rows (`Web UI`, `Operator` when configured, `Proxy`,
-/// `Browser`, `Bus ready` for web; `Bus <transport>` otherwise), then `Scope`,
-/// `CA` only when untrusted, `System proxy`, and `Log` last and dim when a
-/// log file is open.
+/// The ready card (spec D10; M1 for `Server`, M6 for `Web`; R14 D5 for the
+/// operator bus). Rows in order: the mode's own rows (`Web UI`, `Operator`
+/// when configured, `Proxy`, `Browser` for web), `Bus` ([`bus_row_value`]),
+/// `Operator bus` directly after it when the plan has a row
+/// ([`operator_bus_row`]), then `Scope` (its next step only when the operator
+/// bus is reachable), `CA` only when untrusted, `System proxy`, and `Log`
+/// last and dim when a log file is open.
 pub fn ready_card(i: &ReadyInputs) -> Card {
-    let mut rows = Vec::with_capacity(8);
-    match i.mode {
-        ModeWord::Web => {
-            if let Some(url) = i.web_url {
-                rows.push(plain_row("Web UI", url));
-            }
-            if let Some(url) = i.operator_url {
-                rows.push(plain_row("Operator", url));
-            }
-            rows.push(plain_row("Proxy", i.proxy.to_string()));
-            rows.push(plain_row("Browser", format!("{}  {SSRF_NOTE}", i.browser)));
-            rows.push(plain_row("Bus", "ready"));
+    let mut rows = Vec::with_capacity(9);
+    if i.mode == ModeWord::Web {
+        if let Some(url) = i.web_url {
+            rows.push(plain_row("Web UI", url));
         }
-        ModeWord::Server | ModeWord::Tui => rows.push(plain_row("Bus", i.bus.to_string())),
+        if let Some(url) = i.operator_url {
+            rows.push(plain_row("Operator", url));
+        }
+        rows.push(plain_row("Proxy", i.proxy.to_string()));
+        rows.push(plain_row("Browser", format!("{}  {SSRF_NOTE}", i.browser)));
+    }
+    rows.push(plain_row(
+        "Bus",
+        bus_row_value(&i.bus, i.mode, &i.operator_bus),
+    ));
+    if let Some(row) = operator_bus_row(&i.operator_bus) {
+        rows.push(row);
     }
 
-    let (value, next) = scope_row(i.scope_hosts);
+    let (value, next) = scope_row(i.scope_hosts, i.operator_bus.reachable());
     rows.push(Row {
         label: "Scope",
         value,
@@ -366,10 +445,13 @@ mod tests {
     const WEB_URL: &str = "http://127.0.0.1:8082/#t=abc";
     const OPERATOR_URL: &str = "http://127.0.0.1:8082/#t=def&expect=operator";
 
-    /// M1's ready block, byte for byte, colour off (spec M1).
+    /// M1's ready block, byte for byte, colour off (spec M1), plus the R14
+    /// `Operator bus` row directly after `Bus`: the R14 spec's D5 block for
+    /// bare `aitm` after first run.
     const M1: &str = concat!(
         "● aitmproxy · listening 127.0.0.1:8080 · CA untrusted\n",
         "  Bus           stdio (MCP)\n",
+        "  Operator bus  127.0.0.1:50512\n",
         "  Scope         Nothing is decrypted until a host is in Scope.\n",
         "                ▸ aitm scope add --host <host>\n",
         "  CA            untrusted\n",
@@ -422,8 +504,9 @@ mod tests {
         rows.iter().map(|r| r.label).collect()
     }
 
-    /// M1's inputs: bare `aitm`, stdio bus, untrusted CA, empty Scope, the
-    /// system proxy off, the default log, `~` = `/Users/matt`.
+    /// M1's inputs: bare `aitm`, stdio bus, a dedicated operator bus at
+    /// `127.0.0.1:50512` (R14 D5), untrusted CA, empty Scope, the system
+    /// proxy off, the default log, `~` = `/Users/matt`.
     fn m1_inputs<'a>(
         system_proxy: &'a Summary,
         log: Option<&'a Path>,
@@ -434,6 +517,7 @@ mod tests {
             proxy: addr("127.0.0.1:8080"),
             browser: addr("127.0.0.1:8081"),
             bus: BusWord::Stdio,
+            operator_bus: OperatorBusWord::Dedicated(addr("127.0.0.1:50512")),
             web_url: None,
             operator_url: None,
             ca: Some(CaWord::Untrusted),
@@ -524,16 +608,16 @@ mod tests {
     #[test]
     fn scope_row_counts() {
         assert_eq!(
-            scope_row(0),
+            scope_row(0, true),
             (
                 "Nothing is decrypted until a host is in Scope.".to_string(),
                 fix("aitm scope add --host <host>")
             )
         );
-        assert_eq!(scope_row(0).0, NOTHING_DECRYPTED_ADVICE);
-        assert_eq!(scope_row(1), ("1 host in Scope".to_string(), None));
-        assert_eq!(scope_row(2), ("2 hosts in Scope".to_string(), None));
-        assert_eq!(scope_row(49), ("49 hosts in Scope".to_string(), None));
+        assert_eq!(scope_row(0, true).0, NOTHING_DECRYPTED_ADVICE);
+        assert_eq!(scope_row(1, true), ("1 host in Scope".to_string(), None));
+        assert_eq!(scope_row(2, true), ("2 hosts in Scope".to_string(), None));
+        assert_eq!(scope_row(49, true), ("49 hosts in Scope".to_string(), None));
     }
 
     #[test]
@@ -621,6 +705,7 @@ mod tests {
             card.rows,
             vec![
                 row("Bus", "stdio (MCP)", Role::Plain, None),
+                row("Operator bus", "127.0.0.1:50512", Role::Plain, None),
                 row(
                     "Scope",
                     NOTHING_DECRYPTED_ADVICE,
@@ -645,7 +730,7 @@ mod tests {
             home: None,
             ..i.clone()
         };
-        assert_eq!(ready_card(&piped).rows[4], row("Log", LOG, Role::Dim, None));
+        assert_eq!(ready_card(&piped).rows[5], row("Log", LOG, Role::Dim, None));
 
         // Trusted: the pill says so and the CA row is gone.
         let trusted = ReadyInputs {
@@ -659,7 +744,7 @@ mod tests {
         );
         assert_eq!(
             labels(&card.rows),
-            vec!["Bus", "Scope", "System proxy", "Log"]
+            vec!["Bus", "Operator bus", "Scope", "System proxy", "Log"]
         );
 
         // Unread: no word, no row (T7, an unread state never renders as
@@ -672,7 +757,7 @@ mod tests {
         assert_eq!(card.headline, "aitmproxy · listening 127.0.0.1:8080");
         assert_eq!(
             labels(&card.rows),
-            vec!["Bus", "Scope", "System proxy", "Log"]
+            vec!["Bus", "Operator bus", "Scope", "System proxy", "Log"]
         );
 
         // Two hosts in Scope: the count, no next step.
@@ -681,7 +766,7 @@ mod tests {
             ..i.clone()
         };
         assert_eq!(
-            ready_card(&scoped).rows[1],
+            ready_card(&scoped).rows[2],
             row("Scope", "2 hosts in Scope", Role::Plain, None)
         );
 
@@ -692,7 +777,7 @@ mod tests {
         };
         assert_eq!(
             labels(&ready_card(&no_log).rows),
-            vec!["Bus", "Scope", "CA", "System proxy"]
+            vec!["Bus", "Operator bus", "Scope", "CA", "System proxy"]
         );
 
         // The bus word is the Bus row's value in server mode.
@@ -752,6 +837,7 @@ mod tests {
             browser: addr("127.0.0.1:8081"),
             // The web card says `ready` whatever the bus transport is (T7).
             bus: BusWord::Loopback(8083),
+            operator_bus: OperatorBusWord::Dedicated(addr("127.0.0.1:50512")),
             web_url: Some(WEB_URL),
             operator_url: Some(OPERATOR_URL),
             ca: Some(CaWord::Trusted),
@@ -781,6 +867,7 @@ mod tests {
                     None
                 ),
                 row("Bus", "ready", Role::Plain, None),
+                row("Operator bus", "127.0.0.1:50512", Role::Plain, None),
                 row(
                     "Scope",
                     NOTHING_DECRYPTED_ADVICE,
@@ -824,6 +911,7 @@ mod tests {
                 "Proxy",
                 "Browser",
                 "Bus",
+                "Operator bus",
                 "Scope",
                 "System proxy",
                 "Log"
@@ -994,7 +1082,7 @@ mod tests {
                 );
                 assert_eq!(
                     labels(&card.rows),
-                    vec!["Bus", "Scope", "CA", "System proxy"],
+                    vec!["Bus", "Operator bus", "Scope", "CA", "System proxy"],
                     "{mode:?} {bus:?}"
                 );
             }
@@ -1155,7 +1243,15 @@ mod tests {
         };
         assert_eq!(
             labels(&ready_card(&i).rows),
-            vec!["Proxy", "Browser", "Bus", "Scope", "System proxy", "Log"]
+            vec![
+                "Proxy",
+                "Browser",
+                "Bus",
+                "Operator bus",
+                "Scope",
+                "System proxy",
+                "Log"
+            ]
         );
     }
 
@@ -1169,6 +1265,7 @@ mod tests {
             ready_card(&piped).render_plain(&RICH),
             concat!(
                 "Bus: stdio (MCP)\n",
+                "Operator bus: 127.0.0.1:50512\n",
                 "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>\n",
                 "CA: untrusted · aitm ca install\n",
                 "System proxy: off · aitm proxy system set\n",
@@ -1207,6 +1304,7 @@ mod tests {
                 "Proxy: 127.0.0.1:8080\n",
                 "Browser: 127.0.0.1:8081  (SSRF-filtered)\n",
                 "Bus: ready\n",
+                "Operator bus: 127.0.0.1:50512\n",
                 "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>\n",
                 "System proxy: points at this proxy\n",
                 "Log: /Users/matt/Library/Application Support/aitmproxy/logs/aitm.log\n",
@@ -1222,6 +1320,336 @@ mod tests {
                 left_alone: vec!["Wi-Fi".to_string()],
             }),
             Some("system proxy restored · 0 services".to_string())
+        );
+    }
+
+    // ---- R14 one-shot verbs on a running core (spec D5, D14; plan Task 9;
+    // AC-R14-1/2/5/6, the card half) ----
+
+    /// `Dedicated` is a plain `Operator bus` row carrying the address; `Off`
+    /// is `off · <reason>` painted as a warning; `Shared` has no row of its
+    /// own (its word rides on the `Bus` row instead, C16).
+    #[test]
+    fn operator_bus_row_dedicated_and_off() {
+        assert_eq!(
+            operator_bus_row(&OperatorBusWord::Dedicated(addr("127.0.0.1:50512"))),
+            Some(Row {
+                label: "Operator bus",
+                value: "127.0.0.1:50512".to_string(),
+                value_role: Role::Plain,
+                next: None,
+            })
+        );
+        assert_eq!(
+            operator_bus_row(&OperatorBusWord::Off(
+                "mcp.operator_bus.enabled: false".to_string()
+            )),
+            Some(row(
+                "Operator bus",
+                "off · mcp.operator_bus.enabled: false",
+                Role::Warning,
+                None
+            ))
+        );
+        assert_eq!(
+            operator_bus_row(&OperatorBusWord::Off(
+                "could not write mcp.operator_token to /tmp/cfg.yaml".to_string()
+            ))
+            .map(|r| r.value),
+            Some("off · could not write mcp.operator_token to /tmp/cfg.yaml".to_string())
+        );
+        assert_eq!(operator_bus_row(&OperatorBusWord::Shared), None);
+        assert_eq!(OPERATOR_BUS_LABEL, "Operator bus");
+        assert_eq!(OPERATOR_BUS_LABEL.len(), 12, "within T3's 14-column label");
+    }
+
+    /// AC-R14-6: the shared plan appends ` · operator` to the `Bus` value
+    /// (every `BusWord` form; `ready · operator` on the Web card); a
+    /// dedicated or off bus leaves the value exactly as W1 wrote it.
+    #[test]
+    fn bus_row_gets_the_operator_suffix_when_shared() {
+        let dedicated = OperatorBusWord::Dedicated(addr("127.0.0.1:50512"));
+        let off = OperatorBusWord::Off("mcp.operator_bus.enabled: false".to_string());
+        assert_eq!(
+            bus_row_value(
+                &BusWord::Loopback(9090),
+                ModeWord::Server,
+                &OperatorBusWord::Shared
+            ),
+            "loopback 127.0.0.1:9090 · operator"
+        );
+        assert_eq!(
+            bus_row_value(
+                &BusWord::Loopback(0),
+                ModeWord::Server,
+                &OperatorBusWord::Shared
+            ),
+            "loopback 127.0.0.1 (ephemeral port) · operator"
+        );
+        assert_eq!(
+            bus_row_value(&BusWord::Stdio, ModeWord::Server, &dedicated),
+            "stdio (MCP)"
+        );
+        assert_eq!(
+            bus_row_value(&BusWord::Stdio, ModeWord::Web, &OperatorBusWord::Shared),
+            "ready · operator"
+        );
+        assert_eq!(
+            bus_row_value(&BusWord::Loopback(9090), ModeWord::Web, &dedicated),
+            "ready"
+        );
+        assert_eq!(
+            bus_row_value(&BusWord::Stdio, ModeWord::Server, &off),
+            "stdio (MCP)"
+        );
+        assert_eq!(
+            bus_row_value(
+                &BusWord::Http(addr("127.0.0.1:8084")),
+                ModeWord::Tui,
+                &OperatorBusWord::Shared
+            ),
+            "http 127.0.0.1:8084 · operator"
+        );
+    }
+
+    /// D14 (AC-W1-6 re-pinned): the Scope next step is promised only when a
+    /// one-shot can reach this core as the operator; the counts are W1's.
+    #[test]
+    fn scope_row_promises_only_when_reachable() {
+        assert_eq!(
+            scope_row(0, true),
+            (
+                NOTHING_DECRYPTED_ADVICE.to_string(),
+                fix("aitm scope add --host <host>")
+            )
+        );
+        assert_eq!(
+            scope_row(0, false),
+            (NOTHING_DECRYPTED_ADVICE.to_string(), None)
+        );
+        assert_eq!(scope_row(2, true), ("2 hosts in Scope".to_string(), None));
+        assert_eq!(scope_row(2, false), ("2 hosts in Scope".to_string(), None));
+        assert_eq!(scope_row(1, false), ("1 host in Scope".to_string(), None));
+    }
+
+    /// AC-R14-1/5 piped: the `Operator bus` line sits directly after `Bus`;
+    /// with the bus off the row carries the reason and the Scope line has no
+    /// ` · aitm scope add` tail. AC-R14-6: the shared plan prints no
+    /// `Operator bus` line and the Scope promise stands.
+    #[test]
+    fn ready_card_plain_has_the_operator_bus_row_after_bus() {
+        let off_proxy = summary(State::Off);
+        let dedicated = ReadyInputs {
+            operator_bus: OperatorBusWord::Dedicated(addr("127.0.0.1:50512")),
+            ..m1_inputs(&off_proxy, None, None)
+        };
+        let plain = ready_card(&dedicated).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "Bus: stdio (MCP)",
+                "Operator bus: 127.0.0.1:50512",
+                "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>",
+            ]
+        );
+
+        let off = ReadyInputs {
+            operator_bus: OperatorBusWord::Off("mcp.operator_bus.enabled: false".to_string()),
+            ..m1_inputs(&off_proxy, None, None)
+        };
+        let plain = ready_card(&off).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "Bus: stdio (MCP)",
+                "Operator bus: off · mcp.operator_bus.enabled: false",
+                "Scope: Nothing is decrypted until a host is in Scope.",
+            ]
+        );
+        assert!(!plain.contains("aitm scope add"), "{plain:?}");
+
+        let shared = ReadyInputs {
+            bus: BusWord::Loopback(9090),
+            operator_bus: OperatorBusWord::Shared,
+            ..m1_inputs(&off_proxy, None, None)
+        };
+        let plain = ready_card(&shared).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..2],
+            [
+                "Bus: loopback 127.0.0.1:9090 · operator",
+                "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>",
+            ]
+        );
+        assert!(!plain.contains("Operator bus"), "{plain:?}");
+
+        // The Web card on the shared plan: `ready · operator`, still no
+        // `Operator bus` line.
+        let web_shared = ReadyInputs {
+            mode: ModeWord::Web,
+            web_url: Some(WEB_URL),
+            ..shared.clone()
+        };
+        let plain = ready_card(&web_shared).render_plain(&RICH);
+        assert!(plain.contains("Bus: ready · operator\n"), "{plain:?}");
+        assert!(!plain.contains("Operator bus"), "{plain:?}");
+    }
+
+    /// AC-R14-1 (TTY): the 12-character label pads to T3's 14-column field,
+    /// so the value starts at column 17 like every other row; the `off`
+    /// value renders with its reason and the Scope row below it has no fix
+    /// line (AC-R14-5).
+    #[test]
+    fn ready_card_rich_pads_the_operator_bus_label() {
+        let off_proxy = summary(State::Off);
+        let i = ReadyInputs {
+            operator_bus: OperatorBusWord::Dedicated(addr("127.0.0.1:50512")),
+            ..m1_inputs(&off_proxy, None, None)
+        };
+        let rich = ready_card(&i).render_rich(&tty_no_color(), &RICH);
+        assert_eq!(rich.lines().nth(1), Some("  Bus           stdio (MCP)"));
+        assert_eq!(rich.lines().nth(2), Some("  Operator bus  127.0.0.1:50512"));
+
+        let off = ReadyInputs {
+            operator_bus: OperatorBusWord::Off("mcp.operator_bus.enabled: false".to_string()),
+            ..i.clone()
+        };
+        let rich = ready_card(&off).render_rich(&tty_no_color(), &RICH);
+        assert_eq!(
+            rich.lines().nth(2),
+            Some("  Operator bus  off · mcp.operator_bus.enabled: false")
+        );
+        assert_eq!(
+            rich.lines().nth(3),
+            Some("  Scope         Nothing is decrypted until a host is in Scope.")
+        );
+        assert_eq!(rich.lines().nth(4), Some("  CA            untrusted"));
+    }
+
+    // ---- tester additions (stage 5, R14 pass 1) ----
+
+    /// Tester — AC-R14-2/5 on the Web and TUI cards (D5 says every surface):
+    /// the `Operator bus` row follows `Bus` on both; `Off` carries the reason
+    /// as a warning and drops the Scope next step on both; the Web card on
+    /// the shared plan says `Bus: ready · operator` and nothing else moves;
+    /// the rich Web card pads the label like every other row.
+    #[test]
+    fn tester_web_and_tui_cards_carry_the_operator_bus_row() {
+        let off_proxy = summary(State::Off);
+        let base = m1_inputs(&off_proxy, None, None);
+
+        let web_off = ReadyInputs {
+            mode: ModeWord::Web,
+            web_url: Some(WEB_URL),
+            operator_bus: OperatorBusWord::Off("no mcp.operator_token".to_string()),
+            ..base.clone()
+        };
+        let card = ready_card(&web_off);
+        assert_eq!(
+            labels(&card.rows),
+            vec![
+                "Web UI",
+                "Proxy",
+                "Browser",
+                "Bus",
+                "Operator bus",
+                "Scope",
+                "CA",
+                "System proxy"
+            ]
+        );
+        assert_eq!(
+            card.rows[4],
+            row(
+                "Operator bus",
+                "off · no mcp.operator_token",
+                Role::Warning,
+                None
+            )
+        );
+        let plain = card.render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(lines[3], "Bus: ready");
+        assert_eq!(lines[4], "Operator bus: off · no mcp.operator_token");
+        assert_eq!(
+            lines[5],
+            "Scope: Nothing is decrypted until a host is in Scope."
+        );
+        assert!(!plain.contains("aitm scope add"), "{plain:?}");
+        let rich = card.render_rich(&tty_no_color(), &RICH);
+        assert!(
+            rich.contains("\n  Bus           ready\n  Operator bus  off · no mcp.operator_token\n  Scope         Nothing is decrypted until a host is in Scope.\n"),
+            "{rich:?}"
+        );
+
+        let tui_dedicated = ReadyInputs {
+            mode: ModeWord::Tui,
+            operator_bus: OperatorBusWord::Dedicated(addr("127.0.0.1:50512")),
+            ..base.clone()
+        };
+        let plain = ready_card(&tui_dedicated).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "Bus: stdio (MCP)",
+                "Operator bus: 127.0.0.1:50512",
+                "Scope: Nothing is decrypted until a host is in Scope. · aitm scope add --host <host>",
+            ]
+        );
+
+        let tui_off = ReadyInputs {
+            mode: ModeWord::Tui,
+            operator_bus: OperatorBusWord::Off("mcp.operator_bus.enabled: false".to_string()),
+            ..base.clone()
+        };
+        let plain = ready_card(&tui_off).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "Bus: stdio (MCP)",
+                "Operator bus: off · mcp.operator_bus.enabled: false",
+                "Scope: Nothing is decrypted until a host is in Scope.",
+            ]
+        );
+
+        // Scope non-empty with the bus off: the count, no next step, the
+        // reason still on its own row.
+        let tui_off_scoped = ReadyInputs {
+            scope_hosts: 3,
+            ..tui_off.clone()
+        };
+        let plain = ready_card(&tui_off_scoped).render_plain(&RICH);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(lines[2], "Scope: 3 hosts in Scope");
+        assert!(!plain.contains("aitm scope add"), "{plain:?}");
+    }
+
+    /// Tester — the `off` reason is printed as given, in full: the long
+    /// mint-failure form with a path containing a space stays on the row
+    /// unshortened in the plain render (panels and cards never shorten a
+    /// path they were given in a reason).
+    #[test]
+    fn tester_off_reason_prints_in_full() {
+        let reason =
+            "could not write mcp.operator_token to /Users/matt/Library/Application Support/aitmproxy/config.yaml";
+        let row = operator_bus_row(&OperatorBusWord::Off(reason.to_string())).expect("a row");
+        assert_eq!(row.value, format!("off · {reason}"));
+        assert_eq!(row.value_role, Role::Warning);
+        assert_eq!(row.next, None);
+        let off_proxy = summary(State::Off);
+        let i = ReadyInputs {
+            operator_bus: OperatorBusWord::Off(reason.to_string()),
+            ..m1_inputs(&off_proxy, None, None)
+        };
+        let plain = ready_card(&i).render_plain(&RICH);
+        assert!(
+            plain.contains(&format!("Operator bus: off · {reason}\n")),
+            "{plain:?}"
         );
     }
 }

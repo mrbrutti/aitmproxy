@@ -469,12 +469,14 @@ fn is_flag(tok: &str) -> bool {
 /// most once, every required param present. Every error names the spaced
 /// command, ends its causes with the command's `Usage:` line and points at
 /// the verb's help (plan C35, C37).
-// Same contract as `locate`: one `ErrorReport` per failed invocation.
+// Same contract as `locate`: one `ErrorReport` per failed invocation. `pub` for
+// the one-shot's remote path (R14), which parses a live verb's flags against the
+// local schema before dialing.
 #[expect(
     clippy::result_large_err,
     reason = "the plan pins the ErrorReport return (C35)"
 )]
-fn parse_flags(tokens: &[String], cmd: &dyn Command) -> Result<Params, ErrorReport> {
+pub fn parse_flags(tokens: &[String], cmd: &dyn Command) -> Result<Params, ErrorReport> {
     let schema = cmd.schema();
     let name = spaced(cmd.name());
     let usage_error = |what: String, mut why: Vec<String>| {

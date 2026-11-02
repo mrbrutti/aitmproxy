@@ -15,16 +15,32 @@ use aitm_core::Frontend;
 use anyhow::Context as _;
 use serde_json::Value as JsonValue;
 use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take,
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    Take,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::task::JoinError;
 
+use crate::pointer;
 use crate::server::{error_response, ConnCtx, McpServer, NotificationSink, UNAUTHORIZED};
 
 /// Longest single message (one line) a transport accepts. Longer lines end the
 /// connection instead of growing a buffer without bound.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long a fresh loopback connection has to send its token line before
+/// the listener closes it (security S1). The operator bus is on by default
+/// (spec D2), so a same-user process that connects and says nothing must not
+/// hold a task and a socket for ever; ten seconds is generous for a client
+/// that means to speak and short for one that does not. Overridable per
+/// listener with [`LoopbackTcp::with_token_line_timeout`].
+pub const TOKEN_LINE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`LoopbackTcp::serve`] pauses after every `accept()` error
+/// before accepting again (see [`accept_failed`]), so a core out of file
+/// descriptors, buffers or memory logs at a walking pace instead of
+/// spinning.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Serve newline-delimited JSON-RPC on one connection: each line in is one
 /// message, each reply out is one line. Returns at EOF, at a read error, or when
@@ -270,15 +286,23 @@ pub async fn serve_stdio(server: Arc<McpServer>) -> anyhow::Result<()> {
 /// A loopback-only (127.0.0.1) listener. Every connection must send, as its
 /// first line, a JSON object `{"token": "<token>"}` matching a configured token;
 /// anything else is answered with one `unauthorized` error and closed. The token
-/// class picks the connection's role: the required `agent_token` →
+/// class picks the connection's role: the `agent_token` (required by
+/// [`LoopbackTcp::bind`], absent on [`LoopbackTcp::bind_operator_only`]) →
 /// [`Frontend::Mcp`], the optional `operator_token` → [`Frontend::Operator`].
 pub struct LoopbackTcp {
     listener: TcpListener,
     local_addr: SocketAddr,
-    agent_token: Arc<str>,
+    agent_token: Option<Arc<str>>,
     operator_token: Option<Arc<str>>,
     /// A rendezvous file to remove on drop; see [`LoopbackTcp::bind`].
     endpoint_file: Option<PathBuf>,
+    /// The core pointer this listener published (spec D4), if a process
+    /// context was published; see [`LoopbackTcp::publish_pointer`]. The handle
+    /// holds the pointer's advisory lock and removes the file when it drops.
+    pointer: Option<pointer::Published>,
+    /// How long a connection has to send its token line; [`TOKEN_LINE_TIMEOUT`]
+    /// unless [`LoopbackTcp::with_token_line_timeout`] said otherwise.
+    token_line_timeout: Duration,
 }
 
 impl LoopbackTcp {
@@ -308,9 +332,34 @@ impl LoopbackTcp {
         Ok(Self {
             listener,
             local_addr,
-            agent_token: token.into(),
+            agent_token: Some(token.into()),
             operator_token: None,
             endpoint_file,
+            pointer: None,
+            token_line_timeout: TOKEN_LINE_TIMEOUT,
+        })
+    }
+
+    /// Bind `127.0.0.1:port` (`0` picks a free port) as the dedicated operator
+    /// bus (spec D2): no agent token, so only `operator_token` (which must be
+    /// non-empty) admits a connection, always as [`Frontend::Operator`]. No
+    /// endpoint file; the core pointer ([`LoopbackTcp::publish_pointer`]) is
+    /// how a one-shot finds this listener.
+    pub async fn bind_operator_only(port: u16, operator_token: String) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !operator_token.is_empty(),
+            "the operator bus requires a non-empty operator token"
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+        let local_addr = listener.local_addr()?;
+        Ok(Self {
+            listener,
+            local_addr,
+            agent_token: None,
+            operator_token: Some(operator_token.into()),
+            endpoint_file: None,
+            pointer: None,
+            token_line_timeout: TOKEN_LINE_TIMEOUT,
         })
     }
 
@@ -321,15 +370,44 @@ impl LoopbackTcp {
         self
     }
 
+    /// Give each connection `limit` instead of [`TOKEN_LINE_TIMEOUT`] to send
+    /// its token line (security S1); a test's way to see the close without
+    /// waiting ten seconds.
+    pub fn with_token_line_timeout(mut self, limit: Duration) -> Self {
+        self.token_line_timeout = limit;
+        self
+    }
+
     /// The bound address (useful after binding port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Accept connections forever, serving each on its own task.
+    /// Publish this listener's core pointer (spec D4): `<run dir>/<pid>.json`
+    /// naming the bound address and whether an operator token is accepted,
+    /// written only when a process context was published
+    /// ([`pointer::publish`]); otherwise nothing is written. Called once by
+    /// [`McpServer::serve_on`] when the listener starts serving. The pointer
+    /// lives as long as this listener and is removed when it drops.
+    pub fn publish_pointer(&mut self) {
+        self.pointer = pointer::publish_pointer(self.local_addr, self.operator_token.is_some());
+    }
+
+    /// Accept connections forever, serving each on its own task. An `accept()`
+    /// error is logged at `warn!` and the loop goes on (security S1): the
+    /// default-on operator bus must not end quietly on the first `EMFILE`,
+    /// which a neighbour that opens connections and holds them can provoke;
+    /// every error pauses [`ACCEPT_ERROR_BACKOFF`] first so none can spin
+    /// it (security S7).
     pub async fn serve(self, server: Arc<McpServer>) -> anyhow::Result<()> {
         loop {
-            let (stream, peer) = self.listener.accept().await?;
+            let (stream, peer) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    accept_failed(&err).await;
+                    continue;
+                }
+            };
             // The bind is loopback-only already; this is belt and braces.
             if !peer.ip().is_loopback() {
                 continue;
@@ -337,11 +415,22 @@ impl LoopbackTcp {
             let srv = server.clone();
             let agent = self.agent_token.clone();
             let operator = self.operator_token.clone();
+            let token_line_timeout = self.token_line_timeout;
             tokio::spawn(async move {
                 // A failed connection is that client's problem, not the server's:
                 // it is logged at debug (never with a token; the errors carry none)
                 // and the listener goes on accepting.
-                if let Err(err) = serve_connection(srv, stream, &agent, operator.as_deref()).await {
+                let (read_half, write_half) = stream.into_split();
+                if let Err(err) = serve_connection(
+                    srv,
+                    read_half,
+                    write_half,
+                    agent.as_deref(),
+                    operator.as_deref(),
+                    token_line_timeout,
+                )
+                .await
+                {
                     tracing::debug!(
                         error = %format_args!("{err:#}"),
                         "bus connection ended with an error"
@@ -354,7 +443,9 @@ impl LoopbackTcp {
 
 impl Drop for LoopbackTcp {
     /// Remove the rendezvous file, if any, so a bound address never outlives the
-    /// listener. Idempotent — a missing file is fine.
+    /// listener. Idempotent — a missing file is fine. The core pointer, if one
+    /// was published, is removed by its own [`pointer::Published`] handle when
+    /// the `pointer` field drops right after this.
     fn drop(&mut self) {
         if let Some(path) = &self.endpoint_file {
             remove_endpoint_file(path);
@@ -389,6 +480,22 @@ fn write_endpoint_file(path: &Path, addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What [`LoopbackTcp::serve`] does with an `accept()` error (security S1,
+/// S7): logs it at `warn!` and pauses [`ACCEPT_ERROR_BACKOFF`] before the
+/// next `accept()`. Every error pauses and none is inspected: a persistent
+/// one (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) recurs the instant it is
+/// retried and would otherwise spin a core at full CPU, logging as fast as
+/// it loops, while a per-connection one (`ECONNABORTED`, `EINTR`, a reset)
+/// loses nothing to 100 ms; so no class of error can be missed. (tokio's
+/// `accept()` never surfaces `WouldBlock`.)
+async fn accept_failed(err: &io::Error) {
+    tracing::warn!(
+        error = %err,
+        "the bus listener could not accept a connection; still listening"
+    );
+    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+}
+
 /// Remove the rendezvous file; a missing one is fine (idempotent).
 fn remove_endpoint_file(path: &Path) {
     match std::fs::remove_file(path) {
@@ -400,16 +507,35 @@ fn remove_endpoint_file(path: &Path) {
     }
 }
 
-async fn serve_connection(
+/// Serve one accepted connection: the token line first, within
+/// `token_line_timeout` (security S1), then [`serve_lines`] as the role the
+/// token names. A connection that sends no line in time is closed with one
+/// content-free `debug!`; the partial line is never logged, since it may be
+/// a token or part of one.
+async fn serve_connection<R, W>(
     server: Arc<McpServer>,
-    stream: TcpStream,
-    agent_token: &str,
+    read_half: R,
+    mut write_half: W,
+    agent_token: Option<&str>,
     operator_token: Option<&str>,
-) -> anyhow::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+    token_line_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(read_half).take(MAX_MESSAGE_BYTES as u64);
     let mut first = String::new();
-    if !read_message(&mut reader, &mut first).await? {
+    let Ok(read) =
+        tokio::time::timeout(token_line_timeout, read_message(&mut reader, &mut first)).await
+    else {
+        tracing::debug!(
+            limit_secs = token_line_timeout.as_secs_f64(),
+            "closing a bus connection that sent no token line within the limit"
+        );
+        return Ok(());
+    };
+    if !read? {
         return Ok(());
     }
     let Some(role) = classify_token(&first, agent_token, operator_token) else {
@@ -423,13 +549,13 @@ async fn serve_connection(
 }
 
 /// Classify `line` (`{"token": "<t>"}`) by token class: the operator token (if
-/// configured) wins and yields [`Frontend::Operator`], the agent token yields
-/// [`Frontend::Mcp`], and anything else (malformed, or an unknown token) is
-/// `None` — the caller refuses it `-32001`. Tokens are compared in constant time.
-/// The object must carry exactly the `token` key (extra keys are rejected,
-/// matching the web bridge's `token_line_matches`), so nothing can ride along
-/// with the auth line.
-fn classify_token(line: &str, agent: &str, operator: Option<&str>) -> Option<Frontend> {
+/// configured) wins and yields [`Frontend::Operator`], the agent token (if
+/// configured) yields [`Frontend::Mcp`], and anything else (malformed, an
+/// unknown token, or a class this listener has no token for) is `None` — the
+/// caller refuses it `-32001`. Tokens are compared in constant time. The object
+/// must carry exactly the `token` key (extra keys are rejected, matching the web
+/// bridge's `token_line_matches`), so nothing can ride along with the auth line.
+fn classify_token(line: &str, agent: Option<&str>, operator: Option<&str>) -> Option<Frontend> {
     let Ok(JsonValue::Object(obj)) = serde_json::from_str::<JsonValue>(line.trim()) else {
         return None;
     };
@@ -444,6 +570,7 @@ fn classify_token(line: &str, agent: &str, operator: Option<&str>) -> Option<Fro
             return Some(Frontend::Operator);
         }
     }
+    let agent = agent?;
     token_matches(given, agent).then_some(Frontend::Mcp)
 }
 
@@ -478,12 +605,14 @@ async fn read_message<R: AsyncBufRead + Unpin>(
 mod tests {
     use super::*;
 
+    use std::net::IpAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     use aitm_core::{McpTransport, Registry};
     use serde_json::json;
     use tokio::io::{duplex, split, DuplexStream, Lines, ReadHalf, WriteHalf};
-    use tokio::net::TcpSocket;
+    use tokio::net::{TcpSocket, TcpStream};
     use tokio::task::JoinHandle;
 
     /// A unique temp path for one test, cleaned up by the test itself.
@@ -539,6 +668,284 @@ mod tests {
         drop(listener);
     }
 
+    /// A bare server for the operator-only listener tests: no commands, no
+    /// store; `initialize` needs neither.
+    fn bare_server() -> Arc<McpServer> {
+        Arc::new(McpServer::new(
+            Arc::new(Registry::new()),
+            McpTransport::Stdio,
+        ))
+    }
+
+    /// Spec D2 (`bind_operator_only`): an empty operator token is refused
+    /// before anything binds.
+    #[tokio::test]
+    async fn bind_operator_only_refuses_an_empty_token() {
+        let err = LoopbackTcp::bind_operator_only(0, String::new())
+            .await
+            .err()
+            .expect("an empty operator token is an error");
+        assert_eq!(
+            err.to_string(),
+            "the operator bus requires a non-empty operator token"
+        );
+    }
+
+    /// AC-R14-8 (socket, Terminal): `bind_operator_only` binds `127.0.0.1`; a
+    /// connection presenting the operator token is served as `role: "operator"`
+    /// and one presenting any other string gets `-32001` and a closed socket.
+    #[tokio::test]
+    async fn bind_operator_only_binds_loopback_and_refuses_other_tokens() {
+        let listener = LoopbackTcp::bind_operator_only(0, "op".into())
+            .await
+            .expect("bind 127.0.0.1:0 as an operator-only listener");
+        let addr = listener.local_addr();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(addr.port(), 0, "an ephemeral port was resolved");
+        let serving = tokio::spawn(listener.serve(bare_server()));
+        let initialize = initialize_with_name("aitm-cli");
+
+        // What would be the agent token on a shared transport is nobody here:
+        // one refusal line, then the socket is closed.
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(format!("{{\"token\":\"ag\"}}\n{initialize}\n").as_bytes())
+            .await
+            .expect("send the token line and a request");
+        let mut reply = String::new();
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read the refusal line");
+        assert!(
+            reply.contains("\"code\":-32001"),
+            "refused with -32001: {reply:?}"
+        );
+        let mut rest = String::new();
+        let closed = match reader.read_line(&mut rest).await {
+            Ok(n) => n == 0,
+            Err(err) => err.kind() == io::ErrorKind::ConnectionReset,
+        };
+        assert!(closed, "the socket is closed after the refusal: {rest:?}");
+
+        // The operator token is served as the operator role.
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(format!("{{\"token\":\"op\"}}\n{initialize}\n").as_bytes())
+            .await
+            .expect("send the operator token and initialize");
+        let mut reply = String::new();
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read the initialize reply");
+        assert!(
+            reply.contains("\"role\":\"operator\""),
+            "served as the operator: {reply:?}"
+        );
+
+        serving.abort();
+    }
+
+    /// AC-R14-12 (socket, Terminal): a test binary publishes no pointer context,
+    /// so `publish_pointer` on a bound listener writes nothing and holds no
+    /// pointer; dropping the listener then touches no run dir.
+    #[tokio::test]
+    async fn serving_without_a_context_writes_no_pointer() {
+        assert!(
+            pointer::context().is_none(),
+            "the unit binary never publishes a context"
+        );
+        let mut listener = LoopbackTcp::bind_operator_only(0, "op".into())
+            .await
+            .expect("bind 127.0.0.1:0 as an operator-only listener");
+        listener.publish_pointer();
+        assert!(
+            listener.pointer.is_none(),
+            "no context, so no pointer was written"
+        );
+        drop(listener);
+    }
+
+    // ---- S1 (security pass 1): the default-on bus against a silent or
+    // ---- flooding same-user neighbour.
+
+    /// S1(b), security S7 / quality Q15: every `accept()` error pauses the
+    /// listener 100 ms, the per-connection ones (`ECONNABORTED`, `EINTR`, a
+    /// reset) as much as the persistent ones (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`), so no class of error can spin it. `WouldBlock` is no
+    /// case: tokio's `accept()` never surfaces it. Real time, lower bound
+    /// only: a sleep never ends early, and an upper bound would flake under
+    /// load.
+    #[tokio::test]
+    async fn every_accept_error_pauses_the_listener() {
+        // `ENOBUFS` differs per platform; `ENFILE`/`EMFILE` do not. The errnos
+        // are named for the reader: `accept_failed` reads none of them.
+        #[cfg(target_os = "linux")]
+        const ENOBUFS: i32 = 105;
+        #[cfg(not(target_os = "linux"))]
+        const ENOBUFS: i32 = 55;
+        for (label, err) in [
+            ("ENFILE", io::Error::from_raw_os_error(23)),
+            ("EMFILE", io::Error::from_raw_os_error(24)),
+            ("ENOBUFS", io::Error::from_raw_os_error(ENOBUFS)),
+            ("ENOMEM", io::Error::from(io::ErrorKind::OutOfMemory)),
+            (
+                "ECONNABORTED",
+                io::Error::from(io::ErrorKind::ConnectionAborted),
+            ),
+            ("EINTR", io::Error::from(io::ErrorKind::Interrupted)),
+            (
+                "ECONNRESET",
+                io::Error::from(io::ErrorKind::ConnectionReset),
+            ),
+            ("anything else", io::Error::other("anything else")),
+        ] {
+            let before = Instant::now();
+            accept_failed(&err).await;
+            let paused = before.elapsed();
+            assert!(
+                paused >= Duration::from_millis(100),
+                "{label}: the listener paused only {paused:?}"
+            );
+        }
+    }
+
+    /// S1(a): a connection that sends no token line within the limit is
+    /// closed quietly: the server side ends `Ok(())`, the client reads EOF
+    /// and not one byte before it. In-process over a duplex pipe with a
+    /// 200 ms limit; the production limit is `TOKEN_LINE_TIMEOUT`, 10 s.
+    #[tokio::test]
+    async fn a_connection_that_sends_no_token_line_in_time_is_closed() {
+        assert_eq!(TOKEN_LINE_TIMEOUT, Duration::from_secs(10));
+        let (server_side, client_side) = duplex(4096);
+        let (server_read, server_write) = split(server_side);
+        let (mut client_read, client_write) = split(client_side);
+        let started = Instant::now();
+        let serving = tokio::spawn(serve_connection(
+            bare_server(),
+            server_read,
+            server_write,
+            None,
+            Some("op"),
+            Duration::from_millis(200),
+        ));
+
+        // The client keeps its write half open and says nothing.
+        let mut got = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), client_read.read_to_end(&mut got))
+            .await
+            .expect("the server closes the connection within 5 s")
+            .expect("read to EOF");
+        assert_eq!(n, 0, "nothing is written before the close: {got:?}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "closed no earlier than the limit: {:?}",
+            started.elapsed()
+        );
+        let outcome = serving.await.expect("the connection task did not panic");
+        assert!(
+            outcome.is_ok(),
+            "the expiry is a quiet close, not an error: {outcome:?}"
+        );
+        drop(client_write);
+    }
+
+    /// S1(a): the limit is on the token line only. A client that sends it
+    /// within the limit is served (here as the operator) for as long as it
+    /// likes afterwards, well past the limit.
+    #[tokio::test]
+    async fn a_token_line_within_the_limit_is_served_past_it() {
+        let (server_side, client_side) = duplex(4096);
+        let (server_read, server_write) = split(server_side);
+        let (client_read, mut client_write) = split(client_side);
+        let serving = tokio::spawn(serve_connection(
+            bare_server(),
+            server_read,
+            server_write,
+            None,
+            Some("op"),
+            Duration::from_millis(200),
+        ));
+        let mut reader = BufReader::new(client_read);
+        client_write
+            .write_all(b"{\"token\":\"op\"}\n")
+            .await
+            .expect("send the token line in time");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let initialize = initialize_with_name("aitm-cli");
+        client_write
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .expect("send initialize after the limit");
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .expect("read the initialize reply");
+        assert!(
+            reply.contains("\"role\":\"operator\""),
+            "served as the operator after the limit: {reply:?}"
+        );
+
+        // A split duplex closes on `shutdown`, not on dropping one half.
+        client_write.shutdown().await.expect("client EOF");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the connection ends at client EOF")
+            .expect("the connection task did not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// S1(a) (socket, Terminal): through the served listener, a connection
+    /// that sends nothing is closed once the listener's token-line limit
+    /// (200 ms here, `with_token_line_timeout`) expires, and the listener
+    /// goes on serving: a second connection that sends the operator token is
+    /// answered as the operator.
+    #[tokio::test]
+    async fn served_listener_closes_a_silent_connection_after_the_token_line_limit() {
+        let listener = LoopbackTcp::bind_operator_only(0, "op".into())
+            .await
+            .expect("bind 127.0.0.1:0 as an operator-only listener")
+            .with_token_line_timeout(Duration::from_millis(200));
+        let addr = listener.local_addr();
+        let serving = tokio::spawn(listener.serve(bare_server()));
+
+        let silent = TcpStream::connect(addr).await.expect("connect");
+        let (mut silent_read, silent_write) = silent.into_split();
+        let mut got = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), silent_read.read_to_end(&mut got))
+            .await
+            .expect("the silent connection is closed within 5 s")
+            .expect("read to EOF");
+        assert_eq!(n, 0, "nothing is written to a silent client: {got:?}");
+        drop(silent_write);
+
+        let stream = TcpStream::connect(addr).await.expect("connect again");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let initialize = initialize_with_name("aitm-cli");
+        write_half
+            .write_all(format!("{{\"token\":\"op\"}}\n{initialize}\n").as_bytes())
+            .await
+            .expect("send the operator token and initialize");
+        let mut reply = String::new();
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read the initialize reply");
+        assert!(
+            reply.contains("\"role\":\"operator\""),
+            "the listener still serves after closing a silent connection: {reply:?}"
+        );
+        serving.abort();
+    }
+
     /// An `initialize` request whose `clientInfo.name` is `name`.
     fn initialize_with_name(name: &str) -> String {
         serde_json::json!({
@@ -592,29 +999,32 @@ mod tests {
     fn classify_token_shapes() {
         // Agent-only: a match is the agent role, anything else is refused.
         assert_eq!(
-            classify_token(r#"{"token":"t"}"#, "t", None),
+            classify_token(r#"{"token":"t"}"#, Some("t"), None),
             Some(Frontend::Mcp)
         );
         assert_eq!(
-            classify_token("  {\"token\":\"t\"}\r\n", "t", None),
+            classify_token("  {\"token\":\"t\"}\r\n", Some("t"), None),
             Some(Frontend::Mcp)
         );
-        assert_eq!(classify_token(r#"{"token":"x"}"#, "t", None), None);
-        assert_eq!(classify_token(r#"{"tok":"t"}"#, "t", None), None);
-        assert_eq!(classify_token(r#"{"token":1}"#, "t", None), None);
+        assert_eq!(classify_token(r#"{"token":"x"}"#, Some("t"), None), None);
+        assert_eq!(classify_token(r#"{"tok":"t"}"#, Some("t"), None), None);
+        assert_eq!(classify_token(r#"{"token":1}"#, Some("t"), None), None);
         // Minor (b): exactly one key — a correct token can't smuggle extra keys.
-        assert_eq!(classify_token(r#"{"token":"t","x":1}"#, "t", None), None);
         assert_eq!(
-            classify_token(r#"{"token":"t","token2":"t"}"#, "t", None),
+            classify_token(r#"{"token":"t","x":1}"#, Some("t"), None),
             None
         );
-        assert_eq!(classify_token(r#"{}"#, "t", None), None);
-        assert_eq!(classify_token(r#"["t"]"#, "t", None), None);
-        assert_eq!(classify_token("t", "t", None), None);
+        assert_eq!(
+            classify_token(r#"{"token":"t","token2":"t"}"#, Some("t"), None),
+            None
+        );
+        assert_eq!(classify_token(r#"{}"#, Some("t"), None), None);
+        assert_eq!(classify_token(r#"["t"]"#, Some("t"), None), None);
+        assert_eq!(classify_token("t", Some("t"), None), None);
         assert_eq!(
             classify_token(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                "t",
+                Some("t"),
                 None
             ),
             None
@@ -625,14 +1035,35 @@ mod tests {
     fn classify_token_by_class() {
         // Operator token wins when it matches; the agent token is the fallback.
         assert_eq!(
-            classify_token(r#"{"token":"op"}"#, "ag", Some("op")),
+            classify_token(r#"{"token":"op"}"#, Some("ag"), Some("op")),
             Some(Frontend::Operator)
         );
         assert_eq!(
-            classify_token(r#"{"token":"ag"}"#, "ag", Some("op")),
+            classify_token(r#"{"token":"ag"}"#, Some("ag"), Some("op")),
             Some(Frontend::Mcp)
         );
-        assert_eq!(classify_token(r#"{"token":"no"}"#, "ag", Some("op")), None);
+        assert_eq!(
+            classify_token(r#"{"token":"no"}"#, Some("ag"), Some("op")),
+            None
+        );
+    }
+
+    /// Spec D2, AC-R14-8: an operator-only listener has no agent token, so only
+    /// the operator token admits a connection; when an agent token exists it
+    /// still yields the agent role.
+    #[test]
+    fn classify_token_without_an_agent_token_admits_only_the_operator() {
+        assert_eq!(
+            classify_token(r#"{"token":"op"}"#, None, Some("op")),
+            Some(Frontend::Operator)
+        );
+        assert_eq!(classify_token(r#"{"token":"ag"}"#, None, Some("op")), None);
+        assert_eq!(
+            classify_token(r#"{"token":"ag"}"#, Some("ag"), Some("op")),
+            Some(Frontend::Mcp)
+        );
+        // A listener with no token of either class admits nobody.
+        assert_eq!(classify_token(r#"{"token":""}"#, None, None), None);
     }
 
     /// A bare server (no commands, no store: `flow.subscribe` needs neither)

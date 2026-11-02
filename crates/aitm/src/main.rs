@@ -4,11 +4,13 @@
 //! Config comes from `--config <path>` (a leading flag stripped before CLI
 //! dispatch), else `AITM_CONFIG`, else the default path (spec §D10); the env
 //! bridge (`aitm::env`) is applied on top. Invoked with a subcommand (`aitm flow
-//! list`, `aitm scope add --host ex.test`) it dispatches once over the CLI
-//! frontend, prints via `render_cli_value`, and exits. Invoked bare it starts
-//! the proxy accept loop and the MCP server (stdio or loopback-TCP per config),
-//! with the configured browser engine attached when it launches, and closes
-//! the browser on every orderly exit path including SIGINT/SIGTERM (spec §D6).
+//! list`, `aitm scope add --host ex.test`) it hands the verb to
+//! `aitm::oneshot::run` — a local verb runs in-process, a live one on the
+//! running core (R14 spec D6/D8) — writes the rendered bytes to stdout, and
+//! exits. Invoked bare it starts the proxy accept loop and the MCP server
+//! (stdio or loopback-TCP per config), with the configured browser engine
+//! attached when it launches, and closes the browser on every orderly exit
+//! path including SIGINT/SIGTERM (spec §D6).
 //! Invoked as `aitm tui` it does the same but with the terminal operator UI in
 //! the process too, over an in-process bus channel (`aitm::tui`).
 //! `aitm web [--listen ADDR] [--token TOKEN] [--no-open]` is the server path
@@ -31,7 +33,9 @@ use aitm::help::pages;
 use aitm::help::request::{self as help_request, HelpRequest};
 use aitm::macos_capture::feeder;
 use aitm::macos_capture::peer_auth::CodeSignatureVerifier;
-use aitm::render::render_cli_value;
+use aitm::oneshot::{self, args::BusArgs, run::OneShotError};
+use aitm::operator_bus;
+use aitm::operator_token::{self, Minted};
 use aitm::scripts::LateHandles;
 use aitm::startup::card::{ModeWord, ReadyInputs};
 use aitm::startup::errors::{exit_with, report_for, StartupError};
@@ -43,11 +47,13 @@ use aitm::wire::{
     assemble_with_scripts, build_capture_session, self_port_hook, should_request_at_start,
     Assembled, Features, ScriptWiring,
 };
-use aitm::{audit_log, config_file, env, operator_token, tui, PromptHold};
+use aitm::{audit_log, config_file, env, tui, PromptHold};
+use aitm_cli::{Confirmer, TtyConfirmer};
 use aitm_core::{
     engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin, NOTHING_DECRYPTED_ADVICE,
 };
 use aitm_findings::FindingsPlugin;
+use aitm_mcp::pointer::{self, PointerContext};
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_plugin_scanner::jobs::ScanServices;
 use aitm_proto_l4::privilege::linux::HoldCount;
@@ -244,6 +250,30 @@ where
     Ok((bound, recovery))
 }
 
+/// Run one fallible `step` after the system-proxy auto-set: when it fails in
+/// a serving mode, give the OS its proxy back (`on_orderly_exit`, the §D9 (a)
+/// restore the early return would otherwise skip) and hand the error on
+/// unchanged, so its panel is still exact. Security S8 (R14): the operator
+/// bus binds after the auto-set so a fixed-port conflict is the M2 panel.
+async fn or_restore_system_proxy<T, F>(
+    mode: &Mode,
+    sysproxy: &SystemProxy,
+    step: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match step.await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if manages_system_proxy(mode) {
+                log_recovery("exit", &sysproxy.on_orderly_exit());
+            }
+            Err(err)
+        }
+    }
+}
+
 /// A recovery that failed is worth a `warn!` here; every other outcome the
 /// engine already logs at `info` as it happens (plan Q1: one line per
 /// event, not two). `phase` is `startup` (§D9 (c)) or `exit` (§D9 (a)).
@@ -292,6 +322,8 @@ struct Invocation {
     config_arg: Option<PathBuf>,
     script_args: Vec<PathBuf>,
     bus_endpoint_file: Option<PathBuf>,
+    /// The one-shot's own flags (R14 spec D7), split off before the mode.
+    bus_args: BusArgs,
     web_args: Option<WebArgs>,
     mode: Mode,
     /// The global terminal flags (`-v`, `-vv`, `-q`, `--color`), split off
@@ -319,6 +351,10 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     let (config_arg, argv) = split_config_arg(argv)?;
     let (script_args, argv) = split_script_args(argv)?;
     let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
+    let (bus_args, argv) = match oneshot::args::split_bus_args(argv) {
+        Ok(split) => split,
+        Err(text) => exit_with(&ErrorReport::usage(text), Some(&usage_reporter(&term))),
+    };
     // Every help form is answered before anything boots (plan C32); a single
     // bare token is an implicit request that `main` lets fall through to the
     // CLI when it names no group (C33). The hidden watchdog is never one.
@@ -355,6 +391,7 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
         config_arg,
         script_args,
         bus_endpoint_file,
+        bus_args,
         web_args,
         mode,
         term,
@@ -474,6 +511,13 @@ fn main() {
             Some(&reporter),
         ),
     }
+    // The stdio MCP transport reads stdin on a blocking thread that only
+    // returns at EOF. A core stopped by SIGTERM/SIGINT while its stdin is still
+    // open (a supervisor's pipe) must not wait for that read: everything that
+    // had to happen on the way out (the system-proxy restore, the browser reap,
+    // the pointer) ran inside `run()`. Give the rest of the blocking pool a
+    // second, then leave (R14 live proof §3: "SIGTERM: exit 0").
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
@@ -481,6 +525,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         config_arg,
         script_args,
         bus_endpoint_file,
+        bus_args,
         web_args,
         mode,
         term,
@@ -549,6 +594,46 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
     // anything for the loopback-TCP bus, so asking for it over stdio is an error.
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
+    // R14 spec D3/D4, serving modes only: a first run mints `mcp.operator_token`
+    // into the config (a failure only turns the operator bus off); the pointer
+    // context is published whatever the mint did, with the config path made
+    // absolute (observation b).
+    let mut mint_failure = None;
+    if manages_system_proxy(&mode) {
+        if cfg.mcp.operator_bus.enabled
+            && cfg.mcp.operator_token.as_deref().is_none_or(str::is_empty)
+        {
+            match operator_token::mint_if_absent(&effective_path, config_path.is_none()) {
+                Minted::Written { path, token } => {
+                    let phase = reporter.phase("creating operator token");
+                    cfg.mcp.operator_token = Some(token.expose().to_string());
+                    phase.done(&format!(
+                        "operator token written · {}",
+                        reporter.display_path(&path)
+                    ));
+                }
+                Minted::Present => {}
+                Minted::Skipped { reason } => {
+                    let what = format!(
+                        "could not write mcp.operator_token to {}",
+                        effective_path.display()
+                    );
+                    reporter.warn(&format!("operator access off: {what} · {reason}"));
+                    mint_failure = Some(what);
+                }
+            }
+        }
+        // `run()` publishes once per process, so the first-publish answer is
+        // not read. The path is absolute unless the cwd is unreadable, when the
+        // pointer keeps it as typed and says so in the log.
+        let _ = pointer::publish(PointerContext {
+            config: std::path::absolute(&effective_path).unwrap_or_else(|err| {
+                warn!(%err, "core pointer keeps the config path as typed");
+                effective_path.clone()
+            }),
+            run_dir: pointer::run_dir(&|k| std::env::var(k).ok()),
+        });
+    }
     // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
     // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
     // binary-owned feature set below over the live privilege state built here.
@@ -825,6 +910,11 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         ));
         tier.error_sink
             .bind(Arc::new(Chain::new(s.registry.clone(), s.store.clone())));
+        // ONE confirmer for the local and the live path (R14 plan Q7), rendering
+        // for the caps `--color` settled (wave 2 C47); the service `Arc`s are
+        // cloned so `s` stays whole for `Inputs.services`.
+        let confirmer: Arc<dyn Confirmer> =
+            Arc::new(TtyConfirmer::from_stdin().with_caps(*reporter.caps()));
         let cli = aitm_cli::Cli::new(s.registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
@@ -833,19 +923,32 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             // The proxy's live egress posture, so `aitm browser confine` flips
             // the connector's real posture (Task 4b).
             .with_egress(s.egress.clone())
-            // The `[y/N]` prompt renders for the caps `--color` settled (C47).
-            .with_confirmer(Arc::new(
-                aitm_cli::TtyConfirmer::from_stdin().with_caps(*reporter.caps()),
-            ))
-            .with_services(s.store, s.client, s.guard, None);
-        match cli.dispatch(argv) {
-            Ok(value) => {
+            .with_confirmer(confirmer.clone())
+            .with_services(s.store.clone(), s.client.clone(), s.guard.clone(), None);
+        // A local verb runs through `cli`; a live one reaches the running core (D8).
+        match oneshot::run::run(oneshot::run::Inputs {
+            argv,
+            bus_args: &bus_args,
+            cfg: &cfg,
+            effective_path: &effective_path,
+            explicit_config: config_path.is_some(),
+            services: &s,
+            cli,
+            confirmer,
+            reporter: &reporter,
+            log: current_log_path().as_deref(),
+            env: &|k| std::env::var(k).ok(),
+        })
+        .await
+        {
+            Ok(bytes) => {
                 let mut stdout = std::io::stdout().lock();
-                stdout.write_all(&render_cli_value(&value))?;
+                stdout.write_all(&bytes)?;
                 stdout.flush()?;
                 return Ok(());
             }
-            Err(err) => exit_with(
+            Err(OneShotError::Report(report)) => exit_with(&report, Some(&reporter)),
+            Err(OneShotError::Other(err)) => exit_with(
                 &report_for(&err, current_log_path().as_deref()),
                 Some(&reporter),
             ),
@@ -899,8 +1002,9 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // returned above. Blocking shell-outs, but nothing is served yet.
     //
     // The bound addresses are read inside this block too: after the startup set,
-    // no `?` remains before the `select!`, so the §D9 (a) restore below is reached
-    // on every path.
+    // the only fallible step before the `select!` is `operator_bus::start`, run
+    // through `or_restore_system_proxy` (security S8), so the system proxy is
+    // given back on every exit path: the §D9 (a) block below, or that wrapper.
     let config_display = effective_path.display().to_string();
     let phase = reporter.phase("binding ports");
     let bound = bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
@@ -992,7 +1096,8 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         .as_ref()
         .map(|shared| shared.guard.clone());
     // Bound addresses from the pre-bind step: nothing fallible may run between
-    // the system-proxy auto-set and the `select!` (its restore-on-exit depends on it).
+    // the system-proxy auto-set and the `select!` (its restore-on-exit depends on
+    // it) except `operator_bus::start` below, wrapped in `or_restore_system_proxy`.
     if let Some(guard) = &l4_live_guard {
         guard.add_self_ports(
             [proxy_addr.port(), browser_addr.port()]
@@ -1049,6 +1154,27 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     };
     // Shared service handles for the frontends and the replay client.
     let services = tui::services(&proxy, &cfg, browser.clone(), tui_log, job_bus.clone());
+    // The operator bus (R14 spec D2): before the ready card and the TUI handover
+    // (a fixed-port conflict is the M2 panel through `report_for`), bound outside
+    // both branches so its drop, which removes the core pointer (D4), is `run()`'s end.
+    // The one fallible step after the system-proxy auto-set (security S8): on
+    // failure the wrapper gives the OS its proxy back before the M2 panel, as
+    // the §D9 (a) restore below would have.
+    let mut operator_bus = or_restore_system_proxy(
+        &mode,
+        &sysproxy,
+        operator_bus::start(
+            &cfg,
+            &effective_path,
+            &services,
+            &agent_state,
+            &audit_ring,
+            push_tx.clone(),
+            l4_live_guard.clone().map(self_port_hook),
+            mint_failure,
+        ),
+    )
+    .await?;
 
     // The scripting tier now reaches exactly the proxy's store, client and
     // guard, and a failed hook's `Event::Error` reaches the chain rather than
@@ -1145,6 +1271,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             // The Web card's `Bus` row is always `ready` (M6); the transport
             // word is the Server card's.
             bus: startup::card::bus_word(&cfg.mcp.transport),
+            operator_bus: operator_bus.word(),
             web_url,
             operator_url,
             ca: ca_trust,
@@ -1183,6 +1310,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 prompt_hold.clone(),
             ) => result,
             never = capture_run => match never {},
+            result = operator_bus.finished() => result,
         }
     } else {
         // The bare-`aitm` server path is the dedicated agent entry point, so it
@@ -1304,6 +1432,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             }
             result = web_run => result,
             never = capture_run => match never {},
+            result = operator_bus.finished() => result,
             () = aitm::shutdown_signal_unless_held(prompt_hold) => {
                 info!("shutdown signal received");
                 Ok(())
@@ -1566,6 +1695,7 @@ mod tests {
 
     use aitm_core::McpTransport;
 
+    use aitm::oneshot::args::BusArgs;
     use aitm::wire::{build_proxy_with, Features};
 
     use aitm_ca::exec::Executor;
@@ -1574,10 +1704,11 @@ mod tests {
 
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
-        configured_agent_port, manages_system_proxy, pages, parse_invocation, parse_mode,
-        scan_services, split_bus_endpoint_file_arg, split_config_arg, split_script_args,
-        usage_reporter, ErrorReport, HelpRequest, Invocation, Mode, PrivilegeConfig,
-        ProcessLifetime, StartupError, TermOpts, OPERATOR_TOKEN_USAGE, SYSPROXY_WATCHDOG_USAGE,
+        configured_agent_port, manages_system_proxy, or_restore_system_proxy, pages,
+        parse_invocation, parse_mode, scan_services, split_bus_endpoint_file_arg, split_config_arg,
+        split_script_args, usage_reporter, ErrorReport, HelpRequest, Invocation, Mode,
+        PrivilegeConfig, ProcessLifetime, StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
+        SYSPROXY_WATCHDOG_USAGE,
     };
     use aitm_sysproxy::Recovery;
     use aitm_term::caps::{Caps, ColorChoice, Verbosity};
@@ -2283,6 +2414,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Security S8 (R14): a step that fails after `auto` set the system proxy
+    /// — the operator bus's fixed port already taken — gives the OS its proxy
+    /// back before the error becomes the panel; a one-shot mode never touches
+    /// the OS; a step that succeeds restores nothing.
+    #[tokio::test]
+    async fn a_failed_step_after_the_auto_set_restores_the_system_proxy() {
+        let (exec, sp, dir) = scripted_sysproxy("start-failed");
+        let (_, recovery) =
+            bind_then_recover_system_proxy(&Mode::Server, &sp, true, async { Ok(()) })
+                .await
+                .unwrap();
+        assert!(matches!(recovery, Recovery::Set(_)), "{recovery:?}");
+        let set_lines = mutating_lines(&exec);
+        assert_eq!(set_lines.len(), 3, "the auto-set ran: {set_lines:?}");
+
+        let ok = or_restore_system_proxy(&Mode::Server, &sp, async { Ok::<_, anyhow::Error>(7) })
+            .await
+            .unwrap();
+        assert_eq!(ok, 7);
+        assert_eq!(mutating_lines(&exec), set_lines, "success restores nothing");
+
+        // The scripted engine answers every read "off", so at exit nothing of
+        // ours is left to rewrite: the restore shows as the reads it makes to
+        // judge that, and as the consumed state file (nothing for the watchdog).
+        let runs_before = exec.runs().len();
+        assert!(
+            dir.join(STATE_FILE_NAME).is_file(),
+            "the auto-set left its file"
+        );
+        let err = or_restore_system_proxy(&Mode::Server, &sp, async {
+            Err::<(), _>(anyhow::anyhow!(
+                "cannot start: the operator bus port is already in use"
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot start: the operator bus"),
+            "{err}"
+        );
+        assert!(
+            exec.runs().len() > runs_before,
+            "the exit restore read the live state"
+        );
+        assert!(
+            !dir.join(STATE_FILE_NAME).exists(),
+            "the exit restore consumed the state file"
+        );
+        assert_eq!(
+            mutating_lines(&exec),
+            set_lines,
+            "nothing of ours was left to rewrite"
+        );
+
+        let before = exec.runs().len();
+        let err = or_restore_system_proxy(&Mode::Cli(args(&["flow", "list"])), &sp, async {
+            Err::<(), _>(anyhow::anyhow!("nope"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "nope");
+        assert_eq!(
+            exec.runs().len(),
+            before,
+            "a one-shot mode never touches the OS"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn script_flags_are_collected_in_order_and_stripped() {
         let (scripts, rest) = split_script_args(args(&[
@@ -2393,6 +2594,7 @@ mod tests {
                 config_arg,
                 script_args,
                 bus_endpoint_file,
+                bus_args,
                 web_args,
                 mode,
                 term,
@@ -2400,6 +2602,7 @@ mod tests {
                 .expect("parses")
                 .expect("something to run");
             assert_eq!(term, TermOpts::default(), "{argv:?}");
+            assert_eq!(bus_args, BusArgs::default(), "{argv:?}");
             assert_eq!(
                 mode,
                 Mode::SysproxyWatchdog {
@@ -2604,6 +2807,24 @@ mod tests {
             TermOpts {
                 verbosity: Verbosity::Quiet,
                 color: ColorChoice::Never,
+            }
+        );
+        assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
+    }
+
+    /// R14 spec D7 (plan Task 13): the one-shot's own flags are split out of
+    /// argv before the mode is classified and ride in the invocation.
+    #[test]
+    fn invocation_carries_bus_args() {
+        let argv = args(&["--bus", "127.0.0.1:1", "--token-file", "t", "scope", "list"]);
+        let invocation = parse_invocation(argv)
+            .expect("parses")
+            .expect("something to run");
+        assert_eq!(
+            invocation.bus_args,
+            BusArgs {
+                bus: Some("127.0.0.1:1".to_string()),
+                token_file: Some(PathBuf::from("t")),
             }
         );
         assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
