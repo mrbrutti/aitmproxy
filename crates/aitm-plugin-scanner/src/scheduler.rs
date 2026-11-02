@@ -8,7 +8,11 @@
 //! trait, `wants_traits`, the frequent-point rule and `CheckMeta::scope` — and
 //! research 17 §3.2 fixes the order: priority is `0.8 x exposure + 0.2 x
 //! interest`, light checks run before medium ones across all points, and the
-//! passive phase runs before the active one.
+//! passive phase runs before the active one. Amendment 38 adds one rule on top:
+//! an origin-scoped HTTP check is scheduled once per *origin* — the profile's
+//! targets plus every origin a discovered point belongs to — against a
+//! synthetic point in [`SchedulePlan::origin_points`], so a target where
+//! discovery found nothing still gets its origin checks.
 //!
 //! Nothing here sends, charges or decides policy: the scheduler reads metadata
 //! and returns a plan. The budget, the scope guard and the agent gate are the
@@ -20,12 +24,15 @@ use std::sync::Arc;
 
 use aitm_scan_model::{
     Accuracy, Check, CheckCost, CheckMeta, CheckScope, IgnoreRule, InsertionKind, InsertionPoint,
-    PointTrait, ScanProfile, SiteNode, SkippedPoints, Speed, Technique,
+    LaneKind, PointTrait, ScanProfile, SiteNode, SkippedPoints, Speed, Technique,
 };
 
 /// One check to run against one insertion point.
 pub struct ScheduleItem {
-    /// Index into the `points` slice [`plan`] was given.
+    /// Index into the `points` slice [`plan`] was given, or, when it is
+    /// `>= points.len()`, into [`SchedulePlan::origin_points`] at
+    /// `point - points.len()` (amendment 38). Resolve it with
+    /// [`SchedulePlan::point_at`] rather than indexing either slice.
     pub point: usize,
     /// The check to run.
     pub check: Arc<dyn Check>,
@@ -56,6 +63,29 @@ pub struct SchedulePlan {
     /// The `(kind, name)` pairs treated as frequent, so the worker can revert
     /// one to a full audit when a check hits on it (spec D4).
     pub frequent: HashSet<(InsertionKind, String)>,
+    /// One synthetic point per origin in the job's origin set, addressed by
+    /// `ScheduleItem::point - points.len()` (amendment 38). An origin-scoped
+    /// HTTP check runs against these, not against a discovered point, so a
+    /// target with no insertion points at all still gets its origin checks.
+    pub origin_points: Vec<InsertionPoint>,
+}
+
+impl SchedulePlan {
+    /// The insertion point a [`ScheduleItem::point`] index names: a discovered
+    /// point when `index < points.len()`, else the origin item at
+    /// `index - points.len()`. `None` when the index addresses neither.
+    ///
+    /// `points` must be the same slice [`plan`] was given.
+    pub fn point_at<'a>(
+        &'a self,
+        points: &'a [InsertionPoint],
+        index: usize,
+    ) -> Option<&'a InsertionPoint> {
+        match points.get(index) {
+            Some(point) => Some(point),
+            None => self.origin_points.get(index - points.len()),
+        }
+    }
 }
 
 /// How interesting a request is to attack: method, content type, authentication
@@ -181,6 +211,11 @@ pub fn plan(
         for check in checks {
             let meta = check.meta();
 
+            // Amendment 38: an origin-scoped HTTP check is driven by the origin
+            // set below, never by a point, so it claims no slot here.
+            if origin_driven(meta) {
+                continue;
+            }
             if !meta.lanes.contains(&point.lane)
                 || !meta.kinds.contains(&point.kind)
                 || meta.intensity > profile.intensity
@@ -225,6 +260,40 @@ pub fn plan(
         }
         if session_blocked {
             out.skipped.ignored += 1;
+        }
+    }
+
+    // Amendment 38 (spec D4/D8): one item per origin for every origin-scoped
+    // HTTP check, whether or not a point was discovered there. An origin is not
+    // a point, so only `intensity` gates these.
+    for (offset, (key, on_origin)) in origin_set(profile, points, nodes, &by_id)
+        .into_iter()
+        .enumerate()
+    {
+        let score = priority(
+            exposure(
+                on_origin.iter().map(|n| n.points).max().unwrap_or(0),
+                busiest,
+            ),
+            interest(Some("GET"), None, on_origin.iter().any(|n| n.auth)),
+        );
+        out.origin_points.push(origin_point(&key, &on_origin));
+
+        for check in checks {
+            let meta = check.meta();
+            if !origin_driven(meta) || meta.intensity > profile.intensity {
+                continue;
+            }
+            let item = ScheduleItem {
+                point: points.len() + offset,
+                check: Arc::clone(check),
+                priority: score,
+            };
+            if meta.technique == Technique::Passive {
+                out.passive.push(item);
+            } else {
+                out.active.push(item);
+            }
         }
     }
 
@@ -281,6 +350,10 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
 
 /// The slot a node- or origin-scoped check occupies, or `None` for a
 /// per-point check, which never shares a slot (spec D4, coordinator decision 4).
+///
+/// An origin-scoped **HTTP** check never reaches this: amendment 38 drives it
+/// from the origin set instead, so the point loop skips it before asking for a
+/// slot. The `CheckScope::Origin` arm below serves the other lanes.
 fn scope_key(meta: &CheckMeta, point: &InsertionPoint, node: Option<&SiteNode>) -> Option<String> {
     match meta.scope {
         CheckScope::Point => None,
@@ -312,6 +385,101 @@ fn origin_key(point: &InsertionPoint, node: Option<&SiteNode>) -> String {
         }
     }
     format!("point:{}", point.id)
+}
+
+/// Whether a check is driven by the origin set rather than by points:
+/// `scope: origin` on the HTTP lane (amendment 38). An origin-scoped check of
+/// another lane keeps the point-derived rule, where the first admissible point
+/// of each origin claims the check's single slot.
+fn origin_driven(meta: &CheckMeta) -> bool {
+    meta.scope == CheckScope::Origin && meta.lanes.contains(&LaneKind::Http)
+}
+
+/// A site node's origin, `scheme://host:port`.
+fn node_origin_key(node: &SiteNode) -> String {
+    format!("{}://{}:{}", node.scheme, node.host, node.port)
+}
+
+/// An origin string in its `scheme://host:port` form, with the scheme's default
+/// port filled in. An origin that does not parse as a URL is used verbatim, so
+/// a profile's target is never silently dropped.
+fn normalize_origin(origin: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(origin) {
+        if let Some(host) = parsed.host_str() {
+            let port = parsed.port_or_known_default().unwrap_or(0);
+            return format!("{}://{}:{}", parsed.scheme(), host, port);
+        }
+    }
+    origin.to_string()
+}
+
+/// The origins an origin-scoped HTTP check runs against, each with the site
+/// nodes found on it: the profile's target origins in profile order, then every
+/// origin a point that survives the `audit.kinds` and `audit.ignore` gates
+/// belongs to. First-seen order, so the set is deterministic.
+fn origin_set<'a>(
+    profile: &ScanProfile,
+    points: &[InsertionPoint],
+    nodes: &'a [SiteNode],
+    by_id: &HashMap<&str, &'a SiteNode>,
+) -> Vec<(String, Vec<&'a SiteNode>)> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for origin in &profile.target.origins {
+        let key = normalize_origin(origin);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    for point in points {
+        if !profile.audit.kinds.contains(&point.kind) {
+            continue;
+        }
+        if profile.audit.ignore.iter().any(|rule| ignores(rule, point)) {
+            continue;
+        }
+        let node = point
+            .site_node
+            .as_deref()
+            .and_then(|id| by_id.get(id).copied());
+        let key = origin_key(point, node);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+
+    keys.into_iter()
+        .map(|key| {
+            let on_origin = nodes.iter().filter(|n| node_origin_key(n) == key).collect();
+            (key, on_origin)
+        })
+        .collect()
+}
+
+/// The synthetic point that stands for one origin (amendment 38).
+///
+/// It is `GET <origin>/`: the interim lane builds a probe host over it, and
+/// nothing injects into it. The kind is cosmetic — origin items bypass every
+/// point gate — so nothing may branch on it.
+fn origin_point(key: &str, nodes: &[&SiteNode]) -> InsertionPoint {
+    InsertionPoint {
+        id: format!("origin:{key}"),
+        lane: LaneKind::Http,
+        kind: InsertionKind::PathSegment,
+        name: "/".to_string(),
+        path: Some("/".to_string()),
+        example: None,
+        flow: None,
+        site_node: nodes
+            .iter()
+            .find(|n| n.path_template == "/")
+            .map(|n| n.id.clone()),
+        traits: Vec::new(),
+        frequency: 1,
+        method: Some("GET".to_string()),
+        url: Some(format!("{key}/")),
+    }
 }
 
 /// Light before medium before heavy.
@@ -744,16 +912,24 @@ mod tests {
             3,
             "a.test:8080 once (from the URL), b.test once, the url-less point once"
         );
-        let origin_points: Vec<usize> = out
-            .active
-            .iter()
-            .filter(|i| i.check.meta().id == "per-origin")
-            .map(|i| i.point)
-            .collect();
+        // Amendment 38: the origin items are addressed past the end of the
+        // four points, one per origin, in first-seen order.
         assert_eq!(
-            origin_points,
-            vec![0, 2, 3],
-            "the first admissible point of each origin claims the slot"
+            indices_for(&out.active, "per-origin"),
+            vec![4, 5, 6],
+            "an origin item is not a point item"
+        );
+        assert_eq!(
+            out.origin_points
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "origin:http://a.test:8080".to_string(),
+                "origin:https://b.test:443".to_string(),
+                "origin:point:p3".to_string(),
+            ],
+            "the origin comes from the URL, and a url-less point is its own origin"
         );
     }
 
@@ -796,6 +972,127 @@ mod tests {
         assert_eq!(empty.skipped.ignored, 0);
         assert_eq!(empty.skipped.frequent, 0);
         assert!(empty.frequent.is_empty());
+    }
+
+    // ---- amendment 38: origin items -----------------------------------------
+
+    /// A profile whose `target.origins` names `origins`, defaults otherwise.
+    fn profile_with_origins(origins: &[&str]) -> ScanProfile {
+        let mut profile = ScanProfile::default();
+        profile.target.origins = origins.iter().map(|o| o.to_string()).collect();
+        profile
+    }
+
+    /// The `point` indices a given check id was scheduled against, in order.
+    fn indices_for(items: &[ScheduleItem], id: &str) -> Vec<usize> {
+        items
+            .iter()
+            .filter(|i| i.check.meta().id == id)
+            .map(|i| i.point)
+            .collect()
+    }
+
+    /// Amendment 38 (spec D4/D8): an origin-scoped HTTP check is scheduled once
+    /// per target origin whether or not any insertion point was discovered
+    /// there — a parameterless site still gets its origin checks.
+    #[test]
+    fn origin_scoped_checks_run_once_per_target_origin_without_points() {
+        let checks = vec![
+            check("origin.check", |m| m.scope = CheckScope::Origin),
+            check("point.check", |m| m.scope = CheckScope::Point),
+        ];
+        let profile = profile_with_origins(&["http://a.test:8080"]);
+
+        let out = plan(&[], &[], &checks, &profile);
+
+        assert_eq!(ids(&out.active), vec!["origin.check".to_string()]);
+        assert_eq!(out.active[0].point, 0);
+        assert_eq!(out.origin_points.len(), 1);
+        let item = out.point_at(&[], 0).expect("the origin item resolves");
+        assert_eq!(item.url.as_deref(), Some("http://a.test:8080/"));
+        assert_eq!(item.id, "origin:http://a.test:8080");
+    }
+
+    /// Amendment 38: the origin set is the profile's targets plus every origin
+    /// a discovered point belongs to, and each gets exactly one item, addressed
+    /// past the end of `points`.
+    #[test]
+    fn origin_scoped_checks_run_once_per_origin_with_points_on_two_origins() {
+        let checks = vec![
+            check("origin.check", |m| m.scope = CheckScope::Origin),
+            check("point.check", |m| m.scope = CheckScope::Point),
+        ];
+        let nodes = vec![node("n1", "a.test", 2), node("n2", "b.test", 1)];
+        let points: Vec<InsertionPoint> = ["n1", "n1", "n2"]
+            .iter()
+            .enumerate()
+            .map(|(i, node_id)| InsertionPoint {
+                site_node: Some(node_id.to_string()),
+                ..point(&format!("p{i}"), "q")
+            })
+            .collect();
+        let profile = profile_with_origins(&["http://a.test:8080"]);
+
+        let out = plan(&points, &nodes, &checks, &profile);
+
+        assert_eq!(count_for(&out.active, "origin.check"), 2, "one per origin");
+        assert_eq!(count_for(&out.active, "point.check"), 3, "one per point");
+        assert_eq!(
+            indices_for(&out.active, "origin.check"),
+            vec![3, 4],
+            "origin items are addressed past the end of the points slice"
+        );
+        assert_eq!(out.origin_points.len(), 2);
+        assert_eq!(
+            out.point_at(&points, 3).map(|p| p.id.clone()),
+            Some("origin:http://a.test:8080".to_string())
+        );
+        assert_eq!(
+            out.point_at(&points, 4).map(|p| p.id.clone()),
+            Some("origin:http://b.test:8080".to_string())
+        );
+        assert_eq!(
+            out.point_at(&points, 0).map(|p| p.id.clone()),
+            Some("p0".to_string()),
+            "an index inside the slice still resolves to a real point"
+        );
+        assert!(out.point_at(&points, 5).is_none(), "nothing past the end");
+    }
+
+    /// Amendment 38: an origin is not a point, so the kind, trait and session
+    /// gates do not apply to its items — but `intensity` still does.
+    #[test]
+    fn origin_items_ignore_point_gates_but_respect_intensity() {
+        let profile = profile_with_origins(&["http://a.test:8080"]);
+
+        let loud = vec![check("origin.loud", |m| {
+            m.scope = CheckScope::Origin;
+            m.intensity = aitm_scan_model::Intensity::Intrusive;
+        })];
+        let out = plan(&[], &[], &loud, &profile);
+        assert!(
+            out.active.is_empty() && out.passive.is_empty(),
+            "an over-intense check schedules nothing: {:?}",
+            ids(&out.active)
+        );
+        assert_eq!(out.origin_points.len(), 1, "the origin is still known");
+
+        let gated = vec![
+            check("origin.cookie", |m| {
+                m.scope = CheckScope::Origin;
+                m.kinds = vec![InsertionKind::Cookie];
+            }),
+            check("origin.wants-url", |m| {
+                m.scope = CheckScope::Origin;
+                m.wants_traits = Some(vec![PointTrait::Url]);
+            }),
+        ];
+        let out = plan(&[], &[], &gated, &profile);
+        assert_eq!(
+            ids(&out.active),
+            vec!["origin.cookie".to_string(), "origin.wants-url".to_string()],
+            "neither the kinds gate nor wants_traits applies to an origin"
+        );
     }
 
     /// The frequent-point rule is a strict `>` on the threshold, and a frequent
