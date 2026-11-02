@@ -397,6 +397,12 @@ pub fn is_pinned(path: &str) -> bool {
 }
 
 /// Why a field path was refused.
+///
+/// The rendering is the bare sentence. The `invalid_profile` code is added
+/// once by whoever reports the refusal — `DiscoverError`'s `Display` on the
+/// discovery path, `aitm_scan_model::scan_error` on the lane's `validate`
+/// path — so no message carries it twice and no caller strips it back off
+/// (quality panel Minor, T5 live proof 4b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldError {
     /// The path names a pinned field.
@@ -415,15 +421,13 @@ pub enum FieldError {
 impl fmt::Display for FieldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Pinned(path) => write!(
-                f,
-                "invalid_profile: field path {path:?} is pinned and cannot be fuzzed"
-            ),
-            Self::Unknown(path) => write!(f, "invalid_profile: unknown field path {path:?}"),
-            Self::NotApplicable { path, target } => write!(
-                f,
-                "invalid_profile: field path {path:?} does not apply to a {target} target"
-            ),
+            Self::Pinned(path) => {
+                write!(f, "field path {path:?} is pinned and cannot be fuzzed")
+            }
+            Self::Unknown(path) => write!(f, "unknown field path {path:?}"),
+            Self::NotApplicable { path, target } => {
+                write!(f, "field path {path:?} does not apply to a {target} target")
+            }
         }
     }
 }
@@ -462,18 +466,18 @@ pub fn default_fields(ip: IpVersion, transport: L4Transport) -> Vec<FieldPath> {
 /// An empty request is the target's [`default_fields`] table. Otherwise each
 /// entry is trimmed and parsed, must apply to the target's IP version and
 /// transport, and duplicates are dropped keeping first-seen order. The first
-/// failure wins and is returned as its [`FieldError`]'s rendering, so every
-/// error string starts with `invalid_profile: ` and names the path.
+/// failure wins and is returned as itself, naming the path.
 ///
 /// # Errors
 ///
-/// The rendered [`FieldError`] of the first entry that is pinned, unknown or
-/// inapplicable to the target.
+/// The [`FieldError`] of the first entry that is pinned, unknown or
+/// inapplicable to the target. It renders bare; the caller adds the
+/// `invalid_profile` code once (quality panel Minor).
 pub fn validate_fields(
     ip: IpVersion,
     transport: L4Transport,
     requested: &[String],
-) -> Result<Vec<FieldPath>, String> {
+) -> Result<Vec<FieldPath>, FieldError> {
     if requested.is_empty() {
         return Ok(default_fields(ip, transport));
     }
@@ -481,13 +485,12 @@ pub fn validate_fields(
     let mut out: Vec<FieldPath> = Vec::with_capacity(requested.len());
     for entry in requested {
         let trimmed = entry.trim();
-        let path = parse_field(trimmed).map_err(|err| err.to_string())?;
+        let path = parse_field(trimmed)?;
         if !path.applies_to(ip, transport) {
             return Err(FieldError::NotApplicable {
                 path: trimmed.to_string(),
                 target: target.clone(),
-            }
-            .to_string());
+            });
         }
         if !out.contains(&path) {
             out.push(path);
@@ -542,8 +545,11 @@ mod tests {
             );
             let err = validate_fields(IpVersion::V4, L4Transport::Udp, &[p.to_string()])
                 .expect_err("pinned path must be refused");
-            assert!(err.starts_with("invalid_profile:"), "{p}: {err}");
-            assert!(err.contains(p), "{p}: {err}");
+            assert_eq!(err, FieldError::Pinned(p.to_string()), "{p}");
+            // Bare: the code belongs to whoever reports the refusal.
+            let rendered = err.to_string();
+            assert!(!rendered.starts_with("invalid_profile:"), "{p}: {rendered}");
+            assert!(rendered.contains(p), "{p}: {rendered}");
         }
     }
 
@@ -551,7 +557,8 @@ mod tests {
     fn unknown_path() {
         let err = validate_fields(IpVersion::V4, L4Transport::Udp, &["ipv4.bogus".into()])
             .expect_err("unknown path must be refused");
-        assert!(err.contains("unknown field path \"ipv4.bogus\""), "{err}");
+        assert_eq!(err, FieldError::Unknown("ipv4.bogus".to_string()));
+        assert_eq!(err.to_string(), "unknown field path \"ipv4.bogus\"");
     }
 
     #[test]
@@ -585,8 +592,17 @@ mod tests {
         for p in ["ipv6.hop_limit", "tcp.seq"] {
             let err = validate_fields(IpVersion::V4, L4Transport::Udp, &[p.to_string()])
                 .expect_err("inapplicable path must be refused");
-            assert!(err.contains("does not apply"), "{p}: {err}");
-            assert!(err.contains(p), "{p}: {err}");
+            assert_eq!(
+                err,
+                FieldError::NotApplicable {
+                    path: p.to_string(),
+                    target: "ipv4/udp".to_string(),
+                },
+                "{p}"
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("does not apply"), "{p}: {rendered}");
+            assert!(rendered.contains(p), "{p}: {rendered}");
         }
     }
 
@@ -599,7 +615,7 @@ mod tests {
         ];
         let err = validate_fields(IpVersion::V4, L4Transport::Udp, &requested)
             .expect_err("the pinned path must be refused");
-        assert_eq!(err, FieldError::Pinned("dst".to_string()).to_string());
+        assert_eq!(err, FieldError::Pinned("dst".to_string()));
     }
 
     #[test]
@@ -684,11 +700,9 @@ mod tests {
             "ipv4.ttl.extra",
         ] {
             let err = validate_fields(IpVersion::V4, L4Transport::Udp, &[p.to_string()])
-                .expect_err("not a field path");
-            assert!(
-                err.starts_with("invalid_profile: unknown field path "),
-                "{p:?}: {err}"
-            );
+                .expect_err("not a field path")
+                .to_string();
+            assert!(err.starts_with("unknown field path "), "{p:?}: {err}");
             assert!(err.contains(&format!("{:?}", p.trim())), "{p:?}: {err}");
         }
         // An upper-cased pin is not recognised as a pin, but it is still
@@ -749,16 +763,18 @@ mod tests {
     }
 
     /// Tester (stage 5): the three error renderings are literal, so the
-    /// harness and the engine can match them.
+    /// harness and the engine can match them. They are *bare*: the
+    /// `invalid_profile` code is the reporter's, added once (quality panel
+    /// Minor).
     #[test]
     fn error_renderings_are_literal() {
         assert_eq!(
             FieldError::Pinned("dst".to_string()).to_string(),
-            "invalid_profile: field path \"dst\" is pinned and cannot be fuzzed"
+            "field path \"dst\" is pinned and cannot be fuzzed"
         );
         assert_eq!(
             FieldError::Unknown("ipv4.bogus".to_string()).to_string(),
-            "invalid_profile: unknown field path \"ipv4.bogus\""
+            "unknown field path \"ipv4.bogus\""
         );
         assert_eq!(
             FieldError::NotApplicable {
@@ -766,14 +782,20 @@ mod tests {
                 target: "ipv4/udp".to_string(),
             }
             .to_string(),
-            "invalid_profile: field path \"tcp.seq\" does not apply to a ipv4/udp target"
+            "field path \"tcp.seq\" does not apply to a ipv4/udp target"
+        );
+        let err = validate_fields(IpVersion::V6, L4Transport::Tcp, &["udp.length".to_string()])
+            .expect_err("udp.length is no field of a tcp target");
+        assert_eq!(
+            err,
+            FieldError::NotApplicable {
+                path: "udp.length".to_string(),
+                target: "ipv6/tcp".to_string(),
+            }
         );
         assert_eq!(
-            validate_fields(IpVersion::V6, L4Transport::Tcp, &["udp.length".to_string()]),
-            Err(
-                "invalid_profile: field path \"udp.length\" does not apply to a ipv6/tcp target"
-                    .to_string()
-            )
+            err.to_string(),
+            "field path \"udp.length\" does not apply to a ipv6/tcp target"
         );
     }
 
@@ -786,7 +808,9 @@ mod tests {
             if path == FieldPath::Raw {
                 assert_eq!(result, Ok(vec![FieldPath::Raw]));
             } else {
-                let err = result.expect_err("a v6/tcp path on a v4/udp target");
+                let err = result
+                    .expect_err("a v6/tcp path on a v4/udp target")
+                    .to_string();
                 assert!(
                     err.contains("does not apply to a ipv4/udp target"),
                     "{path}: {err}"

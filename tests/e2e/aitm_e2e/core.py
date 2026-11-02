@@ -196,6 +196,12 @@ class Aitm:
                     fh.close()
                 except OSError:
                     pass
+        # AITM_E2E_KEEP_WORKDIR=1 keeps the core's workdir (bus.addr, aitm.stderr.log,
+        # aitm.stdout.log) after the run, for reading the core's own log on a rig
+        # where a cell failed inside the engine (T5 live proof, 2026-11-02).
+        if os.environ.get("AITM_E2E_KEEP_WORKDIR") == "1":
+            print(f"  note: kept core workdir {self.workdir}", flush=True)
+            return
         shutil.rmtree(self.workdir, ignore_errors=True)
 
     def __enter__(self) -> "Aitm":

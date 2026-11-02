@@ -34,8 +34,8 @@ use aitm_proto_l4::types::{
     RateCap,
 };
 use aitm_scan_model::{
-    JobCtx, L4Options, L4Seed, L4TargetSpec, L4Transport, LaneKind, ProfileTarget, ScanProfile,
-    SessionMaterial,
+    JobCtx, L4Counters, L4Options, L4Seed, L4TargetSpec, L4Transport, LaneKind, ProfileTarget,
+    ScanProfile, SessionMaterial,
 };
 use futures::future::BoxFuture;
 
@@ -586,10 +586,13 @@ pub struct TestJob {
     guard: Arc<dyn ScopeRateGuard>,
     job_id: OnceLock<String>,
     marker: OnceLock<String>,
+    fresh_markers: AtomicBool,
+    markers_asked: AtomicU32,
     budget: AtomicU32,
     charged: AtomicU32,
     deadline: Mutex<Instant>,
     cancelled: AtomicBool,
+    l4_reports: Mutex<Vec<L4Counters>>,
 }
 
 impl fmt::Debug for TestJob {
@@ -615,10 +618,13 @@ impl TestJob {
             guard: Arc::new(StdGuard::default()),
             job_id: OnceLock::new(),
             marker: OnceLock::new(),
+            fresh_markers: AtomicBool::new(false),
+            markers_asked: AtomicU32::new(0),
             budget: AtomicU32::new(DEFAULT_BUDGET),
             charged: AtomicU32::new(0),
             deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
             cancelled: AtomicBool::new(false),
+            l4_reports: Mutex::new(Vec::new()),
         })
     }
 
@@ -635,6 +641,24 @@ impl TestJob {
     pub fn with_marker(self: Arc<Self>, marker: &str) -> Arc<Self> {
         let _ = self.marker.set(marker.to_string());
         self
+    }
+
+    /// Make this job's marker behave like the engine's `JobCtx::marker()`: a
+    /// reflection canary that returns a *fresh* token on every call. The
+    /// scanner worker mints `crate::util::marker(self.markers.fetch_add(1, ..))`
+    /// (`aitm_plugin_scanner::worker`), so no two calls agree; a test in this
+    /// mode proves the lane keys a point's runner by the stable job id, never
+    /// by the marker (T5 live proof, 4b).
+    #[must_use]
+    pub fn fresh_markers(self: Arc<Self>) -> Arc<Self> {
+        self.fresh_markers.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// How many times anything asked this job for its marker.
+    #[must_use]
+    pub fn markers_asked(&self) -> u32 {
+        self.markers_asked.load(Ordering::SeqCst)
     }
 
     /// Set the job's deadline.
@@ -656,6 +680,19 @@ impl TestJob {
     #[must_use]
     pub fn charged(&self) -> u32 {
         self.charged.load(Ordering::SeqCst)
+    }
+
+    /// Every [`L4Counters`] the lane reported through `JobCtx::report_l4`, in
+    /// the order they arrived.
+    #[must_use]
+    pub fn l4_reports(&self) -> Vec<L4Counters> {
+        lock(&self.l4_reports).clone()
+    }
+
+    /// The last counters the lane reported, or `None` when it reported none.
+    #[must_use]
+    pub fn reported_l4(&self) -> Option<L4Counters> {
+        lock(&self.l4_reports).last().copied()
     }
 
     /// Cancel the job, as the engine does when the operator stops a scan.
@@ -729,15 +766,27 @@ impl JobCtx for TestJob {
     }
 
     fn marker(&self) -> String {
+        let n = self.markers_asked.fetch_add(1, Ordering::SeqCst);
+        if self.fresh_markers.load(Ordering::SeqCst) {
+            // The engine's canary: a fresh, never-reused token on every call.
+            return format!("aitm-canary-{n:08x}");
+        }
         self.marker
             .get()
             .cloned()
             .unwrap_or_else(|| "aitm7f3a".to_string())
     }
+
+    /// Record the counters the lane reports, where the engine's worker folds
+    /// them into `JobStatus.l4`, so a test can assert what the lane reported.
+    fn report_l4(&self, counters: L4Counters) {
+        lock(&self.l4_reports).push(counters);
+    }
 }
 
-/// A UDP target on `127.0.0.1:port`, no grammar (the packet lane never reads
-/// one).
+/// A UDP target on `127.0.0.1:port`, with no grammar: discovery reads
+/// `grammar` into the site node's `path_template`, so this target's node
+/// template is `/`.
 #[must_use]
 pub fn udp_target(port: u16) -> L4TargetSpec {
     L4TargetSpec {
@@ -791,8 +840,8 @@ pub fn with_hex_seed(mut profile: ScanProfile, hex: &str) -> ScanProfile {
     profile
 }
 
-/// The `requested` field list the lane's discovery takes, while
-/// `plan::requested_fields` still returns an empty list (plan call C1).
+/// A `requested` field list for a test that calls the lane's discovery
+/// directly, rather than through a profile's `L4Options.fields` (plan call C1).
 #[must_use]
 pub fn fields(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
@@ -859,11 +908,12 @@ pub mod harness {
             &profile,
             requested,
             &job.marker(),
+            job.job_id(),
         )
         .expect("the loopback profile discovers");
         let state = Arc::new(LaneState::new());
         let _ = state.begin_job(
-            JobKey::new(job.job_id(), &job.marker()),
+            JobKey::new(job.job_id()),
             plans.clone(),
             discovery.points.iter().map(|p| p.id.clone()).collect(),
             profile.l4.cases,

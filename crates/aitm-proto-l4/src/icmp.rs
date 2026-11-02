@@ -14,9 +14,12 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use etherparse::TransportSlice;
+use etherparse::{
+    icmpv4, icmpv6, Icmpv4Type, Icmpv6Type, IpNumber, Ipv4HeaderSlice, Ipv6HeaderSlice,
+    TransportSlice,
+};
 
-use crate::craft::{endpoints_of, parse_frame};
+use crate::craft::{endpoints_of, parse_frame, PacketEndpoints};
 use crate::flow::L4Packet;
 use crate::types::L4Proto;
 
@@ -107,6 +110,166 @@ pub fn transport_payload(pkt: &L4Packet) -> Option<TransportPayload<'_>> {
         dst_port: ends.dst_port?,
         proto: ends.proto?,
         payload,
+    })
+}
+
+/// An ICMP / ICMPv6 informational message's correlation key: type, identifier
+/// and sequence. Only the request/reply pairs the protocol defines are keyed —
+/// ICMPv4 echo (8 / 0) and timestamp (13 / 14), ICMPv6 echo (128 / 129) —
+/// read through `etherparse`'s typed ICMP slices, never by offset.
+///
+/// The reply correlator (`sendrecv`) accepts a frame as the reply to an ICMP
+/// stimulus only when its key is the stimulus's [`IcmpKey::reply_key`]: ICMP
+/// has no ports, so without the identifier and sequence every ICMP frame
+/// between two loopback addresses would look like the answer to a ping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IcmpKey {
+    /// Whether the message is ICMPv6 (the type spaces overlap: 0 and 8 mean
+    /// other things in ICMPv6).
+    pub(crate) v6: bool,
+    pub(crate) icmp_type: u8,
+    pub(crate) id: u16,
+    pub(crate) seq: u16,
+}
+
+impl IcmpKey {
+    /// The key the reply to this message must carry, when this message is a
+    /// request the protocol pairs with a reply type: the paired type with the
+    /// same identifier and sequence. `None` for a reply or an unpaired type.
+    pub(crate) fn reply_key(self) -> Option<IcmpKey> {
+        let reply_type = match (self.v6, self.icmp_type) {
+            (false, icmpv4::TYPE_ECHO_REQUEST) => icmpv4::TYPE_ECHO_REPLY,
+            (false, icmpv4::TYPE_TIMESTAMP) => icmpv4::TYPE_TIMESTAMP_REPLY,
+            (true, icmpv6::TYPE_ECHO_REQUEST) => icmpv6::TYPE_ECHO_REPLY,
+            _ => return None,
+        };
+        Some(IcmpKey {
+            icmp_type: reply_type,
+            ..self
+        })
+    }
+}
+
+/// The [`IcmpKey`] of an ICMP informational message, or `None` for an error,
+/// an unpaired type or a non-ICMP transport.
+pub(crate) fn icmp_key(transport: &Option<TransportSlice<'_>>) -> Option<IcmpKey> {
+    match transport {
+        Some(TransportSlice::Icmpv4(icmp)) => {
+            let (id, seq) = match icmp.icmp_type() {
+                Icmpv4Type::EchoRequest(h) | Icmpv4Type::EchoReply(h) => (h.id, h.seq),
+                Icmpv4Type::TimestampRequest(m) | Icmpv4Type::TimestampReply(m) => (m.id, m.seq),
+                _ => return None,
+            };
+            Some(IcmpKey {
+                v6: false,
+                icmp_type: icmp.type_u8(),
+                id,
+                seq,
+            })
+        }
+        Some(TransportSlice::Icmpv6(icmp)) => {
+            let (id, seq) = match icmp.icmp_type() {
+                Icmpv6Type::EchoRequest(h) | Icmpv6Type::EchoReply(h) => (h.id, h.seq),
+                _ => return None,
+            };
+            Some(IcmpKey {
+                v6: true,
+                icmp_type: icmp.type_u8(),
+                id,
+                seq,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The endpoints of the datagram an ICMP **error** quotes, or `None`.
+///
+/// Only the ICMP types that carry a quote are read — IPv4 destination
+/// unreachable (3), source quench (4), redirect (5), time exceeded (11) and
+/// parameter problem (12); ICMPv6 destination unreachable (1), packet too big
+/// (2), time exceeded (3) and parameter problem (4). An echo or any other
+/// informational message carries a payload that is not a packet, and reading
+/// one as a quote would invent a correlation.
+pub(crate) fn icmp_quote(transport: &Option<TransportSlice<'_>>) -> Option<PacketEndpoints> {
+    match transport {
+        Some(TransportSlice::Icmpv4(icmp))
+            if matches!(
+                icmp.type_u8(),
+                icmpv4::TYPE_DEST_UNREACH
+                    | icmpv4::TYPE_SOURCE_QUENCH
+                    | icmpv4::TYPE_REDIRECT
+                    | icmpv4::TYPE_TIME_EXCEEDED
+                    | icmpv4::TYPE_PARAMETER_PROBLEM
+            ) =>
+        {
+            quoted_endpoints(icmp.payload())
+        }
+        Some(TransportSlice::Icmpv6(icmp))
+            if matches!(
+                icmp.type_u8(),
+                icmpv6::TYPE_DST_UNREACH
+                    | icmpv6::TYPE_PACKET_TOO_BIG
+                    | icmpv6::TYPE_TIME_EXCEEDED
+                    | icmpv6::TYPE_PARAMETER_PROBLEM
+            ) =>
+        {
+            quoted_endpoints(icmp.payload())
+        }
+        _ => None,
+    }
+}
+
+/// Decode the head of a quoted packet — an IP header plus the first bytes of
+/// its transport — into endpoints.
+///
+/// An ICMP error quotes only the offending datagram's header and (classically)
+/// its first 8 transport bytes, which is a whole UDP header but a fragment of a
+/// TCP one, so the full-packet parser cannot be used here: the IP header is
+/// read with `etherparse`'s header slice (which validates version, IHL and
+/// length and tolerates the truncated payload behind it) and the port pair is
+/// read from the first four transport bytes, the only field TCP and UDP share
+/// at the same offset. Every read is bounds-checked; wire-derived bytes are
+/// hostile and nothing here may panic.
+pub(crate) fn quoted_endpoints(quote: &[u8]) -> Option<PacketEndpoints> {
+    let (src, dst, protocol, rest) = if let Ok(v4) = Ipv4HeaderSlice::from_slice(quote) {
+        (
+            IpAddr::from(v4.source_addr()),
+            IpAddr::from(v4.destination_addr()),
+            v4.protocol(),
+            quote.get(v4.slice().len()..)?,
+        )
+    } else if let Ok(v6) = Ipv6HeaderSlice::from_slice(quote) {
+        (
+            IpAddr::from(v6.source_addr()),
+            IpAddr::from(v6.destination_addr()),
+            v6.next_header(),
+            quote.get(v6.slice().len()..)?,
+        )
+    } else {
+        return None;
+    };
+
+    let proto = match protocol {
+        IpNumber::ICMP => Some(L4Proto::Icmp),
+        IpNumber::TCP => Some(L4Proto::Tcp),
+        IpNumber::UDP => Some(L4Proto::Udp),
+        IpNumber::IPV6_ICMP => Some(L4Proto::IcmpV6),
+        _ => None,
+    };
+    let (src_port, dst_port) = match (proto, rest.get(..4)) {
+        (Some(L4Proto::Tcp | L4Proto::Udp), Some(ports)) => (
+            Some(u16::from_be_bytes([ports[0], ports[1]])),
+            Some(u16::from_be_bytes([ports[2], ports[3]])),
+        ),
+        _ => (None, None),
+    };
+    Some(PacketEndpoints {
+        proto,
+        src: Some(src),
+        dst: Some(dst),
+        src_port,
+        dst_port,
     })
 }
 
