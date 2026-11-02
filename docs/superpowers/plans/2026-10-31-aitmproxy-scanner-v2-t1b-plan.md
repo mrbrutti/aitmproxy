@@ -1694,6 +1694,8 @@ Kept by the main session during stage 6. One row per finding.
 
 Filled 2026-11-01 at integration (branch `claude/wizardly-nightingale-441e25`, PR against `main`; the coordinator merges in milestone order).
 
+**Merged:** PR #232 squash-merged to `main` as `3aa8cc67` on 2026-11-01 (CI Rust gate pass), head `1ec03438` at merge time. Follow-up PR 2 (amendments 38-40, 46; deterministic worker/jobs waits) runs under `docs/superpowers/plans/2026-11-01-aitmproxy-scanner-v2-t1b-followup-2-plan.md`.
+
 **Merged content.** Tasks 1-19 in full: the engine crate (`JobRegistry`/`admit`, worker, `JobClient`, profiles, issue store, catalogue + scheduler, session reuse, PoC-hint reproduction, interim HTTP lane with client-crawl fallback), the 15 new `scan.*` verbs + uniform `check.<id>`, legacy verbs over the job model, `JobBus` + `notifications/aitm/job`, the Rhai `reg.add_check` bridge + `probe.*`, the model additions, binary wiring (`scanner:` config, `collect_lanes_with` + `ssl_insecure` to the WS lane), `docs/scanner.md`. Final contract pins after main f2b0dae6 (T5): `EXPECTED_TOOLS` 92, `CORE_TOOLS` 95, `bus-fixture.json` 95.
 
 **Cut / deferred by ruling.** `confirm_required` is reserved, not emitted (B18). The bundled-origin half of AC T1-6 waits for T3's scripts (cell conditional). `scan.discover`'s browser path is unchanged behind the job model.
