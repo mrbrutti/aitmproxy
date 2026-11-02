@@ -355,6 +355,25 @@ Where each negative is observed (its cell):
   `docs/testing/release-acceptance-index.md` (one row per version: date, PASS/FAIL/SKIP counts,
   verdict, report link).
 
+### D11. Words re-surveyed for the 0.5.11 release (`92a15af2`)
+
+The strings in D3–D7 were read at `c65ed0f2`. The 0.5.11 release tag `92a15af2` adds #272 (Apps
+sidebar tree, UI half) and the site/version chores; #274 (S-081: a Scope add that misses the core
+says so and lands after a restart) is on `main` after the tag and **not** in 0.5.11.
+
+- MAC-9a on 0.5.11: an Apps row per app, titled with `ClientInfo.name` (Safari's
+  `com.apple.Safari` → "Safari"; a bare `com.apple.WebKit.Networking` → "WebKit Networking"),
+  its count, a chevron whose accessibility label is "Expand <app>" / "Collapse <app>", and under
+  it one domain sub-row per host the app talked to (counts sum to the app's). Context menu:
+  "Pin App" / "Unpin App". Selecting the app or a domain opens the domains; the chevron closes
+  them. The dry run on the 0.5.11 core saw `source_app == "com.apple.Safari"` on the extension
+  rows, so the group is "Safari" there.
+- N1 on 0.5.11: the pre-#274 behaviour (pending row kept, error only in the status bar) is the
+  expected FAIL; Explains = #274, merged after the tag, unreleased.
+- Everything else in D3–D7 is unchanged between `c65ed0f2` and `92a15af2` (`git diff --stat` of
+  `apps/mac/Sources`, `crates/aitm/src`, `crates/aitm-tui`, `apps/web/src`: only #272's four
+  Swift files).
+
 ## Acceptance criteria
 
 1. AC1: `docs/superpowers/specs/2026-11-01-release-acceptance-operator-journeys-design.md` (this
