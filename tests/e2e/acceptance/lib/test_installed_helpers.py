@@ -301,6 +301,32 @@ def test_exit_on_term() -> None:
         check(False, "the child did not exit within 10 s of SIGTERM")
     check(p.returncode == 2, f"exit code 2 after SIGTERM (got {p.returncode}; stderr {err.strip()[:120]!r})")
     check("finally ran" in out, f"the `finally` block ran (stdout {out!r})")
+    # SIGINT: even when the child was started with SIGINT ignored (a bash background job), the helper
+    # restores KeyboardInterrupt so the watchdog's first signal reaches `finally` too.
+    child_int = (
+        "import signal, sys, time\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        f"sys.path.insert(0, {E2E!r})\n"
+        "from aitm_e2e.installed import exit_on_term\n"
+        "exit_on_term()\n"
+        "print('armed', flush=True)\n"
+        "try:\n"
+        "    time.sleep(30)\n"
+        "except KeyboardInterrupt:\n"
+        "    print('interrupted', flush=True)\n"
+        "finally:\n"
+        "    print('finally ran', flush=True)\n"
+    )
+    pi = subprocess.Popen([sys.executable, "-c", child_int], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pi.stdout.readline()
+    t_int = time.time()
+    pi.send_signal(signal.SIGINT)
+    try:
+        out_i, _ = pi.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        pi.kill()
+        out_i, _ = pi.communicate()
+    check("interrupted" in out_i and "finally ran" in out_i and time.time() - t_int < 5, f"SIGINT -> KeyboardInterrupt -> finally within 5 s even with SIGINT inherited as ignored (stdout {out_i!r})")
     # A plain child without the handler dies with -SIGTERM and never reaches `finally` (the bug the helper closes).
     plain = subprocess.Popen([sys.executable, "-c", "import time\nprint('up', flush=True)\ntry:\n    time.sleep(30)\nfinally:\n    print('finally ran', flush=True)\n"], stdout=subprocess.PIPE, text=True)
     plain.stdout.readline()

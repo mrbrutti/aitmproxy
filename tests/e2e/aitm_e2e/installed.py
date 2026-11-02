@@ -330,8 +330,11 @@ def keep_scope() -> bool:
 def exit_on_term() -> None:
     """Turn SIGTERM (the runner's watchdog, a Ctrl-C'd run.sh's TERM) into SystemExit(2) so a
     cell's `finally` (restore trap, Scope cleanup, step file) still runs. Every cell calls this
-    first thing in main(). Default SIGTERM disposition kills the interpreter outright."""
+    first thing in main(). Default SIGTERM disposition kills the interpreter outright. SIGINT (the
+    watchdog's first signal) is put back to KeyboardInterrupt in case the cell was started as a
+    background job with SIGINT ignored (bash does that for `cmd &` in a script)."""
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))
+    signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
 def append_leftover(out_dir: str, host: str, state: str, cell: str) -> None:
