@@ -117,7 +117,13 @@ fn rig_on(tag: &str, policy: Option<AgentPolicy>, transport: McpTransport) -> Ri
     }
     let assembled = assemble(&cfg).expect("assemble");
     let governance = assembled.governance();
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        Arc::clone(&assembled.job_bus),
+    );
     let (agent, tui) = tui::build_servers(&cfg, services, governance);
     Rig {
         cfg,

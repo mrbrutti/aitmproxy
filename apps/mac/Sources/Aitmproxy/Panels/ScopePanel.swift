@@ -14,8 +14,6 @@ struct ScopePanel: View {
     @State private var draft = ""
     @State private var selected: String?
     @State private var hovered: String?
-    /// Hosts sent with `scope.add` that the bus has not listed yet (kept in tertiary).
-    @State private var pending: [String] = []
     @State private var width: CGFloat = 0
     @FocusState private var fieldFocused: Bool
     @FocusState private var tableFocused: Bool
@@ -38,13 +36,15 @@ struct ScopePanel: View {
         return max(Self.hostMin, width - fixed)
     }
 
+    /// The core's list, then the adds in flight (S-081): sending, queued for the core's
+    /// return, or failed with the core's reason — each says so on its row.
     private var entries: [ScopeEntry] {
         let listed = ScopeEntry.entries(hosts: session.scopeHosts)
-        return listed + pending.filter { !session.scopeHosts.contains($0) }.map { ScopeEntry(host: $0) }
+        return listed + session.scopeAdds.hosts.filter { !session.scopeHosts.contains($0) }.map { ScopeEntry(host: $0) }
     }
 
-    private var trimmed: String { draft.trimmingCharacters(in: .whitespaces) }
-    private var validation: String? { trimmed.isEmpty ? nil : ScopeEntry.validate(trimmed, existing: session.scopeHosts + pending) }
+    private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var validation: String? { trimmed.isEmpty ? nil : ScopeEntry.validate(trimmed, existing: session.scopeHosts + session.scopeAdds.hosts) }
     private var canAdd: Bool { !trimmed.isEmpty && validation == nil }
 
     var body: some View {
@@ -68,6 +68,9 @@ struct ScopePanel: View {
             } else {
                 table
             }
+            if session.l4Enabled {
+                l4Section
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .gridArea("scope-panel", inset: 0)
@@ -82,7 +85,6 @@ struct ScopePanel: View {
                 fieldFocused = true
             }
         }
-        .onChange(of: session.scopeHosts) { pending.removeAll { session.scopeHosts.contains($0) } }
     }
 
     // MARK: Add
@@ -119,7 +121,6 @@ struct ScopePanel: View {
     private func add() {
         guard canAdd else { return }
         let host = trimmed
-        pending.append(host)
         session.addScope(host)
         draft = ""
         fieldFocused = true
@@ -170,19 +171,42 @@ struct ScopePanel: View {
     }
 
     private func row(_ entry: ScopeEntry) -> some View {
-        let isPending = !session.scopeHosts.contains(entry.host)
+        let addState = session.scopeAdds.state(of: entry.host)
+        let isPending = addState != nil
         let isSelected = selected == entry.host
         let ink = isPending ? Tok.Ink.tertiary.color : Tok.Ink.primary.color
+        // An add in flight carries its state where the limit columns would be (S-081).
+        let stateLine = addState.map(ScopeAddQueue.label(for:))
+        let failed: Bool = if case .failed = addState { true } else { false }
+        // ✕ while the send is in flight would forget the row but not the send: the host would come
+        // back as a listed entry within a poll. It is enabled again as soon as the core has answered.
+        let sending = addState == .sending
         return Button {
             selected = entry.host
             tableFocused = true
         } label: {
             HStack(spacing: Space.md) {
                 cell(entry.host, width: hostWidth).foregroundStyle(ink).truncationMode(.middle)
-                cell(entry.limit?.limitText ?? Format.dash, width: Self.limitWidth)
-                    .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
-                cell(entry.limit?.backoffText ?? Format.dash, width: Self.backoffWidth)
-                    .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+                if let stateLine {
+                    // State and Retry share the Limit + Back-off columns' width exactly, so a
+                    // failed row keeps Host and ✕ where every other row has them (a Retry added
+                    // beside a full-width cell overflowed the row and clipped the host's leading edge).
+                    HStack(spacing: Space.sm) {
+                        Text(stateLine).lineLimit(1).truncationMode(.tail).help(stateLine)
+                            .foregroundStyle(failed ? Tok.Intercept.deep.color : Tok.Ink.tertiary.color)
+                            .accessibilityIdentifier("scope-add-state")
+                        if failed {
+                            FlatButton("Retry") { session.retryScopeAdd(entry.host) }
+                                .accessibilityLabel("Retry adding \(entry.host) to Scope")
+                        }
+                    }
+                    .frame(width: Self.limitWidth + Self.backoffWidth + Space.md, alignment: .leading)
+                } else {
+                    cell(entry.limit?.limitText ?? Format.dash, width: Self.limitWidth)
+                        .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+                    cell(entry.limit?.backoffText ?? Format.dash, width: Self.backoffWidth)
+                        .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+                }
                 cell(String(entry.flowCount(in: session.rows)), width: Self.flowsWidth, alignment: .trailing)
                     .foregroundStyle(ink).monospacedDigit()
                 Spacer(minLength: 0)
@@ -194,7 +218,8 @@ struct ScopePanel: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PressStyle())
-                .help("Remove from Scope")
+                .disabled(sending)
+                .help(sending ? "Sending to the core…" : "Remove from Scope")
                 .accessibilityLabel("Remove \(entry.host) from Scope")
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
@@ -220,7 +245,7 @@ struct ScopePanel: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(entry.host)
-        .accessibilityValue(isPending ? "pending" : entry.limit?.readout ?? "no limit")
+        .accessibilityValue(stateLine ?? entry.limit?.readout ?? "no limit")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
@@ -231,12 +256,274 @@ struct ScopePanel: View {
     // MARK: Remove
 
     private func remove(_ host: String) {
-        if pending.contains(host), !session.scopeHosts.contains(host) {
-            pending.removeAll { $0 == host }
+        if session.scopeAdds.state(of: host) != nil, !session.scopeHosts.contains(host) {
+            session.dropScopeAdd(host)
         } else {
             session.removeScope(host) { ScopeRemoveConfirmation.ask(host: host, pausedCount: $0) }
         }
         if selected == host { selected = nil }
+    }
+
+    // MARK: L4 scope (L4PAR-AC26, AC28, AC30; plan unit (d) Decision 6)
+    //
+    // The row-less L4 home: the core's own capture/inject and in-path intercept
+    // availability (spec §1), its `l4.scope.list` entries, and — only while
+    // `tools/list` shows `l4.scope.add` confirmable (spec §3 last rule) — the
+    // operator's add form with the confirm-over-the-wire handshake. No remove
+    // action and no Craft button live here.
+
+    @State private var l4Cidr = ""
+    @State private var l4Ports = ""
+    @State private var l4Interface = "lo0"
+    @State private var l4Direction = "inbound"
+    @State private var l4Capability = "capture"
+    /// A guard refusal or bus error from the last add, shown inline under the form.
+    @State private var l4AddError: String?
+    /// The core's `needs_confirmation` prompt, bound to the call that caused it.
+    @State private var l4Confirm: L4ConfirmRequest?
+    /// An add (or its confirmed re-issue) is in flight; the button waits.
+    @State private var l4Adding = false
+
+    private static let l4CidrWidth: CGFloat = 160
+    private static let l4PortsWidth: CGFloat = 96
+    private static let l4InterfaceWidth: CGFloat = 56
+    private static let l4DirectionWidth: CGFloat = 72
+    private static let l4CapabilityWidth: CGFloat = 80
+    private static let l4Directions = ["inbound", "outbound"]
+    private static let l4Capabilities = ["capture", "inject", "intercept"]
+
+    private var l4Section: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Rule()
+            Text("L4 SCOPE").font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
+                .foregroundStyle(Tok.Ink.tertiary.color)
+                .gridProbe("scope-l4-title", area: "scope-l4")
+                .padding(.horizontal, Space.lg).padding(.top, Space.lg).padding(.bottom, Space.sm)
+                .accessibilityAddTraits(.isHeader)
+            l4AvailabilityLine(Self.l4LineText("Capture and inject", session.l4CaptureAvailability),
+                               availability: session.l4CaptureAvailability, id: "l4-scope-capture-line")
+            l4AvailabilityLine(Self.l4LineText("In-path intercept", session.l4InterceptAvailability),
+                               availability: session.l4InterceptAvailability, id: "l4-scope-intercept-line")
+            if session.l4Scope.isEmpty {
+                Hint(text: "No L4 scope entries")
+                    .gridProbe("scope-l4-empty", area: "scope-l4")
+                    .padding(.horizontal, Space.lg).padding(.top, Space.sm)
+                    .accessibilityIdentifier("l4-scope-empty")
+            } else {
+                l4Table
+            }
+            if session.l4CanAddScope {
+                if l4IsOperator {
+                    l4AddForm
+                } else {
+                    // `tools/list` says confirmable to an agent too, but only the operator's
+                    // add is ever accepted (spec §3): an agent gets a policy refusal, so the
+                    // form would be a control that can only fail (AC33; plan amendment 7).
+                    Hint(text: "Adding L4 scope needs the operator token (Settings ▸ Bus)")
+                        .gridProbe("scope-l4-operator-only", area: "scope-l4")
+                        .padding(.horizontal, Space.lg).padding(.top, Space.sm)
+                        .accessibilityIdentifier("l4-scope-add-operator-only")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, Space.lg)
+        .gridArea("scope-l4", inset: 0)
+        .sheet(item: $l4Confirm) { request in
+            // The shared L4 confirm sheet (Inspector/L4ConfirmSheet.swift): its words follow the
+            // bound `l4.scope.add` call — "Confirm L4 scope entry" / Add / `l4-scope-confirm`.
+            L4ConfirmSheet(request: request, onConfirm: { confirmL4Scope(request) }, onCancel: { l4Confirm = nil })
+        }
+    }
+
+    /// `<what> available`, `<what> unavailable: <reason>`, or the shared pending
+    /// literal while the first status reply is outstanding (spec §1).
+    static func l4LineText(_ what: String, _ availability: L4Availability) -> String {
+        switch availability {
+        case .available: "\(what) available"
+        case .degraded(let reason): "\(what) unavailable: \(reason)"
+        case .pending: availability.displayText ?? L4Availability.pendingText
+        }
+    }
+
+    /// One documented-limited line, no buttons: the core's own reason, quoted.
+    private func l4AvailabilityLine(_ text: String, availability: L4Availability, id: String) -> some View {
+        Text(text)
+            .font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(availability == .pending ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+            .padding(.horizontal, Space.lg).padding(.bottom, Space.xs)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(text)
+            .accessibilityIdentifier(id)
+    }
+
+    private var l4Table: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: Space.md) {
+                headCell("CIDR", width: Self.l4CidrWidth)
+                headCell("Ports", width: Self.l4PortsWidth)
+                headCell("If", width: Self.l4InterfaceWidth)
+                headCell("Direction", width: Self.l4DirectionWidth)
+                headCell("Capability", width: Self.l4CapabilityWidth)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, Space.md)
+            .frame(height: Tok.Size.columnHeader)
+            .overlay(alignment: .bottom) { Rule() }
+            .accessibilityHidden(true)
+            .gridProbe("scope-l4-table", area: "scope-l4", edge: nil)
+            ForEach(session.l4Scope) { item in l4Row(item) }
+        }
+        .padding(.top, Space.xs)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("L4 scope entries")
+    }
+
+    private func l4Row(_ item: L4ScopeItem) -> some View {
+        HStack(spacing: Space.md) {
+            cell(item.cidr, width: Self.l4CidrWidth).foregroundStyle(Tok.Ink.primary.color)
+            cell(item.ports, width: Self.l4PortsWidth).foregroundStyle(Tok.Ink.secondary.color)
+            cell(item.interface, width: Self.l4InterfaceWidth).foregroundStyle(Tok.Ink.secondary.color)
+            cell(item.direction, width: Self.l4DirectionWidth).foregroundStyle(Tok.Ink.secondary.color)
+            cell(item.capability, width: Self.l4CapabilityWidth).foregroundStyle(Tok.Ink.secondary.color)
+            Spacer(minLength: 0)
+            Badge(text: item.source, pair: item.source == "config" ? Tok.State.neutral : Tok.L4.badge)
+                .help(item.source == "config" ? "Declared in the l4.scope config block" : "Added at runtime over the bus")
+        }
+        .font(Tok.Face.data(Tok.Typography.Size.sm))
+        .padding(.horizontal, Space.md)
+        .frame(height: Tok.Size.Row.dense)
+        .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(item.cidr) \(item.ports) \(item.interface) \(item.direction) \(item.capability)")
+        .accessibilityValue(item.source)
+        .accessibilityIdentifier("l4-scope-row-\(item.id)")
+    }
+
+    // MARK: L4 add (spec §3; rendered only while `l4CanAddScope` and the session is the operator)
+
+    /// The connection is the operator's: `Session.isOperator`, read from the `resolvedRole` the
+    /// server echoed at `initialize`; nil (unconfirmed) is not the operator.
+    private var l4IsOperator: Bool { session.isOperator }
+
+    private var l4CidrTrimmed: String { l4Cidr.trimmingCharacters(in: .whitespaces) }
+    private var l4InterfaceTrimmed: String { l4Interface.trimmingCharacters(in: .whitespaces) }
+    private var canAddL4: Bool { !l4Adding && !l4CidrTrimmed.isEmpty && !l4InterfaceTrimmed.isEmpty }
+
+    private var l4AddForm: some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            HStack(spacing: Space.sm) {
+                l4Field("cidr", text: $l4Cidr, width: Self.l4CidrWidth, label: "CIDR to add to L4 scope")
+                l4Field("all", text: $l4Ports, width: Self.l4PortsWidth, label: "Ports (empty for all)")
+                l4Field("lo0", text: $l4Interface, width: Self.l4InterfaceWidth, label: "Interface")
+            }
+            HStack(spacing: Space.md) {
+                FlatSegment(options: Self.l4Directions.map { ($0, $0) }, selection: $l4Direction)
+                    .accessibilityLabel("Direction")
+                FlatSegment(options: Self.l4Capabilities.map { ($0, $0) }, selection: $l4Capability)
+                    .accessibilityLabel("Capability")
+                Spacer(minLength: 0)
+                PrimaryButton("Add", action: addL4Scope)
+                    .disabled(!canAddL4)
+                    .help(l4Adding ? "Waiting for the core" : "Add the entry to L4 scope — the core confirms it over the wire first")
+                    .accessibilityIdentifier("l4-scope-add")
+            }
+            if let l4AddError {
+                Text(l4AddError)
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Status.serverError.color)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("l4-scope-add-error")
+            }
+        }
+        .gridProbe("scope-l4-add", area: "scope-l4")
+        .padding(.horizontal, Space.lg).padding(.top, Space.md)
+    }
+
+    private func l4Field(_ placeholder: String, text: Binding<String>, width: CGFloat, label: String) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .font(Tok.Face.data(Tok.Typography.Size.md))
+            .padding(.horizontal, Space.sm)
+            .frame(width: width, height: Tok.Size.control)
+            .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+            .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
+            .onSubmit(addL4Scope)
+            .accessibilityLabel(label)
+    }
+
+    /// Issue `l4.scope.add` once, unconfirmed. A `needs_confirmation` reply opens the
+    /// prompt bound to this exact call; a plain result refreshes the list; a guard
+    /// refusal or error lands inline, never in a dialog.
+    private func addL4Scope() {
+        // The role gate at the send site, not only on the form (AC33; plan amendment 7): a
+        // future menu item or shortcut that reaches here without the operator role is refused
+        // inline with the same reason the inspector's verbs use, and nothing is sent.
+        guard l4IsOperator else { l4AddError = Session.operatorOnlyReason; return }
+        guard canAddL4 else { return }
+        let draft = L4ScopeDraft(cidr: l4CidrTrimmed, ports: l4Ports, interface: l4InterfaceTrimmed,
+                                 direction: l4Direction, capability: l4Capability)
+        let call = L4PendingCall(command: "l4.scope.add", args: draft.args)
+        l4AddError = nil
+        l4Adding = true
+        Task {
+            defer { l4Adding = false }
+            do {
+                let result = try await session.runCommand(call.command, call.args)
+                if let request = L4ConfirmRequest(json: result, call: call) {
+                    l4Confirm = request
+                } else {
+                    await refreshL4ScopeAfterAdd()
+                }
+            } catch {
+                l4AddError = BusService.describe(error)
+            }
+        }
+    }
+
+    /// Re-issue the identical call the prompt was bound to, plus `_confirm` and
+    /// nothing else (`L4PendingCall.confirmed(with:)`).
+    private func confirmL4Scope(_ request: L4ConfirmRequest) {
+        l4Confirm = nil
+        guard let call = request.call?.confirmed(with: request) else {
+            l4AddError = "The confirmation was not bound to a call; add the entry again."
+            return
+        }
+        l4Adding = true
+        Task {
+            defer { l4Adding = false }
+            do {
+                _ = try await session.runCommand(call.command, call.args)
+                await refreshL4ScopeAfterAdd()
+            } catch {
+                l4AddError = BusService.describe(error)
+            }
+        }
+    }
+
+    /// Re-read `l4.scope.list` so the new entry shows at once, and clear the form.
+    ///
+    /// The read goes through `session.runCommand` like the add itself (the Scope page has no
+    /// `FlowActions` verb for L4 scope, and this fix may not widen that protocol), so the
+    /// write into `session.l4Scope` has no run-ownership guard of its own: it is taken only
+    /// while the bus still reports connected after the await, which is as close as a view can
+    /// get to `BusService`'s owner check. A reconnect that lands inside the round trip loses
+    /// nothing — `BusService.pollLoop` clears the L4 facts on disconnect and its slow tick
+    /// re-reads `l4.scope.list` (about every 5 s), so the list converges on the core's either
+    /// way. The form is the view's own and is cleared on every successful read.
+    private func refreshL4ScopeAfterAdd() async {
+        do {
+            let list = try await session.runCommand("l4.scope.list", [:])
+            let items = L4ScopeItem.list(list)
+            if case .connected = session.bus, session.l4Scope != items { session.l4Scope = items }
+            l4Cidr = ""
+            l4Ports = ""
+            l4Interface = "lo0"
+        } catch {
+            l4AddError = BusService.describe(error)
+        }
     }
 }
 

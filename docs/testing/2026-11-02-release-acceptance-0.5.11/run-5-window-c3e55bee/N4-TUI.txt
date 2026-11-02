@@ -1,0 +1,4 @@
+Error: cannot start: the proxy port 127.0.0.1:8080 is already in use.
+It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.
+Free it, or set `listen:` to another address in /Users/matt/Library/Application Support/aitmproxy/config.yaml.
+Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN

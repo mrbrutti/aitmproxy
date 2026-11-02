@@ -25,6 +25,19 @@
 //!
 //! **Never hangs.** The await is bounded by `spec.timeout`; silence returns
 //! [`SendRecvOutcome::NoResponse`] carrying how long it waited (AC11).
+//!
+//! **The capture sees the stimulus itself.** A packet capture taps the
+//! interface, not one direction of it: on Linux `lo` libpcap delivers the RX
+//! copy of the frame we just injected, and macOS `lo0` BPF reports sent frames
+//! too, so on a loopback target the first frame the reply capture reads is our
+//! own stimulus. Under `FiveTuple` that frame comes "from" the target host with
+//! the wrong source port, which once classified it `Other` and ended the await
+//! before the real reply arrived (the scanner v2 T5 live proof on Linux saw
+//! every case as `protocol_error` and never an echo, an ICMP error or a RST).
+//! The correlator therefore ignores, in every match mode, a frame that travels
+//! in the stimulus's own direction — same source address and port, same
+//! destination address and port, same protocol, whatever link framing the
+//! capture delivers it under — and keeps waiting for the reply behind it.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -34,7 +47,7 @@ use std::time::{Duration, Instant, SystemTime};
 use etherparse::{NetSlice, TransportSlice};
 
 use crate::backend::{CaptureInjectBackend, L4Error};
-use crate::craft::PacketSpec;
+use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::{L4Guard, L4GuardError};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
@@ -179,13 +192,13 @@ pub fn send_recv(
     // handed over as one pre-built `Raw` frame has no transport layer in its spec
     // yet is an IPv4/UDP (or TCP) packet on the wire, and its reversed five-tuple
     // must still classify `Response` (scanner v2 T5 review, finding T2).
-    let correlation = Correlation {
-        dst: spec.dst,
-        dst_port: spec.dst_port,
-        proto: real_target.proto,
-        expect: spec.expect,
-        stimulus: bytes.clone(),
-    };
+    let correlation = Correlation::new(
+        spec.dst,
+        spec.dst_port,
+        real_target.proto,
+        spec.expect,
+        bytes.clone(),
+    );
     let poll = spec.timeout.min(REPLY_POLL).max(Duration::from_millis(1));
     let iface = spec.interface;
     let timeout = spec.timeout;
@@ -330,6 +343,24 @@ struct Correlation {
     proto: L4Proto,
     expect: ReplyMatch,
     stimulus: Vec<u8>,
+    /// The stimulus's own decoded tuple (`src:src_port -> dst:dst_port`,
+    /// protocol), decoded once at construction so recognising our looped-back
+    /// frame costs no per-frame re-parse of the stimulus.
+    stimulus_ends: PacketEndpoints,
+    /// The stimulus's transport bytes — everything after its IP header — copied
+    /// once at construction. A kernel that puts our frame on the wire for us
+    /// (Linux loopback, a header-included raw socket) may rewrite IP header
+    /// fields (identification, checksum, a zero source address) but never the
+    /// transport, so this is the part of our own frame that comes back verbatim.
+    stimulus_transport: Vec<u8>,
+    /// Whether the one same-host, portless self-echo has been consumed. The
+    /// kernel delivers our injected frame to the capture exactly once per
+    /// `send_recv`, so [`Correlation::is_own_stimulus`] claims at most one
+    /// transport-equal same-host frame as ours and any further one is a reply.
+    /// A `Cell`: `classify` takes `&self` and the correlation is owned by the
+    /// one worker thread that awaits the reply (it moves into the thread, so it
+    /// needs `Send`, never `Sync`).
+    portless_echo_seen: std::cell::Cell<bool>,
 }
 
 /// The verdict on one captured frame.
@@ -344,22 +375,66 @@ enum Classified {
 }
 
 impl Correlation {
+    fn new(
+        dst: IpAddr,
+        dst_port: Option<u16>,
+        proto: L4Proto,
+        expect: ReplyMatch,
+        stimulus: Vec<u8>,
+    ) -> Self {
+        // One decode of the stimulus, over the same parser every captured frame
+        // goes through, so the two sides of every comparison are delimited alike.
+        let (stimulus_ends, stimulus_transport) = decode_reply(&stimulus)
+            .map(|info| (info.ends, info.transport.to_vec()))
+            .unwrap_or_default();
+        Self {
+            dst,
+            dst_port,
+            proto,
+            expect,
+            stimulus,
+            stimulus_ends,
+            stimulus_transport,
+            portless_echo_seen: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether the stimulus is portless (ICMP, an unknown protocol) between the
+    /// same two addresses — the one shape whose self-echo cannot be told from a
+    /// verbatim reply by direction, so it is counted instead.
+    fn is_portless_same_host(&self) -> bool {
+        let ends = &self.stimulus_ends;
+        matches!((ends.src, ends.dst), (Some(src), Some(dst)) if src == dst)
+            && !matches!((ends.src_port, ends.dst_port), (Some(_), Some(_)))
+    }
+
     fn classify(&self, frame: &[u8]) -> Classified {
+        // Our own stimulus, looped back to the capture that is awaiting its
+        // reply (see the module doc), is not a reply under any match mode. The
+        // byte-equal check is the cheap first cut; the direction check below is
+        // the rule, since the capture may re-frame the copy.
+        if frame == self.stimulus.as_slice() {
+            // A verbatim copy (macOS BPF) is the one self-echo a same-host
+            // portless stimulus gets: mark it consumed, so a verbatim reply
+            // behind it is not taken for a second copy of our frame.
+            if self.is_portless_same_host() {
+                self.portless_echo_seen.set(true);
+            }
+            return Classified::Ignore;
+        }
         let Some(info) = decode_reply(frame) else {
             return Classified::Ignore;
         };
+        if self.is_own_stimulus(&info) {
+            return Classified::Ignore;
+        }
+        let ends = &info.ends;
         match self.expect {
             // Any decodable frame that is not our own stimulus echoed back.
-            ReplyMatch::Any => {
-                if frame == self.stimulus.as_slice() {
-                    Classified::Ignore
-                } else {
-                    Classified::Response
-                }
-            }
+            ReplyMatch::Any => Classified::Response,
             // Correlate purely by source host.
             ReplyMatch::FromHost(host) => {
-                if info.src == host {
+                if ends.src == Some(host) {
                     Classified::Response
                 } else {
                     Classified::Ignore
@@ -369,16 +444,19 @@ impl Correlation {
             // protocol, and not a reset. Anything else from the host is Other;
             // anything from another host is unrelated.
             ReplyMatch::FiveTuple => {
-                if info.src != self.dst {
+                if ends.src != Some(self.dst) {
                     return Classified::Ignore;
                 }
                 if info.tcp_rst {
                     return Classified::Other;
                 }
-                let proto_match = info.proto == self.proto;
+                // `self.proto` is the stimulus's `packet_target` protocol, where a
+                // frame with no (or an unknown) transport is `Raw`; name the
+                // reply's the same way so a raw-protocol stimulus matches its reply.
+                let proto_match = ends.proto.unwrap_or(L4Proto::Raw) == self.proto;
                 let port_match = match self.dst_port {
                     Some(p) if matches!(self.proto, L4Proto::Tcp | L4Proto::Udp) => {
-                        info.src_port == Some(p)
+                        ends.src_port == Some(p)
                     }
                     _ => true,
                 };
@@ -390,40 +468,101 @@ impl Correlation {
             }
         }
     }
+
+    /// Whether a decoded frame travels in the stimulus's **own direction** —
+    /// the same source address and port, the same destination address and
+    /// port, the same protocol — and is therefore our injected frame coming
+    /// back through the capture, whatever link framing it came back under.
+    ///
+    /// A TCP/UDP stimulus states its direction with its ports, so this holds on
+    /// loopback too (the lane never claims the target's own port as its
+    /// source). A portless stimulus (ICMP, an unknown protocol) has only its
+    /// addresses: off loopback they differ and still state a direction; on
+    /// loopback both ends are the same host and the direction is symmetric, so
+    /// the frame is ours when its **transport bytes** are the stimulus's. The
+    /// IP header is not compared there: a kernel that sends our frame through a
+    /// header-included raw socket (Linux `lo`) fills a zero identification and
+    /// recomputes the header checksum, so the looped-back copy is not byte-equal
+    /// (the fast path in [`Correlation::classify`] misses it) while its
+    /// transport is untouched. A loopback ICMP echo reply differs in its
+    /// transport (type 0, another checksum) and still correlates. A frame too
+    /// short to carry a transport slice never compares equal.
+    ///
+    /// The transport comparison is consumed **at most once** per correlation
+    /// (`portless_echo_seen`, also set by the byte-equal fast path in
+    /// [`Correlation::classify`]): the kernel delivers our injected frame to the
+    /// capture exactly once per `send_recv`, so the first transport-equal
+    /// same-host frame is the self-echo and any further one is a reply. That
+    /// removes the residual the security delta named — a same-host raw service
+    /// for a protocol with no type field (IPPROTO 253, say) that echoes the
+    /// stimulus verbatim used to be indistinguishable from the self-echo and
+    /// was `Ignore`d in every mode. What remains: a reply that reached the
+    /// capture **before** our own echo is read from it would be taken for the
+    /// echo and the echo for the reply. On loopback that order cannot occur (the
+    /// echo is delivered synchronously with the send, ahead of anything the
+    /// target answers), which is why the rule is "at most one" and not "the
+    /// first one is the echo". The accepted shape on the other side: two
+    /// self-echo-shaped frames with no real reply behind them report the second
+    /// as the `Response` (pinned by a test).
+    fn is_own_stimulus(&self, info: &ReplyInfo<'_>) -> bool {
+        let ends = &self.stimulus_ends;
+        let (Some(src), Some(dst)) = (ends.src, ends.dst) else {
+            return false;
+        };
+        if info.ends.src != Some(src) || info.ends.dst != Some(dst) || info.ends.proto != ends.proto
+        {
+            return false;
+        }
+        match (ends.src_port, ends.dst_port) {
+            (Some(src_port), Some(dst_port)) => {
+                info.ends.src_port == Some(src_port) && info.ends.dst_port == Some(dst_port)
+            }
+            _ => {
+                if src != dst {
+                    return true;
+                }
+                if info.transport == self.stimulus_transport.as_slice()
+                    && !self.portless_echo_seen.get()
+                {
+                    self.portless_echo_seen.set(true);
+                    return true;
+                }
+                false
+            }
+        }
+    }
 }
 
-/// What a reply frame carries for correlation: its source address + port, its
-/// transport protocol, and whether it is a TCP reset.
-struct ReplyInfo {
-    src: IpAddr,
-    src_port: Option<u16>,
-    proto: L4Proto,
+/// What a reply frame carries for correlation: its endpoints (addresses, ports,
+/// transport protocol — the crate's one decode, [`crate::craft::endpoints_of`]),
+/// whether it is a TCP reset, and its transport bytes (everything after the IP
+/// header, as the parser delimits them).
+struct ReplyInfo<'a> {
+    ends: PacketEndpoints,
     tcp_rst: bool,
+    transport: &'a [u8],
 }
 
 /// Decode a captured frame to its correlation fields. `None` for a frame with no
 /// IP layer (ARP / undecodable) — such a frame cannot correlate to an IP stimulus.
 /// Mirrors the link-layer probing in the capture task (our crafted frames start at
 /// L3; a NIC delivers L2 Ethernet; BSD loopback prepends a 4-byte AF word).
-fn decode_reply(frame: &[u8]) -> Option<ReplyInfo> {
+fn decode_reply(frame: &[u8]) -> Option<ReplyInfo<'_>> {
     let parsed = crate::craft::parse_frame(frame)?;
-    let src = match parsed.net? {
-        NetSlice::Ipv4(ip) => IpAddr::V4(ip.header().source_addr()),
-        NetSlice::Ipv6(ip) => IpAddr::V6(ip.header().source_addr()),
+    let transport = match parsed.net.as_ref()? {
+        NetSlice::Ipv4(ip) => ip.payload().payload,
+        NetSlice::Ipv6(ip) => ip.payload().payload,
         NetSlice::Arp(_) => return None,
     };
-    let (src_port, proto, tcp_rst) = match parsed.transport {
-        Some(TransportSlice::Tcp(t)) => (Some(t.source_port()), L4Proto::Tcp, t.rst()),
-        Some(TransportSlice::Udp(u)) => (Some(u.source_port()), L4Proto::Udp, false),
-        Some(TransportSlice::Icmpv4(_)) => (None, L4Proto::Icmp, false),
-        Some(TransportSlice::Icmpv6(_)) => (None, L4Proto::IcmpV6, false),
-        _ => (None, L4Proto::Raw, false),
-    };
+    let ends = crate::craft::endpoints_of(&parsed);
+    if ends.src.is_none() || ends.dst.is_none() {
+        return None;
+    }
+    let tcp_rst = matches!(&parsed.transport, Some(TransportSlice::Tcp(t)) if t.rst());
     Some(ReplyInfo {
-        src,
-        src_port,
-        proto,
+        ends,
         tcp_rst,
+        transport,
     })
 }
 
@@ -1004,6 +1143,1011 @@ mod tests {
         assert_eq!(flow.packets.len(), 1, "only the stimulus is recorded");
         assert!(flow.packets[0].injected);
         assert_eq!(g.in_flight(), 0);
+    }
+
+    /// An L3 UDP frame from `src:src_port` to `dst:dst_port` — both ends
+    /// explicit, so a test can state a direction.
+    fn udp_from_to(src: &str, src_port: u16, dst: &str, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(src_port),
+                    dst_port: Some(dst_port),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(payload.to_vec()),
+            ],
+        }
+        .build()
+        .expect("udp frame builds")
+    }
+
+    /// A TCP SYN from 127.0.0.1:40000 to 127.0.0.1:`dst_port`.
+    fn tcp_syn_to(dst_port: u16) -> Vec<u8> {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some("127.0.0.1".parse::<Ipv4Addr>().unwrap()),
+                    dst: Some("127.0.0.1".parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(40000),
+                    dst_port: Some(dst_port),
+                    flags: Some(0x02),
+                    ..TcpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("syn builds")
+    }
+
+    /// An ICMPv4 `icmp_type`/`code` from `src` to 127.0.0.1, quoting the head
+    /// of `quoted` as a real ICMP error does.
+    fn icmp_from(src: &str, icmp_type: u8, code: u8, quoted: &[u8]) -> Vec<u8> {
+        use crate::craft::IcmpSpec;
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some("127.0.0.1".parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Icmp(IcmpSpec {
+                    icmp_type: Some(icmp_type),
+                    code: Some(code),
+                    rest_of_header: Some(0),
+                    checksum: None,
+                }),
+                Layer::Raw(quoted.iter().take(28).copied().collect()),
+            ],
+        }
+        .build()
+        .expect("icmp builds")
+    }
+
+    /// `frame` as the one `Raw` layer of a spec, so exactly those bytes ship —
+    /// how the lane hands `send_recv` a mutated case.
+    fn raw_spec(
+        frame: &[u8],
+        dst_port: u16,
+        expect: ReplyMatch,
+        timeout: Duration,
+    ) -> SendRecvSpec {
+        SendRecvSpec {
+            packet: PacketSpec {
+                layers: vec![Layer::Raw(frame.to_vec())],
+            },
+            dst: "127.0.0.1".parse().unwrap(),
+            dst_port: Some(dst_port),
+            interface: IFACE.to_string(),
+            timeout,
+            expect,
+        }
+    }
+
+    /// T5 live proof (Critical): on a loopback interface the reply capture
+    /// inside `send_recv` is handed the **injected stimulus itself** before any
+    /// reply (Linux `lo` delivers the RX copy of our own frame; macOS `lo0` BPF
+    /// sees sent frames too). Under `FiveTuple` that frame has `src == dst` and
+    /// the wrong source port, which classified it `Other` and ended the await
+    /// before the real reply arrived. The stimulus must be `Ignore`d in every
+    /// mode and the frame behind it correlated: (a) a UDP echo carrying the very
+    /// same payload bytes with the ports reversed is the `Response`; (b) an
+    /// ICMP 3/3 from the target host is `Other`; (c) a TCP RST is `Other`;
+    /// (d) the self-echo alone is silence — the await keeps waiting past it.
+    #[test]
+    fn loopback_self_echo_is_ignored_and_the_real_reply_correlates() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+
+        // (a) self-echo, then the echo service's reply: identical payload,
+        // ports reversed. The Response is the reply, never the echo.
+        let echo = udp_reply("127.0.0.1", 9, b"probe");
+        assert_ne!(
+            echo, stimulus,
+            "the echo differs from the stimulus only by direction"
+        );
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![stimulus.clone(), echo.clone()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend.clone(),
+            store.clone(),
+            raw_spec(&stimulus, 9, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Response(p) => {
+                assert_eq!(p.bytes, echo, "the reply, not the echo");
+            }
+            other => panic!("(a) expected the UDP echo as Response, got {other:?}"),
+        }
+        let flow = store.get(flow_id).expect("flow present");
+        assert_eq!(
+            flow.packets.len(),
+            2,
+            "stimulus + reply; the self-echo is never recorded"
+        );
+        assert_eq!(flow.packets[1].bytes, echo);
+        assert_eq!(backend.injected(), vec![stimulus.clone()]);
+        assert_eq!(g.in_flight(), 0);
+
+        // (b) self-echo, then the kernel's port-unreachable.
+        let unreachable = icmp_from("127.0.0.1", 3, 3, &stimulus);
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![stimulus.clone(), unreachable.clone()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (_, outcome) = send_recv(
+            &g,
+            backend,
+            store,
+            raw_spec(&stimulus, 9, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Other(p) => {
+                assert_eq!(p.bytes, unreachable, "the icmp, not the echo");
+            }
+            other => panic!("(b) expected the ICMP 3/3 as Other, got {other:?}"),
+        }
+
+        // (c) a TCP SYN's self-echo, then the closed port's RST.
+        let syn = tcp_syn_to(80);
+        let rst = tcp_rst_reply("127.0.0.1", 80);
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![syn.clone(), rst.clone()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (_, outcome) = send_recv(
+            &g,
+            backend,
+            store,
+            raw_spec(&syn, 80, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Other(p) => assert_eq!(p.bytes, rst, "the rst, not the echo"),
+            other => panic!("(c) expected the TCP RST as Other, got {other:?}"),
+        }
+
+        // (d) only the self-echo: the await lasts the whole window and reports
+        // silence, and the flow holds the stimulus alone.
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![stimulus.clone()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let timeout = Duration::from_millis(80);
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            raw_spec(&stimulus, 9, ReplyMatch::FiveTuple, timeout),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::NoResponse { waited } => {
+                assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
+            }
+            other => panic!("(d) expected NoResponse past the self-echo, got {other:?}"),
+        }
+        let flow = store.get(flow_id).expect("flow present");
+        assert_eq!(flow.packets.len(), 1, "only the stimulus is recorded");
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// The self-echo is recognised by **direction**, not by byte equality: the
+    /// capture may deliver our frame under another link framing (here with an
+    /// Ethernet header the L3 stimulus did not carry), and it is still our own
+    /// `src:src_port -> dst:dst_port`. Under `FromHost(127.0.0.1)`, which
+    /// matches on the source host alone, the re-framed echo would otherwise be
+    /// the "reply"; the genuine echo behind it must be the `Response` in every
+    /// match mode.
+    #[test]
+    fn self_echo_is_recognised_by_direction_under_every_match_mode() {
+        use crate::craft::EtherSpec;
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        let reframed = PacketSpec {
+            layers: vec![
+                Layer::Ether(EtherSpec {
+                    ethertype: Some(0x0800),
+                    ..EtherSpec::default()
+                }),
+                Layer::Raw(stimulus.clone()),
+            ],
+        }
+        .build()
+        .expect("ethernet-framed copy builds");
+        assert_ne!(reframed, stimulus);
+        assert_eq!(
+            PacketSpec::summarize(&reframed).layers,
+            vec!["Ethernet", "IPv4", "UDP"],
+            "the re-framed copy still decodes to our tuple"
+        );
+        let echo = udp_reply("127.0.0.1", 9, b"probe");
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![reframed.clone(), echo.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, Duration::from_secs(10)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => {
+                    assert_eq!(
+                        p.bytes, echo,
+                        "{expect:?}: the reply, not the re-framed echo"
+                    );
+                }
+                other => panic!("{expect:?}: expected the echo as Response, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(flow.packets.len(), 2, "{expect:?}: stimulus + reply only");
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// A portless stimulus (ICMP) has only addresses and protocol to state a
+    /// direction. Off loopback that is enough: our `10.0.0.1 -> 10.0.0.2` echo
+    /// request is ignored even re-framed, and the `10.0.0.2 -> 10.0.0.1` echo
+    /// reply is the `Response`. On loopback both ends are `127.0.0.1`, so the
+    /// direction is symmetric and only a byte-equal frame is the self-echo: the
+    /// kernel's echo reply (type 0, a different frame) must still correlate.
+    #[test]
+    fn portless_self_echo_uses_addresses_and_never_swallows_a_loopback_echo_reply() {
+        use crate::craft::{EtherSpec, IcmpSpec};
+        let icmp = |src: &str, dst: &str, icmp_type: u8| {
+            PacketSpec {
+                layers: vec![
+                    Layer::Ipv4(Ipv4Spec {
+                        src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                        dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                        ..Ipv4Spec::default()
+                    }),
+                    Layer::Icmp(IcmpSpec {
+                        icmp_type: Some(icmp_type),
+                        code: Some(0),
+                        rest_of_header: Some(0x1234_0001),
+                        checksum: None,
+                    }),
+                    Layer::Raw(b"ping".to_vec()),
+                ],
+            }
+            .build()
+            .expect("icmp builds")
+        };
+        let reframe = |frame: &[u8]| {
+            PacketSpec {
+                layers: vec![
+                    Layer::Ether(EtherSpec {
+                        ethertype: Some(0x0800),
+                        ..EtherSpec::default()
+                    }),
+                    Layer::Raw(frame.to_vec()),
+                ],
+            }
+            .build()
+            .expect("ethernet-framed copy builds")
+        };
+
+        // Off loopback.
+        let request = icmp("10.0.0.1", "10.0.0.2", 8);
+        let reply = icmp("10.0.0.2", "10.0.0.1", 0);
+        let c = Correlation::new(
+            "10.0.0.2".parse().unwrap(),
+            None,
+            L4Proto::Icmp,
+            ReplyMatch::FiveTuple,
+            request.clone(),
+        );
+        assert!(
+            matches!(c.classify(&request), Classified::Ignore),
+            "byte-equal echo"
+        );
+        assert!(
+            matches!(c.classify(&reframe(&request)), Classified::Ignore),
+            "re-framed echo, same direction"
+        );
+        assert!(
+            matches!(c.classify(&reply), Classified::Response),
+            "the echo reply"
+        );
+
+        // On loopback.
+        let request = icmp("127.0.0.1", "127.0.0.1", 8);
+        let reply = icmp("127.0.0.1", "127.0.0.1", 0);
+        let c = Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            L4Proto::Icmp,
+            ReplyMatch::FiveTuple,
+            request.clone(),
+        );
+        assert!(
+            matches!(c.classify(&request), Classified::Ignore),
+            "byte-equal echo"
+        );
+        assert!(
+            matches!(c.classify(&reply), Classified::Response),
+            "a loopback echo reply differs from the stimulus and is the Response"
+        );
+    }
+
+    /// An ICMPv4 echo frame of `icmp_type` (8 request / 0 reply), code 0,
+    /// id `0x1234` seq 1, payload `ping`, from `src` to `dst`. Like every
+    /// crafted frame it ships with IPv4 identification 0.
+    fn icmp_echo(src: &str, dst: &str, icmp_type: u8) -> Vec<u8> {
+        use crate::craft::IcmpSpec;
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Icmp(IcmpSpec {
+                    icmp_type: Some(icmp_type),
+                    code: Some(0),
+                    rest_of_header: Some(0x1234_0001),
+                    checksum: None,
+                }),
+                Layer::Raw(b"ping".to_vec()),
+            ],
+        }
+        .build()
+        .expect("icmp builds")
+    }
+
+    /// `frame` as a Linux header-included raw socket puts it on `lo`: the kernel
+    /// fills a zero IPv4 identification (bytes 4..6) and recomputes the header
+    /// checksum (bytes 10..12). Nothing after the IP header changes.
+    fn kernel_shaped(frame: &[u8]) -> Vec<u8> {
+        let mut f = frame.to_vec();
+        assert_eq!(&f[4..6], &[0, 0], "crafted frames ship with id 0");
+        f[4..6].copy_from_slice(&0xBEEF_u16.to_be_bytes());
+        f[10..12].copy_from_slice(&[0, 0]);
+        let ihl = usize::from(f[0] & 0x0F) * 4;
+        let mut sum: u32 = f[..ihl]
+            .chunks(2)
+            .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let check = !u16::try_from(sum).expect("folded to 16 bits");
+        f[10..12].copy_from_slice(&check.to_be_bytes());
+        assert_ne!(f, frame, "the kernel copy is not byte-equal");
+        assert_eq!(f[ihl..], frame[ihl..], "the transport bytes are untouched");
+        f
+    }
+
+    /// A pre-built portless (ICMP) stimulus to 127.0.0.1 handed over as one
+    /// `Raw` layer and declaring no port — how the lane sends a ping.
+    fn raw_portless_spec(frame: &[u8], expect: ReplyMatch, timeout: Duration) -> SendRecvSpec {
+        SendRecvSpec {
+            packet: PacketSpec {
+                layers: vec![Layer::Raw(frame.to_vec())],
+            },
+            dst: "127.0.0.1".parse().unwrap(),
+            dst_port: None,
+            interface: IFACE.to_string(),
+            timeout,
+            expect,
+        }
+    }
+
+    /// The three match modes a loopback stimulus can run under.
+    fn loopback_modes() -> [ReplyMatch; 3] {
+        [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ]
+    }
+
+    /// Security panel M2 (T5 live proof): on Linux `lo` the injected stimulus goes
+    /// through a header-included raw socket, and the kernel fills the zero IPv4
+    /// identification and recomputes the header checksum before the RX copy
+    /// reaches the capture. A portless stimulus (ICMP) to a loopback address is
+    /// then neither byte-equal nor directional (`src == dst`), and under
+    /// `FiveTuple` our own ping was the "reply". The kernel-shaped copy must be
+    /// ignored in every mode and the echo reply (type 0) behind it must still be
+    /// the `Response`.
+    #[test]
+    fn linux_shaped_portless_self_echo_is_ignored() {
+        let stimulus = icmp_echo("127.0.0.1", "127.0.0.1", 8);
+        let self_echo = kernel_shaped(&stimulus);
+        let reply = icmp_echo("127.0.0.1", "127.0.0.1", 0);
+        assert_ne!(
+            reply[20..],
+            stimulus[20..],
+            "the echo reply differs from the request past the IP header"
+        );
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Icmp,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Ignore),
+                "{expect:?}: the kernel-shaped self-echo is our own stimulus"
+            );
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the echo reply still correlates"
+            );
+
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![self_echo.clone(), reply.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend.clone(),
+                store.clone(),
+                raw_portless_spec(&stimulus, expect, Duration::from_secs(5)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => {
+                    assert_eq!(p.bytes, reply, "{expect:?}: the reply, not our own ping");
+                    assert!(!p.injected, "{expect:?}: observed, not injected");
+                }
+                other => panic!("{expect:?}: expected the echo reply as Response, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(
+                flow.packets.len(),
+                2,
+                "{expect:?}: the stimulus and the reply; the self-echo is not recorded"
+            );
+            assert_eq!(flow.packets[0].bytes, stimulus);
+            assert!(flow.packets[0].injected);
+            assert_eq!(flow.packets[1].bytes, reply);
+            assert_eq!(backend.injected(), vec![stimulus.clone()]);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// Security panel M2: the kernel-shaped self-echo with nothing behind it is
+    /// silence in every mode — the await runs the whole window and the flow holds
+    /// only the injected stimulus.
+    #[test]
+    fn linux_shaped_portless_self_echo_alone_is_silence() {
+        let stimulus = icmp_echo("127.0.0.1", "127.0.0.1", 8);
+        let self_echo = kernel_shaped(&stimulus);
+        let timeout = Duration::from_millis(80);
+
+        for expect in loopback_modes() {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![self_echo.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend.clone(),
+                store.clone(),
+                raw_portless_spec(&stimulus, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => assert!(
+                    waited >= timeout,
+                    "{expect:?}: waited {waited:?} < timeout {timeout:?}"
+                ),
+                other => panic!("{expect:?}: expected silence past the self-echo, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(flow.packets.len(), 1, "{expect:?}: the stimulus alone");
+            assert!(flow.packets[0].injected, "{expect:?}: and it is ours");
+            assert_eq!(flow.packets[0].bytes, stimulus);
+            assert_eq!(backend.injected(), vec![stimulus.clone()]);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// An IPv4 frame of protocol 253 (an experimental protocol with no type
+    /// field: nothing in its transport distinguishes a request from a reply) from
+    /// `src` to `dst`, carrying `payload` verbatim, with the IPv4 identification
+    /// and TTL the caller names (`None` ⇒ the crafted defaults, id 0 / TTL 64).
+    fn raw_proto_frame(
+        src: &str,
+        dst: &str,
+        identification: Option<u16>,
+        ttl: Option<u8>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                    protocol: Some(253),
+                    identification,
+                    ttl,
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Raw(payload.to_vec()),
+            ],
+        }
+        .build()
+        .expect("raw protocol frame builds")
+    }
+
+    /// Run a portless `send_recv` over `frames` under `expect` and assert its
+    /// outcome is `Response` whose bytes are `want`, recorded behind the stimulus
+    /// as the flow's only other packet.
+    fn assert_portless_response(
+        stimulus: &[u8],
+        frames: Vec<Vec<u8>>,
+        want: &[u8],
+        expect: ReplyMatch,
+    ) {
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(frames);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend.clone(),
+            store.clone(),
+            raw_portless_spec(stimulus, expect, Duration::from_secs(5)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Response(p) => {
+                assert_eq!(p.bytes, want, "{expect:?}: the reply, not our own frame");
+                assert!(!p.injected, "{expect:?}: observed, not injected");
+            }
+            other => panic!("{expect:?}: expected the reply as Response, got {other:?}"),
+        }
+        let flow = store.get(flow_id).expect("flow present");
+        assert_eq!(
+            flow.packets.len(),
+            2,
+            "{expect:?}: the stimulus and the reply"
+        );
+        assert_eq!(flow.packets[0].bytes, stimulus);
+        assert!(flow.packets[0].injected);
+        assert_eq!(flow.packets[1].bytes, want);
+        assert_eq!(backend.injected(), vec![stimulus.to_vec()]);
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// Security delta (Minor): a same-host, portless reply whose transport bytes
+    /// echo the stimulus verbatim (protocol 253 to a loopback raw echo service:
+    /// no type field to flip) was indistinguishable from the self-echo and was
+    /// `Ignore`d in every mode. The self-echo arrives exactly once per
+    /// `send_recv`, so at most one transport-equal same-host frame is consumed as
+    /// ours: the kernel-shaped self-echo (new id, new checksum) is ignored, and
+    /// the verbatim reply behind it (its own id and TTL, the same bytes past the
+    /// IP header) is the `Response` in all three modes.
+    #[test]
+    fn verbatim_portless_echo_reply_after_the_self_echo_is_a_response() {
+        let stimulus = raw_proto_frame("127.0.0.1", "127.0.0.1", None, None, b"raw-echo");
+        let self_echo = kernel_shaped(&stimulus);
+        let reply = raw_proto_frame(
+            "127.0.0.1",
+            "127.0.0.1",
+            Some(0x1234),
+            Some(63),
+            b"raw-echo",
+        );
+        assert_eq!(
+            reply[20..],
+            stimulus[20..],
+            "the reply's transport is verbatim"
+        );
+        assert_ne!(reply, self_echo, "but its IP header is the service's own");
+        assert_ne!(reply, stimulus);
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Raw,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Ignore),
+                "{expect:?}: the kernel-shaped self-echo is our own stimulus"
+            );
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the verbatim echo reply behind it is the reply"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![self_echo.clone(), reply.clone()],
+                &reply,
+                expect,
+            );
+        }
+    }
+
+    /// The macOS shape of the same case: BPF returns our frame byte-identical, so
+    /// the whole-frame fast path in `classify` consumes the self-echo. That fast
+    /// path must also mark the one self-echo as seen, so the verbatim reply behind
+    /// it is the `Response` and not taken for a second copy of our frame.
+    #[test]
+    fn verbatim_portless_echo_reply_after_a_byte_identical_self_echo_is_a_response() {
+        let stimulus = raw_proto_frame("127.0.0.1", "127.0.0.1", None, None, b"raw-echo");
+        let reply = raw_proto_frame(
+            "127.0.0.1",
+            "127.0.0.1",
+            Some(0x1234),
+            Some(63),
+            b"raw-echo",
+        );
+        assert_eq!(
+            reply[20..],
+            stimulus[20..],
+            "the reply's transport is verbatim"
+        );
+        assert_ne!(reply, stimulus, "but its IP header is the service's own");
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Raw,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&stimulus), Classified::Ignore),
+                "{expect:?}: the byte-identical self-echo is our own stimulus"
+            );
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the verbatim echo reply behind it is the reply"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![stimulus.clone(), reply.clone()],
+                &reply,
+                expect,
+            );
+        }
+    }
+
+    /// The accepted shape of the "at most one" rule: the correlator cannot tell a
+    /// second self-echo-shaped frame from a verbatim reply, so when two
+    /// kernel-shaped copies of our frame arrive with no real reply behind them,
+    /// the second is reported as the `Response`. On a real interface the kernel
+    /// delivers our frame to the capture exactly once per inject, so this shape
+    /// needs a second party that echoes verbatim — which is a reply.
+    #[test]
+    fn a_second_self_echo_shaped_frame_is_reported_as_the_response() {
+        let stimulus = raw_proto_frame("127.0.0.1", "127.0.0.1", None, None, b"raw-echo");
+        let self_echo = kernel_shaped(&stimulus);
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Raw,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Ignore),
+                "{expect:?}: the first self-echo-shaped frame is consumed as ours"
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Response),
+                "{expect:?}: the second is a reply — the accepted shape of the rule"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![self_echo.clone(), self_echo.clone()],
+                &self_echo,
+                expect,
+            );
+        }
+    }
+
+    /// Security panel M2, the length guard: a captured frame whose IPv4 header
+    /// claims IHL 5 (20 bytes) but carries only 18 has no transport slice to
+    /// compare. It is ignored without a panic in every mode, and the reply behind
+    /// it still correlates.
+    #[test]
+    fn truncated_portless_frame_is_ignored_without_panic() {
+        let stimulus = icmp_echo("127.0.0.1", "127.0.0.1", 8);
+        let truncated = kernel_shaped(&stimulus)[..18].to_vec();
+        assert_eq!(truncated[0], 0x45, "IHL 5 claimed, 18 bytes present");
+        let reply = icmp_echo("127.0.0.1", "127.0.0.1", 0);
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Icmp,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&truncated), Classified::Ignore),
+                "{expect:?}: a truncated header is not a reply"
+            );
+
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![truncated.clone(), reply.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_portless_spec(&stimulus, expect, Duration::from_secs(5)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => {
+                    assert_eq!(
+                        p.bytes, reply,
+                        "{expect:?}: the reply behind the truncated frame"
+                    );
+                }
+                other => panic!("{expect:?}: expected the echo reply as Response, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(
+                flow.packets.len(),
+                2,
+                "{expect:?}: the truncated frame is not recorded"
+            );
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// Tester (T5 stage 5, plan Task 1 `send_recv_echoed_stimulus_alone_is_silence`):
+    /// a capture that delivers the self-echo and nothing else is **silence in
+    /// every match mode** — the await runs the whole window, reports how long it
+    /// waited, and the flow holds exactly one packet, the injected stimulus.
+    /// `Any` is the mode that would otherwise answer `Response` to any decodable
+    /// frame, which on loopback is always our own.
+    #[test]
+    fn send_recv_echoed_stimulus_alone_is_silence() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        let timeout = Duration::from_millis(80);
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![stimulus.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend.clone(),
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => assert!(
+                    waited >= timeout,
+                    "{expect:?}: waited {waited:?} < timeout {timeout:?}"
+                ),
+                other => panic!("{expect:?}: expected silence past the self-echo, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(flow.packets.len(), 1, "{expect:?}: the stimulus alone");
+            assert!(flow.packets[0].injected, "{expect:?}: and it is ours");
+            assert_eq!(flow.packets[0].bytes, stimulus);
+            assert_eq!(backend.injected(), vec![stimulus.clone()]);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// Tester (plan Task 1 `send_recv_same_direction_frame_is_ignored`): the rule
+    /// is the **direction**, not byte equality. A frame that is not our stimulus
+    /// byte for byte — a different payload, a different IP id — but still runs
+    /// `our src:src_port -> dst:dst_port` over our protocol is a copy of ours
+    /// (a re-framed, re-checksummed or retransmitted one) and is ignored in every
+    /// mode; the genuine reply behind it is still the `Response`.
+    #[test]
+    fn send_recv_same_direction_frame_is_ignored() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        // Same tuple, different payload: byte equality cannot catch this one.
+        let same_direction = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe-rewritten");
+        assert_ne!(same_direction, stimulus);
+        let echo = udp_reply("127.0.0.1", 9, b"probe");
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            // Alone it is silence.
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![same_direction.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let timeout = Duration::from_millis(80);
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => {
+                    assert!(waited >= timeout, "{expect:?}: waited {waited:?}");
+                }
+                other => panic!("{expect:?}: a same-direction frame is no reply, got {other:?}"),
+            }
+            assert_eq!(
+                store.get(flow_id).expect("flow present").packets.len(),
+                1,
+                "{expect:?}: nothing of ours is recorded as a reply"
+            );
+
+            // Ahead of the real reply it does not end the await either.
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![same_direction.clone(), echo.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, Duration::from_secs(10)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => {
+                    assert_eq!(p.bytes, echo, "{expect:?}: the reply, not our own copy");
+                }
+                other => panic!("{expect:?}: expected the echo as Response, got {other:?}"),
+            }
+            let flow = store.get(flow_id).expect("flow present");
+            assert_eq!(flow.packets.len(), 2, "{expect:?}: stimulus + reply");
+            assert_eq!(flow.packets[1].bytes, echo);
+            assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// Tester (the echo case the self-echo rule must not eat): a legitimate reply
+    /// whose source port **is** our destination port and whose destination port
+    /// is our source port is the reversed tuple — the only shape a reply can
+    /// have — and must correlate even when it carries byte-identical payload.
+    /// The documented limit is pinned beside it: a stimulus whose source port
+    /// equals the target's port makes its own echo indistinguishable from
+    /// itself, so that one reads as silence (the lane's liveness probe uses the
+    /// unmutated seed, and `choose_src_port` never picks the target's port, so
+    /// no crash follows).
+    #[test]
+    fn send_recv_reply_on_the_reversed_tuple_is_never_taken_for_the_stimulus() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        // Identical payload, reversed ports: an echo service's answer.
+        let echo = udp_from_to("127.0.0.1", 9, "127.0.0.1", 40000, b"probe");
+
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(vec![stimulus.clone(), echo.clone()]);
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let (_, outcome) = send_recv(
+                &g,
+                backend,
+                store,
+                raw_spec(&stimulus, 9, expect, Duration::from_secs(10)),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::Response(p) => assert_eq!(
+                    p.bytes, echo,
+                    "{expect:?}: a reply to our source port is a reply"
+                ),
+                other => panic!("{expect:?}: expected the echo as Response, got {other:?}"),
+            }
+        }
+
+        // The documented limit: source port == the target's port.
+        let symmetric = udp_from_to("127.0.0.1", 9, "127.0.0.1", 9, b"probe");
+        let symmetric_echo = udp_from_to("127.0.0.1", 9, "127.0.0.1", 9, b"probe-back");
+        let c = Correlation::new(
+            "127.0.0.1".parse().unwrap(),
+            Some(9),
+            L4Proto::Udp,
+            ReplyMatch::FiveTuple,
+            symmetric.clone(),
+        );
+        assert!(
+            matches!(c.classify(&symmetric_echo), Classified::Ignore),
+            "known limit: a symmetric tuple cannot tell the echo from the stimulus"
+        );
+    }
+
+    /// Tester (edge cases a capture must survive): the frames a real interface
+    /// hands the correlator include empty reads, truncated headers, non-IP link
+    /// traffic and an oversized buffer. None of them may panic, none may be
+    /// taken for the reply, and the real reply behind them must still correlate
+    /// inside the window.
+    #[test]
+    fn malformed_empty_and_oversized_frames_never_correlate() {
+        let stimulus = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 9, b"probe");
+        let echo = udp_reply("127.0.0.1", 9, b"probe");
+        let junk: Vec<Vec<u8>> = vec![
+            Vec::new(),                               // an empty read
+            vec![0xFF],                               // one byte
+            vec![0x45, 0x00, 0x00],                   // an IPv4 version nibble, nothing else
+            vec![0x45; 19],                           // one byte short of an IPv4 header
+            vec![0x60; 39],                           // one byte short of an IPv6 header
+            vec![0xAA; 1500],                         // a full-MTU frame of noise
+            vec![0x00; 65_535],                       // the largest buffer a capture can hand us
+            b"\x08\x06arp-ish not a packet".to_vec(), // non-IP link traffic
+        ];
+
+        let mut frames = junk.clone();
+        frames.push(echo.clone());
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(frames);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            raw_spec(&stimulus, 9, ReplyMatch::FiveTuple, Duration::from_secs(10)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Response(p) => assert_eq!(p.bytes, echo, "the reply, not the noise"),
+            other => panic!("expected the echo as Response behind the noise, got {other:?}"),
+        }
+        let flow = store.get(flow_id).expect("flow present");
+        assert_eq!(flow.packets.len(), 2, "no malformed frame is recorded");
+        assert_eq!(g.in_flight(), 0);
+
+        // The same noise with nothing behind it is silence, not a reply and not
+        // a panic — in every match mode, `Any` included.
+        for expect in [
+            ReplyMatch::FiveTuple,
+            ReplyMatch::FromHost("127.0.0.1".parse().unwrap()),
+            ReplyMatch::Any,
+        ] {
+            let g = send_recv_guard();
+            let backend = MockBackend::with_replies(junk.clone());
+            let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+            let timeout = Duration::from_millis(80);
+            let (flow_id, outcome) = send_recv(
+                &g,
+                backend,
+                store.clone(),
+                raw_spec(&stimulus, 9, expect, timeout),
+            )
+            .expect("authorized send_recv runs");
+            match outcome {
+                SendRecvOutcome::NoResponse { waited } => {
+                    assert!(waited >= timeout, "{expect:?}: waited {waited:?}");
+                }
+                other => panic!("{expect:?}: undecodable noise is not a reply, got {other:?}"),
+            }
+            assert_eq!(store.get(flow_id).expect("flow present").packets.len(), 1);
+            assert_eq!(g.in_flight(), 0);
+        }
     }
 
     /// C3 (security): a stimulus whose crafted IP destination is a denylisted host,

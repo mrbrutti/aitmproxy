@@ -954,6 +954,7 @@ fn tool_info_params_reads_the_input_schema() {
         name: "x".into(),
         description: String::new(),
         input_schema: json!({"type":"object","properties":{"id":{"type":"string","description":"The flow."},"n":{"type":"integer"}},"required":["id"]}),
+        confirmable: false,
     };
     assert_eq!(
         t.params(),
@@ -1057,7 +1058,11 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     };
     expect_toast(&mut app, Action::Mark, "F6");
     expect_toast(&mut app, Action::Comment, "F6");
-    expect_toast(&mut app, Action::AgentSet(AgentPolicy::Paused), "F1");
+    expect_toast(
+        &mut app,
+        Action::AgentSet(AgentPolicy::Paused),
+        "agent.set is not on this bus",
+    );
     for (cmd, f) in [
         ("clear", "F7"),
         ("pause", "F7"),
@@ -1093,8 +1098,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         "(core follow-up F7)",
         "F10│",
         "M3│",
-        "F1│",
-        "n/a (F1)",
+        "Agent · n/a",
         "↑ — ↓ — (F4)",
     ] {
         assert!(text.contains(label), "{label}: {text}");
@@ -1359,6 +1363,7 @@ fn dry_run_bypasses_the_confirm_only_as_a_declared_boolean_true() {
         name: "ca.uninstall".into(),
         description: "Remove the CA (confirmed).".into(),
         input_schema: json!({"type":"object","properties":{"dry_run":{"type":"boolean","description":"Only report."}}}),
+        confirmable: false,
     });
     assert_eq!(
         app.run_command("ca.uninstall dry_run=true"),
@@ -1789,7 +1794,10 @@ fn a_bus_that_offers_no_tools_renders_every_mode_and_sends_nothing() {
     for (action, label) in [
         (Action::Mark, "F6"),
         (Action::Comment, "F6"),
-        (Action::AgentSet(AgentPolicy::Paused), "F1"),
+        (
+            Action::AgentSet(AgentPolicy::Paused),
+            "agent.set is not on this bus",
+        ),
     ] {
         assert!(
             app.update(action.clone()).is_empty(),
@@ -2205,6 +2213,15 @@ fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
                      "layers": ["IPv4", "UDP", "Raw"]}]
     })]));
     app.selected = Some("l4-1".into());
+    // Capture/inject available (L4 parity B10 refuses `s` locally before the
+    // scope check while `l4.capture.status` says otherwise).
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: aitm_tui::l4::L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "captures": []}),
+        ),
+        intercept: app.l4.intercept.clone(),
+        captures: vec![],
+    });
     // A capture-only scope entry: refused locally, nothing on the wire.
     let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
         "interface": "lo0", "capability": "capture", "cidr": "127.0.0.1/32",

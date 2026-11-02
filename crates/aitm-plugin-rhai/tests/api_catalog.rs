@@ -152,6 +152,7 @@ fn receiver_type(prefix: &str) -> String {
         "browser" => "browser",
         "store" => "store",
         "scope" => "scope",
+        "probe" => "probe",
         "reg" => "reg",
         "vars" => "Vars",
         "denied" => "Denied",

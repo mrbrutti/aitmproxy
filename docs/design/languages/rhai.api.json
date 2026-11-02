@@ -554,7 +554,7 @@
     {
       "name": "http.send",
       "kind": "function",
-      "signature": "http.send(#{ method, url, headers, body }) -> #{ status, headers, body, flow_id }",
+      "signature": "http.send(#{ method, url, headers, body }) -> #{ status, headers, body, flow_id, elapsed_ms }",
       "description": "Send an HTTP request through the proxy's own client (scope- and rate-gated); the exchange is captured as a flow."
     },
     {
@@ -716,6 +716,50 @@
       "description": "The text of capture group of pat's first match in s (\"\" if none); errors on an invalid pattern."
     }
   ],
+  "probe": [
+    {
+      "name": "probe.send",
+      "kind": "function",
+      "signature": "probe.send(payload | #{ value, mode: \"replace\" | \"prefix\" | \"suffix\" }) -> #{ status, headers, body, elapsed_ms, flow_id }",
+      "description": "Place the payload at the insertion point the check is running against and send it through the job's budgeted client. A string replaces the observed value; the map form chooses how the payload combines with it. Only inside a check closure (reg.add_check)."
+    },
+    {
+      "name": "probe.baseline",
+      "kind": "function",
+      "signature": "probe.baseline() -> #{ status, headers, body, elapsed_ms, flow_id }",
+      "description": "The point's unpayloaded response, cached per point, to diff a probe against. Only inside a check closure."
+    },
+    {
+      "name": "probe.raw",
+      "kind": "function",
+      "signature": "probe.raw(#{ method, url, headers, body }) -> #{ status, headers, body, elapsed_ms, flow_id }",
+      "description": "Send a request the check built itself, for a handshake or header check a payload-at-a-point cannot express. Same origin, same budget. `method` must be an HTTP token (letters, digits, !#$%&'*+-.^_`|~; max 32 bytes), default GET. Only inside a check closure."
+    },
+    {
+      "name": "probe.marker",
+      "kind": "function",
+      "signature": "probe.marker() -> string",
+      "description": "The job's collision-resistant marker token, for a reflection canary or callback label. Only inside a check closure."
+    },
+    {
+      "name": "probe.budget_left",
+      "kind": "function",
+      "signature": "probe.budget_left() -> int",
+      "description": "Probes still affordable for this point; zero means send nothing more. Only inside a check closure."
+    },
+    {
+      "name": "probe.timing_fit",
+      "kind": "function",
+      "signature": "probe.timing_fit(#{ requested_s: [..], observed_ms: [..] }) -> #{ correlated, slope, r }",
+      "description": "Fit observed response times against the delays the payloads asked for (ZAP's rule: correlation error 0.15, slope error 0.30, longer delays must take longer). A pure helper: it reads only its arguments, so it is callable anywhere, not just inside a check closure."
+    },
+    {
+      "name": "probe.levenshtein_ratio",
+      "kind": "function",
+      "signature": "probe.levenshtein_ratio(a, b) -> float",
+      "description": "How alike two strings are: 1.0 identical, 0.0 nothing in common. For boolean-blind comparisons against the baseline body; inputs are truncated to 32 KiB each. A pure helper: it reads only its arguments, so it is callable anywhere, not just inside a check closure."
+    }
+  ],
   "reg": [
     {
       "name": "reg.add_command",
@@ -728,6 +772,12 @@
       "kind": "method",
       "signature": "reg.add_option(name, default, help)",
       "description": "Register a configurable option, callable from `load(reg)`; read it back later with `option(name)`."
+    },
+    {
+      "name": "reg.add_check",
+      "kind": "method",
+      "signature": "reg.add_check(#{ id, name, class, lanes, kinds, intensity, cost, technique, severity, confidence_max, description, needs_baseline?, wants_traits?, targets_session?, scope?, cwe?, remediation? }, |point| { ... }) -> verdict map | string | [verdict map, ...]",
+      "description": "Register a scanner check, callable from load(reg): the metadata map tells the scheduler when to run it (remediation, scope, cwe, needs_baseline, wants_traits and targets_session are optional), and the closure returns a verdict map (outcome, confidence, evidence, detail, poc_hint, location), a plain string read as inconclusive, or an array of verdict maps: the first is the root verdict and the rest are its siblings, each becoming its own issue. A verdict's optional location: #{ path, name } overrides the issue location, so an origin-scoped check reports one issue per exposed path. Inside the closure the probe.* functions are available."
     }
   ],
   "vars": [

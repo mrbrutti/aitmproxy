@@ -1,0 +1,7 @@
+* -> { "content": [  {   "type": "text",   "text": "added * to scope (new connections to it are decrypted)\n\"*\""  } ], "structuredContent": "*", "isError": false}
+héllo.test -> { "content": [  {   "type": "text",   "text": "added h\u00e9llo.test to scope (new connections to it are decrypted)\n\"h\u00e9llo.test\""  } ], "structuredContent": "h\u00e9llo.test", "isError": false}
+a\tb.test -> { "content": [  {   "type": "text",   "text": "scope.add: \"a\\tb.test\" is not a host, host:port, or *.wildcard"  } ], "isError": true}
+x_y.test -> { "content": [  {   "type": "text",   "text": "added x_y.test to scope (new connections to it are decrypted)\n\"x_y.test\""  } ], "structuredContent": "x_y.test", "isError": false}
+-dash.test -> { "content": [  {   "type": "text",   "text": "added -dash.test to scope (new connections to it are decrypted)\n\"-dash.test\""  } ], "structuredContent": "-dash.test", "isError": false}
+1.2.3.4.5.6.7.8.9.10 -> { "content": [  {   "type": "text",   "text": "added 1.2.3.4.5.6.7.8.9.10 to scope (new connections to it are decrypted)\n\"1.2.3.4.5.6.7.8.9.10\""  } ], "structuredContent": "1.2.3.4.5.6.7.8.9.10", "isError": false}
+"structuredContent":["restart2.test","restart3.test","up2.test","burst.test","*","h\u00e9llo.test","x_y.test","-dash.test",

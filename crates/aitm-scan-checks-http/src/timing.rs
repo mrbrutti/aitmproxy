@@ -60,6 +60,10 @@ pub fn fit(requested_s: &[f32], observed_ms: &[u32], baseline_ms: &[u32]) -> Tim
         baseline_ms: baseline_ms.to_vec(),
         slope,
         r,
+        // `fit` is the raw fitter and makes no correlation claim: the check
+        // calls `correlated` on this result and owns the judgment (field doc,
+        // "the check decides, not the reader").
+        correlated: false,
     };
 
     if requested_s.len() != observed_ms.len() || requested_s.len() < 2 {
@@ -253,6 +257,9 @@ mod tests {
             baseline_ms: Vec::new(),
             slope,
             r,
+            // Irrelevant here: this edge helper feeds `correlated`, which reads
+            // only `slope` and `r`.
+            correlated: false,
         };
         assert!(correlated(&edge(1000.0, 0.86)));
         assert!(!correlated(&edge(1000.0, 0.84)));
@@ -316,6 +323,9 @@ mod tests {
             baseline_ms: Vec::new(),
             slope,
             r,
+            // Irrelevant here: this edge helper feeds `correlated`, which reads
+            // only `slope` and `r`.
+            correlated: false,
         };
         assert!(correlated(&edge(1000.0, 1.0 - CORRELATION_ERROR_RANGE)));
         assert!(correlated(&edge(

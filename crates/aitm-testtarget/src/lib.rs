@@ -40,6 +40,7 @@ mod ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 
@@ -84,9 +85,19 @@ pub struct TargetBuilder {
     tls_h1: Option<u16>,
     control: Option<u16>,
     l4: bool,
+    /// `--latency-ms`: per-response sleep for HTTP and WS (D1), default 0.
+    latency: Duration,
 }
 
 impl TargetBuilder {
+    /// A sleep applied once to every HTTP response and every WebSocket server
+    /// frame (not to the L4 speakers); `0` = none. Lets a UI be observed while
+    /// an intrusive scan of this target is still running (T7 ruling).
+    pub fn latency_ms(mut self, ms: u64) -> Self {
+        self.latency = Duration::from_millis(ms);
+        self
+    }
+
     /// Plain HTTP/1 port (default `0`, always started).
     pub fn port(mut self, p: u16) -> Self {
         self.port = p;
@@ -132,7 +143,7 @@ impl TargetBuilder {
         }
         let mode = self.mode;
         let log = log::ControlLog::new(mode);
-        let state = Arc::new(app::AppState::new(mode, log.clone()));
+        let state = Arc::new(app::AppState::with_latency(mode, log.clone(), self.latency));
 
         let plain = bind_plain(self.port, state.clone()).await?;
         let base_url = format!("http://{plain}");
@@ -237,6 +248,7 @@ impl TestTarget {
             tls_h1: None,
             control: None,
             l4: false,
+            latency: Duration::ZERO,
         }
     }
 

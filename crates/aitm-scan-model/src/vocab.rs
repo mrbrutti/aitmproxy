@@ -338,6 +338,26 @@ pub enum PayloadMode {
     Suffix,
 }
 
+/// How often a check runs against what discovery found (spec D4, coordinator
+/// decision 4 of 2026-10-31).
+///
+/// The scheduler reads it: a `Point` check runs once per insertion point (the
+/// default, and what every T1a check assumed), a `Node` check once per site-map
+/// node however many points it carries, and an `Origin` check once per target
+/// origin. It is a scheduling hint, not a permission: scope, intensity and
+/// budget are enforced the same way whatever the scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckScope {
+    /// Once per insertion point.
+    #[default]
+    Point,
+    /// Once per site-map node.
+    Node,
+    /// Once per target origin.
+    Origin,
+}
+
 /// The nine error codes a `scan.*` verb can fail with (spec D3).
 ///
 /// `h2_not_negotiated` is a sender error, not a verb error code, and is not here.
@@ -367,20 +387,92 @@ pub enum ScanErrorCode {
     ConfirmRequired,
 }
 
+/// Every error code and its wire token, in the order the variants are declared.
+///
+/// The one table all three paths read: [`ScanErrorCode::as_str`] indexes it by
+/// the code's discriminant, [`FromStr`] searches it by token, and
+/// [`ScanErrorCode::parse_message`] goes through [`FromStr`]. Adding a code is
+/// therefore a variant plus a row, and `every_code_round_trips_through_the_table`
+/// fails if the two drift apart.
+const SCAN_ERROR_CODES: [(ScanErrorCode, &str); 9] = [
+    (ScanErrorCode::NotFound, "not_found"),
+    (ScanErrorCode::Busy, "busy"),
+    (ScanErrorCode::OutOfScope, "out_of_scope"),
+    (ScanErrorCode::RefusedAgent, "refused_agent"),
+    (ScanErrorCode::RefusedL4, "refused_l4"),
+    (ScanErrorCode::LaneUnavailable, "lane_unavailable"),
+    (ScanErrorCode::InvalidProfile, "invalid_profile"),
+    (ScanErrorCode::UnknownCheck, "unknown_check"),
+    (ScanErrorCode::ConfirmRequired, "confirm_required"),
+];
+
+// Spec D3 names exactly nine codes; a tenth variant must add a row here (the
+// array length is the type's) and this line is what the reviewer counts.
+const _: () = assert!(SCAN_ERROR_CODES.len() == 9);
+
+/// The error [`FromStr`] returns for a token that is not one of the nine codes.
+///
+/// A typed error rather than an `anyhow` string so a caller can match on it and
+/// recover the token it could not read (T1a Quality follow-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownScanErrorCode(
+    /// The token that is not a code, as it was given.
+    pub String,
+);
+
+impl fmt::Display for UnknownScanErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown scan error code `{}`", self.0)
+    }
+}
+
+impl std::error::Error for UnknownScanErrorCode {}
+
+/// A `scan.*` verb's refusal: the code and the message behind the wire string
+/// `scan: <code>: <message>` (spec D3).
+///
+/// [`scan_error`] wraps one of these in the `anyhow::Error` a verb returns, so
+/// an in-process caller downcasts to it and reads `code` directly, while a
+/// frontend on the far side of the bus still parses the string through
+/// [`ScanErrorCode::parse_message`]. `Display` is exactly that wire string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRefusal {
+    /// Which of the nine codes the verb refused with.
+    pub code: ScanErrorCode,
+    /// The human-readable detail after the code.
+    pub message: String,
+}
+
+impl fmt::Display for ScanRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "scan: {}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for ScanRefusal {}
+
+/// Build the one error form a `scan.*` verb refuses with: `scan: <code>: <message>`
+/// (spec D3), as a typed [`ScanRefusal`] inside the `anyhow::Error`.
+///
+/// Every refusal in the engine goes through here, so no verb can emit a bare
+/// `scan:` prefix without a code, an in-process caller can
+/// `downcast_ref::<ScanRefusal>()`, and every frontend can match on the code
+/// token through [`ScanErrorCode::parse_message`].
+pub fn scan_error(code: ScanErrorCode, message: impl fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(ScanRefusal {
+        code,
+        message: message.to_string(),
+    })
+}
+
 impl ScanErrorCode {
     /// The wire token, identical to the serde representation.
     pub fn as_str(&self) -> &'static str {
-        match self {
-            ScanErrorCode::NotFound => "not_found",
-            ScanErrorCode::Busy => "busy",
-            ScanErrorCode::OutOfScope => "out_of_scope",
-            ScanErrorCode::RefusedAgent => "refused_agent",
-            ScanErrorCode::RefusedL4 => "refused_l4",
-            ScanErrorCode::LaneUnavailable => "lane_unavailable",
-            ScanErrorCode::InvalidProfile => "invalid_profile",
-            ScanErrorCode::UnknownCheck => "unknown_check",
-            ScanErrorCode::ConfirmRequired => "confirm_required",
-        }
+        // The enum is fieldless and carries no explicit discriminants, so
+        // `*self as usize` is this code's row in `SCAN_ERROR_CODES`, which is
+        // written in variant order and is always in bounds. No fallback arm can
+        // be reached, so the lookup needs none.
+        SCAN_ERROR_CODES[*self as usize].1
     }
 
     /// Split a `scan: <code>: <message>` error string into its code and message.
@@ -401,21 +493,14 @@ impl fmt::Display for ScanErrorCode {
 }
 
 impl FromStr for ScanErrorCode {
-    type Err = anyhow::Error;
+    type Err = UnknownScanErrorCode;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "not_found" => Ok(ScanErrorCode::NotFound),
-            "busy" => Ok(ScanErrorCode::Busy),
-            "out_of_scope" => Ok(ScanErrorCode::OutOfScope),
-            "refused_agent" => Ok(ScanErrorCode::RefusedAgent),
-            "refused_l4" => Ok(ScanErrorCode::RefusedL4),
-            "lane_unavailable" => Ok(ScanErrorCode::LaneUnavailable),
-            "invalid_profile" => Ok(ScanErrorCode::InvalidProfile),
-            "unknown_check" => Ok(ScanErrorCode::UnknownCheck),
-            "confirm_required" => Ok(ScanErrorCode::ConfirmRequired),
-            other => Err(anyhow::anyhow!("unknown scan error code: {other}")),
-        }
+        SCAN_ERROR_CODES
+            .iter()
+            .find(|(_, token)| *token == s)
+            .map(|(code, _)| *code)
+            .ok_or_else(|| UnknownScanErrorCode(s.to_string()))
     }
 }
 
@@ -576,6 +661,70 @@ mod tests {
         );
     }
 
+    /// T1a Quality follow-up: an unknown token is a typed error a caller can
+    /// match on and print, not an opaque `anyhow` string.
+    #[test]
+    fn unknown_code_is_a_typed_error() {
+        let err = "nope"
+            .parse::<ScanErrorCode>()
+            .expect_err("`nope` is not a code");
+
+        assert_eq!(err, UnknownScanErrorCode("nope".to_string()));
+        assert_eq!(err.to_string(), "unknown scan error code `nope`");
+    }
+
+    /// Spec D3: every verb refusal is `scan: <code>: <message>`, and
+    /// [`scan_error`] is the one place that string is built, so what the engine
+    /// emits is exactly what [`ScanErrorCode::parse_message`] reads back.
+    #[test]
+    fn scan_error_formats_the_wire_form() {
+        let err = scan_error(ScanErrorCode::Busy, "job scan-1a2b3c4d is running");
+
+        assert_eq!(err.to_string(), "scan: busy: job scan-1a2b3c4d is running");
+        assert_eq!(
+            ScanErrorCode::parse_message(&err.to_string()),
+            Some((ScanErrorCode::Busy, "job scan-1a2b3c4d is running"))
+        );
+    }
+
+    /// Wave-1 quality review: a refusal is a typed [`ScanRefusal`] inside the
+    /// `anyhow::Error`, so an in-process caller downcasts to the code instead of
+    /// re-parsing the string — and the wire string is unchanged.
+    #[test]
+    fn scan_error_is_downcastable() {
+        let err = scan_error(ScanErrorCode::Busy, "x");
+
+        assert_eq!(
+            err.downcast_ref::<ScanRefusal>(),
+            Some(&ScanRefusal {
+                code: ScanErrorCode::Busy,
+                message: "x".to_string(),
+            })
+        );
+        assert_eq!(err.to_string(), "scan: busy: x");
+    }
+
+    /// T1a Quality follow-up: one table backs `as_str`, `FromStr` and
+    /// `parse_message`, so a tenth code cannot reach one path and miss another.
+    #[test]
+    fn every_code_round_trips_through_the_table() {
+        assert_eq!(
+            SCAN_ERROR_CODES.len(),
+            9,
+            "spec D3 names exactly nine codes"
+        );
+
+        for (code, token) in SCAN_ERROR_CODES {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(token.parse::<ScanErrorCode>(), Ok(code));
+            assert_eq!(code.as_str().parse::<ScanErrorCode>(), Ok(code));
+            assert_eq!(
+                SCAN_ERROR_CODES[code as usize].0, code,
+                "{token} is not in its own row: `as_str` indexes the table by discriminant"
+            );
+        }
+    }
+
     #[test]
     fn check_origin_is_kind_tagged() {
         assert_eq!(
@@ -616,6 +765,67 @@ mod tests {
             assert_eq!(
                 ScanErrorCode::parse_message(&format!("scan: {token}: why")),
                 None
+            );
+        }
+    }
+
+    /// Tester: `scan_error` with an empty, multi-line, separator-laden or
+    /// space-padded message produces a string `parse_message` reads back whole:
+    /// the message is never trimmed, re-split or dropped.
+    #[test]
+    fn scan_error_round_trips_edge_messages() {
+        for msg in [
+            "",
+            "a: b: c",
+            "line one\nline two",
+            " padded ",
+            "scan: busy: nested",
+        ] {
+            let text = scan_error(ScanErrorCode::InvalidProfile, msg).to_string();
+            assert_eq!(text, format!("scan: invalid_profile: {msg}"));
+            assert_eq!(
+                ScanErrorCode::parse_message(&text),
+                Some((ScanErrorCode::InvalidProfile, msg)),
+                "{msg:?} must come back whole"
+            );
+        }
+    }
+
+    /// Tester: `UnknownScanErrorCode` is a real `std::error::Error`: it boxes,
+    /// wraps into `anyhow` and is recoverable by downcast with its token.
+    #[test]
+    fn unknown_code_is_a_std_error() {
+        let boxed: Box<dyn std::error::Error> =
+            Box::new("x".parse::<ScanErrorCode>().expect_err("not a code"));
+        assert_eq!(boxed.to_string(), "unknown scan error code `x`");
+
+        let wrapped = anyhow::Error::from("y".parse::<ScanErrorCode>().expect_err("not a code"));
+        assert_eq!(
+            wrapped.downcast_ref::<UnknownScanErrorCode>(),
+            Some(&UnknownScanErrorCode("y".to_string()))
+        );
+    }
+
+    /// Tester (coordinator decision 4): `CheckScope` has exactly three snake_case
+    /// tokens, each round-trips, and anything else — including a wrongly cased
+    /// one — is refused rather than defaulted.
+    #[test]
+    fn check_scope_tokens_are_exactly_three() {
+        for (scope, token) in [
+            (CheckScope::Point, "\"point\""),
+            (CheckScope::Node, "\"node\""),
+            (CheckScope::Origin, "\"origin\""),
+        ] {
+            assert_eq!(serde_json::to_string(&scope).expect("serializes"), token);
+            assert_eq!(
+                serde_json::from_str::<CheckScope>(token).expect("deserializes"),
+                scope
+            );
+        }
+        for junk in ["\"everywhere\"", "\"Point\"", "\"\"", "null", "0"] {
+            assert!(
+                serde_json::from_str::<CheckScope>(junk).is_err(),
+                "{junk} must not read as a scope"
             );
         }
     }

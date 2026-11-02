@@ -203,6 +203,7 @@ fn full_registry(features: &Features) -> (tokio::runtime::Runtime, Arc<Registry>
                 executor: Some(tier.executor.clone()),
                 poc_step_handlers: PocStepRegistry::new(),
                 commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
+                script_checks: Some(tier.checks.clone()),
             },
         )
         .expect("the proxy assembles in a temp CA dir");

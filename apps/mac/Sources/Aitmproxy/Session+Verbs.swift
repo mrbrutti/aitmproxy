@@ -108,8 +108,40 @@ extension Session {
         }
     }
 
+    /// Adds `host` to Scope and keeps the outcome where the Scope page can show it (S-081):
+    /// the row reads `sending…`, then leaves when `scope.list` names the host; a bus that
+    /// was not there (the core restarting) leaves it `queued` and `replayQueuedScopeAdds`
+    /// re-sends it on reconnect; a refusal from the core leaves it `failed` with the reason
+    /// until Retry or ✕. The status bar still gets the error line.
     func addScope(_ host: String) {
-        perform("add to scope") { [self] in try await actions.addScope(host) }
+        scopeAdds.begin(host)
+        Task { [self] in
+            do {
+                try await actions.addScope(host)
+                // The core took it: the in-flight entry is done even if the core stored a
+                // normalised form that `scope.list` (and `confirm`) would never match.
+                scopeAdds.drop(host)
+                lastError = nil
+            } catch {
+                if let bus = error as? BusError {
+                    scopeAdds.fail(host, error: bus)
+                } else {
+                    scopeAdds.fail(host, reason: BusService.describe(error), retryable: false)
+                }
+                lastError = "add to scope: \(BusService.describe(error))"
+            }
+        }
+    }
+
+    /// Retry on a failed or queued row: the same send as typing the host again.
+    func retryScopeAdd(_ host: String) { addScope(host) }
+
+    /// ✕ on a row the core never listed: forget the add.
+    func dropScopeAdd(_ host: String) { scopeAdds.drop(host) }
+
+    /// The bus is back (a reconnect after a core restart): send every queued add again.
+    func replayQueuedScopeAdds() {
+        for host in scopeAdds.replayable { addScope(host) }
     }
 
     func removeScope(_ host: String, confirm: (Int) -> Bool = { _ in true }) {
@@ -216,14 +248,21 @@ extension Session {
                            selectedPausedCount: chosen.filter { $0.state == .paused }.count)
     }
 
-    /// The verb table for a row (every surface's titles, keys and enabled rules).
+    /// The verb table for a row (every surface's titles, keys and enabled rules). An L4 row's
+    /// HTTP verbs come back disabled with `L4RowVerbs.disabledReason` (AC29).
     func verbItems(for id: FlowID?) -> [VerbItem] {
-        VerbTable.items(for: id.flatMap(verbContext(for:)))
+        let context = id.flatMap(verbContext(for:))
+        let items = VerbTable.items(for: context)
+        guard let row = context?.row else { return items }
+        return items.map { L4RowVerbs.gate($0, row: row) }
     }
 
-    /// One verb item for a row; with no row the default, disabled item.
+    /// One verb item for a row, through the same L4 gate; with no row the default, disabled item.
     func verbItem(_ verb: FlowVerb, for id: FlowID?) -> VerbItem {
-        VerbTable.item(verb, for: id.flatMap(verbContext(for:)))
+        let context = id.flatMap(verbContext(for:))
+        let item = VerbTable.item(verb, for: context)
+        guard let row = context?.row else { return item }
+        return L4RowVerbs.gate(item, row: row)
     }
 
     /// The only entry for a row verb, from the keyboard, the context menu, the Flow menu or the
@@ -231,7 +270,7 @@ extension Session {
     func perform(_ verb: FlowVerb, on id: FlowID) {
         guard let context = verbContext(for: id) else { return }
         let row = context.row
-        let item = VerbTable.item(verb, for: context)
+        let item = L4RowVerbs.gate(VerbTable.item(verb, for: context), row: row)
         guard item.enabled else {
             lastError = item.disabledReason
             return

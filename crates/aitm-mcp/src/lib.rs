@@ -6,6 +6,10 @@
 //! so the same core serves every transport ([`transport`]): newline-delimited JSON
 //! over stdio, or over a loopback-only TCP socket that requires a token.
 
+// The workspace lint already forbids `unsafe`; the attribute makes the
+// promise local to the crate that parses an agent's wire bytes.
+#![forbid(unsafe_code)]
+
 mod base64;
 pub mod http;
 pub mod json;
@@ -22,6 +26,6 @@ pub use http::{StreamableHttp, StreamableHttpCfg};
 pub use schema::{McpSchemaDerive, McpTool, StdSchemaDerive};
 pub use server::{
     ConnCtx, McpServer, NotificationSink, DEFAULT_BROADCAST_CAPACITY, DEFAULT_PUSH_CAPACITY,
-    DEFAULT_WRITE_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, JOB_NOTIFICATION_METHOD,
 };
 pub use widgets::{widget_meta_for, widgets, Widget, WidgetMeta};

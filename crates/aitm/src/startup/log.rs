@@ -1271,4 +1271,30 @@ mod tests {
             "{debug:?}"
         );
     }
+
+    // Moved from `main.rs` at the merge of #232 (scanner-v2 stage-6 fix, core C):
+    // the server's filter lives here since wave 1.
+    #[test]
+    fn warn_and_error_survive_the_default_and_an_info_rust_log() {
+        // Stage-6 fix (scanner-v2 live e2e, core C): a refused script is logged
+        // at warn-or-above by the script tier; neither the curated default nor
+        // the harness's `RUST_LOG=info` may swallow it.
+        for filter in [
+            build_env_filter(None),
+            build_env_filter(Some("info".into())),
+        ] {
+            let out = capture_with_filter(filter, || {
+                tracing::warn!(target: "aitm_plugin_rhai::script", "script `a` refused (warn)");
+                tracing::error!(target: "aitm_plugin_rhai::script", "script `b` refused (error)");
+            });
+            assert!(
+                out.contains("script `a` refused (warn)"),
+                "warn must pass: {out:?}"
+            );
+            assert!(
+                out.contains("script `b` refused (error)"),
+                "error must pass: {out:?}"
+            );
+        }
+    }
 }
