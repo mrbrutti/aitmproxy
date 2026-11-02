@@ -475,7 +475,7 @@ async fn agent_role_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prepare_keeps_w1_usage_errors() {
+async fn prepare_keeps_the_dispatcher_usage_errors() {
     let (_proxy, services, _governance) = assemble_services(&config("remote-prepare"));
     let reg = &services.registry;
 
@@ -490,11 +490,24 @@ async fn prepare_keeps_w1_usage_errors() {
             .starts_with("expected a command before flags, got `--x`"),
         "{err}"
     );
+    // Wave 2's typed report: the spaced name, never a dotted one (AC-W2-4).
     let err = prepare(reg, &args(&["flow", "list", "--bogus", "1"])).expect_err("unknown flag");
     assert!(
         err.to_string()
-            .starts_with("unknown flag --bogus for `flow.list`"),
+            .starts_with("unknown flag --bogus for `flow list`"),
         "{err}"
+    );
+    // A dotted typo of a registered command is refused here, with the
+    // dispatcher's did-you-mean, before anything is dialed (wave 2 parity).
+    let err = prepare(reg, &args(&["scpe", "add", "--host", "x"])).expect_err("typo");
+    let report = err
+        .downcast_ref::<aitm_term::error::ErrorReport>()
+        .expect("the dispatcher's typed report");
+    assert_eq!(report.what, "unknown command `scpe`");
+    assert!(
+        report.why.iter().any(|l| l == "did you mean: scope"),
+        "{:?}",
+        report.why
     );
 
     match prepare(reg, &args(&["custom", "verb", "--k", "1", "--flag"])).expect("unresolved") {

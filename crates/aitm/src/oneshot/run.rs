@@ -197,7 +197,11 @@ async fn run_live(
                     Err(err) => return Err(refuse_early(err, Stage::Handshake)),
                 };
             if !known_remotely {
-                return Err(OneShotError::Other(remote::unknown_command(&dotted)));
+                return Err(OneShotError::Other(remote::unknown_command(
+                    &i.services.registry,
+                    i.argv,
+                    &dotted,
+                )));
             }
             let map = remote::generic_arguments(&flags).map_err(OneShotError::Other)?;
             (JsonValue::Object(map), TypeDesc::Any)

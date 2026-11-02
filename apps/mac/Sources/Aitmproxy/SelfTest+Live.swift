@@ -28,6 +28,17 @@ extension SelfTest {
             print("tools/list: \(names.joined(separator: " "))")
             check("tools/list has flow.intercept, flow.list, flow.get, request.send, scope.add",
                   ["flow.intercept", "flow.list", "flow.get", "request.send", "scope.add"].allSatisfy(names.contains))
+            // The core's capture account (`capture.status`, status-page spec F-1): this is an EXTERNAL
+            // core (AITM_CONFIG), which runs no extension, so the app must publish no capture fact for
+            // it even though the core lists the verb — the All Apps lane stays on the app's own
+            // tunnel status. Two polls later it is still nil (a poll that read it would have set it).
+            if names.contains("capture.status") {
+                try? await Task.sleep(for: .seconds(2))
+                check("an external core publishes no capture.status fact (the lane keeps its tunnel-status source)",
+                      session.captureStatus == nil, "\(String(describing: session.captureStatus))")
+            } else {
+                print("NOTE core lists no capture.status; the external-core capture fact check is skipped")
+            }
             // A core shared with an earlier run may still be paused (F7 below pauses it):
             // paused, it hides every new flow and request.send would never show up.
             await resumeCapture(session)

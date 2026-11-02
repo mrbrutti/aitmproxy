@@ -733,17 +733,26 @@ impl Op {
         )
     }
 
+    /// The `[y/N]` confirmation text, as a `\n`-separated line protocol
+    /// (plan C47): the first line is the question; a line beginning with two
+    /// spaces is a detail printed whole, never wrapped (the SHA-256
+    /// fingerprint); the last line is the short final ask (`Install it?` /
+    /// `Remove it?`); every other line is a note the renderer wraps to the
+    /// terminal width behind a two-space indent. The CLI renders this text
+    /// through `aitm_term::prompt` (`ConfirmPrompt::parse` +
+    /// `render_confirm`), which appends the `[y/N] ` tail; the string itself
+    /// carries no `[y/N]`.
     fn prompt(self, fingerprint: &str, location: &str, scope: Scope) -> String {
         match self {
             Op::Install => format!(
-                "Install the aitmproxy root CA (SHA-256 {fingerprint}) into {location} (scope \
-                 {scope})? Every TLS client that uses that store will then trust certificates \
-                 this proxy mints. (The embedded obscura browser is unaffected; it trusts the CA \
-                 via --ca-cert.)"
+                "Install the aitmproxy root CA into {location} (scope {scope})?\n  SHA-256 \
+                 {fingerprint}\nEvery TLS client that uses that store will then trust \
+                 certificates this proxy mints. The embedded obscura browser is unaffected; it \
+                 trusts the CA via --ca-cert.\nInstall it?"
             ),
             Op::Uninstall => format!(
-                "Remove the aitmproxy root CA (SHA-256 {fingerprint}) from {location} (scope \
-                 {scope})?"
+                "Remove the aitmproxy root CA from {location} (scope {scope})?\n  SHA-256 \
+                 {fingerprint}\nRemove it?"
             ),
         }
     }

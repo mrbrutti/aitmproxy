@@ -117,17 +117,24 @@ impl fmt::Debug for Prepared {
 /// `--yes` is removed, the rest are the verb's flags, typed by the registry's
 /// schema through [`parse_flags`] when the registry knows the verb.
 ///
-/// The usage errors keep today's words so W1 classifies them (exit 2):
-/// `expected a command before flags, got \`--x\`` and `unknown command
-/// \`nonsense\`; run with no arguments to list commands`. A name the registry
-/// lacks is an unknown command only when it cannot be a verb at all (a single
-/// word: every verb is `group.verb`); a dotted name the registry lacks is
+/// The usage errors are the dispatcher's own (exit 2): `expected a command
+/// before flags, got \`--x\`` keeps today's words, and an unknown name is wave
+/// 2's typed report with its `did you mean:` line ([`unknown_command`]). A name
+/// the registry lacks is an unknown command only when it cannot be a verb at
+/// all (a single word: every verb is `group.verb`); a dotted name the registry lacks is
 /// [`Prepared::Unresolved`], for the core to know or refuse.
 pub fn prepare(registry: &Registry, argv: &[String]) -> anyhow::Result<Prepared> {
     let path_len = argv.iter().take_while(|a| !is_flag(a)).count();
     if path_len == 0 {
         match argv.first() {
-            Some(flag) => anyhow::bail!("expected a command before flags, got `{flag}`"),
+            // The dispatcher's typed report (its `Usage:` line and `fix:`), as
+            // `Cli::dispatch` prints it; today's words stay the fallback.
+            Some(flag) => {
+                return Err(match aitm_cli::dispatch::locate(registry, argv) {
+                    Err(report) => anyhow::Error::new(report),
+                    Ok(_) => anyhow::anyhow!("expected a command before flags, got `{flag}`"),
+                })
+            }
             None => anyhow::bail!("usage: aitm <command> [--flag value]..."),
         }
     }
@@ -137,15 +144,32 @@ pub fn prepare(registry: &Registry, argv: &[String]) -> anyhow::Result<Prepared>
     let flags: Vec<String> = rest.iter().filter(|t| *t != YES_FLAG).cloned().collect();
     match registry.command(&dotted) {
         Some(cmd) => {
-            let params = parse_flags(&flags, &cmd.schema(), cmd.name())?;
+            // Wave 2's typed usage report (`ErrorReport`, C35) rides inside the
+            // anyhow error; `report_for`'s rule 0 renders it as is.
+            let params = parse_flags(&flags, cmd.as_ref())?;
             Ok(Prepared::Typed {
                 cmd: Arc::clone(cmd),
                 params,
                 yes,
             })
         }
-        None if dotted.contains('.') => Ok(Prepared::Unresolved { dotted, flags, yes }),
-        None => Err(unknown_command(&dotted)),
+        // A dotted name the local registry lacks is either a typo of a registered
+        // command or a verb only the core knows (a script registered there). The
+        // dispatcher's own did-you-mean decides (wave 2 parity): a close registered
+        // name means a typo, refused here as the dispatcher would, exit 2, nothing
+        // dialed; no close name means the core gets to know or refuse it (C10).
+        None if dotted.contains('.') => match aitm_cli::dispatch::locate(registry, argv) {
+            Err(report)
+                if report
+                    .why
+                    .iter()
+                    .any(|line| line.starts_with("did you mean")) =>
+            {
+                Err(anyhow::Error::new(report))
+            }
+            _ => Ok(Prepared::Unresolved { dotted, flags, yes }),
+        },
+        None => Err(unknown_command(registry, argv, &dotted)),
     }
 }
 
@@ -153,8 +177,19 @@ pub fn prepare(registry: &Registry, argv: &[String]) -> anyhow::Result<Prepared>
 /// by this prefix (`USAGE_PREFIXES`, exit 2). The one literal, for a name
 /// the registry lacks ([`prepare`]) and one the core's `tools/list` lacks
 /// too (the entry point).
-pub(super) fn unknown_command(dotted: &str) -> anyhow::Error {
-    anyhow::anyhow!("unknown command `{dotted}`; run with no arguments to list commands")
+/// The unknown-command report, exactly the one `Cli::dispatch` would print
+/// for the same argv (wave 2's `locate`: the spaced name, a `did you mean:`
+/// line when a registered name is close, `fix: aitm --help`), carried as a
+/// typed `ErrorReport` so `report_for`'s rule 0 renders it as is (exit 2).
+/// `locate` cannot answer `Ok` for a name the registry lacks; the fallback
+/// keeps today's words for that impossible case.
+pub(super) fn unknown_command(registry: &Registry, argv: &[String], dotted: &str) -> anyhow::Error {
+    match aitm_cli::dispatch::locate(registry, argv) {
+        Err(report) => anyhow::Error::new(report),
+        Ok(_) => {
+            anyhow::anyhow!("unknown command `{dotted}`; run with no arguments to list commands")
+        }
+    }
 }
 
 /// `tok` is a flag: `--` and at least one more character (`--` alone and
@@ -802,18 +837,24 @@ mod tests {
             }
             Prepared::Typed { .. } => panic!("an empty registry knows nothing"),
         }
+        // An unknown single token is the dispatcher's own typed report (wave 2).
+        let dispatcher_what = |argv: &[String]| {
+            aitm_cli::dispatch::locate(&registry, argv)
+                .expect_err("the dispatcher refuses it too")
+                .what
+        };
         let err = prepare(&registry, &strs(&["--"])).expect_err("-- alone");
-        assert_eq!(
-            err.to_string(),
-            "unknown command `--`; run with no arguments to list commands"
-        );
+        let report = err
+            .downcast_ref::<aitm_term::error::ErrorReport>()
+            .expect("a typed usage report");
+        assert_eq!(report.what, dispatcher_what(&strs(&["--"])));
         let err = prepare(&registry, &[]).expect_err("empty argv");
         assert_eq!(err.to_string(), "usage: aitm <command> [--flag value]...");
         let err = prepare(&registry, &strs(&["-x"])).expect_err("single dash");
-        assert_eq!(
-            err.to_string(),
-            "unknown command `-x`; run with no arguments to list commands"
-        );
+        let report = err
+            .downcast_ref::<aitm_term::error::ErrorReport>()
+            .expect("a typed usage report");
+        assert_eq!(report.what, dispatcher_what(&strs(&["-x"])));
     }
 
     fn def(name: &str, ty: TypeDesc, required: bool) -> ParamDef {

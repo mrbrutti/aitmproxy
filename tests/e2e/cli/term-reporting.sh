@@ -648,10 +648,10 @@ ec() {
 section_exitcodes() {
   begin_section "4. exit codes and usage panels (AC-W1-13, AC-W1-14, AC-W1-26, AC-W1-27)"
   new_home exitcodes
-  ec "aitm tui extra"                         2 'usage: aitm [--config <path>] tui' ''                -- "$AITM_BIN" tui extra
-  ec "aitm operator-token"                    2 'usage: aitm [--config <path>] operator-token' ''     -- "$AITM_BIN" operator-token
+  ec "aitm tui extra"                         2 'tui takes no further arguments' 'Usage: aitm [--config <path>] tui' -- "$AITM_BIN" tui extra
+  ec "aitm operator-token"                    2 'operator-token needs a verb' 'Usage: aitm [--config <path>] operator-token' -- "$AITM_BIN" operator-token
   ec "aitm nonsense"                          2 'unknown command `nonsense`' 'fix: aitm --help'      -- "$AITM_BIN" nonsense
-  ec "aitm flow list --bogus 1"               2 'error: unknown flag --bogus' 'fix: aitm --help'     -- "$AITM_BIN" flow list --bogus 1
+  ec "aitm flow list --bogus 1"               2 'error: unknown flag --bogus' 'fix: aitm flow list --help' -- "$AITM_BIN" flow list --bogus 1
   ec "aitm --flag-first"                      2 'error: expected a command before flags, got `--flag-first`' 'fix: aitm --help' -- "$AITM_BIN" --flag-first
   ec "aitm --config (no value)"               2 'error: --config requires a path' 'fix: aitm --help'    -- "$AITM_BIN" --config
   ec "aitm -v -q"                             2 '`-v` and `-q` cannot be combined' ''                -- "$AITM_BIN" -v -q

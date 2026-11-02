@@ -4,11 +4,11 @@
 //! not), and no command claims the one-shot's own flag names.
 //!
 //! The `m4_sensitivity.rs` pattern over the full assembly: names come from
-//! `support::built_in_groups` (the EMPTY Rhai tier plus the `FindingsPlugin`,
+//! `support::live_commands` (the EMPTY Rhai tier plus the `FindingsPlugin`,
 //! exactly as `main` wires it) for `Features::default()` and for the
 //! `synopsis_groups_l4.rs` feature set that registers the native `l4.*` verbs.
 //! The params scan mirrors that assembly to reach the commands themselves and
-//! cross-checks its name set against `built_in_groups` so the two cannot drift.
+//! cross-checks its name set against `live_commands` so the two cannot drift.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -269,9 +269,17 @@ fn full_registry(features: &Features) -> (tokio::runtime::Runtime, Arc<Registry>
 
 #[test]
 fn every_registered_verb_is_classified() {
-    // The authoritative name set: the default assembly plus the l4 natives.
-    let (_, default_names) = support::built_in_groups(&Features::default());
-    let (_, l4_names) = support::built_in_groups(&l4_features());
+    // The authoritative name set: the default assembly plus the l4 natives, from
+    // the live assembly over the EMPTY Rhai tier (`support::live_commands`, the
+    // helper wave 2 kept when it retired `built_in_groups`).
+    let names = |features: &Features| -> Vec<String> {
+        support::live_commands(features, RhaiConfig::default())
+            .into_iter()
+            .map(|(name, _fingerprint)| name)
+            .collect()
+    };
+    let default_names = names(&Features::default());
+    let l4_names = names(&l4_features());
     let registered: BTreeSet<&str> = default_names
         .iter()
         .chain(l4_names.iter())
