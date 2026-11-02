@@ -1,0 +1,11 @@
+07:58:15 l4.scope.add with inject_rate_pps 100 (operator-confirmed over the bus)
+needs_confirmation: Confirm l4.scope.add: inject scope for 127.0.0.1/32 all ports on * (outbound), inject rate 100pps/100burst. A runtime entry never lifts the dangerous-destination denylist.
+"16e5df3a-2c7c-4bc5-b7c3-fbd17e52f867"
+l4 scope entries: [('inject', '*', '0-65535', {'burst': 0, 'pps': 0}), ('inject', '*', '0-65535', {'burst': 100, 'pps': 100})]
+07:58:31 after sheet: jobs []
+07:58:34 after Cancel: jobs []
+07:58:42 shot 64-l4-run-t1; scan.status 
+07:58:47 shot 64-l4-run-t2; scan.status 
+07:58:52 shot 64-l4-run-t3; scan.status 
+07:58:57 shot 64-l4-run-t4; scan.status 
+07:59:01 agent.activity scan.start rows: 1

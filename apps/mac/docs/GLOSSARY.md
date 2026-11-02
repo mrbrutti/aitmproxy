@@ -65,3 +65,25 @@ One name per thing, everywhere: buttons, menus, tooltips, errors, stories.
 | All Apps | System-wide capture through the macOS network extension: every Mac app's traffic, including apps that ignore proxy settings, and the source of the Apps page's per-app grouping; on, off, waiting for approval, or degraded. Toolbar switch, Status lane and Settings tab all say "All Apps"; "the extension" names the mechanism only where macOS does (approval, uninstall) | Capture, Extension, NE, sysext, transparent proxy (in UI text) |
 | Capture All Apps / Stop Capturing All Apps | The operator's switch for All Apps: the toolbar's All Apps switch, Settings ▸ All Apps, Proxy ▸ Capture All Apps (⌃⌘A), the Status card | enable, disable, turn on capture, pause (that is the proxy) |
 | Getting started | The Status page's live checklist: core, bus, extension, scope, first flow | onboarding, wizard, tour |
+| Scan | The Testing page that holds Profiles, Jobs, Site map and Issues | scanner (the engine, in UI text), audit |
+| Profile | A saved recipe for a scan: target origins, lanes, intensity, speed, accuracy, checks, budgets, session mode | config, preset, template |
+| Lane | One protocol family a scan can run: HTTP, WebSocket, L4 packet, L4 stream | module, engine, plugin |
+| Intensity | How far a profile's checks go: Passive, Light, Medium, Intrusive | level, aggressiveness |
+| Start Scan | Launch a job from the selected profile (⌘⏎ on the Profiles tab) | run, launch, execute |
+| Map Only | Launch a crawl-and-passive job with no probes (`scan.map`) | discover, spider |
+| Job | One running or finished scan: its state, phase, counters and issues | run, task, session |
+| Phase | Where a job is: Queued, Crawling, Passive, Auditing, Reporting, Done | stage, step |
+| Probe | One request the scan sent to test a point; counted against the budget | payload, attack, hit |
+| Budget | The probe and time ceilings a job runs under | limit, quota |
+| Cancel Scan | Stop a running job; its issues stay (⌥⌘.) | abort, kill, stop |
+| Site map | The tree of endpoints a job reached, by host and path | tree, crawl results, endpoints |
+| Insertion point | One place in a request a probe can go: query, body param, JSON value, header, cookie, path segment, WebSocket field, L4 field | injection point (legacy form only), parameter |
+| Issue | One thing a check found on one point, with its evidence | finding (that is a PoC run), vuln, alert |
+| Severity | Critical, High, Medium, Low or Info | risk, priority |
+| Confidence | Certain, Firm or Tentative | certainty, score |
+| Evidence | What the check saw: payload, what matched, timing, diff, probe flows | proof, details |
+| Probe flow | A flow the engine recorded for an issue; opens in the inspector | request, capture |
+| Status (issue) | Open, Confirmed or False positive; set by the operator | state, triage, verdict |
+| Session mode | Observed (reuse cookies and auth headers seen through the proxy, names only shown) or None | auth, login |
+
+The legacy form keeps its words (Target, Scan, Endpoints, Injection points) because it is the shipped `scan.discover` surface and goes away with the verb.

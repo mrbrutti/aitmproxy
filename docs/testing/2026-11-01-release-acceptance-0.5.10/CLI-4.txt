@@ -1,0 +1,26 @@
+## CLI-4 exit 0
+## stdout (121 lines; Rhai loader lines dropped)
+{
+  "address": "127.0.0.1:8080",
+  "capturing": true,
+  "decrypt": {
+    "advice": "Nothing is decrypted until a host is in Scope.",
+    "decrypting": false,
+    "scope_hosts": 0
+  },
+  "flows": 0,
+  "intercept_armed": false,
+  "listening": false,
+  "paused": 0,
+  "system_proxy": {
+    "detail": "HTTP and HTTPS off",
+    "host": null,
+    "managed_by_us": false,
+    "port": null,
+    "setting": false,
+    "state": "off",
+    "supported": true
+  },
+  "version": "0.5.10"
+}
+## stderr (0 lines)

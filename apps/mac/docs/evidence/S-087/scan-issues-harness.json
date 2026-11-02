@@ -1,0 +1,83 @@
+{
+ "by_severity": {
+  "critical": 0,
+  "high": 0,
+  "info": 0,
+  "low": 4,
+  "medium": 2
+ },
+ "issues": [
+  {
+   "id": "issue-f2a85a99",
+   "severity": "medium",
+   "class": "reflected-xss",
+   "confidence": "certain",
+   "status": "open",
+   "poc_ref": null,
+   "finding_id": null,
+   "path": "/search",
+   "kind": "query",
+   "name": "q"
+  },
+  {
+   "id": "issue-5a772705",
+   "severity": "medium",
+   "class": "reflected-xss",
+   "confidence": "certain",
+   "status": "open",
+   "poc_ref": null,
+   "finding_id": null,
+   "path": "/greet",
+   "kind": "query",
+   "name": "name"
+  },
+  {
+   "id": "issue-a4020418",
+   "severity": "low",
+   "class": "security-header",
+   "confidence": "firm",
+   "status": "open",
+   "poc_ref": null,
+   "finding_id": null,
+   "path": "/",
+   "kind": "header",
+   "name": "sec-ch-ua"
+  },
+  {
+   "id": "issue-3e502ab1",
+   "severity": "low",
+   "class": "reflection",
+   "confidence": "tentative",
+   "status": "open",
+   "poc_ref": null,
+   "finding_id": null,
+   "path": "/search",
+   "kind": "query",
+   "name": "q"
+  },
+  {
+   "id": "issue-49b3cac1",
+   "severity": "low",
+   "class": "cookie-flag",
+   "confidence": "firm",
+   "status": "open",
+   "poc_ref": null,
+   "finding_id": null,
+   "path": "/lang",
+   "kind": "query",
+   "name": "set"
+  },
+  {
+   "id": "issue-07e96cc0",
+   "severity": "low",
+   "class": "open-redirect",
+   "confidence": "certain",
+   "status": "open",
+   "poc_ref": null,
+   "finding_id": null,
+   "path": "/redirect",
+   "kind": "query",
+   "name": "next"
+  }
+ ]
+}

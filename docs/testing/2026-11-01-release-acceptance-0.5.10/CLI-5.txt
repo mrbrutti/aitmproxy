@@ -1,0 +1,4 @@
+## CLI-5 exit 0
+## stdout (99 lines; Rhai loader lines dropped)
+acceptance-cli5.invalid
+## stderr (0 lines)
