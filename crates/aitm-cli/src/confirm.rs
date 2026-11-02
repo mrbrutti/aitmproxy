@@ -180,4 +180,84 @@ mod tests {
         );
         assert_eq!(out, "", "nothing is written when the question is refused");
     }
+
+    // ---- tester, wave-2 pass 1 (AC-W2-8; plan C47) ----
+
+    /// Whitespace and case around the answer are ignored and anything but
+    /// `y`/`yes` is a no; a dead stdin or an unwritable stderr is an error,
+    /// never a yes, and nothing is read when the prompt could not be shown.
+    #[test]
+    fn confirm_with_answers_and_io_failures() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("stdin gone"))
+            }
+        }
+        impl BufRead for Broken {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Err(std::io::Error::other("stdin gone"))
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        struct Full;
+        impl Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("stderr closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let confirmer = TtyConfirmer::new(true).with_caps(piped_utf8());
+        for (input, expected) in [
+            (" y \n", true),
+            ("Y\n", true),
+            ("Yes\n", true),
+            ("yes please\n", false),
+            ("\n", false),
+            ("n", false),
+            ("yesno\n", false),
+            ("ye\n", false),
+        ] {
+            let (answer, out) = ask(&confirmer, "Q?", input);
+            assert_eq!(answer.expect("answerable"), expected, "{input:?}");
+            assert_eq!(out, "Q? [y/N] ");
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let err = confirmer
+            .confirm_with("Q?", &mut out, &mut Broken)
+            .expect_err("a dead stdin is an error");
+        assert!(err.to_string().contains("stdin gone"), "{err}");
+        assert_eq!(out, b"Q? [y/N] ");
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let err = confirmer
+            .confirm_with("Q?", &mut Full, &mut input)
+            .expect_err("an unwritable stderr is an error");
+        assert!(err.to_string().contains("stderr closed"), "{err}");
+        assert_eq!(input.position(), 0);
+    }
+
+    /// The caps the confirmer was given reach the renderer: on a rich stream
+    /// only the fingerprint detail is painted dim (M-W2-6).
+    #[test]
+    fn with_caps_reaches_the_renderer() {
+        let rich = Caps {
+            tty: true,
+            color: true,
+            unicode: true,
+            animate: true,
+            width: 80,
+            ci: false,
+        };
+        let confirmer = TtyConfirmer::new(true).with_caps(rich);
+        let (answer, out) = ask(&confirmer, &ca_install_text(), "n\n");
+        assert!(!answer.expect("answerable"));
+        assert!(
+            out.contains(&format!("\n  \x1b[2mSHA-256 {FINGERPRINT}\x1b[0m\n")),
+            "{out:?}"
+        );
+        assert_eq!(out.matches("\x1b[").count(), 2, "{out:?}");
+        assert!(out.ends_with("\nInstall it? [y/N] "), "{out:?}");
+    }
 }

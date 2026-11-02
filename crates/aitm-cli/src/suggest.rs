@@ -143,4 +143,55 @@ mod tests {
         );
         assert_eq!(did_you_mean(&[]), None);
     }
+
+    // ---- tester, wave-2 pass 1 (AC-W2-3/10; plan C37) ----
+
+    /// Verbs with underscores and three-segment (dotted) verb names go
+    /// through the same two rules: a dash for an underscore or a dropped one
+    /// is one edit, so the right verb is the only suggestion; a prefix of a
+    /// dotted name lists every verb under it, sorted. Edits are counted over
+    /// chars, the match is case-sensitive, and the cap applies after sorting.
+    #[test]
+    fn suggest_over_underscored_and_three_segment_verbs() {
+        let browser = [
+            "navigate",
+            "click",
+            "type",
+            "eval",
+            "get_dom",
+            "screenshot",
+            "confine",
+        ];
+        assert_eq!(suggest("getdom", browser), vec!["get_dom"]);
+        assert_eq!(suggest("get-dom", browser), vec!["get_dom"]);
+        assert_eq!(suggest("get_", browser), vec!["get_dom"]);
+        let l4 = ["recon", "tcp_probe", "udp_probe", "interfaces"];
+        // `udp_probe` is two edits away; only the closest tier is offered.
+        assert_eq!(suggest("tcp-probe", l4), vec!["tcp_probe"]);
+        assert_eq!(suggest("probe", l4), Vec::<&str>::new());
+        let tls = ["passthrough.add", "passthrough.list", "passthrough.remove"];
+        assert_eq!(
+            suggest("passthrough", tls),
+            vec!["passthrough.add", "passthrough.list", "passthrough.remove"]
+        );
+        assert_eq!(suggest("passthrough.ad", tls), vec!["passthrough.add"]);
+        assert_eq!(suggest("passthrough.lst", tls), vec!["passthrough.list"]);
+        assert_eq!(distance("scöpe", "scope"), 1);
+        assert_eq!(suggest("Scope", GROUPS), vec!["scope"]);
+        assert_eq!(distance("ab", "ba"), 1);
+        assert_eq!(distance("abcd", "badc"), 2);
+        assert_eq!(distance("", ""), 0);
+        // An empty input is a prefix of nothing (rule 1 is skipped) and two
+        // edits from every two-letter name (rule 2).
+        assert_eq!(suggest("", GROUPS), vec!["ca", "l4", "ws"]);
+        assert_eq!(MAX_DISTANCE, 2);
+        assert_eq!(MAX_SUGGESTIONS, 3);
+        // Four groups start with `s`; the first three by name survive the cap.
+        assert_eq!(suggest("s", GROUPS), vec!["scan", "scope", "script"]);
+        assert_eq!(suggest("x", Vec::<&str>::new()), Vec::<&str>::new());
+        // Exactly three edits is one too many (`pe` → `scope`: two insertions
+        // and a substitution), so nothing is offered.
+        assert_eq!(distance("pe", "scope"), 3);
+        assert_eq!(suggest("pe", ["scope", "flow"]), Vec::<&str>::new());
+    }
 }

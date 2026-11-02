@@ -578,4 +578,166 @@ mod tests {
             "{warned:?}"
         );
     }
+
+    // ---- tester, wave-2 pass 1 (AC-W2-2/3/7; plan C29, C31, C33) ----
+
+    use crate::help::request;
+
+    /// A help flag in a value position (`aitm scope add --host --help`) is
+    /// the verb's page: `request::parse` keeps the leading tokens and
+    /// `answer` ignores the rest (plan Task 14); with an unknown verb before
+    /// the flags it is the group's did-you-mean.
+    #[test]
+    fn help_flag_in_a_value_position_is_the_verb_page() {
+        let req =
+            request::parse(&args(&["scope", "add", "--host", "--help"])).expect("a help request");
+        assert_eq!(req.topic, args(&["scope", "add"]));
+        assert!(req.explicit);
+        let (answer, warned) = ask("value-position", &req, NO_CATALOGUE_ENV);
+        let (plain, _) = ask(
+            "value-position-plain",
+            &explicit(&["scope", "add"]),
+            NO_CATALOGUE_ENV,
+        );
+        assert_eq!(answer, plain);
+        assert!(
+            page(&answer).starts_with("Add a host, host:port, or *.wildcard to Scope."),
+            "{}",
+            page(&answer)
+        );
+        assert_eq!(warned, "");
+        let req = request::parse(&args(&["scope", "ad", "--host", "x", "--help"]))
+            .expect("a help request");
+        let (answer, _) = ask("value-position-unknown", &req, NO_CATALOGUE_ENV);
+        let report = error(&answer);
+        assert_eq!(report.what, "unknown command `scope ad`");
+        assert_eq!(report.why, vec!["did you mean: scope add".to_string()]);
+        assert_eq!(report.command, Some(FixCommand("aitm scope".into())));
+        assert_eq!(report.log, None);
+    }
+
+    /// `aitm help help` asks about a topic named `help`, which is neither a
+    /// group nor a command: explicit, so a usage error pointing at the top
+    /// page (no group is within two edits of `help`), exit 2. `aitm help
+    /// --help` is the top page.
+    #[test]
+    fn help_help_is_an_unknown_topic_and_help_dash_help_is_the_top_page() {
+        let req = request::parse(&args(&["help", "help"])).expect("a help request");
+        assert_eq!(req.topic, args(&["help"]));
+        let (answer, warned) = ask("help-help", &req, NO_CATALOGUE_ENV);
+        let report = error(&answer);
+        assert_eq!(report.what, "unknown command `help`");
+        assert_eq!(report.why, Vec::<String>::new());
+        assert_eq!(report.command, Some(FixCommand("aitm --help".into())));
+        assert_eq!(report.exit_code(), 2);
+        assert_eq!(warned, "");
+        let req = request::parse(&args(&["help", "--help"])).expect("a help request");
+        assert_eq!(req.topic, Vec::<String>::new());
+        let (answer, _) = ask("help-dash-help", &req, NO_CATALOGUE_ENV);
+        assert!(page(&answer).starts_with("aitm 0.5.11 — "));
+    }
+
+    /// A `--config` path that is a directory cannot be read: defaults plus
+    /// the one warning, the page still prints, and the directory is left as
+    /// it was — nothing created inside it (plan C31, rule 12).
+    #[test]
+    fn config_path_that_is_a_directory_warns_once_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("aitm-help-answer-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (answer, warned) = ask_with(Some(&dir), &explicit(&["scope"]), NO_CATALOGUE_ENV);
+        let entries = std::fs::read_dir(&dir).expect("readable").count();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = page(&answer);
+        assert!(
+            text.starts_with("aitm scope — which hosts are decrypted\n"),
+            "{text}"
+        );
+        assert_eq!(warned.lines().count(), 1, "{warned:?}");
+        assert!(
+            warned.starts_with(&format!("warning: config not read · {}: ", dir.display())),
+            "{warned:?}"
+        );
+        assert!(
+            warned.ends_with(" · help lists the default command set\n"),
+            "{warned:?}"
+        );
+        assert_eq!(
+            entries, 0,
+            "help created something under the config directory"
+        );
+    }
+
+    /// Plan C33: an implicit single token that names no group falls through
+    /// to the CLI. A dotted verb name (`aitm flow.list`, the dispatcher's
+    /// compatibility form) names no group, so it is `NotHelp` — the one-shot
+    /// runs — not the verb's page; `aitm help flow.list` (explicit) is the
+    /// page.
+    #[test]
+    #[ignore = "DEFECT (tester, wave-2 pass 1): `answer` renders the verb page for an implicit dotted token; plan C33 says an implicit request that names no group is NotHelp. Un-ignore with the fix."]
+    fn implicit_dotted_verb_token_is_not_help() {
+        let (answer, warned) = ask("implicit-dotted", &implicit("flow.list"), NO_CATALOGUE_ENV);
+        assert_eq!(
+            answer,
+            Answer::NotHelp,
+            "C33: only a group answers an implicit request"
+        );
+        assert_eq!(warned, "");
+        let (answer, _) = ask(
+            "explicit-dotted",
+            &explicit(&["flow.list"]),
+            NO_CATALOGUE_ENV,
+        );
+        assert!(
+            page(&answer).contains("\nUsage:\n  aitm flow list\n"),
+            "{}",
+            page(&answer)
+        );
+    }
+
+    /// Plan C29/C31 end to end: a config that enables `l4` is read (never
+    /// written) and the `l4` group gains the module's verbs behind the three
+    /// bundled scripts, in registration order; without it the group is the
+    /// three scripts alone.
+    #[test]
+    fn config_with_l4_enabled_grows_the_l4_group() {
+        fn verb_rows(text: &str) -> Vec<&str> {
+            text.lines()
+                .skip_while(|l| *l != "Verbs:")
+                .skip(1)
+                .take_while(|l| !l.is_empty())
+                .filter(|l| !l.starts_with("    "))
+                .collect()
+        }
+        let config = TempConfig::new("l4", "l4:\n  enabled: true\n");
+        let (answer, warned) = ask_with(Some(&config.path), &implicit("l4"), CATALOGUE_ENV);
+        let text = page(&answer);
+        assert_eq!(warned, "");
+        assert!(
+            text.starts_with("aitm l4 — raw packet recon, probes and capture (opt-in)\n"),
+            "{text}"
+        );
+        let verbs = verb_rows(text);
+        assert_eq!(verbs.len(), 25, "3 scripts + 22 natives: {verbs:?}");
+        assert!(verbs[0].starts_with("  recon "), "{}", verbs[0]);
+        assert!(verbs[1].starts_with("  tcp_probe "), "{}", verbs[1]);
+        assert!(verbs[2].starts_with("  udp_probe "), "{}", verbs[2]);
+        assert!(
+            verbs.iter().any(|l| l.starts_with("  scope add --")),
+            "{verbs:?}"
+        );
+        // The 109-column footer wraps at 80 (plan C40: `Text` paragraphs wrap).
+        assert!(
+            text.ends_with("\n\nMost l4 verbs need l4.enabled in the config and capture privilege; recon and the\nprobes are bundled scripts.\n"),
+            "{text}"
+        );
+        assert!(!text.as_bytes().contains(&0x1b));
+        let (answer, _) = ask("l4-bare", &implicit("l4"), CATALOGUE_ENV);
+        let bare = verb_rows(page(&answer));
+        assert_eq!(bare.len(), 3, "{bare:?}");
+        // The config is read, not written: the file is byte-identical after.
+        assert_eq!(
+            std::fs::read_to_string(&config.path).expect("still there"),
+            "l4:\n  enabled: true\n"
+        );
+    }
 }

@@ -1009,4 +1009,65 @@ mod tests {
         assert_eq!(headline.what, "Usage: aitm x");
         assert_eq!(headline.exit_code(), 2);
     }
+
+    // ---- tester, wave-2 pass 1 (plan C35/C36 rule 0; AC-W2-5) ----
+
+    /// Rule 0 two contexts deep: the typed report — usage or failure — wins
+    /// over every rule that would read the top message (here a usage prefix
+    /// and a `usage:` line), keeps its own pointer (`aitm web --help`, never
+    /// re-derived as `aitm --help`) and gains only the log footer; a typed
+    /// failure stays exit 1 with no pointer.
+    #[test]
+    fn typed_report_nested_two_contexts_deep_wins_over_every_string_rule() {
+        let web = ErrorReport::usage("unknown argument to `aitm web`: --bad")
+            .with_why(vec![
+                "Usage: aitm [--config <path>] web [--listen <addr>] [--token <token>] [--no-open]"
+                    .to_string(),
+            ])
+            .with_command("aitm web --help");
+        let err = anyhow::Error::new(web.clone())
+            .context("parsing arguments")
+            .context("expected a command before flags, got `--bad`");
+        assert_eq!(
+            report_for(&err, Some(Path::new(LOG))),
+            web.clone().with_log(Some(PathBuf::from(LOG)))
+        );
+        assert_eq!(report_for(&err, None), web);
+
+        let failure = ErrorReport::failure("the scripting engine could not be built")
+            .with_why(vec!["no runtime".to_string()]);
+        let err = anyhow::Error::new(failure.clone())
+            .context("building help")
+            .context("usage: aitm x");
+        let report = report_for(&err, Some(Path::new(LOG)));
+        assert_eq!(report.kind, ErrorKind::Failure);
+        assert_eq!(report.exit_code(), 1);
+        assert_eq!(report.command, None);
+        assert_eq!(report, failure.with_log(Some(PathBuf::from(LOG))));
+
+        // The string protocol: a third detail line is a second cause; the
+        // lowercase spelling still works; a `Usage:` that does not start the
+        // second line is not the protocol.
+        let three = report_for(
+            &anyhow::anyhow!(
+                "operator-token needs a verb\nUsage: aitm [--config <path>] operator-token generate [--force]\n  (generate is the only verb)"
+            ),
+            None,
+        );
+        assert_eq!(three.kind, ErrorKind::Usage);
+        assert_eq!(
+            three.why,
+            vec![
+                "Usage: aitm [--config <path>] operator-token generate [--force]".to_string(),
+                "  (generate is the only verb)".to_string(),
+            ]
+        );
+        let lower = report_for(&anyhow::anyhow!("x\nusage: aitm y"), None);
+        assert_eq!(lower.kind, ErrorKind::Usage);
+        assert_eq!(lower.what, "x");
+        assert_eq!(lower.why, vec!["usage: aitm y".to_string()]);
+        let mid = report_for(&anyhow::anyhow!("x\nsee Usage: aitm y"), None);
+        assert_eq!(mid.kind, ErrorKind::Failure);
+        assert_eq!(mid.command, None);
+    }
 }

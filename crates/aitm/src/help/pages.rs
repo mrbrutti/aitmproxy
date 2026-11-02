@@ -841,4 +841,379 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
         assert!(group(&described.registry, "").is_none());
         assert!(group(&described.registry, "scope").is_some());
     }
+
+    // ---- tester, wave-2 pass 1 (AC-W2-1/2; plan C40–C45, C50) ----
+
+    use aitm_term::help::DESC_COL;
+
+    /// The schema-only registry with `l4.enabled` for `env` (the widest set
+    /// help can show), built in-process (plan rule 13).
+    fn registry_with_l4(tag: &str, env: &[(&str, &str)]) -> Described {
+        let mut settings = settings(tag);
+        settings.l4.enabled = true;
+        let env: BTreeMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let lookup = |key: &str| env.get(key).cloned();
+        let described = describe::registry(&DescribeInputs {
+            settings: &settings,
+            script_args: &[],
+            env: &lookup,
+        })
+        .expect("the schema-only registry builds");
+        assert!(
+            !settings.core.ca.dir.exists(),
+            "help must never create the CA directory (plan rule 12)"
+        );
+        described
+    }
+
+    /// The rows of a rendered section as `(left, description words)`: a line
+    /// that does not start at the description column opens a row, every
+    /// following line at that column continues its description.
+    fn rendered_rows(lines: &[&str]) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for line in lines {
+            if line.starts_with("    ") {
+                let (_, desc) = rows.last_mut().expect("a continuation follows a row");
+                desc.push(' ');
+                desc.push_str(line.trim());
+            } else {
+                let body = &line[2..];
+                let (left, desc) = match body.find("  ") {
+                    Some(at) => (&body[..at], body[at..].trim()),
+                    None => (body, ""),
+                };
+                rows.push((left.to_string(), desc.to_string()));
+            }
+        }
+        rows
+    }
+
+    /// The top page at 40 and 200 columns: at 200 nothing wraps, so it is
+    /// the 80-column mock-up; at 40 the 19 group rows keep the fixed column
+    /// with at most twenty columns of description per line, the examples and
+    /// the footer are printed whole, and every row's words are the same.
+    #[test]
+    fn top_level_renders_at_width_forty_and_two_hundred() {
+        let described = registry_with("widths", CATALOGUE_ENV);
+        let page = top_level(&described.registry, VERSION);
+        let at = |width: u16| {
+            render(
+                &Caps {
+                    width,
+                    ..piped_utf8()
+                },
+                &page,
+            )
+        };
+        let (narrow, wide, normal) = (at(40), at(200), at(80));
+        assert_eq!(wide, M_W2_1);
+        assert_eq!(normal, M_W2_1);
+        assert_ne!(narrow, M_W2_1);
+        let narrow_groups = block_lines(&narrow, "Groups:");
+        assert!(narrow_groups.len() > 19, "{narrow}");
+        for line in &narrow_groups {
+            let desc = line.get(DESC_COL..).unwrap_or_default();
+            assert!(text::width(desc) <= 20, "{line:?}");
+            if !line.starts_with("    ") {
+                assert_eq!(line.chars().nth(DESC_COL - 1), Some(' '), "{line:?}");
+                assert_ne!(line.chars().nth(DESC_COL), Some(' '), "{line:?}");
+            }
+        }
+        for heading in ["Usage:", "Groups:", "Options:", "Learn more:"] {
+            let rows_narrow = rendered_rows(&block_lines(&narrow, heading));
+            let rows_wide = rendered_rows(&block_lines(&wide, heading));
+            assert_eq!(rows_narrow, rows_wide, "{heading} at 40 vs 200");
+        }
+        assert_eq!(rendered_rows(&block_lines(&narrow, "Groups:")).len(), 19);
+        assert_eq!(
+            block_lines(&narrow, "Examples:"),
+            block_lines(&wide, "Examples:")
+        );
+        fn last_two(s: &str) -> Vec<&str> {
+            s.lines().rev().take(2).collect()
+        }
+        assert_eq!(last_two(&narrow), last_two(&wide));
+        assert_eq!(
+            last_two(&narrow),
+            vec![
+                "Trust the CA:  aitm ca install",
+                "Nothing is decrypted until a host is in Scope.  aitm scope add --host <host>",
+            ]
+        );
+    }
+
+    /// AC-W2-1's rich half, in-process (the `help.sh` §8 analogue): on a
+    /// colour TTY the top page paints its five headings bold and its 35
+    /// physical description lines dim — nothing else — and stripping the SGR
+    /// gives the piped page back.
+    #[test]
+    fn top_level_rich_paints_five_headings_and_every_description_line() {
+        let described = registry_with("rich", CATALOGUE_ENV);
+        let rich = render(&tty80(), &top_level(&described.registry, VERSION));
+        assert_eq!(rich.matches("\x1b[1m").count(), 5, "{rich:?}");
+        assert_eq!(rich.matches("\x1b[2m").count(), 5 + 19 + 8 + 3, "{rich:?}");
+        assert_eq!(rich.matches("\x1b[").count(), 2 * (5 + 35), "{rich:?}");
+        // The title, the example lines and the two footer lines are never
+        // painted; the headings are the only unindented lines that are.
+        for line in rich.lines() {
+            let plain = text::strip_sgr(line);
+            let heading = !plain.starts_with(' ') && plain.ends_with(':');
+            if plain.starts_with("  $ ") || (!plain.starts_with(' ') && !heading) {
+                assert!(!line.as_bytes().contains(&0x1b), "{line:?}");
+            }
+        }
+        assert_eq!(text::strip_sgr(&rich), M_W2_1);
+    }
+
+    /// An example wider than the terminal is printed whole (plan C40/C45):
+    /// `map.add`'s 124-column line in an 80-column page is one line, at 40 too.
+    #[test]
+    fn verb_page_prints_a_124_column_example_whole_at_80() {
+        let described = registry_with("map-add", NO_CATALOGUE_ENV);
+        let cmd = described
+            .registry
+            .command("map.add")
+            .expect("map.add is registered");
+        let page = verb(cmd.as_ref());
+        let example = examples_for("map.add")[0];
+        assert_eq!(example.chars().count(), 124);
+        for width in [40u16, 80, 200] {
+            let out = render(
+                &Caps {
+                    width,
+                    ..piped_utf8()
+                },
+                &page,
+            );
+            assert!(
+                out.contains(&format!("\nExamples:\n  $ {example}\n")),
+                "{width}: {out}"
+            );
+        }
+    }
+
+    /// A three-segment group (`tls`) and the one-verb groups (`capture`,
+    /// `config`, `request`): the verb rows show the words after the group
+    /// with the required flags (plan C42/C50), the examples fall back to each
+    /// verb's first (plan C45), there is no footer.
+    #[test]
+    fn group_pages_for_three_segment_and_one_verb_groups() {
+        let described = registry_with("tls", NO_CATALOGUE_ENV);
+        let reg = &described.registry;
+        let tls = render(&piped_utf8(), &group(reg, "tls").expect("tls is a group"));
+        assert!(
+            tls.starts_with(
+                "aitm tls — TLS passthrough: hosts tunnelled, not decrypted\n\nUsage:\n  aitm tls <verb> [--flag <value>]...\n\nVerbs:\n"
+            ),
+            "{tls}"
+        );
+        let (_, cmds) = describe::groups(reg)
+            .into_iter()
+            .find(|(g, _)| g == "tls")
+            .expect("tls");
+        let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "tls.passthrough.list",
+                "tls.passthrough.add",
+                "tls.passthrough.remove"
+            ]
+        );
+        let lefts: Vec<String> = rendered_rows(&block_lines(&tls, "Verbs:"))
+            .into_iter()
+            .map(|(left, _)| left)
+            .collect();
+        assert_eq!(
+            lefts,
+            [
+                "passthrough list",
+                "passthrough add --host <host>",
+                "passthrough remove --host <host>",
+            ]
+        );
+        let examples: Vec<String> = cmds
+            .iter()
+            .map(|c| format!("  $ {}", examples_for(c.name())[0]))
+            .collect();
+        assert_eq!(block_lines(&tls, "Examples:"), examples);
+        assert!(
+            tls.ends_with(&format!("{}\n", examples[2])),
+            "no footer: {tls}"
+        );
+        for name in ["capture", "config", "request"] {
+            let (_, cmds) = describe::groups(reg)
+                .into_iter()
+                .find(|(g, _)| g == name)
+                .unwrap_or_else(|| panic!("{name} is a group"));
+            assert_eq!(cmds.len(), 1, "{name} has one verb: {:?}", cmds.len());
+            let out = render(
+                &piped_utf8(),
+                &group(reg, name).unwrap_or_else(|| panic!("{name}")),
+            );
+            assert!(
+                out.contains(&format!("\nVerbs:\n  {}", verb_row(cmds[0].as_ref()))),
+                "{out}"
+            );
+            let example = examples_for(cmds[0].name())[0];
+            assert!(
+                out.ends_with(&format!("\nExamples:\n  $ {example}\n")),
+                "{out}"
+            );
+        }
+    }
+
+    /// Under the ASCII glyph set a verb page's description, its flag
+    /// descriptions, the group row and the group title follow spec T1: `·`
+    /// → `-`, `…` → `...`, ` — ` → ` - ` (plan C41); a UTF-8 pipe keeps them.
+    #[test]
+    fn verb_and_group_pages_asciify_under_ascii_caps() {
+        struct Dotty;
+        impl Command for Dotty {
+            fn name(&self) -> &str {
+                "zzz.dot"
+            }
+            fn schema(&self) -> ParamSchema {
+                ParamSchema {
+                    description: "Join a · b … c. Then more.".into(),
+                    params: vec![aitm_core::ParamDef {
+                        name: "mode".into(),
+                        ty: TypeDesc::Str,
+                        required: false,
+                        description: "one · two … three".into(),
+                    }],
+                    result: TypeDesc::Bool,
+                }
+            }
+            fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+                anyhow::bail!("zzz.dot is schema-only")
+            }
+        }
+        let mut registry = Registry::new();
+        registry.add_command(Arc::new(Dotty));
+        let verb_page = verb(registry.command("zzz.dot").expect("registered").as_ref());
+        assert_eq!(
+            render(&Caps::plain(), &verb_page),
+            "Join a - b ... c. Then more.\n\
+             \n\
+             Usage:\n\
+             \x20 aitm zzz dot [--mode <mode>]\n\
+             \n\
+             Flags:\n\
+             \x20 --mode <string>           one - two ... three\n\
+             \n\
+             Examples:\n\
+             \x20 $ aitm zzz dot [--mode <mode>]\n"
+        );
+        assert!(render(&piped_utf8(), &verb_page).starts_with("Join a · b … c. Then more.\n"));
+        let group_page = group(&registry, "zzz").expect("zzz is a group");
+        assert_eq!(
+            render(&Caps::plain(), &group_page),
+            "aitm zzz - (no description)\n\
+             \n\
+             Usage:\n\
+             \x20 aitm zzz <verb> [--flag <value>]...\n\
+             \n\
+             Verbs:\n\
+             \x20 dot                       Join a - b ... c.\n"
+        );
+        assert!(render(&piped_utf8(), &group_page).starts_with("aitm zzz — (no description)\n"));
+    }
+
+    /// AC-W2-2 in-process over the widest registry (the catalogue and
+    /// `l4.enabled`: 19 groups, 113 commands): every group page opens with
+    /// its title and usage form and has one row per verb — `verb_row` and the
+    /// first sentence — and an example; every verb page opens with its
+    /// description, has `Usage: aitm <spaced>`, a `Flags:` row per parameter
+    /// with the type word and ` [required]` exactly when required, at least
+    /// one example that names the verb, no escape byte, and nothing but an
+    /// example line wider than 80 columns.
+    #[test]
+    fn every_group_and_verb_page_renders_with_the_expected_shape() {
+        let described = registry_with_l4("sweep", CATALOGUE_ENV);
+        let reg = &described.registry;
+        let groups = describe::groups(reg);
+        assert_eq!(groups.len(), 19);
+        assert_eq!(reg.commands().count(), 113);
+        let mut verbs_seen = 0;
+        for (name, cmds) in &groups {
+            let group_page = group(reg, name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(
+                group_page.usage,
+                vec![format!("aitm {name} <verb> [--flag <value>]...")]
+            );
+            let Some(Block::Section(verbs)) = group_page.blocks.first() else {
+                panic!("{name}: the first block is the Verbs: section")
+            };
+            assert_eq!(verbs.heading, "Verbs:");
+            assert_eq!(verbs.rows.len(), cmds.len(), "{name}");
+            for (row, cmd) in verbs.rows.iter().zip(cmds) {
+                assert_eq!(row.left, verb_row(cmd.as_ref()), "{}", cmd.name());
+                assert_eq!(
+                    row.right,
+                    first_sentence(&cmd.schema().description),
+                    "{}",
+                    cmd.name()
+                );
+            }
+            let out = render(&piped_utf8(), &group_page);
+            assert!(out.starts_with(&format!("aitm {name} — ")), "{out}");
+            assert!(out.contains("\nExamples:\n  $ aitm "), "{name}: {out}");
+            assert!(!out.as_bytes().contains(&0x1b), "{name}");
+            for cmd in cmds {
+                verbs_seen += 1;
+                let schema = cmd.schema();
+                let spaced_name = spaced(cmd.name());
+                let verb_page = verb(cmd.as_ref());
+                assert_eq!(verb_page.title, "", "{}", cmd.name());
+                assert_eq!(verb_page.about, vec![schema.description.clone()]);
+                assert_eq!(verb_page.usage, vec![usage_form(cmd.as_ref())]);
+                let flags = verb_page.blocks.iter().find_map(|block| match block {
+                    Block::Section(section) if section.heading == "Flags:" => Some(section),
+                    _ => None,
+                });
+                match flags {
+                    Some(flags) => {
+                        assert_eq!(flags.rows.len(), schema.params.len(), "{}", cmd.name());
+                        for (row, def) in flags.rows.iter().zip(&schema.params) {
+                            assert_eq!(
+                                row.left,
+                                format!("--{} <{}>", def.name, type_hint(&def.ty)),
+                                "{}",
+                                cmd.name()
+                            );
+                            assert!(row.right.starts_with(&def.description));
+                            assert_eq!(
+                                row.right.ends_with(" [required]"),
+                                def.required,
+                                "{}: --{}",
+                                cmd.name(),
+                                def.name
+                            );
+                        }
+                    }
+                    None => assert!(schema.params.is_empty(), "{}", cmd.name()),
+                }
+                let out = render(&piped_utf8(), &verb_page);
+                assert!(
+                    out.contains(&format!("\nUsage:\n  aitm {spaced_name}")),
+                    "{}: {out}",
+                    cmd.name()
+                );
+                assert!(
+                    out.contains(&format!("\nExamples:\n  $ aitm {spaced_name}")),
+                    "{}: {out}",
+                    cmd.name()
+                );
+                assert!(!out.as_bytes().contains(&0x1b), "{}", cmd.name());
+                for line in out.lines().filter(|l| !l.starts_with("  $ ")) {
+                    assert!(text::width(line) <= 80, "{}: {line:?}", cmd.name());
+                }
+            }
+        }
+        assert_eq!(verbs_seen, 113);
+    }
 }

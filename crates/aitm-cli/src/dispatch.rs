@@ -1164,4 +1164,224 @@ mod tests {
         assert_eq!(r.map(|r| r.exit_code()), Some(2));
         assert_eq!(r.map(|r| r.what.as_str()), Some("unknown command `scpe`"));
     }
+
+    // ---- tester, wave-2 pass 1 (AC-W2-3/4; plan C37/C38) ----
+
+    /// A registry with underscored verbs, a three-segment group and a
+    /// one-verb group; confirmations are declined.
+    fn cli_wide() -> Cli {
+        let mut reg = Registry::new();
+        reg.add_command(fake(
+            "tls.passthrough.add",
+            vec![param("host", TypeDesc::Str, true)],
+            None,
+        ));
+        reg.add_command(fake("tls.passthrough.list", vec![], None));
+        reg.add_command(fake("browser.get_dom", vec![], None));
+        reg.add_command(fake(
+            "l4.tcp_probe",
+            vec![param("args", TypeDesc::Any, false)],
+            None,
+        ));
+        reg.add_command(fake(
+            "l4.udp_probe",
+            vec![param("args", TypeDesc::Any, false)],
+            None,
+        ));
+        reg.add_command(fake(
+            "check.open_redirect",
+            vec![param("max_pages", TypeDesc::Int, false)],
+            None,
+        ));
+        reg.add_command(fake("ca.install", vec![], Some("Install it?")));
+        Cli::new(Arc::new(reg))
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            )
+            .with_confirmer(Arc::new(Answer(false)))
+    }
+
+    /// C37 over three-segment and underscored names: the hint for an unknown
+    /// verb comes from the token after the group (so a two-segment prefix of a
+    /// three-segment group lists every verb under it), written as spaced full
+    /// names; a dash for an underscore is one edit; an underscored flag keeps
+    /// its underscore in the hint.
+    #[test]
+    fn locate_suggests_three_segment_and_underscored_verbs_spaced() {
+        let cli = cli_wide();
+        let both = "did you mean: tls passthrough add, tls passthrough list".to_string();
+        let r = cli
+            .locate(&argv(&["tls", "passthrough", "ad"]))
+            .expect_err("unknown verb");
+        assert_eq!(r.what, "unknown command `tls passthrough ad`");
+        assert_eq!(r.why, vec![both.clone()]);
+        assert_eq!(r.command, fix("aitm tls"));
+        assert_eq!(r.exit_code(), 2);
+        let r = cli
+            .locate(&argv(&["tls", "passthrough"]))
+            .expect_err("not a command");
+        assert_eq!(r.what, "unknown command `tls passthrough`");
+        assert_eq!(r.why, vec![both]);
+        assert_eq!(r.command, fix("aitm tls"));
+        let r = cli
+            .locate(&argv(&["browser", "get-dom"]))
+            .expect_err("dash for underscore");
+        assert_eq!(r.what, "unknown command `browser get-dom`");
+        assert_eq!(r.why, vec!["did you mean: browser get_dom".to_string()]);
+        assert_eq!(r.command, fix("aitm browser"));
+        let r = cli
+            .locate(&argv(&["l4", "tcp-probe"]))
+            .expect_err("dash for underscore");
+        assert_eq!(
+            r.why,
+            vec!["did you mean: l4 tcp_probe".to_string()],
+            "udp_probe is two edits away and not offered"
+        );
+        let r = cli
+            .locate(&argv(&["check", "openredirect", "--args", "{}"]))
+            .expect_err("missing underscore");
+        assert_eq!(r.what, "unknown command `check openredirect`");
+        assert_eq!(r.why, vec!["did you mean: check open_redirect".to_string()]);
+        assert_eq!(r.command, fix("aitm check"));
+        let r = report(cli.dispatch(&argv(&["check", "open_redirect", "--max-pages", "3"])));
+        assert_eq!(r.what, "unknown flag --max-pages for `check open_redirect`");
+        assert_eq!(
+            r.why,
+            vec![
+                "did you mean: --max_pages".to_string(),
+                "Usage: aitm check open_redirect [--max_pages <max_pages>]".to_string(),
+            ]
+        );
+        assert_eq!(r.command, fix("aitm check open_redirect --help"));
+        for text in [&r.what, &r.why[0], &r.why[1]] {
+            assert!(!has_dotted_token(text), "{text:?}");
+        }
+    }
+
+    /// `--yes` is a verb flag: before the command it is a leading flag, inside
+    /// the path it ends the path (a bare group), after the verb it skips the
+    /// prompt. A one-verb group locates and suggests like any other.
+    #[test]
+    fn locate_yes_placement_and_a_one_verb_group() {
+        let cli = cli_wide();
+        let r = cli
+            .locate(&argv(&["--yes", "ca", "install"]))
+            .expect_err("leading flag");
+        assert_eq!(r.what, "expected a command before flags, got `--yes`");
+        assert_eq!(r.why, vec![USAGE_FORM.to_string()]);
+        assert_eq!(r.command, fix(TOP_HELP));
+        let r = report(cli.dispatch(&argv(&["ca", "--yes", "install"])));
+        assert_eq!(r.what, "missing verb after `ca`");
+        assert_eq!(
+            r.why,
+            vec!["Usage: aitm ca <verb> [--flag <value>]...".to_string()]
+        );
+        assert_eq!(r.command, fix("aitm ca"));
+        assert_eq!(
+            cli.dispatch(&argv(&["ca", "install", "--yes"]))
+                .expect("--yes skips the declining confirmer"),
+            Value::Null
+        );
+        let e = cli
+            .dispatch(&argv(&["ca", "install"]))
+            .expect_err("declined");
+        assert_eq!(format!("{e:#}"), "aborted: ca install not run");
+        match cli.locate(&argv(&["ca"])) {
+            Ok(Located::Group { name, commands }) => {
+                assert_eq!(name, "ca");
+                let names: Vec<&str> = commands.iter().map(|c| c.name()).collect();
+                assert_eq!(names, vec!["ca.install"]);
+            }
+            other => panic!("expected the ca group, got {other:?}"),
+        }
+        let r = cli
+            .locate(&argv(&["ca", "instal"]))
+            .expect_err("unknown verb");
+        assert_eq!(r.what, "unknown command `ca instal`");
+        assert_eq!(r.why, vec!["did you mean: ca install".to_string()]);
+        assert_eq!(r.command, fix("aitm ca"));
+    }
+
+    /// Dotted tokens are a compatibility affordance (the module doc): a
+    /// dotted name resolves as one token, and a dotted head with a spaced
+    /// tail joins to the registered name. A dotted typo is echoed as the
+    /// operator typed it — the operator's own token, not a wire name we
+    /// composed (AC-W2-4 is about the names we print) — with no hint, since
+    /// the whole token is matched against the groups.
+    #[test]
+    fn locate_dotted_tokens_resolve_and_a_dotted_typo_is_echoed_without_a_hint() {
+        let cli = cli_wide();
+        let dotted = argv(&["tls.passthrough.add", "--host", "h"]);
+        match cli.locate(&dotted) {
+            Ok(Located::Command { cmd, rest }) => {
+                assert_eq!(cmd.name(), "tls.passthrough.add");
+                assert_eq!(rest, argv(&["--host", "h"]).as_slice());
+            }
+            other => panic!("expected tls.passthrough.add, got {other:?}"),
+        }
+        let mixed = argv(&["tls.passthrough", "list"]);
+        match cli.locate(&mixed) {
+            Ok(Located::Command { cmd, rest }) => {
+                assert_eq!(cmd.name(), "tls.passthrough.list");
+                assert!(rest.is_empty(), "{rest:?}");
+            }
+            other => panic!("expected tls.passthrough.list, got {other:?}"),
+        }
+        let r = cli
+            .locate(&argv(&["browser.getdom"]))
+            .expect_err("a dotted typo");
+        assert_eq!(r.what, "unknown command `browser.getdom`");
+        assert_eq!(r.why, Vec::<String>::new());
+        assert_eq!(r.command, fix(TOP_HELP));
+    }
+
+    /// Flag-value edges: an empty inline value is a value; `--` alone and
+    /// `---x` are not flags of the command (the latter is one edit from
+    /// `--host`); a bare bool followed by a stray word reports the word; a
+    /// 64 KiB value is accepted whole; an empty path token is echoed.
+    #[test]
+    fn dispatch_flag_value_edges() {
+        let cli = cli();
+        assert_eq!(
+            cli.dispatch(&argv(&["scope", "add", "--host="]))
+                .expect("an empty inline value is a value"),
+            Value::Null
+        );
+        let r = report(cli.dispatch(&argv(&["scope", "add", "--"])));
+        assert_eq!(r.what, "unexpected argument `--` for `scope add`");
+        assert_eq!(r.why, vec![SCOPE_ADD_USAGE.to_string()]);
+        let r = report(cli.dispatch(&argv(&["scope", "add", "---host", "h"])));
+        assert_eq!(r.what, "unknown flag ---host for `scope add`");
+        assert_eq!(
+            r.why,
+            vec![
+                "did you mean: --host".to_string(),
+                SCOPE_ADD_USAGE.to_string()
+            ]
+        );
+        let r = report(cli.dispatch(&argv(&["browser", "confine", "--on", "maybe"])));
+        assert_eq!(r.what, "unexpected argument `maybe` for `browser confine`");
+        assert_eq!(
+            r.why,
+            vec!["Usage: aitm browser confine --on <true|false>".to_string()]
+        );
+        assert_eq!(r.command, fix("aitm browser confine --help"));
+        let r = report(cli.dispatch(&argv(&["browser", "confine", "--on=maybe"])));
+        assert_eq!(r.what, "flag --on: expected true or false, got `maybe`");
+        let big = "h".repeat(64 * 1024);
+        assert_eq!(
+            cli.dispatch(&argv(&["scope", "add", "--host", &big]))
+                .expect("a 64 KiB value"),
+            Value::Null
+        );
+        // An empty token is echoed; the only group within two edits of the
+        // empty string is the two-letter `ca`.
+        let r = cli.locate(&argv(&[""])).expect_err("an empty token");
+        assert_eq!(r.what, "unknown command ``");
+        assert_eq!(r.why, vec!["did you mean: ca".to_string()]);
+        assert_eq!(r.command, fix(TOP_HELP));
+    }
 }

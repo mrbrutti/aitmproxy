@@ -359,4 +359,59 @@ mod tests {
             " [y/N] "
         );
     }
+
+    // ---- tester, wave-2 pass 1 (AC-W2-8; plan C47) ----
+
+    /// The protocol is `\n`-separated (plan C47); a `\r` is content. CRLF
+    /// text therefore never panics and no control byte reaches the terminal
+    /// (the sanitiser folds `\r` to a space), the fingerprint detail is still
+    /// its own line and exactly one tail is printed — but a final ask that
+    /// ends in `\r` rather than `?` is read as a note, so the tail lands on
+    /// the question line. No in-tree command composes CRLF.
+    #[test]
+    fn parse_tolerates_crlf_without_a_control_byte_in_the_output() {
+        let prompt = ConfirmPrompt::parse("Q?\r\n  SHA-256 AB:CD\r\nInstall it?\r\n");
+        assert_eq!(prompt.question, "Q?\r");
+        assert_eq!(prompt.details, vec!["SHA-256 AB:CD".to_string()]);
+        assert_eq!(prompt.notes, vec!["Install it?\r".to_string()]);
+        assert_eq!(prompt.ask, "");
+        let out = render_confirm(&piped_utf8(), &prompt);
+        assert!(!out.contains('\r'), "{out:?}");
+        assert!(
+            !out.bytes().any(|b| b < 0x20 && b != b'\n'),
+            "a control byte reached the output: {out:?}"
+        );
+        assert_eq!(out.matches("[y/N] ").count(), 1, "{out:?}");
+        assert!(out.contains("\n  SHA-256 AB:CD\n"), "{out:?}");
+        assert_eq!(out, "Q? [y/N] \n  SHA-256 AB:CD\n  Install it?");
+        // Only the last line can be the ask: an earlier line ending in `?` is
+        // a note.
+        let prompt = ConfirmPrompt::parse("Q?\nReally?\nSure?");
+        assert_eq!(prompt.notes, vec!["Really?".to_string()]);
+        assert_eq!(prompt.ask, "Sure?");
+        assert_eq!(
+            render_confirm(&piped_utf8(), &prompt),
+            "Q?\n  Really?\nSure? [y/N] "
+        );
+    }
+
+    /// Oversized input: a 10 000-character unbreakable question is printed
+    /// whole with the tail; 400 words wrap so that every line but the one
+    /// carrying the tail fits the width. The tail is the one constant.
+    #[test]
+    fn render_confirm_oversized_questions_never_panic() {
+        assert_eq!(YES_NO, "[y/N]");
+        let long = "x".repeat(10_000);
+        let out = render_confirm(&piped_utf8(), &ConfirmPrompt::parse(&long));
+        assert_eq!(out, format!("{long} [y/N] "));
+        let words = "word ".repeat(400);
+        let out = render_confirm(&piped_utf8(), &ConfirmPrompt::parse(words.trim()));
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 25, "{}", lines.len());
+        for line in &lines[..lines.len() - 1] {
+            assert_eq!(text::width(line), 79, "{line:?}");
+        }
+        assert!(lines[lines.len() - 1].ends_with(" [y/N] "));
+        assert_eq!(out.matches("word").count(), 400);
+    }
 }

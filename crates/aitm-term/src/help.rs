@@ -764,4 +764,232 @@ mod tests {
             "Examples:\n  $ aitm\n\na  b\nc  d\n"
         );
     }
+
+    // ---- tester, wave-2 pass 1 (spec T1/T5, AC-W2-1; plan C40/C41) ----
+
+    /// Every content path — title, about, usage, heading, left and right
+    /// cells, example, text and verbatim lines — is sanitised and, under the
+    /// ASCII glyph set, `·`/`…`-substituted, with the title's dash following
+    /// (plan C41); a UTF-8 pipe keeps the glyphs and still drops the escapes;
+    /// the rich form paints only its own SGR around the sanitised text.
+    #[test]
+    fn help_page_sanitizes_and_asciifies_every_content_path() {
+        let page = HelpPage {
+            title: "aitm x — a · b\x1b[31m".to_string(),
+            about: strings(&["about … here\x07"]),
+            usage: strings(&["aitm x --flag <v…>\u{9b}"]),
+            blocks: vec![
+                section("Verbs\x1b:", vec![row("ad·d", "x … y\x1b]0;t\x07")]),
+                Block::Examples(strings(&["aitm x · y\x1b"])),
+                Block::Text(strings(&["t … u\x1b"])),
+                Block::Lines(strings(&["l · m\x1b"])),
+            ],
+        };
+        let ascii = help_page(&Caps::plain(), &page);
+        assert_eq!(
+            ascii,
+            "aitm x - a - b\u{FFFD}[31m\n\
+             \n\
+             about ... here\u{FFFD}\n\
+             \n\
+             Usage:\n\
+             \x20 aitm x --flag <v...>\u{FFFD}\n\
+             \n\
+             Verbs\u{FFFD}:\n\
+             \x20 ad-d                      x ... y\u{FFFD}]0;t\u{FFFD}\n\
+             \n\
+             Examples:\n\
+             \x20 $ aitm x - y\u{FFFD}\n\
+             \n\
+             t ... u\u{FFFD}\n\
+             \n\
+             l - m\u{FFFD}\n"
+        );
+        assert!(!ascii.contains(['·', '…', '—']), "{ascii:?}");
+        let utf8 = help_page(&piped_utf8(), &page);
+        assert!(
+            !utf8.as_bytes().contains(&0x1b) && !utf8.as_bytes().contains(&0x07),
+            "{utf8:?}"
+        );
+        assert!(
+            utf8.starts_with("aitm x — a · b\u{FFFD}[31m\n\n"),
+            "{utf8:?}"
+        );
+        assert!(utf8.contains("\n  $ aitm x · y\u{FFFD}\n"), "{utf8:?}");
+        assert!(utf8.ends_with("\nl · m\u{FFFD}\n"), "{utf8:?}");
+        // Rich: three bold headings and one dim description, nothing else;
+        // the injected `[31m` is text, so stripping the renderer's SGR gives
+        // the piped page back.
+        let rich = help_page(&tty80(), &page);
+        assert_eq!(rich.matches("\x1b[1m").count(), 3, "{rich:?}");
+        assert_eq!(rich.matches("\x1b[2m").count(), 1, "{rich:?}");
+        assert_eq!(rich.matches("\x1b[").count(), 8, "{rich:?}");
+        assert_eq!(text::strip_sgr(&rich), utf8);
+    }
+
+    /// The left-cell boundary (plan C40): 24 columns share the line with two
+    /// spaces of padding, 25 stand alone; a row with no description is its
+    /// left cell unpadded; an empty left is an indented paragraph.
+    #[test]
+    fn row_left_of_twenty_four_columns_shares_its_line_and_twenty_five_breaks() {
+        let left24 = "x".repeat(LEFT_MAX);
+        assert_eq!(text::width(&left24), 24);
+        assert_eq!(
+            row_lines(&left24, "desc", 80),
+            vec![format!("  {left24}  desc")]
+        );
+        let left25 = "x".repeat(LEFT_MAX + 1);
+        assert_eq!(
+            row_lines(&left25, "desc", 80),
+            vec![
+                format!("  {left25}"),
+                format!("{}desc", " ".repeat(DESC_COL))
+            ]
+        );
+        assert_eq!(row_lines("list", "", 80), vec!["  list"]);
+        assert_eq!(row_lines("", "a b", 80), vec!["  a b"]);
+        assert_eq!(DESC_COL, 28);
+        assert_eq!(LEFT_MAX, 24);
+        assert_eq!(USAGE_CONT_INDENT, "    ");
+    }
+
+    /// Copy-safe lines (plan C40, C45): an example or a verbatim line of 128
+    /// columns in an 80-column page is one line; a usage unit wider than the
+    /// room stands alone, unbroken.
+    #[test]
+    fn example_and_verbatim_lines_of_128_columns_are_printed_whole_at_80() {
+        let example = format!("aitm {}", "x".repeat(123));
+        assert_eq!(example.chars().count(), 128);
+        let page = HelpPage {
+            title: String::new(),
+            about: Vec::new(),
+            usage: Vec::new(),
+            blocks: vec![
+                Block::Examples(vec![example.clone()]),
+                Block::Lines(vec![example.clone()]),
+            ],
+        };
+        let out = help_page(&piped_utf8(), &page);
+        assert_eq!(out, format!("Examples:\n  $ {example}\n\n{example}\n"));
+        assert_eq!(out.lines().count(), 4);
+
+        let wide_unit = format!("--flag <{}>", "y".repeat(100));
+        assert_eq!(
+            wrap_usage(&format!("aitm x {wide_unit}"), 80),
+            vec!["  aitm x".to_string(), format!("    {wide_unit}")]
+        );
+        let wide_head = format!("aitm {}", "z".repeat(100));
+        assert_eq!(wrap_usage(&wide_head, 80), vec![format!("  {wide_head}")]);
+        assert_eq!(wrap_usage("", 80), Vec::<String>::new());
+        assert_eq!(wrap_usage("   ", 80), Vec::<String>::new());
+    }
+
+    /// The M-W2-2 page at 200 columns is the 80-column page (nothing wrapped
+    /// there); at 40 the descriptions keep their twenty columns of room, the
+    /// usage line breaks between its units and the footer paragraph wraps.
+    #[test]
+    fn help_page_at_width_forty_and_two_hundred() {
+        let wide = Caps {
+            width: 200,
+            ..piped_utf8()
+        };
+        assert_eq!(help_page(&wide, &scope_page()), M_W2_2);
+        let narrow = Caps {
+            width: 40,
+            ..piped_utf8()
+        };
+        assert_eq!(
+            help_page(&narrow, &scope_page()),
+            "aitm scope — which hosts are decrypted\n\
+             \n\
+             Usage:\n\
+             \x20 aitm scope <verb>\n\
+             \x20   [--flag <value>]...\n\
+             \n\
+             Verbs:\n\
+             \x20 add --host <host>         Add a host,\n\
+             \x20                           host:port, or\n\
+             \x20                           *.wildcard to Scope.\n\
+             \x20 remove --host <host>      Remove a scope entry\n\
+             \x20                           (exact match).\n\
+             \x20 list                      List the current\n\
+             \x20                           scope entries.\n\
+             \n\
+             Examples:\n\
+             \x20 $ aitm scope add --host app.example.test\n\
+             \x20 $ aitm scope add --host '*.example.test'\n\
+             \x20 $ aitm scope list\n\
+             \n\
+             Nothing is decrypted until a host is in\n\
+             Scope.\n"
+        );
+    }
+
+    /// Every physical description line is dim, the continuation lines
+    /// included; the left cell and the padding are never painted (C41).
+    #[test]
+    fn help_page_rich_dims_continuation_lines_too() {
+        let page = HelpPage {
+            title: String::new(),
+            about: Vec::new(),
+            usage: Vec::new(),
+            blocks: vec![section("Groups:", vec![row("flow", FLOW_PURPOSE)])],
+        };
+        assert_eq!(
+            help_page(&tty80(), &page),
+            "\x1b[1mGroups:\x1b[0m\n\
+             \x20 flow                      \x1b[2mcaptured flows: list, inspect, intercept, replay,\x1b[0m\n\
+             \x20                           \x1b[2medit, export and import\x1b[0m\n"
+        );
+    }
+
+    /// Degenerate pages render deterministically and never panic: an empty
+    /// page is the empty string, a title alone is one line, blank paragraphs
+    /// and empty blocks add nothing, a section without rows is its heading,
+    /// and width 0 still lays every row out at the description column.
+    #[test]
+    fn help_page_degenerate_pages_render_deterministically_and_never_panic() {
+        let empty = HelpPage {
+            title: String::new(),
+            about: Vec::new(),
+            usage: Vec::new(),
+            blocks: Vec::new(),
+        };
+        assert_eq!(help_page(&piped_utf8(), &empty), "");
+        assert_eq!(help_page(&tty80(), &empty), "");
+        let title_only = HelpPage {
+            title: "t".to_string(),
+            ..empty.clone()
+        };
+        assert_eq!(help_page(&piped_utf8(), &title_only), "t\n");
+        let blanks = HelpPage {
+            about: strings(&["", "  "]),
+            blocks: vec![
+                Block::Text(Vec::new()),
+                Block::Lines(Vec::new()),
+                Block::Text(strings(&[""])),
+                Block::Examples(Vec::new()),
+                section("Verbs:", Vec::new()),
+            ],
+            ..title_only.clone()
+        };
+        assert_eq!(
+            help_page(&piped_utf8(), &blanks),
+            "t\n\nExamples:\n\nVerbs:\n"
+        );
+        let zero = Caps {
+            width: 0,
+            ..piped_utf8()
+        };
+        let out = help_page(&zero, &scope_page());
+        assert!(out.starts_with("aitm scope — which hosts are decrypted\n\n"));
+        for line in out
+            .lines()
+            .filter(|l| l.starts_with("  add") || l.starts_with("  list"))
+        {
+            assert_ne!(line.chars().nth(DESC_COL), Some(' '), "{line:?}");
+        }
+        assert!(out.lines().count() > M_W2_2.lines().count(), "{out:?}");
+        assert_eq!(text::strip_sgr(&out), out);
+    }
 }
