@@ -252,6 +252,10 @@ impl Command for ManualCheck {
 /// recognises. Idempotent, so a Rhai verdict the bridge already scrubbed comes
 /// through unchanged.
 fn scrubbed(mut verdict: Verdict) -> Verdict {
+    // `detail` can echo a response snippet just like `matched` (the bridge's
+    // plain-string verdict form puts the whole string there); the job path
+    // never emits it, the manual path does, so it is scrubbed here too.
+    verdict.detail = util::scrub(&verdict.detail);
     scrub_evidence(&mut verdict.evidence);
     for sibling in &mut verdict.more {
         scrub_evidence(&mut sibling.evidence);
@@ -498,7 +502,7 @@ mod tests {
                         ),
                         ..Evidence::default()
                     },
-                    detail: "echoed the response".to_string(),
+                    detail: "echo: Authorization: Bearer abc.def.ghi".to_string(),
                     poc_hint: None,
                     location: None,
                     more: Vec::new(),
@@ -715,6 +719,11 @@ mod tests {
             &s("Cookie: [redacted]; Authorization: [redacted]")
         );
         assert_eq!(obj(evidence, "payload"), &s("q=1&access_token=[redacted]"));
+        assert_eq!(
+            obj(&result, "detail"),
+            &Value::Str("echo: Authorization: [redacted]".into()),
+            "detail is scrubbed on the manual path too"
+        );
     }
 
     /// Deny-by-default: a URL outside the HTTP scope is refused before anything
