@@ -461,6 +461,55 @@ public struct ScanJobFacts: Equatable, Sendable {
     }
 }
 
+/// The `scan.status` reads the poll has made under rule 2 of the re-read rule
+/// (Jobs view D2; `ScanSurfaceModel.needsStatusRead`): `scan.list` carries no profile
+/// name or targets, so every listed job is read once while nothing is stored, and
+/// once more after the list calls it terminal while the stored status is still live.
+/// A key is the job and whether its list row was terminal when the read was claimed,
+/// so the second read is distinct from the first.
+///
+/// A claim is never undone by the read's own outcome: a failed read against a core
+/// that is not answering would otherwise retry at 1 Hz and flip the link every
+/// second. Only `settle(afterList:stored:)`, called when a list lands (the proof the
+/// core answers), prunes the jobs the list dropped and re-arms every job that still
+/// owes a read under `needsStatusRead`, so a failed read is retried after that list.
+public struct ScanStatusReadLedger: Equatable, Sendable {
+    /// One claimed read: the job and whether its list row was terminal at the claim.
+    public struct Key: Hashable, Sendable {
+        public var job: String
+        public var summaryIsTerminal: Bool
+
+        public init(job: String, summaryIsTerminal: Bool) {
+            self.job = job
+            self.summaryIsTerminal = summaryIsTerminal
+        }
+    }
+
+    public private(set) var keys: Set<Key> = []
+
+    public init() {}
+
+    public var count: Int { keys.count }
+
+    /// Claims the read for `job` under its row's terminality: true when the key was
+    /// absent (the caller makes the read), false when it was already claimed.
+    public mutating func claim(_ job: String, summaryIsTerminal: Bool) -> Bool {
+        keys.insert(Key(job: job, summaryIsTerminal: summaryIsTerminal)).inserted
+    }
+
+    /// A list landed: keeps a key only while its job is listed and
+    /// `ScanSurfaceModel.needsStatusRead` says the job owes nothing more, so an
+    /// unlisted job is pruned and a job whose read failed (nothing stored) or whose
+    /// row turned terminal over a live stored status is re-armed.
+    public mutating func settle(afterList jobs: [ScanJobSummary], stored: [String: ScanJobStatus]) {
+        let listed = Dictionary(jobs.map { ($0.job, $0) }, uniquingKeysWith: { first, _ in first })
+        keys = keys.filter { key in
+            guard let summary = listed[key.job] else { return false }
+            return !ScanSurfaceModel.needsStatusRead(summary: summary, stored: stored[key.job])
+        }
+    }
+}
+
 /// A failed Jobs read (`scan.list`, `scan.status` or `scan.cancel`): the read's
 /// own wording (`Unable to list jobs: <core>` / `Unable to read job <id>: <core>` /
 /// `Unable to cancel job <id>: <core>`) and when it failed (epoch ms, the caller's
@@ -905,8 +954,10 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// clock, the same one `applyList` stamps with. Records the one failure fact (Jobs view
     /// D6 amendment): `jobsError`, `readFailedAt` and `inlineJobsError(ageMs:)` all read it,
     /// and only the next list that lands clears it. The rows and their counters stay.
+    /// The text carries the core's words, so it is bounded like `ScanJobStatus.error`:
+    /// control and format scalars dropped, then cut to `ScanWire.detailMax` scalars.
     public mutating func noteReadFailure(text: String, now: Int) {
-        readFailure = ScanReadFailure(text: text, at: now)
+        readFailure = ScanReadFailure(text: ScanWire.cleaned(text, max: ScanWire.detailMax), at: now)
     }
 
     /// The text of the inline error above the rows: while a Jobs read has failed and no

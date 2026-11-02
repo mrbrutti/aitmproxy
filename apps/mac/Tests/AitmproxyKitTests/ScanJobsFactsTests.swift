@@ -627,4 +627,84 @@ import Testing
         #expect(ScanFormat.grouped(Int.max) == "9,223,372,036,854,775,807")
         #expect(ScanFormat.grouped(Int.min) == "-9,223,372,036,854,775,808")
     }
+
+    /// Fix 1.5f (security minor): a failed read's text is a core-controlled string the
+    /// inline error prints, so `noteReadFailure` bounds it like `ScanJobStatus.error`:
+    /// control and format scalars dropped, then cut to 400 scalars.
+    @Test func readFailureTextIsCleanedAndBounded() {
+        let hostile = String(repeating: "a", count: 300) + "\u{202E}" + String(repeating: "b", count: 299)
+            + "\n" + String(repeating: "c", count: 399)
+        #expect(hostile.count == 1_000)
+        var model = ScanSurfaceModel()
+        model.noteReadFailure(text: hostile, now: 43_000)
+        #expect(model.jobsError?.unicodeScalars.count == 400)
+        #expect(model.jobsError == String(repeating: "a", count: 300) + String(repeating: "b", count: 100))
+        #expect(model.readFailure == ScanReadFailure(
+            text: String(repeating: "a", count: 300) + String(repeating: "b", count: 100), at: 43_000))
+        #expect(model.inlineJobsError(ageMs: 1_000)?.hasPrefix(String(repeating: "a", count: 300)) == true)
+        // A short, clean text is stored as given.
+        model.noteReadFailure(text: "Unable to list jobs: nope", now: 44_000)
+        #expect(model.jobsError == "Unable to list jobs: nope")
+    }
+
+    /// Fix 1.5f (quality important): the status-read ledger behind D2's rule 2. A key
+    /// (job, list-row-terminal) is claimed once; the read's own outcome never changes
+    /// it. Only the next list that lands settles the ledger: a job that still owes a
+    /// read (the read failed, so nothing is stored; or the row turned terminal over a
+    /// live stored status) is re-armed, a job whose read landed keeps its key, and a
+    /// job the list dropped is pruned.
+    @Test func statusReadLedgerReArmsOnlyWhenAListLands() throws {
+        let runningA = try Self.summary("scan-a", state: .running, elapsedMs: 1_000)
+        let doneA = try Self.summary("scan-a", state: .done, elapsedMs: 5_000)
+        let doneB = try Self.summary("scan-b", state: .done, elapsedMs: 2_000)
+        let storedRunningA = try Self.status("scan-a", state: .running, elapsedMs: 1_000)
+        let storedDoneA = try Self.status("scan-a", state: .done, elapsedMs: 5_000)
+        let storedDoneB = try Self.status("scan-b", state: .done, elapsedMs: 2_000)
+
+        var ledger = ScanStatusReadLedger()
+        #expect(ledger.count == 0)
+        #expect(ledger.claim("scan-a", summaryIsTerminal: false) == true)
+        #expect(ledger.claim("scan-a", summaryIsTerminal: false) == false)
+        #expect(ledger.claim("scan-b", summaryIsTerminal: true) == true)
+        #expect(ledger.claim("scan-c", summaryIsTerminal: false) == true)
+        #expect(ledger.count == 3)
+        #expect(ledger.keys == [
+            ScanStatusReadLedger.Key(job: "scan-a", summaryIsTerminal: false),
+            ScanStatusReadLedger.Key(job: "scan-b", summaryIsTerminal: true),
+            ScanStatusReadLedger.Key(job: "scan-c", summaryIsTerminal: false),
+        ])
+
+        // A list lands. scan-a's read failed (nothing stored): re-armed. scan-b's terminal
+        // read landed: kept. scan-c is no longer listed: pruned.
+        ledger.settle(afterList: [runningA, doneB], stored: ["scan-b": storedDoneB])
+        #expect(ledger.count == 1)
+        #expect(ledger.keys == [ScanStatusReadLedger.Key(job: "scan-b", summaryIsTerminal: true)])
+        #expect(ledger.claim("scan-a", summaryIsTerminal: false) == true)
+        #expect(ledger.claim("scan-b", summaryIsTerminal: true) == false)
+        #expect(ledger.claim("scan-c", summaryIsTerminal: false) == true)
+
+        // scan-a's read lands (live): its key is kept through the next list.
+        ledger.settle(afterList: [runningA, doneB], stored: ["scan-a": storedRunningA, "scan-b": storedDoneB])
+        #expect(ledger.count == 2)
+        #expect(ledger.claim("scan-a", summaryIsTerminal: false) == false)
+
+        // The list calls scan-a done over its live stored status: it owes the second
+        // read, so the live key goes and the terminal key is claimable.
+        ledger.settle(afterList: [doneA, doneB], stored: ["scan-a": storedRunningA, "scan-b": storedDoneB])
+        #expect(ledger.keys == [ScanStatusReadLedger.Key(job: "scan-b", summaryIsTerminal: true)])
+        #expect(ledger.claim("scan-a", summaryIsTerminal: true) == true)
+        #expect(ledger.claim("scan-a", summaryIsTerminal: true) == false)
+
+        // The terminal read lands: both keys survive the next list; a terminal stored
+        // status is final.
+        ledger.settle(afterList: [doneA, doneB], stored: ["scan-a": storedDoneA, "scan-b": storedDoneB])
+        #expect(ledger.count == 2)
+        #expect(ledger.claim("scan-a", summaryIsTerminal: true) == false)
+        #expect(ledger.claim("scan-b", summaryIsTerminal: true) == false)
+
+        // An empty list prunes everything.
+        ledger.settle(afterList: [], stored: [:])
+        #expect(ledger.count == 0)
+        #expect(ledger == ScanStatusReadLedger())
+    }
 }

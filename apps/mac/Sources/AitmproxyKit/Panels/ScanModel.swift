@@ -644,14 +644,17 @@ struct ScanWire {
 
     /// The engine's cap on `error_samples`, `skipped_samples`, `checks.running` and `targets`.
     static let listMax = 8
-    /// The cap on an unknown vocabulary token and a profile name.
+    /// The cap on an unknown vocabulary token, a profile name and a job id.
     static let tokenMax = 64
     /// The cap on an error text, a sample field, a clamped field, a skipped reason, a running id.
     static let detailMax = 400
     /// The cap on one target.
     static let targetMax = 200
 
-    /// `text` without control, format and line/paragraph separator scalars, cut to `max` characters.
+    /// `text` without control, format and line/paragraph separator scalars, cut to `max`
+    /// Unicode scalars. Scalars, not Characters: a run of combining marks on one base
+    /// letter is a single grapheme, and a cap counted in graphemes would let a thousand
+    /// of them through.
     static func cleaned(_ text: String, max: Int) -> String {
         var kept = String.UnicodeScalarView()
         for scalar in text.unicodeScalars {
@@ -660,7 +663,7 @@ struct ScanWire {
             default: kept.append(scalar)
             }
         }
-        return String(String(kept).prefix(max))
+        return String(String.UnicodeScalarView(kept.prefix(max)))
     }
 
     /// `optionalString`, cleaned and cut to `max`.
@@ -668,9 +671,22 @@ struct ScanWire {
         try optionalString(key).map { Self.cleaned($0, max: max) }
     }
 
-    /// `strings`, cut to `listMax` items, each cleaned and cut to `max`.
+    /// `string` (required), cleaned and cut to `max`.
+    func boundedString(_ key: String, max: Int) throws -> String {
+        try Self.cleaned(string(key), max: max)
+    }
+
+    /// `array`, cut to the engine's `listMax` items.
+    func boundedArray(_ key: String) throws -> ArraySlice<JSONValue> {
+        try array(key).prefix(Self.listMax)
+    }
+
+    /// `boundedArray`, each item a string cleaned and cut to `max`.
     func boundedStrings(_ key: String, max: Int) throws -> [String] {
-        try strings(key).prefix(Self.listMax).map { Self.cleaned($0, max: max) }
+        try boundedArray(key).map { item in
+            guard let text = item.stringValue else { throw wrong(key, "an array of strings") }
+            return Self.cleaned(text, max: max)
+        }
     }
 
     /// The largest whole number a wire field may carry: 2^53, the last integer a
@@ -936,9 +952,9 @@ extension ScanCheckCounters {
         done = try wire.int("done", default: 0)
         running = try wire.boundedStrings("running", max: ScanWire.detailMax)
         errors = try wire.int("errors", default: 0)
-        errorSamples = try wire.array("error_samples").prefix(ScanWire.listMax).map { try ScanCheckErrorSample(json: $0) }
+        errorSamples = try wire.boundedArray("error_samples").map { try ScanCheckErrorSample(json: $0) }
         skipped = try wire.int("skipped", default: 0)
-        skippedSamples = try wire.array("skipped_samples").prefix(ScanWire.listMax).map { try ScanCheckErrorSample(json: $0) }
+        skippedSamples = try wire.boundedArray("skipped_samples").map { try ScanCheckErrorSample(json: $0) }
     }
 }
 
@@ -1059,7 +1075,7 @@ extension ScanSkippedLane {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanSkippedLane")
         lane = try wire.vocab("lane")
-        reason = try ScanWire.cleaned(wire.string("reason"), max: ScanWire.detailMax)
+        reason = try wire.boundedString("reason", max: ScanWire.detailMax)
     }
 }
 
@@ -1098,7 +1114,7 @@ extension ScanClamped {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanClamped")
         try self.init(
-            field: ScanWire.cleaned(wire.string("field"), max: ScanWire.detailMax),
+            field: wire.boundedString("field", max: ScanWire.detailMax),
             requested: wire.int("requested"), applied: wire.int("applied"))
     }
 }
@@ -1138,7 +1154,7 @@ extension ScanJobSummary {
     }
 
     init(wire: ScanWire) throws {
-        job = try wire.string("job")
+        job = try wire.boundedString("job", max: ScanWire.tokenMax)
         state = try wire.vocab("state")
         phase = try wire.vocab("phase")
         elapsedMs = try wire.int("elapsed_ms", default: 0)
@@ -1183,7 +1199,7 @@ public struct ScanJobStatus: Hashable, Sendable {
 extension ScanJobStatus {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanJobStatus")
-        job = try wire.string("job")
+        job = try wire.boundedString("job", max: ScanWire.tokenMax)
         state = try wire.vocab("state")
         phase = try wire.vocab("phase")
         profileName = try wire.boundedString("profile_name", max: ScanWire.tokenMax) ?? ""

@@ -643,7 +643,7 @@ extension ScanModelTests {
                                         to: .array((0..<1000).map { JSONValue.string("check-\($0)") }))
         let running = try ScanJobStatus(json: manyLanes).checks.running
         #expect(running.count == 8)
-        #expect(running == (0..<8).map { "check-\($0)" })
+        #expect(running == ["check-0", "check-1", "check-2", "check-3", "check-4", "check-5", "check-6", "check-7"])
     }
 
     @Test func taggedObjectsRefuseAMalformedShape() throws {
@@ -1161,5 +1161,36 @@ extension ScanModelTests {
         #expect(try ScanJobStatus(json: ScanPack.load("scan.status.json")).profileName == "standard")
         #expect(ScanWire.cleaned("", max: 64) == "")
         #expect(ScanWire.cleaned("tab\there", max: 64) == "tabhere")
+    }
+
+    /// Fix 1.5f (security minors): `cleaned` cuts on Unicode scalars, not Characters, so
+    /// a thousand combining marks on one base letter cannot ride through a 400 cap as one
+    /// grapheme; and a job id is bounded at decode like every other core string the
+    /// views print (`ScanWire.tokenMax`), while a missing id is still refused.
+    @Test func cleanedCutsOnScalarsAndJobIdsAreBounded() throws {
+        let marks = "a" + String(repeating: "\u{0301}", count: 1_000)
+        #expect(marks.count == 1)
+        #expect(marks.unicodeScalars.count == 1_001)
+        let cut = ScanWire.cleaned(marks, max: 400)
+        #expect(cut.unicodeScalars.count == 400)
+        #expect(cut.unicodeScalars.first == "a")
+        #expect(cut.unicodeScalars.dropFirst().allSatisfy { $0 == "\u{0301}" })
+        // A plain string still cuts to `max` characters.
+        #expect(ScanWire.cleaned(String(repeating: "x", count: 500), max: 400).count == 400)
+
+        // A 300-character job id decodes to 64 scalars on a list row and on a status.
+        let longJob = String(repeating: "j", count: 300)
+        var row = try #require(ScanPack.load("scan.list.json")["jobs"]?.arrayValue?.first)
+        row = ScanPack.edited(row, path: ["job"], to: .string(longJob))
+        #expect(try ScanJobSummary(json: row).job == String(repeating: "j", count: 64))
+        let status = ScanPack.edited(try ScanPack.load("scan.status.json"), path: ["job"], to: .string("\n" + longJob))
+        let decoded = try ScanJobStatus(json: status)
+        #expect(decoded.job.unicodeScalars.count == 64)
+        #expect(decoded.job == String(repeating: "j", count: 64))
+        // A short id is untouched; a missing one is still malformed.
+        #expect(try ScanJobStatus(json: ScanPack.load("scan.status.json")).job == "scan-1a2b3c4d")
+        var members = try #require(try ScanPack.load("scan.status.json").objectValue)
+        members.removeValue(forKey: "job")
+        #expect(throws: BusError.self) { try ScanJobStatus(json: .object(members)) }
     }
 }

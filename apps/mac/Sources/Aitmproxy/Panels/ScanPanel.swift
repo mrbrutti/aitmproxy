@@ -273,8 +273,9 @@ final class ScanPanelState {
         do {
             let value = try await session.runCommand("scan.list", [:])
             surface.applyList(try ScanListResult(json: value), now: Self.clockMs)
-            let listed = Set(surface.jobs.map(\.job))
-            statusRequested = statusRequested.filter { listed.contains($0.job) }
+            // The list landing is the one point that re-arms a status read: the jobs it
+            // dropped are pruned and any job that still owes a read is claimable again.
+            statusReads.settle(afterList: surface.jobs, stored: surface.statuses)
         } catch {
             surface.noteReadFailure(text: scanUnableText("list jobs", BusService.describe(error)), now: Self.clockMs)
         }
@@ -335,21 +336,16 @@ final class ScanPanelState {
 
     // MARK: Polling (D8)
 
-    /// One `scan.status` read the poll owes a listed job: `scan.list` carries no
-    /// profile name or targets, so every job is read once while nothing is stored,
-    /// and once more after the list calls it terminal while the stored status is
-    /// still live (Jobs view D2). The pair makes the second read distinct from the first.
-    private struct StatusReadKey: Hashable {
-        let job: String
-        let summaryIsTerminal: Bool
-    }
-
-    /// The reads already made (or in flight) under the rule above; pruned and re-armed
-    /// only when a list lands (`refreshList`), never by the read's own outcome.
-    @ObservationIgnored private var statusRequested: Set<StatusReadKey> = []
+    /// The `scan.status` reads the poll has claimed under rule 2 of the re-read rule
+    /// (Jobs view D2): the Kit's ledger of (job, list-row-terminal) keys. A claim is
+    /// never undone by the read's own outcome; `refreshList` settles the ledger when a
+    /// list lands, pruning the jobs the list dropped and re-arming every job that still
+    /// owes a read, so a failed status read is retried after the next list.
+    @ObservationIgnored private var statusReads = ScanStatusReadLedger()
     /// The jobs whose `scan.cancel` is on the wire, so a second press within one round
-    /// trip sends nothing and the header reads the cancelling word meanwhile.
-    @ObservationIgnored private var cancelsInFlight: Set<String> = []
+    /// trip sends nothing and the header reads the cancelling word meanwhile. Observed,
+    /// so the header flips to the cancelling word on the press, not on the reply.
+    private var cancelsInFlight: Set<String> = []
     /// The filters the loaded issues page was read under; a change re-reads it.
     @ObservationIgnored private var loadedIssueFilters: ScanIssueFilters?
     /// The job the loaded site-map page was read for, wrapped so "all jobs" (nil)
@@ -396,9 +392,12 @@ final class ScanPanelState {
     }
 
     /// Replaces the previous clock (a generation bump starts the new poll before the
-    /// old one has returned) and loops: sleep 1 s, set `nowMs`. Cancellation ends it.
+    /// old one has returned), takes a fresh reading so the first second on screen is not
+    /// the stale value from the last visit, and loops: sleep 1 s, set `nowMs`.
+    /// Cancellation ends it.
     private func startClock() -> Task<Void, Never> {
         clockTask?.cancel()
+        nowMs = Self.clockMs
         let clock = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
@@ -454,12 +453,14 @@ final class ScanPanelState {
     /// not while the list row is (the list turns terminal first; the stored status
     /// must follow it there or the detail freezes at its last live read, C1). A
     /// terminal stored status is final. Rule 2: every other listed job is read when
-    /// `needsStatusRead` says so and no read under the same key has been made. A key
-    /// is never re-armed by the read's own outcome: a failed read against a core that
-    /// is not answering would otherwise retry at 1 Hz and flip the link every second.
-    /// It is pruned and re-armed only when the next list lands (`refreshList`), the
-    /// proof the core answers, so a failed status read is retried after that list.
-    /// A job the push flags already read this tick is left alone.
+    /// `needsStatusRead` says so and `statusReads` has no claim under the same key
+    /// (the job and whether its row was terminal). A claim is never undone by the
+    /// read's own outcome: a failed read against a core that is not answering would
+    /// otherwise retry at 1 Hz and flip the link every second. The ledger is settled
+    /// only when the next list lands (`refreshList`), the proof the core answers, which
+    /// prunes the jobs the list dropped and re-arms every job that still owes a read,
+    /// so a failed status read is retried after that list. A job the push flags already
+    /// read this tick is left alone.
     private func pollStatuses(flagged: Set<String>) async {
         var readThisBeat = flagged
         if let job = surface.selectedJob, !flagged.contains(job),
@@ -472,9 +473,7 @@ final class ScanPanelState {
             let job = summary.job
             guard !readThisBeat.contains(job),
                   ScanSurfaceModel.needsStatusRead(summary: summary, stored: surface.statuses[job]) else { continue }
-            let key = StatusReadKey(job: job, summaryIsTerminal: summary.state.isTerminal)
-            guard !statusRequested.contains(key) else { continue }
-            statusRequested.insert(key)
+            guard statusReads.claim(job, summaryIsTerminal: summary.state.isTerminal) else { continue }
             await refreshStatus(job)
         }
     }

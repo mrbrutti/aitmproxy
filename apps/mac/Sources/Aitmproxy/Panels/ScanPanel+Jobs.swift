@@ -259,7 +259,7 @@ private struct ScanJobDetail: View {
     /// The Stopped section shows only once the merged state is terminal, and then for
     /// a stopped reason, an error, or a crawl that hit errors (Jobs view D4); a live
     /// job's crawl error is not a stop.
-    private static func hasStoppedFacts(_ summary: ScanJobSummary, _ status: ScanJobStatus) -> Bool {
+    private func hasStoppedFacts(_ status: ScanJobStatus) -> Bool {
         guard summary.state.isTerminal else { return false }
         return status.stoppedReason != nil || status.error != nil || status.crawl.errors > 0
     }
@@ -279,7 +279,7 @@ private struct ScanJobDetail: View {
                     if !clampedLines.isEmpty { clampedSection }
                     if let session = status?.session { sessionSection(session) }
                     if let l4 = status?.l4 { l4Section(l4) }
-                    if let status, Self.hasStoppedFacts(summary, status) { stoppedSection(status) }
+                    if let status, hasStoppedFacts(status) { stoppedSection(status) }
                 }
                 .padding(Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
