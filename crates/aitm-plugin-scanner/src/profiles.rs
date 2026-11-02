@@ -448,6 +448,10 @@ pub fn validate(p: &ScanProfile) -> Result<(), String> {
 /// check may never be allowed to outlast the whole job, and an unbounded `u64`
 /// reaches `Instant + Duration` arithmetic in the scripting engine, where a
 /// large enough value overflows.
+///
+/// `l4.icmp_pace_ms` runs the other way (amendment 46): `ceilings.l4_icmp_pace_ms_min`
+/// is a floor, so a profile value below it is raised to the floor and reported
+/// in the same list.
 pub fn clamp(
     p: &mut ScanProfile,
     ceilings: &Ceilings,
@@ -485,6 +489,12 @@ pub fn clamp(
         "l4.max_bytes_per_s",
         &mut clamped,
     );
+    raise_field(
+        &mut p.l4.icmp_pace_ms,
+        ceilings.l4_icmp_pace_ms_min,
+        "l4.icmp_pace_ms",
+        &mut clamped,
+    );
     clamp_field(
         &mut p.ws.max_frame_bytes,
         ceilings.ws_frame_bytes,
@@ -508,6 +518,26 @@ fn clamp_field<T: Copy + Ord + Into<u64>>(
             applied: ceiling.into(),
         });
         *value = ceiling;
+    }
+}
+
+/// Raise one field to its floor and record it if it moved (amendment 46).
+///
+/// The mirror image of [`clamp_field`], kept as its own helper rather than a
+/// direction flag so each call site reads as what it does.
+fn raise_field<T: Copy + Ord + Into<u64>>(
+    value: &mut T,
+    floor: T,
+    field: &str,
+    clamped: &mut Vec<Clamped>,
+) {
+    if *value < floor {
+        clamped.push(Clamped {
+            field: field.to_string(),
+            requested: (*value).into(),
+            applied: floor.into(),
+        });
+        *value = floor;
     }
 }
 
@@ -764,6 +794,7 @@ mod tests {
             l4: L4Options {
                 cases: 9_999,
                 max_bytes_per_s: 4_000_000,
+                icmp_pace_ms: 1,
                 ..L4Options::default()
             },
             ..ScanProfile::default()
@@ -802,6 +833,11 @@ mod tests {
                     applied: 1_048_576,
                 },
                 Clamped {
+                    field: "l4.icmp_pace_ms".to_string(),
+                    requested: 1,
+                    applied: 1_000,
+                },
+                Clamped {
                     field: "ws.max_frame_bytes".to_string(),
                     requested: 8_388_608,
                     applied: 4_194_304,
@@ -813,6 +849,7 @@ mod tests {
         assert_eq!(all.budget.check_timeout_s, 60);
         assert_eq!(all.l4.cases, 5_000);
         assert_eq!(all.l4.max_bytes_per_s, 1_048_576);
+        assert_eq!(all.l4.icmp_pace_ms, 1_000);
         assert_eq!(all.ws.max_frame_bytes, 4_194_304);
 
         // A profile under every ceiling is left exactly as written.
@@ -820,6 +857,52 @@ mod tests {
         let before = modest.clone();
         assert_eq!(clamp(&mut modest, &ceilings, 60), Vec::new());
         assert_eq!(modest, before);
+    }
+
+    /// Amendment 46 (spec D11): `ceilings.l4_icmp_pace_ms_min` is a floor, not a
+    /// cap. A profile `l4.icmp_pace_ms` below it is raised to the floor and
+    /// reported in `clamped` like every other clamp; a value at or above the
+    /// floor is left exactly as written and reports nothing.
+    #[test]
+    fn icmp_pace_below_the_floor_is_raised_and_reported() {
+        let ceilings = Ceilings::default();
+
+        let mut fast = ScanProfile {
+            l4: L4Options {
+                icmp_pace_ms: 200,
+                ..L4Options::default()
+            },
+            ..named_profile("fast-icmp")
+        };
+        assert_eq!(
+            clamp(&mut fast, &ceilings, 60),
+            vec![Clamped {
+                field: "l4.icmp_pace_ms".to_string(),
+                requested: 200,
+                applied: 1_000,
+            }]
+        );
+        assert_eq!(fast.l4.icmp_pace_ms, 1_000);
+
+        let mut slow = ScanProfile {
+            l4: L4Options {
+                icmp_pace_ms: 1_500,
+                ..L4Options::default()
+            },
+            ..named_profile("slow-icmp")
+        };
+        assert_eq!(clamp(&mut slow, &ceilings, 60), Vec::new());
+        assert_eq!(slow.l4.icmp_pace_ms, 1_500);
+
+        let mut at_floor = ScanProfile {
+            l4: L4Options {
+                icmp_pace_ms: 1_000,
+                ..L4Options::default()
+            },
+            ..named_profile("at-floor-icmp")
+        };
+        assert_eq!(clamp(&mut at_floor, &ceilings, 60), Vec::new());
+        assert_eq!(at_floor.l4.icmp_pace_ms, 1_000);
     }
 
     /// Spec D3: `overrides` is a partial profile merged over the resolved one —

@@ -277,10 +277,14 @@ naming the key.
 | `ceilings.time_s` | `7200` | Wall-clock ceiling for one job, in seconds. |
 | `ceilings.l4_cases` | `5000` | Maximum L4 fuzz cases one job may send. |
 | `ceilings.l4_bytes_per_s` | `1048576` | Maximum L4 send rate, in bytes per second. |
+| `ceilings.l4_icmp_pace_ms_min` | `1000` | Floor for a profile's `l4.icmp_pace_ms`: a lower value is raised to it and reported in `clamped` (amendment 46). |
 | `ceilings.ws_frame_bytes` | `4194304` | Maximum WebSocket frame payload one job may send, in bytes. |
 | `ceilings.max_issues` | `4096` | Maximum issues one job may record. |
 
-Every ceiling key is independent: raising one leaves the other five alone.
+Every ceiling key is independent: raising one leaves the other six alone.
+`l4_icmp_pace_ms_min` is the one floor among them: a profile `l4.icmp_pace_ms`
+below it is clamped **up** to the floor, and the raise appears in `scan.start`'s
+`clamped` list like any other clamp.
 
 **Legacy `scan.discover` budgets.** `ScannerConfig` carries five more fields,
 left over from the Stage 1 crawl that the legacy `scan.discover` /
