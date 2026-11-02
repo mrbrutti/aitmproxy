@@ -17,6 +17,8 @@
 //! unreadable pid, or unprintable name yields `None`, never a guess. A missing
 //! Client is a display gap; a wrong one is misattribution.
 
+mod cache;
+mod coalesce;
 pub mod linux;
 pub mod macos;
 pub(crate) mod matching;

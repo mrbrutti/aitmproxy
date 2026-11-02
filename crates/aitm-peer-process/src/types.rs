@@ -55,9 +55,6 @@ impl Default for Limits {
 /// One operating system's way of finding socket owners and naming them. The
 /// coalescer calls `find_owners` once per batch and `identity` once per
 /// `ProcessKey` cache miss.
-// The trait is consumed by the coalescer (plan Task 2) and implemented by the
-// per-OS scanners (Tasks 3-5); until those land nothing in this crate names it.
-#[allow(dead_code)]
 pub(crate) trait SocketScanner: Send + Sync {
     /// Which process owns the client end of each wanted tuple. Tuples not found by
     /// `deadline` are absent from the map. Never errors: an unreadable pid is a skip.
