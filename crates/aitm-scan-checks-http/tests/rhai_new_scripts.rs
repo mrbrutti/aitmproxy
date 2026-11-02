@@ -10,6 +10,7 @@
 
 mod rhai_harness;
 
+use aitm_core::redact::scrub_text_wide;
 use aitm_scan_model::check::VerdictLocation;
 use aitm_scan_model::vocab::{Confidence, InsertionKind, Outcome, PointTrait};
 
@@ -332,19 +333,24 @@ async fn nosqli_json_places_an_operator_document_at_each_string_field_of_the_bod
         )
     );
     // The evidence payload is the operator document the probe sent, through
-    // the bridge's mandatory `Verdict::scrubbed()`: `scrub_text_wide` masks
-    // the value of a `password` pair, and the value run of `"password":{…}`
-    // is the `{`, so the stored document reads `"password":[redacted]"$ne"…`.
-    // See the plan gap reported with this task: the plan asked for an
-    // `evidence.payload` that parses as JSON, which no document carrying a
-    // secret-named field can do once it is scrubbed. The document **on the
-    // wire** is asserted below, where nothing has scrubbed it.
-    assert_eq!(
-        verdict.evidence.payload.as_deref().map(compact),
-        Some(compact(
-            r#"{"password":[redacted]"$ne":null},"username":"alice"}"#
-        ))
+    // the bridge's mandatory `Verdict::scrubbed()` (amendment 85): the
+    // scrubber masks the value of the `password` pair, so the stored document
+    // is present, carries the mask, and never carries the raw operator at the
+    // secret field. The exact scrubbed spelling is the scrubber's business (a
+    // JSON-aware mask is a scheduled follow-up), so it is not pinned here; the
+    // document **on the wire** is asserted below, where nothing scrubbed it.
+    let stored = verdict
+        .evidence
+        .payload
+        .as_deref()
+        .map(compact)
+        .expect("the vulnerable verdict stores the operator document");
+    assert!(stored.contains("[redacted]"), "stored: {stored}");
+    assert!(
+        !stored.contains(r#""password":{"$ne""#),
+        "the raw operator at the secret field must not survive the scrub: {stored}"
     );
+    assert!(stored.contains(r#""username":"alice""#), "stored: {stored}");
 
     assert_eq!(
         widened
@@ -897,6 +903,18 @@ async fn nosqli_json_is_inconclusive_when_the_body_has_no_string_field() {
 /// example is not the document the store saw: the check answers `inconclusive`
 /// with a detail of its own, because the cause is the scrub and not a cut. A
 /// mask *inside* a quoted string is still a whole document and is still probed.
+///
+/// Every masked example here is built by running the **real** scrubber
+/// ([`aitm_core::redact::scrub_text_wide`], the one
+/// `aitm-scan-http::redact::example` applies) over a plain body, so the shapes
+/// under test are the shapes the lane really produces and nothing is
+/// hand-written. That is also what pins the mask token across the two crates:
+/// reword `aitm_core::redact::MASK` and this test goes red, rather than every
+/// masked body silently becoming an uncatchable `parse_json` error verdict.
+/// The third body is the nested secret-named object, whose scrub takes the
+/// `{` with the value — `{"user":"a","auth":[redacted]"token":"[redacted]"}}` —
+/// so its braces do **not** balance: completeness alone would call it a cut
+/// example, and only the bare-mask reading says what really happened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nosqli_json_is_inconclusive_when_the_scrub_masked_an_unquoted_value() {
     let check = Loaded::load("check-nosqli-json.rhai")
@@ -904,16 +922,21 @@ async fn nosqli_json_is_inconclusive_when_the_scrub_masked_an_unquoted_value() {
         .single()
         .expect("exactly one check");
 
-    for example in [
-        r#"{"user":"a","api_key":[redacted]}"#,
-        r#"{"user":"a","token":[redacted],"page":2}"#,
-        r#"{"user":"a","session":{"token":[redacted]}}"#,
+    for plain in [
+        r#"{"user":"a","api_key":12345}"#,
+        r#"{"user":"a","token":true,"page":2}"#,
+        r#"{"user":"a","auth":{"token":"t"}}"#,
     ] {
+        let example = scrub_text_wide(plain);
+        assert!(
+            example.contains("[redacted]"),
+            "the scrubber masks this body: {plain} -> {example}"
+        );
         let body_point = point(
             InsertionKind::EntireBody,
             "body",
             "http://127.0.0.1:8080/api/login",
-            Some(example),
+            Some(example.as_str()),
             &[PointTrait::Json, PointTrait::Structured],
         );
 
@@ -943,7 +966,14 @@ async fn nosqli_json_is_inconclusive_when_the_scrub_masked_an_unquoted_value() {
     }
 
     // The masked value the lane leaves *quoted* — the ordinary case — is a
-    // whole document still, and every string field of it is probed.
+    // whole document still, and every string field of it is probed. The
+    // scrubber really does produce exactly this body, which is what makes
+    // `LOGIN_BODY` a capture and not a guess.
+    assert_eq!(
+        scrub_text_wide(r#"{"username":"alice","password":"hunter2"}"#),
+        LOGIN_BODY,
+        "the quoted-mask body every other test uses is the scrubber's own output"
+    );
     let quoted = point(
         InsertionKind::EntireBody,
         "body",
