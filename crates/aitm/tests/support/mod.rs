@@ -7,7 +7,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -67,67 +66,13 @@ fn startup_services() -> ScriptServices {
     }
 }
 
-/// The command groups (first name segments) and every command name the
-/// binary registers for `features` with a default config: an EMPTY Rhai tier
-/// (`RhaiConfig::default()` declares no script and the bundled catalogue is
-/// never applied, so no `check.*`/`l4.*` script commands) plus the
-/// `FindingsPlugin`, through `assemble_with_scripts` exactly as `main` wires
-/// it (bare `assemble` would miss `script.*` and `findings.*`). The CA is
-/// minted in a throwaway [`temp_ca_dir`] that is removed before returning.
-/// Builds its own current-thread runtime for the tier's `Handle`, so call it
-/// from a plain `#[test]`, not from inside another runtime. Shared by
-/// `tests/synopsis_groups.rs` and `tests/synopsis_groups_l4.rs` (quality Q19).
-pub fn built_in_groups(features: &Features) -> (BTreeSet<String>, Vec<String>) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime for the script tier");
-    let dir = temp_ca_dir("built-in-groups");
-    let mut cfg = Config::default();
-    cfg.ca.dir = dir.clone();
-
-    let result = rt.block_on(async {
-        let tier = build_with_languages(RhaiConfig::default(), startup_services(), &[])
-            .expect("the empty rhai tier builds");
-        assert!(
-            tier.errors.is_empty(),
-            "empty tier errors: {:?}",
-            tier.errors
-        );
-        let assembled = assemble_with_scripts(
-            &cfg,
-            features,
-            ScriptWiring {
-                plugins: vec![
-                    Box::new(tier.host.with_max_body(cfg.limits.max_body_bytes)) as Box<dyn Plugin>
-                ],
-                executor: Some(tier.executor.clone()),
-                poc_step_handlers: PocStepRegistry::new(),
-                commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
-            },
-        )
-        .expect("the proxy assembles in a temp CA dir");
-
-        let registry = assembled.proxy.registry_arc();
-        let names: Vec<String> = registry.commands().map(|c| c.name().to_string()).collect();
-        let groups: BTreeSet<String> = names
-            .iter()
-            .filter_map(|name| name.split('.').next().map(str::to_string))
-            .collect();
-        drop(assembled);
-        (groups, names)
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-    result
-}
-
 /// Every command the binary registers for `features` with a default config and
 /// the given Rhai config, through `assemble_with_scripts` exactly as `main`
 /// wires it (the tier's host plugin, its executor, an empty PoC step registry,
 /// its commands, then the `FindingsPlugin`), as `(name, describe::fingerprint)`
 /// pairs in registration order. The live side of the `describe_registry` pins
-/// (plan C28): [`built_in_groups`] generalised over the Rhai config, so the
-/// bundled catalogue can be appended by the caller. The CA is minted in a
+/// (plan C28), generic over the Rhai config so the bundled catalogue can be
+/// appended by the caller. The CA is minted in a
 /// throwaway [`temp_ca_dir`] that is removed before returning; the function
 /// builds its own current-thread runtime for the tier's `Handle`, so call it
 /// from a plain `#[test]`, never from inside another runtime.

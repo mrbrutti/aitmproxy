@@ -1,10 +1,14 @@
-//! Global terminal flags, pre-boot dispatch and the static synopsis (spec D8,
-//! D9, M3; plan C19, C26).
+//! Global terminal flags and the pre-boot version answer (spec D8, D9; plan
+//! C19, C26, C32).
 //!
 //! Three things happen before anything boots. [`pre_boot`] looks at the raw
-//! argv and answers `--version`/`--help` from constants ([`version_line`],
-//! [`SYNOPSIS`]), so no config is read, no runtime starts and no CA is minted
-//! (AC-W1-1, AC-W1-2). [`split_term_args`] then strips the terminal flags
+//! argv and answers `--version` from a constant ([`version_line`]), so no
+//! config is read, no runtime starts and no CA is minted (AC-W1-1). Help is
+//! not answered here since wave 2 (plan C32, AC-W2-7): every help form —
+//! `--help`, `-h`, `help [topic…]`, a bare group, `<group> <verb> --help` —
+//! is recognised by `help::request::parse` inside `parse_invocation` and
+//! answered by [`crate::help`] from the schema-only registry, which reads
+//! the config but creates nothing. [`split_term_args`] then strips the terminal flags
 //! (`-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--color`) from the tokens
 //! before the mode word into a [`TermOpts`] and hands the rest to the mode
 //! parser unchanged (AC-W1-12). Finally [`TermOpts::detect_caps`] turns the
@@ -196,17 +200,20 @@ fn parse_color(value: &str) -> Result<ColorChoice, String> {
 pub enum PreBoot {
     /// `--version`, `-V`, `version`: print [`version_line`] and exit 0.
     Version,
-    /// `--help`, `-h`, `help`: print [`SYNOPSIS`] and exit 0.
+    /// returned by nothing since wave 2; T15 deletes it together with
+    /// `main.rs`'s match arm
     Help,
 }
 
 /// The pre-boot fast path: the first token, after stepping over `--config <p>`
 /// / `--config=<p>` and the terminal flags [`split_term_args`] knows (`-v`,
 /// `-vv`, `--verbose`, `-q`, `--quiet`, `--color <v>`, `--color=<v>`; tester
-/// F3, so `aitm -v --version` never boots the host), is one of the version or
-/// help aliases. Anything else, including `web --help` (the mode's own help)
-/// and an empty argv, boots. A flag's value is never read as the alias:
-/// `--config --version` names a file and `--color --help` names a colour.
+/// F3, so `aitm -v --version` never boots the host), is one of the version
+/// aliases. Anything else returns `None` — the help aliases included, since
+/// wave 2 (plan C32): `--help`, `-h` and `help` are `help::request::parse`'s
+/// inside `parse_invocation`, after the terminal flags are split — as does an
+/// empty argv. A flag's value is never read as the alias: `--config
+/// --version` names a file and `--color --version` names a colour.
 pub fn pre_boot(argv: &[String]) -> Option<PreBoot> {
     let mut tokens = argv.iter();
     let first = loop {
@@ -225,7 +232,6 @@ pub fn pre_boot(argv: &[String]) -> Option<PreBoot> {
     };
     match first.as_str() {
         "--version" | "-V" | "version" => Some(PreBoot::Version),
-        "--help" | "-h" | "help" => Some(PreBoot::Help),
         _ => None,
     }
 }
@@ -235,20 +241,12 @@ pub fn version_line() -> String {
     format!("aitm {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// The built-in command groups: the first segments of what the binary
-/// registers with a default config and no bundled catalogue (plan C19). The
-/// `check` and `l4` groups come from the bundled Rhai scripts, which the
-/// operator can turn off or replace, and the `L4Module`'s own verbs register
-/// only when `l4.enabled`, so none of them is listed. Pinned to the live
-/// registry by `tests/synopsis_groups.rs` (AC-W1-2).
-pub const GROUPS: &[&str] = &[
-    "agent", "browser", "ca", "capture", "config", "findings", "flow", "map", "poc", "proxy",
-    "request", "scan", "scope", "script", "session", "tls", "ws",
-];
-
-/// The `aitm --help` text (spec M3's wave-1 block, verbatim, with the package
-/// version in place of the mock-up's). A constant, because the registry cannot
-/// be built without minting the CA (spec D8); wave 2 generates the full help.
+/// Wave 1's static `aitm --help` text (spec M3's wave-1 block, with the
+/// package version in place of the mock-up's). Printed by nothing since wave
+/// 2: [`pre_boot`] no longer answers help and [`crate::help`] builds the pages
+/// from the schema-only registry (plan C32). Still declared only because
+/// `main.rs`'s `PreBoot::Help` arm names it; T15 deletes it together with
+/// that arm and the variant.
 pub const SYNOPSIS: &str = concat!(
     "aitm ",
     env!("CARGO_PKG_VERSION"),
@@ -480,57 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn pre_boot_recognises_every_alias_and_skips_config() {
-        for token in ["--version", "-V", "version"] {
-            assert_eq!(pre_boot(&argv(&[token])), Some(PreBoot::Version), "{token}");
-        }
-        for token in ["--help", "-h", "help"] {
-            assert_eq!(pre_boot(&argv(&[token])), Some(PreBoot::Help), "{token}");
-        }
-        assert_eq!(
-            pre_boot(&argv(&["--config", "x", "--version"])),
-            Some(PreBoot::Version)
-        );
-        assert_eq!(pre_boot(&argv(&["--config=x", "-h"])), Some(PreBoot::Help));
-        assert_eq!(pre_boot(&argv(&["scope", "list"])), None);
-        assert_eq!(pre_boot(&argv(&["web", "--help"])), None);
-        assert_eq!(pre_boot(&[]), None);
-        assert_eq!(pre_boot(&argv(&["--config"])), None);
-    }
-
-    #[test]
     fn version_line_is_aitm_and_the_package_version() {
         assert_eq!(
             version_line(),
             format!("aitm {}", env!("CARGO_PKG_VERSION"))
         );
-    }
-
-    #[test]
-    fn synopsis_first_line_and_groups_block() {
-        let first = format!(
-            "aitm {} — intercepting proxy for authorized security testing",
-            env!("CARGO_PKG_VERSION")
-        );
-        assert_eq!(SYNOPSIS.lines().next(), Some(first.as_str()));
-
-        let block = "\nGroups:\n  agent  browser  ca  capture  config  findings  flow  map  poc  proxy\n  request  scan  scope  script  session  tls  ws\n";
-        assert!(
-            SYNOPSIS.contains(block),
-            "the Groups block is not verbatim:\n{SYNOPSIS}"
-        );
-        let words: Vec<&str> = block
-            .trim_start_matches("\nGroups:\n")
-            .split_whitespace()
-            .collect();
-        assert_eq!(words.as_slice(), GROUPS);
-        assert_eq!(GROUPS.len(), 17);
-
-        assert!(
-            SYNOPSIS.ends_with("  Trust the CA:  aitm ca install\n"),
-            "the synopsis must end with the CA line and one newline:\n{SYNOPSIS}"
-        );
-        assert!(!SYNOPSIS.ends_with("\n\n"));
     }
 
     // ---- tester, whole-branch pass (plan C26, spec D8/D9, AC-W1-1/2/12) ----
@@ -627,144 +579,6 @@ mod tests {
         }
     }
 
-    /// Spec D8: `--config <p>` / `--config=<p>` and the terminal flags are
-    /// stepped over (tester F3), the alias must be the whole first token,
-    /// and nothing after it matters.
-    #[test]
-    fn pre_boot_steps_over_config_and_term_flags_and_matches_whole_tokens() {
-        assert_eq!(pre_boot(&argv(&["--config=x"])), None);
-        assert_eq!(pre_boot(&argv(&["--config", "x"])), None);
-        // `--config --version` names a file called `--version`: it boots.
-        assert_eq!(pre_boot(&argv(&["--config", "--version"])), None);
-        assert_eq!(
-            pre_boot(&argv(&["--config", "a", "--config=b", "-V"])),
-            Some(PreBoot::Version)
-        );
-        // The terminal flags are stepped over too (tester F3: `aitm -v
-        // --version` must not boot the host); any other flag first boots.
-        assert_eq!(
-            pre_boot(&argv(&["-v", "--version"])),
-            Some(PreBoot::Version)
-        );
-        assert_eq!(
-            pre_boot(&argv(&["--color=never", "--help"])),
-            Some(PreBoot::Help)
-        );
-        assert_eq!(pre_boot(&argv(&["--script", "a.rhai", "--help"])), None);
-        for not_alias in [
-            "--version=1",
-            "--helpme",
-            "-Vv",
-            "-hh",
-            "Version",
-            "HELP",
-            "--Help",
-            "",
-        ] {
-            assert_eq!(pre_boot(&argv(&[not_alias])), None, "{not_alias:?}");
-        }
-        assert_eq!(
-            pre_boot(&argv(&["--help", "scope", "list"])),
-            Some(PreBoot::Help)
-        );
-        assert_eq!(
-            pre_boot(&argv(&["version", "--config"])),
-            Some(PreBoot::Version)
-        );
-    }
-
-    /// Tester F3 (spec D8/D9): every terminal flag `split_term_args` knows
-    /// (`-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--color <v>`,
-    /// `--color=<v>`) is stepped over before the alias is matched, so `aitm
-    /// -v --version` answers from the constant instead of booting the host;
-    /// a `--color` value is never read as the alias; and a terminal flag
-    /// before a command word still boots.
-    #[test]
-    fn pre_boot_steps_over_the_terminal_flags() {
-        assert_eq!(
-            pre_boot(&argv(&["-v", "--version"])),
-            Some(PreBoot::Version)
-        );
-        assert_eq!(
-            pre_boot(&argv(&["--color", "never", "-h"])),
-            Some(PreBoot::Help)
-        );
-        assert_eq!(pre_boot(&argv(&["-q", "scope", "list"])), None);
-        for flags in [
-            &["-vv"][..],
-            &["--verbose"],
-            &["--quiet"],
-            &["-q", "-v"],
-            &["--color=always"],
-            &["--color", "auto", "--config", "x", "-vv"],
-        ] {
-            let mut tokens: Vec<&str> = flags.to_vec();
-            tokens.push("version");
-            assert_eq!(
-                pre_boot(&argv(&tokens)),
-                Some(PreBoot::Version),
-                "{tokens:?}"
-            );
-        }
-        // `--color --help` names a colour called `--help`: not the alias.
-        assert_eq!(pre_boot(&argv(&["--color", "--help"])), None);
-        assert_eq!(pre_boot(&argv(&["--color"])), None);
-        assert_eq!(pre_boot(&argv(&["-v"])), None);
-        // `-V` is pre-boot's own alias, not a verbosity flag.
-        assert_eq!(pre_boot(&argv(&["-V", "-v"])), Some(PreBoot::Version));
-    }
-
-    /// AC-W1-2: `aitm --help` is spec M3's wave-1 block verbatim, with the
-    /// package version in place of the mock-up's, the core's own advice
-    /// sentence, 27 lines, none over 80 columns, no tab.
-    #[test]
-    fn synopsis_is_spec_m3_verbatim() {
-        let mut expected = format!(
-            "aitm {} — intercepting proxy for authorized security testing\n",
-            env!("CARGO_PKG_VERSION")
-        );
-        expected.push_str(concat!(
-            "\n",
-            "Usage:\n",
-            "  aitm                      run the proxy with the MCP agent transport\n",
-            "  aitm web [options]        run the proxy and the web operator UI\n",
-            "  aitm tui                  run the proxy and the terminal operator UI\n",
-            "  aitm <group> <verb> [--flag <value>]...\n",
-            "                            run one command and exit\n",
-            "  aitm operator-token generate [--force]\n",
-            "\n",
-            "Groups:\n",
-            "  agent  browser  ca  capture  config  findings  flow  map  poc  proxy\n",
-            "  request  scan  scope  script  session  tls  ws\n",
-            "\n",
-            "Options:\n",
-            "  --config <path>           config file (env AITM_CONFIG)\n",
-            "  --script <path>           load an extra Rhai script (repeatable)\n",
-            "  -v, -vv                   show INFO / DEBUG tracing on stderr\n",
-            "  -q                        errors only\n",
-            "  --color <auto|always|never>\n",
-            "  --version, -V             print the version and exit\n",
-            "  --help, -h                print this help\n",
-            "\n",
-            "Learn more:\n",
-            "  aitm web --help           the web UI's options\n",
-            "  Nothing is decrypted until a host is in Scope.  aitm scope add --host <host>\n",
-            "  Trust the CA:  aitm ca install\n",
-        ));
-        assert_eq!(SYNOPSIS, expected);
-        assert_eq!(SYNOPSIS.lines().count(), 27);
-        assert!(
-            SYNOPSIS.contains(aitm_core::NOTHING_DECRYPTED_ADVICE),
-            "the advice sentence is the core's constant, verbatim"
-        );
-        for line in SYNOPSIS.lines() {
-            assert!(line.chars().count() <= 80, "over 80 columns: {line:?}");
-            assert!(!line.contains('\t'), "tab in {line:?}");
-            assert_eq!(line.trim_end(), line, "trailing whitespace in {line:?}");
-        }
-        assert!(!SYNOPSIS.as_bytes().contains(&0x1b));
-    }
-
     /// A pipe never animates whatever `--color` says (spec D2 rule 7);
     /// `-q` is the reporter's business and leaves the caps alone; `CI` on a
     /// TTY means plain lines (D2 rule 5, plan C22).
@@ -850,6 +664,107 @@ mod tests {
                 Some(PreBoot::Version),
                 "{flag} was not stepped over"
             );
+        }
+    }
+
+    /// Spec D8 as wave 2 reads it (plan C32): `pre_boot` answers the three
+    /// version aliases after stepping over `--config <p>`/`--config=<p>` and
+    /// every terminal flag `split_term_args` knows, so `aitm -v --version`
+    /// and `aitm --color never version` never boot the host (tester F3); the
+    /// alias must be the whole first token, a flag's value is never read as
+    /// the alias, and nothing after the alias matters.
+    #[test]
+    fn pre_boot_recognises_the_version_aliases_and_steps_over_flags() {
+        for alias in ["--version", "-V", "version"] {
+            assert_eq!(pre_boot(&argv(&[alias])), Some(PreBoot::Version), "{alias}");
+        }
+        for flags in [
+            &["--config", "x"][..],
+            &["--config=x"],
+            &["-v"],
+            &["-vv"],
+            &["--verbose"],
+            &["-q"],
+            &["--quiet"],
+            &["-q", "-v"],
+            &["--color", "never"],
+            &["--color=never"],
+            &["--config", "a", "--config=b"],
+            &["--color", "auto", "--config", "x", "-vv"],
+        ] {
+            for alias in ["--version", "-V", "version"] {
+                let mut tokens: Vec<&str> = flags.to_vec();
+                tokens.push(alias);
+                assert_eq!(
+                    pre_boot(&argv(&tokens)),
+                    Some(PreBoot::Version),
+                    "{tokens:?}"
+                );
+            }
+        }
+        // Nothing after the alias matters; `-V` is pre-boot's own alias, not
+        // a verbosity flag.
+        assert_eq!(
+            pre_boot(&argv(&["version", "--config"])),
+            Some(PreBoot::Version)
+        );
+        assert_eq!(pre_boot(&argv(&["-V", "-v"])), Some(PreBoot::Version));
+
+        // A flag's value is never the alias: `--config --version` names a
+        // file and `--color --version` a colour.
+        assert_eq!(pre_boot(&argv(&["--config", "--version"])), None);
+        assert_eq!(pre_boot(&argv(&["--color", "--version"])), None);
+        // Only `--config` and the terminal flags are stepped over.
+        assert_eq!(pre_boot(&argv(&["--script", "a.rhai", "--version"])), None);
+        // Flags alone, a command word, an empty argv: boot.
+        for boots in [
+            &["--config=x"][..],
+            &["--config", "x"],
+            &["--config"],
+            &["--color"],
+            &["-v"],
+            &["scope", "list"],
+            &["-q", "scope", "list"],
+            &["web", "--help"],
+            &[],
+        ] {
+            assert_eq!(pre_boot(&argv(boots)), None, "{boots:?}");
+        }
+        // The alias is the whole token, case-sensitive.
+        for not_alias in ["--version=1", "-Vv", "Version", "VERSION", "--Version", ""] {
+            assert_eq!(pre_boot(&argv(&[not_alias])), None, "{not_alias:?}");
+        }
+    }
+
+    /// Plan C32 (AC-W2-7, one help path): the help aliases are no longer
+    /// pre-boot's. `--help`, `-h`, `help` and `help <topic…>`, with or
+    /// without stepped-over flags before them, return `None`, so they reach
+    /// `help::request::parse` inside `parse_invocation` and are answered by
+    /// `crate::help` from the schema-only registry.
+    #[test]
+    fn pre_boot_leaves_help_to_the_help_resolver() {
+        for tokens in [
+            &["--help"][..],
+            &["-h"],
+            &["help"],
+            &["help", "scope"],
+            &["help", "scope", "add"],
+            &["--color", "never", "-h"],
+            &["--color=never", "--help"],
+            &["--config=x", "-h"],
+            &["--config", "x", "--help"],
+            &["-v", "--help"],
+            &["--help", "scope", "list"],
+            &["scope", "--help"],
+            &["scope", "add", "--help"],
+            &["web", "--help"],
+            &["tui", "--help"],
+            &["-hh"],
+            &["--helpme"],
+            &["HELP"],
+            &["--Help"],
+        ] {
+            assert_eq!(pre_boot(&argv(tokens)), None, "{tokens:?}");
         }
     }
 }

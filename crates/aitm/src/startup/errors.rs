@@ -5,11 +5,14 @@
 //! meets most are typed here so [`report_for`] can turn each into the exact
 //! what/why/fix/command panel of mock-up M2, while the `Display` of every
 //! variant stays what 0.5.10 printed (the `main.rs` pin and
-//! `cli-startup.sh` read it through `anyhow`). A dispatcher, mode-parser or
-//! valued-global-flag usage error becomes a [`ErrorKind::Usage`] panel (exit
-//! 2) pointing at `aitm --help`; anything else is the `anyhow` chain, one cause per line
-//! (exit 1). Addressed by path (`startup::errors::…`), never re-exported from
-//! `mod.rs`.
+//! `cli-startup.sh` read it through `anyhow`). A typed [`ErrorReport`]
+//! anywhere in the chain — what `aitm-cli` and `web::parse_args` return
+//! since wave 2 (plan C35, C36), carrying its own group/verb help pointer —
+//! is the panel as built, plus the log footer. A mode-parser or
+//! valued-global-flag usage error raised as a string becomes a
+//! [`ErrorKind::Usage`] panel (exit 2) pointing at `aitm --help`; anything
+//! else is the `anyhow` chain, one cause per line (exit 1). Addressed by path
+//! (`startup::errors::…`), never re-exported from `mod.rs`.
 //!
 //! [`ErrorKind::Usage`]: aitm_term::error::ErrorKind::Usage
 
@@ -23,9 +26,11 @@ use aitm_term::caps::{Caps, ColorChoice, Verbosity};
 use aitm_term::error::ErrorReport;
 use aitm_term::reporter::Reporter;
 
-/// How an `aitm_cli` dispatch error begins when the command line could not be
-/// understood (spec D6 rule 4). A top message starting with one of these is a
-/// usage error: exit 2, `aitm --help` as the fix command.
+/// How a dispatch error raised as a string begins when the command line could
+/// not be understood (spec D6 rule 4). A top message starting with one of
+/// these is a usage error: exit 2, `aitm --help` as the fix command. Since
+/// wave 2 `aitm-cli` returns typed reports instead (rule 0, plan C35); the
+/// list stays for the string protocol.
 pub const USAGE_PREFIXES: &[&str] = &[
     "unknown command",
     "expected a command",
@@ -35,16 +40,23 @@ pub const USAGE_PREFIXES: &[&str] = &[
     "unexpected argument",
 ];
 
-/// How every mode usage line and the dispatcher's own begins.
-const USAGE_LINE: &str = "usage:";
+/// How a mode usage line begins: wave 1's lowercase `usage:` (the hidden
+/// watchdog keeps it) and wave 2's `Usage:` (plan C34/C35, AC-W2-5), each
+/// recognised in the headline and in the line after it.
+const USAGE_LINES: [&str; 2] = ["usage:", "Usage:"];
 /// The word a valued global flag's one-line error carries when its value is
 /// missing (`--config requires a path`, `--script requires a path`,
 /// `--bus-endpoint-file requires a path`; tester F2). With a headline that
 /// starts with `--`, it is a usage error.
 const REQUIRES: &str = " requires ";
 /// The first line of the dispatcher's full command list, which the panel
-/// drops in favour of the `aitm --help` pointer (plan C15).
-const REGISTRY_DUMP_HEADER: &str = "usage: aitm <command> [--flag value]...";
+/// drops in favour of the `aitm --help` pointer (plan C15): wave 1's header
+/// and wave 2's `aitm_cli::dispatch::USAGE_FORM` (harmless since no error
+/// embeds the dump any more; the typed reports pass through rule 0).
+const REGISTRY_DUMP_HEADERS: [&str; 2] = [
+    "usage: aitm <command> [--flag value]...",
+    aitm_cli::dispatch::USAGE_FORM,
+];
 /// The cause sentence of a port conflict, verbatim from 0.5.10 (M2).
 const HELD_BY: &str = "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.";
 /// The remedy when the config file named by `--config` does not exist.
@@ -169,23 +181,39 @@ impl StdError for StartupError {
 
 /// The panel for `err` (spec D6, first match wins over `err.chain()`):
 ///
+/// 0. an [`ErrorReport`] anywhere in the chain (the typed usage errors
+///    `aitm-cli` and `web::parse_args` return, plan C35/C36) → that report
+///    as it is, its own `command` pointer included (`aitm --help`, `aitm
+///    <group>` or `aitm <group> <verb> --help`); `log` is added only when the
+///    report names none;
 /// 1. a [`StartupError::PortInUse`] anywhere in the chain → the M2 fields;
 /// 2. a [`StartupError::ConfigFile`] → `in config file <path>`, its source
 ///    chain as the causes (minus any equal to the headline), the
 ///    create-or-drop-`--config` remedy when the chain holds a `NotFound`
 ///    `io::Error`, else the fix-the-file remedy;
 /// 3. a [`StartupError::StrictScripts`] → today's message plus its remedy;
-/// 4. a usage error (the top message starts with one of [`USAGE_PREFIXES`]
-///    or with `usage:`, or is a `--<flag> requires <value>` line, or its
-///    headline is followed by the mode parser's own `usage:` line) →
-///    [`ErrorReport::usage`]: the first line as the
-///    headline, the following lines as causes up to, not including, the
-///    dispatcher's command list, which the `aitm --help` pointer replaces
-///    (plan C15);
+/// 4. a usage error raised as a string — `main.rs`'s own mode parsers
+///    (`tui`, `operator-token`, the watchdog) and the valued global flags —
+///    (the top message starts with one of [`USAGE_PREFIXES`] or with
+///    `usage:`/`Usage:`, or is a `--<flag> requires <value>` line, or its
+///    headline is followed by the mode parser's own `usage:`/`Usage:` line) →
+///    [`ErrorReport::usage`]: the first line as the headline, the following
+///    lines as causes up to, not including, the dispatcher's command list,
+///    which the pointer replaces (plan C15). The pointer is `aitm --help`;
+///    since wave 2 the group/verb help pointers come with the typed reports
+///    of rule 0 (plan C34/C35), never from this rule;
 /// 5. anything else → the top message and every `source()` in order.
 ///
-/// `log` becomes the footer whenever it is given.
+/// `log` becomes the footer whenever it is given (rule 0: unless the report
+/// already has one).
 pub fn report_for(err: &anyhow::Error, log: Option<&Path>) -> ErrorReport {
+    if let Some(report) = err.chain().find_map(|c| c.downcast_ref::<ErrorReport>()) {
+        return if report.log.is_none() {
+            report.clone().with_log(log.map(Path::to_path_buf))
+        } else {
+            report.clone()
+        };
+    }
     let report = err
         .chain()
         .find_map(|cause| {
@@ -204,21 +232,34 @@ fn usage_report(message: &str) -> Option<ErrorReport> {
     let what = lines.next().unwrap_or("");
     let mut rest = lines.peekable();
     let is_usage = USAGE_PREFIXES.iter().any(|p| what.starts_with(p))
-        || what.starts_with(USAGE_LINE)
+        || is_usage_line(what)
         || flag_requires_a_value(what)
-        || rest.peek().is_some_and(|line| line.starts_with(USAGE_LINE));
+        || rest.peek().is_some_and(|line| is_usage_line(line));
     if !is_usage {
         return None;
     }
-    let why = if what.starts_with(REGISTRY_DUMP_HEADER) {
+    let why = if is_registry_dump_header(what) {
         Vec::new()
     } else {
-        rest.take_while(|line| !line.starts_with(REGISTRY_DUMP_HEADER))
+        rest.take_while(|line| !is_registry_dump_header(line))
             .filter(|line| !line.trim().is_empty())
             .map(str::to_string)
             .collect()
     };
     Some(ErrorReport::usage(what).with_why(why))
+}
+
+/// Part of rule 4: the line begins with one of [`USAGE_LINES`].
+fn is_usage_line(line: &str) -> bool {
+    USAGE_LINES.iter().any(|lead| line.starts_with(lead))
+}
+
+/// Part of rule 4: the line begins the dispatcher's command list
+/// ([`REGISTRY_DUMP_HEADERS`]).
+fn is_registry_dump_header(line: &str) -> bool {
+    REGISTRY_DUMP_HEADERS
+        .iter()
+        .any(|header| line.starts_with(header))
 }
 
 /// Part of rule 4: a valued flag given without its value (`--config requires
@@ -592,7 +633,8 @@ mod tests {
     /// the cause; the registry dump header as the first line keeps only the
     /// header; blank lines before the dump are dropped and indented detail
     /// lines are kept verbatim; the prefix match is on the first line only
-    /// and is case-sensitive.
+    /// and is case-sensitive (`usage:` and `Usage:` are the two usage-line
+    /// spellings).
     #[test]
     fn report_for_degenerate_usage_shapes() {
         let empty = report_for(&anyhow::anyhow!(""), None);
@@ -645,8 +687,16 @@ mod tests {
 
         let cased = report_for(&anyhow::anyhow!("Unknown command `x`"), None);
         assert_eq!(cased.kind, ErrorKind::Failure, "the prefixes are lowercase");
+        // `Usage:` is accepted beside `usage:` since wave 2 (plan C35,
+        // AC-W2-5); any other casing is not.
         let cased = report_for(&anyhow::anyhow!("Usage: aitm x"), None);
-        assert_eq!(cased.kind, ErrorKind::Failure, "`usage:` is lowercase");
+        assert_eq!(
+            cased.kind,
+            ErrorKind::Usage,
+            "`Usage:` is the wave-2 spelling"
+        );
+        let cased = report_for(&anyhow::anyhow!("USAGE: aitm x"), None);
+        assert_eq!(cased.kind, ErrorKind::Failure, "only `usage:` and `Usage:`");
     }
 
     /// Rule order: a typed error anywhere in the chain beats a usage-looking
@@ -862,5 +912,101 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // ---- wave 2 (plan Task 12; C34, C35; AC-W2-5) ----
+
+    /// Plan C35, rule 0: a typed `ErrorReport` anywhere in the chain is the
+    /// panel exactly as `aitm-cli` built it — kind, headline, causes and its
+    /// own help pointer — never re-derived from its `Display` text (whose
+    /// indented cause lines would otherwise become the causes); only the log
+    /// footer is added.
+    #[test]
+    fn typed_error_report_passes_through_and_gains_the_log_footer() {
+        let typed = ErrorReport::usage("unknown command `scpe`")
+            .with_why(vec!["did you mean: scope".to_string()])
+            .with_command("aitm --help");
+        let err = anyhow::Error::new(typed.clone());
+        let report = report_for(&err, Some(Path::new(LOG)));
+        assert_eq!(report.kind, ErrorKind::Usage);
+        assert_eq!(report.exit_code(), 2);
+        assert_eq!(report.what, "unknown command `scpe`");
+        assert_eq!(report.why, vec!["did you mean: scope".to_string()]);
+        assert_eq!(report.fix, None);
+        assert_eq!(report.command, Some(FixCommand("aitm --help".to_string())));
+        assert_eq!(report.log, Some(PathBuf::from(LOG)));
+        assert_eq!(report, typed.with_log(Some(PathBuf::from(LOG))));
+
+        // The verb pointer survives too, under an outer context, with no log.
+        let verb = ErrorReport::usage("unknown flag --hsot for `scope add`")
+            .with_why(vec![
+                "did you mean: --host".to_string(),
+                "Usage: aitm scope add --host <host>".to_string(),
+            ])
+            .with_command("aitm scope add --help");
+        let err = anyhow::Error::new(verb.clone()).context("dispatching");
+        assert_eq!(report_for(&err, None), verb);
+    }
+
+    /// Rule 0's footer: a report that already names its log is not
+    /// overwritten, whether `report_for` is handed a log path or none.
+    #[test]
+    fn typed_report_keeps_its_own_log() {
+        let own = PathBuf::from("/x/own.log");
+        let typed = ErrorReport::usage("missing verb after `scope`")
+            .with_why(vec![
+                "Usage: aitm scope <verb> [--flag <value>]...".to_string()
+            ])
+            .with_command("aitm scope")
+            .with_log(Some(own.clone()));
+        let err = anyhow::Error::new(typed.clone());
+        assert_eq!(
+            report_for(&err, Some(Path::new(LOG))).log,
+            Some(own.clone())
+        );
+        assert_eq!(report_for(&err, None).log, Some(own));
+        assert_eq!(report_for(&err, Some(Path::new(LOG))), typed);
+    }
+
+    /// Plan C34/C35 (AC-W2-5): the mode parsers' string protocol now spells
+    /// its second line `Usage:`; it is recognised in the headline and in the
+    /// line after it exactly as `usage:` is, keeps the `aitm --help` pointer
+    /// and exits 2.
+    #[test]
+    fn capitalised_usage_line_is_a_usage_error() {
+        let err = anyhow::anyhow!(
+            "tui takes no further arguments, got `--bad`\nUsage: aitm [--config <path>] tui"
+        );
+        let report = report_for(&err, None);
+        assert_eq!(report.kind, ErrorKind::Usage);
+        assert_eq!(report.exit_code(), 2);
+        assert_eq!(report.what, "tui takes no further arguments, got `--bad`");
+        assert_eq!(
+            report.why,
+            vec!["Usage: aitm [--config <path>] tui".to_string()]
+        );
+        assert_eq!(report.command, Some(FixCommand("aitm --help".to_string())));
+        assert_eq!(report.fix, None);
+        assert_eq!(report.log, None);
+
+        let operator_token = report_for(
+            &anyhow::anyhow!(
+                "operator-token needs a verb\nUsage: aitm [--config <path>] operator-token generate [--force]"
+            ),
+            Some(Path::new(LOG)),
+        );
+        assert_eq!(operator_token.kind, ErrorKind::Usage);
+        assert_eq!(operator_token.what, "operator-token needs a verb");
+        assert_eq!(
+            operator_token.why,
+            vec!["Usage: aitm [--config <path>] operator-token generate [--force]".to_string()]
+        );
+        assert_eq!(operator_token.log, Some(PathBuf::from(LOG)));
+
+        // In the headline too, as with `usage:`.
+        let headline = report_for(&anyhow::anyhow!("Usage: aitm x"), None);
+        assert_eq!(headline.kind, ErrorKind::Usage);
+        assert_eq!(headline.what, "Usage: aitm x");
+        assert_eq!(headline.exit_code(), 2);
     }
 }
