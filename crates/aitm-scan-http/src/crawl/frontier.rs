@@ -351,9 +351,13 @@ impl fmt::Display for StopReason {
 ///    `ConnectionReset`, `BrokenPipe`, `UnexpectedEof` or `ConnectionAborted`
 ///    is `transport`; a `tokio::time::error::Elapsed` is `timeout`.
 /// 3. **Text.** Only when no link is typed: the first link whose words read as
-///    a token wins, in the order `connect_refused`, `timeout`, `tls`,
-///    `transport`. These rules exist for a browser driver's error, which has
-///    already been flattened to a scrubbed string by the time it arrives. A
+///    a token wins, in the order `tls`, `connect_refused`, `timeout`,
+///    `transport`. TLS leads (amendment 68): a TLS failure names the
+///    connection or the refusal it was failing on ("the peer refused the
+///    handshake", "tls handshake failed while connecting to h:8443"), and
+///    reading `refused` first mis-tokenised those `connect_refused`. These
+///    rules exist for a browser driver's error, which has already been
+///    flattened to a scrubbed string by the time it arrives. A
 ///    link whose text starts with `scan:` is one of the lane's own refusals
 ///    (the scope guard, the budget) and is never read: it is `other` unless a
 ///    typed link says otherwise.
@@ -392,18 +396,18 @@ pub(crate) fn crawl_error_token(err: &anyhow::Error) -> &'static str {
             continue;
         }
         let lower = text.to_ascii_lowercase();
-        if lower.contains("refused") {
-            return "connect_refused";
-        }
-        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
-            return "timeout";
-        }
         if lower.contains("tls")
             || lower.contains("certificate")
             || lower.contains("handshake")
             || lower.contains("alpn")
         {
             return "tls";
+        }
+        if lower.contains("refused") {
+            return "connect_refused";
+        }
+        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
+            return "timeout";
         }
         // Any other `io::Error` is a transport failure of some kind.
         if link.downcast_ref::<std::io::Error>().is_some()
@@ -689,6 +693,21 @@ mod tests {
         );
         assert_eq!(
             crawl_error_token(&anyhow::anyhow!("no ALPN protocol")),
+            "tls"
+        );
+        // Amendment 68: the TLS words are read before `refused`, so a TLS
+        // chain that mentions the refusal or the connection it failed on is
+        // `tls`, not `connect_refused`.
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!(
+                "TLS to origin.test: the peer refused the handshake"
+            )),
+            "tls"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!(
+                "TLS handshake failed while connecting to t:8443"
+            )),
             "tls"
         );
 
