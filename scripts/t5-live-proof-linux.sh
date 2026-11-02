@@ -152,6 +152,8 @@ pcap_excerpts() {
   rec "pcap frames rst:   $(tcpdump -nn -r "$pcap" 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | wc -l | tr -d ' ')"
   rec "first ICMP lines (tcpdump -ttt = delta from the previous frame):"
   tcpdump -nn -ttt -r "$pcap" icmp 2>/dev/null | head -25 | sed 's/^/  /' | tee -a "$SUMMARY"
+  rec "ICMP reactions other than the kernel's errors for our own source port 40000 (closed-port lines; -ttt deltas show the amendment-46 pace of ~1.1 s):"
+  tcpdump -nn -ttt -r "$pcap" icmp 2>/dev/null | grep -v 'port 40000' | head -14 | sed 's/^/  /' | tee -a "$SUMMARY"
   rec "first RST lines:"
   tcpdump -nn -r "$pcap" 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | head -3 | sed 's/^/  /' | tee -a "$SUMMARY"
   rec "UDP datagrams by destination port (top 6; the echo service shows up as 105 = 100 cases + 1 baseline + 4 probes):"
@@ -261,6 +263,15 @@ run_cells() {
   rec "runner exit: $rc"
   rec "runner first lines (must show no build step):"
   head -5 "$log" | sed 's/^/  /' | tee -a "$SUMMARY"
+
+  step "cells 3b/4: each T5 cell once more on its own, stdout kept (the runner prints a cell's lines only when it FAILs)"
+  mkdir -p "$OUT/cells-direct"
+  local cell
+  for cell in test_t5_bounded_clean test_t5_pins_dryrun test_t5_crash_oracle; do
+    say "python3 tests/e2e/scan/$cell.py   (log: $OUT/cells-direct/$cell.log)"
+    python3 "tests/e2e/scan/$cell.py" > "$OUT/cells-direct/$cell.log" 2>&1
+    rec "direct $cell exit: $? ($(grep -c '\[ok\]' "$OUT/cells-direct/$cell.log") ok lines, $(grep -c '\[FAIL\]' "$OUT/cells-direct/$cell.log") FAIL lines)"
+  done
 
   step "cells 4/4: the three T5 cells, the ledger, and what tcpdump saw"
   rec "T5 cell lines:"
