@@ -1716,7 +1716,6 @@ mod tests {
 
         host.baseline().await.unwrap();
 
-        assert_eq!(host.baseline_peer_addr(), Some(upstream()));
         assert_eq!(
             host.baseline_peer_addr(),
             Some("192.0.2.9:8080".parse().unwrap())
@@ -1762,6 +1761,10 @@ mod tests {
     #[tokio::test]
     async fn baseline_without_a_server_conn_leaves_the_peer_unknown() {
         let fx = fixture(ok_200());
+        assert!(
+            fx.client.peer.is_none(),
+            "no with_peer: the sender observed no upstream connection"
+        );
         let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
 
         host.baseline().await.unwrap();
