@@ -331,6 +331,16 @@ impl JobRuntime {
             point: point.to_string(),
             detail,
         });
+        if samples.len() == MAX_CHECK_ERROR_SAMPLES {
+            // Said once, when the store fills: later distinct errors are
+            // counted in `checks.errors` but neither sampled nor logged, so
+            // a flood of near-identical details cannot flood the log either.
+            tracing::warn!(
+                target: "aitm::scanner",
+                job = %self.job,
+                "check error samples are full ({MAX_CHECK_ERROR_SAMPLES}); further distinct errors are counted only",
+            );
+        }
     }
 
     /// The error samples kept so far (amendment 58).
@@ -1972,6 +1982,53 @@ mod tests {
             missing.len(),
             1,
             "exactly one of the nine details is dropped"
+        );
+    }
+
+    /// Amendment 58: a sample's detail is bounded like an evidence excerpt,
+    /// and the bound is applied **after** the scrub (amendment 16's order), so
+    /// a runner that dumps a whole response into its error cannot grow the
+    /// status and cannot smuggle a credential past the redactor by sitting
+    /// near the cut. Bounded first, the scrub would shrink the text below
+    /// `MAX_EXCERPT_BYTES`; the length is what tells the two orders apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_error_detail_is_scrubbed_then_bounded() {
+        let detail: &'static str =
+            Box::leak(format!("runner missing: token=abc123 {}", "b".repeat(300)).into_boxed_str());
+        let h = Harness::new().with_lane(FakeLane::http().with_check(FakeCheck::new(
+            "fake.loud",
+            "demo",
+            FakeRun::error(detail),
+        )));
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        let sample = status
+            .checks
+            .error_samples
+            .first()
+            .expect("the error is sampled");
+        assert!(
+            !sample.detail.contains("abc123"),
+            "the credential survived: {:?}",
+            sample.detail
+        );
+        assert!(sample
+            .detail
+            .starts_with("runner missing: token=[redacted] b"));
+        assert_eq!(
+            sample.detail.len(),
+            aitm_scan_model::check::MAX_EXCERPT_BYTES,
+            "scrubbed first, then cut to the excerpt bound"
         );
     }
 

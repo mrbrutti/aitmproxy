@@ -1362,7 +1362,79 @@ mod tests {
                 false
             }
             fn marker(&self) -> String {
-                "aitm7f3a".to_string()
+                "aitm7f3a0000".to_string()
+            }
+        }
+
+        /// Amendment 39, call C4: the classifier maps a failure onto exactly
+        /// one closed token, in the documented order — the forced-h2 marker
+        /// first (it is amendment 21's counted probe error), then a typed
+        /// per-probe timeout, then connect, then TLS, with `transport` as the
+        /// catch-all. Nothing here is a heuristic over a free-text reason: the
+        /// token is what reaches `crawl.last_error`, so a wrong mapping is a
+        /// wrong reason on the operator's status.
+        #[test]
+        fn classify_maps_each_failure_to_its_kind() {
+            assert_eq!(
+                classify(&anyhow::anyhow!("h2_not_negotiated: scan.test:80: alpn")),
+                CrawlErrorKind::H2NotNegotiated
+            );
+            assert_eq!(
+                classify(&anyhow::Error::new(ProbeRefused::Timeout {
+                    host: "scan.test:80".to_string(),
+                    after: Duration::from_secs(30),
+                })),
+                CrawlErrorKind::Timeout,
+                "a typed per-probe timeout is `timeout`, not the text it prints"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!(
+                    "tcp connect to scan.test:80: connection refused"
+                )),
+                CrawlErrorKind::ConnectRefused
+            );
+            for tls in [
+                "TLS handshake failure",
+                "the certificate is not trusted",
+                "handshake eof",
+            ] {
+                assert_eq!(
+                    classify(&anyhow::anyhow!(tls)),
+                    CrawlErrorKind::Tls,
+                    "{tls:?} is a TLS failure"
+                );
+            }
+            assert_eq!(
+                classify(&anyhow::anyhow!("stream reset by peer")),
+                CrawlErrorKind::Transport,
+                "an unrecognised failure is `transport`, never `other`"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!("")),
+                CrawlErrorKind::Transport,
+                "an error with no message still classifies"
+            );
+
+            // The whole cause chain is read, not only the outermost error, and
+            // the match is case-insensitive: a wrapped reason still classifies.
+            let wrapped = anyhow::anyhow!("connection refused").context("fetching /a");
+            assert_eq!(classify(&wrapped), CrawlErrorKind::ConnectRefused);
+            assert_eq!(
+                classify(&anyhow::anyhow!("H2_NOT_NEGOTIATED")),
+                CrawlErrorKind::H2NotNegotiated
+            );
+
+            // Every token the classifier can produce is one the model parses
+            // back, so the lane -> `report_crawl_error` -> worker round trip
+            // never degrades a classified failure to `other`.
+            for kind in [
+                CrawlErrorKind::H2NotNegotiated,
+                CrawlErrorKind::Timeout,
+                CrawlErrorKind::ConnectRefused,
+                CrawlErrorKind::Tls,
+                CrawlErrorKind::Transport,
+            ] {
+                assert_eq!(CrawlErrorKind::parse(kind.as_str()), Some(kind));
             }
         }
 
