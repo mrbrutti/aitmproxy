@@ -25,7 +25,7 @@
 use aitm_core::flow::HttpRequest;
 use aitm_scan_model::InsertionKind;
 
-use crate::limits::{MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
+use crate::limits::{MAX_ENTIRE_BODY_EXAMPLE_CHARS, MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
 
 /// What the lane shows instead of a value it must never reveal.
 ///
@@ -67,14 +67,22 @@ pub(crate) fn is_secret_name(name: &str) -> bool {
 ///
 /// [`REDACTED`] when the point is a cookie (every cookie value is session
 /// material, whatever it is called) or when the name reads as a secret;
-/// otherwise the scrubbed value cut to [`MAX_EXAMPLE_CHARS`] characters on a
-/// char boundary, with no ellipsis (an ellipsis would be indistinguishable from
-/// one in the value itself).
+/// otherwise the scrubbed value cut on a char boundary to
+/// [`MAX_ENTIRE_BODY_EXAMPLE_CHARS`] for an `entire_body` point (a
+/// document-level check needs the document, call C13) and to
+/// [`MAX_EXAMPLE_CHARS`] for every other kind, with no ellipsis (an ellipsis
+/// would be indistinguishable from one in the value itself). The scrub runs
+/// before the cut, so a credential past the cap is masked, never kept.
 pub(crate) fn example(kind: InsertionKind, name: &str, value: &str) -> String {
     if kind == InsertionKind::Cookie || is_secret_name(name) {
         return REDACTED.to_string();
     }
-    cut_chars(&scrub(value), MAX_EXAMPLE_CHARS)
+    let cap = if kind == InsertionKind::EntireBody {
+        MAX_ENTIRE_BODY_EXAMPLE_CHARS
+    } else {
+        MAX_EXAMPLE_CHARS
+    };
+    cut_chars(&scrub(value), cap)
 }
 
 /// `url` with every credential removed, safe for a log line or an error message.
@@ -310,7 +318,7 @@ pub(crate) mod capture {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{example, safe_url, scrub_error};
-    use crate::limits::{MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
+    use crate::limits::{MAX_ENTIRE_BODY_EXAMPLE_CHARS, MAX_EXAMPLE_CHARS, MAX_SAFE_URL_CHARS};
     use aitm_scan_model::InsertionKind;
     use regex::Regex;
 
@@ -340,6 +348,42 @@ mod tests {
                 .chars()
                 .count(),
             MAX_EXAMPLE_CHARS
+        );
+
+        // Task 11b / call C13: an `entire_body` point keeps the whole document
+        // up to 1024 chars, so a document-level check sees a real body ...
+        assert_eq!(MAX_ENTIRE_BODY_EXAMPLE_CHARS, 1024);
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                &r#"{"k":"v"}"#.repeat(60)
+            )
+            .chars()
+            .count(),
+            540
+        );
+        assert_eq!(
+            example(InsertionKind::EntireBody, "body", &"x".repeat(2000))
+                .chars()
+                .count(),
+            1024
+        );
+        // ... every other kind keeps the 64-char cut ...
+        assert_eq!(
+            example(InsertionKind::Query, "q", &"x".repeat(100))
+                .chars()
+                .count(),
+            64
+        );
+        // ... and the body is scrubbed before the cut, as before.
+        assert_eq!(
+            example(
+                InsertionKind::EntireBody,
+                "body",
+                r#"{"user":"a","password":"hunter2"}"#
+            ),
+            r#"{"user":"a","password":"[redacted]"}"#
         );
     }
 
