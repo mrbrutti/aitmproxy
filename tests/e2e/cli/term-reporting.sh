@@ -690,14 +690,14 @@ section_log() {
   check "log has 'proxy listening'" grep -q -F 'proxy listening' "$log"
   check "log has no 'loaded script' at the default level" [ "$(count_fx 'loaded script' "$log")" = 0 ]
   check "log has zero ESC bytes" [ "$(count_fx $'\x1b' "$log")" = 0 ]
-  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" -vv scope list >"$ROOT/vv.out" 2>"$ROOT/vv.err" </dev/null
+  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" -vv ca status >"$ROOT/vv.out" 2>"$ROOT/vv.err" </dev/null
   check "-vv one-shot: log gains ≥ 49 'loaded script' records ($(count_fx 'loaded script' "$log"))" [ "$(count_fx 'loaded script' "$log")" -ge 49 ]
   start_server "$ROOT/logweb.out" "$ROOT/logweb.err" "$AITM_BIN" --config "$CFG" web --no-open --listen "127.0.0.1:$WEB_PORT"
   wait_for "$ROOT/logweb.err" '^Log: ' 30 || note "web ready card not seen (the server exited, or 30 s passed)"
   stop_server
   check "aitm web: log has 'web UI listening'" grep -q -F 'web UI listening' "$log"
   grow_file "$log" $((11*1024*1024))
-  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" scope list >/dev/null 2>"$ROOT/rot.err" </dev/null
+  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" ca status >/dev/null 2>"$ROOT/rot.err" </dev/null
   check "rotation: aitm.log.1 exists after opening an 11 MiB log" [ -f "$log.1" ]
   check "rotation: aitm.log.1 > 10 MiB" [ "$(fsize "$log.1" 2>/dev/null || echo 0)" -gt $((10*1024*1024)) ]
   check "rotation: fresh aitm.log < 1 MiB" [ "$(fsize "$log" 2>/dev/null || echo 99999999)" -lt $((1024*1024)) ]
@@ -871,9 +871,16 @@ section_tokens() {
   start_server "$ROOT/web.out" "$ROOT/web.err" "$AITM_BIN" --config "$CFG" web --no-open --listen "127.0.0.1:$WEB_PORT" --token "$t"
   wait_for "$ROOT/web.err" '^Log: ' 30 || note "web ready card not seen (the server exited, or 30 s passed)"
   stop_server
+  # R14 (plan C15): the operator token as the 0600 config holds it AFTER the
+  # run joins both operator-token greps as a third needle (a serving run mints
+  # one when the key is absent; new_env wrote this one, so the read-back is
+  # the same value). Read with sed into a variable, never printed (C13).
+  local minted; minted="$(sed -n 's/^  operator_token: //p' "$CFG" | head -1)"
+  [ -n "$minted" ] || minted="$opsecret"
   check "web: the bridge token appears exactly once on stderr" [ "$(count_fx "$t" "$ROOT/web.err")" = 1 ]
   check "web: that line is the 'Web UI: http://127.0.0.1:$WEB_PORT/#t=…' row" grep -q -E "^Web UI: http://127\.0\.0\.1:$WEB_PORT/#t=[^&[:space:]]+$" "$ROOT/web.err"
-  local hits=$(( $(count_fx "$opsecret" "$ROOT/web.err") + $(count_fx "$opsecret" "$ROOT/web.out") + $(count_fx "$opsecret" "$log") ))
+  local hits=$(( $(count_fx "$opsecret" "$ROOT/web.err") + $(count_fx "$opsecret" "$ROOT/web.out") + $(count_fx "$opsecret" "$log") \
+    + $(count_fx "$minted" "$ROOT/web.err") + $(count_fx "$minted" "$ROOT/web.out") + $(count_fx "$minted" "$log") ))
   check "web: mcp.operator_token appears in neither stderr, stdout nor the log" [ "$hits" = 0 ]
   local opb; opb="$(sed -n -E "s|^Operator: http://127\.0\.0\.1:$WEB_PORT/#t=([^&[:space:]]+)&expect=operator$|\1|p" "$ROOT/web.err" | head -1)"
   if [ -n "$opb" ]; then
@@ -890,7 +897,7 @@ section_tokens() {
   stop_server
   grep -a -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' "$ROOT/webraw.err" > "$ROOT/webraw.trace" 2>/dev/null
   check "RUST_LOG=info: the raw tracing stream has $(wc -l <"$ROOT/webraw.trace" | tr -d ' ') records and none carries the bridge token" [ "$(count_fx "$t" "$ROOT/webraw.trace")" = 0 ]
-  check "RUST_LOG=info: no tracing record carries mcp.operator_token" [ "$(count_fx "$opsecret" "$ROOT/webraw.trace")" = 0 ]
+  check "RUST_LOG=info: no tracing record carries mcp.operator_token" [ "$(( $(count_fx "$opsecret" "$ROOT/webraw.trace") + $(count_fx "$minted" "$ROOT/webraw.trace") ))" = 0 ]
   check "RUST_LOG=info: the bridge token still appears exactly once (the card row)" [ "$(count_fx "$t" "$ROOT/webraw.err")" = 1 ]
   end_section
 }
@@ -963,7 +970,7 @@ section_perf() {
   # Warm-up: the new binary mints the CA in the isolated HOME (the old binary
   # loads it below, when there is one). A new binary that cannot run here
   # ends the section with both SKIPs: nothing below can be read from it.
-  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local rn=$?
+  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" ca status >/dev/null 2>&1 </dev/null; local rn=$?
   if [ "$rn" != 0 ]; then
     skip "no aitm-term thread after the ready card (new binary warm-up failed, exit $rn)"
     skip "one-shot timing vs the old binary (same)"
@@ -989,16 +996,16 @@ section_perf() {
     end_section "$ROOT/thr-new.err"
     return
   fi
-  HOME="$HOME_DIR" "$AITM_OLD_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local ro=$?
+  HOME="$HOME_DIR" "$AITM_OLD_BIN" --config "$CFG" ca status >/dev/null 2>&1 </dev/null; local ro=$?
   if [ "$ro" != 0 ]; then
     skip "one-shot timing (old binary warm-up failed, exit $ro — it may not read this config)"
     end_section "$ROOT/thr-new.err"
     return
   fi
   local med_new med_old
-  med_new="$(median_of 11 "$AITM_BIN" --config "$CFG" scope list)"
-  med_old="$(median_of 11 "$AITM_OLD_BIN" --config "$CFG" scope list)"
-  note "aitm scope list median real of 11 runs: new=${med_new}s old=${med_old}s"
+  med_new="$(median_of 11 "$AITM_BIN" --config "$CFG" ca status)"
+  med_old="$(median_of 11 "$AITM_OLD_BIN" --config "$CFG" ca status)"
+  note "aitm ca status median real of 11 runs: new=${med_new}s old=${med_old}s"
   check "one-shot median: new ($med_new) <= old ($med_old) + 0.005" awk -v n="$med_new" -v o="$med_old" 'BEGIN { exit !(n <= o + 0.005) }'
   start_server "$ROOT/thr-old.out" "$ROOT/thr-old.err" "$AITM_OLD_BIN" --config "$CFG"
   # 0.5.10 logs INFO on stdout.
