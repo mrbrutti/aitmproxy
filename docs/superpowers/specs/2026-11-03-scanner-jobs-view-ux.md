@@ -69,7 +69,8 @@ same words, states and progress rule on the web UI and the TUI.
   are already running`. The Jobs view cannot queue; it can only show what
   runs.
 - **Hostile-core bounds** (TUI D6): strings from the core are bounded before
-  they reach the screen; the mac Kit's existing decoders keep their defaults
+  they reach the screen (mac: at decode, `ScanWire.boundedString`, D1
+  amendment); the mac Kit's existing decoders keep their defaults
   for missing fields.
 - **Palette and type** from `tokens.json`: UI face / data face, six sizes,
   tabular figures on every number; `Tok.*` on mac, CSS variables on web,
@@ -360,6 +361,21 @@ still parses:
 Reason: C6 showed a `done` job with 7 check errors and a connect-refused crawl
 rendered as "Done" and nothing else. The words of D4 and D9 need these fields.
 
+**Amendment (2026-11-02, PR 1 panel).** The Kit bounds every core string at
+decode, mirroring the TUI's `bound_status` (Constraints, hostile-core bounds):
+`ScanWire.boundedString(_ key: String, max: Int) throws -> String?` drops the
+Unicode scalars whose general category is control, format, line separator or
+paragraph separator, then cuts to `max` characters. `profile_name` is cut to
+64; `error`, each `ScanCheckErrorSample` field (`check`, `point`, `detail`),
+`clamped[].field`, `lanes.skipped[].reason` and each `checks.running[]` to
+400; each `targets[]` to 200; the lists `error_samples`, `skipped_samples`,
+`checks.running` and `targets` keep their first 8 (the engine's own cap; how
+many were dropped is not recorded in PR 1). The escape hatches
+`ScanCrawlErrorKind.unknown(raw)`, `ScanStoppedReason.other(raw)`,
+`ScanJobState.other(raw)` and `ScanPhase.other(raw)` clean and cut the raw
+token to 64 in `init?(rawValue:)`, so no view can print an unbounded token.
+AC1b pins it.
+
 #### D2. One truth per job: the merged facts, the re-read rule, cancel gating (F1, C1, C2)
 
 **The merged view.** `ScanSurface.swift` gains a pure value the row and the
@@ -423,6 +439,15 @@ and the context-menu item are hidden for cancelling and terminal rows. The
 `scan.cancel` reply (`cancelling`) is still applied through `applyStatus` so
 the switch is immediate; the poll then carries the job to `cancelled`.
 
+**Amendment (2026-11-02, PR 1 panel).** A cancel in flight counts as
+cancelling. `ScanPanelState` keeps a `cancelsInFlight: Set<String>` of the
+jobs whose `scan.cancel` has been sent and not yet answered; `cancel(job:)`
+sends nothing while a cancel for that job is in flight (two presses within
+one round trip send one `scan.cancel`, AC7), and `cancelInFlight(_ job:)
+-> Bool` is exposed for the view, whose header verb reads `Cancelling…`
+disabled from the press, not from the reply. The `cancelling` reply then
+keeps the header in that state through `applyStatus` as before.
+
 #### D3. Selection follows the list (F3, C8)
 
 `ScanSurfaceModel.applyList` ends with: if `selectedJob == nil` and `jobs` is
@@ -449,6 +474,8 @@ public enum ScanEndText {
     public static func crawlTrouble(_ crawl: ScanCrawlCounters) -> String?
     /// The words for a `crawl.last_error` token.
     public static func crawlErrorWords(_ kind: ScanCrawlErrorKind) -> String
+    /// `crawlTrouble` joined with " — " + `crawlErrorWords(lastError)` when `last_error` is present; nil when crawl.errors == 0.
+    public static func crawlTroubleLine(_ crawl: ScanCrawlCounters) -> String?
     /// "stopped_reason: errors" — the raw token, for the data-face line.
     public static func rawReasonLine(_ reason: ScanStoppedReason) -> String
 }
@@ -477,12 +504,40 @@ separators (D11):
 | raw line | `stopped_reason: errors` · `crawl.last_error: connect_refused` |
 
 In PR 1 the existing *Stopped* section renders `stoppedReason(...)` as its
-text (UI md, `Tok.Ink.secondary`), then `crawlTrouble` + " — " +
-`crawlErrorWords` when the crawl had errors, then the error verbatim in
+text (UI md, `Tok.Ink.secondary`), then `crawlTroubleLine` when the crawl
+had errors, then the error verbatim in
 `Tok.Status.serverError`, and last the raw lines in the data face at
 `Tok.Typography.Size.xs`, `Tok.Ink.tertiary`, selectable. The raw token never
 appears anywhere else (glossary rule; coordinator ruling 3). Singulars:
 `1 page`, `1 error`, `1 check`, `1 point` via `ScanFormat.plural`.
+
+**Amendment (2026-11-02, PR 1 panel).** Three facts the panel pinned down:
+
+- *The suffix follows the engine.* Today's engine sets `crawl.last_error`
+  only when the crawl made at least one request and every one failed
+  (`errors > 0 && pages == 0`, `crates/aitm-scan-model/src/job.rs`), so a
+  crawl that fetched a page never carries it. That is an engine gap, logged
+  as scanner amendment 89 for T1b's follow-up: the engine will set
+  `crawl.last_error` to the latest closed token whenever `crawl.errors > 0`.
+  The UI rule is the same on either core: the crawl-error count sentence
+  (`crawlTrouble`) always shows when `errors > 0`, and the ` — <last_error
+  words>` suffix shows only when the engine provides `last_error`. The
+  dead-target job of today's live proof fetched 1 page, so its line is `The
+  crawl fetched 1 page and hit 1 error` with no suffix; the suffix form,
+  `The crawl fetched 0 pages and hit 1 error — the target refused the
+  connection`, is the shape it takes and lands with amendment 89 (engine);
+  it is not proven on today's core and is not a PR 1 acceptance.
+  `ScanEndText.crawlTroubleLine(_:)` is the joined line the views render
+  (PR 1's Stopped section, PR 2's attention list); no view spells the
+  ` — ` join itself.
+- *`sentence` needs a terminal status.* `ScanEndText.sentence` is nil unless
+  the stored status is itself terminal: during the one-beat gap in which the
+  list says terminal and the stored status is still live (plan gap 8), a
+  stale non-terminal status yields nil rather than the live read's numbers.
+- *The Stopped section is a terminal-job section.* In PR 1 it shows only
+  for a job whose merged state is terminal and that has a stopped reason, an
+  error, or crawl errors; a live job with crawl errors shows nothing there
+  (PR 2's attention lines, D9, cover live jobs).
 
 #### D5. Rows are accessibility elements (F4, C10)
 
@@ -504,29 +559,34 @@ dump, not the modifier **(Architect's call on the first mechanism)**.
 - `jobsLoadedAt: Int?` (epoch ms), set by `applyList(_:now:)` from its new
   `now` parameter; `ScanPanelState.refreshList` passes the wall clock in
   epoch milliseconds, tests pass a literal.
-- `listFailedAt: Int?`, set by `ScanPanelState.refreshList`'s failure path
-  (new `noteListFailure(now:)`), cleared by `applyList`. A failed *cancel* or
-  *status* read still sets `jobsError` but not `listFailedAt`.
+- `readFailure: ScanReadFailure?`, the one stored failure fact
+  (`public struct ScanReadFailure: Equatable, Sendable { public var text: String; public var at: Int }`,
+  a struct so `Equatable`/`Sendable` are synthesised), set by
+  `noteReadFailure(text:now:)` from the list, status and cancel failure
+  paths of `ScanPanelState`, cleared by `applyList`. `jobsError` is a
+  computed alias of `readFailure?.text` and `readFailedAt` is computed from
+  `readFailure?.at`; neither is stored.
 
 ```swift
 public struct ScanJobsLink: Equatable, Sendable {
     public enum Kind: Equatable, Sendable { case live, reconnecting, disconnected, unanswered }
     public var kind: Kind
-    public var valuesAgeMs: Int?      // now - jobsLoadedAt, nil before the first list
+    public var valuesAgeMs: Int?      // max(0, now - jobsLoadedAt), nil before the first list
     public var bannerText: String?    // nil while live (D16 renders it)
     public var verbsEnabled: Bool     // kind == .live
-    public static func make(bus: BusState, listFailedAt: Int?, jobsLoadedAt: Int?, now: Int) -> ScanJobsLink
+    public static func make(bus: BusState, readFailedAt: Int?, jobsLoadedAt: Int?, now: Int) -> ScanJobsLink
 }
 ```
 
 Rules: `bus` is `.connecting` → `.reconnecting`; `.disconnected` or
-`.failed` → `.disconnected`; `.connected` with `listFailedAt != nil` →
+`.failed` → `.disconnected`; `.connected` with `readFailedAt != nil` →
 `.unanswered`; else `.live`. `ScanPanelState.link` computes it from
 `session.bus` each render. In PR 1 the gate alone ships: Cancel Scan, the
 hover Cancel and the context-menu Cancel are disabled while
 `!link.verbsEnabled`; the existing inline list error keeps its text and gains
 the last-good clause: `Unable to list jobs: <core text>. Showing values from
-0:42 ago; retrying every 2 s.` (`ScanFormat.listErrorText(core:ageMs:)`).
+0:42 ago; retrying every 2 s.` (`ScanSurfaceModel.inlineJobsError(ageMs:)`,
+the views' one entry point; the age clause is internal to the Kit).
 `BusState` already lives in the Kit (`ConnectionSummary.swift`), so the
 function is unit-testable.
 
@@ -534,22 +594,44 @@ Reason: C12 showed Cancel enabled against a frozen core for 30 s with no
 word about the values' age.
 
 **Amendment (2026-11-02, from the PR 1 live proof).** The Jobs poll is
-sequential and reads the selected job's `scan.status` before `scan.list`, so
-against a frozen core the *status* read times out first (at ~30 s the inline
-error read `Unable to read job scan-…: the bus did not reply in time`) and
-the list read has not even been attempted; with `.unanswered` tied to the
-list alone, Cancel stayed enabled. So: **any failed Jobs read** (list,
-status, cancel) marks the link. `listFailedAt` is renamed `readFailedAt`,
-`listFailureCore` becomes `readFailure: (text: String, core: String)?`
-recording the failed read's own wording (`Unable to list jobs: …` /
-`Unable to read job <id>: …` / `Unable to cancel job <id>: …`) and the core
-text; `noteReadFailure(text:core:now:)` replaces `noteListFailure`;
-`applyList` clears both (a list that lands is the proof the core answers).
-`inlineJobsError(ageMs:)` returns `<text>. Showing values from 0:42 ago;
-retrying every 2 s.` for whichever read failed (the list beat is what brings
-the values back), else `jobsError`. `ScanJobsLink.make(bus:readFailedAt:…)`
+sequential, so against a frozen core whichever read the freeze lands on
+times out first (in the proof the selected job's *status* read: at ~30 s the
+inline error read `Unable to read job scan-…: the bus did not reply in time`)
+while the list read has not even been attempted; with `.unanswered` tied to
+the list alone, Cancel stayed enabled. So: **any failed Jobs read** (list,
+status, cancel) marks the link. `listFailedAt` is renamed `readFailedAt`, and
+`readFailure: ScanReadFailure?` records the failed read's own wording
+(`Unable to list jobs: …` / `Unable to read job <id>: …` / `Unable to cancel
+job <id>: …`) with its time; `noteReadFailure(text:now:)` replaces
+`noteListFailure`; `applyList` clears it (a list that lands is the proof the
+core answers). `inlineJobsError(ageMs:)` returns `<text>. Showing values from
+0:42 ago; retrying every 2 s.` for whichever read failed (the list beat is
+what brings the values back), else nil. `ScanJobsLink.make(bus:readFailedAt:…)`
 keeps its kind rules with the renamed input. AC12's live literal therefore
 starts with whichever read failed first.
+
+**Amendment (2026-11-02, PR 1 panel).** The shipped shape, which the
+paragraphs above now use: one stored failure record,
+`readFailure: ScanReadFailure?` (`ScanReadFailure { text: String; at: Int }`,
+a struct, not a tuple, so `Equatable`/`Sendable` are synthesised; no `core`
+field, it had no consumer); `jobsError` is a computed alias of
+`readFailure?.text` and `readFailedAt` of `readFailure?.at`, so the three can
+never disagree. `noteReadFailure(text:now:)` is called by the list, status
+and cancel failure paths; `applyList` clears the record; a successful status
+read clears nothing (a status answering is not proof the list answers).
+`inlineJobsError(ageMs:)` is the one entry point the views read
+(`readFailure.map { $0.text + <age clause> }`); the age clause is internal
+to the Kit and there is no `ScanFormat.listErrorText`. Which read fails first
+against a frozen core depends on where the freeze lands in the tick: on a
+tick the list beat precedes the status beat, so the inline text starts with
+whichever read failed first (`Unable to list jobs: …` or `Unable to read job
+<id>: …`). The age clock is an independent 1 s task on `ScanPanelState`
+(`clockTask`, started and cancelled with `poll()`), not the poll tick: the
+poll loop is sequential and a read hung for the client's 30 s timeout must
+not stall the clause (the proof read `from 0:02 ago` over values 36 s old).
+D16 still holds: no view owns a timer; `nowMs` is the state's. `valuesAgeMs`
+is clamped at 0 (`max(0, now - jobsLoadedAt)`: two stamps of the wall clock
+within one tick can otherwise read negative for a beat).
 
 #### D7. What PR 1 does not touch
 
@@ -557,6 +639,12 @@ PR 1 keeps `ScanJobRow`'s two lines and severity bar, the detail's sections,
 the probe rule and every existing string except the *Stopped* section's. It
 adds no motion, no new layout and no Scan Again. It is reviewable as a
 behaviour fix plus a decoder extension, and it is the base PR 2 is cut from.
+
+**Amendment (2026-11-02, PR 1 panel).** The Cancel help text stays PR 1's
+words, `Stop this job; its issues stay (⌥⌘.)`, now one Kit constant
+(`ScanFormat.cancelHelpText`); the hover-help wording of the UX section is
+PR 2's (D11). The Stopped section shows only for a terminal job (D4
+amendment); a live job with crawl errors shows nothing there in PR 1.
 
 ### Part B: PR 2, the redesign (mac)
 
@@ -626,9 +714,11 @@ public enum ScanEndText {
 
 `attention` returns, in this order and only when non-zero: `<n> checks could
 not run` with `errorSamples`; `<n> checks were skipped` with
-`skippedSamples`; the crawl trouble sentence with no samples, shown as
-`The crawl fetched 1 page and hit 1 error — the target refused the connection`
-when `lastError` is set. `notices` is today's `clampedLines` plus
+`skippedSamples`; the crawl trouble line (`crawlTroubleLine`, D4) with no
+samples, shown as `The crawl fetched 0 pages and hit 1 error — the target
+refused the connection` when `lastError` is set (today's engine sets it only
+when the crawl fetched no page; scanner amendment 89 widens it, D4
+amendment). `notices` is today's `clampedLines` plus
 `skippedLaneText` rows, under one **Notices** title. Both render in every
 state (a running job with check errors already shows them).
 
@@ -889,8 +979,8 @@ inline banner (`ScanInlineError`'s shape, but in `Tok.Ink.secondary` on
 | `.unanswered` | `The core is not answering · showing values from 0:42 ago · retrying every 2 s` |
 
 The age clause is `ScanFormat.elapsed(ms: valuesAgeMs)` and is omitted while
-`jobsLoadedAt` is nil. The `now` that drives it is the poll tick's clock
-(the view has no timer). Rows keep their last values; the hover Cancel is
+`jobsLoadedAt` is nil. The `now` that drives it is `ScanPanelState.nowMs`,
+the state's 1 s clock task (D6 amendment; the view has no timer). Rows keep their last values; the hover Cancel is
 hidden; the header's verb slot, Scan Again and the context-menu Cancel are
 disabled (D6). The inline list error (D11) keeps rendering when
 `jobsError != nil`, under the banner.
@@ -900,7 +990,7 @@ disabled (D6). The inline list error (D11) keeps rendering when
 The detail re-renders when `facts(for:)` changes: once per status beat (1 s)
 for a live selected job, once per list beat (2 s) for the rows. No view owns
 a `Timer`; the banner age and the subtitle's elapsed come from the facts and
-the poll tick's `now`. `ScanJobProgress` and `ScanEndText` are value
+the state's 1 s clock (`nowMs`, D6 amendment). `ScanJobProgress` and `ScanEndText` are value
 computations on a struct with at most a few hundred bytes; the builder does
 not memoise them.
 
@@ -1097,6 +1187,13 @@ row it closes.
    `checks.skipped == 3`, `checks.skippedSamples[0].check == "fake.point"`;
    the fixture pack's `scan.status.json` (no such keys) gives `0`, `[]`,
    `0`, `[]`.
+1b. **AC1b (P1, D1 amendment; unit).** A `scan.status` object whose
+   `checks.error_samples[0].detail` is 1,000 characters containing U+202E
+   and `\n` decodes to a `detail` of exactly 400 characters with neither
+   scalar present; `error_samples` of nine objects decodes to
+   `errorSamples.count == 8`; a `crawl.last_error` of 200 characters
+   containing a control character decodes to `.unknown(raw)` whose
+   `rawValue` is 64 clean characters.
 2. **AC2 (P1, D1, C6; unit).** `crawl: {"pages":1,"queued":0,"depth":0,"forms_submitted":0,"errors":1,"forms_skipped":2,"last_error":"connect_refused"}`
    decodes to `errors == 1`, `formsSkipped == 2`, `lastError == .connectRefused`;
    `"last_error":"weird"` decodes to `.unknown("weird")` whose `rawValue` is
@@ -1112,7 +1209,9 @@ row it closes.
    `elapsedMs == 66_000`; `make(summary: running/70_000, status:
    cancelled/69_500)` yields `.cancelled` (terminal wins).
 5. **AC5 (P1, D2, C1; live).** Start `standard`, select it, press Cancel
-   Scan: within 1 s the header reads `Cancelling…` (button disabled); within
+   Scan: within 1 s the header reads `Cancelling…` (button disabled; the
+   frame comes from a frame loop started before the press and is shot within
+   1 s of it); within
    5 s both the row and the header read `Cancelled`, the button is gone,
    `Running: <id>` is absent, and the frame taken 60 s later is identical in
    those fields. A concurrent `scan.status` read shows `state: cancelled`.
@@ -1122,8 +1221,10 @@ row it closes.
    checks.scheduled`, non-zero), and Cancel Scan is not shown.
 7. **AC7 (P1, D2; unit + live).** With the merged state `.cancelling`,
    `ScanPanelState.cancelTarget == nil` and `cancel(job:)` sends nothing
-   (the command recorder logs no second `scan.cancel`); live: pressing ⌥⌘.
-   twice within a second produces one `scan.cancel` in the core's audit log.
+   (the command recorder logs no second `scan.cancel`); live: the proof
+   sends ⌥⌘. twice within a second through a key tool (two real key events,
+   not an AX press of a button that may already be gone) and the core's
+   audit log shows exactly one `scan.cancel`.
 8. **AC8 (P1, D3, C8; unit + live).** `applyList` on an empty model with two
    jobs selects `jobs[0].job`; `applyList` with `selectedJob = "scan-aaaa"`
    still listed keeps it. Live: with nothing selected, a `scan.start` sent by another bus
@@ -1144,28 +1245,41 @@ row it closes.
    `(.unknown("x")) == "the connection failed"`.
 10. **AC10 (P1, D4, C6; live).** The dead-target job's detail *Stopped*
     section reads `Stopped early: too many errors from the target.`, then
-    `The crawl fetched 1 page and hit 1 error — the target refused the
-    connection`, then a data-face line `stopped_reason: errors`; the token
-    `errors` appears nowhere else in the pane (AX dump grep).
+    `The crawl fetched 1 page and hit 1 error` (no ` — ` suffix: the job
+    fetched 1 page, so today's engine sets no `crawl.last_error`, D4
+    amendment), then a data-face line `stopped_reason: errors`; the token
+    `errors` appears nowhere else in the pane (AX dump grep). The suffix
+    form `The crawl fetched 0 pages and hit 1 error — the target refused
+    the connection` lands with amendment 89 (engine); it is not proven on
+    today's core and is not a PR 1 acceptance. Its shape is pinned at unit
+    level: `crawlTroubleLine(pages 0, errors 1, lastError .connectRefused)
+    == "The crawl fetched 0 pages and hit 1 error — the target refused the
+    connection"`, `crawlTroubleLine(pages 1, errors 1, lastError nil) ==
+    "The crawl fetched 1 page and hit 1 error"`, `crawlTroubleLine(errors 0)
+    == nil`.
 11. **AC11 (P1, D5, C10; live).** `tools/axdump.swift` on the real window
     with three jobs lists exactly three row elements under the `Jobs`
     container, each with the label `ScanFormat.jobAccessibilityLabel`
     produces (starts with the state or phase word), role button, and the
-    selected one carrying the selected attribute.
+    selected one carrying the selected attribute (`AXSelected` true in the
+    dump, which prints `AXSelected`/`AXFocused` per row; the others false).
 12. **AC12 (P1, D6, C12; unit + live).** `ScanJobsLink.make(bus:
-    .connecting("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)`
+    .connecting("…"), readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)`
     gives `kind == .reconnecting`, `valuesAgeMs == 42_000`, `verbsEnabled ==
-    false`; `(.connected("…"), listFailedAt: 5_000, …)` gives `.unanswered`;
+    false`; `(.connected("…"), readFailedAt: 5_000, …)` gives `.unanswered`;
     `(.connected, nil, …)` gives `.live`, `verbsEnabled == true`;
     `(.disconnected, …, jobsLoadedAt: nil)` gives `valuesAgeMs == nil`.
     Live: `kill -STOP` the core with a running job selected; at 35 s the
     inline error reads `Unable to read job <id>: <core text>. Showing values
-    from 0:3x ago; retrying every 2 s.` (the status read times out first;
-    with a terminal job selected it is `Unable to list jobs: …`, D6
-    amendment), Cancel Scan is disabled and the hover Cancel hidden, the
-    rows keep their values; after `kill -CONT` the error clears within 5 s
-    of the next list and Cancel Scan is enabled. The `ScanJobsLink.make`
-    unit cases use the renamed `readFailedAt:` input.
+    from 0:3x ago; retrying every 2 s.` or `Unable to list jobs: …` with the
+    same clause (which read fails first depends on where the freeze lands in
+    the tick, D6 amendment; the proof asserts the inline text literal, and
+    the age in the clause advances between a 10 s and a 35 s frame), Cancel
+    Scan is disabled and the hover Cancel hidden, the rows keep their
+    values; after `kill -CONT` the error clears within 5 s of the next list
+    and Cancel Scan is enabled. The `ScanJobsLink.make` unit cases use
+    `readFailedAt:`; `valuesAgeMs` is clamped at 0 (`jobsLoadedAt` later
+    than `now` gives `0`, never a negative).
 
 ### PR 2 (mac, redesign)
 
@@ -1196,15 +1310,20 @@ row it closes.
     for `running` is `nil`. `attention` for `checks.errors 7` with one
     sample gives `[("7 checks could not run", 1 sample)]`; `checks.errors
     1` gives `"1 check could not run"`; `checks.skipped 3` gives `"3 checks
-    were skipped"`; `crawl.errors 1, lastError .connectRefused` gives `"The
-    crawl fetched 1 page and hit 1 error — the target refused the
-    connection"` with no samples; all zero gives `[]`.
+    were skipped"`; `crawl.pages 0, errors 1, lastError .connectRefused`
+    gives `"The crawl fetched 0 pages and hit 1 error — the target refused
+    the connection"` with no samples (`crawlTroubleLine`, D4 amendment);
+    `crawl.pages 1, errors 1, lastError nil` gives `"The crawl fetched 1
+    page and hit 1 error"`; all zero gives `[]`.
 16. **AC16 (P2, D9, D11; live).** The dead-target job's inspector shows the
     end-state card with `Done in 0:3x · 0 points · <n> checks.`, beneath it
     `Stopped early: too many errors from the target.`, then the attention
     disclosure `7 checks could not run` which opens to rows whose first
     detail is `Connection refused (os error 61)`, then `The crawl fetched 1
-    page and hit 1 error — the target refused the connection`; the raw line
+    page and hit 1 error` (no suffix on today's core: the job fetched a
+    page, so the engine sets no `last_error`; the suffix form `… — the
+    target refused the connection` lands with amendment 89 (engine) and is
+    not a PR 2 acceptance on today's core, D4 amendment); the raw line
     `stopped_reason: errors` is the only place the token appears.
 17. **AC17 (P2, D10, C4, C5; unit).** `jobRowLine1(summary running/auditing,
     status profile "standard") == "Auditing · standard"`; `jobRowLine1(done,
