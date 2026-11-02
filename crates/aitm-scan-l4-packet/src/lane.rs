@@ -16,6 +16,7 @@
 //! out verbatim.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use aitm_proto_l4::backend::pcap::PcapBackend;
@@ -24,12 +25,14 @@ use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore};
 use aitm_proto_l4::guard::L4Guard;
 use aitm_scan_model::{
     Check, Discovery, InsertionPoint, JobCtx, L4Counters, Lane, LaneKind, ProbeHost, ProfileTarget,
+    ScanProfile,
 };
 use anyhow::anyhow;
 use futures::future::BoxFuture;
 
 use crate::checks::checks;
-use crate::discover::discover_all;
+use crate::discover::{discover_all, ip_version};
+use crate::fields::validate_fields;
 use crate::host::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
 use crate::plan::{parse_point_id, requested_fields, target_key};
 use crate::state::{JobKey, JobStats, LaneState};
@@ -326,6 +329,55 @@ impl Lane for PacketLane {
     fn checks(&self) -> Vec<Arc<dyn Check>> {
         self.checks.clone()
     }
+
+    /// Refuse, before the job is spawned, a profile whose `L4Options.fields`
+    /// names a field this lane cannot fuzz (AC T5-3, spec D8.4).
+    ///
+    /// Every declared target is checked with the same [`validate_fields`] the
+    /// run itself uses, so a pinned path (`ipv4.src`, `dst`, `interface`,
+    /// `ether.src` ...), an unknown path, or a path that does not apply to the
+    /// target's IP version and transport is named by `scan.start` rather than
+    /// by a job the caller already believes started. `discover` keeps its own
+    /// identical check as the second line of defence: a lane can be driven
+    /// without the engine in front of it.
+    ///
+    /// Only the field list is decided here. Scope, privilege and seeds all need
+    /// the guard and the wire, so they stay with discovery — and a handle-less
+    /// lane validates rather than refusing, so `scan.start` still reports
+    /// `refused_l4` (call A18) instead of `invalid_profile`.
+    ///
+    /// # Errors
+    ///
+    /// The first offending path's message, *bare*: the engine renders it as
+    /// `scan: invalid_profile: <message>` (`aitm_scan_model::scan_error`), so
+    /// the code [`validate_fields`] prefixes is stripped once here, exactly as
+    /// `discover` strips it before `DiscoverError`'s `Display` re-adds it. The
+    /// sentence after the code is the same on both paths.
+    fn validate(&self, target: &ProfileTarget, profile: &ScanProfile) -> Result<(), String> {
+        // The same substitution discovery makes: the profile's own list wins,
+        // and an empty one falls back to this lane's default list (empty in
+        // production, which `validate_fields` reads as the target's default
+        // table and always accepts).
+        let mut requested = requested_fields(profile);
+        if requested.is_empty() {
+            requested.clone_from(&self.default_fields);
+        }
+        for spec in &target.l4 {
+            // A target whose address does not parse has no IP version to check
+            // a path against; `resolve_target` refuses it at discovery with its
+            // own `invalid_profile` message naming the address.
+            let Ok(ip) = spec.ip.parse::<IpAddr>() else {
+                continue;
+            };
+            validate_fields(ip_version(ip), spec.proto, &requested).map_err(|message| {
+                message
+                    .strip_prefix("invalid_profile: ")
+                    .unwrap_or(&message)
+                    .to_string()
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Build the packet lane. Always `Some`: a landed lane with no handles refuses
@@ -358,8 +410,8 @@ mod tests {
     use super::PacketLane;
     use crate::host::Timing;
     use crate::testing::{
-        fields, l4_profile, loopback_guard, udp_target, with_hex_seed, MockBackend, MockReply,
-        TestJob,
+        fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
+        MockReply, TestJob,
     };
 
     /// The job id and marker every [`TestJob`] runs under.
@@ -882,6 +934,93 @@ mod tests {
             assert_eq!(ends.dst, Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
             assert_eq!(ends.dst_port, Some(53));
         }
+    }
+
+    /// A UDP target on `[::1]:port`, for the IPv6 half of the field checks.
+    fn v6_target(port: u16) -> aitm_scan_model::L4TargetSpec {
+        aitm_scan_model::L4TargetSpec {
+            ip: "::1".to_string(),
+            port,
+            proto: aitm_scan_model::L4Transport::Udp,
+            grammar: None,
+        }
+    }
+
+    /// AC T5-3 / spec D8.4: a profile naming a pinned field is refused by
+    /// `Lane::validate`, synchronously, before the engine spawns the job
+    /// (`crates/aitm-plugin-scanner/src/jobs.rs` wraps the `Err` into
+    /// `scan: invalid_profile: <message>`), so the message carries no code of
+    /// its own.
+    #[test]
+    fn validate_refuses_a_pinned_field_synchronously() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["ipv4.src"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv4.src" is pinned and cannot be fuzzed"#.to_string())
+        );
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["dst"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "dst" is pinned and cannot be fuzzed"#.to_string())
+        );
+
+        let mut profile = l4_profile(vec![v6_target(53)], 10);
+        profile.l4.fields = fields(&["ipv6.src"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "ipv6.src" is pinned and cannot be fuzzed"#.to_string())
+        );
+    }
+
+    /// A path the lane does not know is refused the same way, and named.
+    #[test]
+    fn validate_refuses_an_unknown_path() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["udp.nope"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"unknown field path "udp.nope""#.to_string())
+        );
+    }
+
+    /// A fuzzable path and the empty list (the target's default table) both
+    /// pass, so `validate` refuses nothing a run would accept.
+    #[test]
+    fn validate_accepts_raw_and_the_empty_default() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.fields = fields(&["raw"]);
+        assert_eq!(lane.validate(&profile.target, &profile), Ok(()));
+
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        assert!(profile.l4.fields.is_empty());
+        assert_eq!(lane.validate(&profile.target, &profile), Ok(()));
+
+        // A profile with no L4 target at all is this lane's `Ok` too: the
+        // engine's own rule refuses that case (jobs.rs), not the lane.
+        let mut empty = l4_profile(vec![], 10);
+        empty.l4.fields = fields(&["ipv4.src"]);
+        assert_eq!(lane.validate(&empty.target, &empty), Ok(()));
+    }
+
+    /// Every declared target is checked, not just the first: `tcp.flags` is a
+    /// field on the TCP target and absent from the UDP one.
+    #[test]
+    fn validate_checks_every_l4_target() {
+        let lane = lane_with(MockBackend::new(MockReply::Echo), &[]);
+        let mut profile = l4_profile(vec![tcp_target(9), udp_target(53)], 10);
+        profile.l4.fields = fields(&["tcp.flags"]);
+        assert_eq!(
+            lane.validate(&profile.target, &profile),
+            Err(r#"field path "tcp.flags" does not apply to a ipv4/udp target"#.to_string())
+        );
     }
 
     /// Tester (stage 5): `with_timing` on a handle-less lane keeps refusing,
