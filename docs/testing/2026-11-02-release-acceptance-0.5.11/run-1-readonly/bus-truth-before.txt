@@ -1,0 +1,473 @@
+embedded core config: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/F0DDC695-30D7-482B-A9E6-D94FEFA9D4C9/config.yaml
+bus: 127.0.0.1:53156
+role: ?
+
+== scope.list
+[
+ "example.com:443",
+ "www.apple.com:443",
+ "httpbin.org:443"
+]
+
+== proxy.status
+{
+ "address": "127.0.0.1:8080",
+ "capturing": true,
+ "decrypt": {
+  "advice": null,
+  "decrypting": true,
+  "scope_hosts": 3
+ },
+ "flows": 14,
+ "intercept_armed": false,
+ "listening": true,
+ "paused": 0,
+ "system_proxy": {
+  "detail": "HTTP and HTTPS off",
+  "host": null,
+  "managed_by_us": false,
+  "port": null,
+  "setting": false,
+  "state": "off",
+  "supported": true
+ },
+ "version": "0.5.11"
+}
+
+== capture.status
+{
+ "capability": "capturing",
+ "capability_reason": null,
+ "enabled": true,
+ "feeder": {
+  "reason": null,
+  "state": "listening"
+ },
+ "flows_handed_off": {
+  "tcp": 5,
+  "udp": 0
+ },
+ "last_handoff_at": 1793585818221,
+ "provider": {
+  "attached_at": 1793585450470,
+  "state": "attached",
+  "team_id": "995PCLM9KH"
+ },
+ "scope_entries": 3,
+ "scope_tokens": [
+  "example.com:443",
+  "www.apple.com:443",
+  "httpbin.org:443"
+ ]
+}
+
+== proxy.system.status
+{
+ "bypass_default": [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "*.local",
+  "169.254/16"
+ ],
+ "detail": "HTTP and HTTPS off",
+ "effective": {
+  "bypass": [
+   "*.local",
+   "169.254/16"
+  ],
+  "http": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  },
+  "https": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  }
+ },
+ "guidance": null,
+ "last_change_ms": null,
+ "managed_by_us": false,
+ "mechanism": "networksetup",
+ "ours": {
+  "host": "127.0.0.1",
+  "port": 8080
+ },
+ "remedy": null,
+ "services": [
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Display Ethernet"
+  },
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Wi-Fi"
+  }
+ ],
+ "setting": false,
+ "state": "off",
+ "state_file": "/Users/matt/Library/Application Support/aitmproxy/system-proxy-state.json",
+ "supported": true,
+ "watchdog_pid": null
+}
+
+== flow.table
+{
+ "count": 14,
+ "last": [
+  {
+   "authority": "example.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 82,
+   "id": "b10d1db1-51bc-4a4f-96f8-2d024b2253f4",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "com.apple.curl",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "decrypted",
+   "tunnel_reason": null
+  },
+  {
+   "authority": "example.com",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 49,
+   "id": "ced07c3e-eff1-49b0-9ca3-6a323ff2c505",
+   "kind": "http",
+   "marks": [
+    "missing-csp",
+    "clickjacking-exposed",
+    "missing-hsts",
+    "missing-nosniff",
+    "missing-permissions-policy",
+    "missing-referrer-policy"
+   ],
+   "method": "GET",
+   "passive": false,
+   "path": "/",
+   "source_app": "com.apple.curl",
+   "state": "observed",
+   "status": 200,
+   "tunnel": null,
+   "tunnel_reason": null
+  },
+  {
+   "authority": "example.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 89,
+   "id": "a0427249-f348-4630-8ae2-80cb55fc947e",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "com.apple.curl",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "decrypted",
+   "tunnel_reason": null
+  },
+  {
+   "authority": "example.com",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 12,
+   "id": "b300ea6c-5004-4e5b-bcfe-36ae80abbf56",
+   "kind": "http",
+   "marks": [
+    "missing-csp",
+    "clickjacking-exposed",
+    "missing-hsts",
+    "missing-nosniff",
+    "missing-permissions-policy",
+    "missing-referrer-policy"
+   ],
+   "method": "GET",
+   "passive": false,
+   "path": "/",
+   "source_app": "com.apple.curl",
+   "state": "observed",
+   "status": 200,
+   "tunnel": null,
+   "tunnel_reason": null
+  },
+  {
+   "authority": "httpbin.org:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 30662,
+   "id": "5f761f5a-6957-4f99-8ef1-8ac84b816a7f",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": "com.apple.Safari",
+   "state": "observed",
+   "status": 200,
+   "tunnel": "decrypted",
+   "tunnel_reason": null
+  },
+  {
+   "authority": "httpbin.org",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 156,
+   "id": "46cb8c9c-0c6d-4ede-bec2-25138d0d2d63",
+   "kind": "http",
+   "marks": [
+    "cors-wildcard",
+    "missing-hsts"
+   ],
+   "method": "GET",
+   "passive": false,
+   "path": "/get?safari=1793585817",
+   "source_app": "com.apple.Safari",
+   "state": "observed",
+   "status": 200,
+   "tunnel": null,
+   "tunnel_reason": null
+  },
+  {
+   "authority": "httpbin.org",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": "macos-ne",
+   "duration_ms": 135,
+   "id": "5a61fc14-7080-4dea-9f12-0ab2e695bd44",
+   "kind": "http",
+   "marks": [
+    "cors-wildcard",
+    "missing-csp",
+    "clickjacking-exposed",
+    "missing-hsts",
+    "missing-permissions-policy",
+    "missing-referrer-policy"
+   ],
+   "method": "GET",
+   "passive": false,
+   "path": "/favicon.ico",
+   "source_app": "com.apple.Safari",
+   "state": "observed",
+   "status": 404,
+   "tunnel": null,
+   "tunnel_reason": null
+  },
+  {
+   "authority": "httpbin.org:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": null,
+   "duration_ms": 220,
+   "id": "d7c3314e-fa2d-4523-88cb-940c45a3295b",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": null,
+   "tunnel": "failed",
+   "tunnel_reason": "client_rejected_certificate"
+  },
+  {
+   "authority": "merino.services.mozilla.com:443",
+   "bytes_down": 7259,
+   "bytes_up": 2513,
+   "capture_interface": null,
+   "duration_ms": 171084,
+   "id": "6b9fd3c9-918d-4d30-8da2-c94cd2c8a319",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "ads.mozilla.org:443",
+   "bytes_down": 17885,
+   "bytes_up": 2672,
+   "capture_interface": null,
+   "duration_ms": 171086,
+   "id": "a1eeba46-0ead-45b2-beb2-a421bfc67a9d",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  }
+ ]
+}
+
+== ca.status
+{
+ "exists": true,
+ "fingerprint_sha1": "B2:D8:E7:80:FF:3A:B7:1F:71:F8:54:4A:1D:7A:8B:64:DD:C5:A4:85",
+ "stores": {
+  "system": {
+   "installed": "absent",
+   "location": "/Library/Keychains/System.keychain",
+   "trusted": "no"
+  },
+  "user": {
+   "installed": "present",
+   "location": "/Users/matt/Library/Keychains/login.keychain-db",
+   "trusted": "yes"
+  }
+ }
+}
+
+== agent.activity
+[
+ {
+  "args": "{\"id\":\"d464d5e2-72cd-49e9-910f-7b42dd7cecd9\"}",
+  "at": 1793586352996,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_bfa4965765def58d-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"50b48362-5ee6-4090-b7ec-8795e4e15b21\"}",
+  "at": 1793586352997,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_bfa4965765def58d-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"8a5b8770-c12a-4b13-a151-d8339939cc7a\"}",
+  "at": 1793586352997,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_bfa4965765def58d-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"d7c3314e-fa2d-4523-88cb-940c45a3295b\"}",
+  "at": 1793586352998,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_bfa4965765def58d-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793586353155,
+  "client_label": "aitm-e2e",
+  "command": "scope.list",
+  "connection_id": "conn_bfa4965765def58d-14",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793586353155,
+  "client_label": "aitm-e2e",
+  "command": "proxy.status",
+  "connection_id": "conn_bfa4965765def58d-14",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793586353155,
+  "client_label": "aitm-e2e",
+  "command": "capture.status",
+  "connection_id": "conn_bfa4965765def58d-14",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793586353450,
+  "client_label": "aitm-e2e",
+  "command": "proxy.system.status",
+  "connection_id": "conn_bfa4965765def58d-14",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793586353450,
+  "client_label": "aitm-e2e",
+  "command": "flow.table",
+  "connection_id": "conn_bfa4965765def58d-14",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793586353501,
+  "client_label": "aitm-e2e",
+  "command": "ca.status",
+  "connection_id": "conn_bfa4965765def58d-14",
+  "origin": "operator",
+  "result": "ok"
+ }
+]
+
+== durable audit tail (control stream)
+{"at":1793585543263,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_aea527a1184fe4c1-1","command":"proxy.pause","args":"{}","result":"ok"}
+{"at":1793585544300,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_aea527a1184fe4c1-1","command":"proxy.resume","args":"{}","result":"ok"}
+{"at":1793585545609,"marker":"start","pid":82297,"schema":1,"stream":"control","version":"0.5.11"}
+{"at":1793585547153,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_33bff54860740840-1","command":"proxy.pause","args":"{}","result":"ok"}
+{"at":1793585548170,"origin":"operator","client_label":"aitm-mac","connection_id":"conn_33bff54860740840-1","command":"proxy.resume","args":"{}","result":"ok"}
+{"at":1793585596800,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_bfa4965765def58d-3","command":"scope.add","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793585596801,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_bfa4965765def58d-3","command":"scope.add","args":"{\"host\":\"www.apple.com:443\"}","result":"ok"}
+{"at":1793585806928,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_bfa4965765def58d-9","command":"scope.add","args":"{\"host\":\"httpbin.org:443\"}","result":"ok"}

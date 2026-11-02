@@ -1,0 +1,12 @@
+CLI-0	SKIP	release run only; brew upgrade is Matt's		
+CLI-4	FAIL	a core runs on 8080 (aitm pid 16734) but the one-shot printed "listening": false, "version": "0.5.10" (its own in-process state)	running core: proxy.status.listening true	claude/cli-oneshot-live-core
+CLI-5	FAIL	exit 0, printed 'acceptance-cli5.invalid' but the running core's scope.list does not contain it (false success; nothing to remove)	scope.list []	claude/cli-oneshot-live-core
+N4-CLI	PASS	Error: cannot start: the proxy port 127.0.0.1:8080 is already in use.; 98 loader lines on stdout first		log noise: PR #271
+CLI-9	SKIP	status read (exit 0: "managed_by_us": false "state": "off" ); set/unset need Matt's yes (ACCEPT_YES=CLI-9)	proxy.system.status over the bus: {"bypass_default":["localhost","127.0.0.1","::1","*.local","169.254/16"],"detail":"HTTP and HTTPS off","effective":{"bypass":["*.local","169.254/16"],"http":{"enabled":false,"host":"","port":0},"https	
+CLI-10	FAIL	exit 0; the running core has 8 flow(s), the one-shot's output matches 0 of their ids: []	flow.table ids: 8	claude/cli-oneshot-live-core
+CLI-7	PASS	user installed=present trusted=yes (keychain has 1 aitmproxy cert); 98 loader lines before the JSON	ca.status over the bus agrees	log noise: PR #271
+CLI-1	SKIP	port 8080 held by aitm pid 16734; the no-core half needs 8080, 8081 and 8082 free		
+CLI-2	SKIP	port 8080 held by aitm pid 16734; the no-core half needs 8080, 8081 and 8082 free		
+CLI-3	SKIP	port 8080 held by aitm pid 16734; the no-core half needs 8080, 8081 and 8082 free		
+CLI-6	SKIP	port 8080 held by aitm pid 16734; the no-core half needs 8080, 8081 and 8082 free		
+CLI-8	SKIP	port 8080 held by aitm pid 16734; the no-core half needs 8080, 8081 and 8082 free		
