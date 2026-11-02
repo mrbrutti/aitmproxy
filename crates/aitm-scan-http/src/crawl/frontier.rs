@@ -937,4 +937,34 @@ mod tests {
             "CrawlReport { pages: 1, attempts: 0, forms_submitted: 0, forms_skipped: 0, clicks: 0, flows: 0, stopped_reason: Some(MaxPages), depth_reached: 3 }"
         );
     }
+
+    /// Tester (amendment 68): the text pass exists for a browser driver's
+    /// flattened error. Chrome's `net::ERR_CONNECTION_REFUSED` still reads
+    /// `connect_refused` after the reorder (the arm is `refused`, not the
+    /// sender's exact shapes), a certificate error reads `tls` even when the
+    /// same line names a refusal, and a reset reads `transport`.
+    #[test]
+    fn crawl_error_token_reads_a_browser_drivers_errors() {
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("net::ERR_CONNECTION_REFUSED")),
+            "connect_refused"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!(
+                "Page.navigate failed: net::ERR_CONNECTION_REFUSED at http://t:8080/"
+            )),
+            "connect_refused"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!(
+                "net::ERR_CERT_AUTHORITY_INVALID: the certificate was refused"
+            )),
+            "tls",
+            "a certificate failure that names a refusal is still `tls`"
+        );
+        assert_eq!(
+            crawl_error_token(&anyhow::anyhow!("net::ERR_CONNECTION_RESET")),
+            "transport"
+        );
+    }
 }

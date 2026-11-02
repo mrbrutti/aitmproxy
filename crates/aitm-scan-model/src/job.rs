@@ -538,6 +538,50 @@ mod tests {
         assert_eq!(MAX_CHECK_ERROR_SAMPLES, 8);
     }
 
+    /// Tester (amendment 69): `checks.skipped` and `checks.skipped_samples`
+    /// are additive — a record written before them, even one that already
+    /// carries amendment 58's fields, reads 0 / empty — a skip sample
+    /// round-trips by name, and it travels apart from `error_samples`
+    /// (call C6): a skip is never read back as an error.
+    #[test]
+    fn check_counters_skipped_fields_are_additive_and_apart_from_errors() {
+        let old: CheckCounters = serde_json::from_str(
+            r#"{"scheduled":4,"done":3,"running":[],"errors":1,
+                "error_samples":[{"check":"http.xss","point":"p1","detail":"runner missing"}]}"#,
+        )
+        .expect("a record without the skip fields parses");
+        assert_eq!(old.skipped, 0);
+        assert!(old.skipped_samples.is_empty());
+        assert_eq!(old.errors, 1, "the amendment-58 fields are untouched");
+        assert_eq!(old.error_samples.len(), 1);
+
+        let json = serde_json::to_value(CheckCounters {
+            skipped: 3,
+            skipped_samples: vec![CheckErrorSample {
+                check: "fake.point".into(),
+                point: "p1".into(),
+                detail: "the lane hosts nothing".into(),
+            }],
+            ..CheckCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["skipped"], 3);
+        assert_eq!(json["skipped_samples"][0]["check"], "fake.point");
+        assert_eq!(json["skipped_samples"][0]["point"], "p1");
+        assert_eq!(
+            json["skipped_samples"][0]["detail"],
+            "the lane hosts nothing"
+        );
+        assert_eq!(json["errors"], 0, "a skip is not an error");
+        assert_eq!(json["error_samples"], serde_json::json!([]));
+        assert_eq!(json["done"], 0, "a skip is not a finished run");
+
+        let back: CheckCounters = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back.skipped, 3);
+        assert_eq!(back.skipped_samples.len(), 1);
+        assert_eq!(back.skipped_samples[0].detail, "the lane hosts nothing");
+    }
+
     #[test]
     fn summary_is_the_status_minus_the_detail_fields() {
         let status = JobStatus {

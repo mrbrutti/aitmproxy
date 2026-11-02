@@ -1474,6 +1474,46 @@ mod tests {
             }
         }
 
+        /// Tester (amendment 68): the connect arm is the refused shapes the
+        /// OS and the sender print — `Connection refused (os error 61)`,
+        /// `ECONNREFUSED`, `connect refused` — and the TLS arm is read ahead
+        /// of all of them, so a handshake the peer refused is `tls`. A word
+        /// that merely starts with `connect` (`disconnected`) is `transport`.
+        #[test]
+        fn classify_reads_the_refused_shapes_after_tls_and_not_every_connect_word() {
+            for refused in [
+                "Connection refused (os error 61)",
+                "tcp connect to scan.test:80: ECONNREFUSED",
+                "connect refused by scan.test:80",
+            ] {
+                assert_eq!(
+                    classify(&anyhow::anyhow!(refused)),
+                    CrawlErrorKind::ConnectRefused,
+                    "{refused:?} is a refused connection"
+                );
+            }
+            assert_eq!(
+                classify(&anyhow::anyhow!(
+                    "the peer refused the TLS handshake: connection refused"
+                )),
+                CrawlErrorKind::Tls,
+                "TLS is tested before the refused shapes"
+            );
+            assert_eq!(
+                classify(&anyhow::anyhow!("the peer disconnected")),
+                CrawlErrorKind::Transport,
+                "`disconnected` carries `connect` and is not a refusal"
+            );
+            assert_eq!(
+                classify(
+                    &anyhow::anyhow!("connection refused")
+                        .context("error connecting to scan.test:443: tls handshake failed")
+                ),
+                CrawlErrorKind::Tls,
+                "the whole chain is read and TLS still leads"
+            );
+        }
+
         /// Amendment 39: every failed client-crawl request is counted in
         /// `failed` and classified, and `last_error` names the most recent
         /// cause. An all-failing crawl fetches no page; a crawl that lost one

@@ -833,4 +833,75 @@ mod tests {
         assert_eq!(flow.response.as_ref().and_then(|r| r.peer), None);
         assert!(stored_server_conn(&store, flow.id).is_none());
     }
+
+    /// Tester (amendment 59): `record: Never` keeps the flow off the store,
+    /// not the peer off the flow — a bulk sender's probe host still reads
+    /// `server_conn.peer` off the returned flow (the lane hosts'
+    /// `baseline_peer_addr()`), while the store stays empty.
+    #[tokio::test]
+    async fn a_record_never_send_stores_nothing_yet_reports_the_peer() {
+        let upstream: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let client = PipelineClient::new(
+            store.clone(),
+            scoped_guard(),
+            Arc::new(PeerSender(Some(upstream))),
+        );
+        let opts = SendOptions {
+            record: RecordPolicy::Never,
+            ..SendOptions::default()
+        };
+
+        let flow = client.send_opts(req("ex.test"), opts).await.unwrap();
+
+        assert_eq!(
+            flow.server_conn.as_ref().map(|c| (c.peer, c.tls)),
+            Some((upstream, true)),
+            "the returned flow names the peer whether or not it is stored"
+        );
+        assert_eq!(store.count(), 0, "record: Never stores nothing");
+    }
+
+    /// Tester (amendment 59, call C4): `tls` follows the request's scheme —
+    /// `http` is a cleartext upstream connection, and the comparison is
+    /// ASCII case-insensitive, so `HTTPS` reads as TLS too.
+    #[tokio::test]
+    async fn upstream_conn_tls_follows_the_requests_scheme() {
+        let upstream: SocketAddr = "10.0.0.5:8080".parse().unwrap();
+        let store = Arc::new(MemFlowStore::new());
+        let client = PipelineClient::new(
+            store.clone(),
+            scoped_guard(),
+            Arc::new(PeerSender(Some(upstream))),
+        );
+
+        let mut plain = req("ex.test");
+        plain.scheme = "http".into();
+        let flow = client
+            .send_opts(plain, SendOptions::default())
+            .await
+            .unwrap();
+        let conn = flow
+            .server_conn
+            .as_ref()
+            .expect("the sender named its peer");
+        assert_eq!((conn.peer, conn.tls), (upstream, false));
+        assert_eq!(
+            stored_server_conn(&store, flow.id).map(|c| c.tls),
+            Some(false),
+            "the stored copy agrees"
+        );
+
+        let mut shouted = req("ex.test");
+        shouted.scheme = "HTTPS".into();
+        let flow = client
+            .send_opts(shouted, SendOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            flow.server_conn.as_ref().map(|c| c.tls),
+            Some(true),
+            "the scheme comparison folds ASCII case"
+        );
+    }
 }

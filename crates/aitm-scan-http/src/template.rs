@@ -321,7 +321,7 @@ fn last_path_segment(value: &str) -> &str {
 mod tests {
     use super::{
         is_id_like, is_redirect_name, looks_like_filename, path_segment_token, path_template,
-        traits_for,
+        traits_for, REDIRECT_NAMES,
     };
     use aitm_scan_model::PointTrait::{Base64, Email, Filename, Id, Json, Number, Url};
 
@@ -425,5 +425,48 @@ mod tests {
         assert!(!is_redirect_name("q"));
         assert!(!is_redirect_name("nextpage"));
         assert!(!is_redirect_name(""));
+    }
+
+    /// Tester (amendment 83, C1/C2): the name branch is exact and
+    /// ASCII-case-folded over every one of the ruling's names — each matches
+    /// upper-cased, none matches with a character appended, a prefix, or
+    /// surrounding whitespace — and the value branch tags no value that
+    /// carries whitespace or is a bare `/`, however the rest reads.
+    #[test]
+    fn redirect_names_match_exactly_and_url_like_values_are_clean_paths() {
+        for name in REDIRECT_NAMES {
+            assert!(is_redirect_name(name), "{name}");
+            assert!(
+                is_redirect_name(&name.to_ascii_uppercase()),
+                "{name}: ASCII case folds"
+            );
+            assert!(
+                !is_redirect_name(&format!("{name}x")),
+                "{name}x: exact, not prefix"
+            );
+            assert!(
+                !is_redirect_name(&format!("x{name}")),
+                "x{name}: exact, not suffix"
+            );
+            assert!(
+                !is_redirect_name(&format!(" {name}")),
+                "' {name}': whitespace is part of the name"
+            );
+        }
+        assert!(is_redirect_name("Next"));
+        assert!(is_redirect_name("Return_Url"));
+        assert!(
+            !is_redirect_name("redirect-uri"),
+            "a hyphen is not an underscore"
+        );
+        assert!(!is_redirect_name("redirecturi"));
+        assert!(!is_redirect_name("next_url"));
+
+        // The value branch: a whitespace-bearing value is never a URL, and the
+        // path forms need something after the slash (C1).
+        assert_eq!(traits_for("/evil x"), Vec::new());
+        assert_eq!(traits_for("http://x y"), Vec::new());
+        assert_eq!(traits_for("/"), Vec::new());
+        assert_eq!(traits_for("/a"), vec![Url]);
     }
 }

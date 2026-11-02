@@ -1078,6 +1078,60 @@ mod tests {
         );
     }
 
+    /// Tester (amendment 83, C2): the name branch folds case on the wire
+    /// (`ReturnTo`, `REDIRECT_URI`), reaches a JSON field named like a
+    /// redirect parameter (alongside its `Json` trait), and leaves the
+    /// `entire_body` point alone — its name is the lane's own `body` label.
+    #[test]
+    fn redirect_like_names_fold_case_reach_json_fields_and_skip_the_body_point() {
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let opts = EnumerateOptions::from_profile(&profile, &ignore, None);
+
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/go?ReturnTo=home&REDIRECT_URI=x",
+                &[],
+                Some(("application/json", br#"{"redirect_uri":"home","note":"x"}"#)),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&flow, &opts);
+
+        assert_eq!(
+            point(&out, Query, "ReturnTo").traits,
+            vec![PointTrait::Url],
+            "{:?}",
+            triples(&out)
+        );
+        assert_eq!(
+            point(&out, Query, "REDIRECT_URI").traits,
+            vec![PointTrait::Url]
+        );
+        let field = point(&out, JsonValue, "redirect_uri");
+        assert!(
+            field.traits.contains(&PointTrait::Url) && field.traits.contains(&PointTrait::Json),
+            "a JSON field named like a redirect parameter is Url and Json: {:?}",
+            field.traits
+        );
+        assert!(
+            !point(&out, JsonValue, "note")
+                .traits
+                .contains(&PointTrait::Url),
+            "an ordinary JSON field is not Url"
+        );
+        assert!(
+            !point(&out, EntireBody, "body")
+                .traits
+                .contains(&PointTrait::Url),
+            "the whole-body point is never Url by name (C2): {:?}",
+            point(&out, EntireBody, "body").traits
+        );
+    }
+
     /// A structured-body point whose *path* reads as a secret (`session.id`,
     /// `credentials.value`, `auth.value`) is redacted and carries the `Session`
     /// trait even though its leaf name (`id`, `value`) looks innocent, so it is

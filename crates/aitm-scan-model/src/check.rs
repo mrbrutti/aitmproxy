@@ -720,4 +720,60 @@ mod tests {
             }
         );
     }
+
+    /// Tester (amendment 67): the scrub is a no-op on a verdict with nothing
+    /// to redact — empty detail, no evidence, no siblings — and it recurses
+    /// through nested siblings (a sibling's own `more`), not only one level,
+    /// so no depth of the multi-verdict contract carries raw text.
+    #[test]
+    fn verdict_scrub_leaves_a_clean_verdict_alone_and_reaches_nested_siblings() {
+        let clean = Verdict {
+            outcome: Outcome::Clean,
+            confidence: Confidence::Tentative,
+            evidence: Evidence::default(),
+            detail: String::new(),
+            poc_hint: None,
+            location: None,
+            more: Vec::new(),
+        };
+        assert_eq!(
+            clean.clone().scrubbed(),
+            clean,
+            "nothing to redact, nothing changed"
+        );
+
+        let leaf = Verdict {
+            detail: "deep Cookie: sid=deep-secret".into(),
+            evidence: Evidence {
+                payload: Some("access_token=deep".into()),
+                matched: Some("Authorization: Bearer deep".into()),
+                ..Evidence::default()
+            },
+            ..clean.clone()
+        };
+        let middle = Verdict {
+            detail: "middle: nothing secret".into(),
+            more: vec![leaf],
+            ..clean.clone()
+        };
+        let root = Verdict {
+            detail: "root: nothing secret".into(),
+            more: vec![middle],
+            ..clean
+        };
+
+        let out = root.scrubbed();
+        assert_eq!(out.detail, "root: nothing secret");
+        assert_eq!(out.more[0].detail, "middle: nothing secret");
+        let deep = &out.more[0].more[0];
+        assert_eq!(deep.detail, "deep Cookie: [redacted]");
+        assert_eq!(
+            deep.evidence.matched.as_deref(),
+            Some("Authorization: [redacted]")
+        );
+        assert_eq!(
+            deep.evidence.payload.as_deref(),
+            Some("access_token=[redacted]")
+        );
+    }
 }

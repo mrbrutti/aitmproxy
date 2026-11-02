@@ -2452,4 +2452,79 @@ mod tests {
             .expect("origin task");
         assert_eq!(String::from_utf8_lossy(&log.request), "GET /x");
     }
+
+    /// A resolver whose answer moves between calls: the first resolve says
+    /// 127.0.0.1, every later one 127.0.0.2 — a name whose address changed
+    /// while a pooled connection to the old one was still open.
+    struct MovingResolver(AtomicUsize);
+
+    impl HostResolver for MovingResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            let call = self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            let ip = if call == 0 {
+                Ipv4Addr::LOCALHOST
+            } else {
+                Ipv4Addr::new(127, 0, 0, 2)
+            };
+            Box::pin(async move { Ok(vec![IpAddr::V4(ip)]) })
+        }
+    }
+
+    /// Tester (amendment 59): a pooled send reports the address the pooled
+    /// connection was dialled to — `checkout.addr` — not what this send's own
+    /// resolve answered. The two differ here on purpose: a `peer` read off
+    /// `leg.addr` on the pooled path would name 127.0.0.2, an address the
+    /// sender never connected to.
+    #[tokio::test]
+    async fn a_pooled_send_names_the_pooled_connections_peer_not_todays_resolution() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_h2_origin(server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(MovingResolver(AtomicUsize::new(0))))
+            .with_dialer(dialer.clone());
+        let req = https_get();
+        let dialled: SocketAddr = "127.0.0.1:443".parse().expect("socket address");
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the first exchange succeeds");
+        assert_eq!(first.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            first.peer,
+            Some(dialled),
+            "the fresh dial names its address"
+        );
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the pooled exchange succeeds");
+        assert_eq!(second.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            dialer.calls(),
+            1,
+            "the second send rode the pooled connection"
+        );
+        assert_eq!(
+            second.peer,
+            Some(dialled),
+            "the pooled send names the connection it rode, not the 127.0.0.2 the name now resolves to"
+        );
+
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(10), origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("origin task");
+    }
 }

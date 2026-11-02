@@ -2038,6 +2038,26 @@ mod tests {
             "{:?}",
             ws_samples[0].detail
         );
+        // Tester: the lane-absent branch keeps every amendment-69 promise the
+        // cannot-host branch makes — nothing is a silent `done`, the skips
+        // account for the schedule, a skip is not an error, and the one
+        // sample names the point it was seen on.
+        assert_eq!(
+            status.checks.done, 0,
+            "an item nobody could host never finished: {:?}",
+            status.checks
+        );
+        assert_eq!(
+            status.checks.done + status.checks.skipped,
+            status.checks.scheduled,
+            "every scheduled item is accounted for: {:?}",
+            status.checks
+        );
+        assert_eq!(status.checks.errors, 0, "a skip is not a check error");
+        assert!(status.checks.error_samples.is_empty());
+        assert_eq!(ws_samples.len(), 1, "one sample per (check, detail)");
+        assert_eq!(ws_samples[0].point, "w1");
+        assert_eq!(status.stopped_reason, None);
     }
 
     /// Amendment 69: an item whose lane cannot host it — a point the lane
@@ -2192,6 +2212,60 @@ mod tests {
             .map(|s| s.check.as_str())
             .collect();
         assert_eq!(named.len(), 8, "every kept sample names a distinct check");
+    }
+
+    /// Tester (amendment 69, spec amendment 16): a skip reason is cut like an
+    /// evidence excerpt after the scrub — a lane that refuses with a
+    /// response-sized message leaves a bounded sample, never the whole text —
+    /// and the cut never splits a character.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skip_reason_is_bounded_like_an_evidence_excerpt() {
+        let long_reason = format!("no host: {}", "é".repeat(300));
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_check(FakeCheck::new("fake.point", "demo", FakeRun::clean()))
+                .with_host_error(&long_reason),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.done, 0);
+        assert_eq!(status.checks.skipped, status.checks.scheduled);
+        assert!(
+            !status.checks.skipped_samples.is_empty(),
+            "{:?}",
+            status.checks
+        );
+        for sample in &status.checks.skipped_samples {
+            assert!(
+                sample.detail.len() <= aitm_scan_model::MAX_EXCERPT_BYTES,
+                "a sample detail is bounded: {} bytes",
+                sample.detail.len()
+            );
+            assert!(
+                sample.detail.starts_with("no host: "),
+                "the cut keeps the head of the reason: {:?}",
+                sample.detail
+            );
+            assert!(
+                long_reason.starts_with(sample.detail.as_str()),
+                "the cut lands on a character boundary and changes nothing before it"
+            );
+            assert!(
+                sample.detail.len() > aitm_scan_model::MAX_EXCERPT_BYTES - 4,
+                "the bound is the excerpt bound, not a shorter one: {} bytes",
+                sample.detail.len()
+            );
+        }
     }
 
     /// Amendment 58 (T5's inert lane): a check that answers `Outcome::Error`

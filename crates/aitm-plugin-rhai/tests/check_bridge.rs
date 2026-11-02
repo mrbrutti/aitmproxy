@@ -566,6 +566,52 @@ async fn detail_is_scrubbed_at_the_root_in_siblings_and_in_the_string_form() {
     assert_eq!(verdict.detail, "saw Authorization: [redacted]");
 }
 
+/// Tester (amendment 67): the map form scrubs `detail` on its own — not only
+/// when it arrives as an element of the array form — and a sibling's evidence
+/// is scrubbed and bounded like the root's. Together with
+/// `detail_is_scrubbed_at_the_root_in_siblings_and_in_the_string_form` this
+/// covers every field of every return shape the bridge accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn map_form_detail_and_sibling_evidence_are_scrubbed() {
+    let (verdict, _host) = verdict_of(
+        r#"#{ outcome: "clean", detail: "saw Cookie: sid=s3cr3t in the reply" }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.detail, "saw Cookie: [redacted] in the reply");
+
+    let (verdict, _host) = verdict_of(
+        r#"{ let pad = ""; pad.pad(230, 'a');
+            [ #{ outcome: "vulnerable", detail: "root" },
+              #{ outcome: "vulnerable",
+                 evidence: #{ payload: "q=1&access_token=tok-123",
+                              matched: pad + " Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi" } } ] }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.more.len(), 1);
+    let sibling = &verdict.more[0];
+    assert_eq!(
+        sibling.evidence.payload.as_deref(),
+        Some("q=1&access_token=[redacted]")
+    );
+    let matched = sibling
+        .evidence
+        .matched
+        .as_deref()
+        .expect("the sibling's matched is kept");
+    assert_eq!(matched.len(), MAX_EXCERPT_BYTES);
+    assert_eq!(
+        matched,
+        format!("{} Cookie: [redacted]; Autho", "a".repeat(230)),
+        "scrubbed then bounded, in the sibling too"
+    );
+}
+
 /// What every `ProbeHost` method below returns: the model's `BoxFuture` spelled
 /// with std types, because this crate does not depend on `futures`.
 type ProbeFuture<'a> = Pin<
