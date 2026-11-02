@@ -117,7 +117,7 @@ final class ScanPanelState {
     /// injection-point list the sidebar counts.
     var surface = ScanSurfaceModel()
 
-    /// Every poll-driven write to `surface` goes through here. The surface is ONE `@Observable`
+    /// Every non-gesture write to `surface` (poll ticks, push lines) goes through here. The surface is ONE `@Observable`
     /// property, so a mutation that changes nothing would still publish the whole page — on
     /// 0.5.14 the 250 ms tick's `clearRefreshFlags()` did exactly that, and the Profiles check
     /// tree (one FlatMenu per check) rebuilt four times a second at idle: 31–45 % CPU, AX reads of
@@ -741,7 +741,9 @@ final class ScanPanelState {
     /// A `notifications/aitm/job` line: a trigger for the poll loop, never a value
     /// on screen. The sink that calls this is the follow-on PR's.
     func noteJobEvent(_ params: JSONValue) {
-        surface.noteJobEvent(params)
+        // A stale or duplicate line changes nothing in the Kit (`noteJobEvent` says so); the
+        // compare keeps it from republishing the page (MS-R1, quality P4-1).
+        updateSurface { $0.noteJobEvent(params) }
     }
 
     /// The legacy Add Host to Scope… path, reused by an out-of-scope origin row.

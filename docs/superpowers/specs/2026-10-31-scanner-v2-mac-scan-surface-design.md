@@ -232,7 +232,11 @@ None. Numbering of the new stories starts at S-085 to leave S-073..S-079 to the 
 
 ## Review log
 
-| # | Source | Sev | Finding | Disposition |
-|---|---|---|---|---|
-| MS-R1 | 0.5.14 acceptance run (2026-11-02): `ax_texts.sh` timed out; read-only diagnosis on the installed app | Important | The page's 250 ms poll called `surface.clearRefreshFlags()` on every tick; `surface` is one `@Observable` property, so an unchanged model was republished four times a second and every view on the page re-evaluated — the Profiles check tree (`ScanCheckTree` built inside `body`, one `FlatMenu` per check) rebuilt each time. Idle on Scan ▸ Profiles: 31–45 % CPU, main thread ~74 % inside SwiftUI text/layout, AX attribute reads 150–570 ms, VoiceOver and the acceptance dump starved. `applyList` etc. likewise reassigned unguarded every 2 s. | FIXED — `ScanPanelState.updateSurface` compares the model before assigning (every poll-driven write goes through it); `ScanCheckTree` is cached on the state keyed by (catalogue, selection, intensity, query); the D8 push-flag and timer semantics are unchanged. Kit tests pin the equalities the comparison relies on. Live proof: dev bundle parked on Scan ▸ Profiles, `sample` main thread idle, AX reads under 20 ms, the acceptance dump under 30 s |
-| MS-R2 | same run | Minor | A dev bundle's embedded core published its pointer in the operator's default run dir, so the CLI one-shots refused with "two running cores" beside the installed app | FIXED — `EmbeddedCore` sets `AITM_RUN_DIR` to `<store>/run/cores` whenever the store is overridden (`EmbeddedCoreLaunch.isolatedRunDir`); the installed app keeps the default |
+Dispositions live in the plan's Review log (`docs/superpowers/plans/2026-10-31-scanner-v2-mac-scan-surface-plan.md`,
+rows MS-R1 and MS-R2, post-release 0.5.14). Design consequence recorded here: **D8 amendment (MS-R1)** — the
+page's `surface` is one `@Observable` value, so every non-gesture write (poll tick, push line) compares the
+model before assigning and publishes only on a real change; the `ScanCheckTree` is derived once per distinct
+(catalogue, selection, intensity, query), not per body pass. The tick cadence, the flag semantics and D11 are
+unchanged. The run-dir isolation of dev-bundle cores (MS-R2) is owned by the one-shot spec
+(`2026-11-01-cli-oneshot-live-core-design.md` §D4 `AITM_RUN_DIR`, §D11 mac follow-up) and is recorded in that
+plan's Review log; it travelled in the same PR because the 0.5.14 acceptance run surfaced both.

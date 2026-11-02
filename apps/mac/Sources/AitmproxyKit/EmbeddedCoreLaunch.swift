@@ -396,9 +396,8 @@ extension EmbeddedCoreLaunch {
     /// dir. Nil for a normal launch — the installed app leaves the default in place, which is where
     /// the CLI looks. Pure on the environment, so the core spawner can call it off the main actor.
     public static func isolatedRunDir(environment: [String: String]) -> URL? {
-        guard let store = environment["APP_STORE"], !store.isEmpty else { return nil }
-        return URL(fileURLWithPath: store, isDirectory: true)
-            .appending(path: "run", directoryHint: .isDirectory)
+        guard let store = SettingsDomain.overriddenStoreURL(environment: environment) else { return nil }
+        return store.appending(path: "run", directoryHint: .isDirectory)
             .appending(path: "cores", directoryHint: .isDirectory)
     }
 }

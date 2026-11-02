@@ -225,8 +225,11 @@ actor EmbeddedCore {
         // A dev bundle, harness or live self-test (an overridden store) publishes its core pointer
         // under its own store, never in the operator's run dir: otherwise the CLI's one-shots see
         // "two running cores" beside the installed app (seen on the 0.5.14 acceptance run). The
-        // installed app keeps the core's default dir, which is where the CLI looks.
-        if let runDir = EmbeddedCoreLaunch.isolatedRunDir(environment: environment) {
+        // installed app keeps the core's default dir, which is where the CLI looks. An explicit
+        // AITM_RUN_DIR in the launch environment wins over the store's (the core's own rule: a
+        // non-empty AITM_RUN_DIR is the operator's choice).
+        if (environment[EmbeddedCoreLaunch.runDirEnvironmentKey] ?? "").isEmpty,
+           let runDir = EmbeddedCoreLaunch.isolatedRunDir(environment: environment) {
             environment[EmbeddedCoreLaunch.runDirEnvironmentKey] = runDir.path
         }
         process.environment = environment

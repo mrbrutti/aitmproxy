@@ -507,11 +507,15 @@ private struct ScanProfileEditor: View {
                 // Names only, never values (the Kit's rule); the preview is the core's
                 // `scan.session.preview` for the first origin.
                 if let preview = state.surface.sessionPreview {
-                    Text(ScanFormat.sessionPreviewText(
-                        preview, flowLabel: preview.sourceFlow.flatMap(state.flowLabel), now: Self.nowMs))
-                        .font(Tok.Face.data(Tok.Typography.Size.sm))
-                        .foregroundStyle(Tok.Ink.secondary.color)
-                        .textSelection(.enabled)
+                    // "observed 5 s ago" ticks on its own 1 Hz timeline (MS-R1: the model no longer
+                    // republishes every 250 ms, so a clock read in `body` would freeze).
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(ScanFormat.sessionPreviewText(
+                            preview, flowLabel: preview.sourceFlow.flatMap(state.flowLabel), now: Self.ms(context.date)))
+                            .font(Tok.Face.data(Tok.Typography.Size.sm))
+                            .foregroundStyle(Tok.Ink.secondary.color)
+                            .textSelection(.enabled)
+                    }
                     Text(ScanFormat.canaryText(preview.canary))
                         .font(Tok.Face.data(Tok.Typography.Size.sm))
                         .foregroundStyle(Tok.Ink.secondary.color)
@@ -536,7 +540,7 @@ private struct ScanProfileEditor: View {
         .onChange(of: edited.target.origins.first) { Task { await state.refreshSessionPreview() } }
     }
 
-    private static var nowMs: Int { Int(Date().timeIntervalSince1970 * 1000) }
+    private static func ms(_ date: Date) -> Int { Int(date.timeIntervalSince1970 * 1000) }
 
     // MARK: Helpers
 

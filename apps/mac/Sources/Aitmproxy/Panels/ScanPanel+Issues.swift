@@ -283,7 +283,7 @@ struct ScanIssueDetail: View {
     }
 
     /// Milliseconds since the epoch, for `ScanFormat.issueMetaLine`.
-    private static var nowMs: Int { Int(Date().timeIntervalSince1970 * 1000) }
+    private static func ms(_ date: Date) -> Int { Int(date.timeIntervalSince1970 * 1000) }
 
     // MARK: Header
 
@@ -343,10 +343,14 @@ struct ScanIssueDetail: View {
                 ScanSectionTitle("Note")
                 noteField
 
-                Text(ScanFormat.issueMetaLine(issue, now: Self.nowMs))
-                    .font(Tok.Face.data(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.Ink.tertiary.color)
-                    .textSelection(.enabled)
+                // "first seen 12 s ago" keeps counting on its own 1 Hz timeline: the model is only
+                // republished on a real change now (MS-R1), so a clock read in `body` would freeze.
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(ScanFormat.issueMetaLine(issue, now: Self.ms(context.date)))
+                        .font(Tok.Face.data(Tok.Typography.Size.sm))
+                        .foregroundStyle(Tok.Ink.tertiary.color)
+                        .textSelection(.enabled)
+                }
             }
             .padding(Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
