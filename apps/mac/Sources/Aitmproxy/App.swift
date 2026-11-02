@@ -223,9 +223,18 @@ struct FlowCommands: Commands {
             // The first-run step from the menu (spec D17.10): the same `trustCA()` as the sheet, the
             // Status card and the CA panel. ⌃⌘T is free (⌘T is New Browser Tab). Disabled while the
             // bus is not the operator's, while a change is in flight, and once a store says trusted.
-            Button("Trust the aitmproxy CA") { Task { await session.trustCA() } }
+            Button(ConnectionAction.trustCA.title) { Task { await session.trustCA() } }
                 .keyboardShortcut("t", modifiers: [.command, .control])
                 .disabled(!session.caTrustControlLive || session.caTrust?.trusted == true)
+            // The system-proxy step from the menu (spec D13 "Menu"): one item whose title follows the fact
+            // (CommandMap's toggle pair), the same `setSystemProxy()` / `restoreSystemProxy()` as the sheet,
+            // the Status page and the Flows banner. ⌥⌘P is free. Disabled while the bus is not the
+            // operator's or a change is in flight.
+            Button(session.systemProxyPointsAtUs ? ConnectionAction.unsetSystemProxy.title : ConnectionAction.setSystemProxy.title) {
+                Task { await (session.systemProxyPointsAtUs ? session.restoreSystemProxy() : session.setSystemProxy()) }
+            }
+            .keyboardShortcut("p", modifiers: [.command, .option])
+            .disabled(!session.systemProxyControlLive)
             Button("Certificate Authority…") { session.show(.ca) }
             Button("Configuration…") { session.show(.config) }
             Button(session.coreLogVisible ? "Hide Core Log" : "Core Log…") { session.coreLogVisible.toggle() }

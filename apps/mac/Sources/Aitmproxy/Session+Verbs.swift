@@ -108,8 +108,40 @@ extension Session {
         }
     }
 
+    /// Adds `host` to Scope and keeps the outcome where the Scope page can show it (S-081):
+    /// the row reads `sending…`, then leaves when `scope.list` names the host; a bus that
+    /// was not there (the core restarting) leaves it `queued` and `replayQueuedScopeAdds`
+    /// re-sends it on reconnect; a refusal from the core leaves it `failed` with the reason
+    /// until Retry or ✕. The status bar still gets the error line.
     func addScope(_ host: String) {
-        perform("add to scope") { [self] in try await actions.addScope(host) }
+        scopeAdds.begin(host)
+        Task { [self] in
+            do {
+                try await actions.addScope(host)
+                // The core took it: the in-flight entry is done even if the core stored a
+                // normalised form that `scope.list` (and `confirm`) would never match.
+                scopeAdds.drop(host)
+                lastError = nil
+            } catch {
+                if let bus = error as? BusError {
+                    scopeAdds.fail(host, error: bus)
+                } else {
+                    scopeAdds.fail(host, reason: BusService.describe(error), retryable: false)
+                }
+                lastError = "add to scope: \(BusService.describe(error))"
+            }
+        }
+    }
+
+    /// Retry on a failed or queued row: the same send as typing the host again.
+    func retryScopeAdd(_ host: String) { addScope(host) }
+
+    /// ✕ on a row the core never listed: forget the add.
+    func dropScopeAdd(_ host: String) { scopeAdds.drop(host) }
+
+    /// The bus is back (a reconnect after a core restart): send every queued add again.
+    func replayQueuedScopeAdds() {
+        for host in scopeAdds.replayable { addScope(host) }
     }
 
     func removeScope(_ host: String, confirm: (Int) -> Bool = { _ in true }) {

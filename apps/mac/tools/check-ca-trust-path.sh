@@ -31,7 +31,7 @@
 #   1. The quoted literals "ca.install" and "ca.uninstall" appear in Session+CATrust.swift
 #      only (the fixture data files that once named them are gone with the fake-data removal).
 #   2. `.trustCA(` / `.untrustCA(` are called from Panels/CAPanel.swift,
-#      Shell/SetupSheet.swift, Panels/StatusPanel.swift and App.swift only (each with an
+#      Shell/SetupSheet.swift, Panels/StatusPanel.swift, App.swift and Shell/RouteBanner.swift only (each with an
 #      expect). An UNDOTTED `trustCA(` / `untrustCA(` (a call from inside an `extension
 #      Session`, or a second definition) may appear in those four files and in
 #      Session+CATrust.swift only, where the undotted matches are exactly the two `func`
@@ -113,6 +113,9 @@ ca_panel=Sources/Aitmproxy/Panels/CAPanel.swift
 setup_sheet=Sources/Aitmproxy/Shell/SetupSheet.swift
 status_panel=Sources/Aitmproxy/Panels/StatusPanel.swift
 app_swift=Sources/Aitmproxy/App.swift
+# The Flows route banner / empty-state CA button (traffic-route spec D4/D5): calls session.trustCA() and
+# nothing else; the shared model hides the button once trusted or while an install is in flight.
+route_banner=Sources/Aitmproxy/Shell/RouteBanner.swift
 
 violations=0
 checked=0
@@ -196,15 +199,16 @@ expect "1 ca.install/ca.uninstall literal" "$ca_trust" '"ca\.uninstall"' 'the "c
 
 # ---- 2. trustCA()/untrustCA() calls: the operator surfaces only ----------------------
 call_re='\.(un)?trustCA[[:space:]]*\('
-scan "2 trustCA()/untrustCA() call" "$call_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift"
+scan "2 trustCA()/untrustCA() call" "$call_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$route_banner"
 expect "2 trustCA()/untrustCA() call" "$ca_panel" '\.trustCA[[:space:]]*\(' 'the Install… call to session.trustCA()'
 expect "2 trustCA()/untrustCA() call" "$ca_panel" '\.untrustCA[[:space:]]*\(' 'the Uninstall… call to session.untrustCA()'
 expect "2 trustCA()/untrustCA() call" "$setup_sheet" '\.trustCA[[:space:]]*\(' 'the sheet'"'"'s Trust the aitmproxy CA button'
 expect "2 trustCA()/untrustCA() call" "$status_panel" '\.trustCA[[:space:]]*\(' 'the Status page'"'"'s .trustCA action'
 expect "2 trustCA()/untrustCA() call" "$app_swift" '\.trustCA[[:space:]]*\(' 'the Proxy menu item'
+expect "2 trustCA()/untrustCA() call" "$route_banner" '\.trustCA[[:space:]]*\(' 'the Flows route banner / empty-state button'
 # Undotted: a call from inside an `extension Session` (self is implicit) or a second definition.
 undotted_re='(^|[^A-Za-z0-9_.])(un)?trustCA[[:space:]]*\('
-scan "2 trustCA()/untrustCA() call" "$undotted_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$ca_trust"
+scan "2 trustCA()/untrustCA() call" "$undotted_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$route_banner" "$ca_trust"
 # The definitions live in the one file, and they are its only undotted matches.
 expect "2 trustCA()/untrustCA() call" "$ca_trust" 'func trustCA\(\)' 'func trustCA()'
 expect "2 trustCA()/untrustCA() call" "$ca_trust" 'func untrustCA\(\)' 'func untrustCA()'
@@ -212,7 +216,7 @@ expect_count "2 trustCA()/untrustCA() call" "$ca_trust" "$undotted_re" 2 'an und
 # Bare: the method as a value, `session.trustCA` / `self.untrustCA` / `Session.trustCA` with no
 # `(` after it. The receiver is required: `.trustCA` alone is also the ConnectionAction case.
 bare_re='([Ss]ession|self)\.(un)?trustCA([^A-Za-z0-9_(]|$)'
-scan "2 trustCA()/untrustCA() call" "$bare_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$ca_trust"
+scan "2 trustCA()/untrustCA() call" "$bare_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$route_banner" "$ca_trust"
 
 # ---- 3. the scope is the user store, never "system" ----------------------------------
 expect "3 user scope" "$ca_facts" '\.string\("user"\)' 'the .string("user") scope'

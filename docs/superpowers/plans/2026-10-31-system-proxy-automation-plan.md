@@ -1222,6 +1222,88 @@ never evidence; Kit unit tests and the live run are. Do not edit `Fixtures.rows`
 
 ---
 
+### PR 4 as re-based on main 681dff57 (orchestrator, 2026-11-01; supersedes Tasks 24–31 where they differ)
+
+Main moved under PR 4 while PRs 1–3 landed: #242/#265 (mac-attribution's traffic-route model),
+#246 (PR 4a, `SystemProxyState`), #254 (CA trust: `Session+CATrust.swift`, `Shell/SetupSheet.swift`,
+`tools/check-ca-trust-path.sh`), #262 (BusService generation-owned runs). The seams the tasks
+above assumed have been replaced by these, so the tasks are re-read as follows. Self-approved
+under Matt's standing mandate; the deviations marked **(Matt)** are flagged in the wrap-up.
+
+- **Where the mac words live.** §D12's "mac fact" column is realised by #265's `TrafficRoute`
+  entry of kind `.systemProxy` (state line, remedy, actions) and its Getting-started step — not
+  by a new `SystemProxyFact`. #265's state words stay ("system proxy off", "system proxy on ·
+  <addr>[, not this core]", "· HTTP only"); §D12 adds, when the verb facts are present:
+  the suffix " · set outside the app" (`managed_by_us == false`), "setting system proxy…"
+  (closed, no action), "system proxy needs an administrator" (closed, remedy = the core's
+  sentence), and the two §D12 remedies for `off`/`other` in place of #265's generic "set <addr>
+  as the system proxy, or point a client at it" when `supported`. `unsupported`/`unknown` (and
+  `other` at our own endpoint) → route nil (never named; `guidance` is shown in Settings ▸ Proxy
+  only). **(Matt)** `overall`/the toolbar pill do NOT take the fact's state: the route model is
+  not a lane and #265 decided the pill shows lanes only.
+- **Task 24 → `SystemProxyFacts` + route actions** (Kit): `SystemProxyFacts { word: Word
+  (points_at_us|other|off|unsupported|needs_privilege|unknown), state: SystemProxyState?,
+  managedByUs: Bool?, setting, supported, detail, remedy?, guidance? }`, `init?(compact:
+  listenAddress:)`; `ConnectionSummary.make(… systemProxyFacts: SystemProxyFacts? = nil)` (the
+  `systemProxy: SystemProxyState?` CFNetwork fallback stays; the verb wins, D1);
+  `ConnectionAction.setSystemProxy` ("Set as System Proxy") / `.unsetSystemProxy` ("Restore
+  System Proxy"); the `.systemProxy` step's action = the route's first action; the `.firstFlow`
+  titles of §D13; `ConnectionSummary.systemProxyLaneSentence` / `.bypassFieldCopy`. Task 30 folded in.
+- **Task 25** unchanged (Config `systemProxyAuto`/`systemProxyBypass`, the `system_proxy:` tail
+  after `scope`). Files added by the build (recorded 2026-11-01 after the panel): Task 27 →
+  `AitmproxyKit/SystemProxyPreferences.swift` (+Tests: the four keys, `bypassHosts`, `bypassField`,
+  `defaultBypassField` — one parser for spawn, the applied snapshot and the live set),
+  `AitmproxyKit/CoreConnection.swift`, `Bus/EmbeddedCoreController.swift`; Task 28 →
+  `AitmproxyKit/SetupWords.swift` (+Tests: row title, checklist, caption), `Session+Palette.swift`
+  (the two verbs excluded from the Commands list), `Panels/AgentPanel.swift` (Approve refuses them);
+  Task 24 → `SystemProxyFacts.keepingFullFields(from:)`; Task 28 → `Shell/ShellView.swift`
+  (`EmptyFlows` carries `systemProxyControlLive`). Task 28's Kit half: `CommandMap` row `E("Proxy", "Set as / Restore System
+  Proxy", "⌥⌘P", items: toggle([...]))` directly after the CA row, and the same words appended to
+  `docs/BRIEF.md`'s Proxy row (`mapMatchesTheBrief` pins the two together). There is no
+  "Network Settings…" item on main (superseded 2026-11-01 in the traffic-route plan).
+- **Task 26 → facts in, calls out.** `BusService.refreshProxyStatus()` (the one `proxy.status`
+  reader) parses `system_proxy` into `session.systemProxyFacts` and `session.systemProxy =
+  facts.state` (both reset in the poll loop's `defer`, beside `forgetCATrust()`).
+  `Session+SystemProxy.swift` mirrors `Session+CATrust.swift`: `setSystemProxy()` /
+  `restoreSystemProxy()` (`async`, through `runCommand`, `systemProxySetting` flag with `defer`,
+  `bypass` from `Store.defaults["systemProxy.bypass"]`, the reply parsed as the full status
+  object into the facts, errors to `lastError`), `refreshSystemProxyStatus()` (one
+  `proxy.system.status` read, for Settings ▸ Proxy's open and the `guidance` line),
+  `systemProxyControlLive`. `perform(connection:)` returns `false` for the two actions.
+  `setupSheetDue` (Session+CATrust.swift) widens to "or the system-proxy route is known, closed
+  and `supported`"; `Session.systemProxySetting` lives in Session.swift beside the CA flags.
+- **Task 27** as written, plus: `CoreConnection` gains `appliedSystemProxyAuto: Bool?` /
+  `appliedSystemProxyBypass: String?` snapshotted in `EmbeddedCoreController` on `.ready` (the
+  Apply dirty-check pattern of `appliedPort`); `EmbeddedCore.spawn()` reads the two keys beside
+  `capture.enabled` without moving the lines `check-capture-toggle.sh` pins.
+- **Task 28 → sheet row, Status, banner, menu.** `SetupSheet` gains row 1 "Set aitmproxy as the
+  system proxy" above the CA row (CA → 2, Scope → 3; the `SetupRow` numbers follow), with the
+  route's line, `PrimaryButton("Set as System Proxy")` (calls `setSystemProxy()`, then sets
+  `systemProxy.auto = true` once the facts report `points_at_us` — a refused set leaves the
+  preference off; caption exactly "Also turns on “Set system proxy at launch” in
+  Settings ▸ Proxy"), hidden once open, disabled unless `systemProxyControlLive`; a
+  `Toggle("Don't ask again")` writing `systemProxy.promptSuppressed` (the key existed unwritten).
+  `StatusPanel.run`, `RouteActions.run` (RouteBanner.swift) and the Flows empty state route
+  `.setSystemProxy`/`.unsetSystemProxy` to the Session entries, disabled unless live. App.swift:
+  `Button(atUs ? "Restore System Proxy" : "Set as System Proxy")` ⌥⌘P directly after the CA
+  item, `.disabled(!session.systemProxyControlLive)`. **(Matt)** The 30-s "No flows yet?" nudge is
+  DROPPED: #265's Flows empty state already lists the closed system-proxy route with its action
+  while flows == 0, and its banner names it once rows exist — a third banner would say it thrice.
+  `ShellToolbar`'s Proxy switch is pause/resume, not the system proxy; the "flip to on" sheet
+  trigger is dropped with it (the sheet shows on `.ready` via `setupSheetDue`).
+- **Task 29** keeps the four rules in `check-ca-trust-path.sh`'s shape (`scan`/`expect`/
+  `expect_count`/`deny`, `--self-check` planting one violation per rule): literals in
+  `Session+SystemProxy.swift` only; `.setSystemProxy(`/`.restoreSystemProxy(` calls from
+  `SettingsView.swift`, `Panels/StatusPanel.swift`, `Shell/SetupSheet.swift`,
+  `Shell/RouteBanner.swift`, `App.swift` only (the Flows empty state routes through RouteBanner); the
+  agent-reachable surfaces (`Bus/BusService.swift` may parse the STATUS but not spell the verbs or
+  the method names, `CommandMap.swift` titles only, `CommandPalette.swift`, `Session+Palette.swift`,
+  `Session+Verbs.swift`, `Panels/AgentPanel.swift`, `SelfTest*.swift`) match none of
+  `"proxy\.system\.(set|unset)"|setSystemProxy|restoreSystemProxy`; `systemProxy.auto` written in
+  `SettingsView.swift` and `Shell/SetupSheet.swift`, read in `Bus/EmbeddedCore.swift`.
+- **Task 31** as written, via `tools/snap-dev.sh` (never `build.sh`), after Matt's "Yes, both"
+  (given 2026-11-01) with the display lock from the orchestrator for the window part.
+
 ## PR 5 — CA trust (spec §D17, SP-AC29 … SP-AC38)
 
 **Branch:** `feat/ca-trust-first-run`, cut from `main` after PR 1 merges (the core tasks
@@ -1641,6 +1723,14 @@ Kept by the main session during stage 6. One row per finding.
 | F-tui (PR 2) | quality (PR 2, re-run) | Minor | `toolbar_at`/`toolbar_text` duplicated across two test files; `PILL_GUTTER` doc said "each side" while two uses take it as the total gap; TUI and core spelled the in-flight refusal differently | fixed: `toolbar_at` lives in `tests/common/mod.rs`; doc reworded (arithmetic unchanged); the TUI toast is the core's exact sentence "a system-proxy change is already in flight" |
 | F-tui (PR 2) | spec (PR 2, re-run) | Minor | plan Task 18 still spelled the old palette literal; Task 17 did not mention the status reply refreshing the word; the core-flag half of the guard can refuse on a `setting` up to 5 s stale | plan Tasks 17/18 amended (dated); the 5 s staleness recorded, no code change (self-heals on the next poll) |
 | 19 (PR 2) | live proof (SP-AC27 TUI half) | — | run 1 (11:27 PST) flipped and restored the proxy but the pty had a 0×0 window (crossterm sizes by TIOCGWINSZ) so no text was drawn; run 2 (11:30:14–11:30:33 PST) with the window set: pill `off` → `setting…` → `→ us` → `setting…` → `off`, `scutil` HTTP/HTTPS 28080 while set, before == after, state file gone, token leak 0, a real CONNECT (api.apple-cloudkit.com, out of scope) rode through the proxy during the window | done 2026-11-01 on Matt's "Yes, both"; dumps in PR #258 |
+| 31 (PR 4) | live proof (SP-AC20/21 app path, SP-AC24 live half) | — | 2026-11-01 15:15:19–15:16:32 PST, Matt's "Yes, both", orchestrator's display lock, dev bundle /tmp/Aitmproxy-dev-sp.app (head e811a6ef) on 28080 in an isolated defaults suite, CGEvent keystrokes only while frontmost (no osascript): Proxy ▸ ⌥⌘P set → scutil HTTP/HTTPS 28080, state file beside the CA with `previous`, curl through the core 200; ⌥⌘P restore → off; set → ⌘Q → off (RESTORED-ON-QUIT); relaunch → set (core bound 54835: 28080 in TIME_WAIT) → kill -9 our core → off within 3 s, state file gone, watchdog `restored services=2 ms=1484`; before == after, token leak 0, Matt's 0.5.10 on 8080 untouched. Gap: winshot found no on-screen window for the dev process, so no screenshot of the sheet. Leg 1 re-run 15:31 PST on the fix-round bundle (code 7de7c398): set 28080 → restore → quit, before == after, token leak 0. SP-AC20 leg 15:38 PST (spec re-check Important): `previous` = both services disabled at 127.0.0.1:9090 with bypass `*.local, 169.254/16` (matches the before dump); URLSession default-configuration fetch of example.com → HTTP 200, flow count 2 → 3; the Status-step wording accepted as unit-pinned (no window captured) | done; all three runs' dumps in PR 4 |
+| 28 (PR 4) | spec | Important | sheet row 1 showed the route line as its title, not Matt's words; the §D13 checklist was absent; the two `SetupWords` literals were unpinned and the file undeclared | fixed in F-mac d69b0782 (title = `SetupWords.systemProxyRowTitle`, route `line` + `systemProxyChecklist` under it; tests in `SetupWordsTests`; files recorded in the amendment) |
+| 24–28 (PR 4) | spec | Important | undeclared files (`SystemProxyPreferences`, `SetupWords`, `Session+Palette`, `AgentPanel`, `CoreConnection`, `EmbeddedCoreController`, `docs/BRIEF.md`) and spec text stale against the tree (§D12 mac column, §D13 facts/sheet/nudge/menu/tripwire, SP-AC20, SP-AC23) | plan amendment lists the files; spec amended and dated in d69b0782 |
+| 26 (PR 4) | spec, tester | Important/Minor | `setupSheetDue` followed the word, not "route known, closed and supported" (`unknown` + supported burned the once-per-install sheet with an empty row) | fixed in F-mac: requires `systemProxy != nil`; D13's "at launch off" condition kept |
+| 26–28 (PR 4) | security | Minor | the Agent log's Approve did not refuse the two verbs; tripwire blind spots (bare undotted reference, receiver other than session/self, a comment satisfying an expect); a bypass host with a control scalar or a leading `-` reached the config/`networksetup` | fixed in F-mac: `AgentPanel.approve` refuses `isSystemProxyVerb` (pinned by rule 3); left-bounded receiver-agnostic `bare_re`, `bare_undotted_re`, comment-stripping `expect`, two more self-check plants; `isPlausibleBypassHost` drops them (tested) |
+| 24–28 (PR 4) | quality | Minor ×11 | two cause ladders; `systemProxy` stored twice; facts written in two files; listen address ×3; two per-action gates; `.task` on a Section; `@State` mirror of a defaults key; `auto` written before the call; `lastError` blanked on success; three doc comments; `CaseIterable`/aliases/copied YAML loop | all fixed in F-mac (`SystemProxyNotLive`, computed `systemProxy`, `applySystemProxyFacts` the one write, `effectiveListenAddress`, `RouteActions.standsDown` on Status too — the CA button now stands down there as on the banner, `.task` on the toggle, `@AppStorage`, auto after success, `clearOwnError`, docs, `yamlHostList`); `detail` kept as the §D6 contract field (recorded) |
+| 28 (PR 4) | spec | Minor | Settings ▸ Proxy carries the route line, an "N hosts" caption and a fourth reason ("waiting for the core"); Restore System Proxy is not offered on the Status page (done rows carry no button); the palette has no entry beyond the `CommandMap` row | accepted (recorded) in Matt's name under the standing mandate: the route line keeps Settings and Status in one voice; the fourth reason is honest for an older core; Restore lives in the menu and Settings (§D13 amended); the palette sentence amended |
+| 28 (PR 4) | tester | Minor | `points_at_us` on a wildcard listen renders "system proxy on · 0.0.0.0:8080" (inherited from #265's words; the embedded core never binds a wildcard) | recorded; no change |
 | 16 | coder (stop-on-gap) | Minor | Task 16 declared only `model.rs`, but `ProxyStatus` is built with exhaustive struct literals in `src/app.rs` (test helper), `tests/core_sync.rs`, `tests/common/mod.rs`; adding `system_proxy` there is required to compile | file list extended to those three one-line edits, orchestrator 2026-11-01 |
 | 20–22 | quality, spec (F-web re-run) | Minor | `refreshSystemProxy` ran while our own set/unset was in flight; three redundant `.listenButton` declarations; failure toast wording | fixed in the follow-up commit (gate on `systemProxySetting`; CSS trimmed; "Copy env line failed") |
 | 20 | quality (F-web re-run) | Minor | `mergeSystemProxy` keeps `guidance`/`remedy` across a state change; one Toolbar test waits a real ~2 s poll | accepted (recorded) by the orchestrator in Matt's name under the standing mandate: the kept fields are only read in the states that produce them; the store proves the rule on fake timers |
