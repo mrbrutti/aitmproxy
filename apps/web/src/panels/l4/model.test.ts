@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  createOnceLog,
   flowScope,
   flowSubLabel,
   isKnownKind,
   KNOWN_KINDS,
+  L4_ACTIVE_MS,
+  L4_IDLE_SLOW_MS,
+  L4_IDLE_TICK_MS,
+  l4PollPlan,
   l4Row,
   l4SessionState,
   l4Target,
@@ -12,6 +17,7 @@ import {
   placeholderRow,
   protoSubLabel,
   type L4FlowWire,
+  type L4PollClock,
   type L4ScopeEntryWire,
 } from './model';
 
@@ -131,5 +137,79 @@ describe('PacketSpec YAML parser', () => {
     const bad = parsePacketSpec(`layers:\n  - raw: [1, 999]\n`);
     expect('error' in bad).toBe(true);
     if ('error' in bad) expect(bad.error).toContain('0–255');
+  });
+});
+
+// ---- poll plan (parity spec §7(c) "Polling", AC23) -----------------------------------------------
+
+/** Drive the plan the way `store.refresh()` does: one call per 1.5 s timer tick for a minute. */
+function driveMinute(idle: boolean): { ticks: number; slows: number; tickTimes: number[] } {
+  const clock: L4PollClock = { lastTickAt: null, lastSlowAt: null };
+  let ticks = 0;
+  let slows = 0;
+  const tickTimes: number[] = [];
+  for (let now = 0; now < 60_000; now += L4_ACTIVE_MS) {
+    const plan = l4PollPlan(now, clock, idle);
+    if (plan.tick) {
+      ticks++;
+      tickTimes.push(now);
+      clock.lastTickAt = now;
+    }
+    if (plan.slow) {
+      slows++;
+      clock.lastSlowAt = now;
+    }
+  }
+  return { ticks, slows, tickTimes };
+}
+
+describe('L4 poll plan', () => {
+  it('has the spec intervals', () => {
+    expect(L4_ACTIVE_MS).toBe(1500);
+    expect(L4_IDLE_TICK_MS).toBe(10_000);
+    expect(L4_IDLE_SLOW_MS).toBe(60_000);
+  });
+
+  it('idle: 40 timer calls in a minute fire tick 6 times and slow once (20 l4.* calls, ≤ 30)', () => {
+    const { ticks, slows, tickTimes } = driveMinute(true);
+    expect(ticks).toBe(6);
+    expect(slows).toBe(1);
+    expect(tickTimes).toEqual([0, 10_500, 21_000, 31_500, 42_000, 52_500]);
+    // tick reads l4.flow.list + l4.capture.status + l4.intercept.status; slow reads
+    // l4.scope.list + l4.agent.status.
+    const calls = ticks * 3 + slows * 2;
+    expect(calls).toBe(20);
+    expect(calls).toBeLessThanOrEqual(30);
+  });
+
+  it('not idle: every one of the 40 timer calls ticks and slows', () => {
+    const { ticks, slows } = driveMinute(false);
+    expect(ticks).toBe(40);
+    expect(slows).toBe(40);
+  });
+
+  it('both fire on the first call and are due exactly at the interval', () => {
+    expect(l4PollPlan(5, { lastTickAt: null, lastSlowAt: null }, true)).toEqual({ tick: true, slow: true });
+    expect(l4PollPlan(9_999, { lastTickAt: 0, lastSlowAt: 0 }, true)).toEqual({ tick: false, slow: false });
+    expect(l4PollPlan(10_000, { lastTickAt: 0, lastSlowAt: 0 }, true)).toEqual({ tick: true, slow: false });
+    expect(l4PollPlan(60_000, { lastTickAt: 50_000, lastSlowAt: 0 }, true)).toEqual({ tick: true, slow: true });
+  });
+
+  it('is pure: it never mutates the clock', () => {
+    const clock: L4PollClock = { lastTickAt: null, lastSlowAt: null };
+    l4PollPlan(0, clock, true);
+    expect(clock).toEqual({ lastTickAt: null, lastSlowAt: null });
+  });
+});
+
+describe('createOnceLog', () => {
+  it('passes each distinct message to the sink once, and clear() lets it log again', () => {
+    const seen: string[] = [];
+    const once = createOnceLog((m) => seen.push(m));
+    for (const m of ['a', 'a', 'b', 'a']) once.log(m);
+    expect(seen).toEqual(['a', 'b']);
+    once.clear();
+    once.log('a');
+    expect(seen).toEqual(['a', 'b', 'a']);
   });
 });

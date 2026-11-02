@@ -544,3 +544,71 @@ export const L4_ARG_BUILDERS: readonly { tool: string; keys: readonly string[] }
   { tool: 'l4.scope.add', keys: ['cidr', 'ports', 'interface', 'direction', 'capability'] },
   { tool: 'l4.flow.get', keys: ['id', 'offset', 'limit'] },
 ];
+
+// ---- poll plan (parity spec §7(c) "Polling", AC23) ------------------------------------------------
+//
+// The app's 1.5 s timer calls `store.refresh()`; the store asks this plan what is due and returns
+// early when nothing is. While the lane is idle (capture unavailable and `l4.flow.list` empty) a
+// `tick` (`l4.flow.list`, `l4.capture.status`, `l4.intercept.status`) is due every 10 s and a
+// `slow` (`l4.scope.list`, `l4.agent.status`) every 60 s: 6 × 3 + 1 × 2 = 20 `l4.*` calls a
+// minute, under AC23's 30. Not idle ⇒ both on every timer call. The plan is pure; the caller
+// records `now` into the clock for each part that fired.
+
+/** The timer interval `state/context.tsx` drives the store with. */
+export const L4_ACTIVE_MS = 1500;
+/** Idle: the fast group's interval. */
+export const L4_IDLE_TICK_MS = 10_000;
+/** Idle: the slow group's interval (availability is re-read here, never cached for the session). */
+export const L4_IDLE_SLOW_MS = 60_000;
+
+export interface L4PollClock {
+  /** When the last `tick` fired (epoch or monotonic ms, the caller's choice); `null` before the first. */
+  lastTickAt: number | null;
+  /** When the last `slow` fired; `null` before the first. */
+  lastSlowAt: number | null;
+}
+
+export interface L4PollPlan {
+  tick: boolean;
+  slow: boolean;
+}
+
+function due(now: number, last: number | null, interval: number): boolean {
+  return last === null || now - last >= interval;
+}
+
+/** What `refresh()` should read on this timer call; never mutates `clock`. */
+export function l4PollPlan(now: number, clock: Readonly<L4PollClock>, idle: boolean): L4PollPlan {
+  if (!idle) return { tick: true, slow: true };
+  return {
+    tick: due(now, clock.lastTickAt, L4_IDLE_TICK_MS),
+    slow: due(now, clock.lastSlowAt, L4_IDLE_SLOW_MS),
+  };
+}
+
+// ---- once-per-message logging ---------------------------------------------------------------------
+
+export interface OnceLog {
+  /** Pass `msg` to the sink unless the same text was already logged since the last `clear()`. */
+  log(msg: string): void;
+  /** Forget every message seen so far (e.g. after a successful read, so a recurrence logs again). */
+  clear(): void;
+}
+
+/**
+ * A read failure repeats on every poll; the activity log should carry each distinct message once
+ * (spec §7(c)), so the store routes every read failure through one of these.
+ */
+export function createOnceLog(sink: (msg: string) => void): OnceLog {
+  const seen = new Set<string>();
+  return {
+    log(msg) {
+      if (seen.has(msg)) return;
+      seen.add(msg);
+      sink(msg);
+    },
+    clear() {
+      seen.clear();
+    },
+  };
+}
