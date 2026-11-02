@@ -578,11 +578,18 @@ impl Correlation {
     }
 
     /// Whether an ICMP error's quoted inner packet is the stimulus we sent:
-    /// same source, same destination, same protocol, and — when the quote
-    /// carries ports (the first 8 quoted transport bytes always do for TCP and
-    /// UDP) — the same ports. The port test is what separates our error from
-    /// the kernel's port-unreachable for the target's reply on loopback, where
-    /// both addresses are 127.0.0.1 and only the ports differ.
+    /// same source, same destination, same protocol, and — when we sent ports —
+    /// a quote that carries our ports. A real kernel always quotes 8 transport
+    /// bytes (RFC 792), a whole UDP header and enough of a TCP one to carry both
+    /// ports; but the frame is wire-controlled, so anything on the segment can
+    /// emit a bare-header quote with no ports, and on loopback both addresses
+    /// are 127.0.0.1 and tell nothing. So a quote that does not carry our ports
+    /// is **not** our stimulus — not "not disqualifying" — which is what
+    /// separates our error from the kernel's port-unreachable for the target's
+    /// reply (same addresses, only the ports differ) and what stops a hostile
+    /// bare-header quote from turning the crash oracle's silence into a reaction.
+    /// A portless stimulus (ICMP, an unknown protocol) has no ports to match, so
+    /// the address-and-protocol rule stands on its own there.
     fn quote_is_our_stimulus(&self, quote: &PacketEndpoints) -> bool {
         if quote.dst != Some(self.dst) || quote.proto.unwrap_or(L4Proto::Raw) != self.proto {
             return false;
@@ -593,12 +600,12 @@ impl Correlation {
             }
         }
         if let Some(p) = self.dst_port {
-            if quote.dst_port.is_some() && quote.dst_port != Some(p) {
+            if quote.dst_port != Some(p) {
                 return false;
             }
         }
         if let Some(our_port) = self.our_port() {
-            if quote.src_port.is_some() && quote.src_port != Some(our_port) {
+            if quote.src_port != Some(our_port) {
                 return false;
             }
         }
@@ -618,14 +625,15 @@ impl Correlation {
     /// The two `Other` shapes under [`ReplyMatch::FromHost`], with the target
     /// port relaxed to the host: an ICMP error quoting a datagram we sent to
     /// `host`, and a reset from `host` addressed back to the port we sent from.
+    /// As in [`Correlation::quote_is_our_stimulus`], when we sent a source port
+    /// the quote must carry it: a wire-controlled bare-header quote with no
+    /// ports is not our reaction (on loopback its addresses tell nothing).
     fn is_reaction_from_host(&self, info: &ReplyInfo<'_>, host: IpAddr) -> bool {
         if let Some(quote) = info.icmp_quote {
             let ours = quote.dst == Some(host)
                 && quote.proto.unwrap_or(L4Proto::Raw) == self.proto
                 && self.our_addr().is_none_or(|a| quote.src == Some(a))
-                && self
-                    .our_port()
-                    .is_none_or(|p| quote.src_port.is_none() || quote.src_port == Some(p));
+                && self.our_port().is_none_or(|p| quote.src_port == Some(p));
             if ours {
                 return true;
             }
@@ -2863,19 +2871,19 @@ mod tests {
     /// header cut mid-way, or with fewer than the four bytes that carry the
     /// port pair all decode to "no correlation" rather than crashing.
     ///
-    /// What each length does today (the first four are the assertion, the last
-    /// is **tester finding F1**, reported, not fixed):
+    /// What each length does:
     /// * 0, 1, 19 bytes — no readable IP header, so no quote: `Ignore`.
     /// * garbage bytes — the same.
     /// * 24 bytes (header + the 4 bytes carrying both ports) — the ports are
     ///   read and compared, so our stimulus's head is `Other` and another
     ///   datagram's head is `Ignore`.
     /// * 20..=23 bytes (header, fewer than 4 transport bytes) — the quote
-    ///   carries no ports, and `quote_is_our_stimulus` treats a port it cannot
-    ///   read as "not disqualifying", so a quote of the **reversed** packet
-    ///   reads as ours on loopback. See the report: a real kernel always
-    ///   quotes 8 transport bytes, but a hostile target can emit this shape to
-    ///   turn silence into a protocol reaction.
+    ///   carries no ports. **Tester finding F1, now fixed:** our stimulus has
+    ///   ports, so a quote that does not carry ours is not our stimulus and is
+    ///   `Ignore`d. A real kernel always quotes 8 transport bytes (RFC 792);
+    ///   the frame is wire-controlled, so anything on the segment could emit a
+    ///   bare-header quote, and on loopback the addresses alone tell nothing —
+    ///   accepting it would turn the crash oracle's silence into a reaction.
     ///
     /// Mutation: make any read in `quoted_endpoints` unchecked (`quote[..4]`,
     /// `&quote[v4.slice().len()..]`) and the short cases panic instead.
@@ -2922,18 +2930,19 @@ mod tests {
             "a 24-byte quote of the target's reply is still not ours"
         );
 
-        // 20..=23 bytes: no port pair. Tester finding F1 — today a quote of
-        // the reversed packet reads as ours. Pinned so the behaviour cannot
-        // drift silently; flip to `Ignore` when the rule tightens.
+        // 20..=23 bytes: no port pair. Tester finding F1, now fixed — a quote
+        // the ports cannot be read from is not our stimulus, because our
+        // stimulus carries ports and this quote does not. On loopback the
+        // addresses tell nothing, so a wire-controlled bare-header quote of the
+        // reversed packet no longer reads as ours: `Ignore`, silence survives.
         for len in 20..=23_usize {
             let theirs: Vec<u8> = reversed.iter().take(len).copied().collect();
             assert!(
                 matches!(
                     c.classify(&icmp_quoting("127.0.0.1", "127.0.0.1", 3, 3, &theirs)),
-                    Classified::Other
+                    Classified::Ignore
                 ),
-                "finding F1: a {len}-byte port-less quote of the reversed packet is \
-                 accepted as ours today"
+                "finding F1: a {len}-byte port-less quote is not our ported stimulus"
             );
         }
 
@@ -2948,6 +2957,59 @@ mod tests {
             "expected silence past an empty quote, got {outcome:?}"
         );
         assert_eq!(packets, 1, "the flow holds the stimulus alone");
+    }
+
+    /// Tester finding F1 (amendment 66): our stimulus carries ports, so an ICMP
+    /// error whose quote the ports cannot be read from is **not** our reaction.
+    /// A real kernel quotes 8 transport bytes (RFC 792), but the frame is
+    /// wire-controlled — anything on the segment can emit a bare-header quote,
+    /// and on loopback both addresses are 127.0.0.1 so the quote's addresses
+    /// prove nothing. Accepting it would turn the crash oracle's silence into a
+    /// `protocol_error`. The quote must therefore carry our ports; one that does
+    /// not is `Ignore`d under both match modes, and the await keeps waiting.
+    ///
+    /// The positive twin — the same error with a full 8-byte transport quote —
+    /// names both ports and is the reaction it always was: `Other`.
+    #[test]
+    fn a_port_less_quote_of_a_ported_stimulus_is_not_our_reaction() {
+        let stimulus = lane_stimulus();
+        // The 20-byte inner IP header alone: proto UDP, both addresses
+        // 127.0.0.1, no transport bytes, so no ports.
+        let bare_header: Vec<u8> = stimulus.iter().take(20).copied().collect();
+        let bare_quote = icmp_quoting("127.0.0.1", "127.0.0.1", 3, 3, &bare_header);
+
+        let five_tuple = lane_correlation(ReplyMatch::FiveTuple);
+        assert!(
+            matches!(five_tuple.classify(&bare_quote), Classified::Ignore),
+            "FiveTuple: a bare-header quote carries no ports and is not our ported stimulus"
+        );
+        let from_host = lane_correlation(ReplyMatch::FromHost("127.0.0.1".parse().unwrap()));
+        assert!(
+            matches!(from_host.classify(&bare_quote), Classified::Ignore),
+            "FromHost: the quote must still carry the port we sent from"
+        );
+
+        // End to end: the bare-header quote ends nothing, so silence survives.
+        let timeout = Duration::from_millis(80);
+        let (outcome, packets) = lane_run(vec![bare_quote], timeout);
+        assert!(
+            matches!(outcome, SendRecvOutcome::NoResponse { .. }),
+            "expected silence past a port-less quote, got {outcome:?}"
+        );
+        assert_eq!(packets, 1, "the flow holds the stimulus alone");
+
+        // The positive twin: header + the full 8-byte UDP transport, so both
+        // ports are read and the error is our reaction.
+        let with_ports: Vec<u8> = stimulus.iter().take(28).copied().collect();
+        let ported_quote = icmp_quoting("127.0.0.1", "127.0.0.1", 3, 3, &with_ports);
+        assert!(
+            matches!(five_tuple.classify(&ported_quote), Classified::Other),
+            "FiveTuple: an 8-byte transport quote names our ports and is our reaction"
+        );
+        assert!(
+            matches!(from_host.classify(&ported_quote), Classified::Other),
+            "FromHost: the same quote, carrying the port we sent from, is our reaction"
+        );
     }
 
     /// A reset that carries exactly our two ports but comes from **another
