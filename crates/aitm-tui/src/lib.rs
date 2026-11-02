@@ -336,6 +336,9 @@ pub const CORE_TOOLS: &[&str] = &[
     "check.ws-subprotocol-observe",
     "check.l4-packet-crash",
     "check.l4-packet-reaction",
+    "check.l4-crash",
+    "check.l4-parser-fault",
+    "check.l4-latency-outlier",
 ];
 
 /// An [`App`] for in-crate tests: `cols`×`rows`, connected to a bus that
