@@ -141,7 +141,19 @@ end); `.secrets` shredded. This is the runner the PR ships.
 | TUI | 0 | 0 | 11 | 0 | 0 | 3 |
 | WEB | 0 | 0 | 14 | 0 | 0 | 3 |
 
-## Run 4 — window half
+## Run 4 — read-only half on the final runner, 2026-11-02 03:35Z (`run-4-readonly-c3e55bee/`)
+
+The app's core had been restarted again (pid 98224, 0.5.11, no flows yet, Scope empty), so MAC-9a and
+MAC-9b are BLOCKED this time (nothing to judge) and the mac cell is SKIP; CLI-4/5/10 FAIL as before;
+N4-CLI/TUI/WEB and N5-TUI PASS; verdict **fail**. The restore diff is NOT empty this run and the cause
+is the harness's own CLI launches: every `aitm` the CLI journey and the N4 cells start (one-shots, the
+refused `aitm web`/`aitm tui`) writes a `start` marker into the operator's shared `audit.jsonl`, so the
+audit-tail section of `state-after.txt` shows three new `{"marker":"start",…,"version":"0.5.11"}` lines
+and the tail has rolled past the attribution session's `scope.remove` entries. No proxy, CA, Scope,
+capture or extension reading changed. `.secrets` did not exist after the run (never written: the web
+cell did not run). Secret grep: 2 values known at start and end, none found.
+
+## Run 5 — window half
 
 Pending: display lock after the attribution session's Task 8; yes-list requested from Matt
 (MAC-1/16 quit + relaunch, MAC-6/15, MAC-7/14 not needed while All Apps is on, Safari visits,
