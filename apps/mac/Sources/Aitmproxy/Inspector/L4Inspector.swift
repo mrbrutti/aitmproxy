@@ -28,7 +28,7 @@ struct L4Inspector: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let reason = session.l4Availability.reason {
+            if let reason = session.l4CaptureAvailability.reason {
                 L4DegradedBanner(reason: reason)
                 Rule()
             }
@@ -103,7 +103,7 @@ struct L4Inspector: View {
                     .help(gate.disabledReason ?? "Parse the YAML and preview the on-wire bytes")
                 Button("Inject…") { beginInject() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!gate.injectEnabled || preview == nil || !session.l4Availability.canDriveWire)
+                    .disabled(!gate.injectEnabled || preview == nil || !session.l4CaptureAvailability.canDriveWire)
                     .help(injectHelp)
                 Spacer()
                 if let preview {
@@ -134,7 +134,7 @@ struct L4Inspector: View {
 
     private var injectHelp: String {
         if !gate.injectEnabled { return gate.disabledReason ?? "" }
-        if !session.l4Availability.canDriveWire { return session.l4Availability.reason ?? "" }
+        if !session.l4CaptureAvailability.canDriveWire { return session.l4CaptureAvailability.reason ?? "" }
         if preview == nil { return "Build the packet first" }
         return "Inject through l4.inject — the guard confirms over the wire before anything hits the wire"
     }
@@ -175,13 +175,11 @@ struct L4Inspector: View {
                 } else {
                     // A plain result (no confirmation needed) — report it.
                     injectResult = "Injected."
-                    session.l4LastWireError = nil
                 }
             } catch {
                 // A guard refusal is surfaced verbatim, never as a confirm dialog.
                 let message = BusService.describe(error)
                 injectResult = message
-                if message.lowercased().contains("l4 unavailable") { session.l4LastWireError = message }
             }
         }
     }
@@ -195,7 +193,6 @@ struct L4Inspector: View {
             do {
                 _ = try await session.runCommand(command, args)
                 injectResult = "\(command) confirmed."
-                session.l4LastWireError = nil
             } catch {
                 injectResult = BusService.describe(error)
             }

@@ -15,6 +15,9 @@ final class BusService: FlowActions {
     var pollInterval: Duration = .milliseconds(500)
     /// `ca.status` is read on one poll tick in this many (spec D17.10: about every 5 s).
     static let caStatusEveryTicks = 10
+    /// The L4 status, scope and parked reads run on one poll tick in this many (l4-parity plan,
+    /// unit (d) amendment 6: the same ~5 s cadence as `ca.status`; spec §1 says re-read, never cache).
+    static let l4StatusEveryTicks = 10
 
     @ObservationIgnored private var client: BusClient?
     @ObservationIgnored private var runTask: Task<Void, Never>?
@@ -173,6 +176,13 @@ final class BusService: FlowActions {
             session.forgetCATrust()
             // Likewise the system-proxy facts: the route and the menu title must not keep a gone core's word.
             session.forgetSystemProxy()
+            // And the L4 facts (l4-parity spec §1: never cached for the session): a new core is
+            // re-read from `.pending`, and no stale scope or parked packet shows under a failed badge.
+            session.l4CaptureAvailability = .pending
+            session.l4InterceptAvailability = .pending
+            session.l4Scope = []
+            session.l4Parked = []
+            session.l4CanAddScope = false
         }
         var tick = 0
         while !Task.isCancelled && owns() {
@@ -192,6 +202,12 @@ final class BusService: FlowActions {
             // CA trust is the OS store's fact (spec D17.5, D17.10): read on the first tick and every
             // 10th (about every 5 s), because each read spawns `security` per store on the core side.
             if tick % Self.caStatusEveryTicks == 0 { await session.refreshCAStatus() }
+            // Same: the L4 reads below go through `self.client`.
+            guard owns() else { return }
+            // L4 availability, scope and parked packets are the core's facts (l4-parity spec §1): read on
+            // the first tick and every 10th, only from a core that advertises the L4 family. Each write
+            // inside is the owner's, guarded after every await.
+            if tick % Self.l4StatusEveryTicks == 0, session.l4Enabled { await refreshL4State(generation: generation) }
             // From here the iteration is the owner's: the stop() that retired a superseded run is
             // closing its socket, so whatever it still listed would only be dropped at the next guard.
             guard owns() else { return }
@@ -291,6 +307,50 @@ final class BusService: FlowActions {
         } else if session.systemProxyFacts != nil {
             session.forgetSystemProxy()
         }
+    }
+
+    /// `l4.capture.status` / `l4.intercept.status` → the two availabilities, `l4.scope.list` → the
+    /// L4 scope, `l4.intercept.list` → the parked packets (only while intercept is available, spec §4:
+    /// the UI does not poll it otherwise), and `tools/list`'s `confirmable` on `l4.scope.add` → whether
+    /// the operator scope-add control renders. Each verb's reply is mapped through the Kit's pure
+    /// parsers; a status verb that fails degrades through its error text (an older core's gated verb
+    /// says `L4 unavailable: …`). Polls, not actions: nothing here is recorded in the activity log,
+    /// like `flow.list` and `proxy.status`. Every session write is the owner's (`generation` still
+    /// current after the await) and change-guarded like the other per-tick writes.
+    private func refreshL4State(generation: Int) async {
+        func owns() -> Bool { generation == runGeneration }
+        /// One poll read: the reply, or the error's text; never both.
+        func read(_ name: String) async -> (status: JSONValue?, error: String?) {
+            guard let client else { return (nil, BusError.disconnected.description) }
+            do { return (try await client.call(name), nil) } catch { return (nil, Self.describe(error)) }
+        }
+        let capture = await read("l4.capture.status")
+        guard owns() else { return }
+        let captureAvailability = L4Availability.resolve(status: capture.status, error: capture.error)
+        if session.l4CaptureAvailability != captureAvailability { session.l4CaptureAvailability = captureAvailability }
+
+        let intercept = await read("l4.intercept.status")
+        guard owns() else { return }
+        let interceptAvailability = L4Availability.resolve(status: intercept.status, error: intercept.error)
+        if session.l4InterceptAvailability != interceptAvailability { session.l4InterceptAvailability = interceptAvailability }
+
+        let scope = await read("l4.scope.list")
+        guard owns() else { return }
+        if let reply = scope.status {
+            let items = L4ScopeItem.list(reply)
+            if session.l4Scope != items { session.l4Scope = items }
+        }
+
+        var parked: [L4ParkedPacket] = []
+        if interceptAvailability == .available {
+            let list = await read("l4.intercept.list")
+            guard owns() else { return }
+            parked = list.status.map(L4ParkedPacket.list) ?? session.l4Parked
+        }
+        if session.l4Parked != parked { session.l4Parked = parked }
+
+        let canAddScope = L4Wire.supportsOperatorScopeAdd(tools)
+        if session.l4CanAddScope != canAddScope { session.l4CanAddScope = canAddScope }
     }
 
     // MARK: FlowActions
