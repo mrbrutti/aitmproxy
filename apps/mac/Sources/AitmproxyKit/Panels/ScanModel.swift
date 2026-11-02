@@ -150,6 +150,41 @@ public enum ScanStoppedReason: ScanVocabulary {
     }
 }
 
+/// `CrawlErrorKind`: why every request of an all-failing crawl failed
+/// (`crawl.last_error`). The engine's own token `other` is a known case; a
+/// string this build does not know lands in `unknown`, so the two never collide.
+public enum ScanCrawlErrorKind: ScanVocabulary {
+    case h2NotNegotiated, connectRefused, tls, timeout, transport, other
+    case unknown(String)
+
+    public init?(rawValue: String) {
+        switch rawValue {
+        case "h2_not_negotiated": self = .h2NotNegotiated
+        case "connect_refused": self = .connectRefused
+        case "tls": self = .tls
+        case "timeout": self = .timeout
+        case "transport": self = .transport
+        case "other": self = .other
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .h2NotNegotiated: "h2_not_negotiated"
+        case .connectRefused: "connect_refused"
+        case .tls: "tls"
+        case .timeout: "timeout"
+        case .transport: "transport"
+        case .other: "other"
+        case .unknown(let raw): raw
+        }
+    }
+
+    /// The `ScanVocabulary` escape hatch: an unknown wire string.
+    public static func other(_ raw: String) -> Self { .unknown(raw) }
+}
+
 /// `LaneKind`: which protocol lane a point, check, probe or issue belongs to.
 public enum ScanLane: ScanVocabulary {
     case http, ws, l4Packet, l4Stream
@@ -755,12 +790,18 @@ extension ScanProbeCounters {
     }
 }
 
-/// `CrawlCounters`: how far the crawl got.
+/// `CrawlCounters`: how far the crawl got, and what went wrong on the way.
 public struct ScanCrawlCounters: Hashable, Sendable {
     public var pages: Int
     public var queued: Int
     public var depth: Int
     public var formsSubmitted: Int
+    /// Crawl requests that failed; 0 on an older core.
+    public var errors: Int
+    /// Forms the crawl left alone; 0 on an older core.
+    public var formsSkipped: Int
+    /// Why every request failed when none got a page; nil otherwise.
+    public var lastError: ScanCrawlErrorKind?
 }
 
 extension ScanCrawlCounters {
@@ -770,6 +811,9 @@ extension ScanCrawlCounters {
         queued = try wire.int("queued", default: 0)
         depth = try wire.int("depth", default: 0)
         formsSubmitted = try wire.int("forms_submitted", default: 0)
+        errors = try wire.int("errors", default: 0)
+        formsSkipped = try wire.int("forms_skipped", default: 0)
+        lastError = try wire.optionalVocab("last_error")
     }
 }
 
@@ -808,12 +852,39 @@ extension ScanPointCounters {
     }
 }
 
-/// `CheckCounters`: checks scheduled, done and running right now.
+/// `CheckErrorSample`: one sampled check error or skip: which check, the first
+/// point it happened on, and the engine's scrubbed detail. A missing key reads
+/// `""` (the engine's `#[serde(default)]`).
+public struct ScanCheckErrorSample: Hashable, Sendable {
+    public var check: String
+    public var point: String
+    public var detail: String
+}
+
+extension ScanCheckErrorSample {
+    public init(json: JSONValue) throws {
+        let wire = try ScanWire(json, as: "ScanCheckErrorSample")
+        check = try wire.optionalString("check") ?? ""
+        point = try wire.optionalString("point") ?? ""
+        detail = try wire.optionalString("detail") ?? ""
+    }
+}
+
+/// `CheckCounters`: checks scheduled, done, running right now, and the ones
+/// that errored or could not run (with the engine's first samples of each).
 public struct ScanCheckCounters: Hashable, Sendable {
     public var scheduled: Int
     public var done: Int
     /// The ids of the checks in flight (the engine caps this at 8).
     public var running: [String]
+    /// Check runs that ended in an `error` verdict; 0 on an older core.
+    public var errors: Int
+    /// The first distinct error samples (the engine caps this at 8).
+    public var errorSamples: [ScanCheckErrorSample]
+    /// Items no lane could host; 0 on an older core.
+    public var skipped: Int
+    /// The first distinct skip samples (the engine caps this at 8).
+    public var skippedSamples: [ScanCheckErrorSample]
 }
 
 extension ScanCheckCounters {
@@ -822,6 +893,10 @@ extension ScanCheckCounters {
         scheduled = try wire.int("scheduled", default: 0)
         done = try wire.int("done", default: 0)
         running = try wire.strings("running")
+        errors = try wire.int("errors", default: 0)
+        errorSamples = try wire.array("error_samples").map { try ScanCheckErrorSample(json: $0) }
+        skipped = try wire.int("skipped", default: 0)
+        skippedSamples = try wire.array("skipped_samples").map { try ScanCheckErrorSample(json: $0) }
     }
 }
 

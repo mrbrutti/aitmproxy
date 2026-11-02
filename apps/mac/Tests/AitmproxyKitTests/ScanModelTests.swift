@@ -940,4 +940,63 @@ extension ScanModelTests {
         #expect(ScanFormat.relative(ms: topIssue.firstSeen, now: 1_761_900_000_000) == "0 s ago")
         #expect(ScanFormat.relative(ms: 0, now: topIssue.firstSeen) == "2501999792 h ago")
     }
+
+    /// AC1 and AC2 (Jobs view spec D1): the check-error, skipped-check and crawl-error
+    /// fields decode with their literals, and an older core's status without them
+    /// reads 0 / `[]` / nil.
+    @Test func checkAndCrawlErrorFieldsDecodeWithDefaults() throws {
+        let checks = try ScanCheckCounters(json: JSONValue.parse(Data("""
+            {"scheduled":4,"done":3,"running":[],"errors":7,\
+            "error_samples":[{"check":"http.xss","point":"p1","detail":"Connection refused (os error 61)"}],\
+            "skipped":3,"skipped_samples":[{"check":"fake.point","point":"p2","detail":"the lane hosts nothing"}]}
+            """.utf8)))
+        #expect(checks.scheduled == 4)
+        #expect(checks.done == 3)
+        #expect(checks.errors == 7)
+        #expect(checks.errorSamples.count == 1)
+        #expect(checks.errorSamples[0] == ScanCheckErrorSample(check: "http.xss", point: "p1", detail: "Connection refused (os error 61)"))
+        #expect(checks.errorSamples[0].detail == "Connection refused (os error 61)")
+        #expect(checks.skipped == 3)
+        #expect(checks.skippedSamples.count == 1)
+        #expect(checks.skippedSamples[0].check == "fake.point")
+        #expect(checks.skippedSamples[0].point == "p2")
+        #expect(checks.skippedSamples[0].detail == "the lane hosts nothing")
+
+        // A sample with a key missing reads "" (the engine's `#[serde(default)]`).
+        #expect(try ScanCheckErrorSample(json: ["check": "http.xss"]) == ScanCheckErrorSample(check: "http.xss", point: "", detail: ""))
+        #expect(throws: BusError.self) { try ScanCheckErrorSample(json: ["check": 7]) }
+        #expect(throws: BusError.self) { try ScanCheckCounters(json: ["error_samples": "nope"]) }
+
+        let crawl = try ScanCrawlCounters(json: JSONValue.parse(Data("""
+            {"pages":1,"queued":0,"depth":0,"forms_submitted":0,"errors":1,"forms_skipped":2,"last_error":"connect_refused"}
+            """.utf8)))
+        #expect(crawl.pages == 1)
+        #expect(crawl.errors == 1)
+        #expect(crawl.formsSkipped == 2)
+        #expect(crawl.lastError == .connectRefused)
+
+        let weird = try ScanCrawlCounters(json: ["pages": 0, "last_error": "weird"])
+        #expect(weird.lastError == .unknown("weird"))
+        #expect(weird.lastError?.rawValue == "weird")
+        #expect(try ScanCrawlCounters(json: ["pages": 0, "last_error": .null]).lastError == nil)
+
+        // The vocabulary spells the wire both ways; the engine's own `other` is a known case.
+        let kinds: [ScanCrawlErrorKind] = [.h2NotNegotiated, .connectRefused, .tls, .timeout, .transport, .other]
+        #expect(kinds.map(\.rawValue) == ["h2_not_negotiated", "connect_refused", "tls", "timeout", "transport", "other"])
+        for kind in kinds {
+            #expect(ScanCrawlErrorKind(rawValue: kind.rawValue) == kind)
+        }
+        #expect(ScanCrawlErrorKind(rawValue: "other") == .other)
+        #expect(ScanCrawlErrorKind.other("x") == .unknown("x"))
+
+        // The fixture pack's status carries none of the keys: zero, empty, nil.
+        let status = try ScanJobStatus(json: ScanPack.load("scan.status.json"))
+        #expect(status.checks.errors == 0)
+        #expect(status.checks.errorSamples == [])
+        #expect(status.checks.skipped == 0)
+        #expect(status.checks.skippedSamples == [])
+        #expect(status.crawl.errors == 0)
+        #expect(status.crawl.formsSkipped == 0)
+        #expect(status.crawl.lastError == nil)
+    }
 }
