@@ -1706,6 +1706,10 @@ pub(crate) mod test_support {
         /// [`JobCtx::report_crawl_error`], one per failed crawl request, as the
         /// interim lane does (amendment 39).
         crawl_errors: Vec<(String, String)>,
+        /// Forms `discover` reports as submitted through
+        /// [`JobCtx::report_forms_submitted`], as a crawl that posted them
+        /// does (amendment 53).
+        forms_submitted: u64,
     }
 
     impl FakeLane {
@@ -1727,6 +1731,7 @@ pub(crate) mod test_support {
                 discover_charge: 0,
                 crawl_flows: 0,
                 crawl_errors: Vec::new(),
+                forms_submitted: 0,
             }
         }
 
@@ -1770,6 +1775,14 @@ pub(crate) mod test_support {
                 .into_iter()
                 .map(|(o, r)| (o.to_string(), r.to_string()))
                 .collect();
+            self
+        }
+
+        /// `discover` reports `count` submitted forms through
+        /// `JobCtx::report_forms_submitted`, like a client crawl that posted
+        /// `count` forms (amendment 53).
+        pub(crate) fn with_forms_submitted(mut self, count: u64) -> Self {
+            self.forms_submitted = count;
             self
         }
 
@@ -1832,6 +1845,9 @@ pub(crate) mod test_support {
                 }
                 for (origin, reason) in &self.crawl_errors {
                     job.report_crawl_error(origin, reason);
+                }
+                if self.forms_submitted > 0 {
+                    job.report_forms_submitted(self.forms_submitted);
                 }
                 if self.discover_panic {
                     panic!("{PANIC_TEXT}");

@@ -268,6 +268,9 @@ pub struct JobRuntime {
     /// (`JobCtx::report_forms_skipped`), folded into `crawl.forms_skipped` by
     /// `sync_counters`.
     forms_skipped: AtomicU64,
+    /// Forms the crawl submitted (`JobCtx::report_forms_submitted`), folded
+    /// into `crawl.forms_submitted` by `sync_counters` (amendment 53).
+    forms_submitted: AtomicU64,
 }
 
 impl JobRuntime {
@@ -466,6 +469,10 @@ impl JobCtx for JobRuntime {
         self.forms_skipped.fetch_add(count, Ordering::SeqCst);
     }
 
+    fn report_forms_submitted(&self, count: u64) {
+        self.forms_submitted.fetch_add(count, Ordering::SeqCst);
+    }
+
     fn report_session_canary(&self, canary: Canary) {
         self.with_session(|session| session.canary = canary);
     }
@@ -629,6 +636,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         crawl_errors: AtomicU64::new(0),
         last_crawl_error: Mutex::new(None),
         forms_skipped: AtomicU64::new(0),
+        forms_submitted: AtomicU64::new(0),
     });
     let job_ctx: Arc<dyn JobCtx> = Arc::clone(&runtime) as Arc<dyn JobCtx>;
 
@@ -1485,6 +1493,10 @@ fn sync_counters(
         runtime.forms_skipped.load(Ordering::SeqCst),
     );
     raise(
+        &mut guarded.crawl.forms_submitted,
+        runtime.forms_submitted.load(Ordering::SeqCst),
+    );
+    raise(
         &mut guarded.probes.rate_waits,
         meter.rate_waits.load(Ordering::SeqCst),
     );
@@ -1911,6 +1923,28 @@ mod tests {
         assert_eq!(status.crawl.errors, 1);
         assert!(status.crawl.pages >= 1, "pages: {}", status.crawl.pages);
         assert_eq!(status.crawl.last_error, None);
+    }
+
+    /// Amendment 53, full run: a lane that reports three submitted forms
+    /// through `JobCtx::report_forms_submitted` ends with
+    /// `crawl.forms_submitted == 3` on the terminal status — the counter the
+    /// model carried but nothing wrote until the hook existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reported_form_submissions_reach_the_status() {
+        let h = Harness::new().with_lane(FakeLane::http().with_forms_submitted(3));
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.crawl.forms_submitted, 3, "{:?}", status.crawl);
+        assert_eq!(status.crawl.forms_skipped, 0, "a submit is not a skip");
+        assert_eq!(status.crawl.errors, 0);
     }
 
     /// Spec D5 / call B15: a host whose answers are all unusable trips the
@@ -2444,6 +2478,7 @@ mod tests {
             crawl_errors: AtomicU64::new(0),
             last_crawl_error: Mutex::new(None),
             forms_skipped: AtomicU64::new(0),
+            forms_submitted: AtomicU64::new(0),
         };
         (runtime, status)
     }
@@ -2474,6 +2509,43 @@ mod tests {
         let seen = status.read().expect("status");
         assert_eq!(seen.crawl.errors, 1, "a sync copies, it does not add");
         assert_eq!(seen.crawl.forms_skipped, 1);
+    }
+
+    /// Amendment 53: `report_forms_submitted` accumulates across calls and a
+    /// sync copies the runtime's tally onto `crawl.forms_submitted` — it does
+    /// not add it again — exactly as `forms_skipped` behaves.
+    #[test]
+    fn reported_form_submissions_are_copied_not_added_by_a_sync() {
+        use aitm_scan_model::JobCtx;
+        let h = Harness::bare();
+        let (runtime, status) = bare_runtime(&h, "scan-0c0ffee2", 1);
+        let meter = crate::client::ProbeMeter::default();
+        let issues = crate::issues::IssueStore::new(None);
+
+        runtime.report_forms_submitted(2);
+        runtime.report_forms_submitted(1);
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee2");
+        assert_eq!(status.read().expect("status").crawl.forms_submitted, 3);
+
+        super::sync_counters(&status, &meter, &runtime, &issues, "scan-0c0ffee2");
+        let seen = status.read().expect("status");
+        assert_eq!(
+            seen.crawl.forms_submitted, 3,
+            "a sync copies, it does not add"
+        );
+        assert_eq!(seen.crawl.forms_skipped, 0);
+    }
+
+    /// Amendment 53 is additive on the wire: a status record written before
+    /// any lane reported submissions — no `forms_submitted` key at all —
+    /// still parses, and reads 0 (the struct-level serde default).
+    #[test]
+    fn a_record_without_forms_submitted_reads_zero() {
+        let old: aitm_scan_model::CrawlCounters =
+            serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1}"#)
+                .expect("a record without forms_submitted parses");
+        assert_eq!(old.forms_submitted, 0);
+        assert_eq!(old.pages, 3);
     }
 
     /// Replicate the end-of-crawling fold the worker does: fold `crawl.errors`

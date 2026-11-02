@@ -291,6 +291,17 @@ pub trait JobCtx: Send + Sync {
     fn report_forms_skipped(&self, count: u64) {
         let _ = count;
     }
+
+    /// The crawl submitted `count` forms it found — sent them, with inert
+    /// generated values, as the map's way of reaching routes (see
+    /// `CrawlCounters::forms_submitted`). The engine adds them to
+    /// `crawl.forms_submitted`, so beside `forms_skipped` a frontend can say
+    /// how much of the form surface the map actually walked (amendment 53).
+    ///
+    /// A no-op by default.
+    fn report_forms_submitted(&self, count: u64) {
+        let _ = count;
+    }
 }
 
 /// What one lane's discovery pass found (spec D2).

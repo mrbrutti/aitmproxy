@@ -201,6 +201,10 @@ impl InterimHttpLane {
         if crawled.forms_skipped > 0 {
             job.report_forms_skipped(u64::from(crawled.forms_skipped));
         }
+        // Amendment 53: the forms the crawl posted feed `crawl.forms_submitted`.
+        if crawled.forms_submitted > 0 {
+            job.report_forms_submitted(u64::from(crawled.forms_submitted));
+        }
         // Amendment 39: each failed request is one `crawl.errors` unit, named by
         // its classified token. `last_error` is the aggregate kind the crawl
         // retained; the reason is a token, so there is nothing to scrub.
@@ -1169,7 +1173,7 @@ fn passive_meta(
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1643,6 +1647,8 @@ mod tests {
         /// Every `(origin, reason)` the lane reported through
         /// [`JobCtx::report_crawl_error`].
         crawl_errors: Mutex<Vec<(String, String)>>,
+        /// Forms the lane reported through [`JobCtx::report_forms_submitted`].
+        forms_submitted: AtomicU64,
     }
 
     impl TestJob {
@@ -1662,7 +1668,12 @@ mod tests {
                 charged: AtomicU32::new(0),
                 cancelled: std::sync::atomic::AtomicBool::new(false),
                 crawl_errors: Mutex::new(Vec::new()),
+                forms_submitted: AtomicU64::new(0),
             }
+        }
+
+        fn forms_submitted(&self) -> u64 {
+            self.forms_submitted.load(Ordering::SeqCst)
         }
 
         fn charged(&self) -> u32 {
@@ -1723,6 +1734,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((origin.to_string(), reason.to_string()));
+        }
+        fn report_forms_submitted(&self, count: u64) {
+            self.forms_submitted.fetch_add(count, Ordering::SeqCst);
         }
     }
 
@@ -2303,6 +2317,36 @@ mod tests {
             client.trail()
         );
         assert_eq!(point_named(&discovery, "q").kind, InsertionKind::Query);
+    }
+
+    /// Amendment 53: the interim lane feeds `crawl.forms_submitted` too — the
+    /// one form its client crawl posted reaches the job through
+    /// `JobCtx::report_forms_submitted`, and the skipped one beside it does
+    /// not count there (`max_depth: 1` parses the seed page only).
+    #[tokio::test]
+    async fn the_client_crawl_reports_the_forms_it_submitted() {
+        const PAGE: &str = "<html><body>\
+             <form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>\
+             <form action=\"/account/delete\" method=\"post\"><input name=\"id\"></form>\
+             </body></html>";
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/html; charset=utf-8", PAGE));
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.profile.crawl.max_depth = 1;
+
+        let _ = discover_with(&job).await;
+
+        let trail: Vec<String> = client
+            .seen()
+            .iter()
+            .map(|(req, _)| format!("{} {}", req.method, req.path))
+            .collect();
+        assert_eq!(
+            trail,
+            vec!["GET /", "POST /comments"],
+            "one form posted, the delete form left alone"
+        );
+        assert_eq!(job.forms_submitted(), 1);
     }
 
     // ---- wave-2/3 fix task ---------------------------------------------------

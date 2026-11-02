@@ -151,6 +151,13 @@ pub struct ClientCrawl {
     /// Forms the crawl found and deliberately did not submit — logout-looking
     /// or destructive-looking ones (`CrawlCounters::forms_skipped`).
     pub forms_skipped: u32,
+    /// Forms the crawl submitted and got an answer for
+    /// (`CrawlCounters::forms_submitted`, amendment 53): the `POST`
+    /// navigations a form became and the client sent. A form the crawl
+    /// skipped is in `forms_skipped`, not here; a `POST` whose send failed is
+    /// in `failed`. A `GET` form is a navigation like any link and is counted
+    /// in `pages` only.
+    pub forms_submitted: u32,
     /// Why it stopped, or `None` when the reachable graph was exhausted.
     pub stopped: Option<CrawlStop>,
 }
@@ -203,6 +210,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
             failed: 0,
             last_error: None,
             forms_skipped: 0,
+            forms_submitted: 0,
             stopped: Some(CrawlStop::BadOrigin),
         };
     };
@@ -223,6 +231,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     let mut failed = 0u32;
     let mut last_error: Option<CrawlErrorKind> = None;
     let mut forms_skipped = 0u32;
+    let mut forms_submitted = 0u32;
     let mut attempts = 0u32;
     let mut depth_hit = false;
     let mut stopped: Option<CrawlStop> = None;
@@ -269,6 +278,11 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
             }
         };
         pages += 1;
+        // Only a form becomes a `POST` navigation, so an answered `POST` is a
+        // form the crawl submitted (amendment 53).
+        if nav.method == "POST" {
+            forms_submitted = forms_submitted.saturating_add(1);
+        }
 
         let Some(response) = flow.response.as_ref() else {
             continue;
@@ -326,6 +340,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
         failed,
         last_error,
         forms_skipped,
+        forms_submitted,
         stopped: stopped.or(depth_hit.then_some(CrawlStop::MaxDepth)),
     }
 }
@@ -1219,6 +1234,8 @@ mod tests {
         struct PathClient {
             answers: std::collections::HashMap<&'static str, Answer>,
             default: Answer,
+            /// `METHOD path` for every request, in order.
+            trail: std::sync::Mutex<Vec<String>>,
         }
 
         impl PathClient {
@@ -1226,7 +1243,12 @@ mod tests {
                 Arc::new(Self {
                     answers: answers.into_iter().collect(),
                     default,
+                    trail: std::sync::Mutex::new(Vec::new()),
                 })
+            }
+
+            fn trail(&self) -> Vec<String> {
+                self.trail.lock().unwrap_or_else(|e| e.into_inner()).clone()
             }
         }
 
@@ -1252,6 +1274,10 @@ mod tests {
             ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
                 Box::pin(async move {
                     let path = req.path.split('?').next().unwrap_or("/");
+                    self.trail
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("{} {path}", req.method));
                     let answer = self.answers.get(path).unwrap_or(&self.default);
                     let (status, ctype, body) = match answer {
                         Answer::Err(message) => return Err(anyhow::anyhow!(*message)),
@@ -1377,6 +1403,59 @@ mod tests {
             assert_eq!(crawled.pages, 2, "the seed and the reachable link");
             assert_eq!(crawled.failed, 1, "exactly the refused link");
             assert_eq!(crawled.last_error, Some(CrawlErrorKind::ConnectRefused));
+        }
+
+        /// Amendment 53: `forms_submitted` is the number of forms the crawl
+        /// actually sent — the POSTs on the wire — and nothing else: the
+        /// logout-looking and destructive-looking forms it refused are
+        /// `forms_skipped`, a link is a page, and a form whose send failed
+        /// was not submitted.
+        #[tokio::test]
+        async fn submitted_forms_are_counted() {
+            let seed = concat!(
+                "<html><body>",
+                "<a href=\"/about\">about</a>",
+                "<form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>",
+                "<form action=\"/notes\" method=\"post\"><input name=\"note\"></form>",
+                "<form action=\"/account/delete\" method=\"post\"><input name=\"id\"></form>",
+                "<form action=\"/logout\" method=\"post\"></form>",
+                "<form action=\"/broken\" method=\"post\"><input name=\"x\"></form>",
+                "</body></html>",
+            );
+            let client = PathClient::new(
+                Answer::Ok,
+                vec![
+                    ("/", Answer::Html(seed)),
+                    ("/broken", Answer::Err("connection refused")),
+                ],
+            );
+            let job = Job::new(Arc::clone(&client) as Arc<dyn ProxyClient>);
+            let crawled = crawl_with_client("http://scan.test", &job).await;
+
+            let posts_sent = client
+                .trail()
+                .iter()
+                .filter(|line| line.starts_with("POST "))
+                .count();
+            assert_eq!(
+                client.trail(),
+                vec![
+                    "GET /",
+                    "GET /about",
+                    "POST /comments",
+                    "POST /notes",
+                    "POST /broken",
+                ],
+                "the two skipped forms never reach the wire"
+            );
+            assert_eq!(posts_sent, 3, "three POSTs went out, one of them failed");
+            assert_eq!(
+                crawled.forms_submitted, 2,
+                "the POSTs that were answered: {crawled:?}"
+            );
+            assert_eq!(crawled.forms_skipped, 2, "delete + logout");
+            assert_eq!(crawled.failed, 1, "the broken form's send");
+            assert_eq!(crawled.pages, 4, "seed, about, comments, notes");
         }
     }
 }
