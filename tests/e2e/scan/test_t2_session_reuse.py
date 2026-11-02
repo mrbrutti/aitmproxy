@@ -127,8 +127,14 @@ def main() -> None:
                 sess2 = st2.get("session")
                 check(sess2 is None or sess2.get("reused") is False,
                       f"job 2 did not reuse a session ({sess2})")
-                xs2 = account_issues(issues(op, "operator", job=job2))
-                check(not xs2, f"job 2: no issue on /account ({len(xs2)})")
+                # AC T2-4 is about the session-dependent *reflected-xss* on /account.
+                # The engine's shipped passive checks (`security-header`, `reflection`)
+                # legitimately report job 2's own unauthenticated 302 from /account and
+                # are merged across jobs (`Issue.jobs`), so only the active reflection
+                # class counts here (measured 2026-11-02: job 2 sends no cookie to
+                # /account and gets 302 on every request).
+                xs2 = reflected(account_issues(issues(op, "operator", job=job2)))
+                check(not xs2, f"job 2: no reflected-xss issue on /account ({len(xs2)})")
                 acct2 = [e for e in V.logs.scanner_requests(seq1) if e.get("path") == "/account"]
                 check(bool(acct2), f"V log shows job 2 requested /account ({len(acct2)})")
                 statuses = sorted({e.get("status") for e in acct2})
