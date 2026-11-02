@@ -620,9 +620,11 @@ mod tests {
     }
 
     /// F2 (sandbox): launchd's fd table is `EPERM` and an impossible pid is
-    /// `ESRCH`; a probe reports both as `gone` and finds nothing. Our own pid
-    /// has sockets (the test harness), so it is probed, matches a tuple nobody
-    /// owns on nothing, and is not gone.
+    /// `ESRCH`; a probe reports both as `gone` and finds nothing. Our own pid,
+    /// holding a socket (a `socketpair`, which needs no bind, so it works in
+    /// the sandbox), is probed, matches a tuple nobody owns on nothing, and is
+    /// not gone. Quality finding Q2 (2026-11-01): a pid with fds but **no
+    /// socket** among them is gone as well, so the socket must really exist.
     #[test]
     fn a_targeted_probe_reports_unreadable_pids_gone() {
         let nobody = Tuple {
@@ -635,6 +637,7 @@ mod tests {
         assert_eq!(probe.gone, vec![1, i32::MAX as u32]);
 
         let me = std::process::id();
+        let _held = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let probe = find_owners_among_raw(&[nobody], deadline, None, &[me]);
         assert!(probe.owners.is_empty(), "{:?}", probe.owners);
         assert!(probe.gone.is_empty(), "{:?}", probe.gone);
