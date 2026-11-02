@@ -2276,14 +2276,15 @@ extension ScanSurfaceTests {
         empty.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         #expect(empty.selectedJob == nil)
 
-        // D6: a list failure stamps `listFailedAt` beside the error; the next list clears it.
+        // D6: a list failure stamps `readFailedAt` beside the error; the next list clears it.
         var failed = ScanSurfaceModel()
-        failed.noteListFailure(core: "the bus did not reply in time", now: 5_000)
+        failed.noteReadFailure(
+            text: "Unable to list jobs: the bus did not reply in time", core: "the bus did not reply in time", now: 5_000)
         #expect(failed.jobsError == "Unable to list jobs: the bus did not reply in time")
-        #expect(failed.listFailedAt == 5_000)
+        #expect(failed.readFailedAt == 5_000)
         failed.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 7_000)
         #expect(failed.jobsError == nil)
-        #expect(failed.listFailedAt == nil)
+        #expect(failed.readFailedAt == nil)
         #expect(failed.jobsLoadedAt == 7_000)
     }
 
@@ -2308,10 +2309,12 @@ extension ScanSurfaceTests {
         model.applyStatus(try Self.status(state: .cancelling, elapsedMs: 44_000))
         #expect(model.cancelTarget == nil)
 
-        // A queued job is a target; with the selection on a done job the only live job is the target.
+        // A queued job is a target. With the selection on a done job there is no target
+        // (D2 amendment: never a job the operator is not looking at); with no selection
+        // the only live job is the target.
         model.applyStatus(try Self.status(state: .queued, elapsedMs: 0))
         model.selectedJob = "scan-55667788"
-        #expect(model.cancelTarget == "scan-1a2b3c4d")
+        #expect(model.cancelTarget == nil)
         model.selectedJob = nil
         #expect(model.cancelTarget == "scan-1a2b3c4d")
 
@@ -2328,41 +2331,41 @@ extension ScanSurfaceTests {
     /// AC12 (unit half) and D15's banner table: the link kind from the bus state
     /// and the last list failure, the values' age, the verb gate and the words.
     @Test func jobsLinkKindsAndAge() {
-        let reconnecting = ScanJobsLink.make(bus: .connecting("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
+        let reconnecting = ScanJobsLink.make(bus: .connecting("…"), readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
         #expect(reconnecting.kind == .reconnecting)
         #expect(reconnecting.valuesAgeMs == 42_000)
         #expect(reconnecting.verbsEnabled == false)
         #expect(reconnecting.bannerText == "Bus disconnected · showing values from 0:42 ago · reconnecting…")
 
-        let unanswered = ScanJobsLink.make(bus: .connected("…"), listFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
+        let unanswered = ScanJobsLink.make(bus: .connected("…"), readFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
         #expect(unanswered.kind == .unanswered)
         #expect(unanswered.valuesAgeMs == 42_000)
         #expect(unanswered.verbsEnabled == false)
         #expect(unanswered.bannerText == "The core is not answering · showing values from 0:42 ago · retrying every 2 s")
 
-        let live = ScanJobsLink.make(bus: .connected("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
+        let live = ScanJobsLink.make(bus: .connected("…"), readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
         #expect(live.kind == .live)
         #expect(live.valuesAgeMs == 42_000)
         #expect(live.verbsEnabled == true)
         #expect(live.bannerText == nil)
 
-        let disconnected = ScanJobsLink.make(bus: .disconnected, listFailedAt: nil, jobsLoadedAt: nil, now: 43_000)
+        let disconnected = ScanJobsLink.make(bus: .disconnected, readFailedAt: nil, jobsLoadedAt: nil, now: 43_000)
         #expect(disconnected.kind == .disconnected)
         #expect(disconnected.valuesAgeMs == nil)
         #expect(disconnected.verbsEnabled == false)
         #expect(disconnected.bannerText == "Bus disconnected · Proxy ▸ Reconnect Bus (⌃⌘R) to retry",
                 "the age clause is omitted before the first list")
 
-        let disconnectedAged = ScanJobsLink.make(bus: .disconnected, listFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
+        let disconnectedAged = ScanJobsLink.make(bus: .disconnected, readFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
         #expect(disconnectedAged.kind == .disconnected, "a dead bus outranks a failed list")
         #expect(disconnectedAged.bannerText
                 == "Bus disconnected · showing values from 0:42 ago · Proxy ▸ Reconnect Bus (⌃⌘R) to retry")
 
-        let failed = ScanJobsLink.make(bus: .failed("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
+        let failed = ScanJobsLink.make(bus: .failed("…"), readFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
         #expect(failed.kind == .disconnected)
         #expect(failed.verbsEnabled == false)
 
-        let unansweredUnaged = ScanJobsLink.make(bus: .connected("…"), listFailedAt: 5_000, jobsLoadedAt: nil, now: 43_000)
+        let unansweredUnaged = ScanJobsLink.make(bus: .connected("…"), readFailedAt: 5_000, jobsLoadedAt: nil, now: 43_000)
         #expect(unansweredUnaged.bannerText == "The core is not answering · retrying every 2 s")
 
         #expect(ScanFormat.listErrorText(core: "the bus did not reply in time", ageMs: 42_000)
@@ -2492,34 +2495,54 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.grouped(1_234_567) == "1,234,567")
     }
 
-    /// Fix 1.5b: the `Cancelling…` title (D2, AC5) and the inline list error's
-    /// age clause (D6, AC12) both come from the Kit. `noteListFailure(core:now:)`
-    /// keeps the raw core text so `inlineJobsError(ageMs:)` can add the last-good
-    /// clause, while `jobsError` itself keeps its plain wording; a failed cancel or
-    /// status read, which sets `jobsError` alone, keeps its own text verbatim.
+    /// Fix 1.5b and 1.5c: the `Cancelling…` title (D2, AC5) and the inline error's
+    /// age clause (D6, AC12) both come from the Kit. `noteReadFailure(text:core:now:)`
+    /// keeps the failed read's own wording and the core text so `inlineJobsError(ageMs:)`
+    /// can add the last-good clause, while `jobsError` itself keeps its plain wording.
+    /// Any failed Jobs read (list, status, cancel) marks the link (D6 amendment).
     @Test func cancellingTitleAndInlineListError() throws {
         #expect(ScanFormat.cancellingTitle == "Cancelling…")
 
         var model = ScanSurfaceModel()
-        model.noteListFailure(core: "the bus did not reply in time", now: 43_000)
-        #expect(model.listFailureCore == "the bus did not reply in time")
-        #expect(model.listFailedAt == 43_000)
+        model.noteReadFailure(
+            text: "Unable to list jobs: the bus did not reply in time", core: "the bus did not reply in time", now: 43_000)
+        #expect(model.readFailure
+                == ScanReadFailure(text: "Unable to list jobs: the bus did not reply in time", core: "the bus did not reply in time"))
+        #expect(model.readFailedAt == 43_000)
         #expect(model.jobsError == "Unable to list jobs: the bus did not reply in time")
         #expect(model.inlineJobsError(ageMs: 42_000)
                 == "Unable to list jobs: the bus did not reply in time. Showing values from 0:42 ago; retrying every 2 s.")
         #expect(model.inlineJobsError(ageMs: nil)
                 == "Unable to list jobs: the bus did not reply in time. Retrying every 2 s.")
 
-        // The next list that lands clears the core text with the stamp and the error.
+        // The next list that lands clears the failure with the stamp and the error.
         model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 45_000)
-        #expect(model.listFailureCore == nil)
-        #expect(model.listFailedAt == nil)
+        #expect(model.readFailure == nil)
+        #expect(model.readFailedAt == nil)
         #expect(model.jobsError == nil)
         #expect(model.inlineJobsError(ageMs: 1_000) == nil)
 
-        // A cancel failure is not a list failure: its text shows verbatim, no age clause.
-        model.jobsError = "Unable to cancel job scan-1a2b3c4d: nope"
-        #expect(model.inlineJobsError(ageMs: 42_000) == "Unable to cancel job scan-1a2b3c4d: nope")
+        // A failed status read marks the link too (the poll reads the selected job's status
+        // before the list, so against a frozen core it is the first to time out); the inline
+        // error starts with that read's own wording and carries the age clause.
+        model.noteReadFailure(
+            text: "Unable to read job scan-1a2b3c4d: the bus did not reply in time",
+            core: "the bus did not reply in time", now: 43_000)
+        #expect(model.jobsError == "Unable to read job scan-1a2b3c4d: the bus did not reply in time")
+        #expect(model.readFailedAt == 43_000)
+        #expect(ScanJobsLink.make(bus: .connected("…"), readFailedAt: 43_000, jobsLoadedAt: 1_000, now: 43_000).kind
+                == .unanswered)
+        #expect(model.inlineJobsError(ageMs: 42_000)
+                == "Unable to read job scan-1a2b3c4d: the bus did not reply in time. Showing values from 0:42 ago; retrying every 2 s.")
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 45_000)
+        #expect(model.readFailure == nil)
+        #expect(model.inlineJobsError(ageMs: 0) == nil)
+
+        // A failed cancel marks the link the same way, with its own wording.
+        model.noteReadFailure(text: "Unable to cancel job scan-1a2b3c4d: nope", core: "nope", now: 43_000)
+        #expect(model.readFailedAt == 43_000)
+        #expect(model.inlineJobsError(ageMs: 42_000)
+                == "Unable to cancel job scan-1a2b3c4d: nope. Showing values from 0:42 ago; retrying every 2 s.")
     }
 
     /// Tester (Jobs view plan 1.6): the edges of D2's precedence, the re-read rule,
@@ -2590,8 +2613,9 @@ extension ScanSurfaceTests {
         #expect(local.status?.job == "scan-local")
         #expect(started.mayCancel(job: "scan-local") == true)
         #expect(started.cancelTarget == "scan-local")
-        // D2 as written: with the selection on a cancelling job, Cancel Scan's target
-        // falls to the only queued or running job elsewhere in the list.
+        // D2 amendment: with the selection on a cancelling job, Cancel Scan has no target,
+        // even though another job in the list is running; the fallback to the only queued
+        // or running job applies only while nothing is selected, and never between two.
         var twoJobs = try Self.load("scan.list.json")
         var rows = try #require(twoJobs["jobs"]?.arrayValue)
         rows[1] = ScanPack.edited(rows[1], path: ["state"], to: "running")
@@ -2599,7 +2623,11 @@ extension ScanSurfaceTests {
         model.applyList(try ScanListResult(json: twoJobs), now: 0)
         model.applyStatus(try Self.status(state: .cancelling, elapsedMs: 43_000))
         model.selectedJob = "scan-1a2b3c4d"
-        #expect(model.cancelTarget == "scan-55667788")
+        #expect(model.cancelTarget == nil)
+        model.selectedJob = nil
+        #expect(model.cancelTarget == "scan-55667788", "no selection, one running job: that job")
+        model.applyStatus(try Self.status(state: .running, elapsedMs: 44_000))
+        #expect(model.cancelTarget == nil, "no selection, two running jobs: a guess, so nothing")
 
         // D3: an empty list never invents a selection, and a selection the list dropped
         // falls to nothing when the list is empty too.
@@ -2611,25 +2639,26 @@ extension ScanSurfaceTests {
         // D6: a connecting bus outranks a failed list; a second failure moves the stamp and
         // keeps the age of the last good list; the age clause clamps at 0:00 when the
         // caller's clock is behind the stamp.
-        let connectingFailed = ScanJobsLink.make(bus: .connecting("…"), listFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
+        let connectingFailed = ScanJobsLink.make(bus: .connecting("…"), readFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
         #expect(connectingFailed.kind == .reconnecting)
         #expect(connectingFailed.verbsEnabled == false)
         var failing = ScanSurfaceModel()
         failing.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 1_000)
-        failing.noteListFailure(core: "the bus did not reply in time", now: 31_000)
-        failing.noteListFailure(core: "the core closed the bus", now: 33_000)
-        #expect(failing.listFailedAt == 33_000)
+        failing.noteReadFailure(
+            text: "Unable to list jobs: the bus did not reply in time", core: "the bus did not reply in time", now: 31_000)
+        failing.noteReadFailure(text: "Unable to list jobs: the core closed the bus", core: "the core closed the bus", now: 33_000)
+        #expect(failing.readFailedAt == 33_000)
         #expect(failing.jobsLoadedAt == 1_000)
         #expect(failing.jobs.count == 2, "the rows and their counters stay through a failure")
         #expect(failing.inlineJobsError(ageMs: 32_000)
                 == "Unable to list jobs: the core closed the bus. Showing values from 0:32 ago; retrying every 2 s.")
-        let behind = ScanJobsLink.make(bus: .connected("…"), listFailedAt: 2_000, jobsLoadedAt: 1_000, now: 700)
+        let behind = ScanJobsLink.make(bus: .connected("…"), readFailedAt: 2_000, jobsLoadedAt: 1_000, now: 700)
         #expect(behind.valuesAgeMs == -300)
         #expect(behind.bannerText == "The core is not answering · showing values from 0:00 ago · retrying every 2 s")
-        let hourOld = ScanJobsLink.make(bus: .disconnected, listFailedAt: nil, jobsLoadedAt: 0, now: 3_600_000)
+        let hourOld = ScanJobsLink.make(bus: .disconnected, readFailedAt: nil, jobsLoadedAt: 0, now: 3_600_000)
         #expect(hourOld.bannerText == "Bus disconnected · showing values from 1:00:00 ago · Proxy ▸ Reconnect Bus (⌃⌘R) to retry")
-        // (D6 amendment of 2026-11-02: a failed status or cancel read is to mark the link
-        // too, through `noteReadFailure(text:core:now:)`; that is the fix task's test.)
+        // (D6 amendment of 2026-11-02: a failed status or cancel read marks the link too;
+        // `cancellingTitleAndInlineListError` pins it.)
         failing.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 35_000)
         #expect(failing.inlineJobsError(ageMs: 0) == nil)
         #expect(failing.jobsLoadedAt == 35_000)

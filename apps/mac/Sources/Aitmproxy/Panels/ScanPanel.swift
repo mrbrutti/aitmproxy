@@ -160,9 +160,10 @@ final class ScanPanelState {
     var launchRefusal: String? { surface.launchRefusal(scopeHosts: session.scopeHosts, tools: session.tools) }
 
     /// The job Cancel Scan would stop: the Kit's choice by the merged state (the
-    /// selected job while queued or running, else the only such job; never a
-    /// cancelling one, Jobs view D2), and nothing at all while the verbs are gated
-    /// off by the link (Jobs view D6).
+    /// selected job while queued or running; with nothing selected the only such
+    /// job; never a cancelling one and never a job other than the selected, Jobs
+    /// view D2), and nothing at all while the verbs are gated off by the link
+    /// (Jobs view D6).
     var cancelTarget: String? { link.verbsEnabled ? surface.cancelTarget : nil }
 
     var canCancel: Bool { cancelTarget != nil }
@@ -172,10 +173,11 @@ final class ScanPanelState {
     var nowMs = ScanPanelState.clockMs
 
     /// How the Jobs view is linked to the core right now: the bus state, the last
-    /// `scan.list` outcome and the age of the values on screen (Jobs view D6).
-    /// Computed each render; the verbs follow `verbsEnabled`.
+    /// Jobs read's outcome (list, status or cancel; D6 amendment) and the age of the
+    /// values on screen (Jobs view D6). Computed each render; the verbs follow
+    /// `verbsEnabled`.
     var link: ScanJobsLink {
-        ScanJobsLink.make(bus: session.bus, listFailedAt: surface.listFailedAt, jobsLoadedAt: surface.jobsLoadedAt, now: nowMs)
+        ScanJobsLink.make(bus: session.bus, readFailedAt: surface.readFailedAt, jobsLoadedAt: surface.jobsLoadedAt, now: nowMs)
     }
 
     private static var clockMs: Int { Int(Date().timeIntervalSince1970 * 1000) }
@@ -274,18 +276,23 @@ final class ScanPanelState {
             let listed = Set(surface.jobs.map(\.job))
             statusRequested = statusRequested.filter { listed.contains($0.job) }
         } catch {
-            surface.noteListFailure(core: BusService.describe(error), now: Self.clockMs)
+            let core = BusService.describe(error)
+            surface.noteReadFailure(text: scanUnableText("list jobs", core), core: core, now: Self.clockMs)
         }
     }
 
-    /// `scan.status {job}`: the counters of one job, and its list row.
+    /// `scan.status {job}`: the counters of one job, and its list row. A failure
+    /// marks the link like a failed list (Jobs view D6 amendment: the poll reads the
+    /// selected job's status first, so against a frozen core this times out first);
+    /// the next list that lands clears it.
     func refreshStatus(_ job: String) async {
         do {
             let value = try await session.runCommand("scan.status", ["job": .string(job)])
             surface.applyStatus(try ScanJobStatus(json: value))
             surface.jobsError = nil
         } catch {
-            surface.jobsError = scanUnableText("read job \(job)", BusService.describe(error))
+            let core = BusService.describe(error)
+            surface.noteReadFailure(text: scanUnableText("read job \(job)", core), core: core, now: Self.clockMs)
         }
     }
 
@@ -556,11 +563,13 @@ final class ScanPanelState {
                 await refreshStatus(job)
             }
         } catch {
-            surface.jobsError = scanUnableText("cancel job \(job)", BusService.describe(error))
+            let core = BusService.describe(error)
+            surface.noteReadFailure(text: scanUnableText("cancel job \(job)", core), core: core, now: Self.clockMs)
         }
     }
 
-    /// Cancel Scan (⌥⌘.): the selected job, or the only running one.
+    /// Cancel Scan (⌥⌘.): the selected job while queued or running; with nothing
+    /// selected, the only running one (Jobs view D2 amendment).
     func cancelSelectedOrOnlyRunning() {
         guard let job = cancelTarget else { return }
         Task { await cancel(job: job) }

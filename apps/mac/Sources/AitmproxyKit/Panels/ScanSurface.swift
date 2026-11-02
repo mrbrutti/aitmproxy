@@ -461,8 +461,22 @@ public struct ScanJobFacts: Equatable, Sendable {
     }
 }
 
+/// A failed Jobs read (`scan.list`, `scan.status` or `scan.cancel`): the read's
+/// own wording (`Unable to list jobs: <core>` / `Unable to read job <id>: <core>` /
+/// `Unable to cancel job <id>: <core>`) and the core's own text (Jobs view D6
+/// amendment). `ScanSurfaceModel.inlineJobsError(ageMs:)` adds the last-good clause.
+public struct ScanReadFailure: Equatable, Sendable {
+    public var text: String
+    public var core: String
+
+    public init(text: String, core: String) {
+        self.text = text
+        self.core = core
+    }
+}
+
 /// How the Jobs view is linked to the core right now: from the bus state and
-/// the last `scan.list` outcome (Jobs view spec D6). The verbs (Cancel Scan,
+/// the last Jobs read's outcome (Jobs view spec D6). The verbs (Cancel Scan,
 /// the hover Cancel, the context-menu Cancel) are enabled only while `.live`;
 /// `bannerText` is D15's inline banner, nil while live.
 public struct ScanJobsLink: Equatable, Sendable {
@@ -482,13 +496,13 @@ public struct ScanJobsLink: Equatable, Sendable {
     }
 
     /// A connecting bus is `.reconnecting`; a disconnected or failed one
-    /// `.disconnected`; a connected bus whose last `scan.list` failed is
-    /// `.unanswered`; else `.live`.
-    public static func make(bus: BusState, listFailedAt: Int?, jobsLoadedAt: Int?, now: Int) -> ScanJobsLink {
+    /// `.disconnected`; a connected bus whose last Jobs read (list, status or
+    /// cancel) failed is `.unanswered` (D6 amendment); else `.live`.
+    public static func make(bus: BusState, readFailedAt: Int?, jobsLoadedAt: Int?, now: Int) -> ScanJobsLink {
         let kind: Kind = switch bus {
         case .connecting: .reconnecting
         case .disconnected, .failed: .disconnected
-        case .connected: listFailedAt != nil ? .unanswered : .live
+        case .connected: readFailedAt != nil ? .unanswered : .live
         }
         let age = jobsLoadedAt.map { now - $0 }
         return ScanJobsLink(
@@ -625,13 +639,14 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     public var jobsError: String?
     /// When the last `scan.list` landed (epoch ms, the caller's clock); nil before the first (Jobs view D6).
     public var jobsLoadedAt: Int?
-    /// When the last `scan.list` failed (epoch ms); cleared by the next list that lands. A failed
-    /// cancel or status read sets `jobsError` but not this (Jobs view D6).
-    public var listFailedAt: Int?
-    /// The core's own text of the last failed `scan.list`, so the inline error can
-    /// carry the last-good clause (`inlineJobsError(ageMs:)`); nil when the list is
-    /// fine or when `jobsError` came from a cancel or status read (Jobs view D6).
-    public var listFailureCore: String?
+    /// When the last Jobs read (`scan.list`, `scan.status` or `scan.cancel`) failed (epoch
+    /// ms); cleared by the next list that lands, the proof the core answers (Jobs view D6
+    /// amendment). Any failed Jobs read marks the link: the poll reads the selected job's
+    /// status before the list, so against a frozen core the status read times out first.
+    public var readFailedAt: Int?
+    /// The last failed Jobs read's own wording and the core's text, so the inline error can
+    /// carry the last-good clause (`inlineJobsError(ageMs:)`); nil once a list lands.
+    public var readFailure: ScanReadFailure?
 
     // Site map
     public var sitemapJob: String?
@@ -703,10 +718,12 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     }
 
     /// The job Cancel Scan would stop: the selected one while its merged state is
-    /// queued or running, else the only such job in the list. Nil when the choice
-    /// would be a guess, and never a cancelling job (Jobs view D2).
+    /// queued or running; nil while a job is selected but is cancelling, terminal
+    /// or unknown (never a job the operator is not looking at, Jobs view D2
+    /// amendment). Only with nothing selected, the only queued or running job in
+    /// the list; nil when the choice would be a guess.
     public var cancelTarget: String? {
-        if let job = selectedJob, mayCancel(job: job) { return job }
+        if let job = selectedJob { return mayCancel(job: job) ? job : nil }
         let live = jobs.filter { mayCancel(job: $0.job) }
         return live.count == 1 ? live[0].job : nil
     }
@@ -833,7 +850,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     /// `scan.list`, newest first as delivered. A job this app started that the
     /// list does not carry yet stays in front of it. `now` (epoch ms, the caller's
-    /// clock) stamps `jobsLoadedAt` and clears `listFailedAt` (Jobs view D6). The
+    /// clock) stamps `jobsLoadedAt` and clears `readFailedAt` (Jobs view D6). The
     /// selection follows the list (Jobs view D3): nothing selected → the newest
     /// job; a selection the core dropped and this app is not waiting on → the
     /// first row; an existing selection is never replaced by a newer job.
@@ -853,8 +870,8 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         launchNotices = launchNotices.filter { kept.contains($0.key) }
         refreshNeeded = refreshNeeded.intersection(kept)
         jobsLoadedAt = now
-        listFailedAt = nil
-        listFailureCore = nil
+        readFailedAt = nil
+        readFailure = nil
         if let selected = selectedJob {
             if !jobs.contains(where: { $0.job == selected }), !locallyStarted.contains(selected) {
                 selectedJob = jobs.first?.job
@@ -864,22 +881,24 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         }
     }
 
-    /// A `scan.list` that failed: `core` is the core's own text (`BusService.describe`).
-    /// Sets the inline error `Unable to list jobs: <core>`, keeps the core text for
-    /// `inlineJobsError(ageMs:)` and stamps the failure (Jobs view D6); the rows and
-    /// their counters stay. The caller passes the same clock as `applyList`.
-    public mutating func noteListFailure(core: String, now: Int) {
-        jobsError = scanUnableText("list jobs", core)
-        listFailureCore = core
-        listFailedAt = now
+    /// A Jobs read (`scan.list`, `scan.status`, `scan.cancel`) that failed: `text` is the
+    /// read's own wording (`Unable to list jobs: <core>` and the like), `core` the core's
+    /// own text (`BusService.describe`). Sets the inline error to `text`, keeps both for
+    /// `inlineJobsError(ageMs:)` and stamps the failure (Jobs view D6 amendment); the rows
+    /// and their counters stay. The caller passes the same clock as `applyList`.
+    public mutating func noteReadFailure(text: String, core: String, now: Int) {
+        jobsError = text
+        readFailure = ScanReadFailure(text: text, core: core)
+        readFailedAt = now
     }
 
-    /// The text of the inline error above the rows: a failed list says
-    /// `Unable to list jobs: <core>. Showing values from 0:42 ago; retrying every 2 s.`
-    /// (`ScanFormat.listErrorText`, with `ScanJobsLink.valuesAgeMs` as the age, Jobs
-    /// view D6); a failed cancel or status read shows its `jobsError` verbatim.
+    /// The text of the inline error above the rows: while a Jobs read has failed and no
+    /// list has landed since, that read's own wording with the last-good clause, e.g.
+    /// `Unable to read job scan-…: <core>. Showing values from 0:42 ago; retrying every 2 s.`
+    /// (`ScanFormat.ageClause`, with `ScanJobsLink.valuesAgeMs` as the age; the list beat
+    /// is what brings the values back, Jobs view D6); else `jobsError`.
     public func inlineJobsError(ageMs: Int?) -> String? {
-        if let core = listFailureCore { return ScanFormat.listErrorText(core: core, ageMs: ageMs) }
+        if let failure = readFailure { return failure.text + ScanFormat.ageClause(ageMs) }
         return jobsError
     }
 
@@ -1110,12 +1129,18 @@ public enum ScanFormat {
         "Out of scope — add \(hostOf(origin: origin)) to scope to scan it"
     }
 
+    /// The last-good clause a failed Jobs read's inline error ends with (Jobs view D6):
+    /// `. Showing values from 0:42 ago; retrying every 2 s.` with an age; without one (no
+    /// list has landed yet) `. Retrying every 2 s.`
+    public static func ageClause(_ ageMs: Int?) -> String {
+        guard let ageMs else { return ". Retrying every 2 s." }
+        return ". Showing values from \(elapsed(ms: ageMs)) ago; retrying every 2 s."
+    }
+
     /// `Unable to list jobs: <core text>. Showing values from 0:42 ago; retrying every 2 s.`
-    /// (Jobs view D6): the inline list error with the last-good clause; without an age
-    /// (no list has landed yet) `Unable to list jobs: <core text>. Retrying every 2 s.`
+    /// (Jobs view D6): the inline list error with the last-good clause (`ageClause`).
     public static func listErrorText(core: String, ageMs: Int?) -> String {
-        guard let ageMs else { return "Unable to list jobs: \(core). Retrying every 2 s." }
-        return "Unable to list jobs: \(core). Showing values from \(elapsed(ms: ageMs)) ago; retrying every 2 s."
+        "Unable to list jobs: \(core)" + ageClause(ageMs)
     }
 
     /// `Clamped budget.probes 50000 → 20000`: a `scan.start` / `scan.status` clamp notice.
