@@ -1144,7 +1144,7 @@ mod tests {
     /// parsed in memory, so `RecordPolicy::Never` loses nothing, while the
     /// crawl GET stays `Always`.
     #[tokio::test]
-    async fn seed_sends_carry_the_job_mark_only() {
+    async fn seed_sends_carry_the_job_mark_only_and_are_never_recorded() {
         let client = Arc::new(site(&fixture_pages()));
         let job = FakeJob::new(
             profile(|p| {

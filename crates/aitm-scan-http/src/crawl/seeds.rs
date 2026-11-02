@@ -379,7 +379,8 @@ mod tests {
 
     /// The options the lane passes: `record: Never` (amendment 79) and the
     /// job mark only (plan call A2; the lane test
-    /// `seed_sends_carry_the_job_mark_only` owns both choices).
+    /// `seed_sends_carry_the_job_mark_only_and_are_never_recorded` owns both
+    /// choices).
     fn send_options() -> SendOptions {
         SendOptions {
             record: RecordPolicy::Never,
