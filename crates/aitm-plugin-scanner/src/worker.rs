@@ -2183,7 +2183,16 @@ mod tests {
             .registry
             .cancel(&started.job)
             .expect("the job is in the registry");
-        assert_eq!(cancelling.state, JobState::Cancelling);
+        // `cancel` answers with the status as it stands: `Cancelling` while the
+        // worker is still unwinding, or already `Cancelled` when the finaliser
+        // beat this read on the multi-thread runtime (CI flake, amendment 71b:
+        // "left: Cancelled, right: Cancelling"). Either says the cancel took;
+        // the terminal facts are asserted after the signal below.
+        assert!(
+            matches!(cancelling.state, JobState::Cancelling | JobState::Cancelled),
+            "cancel answered {:?}",
+            cancelling.state
+        );
 
         let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Cancelled);
