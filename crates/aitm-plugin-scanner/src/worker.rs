@@ -695,15 +695,18 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         cancel.clone(),
     ));
     let meter = Arc::new(ProbeMeter::default());
-    let job_client: Arc<dyn ProxyClient> = Arc::new(JobClient::new(
-        inner_client,
-        &job,
-        Arc::clone(&budget),
-        Arc::clone(&meter),
-        profile.http.record_probes,
-        profile.http.version,
-        profile.budget.per_host_errors.clone(),
-    ));
+    let job_client: Arc<dyn ProxyClient> = Arc::new(
+        JobClient::new(
+            inner_client,
+            &job,
+            Arc::clone(&budget),
+            Arc::clone(&meter),
+            profile.http.record_probes,
+            profile.http.version,
+            profile.budget.per_host_errors.clone(),
+        )
+        .with_guard(Arc::clone(&guard)),
+    );
 
     // Spec D7: the session's values live in the worker's memory and nowhere
     // else; only its names ever reach a status, a log or the bus.
