@@ -62,6 +62,8 @@ if [ -f "$data/config.yaml" ]; then
 else
   echo "(no config.yaml)"
 fi
+echo "-- run/cores pointer files (cli-oneshot-live-core, after #271)"
+ls -la "$data/run/cores" 2>/dev/null || echo "(none)"
 echo "-- system-proxy-state.json"
 [ -f "$data/system-proxy-state.json" ] && sed -E 's/"[a-f0-9]{32,}"/"<redacted>"/g' "$data/system-proxy-state.json" || echo "(absent)"
 echo "-- audit.jsonl tail (last 5 control entries)"

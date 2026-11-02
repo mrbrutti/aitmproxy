@@ -117,11 +117,11 @@ as the N4 startup refusal, which the CLI journey already proved (`N4-CLI`).
 | N4 port held | CLI | PASS (above) | — | — |
 | N5 wrong token | all | SKIP | — | — |
 
-## Runner dry run at 02:25Z (`dry-run/`) — the state had changed under the run
+## Runner dry run at 02:25Z — the state had changed under the run (evidence moved to `../2026-11-02-release-acceptance-0.5.11/run-1-readonly/`)
 
 `tests/e2e/acceptance/lib/run.sh 0.5.10-dry` with no yes-list and no window, read-only. Between
-the 02:06Z readings above and this run the app was **relaunched by someone else** (core pid
-78375 → 79160, `proxy.status.version` **0.5.11**), three hosts were added to Scope
+the 02:06Z readings above and this run the app was **relaunched by the orchestrator as the 0.5.11 release build** (core pid
+78375 → 79160, `proxy.status.version` **0.5.11**), three hosts were added to Scope by the attribution session's checklist
 (`example.com:443`, `www.apple.com:443`, `httpbin.org:443`) and traffic went through the
 extension. This is why D2 reads the state first and why nothing here is "arranged".
 
@@ -129,7 +129,7 @@ extension. This is why D2 reads the state first and why nothing here is "arrange
 |---|---|---|
 | cli-livecore | FAIL | CLI-4 FAIL (one-shot `listening: false` beside a core on 8080); CLI-5 FAIL (host echoed, running core's `scope.list` unchanged); N4-CLI PASS; CLI-7 PASS |
 | mac | FAIL | MAC-1 PASS (bundle 0.5.11, core 0.5.11 pid 79160); MAC-7 PASS (All Apps already on, attached, `flows_handed_off.tcp 5`); **MAC-9a PASS**: 9 extension rows all carry `source_app` (`com.apple.Safari`, `com.apple.curl`, `capture_interface macos-ne`, `tunnel decrypted`) — so with a host in Scope and All Apps on, the Apps sidebar does get its app; **MAC-9b FAIL**: 5 proxied rows (Firefox → 8080) carry no `source_app`, and one is `CONNECT httpbin.org:443 … failed / client_rejected_certificate` (a client with its own trust store); MAC-2/3/4/5/6/13 SKIP (window / yes); MAC-8/10/11/12 BLOCKED |
-| mac AX read (`dry-run/MAC-ax-initial.txt`, read-only, no press) | observation | the window was on the Flows page: 260 accessibility nodes, flow rows readable (`https://push.services.mozilla.com:443 — CONNECT 200 …`), sidebar `3 hosts in scope`, one `out of scope` mark; **no route banner** — correct per the spec's banner rule (All Apps is on, so the closed system proxy is not named; Scope has hosts; CA trusted). SwiftUI buttons expose no title through AX (only "button"), so button labels are checked via the menu titles (`ax_texts.sh menu Proxy`), not the toolbar |
+| mac AX read (`../2026-11-02-release-acceptance-0.5.11/run-1-readonly/MAC-ax-initial.txt`, read-only, no press) | observation | the window was on the Flows page: 260 accessibility nodes, flow rows readable (`https://push.services.mozilla.com:443 — CONNECT 200 …`), sidebar `3 hosts in scope`, one `out of scope` mark; **no route banner** — correct per the spec's banner rule (All Apps is on, so the closed system proxy is not named; Scope has hosts; CA trusted). SwiftUI buttons expose no title through AX (only "button"), so button labels are checked via the menu titles (`ax_texts.sh menu Proxy`), not the toolbar |
 | n5 | PASS | `aitm-tui --bus <app bus> --token-file <wrong>` shows the exact sentence `bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)` and stops retrying |
 | tui, web, cli-nocore | SKIP | `port 8080 held by aitm pid 79160` (the app's core) |
 | restore diff | identical | no `yes` step ran |

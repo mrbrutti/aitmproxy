@@ -334,6 +334,12 @@ Where each negative is observed (its cell):
   Chromium (`apps/web/scripts/` has the CDP driver; Safari stays a hand step).
 - Nothing in the runner starts a core on a non-default port, seeds Scope over the bus, or edits the
   operator's config. The only writes are the `yes` steps through the surfaces' own controls.
+- Pointer files (`claude/cli-oneshot-live-core`, after #271): every serving `aitm` writes
+  `<data dir>/run/cores/<pid>.json` (0600, no token) and a serving first run mints
+  `mcp.operator_token` into the config. The runner does **not** set `AITM_RUN_DIR`: the journey
+  cores are the operator's own (`aitm tui`, `aitm web` on his config), their pointers are the real
+  behaviour, and a one-shot must find them. D2 lists `run/cores/` before and after; a pointer left
+  behind by a journey core after a clean exit is a FAIL of that journey's stop step.
 
 ### D10. Ownership and cadence
 
@@ -406,9 +412,11 @@ Only Matt can answer these; defaults in force until he does.
    default ports?** Default: ask once per run; without it TUI and WEB are SKIP `port 8080 held by
    Aitmproxy.app's embedded core` and their words are checked only as far as the ready card /
    startup (which fails on the port anyway, and that output is itself pinned as N4).
-3. **Should the Scope hosts added by the run (`example.com`, `httpbin.org`) be removed at the end?**
-   Default: left in place and listed under Leftovers, because removing them is a Sensitive verb on
-   his core; Matt may say "remove them" and the run then does so through the same surface.
+3. ~~Should the Scope hosts added by the run be removed at the end?~~ Decided by the orchestrator
+   2026-11-02: hosts the run adds are **removed at the end** through the same surface (the Scope
+   page's "Remove from Scope", the TUI's `d`, the web row's remove button), unless Matt says keep;
+   they are listed in the report either way. Hosts that were in Scope before the run are never
+   touched.
 
 ## Review log
 
