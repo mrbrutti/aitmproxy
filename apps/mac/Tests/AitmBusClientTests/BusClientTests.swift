@@ -38,7 +38,7 @@ private func makeClient(_ endpoint: BusEndpoint, timeout: Duration = .seconds(5)
         try await withTimeout { try await client.ping() }
 
         let tools = try await withTimeout { try await client.listTools() }
-        #expect(tools.map(\.name) == ["fake.echo", "fake.fail", "fake.hang"])
+        #expect(tools.map(\.name) == ["fake.echo", "fake.fail", "fake.hang", "l4.inject"])
         let echo = try #require(tools.first)
         #expect(echo.description == "Echo typed arguments back.")
         let types = Dictionary(uniqueKeysWithValues: echo.parameters.map { ($0.name, $0.type) })
@@ -205,6 +205,14 @@ private func makeClient(_ endpoint: BusEndpoint, timeout: Duration = .seconds(5)
         let client = makeClient(endpoint)
         _ = try await withTimeout { try await client.connect() }
 
+        // The pin is only meaningful against a declared schema that does not list `_confirm`
+        // and forbids extra keys: that is what a schema-pruning client would prune to.
+        let tools = try await withTimeout { try await client.listTools() }
+        let inject = try #require(tools.first { $0.name == "l4.inject" })
+        #expect(inject.inputSchema["properties"]?["_confirm"] == nil)
+        #expect(inject.inputSchema["additionalProperties"] == false)
+        #expect(inject.parameters.map(\.name) == ["count", "dst", "interface", "spec"])
+
         let confirmed = Self.bareInjectArgs.merging(["_confirm": .string("tok-7f1c")]) { _, new in new }
         _ = try await withTimeout { try await client.call("l4.inject", confirmed) }
 
@@ -280,5 +288,84 @@ private func makeClient(_ endpoint: BusEndpoint, timeout: Duration = .seconds(5)
         #expect(secondMinusToken.removeValue(forKey: "_confirm") == "tok-7f1c")
         #expect(secondMinusToken == calls.first?.arguments.objectValue)
         #expect(secondMinusToken == Self.bareInjectArgs)
+    }
+    // MARK: Tester additions (stage 5, plan 2026-10-31-l4-parity-fixes unit (d))
+
+    /// AC39's wire half: `confirmable` is decoded from the `tools/list` entry through the real
+    /// client — `true` on `l4.inject`, `false` on every tool that does not declare it — and
+    /// `ToolDescriptor(json:)` treats a non-bool or missing flag as `false`, never `true`.
+    @Test func toolsListDecodesConfirmable() async throws {
+        let server = FakeBusServer()
+        let endpoint = try await server.start()
+        defer { Task { await server.stop() } }
+        let client = makeClient(endpoint)
+        _ = try await withTimeout { try await client.connect() }
+        let tools = try await withTimeout { try await client.listTools() }
+        #expect(tools.map { ($0.name, $0.confirmable) }.map { "\($0.0)=\($0.1)" }
+            == ["fake.echo=false", "fake.fail=false", "fake.hang=false", "l4.inject=true"])
+
+        let schema: JSONValue = ["type": "object", "properties": [:], "additionalProperties": false]
+        #expect(try ToolDescriptor(json: ["name": "t", "inputSchema": schema, "confirmable": true]).confirmable)
+        #expect(!(try ToolDescriptor(json: ["name": "t", "inputSchema": schema, "confirmable": false]).confirmable))
+        #expect(!(try ToolDescriptor(json: ["name": "t", "inputSchema": schema]).confirmable))
+        #expect(!(try ToolDescriptor(json: ["name": "t", "inputSchema": schema, "confirmable": "true"]).confirmable))
+        #expect(!(try ToolDescriptor(json: ["name": "t", "inputSchema": schema, "confirmable": 1]).confirmable))
+        #expect(!(try ToolDescriptor(json: ["name": "t", "inputSchema": schema, "confirmable": nil]).confirmable))
+        // A tool without a name is malformed, confirmable or not.
+        #expect(throws: BusError.malformed("tool without a name")) {
+            try ToolDescriptor(json: ["confirmable": true])
+        }
+    }
+
+    /// A `needs_confirmation` result that the core flags `isError: true` (a future shape, or a
+    /// proxy that rewrites it) is a thrown tool error, not a silent dialog: the UI never shows a
+    /// confirm prompt for a reply the core called a failure.
+    @Test func needsConfirmationWithIsErrorIsAToolError() async throws {
+        let server = FakeBusServer()
+        let endpoint = try await server.start()
+        defer { Task { await server.stop() } }
+        var members = try #require(Self.needsConfirmationResult.objectValue)
+        members["isError"] = true
+        await server.script("l4.inject", [.object(members)])
+        let client = makeClient(endpoint)
+        _ = try await withTimeout { try await client.connect() }
+        await #expect(throws: BusError.tool(message: "Inject 1× UDP 127.0.0.1:9 on lo0")) {
+            try await withTimeout { try await client.call("l4.inject", Self.bareInjectArgs) }
+        }
+        // The bare call still reached the wire with exactly its arguments.
+        let calls = await server.receivedCalls
+        #expect(calls == [RecordedCall(name: "l4.inject", arguments: .object(Self.bareInjectArgs))])
+        try await withTimeout { try await client.ping() }
+    }
+
+    /// A `needs_confirmation` reply whose `structuredContent` is malformed (no `confirm_token`)
+    /// is still returned as a result for the UI's parser to reject — the client never invents a
+    /// token — and a second `needs_confirmation` to a confirmed re-issue (the pruning failure
+    /// mode seen live on the TUI) is visible as such to the caller.
+    @Test func malformedAndRepeatedConfirmationsAreReturnedAsResults() async throws {
+        let server = FakeBusServer()
+        let endpoint = try await server.start()
+        defer { Task { await server.stop() } }
+        let tokenless: JSONValue = [
+            "content": [["type": "text", "text": "needs confirmation"]],
+            "structuredContent": ["status": "needs_confirmation", "prompt": "Inject?"],
+            "isError": false,
+        ]
+        await server.script("l4.inject", [tokenless, Self.needsConfirmationResult])
+        let client = makeClient(endpoint)
+        _ = try await withTimeout { try await client.connect() }
+
+        let first = try await withTimeout { try await client.call("l4.inject", Self.bareInjectArgs) }
+        #expect(first == ["status": "needs_confirmation", "prompt": "Inject?"])
+        #expect(first["confirm_token"] == nil)
+
+        let confirmed = Self.bareInjectArgs.merging(["_confirm": .string("stale")]) { _, new in new }
+        let second = try await withTimeout { try await client.call("l4.inject", confirmed) }
+        #expect(second["status"]?.stringValue == "needs_confirmation")
+        #expect(second["confirm_token"]?.stringValue == "tok-7f1c")
+        let calls = await server.receivedCalls
+        #expect(calls.count == 2)
+        #expect(calls[1].arguments["_confirm"] == "stale")
+        #expect(calls[1].arguments.objectValue?.count == 4)
     }
 }

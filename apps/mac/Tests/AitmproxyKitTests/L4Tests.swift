@@ -784,3 +784,534 @@ import Testing
         #expect(L4ConfirmRequest(prompt: "p", token: "t").id == "t")
     }
 }
+
+// MARK: - Tester additions (stage 5, plan 2026-10-31-l4-parity-fixes unit (d), whole branch)
+//
+// Every input below is built inline with literal expectations: no fixture, snapshot, self-test
+// or seeded-store data (the plan's "Rule for every task"). These close the holes the task tests
+// left open: the rig's real status shapes through `resolve`, malformed and oversized wire data
+// into every parser the live poll feeds, the CIDR / port arithmetic at its edges, and the inert
+// renderer over all 256 byte values.
+
+@Suite struct L4TesterAvailabilityTests {
+    /// The two status objects the unit (d) rig answered on 2026-11-01 (probe-1.txt), verbatim,
+    /// map to `.degraded` with exactly the core's `reason`: this is the text the Scope page shows
+    /// after `Capture and inject unavailable: ` / `In-path intercept unavailable: ` (AC26, AC28).
+    @Test func testResolveReadsTheRigsStatusShapes() {
+        let capture = JSONValue.object([
+            "available": .bool(false),
+            "captures": .array([]),
+            "code": .string("needs_privilege"),
+            "reason": .string(
+                "no read+write access to any /dev/bpf* device (capture/inject needs it; install ChmodBPF or run with privilege)"),
+        ])
+        #expect(L4Availability.resolve(status: capture, error: nil)
+            == .degraded(reason: "no read+write access to any /dev/bpf* device (capture/inject needs it; install ChmodBPF or run with privilege)"))
+
+        let intercept = JSONValue.object([
+            "available": .bool(false),
+            "code": .string("unsupported_platform"),
+            "reason": .string("in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)"),
+            "sessions": .array([]),
+        ])
+        #expect(L4Availability.resolve(status: intercept, error: nil)
+            == .degraded(reason: "in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)"))
+
+        // The shape D0 will answer with: `available: true`, `code: available`, `reason: null`.
+        let privileged = JSONValue.object([
+            "available": .bool(true), "code": .string("available"), "reason": .null,
+            "captures": .array([.string("f1")]),
+        ])
+        #expect(L4Availability.resolve(status: privileged, error: nil) == .available)
+    }
+
+    /// Malformed status replies never fabricate availability: anything without a bool
+    /// `available` (and not a bare array) is `.pending`; a blank, null or non-string `reason`
+    /// degrades with the fallback text; the marker with nothing after it degrades with the
+    /// fallback too; a stale error never overrides a bare-array status.
+    @Test func testResolveFailsClosedOnMalformedReplies() {
+        #expect(L4Availability.resolve(status: .object([:]), error: nil) == .pending)
+        #expect(L4Availability.resolve(status: .string("ok"), error: nil) == .pending)
+        #expect(L4Availability.resolve(status: .number(1), error: nil) == .pending)
+        #expect(L4Availability.resolve(status: .null, error: nil) == .pending)
+        // `available` as a string is not a verdict.
+        #expect(L4Availability.resolve(status: .object(["available": .string("false")]), error: nil) == .pending)
+        #expect(L4Availability.resolve(status: .object(["available": .string("true")]), error: nil) == .pending)
+        // A wrapper with no usable status inside.
+        #expect(L4Availability.resolve(status: .object(["structuredContent": .object([:])]), error: nil) == .pending)
+
+        #expect(L4Availability.resolve(status: .object(["available": .bool(false), "reason": .string("   ")]), error: nil)
+            == .degraded(reason: "L4 unavailable"))
+        #expect(L4Availability.resolve(status: .object(["available": .bool(false), "reason": .null]), error: nil)
+            == .degraded(reason: "L4 unavailable"))
+        #expect(L4Availability.resolve(status: .object(["available": .bool(false), "reason": .number(7)]), error: nil)
+            == .degraded(reason: "L4 unavailable"))
+        // Surrounding whitespace and newlines in the reason are trimmed, inner text is kept verbatim.
+        #expect(L4Availability.resolve(status: .object(["available": .bool(false), "reason": .string("  a  b\n")]), error: nil)
+            == .degraded(reason: "a  b"))
+
+        #expect(L4Availability.resolve(status: nil, error: "L4 unavailable: ") == .degraded(reason: "L4 unavailable"))
+        #expect(L4Availability.resolve(status: nil, error: "L4 unavailable:  X \n") == .degraded(reason: "X"))
+        #expect(L4Availability.resolve(status: nil, error: "") == .pending)
+        // The marker is matched exactly: a lowercase variant is not an availability verdict.
+        #expect(L4Availability.resolve(status: nil, error: "l4 unavailable: X") == .pending)
+        // A bare-array status (older core, payload only) beats a stale error.
+        #expect(L4Availability.resolve(status: .array([]), error: "L4 unavailable: X") == .available)
+        // A malformed status with a real error falls through to the error.
+        #expect(L4Availability.resolve(status: .object([:]), error: "L4 unavailable: Y") == .degraded(reason: "Y"))
+
+        // The display text of each state is exactly what the surfaces render.
+        #expect(L4Availability.available.displayText == nil)
+        #expect(L4Availability.degraded(reason: "R").displayText == "R")
+        #expect(L4Availability.pending.displayText == "Reading L4 availability…")
+        #expect(L4Availability.pendingText == "Reading L4 availability…")
+        #expect(L4Availability.unavailableMarker == "L4 unavailable: ")
+    }
+}
+
+@Suite struct L4TesterWireParsingTests {
+    /// Malformed `l4.flow.get` replies fail closed: no `id` or `kind` ⇒ nil; an unknown kind ⇒
+    /// nil (the session-state cell never shows a made-up state); a packet without a valid `dir`
+    /// is skipped while its neighbours parse; invalid base64 ⇒ no bytes; a non-numeric
+    /// `timestamp` / `started_at` ⇒ nil; non-array `packets` ⇒ none; counts fall back to what
+    /// was parsed; the `structuredContent` wrapper is unwrapped.
+    @Test func testFlowGetMalformedRepliesFailClosed() throws {
+        #expect(L4Flow(json: .object(["kind": .string("capture")])) == nil)
+        #expect(L4Flow(json: .object(["id": .string("F")])) == nil)
+        #expect(L4Flow(json: .object(["id": .string("F"), "kind": .string("teleport")])) == nil)
+        #expect(L4Flow(json: .string("F")) == nil)
+        #expect(L4Flow(json: .array([])) == nil)
+        #expect(L4Flow(json: .null) == nil)
+
+        let wrapped = JSONValue.object([
+            "structuredContent": .object([
+                "id": .string("F"), "kind": .string("send_recv"),
+                "packets": .array([
+                    .object(["dir": .string("sideways"), "length": .number(1)]),
+                    .object(["length": .number(2)]),
+                    .object([
+                        "dir": .string("inbound"), "length": .number(3), "injected": .bool(false),
+                        "bytes": .string("!!not-base64!!"), "timestamp": .string("yesterday"),
+                        "src_port": .string("40000"), "proto": .number(17),
+                    ]),
+                    .object(["dir": .string("outbound"), "injected": .bool(true), "bytes": .string("AAEC")]),
+                ]),
+                "started_at": .string("2026-11-01T17:03:00Z"),
+            ]),
+        ])
+        let flow = try #require(L4Flow(json: wrapped))
+        #expect(flow.id == FlowID("F"))
+        #expect(flow.sessionState == .sendRecv)
+        #expect(flow.interface == "")
+        #expect(flow.packets.count == 2)
+        #expect(flow.packets[0].index == 2)
+        #expect(flow.packets[0].dir == .inbound)
+        #expect(flow.packets[0].length == 3)
+        #expect(flow.packets[0].bytes == nil)
+        #expect(flow.packets[0].timestamp == nil)
+        #expect(flow.packets[0].srcPort == nil)
+        #expect(flow.packets[0].proto == nil)
+        #expect(flow.packets[1].index == 3)
+        #expect(flow.packets[1].length == 0)
+        #expect(flow.packets[1].injected)
+        #expect(flow.packets[1].bytes == Data([0x00, 0x01, 0x02]))
+        // No counts on the wire ⇒ what was parsed: two packets, one injected.
+        #expect(flow.packetCount == 2)
+        #expect(flow.injectedCount == 1)
+        #expect(flow.startedAt == nil)
+        #expect(flow.proto == .raw)
+        #expect(flow.target == "l4")
+
+        let noPackets = try #require(L4Flow(json: .object([
+            "id": .string("G"), "kind": .string("intercept"), "interface": .string("lo0"),
+            "packets": .string("none"), "packet_count": .number(300), "queue": .number(5),
+        ])))
+        #expect(noPackets.packets.isEmpty)
+        #expect(noPackets.packetCount == 300)
+        #expect(noPackets.queue == 5)
+        #expect(noPackets.row(seq: 1, inScope: false).state == .paused)
+        #expect(noPackets.row(seq: 1, inScope: false).l4?.inScope == false)
+    }
+
+    /// An oversized reply (a 4096-packet window, the core's clamp) parses every packet with its
+    /// index, and a flow-level destination without a port falls back to the filter text.
+    @Test func testFlowGetWindowAtTheClamp() throws {
+        var packets: [JSONValue] = []
+        packets.reserveCapacity(4096)
+        for i in 0..<4096 {
+            packets.append(.object([
+                "dir": .string(i % 2 == 0 ? "inbound" : "outbound"), "length": .number(Double(60 + i % 7)),
+                "injected": .bool(i % 3 == 0), "layers": .array([.string("IPv4"), .string("TCP")]),
+            ]))
+        }
+        let flow = try #require(L4Flow(json: .object([
+            "id": .string("big"), "kind": .string("capture"), "interface": .string("lo0"),
+            "filter": .string("tcp port 9199"), "dst": .string("127.0.0.1"),
+            "packets": .array(packets), "packet_count": .number(300_000),
+        ])))
+        #expect(flow.packets.count == 4096)
+        #expect(flow.packets.last?.index == 4095)
+        #expect(flow.packets[4095].dir == .outbound)
+        #expect(flow.packetCount == 300_000)
+        #expect(flow.injectedCount == 1366)
+        #expect(flow.proto == .tcp)
+        // `dst` without `dst_port` is not a target: the filter text is shown instead.
+        #expect(flow.target == "lo0 · tcp port 9199")
+    }
+
+    /// `l4.intercept.list` and `l4.scope.list` entries with the wrong types never crash the poll
+    /// and never produce an actionable id out of nothing.
+    @Test func testListParsersTolerateWrongTypes() {
+        let parked = L4ParkedPacket.list(.array([
+            .object(["id": .number(1), "flow": .string("F")]),
+            .object(["id": .string("P1"), "flow": .number(2)]),
+            .object(["id": .string("P2"), "flow": .string("F"), "length": .string("big"),
+                     "layers": .string("IPv4"), "parked_at": .string("now"), "state": .number(0)]),
+            .string("P3"),
+            .null,
+        ]))
+        #expect(parked.map(\.id) == ["P2"])
+        #expect(parked[0].length == 0)
+        #expect(parked[0].layers == [])
+        #expect(parked[0].parkedAt == nil)
+        #expect(parked[0].state == "")
+        #expect(L4ParkedPacket.list(.null).isEmpty)
+        #expect(L4ParkedPacket.list(.string("[]")).isEmpty)
+        #expect(L4ParkedPacket.list(.object(["structuredContent": .string("x")])).isEmpty)
+
+        let scope = L4ScopeItem.list(.array([
+            .object(["id": .number(1)]),
+            .object(["id": .string("S1"), "ports": .string("   "), "cidr": .number(32)]),
+            .object(["id": .string("S2"), "ports": .number(9000)]),
+            .bool(true),
+        ]))
+        #expect(scope.map(\.id) == ["S1", "S2"])
+        #expect(scope[0].ports == "all")
+        #expect(scope[0].cidr == "")
+        #expect(scope[1].ports == "all")
+        // A blank cidr covers nothing, whatever the interface.
+        #expect(!scope[0].covers(interface: "", dst: "127.0.0.1", port: nil))
+        #expect(L4ScopeItem.list(.null).isEmpty)
+    }
+
+    /// A `needs_confirmation` reply without its token or prompt is not a confirm dialog (the UI
+    /// would have nothing to re-issue); the status string is matched exactly.
+    @Test func testConfirmRequestNeedsPromptAndToken() {
+        let call = L4PendingCall(command: "l4.scope.add", args: ["cidr": .string("127.0.0.1/32")])
+        #expect(L4ConfirmRequest(json: .object([
+            "status": .string("needs_confirmation"), "prompt": .string("p"),
+        ]), call: call) == nil)
+        #expect(L4ConfirmRequest(json: .object([
+            "status": .string("needs_confirmation"), "confirm_token": .string("t"),
+        ]), call: call) == nil)
+        #expect(L4ConfirmRequest(json: .object([
+            "status": .string("NEEDS_CONFIRMATION"), "prompt": .string("p"), "confirm_token": .string("t"),
+        ]), call: call) == nil)
+        #expect(L4ConfirmRequest(json: .object([
+            "status": .string("needs_confirmation"), "prompt": .string("p"), "confirm_token": .number(7),
+        ]), call: call) == nil)
+        #expect(L4ConfirmRequest(json: .null, call: call) == nil)
+
+        // Confirming a call with no args yields exactly the token and nothing else.
+        let bare = L4PendingCall(command: "l4.intercept.forward", args: [:])
+        let request = L4ConfirmRequest(prompt: "Forward P1", token: "tok-1", call: bare)
+        #expect(bare.confirmed(with: request).args == ["_confirm": .string("tok-1")])
+        #expect(bare.confirmed(with: request).command == "l4.intercept.forward")
+    }
+}
+
+@Suite struct L4TesterScopeCoverTests {
+    private func item(_ cidr: String, ports: String, interface: String = "lo0") -> L4ScopeItem {
+        L4ScopeItem(id: "T", cidr: cidr, ports: ports, interface: interface, direction: "inbound",
+                    capability: "capture", source: "config")
+    }
+
+    /// The IPv4 prefix arithmetic at its edges: `/0` covers every IPv4 address, `/32` only the
+    /// one, a missing prefix means `/32`, `/33` and non-numeric prefixes cover nothing, octets
+    /// above 255 are not an address, and `/8` stops at the network boundary.
+    @Test func testCidrEdges() {
+        #expect(item("0.0.0.0/0", ports: "all").covers(interface: "lo0", dst: "203.0.113.9", port: 1))
+        #expect(item("0.0.0.0/0", ports: "all").covers(interface: "lo0", dst: "255.255.255.255", port: 65535))
+        #expect(!item("0.0.0.0/0", ports: "all").covers(interface: "lo0", dst: "::1", port: 1))
+        #expect(item("127.0.0.1", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item("127.0.0.1", ports: "all").covers(interface: "lo0", dst: "127.0.0.2", port: 9053))
+        #expect(!item("127.0.0.1/33", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item("127.0.0.1/-1", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item("127.0.0.1/x", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item("127.0.0.1/", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item("", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        #expect(!item("/32", ports: "all").covers(interface: "lo0", dst: "127.0.0.1", port: 9053))
+        // 256 is not an octet: the network is not IPv4, so only the literal matches, and
+        // "256.1.1.1" as a destination is not an IPv4 address either.
+        #expect(!item("256.1.1.1/8", ports: "all").covers(interface: "lo0", dst: "256.1.1.2", port: 1))
+        #expect(item("256.1.1.1/32", ports: "all").covers(interface: "lo0", dst: "256.1.1.1", port: 1))
+        #expect(!item("127.0.0.1/32", ports: "all").covers(interface: "lo0", dst: "127.0.0.1.1", port: 1))
+        #expect(!item("127.0.0.1/32", ports: "all").covers(interface: "lo0", dst: "127.0.0", port: 1))
+        #expect(!item("127.0.0.1/32", ports: "all").covers(interface: "lo0", dst: "", port: 1))
+        // /8 boundaries.
+        let ten = item("10.0.0.0/8", ports: "all", interface: "en0")
+        #expect(ten.covers(interface: "en0", dst: "10.0.0.0", port: 1))
+        #expect(ten.covers(interface: "en0", dst: "10.255.255.255", port: 1))
+        #expect(!ten.covers(interface: "en0", dst: "9.255.255.255", port: 1))
+        #expect(!ten.covers(interface: "en0", dst: "11.0.0.0", port: 1))
+        // /31 covers exactly two addresses.
+        let pair = item("192.0.2.4/31", ports: "all")
+        #expect(pair.covers(interface: "lo0", dst: "192.0.2.4", port: nil))
+        #expect(pair.covers(interface: "lo0", dst: "192.0.2.5", port: nil))
+        #expect(!pair.covers(interface: "lo0", dst: "192.0.2.6", port: nil))
+        #expect(!pair.covers(interface: "lo0", dst: "192.0.2.3", port: nil))
+        // The interface is compared exactly (case and whitespace included).
+        #expect(!item("127.0.0.1/32", ports: "all").covers(interface: "LO0", dst: "127.0.0.1", port: nil))
+        #expect(!item("127.0.0.1/32", ports: "all").covers(interface: "lo0 ", dst: "127.0.0.1", port: nil))
+    }
+
+    /// Port text at its edges: an inclusive range, a reversed range, a single port, `all` in any
+    /// case, surrounding spaces, and garbage (which covers nothing).
+    @Test func testPortsEdges() {
+        let range = item("127.0.0.1/32", ports: "9000-9999")
+        #expect(range.covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
+        #expect(range.covers(interface: "lo0", dst: "127.0.0.1", port: 9999))
+        #expect(!range.covers(interface: "lo0", dst: "127.0.0.1", port: 10000))
+        #expect(!range.covers(interface: "lo0", dst: "127.0.0.1", port: 0))
+        #expect(!range.covers(interface: "lo0", dst: "127.0.0.1", port: -1))
+        #expect(item("127.0.0.1/32", ports: "9999-9000").covers(interface: "lo0", dst: "127.0.0.1", port: 9500))
+        #expect(item("127.0.0.1/32", ports: " 9000 - 9999 ").covers(interface: "lo0", dst: "127.0.0.1", port: 9500))
+        #expect(item("127.0.0.1/32", ports: "ALL").covers(interface: "lo0", dst: "127.0.0.1", port: 1))
+        #expect(item("127.0.0.1/32", ports: "").covers(interface: "lo0", dst: "127.0.0.1", port: 65535))
+        #expect(!item("127.0.0.1/32", ports: "abc").covers(interface: "lo0", dst: "127.0.0.1", port: 1))
+        #expect(!item("127.0.0.1/32", ports: "9000-").covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
+        #expect(!item("127.0.0.1/32", ports: "-9000").covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
+        #expect(!item("127.0.0.1/32", ports: "9000,9001").covers(interface: "lo0", dst: "127.0.0.1", port: 9000))
+        // Garbage ports still cover an unknown port (nil) — the CIDR decides alone.
+        #expect(item("127.0.0.1/32", ports: "abc").covers(interface: "lo0", dst: "127.0.0.1", port: nil))
+    }
+
+    /// The draft trims the ports' surrounding spaces, and its key set is exactly the five AC5
+    /// keys, or four when the ports are blank; `_confirm` is never part of a draft.
+    @Test func testDraftArgsKeySet() {
+        let draft = L4ScopeDraft(cidr: " 127.0.0.1/32", ports: "  9100-9199  ", interface: "lo0", direction: "inbound",
+                                 capability: "inject")
+        #expect(draft.args["ports"] == .string("9100-9199"))
+        #expect(Set(draft.args.keys) == ["cidr", "ports", "interface", "direction", "capability"])
+        let spaces = L4ScopeDraft(cidr: "127.0.0.1/32", ports: "   ", interface: "lo0", direction: "inbound",
+                                  capability: "capture")
+        #expect(Set(spaces.args.keys) == ["cidr", "interface", "direction", "capability"])
+        #expect(spaces.args["_confirm"] == nil)
+    }
+}
+
+@Suite struct L4TesterHexTests {
+    /// AC40 over the whole byte space: every one of the 256 values renders to exactly one
+    /// character in 0x20…0x7e; the 95 printable bytes render as themselves and the other 161 as
+    /// `.`; no row of any width carries a line break, tab, escape or DEL.
+    @Test func testEveryByteValueRendersInert() {
+        let all = Data((0...255).map { UInt8($0) })
+        let column = L4Hex.asciiColumn(all)
+        #expect(column.unicodeScalars.count == 256)
+        for scalar in column.unicodeScalars {
+            #expect((0x20...0x7e).contains(scalar.value), "U+\(String(scalar.value, radix: 16)) reached the column")
+        }
+        let printable = Data((0x20...0x7e).map { UInt8($0) })
+        #expect(L4Hex.asciiColumn(printable) == String(String.UnicodeScalarView((0x20...0x7e).map { UnicodeScalar(UInt8($0)) })))
+        #expect(L4Hex.asciiColumn(printable).count == 95)
+        #expect(L4Hex.asciiColumn(Data((0x00...0x1f).map { UInt8($0) })) == String(repeating: ".", count: 32))
+        #expect(L4Hex.asciiColumn(Data((0x7f...0xff).map { UInt8($0) })) == String(repeating: ".", count: 129))
+        #expect(L4Hex.asciiColumn(Data()) == "")
+
+        let rows = L4Hex.rows(all)
+        #expect(rows.count == 16)
+        #expect(rows[0] == "00000000  00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f  ................")
+        #expect(rows[2] == "00000020  20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f   !\"#$%&'()*+,-./")
+        #expect(rows[7] == "00000070  70 71 72 73 74 75 76 77 78 79 7a 7b 7c 7d 7e 7f  pqrstuvwxyz{|}~.")
+        #expect(rows[15] == "000000f0  f0 f1 f2 f3 f4 f5 f6 f7 f8 f9 fa fb fc fd fe ff  ................")
+        for row in rows {
+            #expect(row.count == 8 + 2 + 47 + 2 + 16)
+            for scalar in row.unicodeScalars { #expect(scalar.value >= 0x20 && scalar.value <= 0x7e) }
+        }
+    }
+
+    /// Oversized and odd widths: a 4 MiB-window-sized dump stays linear and keeps its offsets,
+    /// width 1 gives one byte per row, width 0 is clamped to 1, and the last short row is padded
+    /// so the ASCII column lines up.
+    @Test func testRowsAtOddWidthsAndSizes() {
+        let big = Data(repeating: 0x0a, count: 65_536)
+        let rows = L4Hex.rows(big)
+        #expect(rows.count == 4096)
+        #expect(rows[4095].hasPrefix("0000fff0  0a 0a"))
+        #expect(rows[4095].hasSuffix("  ................"))
+        #expect(!rows.contains { $0.contains("\n") })
+
+        #expect(L4Hex.rows(Data([0x41, 0x1b]), width: 1) == ["00000000  41  A", "00000001  1b  ."])
+        #expect(L4Hex.rows(Data([0x41, 0x1b]), width: 0) == ["00000000  41  A", "00000001  1b  ."])
+        #expect(L4Hex.rows(Data([0x41, 0x1b]), width: -5) == ["00000000  41  A", "00000001  1b  ."])
+        #expect(L4Hex.rows(Data([0x41, 0x42, 0x43]), width: 2) == ["00000000  41 42  AB", "00000002  43     C"])
+        #expect(L4Hex.rows(Data(), width: 1) == [])
+    }
+}
+
+@Suite struct L4TesterCraftDraftTests {
+    /// Malformed drafts never reach the core: an unknown layer name, a `layers:` list with no
+    /// items, an unterminated or unquoted payload, a negative or non-integer byte, a `raw` list
+    /// with a nested list, and an empty payload (which is a legitimate zero-byte `raw`).
+    @Test func testParseRejectsWhatTheCoreWouldReject() throws {
+        #expect(PacketSpecDraft.parse("layers:") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - quic:\n      version: 1") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: \"open") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: 'single'") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [-1]") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [1, [2]]") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [0x41]") == nil)
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [1 2]") == nil)
+        #expect(PacketSpecDraft.parse("# only a comment") == nil)
+
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: \"\"") == .object(["layers": .array([.object(["raw": .array([])])])]))
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: []") == .object(["layers": .array([.object(["raw": .array([])])])]))
+        #expect(PacketSpecDraft.parse("layers:\n  - raw: [0, 255]") == .object(["layers": .array([.object(["raw": .array([0, 255])])])]))
+
+        // A non-ASCII payload is its UTF-8 bytes, each an integer 0...255.
+        let utf8 = try #require(PacketSpecDraft.parse("layers:\n  - raw: \"é\""))
+        #expect(utf8["layers"]?[0]?["raw"] == .array([195, 169]))
+
+        // Layer keys are case-insensitive, field keys are kept as written, a quoted scalar stays
+        // a string, an integer becomes a number, and a bare word stays a string.
+        let mixed = try #require(PacketSpecDraft.parse("""
+        layers:
+          - IPv4:
+              src: 127.0.0.1
+              ttl: 64
+              flags: "df"
+          - TCP:
+              dst_port: 9199
+              syn: true
+        """))
+        #expect(mixed == .object(["layers": .array([
+            .object(["ipv4": .object(["src": .string("127.0.0.1"), "ttl": 64, "flags": .string("df")])]),
+            .object(["tcp": .object(["dst_port": 9199, "syn": .bool(true)])]),
+        ])]))
+    }
+
+    /// An oversized draft (10 000 raw layers, a 100 000-byte payload) parses in order without
+    /// losing or reordering a layer.
+    @Test func testParseStaysLinearOnOversizedDrafts() throws {
+        var text = "layers:\n"
+        for i in 0..<10_000 { text += "  - raw: [\(i % 256)]\n" }
+        let value = try #require(PacketSpecDraft.parse(text))
+        let layers = try #require(value["layers"]?.arrayValue)
+        #expect(layers.count == 10_000)
+        #expect(layers[0]["raw"] == .array([0]))
+        #expect(layers[9_999]["raw"] == .array([.number(Double(9_999 % 256))]))
+
+        let payload = String(repeating: "A", count: 100_000)
+        let big = try #require(PacketSpecDraft.parse("layers:\n  - raw: \"\(payload)\""))
+        #expect(big["layers"]?[0]?["raw"]?.arrayValue?.count == 100_000)
+        #expect(big["layers"]?[0]?["raw"]?[99_999] == .number(65))
+    }
+
+    /// A craft result without `bytes`, or with bytes that are not base64, is no preview (the
+    /// inspector says `l4.craft returned no bytes.` instead of rendering an empty dump).
+    @Test func testCraftPreviewNeedsBytes() {
+        #expect(L4CraftPreview(json: .object(["length": .number(36)])) == nil)
+        #expect(L4CraftPreview(json: .object(["bytes": .string("***")])) == nil)
+        #expect(L4CraftPreview(json: .object(["bytes": .number(1)])) == nil)
+        #expect(L4CraftPreview(json: .null) == nil)
+        let empty = L4CraftPreview(json: .object(["bytes": .string("")]))
+        #expect(empty?.bytes == Data())
+        #expect(empty?.length == 0)
+        #expect(empty?.layers == [])
+    }
+}
+
+@Suite struct L4TesterWireCapabilityTests {
+    /// AC39 at the descriptor level: `confirmable` on a *different* tool, or on a tool whose name
+    /// merely starts with `l4.scope.add`, never enables the form; two descriptors for the add
+    /// verb enable it as soon as one is confirmable (the core lists each name once, but the
+    /// rule is "any confirmable l4.scope.add").
+    @Test func testSupportsOperatorScopeAddMatchesTheExactName() {
+        let schema = JSONValue.object(["type": .string("object"), "properties": .object([:])])
+        let lookalike = ToolDescriptor(name: "l4.scope.add.v2", description: "", inputSchema: schema, confirmable: true)
+        let caps = ToolDescriptor(name: "L4.scope.add", description: "", inputSchema: schema, confirmable: true)
+        let inject = ToolDescriptor(name: "l4.inject", description: "", inputSchema: schema, confirmable: true)
+        let add = ToolDescriptor(name: "l4.scope.add", description: "", inputSchema: schema, confirmable: true)
+        let plainAdd = ToolDescriptor(name: "l4.scope.add", description: "", inputSchema: schema)
+        #expect(!L4Wire.supportsOperatorScopeAdd([lookalike, caps, inject]))
+        #expect(!L4Wire.supportsOperatorScopeAdd([plainAdd, inject]))
+        #expect(L4Wire.supportsOperatorScopeAdd([plainAdd, add]))
+        #expect(L4Wire.supportsOperatorScopeAdd([inject, lookalike, add]))
+    }
+
+    /// `supportsWindow` reads `properties.limit` and nothing else: a `limit` outside
+    /// `properties`, a schema with no `properties`, or a `limit` on another verb is no window.
+    @Test func testSupportsWindowReadsOnlyTheFlowGetProperties() {
+        let noProps = ToolDescriptor(name: "l4.flow.get", description: "", inputSchema: .object(["type": .string("object")]))
+        let topLevel = ToolDescriptor(name: "l4.flow.get", description: "",
+                                      inputSchema: .object(["limit": .object(["type": .string("integer")])]))
+        let onList = ToolDescriptor(name: "l4.flow.list", description: "",
+                                    inputSchema: .object(["properties": .object(["limit": .object([:])])]))
+        let nullLimit = ToolDescriptor(name: "l4.flow.get", description: "",
+                                       inputSchema: .object(["properties": .object(["limit": .null])]))
+        #expect(!L4Wire.supportsWindow([noProps]))
+        #expect(!L4Wire.supportsWindow([topLevel]))
+        #expect(!L4Wire.supportsWindow([onList]))
+        #expect(!L4Wire.supportsWindow([]))
+        // A `limit` property that is JSON null still counts as declared.
+        #expect(L4Wire.supportsWindow([nullLimit]))
+
+        // The args builders never carry a key the core did not declare: no `filter`, no
+        // `_confirm`, no `inspect`.
+        for inspect in [true, false] {
+            for window in [true, false] {
+                let args = L4Wire.flowGetArgs(id: FlowID("F"), inspect: inspect, window: window)
+                #expect(Set(args.keys).isSubset(of: ["id", "offset", "limit"]))
+                #expect(args["id"] == .string("F"))
+            }
+        }
+    }
+}
+
+@Suite struct L4TesterRowVerbTests {
+    /// AC29 on every L4 session kind and both scope states: capture, craft, send_recv and
+    /// intercept rows, in and out of scope, all end with the same eleven HTTP verbs disabled and
+    /// the three host verbs as the table built them. An out-of-scope L4 row keeps the table's
+    /// scope reason on the host verbs (the gate never rewrites a reason it did not set).
+    @Test func testEveryL4KindAndScopeStateIsGated() {
+        for state in [L4SessionState.capture, .craft, .sendRecv, .intercept] {
+            for inScope in [true, false] {
+                let flow = L4Flow(id: FlowID("x"), sessionState: state, interface: "lo0", packetCount: 1,
+                                  injectedCount: 0, packets: [])
+                let row = flow.row(seq: 3, inScope: inScope)
+                let original = VerbTable.items(for: VerbContext(row: row, selectedCount: 2, selectedPausedCount: 2))
+                let gated = original.map { L4RowVerbs.gate($0, row: row) }
+                #expect(gated.count == 14)
+                let disabled = gated.filter { !$0.enabled }.map(\.verb)
+                let httpOnly: [FlowVerb] = [
+                    .resume, .edit, .delete, .kill, .replay, .editAndReplay, .buildPoC, .resumeSelected, .killSelected,
+                    .mark(nil), .comment,
+                ]
+                for verb in httpOnly {
+                    let item = VerbTable.item(verb, in: gated)
+                    #expect(!item.enabled, "\(state) inScope=\(inScope): \(verb) enabled")
+                    #expect(item.disabledReason == "Not available for L4 flows", "\(state) inScope=\(inScope): \(verb) reason")
+                }
+                #expect(Set(disabled).isSuperset(of: Set(httpOnly)))
+                for verb in [FlowVerb.pinHost, .copyURL, .quickLook] {
+                    #expect(VerbTable.item(verb, in: gated) == VerbTable.item(verb, in: original))
+                }
+                if !inScope {
+                    #expect(VerbTable.item(.pinHost, in: gated).disabledReason == VerbTable.outOfScopeReason(row.authority))
+                }
+            }
+        }
+        // The gate is idempotent: gating twice is the same as once.
+        let flow = L4Flow(id: FlowID("y"), sessionState: .intercept, interface: "lo0", packetCount: 1, injectedCount: 0,
+                          packets: [])
+        let row = flow.row(seq: 1, inScope: true)
+        let once = VerbTable.items(for: VerbContext(row: row)).map { L4RowVerbs.gate($0, row: row) }
+        #expect(once.map { L4RowVerbs.gate($0, row: row) } == once)
+        // A WebSocket row is not an L4 row: untouched.
+        let ws = FlowRow(id: FlowID("w"), seq: 1, kind: .websocket, method: .get, scheme: "wss", authority: "ws.example.test",
+                         path: "/", status: 101, state: .complete)
+        let wsItems = VerbTable.items(for: VerbContext(row: ws))
+        #expect(wsItems.map { L4RowVerbs.gate($0, row: ws) } == wsItems)
+    }
+}

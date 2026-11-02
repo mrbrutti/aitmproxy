@@ -260,6 +260,27 @@ actor FakeBusServer {
             "name": "fake.hang", "description": "Never replies.",
             "inputSchema": ["type": "object", "properties": [:], "additionalProperties": false],
         ],
+        // The confirm-over-the-wire shape the real core lists (`aitm-mcp` schema.rs): the
+        // schema declares the tool's own arguments with `additionalProperties: false` and
+        // never `_confirm` (the core strips it before schema enforcement), and the entry
+        // carries `confirmable: true`. Listed here so the `_confirm` pins run against a tool
+        // whose schema a pruning client *would* prune to, and so `ToolDescriptor.confirmable`
+        // is decoded from a real `tools/list` line.
+        [
+            "name": "l4.inject", "description": "Inject a crafted packet (operator confirm).",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "spec": ["type": "object"],
+                    "dst": ["type": "string"],
+                    "interface": ["type": "string"],
+                    "count": ["type": "integer"],
+                ],
+                "required": ["spec", "dst"],
+                "additionalProperties": false,
+            ],
+            "confirmable": true,
+        ],
     ]
 }
 
