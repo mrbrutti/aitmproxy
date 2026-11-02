@@ -184,6 +184,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aitm-peer-process"
+version = "0.5.10"
+dependencies = [
+ "aitm-core",
+ "core-foundation",
+ "libc",
+]
+
+[[package]]
 name = "aitm-peer-token"
 version = "0.5.10"
 dependencies = [
