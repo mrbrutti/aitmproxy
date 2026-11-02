@@ -69,7 +69,7 @@ fn load(reg) {
                 verdicts.push(#{
                     outcome: "vulnerable",
                     confidence: "firm",
-                    evidence: #{ payload: "GET " + url, matched: "HTTP " + reply.status + ", " + reply.body.len() + " bytes" },
+                    evidence: #{ payload: "GET " + url, matched: "HTTP " + reply.status + ", " + reply.body.len() + " chars" },
                     detail: `${path} answered ${reply.status} on ${origin}; this well-known path should not be served.`,
                     location: #{ path: path },
                 });

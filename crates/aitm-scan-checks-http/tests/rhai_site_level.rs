@@ -576,7 +576,7 @@ async fn paths_is_vulnerable_against_its_vulnerable_shape() {
     );
     assert_eq!(
         verdict.evidence.matched.as_deref(),
-        Some("HTTP 200, 21 bytes")
+        Some("HTTP 200, 21 chars")
     );
     assert_eq!(
         verdict.detail,
@@ -661,7 +661,7 @@ async fn the_sensitive_path_audit_returns_one_verdict_per_exposed_path() {
     );
     assert_eq!(
         verdicts[1].evidence.matched.as_deref(),
-        Some("HTTP 200, 20 bytes")
+        Some("HTTP 200, 20 chars")
     );
     assert_eq!(
         verdicts[1].detail,
