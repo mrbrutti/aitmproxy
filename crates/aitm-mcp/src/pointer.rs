@@ -1,0 +1,571 @@
+//! The core pointer file (spec D4; plan Task 1).
+//!
+//! A serving core writes `<run dir>/<pid>.json`: one compact JSON line that
+//! tells a one-shot `aitm` verb where the core's operator bus listens and
+//! which config file holds the operator token. The pointer **never carries a
+//! token**. The run dir is `<aitm dir>/run/cores` ([`default_run_dir`], the
+//! `run` sibling of the CA audit log, exactly as W1 derives its `logs` dir),
+//! overridable with `AITM_RUN_DIR` ([`run_dir`]).
+//!
+//! Liveness is the advisory lock, not the pid: the writer holds
+//! `File::try_lock` on the inode from before the rename until the listener
+//! ends, and a reader probes with `File::try_lock_shared` ([`liveness`]). A
+//! lock the kernel released means the writer is gone, SIGKILL included.
+//!
+//! The process context ([`publish`], [`context`]) is a write-once `OnceLock`
+//! set by `main.rs` for the serving modes only; an in-process `McpServer`
+//! built by a test has no context and publishes nothing (AC-R14-12).
+
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, TryLockError};
+use std::io::{self, Write as _};
+use std::net::SocketAddr;
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value as JsonValue};
+
+/// The pointer schema version this writer emits and this reader accepts.
+pub const POINTER_VERSION: u64 = 1;
+
+/// Environment variable that overrides the run dir for writer and reader.
+pub const RUN_DIR_ENV: &str = "AITM_RUN_DIR";
+
+/// What a serving process publishes once so the transport can write a pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerContext {
+    /// Absolute path of the config file the core read.
+    pub config: PathBuf,
+    /// The directory pointers are written to.
+    pub run_dir: PathBuf,
+}
+
+static CONTEXT: OnceLock<PointerContext> = OnceLock::new();
+
+/// Publish the process context. Write-once: `false` when already set.
+pub fn publish(ctx: PointerContext) -> bool {
+    CONTEXT.set(ctx).is_ok()
+}
+
+/// The published process context, if any.
+pub fn context() -> Option<&'static PointerContext> {
+    CONTEXT.get()
+}
+
+/// `<aitm dir>/run/cores`, the `run` sibling of the CA audit log.
+pub fn default_run_dir() -> PathBuf {
+    aitm_core::CaConfig::default()
+        .audit_log
+        .with_file_name("run")
+        .join("cores")
+}
+
+/// The run dir: a non-empty [`RUN_DIR_ENV`] wins, else [`default_run_dir`].
+pub fn run_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    match env(RUN_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => default_run_dir(),
+    }
+}
+
+/// The pointer file's content (spec D4 table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorePointer {
+    /// Schema version, [`POINTER_VERSION`].
+    pub v: u64,
+    /// The core's pid.
+    pub pid: u32,
+    /// The operator bus address; always loopback.
+    pub bus: SocketAddr,
+    /// Whether the bus accepts an operator token.
+    pub operator: bool,
+    /// Absolute path of the config file the core read.
+    pub config: PathBuf,
+    /// Epoch seconds when the bus bound.
+    pub started_unix: u64,
+    /// `CARGO_PKG_VERSION` of the writer.
+    pub version: String,
+}
+
+impl CorePointer {
+    /// One compact JSON line, keys in the order
+    /// `v,pid,bus,operator,config,started_unix,version`, trailing newline.
+    ///
+    /// Built by hand so the key order never depends on whether `serde_json`
+    /// was compiled with `preserve_order`.
+    pub fn to_json_line(&self) -> String {
+        format!(
+            "{{\"v\":{},\"pid\":{},\"bus\":{},\"operator\":{},\"config\":{},\"started_unix\":{},\"version\":{}}}\n",
+            self.v,
+            self.pid,
+            json_string(&self.bus.to_string()),
+            self.operator,
+            json_string(&self.config.to_string_lossy()),
+            self.started_unix,
+            json_string(&self.version),
+        )
+    }
+
+    /// Parse one pointer line; unknown keys are ignored.
+    pub fn parse(text: &str) -> Result<Self, PointerProblem> {
+        let value: JsonValue =
+            serde_json::from_str(text).map_err(|err| PointerProblem::NotJson(err.to_string()))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| PointerProblem::NotJson("not a JSON object".to_string()))?;
+        let v = u64_field(obj, "v")?;
+        if v != POINTER_VERSION {
+            return Err(PointerProblem::UnknownVersion(v));
+        }
+        let pid = u32::try_from(u64_field(obj, "pid")?)
+            .map_err(|_| PointerProblem::MissingField("pid"))?;
+        let bus: SocketAddr = str_field(obj, "bus")?
+            .parse()
+            .map_err(|_| PointerProblem::MissingField("bus"))?;
+        if !bus.ip().is_loopback() {
+            return Err(PointerProblem::NonLoopback(bus));
+        }
+        let operator = obj
+            .get("operator")
+            .and_then(JsonValue::as_bool)
+            .ok_or(PointerProblem::MissingField("operator"))?;
+        let config = PathBuf::from(str_field(obj, "config")?);
+        let started_unix = u64_field(obj, "started_unix")?;
+        let version = str_field(obj, "version")?.to_string();
+        Ok(Self {
+            v,
+            pid,
+            bus,
+            operator,
+            config,
+            started_unix,
+            version,
+        })
+    }
+}
+
+/// `s` as a JSON string literal with `serde_json`'s escaping.
+fn json_string(s: &str) -> String {
+    JsonValue::String(s.to_string()).to_string()
+}
+
+fn u64_field(obj: &Map<String, JsonValue>, key: &'static str) -> Result<u64, PointerProblem> {
+    obj.get(key)
+        .and_then(JsonValue::as_u64)
+        .ok_or(PointerProblem::MissingField(key))
+}
+
+fn str_field<'a>(
+    obj: &'a Map<String, JsonValue>,
+    key: &'static str,
+) -> Result<&'a str, PointerProblem> {
+    obj.get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or(PointerProblem::MissingField(key))
+}
+
+/// Why a reader ignores a pointer (spec D4 trust rules).
+#[derive(Debug, PartialEq, Eq)]
+pub enum PointerProblem {
+    /// Not a JSON object.
+    NotJson(String),
+    /// A schema version this reader does not know.
+    UnknownVersion(u64),
+    /// A required field is missing or has the wrong type.
+    MissingField(&'static str),
+    /// The bus address is not loopback.
+    NonLoopback(SocketAddr),
+    /// Not a regular file.
+    NotRegular,
+    /// Not owned by the current uid.
+    Foreign,
+    /// Wider than `0600`; carries `mode & 0o777`.
+    Wide(u32),
+}
+
+/// The trust rules on a pointer's metadata: a regular file, owned by
+/// `owner_uid`, no group or other bits.
+pub fn trust(meta: &Metadata, owner_uid: u32) -> Result<(), PointerProblem> {
+    if !meta.is_file() {
+        return Err(PointerProblem::NotRegular);
+    }
+    if meta.uid() != owner_uid {
+        return Err(PointerProblem::Foreign);
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(PointerProblem::Wide(mode));
+    }
+    Ok(())
+}
+
+/// Whether the pointer's writer still holds its lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The writer holds the exclusive lock.
+    Alive,
+    /// The lock is free: the writer is gone.
+    Dead,
+    /// The probe failed; treated as alive.
+    Unknown,
+}
+
+/// Probe a pointer's lock with `try_lock_shared`: `WouldBlock` means the
+/// writer holds it; success means the writer is gone (the shared lock is
+/// released again); any other error is `Unknown`.
+pub fn liveness(path: &Path) -> Liveness {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::debug!(path = %path.display(), %err, "could not open the core pointer to probe its lock");
+            return Liveness::Unknown;
+        }
+    };
+    match file.try_lock_shared() {
+        Err(TryLockError::WouldBlock) => Liveness::Alive,
+        Ok(()) => {
+            if let Err(err) = file.unlock() {
+                tracing::debug!(path = %path.display(), %err, "could not release the probe lock on the core pointer");
+            }
+            Liveness::Dead
+        }
+        Err(TryLockError::Error(err)) => {
+            tracing::debug!(path = %path.display(), %err, "could not probe the core pointer's lock");
+            Liveness::Unknown
+        }
+    }
+}
+
+/// A pointer this process wrote; dropping it removes the file.
+pub struct Published {
+    /// The pointer file's path.
+    pub path: PathBuf,
+    /// The exclusively locked handle, held for the pointer's lifetime so the
+    /// kernel releases the lock only when this value drops or the process
+    /// ends. Never read; it exists to be held.
+    _lock: File,
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        // The file is removed while still locked, so no reader ever sees an
+        // unlocked file at this path; the handle closes right after.
+        remove(&self.path);
+    }
+}
+
+/// Write `ptr` atomically as `<dir>/<pid>.json`, mode `0600`, locked before
+/// it becomes visible. Every directory this creates is `0700` and `dir`
+/// itself is tightened to `0700` if it already existed.
+pub fn write(dir: &Path, ptr: &CorePointer) -> io::Result<Published> {
+    let mut builder = DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
+    let path = dir.join(format!("{}.json", ptr.pid));
+    let tmp = dir.join(format!("{}.json.tmp", ptr.pid));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    match fill_lock_rename(&mut file, ptr, &tmp, &path) {
+        Ok(()) => Ok(Published { path, _lock: file }),
+        Err(err) => {
+            remove(&tmp);
+            Err(err)
+        }
+    }
+}
+
+/// Write the line, take the exclusive lock, then rename over the final name,
+/// so the inode is locked from the first instant it is visible.
+fn fill_lock_rename(file: &mut File, ptr: &CorePointer, tmp: &Path, path: &Path) -> io::Result<()> {
+    file.write_all(ptr.to_json_line().as_bytes())?;
+    file.try_lock().map_err(|err| match err {
+        TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the new pointer file is already locked",
+        ),
+        TryLockError::Error(err) => err,
+    })?;
+    fs::rename(tmp, path)
+}
+
+/// Remove a pointer file; a missing one is fine (idempotent).
+pub fn remove(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::debug!(path = %path.display(), %err, "could not remove the core pointer file");
+        }
+    }
+}
+
+/// A pointer that passed the trust rules and parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    /// The pointer file's path.
+    pub path: PathBuf,
+    /// Its content.
+    pub pointer: CorePointer,
+}
+
+/// Every `*.json` in `dir`, sorted by name, each trusted ([`trust`] on its
+/// own metadata, symlinks not followed) and parsed, or reported with its
+/// problem. A missing dir is empty; an entry that vanishes mid-scan is skipped.
+pub fn scan(dir: &Path, owner_uid: u32) -> Vec<Result<Found, (PathBuf, PointerProblem)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            if err.kind() != io::ErrorKind::NotFound {
+                tracing::debug!(path = %dir.display(), %err, "could not read the core pointer dir");
+            }
+            return Vec::new();
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err, "core pointer vanished mid-scan");
+                    return None;
+                }
+            };
+            if let Err(problem) = trust(&meta, owner_uid) {
+                return Some(Err((path, problem)));
+            }
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err, "could not read a core pointer");
+                    return None;
+                }
+            };
+            Some(match CorePointer::parse(&text) {
+                Ok(pointer) => Ok(Found { path, pointer }),
+                Err(problem) => Err((path, problem)),
+            })
+        })
+        .collect()
+}
+
+/// The transport's one call: write this process's pointer under the
+/// published context, or nothing when no context was published. A write
+/// failure is one `warn!` and `None`; it never ends a boot.
+pub fn publish_pointer(bus: SocketAddr, operator: bool) -> Option<Published> {
+    let ctx = context()?;
+    let started_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let ptr = CorePointer {
+        v: POINTER_VERSION,
+        pid: std::process::id(),
+        bus,
+        operator,
+        config: ctx.config.clone(),
+        started_unix,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    match write(&ctx.run_dir, &ptr) {
+        Ok(published) => Some(published),
+        Err(err) => {
+            tracing::warn!(path = %ctx.run_dir.display(), %err, "could not publish the core pointer");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique empty temp directory for one test, removed by the test.
+    fn temp_root(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("aitm-mcp-pointer-{}-{n}-{tag}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp root");
+        dir
+    }
+
+    fn sample() -> CorePointer {
+        CorePointer {
+            v: 1,
+            pid: 4821,
+            bus: "127.0.0.1:50512".parse().expect("addr"),
+            operator: true,
+            config: PathBuf::from("/Users/matt/Library/Application Support/aitmproxy/config.yaml"),
+            started_unix: 1761998645,
+            version: "0.5.11".to_string(),
+        }
+    }
+
+    const LINE: &str = "{\"v\":1,\"pid\":4821,\"bus\":\"127.0.0.1:50512\",\"operator\":true,\"config\":\"/Users/matt/Library/Application Support/aitmproxy/config.yaml\",\"started_unix\":1761998645,\"version\":\"0.5.11\"}\n";
+
+    /// AC-R14-10: the spec's example line byte for byte, and it round-trips.
+    #[test]
+    fn to_json_line_has_the_contract_shape() {
+        assert_eq!(sample().to_json_line(), LINE);
+        assert_eq!(CorePointer::parse(LINE), Ok(sample()));
+    }
+
+    /// D4 trust: unknown `v`, a missing field, a non-loopback bus and non-JSON
+    /// are each refused by name; an unknown extra key is ignored.
+    #[test]
+    fn parse_rejects_bad_pointers() {
+        let v2 = LINE.replacen("\"v\":1", "\"v\":2", 1);
+        assert_eq!(
+            CorePointer::parse(&v2),
+            Err(PointerProblem::UnknownVersion(2))
+        );
+        assert_eq!(
+            CorePointer::parse("{\"v\":1,\"pid\":1}"),
+            Err(PointerProblem::MissingField("bus"))
+        );
+        let off_box = LINE.replace("127.0.0.1:50512", "10.0.0.5:1");
+        assert_eq!(
+            CorePointer::parse(&off_box),
+            Err(PointerProblem::NonLoopback(
+                "10.0.0.5:1".parse().expect("addr")
+            ))
+        );
+        match CorePointer::parse("not json") {
+            Err(PointerProblem::NotJson(msg)) => assert!(!msg.is_empty()),
+            other => panic!("expected NotJson, got {other:?}"),
+        }
+        let extra = LINE.replacen('{', "{\"extra\":\"ignored\",", 1);
+        assert_eq!(CorePointer::parse(&extra), Ok(sample()));
+    }
+
+    /// AC-R14-10: `0600` file in `0700` `run` and `cores`, no `.tmp` left, the
+    /// exact line, locked while published, removed on drop, and an unlocked
+    /// file at the same path reads `Dead`.
+    #[test]
+    fn write_is_atomic_0600_locked_in_a_0700_dir() {
+        let root = temp_root("write");
+        let cores = root.join("run").join("cores");
+        let ptr = sample();
+
+        let published = write(&cores, &ptr).expect("write pointer");
+        assert_eq!(published.path, cores.join("4821.json"));
+        let mode = |p: &Path| fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&published.path), 0o600);
+        assert_eq!(mode(&cores), 0o700);
+        assert_eq!(mode(&root.join("run")), 0o700);
+        let names: Vec<String> = fs::read_dir(&cores)
+            .expect("read cores")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["4821.json".to_string()]);
+        assert_eq!(
+            fs::read_to_string(&published.path).expect("read pointer"),
+            ptr.to_json_line()
+        );
+        assert_eq!(liveness(&published.path), Liveness::Alive);
+
+        let path = published.path.clone();
+        drop(published);
+        assert!(!path.exists(), "drop removes the pointer");
+
+        File::create(&path).expect("an unlocked file");
+        assert_eq!(liveness(&path), Liveness::Dead);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// AC-R14-32 (pure half): a `0644` pointer, a directory named `x.json` and
+    /// a valid one are reported by file, in name order; a `.tmp` sibling is
+    /// not a pointer; a foreign uid is `Foreign`; a missing dir is empty.
+    #[test]
+    fn scan_reports_trust_problems_by_file() {
+        let root = temp_root("scan");
+        let cores = root.join("cores");
+        fs::create_dir_all(&cores).expect("cores");
+        let owner_uid = fs::metadata(&cores).expect("cores metadata").uid();
+
+        let wide = cores.join("1.json");
+        fs::write(&wide, sample().to_json_line()).expect("wide pointer");
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        let dir = cores.join("2.json");
+        fs::create_dir(&dir).expect("dir named x.json");
+        let good = cores.join("3.json");
+        fs::write(&good, sample().to_json_line()).expect("good pointer");
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        fs::write(cores.join("4.json.tmp"), "half").expect("tmp sibling");
+
+        assert_eq!(
+            scan(&cores, owner_uid),
+            vec![
+                Err((wide.clone(), PointerProblem::Wide(0o644))),
+                Err((dir.clone(), PointerProblem::NotRegular)),
+                Ok(Found {
+                    path: good.clone(),
+                    pointer: sample()
+                }),
+            ]
+        );
+        assert_eq!(
+            scan(&cores, owner_uid.wrapping_add(1)),
+            vec![
+                Err((wide, PointerProblem::Foreign)),
+                Err((dir, PointerProblem::NotRegular)),
+                Err((good, PointerProblem::Foreign)),
+            ]
+        );
+        assert!(scan(&root.join("missing"), owner_uid).is_empty());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// AC-R14-11: a non-empty `AITM_RUN_DIR` wins; empty or unset falls back
+    /// to the default, which is the `run/cores` sibling of the CA audit log.
+    #[test]
+    fn run_dir_prefers_the_env_override() {
+        let set = |k: &str| (k == "AITM_RUN_DIR").then(|| "/tmp/claude/r".to_string());
+        assert_eq!(run_dir(&set), PathBuf::from("/tmp/claude/r"));
+        let empty = |k: &str| (k == "AITM_RUN_DIR").then(String::new);
+        assert_eq!(run_dir(&empty), default_run_dir());
+        let unset = |_: &str| -> Option<String> { None };
+        assert_eq!(run_dir(&unset), default_run_dir());
+        assert!(
+            default_run_dir().ends_with("aitmproxy/run/cores"),
+            "{}",
+            default_run_dir().display()
+        );
+        assert_eq!(
+            default_run_dir(),
+            aitm_core::CaConfig::default()
+                .audit_log
+                .with_file_name("run")
+                .join("cores")
+        );
+    }
+
+    /// AC-R14-12: the unit-test binary never publishes a context, so the
+    /// transport's call writes nothing, anywhere.
+    #[test]
+    fn publish_pointer_without_context_writes_nothing() {
+        assert!(context().is_none(), "the unit-test binary never publishes");
+        let bus: SocketAddr = "127.0.0.1:50512".parse().expect("addr");
+        assert!(publish_pointer(bus, true).is_none());
+        let own = default_run_dir().join(format!("{}.json", std::process::id()));
+        assert!(!own.exists(), "{} must not exist", own.display());
+    }
+}
