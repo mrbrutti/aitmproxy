@@ -537,7 +537,15 @@ async function run() {
     } while (!agreed && Date.now() < until);
     expect(agreed, '04a issue group counts equal the witness by_severity (zero groups absent)', `rendered ${j(rendered)} vs witness ${j(wanted)}`);
 
-    const issueId = await attr(`${SCANNER} [data-issue]`, 'data-issue');
+    // D6: `poc_ref` is linked only for a hinted class (T3's natives: xss-reflected, open-redirect,
+    // ...), so 04d judges the engine on one of those rows, not on whichever row renders first.
+    const HINTED = ['xss-reflected', 'open-redirect'];
+    const listed = (await bus.call('scan.issues', { job: jobId, limit: 1024 })).issues ?? [];
+    const hinted = listed.find((i) => HINTED.includes(i.check_id)) ?? null;
+    const hintedRendered = hinted ? await d.q('exists', `${SCANNER} [data-issue="${hinted.id}"]`) : false;
+    if (hinted && hintedRendered) note('04 issue pick', `hinted class ${hinted.check_id} (${hinted.id})`);
+    else note('04 issue pick', `no hinted-class row (listed: ${[...new Set(listed.map((i) => i.check_id))].join(', ') || 'none'}); first row`);
+    const issueId = hintedRendered ? hinted.id : await attr(`${SCANNER} [data-issue]`, 'data-issue');
     if (!issueId) {
       gap('04 issue detail', 'the groups rendered but no [data-issue] row is present');
       return;
@@ -559,7 +567,7 @@ async function run() {
     }
 
     if (!issue.poc_ref) {
-      gap('04d PoC ref', 'no issue carries poc_ref on this engine');
+      gap('04d PoC ref', `${issue.check_id} (${issue.class}, ${issue.confidence}) carries no poc_ref${HINTED.includes(issue.check_id) ? ' though its class is hinted: the PoC run did not pass or the engine did not link it (D6)' : ' and no hinted-class issue was listed'}`);
     } else {
       await d.click({ role: 'button', text: `Open PoC ${issue.poc_ref}`, match: 'startsWith' });
       // Two honest outcomes (D-T8.9): the Findings panel selects the PoC's row, or the store's
