@@ -1,2 +1,260 @@
-
-[stderr] 619:620: syntax error: Can’t set line to r & "	" & t & "	" & v & "	" & d. Access not allowed. (-10003)
+AXStaticText	missing value	aitmproxy	text
+AXStaticText	missing value	TRAFFIC	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	TESTING	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	AUTOMATION	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXTextField	missing value		text field
+AXStaticText	missing value	⌘⇧F	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	1	text
+AXStaticText	missing value	https://push.services.mozilla.com:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:10:49.267	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	2	text
+AXStaticText	missing value	https://push.services.mozilla.com:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	—	text
+AXStaticText	missing value	18:10:49.358	text
+AXStaticText	missing value	…	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	3	text
+AXStaticText	missing value	https://www.apple.com:443	text
+AXStaticText	missing value	Safari	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	—	text
+AXStaticText	missing value	18:14:21.467	text
+AXStaticText	missing value	…	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	4	text
+AXStaticText	missing value	https://www.apple.com:443	text
+AXStaticText	missing value	Safari	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	—	text
+AXStaticText	missing value	18:14:23.230	text
+AXStaticText	missing value	…	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	5	text
+AXStaticText	missing value	https://example.com:443	text
+AXStaticText	missing value	curl	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:14:28.967	text
+AXStaticText	missing value	82 ms	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	6	text
+AXStaticText	missing value	https://example.com/	text
+AXStaticText	missing value	curl	text
+AXStaticText	missing value	missing value	GET
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:14:29.000	text
+AXStaticText	missing value	49 ms	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	577 B	text
+AXStaticText	missing value	7	text
+AXStaticText	missing value	https://example.com:443	text
+AXStaticText	missing value	curl	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:14:29.098	text
+AXStaticText	missing value	89 ms	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	8	text
+AXStaticText	missing value	https://example.com/	text
+AXStaticText	missing value	curl	text
+AXStaticText	missing value	missing value	GET
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:14:29.171	text
+AXStaticText	missing value	12 ms	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	577 B	text
+AXStaticText	missing value	9	text
+AXStaticText	missing value	https://httpbin.org:443	text
+AXStaticText	missing value	Safari	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:16:58.220	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	10	text
+AXStaticText	missing value	https://httpbin.org/get?safari=1793585817	text
+AXStaticText	missing value	Safari	text
+AXStaticText	missing value	missing value	GET
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:16:58.690	text
+AXStaticText	missing value	156 ms	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	631 B	text
+AXStaticText	missing value	11	text
+AXStaticText	missing value	https://httpbin.org/favicon.ico	text
+AXStaticText	missing value	Safari	text
+AXStaticText	missing value	missing value	GET
+AXStaticText	missing value	404	text
+AXStaticText	missing value	18:16:58.881	text
+AXStaticText	missing value	135 ms	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	233 B	text
+AXStaticText	missing value	12	text
+AXStaticText	missing value	https://httpbin.org:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	—	text
+AXStaticText	missing value	18:19:21.311	text
+AXStaticText	missing value	…	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	13	text
+AXStaticText	missing value	https://merino.services.mozilla.com:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:21:39.427	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	14	text
+AXStaticText	missing value	https://ads.mozilla.org:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:21:39.427	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	15	text
+AXStaticText	missing value	https://merino.services.mozilla.com:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText	missing value	18:26:39.444	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	16	text
+AXStaticText	missing value	https://ads.mozilla.org:443	text
+AXStaticText	missing value	—	text
+AXStaticText	missing value	missing value	CONNECT
+AXStaticText	missing value	200	text
+AXStaticText			
+AXButton		missing value	sort button
+AXButton	#	missing value	sort button
+AXButton	URL	missing value	sort button
+AXButton	Client	missing value	sort button
+AXButton	Method	missing value	sort button
+AXButton	Status	missing value	sort button
+AXButton	Time	missing value	sort button
+AXButton	Duration	missing value	sort button
+AXButton	Request	missing value	sort button
+AXButton	Response	missing value	sort button
+AXButton	SSL	missing value	sort button
+AXButton	Edited	missing value	sort button
+AXButton	Origin	missing value	sort button
+AXButton		missing value	sort button
+AXStaticText	missing value	GET	text
+AXStaticText	missing value	200 OK	text
+AXStaticText	missing value	HTTP/2 · h2	text
+AXStaticText	missing value	req	text
+AXStaticText	missing value	0 B	text
+AXStaticText	missing value	resp	text
+AXStaticText	missing value	577 B	text
+AXStaticText	missing value	54 ms	text
+AXStaticText	missing value	client	text
+AXStaticText	missing value	104.20.23.154:443	text
+AXStaticText	missing value	out of scope	text
+AXStaticText	missing value	Request	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	1	text
+AXStaticText	missing value	GET / HTTP/2	text
+AXStaticText	missing value	2	text
+AXStaticText	missing value	accept: */*	text
+AXStaticText	missing value	Response	text
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	increment arrow button
+AXButton	missing value	missing value	decrement arrow button
+AXButton	missing value	missing value	increment page button
+AXButton	missing value	missing value	decrement page button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXStaticText	missing value	3 hosts in scope	text
+AXStaticText	missing value	↑ 0 B/s	text
+AXStaticText	missing value	↓ 0 B/s	text
+AXButton	missing value	missing value	button
+AXCheckBox	missing value	1	toggle button
+AXCheckBox	missing value	1	toggle button
+AXButton	missing value	missing value	Toggle Sidebar
+AXButton	missing value	missing value	Compose
+AXButton	missing value	missing value	Clear Session
+AXButton	missing value	missing value	Command Palette
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	button
+AXButton	missing value	missing value	close button
+AXButton	missing value	missing value	full screen button
+AXButton	missing value	missing value	minimize button
