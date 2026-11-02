@@ -21,9 +21,9 @@ Assert:
     `ssti` /greet, `cmdi` /ping, `path-traversal` /static, `crlf` /lang, `xxe`
     /xml, `nosqli` /api/login, `ldapi` /ldap, `open-redirect` /redirect);
   - the same job on P yields none of those nine classes.
-  `cmdi` on /ping is printed as pending rather than failed while T10's seed shell
-  knows only `id` and `sleep` (spec amendment 64): the Rhai echo marker cannot fire
-  there, and the native `cmdi-time` (class cmdi) is accepted when it does. `xxe` on
+  `cmdi` on /ping is satisfied by either `cmdi` (the Rhai echo marker; T10's seed
+  shell answers `echo <word>` since #291, spec amendment 64) or the native
+  `cmdi-time`, both class cmdi. `xxe` on
   /xml and `nosqli` on /api/login are likewise pending until the HTTP lane emits a
   whole-body insertion point for XML/JSON bodies (spec amendment 65, T2's follow-up
   after #223): both checks are keyed on `entire_body`. On a build whose `scan.checks`
@@ -178,15 +178,6 @@ def main() -> None:
             for cls, path in sorted(SEEDED.items()):
                 hits = [i for i in by_class.get(cls, [])
                         if (i.get("location") or {}).get("path") == path]
-                if cls == "cmdi" and not hits:
-                    # Spec amendment 64: V's /ping shell knows `id` and `sleep` only,
-                    # so the Rhai `cmdi` echo marker cannot fire there until T10's seed
-                    # learns `echo <word>`; the native `cmdi-time` (class cmdi) counts
-                    # when it fires. Pending, not a failure, until the seed lands.
-                    print(f"  ~ V: class 'cmdi' on {path} pending T10's echo seed (amendment 64); "
-                          f"observed classes [{brief(iss_v, 16)}]")
-                    pending.add(cls)
-                    continue
                 if cls in ("open-redirect", "path-traversal") and not hits and interim_lane:
                     # Spec amendment 63: the interim lane sets no point traits, so the
                     # `wants_traits` checks never schedule under the standard speed on
