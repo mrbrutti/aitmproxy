@@ -932,12 +932,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("aitm-client-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("aitm");
-        let uid = std::fs::metadata(std::env::temp_dir())
-            .map(|m| m.uid())
-            .expect("tmp uid");
+        // The owner to check against is the owner of the base directory this
+        // test just created (the current user), never `$TMPDIR` itself: on
+        // GitHub's Linux runners `/tmp` is root-owned while the base is ours.
         std::fs::create_dir_all(&base).expect("base");
         let my_uid = std::fs::metadata(&base).expect("base meta").uid();
-        assert_eq!(uid, my_uid, "test assumes $TMPDIR belongs to this user");
 
         ensure_socket_dir(&dir, my_uid).expect("create");
         let mode = std::fs::metadata(&dir).expect("meta").mode() & 0o777;
