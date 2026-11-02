@@ -412,8 +412,9 @@ async function run() {
       return;
     }
     engineOk = true;
-    const item = await d.q('find', { role: 'button', text: 'Scan', match: 'startsWith', within: SIDEBAR });
-    expect(!!item, '01a the sidebar shows Scan', 'no Scan item in the sidebar');
+    // The sidebar paints after the bus opens; a one-shot find here raced it once (first paint).
+    const item = await soft(() => d.q('find', { role: 'button', text: 'Scan', match: 'startsWith', within: SIDEBAR }), 5000);
+    expect(!!item, '01a the sidebar shows Scan', 'no Scan item in the sidebar within 5 s');
     await goScan();
     const std = await soft(() => d.q('exists', `${PROFILES} [data-profile="standard"]`), 10000);
     expect(!!std, '01b the v2 surface lists the standard profile', `${PROFILES} [data-profile="standard"] never appeared`);
@@ -627,8 +628,16 @@ async function run() {
 
   // 5 ----------------------------------------------------------------------------------------
   await step('05 cancel', async () => {
-    // The first job is long done by now (a standard scan of the test target lasts seconds), so the
-    // cancel is proven on a SECOND standard job started here and cancelled within a second.
+    // The cancel is proven on a SECOND standard job against the same origin, so the first must be
+    // over: the engine admits one job per origin (`scan: busy`), and a debug-build core takes
+    // ~30 s for a standard scan of the test target.
+    const settledAt = Date.now();
+    const first = await soft(async () => (TERMINAL.has((await status(jobId)).state) ? true : null), 120000);
+    if (!first) {
+      fail('05 the first job ends before the cancel job starts', `job ${jobId} not terminal after 120 s (witness scan.status)`);
+      return;
+    }
+    note('05 first job', `terminal ${Date.now() - settledAt} ms after step 4 ended`);
     await clickTab('Profiles');
     if (!(await selectProfile('standard', '05'))) return;
     const want = `http://127.0.0.1:${target.port}`;
