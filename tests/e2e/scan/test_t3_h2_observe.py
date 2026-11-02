@@ -31,7 +31,8 @@ Observer, independent of the scanner: the target's control origin `GET /log/conn
 (`alpn`, `opened_ms`, per-connection `requests`, and with T10's #284 the per-connection
 `streams` counter: HEADERS frames seen before hyper parses them), which is the T3-3
 oracle for "<= 1 connection per check, <= 8 streams": sorted stream counts
-`[0, 2, 2, 3, 8]` (amendment 14b's 0/8/3/2/2) and none above 8. On a build without
+`[0, 1, 2, 3, 8]` (amendment 14b plans 0/8/3/2/2; header-crlf's second variant is
+never written after the first draws a connection-level GOAWAY) and none above 8. On a build without
 `streams` that half is printed as pending, not passed. No fixture.
 
 SKIP 77 when: no `scan.*` verbs, no `http` lane in `scan.checks`, any of the five
@@ -80,11 +81,17 @@ RAPID_RESET_PHRASE = "no reset-rate mitigation"
 EXPECTED_REQUESTS = [0, 0, 0, 0, 8]
 # T10's per-connection stream counter (PR #284): distinct client-initiated stream ids
 # seen in HEADERS frames on the inbound bytes before hyper parses them, so a rejected
-# header block and a cancelled stream count like a served one. The five checks open
-# 0 (settings), 2 (header-crlf), 2 (cl-te), 3 (pseudo-header) and 8 (rapid-reset)
-# streams: spec amendment 14b's 0/8/3/2/2, sorted. `streams` is absent on a build
-# without #284, in which case that half is reported as pending, not passed.
-EXPECTED_STREAMS = [0, 2, 2, 3, 8]
+# header block and a cancelled stream count like a served one -- but only the bytes
+# hyper's connection task still reads: after a connection-level GOAWAY nothing later
+# is counted. The five checks plan 0 (settings), 2 (header-crlf), 2 (cl-te),
+# 3 (pseudo-header) and 8 (rapid-reset) streams (spec amendment 14b's 0/8/3/2/2);
+# what the target really sees is one fewer for header-crlf, whose first variant
+# (CR LF in a header value) draws a connection-level GOAWAY(PROTOCOL_ERROR) from
+# hyper, so its second variant is never written (the check says so in its verdict:
+# "1 later variant(s) could not be tried"). Live on hyper: [0, 1, 2, 3, 8].
+# `streams` is absent on a build without #284, in which case that half is reported
+# as pending, not passed.
+EXPECTED_STREAMS = [0, 1, 2, 3, 8]
 MAX_STREAMS_PER_CONNECTION = 8
 JOB_TIMEOUT = 600.0
 
