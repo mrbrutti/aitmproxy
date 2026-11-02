@@ -9,6 +9,7 @@ import type { L4Store } from './store';
 import { ConfirmInject } from './ConfirmInject';
 import { L4Inspector } from './L4Inspector';
 import { beginGuarded, beginInject, confirmGuarded, confirmInject, type InjectArgs } from './inject';
+import { parkedFor } from './model';
 import css from './l4.module.css';
 
 interface Pending {
@@ -43,7 +44,7 @@ export const L4InspectorPanel: Component<{ store: L4Store }> = (props) => {
 
   // Forward / Drop reach the wire through the same confirm path (operator confirm-over-the-wire).
   const onVerb = (tool: string, label: string) => async () => {
-    const id = store.firstParkedId();
+    const id = parkedFor(store.parked(), store.selectedFlow()?.id ?? '')?.id ?? null;
     if (!id) {
       app.notice('No parked packet to act on', 'error');
       return;

@@ -24,7 +24,7 @@ export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
         canScope={store.caps().scope}
         activeCaptures={store.captureIds().length}
         scope={store.scope()}
-        onStart={(iface, filter) => void store.startCapture(iface, filter)}
+        onStart={(iface) => void store.startCapture(iface, 'inbound')}
       />
     </Show>
   );

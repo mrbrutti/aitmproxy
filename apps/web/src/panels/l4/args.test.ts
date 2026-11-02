@@ -192,6 +192,71 @@ describe('L4_ARG_BUILDERS table', () => {
   });
 });
 
+// ---- store tripwire (task C3) ---------------------------------------------------------------------
+//
+// `store.ts` must reach every argument-taking L4 verb through a C1 builder, never an object literal
+// (AC18–AC20), must hold no `firstParkedId` (verdicts take a parked id, spec §4) and must route read
+// failures through one `createOnceLog` (spec §7(c), AC23). The source is read with node `fs`, loaded
+// the way the live block below loads `node:net` (no `@types/node` in this package).
+
+async function readL4Source(name: string): Promise<string> {
+  const fsModule = 'node:fs';
+  const pathModule = 'node:path';
+  const urlModule = 'node:url';
+  const fs = (await import(/* @vite-ignore */ fsModule)) as { readFileSync(path: string, encoding: 'utf8'): string };
+  const path = (await import(/* @vite-ignore */ pathModule)) as { dirname(p: string): string; join(...parts: string[]): string };
+  const url = (await import(/* @vite-ignore */ urlModule)) as { fileURLToPath(u: string): string };
+  // Not `new URL(name, import.meta.url)`: Vite rewrites that form into an asset glob over the folder.
+  const here = url.fileURLToPath(import.meta.url);
+  return fs.readFileSync(path.join(path.dirname(here), name), 'utf8');
+}
+
+/** The verbs whose argument must be a C1 builder call wherever the store names them. */
+const ARG_VERB = String.raw`l4\.(?:flow\.get|capture\.start|capture\.stop|intercept\.[a-z_]+)`;
+/** `call('<verb>'…` and `app.call<T>('<verb>'…`: the literal, then `)` (no args) or `, <argument>`. */
+const CALL_SITE = new RegExp(String.raw`\bcall(?:<[^>]*>)?\(\s*'(${ARG_VERB})'\s*(\)|,\s*)`, 'g');
+/** `beginGuarded(call, '<verb>', <argument>)` / `confirmGuarded(call, '<verb>', <argument>, token)`. */
+const GUARDED_SITE = new RegExp(String.raw`\b(?:beginGuarded|confirmGuarded)\(\s*[^,()]+,\s*'(${ARG_VERB})'\s*(\)|,\s*)`, 'g');
+const BUILDER_CALL = /^(flowGetArgs|captureStartArgs|captureStopArgs|verdictArgs|mutateArgs|revertArgs)\(/;
+/** The two intercept reads take no arguments; a call with no second argument is right for them. */
+const NO_ARG_VERBS = new Set(['l4.intercept.status', 'l4.intercept.list']);
+/** The store must name each of these literally (so the check above actually sees the call). */
+const MUST_CALL = [
+  'l4.flow.get',
+  'l4.capture.start',
+  'l4.capture.stop',
+  'l4.intercept.forward',
+  'l4.intercept.drop',
+  'l4.intercept.mutate',
+  'l4.intercept.revert',
+];
+
+describe('store_reads_through_builders (C3 tripwire)', () => {
+  it('store.ts passes every argument-taking L4 verb a C1 builder, has no firstParkedId, logs failures once', async () => {
+    const src = await readL4Source('store.ts');
+    const problems: string[] = [];
+    if (src.includes('firstParkedId')) problems.push('store.ts still has firstParkedId (verdicts take a parked id, spec §4)');
+    if (!src.includes('createOnceLog(')) problems.push('store.ts does not route read failures through createOnceLog(');
+    const seen = new Set<string>();
+    for (const re of [CALL_SITE, GUARDED_SITE]) {
+      for (const m of src.matchAll(re)) {
+        const verb = m[1]!;
+        seen.add(verb);
+        if (m[2] === ')') {
+          if (!NO_ARG_VERBS.has(verb)) problems.push(`${verb}: called with no argument`);
+          continue;
+        }
+        const argument = src.slice(m.index! + m[0].length);
+        if (!BUILDER_CALL.test(argument)) {
+          problems.push(`${verb}: argument is not a C1 builder call: ${argument.split('\n')[0]!.slice(0, 48)}`);
+        }
+      }
+    }
+    for (const verb of MUST_CALL) if (!seen.has(verb)) problems.push(`${verb}: store.ts never calls it by its literal name`);
+    expect(problems).toEqual([]);
+  });
+});
+
 // ---- live schema block (AC18 live; run in C10 against the rig, skipped in the gate) ---------------
 //
 // Reads the real core's `tools/list` over the loopback-TCP bus (the wire of
