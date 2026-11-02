@@ -129,6 +129,78 @@ import Testing
     }
 }
 
+@Suite struct L4PendingCallTests {
+    /// `testConfirmedReissueKeepsEveryArgAndAddsOnlyTheToken` (L4PAR-AC33; spec
+    /// §3 last rule, plan unit (d) amendment 2): a `needs_confirmation` prompt is
+    /// bound to the exact call that produced it, and the confirmed re-issue is
+    /// that call — same command, every original arg — plus `_confirm: token` and
+    /// nothing else. Unit (b)'s TUI kept one shared "pending call" slot, so a
+    /// confirm for `l4.intercept.drop` could be re-issued as `l4.inject`; here the
+    /// binding is a value on the request, never a shared slot.
+    @Test func testConfirmedReissueKeepsEveryArgAndAddsOnlyTheToken() throws {
+        let drop = L4PendingCall(command: "l4.intercept.drop", args: ["id": .string("P1")])
+        #expect(!drop.isConfirmed)
+
+        // Parsing the core's reply with the call that caused it binds them.
+        let request = L4ConfirmRequest(
+            json: .object([
+                "status": .string("needs_confirmation"),
+                "prompt": .string("Drop parked packet P1"),
+                "confirm_token": .string("tok"),
+            ]),
+            call: drop)
+        let bound = try #require(request)
+        #expect(bound.prompt == "Drop parked packet P1")
+        #expect(bound.token == "tok")
+        #expect(bound.call == drop)
+
+        // The re-issue: identical command, identical args, plus exactly `_confirm`.
+        let again = try #require(bound.call?.confirmed(with: bound))
+        #expect(again.command == "l4.intercept.drop")
+        #expect(again.args == ["id": .string("P1"), "_confirm": .string("tok")])
+        #expect(again.args.count == 2)
+        #expect(again.isConfirmed)
+        #expect(!drop.isConfirmed)
+
+        // Confirming an already-confirmed call replaces the token; it never
+        // duplicates the key or grows the args.
+        #expect(again.confirmed(with: bound).args == again.args)
+        let other = L4ConfirmRequest(prompt: "again", token: "tok2")
+        #expect(again.confirmed(with: other).args == ["id": .string("P1"), "_confirm": .string("tok2")])
+
+        // Value semantics: binding the same reply to a different call yields a
+        // request whose re-issue is *that* call; the drop request is untouched.
+        let inject = L4PendingCall(
+            command: "l4.inject",
+            args: ["spec": .object([:]), "dst": .string("127.0.0.1")])
+        let injectRequest = bound.bound(to: inject)
+        #expect(injectRequest.call == inject)
+        #expect(injectRequest.token == "tok")
+        #expect(injectRequest.prompt == "Drop parked packet P1")
+        let injectAgain = try #require(injectRequest.call?.confirmed(with: injectRequest))
+        #expect(injectAgain.command == "l4.inject")
+        #expect(injectAgain.args == [
+            "spec": .object([:]),
+            "dst": .string("127.0.0.1"),
+            "_confirm": .string("tok"),
+        ])
+        #expect(bound.call == drop)
+        #expect(bound.call != inject)
+
+        // An unbound parse (the pre-M2b shape) carries no call.
+        let unbound = L4ConfirmRequest(json: .object([
+            "status": .string("needs_confirmation"),
+            "prompt": .string("Drop parked packet P1"),
+            "confirm_token": .string("tok"),
+        ]))
+        #expect(unbound?.call == nil)
+        #expect(L4ConfirmRequest(prompt: "p", token: "t").call == nil)
+
+        // A non-confirm reply is still not a dialog, bound or not.
+        #expect(L4ConfirmRequest(json: .object(["status": .string("ok")]), call: drop) == nil)
+    }
+}
+
 @Suite struct L4AvailabilityTests {
     /// L4PAR-AC26 (Kit): availability comes from the core's `l4.capture.status` /
     /// `l4.intercept.status` reply (spec §1), never from a guess about the core.

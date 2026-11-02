@@ -349,28 +349,67 @@ public struct L4ActionGate: Hashable, Sendable {
 
 // MARK: - Guarded inject + confirm-over-the-wire (AC10)
 
+/// One bus call awaiting the operator's confirmation: the command and the exact
+/// arguments that produced a `needs_confirmation` reply. The confirmed re-issue is
+/// this call — same command, every original arg — plus `_confirm: token` and
+/// nothing else (spec §3 last rule: "the operator re-issues the identical call
+/// carrying `_confirm`"). A value, so a prompt is bound to the call that caused it
+/// and can never be re-issued as a different call through a shared "last call"
+/// slot (unit (b)'s TUI lesson).
+public struct L4PendingCall: Hashable, Sendable {
+    public let command: String
+    public let args: [String: JSONValue]
+
+    public init(command: String, args: [String: JSONValue]) {
+        self.command = command
+        self.args = args
+    }
+
+    /// True once the args carry `_confirm`.
+    public var isConfirmed: Bool { args["_confirm"] != nil }
+
+    /// The identical call with exactly one more key, `_confirm: request.token`. An
+    /// existing `_confirm` is replaced, never duplicated.
+    public func confirmed(with request: L4ConfirmRequest) -> L4PendingCall {
+        var next = args
+        next["_confirm"] = .string(request.token)
+        return L4PendingCall(command: command, args: next)
+    }
+}
+
 /// The operator confirm dialog's content, parsed from the M4 `needs_confirmation`
 /// tool result (`aitm-mcp::server::needs_confirmation`): a wire summary (destination
-/// + PacketSummary + count + scope + permit budget) and a single-use token the
-/// operator re-issues the identical call with (`_confirm`).
+/// + PacketSummary + count + scope + permit budget), a single-use token the
+/// operator re-issues the identical call with (`_confirm`), and that call itself
+/// when the caller bound it at parse time.
 public struct L4ConfirmRequest: Hashable, Sendable {
     public let prompt: String
     public let token: String
+    /// The call that produced this prompt, or nil for an unbound parse.
+    public let call: L4PendingCall?
 
-    public init(prompt: String, token: String) {
+    public init(prompt: String, token: String, call: L4PendingCall? = nil) {
         self.prompt = prompt
         self.token = token
+        self.call = call
     }
 
     /// Parse a `needs_confirmation` result; nil for any other outcome (a plain
-    /// success or an error is not a confirm dialog).
-    public init?(json raw: JSONValue) {
+    /// success or an error is not a confirm dialog). Pass the call that was issued
+    /// so the prompt is bound to it.
+    public init?(json raw: JSONValue, call: L4PendingCall? = nil) {
         let json = raw["structuredContent"] ?? raw
         guard json["status"]?.stringValue == "needs_confirmation",
               let prompt = json["prompt"]?.stringValue,
               let token = json["confirm_token"]?.stringValue else { return nil }
         self.prompt = prompt
         self.token = token
+        self.call = call
+    }
+
+    /// The same prompt and token bound to `call`.
+    public func bound(to call: L4PendingCall) -> L4ConfirmRequest {
+        L4ConfirmRequest(prompt: prompt, token: token, call: call)
     }
 }
 
