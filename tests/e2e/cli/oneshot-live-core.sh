@@ -927,7 +927,8 @@ section_gate() {
   check "R9: no 'fix:' line" [ "$(count_re '^  fix: ' "$ROOT/r9.err")" = 0 ]
   oneshot r9b tls passthrough list
   check "aitm tls passthrough list → exit 0 (rc=$RC)" [ "$RC" = 0 ]
-  check "…stdout is exactly '[]\\n' (the add did not happen)" bytes_equal "$ROOT/r9b.out" $'[]\n'
+  # `tls.passthrough.list` answers `{ "hosts": [] }` (pretty JSON, as the local CLI renders it).
+  check "…stdout is exactly '{ \"hosts\": [] }' (the add did not happen)" bytes_equal "$ROOT/r9b.out" $'{\n  "hosts": []\n}\n'
   stop_server
   end_section "$ROOT/r9.err" "$ROOT/r9b.err"
 }
