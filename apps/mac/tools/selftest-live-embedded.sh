@@ -88,7 +88,11 @@ sleep 0.5
 #    off the real database; the app runs its live embedded path (there is no fixture mode).
 rm -rf ~/Library/Saved\ Application\ State/com.mrbrutti.aitmproxy.savedState
 store=/tmp/Aitmproxy-live-embedded-state
-rm -rf "$store"; mkdir -p "$store"
+rm -rf "$store"
+# /tmp is shared: a plain mkdir (no -p) fails on anything that appeared since the rm -rf, and the
+# check refuses a symlink or a directory another user owns (snap-dev.sh has the same guard).
+mkdir "$store" || fail "store $store already exists; refusing to launch"
+[[ ! -L $store && -O $store && -d $store ]] || fail "store $store is not a directory we own; refusing to launch"
 note "launching the app (embedded, no external core)"
 AITM_AUDIT_LOG="${AITM_AUDIT_LOG:-off}" APP_STORE="$store" "$app_bin" &
 app_pid=$!
