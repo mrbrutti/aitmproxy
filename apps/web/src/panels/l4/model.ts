@@ -518,6 +518,21 @@ export function parkedFor(parked: readonly L4ParkedWire[], flowId: string): L4Pa
   return parked.find((p) => p.flow === flowId) ?? null;
 }
 
+// ---- intercept bar model (spec §4, AC20) ------------------------------------------------------------
+//
+// What the intercept bar renders for the selected flow. Intercept unavailable (including pending)
+// is one documented-limited line with the core's reason and no live buttons; available with a
+// packet parked for the flow carries that parked id (the verdicts' argument, never the flow id);
+// available with nothing parked is a quiet idle line.
+
+export type InterceptBarModel = { kind: 'limited'; reason: string } | { kind: 'idle' } | { kind: 'parked'; id: string };
+
+export function interceptBarModel(avail: L4Availability, parked: readonly L4ParkedWire[], flowId: string): InterceptBarModel {
+  if (!avail.available) return { kind: 'limited', reason: avail.reason ?? '' };
+  const p = parkedFor(parked, flowId);
+  return p ? { kind: 'parked', id: p.id } : { kind: 'idle' };
+}
+
 // ---- tools/list feature detects -------------------------------------------------------------------
 
 /** True iff `l4.flow.get` declares `limit` (the parity core's bounded window, spec §2). */

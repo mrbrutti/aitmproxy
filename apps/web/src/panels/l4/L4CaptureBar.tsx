@@ -2,10 +2,12 @@
 // L4 sessions now live in the one unified list, so the retired L4Panel's capture controls move here
 // — reachable when the operator narrows to L4, out of the way otherwise. Honest degradation: when
 // `l4.*` is not advertised it says so in place instead of faking an L4 surface; when it is, the
-// controls follow the store's live `l4.capture.status` availability (parity spec §1).
+// controls follow the store's live `l4.capture.status` availability (parity spec §1), and an
+// unavailable in-path intercept is the same one documented-limited line the inspector shows (§4).
 import { Show, type Component } from 'solid-js';
 import type { L4Store } from './store';
 import { CaptureControls } from './CaptureControls';
+import { InterceptLimitedLine } from './L4InterceptBar';
 import css from './l4.module.css';
 
 export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
@@ -28,6 +30,9 @@ export const L4CaptureBar: Component<{ store: L4Store }> = (props) => {
         onStart={(iface, direction) => void store.startCapture(iface, direction)}
         onStop={(id) => void store.stopCapture(id)}
       />
+      <Show when={!store.interceptAvailability().available}>
+        <InterceptLimitedLine reason={store.interceptAvailability().reason ?? ''} />
+      </Show>
     </Show>
   );
 };

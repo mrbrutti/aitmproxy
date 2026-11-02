@@ -3,6 +3,7 @@ import {
   createOnceLog,
   flowScope,
   flowSubLabel,
+  interceptBarModel,
   isKnownKind,
   KNOWN_KINDS,
   L4_ACTIVE_MS,
@@ -14,9 +15,12 @@ import {
   l4Target,
   listCmd,
   parsePacketSpec,
+  PENDING_AVAILABILITY,
   placeholderRow,
   protoSubLabel,
+  type L4Availability,
   type L4FlowWire,
+  type L4ParkedWire,
   type L4PollClock,
   type L4ScopeEntryWire,
 } from './model';
@@ -211,5 +215,50 @@ describe('createOnceLog', () => {
     once.clear();
     once.log('a');
     expect(seen).toEqual(['a', 'b', 'a']);
+  });
+});
+
+// ---- intercept bar model (parity spec §4, AC20; task C5) -------------------------------------------
+
+const parkedWire = (id: string, flow: string): L4ParkedWire => ({
+  id,
+  flow,
+  state: 'parked',
+  dir: 'inbound',
+  length: 60,
+  layers: ['IPv4', 'TCP'],
+});
+
+const AVAILABLE: L4Availability = { available: true, code: 'available', reason: null };
+
+describe('interceptBarModel', () => {
+  it('unavailable intercept is one documented-limited line carrying the core reason', () => {
+    expect(interceptBarModel({ available: false, code: 'unsupported_platform', reason: 'Y' }, [], 'F')).toEqual({ kind: 'limited', reason: 'Y' });
+  });
+
+  it('unavailable with a parked list still reports limited (no verdict can succeed)', () => {
+    expect(interceptBarModel({ available: false, code: 'needs_privilege', reason: 'Z' }, [parkedWire('P1', 'F')], 'F')).toEqual({
+      kind: 'limited',
+      reason: 'Z',
+    });
+  });
+
+  it('pending availability is the shared pending literal as a limited line', () => {
+    expect(interceptBarModel(PENDING_AVAILABILITY, [], 'F')).toEqual({ kind: 'limited', reason: 'Reading L4 availability…' });
+  });
+
+  it('available with a packet parked for the flow names that parked id (never the flow id)', () => {
+    expect(interceptBarModel(AVAILABLE, [parkedWire('P1', 'F')], 'F')).toEqual({ kind: 'parked', id: 'P1' });
+    // First listed (oldest) for the flow wins.
+    expect(interceptBarModel(AVAILABLE, [parkedWire('P0', 'G'), parkedWire('P1', 'F'), parkedWire('P2', 'F')], 'F')).toEqual({ kind: 'parked', id: 'P1' });
+  });
+
+  it('available with nothing parked for the flow is idle', () => {
+    expect(interceptBarModel(AVAILABLE, [parkedWire('P1', 'G')], 'F')).toEqual({ kind: 'idle' });
+    expect(interceptBarModel(AVAILABLE, [], 'F')).toEqual({ kind: 'idle' });
+  });
+
+  it('a null reason while unavailable renders as an empty reason string, not "null"', () => {
+    expect(interceptBarModel({ available: false, code: null, reason: null }, [], 'F')).toEqual({ kind: 'limited', reason: '' });
   });
 });

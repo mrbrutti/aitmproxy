@@ -1,15 +1,17 @@
 // The lower-region L4 inspector: shown (by kind) when the selected flow is an L4 session. It is the
 // inspector half of the retired L4Panel — the packet list → layer tree → craft → intercept view
-// plus the guarded inject/forward/drop confirm path — now driven by the lifted L4 store and the
-// app's single selection, so L4 lives in the one unified flow list exactly like the TUI and macOS.
-// The wire is reached only through `l4.inject` / `l4.intercept.*` via the confirm path.
+// plus the guarded inject/forward/drop/mutate/revert confirm path — now driven by the lifted L4
+// store and the app's single selection, so L4 lives in the one unified flow list exactly like the
+// TUI and macOS. The wire is reached only through `l4.inject` / `l4.intercept.*` via the confirm
+// path, and every intercept verdict carries the parked packet's id (parity spec §4) built by the
+// `model.ts` builders — never a hand-built literal.
 import { createSignal, Show, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import type { L4Store } from './store';
 import { ConfirmInject } from './ConfirmInject';
 import { L4Inspector } from './L4Inspector';
 import { beginGuarded, beginInject, confirmGuarded, confirmInject, type InjectArgs } from './inject';
-import { parkedFor } from './model';
+import { interceptBarModel, mutateArgs, revertArgs, verdictArgs, type PacketSpec } from './model';
 import css from './l4.module.css';
 
 interface Pending {
@@ -42,21 +44,21 @@ export const L4InspectorPanel: Component<{ store: L4Store }> = (props) => {
     else app.notice(outcome.message, 'error');
   };
 
-  // Forward / Drop reach the wire through the same confirm path (operator confirm-over-the-wire).
-  const onVerb = (tool: string, label: string) => async () => {
-    const id = parkedFor(store.parked(), store.selectedFlow()?.id ?? '')?.id ?? null;
-    if (!id) {
-      app.notice('No parked packet to act on', 'error');
-      return;
-    }
-    const params = { id };
+  // Every intercept verdict takes the same guarded confirm path (operator confirm-over-the-wire):
+  // `params` is the builder's output for that verb and is re-sent verbatim with `_confirm` on
+  // confirm. The core may ask for confirmation on any of the four, so all four go through here.
+  const verdict = async (tool: string, label: string, params: Record<string, unknown>) => {
     const outcome = await beginGuarded(store.call, tool, params);
     if (outcome.kind === 'confirm') setPending({ title: `Confirm ${label} the parked packet`, prompt: outcome.prompt, token: outcome.token, tool, params });
     else if (outcome.kind === 'done') {
       app.notice(`${label} done`);
-      void store.refresh();
+      void store.refresh(true);
     } else app.notice(outcome.message, 'error');
   };
+  const onForward = (parkedId: string) => void verdict('l4.intercept.forward', 'Forward', verdictArgs(parkedId));
+  const onDrop = (parkedId: string) => void verdict('l4.intercept.drop', 'Drop', verdictArgs(parkedId));
+  const onMutate = (parkedId: string, spec: PacketSpec) => void verdict('l4.intercept.mutate', 'Mutate', mutateArgs(parkedId, spec));
+  const onRevert = (parkedId: string) => void verdict('l4.intercept.revert', 'Revert', revertArgs(parkedId));
 
   const confirm = async () => {
     const p = pending();
@@ -70,7 +72,7 @@ export const L4InspectorPanel: Component<{ store: L4Store }> = (props) => {
     } else if (outcome.kind === 'done') {
       app.notice(`${p.title} — done`);
       setPending(null);
-      void store.refresh();
+      void store.refresh(true);
       return;
     }
     setPending({ ...p, busy: false, refusal: outcome.kind === 'refused' ? outcome.message : 'the core did not accept the confirmation' });
@@ -86,12 +88,13 @@ export const L4InspectorPanel: Component<{ store: L4Store }> = (props) => {
           flow={store.selectedFlow()!}
           row={store.selectedRow()!}
           caps={store.caps()}
-          interceptParked={store.interceptParked()}
+          interceptModel={interceptBarModel(store.interceptAvailability(), store.parked(), store.selectedFlow()!.id)}
           onBuild={store.craft}
           onInject={onInject}
-          onForward={onVerb('l4.intercept.forward', 'Forward')}
-          onMutate={() => app.notice('Author the mutation in the craft editor, then Forward the parked packet', 'info')}
-          onDrop={onVerb('l4.intercept.drop', 'Drop')}
+          onForward={onForward}
+          onMutate={onMutate}
+          onDrop={onDrop}
+          onRevert={onRevert}
         />
       </Show>
 

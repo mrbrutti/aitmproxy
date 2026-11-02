@@ -1,6 +1,9 @@
 // The L4 inspector (ui-ext §3.2): for a selected L4 flow — the packet list, a selected packet's
 // layer tree + hex-availability note, the craft editor (YAML build → hex preview → guarded inject),
-// and the feature-detected in-path intercept bar. Presentational: the panel wires the bus.
+// and the in-path intercept bar driven by `interceptBarModel` (parity spec §4). Presentational: the
+// panel wires the bus. Mutate sends the craft editor's spec: the editor hands each spec it builds
+// through `onBuild`, the inspector keeps the last one, and Mutate is off with a reason until a
+// packet has been built.
 import { createSignal, Show, type Component } from 'solid-js';
 import { CraftEditor } from './CraftEditor';
 import { LayerTree } from './LayerTree';
@@ -8,26 +11,43 @@ import { PacketList } from './PacketList';
 import { L4InterceptBar } from './L4InterceptBar';
 import type { InjectArgs } from './inject';
 import type { L4Caps } from './store';
-import type { L4CraftResult, L4FlowWire, PacketSpec, UnionRow } from './model';
+import type { InterceptBarModel, L4CraftResult, L4FlowWire, PacketSpec, UnionRow } from './model';
 import css from './l4.module.css';
+
+/** Mutate's tooltip until the craft editor has built a spec to send. */
+export const MUTATE_NEEDS_BUILD = 'Build a packet in the craft editor first';
 
 export interface L4InspectorProps {
   flow: L4FlowWire;
   row: UnionRow;
   caps: L4Caps;
-  interceptParked: number;
+  /** What the intercept bar shows for this flow (`interceptBarModel(avail, parked, flow.id)`). */
+  interceptModel: InterceptBarModel;
   onBuild: (spec: PacketSpec) => Promise<L4CraftResult>;
   onInject: (args: InjectArgs) => void;
-  onForward: () => void;
-  onMutate: () => void;
-  onDrop: () => void;
+  onForward: (parkedId: string) => void;
+  /** Mutate the parked packet into the spec the craft editor last built. */
+  onMutate: (parkedId: string, spec: PacketSpec) => void;
+  onDrop: (parkedId: string) => void;
+  onRevert: (parkedId: string) => void;
 }
 
 export const L4Inspector: Component<L4InspectorProps> = (props) => {
   const [sel, setSel] = createSignal<number | null>(props.flow.packets.length ? 0 : null);
+  /** The spec the craft editor last built successfully; what Mutate sends. */
+  const [lastBuilt, setLastBuilt] = createSignal<PacketSpec | null>(null);
   const packet = () => {
     const i = sel();
     return i != null ? (props.flow.packets[i] ?? null) : null;
+  };
+  const build = async (spec: PacketSpec): Promise<L4CraftResult> => {
+    const result = await props.onBuild(spec);
+    setLastBuilt(spec);
+    return result;
+  };
+  const mutate = (parkedId: string) => {
+    const spec = lastBuilt();
+    if (spec) props.onMutate(parkedId, spec);
   };
   return (
     <div class={css.inspector}>
@@ -56,18 +76,19 @@ export const L4Inspector: Component<L4InspectorProps> = (props) => {
         scopeReason={props.row.scopeReason}
         canCraft={props.caps.craft}
         canInject={props.caps.inject}
-        onBuild={props.onBuild}
+        onBuild={build}
         onInject={props.onInject}
       />
 
       <L4InterceptBar
-        available={props.caps.intercept}
-        parked={props.interceptParked}
+        model={props.interceptModel}
         inScope={props.row.inScope}
         scopeReason={props.row.scopeReason}
+        mutateBlocked={lastBuilt() ? null : MUTATE_NEEDS_BUILD}
         onForward={props.onForward}
-        onMutate={props.onMutate}
+        onMutate={mutate}
         onDrop={props.onDrop}
+        onRevert={props.onRevert}
       />
     </div>
   );
