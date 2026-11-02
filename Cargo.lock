@@ -58,6 +58,7 @@ dependencies = [
  "aitm-scan-model",
  "aitm-scan-ws",
  "aitm-sysproxy",
+ "aitm-term",
  "aitm-testtarget",
  "aitm-tui",
  "anyhow",
@@ -68,6 +69,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "ratatui",
  "rcgen",
  "rustls",
@@ -567,6 +569,17 @@ dependencies = [
  "serde_json",
  "time",
  "tracing",
+]
+
+[[package]]
+name = "aitm-term"
+version = "0.5.12"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

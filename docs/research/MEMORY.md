@@ -54,8 +54,8 @@ user's request to keep research docs and memory inside `docs/research`.)
 - Build the UI once: `cd apps/web && npm ci && npm run build` (writes the git-ignored
   `apps/web/dist`), then rebuild `aitm` — `crates/aitm/build.rs` embeds `dist/`; without it
   `/` serves a "not built" page.
-- Run `aitm web [--listen 127.0.0.1:8082] [--token …] [--no-open]`; it prints
-  `web UI: http://127.0.0.1:8082/#t=<token>` — the UI takes the token from `#t=` and sends it
+- Run `aitm web [--listen 127.0.0.1:8082] [--token …] [--no-open]`; its ready card (stderr) carries
+  `Web UI  http://127.0.0.1:8082/#t=<token>` — the UI takes the token from `#t=` and sends it
   as the first `/bus` WebSocket message (`{"token":"…"}`, as LoopbackTcp). Env: `AITM_WEB_LISTEN`,
   `AITM_WEB_TOKEN`; a non-loopback bind is refused until TLS lands (`AITM_WEB_INSECURE_BIND=1` overrides).
 

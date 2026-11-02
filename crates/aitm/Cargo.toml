@@ -63,6 +63,8 @@ aitm-peer-process.workspace = true
 # `InProcessTransport` (TUI plan Task 4). Both are already in the tree.
 aitm-tui.workspace = true
 aitm-bus-client.workspace = true
+# Terminal reporting layer (CLI terminal reporting wave 1): `startup/` builds its `Caps`, reporter, card and panels.
+aitm-term.workspace = true
 anyhow = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -82,6 +84,8 @@ bytes = "1"
 tokio-tungstenite.workspace = true
 # Bridge token generation (two v4 UUIDs).
 uuid.workspace = true
+# `O_NOFOLLOW` on the startup log file (`startup/log.rs`), as `aitm-proto-http` opens the CA key; 0.2 is already in the lock.
+libc = "0.2"
 
 # macOS NE live-capture feeder, peer-auth seam (`macos_capture::peer_auth`): the
 # core verifies the System Extension provider's code signature before it sends

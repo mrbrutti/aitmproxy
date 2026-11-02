@@ -33,6 +33,9 @@ pub struct LaunchedBrowser {
     /// Handed to the `browser.*` commands; clones may outlive the owner.
     pub driver: Arc<dyn BrowserDriver>,
     closer: Closer,
+    /// The probed obscura `--version`; `None` for Chrome and Firefox, which
+    /// are never probed.
+    version: Option<String>,
 }
 
 /// The engine-specific close path behind [`LaunchedBrowser::close`].
@@ -47,13 +50,20 @@ impl LaunchedBrowser {
     /// SIGKILL after `stop_timeout`); Chrome: `ChromeDriver::close`. Works while
     /// command handlers still hold `driver` clones; their next call fails.
     pub async fn close(self) -> anyhow::Result<()> {
-        let Self { driver, closer } = self;
+        let Self { driver, closer, .. } = self;
         drop(driver);
         match closer {
             Closer::Obscura(driver) => driver.shutdown().await,
             Closer::Chrome(driver) => driver.shutdown().await,
             Closer::Firefox(driver) => driver.shutdown().await,
         }
+    }
+
+    /// The engine's probed version: `Some(<obscura --version>)` for obscura,
+    /// `None` for Chrome and Firefox. Feeds the startup reporter's
+    /// `obscura probed <version>` line (spec T7).
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
 }
 
@@ -68,9 +78,11 @@ pub async fn launch_owned(
     match config.engine {
         BrowserEngine::Obscura => {
             let driver = Arc::new(ObscuraDriver::launch(config, ca_cert).await?);
+            let version = Some(driver.version().to_string());
             Ok(LaunchedBrowser {
                 driver: driver.clone(),
                 closer: Closer::Obscura(driver),
+                version,
             })
         }
         BrowserEngine::Chrome => {
@@ -78,6 +90,7 @@ pub async fn launch_owned(
             Ok(LaunchedBrowser {
                 driver: driver.clone(),
                 closer: Closer::Chrome(driver),
+                version: None,
             })
         }
         BrowserEngine::Firefox => {
@@ -85,6 +98,7 @@ pub async fn launch_owned(
             Ok(LaunchedBrowser {
                 driver: driver.clone(),
                 closer: Closer::Firefox(driver),
+                version: None,
             })
         }
     }

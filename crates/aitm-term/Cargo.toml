@@ -1,0 +1,26 @@
+[package]
+name = "aitm-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Terminal reporting layer for the aitm CLI: capabilities, glyphs, phases, cards, error panels."
+
+[lib]
+name = "aitm_term"
+
+[dependencies]
+anyhow.workspace = true
+# Cursor movement, clearing, the stderr width and the synchronized-update
+# brackets only (plan C2: `style::paint` writes the classic 16-colour SGR codes
+# itself). Default features; `aitm-tui` already resolves 0.29 with
+# `event-stream`, a superset, so nothing new enters Cargo.lock.
+crossterm = "0.29"
+# Display width for truncation and wrapping (`text.rs`); 0.2.3 is in the lock.
+unicode-width = "0.2"
+tracing.workspace = true
+# `registry` + `std` for the `UiLayer`; the `env-filter` feature is `aitm`'s.
+tracing-subscriber = { version = "0.3", features = ["registry", "std"] }
+
+[lints]
+workspace = true
