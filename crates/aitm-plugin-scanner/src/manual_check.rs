@@ -228,8 +228,13 @@ impl Command for ManualCheck {
                         format!("`{param}` is not a query parameter of that url"),
                     )
                 })?;
-            let host = lane.probe_host_for(&point, Arc::clone(&job))?;
-            bounded_await(job.deadline(), &cancel, check.run(&point, host.as_ref()))
+            // Behind an `Arc`, as the worker hands it (amendment 62): a
+            // script check borrows the host through `shared()` for the
+            // length of its run and errors out before sending a byte when
+            // there is none to borrow.
+            let host =
+                crate::worker::ArcHost(Arc::from(lane.probe_host_for(&point, Arc::clone(&job))?));
+            bounded_await(job.deadline(), &cancel, check.run(&point, &host))
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
@@ -517,6 +522,114 @@ mod tests {
         }
     }
 
+    /// A native check whose `matched` is long enough that the excerpt bound
+    /// bites, with the secrets at the end, and which also returns a sibling
+    /// verdict carrying its own leak. Both are what a real check produces when
+    /// it quotes a whole response header block.
+    struct LoudLeakyCheck {
+        meta: CheckMeta,
+    }
+
+    impl LoudLeakyCheck {
+        /// The same shape the Rhai bridge's order test uses: 230 bytes of
+        /// padding, then a cookie and an `Authorization` line.
+        fn matched() -> String {
+            format!(
+                "{} Cookie: sid=s3cr3t-cookie; Authorization: Bearer abc.def.ghi",
+                "a".repeat(230)
+            )
+        }
+
+        fn new() -> Self {
+            Self {
+                meta: null_meta("loud-echo"),
+            }
+        }
+    }
+
+    impl Check for LoudLeakyCheck {
+        fn meta(&self) -> &CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a InsertionPoint,
+            _host: &'a dyn ProbeHost,
+        ) -> BoxFuture<'a, Verdict> {
+            Box::pin(async {
+                Verdict {
+                    outcome: Outcome::Vulnerable,
+                    confidence: Confidence::Firm,
+                    evidence: Evidence {
+                        matched: Some(Self::matched()),
+                        ..Evidence::default()
+                    },
+                    detail: "loud".to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: vec![Verdict {
+                        outcome: Outcome::Vulnerable,
+                        confidence: Confidence::Firm,
+                        evidence: Evidence {
+                            payload: Some("sid=s3cr3t-cookie".to_string()),
+                            matched: Some("Cookie: sid=s3cr3t-cookie".to_string()),
+                            ..Evidence::default()
+                        },
+                        detail: "sibling".to_string(),
+                        poc_hint: None,
+                        location: None,
+                        more: Vec::new(),
+                    }],
+                }
+            })
+        }
+    }
+
+    /// A native check that needs the host behind an `Arc` the way every Rhai
+    /// script check does (the bridge errors with "ProbeHost::shared returned
+    /// none" otherwise): `Vulnerable` when `shared()` gives one, `Error`
+    /// naming the gap when it does not.
+    struct SharingCheck {
+        meta: CheckMeta,
+    }
+
+    impl SharingCheck {
+        fn new() -> Self {
+            Self {
+                meta: null_meta("needs-shared"),
+            }
+        }
+    }
+
+    impl Check for SharingCheck {
+        fn meta(&self) -> &CheckMeta {
+            &self.meta
+        }
+
+        fn run<'a>(
+            &'a self,
+            _point: &'a InsertionPoint,
+            host: &'a dyn ProbeHost,
+        ) -> BoxFuture<'a, Verdict> {
+            Box::pin(async move {
+                let (outcome, detail) = match host.shared() {
+                    Some(_) => (Outcome::Vulnerable, "shared host received"),
+                    None => (Outcome::Error, "ProbeHost::shared returned none"),
+                };
+                Verdict {
+                    outcome,
+                    confidence: Confidence::Firm,
+                    evidence: Evidence::default(),
+                    detail: detail.to_string(),
+                    poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
+                }
+            })
+        }
+    }
+
     /// A client that answers every request with an HTML page echoing the
     /// decoded query values, so the interim `xss-reflected` check sees its
     /// marker come back unencoded.
@@ -701,6 +814,28 @@ mod tests {
         );
     }
 
+    /// Amendment 62: the manual path hands the check a host whose `shared()`
+    /// is `Some`, exactly as the worker does with `ArcHost`; otherwise every
+    /// `check.<rhai-id>` verb errors before it sends a byte (T3's 2b live run).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_check_hands_a_shared_host_to_the_check() {
+        let h = Harness::with_checks(vec![Arc::new(SharingCheck::new())]);
+
+        let result = h
+            .call(
+                "check.needs-shared",
+                &[("url", s("http://ex.test/search")), ("param", s("q"))],
+            )
+            .expect("the manual check runs");
+
+        assert_eq!(
+            obj(&result, "detail"),
+            &s("shared host received"),
+            "the host handed to a manual check has `shared()`: {result:?}"
+        );
+        assert_eq!(obj(&result, "outcome"), &s("vulnerable"));
+    }
+
     /// Amendment 56 (D8.1): the manual path returns a verdict straight to the bus
     /// caller, so it scrubs `evidence.matched` and `evidence.payload` the way the
     /// job path's worker does — a native check that echoes a session cookie or a
@@ -730,6 +865,47 @@ mod tests {
             &Value::Str("echo: Authorization: [redacted]".into()),
             "detail is scrubbed on the manual path too"
         );
+    }
+
+    /// Amendment 56 with amendment 16's order: the manual path scrubs **then**
+    /// bounds, exactly as the Rhai bridge does, and it reaches the sibling
+    /// verdicts too. Bounded first, the cut would land inside the cookie value
+    /// and the scrub would then leave 249 bytes; the exact 256-byte literal
+    /// pins the order rather than merely "something was redacted".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manual_evidence_is_scrubbed_before_it_is_bounded() {
+        let h = Harness::with_checks(vec![Arc::new(LoudLeakyCheck::new()) as Arc<dyn Check>]);
+
+        let result = h
+            .call(
+                "check.loud-echo",
+                &[("url", s("http://ex.test/search")), ("param", s("q"))],
+            )
+            .expect("the manual check runs");
+
+        let matched = match obj(obj(&result, "evidence"), "matched") {
+            Value::Str(text) => text.clone(),
+            other => panic!("matched is not a string: {other:?}"),
+        };
+        assert_eq!(
+            matched.len(),
+            aitm_scan_model::check::MAX_EXCERPT_BYTES,
+            "scrubbed first, then cut: {matched:?}"
+        );
+        assert_eq!(
+            matched,
+            format!("{} Cookie: [redacted]; Autho", "a".repeat(230))
+        );
+        assert!(!matched.contains("s3cr3t"), "{matched:?}");
+
+        let more = match obj(&result, "more") {
+            Value::Array(items) => items.clone(),
+            other => panic!("more is not an array: {other:?}"),
+        };
+        assert_eq!(more.len(), 1);
+        let sibling = obj(&more[0], "evidence");
+        assert_eq!(obj(sibling, "matched"), &s("Cookie: [redacted]"));
+        assert_eq!(obj(sibling, "payload"), &s("sid=[redacted]"));
     }
 
     /// Deny-by-default: a URL outside the HTTP scope is refused before anything

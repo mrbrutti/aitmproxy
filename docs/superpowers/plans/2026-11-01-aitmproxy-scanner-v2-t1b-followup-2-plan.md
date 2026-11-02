@@ -389,6 +389,16 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 - **Tests (red first):** `check_bridge` test: a closure returning `matched` containing `Cookie: sid=s3cr3t` and `Authorization: Bearer abc.def` yields `matched` with both values redacted and the bound still applied; `manual_check::tests::manual_verdict_evidence_is_scrubbed`: a native check whose evidence echoes a bearer token returns a redacted `matched` through `check.<id>`.
 - **Ownership:** `check_bridge.rs` (aitm-plugin-rhai, T1b row) and `manual_check.rs`; no overlap with Tasks 1b/7; can run in parallel with them.
 
+### Task 12: the manual path hands the check a shared host (amendment 62, BLOCKER from T3's 2b live run)
+
+**Files:** `crates/aitm-plugin-scanner/src/manual_check.rs` only (orchestrator, test-first, folded in before the push).
+
+Every manual `check.<rhai-id>` returned "the engine must hand a shared probe host to a script check (ProbeHost::shared returned none)": `manual_check.rs` ran `check.run(&point, host.as_ref())` on the lane's `Box<dyn ProbeHost>`, whose `shared()` is the trait default `None`, while the worker wraps the same host in `worker::ArcHost` (whose `shared()` is `Some`). The manual path now wraps it the same way.
+
+- [x] Test `manual_check::tests::manual_check_hands_a_shared_host_to_the_check`: a native `needs-shared` check returns `Vulnerable`/"shared host received" when `host.shared()` is `Some` and `Error`/"ProbeHost::shared returned none" otherwise; red on the unwrapped host (left: the error text), green wrapped.
+
+**Amendment 63 (recorded, not done here):** the interim discovery sets no `PointTrait`s, so `wants_traits` checks (path-traversal: filename, ssrf: url) run only under `speed: thorough`; T2's insertion points v2 (#223) replaces the interim discovery, so `discover.rs` is left alone.
+
 ### Task 6: bookkeeping and docs wording
 
 - **Satisfies:** workflow stage-7 record keeping; amendment 39/40 operator docs.
@@ -503,6 +513,7 @@ Kept by the main session during stage 6. One row per finding.
 | 5 | Coder (Task 5) | Note | No measured bound turned out to be the property: four test sites converted (blocking check + `terminal_signal` still `false`; direct hold assertion; `TERMINAL_NET` nets) and `poll_until` → `wait_until` (timeout over the terminal signal on the engine runtime, mpsc-bridged so it is correct from any caller context); zero-deadline test distinguishes "answers on the first look" without a clock | accepted; committed in df127f56 |
 | 8 | Coder (Task 8) | Note | Crate has no `rand`/`getrandom`; seed = `RandomState::hash_one(nanos)` folded to `u32`, no new dependency; marker = `lowbias32(counter ^ seed)` (bijective per seed) so a target cannot predict the next marker by flipping a bit; doc states the seed is not a secret and the mix is not a MAC | accepted; committed in 5503cba8 (plus the interim-lane test fake made shape-conformant) |
 | 10, 11 | Coder (Tasks 10, 11) | Note | Reports accepted; committed in 11a66c51 | done |
+| 12 | Coordinator (amendment 62) | Blocker | Manual `check.<rhai-id>` verbs all error: the lane host is handed unwrapped, `shared()` is `None` | fixed by the orchestrator, test-first (`manual_check_hands_a_shared_host_to_the_check`); amendment 63 recorded as a note on Task 12, no change |
 
 ## Follow-up PR 3 (not in this PR; amendment 59, T3's 2b live run)
 
