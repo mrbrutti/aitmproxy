@@ -440,6 +440,13 @@ fn main() {
             Some(&reporter),
         ),
     }
+    // The stdio MCP transport reads stdin on a blocking thread that only
+    // returns at EOF. A core stopped by SIGTERM/SIGINT while its stdin is still
+    // open (a supervisor's pipe) must not wait for that read: everything that
+    // had to happen on the way out (the system-proxy restore, the browser reap,
+    // the pointer) ran inside `run()`. Give the rest of the blocking pool a
+    // second, then leave (R14 live proof §3: "SIGTERM: exit 0").
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
