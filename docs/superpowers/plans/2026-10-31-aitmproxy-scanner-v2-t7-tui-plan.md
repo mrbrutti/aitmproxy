@@ -779,6 +779,9 @@ Kept by the main session during stage 6. One row per finding.
 | I | fix round | dispatched | `docs/superpowers/plans/2026-11-01-aitmproxy-scanner-v2-t7-fix-round-i.md` I1-I11 | re-gate (crate + workspace) and re-run the cell on the final head |
 | 17 | gate | green | workspace gate on `955e84c8` from the Terminal (`/tmp/claude/t7-gate17.log`): `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test --no-fail-fast` 0 (every suite ok, `perf.rs` included) | repeat on the round I head |
 | I | fix round | done | I1 `68e78089` (shared `location_strings`/`target_strings`/`bound_jobs`, dedupe keeping first), I2 I3 `7328d661` (`forget_job` forgets when every listed finder is the job; `next_cursor` dropped past `CURSOR_MAX` bytes, G16 unit), I4 I5 I8 I10 I11 `0b519810`, I6 I7 I9 `eea46de2`; crate gate 532 passed (`/tmp/claude/t7-fix-i-test.log`) | security + quality re-review of `56b72913..eea46de2`; workspace gate and cell on `eea46de2` |
+| I | security | PASS | no findings; both Minors closed; `bound_jobs` O(N log N) single pass, clone of the uncut id noted (not a finding); `next_cursor` bytes unit matches G16; nothing echoes the Issues cursor | none |
+| I | quality | PASS | no findings; every I1-I11 fix is the small one; `bound_jobs` clone acceptable (`retain` holds `&mut`); README line 397 at 79 columns cosmetic; Issues `next_cursor` is write-only until paging lands (pre-existing) | none |
+| 15 | live smoke | run 10 | 55 ok, 1 noted, 0 failed on `eea46de2` (`/tmp/claude/t7-live-smoke14`): the note is T7-17's `P` on an issue the engine gave no PoC (toast recorded; the cell's three-state), everything else live as in run 9 | workspace gate on `eea46de2`, then un-draft |
 
 ## Shipped
 
