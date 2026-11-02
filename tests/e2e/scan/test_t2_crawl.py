@@ -110,7 +110,6 @@ def main() -> None:
                 check(st.get("state") == "done", f"scan.map job ended done (state={st.get('state')!r})")
                 crawl = st.get("crawl") or {}
                 ok(f"crawl counters: pages={crawl.get('pages')} forms_submitted={crawl.get('forms_submitted')}")
-                check((crawl.get("forms_submitted") or 0) >= 1, "at least one form was submitted")
 
                 section("site map covers every linked path")
                 nodes, _points = sitemap(op, "operator", job)
@@ -137,6 +136,17 @@ def main() -> None:
                 check(bool(form_posts & {"/comments", "/login", "/upload"}),
                       f"target log shows a form POST ({sorted(form_posts)})")
                 ok(f"{len(reqs)} crawler requests logged by the target")
+
+                section("crawl.forms_submitted (umbrella amendment 53: the engine's report_forms_submitted hook)")
+                # The target log above proved the lane submitted forms; the lane reports
+                # the count through `JobCtx::report_forms_submitted` (umbrella amendment 53,
+                # engine hook in T1b's follow-up PR 2, lane call in T2's follow-up), so this
+                # is a hard check: a zero counter beside real POSTs is a defect.
+                forms = int(crawl.get("forms_submitted") or 0)
+                n_form_posts = sum(1 for e in reqs if e.get("method") == "POST")
+                check(1 <= forms <= max(n_form_posts, 1),
+                      f"crawl.forms_submitted = {forms} is at least one and no more than the "
+                      f"{n_form_posts} POST(s) the target logged (paths {sorted(form_posts)})")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

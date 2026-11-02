@@ -155,6 +155,20 @@ impl ProxyClient for LateHandles {
             None => not_running_yet(),
         }
     }
+
+    /// Forward the probe path too (spec amendment 80): the trait default would
+    /// route it to `send_opts` and quietly charge a probe's 5xx answers to the
+    /// host's error budget again.
+    fn send_probe(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        match self.client.get() {
+            Some(client) => client.send_probe(req, opts),
+            None => not_running_yet(),
+        }
+    }
 }
 
 impl ScopeRateGuard for LateHandles {
@@ -288,6 +302,7 @@ mod tests {
                     trailers: aitm_core::HeaderMap::new(),
                     body: aitm_core::Body::Empty,
                     timestamp: std::time::SystemTime::now(),
+                    peer: None,
                 })
             })
         }

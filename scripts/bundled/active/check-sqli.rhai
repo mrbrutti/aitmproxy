@@ -1,78 +1,69 @@
-// check-sqli.rhai — operator/agent command
-// `check.sqli { url, param, value? }`: confirm SQL injection in a query
-// parameter by (1) error-based detection and (2) a boolean differential
-// (TRUE condition ≈ baseline, FALSE condition diverges). OWASP A03 Injection.
+// check-sqli.rhai — catalogue check `sqli`, class `sqli`, error technique.
 //
-// ACTIVE: a few scope-/rate-gated GETs through the proxy client, invoked only.
-// The payloads are detection conditions (1=1 / 1=2, a single quote); they read
-// nothing and change nothing in the database. For authorised testing only.
+// A single quote closes a string literal early. Where the point's value reaches
+// the database unparameterised, the engine answers with its own syntax error,
+// and that error text is the whole finding: the probe reads no row and changes
+// no row, it only makes the parser complain about an unbalanced quote.
+//
+// The shipped script's boolean-differential half is gone. Native `sqli-boolean`
+// owns that technique now, so one class has one source per technique and the
+// two dedupe into a single issue (spec D6).
+//
+// OWASP A03 Injection. CWE-89.
 const NAME = "check-sqli";
 const API  = "1";
 
-const SQL_ERR = "(?i)(SQL syntax.*MySQL|ORA-[0-9]{5}|PostgreSQL.*ERROR|SQLSTATE\\[|SQLiteException|Unclosed quotation mark|SqlException|psycopg2\\.|sqlalchemy\\.exc\\.|Warning.*mysqli?_|quoted string not properly terminated)";
+// Database error signatures, carried over verbatim from the shipped script.
+const SQL_ERR = "(?i)(SQL syntax.*MySQL|SQL syntax error|syntax error at or near|ORA-[0-9]{5}|PostgreSQL.*ERROR|SQLSTATE\\[|SQLiteException|Unclosed quotation mark|SqlException|psycopg2\\.|sqlalchemy\\.exc\\.|Warning.*mysqli?_|quoted string not properly terminated)";
 
-fn q(url, param, value) {
-    let sep = if url.contains("?") { "&" } else { "?" };
-    `${url}${sep}${url_encode(param)}=${url_encode(value)}`
-}
-fn body_of(url) {
-    let r = http.send(#{ method: "GET", url: url });
-    if r.status == () { return (); }
-    r
-}
-fn diff(a, b) { let d = a - b; if d < 0 { -d } else { d } }
+const META = #{
+    id: "sqli",
+    name: "SQL injection (error-based)",
+    class: "sqli",
+    lanes: ["http"],
+    kinds: ["query", "body_param", "json_value", "cookie"],
+    intensity: "medium",
+    cost: "light",
+    technique: "error",
+    severity: "critical",
+    confidence_max: "firm",
+    needs_baseline: false,
+    cwe: 89,
+    description: "Appends a single quote to the value and looks for a database error signature in the reply.",
+    remediation: "Use parameterised queries or prepared statements; never concatenate request values into SQL.",
+};
 
 fn load(reg) {
-    reg.add_command("check.sqli", "Confirm SQL injection in { url, param, value? } (error + boolean)", |args| {
-        if type_of(args.url) != "string" || type_of(args.param) != "string" {
-            return "usage: check.sqli { url, param, value? }";
-        }
-        let base = if type_of(args.value) == "string" { args.value } else { "1" };
-        let p = args.param;
+    reg.add_check(META, |point| {
+        // Start from the value the application already accepts here, so the
+        // quote lands in the context the query actually parses.
+        let base = if type_of(point.example) == "string" { point.example } else { "1" };
+        let payload = base + "'";
 
-        // 1) Error-based: a lone quote that breaks a string context.
-        let err = body_of(q(args.url, p, base + "'"));
-        if err != () && regex_match(SQL_ERR, err.body) {
-            finding(#{
-                name: "SQL injection (error-based)",
-                severity: "critical",
-                flow_id: err.flow_id,
-                detail: `Injecting a single quote into \"${p}\" on ${args.url} produced a database error. The parameter is injectable.`,
-                tags: ["sqli", "injection", "active", "owasp-a03"],
-            });
-            return "VULNERABLE: error-based SQLi confirmed";
+        let reply = probe.send(payload);
+        if regex_match(SQL_ERR, reply.body) {
+            return #{
+                outcome: "vulnerable",
+                confidence: "firm",
+                evidence: #{ payload: payload, matched: "database error signature" },
+                detail: `A single quote in "${point.name}" provoked a database error, so the value reaches the query unparameterised.`,
+                // The PoC re-sends the quote and must see the same error; the
+                // control re-sends the untouched value and must not.
+                poc_hint: #{
+                    matchers: [ #{ type: "regex", regex: SQL_ERR, part: "body" } ],
+                    control: #{
+                        payload: base,
+                        matchers: [ #{ not: #{ type: "regex", regex: SQL_ERR, part: "body" } } ],
+                    },
+                },
+            };
         }
 
-        // 2) Boolean differential: TRUE should match the baseline, FALSE diverge.
-        let baseline = body_of(q(args.url, p, base));
-        if baseline == () { return "no response from baseline request"; }
-        let blen = baseline.body.len();
-
-        // Try a numeric and a string-break context.
-        let pairs = [
-            [` AND 1=1`, ` AND 1=2`],
-            [`' AND '1'='1`, `' AND '1'='2`],
-            [`" AND "1"="1`, `" AND "1"="2`],
-        ];
-        for pair in pairs {
-            let t = body_of(q(args.url, p, base + pair[0]));
-            let f = body_of(q(args.url, p, base + pair[1]));
-            if t == () || f == () { continue; }
-            let tlen = t.body.len();
-            let flen = f.body.len();
-            let thresh = if blen / 20 > 40 { blen / 20 } else { 40 };
-            // TRUE tracks the baseline, FALSE departs from both.
-            if diff(tlen, blen) <= thresh && diff(flen, tlen) > thresh {
-                finding(#{
-                    name: "SQL injection (boolean-based blind)",
-                    severity: "critical",
-                    flow_id: t.flow_id,
-                    detail: `\"${p}\" on ${args.url} shows a boolean differential: a TRUE condition matches the baseline (${blen}≈${tlen} bytes) while a FALSE condition diverges (${flen} bytes). The parameter is injectable.`,
-                    tags: ["sqli", "injection", "active", "owasp-a03"],
-                });
-                return "VULNERABLE: boolean-based SQLi confirmed";
-            }
+        #{
+            outcome: "clean",
+            confidence: "firm",
+            evidence: #{ payload: payload, matched: () },
+            detail: "A quote in this value produced no database error signature.",
         }
-        "no SQL injection confirmed"
     });
 }

@@ -130,7 +130,7 @@ pub fn manifest() -> &'static [PlantedVuln] {
                     "cmdi-ping-host",
                     "cmdi",
                     "/ping",
-                    "GET /ping?host=127.0.0.1;id — ; | && ` $( introduce a command: id appends the marker, sleep n sleeps min(n,5) s; patched: host must match ^[A-Za-z0-9.-]{1,253}$ else 400",
+                    "GET /ping?host=127.0.0.1;id — ; | && ` $( introduce a command: id appends the marker, echo w appends w, sleep n sleeps min(n,5) s; patched: host must match ^[A-Za-z0-9.-]{1,253}$ else 400",
                     seed::CMDI_MARKER,
                 ),
                 planted(
@@ -644,6 +644,13 @@ mod tests {
                 .contains("never sleeps"),
             "{}",
             by_id("sqli-boolean-items-id").trigger_hint
+        );
+        assert!(
+            by_id("cmdi-ping-host")
+                .trigger_hint
+                .contains("echo w appends w"),
+            "{}",
+            by_id("cmdi-ping-host").trigger_hint
         );
         assert!(
             manifest().iter().all(|v| v.id != "sqli-time-items"),

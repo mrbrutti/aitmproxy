@@ -287,7 +287,10 @@ impl fmt::Debug for PointRunner {
 
 impl PointRunner {
     /// A runner for one `(point, field)` of one job. The point's PRNG seed is
-    /// derived from the job marker and the point id, so the run replays. Seed 0
+    /// derived from the job id and the point id, so the run replays — never
+    /// from the engine's `JobCtx::marker`, which mints a fresh token on every
+    /// call and so would seed the run differently each time (T5 live proof,
+    /// 4b). Seed 0
     /// is built here, once, so a seed that does not craft is refused at
     /// `probe_host_for` rather than at send time (review finding M8).
     ///
@@ -300,7 +303,7 @@ impl PointRunner {
         plan: TargetPlan,
         field: FieldPath,
     ) -> Result<Self, PlanError> {
-        let rng_seed = derive_seed(&job.marker(), &point.id);
+        let rng_seed = derive_seed(job.job_id(), &point.id);
         let seed0 = plan.seed_spec(0)?;
         Ok(Self {
             shared,
@@ -396,6 +399,16 @@ impl PointRunner {
     /// Send the unmutated seed and compare its class with the baseline's: the
     /// target is alive exactly while it reacts as it did before any case.
     ///
+    /// The correlation pins `dst_port`, as [`PointRunner::replay`] does and
+    /// whatever field this runner fuzzes: the probe sends seed 0, whose
+    /// transport header is intact, so the strict pin is always possible — and
+    /// it is the correct one. Only a *mutated* case may need the looser rule
+    /// its field dictates (`send_recv_spec`). Passing `self.field` here would
+    /// drop the pin on every point that does not preserve the transport
+    /// (`udp.length`, `ipv4.proto`, the fragmentation fields), and on a shared
+    /// interface an unrelated frame from another port of the same host could
+    /// then be read as a passing probe (review finding SEC4).
+    ///
     /// # Errors
     /// As [`PointRunner::send_spec`]; the probe is charged but is never a case.
     pub async fn liveness_probe(&self) -> Result<bool, HostError> {
@@ -407,14 +420,25 @@ impl PointRunner {
                 vec!["liveness".to_string()],
                 0,
                 Counted::Probe,
-                self.field,
+                FieldPath::Raw,
             )
             .await?;
-        let passed = match (*lock(&self.baseline), delivered.sent.record.class()) {
+        let baseline = *lock(&self.baseline);
+        let class = delivered.sent.record.class();
+        let passed = match (baseline, class) {
             (Some(baseline), Some(class)) => liveness_passes(baseline, class),
             // No baseline yet, or a case that never went out: not a pass.
             _ => false,
         };
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %self.job.job_id(),
+            point = %self.point.id,
+            baseline = %class_label(baseline),
+            class = %class_label(class),
+            passed,
+            "liveness probe"
+        );
         self.shared.state.record_liveness(self.job.job_id(), passed);
         Ok(passed)
     }
@@ -551,6 +575,18 @@ impl PointRunner {
     /// counters, as call C1b requires of every stop this runner raises.
     fn stop(&self, reason: StopReason) {
         let job_id = self.job.job_id();
+        // The lane's one `info!` line (its triage trail is all `debug` under
+        // the same target): a stop reason names a cap, a deadline, a budget, a
+        // wire or craft failure or an unavailable backend, never a payload
+        // byte, and it is the only trace a core operator has by default of why
+        // a packet job sent fewer cases than its profile asked for (the engine
+        // records a check's error verdict nowhere else; T5 live proof, 4b).
+        tracing::info!(
+            target: "aitm::scanner::l4_packet",
+            job = %job_id,
+            point = %self.point.id,
+            "packet lane stopped this point's run: {reason:?}"
+        );
         self.shared.state.mark_stopped(job_id, reason);
         self.report(job_id);
     }
@@ -798,6 +834,15 @@ impl PointRunner {
 
         // The baseline is the yardstick every case and every liveness probe is
         // read against. It is charged, but it is not a case.
+        //
+        // Its correlation pins `dst_port`, as the probes read against it do and
+        // whatever field this point fuzzes: the baseline sends seed 0, whose
+        // transport header is intact, so the strict pin is always possible and
+        // correct. Only a mutated case may need the looser rule its field
+        // dictates. With `self.field` a point that does not preserve the
+        // transport would take its yardstick from a loose correlation, and an
+        // unrelated frame from another port of the same host could become the
+        // baseline class (review finding SEC4).
         let seed = self.seed0.clone();
         match self
             .deliver(
@@ -806,7 +851,7 @@ impl PointRunner {
                 vec!["baseline".to_string()],
                 0,
                 Counted::Probe,
-                self.field,
+                FieldPath::Raw,
             )
             .await
         {
@@ -917,6 +962,20 @@ impl PointRunner {
                 };
             }
 
+            if class.is_candidate() {
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %job_id,
+                    point = %self.point.id,
+                    index,
+                    class = %class.label(),
+                    liveness_before,
+                    icmp_paced = self.is_icmp_paced(),
+                    stopped = stop.is_some(),
+                    "candidate case"
+                );
+            }
+
             // An ICMP-baseline point never spends a liveness probe on a
             // candidate class and never becomes a crash: the kernel's reaction
             // proves classification, never a crash (spec D8.4, amendment 46).
@@ -957,6 +1016,16 @@ impl PointRunner {
                         // finding F1). `checks::CrashCheck` surfaces the
                         // unconfirmed candidate as inconclusive.
                         if let Some(reason) = triage.stop {
+                            tracing::debug!(
+                                target: "aitm::scanner::l4_packet",
+                                job = %job_id,
+                                point = %self.point.id,
+                                index,
+                                attempts = triage.attempts,
+                                reproduced = triage.reproduced,
+                                stop = ?reason,
+                                "crash decision: none, the triage was cut short"
+                            );
                             record.candidate = Candidate::Interrupted {
                                 stop: reason.clone(),
                             };
@@ -967,6 +1036,18 @@ impl PointRunner {
                         let crashed = !triage.recovered
                             || (triage.attempts == reproduce_count
                                 && triage.reproduced == triage.attempts);
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            index,
+                            crashed,
+                            recovered = triage.recovered,
+                            attempts = triage.attempts,
+                            reproduced = triage.reproduced,
+                            reproduce_count,
+                            "crash decision"
+                        );
                         record.candidate = if crashed {
                             Candidate::Confirmed {
                                 reproduced: triage.reproduced,
@@ -1008,6 +1089,18 @@ impl PointRunner {
 
             run.cases.push(record);
             if let Some(reason) = stop {
+                // The consecutive-timeout ladder marks the job stopped inside
+                // `record_case`, never through `PointRunner::stop`, so this
+                // line is the only trace such a stop leaves (T5 live proof, 4b).
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %job_id,
+                    point = %self.point.id,
+                    index,
+                    sent_cases,
+                    stop = ?reason,
+                    "the case's own stop ended this point's run"
+                );
                 run.stopped = Some(reason);
                 break;
             }
@@ -1016,7 +1109,19 @@ impl PointRunner {
             // whatever the oracle said (spec D8.4).
             if liveness_every > 0 && sent_cases.is_multiple_of(liveness_every) {
                 match self.liveness_probe().await {
-                    Ok(passed) => alive = passed,
+                    Ok(passed) => {
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            index,
+                            sent_cases,
+                            liveness_every,
+                            passed,
+                            "scheduled liveness probe"
+                        );
+                        alive = passed;
+                    }
                     Err(HostError::Stopped(reason)) => {
                         run.stopped = Some(reason);
                         break;
@@ -1028,6 +1133,35 @@ impl PointRunner {
                 }
             }
         }
+
+        // The class histogram and the mean reply wait, so a rig log says what
+        // the cases were answered with and how fast (labels and counts only).
+        let mut classes: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut elapsed_total: u64 = 0;
+        for case in &run.cases {
+            let label = case
+                .class()
+                .map_or_else(|| "unsent".to_string(), |class| class.label());
+            *classes.entry(label).or_insert(0) += 1;
+            elapsed_total = elapsed_total.saturating_add(u64::from(case.elapsed_ms()));
+        }
+        let mean_elapsed_ms = elapsed_total
+            .checked_div(run.cases.len() as u64)
+            .unwrap_or(0);
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %job_id,
+            point = %self.point.id,
+            sent_cases,
+            allocated,
+            cases = run.cases.len(),
+            classes = ?classes,
+            mean_elapsed_ms,
+            stopped = run.stopped.is_some(),
+            crash = run.crash.is_some(),
+            "point run finished"
+        );
 
         run
     }
@@ -1052,11 +1186,32 @@ impl PointRunner {
             Err(HostError::Craft(message)) => return Err(self.stop_on_craft(SEED0, &message)),
         };
         if first && !always {
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                always,
+                first,
+                retried = false,
+                "liveness pair: the first probe passed, so no retry"
+            );
             return Ok((true, true));
         }
         tokio::time::sleep(self.shared.timing.liveness_retry).await;
         match self.liveness_probe().await {
-            Ok(second) => Ok((first, second)),
+            Ok(second) => {
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %self.job.job_id(),
+                    point = %self.point.id,
+                    always,
+                    first,
+                    second,
+                    retried = true,
+                    "liveness pair"
+                );
+                Ok((first, second))
+            }
             Err(HostError::Stopped(reason)) => Err(reason),
             Err(HostError::Craft(message)) => Err(self.stop_on_craft(SEED0, &message)),
         }
@@ -1082,7 +1237,7 @@ impl PointRunner {
         // The candidate left the target silent, so the first replay always
         // waits for it.
         let mut alive = false;
-        for _ in 0..reproduce_count {
+        for round in 1..=reproduce_count {
             // A replay is a case (call C10), so the job's ceiling bounds it
             // exactly as it bounds the fuzz loop: with no room left there is
             // no reproduction to be had, and the triage stops before it even
@@ -1093,9 +1248,20 @@ impl PointRunner {
                 let cap = self.shared.state.cases_cap(job_id).unwrap_or(0);
                 let reason = StopReason::CaseCap(cap);
                 self.stop(reason.clone());
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %job_id,
+                    point = %self.point.id,
+                    round,
+                    attempts = triage.attempts,
+                    reproduced = triage.reproduced,
+                    "triage decision: stop, the case ceiling left no room for this replay"
+                );
                 triage.stop = Some(reason);
                 return triage;
             }
+            let waited_for_recovery = !alive;
+            let wait_started = Instant::now();
             if !alive {
                 match self.await_recovery().await {
                     // The replay below sets `alive` from its own probes.
@@ -1105,9 +1271,29 @@ impl PointRunner {
                     // evidence there is; stop replaying into it.
                     Ok(false) => {
                         triage.recovered = false;
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            round,
+                            attempts = triage.attempts,
+                            reproduced = triage.reproduced,
+                            waited_ms = elapsed_ms(wait_started),
+                            "triage decision: recovered=false, the outage is persistent"
+                        );
                         return triage;
                     }
                     Err(HostError::Stopped(reason)) => {
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            round,
+                            attempts = triage.attempts,
+                            reproduced = triage.reproduced,
+                            stop = ?reason,
+                            "triage decision: stop, the job stopped while waiting for recovery"
+                        );
                         triage.stop = Some(reason);
                         return triage;
                     }
@@ -1130,6 +1316,10 @@ impl PointRunner {
                     .min(deadline.saturating_duration_since(now));
                 tokio::time::sleep(spacing).await;
             }
+            // Named for what it measures: the recovery wait when
+            // `waited_for_recovery`, the `replay_spacing` sleep otherwise
+            // (quality panel Minor).
+            let paused_ms = elapsed_ms(wait_started);
             triage.recovered = true;
             let delivered = match self
                 .deliver(
@@ -1144,6 +1334,16 @@ impl PointRunner {
             {
                 Ok(delivered) => delivered,
                 Err(HostError::Stopped(reason)) => {
+                    tracing::debug!(
+                        target: "aitm::scanner::l4_packet",
+                        job = %self.job.job_id(),
+                        point = %self.point.id,
+                        round,
+                        attempts = triage.attempts,
+                        reproduced = triage.reproduced,
+                        stop = ?reason,
+                        "triage decision: stop, the replay never went out"
+                    );
                     triage.stop = Some(reason);
                     return triage;
                 }
@@ -1159,17 +1359,36 @@ impl PointRunner {
             // counted (above, as a stop) but is not a reproduction attempt
             // (round-1 leftover).
             triage.attempts += 1;
-            let candidate = delivered
-                .sent
-                .record
-                .class()
-                .is_some_and(|class| class.is_candidate());
+            let class = delivered.sent.record.class();
+            let candidate = class.is_some_and(|class| class.is_candidate());
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                round,
+                attempt = triage.attempts,
+                waited_for_recovery,
+                paused_ms,
+                class = %class_label(class),
+                candidate,
+                "triage replay sent"
+            );
             // A pair a stop cut short never finished, so it is read as the
             // stop it is and no reproduction is counted off it (review
             // finding P1).
             let (first, second) = match self.probe_pair(true).await {
                 Ok(pair) => pair,
                 Err(reason) => {
+                    tracing::debug!(
+                        target: "aitm::scanner::l4_packet",
+                        job = %self.job.job_id(),
+                        point = %self.point.id,
+                        round,
+                        attempts = triage.attempts,
+                        reproduced = triage.reproduced,
+                        stop = ?reason,
+                        "triage decision: stop, the probe pair after the replay was cut short"
+                    );
                     triage.stop = Some(reason);
                     return triage;
                 }
@@ -1178,11 +1397,47 @@ impl PointRunner {
             if candidate && !first && !second {
                 triage.reproduced += 1;
             }
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                round,
+                first,
+                second,
+                candidate,
+                attempts = triage.attempts,
+                reproduced = triage.reproduced,
+                "triage replay judged"
+            );
             if let Some(reason) = delivered.stop {
+                // The replay's own case tripped the ladder (a reproducing
+                // replay is silent, and a probe is not a case, so nothing
+                // resets it). The triage is cut short and is never a crash
+                // however many replays reproduced (tester finding F1).
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %self.job.job_id(),
+                    point = %self.point.id,
+                    round,
+                    attempts = triage.attempts,
+                    reproduced = triage.reproduced,
+                    stop = ?reason,
+                    "triage decision: stop, the replay's own case ended the job's sending"
+                );
                 triage.stop = Some(reason);
                 return triage;
             }
         }
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %self.job.job_id(),
+            point = %self.point.id,
+            attempts = triage.attempts,
+            reproduced = triage.reproduced,
+            recovered = triage.recovered,
+            reproduce_count,
+            "triage finished"
+        );
         triage
     }
 
@@ -1199,24 +1454,56 @@ impl PointRunner {
     /// when this wait is what ran it past its deadline.
     async fn await_recovery(&self) -> Result<bool, HostError> {
         let timing = self.shared.timing;
+        let started = Instant::now();
         for attempt in 0..timing.recovery_polls {
             if Instant::now() >= self.job.deadline() {
                 self.stop(StopReason::Deadline);
                 return Err(HostError::Stopped(StopReason::Deadline));
             }
-            if self.liveness_probe().await? {
+            let passed = self.liveness_probe().await?;
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                attempt = attempt + 1,
+                polls = timing.recovery_polls,
+                passed,
+                elapsed_ms = elapsed_ms(started),
+                "recovery poll"
+            );
+            if passed {
                 return Ok(true);
             }
             if attempt + 1 < timing.recovery_polls {
                 tokio::time::sleep(timing.recovery_poll).await;
             }
         }
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %self.job.job_id(),
+            point = %self.point.id,
+            polls = timing.recovery_polls,
+            elapsed_ms = elapsed_ms(started),
+            "recovery bound ran out: the target answered none of its polls"
+        );
         Ok(false)
     }
 }
 
 /// What [`craft_stop`] calls the lane's one cached seed.
 const SEED0: &str = "seed 0";
+
+/// A class's label for a debug line, or `none` for a stimulus that never went
+/// out. The lane's tracing names a class, a count or a verdict — never a byte
+/// of the stimulus or of the reply (T5 live proof, 4b).
+fn class_label(class: Option<CaseClass>) -> String {
+    class.map_or_else(|| "none".to_string(), |class| class.label())
+}
+
+/// Milliseconds since `since`, saturated, for a debug line's `*_ms` field.
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// The stop a craft failure raises: `what` no longer builds, so the stimulus
 /// never reached the wire and the run cannot be read as a clean one (review
@@ -1380,8 +1667,23 @@ impl ProbeHost for PacketHost {
         Box::pin(async { Err(anyhow::anyhow!("the packet lane hosts no raw HTTP probes")) })
     }
 
+    /// **This is not a marker.** It returns the engine's stable, unique **job
+    /// id**, because that is the key `Lane::probe_host_for` registered this
+    /// point's runner under in the [`RunnerRegistry`] and `resolve_run` has
+    /// only this `&dyn ProbeHost` to find it by. [`JobCtx::marker`] itself is a
+    /// reflection canary that mints a fresh token on every call (its trait doc
+    /// and `aitm_plugin_scanner::worker`), so keying by it would have a check
+    /// look the runner up under a different token than it was registered under
+    /// and read `missing_runner`: zero cases, nothing on the wire (T5 live
+    /// proof, 4b). A check that wants a canary from an L4 host therefore gets a
+    /// job id instead; the lane's own two checks never ask for one.
+    ///
+    /// T1b follow-up 57: `JobCtx::marker` documented as fresh-per-call plus a
+    /// stable `job_id()` key; once the lane keys on `job_id()` directly this
+    /// method's registry role goes away and it can return the engine's marker
+    /// again (quality panel Minor).
     fn marker(&self) -> String {
-        self.runner.job.marker()
+        self.runner.job.job_id().to_string()
     }
 
     fn budget_left(&self) -> u32 {
@@ -1407,9 +1709,12 @@ impl ProbeHost for PacketHost {
     }
 }
 
-/// The runners of every point the lane is driving, keyed by `(job marker,
-/// point id)` so a check finds the one run of a point without downcasting the
-/// `&dyn ProbeHost` it was handed (plan call C2).
+/// The runners of every point the lane is driving, keyed by `(job id, point
+/// id)` so a check finds the one run of a point without downcasting the
+/// `&dyn ProbeHost` it was handed (plan call C2). The job id is the engine's
+/// stable, unique [`JobCtx::job_id`], never its per-call [`JobCtx::marker`]
+/// canary — keying by the marker made every real-bus job send nothing
+/// (T5 live proof, 4b).
 #[derive(Default)]
 pub struct RunnerRegistry {
     runners: Mutex<HashMap<(String, String), Arc<PointRunner>>>,
@@ -1430,8 +1735,10 @@ impl RunnerRegistry {
         Self::default()
     }
 
-    /// Remember `runner` as the one runner for this marker and point, and
-    /// hand back the runner this point now has.
+    /// Remember `runner` as the one runner for this job and point, and hand
+    /// back the runner this point now has. `job_id` is the engine's stable
+    /// [`JobCtx::job_id`], never its per-call [`JobCtx::marker`] canary
+    /// (T5 live proof, 4b).
     ///
     /// Idempotent: a point already registered keeps its runner and `runner` is
     /// dropped, so two hosts for one point share one `PointRunner` and
@@ -1439,28 +1746,28 @@ impl RunnerRegistry {
     /// the same point against the same job (review finding Q3).
     pub fn register(
         &self,
-        marker: &str,
+        job_id: &str,
         point_id: &str,
         runner: Arc<PointRunner>,
     ) -> Arc<PointRunner> {
         Arc::clone(
             lock(&self.runners)
-                .entry((marker.to_string(), point_id.to_string()))
+                .entry((job_id.to_string(), point_id.to_string()))
                 .or_insert(runner),
         )
     }
 
-    /// The runner for this marker and point, if one was registered.
+    /// The runner for this job and point, if one was registered.
     #[must_use]
-    pub fn get(&self, marker: &str, point_id: &str) -> Option<Arc<PointRunner>> {
+    pub fn get(&self, job_id: &str, point_id: &str) -> Option<Arc<PointRunner>> {
         lock(&self.runners)
-            .get(&(marker.to_string(), point_id.to_string()))
+            .get(&(job_id.to_string(), point_id.to_string()))
             .map(Arc::clone)
     }
 
-    /// Drop every runner of one job, once its marker is done with.
-    pub fn forget_marker(&self, marker: &str) {
-        lock(&self.runners).retain(|(known, _), _| known != marker);
+    /// Drop every runner of one job, once its job id is done with.
+    pub fn forget_job(&self, job_id: &str) {
+        lock(&self.runners).retain(|(known, _), _| known != job_id);
     }
 
     /// How many runners are registered.
@@ -1478,10 +1785,13 @@ impl RunnerRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::net::IpAddr;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
-    use aitm_proto_l4::craft::PacketSpec;
+    use aitm_proto_l4::backend::{CaptureInjectBackend, CaptureSource, L4Error};
+    use aitm_proto_l4::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
     use aitm_proto_l4::flow::L4Packet;
     use aitm_proto_l4::icmp::transport_payload;
     use aitm_proto_l4::types::L4Direction;
@@ -1493,10 +1803,11 @@ mod tests {
     };
     use crate::codec::hex_encode;
     use crate::discover::max_payload_for;
-    use crate::fields::FieldPath;
+    use crate::fields::{FieldPath, UdpField};
     use crate::oracle::CaseClass;
-    use crate::plan::{SeedOrigin, SeedPayload};
+    use crate::plan::{send_recv_spec, SeedOrigin, SeedPayload};
     use crate::state::{Candidate, CaseNote, StopReason};
+    use crate::sync::lock;
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
         fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply,
@@ -1960,7 +2271,10 @@ mod tests {
             .to_string()
             .contains("no raw HTTP probes"));
         assert!(host.held_flows().is_empty());
-        assert_eq!(host.marker(), "aitm7f3a");
+        // The host's `marker()` is the registry key: the stable job id, never
+        // the engine's per-call marker canary (T5 live proof, 4b).
+        assert_eq!(host.marker(), "scan-1a2b3c4d");
+        assert_eq!(host.marker(), job.job_id());
 
         let baseline = host.baseline().await.expect("the seed is sent once");
         assert!(baseline.l4.is_none(), "a clean reply carries no L4Reply");
@@ -2141,7 +2455,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn registry_keys_by_marker_and_point() {
+    async fn registry_keys_by_job_id_and_point() {
         let mock = MockBackend::new(MockReply::Echo);
         let profile = l4_profile(vec![udp_target(9)], 5);
         let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
@@ -2150,18 +2464,77 @@ mod tests {
         assert!(registry.is_empty());
 
         registry.register(
-            &job.marker(),
+            job.job_id(),
             runner.point().id.as_str(),
             Arc::clone(&runner),
         );
 
         assert_eq!(registry.len(), 1);
         let found = registry
-            .get(&job.marker(), runner.point().id.as_str())
+            .get(job.job_id(), runner.point().id.as_str())
             .expect("the registered runner");
         assert!(Arc::ptr_eq(&found, &runner));
         assert!(registry.get("other", runner.point().id.as_str()).is_none());
-        registry.forget_marker(&job.marker());
+        registry.forget_job(job.job_id());
+        assert!(registry.is_empty());
+    }
+
+    /// Tester (stage 5), T5 live proof 4b: the registry key is a **pair**, so
+    /// two jobs auditing the same target hold their own runner for the same
+    /// point id, and forgetting one job leaves the other's untouched. The
+    /// point id is derived from the target alone (`l4:<ip>:<port>/<proto>/
+    /// <field>`), so two concurrent jobs against one host collide on it by
+    /// construction — this is the case a job-id-only or point-id-only key
+    /// would get wrong, in opposite ways.
+    ///
+    /// Mutation: key the map by the point id alone and the second
+    /// `register` hands back the first job's runner (`Arc::ptr_eq` fails);
+    /// make `forget_job` clear the whole map and the surviving-job assertions
+    /// fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_jobs_sharing_a_point_id_keep_their_own_runners() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 5);
+        let (shared, job_a, plans, disc) =
+            setup(Arc::clone(&mock), profile.clone(), &fields(&["raw"]), 1000);
+        let job_b = crate::testing::TestJob::new(profile).with_job_id("scan-b0b0b0b0");
+        assert_ne!(job_a.job_id(), job_b.job_id(), "two distinct jobs");
+
+        let runner_a = runner_for(&shared, &job_a, &plans, &disc.points, "raw");
+        let runner_b = runner_for(&shared, &job_b, &plans, &disc.points, "raw");
+        let point_id = runner_a.point().id.clone();
+        assert_eq!(point_id, runner_b.point().id, "the same point id");
+        assert!(
+            !Arc::ptr_eq(&runner_a, &runner_b),
+            "two runners, one per job"
+        );
+
+        let registry = RunnerRegistry::new();
+        let got_a = registry.register(job_a.job_id(), &point_id, Arc::clone(&runner_a));
+        let got_b = registry.register(job_b.job_id(), &point_id, Arc::clone(&runner_b));
+        assert!(Arc::ptr_eq(&got_a, &runner_a), "job A keeps its own runner");
+        assert!(
+            Arc::ptr_eq(&got_b, &runner_b),
+            "job B is not handed job A's runner"
+        );
+        assert_eq!(registry.len(), 2, "one entry per (job, point) pair");
+
+        // Forgetting a job the registry never saw changes nothing.
+        registry.forget_job("scan-never-ran");
+        assert_eq!(registry.len(), 2);
+
+        registry.forget_job(job_a.job_id());
+        assert!(
+            registry.get(job_a.job_id(), &point_id).is_none(),
+            "job A's runner is gone"
+        );
+        let survivor = registry
+            .get(job_b.job_id(), &point_id)
+            .expect("job B's runner survives its neighbour's end");
+        assert!(Arc::ptr_eq(&survivor, &runner_b));
+        assert_eq!(registry.len(), 1);
+
+        registry.forget_job(job_b.job_id());
         assert!(registry.is_empty());
     }
 
@@ -2611,7 +2984,7 @@ mod tests {
         let first = runner_for(&shared, &job, &plans, &disc.points, "raw");
         let registry = RunnerRegistry::new();
         let registered =
-            registry.register(&job.marker(), first.point().id.as_str(), Arc::clone(&first));
+            registry.register(job.job_id(), first.point().id.as_str(), Arc::clone(&first));
         assert!(Arc::ptr_eq(&registered, &first));
 
         let in_flight = {
@@ -2632,7 +3005,7 @@ mod tests {
         let second = runner_for(&shared, &job, &plans, &disc.points, "raw");
         assert!(!Arc::ptr_eq(&second, &first));
         let second_id = second.point().id.clone();
-        let shared_runner = registry.register(&job.marker(), &second_id, second);
+        let shared_runner = registry.register(job.job_id(), &second_id, second);
         assert!(
             Arc::ptr_eq(&shared_runner, &first),
             "the in-flight runner stays the point's one runner"
@@ -2814,7 +3187,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "invalid_profile: cannot craft the seed packet: crafted packet exceeds 65535 bytes"
+            "cannot craft the seed packet: crafted packet exceeds 65535 bytes"
         );
 
         assert!(
@@ -3459,5 +3832,149 @@ mod tests {
                 "{expected:?}: six cases cost milliseconds unpaced; the run took {elapsed:?}"
             );
         }
+    }
+
+    /// The stray same-host frame a shared interface carries: a UDP frame from
+    /// the target host but one port off the target's, addressed back at the
+    /// stimulus's source port. Pinned to the five-tuple it is not this
+    /// stimulus's reply and the oracle reads it as `ProtocolError`; correlated
+    /// on the host alone it is taken for the target's own answer (`Clean`).
+    fn stray_port_frame(stimulus: &[u8]) -> Option<Vec<u8>> {
+        let packet = as_packet(stimulus);
+        let ends = transport_payload(&packet)?;
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (ends.dst, ends.src) else {
+            return None;
+        };
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src),
+                    dst: Some(dst),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(ends.dst_port.wrapping_add(1)),
+                    dst_port: Some(ends.src_port),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"stray".to_vec()),
+            ],
+        }
+        .build()
+        .ok()
+    }
+
+    /// A host that answers every stimulus with a [`stray_port_frame`] and never
+    /// echoes the stimulus back, so the stray frame is the only thing a send
+    /// can read.
+    #[derive(Debug, Default)]
+    struct StrayPortHost {
+        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    #[derive(Debug)]
+    struct StrayPortCapture {
+        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl CaptureSource for StrayPortCapture {
+        fn next_frame(&mut self) -> Result<Option<Vec<u8>>, L4Error> {
+            if let Some(frame) = lock(&self.queue).pop_front() {
+                return Ok(Some(frame));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(None)
+        }
+    }
+
+    impl CaptureInjectBackend for StrayPortHost {
+        fn open_capture(
+            &self,
+            _iface: &str,
+            _filter: Option<&str>,
+            _read_timeout: Duration,
+        ) -> Result<Box<dyn CaptureSource>, L4Error> {
+            Ok(Box::new(StrayPortCapture {
+                queue: Arc::clone(&self.queue),
+            }))
+        }
+
+        fn inject(&self, _iface: &str, bytes: &[u8]) -> Result<(), L4Error> {
+            if let Some(frame) = stray_port_frame(bytes) {
+                lock(&self.queue).push_back(frame);
+            }
+            Ok(())
+        }
+    }
+
+    /// A runner on one field of `127.0.0.1:9`, talking to a [`StrayPortHost`].
+    /// One lane context per point, so one point's stop ladder never reaches
+    /// another's; discovery runs against a silent mock, since discovery is not
+    /// what this test drives.
+    fn stray_point(field: &str) -> Arc<PointRunner> {
+        let (shared, job, plans, disc) = setup(
+            MockBackend::new(MockReply::Silence),
+            l4_profile(vec![udp_target(9)], 2),
+            &fields(&[field]),
+            1000,
+        );
+        let shared = Arc::new(Shared {
+            backend: Arc::new(StrayPortHost::default()),
+            ..(*shared).clone()
+        });
+        runner_for(&shared, &job, &plans, &disc.points, field)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn baseline_and_liveness_probes_correlate_on_the_pinned_tuple_whatever_the_field() {
+        let length_point = stray_point("udp.length");
+
+        // The rule a *mutated* case follows: a case that garbles `udp.length`
+        // cannot present the port `send_recv`'s C3 check compares, so its reply
+        // is correlated on the host alone. The seed a baseline and a liveness
+        // probe send is unmutated, so the pin is always possible for it — and
+        // the looser rule must not leak onto it from the point's field.
+        let target = &length_point.plan.target;
+        let seed = length_point.seed0.spec.clone();
+        let window = Duration::from_millis(50);
+        assert_eq!(
+            send_recv_spec(target, seed.clone(), FieldPath::Raw, window).dst_port,
+            Some(9),
+            "an intact transport header pins the target's port"
+        );
+        assert_eq!(
+            send_recv_spec(target, seed, FieldPath::Udp(UdpField::Length), window).dst_port,
+            None,
+            "a garbled length cannot present a port to pin"
+        );
+
+        // The baseline: a frame from another port of the target host is not the
+        // seed's reply, on a `udp.length` point exactly as on a `raw` one.
+        // Which class a *rejected* frame earns is `send_recv`'s correlator to
+        // say and is pinned by its own tests; what this point fuzzes must not
+        // change it, and it is never `Clean` — `Clean` is the stray frame
+        // mistaken for the target's own answer.
+        let length_run = length_point.run_point().await;
+        let raw_point = stray_point("raw");
+        let raw_run = raw_point.run_point().await;
+        assert_ne!(
+            raw_run.baseline,
+            Some(CaseClass::Clean),
+            "the pinned correlation rejects the stray frame"
+        );
+        assert_eq!(
+            length_run.baseline, raw_run.baseline,
+            "the baseline is correlated the same way whatever this point fuzzes"
+        );
+
+        // Every liveness probe, too. Read against the baseline a pinned send
+        // measures, a probe correlating loosely reads the stray frame as
+        // `Clean` and so calls the target changed.
+        let probe_point = stray_point("udp.length");
+        *lock(&probe_point.baseline) = raw_run.baseline;
+        assert!(
+            probe_point.liveness_probe().await.expect("the probe sends"),
+            "the probe reads the stray frame as the baseline did"
+        );
     }
 }

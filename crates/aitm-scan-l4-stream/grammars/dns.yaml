@@ -1,0 +1,65 @@
+# The DNS message (RFC 1035 section 4), as this lane speaks it over UDP.
+#
+# A message is a twelve-byte header followed by `qdcount` questions. A question
+# is a domain name -- a run of length-prefixed labels closed by a zero byte --
+# and the type and class being asked for. Everything after the questions (the
+# answer, authority and additional sections of a reply) stays in `rest`, which
+# the lane carries but does not take apart.
+#
+# hickory-proto is the judge of what is a DNS message at all: a datagram it
+# refuses never becomes a seed, and it builds every message the lane generates.
+# This grammar exists alongside it because hickory reports no byte offsets, and
+# the lane mutates bytes at a named path -- above all
+# `questions[0].name.labels[0].len`, the label length that has to agree with the
+# label following it.
+grammar: dns
+transport: udp
+default_ports: [53]
+reply: >
+  A reply is one datagram, read in a single receive: there is no length prefix
+  and no continuation, so the first read is the whole answer. Its first two
+  bytes repeat the query's id, which is how an answer is matched to its
+  question, and the low nibble of byte three carries the RCODE. NOERROR and
+  NXDOMAIN are both healthy answers -- a name that does not exist is a real
+  answer from a working server. FORMERR, SERVFAIL, NOTIMP and REFUSED are the
+  server rejecting the message it was sent. A datagram hickory cannot parse at
+  all says nothing about the server and is classified unknown.
+message:
+  - name: header
+    type: group
+    fields:
+      # The id matches a reply to its query, so no mutator may move it.
+      - { name: id, type: u16 be, mutable: false }
+      # QR, OPCODE, AA, TC, RD, RA, Z, RCODE. 0x0100 is a plain recursive query.
+      - { name: flags, type: u16 be, value: 256 }
+      - { name: qdcount, type: u16 be, count: { of: questions } }
+      - { name: ancount, type: u16 be, value: 0 }
+      - { name: nscount, type: u16 be, value: 0 }
+      - { name: arcount, type: u16 be, value: 0 }
+  # How many questions follow is `qdcount` in the header above, which carries
+  # `count: { of: questions }`; this repeat names that field in turn. The two
+  # name each other, and the validator refuses a grammar where they disagree
+  # or where the count field is not declared before the repeat it bounds.
+  - name: questions
+    type: repeat
+    count_from: qdcount
+    fields:
+      - name: name
+        type: group
+        fields:
+          # Labels run until the zero byte that ends the name; that zero byte
+          # is `root`, the next field, and not part of the repeat.
+          - name: labels
+            type: repeat
+            until: terminator
+            terminator: "0x00"
+            fields:
+              - { name: len, type: u8, len: { of: [text] } }
+              - { name: text, type: bytes }
+          - { name: root, type: u8, value: 0 }
+      # 1 is A, the only type the lane asks for unprompted.
+      - { name: qtype, type: u16 be, value: 1 }
+      # 1 is IN, the internet class.
+      - { name: qclass, type: u16 be, value: 1 }
+  # Answer, authority and additional sections, kept whole.
+  - { name: rest, type: bytes }

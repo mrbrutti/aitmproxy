@@ -732,6 +732,7 @@ impl Plugin for MapLocal {
                 trailers: HeaderMap::new(),
                 body: Body::Bytes(self.body.clone()),
                 timestamp: std::time::SystemTime::now(),
+                peer: None,
             });
         }
         Verdict::Continue

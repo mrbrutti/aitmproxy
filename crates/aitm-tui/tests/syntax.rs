@@ -1,6 +1,6 @@
 //! Task 7 (TUI, UI-ext plan): the Rhai and PoC-YAML tokenizers colour the two
 //! languages an operator edits by the foundation `syntax.*` tokens, and stay
-//! tolerant of partial/odd input — a bad line still renders and later lines
+//! tolerant of partial/odd input: a bad line still renders and later lines
 //! keep their colour (plan Review Focus: "malformed / partial source while
 //! typing"). Driven by the shared grammar in `docs/design/languages/`.
 

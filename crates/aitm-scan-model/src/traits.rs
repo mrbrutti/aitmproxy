@@ -100,8 +100,13 @@ pub trait ProbeHost: Send + Sync {
     /// [`ProbeHost::probe`].
     fn probe_raw(&self, req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>>;
 
-    /// The job's collision-resistant marker token, for a check that needs a
+    /// A fresh collision-resistant marker token, for a check that needs a
     /// value it can recognise again (a reflection canary, a callback label).
+    ///
+    /// **Every call mints a new token.** It is never a key: two calls on one
+    /// host return two different strings, so per-job state keyed on it misses
+    /// every lookup (amendment 57). A lane that needs the stable per-job key
+    /// uses [`JobCtx::job_id`] on the context it was handed.
     fn marker(&self) -> String;
 
     /// Probes still affordable for this point. Zero means send nothing more.
@@ -185,7 +190,9 @@ pub trait ProbeHost: Send + Sync {
 /// browser, the in-memory session material and the job's budget, deadline and
 /// cancellation state. The engine implements it; a lane only reads it.
 pub trait JobCtx: Send + Sync {
-    /// The job's identifier, as it appears in results and push lines.
+    /// The job's identifier, as it appears in results and push lines. Stable
+    /// for the life of the job: this is the key for any per-job state a lane
+    /// holds (amendment 57; [`JobCtx::marker`] is not).
     fn job_id(&self) -> &str;
 
     /// The profile the job is running under.
@@ -229,7 +236,12 @@ pub trait JobCtx: Send + Sync {
     /// Whether the job was cancelled. A lane polls this inside every loop.
     fn cancelled(&self) -> bool;
 
-    /// The job's collision-resistant marker token (see [`ProbeHost::marker`]).
+    /// A fresh collision-resistant marker token (see [`ProbeHost::marker`]).
+    ///
+    /// **Every call mints a new token.** It is never a key: use it as a canary
+    /// value, not to index per-job state — two calls return two different
+    /// strings. The stable per-job key is [`JobCtx::job_id`], which returns
+    /// the same value for the life of the job (amendment 57).
     fn marker(&self) -> String;
 
     /// Report the L4 lane's running counters — cases sent, crashes, failed
@@ -267,11 +279,14 @@ pub trait JobCtx: Send + Sync {
         let _ = cookie_names;
     }
 
-    /// A crawl of one origin failed outright (the browser crawl timed out or
-    /// was refused). The engine counts it in `crawl.errors` so the status says
-    /// the job ran on fewer points than it could have; the lane then falls back
-    /// to whatever discovery it still has. The runtime scrubs `reason` before
-    /// it is logged; lanes need not.
+    /// One failed crawl request (client crawl, `reason` = a
+    /// [`CrawlErrorKind`](crate::CrawlErrorKind) token) or one crawl that failed
+    /// outright (browser crawl, `reason` = free
+    /// text). The engine counts each in `crawl.errors` so the status says the
+    /// job ran on fewer points than it could have; when the crawl made requests
+    /// and every one failed it also names why on `crawl.last_error`. The lane
+    /// then falls back to whatever discovery it still has. The runtime scrubs a
+    /// free-text `reason` before it is logged; lanes need not.
     ///
     /// A no-op by default.
     fn report_crawl_error(&self, origin: &str, reason: &str) {
@@ -286,6 +301,17 @@ pub trait JobCtx: Send + Sync {
     ///
     /// A no-op by default.
     fn report_forms_skipped(&self, count: u64) {
+        let _ = count;
+    }
+
+    /// The crawl submitted `count` forms it found — sent them, with inert
+    /// generated values, as the map's way of reaching routes (see
+    /// `CrawlCounters::forms_submitted`). The engine adds them to
+    /// `crawl.forms_submitted`, so beside `forms_skipped` a frontend can say
+    /// how much of the form surface the map actually walked (amendment 53).
+    ///
+    /// A no-op by default.
+    fn report_forms_submitted(&self, count: u64) {
         let _ = count;
     }
 }

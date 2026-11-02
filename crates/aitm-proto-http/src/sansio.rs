@@ -912,6 +912,7 @@ fn parse_response(head: &[u8]) -> Result<HttpResponse> {
         trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: std::time::SystemTime::now(),
+        peer: None,
     })
 }
 
@@ -1310,6 +1311,7 @@ mod tests {
             body: Body::Empty,
             version: HttpVersion::Http11,
             timestamp: std::time::SystemTime::now(),
+            peer: None,
         });
         m.short_circuit_done();
 
@@ -1631,6 +1633,7 @@ mod tests {
             body: Body::Streamed(StreamBody),
             version: HttpVersion::Http11,
             timestamp: std::time::SystemTime::now(),
+            peer: None,
         }
     }
 

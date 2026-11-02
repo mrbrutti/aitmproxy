@@ -68,6 +68,7 @@ fn seeded_flow() -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(b"{\"ok\":true}".to_vec()),
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: addr,

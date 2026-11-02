@@ -96,6 +96,7 @@ impl aitm_core::RequestSender for EchoSender {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: SystemTime::now(),
+                peer: None,
             })
         })
     }
@@ -115,6 +116,7 @@ impl ProxyClient for EchoClient {
                     trailers: HeaderMap::new(),
                     body: Body::Empty,
                     timestamp: SystemTime::now(),
+                    peer: None,
                 }),
                 client_conn: conn(),
                 server_conn: None,

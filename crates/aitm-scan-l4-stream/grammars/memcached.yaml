@@ -1,0 +1,106 @@
+# memcached's text protocol, the request half.
+#
+# A request is one command line: a verb, then a space and the rest of the line
+# (`get mykey\r\n`), or nothing at all (`version\r\n`). The storage commands
+# are the exception -- they put a byte count on the command line and the data
+# on the line after it:
+#
+#     set mykey 0 0 2\r\nhi\r\n
+#
+# so `bytes` and the block it measures are the one length relation this
+# protocol has, and the one worth disagreeing with.
+#
+# This file holds two documents. The first is the command line above, which is
+# what the lane generates. The second, after the `---` line, is the storage
+# form. `Memcached::parse` tries the command form first and falls back to the
+# storage one, so each form keeps the key field its own syntax needs: a key
+# that runs to the end of the line, or one that stops at the space before the
+# flags.
+grammar: memcached
+transport: tcp
+default_ports: [11211]
+reply: >
+  Every reply is a CRLF-terminated line. `VERSION <v>`, `STORED`,
+  `NOT_STORED`, `EXISTS`, `NOT_FOUND`, `DELETED`, `TOUCHED`, `OK` and a bare
+  number (what `incr` and `decr` return) are all well-formed answers, and so
+  is `END`. A retrieval answers with one `VALUE <key> <flags> <bytes>` line
+  and its data block per hit, and closes the whole response with `END\r\n`:
+  that terminator, not the first CRLF, is where a retrieval's reply ends.
+  `ERROR` means the verb was not understood, `CLIENT_ERROR` that the request
+  was malformed, `SERVER_ERROR` that the server failed to carry it out --
+  all three are the server rejecting what it was sent.
+message:
+  - name: line
+    type: group
+    fields:
+      - name: cmd
+        type: token
+        one_of:
+          [
+            get,
+            gets,
+            set,
+            add,
+            replace,
+            append,
+            prepend,
+            cas,
+            incr,
+            decr,
+            delete,
+            touch,
+            gat,
+            gats,
+            stats,
+            version,
+            verbosity,
+          ]
+      # `version\r\n` and `stats\r\n` take no argument; everything else takes
+      # at least a key. The key field holds the rest of the line, CRLF
+      # included, so a command with further arguments (`touch mykey 0`) is one
+      # mutable field rather than an unparsed message.
+      - name: tail
+        type: choice
+        fields:
+          - name: with_args
+            type: group
+            fields:
+              - { name: sp, type: delim, value: " " }
+              - { name: key, type: line, terminator: "\r\n" }
+          - { name: crlf, type: delim, value: "\r\n" }
+---
+# The storage form: a command line that declares a byte count, then the data.
+#
+# `cas`'s unique id and the optional `noreply` suffix are not modelled: a seed
+# carrying either does not parse under this grammar and is skipped rather than
+# guessed at.
+grammar: memcached
+transport: tcp
+default_ports: [11211]
+reply: >
+  `STORED`, or `NOT_STORED`, `EXISTS` and `NOT_FOUND` when the command's
+  precondition did not hold; `CLIENT_ERROR bad data chunk` when the data block
+  does not match the byte count the command line declared, which is what a
+  mutated `bytes` field is asking about.
+message:
+  - name: line
+    type: group
+    fields:
+      - name: cmd
+        type: token
+        one_of: [set, add, replace, append, prepend, cas]
+      - { name: sp, type: delim, value: " " }
+      - { name: key, type: line, terminator: " " }
+  - name: storage
+    type: group
+    fields:
+      - { name: flags, type: decimal }
+      - { name: sp1, type: delim, value: " " }
+      - { name: exptime, type: decimal }
+      - { name: sp2, type: delim, value: " " }
+      # How many bytes of data follow. The server reads exactly this many and
+      # expects a CRLF after them.
+      - { name: bytes, type: decimal, len: { of: [data] } }
+      - { name: crlf, type: delim, value: "\r\n" }
+      - { name: data, type: bytes }
+      - { name: crlf2, type: delim, value: "\r\n" }

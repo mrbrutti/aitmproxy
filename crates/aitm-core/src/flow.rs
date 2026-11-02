@@ -186,6 +186,11 @@ pub struct HttpResponse {
     pub trailers: HeaderMap,
     pub body: Body,
     pub timestamp: SystemTime,
+    /// The upstream socket this response was read from, when the sender that
+    /// produced it knows (the TCP peer under TLS). `None` for a response the
+    /// proxy captured — its connection is `HttpFlow::server_conn` — and for a
+    /// sender that cannot tell.
+    pub peer: Option<SocketAddr>,
 }
 
 /// HTTP protocol version.
