@@ -350,18 +350,18 @@ mod tests {
     /// The env of a page built with the catalogue (19 groups, M-W2-1).
     const CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_BUNDLED_SCRIPTS", BUNDLED)];
 
-    /// The env of a page built without it (18 groups, plan C30).
+    /// The env of a page built without it (19 groups, plan C30).
     const NO_CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_NO_BUNDLED_SCRIPTS", "1")];
 
     /// The version the top page is built with: injected, so the literal is
     /// stable.
     const VERSION: &str = "0.5.11";
 
-    /// The 18 built-in groups (catalogue off; `check` is native since the
-    /// scanner v2 engine, main #232).
-    const BUILT_IN_GROUPS: [&str; 18] = [
-        "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "map", "poc",
-        "proxy", "request", "scan", "scope", "script", "session", "tls", "ws",
+    /// The 19 built-in groups (catalogue off; `check` is native since the
+    /// scanner v2 engine, main #232; `l4` since p1b #267).
+    const BUILT_IN_GROUPS: [&str; 19] = [
+        "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "l4", "map",
+        "poc", "proxy", "request", "scan", "scope", "script", "session", "tls", "ws",
     ];
 
     /// M-W2-1, byte for byte.
@@ -604,7 +604,7 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
     }
 
     #[test]
-    fn top_level_without_the_catalogue_has_eighteen_groups() {
+    fn top_level_without_the_catalogue_has_nineteen_groups() {
         let described = registry_with("top-bare", NO_CATALOGUE_ENV);
         let page = top_level(&described.registry, VERSION);
         let out = render(&piped_utf8(), &page);
@@ -616,15 +616,17 @@ an SSH tunnel, or set AITM_WEB_INSECURE_BIND=1 to bind anyway.
             .collect();
         assert_eq!(names, BUILT_IN_GROUPS);
         let rendered = block_lines(&out, "Groups:");
-        assert_eq!(rendered.len(), 18, "{out}");
+        assert_eq!(rendered.len(), 19, "{out}");
         // `check` is native since the scanner v2 engine (main #232): the
         // catalogue being off no longer takes the group off the page.
         assert!(
             rendered.iter().any(|line| line.starts_with("  check ")),
             "{out}"
         );
+        // `l4` is built in since p1b (main #267): `l4.privilege` registers on
+        // every core, so the row is there with the catalogue off too.
         assert!(
-            !rendered.iter().any(|line| line.starts_with("  l4 ")),
+            rendered.iter().any(|line| line.starts_with("  l4 ")),
             "{out}"
         );
         assert_eq!(

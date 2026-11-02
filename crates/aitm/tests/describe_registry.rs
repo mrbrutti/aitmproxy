@@ -27,10 +27,11 @@ mod support;
 /// The shipped catalogue, reached through the injected env (plan rule 13).
 const BUNDLED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/bundled");
 
-/// The 18 built-in groups (catalogue off, `l4.enabled` off; `check` is
-/// native since the scanner v2 engine, main #232).
-const BUILT_IN_GROUPS: [&str; 18] = [
-    "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "map", "poc",
+/// The 19 built-in groups (catalogue off, `l4.enabled` off; `check` is
+/// native since the scanner v2 engine, main #232; `l4` since p1b #267 registers
+/// `l4.privilege` on every core).
+const BUILT_IN_GROUPS: [&str; 19] = [
+    "agent", "browser", "ca", "capture", "check", "config", "findings", "flow", "l4", "map", "poc",
     "proxy", "request", "scan", "scope", "script", "session", "tls", "ws",
 ];
 
@@ -185,7 +186,14 @@ fn describe_with_the_bundled_catalogue_lists_check_and_l4_scripts() {
     assert!(check.iter().all(|v| v.starts_with("check.")));
     assert_eq!(
         verbs_of(&described.registry, "l4"),
-        ["l4.recon", "l4.tcp_probe", "l4.udp_probe"]
+        // the three bundled scripts, then p1b's two natives (registration order)
+        [
+            "l4.recon",
+            "l4.tcp_probe",
+            "l4.udp_probe",
+            "l4.privilege",
+            "l4.privilege.request"
+        ]
     );
     assert!(
         !settings.core.ca.dir.exists(),
@@ -309,11 +317,12 @@ fn describe_matches_the_live_registry_with_the_catalogue_and_l4_enabled() {
         "with the catalogue and l4.enabled describe::registry drifted from the live assembly"
     );
     // Plan Task 10 counted 113 before main's scanner track registered the
-    // fifteen `scan.*` job verbs and 26 native `check.*` (2026-11-02).
-    assert_eq!(ours.len(), 154, "plan Task 10's command count");
+    // fifteen `scan.*` job verbs and 26 native `check.*`, and p1b the two
+    // `l4.privilege.*` (2026-11-02).
+    assert_eq!(ours.len(), 156, "plan Task 10's command count");
     assert_eq!(group_names(&described.registry), CATALOGUE_GROUPS);
     let l4 = verbs_of(&described.registry, "l4");
-    assert_eq!(l4.len(), 25, "{l4:?}");
+    assert_eq!(l4.len(), 27, "{l4:?}");
     assert_eq!(&l4[..3], ["l4.recon", "l4.tcp_probe", "l4.udp_probe"]);
     assert!(l4.iter().all(|v| v.starts_with("l4.")), "{l4:?}");
     let mut distinct = l4.clone();

@@ -24,13 +24,14 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::commands::scope::OperatorConfirmed;
 use crate::config::L4Config;
 use crate::craft::{PacketEndpoints, PacketSpec};
+use crate::helper::proto::ScopeSet;
 use crate::types::{
     IpCidr, L4Action, L4Capability, L4Proto, L4ScopeEntry, L4ScopeId, L4ScopeSource,
 };
@@ -296,6 +297,10 @@ pub struct L4Guard {
     /// bus's plaintext `{"token": …}` line among it — and is never recorded by a
     /// capture, whatever the scope says (L4PAR-AC34, spec §2.1). Empty until set.
     self_ports: RwLock<BTreeSet<u16>>,
+    /// Counts every mutation of the state a [`ScopeSet`] carries (scope entries
+    /// and self ports), so the helper backend (privilege plan P1b.13) can resend
+    /// the set before the next capture or inject whenever it changed.
+    scope_generation: AtomicU64,
 }
 
 impl L4Guard {
@@ -316,7 +321,33 @@ impl L4Guard {
             agent_gates: crate::gates::L4AgentGates::from_config(cfg),
             in_flight: Arc::new(AtomicU32::new(0)),
             self_ports: RwLock::new(BTreeSet::new()),
+            scope_generation: AtomicU64::new(0),
         }
+    }
+
+    /// How many times the scope entries or the self ports changed since this
+    /// guard was built (privilege plan P1b.13). A reader that remembers the value
+    /// it last acted on knows whether [`scope_set`](Self::scope_set) is stale.
+    #[must_use]
+    pub fn scope_generation(&self) -> u64 {
+        self.scope_generation.load(Ordering::SeqCst)
+    }
+
+    /// The guard state the core hands the privileged helper (spec §5.2): the
+    /// scope entries verbatim, the three limits and the self-exclusion ports.
+    #[must_use]
+    pub fn scope_set(&self) -> ScopeSet {
+        ScopeSet {
+            scope: self.list_scope(),
+            global_inject_pps: self.global_inject_pps,
+            max_packet_bytes: self.max_packet_bytes,
+            max_packets_per_call: self.max_packets_per_call,
+            self_ports: self.self_ports(),
+        }
+    }
+
+    fn bump_scope_generation(&self) {
+        self.scope_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Replace the set of the core's own listener ports (see `self_ports` on the
@@ -329,6 +360,7 @@ impl L4Guard {
             .self_ports
             .write()
             .unwrap_or_else(PoisonError::into_inner) = set;
+        self.bump_scope_generation();
     }
 
     /// Union `ports` into the core's own listener ports (port `0` ignored). The
@@ -340,6 +372,7 @@ impl L4Guard {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .extend(ports.into_iter().filter(|p| *p != 0));
+        self.bump_scope_generation();
     }
 
     /// The core's own listener ports, ascending.
@@ -590,6 +623,7 @@ impl L4Guard {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(entry);
+        self.bump_scope_generation();
         id
     }
 
@@ -605,6 +639,7 @@ impl L4Guard {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
+            self.bump_scope_generation();
         }
         removed
     }
@@ -1836,5 +1871,79 @@ mod tests {
             &literal,
             &target("*", L4Direction::Outbound, "10.1.2.3", 80)
         ));
+    }
+
+    /// Privilege plan P1b.13: `scope_generation` counts every mutation of the
+    /// state a helper's `ScopeSet` carries, so `HelperBackend` can resend the
+    /// set before the next capture or inject whenever it changed. A fresh guard
+    /// starts at 0; a no-op remove is not a mutation.
+    #[test]
+    fn scope_generation_bumps_on_each_mutation() {
+        let mut c = cfg();
+        c.allow_agent_widen = true;
+        let g = L4Guard::new(&c);
+        assert_eq!(g.scope_generation(), 0);
+
+        let id = g
+            .add_runtime_scope(entry(
+                ("127.0.0.1", 32),
+                "lo",
+                L4Direction::Inbound,
+                L4Capability::Capture,
+                (10, 10),
+            ))
+            .unwrap();
+        assert_eq!(g.scope_generation(), 1, "add_runtime_scope bumps");
+
+        g.set_self_ports([28182, 27431]);
+        assert_eq!(g.scope_generation(), 2, "set_self_ports bumps");
+
+        g.add_self_ports([9]);
+        assert_eq!(g.scope_generation(), 3, "add_self_ports bumps");
+
+        assert!(g.remove_scope(id));
+        assert_eq!(g.scope_generation(), 4, "remove_scope bumps");
+
+        assert!(!g.remove_scope(id), "second remove is a no-op");
+        assert_eq!(g.scope_generation(), 4, "a no-op remove is not a mutation");
+    }
+
+    /// Privilege plan P1b.13: `scope_set` is the guard state the core hands the
+    /// helper (spec §5.2): the entries verbatim, the three limits and the
+    /// self-exclusion ports, and it round-trips through `ScopeSet::to_config`.
+    #[test]
+    fn scope_set_mirrors_the_guard_state() {
+        let mut c = cfg();
+        c.allow_agent_widen = true;
+        c.global_inject_pps = 7;
+        c.max_packet_bytes = 1400;
+        c.max_packets_per_call = 3;
+        let g = L4Guard::new(&c);
+        g.set_self_ports([28182, 27431]);
+        let id = g
+            .add_runtime_scope(entry(
+                ("127.0.0.1", 32),
+                "lo",
+                L4Direction::Inbound,
+                L4Capability::Capture,
+                (10, 10),
+            ))
+            .unwrap();
+
+        let set = g.scope_set();
+        assert_eq!(set.scope, g.list_scope());
+        assert_eq!(set.scope.len(), c.scope.len() + 1);
+        let added = set.scope.iter().find(|e| e.id == id).expect("added entry");
+        assert_eq!(added.source, L4ScopeSource::Runtime);
+        assert_eq!(set.global_inject_pps, 7);
+        assert_eq!(set.max_packet_bytes, 1400);
+        assert_eq!(set.max_packets_per_call, 3);
+        assert_eq!(set.self_ports, vec![27431, 28182]);
+
+        let again = set.to_config();
+        assert_eq!(again.scope, set.scope);
+        assert_eq!(again.global_inject_pps, 7);
+        assert_eq!(again.max_packet_bytes, 1400);
+        assert_eq!(again.max_packets_per_call, 3);
     }
 }

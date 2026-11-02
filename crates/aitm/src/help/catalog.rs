@@ -438,6 +438,9 @@ pub const EXAMPLES: &[(&str, &[&str])] = &[
     ("l4.interfaces", &[
         "aitm l4 interfaces",
     ]),
+    // p1b (#267): the privilege verbs register on every core, no parameters.
+    ("l4.privilege", &["aitm l4 privilege"]),
+    ("l4.privilege.request", &["aitm l4 privilege request"]),
     ("l4.recon", &[
         "aitm l4 recon",
     ]),

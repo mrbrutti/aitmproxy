@@ -265,7 +265,7 @@ mod tests {
     /// The env of a page built with the catalogue (19 groups, M-W2-1).
     const CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_BUNDLED_SCRIPTS", BUNDLED)];
 
-    /// The env of a page built without it (18 groups, plan C30).
+    /// The env of a page built without it (19 groups, plan C30).
     const NO_CATALOGUE_ENV: &[(&str, &str)] = &[("AITM_NO_BUNDLED_SCRIPTS", "1")];
 
     /// The version the top page is built with: injected, so the literal is
@@ -582,7 +582,7 @@ mod tests {
         let config = TempConfig::new("bad", "listen: [\n");
         let (answer, warned) = ask_with(Some(&config.path), &explicit(&[]), NO_CATALOGUE_ENV);
         let text = page(&answer);
-        // The default command set: the 18 built-in groups, the top page as
+        // The default command set: the 19 built-in groups, the top page as
         // usual.
         assert!(text.starts_with("aitm 0.5.11 — "), "{text}");
         assert!(text.contains("\n  scope "), "{text}");
@@ -793,8 +793,8 @@ mod tests {
             "{text}"
         );
         let verbs = verb_rows(text);
-        // One row per `l4` command of the same registry (3 scripts, then the
-        // module's natives); the absolute count is pinned once, in
+        // One row per `l4` command of the same registry (3 scripts, the two
+        // privilege natives, then the module's natives); the absolute count is pinned once, in
         // `tests/describe_registry.rs`.
         let (reporter, _) = reporter();
         let settings = settings_for_help(Some(&config.path), &reporter);
@@ -827,7 +827,9 @@ mod tests {
         assert!(!text.as_bytes().contains(&0x1b));
         let (answer, _) = ask("l4-bare", &implicit("l4"), CATALOGUE_ENV);
         let bare = verb_rows(page(&answer));
-        assert_eq!(bare.len(), 3, "{bare:?}");
+        // Without `l4.enabled`: the three bundled scripts plus p1b's two
+        // `l4.privilege.*` natives, which every core registers.
+        assert_eq!(bare.len(), 5, "{bare:?}");
         // The config is read, not written: the file is byte-identical after.
         assert_eq!(
             std::fs::read_to_string(&config.path).expect("still there"),

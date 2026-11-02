@@ -4,8 +4,8 @@
 //! **Source of truth: `wire::assemble_with_scripts`.** [`registry`] constructs
 //! the same plugins in the same order, over inert handles — a `LateHandles`
 //! that is never bound, a `StdGuard::default()` for the map guard, a
-//! `SystemProxy` fixed to `Mechanism::None`, `L4Privilege::available()` so no
-//! probe runs, a `CaPlugin` whose audit log opens nothing until a write — and
+//! `SystemProxy` fixed to `Mechanism::None`, a `PrivilegeState` nothing reports
+//! on (so no probe runs), a `CaPlugin` whose audit log opens nothing until a write — and
 //! registers them into a bare `aitm_core::Registry`: no `Proxy`, no
 //! `CertAuthority`, nothing bound, nothing written (plan rule 12). The Rhai
 //! tier is composed as `main.rs`'s `run()` composes it (plan C29: config
@@ -48,10 +48,10 @@ use aitm_plugins::{
     MutatePlugin, RateLimitPlugin, ReplayPlugin, ScopePlugin, SubscriptionPlugin,
 };
 use aitm_poc::step_registry::PocStepRegistry;
-use aitm_proto_l4::backend::pcap::PcapBackend;
 use aitm_proto_l4::flow::InMemoryL4FlowStore;
 use aitm_proto_l4::guard::L4Guard;
-use aitm_proto_l4::{L4Language, L4Module, L4Privilege};
+use aitm_proto_l4::privilege::state::{PrivilegeConfig, ProcessLifetime};
+use aitm_proto_l4::{L4Language, L4Module, PrivilegePlugin, PrivilegeState};
 use aitm_sysproxy::plugin::SysProxyPlugin;
 use aitm_sysproxy::{Mechanism, SystemProxy};
 
@@ -131,10 +131,18 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
         guard: Arc::new(L4Guard::new(&l4)),
         store: Arc::new(InMemoryL4FlowStore::new()),
     });
+    // The one privilege state `run()` builds (p1b, privilege spec §2.1): the
+    // language's wire verbs, the `l4.*` module and the `l4.privilege` verbs all
+    // read it. Building it probes nothing; nothing here calls `report()`.
+    let privilege_state = Arc::new(PrivilegeState::new(&PrivilegeConfig {
+        enabled: l4.enabled,
+        l4: l4.privilege.clone(),
+        lifetime: ProcessLifetime::Serving,
+    }));
     let l4_language = l4_shared.as_ref().map(|shared| {
         L4Language::new(
             shared.guard.clone(),
-            Arc::new(PcapBackend::new()),
+            privilege_state.backend(),
             shared.store.clone(),
         )
     });
@@ -239,13 +247,16 @@ pub fn registry(inputs: &DescribeInputs) -> anyhow::Result<Described> {
             ))
             .with_script_checks(script_checks),
     ));
-    // Opt-in, as in `wire.rs`; the privilege is pre-answered so no probe runs.
+    // The privilege verbs register on every core (p1b #267), after the scanner
+    // as `wire.rs` orders them; the module itself stays opt-in, over the same
+    // state, and `log_l4_startup` (which reports, hence probes) is `run()`'s.
+    reg.add_plugin(Box::new(PrivilegePlugin::new(Arc::clone(&privilege_state))));
     if let Some(shared) = l4_shared {
-        reg.add_plugin(Box::new(L4Module::with_shared(
+        reg.add_plugin(Box::new(L4Module::with_shared_state(
             shared.guard,
             shared.store,
             l4.intercept.clone(),
-            L4Privilege::available(),
+            Arc::clone(&privilege_state),
         )));
     }
 

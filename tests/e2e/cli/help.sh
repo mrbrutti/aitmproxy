@@ -40,7 +40,7 @@
 #   - the `aitm-tui --help` pin needs `aitm-tui` beside AITM_BIN;
 #   - the Cargo.lock check needs `git` and one of its two base refs;
 #   - with no bundled catalogue discoverable beside AITM_BIN the top page
-#     lists 18 groups, not 19 (noted in section 1, asserted as 18).
+#     still lists 19 groups (`l4` is built in since p1b #267; the catalogue adds verbs, not a group).
 #
 # The recordings' stdin feeders write into anonymous pipes (never FIFOs: BSD
 # `script` refuses a FIFO stdin, dry-run D5) and are tracked by PID, so no
@@ -105,8 +105,8 @@ REC_ROWS=40; REC_COLS=120
 # The bundled catalogue the binary will find: crates/aitm/src/bundled.rs
 # `candidates`, in its order, over the binary's real path (symlinks
 # resolved, as `std::fs::canonicalize` does). Empty when none is a
-# directory. Decides whether the top page lists 19 groups or 18 (plan C30:
-# `l4` is the only catalogue-only group).
+# directory. Since p1b #267 the top page lists 19 groups either way (`l4` is
+# built in); the directory is reported for the record.
 catalogue_dir() {
   local real dir c
   real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$AITM_BIN")"
@@ -121,7 +121,7 @@ CATALOGUE_DIR="$(catalogue_dir || true)"
 echo "aitm under test:  $AITM_BIN"
 echo "expected version: $EXPECT_VERSION"
 [ -x "$TUI_BIN" ] && echo "aitm-tui:         $TUI_BIN" || echo "aitm-tui:         (absent; the 'aitm-tui --help' pin will be skipped)"
-[ -n "$CATALOGUE_DIR" ] && echo "catalogue:        $CATALOGUE_DIR (19 groups)" || echo "catalogue:        (none beside the binary; the top page lists 18 groups)"
+[ -n "$CATALOGUE_DIR" ] && echo "catalogue:        $CATALOGUE_DIR" || echo "catalogue:        (none beside the binary; the bundled check/l4 scripts are absent)"
 echo "platform:         $OS"
 echo "sections:         $SECTIONS"
 echo
@@ -485,16 +485,13 @@ section_top() {
   check "has the literal 'aitm scope add --host <host>'" grep -q -F 'aitm scope add --host <host>' "$out"
   local lines want_lines
   lines="$(block_lines "$out" "Groups:" | wc -l | tr -d ' ')"
-  if [ -n "$CATALOGUE_DIR" ]; then
-    want_lines=19
-  else
-    want_lines=18
-    note "no bundled catalogue beside $AITM_BIN: the top page lists 18 groups (l4 is catalogue-only; check is native)"
-  fi
+  # 19 with or without the catalogue since p1b #267 (`l4.privilege` registers on every core).
+  want_lines=19
+  [ -n "$CATALOGUE_DIR" ] || note "no bundled catalogue beside $AITM_BIN (the group list is unchanged: 19)"
   check "Groups: block is $want_lines lines (got $lines)" [ "$lines" = "$want_lines" ]
   HOME="$HOME_DIR" AITM_NO_BUNDLED_SCRIPTS=1 "$AITM_BIN" --help >"$ROOT/top-nocat.out" 2>"$ROOT/top-nocat.err" </dev/null
   local nocat; nocat="$(block_lines "$ROOT/top-nocat.out" "Groups:" | wc -l | tr -d ' ')"
-  check "AITM_NO_BUNDLED_SCRIPTS=1 aitm --help: Groups: block is exactly 18 lines (got $nocat)" [ "$nocat" = 18 ]
+  check "AITM_NO_BUNDLED_SCRIPTS=1 aitm --help: Groups: block is exactly 19 lines (got $nocat)" [ "$nocat" = 19 ]
   check "piped: zero ESC bytes (AC-W2-1)" [ "$(count_fx $'\x1b' "$out")" = 0 ]
   local created; created="$(created_since "$ROOT/marker-top")"
   check "help created nothing under a fresh HOME ($created entries)" [ "$created" = 0 ]
