@@ -1796,6 +1796,10 @@ pub(crate) mod test_support {
         discover_error: Option<String>,
         /// Panic inside `discover` instead of returning.
         discover_panic: bool,
+        /// Refuse to host a point without a source flow, as a lane crate whose
+        /// host is built from the captured flow does (`aitm-scan-http`:
+        /// "point ... has no source flow"); an origin item has none.
+        refuse_flowless: bool,
         validate_error: Option<String>,
         l4_reports: Vec<L4Counters>,
         discoveries: AtomicU64,
@@ -1829,6 +1833,7 @@ pub(crate) mod test_support {
                 checks: Vec::new(),
                 discover_error: None,
                 discover_panic: false,
+                refuse_flowless: false,
                 validate_error: None,
                 l4_reports: Vec::new(),
                 discoveries: AtomicU64::new(0),
@@ -1898,6 +1903,13 @@ pub(crate) mod test_support {
         /// A lane whose `discover` panics with [`PANIC_TEXT`].
         pub(crate) fn with_discover_panic(mut self) -> Self {
             self.discover_panic = true;
+            self
+        }
+
+        /// The lane refuses every flowless point (an origin item included), as
+        /// `aitm-scan-http`'s host does.
+        pub(crate) fn refusing_flowless_points(mut self) -> Self {
+            self.refuse_flowless = true;
             self
         }
 
@@ -1971,6 +1983,9 @@ pub(crate) mod test_support {
             point: &InsertionPoint,
             job: Arc<dyn JobCtx>,
         ) -> anyhow::Result<Box<dyn ProbeHost>> {
+            if self.refuse_flowless && point.flow.is_none() {
+                anyhow::bail!("scan: point {} has no source flow", point.id);
+            }
             let profile = job.profile().clone();
             Ok(Box::new(FakeHost {
                 point: point.clone(),

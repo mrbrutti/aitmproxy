@@ -1035,7 +1035,27 @@ impl RunCtx<'_> {
         // `probes.by_lane`).
         self.runtime.set_lane(lane.lane());
 
-        let host = match lane.probe_host_for(point, Arc::clone(self.job_ctx)) {
+        let hosted = match lane.probe_host_for(point, Arc::clone(self.job_ctx)) {
+            // Amendment 38: an origin item carries no captured flow, and a lane
+            // crate whose host is built from the captured flow refuses it
+            // (`aitm-scan-http`: "has no source flow"). The engine then hosts
+            // it itself, over the interim lane's synthesized `GET <origin>/`,
+            // so origin-scoped checks run whatever crate holds the http slot.
+            Err(lane_error)
+                if point.flow.is_none()
+                    && point.id.starts_with("origin:")
+                    && point.lane == aitm_scan_model::LaneKind::Http =>
+            {
+                self.engine
+                    .interim
+                    .probe_host_for(point, Arc::clone(self.job_ctx))
+                    .map_err(|engine_error| {
+                        anyhow::anyhow!("{lane_error}; engine origin host: {engine_error}")
+                    })
+            }
+            other => other,
+        };
+        let host = match hosted {
             Ok(host) => ArcHost(Arc::from(host)),
             Err(e) => {
                 self.note_lane_text(&e.to_string());
@@ -1818,6 +1838,54 @@ mod tests {
             check.points_seen(),
             vec!["origin:http://scan.test:80".to_string()],
             "the check ran once, against the origin item"
+        );
+    }
+
+    /// Amendment 38 on a lane crate whose host needs a captured flow
+    /// (`aitm-scan-http` refuses "a point with no source flow"): the origin
+    /// item is still run, hosted by the engine's own origin host (the interim
+    /// lane's synthesized `GET <origin>/`), so the origin-scoped checks do not
+    /// vanish from the product when a lane crate takes the http slot (found
+    /// live: `test_t3_h2_observe.py` produced no issue on T2's lane).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_origin_item_is_hosted_by_the_engine_when_the_lane_cannot() {
+        // Like a real origin-scoped check (the h2 observe kinds), the fake
+        // sends nothing through `probe()`: an origin host has no insertion
+        // point to inject into and refuses it.
+        let check = FakeCheck::with_scope(
+            "fake.origin",
+            "demo",
+            aitm_scan_model::CheckScope::Origin,
+            FakeRun::clean().with_probes(0),
+        );
+        let h = Harness::new().with_lane(
+            FakeLane::http()
+                .with_points(Vec::new())
+                .refusing_flowless_points()
+                .with_check(Arc::clone(&check) as Arc<dyn aitm_scan_model::Check>),
+        );
+        h.bind();
+
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            false,
+        )
+        .expect("the job starts");
+
+        let status = h.wait_terminal(&started.job).await;
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.checks.scheduled, 1);
+        assert_eq!(status.checks.done, 1);
+        assert_eq!(
+            check.points_seen(),
+            vec!["origin:http://scan.test:80".to_string()],
+            "the origin check ran on the engine's origin host"
+        );
+        assert_eq!(
+            status.checks.errors, 0,
+            "a hosted origin item is not a check error"
         );
     }
 
