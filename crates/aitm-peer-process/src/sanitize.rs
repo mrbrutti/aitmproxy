@@ -6,18 +6,21 @@
 /// not truncated: a 257-byte "name" is not a name.
 const MAX_LEN: usize = 256;
 
-/// Remove every Unicode Cc scalar (`char::is_control`) and every scalar in the
+/// Remove every Unicode Cc scalar (`char::is_control`), every scalar in the
 /// invisible-format (Cf) ranges U+00AD, U+061C, U+180E, U+200B–U+200F,
 /// U+202A–U+202E, U+2060–U+2064, U+2066–U+2069, U+FEFF, U+FFF9–U+FFFB, U+E0001,
-/// U+E0020–U+E007F; trim ASCII whitespace; `None` if nothing is left or the result
-/// exceeds 256 bytes.
+/// U+E0020–U+E007F, and every non-ASCII whitespace scalar (`char::is_whitespace`
+/// minus `is_ascii_whitespace`: NBSP, ideographic space, the Zs block, and the
+/// line / paragraph separators U+2028 / U+2029, which render blank or break a
+/// line; security finding S2, 2026-11-01); trim whitespace; `None` if nothing
+/// is left or the result exceeds 256 bytes.
 #[must_use]
 pub fn sanitize(raw: &str) -> Option<String> {
     let kept: String = raw
         .chars()
-        .filter(|&c| !c.is_control() && !is_invisible_format(c))
+        .filter(|&c| !c.is_control() && !is_invisible_format(c) && !is_non_ascii_whitespace(c))
         .collect();
-    let trimmed = kept.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = kept.trim_matches(char::is_whitespace);
     if trimmed.is_empty() || trimmed.len() > MAX_LEN {
         return None;
     }
@@ -41,6 +44,13 @@ fn is_invisible_format(c: char) -> bool {
             | '\u{E0001}'
             | '\u{E0020}'..='\u{E007F}'
     )
+}
+
+/// Whitespace that is not ASCII whitespace, plus the two separators the
+/// `White_Space` property already covers but which are named here because they
+/// are the line-injection cases: U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR.
+fn is_non_ascii_whitespace(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}') || (c.is_whitespace() && !c.is_ascii_whitespace())
 }
 
 #[cfg(test)]
@@ -110,13 +120,23 @@ mod tests {
         assert_eq!(sanitize(&raw), Some("a".repeat(256)));
     }
 
-    /// Only ASCII whitespace is trimmed (spec D5); a no-break space is content.
+    /// Security finding S2 (2026-11-01): non-ASCII whitespace is dropped like
+    /// a format scalar, so a no-break space at either edge is gone, not kept
+    /// as content (it used to pass through and render as a blank).
     #[test]
-    fn only_ascii_whitespace_is_trimmed() {
-        assert_eq!(
-            sanitize("\u{A0}node\u{A0}"),
-            Some("\u{A0}node\u{A0}".to_string())
-        );
+    fn non_ascii_whitespace_is_dropped() {
+        assert_eq!(sanitize("\u{A0}node\u{A0}"), Some("node".to_string()));
+        assert_eq!(sanitize("py\u{A0}thon"), Some("python".to_string()));
+    }
+
+    /// S2: an ideographic space alone renders blank, so it is `None`, and the
+    /// line / paragraph separators (U+2028 / U+2029) cannot inject a line.
+    #[test]
+    fn blank_rendering_whitespace_and_line_separators_are_none_or_stripped() {
+        assert_eq!(sanitize("\u{3000}"), None);
+        assert_eq!(sanitize("\u{2028}\u{2029}"), None);
+        assert_eq!(sanitize("a\u{2028}b"), Some("ab".to_string()));
+        assert_eq!(sanitize("a\u{2029}b"), Some("ab".to_string()));
     }
 
     #[test]

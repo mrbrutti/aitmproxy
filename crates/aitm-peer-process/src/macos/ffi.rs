@@ -9,9 +9,10 @@
 //! macOS SDK on this Mac (`$(xcrun --show-sdk-path)/usr/include/sys/proc_info.h`,
 //! measured in research 24 §3.1, corrected 2026-11-01: `soi_kind` / `soi_proto`
 //! sit at 232 / 240 *inside `socket_info`*, i.e. 256 / 264 inside
-//! `socket_fdinfo`); `tests::socket_fdinfo_layout_matches_the_sdk`
-//! pins every size and offset the code relies on (spec AC8), so a header change
-//! fails the build's tests rather than silently misreading a port.
+//! `socket_fdinfo`). `tests::socket_fdinfo_layout_matches_the_sdk` pins the
+//! mirrors to the offsets measured from the SDK on 2026-11-01 with a C
+//! `offsetof` probe (spec AC8): it catches a drift of the *Rust* mirrors, not a
+//! change in the header itself, which only re-running the probe would show.
 //!
 //! Every wrapper is **fail-closed**: a short read, an unexpected `soi_kind`, an
 //! unknown address family, `EPERM`, `ESRCH`, `EBADF`, `ENOTSOCK` or any other
@@ -400,8 +401,9 @@ pub(crate) fn pid_start_micros(pid: u32) -> Option<u64> {
 }
 
 /// The spec D4 scan: pids ascending, `skip_pid` skipped, the deadline checked
-/// before each pid, every socket fd of each pid decoded and matched against the
-/// tuples not yet found; the first (lowest) matching pid wins. `start` comes from
+/// before each pid and every [`FD_DEADLINE_STRIDE`] fds within one, every socket
+/// fd of each pid decoded and matched against the tuples not yet found; the
+/// first (lowest) matching pid wins. `start` comes from
 /// [`pid_start_micros`] for matched pids only, `0` if the kernel would not say.
 /// Any per-pid or per-fd failure is a skip. Tuples not found by `deadline` are
 /// absent from the result.
@@ -429,6 +431,11 @@ pub(crate) fn find_owners_among_raw(
     walk_pids(wanted, deadline, skip_pid, pids)
 }
 
+/// How many socket fds of one pid are decoded between deadline checks
+/// (security finding S3, 2026-11-01): a single process with tens of thousands
+/// of sockets must not carry the walk past the deadline on its own.
+const FD_DEADLINE_STRIDE: usize = 64;
+
 /// The per-pid body shared by the full scan and the targeted probe.
 fn walk_pids(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>, pids: &[u32]) -> Probe {
     let mut probe = Probe {
@@ -447,7 +454,10 @@ fn walk_pids(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>, pids: &
             probe.gone.push(pid);
             continue;
         };
-        for fd in fds {
+        for (i, fd) in fds.into_iter().enumerate() {
+            if i % FD_DEADLINE_STRIDE == FD_DEADLINE_STRIDE - 1 && Instant::now() >= deadline {
+                return probe;
+            }
             let Some(sock) = tcp_socket(pid, fd) else {
                 continue;
             };

@@ -25,6 +25,11 @@ use crate::types::{Probe, ProcessKey, SocketScanner, Tuple};
 #[cfg(target_os = "linux")]
 const NO_UID: u32 = u32::MAX;
 
+/// How many socket inodes of one pid are matched between deadline checks
+/// (security finding S3, 2026-11-01): one process with tens of thousands of
+/// sockets must not carry the walk past the deadline on its own.
+const FD_DEADLINE_STRIDE: usize = 64;
+
 /// The Linux [`SocketScanner`]: same-user `/proc/net/tcp{,6}` rows → inode →
 /// `/proc/<pid>/fd` walk.
 pub(crate) struct LinuxScanner {
@@ -179,7 +184,10 @@ impl LinuxScanner {
                 continue;
             }
             let mut key: Option<ProcessKey> = None;
-            for inode in held {
+            for (i, inode) in held.into_iter().enumerate() {
+                if i % FD_DEADLINE_STRIDE == FD_DEADLINE_STRIDE - 1 && Instant::now() >= deadline {
+                    return probe;
+                }
                 let Some(tuple) = inodes.remove(&inode) else {
                     continue;
                 };
