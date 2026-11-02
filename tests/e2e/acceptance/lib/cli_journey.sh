@@ -52,6 +52,8 @@ run() { # id secs -- cmd...   (capped; SIGINT at the cap so a serving mode exits
   python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$OUT/$id.out" 2>"$OUT/$id.err" & local pid=$!
   ( sleep "$secs"; kill -INT "$pid" 2>/dev/null; sleep 2; kill "$pid" 2>/dev/null ) & local w=$!
   wait "$pid" 2>/dev/null; local rc=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  # A web card (CLI-8/N4-CLI when the holder vanished) carries two per-run bearers: never on disk.
+  sed -i '' -E 's/#t=[^&[:space:]]+/#t=<redacted>/g' "$OUT/$id.out" "$OUT/$id.err" 2>/dev/null || true
   echo "$rc" >"$OUT/$id.exit"; return "$rc"
 }
 lines() { wc -l <"$1" | tr -d ' '; }
@@ -97,13 +99,15 @@ if want nocore; then
     else
       res CLI-2 FAIL "exit $rc; stdout $(lines "$OUT/CLI-2.out") lines ($(loader "$OUT/CLI-2.out") loader); groups seen: tui=$(grep -c tui "$OUT/CLI-2.out") web=$(grep -c web "$OUT/CLI-2.out") operator-token=$(grep -c operator-token "$OUT/CLI-2.out"); stderr first: $(clean "$OUT/CLI-2.err" | head -1 | head -c 100)" "" "PR #271"
     fi
-    # CLI-3 bare aitm: the ready card within 10 s (proxy address, bus, CA state, Scope advice), no loader lines on stdout, orderly exit on SIGINT.
+    # CLI-3 bare aitm: the ready card within 10 s on STDERR (wave 1 G1/D13: every human line is on
+    # stderr; stdout is the stdio MCP transport's JSON-RPC channel and stays empty with no client),
+    # in the plain `Label: value` form on this pipe; no loader lines anywhere; orderly exit on SIGINT.
     run CLI-3 10 "$AITM"; rc=$?
-    card=$(clean "$OUT/CLI-3.out" | grep -ciE 'proxy|listening|bus|CA (trusted|untrusted)|Scope')
-    if [ "$(loader "$OUT/CLI-3.out")" = 0 ] && [ "$card" -ge 3 ] && grep -qiE 'CA (trusted|untrusted)' "$OUT/CLI-3.out"; then
-      res CLI-3 PASS "ready card: $(clean "$OUT/CLI-3.out" | grep -iE 'proxy|bus|CA' | tr '\n' ' ' | head -c 160)"
+    card=$(clean "$OUT/CLI-3.err" | grep -ciE 'proxy|listening|bus|CA:? *(trusted|untrusted)|Scope')
+    if [ "$(lines "$OUT/CLI-3.out")" = 0 ] && [ "$(loader "$OUT/CLI-3.err")" = 0 ] && [ "$card" -ge 3 ] && grep -qiE 'CA:? *(trusted|untrusted)' "$OUT/CLI-3.err"; then
+      res CLI-3 PASS "ready card on stderr, stdout empty: $(clean "$OUT/CLI-3.err" | grep -iE 'proxy|bus|CA' | tr '\n' ' ' | head -c 160)"
     else
-      res CLI-3 FAIL "no ready card: stdout $(lines "$OUT/CLI-3.out") lines ($(loader "$OUT/CLI-3.out") loader), non-log lines: $(clean "$OUT/CLI-3.out" | grep -v '^[[:space:]]*$' | head -3 | tr '\n' '|' | head -c 160); exit $rc" "" "PR #271"
+      res CLI-3 FAIL "no ready card on stderr: stderr $(lines "$OUT/CLI-3.err") lines ($(loader "$OUT/CLI-3.err") loader), stdout $(lines "$OUT/CLI-3.out") lines, non-log lines: $(clean "$OUT/CLI-3.err" | grep -v '^[[:space:]]*$' | head -3 | tr '\n' '|' | head -c 160); exit $rc"
     fi
     # CLI-6 scope add with NO core: refusal, exit 1, never the host echoed as success.
     run CLI-6 10 "$AITM" scope add --host acceptance-cli6.invalid; rc=$?
@@ -121,10 +125,10 @@ if want nocore; then
     else
       run CLI-8 10 "$AITM" web; rc=$?
       kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
-      if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/CLI-8.err" && grep -q '8082' "$OUT/CLI-8.err" && ! grep -qE 'Web UI +http' "$OUT/CLI-8.out"; then
+      if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/CLI-8.err" && grep -q '8082' "$OUT/CLI-8.err" && ! grep -qE 'Web UI:? +http' "$OUT/CLI-8.err"; then
         res CLI-8 PASS "$(clean "$OUT/CLI-8.err" | grep -m1 'cannot start' | head -c 120)"
       else
-        res CLI-8 FAIL "exit $rc; stderr: $(clean "$OUT/CLI-8.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI +http' "$OUT/CLI-8.out")"
+        res CLI-8 FAIL "exit $rc; stderr: $(clean "$OUT/CLI-8.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI:? +http' "$OUT/CLI-8.err")"
       fi
     fi
   fi
@@ -161,10 +165,10 @@ if want livecore; then
     fi
     # N4-CLI: `aitm web` while 8080 is held must print the cannot-start panel, exit 1, no card first.
     run N4-CLI 10 "$AITM" web; rc=$?
-    if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/N4-CLI.err" && ! grep -qE 'Web UI +http' "$OUT/N4-CLI.out"; then
-      res N4-CLI PASS "$(clean "$OUT/N4-CLI.err" | grep -m1 'cannot start' | head -c 120); $(loader "$OUT/N4-CLI.out") loader lines on stdout first" "" "log noise: PR #271"
+    if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/N4-CLI.err" && ! grep -qE 'Web UI:? +http' "$OUT/N4-CLI.err"; then
+      res N4-CLI PASS "$(clean "$OUT/N4-CLI.err" | grep -m1 'cannot start' | head -c 120); $(loader "$OUT/N4-CLI.out") loader lines on stdout first" "" "regression after #271 (loader noise)"
     else
-      res N4-CLI FAIL "exit $rc; stderr: $(clean "$OUT/N4-CLI.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI +http' "$OUT/N4-CLI.out")"
+      res N4-CLI FAIL "exit $rc; stderr: $(clean "$OUT/N4-CLI.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI:? +http' "$OUT/N4-CLI.err")"
     fi
     # CLI-9 proxy system: `status` is read-only and always runs; `set`/`unset` only with Matt's yes.
     run CLI-9-status 10 "$AITM" proxy system status; rc9=$?
@@ -227,7 +231,7 @@ if want livecore; then
   tr7=$(python3 -c 'import json,sys; t=open(sys.argv[1]).read(); i=t.find("{"); d=json.loads(t[i:]); u=d["stores"]["user"]; print("user installed="+u["installed"]+" trusted="+u["trusted"])' "$OUT/CLI-7.out" 2>/dev/null || echo "unparseable")
   kc=$(security find-certificate -a -c aitmproxy -Z "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null | grep -c 'SHA-1')
   if [ "$rc" = 0 ] && { { [ "$kc" -ge 1 ] && echo "$tr7" | grep -q 'installed=present'; } || { [ "$kc" = 0 ] && echo "$tr7" | grep -q 'installed=absent'; }; }; then
-    res CLI-7 PASS "$tr7 (keychain has $kc aitmproxy cert); $(loader "$OUT/CLI-7.out") loader lines before the JSON" "ca.status over the bus agrees" "log noise: PR #271"
+    res CLI-7 PASS "$tr7 (keychain has $kc aitmproxy cert); $(loader "$OUT/CLI-7.out") loader lines before the JSON" "ca.status over the bus agrees" "regression after #271 (loader noise)"
   else
     res CLI-7 FAIL "exit $rc; $tr7 vs keychain count $kc"
   fi
