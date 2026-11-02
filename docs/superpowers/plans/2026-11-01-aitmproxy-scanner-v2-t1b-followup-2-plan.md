@@ -348,6 +348,24 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 - **Done when:** the three tests are green, `cargo test -p aitm-scan-model -p aitm-plugin-scanner` green, docs/scanner.md's status field list names `crawl.forms_submitted` as written by any lane through the hook (Task 6 docs coder or this task, one writer).
 - **Ownership:** runs after Task 1b (same `worker.rs`/`interim_lane.rs`), before Task 5.
 
+### Task 10: `marker()` is fresh per call; `job_id()` is the per-job key (amendment 57)
+
+**Added 2026-11-01 (T5's real-bus cells; T6 hit it earlier).** `JobCtx::marker()` returns a fresh token per call (right for canaries); two lanes keyed per-job state on it and silently missed every lookup.
+
+- **Rule:** the trait documents, on `marker()`, that every call mints a new token and it must never be used as a key, and names `JobCtx::job_id()` as the stable per-job key (it already exists; if a lane needs a `&str` key with a different lifetime shape, add nothing — point at `job_id()`). The `ProbeHost::marker` docs say the same.
+- **Files:** `crates/aitm-scan-model/src/traits.rs` (docs), `crates/aitm-plugin-scanner/src/worker.rs`/`interim_lane.rs` (`ProbeHost::marker` impl docs only).
+- **Tests:** `worker::tests::markers_are_fresh_per_call_and_job_id_is_stable` — two `marker()` calls on one runtime differ, `job_id()` is identical across calls and equals `status.job`.
+- **Ownership:** after Task 7 (worker.rs), before Task 8 (which changes `marker`'s body).
+
+### Task 11: a check that returns `Outcome::Error` is counted, sampled and logged (amendment 58)
+
+**Added 2026-11-01 (T5's lane was inert for an hour with `done` in 1 s, 0 cases, 0 frames and no trace).** Today the worker's `note_lane_text` drops the detail, `checks.errors` is never bumped, nothing is logged.
+
+- **Rule:** on `Outcome::Error` the worker bumps `JobStatus.checks.errors` (add the field to `CheckCounters` if absent, additive, serde default), keeps the first 8 error details per job on an additive `JobStatus.checks.error_samples: Vec<CheckErrorSample { check, point, detail }>` (scrubbed through `util::scrub`, detail bounded like evidence excerpts; distinct `(check, detail)` pairs only), and emits one `tracing::warn!` per distinct detail (never per probe). `Outcome::Inconclusive` is unchanged.
+- **Files:** `crates/aitm-scan-model/src/job.rs` (fields), `crates/aitm-plugin-scanner/src/worker.rs` (`run_item`/`item_done` region, `JobRuntime` sample store, `sync_counters`), `docs/scanner.md` status notes (Task 6 docs coder or this task — one writer).
+- **Tests (red first):** `worker::tests::an_erroring_check_is_counted_sampled_and_logged` — a `FakeLane` check returning `Outcome::Error` with detail `"runner missing"` on two points → `checks.errors == 2`, `error_samples.len() == 1` (distinct), sample names the check id and the first point, detail scrubbed; a ninth distinct detail is not kept (cap 8); `scan.status` shows them; `job::tests::check_counters_additive_fields_default_to_zero` (reload without the fields → 0 / empty).
+- **Ownership:** after Task 7 and Task 10 (worker.rs, model job.rs), before Task 8.
+
 ### Task 8: per-job random nonce in `util::marker` (amendment 55, security Minor from T3's 2b panel)
 
 **Added 2026-11-01.** `util::marker(counter)` is `aitm` + an 8-hex per-job counter starting at zero, so every job's first marker is `aitm00000000`; the converted Rhai checks (ssti/cmdi/crlf/xxe/cors/header-reflection) use `probe.marker()` as their canary, so a target that knows aitmproxy can forge a Vulnerable verdict by echoing `aitm0000000N`.
