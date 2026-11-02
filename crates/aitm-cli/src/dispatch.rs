@@ -418,8 +418,9 @@ fn any_from_json(j: &JsonValue) -> Value {
     }
 }
 
-/// The placeholder shown for a flag's value in usage text.
-fn type_hint(ty: &TypeDesc) -> &'static str {
+/// The placeholder shown for a flag's value in usage text (also the words
+/// `aitm::describe::fingerprint` pins the schema-only registry with, plan C28).
+pub fn type_hint(ty: &TypeDesc) -> &'static str {
     match ty {
         TypeDesc::Bool => "true|false",
         TypeDesc::Int => "int",
