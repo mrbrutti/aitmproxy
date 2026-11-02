@@ -26,8 +26,11 @@ becomes a request; the eight cancelled rapid-reset heads do) and none above 8;
 and the issue set on P equals the issue set on V.
 
 Observer, independent of the scanner: the target's control origin `GET /log/conns`
-(`alpn`, `opened_ms`, per-connection `requests`), which is the T3-3 oracle for
-"<= 1 connection per check, <= 8 streams". No fixture.
+(`alpn`, `opened_ms`, per-connection `requests`, and with T10's #284 the per-connection
+`streams` counter: HEADERS frames seen before hyper parses them), which is the T3-3
+oracle for "<= 1 connection per check, <= 8 streams": sorted stream counts
+`[0, 2, 2, 3, 8]` (amendment 14b's 0/8/3/2/2) and none above 8. On a build without
+`streams` that half is printed as pending, not passed. No fixture.
 
 SKIP 77 when: no `scan.*` verbs, no `http` lane in `scan.checks`, any of the five
 h2 check ids is missing from the catalogue (T3 is not merged yet), or the target
@@ -73,6 +76,14 @@ RAPID_RESET_PHRASE = "no reset-rate mitigation"
 # crawl and the checks' baselines) is not a raw-probe connection and is told
 # apart by the `GET /` the crawl fetched on it.
 EXPECTED_REQUESTS = [0, 0, 0, 0, 8]
+# T10's per-connection stream counter (PR #284): distinct client-initiated stream ids
+# seen in HEADERS frames on the inbound bytes before hyper parses them, so a rejected
+# header block and a cancelled stream count like a served one. The five checks open
+# 0 (settings), 2 (header-crlf), 2 (cl-te), 3 (pseudo-header) and 8 (rapid-reset)
+# streams: spec amendment 14b's 0/8/3/2/2, sorted. `streams` is absent on a build
+# without #284, in which case that half is reported as pending, not passed.
+EXPECTED_STREAMS = [0, 2, 2, 3, 8]
+MAX_STREAMS_PER_CONNECTION = 8
 JOB_TIMEOUT = 600.0
 
 
@@ -167,16 +178,27 @@ def assert_issue_set(op, iss, label: str) -> set:
 
 def assert_connections(conns, label: str) -> None:
     counts = sorted(int(c.get("requests", 0)) for c in conns)
-    detail = ", ".join(f"{c.get('conn_id')}:{c.get('requests')}" for c in conns)
+    detail = ", ".join(f"{c.get('conn_id')}:{c.get('requests')}/{c.get('streams')}" for c in conns)
     check(len(conns) == 5,
           f"{label}: the five checks opened exactly five h2 connections "
           f"(observed {len(conns)}: {detail})")
     check(counts == EXPECTED_REQUESTS,
-          f"{label}: per-connection request counts are {EXPECTED_REQUESTS} "
-          f"(observed {counts}) -- the exact list; the <= 8 streams/connection bound "
-          f"cannot be seen by the request counter for a rejected stream and rests on the "
-          f"driver's pre-dial cap (RawH2Plan.streams refused above 8, unit-pinned) until "
-          f"T10 logs a per-connection stream counter")
+          f"{label}: per-connection request counts (hyper's dispatched requests) are "
+          f"{EXPECTED_REQUESTS} (observed {counts}) -- a rejected header block and a "
+          f"cancelled stream are never counted here")
+    if any(c.get("streams") is None for c in conns):
+        print(f"  ~ {label}: the target logs no per-connection stream counter on this build "
+              f"(T10 PR #284 not in it); the <= {MAX_STREAMS_PER_CONNECTION} streams/connection "
+              f"bound rests on the driver's pre-dial cap (RawH2Plan.streams refused above 8, "
+              f"unit-pinned) for this run")
+        return
+    streams = sorted(int(c["streams"]) for c in conns)
+    check(streams == EXPECTED_STREAMS,
+          f"{label}: per-connection stream counts (HEADERS frames the target saw, rejected "
+          f"and cancelled ones included) are {EXPECTED_STREAMS} (observed {streams})")
+    check(all(n <= MAX_STREAMS_PER_CONNECTION for n in streams),
+          f"{label}: no connection the checks opened carried more than "
+          f"{MAX_STREAMS_PER_CONNECTION} streams (observed {streams})")
 
 
 def main() -> None:
