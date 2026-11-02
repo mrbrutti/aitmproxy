@@ -48,3 +48,13 @@ Live run on the fixed head 404cb613 (full parallel cells): 31 pass / 8 skip / 1 
 | 2 | Security | Minor | a probe dropped at the scanner's 30 s ceiling (`MAX_AWAIT`) before the sender's 60 s timeout never reaches `record_error`, so a tarpit is bounded by the scanner's ladder only, not the core breaker | **accepted as a follow-up (amendment candidate 81)**: the `JobClient` holds no guard; the fix is a drop-guard in `send_inner` or passing `ScanServices.guard` into the job client — a design change outside this PR's two rulings |
 | 1 | Security | Minor | per-port keys multiply the three maps; `host_errors`/`disable_count` are never pruned | partly addressed 2aa99a92 (windows pruned); counters bounded by scope × ports; cap per host left as a follow-up note |
 | all | Spec | Note | amendment rows 74/80 not yet in the spec on main | coordinator's docs PR |
+
+## Shipped
+
+PR #299 (`claude/scanner-v2-t1b-pr2b` → `main`), opened 2026-11-02 at 51fd6bf4 (+ this note); contains main 179bc01f, 8387d83e (#298) and 8fc179e4 (#297). Merge is the coordinator's.
+
+- Gate: full workspace gate exit 0 at be73894b and 404cb613; reduced gate (fmt, clippy, workspace build, tests on core/model/scanner/rhai/aitm) exit 0 at 79a8c19e and 51fd6bf4. `target/` deleted after the runs.
+- 71c proof: the two start tests ×50 default + ×50 `--test-threads=1`, 0 failures (each run checked for "2 passed").
+- Live proof (parallel `run.py scan` at 51fd6bf4): 32 pass / 7 skip / 1 fail. `test_t3_h2_sender.py`, `test_t2_mutable_points.py`, `test_t2_session_reuse.py`, `test_t1_finding_link.py` PASS under load; the sweep job runs its whole catalogue (checks.done 1068, probes 2671, errors 0, stopped_reason None; on #292's build: 941/1052, stopped errors). The one red is the sweep's `open-redirect` on `/redirect`: the seeded link is `/redirect?next=/`, T2's lane tags `Url` only for `is_url` values and T3's check `wants_traits: [Url]`, so the check never runs on that point — a T2/T3 trait gap the early stop had masked; routed to the coordinator, not this PR's.
+- Panel: security PASS, quality FAIL → fixed, spec FAIL → fixed (tests); amendment 81 (30 s ceiling vs breaker) to PR 3; panel comment on #299.
+
