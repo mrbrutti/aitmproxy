@@ -1053,25 +1053,73 @@ async fn every_h2_check_charges_one_unit_per_stream_before_it_dials() {
     }
 }
 
-/// T3-7 (plan amendment A5): the raw probe dials the address the guarded
-/// baseline answered from. A host that does not know it is not probed at all
-/// — and the refusal costs nothing, because the address is read before the
-/// charge.
+/// T3-7 (plan amendment A5, as F12c amended it): a host that does not know
+/// where its baseline came from no longer stops the probe — it loses the
+/// strict dial and nothing else. The plan carries no address, so the driver
+/// resolves the authority's own name and puts every address it resolves to
+/// through the SSRF gate and the live scope permit (what PR 2a shipped); the
+/// job still pays one unit per stream; and the verdict says, in the detail
+/// the operator reads, that this connection was aimed by name.
+///
+/// Live on the real bus (2026-11-01): `aitm-core`'s `ProxyClient` records
+/// `server_conn: None` for every client-sent flow, so no host on main can
+/// report a peer and the old gate turned all five checks Inconclusive.
 #[tokio::test]
-async fn a_host_without_a_baseline_peer_address_is_never_dialled() {
-    for id in ALL_IDS {
-        let runner = FakeRunner::answering(resets(8));
+async fn a_host_without_a_baseline_peer_address_dials_by_name() {
+    for (id, units) in [
+        ("h2-settings-observe", 1u32),
+        ("h2-pseudo-header-validation", 3),
+        ("h2-header-crlf-tolerance", 2),
+        ("h2-cl-te-downgrade-indicator", 2),
+        ("h2-rapid-reset-mitigation", 8),
+    ] {
+        let runner = FakeRunner::scripted(|plan| match &plan.mode {
+            RawH2Mode::SettingsOnly => Ok(obs(vec![])),
+            _ => Ok(resets(plan.streams as usize)),
+        });
         let check = check_named(&runner, id);
-        let host = h2host().without_a_peer();
+        // Twenty units: one for the baseline, the rest for the probe.
+        let host = h2host().with_budget(20).without_a_peer();
 
         let v = run(&check, &host).await;
 
-        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
-        assert_eq!(v.detail, "baseline peer address unknown", "{id}");
-        assert_eq!(runner.calls(), 0, "{id}");
-        assert_eq!(host.charges(), Vec::<u32>::new(), "{id}: charged anyway");
+        assert_eq!(runner.calls(), 1, "{id}: the probe was sent");
+        assert_eq!(
+            runner.only_plan().target.addr,
+            None,
+            "{id}: the driver resolves the name and gates what it resolves"
+        );
+        assert_eq!(
+            host.charges(),
+            vec![units],
+            "{id}: the charge still happened"
+        );
         assert_eq!(host.baseline_calls(), 1, "{id}: the baseline was taken");
+        assert_ne!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
+        assert!(
+            v.detail
+                .ends_with(" (dialled by name: the host reported no baseline peer address)"),
+            "{id}: {}",
+            v.detail
+        );
     }
+}
+
+/// The note describes a dial, so only a verdict the probe actually produced
+/// carries it (the coder's reading of the amendment, pinned here): a
+/// peer-less host whose budget refuses the streams is still refused in that
+/// gate's own plain words, with nothing dialled and nothing to describe.
+#[tokio::test]
+async fn a_gate_that_sends_nothing_claims_no_dial_by_name() {
+    let runner = FakeRunner::answering(resets(3));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+    let host = h2host().with_budget(1).without_a_peer();
+
+    let v = run(&check, &host).await;
+
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert_eq!(v.detail, "budget refused the raw probe");
+    assert_eq!(runner.calls(), 0);
 }
 
 /// T3-7: every one of the five hands the driver the baseline's own address,

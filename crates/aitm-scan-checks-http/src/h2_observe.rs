@@ -53,16 +53,29 @@
 //!
 //! # Where the raw probe goes
 //!
-//! To exactly the address the guarded baseline answered from:
-//! [`ProbeHost::baseline_peer_addr`] is read after the baseline succeeded and
-//! handed to the driver as [`RawH2Target::addr`], which dials it and
-//! **resolves nothing**. There is therefore no second name lookup that could
-//! answer differently from the baseline's — the acceptance criterion's
-//! "refuses when the address differs from the one the baseline reported"
-//! holds by construction — and the driver refuses outright an address whose
-//! port is not the authority's. A host that does not know the address is not
-//! probed at all: the check returns `Inconclusive` before it charges
-//! anything (plan amendment A5, T3-7).
+//! To the address the guarded baseline answered from, whenever the host knows
+//! it: [`ProbeHost::baseline_peer_addr`] is read after the baseline succeeded
+//! and handed to the driver as [`RawH2Target::addr`], which dials it and
+//! **resolves nothing**. There is then no second name lookup that could answer
+//! differently from the baseline's — the acceptance criterion's "refuses when
+//! the address differs from the one the baseline reported" holds by
+//! construction — and the driver refuses outright an address whose port is not
+//! the authority's.
+//!
+//! A host that does **not** know the address is still probed, by name. No lane
+//! host can report a peer today: aitm-core's `ProxyClient` records
+//! `server_conn: None` for every flow it sends on a client's behalf, because
+//! `RequestSender::send_with` hands back an `HttpResponse` and no connection
+//! record at all. The strict dial above therefore turned all five checks
+//! `Inconclusive` on the live bus and the lane observed nothing (found
+//! 2026-11-01). So when the peer is `None` the check logs a warning, builds
+//! the plan with `addr: None`, and the driver resolves the authority's own
+//! name and puts **every** address it resolves to through the SSRF gate and
+//! the live scope permit, exactly as PR 2a shipped that path; the verdict's
+//! detail then ends with "(dialled by name: the host reported no baseline peer
+//! address)" so the operator reads which aim was used. The strict dial comes
+//! back by itself, with no change here, the day the core fills `server_conn`
+//! on client-sent flows (plan amendment A5, T3-7, amendment 59).
 //!
 //! # One connection per authority
 //!
@@ -477,9 +490,11 @@ impl H2Check {
     }
 
     /// The plan this check sends to `target` at `addr` — the address the
-    /// guarded baseline answered from — with the labels its verdict will
-    /// quote for a `Blocks` plan (empty for the other two modes).
-    fn plan(&self, target: &Target, addr: SocketAddr) -> Planned {
+    /// guarded baseline answered from, or `None` when the host did not know
+    /// it and the driver is to resolve the authority's name itself — with the
+    /// labels its verdict will quote for a `Blocks` plan (empty for the other
+    /// two modes).
+    fn plan(&self, target: &Target, addr: Option<SocketAddr>) -> Planned {
         let (headers, mode, streams, labels) = match self.kind {
             Kind::Settings => (Vec::new(), RawH2Mode::SettingsOnly, 0, Vec::new()),
             Kind::RapidReset => (
@@ -502,10 +517,12 @@ impl H2Check {
                 target: RawH2Target {
                     scheme: target.scheme.clone(),
                     authority: target.wire_authority.clone(),
-                    // The driver dials exactly this and resolves nothing, so
-                    // the connection can only go where the baseline went
-                    // (plan amendment A5, T3-7).
-                    addr: Some(addr),
+                    // `Some`: the driver dials exactly this and resolves
+                    // nothing, so the connection can only go where the
+                    // baseline went (plan amendment A5, T3-7). `None`: it
+                    // resolves the authority above and gates every address
+                    // that name gives (amendment 59).
+                    addr,
                 },
                 headers,
                 mode,
@@ -538,9 +555,10 @@ impl Check for H2Check {
         &self.meta
     }
 
-    /// Eleven gates stand between a point and the raw connection, in this
-    /// order, and each one that fails returns `Inconclusive` with nothing
-    /// sent:
+    /// Eleven steps stand between a point and the raw connection, in this
+    /// order. Each one that fails returns `Inconclusive` with nothing sent,
+    /// except step 8, which only decides how the probe is aimed and never
+    /// refuses:
     ///
     /// 1. **url** — the point's URL must name a dialable `http(s)` authority
     ///    ([`Target::parse`]);
@@ -555,9 +573,11 @@ impl Check for H2Check {
     ///    client, so scope has cleared the authority before a raw byte moves;
     /// 7. **cancel/deadline re-check** — the baseline took time; a job that
     ///    stopped meanwhile sends nothing;
-    /// 8. **baseline peer address** — [`ProbeHost::baseline_peer_addr`] knows
-    ///    where the baseline came from; that address, and no name lookup, is
-    ///    what the probe dials (T3-7);
+    /// 8. **address** — the baseline's peer when it is known
+    ///    ([`ProbeHost::baseline_peer_addr`]), which is then the only thing
+    ///    the probe dials and no name is looked up; else the authority's name
+    ///    through the driver's SSRF gate and the live scope permit, said so
+    ///    in the verdict's detail (T3-7, amendment 59);
     /// 9. **charge** — [`ProbeHost::charge`] accepts one unit per stream the
     ///    plan will open, `max(1)`; the job's budget pays for the connection
     ///    before it exists (T3-6);
@@ -571,8 +591,8 @@ impl Check for H2Check {
     /// It is atomic, so two points of one origin that race through gates 1–9
     /// open one connection, not two.
     ///
-    /// The address at 8 is read before the charge at 9, so a probe that
-    /// cannot be aimed costs the job nothing.
+    /// The address at 8 is read before the charge at 9, so how the probe is
+    /// aimed is settled before the job pays for it.
     ///
     /// The re-check at 7 tests cancellation and the deadline but not the
     /// budget, because gate 9 immediately charges the plan's real stream
@@ -615,15 +635,24 @@ impl Check for H2Check {
             if host.cancelled() || Instant::now() >= host.deadline() {
                 return stopped();
             }
-            // Where the baseline actually came from. The raw probe dials
-            // that address and nothing else, so a name that moved between
-            // the baseline and the probe cannot move the connection (plan
-            // amendment A5, T3-7). A host that does not know it is not
-            // probed — read before the charge, so a refusal here costs the
-            // job nothing.
-            let Some(addr) = host.baseline_peer_addr() else {
-                return inconclusive(PEER_ADDR_UNKNOWN);
-            };
+            // Where the baseline actually came from. When the host knows it,
+            // the raw probe dials that address and nothing else, so a name
+            // that moved between the baseline and the probe cannot move the
+            // connection (plan amendment A5, T3-7).
+            //
+            // When it does not — which is every lane host on main, the core
+            // leaving `server_conn: None` on client-sent flows — the probe is
+            // still sent, aimed by name through the driver's SSRF gate and
+            // the live scope permit, and the verdict carries that fact
+            // (amendment 59). Read before the charge, so the aim is settled
+            // before the job pays.
+            let addr = host.baseline_peer_addr();
+            if addr.is_none() {
+                tracing::warn!(
+                    check = %self.meta.id,
+                    "{PEER_ADDR_UNKNOWN}; the raw h2 probe dials by name through the SSRF gate and the live scope permit"
+                );
+            }
             // The streams a raw probe opens never pass through
             // `ProbeHost::probe`, so the job is charged for them here, one
             // unit per stream (`max(1)` for the stream-less settings probe):
@@ -639,7 +668,7 @@ impl Check for H2Check {
             if !self.guard.claim(&target.origin_key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
-            match self.runner.run(plan).await {
+            let verdict = match self.runner.run(plan).await {
                 Ok(obs) => {
                     // Shape only: stream outcomes, GOAWAY codes and the two
                     // end flags. The observation carries no peer text.
@@ -657,6 +686,13 @@ impl Check for H2Check {
                     tracing::debug!(%error, check = %self.meta.id, "raw h2 probe did not complete");
                     inconclusive(NO_H2)
                 }
+            };
+            // Only a verdict the probe itself produced carries the note: a
+            // gate that sent nothing has no dial to describe.
+            if addr.is_some() {
+                verdict
+            } else {
+                dialled_by_name(verdict)
             }
         })
     }
@@ -666,7 +702,13 @@ const ALREADY_OBSERVED: &str = "already observed for this authority";
 const FORCED_H1: &str = "skipped: the profile forces http.version h1, so no HTTP/2 probe is sent";
 const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
 const BUDGET_REFUSED: &str = "budget refused the raw probe";
+/// The warning a probe logs when it has no baseline peer to aim at, and the
+/// first clause of that warning's message.
 const PEER_ADDR_UNKNOWN: &str = "baseline peer address unknown";
+
+/// What such a probe's verdict adds to its detail, so the operator reads how
+/// the connection was aimed (amendment 59).
+const DIALLED_BY_NAME: &str = " (dialled by name: the host reported no baseline peer address)";
 
 /// Where a raw probe goes, cut from a point's URL by [`crate::url`].
 ///
@@ -747,6 +789,13 @@ impl Target {
             .filter_map(|origin| origin.origin_key())
             .any(|origin| origin == self.origin_key)
     }
+}
+
+/// The same verdict, noting that the probe was aimed at the authority's name
+/// and not at the address the baseline answered from (amendment 59).
+fn dialled_by_name(mut verdict: Verdict) -> Verdict {
+    verdict.detail.push_str(DIALLED_BY_NAME);
+    verdict
 }
 
 /// The verdict for a probe that was not sent, with nothing to show for it.
@@ -1114,7 +1163,7 @@ mod tests {
 
             // The plan is cut from the same list, in the same order.
             let peer = "203.0.113.7:443".parse().expect("a literal address");
-            let planned = H2Check::new(kind, Arc::clone(&runner)).plan(&target, peer);
+            let planned = H2Check::new(kind, Arc::clone(&runner)).plan(&target, Some(peer));
             assert_eq!(planned.plan.target.addr, Some(peer), "{kind:?}");
             let blocks: Vec<Vec<RawHeader>> = variants.iter().map(|(_, b)| b.clone()).collect();
             assert_eq!(planned.plan.mode, RawH2Mode::Blocks(blocks), "{kind:?}");
