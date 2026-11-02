@@ -65,6 +65,7 @@ use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::{L4Guard, L4GuardError};
+use crate::icmp::{icmp_key, icmp_quote, IcmpKey};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
 use crate::wire::send_on_wire;
 
@@ -468,31 +469,26 @@ impl Correlation {
         if self.is_own_stimulus(&info) {
             return Classified::Ignore;
         }
-        match self.expect {
+        // The one variable between the two correlating modes: the host the
+        // reply must come from and — under `FiveTuple` — the port too.
+        // `FromHost` frees the target's port (a service that answers off an
+        // ephemeral socket); everything else is the same rule.
+        let (host, port) = match self.expect {
             // Any decodable frame that is not our own stimulus echoed back. The
             // operator's explicit "show me whatever answers" choice.
-            ReplyMatch::Any => Classified::Response,
-            // The reaction shapes are tested first: a reset carries the reversed
-            // tuple too, and an ICMP error quoting our ICMP stimulus carries our
-            // protocol — both are reactions, never the reply.
-            ReplyMatch::FromHost(host) => {
-                if self.is_reaction_from_host(&info, host) {
-                    Classified::Other
-                } else if self.is_reply_from_host(&info, host) {
-                    Classified::Response
-                } else {
-                    Classified::Ignore
-                }
-            }
-            ReplyMatch::FiveTuple => {
-                if self.is_reaction_to_our_stimulus(&info) {
-                    Classified::Other
-                } else if self.is_reversed_tuple(&info) {
-                    Classified::Response
-                } else {
-                    Classified::Ignore
-                }
-            }
+            ReplyMatch::Any => return Classified::Response,
+            ReplyMatch::FiveTuple => (self.dst, self.dst_port),
+            ReplyMatch::FromHost(host) => (host, None),
+        };
+        // The reaction shapes are tested first: a reset carries the reversed
+        // tuple too, and an ICMP error quoting our ICMP stimulus carries our
+        // protocol — both are reactions, never the reply.
+        if self.is_reaction(&info, host, port) {
+            Classified::Other
+        } else if self.is_reply(&info, host, port) {
+            Classified::Response
+        } else {
+            Classified::Ignore
         }
     }
 
@@ -514,13 +510,15 @@ impl Correlation {
         self.stimulus_ends.src_port
     }
 
-    /// Whether the frame comes **from** the address and port we probed: the
-    /// target half of the reversed tuple.
-    fn is_from_the_target(&self, info: &ReplyInfo<'_>) -> bool {
-        if info.ends.src != Some(self.dst) {
+    /// Whether the frame comes **from** `host` and, when `port` is given and
+    /// the stimulus has ports, from that port: the target half of the reversed
+    /// tuple. `FiveTuple` passes the port we probed; `FromHost` passes `None`
+    /// and frees it.
+    fn is_from(&self, info: &ReplyInfo<'_>, host: IpAddr, port: Option<u16>) -> bool {
+        if info.ends.src != Some(host) {
             return false;
         }
-        match self.dst_port {
+        match port {
             Some(p) if matches!(self.proto, L4Proto::Tcp | L4Proto::Udp) => {
                 info.ends.src_port == Some(p)
             }
@@ -578,20 +576,24 @@ impl Correlation {
         }
     }
 
-    /// The reversed five-tuple — the **only** shape a reply to our stimulus can
-    /// have: from the address and port we probed, back to the address and port
-    /// we sent from, over the stimulus's protocol. For a portless stimulus
-    /// (ICMP, an unknown IP protocol) that is addresses and protocol — and, for
-    /// ICMP, the informational twin ([`Correlation::is_our_protos_reply`]).
+    /// The **only** shape a reply to our stimulus can have: from `host` (and
+    /// under `FiveTuple` from the port we probed), back to the address and
+    /// port we sent from, over the stimulus's protocol — for ICMP, its
+    /// informational twin ([`Correlation::is_our_protos_reply`]). For a
+    /// portless stimulus (ICMP, an unknown IP protocol) the port pins are
+    /// moot and addresses and protocol carry the rule.
     ///
-    /// "Same host" is deliberately not enough. On loopback every frame's source
-    /// address is 127.0.0.1, so accepting a frame on its source address alone
-    /// reads the core's own bus traffic, another cell's datagrams and the test
-    /// target's HTTP control channel as the target's answer — which is how the
-    /// packet lane scored every case `clean`/`protocol_error` and never once
-    /// observed the silence a crash shows up as (task 4b, rig run 9).
-    fn is_reversed_tuple(&self, info: &ReplyInfo<'_>) -> bool {
-        self.is_from_the_target(info)
+    /// "Same host" is deliberately not enough, in either mode. On loopback
+    /// every frame's source address is 127.0.0.1, so accepting a frame on its
+    /// source address alone reads the core's own bus traffic, another cell's
+    /// datagrams and the test target's HTTP control channel as the target's
+    /// answer — which is how the packet lane scored every case
+    /// `clean`/`protocol_error` and never once observed the silence a crash
+    /// shows up as (task 4b, rig run 9). `FromHost` frees the target's source
+    /// port only; the frame must still be addressed back to the port we sent
+    /// from.
+    fn is_reply(&self, info: &ReplyInfo<'_>, host: IpAddr, port: Option<u16>) -> bool {
+        self.is_from(info, host, port)
             && self.is_addressed_to_us(info)
             && self.is_our_protos_reply(info)
     }
@@ -599,26 +601,28 @@ impl Correlation {
     /// The two frames that are a reaction to our stimulus without being a reply
     /// to it ([`SendRecvOutcome::Other`]), and nothing else:
     ///
-    /// (a) an ICMP error whose **quoted** datagram is our stimulus. The quote is
-    /// what makes the test sound, and the concrete reason it exists is the
-    /// loopback hazard that produced the wrong reading: our stimulus carries a
-    /// crafted source port no socket is bound to, so every time the target
-    /// answers it the **kernel** sends an ICMP port-unreachable *to the target*,
-    /// and the capture sees that error on the same loopback. Its quoted packet
-    /// is the target's datagram — our tuple reversed — so without reading the
-    /// quote the error would be taken for the target reacting to us, and a
-    /// healthy echo service would score a protocol_error on every case. The
-    /// error's own source address is not checked: a TTL-exceeded legitimately
-    /// comes from a router that is not the target.
+    /// (a) an ICMP error whose **quoted** datagram is our stimulus
+    /// ([`Correlation::quote_is_our_stimulus`]). The quote is what makes the
+    /// test sound, and the concrete reason it exists is the loopback hazard
+    /// that produced the wrong reading: our stimulus carries a crafted source
+    /// port no socket is bound to, so every time the target answers it the
+    /// **kernel** sends an ICMP port-unreachable *to the target*, and the
+    /// capture sees that error on the same loopback. Its quoted packet is the
+    /// target's datagram — our tuple reversed — so without reading the quote
+    /// the error would be taken for the target reacting to us, and a healthy
+    /// echo service would score a protocol_error on every case. The error's
+    /// own source address is not checked: a TTL-exceeded legitimately comes
+    /// from a router that is not the target.
     ///
-    /// (b) a TCP reset from the port we probed back to the port we sent from —
-    /// a closed TCP port's answer **to a TCP stimulus**. Sequence and ack
-    /// numbers are not checked (a kernel RST to a crafted SYN need not be in
-    /// any window we track), but the endpoints and the stimulus's protocol
-    /// are: a reset belonging to another loopback conversation is not ours,
-    /// and a UDP probe cannot be reset, so a RST on a UDP stimulus's ports is
-    /// another conversation's whatever its ports say.
-    fn is_reaction_to_our_stimulus(&self, info: &ReplyInfo<'_>) -> bool {
+    /// (b) a TCP reset from `host` (and under `FiveTuple` from the port we
+    /// probed) back to the port we sent from — a closed TCP port's answer **to
+    /// a TCP stimulus**. Sequence and ack numbers are not checked (a kernel
+    /// RST to a crafted SYN need not be in any window we track), but the
+    /// endpoints and the stimulus's protocol are: a reset belonging to another
+    /// loopback conversation is not ours, and a UDP probe cannot be reset, so
+    /// a RST on a UDP stimulus's ports is another conversation's whatever its
+    /// ports say.
+    fn is_reaction(&self, info: &ReplyInfo<'_>, host: IpAddr, port: Option<u16>) -> bool {
         if let Some(quote) = info.icmp_quote {
             if self.quote_is_our_stimulus(&quote) {
                 return true;
@@ -626,23 +630,28 @@ impl Correlation {
         }
         self.proto == L4Proto::Tcp
             && info.tcp_rst
-            && self.is_from_the_target(info)
+            && self.is_from(info, host, port)
             && self.is_addressed_to_us(info)
     }
 
     /// Whether an ICMP error's quoted inner packet is the stimulus we sent:
     /// same source, same destination, same protocol, and — when we sent ports —
-    /// a quote that carries our ports. A real kernel always quotes 8 transport
-    /// bytes (RFC 792), a whole UDP header and enough of a TCP one to carry both
-    /// ports; but the frame is wire-controlled, so anything on the segment can
-    /// emit a bare-header quote with no ports, and on loopback both addresses
-    /// are 127.0.0.1 and tell nothing. So a quote that does not carry our ports
-    /// is **not** our stimulus — not "not disqualifying" — which is what
-    /// separates our error from the kernel's port-unreachable for the target's
-    /// reply (same addresses, only the ports differ) and what stops a hostile
-    /// bare-header quote from turning the crash oracle's silence into a reaction.
-    /// A portless stimulus (ICMP, an unknown protocol) has no ports to match, so
-    /// the address-and-protocol rule stands on its own there.
+    /// a quote that carries our ports. The pins are the stimulus's own
+    /// (`self.dst:self.dst_port` is where we sent it) in **both** modes:
+    /// `FromHost` frees the port the target answers *from*, never the port we
+    /// sent *to*, so a quote of a datagram from our port to another port of
+    /// the host is about another probe, not ours. A real kernel always quotes
+    /// 8 transport bytes (RFC 792), a whole UDP header and enough of a TCP one
+    /// to carry both ports; but the frame is wire-controlled, so anything on
+    /// the segment can emit a bare-header quote with no ports, and on loopback
+    /// both addresses are 127.0.0.1 and tell nothing. So a quote that does not
+    /// carry our ports is **not** our stimulus — not "not disqualifying" —
+    /// which is what separates our error from the kernel's port-unreachable
+    /// for the target's reply (same addresses, only the ports differ) and what
+    /// stops a hostile bare-header quote from turning the crash oracle's
+    /// silence into a reaction. A portless stimulus (ICMP, an unknown
+    /// protocol) has no ports to match, so the address-and-protocol rule
+    /// stands on its own there.
     fn quote_is_our_stimulus(&self, quote: &PacketEndpoints) -> bool {
         if quote.dst != Some(self.dst) || quote.proto.unwrap_or(L4Proto::Raw) != self.proto {
             return false;
@@ -663,40 +672,6 @@ impl Correlation {
             }
         }
         true
-    }
-
-    /// [`ReplyMatch::FromHost`] is the mode for a target that answers **from
-    /// another port** than the one probed (a service that replies off an
-    /// ephemeral socket): the frame must come from `host`, carry the stimulus's
-    /// protocol and be addressed back to the port we sent from, but its source
-    /// port is free. It is still not "any frame from that host" — on loopback
-    /// that would admit every unrelated conversation.
-    fn is_reply_from_host(&self, info: &ReplyInfo<'_>, host: IpAddr) -> bool {
-        info.ends.src == Some(host)
-            && self.is_addressed_to_us(info)
-            && self.is_our_protos_reply(info)
-    }
-
-    /// The two `Other` shapes under [`ReplyMatch::FromHost`], with the target
-    /// port relaxed to the host: an ICMP error quoting a datagram we sent to
-    /// `host`, and a reset from `host` addressed back to the port we sent from.
-    /// As in [`Correlation::quote_is_our_stimulus`], when we sent a source port
-    /// the quote must carry it: a wire-controlled bare-header quote with no
-    /// ports is not our reaction (on loopback its addresses tell nothing).
-    fn is_reaction_from_host(&self, info: &ReplyInfo<'_>, host: IpAddr) -> bool {
-        if let Some(quote) = info.icmp_quote {
-            let ours = quote.dst == Some(host)
-                && quote.proto.unwrap_or(L4Proto::Raw) == self.proto
-                && self.our_addr().is_none_or(|a| quote.src == Some(a))
-                && self.our_port().is_none_or(|p| quote.src_port == Some(p));
-            if ours {
-                return true;
-            }
-        }
-        self.proto == L4Proto::Tcp
-            && info.tcp_rst
-            && info.ends.src == Some(host)
-            && self.is_addressed_to_us(info)
     }
 
     /// Whether a decoded frame travels in the stimulus's **own direction** —
@@ -787,73 +762,6 @@ struct ReplyInfo<'a> {
     icmp_key: Option<IcmpKey>,
 }
 
-/// An ICMP / ICMPv6 informational message's correlation key: type, identifier
-/// and sequence. Only the request/reply pairs the protocol defines are keyed —
-/// ICMPv4 echo (8 / 0) and timestamp (13 / 14), ICMPv6 echo (128 / 129) —
-/// read through `etherparse`'s typed ICMP slices, never by offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IcmpKey {
-    /// Whether the message is ICMPv6 (the type spaces overlap: 0 and 8 mean
-    /// other things in ICMPv6).
-    v6: bool,
-    icmp_type: u8,
-    id: u16,
-    seq: u16,
-}
-
-impl IcmpKey {
-    /// The key the reply to this message must carry, when this message is a
-    /// request the protocol pairs with a reply type: the paired type with the
-    /// same identifier and sequence. `None` for a reply or an unpaired type.
-    fn reply_key(self) -> Option<IcmpKey> {
-        use etherparse::{icmpv4, icmpv6};
-        let reply_type = match (self.v6, self.icmp_type) {
-            (false, icmpv4::TYPE_ECHO_REQUEST) => icmpv4::TYPE_ECHO_REPLY,
-            (false, icmpv4::TYPE_TIMESTAMP) => icmpv4::TYPE_TIMESTAMP_REPLY,
-            (true, icmpv6::TYPE_ECHO_REQUEST) => icmpv6::TYPE_ECHO_REPLY,
-            _ => return None,
-        };
-        Some(IcmpKey {
-            icmp_type: reply_type,
-            ..self
-        })
-    }
-}
-
-/// The [`IcmpKey`] of an ICMP informational message, or `None` for an error,
-/// an unpaired type or a non-ICMP transport.
-fn icmp_key(transport: &Option<TransportSlice<'_>>) -> Option<IcmpKey> {
-    use etherparse::{Icmpv4Type, Icmpv6Type};
-    match transport {
-        Some(TransportSlice::Icmpv4(icmp)) => {
-            let (id, seq) = match icmp.icmp_type() {
-                Icmpv4Type::EchoRequest(h) | Icmpv4Type::EchoReply(h) => (h.id, h.seq),
-                Icmpv4Type::TimestampRequest(m) | Icmpv4Type::TimestampReply(m) => (m.id, m.seq),
-                _ => return None,
-            };
-            Some(IcmpKey {
-                v6: false,
-                icmp_type: icmp.type_u8(),
-                id,
-                seq,
-            })
-        }
-        Some(TransportSlice::Icmpv6(icmp)) => {
-            let (id, seq) = match icmp.icmp_type() {
-                Icmpv6Type::EchoRequest(h) | Icmpv6Type::EchoReply(h) => (h.id, h.seq),
-                _ => return None,
-            };
-            Some(IcmpKey {
-                v6: true,
-                icmp_type: icmp.type_u8(),
-                id,
-                seq,
-            })
-        }
-        _ => None,
-    }
-}
-
 /// Decode a captured frame to its correlation fields. `None` for a frame with no
 /// IP layer (ARP / undecodable) — such a frame cannot correlate to an IP stimulus.
 /// Mirrors the link-layer probing in the capture task (our crafted frames start at
@@ -876,81 +784,6 @@ fn decode_reply(frame: &[u8]) -> Option<ReplyInfo<'_>> {
         transport,
         icmp_quote: icmp_quote(&parsed.transport),
         icmp_key: icmp_key(&parsed.transport),
-    })
-}
-
-/// The endpoints of the datagram an ICMP **error** quotes, or `None`.
-///
-/// Only the ICMP types that carry a quote are read — IPv4 destination
-/// unreachable (3), source quench (4), redirect (5), time exceeded (11) and
-/// parameter problem (12); ICMPv6 destination unreachable (1), packet too big
-/// (2), time exceeded (3) and parameter problem (4). An echo or any other
-/// informational message carries a payload that is not a packet, and reading
-/// one as a quote would invent a correlation.
-fn icmp_quote(transport: &Option<TransportSlice<'_>>) -> Option<PacketEndpoints> {
-    match transport {
-        Some(TransportSlice::Icmpv4(icmp)) if matches!(icmp.type_u8(), 3 | 4 | 5 | 11 | 12) => {
-            quoted_endpoints(icmp.payload())
-        }
-        Some(TransportSlice::Icmpv6(icmp)) if matches!(icmp.type_u8(), 1..=4) => {
-            quoted_endpoints(icmp.payload())
-        }
-        _ => None,
-    }
-}
-
-/// Decode the head of a quoted packet — an IP header plus the first bytes of
-/// its transport — into endpoints.
-///
-/// An ICMP error quotes only the offending datagram's header and (classically)
-/// its first 8 transport bytes, which is a whole UDP header but a fragment of a
-/// TCP one, so the full-packet parser cannot be used here: the IP header is
-/// read with `etherparse`'s header slice (which validates version, IHL and
-/// length and tolerates the truncated payload behind it) and the port pair is
-/// read from the first four transport bytes, the only field TCP and UDP share
-/// at the same offset. Every read is bounds-checked; wire-derived bytes are
-/// hostile and nothing here may panic.
-fn quoted_endpoints(quote: &[u8]) -> Option<PacketEndpoints> {
-    use etherparse::{Ipv4HeaderSlice, Ipv6HeaderSlice};
-
-    let (src, dst, protocol, rest) = if let Ok(v4) = Ipv4HeaderSlice::from_slice(quote) {
-        (
-            IpAddr::from(v4.source_addr()),
-            IpAddr::from(v4.destination_addr()),
-            v4.protocol().0,
-            quote.get(v4.slice().len()..)?,
-        )
-    } else if let Ok(v6) = Ipv6HeaderSlice::from_slice(quote) {
-        (
-            IpAddr::from(v6.source_addr()),
-            IpAddr::from(v6.destination_addr()),
-            v6.next_header().0,
-            quote.get(v6.slice().len()..)?,
-        )
-    } else {
-        return None;
-    };
-
-    let proto = match protocol {
-        1 => Some(L4Proto::Icmp),
-        6 => Some(L4Proto::Tcp),
-        17 => Some(L4Proto::Udp),
-        58 => Some(L4Proto::IcmpV6),
-        _ => None,
-    };
-    let (src_port, dst_port) = match (proto, rest.get(..4)) {
-        (Some(L4Proto::Tcp | L4Proto::Udp), Some(ports)) => (
-            Some(u16::from_be_bytes([ports[0], ports[1]])),
-            Some(u16::from_be_bytes([ports[2], ports[3]])),
-        ),
-        _ => (None, None),
-    };
-    Some(PacketEndpoints {
-        proto,
-        src: Some(src),
-        dst: Some(dst),
-        src_port,
-        dst_port,
     })
 }
 
@@ -2902,6 +2735,43 @@ mod tests {
             other => panic!("expected the other-port reply as Response, got {other:?}"),
         }
         assert_eq!(packets, 2);
+    }
+
+    /// Quality panel (Important): `FromHost` relaxes the port the target
+    /// *answers from*, not the port we *sent to*. An ICMP error's quote is our
+    /// stimulus — sent from our address and port to `host:dst_port` — so the
+    /// quoted destination port is pinned in both modes. A quote of a datagram
+    /// from our port to **another** port of the host (another cell's probe, or
+    /// the same socket probing port 7) is not about our stimulus and is
+    /// `Ignore`d under `FromHost` exactly as under `FiveTuple`.
+    ///
+    /// Mutation: drop the `dst_port` pin from the one quote predicate (or
+    /// resurrect a `FromHost` copy without it) and the `FromHost` half reads
+    /// `Other`.
+    #[test]
+    fn from_host_quote_check_pins_the_destination_port_too() {
+        let to_another_port = udp_from_to("127.0.0.1", 40000, "127.0.0.1", 7, b"probe");
+        let unreachable = icmp_from("127.0.0.1", 3, 3, &to_another_port);
+        let host = ReplyMatch::FromHost("127.0.0.1".parse().unwrap());
+        assert!(
+            matches!(
+                lane_correlation(host).classify(&unreachable),
+                Classified::Ignore
+            ),
+            "FromHost: a quote of our port to another port of the host is not our stimulus"
+        );
+        assert!(
+            matches!(
+                lane_correlation(ReplyMatch::FiveTuple).classify(&unreachable),
+                Classified::Ignore
+            ),
+            "FiveTuple: the same"
+        );
+        let ours = icmp_from("127.0.0.1", 3, 3, &lane_stimulus());
+        assert!(
+            matches!(lane_correlation(host).classify(&ours), Classified::Other),
+            "FromHost: the quote of our stimulus to host:9 is the reaction"
+        );
     }
 
     // --- Tester (stage 5), amendment 66: the edges of the strict rule -------
