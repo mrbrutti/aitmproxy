@@ -11,13 +11,16 @@
 `needs_privilege` and in-path intercept is `unsupported_platform`. Headless Google Chrome over CDP, real input events only.
 **Core:** spawned by `live-env.startAitm` on free ports (proxy 52981, web 52983, target 52980); 113 tools, **25 `l4.*`**;
 `l4.scope.add` advertised with `confirmable: true`.
-**Full redacted log:** `/tmp/claude/l4-rig/c-evidence/08-cua-l4-full-run.log` (407 lines; every step line, the histogram, the scope prompt, the 19 screenshot paths).
+**Full redacted log (run 1):** `/tmp/claude/l4-rig/c-evidence/08-cua-l4-full-run.log` (407 lines; every step line, the histogram, the scope prompt, the 19 screenshot paths).
+**Full redacted log (run 2, after the wrapper fix):** `/tmp/claude/l4-rig/c-evidence/10-cua-l4-run2-after-wrapper-fix.log` (402 lines; same
+rig and binary; its idle-window `t0` is 2026-11-01 18:15:02 local time, file written 18:16).
 
-**Summary line printed by the script:** `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`.
+**Summary line printed by the script, run 1:** `38 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`.
 One of the 38 PASS lines was the step-09 wrapper line (`PASS 09 privileged real-packet click-drive …`) printed after the
-body had recorded only `BLOCKED 09 …`; the wrapper is fixed in the commit that fills this record (a body that records a
-BLOCKED line is no longer auto-passed), so a re-run prints **37 PASS · 0 FAIL · 5 BLOCKED**. The 37 real PASS lines below
-are unchanged in meaning.
+body had recorded only `BLOCKED 09 …`; the wrapper was fixed in the commit that filled this record (a body that records a
+BLOCKED line is no longer auto-passed). **Run 2 (log 10) confirmed it:** its summary line is
+`37 PASS · 0 FAIL · 5 BLOCKED · 4 notes`, `EXIT=0`, with no `PASS 09` line. The 37 real PASS lines below are the same
+assertions in both runs (the ids and scope ids quoted are run 1's).
 
 ## Rule for every task (plan, Matt 2026-10-31)
 
@@ -134,8 +137,10 @@ Per-step shots: `01-01-connect-as-operator-sidebar-l4-reads-.png`, `02-02-ac18-l
 `10-07-ac23-60-s-idle-as-operator-on-the-l4-.png`, `13-08-ac24-agent-url-every-sensitive-l4-con.png`,
 `14-09-privileged-real-packet-click-drive-ca.png`, `19-10-dark-screenshots-theme-pinned-through.png`.
 
-The orchestrator looks at the named shots and records what they show in the plan's Review log; this record lists them
-and claims nothing about their content beyond the DOM assertions above.
+**Screenshots looked at (orchestrator).** 03 L4 focus view (light), operator: the chip bar reads All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON …; under it the Capture section with interface lo0, a direction select at inbound, a greyed Start capture, the BPF reason line, the three config scope rows each ending in `config`, the add-scope form (cidr 127.0.0.1/32, ports placeholder `all ports`, interface lo0, direction inbound, capability capture, Add L4 scope), then the one intercept line with the macOS reason, then the empty flow list and the Request/Response inspector. 17 scope-add confirm dialog (dark): centred dialog titled `Confirm L4 scope add` with the core's prompt (`Confirm l4.scope.add: capture scope for 127.0.0.1/32 ports 9100-9199 on lo0 (inbound), inject refused (rate 0). A runtime entry never lifts the dangerous-destination denylist.`), Cancel and Send to wire buttons; three HTTP rows behind it. 11 agent URL disabled controls (light): the banner `L4 actions (capture, inject, scope, intercept) need the Operator URL.` with a lock icon replaces the operator strip; Start capture greyed with the operator-only line under it; the add-scope form present with its button greyed; the chip bar with L4 pressed and `No flows match`. 16 chip bar with L4 selected (dark): same bar, L4 pressed, zero HTTP rows.
+
+The other named and per-step shots are listed above; this record claims nothing about their content beyond the DOM
+assertions in the table.
 
 ## What this run does not prove (and why)
 

@@ -93,6 +93,8 @@ const SCOPE_FORM = '[data-testid="l4-scope-add-form"]';
 const SCOPE_ADD = '[data-testid="l4-scope-add"]';
 const SCOPE_REFUSAL = '[data-testid="l4-scope-add-refusal"]';
 const SCOPE_ENTRY = '[data-testid="l4-scope-entry"]';
+/** The Agent panel's activity log (`panels/agent/ActivityLog.tsx`): one `[role=row][data-seq]` per invocation; cells time · origin · command · args · result, the result cell `data-result="ok"|"error"`. */
+const ACTIVITY_LOG = 'section[aria-label="Activity log"]';
 const SCOPE_PORTS = 'input[aria-label="Scope ports"]';
 const BANNER_SEL = '[data-testid="l4-operator-only-banner"]';
 const DIALOG = '[role=alertdialog][aria-label="Confirm L4 action over the wire"]';
@@ -115,8 +117,17 @@ const note = (step, detail) => record('NOTE', step, detail);
 /** An honest blocked verdict: `why` is `needs D0` or `no Linux rig`; `reason` is the core's text, quoted. */
 const blocked = (step, why, reason) => record('BLOCKED', step, `blocked: ${why} — core reason: "${reason}"`);
 const expect = (cond, okMsg, detail) => (cond ? pass(okMsg, detail) : fail(okMsg, detail));
-/** The `#t=<token>` fragment of a UI URL, redacted; never print a UI URL any other way. */
-const redact = (url) => String(url ?? '').replace(/#t=[^&\s]*/, '#t=<redacted>');
+/**
+ * Every `#t=<token>` fragment in `text` (a stack or a log line can carry both UI URLs), and the
+ * per-run bus tokens themselves wherever they appear (a `connectBus` error quotes what it sent),
+ * redacted; never print a UI URL or an error any other way. `env` is read at call time (it is
+ * assigned by `startAitm` below, before the first line that could carry a token is printed).
+ */
+const redact = (text) => {
+  let out = String(text ?? '').replace(/#t=[^&\s]*/g, '#t=<redacted>');
+  for (const secret of [env?.operatorToken, env?.token]) if (secret) out = out.split(secret).join('<redacted>');
+  return out;
+};
 const log = (m) => console.log(m);
 
 // ------------------------------------------------------------------------------------------
@@ -160,16 +171,18 @@ let target, env, bus, cdp, d;
 let toolDefs = [];
 
 /**
- * Runs one step. A body that recorded nothing but notes passes as a whole; a body that recorded any
- * PASS / FAIL / BLOCKED line is its own recorder (a step whose only line is `blocked: needs D0` is
- * blocked, not passed). A thrown error fails the step. Ends with a screenshot.
+ * Runs one step. Every body is its own recorder: its PASS / FAIL / BLOCKED / NOTE lines are the
+ * step's verdict, and the wrapper never adds a PASS. A body that recorded nothing at all prints
+ * `NOTE <step> — no assertion ran` (a silent bail is never proven); a body that recorded only notes
+ * (an "n/a on this core" branch) stays at its notes. A thrown error fails the step. Ends with a
+ * screenshot.
  */
 async function step(name, body) {
   log(`\n== ${name}`);
   const before = results.length;
   try {
     await body();
-    if (!results.slice(before).some((r) => r.status === 'PASS' || r.status === 'FAIL' || r.status === 'BLOCKED')) pass(name);
+    if (results.length === before) note(name, 'no assertion ran');
   } catch (e) {
     fail(name, redact(e.message.split('\n')[0]));
   } finally {
@@ -361,7 +374,8 @@ try {
     intAvail = availability(st.value);
     log(`  intercept availability: ${JSON.stringify(intAvail)}`);
     if (intAvail.available) {
-      note('04 intercept available on this core', 'the limited line is not expected; Forward/Mutate/Drop/Revert need a parked packet (step 09 / Linux)');
+      // Not a PASS: nothing about the bar is asserted on this branch (the verdicts need a parked packet).
+      note('04b-04d intercept available on this core', `code=${intAvail.code}; the limited line is not expected; Forward/Mutate/Drop/Revert need a parked packet (step 09 / Linux)`);
       return;
     }
     const line = await waitFor(async () => {
@@ -405,7 +419,10 @@ try {
       return p.length === 1 && p[0] === 'TCP' ? p : null;
     }, { timeoutMs: 4000, what: '⌘5 → TCP chip pressed' }).catch(() => pressedChips());
     expect(JSON.stringify(pressed) === JSON.stringify(['TCP']), '05e ⌘5 selects the TCP chip', `pressed=${JSON.stringify(pressed)}`);
-    blocked('05f L4 rows under the TCP / UDP / L4 chips', 'needs D0', capAvail.reason ?? '(capture available; no L4 row was captured in this run)');
+    if (privileged) {
+      // Not privilege: ordering. No capture has run yet, so there is no L4 row to find under a chip here.
+      note('05f L4 rows under the TCP / UDP / L4 chips', `capture available on this core (code=${capAvail.code}); no capture has run yet — L4 rows are asserted in step 09 after a capture`);
+    } else blocked('05f L4 rows under the TCP / UDP / L4 chips', 'needs D0', capAvail.reason);
     await clickChip('All');
   });
 
@@ -494,6 +511,19 @@ try {
     expect(l4.length <= IDLE_BUDGET, `07a ≤ ${IDLE_BUDGET} l4.* calls from the UI connection in ${IDLE_WINDOW_MS / 1000} s`, `count=${l4.length}; histogram=${JSON.stringify(histogram(l4))}`);
     expect(errors.length === 0, '07b no l4.* entry with an error result (no L4 polling error lines)', errors.length ? JSON.stringify(errors.slice(0, 5)) : 'all ok');
     expect(conns.length <= 1, '07c every l4.* entry in the window came from one connection', `connection_ids=${JSON.stringify(conns)}`);
+    // AC23's first clause is about the UI's own activity log, not only the core's audit ring: open
+    // the Agent panel and read its rows — no `l4.*` row may carry the error result.
+    await d.click({ role: 'button', text: 'Agent', match: 'startsWith', within: SIDEBAR });
+    await d.locate({ sel: ACTIVITY_LOG });
+    const uiLog = await d.ev(`(() => {
+      const rows = [...document.querySelectorAll(${JSON.stringify(`${ACTIVITY_LOG} [role=row][data-seq]`)})];
+      const l4 = rows
+        .map((r) => ({ command: (r.querySelectorAll('[role=cell]')[2]?.textContent ?? '').trim(), error: !!r.querySelector('[role=cell][data-result="error"]') }))
+        .filter((r) => r.command.startsWith('l4.'));
+      return { rows: rows.length, l4: l4.length, errors: l4.filter((r) => r.error).map((r) => r.command) };
+    })()`);
+    expect(uiLog.errors.length === 0, '07d the UI activity log (Agent panel) has no l4.* entry marked error', `rows=${uiLog.rows}; l4 rows=${uiLog.l4}; error rows=${JSON.stringify(uiLog.errors)}`);
+    await focusL4();
     note('07 console', `${cdp.consoleErrors.length - consoleBefore} new browser console error(s) during the window`);
   });
 
