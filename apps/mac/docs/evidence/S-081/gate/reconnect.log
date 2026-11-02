@@ -1,0 +1,13 @@
+reconnect-live: build: bundle /tmp/Aitmproxy-dev-il-rc.app (core from CORE_DIR=/Applications/Aitmproxy.app/Contents/Resources/core)
+reconnect-live: launch: app pid 46447; embedded core pid 46504; bus: connected after 2.5 s
+reconnect-live: reconnect-bus: bus: connected after 1.1 s (labels: Bus: connected — operator · 127.0.0.1:49410)
+reconnect-live: reconnect-bus: Pause Proxy → proxy.status.capturing=false in 0.0 s; Resume Proxy → capturing=true in 0.1 s
+reconnect-live: reconnect-bus: child pid unchanged (46504)
+reconnect-live: restart-core: new core pid 46617 after 1.0 s
+reconnect-live: restart-core: bus: connected after 1.1 s (labels: Bus: connected — operator · 127.0.0.1:49444)
+reconnect-live: restart-core: Pause Proxy → proxy.status.capturing=false in 0.1 s; Resume Proxy → capturing=true in 0.1 s
+reconnect-live: crash-respawn: bus failed seen 0.6 s after kill -KILL 46617
+reconnect-live: crash-respawn: bus: connected after 1.3 s (labels: Bus: connected — operator · 127.0.0.1:49459)
+reconnect-live: crash-respawn: Pause Proxy → proxy.status.capturing=false in 0.0 s; Resume Proxy → capturing=true in 0.0 s
+reconnect-live: teardown: app did not leave cleanly within 15 s of the app menu's Quit click (or a core remained); killed and reaped by the bundle path
+RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn: an operator action through the app succeeded after each)

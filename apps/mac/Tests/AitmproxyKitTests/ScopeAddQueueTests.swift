@@ -11,7 +11,7 @@ import Testing
         queue.begin("api.shop-staging.test")
         #expect(queue.state(of: "api.shop-staging.test") == .sending)
         queue.fail("api.shop-staging.test", error: .disconnected)
-        #expect(queue.state(of: "api.shop-staging.test") == .queued("the bus connection closed"))
+        #expect(queue.state(of: "api.shop-staging.test") == .queued)
         #expect(queue.replayable == ["api.shop-staging.test"])
         #expect(ScopeAddQueue.label(for: queue.state(of: "api.shop-staging.test")!) == "queued — added when the core is back")
     }
@@ -27,6 +27,10 @@ import Testing
         queue.begin("bad host")
         #expect(queue.state(of: "bad host") == .sending)
         #expect(queue.hosts == ["bad host"])
+        // An RPC-level refusal is the core's answer too: failed with its message, not replayed.
+        queue.fail("bad host", error: .rpc(code: -32602, message: "bad args"))
+        #expect(queue.state(of: "bad host") == .failed(BusError.rpc(code: -32602, message: "bad args").description))
+        #expect(queue.replayable.isEmpty)
     }
 
     @Test func onlyTheBusAbsenceIsRetryable() {
@@ -48,5 +52,33 @@ import Testing
         #expect(queue.hosts == ["b.test"])
         queue.drop("b.test")
         #expect(queue.isEmpty)
+    }
+
+    @Test func replayBeginsAQueuedHostAgainWithoutDuplicatingIt() {
+        var queue = ScopeAddQueue()
+        queue.begin("later.test")
+        queue.fail("later.test", error: .disconnected)
+        #expect(queue.replayable == ["later.test"])
+        queue.begin("later.test")
+        #expect(queue.state(of: "later.test") == .sending)
+        #expect(queue.hosts == ["later.test"])
+        #expect(queue.replayable.isEmpty)
+    }
+
+    @Test func unknownHostsAreNoOpsAndANonBusErrorFails() {
+        var queue = ScopeAddQueue()
+        queue.begin("one.test")
+        queue.drop("nope.test")
+        queue.fail("nope.test", error: .disconnected)
+        #expect(queue.hosts == ["one.test"])
+        // ✕ on a sending row, then the send fails: nothing comes back.
+        queue.drop("one.test")
+        queue.fail("one.test", error: .tool(message: "late"))
+        #expect(queue.isEmpty)
+        // An error that is not the bus's (decoding, a thrown String) is a refusal, not a replay.
+        queue.begin("odd.test")
+        queue.fail("odd.test", reason: "unexpected reply", retryable: false)
+        #expect(queue.state(of: "odd.test") == .failed("unexpected reply"))
+        #expect(queue.replayable.isEmpty)
     }
 }

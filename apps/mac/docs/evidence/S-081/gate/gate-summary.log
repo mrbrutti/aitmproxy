@@ -1,0 +1,10 @@
+swift test exit 0
+tools/grid-lint.sh exit 0
+tools/check-connection-words.sh exit 0
+tools/check-capture-operator-only.sh exit 0
+tools/check-capture-toggle.sh exit 0
+snap-dev exit 0
+live-fresh exit 0
+LIVE SELFTEST PASS 98 checks
+reconnect exit 0
+RECONNECT LIVE SELFTEST PASS (reconnect-bus, restart-core, crash-respawn: an operator action through the app succeeded after each)

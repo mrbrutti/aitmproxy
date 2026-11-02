@@ -43,7 +43,7 @@ struct ScopePanel: View {
         return listed + session.scopeAdds.hosts.filter { !session.scopeHosts.contains($0) }.map { ScopeEntry(host: $0) }
     }
 
-    private var trimmed: String { draft.trimmingCharacters(in: .whitespaces) }
+    private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var validation: String? { trimmed.isEmpty ? nil : ScopeEntry.validate(trimmed, existing: session.scopeHosts + session.scopeAdds.hosts) }
     private var canAdd: Bool { !trimmed.isEmpty && validation == nil }
 
@@ -175,6 +175,9 @@ struct ScopePanel: View {
         // An add in flight carries its state where the limit columns would be (S-081).
         let stateLine = addState.map(ScopeAddQueue.label(for:))
         let failed: Bool = if case .failed = addState { true } else { false }
+        // ✕ while the send is in flight would forget the row but not the send: the host would come
+        // back as a listed entry within a poll. It is enabled again as soon as the core has answered.
+        let sending = addState == .sending
         return Button {
             selected = entry.host
             tableFocused = true
@@ -212,7 +215,8 @@ struct ScopePanel: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PressStyle())
-                .help("Remove from Scope")
+                .disabled(sending)
+                .help(sending ? "Sending to the core…" : "Remove from Scope")
                 .accessibilityLabel("Remove \(entry.host) from Scope")
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))

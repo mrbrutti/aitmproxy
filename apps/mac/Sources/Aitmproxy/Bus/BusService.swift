@@ -48,6 +48,7 @@ final class BusService: FlowActions {
     func awaitEmbeddedEndpoint() {
         preferEmbedded = true
         endpointOverride = nil
+        forgetQueuedScopeAdds()
         start()
     }
 
@@ -64,7 +65,15 @@ final class BusService: FlowActions {
     func useExternalEndpoint() {
         preferEmbedded = false
         endpointOverride = nil
+        forgetQueuedScopeAdds()
         start()
+    }
+
+    /// A Scope add queued while one core was away must not land on another: the two
+    /// Settings ▸ Bus switches drop the queue, a restart of the same core (`useEmbeddedEndpoint`
+    /// from `.ready`) keeps it for replay (S-081).
+    private func forgetQueuedScopeAdds() {
+        session.scopeAdds = ScopeAddQueue()
     }
 
     // MARK: Lifecycle

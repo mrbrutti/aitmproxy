@@ -13,15 +13,14 @@ public struct ScopeAddQueue: Hashable, Sendable {
     public enum State: Hashable, Sendable {
         case sending
         /// The bus was not there; replayed when it is (`replayable`).
-        case queued(String)
+        case queued
         /// The core refused it; not replayed, Retry re-sends.
         case failed(String)
     }
 
-    public struct Entry: Hashable, Sendable, Identifiable {
+    public struct Entry: Hashable, Sendable {
         public var host: String
         public var state: State
-        public var id: String { host }
     }
 
     public private(set) var entries: [Entry] = []
@@ -50,7 +49,7 @@ public struct ScopeAddQueue: Hashable, Sendable {
     /// (`queued`); anything the core said means it will not land as typed (`failed`).
     public mutating func fail(_ host: String, reason: String, retryable: Bool) {
         guard let index = entries.firstIndex(where: { $0.host == host }) else { return }
-        entries[index].state = retryable ? .queued(reason) : .failed(reason)
+        entries[index].state = retryable ? .queued : .failed(reason)
     }
 
     public mutating func fail(_ host: String, error: BusError) {

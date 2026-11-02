@@ -118,11 +118,16 @@ extension Session {
         Task { [self] in
             do {
                 try await actions.addScope(host)
-                scopeAdds.confirm(listed: scopeHosts)
+                // The core took it: the in-flight entry is done even if the core stored a
+                // normalised form that `scope.list` (and `confirm`) would never match.
+                scopeAdds.drop(host)
                 lastError = nil
             } catch {
-                let retryable = (error as? BusError).map(ScopeAddQueue.isRetryable) ?? false
-                scopeAdds.fail(host, reason: BusService.describe(error), retryable: retryable)
+                if let bus = error as? BusError {
+                    scopeAdds.fail(host, error: bus)
+                } else {
+                    scopeAdds.fail(host, reason: BusService.describe(error), retryable: false)
+                }
                 lastError = "add to scope: \(BusService.describe(error))"
             }
         }
