@@ -5,3 +5,6 @@
 //! (Task 5) are macOS-only.
 
 pub(crate) mod bundle_path;
+
+#[cfg(target_os = "macos")]
+pub(crate) mod ffi;
