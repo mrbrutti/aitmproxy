@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Read every static text, button title and menu-item title the INSTALLED Aitmproxy app's main
 # window exposes through accessibility, one per line. Read-only; no click, no keystroke.
-# Usage: ax_texts.sh            (window 1 of the Aitmproxy process)
+# Usage: ax_texts.sh            (window 1 of the Aitmproxy process; rows are role, title, value,
+#                                 description, and for text fields also identifier, position x,y, size w,h)
 #        ax_texts.sh menu Proxy (the titles of one menu, with enabled state)
 #        ax_texts.sh bounds     (window 1 as `x,y,w,h` for `screencapture -R`)
 set -euo pipefail
@@ -51,6 +52,21 @@ tell application "System Events" to tell process "Aitmproxy"
           set d to description of e as text
         end try
         set rowText to r & "	" & t & "	" & v & "	" & d
+        if r is "AXTextField" then
+          -- three more columns for text fields only: accessibility identifier, position, size
+          -- (the harness clicks a field's centre before typing into it)
+          set ident to ""
+          try
+            set ident to (value of attribute "AXIdentifier" of e) as text
+          end try
+          set p to {0, 0}
+          set z to {0, 0}
+          try
+            set p to position of e
+            set z to size of e
+          end try
+          set rowText to rowText & "	" & ident & "	" & (item 1 of p as text) & "," & (item 2 of p as text) & "	" & (item 1 of z as text) & "," & (item 2 of z as text)
+        end if
         set end of out to rowText
       end if
     end try

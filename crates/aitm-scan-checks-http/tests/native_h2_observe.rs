@@ -92,6 +92,7 @@ fn obs(streams: Vec<StreamOutcome>) -> RawH2Observation {
         streams,
         goaway: None,
         connection_closed: false,
+        peer_silent: false,
         elapsed_ms: 5,
     }
 }
@@ -1622,46 +1623,63 @@ async fn an_empty_observation_is_inconclusive_for_the_malformed_checks() {
     }
 }
 
-/// `h2-rapid-reset-mitigation`'s `firm` verdict is, per SP-3, "a complete
-/// repeated observation: 8 reset pairs, no GOAWAY, no refused stream". The
-/// rule (tester finding of the F3 pass, fixed in F5):
-///
-/// - **fewer than eight outcomes**, or an outcome that is not a reset or an
-///   answer (a `Timeout`), is not that observation and is `Inconclusive`;
-/// - a peer that **closed the connection** on the resets without a GOAWAY,
-///   after at least one pair reached an outcome, has mitigated by the
-///   bluntest means there is, and is `Clean`; a close before any pair was
-///   observed says nothing about resets and is `Inconclusive` (FS-2);
-/// - only eight non-refused resets/answers on a connection that stayed open
-///   are "no reset-rate mitigation observed", at `firm`.
+/// The reset-rate question is answered by how the peer reacts to eight
+/// open/cancel pairs on one connection, and the reaction that means "no
+/// mitigation" is **no reaction**: a correct server discards a cancelled
+/// stream without a word (hyper did exactly that in the live run of
+/// 2026-11-01), so a still-open connection after all eight pairs is the
+/// finding whether the peer stayed silent, answered a few, or reset a few.
+/// Only a GOAWAY, a refused stream or a hang-up is a mitigation.
 #[tokio::test]
-async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
-    // Two pairs answered, then nothing: not eight, so not a complete observation.
+async fn rapid_reset_with_the_connection_open_is_no_mitigation_however_the_peer_reacted() {
+    // Eight pairs, every one reset by the peer, connection open.
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Vulnerable, "{}", v.detail);
+    assert_eq!(v.confidence, Confidence::Firm);
+    assert_eq!(
+        v.detail,
+        "no reset-rate mitigation observed in 8 reset pairs"
+    );
+
+    // Two pairs reset, six without a word, connection open: still no mitigation.
     let runner = FakeRunner::answering(resets(2));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
     let v = run(&check, &h2host()).await;
-    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
-    assert_eq!(v.confidence, Confidence::Tentative);
-    assert_eq!(
-        v.detail,
-        "only 2 of 8 reset pairs reached an outcome before the probe stopped"
-    );
-    assert_eq!(v.evidence.matched, None);
+    assert_eq!(v.outcome, Outcome::Vulnerable, "{}", v.detail);
+    assert_eq!(v.confidence, Confidence::Firm);
 
-    // Eight outcomes, but one of them is a timeout: nothing was observed for
-    // that pair, so the series is not complete either.
-    let mut streams = vec![reset(); 8];
-    streams[3] = StreamOutcome::Timeout;
-    let runner = FakeRunner::answering(obs(streams));
+    // Silence: eight timeouts, the peer still there. The realistic shape, and
+    // the detail says so.
+    let mut o = obs(vec![StreamOutcome::Timeout; 8]);
+    o.peer_silent = true;
+    let runner = FakeRunner::answering(o);
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
     let v = run(&check, &h2host()).await;
-    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(v.outcome, Outcome::Vulnerable, "{}", v.detail);
+    assert_eq!(v.confidence, Confidence::Firm);
     assert_eq!(
         v.detail,
-        "only 7 of 8 reset pairs reached an outcome before the probe stopped"
+        "no reset-rate mitigation observed in 8 reset pairs: the peer neither reset, \
+         refused nor closed, and stayed silent with the connection open"
     );
+    assert_eq!(
+        v.evidence.matched.as_deref(),
+        Some(
+            "no reset-rate mitigation in 8 reset pairs: no GOAWAY, no refused stream, \
+             connection still open"
+        )
+    );
+}
 
-    // Eight pairs, no GOAWAY, but the peer dropped the connection.
+/// A hang-up is the peer's doing and a mitigation of sorts: Clean, with the
+/// detail saying how far the series got. A hang-up before a single pair had
+/// an outcome says nothing about resets at all — the peer may have closed on
+/// the preface, the SETTINGS or the first HEADERS — so it is Inconclusive,
+/// not Clean (final security review FS-2).
+#[tokio::test]
+async fn rapid_reset_reads_a_dropped_connection_as_clean_once_a_pair_was_observed() {
     let mut o = resets(8);
     o.connection_closed = true;
     let runner = FakeRunner::answering(o);
@@ -1673,8 +1691,6 @@ async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
         "the peer closed the connection without a GOAWAY after 8 of 8 reset pairs"
     );
 
-    // A drop part-way through is still the peer's doing: Clean, and the
-    // detail says how far the series got.
     let mut o = resets(3);
     o.connection_closed = true;
     let runner = FakeRunner::answering(o);
@@ -1686,10 +1702,6 @@ async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
         "the peer closed the connection without a GOAWAY after 3 of 8 reset pairs"
     );
 
-    // A drop before a single pair reached an outcome says nothing about
-    // resets at all — the peer may have closed on the preface, the SETTINGS
-    // or the first HEADERS — so it is Inconclusive, not Clean (final
-    // security review FS-2).
     let mut o = resets(0);
     o.connection_closed = true;
     let runner = FakeRunner::answering(o);
@@ -1703,7 +1715,6 @@ async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
     );
     assert_eq!(v.evidence.matched, None);
 
-    // Eight timeouts and a close: still nothing observed, still Inconclusive.
     let mut o = obs(vec![StreamOutcome::Timeout; 8]);
     o.connection_closed = true;
     let runner = FakeRunner::answering(o);
@@ -1714,4 +1725,143 @@ async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
         v.detail,
         "the peer closed before any reset pair was observed"
     );
+}
+
+/// A GOAWAY with an error code while a malformed variant was in flight is the
+/// peer rejecting that variant at the connection level — what hyper does with
+/// a malformed header block (live run 2026-11-01). The variant in flight counts
+/// as rejected, the later ones as not tried, and the verdict is Clean with
+/// both facts in the detail; a GOAWAY(NO_ERROR) is not a rejection.
+/// Only a header-block rejection code (PROTOCOL_ERROR 1, FRAME_SIZE_ERROR 6,
+/// COMPRESSION_ERROR 9) reads as the peer rejecting the variant in flight. A
+/// rate-limit GOAWAY (`ENHANCE_YOUR_CALM`, 11) or an internal error says
+/// nothing about the variant and is Inconclusive naming the code; a graceful
+/// GOAWAY(NO_ERROR) with nothing observed is a plain close (F9, security
+/// review of PR 2a).
+#[tokio::test]
+async fn only_a_header_block_rejection_code_counts_as_a_connection_level_rejection() {
+    for code in [1u32, 6, 9] {
+        let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+        o.goaway = Some((0, code));
+        o.connection_closed = true;
+        let runner = FakeRunner::answering(o);
+        let check = check_named(&runner, "h2-header-crlf-tolerance");
+        let v = run(&check, &h2host()).await;
+        assert_eq!(v.outcome, Outcome::Clean, "code {code}: {}", v.detail);
+        assert!(
+            v.detail.contains(&format!("(GOAWAY error_code={code})")),
+            "code {code}: {}",
+            v.detail
+        );
+    }
+    for code in [2u32, 7, 11, 13] {
+        let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+        o.goaway = Some((0, code));
+        o.connection_closed = true;
+        let runner = FakeRunner::answering(o);
+        let check = check_named(&runner, "h2-header-crlf-tolerance");
+        let v = run(&check, &h2host()).await;
+        assert_eq!(
+            v.outcome,
+            Outcome::Inconclusive,
+            "code {code}: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.starts_with(&format!(
+                "the peer sent GOAWAY(error_code={code}) while variant 0 ("
+            )) && v.detail.ends_with(
+                "which is not a header-block rejection; 2 of 2 variants did not reach an outcome"
+            ),
+            "code {code}: {}",
+            v.detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_variant_rejected_at_the_connection_level_is_clean_and_says_so() {
+    let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+    o.goaway = Some((0, 1));
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-header-crlf-tolerance");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert!(
+        v.detail.starts_with("variant 0 (")
+            && v.detail.contains(
+                ") was rejected at the connection level (GOAWAY error_code=1); 1 later \
+             variant(s) could not be tried on that connection"
+            ),
+        "{}",
+        v.detail
+    );
+
+    // The second variant in flight: the first was reset on its stream.
+    let mut o = obs(vec![reset(), StreamOutcome::Timeout]);
+    o.goaway = Some((1, 1));
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-header-crlf-tolerance");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert!(
+        v.detail.starts_with("variant 1 (") && v.detail.contains("0 later variant(s)"),
+        "{}",
+        v.detail
+    );
+
+    // GOAWAY(NO_ERROR) with nothing observed is a plain close: Inconclusive.
+    let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+    o.goaway = Some((0, 0));
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-header-crlf-tolerance");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(
+        v.detail,
+        "2 of 2 variants did not reach an outcome before the probe stopped"
+    );
+
+    // A silent peer: the detail names the silence rather than a stop.
+    let mut o = obs(vec![StreamOutcome::Timeout; 2]);
+    o.peer_silent = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-header-crlf-tolerance");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(
+        v.detail,
+        "2 of 2 variants were not answered within the read timeout; the peer stayed silent"
+    );
+}
+
+/// `http.version: h1` forces HTTP/1.1 for the job (spec D8.2): none of the
+/// five checks opens an HTTP/2 connection then, and the verdict says why. Found
+/// live (T3-2 cell, 2026-11-01): the h2 checks were the only h2 traffic in a
+/// forced-h1 job.
+#[tokio::test]
+async fn no_h2_check_probes_when_the_profile_forces_h1() {
+    use aitm_scan_model::{HttpVersionPolicy, ProbeHost};
+
+    for id in ALL_IDS {
+        let runner = FakeRunner::answering(resets(8));
+        let check = check_named(&runner, id);
+        let base = h2host();
+        let mut profile = base.profile().clone();
+        profile.http.version = HttpVersionPolicy::H1;
+        let host = base.with_profile(profile);
+
+        let v = run(&check, &host).await;
+
+        assert_eq!(v.outcome, Outcome::Inconclusive, "{id}: {}", v.detail);
+        assert_eq!(
+            v.detail, "skipped: the profile forces http.version h1, so no HTTP/2 probe is sent",
+            "{id}"
+        );
+        assert_eq!(runner.calls(), 0, "{id}: nothing was dialled");
+        assert_eq!(host.sent().len(), 0, "{id}: no baseline either");
+    }
 }

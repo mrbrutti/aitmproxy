@@ -1,0 +1,13 @@
+listen: "127.0.0.1:56193"
+mcp:
+  transport:
+    loopback_tcp:
+      port: 0
+      token: <redacted>
+      endpoint_file: "/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/B91632B3-BFCB-434F-9F44-8B63963209DA/bus.endpoint"
+  operator_token: <redacted>
+browser:
+  proxy_addr: "127.0.0.1:56194"
+  obscura:
+    binary: "/tmp/Aitmproxy-dev-t9.app/Contents/Resources/core/obscura"
+    stop_timeout: 2
