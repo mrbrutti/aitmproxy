@@ -285,6 +285,41 @@ public struct L4RowInfo: Hashable, Sendable {
     }
 }
 
+// MARK: - L4 rows offer no HTTP verbs (L4PAR-AC29; spec §7(d))
+
+/// The one rule that keeps an HTTP verb from ever being sent with an L4 id: on a
+/// `kind == .l4` row, every verb that would reach `flow.mark`, `flow.comment`,
+/// `flow.replay`, `poc.build` or the HTTP intercept path is off, with one reason the
+/// surfaces show. Pure over `VerbTable`'s items, so `Session+Verbs.swift` maps the
+/// table through it and a Kit unit pins the decision without a bus. L4 packets are
+/// parked and resumed through the `l4.intercept.*` verdicts, not these verbs.
+public enum L4RowVerbs {
+    /// The reason every gated item carries.
+    public static let disabledReason = "Not available for L4 flows"
+
+    /// `item` as an L4 row may offer it: unchanged on a non-L4 row and for the host
+    /// verbs (Pin Host, Copy URL, Quick Look); otherwise disabled with `disabledReason`.
+    public static func gate(_ item: VerbItem, row: FlowRow) -> VerbItem {
+        guard row.kind == .l4, isHTTPOnly(item.verb) else { return item }
+        var gated = item
+        gated.enabled = false
+        gated.disabledReason = disabledReason
+        return gated
+    }
+
+    /// The verbs an L4 row never offers, matched on the table key so every mark
+    /// colour shares `Mark`'s fate.
+    static func isHTTPOnly(_ verb: FlowVerb) -> Bool {
+        switch verb.tableKey {
+        case .resume, .edit, .kill, .delete, .replay, .editAndReplay, .buildPoC,
+             .resumeSelected, .killSelected, .comment, .mark:
+            true
+        case .pinHost, .copyURL, .quickLook:
+            false
+        }
+    }
+}
+
 // MARK: - Scope-as-authorization (AC9/AC10: dim + disable out-of-scope mutations)
 
 /// A mutating L4 action the UI disables for an out-of-L4-scope session. Enforcement
@@ -422,23 +457,6 @@ public enum L4Availability: Hashable, Sendable {
     public var reason: String? {
         if case let .degraded(reason) = self { return reason }
         return nil
-    }
-
-    // Kept for Session.swift / L4Inspector.swift until M4a rewires them to
-    // `resolve(status:error:)`; M4a deletes both members.
-    public static let embeddedReason =
-        "Raw L4 capture and injection need a privileged core. This app's embedded core runs as "
-        + "you and cannot open raw sockets, /dev/bpf or NFQUEUE. A macOS Network/System Extension "
-        + "(Phase 2) will provide the local capture path; until then, point the app at a privileged "
-        + "core (Linux, elevated, or remote) over the bus to drive L4."
-
-    // Kept for Session.swift until M4a; M4a deletes it.
-    public static func resolve(embeddedCore: Bool, wireError: String?) -> L4Availability {
-        if embeddedCore { return .degraded(reason: embeddedReason) }
-        if let wireError, wireError.lowercased().contains("l4 unavailable") {
-            return .degraded(reason: wireError)
-        }
-        return .available
     }
 }
 

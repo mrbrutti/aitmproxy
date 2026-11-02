@@ -604,3 +604,70 @@ import Testing
         #expect(!L4Wire.supportsWindow([list]))
     }
 }
+
+// MARK: - L4 rows offer no HTTP verbs (L4PAR-AC29; spec §7(d))
+
+@Suite struct L4RowVerbTests {
+    /// The verbs an L4 row must never offer: everything that would send an HTTP
+    /// verb (`flow.mark`, `flow.comment`, `flow.replay`, `poc.build`, the intercept
+    /// and bulk verbs) with an L4 id. Pin host, Copy URL and Quick Look stay.
+    static let gatedKeys: [FlowVerb] = [
+        .mark(nil), .comment, .replay, .buildPoC, .resume, .edit, .kill, .delete, .editAndReplay,
+        .resumeSelected, .killSelected,
+    ]
+
+    /// AC29 (Kit): the context-action model for an in-scope L4 row has no enabled
+    /// mark, comment, replay or PoC; the host verbs are untouched; a concrete
+    /// `.mark(.red)` item is gated through its table key; an HTTP row is unchanged.
+    @Test func testL4RowOffersNoHTTPVerbs() {
+        let flow = L4Flow(
+            id: FlowID("l4-1"), sessionState: .capture, interface: "lo0", packetCount: 2, injectedCount: 0,
+            packets: [])
+        let row = flow.row(seq: 1, inScope: true)
+        #expect(row.kind == .l4)
+
+        let original = VerbTable.items(for: VerbContext(row: row))
+        let gated = original.map { L4RowVerbs.gate($0, row: row) }
+        #expect(gated.count == original.count)
+        #expect(gated.count == 14)
+
+        for key in Self.gatedKeys {
+            let item = VerbTable.item(key, in: gated)
+            #expect(!item.enabled, "\(key) must be disabled on an L4 row")
+            #expect(item.disabledReason == "Not available for L4 flows", "\(key) carries the L4 reason")
+        }
+        // Before the gate the in-scope capture row had these on, so the gate is what turned them off.
+        #expect(VerbTable.item(.mark(nil), in: original).enabled)
+        #expect(VerbTable.item(.comment, in: original).enabled)
+        #expect(VerbTable.item(.replay, in: original).enabled)
+        #expect(VerbTable.item(.buildPoC, in: original).enabled)
+        #expect(VerbTable.item(.delete, in: original).enabled)
+
+        // The host verbs come back byte-for-byte as the table built them.
+        for key in [FlowVerb.pinHost, .copyURL, .quickLook] {
+            #expect(VerbTable.item(key, in: gated) == VerbTable.item(key, in: original), "\(key) unchanged")
+        }
+        #expect(VerbTable.item(.pinHost, in: gated).enabled)
+        #expect(VerbTable.item(.copyURL, in: gated).enabled)
+        #expect(VerbTable.item(.quickLook, in: gated).enabled)
+
+        // A concrete colour mark is gated through its table key (`.mark(nil)`), not by equality.
+        let red = VerbItem(verb: .mark(.red), title: "Mark", enabled: true, group: .annotate)
+        let gatedRed = L4RowVerbs.gate(red, row: row)
+        #expect(gatedRed.verb == .mark(.red))
+        #expect(gatedRed.title == "Mark")
+        #expect(!gatedRed.enabled)
+        #expect(gatedRed.disabledReason == "Not available for L4 flows")
+
+        // An HTTP row passes through untouched, item for item.
+        let http = FlowRow(
+            id: FlowID("h-1"), seq: 2, kind: .http, method: .post, scheme: "https",
+            authority: "api.example.test", path: "/login", status: 200, state: .complete)
+        let httpOriginal = VerbTable.items(for: VerbContext(row: http))
+        let httpGated = httpOriginal.map { L4RowVerbs.gate($0, row: http) }
+        #expect(httpGated == httpOriginal)
+        #expect(VerbTable.item(.mark(nil), in: httpGated).enabled)
+        #expect(VerbTable.item(.replay, in: httpGated).enabled)
+        #expect(L4RowVerbs.gate(red, row: http) == red)
+    }
+}
