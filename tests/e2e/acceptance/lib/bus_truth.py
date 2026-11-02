@@ -15,28 +15,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import subprocess
 import sys
 
 E2E = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, E2E)
 from aitm_e2e.bus import BusClient, ToolError  # noqa: E402
-
-APP_CORE = "/Applications/Aitmproxy.app/Contents/Resources/core/aitm"
-DATA = os.path.expanduser("~/Library/Application Support/aitmproxy")
+from aitm_e2e.installed import DATA_DIR as DATA, find_embedded_core  # noqa: E402
 
 
 def embedded_config() -> str:
-    out = subprocess.run(["pgrep", "-fl", APP_CORE], capture_output=True, text=True).stdout
-    hits = re.findall(r"^\d+ /Applications/Aitmproxy\.app/Contents/Resources/core/aitm --config (.+?/config\.yaml)\s*$", out, re.M)
-    if not hits:
+    """The installed app's embedded core config, through the shared finder (own cmdline, anchored
+    to /Applications; a dev bundle never matches; two installed cores = refuse)."""
+    try:
+        core = find_embedded_core()
+    except RuntimeError as e:
+        print(f"[SKIP] {e}", flush=True)
+        sys.exit(77)
+    if core is None:
         print("[SKIP] the installed app's embedded core is not running", flush=True)
         sys.exit(77)
-    if len(hits) > 1:
-        print(f"[SKIP] {len(hits)} installed-bundle cores running; refusing to pick one", flush=True)
-        sys.exit(77)
-    return hits[0]
+    return core.config_path
 
 
 def read_config(path: str) -> tuple[str, str]:
