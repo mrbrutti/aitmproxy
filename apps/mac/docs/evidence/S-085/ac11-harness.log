@@ -1,0 +1,8 @@
+after Cancel: jobs ['scan-ac5a0fcc', 'scan-3bb76a3b', 'scan-4a0d4629']
+after confirm: jobs [('scan-75753bf2', 'running'), ('scan-ac5a0fcc', 'cancelled'), ('scan-3bb76a3b', 'done'), ('scan-4a0d4629', 'done')]
+activity-before scan.start rows: 3
+activity-after-sheet scan.start rows: 3
+activity-after-cancel scan.start rows: 3
+activity-after-confirm scan.start rows: 4
+newest scan.start row keys: ['args', 'at', 'client_label', 'command', 'connection_id', 'origin', 'result']
+newest scan.start row (args trimmed): {"args": [false, false], "at": 1793547961184, "client_label": "aitm-mac", "command": "scan.start", "connection_id": "conn_42fec84ddfacf35a-1", "origin": "operator", "result": "ok"}

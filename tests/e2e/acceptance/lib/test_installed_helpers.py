@@ -19,6 +19,7 @@ import time
 E2E = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, E2E)
 from aitm_e2e.installed import (  # noqa: E402
+    field_center,
     SERVICES,
     TOOLING,
     StepWriter,
@@ -376,6 +377,27 @@ def test_config_scope_entries() -> None:
         check(config_scope_entries(os.path.join(d, "absent.yaml")) == [], "no config -> []")
 
 
+def test_field_center() -> None:
+    print("field_center")
+    dump = "\n".join([
+        "AXStaticText\t\tEdit Scope\ttext",
+        "AXTextField\t\t\ttext field\tsidebar-filter\t10,20\t100,20",
+        "AXTextField\t\t\tHost to add to scope\t\t300,400\t200,24",
+        "AXButton\t\t\tbutton",
+        "AXTextField\t\t\tHost to add to scope\tscope-add-host\t500,600\t200,24",
+        "AXTextField\t\t\tHost to add to scope\t\t0,0\t0,0",
+    ])
+    check(field_center(dump, "Host to add to scope", "scope-add-host") == (600, 612), "the identifier row wins over an earlier description match")
+    check(field_center(dump, "Host to add to scope", "no-such-id") == (400, 412), "falls back to the first description match with a real size")
+    check(field_center(dump, "Host to add to scope") == (400, 412), "no identifier asked: first description match")
+    check(field_center(dump, "nothing like it") is None, "unknown description -> None")
+    check(field_center("AXTextField\t\t\tHost to add to scope", "Host to add to scope") is None, "a row without position/size columns (older dump) -> None")
+    check(field_center("AXTextField\t\t\tHost to add to scope\t\t0,0\t0,0", "Host to add to scope") is None, "the only match has zero size -> None (never a click at 0,0)")
+    check(field_center("AXTextField\t\t\tHost to add to scope\t\t300.5,400.0\t200.0,24.0", "Host to add to scope") == (400, 412), "float coordinates are accepted")
+    check(field_center("AXTextField\t\t\tHost to add to scope\t\tabc,1\t200,24", "Host to add to scope") is None, "a garbage position -> None")
+    check(field_center("AXTextField\t\t\tsome other field\tscope-add-host\t500,600\t200,24", "Host to add to scope", "scope-add-host") is None, "the identifier on a field with another description does not win")
+
+
 def test_tooling_mentioned() -> None:
     print("tooling_mentioned")
     check(tooling_mentioned("*.anthropic.com, api.anthropic.com, claude.ai") is True, "the recommended list -> True")
@@ -418,6 +440,7 @@ def main() -> int:
     test_report_verdict()
     test_exit_on_term()
     test_config_scope_entries()
+    test_field_center()
     test_tooling_mentioned()
     test_read_core_config_oserror()
     print()

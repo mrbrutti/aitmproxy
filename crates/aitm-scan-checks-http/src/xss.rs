@@ -86,6 +86,9 @@ impl XssReflected {
                     InsertionKind::XmlValue,
                     InsertionKind::MultipartValue,
                     InsertionKind::Header,
+                    // A cookie value printed into the page (the seeded `/prefs`
+                    // theme, AC T2-3; T2's live run, 2026-11-01).
+                    InsertionKind::Cookie,
                     InsertionKind::PathSegment,
                     InsertionKind::ParamNameQuery,
                 ],

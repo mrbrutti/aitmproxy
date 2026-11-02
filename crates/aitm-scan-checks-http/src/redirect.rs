@@ -95,7 +95,7 @@ impl OpenRedirect {
                 targets_session: false,
                 scope: aitm_scan_model::CheckScope::Point,
                 cwe: Some(601),
-                description: "Sets the point to a non-resolving canary host in three forms \
+                description: "Sets the point to a non-resolving canary host in six forms \
                               (absolute, scheme-relative and backslash) and reports when the \
                               target answers with a 3xx whose Location authority is the canary."
                     .to_string(),
@@ -112,8 +112,8 @@ impl OpenRedirect {
     }
 }
 
-/// The three canary forms, in the order they are tried.
-fn canary_forms() -> [&'static str; 3] {
+/// The six canary forms, in the order they are tried.
+fn canary_forms() -> [&'static str; 6] {
     [
         // Absolute: the plain case, and the one a correct filter catches.
         REDIRECT_CANARY,
@@ -123,6 +123,13 @@ fn canary_forms() -> [&'static str; 3] {
         // Backslash: browsers normalise `\` to `/` in the authority, so this
         // behaves as the scheme-relative form while reading as a local path.
         r"/\aitm-redirect.invalid/",
+        // A control byte between two slashes: a filter that refuses `//` but
+        // strips tabs, carriage returns or newlines afterwards (or a browser
+        // that does) is left with the scheme-relative form. The seeded
+        // Patched route had exactly this gap (T10 PR #245, 2026-11-01).
+        "/\t/aitm-redirect.invalid/",
+        "/\r/aitm-redirect.invalid/",
+        "/\n\\aitm-redirect.invalid/",
     ]
 }
 
@@ -243,7 +250,9 @@ mod tests {
     use super::{canary_forms, location_host, CANARY_HOST, LOCATION_CANARY_REGEX, REDIRECT_CANARY};
 
     /// Every form must name the canary and nothing else; a probe that named a
-    /// real host would be a request to a third party.
+    /// real host would be a request to a third party. The control-byte forms
+    /// name it once a server (or a browser) strips the byte, which is the
+    /// `Location` the check then reads.
     #[test]
     fn every_canary_form_resolves_to_the_reserved_host() {
         assert_eq!(REDIRECT_CANARY, "https://aitm-redirect.invalid/");
@@ -252,10 +261,15 @@ mod tests {
             "the canary must stay under the RFC 2606 reserved TLD"
         );
         for form in canary_forms() {
+            let as_served = form.replace(['\t', '\r', '\n'], "");
             assert_eq!(
-                location_host(form).as_deref(),
+                location_host(&as_served).as_deref(),
                 Some(CANARY_HOST),
-                "form {form} did not resolve to the canary"
+                "form {form:?} did not resolve to the canary"
+            );
+            assert!(
+                !form.contains("example") && form.contains("aitm-redirect.invalid"),
+                "form {form:?} names a host other than the canary"
             );
         }
     }
