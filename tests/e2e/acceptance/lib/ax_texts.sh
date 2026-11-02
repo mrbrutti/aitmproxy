@@ -3,9 +3,14 @@
 # window exposes through accessibility, one per line. Read-only; no click, no keystroke.
 # Usage: ax_texts.sh            (window 1 of the Aitmproxy process)
 #        ax_texts.sh menu Proxy (the titles of one menu, with enabled state)
+#        ax_texts.sh bounds     (window 1 as `x,y,w,h` for `screencapture -R`)
 set -euo pipefail
 pgrep -f '^/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy' >/dev/null || { echo "refused: the installed Aitmproxy is not running" >&2; exit 3; }
 [ "$(pgrep -f 'Aitmproxy.app/Contents/MacOS/Aitmproxy' | wc -l | tr -d ' ')" = 1 ] || { echo "refused: more than one Aitmproxy process (a dev bundle is running)" >&2; exit 3; }
+if [ "${1:-}" = bounds ]; then
+  osascript -e 'tell application "System Events" to tell process "Aitmproxy" to get {position, size} of window 1' | tr -d ' '
+  exit 0
+fi
 if [ "${1:-}" = menu ]; then
   osascript - "$2" <<'APPLESCRIPT'
 on run argv
