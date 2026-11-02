@@ -171,6 +171,8 @@ final class BusService: FlowActions {
             // No connection means no fact: the CA row and step must not keep a stale store's word,
             // nor the last change's latch and error.
             session.forgetCATrust()
+            // Likewise the system-proxy facts: the route and the menu title must not keep a gone core's word.
+            session.forgetSystemProxy()
         }
         var tick = 0
         while !Task.isCancelled && owns() {
@@ -281,6 +283,14 @@ final class BusService: FlowActions {
         // notifies even when the value is equal, and every route surface reads it.
         let decrypt = status["decrypt"].flatMap(DecryptStatus.init)
         if session.decrypt != decrypt { session.decrypt = decrypt }
+        // `system_proxy` (system-proxy spec D6, D13 "Facts in"): the verb's compact object, read against the
+        // address the summary compares the services with; the endpoint half follows it (nil = unknown,
+        // never off). Absent on an older core → nil, which the route model reads as "no verb on this bus".
+        if let facts = status["system_proxy"].flatMap({ SystemProxyFacts(compact: $0, listenAddress: session.effectiveListenAddress) }) {
+            session.applySystemProxyFacts(facts)
+        } else if session.systemProxyFacts != nil {
+            session.forgetSystemProxy()
+        }
     }
 
     // MARK: FlowActions

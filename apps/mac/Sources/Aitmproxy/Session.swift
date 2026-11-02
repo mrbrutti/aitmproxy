@@ -192,10 +192,12 @@ final class Session {
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
     var scopeHosts: [String] = []
-    /// The macOS system proxy as the core reports it. nil = unknown (never rendered as off); written by
-    /// the system-proxy session's PR4 from `proxy.status.system_proxy` and the `proxy.system.set`/`unset`
-    /// replies — nothing in this app writes it until then (traffic-route spec D6, plan call 4).
-    var systemProxy: SystemProxyState?
+    /// The macOS system proxy's endpoint half as the core reports it: the facts' `state`, one source
+    /// (`BusService.refreshProxyStatus()` and the set/unset replies write the facts; Session+SystemProxy.swift).
+    /// nil = unknown (never rendered as off): no facts, or a verb word that names no endpoint
+    /// (traffic-route spec D6, plan call 4). `ConnectionSummary.make` keeps a separate `systemProxy:`
+    /// parameter for a CFNetwork read this app does not make.
+    var systemProxy: SystemProxyState? { systemProxyFacts?.state }
     /// `proxy.status.decrypt` as last polled (traffic-route spec D6): how many hosts Scope decrypts and the
     /// core's own empty-Scope sentence. nil until the first live read or on an older core; `make` ignores
     /// it while the bus lane is not `.ok`, so no reset on disconnect is needed.
@@ -247,6 +249,16 @@ final class Session {
     var caTrustLastError: CATrustFailure?
     /// The first-run sheet (Shell/SetupSheet.swift) is up.
     var setupSheetVisible = false
+
+    // MARK: System proxy (spec 2026-10-31-system-proxy-automation §D13; the actions live in Session+SystemProxy.swift)
+
+    /// The verb's compact object from the last `proxy.status`, or the last full `proxy.system.status` /
+    /// set / unset reply (the same keys plus `guidance` and `remedy`). nil until read and while the bus
+    /// is down (`forgetSystemProxy`); `systemProxy` is its endpoint half.
+    var systemProxyFacts: SystemProxyFacts?
+    /// A `proxy.system.set` / `unset` call is in flight from THIS app. The facts' `setting` is another
+    /// client's change; `systemProxyControlLive` closes the controls for either.
+    var systemProxySetting = false
 
     init() {
         pins = Pins.load(from: pinsURL)
