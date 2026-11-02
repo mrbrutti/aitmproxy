@@ -28,7 +28,9 @@ use std::time::Duration;
 use aitm::config_file::Settings;
 use aitm::macos_capture::feeder;
 use aitm::macos_capture::peer_auth::CodeSignatureVerifier;
-use aitm::render::render_cli_value;
+use aitm::oneshot::{self, args::BusArgs, run::OneShotError};
+use aitm::operator_bus;
+use aitm::operator_token::{self, Minted};
 use aitm::scripts::LateHandles;
 use aitm::startup::card::{ModeWord, ReadyInputs};
 use aitm::startup::errors::{exit_with, report_for, StartupError};
@@ -39,11 +41,13 @@ use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{
     assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
 };
-use aitm::{audit_log, config_file, env, operator_token, tui};
+use aitm::{audit_log, config_file, env, tui};
+use aitm_cli::{Confirmer, TtyConfirmer};
 use aitm_core::{
     engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin, NOTHING_DECRYPTED_ADVICE,
 };
 use aitm_findings::FindingsPlugin;
+use aitm_mcp::pointer::{self, PointerContext};
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_plugin_scanner::jobs::ScanServices;
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
@@ -239,6 +243,8 @@ struct Invocation {
     config_arg: Option<PathBuf>,
     script_args: Vec<PathBuf>,
     bus_endpoint_file: Option<PathBuf>,
+    /// The one-shot's own flags (R14 spec D7), split off before the mode.
+    bus_args: BusArgs,
     web_args: Option<WebArgs>,
     mode: Mode,
     /// The global terminal flags (`-v`, `-vv`, `-q`, `--color`), split off
@@ -266,6 +272,10 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     let (config_arg, argv) = split_config_arg(argv)?;
     let (script_args, argv) = split_script_args(argv)?;
     let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
+    let (bus_args, argv) = match oneshot::args::split_bus_args(argv) {
+        Ok(split) => split,
+        Err(text) => exit_with(&ErrorReport::usage(text), None),
+    };
     // `aitm web …` is the server path with the web UI attached; its options
     // are resolved before any config is loaded so `--help` and bad flags are
     // answered immediately.
@@ -290,6 +300,7 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
         config_arg,
         script_args,
         bus_endpoint_file,
+        bus_args,
         web_args,
         mode,
         term,
@@ -393,6 +404,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         config_arg,
         script_args,
         bus_endpoint_file,
+        bus_args,
         web_args,
         mode,
         term,
@@ -461,6 +473,39 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
     // anything for the loopback-TCP bus, so asking for it over stdio is an error.
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
+    // R14 spec D3/D4, serving modes only: a first run mints `mcp.operator_token`
+    // into the config (a failure only turns the operator bus off); the pointer
+    // context is published whatever the mint did, with an absolute config path.
+    let mut mint_failure = None;
+    if manages_system_proxy(&mode) {
+        if cfg.mcp.operator_bus.enabled
+            && cfg.mcp.operator_token.as_deref().is_none_or(str::is_empty)
+        {
+            match operator_token::mint_if_absent(&effective_path, config_path.is_none()) {
+                Minted::Written { path, token } => {
+                    let phase = reporter.phase("creating operator token");
+                    cfg.mcp.operator_token = Some(token.expose().to_string());
+                    phase.done(&format!(
+                        "operator token written · {}",
+                        reporter.display_path(&path)
+                    ));
+                }
+                Minted::Present => {}
+                Minted::Skipped { reason } => {
+                    let what = format!(
+                        "could not write mcp.operator_token to {}",
+                        effective_path.display()
+                    );
+                    reporter.warn(&format!("operator access off: {what} · {reason}"));
+                    mint_failure = Some(what);
+                }
+            }
+        }
+        pointer::publish(PointerContext {
+            config: std::path::absolute(&effective_path).unwrap_or_else(|_| effective_path.clone()),
+            run_dir: pointer::run_dir(&|k| std::env::var(k).ok()),
+        });
+    }
     // The L4 module is opt-in (fail-closed) and carried outside `aitm-core`'s
     // `Config`; `AITM_L4_*` env overrides win over the file (M5-AC17). It rides the
     // binary-owned feature set below; `l4_privilege: None` runs the real startup probe.
@@ -706,6 +751,9 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
         ));
         tier.error_sink
             .bind(Arc::new(Chain::new(s.registry.clone(), s.store.clone())));
+        // ONE confirmer for the local and the live path (R14 plan Q7); the
+        // service `Arc`s are cloned so `s` stays whole for `Inputs.services`.
+        let confirmer: Arc<dyn Confirmer> = Arc::new(TtyConfirmer::from_stdin());
         let cli = aitm_cli::Cli::new(s.registry.clone())
             .with_ssrf_policy(cfg.browser.ssrf.clone())
             .with_poc_dir(cfg.poc.dir.clone())
@@ -714,15 +762,32 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             // The proxy's live egress posture, so `aitm browser confine` flips
             // the connector's real posture (Task 4b).
             .with_egress(s.egress.clone())
-            .with_services(s.store, s.client, s.guard, None);
-        match cli.dispatch(argv) {
-            Ok(value) => {
+            .with_confirmer(confirmer.clone())
+            .with_services(s.store.clone(), s.client.clone(), s.guard.clone(), None);
+        // A local verb runs through `cli`; a live one reaches the running core (D8).
+        match oneshot::run::run(oneshot::run::Inputs {
+            argv,
+            bus_args: &bus_args,
+            cfg: &cfg,
+            effective_path: &effective_path,
+            explicit_config: config_path.is_some(),
+            services: &s,
+            cli,
+            confirmer,
+            reporter: &reporter,
+            log: current_log_path().as_deref(),
+            env: &|k| std::env::var(k).ok(),
+        })
+        .await
+        {
+            Ok(bytes) => {
                 let mut stdout = std::io::stdout().lock();
-                stdout.write_all(&render_cli_value(&value))?;
+                stdout.write_all(&bytes)?;
                 stdout.flush()?;
                 return Ok(());
             }
-            Err(err) => exit_with(
+            Err(OneShotError::Report(report)) => exit_with(&report, Some(&reporter)),
+            Err(OneShotError::Other(err)) => exit_with(
                 &report_for(&err, current_log_path().as_deref()),
                 Some(&reporter),
             ),
@@ -912,6 +977,20 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     };
     // Shared service handles for the frontends and the replay client.
     let services = tui::services(&proxy, &cfg, browser.clone(), tui_log, job_bus.clone());
+    // The operator bus (R14 spec D2): before the ready card and the TUI handover
+    // (a fixed-port conflict is the M2 panel through `report_for`), bound outside
+    // both branches so its drop, which removes the core pointer (D4), is `run()`'s end.
+    let mut operator_bus = operator_bus::start(
+        &cfg,
+        &effective_path,
+        &services,
+        &agent_state,
+        &audit_ring,
+        push_tx.clone(),
+        l4_live_guard.clone().map(self_port_hook),
+        mint_failure,
+    )
+    .await?;
 
     // The scripting tier now reaches exactly the proxy's store, client and
     // guard, and a failed hook's `Event::Error` reaches the chain rather than
@@ -1005,6 +1084,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             // The Web card's `Bus` row is always `ready` (M6); the transport
             // word is the Server card's.
             bus: startup::card::bus_word(&cfg.mcp.transport),
+            operator_bus: operator_bus.word(),
             web_url,
             operator_url,
             ca: ca_trust,
@@ -1042,6 +1122,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
                 on_agent_bound,
             ) => result,
             never = capture_run => match never {},
+            result = operator_bus.finished() => result,
         }
     } else {
         // The bare-`aitm` server path is the dedicated agent entry point, so it
@@ -1163,6 +1244,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             }
             result = web_run => result,
             never = capture_run => match never {},
+            result = operator_bus.finished() => result,
             () = aitm::shutdown_signal() => {
                 info!("shutdown signal received");
                 Ok(())
@@ -1425,6 +1507,7 @@ mod tests {
 
     use aitm_core::McpTransport;
 
+    use aitm::oneshot::args::BusArgs;
     use aitm::wire::{build_proxy_with, Features};
 
     use aitm_ca::exec::Executor;
@@ -2184,6 +2267,7 @@ mod tests {
                 config_arg,
                 script_args,
                 bus_endpoint_file,
+                bus_args,
                 web_args,
                 mode,
                 term,
@@ -2191,6 +2275,7 @@ mod tests {
                 .expect("parses")
                 .expect("something to run");
             assert_eq!(term, TermOpts::default(), "{argv:?}");
+            assert_eq!(bus_args, BusArgs::default(), "{argv:?}");
             assert_eq!(
                 mode,
                 Mode::SysproxyWatchdog {
@@ -2223,6 +2308,24 @@ mod tests {
             TermOpts {
                 verbosity: Verbosity::Quiet,
                 color: ColorChoice::Never,
+            }
+        );
+        assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
+    }
+
+    /// R14 spec D7 (plan Task 13): the one-shot's own flags are split out of
+    /// argv before the mode is classified and ride in the invocation.
+    #[test]
+    fn invocation_carries_bus_args() {
+        let argv = args(&["--bus", "127.0.0.1:1", "--token-file", "t", "scope", "list"]);
+        let invocation = parse_invocation(argv)
+            .expect("parses")
+            .expect("something to run");
+        assert_eq!(
+            invocation.bus_args,
+            BusArgs {
+                bus: Some("127.0.0.1:1".to_string()),
+                token_file: Some(PathBuf::from("t")),
             }
         );
         assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
