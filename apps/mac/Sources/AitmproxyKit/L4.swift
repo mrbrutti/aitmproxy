@@ -382,11 +382,15 @@ public struct L4PendingCall: Hashable, Sendable {
 /// + PacketSummary + count + scope + permit budget), a single-use token the
 /// operator re-issues the identical call with (`_confirm`), and that call itself
 /// when the caller bound it at parse time.
-public struct L4ConfirmRequest: Hashable, Sendable {
+public struct L4ConfirmRequest: Hashable, Sendable, Identifiable {
     public let prompt: String
     public let token: String
     /// The call that produced this prompt, or nil for an unbound parse.
     public let call: L4PendingCall?
+
+    /// A sheet is presented by item: the single-use token the core minted
+    /// identifies the request.
+    public var id: String { token }
 
     public init(prompt: String, token: String, call: L4PendingCall? = nil) {
         self.prompt = prompt
@@ -594,6 +598,46 @@ public enum L4Wire {
     /// An integer epoch-milliseconds value → `Date`; nil for anything else.
     static func date(epochMillis value: JSONValue?) -> Date? {
         value?.doubleValue.map { Date(timeIntervalSince1970: $0 / 1000) }
+    }
+}
+
+// MARK: - Inert packet text (L4PAR-AC40; spec §2.3, Decision 10)
+
+/// The hex/ASCII rows the inspector renders a packet's bytes through. Every byte
+/// outside printable ASCII (0x20–0x7e) renders as `.`, so a captured escape
+/// sequence, newline or DEL can never reach the screen as itself; the rows carry
+/// no line breaks of their own (one `String` per row, each rendered by one `Text`).
+public enum L4Hex {
+    /// The ASCII column: each byte 0x20…0x7e as its character, every other as `.`.
+    public static func asciiColumn(_ bytes: Data) -> String {
+        var out = ""
+        out.reserveCapacity(bytes.count)
+        for b in bytes {
+            out.append((0x20...0x7e).contains(b) ? Character(UnicodeScalar(b)) : ".")
+        }
+        return out
+    }
+
+    /// One row per `width` bytes: an 8-digit lowercase hex offset, two spaces, the
+    /// bytes as two-digit hex separated by one space (the last row padded to the
+    /// full width so the ASCII column lines up), two spaces, the ASCII column.
+    /// No bytes make no rows.
+    public static func rows(_ bytes: Data, width: Int = 16) -> [String] {
+        let width = max(1, width)
+        guard !bytes.isEmpty else { return [] }
+        let all = Array(bytes)
+        var rows: [String] = []
+        rows.reserveCapacity((all.count + width - 1) / width)
+        var offset = 0
+        while offset < all.count {
+            let slice = all[offset..<min(offset + width, all.count)]
+            var hex = slice.map { String(format: "%02x", $0) }.joined(separator: " ")
+            let shortfall = width - slice.count
+            if shortfall > 0 { hex += String(repeating: "   ", count: shortfall) }
+            rows.append(String(format: "%08x", offset) + "  " + hex + "  " + asciiColumn(Data(slice)))
+            offset += width
+        }
+        return rows
     }
 }
 

@@ -743,3 +743,44 @@ import Testing
         #expect(L4RowVerbs.gate(red, row: http) == red)
     }
 }
+
+// MARK: - Inert packet text (L4PAR-AC40; spec §2.3, Decision 10)
+
+@Suite struct L4HexTests {
+    /// The bytes AC40 names: an ANSI escape (`ESC [ A`), a newline, DEL, `~`, `A`.
+    static let probe = Data([0x1b, 0x5b, 0x41, 0x0a, 0x7f, 0x7e, 0x41])
+
+    /// AC40 (mac): the ASCII column maps every byte outside 0x20–0x7e to `.`, so
+    /// the probe renders `.[A..~A`; no row carries any character below 0x20 (no
+    /// line breaks inside a row, no raw escape); 17 bytes make two rows, the
+    /// second at offset `00000010`; no bytes make no rows.
+    @Test func testAsciiColumnIsInert() {
+        #expect(L4Hex.asciiColumn(Self.probe) == ".[A..~A")
+
+        let rows = L4Hex.rows(Self.probe)
+        #expect(rows.count == 1)
+        #expect(rows[0].hasPrefix("00000000"))
+        #expect(rows[0].hasSuffix(".[A..~A"))
+        #expect(rows[0] == "00000000  1b 5b 41 0a 7f 7e 41                             .[A..~A")
+        for row in rows {
+            for scalar in row.unicodeScalars {
+                #expect(scalar.value >= 0x20, "row carries a control character: U+\(String(scalar.value, radix: 16))")
+            }
+        }
+
+        let seventeen = L4Hex.rows(Data(repeating: 0x41, count: 17))
+        #expect(seventeen.count == 2)
+        #expect(seventeen[1].hasPrefix("00000010"))
+        #expect(seventeen[0] == "00000000  41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41  AAAAAAAAAAAAAAAA")
+        #expect(seventeen[1] == "00000010  41                                               A")
+
+        #expect(L4Hex.rows(Data()) == [])
+    }
+
+    /// The confirm sheet is presented by item, so a request is identified by the
+    /// single-use token the core minted for it (Kit-owned, not a retroactive
+    /// conformance in the app).
+    @Test func testConfirmRequestIdentityIsItsToken() {
+        #expect(L4ConfirmRequest(prompt: "p", token: "t").id == "t")
+    }
+}

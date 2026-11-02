@@ -83,7 +83,18 @@ check_scope_add_gated() {
     grep -q 'l4\.scope\.remove' "$f" && fail scope-add-gated "$f"
 }
 
-checks="live_path no_embedded_switch verbs_gated scope_add_gated"
+# inspector-parked-id: the L4 inspector starts the craft editor from Kit's accepted sample (AC27,
+# task M5; the old `sampleSpec` with `sport`/`dport` is gone) and its Forward/Drop verdicts send the
+# parked id through `L4Verdict.args` (AC28), never the flow id.
+check_inspector_parked_id() {
+    local f=Sources/Aitmproxy/Inspector/L4Inspector.swift
+    [ -f "$f" ] || { fail inspector-parked-id "$f"; return; }
+    if grep -q 'sampleSpec' "$f" || ! grep -q 'L4Verdict\.args' "$f"; then
+        fail inspector-parked-id "$f"
+    fi
+}
+
+checks="live_path no_embedded_switch verbs_gated scope_add_gated inspector_parked_id"
 for c in $checks; do
     "check_$c"
 done
