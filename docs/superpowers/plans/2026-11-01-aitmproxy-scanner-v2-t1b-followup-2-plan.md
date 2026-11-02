@@ -19,7 +19,7 @@ wire key's meaning, or any operator decision; every status/model change is addit
 | C | Task 5 (deterministic terminal waits) | Task 1b (last writer of `worker.rs`) |
 | D | Task 6 (bookkeeping, docs wording) | all |
 
-**The rules this plan implements** (coordinator wording; spec text in PR #273):
+**The rules this plan implements** (the spec's amendment table on main, rows 38-40 and 46, landed via docs PR #273 = 449d6d17):
 
 - **Amendment 38, D4/D8:** an origin-scoped check is scheduled once per target
   origin whether or not any insertion point was discovered there.
