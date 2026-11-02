@@ -451,7 +451,10 @@ macOS 27.0 and a `/32` UDP host rule diverts the datagram.
   `capture.enabled` 0, `bus.activeKind` embedded, rendezvous absent. Active sysex after: 0.5.10/202611011427 (the
   branch build, idle, tunnel stopped) instead of the idle 0.5.7 — with capture off the relaunched release app makes
   no activation request; the next capture-on re-activates the release's own build (delegate `.replace`). Reported to
-  the orchestrator; no state change made for it.
+  the orchestrator; Matt then chose "Cycle capture now": one Proxy ▸ Capture All Apps / Stop Capturing All Apps cycle
+  at 16:57–16:58 PST (≈16 s on, no prompt) made the release's own sysex `0.5.10/202611011041` the active one (the
+  `.replace` answer accepted the lower build number within 5 s); the branch build is now "terminated waiting to
+  uninstall on reboot"; `scutil --proxy` unchanged, capture off, bus embedded, core back on :8080.
 
 ### Ladder verdict
 
