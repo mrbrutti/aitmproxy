@@ -437,6 +437,13 @@ impl ProbeHost for HttpProbeHost {
         })
     }
 
+    /// The job's budgeted client, so a script check's `http.send` keeps the
+    /// job's scope, rate limits, marks and record policy (spec D9.3). Without
+    /// it the rhai bridge refuses every script check on this lane.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        Some(self.job.client())
+    }
+
     fn captured(&self) -> Option<HttpFlow> {
         Some(self.captured.clone())
     }
@@ -454,6 +461,14 @@ impl ProbeHost for HttpProbeHost {
 
     fn budget_left(&self) -> u32 {
         self.job.budget_left()
+    }
+
+    /// A stimulus that bypasses [`ProbeHost::probe`]/[`ProbeHost::probe_raw`]
+    /// — T3's raw-h2 connections, one unit per stream — spends the same one
+    /// job budget, so it is paced and counted in `scan.status.probes`.
+    /// Nothing is charged when the budget cannot cover it.
+    fn charge(&self, units: u32) -> bool {
+        self.job.charge(units)
     }
 
     fn deadline(&self) -> Instant {
@@ -644,6 +659,7 @@ impl SessionMonitors {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -806,6 +822,79 @@ mod tests {
             "the capture is the flow as proxied, not the session-applied source"
         );
         assert!(fx.sent().is_empty(), "reading the capture sends nothing");
+    }
+
+    /// Spec D9.3: a script check's `http.send` must run through the job's
+    /// budgeted client, so scope, rate limits, marks and the record policy
+    /// still apply. Leaving the trait default (`None`) in place made the rhai
+    /// bridge answer every script check on this lane with the
+    /// "ProbeHost::client returned none" error verdict (amendment 72).
+    #[tokio::test]
+    async fn client_is_the_jobs_budgeted_client() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        let client = host.client().expect("the host lends the job's client");
+        assert!(
+            Arc::ptr_eq(&client, &fx.ctx().client()),
+            "the lent client is the job's own, not a second unbudgeted one"
+        );
+
+        let flow = client
+            .send_opts(
+                request("GET", "http://t:8080/sent-by-a-script", &[], None),
+                host.send_options(),
+            )
+            .await
+            .expect("the job's client answers");
+
+        assert_eq!(flow.response.map(|r| r.status), Some(200));
+        let sent = fx.sent();
+        assert_eq!(sent.len(), 1, "the send went through the job's client");
+        assert_eq!(sent[0].0.path, "/sent-by-a-script");
+        assert_eq!(
+            sent[0].1.marks,
+            vec![format!("scan:{JOB_ID}")],
+            "a script's send carries the job's mark"
+        );
+        assert_eq!(sent[0].1.record, RecordPolicy::Never);
+    }
+
+    /// T3's raw-h2 stimuli bypass `probe`/`probe_raw` and are budgeted through
+    /// `charge`, so the host must spend the job's one budget. The trait default
+    /// only reads `budget_left` and charges nothing, which left those
+    /// connections undebited (amendment 72).
+    #[tokio::test]
+    async fn charge_spends_the_jobs_budget() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+        let before = host.budget_left();
+
+        assert!(host.charge(3), "the job can afford three units");
+
+        assert_eq!(
+            host.budget_left(),
+            before - 3,
+            "the job's own budget was spent"
+        );
+        assert_eq!(fx.job.charges.load(Ordering::SeqCst), 1);
+        assert!(fx.sent().is_empty(), "a charge sends nothing");
+    }
+
+    /// A charge the budget cannot cover is refused and spends nothing, so what
+    /// is left stays affordable for a smaller stimulus.
+    #[tokio::test]
+    async fn charge_is_refused_when_the_budget_cannot_cover_it() {
+        let fx = fixture(ok_200());
+        fx.job.budget.store(2, Ordering::SeqCst);
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        assert!(!host.charge(3), "two units cannot cover three");
+
+        assert_eq!(host.budget_left(), 2, "a refused charge spends nothing");
+        assert_eq!(fx.job.charges.load(Ordering::SeqCst), 0);
+        assert!(host.charge(2), "the refused charge left the budget intact");
+        assert_eq!(host.budget_left(), 0, "the affordable charge spent it");
     }
 
     #[tokio::test]
