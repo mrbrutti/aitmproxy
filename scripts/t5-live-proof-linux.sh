@@ -152,8 +152,27 @@ pcap_excerpts() {
   rec "pcap frames rst:   $(tcpdump -nn -r "$pcap" 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | wc -l | tr -d ' ')"
   rec "first ICMP lines (tcpdump -ttt = delta from the previous frame):"
   tcpdump -nn -ttt -r "$pcap" icmp 2>/dev/null | head -25 | sed 's/^/  /' | tee -a "$SUMMARY"
-  rec "ICMP reactions other than the kernel's errors for our own source port 40000 (closed-port lines; -ttt deltas show the amendment-46 pace of ~1.1 s):"
-  tcpdump -nn -ttt -r "$pcap" icmp 2>/dev/null | grep -v 'port 40000' | head -14 | sed 's/^/  /' | tee -a "$SUMMARY"
+  # Every ICMP line is a port-unreachable: either the closed UDP point answering
+  # our stimuli, or the kernel answering an echo reply addressed to our
+  # socketless source port (derived from the job id since amendment 73 b, so
+  # it is not a fixed number). The histogram tells them apart by volume: the
+  # echo jobs draw ~105 kernel errors each, the closed-UDP oracle job draws
+  # about a dozen reactions. The busiest port with at most 20 lines is that
+  # job; its lines are printed with the gap to the previous one of ITS lines,
+  # which is the amendment-46 pace (~1.1 s on the rig).
+  rec "ICMP port-unreachable lines by quoted port:"
+  tcpdump -nn -r "$pcap" icmp 2>/dev/null | grep -o 'udp port [0-9]* unreachable' | sort | uniq -c | sort -rn | head -6 \
+    | sed 's/^/  /' | tee -a "$SUMMARY"
+  local closed_port
+  closed_port=$(tcpdump -nn -r "$pcap" icmp 2>/dev/null | grep -o 'udp port [0-9]* unreachable' | sort | uniq -c | sort -rn \
+    | awk '$1 <= 20 {print $4; exit}')
+  if [ -n "$closed_port" ]; then
+    rec "closed-UDP oracle reactions (quoted port $closed_port; +gap to the previous reaction of this port):"
+    tcpdump -nn -tt -r "$pcap" icmp 2>/dev/null | grep "udp port $closed_port unreachable" | head -14 \
+      | awk '{ gap = (NR > 1) ? $1 - prev : 0; prev = $1; printf "  +%.3fs %s\n", gap, $0 }' | tee -a "$SUMMARY"
+  else
+    rec "closed-UDP oracle reactions: no quoted port with at most 20 lines"
+  fi
   rec "first RST lines:"
   tcpdump -nn -r "$pcap" 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | head -3 | sed 's/^/  /' | tee -a "$SUMMARY"
   rec "UDP datagrams by destination port (top 6; the echo service shows up as 105 = 100 cases + 1 baseline + 4 probes):"
