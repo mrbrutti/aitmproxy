@@ -32,19 +32,24 @@ use std::time::{Duration, SystemTime};
 use aitm_core::{
     Body, CommandHost, Flow, FlowId, HeaderMap, HttpFlow, HttpRequest, RecordPolicy, SendOptions,
 };
+#[cfg(test)]
+use aitm_scan_model::PocHint;
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Discovery, Evidence, FlowRef,
     InsertionKind, InsertionPoint, Intensity, JobCtx, Lane, LaneKind, NodeId, Outcome, ParamRef,
-    Payload, PayloadMode, PocHint, PointTrait, ProbeHost, ProbeResponse, ProfileTarget, RawProbe,
+    Payload, PayloadMode, PointTrait, ProbeHost, ProbeResponse, ProfileTarget, RawProbe,
     ScanProfile, SiteNode, Technique, UseBrowser, Verdict, MAX_MATCH_BODY,
 };
 use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
 use crate::checks::CheckDefinition;
+#[cfg(test)]
 use crate::client::ProbeRefused;
 use crate::config::ScannerConfig;
 use crate::discover::{is_secret_name, InjectionPoint, Location};
+#[cfg(test)]
 use crate::scheduler::payload_cap;
 use crate::util::{default_port, normalize_origin, origin_key, scrub, split_authority, wire_token};
 
@@ -57,7 +62,26 @@ pub const MAX_HELD_FLOWS: usize = 16;
 /// The reflected-XSS check's **id**, spec D8.2's literal name — distinct from
 /// the issue **class** it emits (`crate::checks::CLASS_REFLECTED_XSS`), and so
 /// the manual verb is `check.xss-reflected`.
+#[cfg(test)]
 const CHECK_XSS_REFLECTED: &str = "xss-reflected";
+
+/// The two legacy active checks (`xss-reflected`, `open-redirect`) for this
+/// crate's tests, which hand them to the plugin's native slot the way the
+/// binary hands it the T3 natives that superseded them (T3 PR 2a). Not part of
+/// [`Lane::checks`] any more; retired with the lane.
+#[cfg(test)]
+pub(crate) fn legacy_active_checks() -> Vec<Arc<dyn Check>> {
+    vec![
+        Arc::new(LegacyActiveCheck {
+            def: CheckDefinition::reflected_xss(),
+            meta: reflected_xss_meta(),
+        }),
+        Arc::new(LegacyActiveCheck {
+            def: CheckDefinition::open_redirect(),
+            meta: open_redirect_meta(),
+        }),
+    ]
+}
 
 /// The interim HTTP [`Lane`]: the v1 scanner behind the v2 traits.
 pub struct InterimHttpLane {
@@ -372,15 +396,13 @@ impl Lane for InterimHttpLane {
     }
 
     fn checks(&self) -> Vec<Arc<dyn Check>> {
+        // The three passive checks only. The two active ones this lane used to
+        // ship (`xss-reflected`, `open-redirect`) are owned by the T3 natives in
+        // `aitm-scan-checks-http` since T3 PR 2a: the catalogue gives lanes
+        // precedence over the native slot, so listing them here would refuse
+        // the natives as id conflicts. `LegacyActiveCheck` stays as the test
+        // vehicle for this lane's probe host until T2 retires the lane.
         vec![
-            Arc::new(LegacyActiveCheck {
-                def: CheckDefinition::reflected_xss(),
-                meta: reflected_xss_meta(),
-            }),
-            Arc::new(LegacyActiveCheck {
-                def: CheckDefinition::open_redirect(),
-                meta: open_redirect_meta(),
-            }),
             Arc::new(LegacyPassiveCheck {
                 class: crate::passive::CLASS_REFLECTION,
                 meta: passive_meta(
@@ -595,11 +617,17 @@ impl ProbeHost for InterimProbeHost {
 }
 
 /// One of the two shipped payload classes as a v2 [`Check`].
-pub struct LegacyActiveCheck {
+///
+/// No longer in [`Lane::checks`]: the T3 natives own `xss-reflected` and
+/// `open-redirect` (T3 PR 2a). Kept as the test vehicle for this lane's probe
+/// host (recording policy, held flows, budget) and retired with the lane.
+#[cfg(test)]
+pub(crate) struct LegacyActiveCheck {
     def: CheckDefinition,
     meta: CheckMeta,
 }
 
+#[cfg(test)]
 impl Check for LegacyActiveCheck {
     fn meta(&self) -> &CheckMeta {
         &self.meta
@@ -903,6 +931,7 @@ fn bounded_body(body: &Body) -> Vec<u8> {
 /// Read from the typed [`ProbeRefused`] the job client raises, never from
 /// words in the message: an upstream error that happens to say "canceled" is
 /// one failed send, not the end of the run.
+#[cfg(test)]
 fn ends_the_run(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ProbeRefused>(),
@@ -954,6 +983,7 @@ fn http_kinds() -> Vec<InsertionKind> {
 /// The **id** is spec D8.2's literal check name (`xss-reflected`, so the
 /// manual verb is `check.xss-reflected`); the **class** stays the issue class
 /// the check emits (`reflected-xss`).
+#[cfg(test)]
 fn reflected_xss_meta() -> CheckMeta {
     CheckMeta {
         id: CHECK_XSS_REFLECTED.to_string(),
@@ -984,6 +1014,7 @@ fn reflected_xss_meta() -> CheckMeta {
 }
 
 /// The catalogue entry for the shipped open-redirect class.
+#[cfg(test)]
 fn open_redirect_meta() -> CheckMeta {
     CheckMeta {
         id: crate::checks::CLASS_OPEN_REDIRECT.to_string(),
@@ -1650,7 +1681,17 @@ mod tests {
             .checks()
             .into_iter()
             .find(|c| c.meta().id == id)
-            .unwrap_or_else(|| panic!("the lane ships the {id} check"))
+            .unwrap_or_else(|| legacy_active(id))
+    }
+
+    /// The two legacy active checks, no longer in `checks()` since the T3
+    /// natives own their ids (PR 2a); still the vehicle these tests drive the
+    /// lane's probe host with.
+    fn legacy_active(id: &str) -> Arc<dyn aitm_scan_model::Check> {
+        legacy_active_checks()
+            .into_iter()
+            .find(|c| c.meta().id == id)
+            .unwrap_or_else(|| panic!("the lane ships no {id} check"))
     }
 
     fn payload(value: &str) -> Payload {
@@ -2568,40 +2609,32 @@ mod tests {
         assert_eq!(client.calls(), 0);
     }
 
-    /// The lane's five checks carry the metadata the plan pins (call B19), in
-    /// the plan's order, with a native origin; the passive three cover every
-    /// HTTP kind and no WebSocket or L4 one.
+    /// The lane ships its three passive checks (call B19), in the plan's order,
+    /// with a native origin, covering every HTTP kind and no WebSocket or L4
+    /// one. Its two legacy active checks left `checks()` with T3 PR 2a (the
+    /// natives in `aitm-scan-checks-http` own `xss-reflected` and
+    /// `open-redirect`) but still carry the metadata the plan pinned.
     ///
     /// Coordinator ruling 2026-11-01: an **id** is spec D8.2's literal name
     /// (`xss-reflected`), a **class** is the issue class the check emits
     /// (`reflected-xss`), so the two differ for the reflected-XSS check and
     /// coincide for the other four.
     #[test]
-    fn the_five_interim_checks_carry_the_pinned_metadata() {
+    fn the_three_interim_checks_carry_the_pinned_metadata() {
         let checks = lane().checks();
         let ids: Vec<&str> = checks.iter().map(|c| c.meta().id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "xss-reflected",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag"
-            ]
-        );
+        assert_eq!(ids, ["reflection", "security-header", "cookie-flag"]);
         let classes: Vec<&str> = checks.iter().map(|c| c.meta().class.as_str()).collect();
-        assert_eq!(
-            classes,
-            [
-                "reflected-xss",
-                "open-redirect",
-                "reflection",
-                "security-header",
-                "cookie-flag"
-            ]
-        );
-        for check in &checks {
+        assert_eq!(classes, ["reflection", "security-header", "cookie-flag"]);
+        let legacy = [
+            legacy_active("xss-reflected"),
+            legacy_active("open-redirect"),
+        ];
+        assert_eq!(legacy[0].meta().id, "xss-reflected");
+        assert_eq!(legacy[0].meta().class, "reflected-xss");
+        assert_eq!(legacy[1].meta().id, "open-redirect");
+        assert_eq!(legacy[1].meta().class, "open-redirect");
+        for check in checks.iter().chain(legacy.iter()) {
             let meta = check.meta();
             assert_eq!(meta.origin, CheckOrigin::Native, "{}", meta.id);
             assert_eq!(meta.lanes, vec![LaneKind::Http], "{}", meta.id);
@@ -2609,7 +2642,7 @@ mod tests {
             assert_eq!(meta.scope, CheckScope::Point, "{}", meta.id);
         }
 
-        let xss = checks[0].meta();
+        let xss = legacy[0].meta();
         assert_eq!(
             xss.kinds,
             vec![InsertionKind::Query, InsertionKind::BodyParam]
@@ -2622,7 +2655,7 @@ mod tests {
         assert_eq!(xss.cwe, Some(79));
         assert!(xss.remediation.is_some());
 
-        let redirect = checks[1].meta();
+        let redirect = legacy[1].meta();
         assert_eq!(redirect.kinds, vec![InsertionKind::Query]);
         assert_eq!(redirect.cost, CheckCost::Light);
         assert_eq!(redirect.severity, aitm_poc::Severity::Low);
@@ -2630,7 +2663,7 @@ mod tests {
         assert_eq!(redirect.wants_traits, Some(vec![PointTrait::Url]));
 
         for (check, confidence) in
-            checks[2..]
+            checks
                 .iter()
                 .zip([Confidence::Tentative, Confidence::Firm, Confidence::Firm])
         {
