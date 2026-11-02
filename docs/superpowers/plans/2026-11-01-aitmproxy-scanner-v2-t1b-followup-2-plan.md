@@ -328,20 +328,20 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
     | `commands.rs` 1652 `overlapping_scan_is_refused_without_touching_the_browser` | `gate.entered.recv_timeout(10 s)` | net (this PR): the gate channel is the notification; the bound is `TERMINAL_NET`, documented in the test as a safety net that names the hang, never measured |
     | `commands.rs` 2986 `discover_time_budget_cancels_and_reports` | `started.elapsed() < 6 s` (300 ms budget + `CANCEL_GRACE`) | converted + net (this PR): the lane only ends on cancel, so `stopped_reason: time_budget` plus the job's `Cancelled` state is the proof the budget ended the wait; the call runs on a scoped thread under `recv_timeout(TERMINAL_NET)` which cancels the job and panics by name on expiry |
     | `commands.rs` 241 `ScanDiscover::poll_until` (production) | `status()` every 100 ms `thread::sleep` until terminal or deadline | converted (this PR) to `wait_until`: `tokio::time::timeout(within, ..)` on the registry's terminal signal, run on the engine's runtime and bridged to the synchronous verb over a `std::sync::mpsc` channel; `scan.discover`'s deadline semantics (budget, then `cancel` + `CANCEL_GRACE`) unchanged; a pruned entry (sender dropped) still answers with the last status. Red test `discover_wait_answers_on_finish_not_on_a_terminal_status`: the wait answers after `finish`, not on a terminal `state` |
-- **Test** (`jobs::tests`):
-  - `wait_terminal_resolves_at_once_for_a_finished_job`: admit an entry, call `finish`, then
-    `registry.wait_terminal(id).await` returns `Some(status)` without yielding (wrap in
-    `tokio::time::timeout(Duration::ZERO, ..)` on a paused clock: it completes).
-  - `a_cancelled_job_notifies_its_waiter`: a job on a `block_until_cancelled` check; a waiter
-    task awaits `wait_terminal`; `registry.cancel(id)`; the waiter resolves with `state ==
-    Cancelled`.
-  - `an_unknown_job_has_no_signal`: `registry.wait_terminal("scan-00000000").await == None`.
-  - `a_reloaded_record_is_already_terminal`: after `load_history`, `wait_terminal` on a
-    reloaded id resolves at once.
+- **Test** (as landed; the four names below were the pre-#285 draft and were superseded):
+  - #285 shipped the signal and its test `jobs::tests::terminal_signal_flips_once_on_finish_and_reads_true_for_finished_jobs`
+    (unknown id → `None`; running → `false`; a waiter wakes on `finish`; `true` after; a reloaded
+    record starts `true`). The cancelled-waiter case is covered by `verbs::tests::start_returns_a_start_result_immediately`
+    (cancel, then wait under `TERMINAL_NET`). `JobRegistry::wait_terminal` (`wait_for(|t| *t)` → `status(id)`)
+    lands in this PR's panel fix round (quality Minor: two hand-rolled watch loops), used by `wait_until` and `test_support`.
+  - This PR's converted sites: `commands::tests::discover_wait_answers_on_finish_not_on_a_terminal_status`
+    (production `wait_until`), `verbs::tests::start_returns_a_start_result_immediately`,
+    `commands::tests::scan_discover_crawls_under_egress_confinement`,
+    `overlapping_scan_is_refused_without_touching_the_browser`, `discover_time_budget_cancels_and_reports`.
   - Static check the Tester repeats: `grep -n "from_secs(2)\|from_secs(5)\|from_secs(10)"`
     over the `#[cfg(test)]` regions of `worker.rs` and `jobs.rs` lists only the kept sites
     above (the 60 s budget deadline, and none of the converted ones).
-- **Done when:** the four tests pass; `cargo test -p aitm-plugin-scanner --offline` passes
+- **Done when:** the tests above pass; `cargo test -p aitm-plugin-scanner --offline` passes
   three times in a row in the sandbox (no flake); per-task gate green.
 
 ### Task 7: `JobCtx::report_forms_submitted` feeds `crawl.forms_submitted` (amendment 53)
@@ -366,7 +366,7 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 
 **Added 2026-11-01 (T5's lane was inert for an hour with `done` in 1 s, 0 cases, 0 frames and no trace).** Today the worker's `note_lane_text` drops the detail, `checks.errors` is never bumped, nothing is logged.
 
-- **Rule:** on `Outcome::Error` the worker bumps `JobStatus.checks.errors` (add the field to `CheckCounters` if absent, additive, serde default), keeps the first 8 error details per job on an additive `JobStatus.checks.error_samples: Vec<CheckErrorSample { check, point, detail }>` (scrubbed through `util::scrub`, detail bounded like evidence excerpts; distinct `(check, detail)` pairs only), and emits one `tracing::warn!` per distinct detail (never per probe). `Outcome::Inconclusive` is unchanged.
+- **Rule:** on `Outcome::Error` the worker bumps `JobStatus.checks.errors` (add the field to `CheckCounters` if absent, additive, serde default), keeps the first 8 error details per job on an additive `JobStatus.checks.error_samples: Vec<CheckErrorSample { check, point, detail }>` (scrubbed through `util::scrub`, detail bounded like evidence excerpts; distinct `(check, detail)` pairs only), and emits one `tracing::warn!` per distinct detail kept (the first 8, never per probe), then one notice that the sample store is full; later distinct errors are counted only (panel-accepted bounded reading, spec Minor). `Outcome::Inconclusive` is unchanged.
 - **Files:** `crates/aitm-scan-model/src/job.rs` (fields), `crates/aitm-plugin-scanner/src/worker.rs` (`run_item`/`item_done` region, `JobRuntime` sample store, `sync_counters`), `docs/scanner.md` status notes (Task 6 docs coder or this task — one writer).
 - **Tests (red first):** `worker::tests::an_erroring_check_is_counted_sampled_and_logged` — a `FakeLane` check returning `Outcome::Error` with detail `"runner missing"` on two points → `checks.errors == 2`, `error_samples.len() == 1` (distinct), sample names the check id and the first point, detail scrubbed; a ninth distinct detail is not kept (cap 8); `scan.status` shows them; `job::tests::check_counters_additive_fields_default_to_zero` (reload without the fields → 0 / empty).
 - **Ownership:** after Task 7 and Task 10 (worker.rs, model job.rs), before Task 8.
@@ -430,7 +430,7 @@ Every manual `check.<rhai-id>` returned "the engine must hand a shared probe hos
 | `aitm-plugin-scanner/src/interim_lane.rs` | | W (client_crawl) | | | W (probe_host_for) | | |
 | `aitm-plugin-scanner/src/worker.rs` | | W (crawl phase, JobRuntime) | | | W (audit region) | W (tests) | |
 | `aitm-plugin-scanner/src/jobs.rs` | | | | | | W | |
-| `aitm-plugin-scanner/src/verbs.rs`, `commands.rs` | | | | | | W (tests) | |
+| `aitm-plugin-scanner/src/verbs.rs`, `commands.rs` | | | | | | W (tests + `commands.rs::wait_until`, the rescoped production piece) | |
 | `aitm-plugin-scanner/src/config.rs`, `profiles.rs` | | | | W | | | |
 | `aitm/src/config_file.rs` | | | | W | | | |
 | `aitm-scan-model/src/job.rs`, `traits.rs` (doc) | | W | | | | | |
@@ -511,7 +511,7 @@ Kept by the main session during stage 6. One row per finding.
 | merge | Orchestrator | Note | main a2ab31c3 (#285) merged as c7575cdc; the branch's five new bounded `wait_terminal` calls dropped their `Duration` (11eb38ec); Task 5 rescoped per the paragraph above | done |
 | all | Orchestrator | Note | Wave A coders ran into each other's mid-TDD states (expected in one tree); whole-package reds during Wave A were the Task 3 casualty above, not regressions | noted |
 | 5 | Coder (Task 5) | Note | No measured bound turned out to be the property: four test sites converted (blocking check + `terminal_signal` still `false`; direct hold assertion; `TERMINAL_NET` nets) and `poll_until` → `wait_until` (timeout over the terminal signal on the engine runtime, mpsc-bridged so it is correct from any caller context); zero-deadline test distinguishes "answers on the first look" without a clock | accepted; committed in df127f56 |
-| 8 | Coder (Task 8) | Note | Crate has no `rand`/`getrandom`; seed = `RandomState::hash_one(nanos)` folded to `u32`, no new dependency; marker = `lowbias32(counter ^ seed)` (bijective per seed) so a target cannot predict the next marker by flipping a bit; doc states the seed is not a secret and the mix is not a MAC | accepted; committed in 5503cba8 (plus the interim-lane test fake made shape-conformant) |
+| 8 | Coder (Task 8) | Note | Crate has no `rand`/`getrandom`; seed = `RandomState::hash_one(nanos)` folded to `u32`, no new dependency; marker = `lowbias32(counter ^ seed)` (bijective per seed) a public bijection, so a target that has seen one marker can compute the rest of the job's — acceptable because amendment 57 pins markers as per-call canaries that are never keys (security Note: a future check relying on an unseen marker being unguessable needs a CSPRNG seed and a keyed hash); doc states the seed is not a secret and the mix is not a MAC | accepted; committed in 5503cba8 (plus the interim-lane test fake made shape-conformant) |
 | 10, 11 | Coder (Tasks 10, 11) | Note | Reports accepted; committed in 11a66c51 | done |
 | 12 | Coordinator (amendment 62) | Blocker | Manual `check.<rhai-id>` verbs all error: the lane host is handed unwrapped, `shared()` is `None` | fixed by the orchestrator, test-first (`manual_check_hands_a_shared_host_to_the_check`); amendment 63 recorded as a note on Task 12, no change |
 | all | Tester | PASS | Every plan criterion maps to a behavioural test; 8 tests added (scheduler ×3, interim_crawl classify, interim_lane https/foreign scheme, profiles floor-from-ceilings, worker detail scrub-then-bound, model token agreement, plus the manual-path order test); scanner ×3 / model / check_bridge / aitm config_file all exit 0 | committed by path |
