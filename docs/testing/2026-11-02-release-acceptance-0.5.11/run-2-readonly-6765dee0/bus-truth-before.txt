@@ -1,0 +1,351 @@
+embedded core config: /var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-embedded-core/137E0FB1-FA40-4745-AD78-40DE359ADC94/config.yaml
+bus: 127.0.0.1:57574
+role: ?
+
+== scope.list
+[]
+
+== proxy.status
+{
+ "address": "127.0.0.1:8080",
+ "capturing": true,
+ "decrypt": {
+  "advice": "Nothing is decrypted until a host is in Scope.",
+  "decrypting": false,
+  "scope_hosts": 0
+ },
+ "flows": 5,
+ "intercept_armed": false,
+ "listening": true,
+ "paused": 0,
+ "system_proxy": {
+  "detail": "HTTP and HTTPS off",
+  "host": null,
+  "managed_by_us": false,
+  "port": null,
+  "setting": false,
+  "state": "off",
+  "supported": true
+ },
+ "version": "0.5.11"
+}
+
+== capture.status
+{
+ "capability": "approved_attached",
+ "capability_reason": null,
+ "enabled": true,
+ "feeder": {
+  "reason": null,
+  "state": "listening"
+ },
+ "flows_handed_off": {
+  "tcp": 0,
+  "udp": 0
+ },
+ "last_handoff_at": null,
+ "provider": {
+  "attached_at": 1793586814583,
+  "state": "attached",
+  "team_id": "995PCLM9KH"
+ },
+ "scope_entries": 0,
+ "scope_tokens": []
+}
+
+== proxy.system.status
+{
+ "bypass_default": [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "*.local",
+  "169.254/16"
+ ],
+ "detail": "HTTP and HTTPS off",
+ "effective": {
+  "bypass": [
+   "*.local",
+   "169.254/16"
+  ],
+  "http": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  },
+  "https": {
+   "enabled": false,
+   "host": "",
+   "port": 0
+  }
+ },
+ "guidance": null,
+ "last_change_ms": null,
+ "managed_by_us": false,
+ "mechanism": "networksetup",
+ "ours": {
+  "host": "127.0.0.1",
+  "port": 8080
+ },
+ "remedy": null,
+ "services": [
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Display Ethernet"
+  },
+  {
+   "bypass": [
+    "*.local",
+    "169.254/16"
+   ],
+   "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "https": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090
+   },
+   "service": "Wi-Fi"
+  }
+ ],
+ "setting": false,
+ "state": "off",
+ "state_file": "/Users/matt/Library/Application Support/aitmproxy/system-proxy-state.json",
+ "supported": true,
+ "watchdog_pid": null
+}
+
+== flow.table
+{
+ "count": 5,
+ "last": [
+  {
+   "authority": "example.com:443",
+   "bytes_down": 4900,
+   "bytes_up": 585,
+   "capture_interface": null,
+   "duration_ms": 65,
+   "id": "9df9e9f3-6740-40a5-aaf1-b51a8eed8187",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "ads.mozilla.org:443",
+   "bytes_down": 17782,
+   "bytes_up": 2594,
+   "capture_interface": null,
+   "duration_ms": 172149,
+   "id": "bc7dff40-208c-49c5-b0d0-56cbe51a2c23",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "merino.services.mozilla.com:443",
+   "bytes_down": 7196,
+   "bytes_up": 2436,
+   "capture_interface": null,
+   "duration_ms": 172109,
+   "id": "a31d2113-5af2-4beb-9930-9854b8e07114",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": 6385,
+   "bytes_up": 2234,
+   "capture_interface": null,
+   "duration_ms": 170346,
+   "id": "6dcb5c9a-25bc-44bb-afac-ab1fee45daaf",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": 200,
+   "tunnel": "passthrough",
+   "tunnel_reason": "out_of_scope"
+  },
+  {
+   "authority": "push.services.mozilla.com:443",
+   "bytes_down": null,
+   "bytes_up": null,
+   "capture_interface": null,
+   "duration_ms": 35,
+   "id": "2033ee81-dd02-41e7-bba8-fc81ac053927",
+   "kind": "http",
+   "marks": [],
+   "method": "CONNECT",
+   "passive": false,
+   "path": "",
+   "source_app": null,
+   "state": "observed",
+   "status": null,
+   "tunnel": "failed",
+   "tunnel_reason": "client_closed"
+  }
+ ]
+}
+
+== ca.status
+{
+ "exists": true,
+ "fingerprint_sha1": "B2:D8:E7:80:FF:3A:B7:1F:71:F8:54:4A:1D:7A:8B:64:DD:C5:A4:85",
+ "stores": {
+  "system": {
+   "installed": "absent",
+   "location": "/Library/Keychains/System.keychain",
+   "trusted": "no"
+  },
+  "user": {
+   "installed": "present",
+   "location": "/Users/matt/Library/Keychains/login.keychain-db",
+   "trusted": "yes"
+  }
+ }
+}
+
+== agent.activity
+[
+ {
+  "args": "{}",
+  "at": 1793588418579,
+  "client_label": "aitm-mac",
+  "command": "scope.list",
+  "connection_id": "conn_d4ab833f2733e0a0-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418580,
+  "client_label": "aitm-mac",
+  "command": "proxy.status",
+  "connection_id": "conn_d4ab833f2733e0a0-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418580,
+  "client_label": "aitm-mac",
+  "command": "flow.list",
+  "connection_id": "conn_d4ab833f2733e0a0-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{\"id\":\"2033ee81-dd02-41e7-bba8-fc81ac053927\"}",
+  "at": 1793588418581,
+  "client_label": "aitm-mac",
+  "command": "flow.get",
+  "connection_id": "conn_d4ab833f2733e0a0-1",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418759,
+  "client_label": "aitm-e2e",
+  "command": "scope.list",
+  "connection_id": "conn_d4ab833f2733e0a0-7",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418759,
+  "client_label": "aitm-e2e",
+  "command": "proxy.status",
+  "connection_id": "conn_d4ab833f2733e0a0-7",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418760,
+  "client_label": "aitm-e2e",
+  "command": "capture.status",
+  "connection_id": "conn_d4ab833f2733e0a0-7",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418988,
+  "client_label": "aitm-e2e",
+  "command": "proxy.system.status",
+  "connection_id": "conn_d4ab833f2733e0a0-7",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588418989,
+  "client_label": "aitm-e2e",
+  "command": "flow.table",
+  "connection_id": "conn_d4ab833f2733e0a0-7",
+  "origin": "operator",
+  "result": "ok"
+ },
+ {
+  "args": "{}",
+  "at": 1793588419041,
+  "client_label": "aitm-e2e",
+  "command": "ca.status",
+  "connection_id": "conn_d4ab833f2733e0a0-7",
+  "origin": "operator",
+  "result": "ok"
+ }
+]
+
+== durable audit tail (control stream)
+{"at":1793586611435,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_bfa4965765def58d-19","command":"scope.remove","args":"{\"host\":\"httpbin.org:443\"}","result":"ok"}
+{"at":1793586707287,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_bfa4965765def58d-20","command":"scope.add","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793586713163,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_bfa4965765def58d-21","command":"scope.remove","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793586723559,"marker":"start","pid":15639,"schema":1,"stream":"control","version":"0.5.11"}
+{"at":1793586812616,"marker":"start","pid":16734,"schema":1,"stream":"control","version":"0.5.11"}
+{"at":1793586905464,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_d4ab833f2733e0a0-2","command":"scope.add","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793586911134,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_d4ab833f2733e0a0-3","command":"scope.remove","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+{"at":1793587928813,"marker":"start","pid":31540,"schema":1,"stream":"control","version":"0.5.10"}

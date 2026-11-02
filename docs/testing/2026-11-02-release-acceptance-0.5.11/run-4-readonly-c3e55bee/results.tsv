@@ -1,0 +1,6 @@
+cli-livecore	FAIL	exit 1
+mac	SKIP	MAC-0    SKIP    release run only; brew upgrade is Matt's
+n5	PASS
+tui	SKIP	TUI-1    SKIP    port 8080 held by aitm pid 98224; aitm tui needs the default ports (quit the app first)
+web	SKIP	WEB-1    SKIP    port 8080 held by aitm pid 98224; aitm web needs the default ports (quit the app first)
+cli-nocore	SKIP	CLI-1   SKIP    port 8080 held by aitm pid 98224; the no-core half needs 8080, 8081 and 8082 free

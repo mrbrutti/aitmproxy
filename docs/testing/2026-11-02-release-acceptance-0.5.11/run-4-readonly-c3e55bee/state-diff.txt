@@ -1,0 +1,8 @@
+111,113d110
+< {"at":<ms>,"origin":"operator","client_label":"icons-task8-state","connection_id":"conn_d4ab833f2733e0a0-3","command":"scope.remove","args":"{\"host\":\"example.com:443\"}","result":"ok"}
+< {"at":<ms>,"marker":"start","pid":31540,"schema":1,"stream":"control","version":"0.5.10"}
+< {"at":<ms>,"marker":"start","pid":57303,"schema":1,"stream":"control","version":"0.5.10"}
+115a113,115
+> {"at":<ms>,"marker":"start","pid":98877,"schema":1,"stream":"control","version":"0.5.11"}
+> {"at":<ms>,"marker":"start","pid":99071,"schema":1,"stream":"control","version":"0.5.11"}
+> {"at":<ms>,"marker":"start","pid":99077,"schema":1,"stream":"control","version":"0.5.11"}
