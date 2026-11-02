@@ -31,7 +31,7 @@ use aitm_core::{
 use aitm_scan_model::{Canary, CanaryMethod, OnLost, SessionMaterial};
 use url::Url;
 
-use crate::{limits, params, redact, url_norm};
+use crate::{limits, params, redact, template, url_norm};
 
 /// The prefix of every error returned once a job's session is lost (seam S1).
 pub(crate) const SESSION_LOST_PREFIX: &str = "scan: session_lost: ";
@@ -286,9 +286,10 @@ fn canary_from(flow: &Flow, origin: &Url, material: &SessionMaterial) -> Option<
     request.body = Body::Empty;
     request.headers.remove("content-length");
     request.headers.remove("transfer-encoding");
-    // The status shape is the path alone: `/account?tab=overview` reports as
-    // `/account`, while the replay keeps the captured target.
-    let path = params::split_path(&request.path).path.to_string();
+    // The status shape is the masked path alone: `/account?tab=overview`
+    // reports as `/account` and `/share/<token>` as `/share/{token}`, while
+    // the replay keeps the captured target.
+    let path = canary_status_path(&request.path);
 
     Some(CanaryRequest {
         request,
@@ -296,6 +297,23 @@ fn canary_from(flow: &Flow, origin: &Url, material: &SessionMaterial) -> Option<
         path,
         expected_status,
     })
+}
+
+/// The shape of a canary path as the job reports it: the query dropped and
+/// every segment that carries an identifier or an opaque token shown under its
+/// template name (`{id}`, `{uuid}`, `{oid}`, `{token}`, see
+/// [`template::path_segment_token`]), so `JobStatus.session.canary.path` never
+/// publishes a signed share link or a reset token. The replay target is
+/// untouched: this names the canary, it does not address it.
+fn canary_status_path(raw: &str) -> String {
+    let path = params::split_path(raw).path;
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    path.split('/')
+        .map(|segment| template::path_segment_token(segment).unwrap_or(segment))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Whether `req` carries at least one of the material's cookie or header names.
@@ -769,6 +787,61 @@ mod tests {
         // Another origin's flows are not this origin's canary.
         let elsewhere = parse_absolute("http://other:8080/").unwrap();
         assert!(pick_canary(store.as_ref(), &elsewhere, &material, None).is_none());
+    }
+
+    /// The status path never publishes a token (delta-panel security Minor):
+    /// a segment that carries an identifier or an opaque token is shown under
+    /// its template name, `{id}`, `{uuid}`, `{oid}` or `{token}`, while the
+    /// replay target keeps the real URL so the canary still reaches the page.
+    #[test]
+    fn canary_status_path_masks_tokens() {
+        let store = Arc::new(MemFlowStore::default());
+        let origin = parse_absolute("http://t:8080/").unwrap();
+        let material = session_of(&[("sid", "S3")], &[]);
+        let token = "3f9c2b7e1a4d4c0f9b8e7d6c5a4b3c2d1e0f9a8b";
+
+        store.insert(Flow::Http(captured_flow(
+            request(
+                "GET",
+                &format!("http://t:8080/share/{token}"),
+                &[("cookie", "sid=S3")],
+                None,
+            ),
+            200,
+            &[],
+            b"shared",
+        )));
+        let picked = pick_canary(store.as_ref(), &origin, &material, None).expect("a canary");
+        assert_eq!(picked.path, "/share/{token}");
+        assert_eq!(picked.request.path, format!("/share/{token}"));
+        // The shape the monitor reports to the job (`JobStatus.session.canary`)
+        // is the masked path.
+        let monitor = SessionMonitor::new(Some(picked), OnLost::Stop, 2);
+        assert_eq!(
+            monitor.canary(),
+            Canary::Flow {
+                method: CanaryMethod::Get,
+                path: "/share/{token}".to_string(),
+                expected_status: Some(200),
+            }
+        );
+
+        // A numeric id folds to the site-map placeholder; the query is still
+        // dropped from the shape and kept on the replay target.
+        store.insert(Flow::Http(captured_flow(
+            request(
+                "GET",
+                "http://t:8080/account/42?tab=overview",
+                &[("cookie", "sid=S3")],
+                None,
+            ),
+            200,
+            &[],
+            b"account",
+        )));
+        let picked = pick_canary(store.as_ref(), &origin, &material, None).expect("a canary");
+        assert_eq!(picked.path, "/account/{id}");
+        assert_eq!(picked.request.path, "/account/42?tab=overview");
     }
 
     #[tokio::test]
