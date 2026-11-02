@@ -1250,8 +1250,8 @@ async fn tester_every_read_only_live_verb_renders_byte_identically_to_the_local_
     let mut skipped = Vec::new();
     let mut compared = Vec::new();
     for dotted in READ_ONLY_LIVE_VERBS {
-        // The bare assembly registers neither `script.*` nor `findings.*`
-        // (those arrive with the script tier); they are recorded, not failed.
+        // The bare assembly registers no `script.*` verb (the two arrive with
+        // the script tier); they are recorded, not failed.
         let Some(cmd) = rig.services.registry.command(dotted).cloned() else {
             skipped.push(format!("{dotted}: not registered in a bare assembly"));
             continue;

@@ -783,7 +783,8 @@ mod tests {
     /// load.
     #[tokio::test]
     async fn every_accept_error_pauses_the_listener() {
-        // `ENOBUFS` differs per platform; `ENFILE`/`EMFILE` do not.
+        // `ENOBUFS` differs per platform; `ENFILE`/`EMFILE` do not. The errnos
+        // are named for the reader: `accept_failed` reads none of them.
         #[cfg(target_os = "linux")]
         const ENOBUFS: i32 = 105;
         #[cfg(not(target_os = "linux"))]

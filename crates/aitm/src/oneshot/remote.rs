@@ -914,8 +914,9 @@ mod tests {
 
     /// Spec D8 step 10 against a healthy core (tester defect, 2026-11-01):
     /// `proxy.status` and `config.get` declare `result: Object(Vec::new())`,
-    /// "some object", and answer keys the schema never names. Step 1 renders
-    /// the answer structurally, byte-identical to the local path.
+    /// "some object", and answer keys the schema never names. Step 2
+    /// (`lenient`'s empty-object arm) renders the answer structurally,
+    /// byte-identical to the local path.
     #[test]
     fn render_untyped_object_schema_accepts_undeclared_keys() {
         let answer =
