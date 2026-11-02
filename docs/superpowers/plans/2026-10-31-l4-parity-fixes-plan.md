@@ -495,6 +495,8 @@ Spec §7(d) file list. Not touched: `apps/mac/Extension`, anything `R` removes, 
 5. **Tripwire exception.** `APP_L4_EMBEDDED` is listed in `apps/mac/Sources/AitmproxyKit/RemovedModes.swift` (and its test) as a removed switch that a launch must refuse (fake-data removal spec D3 item 8), so `check-l4-live.sh`'s `APP_L4_EMBEDDED` grep excludes `RemovedModes.swift` and `RemovedModesTests.swift`.
 6. **Slow cadence.** The mac L4 status/scope/parked reads run on every 10th poll tick (about 5 s), the same cadence as `ca.status`; `l4.flow.list` (M4b) runs every tick like `flow.list`.
 
+7. **Operator-only add form (AC33, found live).** `tools/list` reports `l4.scope.add` `confirmable: true` to an agent connection too, and the dev bundle connects as the agent unless the harness suite carries `bus.operatorToken`; the first live add from the app was refused by the agent policy. So the mac add form renders only when `l4CanAddScope && session.resolvedRole == "operator"` (nil = unconfirmed = not operator); otherwise one line says the operator token is needed. `scope-add-gated` also requires `resolvedRole` beside `l4.scope.add`. The live walk passes the operator token as `APP_LIVE_OPERATOR_TOKEN` (read from the 0600 token file into the environment, never printed), the same way `tools/selftest-live.sh` does.
+
 ### Task M1: availability from the status replies, parked-id verdict args
 
 - **Satisfies:** AC26 (Kit), AC28 (Kit)
