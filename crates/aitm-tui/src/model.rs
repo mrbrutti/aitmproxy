@@ -891,10 +891,14 @@ impl Finding {
     }
 }
 
-/// Agent policy (F1).
+/// Agent policy, the core's five words: `all | auto | ask | readonly | paused`.
+/// `Auto` and `Ask` are parsed and labelled for display only; the TUI sets
+/// only `All`, `ReadOnly` and `Paused` (see [`AgentPolicy::settable`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentPolicy {
     All,
+    Auto,
+    Ask,
     ReadOnly,
     Paused,
 }
@@ -903,6 +907,8 @@ impl AgentPolicy {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "all" => Some(Self::All),
+            "auto" => Some(Self::Auto),
+            "ask" => Some(Self::Ask),
             "readonly" | "read_only" | "read-only" => Some(Self::ReadOnly),
             "paused" => Some(Self::Paused),
             _ => None,
@@ -912,6 +918,8 @@ impl AgentPolicy {
     pub fn wire(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Auto => "auto",
+            Self::Ask => "ask",
             Self::ReadOnly => "readonly",
             Self::Paused => "paused",
         }
@@ -920,9 +928,18 @@ impl AgentPolicy {
     pub fn label(self) -> &'static str {
         match self {
             Self::All => "all tools",
+            Self::Auto => "auto",
+            Self::Ask => "ask",
             Self::ReadOnly => "read-only",
             Self::Paused => "paused",
         }
+    }
+
+    /// Whether the TUI may set this policy over `agent.set`. `auto` and `ask`
+    /// are display only here (plan decision 7): the core shows them, the TUI
+    /// never sends them.
+    pub fn settable(self) -> bool {
+        matches!(self, Self::All | Self::ReadOnly | Self::Paused)
     }
 }
 

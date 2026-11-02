@@ -13,7 +13,8 @@
 //! Atoms: `~u` url · `~d` host · `~m` method · `~s`/`~c` status (`200`, `4xx`) ·
 //! `~h` header name/value · `~b` body text · `~t` content-type · `~client` process ·
 //! `~comment` · `~mark` colour · flags `~a` agent-originated · `~scope` / `~oos` ·
-//! `~ws` · `~paused` · `~killed` · `~replay` · `~e` edited · `~q` no response yet.
+//! `~ws` · `~paused` · `~killed` · `~replay` · `~e` edited · `~q` no response yet ·
+//! `~l4` a raw-L4 flow · `~tcp` / `~udp` / `~icmp` its transport.
 //! Text arguments match case-insensitively as substrings, with `*` and `?`
 //! wildcards; a quoted argument may contain spaces. A slash-delimited
 //! argument (`~u /^https:\/\/api\./`) is a regex, case-insensitive unless it
@@ -102,6 +103,11 @@ pub enum Expr {
     Replay,
     Edited,
     Pending,
+    /// `~l4`: a raw-L4 flow (`FlowKind::L4`).
+    L4,
+    /// `~tcp` / `~udp` / `~icmp`: an L4 flow whose transport sub-label
+    /// (`L4Row::proto`, from the flow's layers) is this word.
+    L4Proto(&'static str),
 }
 
 /// What `Expr::matches` needs besides the row.
@@ -413,6 +419,10 @@ impl Parser {
                     "replay" | "r" => Expr::Replay,
                     "e" | "edited" => Expr::Edited,
                     "q" | "pending" => Expr::Pending,
+                    "l4" => Expr::L4,
+                    "tcp" => Expr::L4Proto("TCP"),
+                    "udp" => Expr::L4Proto("UDP"),
+                    "icmp" => Expr::L4Proto("ICMP"),
                     other => return Err(format!("unknown filter `~{other}`")),
                 })
             }
@@ -511,6 +521,8 @@ impl Expr {
             Expr::Replay => row.is_replay,
             Expr::Edited => row.edited,
             Expr::Pending => row.pending(),
+            Expr::L4 => row.kind == FlowKind::L4,
+            Expr::L4Proto(p) => row.l4.as_ref().and_then(|l| l.proto.as_deref()) == Some(*p),
         }
     }
 }
@@ -724,5 +736,46 @@ mod tests {
         assert!(parse("~h content-type").unwrap().unwrap().matches(&r, &c));
         assert!(parse("~h json").unwrap().unwrap().matches(&r, &c));
         assert!(parse("~oos").unwrap().unwrap().matches(&r, &c));
+    }
+
+    /// L4 parity AC14: `~l4` is the L4 row; `~tcp` / `~udp` / `~icmp` are its
+    /// transport (the row's `L4Row::proto`), never an HTTP row.
+    #[test]
+    fn l4_atoms() {
+        assert_eq!(parse("~l4").unwrap().unwrap(), Expr::L4);
+        assert_eq!(parse("~tcp").unwrap().unwrap(), Expr::L4Proto("TCP"));
+        assert_eq!(parse("~udp").unwrap().unwrap(), Expr::L4Proto("UDP"));
+        assert_eq!(parse("~icmp").unwrap().unwrap(), Expr::L4Proto("ICMP"));
+        let flow = crate::l4::L4Flow::from_json(&json!({
+            "id": "F", "kind": "intercept", "interface": "lo", "packet_count": 1,
+            "injected_count": 0,
+            "packets": [{"dir": "inbound", "length": 60, "injected": false,
+                         "layers": ["IPv4", "TCP"]}]
+        }))
+        .unwrap();
+        let l4 = FlowRow::from_l4(&flow, 1);
+        let http = row("GET", "http://127.0.0.1:9099/", Some(200));
+        for (expr, on_l4, on_http) in [
+            ("~l4", true, false),
+            ("~tcp", true, false),
+            ("~udp", false, false),
+            ("~icmp", false, false),
+            ("!~l4", false, true),
+            ("~l4 & ~tcp", true, false),
+        ] {
+            let e = parse(expr).unwrap().unwrap();
+            assert_eq!(e.matches(&l4, &ctx()), on_l4, "{expr} on the L4 row");
+            assert_eq!(e.matches(&http, &ctx()), on_http, "{expr} on the HTTP row");
+        }
+        // A UDP flow is `~udp`, not `~tcp`.
+        let udp = crate::l4::L4Flow::from_json(&json!({
+            "id": "U", "kind": "capture", "interface": "lo",
+            "packets": [{"dir": "outbound", "length": 40, "injected": false,
+                         "layers": ["IPv4", "UDP", "Raw"]}]
+        }))
+        .unwrap();
+        let udp_row = FlowRow::from_l4(&udp, 2);
+        assert!(parse("~udp").unwrap().unwrap().matches(&udp_row, &ctx()));
+        assert!(!parse("~tcp").unwrap().unwrap().matches(&udp_row, &ctx()));
     }
 }
