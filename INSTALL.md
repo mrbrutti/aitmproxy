@@ -54,6 +54,10 @@ mcp:
       token: <a long random token>
 ```
 
+Every core mints `mcp.operator_token` into its `config.yaml` (mode `0600`) on
+its first run and serves a loopback operator bus; `aitm scope add --host <host>`
+and the other one-shot verbs use it.
+
 1. Set **Active core** to **External**. The embedded core stops while external
    is active and starts again when you switch back; the choice persists across
    launches.

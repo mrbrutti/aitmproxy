@@ -38,7 +38,7 @@
 <section class="page-head">
   <div class="wrap">
     <h1 class="display">Every feature, by hand or by agent.</h1>
-    <p class="lead">What follows is the surface of aitmproxy. Under each one you will find the same action twice: once as a person does it, in a UI or at the command line, and once as an assistant calls it over MCP. They are the same call into the same core. The one-shot CLI (<code>aitm &lt;family&gt; &lt;verb&gt;</code>) runs a single command in its own process, so for anything that acts on live flows the hand side is a UI action instead.</p>
+    <p class="lead">What follows is the surface of aitmproxy. Under each one you will find the same action twice: once as a person does it, in a UI or at the command line, and once as an assistant calls it over MCP. They are the same call into the same core. The one-shot CLI (<code>aitm &lt;family&gt; &lt;verb&gt;</code>) is a client of that running core too: it finds the core, runs the command there and prints the answer, so the hand side is either a UI action or that one line.</p>
   </div>
 </section>
 
@@ -100,7 +100,7 @@
       <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">$ </span>aitm request send --authority shop.example.com --scheme https --path /api/products</code></div>
       <div class="pair-row is-agent"><span class="pair-who">agent</span><code>request.send({ authority: <span class="s">"shop.example.com"</span>, scheme: <span class="s">"https"</span>, path: <span class="s">"/api/products"</span> })</code></div>
     </div>
-    <p>The one-shot CLI runs its own core, so the flow it captures is gone when it exits. To keep flows and edit them, drive a running core from a UI or over MCP.</p>
+    <p>The one-shot <code>aitm request send</code> runs on the running core, so the flow lands in that core's store and shows up in the UIs; keep editing it from there, or over MCP.</p>
   </div>
   <div class="feat-stack">
     <figure class="code term">
@@ -251,7 +251,7 @@
       <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">web UI </span>Scan → pick an in-scope target → Discover <span class="pr">(TUI: Scan view, then </span><span class="s">r</span><span class="pr">)</span></code></div>
       <div class="pair-row is-agent"><span class="pair-who">agent</span><code>scan.discover({ target: <span class="s">"https://staging.example.com/"</span>, max_depth: <span class="n">2</span>, max_pages: <span class="n">50</span> })</code></div>
     </div>
-    <p>A real crawl needs a running proxy with its embedded browser. The one-shot <code>aitm scan discover</code> has no browser and an empty store, so it cannot crawl.</p>
+    <p>A real crawl needs a running core with its embedded browser. The one-shot <code>aitm scan discover</code> reaches that core and crawls with its browser; with no core running it refuses rather than returning an empty result.</p>
   </div>
   <div class="feat-stack">
     <div class="ui">
@@ -323,7 +323,7 @@
       <div class="pair-row"><span class="pair-who">hand</span><code><span class="pr">web UI </span>Browser panel → enter the URL; the Eval drawer runs <span class="s">window.__aitm</span> <span class="pr">(TUI: browser view, </span><span class="s">g</span> <span class="pr">for the URL)</span></code></div>
       <div class="pair-row is-agent"><span class="pair-who">agent</span><code>browser.navigate({ url: <span class="s">"https://staging.example.com/search?q=k7x2"</span> }); browser.eval({ expr: <span class="s">"window.__aitm"</span> }); browser.screenshot()</code></div>
     </div>
-    <p>The one-shot CLI has no browser handle, so the <code>browser.*</code> commands run from a UI, a PoC, a plugin or over MCP.</p>
+    <p>The <code>browser.*</code> commands drive the running core's browser from a UI, a PoC, a plugin, over MCP, or from the one-shot CLI, which reaches the same core.</p>
   </div>
   <div class="feat-stack">
     <div class="ui">

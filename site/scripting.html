@@ -273,7 +273,7 @@
         <div><div class="sig">script.enable { name }<br>script.disable { name }<small>sensitive</small></div><div>Switch a loaded script's hooks on or off live. Its registered commands stay.</div></div>
         <div><div class="sig">script.findings { limit? }<small>read</small></div><div>What scripts recorded with <code>finding(...)</code> this run, oldest first, and how many the bounded buffer dropped.</div></div>
       </div>
-      <p>From a terminal, <code>aitm script validate</code> is the useful one-shot. The one-shot CLI builds a fresh core of its own and exits, so it cannot see or change the scripts of a proxy that is already running; drive the live commands through MCP, or any other client of the running core.</p>
+      <p>From a terminal, <code>aitm script validate</code> compiles a file on this machine and needs no core. <code>aitm script list</code>, <code>enable</code>, <code>disable</code>, <code>reload</code> and <code>save</code> act on the running core's scripts, the same core MCP and the UIs talk to.</p>
     </div>
 
     <nav class="pager" aria-label="Previous and next">

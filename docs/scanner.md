@@ -57,7 +57,7 @@ same scope and sensitivity rules. It is **operator-run and agent-taskable**.
 A real crawl needs a **running proxy with its embedded browser**: the bare `aitm`
 server (the MCP server), `aitm web` and `aitm tui` each launch the configured
 engine (obscura by default; see [INSTALL.md](../INSTALL.md) if it is not found)
-and register `scan.discover`. Drive it through one of those, not the one-shot CLI.
+and register `scan.discover`. Drive it through any of them; the one-shot CLI reaches the same running core.
 
 ### MCP
 
@@ -66,7 +66,7 @@ Call the `scan.discover` tool with the same parameters (`target`, and optionally
 **agent-taskable** (an agent can run a discovery pass on its own) and
 **operator-driven**.
 
-### CLI (one-shot, no crawl)
+### CLI
 
 ```bash
 aitm scan discover --target https://example.test/
@@ -74,16 +74,11 @@ aitm scan discover --target https://example.test/
 aitm scan discover --target https://example.test/ --max_depth 2 --max_pages 50
 ```
 
-The `aitm <family> <verb>` form is a **one-shot, in-process** dispatch: it builds a
-fresh core with an empty flow store and **no browser**, runs this one command and
-exits. It never connects to a proxy you have running, so it cannot crawl and
-cannot see that proxy's flows. Against a target whose host is in scope it returns
-no endpoints, `pages_crawled: 0` and `stopped_reason: "no_browser"` (the
-store-only fallback has nothing to list); against any other host it fails with an
-out-of-scope error before fetching anything. The one-shot process takes its scope
-from `scope.entries` in `config.yaml`; an `aitm scope add` run in a separate
-process neither persists nor reaches the running proxy. Treat the CLI form as a
-way to check argument parsing and scope, and use MCP or a UI for actual scans.
+`aitm scan discover --target …` runs on the running core, with its embedded
+browser and its flow store, and prints the same result the UIs and MCP show.
+With no core running it refuses (`no running core found`) rather than returning
+`pages_crawled: 0`. Scope is the core's: add the host with
+`aitm scope add --host <host>` first.
 
 ### UIs
 
@@ -198,7 +193,7 @@ harvests same-origin in-scope links (tag-aware — only `<a>`/`<area>` `href` an
 `<form>` `action`, never script or comment bodies), and enqueues them under the
 depth / page / time caps. The browser proxies through aitmproxy, so each
 navigation produces captured flows that the enumerator then reads. When no
-browser engine is attached (obscura not found, or a one-shot CLI call), discovery
+browser engine is attached (obscura not found), discovery
 does not navigate: it lists the distinct same-origin, in-scope request URLs
 already in the flow store (up to `max_pages`) and enumerates their injection
 points, reporting `stopped_reason: "no_browser"` and `pages_crawled: 0`. That

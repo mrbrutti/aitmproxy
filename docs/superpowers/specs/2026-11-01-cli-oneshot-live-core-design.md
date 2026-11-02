@@ -373,7 +373,7 @@ Every shipped sentence that says the one-shot cannot reach a running core is rep
 - `docs/scanner.md:60`: "and register `scan.discover`. Drive it through one of those, not the one-shot CLI." → "and register `scan.discover`. Drive it through any of them; the one-shot CLI reaches the same running core."
 - `docs/scanner.md:196`: "(obscura not found, or a one-shot CLI call)" → "(obscura not found)".
 - Left as they are (still true): `site/features.html:41`'s other sentences, `site/docs.html:82` ("runs one-shot commands"), `docs/scanner.md:54` ("reachable from MCP, the one-shot CLI and the UIs").
-- AC-R14-30 gains: `grep -c 'runs its own core' site/features.html` → 0, `grep -c 'has no browser' site/features.html site/poc.html` → 0 in both, `grep -c 'not the one-shot CLI' docs/scanner.md` → 0, `grep -c 'status-check.yaml' site/poc.html` → 0.
+- AC-R14-30 gains: `grep -c 'runs its own core' site/features.html` → 0, `grep -c 'has no browser' site/features.html site/poc.html` → 0 in both, `grep -c 'not the one-shot CLI' docs/scanner.md` → 0, `grep -c 'poc_path pocs/reflected-xss-search-q.yaml' site/poc.html` → 1 (the pair's `cli` row; the terminal figure below it keeps its `status-check` sample run, a valid run of a different PoC).
 
 **Release note** (exact text for the PR body and the next release; records the posture change):
 
