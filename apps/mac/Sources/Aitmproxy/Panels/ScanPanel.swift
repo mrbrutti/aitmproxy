@@ -168,7 +168,7 @@ final class ScanPanelState {
 
     var canCancel: Bool { cancelTarget != nil }
 
-    /// The wall clock in epoch milliseconds, read once a second by the poll so the
+    /// The wall clock in epoch milliseconds, set once a second by `clockTask` so the
     /// link's age clause moves without a render-time clock (Jobs view D6).
     var nowMs = ScanPanelState.clockMs
 
@@ -359,11 +359,27 @@ final class ScanPanelState {
     /// a line nothing else has replaced.
     @ObservationIgnored private var savedLine: String?
 
+    /// The Jobs age clock (Jobs view D6, D16): the state's one clock, started by
+    /// `poll()` and cancelled when it returns, so it runs exactly while the Scan page
+    /// is on screen. It is its own task, not a poll tick, because the poll loop is
+    /// sequential: while a bus read hangs for the client's 30 s timeout no tick runs,
+    /// and a hung read must not stop the age clock (the link read "from 0:02 ago"
+    /// over values 36 s old). It touches `nowMs` and nothing else; no view owns a
+    /// `Timer`.
+    @ObservationIgnored private var clockTask: Task<Void, Never>?
+
     /// Runs exactly while the Scan page is on screen (`.task(id: pollGeneration)`):
     /// the first-visit reads, then a 250 ms tick. Each tick serves the push flags
     /// first — that is D8's coalescing — then the timers. A read that fails sets
     /// its own error and leaves every counter and row exactly as it was (D11).
+    /// The age clock starts and stops with this task; it is cancelled by handle, not
+    /// by property, so a generation bump's new clock survives the old poll's return.
     func poll() async {
+        let clock = startClock()
+        defer {
+            clock.cancel()
+            if clockTask == clock { clockTask = nil }
+        }
         await firstVisitLoads()
         var tick = 0
         while !Task.isCancelled {
@@ -377,9 +393,22 @@ final class ScanPanelState {
         }
     }
 
+    /// Replaces the previous clock (a generation bump starts the new poll before the
+    /// old one has returned) and loops: sleep 1 s, set `nowMs`. Cancellation ends it.
+    private func startClock() -> Task<Void, Never> {
+        clockTask?.cancel()
+        let clock = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self else { return }
+                self.nowMs = Self.clockMs
+            }
+        }
+        clockTask = clock
+        return clock
+    }
+
     private func pollTick(_ tick: Int) async {
-        // The link's clock, once a second, before any read so the age never runs ahead.
-        if tick.isMultiple(of: 4) { nowMs = Self.clockMs }
         guard surfaceOffered else { return }
         // Push flags first: `noteJobEvent` only ever flags, so the values on screen
         // come from `scan.status` / `scan.list` / `scan.issues`, never from the line.
