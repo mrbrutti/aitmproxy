@@ -959,3 +959,57 @@ fn the_summary_head_names_the_maps_job_when_the_reply_carries_it() {
         "no job on the wire, no job on the head: {text}"
     );
 }
+
+/// Fix round H, H85 (#232 `b77b4d58`, pin only): an L4 lane's `SiteNode`
+/// carries `scheme` `tcp` or `udp`, `method` `L4`, the L4 target as
+/// `host:port` and the grammar as `path_template`. `default_port` knows
+/// neither scheme, so the host row reads `host:port` and the node row
+/// `L4 <grammar>` beside unchanged HTTP rows, with no code change.
+#[test]
+fn an_l4_site_node_reads_host_port_and_l4_grammar() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    let page = json!({
+        "nodes": [
+            {
+                "id": "node-http", "method": "GET", "scheme": "http", "host": "h1",
+                "port": 8080, "path_template": "/", "flows": [NODE_FLOW], "params": [],
+                "auth": false, "points": 1, "audited": false,
+            },
+            {
+                "id": "node-l4", "method": "L4", "scheme": "udp", "host": "10.0.0.7",
+                "port": 5353, "path_template": "/mdns", "flows": [], "params": [],
+                "auth": false, "points": 1, "audited": false,
+            },
+        ],
+        "points": [],
+        "next_cursor": null,
+    });
+    let _ = app.on_bus(sitemap_reply(page));
+    assert_eq!(app.scan.sitemap.nodes.len(), 2);
+    let text = screen(&app);
+    let unmarked = |row: String| row.trim_start_matches("> ").to_string();
+    assert!(
+        line_with(&text, "10.0.0.7:5353").is_some(),
+        "the L4 host row is host:port: {text}"
+    );
+    let l4_row = unmarked(pane_row(&text, "/mdns"));
+    assert!(
+        l4_row.starts_with("L4 "),
+        "the node row begins L4: {l4_row:?}"
+    );
+    assert_eq!(l4_row, "L4   /mdns  flows 0 · pts 1", "{text}");
+    assert!(
+        line_with(&text, "h1:8080").is_some(),
+        "the HTTP host row is unchanged: {text}"
+    );
+    assert_eq!(
+        unmarked(pane_row(&text, "GET  /")),
+        "GET  /  flows 1 · pts 1",
+        "the HTTP node row is unchanged: {text}"
+    );
+    assert!(
+        line_with(&text, "2 nodes").is_some(),
+        "both nodes are counted: {text}"
+    );
+}
