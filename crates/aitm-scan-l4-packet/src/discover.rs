@@ -84,38 +84,25 @@ impl DiscoverError {
 
 impl fmt::Display for DiscoverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Every variant stores the bare message (the code is stripped once at
-        // construction, review finding M4), so `Display` is the one place the
-        // code is prepended and it is never doubled.
+        // Every variant stores the bare message — `FieldError`, `PlanError` and
+        // `CodecError` all render without a code of their own (quality panel
+        // Minor) — so `Display` is the one place the code is prepended and it
+        // is never doubled (review finding M4).
         write!(f, "{}: {}", self.code(), self.message())
     }
 }
 
 impl std::error::Error for DiscoverError {}
 
-/// Strip a leading `invalid_profile: ` from a message a source already rendered
-/// with it, so a `DiscoverError` stores the bare message and `Display` is the
-/// single place the code is added (review finding M4).
-fn bare_invalid_profile(message: String) -> String {
-    match message.strip_prefix("invalid_profile: ") {
-        Some(rest) => rest.to_string(),
-        None => message,
-    }
-}
-
 impl From<FieldError> for DiscoverError {
     fn from(err: FieldError) -> Self {
-        // `FieldError` renders with its own `invalid_profile: ` prefix; strip it
-        // once so the stored message is bare.
-        Self::InvalidProfile(bare_invalid_profile(err.to_string()))
+        Self::InvalidProfile(err.to_string())
     }
 }
 
 impl From<PlanError> for DiscoverError {
     fn from(err: PlanError) -> Self {
-        // `PlanError` renders with its own `invalid_profile: ` prefix; strip it
-        // once so the stored message is bare.
-        Self::InvalidProfile(bare_invalid_profile(err.to_string()))
+        Self::InvalidProfile(err.to_string())
     }
 }
 
@@ -456,7 +443,7 @@ pub fn max_payload_for(target: &ResolvedTarget) -> usize {
 fn uncraftable_seed(id: &str, err: &PlanError) -> DiscoverError {
     let why = match err {
         PlanError::Craft(message) => message.clone(),
-        other => bare_invalid_profile(other.to_string()),
+        other => other.to_string(),
     };
     DiscoverError::InvalidProfile(format!("seed {id} cannot be crafted: {why}"))
 }
@@ -831,8 +818,7 @@ pub fn discover_all(
 
     for (index, spec) in target.l4.iter().enumerate() {
         let resolved = resolve_target(guard, spec)?;
-        let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)
-            .map_err(|message| DiscoverError::InvalidProfile(bare_invalid_profile(message)))?;
+        let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)?;
         let seeds = seed_payloads(&resolved, &profile.l4, seed_store, marker)?;
         let src_port = choose_src_port(guard, job_id, index, resolved.port);
 

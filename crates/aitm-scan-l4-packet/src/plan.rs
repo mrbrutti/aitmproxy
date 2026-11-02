@@ -144,6 +144,11 @@ pub struct SeedSpec {
 }
 
 /// What went wrong building a plan or a seed.
+///
+/// Like [`FieldError`](crate::fields::FieldError) this renders bare: the
+/// `invalid_profile` code is added once by the reporter (`DiscoverError`'s
+/// `Display` at discovery, `PacketLane::probe_host_for` at host time), so no
+/// message carries it twice (quality panel Minor, T5 live proof 4b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     /// The local address and the target address are different IP versions.
@@ -155,10 +160,10 @@ pub enum PlanError {
 impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IpVersionMismatch => f.write_str(
-                "invalid_profile: the local address and the target address are different IP versions",
-            ),
-            Self::Craft(message) => write!(f, "invalid_profile: cannot craft the seed packet: {message}"),
+            Self::IpVersionMismatch => {
+                f.write_str("the local address and the target address are different IP versions")
+            }
+            Self::Craft(message) => write!(f, "cannot craft the seed packet: {message}"),
         }
     }
 }

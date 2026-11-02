@@ -264,8 +264,11 @@ impl Lane for PacketLane {
                     return Err(anyhow!("lane_unavailable: discovery task failed: {join}"))
                 }
             };
+            // Keyed by the job id alone: `job.marker()` was asked once, above,
+            // for the canary seed, and the engine mints a fresh token on every
+            // call (quality panel Minor).
             let forgotten = shared.state.begin_job(
-                JobKey::new(job.job_id(), &job.marker()),
+                JobKey::new(job.job_id()),
                 plans,
                 discovery.points.iter().map(|p| p.id.clone()).collect(),
                 profile.l4.cases,
@@ -321,9 +324,11 @@ impl Lane for PacketLane {
         // Seed 0 is built here, once, so a seed that does not craft is refused
         // with its D3 code rather than at send time (review finding M8); it was
         // already validated at discovery, so this is unreachable short of a
-        // guard ceiling change mid-job.
+        // guard ceiling change mid-job. `PlanError` renders bare (quality panel
+        // Minor), so this is the one place that code is added on the host-time
+        // path and the text the engine notes is unchanged.
         let runner = PointRunner::new(Arc::clone(shared), job, point.clone(), plan, field)
-            .map_err(|err| anyhow!("{err}"))?;
+            .map_err(|err| anyhow!("invalid_profile: {err}"))?;
         // The registry owns the point's runner, keyed by the engine's stable
         // job id — never `JobCtx::marker`, which mints a fresh token on every
         // call, so the crash and reaction checks (which look the runner up by
@@ -357,11 +362,11 @@ impl Lane for PacketLane {
     ///
     /// # Errors
     ///
-    /// The first offending path's message, *bare*: the engine renders it as
-    /// `scan: invalid_profile: <message>` (`aitm_scan_model::scan_error`), so
-    /// the code [`validate_fields`] prefixes is stripped once here, exactly as
-    /// `discover` strips it before `DiscoverError`'s `Display` re-adds it. The
-    /// sentence after the code is the same on both paths.
+    /// The first offending path's [`FieldError`](crate::fields::FieldError),
+    /// rendered: the message is *bare*, because the engine renders it as
+    /// `scan: invalid_profile: <message>` (`aitm_scan_model::scan_error`) and
+    /// `DiscoverError`'s `Display` adds the same code on the discovery path.
+    /// The sentence after the code is the same on both paths.
     fn validate(&self, target: &ProfileTarget, profile: &ScanProfile) -> Result<(), String> {
         // The same substitution discovery makes: the profile's own list wins,
         // and an empty one falls back to this lane's default list (empty in
@@ -378,12 +383,8 @@ impl Lane for PacketLane {
             let Ok(ip) = spec.ip.parse::<IpAddr>() else {
                 continue;
             };
-            validate_fields(ip_version(ip), spec.proto, &requested).map_err(|message| {
-                message
-                    .strip_prefix("invalid_profile: ")
-                    .unwrap_or(&message)
-                    .to_string()
-            })?;
+            validate_fields(ip_version(ip), spec.proto, &requested)
+                .map_err(|err| err.to_string())?;
         }
         Ok(())
     }

@@ -10,10 +10,11 @@
 //! Ownership inside the lane: `PacketLane` ([`lane`](crate::lane)) holds an
 //! `Arc<Shared>` ([`host`]) — guard, backend, case store, seed store and the
 //! per-job `Arc<LaneState>` ([`state`]) — plus an `Arc<RunnerRegistry>` that maps
-//! `(job marker, point id)` to the one `PointRunner` that owns a point's fuzz
-//! run. Both checks ([`checks`]) read that single cached run through the
-//! registry, so whichever check reaches a point first drives the cases and the
-//! other sends nothing.
+//! `(job id, point id)` to the one `PointRunner` that owns a point's fuzz run.
+//! That key is the engine's stable job id, never `JobCtx::marker`, which mints
+//! a fresh token on every call. Both checks ([`checks`]) read that single
+//! cached run through the registry, so whichever check reaches a point first
+//! drives the cases and the other sends nothing.
 //!
 //! `crates/aitm/src/wire.rs` calls [`lane`](crate::lane()) with the handles from
 //! `Features::l4_shared`; both are `None` when L4 is disabled. A landed L4 lane

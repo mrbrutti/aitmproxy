@@ -784,8 +784,9 @@ impl JobCtx for TestJob {
     }
 }
 
-/// A UDP target on `127.0.0.1:port`, no grammar (the packet lane never reads
-/// one).
+/// A UDP target on `127.0.0.1:port`, with no grammar: discovery reads
+/// `grammar` into the site node's `path_template`, so this target's node
+/// template is `/`.
 #[must_use]
 pub fn udp_target(port: u16) -> L4TargetSpec {
     L4TargetSpec {
@@ -912,7 +913,7 @@ pub mod harness {
         .expect("the loopback profile discovers");
         let state = Arc::new(LaneState::new());
         let _ = state.begin_job(
-            JobKey::new(job.job_id(), &job.marker()),
+            JobKey::new(job.job_id()),
             plans.clone(),
             discovery.points.iter().map(|p| p.id.clone()).collect(),
             profile.l4.cases,

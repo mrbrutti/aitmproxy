@@ -575,10 +575,11 @@ impl PointRunner {
     /// counters, as call C1b requires of every stop this runner raises.
     fn stop(&self, reason: StopReason) {
         let job_id = self.job.job_id();
-        // The lane's one log line: a stop reason names a cap, a deadline, a
-        // budget, a wire or craft failure or an unavailable backend, never a
-        // payload byte, and it is the only trace a core operator has of why a
-        // packet job sent fewer cases than its profile asked for (the engine
+        // The lane's one `info!` line (its triage trail is all `debug` under
+        // the same target): a stop reason names a cap, a deadline, a budget, a
+        // wire or craft failure or an unavailable backend, never a payload
+        // byte, and it is the only trace a core operator has by default of why
+        // a packet job sent fewer cases than its profile asked for (the engine
         // records a check's error verdict nowhere else; T5 live proof, 4b).
         tracing::info!(
             target: "aitm::scanner::l4_packet",
@@ -1315,7 +1316,10 @@ impl PointRunner {
                     .min(deadline.saturating_duration_since(now));
                 tokio::time::sleep(spacing).await;
             }
-            let waited_ms = elapsed_ms(wait_started);
+            // Named for what it measures: the recovery wait when
+            // `waited_for_recovery`, the `replay_spacing` sleep otherwise
+            // (quality panel Minor).
+            let paused_ms = elapsed_ms(wait_started);
             triage.recovered = true;
             let delivered = match self
                 .deliver(
@@ -1364,7 +1368,7 @@ impl PointRunner {
                 round,
                 attempt = triage.attempts,
                 waited_for_recovery,
-                waited_ms,
+                paused_ms,
                 class = %class_label(class),
                 candidate,
                 "triage replay sent"
@@ -1663,16 +1667,21 @@ impl ProbeHost for PacketHost {
         Box::pin(async { Err(anyhow::anyhow!("the packet lane hosts no raw HTTP probes")) })
     }
 
-    /// The key the packet checks look this point's runner up by in the
-    /// [`RunnerRegistry`]: the engine's stable, unique **job id**, which is the
-    /// key `Lane::probe_host_for` registered the runner under. It is *not*
-    /// [`JobCtx::marker`] — the engine's `marker()` is a reflection canary that
-    /// mints a fresh token on every call (its trait doc and
-    /// `aitm_plugin_scanner::worker`), so keying by it would have a check look
-    /// the runner up under a different token than it was registered under and
-    /// read `missing_runner`: zero cases, nothing on the wire (T5 live proof,
-    /// 4b). `resolve_run` has only this `&dyn ProbeHost`, so this is the one
-    /// handle it has to the runner's key.
+    /// **This is not a marker.** It returns the engine's stable, unique **job
+    /// id**, because that is the key `Lane::probe_host_for` registered this
+    /// point's runner under in the [`RunnerRegistry`] and `resolve_run` has
+    /// only this `&dyn ProbeHost` to find it by. [`JobCtx::marker`] itself is a
+    /// reflection canary that mints a fresh token on every call (its trait doc
+    /// and `aitm_plugin_scanner::worker`), so keying by it would have a check
+    /// look the runner up under a different token than it was registered under
+    /// and read `missing_runner`: zero cases, nothing on the wire (T5 live
+    /// proof, 4b). A check that wants a canary from an L4 host therefore gets a
+    /// job id instead; the lane's own two checks never ask for one.
+    ///
+    /// T1b follow-up 57: `JobCtx::marker` documented as fresh-per-call plus a
+    /// stable `job_id()` key; once the lane keys on `job_id()` directly this
+    /// method's registry role goes away and it can return the engine's marker
+    /// again (quality panel Minor).
     fn marker(&self) -> String {
         self.runner.job.job_id().to_string()
     }
@@ -3178,7 +3187,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "invalid_profile: cannot craft the seed packet: crafted packet exceeds 65535 bytes"
+            "cannot craft the seed packet: crafted packet exceeds 65535 bytes"
         );
 
         assert!(
