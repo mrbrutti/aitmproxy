@@ -2090,11 +2090,23 @@ mod tests {
                 built, 1,
                 "{file} builds {built} job clients; this lint reads exactly one"
             );
+            // Read only the builder expression — from the one
+            // `JobClient::new(` to the `;` that ends the statement — so a
+            // `.with_guard(` in a comment or on some other builder cannot
+            // satisfy the lint (quality review, PR 3b). The `== 1` count
+            // above makes the slice unambiguous.
+            let start = source
+                .find("JobClient::new(")
+                .expect("the count above found exactly one");
+            let end = source[start..]
+                .find(';')
+                .expect("the JobClient::new(..) statement ends in a `;`");
+            let expression = &source[start..start + end];
             assert!(
-                source.contains(".with_guard("),
+                expression.contains(".with_guard("),
                 "{file} builds a JobClient without `.with_guard(...)`: a probe \
                  abandoned at the 30 s ceiling would not charge the core \
-                 breaker there (amendment 81)"
+                 breaker there (amendment 81). The builder reads:\n{expression}"
             );
         }
     }
