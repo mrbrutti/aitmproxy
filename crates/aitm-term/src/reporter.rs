@@ -941,7 +941,8 @@ impl Reporter {
     /// [`Reporter::send`] with the instant a non-droppable message stops
     /// waiting for room in a full queue (S5), so a call that sends twice
     /// (`card`, `error`) is bounded as a whole. The wait runs under the
-    /// state lock, so every caller is bounded by the same deadline.
+    /// state lock; every caller takes its deadline before `lock()`, so the
+    /// lock wait counts against its own `ACK_TIMEOUT` (S8).
     fn send_by(&self, msg: Msg, deadline: Instant) {
         let mut state = self.lock();
         if matches!(&*state, State::Idle(_)) {

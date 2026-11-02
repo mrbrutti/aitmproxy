@@ -961,8 +961,15 @@ section_perf() {
   # the audit threads explained — needs AITM_OLD_BIN and SKIPs without it.
   new_env perf || return
   # Warm-up: the new binary mints the CA in the isolated HOME (the old binary
-  # loads it below, when there is one).
+  # loads it below, when there is one). A new binary that cannot run here
+  # ends the section with both SKIPs: nothing below can be read from it.
   HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local rn=$?
+  if [ "$rn" != 0 ]; then
+    skip "no aitm-term thread after the ready card (new binary warm-up failed, exit $rn)"
+    skip "one-shot timing vs the old binary (same)"
+    end_section "$ROOT/thr-new.err"
+    return
+  fi
   start_server "$ROOT/thr-new.out" "$ROOT/thr-new.err" "$AITM_BIN" --config "$CFG"
   wait_for "$ROOT/thr-new.err" '^Log: ' 30 || note "new binary: ready card not seen (the server exited, or 30 s passed)"
   sleep 1
@@ -983,8 +990,8 @@ section_perf() {
     return
   fi
   HOME="$HOME_DIR" "$AITM_OLD_BIN" --config "$CFG" scope list >/dev/null 2>&1 </dev/null; local ro=$?
-  if [ "$rn" != 0 ] || [ "$ro" != 0 ]; then
-    skip "one-shot timing (warm-up failed: new exit $rn, old exit $ro — the old binary may not read this config)"
+  if [ "$ro" != 0 ]; then
+    skip "one-shot timing (old binary warm-up failed, exit $ro — it may not read this config)"
     end_section "$ROOT/thr-new.err"
     return
   fi

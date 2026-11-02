@@ -1154,10 +1154,7 @@ async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
             // lost audit records are an integrity signal the operator must
             // see, so the reporter says it too (a plain `warning:` line after
             // `finish()`, C10).
-            reporter.warn(&format!(
-                "the audit log did not finish flushing before exit ({} records estimated left)",
-                report.estimated_left
-            ));
+            reporter.warn(&audit_flush_warning(report.estimated_left));
         }
     }
     result
@@ -1182,6 +1179,16 @@ fn configured_agent_port(transport: &McpTransport) -> Option<u16> {
 /// reporting.
 fn stdio_eof_note(transport_is_stdio: bool, result: &anyhow::Result<()>) -> Option<&'static str> {
     (transport_is_stdio && result.is_ok()).then_some("stdin closed · stdio MCP transport ended")
+}
+
+/// The reporter's S7 integrity warning when the audit log did not finish
+/// flushing within `SHUTDOWN_BUDGET`: `estimated_left` is the estimate of
+/// records left behind. One place for the words, so the `warning:` line after
+/// `finish()` (C10) and the unit test that pins it cannot drift apart.
+fn audit_flush_warning(estimated_left: usize) -> String {
+    format!(
+        "the audit log did not finish flushing before exit ({estimated_left} records estimated left)"
+    )
 }
 
 /// Split a leading `--config <path>` / `--config=<path>` off `argv`, returning
@@ -1386,6 +1393,20 @@ mod tests {
         assert_eq!(super::stdio_eof_note(false, &ok), None);
         assert_eq!(super::stdio_eof_note(true, &err), None);
         assert_eq!(super::stdio_eof_note(false, &err), None);
+    }
+
+    /// S7: the reporter's audit-flush integrity warning names the estimate of
+    /// records left behind, in exactly these words for 0 and for 3.
+    #[test]
+    fn audit_flush_warning_names_the_count() {
+        assert_eq!(
+            super::audit_flush_warning(0),
+            "the audit log did not finish flushing before exit (0 records estimated left)"
+        );
+        assert_eq!(
+            super::audit_flush_warning(3),
+            "the audit log did not finish flushing before exit (3 records estimated left)"
+        );
     }
 
     /// A `MakeWriter` that appends every formatted log line to a shared buffer,

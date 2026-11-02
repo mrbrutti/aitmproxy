@@ -177,7 +177,9 @@ fn replacement(c: char) -> Option<char> {
         | '\u{2066}'..='\u{2069}' => Some('\u{FFFD}'),
         // S9: invisible format characters that hide inside a name on screen.
         // The joiners U+200C and U+200D are deliberately not here: emoji
-        // sequences and Indic/Persian text need them.
+        // sequences and Indic/Persian text need them. The deprecated format
+        // controls U+206A–U+206F are deliberately deferred to wave 2 (spec
+        // D4: left as-is in wave 1).
         '\u{00AD}'
         | '\u{180E}'
         | '\u{200B}'
@@ -522,5 +524,11 @@ mod tests {
         let neighbours = "\u{00AC}\u{00AE}\u{180D}\u{180F}\u{200A}\u{205F}\u{2065}\u{FEFE}\u{FF01}\u{FFF8}\u{FFFC}\u{E0080}";
         assert!(matches!(sanitize(neighbours), Cow::Borrowed(_)));
         assert_eq!(sanitize(neighbours), neighbours);
+        // Deferral pin (spec D4): the deprecated format controls U+206A–U+206F
+        // are left as-is in wave 1 (wave 2 takes them), so such text is still
+        // borrowed and unchanged.
+        let deferred = "a\u{206A}b";
+        assert!(matches!(sanitize(deferred), Cow::Borrowed(_)));
+        assert_eq!(sanitize(deferred), deferred);
     }
 }
