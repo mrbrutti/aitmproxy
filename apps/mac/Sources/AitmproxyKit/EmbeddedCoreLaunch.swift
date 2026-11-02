@@ -162,13 +162,17 @@ public enum EmbeddedCoreLaunch {
 
     /// Where a harness run's embedded core should write its durable audit, or `nil`
     /// for a normal launch. Pure and environment-injected so it is unit-testable
-    /// without the process environment. The same two variables that make
-    /// `SettingsDomain` pick the isolated defaults suite drive this:
+    /// without the process environment. "Harness run" is decided by the SAME
+    /// predicate `SettingsDomain.select` uses to pick the isolated defaults suite:
+    /// either of `SettingsDomain.harnessVariables` is NON-EMPTY. So a run that
+    /// isolates its settings always isolates its audit, whatever `APP_LIVE` spells.
+    /// (`SelfTest.live` wants exactly `APP_LIVE=1`, but that is the stricter question
+    /// of whether the live self-test RUNS, not whether the run is a harness.)
     /// - `APP_STORE` non-empty (a dev bundle, `tools/snap-dev.sh`): `<APP_STORE>/audit.jsonl`
     ///   — the store wins when both are set, as it does for `Store.url` (AC2);
-    /// - else `APP_LIVE == "1"` (the live self-test, which `SelfTest.live` matches
-    ///   exactly so): `<workDir>/audit.jsonl`, the per-run `0700` dir the manager
-    ///   deletes at teardown, so the record dies with the run (AC3);
+    /// - else `APP_LIVE` non-empty (the live self-test): `<workDir>/audit.jsonl`, the
+    ///   per-run `0700` dir the manager deletes at teardown, so the record dies with
+    ///   the run (AC3);
     /// - else `nil`: the installed app keeps the core's default (AC1).
     /// Both destinations are absolute, as `mcp.audit_log` requires; the core's writer
     /// preflight creates the file `0600` and any missing parent `0700`.
@@ -176,7 +180,7 @@ public enum EmbeddedCoreLaunch {
         if let store = environment["APP_STORE"], !store.isEmpty {
             return URL(fileURLWithPath: store, isDirectory: true).appending(path: "audit.jsonl")
         }
-        if environment["APP_LIVE"] == "1" {
+        if let live = environment["APP_LIVE"], !live.isEmpty {
             return workDir.appending(path: "audit.jsonl")
         }
         return nil
@@ -274,14 +278,15 @@ public enum EmbeddedCoreLaunch {
 
         /// The `config.yaml` body. The bus binds `port: 0` (ephemeral, so it
         /// never collides) and publishes its resolved address to `endpoint_file`;
-        /// the token and both paths are double-quoted so hex/paths never trip the
-        /// YAML parser. The curated default log level comes from the core itself
-        /// (Task 3) when `RUST_LOG` is unset, so it is not configured here.
+        /// the tokens and every spliced path are double-quoted so hex/paths never
+        /// trip the YAML parser. The curated default log level comes from the core
+        /// itself (Task 3) when `RUST_LOG` is unset, so it is not configured here.
         ///
         /// `obscura.stop_timeout` is pinned small (so the core's whole teardown
-        /// budget stays under the Swift-side `SIGKILL` grace — AC7), and both paths
-        /// are escaped for a double-quoted YAML scalar so a path with a quote or
-        /// backslash cannot break the file; a path with a newline is rejected.
+        /// budget stays under the Swift-side `SIGKILL` grace — AC7). All three
+        /// spliced paths — `endpoint_file`, `obscura.binary` and, for a harness run,
+        /// `mcp.audit_log` — go through `yamlDoubleQuoted`, so a path with a quote or
+        /// backslash cannot break the file and a path with a line break is rejected.
         ///
         /// `mcp.operator_token` is emitted alongside the agent token so the app can
         /// connect as a present human (`Frontend::Operator`) and widen scope from
@@ -380,17 +385,20 @@ public enum EmbeddedCoreLaunch {
 
     /// Escapes a value (a filesystem path, or a scope host) for embedding inside a
     /// double-quoted YAML scalar: backslashes and double-quotes are backslash-escaped.
-    /// A value containing a newline scalar (`\n` or `\r`, alone or as CRLF) is rejected
-    /// with `onNewline(value)` — a newline cannot be represented inside a double-quoted
-    /// scalar on one line, and allowing it would let a crafted value inject arbitrary
-    /// YAML (S3). Returns the inner text to splice between quotes.
+    /// A value containing a line-break scalar is rejected with `onNewline(value)`:
+    /// `\n` or `\r` (alone or as CRLF), which would break out of the scalar and let a
+    /// crafted value inject arbitrary YAML (S3); and the Unicode line breaks U+0085
+    /// (NEL), U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR), which YAML
+    /// treats as line folding inside a double-quoted scalar, so the core would read
+    /// a path the app never wrote (S-2). Returns the inner text to splice between quotes.
     static func yamlDoubleQuoted(
         _ value: String,
         onNewline: (String) -> ConfigError = ConfigError.pathContainsNewline
     ) throws -> String {
         // Scalars, not Characters: `"\r\n"` is one Swift grapheme, so a Character-level
         // `contains("\n")` let a CRLF value through.
-        guard !value.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) else {
+        let lineBreaks: Set<Unicode.Scalar> = ["\n", "\r", "\u{85}", "\u{2028}", "\u{2029}"]
+        guard !value.unicodeScalars.contains(where: { lineBreaks.contains($0) }) else {
             throw onNewline(value)
         }
         return value

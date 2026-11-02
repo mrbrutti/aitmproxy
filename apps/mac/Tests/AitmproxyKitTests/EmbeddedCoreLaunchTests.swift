@@ -816,13 +816,14 @@ import Testing
         #expect(!(try config.yaml()).contains("audit_log"))
     }
 
-    @Test func default_config_is_byte_identical_to_the_pre_audit_log_document() throws {
-        // AC1 (tester): "no `audit_log` key" alone would still pass if the nil path left a stray
-        // byte in the `mcp:` block (a blank line, a shifted indent after `operator_token`), and
-        // the tail `hasSuffix` pins never look there. Pin the whole default document exactly as
-        // `yaml()` rendered it before `auditLogFile` existed (`EmbeddedCoreLaunch.swift` at
-        // 61a5ae05: no trailing newline, the tails each start with their own `\n`), so the
-        // installed app's config is proven byte-identical, not merely key-free.
+    @Test func default_config_is_exactly_this_document() throws {
+        // AC1: the installed app's config (no harness variable, every option at its default) is
+        // pinned byte-for-byte. "No `audit_log` key" alone would still pass if an optional line
+        // left a stray byte in the `mcp:` block (a blank line, a shifted indent after
+        // `operator_token`), and the tail `hasSuffix` pins never look there. No trailing newline;
+        // each optional tail starts with its own `\n`. Update this document deliberately, and
+        // only when a key is meant to appear in every launch. (The text is what `yaml()` rendered
+        // at 61a5ae05, before `auditLogFile` existed.)
         let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
         let expected = """
         listen: "127.0.0.1:8080"
@@ -845,13 +846,15 @@ import Testing
     @Test func audit_log_line_sits_inside_the_mcp_block_and_is_what_the_core_parses() throws {
         // AC2/AC5: the key belongs to `mcp` (`deny_unknown_fields`), so it is the line directly
         // after `operator_token` at two-space indent and before the top-level `browser:`.
+        let fragment = "  operator_token: \"11\"\n  audit_log: \"/tmp/store/audit.jsonl\"\n"
         let yaml = try config(auditLogFile: URL(fileURLWithPath: "/tmp/store/audit.jsonl")).yaml()
-        #expect(yaml.contains("  operator_token: \"11\"\n  audit_log: \"/tmp/store/audit.jsonl\"\nbrowser:\n"))
+        #expect(yaml.contains(fragment + "browser:\n"))
 
         // Pin the fragment to the core's round-trip test: the Rust test must still spell the same
         // two lines (under the minimal `mcp:` header that makes them a complete parse input) and
-        // must still exist. This file lives at apps/mac/Tests/AitmproxyKitTests/, so the repo
-        // root is five levels up.
+        // must still exist. The Rust literal is derived from the asserted fragment with the same
+        // escaping as the system-proxy pin, so the two can never drift apart silently. This file
+        // lives at apps/mac/Tests/AitmproxyKitTests/, so the repo root is five levels up.
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { root.deleteLastPathComponent() }
         let source = root.appending(path: "crates/aitm/src/config_file.rs")
@@ -859,7 +862,10 @@ import Testing
             FileManager.default.fileExists(atPath: source.path),
             "cannot find the core's src/config_file.rs at \(source.path)")
         let rust = try String(contentsOf: source, encoding: .utf8)
-        let rustLiteral = #""mcp:\n  operator_token: \"11\"\n  audit_log: \"/tmp/store/audit.jsonl\"\n""#
+        let rustLiteral = "\"" + ("mcp:\n" + fragment)
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n") + "\""
         #expect(rust.contains(rustLiteral), "src/config_file.rs no longer contains the literal \(rustLiteral)")
         #expect(rust.contains("fn mcp_audit_log_path_the_mac_app_emits_parses()"))
     }
@@ -875,22 +881,40 @@ import Testing
         #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\nlisten: evil")) {
             try bad.yaml()
         }
+        // A bare carriage return is a line break to YAML as much as `\n` is (AC4's `\r` half).
+        let cr = config(auditLogFile: URL(fileURLWithPath: "/tmp/x\rlisten: evil"))
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\rlisten: evil")) {
+            try cr.yaml()
+        }
+        // libyaml folds U+0085 (NEL), U+2028 and U+2029 inside a double-quoted scalar, so the
+        // core would read a directory the app never named; they are refused like `\n` (S-2).
+        let nel = config(auditLogFile: URL(fileURLWithPath: "/tmp/x\u{85}listen: evil"))
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\u{85}listen: evil")) {
+            try nel.yaml()
+        }
+        let lineSeparator = config(auditLogFile: URL(fileURLWithPath: "/tmp/x\u{2028}listen: evil"))
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.pathContainsNewline("/tmp/x\u{2028}listen: evil")) {
+            try lineSeparator.yaml()
+        }
     }
 
     @Test func harness_audit_log_file_follows_the_harness_variables() {
-        // AC1–AC3: no harness variable means nil (the installed app); a non-empty `APP_STORE`
-        // points into the store; `APP_LIVE=1` alone points into the per-run work dir; when both
-        // are set the store wins, as it does for `Store.url`.
+        // AC1–AC3: no harness variable (absent or empty) means nil (the installed app); a
+        // non-empty `APP_STORE` points into the store; a non-empty `APP_LIVE` alone points into
+        // the per-run work dir; when both are set the store wins, as it does for `Store.url`.
         let workDir = URL(fileURLWithPath: "/tmp/wd", isDirectory: true)
         func file(_ env: [String: String]) -> URL? {
             EmbeddedCoreLaunch.harnessAuditLogFile(environment: env, workDir: workDir)
         }
         #expect(file([:]) == nil)
         #expect(file(["APP_STORE": ""]) == nil)
-        #expect(file(["APP_LIVE": "0"]) == nil)
-        // Spec Design 2: `APP_LIVE` is matched as exactly "1" (what the live harness sets and
-        // `SelfTest.live` checks), so a truthy-looking spelling is still a normal launch.
-        #expect(file(["APP_LIVE": "true"]) == nil)
+        #expect(file(["APP_LIVE": ""]) == nil)
+        // Spec Design 2 (Amendment 1): `APP_LIVE` is matched as NON-EMPTY, the same predicate
+        // `SettingsDomain.select` uses to pick the isolated defaults suite, so a run that isolates
+        // its settings always isolates its audit too; "0" and "true" are harness runs here even
+        // though `SelfTest.live` (does the self-test RUN) still wants exactly "1".
+        #expect(file(["APP_LIVE": "0"])?.path == "/tmp/wd/audit.jsonl")
+        #expect(file(["APP_LIVE": "true"])?.path == "/tmp/wd/audit.jsonl")
         #expect(file(["APP_STORE": "/tmp/Aitmproxy-dev-state-x"])?.path == "/tmp/Aitmproxy-dev-state-x/audit.jsonl")
         #expect(file(["APP_LIVE": "1"])?.path == "/tmp/wd/audit.jsonl")
         #expect(file(["APP_STORE": "/tmp/Aitmproxy-dev-state-x", "APP_LIVE": "1"])?.path == "/tmp/Aitmproxy-dev-state-x/audit.jsonl")
