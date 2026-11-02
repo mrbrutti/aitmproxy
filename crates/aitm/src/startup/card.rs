@@ -221,13 +221,34 @@ pub fn recovery_summary(r: &Recovery) -> Option<String> {
 /// `obscura probed <version>` (the line `cli-startup.sh` matches), or
 /// `obscura probed` when the engine reported no version; another engine is
 /// `browser ready (<engine>)`.
+///
+/// The engine's `--version` output names itself (`obscura aitm-v1`), so a
+/// leading engine name, case-insensitive and followed by one or more spaces,
+/// is dropped from `version` before formatting (live dry-run finding D4);
+/// the word after `probed` is the version alone.
 pub fn browser_summary(engine: &BrowserEngine, version: Option<&str>) -> String {
-    match (engine, version) {
+    match (engine, version.and_then(obscura_version)) {
         (BrowserEngine::Obscura, Some(version)) => format!("obscura probed {version}"),
         (BrowserEngine::Obscura, None) => "obscura probed".to_string(),
         (BrowserEngine::Chrome, _) => "browser ready (chrome)".to_string(),
         (BrowserEngine::Firefox, _) => "browser ready (firefox)".to_string(),
     }
+}
+
+/// `version` trimmed, minus a leading `obscura` engine name (any case) and
+/// the whitespace after it; `None` when nothing is left (a blank string or
+/// the bare engine name carries no version).
+fn obscura_version(version: &str) -> Option<&str> {
+    let version = version.trim();
+    let (head, tail) = version
+        .split_once(char::is_whitespace)
+        .unwrap_or((version, ""));
+    let rest = if head.eq_ignore_ascii_case("obscura") {
+        tail.trim()
+    } else {
+        version
+    };
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// A row painted plain with no next step.
@@ -876,6 +897,50 @@ mod tests {
         assert_eq!(
             browser_summary(&BrowserEngine::Firefox, None),
             "browser ready (firefox)"
+        );
+    }
+
+    /// Live dry-run finding D4: obscura's `--version` output is
+    /// `obscura aitm-v1`, so the raw string printed `obscura probed obscura
+    /// aitm-v1`. Spec T7 is `obscura probed <version>` (the plan's live regex
+    /// is `^obscura probed \S+$`): a leading engine name, case-insensitive
+    /// and followed by one or more spaces, is dropped and the rest trimmed.
+    #[test]
+    fn browser_summary_strips_the_engine_name_from_the_version() {
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("obscura aitm-v1")),
+            "obscura probed aitm-v1"
+        );
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("Obscura   aitm-v1")),
+            "obscura probed aitm-v1"
+        );
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("  obscura aitm-v1 \n")),
+            "obscura probed aitm-v1"
+        );
+        // A bare engine name carries no version: same line as `None`.
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("obscura")),
+            "obscura probed"
+        );
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("   ")),
+            "obscura probed"
+        );
+        // A version that merely contains the name is left alone.
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("aitm-v1 (obscura)")),
+            "obscura probed aitm-v1 (obscura)"
+        );
+        // The pre-existing forms are unchanged.
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, Some("0.3.1")),
+            "obscura probed 0.3.1"
+        );
+        assert_eq!(
+            browser_summary(&BrowserEngine::Obscura, None),
+            "obscura probed"
         );
     }
 

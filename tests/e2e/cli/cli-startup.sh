@@ -99,12 +99,16 @@ start_server() {
   SERVER_PID=$!
 }
 
-# Wait up to $2 seconds for the server logging to $1 to come up (a "listening"
-# line) or to exit on its own.
+# Wait up to $2 seconds for the server logging to $1 to be ready or to exit on
+# its own. Ready is the startup card's last row (`Log: `), or the line that
+# replaces it when the log file could not be opened (`warning: log file
+# unavailable`). The earlier signal, `proxy listening`, is printed as soon as
+# the ports bind, BEFORE the browser launches and the card prints; waiting on
+# it stopped the server too early for `obscura probed` and the `#t=` URL.
 wait_ready() {
   local log="$1" secs="$2" i=0
   while kill -0 "$SERVER_PID" 2>/dev/null; do
-    grep -qE "web UI \(agent\):|proxy listening" "$log" 2>/dev/null && break
+    grep -qE '^Log: |^warning: log file unavailable' "$log" 2>/dev/null && break
     [ "$i" -ge "$((secs*4))" ] && break
     sleep 0.25; i=$((i+1))
   done
