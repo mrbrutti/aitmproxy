@@ -17,6 +17,11 @@ final class FlowCellView: NSTableCellView {
     /// The identifier this cell last showed: a pending verdict is applied only while it still matches
     /// (cells are reused).
     private var shownIdentifier: String?
+    /// The identifier this cell has a pending `onResolve` callback for (stage-6 security on #272):
+    /// a cell reconfigured every tick while a lookup is in flight registers once, not once per tick.
+    private var awaitingIdentifier: String?
+    /// The tint the pending mark should take when the verdict lands (the latest configure wins).
+    private var pendingTint: NSColor?
 
     init(column: FlowColumn) {
         self.column = column
@@ -56,7 +61,7 @@ final class FlowCellView: NSTableCellView {
             clientIcon.heightAnchor.constraint(equalToConstant: Tok.Size.icon),
         ])
         if column == .client {
-            label.leadingAnchor.constraint(equalTo: clientIcon.trailingAnchor, constant: 6).isActive = true
+            label.leadingAnchor.constraint(equalTo: clientIcon.trailingAnchor, constant: Tok.Metric.gapTight).isActive = true
         } else {
             label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad).isActive = true
         }
@@ -116,10 +121,17 @@ final class FlowCellView: NSTableCellView {
                     // Pending: an empty mark keeps the label's x; the verdict lands through the callback
                     // only if this reused cell still shows the same identifier.
                     clientIcon.image = nil
-                    AppIdentityResolver.shared.onResolve(identifier) { [weak self] identity in
-                        guard let self, self.shownIdentifier == identifier else { return }
-                        self.applyClientMark(identity, name: client.name, tint: meta.nsColor)
-                        self.clientIcon.setAccessibilityElement(self.clientIcon.image != nil)
+                    pendingTint = meta.nsColor
+                    if awaitingIdentifier != identifier {
+                        awaitingIdentifier = identifier
+                        AppIdentityResolver.shared.onResolve(identifier) { [weak self] identity in
+                            guard let self else { return }
+                            if self.awaitingIdentifier == identifier { self.awaitingIdentifier = nil }
+                            guard self.shownIdentifier == identifier else { return }
+                            // The label already carries the latest configure's name; the tint likewise.
+                            self.applyClientMark(identity, name: self.label.stringValue, tint: self.pendingTint ?? meta.nsColor)
+                            self.clientIcon.setAccessibilityElement(self.clientIcon.image != nil)
+                        }
                     }
                 }
             } else {

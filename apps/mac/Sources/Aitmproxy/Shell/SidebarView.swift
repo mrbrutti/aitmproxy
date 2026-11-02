@@ -10,12 +10,14 @@ struct SidebarView: View {
     @Environment(Session.self) private var session
     @FocusState private var filterFocused: Bool
 
-    /// The three leading insets of the Apps tree (spec D5 / D11), on the `Space` scale: the chevron
-    /// at 12, the mark (and every flat sub-item) at 28, a domain under an app at 52.
+    /// The three leading insets of the Apps tree (spec D5 / D11), each derived from the anatomy, not
+    /// summed from unrelated steps: the chevron at `Space.md` (12); the mark — and every flat
+    /// sub-item — right after the chevron's `Tok.Size.icon` frame (28); a domain's mark where the
+    /// app's name starts, one icon and one `Space.sm` gap further in (52) — stage-6 quality on #272.
     private enum Inset {
         static let chevron = Space.md
-        static let mark = Space.md + Space.lg
-        static let domain = mark + Space.xxl
+        static let mark = chevron + Tok.Size.icon
+        static let domain = mark + Tok.Size.icon + Space.sm
     }
 
     /// Case-insensitive substring over host / client name (S-034).
@@ -37,13 +39,15 @@ struct SidebarView: View {
             brand
             Rule()
             ScrollView {
+                // `Session.clients` groups every row on each read (stage-6 quality on #272): read once per body.
+                let clients = session.clients
                 VStack(alignment: .leading, spacing: 0) {
                     // Groups by the operator's jobs (spec §3): the main work window first.
                     group("Traffic")
                     item(.flows, count: session.rows.count)
-                    item(.apps, count: session.clients.count)
+                    item(.apps, count: clients.count)
                     if session.page == .apps || querying {
-                        let visible = session.clients.filter { matches($0.0) }
+                        let visible = clients.filter { matches($0.0) }
                         if querying, visible.isEmpty { hint("No match") }
                         ForEach(visible, id: \.0.groupKey) { client, count in
                             appRow(client, count: count)
@@ -70,9 +74,9 @@ struct SidebarView: View {
                     // Pinned apps are keyed by the stored group key (D7, no migration): a key with no current
                     // client keeps its key as title and resolves through the one cache (plan call 5).
                     ForEach(session.pins.apps.filter { key in
-                        matches(key) || (session.clients.first { $0.0.groupKey == key }.map { matches($0.0.name) } ?? false)
+                        matches(key) || (clients.first { $0.0.groupKey == key }.map { matches($0.0.name) } ?? false)
                     }, id: \.self) { key in
-                        let current = session.clients.first { $0.0.groupKey == key }
+                        let current = clients.first { $0.0.groupKey == key }
                         subItem(.client(key), title: current?.0.name ?? key, count: current?.1, page: .pinned,
                                 help: AppIdentifier.tooltipText(key)) {
                             ClientMark(client: current?.0 ?? ClientInfo(name: key, bundleID: key))
@@ -133,7 +137,7 @@ struct SidebarView: View {
         Text(text)
             .font(Tok.Face.ui(Tok.Typography.Size.sm))
             .foregroundStyle(Tok.Ink.tertiary.color)
-            .padding(.leading, 28)
+            .padding(.leading, Inset.mark)
             .padding(.vertical, Space.xs)
     }
 
@@ -180,6 +184,9 @@ struct SidebarView: View {
     /// expanded; while querying, the hosts matching the query — or all of them when the app matched
     /// only by name or key.
     private func domains(under key: String) -> [(String, Int)] {
+        // Scan the rows only for a row that will show domains (stage-6 security on #272: the idle
+        // Apps page with every app collapsed must not walk every row per app per tick).
+        guard querying || session.expandedApps.contains(key) else { return [] }
         let hosts = session.hosts(forClient: key)
         if querying {
             let matching = hosts.filter { matches($0.0) }
@@ -196,9 +203,9 @@ struct SidebarView: View {
         let group = FlowGroup.client(key)
         let selected = session.page == .apps && session.group == group
         let pinned = session.isPinned(group)
-        // The chevron reads open whenever domain rows are showing: toggled open, or every match while
-        // a query is typed (Tester M3 — spec D4 shows the hosts while querying, D5 draws the chevron).
-        let expanded = session.expandedApps.contains(key) || (querying && !domains(under: key).isEmpty)
+        // The chevron reads open whenever domain rows are showing: toggled open, or while a query is
+        // typed (Tester M3 — a visible app always has hosts, so "querying" is the whole condition).
+        let expanded = session.expandedApps.contains(key) || querying
         return HStack(spacing: 0) {
             Button {
                 session.toggleExpanded(key)
@@ -210,6 +217,9 @@ struct SidebarView: View {
                     .frame(width: Tok.Size.icon, height: Tok.Size.icon)
                     .contentShape(Rectangle())
             }
+            // While a query drives the sub-rows a click would change nothing visible yet flip
+            // `expandedApps` for later (stage-6 spec on #272): the chevron is inert until the query clears.
+            .disabled(querying)
             .buttonStyle(.plain)
             .accessibilityLabel(expanded ? "Collapse \(client.name)" : "Expand \(client.name)")
             Button {

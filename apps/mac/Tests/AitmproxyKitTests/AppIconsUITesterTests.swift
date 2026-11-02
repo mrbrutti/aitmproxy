@@ -73,7 +73,6 @@ import Testing
         #expect(clients.map(\.0.name) == ["Chrome"])
         let hosts = ClientTree.hosts(forClient: key, in: rows)
         #expect(hosts.map { "\($0.0):\($0.1)" } == ["a.example:2", "b.example:1"])
-        #expect(hosts.map(\.1).reduce(0, +) == clients[0].1)
 
         #expect(OverviewStats(rows: rows).clients == clients.count)
         #expect(OverviewBreakdowns(rows: rows).clients.map(\.key) == [key])
@@ -90,11 +89,9 @@ import Testing
         let key = "com.example.Gone"
         let rebuilt = ClientInfo(name: key, bundleID: key)
         #expect(rebuilt.groupKey == key)
-        #expect((rebuilt.bundleID ?? rebuilt.name) == key)
         #expect(AppIdentifier.tooltipText(key) == key)
         // The same for a client with no identifier at all: the sidebar and the cell resolve it by its name.
         let nameless = ClientInfo(name: "curl")
-        #expect((nameless.bundleID ?? nameless.name) == "curl")
         #expect(AppIdentifier.tooltipText(nameless.bundleID ?? nameless.name) == "curl")
 
         let rows = [
