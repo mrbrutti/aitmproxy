@@ -170,6 +170,14 @@ impl ProbeHost for H2Host {
         self.peer
     }
 
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        self.inner.client()
+    }
+
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        self.inner.captured()
+    }
+
     fn charge(&self, units: u32) -> bool {
         self.charges
             .lock()

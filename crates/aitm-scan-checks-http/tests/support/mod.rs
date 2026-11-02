@@ -452,6 +452,22 @@ impl ProbeHost for ScriptedHost {
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         Vec::new()
     }
+
+    /// None to lend: a scripted host answers from its table and never sends.
+    fn client(&self) -> Option<std::sync::Arc<dyn aitm_core::ProxyClient>> {
+        None
+    }
+
+    /// The script, not a captured flow, is where every answer comes from.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Affordable up to `budget_left`, debiting nothing: a scripted probe is
+    /// what spends this host's budget.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
+    }
 }
 
 /// A response with an explicit status, header list and body.

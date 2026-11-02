@@ -135,11 +135,10 @@ pub trait ProbeHost: Send + Sync {
     /// `http.send` runs through this client, so scope, rate, marks and the
     /// record policy still apply (spec D9.3).
     ///
-    /// `None` by default: a host that cannot lend its client out makes the
-    /// bridge fall back to refusing the send rather than sending unbudgeted.
-    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
-        None
-    }
+    /// **Required (amendment 72b).** A lane that holds a [`JobCtx`] answers
+    /// `Some(job.client())`; a host with no client to lend answers `None`,
+    /// which makes the bridge refuse the send rather than send unbudgeted.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>>;
 
     /// An owning handle to this host, for a bridge that must keep it alive past
     /// the borrow it was handed — the scripting tier parks it in a thread-local
@@ -154,11 +153,10 @@ pub trait ProbeHost: Send + Sync {
     /// The captured flow this point came from, for a passive check that must
     /// read what was already observed and send nothing at all.
     ///
-    /// `None` by default, and `None` for any point that was not built from a
-    /// captured flow.
-    fn captured(&self) -> Option<aitm_core::HttpFlow> {
-        None
-    }
+    /// **Required (amendment 72b).** A host built from a captured HTTP flow
+    /// answers `Some` with that flow; every synthetic or non-HTTP point (the
+    /// ws and L4 lanes, a generated point) answers `None`.
+    fn captured(&self) -> Option<aitm_core::HttpFlow>;
 
     /// The peer address the baseline response actually came from, when the host
     /// knows it (an HTTP host fills it from the baseline flow's connection), so
@@ -175,12 +173,11 @@ pub trait ProbeHost: Send + Sync {
     /// in `scan.status.probes`. Returns `false` when the budget cannot cover
     /// it; the caller must then not send.
     ///
-    /// The default only checks [`ProbeHost::budget_left`] and charges nothing
-    /// because the trait has no job handle; the engine's host overrides it to
-    /// charge the job's `JobBudget` and pace through the guard.
-    fn charge(&self, units: u32) -> bool {
-        self.budget_left() >= units
-    }
+    /// **Required (amendment 72b).** The charge must actually debit the job's
+    /// budget — a lane that holds a [`JobCtx`] answers `job.charge(units)`, so
+    /// the stimulus is paced and counted like every other. A host that cannot
+    /// debit anything answers `false` for anything it cannot cover.
+    fn charge(&self, units: u32) -> bool;
 }
 
 /// The engine-owned, per-job surface a [`Lane`] consumes (spec D5).

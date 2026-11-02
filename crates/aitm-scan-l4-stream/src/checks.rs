@@ -1796,6 +1796,22 @@ mod tests {
         fn held_flows(&self) -> Vec<aitm_core::Flow> {
             Vec::new()
         }
+
+        /// None to lend: the scripted host sends nothing at all.
+        fn client(&self) -> Option<Arc<dyn ProxyClient>> {
+            None
+        }
+
+        /// An l4 point is built from no captured HTTP flow.
+        fn captured(&self) -> Option<aitm_core::HttpFlow> {
+            None
+        }
+
+        /// Affordable up to `budget_left`, debiting nothing: the scripted
+        /// host holds no budget.
+        fn charge(&self, units: u32) -> bool {
+            self.budget_left() >= units
+        }
     }
 
     /// A clean reply that took `elapsed_ms`.

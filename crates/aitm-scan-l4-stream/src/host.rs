@@ -805,6 +805,24 @@ impl ProbeHost for StreamHost {
         self.job.cancelled()
     }
 
+    /// The job's budgeted client, lent for a bridge send (amendment 72b).
+    ///
+    /// Not this host's `client` field, which is the L4 stream transport.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        Some(self.job.client())
+    }
+
+    /// `None`: an l4 stream point is generated from a grammar, never from a
+    /// captured HTTP flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Debited against the one job budget, like every case sent.
+    fn charge(&self, units: u32) -> bool {
+        self.job.charge(units)
+    }
+
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         // The lane holds no HTTP flow; `L4Evidence.sent_hex` is its record.
         Vec::new()
@@ -1393,6 +1411,30 @@ mod tests {
             1
         );
         assert_eq!(host.state.cases_sent.load(Ordering::SeqCst), 0);
+    }
+
+    /// Amendment 72b: `client`, `charge` and `captured` are required, and the
+    /// stream host answers them from its job.
+    #[tokio::test]
+    async fn the_stream_host_lends_the_job_client_and_debits_its_budget() {
+        let job = Arc::new(TestJob::new());
+        let client = Arc::new(CountingClient::live());
+        let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
+
+        let lent = host
+            .client()
+            .expect("the stream host lends the job's client");
+        assert!(
+            Arc::ptr_eq(&lent, &job.client()),
+            "the host lends the job's own budgeted client, not a second one"
+        );
+        assert!(host.charge(2), "two units are affordable");
+        assert_eq!(job.charges(), 2, "the charge reaches the job's budget");
+        assert_eq!(client.count(), 0, "answering the three costs no exchange");
+        assert!(
+            host.captured().is_none(),
+            "an l4 stream point came from no captured HTTP flow"
+        );
     }
 
     /// C4's host half across the whole profile surface: no built-in profile,

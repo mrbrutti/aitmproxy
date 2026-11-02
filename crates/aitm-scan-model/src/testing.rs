@@ -167,6 +167,19 @@ impl ProbeHost for NullHost {
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         Vec::new()
     }
+    /// None to lend: a check driven by the null host cannot send at all.
+    fn client(&self) -> Option<Arc<dyn ProxyClient>> {
+        None
+    }
+    /// The null host is built from no flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+    /// Affordable up to [`ProbeHost::budget_left`], and nothing is debited:
+    /// the null host has no budget to debit.
+    fn charge(&self, units: u32) -> bool {
+        self.budget_left() >= units
+    }
 }
 
 /// A [`CheckMeta`] for `id`: class `none`, HTTP lane, query points, passive,
@@ -521,6 +534,12 @@ impl ProbeHost for RecordingHost {
 
     fn baseline_peer_addr(&self) -> Option<SocketAddr> {
         self.peer
+    }
+
+    /// The recorder answers every probe itself; it was built from no captured
+    /// flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
     }
 
     /// The recorder charges for real, so a test can see a bypassing stimulus

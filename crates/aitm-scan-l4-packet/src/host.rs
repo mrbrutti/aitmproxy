@@ -1702,6 +1702,22 @@ impl ProbeHost for PacketHost {
         self.runner.job.cancelled()
     }
 
+    /// The job's budgeted client, lent for a bridge send (amendment 72b).
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        Some(self.runner.job.client())
+    }
+
+    /// `None`: a packet point is crafted from a seed, never from a captured
+    /// HTTP flow.
+    fn captured(&self) -> Option<aitm_core::HttpFlow> {
+        None
+    }
+
+    /// Debited against the one job budget, like every injected frame.
+    fn charge(&self, units: u32) -> bool {
+        self.runner.job.charge(units)
+    }
+
     fn held_flows(&self) -> Vec<aitm_core::Flow> {
         // Every case is recorded in the lane-private L4 store, not as an HTTP
         // flow; there is nothing for the engine to re-record.
@@ -1822,6 +1838,31 @@ mod tests {
             bytes: bytes.to_vec(),
             injected: true,
         }
+    }
+
+    /// Amendment 72b: `client`, `charge` and `captured` are required, and the
+    /// packet host answers them from its runner's job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_packet_host_lends_the_job_client_and_debits_its_budget() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let host = PacketHost::new(runner);
+
+        let lent = host
+            .client()
+            .expect("the packet host lends the job's client");
+        assert!(
+            Arc::ptr_eq(&lent, &job.client()),
+            "the host lends the job's own budgeted client, not a second one"
+        );
+        assert!(host.charge(2), "two units are affordable");
+        assert_eq!(job.charged(), 2, "the charge reaches the job's budget");
+        assert!(
+            host.captured().is_none(),
+            "a packet point came from no captured HTTP flow"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
