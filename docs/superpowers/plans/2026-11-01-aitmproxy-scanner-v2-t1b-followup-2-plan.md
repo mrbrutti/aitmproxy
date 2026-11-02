@@ -313,16 +313,21 @@ secret; never touch `crates/aitm-tui/**`, `apps/**`, `tests/e2e/**`, lane crates
 
     | Site | Today | Disposition |
     |---|---|---|
-    | `worker.rs` 1599, 1702, 1734, 1764, 1904, 1945, 1969, 1991, 2010, 2031, 2064, 2100, 2144, 2441, 2478, 2494, 2523, 2562, 2636, 2799, 2835, 2866 | `wait_terminal(.., 5 s)` | convert (notification) |
-    | `worker.rs` 1651, 2728, 2761 | `wait_terminal(.., 2 s)` (the CI failure) | convert |
-    | `worker.rs` 2675 | `wait_terminal(.., 10 s)` (panic path) | convert |
-    | `worker.rs` 1638-1641 | poll `issues.for_job` under a 5 s deadline, 10 ms sleep | convert to a poll under `TERMINAL_NET` (readiness, no notification exists for "first issue recorded"; the bound is no longer measured) |
+    | `worker.rs` 1599, 1702, 1734, 1764, 1904, 1945, 1969, 1991, 2010, 2031, 2064, 2100, 2144, 2441, 2478, 2494, 2523, 2562, 2636, 2799, 2835, 2866 | `wait_terminal(.., 5 s)` | converted in #285 (notification); re-checked after the c7575cdc merge: `grep "wait_terminal("` over `worker.rs`/`jobs.rs` shows no `Duration` argument left |
+    | `worker.rs` 1651, 2728, 2761 | `wait_terminal(.., 2 s)` (the CI failure) | converted in #285; re-checked, gone |
+    | `worker.rs` 2675 | `wait_terminal(.., 10 s)` (panic path) | converted in #285; re-checked, gone |
+    | `worker.rs` 1638-1641 | poll `issues.for_job` under a 5 s deadline, 10 ms sleep | converted in #285 to a poll under `TERMINAL_NET`; re-checked: `grep "from_secs(2)\|from_secs(5)\|from_secs(10)"` over `worker.rs`/`jobs.rs` returns nothing |
     | `worker.rs` 1659 | `sleep(100 ms)` then "no client call after `finished_at`" | keep: a negative wait that can only miss a bug, never fail spuriously; comment says so |
     | `worker.rs` 1833 | 50 x 10 ms ticks on the injected `ProgressClock` | keep: already an injected clock, no real sleep |
-    | `worker.rs` 2185 | `Instant::now() + 60 s` budget deadline | keep: a budget the test never reaches |
-    | `jobs.rs` 2653, 2976, 3008, 3177 | `wait_terminal(.., 5 s)` | convert |
-    | `jobs.rs` 2170, 2185 | the helper's own 10 ms polls | removed with the helper |
+    | `worker.rs` 2185 (now 2470) | `Instant::now() + 60 s` budget deadline | keep: a budget the test never reaches |
+    | `jobs.rs` 2653, 2976, 3008, 3177 | `wait_terminal(.., 5 s)` | converted in #285; re-checked, gone |
+    | `jobs.rs` 2170, 2185 | the helper's own 10 ms polls | removed with the helper in #285 |
     | `jobs.rs` 1481 | stub check polls `host.cancelled()` every 5 ms | keep: the fake check's blocking body (`ProbeHost` exposes a bool, not a token); it ends on cancel, not on a bound |
+    | `verbs.rs` 1573 `start_returns_a_start_result_immediately` | `began.elapsed() < 2 s` | converted (this PR): the job runs `FakeCheck::blocking`, which cannot end until cancelled, so the verb answering with `terminal_signal(job)` still `false` proves it did not wait for the work; then `scan.cancel` + `wait_terminal`. No clock |
+    | `commands.rs` 1550 `scan_discover_crawls_under_egress_confinement` | poll `posture.confined()` under a 5 s deadline, 10 ms sleep | converted (this PR): with the verb's wait on the terminal signal (flipped last in `finish`, after the hold drops) the release has happened when `invoke` returns; direct `assert!(!posture.confined())` |
+    | `commands.rs` 1652 `overlapping_scan_is_refused_without_touching_the_browser` | `gate.entered.recv_timeout(10 s)` | net (this PR): the gate channel is the notification; the bound is `TERMINAL_NET`, documented in the test as a safety net that names the hang, never measured |
+    | `commands.rs` 2986 `discover_time_budget_cancels_and_reports` | `started.elapsed() < 6 s` (300 ms budget + `CANCEL_GRACE`) | converted + net (this PR): the lane only ends on cancel, so `stopped_reason: time_budget` plus the job's `Cancelled` state is the proof the budget ended the wait; the call runs on a scoped thread under `recv_timeout(TERMINAL_NET)` which cancels the job and panics by name on expiry |
+    | `commands.rs` 241 `ScanDiscover::poll_until` (production) | `status()` every 100 ms `thread::sleep` until terminal or deadline | converted (this PR) to `wait_until`: `tokio::time::timeout(within, ..)` on the registry's terminal signal, run on the engine's runtime and bridged to the synchronous verb over a `std::sync::mpsc` channel; `scan.discover`'s deadline semantics (budget, then `cancel` + `CANCEL_GRACE`) unchanged; a pruned entry (sender dropped) still answers with the last status. Red test `discover_wait_answers_on_finish_not_on_a_terminal_status`: the wait answers after `finish`, not on a terminal `state` |
 - **Test** (`jobs::tests`):
   - `wait_terminal_resolves_at_once_for_a_finished_job`: admit an entry, call `finish`, then
     `registry.wait_terminal(id).await` returns `Some(status)` without yielding (wrap in
