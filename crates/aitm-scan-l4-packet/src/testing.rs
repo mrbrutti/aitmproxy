@@ -12,7 +12,7 @@
 //! loop and never the proof: the acceptance evidence for T5 is the real-bus
 //! e2e cells and the live loopback test.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -113,6 +113,11 @@ struct Script {
     reply_delay: Duration,
     /// Whether every inject fails with [`L4Error::WireWrite`].
     wire_write_fails: bool,
+    /// At most one ICMP reply per target per this window, as a kernel that
+    /// rate-limits the ICMP errors it generates does.
+    icmp_window: Option<Duration>,
+    /// When each target last had an ICMP reply out of this mock.
+    last_icmp: HashMap<IpAddr, Instant>,
 }
 
 /// An in-memory [`CaptureInjectBackend`]: it answers injected stimuli from a
@@ -125,6 +130,17 @@ struct Script {
 /// filter `send_recv` passes (the guard's self-exclusion clause) is ignored:
 /// the mock never synthesises the core's own traffic.
 ///
+/// **The mock echoes the stimulus like a real loopback capture.** A capture
+/// taps the interface, not one direction of it: on Linux `lo` libpcap delivers
+/// the RX copy of the frame just injected, and macOS `lo0` BPF reports sent
+/// frames too, so the first frame a real reply capture reads is the stimulus
+/// itself (the T5 live proof found `send_recv` classifying that frame instead
+/// of the reply). Every `inject` therefore queues the injected bytes **ahead
+/// of** the scripted reply, by default; `send_recv` must ignore them, and a
+/// lane test that goes red here would go red on the real loopback too.
+/// [`MockBackend::without_self_echo`] models a capture that never sees its
+/// own injects, for a test that needs exactly the reply queue.
+///
 /// Replies are built as L3 (IP-first) frames with the stimulus's five-tuple
 /// reversed, which is what [`aitm_proto_l4::sendrecv::ReplyMatch::FiveTuple`]
 /// correlation needs: an [`MockReply::Echo`] is a `Response`, an
@@ -133,6 +149,7 @@ struct Script {
 pub struct MockBackend {
     reply: MockReply,
     available: bool,
+    self_echo: AtomicBool,
     queue: Arc<Mutex<VecDeque<Pending>>>,
     injected: Mutex<Vec<Vec<u8>>>,
     script: Mutex<Script>,
@@ -144,6 +161,7 @@ impl fmt::Debug for MockBackend {
         f.debug_struct("MockBackend")
             .field("reply", &self.reply)
             .field("available", &self.available)
+            .field("self_echo", &self.self_echo.load(Ordering::SeqCst))
             .field("queued", &lock(&self.queue).len())
             .field("injected", &format_args!("<{} frames>", injected.len()))
             .field("script", &*lock(&self.script))
@@ -158,6 +176,7 @@ impl MockBackend {
         Arc::new(Self {
             reply,
             available: true,
+            self_echo: AtomicBool::new(true),
             queue: Arc::new(Mutex::new(VecDeque::new())),
             injected: Mutex::new(Vec::new()),
             script: Mutex::new(Script::default()),
@@ -172,6 +191,7 @@ impl MockBackend {
         Arc::new(Self {
             reply: MockReply::Silence,
             available: false,
+            self_echo: AtomicBool::new(true),
             queue: Arc::new(Mutex::new(VecDeque::new())),
             injected: Mutex::new(Vec::new()),
             script: Mutex::new(Script::default()),
@@ -222,6 +242,31 @@ impl MockBackend {
         lock(&self.script).reply_delay = d;
     }
 
+    /// Answer at most one [`MockReply::Icmp`] per `window` per target and stay
+    /// silent in between, the way a remote target's kernel rate-limits the
+    /// ICMP errors it generates (Linux: `net.ipv4.icmp_ratelimit = 1000` ms per
+    /// destination, the remote-host behaviour spec amendment 46 paces for;
+    /// loopback is exempt, write-up `2026-11-01-t5-live-proof.md` section iii).
+    ///
+    /// The self-echo is unaffected: the capture still reads the injected frame
+    /// first, exactly as loopback delivers it, whether or not an ICMP error
+    /// follows.
+    pub fn icmp_ratelimit(&self, window: Duration) {
+        let mut script = lock(&self.script);
+        script.icmp_window = Some(window);
+        script.last_icmp.clear();
+    }
+
+    /// A capture that never sees its own injects: only the scripted reply is
+    /// queued. The default models the real loopback, which delivers the
+    /// stimulus first (see the type doc); use this for a test that needs the
+    /// reply queue and nothing else.
+    #[must_use]
+    pub fn without_self_echo(self: Arc<Self>) -> Arc<Self> {
+        self.self_echo.store(false, Ordering::SeqCst);
+        self
+    }
+
     /// Every frame handed to [`CaptureInjectBackend::inject`], in order.
     #[must_use]
     pub fn injected(&self) -> Vec<Vec<u8>> {
@@ -259,6 +304,27 @@ impl MockBackend {
         false
     }
 
+    /// Whether this mock may answer `target` with an ICMP error now: always,
+    /// unless [`MockBackend::icmp_ratelimit`] set a window and one went out
+    /// inside it. Spending the token is part of the answer, so the caller
+    /// cannot ask twice for one reply.
+    fn icmp_allowed(&self, target: IpAddr) -> bool {
+        let mut script = lock(&self.script);
+        let Some(window) = script.icmp_window else {
+            return true;
+        };
+        let now = Instant::now();
+        if script
+            .last_icmp
+            .get(&target)
+            .is_some_and(|last| now.duration_since(*last) < window)
+        {
+            return false;
+        }
+        script.last_icmp.insert(target, now);
+        true
+    }
+
     /// The reply frame for `stimulus`, or `None` when this mock answers
     /// nothing or the stimulus does not decode to a UDP/TCP packet.
     fn reply_frame(&self, stimulus: &[u8]) -> Option<Vec<u8>> {
@@ -287,17 +353,22 @@ impl MockBackend {
                 };
                 vec![ip, transport, Layer::Raw(ends.payload.to_vec())]
             }
-            MockReply::Icmp { icmp_type, code } => vec![
-                ip,
-                Layer::Icmp(IcmpSpec {
-                    icmp_type: Some(icmp_type),
-                    code: Some(code),
-                    rest_of_header: Some(0),
-                    checksum: None,
-                }),
-                // An ICMP error quotes the head of the offending datagram.
-                Layer::Raw(quoted_datagram(stimulus)),
-            ],
+            MockReply::Icmp { icmp_type, code } => {
+                if !self.icmp_allowed(ends.dst) {
+                    return None;
+                }
+                vec![
+                    ip,
+                    Layer::Icmp(IcmpSpec {
+                        icmp_type: Some(icmp_type),
+                        code: Some(code),
+                        rest_of_header: Some(0),
+                        checksum: None,
+                    }),
+                    // An ICMP error quotes the head of the offending datagram.
+                    Layer::Raw(quoted_datagram(stimulus)),
+                ]
+            }
             MockReply::Rst => vec![
                 ip,
                 Layer::Tcp(TcpSpec {
@@ -340,6 +411,14 @@ impl CaptureInjectBackend for MockBackend {
             injected.push(bytes.to_vec());
             injected.len()
         };
+        // The loopback truth: the capture reads the injected frame itself
+        // before anything answers it, whether or not anything does.
+        if self.self_echo.load(Ordering::SeqCst) {
+            lock(&self.queue).push_back(Pending {
+                ready_at: Instant::now(),
+                frame: bytes.to_vec(),
+            });
+        }
         if self.is_silent(count, bytes) {
             return Ok(());
         }
@@ -750,6 +829,9 @@ pub mod harness {
             replay_spacing: Duration::from_millis(10),
             recovery_poll: Duration::from_millis(10),
             recovery_polls: 10,
+            // Unpaced by default, so a test that does not care about amendment
+            // 46 still costs milliseconds; a test that does sets its own pace.
+            icmp_pace: Some(Duration::ZERO),
             ..Timing::default()
         }
     }
@@ -929,16 +1011,86 @@ mod tests {
         }
     }
 
+    /// The first frame after an inject is the injected frame itself, as on a
+    /// real loopback capture; consume it and prove it is byte-equal.
+    fn expect_self_echo(source: &mut dyn CaptureSource, stimulus: &[u8]) {
+        let frame = wait_frame(source, Duration::from_millis(500))
+            .expect("the capture sees the injected frame first");
+        assert_eq!(
+            frame, stimulus,
+            "the self-echo is the stimulus byte-for-byte"
+        );
+    }
+
+    /// T5 live proof: by default every inject reaches the capture queue ahead
+    /// of its reply — the stimulus first, then the scripted echo — and a
+    /// silent inject still shows its own frame. `without_self_echo` queues the
+    /// reply alone.
+    #[test]
+    fn mock_echoes_the_stimulus_before_the_reply_like_a_loopback_capture() {
+        let stimulus = udp_stimulus(b"probe");
+
+        let backend = MockBackend::new(MockReply::Echo);
+        let mut source = backend
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        backend
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source.as_mut(), &stimulus);
+        let reply = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("the echo");
+        assert_ne!(
+            reply, stimulus,
+            "the reply is the reversed tuple, not the echo"
+        );
+        assert_eq!(
+            transport_payload(&captured(reply))
+                .expect("a udp reply")
+                .src_port,
+            9
+        );
+        expect_silence(source.as_mut(), Duration::from_millis(20));
+
+        // A silent target still lets the capture see what was sent.
+        let silent = MockBackend::new(MockReply::Silence);
+        let mut source = silent
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        silent
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source.as_mut(), &stimulus);
+        expect_silence(source.as_mut(), Duration::from_millis(20));
+
+        // Opted out: only the reply.
+        let quiet = MockBackend::new(MockReply::Echo).without_self_echo();
+        let mut source = quiet
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        quiet
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        let only = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("the echo");
+        assert_ne!(
+            only, stimulus,
+            "without the self-echo the first frame is the reply"
+        );
+        expect_silence(source.as_mut(), Duration::from_millis(20));
+        assert_eq!(quiet.inject_count(), 1);
+    }
+
     #[test]
     fn echo_mock_reverses_the_tuple() {
         let backend = MockBackend::new(MockReply::Echo);
+        let stimulus = udp_stimulus(b"probe");
         backend
-            .inject(IFACE, &udp_stimulus(b"probe"))
+            .inject(IFACE, &stimulus)
             .expect("the mock accepts the inject");
         let mut source = backend
             .open_capture(IFACE, None, Duration::from_millis(5))
             .expect("the mock capture opens");
 
+        expect_self_echo(source.as_mut(), &stimulus);
         let frame = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("an echo reply");
         let pkt = captured(frame);
         let reply = transport_payload(&pkt).expect("the reply is a udp packet");
@@ -960,14 +1112,81 @@ mod tests {
         let mut source = backend
             .open_capture(IFACE, None, Duration::from_millis(5))
             .expect("the mock capture opens");
+        let stimulus = udp_stimulus(b"probe");
         backend
-            .inject(IFACE, &udp_stimulus(b"probe"))
+            .inject(IFACE, &stimulus)
             .expect("the mock accepts the inject");
 
+        expect_self_echo(source.as_mut(), &stimulus);
         let frame = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("an icmp reply");
         let pkt = captured(frame);
         assert_eq!(icmp_error(&pkt), Some((3, 3)));
         assert!(!tcp_rst(&pkt));
+    }
+
+    /// Tester (T5 stage 5): the rate-limiting mock the two amendment-46
+    /// differentials rest on answers **at most one ICMP error per window per
+    /// target** and is silent in between, and the self-echo is delivered
+    /// either way — so a lane test cannot mistake a suppressed error for a
+    /// dropped stimulus. Without this the "unpaced reads silence / paced reads
+    /// icmp(3,3)" pair would prove nothing about the pace.
+    #[test]
+    fn icmp_ratelimit_answers_once_per_window() {
+        let window = Duration::from_millis(500);
+        let backend = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        backend.icmp_ratelimit(window);
+        let mut source = backend
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        let stimulus = udp_stimulus(b"probe");
+
+        // The first stimulus of the window draws the port-unreachable.
+        backend
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source.as_mut(), &stimulus);
+        let frame = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("an icmp reply");
+        assert_eq!(icmp_error(&captured(frame)), Some((3, 3)));
+
+        // Two more inside the same window: the echo, and nothing behind it.
+        for _ in 0..2 {
+            backend
+                .inject(IFACE, &stimulus)
+                .expect("the mock accepts the inject");
+            expect_self_echo(source.as_mut(), &stimulus);
+            expect_silence(source.as_mut(), Duration::from_millis(20));
+        }
+
+        // Past the window the kernel's token is back.
+        std::thread::sleep(window);
+        backend
+            .inject(IFACE, &stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source.as_mut(), &stimulus);
+        let frame =
+            wait_frame(source.as_mut(), Duration::from_millis(500)).expect("the window reopened");
+        assert_eq!(icmp_error(&captured(frame)), Some((3, 3)));
+        assert_eq!(backend.inject_count(), 4);
+
+        // Unlimited by default: three in a row, three errors.
+        let open = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        let mut source = open
+            .open_capture(IFACE, None, Duration::from_millis(5))
+            .expect("the mock capture opens");
+        for _ in 0..3 {
+            open.inject(IFACE, &stimulus)
+                .expect("the mock accepts the inject");
+            expect_self_echo(source.as_mut(), &stimulus);
+            let frame =
+                wait_frame(source.as_mut(), Duration::from_millis(500)).expect("an icmp reply");
+            assert_eq!(icmp_error(&captured(frame)), Some((3, 3)));
+        }
     }
 
     #[test]
@@ -976,10 +1195,12 @@ mod tests {
         let mut source = backend
             .open_capture(IFACE, None, Duration::from_millis(5))
             .expect("the mock capture opens");
+        let stimulus = tcp_stimulus(b"");
         backend
-            .inject(IFACE, &tcp_stimulus(b""))
+            .inject(IFACE, &stimulus)
             .expect("the mock accepts the inject");
 
+        expect_self_echo(source.as_mut(), &stimulus);
         let frame = wait_frame(source.as_mut(), Duration::from_millis(500)).expect("a reset reply");
         let pkt = captured(frame);
         assert!(tcp_rst(&pkt));
@@ -988,6 +1209,15 @@ mod tests {
         assert_eq!(reply.src_port, 80);
         assert_eq!(reply.dst_port, 40000);
         assert_eq!(reply.proto, L4Proto::Tcp);
+    }
+
+    /// Inject `stimulus` and consume its self-echo, so what follows on the
+    /// queue is the target's answer (or nothing).
+    fn inject_past_echo(backend: &MockBackend, source: &mut dyn CaptureSource, stimulus: &[u8]) {
+        backend
+            .inject(IFACE, stimulus)
+            .expect("the mock accepts the inject");
+        expect_self_echo(source, stimulus);
     }
 
     #[test]
@@ -999,21 +1229,15 @@ mod tests {
             .expect("the mock capture opens");
 
         for _ in 0..2 {
-            backend
-                .inject(IFACE, &udp_stimulus(b"probe"))
-                .expect("the mock accepts the inject");
+            inject_past_echo(&backend, source.as_mut(), &udp_stimulus(b"probe"));
             assert!(wait_frame(source.as_mut(), Duration::from_millis(500)).is_some());
         }
 
-        backend
-            .inject(IFACE, &udp_stimulus(b"probe"))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&backend, source.as_mut(), &udp_stimulus(b"probe"));
         expect_silence(source.as_mut(), Duration::from_millis(20));
 
         // It never recovers.
-        backend
-            .inject(IFACE, &udp_stimulus(b"probe"))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&backend, source.as_mut(), &udp_stimulus(b"probe"));
         expect_silence(source.as_mut(), Duration::from_millis(20));
         assert_eq!(backend.inject_count(), 4);
     }
@@ -1030,33 +1254,23 @@ mod tests {
             .expect("the mock capture opens");
 
         // Too short for the trigger: echoed.
-        backend
-            .inject(IFACE, &udp_stimulus(&short))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&backend, source.as_mut(), &udp_stimulus(&short));
         assert!(wait_frame(source.as_mut(), Duration::from_millis(500)).is_some());
 
         // The trigger itself and the next two injects are silent.
-        backend
-            .inject(IFACE, &udp_stimulus(&trigger))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&backend, source.as_mut(), &udp_stimulus(&trigger));
         expect_silence(source.as_mut(), Duration::from_millis(20));
         for payload in [b"a".as_slice(), b"b".as_slice()] {
-            backend
-                .inject(IFACE, &udp_stimulus(payload))
-                .expect("the mock accepts the inject");
+            inject_past_echo(&backend, source.as_mut(), &udp_stimulus(payload));
             expect_silence(source.as_mut(), Duration::from_millis(20));
         }
 
         // The fourth inject after the trigger is answered again.
-        backend
-            .inject(IFACE, &udp_stimulus(b"c"))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&backend, source.as_mut(), &udp_stimulus(b"c"));
         assert!(wait_frame(source.as_mut(), Duration::from_millis(500)).is_some());
 
         // `repeat: false`, so a second trigger is answered.
-        backend
-            .inject(IFACE, &udp_stimulus(&trigger))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&backend, source.as_mut(), &udp_stimulus(&trigger));
         assert!(wait_frame(source.as_mut(), Duration::from_millis(500)).is_some());
 
         // `repeat: true` re-triggers on every match.
@@ -1065,21 +1279,13 @@ mod tests {
         let mut source = repeating
             .open_capture(IFACE, None, Duration::from_millis(5))
             .expect("the mock capture opens");
-        repeating
-            .inject(IFACE, &udp_stimulus(&trigger))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&repeating, source.as_mut(), &udp_stimulus(&trigger));
         expect_silence(source.as_mut(), Duration::from_millis(20));
-        repeating
-            .inject(IFACE, &udp_stimulus(b"a"))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&repeating, source.as_mut(), &udp_stimulus(b"a"));
         expect_silence(source.as_mut(), Duration::from_millis(20));
-        repeating
-            .inject(IFACE, &udp_stimulus(b"b"))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&repeating, source.as_mut(), &udp_stimulus(b"b"));
         assert!(wait_frame(source.as_mut(), Duration::from_millis(500)).is_some());
-        repeating
-            .inject(IFACE, &udp_stimulus(&trigger))
-            .expect("the mock accepts the inject");
+        inject_past_echo(&repeating, source.as_mut(), &udp_stimulus(&trigger));
         expect_silence(source.as_mut(), Duration::from_millis(20));
     }
 

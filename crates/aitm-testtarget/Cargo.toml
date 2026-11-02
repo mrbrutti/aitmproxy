@@ -36,6 +36,9 @@ aitm-poc.workspace = true
 # `tests/scan_http.rs` drives the h2 listener with hyper's client half; a
 # feature of an already-present crate, so `Cargo.lock` gains no package.
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+# `start_paused` virtual time for the `--latency-ms` unit tests: deterministic,
+# no wall-clock flake; again a feature of a present crate, no new package.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

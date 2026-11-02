@@ -163,8 +163,8 @@ The prepared privileged walk (capture lo0, real HTTP/TCP/UDP traffic, `l4.flow.g
 - `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/docs/tool-reference.md` (the two 'not shipped yet' sentences only: the overview's L4 scope paragraph and the tool-reference's `l4.scope.add` bullet)
 
 **(b) TUI**, branch `fix/l4-parity-tui`. Covers D2, D5 UI, D6, D9 UI, D10, D10c, and capture controls.
-- `crates/aitm-tui/src/{app,bus,l4,model,filter,keys,action}.rs`, `src/ui/{l4,overlays,flows,sidebar,bars,complete}.rs`
-- `crates/aitm-bus-client/src/lib.rs` (`ToolDef` gains `confirmable`), and the `ToolDef` / `ToolInfo` struct literals it breaks in `crates/aitm-tui/tests/{common/mod,fix_pass2,tester_components,tester_edge_cases}.rs`
+- `crates/aitm-tui/src/{app,bus,l4,model,filter,keys,action}.rs`, `src/ui/{l4,overlays,flows,sidebar,bars,complete}.rs`, `src/ui/mod.rs` (mode dispatch arm only)
+- `crates/aitm-bus-client/src/lib.rs` (`ToolDef` gains `confirmable`), and the `ToolDef` / `ToolInfo` struct literals it breaks in `crates/aitm-tui/tests/{common/mod,robustness,tester_edge_cases}.rs` and the `#[cfg(test)]` helper in `crates/aitm-tui/src/lib.rs` (`fix_pass2.rs` / `tester_components.rs` were deleted by the fixture-removal PR #244; `tests/robustness.rs` also carries the toast literals B8b/B10 change)
 - new `crates/aitm-tui/tests/l4_parity.rs` (pure-logic App tests: input built in the test, output is the emitted `BusRequest`s)
 - `crates/aitm/tests/l4_cua_tui.rs`; new `tests/e2e/l4/test_l4_tui_live.py` (real `aitm-tui` in a pty against the rig bus)
 - Capture commands: `:l4 capture <iface> [inbound|outbound]`, `:l4 stop [<id>]`, with completion. Key letters are the builder's, as long as help lists them.
