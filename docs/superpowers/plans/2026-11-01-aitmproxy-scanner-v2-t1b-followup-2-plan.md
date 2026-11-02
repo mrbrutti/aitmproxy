@@ -1,6 +1,6 @@
 # Scanner v2 T1b follow-up 2 (amendments 38, 39, 40, 46; deterministic job tests) implementation plan
 
-**Status:** approved 2026-11-01 by the T1b orchestrator under Matt's autonomous mandate (self-approve specs/plans). Decisions on the architect's open calls: C4 keeps "reason only when every crawl request failed" (the coordinator's wording of amendment 39; a partial failure is visible in `crawl.errors` alone); the `other` token for free-text browser-crawl failures is accepted. Amendments 38-40 are cited as "(PR #273)" until that docs PR is on main.
+**Status:** approved 2026-11-01 by the T1b orchestrator under Matt's autonomous mandate (self-approve specs/plans). Decisions on the architect's open calls: C4 keeps "reason only when every crawl request failed" (the coordinator's wording of amendment 39; a partial failure is visible in `crawl.errors` alone); the `other` token for free-text browser-crawl failures is accepted. Amendments 38-40 are cited as "" until that docs PR is on main.
 **Spec:** `docs/superpowers/specs/2026-10-31-aitmproxy-scanner-v2-design.md` (Approved), D4 "Scheduling", D5 (job model, budget and pacing, "degrade, do not fail"), D11 (`l4_icmp_pace_ms_min`), amendment log rows 46 (on `main`) and 38/39/40 (folded by the coordinator's docs PR #273, head `0f1f8509`, wording quoted below).
 **Prior plan (conventions, Review log, Shipped):** `docs/superpowers/plans/2026-10-31-aitmproxy-scanner-v2-t1b-plan.md` (T1b, merged as #232 = `3aa8cc67`).
 **Branch / worktree:** `claude/scanner-v2-t1b-followup-2` in `/Users/matt/Security/aitmproxy/.claude/worktrees/wizardly-nightingale-441e25`, cut from `main` `7f942f9f` (contains T1b `3aa8cc67`, T3 PR 2a `2044ac52`, T5 `7f942f9f`). PR target `main`.
@@ -21,16 +21,16 @@ wire key's meaning, or any operator decision; every status/model change is addit
 
 **The rules this plan implements** (coordinator wording; spec text in PR #273):
 
-- **Amendment 38 (PR #273), D4/D8:** an origin-scoped check is scheduled once per target
+- **Amendment 38, D4/D8:** an origin-scoped check is scheduled once per target
   origin whether or not any insertion point was discovered there.
-- **Amendment 39 (PR #273), D5:** every failed crawl request counts in `crawl.errors`; when a
+- **Amendment 39, D5:** every failed crawl request counts in `crawl.errors`; when a
   crawl made at least one request and all of them failed (no page fetched) the job surfaces
   it: `crawl.errors > 0` and a classified reason on the status. The job still runs its
   passive checks over captured flows (D5 "degrade, do not fail"): `state: done`,
   `stopped_reason` as the audit decides, reason visible. Where the cause is forced `h2`
   against an h1-only listener the reason is amendment 21's counted probe error
   `h2_not_negotiated`.
-- **Amendment 40 (PR #273), D5:** the per-host error ladder counts connect/transport errors
+- **Amendment 40, D5:** the per-host error ladder counts connect/transport errors
   and per-probe timeouts (`AwaitEnd::Timeout`) only. A 5xx is an answer: returned to the
   check, counted nowhere on the ladder. `StoppedReason::Errors` and the
   `consecutive`/`ratio` thresholds keep their semantics over those failures.
