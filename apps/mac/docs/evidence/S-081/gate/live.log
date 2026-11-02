@@ -1,0 +1,15 @@
+LIVE self-test · app /tmp/Aitmproxy-dev-il.app/Contents/MacOS/Aitmproxy-il · defaults suite com.mrbrutti.aitmproxy.harness · role operator
+LIVE self-test · config /tmp/claude/mac-il/live/config.yaml · upstream 127.0.0.1:38199
+PASS flow.detail returns the response with a body to review
+PASS flow.resume releases a parked flow and the client gets its response
+PASS flow.intercept takes a response-phase rule
+PASS a response rule parks at the response head: the row is parked at the response (Paused · response) and the detail carries it
+PASS the response draft has three pending edits
+PASS the client received the edited status and header (flow.mutate on the parked response, then flow.resume)
+PASS the client received the edited body
+PASS the inspector's detail is refreshed to the edited response after Apply & Resume
+SKIP menu Save Session: S-066
+PASS Flow menu has Edit Paused Request
+SKIP menu Focus Inspector: the inspector has no single focus target yet
+PASS Agent menu has Allow All Tools / Read-only / Paused
+LIVE SELFTEST PASS 98 checks

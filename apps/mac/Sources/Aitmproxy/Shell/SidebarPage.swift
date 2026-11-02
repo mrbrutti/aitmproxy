@@ -2,7 +2,7 @@
 // policy the toolbar and the Agent page switch. Model enums with titles and symbols; the
 // state that picks among them lives on `Session`.
 
-/// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
+/// The sidebar's entries (foundation §2.6).
 enum SidebarPage: String, CaseIterable, Identifiable {
     case status, flows, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
 

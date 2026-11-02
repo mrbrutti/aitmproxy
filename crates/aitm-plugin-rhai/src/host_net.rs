@@ -35,15 +35,17 @@
 //! **guard refusal is never forgiven**: it is a catchable Rhai error naming the
 //! capability and the reason, because a denial is not an absence.
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use aitm_browser::{check_url, HostResolver, SystemResolver};
 use aitm_core::{
     Authority, Body, BrowserDriver, ClickTarget, Flow, FlowId, FlowKind, FlowQuery, GuardError,
-    HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, ScopeEntry, SsrfPolicy, Value,
+    HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, ProxyClient, ScopeEntry,
+    SsrfPolicy, Value,
 };
 use rhai::{
     Array, Blob, Dynamic, Engine, EvalAltResult, ImmutableString, Map, Module, NativeCallContext,
@@ -52,7 +54,8 @@ use rhai::{
 
 use crate::config::{DEFAULT_BROWSER_TIMEOUT, DEFAULT_HOOK_TIMEOUT};
 use crate::engine::{
-    browser_budget, current_run, extend_deadline, remaining_budget, AbortKind, RunKind,
+    browser_budget, current_run, extend_deadline, probe_budget, remaining_budget, AbortKind,
+    RunKind,
 };
 use crate::host_core::{ScriptCapability, ScriptServices};
 use crate::marshal::{dynamic_to_value, value_to_dynamic};
@@ -335,22 +338,7 @@ fn set_namespace<T: Clone + Send + Sync + 'static>(engine: &mut Engine, name: &s
     engine.register_global_module(module.into());
 }
 
-/// Drive a guarded future from the synchronous engine, for at most what is
-/// left of the run's budget. The caller has already entered `block_in_place`,
-/// so this worker may block. A future that outlives the budget aborts the run
-/// with the same Timeout termination `on_progress` would raise — the hook
-/// ends at its deadline whether it is computing or waiting. Outside any run
-/// (a bare evaluation) the default hook budget applies.
-fn block_on<T>(
-    capability: &str,
-    services: &ScriptServices,
-    fut: impl Future<Output = anyhow::Result<T>>,
-) -> ScriptResult<T> {
-    let budget = remaining_budget().unwrap_or(DEFAULT_HOOK_TIMEOUT);
-    drive(capability, services, budget, AbortKind::Timeout, fut)
-}
-
-/// [`block_on`] for a `browser.*` verb (T9): the future gets the run's whole
+/// [`drive`] for a `browser.*` verb (T9): the future gets the run's whole
 /// `browser_timeout` rather than the hook remainder, and once it has
 /// completed — succeeded or failed — the run's deadline is renewed, so the
 /// script's follow-up work (reading the DOM it just fetched, the next
@@ -401,21 +389,82 @@ fn drive<T>(
 
 // ---------------------------------------------------------------- http.send
 
+thread_local! {
+    /// A caller-supplied [`ProxyClient`] that `http.send` routes through for the
+    /// duration of a [`with_client`] call, in place of `services.client`. A
+    /// scanner check runs its script under `with_client(job_client, ..)` so a
+    /// check's sends are budgeted, paced, marked and recorded by the job (D9.3);
+    /// outside any `with_client` the namespace's own `services.client` is used.
+    ///
+    /// Scoped to the thread like [`crate::engine`]'s run cell: rhai (`sync`) runs
+    /// each eval on its calling thread, so the override is seen by exactly the
+    /// eval it wraps and never by a concurrent eval elsewhere.
+    static CLIENT_OVERRIDE: RefCell<Option<Arc<dyn ProxyClient>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with every `http.send` on this thread routed through `client` instead
+/// of the namespace's own `services.client`. The previous override (normally
+/// none, or an outer `with_client`) is restored when `f` returns **or unwinds**,
+/// so a panicking check never leaks its client onto the thread.
+pub fn with_client<T>(client: Arc<dyn ProxyClient>, f: impl FnOnce() -> T) -> T {
+    /// Restores the previous override on drop — including during an unwind.
+    struct Restore(Option<Arc<dyn ProxyClient>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CLIENT_OVERRIDE.with(|cell| *cell.borrow_mut() = previous);
+        }
+    }
+
+    let previous = CLIENT_OVERRIDE.with(|cell| cell.borrow_mut().replace(client));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// The client `http.send` sends through on this thread: the [`with_client`]
+/// override if one is set, else the namespace's own `services.client`.
+fn current_client(services: &ScriptServices) -> Arc<dyn ProxyClient> {
+    CLIENT_OVERRIDE
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| Arc::clone(&services.client))
+}
+
+/// Drive `http.send`'s future for the right slice of the run's budget: under a
+/// scanner check ([`RunKind::Check`]) a single probe gets [`probe_budget`]
+/// (`min(remaining, 30 s)`, D4); every other run keeps the existing
+/// whole-remainder rule.
+fn block_on_send<T>(
+    services: &ScriptServices,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> ScriptResult<T> {
+    let budget = if current_run() == Some(RunKind::Check) {
+        probe_budget().unwrap_or(DEFAULT_HOOK_TIMEOUT)
+    } else {
+        remaining_budget().unwrap_or(DEFAULT_HOOK_TIMEOUT)
+    };
+    drive("http.send", services, budget, AbortKind::Timeout, fut)
+}
+
 /// `http.send(#{ … })`: scope/rate-gated, then reissued through the proxy's own
 /// client (which captures the flow). The guard is checked here, on the same
 /// `check_active` gate a Rust plugin passes, and the permit is held for the
-/// whole send.
+/// whole send. The elapsed wall time is measured around the client call and
+/// returned as `elapsed_ms`, independent of the store's own duration, so a
+/// timing check reads a latency without a clock host function.
 fn send(services: &ScriptServices, req: Map) -> ScriptResult<Map> {
     let request = parse_request(req)?;
     let authority = request.authority.clone();
+    let client = current_client(services);
 
     let _permit = services
         .guard
         .check_active(&authority)
         .map_err(|reason| denied("http.send", &authority, &reason))?;
 
-    let flow = block_on("http.send", services, services.client.send(request))?;
-    Ok(response_map(&flow))
+    let started = Instant::now();
+    let flow = block_on_send(services, client.send(request))?;
+    let elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    Ok(response_map(&flow, elapsed_ms))
 }
 
 /// The keys `http.send(...)` accepts, for the error a typo gets.
@@ -511,10 +560,13 @@ fn is_token(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-/// What a script sees back from `http.send`.
-fn response_map(flow: &HttpFlow) -> Map {
+/// What a script sees back from `http.send`. `elapsed_ms` is the host-measured
+/// wall time around the send (D4), always present regardless of whether the peer
+/// answered.
+fn response_map(flow: &HttpFlow, elapsed_ms: u32) -> Map {
     let mut out = Map::new();
     out.insert("flow_id".into(), Dynamic::from(flow.id.to_string()));
+    out.insert("elapsed_ms".into(), Dynamic::from_int(elapsed_ms as i64));
     match &flow.response {
         Some(resp) => {
             out.insert("status".into(), Dynamic::from_int(resp.status as i64));

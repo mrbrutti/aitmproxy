@@ -2095,7 +2095,7 @@ fn a_prompt_draws_over_the_view_it_was_opened_from() {
         "the Flows view is not drawn under a Scan prompt: {text}"
     );
 
-    let mut flows = aitm_tui::fixture_app_core(200, 50);
+    let mut flows = sample_app(200, 50);
     let _ = flows.update(Action::FilterOpen);
     assert_eq!(flows.mode, Mode::Prompt(PromptKind::Filter));
     let text = text_of(&flows, 200, 50);

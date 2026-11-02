@@ -78,7 +78,13 @@ async fn start(tag: &str) -> Server {
     cfg.ca.dir = temp_ca_dir(tag);
     cfg.mcp.policy = AgentPolicy::Auto;
     let assembled = assemble(&cfg).expect("assemble");
-    let services = tui::services(&assembled.proxy, &cfg, None, TuiLog::Off);
+    let services = tui::services(
+        &assembled.proxy,
+        &cfg,
+        None,
+        TuiLog::Off,
+        Arc::clone(&assembled.job_bus),
+    );
     let web_server = tui::server(&cfg, cfg.mcp.transport.clone(), &services);
     let agent_state = &assembled.agent_state;
     let audit_ring = &assembled.audit_ring;

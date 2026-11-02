@@ -1,7 +1,11 @@
 // Toolbar (§2.7): sidebar toggle · record/pause · compose · clear | listening pill | Agent toggle ·
 // ⌘K · layout. Icons flat, 16px, secondary; nothing outlined except the Agent toggle and the
-// segmented control.
-import { createSignal, Show, type Component } from 'solid-js';
+// segmented control. The listening pill is a menu button (system-proxy spec D15): it appends the
+// D12 pill word after the address and opens the "Set as system proxy" menu; no icon beyond its dot.
+// Opening the menu asks the store for the full `proxy.system.status` (D15, amended 2026-11-01): the
+// polled compact object has no `guidance`/`remedy`, so the menu renders from it first and the "Copy
+// env line" item / the privilege remedy land when the full read arrives.
+import { createMemo, createSignal, Show, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import type { AgentPolicy } from '~/state/app';
 import { Button } from '~/components/Button';
@@ -11,9 +15,16 @@ import { Popover } from '~/components/Popover';
 import { StatusDot } from '~/components/StatusDot';
 import { rectAnchor, type AnchorRect } from '~/components/floating';
 import { pluralize } from '~/lib/format';
+import { copyText } from '~/inspector/ui';
+import { menuState, pillWord } from '~/state/systemProxy';
+import { caPillWord } from '~/state/caTrust';
 import css from './Toolbar.module.css';
 
-const POLICY_LABEL: Record<AgentPolicy, string> = { all: 'Allow all tools', readonly: 'Read-only', paused: 'Paused' };
+/** The five core postures, in the Agent menu's order; `auto`/`ask` as the core defines them (autonomous: sensitive refused · human in the loop: sensitive asks). */
+const POLICIES = ['all', 'auto', 'ask', 'readonly', 'paused'] as const satisfies readonly AgentPolicy[];
+const POLICY_LABEL: Record<AgentPolicy, string> = { all: 'Allow all tools', auto: 'Auto-approve', ask: 'Ask first', readonly: 'Read-only', paused: 'Paused' };
+/** The label, or the wire word itself for a posture a newer core added that this build does not name (never throw in render). */
+const policyLabel = (p: AgentPolicy): string => POLICY_LABEL[p] ?? p;
 
 /** Clear with a one-step inline confirm when there is anything to clear (never window.confirm). */
 export const ClearButton: Component<{ variant: 'toolbar' | 'small'; label?: string }> = (props) => {
@@ -73,8 +84,37 @@ export const ClearButton: Component<{ variant: 'toolbar' | 'small'; label?: stri
 export const Toolbar: Component = () => {
   const app = useApp();
   const [agentMenu, setAgentMenu] = createSignal<{ anchor: AnchorRect; kb: boolean } | null>(null);
+  const [sysMenu, setSysMenu] = createSignal<{ anchor: AnchorRect; kb: boolean } | null>(null);
 
   const dotHue = () => (app.proxy.armed ? 'armed' : app.proxy.listening ? 'success' : 'grey');
+  const sysWord = createMemo(() => pillWord(app.proxy.systemProxy, app.proxy.systemProxySetting));
+
+  /** Open the pill menu and ask for the full status (gated in the store on the tool being offered). */
+  const openSysMenu = (e: MouseEvent & { currentTarget: HTMLElement }) => {
+    setSysMenu({ anchor: rectAnchor(e.currentTarget.getBoundingClientRect()), kb: e.detail === 0 });
+    void app.refreshSystemProxy();
+  };
+
+  /** Copy the env line; a failure reaches the notice toast (D15), never the console. */
+  const copyEnvLine = (guidance: string) => void copyText(guidance).then((ok) => app.notice(ok ? 'Copied env line' : 'Copy env line failed', ok ? 'info' : 'error'));
+
+  /** The D15 menu: the checkbox from `menuState`, the `detail` line, and "Copy env line" when `guidance` is present. */
+  const sysItems = () => {
+    const status = app.proxy.systemProxy;
+    const m = menuState(status, app.proxy.systemProxySetting, app.bus.role());
+    const guidance = status?.guidance;
+    return [
+      {
+        label: 'Set as system proxy',
+        checked: m.checked,
+        disabled: m.disabled,
+        title: m.title,
+        onSelect: () => void (m.checked ? app.unsetSystemProxy() : app.setSystemProxy()),
+      },
+      ...(status && status.detail ? [{ label: status.detail, disabled: true }] : []),
+      ...(m.showCopyEnv && guidance ? [{ label: 'Copy env line', title: guidance, onSelect: () => copyEnvLine(guidance) }] : []),
+    ];
+  };
 
   return (
     <header class={css.toolbar} role="toolbar" aria-label="Capture">
@@ -98,25 +138,37 @@ export const Toolbar: Component = () => {
       <ClearButton variant="toolbar" />
 
       <span class={css.spacer} />
-      <div class={css.listen} role="status" aria-live="polite">
+      <button
+        type="button"
+        class={`${css.listen} ${css.listenButton}`}
+        title="System proxy"
+        aria-haspopup="menu"
+        aria-expanded={sysMenu() != null}
+        onClick={openSysMenu}
+      >
         <StatusDot hue={dotHue()} />
-        <span>
+        <span role="status" aria-live="polite">
           <b>aitmproxy</b> · {app.proxy.listening ? 'listening' : 'paused'}
           <Show when={app.proxy.address}>
             {' '}
             <b class={css.mono}>{app.proxy.address}</b>
           </Show>
           <Show when={app.proxy.protocol}> · {app.proxy.protocol}</Show>
+          <Show when={sysWord()}>{(w) => <> {w()}</>}</Show>
+          <Show when={caPillWord(app.ca, app.caInstalling)}>{(word) => <> {word()}</>}</Show>
           <Show when={app.proxy.armed}> · intercept armed</Show>
         </span>
-      </div>
+      </button>
+      <Show when={sysMenu()}>
+        {(m) => <Menu anchor={m().anchor} placement="bottom-start" animate={!m().kb} label="System proxy" onClose={() => setSysMenu(null)} items={sysItems()} />}
+      </Show>
       <span class={css.spacer} />
 
       <button
         type="button"
         class={css.agent}
         data-policy={app.proxy.agent}
-        title={`Agent policy: ${POLICY_LABEL[app.proxy.agent].toLowerCase()}`}
+        title={`Agent policy: ${policyLabel(app.proxy.agent).toLowerCase()}`}
         aria-haspopup="menu"
         aria-expanded={agentMenu() != null}
         onClick={(e) => setAgentMenu({ anchor: rectAnchor(e.currentTarget.getBoundingClientRect()), kb: e.detail === 0 })}
@@ -134,7 +186,7 @@ export const Toolbar: Component = () => {
             label="Agent policy"
             onClose={() => setAgentMenu(null)}
             items={[
-              ...(['all', 'readonly', 'paused'] as const).map((p) => ({
+              ...POLICIES.map((p) => ({
                 label: POLICY_LABEL[p],
                 checked: app.proxy.agent === p,
                 onSelect: () => void app.setAgentPolicy(p),

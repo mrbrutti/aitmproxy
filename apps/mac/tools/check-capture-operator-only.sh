@@ -185,19 +185,15 @@ for f in "$embedded_core" "$ext_controller" "$settings_view" "$app_swift"; do
 done
 
 # ---- 4. the agent-reachable surfaces reference none of it ----------------------------
-# FixtureBus.swift is the bus's stand-in in fixture, snapshot and self-test runs (the test
-# adapter behind Session.commandRunner, where BusService is the live one), so it is held to the
-# same rule as BusService.swift.
+# BusService.swift is the one command path (no fixture adapters since 2026-10-31); the
+# agent-reachable surfaces below reference none of the capture keys.
 deny "$key_re|captureEnabled|CaptureSwitch|ToolbarSwitches|flipCapture|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
   Sources/Aitmproxy/Bus/BusService.swift \
-  Sources/Aitmproxy/Bus/FixtureBus.swift \
   Sources/AitmproxyKit/CommandMap.swift \
   Sources/Aitmproxy/Shell/CommandPalette.swift \
   Sources/Aitmproxy/Session+Palette.swift \
   Sources/Aitmproxy/Session+Verbs.swift \
-  Sources/Aitmproxy/Panels/AgentPanel.swift \
-  Sources/AitmproxyKit/Fixtures+Agent.swift \
-  Sources/AitmproxyKit/Fixtures+Tools.swift
+  Sources/Aitmproxy/Panels/AgentPanel.swift
 
 # ---- 5. ShellView: one ExtensionController, one start() on it ------------------------
 shell_rule="5 ShellView single call site"

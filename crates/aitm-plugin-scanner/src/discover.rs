@@ -9,37 +9,27 @@
 //! its example — a cookie value is session or credential material whatever its
 //! name (`PHPSESSID`, `sid`, `JSESSIONID`), so no name list is trusted to spot
 //! it. A header, query or body point whose *name* reads as a secret
-//! ([`aitm_core::redact::is_secret_key`] — `Authorization`, `token`, `api-key`,
-//! `password`, … — widened locally by [`is_secret_name`] with the common auth
-//! parameter names) is redacted the same way. So an auth header or session
-//! cookie seen in captured traffic cannot reach a structured `scan.*` result.
+//! ([`aitm_core::redact::is_secret_key_wide`], the wide reading of the shared
+//! vocabulary: `Authorization`, `token`, `api-key`, `password`, … and any name
+//! that merely contains one of the short auth words, `author` and `sidebar`
+//! included) is redacted the same way. So an auth header or session cookie seen
+//! in captured traffic cannot reach a structured `scan.*` result.
 
 use std::collections::HashSet;
 
-use aitm_core::redact::is_secret_key;
+use aitm_core::redact::is_secret_key_wide;
 use aitm_core::Body;
 
 /// The example value a secret-named injection point carries.
 pub const REDACTED: &str = "<redacted>";
 
-/// Auth-parameter name fragments the shared vocabulary in `aitm_core::redact`
-/// does not carry, matched the same way (case-insensitive substring). They
-/// over-match on purpose (`sid` catches `subsidiary`): a redacted example costs
-/// nothing, a leaked session id does. `pub(crate)` so `reproduce`'s embedded-value
-/// scrub is built from this very slice rather than a second copy of the list.
-pub(crate) const EXTRA_SECRET_NEEDLES: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
-
-/// Whether a header / query / body parameter name reads as a secret: the shared
-/// vocabulary plus [`EXTRA_SECRET_NEEDLES`]. `pub(crate)` so `reproduce`'s PoC
-/// scrubber masks exactly the names `enumerate` redacts here — one vocabulary.
+/// Whether a header / query / body parameter name reads as a secret. A delegate
+/// to [`is_secret_key_wide`], which over-matches on purpose (`sid` catches
+/// `subsidiary`): a redacted example costs nothing, a leaked session id does.
+/// `pub(crate)` so `reproduce`'s PoC scrubber masks exactly the names `enumerate`
+/// redacts here.
 pub(crate) fn is_secret_name(name: &str) -> bool {
-    if is_secret_key(name) {
-        return true;
-    }
-    let lower = name.to_ascii_lowercase();
-    EXTRA_SECRET_NEEDLES
-        .iter()
-        .any(|needle| lower.contains(needle))
+    is_secret_key_wide(name)
 }
 
 /// Upper bound on the injection points enumerated from one flow. A hostile
@@ -322,6 +312,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no {location:?} point named {name}: {points:?}"))
     }
 
+    /// Assert that no point's example contains any of the `leaked` secrets.
+    fn assert_no_leak(points: &[InjectionPoint], leaked: &[&str]) {
+        for secret in leaked {
+            assert!(
+                !points.iter().any(|p| p.example.contains(secret)),
+                "{secret} leaked: {points:?}"
+            );
+        }
+    }
+
     #[test]
     fn enumerate_finds_query_body_cookie_path() {
         let mut headers = HeaderMap::new();
@@ -534,8 +534,9 @@ mod tests {
         assert_eq!(points.len(), 4, "the cookie *names* survive: {points:?}");
     }
 
-    /// Common auth parameter names outside the shared vocabulary are caught
-    /// for headers, query and body parameters too.
+    /// Common auth parameter names (`sid`, `jwt`, `session`, `X-CSRF-Token`,
+    /// `X-Auth`) are redacted for headers and query parameters as well as
+    /// cookies, and a plain parameter keeps its value.
     #[test]
     fn enumerate_redacts_common_auth_parameter_names() {
         let mut headers = HeaderMap::new();
@@ -574,6 +575,96 @@ mod tests {
                 "{leaked} leaked: {points:?}"
             );
         }
+    }
+
+    /// A name that only contains one of the short secret words (`subsidiary`
+    /// holds `sid`, `author` holds `auth`) is redacted too: over-matching is
+    /// deliberate, a leaked session id costs more than a hidden example.
+    #[test]
+    fn enumerate_redacts_a_wide_only_parameter_name() {
+        let flow = captured(
+            "/x?subsidiary=acme&author=bob&sidebar=1&page=2",
+            HeaderMap::new(),
+        );
+
+        let points = enumerate(&flow);
+
+        assert_eq!(points.len(), 4, "exactly four query points: {points:?}");
+        for name in ["subsidiary", "author", "sidebar"] {
+            assert_eq!(
+                example_of(&points, Location::Query, name),
+                "<redacted>",
+                "query {name} must be redacted"
+            );
+        }
+        assert_eq!(
+            example_of(&points, Location::Query, "page"),
+            "2",
+            "a plain parameter keeps its value"
+        );
+        assert_no_leak(&points, &["acme", "bob"]);
+    }
+
+    /// A wide-only name is redacted however it arrives: percent-encoded or
+    /// non-ASCII in a query, with an empty value, with a URL value (a redirect
+    /// point), as a form field, a top-level JSON key, or a header. An empty name
+    /// is skipped and a plain name keeps its value.
+    #[test]
+    fn enumerate_redacts_a_wide_only_name_however_it_arrives() {
+        let flow = captured(
+            "/x?%73idebar=qval&authority=https%3A%2F%2Fevil.test&subsidiary=\
+             &sid%C3%A9=uval&=orphan&&page=2",
+            HeaderMap::new(),
+        );
+        let points = enumerate(&flow);
+        assert_eq!(points.len(), 5, "five named points: {points:?}");
+        assert_eq!(example_of(&points, Location::Query, "sidebar"), REDACTED);
+        assert_eq!(
+            example_of(&points, Location::Redirect, "authority"),
+            REDACTED,
+            "a URL value does not exempt a wide-only name"
+        );
+        assert_eq!(
+            example_of(&points, Location::Query, "subsidiary"),
+            REDACTED,
+            "the name decides, not the value"
+        );
+        assert_eq!(example_of(&points, Location::Query, "sid\u{e9}"), REDACTED);
+        assert_eq!(example_of(&points, Location::Query, "page"), "2");
+        assert_no_leak(&points, &["qval", "evil.test", "uval"]);
+
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        headers.set("X-Authority", "hdrval");
+        let flow = captured_body(
+            "/x",
+            headers,
+            Body::Bytes(b"author=formval&page=7".to_vec()),
+        );
+        let points = enumerate(&flow);
+        assert_eq!(example_of(&points, Location::BodyParam, "author"), REDACTED);
+        assert_eq!(example_of(&points, Location::BodyParam, "page"), "7");
+        assert_eq!(
+            example_of(&points, Location::Header, "X-Authority"),
+            REDACTED
+        );
+        assert_no_leak(&points, &["formval", "hdrval"]);
+
+        let mut headers = HeaderMap::new();
+        headers.set("Content-Type", "application/json");
+        let flow = captured_body(
+            "/x",
+            headers,
+            Body::Bytes(br#"{"author":"jsonval","sidebar":{"n":"nestedval"},"page":3}"#.to_vec()),
+        );
+        let points = enumerate(&flow);
+        assert_eq!(example_of(&points, Location::BodyParam, "author"), REDACTED);
+        assert_eq!(
+            example_of(&points, Location::BodyParam, "sidebar"),
+            REDACTED
+        );
+        assert_eq!(example_of(&points, Location::BodyParam, "page"), "3");
+        assert_no_leak(&points, &["jsonval", "nestedval"]);
     }
 
     /// A hostile body of a million parameters must be capped, and the dedupe
@@ -648,6 +739,52 @@ mod tests {
         assert!(
             !deps.contains("aitm-testtarget"),
             "aitm-testtarget must not be a non-dev dependency"
+        );
+    }
+
+    /// A 256 KiB parameter name that ends in a short secret word is redacted
+    /// like a short one: the name decides, whatever its length.
+    #[test]
+    fn enumerate_redacts_an_oversized_wide_only_name() {
+        let long = "a".repeat(1 << 18);
+        let flow = captured(
+            &format!("/x?{long}sidebar=longval&{long}=plainval&page=2"),
+            HeaderMap::new(),
+        );
+
+        let points = enumerate(&flow);
+
+        // The points hold two 256 KiB names, so a failure prints each one's name
+        // length and example, never the points themselves.
+        let summary: Vec<(usize, &str)> = points
+            .iter()
+            .map(|p| (p.name.len(), p.example.as_str()))
+            .collect();
+        let example_for = |name: &str| {
+            points
+                .iter()
+                .find(|p| p.location == Location::Query && p.name == name)
+                .map(|p| p.example.as_str())
+        };
+        assert_eq!(
+            points.len(),
+            3,
+            "three query points, as (name length, example): {summary:?}"
+        );
+        assert_eq!(
+            example_for(&format!("{long}sidebar")),
+            Some(REDACTED),
+            "(name length, example) of each point: {summary:?}"
+        );
+        assert_eq!(
+            example_for(&long),
+            Some("plainval"),
+            "a long name with no secret word keeps its value: {summary:?}"
+        );
+        assert_eq!(example_for("page"), Some("2"), "{summary:?}");
+        assert!(
+            !points.iter().any(|p| p.example.contains("longval")),
+            "longval leaked: {summary:?}"
         );
     }
 }

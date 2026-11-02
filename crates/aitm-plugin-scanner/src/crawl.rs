@@ -198,7 +198,7 @@ pub async fn crawl(
         };
         drop(permit);
 
-        for link in harvest_links(truncate_on_char_boundary(&dom, MAX_DOM_BYTES)) {
+        for link in harvest_links(crate::util::truncate_on_char_boundary(&dom, MAX_DOM_BYTES)) {
             let Ok(resolved) = page.join(&link) else {
                 continue;
             };
@@ -268,7 +268,7 @@ pub(crate) fn safe_target(target: &str) -> String {
         Err(_) => strip_unparsed_userinfo(target),
     };
     let scrubbed = aitm_core::redact::scrub_text(&bare);
-    truncate_on_char_boundary(&scrubbed, 256).to_string()
+    crate::util::truncate_on_char_boundary(&scrubbed, 256).to_string()
 }
 
 /// Bytes that can never appear raw inside a URL's userinfo once it is
@@ -368,8 +368,11 @@ fn normalize(mut url: Url) -> Option<Url> {
 /// A portless scope entry still covers every port of its host.
 fn guard_authority(url: &Url) -> String {
     let host = url.host_str().unwrap_or_default();
-    let port = url.port_or_known_default().unwrap_or(0);
-    format!("{host}:{port}")
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    crate::util::guard_authority(url.scheme(), &authority)
 }
 
 /// The guard `host:port` for a bare target string: [`parse_target`] then
@@ -386,19 +389,6 @@ fn remaining_budget(budget: Duration, started: Instant) -> Option<Duration> {
     budget
         .checked_sub(started.elapsed())
         .filter(|left| !left.is_zero())
-}
-
-/// The longest prefix of `s` that is at most `max` bytes and ends on a `char`
-/// boundary.
-fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 /// Bridge a `crawl` future from a synchronous command.
@@ -495,7 +485,7 @@ fn harvest_links(html: &str) -> Vec<String> {
         // Raw-text elements: their content is script or CSS, not markup, so
         // `var action = "/api/delete"` inside one is not a link.
         if tag == "script" || tag == "style" {
-            i = find_close_tag(html, &tag, j).unwrap_or(bytes.len());
+            i = crate::util::find_close_tag(html, &tag, j, bytes.len()).unwrap_or(bytes.len());
             continue;
         }
         let wanted = match tag.as_str() {
@@ -508,34 +498,11 @@ fn harvest_links(html: &str) -> Vec<String> {
         };
         let (after_tag, value) = tag_attribute(html, j, wanted);
         if let Some(value) = value {
-            links.push(decode_entities(value));
+            links.push(crate::util::decode_entities(value));
         }
         i = after_tag;
     }
     links
-}
-
-/// The index just past `</tag`, searched case-insensitively from `from`.
-///
-/// A single forward pass over the bytes, comparing in place: nothing is
-/// allocated or lowercased per call, so a page of a hundred thousand empty
-/// `<script></script>` pairs costs one linear scan in total, not one copy of
-/// the remaining DOM per tag. (This runs synchronously between awaits, where the
-/// time budget cannot interrupt it, so it has to be linear.)
-fn find_close_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
-    let hay = &html.as_bytes()[from.min(html.len())..];
-    let tag = tag.as_bytes();
-    let needle_len = tag.len() + 2;
-    if hay.len() < needle_len {
-        return None;
-    }
-    (0..=hay.len() - needle_len)
-        .find(|&i| {
-            hay[i] == b'<'
-                && hay[i + 1] == b'/'
-                && hay[i + 2..i + needle_len].eq_ignore_ascii_case(tag)
-        })
-        .map(|i| from + i + needle_len)
 }
 
 /// Walk the attributes of the tag whose name ends at `from`, returning the index
@@ -604,22 +571,6 @@ fn tag_attribute<'a>(html: &'a str, from: usize, wanted: &str) -> (usize, Option
         i = next;
     }
     (bytes.len(), found)
-}
-
-/// Decode the entities an attribute value commonly carries. `&amp;` is decoded
-/// **last**, so `&amp;lt;` decodes to the text `&lt;` and never to `<`.
-fn decode_entities(value: &str) -> String {
-    if !value.contains('&') {
-        return value.to_string();
-    }
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
-        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -1524,6 +1475,7 @@ mod tests {
 
     #[test]
     fn decode_entities_does_not_double_decode() {
+        use crate::util::decode_entities;
         assert_eq!(decode_entities("&amp;lt;"), "&lt;");
         assert_eq!(decode_entities("a&amp;b"), "a&b");
         assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { beginInject, confirmInject, type InjectArgs } from './inject';
+import { beginGuarded, beginInject, confirmGuarded, confirmInject, type InjectArgs } from './inject';
 
 const args: InjectArgs = {
   spec: { layers: [{ ipv4: { dst: '127.0.0.1' } }, { udp: { dst_port: 9 } }, { raw: [112] }] },
@@ -51,5 +51,12 @@ describe('inject_shows_confirm', () => {
     const call = vi.fn().mockResolvedValue({ status: 'needs_confirmation', prompt: PROMPT, confirm_token: 'fresh' });
     const outcome = await confirmInject(call, args, 'stale');
     expect(outcome.kind).toBe('refused');
+  });
+
+  it('a needs_confirmation envelope missing its prompt or token is refused as malformed in both guarded phases, never done', async () => {
+    const noToken = vi.fn().mockResolvedValue({ status: 'needs_confirmation', prompt: PROMPT });
+    expect(await beginGuarded(noToken, 'intercept.forward', { id: 'f1' })).toEqual({ kind: 'refused', message: 'malformed confirmation envelope' });
+    const noPrompt = vi.fn().mockResolvedValue({ status: 'needs_confirmation', confirm_token: 'tok-123' });
+    expect(await confirmGuarded(noPrompt, 'intercept.forward', { id: 'f1' }, 'tok-123')).toEqual({ kind: 'refused', message: 'malformed confirmation envelope' });
   });
 });

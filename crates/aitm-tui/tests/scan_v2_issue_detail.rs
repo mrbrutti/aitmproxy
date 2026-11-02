@@ -19,7 +19,6 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::model::Finding;
 use aitm_tui::scan::{IssuePane, ScanTab, DETAIL_VALUE_MAX};
-use aitm_tui::snapshot::to_text;
 use common::*;
 use serde_json::{json, Value};
 

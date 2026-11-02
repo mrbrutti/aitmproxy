@@ -1319,6 +1319,7 @@ mod tests {
                 baseline_ms: vec![12, 11, 13],
                 slope: 1004.5,
                 r: 0.998,
+                correlated: true,
             }),
             diff: Some(Diff {
                 baseline_len: 1200,
@@ -1478,6 +1479,7 @@ mod tests {
             baseline_ms: vec![3; 10],
             slope: 1.0,
             r: 0.5,
+            correlated: false,
         });
         issue.evidence.probe_flows = vec![issue.evidence.probe_flows[0]; 1000];
         let mut state = IssuesState::default();

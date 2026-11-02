@@ -407,7 +407,7 @@ struct MatchContext {
         case .size:
             guard row.requestBytes != nil || row.responseBytes != nil else { return nil }
             // Summed as doubles so no pair of sizes can trap: the bus decode bounds its
-            // sizes, but rows also come from imports and fixtures.
+            // sizes, but rows also come from imports.
             return Double(row.requestBytes ?? 0) + Double(row.responseBytes ?? 0)
         default:
             return nil

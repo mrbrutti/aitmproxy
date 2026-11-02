@@ -665,6 +665,7 @@ mod tests {
     fn fold_sorts_nodes_into_group_order_and_the_cursor_follows_the_id() {
         let mut s = SitemapState::default();
         s.fold_result(SitemapResult {
+            job: None,
             nodes: vec![
                 node("a", "h1", 8080, "http"),
                 node("b", "h2", 443, "https"),
@@ -686,6 +687,7 @@ mod tests {
 
         s.appending = true;
         s.fold_result(SitemapResult {
+            job: None,
             nodes: vec![node("e", "h2", 443, "https")],
             points: vec![],
             next_cursor: None,
@@ -812,6 +814,7 @@ mod tests {
         };
         let mut s = SitemapState::default();
         s.fold_result(SitemapResult {
+            job: None,
             nodes: vec![node("a", "h", 80, "http"), node("b", "h", 80, "http")],
             points: vec![
                 point("b1", Some("b")),
@@ -845,6 +848,7 @@ mod tests {
         assert_eq!(s.selected_point(), None, "past the node's points");
         s.appending = true;
         s.fold_result(SitemapResult {
+            job: None,
             nodes: vec![node("c", "h", 80, "http")],
             points: vec![],
             next_cursor: None,

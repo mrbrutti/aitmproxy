@@ -8,6 +8,10 @@ description = "Rhai scripting tier: a .rhai file becomes an ordered-chain Plugin
 
 [dependencies]
 aitm-core.workspace = true
+# Scanner v2 (T1b): `CheckMeta`/`Verdict`/`CheckRegistry` the `reg.add_check`
+# bridge (Task 13) produces a `ScriptCheck` against, and `probe.*` reads. Added
+# here (Task 4) so Task 13 need not touch this manifest.
+aitm-scan-model.workspace = true
 # The `ProtocolLanguage` / `ScriptHostRegistry` / `Guarded` seam a protocol
 # crate registers its `<ns>.*` host fns against (acyclic: aitm-plugin depends
 # only on aitm-core).
@@ -21,6 +25,10 @@ aitm-poc.workspace = true
 # static catalog is needed here; `aitm-proto-l4` depends on `aitm-plugin` +
 # `aitm-core`, never back on this crate, so the library graph stays acyclic.
 aitm-proto-l4.workspace = true
+# Scanner v2 T4: the `ws` namespace's static catalog (`WsLanguage::for_catalog()`), for
+# `production_languages()` / `rhai.api.json`. `aitm-scan-ws` depends on `aitm-plugin`, not on this
+# crate, so there is no cycle (T4 integration task, plan call 13 as amended by the coordinator).
+aitm-scan-ws.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 # `time`: every guarded host call is wrapped in `tokio::time::timeout` for the
@@ -38,10 +46,16 @@ base64 = "0.22"
 regex = "1"
 sha2 = "0.10"
 md-5 = "0.10"
+# A Rhai check's `poc_hint` map and the `CheckMeta` map cross into the model's
+# wire types through serde_json (the model has no rhai dependency; Task 13).
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde_yaml = "0.9"
+# The model's test scaffolding (null client/job/host/check/lane, recording probe
+# host) the check-bridge and probe tests (Task 13) build against.
+aitm-scan-model = { workspace = true, features = ["testing"] }
 # The seam's test consumer: proves a protocol crate registers `test.*` host fns
 # and a script calls them with no edit to this crate (acyclic dev-dep).
 aitm-proto-test.workspace = true

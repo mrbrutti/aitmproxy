@@ -19,21 +19,24 @@ pub mod event;
 pub mod flow;
 pub mod guard;
 pub mod header;
+pub mod jobs;
 pub mod plugin;
 pub mod protocol;
 pub mod proxy;
 pub mod redact;
+pub mod redact_strict;
 pub mod registry;
 pub mod store;
 pub mod stream;
+pub mod tunnel;
 pub mod value;
 
 pub use agent::{AgentPolicy, AgentState};
 pub use audit::{
     declared_client_label, lane_for, origin_label, sanitize_client_label, AuditEntry, AuditLane,
-    AuditResult, AuditRing, AuditSink, DEFAULT_ARGS_SUMMARY_CAP, DEFAULT_AUDIT_CAPACITY,
-    DEFAULT_RESULT_REASON_CAP, DEFAULT_ROUTINE_AUDIT_CAPACITY, MAX_AUDIT_SOURCES,
-    MAX_CLIENT_LABEL_CHARS, WEB_BRIDGE_CLIENT_LABEL,
+    AuditResult, AuditRing, AuditSink, DurableAudit, DurableAuditStatus, DEFAULT_ARGS_SUMMARY_CAP,
+    DEFAULT_AUDIT_CAPACITY, DEFAULT_RESULT_REASON_CAP, DEFAULT_ROUTINE_AUDIT_CAPACITY,
+    MAX_AUDIT_SOURCES, MAX_CLIENT_LABEL_CHARS, WEB_BRIDGE_CLIENT_LABEL,
 };
 pub use authority::{Authority, AuthorityError};
 pub use body::{Body, StreamBody};
@@ -41,9 +44,9 @@ pub use chain::Chain;
 pub use client::{PipelineClient, RecordPolicy, RequestSender, SendOptions, VersionPolicy};
 pub use command::{Command, ParamDef, ParamSchema, Sensitivity, TypeDesc};
 pub use config::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
-    LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig, ScopeConfig,
-    ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig,
+    AuditLogSetting, BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig,
+    FirefoxConfig, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig,
+    ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, NOTHING_DECRYPTED_ADVICE,
 };
 pub use ctx::{
     BrowserDriver, CallerTrust, ClickTarget, CommandHost, FindingDraft, FindingRecorder, FlowCtx,
@@ -53,20 +56,23 @@ pub use egress::{ConfinementToken, EgressConfinement};
 pub use error::{FlowError, GuardError};
 pub use event::{Event, Verdict};
 pub use flow::{
-    ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse, HttpVersion,
-    InterceptState, ResumeHandle, WsDir, WsFlow, WsMessage, WsOpcode,
+    saturating_i64, ConnInfo, Flow, FlowId, FlowMeta, HttpFlow, HttpRequest, HttpResponse,
+    HttpVersion, InterceptState, ResumeHandle, TunnelInfo, TunnelMode, TunnelReason, WsDir, WsFlow,
+    WsMessage, WsOpcode,
 };
 pub use guard::{
     classify_host, engine_may_reach_private, ssrf_check, ActionPermit, HostClass, ScopeRateGuard,
     StdGuard,
 };
 pub use header::{HeaderError, HeaderMap};
+pub use jobs::{JobBus, JobEvent, DEFAULT_JOB_BUS_CAPACITY};
 pub use plugin::Plugin;
 pub use protocol::{EventSink, ModuleCtx, NextLayerHint, ProtocolModule, UpstreamConnector};
 pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
 pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
+pub use tunnel::{classify_client_failure, relay, RelayCounts, TunnelRequest, TunnelRow};
 pub use value::{Params, Value};
 
 /// The crate version, wired to the Cargo package version.

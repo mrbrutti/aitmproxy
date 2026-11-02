@@ -11,7 +11,7 @@ Rust; runs on macOS and Linux.
 **Website: [mrbrutti.github.io/aitmproxy](https://mrbrutti.github.io/aitmproxy/)**
 — features, documentation, demos and downloads.
 
-![release](https://img.shields.io/badge/release-v0.5.8-555?style=flat-square)
+![release](https://img.shields.io/badge/release-v0.5.11-555?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-555?style=flat-square)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-555?style=flat-square)
 
@@ -40,7 +40,9 @@ Elsewhere: [Docs](https://mrbrutti.github.io/aitmproxy/docs.html) ·
 Every action in aitmproxy is a registered command. A person drives a running core
 from the web UI, the terminal UI or the macOS app; an AI agent calls the very
 same commands over MCP. There is no second API for agents and no hidden menu for
-humans, and every call lands in one audit log with the operator named.
+humans. Every call that arrives over MCP or the command bus is audit-logged with
+its origin named, in memory and by default in files on disk; the
+[Audit log](#audit-log) section says what is not recorded.
 
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
@@ -145,8 +147,8 @@ then install it. Packages place `aitm` and `aitm-tui` on your `PATH` with obscur
 beside them.
 
 ```bash
-sudo apt install ./aitm-0.5.8-amd64.deb     # Debian / Ubuntu
-sudo dnf install ./aitm-0.5.8-x86_64.rpm    # Fedora / RHEL
+sudo apt install ./aitm-0.5.11-amd64.deb     # Debian / Ubuntu
+sudo dnf install ./aitm-0.5.11-x86_64.rpm    # Fedora / RHEL
 ```
 
 The release also ships `aitm-<version>-<target>.tar.gz` for Linux and macOS, and
@@ -221,6 +223,201 @@ edit a flow, discover the attack surface, build a PoC from a captured request, o
 hand the whole thing to an agent. The website's
 [getting-started guide](https://mrbrutti.github.io/aitmproxy/docs.html) walks the
 same path step by step.
+
+### Audit log
+
+Every call that arrives over MCP or the command bus is recorded with its origin,
+client label, command, arguments and outcome. The recent ones stay in memory (read
+them with `agent.activity`). By default they are also appended to files on disk,
+so the record outlives a restart and the in-memory ring. Nothing needs switching
+on. The files belong to the core: no command and nothing on the bus reads or
+serves them, with one exception that the operator's own opt-in creates. With
+`session_io.allow_agent_file_io: true` and no `session_io.root`, the paths given to
+`session.save`, `session.load`, `flow.export` and `flow.import` are not confined,
+so an agent could overwrite or truncate any file the proxy can write, the audit
+files included. That opt-in is the operator's authorization decision; set
+`session_io.root` whenever agents get file access.
+
+They sit in the per-user config directory, beside `config.yaml`, with mode `0600`
+in a directory created `0700`:
+
+- macOS: `~/Library/Application Support/aitmproxy/audit.jsonl`
+- Linux: `~/.config/aitmproxy/audit.jsonl`
+
+A flood of one kind of call must not push another kind off the disk, so each kind
+has its own file, queue and size cap:
+
+| File | Holds | Size cap |
+|---|---|---|
+| `audit.jsonl` | The operator's calls (the macOS app, the web operator link, `aitm-tui --bus`) and any call with origin `cli` | 20 MiB: 4 MiB each, the active file plus 4 rotated |
+| `audit.agent.jsonl` | The agent's calls other than successful reads: writes, sensitive calls, refusals and failures | 48 MiB: 8 MiB each, the active file plus 5 rotated |
+| `audit.reads.jsonl` | Successful reads such as `flow.list` and `flow.detail`, from any origin | 24 MiB: 8 MiB each, the active file plus 2 rotated |
+
+A file that reaches its cap rotates to `.1`, `.2` and so on (`audit.agent.jsonl.1`
+is the newest rotated file; the highest number is the oldest, and the only one
+ever deleted). While rotation works, the three streams use at most 92 MiB with the
+defaults. If rotation is wedged (for example a non-regular file planted at the
+oldest rotated name), the active file is held to twice its size cap and further
+lines are counted as dropped; `agent.status.durable_audit.degraded` turns true and
+a `gap` marker records the dropped lines. Retention is by size, not time, so how
+far back the files reach depends on call volume.
+
+Configure it with `mcp.audit_log` in the same `config.yaml`:
+
+```yaml
+mcp:
+  audit_log: true    # true (the default) | false | off | an absolute path
+```
+
+`false` or `off` turns the files off and creates nothing. An absolute path moves
+the operator's file there; the other two sit beside it with `.agent` and `.reads`
+before the extension (`/var/aitm/audit.jsonl` gives `audit.agent.jsonl` and
+`audit.reads.jsonl` in `/var/aitm`). A relative path, `~/x` or an empty string is a
+config error. The log is separate from `ca.audit_log`, the CA's own fail-closed
+log, and the two must not share a file.
+
+The environment variable `AITM_AUDIT_LOG` overrides the file. `off`, `false`, `0`
+or `no` turn the log off; `on`, `true`, `1`, `yes` or `default` select the default
+path; an absolute path names the file. Any other value is ignored with one
+warning and leaves the file's setting alone, so a typo such as
+`AITM_AUDIT_LOG=ofd` cannot silently turn the log off.
+
+At startup the core logs one line, `durable audit log on`, naming the operator's
+file. A path you set that cannot be used (a symlink, a directory, a parent that
+other users can write to) stops the boot with the path and the reason, before any
+port is bound. A default path that cannot be used (a read-only home, no config
+directory) does not: the core warns once, runs with the log degraded and retries
+about once a second. `agent.status` reports the state in `durable_audit`:
+`enabled` and `degraded` to every caller, `dropped` and `write_failures` to the
+operator only.
+
+#### Reading the files
+
+Each line is one JSON object. An entry has seven keys:
+
+```json
+{"at":1730419200123,"origin":"mcp","client_label":"claude-code","connection_id":"conn_1f3a9c05d2b84e77-3","command":"request.send","args":"{\"authority\":\"example.test\",\"headers\":{\"Authorization\":\"<redacted>\",\"X-Debug\":\"<redacted>\"},\"method\":\"GET\"}","result":"ok"}
+```
+
+`at` is epoch milliseconds. `origin` is `operator` for the operator's calls, `mcp`
+for an agent's and `cli` for a CLI call, which lands in `audit.jsonl` with the
+operator's. No `cli` line is written today, because one-shot CLI commands run in
+their own process and build no writer. `args` is the JSON text of the arguments,
+redacted and cut at 512 bytes. `result` is `"ok"` or `{"error":"<reason>"}`.
+`client_label` and `connection_id` are `null` when the call has none.
+
+The writer adds two kinds of marker line. Neither has a `command` key, so an entry
+is the line where `select(.command)` is true, and `select(has("marker"))` picks
+out the markers:
+
+- `{"marker":"start","schema":1,"at":…,"version":"…","pid":…,"stream":"agent"}` is
+  the first line of every file the writer creates, and one more at every boot that
+  appends to an existing file. It marks a restart: the in-memory ring was emptied
+  there. `stream` is `control`, `agent` or `reads`.
+- `{"marker":"gap","at":…,"from":…,"to":…,"dropped":…,"failed":…}` is written
+  before the next entry after any were lost. `dropped` counts entries refused by a
+  full queue, `failed` counts entries lost to write errors, and `from` and `to` are
+  the `at` of the first and last lost entry.
+
+Run these in the directory that holds the files:
+
+```bash
+jq -c 'select(.marker|not)' audit.agent.jsonl                    # entries only, no markers
+jq -c 'select(has("marker"))' audit.agent.jsonl                  # restarts and gaps
+cat audit*.jsonl | jq -s 'map(select(.command)) | sort_by(.at)'  # all three streams, in time order
+jq -r 'select(.command) | [(.at/1000|floor|todate), .origin, .command] | @tsv' audit.jsonl
+```
+
+`audit*.jsonl` does not match rotated files; add `audit*.jsonl.*` to read those
+too.
+
+#### Limits
+
+- **Best effort, not tamper-evident.** There is no hash chain or signature, and
+  mode `0600` does not stop a process running as the same user. An agent with a
+  shell on the operator's account can read the files and delete them. A deleted
+  file is recreated with a `start` marker, so the loss shows as a break in the
+  history, not as a continuous record. Do not treat the files as evidence-grade.
+- **No `fsync` per line.** An OS crash or power loss can lose recent lines, and a
+  process crash loses whatever was queued. The next start closes a torn last line
+  with a newline but leaves it in the file, and `jq -s` stops at it. Put
+  `jq -R 'fromjson?'` first to skip such a line:
+  `cat audit*.jsonl | jq -R 'fromjson?' | jq -s 'map(select(.command))'`.
+  Rotation and a clean shutdown do sync.
+- **A flood drops the newest entries.** The call path never waits for the disk.
+  When a stream's queue is full the newest entries are dropped, counted in
+  `agent.status` and marked by a `gap` line. The streams are separate, so an agent
+  flood cannot drop the operator's entries, but a sustained one does rotate earlier
+  agent entries out of the size cap.
+- **Sort by `at`, never by position.** A `gap` line's place in the file is not
+  exact, two concurrent calls can be written in either order, and `at` is
+  wall-clock milliseconds, so a clock change reorders it.
+- **Not recorded:** the built-in UI of `aitm tui` (the operator and agent clients
+  of that same process are recorded) and one-shot CLI commands such as
+  `aitm ca status`, which run in their own process with no writer. Calls over
+  streamable HTTP are recorded with `connection_id: null`.
+- **One path per process.** Two `aitm` processes sharing one `mcp.audit_log` are
+  not locked against each other; give each its own path.
+- **Review before sharing.** The files name hosts, URLs, flow ids and paths. Do not
+  attach them to a bug report unreviewed.
+
+#### What is redacted before anything is written
+
+One redaction applies at the source, and the writer checks every field again, more
+strictly, just before it writes. The aim is that no token, secret or credential
+value reaches a file. The rules below enforce it; the last item names what no rule
+can see.
+
+- **Configured tokens and environment secrets, by exact value.** The configured
+  transport, operator and agent tokens, the web agent token, the per-run operator
+  bridge token, and the value of every environment variable whose name says secret
+  (`token`, `secret`, `password`, `passwd`, `credential`, `api_key`, `apikey`,
+  `private_key`, `passphrase`, `access_key`) are masked as `[redacted]` wherever
+  they appear and whatever frames them: raw, JSON-escaped and percent-encoded. An
+  environment value that is plainly a switch (`true`, `false`, `off`) or a number
+  under 8 digits is not treated as a secret, or masking it would corrupt ordinary
+  JSON. A token of 4 to 7 characters is masked only as a whole word, and one under
+  4 characters is not masked by value at all. The core warns at startup about any
+  such secret shorter than 8 characters, naming where it came from and never the
+  value.
+- **Header values are default-deny.** Inside a header collection (`headers`, a
+  list of name and value pairs, `edits.headers`), a header keeps its value only
+  when its name is on a short benign list: `Accept*`, `Cache-Control`,
+  `Connection`, `Content-Type`, `Content-Length` and the other plain content
+  descriptors, `Date`, `Host`, `Origin`, `Referer`, `User-Agent`, `Sec-Fetch-*`,
+  `Sec-CH-*`, and the routing and override headers (`X-Forwarded-*`, `X-Real-IP`,
+  `X-HTTP-Method-Override`, `X-Original-URL`, `X-Rewrite-URL`). Every other value
+  reads `<redacted>` and the name stays: `{"X-Debug":"<redacted>"}`. This is
+  deliberate over-redaction, because a name cannot tell a debug header from one
+  that carries a password. The capture store keeps the real request; open the flow
+  (`flow.detail`) to see what was sent.
+- **Credential lines and shapes in text.** Every `Authorization`,
+  `Proxy-Authorization`, `Cookie`, `Cookie2` and `Set-Cookie` line is masked to its
+  end (`Cookie: [redacted]`), folded continuation lines included. `Basic`,
+  `Negotiate` and `NTLM` credentials, the password in a URL
+  (`https://user:[redacted]@host`), JWT and JWE tokens, PEM and PGP private key
+  blocks, and well-known vendor key shapes (AWS access key ids, GitHub, GitLab,
+  Slack, Stripe, `sk-` and Google API keys) are masked wherever they appear.
+- **Secret-named keys.** The value under a key such as `password`, `token`,
+  `secret`, `cookie`, `authorization` or `api_key` is masked in JSON, form fields
+  (`user[password]=`), XML and HTML elements, multipart fields, command-line flags
+  (`--password x`, `-u user:pw`) and Debug-printed values. The audit adds the words
+  `pass`, `pw`, `otp`, `totp`, `passphrase`, `private_key`, `access_key` and
+  `signing_key`, and reads camelCase names such as `userPass`, `adminPw` and
+  `totpCode`. A value typed into a field whose `selector` or `name` names a secret
+  (`browser.type` into `#password`) reads `<redacted>`.
+- **The same text everywhere.** The source applies the redaction before anything
+  is stored, so the in-memory ring, `agent.activity` and the pushed
+  `notifications/aitm/agent` audit line carry it too, not only the files. Custom
+  header values no longer appear in them.
+- **What no rule can catch.** A bare credential: one with no frame around it, no
+  registered value and no known shape. A password typed into a free-text field
+  under an innocuous key (`"note":"my password is hunter2"`), an application's own
+  session id in a request body, or a number under an innocuous key reaches the
+  file. A configured token shorter than 8 characters is only partly covered by
+  value masking. Percent-encoded frames and SQL (`SET PASSWORD = 'x'`) are not
+  read. The rules also err the other way: `pass: ok` in prose loses `ok`, and a
+  `Cookie:` in the middle of a sentence loses the rest of its line.
 
 ---
 
@@ -298,35 +495,36 @@ source checkout.
 
 ### Attack-surface scanner
 
-`scan.discover` drives the embedded browser to crawl an authorized, in-scope
-target breadth-first, then reads the captured flows back to enumerate **injection
-points** — query and body parameters, headers, cookies, path segments. It is
-deterministic and AI-free, and every step is bounded by scope and by depth, page
-and time caps.
+The scanner crawls an authorized, in-scope target, enumerates its **injection
+points** — query and body parameters, headers, cookies, path segments — and runs
+a catalogue of checks over them. It is deterministic and AI-free, and every step
+is bounded by scope and by probe, page and time budgets.
 
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
 flowchart LR
-    target["scan.discover<br/>target"] --> gate{"In scope?"}
+    target["scan.start<br/>target"] --> gate{"In scope?"}
     gate -- no --> refused["Refused before<br/>any page opens"]
     gate -- yes --> crawl["Crawl in obscura<br/>same-origin, capped"]
     crawl --> flows["Captured flows"]
     flows --> points["Endpoints and<br/>injection points"]
-    points -.-> active["Active fuzz and inject<br/>(roadmap)"]
+    points --> checks["Catalogue checks<br/>budgeted, paced"]
+    checks --> issues["Issues<br/>scan.issues"]
 ```
 
 ```text
-scan.discover({ target: "https://staging.example.com/", max_depth: 2, max_pages: 50 })
+scan.start({ target: "https://staging.example.com/" })
 ```
 
-Run it from the **Scan** view in any UI, or have an agent call it over MCP; it
-needs a running core with the embedded browser, so the one-shot CLI cannot crawl.
-It returns the endpoints found, the injection points, pages crawled and why the
-crawl stopped. Endpoint and injection-point rows link back to the flow they came
-from. **What shipped in v0.5.0 is discovery.** It reads and enumerates; it never
-injects or mutates. Active fuzzing, injection and campaigns build on the same
-seam and are roadmap, not present features. Details in
-[docs/scanner.md](docs/scanner.md).
+A scan is a **job**: `scan.start` accepts it against an in-scope target and
+returns a job id immediately. Poll `scan.status` for state, counters and why it
+stopped; read what it found with `scan.issues` and `scan.issue`, the crawled
+tree with `scan.sitemap`, and stop it with `scan.cancel`. `scan.map` crawls and
+runs the passive checks without sending a probe. `scan.checks` lists the
+catalogue, and `check.<id>` runs one check by hand against one parameter. Run
+these from the **Scan** view in any UI or over MCP; a crawl needs a running core
+with the embedded browser, so the one-shot CLI cannot crawl. Issues link back to
+the flows they came from. Details in [docs/scanner.md](docs/scanner.md).
 
 ### Scripting and PoCs
 
@@ -522,8 +720,10 @@ and the MCP plugin package at the root.
   memory.
 - **Deny-by-default** at every layer: scope, scripting, agent privileges and the
   scanner each refuse before they act.
-- **One audit log** of every command, its arguments and its effect, whichever
-  operator issued it.
+- **One audit trail** for every command that arrives over MCP or the command bus:
+  its origin, its arguments (credentials redacted) and its outcome, kept in memory
+  and in best-effort files on disk. It is not tamper-evident; the limits are under
+  [Audit log](#audit-log).
 
 ## Build
 
@@ -547,7 +747,9 @@ beside `target/debug` and `target/release`; `scripts/package.sh` builds a releas
   started, scripting and PoC references, demos, downloads.
 - [INSTALL.md](INSTALL.md) — install on macOS and Linux, build from source, point
   the app at an external core.
-- [docs/scanner.md](docs/scanner.md) — the automated scanner (`scan.discover`).
+- [docs/scanner.md](docs/scanner.md) — the scanner: scan jobs, the `scan.*`
+  and `check.<id>` verbs, profiles, the `scanner:` config section, issues,
+  and writing a check in Rhai.
 - [`aitmproxy-plugin/README.md`](aitmproxy-plugin/README.md) — the MCP plugin for
   ChatGPT, Claude Desktop / claude.ai and Claude Code.
 - [docs/design/languages/](docs/design/languages) — the canonical Rhai and

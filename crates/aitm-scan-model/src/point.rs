@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::check::L4Oracle;
 use crate::ids::{FlowRef, NodeId};
-use crate::vocab::{InsertionKind, LaneKind, PayloadMode, PointTrait};
+use crate::vocab::{InsertionKind, L4Transport, LaneKind, PayloadMode, PointTrait};
 
 /// The largest response body a check matches against: 1 MiB (spec D8.1).
 ///
@@ -87,13 +87,15 @@ pub struct SiteNode {
     pub id: NodeId,
     /// The request method.
     pub method: String,
-    /// `http` or `https`.
+    /// `http` or `https`. An L4 lane's node (T6 child spec S6.3) is `tcp` or
+    /// `udp` instead; [`SiteNode::l4_transport`] reads it.
     pub scheme: String,
-    /// The origin host.
+    /// The origin host. For an L4 node, the target IP.
     pub host: String,
-    /// The origin port.
+    /// The origin port. For an L4 node, the target port.
     pub port: u16,
-    /// The path with variable segments collapsed (`/account/{id}`).
+    /// The path with variable segments collapsed (`/account/{id}`). For an L4
+    /// node, `/` + the grammar name (`/resp`); [`SiteNode::l4_grammar`] reads it.
     pub path_template: String,
     /// The captured flows that mapped to this node.
     #[serde(default)]
@@ -110,6 +112,31 @@ pub struct SiteNode {
     /// Whether the audit phase has finished with this node.
     #[serde(default)]
     pub audited: bool,
+}
+
+impl SiteNode {
+    /// The transport an L4 node names in `scheme`: `Some` only for `tcp` or
+    /// `udp` (case-insensitive). An HTTP node, or anything else, is `None`,
+    /// so a reader never guesses `Tcp` for a node that is not L4.
+    pub fn l4_transport(&self) -> Option<L4Transport> {
+        if self.scheme.eq_ignore_ascii_case("tcp") {
+            Some(L4Transport::Tcp)
+        } else if self.scheme.eq_ignore_ascii_case("udp") {
+            Some(L4Transport::Udp)
+        } else {
+            None
+        }
+    }
+
+    /// The grammar name an L4 node carries in `path_template`: the template
+    /// without its one leading `/`, or `None` when nothing is left.
+    pub fn l4_grammar(&self) -> Option<&str> {
+        let grammar = self
+            .path_template
+            .strip_prefix('/')
+            .unwrap_or(&self.path_template);
+        (!grammar.is_empty()).then_some(grammar)
+    }
 }
 
 /// `Debug` helper: header names with every value replaced by `<redacted>`.
@@ -314,6 +341,51 @@ mod tests {
         assert!(!node.auth);
         assert_eq!(node.points, 0);
         assert!(!node.audited);
+    }
+
+    /// T6 child spec S6.3: an L4 lane's site node is `scheme = tcp | udp`,
+    /// `host` = the target IP, `port`, `path_template` = `/` + grammar name.
+    /// `l4_transport` reads the scheme case-insensitively and is `None` for
+    /// anything else (an HTTP node never gets a `Tcp` guess); `l4_grammar` is
+    /// the template without its leading `/`, `None` when nothing is left.
+    #[test]
+    fn site_node_l4_transport_and_grammar() {
+        let l4 = |scheme: &str, template: &str| SiteNode {
+            id: format!("l4:10.0.0.7:5353/{scheme}"),
+            method: "L4".into(),
+            scheme: scheme.into(),
+            host: "10.0.0.7".into(),
+            port: 5353,
+            path_template: template.into(),
+            flows: Vec::new(),
+            params: Vec::new(),
+            auth: false,
+            points: 0,
+            audited: false,
+        };
+
+        assert_eq!(l4("tcp", "/resp").l4_transport(), Some(L4Transport::Tcp));
+        assert_eq!(l4("UDP", "/dns").l4_transport(), Some(L4Transport::Udp));
+        assert_eq!(l4("Tcp", "/x").l4_transport(), Some(L4Transport::Tcp));
+        assert_eq!(l4("http", "/resp").l4_transport(), None);
+        assert_eq!(l4("https", "/resp").l4_transport(), None);
+        assert_eq!(l4("", "/resp").l4_transport(), None);
+        assert_eq!(l4("tcp6", "/resp").l4_transport(), None, "no prefix match");
+
+        assert_eq!(l4("tcp", "/resp").l4_grammar(), Some("resp"));
+        assert_eq!(l4("udp", "/dns").l4_grammar(), Some("dns"));
+        assert_eq!(
+            l4("tcp", "resp").l4_grammar(),
+            Some("resp"),
+            "no slash is fine"
+        );
+        assert_eq!(
+            l4("tcp", "//resp").l4_grammar(),
+            Some("/resp"),
+            "one slash only"
+        );
+        assert_eq!(l4("tcp", "/").l4_grammar(), None);
+        assert_eq!(l4("tcp", "").l4_grammar(), None);
     }
 
     /// Panel S3 — the in-process probe types carry unredacted headers and raw

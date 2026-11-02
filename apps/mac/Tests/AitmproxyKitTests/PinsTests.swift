@@ -25,8 +25,19 @@ import Testing
 }
 
 @Suite struct SelectionSummaryTests {
+    /// A finished listing with both sizes known: 412 + 18 200 B in 89 ms.
+    static let listing = Make.row(seq: 1, host: "api.shop-staging.test", path: "/api/products", status: 200,
+                                  duration: .milliseconds(89), requestBytes: 412, responseBytes: 18_200)
+
     @Test func sumsSizesAndDurations() {
-        let rows = Array(Fixtures.rows[0..<3]) // 41, 42, 43: all sized
+        // Three finished rows, every size known.
+        let rows = [
+            Self.listing,
+            Make.row(seq: 2, method: .put, host: "api.shop-staging.test", path: "/api/cart/items/42", status: 200,
+                     duration: .milliseconds(67), requestBytes: 1_100, responseBytes: 640),
+            Make.row(seq: 3, host: "cdn.shop-staging.test", path: "/assets/app.js", status: 304,
+                     duration: .milliseconds(21), requestBytes: 388, responseBytes: 0),
+        ]
         let summary = SelectionSummary(rows: rows)
         #expect(summary.count == 3)
         #expect(summary.sized == 3)
@@ -35,7 +46,13 @@ import Testing
     }
 
     @Test func saysHowManyWereSizedWhenSomeAreMissing() {
-        let rows = [Fixtures.rows[0], Fixtures.rows[9], Fixtures.rows[10]] // 41 sized; 50, 51 paused (no response size)
+        // One sized row and two parked requests with no response size yet.
+        let rows = [
+            Self.listing,
+            Make.row(seq: 2, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login", state: .paused,
+                     requestBytes: 186),
+            Make.row(seq: 3, host: "api.shop-staging.test", path: "/api/me", state: .paused, requestBytes: 344),
+        ]
         let summary = SelectionSummary(rows: rows)
         #expect(summary.sized == 1)
         #expect(summary.text == "3 selected · 1 sized · 18.6 KB · 89 ms")

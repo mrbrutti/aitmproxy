@@ -56,7 +56,7 @@ const flow = (seq: number, p: Partial<FlowSummary> = {}): FlowEntry => {
 const FLOWS = [flow(1), flow(2, { authority: 'auth.shop-staging.test', path: '/login', method: 'POST' }), flow(3)];
 
 const SETUP: SetupAction[] = [
-  { id: 'install-ca', label: 'Install CA', icon: 'lock', tool: 'ca.install' },
+  { id: 'install-ca', label: 'Trust the aitmproxy CA', icon: 'lock', tool: 'ca.install', args: { scope: 'user' } },
   { id: 'open-browser', label: 'Open browser', icon: 'globe', run: () => {} },
 ];
 

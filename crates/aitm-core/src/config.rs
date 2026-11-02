@@ -34,9 +34,10 @@ pub struct Config {
     /// `max_flows`, so a few very large captures cannot exhaust memory while under
     /// the flow-count cap.
     pub max_flow_bytes: usize,
-    /// Per-host TLS passthrough (M6 F11). Deny-by-default: the list is empty and
-    /// agent authoring is off, so nothing is tunnelled past MITM until the
-    /// operator names a host.
+    /// Per-host TLS passthrough pins (M6 F11). The list is empty and agent
+    /// authoring is off by default. Decryption itself follows Scope (per-host
+    /// decryption, 2026-10-31): a host is decrypted only while it is in Scope and
+    /// not pinned here; everything else is tunnelled.
     pub tls: TlsConfig,
     /// Map Local/Remote rules (M6). Deny-by-default: no map root and agent
     /// authoring off, so Map Local is unusable and no agent may author maps until
@@ -71,11 +72,16 @@ impl Default for Config {
 
 /// Per-host TLS passthrough configuration (M6 F11). A passthrough host is
 /// tunnelled byte-for-byte without MITM, so the client speaks TLS to the real
-/// upstream and the proxy captures no decrypted flow for it.
+/// upstream and the proxy records only a `CONNECT` row for it (`tunnel:
+/// passthrough`, `tunnel_reason: pinned`), never a decrypted flow.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
-    /// Hosts (or `*.wildcard`) to tunnel past MITM. **Empty by default**: every
-    /// host is MITM'd until the operator pins one here.
+    /// Hosts (or `*.wildcard`) pinned out of MITM. **Empty by default.** Scope is
+    /// the decryption list (per-host decryption, 2026-10-31): a host is decrypted
+    /// only while it is in Scope **and** not pinned here; a host outside Scope is
+    /// tunnelled regardless (`tunnel_reason: out_of_scope`). Pins win over Scope,
+    /// so pinning an in-scope host stops its decryption without removing it from
+    /// Scope.
     pub passthrough: Vec<String>,
     /// Let an agent frontend (MCP) change the passthrough list with
     /// `tls.passthrough.add`/`remove`. **Off by default**: pinning a host out of
@@ -162,6 +168,12 @@ pub struct ScopeConfig {
     /// scope) is never gated.
     pub allow_agent_widen: bool,
 }
+
+/// The one sentence every surface prints, verbatim, when Scope is empty and so
+/// nothing is decrypted (spec D8): `proxy.status.decrypt.advice`, the `Scope`
+/// line of `aitm web`'s startup summary, and bare `aitm`'s one launch `info`
+/// line. Frontends print it; they never compose their own.
+pub const NOTHING_DECRYPTED_ADVICE: &str = "Nothing is decrypted until a host is in Scope.";
 
 /// One scope entry: a host, `host:port`, or `*.wildcard`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +350,9 @@ pub struct McpConfig {
     /// Default [`Frontend::Mcp`] — stdio is the agent-attach transport; an
     /// operator attached over stdio sets this to [`Frontend::Operator`].
     pub stdio_role: Frontend,
+    /// Where the durable audit log is written; see [`AuditLogSetting`]. The
+    /// default is the per-user `audit.jsonl`.
+    pub audit_log: AuditLogSetting,
 }
 
 impl Default for McpConfig {
@@ -348,6 +363,35 @@ impl Default for McpConfig {
             operator_token: None,
             policy: AgentPolicy::Auto,
             stdio_role: Frontend::Mcp,
+            audit_log: AuditLogSetting::Default,
+        }
+    }
+}
+
+/// Where the durable audit log (the JSONL file the `aitm` binary appends every
+/// command invocation to) is written: the `mcp.audit_log` setting.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AuditLogSetting {
+    /// The operator said nothing: the per-user `audit.jsonl` beside the CA
+    /// audit log, written on a best-effort basis.
+    #[default]
+    Default,
+    /// The operator turned the file off.
+    Off,
+    /// An explicit path: the operator asked for this file, so a failure to use it
+    /// is theirs to hear about (the spellings are in Design 2 of the durable
+    /// audit spec).
+    Path(PathBuf),
+}
+
+impl AuditLogSetting {
+    /// The file to write, or `None` when the log is off. `Default` is
+    /// `<config_dir>/aitmproxy/audit.jsonl`, a sibling of the CA audit log.
+    pub fn resolved_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Default => Some(default_aitm_dir().join("audit.jsonl")),
+            Self::Off => None,
+            Self::Path(path) => Some(path.clone()),
         }
     }
 }

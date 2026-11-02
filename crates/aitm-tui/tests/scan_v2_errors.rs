@@ -7,8 +7,9 @@
 //! wording in the launch footer in the warning hue and leaves `s` live, and
 //! the next success under the same tag clears the error.
 //!
-//! Fixture-driven: this proves the reducer and the drawing only. Acceptance
-//! is the pty cell against a real core (spec Acceptance criteria, "Live").
+//! Inline-literal driven: this proves the reducer and the drawing only.
+//! Acceptance is the pty cell against a real core (spec Acceptance criteria,
+//! "Live").
 
 mod common;
 
@@ -770,5 +771,41 @@ fn the_banner_wears_the_error_hue_only_for_an_error() {
         hue_of(&app, "Scanner busy"),
         error_fg,
         "an error wears the server-error hue"
+    );
+}
+
+/// Fix round H, H47 (D6 hostile-core bounds), re-homed from the deleted
+/// fixture suite: `App::toast` bounds its text once, when it is stored
+/// (control characters stripped, cut to `TOAST_MAX` cells), so a raw 1 MiB
+/// `CallFailed` message toasted whole neither keeps a megabyte in the ring
+/// nor overflows the status bar's `u16` width sums. The stored text is at
+/// most `4 * TOAST_MAX` chars, tab-free and ends in an ellipsis; the frame
+/// at 200x50 draws without a panic.
+#[test]
+fn a_megabyte_toast_is_bounded_when_stored_and_renders() {
+    use aitm_tui::app::TOAST_MAX;
+    use aitm_tui::text::width;
+
+    let mut app = connected_app(200, 50);
+    let message = "refused:\t".repeat(1 << 17);
+    assert!(message.len() >= 1 << 20);
+    let _ = app.on_bus(BusEvent::CallFailed {
+        name: "flow.get".into(),
+        message,
+    });
+    let stored = toast(&app);
+    assert!(
+        stored.chars().count() <= 4 * TOAST_MAX,
+        "{} chars stored",
+        stored.chars().count()
+    );
+    assert!(width(stored) <= TOAST_MAX, "{} cells stored", width(stored));
+    assert!(!stored.contains('\t'), "tabs stripped: {stored:?}");
+    assert!(stored.ends_with('…'), "{stored:?}");
+    assert!(stored.starts_with("refused:refused:"), "{stored:?}");
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.contains("refused:refused:"),
+        "the status bar draws the bounded toast:\n{text}"
     );
 }

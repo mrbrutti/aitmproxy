@@ -728,24 +728,77 @@ fn editor(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 
 #[cfg(test)]
 mod tests {
-    use crate::action::Action;
-    use crate::app::{Mode, Pane, RESPONSE_TABS};
-    use crate::snapshot::{render as snap, to_text};
+    use crate::action::{Action, BusEvent};
+    use crate::app::{App, Mode, Pane, RESPONSE_TABS};
+    use crate::model::FlowDetail;
     use crate::theme::Theme;
+    use crate::ui::{render_buffer, render_text};
+    use serde_json::json;
 
-    fn json_tab_app(cols: u16, rows: u16) -> crate::app::App {
-        let mut app = crate::fixture_app(cols, rows);
+    /// An app in Inspector mode on `f41`: a completed GET whose response is a
+    /// small JSON document (18 lines as a tree) and whose request carries a
+    /// `cookie` header. Both messages are written here, in the wire shape.
+    fn f41_app(cols: u16, rows: u16) -> App {
+        let mut app = crate::connected_app(cols, rows);
+        let _ = app.on_bus(BusEvent::Flows(vec![json!({
+            "id": "f41", "kind": "http", "method": "GET", "scheme": "https",
+            "authority": "api.example.test",
+            "path": "/api/products?category=widgets&limit=2",
+            "status": 200, "is_replay": false, "intercept": "observed"
+        })]));
+        let body = json!({
+            "items": [
+                {"id": 1, "name": "Widget", "price": 9.5, "in_stock": true},
+                {"id": 2, "name": "Gadget", "price": 12.0, "in_stock": false}
+            ],
+            "page": 1,
+            "total": 2
+        })
+        .to_string();
+        let detail = FlowDetail::from_json(&json!({
+            "id": "f41", "kind": "http", "intercept": "observed", "edited": false,
+            "request": {
+                "method": "GET", "scheme": "https", "authority": "api.example.test",
+                "path": "/api/products?category=widgets&limit=2", "version": "HTTP/2",
+                "headers": [
+                    ["host", "api.example.test"],
+                    ["accept", "application/json"],
+                    ["cookie", "session=9f1c"]
+                ],
+                "body_size": 0, "body_truncated": false
+            },
+            "response": {
+                "status": 200, "version": "HTTP/2",
+                "headers": [["content-type", "application/json; charset=utf-8"]],
+                "body": crate::base64::encode(body.as_bytes()),
+                "body_size": body.len(), "body_truncated": false
+            },
+            "client_conn": {"peer": "127.0.0.1:52101", "sni": "api.example.test",
+                            "alpn": "h2", "tls": true, "process": "curl"},
+            "server_conn": {"peer": "203.0.113.10:443", "sni": "api.example.test",
+                            "alpn": "h2", "tls": true},
+            "meta": {"marks": [], "comment": null, "is_replay": false,
+                     "created": "2026-10-31T12:00:00.000Z", "duration_ms": 89,
+                     "truncated": false, "origin": "human"}
+        }))
+        .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(detail)));
         app.selected = Some("f41".into());
         app.mode = Mode::Inspector;
+        app
+    }
+
+    /// [`f41_app`] with the Response pane's JSON tab focused.
+    fn json_tab_app(cols: u16, rows: u16) -> App {
+        let mut app = f41_app(cols, rows);
         app.inspector.pane = Pane::Response;
         app.inspector.response_tab = RESPONSE_TABS.iter().position(|t| *t == "JSON").unwrap();
         app
     }
 
-    /// The buffer row (as text) that contains `needle`, with its y.
-    fn row_with(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, String)> {
-        to_text(buf)
-            .lines()
+    /// The rendered row that contains `needle`, with its y.
+    fn row_with(text: &str, needle: &str) -> Option<(u16, String)> {
+        text.lines()
             .enumerate()
             .find(|(_, l)| l.contains(needle))
             .map(|(y, l)| (y as u16, l.to_string()))
@@ -756,27 +809,25 @@ mod tests {
         let theme = Theme::new(true);
         let mut app = json_tab_app(200, 50);
         app.inspector.cursor_line = 4;
-        let buf = snap(&app, &theme, 200, 50);
-        let (_, tabs) = row_with(&buf, "Response  Headers").expect("response tab row");
+        let buf = render_buffer(&app, 200, 50);
+        let text = render_text(&app, 200, 50);
+        let (_, tabs) = row_with(&text, "Response  Headers").expect("response tab row");
         assert!(
             tabs.trim_end().ends_with("$.items[0].name"),
             "node path right-aligned on the tab row: {tabs:?}"
         );
-        let (y, _) = row_with(&buf, "Noise-cancelling headphones").expect("cursor line drawn");
+        // Line 4 of the tree is `"name": "Widget"`, the cursor line.
+        let (y, line) = row_with(&text, "Widget").expect("cursor line drawn");
         let sel = theme.selection().bg;
-        let x = to_text(&buf)
-            .lines()
-            .nth(usize::from(y))
-            .and_then(|l| l.find("Noise"))
-            .unwrap() as u16;
+        let x = line.find("Widget").unwrap() as u16;
         assert_eq!(buf.cell((x, y)).map(|c| c.bg), Some(sel.unwrap()));
         // The line above is not highlighted.
         assert_ne!(buf.cell((x, y - 1)).map(|c| c.bg), Some(sel.unwrap()));
 
         // Off the JSON tab there is no path and no highlight.
         app.inspector.response_tab = 1;
-        let buf = snap(&app, &theme, 200, 50);
-        let (_, tabs) = row_with(&buf, "Response  Headers").unwrap();
+        let text = render_text(&app, 200, 50);
+        let (_, tabs) = row_with(&text, "Response  Headers").unwrap();
         assert!(!tabs.contains("$."), "{tabs:?}");
 
         // Without detail both Body tabs fall back to the summary facts, which
@@ -786,7 +837,7 @@ mod tests {
             .position(|t| *t == "Body")
             .unwrap();
         app.details.remove("f41");
-        let text = to_text(&snap(&app, &theme, 200, 50));
+        let text = render_text(&app, 200, 50);
         // The `id … f41` fact row: whatever sits before it on the line (the
         // sidebar), the label is `id`, not a line number followed by `id`.
         let fact_prefixes: Vec<&str> = text
@@ -808,11 +859,10 @@ mod tests {
     #[test]
     fn timing_tab_is_labelled_and_explains_itself() {
         let theme = Theme::new(true);
-        let mut app = crate::fixture_app(200, 50);
-        app.selected = Some("f41".into());
-        app.mode = Mode::Inspector;
-        let buf = snap(&app, &theme, 200, 50);
-        let (y, req_tabs) = row_with(&buf, "Request  Headers").expect("request tab row");
+        let mut app = f41_app(200, 50);
+        let buf = render_buffer(&app, 200, 50);
+        let text = render_text(&app, 200, 50);
+        let (y, req_tabs) = row_with(&text, "Request  Headers").expect("request tab row");
         assert!(req_tabs.contains("Timing (F5)"), "{req_tabs}");
         // Cookies and Set-Cookie are live now: no F5 label on them.
         assert!(
@@ -829,7 +879,7 @@ mod tests {
             theme.text_tertiary().fg,
             "disabled tab is dim"
         );
-        let (_, resp_tabs) = row_with(&buf, "Response  Headers").expect("response tab row");
+        let (_, resp_tabs) = row_with(&text, "Response  Headers").expect("response tab row");
         assert!(!resp_tabs.contains("Set-Cookie (F5)"), "{resp_tabs}");
 
         app.inspector.pane = Pane::Request;
@@ -837,7 +887,7 @@ mod tests {
             .iter()
             .position(|t| *t == "Timing")
             .unwrap();
-        let text = to_text(&snap(&app, &theme, 200, 50));
+        let text = render_text(&app, 200, 50);
         assert!(
             text.contains("Timing need core follow-up F5"),
             "Timing sentence: {text}"
@@ -850,36 +900,29 @@ mod tests {
     /// live, binding each value to its own name on the same row.
     #[test]
     fn cookies_tab_renders_served_cookies_bound_to_their_names() {
-        let theme = Theme::new(true);
-        let mut app = crate::fixture_app(200, 50);
-        app.selected = Some("f41".into());
-        app.mode = Mode::Inspector;
+        let mut app = f41_app(200, 50);
         app.inspector.pane = Pane::Request;
         app.inspector.request_tab = crate::app::REQUEST_TABS
             .iter()
             .position(|t| *t == "Cookies")
             .unwrap();
-        let buf = snap(&app, &theme, 200, 50);
-        // f41 sends `cookie: session=9f1c…`: the value sits on the `session`
+        let text = render_text(&app, 200, 50);
+        // f41 sends `cookie: session=9f1c`: the value sits on the `session`
         // row, not merely somewhere on the screen.
-        let (_, row) = row_with(&buf, "session").expect("cookie name row");
+        let (_, row) = row_with(&text, "session").expect("cookie name row");
         assert!(
-            row.contains("session") && row.contains("= 9f1c…"),
+            row.contains("session") && row.contains("= 9f1c"),
             "value bound to its name: {row:?}"
         );
         // No follow-up placeholder on a live tab.
-        assert!(
-            !to_text(&buf).contains("need core follow-up F5"),
-            "cookies is live"
-        );
+        assert!(!text.contains("need core follow-up F5"), "cookies is live");
     }
 
     #[test]
     fn json_tab_scrolls_to_keep_the_cursor_visible() {
-        let theme = Theme::new(true);
         // A short terminal: the response pane shows fewer than 18 lines.
         let mut app = json_tab_app(200, 20);
-        let text = to_text(&snap(&app, &theme, 200, 20));
+        let text = render_text(&app, 200, 20);
         assert!(text.contains("\"items\": ["), "{text}");
         assert!(
             !text.contains("\"total\": 2"),
@@ -888,11 +931,11 @@ mod tests {
         // Cursor on the last line: the window follows it down.
         let _ = app.update(Action::End);
         assert_eq!(app.inspector.cursor_line, 17);
-        let text = to_text(&snap(&app, &theme, 200, 20));
+        let text = render_text(&app, 200, 20);
         assert!(text.contains("\"total\": 2"), "{text}");
         // And back up: Home shows the top again.
         let _ = app.update(Action::Home);
-        let text = to_text(&snap(&app, &theme, 200, 20));
+        let text = render_text(&app, 200, 20);
         assert!(text.contains("\"items\": ["), "{text}");
     }
 }

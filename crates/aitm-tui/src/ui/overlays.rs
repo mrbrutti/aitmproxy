@@ -137,6 +137,10 @@ const FLOW_KEYS: &[(&str, &str)] = &[
         "b / l / t",
         "toggle sidebar · layout below/right · auto-select",
     ),
+    (
+        "s",
+        "set / restore the system proxy (:sysproxy on|off|status)",
+    ),
     ("y / o", "copy URL (OSC 52) · open externally"),
     (
         "/",

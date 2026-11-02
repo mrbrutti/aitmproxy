@@ -1,19 +1,17 @@
 //! Tester (stage 5): malformed, empty and oversized input, and a key/reducer
-//! sweep. Nothing a proxy peer, a fixture file or the keyboard can send may
-//! panic the UI: a crash here is a crash of the operator's console mid-test.
+//! sweep. Nothing a proxy peer or the keyboard can send may panic the UI: a
+//! crash here is a crash of the operator's console mid-test. Every app here
+//! is built from inline literals in the core's wire shapes.
 
 mod common;
 
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use aitm_bus_client::BusTransport;
-use aitm_tui::action::Action;
+use aitm_tui::action::{Action, BusEvent};
 use aitm_tui::app::{parse_kv_args, App, ComposeForm, EditBuffer, Mode, PromptKind};
 use aitm_tui::base64;
 use aitm_tui::filter;
-use aitm_tui::fixture::{Fixture, FixtureTransport};
-use aitm_tui::fixture_app;
 use aitm_tui::keys;
 use aitm_tui::model::{
     scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Intercept,
@@ -25,7 +23,7 @@ use common::*;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MediaKeyCode, ModifierKeyCode,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 fn lines_text(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
     lines
@@ -96,8 +94,12 @@ fn flow_detail_from_json_tolerates_empty_and_wrongly_typed_input() {
     assert_eq!(d.messages[2].dir, None);
 
     // Through the app: a malformed detail for a known flow leaves the row as it was.
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app(200, 50);
     let before = app.row("f41").unwrap().clone();
+    assert!(
+        before.time.is_some() && before.req_size.is_some(),
+        "{before:?}"
+    );
     let d = FlowDetail::from_json(&json!({"id":"f41","request":"nope","response":"nope"})).unwrap();
     let _ = app.on_bus(aitm_tui::action::BusEvent::Detail(Box::new(d)));
     let after = app.row("f41").unwrap();
@@ -213,26 +215,26 @@ fn base64_and_percent_decoding_survive_odd_input() {
 /// sends `GET /x?%aé=1` through the proxy crashes the operator's TUI.
 #[test]
 fn percent_decoding_survives_a_multibyte_character_after_the_percent_sign() {
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let direct = catch_unwind(|| viewers::percent_decode("%aé=1"));
-    let mut app = fixture_app(200, 50);
-    let _ = app.on_bus(aitm_tui::action::BusEvent::Flows(vec![summary(
-        "evil",
-        "GET",
-        "api.shop-staging.test",
-        "/search?q=%aé&x=1",
-        Some(200),
-        "observed",
-    )]));
-    app.selected = Some("evil".into());
-    app.mode = Mode::Inspector;
-    app.inspector.request_tab = aitm_tui::app::REQUEST_TABS
-        .iter()
-        .position(|t| *t == "Query")
-        .unwrap();
-    let via_query_tab = catch_unwind(AssertUnwindSafe(|| text_of(&app, 200, 50)));
-    std::panic::set_hook(previous_hook);
+    let (direct, via_query_tab) = quietly(|| {
+        let direct = catch_unwind(|| viewers::percent_decode("%aé=1"));
+        let mut app = connected_app(200, 50);
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            "evil",
+            "GET",
+            "api.shop-staging.test",
+            "/search?q=%aé&x=1",
+            Some(200),
+            "observed",
+        )]));
+        app.selected = Some("evil".into());
+        app.mode = Mode::Inspector;
+        app.inspector.request_tab = aitm_tui::app::REQUEST_TABS
+            .iter()
+            .position(|t| *t == "Query")
+            .unwrap();
+        let via_query_tab = catch_unwind(AssertUnwindSafe(|| text_of(&app, 200, 50)));
+        (direct, via_query_tab)
+    });
     assert!(direct.is_ok(), "percent_decode(\"%aé=1\") panicked");
     assert!(
         via_query_tab.is_ok(),
@@ -389,7 +391,7 @@ fn filter_parser_never_panics_and_names_each_error() {
     assert!(!filter::wild("?", ""));
     assert!(filter::wild("A.TEST", "https://a.test/p"));
     // The prompt applies live and swallows parse errors until Enter.
-    let mut app = fixture_app(200, 50);
+    let mut app = connected_app(200, 50);
     let _ = app.update(Action::FilterOpen);
     for c in "~m (".chars() {
         let _ = app.update(Action::Input(c));
@@ -402,113 +404,6 @@ fn filter_parser_never_panics_and_names_each_error() {
         "stays open on an error"
     );
     assert!(toast(&app).starts_with("filter: "), "{}", toast(&app));
-}
-
-// ----------------------------------------------------------- fixture bus
-
-async fn reply(t: &FixtureTransport, line: impl Into<String>) -> Value {
-    let raw = t
-        .send(line.into())
-        .await
-        .expect("fixture transport never fails")
-        .expect("a reply line");
-    serde_json::from_str(&raw).expect("reply is JSON")
-}
-
-#[tokio::test]
-async fn fixture_transport_answers_malformed_lines_with_json_rpc_errors() {
-    let t = FixtureTransport::new(Fixture::builtin().shared());
-    let v = reply(&t, "this is not json").await;
-    assert_eq!(v["error"]["code"], -32700);
-    assert!(v["id"].is_null());
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .starts_with("parse error"));
-    assert_eq!(reply(&t, "").await["error"]["code"], -32700);
-    assert_eq!(
-        reply(&t, "x".repeat(1 << 20)).await["error"]["code"],
-        -32700
-    );
-    assert_eq!(reply(&t, "{").await["error"]["code"], -32700);
-
-    // No id: a notification, no reply.
-    assert_eq!(
-        t.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string())
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        t.send(json!({"method":"tools/list"}).to_string())
-            .await
-            .unwrap(),
-        None,
-        "a request without an id gets no reply"
-    );
-    // Unknown method, unknown tool, missing arguments.
-    assert_eq!(
-        reply(
-            &t,
-            json!({"jsonrpc":"2.0","id":1,"method":"nope"}).to_string()
-        )
-        .await["error"]["code"],
-        -32601
-    );
-    let v = reply(
-        &t,
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope"}}).to_string(),
-    )
-    .await;
-    assert_eq!(v["error"]["code"], -32602);
-    let v = reply(
-        &t,
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flow.get","arguments":"not an object"}}).to_string(),
-    )
-    .await;
-    assert_eq!(v["result"]["isError"], true);
-    assert_eq!(v["result"]["content"][0]["text"], "missing `id`");
-    let v = reply(
-        &t,
-        json!({"jsonrpc":"2.0","id":4,"method":"tools/call"}).to_string(),
-    )
-    .await;
-    assert_eq!(v["error"]["code"], -32602, "no params at all");
-    // Ids of any JSON type are echoed.
-    assert_eq!(
-        reply(&t, json!({"id":"abc","method":"ping"}).to_string()).await["id"],
-        "abc"
-    );
-    assert_eq!(
-        reply(&t, json!({"id":{"a":1},"method":"ping"}).to_string()).await["id"],
-        json!({"a":1})
-    );
-
-    // Fixture documents: not JSON is an error; `{}` and `[]` give defaults.
-    assert!(Fixture::parse("nope").is_err());
-    let f = Fixture::parse("{}").unwrap();
-    assert!(f.flows.is_empty());
-    assert_eq!(f.listening, "127.0.0.1:8080");
-    assert!(!f.intercept_armed);
-    let f = Fixture::parse("[]").unwrap();
-    assert!(f.tools.is_empty());
-    // Non-numeric ids do not break id allocation.
-    let mut f =
-        Fixture::parse(r#"{"flows":[{"id":"abc"},{"id":"f7"}],"tools":[{"name":"flow.replay"}]}"#)
-            .unwrap();
-    let mut args = Map::new();
-    args.insert("id".into(), json!("abc"));
-    assert_eq!(f.call("flow.replay", &args).unwrap(), json!("f8"));
-    assert_eq!(f.flows.len(), 3);
-    assert!(f
-        .call("flow.get", &Map::new())
-        .unwrap_err()
-        .contains("missing `id`"));
-    args.insert("id".into(), json!("zzz"));
-    assert_eq!(
-        f.call("flow.kill", &args).unwrap_err(),
-        "no flow with id zzz"
-    );
 }
 
 // ------------------------------------------------------------ key sweep
@@ -595,9 +490,9 @@ fn every_mode() -> Vec<Mode> {
     v
 }
 
-/// The fixture app put into `mode` the way the operator would get there.
+/// The sample app put into `mode` the way the operator would get there.
 fn app_in(mode: Mode) -> App {
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app(200, 50);
     match mode {
         Mode::Edit => {
             let _ = app.update(Action::Edit);
@@ -703,36 +598,40 @@ fn key_map_returns_an_option_for_every_key_in_every_mode() {
 #[test]
 fn reducer_and_renderer_survive_every_key_in_every_mode() {
     let codes = every_key_code();
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut applied = 0usize;
-    for mode in every_mode() {
-        let base = app_in(mode);
-        for code in &codes {
-            for m in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
-                let Some(action) = keys::map(KeyEvent::new(*code, m), mode) else {
-                    continue;
-                };
-                let mut app = base.clone();
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    let _ = app.update(action.clone());
-                    let _ = app.update(Action::Resize(100, 30));
-                    let _ = text_of(&app, 100, 30);
-                }));
-                applied += 1;
-                if let Err(e) = outcome {
-                    let msg = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_default();
-                    failures.push(format!("{mode:?} + {code:?} {m:?} → {action:?}: {msg}"));
+    quietly(|| {
+        for mode in every_mode() {
+            let base = app_in(mode);
+            assert_eq!(
+                text_of(&base, 200, 50).lines().count(),
+                50,
+                "{mode:?} draws the whole 200×50 screen"
+            );
+            for code in &codes {
+                for m in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+                    let Some(action) = keys::map(KeyEvent::new(*code, m), mode) else {
+                        continue;
+                    };
+                    let mut app = base.clone();
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = app.update(action.clone());
+                        let _ = app.update(Action::Resize(100, 30));
+                        let _ = text_of(&app, 100, 30);
+                    }));
+                    applied += 1;
+                    if let Err(e) = outcome {
+                        let msg = e
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                            .unwrap_or_default();
+                        failures.push(format!("{mode:?} + {code:?} {m:?} → {action:?}: {msg}"));
+                    }
                 }
             }
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(applied > 500, "{applied}");
     assert!(
         failures.is_empty(),
@@ -746,7 +645,7 @@ fn reducer_and_renderer_survive_every_key_in_every_mode() {
 #[test]
 fn a_random_key_walk_never_panics() {
     let codes = every_key_code();
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app(200, 50);
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
         seed ^= seed << 13;
@@ -754,54 +653,81 @@ fn a_random_key_walk_never_panics() {
         seed ^= seed << 17;
         seed
     };
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failure = None;
-    for step in 0..3000usize {
-        let code = codes[(next() as usize) % codes.len()];
-        let m = if next() % 7 == 0 {
-            KeyModifiers::CONTROL
-        } else {
-            KeyModifiers::NONE
-        };
-        let key = KeyEvent::new(code, m);
-        // Ctrl-C would only set should_quit; keep walking.
-        let Some(action) = keys::map(key, app.mode) else {
-            continue;
-        };
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let _ = app.update(action.clone());
-            if step % 25 == 0 {
-                let (c, r) = match next() % 4 {
-                    0 => (80, 24),
-                    1 => (120, 30),
-                    2 => (200, 50),
-                    _ => (41, 5),
-                };
-                let _ = app.update(Action::Resize(c, r));
-                let _ = text_of(&app, c, r);
+    quietly(|| {
+        for step in 0..3000usize {
+            let code = codes[(next() as usize) % codes.len()];
+            let m = if next() % 7 == 0 {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            let key = KeyEvent::new(code, m);
+            // Ctrl-C would only set should_quit; keep walking.
+            let Some(action) = keys::map(key, app.mode) else {
+                continue;
+            };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = app.update(action.clone());
+                if step % 25 == 0 {
+                    let (c, r) = match next() % 4 {
+                        0 => (80, 24),
+                        1 => (120, 30),
+                        2 => (200, 50),
+                        _ => (41, 5),
+                    };
+                    let _ = app.update(Action::Resize(c, r));
+                    let _ = text_of(&app, c, r);
+                }
+            }));
+            if let Err(e) = outcome {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_default();
+                failure = Some(format!(
+                    "step {step}: {key:?} in {:?} → {action:?}: {msg}",
+                    app.mode
+                ));
+                break;
             }
-        }));
-        if let Err(e) = outcome {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                .unwrap_or_default();
-            failure = Some(format!(
-                "step {step}: {key:?} in {:?} → {action:?}: {msg}",
-                app.mode
-            ));
-            break;
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(failure.is_none(), "{}", failure.unwrap());
+    let _ = app.update(Action::Resize(200, 50));
+    assert_eq!(
+        text_of(&app, 200, 50).lines().count(),
+        50,
+        "the whole 200×50 screen still draws after the walk"
+    );
 }
 
 #[test]
 fn run_command_survives_odd_lines_and_reports_each_problem() {
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app(200, 50);
+    // Two verbs carry their `tools/list` input schema, because the asserts
+    // below ride on it: `flow.get` requires `id`; `flow.intercept` takes a
+    // boolean `enabled`. Every other tool keeps the empty schema.
+    for t in &mut app.tools {
+        match t.name.as_str() {
+            "flow.get" => {
+                t.input_schema = json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "The flow to summarize."}},
+                    "required": ["id"]
+                });
+            }
+            "flow.intercept" => {
+                t.input_schema = json!({
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean",
+                                               "description": "true to arm (default), false to disarm."}}
+                });
+            }
+            _ => {}
+        }
+    }
     let odd = [
         "",
         ":",
@@ -1023,7 +949,7 @@ fn compose_kv_and_edit_buffer_edge_cases() {
     bin_edited.lines[2] = "typed over".into();
     assert!(bin_edited.to_edits().get("body").is_none());
     // Editing at the ends of lines and across lines.
-    let mut app = fixture_app(200, 50);
+    let mut app = sample_app(200, 50);
     let _ = app.update(Action::Edit);
     for _ in 0..40 {
         let _ = app.update(Action::Right);

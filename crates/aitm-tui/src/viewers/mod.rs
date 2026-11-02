@@ -1,6 +1,6 @@
 //! Body viewers (foundation §2.7 "Inspector → Body viewers"), each a function
-//! from bytes to styled lines so the inspector, quick-look and snapshots share
-//! them: header tables, pretty JSON, a JSON tree with folds, hex, unified diff,
+//! from bytes to styled lines so the inspector and quick-look share them:
+//! header tables, pretty JSON, a JSON tree with folds, hex, unified diff,
 //! raw text, and the image placeholder the terminal degrades to.
 
 pub mod diff;

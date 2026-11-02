@@ -737,7 +737,6 @@ fn a_huge_list_folds_to_jobs_max_rows() {
 /// stays primary text, whether or not the row is under the cursor.
 #[test]
 fn the_state_cell_wears_its_states_hue() {
-    use aitm_tui::snapshot::to_text;
     use aitm_tui::tokens::color::status;
 
     let theme = theme();

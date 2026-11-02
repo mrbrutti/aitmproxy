@@ -1,14 +1,15 @@
 //! Core sync (2026-10-28): the F-gated rows lit up against the real core's
-//! shapes: what the operator sees (render) for C1–C12. The model and
-//! reducer halves are unit tests in `model.rs` / `app.rs`; the bus halves in
-//! `tester_bus_task.rs`.
+//! shapes: what the operator sees (render) for C1–C12. Every input is an
+//! inline literal in the core's wire shape. The model and reducer halves are
+//! unit tests in `model.rs` / `app.rs`; the bus task against a real server is
+//! `crates/aitm/tests/tui_live_bus.rs`.
 
 mod common;
 
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode, Pane, REQUEST_TABS, RESPONSE_TABS};
+use aitm_tui::base64;
 use aitm_tui::caps::TermCaps;
-use aitm_tui::fixture_app;
 use aitm_tui::model::{Finding, FlowDetail, ProxyStatus};
 use common::*;
 use serde_json::json;
@@ -21,6 +22,7 @@ fn status(listening: bool, capturing: bool) -> ProxyStatus {
         capturing,
         paused: 5,
         flows: 3,
+        system_proxy: None,
     }
 }
 
@@ -102,7 +104,132 @@ fn status_bar_paused_count_prefers_the_store_while_filtered() {
 /// section for them; run results keep their verdict; the sidebar counts all.
 #[test]
 fn findings_panel_renders_library_entries_as_not_run_with_their_description() {
-    let mut app = fixture_app(200, 50);
+    let mut app = connected_app(200, 50);
+    // The library pass (`poc.list`: path, id, title, severity, no run).
+    let library = [
+        (
+            "reflected-xss-search",
+            "Reflected XSS in /api/search q",
+            "high",
+        ),
+        ("idor-cart-items", "IDOR on /api/cart/items/{id}", "medium"),
+        ("open-redirect-next", "Open redirect via next=", "low"),
+    ]
+    .map(|(id, title, severity)| {
+        Finding::from_json(&json!({
+            "poc_path": format!("pocs/{id}.yaml"), "id": id,
+            "title": title, "severity": severity
+        }))
+        .unwrap()
+    });
+    let mut pending = app.on_bus(BusEvent::Findings(library.into()));
+    // Two `poc.run` answers this session, oldest first: one failed, one passed.
+    pending.extend(app.on_bus(BusEvent::CallOk {
+        name: "poc.run".into(),
+        value: json!({
+            "title": "IDOR on /api/cart/items/{id}", "severity": "medium",
+            "target": "https://api.shop-staging.test", "passed": false,
+            "at": "2026-10-27T11:05:40.002Z", "origin": "human",
+            "poc_path": "pocs/idor-cart-items.yaml", "finding_capture": "f42",
+            "screenshot_path": null,
+            "evaluated": [
+                {"assertion": "status == 200", "matched": true},
+                {"assertion": "dsl: body.item_id != 42", "matched": false}
+            ]
+        }),
+    }));
+    pending.extend(app.on_bus(BusEvent::CallOk {
+        name: "poc.run".into(),
+        value: json!({
+            "title": "Reflected XSS in /api/search q", "severity": "high",
+            "target": "https://api.shop-staging.test", "passed": true,
+            "at": "2026-10-27T11:05:16.410Z", "origin": "agent",
+            "poc_path": "pocs/reflected-xss-search.yaml", "finding_capture": "f48",
+            "screenshot_path": "pocs/reflected-xss-search.png",
+            "evaluated": [
+                {"assertion": "status == 200", "matched": true},
+                {"assertion": "word: <img src=x onerror=alert(1)>", "matched": true}
+            ]
+        }),
+    }));
+    // The bus is not loopback, so each entry's YAML is asked for through
+    // `poc.get` (C8): answer every request with the file's description and
+    // source, as the core does.
+    let asked: Vec<String> = pending
+        .into_iter()
+        .filter_map(|r| match r {
+            BusRequest::PocGet(path) => Some(path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "pocs/reflected-xss-search.yaml",
+            "pocs/idor-cart-items.yaml",
+            "pocs/open-redirect-next.yaml"
+        ],
+        "one poc.get per path, asked once"
+    );
+    let (xss_desc, xss_yaml) = (
+        "The q parameter of /api/search is reflected into the results heading without encoding.",
+        "name: Reflected XSS in /api/search q\nseverity: high\n",
+    );
+    let (idor_desc, idor_yaml) = (
+        "Reading another customer's cart line by id.",
+        "name: IDOR on /api/cart/items/{id}\nseverity: medium\n",
+    );
+    let (redirect_desc, redirect_yaml) = (
+        "The login page's next= parameter is followed verbatim after a successful login.",
+        "name: Open redirect via next=\nseverity: low\n",
+    );
+    for (path, id, title, severity, description, yaml) in [
+        (
+            "pocs/reflected-xss-search.yaml",
+            "reflected-xss-search",
+            "Reflected XSS in /api/search q",
+            "high",
+            xss_desc,
+            xss_yaml,
+        ),
+        (
+            "pocs/idor-cart-items.yaml",
+            "idor-cart-items",
+            "IDOR on /api/cart/items/{id}",
+            "medium",
+            idor_desc,
+            idor_yaml,
+        ),
+        (
+            "pocs/open-redirect-next.yaml",
+            "open-redirect-next",
+            "Open redirect via next=",
+            "low",
+            redirect_desc,
+            redirect_yaml,
+        ),
+    ] {
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.get".into(),
+            value: json!({"poc_path": path, "id": id, "title": title, "severity": severity,
+                          "description": description, "yaml": yaml}),
+        });
+    }
+    assert_eq!(app.findings.len(), 3);
+    assert_eq!(
+        app.findings[0].poc_path, "pocs/reflected-xss-search.yaml",
+        "the newest run is on top, and selected"
+    );
+    // Live `poc.run` answers toast their verdict; the status bar shows the
+    // toast while it lasts, so tick it away before reading what sits under it.
+    assert_eq!(toast(&app), "PoC passed: Reflected XSS in /api/search q");
+    for _ in 0..1_000 {
+        if app.current_toast().is_none() {
+            break;
+        }
+        let _ = app.update(Action::Tick);
+    }
+    assert_eq!(toast(&app), "<no toast>", "the toast expired");
     // The sidebar (drawn with the flow list) counts every entry: two runs
     // and the library-only third PoC.
     let shell = text_of(&app, 200, 50);
@@ -139,7 +266,7 @@ fn findings_panel_renders_library_entries_as_not_run_with_their_description() {
     assert!(!text.contains(" Assertions"), "{text}");
     assert!(
         text.contains("next= parameter is followed verbatim"),
-        "{text}"
+        "description from poc.get: {text}"
     );
     assert!(
         text.contains(" name: Open redirect via next="),
@@ -264,7 +391,31 @@ fn scope_panel_rate_limits_come_from_config_get() {
 /// Response Body tab and quick-look.
 #[test]
 fn websocket_messages_draw_with_arrows_from_the_core_direction() {
-    let mut app = fixture_app(200, 50);
+    let mut app = connected_app(200, 50);
+    // `flow.get` of a WebSocket flow: the handshake id and a message count
+    // in place of method / status; then its `flow.detail` with two messages.
+    let _ = app.on_bus(BusEvent::Flows(vec![json!({
+        "id": "f47", "kind": "websocket", "handshake": "f40", "messages": 2,
+        "is_replay": false, "intercept": "observed"
+    })]));
+    let frame = |dir: &str, text: &str, timestamp: &str| {
+        json!({"dir": dir, "opcode": "text", "length": text.len(),
+               "data": base64::encode(text.as_bytes()),
+               "timestamp": timestamp, "injected": false})
+    };
+    let d = FlowDetail::from_json(&json!({
+        "id": "f47", "kind": "websocket", "handshake": "f40", "intercept": "observed",
+        "edited": false,
+        "messages": [
+            frame("client_to_server", "{\"type\":\"subscribe\"}", "2026-10-27T11:05:05.001Z"),
+            frame("server_to_client", "{\"type\":\"ack\"}", "2026-10-27T11:05:05.040Z")
+        ],
+        "meta": {"marks": [], "comment": null, "is_replay": false,
+                 "created": "2026-10-27T11:05:04.966Z", "duration_ms": null,
+                 "truncated": false, "origin": "human"}
+    }))
+    .unwrap();
+    let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
     app.selected = Some("f47".into());
     app.mode = Mode::Inspector;
     app.inspector.pane = Pane::Response;
@@ -274,7 +425,11 @@ fn websocket_messages_draw_with_arrows_from_the_core_direction() {
     assert!(sub.contains("11:05:05.001 → text"), "{sub}");
     let ack = line_with(&text, "{\"type\":\"ack\"").expect("the reply");
     assert!(ack.contains("11:05:05.040 ← text"), "{ack}");
-    assert_eq!(app.row("f47").unwrap().ws_messages, Some(3));
+    assert_eq!(
+        app.row("f47").unwrap().ws_messages,
+        Some(2),
+        "the row's count is the summary's `messages`"
+    );
     // An unknown direction is drawn as `?`, never guessed.
     let d = FlowDetail::from_json(&json!({"id":"f47","kind":"websocket","handshake":"f40",
         "messages":[{"dir":"sideways","opcode":"text","data":"aGk=","timestamp":"2026-10-27T11:05:05.001Z"}]}))

@@ -29,6 +29,12 @@ use crate::types::L4Proto;
 /// builder's own sanity cap, at the IPv4 total-length limit.
 const MAX_PACKET_BYTES: usize = 65_535;
 
+/// The well-formed `ihl` of an option-less IPv4 header, in 32-bit words.
+const IPV4_MIN_IHL: u8 = 5;
+
+/// The well-formed `data_offset` of an option-less TCP header, in 32-bit words.
+const TCP_MIN_DATA_OFFSET: u8 = 5;
+
 /// A scapy-style packet: an ordered stack of layers, outermost first.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PacketSpec {
@@ -517,19 +523,35 @@ fn build_ether(s: &EtherSpec, payload: &[u8], next: Option<&Layer>) -> Vec<u8> {
 
 /// IPv4 header: auto-complete total length / protocol / checksum unless the spec
 /// pins them, in which case the pinned (possibly invalid) value ships verbatim.
+///
+/// `pnet` derives the writable payload window from `ihl` and `total_length`, so a
+/// pinned length shorter than the real payload used to abort the whole build on
+/// `pnet`'s internal `assert!(vals.len() <= len)`. Both length fields are therefore
+/// laid down well-formed, the payload is written, and only then are the verbatim
+/// values stamped into the finished header: a deliberately-wrong length ships
+/// unchanged without moving, truncating or panicking over its payload.
 fn build_ipv4(s: &Ipv4Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<u8>, CraftError> {
     use pnet_packet::ip::IpNextHeaderProtocol;
     use pnet_packet::ipv4::{checksum, MutableIpv4Packet};
+    use pnet_packet::MutablePacket;
 
+    // `total_length` is a `u16`: a payload that would overflow it must be refused
+    // here, before `pnet` sizes its payload window from the wrapped value and
+    // `set_payload` panics on a window smaller than the payload.
+    if payload.len() > usize::from(u16::MAX) - 20 {
+        return Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+    }
     let total = 20 + payload.len();
     let mut buf = vec![0u8; total];
     {
         let mut p = MutableIpv4Packet::new(&mut buf).expect("ipv4 buffer is >= 20 bytes");
         p.set_version(4);
-        p.set_header_length(s.ihl.unwrap_or(5));
+        p.set_header_length(IPV4_MIN_IHL);
         p.set_dscp(s.dscp.unwrap_or(0));
         p.set_ecn(s.ecn.unwrap_or(0));
-        p.set_total_length(s.total_length.unwrap_or(total as u16));
+        p.set_total_length(total as u16);
         p.set_identification(s.identification.unwrap_or(0));
         p.set_flags(s.flags.unwrap_or(0));
         p.set_fragment_offset(s.fragment_offset.unwrap_or(0));
@@ -540,18 +562,41 @@ fn build_ipv4(s: &Ipv4Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<
         p.set_source(s.src.unwrap_or(Ipv4Addr::UNSPECIFIED));
         p.set_destination(s.dst.unwrap_or(Ipv4Addr::UNSPECIFIED));
         p.set_payload(payload);
-        // `None` ⇒ computed over the header just written; `Some` ⇒ verbatim.
+
+        // Verbatim lengths, stamped over the well-formed ones now that the
+        // payload is placed: `ihl` is the low nibble of byte 0, `total_length`
+        // is bytes 2..4.
+        if let Some(ihl) = s.ihl {
+            let bytes = p.packet_mut();
+            bytes[0] = (bytes[0] & 0xF0) | (ihl & 0x0F);
+        }
+        if let Some(total_length) = s.total_length {
+            p.packet_mut()[2..4].copy_from_slice(&total_length.to_be_bytes());
+        }
+
+        // `None` ⇒ computed over the header **as it ships** (after stamping), so a
+        // pinned `ihl`/`total_length` is covered by the checksum a receiver
+        // verifies; `Some` ⇒ verbatim.
         let csum = s.checksum.unwrap_or_else(|| checksum(&p.to_immutable()));
         p.set_checksum(csum);
     }
     Ok(buf)
 }
 
-/// IPv6 header (no checksum at this layer).
+/// IPv6 header (no checksum at this layer). `payload_length` is stamped after the
+/// payload is written, for the reason given on [`build_ipv4`].
 fn build_ipv6(s: &Ipv6Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<u8>, CraftError> {
     use pnet_packet::ip::IpNextHeaderProtocol;
     use pnet_packet::ipv6::MutableIpv6Packet;
+    use pnet_packet::MutablePacket;
 
+    // `payload_length` is a `u16`; see [`build_ipv4`] for why a wrap must not
+    // reach `pnet`.
+    if payload.len() > usize::from(u16::MAX) {
+        return Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+    }
     let total = 40 + payload.len();
     let mut buf = vec![0u8; total];
     {
@@ -559,7 +604,7 @@ fn build_ipv6(s: &Ipv6Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<
         p.set_version(6);
         p.set_traffic_class(s.traffic_class.unwrap_or(0));
         p.set_flow_label(s.flow_label.unwrap_or(0));
-        p.set_payload_length(s.payload_length.unwrap_or(payload.len() as u16));
+        p.set_payload_length(payload.len() as u16);
         p.set_next_header(IpNextHeaderProtocol(
             s.next_header.unwrap_or_else(|| ip_proto_for(next)),
         ));
@@ -567,13 +612,21 @@ fn build_ipv6(s: &Ipv6Spec, payload: &[u8], next: Option<&Layer>) -> Result<Vec<
         p.set_source(s.src.unwrap_or(Ipv6Addr::UNSPECIFIED));
         p.set_destination(s.dst.unwrap_or(Ipv6Addr::UNSPECIFIED));
         p.set_payload(payload);
+
+        // Verbatim `payload_length`: bytes 4..6 of the finished header.
+        if let Some(payload_length) = s.payload_length {
+            p.packet_mut()[4..6].copy_from_slice(&payload_length.to_be_bytes());
+        }
     }
     Ok(buf)
 }
 
 /// TCP header; checksum uses the enclosing IP pseudo-header when auto-completed.
+/// `data_offset` is stamped after the payload is written, for the reason given on
+/// [`build_ipv4`] (`pnet` reads it as an options length).
 fn build_tcp(s: &TcpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u8>, CraftError> {
     use pnet_packet::tcp::{ipv4_checksum, ipv6_checksum, MutableTcpPacket};
+    use pnet_packet::MutablePacket;
 
     let total = 20 + payload.len();
     let mut buf = vec![0u8; total];
@@ -583,11 +636,21 @@ fn build_tcp(s: &TcpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u
         p.set_destination(s.dst_port.unwrap_or(0));
         p.set_sequence(s.seq.unwrap_or(0));
         p.set_acknowledgement(s.ack.unwrap_or(0));
-        p.set_data_offset(s.data_offset.unwrap_or(5));
+        p.set_data_offset(TCP_MIN_DATA_OFFSET);
         p.set_flags(s.flags.unwrap_or(0));
         p.set_window(s.window.unwrap_or(0));
         p.set_urgent_ptr(s.urgent_ptr.unwrap_or(0));
         p.set_payload(payload);
+
+        // Verbatim `data_offset`: the high nibble of byte 12, stamped now that
+        // the payload is placed.
+        if let Some(data_offset) = s.data_offset {
+            let bytes = p.packet_mut();
+            bytes[12] = (bytes[12] & 0x0F) | ((data_offset & 0x0F) << 4);
+        }
+
+        // Computed over the segment **as it ships** (after stamping), so a
+        // pinned `data_offset` is covered by the checksum.
         let csum = s.checksum.unwrap_or_else(|| match ip_ctx {
             Some(IpCtx::V4 { src, dst }) => ipv4_checksum(&p.to_immutable(), &src, &dst),
             Some(IpCtx::V6 { src, dst }) => ipv6_checksum(&p.to_immutable(), &src, &dst),
@@ -599,9 +662,21 @@ fn build_tcp(s: &TcpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u
 }
 
 /// UDP header; checksum uses the enclosing IP pseudo-header when auto-completed.
+///
+/// No stamping is needed here: `pnet`'s UDP payload window is the buffer remainder,
+/// not `length`, so a pinned `length` already ships verbatim and cannot abort the
+/// build the way `ihl`/`total_length`/`data_offset` could.
 fn build_udp(s: &UdpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u8>, CraftError> {
     use pnet_packet::udp::{ipv4_checksum, ipv6_checksum, MutableUdpPacket};
 
+    // The auto `length` is `8 + payload`, a `u16` on the wire: refuse the payload
+    // rather than stamp a wrapped length a caller never asked for. A *pinned*
+    // `length` still ships verbatim, wrong value and all.
+    if payload.len() > usize::from(u16::MAX) - 8 {
+        return Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+    }
     let total = 8 + payload.len();
     let mut buf = vec![0u8; total];
     {
@@ -621,7 +696,8 @@ fn build_udp(s: &UdpSpec, payload: &[u8], ip_ctx: Option<IpCtx>) -> Result<Vec<u
 }
 
 /// ICMP (v4) header. The 4-byte rest-of-header word, when pinned, is prepended
-/// to the payload the way scapy models it.
+/// to the payload the way scapy models it. ICMP declares no length field, so it
+/// has no verbatim length to stamp.
 fn build_icmp(s: &IcmpSpec, payload: &[u8]) -> Result<Vec<u8>, CraftError> {
     use pnet_packet::icmp::{checksum, IcmpCode, IcmpType, MutableIcmpPacket};
 
@@ -847,5 +923,345 @@ mod tests {
         assert_eq!(e.src, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert_eq!(e.dst, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert_eq!(e.dst_port, Some(9));
+    }
+
+    /// The IPv4/UDP probe used by the verbatim-length regressions, so every
+    /// expectation below is a literal over the same 33-byte frame.
+    fn probe_v4(ip: Ipv4Spec) -> PacketSpec {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(ip),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        }
+    }
+
+    /// D8.4: an off-by-one `ihl` that claims a longer header than the frame
+    /// carries is a default mutator value. It must ship verbatim, not panic,
+    /// and must not move or truncate the payload.
+    #[test]
+    fn verbatim_ihl_larger_than_header_builds() {
+        let bytes = probe_v4(Ipv4Spec {
+            dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            ihl: Some(6),
+            ..Ipv4Spec::default()
+        })
+        .build()
+        .expect("a too-large ihl still builds");
+
+        assert_eq!(bytes[0], 0x46, "version 4, verbatim ihl 6");
+        assert_eq!(bytes.len(), 33, "the frame keeps its real length");
+        assert_eq!(
+            bytes[22..24],
+            [0u8, 9],
+            "UDP header still starts at byte 20"
+        );
+        assert_eq!(bytes[24..26], [0u8, 13], "UDP length 8 + 5");
+        assert_eq!(&bytes[28..], b"probe", "the payload is not moved");
+    }
+
+    /// The maximum `ihl` (15 ⇒ a claimed 60-byte header over a 20-byte one).
+    #[test]
+    fn verbatim_ihl_15_builds() {
+        let bytes = probe_v4(Ipv4Spec {
+            dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            ihl: Some(15),
+            ..Ipv4Spec::default()
+        })
+        .build()
+        .expect("ihl 15 still builds");
+
+        assert_eq!(bytes[0], 0x4f, "version 4, verbatim ihl 15");
+        assert_eq!(bytes.len(), 33);
+    }
+
+    /// `total_length` 0 and 1 are default mutator values: both are shorter than
+    /// the header itself, and both must reach the wire unchanged.
+    #[test]
+    fn verbatim_total_length_zero_and_one_build() {
+        for (declared, expected) in [(0u16, [0u8, 0]), (1, [0, 1])] {
+            let bytes = probe_v4(Ipv4Spec {
+                dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                total_length: Some(declared),
+                ..Ipv4Spec::default()
+            })
+            .build()
+            .expect("a too-short total_length still builds");
+
+            assert_eq!(bytes[2..4], expected, "verbatim total_length {declared}");
+            assert_eq!(bytes.len(), 33, "the frame keeps its real length");
+        }
+    }
+
+    /// The off-by-one `total_length` (declared − 1 = 32 for this 33-byte frame).
+    #[test]
+    fn verbatim_total_length_short_builds() {
+        let bytes = probe_v4(Ipv4Spec {
+            dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            total_length: Some(32),
+            ..Ipv4Spec::default()
+        })
+        .build()
+        .expect("total_length - 1 still builds");
+
+        assert_eq!(bytes[2..4], [0u8, 32]);
+        assert_eq!(bytes.len(), 33);
+    }
+
+    /// D8.4 for TCP: a `data_offset` that claims options the segment does not
+    /// carry ships verbatim in the high nibble of TCP byte 12.
+    #[test]
+    fn verbatim_tcp_data_offset_builds() {
+        let spec = |data_offset: u8| PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    dst_port: Some(80),
+                    data_offset: Some(data_offset),
+                    ..TcpSpec::default()
+                }),
+            ],
+        };
+
+        let bytes = spec(6).build().expect("data_offset 6 still builds");
+        assert_eq!(bytes.len(), 40, "20-byte IPv4 header + 20-byte TCP header");
+        assert_eq!(bytes[20 + 12] >> 4, 6, "verbatim data_offset 6");
+
+        let bytes = spec(15).build().expect("data_offset 15 still builds");
+        assert_eq!(bytes[20 + 12], 0xf0, "verbatim data_offset 15, reserved 0");
+        assert_eq!(bytes.len(), 40);
+    }
+
+    /// The same shape on IPv6: a `payload_length` shorter than the real payload.
+    #[test]
+    fn verbatim_ipv6_payload_length_short_builds() {
+        let bytes = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    payload_length: Some(1),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        }
+        .build()
+        .expect("a too-short payload_length still builds");
+
+        assert_eq!(bytes[4..6], [0u8, 1], "verbatim payload_length 1");
+        assert_eq!(bytes.len(), 53, "40-byte IPv6 header + 8 + 5");
+    }
+
+    /// `Mutation::apply`'s contract needs `build()` to be total over these
+    /// fields: every representable `ihl` and `data_offset` must build.
+    #[test]
+    fn every_u8_ihl_and_data_offset_value_builds() {
+        for v in 0u8..=15 {
+            assert!(
+                probe_v4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ihl: Some(v),
+                    ..Ipv4Spec::default()
+                })
+                .build()
+                .is_ok(),
+                "ihl {v} must build"
+            );
+
+            assert!(
+                PacketSpec {
+                    layers: vec![
+                        Layer::Ipv4(Ipv4Spec {
+                            dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                            ..Ipv4Spec::default()
+                        }),
+                        Layer::Tcp(TcpSpec {
+                            dst_port: Some(80),
+                            data_offset: Some(v),
+                            ..TcpSpec::default()
+                        }),
+                        Layer::Raw(b"probe".to_vec()),
+                    ],
+                }
+                .build()
+                .is_ok(),
+                "data_offset {v} must build"
+            );
+        }
+    }
+
+    /// An oversize payload is refused by the length guards, never by a wrapped
+    /// auto length: `20 + payload` (IPv4 `total_length`), `8 + payload` (UDP
+    /// `length`) and `payload` (IPv6 `payload_length`) are all `u16` on the wire,
+    /// so a payload that overflows one of them must return
+    /// [`CraftError::TooLarge`] before `pnet`'s payload window is sized from the
+    /// wrapped value (which panicked inside `set_payload`).
+    #[test]
+    fn oversize_payload_is_too_large_not_a_panic() {
+        // `[Raw(AF prefix), Ipv4, Udp, Raw(n)]` — the shape the loopback send path
+        // builds, so the four-byte prefix is counted the way production counts it.
+        let spec = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Raw(vec![0u8; 4]),
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+
+        // 65507: every auto length still fits in a `u16`; the finished frame is
+        // 65539 bytes, so the existing whole-packet cap refuses it.
+        assert_eq!(
+            spec(65_507).build(),
+            Err(CraftError::TooLarge {
+                max: MAX_PACKET_BYTES
+            }),
+            "65507 must stay a TooLarge from the whole-packet cap"
+        );
+        // 65508: `20 + 8 + 65508` wraps `total_length` to 0. 70000: it wraps the
+        // UDP `length` as well. Both panicked before the guards existed.
+        for n in [65_508usize, 70_000] {
+            assert_eq!(
+                spec(n).build(),
+                Err(CraftError::TooLarge {
+                    max: MAX_PACKET_BYTES
+                }),
+                "payload {n} must be TooLarge, not a panic"
+            );
+        }
+
+        // IPv6 carries the payload length alone, so it wraps one byte later.
+        let v6 = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Raw(vec![0u8; 65_536]),
+            ],
+        };
+        assert_eq!(
+            v6.build(),
+            Err(CraftError::TooLarge {
+                max: MAX_PACKET_BYTES
+            }),
+            "an IPv6 payload over 65535 bytes must be TooLarge, not a panic"
+        );
+    }
+
+    /// Tester (fix rounds, review finding SEC1): the three auto-length guards
+    /// sit exactly at the `u16` boundary. A payload that fills the length to
+    /// 65535 builds with the length stamped `0xffff`; one byte more is
+    /// `TooLarge` from the guard (IPv4) or from the whole-packet cap (IPv6 and
+    /// UDP, whose own `u16` still fits), and never a panic. A *pinned* UDP
+    /// length still ships verbatim.
+    #[test]
+    fn auto_lengths_at_the_u16_boundary_build_and_one_more_is_too_large() {
+        let too_large = Err(CraftError::TooLarge {
+            max: MAX_PACKET_BYTES,
+        });
+        let v4 = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+        let frame = v4(65_515).build().expect("20 + 65515 = 65535 builds");
+        assert_eq!(frame.len(), 65_535);
+        assert_eq!(&frame[2..4], &[0xff, 0xff], "total_length is 65535");
+        assert_eq!(v4(65_516).build(), too_large);
+
+        let v4_udp = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+        let frame = v4_udp(65_507)
+            .build()
+            .expect("20 + 8 + 65507 = 65535 builds");
+        assert_eq!(frame.len(), 65_535);
+        assert_eq!(&frame[2..4], &[0xff, 0xff], "total_length is 65535");
+        assert_eq!(&frame[24..26], &[0xff, 0xeb], "udp length is 65515");
+        assert_eq!(v4_udp(65_508).build(), too_large);
+
+        let v6 = |n: usize| PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Raw(vec![0u8; n]),
+            ],
+        };
+        let frame = v6(65_495).build().expect("40 + 65495 = 65535 builds");
+        assert_eq!(frame.len(), 65_535);
+        assert_eq!(&frame[4..6], &[0xff, 0xd7], "payload_length is 65495");
+        // 65496 fits payload_length but not the frame: the cap, not a wrap.
+        assert_eq!(v6(65_496).build(), too_large);
+        // The largest UDP payload IPv6 can declare (65527) still overflows the
+        // frame; both the UDP and IPv6 guards admit it and the cap refuses it.
+        let v6_udp = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(53),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; 65_527]),
+            ],
+        };
+        assert_eq!(v6_udp.build(), too_large);
+
+        // A pinned UDP length is the operator's and ships verbatim, however
+        // wrong.
+        let pinned = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    length: Some(0xffff),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(vec![0u8; 4]),
+            ],
+        }
+        .build()
+        .expect("a pinned length builds");
+        assert_eq!(pinned.len(), 32);
+        assert_eq!(&pinned[24..26], &[0xff, 0xff], "the pinned length ships");
     }
 }

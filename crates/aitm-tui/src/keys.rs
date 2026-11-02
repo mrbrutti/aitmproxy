@@ -205,6 +205,7 @@ fn flows(key: KeyEvent, ctrl: bool) -> Option<Action> {
         KeyCode::Char('P') => Action::BuildPoc,
         KeyCode::Char('F') => Action::OpenFindings,
         KeyCode::Char('S') => Action::OpenScope,
+        KeyCode::Char('s') => Action::ToggleSysProxy,
         KeyCode::Char('@') => Action::OpenAgent,
         KeyCode::Char('l') => Action::ToggleLayout,
         KeyCode::Char('t') => Action::ToggleAutoSelect,
