@@ -12,6 +12,8 @@ pub mod config_file;
 pub mod env;
 pub mod ingress;
 pub mod macos_capture;
+pub mod oneshot;
+pub mod operator_bus;
 pub mod operator_token;
 pub mod render;
 pub mod scripts;

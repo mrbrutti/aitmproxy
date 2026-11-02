@@ -221,7 +221,7 @@ fn is_flag(tok: &str) -> bool {
 
 /// Flags → typed `Params` for `cmd`: every flag a declared param, each given at
 /// most once, every required param present.
-fn parse_flags(tokens: &[String], schema: &ParamSchema, cmd: &str) -> anyhow::Result<Params> {
+pub fn parse_flags(tokens: &[String], schema: &ParamSchema, cmd: &str) -> anyhow::Result<Params> {
     let mut map = BTreeMap::new();
     let mut toks = tokens.iter().peekable();
     while let Some(tok) = toks.next() {
