@@ -105,11 +105,10 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
 }
 
-pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let area = centered(screen, 96, 37);
-    let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
+pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     let k = |a: &str, b: &str| key_line(theme, a, b);
-    let mut lines = vec![
+    let mut lines =
+        vec![
         heading(theme, "Flow list"),
         k("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
         k(
@@ -131,6 +130,15 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             "F / S / @",
             "findings · scope · agent panels · :scan scan panel (r crawls, ⏎ opens a point's flow)",
         ),
+        k(
+            "L / :l4",
+            "L4 panel: capture / intercept availability and running captures",
+        ),
+        k("", ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]"),
+        k(
+            "b / s / m / u",
+            "L4 craft pane: build · inject (guarded) · apply to parked packet · revert",
+        ),
         k("1-9 0 Tab", "content-type chips"),
         k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
         k(
@@ -144,7 +152,7 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         k("y / o", "copy URL (OSC 52) · open externally"),
         k(
             "/",
-            "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed · & | ! ( )",
+            "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed ~l4 ~tcp ~udp ~icmp · & | ! ( )",
         ),
         k(":", "command palette — every bus tool plus:"),
     ];
@@ -154,11 +162,42 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             Span::styled((*detail).to_string(), theme.text_tertiary()),
         ]));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " Any key closes this help.",
-        theme.text_tertiary(),
-    ));
+    // The L4 scope add form exists only where the core can confirm it (spec
+    // §3 / AC39); against any other core help does not offer it.
+    if crate::l4::supports_operator_scope_add(&app.tools) {
+        lines.push(Line::from(vec![
+            Span::styled("   :scope add l4 …             ", theme.accent()),
+            Span::styled(
+                "Add an L4 scope entry: <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>",
+                theme.text_tertiary(),
+            ),
+        ]));
+    }
+    // `lines` is the body: the key and palette lines. The box wants the body,
+    // a blank spacer, the closing hint and the frame, and is never taller than
+    // the screen. On a short terminal the spacer goes first; then the tail of
+    // the body is replaced by a footer that counts exactly the body lines it
+    // hides, so the closing hint is never clipped and a footer never appears
+    // when nothing is hidden.
+    let closing = " Any key closes this help.";
+    let wanted = u16::try_from(lines.len().saturating_add(4)).unwrap_or(u16::MAX);
+    let area = centered(screen, 96, wanted.min(screen.height));
+    let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
+    let visible = usize::from(inner.height);
+    if lines.len() + 2 <= visible {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(closing, theme.text_tertiary()));
+    } else if lines.len() < visible {
+        lines.push(Line::styled(closing, theme.text_tertiary()));
+    } else if visible > 0 {
+        let shown = visible - 1;
+        let hidden = lines.len() - shown;
+        lines.truncate(shown);
+        lines.push(Line::styled(
+            format!(" … {hidden} more lines need a taller window ·{closing}"),
+            theme.text_tertiary(),
+        ));
+    }
     lines_into(buf, inner, &lines, 0);
 }
 
@@ -353,6 +392,42 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         for h in oos {
             lines.push(Line::styled(format!("   {h}"), theme.text_tertiary()));
         }
+    }
+    // The L4 scope (L4 parity spec §3, AC13): every `l4.scope.list` entry
+    // with its provenance; the add form only where the core can confirm it.
+    lines.push(Line::raw(""));
+    lines.push(heading(theme, "L4 scope"));
+    if app.l4.scope.is_empty() {
+        lines.push(Line::styled(
+            " no L4 scope — nothing is captured, injected or intercepted at L4.",
+            theme.text_tertiary(),
+        ));
+    }
+    for e in &app.l4.scope {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} {:<8} {:<20} {:<12} {:<9} {:<10}",
+                    glyph::SCOPE,
+                    fit(&e.interface, 8),
+                    fit(&e.cidr, 20),
+                    fit(&e.ports, 12),
+                    e.direction,
+                    e.capability
+                ),
+                theme.text_primary(),
+            ),
+            Span::styled(e.source.clone(), theme.text_tertiary()),
+        ]));
+    }
+    if crate::l4::supports_operator_scope_add(&app.tools) {
+        lines.push(Line::styled(
+            format!(
+                " {} (the core asks you to confirm)",
+                crate::l4::SCOPE_ADD_L4_USAGE.trim_start_matches("usage: ")
+            ),
+            theme.text_tertiary(),
+        ));
     }
     lines.push(Line::raw(""));
     let remove_note = if app.has_tool("scope.remove") {
@@ -685,7 +760,7 @@ pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         theme.text_tertiary(),
     ));
     lines.push(Line::styled(
-        " install/uninstall ask for a local y/N first: the bus has no confirm step until core follow-up F1.",
+        " install/uninstall ask for a local y/N before the call.",
         theme.text_tertiary(),
     ));
     lines_into(buf, inner, &lines, 0);
@@ -750,16 +825,29 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             Span::styled(format!(" {} ", glyph::AGENT), theme.agent()),
             Span::styled(
                 match app.agent.policy {
-                    Some(p) => format!("policy: {} · {} actions in the last minute · {} client(s)", p.label(), app.agent.actions_last_minute, app.agent.connected_clients),
-                    None => "agent.status is not on this bus (core follow-up F1) — the toggle is read-only here".to_string(),
+                    Some(p) => format!(
+                        "policy: {} · {} actions in the last minute · {} client(s)",
+                        p.label(),
+                        app.agent.actions_last_minute,
+                        app.agent.connected_clients
+                    ),
+                    None => "agent policy not reported by agent.status".to_string(),
                 },
                 theme.text_primary(),
             ),
         ]),
         Line::raw(""),
         policy_line(AgentPolicy::All, "1", "the agent may call every tool"),
-        policy_line(AgentPolicy::ReadOnly, "2", "list/get/status only; mutations are refused"),
-        policy_line(AgentPolicy::Paused, "3", "every tools/call from MCP returns \"paused by operator\""),
+        policy_line(
+            AgentPolicy::ReadOnly,
+            "2",
+            "list/get/status only; mutations are refused",
+        ),
+        policy_line(
+            AgentPolicy::Paused,
+            "3",
+            "every tools/call from MCP returns \"paused by operator\"",
+        ),
         Line::raw(""),
     ];
     l4_capabilities(app, theme, &mut lines);

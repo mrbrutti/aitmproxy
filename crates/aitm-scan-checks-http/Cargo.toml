@@ -7,7 +7,7 @@ rust-version.workspace = true
 description = "Scanner v2 native HTTP checks (track T3): checks contributed to the HTTP lane's catalogue. Skeleton slot handed over at T1a."
 
 [dependencies]
-# The `Check` trait this crate's `checks()` slot returns. This crate contributes
+# The `Check` trait this crate's `checks_with()` slot returns. This crate contributes
 # native checks to the HTTP lane's catalogue; it is not a lane of its own (A16).
 aitm-scan-model.workspace = true
 # `redact::scrub_text`, which every excerpt passes through before it reaches an

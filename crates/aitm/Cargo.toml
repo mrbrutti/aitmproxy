@@ -53,6 +53,12 @@ aitm-findings.workspace = true
 aitm-plugin-rhai.workspace = true
 aitm-mcp.workspace = true
 aitm-cli.workspace = true
+# Proxied client attribution: names the loopback client of every proxied
+# connection (`source_app` on explicit-proxy flows). It holds the audited
+# `unsafe` libproc calls (macOS) and the `/proc` walk (Linux) so that this crate
+# can keep the workspace `unsafe_code = "forbid"`; `wire.rs` hands its
+# `ProcessResolver` to `ProxyBuilder::with_peer_resolver`.
+aitm-peer-process.workspace = true
 # `aitm tui` embeds the proxy: the TUI runs in-process over `aitm-bus-client`'s
 # `InProcessTransport` (TUI plan Task 4). Both are already in the tree.
 aitm-tui.workspace = true

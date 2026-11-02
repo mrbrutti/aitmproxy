@@ -3,11 +3,14 @@
 # docs/superpowers/specs/2026-10-31-ne-claim-rule-design.md, D5 and CR-AC7).
 #
 # The Extension (apps/mac/Extension) has no SwiftPM test target: build.sh compiles
-# Extension/Sources/*.swift straight with swiftc. Its tests are `enum HandoffSelfCheck`
-# at the bottom of Extension/Sources/FlowHandoff.swift, compiled only under `DEBUG`;
-# `HandoffSelfCheck.run()` returns one `FAIL ...` line per broken check and an empty
-# array when everything holds. Before this script the only way to run them was a
-# driver typed into a terminal by hand. This script is that driver, committed.
+# Extension/Sources/*.swift straight with swiftc. Its tests are the checks of
+# `enum HandoffSelfCheck` (Extension/Sources/FlowHandoff.swift) and of the
+# `#if DEBUG extension HandoffSelfCheck` blocks beside the code they test
+# (ProviderRules.swift, RuleReconciler.swift), all compiled only under `DEBUG`;
+# `HandoffSelfCheck.run()` lists every group and returns one `FAIL ...` line per broken
+# check and an empty array when everything holds. Before this script the only way to
+# run them was a driver typed into a terminal by hand. This script is that driver,
+# committed.
 #
 # Usage: tools/ne-selfcheck.sh [mac-dir]   (default: the apps/mac that holds this script)
 #
