@@ -86,7 +86,8 @@ use crate::{mutate, redact, session, url_norm};
 /// No `Debug`: it holds the captured request, whose `Debug` prints every header
 /// value.
 pub(crate) struct HttpProbeHost {
-    /// The captured request, session already applied, every probe starts from.
+    /// The source request (captured, or synthetic for an origin-scoped point),
+    /// session already applied, every probe starts from.
     source: HttpRequest,
     /// The stored flow the point came from, as the proxy captured it, for the
     /// engine's passive checks ([`ProbeHost::captured`]): they read the
