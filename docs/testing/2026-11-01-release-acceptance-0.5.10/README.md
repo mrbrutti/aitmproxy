@@ -5,6 +5,8 @@ Everything here was read from Matt's Mac as it was, through the installed binari
 operator's real HOME and data dir. Nothing was pre-set. Every bus reading went over the running
 core's operator bus with the token read from its per-launch config and never printed.
 
+**Yes-list for this run:** none (no machine-state step performed). **Manual:** no. **Window:** no.
+
 **Status of this run:** the read-only half is done (state, bus truth, CLI journey). The MAC, TUI
 and WEB journeys and every `yes` step wait for the orchestrator's display-lock window and Matt's
 yes-list (spec Open questions 1–2). Their rows below are `SKIP needs Matt's yes` / `SKIP needs a
@@ -93,19 +95,51 @@ CLI: PASS 2 · FAIL 3 · SKIP 3. Every FAIL has an owner; none is new.
 | MAC-1 | PASS (already running) | app pid 16190; core pid 78375 | `listening true`, `version 0.5.10`, `start` marker present | — |
 | MAC-2 first-run sheet | SKIP needs the window | the sheet shows once per store; read whether it is still due from the window | `ca.status.user.trusted yes` → row 2 must read "CA trusted (user keychain)" | — |
 | MAC-3 Status words | SKIP needs the window | expected for this state: "system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.", "All Apps is on", "Add a host to Scope (for now as example.com:443)", CA step done, "Set aitmproxy as the system proxy, or open the browser" | as above | — |
-| MAC-4 Flows empty | n/a | 16 rows exist (O3); the banner case applies instead: expected "system proxy off · Nothing is decrypted until a host is in Scope." with button "Set as System Proxy" | `flow.table` 16 rows all passthrough | — |
+| MAC-4 Flows empty | SKIP needs the window | 16 rows exist (O3), so the banner case applies: expected "system proxy off · Nothing is decrypted until a host is in Scope." with button "Set as System Proxy" (All Apps was on at 02:06Z? — `capture.enabled 1`, provider attached: then the banner names only Scope and the CA rule applies; read on the window) | `flow.table` 16 rows all passthrough | — |
 | MAC-5 add host on the Scope page | SKIP needs the window (hand on his app) | — | — | — |
 | MAC-6 Set as System Proxy | SKIP needs Matt's yes | — | — | — |
 | MAC-7 Capture All Apps | already on (`capture.enabled 1`, provider attached) — the step becomes "verify the words for on, nothing in scope": lane "on, nothing in scope", remedy "Add a host to Scope (for now as example.com:443); nothing is captured until then" | SKIP needs the window to read | `capture.status enabled true, attached, 0 handed off` | — |
 | MAC-8 real browser rows | SKIP needs MAC-5/6 | — | — | — |
 | MAC-9b Apps sidebar, proxied flows | **FAIL (missing feature), read from the bus** | every one of the 16 flows is proxied with `source_app: null`, so the sidebar can show no app; this is Matt's "NOTHING is there". With All Apps on, extension-captured flows would carry `source_app`, but nothing is in Scope so the extension claims nothing (`flows_handed_off 0`) | `flow.table`: `source_app null` ×16, `capture_interface null` ×16 | missing feature: attribution for proxied flows (session core-name-the-client-app); plus the empty Scope (operator state, words in MAC-3/7) |
-| MAC-10…16 | SKIP needs the window / Matt's yes | — | — | — |
+| MAC-10 arm intercept | BLOCKED MAC-8 | — | — | — |
+| MAC-11 resume | BLOCKED MAC-8 | — | — | — |
+| MAC-12 disarm | BLOCKED MAC-8 | — | — | — |
+| MAC-13 Restart Core | SKIP needs the window | — | — | — |
+| MAC-14 Stop Capturing | SKIP All Apps was on at start; the run never turns the operator's capture off | — | — | — |
+| MAC-15 Restore System Proxy | SKIP nothing to restore (MAC-6 not run) | — | — | — |
+| MAC-16 Quit | SKIP the app was running at start; not quit by the run | — | — | — |
 
-## Journey TUI (spec D4), Journey WEB (spec D5)
+## Journey TUI (spec D4)
 
-SKIP `port 8080 held by Aitmproxy.app's embedded core` (Open question 2). Both will run in the
-window if Matt allows quitting and relaunching the app; otherwise their words stay checked only
-as the N4 startup refusal, which the CLI journey already proved (`N4-CLI`).
+| # | Result | Observed | Bus truth | Explains |
+|---|---|---|---|---|
+| TUI-1 | SKIP | port 8080 held by the app's embedded core (`aitm tui` needs the default ports; quitting his app is Open question 2) | — | — |
+| TUI-2 | SKIP | same | — | — |
+| TUI-3 | SKIP | same; also needs Matt's yes | — | — |
+| TUI-4 | SKIP | same; also a hand | — | — |
+| TUI-5 | SKIP | same | — | — |
+| TUI-6 | SKIP | same | — | — |
+| TUI-7 | SKIP | same; also needs Matt's yes | — | — |
+| TUI-8 | SKIP | same | — | — |
+| TUI-9 | SKIP | no All Apps control on this surface | — | UIs pending (per-host decryption decision) |
+| TUI-10 | SKIP | no Apps view on this surface on 0.5.10 | — | — |
+
+## Journey WEB (spec D5)
+
+| # | Result | Observed | Bus truth | Explains |
+|---|---|---|---|---|
+| WEB-1 | SKIP | port 8080 held by the app's embedded core (`aitm web` binds the proxy port first) | — | — |
+| WEB-2 | SKIP | same | — | — |
+| WEB-3 | SKIP | same | — | — |
+| WEB-4 | SKIP | same; also needs Matt's yes | — | — |
+| WEB-5 | SKIP | same; also a hand | — | — |
+| WEB-6a/6b/6c/6d | SKIP | same | — | — |
+| WEB-7 | SKIP | same; also needs Matt's yes | — | — |
+| WEB-8 | SKIP | same | — | — |
+| WEB-9 | SKIP | no All Apps control on this surface | — | UIs pending |
+| WEB-10 | SKIP | no Apps view on this surface on 0.5.10 | — | — |
+
+The startup refusal both surfaces would print on the held port is pinned by `N4-CLI` below.
 
 ## Negative paths (spec D7)
 
@@ -115,7 +149,8 @@ as the N4 startup refusal, which the CLI journey already proved (`N4-CLI`).
 | N2 no route, host in Scope | all | not reproducible without MAC-5 | the inverse state is live now: route (Firefox) without Scope → passthrough rows, `advice` set | — |
 | N3 untrusted CA | all | SKIP `CA stays trusted` (not requested) | words read from source in the spec | — |
 | N4 port held | CLI | PASS (above) | — | — |
-| N5 wrong token | all | SKIP | — | — |
+| N5 wrong token | TUI | PASS (02:25Z run, 0.5.11 core) | `aitm-tui --bus <app bus> --token-file <wrong>`: `bus refused the token: it matched neither the agent nor the operator token (check the token you supplied)`; retries stop | — |
+| N5 wrong token | MAC, WEB, CLI | SKIP | hand (Settings ▸ Bus field); web needs `aitm web` up; CLI is CLI-6's refusal | — |
 
 ## Runner dry run at 02:25Z — the state had changed under the run (evidence moved to `../2026-11-02-release-acceptance-0.5.11/run-1-readonly/`)
 
@@ -145,8 +180,11 @@ state are the MAC-3 words, still to be read on the window.
 
 ## Restore proof
 
-No `yes` step has run; nothing was changed. `state-after.txt` will be taken after the window and
-diffed here. The only writes so far: this run's bus reads (`agent.activity` shows them as
+No `yes` step has run; nothing was changed. The after-readings of the 02:25Z runner pass (taken on
+the 0.5.11 core) equal the before-readings with timestamps and pids excluded
+(`../2026-11-02-release-acceptance-0.5.11/run-1-readonly/state-diff.txt`); the 02:06Z 0.5.10
+readings were not re-taken on the 0.5.10 core because that core was replaced by the 0.5.11 relaunch
+before the runner existed. The only writes so far: this run's bus reads (`agent.activity` shows them as
 `aitm-e2e`, origin operator) and the CLI-5 one-shot, which changed nothing in the running core
 and left no state file (the one-shot's in-process core minted nothing: `ca/` unchanged).
 
@@ -155,10 +193,10 @@ and left no state file (the one-shot's in-process core minted nothing: `ca/` unc
 | Journey | PASS | FAIL | SKIP | BLOCKED |
 |---|---|---|---|---|
 | CLI | 2 | 3 | 3 | 0 |
-| MAC (dry run, 0.5.11 core) | 3 | 1 | 10 | 4 |
-| TUI | 0 | 0 | 8 | 0 |
-| WEB | 0 | 0 | 8 | 0 |
-| Negatives | 2 | 0 | 3 | 0 |
+| MAC (02:06Z, 0.5.10 core; MAC-9b from the bus) | 1 | 1 | 11 | 3 |
+| TUI | 0 | 0 | 10 | 0 |
+| WEB | 0 | 0 | 13 | 0 |
+| Negatives | 2 | 0 | 5 | 0 |
 
 **Verdict so far: `fail` — 0.5.10 fails the acceptance on the CLI journey (CLI-1/2/4/5) and on
 proxied-flow Apps attribution (MAC-9b); the rest is `incomplete` (window and yes-list pending).** Owners: PR #271 (CLI-1, CLI-2, log noise in CLI-7/N4), the
