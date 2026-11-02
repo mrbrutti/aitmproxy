@@ -420,6 +420,95 @@ public struct ScanCheckTree: Hashable, Sendable {
     }
 }
 
+// MARK: - Job facts and the bus link (Jobs view spec D2, D6, D15)
+
+/// One truth per job: the counters both wire shapes carry, merged from the
+/// `scan.list` row and the stored `scan.status`, plus the detail-only fields
+/// the status alone carries. The row and the detail both read this value, so
+/// they can never disagree (Jobs view spec D2).
+public struct ScanJobFacts: Equatable, Sendable {
+    public var job: String
+    /// The shared counters (state, phase, elapsed, probes, points, issues), from
+    /// whichever of the two shapes is the newer truth.
+    public var summary: ScanJobSummary
+    /// The detail-only fields (profile, targets, started by, crawl, checks, lanes,
+    /// stopped reason, error); nil until the first `scan.status` lands.
+    public var status: ScanJobStatus?
+
+    public init(job: String, summary: ScanJobSummary, status: ScanJobStatus?) {
+        self.job = job
+        self.summary = summary
+        self.status = status
+    }
+
+    /// The shared counters come from, in order: a terminal status (final, every
+    /// field present); else a terminal list row (the list turned terminal while
+    /// the stored status is still live, the C1 and C2 bug); else whichever of the
+    /// two has the higher `elapsedMs` (the status on a tie). `status` is kept as
+    /// given either way.
+    public static func make(summary: ScanJobSummary, status: ScanJobStatus?) -> ScanJobFacts {
+        guard let status else { return ScanJobFacts(job: summary.job, summary: summary, status: nil) }
+        let merged: ScanJobSummary = if status.state.isTerminal {
+            status.summary
+        } else if summary.state.isTerminal {
+            summary
+        } else if status.elapsedMs >= summary.elapsedMs {
+            status.summary
+        } else {
+            summary
+        }
+        return ScanJobFacts(job: summary.job, summary: merged, status: status)
+    }
+}
+
+/// How the Jobs view is linked to the core right now: from the bus state and
+/// the last `scan.list` outcome (Jobs view spec D6). The verbs (Cancel Scan,
+/// the hover Cancel, the context-menu Cancel) are enabled only while `.live`;
+/// `bannerText` is D15's inline banner, nil while live.
+public struct ScanJobsLink: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable { case live, reconnecting, disconnected, unanswered }
+
+    public var kind: Kind
+    /// `now - jobsLoadedAt`; nil before the first list arrived.
+    public var valuesAgeMs: Int?
+    public var bannerText: String?
+    public var verbsEnabled: Bool
+
+    public init(kind: Kind, valuesAgeMs: Int?, bannerText: String?, verbsEnabled: Bool) {
+        self.kind = kind
+        self.valuesAgeMs = valuesAgeMs
+        self.bannerText = bannerText
+        self.verbsEnabled = verbsEnabled
+    }
+
+    /// A connecting bus is `.reconnecting`; a disconnected or failed one
+    /// `.disconnected`; a connected bus whose last `scan.list` failed is
+    /// `.unanswered`; else `.live`.
+    public static func make(bus: BusState, listFailedAt: Int?, jobsLoadedAt: Int?, now: Int) -> ScanJobsLink {
+        let kind: Kind = switch bus {
+        case .connecting: .reconnecting
+        case .disconnected, .failed: .disconnected
+        case .connected: listFailedAt != nil ? .unanswered : .live
+        }
+        let age = jobsLoadedAt.map { now - $0 }
+        return ScanJobsLink(
+            kind: kind, valuesAgeMs: age, bannerText: bannerText(kind: kind, ageMs: age), verbsEnabled: kind == .live)
+    }
+
+    /// D15's table; the age clause is omitted while no list has arrived.
+    static func bannerText(kind: Kind, ageMs: Int?) -> String? {
+        guard kind != .live else { return nil }
+        let age = ageMs.map { "showing values from \(ScanFormat.elapsed(ms: $0)) ago" }
+        let parts: [String?] = switch kind {
+        case .live: []
+        case .reconnecting: ["Bus disconnected", age, "reconnecting…"]
+        case .disconnected: ["Bus disconnected", age, "Proxy ▸ Reconnect Bus (⌃⌘R) to retry"]
+        case .unanswered: ["The core is not answering", age, "retrying every 2 s"]
+        }
+        return parts.compactMap { $0 }.joined(separator: " · ")
+    }
+}
+
 // MARK: - The model (D8)
 
 /// Everything the Scan page shows and the app drives: the tab, the lists and
@@ -451,6 +540,11 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     /// Per job: the `clamped` and `lanes.skipped` notices of its `scan.start` result.
     public var launchNotices: [String: [String]] = [:]
     public var jobsError: String?
+    /// When the last `scan.list` landed (epoch ms, the caller's clock); nil before the first (Jobs view D6).
+    public var jobsLoadedAt: Int?
+    /// When the last `scan.list` failed (epoch ms); cleared by the next list that lands. A failed
+    /// cancel or status read sets `jobsError` but not this (Jobs view D6).
+    public var listFailedAt: Int?
 
     // Site map
     public var sitemapJob: String?
@@ -498,6 +592,37 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     }
 
     public var openIssueCount: Int { issues.filter { $0.status == .open }.count }
+
+    /// The one accessor the Jobs views read: the listed row merged with the stored
+    /// status (Jobs view D2); nil when the job is not listed.
+    public func facts(for job: String) -> ScanJobFacts? {
+        guard let summary = jobs.first(where: { $0.job == job }) else { return nil }
+        return ScanJobFacts.make(summary: summary, status: statuses[job])
+    }
+
+    /// Whether the poll should read `scan.status` for a listed job (Jobs view D2):
+    /// while nothing is stored, and once more when the list calls it terminal
+    /// while the stored status is still live. A terminal stored status is final.
+    public static func needsStatusRead(summary: ScanJobSummary, stored: ScanJobStatus?) -> Bool {
+        guard let stored else { return true }
+        return summary.state.isTerminal && !stored.state.isTerminal
+    }
+
+    /// Whether Cancel may be offered for `job`: its merged state is queued or
+    /// running. A cancelling or terminal job is never a target (Jobs view D2).
+    public func mayCancel(job: String) -> Bool {
+        guard let state = facts(for: job)?.summary.state else { return false }
+        return state == .queued || state == .running
+    }
+
+    /// The job Cancel Scan would stop: the selected one while its merged state is
+    /// queued or running, else the only such job in the list. Nil when the choice
+    /// would be a guess, and never a cancelling job (Jobs view D2).
+    public var cancelTarget: String? {
+        if let job = selectedJob, mayCancel(job: job) { return job }
+        let live = jobs.filter { mayCancel(job: $0.job) }
+        return live.count == 1 ? live[0].job : nil
+    }
 
     /// Running jobs when any (queue style), else open issues. Computed for the
     /// follow-on PR; the sidebar does not read it yet.
@@ -620,8 +745,12 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     // MARK: Mutations: jobs
 
     /// `scan.list`, newest first as delivered. A job this app started that the
-    /// list does not carry yet stays in front of it.
-    public mutating func applyList(_ result: ScanListResult) {
+    /// list does not carry yet stays in front of it. `now` (epoch ms, the caller's
+    /// clock) stamps `jobsLoadedAt` and clears `listFailedAt` (Jobs view D6). The
+    /// selection follows the list (Jobs view D3): nothing selected → the newest
+    /// job; a selection the core dropped and this app is not waiting on → the
+    /// first row; an existing selection is never replaced by a newer job.
+    public mutating func applyList(_ result: ScanListResult, now: Int) {
         let listed = Set(result.jobs.map(\.job))
         // Only a job this app started and the core has not listed yet stays ahead of the
         // list; a job the core itself stopped listing (restart, history cap) goes with it.
@@ -636,6 +765,22 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         statuses = statuses.filter { kept.contains($0.key) }
         launchNotices = launchNotices.filter { kept.contains($0.key) }
         refreshNeeded = refreshNeeded.intersection(kept)
+        jobsLoadedAt = now
+        listFailedAt = nil
+        if let selected = selectedJob {
+            if !jobs.contains(where: { $0.job == selected }), !locallyStarted.contains(selected) {
+                selectedJob = jobs.first?.job
+            }
+        } else if let first = jobs.first {
+            selectedJob = first.job
+        }
+    }
+
+    /// A `scan.list` that failed: the inline error and the failure stamp (Jobs view
+    /// D6); the rows and their counters stay. The caller passes the same clock as `applyList`.
+    public mutating func noteListFailure(_ text: String, now: Int) {
+        jobsError = text
+        listFailedAt = now
     }
 
     /// `scan.status`: stored, and the matching list row takes its summary.
@@ -860,6 +1005,14 @@ public enum ScanFormat {
     /// the `out_of_scope` error and the origin row all say this.
     public static func outOfScopeText(origin: String) -> String {
         "Out of scope — add \(hostOf(origin: origin)) to scope to scan it"
+    }
+
+    /// `Unable to list jobs: <core text>. Showing values from 0:42 ago; retrying every 2 s.`
+    /// (Jobs view D6): the inline list error with the last-good clause; without an age
+    /// (no list has landed yet) `Unable to list jobs: <core text>. Retrying every 2 s.`
+    public static func listErrorText(core: String, ageMs: Int?) -> String {
+        guard let ageMs else { return "Unable to list jobs: \(core). Retrying every 2 s." }
+        return "Unable to list jobs: \(core). Showing values from \(elapsed(ms: ageMs)) ago; retrying every 2 s."
     }
 
     /// `Clamped budget.probes 50000 → 20000`: a `scan.start` / `scan.status` clamp notice.

@@ -25,7 +25,7 @@ import Testing
     /// A model that has read `scan.list.json`, so it knows `scan-1a2b3c4d` and `scan-55667788`.
     static func listed() throws -> ScanSurfaceModel {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: load("scan.list.json")))
+        model.applyList(try ScanListResult(json: load("scan.list.json")), now: 0)
         return model
     }
 
@@ -158,7 +158,7 @@ import Testing
 
     @Test func aProgressLineIsATriggerNotAValue() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
         let before = model.jobs
 
@@ -363,12 +363,12 @@ import Testing
 
     @Test func sidebarCountIsRunningJobsElseOpenIssues() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(model.runningJobs.map(\.job) == ["scan-1a2b3c4d"])
         #expect(model.sidebarCount == 1)
 
         let finished = ScanPack.edited(try Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "done")
-        model.applyList(try ScanListResult(json: finished))
+        model.applyList(try ScanListResult(json: finished), now: 0)
         #expect(model.runningJobs.isEmpty)
         #expect(model.sidebarCount == 0)
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
@@ -380,7 +380,7 @@ import Testing
         var model = ScanSurfaceModel()
         #expect(model.tabTitle(.jobs) == "Jobs")
         #expect(model.tabTitle(.issues) == "Issues")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         #expect(model.tabTitle(.jobs) == "Jobs 2")
         #expect(model.tabTitle(.issues) == "Issues 2")
@@ -472,11 +472,16 @@ import Testing
         model.moveSelection(in: .issues, by: -1)
         #expect(model.selectedIssue == "issue-9f8e7d6c")
 
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
-        model.moveSelection(in: .jobs, by: 1)
+        // Jobs view spec D3: the list selects its newest job when nothing is selected,
+        // so the walk starts from `scan-1a2b3c4d`, not from no selection.
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(model.selectedJob == "scan-1a2b3c4d")
         model.moveSelection(in: .jobs, by: 1)
         #expect(model.selectedJob == "scan-55667788")
+        model.moveSelection(in: .jobs, by: 1)
+        #expect(model.selectedJob == "scan-55667788")
+        model.moveSelection(in: .jobs, by: -1)
+        #expect(model.selectedJob == "scan-1a2b3c4d")
 
         model.applyProfiles(try ScanProfileListResult(json: Self.load("scan.profile.list.json")))
         model.moveSelection(in: .profiles, by: 1)
@@ -711,7 +716,7 @@ extension ScanSurfaceTests {
 
     @Test func pushLinesForUnknownJobsAndIssueLinesWithoutAnIssueStillTrigger() throws {
         var model = ScanSurfaceModel()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         let before = model
 
@@ -847,7 +852,7 @@ extension ScanSurfaceTests {
         #expect(Set(model.launchNotices.keys) == ["scan-local"])
 
         // The list carries scan-1a2b3c4d and scan-55667788 but not scan-elsewhere; scan-local waits.
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(Set(model.statuses.keys) == ["scan-1a2b3c4d", "scan-local"])
         #expect(Set(model.lastSeq.keys) == ["scan-1a2b3c4d"])
@@ -856,7 +861,7 @@ extension ScanSurfaceTests {
         #expect(model.locallyStarted == ["scan-local"])
 
         // An empty list keeps only what this app started.
-        model.applyList(try ScanListResult(json: ["jobs": []]))
+        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         #expect(model.jobs.map(\.job) == ["scan-local"])
         #expect(Set(model.statuses.keys) == ["scan-local"])
         #expect(model.lastSeq.isEmpty)
@@ -868,10 +873,10 @@ extension ScanSurfaceTests {
         var jobs = try #require(listed["jobs"]?.arrayValue)
         jobs.append(ScanPack.edited(jobs[1], path: ["job"], to: "scan-local"))
         listed = ScanPack.edited(listed, path: ["jobs"], to: .array(jobs))
-        model.applyList(try ScanListResult(json: listed))
+        model.applyList(try ScanListResult(json: listed), now: 0)
         #expect(model.locallyStarted.isEmpty)
         #expect(Set(model.statuses.keys) == ["scan-local"])
-        model.applyList(try ScanListResult(json: ["jobs": []]))
+        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         #expect(model.jobs.isEmpty)
         #expect(model.statuses.isEmpty)
         #expect(model.launchNotices.isEmpty)
@@ -1297,13 +1302,13 @@ extension ScanSurfaceTests {
     @Test func aJobTheCoreStopsListingIsDropped() throws {
         var started = ScanSurfaceModel()
         started.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
-        started.applyList(try ScanListResult(json: ["jobs": []]))
+        started.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         #expect(started.jobs.map(\.job) == ["scan-1a2b3c4d"], "a job this app started stays until the list carries it")
 
         var listed = ScanSurfaceModel()
-        listed.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        listed.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(listed.jobs.count == 2)
-        listed.applyList(try ScanListResult(json: ["jobs": []]))
+        listed.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         #expect(listed.jobs.isEmpty, "scan.list is the truth for a job it carried before")
     }
 
@@ -1344,7 +1349,7 @@ extension ScanSurfaceTests {
         start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
         model.applyStart(try ScanStartResult(json: start))
         model.jobsError = "old"
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(model.jobsError == nil)
         #expect(model.selectedJob == "scan-local")
@@ -1354,14 +1359,14 @@ extension ScanSurfaceTests {
         var jobs = try #require(listed["jobs"]?.arrayValue)
         jobs.append(ScanPack.edited(jobs[1], path: ["job"], to: "scan-local"))
         listed = ScanPack.edited(listed, path: ["jobs"], to: .array(jobs))
-        model.applyList(try ScanListResult(json: listed))
+        model.applyList(try ScanListResult(json: listed), now: 0)
         #expect(model.jobs.map(\.job) == ["scan-1a2b3c4d", "scan-55667788", "scan-local"])
         #expect(model.jobs[2].state == .done)
         #expect(model.statuses["scan-local"]?.state == .queued, "the start's status stays until scan.status replaces it")
 
         // applyStatus replaces the matching row and only that row; a stranger is stored without a row.
         var statusModel = ScanSurfaceModel()
-        statusModel.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        statusModel.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         let status = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["probes", "sent"], to: 777))
         statusModel.applyStatus(status)
         #expect(statusModel.jobs[0].probes.sent == 777)
@@ -1659,7 +1664,7 @@ extension ScanSurfaceTests {
         var model = ScanSurfaceModel()
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil, "nothing to seed from")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == "scan-1a2b3c4d")
         model.seedSitemapJobIfNeeded()
@@ -1673,7 +1678,7 @@ extension ScanSurfaceTests {
         // A chosen job is never overridden.
         var chosen = ScanSurfaceModel()
         chosen.sitemapJob = "scan-55667788"
-        chosen.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        chosen.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         chosen.seedSitemapJobIfNeeded()
         #expect(chosen.sitemapJob == "scan-55667788")
 
@@ -1823,7 +1828,7 @@ extension ScanSurfaceTests {
         model.clearRefreshFlags()
 
         // The list omits the stranger: its tables go, the listed job's stay.
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(model.statuses["scan-elsewhere"] == nil)
         #expect(model.lastSeq["scan-elsewhere"] == nil)
         #expect(model.statuses["scan-1a2b3c4d"]?.probes.sent == 418)
@@ -1859,7 +1864,7 @@ extension ScanSurfaceTests {
         #expect(acceptedLocal)
         #expect(model.lastSeq["scan-local"] == 3)
         model.clearRefreshFlags()
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
         #expect(model.statuses["scan-local"]?.state == .queued)
         #expect(model.launchNotices["scan-local"]
@@ -1872,7 +1877,7 @@ extension ScanSurfaceTests {
 
         // The same list twice changes nothing.
         var twice = model
-        twice.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        twice.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         #expect(twice == model)
 
         // A stranger's issue or terminal line is a list request only: the issues flag is not raised for it.
@@ -1921,7 +1926,7 @@ extension ScanSurfaceTests {
 
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         model.applyIssue(try ScanIssue(json: Self.load("scan.issue.json")))
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
         model.applyProfiles(try ScanProfileListResult(json: Self.load("scan.profile.list.json")))
         model.applyProfile(try Self.standardProfile())
@@ -1986,19 +1991,19 @@ extension ScanSurfaceTests {
         #expect(model.jobs.first?.job == "scan-new")
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil, "All jobs stands after the first seed")
-        model.applyList(try ScanListResult(json: ["jobs": []]))
+        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil)
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == nil)
 
         // A chosen job survives the list dropping and re-adding jobs.
         model.sitemapJob = "scan-55667788"
-        model.applyList(try ScanListResult(json: ["jobs": []]))
+        model.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == "scan-55667788")
-        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         model.seedSitemapJobIfNeeded()
         #expect(model.sitemapJob == "scan-55667788")
 
@@ -2007,7 +2012,7 @@ extension ScanSurfaceTests {
         early.sitemapJob = nil
         early.seedSitemapJobIfNeeded()
         #expect(early.sitemapJob == nil)
-        early.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        early.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
         early.seedSitemapJobIfNeeded()
         #expect(early.sitemapJob == "scan-1a2b3c4d")
 
@@ -2016,7 +2021,7 @@ extension ScanSurfaceTests {
         let list = try Self.load("scan.list.json")
         let rows = try #require(list["jobs"]?.arrayValue)
         let reversed = ScanPack.edited(list, path: ["jobs"], to: .array(Array(rows.reversed())))
-        doneFirst.applyList(try ScanListResult(json: reversed))
+        doneFirst.applyList(try ScanListResult(json: reversed), now: 0)
         doneFirst.seedSitemapJobIfNeeded()
         #expect(doneFirst.sitemapJob == "scan-55667788")
     }
@@ -2130,5 +2135,239 @@ extension ScanSurfaceTests {
         let listed = try ScanProfileListResult(json: Self.load("scan.profile.list.json")).profiles.map(\.name)
         #expect(ScanSurface.profileNameCollides("Standard", with: listed))
         #expect(!ScanSurface.profileNameCollides("standard-2", with: listed))
+    }
+}
+
+// MARK: - Jobs view: merged facts, re-read rule, selection, link facts (plan Task 1.2)
+
+/// Jobs view spec D2, D3, D6 and D15 (plan Task 1.2): the merged facts the row
+/// and the detail both read, the predicate that drives the status poll, the
+/// list-driven selection, the cancel gate and the bus-link facts with the
+/// banner strings. Pins AC3, AC4, AC7 (pure half), AC8 (unit half) and AC12
+/// (unit half) with the spec's literals.
+@Suite struct ScanJobsFactsTests {
+    static func load(_ file: String) throws -> JSONValue { try ScanPack.load(file) }
+
+    /// `scan.list.json`'s first row, re-stated with the given job, state and elapsed.
+    static func summary(_ job: String = "scan-1a2b3c4d", state: ScanJobState, elapsedMs: Int) throws -> ScanJobSummary {
+        var row = try #require(load("scan.list.json")["jobs"]?.arrayValue?.first)
+        row = ScanPack.edited(row, path: ["job"], to: .string(job))
+        row = ScanPack.edited(row, path: ["state"], to: .string(state.rawValue))
+        row = ScanPack.edited(row, path: ["elapsed_ms"], to: .number(Double(elapsedMs)))
+        return try ScanJobSummary(json: row)
+    }
+
+    /// `scan.status.json`, re-stated with the given job, state, elapsed and profile name.
+    static func status(_ job: String = "scan-1a2b3c4d", state: ScanJobState, elapsedMs: Int,
+                       profile: String = "standard") throws -> ScanJobStatus {
+        var json = try load("scan.status.json")
+        json = ScanPack.edited(json, path: ["job"], to: .string(job))
+        json = ScanPack.edited(json, path: ["state"], to: .string(state.rawValue))
+        json = ScanPack.edited(json, path: ["elapsed_ms"], to: .number(Double(elapsedMs)))
+        json = ScanPack.edited(json, path: ["profile_name"], to: .string(profile))
+        return try ScanJobStatus(json: json)
+    }
+
+    /// AC3: a job is read while no status is stored, and once more when the list
+    /// calls it terminal while the stored status is still live; never otherwise.
+    @Test func needsStatusReadFollowsTheListAndTheStoredState() throws {
+        let running = try Self.summary(state: .running, elapsedMs: 42_000)
+        let done = try Self.summary(state: .done, elapsedMs: 69_000)
+        let cancelled = try Self.summary(state: .cancelled, elapsedMs: 115_000)
+        let storedRunning = try Self.status(state: .running, elapsedMs: 42_000)
+        let storedDone = try Self.status(state: .done, elapsedMs: 69_000)
+        let storedCancelled = try Self.status(state: .cancelled, elapsedMs: 115_000)
+
+        #expect(ScanSurfaceModel.needsStatusRead(summary: running, stored: nil) == true)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: done, stored: storedRunning) == true)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: running, stored: storedRunning) == false)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: done, stored: storedDone) == false)
+        #expect(ScanSurfaceModel.needsStatusRead(summary: cancelled, stored: storedCancelled) == false)
+    }
+
+    /// AC4 plus the plan's C1 tie: a terminal status wins, then a terminal list row,
+    /// then the higher `elapsedMs`; the detail-only fields always come from the status.
+    @Test func jobFactsPickTheNewerTruth() throws {
+        // The list says done at 69 s while the stored status is still running at 65 s: the list wins.
+        let listDone = ScanJobFacts.make(
+            summary: try Self.summary(state: .done, elapsedMs: 69_000),
+            status: try Self.status(state: .running, elapsedMs: 65_000, profile: "light-http"))
+        #expect(listDone.job == "scan-1a2b3c4d")
+        #expect(listDone.summary.state == .done)
+        #expect(listDone.summary.elapsedMs == 69_000)
+        #expect(listDone.status?.profileName == "light-http")
+        #expect(listDone.status?.state == .running, "the status is kept as given")
+
+        // Both live: the later elapsed wins.
+        let later = ScanJobFacts.make(
+            summary: try Self.summary(state: .running, elapsedMs: 65_000),
+            status: try Self.status(state: .running, elapsedMs: 66_000))
+        #expect(later.summary.elapsedMs == 66_000)
+        let earlier = ScanJobFacts.make(
+            summary: try Self.summary(state: .running, elapsedMs: 67_000),
+            status: try Self.status(state: .running, elapsedMs: 66_000))
+        #expect(earlier.summary.elapsedMs == 67_000)
+
+        // A terminal status beats a later live list row.
+        let terminalStatus = ScanJobFacts.make(
+            summary: try Self.summary(state: .running, elapsedMs: 70_000),
+            status: try Self.status(state: .cancelled, elapsedMs: 69_500))
+        #expect(terminalStatus.summary.state == .cancelled)
+        #expect(terminalStatus.summary.elapsedMs == 69_500)
+
+        // The C1 tie: the list says cancelled, the stored status still says cancelling, same elapsed.
+        let tie = ScanJobFacts.make(
+            summary: try Self.summary(state: .cancelled, elapsedMs: 115_000),
+            status: try Self.status(state: .cancelling, elapsedMs: 115_000))
+        #expect(tie.summary.state == .cancelled)
+
+        // No status yet: the list row alone, the detail-only fields absent.
+        let bare = ScanJobFacts.make(summary: try Self.summary(state: .queued, elapsedMs: 0), status: nil)
+        #expect(bare.summary.state == .queued)
+        #expect(bare.status == nil)
+
+        // `facts(for:)` is the one accessor: it merges the listed row with the stored status; nil when unlisted.
+        var model = ScanSurfaceModel()
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.statuses["scan-1a2b3c4d"] = try Self.status(state: .running, elapsedMs: 43_000, profile: "standard")
+        let facts = try #require(model.facts(for: "scan-1a2b3c4d"))
+        #expect(facts.summary.elapsedMs == 43_000)
+        #expect(facts.status?.profileName == "standard")
+        let unread = try #require(model.facts(for: "scan-55667788"))
+        #expect(unread.summary.state == .done)
+        #expect(unread.status == nil)
+        #expect(model.facts(for: "scan-elsewhere") == nil)
+    }
+
+    /// AC8 (unit half) and D6's list facts: the list selects its newest job when
+    /// nothing is selected, keeps a selection it still carries, and moves a
+    /// selection the core dropped (unless this app started it) to the first row.
+    @Test func applyListSelectsWhenNothingIsSelected() throws {
+        var model = ScanSurfaceModel()
+        #expect(model.selectedJob == nil)
+        #expect(model.jobsLoadedAt == nil)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 1_000)
+        #expect(model.selectedJob == "scan-1a2b3c4d")
+        #expect(model.jobsLoadedAt == 1_000)
+
+        // An existing selection is never replaced by a newer job.
+        var kept = ScanSurfaceModel()
+        kept.selectedJob = "scan-55667788"
+        kept.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        #expect(kept.selectedJob == "scan-55667788")
+
+        // A selected job the list no longer carries, and this app is not waiting on, falls to the first row.
+        var gone = ScanSurfaceModel()
+        gone.selectedJob = "scan-gone"
+        gone.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        #expect(gone.selectedJob == "scan-1a2b3c4d")
+
+        // A job this app started stays selected while the list has yet to carry it.
+        var local = ScanSurfaceModel()
+        var start = try Self.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["job"], to: "scan-local")
+        start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
+        local.applyStart(try ScanStartResult(json: start))
+        local.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        #expect(local.selectedJob == "scan-local")
+
+        // An empty list leaves nothing selected and does not invent a selection.
+        var empty = ScanSurfaceModel()
+        empty.applyList(try ScanListResult(json: ["jobs": []]), now: 0)
+        #expect(empty.selectedJob == nil)
+
+        // D6: a list failure stamps `listFailedAt` beside the error; the next list clears it.
+        var failed = ScanSurfaceModel()
+        failed.noteListFailure("Unable to list jobs: the bus did not reply in time", now: 5_000)
+        #expect(failed.jobsError == "Unable to list jobs: the bus did not reply in time")
+        #expect(failed.listFailedAt == 5_000)
+        failed.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 7_000)
+        #expect(failed.jobsError == nil)
+        #expect(failed.listFailedAt == nil)
+        #expect(failed.jobsLoadedAt == 7_000)
+    }
+
+    /// AC7 (pure half): a cancelling job is never Cancel Scan's target, by the
+    /// merged state; a queued or running one is.
+    @Test func cancelTargetSkipsACancellingJob() throws {
+        var model = ScanSurfaceModel()
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")), now: 0)
+        model.selectedJob = "scan-1a2b3c4d"
+        #expect(model.cancelTarget == "scan-1a2b3c4d")
+        #expect(model.mayCancel(job: "scan-1a2b3c4d") == true)
+        #expect(model.mayCancel(job: "scan-55667788") == false, "a done job cannot be cancelled")
+        #expect(model.mayCancel(job: "scan-elsewhere") == false, "an unlisted job cannot be cancelled")
+
+        // The list row still says running; the stored status (the `scan.cancel` reply) says cancelling: merged wins.
+        model.statuses["scan-1a2b3c4d"] = try Self.status(state: .cancelling, elapsedMs: 43_000)
+        #expect(model.facts(for: "scan-1a2b3c4d")?.summary.state == .cancelling)
+        #expect(model.cancelTarget == nil)
+        #expect(model.mayCancel(job: "scan-1a2b3c4d") == false)
+
+        // Through `applyStatus` the row itself turns cancelling; still no target.
+        model.applyStatus(try Self.status(state: .cancelling, elapsedMs: 44_000))
+        #expect(model.cancelTarget == nil)
+
+        // A queued job is a target; with the selection on a done job the only live job is the target.
+        model.applyStatus(try Self.status(state: .queued, elapsedMs: 0))
+        model.selectedJob = "scan-55667788"
+        #expect(model.cancelTarget == "scan-1a2b3c4d")
+        model.selectedJob = nil
+        #expect(model.cancelTarget == "scan-1a2b3c4d")
+
+        // Two live jobs and no live selection: the choice would be a guess.
+        var second = try Self.load("scan.list.json")
+        var rows = try #require(second["jobs"]?.arrayValue)
+        rows[1] = ScanPack.edited(rows[1], path: ["state"], to: "running")
+        second = ScanPack.edited(second, path: ["jobs"], to: .array(rows))
+        model.applyList(try ScanListResult(json: second), now: 0)
+        model.selectedJob = nil
+        #expect(model.cancelTarget == nil)
+    }
+
+    /// AC12 (unit half) and D15's banner table: the link kind from the bus state
+    /// and the last list failure, the values' age, the verb gate and the words.
+    @Test func jobsLinkKindsAndAge() {
+        let reconnecting = ScanJobsLink.make(bus: .connecting("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
+        #expect(reconnecting.kind == .reconnecting)
+        #expect(reconnecting.valuesAgeMs == 42_000)
+        #expect(reconnecting.verbsEnabled == false)
+        #expect(reconnecting.bannerText == "Bus disconnected · showing values from 0:42 ago · reconnecting…")
+
+        let unanswered = ScanJobsLink.make(bus: .connected("…"), listFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
+        #expect(unanswered.kind == .unanswered)
+        #expect(unanswered.valuesAgeMs == 42_000)
+        #expect(unanswered.verbsEnabled == false)
+        #expect(unanswered.bannerText == "The core is not answering · showing values from 0:42 ago · retrying every 2 s")
+
+        let live = ScanJobsLink.make(bus: .connected("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
+        #expect(live.kind == .live)
+        #expect(live.valuesAgeMs == 42_000)
+        #expect(live.verbsEnabled == true)
+        #expect(live.bannerText == nil)
+
+        let disconnected = ScanJobsLink.make(bus: .disconnected, listFailedAt: nil, jobsLoadedAt: nil, now: 43_000)
+        #expect(disconnected.kind == .disconnected)
+        #expect(disconnected.valuesAgeMs == nil)
+        #expect(disconnected.verbsEnabled == false)
+        #expect(disconnected.bannerText == "Bus disconnected · Proxy ▸ Reconnect Bus (⌃⌘R) to retry",
+                "the age clause is omitted before the first list")
+
+        let disconnectedAged = ScanJobsLink.make(bus: .disconnected, listFailedAt: 5_000, jobsLoadedAt: 1_000, now: 43_000)
+        #expect(disconnectedAged.kind == .disconnected, "a dead bus outranks a failed list")
+        #expect(disconnectedAged.bannerText
+                == "Bus disconnected · showing values from 0:42 ago · Proxy ▸ Reconnect Bus (⌃⌘R) to retry")
+
+        let failed = ScanJobsLink.make(bus: .failed("…"), listFailedAt: nil, jobsLoadedAt: 1_000, now: 43_000)
+        #expect(failed.kind == .disconnected)
+        #expect(failed.verbsEnabled == false)
+
+        let unansweredUnaged = ScanJobsLink.make(bus: .connected("…"), listFailedAt: 5_000, jobsLoadedAt: nil, now: 43_000)
+        #expect(unansweredUnaged.bannerText == "The core is not answering · retrying every 2 s")
+
+        #expect(ScanFormat.listErrorText(core: "the bus did not reply in time", ageMs: 42_000)
+                == "Unable to list jobs: the bus did not reply in time. Showing values from 0:42 ago; retrying every 2 s.")
+        #expect(ScanFormat.listErrorText(core: "the bus did not reply in time", ageMs: nil)
+                == "Unable to list jobs: the bus did not reply in time. Retrying every 2 s.")
     }
 }
