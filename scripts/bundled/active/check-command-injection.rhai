@@ -4,7 +4,7 @@
 // echoes the request shows the literal command text; a server that runs it
 // shows the halves joined and the command word gone. That asymmetry is the
 // whole detection: a reflection cannot be mistaken for execution. The
-// injected command is a benign echo of random letters.
+// injected command is a benign echo of the job's own marker.
 //
 // The shipped script's timing half is gone — native `cmdi-time` owns that
 // technique, and a check never sleeps (spec D4). OWASP A03. CWE-78.
@@ -31,8 +31,15 @@ const META = #{
 fn load(reg) {
     reg.add_check(META, |point| {
         let base = if type_of(point.example) == "string" { point.example } else { "1" };
-        let first = rand_text_alpha(3).to_upper();
-        let second = rand_text_alpha(3).to_upper();
+        // The job's marker, cut in half. The halves are what the payload
+        // carries; the whole is what only a shell puts back together. The
+        // marker rather than random letters: the oracle has to recognise this
+        // job's token in the reply, and the engine, the evidence and a later
+        // PoC all speak that same token.
+        let marker = probe.marker().to_upper();
+        let half = marker.len() / 2;
+        let first = marker.sub_string(0, half);
+        let second = marker.sub_string(half);
         let executed = first + second;
         let literal = "echo " + first;
         // Separators for a POSIX shell (; | && $() backticks) and a Windows one.

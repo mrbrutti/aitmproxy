@@ -30,9 +30,12 @@ const META = #{
 
 fn load(reg) {
     reg.add_check(META, |point| {
-        // Two primes, so the product is unlikely to appear by chance, and a
-        // per-run tag so the match is this probe's and nobody else's.
-        let tag = rand_text_alpha(4);
+        // Two primes, so the product is unlikely to appear by chance, and the
+        // job's own marker as the tag, so the match is this probe's and nobody
+        // else's. The marker rather than random letters: the oracle has to
+        // recognise the tag coming back, and the marker is the one token the
+        // engine, the evidence and a later PoC all agree on.
+        let tag = probe.marker();
         let want = tag + `${73 * 79}`;
         // The second payload is assembled rather than interpolated: a literal
         // dollar-brace would be read by Rhai's own string interpolation.
