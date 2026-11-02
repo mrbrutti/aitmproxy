@@ -427,6 +427,7 @@ mod tests {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         }
     }
 

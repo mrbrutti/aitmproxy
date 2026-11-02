@@ -40,6 +40,7 @@ fn http(intercept: InterceptState, with_response: bool) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: conn(),
         server_conn: None,

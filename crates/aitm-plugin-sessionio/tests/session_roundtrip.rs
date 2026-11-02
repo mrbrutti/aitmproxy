@@ -68,6 +68,7 @@ fn seeded_flow() -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Bytes(vec![0u8, 1, 2, 255, 128, 42]),
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: addr,
@@ -103,6 +104,7 @@ fn plain_flow(path: &str) -> Flow {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         }),
         client_conn: ConnInfo {
             peer: addr,

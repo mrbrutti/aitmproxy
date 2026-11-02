@@ -125,6 +125,7 @@ pub(crate) fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Ht
             Body::Bytes(body.to_vec())
         },
         timestamp: SystemTime::now(),
+        peer: None,
     }
 }
 

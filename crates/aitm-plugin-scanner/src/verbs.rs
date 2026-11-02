@@ -1376,6 +1376,7 @@ mod tests {
                     trailers: HeaderMap::new(),
                     body: Body::Bytes(body.as_bytes().to_vec()),
                     timestamp: SystemTime::now(),
+                    peer: None,
                 }),
                 client_conn: ConnInfo {
                     peer: "127.0.0.1:0".parse().expect("loopback"),

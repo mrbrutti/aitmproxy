@@ -687,6 +687,7 @@ mod tests {
                             format!("<html><body>{}</body></html>", echoed.join(" ")).into_bytes(),
                         ),
                         timestamp: SystemTime::now(),
+                        peer: None,
                     }),
                     client_conn: ConnInfo {
                         peer: "127.0.0.1:0".parse().expect("loopback"),

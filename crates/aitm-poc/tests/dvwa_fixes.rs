@@ -35,6 +35,7 @@ impl RequestSender for OkSender {
                 trailers: HeaderMap::new(),
                 body: Body::Bytes(b"ok".to_vec()),
                 timestamp: SystemTime::now(),
+                peer: None,
             })
         })
     }

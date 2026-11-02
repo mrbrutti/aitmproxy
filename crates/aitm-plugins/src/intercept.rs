@@ -453,6 +453,7 @@ fn set_short_circuit(flow: &mut Flow, status: u16) {
             trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
+            peer: None,
         });
     }
 }

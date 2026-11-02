@@ -1298,6 +1298,7 @@ mod tests {
                         trailers: HeaderMap::new(),
                         body: Body::Bytes(body.as_bytes().to_vec()),
                         timestamp: std::time::SystemTime::now(),
+                        peer: None,
                     };
                     Ok(HttpFlow {
                         id: aitm_core::FlowId::new(),
