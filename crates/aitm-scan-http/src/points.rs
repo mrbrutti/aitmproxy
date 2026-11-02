@@ -71,19 +71,24 @@ const EXCLUDED_HEADERS: [&str; 12] = [
     "expect",
 ];
 
-/// [`PointTrait`]'s declaration order, so two points with the same traits always
-/// compare and serialise equal (plan call A12).
-const TRAIT_ORDER: [PointTrait; 9] = [
-    PointTrait::Url,
-    PointTrait::Filename,
-    PointTrait::Number,
-    PointTrait::Email,
-    PointTrait::Base64,
-    PointTrait::Json,
-    PointTrait::Id,
-    PointTrait::Session,
-    PointTrait::Structured,
-];
+/// A trait's place in [`PointTrait`]'s declaration order, so two points with
+/// the same traits always compare and serialise equal (plan call A12).
+///
+/// The match is exhaustive on purpose: a new variant is a compile error here
+/// until it is given a rank, rather than silently falling out of every point.
+fn trait_rank(point_trait: PointTrait) -> u8 {
+    match point_trait {
+        PointTrait::Url => 0,
+        PointTrait::Filename => 1,
+        PointTrait::Number => 2,
+        PointTrait::Email => 3,
+        PointTrait::Base64 => 4,
+        PointTrait::Json => 5,
+        PointTrait::Id => 6,
+        PointTrait::Session => 7,
+        PointTrait::Structured => 8,
+    }
+}
 
 /// One [`IgnoreRule`] with its regex compiled.
 ///
@@ -264,19 +269,19 @@ impl<'a> Collector<'a> {
 
     /// Record the whole-body candidate (`entire_body`, named `body`).
     ///
-    /// `structured` says the body is a recognised document — JSON or XML —
-    /// and marks the point [`PointTrait::Structured`] (amendment 65); `json`
-    /// adds [`PointTrait::Json`] from the declared content type, the same
+    /// The traits come from the *declared* `format`, not from whether the
+    /// body parsed: a JSON or XML body is [`PointTrait::Structured`]
+    /// (amendment 65), and a JSON body is also [`PointTrait::Json`], the same
     /// signal every `json_value` point of that body carries.
-    fn push_entire_body(&mut self, text: &str, json: bool, structured: bool) {
+    fn push_entire_body(&mut self, text: &str, format: &BodyFormat) {
         self.record(
             InsertionKind::EntireBody,
             "body",
             None,
             text,
             RecordFlags {
-                json,
-                structured,
+                json: matches!(format, BodyFormat::Json),
+                structured: matches!(format, BodyFormat::Json | BodyFormat::Xml),
                 ..RecordFlags::default()
             },
         );
@@ -302,10 +307,9 @@ impl<'a> Collector<'a> {
             Some(index.to_string()),
             value,
             RecordFlags {
-                json: false,
-                structured: false,
                 placeholder,
                 withhold,
+                ..RecordFlags::default()
             },
         );
     }
@@ -338,11 +342,9 @@ impl<'a> Collector<'a> {
         if session_trait(name, flags.placeholder) || path_is_secret(kind, path.as_deref()) {
             found.push(PointTrait::Session);
         }
-        let traits: Vec<PointTrait> = TRAIT_ORDER
-            .iter()
-            .copied()
-            .filter(|point_trait| found.contains(point_trait))
-            .collect();
+        found.sort_by_key(|point_trait| trait_rank(*point_trait));
+        found.dedup();
+        let traits = found;
 
         // D8.1: a session point never shows its value, whatever it is named;
         // the caller withholds a path token's value the same way (S-M2); and a
@@ -647,15 +649,10 @@ fn body_candidates(
     //
     // It is recorded *before* the value points of the same body so the
     // per-request cap, which keeps candidates in order, can never drop the
-    // document in favour of the hundredth value.
-    let structured = matches!(format, BodyFormat::Json | BodyFormat::Xml);
-    if !matches!(format, BodyFormat::None | BodyFormat::Unavailable) {
-        collector.push_entire_body(
-            &String::from_utf8_lossy(bytes),
-            matches!(format, BodyFormat::Json),
-            structured,
-        );
-    }
+    // document in favour of the hundredth value. [`parsed_body`] has already
+    // returned `None` for `BodyFormat::None` and `Unavailable`, so every
+    // format that reaches here is a body the lane read.
+    collector.push_entire_body(&String::from_utf8_lossy(bytes), format);
 
     match format {
         BodyFormat::Form => {
@@ -2154,15 +2151,28 @@ mod tests {
         assert!(out.points.iter().all(|p| !p.name.is_empty()));
         assert!(has(&out, Query, "a", None), "{:?}", triples(&out));
 
-        for (content_type, body) in [
-            ("application/json", &b"{\"a\":"[..]),
-            ("application/json", &[0xff_u8, 0xfe][..]),
-            ("text/xml", &b"<a><b>"[..]),
+        // The traits come from the *declared* type, not from a parse that
+        // failed: a body sent as JSON is `[Json, Structured]` even when it is
+        // not JSON, one sent as XML is `[Structured]`, and a multipart or form
+        // body is a document of neither kind.
+        for (content_type, body, traits) in [
+            (
+                "application/json",
+                &b"{\"a\":"[..],
+                &[PointTrait::Json, PointTrait::Structured][..],
+            ),
+            (
+                "application/json",
+                &[0xff_u8, 0xfe][..],
+                &[PointTrait::Json, PointTrait::Structured][..],
+            ),
+            ("text/xml", &b"<a><b>"[..], &[PointTrait::Structured][..]),
             (
                 "multipart/form-data; boundary=XyZ",
                 &b"--nope\r\n\r\nx\r\n--nope--\r\n"[..],
+                &[][..],
             ),
-            ("application/x-www-form-urlencoded", &b"&&=&"[..]),
+            ("application/x-www-form-urlencoded", &b"&&=&"[..], &[][..]),
         ] {
             let flow = captured_flow(
                 request(
@@ -2187,6 +2197,11 @@ mod tests {
                 vec![EntireBody],
                 "{content_type}: {:?}",
                 triples(&out)
+            );
+            assert_eq!(
+                point(&out, EntireBody, "body").traits,
+                traits,
+                "{content_type}"
             );
             assert!(has(&out, Query, "q", None), "{content_type}");
         }

@@ -156,8 +156,8 @@ pub enum PointTrait {
     Id,
     /// The value carries session state; ignored by default (spec D2).
     Session,
-    /// The value is a whole structured document — a JSON or XML body — rather
-    /// than one field of it.
+    /// The value is a whole body declared as a JSON or XML document (whether
+    /// or not it parses), rather than one field of it.
     ///
     /// Information for checks and UIs, not a skip mechanism (spec amendment
     /// 65): a value-level check skips such a point through its `kinds` (it
