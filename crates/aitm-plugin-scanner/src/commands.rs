@@ -2791,8 +2791,8 @@ mod tests {
         }
 
         /// Poll a job to its terminal state from outside the runtime.
-        fn wait_terminal(&self, job: &str, within: Duration) -> aitm_scan_model::JobStatus {
-            crate::jobs::test_support::wait_terminal_blocking(&self.engine.registry, job, within)
+        fn wait_terminal(&self, job: &str) -> aitm_scan_model::JobStatus {
+            crate::jobs::test_support::wait_terminal_blocking(&self.engine.registry, job)
         }
     }
 
@@ -2995,7 +2995,7 @@ mod tests {
         );
         let job = h.newest_job();
         assert_eq!(
-            h.wait_terminal(&job, Duration::from_secs(5)).state,
+            h.wait_terminal(&job).state,
             JobState::Cancelled,
             "the verb cancelled the job it could not wait for"
         );
@@ -3069,7 +3069,7 @@ mod tests {
             false,
         )
         .expect("the audit job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(10));
+        let status = h.wait_terminal(&started.job);
         assert_eq!(status.state, JobState::Done, "{status:?}");
         let issues = h.engine.issues.for_job(&started.job);
         let name = issues

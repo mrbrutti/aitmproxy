@@ -1350,12 +1350,7 @@ mod tests {
 
         /// Poll the registry until `job` is terminal.
         async fn wait_terminal(&self, job: &str) {
-            crate::jobs::test_support::wait_terminal(
-                &self.engine.registry,
-                job,
-                Duration::from_secs(5),
-            )
-            .await;
+            crate::jobs::test_support::wait_terminal(&self.engine.registry, job).await;
         }
 
         /// A captured, in-scope flow the interim lane can map.

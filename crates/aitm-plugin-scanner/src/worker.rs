@@ -1596,7 +1596,7 @@ mod tests {
         assert_eq!(started.status.probes.budget, 2000);
         assert_eq!(started.job, started.status.job);
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.phase, Phase::Done);
         assert_eq!(status.stopped_reason, None);
@@ -1634,10 +1634,13 @@ mod tests {
         )
         .expect("the job starts");
 
-        // Wait until the vulnerable verdict has been recorded.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Wait until the vulnerable verdict has been recorded. The bound is the
+        // tests' safety net (`TERMINAL_NET`), never a measured figure: the
+        // blocking check holds the job open until the cancel below, so the
+        // issue appears as soon as the scheduler reaches it.
+        let net = std::time::Instant::now() + crate::jobs::test_support::TERMINAL_NET;
         while h.engine.issues.for_job(&started.job).is_empty() {
-            assert!(std::time::Instant::now() < deadline, "no issue was raised");
+            assert!(std::time::Instant::now() < net, "no issue was raised");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -1648,7 +1651,7 @@ mod tests {
             .expect("the job is in the registry");
         assert_eq!(cancelling.state, JobState::Cancelling);
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(2)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Cancelled);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Cancelled));
         assert_eq!(h.engine.issues.for_job(&started.job).len(), 1);
@@ -1699,7 +1702,7 @@ mod tests {
         let started =
             crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(
             h.client.authorities().first().map(String::as_str),
             Some("scan.test"),
@@ -1731,7 +1734,7 @@ mod tests {
         let started =
             crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Budget));
         assert!(
@@ -1761,7 +1764,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h.wait_terminal(&started.job).await;
 
         let mut lines: Vec<JobNotification> = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -1901,7 +1904,7 @@ mod tests {
         profile.budget.probes = 10;
         let started =
             crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
 
         let issues = h.engine.issues.for_job(&started.job);
@@ -1942,7 +1945,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h2.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h2.wait_terminal(&started.job).await;
         assert_eq!(h2.store.count(), 0);
         assert!(h2.engine.issues.for_job(&started.job).is_empty());
     }
@@ -1966,7 +1969,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
 
         assert_eq!(status.issues.total, 1);
         let issues = h.engine.issues.for_job(&started.job);
@@ -1988,7 +1991,7 @@ mod tests {
         let started =
             crate::jobs::start(&h.engine, h.profile(&["http://scan.test"]), agent(), false)
                 .expect("the agent job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Cancelled);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Policy));
 
@@ -2007,7 +2010,7 @@ mod tests {
             false,
         )
         .expect("the operator job starts");
-        let status = h2.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h2.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.stopped_reason, None);
     }
@@ -2028,7 +2031,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h.wait_terminal(&started.job).await;
 
         let dir = h.findings_dir();
         let path = crate::util::scan_dir(&dir, "jobs").join(format!("{}.json", started.job));
@@ -2061,7 +2064,7 @@ mod tests {
             false,
         )
         .expect("start does not know yet");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
 
         assert_eq!(status.state, JobState::Failed);
         assert_eq!(
@@ -2097,7 +2100,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
 
         assert_eq!(
             status.l4,
@@ -2141,7 +2144,7 @@ mod tests {
             profile.session.on_lost = on_lost;
             let started =
                 crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
-            let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+            let status = h.wait_terminal(&started.job).await;
 
             assert_eq!(status.state, JobState::Done, "{payload} / {on_lost:?}");
             assert_eq!(status.stopped_reason, reason, "{payload} / {on_lost:?}");
@@ -2438,7 +2441,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
 
         let mut paths: Vec<String> = h
@@ -2475,7 +2478,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h.wait_terminal(&started.job).await;
         let issues = h.engine.issues.for_job(&started.job);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].poc_ref, None);
@@ -2491,7 +2494,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h.wait_terminal(&started.job).await;
         let pocs = crate::util::scan_dir(&h.findings_dir(), "pocs");
         assert!(pocs.is_dir(), "{} was not created", pocs.display());
         assert!(
@@ -2520,7 +2523,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h.wait_terminal(&started.job).await;
 
         let mut saw_issue = false;
         while let Ok(event) = rx.try_recv() {
@@ -2559,7 +2562,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        h.wait_terminal(&started.job).await;
 
         let seen = h.client.seen();
         assert!(!seen.is_empty(), "the job probed");
@@ -2633,7 +2636,7 @@ mod tests {
             false,
         )
         .expect("the job starts");
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
 
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.points.found, 0);
@@ -2672,7 +2675,7 @@ mod tests {
         // 10 s, not 2: the job is supervised through catch_unwind on a worker
         // thread, and a load average near 300 (shared gate machine) stretched
         // the hand-back past 2 s once (2026-11-01).
-        let status = h.wait_terminal(&started.job, Duration::from_secs(10)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Failed);
         assert_eq!(status.stopped_reason, Some(StoppedReason::Failed));
         assert_eq!(status.phase, Phase::Done);
@@ -2725,7 +2728,7 @@ mod tests {
         )
         .expect("the origin is free once the failed job is terminal");
         assert_ne!(again.job, started.job);
-        h.wait_terminal(&again.job, Duration::from_secs(2)).await;
+        h.wait_terminal(&again.job).await;
 
         // Cancelling the failed job is a no-op, not a hang.
         let cancelled = h
@@ -2758,7 +2761,7 @@ mod tests {
         )
         .expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(2)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done, "{:?}", status.error);
         assert_eq!(status.stopped_reason, None);
         assert_eq!(status.error, None);
@@ -2796,7 +2799,7 @@ mod tests {
         let started =
             crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.checks.done, 1, "the ws check ran");
         assert_eq!(h.client.calls(), 0, "a ws frame is no HTTP send");
@@ -2832,7 +2835,7 @@ mod tests {
         )
         .expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(h.client.calls(), 2);
         assert_eq!(status.probes.sent, 2);
@@ -2863,7 +2866,7 @@ mod tests {
         )
         .expect("the job starts");
 
-        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        let status = h.wait_terminal(&started.job).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.crawl.pages, 2, "two pages, counted once each");
     }
