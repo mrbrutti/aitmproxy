@@ -7,7 +7,10 @@
 //!   `/account/{id}` instead of one node per customer.
 //! - [`traits_for`] labels a value with the [`PointTrait`]s a scheduler uses to
 //!   skip checks that cannot apply (`open-redirect` wants `url`,
-//!   `path-traversal` wants `filename`; spec D4 scheduling).
+//!   `path-traversal` wants `filename`; spec D4 scheduling). It sees the value
+//!   and nothing else; amendment 83's third `Url` branch is on the parameter
+//!   *name*, so [`is_redirect_name`] is exported for `points.rs`, the one
+//!   place that knows a point's name and kind.
 //!
 //! Every rule here is a shape heuristic on a short string. None of it decodes,
 //! fetches or trusts the value, and none of it ever logs one: a trait is a
@@ -138,13 +141,15 @@ pub(crate) fn is_id_like(value: &str) -> bool {
 /// so two points with the same traits always compare and serialise equal.
 /// Traits are not exclusive: `42` is both a number and an id. `Session` is
 /// never returned here — it depends on the point's name and kind, which only
-/// `points.rs` knows.
+/// `points.rs` knows, and neither is [`PointTrait::Url`] by a redirect-like
+/// name (amendment 83's name branch, [`is_redirect_name`]): this answers from
+/// the value alone.
 pub(crate) fn traits_for(value: &str) -> Vec<PointTrait> {
     let mut traits = Vec::new();
     let clean = !value.chars().any(char::is_whitespace);
     let email = clean && is_email(value);
 
-    if clean && is_url(value) {
+    if clean && is_url_like(value) {
         traits.push(PointTrait::Url);
     }
     // An email address ends in a dot plus two to four letters, so the file-name
@@ -199,14 +204,62 @@ fn is_hex(value: &str) -> bool {
     value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Whether `value` points somewhere: absolute, protocol-relative, or site-root.
+/// Whether `value` points somewhere: an absolute URL, or path-like.
 ///
-/// `/` alone is excluded: every path starts with it, so it carries no signal.
-fn is_url(value: &str) -> bool {
+/// Amendment 83's value branch. Path-like is `//host` (protocol-relative),
+/// `\/host` and `\\host` (the back-slash forms a browser normalises to a
+/// protocol-relative URL, which is how a naive redirect filter is bypassed),
+/// or a site-root path — `/` followed by at least one more character.
+///
+/// `/` alone is excluded (C1): every path starts with it, so it carries no
+/// signal; the name branch ([`is_redirect_name`]) is what tags `next=/`.
+pub(crate) fn is_url_like(value: &str) -> bool {
     value.starts_with("http://")
         || value.starts_with("https://")
         || value.starts_with("//")
+        || value.starts_with(r"\/")
+        || value.starts_with(r"\\")
         || (value.starts_with('/') && value.len() > 1)
+}
+
+/// The parameter names that carry a destination, ASCII-lowercased.
+///
+/// Amendment 83's list, verbatim and folded to lower case (`returnTo` reads
+/// `returnto`). A redirect target is named far more reliably than it is
+/// shaped: `next=/`, `goto=home` and `dest=account` are all destinations that
+/// no value heuristic can tell from ordinary text.
+///
+/// The ruling spells seventeen names and none of them fold together, so the
+/// array is seventeen long (the plan's "[&str; 18]" counts one name that the
+/// ruling's list does not contain; no name is invented here).
+const REDIRECT_NAMES: [&str; 17] = [
+    "next",
+    "url",
+    "redirect",
+    "redirect_uri",
+    "return",
+    "returnto",
+    "return_url",
+    "goto",
+    "continue",
+    "dest",
+    "destination",
+    "target",
+    "rurl",
+    "back",
+    "callback",
+    "forward",
+    "location",
+];
+
+/// Whether `name` is one of [`REDIRECT_NAMES`] (amendment 83's name branch).
+///
+/// ASCII case-insensitive and exact, never a substring: `returnTo` and
+/// `REDIRECT_URI` match, `nextpage` does not. The caller decides which kinds
+/// have a parameter name at all (C2: not a path segment, not the whole body).
+pub(crate) fn is_redirect_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    REDIRECT_NAMES.contains(&lower.as_str())
 }
 
 /// Whether `value` parses as a whole number or a finite decimal.
@@ -266,7 +319,10 @@ fn last_path_segment(value: &str) -> &str {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{is_id_like, looks_like_filename, path_segment_token, path_template, traits_for};
+    use super::{
+        is_id_like, is_redirect_name, looks_like_filename, path_segment_token, path_template,
+        traits_for,
+    };
     use aitm_scan_model::PointTrait::{Base64, Email, Filename, Id, Json, Number, Url};
 
     #[test]
@@ -344,5 +400,30 @@ mod tests {
         assert_eq!(traits_for("QUJDREVGR0hJSktMTU5PUA=="), vec![Base64]);
         assert_eq!(traits_for("550e8400-e29b-41d4-a716-446655440000"), vec![Id]);
         assert_eq!(traits_for("hello"), Vec::new());
+        // Amendment 83, C1: a lone slash is every path's first byte and
+        // carries no signal, so the value branch leaves it untagged.
+        assert_eq!(traits_for("/"), Vec::new());
+    }
+
+    /// Amendment 83's value branch (path-like, including the `//host`, `\/host`
+    /// and `\\host` forms a redirect filter is bypassed with) and its name
+    /// branch (the eighteen redirect-like parameter names, ASCII
+    /// case-insensitive and exact).
+    #[test]
+    fn url_like_and_redirect_name_pins() {
+        assert_eq!(traits_for("http://x"), vec![Url]);
+        assert_eq!(traits_for("/cb"), vec![Url]);
+        assert_eq!(traits_for("//evil.test/"), vec![Url]);
+        assert_eq!(traits_for(r"\/evil.test/"), vec![Url]);
+        assert_eq!(traits_for(r"\\evil.test\"), vec![Url]);
+        assert_eq!(traits_for("/"), Vec::new());
+
+        assert!(is_redirect_name("next"));
+        assert!(is_redirect_name("returnTo"));
+        assert!(is_redirect_name("REDIRECT_URI"));
+        assert!(is_redirect_name("continue"));
+        assert!(!is_redirect_name("q"));
+        assert!(!is_redirect_name("nextpage"));
+        assert!(!is_redirect_name(""));
     }
 }
