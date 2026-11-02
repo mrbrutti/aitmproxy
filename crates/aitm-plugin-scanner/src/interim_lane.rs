@@ -2842,6 +2842,37 @@ mod tests {
         assert_eq!(client.calls(), 0);
     }
 
+    /// Amendment 38, call C3: the synthetic flow is built from the origin, so
+    /// an `https` target with no port written reaches the right authority, and
+    /// an origin of a scheme this lane does not speak is refused outright
+    /// rather than being probed over HTTP.
+    #[tokio::test]
+    async fn an_https_origin_item_keeps_its_scheme_and_a_foreign_scheme_is_refused() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let secure = origin_item(&["https://target.test"], &[]);
+        assert_eq!(secure.id, "origin:https://target.test:443");
+        let host = lane()
+            .probe_host_for(&secure, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("an https origin item is hosted");
+        host.baseline().await.expect("the stub answers");
+        let (req, _) = client.seen().last().cloned().expect("a send");
+        assert_eq!(req.scheme, "https");
+        assert_eq!(req.authority, "target.test:443", "the default port is used");
+        assert_eq!(req.path, "/");
+
+        let foreign = origin_item(&["ws://target.test:8080"], &[]);
+        assert_eq!(foreign.id, "origin:ws://target.test:8080");
+        let err = lane()
+            .probe_host_for(&foreign, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("the HTTP lane does not host a `ws` origin");
+        assert!(err.to_string().contains("carries no flow"), "{err}");
+        assert_eq!(client.calls(), 1, "only the https baseline was sent");
+    }
+
     /// The lane ships its three passive checks (call B19), in the plan's order,
     /// with a native origin, covering every HTTP kind and no WebSocket or L4
     /// one. Its two legacy active checks left `checks()` with T3 PR 2a (the

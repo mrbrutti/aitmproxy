@@ -577,6 +577,50 @@ mod tests {
         assert_eq!(full, summary);
     }
 
+    /// Amendment 39, the three spellings of one token: `as_str` (what the
+    /// lane hands `report_crawl_error`), `parse` (what the worker reads back)
+    /// and serde (what `scan.status` puts on the wire) must agree for every
+    /// variant, or a classified failure silently degrades to `other` between
+    /// the lane and the operator. Every token is distinct, so no two kinds
+    /// collapse into one.
+    #[test]
+    fn every_crawl_error_kind_has_one_token_in_all_three_spellings() {
+        const ALL: [CrawlErrorKind; 6] = [
+            CrawlErrorKind::H2NotNegotiated,
+            CrawlErrorKind::ConnectRefused,
+            CrawlErrorKind::Tls,
+            CrawlErrorKind::Timeout,
+            CrawlErrorKind::Transport,
+            CrawlErrorKind::Other,
+        ];
+
+        let mut tokens = std::collections::BTreeSet::new();
+        for kind in ALL {
+            let token = kind.as_str();
+            assert!(tokens.insert(token), "`{token}` names two kinds");
+            assert_eq!(
+                CrawlErrorKind::parse(token),
+                Some(kind),
+                "`{token}` does not parse back to {kind:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(kind).expect("serializes"),
+                serde_json::Value::String(token.to_string()),
+                "the wire token and `as_str` disagree for {kind:?}"
+            );
+            let back: CrawlErrorKind =
+                serde_json::from_value(serde_json::Value::String(token.to_string()))
+                    .expect("the wire token deserializes");
+            assert_eq!(back, kind);
+            assert_eq!(
+                CrawlErrorKind::parse(&token.to_uppercase()),
+                None,
+                "`parse` is an exact match, not a case-insensitive one"
+            );
+        }
+        assert_eq!(tokens.len(), 6);
+    }
+
     /// Amendment 39: the crawl's all-failed reason is a closed token on
     /// `crawl.last_error`. `parse` is an exact token match (no heuristics), its
     /// inverse `as_str` is the wire token, a free-text browser reason parses to

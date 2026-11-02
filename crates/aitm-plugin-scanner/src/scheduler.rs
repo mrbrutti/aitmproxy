@@ -1095,6 +1095,112 @@ mod tests {
         );
     }
 
+    /// Amendment 38 and call C2: only the **HTTP** lane's origin-scoped checks
+    /// moved to the origin set. An origin-scoped check of another lane keeps
+    /// the point-derived rule — the first admissible point of each origin
+    /// claims its single slot — so its item still addresses a real point.
+    #[test]
+    fn an_origin_scoped_check_of_another_lane_keeps_the_point_rule() {
+        let checks = vec![
+            check("ws.origin", |m| {
+                m.scope = CheckScope::Origin;
+                m.lanes = vec![LaneKind::Ws];
+                m.kinds = vec![InsertionKind::WsText];
+            }),
+            check("http.origin", |m| m.scope = CheckScope::Origin),
+        ];
+        let ws_points: Vec<InsertionPoint> = (0..2)
+            .map(|i| InsertionPoint {
+                lane: LaneKind::Ws,
+                kind: InsertionKind::WsText,
+                ..point(&format!("w{i}"), "frame")
+            })
+            .collect();
+        let profile = profile_with_origins(&["http://a.test:8080"]);
+
+        let out = plan(&ws_points, &[], &checks, &profile);
+
+        assert_eq!(
+            indices_for(&out.active, "ws.origin"),
+            vec![0],
+            "a WebSocket origin check runs on a point, not on an origin item"
+        );
+        assert_eq!(
+            indices_for(&out.active, "http.origin"),
+            vec![2, 3],
+            "the HTTP origin check runs once per origin, past the points"
+        );
+        assert_eq!(
+            out.origin_points
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "origin:http://a.test:8080".to_string(),
+                "origin:http://127.0.0.1:8080".to_string(),
+            ],
+            "the target origin first, then the origin the points belong to"
+        );
+    }
+
+    /// Amendment 38: the origin set is normalized before it is deduplicated,
+    /// so a target written without its default port and the same origin
+    /// reached through a discovered point are one origin, not two — and an
+    /// origin that is not a URL is still kept, verbatim, rather than dropped.
+    #[test]
+    fn the_origin_set_normalizes_default_ports_and_dedupes() {
+        let checks = vec![check("origin.check", |m| m.scope = CheckScope::Origin)];
+        let mut on_a = point("p0", "q");
+        on_a.url = Some("http://a.test/path?q=1".to_string());
+        let points = vec![on_a];
+        let profile =
+            profile_with_origins(&["http://a.test", "http://a.test:80/deep", "not a url", ""]);
+
+        let out = plan(&points, &[], &checks, &profile);
+
+        assert_eq!(
+            out.origin_points
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "origin:http://a.test:80".to_string(),
+                "origin:not a url".to_string(),
+                "origin:".to_string(),
+            ],
+            "the default port is filled in, so the three spellings of a.test are one origin; \
+             a malformed or empty origin is kept verbatim for the lane to refuse, not dropped \
+             and not a panic"
+        );
+        assert_eq!(count_for(&out.active, "origin.check"), 3);
+        assert_eq!(
+            out.point_at(&points, 1).and_then(|p| p.url.clone()),
+            Some("http://a.test:80/".to_string())
+        );
+    }
+
+    /// Amendment 38: an origin item is scheduled by technique like any other —
+    /// a passive origin-scoped check belongs to the passive phase, which runs
+    /// over captured flows, not to the active one.
+    #[test]
+    fn a_passive_origin_scoped_check_runs_in_the_passive_phase() {
+        let checks = vec![
+            check("origin.passive", |m| {
+                m.scope = CheckScope::Origin;
+                m.technique = Technique::Passive;
+            }),
+            check("origin.active", |m| m.scope = CheckScope::Origin),
+        ];
+        let profile = profile_with_origins(&["http://a.test:8080"]);
+
+        let out = plan(&[], &[], &checks, &profile);
+
+        assert_eq!(ids(&out.passive), vec!["origin.passive".to_string()]);
+        assert_eq!(ids(&out.active), vec!["origin.active".to_string()]);
+        assert_eq!(out.passive[0].point, 0, "both address the one origin item");
+        assert_eq!(out.active[0].point, 0);
+    }
+
     /// The frequent-point rule is a strict `>` on the threshold, and a frequent
     /// point still gets every light check — including passive ones, which run
     /// in their own phase.

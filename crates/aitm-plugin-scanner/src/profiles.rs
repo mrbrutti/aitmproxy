@@ -905,6 +905,52 @@ mod tests {
         assert_eq!(at_floor.l4.icmp_pace_ms, 1_000);
     }
 
+    /// Amendment 46 (spec D11): the floor is the operator's
+    /// `scanner.ceilings.l4_icmp_pace_ms_min`, not the default baked into the
+    /// clamp — a deployment that raises it slows every profile below it, and
+    /// one that sets it to zero clamps nothing.
+    #[test]
+    fn the_icmp_floor_is_read_from_the_ceilings() {
+        let strict = Ceilings {
+            l4_icmp_pace_ms_min: 2_500,
+            ..Ceilings::default()
+        };
+        let mut profile = ScanProfile {
+            l4: L4Options {
+                icmp_pace_ms: 1_500,
+                ..L4Options::default()
+            },
+            ..named_profile("strict-icmp")
+        };
+        assert_eq!(
+            clamp(&mut profile, &strict, 60),
+            vec![Clamped {
+                field: "l4.icmp_pace_ms".to_string(),
+                requested: 1_500,
+                applied: 2_500,
+            }],
+            "a value the default would have left alone is raised to the configured floor"
+        );
+        assert_eq!(profile.l4.icmp_pace_ms, 2_500);
+
+        let off = Ceilings {
+            l4_icmp_pace_ms_min: 0,
+            ..Ceilings::default()
+        };
+        let mut fastest = ScanProfile {
+            l4: L4Options {
+                icmp_pace_ms: 1,
+                ..L4Options::default()
+            },
+            ..named_profile("no-floor-icmp")
+        };
+        assert_eq!(clamp(&mut fastest, &off, 60), Vec::new());
+        assert_eq!(
+            fastest.l4.icmp_pace_ms, 1,
+            "a floor of zero raises nothing (the packet lane keeps its own)"
+        );
+    }
+
     /// Spec D3: `overrides` is a partial profile merged over the resolved one —
     /// nested objects merge key by key, and a mistyped key is `invalid_profile`
     /// naming the key rather than a silently ignored line.
