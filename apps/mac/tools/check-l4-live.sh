@@ -67,7 +67,23 @@ check_verbs_gated() {
     grep -q 'L4RowVerbs\.gate' "$f" || fail verbs-gated "$f"
 }
 
-checks="live_path no_embedded_switch verbs_gated"
+# scope-add-gated: the Scope page's operator scope-add form renders only when `tools/list`
+# shows `l4.scope.add` confirmable (spec §3 last rule, AC30, task M7) AND the bus session
+# resolved as the operator (plan amendment 7: `tools/list` says confirmable to an agent too,
+# and an agent's add can only be refused, AC33). Any mention of the add verb in
+# ScopePanel.swift must sit beside both the `l4CanAddScope` gate and a `resolvedRole` read,
+# and the page offers no remove action at all (Decision 6).
+check_scope_add_gated() {
+    local f=Sources/Aitmproxy/Panels/ScopePanel.swift
+    [ -f "$f" ] || { fail scope-add-gated "$f"; return; }
+    if grep -q 'l4\.scope\.add' "$f" && { ! grep -q 'l4CanAddScope' "$f" || ! grep -q 'resolvedRole' "$f"; }; then
+        fail scope-add-gated "$f"
+        return
+    fi
+    grep -q 'l4\.scope\.remove' "$f" && fail scope-add-gated "$f"
+}
+
+checks="live_path no_embedded_switch verbs_gated scope_add_gated"
 for c in $checks; do
     "check_$c"
 done
