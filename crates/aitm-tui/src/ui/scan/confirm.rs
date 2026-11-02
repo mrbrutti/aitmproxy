@@ -69,10 +69,6 @@ impl Family {
     }
 }
 
-/// The rows around the prompt: the call-name line and its blank above, the
-/// blank, the footnote and the key line below.
-const PROMPT_FRAME_ROWS: usize = 5;
-
 /// Draw the wire-confirm overlay for the pending `App::wire_confirm`: a
 /// `scan.*` call reads the scan-launch wording, any other call (the `l4.*`
 /// verbs) the guarded-L4 wording ([`Family`]).
@@ -81,6 +77,11 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         return;
     };
     let family = Family::of(c);
+    let footnote = family.footnote(&c.call);
+    // The rows around the prompt: the call-name line and the blank below it
+    // above, the blank and the key line below, plus the footnote row when the
+    // call has one (fix round J, J2).
+    let frame = 4 + usize::from(footnote.is_some());
     let area = centered(
         screen,
         screen.width.saturating_sub(10).clamp(40, 90),
@@ -96,13 +97,13 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     ];
     // Wrap the server's prompt (bounded at fold, fix round H, H34) to the
     // panel width by cell width (fix round G, G55) and to the rows the box
-    // has left after the two header rows and the three trailer rows (fix
-    // round H, H50), so the key line is always the last row drawn; an
-    // empty prompt keeps its one blank row.
+    // has left after the frame rows above and below it (fix round H, H50),
+    // so the key line is always the last row drawn; an empty prompt keeps
+    // its one blank row.
     let mut chunks = wrap(
         &c.prompt,
         usize::from(inner.width).saturating_sub(2),
-        usize::from(inner.height).saturating_sub(PROMPT_FRAME_ROWS),
+        usize::from(inner.height).saturating_sub(frame),
     );
     if chunks.is_empty() {
         chunks.push(String::new());
@@ -111,7 +112,7 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
     }
     lines.push(Line::raw(""));
-    if let Some(footnote) = family.footnote(&c.call) {
+    if let Some(footnote) = footnote {
         lines.push(Line::styled(format!(" {footnote}"), theme.text_tertiary()));
     }
     lines.push(Line::styled(

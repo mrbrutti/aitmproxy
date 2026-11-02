@@ -3416,7 +3416,7 @@ const HELP_SCOPE_ADD_MARKER: &str = "Add an L4 scope entry";
 /// 160×44 and 160×50 show every key / palette line (the Scan section below
 /// them is what scrolls at 44 rows, and nothing at 50).
 #[test]
-fn help_footer_counts_exactly_the_hidden_lines_and_only_when_some_are() {
+fn help_more_marker_shows_exactly_when_lines_are_hidden_and_end_reaches_the_closing_hint() {
     let cells: [(u16, u16, bool, Option<usize>); 8] = [
         (100, 37, false, Some(2)),
         (100, 37, true, Some(3)),
@@ -3707,7 +3707,7 @@ fn quality_refusal_fallback_reason_is_unknown_for_every_class() {
 /// stripped the control characters at store time (T7 fix round H), so none
 /// reaches the terminal by design rather than by a ratatui rendering detail.
 #[test]
-fn quality_toast_text_renders_inert() {
+fn quality_toast_text_is_cleaned_at_store_time_and_inert_on_render() {
     let theme = Theme::new(true);
     let mut app = app();
     let _ = connected(&mut app, l4_tools(false));

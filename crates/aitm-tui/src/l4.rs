@@ -894,7 +894,8 @@ pub struct L4State {
     pub pane: L4Pane,
     /// The YAML craft editor + hex preview.
     pub craft: CraftBuffer,
-    /// A pending inject (call, args) awaiting the `needs_confirmation` reply.
+    /// A pending guarded call (`l4.inject`, `l4.scope.add`, an intercept
+    /// verdict) awaiting its `needs_confirmation` reply, as (call, args).
     pub pending: Option<(String, Value)>,
     /// `l4.capture.status` (capture + inject), re-read every slow poll (§1).
     pub capture: L4Availability,

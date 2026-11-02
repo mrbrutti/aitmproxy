@@ -2195,7 +2195,6 @@ impl App {
             return Vec::new();
         }
         self.l4.pending = Some(("l4.inject".to_string(), args.clone()));
-        self.wire_confirm_from = Mode::Inspector;
         vec![BusRequest::Call {
             name: "l4.inject".into(),
             args,
@@ -2321,7 +2320,6 @@ impl App {
             return Vec::new();
         }
         self.l4.pending = Some((tool.to_string(), args.clone()));
-        self.wire_confirm_from = Mode::Inspector;
         vec![BusRequest::Call {
             name: tool.to_string(),
             args,

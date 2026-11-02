@@ -1,6 +1,7 @@
-//! The L4 operator surface's inspector and the inject confirm overlay
-//! (ui-ext §3.2–§3.4, L4OPS-AC8/AC10/AC12). The flow list renders L4 rows in
-//! `ui::flows`; this draws the selected L4 flow: a packet list, a packet's
+//! The L4 operator surface's inspector and the L4 panel (the wire-confirm
+//! overlay is `ui::scan::confirm`; ui-ext §3.2–§3.4, L4OPS-AC8/AC10/AC12).
+//! The flow list renders L4 rows in `ui::flows`; this draws the selected L4
+//! flow: a packet list, a packet's
 //! layer tree (honest indented **text** tree) + hex, the YAML craft editor with
 //! its `build()` hex preview, and the in-path intercept bar.
 

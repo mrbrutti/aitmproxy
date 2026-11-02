@@ -221,12 +221,6 @@ fn help_rows(scope_add_l4: bool) -> Vec<HelpRow> {
     rows
 }
 
-/// Whether `app`'s bus can confirm an operator L4 scope add, the one fact
-/// the help table depends on.
-fn help_scope_add_l4(app: &App) -> bool {
-    crate::l4::supports_operator_scope_add(&app.tools)
-}
-
 /// [`help_rows`] styled for `theme`, one line per row.
 fn help_lines(theme: &Theme, scope_add_l4: bool) -> Vec<Line<'static>> {
     help_rows(scope_add_l4)
@@ -257,7 +251,8 @@ fn help_box(screen: Rect, lines: usize) -> Rect {
 /// The furthest the help overlay scrolls on a `cols`x`rows` screen: the
 /// lines that do not fit inside its box (fix round G, G85). Zero when the
 /// screen is tall enough for all of them. `scope_add_l4` is
-/// [`help_scope_add_l4`] for the app.
+/// [`crate::l4::supports_operator_scope_add`] over the app's tools, the one
+/// fact the help table depends on (the reducer's clamp passes the same).
 pub fn help_scroll_max(cols: u16, rows: u16, scope_add_l4: bool) -> usize {
     let lines = help_rows(scope_add_l4).len();
     let inner = help_box(Rect::new(0, 0, cols, rows), lines)
@@ -281,7 +276,7 @@ pub fn help_page(cols: u16, rows: u16, scope_add_l4: bool) -> usize {
 /// `app.help_scroll` when the screen is too short for all of its lines,
 /// with a `more` marker on the cut edge (fix round G, G85).
 pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let lines = help_lines(theme, help_scope_add_l4(app));
+    let lines = help_lines(theme, crate::l4::supports_operator_scope_add(&app.tools));
     let area = help_box(screen, lines.len());
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     if inner.height == 0 {
