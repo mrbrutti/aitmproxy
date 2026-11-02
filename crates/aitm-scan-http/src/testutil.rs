@@ -819,6 +819,9 @@ pub(crate) struct FakeJob {
     /// Every `JobCtx::report_session_browser_partial` call's cookie **names**,
     /// in order; a value never reaches this double.
     pub browser_partials: Mutex<Vec<Vec<String>>>,
+    /// Every `JobCtx::report_crawl_error` call as `(origin, reason)`, in order
+    /// (amendment 39b: the engine counts these into `crawl.errors`).
+    pub crawl_errors: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeJob {
@@ -846,6 +849,7 @@ impl FakeJob {
             session_canaries: Mutex::new(Vec::new()),
             session_lost: AtomicU32::new(0),
             browser_partials: Mutex::new(Vec::new()),
+            crawl_errors: Mutex::new(Vec::new()),
         }
     }
 
@@ -964,6 +968,13 @@ impl JobCtx for FakeJob {
 
     fn report_session_browser_partial(&self, cookie_names: Vec<String>) {
         self.browser_partials.lock().unwrap().push(cookie_names);
+    }
+
+    fn report_crawl_error(&self, origin: &str, reason: &str) {
+        self.crawl_errors
+            .lock()
+            .unwrap()
+            .push((origin.to_string(), reason.to_string()));
     }
 }
 

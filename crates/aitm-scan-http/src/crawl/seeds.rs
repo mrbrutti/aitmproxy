@@ -11,8 +11,10 @@
 //! paths*, not as permission: this is an authorised scan of the operator's own
 //! target, where the whole point is to reach what a crawler would not.
 //!
-//! Every GET here goes through the job's client with the job's marks
-//! (`scan:<job>` and `crawl`, spec D5), carries the session, is bounded by
+//! Every GET here goes through the job's client with the marks the lane hands
+//! it (the job mark `scan:<job>` alone, spec D5: a seed fetch is not a crawled
+//! page, so the lane gives it no `crawl` mark and the engine's page count is
+//! untouched), carries the session, is bounded by
 //! `min(deadline - now, MAX_AWAIT)` and parses at most `MAX_BODY_PARSE_BYTES`.
 //! A failure is logged at debug through [`redact::safe_url`] and skipped: a
 //! target without a `robots.txt` is the normal case, not an error.
@@ -306,7 +308,7 @@ async fn fetch(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::limits::{MARK_CRAWL, USER_AGENT};
+    use crate::limits::USER_AGENT;
     use crate::testutil::{response, ScriptedClient, JOB_ID};
     use aitm_core::{HttpRequest, RecordPolicy, VersionPolicy};
     use std::time::Duration;
@@ -373,12 +375,13 @@ mod tests {
         })
     }
 
-    /// The options the engine passes: `record: Always` and the two marks
-    /// (plan call A2).
+    /// The options the lane passes: `record: Always` and the job mark only
+    /// (plan call A2; the lane test `seed_sends_carry_the_job_mark_only` owns
+    /// that choice).
     fn send_options() -> SendOptions {
         SendOptions {
             record: RecordPolicy::Always,
-            marks: vec![format!("scan:{JOB_ID}"), MARK_CRAWL.to_string()],
+            marks: vec![format!("scan:{JOB_ID}")],
             version: VersionPolicy::H1,
         }
     }
@@ -420,11 +423,9 @@ mod tests {
             client.sent_paths(),
             vec!["/robots.txt", "/sitemap.xml", "/sm.xml"]
         );
+        // The caller's marks go out on every seed send unchanged.
         for marks in client.sent_marks() {
-            assert_eq!(
-                marks,
-                vec!["scan:scan-1a2b3c4d".to_string(), "crawl".to_string()]
-            );
+            assert_eq!(marks, vec!["scan:scan-1a2b3c4d".to_string()]);
         }
         for (req, opts) in client.sent.lock().unwrap().iter() {
             assert_eq!(req.method, "GET");
