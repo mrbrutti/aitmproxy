@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The two ends of an accepted connection as the core sees them: the client's
@@ -53,6 +54,12 @@ impl Default for Limits {
     }
 }
 
+/// How many socket fds of one pid are read or matched between deadline checks
+/// on both platforms (security findings S3 and S5, 2026-11-01): one process
+/// with tens of thousands of sockets must not carry a scan past its deadline
+/// on its own.
+pub(crate) const FD_DEADLINE_STRIDE: usize = 64;
+
 /// The outcome of a targeted probe ([`SocketScanner::find_owners_among`]).
 #[derive(Default, Debug)]
 pub(crate) struct Probe {
@@ -83,6 +90,22 @@ pub(crate) trait SocketScanner: Send + Sync {
     /// The raw, **unsanitised** identity of a process (bundle identifier or
     /// executable basename), or `None` if the OS would not say.
     fn identity(&self, key: ProcessKey) -> Option<String>;
+}
+
+/// A shared scanner scans like the scanner it points at (tests keep a handle
+/// on their fake to read its records after `resolve`).
+impl<S: SocketScanner + ?Sized> SocketScanner for Arc<S> {
+    fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
+        self.as_ref().find_owners(wanted, deadline)
+    }
+
+    fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
+        self.as_ref().find_owners_among(wanted, deadline, pids)
+    }
+
+    fn identity(&self, key: ProcessKey) -> Option<String> {
+        self.as_ref().identity(key)
+    }
 }
 
 #[cfg(test)]

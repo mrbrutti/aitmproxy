@@ -99,6 +99,19 @@ impl State {
         }
     }
 
+    /// The tail every scan shares, finished normally or unwound: publish
+    /// `found` for the batch to the callers still waiting (absent = `None`),
+    /// clear `scanning` and wake everyone.
+    fn finish_scan(&mut self, batch: &[Tuple], found: &HashMap<Tuple, ProcessKey>, wake: &Condvar) {
+        for t in batch {
+            if self.wanted.contains_key(t) {
+                self.results.insert(*t, found.get(t).copied());
+            }
+        }
+        self.scanning = false;
+        wake.notify_all();
+    }
+
     /// Drop one caller's interest in `tuple`; the last one out clears its entries.
     fn release(&mut self, tuple: &Tuple) {
         let last = match self.wanted.get_mut(tuple) {
@@ -228,13 +241,7 @@ impl<S: SocketScanner> Coalescer<S> {
         for pid in matched {
             state.warm_hit(pid);
         }
-        for t in batch {
-            if state.wanted.contains_key(t) {
-                state.results.insert(*t, found.get(t).copied());
-            }
-        }
-        state.scanning = false;
-        self.wake.notify_all();
+        state.finish_scan(batch, &found, &self.wake);
         guard.armed = false;
         state
     }
@@ -266,9 +273,18 @@ impl<S: SocketScanner> Coalescer<S> {
 }
 
 /// Armed for the span of one `lead_scan`; disarmed on the normal path. If the
-/// scanner panics, `Drop` runs on unwind (with the lock **not** held: the
-/// `MutexGuard` locals of `lead_scan` are declared after it and so dropped
-/// first) and finishes the scan as a miss for every tuple in the batch.
+/// scanner panics, `Drop` runs on unwind and finishes the scan as a miss for
+/// every tuple in the batch.
+///
+/// Invariant (quality finding Q12, 2026-11-01): `Drop` takes the state lock
+/// with a blocking `lock()`, so it must never run while **this** frame holds
+/// it. `lead_scan` keeps that true by declaration order: every `MutexGuard`
+/// local there is declared after the guard, so on unwind it is dropped (and the
+/// lock released, poisoned) before the guard runs. A `try_lock()` that treats
+/// `WouldBlock` as "held by this frame" was considered and rejected: the lock
+/// is legitimately contended by waiters and new callers for microseconds at a
+/// time, and skipping on contention would leave `scanning` set, the T-F1
+/// wedge as a race (`tests::the_guard_waits_for_a_contended_lock_instead_of_skipping`).
 struct ScanGuard<'a, S: SocketScanner> {
     coalescer: &'a Coalescer<S>,
     batch: Vec<Tuple>,
@@ -281,13 +297,7 @@ impl<S: SocketScanner> Drop for ScanGuard<'_, S> {
             return;
         }
         let mut state = self.coalescer.lock();
-        for t in &self.batch {
-            if state.wanted.contains_key(t) {
-                state.results.insert(*t, None);
-            }
-        }
-        state.scanning = false;
-        self.coalescer.wake.notify_all();
+        state.finish_scan(&self.batch, &HashMap::new(), &self.coalescer.wake);
     }
 }
 
@@ -296,6 +306,7 @@ mod tests {
     use super::*;
     use crate::types::Probe;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -393,21 +404,6 @@ mod tests {
         fn identity(&self, key: ProcessKey) -> Option<String> {
             self.identities.lock().unwrap().push(key);
             self.names.get(&key).cloned()
-        }
-    }
-
-    /// Tests keep a handle on the fake to read its records after `resolve`.
-    impl SocketScanner for Arc<FakeScanner> {
-        fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
-            self.as_ref().find_owners(wanted, deadline)
-        }
-
-        fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
-            self.as_ref().find_owners_among(wanted, deadline, pids)
-        }
-
-        fn identity(&self, key: ProcessKey) -> Option<String> {
-            self.as_ref().identity(key)
         }
     }
 
@@ -822,22 +818,28 @@ mod tests {
         assert_eq!(seen, vec![tuple(50_950), tuple(50_951)]);
     }
 
-    /// Panics on the first `panics` full scans (after sleeping `delay` so a
-    /// waiter can register mid-scan); every later full scan finds nothing.
+    /// Panics on its first full scan (after sleeping `delay` so a waiter can
+    /// register mid-scan); every later full scan finds nothing.
     struct PanickingScanner {
         calls: Mutex<usize>,
-        panics: usize,
+        panic_pending: AtomicBool,
         delay: Duration,
+    }
+
+    impl PanickingScanner {
+        fn new(delay: Duration) -> Self {
+            Self {
+                calls: Mutex::new(0),
+                panic_pending: AtomicBool::new(true),
+                delay,
+            }
+        }
     }
 
     impl SocketScanner for PanickingScanner {
         fn find_owners(&self, _wanted: &[Tuple], _deadline: Instant) -> HashMap<Tuple, ProcessKey> {
-            let call = {
-                let mut calls = self.calls.lock().unwrap();
-                *calls += 1;
-                *calls
-            };
-            if call <= self.panics {
+            *self.calls.lock().unwrap() += 1;
+            if self.panic_pending.swap(false, Ordering::SeqCst) {
                 thread::sleep(self.delay);
                 panic!("scanner blew up");
             }
@@ -853,20 +855,6 @@ mod tests {
         }
     }
 
-    impl SocketScanner for Arc<PanickingScanner> {
-        fn find_owners(&self, wanted: &[Tuple], deadline: Instant) -> HashMap<Tuple, ProcessKey> {
-            self.as_ref().find_owners(wanted, deadline)
-        }
-
-        fn find_owners_among(&self, wanted: &[Tuple], deadline: Instant, pids: &[u32]) -> Probe {
-            self.as_ref().find_owners_among(wanted, deadline, pids)
-        }
-
-        fn identity(&self, key: ProcessKey) -> Option<String> {
-            self.as_ref().identity(key)
-        }
-    }
-
     /// Tester finding T-F1 (stage 5, 2026-11-01): `lead_scan` sets `scanning`
     /// and releases the lock before calling the scanner; without the
     /// `ScanGuard`, a scanner panic left the flag set, so every later caller
@@ -876,11 +864,7 @@ mod tests {
     /// every connection. Before the fix: `calls == 1`, elapsed == deadline.
     #[test]
     fn a_scanner_panic_does_not_wedge_later_callers() {
-        let scanner = Arc::new(PanickingScanner {
-            calls: Mutex::new(0),
-            panics: 1,
-            delay: Duration::ZERO,
-        });
+        let scanner = Arc::new(PanickingScanner::new(Duration::ZERO));
         let limits = Limits {
             scan_deadline: Duration::from_millis(30),
             ..Limits::default()
@@ -918,11 +902,7 @@ mod tests {
     /// itself, instead of sitting out its own 2 s deadline.
     #[test]
     fn a_waiter_is_released_when_the_leader_panics() {
-        let scanner = Arc::new(PanickingScanner {
-            calls: Mutex::new(0),
-            panics: 1,
-            delay: Duration::from_millis(100),
-        });
+        let scanner = Arc::new(PanickingScanner::new(Duration::from_millis(100)));
         let limits = Limits {
             scan_deadline: Duration::from_secs(2),
             ..Limits::default()
@@ -955,5 +935,57 @@ mod tests {
             elapsed < Duration::from_millis(1_000),
             "took {elapsed:?}: the waiter sat out the deadline instead of being woken"
         );
+    }
+
+    /// Quality finding Q12 (2026-11-01): the guard's `Drop` runs while another
+    /// caller may hold the state lock for a moment (a waiter timing out, a new
+    /// tuple registering). It must wait for that lock, never skip: a skipped
+    /// finish leaves `scanning` set, the T-F1 wedge as a race. Here the test
+    /// thread holds the lock across the leader's panic; once it lets go the
+    /// guard finishes the scan and the next caller leads a fresh one.
+    #[test]
+    fn the_guard_waits_for_a_contended_lock_instead_of_skipping() {
+        let scanner = Arc::new(PanickingScanner::new(Duration::from_millis(50)));
+        let limits = Limits {
+            scan_deadline: Duration::from_secs(2),
+            ..Limits::default()
+        };
+        let coalescer = Arc::new(Coalescer::new(Arc::clone(&scanner), limits));
+        let c = Arc::clone(&coalescer);
+        let leader = thread::spawn(move || c.resolve(tuple(50_920)));
+        let started = Instant::now();
+        while *scanner.calls.lock().unwrap() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "leader never scanned"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Hold the state lock while the leader panics and its guard drops.
+        let held = coalescer.lock();
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            held.scanning,
+            "the guard could not finish while we held the lock"
+        );
+        drop(held);
+        assert!(leader.join().is_err(), "the leader's thread panicked");
+
+        let released = Instant::now();
+        while coalescer.lock().scanning {
+            assert!(
+                released.elapsed() < Duration::from_secs(1),
+                "the guard skipped the contended lock and left `scanning` set"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let waited = Instant::now();
+        assert_eq!(coalescer.resolve(tuple(50_921)), None);
+        assert!(
+            waited.elapsed() < Duration::from_millis(500),
+            "the next caller led a fresh scan at once"
+        );
+        assert_eq!(*scanner.calls.lock().unwrap(), 2);
     }
 }

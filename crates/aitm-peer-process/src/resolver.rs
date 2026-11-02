@@ -79,13 +79,19 @@ impl ProcessResolver {
 
     /// Custom limits, own pid skipped.
     pub fn with_limits(limits: Limits) -> Self {
-        Self::for_tests(limits, Some(std::process::id()))
+        Self::build(limits, Some(std::process::id()))
     }
 
     /// Custom limits **and** skipped pid. Tests only: `skip_pid = None` lets a
     /// test resolve its own sockets; production never reports itself.
     #[doc(hidden)]
     pub fn for_tests(limits: Limits, skip_pid: Option<u32>) -> Self {
+        Self::build(limits, skip_pid)
+    }
+
+    /// The one constructor behind both: the platform scanner with `skip_pid`
+    /// never reported, under a coalescer with `limits`.
+    fn build(limits: Limits, skip_pid: Option<u32>) -> Self {
         Self {
             inner: Coalescer::new(platform_scanner(skip_pid), limits),
         }

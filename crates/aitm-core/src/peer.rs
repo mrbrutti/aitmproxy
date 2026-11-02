@@ -18,6 +18,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -91,17 +92,34 @@ fn start_attribution_with(
     let permit = Arc::clone(slots).try_acquire_owned().ok()?;
     Some(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        // A resolver panic costs this connection its identity, nothing more;
-        // say so once per occurrence (the identity itself is never logged
-        // above `debug`; the loopback peer address names no process).
+        // A resolver panic costs this connection its identity, nothing more.
         match catch_unwind(AssertUnwindSafe(|| resolver.resolve(peer, local))) {
             Ok(identity) => identity,
             Err(_panic) => {
-                tracing::warn!(%peer, "attribution task panicked; client identity dropped");
+                report_resolver_panic(peer, &RESOLVER_PANIC_WARNED);
                 None
             }
         }
     }))
+}
+
+/// Set by the first resolver panic in the life of the process.
+static RESOLVER_PANIC_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Say that the resolver panicked: at `warn` the first time `warned` is seen
+/// clear, at `debug` from then on (security finding S6, 2026-11-01: a resolver
+/// that panics deterministically would otherwise warn once per connection).
+/// The line carries only the loopback peer address, which names no process;
+/// the identity itself is never logged above `debug`.
+fn report_resolver_panic(peer: SocketAddr, warned: &AtomicBool) {
+    if warned.swap(true, Ordering::Relaxed) {
+        tracing::debug!(%peer, "attribution task panicked; client identity dropped");
+    } else {
+        tracing::warn!(
+            %peer,
+            "attribution task panicked; client identity dropped (later occurrences at debug)"
+        );
+    }
 }
 
 /// Wait at most `budget` for the attribution task and flatten its result:
@@ -424,5 +442,59 @@ mod tests {
     #[test]
     fn in_flight_cap_is_sixty_four() {
         assert_eq!(super::MAX_IN_FLIGHT, 64);
+    }
+
+    /// Counts `warn` and `debug` events on the thread it is installed on.
+    #[derive(Default)]
+    struct LevelCounts {
+        warns: AtomicUsize,
+        debugs: AtomicUsize,
+    }
+
+    struct LevelCounter(Arc<LevelCounts>);
+
+    impl tracing::Subscriber for LevelCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            match *event.metadata().level() {
+                tracing::Level::WARN => self.0.warns.fetch_add(1, Ordering::SeqCst),
+                tracing::Level::DEBUG => self.0.debugs.fetch_add(1, Ordering::SeqCst),
+                _ => 0,
+            };
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Security finding S6 (2026-11-01): a resolver that panics
+    /// deterministically would otherwise emit one `warn` per connection. The
+    /// first panic in the life of the process is a `warn`; every later one is
+    /// a `debug`. Driven with a fresh flag (the production flag is
+    /// process-wide and sibling tests flip it) under a counting subscriber on
+    /// this thread: three panics, one warn, two debugs.
+    #[test]
+    fn a_resolver_panic_warns_once_per_process_then_debugs() {
+        let counts = Arc::new(LevelCounts::default());
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        let peer = addr("127.0.0.1:5000");
+        tracing::subscriber::with_default(LevelCounter(Arc::clone(&counts)), || {
+            for _ in 0..3 {
+                super::report_resolver_panic(peer, &warned);
+            }
+        });
+        assert_eq!(
+            counts.warns.load(Ordering::SeqCst),
+            1,
+            "one warn per process"
+        );
+        assert_eq!(counts.debugs.load(Ordering::SeqCst), 2, "the rest at debug");
+        assert!(warned.load(Ordering::SeqCst), "the flag stays set");
     }
 }

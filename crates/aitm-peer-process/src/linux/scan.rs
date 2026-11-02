@@ -18,17 +18,12 @@ use std::time::Instant;
 
 use crate::linux::parse::{exe_basename, fd_socket_inode, parse_stat_starttime, parse_tcp_row};
 use crate::matching::tuple_matches;
-use crate::types::{Probe, ProcessKey, SocketScanner, Tuple};
+use crate::types::{Probe, ProcessKey, SocketScanner, Tuple, FD_DEADLINE_STRIDE};
 
 /// The uid stored when `/proc/self` could not be read: no `/proc/net/tcp` row can
 /// carry it, so the scanner matches nothing rather than guessing.
 #[cfg(target_os = "linux")]
 const NO_UID: u32 = u32::MAX;
-
-/// How many socket inodes of one pid are matched between deadline checks
-/// (security finding S3, 2026-11-01): one process with tens of thousands of
-/// sockets must not carry the walk past the deadline on its own.
-const FD_DEADLINE_STRIDE: usize = 64;
 
 /// The Linux [`SocketScanner`]: same-user `/proc/net/tcp{,6}` rows → inode →
 /// `/proc/<pid>/fd` walk.
@@ -121,18 +116,29 @@ impl LinuxScanner {
         pids
     }
 
-    /// The socket inodes held open by `pid`; empty when its fd table cannot be read.
-    fn socket_inodes(&self, pid: u32) -> Vec<u64> {
+    /// The socket inodes held open by `pid`; empty when its fd table cannot be
+    /// read. The deadline is checked before every [`FD_DEADLINE_STRIDE`] entries
+    /// (security finding S5, 2026-11-01: a pid with thousands of fds used to be
+    /// read to the end before the first check); on expiry what was collected so
+    /// far comes back with `expired` set.
+    fn socket_inodes(&self, pid: u32, deadline: Instant) -> FdTable {
+        let mut table = FdTable::default();
         let Ok(entries) = fs::read_dir(self.pid_dir(pid).join("fd")) else {
-            return Vec::new();
+            return table;
         };
-        entries
-            .flatten()
-            .filter_map(|e| {
-                let target = fs::read_link(e.path()).ok()?;
-                fd_socket_inode(target.to_str()?)
-            })
-            .collect()
+        for (i, entry) in entries.flatten().enumerate() {
+            if i % FD_DEADLINE_STRIDE == 0 && Instant::now() >= deadline {
+                table.expired = true;
+                return table;
+            }
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            if let Some(inode) = target.to_str().and_then(fd_socket_inode) {
+                table.inodes.push(inode);
+            }
+        }
+        table
     }
 
     /// Field 22 of `<root>/<pid>/stat`, or 0 when it cannot be read.
@@ -161,7 +167,9 @@ impl LinuxScanner {
     /// One pid's fd walk, shared by the full scan and the targeted probe:
     /// every socket inode it holds that is still in `inodes` moves to `owners`
     /// under this pid's key. The deadline is checked every
-    /// [`FD_DEADLINE_STRIDE`] inodes.
+    /// [`FD_DEADLINE_STRIDE`] fds, both while reading the links and while
+    /// matching them; a walk cut short by the deadline is `Expired`, never
+    /// `Socketless`.
     fn owners_of_pid(
         &self,
         pid: u32,
@@ -169,8 +177,11 @@ impl LinuxScanner {
         deadline: Instant,
         owners: &mut HashMap<Tuple, ProcessKey>,
     ) -> PidWalk {
-        let held = self.socket_inodes(pid);
-        if held.is_empty() {
+        let FdTable {
+            inodes: held,
+            expired,
+        } = self.socket_inodes(pid, deadline);
+        if held.is_empty() && !expired {
             return PidWalk::Socketless;
         }
         let mut key: Option<ProcessKey> = None;
@@ -187,11 +198,25 @@ impl LinuxScanner {
             });
             owners.insert(tuple, key);
         }
-        PidWalk::Walked
+        if expired {
+            PidWalk::Expired
+        } else {
+            PidWalk::Walked
+        }
     }
 }
 
+/// What [`LinuxScanner::socket_inodes`] read of one pid's fd table.
+#[derive(Default)]
+struct FdTable {
+    /// The socket inodes among the entries read so far.
+    inodes: Vec<u64>,
+    /// The deadline passed before the table was read to the end.
+    expired: bool,
+}
+
 /// What [`LinuxScanner::owners_of_pid`] found out about one pid.
+#[derive(Debug, PartialEq, Eq)]
 enum PidWalk {
     /// Its fd dir was unreadable or held no socket fd (a probe reports it `gone`).
     Socketless,
@@ -264,13 +289,14 @@ impl SocketScanner for LinuxScanner {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::net::SocketAddr;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    use super::LinuxScanner;
+    use super::{LinuxScanner, PidWalk};
     use crate::types::{ProcessKey, SocketScanner, Tuple};
 
     const UID: u32 = 1000;
@@ -742,5 +768,39 @@ mod tests {
                 start: 777
             }
         );
+    }
+
+    /// Security finding S5 (2026-11-01): the `readlink` walk over one pid's fd
+    /// table checks the deadline every `FD_DEADLINE_STRIDE` entries, like the
+    /// matching loop after it, so one process with thousands of fds cannot
+    /// carry the scan past the deadline before any match is attempted. With
+    /// the deadline already past, a 200-fd pid whose every socket is wanted is
+    /// `Expired` at its first stride and nothing is matched. Before the fix all
+    /// 200 links were read and the first 63 inodes were matched.
+    #[test]
+    fn the_fd_walk_of_one_pid_stops_at_an_expired_deadline() {
+        let fx = Fixture::new("fd-stride");
+        fx.pid(7000).stat(7000, "hog", 5);
+        let mut inodes: HashMap<u64, Tuple> = HashMap::new();
+        for n in 0..200u32 {
+            let inode = 100_000 + u64::from(n);
+            fx.fd(7000, n, &format!("socket:[{inode}]"));
+            let port = 20_000 + u16::try_from(n).unwrap();
+            inodes.insert(inode, tuple(&format!("127.0.0.1:{port}"), "127.0.0.1:8080"));
+        }
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+
+        let mut owners: HashMap<Tuple, ProcessKey> = HashMap::new();
+        let walk = scanner(&fx, None).owners_of_pid(7000, &mut inodes, past, &mut owners);
+
+        assert_eq!(walk, PidWalk::Expired);
+        assert!(
+            owners.is_empty(),
+            "{} tuples matched after the deadline had passed",
+            owners.len()
+        );
+        assert_eq!(inodes.len(), 200, "every wanted inode is still unclaimed");
     }
 }

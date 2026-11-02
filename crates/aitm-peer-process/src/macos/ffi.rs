@@ -26,7 +26,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
 use crate::matching::{port_from_libproc, tuple_matches};
-use crate::types::{Probe, ProcessKey, Tuple};
+use crate::types::{Probe, ProcessKey, Tuple, FD_DEADLINE_STRIDE};
 
 // ---------------------------------------------------------------------------
 // Constants (`sys/proc_info.h`, SDK on this Mac; values pinned in research 24).
@@ -434,11 +434,6 @@ pub(crate) fn find_owners_among_raw(
 ) -> Probe {
     walk_pids(wanted, deadline, skip_pid, pids)
 }
-
-/// How many socket fds of one pid are decoded between deadline checks
-/// (security finding S3, 2026-11-01): a single process with tens of thousands
-/// of sockets must not carry the walk past the deadline on its own.
-const FD_DEADLINE_STRIDE: usize = 64;
 
 /// The per-pid body shared by the full scan and the targeted probe.
 fn walk_pids(wanted: &[Tuple], deadline: Instant, skip_pid: Option<u32>, pids: &[u32]) -> Probe {
