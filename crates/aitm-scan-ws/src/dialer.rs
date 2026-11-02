@@ -1134,7 +1134,10 @@ impl WsConn {
                 trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: self.opened,
-                peer: None,
+                // The dialer knows exactly which address answered the
+                // upgrade; the wire carrier is `server_conn.peer`, this field
+                // keeps the in-memory response honest with it (amendment 59).
+                peer: Some(self.peer),
             }),
             client_conn: conn.clone(),
             server_conn: Some(conn.clone()),
@@ -1741,6 +1744,11 @@ mod tests {
         let (http, ws) = conn.into_flows(vec!["scan:job-1".to_string()]);
 
         assert_eq!(http.response.as_ref().map(|r| r.status), Some(101));
+        // The response carries the dialled peer, the same address the wire
+        // carrier `server_conn.peer` reports (amendment 59, WS half).
+        let response_peer = http.response.as_ref().and_then(|r| r.peer);
+        assert!(response_peer.is_some(), "the WS dialer knows its peer");
+        assert_eq!(response_peer, http.server_conn.as_ref().map(|c| c.peer));
         assert!(http.metadata.is_replay);
         assert_eq!(http.metadata.marks, vec!["scan:job-1".to_string()]);
         assert_eq!(
