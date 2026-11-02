@@ -170,10 +170,17 @@ def main() -> int:
         injected = [p for p in packets if p.get("injected") is True]
         note("capture", f"{len(packets)} packets total, {len(to_port)} to port {port}, "
                         f"{len(injected)} flagged injected")
-        expect(len(to_port) == EXPECTED_FRAMES,
-               f"the capture holds exactly {EXPECTED_FRAMES} frames to port {port} "
-               f"({CASES} cases + 1 baseline + {CASES // LIVENESS_EVERY} scheduled liveness probes)",
+        # Exactly 105 on a quiet rig; one liveness probe pair more for every case whose
+        # 500 ms reply window a loaded rig read as silent (the strict correlation of
+        # amendment 66 no longer lets a stray loopback frame end the window early;
+        # rig run 10 saw 106). The lane's counters above are exact regardless.
+        extra_probes = len(to_port) - EXPECTED_FRAMES
+        expect(0 <= extra_probes <= 2 * CASES,
+               f"the capture holds {EXPECTED_FRAMES} frames to port {port} "
+               f"({CASES} cases + 1 baseline + {CASES // LIVENESS_EVERY} scheduled liveness probes), "
+               f"plus at most one probe pair per silent-read case",
                len(to_port))
+        note("extra liveness probes beyond the budgeted 105", extra_probes)
         stray_dst = sorted({str(p.get("dst")) for p in to_port if p.get("dst") != "127.0.0.1"})
         expect(not stray_dst, "every frame to the pinned port has dst 127.0.0.1", stray_dst)
         stray_injected = [{"dst": p.get("dst"), "dst_port": p.get("dst_port")} for p in injected
