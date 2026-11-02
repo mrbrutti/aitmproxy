@@ -413,11 +413,22 @@ impl PointRunner {
                 self.field,
             )
             .await?;
-        let passed = match (*lock(&self.baseline), delivered.sent.record.class()) {
+        let baseline = *lock(&self.baseline);
+        let class = delivered.sent.record.class();
+        let passed = match (baseline, class) {
             (Some(baseline), Some(class)) => liveness_passes(baseline, class),
             // No baseline yet, or a case that never went out: not a pass.
             _ => false,
         };
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %self.job.job_id(),
+            point = %self.point.id,
+            baseline = %class_label(baseline),
+            class = %class_label(class),
+            passed,
+            "liveness probe"
+        );
         self.shared.state.record_liveness(self.job.job_id(), passed);
         Ok(passed)
     }
@@ -931,6 +942,20 @@ impl PointRunner {
                 };
             }
 
+            if class.is_candidate() {
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %job_id,
+                    point = %self.point.id,
+                    index,
+                    class = %class.label(),
+                    liveness_before,
+                    icmp_paced = self.is_icmp_paced(),
+                    stopped = stop.is_some(),
+                    "candidate case"
+                );
+            }
+
             // An ICMP-baseline point never spends a liveness probe on a
             // candidate class and never becomes a crash: the kernel's reaction
             // proves classification, never a crash (spec D8.4, amendment 46).
@@ -971,6 +996,16 @@ impl PointRunner {
                         // finding F1). `checks::CrashCheck` surfaces the
                         // unconfirmed candidate as inconclusive.
                         if let Some(reason) = triage.stop {
+                            tracing::debug!(
+                                target: "aitm::scanner::l4_packet",
+                                job = %job_id,
+                                point = %self.point.id,
+                                index,
+                                attempts = triage.attempts,
+                                reproduced = triage.reproduced,
+                                stop = ?reason,
+                                "crash decision: none, the triage was cut short"
+                            );
                             record.candidate = Candidate::Interrupted {
                                 stop: reason.clone(),
                             };
@@ -981,6 +1016,18 @@ impl PointRunner {
                         let crashed = !triage.recovered
                             || (triage.attempts == reproduce_count
                                 && triage.reproduced == triage.attempts);
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            index,
+                            crashed,
+                            recovered = triage.recovered,
+                            attempts = triage.attempts,
+                            reproduced = triage.reproduced,
+                            reproduce_count,
+                            "crash decision"
+                        );
                         record.candidate = if crashed {
                             Candidate::Confirmed {
                                 reproduced: triage.reproduced,
@@ -1022,6 +1069,18 @@ impl PointRunner {
 
             run.cases.push(record);
             if let Some(reason) = stop {
+                // The consecutive-timeout ladder marks the job stopped inside
+                // `record_case`, never through `PointRunner::stop`, so this
+                // line is the only trace such a stop leaves (T5 live proof, 4b).
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %job_id,
+                    point = %self.point.id,
+                    index,
+                    sent_cases,
+                    stop = ?reason,
+                    "the case's own stop ended this point's run"
+                );
                 run.stopped = Some(reason);
                 break;
             }
@@ -1030,7 +1089,19 @@ impl PointRunner {
             // whatever the oracle said (spec D8.4).
             if liveness_every > 0 && sent_cases.is_multiple_of(liveness_every) {
                 match self.liveness_probe().await {
-                    Ok(passed) => alive = passed,
+                    Ok(passed) => {
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            index,
+                            sent_cases,
+                            liveness_every,
+                            passed,
+                            "scheduled liveness probe"
+                        );
+                        alive = passed;
+                    }
                     Err(HostError::Stopped(reason)) => {
                         run.stopped = Some(reason);
                         break;
@@ -1042,6 +1113,18 @@ impl PointRunner {
                 }
             }
         }
+
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %job_id,
+            point = %self.point.id,
+            sent_cases,
+            allocated,
+            cases = run.cases.len(),
+            stopped = run.stopped.is_some(),
+            crash = run.crash.is_some(),
+            "point run finished"
+        );
 
         run
     }
@@ -1066,11 +1149,32 @@ impl PointRunner {
             Err(HostError::Craft(message)) => return Err(self.stop_on_craft(SEED0, &message)),
         };
         if first && !always {
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                always,
+                first,
+                retried = false,
+                "liveness pair: the first probe passed, so no retry"
+            );
             return Ok((true, true));
         }
         tokio::time::sleep(self.shared.timing.liveness_retry).await;
         match self.liveness_probe().await {
-            Ok(second) => Ok((first, second)),
+            Ok(second) => {
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %self.job.job_id(),
+                    point = %self.point.id,
+                    always,
+                    first,
+                    second,
+                    retried = true,
+                    "liveness pair"
+                );
+                Ok((first, second))
+            }
             Err(HostError::Stopped(reason)) => Err(reason),
             Err(HostError::Craft(message)) => Err(self.stop_on_craft(SEED0, &message)),
         }
@@ -1096,7 +1200,7 @@ impl PointRunner {
         // The candidate left the target silent, so the first replay always
         // waits for it.
         let mut alive = false;
-        for _ in 0..reproduce_count {
+        for round in 1..=reproduce_count {
             // A replay is a case (call C10), so the job's ceiling bounds it
             // exactly as it bounds the fuzz loop: with no room left there is
             // no reproduction to be had, and the triage stops before it even
@@ -1107,9 +1211,20 @@ impl PointRunner {
                 let cap = self.shared.state.cases_cap(job_id).unwrap_or(0);
                 let reason = StopReason::CaseCap(cap);
                 self.stop(reason.clone());
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %job_id,
+                    point = %self.point.id,
+                    round,
+                    attempts = triage.attempts,
+                    reproduced = triage.reproduced,
+                    "triage decision: stop, the case ceiling left no room for this replay"
+                );
                 triage.stop = Some(reason);
                 return triage;
             }
+            let waited_for_recovery = !alive;
+            let wait_started = Instant::now();
             if !alive {
                 match self.await_recovery().await {
                     // The replay below sets `alive` from its own probes.
@@ -1119,9 +1234,29 @@ impl PointRunner {
                     // evidence there is; stop replaying into it.
                     Ok(false) => {
                         triage.recovered = false;
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            round,
+                            attempts = triage.attempts,
+                            reproduced = triage.reproduced,
+                            waited_ms = elapsed_ms(wait_started),
+                            "triage decision: recovered=false, the outage is persistent"
+                        );
                         return triage;
                     }
                     Err(HostError::Stopped(reason)) => {
+                        tracing::debug!(
+                            target: "aitm::scanner::l4_packet",
+                            job = %job_id,
+                            point = %self.point.id,
+                            round,
+                            attempts = triage.attempts,
+                            reproduced = triage.reproduced,
+                            stop = ?reason,
+                            "triage decision: stop, the job stopped while waiting for recovery"
+                        );
                         triage.stop = Some(reason);
                         return triage;
                     }
@@ -1144,6 +1279,7 @@ impl PointRunner {
                     .min(deadline.saturating_duration_since(now));
                 tokio::time::sleep(spacing).await;
             }
+            let waited_ms = elapsed_ms(wait_started);
             triage.recovered = true;
             let delivered = match self
                 .deliver(
@@ -1158,6 +1294,16 @@ impl PointRunner {
             {
                 Ok(delivered) => delivered,
                 Err(HostError::Stopped(reason)) => {
+                    tracing::debug!(
+                        target: "aitm::scanner::l4_packet",
+                        job = %self.job.job_id(),
+                        point = %self.point.id,
+                        round,
+                        attempts = triage.attempts,
+                        reproduced = triage.reproduced,
+                        stop = ?reason,
+                        "triage decision: stop, the replay never went out"
+                    );
                     triage.stop = Some(reason);
                     return triage;
                 }
@@ -1173,17 +1319,36 @@ impl PointRunner {
             // counted (above, as a stop) but is not a reproduction attempt
             // (round-1 leftover).
             triage.attempts += 1;
-            let candidate = delivered
-                .sent
-                .record
-                .class()
-                .is_some_and(|class| class.is_candidate());
+            let class = delivered.sent.record.class();
+            let candidate = class.is_some_and(|class| class.is_candidate());
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                round,
+                attempt = triage.attempts,
+                waited_for_recovery,
+                waited_ms,
+                class = %class_label(class),
+                candidate,
+                "triage replay sent"
+            );
             // A pair a stop cut short never finished, so it is read as the
             // stop it is and no reproduction is counted off it (review
             // finding P1).
             let (first, second) = match self.probe_pair(true).await {
                 Ok(pair) => pair,
                 Err(reason) => {
+                    tracing::debug!(
+                        target: "aitm::scanner::l4_packet",
+                        job = %self.job.job_id(),
+                        point = %self.point.id,
+                        round,
+                        attempts = triage.attempts,
+                        reproduced = triage.reproduced,
+                        stop = ?reason,
+                        "triage decision: stop, the probe pair after the replay was cut short"
+                    );
                     triage.stop = Some(reason);
                     return triage;
                 }
@@ -1192,11 +1357,47 @@ impl PointRunner {
             if candidate && !first && !second {
                 triage.reproduced += 1;
             }
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                round,
+                first,
+                second,
+                candidate,
+                attempts = triage.attempts,
+                reproduced = triage.reproduced,
+                "triage replay judged"
+            );
             if let Some(reason) = delivered.stop {
+                // The replay's own case tripped the ladder (a reproducing
+                // replay is silent, and a probe is not a case, so nothing
+                // resets it). The triage is cut short and is never a crash
+                // however many replays reproduced (tester finding F1).
+                tracing::debug!(
+                    target: "aitm::scanner::l4_packet",
+                    job = %self.job.job_id(),
+                    point = %self.point.id,
+                    round,
+                    attempts = triage.attempts,
+                    reproduced = triage.reproduced,
+                    stop = ?reason,
+                    "triage decision: stop, the replay's own case ended the job's sending"
+                );
                 triage.stop = Some(reason);
                 return triage;
             }
         }
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %self.job.job_id(),
+            point = %self.point.id,
+            attempts = triage.attempts,
+            reproduced = triage.reproduced,
+            recovered = triage.recovered,
+            reproduce_count,
+            "triage finished"
+        );
         triage
     }
 
@@ -1213,24 +1414,56 @@ impl PointRunner {
     /// when this wait is what ran it past its deadline.
     async fn await_recovery(&self) -> Result<bool, HostError> {
         let timing = self.shared.timing;
+        let started = Instant::now();
         for attempt in 0..timing.recovery_polls {
             if Instant::now() >= self.job.deadline() {
                 self.stop(StopReason::Deadline);
                 return Err(HostError::Stopped(StopReason::Deadline));
             }
-            if self.liveness_probe().await? {
+            let passed = self.liveness_probe().await?;
+            tracing::debug!(
+                target: "aitm::scanner::l4_packet",
+                job = %self.job.job_id(),
+                point = %self.point.id,
+                attempt = attempt + 1,
+                polls = timing.recovery_polls,
+                passed,
+                elapsed_ms = elapsed_ms(started),
+                "recovery poll"
+            );
+            if passed {
                 return Ok(true);
             }
             if attempt + 1 < timing.recovery_polls {
                 tokio::time::sleep(timing.recovery_poll).await;
             }
         }
+        tracing::debug!(
+            target: "aitm::scanner::l4_packet",
+            job = %self.job.job_id(),
+            point = %self.point.id,
+            polls = timing.recovery_polls,
+            elapsed_ms = elapsed_ms(started),
+            "recovery bound ran out: the target answered none of its polls"
+        );
         Ok(false)
     }
 }
 
 /// What [`craft_stop`] calls the lane's one cached seed.
 const SEED0: &str = "seed 0";
+
+/// A class's label for a debug line, or `none` for a stimulus that never went
+/// out. The lane's tracing names a class, a count or a verdict — never a byte
+/// of the stimulus or of the reply (T5 live proof, 4b).
+fn class_label(class: Option<CaseClass>) -> String {
+    class.map_or_else(|| "none".to_string(), |class| class.label())
+}
+
+/// Milliseconds since `since`, saturated, for a debug line's `*_ms` field.
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// The stop a craft failure raises: `what` no longer builds, so the stimulus
 /// never reached the wire and the run cannot be read as a clean one (review
