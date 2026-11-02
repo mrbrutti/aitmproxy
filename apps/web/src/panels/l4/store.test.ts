@@ -301,6 +301,68 @@ describe('L4 store: once-per-message failure log (spec §7(c))', () => {
     expect(h.notices.map(([t]) => t)).toEqual(['l4.flow.get: A broke', 'l4.flow.get: B broke', 'l4.flow.get: A broke']);
   });
 
+  it("the inspect read is its own call: a flow whose list read succeeds every pass while its inspect read fails on every click is noticed once (tester pass 3)", async () => {
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A'],
+        'l4.flow.get': (a: Record<string, unknown>) => (a.limit === 0 ? flowWire('A', { packet_count: 3 }) : new BusError('inspect window boom')),
+      },
+    });
+    for (let i = 0; i < 3; i++) {
+      await h.store.refresh(true);
+      await h.store.inspect('A');
+    }
+    expect(h.argsOf('l4.flow.get').filter((a) => a.limit === 0)).toHaveLength(3);
+    expect(h.argsOf('l4.flow.get').filter((a) => a.offset === 0)).toHaveLength(3);
+    // The list read of the same id succeeding on every pass must not re-arm the inspect read's message.
+    expect(h.notices).toEqual([['l4.flow.get: inspect window boom', 'error']]);
+    expect(h.store.inspected()?.id).toBeUndefined();
+    expect(h.store.rows().map((r) => r.id)).toEqual(['A']);
+  });
+
+  // DEFECT (tester pass 3, reported to the Coder): fix 4 keys `lastFailure` by call identity, but
+  // `recovered(key)` still calls `OnceLog.forget(message)`, which is keyed by message TEXT. Two reads
+  // that fail with the same text (two flows whose core error does not name the id; or the list read
+  // and the inspect read of the same broken flow, whose text is identical) share one `seen` entry, so
+  // when either recovers the other — still failing on every pass — is logged again. This is the same
+  // class as the quality Minor fix 4 closed ("one read's success forgets another's message"),
+  // surviving at the message level. Pinned with `it.fails` so the gate stays green while the defect
+  // is open: once `forget` releases a message only when no other key still holds it, these go red —
+  // drop the `.fails` then.
+  it.fails('two flows failing with the SAME message text, one recovering: the other, still failing on every pass, is not re-logged (tester pass 3)', async () => {
+    let broken = new Set(['A', 'B']);
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => (broken.has(String(a.id)) ? new BusError('flow store closed') : flowWire(String(a.id))),
+      },
+    });
+    await h.store.refresh(true);
+    expect(h.notices).toEqual([['l4.flow.get: flow store closed', 'error']]);
+    broken = new Set(['B']);
+    await h.store.refresh(true);
+    await h.store.refresh(true);
+    expect(h.argsOf('l4.flow.get').filter((a) => a.id === 'B')).toHaveLength(3);
+    // B never recovered: the message already in the log is still B's live failure.
+    expect(h.notices).toEqual([['l4.flow.get: flow store closed', 'error']]);
+  });
+
+  it.fails("a list read still failing is not re-logged because the inspect read of ANOTHER flow succeeded (tester pass 3)", async () => {
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => (a.id === 'A' ? new BusError('A broke') : flowWire('B', { packet_count: 1 })),
+      },
+    });
+    await h.store.refresh(true); // list A fails → logged once
+    await h.store.inspect('A'); // inspect A fails with the same text → suppressed
+    await h.store.inspect('B'); // inspect B succeeds → must not un-suppress the list's A message
+    await h.store.refresh(true); // list A still failing
+    await h.store.refresh(true);
+    expect(h.argsOf('l4.flow.get').filter((a) => a.id === 'A' && a.limit === 0)).toHaveLength(3);
+    expect(h.notices).toEqual([['l4.flow.get: A broke', 'error']]);
+  });
+
   it('two distinct failure messages are each noticed once', async () => {
     h = harness({ replies: { 'l4.flow.list': new BusError('boom'), 'l4.scope.list': new BusError('scope closed') } });
     for (let i = 0; i < 3; i++) await h.store.refresh(true);
@@ -429,6 +491,46 @@ describe('L4 store: windowed reads (spec §2)', () => {
     const before = h.count('l4.flow.get');
     await h.store.loadMore();
     expect(h.count('l4.flow.get')).toBe(before);
+  });
+
+  it("finishing flow A's load-more releases only A's window: a second click for flow B while B's own read is still out is a no-op (tester pass 3)", async () => {
+    const pkt = (n: number) => ({ dir: 'inbound' as const, length: n, injected: false, layers: ['IPv4', 'UDP'] });
+    const gates: Record<string, () => void> = {};
+    const gated = (id: string) => new Promise<void>((res) => (gates[id] = res));
+    h = harness({
+      replies: {
+        'l4.flow.list': ['A', 'B'],
+        'l4.flow.get': (a: Record<string, unknown>) => {
+          const id = String(a.id);
+          if (a.limit === 0) return flowWire(id, { packet_count: 3 });
+          if (a.offset === 0) return flowWire(id, { packet_count: 3, packets: [pkt(1), pkt(2)], offset: 0, truncated: true, next_offset: 2 });
+          return gated(id).then(() => flowWire(id, { packet_count: 3, packets: [pkt(3)], offset: 2, truncated: false, next_offset: null }));
+        },
+      },
+    });
+    const tailReads = (id: string) => h!.argsOf('l4.flow.get').filter((a) => a.id === id && a.offset === 2).length;
+    await h.store.refresh();
+    await h.store.inspect('A');
+    const aMore = h.store.loadMore();
+    await h.store.inspect('B');
+    const bMore = h.store.loadMore();
+    expect(tailReads('A')).toBe(1);
+    expect(tailReads('B')).toBe(1);
+    // A's read lands while B's is still out: A's `finally` must release A's window only.
+    gates.A!();
+    await aMore;
+    expect(h.store.inspected()?.id).toBe('B');
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2]);
+    await h.store.loadMore();
+    expect(tailReads('B')).toBe(1);
+    // B's read lands: appended once; the window is complete.
+    gates.B!();
+    await bMore;
+    expect(h.store.inspected()?.id).toBe('B');
+    expect(h.store.inspected()?.packets.map((p) => p.length)).toEqual([1, 2, 3]);
+    expect(h.store.inspected()?.truncated).toBe(false);
+    expect(tailReads('A')).toBe(1);
+    expect(tailReads('B')).toBe(1);
   });
 
   it('loadMore releases its guard after a failed read, so the next click reads the same window again (tester pass 2)', async () => {

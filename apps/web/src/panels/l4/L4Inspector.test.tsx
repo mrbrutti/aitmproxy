@@ -106,6 +106,27 @@ describe('L4Inspector: packet selection derives from the flow (I1; spec §2, pla
   });
 });
 
+describe('L4Inspector: packet timestamps at the render site (fix 4; spec §2)', () => {
+  it('a packet whose timestamp no clock can render shows the placeholder, its neighbours a clock, and the list renders every row', () => {
+    // `1e400` and `9e15` are valid JSON numbers a core can put in a packet (`1e400` parses to Infinity).
+    const packets: L4PacketWire[] = [
+      { ...pkt(1), timestamp: Date.UTC(2026, 10, 1, 12, 0, 0, 0) },
+      { ...pkt(2), timestamp: Number.POSITIVE_INFINITY },
+      { ...pkt(3), timestamp: 9_000_000_000_000_000 },
+      { ...pkt(4), timestamp: Number.NaN },
+      pkt(5),
+    ];
+    const { rows } = mount('operator', flow('F1', packets));
+    expect(rows()).toHaveLength(5);
+    const texts = rows().map((el) => el.textContent ?? '');
+    expect(texts[0]).toMatch(/\d\d:\d\d:\d\d\.000/);
+    expect(texts[0]).not.toContain('--:--:--.---');
+    for (const i of [1, 2, 3]) expect(texts[i], `row ${i}`).toContain('--:--:--.---');
+    expect(texts[4]).not.toContain(':');
+    for (const t of texts) expect(t).not.toContain('NaN');
+  });
+});
+
 describe('L4Inspector: agent role gates Inject and the verdicts (I3; spec §7(c) D12, AC24)', () => {
   it('Inject is disabled with the operator-only line beside it, a forced click calls no onInject, and Forward carries the reason', () => {
     const { byId, handlers } = mount('agent', flow('F1', [pkt(1)]), { interceptModel: { kind: 'parked', id: 'P1', state: 'parked' } });

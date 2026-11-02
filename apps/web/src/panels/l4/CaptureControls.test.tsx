@@ -320,6 +320,36 @@ describe('CaptureControls: dialog dismissed while the confirm is in flight, then
   });
 });
 
+describe('CaptureControls: re-entrancy while the confirm is in flight (tester pass 3; the `busy` guard)', () => {
+  it('further Send to wire clicks while busy do not call onConfirmAddScope again, and the one answer closes the dialog once', async () => {
+    const { r, byId, handlers } = mount('operator', { tools: CONFIRMABLE });
+    handlers.onAddScope.mockResolvedValueOnce({ kind: 'confirm', prompt: 'P', token: 'T' });
+    let answer!: (o: GuardedOutcome) => void;
+    handlers.onConfirmAddScope.mockImplementationOnce(() => new Promise<GuardedOutcome>((res) => (answer = res)));
+    fireEvent.submit(byId('l4-scope-add-form')!);
+    const dialog = await waitFor(() => {
+      const d = r.container.querySelector('[role="alertdialog"]');
+      if (!d) throw new Error('no dialog yet');
+      return d;
+    });
+    const send = () => [...dialog.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Send to wire')!;
+    fireEvent.click(send());
+    await waitFor(() => expect(handlers.onConfirmAddScope).toHaveBeenCalledTimes(1));
+    // Disabled while busy; Solid's delegated `onClick` skips a disabled node, so the DOM path is closed here
+    // (the handler's own `busy` guard is driven with a stub dialog in `confirmReentrancy.test.tsx`).
+    expect(send().disabled).toBe(true);
+    fireEvent.click(send());
+    fireEvent.click(send());
+    await new Promise((res) => setTimeout(res, 10));
+    expect(handlers.onConfirmAddScope).toHaveBeenCalledTimes(1);
+    expect(handlers.onConfirmAddScope).toHaveBeenCalledWith(expect.objectContaining({ cidr: '127.0.0.1/32' }), 'T');
+    answer({ kind: 'done', result: 's9' });
+    await waitFor(() => expect(r.container.querySelector('[role="alertdialog"]')).toBeNull());
+    expect(handlers.onConfirmAddScope).toHaveBeenCalledTimes(1);
+    expect((byId('l4-scope-add') as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
 describe('CaptureControls: agent role (D12, AC24)', () => {
   it('on an agent connection Start is disabled "operator only" even when capture is available, and a forced click sends nothing', () => {
     const { start, byId, handlers } = mount('agent', { capture: AVAILABLE });

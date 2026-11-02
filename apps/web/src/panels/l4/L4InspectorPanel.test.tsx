@@ -189,6 +189,28 @@ describe('L4InspectorPanel.confirm: dismissed while in flight, then a second ver
   });
 });
 
+describe('L4InspectorPanel.confirm: re-entrancy while the confirming call is out (fix 4: a busy confirm is not re-sent)', () => {
+  it('further Send to wire clicks while busy send nothing: exactly one `_confirm` call, the late "done" applied once', async () => {
+    const m = mount();
+    await m.forwardAndConfirm();
+    // The button is disabled while busy and Solid's delegated `onClick` skips a disabled node, so through
+    // the real dialog these clicks never reach `confirm()`: this proves the DOM path is closed. The
+    // handler's own `busy` guard behind it is driven in `confirmReentrancy.test.tsx` with a stub dialog.
+    const send = () => [...m.dialog()!.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === 'Send to wire')!;
+    expect(send().disabled).toBe(true);
+    fireEvent.click(send());
+    fireEvent.click(send());
+    await new Promise((res) => setTimeout(res, 10));
+    expect(m.call).toHaveBeenCalledTimes(2);
+    expect(m.call.mock.calls.filter(([, p]) => p && '_confirm' in (p as object))).toHaveLength(1);
+    m.resolveConfirm(true);
+    await waitFor(() => expect(m.dialog()).toBeNull());
+    expect(m.call).toHaveBeenCalledTimes(2);
+    expect(m.store.refresh).toHaveBeenCalledTimes(1);
+    expect(m.app.toast()).toEqual({ text: 'Confirm Forward the parked packet — done', kind: 'info' });
+  });
+});
+
 describe('L4InspectorPanel: the inspector bar while intercept availability is pending (spec §1)', () => {
   it('renders exactly "Reading L4 availability…" as one status line, no limited sentence, no verdict buttons', () => {
     const { r, byId } = mount({ intercept: PENDING_AVAILABILITY, parked: [PARKED_P1] });
