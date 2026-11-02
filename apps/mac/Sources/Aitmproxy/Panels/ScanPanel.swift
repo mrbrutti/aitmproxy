@@ -108,12 +108,720 @@ final class ScanPanelState {
         session.select(flow)
         session.show(.apps)
     }
+
+    // MARK: - Scanner v2 surface (T9)
+
+    /// The four-tab surface's state (Kit, no SwiftUI): profiles, jobs, site map,
+    /// issues, the pending launch and the push flags. The legacy members above are
+    /// untouched and the two halves never share a value: `points` stays the legacy
+    /// injection-point list the sidebar counts.
+    var surface = ScanSurfaceModel()
+
+    /// Restarts the page's poll task (`.task(id:)`). A launch bumps it so the new
+    /// job is read at once instead of at the next whole tick.
+    var pollGeneration = 0
+
+    /// Bumped by `focusLaunch()`: the Profiles footer scrolls into view and Start
+    /// Scan takes focus.
+    var launchFocusTick = 0
+
+    /// The profile the Delete Profile dialog is asking about; nil closes it.
+    var deleteCandidate: String?
+
+    /// The name typed into the Duplicate… popover.
+    var duplicateName: String?
+
+    /// When the `scan.profile.list` in flight started, nil when none is.
+    var profilesLoadingSince: Date?
+
+    /// That load has been in flight for more than 500 ms, which is the only time
+    /// the header shows a spinner (D11: the cached list is shown first).
+    var profilesLoadingSlow = false
+
+    /// The last `scan.checks` read failed. Rendered inside the editor's Checks
+    /// block; the catalogue already loaded stays (D11).
+    var checksError: String?
+
+    /// The Site map tab's last read failed. The Kit model carries `profilesError`,
+    /// `jobsError` and `issuesError` but no site-map slot, so the page keeps this
+    /// one; like the others it never blanks the list it could not refresh.
+    var sitemapError: String?
+
+    // MARK: Surface queries
+
+    /// Which Scan page this bus can back (D11), feature-detected, never assumed.
+    var mode: ScanSurface.Mode { ScanSurface.mode(for: session.tools) }
+
+    /// The bus lists `scan.start`.
+    var surfaceOffered: Bool { ScanSurface.isOffered(in: session.tools) }
+
+    /// Why a launch may not be sent, nil when it may: the one gate every launch
+    /// passes (D9). Computed, so a scope or tools change updates it with no read.
+    var launchRefusal: String? { surface.launchRefusal(scopeHosts: session.scopeHosts, tools: session.tools) }
+
+    /// The job Cancel Scan would stop: the selected one while it is non-terminal,
+    /// else the only running one. Nil when the choice would be a guess.
+    var cancelTarget: String? {
+        if let job = surface.selectedJob,
+           let summary = surface.jobs.first(where: { $0.job == job }), !summary.state.isTerminal {
+            return job
+        }
+        let running = surface.runningJobs
+        return running.count == 1 ? running[0].job : nil
+    }
+
+    var canCancel: Bool { cancelTarget != nil }
+
+    // MARK: Surface reads
+
+    /// `scan.profile.list`. A failure keeps the profiles already listed (D11).
+    func refreshProfiles() async {
+        let started = Date()
+        profilesLoadingSince = started
+        let slowMark = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self, !Task.isCancelled, profilesLoadingSince == started else { return }
+            profilesLoadingSlow = true
+        }
+        defer {
+            slowMark.cancel()
+            profilesLoadingSince = nil
+            profilesLoadingSlow = false
+        }
+        do {
+            let value = try await session.runCommand("scan.profile.list", [:])
+            surface.applyProfiles(try ScanProfileListResult(json: value))
+        } catch {
+            surface.profilesError = scanUnableText("load profiles", BusService.describe(error))
+        }
+    }
+
+    /// `scan.profile.get {name}` into the editor; the session preview follows it,
+    /// because the preview is per target origin.
+    func loadProfile(_ name: String) async {
+        do {
+            let value = try await session.runCommand("scan.profile.get", ["name": .string(name)])
+            surface.applyProfile(try ScanProfile(json: value))
+            surface.profilesError = nil
+        } catch {
+            surface.profilesError = scanUnableText("load profile \(name)", BusService.describe(error))
+            return
+        }
+        await refreshSessionPreview()
+    }
+
+    /// `scan.checks {}`: the catalogue the Checks tree groups.
+    func refreshChecks() async {
+        do {
+            let value = try await session.runCommand("scan.checks", [:])
+            surface.applyChecks(try ScanChecksResult(json: value))
+            checksError = nil
+        } catch {
+            checksError = scanUnableText("load checks", BusService.describe(error))
+        }
+    }
+
+    /// `scan.session.preview {target}` for the edited profile's first origin, only
+    /// while its session mode is Observed. A failure, no origin or no names at all
+    /// leaves the preview nil, which the editor reads as `ScanFormat.noSessionText`.
+    func refreshSessionPreview() async {
+        guard let profile = surface.editedProfile, profile.session.mode == .observed,
+              let origin = profile.target.origins.first else {
+            surface.sessionPreview = nil
+            return
+        }
+        guard let value = try? await session.runCommand("scan.session.preview", ["target": .string(origin)]),
+              let preview = try? ScanSessionProfile(json: value),
+              !(preview.cookies.isEmpty && preview.headers.isEmpty) else {
+            surface.sessionPreview = nil
+            return
+        }
+        surface.sessionPreview = preview
+    }
+
+    /// `l4.scope.list {}`, and only when the bus lists it: an L4 lane needs a scope
+    /// entry with the Inject capability. Unknown stays unknown (nil), which the
+    /// launch gate reads as "not available" — deny by default.
+    func refreshL4Scope() async {
+        guard ScanSurface.has("l4.scope.list", in: session.tools) else {
+            surface.l4InjectScopeKnown = nil
+            return
+        }
+        do {
+            let value = try await session.runCommand("l4.scope.list", [:])
+            let entries = value["entries"]?.arrayValue ?? value.arrayValue ?? []
+            surface.l4InjectScopeKnown = entries.contains { $0["capability"]?.stringValue == "inject" }
+        } catch {
+            surface.l4InjectScopeKnown = nil
+        }
+    }
+
+    /// `scan.list {}`: the job rows. A failure keeps the rows and their counters.
+    func refreshList() async {
+        do {
+            let value = try await session.runCommand("scan.list", [:])
+            surface.applyList(try ScanListResult(json: value))
+            statusRequested.formIntersection(Set(surface.jobs.map(\.job)))
+        } catch {
+            surface.jobsError = scanUnableText("list jobs", BusService.describe(error))
+        }
+    }
+
+    /// `scan.status {job}`: the counters of one job, and its list row.
+    func refreshStatus(_ job: String) async {
+        do {
+            let value = try await session.runCommand("scan.status", ["job": .string(job)])
+            surface.applyStatus(try ScanJobStatus(json: value))
+            surface.jobsError = nil
+        } catch {
+            surface.jobsError = scanUnableText("read job \(job)", BusService.describe(error))
+        }
+    }
+
+    /// `scan.issues` under the current filters; `append` adds the next page.
+    func refreshIssues(append: Bool = false) async {
+        loadedIssueFilters = surface.filters
+        var args = surface.filters.arguments()
+        if append, let cursor = surface.issuesCursor { args["cursor"] = .string(cursor) }
+        do {
+            let value = try await session.runCommand("scan.issues", args)
+            surface.applyIssues(try ScanIssuesResult(json: value), append: append)
+        } catch {
+            surface.issuesError = scanUnableText("load issues", BusService.describe(error))
+        }
+    }
+
+    /// `scan.issue {id}`: the evidence of one issue, for the detail pane.
+    func loadIssue(_ id: String) async {
+        do {
+            let value = try await session.runCommand("scan.issue", ["id": .string(id)])
+            surface.applyIssue(try ScanIssue(json: value))
+        } catch {
+            surface.issuesError = scanUnableText("load issue \(id)", BusService.describe(error))
+        }
+    }
+
+    /// `scan.sitemap` for the chosen job (all jobs when none); `append` adds the
+    /// next page behind Load More.
+    func refreshSitemap(append: Bool = false) async {
+        loadedSitemapJob = .some(surface.sitemapJob)
+        var args: [String: JSONValue] = [:]
+        if let job = surface.sitemapJob { args["job"] = .string(job) }
+        if append, let cursor = surface.sitemap?.nextCursor { args["cursor"] = .string(cursor) }
+        do {
+            let value = try await session.runCommand("scan.sitemap", args)
+            surface.applySitemap(try ScanSitemapResult(json: value), append: append)
+            sitemapError = nil
+        } catch {
+            sitemapError = scanUnableText("load the site map", BusService.describe(error))
+        }
+    }
+
+    // MARK: Polling (D8)
+
+    /// Jobs whose `scan.status` has been asked for once already: `scan.list` carries
+    /// no profile name or targets, so every listed job needs one status read.
+    @ObservationIgnored private var statusRequested: Set<String> = []
+    /// The filters the loaded issues page was read under; a change re-reads it.
+    @ObservationIgnored private var loadedIssueFilters: ScanIssueFilters?
+    /// The job the loaded site-map page was read for, wrapped so "all jobs" (nil)
+    /// is distinguishable from "nothing read yet".
+    @ObservationIgnored private var loadedSitemapJob: String??
+    /// The issue whose detail was asked for, so a failed read does not spin.
+    @ObservationIgnored private var loadedIssueDetail: String?
+    /// The "Saved <name>" line this state put up, so the 4 s timer only clears
+    /// a line nothing else has replaced.
+    @ObservationIgnored private var savedLine: String?
+
+    /// Runs exactly while the Scan page is on screen (`.task(id: pollGeneration)`):
+    /// the first-visit reads, then a 250 ms tick. Each tick serves the push flags
+    /// first — that is D8's coalescing — then the timers. A read that fails sets
+    /// its own error and leaves every counter and row exactly as it was (D11).
+    func poll() async {
+        await firstVisitLoads()
+        var tick = 0
+        while !Task.isCancelled {
+            await pollTick(tick)
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+            tick += 1
+        }
+    }
+
+    private func pollTick(_ tick: Int) async {
+        guard surfaceOffered else { return }
+        // Push flags first: `noteJobEvent` only ever flags, so the values on screen
+        // come from `scan.status` / `scan.list` / `scan.issues`, never from the line.
+        let flagged = surface.refreshNeeded
+        let listFlagged = surface.listRefreshNeeded
+        let issuesFlagged = surface.issuesRefreshNeeded
+        surface.clearRefreshFlags()
+        // A page leave or a launch's `pollGeneration` bump cancels this task between
+        // reads; every await below is a point where the next read must not start.
+        for job in flagged.sorted() {
+            guard !Task.isCancelled else { return }
+            await refreshStatus(job)
+        }
+        guard !Task.isCancelled else { return }
+        if listFlagged { await refreshList() }
+        guard !Task.isCancelled else { return }
+        if issuesFlagged, surface.tab == .issues { await refreshIssues() }
+
+        // Timers: the list every 2 s.
+        guard !Task.isCancelled else { return }
+        if tick.isMultiple(of: 8), !listFlagged { await refreshList() }
+        // The selected job every 1 s while it runs, and once for every listed job
+        // whose status this app has not read yet.
+        guard !Task.isCancelled else { return }
+        if tick.isMultiple(of: 4) { await pollStatuses(flagged: flagged) }
+        guard !Task.isCancelled else { return }
+        if surface.tab == .issues {
+            // Issues every 2 s while a job is running, offset from the list beat.
+            if tick % 8 == 4, !issuesFlagged, !surface.runningJobs.isEmpty { await refreshIssues() }
+            guard !Task.isCancelled else { return }
+            await loadIssuesIfFiltersChanged()
+            guard !Task.isCancelled else { return }
+            await loadSelectedIssueDetail()
+        }
+        guard !Task.isCancelled else { return }
+        if surface.tab == .sitemap { await loadSitemapIfJobChanged() }
+    }
+
+    private func pollStatuses(flagged: Set<String>) async {
+        if let job = surface.selectedJob, !flagged.contains(job),
+           let summary = surface.jobs.first(where: { $0.job == job }), !summary.state.isTerminal {
+            await refreshStatus(job)
+        }
+        for summary in surface.jobs where surface.statuses[summary.job] == nil {
+            guard !Task.isCancelled else { return }
+            guard !flagged.contains(summary.job), !statusRequested.contains(summary.job) else { continue }
+            statusRequested.insert(summary.job)
+            await refreshStatus(summary.job)
+            // A read that failed is worth one more try on the next beat; one that
+            // succeeded has a stored status, so this job is never asked for again.
+            if surface.statuses[summary.job] == nil { statusRequested.remove(summary.job) }
+        }
+    }
+
+    /// The reads a first visit needs so no tab opens blank: the profiles, the check
+    /// catalogue, the L4 scope when the bus has it, then a profile in the editor.
+    private func firstVisitLoads() async {
+        guard surfaceOffered, surface.profiles.isEmpty else { return }
+        await refreshProfiles()
+        await refreshChecks()
+        await refreshL4Scope()
+        await loadDefaultProfile()
+    }
+
+    /// `standard` when the core ships it, else the first profile listed.
+    private func loadDefaultProfile() async {
+        guard surface.editedProfile == nil, let first = surface.profiles.first else { return }
+        let name = surface.profiles.first { $0.name == "standard" }?.name ?? first.name
+        await loadProfile(name)
+    }
+
+    /// The Issues tab reads its page once per filter set; the filters are the
+    /// verb's parameters, so a changed filter is a new read, not a local sieve.
+    private func loadIssuesIfFiltersChanged() async {
+        guard loadedIssueFilters != surface.filters else { return }
+        await refreshIssues()
+    }
+
+    private func loadSitemapIfJobChanged() async {
+        guard loadedSitemapJob != .some(surface.sitemapJob) else { return }
+        await refreshSitemap()
+    }
+
+    private func loadSelectedIssueDetail() async {
+        guard let id = surface.selectedIssue else {
+            loadedIssueDetail = nil
+            return
+        }
+        guard loadedIssueDetail != id else { return }
+        loadedIssueDetail = id
+        await loadIssue(id)
+    }
+
+    // MARK: Surface intents: launch (D9)
+
+    /// Start Scan / Map Only. The gate is checked before anything is sent.
+    func startScan(map: Bool) {
+        Task { await launch(map: map) }
+    }
+
+    /// `scan.start` / `scan.map`. A refused launch never reaches the bus: the
+    /// refusal becomes the footer's status line and the call is not made.
+    func launch(map: Bool) async {
+        // One launch at a time: a confirm sheet or an in-flight call owns the bus until it settles.
+        guard surface.confirm == nil, !surface.launchInFlight else { return }
+        // The footer and the button's help already show the refusal; echoing it into the
+        // status line would outlive the refusal once the operator fixes the cause.
+        guard launchRefusal == nil else { return }
+        let call = surface.launchArguments(map: map)
+        surface.launchInFlight = true
+        await send(tool: call.tool, args: call.args)
+    }
+
+    /// The second half of the handshake: the identical arguments plus `_confirm`.
+    /// A second Start Scan while the first is on the wire sends nothing.
+    func confirmLaunch() async {
+        guard let confirm = surface.confirm, !surface.launchInFlight else { return }
+        surface.launchInFlight = true
+        await send(tool: confirm.tool, args: confirm.confirmedArguments)
+    }
+
+    /// Cancel on the confirm sheet: nothing more is sent. Only the pending confirm
+    /// is cleared; a confirmed call already on the wire keeps `launchInFlight`
+    /// until `send` settles it, so the footer cannot start a second job meanwhile.
+    func dismissConfirm() {
+        surface.confirm = nil
+    }
+
+    /// One launch call, read as D9 reads it: a `needs_confirmation` answer first,
+    /// then a start result, and a thrown error last.
+    private func send(tool: String, args: [String: JSONValue]) async {
+        let origins = surface.editedProfile?.target.origins ?? []
+        let value: JSONValue
+        do {
+            value = try await session.runCommand(tool, args)
+        } catch {
+            surface.applyLaunchError(ScanLaunchError(busMessage: BusService.describe(error), origins: origins))
+            return
+        }
+        if let request = L4ConfirmRequest(json: value) {
+            surface.applyConfirm(tool: tool, args: args, request: request)
+            return
+        }
+        do {
+            surface.applyStart(try ScanStartResult(json: value))
+        } catch {
+            surface.applyLaunchError(ScanLaunchError(
+                code: nil, message: "\(tool) returned a result this app cannot read", origins: origins))
+            return
+        }
+        pollGeneration += 1
+    }
+
+    // MARK: Surface intents: jobs
+
+    /// `scan.cancel {job}`. The issues the job already found stay.
+    func cancel(job: String) async {
+        do {
+            let value = try await session.runCommand("scan.cancel", ["job": .string(job)])
+            if let status = try? ScanJobStatus(json: value) {
+                surface.applyStatus(status)
+            } else {
+                await refreshStatus(job)
+            }
+        } catch {
+            surface.jobsError = scanUnableText("cancel job \(job)", BusService.describe(error))
+        }
+    }
+
+    /// Cancel Scan (⌥⌘.): the selected job, or the only running one.
+    func cancelSelectedOrOnlyRunning() {
+        guard let job = cancelTarget else { return }
+        Task { await cancel(job: job) }
+    }
+
+    // MARK: Surface intents: profiles
+
+    /// `scan.profile.save {profile}`: the edited profile becomes the saved one and
+    /// the footer says so for four seconds.
+    func saveProfile() async {
+        guard let profile = surface.editedProfile else { return }
+        do {
+            let value = try await session.runCommand("scan.profile.save", ["profile": profile.json()])
+            let result = try ScanProfileSaveResult(json: value)
+            surface.loadedProfile = profile
+            let line = "Saved \(result.saved)"
+            surface.setStatusLine(line)
+            clearStatusLine(line, after: .seconds(4))
+        } catch {
+            surface.setStatusLine(scanUnableText("save profile", BusService.describe(error)))
+            return
+        }
+        await refreshProfiles()
+    }
+
+    /// Duplicate…: the edited values under a new name, unsaved and unloaded, so a
+    /// launch sends the whole profile and Save Profile writes a new file. The name
+    /// rule is checked here, not only by the popover's button: a name the core
+    /// could not store as a file never becomes a profile's.
+    func duplicateProfile(as name: String) {
+        guard var profile = surface.editedProfile else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard ScanSurface.isValidProfileName(trimmed) else { return }
+        profile.name = trimmed
+        surface.loadedProfile = nil
+        surface.editedProfile = profile
+        // Through `select(profile:)`: picking the duplicate starts afresh like any pick.
+        surface.select(profile: trimmed)
+        duplicateName = nil
+    }
+
+    /// `scan.profile.delete {name}`. The editor never ends up blank: the first
+    /// profile left takes its place. `deleted: false` (nothing on file under that
+    /// name) is said in the footer, not treated as a failure.
+    func deleteProfile(_ name: String) async {
+        deleteCandidate = nil
+        do {
+            let value = try await session.runCommand("scan.profile.delete", ["name": .string(name)])
+            let result = try ScanProfileDeleteResult(json: value)
+            if !result.deleted {
+                let line = scanNothingToDeleteText(name: name)
+                surface.setStatusLine(line)
+                clearStatusLine(line, after: .seconds(4))
+            }
+        } catch {
+            surface.profilesError = scanUnableText("delete profile \(name)", BusService.describe(error))
+            return
+        }
+        if surface.selectedProfile == name {
+            surface.selectedProfile = nil
+            surface.loadedProfile = nil
+            surface.editedProfile = nil
+        }
+        await refreshProfiles()
+        await loadDefaultProfile()
+    }
+
+    // MARK: Surface intents: issues
+
+    /// `scan.issue.update {id, status}`. The pill moves at once and moves back if
+    /// the core refuses, so the list never claims a status the core does not hold.
+    func updateIssueStatus(_ id: String, _ status: ScanIssueStatus) async {
+        guard let previous = issueStatus(id) else { return }
+        setIssueStatus(id, status)
+        do {
+            let value = try await session.runCommand(
+                "scan.issue.update", ["id": .string(id), "status": .string(status.rawValue)])
+            surface.applyIssue(try ScanIssue(json: value))
+            surface.issuesError = nil
+        } catch {
+            setIssueStatus(id, previous)
+            surface.issuesError = scanUnableText("update the issue", BusService.describe(error))
+        }
+    }
+
+    /// `scan.issue.update {id, status, note}`: the note with the status it has now.
+    func saveNote(_ id: String, note: String) async {
+        guard let status = issueStatus(id) else { return }
+        do {
+            let value = try await session.runCommand(
+                "scan.issue.update",
+                ["id": .string(id), "status": .string(status.rawValue), "note": .string(note)])
+            surface.applyIssue(try ScanIssue(json: value))
+            surface.issuesError = nil
+        } catch {
+            surface.issuesError = scanUnableText("save the note", BusService.describe(error))
+        }
+    }
+
+    private func issueStatus(_ id: String) -> ScanIssueStatus? {
+        if surface.issueDetail?.id == id { return surface.issueDetail?.status }
+        return surface.issues.first { $0.id == id }?.status
+    }
+
+    private func setIssueStatus(_ id: String, _ status: ScanIssueStatus) {
+        if let index = surface.issues.firstIndex(where: { $0.id == id }) { surface.issues[index].status = status }
+        if surface.issueDetail?.id == id { surface.issueDetail?.status = status }
+    }
+
+    // MARK: Surface intents: links out
+
+    /// Open a flow the scanner names in the inspector, by the legacy rule: a flow
+    /// that is no longer listed is refused, never silently selected.
+    func openFlow(_ id: String) {
+        guard isListed(id) else {
+            session.lastError = "flow \(id) is not in the flow list (cleared, or not captured here)"
+            return
+        }
+        session.select(FlowID(id))
+        session.show(.apps)
+    }
+
+    /// That flow id is still in this app's flow list.
+    func isListed(_ id: String) -> Bool { session.rows.contains { $0.id.raw == id } }
+
+    /// `GET /search` for a listed flow; nil when the app never saw it, so the row
+    /// can fall back to the bare id.
+    func flowLabel(_ id: String) -> String? {
+        guard let row = session.rows.first(where: { $0.id.raw == id }) else { return nil }
+        return "\(row.method.label) \(row.path)"
+    }
+
+    /// Open the PoC an issue points at on the Findings page. The match is the
+    /// Kit's `ScanFindingLink.match` over the findings' PoC paths, nothing looser;
+    /// a reference no finding carries is refused, never guessed.
+    func openPoC(ref: String) {
+        if session.poc.findings.isEmpty { session.poc.load() }
+        let findings = session.poc.findings
+        guard let index = ScanFindingLink.match(pocRef: ref, in: findings.map(\.pocPath)) else {
+            session.lastError = "PoC \(ref) is not in this app's findings list"
+            return
+        }
+        session.show(.findings)
+        session.poc.select(findings[index].id)
+    }
+
+    // MARK: Surface intents: navigation
+
+    /// Show Issues: the Issues tab filtered to one job (all jobs when nil).
+    func showIssues(job: String?) {
+        surface.filters.job = job
+        surface.tab = .issues
+    }
+
+    /// Show Site Map: the Site map tab for one job (all jobs when nil).
+    func showSitemap(job: String?) {
+        surface.sitemapJob = job
+        surface.tab = .sitemap
+    }
+
+    /// Start Scan… from the menu or the palette: the Scan page, Profiles, launch focused.
+    func focusLaunch() {
+        surface.tab = .profiles
+        launchFocusTick += 1
+        session.show(.scan)
+    }
+
+    /// A `notifications/aitm/job` line: a trigger for the poll loop, never a value
+    /// on screen. The sink that calls this is the follow-on PR's.
+    func noteJobEvent(_ params: JSONValue) {
+        surface.noteJobEvent(params)
+    }
+
+    /// The legacy Add Host to Scope… path, reused by an out-of-scope origin row.
+    func openScopeSheet(for host: String) {
+        session.scopeSheetHost = host
+        session.scopeSheetVisible = true
+    }
+
+    /// The tools list or the scope changed: `launchRefusal` is computed, so only the
+    /// L4 scope — which lives on the bus — has to be read again.
+    func refreshGate() {
+        guard surfaceOffered else { return }
+        Task { await refreshL4Scope() }
+    }
+
+    /// Takes a status line down after a while, and only while it is still the line
+    /// this state put up.
+    private func clearStatusLine(_ line: String, after delay: Duration) {
+        savedLine = line
+        Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, savedLine == line, surface.statusLine == line else { return }
+            surface.setStatusLine(nil)
+            savedLine = nil
+        }
+    }
 }
 
-/// The Scan page: a launch bar on top (target bound to the scope, depth and page
-/// budget from the tool schema), then a master list of endpoints and injection
-/// points on the left and the selected injection point on the right.
+/// The Scan page. Which page that is depends only on what the bus lists (D11):
+/// the scanner-v2 surface when `scan.start` is there, the legacy one-shot crawl
+/// form when only `scan.discover` is, and an unavailable state otherwise. Opening
+/// any of them never scans.
 struct ScanPanel: View {
+    @Bindable var state: ScanPanelState
+
+    var body: some View {
+        switch state.mode {
+        case .surface: ScanSurfaceView(state: state)
+        case .legacy: LegacyScanPanel(state: state)
+        case .unavailable: ScanUnavailablePanel()
+        }
+    }
+}
+
+/// The core lists no scanner verb at all: degraded, never broken.
+private struct ScanUnavailablePanel: View {
+    var body: some View {
+        ContentUnavailableView {
+            Label("Scan is unavailable", systemImage: Tok.Glyph.search)
+        } description: {
+            Text("The core lists neither scan.start nor scan.discover (it needs the scanner plugin).")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Tok.Ground.surface.color)
+        .gridArea("scan", inset: 0)
+    }
+}
+
+/// The scanner-v2 Scan page (D2): the page header, the four tabs on one strip,
+/// the selected tab, and the page's modals. The poll task lives here, so the page
+/// reads `scan.list` / `scan.status` / `scan.issues` exactly while it is on screen
+/// and stops the moment the operator leaves it (D8).
+struct ScanSurfaceView: View {
+    @Bindable var state: ScanPanelState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageHeader("Scan") {
+                // The cached list shows first; the spinner appears only when a
+                // profiles load has been in flight for more than 500 ms (D11).
+                if state.profilesLoadingSlow {
+                    ProgressView()
+                        .controlSize(.small)
+                        .help("Loading profiles")
+                }
+            }
+            PaneTabs(title: "", tabs: tabs, selected: selection) { EmptyView() }
+            tab
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Tok.Ground.surface.color)
+        .scanModals(state)
+        .task(id: state.pollGeneration) { await state.poll() }
+        .onChange(of: state.session.tools) { state.refreshGate() }
+        .onChange(of: state.session.scopeHosts) { state.refreshGate() }
+        .gridArea("scan", inset: 0)
+    }
+
+    private var tabs: [ScanTabItem] {
+        ScanTab.allCases.map { ScanTabItem(tab: $0, title: state.surface.tabTitle($0)) }
+    }
+
+    private var selection: Binding<ScanTabItem> {
+        Binding(
+            get: { ScanTabItem(tab: state.surface.tab, title: state.surface.tabTitle(state.surface.tab)) },
+            set: { state.surface.tab = $0.tab }
+        )
+    }
+
+    @ViewBuilder private var tab: some View {
+        switch state.surface.tab {
+        case .profiles: ScanProfilesTab(state: state)
+        case .jobs: ScanJobsTab(state: state)
+        case .sitemap: ScanSitemapTab(state: state)
+        case .issues: ScanIssuesTab(state: state)
+        }
+    }
+}
+
+/// `PaneTabs` renders a tab's `description`, so the counted title ("Jobs 2") rides
+/// along as the description while identity stays the `ScanTab` itself — a count
+/// that changes must not look like a different tab.
+struct ScanTabItem: Hashable, CustomStringConvertible {
+    var tab: ScanTab
+    var title: String
+
+    var description: String { title }
+
+    static func == (lhs: ScanTabItem, rhs: ScanTabItem) -> Bool { lhs.tab == rhs.tab }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(tab) }
+}
+
+/// The legacy Scan page, shown when the core lists `scan.discover` but not
+/// `scan.start` (D11): a launch bar on top (target bound to the scope, depth and
+/// page budget from the tool schema), then a master list of endpoints and
+/// injection points on the left and the selected injection point on the right.
+struct LegacyScanPanel: View {
     @Bindable var state: ScanPanelState
 
     var body: some View {
@@ -327,6 +1035,8 @@ struct ScanEndpointRow: View {
     var linked: Bool
     /// That flow is still in the flow list, so opening it can succeed.
     var openable: Bool
+    /// The chevron's tooltip while the flow can be opened.
+    var help: String = "Open Flow"
     var open: () -> Void
 
     var body: some View {
@@ -343,7 +1053,7 @@ struct ScanEndpointRow: View {
                 }
                 .buttonStyle(PressStyle())
                 .disabled(!openable)
-                .help(openable ? "Open Flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
+                .help(openable ? help : "This flow is no longer in the flow list (cleared, or not captured here).")
             } else {
                 label.textSelection(.enabled)
             }
@@ -422,7 +1132,7 @@ struct ScanPointDetail: View {
                 Rule()
                 ScrollView {
                     VStack(alignment: .leading, spacing: Space.lg) {
-                        section("Example")
+                        ScanSectionTitle("Example")
                         Text(point.example.isEmpty ? "(empty)" : point.example)
                             .font(Tok.Face.data(Tok.Typography.Size.md))
                             .foregroundStyle(point.example.isEmpty ? Tok.Ink.tertiary.color : Tok.Ink.primary.color)
@@ -432,7 +1142,7 @@ struct ScanPointDetail: View {
                             .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
                         Hint(text: "Shown as the scanner returned it; secrets are redacted at the source.")
 
-                        section("Flow")
+                        ScanSectionTitle("Flow")
                         flowReference(point)
                         if !state.canOpen(point) {
                             Hint(text: "This flow is no longer in the flow list (cleared, or not captured here).")
@@ -464,13 +1174,13 @@ struct ScanPointDetail: View {
     private var scanSummary: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.lg) {
-                section("Coverage")
+                ScanSectionTitle("Coverage")
                 HStack(alignment: .top, spacing: Space.section) {
                     stat("Endpoints", "\(state.endpoints.count)")
                     stat("Injection points", "\(state.points.count)")
                 }
                 if !state.points.isEmpty {
-                    section("Injection points by type")
+                    ScanSectionTitle("Injection points by type")
                     typeBreakdown
                 }
                 if let reason = state.model.stoppedReason {
@@ -556,10 +1266,82 @@ struct ScanPointDetail: View {
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.inspectorHeader)
     }
+}
 
-    private func section(_ title: String) -> some View {
-        Text(title.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
-            .foregroundStyle(Tok.Ink.tertiary.color)
+// MARK: - Shared chrome
+
+/// A section title on any Scan tab: tracked xs caps in tertiary, read as a
+/// header. With `count`, the count sits beside it in the same ink (the site
+/// map's "INSERTION POINTS 3").
+struct ScanSectionTitle: View {
+    var title: String
+    var count: Int?
+
+    init(_ title: String, count: Int? = nil) {
+        self.title = title
+        self.count = count
+    }
+
+    var body: some View {
+        HStack(spacing: Space.sm) {
+            Text(title.uppercased())
+                .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
+                .tracking(0.6)
+                .foregroundStyle(Tok.Ink.tertiary.color)
+            if let count {
+                Text("\(count)")
+                    .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                    .foregroundStyle(Tok.Ink.tertiary.color)
+                    .monospacedDigit()
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// A failed read or update, inline (D11): the list it could not refresh stays
+/// as it was. Selectable so the reason can be copied into a bug report. `inset`
+/// is the list inset it sits in; 0 inside a block that carries its own.
+struct ScanInlineError: View {
+    var text: String
+    var inset: CGFloat = Space.md
+
+    var body: some View {
+        Text(text)
+            .font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(Tok.Status.serverError.color)
+            .lineLimit(2)
+            .textSelection(.enabled)
+            .padding(.horizontal, inset)
+            .padding(.vertical, Space.xs)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Error: \(text)")
+    }
+}
+
+/// A label over a value; `—` in tertiary for a value the bus has not told us yet.
+struct ScanStat: View {
+    var label: String
+    var value: String?
+
+    init(_ label: String, _ value: String?) {
+        self.label = label
+        self.value = value
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            Text(label)
+                .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                .foregroundStyle(Tok.Ink.tertiary.color)
+            Text(value ?? "—")
+                .font(Tok.Face.data(Tok.Typography.Size.md, .medium))
+                .foregroundStyle((value == nil ? Tok.Ink.tertiary : Tok.Ink.primary).color)
+                .lineLimit(1)
+                .textSelection(.enabled)
+        }
     }
 }
 
@@ -569,11 +1351,15 @@ private extension View {
     @ViewBuilder func opensOnDoubleClick(_ enabled: Bool, _ action: @escaping () -> Void) -> some View {
         if enabled { onTapGesture(count: 2, perform: action) } else { self }
     }
+}
 
-    /// The launch bar's text field: plain, on `surface`, a control-border outline.
-    func scanFieldChrome() -> some View {
+extension View {
+    /// The Scan page's text field, on every tab: plain, on `surface`, a
+    /// control-border outline. `face` is the data face unless the field holds
+    /// prose (the Issues note).
+    func scanFieldChrome(face: Font = Tok.Face.data(Tok.Typography.Size.md)) -> some View {
         textFieldStyle(.plain)
-            .font(Tok.Face.data(Tok.Typography.Size.md))
+            .font(face)
             .padding(.horizontal, Space.sm)
             .frame(height: Tok.Size.control)
             .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))

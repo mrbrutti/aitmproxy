@@ -1,0 +1,175 @@
+07:34:27.3N after Start Scan: scan.list
+{
+ "jobs": [
+  {
+   "elapsed_ms": 0,
+   "issues": {
+    "by_confidence": {
+     "certain": 1,
+     "firm": 2,
+     "tentative": 1
+    },
+    "by_severity": {
+     "critical": 0,
+     "high": 0,
+     "info": 0,
+     "low": 3,
+     "medium": 1
+    },
+    "total": 4
+   },
+   "job": "scan-4a0d4629",
+   "phase": "auditing",
+   "points": {
+    "audited": 475,
+    "found": 485,
+    "queued": 1469,
+    "skipped": {
+     "frequent": 0,
+     "ignored": 3,
+     "limit": 0
+    }
+   },
+   "probes": {
+    "budget": 2000,
+    "by_lane": {
+     "http": 148
+    },
+    "errors": 0,
+    "rate_waits": 67,
+    "sent": 148,
+    "timeouts": 0
+   },
+   "state": "running"
+  }
+ ]
+}
+07:34:28.3N shot 13-jobs-t1; scan.status scan-4a0d4629
+{"state": "done", "phase": "done", "elapsed_ms": 2959, "probes": {"budget": 2000, "by_lane": {"http": 197}, "errors": 0, "rate_waits": 108, "sent": 197, "timeouts": 0}, "points": {"audited": 482, "found": 485, "queued": 1469, "skipped": {"frequent": 0, "ignored": 3, "limit": 0}}, "issues": {"by_confidence": {"certain": 2, "firm": 2, "tentative": 1}, "by_severity": {"critical": 0, "high": 0, "info": 0, "low": 3, "medium": 2}, "total": 5}}
+07:34:34.3N shot 13-jobs-t2; scan.status scan-4a0d4629
+{"state": "done", "phase": "done", "elapsed_ms": 2959, "probes": {"budget": 2000, "by_lane": {"http": 197}, "errors": 0, "rate_waits": 108, "sent": 197, "timeouts": 0}, "points": {"audited": 482, "found": 485, "queued": 1469, "skipped": {"frequent": 0, "ignored": 3, "limit": 0}}, "issues": {"by_confidence": {"certain": 2, "firm": 2, "tentative": 1}, "by_severity": {"critical": 0, "high": 0, "info": 0, "low": 3, "medium": 2}, "total": 5}}
+07:34:40.3N shot 13-jobs-t3; scan.status scan-4a0d4629
+{"state": "done", "phase": "done", "elapsed_ms": 2959, "probes": {"budget": 2000, "by_lane": {"http": 197}, "errors": 0, "rate_waits": 108, "sent": 197, "timeouts": 0}, "points": {"audited": 482, "found": 485, "queued": 1469, "skipped": {"frequent": 0, "ignored": 3, "limit": 0}}, "issues": {"by_confidence": {"certain": 2, "firm": 2, "tentative": 1}, "by_severity": {"critical": 0, "high": 0, "info": 0, "low": 3, "medium": 2}, "total": 5}}
+07:34:46.3N shot 13-jobs-t4; scan.status scan-4a0d4629
+{"state": "done", "phase": "done", "elapsed_ms": 2959, "probes": {"budget": 2000, "by_lane": {"http": 197}, "errors": 0, "rate_waits": 108, "sent": 197, "timeouts": 0}, "points": {"audited": 482, "found": 485, "queued": 1469, "skipped": {"frequent": 0, "ignored": 3, "limit": 0}}, "issues": {"by_confidence": {"certain": 2, "firm": 2, "tentative": 1}, "by_severity": {"critical": 0, "high": 0, "info": 0, "low": 3, "medium": 2}, "total": 5}}
+07:34:51.3N scan.issues
+{
+ "by_severity": {
+  "critical": 0,
+  "high": 0,
+  "info": 0,
+  "low": 3,
+  "medium": 2
+ },
+ "issues": [
+  {
+   "check_id": "xss-reflected",
+   "class": "reflected-xss",
+   "confidence": "certain",
+   "finding_id": null,
+   "first_seen": 1793547265861,
+   "id": "issue-f2a85a99",
+   "job": "scan-4a0d4629",
+   "lane": "http",
+   "last_seen": 1793547265861,
+   "location": {
+    "field_path": null,
+    "kind": "query",
+    "l4": null,
+    "method": "GET",
+    "name": "q",
+    "path": "/search",
+    "path_template": "/search",
+    "ws_path": null
+   },
+   "name": "Reflected cross-site scripting",
+   "occurrences": 1,
+   "poc_ref": null,
+   "severity": "medium",
+   "status": "open",
+   "target": {
+    "host": "127.0.0.1",
+    "port": 8097,
+    "scheme": "http"
+   }
+  },
+  {
+   "check_id": "xss-reflected",
+   "class": "reflected-xss",
+   "confidence": "certain",
+   "finding_id": null,
+   "first_seen": 1793547268060,
+   "id": "issue-5a772705",
+   "job": "scan-4a0d4629",
+   "lane": "http",
+   "last_seen": 1793547268060,
+   "location": {
+    "field_path": null,
+    "kind": "query",
+    "l4": null,
+    "method": "GET",
+    "name": "name",
+    "path": "/greet",
+    "path_template": "/greet",
+    "ws_path": null
+   },
+   "name": "Reflected cross-site scripting",
+   "occurrences": 1,
+   "poc_ref": null,
+   "severity": "medium",
+   "status": "open",
+   "target": {
+    "host": "127.0.0.1",
+    "port": 8097,
+    "scheme": "http"
+   }
+  },
+  {
+   "check_id": "security-header",
+   "class": "security-header",
+   "confidence": "firm",
+   "finding_id": null,
+   "first_seen": 1793547265804,
+   "id": "issue-a4020418",
+   "job": "scan-4a0d4629",
+   "lane": "http",
+   "last_seen": 1793547265853,
+   "location": {
+    "field_path": null,
+    "kind": "header",
+    "l4": null,
+    "method": "GET",
+    "name": "sec-ch-ua",
+    "path": "/",
+    "path_template": "/",
+    "ws_path": null
+   },
+   "name": "Missing security header",
+   "occurrences": 407,
+   "poc_ref": null,
+   "severity": "low",
+   "status": "open",
+   "target": {
+    "host": "127.0.0.1",
+    "port": 8097,
+    "scheme": "http"
+   }
+  },
+  {
+   "check_id": "reflection",
+   "class": "reflection",
+   "confidence": "tentative",
+   "finding_id": null,
+   "first_seen": 1793547265807,
+   "id": "issue-3e502ab1",
+   "job": "scan-4a0d4629",
+   "lane": "http",
+   "last_seen": 1793547265838,
+   "location": {
+    "field_path": null,
+    "kind": "query",
+    "l4": null,
+    "method": "GET",
+    "name": "q",
+    "path": "/search",
+    "p

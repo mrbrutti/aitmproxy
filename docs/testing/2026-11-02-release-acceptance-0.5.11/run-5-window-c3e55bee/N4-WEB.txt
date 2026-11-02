@@ -1,0 +1,104 @@
+2026-11-02T04:01:23.263092Z  INFO aitm_plugin_rhai::loader: loaded script script=check-command-injection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-command-injection.rhai hooks=["load"]
+2026-11-02T04:01:23.263364Z  INFO aitm_plugin_rhai::loader: loaded script script=check-cors path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-cors.rhai hooks=["load"]
+2026-11-02T04:01:23.263540Z  INFO aitm_plugin_rhai::loader: loaded script script=check-crlf-injection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-crlf-injection.rhai hooks=["load"]
+2026-11-02T04:01:23.263686Z  INFO aitm_plugin_rhai::loader: loaded script script=check-http-methods path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-http-methods.rhai hooks=["load"]
+2026-11-02T04:01:23.263896Z  INFO aitm_plugin_rhai::loader: loaded script script=check-ldap-injection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-ldap-injection.rhai hooks=["load"]
+2026-11-02T04:01:23.264099Z  INFO aitm_plugin_rhai::loader: loaded script script=check-nosql-injection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-nosql-injection.rhai hooks=["load"]
+2026-11-02T04:01:23.264252Z  INFO aitm_plugin_rhai::loader: loaded script script=check-open-redirect path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-open-redirect.rhai hooks=["load"]
+2026-11-02T04:01:23.264383Z  INFO aitm_plugin_rhai::loader: loaded script script=check-path-traversal path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-path-traversal.rhai hooks=["load"]
+2026-11-02T04:01:23.264526Z  INFO aitm_plugin_rhai::loader: loaded script script=check-security-headers path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-security-headers.rhai hooks=["load"]
+2026-11-02T04:01:23.264656Z  INFO aitm_plugin_rhai::loader: loaded script script=check-sensitive-paths path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-sensitive-paths.rhai hooks=["load"]
+2026-11-02T04:01:23.264921Z  INFO aitm_plugin_rhai::loader: loaded script script=check-sqli path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-sqli.rhai hooks=["load"]
+2026-11-02T04:01:23.265069Z  INFO aitm_plugin_rhai::loader: loaded script script=check-ssrf path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-ssrf.rhai hooks=["load"]
+2026-11-02T04:01:23.265224Z  INFO aitm_plugin_rhai::loader: loaded script script=check-ssti path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-ssti.rhai hooks=["load"]
+2026-11-02T04:01:23.265368Z  INFO aitm_plugin_rhai::loader: loaded script script=check-xss path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-xss.rhai hooks=["load"]
+2026-11-02T04:01:23.265549Z  INFO aitm_plugin_rhai::loader: loaded script script=check-xxe path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/active/check-xxe.rhai hooks=["load"]
+2026-11-02T04:01:23.265688Z  INFO aitm_plugin_rhai::loader: loaded script script=basic-auth-cleartext path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/basic-auth-cleartext.rhai hooks=["on_request"]
+2026-11-02T04:01:23.265812Z  INFO aitm_plugin_rhai::loader: loaded script script=cacheable-sensitive-response path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/cacheable-sensitive-response.rhai hooks=["on_response"]
+2026-11-02T04:01:23.265955Z  INFO aitm_plugin_rhai::loader: loaded script script=cors-misconfiguration path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/cors-misconfiguration.rhai hooks=["on_response"]
+2026-11-02T04:01:23.266073Z  INFO aitm_plugin_rhai::loader: loaded script script=csrf-token-missing path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/csrf-token-missing.rhai hooks=["on_request"]
+2026-11-02T04:01:23.266200Z  INFO aitm_plugin_rhai::loader: loaded script script=dangerous-http-methods path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/dangerous-http-methods.rhai hooks=["on_response"]
+2026-11-02T04:01:23.266286Z  INFO aitm_plugin_rhai::loader: loaded script script=directory-listing path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/directory-listing.rhai hooks=["on_response"]
+2026-11-02T04:01:23.266366Z  INFO aitm_plugin_rhai::loader: loaded script script=graphql-introspection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/graphql-introspection.rhai hooks=["on_response"]
+2026-11-02T04:01:23.266555Z  INFO aitm_plugin_rhai::loader: loaded script script=host-header-reflection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/host-header-reflection.rhai hooks=["on_response"]
+2026-11-02T04:01:23.266800Z  INFO aitm_plugin_rhai::loader: loaded script script=insecure-cookies path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/insecure-cookies.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267060Z  INFO aitm_plugin_rhai::loader: loaded script script=jwt-weakness path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/jwt-weakness.rhai hooks=["on_request"]
+2026-11-02T04:01:23.267186Z  INFO aitm_plugin_rhai::loader: loaded script script=missing-csp path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/missing-csp.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267288Z  INFO aitm_plugin_rhai::loader: loaded script script=missing-frame-protection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/missing-frame-protection.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267368Z  INFO aitm_plugin_rhai::loader: loaded script script=missing-hsts path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/missing-hsts.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267453Z  INFO aitm_plugin_rhai::loader: loaded script script=missing-nosniff path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/missing-nosniff.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267530Z  INFO aitm_plugin_rhai::loader: loaded script script=missing-permissions-policy path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/missing-permissions-policy.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267608Z  INFO aitm_plugin_rhai::loader: loaded script script=missing-referrer-policy path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/missing-referrer-policy.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267687Z  INFO aitm_plugin_rhai::loader: loaded script script=mixed-content path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/mixed-content.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267789Z  INFO aitm_plugin_rhai::loader: loaded script script=open-redirect-reflection path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/open-redirect-reflection.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267882Z  INFO aitm_plugin_rhai::loader: loaded script script=private-address-disclosure path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/private-address-disclosure.rhai hooks=["on_response"]
+2026-11-02T04:01:23.267986Z  INFO aitm_plugin_rhai::loader: loaded script script=reflected-input-indicator path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/reflected-input-indicator.rhai hooks=["on_response"]
+2026-11-02T04:01:23.268075Z  INFO aitm_plugin_rhai::loader: loaded script script=request-smuggling-indicator path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/request-smuggling-indicator.rhai hooks=["on_request"]
+2026-11-02T04:01:23.268201Z  INFO aitm_plugin_rhai::loader: loaded script script=secret-in-response path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/secret-in-response.rhai hooks=["on_response"]
+2026-11-02T04:01:23.268297Z  INFO aitm_plugin_rhai::loader: loaded script script=secret-in-url path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/secret-in-url.rhai hooks=["on_request"]
+2026-11-02T04:01:23.268403Z  INFO aitm_plugin_rhai::loader: loaded script script=sensitive-path-exposed path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/sensitive-path-exposed.rhai hooks=["on_response"]
+2026-11-02T04:01:23.268502Z  INFO aitm_plugin_rhai::loader: loaded script script=server-banner-disclosure path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/server-banner-disclosure.rhai hooks=["on_response"]
+2026-11-02T04:01:23.269564Z  INFO aitm_plugin_rhai::loader: loaded script script=sql-error-indicator path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/sql-error-indicator.rhai hooks=["on_response"]
+2026-11-02T04:01:23.269759Z  INFO aitm_plugin_rhai::loader: loaded script script=verbose-error-disclosure path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/http/verbose-error-disclosure.rhai hooks=["on_response"]
+2026-11-02T04:01:23.269869Z  INFO aitm_plugin_rhai::loader: loaded script script=l4-recon path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/l4/l4-recon.rhai hooks=["load"]
+2026-11-02T04:01:23.270052Z  INFO aitm_plugin_rhai::loader: loaded script script=l4-tcp-syn-probe path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/l4/l4-tcp-syn-probe.rhai hooks=["load"]
+2026-11-02T04:01:23.270187Z  INFO aitm_plugin_rhai::loader: loaded script script=l4-udp-probe path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/l4/l4-udp-probe.rhai hooks=["load"]
+2026-11-02T04:01:23.270271Z  INFO aitm_plugin_rhai::loader: loaded script script=ws-cleartext-transport path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/ws/ws-cleartext-transport.rhai hooks=["on_ws_start"]
+2026-11-02T04:01:23.270358Z  INFO aitm_plugin_rhai::loader: loaded script script=ws-cross-site-hijack-indicator path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/ws/ws-cross-site-hijack-indicator.rhai hooks=["on_ws_start"]
+2026-11-02T04:01:23.270463Z  INFO aitm_plugin_rhai::loader: loaded script script=ws-pii-in-frame path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/ws/ws-pii-in-frame.rhai hooks=["on_ws_message"]
+2026-11-02T04:01:23.270565Z  INFO aitm_plugin_rhai::loader: loaded script script=ws-secret-in-frame path=/opt/homebrew/Cellar/aitm/0.5.11/libexec/share/aitm/scripts/ws/ws-secret-in-frame.rhai hooks=["on_ws_message"]
+2026-11-02T04:01:23.270583Z  INFO aitm::scripts: script loaded into the host script=check-command-injection
+2026-11-02T04:01:23.270588Z  INFO aitm::scripts: script loaded into the host script=check-cors
+2026-11-02T04:01:23.270590Z  INFO aitm::scripts: script loaded into the host script=check-crlf-injection
+2026-11-02T04:01:23.270591Z  INFO aitm::scripts: script loaded into the host script=check-http-methods
+2026-11-02T04:01:23.270593Z  INFO aitm::scripts: script loaded into the host script=check-ldap-injection
+2026-11-02T04:01:23.270594Z  INFO aitm::scripts: script loaded into the host script=check-nosql-injection
+2026-11-02T04:01:23.270595Z  INFO aitm::scripts: script loaded into the host script=check-open-redirect
+2026-11-02T04:01:23.270597Z  INFO aitm::scripts: script loaded into the host script=check-path-traversal
+2026-11-02T04:01:23.270598Z  INFO aitm::scripts: script loaded into the host script=check-security-headers
+2026-11-02T04:01:23.270599Z  INFO aitm::scripts: script loaded into the host script=check-sensitive-paths
+2026-11-02T04:01:23.270602Z  INFO aitm::scripts: script loaded into the host script=check-sqli
+2026-11-02T04:01:23.270604Z  INFO aitm::scripts: script loaded into the host script=check-ssrf
+2026-11-02T04:01:23.270605Z  INFO aitm::scripts: script loaded into the host script=check-ssti
+2026-11-02T04:01:23.270607Z  INFO aitm::scripts: script loaded into the host script=check-xss
+2026-11-02T04:01:23.270608Z  INFO aitm::scripts: script loaded into the host script=check-xxe
+2026-11-02T04:01:23.270609Z  INFO aitm::scripts: script loaded into the host script=basic-auth-cleartext
+2026-11-02T04:01:23.270611Z  INFO aitm::scripts: script loaded into the host script=cacheable-sensitive-response
+2026-11-02T04:01:23.270613Z  INFO aitm::scripts: script loaded into the host script=cors-misconfiguration
+2026-11-02T04:01:23.270614Z  INFO aitm::scripts: script loaded into the host script=csrf-token-missing
+2026-11-02T04:01:23.270616Z  INFO aitm::scripts: script loaded into the host script=dangerous-http-methods
+2026-11-02T04:01:23.270617Z  INFO aitm::scripts: script loaded into the host script=directory-listing
+2026-11-02T04:01:23.270619Z  INFO aitm::scripts: script loaded into the host script=graphql-introspection
+2026-11-02T04:01:23.270620Z  INFO aitm::scripts: script loaded into the host script=host-header-reflection
+2026-11-02T04:01:23.270621Z  INFO aitm::scripts: script loaded into the host script=insecure-cookies
+2026-11-02T04:01:23.270623Z  INFO aitm::scripts: script loaded into the host script=jwt-weakness
+2026-11-02T04:01:23.270624Z  INFO aitm::scripts: script loaded into the host script=missing-csp
+2026-11-02T04:01:23.270626Z  INFO aitm::scripts: script loaded into the host script=missing-frame-protection
+2026-11-02T04:01:23.270627Z  INFO aitm::scripts: script loaded into the host script=missing-hsts
+2026-11-02T04:01:23.270629Z  INFO aitm::scripts: script loaded into the host script=missing-nosniff
+2026-11-02T04:01:23.270630Z  INFO aitm::scripts: script loaded into the host script=missing-permissions-policy
+2026-11-02T04:01:23.270631Z  INFO aitm::scripts: script loaded into the host script=missing-referrer-policy
+2026-11-02T04:01:23.270633Z  INFO aitm::scripts: script loaded into the host script=mixed-content
+2026-11-02T04:01:23.270634Z  INFO aitm::scripts: script loaded into the host script=open-redirect-reflection
+2026-11-02T04:01:23.270635Z  INFO aitm::scripts: script loaded into the host script=private-address-disclosure
+2026-11-02T04:01:23.270637Z  INFO aitm::scripts: script loaded into the host script=reflected-input-indicator
+2026-11-02T04:01:23.270638Z  INFO aitm::scripts: script loaded into the host script=request-smuggling-indicator
+2026-11-02T04:01:23.270639Z  INFO aitm::scripts: script loaded into the host script=secret-in-response
+2026-11-02T04:01:23.270642Z  INFO aitm::scripts: script loaded into the host script=secret-in-url
+2026-11-02T04:01:23.270644Z  INFO aitm::scripts: script loaded into the host script=sensitive-path-exposed
+2026-11-02T04:01:23.270645Z  INFO aitm::scripts: script loaded into the host script=server-banner-disclosure
+2026-11-02T04:01:23.270646Z  INFO aitm::scripts: script loaded into the host script=sql-error-indicator
+2026-11-02T04:01:23.270648Z  INFO aitm::scripts: script loaded into the host script=verbose-error-disclosure
+2026-11-02T04:01:23.270649Z  INFO aitm::scripts: script loaded into the host script=l4-recon
+2026-11-02T04:01:23.270650Z  INFO aitm::scripts: script loaded into the host script=l4-tcp-syn-probe
+2026-11-02T04:01:23.270652Z  INFO aitm::scripts: script loaded into the host script=l4-udp-probe
+2026-11-02T04:01:23.270653Z  INFO aitm::scripts: script loaded into the host script=ws-cleartext-transport
+2026-11-02T04:01:23.270654Z  INFO aitm::scripts: script loaded into the host script=ws-cross-site-hijack-indicator
+2026-11-02T04:01:23.270656Z  INFO aitm::scripts: script loaded into the host script=ws-pii-in-frame
+2026-11-02T04:01:23.270657Z  INFO aitm::scripts: script loaded into the host script=ws-secret-in-frame
+2026-11-02T04:01:23.278282Z  INFO aitm::audit: durable audit log on path=/Users/matt/Library/Application Support/aitmproxy/audit.jsonl
+
+Error: cannot start: the proxy port 127.0.0.1:8080 is already in use.
+It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.
+Free it, or set `listen:` to another address in /Users/matt/Library/Application Support/aitmproxy/config.yaml.
+Find the holder with:  lsof -nP -iTCP:8080 -sTCP:LISTEN

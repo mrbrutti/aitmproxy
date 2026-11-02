@@ -1,0 +1,2 @@
+
+[stderr] 86:94: execution error: System Events got an error: Can’t get window 1 of process "Aitmproxy". Invalid index. (-1719)
