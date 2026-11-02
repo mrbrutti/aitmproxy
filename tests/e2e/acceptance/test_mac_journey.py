@@ -147,6 +147,21 @@ def open_scope_sheet() -> bool:
     return False
 
 
+SCOPE_FIELD_DESC = "Host to add to scope"
+SCOPE_FIELD_ID = "scope-add-host"   # the identifier the mac fix adds; the description is the fallback
+
+
+def click_scope_field() -> bool:
+    """Give the Edit Scope sheet's field the focus by clicking it: `click.sh` locates the field
+    through accessibility right before each click (identifier when present, else description) and
+    refuses if it is gone or moved. The sheet does not focus the field itself when Scope already
+    has hosts (run 5, MAC-5)."""
+    out = sh("bash", os.path.join(LIB, "click.sh"), SCOPE_FIELD_DESC, SCOPE_FIELD_ID)
+    time.sleep(0.4)
+    globals()["last_click"] = out.strip()[:160]
+    return "clicked" in out
+
+
 def field_focused() -> bool:
     """Type one harmless digit, read it back from the text field, clear it. When the digit is NOT
     read back the focus is somewhere unknown: nothing more is sent there (no ⌘A/Delete either)."""
@@ -264,6 +279,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
         step("MAC-5", "PASS", f"both hosts were already in Scope before the run ({pre}); nothing typed, nothing to remove later", f"scope.list {sc}")
     elif not open_scope_sheet():
         step("MAC-5", "FAIL", "Proxy ▸ Scope… (twice) did not show the Edit Scope sheet's field 'Host to add to scope'; nothing typed")
+    elif not click_scope_field():
+        step("MAC-5", "FAIL", f"the Edit Scope field could not be clicked ({globals().get('last_click', 'click.sh gave no output')}); nothing typed")
     elif not field_focused():
         step("MAC-5", "FAIL", "the sheet's field did not take the focus probe (typed '1' not read back); refusing to type into an unknown target")
     else:
@@ -407,7 +424,8 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("N1-MAC", "SKIP", "needs the window and --manual (Restart Core, then an add within ~1 s after a focus re-probe)")
         else:
             sc_before = bus.call("scope.list", {})
-            n1 = is_manual() and open_scope_sheet() and field_focused()
+            n1_clicked = is_manual() and open_scope_sheet() and click_scope_field()
+            n1 = n1_clicked and field_focused()
             stop = threading.Event()
             if n1:
                 bounds = sh("bash", os.path.join(LIB, "ax_texts.sh"), "bounds").strip()
@@ -419,7 +437,7 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 # Re-probe the focus AFTER the restart press (one digit + AX read): the restart may have moved
                 # it. Seen → paste + Return (the add lands while the core is still coming back); not seen →
                 # send NOTHING more (a blind paste could land in a persisting field such as Settings' bypass).
-                n1_focus = field_focused()
+                n1_focus = field_focused()   # no click here: the paste must land within ~1 s of the press (D7)
                 if n1_focus:
                     type_text(N1_HOST, enter=True)
             time.sleep(6)
@@ -438,8 +456,10 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             step("MAC-13", "PASS" if ok and "Embedded core failed" not in dump else "FAIL", f"new core pid {core2.pid if core2 else None}; Scope rows kept {kept}; stale failed banner present {'Embedded core failed' in dump}", f"scope.list before {sc_before} after {sc_after}")
             if not is_manual():
                 step("N1-MAC", "SKIP", "needs --manual (a hand watches the restart) — the restart itself ran as MAC-13")
+            elif not n1_clicked:
+                step("N1-MAC", "SKIP", f"the Edit Scope sheet did not open or its field could not be clicked before the restart ({globals().get('last_click', '')}); no probe sent, no add attempted")
             elif not n1:
-                step("N1-MAC", "SKIP", "the Edit Scope sheet did not open / take focus before the restart; no add attempted")
+                step("N1-MAC", "SKIP", "the Edit Scope field was clicked but did not take the focus probe before the restart; the probe digit `1` went to the then-focused field (clear by hand if visible); no add attempted")
             elif not n1_focus:
                 step("N1-MAC", "SKIP", f"the focus probe after Restart Core was not seen in the sheet's field; nothing was pasted — only the probe digit `1` went to the then-focused field: clear it by hand if it is visible; frames in N1-frames/", f"scope.list after restart {sc_after}")
             else:
