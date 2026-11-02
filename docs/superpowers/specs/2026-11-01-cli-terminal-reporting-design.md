@@ -294,7 +294,7 @@ Learn more:
   Trust the CA:  aitm ca install
 ```
 
-After (W2), `aitm --help` is grouped with every verb (19 groups, 91 verbs; `l4` appears when `l4.enabled`), two aligned columns, dim descriptions wrapped to width, an `Examples:` block and the `Learn more:` footer; `aitm scope` prints the `scope` group's help; `aitm scope add --help` prints the flags with types and defaults and one or two examples. Mock-up of a group page (W2):
+After (W2), `aitm --help` is grouped with every verb (19 groups, 91 verbs; `l4` appears when `l4.enabled`), two aligned columns, dim descriptions wrapped to width, an `Examples:` block and the `Learn more:` footer; `aitm scope` prints the `scope` group's help; `aitm scope add --help` prints the flags with types and defaults and one or two examples. Mock-up of a group page (W2; **illustrative** — the exact page, bytes and verbs, is the wave-2 plan's M-W2-2, which the code pins; `remove` and the counts here are not):
 
 ```text
 aitm scope — which hosts are decrypted
@@ -586,6 +586,8 @@ pub fn pre_boot(argv: &[String]) -> Option<PreBoot>;      // first token ∈ {--
 pub fn version_line() -> String;                            // "aitm 0.5.11"
 pub const SYNOPSIS: &str;                                   // M3's W1 text, with the version interpolated
 ```
+
+> Wave 2 (plan C32, 2026-11-01): `Help` and `SYNOPSIS` are deleted by wave-2 Task 15; every help form becomes `Mode::Help`, resolved by `crate::help` before the runtime (it reads the config read-only and compiles the catalogue, C31). The block above is the wave-1 shape; see the wave-2 amendments under D15.
 
 `main()` calls `startup::pre_boot` **before** `parse_invocation`, before the runtime, before any config read, tracing sink, script tier or CA: `Version` prints `version_line()` + `\n` on stdout and exits 0; `Help` prints `SYNOPSIS` on stdout and exits 0. `pre_boot` steps over `--config <p>`/`--config=<p>` **and** the terminal flags (`-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--color <v>`, `--color=<v>`) before matching the alias, so `aitm --config x --version`, `aitm -v --version` and `aitm --color never -h` all answer pre-boot and create nothing (tester pass 2 F3: before the fix a leading terminal flag booted the host). **Why a static synopsis and not the existing registry text (Architect's call, deviating from the orchestrator's "existing usage text"):** the registry's usage is `Cli::usage()` over `Registry::commands()`, and the registry is built by `wire::assemble`, which calls `Ca::load_or_generate` (`crates/aitm-proto-http/src/ca.rs:42`) and so mints the CA key; there is no side-effect-free registry in wave 1, and `wire.rs` is frozen. The static group list is pinned by a unit test that assembles the registry in a temp CA dir and compares first segments (AC-W1-9). W2 adds the schema-only registry and restyles the whole help.
 
