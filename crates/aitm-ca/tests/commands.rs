@@ -1124,15 +1124,15 @@ fn audit_fail_closed() {
 fn confirm_prompts() {
     let h = Harness::scripted(false);
 
+    // The prompt is the C47 line protocol: question, "  SHA-256 <fp>" detail
+    // line, notes, then the short final ask (M-W2-6).
     let p = h.confirm("ca.install", &[]).expect("install asks");
-    assert!(
-        p.starts_with("Install the aitmproxy root CA (SHA-256 "),
-        "{p}"
-    );
-    assert!(p.contains(FIXTURE_FP256), "{p}");
+    assert!(p.starts_with("Install the aitmproxy root CA into "), "{p}");
+    assert!(p.contains(&format!("\n  SHA-256 {FIXTURE_FP256}\n")), "{p}");
     assert!(p.contains(&format!("into {K_USER} (scope user)?")), "{p}");
     assert!(p.contains(OBSCURA_FLAG), "{p}");
     assert!(p.contains("obscura"), "{p}");
+    assert!(p.ends_with("\nInstall it?"), "{p}");
 
     let p = h
         .confirm("ca.install", &[("scope", str_arg("system"))])
@@ -1146,7 +1146,8 @@ fn confirm_prompts() {
     assert_eq!(
         p,
         format!(
-            "Remove the aitmproxy root CA (SHA-256 {FIXTURE_FP256}) from {K_USER} (scope user)?"
+            "Remove the aitmproxy root CA from {K_USER} (scope user)?\n  SHA-256 \
+             {FIXTURE_FP256}\nRemove it?"
         )
     );
 
