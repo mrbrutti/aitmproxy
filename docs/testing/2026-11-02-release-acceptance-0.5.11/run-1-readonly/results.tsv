@@ -1,0 +1,6 @@
+cli-livecore	FAIL	exit 1
+mac	FAIL	exit 1
+n5	PASS
+tui	SKIP	
+web	SKIP	
+cli-nocore	SKIP	

@@ -100,7 +100,10 @@ def main() -> None:
 
                 section("scan.map with the real browser")
                 seq0 = V.logs.reset()
-                res = map_job(op, "operator", target=V.base)
+                # This cell IS the browser-crawl proof: opt out of the harness's
+                # client-crawl default (use_browser: never) explicitly.
+                res = map_job(op, "operator", target=V.base,
+                              overrides={"crawl": {"use_browser": "auto"}})
                 job = res["job"]
                 ok(f"job {job} started (lanes run={res.get('lanes', {}).get('run')})")
                 st = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)

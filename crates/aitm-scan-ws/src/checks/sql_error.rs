@@ -21,9 +21,9 @@
 use std::sync::{Arc, OnceLock};
 
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, ProbeResponse, Technique,
-    Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, InsertionKind,
+    InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, ProbeResponse,
+    Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -64,6 +64,7 @@ fn meta() -> &'static CheckMeta {
         needs_baseline: true,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: Some(89),
         description:
             "Places an unbalanced quote in a WebSocket message field and reads the reply for a \
@@ -136,6 +137,8 @@ async fn run(host: &dyn ProbeHost) -> Verdict {
                 },
                 detail: detail_for(signature),
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             };
         }
     }
