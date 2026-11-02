@@ -397,6 +397,7 @@ Kept by the main session during stage 6. One row per finding.
 | T13 | quality pass 6 | Minor | Q30 the module-doc reflow stopped one line short | fixed in 342ae1af |
 | docs | spec pass 6 | Minor | Sp37 plan item 4, spec D2 "Start" and Claims hook (3) still described the inline `match` / the bare `?` | fixed in d8de9401 |
 | docs | spec pass 6 | Minor | Sp38 "six greps", "one sentence", round F's size absent | fixed in d8de9401 |
+| merge | lead 2026-11-02 | — | origin/main de27aa27 (p1b #267: `l4.privilege`/`l4.privilege.request` on every core, privilege state + prompt hold in `main.rs`; v0.5.13 release commits) merged as b22348df. `main.rs`: three conflicts — the `aitm::{…}` import line (p1b's `PromptHold` beside T13's separate `operator_token` import and `aitm_cli::{Confirmer, TtyConfirmer}`), the tui `select!` (T13's `finished()` arm kept above p1b's `shutdown_signal_unless_held(prompt_hold)` arm), the test-module import list (union). `tests/oneshot_verbs.rs` pins the two privilege verbs `Live` (both return at once: the status verb reads the live state, `request` hands the platform action off); 116 default verbs, spec D6 updated. Sandbox: fmt, clippy `--all-targets -D warnings`, bin 45, lib 548, `oneshot_verbs` 2/2. Terminal gate on b22348df follows. | b22348df; for the final panel confirmation |
 
 ## Follow-ups recorded by this plan (not this PR)
 
