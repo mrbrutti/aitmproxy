@@ -99,22 +99,42 @@ def note_secret(value: str) -> None:
         f.write(value + "\n")
 
 
+def log_redacted(dst, line: str) -> bool:
+    """One line to the log through the writer's redaction; False once the log is closed."""
+    try:
+        dst.write(w.redact(line))
+        dst.flush()
+        return True
+    except ValueError:  # the log was closed at the end of the cell while a last line arrived
+        return False
+
+
 def pump_redacted(src, dst) -> None:
-    """Copy `aitm web`'s stderr to the log file line by line through the writer's redaction."""
+    """Copy a child stream (or any line iterable) to the log line by line, redacted."""
     for line in src:
-        try:
-            dst.write(w.redact(line))
-            dst.flush()
-        except ValueError:  # the log was closed at the end of the cell while a last line arrived
+        if not log_redacted(dst, line):
+            return
+
+
+STDOUT_LINES: list[str] = []
+
+
+def pump_stdout(src, dst) -> None:
+    """`aitm web`'s stdout carries nothing (wave 1 G1); keep what arrives for WEB-1's
+    "nothing from the Rhai loader on stdout" check and log it, redacted."""
+    for line in src:
+        STDOUT_LINES.append(line.rstrip("\n"))
+        if not log_redacted(dst, line):
             return
 
 
 def read_card(proc: subprocess.Popen, deadline_s: float, log) -> tuple[list[str], str | None, str | None]:
     """The ready card from STDERR (wave 1 G1/D13), read in a thread so a silent `aitm web` cannot
-    hang the cell: stops at the `Log` row (the plain form's last row), at the SECOND rule line
-    (`────`, the TTY form), at EOF, or at the deadline. Every stderr line, card or not, also goes to
-    the log through the writer's redaction, and once the card is in a drain thread keeps doing that
-    for the rest of the run."""
+    hang the cell: stops at the `Log` row when the log file opened (the plain form's last row;
+    absent it, the deadline ends the read), at EOF, or at the deadline. Every stderr line, card or
+    not, goes to the log through the writer's redaction (`installed.redact` masks `#t=` bearers by
+    pattern, so the first copy is masked before `note_secret` runs), and once the card is in,
+    `pump_redacted` keeps doing that for the rest of the run."""
     q: queue.Queue[str | None] = queue.Queue()
 
     def pump() -> None:
@@ -122,33 +142,20 @@ def read_card(proc: subprocess.Popen, deadline_s: float, log) -> tuple[list[str]
             q.put(line)
         q.put(None)
 
-    def to_log(line: str) -> None:
-        try:
-            log.write(w.redact(line))
-            log.flush()
-        except ValueError:  # the log was closed at the end of the cell while a last line arrived
-            pass
-
-    def drain() -> None:
-        while True:
-            line = q.get()
-            if line is None:
-                return
-            to_log(line)
-
     threading.Thread(target=pump, daemon=True).start()
     card: list[str] = []
     op_url = agent_url = None
-    rules = 0
     end = time.time() + deadline_s
+    eof = False
     while time.time() < end:
         try:
             line = q.get(timeout=max(0.05, end - time.time()))
         except queue.Empty:
             break
         if line is None:
+            eof = True
             break
-        to_log(line)
+        log_redacted(log, line)
         card.append(line.rstrip("\n"))
         m = re.match(r"\s*Operator:?\s+(https?://\S+)", line)
         if m:
@@ -156,13 +163,10 @@ def read_card(proc: subprocess.Popen, deadline_s: float, log) -> tuple[list[str]
         m = re.match(r"\s*Web UI:?\s+(https?://\S+)", line)
         if m:
             agent_url = m.group(1)
-        if "────" in line:
-            rules += 1
-            if rules >= 2:
-                break
         if re.match(r"\s*Log:?\s+\S", line):
             break
-    threading.Thread(target=drain, daemon=True).start()
+    if not eof:
+        threading.Thread(target=pump_redacted, args=(iter(q.get, None), log), daemon=True).start()
     return card, op_url, agent_url
 
 
@@ -194,8 +198,9 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
     log_path = os.path.join(OUT, "aitm-web.log")
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen([AITM, "web"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
-        # stdout carries nothing for `aitm web` (wave 1 G1); whatever arrives is logged, redacted.
-        threading.Thread(target=pump_redacted, args=(proc.stdout, log), daemon=True).start()
+        # stdout carries nothing for `aitm web` (wave 1 G1); whatever arrives is kept for WEB-1
+        # and logged, redacted.
+        threading.Thread(target=pump_stdout, args=(proc.stdout, log), daemon=True).start()
         try:
             # WEB-1 — the ready card.
             card, op_url, agent_url = read_card(proc, 20, log)
@@ -205,11 +210,11 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
             shown = "\n".join(card)
             with open(os.path.join(OUT, "WEB-1.txt"), "w", encoding="utf-8") as f:
                 f.write(w.redact(shown))
-            loader = sum(1 for ln in card if "loaded script" in ln or "script loaded into the host" in ln)
+            loader = sum(1 for ln in card + STDOUT_LINES if "loaded script" in ln or "script loaded into the host" in ln)
+            stdout_lines = len(STDOUT_LINES)
             have = {label: bool(re.search(rx, shown, re.M)) for label, rx in CARD_WANT.items()}
-            # The two 60-char rules frame the card only on a TTY; on this pipe the plain form has
-            # none (wave 1 D13), so they are reported, not required.
-            rules = sum(1 for ln in card if "────" in ln)
+            # Wave 1 G1: nothing on stdout, from the loader or anything else (CLI-3's twin).
+            have["stdout empty"] = stdout_lines == 0
             scope_empty = not pre_scope
             if scope_empty:
                 have["Scope line (Scope empty)"] = bool(SCOPE_LINE.search(shown))
@@ -218,11 +223,11 @@ def main() -> int:  # noqa: C901 — one journey, in the operator's order
                 healthz = urllib.request.urlopen("http://127.0.0.1:8082/healthz", timeout=5).read().decode()
             except Exception as e:  # noqa: BLE001
                 healthz = f"error {e}"
-            obs = f"card lines {len(card)} on stderr ({loader} loader lines, {rules} rules); " + ", ".join(f"{k}: {v}" for k, v in have.items()) + f"; Operator line {'present' if op_url else 'ABSENT'}; config scope empty {scope_empty}; /healthz {healthz.strip()}"
+            obs = f"card lines {len(card)} on stderr ({loader} loader lines; stdout {stdout_lines} lines); " + ", ".join(f"{k}: {v}" for k, v in have.items()) + f"; Operator line {'present' if op_url else 'ABSENT'}; config scope empty {scope_empty}; /healthz {healthz.strip()}"
             if all(have.values()) and loader == 0 and healthz.strip() == '{"ok":true}':
                 step("WEB-1", "PASS", obs)
             else:
-                step("WEB-1", "FAIL", obs, "", "log noise: PR #271" if loader else "")
+                step("WEB-1", "FAIL", obs, "", "regression after #271 (loader noise)" if loader else "")
             if not op_url:
                 for sid in BROWSER_STEPS:
                     step(sid, "BLOCKED", "no Operator line: mcp.operator_token is not set in the operator's config (`aitm operator-token generate` is a manual step on 0.5.10)")

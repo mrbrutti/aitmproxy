@@ -52,6 +52,8 @@ run() { # id secs -- cmd...   (capped; SIGINT at the cap so a serving mode exits
   python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$OUT/$id.out" 2>"$OUT/$id.err" & local pid=$!
   ( sleep "$secs"; kill -INT "$pid" 2>/dev/null; sleep 2; kill "$pid" 2>/dev/null ) & local w=$!
   wait "$pid" 2>/dev/null; local rc=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  # A web card (CLI-8/N4-CLI when the holder vanished) carries two per-run bearers: never on disk.
+  sed -i '' -E 's/#t=[^&[:space:]]+/#t=<redacted>/g' "$OUT/$id.out" "$OUT/$id.err" 2>/dev/null || true
   echo "$rc" >"$OUT/$id.exit"; return "$rc"
 }
 lines() { wc -l <"$1" | tr -d ' '; }
@@ -164,7 +166,7 @@ if want livecore; then
     # N4-CLI: `aitm web` while 8080 is held must print the cannot-start panel, exit 1, no card first.
     run N4-CLI 10 "$AITM" web; rc=$?
     if [ "$rc" != 0 ] && grep -q 'cannot start' "$OUT/N4-CLI.err" && ! grep -qE 'Web UI:? +http' "$OUT/N4-CLI.err"; then
-      res N4-CLI PASS "$(clean "$OUT/N4-CLI.err" | grep -m1 'cannot start' | head -c 120); $(loader "$OUT/N4-CLI.out") loader lines on stdout first" "" "log noise: PR #271"
+      res N4-CLI PASS "$(clean "$OUT/N4-CLI.err" | grep -m1 'cannot start' | head -c 120); $(loader "$OUT/N4-CLI.out") loader lines on stdout first" "" "regression after #271 (loader noise)"
     else
       res N4-CLI FAIL "exit $rc; stderr: $(clean "$OUT/N4-CLI.err" | grep -m1 -iE 'cannot start|in use|rror' | head -c 160); card printed? $(grep -cE 'Web UI:? +http' "$OUT/N4-CLI.err")"
     fi
@@ -229,7 +231,7 @@ if want livecore; then
   tr7=$(python3 -c 'import json,sys; t=open(sys.argv[1]).read(); i=t.find("{"); d=json.loads(t[i:]); u=d["stores"]["user"]; print("user installed="+u["installed"]+" trusted="+u["trusted"])' "$OUT/CLI-7.out" 2>/dev/null || echo "unparseable")
   kc=$(security find-certificate -a -c aitmproxy -Z "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null | grep -c 'SHA-1')
   if [ "$rc" = 0 ] && { { [ "$kc" -ge 1 ] && echo "$tr7" | grep -q 'installed=present'; } || { [ "$kc" = 0 ] && echo "$tr7" | grep -q 'installed=absent'; }; }; then
-    res CLI-7 PASS "$tr7 (keychain has $kc aitmproxy cert); $(loader "$OUT/CLI-7.out") loader lines before the JSON" "ca.status over the bus agrees" "log noise: PR #271"
+    res CLI-7 PASS "$tr7 (keychain has $kc aitmproxy cert); $(loader "$OUT/CLI-7.out") loader lines before the JSON" "ca.status over the bus agrees" "regression after #271 (loader noise)"
   else
     res CLI-7 FAIL "exit $rc; $tr7 vs keychain count $kc"
   fi
