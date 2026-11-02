@@ -283,8 +283,12 @@ describe('interceptBarModel', () => {
 
   it('pending availability is its own pending kind, not a "not available on this core" conclusion (spec §1)', () => {
     expect(interceptBarModel(PENDING_AVAILABILITY, [], 'F')).toEqual({ kind: 'pending' });
-    // The same shape built elsewhere (a copy, not the frozen constant) is pending too.
-    expect(interceptBarModel({ available: false, code: null, reason: 'Reading L4 availability…' }, [parkedWire('P1', 'F')], 'F')).toEqual({ kind: 'pending' });
+    // Pending is identity (fix 4): the same shape built elsewhere is an answer the core gave, so it
+    // is limited with that text, not pending — and a parked packet does not change that.
+    expect(interceptBarModel({ available: false, code: null, reason: 'Reading L4 availability…' }, [parkedWire('P1', 'F')], 'F')).toEqual({
+      kind: 'limited',
+      reason: 'Reading L4 availability…',
+    });
     // A real "unavailable, no code" answer with another reason is limited, not pending.
     expect(interceptBarModel({ available: false, code: null, reason: 'OLD-CORE-REASON' }, [], 'F')).toEqual({ kind: 'limited', reason: 'OLD-CORE-REASON' });
   });
@@ -345,10 +349,13 @@ describe('packetHeadline (spec §2 addresses)', () => {
   });
 });
 
-describe('isPendingAvailability (spec §1 pending literal; tester pass 2)', () => {
-  it('is true for the frozen constant and for an equal copy, false for anything the core actually answered', () => {
+describe('isPendingAvailability (spec §1 pending literal; tester pass 2; fix 4 identity only)', () => {
+  it('is true for the frozen constant only; anything the core actually answered — even an equal copy carrying the text — is not pending', () => {
     expect(isPendingAvailability(PENDING_AVAILABILITY)).toBe(true);
-    expect(isPendingAvailability({ available: false, code: null, reason: 'Reading L4 availability…' })).toBe(true);
+    // Pending is a UI state, not a reason string: a structurally equal object (what an old core
+    // refusing with `L4 unavailable: Reading L4 availability…` would map to) is a real answer.
+    expect(isPendingAvailability({ available: false, code: null, reason: 'Reading L4 availability…' })).toBe(false);
+    expect(isPendingAvailability({ ...PENDING_AVAILABILITY })).toBe(false);
     // The pending reason text with any real answer shape is not pending: the core said something.
     expect(isPendingAvailability({ available: true, code: 'available', reason: 'Reading L4 availability…' })).toBe(false);
     expect(isPendingAvailability({ available: true, code: null, reason: 'Reading L4 availability…' })).toBe(false);

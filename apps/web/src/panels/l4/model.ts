@@ -428,9 +428,13 @@ export const PENDING_AVAILABILITY: L4Availability = Object.freeze({
   reason: 'Reading L4 availability…',
 });
 
-/** True while `avail` is the pending placeholder (the frozen constant or an equal copy): no status reply yet. */
+/**
+ * True while `avail` is the pending placeholder itself: no status reply yet. Identity, not shape —
+ * pending is a UI state the store mints (it only ever sets the frozen constant), never something a
+ * core answered, so an answer that happens to carry the same text is a real answer.
+ */
 export function isPendingAvailability(avail: L4Availability): boolean {
-  return avail === PENDING_AVAILABILITY || (avail.available === false && avail.code === null && avail.reason === PENDING_AVAILABILITY.reason);
+  return avail === PENDING_AVAILABILITY;
 }
 
 const L4_UNAVAILABLE_MARKER = 'L4 unavailable: ';
