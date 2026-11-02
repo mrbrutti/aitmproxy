@@ -405,6 +405,12 @@ Every manual `check.<rhai-id>` returned "the engine must hand a shared probe hos
 
 Live run on `c6092927` (cells17: 20 pass / 17 skip / 1 fail): the cell counted 4 raw h2 connections instead of 5. Dump of the target log (`/tmp/claude/t1b/proof/out/h2_dump.log`): all five checks ran on five raw connections (c-2…c-6), issues correct (`settings-observe`, `rapid-reset-mitigation`), `checks.done 5`, `probes.sent 9`. The cell classified any connection that carried `GET /` as the job client's pooled connection; since amendment 38 the five checks' baselines are `GET <origin>/` on the pooled connection and the raw rapid-reset probe's eight stream heads are `GET /` too (the check cuts `:path` from the origin item's URL `<origin>/`, where it used to cut `/search` from a captured point), so the rapid-reset connection was mis-filed as pooled. Fix: pooled = connections whose request rows carry a `host` header (the job client sends one on every request; a raw probe stream writes pseudo-headers only — every c-6 row has an empty header map, every c-1 row has `host`). Engine untouched.
 
+### Task 13b: `test_t3_version_override.py` asserts the amendment-39b shape (e2e-only; the plan's live proof for 39)
+
+**Files:** `tests/e2e/scan/test_t3_version_override.py` only (orchestrator; D12 exception, T3 informed).
+
+The cell forces `http.version: h2` against the h1-only listener — exactly the plan's live proof for amendment 39 — but its second half encoded the superseded row 39 (`stopped_reason == "errors"`, `h2_not_negotiated` in `status.error`) and SKIPped whenever both were null, which under the coordinator's 39b ruling is forever (cells17: SKIP "pending amendment 39", `probes.errors 6, sent 0`). It now asserts 39b: `state done`, `stopped_reason` and `error` null, `crawl.errors > 0`, `crawl.pages == 0`, `crawl.last_error == "h2_not_negotiated"`, `probes.errors > 0`; the T3 half (h1 override) is unchanged.
+
 ### Task 6: bookkeeping and docs wording
 
 - **Satisfies:** workflow stage-7 record keeping; amendment 39/40 operator docs.
