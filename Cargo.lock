@@ -36,6 +36,7 @@ dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-mcp",
+ "aitm-peer-process",
  "aitm-peer-token",
  "aitm-plugin",
  "aitm-plugin-maprules",
